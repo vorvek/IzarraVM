@@ -112,18 +112,15 @@ impl UmbArena {
 }
 
 /// Furnish or clear the upper-memory arena that DOS exposes to AH=48h high
-/// allocations and XMS UMB calls. Clearing the arena also unlinks it, preserving
-/// the invariant that a linked state always has a real pool behind it.
+/// allocations and XMS UMB calls.
 fn set_umb_region(
     umb: &mut Option<UmbArena>,
-    umb_link: &mut bool,
     seg: u16,
     paras: u16,
     mem: &mut Memory,
 ) -> Result<(), BusError> {
     if paras < 2 {
         *umb = None;
-        *umb_link = false;
         return Ok(());
     }
     write_mcb_header(mem, seg, b'Z', 0, paras - 1, NO_NAME)?;
@@ -425,14 +422,12 @@ fn resize_block(
     Ok(Ok(()))
 }
 
-/// Owns the UMB arena state that used to live in `izarravm_dos::DosKernel`: the
-/// upper-memory MCB chain descriptor plus the AH=5803h link flag. This is the live
-/// DOS memory-manager the XMS UMB services and `furnish_dos_upper_memory` drive; it
-/// is deliberately separate from the retired HLE DOS kernel.
+/// Owns the UMB arena state that used to live in the retired Rust DOS kernel: the
+/// upper-memory MCB chain descriptor. This is the live DOS memory-manager the XMS
+/// UMB services and `furnish_dos_upper_memory` drive.
 #[derive(Debug, Default)]
 pub struct DosMemory {
     umb: Option<UmbArena>,
-    umb_link: bool,
 }
 
 impl DosMemory {
@@ -447,7 +442,7 @@ impl DosMemory {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<(), BusError> {
-        set_umb_region(&mut self.umb, &mut self.umb_link, seg, paras, mem)
+        set_umb_region(&mut self.umb, seg, paras, mem)
     }
 
     /// XMS function 10h Request UMB: carve `paras` paragraphs from the SAME
@@ -482,23 +477,6 @@ impl DosMemory {
     ) -> Result<Result<(), Option<u16>>, BusError> {
         resize_umb(self.umb, seg, paras, mem)
     }
-
-    /// Whether an upper-memory-block arena is furnished (the EMM386 manager is
-    /// loaded with UMBs). The XMS UMB calls and the AH=5803h link gate on this.
-    // The SYSINIT caller still reads this off the HLE `dos` field; it is rewired to
-    // `dosmem` when that seam is deleted in the next task, so it has no caller yet.
-    #[allow(dead_code)]
-    pub fn has_umb_arena(&self) -> bool {
-        self.umb.is_some()
-    }
-
-    /// Set the AH=5803h UMB link state. The machine calls this at SYSINIT to link
-    /// the arena when CONFIG.SYS carries DOS=UMB, so a default box comes up linked.
-    // As with `has_umb_arena`, the SYSINIT caller is rewired here in the next task.
-    #[allow(dead_code)]
-    pub fn set_umb_link(&mut self, linked: bool) {
-        self.umb_link = linked;
-    }
 }
 
 #[cfg(test)]
@@ -514,7 +492,7 @@ mod tests {
         let mut mem = mem_1mib();
         let mut dm = DosMemory::default();
         dm.set_umb_region(0xC800, 0x0800, &mut mem).unwrap();
-        assert!(dm.has_umb_arena());
+        assert!(dm.umb.is_some());
         let arena = dm.umb.unwrap();
         let chain = arena.chain(&mem);
         assert_eq!(chain.len(), 1, "one free block spans the pool");
@@ -525,14 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn set_umb_region_clears_and_unlinks_a_too_small_pool() {
+    fn set_umb_region_clears_a_too_small_pool() {
         let mut mem = mem_1mib();
         let mut dm = DosMemory::default();
         dm.set_umb_region(0xC800, 0x0800, &mut mem).unwrap();
-        dm.set_umb_link(true);
         dm.set_umb_region(0xC800, 1, &mut mem).unwrap();
-        assert!(!dm.has_umb_arena(), "a <2-para pool clears the arena");
-        assert!(!dm.umb_link, "clearing also unlinks");
+        assert!(dm.umb.is_none(), "a <2-para pool clears the arena");
     }
 
     #[test]

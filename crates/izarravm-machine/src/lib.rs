@@ -14,7 +14,7 @@ use izarravm_core::{
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{
-    Cpu386, CpuError, CpuLevel, CycleOutcome, Registers, SegmentIndex, SegmentRegister, bus_timing,
+    Cpu386, CpuError, CpuLevel, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing,
 };
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
@@ -360,8 +360,6 @@ pub enum MachineError {
     Bus(#[from] BusError),
     #[error(transparent)]
     Cpu(#[from] CpuError),
-    #[error(transparent)]
-    Dos(#[from] izarravm_dos::DosError),
     #[error(transparent)]
     Program(#[from] raw_program::ProgramLoadError),
     #[error("test BIOS ROM must be exactly 64 KiB, got {0} bytes")]
@@ -749,22 +747,6 @@ fn write_register_bytes(register: u32, byte_offset: u16, width: BusWidth, value:
     u32::from_le_bytes(bytes)
 }
 
-/// A frozen parent CPU state for EXEC (AH=4Bh AL=0) resume: the register file as
-/// handle_dos_int left it at the parent's AH=4Bh INT, so restoring it lands the
-/// CPU back on the IRET stub with the parent's INT-return frame on the stack.
-#[derive(Debug)]
-struct ProgramFrame {
-    registers: Registers,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingCriticalError {
-    AbsoluteDisk {
-        return_to: izarravm_dos::FarPtr,
-        ax: u16,
-    },
-}
-
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
 const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
@@ -1130,31 +1112,22 @@ pub struct Machine {
     // the resulting status is read back at 0xE3.
     pending_toka_service: Option<u8>,
     toka_service_status: u8,
-    toka_c_root: Option<std::path::PathBuf>, // host C: root for Repair/Format
     /// The host folder backing the Katea C: drive (set by `mount_hdd_folder`), so
     /// the BIOS "Repair Toka-DOS" service can reset CONFIG.SYS/AUTOEXEC.BAT on it.
     katea_root: Option<std::path::PathBuf>,
-    // True while a CallDevice service is on the CPU. A driver running on the
-    // borrowed context can issue INT 21h AH=3Fh/40h on a device handle, which
-    // would re-enter the same fixed request packet at DEVICE_REQUEST_SCRATCH and
-    // grow the host stack without bound. The CallDevice arm refuses a nested call
-    // while this is set. It is not part of any snapshot.
-    in_device_call: bool,
     // How many bytes of the DOS console output have already been teletyped onto
     // the VGA text screen. DOS CON output goes to the kernel's stdout buffer; the
     // machine mirrors the new bytes onto the framebuffer so the screen shows them.
     dos_screen_shown: usize,
-    dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
     // The live DOS UMB/MCB memory-manager, extracted from `izarravm-dos`. Drives the
-    // XMS UMB services and `furnish_dos_upper_memory`; independent of the HLE `dos`.
+    // XMS UMB services and `furnish_dos_upper_memory`.
     dosmem: dosmem::DosMemory,
     /// True only for a `new_raw_program` machine: routes INT 20h/21h/27h to
-    /// `handle_raw_program_int` instead of `handle_dos_int`. See
+    /// `handle_raw_program_int`. See
     /// `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3a.
     program_runtime: bool,
-    /// Accumulated console output for a `new_raw_program` machine (the
-    /// `program_output()`/`set_program_stdin()` counterpart to `self.dos`'s
-    /// `dos_output()`/`set_dos_stdin()`).
+    /// Accumulated console output for a `new_raw_program` machine, read back
+    /// through `program_output()` / seeded through `set_program_stdin()`.
     program_output: Vec<u8>,
     rom: Vec<u8>,
     serial: uart::Uart16450,
@@ -1220,8 +1193,6 @@ pub struct Machine {
     // read, later ATA) rather than executed instructions. A realtime host can
     // subtract these so blocking on a drive does not read as running over 100%.
     io_stall_clocks: u64,
-    // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
-    program_frames: Vec<ProgramFrame>,
     // INT 2Fh AH=13h DOS disk-driver hook state: DS:DX live handler and ES:BX
     // restore target. Initial value is the seeded BIOS INT 13h IRET vector.
     dos_disk_handler: (u16, u16),
@@ -1229,9 +1200,6 @@ pub struct Machine {
     // INT 2Fh AX=B803h/B804h network post address. Null when no network TSR has
     // published one.
     network_post_address: (u16, u16),
-    // Host-to-guest DOS INT 24h trampoline waiting for the guest handler to return
-    // through the low-memory completion stub.
-    pending_critical_error: Option<PendingCriticalError>,
     // Mounted A: floppy image, geometry inferred from the image length. INT 13h
     // disk services read and write it; None means the drive is empty.
     floppy: Option<floppy::Floppy>,
@@ -1247,10 +1215,6 @@ pub struct Machine {
     // MSCDEX/IZCDEX volume-descriptor preference. The default selects the primary
     // volume descriptor.
     icdex_vd_preference: u16,
-    // Guest BDS entries installed through INT 2Fh AX=0801h. The DOS-owned BDS
-    // list is regenerated on demand, so keep external entries as far pointers and
-    // relink them after each regeneration.
-    external_driver_bds: Vec<(u16, u16)>,
     // ATA hard disk on the primary IDE channel (0x1F0-0x1F7/0x3F6, IRQ14). The
     // boot drive C:; None when no image is mounted. INT 13h DL>=0x80 and the
     // primary-channel ports drive it.
@@ -1350,133 +1314,6 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
         ("BLASTER".to_string(), value.clone()),
         ("SETSOUND".to_string(), value),
     ]
-}
-
-fn device_call_error_code(command: u8, status: u16) -> u16 {
-    let status_code = status & 0x00ff;
-    if status_code != 0 {
-        return status_code;
-    }
-    match command {
-        8 => 0x001d, // write fault
-        4 => 0x001e, // read fault
-        _ => 0x001f, // general failure
-    }
-}
-
-fn block_device_error_code(write: bool, status: u16) -> u8 {
-    let status_code = status as u8;
-    if status_code != 0 {
-        return status_code;
-    }
-    if write { 0x0a } else { 0x0b }
-}
-
-fn block_fs_drive(path: &str) -> Option<u8> {
-    let bytes = path.as_bytes();
-    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
-        return None;
-    }
-    let drive = bytes[0].to_ascii_uppercase().checked_sub(b'A')?;
-    if drive > 25 {
-        return None;
-    }
-    Some(drive)
-}
-
-fn normalize_dos_name_byte(byte: u8) -> u8 {
-    if byte == b'/' {
-        b'\\'
-    } else {
-        byte.to_ascii_uppercase()
-    }
-}
-
-fn block_fs_path_8_3(path: &str) -> Option<(u8, [u8; 11])> {
-    let drive = block_fs_drive(path)?;
-    let bytes = path.as_bytes();
-    if bytes.len() < 4 || !matches!(bytes[2], b'\\' | b'/') {
-        return None;
-    }
-    let mut name = &path[2..];
-    while name.starts_with(['\\', '/']) {
-        name = &name[1..];
-    }
-    if name.is_empty() || name.contains(['\\', '/']) || name.contains(['*', '?']) {
-        return None;
-    }
-    let mut out = [b' '; 11];
-    let mut parts = name.split('.');
-    let stem = parts.next().unwrap_or_default();
-    let ext = parts.next().unwrap_or_default();
-    if parts.next().is_some() || stem.is_empty() || stem.len() > 8 || ext.len() > 3 {
-        return None;
-    }
-    if !stem
-        .bytes()
-        .chain(ext.bytes())
-        .all(|b| b.is_ascii_alphanumeric() || b"$%'-_@~`!(){}^#&".contains(&b))
-    {
-        return None;
-    }
-    for (i, b) in stem.bytes().enumerate() {
-        out[i] = b.to_ascii_uppercase();
-    }
-    for (i, b) in ext.bytes().enumerate() {
-        out[8 + i] = b.to_ascii_uppercase();
-    }
-    Some((drive, out))
-}
-
-fn block_fs_find_spec(path: &str) -> Option<(u8, String)> {
-    let drive = block_fs_drive(path)?;
-    let mut pattern = &path[2..];
-    while pattern.starts_with(['\\', '/']) {
-        pattern = &pattern[1..];
-    }
-    if pattern.is_empty() || pattern.contains(['\\', '/']) {
-        return None;
-    }
-    Some((drive, pattern.to_string()))
-}
-
-const BLOCK_FS_MAX_FILE_SIZE: u32 = 8 * 1024 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlockFsRootEntry {
-    name_8_3: [u8; 11],
-    attr: u8,
-    time: u16,
-    date: u16,
-    size: u32,
-    first_cluster: u16,
-}
-
-fn block_fs_fat_entry(fat: &[u8], cluster: u16, fat12: bool) -> Option<u16> {
-    if fat12 {
-        let offset = usize::from(cluster) * 3 / 2;
-        let lo = *fat.get(offset)?;
-        let hi = *fat.get(offset + 1)?;
-        let word = u16::from_le_bytes([lo, hi]);
-        Some(if cluster & 1 == 0 {
-            word & 0x0fff
-        } else {
-            word >> 4
-        })
-    } else {
-        let offset = usize::from(cluster) * 2;
-        Some(u16::from_le_bytes([
-            *fat.get(offset)?,
-            *fat.get(offset + 1)?,
-        ]))
-    }
-}
-
-fn device_request_packet_len(command: u8) -> u8 {
-    match command {
-        0x0d | 0x0e => 0x0d, // OPEN/CLOSE carry only the common request header.
-        _ => 0x1a,
-    }
 }
 
 /// Files that are NOT overlaid in user-folder mode: the demo file and the two
@@ -1625,11 +1462,8 @@ impl Machine {
             device_wrote_memory: false,
             pending_toka_service: None,
             toka_service_status: 0,
-            toka_c_root: None,
             katea_root: None,
-            in_device_call: false,
             dos_screen_shown: 0,
-            dos: izarravm_dos::DosKernel::default(),
             dosmem: dosmem::DosMemory::default(),
             program_runtime: false,
             program_output: Vec::new(),
@@ -1682,17 +1516,14 @@ impl Machine {
             },
             elapsed_clocks: 0,
             io_stall_clocks: 0,
-            program_frames: Vec::new(),
             dos_disk_handler: (BIOS_ROM_IRET_SEG, 0),
             dos_disk_restore: (BIOS_ROM_IRET_SEG, 0),
             network_post_address: (0, 0),
-            pending_critical_error: None,
             floppy: None,
             floppy_accesses: 0,
             c_accesses: 0,
             ide: ide::IdeChannel::new(),
             icdex_vd_preference: 0x0100,
-            external_driver_bds: Vec::new(),
             ata: None,
             fat32_c: None,
             cd_accesses: 0,
@@ -2135,78 +1966,6 @@ impl Machine {
         Ok(machine)
     }
 
-    /// Build a machine with a DOS program loaded and ready to run. The format is
-    /// detected by the "MZ" signature: an .EXE is relocated and entered at its
-    /// header CS:IP / SS:SP with DS=ES=PSP; a .COM is loaded flat at
-    /// DOS_LOAD_SEGMENT with CS=DS=ES=SS=that segment, IP=0x100, SP=0xFFFE. Run
-    /// with run_until_halt_or_cycles and read dos_output plus the DosExit stop
-    /// reason.
-    ///
-    /// Entry eflags has IF set, matching real DOS which hands control with
-    /// interrupts enabled. The resident keyboard BIOS is installed (IVT[09h]/[16h]
-    /// point at its ROM handlers, the PIC is programmed, and IRQ1 is unmasked), so
-    /// a typed key flows 8042 -> IRQ1 -> INT 09h ISR -> BDA ring. IRQ0 (timer) is
-    /// masked, so with no key injected no hardware interrupt fires.
-    pub fn new_dos_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
-        let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
-        let mut rom = vec![0u8; BIOS_ROM_SIZE];
-        let kb = izarravm_firmware::kbd_resident_bios();
-        rom[..kb.len()].copy_from_slice(kb);
-        // The BIOS service vectors return through the ROM IRET at offset 0xF000
-        // (FF00:0000); supply it on this synthetic ROM. The resident keyboard
-        // BIOS image is short and never reaches that offset.
-        rom[0xF000] = 0xCF;
-        let mut machine = Self::base(profile, Cpu386::default(), rom)?;
-        install_boot_bios_stubs(&mut machine.memory)?;
-        machine.install_keyboard_bios()?;
-
-        let entry = izarravm_dos::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
-        machine.apply_program_entry(entry);
-        // Seed the Toka-DOS per-program state (memory arena, DTA). prog_top is the
-        // top-of-memory paragraph the loader wrote to PSP:0x02.
-        let prog_top = machine
-            .memory
-            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)?;
-        {
-            let Machine { dos, memory, .. } = &mut machine;
-            dos.init_program(DOS_LOAD_SEGMENT, prog_top, memory)?;
-        }
-        // Seed the DOS environment segment (BLASTER=/SETSOUND=) and record it in
-        // PSP:0x2C so auto-detecting games find the SB16. The entries are derived
-        // from the host config above; the borrow is split so the kernel and memory
-        // are reached as disjoint fields.
-        let entries: Vec<(&str, &str)> = env_entries
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        {
-            let Machine { dos, memory, .. } = &mut machine;
-            dos.install_environment(memory, &entries)?;
-        }
-        machine.furnish_dos_upper_memory()?;
-        // A directly-loaded program runs in the default DOS=UMB environment, so it
-        // inherits the boot link state of a real DOS=HIGH,UMB box: AH=5803h is
-        // allowed and the UMB area comes up linked.
-        machine.dos.set_dos_umb(true);
-        if machine.dos.has_umb_arena() {
-            machine.dos.set_umb_link(true);
-        }
-        // A program loaded directly under DOS still expects the BIOS POST to have
-        // programmed PIT counter 0 (mode 2, count 65536 -> the 18.2 Hz tick), the
-        // way probe-pit.inc leaves it on a real boot. Without it counter 0 never
-        // counts, so a guest that polls the timer for a delay or a speed
-        // calibration (TSUMERA's setup does) reads a frozen count and spins
-        // forever. IRQ0 stays PIC-masked here, so this advances the count without
-        // delivering an unhandled tick.
-        {
-            let mut bus = machine.make_bus();
-            let _ = bus.write_io(0x43, BusWidth::Byte, 0x34);
-            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
-            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
-        }
-        Ok(machine)
-    }
-
     /// Build a machine with a DOS-format program loaded and ready to run, with
     /// no DOS kernel behind it — only `handle_raw_program_int`'s minimal
     /// terminate/console-I/O surface services interrupts. For tests and
@@ -2234,9 +1993,8 @@ impl Machine {
             .collect();
         raw_program::place_environment(&mut machine.memory, DOS_LOAD_SEGMENT, prog_top, &entries)?;
 
-        // Same PIT-counter0 seed new_dos_program uses, so a program that
-        // polls the timer for a delay doesn't spin forever. See the comment
-        // on new_dos_program for the full rationale.
+        // Seed PIT counter 0 the way the BIOS POST leaves it, so a program that
+        // polls the timer for a delay doesn't spin forever.
         {
             let mut bus = machine.make_bus();
             let _ = bus.write_io(0x43, BusWidth::Byte, 0x34);
@@ -2276,14 +2034,13 @@ impl Machine {
         let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_TAIL, off);
     }
 
-    /// Lay out the upper-memory window and hand the DOS kernel its UMB arena: the
+    /// Lay out the upper-memory window and furnish the `dosmem` UMB arena: the
     /// IZEMM SYSINIT step. Reserve the ROM, then carve the largest remaining hole as
-    /// the UMB pool. With no upper memory free, the kernel keeps no arena.
+    /// the UMB pool. With no upper memory free, no arena is kept.
     ///
     /// This rebuilds the window from scratch every call, so a warm reboot (INT 19h
-    /// re-enters this through setup_toka_dos_base) brings the upper arena back as a
-    /// single free block like the conventional arena, rather than keeping the prior
-    /// session's chain.
+    /// re-enters this) brings the upper arena back as a single free block like the
+    /// conventional arena, rather than keeping the prior session's chain.
     fn furnish_dos_upper_memory(&mut self) -> Result<(), MachineError> {
         self.uma.reset();
         let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
@@ -2320,24 +2077,8 @@ impl Machine {
         Ok(())
     }
 
-    /// Set the CPU to a loaded program's entry: CS:IP, SS:SP, DS, ES, and a
-    /// real-mode eflags with IF set, matching real DOS which hands control with
-    /// interrupts enabled so the keyboard ISR can run while a program polls.
-    fn apply_program_entry(&mut self, entry: izarravm_dos::ProgramEntry) {
-        let r = &mut self.cpu.registers;
-        r.set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.cs));
-        r.set_segment(SegmentIndex::Ds, SegmentRegister::real(entry.ds));
-        r.set_segment(SegmentIndex::Es, SegmentRegister::real(entry.es));
-        r.set_segment(SegmentIndex::Ss, SegmentRegister::real(entry.ss));
-        r.eip = u32::from(entry.ip);
-        r.set_esp(u32::from(entry.sp));
-        r.eflags = 0x0000_0202; // IF set: DOS programs start with interrupts on
-    }
-
-    /// Set the CPU to a loaded raw program's entry. Identical in effect to
-    /// `apply_program_entry`, kept as a separate copy so `new_raw_program`
-    /// (and this module) never need an `izarravm_dos::ProgramEntry` value —
-    /// `raw_program::ProgramEntry` carries the same six fields independently.
+    /// Set the CPU to a loaded raw program's entry from its six-field
+    /// `raw_program::ProgramEntry` (CS/DS/ES/SS + IP/SP).
     fn apply_raw_program_entry(&mut self, entry: raw_program::ProgramEntry) {
         let r = &mut self.cpu.registers;
         r.set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.cs));
@@ -2347,151 +2088,6 @@ impl Machine {
         r.eip = u32::from(entry.ip);
         r.set_esp(u32::from(entry.sp));
         r.eflags = 0x0000_0202; // IF set: DOS programs start with interrupts on
-    }
-
-    fn invoke_real_mode_interrupt(&mut self, vector: u8) -> Result<(), izarravm_dos::DosError> {
-        let ss_base = self.cpu.registers.segment(SegmentIndex::Ss).base;
-        let old_sp = self.cpu.registers.esp() as u16;
-        let old_flags = self.cpu.registers.eflags as u16;
-        let old_cs = self.cpu.registers.segment(SegmentIndex::Cs).selector;
-        let old_ip = self.cpu.registers.eip as u16;
-
-        let mut sp = old_sp.wrapping_sub(2);
-        self.memory
-            .write_u16((ss_base + u32::from(sp)) as usize, old_flags)?;
-        sp = sp.wrapping_sub(2);
-        self.memory
-            .write_u16((ss_base + u32::from(sp)) as usize, old_cs)?;
-        sp = sp.wrapping_sub(2);
-        self.memory
-            .write_u16((ss_base + u32::from(sp)) as usize, old_ip)?;
-
-        let vector_base = usize::from(vector) * 4;
-        let ip = self.memory.read_u16(vector_base)?;
-        let cs = self.memory.read_u16(vector_base + 2)?;
-
-        let r = &mut self.cpu.registers;
-        r.set_esp((r.esp() & 0xffff_0000) | u32::from(sp));
-        r.eflags &= !0x0000_0300; // clear IF and TF for interrupt entry
-        r.set_segment(SegmentIndex::Cs, SegmentRegister::real(cs));
-        r.eip = u32::from(ip);
-        Ok(())
-    }
-
-    fn invoke_critical_error_call(
-        &mut self,
-        call: izarravm_dos::CriticalErrorCall,
-        pending: PendingCriticalError,
-    ) -> Result<(), izarravm_dos::DosError> {
-        let ss_base = self.cpu.registers.segment(SegmentIndex::Ss).base;
-        let old_sp = self.cpu.registers.esp() as u16;
-        let old_flags = self.cpu.registers.eflags as u16;
-
-        let mut sp = old_sp.wrapping_sub(2);
-        self.memory
-            .write_u16((ss_base + u32::from(sp)) as usize, old_flags)?;
-        sp = sp.wrapping_sub(2);
-        self.memory
-            .write_u16((ss_base + u32::from(sp)) as usize, 0)?;
-        sp = sp.wrapping_sub(2);
-        self.memory.write_u16(
-            (ss_base + u32::from(sp)) as usize,
-            BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS as u16,
-        )?;
-
-        let regs = call.regs;
-        let r = &mut self.cpu.registers;
-        r.set_eax((r.eax() & 0xffff_0000) | u32::from(regs.ax));
-        r.set_esi((r.esi() & 0xffff_0000) | u32::from(regs.si));
-        r.set_edi((r.edi() & 0xffff_0000) | u32::from(regs.di));
-        r.set_ebp((r.ebp() & 0xffff_0000) | u32::from(regs.bp));
-        r.set_esp((r.esp() & 0xffff_0000) | u32::from(sp));
-        r.eflags &= !0x0000_0300;
-        r.set_segment(
-            SegmentIndex::Cs,
-            SegmentRegister::real(call.handler.segment),
-        );
-        r.eip = u32::from(call.handler.offset);
-        self.pending_critical_error = Some(pending);
-        Ok(())
-    }
-
-    fn finish_pending_critical_error_trampoline(&mut self) -> bool {
-        let Some(pending) = self.pending_critical_error else {
-            return false;
-        };
-        let cs = self.cpu.registers.cs().selector;
-        let ip = self.cpu.registers.eip as u16;
-        if !self.cpu.halted || cs != 0 || ip != BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS as u16 + 1 {
-            return false;
-        }
-
-        self.cpu.halted = false;
-        self.pending_critical_error = None;
-        let handler_al = self.cpu.registers.eax() as u8;
-        let response = self.dos.finish_critical_error(handler_al);
-        self.apply_critical_error_response(pending, response);
-        true
-    }
-
-    fn apply_critical_error_response(
-        &mut self,
-        pending: PendingCriticalError,
-        response: izarravm_dos::CriticalErrorResponse,
-    ) {
-        match pending {
-            PendingCriticalError::AbsoluteDisk { return_to, ax } => {
-                match response {
-                    izarravm_dos::CriticalErrorResponse::Ignore
-                    | izarravm_dos::CriticalErrorResponse::Retry
-                    | izarravm_dos::CriticalErrorResponse::Abort
-                    | izarravm_dos::CriticalErrorResponse::Fail => {
-                        self.set_ax(ax);
-                        self.set_int_frame_carry(true);
-                    }
-                }
-                let r = &mut self.cpu.registers;
-                r.set_segment(SegmentIndex::Cs, SegmentRegister::real(return_to.segment));
-                r.eip = u32::from(return_to.offset);
-            }
-        }
-    }
-
-    fn start_int25_26_critical_error(
-        &mut self,
-        drive: u8,
-        error_code: u8,
-        write: bool,
-        area: izarravm_dos::CriticalErrorArea,
-        device_header: izarravm_dos::FarPtr,
-        ax: u16,
-    ) {
-        let return_to = izarravm_dos::FarPtr {
-            segment: self.cpu.registers.cs().selector,
-            offset: self.cpu.registers.eip as u16,
-        };
-        let pending = PendingCriticalError::AbsoluteDisk { return_to, ax };
-        let request =
-            izarravm_dos::CriticalErrorRequest::disk(drive, error_code, write, area, device_header);
-        let Ok(call) = self.dos.begin_critical_error(&mut self.memory, request) else {
-            self.apply_critical_error_response(pending, izarravm_dos::CriticalErrorResponse::Fail);
-            return;
-        };
-        let default_int24_handler = izarravm_dos::FarPtr {
-            segment: 0,
-            offset: DOS_INT24_DEFAULT_STUB_ADDRESS as u16,
-        };
-        if call.handler == izarravm_dos::FarPtr::default() || call.handler == default_int24_handler
-        {
-            let response = self.dos.finish_critical_error(0x03);
-            self.apply_critical_error_response(pending, response);
-            return;
-        }
-        if self.invoke_critical_error_call(call, pending).is_err() {
-            self.pending_critical_error = None;
-            let response = self.dos.finish_critical_error(0x03);
-            self.apply_critical_error_response(pending, response);
-        }
     }
 
     /// Install the resident keyboard BIOS for the DOS machine: point IVT[09h] and
@@ -2734,6 +2330,7 @@ impl Machine {
             pending_mode: &mut self.pending_mode,
             fast_post: self.fast_post,
             booter_inert: self.booter_inert,
+            program_runtime: self.program_runtime,
             pending_toka_service: &mut self.pending_toka_service,
             toka_service_status: self.toka_service_status,
             unittester: &mut self.unittester,
@@ -5305,18 +4902,9 @@ impl Machine {
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
             return;
         }
-        // No bootable floppy: try the C: Toka-DOS HLE boot. A zero status means the
-        // boot record landed at 0x7C00 and the DOS base is set up; jump to it.
-        if self.toka_load_boot_record() == 0 {
-            self.cpu.registers.set_edx(0x80); // DL = 80h: booted from fixed disk C:
-            // The bundled Toka-DOS is the OS, so the HLE is live again. Clearing
-            // here is what makes a warm reboot from C: take the machine back from
-            // a booter floppy that set the flag on a previous INT 19h.
-            self.booter_inert = false;
-            self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
-            return;
-        }
-        // Nothing bootable: hand off to the diskless/no-boot path.
+        // Nothing bootable (no signed floppy or ATA MBR): the Rust Toka-DOS HLE
+        // boot fallback was retired in SP-3, so hand off to the diskless/no-boot
+        // path exactly like the firmware's .disk_absent branch.
         self.handle_int18();
     }
 
@@ -5380,42 +4968,6 @@ impl Machine {
     fn set_ah(&mut self, ah: u8) {
         let eax = (self.cpu.registers.eax() & !0xFF00) | (u32::from(ah) << 8);
         self.cpu.registers.set_eax(eax);
-    }
-
-    /// Service INT 2Ah. The network installation check reports absent, direct
-    /// disk I/O is allowed, and DOS critical-section/keyboard-busy notifications
-    /// are no-ops in this single-tasking box.
-    fn handle_int2a(&mut self) {
-        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
-        let ax = self.cpu.registers.eax() as u16;
-        match ax {
-            _ if ah == 0x00 => {
-                self.set_eax_ah(0x00);
-                self.set_int_frame_carry(false);
-            }
-            0x0300 => {
-                self.set_int_frame_carry(false);
-            }
-            0x0500 => {
-                self.set_ax(0x0000);
-                self.set_bx(0x0000);
-                self.set_cx(0x0000);
-                self.set_dx(0x0000);
-                self.set_int_frame_carry(false);
-            }
-            _ if ah == 0x04 => {
-                self.set_ax(0x0101);
-                self.set_int_frame_carry(false);
-            }
-            _ if ah == 0x06 => {
-                self.set_ax(0x0001);
-                self.set_int_frame_carry(true);
-            }
-            _ if matches!(ah, 0x80 | 0x81 | 0x82 | 0x84) => {
-                self.set_int_frame_carry(false);
-            }
-            _ => {}
-        }
     }
 
     fn handle_absent_resident_api(&mut self, vector: u8) {
@@ -5505,47 +5057,6 @@ impl Machine {
         }
     }
 
-    fn handle_int2e(&mut self) -> Result<Option<u8>, izarravm_dos::DosError> {
-        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
-        let si = self.cpu.registers.esi() as u16;
-        let len = self.read_physical_u8(ds + u32::from(si)).min(123);
-        let command = self.read_guest_block(ds + u32::from(si.wrapping_add(1)), usize::from(len));
-
-        let scratch_seg = SYSINIT_SCRATCH_STACK_SEG;
-        let scratch = DEVICE_REQUEST_SCRATCH as u32;
-        let path_off = 0x0000u16;
-        let tail_off = 0x0020u16;
-        let epb_off = 0x00b0u16;
-        let mut tail = Vec::with_capacity(usize::from(len) + 5);
-        tail.extend_from_slice(b" /C ");
-        tail.extend_from_slice(&command);
-
-        self.write_guest_block(scratch + u32::from(path_off), b"C:\\DOS\\IZCMD.COM\0");
-        self.write_physical_u8(scratch + u32::from(tail_off), tail.len() as u8);
-        self.write_guest_block(scratch + u32::from(tail_off) + 1, &tail);
-        self.write_physical_u8(scratch + u32::from(tail_off) + 1 + tail.len() as u32, 0x0d);
-        self.write_physical_u16(scratch + u32::from(epb_off), 0);
-        self.write_physical_u16(scratch + u32::from(epb_off) + 2, tail_off);
-        self.write_physical_u16(scratch + u32::from(epb_off) + 4, scratch_seg);
-        self.write_physical_u16(scratch + u32::from(epb_off) + 6, 0);
-        self.write_physical_u16(scratch + u32::from(epb_off) + 8, 0);
-        self.write_physical_u16(scratch + u32::from(epb_off) + 0x0a, 0);
-        self.write_physical_u16(scratch + u32::from(epb_off) + 0x0c, 0);
-
-        // Run a transient IZCMD /C child until IZCMD grows a true resident
-        // INT 2Eh entry point.
-        self.cpu.registers.set_eax(0x4b00);
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(scratch_seg));
-        self.cpu.registers.set_edx(u32::from(path_off));
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(scratch_seg));
-        self.cpu.registers.set_ebx(u32::from(epb_off));
-        self.handle_dos_int(0x21)
-    }
-
     /// Service the DOS-owned and IZCDEX functions of `INT 2Fh` (the multiplex
     /// interrupt) as HLE bridges. Unrecognized AX values fall through unchanged
     /// so other INT 2Fh consumers are unaffected. Returns true if the bridge
@@ -5553,581 +5064,6 @@ impl Machine {
     fn handle_int2f(&mut self) -> bool {
         let ax = self.cpu.registers.eax() as u16;
         match ax {
-            // DOS 3.0+ internal-services installation check. AL=FFh follows the
-            // common multiplex convention and lets internal helper probes detect
-            // that the DOS 12xx group is present.
-            0x1200 => {
-                self.set_eax_al(0xff);
-                true
-            }
-            // DOS 3.0+ internal: get DOS data segment. Our DOS data image is the
-            // live SysVars paragraph refreshed by AH=52h.
-            0x1203 => {
-                let Some((seg, _)) = self.refresh_dos_sysvars() else {
-                    return false;
-                };
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
-                true
-            }
-            // DOS 3.0+ internal: get interrupt vector whose number is on the
-            // caller's stack.
-            0x1202 => {
-                let vector = self.int2f_stack_word() as u8;
-                let ivt = u32::from(vector) * 4;
-                let off = self.read_guest_word(ivt);
-                let seg = self.read_guest_word(ivt + 2);
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
-                self.set_bx(off);
-                true
-            }
-            // DOS 3.0+ internal: normalize a path separator passed on the stack.
-            0x1204 => {
-                let ch = self.int2f_stack_word() as u8;
-                let separator = ch == b'/' || ch == b'\\';
-                self.set_eax_al(if ch == b'/' { b'\\' } else { ch });
-                self.set_int_frame_zero(separator);
-                true
-            }
-            // DOS 3.0+ internal: output character passed on the stack to STDOUT.
-            0x1205 => {
-                let ch = self.int2f_stack_word() as u8;
-                self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
-                    ax: 0x0200,
-                    dx: u16::from(ch),
-                    ..self.cpu_dos_regs()
-                })
-            }
-            // DOS 3.0+ internal: close current file via the SDA's current SFT
-            // pointer. The HLE does not keep that transient SDA field, so there is
-            // no current file to close.
-            0x1201 => {
-                self.set_ax(0x0006);
-                self.set_int_frame_carry(true);
-                true
-            }
-            // DOS 3.0+ internal critical-error helpers. No nested INT 24h dialog
-            // is active here, so answer Fail/do-not-retry deterministically.
-            0x1206 => {
-                self.set_eax_al(0x03);
-                true
-            }
-            0x120A => {
-                self.set_eax_al(0x03);
-                self.set_int_frame_carry(true);
-                true
-            }
-            0x120B => {
-                self.set_ax(0x0020);
-                self.set_int_frame_carry(true);
-                true
-            }
-            // DOS 3.0+ internal disk-buffer helpers. Toka-DOS writes through to the
-            // mounted host files and block devices, so there is no DOS buffer chain.
-            0x1207 | 0x1209 | 0x120C | 0x1215 => true,
-            0x120E | 0x120F => {
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
-                let edi = self.cpu.registers.edi() & !0xFFFF;
-                self.cpu.registers.set_edi(edi);
-                true
-            }
-            0x1210 => {
-                self.set_int_frame_zero(true);
-                true
-            }
-            // DOS 3.0+ internal: decrement the reference count at ES:DI SFT.
-            0x1208 => {
-                let sft = self.cpu.registers.segment(SegmentIndex::Es).base
-                    + u32::from(self.cpu.registers.edi() as u16);
-                let original = self.read_guest_word(sft);
-                let next = match original {
-                    0 => 0,
-                    1 => 0xffff,
-                    n => n - 1,
-                };
-                self.write_physical_u16(sft, next);
-                self.set_ax(original);
-                true
-            }
-            // DOS 3.0+ internal: return current date and time in packed DOS file
-            // timestamp format.
-            0x120D => {
-                let mut date = izarravm_dos::DosRegs {
-                    ax: 0x2a00,
-                    ..izarravm_dos::DosRegs::default()
-                };
-                let mut time = izarravm_dos::DosRegs {
-                    ax: 0x2c00,
-                    ..izarravm_dos::DosRegs::default()
-                };
-                if !self.dispatch_int21_no_marshal(&mut date)
-                    || !self.dispatch_int21_no_marshal(&mut time)
-                {
-                    return false;
-                }
-                let year = date.cx.saturating_sub(1980).min(127);
-                let month = (date.dx >> 8) & 0x0f;
-                let day = date.dx & 0x1f;
-                let hour = (time.cx >> 8) & 0x1f;
-                let minute = time.cx & 0x3f;
-                let second = ((time.dx >> 8) / 2) & 0x1f;
-                self.set_ax((year << 9) | (month << 5) | day);
-                self.set_dx((hour << 11) | (minute << 5) | second);
-                true
-            }
-            // DOS 3.0+ internal: get SFT entry for the file handle in BX. Resolve
-            // through the current PSP's JFT before indexing the AH=52h SFT table.
-            0x1216 => {
-                if let Some((seg, off)) = self.sft_entry_for_handle(self.cpu.registers.ebx() as u16)
-                {
-                    self.cpu
-                        .registers
-                        .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
-                    let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
-                    self.cpu.registers.set_edi(edi);
-                    self.set_int_frame_carry(false);
-                } else {
-                    self.set_ax(0x0006);
-                    self.set_int_frame_carry(true);
-                }
-                true
-            }
-            // DOS 3.0+ internal: normalize ASCIZ filename, uppercasing and turning
-            // forward slashes into backslashes without making the path absolute.
-            0x1211 => {
-                let mut src = self.cpu.registers.segment(SegmentIndex::Ds).base
-                    + (self.cpu.registers.esi() as u16) as u32;
-                let mut dst = self.cpu.registers.segment(SegmentIndex::Es).base
-                    + (self.cpu.registers.edi() as u16) as u32;
-                for _ in 0..=u16::MAX {
-                    let byte = self.read_physical_u8(src);
-                    let out = if byte == b'/' {
-                        b'\\'
-                    } else {
-                        byte.to_ascii_uppercase()
-                    };
-                    self.write_physical_u8(dst, out);
-                    src = src.wrapping_add(1);
-                    dst = dst.wrapping_add(1);
-                    if byte == 0 {
-                        break;
-                    }
-                }
-                true
-            }
-            // DOS 3.0+ internal: get length of ASCIIZ string at ES:DI.
-            0x1212 => {
-                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                let di = self.cpu.registers.edi() as u16;
-                let len = self.asciz_len(es + u32::from(di));
-                self.set_cx(len);
-                true
-            }
-            // DOS 3.0+ internal: uppercase a character passed on the stack.
-            0x1213 => {
-                let ch = self.int2f_stack_word() as u8;
-                self.set_eax_al(ch.to_ascii_uppercase());
-                true
-            }
-            // DOS 3.0+ internal: compare DS:SI and ES:DI as far pointers.
-            0x1214 => {
-                let equal = self.cpu.registers.segment(SegmentIndex::Ds).selector
-                    == self.cpu.registers.segment(SegmentIndex::Es).selector
-                    && (self.cpu.registers.esi() as u16) == (self.cpu.registers.edi() as u16);
-                self.set_int_frame_zero(equal);
-                self.set_int_frame_carry(!equal);
-                true
-            }
-            // DOS 3.0+ internal: get CDS for the drive number on the stack.
-            0x1217 => {
-                let drive = self.int2f_stack_word();
-                if let Some((seg, off)) = self.cds_entry_for_drive(drive) {
-                    self.cpu
-                        .registers
-                        .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
-                    let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(off);
-                    self.cpu.registers.set_esi(esi);
-                    self.set_int_frame_carry(false);
-                } else {
-                    self.set_ax(0x000f);
-                    self.set_int_frame_carry(true);
-                }
-                true
-            }
-            // DOS 3.0+ internal: return a saved caller-register image.
-            0x1218 => {
-                let frame = [
-                    self.cpu.registers.eax() as u16,
-                    self.cpu.registers.ebx() as u16,
-                    self.cpu.registers.ecx() as u16,
-                    self.cpu.registers.edx() as u16,
-                    self.cpu.registers.esi() as u16,
-                    self.cpu.registers.edi() as u16,
-                    self.cpu.registers.ebp() as u16,
-                    self.cpu.registers.segment(SegmentIndex::Ds).selector,
-                    self.cpu.registers.segment(SegmentIndex::Es).selector,
-                ];
-                let base = (u32::from(DOS_INT2F_REGS_SEG) << 4) + u32::from(DOS_INT2F_REGS_OFF);
-                for (index, value) in frame.into_iter().enumerate() {
-                    self.write_physical_u16(base + (index as u32) * 2, value);
-                }
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(DOS_INT2F_REGS_SEG));
-                let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(DOS_INT2F_REGS_OFF);
-                self.cpu.registers.set_esi(esi);
-                true
-            }
-            // DOS 3.0+ internal: select/resolve a drive. Drive 0 means default.
-            0x1219 => {
-                let raw = self.int2f_stack_word();
-                let drive = if raw == 0 { 2 } else { raw.saturating_sub(1) };
-                if let Some((seg, off)) = self.cds_entry_for_drive(drive) {
-                    self.cpu
-                        .registers
-                        .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
-                    let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(off);
-                    self.cpu.registers.set_esi(esi);
-                    self.set_int_frame_carry(false);
-                } else {
-                    self.set_ax(0x000f);
-                    self.set_int_frame_carry(true);
-                }
-                true
-            }
-            // DOS 3.0+ internal: get current process JFT byte for handle in BX.
-            0x1220 => {
-                if let Some((seg, off)) = self.jft_entry_for_handle(self.cpu.registers.ebx() as u16)
-                {
-                    self.cpu
-                        .registers
-                        .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
-                    let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
-                    self.cpu.registers.set_edi(edi);
-                    self.set_int_frame_carry(false);
-                } else {
-                    self.set_eax_al(0x06);
-                    self.set_int_frame_carry(true);
-                }
-                true
-            }
-            // DOS 3.0+ internal: parse an optional leading drive from DS:SI.
-            0x121A => {
-                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
-                let si = self.cpu.registers.esi() as u16;
-                let addr = ds + u32::from(si);
-                let first = self.read_physical_u8(addr);
-                let second = self.read_physical_u8(addr + 1);
-                let al = if second == b':' {
-                    if first.is_ascii_alphabetic() {
-                        let drive = first.to_ascii_uppercase() - b'A' + 1;
-                        let esi =
-                            (self.cpu.registers.esi() & !0xFFFF) | u32::from(si.wrapping_add(2));
-                        self.cpu.registers.set_esi(esi);
-                        drive
-                    } else {
-                        0xff
-                    }
-                } else {
-                    0
-                };
-                self.set_eax_al(al);
-                true
-            }
-            // DOS 3.0+ internal: compute February length for year 1980+CL.
-            0x121B => {
-                let year = 1980 + u16::from(self.cpu.registers.ecx() as u8);
-                let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-                self.set_eax_al(if leap { 29 } else { 28 });
-                true
-            }
-            // DOS 3.0+ internal: 16-bit additive checksum over CX bytes.
-            0x121C => {
-                let count = self.cpu.registers.ecx() as u16;
-                let mut addr = self.cpu.registers.segment(SegmentIndex::Ds).base
-                    + (self.cpu.registers.esi() as u16) as u32;
-                let mut sum = self.cpu.registers.edx() as u16;
-                for _ in 0..count {
-                    sum = sum.wrapping_add(u16::from(self.read_physical_u8(addr)));
-                    addr = addr.wrapping_add(1);
-                }
-                self.set_dx(sum);
-                self.set_cx(0);
-                let si = (self.cpu.registers.esi() as u16).wrapping_add(count);
-                let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(si);
-                self.cpu.registers.set_esi(esi);
-                true
-            }
-            // DOS 3.0+ internal: sum bytes until the next byte would exceed DX.
-            0x121D => {
-                let mut addr = self.cpu.registers.segment(SegmentIndex::Ds).base
-                    + (self.cpu.registers.esi() as u16) as u32;
-                let start_si = self.cpu.registers.esi() as u16;
-                let mut remaining = self.cpu.registers.edx() as u16;
-                let mut count = 0u16;
-                for _ in 0..=u16::MAX {
-                    let byte = self.read_physical_u8(addr);
-                    if u16::from(byte) > remaining {
-                        self.set_eax_al(byte);
-                        self.set_cx(count);
-                        self.set_dx(remaining);
-                        let si = start_si.wrapping_add(count).wrapping_add(1);
-                        let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(si);
-                        self.cpu.registers.set_esi(esi);
-                        return true;
-                    }
-                    remaining = remaining.wrapping_sub(u16::from(byte));
-                    count = count.wrapping_add(1);
-                    addr = addr.wrapping_add(1);
-                }
-                let si = start_si.wrapping_add(count);
-                let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(si);
-                self.cpu.registers.set_esi(esi);
-                self.set_cx(count);
-                self.set_dx(remaining);
-                self.set_eax_al(0);
-                true
-            }
-            // DOS 3.0+ internal: compare two ASCIZ filenames after DOS-style case
-            // and slash normalization.
-            0x121E => {
-                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
-                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                let mut left = ds + u32::from(self.cpu.registers.esi() as u16);
-                let mut right = es + u32::from(self.cpu.registers.edi() as u16);
-                let mut equal = true;
-                for _ in 0..=u16::MAX {
-                    let a = normalize_dos_name_byte(self.read_physical_u8(left));
-                    let b = normalize_dos_name_byte(self.read_physical_u8(right));
-                    if a != b {
-                        equal = false;
-                        break;
-                    }
-                    if a == 0 {
-                        break;
-                    }
-                    left = left.wrapping_add(1);
-                    right = right.wrapping_add(1);
-                }
-                self.set_int_frame_zero(equal);
-                true
-            }
-            // DOS 3.0+ internal: build CDS for the drive named on the stack.
-            0x121F => {
-                let raw = self.int2f_stack_word();
-                let drive = match raw as u8 {
-                    b'a'..=b'z' => u16::from(raw as u8 - b'a'),
-                    b'A'..=b'Z' => u16::from(raw as u8 - b'A'),
-                    _ => raw,
-                };
-                if let Some((seg, off)) = self.cds_entry_for_drive(drive) {
-                    self.cpu
-                        .registers
-                        .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
-                    let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
-                    self.cpu.registers.set_edi(edi);
-                    self.set_int_frame_carry(false);
-                } else {
-                    self.set_ax(0x000f);
-                    self.set_int_frame_carry(true);
-                }
-                true
-            }
-            // DOS 3.0+ internal: canonicalize filename, same result as INT 21h
-            // AH=60h.
-            0x1221 => {
-                let mut regs = izarravm_dos::DosRegs {
-                    ax: 0x6000,
-                    ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-                    si: self.cpu.registers.esi() as u16,
-                    es: self.cpu.registers.segment(SegmentIndex::Es).selector,
-                    di: self.cpu.registers.edi() as u16,
-                    ..izarravm_dos::DosRegs::default()
-                };
-                if self.dos.dispatch(0x21, &mut regs, &mut self.memory).is_ok() {
-                    self.set_ax(regs.ax);
-                    self.set_int_frame_carry(regs.cf);
-                    true
-                } else {
-                    false
-                }
-            }
-            // DOS 3.0+ internal: check whether the current SDA filename is a
-            // character device. The extended SDA filename buffer is not modeled, so
-            // report "not a device" instead of consulting stale memory.
-            0x1223 => {
-                self.set_int_frame_carry(true);
-                true
-            }
-            // DOS 3.3+ internal: open file, equivalent to INT 21h AH=3Dh with
-            // access in CL.
-            0x1226 => self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
-                ax: 0x3d00 | u16::from(self.cpu.registers.ecx() as u8),
-                dx: self.cpu.registers.edx() as u16,
-                ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-                ..self.cpu_dos_regs()
-            }),
-            // DOS 3.3+ internal: close file, equivalent to INT 21h AH=3Eh.
-            0x1227 => self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
-                ax: 0x3e00,
-                bx: self.cpu.registers.ebx() as u16,
-                ..self.cpu_dos_regs()
-            }),
-            // DOS 3.3+ internal: move file pointer, equivalent to INT 21h AH=42h
-            // with the full AX supplied in BP.
-            0x1228 if (0x4200..=0x4202).contains(&(self.cpu.registers.ebp() as u16)) => self
-                .dispatch_int21_from_int2f(izarravm_dos::DosRegs {
-                    ax: self.cpu.registers.ebp() as u16,
-                    bx: self.cpu.registers.ebx() as u16,
-                    cx: self.cpu.registers.ecx() as u16,
-                    dx: self.cpu.registers.edx() as u16,
-                    ..self.cpu_dos_regs()
-                }),
-            0x1228 => {
-                self.set_ax(0x0001);
-                self.set_int_frame_carry(true);
-                true
-            }
-            // DOS 3.3+ internal: read file, equivalent to INT 21h AH=3Fh.
-            0x1229 => self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
-                ax: 0x3f00,
-                bx: self.cpu.registers.ebx() as u16,
-                cx: self.cpu.registers.ecx() as u16,
-                dx: self.cpu.registers.edx() as u16,
-                ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-                ..self.cpu_dos_regs()
-            }),
-            // DOS 3.3+ internal: install FASTOPEN entry point. FASTOPEN is absent,
-            // but accepting the registration lets the TSR load without changing
-            // normal file semantics.
-            0x122A => {
-                self.set_int_frame_carry(false);
-                true
-            }
-            // DOS 3.3+ internal: get device chain, returning the header after NUL.
-            0x122C => {
-                let Some((seg, off)) = self.refresh_dos_sysvars() else {
-                    return false;
-                };
-                let nul = (u32::from(seg) << 4) + u32::from(off.wrapping_add(0x22));
-                let next_off = self.read_guest_word(nul);
-                let next_seg = self.read_guest_word(nul + 2);
-                self.set_ax(next_off);
-                self.set_bx(next_seg);
-                true
-            }
-            // DOS 3.0+ internal: sharing retry delay. In this single-tasking DOS
-            // model no SHARE retry loop is pending, so the delay completes
-            // immediately.
-            0x1224 => true,
-            // DOS 3.0+ internal: update extended-error class/action/locus from the
-            // caller's record table at SS:SI.
-            0x1222 => {
-                let ss = self.cpu.registers.segment(SegmentIndex::Ss).selector;
-                let si = self.cpu.registers.esi() as u16;
-                match self.dos.set_extended_error_from_table(&self.memory, ss, si) {
-                    Ok(next_si) => {
-                        let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(next_si);
-                        self.cpu.registers.set_esi(esi);
-                        true
-                    }
-                    Err(_) => false,
-                }
-            }
-            // DOS 3.3+ internal: get current extended error code.
-            0x122D => {
-                let mut regs = izarravm_dos::DosRegs {
-                    ax: 0x5900,
-                    ..izarravm_dos::DosRegs::default()
-                };
-                if self.dispatch_int21_no_marshal(&mut regs) {
-                    self.set_ax(regs.ax);
-                    true
-                } else {
-                    false
-                }
-            }
-            // DOS 3.3+ internal: IOCTL, equivalent to INT 21h AX=44xxh with AX
-            // supplied in BP.
-            0x122B if (self.cpu.registers.ebp() as u16) & 0xff00 == 0x4400 => self
-                .dispatch_int21_from_int2f(izarravm_dos::DosRegs {
-                    ax: self.cpu.registers.ebp() as u16,
-                    bx: self.cpu.registers.ebx() as u16,
-                    cx: self.cpu.registers.ecx() as u16,
-                    dx: self.cpu.registers.edx() as u16,
-                    ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-                    ..self.cpu_dos_regs()
-                }),
-            0x122B => {
-                self.set_ax(0x0001);
-                self.set_int_frame_carry(true);
-                true
-            }
-            // DOS 3.0+ internal: get length of ASCIIZ string at DS:SI.
-            0x1225 => {
-                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
-                let si = self.cpu.registers.esi() as u16;
-                let len = self.asciz_len(ds + u32::from(si));
-                self.set_cx(len);
-                true
-            }
-            // DOS 4.0+ internal: get/set error-table addresses. Toka-DOS keeps
-            // AH=59h state internally and has no resident message tables.
-            0x122E => {
-                if self.cpu.registers.edx() as u8 & 1 == 0 {
-                    self.cpu
-                        .registers
-                        .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
-                    let edi = self.cpu.registers.edi() & !0xFFFF;
-                    self.cpu.registers.set_edi(edi);
-                }
-                self.set_int_frame_carry(false);
-                true
-            }
-            // DOS 4.x internal: set the apparent version returned by INT 21h
-            // AH=30h. DX=0000h restores the true version.
-            0x122F => {
-                self.dos
-                    .set_reported_version_word(self.cpu.registers.edx() as u16);
-                true
-            }
-            // DOS 3.2+ DRIVER.SYS support install check. The backing table is the
-            // DOS 4.x BDS list returned by AX=0803h.
-            0x0800 => {
-                self.set_eax_al(0xff);
-                true
-            }
-            // DOS 3.2+ DRIVER.SYS support: append a guest-supplied BDS entry to
-            // the internal drive data table list.
-            0x0801 => self.int2f_driver_install_bds(),
-            // DOS 3.2+ DRIVER.SYS support: execute a block-device request packet
-            // at ES:BX through the internal disk-driver facade. DOS 4 routes
-            // AL=02h and AL=04h..F7h here; AL=03h is the BDS-list query below.
-            0x0802 | 0x0804..=0x08f7 => {
-                let header = self.cpu.registers.segment(SegmentIndex::Es).base
-                    + u32::from(self.cpu.registers.ebx() as u16);
-                self.int2f_driver_disk_request(header);
-                true
-            }
-            // DOS 4.0+ DRIVER.SYS support: DS:DI -> first drive data table.
-            0x0803 => {
-                let Some((seg, off)) = self.publish_driver_bds_chain() else {
-                    return false;
-                };
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
-                let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
-                self.cpu.registers.set_edi(edi);
-                true
-            }
-            // Reserved DRIVER.SYS functions are consumed by the DOS 4 handler.
-            0x08f8..=0x08ff => true,
             // DOS-owned install checks for resident utilities we do not load.
             // Report "not installed, OK to install" rather than falling through
             // with stale register contents.
@@ -6535,151 +5471,6 @@ impl Machine {
             }
             _ => false,
         }
-    }
-
-    fn refresh_dos_sysvars(&mut self) -> Option<(u16, u16)> {
-        let mut regs = izarravm_dos::DosRegs {
-            ax: 0x5200,
-            ..izarravm_dos::DosRegs::default()
-        };
-        match self.dos.dispatch(0x21, &mut regs, &mut self.memory) {
-            Ok(izarravm_dos::DosAction::Continue) => Some((regs.es, regs.bx)),
-            _ => None,
-        }
-    }
-
-    fn current_dos_psp(&mut self) -> Option<u16> {
-        let mut regs = izarravm_dos::DosRegs {
-            ax: 0x5100,
-            ..izarravm_dos::DosRegs::default()
-        };
-        match self.dos.dispatch(0x21, &mut regs, &mut self.memory) {
-            Ok(izarravm_dos::DosAction::Continue) => Some(regs.bx),
-            _ => None,
-        }
-    }
-
-    fn jft_entry_for_handle(&mut self, handle: u16) -> Option<(u16, u16)> {
-        let psp = self.current_dos_psp()?;
-        let psp_base = u32::from(psp) << 4;
-        let jft_count = self.read_guest_word(psp_base + 0x32);
-        if handle >= jft_count {
-            return None;
-        }
-        let jft_off = self.read_guest_word(psp_base + 0x34);
-        let jft_seg = self.read_guest_word(psp_base + 0x36);
-        Some((jft_seg, jft_off.wrapping_add(handle)))
-    }
-
-    fn sft_entry_for_handle(&mut self, handle: u16) -> Option<(u16, u16)> {
-        const SFT_HEADER_LEN: u16 = 0x06;
-        const SFT_ENTRY_LEN: u16 = 0x3b;
-
-        let (jft_seg, jft_off) = self.jft_entry_for_handle(handle)?;
-        let jft = (u32::from(jft_seg) << 4) + u32::from(jft_off);
-        let slot = self.read_physical_u8(jft);
-        if slot == 0xff {
-            return None;
-        }
-
-        let (list_seg, list_off) = self.refresh_dos_sysvars()?;
-        let list = (u32::from(list_seg) << 4) + u32::from(list_off);
-        let sft_off = self.read_guest_word(list + 0x04);
-        let sft_seg = self.read_guest_word(list + 0x06);
-        let sft = (u32::from(sft_seg) << 4) + u32::from(sft_off);
-        let sft_count = self.read_guest_word(sft + 0x04);
-        if u16::from(slot) >= sft_count {
-            return None;
-        }
-
-        let entry_off = sft_off
-            .checked_add(SFT_HEADER_LEN)?
-            .checked_add(u16::from(slot).checked_mul(SFT_ENTRY_LEN)?)?;
-        Some((sft_seg, entry_off))
-    }
-
-    fn cds_entry_for_drive(&mut self, drive: u16) -> Option<(u16, u16)> {
-        const CDS_ENTRY_LEN: u16 = 0x58;
-
-        let (list_seg, list_off) = self.refresh_dos_sysvars()?;
-        let list = (u32::from(list_seg) << 4) + u32::from(list_off);
-        let lastdrive = self.read_physical_u8(list + 0x21);
-        if drive >= u16::from(lastdrive) {
-            return None;
-        }
-
-        let cds_off = self.read_guest_word(list + 0x16);
-        let cds_seg = self.read_guest_word(list + 0x18);
-        let entry_off = cds_off.checked_add(drive.checked_mul(CDS_ENTRY_LEN)?)?;
-        Some((cds_seg, entry_off))
-    }
-
-    fn dispatch_int21_no_marshal(&mut self, regs: &mut izarravm_dos::DosRegs) -> bool {
-        matches!(
-            self.dos.dispatch(0x21, regs, &mut self.memory),
-            Ok(izarravm_dos::DosAction::Continue)
-        )
-    }
-
-    fn dispatch_int21_from_int2f(&mut self, mut regs: izarravm_dos::DosRegs) -> bool {
-        if !self.dispatch_int21_no_marshal(&mut regs) {
-            return false;
-        }
-        self.apply_dos_regs_to_cpu(&regs);
-        true
-    }
-
-    fn cpu_dos_regs(&self) -> izarravm_dos::DosRegs {
-        izarravm_dos::DosRegs {
-            ax: self.cpu.registers.eax() as u16,
-            bx: self.cpu.registers.ebx() as u16,
-            cx: self.cpu.registers.ecx() as u16,
-            dx: self.cpu.registers.edx() as u16,
-            si: self.cpu.registers.esi() as u16,
-            di: self.cpu.registers.edi() as u16,
-            bp: self.cpu.registers.ebp() as u16,
-            ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-            es: self.cpu.registers.segment(SegmentIndex::Es).selector,
-            cf: self.cpu.registers.eflags & 0x1 != 0,
-            zf: self.cpu.registers.eflags & 0x40 != 0,
-        }
-    }
-
-    fn apply_dos_regs_to_cpu(&mut self, regs: &izarravm_dos::DosRegs) {
-        self.set_ax(regs.ax);
-        self.set_bx(regs.bx);
-        self.set_cx(regs.cx);
-        self.set_dx(regs.dx);
-        let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(regs.si);
-        self.cpu.registers.set_esi(esi);
-        let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(regs.di);
-        self.cpu.registers.set_edi(edi);
-        let ebp = (self.cpu.registers.ebp() & !0xFFFF) | u32::from(regs.bp);
-        self.cpu.registers.set_ebp(ebp);
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(regs.ds));
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(regs.es));
-        self.set_int_frame_carry(regs.cf);
-        self.set_int_frame_zero(regs.zf);
-    }
-
-    fn asciz_len(&mut self, addr: u32) -> u16 {
-        let mut len = 0u16;
-        loop {
-            if self.read_physical_u8(addr + u32::from(len)) == 0 || len == u16::MAX {
-                return len;
-            }
-            len = len.wrapping_add(1);
-        }
-    }
-
-    fn int2f_stack_word(&mut self) -> u16 {
-        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
-        let sp = self.cpu.registers.esp() as u16;
-        self.read_guest_word(ss + u32::from(sp.wrapping_add(6)))
     }
 
     /// Service the XMS driver, reached when a guest FAR-CALLs the entry point
@@ -7450,21 +6241,13 @@ impl Machine {
         self.xms_success();
     }
 
-    /// Service INT 29h (DOS fast console output). The character is in AL; write it to
-    /// the active page through the same teletype path INT 10h AH=0Eh uses, the way
-    /// the DOS CON device's fast-output hook does.
-    fn handle_int29(&mut self) {
-        if self.read_guest_word(0x29 * 4) != 0
-            || self.read_guest_word(0x29 * 4 + 2) != BIOS_ROM_IRET_SEG
-        {
-            return;
-        }
-        let al = self.cpu.registers.eax() as u8;
-        self.teletype_char(al);
-    }
-
     fn icdex_cd_drive_number(&self) -> Option<u8> {
-        self.dos.next_block_device_drive()
+        // The ATAPI CD-ROM sits at a fixed DOS drive letter (D: = 3). With the
+        // Rust DOS kernel retired there are no CONFIG.SYS block-device drivers
+        // that could shift it, so the CD drive is always the first loaded block
+        // drive. "No disc" is still a present drive, so this reports the letter
+        // unconditionally (the install check keys off the ATAPI channel existing).
+        Some(CD_DRIVE_NUMBER)
     }
 
     fn icdex_drive_matches(&self, drive: u16) -> bool {
@@ -7654,287 +6437,6 @@ impl Machine {
         u32::from_le_bytes(bytes)
     }
 
-    fn driver_request_far_ptr(&mut self, header: u32, offset: u32) -> izarravm_dos::FarPtr {
-        izarravm_dos::FarPtr {
-            offset: self.read_guest_word(header + offset),
-            segment: self.read_guest_word(header + offset + 2),
-        }
-    }
-
-    fn driver_request_linear(&mut self, header: u32, offset: u32) -> u32 {
-        let ptr = self.driver_request_far_ptr(header, offset);
-        (u32::from(ptr.segment) << 4).wrapping_add(u32::from(ptr.offset))
-    }
-
-    fn driver_request_start_lba(&mut self, header: u32) -> u32 {
-        let len = self.read_physical_u8(header);
-        let word = self.read_guest_word(header + 0x14);
-        if len == 0x1e && word == 0xffff {
-            self.read_guest_dword(header + 0x1a)
-        } else if len == 0x18 {
-            self.read_guest_dword(header + 0x14)
-        } else {
-            u32::from(word)
-        }
-    }
-
-    fn publish_driver_bds_chain(&mut self) -> Option<(u16, u16)> {
-        let first = self.dos.publish_driver_bds(&mut self.memory).ok()?;
-        self.link_external_driver_bds(first);
-        for entry in self.external_driver_bds.clone() {
-            self.mark_shared_driver_bds(first, entry);
-        }
-        Some(first)
-    }
-
-    fn link_external_driver_bds(&mut self, first: (u16, u16)) {
-        let entries = self.external_driver_bds.clone();
-        let Some(&head) = entries.first() else {
-            return;
-        };
-        let Some(tail) = self.driver_bds_tail(first) else {
-            return;
-        };
-        self.write_driver_bds_link(tail, head);
-        for (index, &entry) in entries.iter().enumerate() {
-            let next = entries.get(index + 1).copied().unwrap_or((0xffff, 0xffff));
-            self.write_driver_bds_link(entry, next);
-        }
-    }
-
-    fn driver_bds_tail(&mut self, first: (u16, u16)) -> Option<(u16, u16)> {
-        let (mut seg, mut off) = first;
-        for _ in 0..32 {
-            if (seg, off) == (0xffff, 0xffff) {
-                return None;
-            }
-            let linear = (u32::from(seg) << 4) + u32::from(off);
-            let next_off = self.read_guest_word(linear);
-            let next_seg = self.read_guest_word(linear + 2);
-            if (next_seg, next_off) == (0xffff, 0xffff) {
-                return Some((seg, off));
-            }
-            seg = next_seg;
-            off = next_off;
-        }
-        None
-    }
-
-    fn write_driver_bds_link(&mut self, entry: (u16, u16), next: (u16, u16)) {
-        let linear = (u32::from(entry.0) << 4) + u32::from(entry.1);
-        self.write_physical_u16(linear, next.1);
-        self.write_physical_u16(linear + 2, next.0);
-    }
-
-    fn int2f_driver_install_bds(&mut self) -> bool {
-        let seg = self.cpu.registers.segment(SegmentIndex::Ds).selector;
-        let off = self.cpu.registers.edi() as u16;
-        let entry = (seg, off);
-        if entry == (0xffff, 0xffff) {
-            return true;
-        }
-        if !self.external_driver_bds.contains(&entry) {
-            self.external_driver_bds.push(entry);
-        }
-        self.publish_driver_bds_chain().is_some()
-    }
-
-    fn mark_shared_driver_bds(&mut self, first: (u16, u16), new_entry: (u16, u16)) {
-        const FCHANGELINE: u16 = 0x0002;
-        const FI_AM_MULT: u16 = 0x0010;
-        const FI_OWN_PHYSICAL: u16 = 0x0020;
-
-        let new_linear = (u32::from(new_entry.0) << 4) + u32::from(new_entry.1);
-        let unit = self.read_physical_u8(new_linear + 0x04);
-        let mut new_flags = self.read_guest_word(new_linear + 0x23);
-        let (mut seg, mut off) = first;
-        for _ in 0..32 {
-            if (seg, off) == (0xffff, 0xffff) || (seg, off) == new_entry {
-                break;
-            }
-            let linear = (u32::from(seg) << 4) + u32::from(off);
-            if self.read_physical_u8(linear + 0x04) == unit {
-                let flags = self.read_guest_word(linear + 0x23) | FI_AM_MULT;
-                self.write_physical_u16(linear + 0x23, flags);
-                new_flags |= FI_AM_MULT | (flags & FCHANGELINE);
-                new_flags &= !FI_OWN_PHYSICAL;
-            }
-            let next_off = self.read_guest_word(linear);
-            let next_seg = self.read_guest_word(linear + 2);
-            seg = next_seg;
-            off = next_off;
-        }
-        self.write_physical_u16(new_linear + 0x23, new_flags);
-    }
-
-    fn driver_bds_for_unit(&mut self, unit: u8) -> Option<(u16, u16, u8)> {
-        let (mut seg, mut off) = self.publish_driver_bds_chain()?;
-        for _ in 0..32 {
-            if (seg, off) == (0xffff, 0xffff) {
-                return None;
-            }
-            let linear = (u32::from(seg) << 4) + u32::from(off);
-            if self.read_physical_u8(linear + 0x04) == unit {
-                return Some((seg, off, self.read_physical_u8(linear + 0x05)));
-            }
-            let next_off = self.read_guest_word(linear);
-            let next_seg = self.read_guest_word(linear + 2);
-            seg = next_seg;
-            off = next_off;
-        }
-        None
-    }
-
-    fn int2f_driver_disk_request(&mut self, header: u32) {
-        let command = self.read_physical_u8(header + 0x02);
-        let result = match command {
-            // MEDIA CHECK: this HLE does not model change-line state, so media is
-            // stable when the unit exists.
-            0x01 => {
-                let unit = self.read_physical_u8(header + 0x01);
-                if self.driver_bds_for_unit(unit).is_some() {
-                    self.write_physical_u8(header + 0x0e, 0x01);
-                    Ok(())
-                } else {
-                    Err(0x01)
-                }
-            }
-            // BUILD BPB: return a pointer into the matching published BDS entry.
-            0x02 => {
-                let unit = self.read_physical_u8(header + 0x01);
-                if let Some((seg, off, _)) = self.driver_bds_for_unit(unit) {
-                    self.write_physical_u16(header + 0x12, off.wrapping_add(0x06));
-                    self.write_physical_u16(header + 0x14, seg);
-                    Ok(())
-                } else {
-                    Err(0x01)
-                }
-            }
-            0x04 => self.driver_disk_transfer_request(header, false),
-            0x08 | 0x09 => self.driver_disk_transfer_request(header, true),
-            0x0d..=0x0f => Ok(()),
-            _ => Err(0x03),
-        };
-        let status = match result {
-            Ok(()) => 0x0100,
-            Err(code) => 0x8100 | u16::from(code),
-        };
-        self.write_physical_u16(header + 0x03, status);
-    }
-
-    fn driver_disk_transfer_request(&mut self, header: u32, write: bool) -> Result<(), u8> {
-        let unit = self.read_physical_u8(header + 0x01);
-        let Some((_, _, drive)) = self.driver_bds_for_unit(unit) else {
-            return Err(0x01);
-        };
-        let transfer = self.driver_request_far_ptr(header, 0x0e);
-        let count = self.read_guest_word(header + 0x12);
-        let lba = self.driver_request_start_lba(header);
-        if count == 0 {
-            return Ok(());
-        }
-        if drive == 2 {
-            let transfer = self.driver_request_linear(header, 0x0e);
-            return self.driver_c_transfer(write, transfer, count, lba);
-        }
-        let Some(target) = self.dos.block_device_io_target(drive) else {
-            return Err(0x01);
-        };
-        let start = u16::try_from(lba).map_err(|_| 0x08)?;
-        self.block_device_transfer_outcome(target, write, transfer, count, start)
-    }
-
-    fn driver_c_transfer(
-        &mut self,
-        write: bool,
-        transfer: u32,
-        count: u16,
-        lba: u32,
-    ) -> Result<(), u8> {
-        if write && self.fat32_c.is_some() && self.ata.is_none() {
-            return Err(0x00);
-        }
-        if !write && self.fat32_c.is_some() && self.ata.is_none() {
-            for index in 0..count {
-                let sector = self
-                    .fat32_c
-                    .as_ref()
-                    .unwrap()
-                    .read_sector(lba.wrapping_add(u32::from(index)));
-                self.write_guest_block(transfer.wrapping_add(u32::from(index) * 512), &sector);
-            }
-            self.c_accesses += 1;
-            return Ok(());
-        }
-        let total = self.ata.as_ref().map_or(0, |disk| disk.total_sectors());
-        if lba.saturating_add(u32::from(count)) > total {
-            return Err(0x08);
-        }
-        for index in 0..count {
-            let sector_lba = lba + u32::from(index);
-            let addr = transfer.wrapping_add(u32::from(index) * 512);
-            if write {
-                let bytes = self.read_guest_block(addr, 512);
-                if !self
-                    .ata
-                    .as_mut()
-                    .is_some_and(|disk| disk.write_lba(sector_lba, &bytes))
-                {
-                    return Err(0x0a);
-                }
-            } else {
-                let Some(bytes) = self.ata.as_ref().and_then(|disk| disk.read_lba(sector_lba))
-                else {
-                    return Err(0x0b);
-                };
-                self.write_guest_block(addr, &bytes);
-            }
-        }
-        self.c_accesses += 1;
-        Ok(())
-    }
-
-    fn handle_int21_ax7305(&mut self) {
-        let drive = self.cpu.registers.edx() as u8;
-        let flags = self.cpu.registers.esi() as u16;
-        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
-        let bx = self.cpu.registers.ebx() as u16;
-        let packet = ds.wrapping_add(u32::from(bx));
-        let write = flags & 0x0001 != 0;
-
-        if self.cpu.registers.ecx() as u16 != 0xffff
-            || drive == 0
-            || drive != 3
-            || flags & !0x6001 != 0
-            || (!write && flags & 0x6000 != 0)
-        {
-            self.dos.record_last_error(0x0001);
-            self.set_ax(0x0001);
-            self.set_int_frame_carry(true);
-            return;
-        }
-
-        let lba = self.read_guest_dword(packet);
-        let count = self.read_guest_word(packet + 4);
-        let transfer = self.driver_request_linear(packet, 6);
-        match self.driver_c_transfer(write, transfer, count, lba) {
-            Ok(()) => {
-                self.set_ax(0);
-                self.set_int_frame_carry(false);
-            }
-            Err(code) => {
-                let error = if write && code == 0 {
-                    0x0300
-                } else {
-                    u16::from(code)
-                };
-                self.dos.record_last_error(error);
-                self.set_ax(error);
-                self.set_int_frame_carry(true);
-            }
-        }
-    }
-
     /// Consume `secs` of emulated time for a device operation that blocks the
     /// guest (a floppy seek/read). Advancing both the master clock and the devices
     /// by the same amount keeps timekeeping coupled, the way an instruction's own
@@ -8067,235 +6569,6 @@ impl Machine {
     /// report it. 0x00 is success; any other value is the error code.
     fn set_disk_status(&mut self, status: u8) {
         let _ = self.memory.write_u8(0x441, status);
-    }
-
-    /// INT 25h ABSOLUTE DISK READ (DOS). AL=drive (0=A:). The classic form uses
-    /// CX=sector count, DX=first logical sector, DS:BX=buffer. The DOS 3.31+
-    /// packet form uses CX=FFFFh and DS:BX -> DWORD LBA, WORD count, DWORD far
-    /// transfer pointer. On success AX=0 and CF clear; on error CF set and AX holds
-    /// the disk status. Limit: the real INT 25h/26h leave the original FLAGS on the
-    /// stack for the caller to discard with its own POPF, but this HLE returns
-    /// through the standard IRET stub, so the result CF is written into the IRET
-    /// FLAGS image (set_int_frame_carry) like every other host-serviced INT here.
-    fn handle_int25(&mut self) {
-        self.int25_26_transfer(false);
-    }
-
-    /// INT 26h ABSOLUTE DISK WRITE (DOS). Same register layout as INT 25h; the
-    /// DS:BX buffer is the source. See handle_int25 for the FLAGS-frame note.
-    fn handle_int26(&mut self) {
-        self.int25_26_transfer(true);
-    }
-
-    /// Shared body of INT 25h/26h. Converts each logical sector to CHS through the
-    /// mounted floppy geometry and reads or writes it against the DS:BX buffer.
-    fn int25_26_transfer(&mut self, write: bool) {
-        let al = self.cpu.registers.eax() as u8;
-        let count = self.cpu.registers.ecx() as u16;
-        let start_lba = self.cpu.registers.edx() as u16;
-        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
-        let bx = self.cpu.registers.ebx() as u16;
-        let buffer = ds.wrapping_add(u32::from(bx));
-
-        if count == 0xffff {
-            self.int25_26_packet_transfer(write, al, buffer);
-            return;
-        }
-
-        // Drive C: (AL=2) is served by the synthesized FAT32 volume when one is
-        // mounted. Every 16-bit logical sector falls in the first 32 MB of any
-        // FAT32 volume (its sector count exceeds 0xFFFF), so the classic form
-        // addresses a valid sector and never reports out of range here.
-        if al == 0x02 && self.fat32_c.is_some() {
-            if write {
-                self.start_int25_26_critical_error(
-                    al,
-                    0x00,
-                    true,
-                    izarravm_dos::CriticalErrorArea::Data,
-                    izarravm_dos::FarPtr::default(),
-                    0x0300,
-                );
-                return;
-            }
-            // Stream one sector at a time: each read borrows the volume only until
-            // the [u8;512] is returned by value, freeing self for the write, so a
-            // 512-byte buffer suffices rather than materializing up to 32 MB.
-            for i in 0..count {
-                let sector = self
-                    .fat32_c
-                    .as_ref()
-                    .unwrap()
-                    .read_sector(u32::from(start_lba.wrapping_add(i)));
-                let addr = buffer.wrapping_add(u32::from(i) * 512);
-                self.write_guest_block(addr, &sector);
-            }
-            self.set_ax(0);
-            self.set_int_frame_carry(false);
-            return;
-        }
-
-        if count != 0xffff {
-            if let Some(target) = self.dos.block_device_io_target(al) {
-                let transfer = izarravm_dos::FarPtr {
-                    segment: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-                    offset: bx,
-                };
-                match self.block_device_transfer_outcome(target, write, transfer, count, start_lba)
-                {
-                    Ok(()) => {
-                        self.set_ax(0);
-                        self.set_int_frame_carry(false);
-                    }
-                    Err(error_code) => {
-                        self.start_int25_26_critical_error(
-                            al,
-                            error_code,
-                            write,
-                            izarravm_dos::CriticalErrorArea::Data,
-                            target.header,
-                            u16::from(error_code),
-                        );
-                    }
-                }
-                return;
-            }
-        }
-
-        // Only floppy A: is backed. Any other drive, or no media, reports a
-        // drive-not-ready error (AX low byte 0x02 = drive not ready, high byte 0x40
-        // = seek failed, per the DOS error-byte convention).
-        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
-            self.start_int25_26_critical_error(
-                al,
-                0x02,
-                write,
-                izarravm_dos::CriticalErrorArea::Data,
-                izarravm_dos::FarPtr::default(),
-                0x4002,
-            );
-            return;
-        };
-        if al != 0x00 {
-            self.start_int25_26_critical_error(
-                al,
-                0x02,
-                write,
-                izarravm_dos::CriticalErrorArea::Data,
-                izarravm_dos::FarPtr::default(),
-                0x4002,
-            );
-            return;
-        }
-
-        self.floppy_accesses += 1;
-        let spt = u16::from(geom.sectors);
-        let heads = u16::from(geom.heads);
-        let mut last_cyl = 0u16;
-        for i in 0..count {
-            let lba = start_lba.wrapping_add(i);
-            // LBA -> CHS for the mounted geometry. The floppy sector index is 1-based.
-            let sector = (lba % spt) as u8 + 1;
-            let head = ((lba / spt) % heads) as u8;
-            let cyl = lba / spt / heads;
-            last_cyl = cyl;
-            let addr = buffer.wrapping_add(u32::from(i) * 512);
-            if write {
-                let bytes = self.read_guest_block(addr, 512);
-                let ok = self
-                    .floppy
-                    .as_mut()
-                    .map(|f| f.write_sector(cyl, head, sector, &bytes))
-                    .unwrap_or(false);
-                if !ok {
-                    // Sector off the mounted media: sector-not-found (0x40 = seek
-                    // failed, 0x08 = sector not found).
-                    self.start_int25_26_critical_error(
-                        al,
-                        0x08,
-                        true,
-                        izarravm_dos::CriticalErrorArea::Data,
-                        izarravm_dos::FarPtr::default(),
-                        0x4008,
-                    );
-                    return;
-                }
-            } else {
-                let data = self
-                    .floppy
-                    .as_ref()
-                    .and_then(|f| f.read_sector(cyl, head, sector))
-                    .map(<[u8]>::to_vec);
-                match data {
-                    Some(bytes) => self.write_guest_block(addr, &bytes),
-                    None => {
-                        self.start_int25_26_critical_error(
-                            al,
-                            0x08,
-                            false,
-                            izarravm_dos::CriticalErrorArea::Data,
-                            izarravm_dos::FarPtr::default(),
-                            0x4008,
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-
-        // Charge the drive's mechanical time for the access the way INT 13h does.
-        if count > 0 {
-            let bytes = usize::from(count) * 512;
-            let secs = self
-                .floppy
-                .as_mut()
-                .map_or(0.0, |f| f.access_duration_secs(last_cyl, bytes));
-            self.stall_for(secs);
-        }
-
-        self.set_ax(0x0000);
-        self.set_int_frame_carry(false);
-    }
-
-    fn int25_26_packet_transfer(&mut self, write: bool, drive: u8, packet: u32) {
-        let lba = self.read_guest_dword(packet);
-        let count = self.read_guest_word(packet + 4);
-        let transfer = self.driver_request_linear(packet, 6);
-
-        if drive == 0x02 && self.fat32_c.is_some() {
-            self.set_ax(0x0207);
-            self.set_int_frame_carry(true);
-            return;
-        }
-
-        if drive == 0x02 && self.ata.is_some() {
-            match self.driver_c_transfer(write, transfer, count, lba) {
-                Ok(()) => {
-                    self.set_ax(0);
-                    self.set_int_frame_carry(false);
-                }
-                Err(error_code) => {
-                    self.start_int25_26_critical_error(
-                        drive,
-                        error_code,
-                        write,
-                        izarravm_dos::CriticalErrorArea::Data,
-                        izarravm_dos::FarPtr::default(),
-                        0x4000 | u16::from(error_code),
-                    );
-                }
-            }
-            return;
-        }
-
-        self.start_int25_26_critical_error(
-            drive,
-            0x02,
-            write,
-            izarravm_dos::CriticalErrorArea::Data,
-            izarravm_dos::FarPtr::default(),
-            0x4002,
-        );
     }
 
     /// AH=04h verify: confirm the requested sectors are readable without copying
@@ -9107,21 +7380,6 @@ impl Machine {
         }
     }
 
-    /// Set or clear ZF in the FLAGS image the pending IRET stub will pop.
-    fn set_int_frame_zero(&mut self, zero: bool) {
-        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
-        let sp = self.cpu.registers.esp() as u16;
-        let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
-        if let Ok(mut flags) = self.memory.read_u16(flags_addr) {
-            if zero {
-                flags |= 0x0040;
-            } else {
-                flags &= !0x0040;
-            }
-            let _ = self.memory.write_u16(flags_addr, flags);
-        }
-    }
-
     /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. Covers the
     /// set/get forms for the attribute palette (00/01/02/03/07/08/09) and the DAC
     /// (10/12/13/15/17/18/19/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
@@ -9468,7 +7726,7 @@ impl Machine {
                     // Blocking read with an empty ring: rewind the stacked
                     // return IP by 2 so the IRET stub re-enters the same
                     // `CD 21`, and set IF so IRQ1 can run the keyboard ISR
-                    // before the retry. Mirrors handle_dos_int's WaitForKey.
+                    // before the retry (a wait-for-key spin).
                     let ip_addr = (ss + u32::from(sp)) as usize;
                     let ret_ip = self.memory.read_u16(ip_addr)?;
                     self.memory.write_u16(ip_addr, ret_ip.wrapping_sub(2))?;
@@ -9545,197 +7803,13 @@ impl Machine {
         Ok(None)
     }
 
-    /// Service a DOS software interrupt (INT 20h or INT 21h) host-side after the
-    /// instruction retires. The CPU registers are intact here (a software interrupt
-    /// only pushes flags/CS/IP), so the kernel reads and writes them through a
-    /// marshalled DosRegs. IVT[0x20]/[0x21] is an IRET stub, so the next cycle
-    /// returns to the caller with the results in place. DOS services are emulated
-    /// host-side (HLE); the hardware INT path is otherwise real. Returns Some(code)
-    /// when the program should terminate.
-    fn handle_dos_int(&mut self, vector: u8) -> Result<Option<u8>, izarravm_dos::DosError> {
-        let mut regs = izarravm_dos::DosRegs {
-            ax: self.cpu.registers.eax() as u16,
-            bx: self.cpu.registers.ebx() as u16,
-            cx: self.cpu.registers.ecx() as u16,
-            dx: self.cpu.registers.edx() as u16,
-            si: self.cpu.registers.esi() as u16,
-            di: self.cpu.registers.edi() as u16,
-            bp: self.cpu.registers.ebp() as u16,
-            ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
-            es: self.cpu.registers.segment(SegmentIndex::Es).selector,
-            cf: self.cpu.registers.eflags & 0x1 != 0,
-            zf: self.cpu.registers.eflags & 0x40 != 0,
-        };
-        // C: is the only mounted host drive, so a DOS file-I/O call is a C:
-        // access for the GUI LED: open/create/close/read/write/seek/find.
-        if vector == 0x21 {
-            let ah = (regs.ax >> 8) as u8;
-            if matches!(ah, 0x3C | 0x3D | 0x3E | 0x3F | 0x40 | 0x42 | 0x4E | 0x4F) {
-                self.c_accesses += 1;
-            }
-            if regs.ax == 0x7305 {
-                self.handle_int21_ax7305();
-                return Ok(None);
-            }
-        }
-        let action = if vector == 0x21
-            && (self.try_find_first_block_device_file(&mut regs)?
-                || self.try_open_block_device_file(&mut regs)?)
-        {
-            izarravm_dos::DosAction::Continue
-        } else {
-            self.dos.dispatch(vector, &mut regs, &mut self.memory)?
-        };
-        if matches!(action, izarravm_dos::DosAction::WaitForKey) {
-            // Blocking read with an empty ring. Rewind the stacked return IP by 2
-            // so the IRET stub re-enters the INT 21h (CD 21), and set IF in the
-            // stacked FLAGS so IRQ1 can run the keyboard ISR before the retry.
-            let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
-            let sp = self.cpu.registers.esp() as u16;
-            let ip_addr = (ss + u32::from(sp)) as usize;
-            let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
-            let ret_ip = self.memory.read_u16(ip_addr)?;
-            self.memory.write_u16(ip_addr, ret_ip.wrapping_sub(2))?;
-            let mut flags = self.memory.read_u16(flags_addr)?;
-            flags |= 0x0200; // IF
-            self.memory.write_u16(flags_addr, flags)?;
-            return Ok(None);
-        }
-        // Marshal the result back. Every general-purpose register is written
-        // unconditionally so a later slice that returns a value in any of them (for
-        // example AH=3Fh returns the byte count in CX) needs no change here. Only the
-        // low 16 bits are touched, preserving each e-register's high half. DS and ES
-        // are segment inputs for most INT 21h calls, but some DOS internals return
-        // pointers in DS:BX or DS:SI.
-        //
-        // The INT pushed FLAGS/CS/IP; after it the real-mode frame is [SS:SP]=IP,
-        // [SS:SP+2]=CS, [SS:SP+4]=FLAGS. handle_dos_int does not move the guest
-        // stack, so SS:SP+4 is the FLAGS image the IRET stub will pop. Returned
-        // flags must go there: writing live eflags would be discarded by that IRET.
-        let flags_addr = self.cpu.registers.segment(SegmentIndex::Ss).base
-            + u32::from((self.cpu.registers.esp() as u16).wrapping_add(4));
-        let r = &mut self.cpu.registers;
-        r.set_eax((r.eax() & 0xffff_0000) | u32::from(regs.ax));
-        r.set_ebx((r.ebx() & 0xffff_0000) | u32::from(regs.bx));
-        r.set_ecx((r.ecx() & 0xffff_0000) | u32::from(regs.cx));
-        r.set_edx((r.edx() & 0xffff_0000) | u32::from(regs.dx));
-        r.set_esi((r.esi() & 0xffff_0000) | u32::from(regs.si));
-        r.set_edi((r.edi() & 0xffff_0000) | u32::from(regs.di));
-        r.set_ebp((r.ebp() & 0xffff_0000) | u32::from(regs.bp));
-        // CF is bit 0, ZF is bit 6; FLAG_CF/FLAG_ZF are private to the cpu crate.
-        let mut flags = self.memory.read_u16(flags_addr as usize)?;
-        flags = if regs.cf {
-            flags | 0x0001
-        } else {
-            flags & !0x0001
-        };
-        flags = if regs.zf {
-            flags | 0x0040
-        } else {
-            flags & !0x0040
-        };
-        self.memory.write_u16(flags_addr as usize, flags)?;
-        // The marshalling reads segment registers as inputs at the top; write them
-        // back so pointer-return calls reach the guest. For calls that do not touch
-        // segments, these re-set the same real-mode bases.
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(regs.ds));
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(regs.es));
-        Ok(match action {
-            izarravm_dos::DosAction::Continue => None,
-            izarravm_dos::DosAction::Exit(code) => Some(code),
-            izarravm_dos::DosAction::InvokeInterrupt(vector) => {
-                self.invoke_real_mode_interrupt(vector)?;
-                None
-            }
-            izarravm_dos::DosAction::Exec { entry, child_ax } => {
-                // Snapshot the parent and switch to the child. The kernel has
-                // already saved its per-program state; we save the CPU side.
-                self.program_frames.push(ProgramFrame {
-                    registers: self.cpu.registers.clone(),
-                });
-                self.apply_program_entry(entry);
-                // Only AX is defined on child entry (FCB drive validity); the
-                // other GPRs are undefined, matching real DOS (marked).
-                self.cpu.registers.set_eax(u32::from(child_ax));
-                None // keep looping; the CPU now runs the child
-            }
-            // Handled above with an early return; kept so the match stays exhaustive.
-            izarravm_dos::DosAction::WaitForKey => None,
-            izarravm_dos::DosAction::CallDevice {
-                header,
-                command,
-                transfer,
-                count,
-                success_ax,
-                rollback_handle_on_error,
-            } => {
-                // Far-call the driver on the CPU. It runs through the same nested
-                // seam SYSINIT used, which restores the program's register context,
-                // so SS:SP returns to the INT frame the input registers were
-                // marshalled onto. Write the result over AX (transferred count for
-                // read/write, preserved or supplied AX for control calls) and the
-                // stacked CF the way the EXEC-return path edits the frame.
-                let (ax, cf) = match self.device_call_outcome(header, command, transfer, count) {
-                    Ok(count) => (success_ax.unwrap_or(count), false),
-                    Err(code) => {
-                        self.dos.record_last_error(code);
-                        if let Some(handle) = rollback_handle_on_error {
-                            self.dos.rollback_failed_device_open(handle);
-                        }
-                        (code, true)
-                    }
-                };
-                self.cpu
-                    .registers
-                    .set_eax((self.cpu.registers.eax() & 0xffff_0000) | u32::from(ax));
-                let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
-                let sp = self.cpu.registers.esp() as u16;
-                let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
-                let mut flags = self.memory.read_u16(flags_addr)?;
-                flags = if cf { flags | 0x0001 } else { flags & !0x0001 };
-                self.memory.write_u16(flags_addr, flags)?;
-                None
-            }
-        })
-    }
-
-    /// The bytes the DOS kernel has written to standard output (INT 21h AH=09h and
-    /// the character-output calls). Captured host-side for headless runs; not yet
-    /// rendered to the VGA text mode.
-    pub fn dos_output(&self) -> &[u8] {
-        self.dos.stdout()
-    }
-
-    /// Seed the BDA keyboard ring with input bytes for the character-input calls.
-    /// An empty ring blocks the reads (AH=01h/08h) until the keyboard ISR refills
-    /// it; AH=06h reports an empty ring through ZF. Holds up to 15 bytes.
-    pub fn set_dos_stdin(&mut self, bytes: &[u8]) {
-        let _ = izarravm_dos::seed_keyboard_ring(&mut self.memory, bytes);
-    }
-
-    /// Mount a host directory as the guest C: drive for INT 21h file calls.
-    pub fn mount_c_drive(&mut self, drive: izarravm_dos::HostDrive) {
-        self.dos.mount_c(drive);
-    }
-
-    /// Tell the machine where the host C: drive lives so the BIOS Repair and
-    /// Format service-port commands can lay Toka-DOS down on it.
-    pub fn set_toka_c_root(&mut self, root: std::path::PathBuf) {
-        self.toka_c_root = Some(root);
-    }
-
     /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the
     /// status the BIOS reads back. Cmd 0x01 (Repair Toka-DOS) resets the Katea host
-    /// folder's CONFIG.SYS/AUTOEXEC.BAT; 0x10 is the legacy HLE C: boot shim (reached
-    /// only when Katea is not mounted; removed with the HLE in SP-3).
+    /// folder's CONFIG.SYS/AUTOEXEC.BAT. (The legacy 0x10 HLE C: boot shim was
+    /// removed with the Rust DOS kernel in SP-3.)
     fn perform_toka_service(&mut self, command: u8) {
         self.toka_service_status = match command {
             0x01 => self.katea_repair(),
-            0x10 => self.toka_load_boot_record(),
             _ => 0xff,
         };
     }
@@ -9773,304 +7847,6 @@ impl Machine {
         0
     }
 
-    /// Place the Toka-DOS boot record (TOKABOOT) at 0x7C00 and set up the DOS
-    /// base context so the boot record's EXEC of C:\DOS\IZCMD.COM works. The BIOS
-    /// then jumps to 0x7C00 like a real INT 19h boot.
-    fn toka_load_boot_record(&mut self) -> u8 {
-        // Toka-DOS is bootable only when it is installed on C: (C:\DOS\IZCMD.COM
-        // present). The boot record always lives in the ROM, so without this
-        // check the machine would "boot" a drive that carries no OS.
-        let installed = self
-            .toka_c_root
-            .as_ref()
-            .is_some_and(|root| root.join("DOS").join("IZCMD.COM").exists());
-        if !installed {
-            return 1; // not installed: the BIOS reports and idles
-        }
-        let Some(boot) = izarravm_firmware::toka_boot_record() else {
-            return 1; // ROM carries no boot record
-        };
-        let boot = boot.to_vec();
-        for (offset, &byte) in boot.iter().enumerate() {
-            if self
-                .memory
-                .write_u8(BOOT_SECTOR_ADDRESS + offset, byte)
-                .is_err()
-            {
-                return 0xfe;
-            }
-        }
-        if self.setup_toka_dos_base().is_err() {
-            return 0xfe;
-        }
-        // The bundled Toka-DOS boot record is the OS for C:, so the HLE DOS/IZEMM
-        // services are live again. This mirrors handle_int19's C: path for BIOS
-        // ROM boots that request LoadBootRecord through the service port.
-        self.booter_inert = false;
-        0
-    }
-
-    /// Stand up the DOS base context for a Toka-DOS boot: point the INT 20h/21h
-    /// vectors at the RAM IRET stub the HLE kernel returns through (the real BIOS
-    /// does not install these), then build a system PSP, arena, and base
-    /// environment so the boot record's EXEC has a parent to inherit from. This
-    /// is the SYSINIT-equivalent for the HLE kernel.
-    fn setup_toka_dos_base(&mut self) -> Result<(), MachineError> {
-        install_dos_low_memory_stubs(&mut self.memory)?;
-        let env: [(&str, &str); 3] = [
-            ("COMSPEC", "C:\\DOS\\IZCMD.COM"),
-            ("PATH", "C:\\DOS"),
-            ("PROMPT", "$p$g"),
-        ];
-        {
-            let Machine { dos, memory, .. } = self;
-            dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
-        }
-        // CONFIG.SYS DEVICE=EMM386 / DOS=UMB drive the memory manager at SYSINIT;
-        // scalar directives such as LASTDRIVE feed the DOS SysVars table.
-        // A present, readable file applies its mode (re-laying the layout only when
-        // it differs from the current mode); with no readable file the last-applied
-        // mode stands (the construction mode on a cold boot) and the shipped
-        // default's DOS=UMB is assumed. DOS=UMB links a non-empty arena so a default
-        // box comes up with UMBs linked, like a real DOS=HIGH,UMB machine.
-        let config = self.read_config_sys();
-        match config {
-            Some(cfg) => self.set_emm386_config(cfg)?,
-            None => self.furnish_dos_upper_memory()?,
-        }
-        let dos_umb = config.map(|c| c.dos_umb).unwrap_or(true);
-        self.dos.set_dos_umb(dos_umb);
-        self.dos.set_lastdrive(
-            config
-                .map(|c| c.lastdrive)
-                .unwrap_or(izarravm_core::DEFAULT_LASTDRIVE),
-        );
-        self.dos.set_config_sys_counts(
-            config
-                .map(|c| c.files)
-                .unwrap_or(izarravm_core::DEFAULT_FILES),
-            config
-                .map(|c| c.buffers)
-                .unwrap_or(izarravm_core::DEFAULT_BUFFERS),
-        );
-        if dos_umb && self.dos.has_umb_arena() {
-            self.dos.set_umb_link(true);
-        }
-        // Load CONFIG.SYS DEVICE= drivers after the memory manager and scalar
-        // directives, the way DOS SYSINIT processes the file top to bottom.
-        self.load_config_drivers();
-        Ok(())
-    }
-
-    /// Walk CONFIG.SYS DEVICE= lines in order and load each non-memory-manager raw
-    /// `.SYS` driver: stage it resident, run its strategy then interrupt INIT on the
-    /// CPU, finalize on success or abort on failure, and emit a boot message.
-    /// Driver loading is non-critical: a failed line never aborts the boot.
-    fn load_config_drivers(&mut self) {
-        let Some(root) = self.toka_c_root.clone() else {
-            return;
-        };
-        let Ok(text) = std::fs::read_to_string(root.join("CONFIG.SYS")) else {
-            return;
-        };
-        for line in izarravm_core::parse_device_lines(&text) {
-            let base = izarravm_core::dos_basename(&line.path).to_ascii_uppercase();
-            let label = device_label(&line);
-            if matches!(
-                base.as_str(),
-                "HIMEM.SYS" | "IZEMM.EXE" | "IZEMM" | "IEMM.EXE" | "IEMM" | "EMM386.EXE" | "EMM386"
-            ) {
-                self.dos
-                    .write_boot_message(&format!("{label} (memory manager)"));
-                continue;
-            }
-            // CONFIG.SYS paths are C:-rooted; resolve against the host C: root.
-            let rel = line
-                .path
-                .trim_start_matches("C:\\")
-                .trim_start_matches("c:\\")
-                .replace('\\', "/");
-            // Anything that still names a drive or starts at the filesystem root
-            // would escape the C: root once joined (PathBuf::join replaces the base
-            // on a rooted component). Refuse it the same way a missing file reports.
-            if rel.contains(':') || rel.starts_with('/') || rel.starts_with('\\') {
-                self.dos.write_boot_message(&format!("{label} not found"));
-                continue;
-            }
-            let Ok(image) = std::fs::read(root.join(&rel)) else {
-                self.dos.write_boot_message(&format!("{label} not found"));
-                continue;
-            };
-            let staged = {
-                let Machine { dos, memory, .. } = self;
-                let placement = if line.high {
-                    izarravm_dos::DriverLoadPlacement::HighThenLow
-                } else {
-                    izarravm_dos::DriverLoadPlacement::Low
-                };
-                match dos.stage_sys_driver(&image, &line.args, placement, memory) {
-                    Ok(staged) => staged,
-                    Err(izarravm_dos::DriverStageError::Load(
-                        izarravm_dos::DriverLoadError::UnsupportedFormat,
-                    )) => {
-                        dos.write_boot_message(&format!("{label} skipped (unsupported format)"));
-                        continue;
-                    }
-                    Err(_) => {
-                        dos.write_boot_message(&format!("{label} failed to install"));
-                        continue;
-                    }
-                }
-            };
-            // DOS calls strategy (stores the request pointer) then interrupt (runs
-            // INIT). The interrupt call's status decides success.
-            let _ = self.call_driver_request(staged.strategy, staged.request_ptr);
-            let ok = self
-                .call_driver_request(staged.interrupt, staged.request_ptr)
-                .unwrap_or(false);
-            let Machine { dos, memory, .. } = self;
-            if ok {
-                let _ = dos.finalize_sys_driver(&staged, memory);
-                dos.write_boot_message(&format!("{label} installed"));
-            } else {
-                let _ = dos.abort_sys_driver(&staged, memory);
-                dos.write_boot_message(&format!("{label} failed to install (INIT error)"));
-            }
-        }
-    }
-
-    /// Read and parse C:\CONFIG.SYS for the HLE SYSINIT directives, or None when
-    /// the C: root is unset or the file is missing or unreadable.
-    fn read_config_sys(&self) -> Option<izarravm_core::ConfigSysMemory> {
-        let root = self.toka_c_root.as_ref()?;
-        let text = std::fs::read_to_string(root.join("CONFIG.SYS")).ok()?;
-        Some(izarravm_core::parse_config_sys(&text))
-    }
-
-    /// Far-call a device-driver entry on the real CPU with ES:BX = the request
-    /// header, running until its RETF lands on the HLT sentinel (or the budget runs
-    /// out). Returns whether the request reported DONE with no error bit. The CPU
-    /// register context is snapshotted and restored, so the call is transparent to
-    /// the guest that issued the service. The call runs with interrupts disabled,
-    /// the way real DOS SYSINIT loads drivers and routes a device request. Time
-    /// genuinely passes: the nested run advances the PIT, PIC, RTC, and video like
-    /// any other run, and the boot or program clock absorbs the call cost, so the
-    /// clock and the devices stay consistent. Success is decided by the
-    /// request-header DONE bit, not by where IP stops: a bare HLT can resume on a
-    /// timer wake, and the budget bounds a driver that never returns. INIT staging
-    /// and device I/O both reach the driver through this one seam.
-    fn call_driver_request(
-        &mut self,
-        entry: (u16, u16),
-        request: (u16, u16),
-    ) -> Result<bool, MachineError> {
-        use izarravm_cpu::{SegmentIndex, SegmentRegister};
-        let saved_regs = self.cpu.registers.clone();
-        let saved_halted = self.cpu.halted;
-
-        // Borrow the CPU register context for the nested call, then restore it on
-        // every path. Time passes for real, so the clock is deliberately not saved.
-        let outcome: Result<bool, MachineError> = (|| {
-            // Far-return frame: SS:SP -> [sentinel IP][sentinel CS]. RETF pops IP then
-            // CS, so the driver returns to the HLT sentinel in segment 0.
-            let sp = SYSINIT_SCRATCH_STACK_SP;
-            let stack = usize::from(SYSINIT_SCRATCH_STACK_SEG) * 16 + usize::from(sp);
-            self.memory.write_u16(stack, SYSINIT_HALT_STUB as u16)?; // return IP
-            self.memory.write_u16(stack + 2, 0x0000)?; // return CS (HLT stub is in seg 0)
-
-            self.cpu.registers.set_segment(
-                SegmentIndex::Ss,
-                SegmentRegister::real(SYSINIT_SCRATCH_STACK_SEG),
-            );
-            self.cpu.registers.set_esp(u32::from(sp));
-            self.cpu
-                .registers
-                .set_segment(SegmentIndex::Es, SegmentRegister::real(request.0));
-            self.cpu.registers.set_ebx(u32::from(request.1));
-            self.cpu
-                .registers
-                .set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.0));
-            self.cpu.registers.eip = u32::from(entry.1);
-            // Clear IF (bit 9) so the nested run does not vector a hardware IRQ into
-            // the borrowed driver context, matching DOS SYSINIT loading with
-            // interrupts off.
-            self.cpu.registers.eflags &= !0x0000_0200;
-            self.cpu.halted = false;
-
-            let _ = self.run_until_halt_or_cycles(SYSINIT_INIT_BUDGET)?;
-
-            let req_lin = usize::from(request.0) * 16 + usize::from(request.1);
-            let status = self.memory.read_u16(req_lin + 3)?;
-            Ok(status & 0x0100 != 0 && status & 0x8000 == 0)
-        })();
-
-        self.cpu.registers = saved_regs;
-        self.cpu.halted = saved_halted;
-        outcome
-    }
-
-    fn block_device_transfer_outcome(
-        &mut self,
-        target: izarravm_dos::BlockDeviceIoTarget,
-        write: bool,
-        transfer: izarravm_dos::FarPtr,
-        count: u16,
-        start_lba: u16,
-    ) -> Result<(), u8> {
-        let fallback_error = block_device_error_code(write, 0);
-        if self.in_device_call {
-            return Err(fallback_error);
-        }
-        self.in_device_call = true;
-        let r = self.service_block_device_transfer(target, write, transfer, count, start_lba);
-        self.in_device_call = false;
-        match r {
-            Ok(None) => Ok(()),
-            Ok(Some(code)) => Err(code),
-            Err(_) => Err(fallback_error),
-        }
-    }
-
-    fn service_block_device_transfer(
-        &mut self,
-        target: izarravm_dos::BlockDeviceIoTarget,
-        write: bool,
-        transfer: izarravm_dos::FarPtr,
-        count: u16,
-        start_lba: u16,
-    ) -> Result<Option<u8>, MachineError> {
-        let req = DEVICE_REQUEST_SCRATCH;
-        let command = if write { 0x08 } else { 0x04 };
-        for i in 0..0x1a {
-            self.memory.write_u8(req + i, 0)?;
-        }
-        self.memory.write_u8(req, 0x1a)?;
-        self.memory.write_u8(req + 0x01, target.unit)?;
-        self.memory.write_u8(req + 0x02, command)?;
-        self.memory.write_u16(req + 0x03, 0)?;
-        self.memory.write_u8(req + 0x0d, target.media)?;
-        self.memory.write_u16(req + 0x0e, transfer.offset)?;
-        self.memory.write_u16(req + 0x10, transfer.segment)?;
-        self.memory.write_u16(req + 0x12, count)?;
-        self.memory.write_u16(req + 0x14, start_lba)?;
-        self.memory.write_u16(req + 0x16, 0)?;
-
-        let header_lin =
-            usize::from(target.header.segment) * 16 + usize::from(target.header.offset);
-        let strat_off = self.memory.read_u16(header_lin + 6)?;
-        let int_off = self.memory.read_u16(header_lin + 8)?;
-        let req_ptr = ((req >> 4) as u16, 0u16);
-        let _ = self.call_driver_request((target.header.segment, strat_off), req_ptr)?;
-        let _ = self.call_driver_request((target.header.segment, int_off), req_ptr)?;
-
-        let status = self.memory.read_u16(req + 0x03)?;
-        if status & 0x0100 != 0 && status & 0x8000 == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(block_device_error_code(write, status)))
-        }
-    }
-
     fn read_guest_asciiz_lossy(&mut self, segment: u16, offset: u16, max: usize) -> String {
         let base = u32::from(segment) * 16 + u32::from(offset);
         let mut bytes = Vec::new();
@@ -10084,424 +7860,12 @@ impl Machine {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
-    fn alloc_block_fs_scratch(&mut self) -> Result<Option<u16>, izarravm_dos::DosError> {
-        self.dos
-            .alloc_internal_scratch(0x0020, &mut self.memory)
-            .map(Result::ok)
-    }
-
-    fn free_block_fs_scratch(&mut self, segment: u16) -> Result<(), izarravm_dos::DosError> {
-        let _ = self.dos.free_internal_scratch(segment, &mut self.memory)?;
-        Ok(())
-    }
-
-    fn read_block_fs_sector(
-        &mut self,
-        io: izarravm_dos::BlockDeviceIoTarget,
-        scratch_seg: u16,
-        lba: u16,
-    ) -> Result<[u8; 512], u16> {
-        self.block_device_transfer_outcome(
-            io,
-            false,
-            izarravm_dos::FarPtr {
-                segment: scratch_seg,
-                offset: 0,
-            },
-            1,
-            lba,
-        )
-        .map_err(|_| 0x001e_u16)?;
-        let base = usize::from(scratch_seg) * 16;
-        let mut sector = [0u8; 512];
-        for (index, byte) in sector.iter_mut().enumerate() {
-            *byte = self.memory.read_u8(base + index).map_err(|_| 0x000d_u16)?;
-        }
-        Ok(sector)
-    }
-
-    fn read_block_fs_lba(
-        &mut self,
-        io: izarravm_dos::BlockDeviceIoTarget,
-        scratch_seg: u16,
-        lba: u32,
-    ) -> Result<[u8; 512], u16> {
-        let lba = u16::try_from(lba).map_err(|_| 0x000d_u16)?;
-        self.read_block_fs_sector(io, scratch_seg, lba)
-    }
-
-    fn block_fs_target_supported(target: izarravm_dos::BlockDeviceFsTarget) -> bool {
-        target.bytes_per_sector == 512
-            && target.sectors_per_cluster != 0
-            && target.sectors_per_cluster.is_power_of_two()
-            && target.root_entries != 0
-            && target.fat_count != 0
-            && target.sectors_per_fat != 0
-    }
-
-    fn read_block_fs_root_entries(
-        &mut self,
-        target: izarravm_dos::BlockDeviceFsTarget,
-    ) -> Result<Vec<BlockFsRootEntry>, u16> {
-        if !Self::block_fs_target_supported(target) {
-            return Err(0x000d);
-        }
-        let Some(scratch_seg) = self.alloc_block_fs_scratch().map_err(|_| 0x0008_u16)? else {
-            return Err(0x0008);
-        };
-        let result = self.read_block_fs_root_entries_with_scratch(target, scratch_seg);
-        let _ = self.free_block_fs_scratch(scratch_seg);
-        result
-    }
-
-    fn read_block_fs_root_entries_with_scratch(
-        &mut self,
-        target: izarravm_dos::BlockDeviceFsTarget,
-        scratch_seg: u16,
-    ) -> Result<Vec<BlockFsRootEntry>, u16> {
-        let mut entries = Vec::new();
-        self.scan_block_fs_root_entries_with_scratch(target, scratch_seg, |entry| {
-            entries.push(entry);
-            true
-        })?;
-        Ok(entries)
-    }
-
-    fn scan_block_fs_root_entries_with_scratch(
-        &mut self,
-        target: izarravm_dos::BlockDeviceFsTarget,
-        scratch_seg: u16,
-        mut visit: impl FnMut(BlockFsRootEntry) -> bool,
-    ) -> Result<(), u16> {
-        let root_sectors = (u32::from(target.root_entries) * 32).div_ceil(512);
-        let mut root_finished = false;
-        let mut entries_seen = 0u32;
-        let root_entries = u32::from(target.root_entries);
-        for sector_index in 0..root_sectors {
-            let sector = self.read_block_fs_lba(
-                target.io,
-                scratch_seg,
-                u32::from(target.first_root_sector) + sector_index,
-            )?;
-            for entry in sector.chunks_exact(32) {
-                if entries_seen >= root_entries {
-                    root_finished = true;
-                    break;
-                }
-                entries_seen += 1;
-                match entry[0] {
-                    0x00 => {
-                        root_finished = true;
-                        break;
-                    }
-                    0xe5 => continue,
-                    _ => {}
-                }
-                let attr = entry[0x0b];
-                if attr & 0x0f == 0x0f || attr & 0x18 != 0 {
-                    continue;
-                }
-                let mut name_8_3 = [0u8; 11];
-                name_8_3.copy_from_slice(&entry[..11]);
-                let root_entry = BlockFsRootEntry {
-                    name_8_3,
-                    attr,
-                    time: u16::from_le_bytes([entry[0x16], entry[0x17]]),
-                    date: u16::from_le_bytes([entry[0x18], entry[0x19]]),
-                    first_cluster: u16::from_le_bytes([entry[0x1a], entry[0x1b]]),
-                    size: u32::from_le_bytes([entry[0x1c], entry[0x1d], entry[0x1e], entry[0x1f]]),
-                };
-                if !visit(root_entry) {
-                    return Ok(());
-                }
-            }
-            if root_finished {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn read_block_fs_file(
-        &mut self,
-        target: izarravm_dos::BlockDeviceFsTarget,
-        name_8_3: [u8; 11],
-    ) -> Result<Vec<u8>, u16> {
-        if !Self::block_fs_target_supported(target) {
-            return Err(0x000d);
-        }
-        let Some(scratch_seg) = self.alloc_block_fs_scratch().map_err(|_| 0x0008_u16)? else {
-            return Err(0x0008);
-        };
-        let result = self.read_block_fs_file_with_scratch(target, name_8_3, scratch_seg);
-        let _ = self.free_block_fs_scratch(scratch_seg);
-        result
-    }
-
-    fn read_block_fs_file_with_scratch(
-        &mut self,
-        target: izarravm_dos::BlockDeviceFsTarget,
-        name_8_3: [u8; 11],
-        scratch_seg: u16,
-    ) -> Result<Vec<u8>, u16> {
-        let mut found = None;
-        self.scan_block_fs_root_entries_with_scratch(target, scratch_seg, |entry| {
-            if entry.name_8_3 == name_8_3 {
-                found = Some(entry);
-                false
-            } else {
-                true
-            }
-        })?;
-        let Some(entry) = found else {
-            return Err(0x0002);
-        };
-        let mut cluster = entry.first_cluster;
-        let size = entry.size;
-        if size > BLOCK_FS_MAX_FILE_SIZE {
-            return Err(0x0008);
-        }
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        if cluster < 2 || cluster > target.highest_cluster {
-            return Err(0x000d);
-        }
-
-        let mut fat = Vec::with_capacity(usize::from(target.sectors_per_fat) * 512);
-        for sector in 0..u32::from(target.sectors_per_fat) {
-            fat.extend_from_slice(&self.read_block_fs_lba(
-                target.io,
-                scratch_seg,
-                u32::from(target.first_fat_sector) + sector,
-            )?);
-        }
-        let data_clusters = target.highest_cluster.saturating_sub(1);
-        let fat12 = data_clusters < 4085;
-        let eoc = if fat12 { 0x0ff8 } else { 0xfff8 };
-        let bad = if fat12 { 0x0ff7 } else { 0xfff7 };
-        let mut bytes = Vec::with_capacity(size as usize);
-        let mut guard = 0u16;
-        while bytes.len() < size as usize {
-            if cluster < 2 || cluster > target.highest_cluster || guard > target.highest_cluster {
-                return Err(0x000d);
-            }
-            for sector_in_cluster in 0..u32::from(target.sectors_per_cluster) {
-                if bytes.len() == size as usize {
-                    break;
-                }
-                let lba = u32::from(target.first_data_sector)
-                    + u32::from(cluster - 2) * u32::from(target.sectors_per_cluster)
-                    + sector_in_cluster;
-                let sector = self.read_block_fs_lba(target.io, scratch_seg, lba)?;
-                let want = (size as usize - bytes.len()).min(512);
-                bytes.extend_from_slice(&sector[..want]);
-            }
-            if bytes.len() == size as usize {
-                break;
-            }
-            let Some(next) = block_fs_fat_entry(&fat, cluster, fat12) else {
-                return Err(0x000d);
-            };
-            if next >= eoc {
-                break;
-            }
-            if next == bad || next < 2 {
-                return Err(0x000d);
-            }
-            cluster = next;
-            guard = guard.saturating_add(1);
-        }
-        if bytes.len() < size as usize {
-            return Err(0x000d);
-        }
-        Ok(bytes)
-    }
-
-    fn try_find_first_block_device_file(
-        &mut self,
-        regs: &mut izarravm_dos::DosRegs,
-    ) -> Result<bool, izarravm_dos::DosError> {
-        if (regs.ax >> 8) as u8 != 0x4e {
-            return Ok(false);
-        }
-        let Some(path) = izarravm_dos::read_dos_asciiz(&self.memory, regs.ds, regs.dx)? else {
-            self.dos.fail_find_first(regs, 0x0003);
-            return Ok(true);
-        };
-        let Some(drive) = block_fs_drive(&path) else {
-            return Ok(false);
-        };
-        let Some(target) = self.dos.block_device_fs_target(drive) else {
-            return Ok(false);
-        };
-        let Some((_, pattern)) = block_fs_find_spec(&path) else {
-            self.dos.fail_find_first(regs, 0x0003);
-            return Ok(true);
-        };
-        if self.in_device_call {
-            self.dos.fail_find_first(regs, 0x0005);
-            return Ok(true);
-        }
-        match self.read_block_fs_root_entries(target) {
-            Ok(entries) => {
-                let entries = entries
-                    .into_iter()
-                    .map(|entry| izarravm_dos::DosFindEntry {
-                        name_8_3: entry.name_8_3,
-                        attr: entry.attr,
-                        time: entry.time,
-                        date: entry.date,
-                        size: entry.size,
-                    })
-                    .collect::<Vec<_>>();
-                let _ =
-                    self.dos
-                        .find_first_from_entries(&mut self.memory, regs, &pattern, &entries)?;
-            }
-            Err(code) => self.dos.fail_find_first(regs, code),
-        }
-        Ok(true)
-    }
-
-    fn try_open_block_device_file(
-        &mut self,
-        regs: &mut izarravm_dos::DosRegs,
-    ) -> Result<bool, izarravm_dos::DosError> {
-        if (regs.ax >> 8) as u8 != 0x3d {
-            return Ok(false);
-        }
-        let path = self.read_guest_asciiz_lossy(regs.ds, regs.dx, 260);
-        if self
-            .dos
-            .open_name_would_resolve_to_character_device(&self.memory, &path)
-        {
-            return Ok(false);
-        }
-        let Some((drive, name_8_3)) = block_fs_path_8_3(&path) else {
-            if let Some(drive) = block_fs_drive(&path) {
-                if self.dos.block_device_fs_target(drive).is_some() {
-                    self.dos.fail_regs(regs, 0x0003);
-                    return Ok(true);
-                }
-            }
-            return Ok(false);
-        };
-        let Some(target) = self.dos.block_device_fs_target(drive) else {
-            return Ok(false);
-        };
-        match (regs.ax as u8) & 0x0f {
-            0 => {}
-            1 | 2 => {
-                self.dos.fail_regs(regs, 0x0005);
-                return Ok(true);
-            }
-            _ => {
-                self.dos.fail_regs(regs, 0x000c);
-                return Ok(true);
-            }
-        }
-        if self.in_device_call {
-            self.dos.fail_regs(regs, 0x0005);
-            return Ok(true);
-        }
-        match self.read_block_fs_file(target, name_8_3) {
-            Ok(bytes) => self.dos.open_readonly_memory_file(regs, name_8_3, bytes),
-            Err(code) => {
-                self.dos.fail_regs(regs, code);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Run a CallDevice action with the re-entrancy guard, returning Ok(count) on
-    /// success or Err(dos_error_code) on a fault. A host-side failure of the nested
-    /// call (a memory or CPU fault) is reported as a DOS device error, not
-    /// propagated as an abort. The fixed request packet is not reentrant, so a
-    /// driver that issues its own device I/O while it runs is refused rather than
-    /// allowed to clobber the packet and grow the host stack. in_device_call is
-    /// reset before this returns, so an error can never leave the guard stuck.
-    fn device_call_outcome(
-        &mut self,
-        header: izarravm_dos::FarPtr,
-        command: u8,
-        transfer: izarravm_dos::FarPtr,
-        count: u16,
-    ) -> Result<u16, u16> {
-        let fallback_error = device_call_error_code(command, 0);
-        if self.in_device_call {
-            return Err(fallback_error); // nested device call: the fixed packet is not reentrant
-        }
-        self.in_device_call = true;
-        let r = self.service_device_call(header, command, transfer, count);
-        self.in_device_call = false;
-        match r {
-            Ok((count, None)) => Ok(count),
-            Ok((_, Some(code))) => Err(code),
-            Err(_) => Err(fallback_error), // host-side failure: command-keyed device failure
-        }
-    }
-
-    /// Service a CallDevice action: build a DOS request packet for OPEN (0Dh),
-    /// CLOSE (0Eh), READ (4), or WRITE (8), far-call the driver's strategy then
-    /// interrupt on the CPU, and read back its status. READ/WRITE packets carry the
-    /// caller's transfer pointer and count, and return the transferred count on
-    /// success. OPEN/CLOSE packets are header-only; the action handler supplies the
-    /// success AX. The register context the program was running with is restored by
-    /// call_driver_request, so the only effect on the program is the AX and CF the
-    /// action handler writes back. On success returns the transferred count with
-    /// `None`; on a driver fault it returns `(0, Some(code))` with a DOS error code.
-    fn service_device_call(
-        &mut self,
-        header: izarravm_dos::FarPtr,
-        command: u8,
-        transfer: izarravm_dos::FarPtr,
-        count: u16,
-    ) -> Result<(u16, Option<u16>), MachineError> {
-        let req = DEVICE_REQUEST_SCRATCH;
-        for i in 0..0x1a {
-            self.memory.write_u8(req + i, 0)?;
-        }
-        self.memory
-            .write_u8(req, device_request_packet_len(command))?; // +0x00 request length
-        self.memory.write_u8(req + 0x01, 0)?; // +0x01 unit (single-unit char device)
-        self.memory.write_u8(req + 0x02, command)?; // +0x02 command
-        self.memory.write_u16(req + 0x03, 0)?; // +0x03 status (the driver fills it)
-        if matches!(command, 4 | 8) {
-            self.memory.write_u16(req + 0x0e, transfer.offset)?; // +0x0E transfer offset
-            self.memory.write_u16(req + 0x10, transfer.segment)?; // +0x10 transfer segment
-            self.memory.write_u16(req + 0x12, count)?; // +0x12 requested byte count
-        }
-
-        let header_lin = usize::from(header.segment) * 16 + usize::from(header.offset);
-        let strat_off = self.memory.read_u16(header_lin + 6)?;
-        let int_off = self.memory.read_u16(header_lin + 8)?;
-        // The packet is paragraph-aligned at DEVICE_REQUEST_SCRATCH, so the far
-        // pointer is (req >> 4):0.
-        let req_ptr = ((req >> 4) as u16, 0u16);
-        // Strategy stores the request pointer; interrupt does the transfer. The seam
-        // restores the program's CPU context after each call. STRATEGY legitimately
-        // never sets DONE (it only stores the request pointer), so success is gated
-        // on the INTERRUPT call's bool: DONE set with the error bit clear.
-        let _ = self.call_driver_request((header.segment, strat_off), req_ptr)?;
-        let done = self.call_driver_request((header.segment, int_off), req_ptr)?;
-
-        let status = self.memory.read_u16(req + 0x03)?;
-        let done_count = self.memory.read_u16(req + 0x12)?;
-        if !done || status & 0x8000 != 0 {
-            let code = device_call_error_code(command, status);
-            return Ok((0, Some(code)));
-        }
-        Ok((done_count, None))
-    }
-
     /// Mirror any console output produced since the last call onto the VGA
-    /// text screen. Programs write CON through INT 21h, which is buffered
-    /// (by `self.dos` for the DOS-kernel runtime, by `self.program_output`
-    /// for the native `new_raw_program` runtime); real DOS renders that to
-    /// the screen via the BIOS teletype. We do the same here so a session is
-    /// visible on the framebuffer, sharing the BDA cursor at 0040:0050 with
-    /// the BIOS.
+    /// text screen. Programs write CON through INT 21h, which is buffered in
+    /// `self.program_output` for the native `new_raw_program` runtime; real
+    /// DOS renders that to the screen via the BIOS teletype. We do the same
+    /// here so a session is visible on the framebuffer, sharing the BDA cursor
+    /// at 0040:0050 with the BIOS.
     fn flush_dos_console_to_screen(&mut self) {
         let total = self.console_output().len();
         if self.dos_screen_shown >= total {
@@ -10514,15 +7878,10 @@ impl Machine {
         }
     }
 
-    /// Whichever console output buffer is live for this machine's runtime:
-    /// `program_output` for a native `new_raw_program` machine, `dos_output`
-    /// for the DOS-kernel-backed `new_dos_program` path otherwise.
+    /// The live console output buffer. With the Rust DOS kernel retired every
+    /// machine uses the native `program_output` buffer.
     fn console_output(&self) -> &[u8] {
-        if self.program_runtime {
-            &self.program_output
-        } else {
-            self.dos_output()
-        }
+        &self.program_output
     }
 
     /// Write one character to the VGA text screen at the BDA cursor, advancing it
@@ -11831,6 +9190,7 @@ impl Machine {
                     pending_soft_int,
                     fast_post,
                     booter_inert,
+                    program_runtime,
                     pending_toka_service,
                     toka_service_status,
                     unittester,
@@ -11877,6 +9237,7 @@ impl Machine {
                     pending_mode,
                     fast_post: *fast_post,
                     booter_inert: *booter_inert,
+                    program_runtime: *program_runtime,
                     pending_toka_service,
                     toka_service_status: *toka_service_status,
                     unittester,
@@ -12018,13 +9379,6 @@ impl Machine {
                             0x18 => self.handle_int18(),
                             0x19 => self.handle_int19(),
                             0x1A => self.handle_int1a(),
-                            0x25 => self.handle_int25(),
-                            0x26 => self.handle_int26(),
-                            0x29 => self.handle_int29(),
-                            0x2A => self.handle_int2a(),
-                            0x2E => {
-                                self.handle_int2e()?;
-                            }
                             0x5C => self.handle_absent_resident_api(0x5C),
                             0x60 => self.handle_absent_resident_api(0x60),
                             0x68 => self.handle_absent_resident_api(0x68),
@@ -12048,43 +9402,11 @@ impl Machine {
                                     }
                                 }
                             }
-                            0x20 | 0x21 | 0x27 => match self.handle_dos_int(vector) {
-                                Ok(Some(code)) => {
-                                    if let Some(frame) = self.program_frames.pop() {
-                                        // A child exited; resume the parent.
-                                        self.cpu.registers = frame.registers;
-                                        self.dos.finish_exec(code, &mut self.memory)?;
-                                        // EXEC success: AX=0, CF=0 in the parent's
-                                        // INT-return FLAGS image (SS:SP+4).
-                                        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
-                                        let sp = self.cpu.registers.esp() as u16;
-                                        let flags_addr =
-                                            (ss + u32::from(sp.wrapping_add(4))) as usize;
-                                        let mut flags = self.memory.read_u16(flags_addr)?;
-                                        flags &= !0x0001; // CF=0
-                                        self.memory.write_u16(flags_addr, flags)?;
-                                        self.cpu.registers.set_eax(0);
-                                        // fall through: the loop continues, the
-                                        // IRET stub returns to the parent.
-                                    } else {
-                                        return Ok(StopReason::DosExit { code });
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    return Ok(StopReason::CpuError(format!(
-                                        "DOS INT {vector:#04x}: {error}"
-                                    )));
-                                }
-                            },
                             _ => {}
                         }
                     }
                     // Mirror any DOS console output onto the VGA text screen.
                     self.flush_dos_console_to_screen();
-                    if outcome.halted && self.finish_pending_critical_error_trampoline() {
-                        continue;
-                    }
                     if outcome.halted {
                         match self.next_timer_wake(deadline) {
                             Some(wake_step) => {
@@ -12160,12 +9482,15 @@ struct MachineBus<'a> {
     ata: &'a mut Option<ata::AtaDisk>,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
-    active_mode: GswMode,                       // a copy, for the 0xE1 read
-    pending_mode: &'a mut Option<GswMode>,      // a 0xE1 write records the request here
-    fast_post: bool,                            // a copy, for the 0xE2 POST-pacing read
-    booter_inert: bool,                         // a copy, stands the HLE down at INT-ack
-    pending_toka_service: &'a mut Option<u8>,   // a 0xE3 write records the command
-    toka_service_status: u8,                    // a copy, for the 0xE3 status read
+    active_mode: GswMode,                  // a copy, for the 0xE1 read
+    pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
+    fast_post: bool,                       // a copy, for the 0xE2 POST-pacing read
+    booter_inert: bool,                    // a copy, stands the multiplex vectors down at INT-ack
+    // A copy: when set (a `new_raw_program` machine) INT 20h/21h/27h stay
+    // intercepted at INT-ack so the run loop's guarded raw-program arm services them.
+    program_runtime: bool,
+    pending_toka_service: &'a mut Option<u8>, // a 0xE3 write records the command
+    toka_service_status: u8,                  // a copy, for the 0xE3 status read
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
     // The cache model and the live CPU level it is keyed on. A data access warms
@@ -12769,19 +10094,22 @@ impl CpuBus for MachineBus<'_> {
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
         //
-        // In booter-inert mode the DOS kernel, absolute-disk, multiplex, and XMS
-        // vectors stand down so a self-booting disk owns them through the IVT; the
-        // BIOS hardware services (0x10-0x1A) stay intercepted.
-        let dos_or_iemm = matches!(
-            vector,
-            0x20 | 0x21 | 0x25 | 0x26 | 0x27 | 0x29 | 0x2A | 0x2E | 0x2F | 0x66 | 0x67
-        );
+        // In booter-inert mode the IEMM/EMS/XMS multiplex vectors stand down so a
+        // self-booting disk owns them through the IVT; the BIOS hardware services
+        // (0x10-0x1A) stay intercepted. (The pure DOS vectors 0x20-0x2E are no
+        // longer intercepted at all — the Rust DOS kernel that serviced them was
+        // retired in SP-3 — so they always pass straight through.)
+        let dos_or_iemm = matches!(vector, 0x2F | 0x66 | 0x67);
         // INT 67h is intercepted whenever a manager is built: RAM answers the full
         // EMS API, NOEMS answers a frameless manager (present, 0 pages, no frame).
         // Only HIMEM-only (unloaded) has no manager, so the vector runs the ROM IRET
         // there, the way a box with no EMM386 leaves no working EMS.
         let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
             && self.vector_points_at_rom_iret(vector)?;
+        // A `new_raw_program` machine keeps INT 20h/21h/27h intercepted so the run
+        // loop's guarded raw-program arm (`handle_raw_program_int`) services them.
+        // Outside that runtime nothing intercepts the pure-DOS vectors any more.
+        let raw_program_vector = self.program_runtime && matches!(vector, 0x20 | 0x21 | 0x27);
         let intercepted = matches!(
             vector,
             0x10 | 0x11
@@ -12793,19 +10121,12 @@ impl CpuBus for MachineBus<'_> {
                 | 0x18
                 | 0x19
                 | 0x1A
-                | 0x20
-                | 0x21
-                | 0x25
-                | 0x26
-                | 0x27
-                | 0x29
-                | 0x2A
-                | 0x2E
                 | 0x2F
                 | 0x40
                 | 0x42
                 | 0x66
-        ) || (vector == 0x67 && self.ems.is_some())
+        ) || raw_program_vector
+            || (vector == 0x67 && self.ems.is_some())
             || absent_resident_api;
         if intercepted && !(self.booter_inert && dos_or_iemm) {
             *self.pending_soft_int = Some(vector);
@@ -13053,45 +10374,10 @@ const BDA_DAY_COUNT: usize = 0x4f0;
 /// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
 const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
-/// RAM address of the one-byte HLT sentinel a driver call's far return lands on.
-/// It sits in the free gap between the IRET stub at 0x600 and the RTC ISR stub at
-/// 0x610. `setup_toka_dos_base` writes it; `call_driver_request` returns the CPU
-/// here for both INIT staging and device-I/O routing.
+/// RAM address of a one-byte HLT sentinel in the free gap between the IRET stub at
+/// 0x600 and the RTC ISR stub at 0x610. `install_dos_low_memory_stubs` seeds it as
+/// a safe HLT landing spot in the reserved low-memory stub cluster.
 const SYSINIT_HALT_STUB: usize = BIOS_IRET_STUB_ADDRESS + 1;
-
-/// Scratch stack segment for the nested driver-INIT call. Linear 0x500 is the
-/// classic free DOS low-memory scratch page, below the BIOS stub cluster at 0x600
-/// and above the BIOS data area. The stack grows down from a low SP and uses only
-/// the far-return frame plus the driver's own pushes.
-const SYSINIT_SCRATCH_STACK_SEG: u16 = 0x0050;
-/// Initial SP for the scratch stack: high enough for the driver's pushes, low
-/// enough to keep the stack inside the 0x500 page (below the stub cluster).
-const SYSINIT_SCRATCH_STACK_SP: u16 = 0x00f0;
-
-/// Cycle budget for one driver-INIT routine. An INIT is short; the budget bounds a
-/// malformed driver that never returns so it cannot hang the boot.
-const SYSINIT_INIT_BUDGET: u64 = 50_000;
-
-/// Linear address of the device-driver request packet a CallDevice service builds.
-/// It sits at the bottom of the SYSINIT scratch page (seg 0x0050, linear 0x500),
-/// paragraph-aligned so the far pointer is 0050:0000. This is host-reserved low
-/// memory: the BIOS data area ends at 0x4FF, the BIOS stub cluster starts at 0x600,
-/// and SysVars starts at 0x640, so 0x500 belongs to no guest structure. The driver
-/// call's stack uses the same page from a high SP (0xF0 -> linear 0x5F0) growing
-/// down, so the 0x1A-byte packet at 0x500-0x519 and the live stack never overlap.
-/// No test asserts that the full packet survives the call. The packet occupies
-/// 0x500-0x519 and the driver-call scratch stack grows down from linear 0x5F0, so
-/// the ~214-byte gap between them is a hard ceiling on driver stack depth: a driver
-/// that pushes past it walks down into the packet. The single fixed packet also
-/// assumes device calls are non-reentrant, which the in_device_call guard now
-/// enforces (a nested device call is refused, not run on the same packet).
-const DEVICE_REQUEST_SCRATCH: usize = 0x0500;
-
-/// Low-memory scratch record returned by INT 2Fh AX=1218h. 0052:0000 is the
-/// DOS SDA-list pointer block; this starts after that small structure and stays
-/// below the driver scratch stack.
-const DOS_INT2F_REGS_SEG: u16 = 0x0052;
-const DOS_INT2F_REGS_OFF: u16 = 0x0010;
 
 /// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
 /// stub at 0x600 in the free BIOS scratch below the .COM load segment (0x1000).
@@ -13313,18 +10599,6 @@ fn seed_video_bios_tables(memory: &mut Memory) -> Result<(), BusError> {
     Ok(())
 }
 
-/// Format a CONFIG.SYS device line for a boot message: the DEVICE= path and its
-/// argument tail, left-padded to a column so the status that follows lines up.
-fn device_label(line: &izarravm_core::ConfigDeviceLine) -> String {
-    let keyword = if line.high { "DEVICEHIGH=" } else { "DEVICE=" };
-    let body = if line.args.is_empty() {
-        format!("{keyword}{}", line.path)
-    } else {
-        format!("{keyword}{} {}", line.path, line.args)
-    };
-    format!("{body:<28}")
-}
-
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // Low CPU exception vectors and INT 05h Print Screen start as safe BIOS
     // defaults. Guests and DOS can replace them through the IVT.
@@ -13481,7 +10755,7 @@ fn install_dos_low_memory_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u8(DOS_CALL5_ENTRY_ADDRESS, 0xea)?; // jmp far FF00:0020
     memory.write_u16(DOS_CALL5_ENTRY_ADDRESS + 1, DOS_CALL5_ENTRY_OFF)?;
     memory.write_u16(DOS_CALL5_ENTRY_ADDRESS + 3, DOS_CALL5_ENTRY_SEG)?;
-    // The HLT sentinel a driver call's far return lands on (see call_driver_request).
+    // A safe HLT sentinel byte in the reserved low-memory stub cluster.
     memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
     // INT 18h's halt target: CLI;HLT in low RAM. INT 22h uses the same safe
     // default terminate-address target until a shell or guest replaces it.
@@ -14726,7 +12000,7 @@ mod tests {
     }
 
     #[test]
-    fn new_dos_program_leaves_pit_counter0_running() {
+    fn new_raw_program_leaves_pit_counter0_running() {
         // A directly-loaded DOS program must see PIT counter 0 ticking, the way the
         // BIOS POST leaves it; otherwise a guest that polls the timer for a delay or
         // a speed calibration spins forever (TSUMERA's setup does exactly that).
@@ -14853,58 +12127,6 @@ mod tests {
             .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x2c)
             .unwrap();
         assert_eq!(env_seg, prog_top + 1);
-    }
-
-    #[test]
-    fn call_driver_request_runs_a_routine_and_restores_state() {
-        let mut m = test_machine();
-        // The HLT sentinel the far-return lands on, the way setup_toka_dos_base
-        // writes it during a real boot.
-        m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
-        // A routine at 0x3000:0000 that, given ES:BX = request, sets [ES:BX+3] to
-        // 0x0100 (DONE) and RETFs: mov ax,0x0100 / mov es:[bx+3],ax / retf.
-        let code = [0xB8, 0x00, 0x01, 0x26, 0x89, 0x47, 0x03, 0xCB];
-        for (i, &b) in code.iter().enumerate() {
-            m.memory.write_u8(0x30000 + i, b).unwrap();
-        }
-        let req = 0x40000usize;
-        m.memory.write_u16(req + 3, 0).unwrap();
-
-        use izarravm_cpu::SegmentIndex;
-        let saved = m.cpu.registers.clone();
-        let saved_clocks = m.elapsed_clocks;
-
-        let ok = m
-            .call_driver_request((0x3000, 0x0000), (0x4000, 0x0000))
-            .unwrap();
-
-        assert!(ok); // DONE seen, no error bit
-        assert_eq!(m.memory.read_u16(req + 3).unwrap(), 0x0100);
-        // The borrowed CPU register context is restored on every path.
-        assert_eq!(
-            m.cpu.registers.segment(SegmentIndex::Ss).selector,
-            saved.segment(SegmentIndex::Ss).selector,
-            "SS restored"
-        );
-        assert_eq!(m.cpu.registers.esp(), saved.esp(), "ESP/SP restored");
-        assert_eq!(
-            m.cpu.registers.segment(SegmentIndex::Es).selector,
-            saved.segment(SegmentIndex::Es).selector,
-            "ES restored"
-        );
-        assert_eq!(m.cpu.registers.ebx(), saved.ebx(), "EBX restored");
-        assert_eq!(
-            m.cpu.registers.cs().selector,
-            saved.cs().selector,
-            "CS restored"
-        );
-        assert_eq!(m.cpu.registers.eip, saved.eip, "EIP restored");
-        assert_eq!(m.cpu.registers, saved); // whole register file restored
-        // INIT runs on the real CPU, so the boot clock advances; it is not rewound.
-        assert!(
-            m.elapsed_clocks >= saved_clocks,
-            "clock advanced, not rewound"
-        );
     }
 
     fn prime_dos_int_frame(m: &mut Machine) {
@@ -16523,16 +13745,6 @@ mod tests {
         assert_eq!(bus.read_io(0x0278, BusWidth::Byte).unwrap(), 0x42);
         // The LPT2 status port reports the always-ready idle byte.
         assert_eq!(bus.read_io(0x0279, BusWidth::Byte).unwrap(), 0xdf);
-    }
-
-    #[test]
-    fn int29_writes_the_character_to_the_screen() {
-        let mut m = int15_machine(16);
-        // Place the cursor at the top-left so the byte lands at video offset 0.
-        m.memory.write_u16(0x450, 0).unwrap();
-        m.cpu.registers.set_eax(u32::from(b'Z'));
-        m.handle_int29();
-        assert_eq!(m.video.read_u8(0).unwrap(), b'Z');
     }
 
     #[test]
@@ -19932,172 +17144,27 @@ mod tests {
     }
 
     #[test]
-    fn int26_write_then_int25_read_round_trips_a_sector() {
-        let mut m = int15_machine(16);
-        m.mount_floppy(vec![0u8; 1_474_560]).unwrap(); // 1.44 MB, 18 spt, 2 heads
-        // Seed a pattern in a guest buffer at DS:BX = 2000:0000 (physical 0x20000).
-        for i in 0..512u32 {
-            m.write_physical_u8(0x2_0000 + i, (i & 0xff) as u8);
-        }
-        // INT 26h: AL=0 (A:), CX=1 sector, DX=LBA 40, DS:BX -> 0x20000.
-        m.cpu.registers.set_eax(0x0000);
-        m.cpu.registers.set_ecx(0x0001);
-        m.cpu.registers.set_edx(40);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int26();
-        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "write AX=0");
-
-        // LBA 40 with 18 spt, 2 heads: cyl=1, head=0, sector=5 (40 = 1*36 + 0*18 + 4).
-        let on_disk = m.floppy.as_ref().unwrap().read_sector(1, 0, 5).unwrap();
-        assert_eq!(on_disk[0], 0x00);
-        assert_eq!(on_disk[5], 0x05);
-        assert_eq!(on_disk[511], 0xFF);
-
-        // INT 25h reads it back into a fresh buffer at 3000:0000.
-        m.cpu.registers.set_eax(0x0000);
-        m.cpu.registers.set_ecx(0x0001);
-        m.cpu.registers.set_edx(40);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int25();
-        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "read AX=0");
-        for i in 0..512u32 {
-            assert_eq!(m.read_physical_u8(0x3_0000 + i), (i & 0xff) as u8);
-        }
-    }
-
-    #[test]
-    fn int25_out_of_range_sector_sets_carry() {
-        let mut m = int15_machine(16);
-        m.mount_floppy(vec![0u8; 737_280]).unwrap(); // 720 KB = 1440 sectors (0..1439)
-        // LBA 5000 is well past the media; the read must report an error.
-        m.cpu.registers.set_eax(0x0000);
-        m.cpu.registers.set_ecx(0x0001);
-        m.cpu.registers.set_edx(5000);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int25();
-        assert_ne!(
-            m.cpu.registers.eax() as u16,
-            0x0000,
-            "AX carries an error code"
-        );
-        assert_eq!(
-            (m.cpu.registers.eax() as u16 >> 8) as u8,
-            0x40,
-            "high byte 0x40"
-        );
-    }
-
-    #[test]
-    fn int25_no_media_sets_carry() {
-        // No floppy mounted: the absolute read reports drive-not-ready.
-        let mut m = int15_machine(16);
-        m.cpu.registers.set_eax(0x0000);
-        m.cpu.registers.set_ecx(0x0001);
-        m.cpu.registers.set_edx(0);
-        m.handle_int25();
-        assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
-    }
-
-    #[test]
-    fn int25_reads_the_fat32_volume_and_int26_is_write_protected() {
-        let dir = std::env::temp_dir().join(format!(
-            "izarra_int25_fat32_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("HELLO.TXT"), b"hi").unwrap();
-        let vol = build_fat32(&dir, 64 * 1024 * 1024, 0x1234_5678).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-
-        let mut m = int15_machine(16);
-        m.mount_fat32(vol);
-
-        // INT 25h: AL=2 (C:), CX=2 sectors from LBA 0 (boot + FSInfo), DS:BX ->
-        // 0x20000. Two sectors exercise the i*512 buffer stepping.
-        m.cpu.registers.set_eax(0x0002);
-        m.cpu.registers.set_ecx(0x0002);
-        m.cpu.registers.set_edx(0x0000);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int25();
-        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "INT 25h read AX=0");
-        // Sector 0 (the boot sector) landed at buffer+0: the FAT32 type string and
-        // the 0x55AA signature prove the volume's sector reached guest RAM.
-        let fstype: Vec<u8> = (0..8u32)
-            .map(|i| m.read_physical_u8(0x2_0000 + 82 + i))
-            .collect();
-        assert_eq!(&fstype, b"FAT32   ", "boot sector filesystem type");
-        assert_eq!(m.read_physical_u8(0x2_0000 + 510), 0x55, "signature lo");
-        assert_eq!(m.read_physical_u8(0x2_0000 + 511), 0xAA, "signature hi");
-        // Sector 1 (FSInfo) landed at buffer+512: its lead signature 0x41615252
-        // confirms the second sector stepped to the right offset.
-        let fsi_lead: Vec<u8> = (0..4u32)
-            .map(|i| m.read_physical_u8(0x2_0000 + 512 + i))
-            .collect();
-        assert_eq!(
-            &fsi_lead,
-            &0x4161_5252u32.to_le_bytes(),
-            "FSInfo lead signature"
-        );
-
-        // INT 26h write to the read-only volume is write-protected.
-        m.cpu.registers.set_eax(0x0002);
-        m.cpu.registers.set_ecx(0x0001);
-        m.cpu.registers.set_edx(0x0000);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int26();
-        assert_eq!(
-            m.cpu.registers.eax() as u16,
-            0x0300,
-            "INT 26h write to a read-only volume is write-protected"
-        );
-    }
-
-    #[test]
-    fn int25_drive_c_without_a_volume_is_drive_not_ready() {
-        // AL=2 with no FAT32 volume mounted falls through to the drive-not-ready
-        // path, the same as before this wiring existed.
-        let mut m = int15_machine(16);
-        m.cpu.registers.set_eax(0x0002);
-        m.cpu.registers.set_ecx(0x0001);
-        m.cpu.registers.set_edx(0x0000);
-        m.handle_int25();
-        assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
-    }
-
-    #[test]
     fn booter_inert_stands_down_dos_vectors_but_keeps_the_bios() {
         let mut m = int15_machine(16);
 
-        // By default the HLE intercepts INT 21h (the DOS kernel).
+        // The Rust DOS kernel that used to service INT 21h/25h/26h/27h/29h/2Ah/2Eh
+        // was retired in SP-3, so those pure-DOS vectors are no longer intercepted
+        // in EITHER mode; they always pass straight through to the guest's IVT.
         m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
         assert_eq!(
+            m.pending_soft_int, None,
+            "INT 21h is never intercepted (the DOS kernel was retired)"
+        );
+
+        // The IEMM/EMS/XMS multiplex vectors ARE intercepted by default: INT 2Fh
+        // (multiplex/XMS), and INT 67h (EMS) since RAM mode provisions a manager.
+        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        assert_eq!(
             m.pending_soft_int,
-            Some(0x21),
-            "INT 21h is intercepted by default"
+            Some(0x2f),
+            "INT 2Fh (multiplex/XMS) is intercepted by default"
         );
         m.pending_soft_int = None;
-
-        // INT 67h (EMS) is intercepted by default too, since RAM mode provisions a
-        // manager.
         m.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
         assert_eq!(
             m.pending_soft_int,
@@ -20106,14 +17173,14 @@ mod tests {
         );
         m.pending_soft_int = None;
 
-        // Booter-inert mode stands the DOS/IZEMM vectors down so the guest's own
-        // handlers run through the IVT.
+        // Booter-inert mode stands the IEMM/EMS/XMS multiplex vectors down so the
+        // guest's own handlers run through the IVT.
         m.set_booter_inert(true);
         assert!(m.booter_inert());
         m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
         assert_eq!(
             m.pending_soft_int, None,
-            "INT 21h stands down in booter mode"
+            "INT 21h is still not intercepted in booter mode"
         );
         m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
         assert_eq!(
@@ -22150,6 +19217,7 @@ mod tests {
             pending_mode: &mut machine.pending_mode,
             fast_post: machine.fast_post,
             booter_inert: machine.booter_inert,
+            program_runtime: machine.program_runtime,
             pending_toka_service: &mut machine.pending_toka_service,
             toka_service_status: machine.toka_service_status,
             unittester: &mut machine.unittester,
@@ -23615,61 +20683,6 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 7 });
         assert!(machine.program_output().is_empty());
-    }
-
-    #[test]
-    fn int2a_direct_io_check_allows_local_disk_access() {
-        let mut machine = test_machine();
-
-        prime_dos_int_frame(&mut machine);
-        machine.cpu.registers.set_eax(0x0300);
-        machine.handle_int2a();
-
-        assert_eq!(dos_int_flags(&machine) & 1, 0, "AX=0300h clears CF");
-    }
-
-    #[test]
-    fn int2a_network_resource_and_netbios_calls_report_absent() {
-        let mut machine = test_machine();
-
-        prime_dos_int_frame(&mut machine);
-        machine.cpu.registers.set_eax(0x0500);
-        machine.cpu.registers.set_ebx(0x1111_2222);
-        machine.cpu.registers.set_ecx(0x3333_4444);
-        machine.cpu.registers.set_edx(0x5555_6666);
-        machine.handle_int2a();
-
-        assert_eq!(machine.cpu.registers.eax() as u16, 0x0000);
-        assert_eq!(machine.cpu.registers.ebx() as u16, 0x0000);
-        assert_eq!(machine.cpu.registers.ecx() as u16, 0x0000);
-        assert_eq!(machine.cpu.registers.edx() as u16, 0x0000);
-        assert_eq!(dos_int_flags(&machine) & 1, 0, "AX=0500h clears CF");
-
-        prime_dos_int_frame(&mut machine);
-        machine.cpu.registers.set_eax(0x0401);
-        machine.handle_int2a();
-
-        assert_eq!(machine.cpu.registers.eax() as u16, 0x0101);
-        assert_eq!(dos_int_flags(&machine) & 1, 0, "AH=04h returns AX status");
-
-        prime_dos_int_frame(&mut machine);
-        machine.cpu.registers.set_eax(0x0600);
-        machine.handle_int2a();
-
-        assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
-        assert_ne!(dos_int_flags(&machine) & 1, 0, "AH=06h sets CF");
-    }
-
-    #[test]
-    fn int2a_dos_critical_section_notifications_are_noops() {
-        let mut machine = test_machine();
-
-        for ax in [0x8001, 0x8101, 0x8201, 0x8401] {
-            prime_dos_int_frame(&mut machine);
-            machine.cpu.registers.set_eax(ax);
-            machine.handle_int2a();
-            assert_eq!(dos_int_flags(&machine) & 1, 0, "AX={ax:04X}h clears CF");
-        }
     }
 
     #[test]
@@ -26770,7 +23783,7 @@ mod tests {
     }
 
     #[test]
-    fn new_dos_program_seeds_psp_env_pointer_with_blaster() {
+    fn new_raw_program_seeds_psp_env_pointer_with_blaster() {
         // A trivial exit-only program is enough: the env is seeded at load.
         let com: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
         let machine =
