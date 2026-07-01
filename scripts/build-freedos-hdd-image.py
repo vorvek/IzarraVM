@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Build a bootable, partitioned FAT32 Toka-DOS hard-disk image from the built
-components. Authoring-only sibling of build-freedos-image.py (the FAT12 floppy
-builder); this one emits crates/izarravm-firmware/roms/tokados-hdd.img.
+components. Authoring-only; emits crates/izarravm-firmware/roms/tokados-hdd.img.
 
 Layout:
   LBA 0                         MBR (mbr.bin) + a 4-entry partition table with one

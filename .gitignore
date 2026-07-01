@@ -16,7 +16,7 @@ __pycache__/
 # FreeDOS kernel build outputs (build-freedos.ps1). The vendored kernel tree's
 # own .gitignore already covers *.obj/*.lib/*.exe/*.com/*.bin/*.sys/*.map/config.bat;
 # this only adds the owcc .o files the cross-compile (owwin) profile emits, which
-# that vendored ignore predates. Shipped artifact is tokados.img, not these.
+# that vendored ignore predates. Shipped artifact is tokados-hdd.img, not these.
 toka-dos/freedos/**/*.o
 toka-dos/freedos/**/bin/
 
