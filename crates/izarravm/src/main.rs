@@ -795,7 +795,7 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
         CPU_OPCODE_PROFILE_PRINT_LIMIT, snapshot.sample_stride
     );
     println!(
-        "{:<8} {:<18} {:>13} {:>8} {:>13} {:>8} {:>12} {:>8} {:>9}",
+        "{:<8} {:<18} {:>13} {:>8} {:>13} {:>8} {:>12} {:>8} {:>9} {:>9} {:>9}",
         "opcode",
         "group",
         "instr",
@@ -804,7 +804,9 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
         "guest%",
         "sample_ms",
         "sample%",
-        "samples"
+        "samples",
+        "reg_i",
+        "mem_i"
     );
     for opcode in opcodes
         .iter()
@@ -812,7 +814,7 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
         .take(CPU_OPCODE_PROFILE_PRINT_LIMIT)
     {
         println!(
-            "{:<8} {:<18} {:>13} {:>7.2}% {:>13} {:>7.2}% {:>12.3} {:>7.2}% {:>9}",
+            "{:<8} {:<18} {:>13} {:>7.2}% {:>13} {:>7.2}% {:>12.3} {:>7.2}% {:>9} {:>9} {:>9}",
             format_profile_opcode(opcode.opcode),
             opcode.group,
             opcode.instructions,
@@ -822,6 +824,8 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
             opcode.sample_wall_ns as f64 / 1_000_000.0,
             100.0 * opcode.sample_wall_ns as f64 / total_sample as f64,
             opcode.samples,
+            opcode.register_instructions,
+            opcode.memory_instructions,
         );
     }
 }
@@ -895,6 +899,10 @@ fn write_profile_json(
                 "guest_core_clocks": opcode.guest_core_clocks,
                 "sample_wall_ns": opcode.sample_wall_ns,
                 "samples": opcode.samples,
+                "register_instructions": opcode.register_instructions,
+                "memory_instructions": opcode.memory_instructions,
+                "register_samples": opcode.register_samples,
+                "memory_samples": opcode.memory_samples,
             })).collect::<Vec<_>>(),
             "perf": perf_counters_json(&profiled.perf),
         },

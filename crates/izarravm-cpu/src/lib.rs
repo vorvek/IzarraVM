@@ -896,6 +896,10 @@ pub struct CpuOpcodeProfileBucket {
     pub guest_core_clocks: u64,
     pub sample_wall_ns: u64,
     pub samples: u64,
+    pub register_instructions: u64,
+    pub memory_instructions: u64,
+    pub register_samples: u64,
+    pub memory_samples: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -913,10 +917,32 @@ struct CpuProfileBucketState {
     samples: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuProfileOperandForm {
+    None,
+    Register,
+    Memory,
+}
+
+impl CpuProfileOperandForm {
+    #[inline]
+    fn from_insn(insn: &DecodedInsn) -> Self {
+        match insn.operand {
+            Some(DecodedOperand::Reg(_)) => Self::Register,
+            Some(DecodedOperand::Mem(_)) => Self::Memory,
+            None => Self::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CpuOpcodeProfileBucketState {
     group: DecodeGroup,
     bucket: CpuProfileBucketState,
+    register_instructions: u64,
+    memory_instructions: u64,
+    register_samples: u64,
+    memory_samples: u64,
 }
 
 #[derive(Clone)]
@@ -1431,6 +1457,7 @@ impl CpuProfileState {
         &mut self,
         group: DecodeGroup,
         opcode: u16,
+        form: CpuProfileOperandForm,
         guest_core_clocks: u64,
         start: Option<std::time::Instant>,
     ) {
@@ -1452,15 +1479,29 @@ impl CpuProfileState {
             .or_insert(CpuOpcodeProfileBucketState {
                 group,
                 bucket: CpuProfileBucketState::default(),
+                register_instructions: 0,
+                memory_instructions: 0,
+                register_samples: 0,
+                memory_samples: 0,
             });
         opcode_bucket.bucket.instructions += 1;
         opcode_bucket.bucket.guest_core_clocks += guest_core_clocks;
+        match form {
+            CpuProfileOperandForm::Register => opcode_bucket.register_instructions += 1,
+            CpuProfileOperandForm::Memory => opcode_bucket.memory_instructions += 1,
+            CpuProfileOperandForm::None => {}
+        }
         if let Some(sample_wall_ns) = sample_wall_ns {
             opcode_bucket.bucket.samples += 1;
             opcode_bucket.bucket.sample_wall_ns = opcode_bucket
                 .bucket
                 .sample_wall_ns
                 .saturating_add(sample_wall_ns);
+            match form {
+                CpuProfileOperandForm::Register => opcode_bucket.register_samples += 1,
+                CpuProfileOperandForm::Memory => opcode_bucket.memory_samples += 1,
+                CpuProfileOperandForm::None => {}
+            }
         }
         self.until_sample = if self.until_sample <= 1 {
             self.sample_stride
@@ -1480,6 +1521,10 @@ impl CpuProfileState {
                 guest_core_clocks: state.bucket.guest_core_clocks,
                 sample_wall_ns: state.bucket.sample_wall_ns,
                 samples: state.bucket.samples,
+                register_instructions: state.register_instructions,
+                memory_instructions: state.memory_instructions,
+                register_samples: state.register_samples,
+                memory_samples: state.memory_samples,
             })
             .collect::<Vec<_>>();
         opcodes.sort_by_key(|bucket| bucket.opcode);
@@ -2291,7 +2336,11 @@ impl Cpu386 {
         let result = match self.fetch_decoded(bus, lin) {
             Ok(insn) => {
                 if profiling {
-                    profile_key = Some((insn.group, insn.opcode));
+                    profile_key = Some((
+                        insn.group,
+                        insn.opcode,
+                        CpuProfileOperandForm::from_insn(&insn),
+                    ));
                 }
                 self.execute_decoded(&insn, bus)
             }
@@ -2316,7 +2365,7 @@ impl Cpu386 {
         result: ExecResult<CycleOutcome>,
         start_eip: u32,
         start_cs: u16,
-        profile_key: Option<(DecodeGroup, u16)>,
+        profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
     ) -> Result<CycleOutcome, CpuError> {
         let outcome = match result {
@@ -2342,8 +2391,9 @@ impl Cpu386 {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += 1;
-        if let Some((group, opcode)) = profile_key {
-            self.profile.record(group, opcode, charged, profile_start);
+        if let Some((group, opcode, form)) = profile_key {
+            self.profile
+                .record(group, opcode, form, charged, profile_start);
         }
         Ok(CycleOutcome {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
@@ -2485,7 +2535,11 @@ impl Cpu386 {
             result,
             start_eip,
             start_cs,
-            profiling.then_some((insn.group, insn.opcode)),
+            profiling.then_some((
+                insn.group,
+                insn.opcode,
+                CpuProfileOperandForm::from_insn(insn),
+            )),
             profile_start,
         )
     }
@@ -11737,6 +11791,29 @@ mod tests {
         let opcode = profile_opcode(&snapshot, 0x40);
         assert_eq!(opcode.instructions, 4);
         assert_eq!(opcode.samples, 2);
+    }
+
+    #[test]
+    fn cpu_profile_opcode_counts_register_and_memory_forms() {
+        let code = [
+            0x8b, 0xc0, // mov ax, ax
+            0x8b, 0x06, 0x20, 0x00, // mov ax, [0x0020]
+        ];
+        let (mut cpu, mut bus) = profile_test_cpu(&code);
+        cpu.enable_profiling(1);
+
+        for _ in 0..2 {
+            cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+        }
+
+        let snapshot = cpu.profile_snapshot();
+        let opcode = profile_opcode(&snapshot, 0x8b);
+        assert_eq!(opcode.instructions, 2);
+        assert_eq!(opcode.samples, 2);
+        assert_eq!(opcode.register_instructions, 1);
+        assert_eq!(opcode.memory_instructions, 1);
+        assert_eq!(opcode.register_samples, 1);
+        assert_eq!(opcode.memory_samples, 1);
     }
 
     #[test]
