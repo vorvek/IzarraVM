@@ -2,8 +2,8 @@
 # Builds the kernel (kernel.sys + fat12com.bin) and the FreeCOM shell
 # (command.com), in that order.
 #
-# The shipped artifact is tokados.img (built in a later step), not the files this
-# script emits; kernel.sys / fat12com.bin / command.com / *.obj are gitignored.
+# The shipped artifact is tokados-hdd.img (built in a later step), not the files
+# this script emits; kernel.sys / fat12com.bin / command.com / *.obj are gitignored.
 # Run from anywhere; paths resolve against this script.
 #
 # Why not freedos\kernel\build.bat? That batch uses the COMPILER=WATCOM profile,
@@ -178,11 +178,7 @@ if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
 Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
 
-# --- Assemble the committed images (FAT12 floppy + FAT32 HDD) ---
-& python (Join-Path $root '..\scripts\build-freedos-image.py')
-if ($LASTEXITCODE -ne 0) { throw "floppy image build failed" }
-Write-Host "Toka-DOS floppy image built: crates/izarravm-firmware/roms/tokados.img"
-
+# --- Assemble the committed image (FAT32 HDD) ---
 & python (Join-Path $root '..\scripts\build-freedos-hdd-image.py')
 if ($LASTEXITCODE -ne 0) { throw "HDD image build failed" }
 Write-Host "Toka-DOS HDD image built: crates/izarravm-firmware/roms/tokados-hdd.img"

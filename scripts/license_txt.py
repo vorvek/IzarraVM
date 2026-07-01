@@ -6,7 +6,7 @@ past on every boot. It is built from the project's NOTICE (attributions) and the
 FreeDOS kernel COPYING (the full GNU GPL v2) — single source, no duplicated blob;
 edit NOTICE / kernel/COPYING and rebuild the images, not a checked-in copy.
 
-Both build-freedos-hdd-image.py and build-freedos-image.py import this.
+build-freedos-hdd-image.py imports this.
 """
 import os
 

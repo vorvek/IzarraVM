@@ -62,11 +62,6 @@ static IZARRA_FLASH: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| 
     flash
 });
 
-/// The Toka-DOS floppy disk image: a 1.44 MiB bootable floppy disk image
-/// containing a complete Toka-DOS system. Used for booting real FreeDOS on
-/// the Izarra 3000.
-pub const TOKADOS_IMG: &[u8] = include_bytes!("../roms/tokados.img");
-
 /// The Toka-DOS hard-disk image: a partitioned, bootable FAT32 disk image with a
 /// standard MBR, one primary FAT32-LBA partition, and a complete Toka-DOS system
 /// (KERNEL.SYS, COMMAND.COM, CONFIG.SYS, AUTOEXEC.BAT, HELLO.TXT). Mount with
@@ -105,10 +100,6 @@ pub fn boot_test_image() -> &'static [u8] {
 /// with `Machine::bench_iterations` / `bench_aux` after the `TestExit` stop.
 pub fn neurketa_image() -> &'static [u8] {
     NEURKETA_IMAGE
-}
-
-pub fn tokados_img() -> &'static [u8] {
-    TOKADOS_IMG
 }
 
 pub fn tokados_hdd_img() -> &'static [u8] {
@@ -538,12 +529,5 @@ mod tests {
     #[test]
     fn whetstone_exe_starts_with_mz() {
         assert_eq!(&whetstone_exe()[0..2], &[0x4D, 0x5A]);
-    }
-
-    #[test]
-    fn tokados_img_is_a_144_floppy_with_boot_signature() {
-        let img = super::tokados_img();
-        assert_eq!(img.len(), 1_474_560, "tokados.img must be a 1.44MB floppy");
-        assert_eq!(&img[0x1FE..0x200], &[0x55, 0xAA], "boot signature");
     }
 }
