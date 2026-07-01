@@ -32,7 +32,6 @@ mod ata;
 mod atapi;
 mod cdimage;
 mod dma;
-mod dosmem;
 mod ems;
 mod fat12;
 mod fat32;
@@ -1321,9 +1320,6 @@ pub struct Machine {
     // the VGA text screen. DOS CON output goes to the kernel's stdout buffer; the
     // machine mirrors the new bytes onto the framebuffer so the screen shows them.
     dos_screen_shown: usize,
-    // The live DOS UMB/MCB memory-manager, extracted from `izarravm-dos`. Drives
-    // `furnish_dos_upper_memory`.
-    dosmem: dosmem::DosMemory,
     /// True only for a `new_raw_program` machine: routes INT 20h/21h/27h to
     /// `handle_raw_program_int`. See
     /// `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3a.
@@ -1662,7 +1658,6 @@ impl Machine {
             toka_service_status: 0,
             katea_root: None,
             dos_screen_shown: 0,
-            dosmem: dosmem::DosMemory::default(),
             program_runtime: false,
             program_output: Vec::new(),
             rom,
@@ -2228,21 +2223,15 @@ impl Machine {
         let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_TAIL, off);
     }
 
-    /// Lay out the upper-memory window and furnish the `dosmem` UMB arena: the
-    /// IZEMM SYSINIT step. Reserve the ROM, then carve the largest remaining hole as
-    /// the UMB pool. With no upper memory free, no arena is kept.
-    ///
-    /// This rebuilds the window from scratch every call, so a warm reboot (INT 19h
-    /// re-enters this) brings the upper arena back as a single free block like the
-    /// conventional arena, rather than keeping the prior session's chain.
     fn furnish_dos_upper_memory(&mut self) -> Result<(), MachineError> {
         self.uma.reset();
         let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
         debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
+        // RAM-mode EMS reserves its 64 KiB page frame in the upper window (host EMS
+        // is still native). The UMB pool is no longer carved here: TOKAEMM page-maps
+        // extended RAM into the free upper holes and serves UMBs itself (SP-4b M3),
+        // so `set_umb_region` / the dosmem UMB engine are gone.
         let mode = self.profile.emm386;
-        // RAM mode reserves the EMS page frame first, at the configured FRAME
-        // segment when present, so the UMB pool carves around it. If the configured
-        // address is not available, fall back to a first-fit hole.
         if mode.provides_ems()
             && self
                 .uma
@@ -2251,23 +2240,6 @@ impl Machine {
         {
             self.uma.alloc_ems_frame();
         }
-        // With EMM386 unloaded there is no upper memory; otherwise carve the UMB
-        // pool from the largest remaining hole. Always call set_umb_region (with
-        // (0, 0) when there is no pool) so a reboot clears any arena a prior session
-        // left rather than stranding the kernel on a stale pool.
-        let (seg, paras) = if mode.provides_umb() {
-            match self.uma.largest_free_hole() {
-                Some((_, size)) => match self.uma.alloc_umb(size) {
-                    Some(base) => ((base >> 4) as u16, (size >> 4) as u16),
-                    None => (0, 0),
-                },
-                None => (0, 0),
-            }
-        } else {
-            (0, 0)
-        };
-        let Machine { dosmem, memory, .. } = self;
-        dosmem.set_umb_region(seg, paras, memory)?;
         Ok(())
     }
 
@@ -14536,31 +14508,28 @@ mod tests {
     #[test]
     fn refurnishing_resets_the_upper_arena_like_a_warm_reboot() {
         const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
-        let mut machine =
-            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
-                .unwrap();
-        let base = (0xc800u32 << 4) as usize;
-        // Dirty the pool the way a prior session would: an owned (non-free) block at
-        // the pool head, the stale chain the warm-reboot blocker would have kept.
-        machine.memory.write_u8(base, b'M').unwrap();
-        machine.memory.write_u16(base + 1, 0x1234).unwrap(); // owner = a dead PSP
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         // Re-furnish: the INT 19h SYSINIT path runs this again. It must re-lay the
-        // arena, not early-out on a window the prior carve left fully reserved.
+        // window from scratch, not accumulate reservations across calls (TOKAEMM,
+        // not the host, now owns UMBs — see SP-4b M3).
         machine.furnish_dos_upper_memory().unwrap();
-        assert_eq!(machine.read_physical_u8(base as u32), b'Z', "arena re-laid");
+        let kinds: Vec<_> = machine.uma.reservations().iter().map(|r| r.kind).collect();
         assert_eq!(
-            read_u16(&mut machine, base as u32 + 1),
-            0,
-            "pool free again"
+            kinds.iter().filter(|k| **k == UmaUse::Rom).count(),
+            1,
+            "no duplicate ROM reservation after re-furnish"
         );
-        // The map did not accumulate stale reservations: one ROM, one UMB.
-        let umb = machine
-            .uma
-            .reservations()
-            .iter()
-            .filter(|r| r.kind == UmaUse::Umb)
-            .count();
-        assert_eq!(umb, 1, "no duplicate UMB reservation after re-furnish");
+        assert_eq!(
+            kinds.iter().filter(|k| **k == UmaUse::EmsFrame).count(),
+            1,
+            "no duplicate EMS frame reservation after re-furnish"
+        );
+        assert!(
+            !kinds.contains(&UmaUse::Umb),
+            "the host no longer carves a UMB pool"
+        );
     }
 
     #[test]
@@ -14614,8 +14583,9 @@ mod tests {
         assert!(machine.ems.is_some(), "RAM provisions EMS at construction");
 
         // A CONFIG.SYS NOEMS line re-applies at SYSINIT: the manager becomes
-        // frameless (no backing pages, no frame) but stays present, UMBs stay, and
-        // the EMS frame is no longer reserved (the UMB pool grows over it).
+        // frameless (no backing pages, no frame) but stays present, and the EMS
+        // frame is no longer reserved. The host no longer carves UMBs at all
+        // (TOKAEMM page-maps them itself, SP-4b M3).
         machine.set_emm386_mode(Emm386Mode::NoEms).unwrap();
         let noems_ems = machine
             .ems
@@ -14628,13 +14598,16 @@ mod tests {
             "NOEMS has no backing pages"
         );
         let kinds: Vec<_> = machine.uma.reservations().iter().map(|r| r.kind).collect();
-        assert!(kinds.contains(&UmaUse::Umb), "NOEMS keeps UMBs");
+        assert!(
+            !kinds.contains(&UmaUse::Umb),
+            "the host no longer carves UMBs"
+        );
         assert!(
             !kinds.contains(&UmaUse::EmsFrame),
             "NOEMS reserves no frame"
         );
 
-        // Unloaded drops UMBs too; only the VGA BIOS stays reserved.
+        // Unloaded also leaves only the VGA BIOS reserved.
         machine.set_emm386_mode(Emm386Mode::Unloaded).unwrap();
         assert!(machine.ems.is_none());
         assert_eq!(

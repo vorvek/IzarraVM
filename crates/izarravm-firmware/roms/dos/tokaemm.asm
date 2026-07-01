@@ -62,6 +62,19 @@ XMS_HANDLES equ 32
 XMS_SLOT    equ 8
 xms_table: times XMS_HANDLES*XMS_SLOT db 0
 
+; SP-4b M3 UMB: the free upper window 0xC8000-0xEFFFF (above the VGA BIOS, below
+; system ROM), 160 KB, page-mapped at INIT to extended RAM just above the HMA. The
+; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, 0xF000).
+UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
+UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
+UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
+UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment)
+UMB_SEG_PARAS equ 0x2800          ; 160 KB / 16 = paragraphs in the window
+; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
+UMB_SLOTS equ 8
+UMB_SLOT  equ 6
+umb_table: times UMB_SLOTS*UMB_SLOT db 0
+
 strategy:
     mov [cs:rh_ptr], bx
     mov [cs:rh_ptr+2], es
@@ -104,9 +117,9 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
-    ; --- SP-4b M1: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
-    ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Pool = [1 MB + 64 KB
-    ; HMA, 1 MB + min(ext, 15 MB)) so it stays inside the monitor's 0..16 MB map.
+    ; --- SP-4b M1/M3: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
+    ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
+    ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
     mov ah, 0x88
     int 0x15                      ; AX = extended KB (real mode, before V86)
     movzx eax, ax
@@ -115,11 +128,11 @@ init:
     mov eax, 15*1024
 .pool_ok:
     sub eax, 64                   ; drop the HMA (first 64 KB of extended memory)
-    shl eax, 10                   ; KB -> bytes = pool length
-    mov ebx, 0x00110000           ; base = 1 MB + 64 KB (above the HMA)
-    mov [cs:xms_pool_base], ebx
-    add eax, ebx
+    shl eax, 10                   ; KB -> bytes
+    add eax, 0x00110000           ; eax = top of extended (pool_end, unchanged from M1)
     mov [cs:xms_pool_end], eax
+    ; The 160 KB UMB backing sits just above the HMA (SP-4b M3); XMS starts past it.
+    mov dword [cs:xms_pool_base], UMB_PHYS_BASE + UMB_BYTES
     ; Hook INT 2Fh: save the old vector, install our handler (IVT at linear 0).
     push ds
     xor ax, ax
@@ -223,8 +236,8 @@ xms_2f_handler:
 ; (AX=1 success / AX=0 + BL=error). Register-safe table dispatch (only BX is
 ; touched, then restored, so CX/DX/SI/DI/BP/DS inputs survive to the handler).
 xms_entry:
-    cmp ah, 0x0F
-    ja .unimpl                   ; 10h+ (UMB) : not implemented in M1 (guest UMB = M3)
+    cmp ah, 0x12
+    ja .unimpl                   ; 13h+ : not implemented
     push bx
     movzx bx, ah
     add bx, bx
@@ -234,13 +247,14 @@ xms_entry:
     jmp [cs:xms_disp]
 .unimpl:
     xor ax, ax
-    mov bl, 0xB1                  ; no UMB available / not implemented
+    mov bl, 0x80                  ; function not implemented
     retf
 xms_jt:
     dw xf_version, xf_req_hma,   xf_rel_hma,  xf_a20_gon
     dw xf_a20_goff, xf_a20_lon,  xf_a20_loff, xf_a20_query
     dw xf_query_free, xf_alloc,  xf_free,     xf_move
     dw xf_lock,    xf_unlock,    xf_info,     xf_resize
+    dw xf_req_umb, xf_rel_umb,   xf_realloc_umb
 
 ; shared tails
 xms_ok:
@@ -709,6 +723,214 @@ resolve:
     stc
     ret
 
+; --- SP-4b M3 UMB (XMS 10h/11h/12h) over the paged window [UMB_SEG_BASE, +PARAS) --
+
+; 10h Request UMB: DX = paragraphs. First-fit a free run; on success mark a slot.
+;   success: AX=1, BX=segment, DX=paras. smaller-only: AX=0, BL=0xB0, DX=largest.
+;   none: AX=0, BL=0xB1, DX=0.
+xf_req_umb:
+    push si
+    call umb_free_run             ; DX=need -> BX=seg, CF clear; or CF set
+    jc .toobig
+    mov si, umb_table             ; find a free slot for the block record
+    push cx
+    mov cx, UMB_SLOTS
+.slot:
+    cmp byte [cs:si], 0
+    je .got
+    add si, UMB_SLOT
+    loop .slot
+    pop cx                        ; no slot (DOS grabs once, so unexpected)
+    xor dx, dx
+    mov bl, 0xB1
+    pop si
+    jmp xms_fail
+.got:
+    pop cx
+    mov byte [cs:si], 1
+    mov [cs:si+2], bx             ; seg
+    mov [cs:si+4], dx             ; paras
+    pop si
+    mov ax, 1                     ; BX=seg, DX=paras already set
+    retf
+.toobig:
+    call umb_largest              ; AX = largest free run (paras)
+    test ax, ax
+    jz .none
+    mov dx, ax                    ; DX = largest
+    mov bl, 0xB0
+    xor ax, ax
+    pop si
+    retf
+.none:
+    xor dx, dx
+    mov bl, 0xB1
+    xor ax, ax
+    pop si
+    retf
+
+; 11h Release UMB: DX = segment.
+xf_rel_umb:
+    push si
+    call umb_slot_of_seg          ; DX=seg -> SI=slot, CF clear; or CF set (BL=0xB2)
+    jc .bad
+    mov byte [cs:si], 0
+    pop si
+    jmp xms_ok
+.bad:
+    pop si
+    jmp xms_fail
+
+; 12h Reallocate UMB: BX = new paras, DX = segment. Shrink always; grow if the
+; space above the block is free. Grow-fail: AX=0, BL=0xB0, DX=largest growable.
+xf_realloc_umb:
+    push si
+    call umb_slot_of_seg
+    jc .bad
+    cmp bx, [cs:si+4]             ; new <= old?
+    jbe .set
+    call umb_max_grow             ; SI=slot -> AX = max paras from this seg
+    cmp bx, ax                    ; new <= maxgrow?
+    ja .nofit
+.set:
+    mov [cs:si+4], bx
+    pop si
+    jmp xms_ok
+.nofit:
+    mov dx, ax                    ; DX = largest growable
+    mov bl, 0xB0
+    pop si
+    xor ax, ax
+    retf
+.bad:
+    pop si
+    jmp xms_fail
+
+; First-fit free run of DX paras in [UMB_SEG_BASE, +UMB_SEG_PARAS). Restart-on-
+; overlap (mirrors find_gap). out: BX = seg, CF clear; or CF set. Preserves DX;
+; clobbers ax, cx, si.
+umb_free_run:
+    push cx
+    push si
+    cmp dx, UMB_SEG_PARAS         ; bigger than the whole window? can't fit (dodges
+    ja .none                      ; the 16-bit wrap on cursor+need for huge probes).
+    mov bx, UMB_SEG_BASE
+.restart:
+    mov ax, bx
+    add ax, dx                    ; cursor + need
+    cmp ax, UMB_SEG_BASE + UMB_SEG_PARAS
+    ja .none
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.scan:
+    cmp byte [cs:si], 0
+    je .next
+    mov ax, [cs:si+2]
+    add ax, [cs:si+4]             ; b.top = seg + paras
+    cmp ax, bx                    ; b.top <= cursor? (below)
+    jbe .next
+    mov ax, bx
+    add ax, dx                    ; cursor + need
+    cmp [cs:si+2], ax             ; b.seg >= cursor+need? (above)
+    jae .next
+    mov bx, [cs:si+2]             ; overlap: cursor = b.top, restart
+    add bx, [cs:si+4]
+    jmp .restart
+.next:
+    add si, UMB_SLOT
+    loop .scan
+    pop si
+    pop cx
+    clc
+    ret
+.none:
+    pop si
+    pop cx
+    stc
+    ret
+
+; Largest free run in paras. Approximated as the run from the highest block top to
+; the window end (exact for first-fit-from-base without middle frees, which is how
+; DOS=UMB uses it). ponytail: an exact largest-gap needs a sorted walk.
+; out: AX = largest free paras. clobbers cx, dx, si.
+umb_largest:
+    push cx
+    push si
+    push dx
+    mov ax, UMB_SEG_BASE          ; highest top so far
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.l:
+    cmp byte [cs:si], 0
+    je .n
+    mov dx, [cs:si+2]
+    add dx, [cs:si+4]             ; b.top
+    cmp dx, ax
+    jbe .n
+    mov ax, dx
+.n:
+    add si, UMB_SLOT
+    loop .l
+    neg ax
+    add ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; window_end - highest_top
+    pop dx
+    pop si
+    pop cx
+    ret
+
+; DX = seg -> SI = slot offset, CF clear; or CF set (BL=0xB2). Clobbers ax, cx.
+umb_slot_of_seg:
+    push cx
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.f:
+    cmp byte [cs:si], 0
+    je .n
+    mov ax, [cs:si+2]
+    cmp ax, dx
+    je .hit
+.n:
+    add si, UMB_SLOT
+    loop .f
+    pop cx
+    mov bl, 0xB2                  ; invalid UMB segment
+    stc
+    ret
+.hit:
+    pop cx
+    clc
+    ret
+
+; Max paras the block at SI can grow to (nearest higher block seg, or window end,
+; minus this seg). in: SI = slot. out: AX. preserves SI/BX/CX/DX.
+umb_max_grow:
+    push bx
+    push cx
+    push di
+    mov di, [cs:si+2]             ; our seg
+    mov ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; nearest boundary = window end
+    push si
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.s:
+    cmp byte [cs:si], 0
+    je .n
+    mov bx, [cs:si+2]             ; other seg
+    cmp bx, di                    ; other <= our seg? (self or below)
+    jbe .n
+    cmp bx, ax                    ; other < nearest?
+    jae .n
+    mov ax, bx
+.n:
+    add si, UMB_SLOT
+    loop .s
+    pop si
+    sub ax, di                    ; max paras = nearest - our seg
+    pop di
+    pop cx
+    pop bx
+    ret
+
 align 8
 gdt:
     dq 0
@@ -768,6 +990,20 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     add eax, 0x1000
     add edi, 4
     loop .pt
+    ; SP-4b M3: page the free upper window 0xC8000-0xEFFFF to extended RAM (the
+    ; EMM386 trick). On real hardware these holes have no RAM; a UMB there must be
+    ; extended RAM mapped in. (This emulator's flat array also backs phys 0xC8000 via
+    ; read_phys's fallback, so identity would work too -- but mapping proper extended
+    ; RAM is faithful and keeps the UMB accounted against extended memory, not phantom
+    ; RAM.) ROM/video PTEs stay identity; only these 40 move.
+    lea edi, [ebp + 0x1000 + (UMB_LIN_BASE >> 12) * 4]  ; PT0 entry for 0xC8000
+    mov eax, UMB_PHYS_BASE | 7                          ; backing base, present/rw/user
+    mov ecx, UMB_BYTES >> 12                            ; 40 pages
+.umb_map:
+    mov [edi], eax
+    add eax, 0x1000
+    add edi, 4
+    loop .umb_map
     mov cr3, ebp
     mov eax, cr0
     or eax, 0x80000000            ; paging on

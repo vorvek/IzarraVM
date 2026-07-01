@@ -18,6 +18,10 @@ pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
 pub const XMSTEST_COM: &[u8] = include_bytes!("../roms/dos/xmstest.com");
 pub const XMSTEST_COM_SOURCE: &str = include_str!("../roms/dos/xmstest.asm");
+pub const UMBTEST_COM: &[u8] = include_bytes!("../roms/dos/umbtest.com");
+pub const UMBTEST_COM_SOURCE: &str = include_str!("../roms/dos/umbtest.asm");
+pub const UMBMECH_COM: &[u8] = include_bytes!("../roms/dos/umbmech.com");
+pub const UMBMECH_COM_SOURCE: &str = include_str!("../roms/dos/umbmech.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
@@ -140,6 +144,23 @@ pub fn exit42_com() -> &'static [u8] {
 /// V86 under TOKAEMM; a non-0xA5 exit code names the step that broke.
 pub fn xmstest_com() -> &'static [u8] {
     XMSTEST_COM
+}
+
+/// The SP-4b M3 UMB e2e fixture: with DOS=UMB, set the high-first allocation
+/// strategy, AH=48h-allocate a block, assert it landed in upper memory (segment
+/// 0xC800 or above) with real RAM behind it (write/read a pattern) — proving
+/// TOKAEMM page-mapped extended RAM into the upper holes and DOS=UMB consumed it.
+/// Runs in V86; signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
+pub fn umbtest_com() -> &'static [u8] {
+    UMBTEST_COM
+}
+
+/// The SP-4b M3 UMB *mechanism* fixture: drives XMS 10h/11h/12h directly (no
+/// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach — the
+/// too-big probe (B0h + largest), alloc, grow, release, and reuse-after-free —
+/// plus a write/read of the paged RAM. Signals 0xA5 (or a 0xEn step code).
+pub fn umbmech_com() -> &'static [u8] {
+    UMBMECH_COM
 }
 
 /// TOKAEMM.SYS (SP-4b M0): a bespoke memory-manager char device. Its INIT runs
