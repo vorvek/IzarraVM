@@ -10403,20 +10403,33 @@ impl Machine {
         Ok((done_count, None))
     }
 
-    /// Mirror any DOS console output produced since the last call onto the VGA
-    /// text screen. DOS programs write CON through INT 21h, which the kernel
-    /// buffers; real DOS renders that to the screen via the BIOS teletype. We do
-    /// the same here so a Toka-DOS session is visible on the framebuffer, sharing
-    /// the BDA cursor at 0040:0050 with the BIOS.
+    /// Mirror any console output produced since the last call onto the VGA
+    /// text screen. Programs write CON through INT 21h, which is buffered
+    /// (by `self.dos` for the DOS-kernel runtime, by `self.program_output`
+    /// for the native `new_raw_program` runtime); real DOS renders that to
+    /// the screen via the BIOS teletype. We do the same here so a session is
+    /// visible on the framebuffer, sharing the BDA cursor at 0040:0050 with
+    /// the BIOS.
     fn flush_dos_console_to_screen(&mut self) {
-        let total = self.dos_output().len();
+        let total = self.console_output().len();
         if self.dos_screen_shown >= total {
             return;
         }
-        let pending: Vec<u8> = self.dos_output()[self.dos_screen_shown..].to_vec();
+        let pending: Vec<u8> = self.console_output()[self.dos_screen_shown..].to_vec();
         self.dos_screen_shown = total;
         for byte in pending {
             self.teletype_char(byte);
+        }
+    }
+
+    /// Whichever console output buffer is live for this machine's runtime:
+    /// `program_output` for a native `new_raw_program` machine, `dos_output`
+    /// for the DOS-kernel-backed `new_dos_program` path otherwise.
+    fn console_output(&self) -> &[u8] {
+        if self.program_runtime {
+            &self.program_output
+        } else {
+            self.dos_output()
         }
     }
 
@@ -14647,6 +14660,29 @@ mod tests {
         let reason = m.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(m.program_output(), b"Hi");
+    }
+
+    #[test]
+    fn new_raw_program_output_reaches_the_vga_screen() {
+        // Same program as new_raw_program_prints_a_dollar_terminated_string:
+        // org 0x100: mov ah,9 / mov dx,msg / int 21h / mov ax,4c00h / int 21h
+        // msg ("Hi$") placed right after the code, addressed PSP-relative.
+        // Code is 12 bytes, so msg starts at offset 0x100+12 = 0x10C.
+        let prog: &[u8] = &[
+            0xb4, 0x09, 0xba, 0x0c, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'H', b'i',
+            b'$',
+        ];
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        let reason = m.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let screen = m.screen_text();
+        assert!(
+            screen.line_string(0).starts_with("Hi"),
+            "screen line 0 was {:?}",
+            screen.line_string(0)
+        );
     }
 
     #[test]
