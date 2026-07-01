@@ -1037,6 +1037,12 @@ pub struct Cpu386 {
     /// `flag()` (single bit) or `eflags()`/`materialized_eflags()` (whole word), or call
     /// `materialize_flags()` before a read-modify-write of the whole word.
     pending_flags: Option<LazyFlags>,
+    /// Cached `CR0.AM && EFLAGS.AC`, so the per-data-access #AC gate in `check_alignment`
+    /// is a single bool test instead of two register loads. Pure derived state, recomputed
+    /// by `recompute_alignment_armed` at every writer that can change either bit (see that
+    /// method for the chokepoint inventory). `Default`/`reset` leave it `false`, matching
+    /// the reset images (CR0 without AM, EFLAGS 0x2); `Clone` copies it consistently.
+    alignment_armed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5778,6 +5784,7 @@ impl Cpu386 {
                         }
                         if self.control.cr0 != cr0 {
                             self.control.cr0 = cr0;
+                            self.recompute_alignment_armed();
                             self.flush_tlb_and_code_caches();
                         }
                         Ok(clocks(3))
@@ -5941,6 +5948,7 @@ impl Cpu386 {
                 match modrm.reg {
                     0 => {
                         self.control.cr0 = value;
+                        self.recompute_alignment_armed();
                         self.flush_tlb_and_code_caches();
                     }
                     2 => self.control.cr2 = value,
@@ -7132,12 +7140,10 @@ impl Cpu386 {
     // a 4-byte boundary). Supervisor accesses (CPL < 3) and instruction fetches are exempt;
     // fetches never route through this helper. Byte accesses (width 1) are always aligned.
     fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
-        if width <= 1 {
+        if width <= 1 || !self.alignment_armed {
             return Ok(());
         }
-        let am = self.control.cr0 & CR0_AM != 0;
-        let ac = self.registers.eflags & FLAG_AC != 0;
-        if am && ac && self.current_privilege_level() == 3 && offset % width != 0 {
+        if self.current_privilege_level() == 3 && offset % width != 0 {
             // Real 486 #AC pushes a zero error code; this core models it without one,
             // matching the rest of the spec's fault contract. Flagged as a divergence.
             return Err(InternalFault::Exception {
@@ -7146,6 +7152,24 @@ impl Cpu386 {
             });
         }
         Ok(())
+    }
+
+    /// Recompute the cached `alignment_armed` bit (`CR0.AM && EFLAGS.AC`). Called at every
+    /// writer that can change either bit:
+    /// - CR0.AM: `MOV CR0, reg` and (defensively) LMSW. LMSW only loads MP/EM/TS/PE,
+    ///   CLTS and the task-switch `CR0.TS |=` only touch TS, so none of those can flip
+    ///   AM, but the two explicit CR0 image writers both recompute for uniformity.
+    /// - EFLAGS.AC: `load_flags` (POPF/POPFD and every IRET form route through it), the
+    ///   task-switch EFLAGS load, and `set_flag_live` when the mask includes AC (the
+    ///   check const-folds away at the arithmetic-flag call sites). SAHF, the lazy-flag
+    ///   materialization, and the VM/NT/AF read-modify-writes never reach bit 18.
+    ///
+    /// `registers`/`control` are pub, so a direct field poke bypasses this; the only such
+    /// non-test writer in the tree (`boot_sector_cpu`) pokes a fresh `Cpu386::default()`
+    /// whose reset image has both bits clear, matching the default `false`.
+    fn recompute_alignment_armed(&mut self) {
+        self.alignment_armed =
+            self.control.cr0 & CR0_AM != 0 && self.registers.eflags & FLAG_AC != 0;
     }
 
     fn translate_segmented<B: CpuBus>(
@@ -8116,6 +8140,8 @@ impl Cpu386 {
         // The loaded image is the new truth for every flag bit; any deferred descriptor would
         // otherwise override the arithmetic bits we just wrote.
         self.pending_flags = None;
+        // The dword form can change EFLAGS.AC (the word form keeps the high half).
+        self.recompute_alignment_armed();
     }
 
     fn iret<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<()> {
@@ -8563,6 +8589,7 @@ impl Cpu386 {
         self.registers.eflags = eflags | 0x2;
         // The incoming task's eflags is the new truth; drop any stale arithmetic descriptor.
         self.pending_flags = None;
+        self.recompute_alignment_armed();
         self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
             let selector = bus.read_memory(
@@ -8881,6 +8908,11 @@ impl Cpu386 {
             self.registers.eflags &= !flag;
         }
         self.registers.eflags |= 0x2;
+        // `flag` is a compile-time-constant mask at every call site, so this folds away
+        // everywhere except the (cold) AC writers.
+        if flag & FLAG_AC != 0 {
+            self.recompute_alignment_armed();
+        }
     }
 
     fn set_flag(&mut self, flag: u32, enabled: bool) {
