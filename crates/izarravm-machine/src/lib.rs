@@ -10173,6 +10173,26 @@ impl CpuBus for MachineBus<'_> {
         if count == 0 {
             return Ok(());
         }
+        // Fast path: a run that lies entirely in conventional RAM (below the
+        // 0xA0000 video aperture). Every address below 0x100000 has bit 20 clear,
+        // so `apply_a20` is the identity there regardless of the gate state;
+        // `code_fetch_wait_states` is the per-mode I-cache constant for any
+        // address below 0xA0000 (the device-window gate only engages at or above
+        // it); and a contiguous run below 0xA0000 is uniform by construction.
+        // The classification below would therefore always land in the uniform
+        // cacheable-RAM arm and charge ONE I-cache access at the constant
+        // wait-state, so charge exactly that in one step. ROM/device/A20-edge
+        // runs keep the full classification, byte-for-byte.
+        if let Some(end) = start.checked_add(count - 1) {
+            if end < 0x000A_0000 {
+                self.trace.record_instruction_fetch_run(
+                    start,
+                    1,
+                    self.cache.code_fetch_wait_states(),
+                );
+                return Ok(());
+            }
+        }
         let first = self.apply_a20(start);
         let last = self.apply_a20(start.wrapping_add(count - 1));
         let first_ws = self.code_fetch_wait_states(first);
