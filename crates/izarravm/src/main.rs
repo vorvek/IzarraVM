@@ -2388,8 +2388,7 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
         let autoexec = b"@ECHO OFF\r\nXMSTEST\r\n".to_vec();
 
-        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        profile.emm386 = izarravm_core::Emm386Mode::NoEms;
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
@@ -2447,8 +2446,7 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
         let autoexec = b"@ECHO OFF\r\nUMBTEST\r\n".to_vec();
 
-        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        profile.emm386 = izarravm_core::Emm386Mode::NoEms;
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
@@ -2504,8 +2502,7 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
         let autoexec = b"@ECHO OFF\r\nUMBMECH\r\n".to_vec();
 
-        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        profile.emm386 = izarravm_core::Emm386Mode::NoEms;
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
