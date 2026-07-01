@@ -2783,11 +2783,11 @@ impl Cpu386 {
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
                     };
-                    self.write_gpr_sized(
-                        index,
-                        insn.operand_size,
-                        self.read_gpr_sized(modrm.reg, insn.operand_size),
-                    );
+                    if insn.operand_size == OperandSize::Word {
+                        self.write_gpr16(index, self.read_gpr16(modrm.reg));
+                    } else {
+                        self.write_gpr32(index, self.read_gpr32(modrm.reg));
+                    }
                     Some(clocks(2))
                 }
                 0x8a => {
