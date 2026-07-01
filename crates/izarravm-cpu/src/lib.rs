@@ -2744,29 +2744,31 @@ impl Cpu386 {
                 }
                 0x84 => {
                     let modrm = insn.modrm?;
+                    if modrm.mode == 3 && modrm.reg == modrm.rm {
+                        let value = self.read_gpr8(modrm.rm);
+                        self.alu_logic(u32::from(value), BusWidth::Byte);
+                        return Some(clocks(2));
+                    }
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
                     };
                     let value = self.read_gpr8(index);
-                    let result = if index == modrm.reg {
-                        value
-                    } else {
-                        value & self.read_gpr8(modrm.reg)
-                    };
+                    let result = value & self.read_gpr8(modrm.reg);
                     self.alu_logic(u32::from(result), BusWidth::Byte);
                     Some(clocks(2))
                 }
                 0x85 => {
                     let modrm = insn.modrm?;
+                    if modrm.mode == 3 && modrm.reg == modrm.rm {
+                        let value = self.read_gpr_sized(modrm.rm, insn.operand_size);
+                        self.alu_logic(value, insn.operand_size.bus_width());
+                        return Some(clocks(2));
+                    }
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
                     };
                     let value = self.read_gpr_sized(index, insn.operand_size);
-                    let result = if index == modrm.reg {
-                        value
-                    } else {
-                        value & self.read_gpr_sized(modrm.reg, insn.operand_size)
-                    };
+                    let result = value & self.read_gpr_sized(modrm.reg, insn.operand_size);
                     self.alu_logic(result, insn.operand_size.bus_width());
                     Some(clocks(2))
                 }
