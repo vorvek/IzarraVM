@@ -29,6 +29,44 @@ start:
     cmp ax, 0x0300
     jne f_ver
 
+    ; 3b. query free extended memory (08h): DX = total KB, expect >= 64
+    mov ah, 0x08
+    call far [entry]
+    cmp dx, 64
+    jb f_query
+
+    ; 3c. HMA claim (01h) succeeds, re-claim fails with BL=0x91, release (02h)
+    mov ah, 0x01
+    mov dx, 0xFFFF
+    call far [entry]
+    or ax, ax
+    jz f_hma
+    mov ah, 0x01
+    mov dx, 0xFFFF
+    call far [entry]
+    or ax, ax
+    jnz f_hma                    ; a second claim must fail
+    cmp bl, 0x91
+    jne f_hma
+    mov ah, 0x02
+    call far [entry]
+    or ax, ax
+    jz f_hma
+
+    ; 3d. A20 local enable (05h) -> query (07h) == 1 -> disable (06h)
+    mov ah, 0x05
+    call far [entry]
+    or ax, ax
+    jz f_a20
+    mov ah, 0x07
+    call far [entry]
+    cmp ax, 1
+    jne f_a20
+    mov ah, 0x06
+    call far [entry]
+    or ax, ax
+    jz f_a20
+
     ; 4. allocate a 64 KB EMB (09h): DX = KB -> DX = handle
     mov ah, 0x09
     mov dx, 64
@@ -36,6 +74,28 @@ start:
     or ax, ax
     jz f_alloc
     mov [handle], dx
+
+    ; 4b. handle info (0Eh): DX = size KB, expect 64
+    mov ah, 0x0E
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jz f_info
+    cmp dx, 64
+    jne f_info
+
+    ; 4c. resize (0Fh) to 128 KB, then info reports 128
+    mov ah, 0x0F
+    mov bx, 128
+    mov dx, [handle]
+    call far [entry]
+    or ax, ax
+    jz f_resize
+    mov ah, 0x0E
+    mov dx, [handle]
+    call far [entry]
+    cmp dx, 128
+    jne f_resize
 
     ; 5. lock the block (0Ch) — exercises lock and arms the free-locked guard
     mov ah, 0x0C
@@ -127,6 +187,16 @@ f_move_in:  mov al, 0xE5
 f_verify:   mov al, 0xE6
             jmp sig
 f_unlock:   mov al, 0xE7
+            jmp sig
+f_query:    mov al, 0xE9
+            jmp sig
+f_hma:      mov al, 0xEA
+            jmp sig
+f_a20:      mov al, 0xEB
+            jmp sig
+f_info:     mov al, 0xEC
+            jmp sig
+f_resize:   mov al, 0xED
             jmp sig
 f_free:     mov al, 0xE8
 

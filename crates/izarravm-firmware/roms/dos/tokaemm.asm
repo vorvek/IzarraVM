@@ -54,6 +54,7 @@ xms_disp:  dw 0                   ; dispatch scratch (register-safe table jump)
 xms_mv_len: dd 0                  ; 0Bh move: byte count / src linear / dst linear
 xms_mv_src: dd 0
 xms_mv_dst: dd 0
+xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
 
 ; 32 EMB handles. handle h (1-based) -> slot at xms_table + (h-1)*XMS_SLOT.
 ; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_linear(dd)
@@ -484,6 +485,7 @@ xf_resize:
     push di
     call slot_of
     jc .bad
+    mov [cs:xms_slot_save], si    ; find_gap clobbers SI; keep the slot offset
     cmp byte [cs:si+1], 0         ; locked?
     jne .locked
     cmp bx, [cs:si+2]             ; same size?
@@ -495,10 +497,13 @@ xf_resize:
     shl eax, 10
     mov [cs:xms_mv_len], eax
     call find_gap
+    mov si, [cs:xms_slot_save]    ; restore the slot offset (find_gap clobbered SI)
     jc .restore
     mov byte [cs:si], 1
     mov byte [cs:si+1], 0
-    mov [cs:si+2], bx
+    mov eax, [cs:xms_mv_len]      ; size_kb from need bytes (find_gap clobbered BX)
+    shr eax, 10
+    mov [cs:si+2], ax
     mov [cs:si+4], edi
     add sp, 6                     ; discard saved old (dword + word)
 .ok:
