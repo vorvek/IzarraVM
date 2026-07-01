@@ -9,6 +9,13 @@
 //! per-mode bus scalar `bus_timing`) every `--headless-bench` and
 //! `--headless-bandwidth` row tags [in band].
 //!
+//! GswMode splits into two timing classes (`izarravm_core::TimingClass`): 286/386
+//! are Accurate and stay on the tight bands below; 486/586 are Approximate (the
+//! fast modes trade cycle fidelity for speed), so their runnable bands (dhrystone,
+//! sieve, fp-mandel, whetstone) are widened to informational width and never fail
+//! the `--headless-bench` process (see `main.rs`'s exit-gating, which only counts
+//! an Accurate-mode out-of-band verdict as a failure).
+//!
 //! Every band is encoded in the bench's NATIVE comparison unit (`iters/sec`) so
 //! the reporter compares directly:
 //! - Dhrystone: one iteration == one "Dhrystone", so `iters/sec` ==
@@ -23,8 +30,10 @@
 //!
 //! DHRYSTONE = PRIMARY ORACLE (owner authoritative). The B-T10 bus scalar lets the
 //! fast modes pull away from the old flat per-access bus floor, so all four modes
-//! now hit the owner's targets TIGHTLY (+/-5% in-order, wider best-effort for the
-//! superscalar 586 but centered on 300000):
+//! hit the owner's targets on center. The Accurate in-order modes (286/386) hit
+//! them TIGHTLY (+/-5%); the Approximate fast modes (486/586) carry the same
+//! centered target but a loosened, informational band (+/-20%/+/-22%; they are
+//! not cycle-accurate, so the band is observability, not a gate):
 //!   286 ~3500 (~2.0 DMIPS), 386 ~9200 (~5.2 DMIPS), 486 ~61000 (~34.7 DMIPS),
 //!   586 ~300000 (~170.5 DMIPS).
 //!
@@ -146,9 +155,11 @@ pub fn band_for(payload: &str, mode: GswMode) -> Option<&'static BenchBand> {
 pub const BENCH_BANDS: &[BenchBand] = &[
     // ---- Dhrystone (all four modes); target = Dhrystones/sec. OWNER AUTHORITATIVE. ----
     // The B-T10 per-mode bus scalar lifts the fast modes off the old flat per-access
-    // bus floor, so all four modes hit the owner's targets within ~0.3%. Bands are
-    // tight (+/-5% in-order; the 286 a touch wider for sparse period data; the 586
-    // widest per the band-width-ordering invariant, but centered on 300000).
+    // bus floor, so all four modes hit the owner's targets within ~0.3%. The Accurate
+    // 286/386 bands stay tight (+/-5%; the 286 a touch wider for sparse period data).
+    // The Approximate 486/586 (not cycle-accurate; see TimingClass) carry loosened,
+    // informational bands (+/-20%/+/-22%), the 586 widest per the
+    // band-width-ordering invariant, both still centered on the owner target.
     BenchBand {
         payload: "dhrystone",
         mode: GswMode::Gsw286,
@@ -171,22 +182,23 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "dhrystone",
         mode: GswMode::Gsw486,
         target: 61000.0,
-        lo: 57950.0, // +/-5%.
-        hi: 64050.0,
+        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        lo: 48800.0,
+        hi: 73200.0,
         unit: "iters/sec",
-        cite: "OWNER AUTHORITATIVE: 486 DX2 @ 66 MHz ~61000 Dhrystones/sec (~34.7 DMIPS); Roy Longbottom PC collection",
+        cite: "APPROXIMATE class (486, not cycle-accurate): OWNER AUTHORITATIVE: 486 DX2 @ 66 MHz ~61000 Dhrystones/sec (~34.7 DMIPS); Roy Longbottom PC collection",
     },
     BenchBand {
         payload: "dhrystone",
         mode: GswMode::Gsw586,
         target: 300000.0,
-        // Widest band (superscalar), ~ +/-8%, centered on the owner anchor; stays
-        // wider than the in-order modes per the band-width ordering invariant.
-        // Achieved 301341 (bus_timing 7/30).
-        lo: 276000.0,
-        hi: 324000.0,
+        // APPROXIMATE class: widest band (superscalar, informational, +/-22%),
+        // centered on the owner anchor; stays wider than the in-order modes and
+        // the 486 sibling per the band-width ordering invariant.
+        lo: 234000.0,
+        hi: 366000.0,
         unit: "iters/sec",
-        cite: "OWNER AUTHORITATIVE: Pentium MMX-200 @ 200 MHz ~300000 Dhrystones/sec (~170.5 DMIPS); Roy Longbottom PC collection",
+        cite: "APPROXIMATE class (586, not cycle-accurate): OWNER AUTHORITATIVE: Pentium MMX-200 @ 200 MHz ~300000 Dhrystones/sec (~170.5 DMIPS); Roy Longbottom PC collection",
     },
     // ---- BYTE Sieve (all four modes); target = sieve passes/sec. ----
     // NO authoritative owner target. Best-effort bands centered on the B-T10
@@ -216,19 +228,21 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "sieve",
         mode: GswMode::Gsw486,
         target: 372.0,
-        lo: 335.0, // +/-10%, best-effort.
-        hi: 409.0,
+        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        lo: 297.6,
+        hi: 446.4,
         unit: "iters/sec",
-        cite: "NO authoritative Sieve absolute; best-effort centered on B-T10 achieved (~20.7x the 286 Sieve, tracks integer scaling)",
+        cite: "APPROXIMATE class (486, not cycle-accurate): NO authoritative Sieve absolute; best-effort centered on B-T10 achieved (~20.7x the 286 Sieve, tracks integer scaling)",
     },
     BenchBand {
         payload: "sieve",
         mode: GswMode::Gsw586,
         target: 1657.0,
-        lo: 1458.0, // widest band (superscalar), ~ +/-12%, best-effort.
-        hi: 1856.0,
+        // APPROXIMATE class: widest band (superscalar, informational, +/-22%).
+        lo: 1292.46,
+        hi: 2021.54,
         unit: "iters/sec",
-        cite: "NO authoritative Sieve absolute; best-effort centered on the P55C-retarget achieved (200 MHz, bus 7/30; ~92x the 286 Sieve, tracks integer scaling)",
+        cite: "APPROXIMATE class (586, not cycle-accurate): NO authoritative Sieve absolute; best-effort centered on the P55C-retarget achieved (200 MHz, bus 7/30; ~92x the 286 Sieve, tracks integer scaling)",
     },
     // ---- fp-Mandelbrot (486/586 only); target = pixels/sec. ----
     // fp-mandel is x87-compute-bound, so it rides `level_timing` (and `fp_timing` at
@@ -242,19 +256,21 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "fp-mandel",
         mode: GswMode::Gsw486,
         target: 24600.0,
-        lo: 21650.0, // +/-12%, best-effort (compute dial shared with Dhrystone PRIMARY).
-        hi: 27550.0,
+        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        lo: 19680.0,
+        hi: 29520.0,
         unit: "iters/sec",
-        cite: "B-T10 achieved; fp rides level_timing which Dhrystone (PRIMARY) pins, so above era; era basis 486DX2-66 ~6.5 MFLOPS Whetstone (Roy Longbottom); recenter, ratio gap noted on 586",
+        cite: "APPROXIMATE class (486, not cycle-accurate): B-T10 achieved; fp rides level_timing which Dhrystone (PRIMARY) pins, so above era; era basis 486DX2-66 ~6.5 MFLOPS Whetstone (Roy Longbottom); recenter, ratio gap noted on 586",
     },
     BenchBand {
         payload: "fp-mandel",
         mode: GswMode::Gsw586,
         target: 141600.0,
-        lo: 120360.0, // ~ +/-15%: widest band (superscalar), best-effort.
-        hi: 162840.0,
+        // APPROXIMATE class: widest band (superscalar, informational, +/-22%).
+        lo: 110448.0,
+        hi: 172752.0,
         unit: "iters/sec",
-        cite: "P55C-retarget achieved (200 MHz + fp_timing 31/34); 586/486 pixels/sec ratio ~5.8x. fp-mandel is NOT authoritative (pixels/sec, not Whetstone MFLOPS); Whetstone is the FP oracle now. Recenter best-effort",
+        cite: "APPROXIMATE class (586, not cycle-accurate): P55C-retarget achieved (200 MHz + fp_timing 31/34); 586/486 pixels/sec ratio ~5.8x. fp-mandel is NOT authoritative (pixels/sec, not Whetstone MFLOPS); Whetstone is the FP oracle now. Recenter best-effort",
     },
     // ---- Whetstone (486/586 only); target = MFLOPS. OWNER AUTHORITATIVE (FP oracle). ----
     // The real Whetstone .EXE payload reports MFLOPS = sweeps/sec * the per-sweep FLOP
@@ -265,19 +281,23 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "whetstone",
         mode: GswMode::Gsw486,
         target: 6.5,
-        lo: 6.175, // +/-5% (in-order); 486 anchors the FP weight, lands 6.50.
-        hi: 6.825,
+        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        // 486 still anchors the FP weight, lands 6.50.
+        lo: 5.2,
+        hi: 7.8,
         unit: "MFLOPS",
-        cite: "OWNER AUTHORITATIVE: 486DX2-66 ~6.5 MFLOPS Whetstone (Roy Longbottom); anchors the per-sweep FLOP weight (fp_timing(I486) identity)",
+        cite: "APPROXIMATE class (486, not cycle-accurate): OWNER AUTHORITATIVE: 486DX2-66 ~6.5 MFLOPS Whetstone (Roy Longbottom); anchors the per-sweep FLOP weight (fp_timing(I486) identity)",
     },
     BenchBand {
         payload: "whetstone",
         mode: GswMode::Gsw586,
         target: 34.5,
-        lo: 31.7, // widest band (superscalar), ~ +/-8%; lands 34.50 via fp_timing(I586) 31/34.
-        hi: 37.3,
+        // APPROXIMATE class: widest band (superscalar, informational, +/-22%);
+        // lands 34.50 via fp_timing(I586) 31/34.
+        lo: 26.91,
+        hi: 42.09,
         unit: "MFLOPS",
-        cite: "OWNER AUTHORITATIVE: Pentium MMX-200 ~34.5 MFLOPS Whetstone (Roy Longbottom); seated by fp_timing(I586) = 31/34",
+        cite: "APPROXIMATE class (586, not cycle-accurate): OWNER AUTHORITATIVE: Pentium MMX-200 ~34.5 MFLOPS Whetstone (Roy Longbottom); seated by fp_timing(I586) = 31/34",
     },
     // ---- Memory read bandwidth tiers (MB/s), consumed by --headless-bandwidth. ----
     // 286: RAM only (no cache). 386: L2 + RAM. 486/586: L1 + L2 + RAM. The B-T10 bus
@@ -586,5 +606,28 @@ mod tests {
         assert_eq!(band.verdict(band.target), BandVerdict::InBand);
         assert_eq!(band.verdict(band.lo - 1.0), BandVerdict::Low);
         assert_eq!(band.verdict(band.hi + 1.0), BandVerdict::High);
+    }
+
+    #[test]
+    fn approximate_mode_bands_are_loose_accurate_mode_bands_are_tight() {
+        use izarravm_core::TimingClass;
+        for payload in ["dhrystone", "sieve", "fp-mandel", "whetstone"] {
+            for mode in MODES {
+                let Some(band) = band_for(payload, mode) else {
+                    continue;
+                };
+                let width = relative_width(band);
+                match mode.timing_class() {
+                    TimingClass::Accurate => assert!(
+                        width <= 0.22,
+                        "{payload} {mode:?} (Accurate) band width {width} must stay tight (<=0.22)"
+                    ),
+                    TimingClass::Approximate => assert!(
+                        width >= 0.30,
+                        "{payload} {mode:?} (Approximate) band width {width} must be loose (>=0.30)"
+                    ),
+                }
+            }
+        }
     }
 }

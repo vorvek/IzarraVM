@@ -89,6 +89,30 @@ impl GswMode {
     }
 }
 
+/// How faithfully a GSW mode models time. A hard property of the mode, not a
+/// runtime toggle: the two slow modes are cycle-faithful; the two fast modes are
+/// close approximations that trade cycle accuracy for host headroom (real DOS
+/// audio/timers hold realtime). Instruction RESULTS are bit-exact in both classes;
+/// only TIME differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingClass {
+    /// 286/386: era-calibrated, cycle-faithful, exactly as today.
+    Accurate,
+    /// 486/586: fast by default, close approximations, not cycle-accurate.
+    Approximate,
+}
+
+impl GswMode {
+    /// The timing class this mode runs in. `const fn` so every timing decision can
+    /// branch on it cheaply. 286/386 are Accurate; 486/586 are Approximate.
+    pub const fn timing_class(self) -> TimingClass {
+        match self {
+            Self::Gsw286 | Self::Gsw386 => TimingClass::Accurate,
+            Self::Gsw486 | Self::Gsw586 => TimingClass::Approximate,
+        }
+    }
+}
+
 impl fmt::Display for GswMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.canonical_name())
@@ -1149,6 +1173,15 @@ mod tests {
         assert_eq!(GswMode::Gsw386.cache_kb(), (0, 64));
         assert_eq!(GswMode::Gsw486.cache_kb(), (16, 128));
         assert_eq!(GswMode::Gsw586.cache_kb(), (32, 512));
+    }
+
+    #[test]
+    fn timing_class_is_accurate_for_286_386_and_approximate_for_486_586() {
+        use crate::{GswMode, TimingClass};
+        assert_eq!(GswMode::Gsw286.timing_class(), TimingClass::Accurate);
+        assert_eq!(GswMode::Gsw386.timing_class(), TimingClass::Accurate);
+        assert_eq!(GswMode::Gsw486.timing_class(), TimingClass::Approximate);
+        assert_eq!(GswMode::Gsw586.timing_class(), TimingClass::Approximate);
     }
 
     #[test]

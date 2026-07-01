@@ -1,6 +1,6 @@
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink};
-use izarravm_core::GswMode;
+use izarravm_core::{GswMode, TimingClass};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
@@ -922,6 +922,18 @@ fn emulate(
             // framebuffer is presented instead.
             if matches!(stop, Some(StopReason::Halted)) {
                 machine.advance_devices_clocks(budget);
+            } else if machine.active_mode().timing_class() == TimingClass::Approximate
+                && stalled > 0
+            {
+                // Approximate class (486/586): a device I/O stall (floppy/CD seek)
+                // jumped the master clock without advancing the devices, so fill the
+                // device gap to match and audio keeps playing through a disk grind
+                // instead of the sink starving. The master clock is NOT bumped here:
+                // stall_for already advanced it by the stall, and re-adding it gave
+                // the audio pump a cumulative lead over wall time. The Accurate
+                // class (286/386) keeps exact main behavior (devices resume from
+                // the next instruction's own advance).
+                machine.advance_devices_clocks(stalled);
             }
             if let Some(sink) = &sink {
                 pump_audio(
