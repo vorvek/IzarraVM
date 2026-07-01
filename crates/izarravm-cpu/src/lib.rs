@@ -2459,6 +2459,48 @@ impl Cpu386 {
         }
 
         match insn.opcode {
+            0x0fb6 => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                self.write_gpr_sized(
+                    modrm.reg,
+                    insn.operand_size,
+                    u32::from(self.read_gpr8(index)),
+                );
+                Some(clocks(3))
+            }
+            0x0fb7 => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                self.write_gpr_sized(
+                    modrm.reg,
+                    insn.operand_size,
+                    self.read_gpr_sized(index, OperandSize::Word),
+                );
+                Some(clocks(3))
+            }
+            0x0fbe => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                let value = self.read_gpr8(index) as i8 as i32 as u32;
+                self.write_gpr_sized(modrm.reg, insn.operand_size, value);
+                Some(clocks(3))
+            }
+            0x0fbf => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                let value = self.read_gpr_sized(index, OperandSize::Word) as i16 as i32 as u32;
+                self.write_gpr_sized(modrm.reg, insn.operand_size, value);
+                Some(clocks(3))
+            }
             0x70..=0x7f | 0x0f80..=0x0f8f => {
                 if self.condition((insn.opcode & 0x0f) as u8) {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
@@ -2536,6 +2578,26 @@ impl Cpu386 {
                         self.read_gpr_sized(index, insn.operand_size),
                     );
                     Some(clocks(2))
+                }
+                0x8d => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Mem(addr) = insn.operand? else {
+                        return None;
+                    };
+                    let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                        return None;
+                    };
+                    self.write_gpr_sized(modrm.reg, insn.operand_size, memory.offset);
+                    Some(clocks(2))
+                }
+                0x90 => Some(clocks(3)),
+                0x91..=0x97 => {
+                    let reg = opcode as u8 & 0x07;
+                    let acc = self.read_gpr_sized(0, insn.operand_size);
+                    let other = self.read_gpr_sized(reg, insn.operand_size);
+                    self.write_gpr_sized(0, insn.operand_size, other);
+                    self.write_gpr_sized(reg, insn.operand_size, acc);
+                    Some(clocks(3))
                 }
                 0xb0..=0xb7 => {
                     self.write_gpr8(insn.opcode as u8 - 0xb0, insn.imm as u8);
@@ -17619,6 +17681,42 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Bx), 3);
         assert!(!cpu.flag(FLAG_ZF), "final AND leaves a nonzero result");
         assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn straight_line_run_executes_hot_datamove_cached_forms() {
+        // MOV AX,0x00fe ; MOV BX,0x1234 ; MOV DI,4 ; MOVSX CX,AL ; MOVZX DX,BL ;
+        // XCHG AX,BX ; LEA SI,[BX+DI+5] ; HLT.
+        let code = [
+            0xb8, 0xfe, 0x00, // MOV AX, 0x00fe
+            0xbb, 0x34, 0x12, // MOV BX, 0x1234
+            0xbf, 0x04, 0x00, // MOV DI, 4
+            0x0f, 0xbe, 0xc8, // MOVSX CX, AL
+            0x0f, 0xb6, 0xd3, // MOVZX DX, BL
+            0x93, // XCHG AX, BX
+            0x8d, 0x71, 0x05, // LEA SI, [BX+DI+5]
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ebx(0);
+        cpu.registers.set_ecx(0);
+        cpu.registers.set_edx(0);
+        cpu.write_reg16(Reg16::Si, 0);
+        cpu.write_reg16(Reg16::Di, 0);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.registers.eip, 0x13, "run stopped at HLT");
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234);
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x00fe);
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0xfffe);
+        assert_eq!(cpu.read_reg16(Reg16::Dx), 0x0034);
+        assert_eq!(cpu.read_reg16(Reg16::Si), 0x0107);
     }
 
     #[test]
