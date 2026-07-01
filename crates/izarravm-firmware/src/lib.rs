@@ -16,6 +16,8 @@ pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
 pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
 pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
+pub const XMSTEST_COM: &[u8] = include_bytes!("../roms/dos/xmstest.com");
+pub const XMSTEST_COM_SOURCE: &str = include_str!("../roms/dos/xmstest.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
@@ -130,6 +132,14 @@ pub fn runner_com() -> &'static [u8] {
 /// A test program that terminates with DOS exit code 42; the katea-run e2e fixture.
 pub fn exit42_com() -> &'static [u8] {
     EXIT42_COM
+}
+
+/// The SP-4b M1 XMS round-trip e2e fixture: install-check, get entry, version,
+/// alloc a 64 KB EMB, lock, move a pattern conventional->EMB->conventional, verify,
+/// unlock, free — then signal 0xA5 (success) via the unit-tester exit port. Runs in
+/// V86 under TOKAEMM; a non-0xA5 exit code names the step that broke.
+pub fn xmstest_com() -> &'static [u8] {
+    XMSTEST_COM
 }
 
 /// TOKAEMM.SYS (SP-4b M0): a bespoke memory-manager char device. Its INIT runs
