@@ -205,22 +205,10 @@ boot_entry:
     jmp 0x0000:0x7c00
 
 .disk_hle:
-    ; No real disk: boot Toka-DOS from the host-backed C: via the HLE. Ask the
-    ; machine (Lotura service port 0xE3) to place the Toka-DOS boot record at
-    ; 0000:7C00, then read the status. 0 means it is loaded and the DOS base
-    ; context is ready; anything else means Toka-DOS is not installed.
-    mov al, 0x10                ; LoadBootRecord
-    out 0xE3, al
-    in  al, 0xE3                ; status: 0 = loaded
-    test al, al
-    jnz .disk_absent
-
-    ; Enter the boot record exactly like a real INT 19h hard-disk boot.
-    xor ax, ax
-    mov ds, ax
-    mov es, ax
-    mov dl, 0x80               ; DL = first hard disk
-    jmp 0x0000:0x7c00
+    ; No bootable fixed disk (no 55AA MBR signature on the ATA primary master).
+    ; There is no HLE fallback any more -- the Rust Toka-DOS kernel was retired --
+    ; so report and idle, exactly like the no-CD-ROM path below.
+    ; fall through into .disk_absent
 
 .disk_absent:
     mov si, bm_str_disk_msg
@@ -257,7 +245,7 @@ bm_str_disk_tag: db '(not available yet)', 0
 bm_str_cdrom:    db 'CD-ROM', 0
 bm_str_cd_tag:   db '(unavailable)', 0
 bm_str_hint:     db 'Up/Dn move   Enter select   Esc cancel', 0
-bm_str_disk_msg: db 'Toka-DOS not installed yet', 0
+bm_str_disk_msg: db 'No bootable disk', 0
 bm_str_cd_msg:   db 'CD-ROM drive not available', 0
 
 str_boot_error:  db 'FLOPPY READ ERROR', 0

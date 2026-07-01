@@ -1703,15 +1703,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "izarravm-dos"
-version = "0.1.0"
-dependencies = [
- "izarravm-bus",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "izarravm-firmware"
 version = "0.1.0"
 dependencies = [
@@ -1734,7 +1725,6 @@ dependencies = [
  "izarravm-bus",
  "izarravm-core",
  "izarravm-cpu",
- "izarravm-dos",
  "izarravm-firmware",
  "izarravm-video",
  "tempfile",
