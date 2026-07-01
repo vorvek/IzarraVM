@@ -2510,22 +2510,6 @@ impl Cpu386 {
         bus: &mut B,
         cap: u64,
     ) -> Result<CycleOutcome, CpuError> {
-        // The retired-instruction perf counter is batched: each fast-tail continuation
-        // bumps a run-local (`retired` in the loop helper) and the total lands on the
-        // counter exactly once per run, on EVERY exit (break, halt, fault, hard error),
-        // so the printed totals stay identical to the per-instruction increments.
-        let mut retired = 0u64;
-        let result = self.run_straight_line_loop(bus, cap, &mut retired);
-        self.perf.instructions += retired;
-        result
-    }
-
-    fn run_straight_line_loop<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        cap: u64,
-        retired: &mut u64,
-    ) -> Result<CycleOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
         self.perf.straight_line_runs += 1;
@@ -2548,7 +2532,7 @@ impl Cpu386 {
                         break;
                     }
                 };
-                self.run_one_cached(bus, &insn, lin, retired)?
+                self.run_one_cached(bus, &insn, lin)?
             };
             total += u64::from(outcome.core_clocks);
             // The post-instruction break checks run in the SAME ORDER the old per-instruction machine
@@ -2601,7 +2585,6 @@ impl Cpu386 {
         bus: &mut B,
         insn: &DecodedInsn,
         lin: u32,
-        retired: &mut u64,
     ) -> Result<CycleOutcome, CpuError> {
         self.interrupt_shadow = false;
         self.begin_instruction();
@@ -2616,9 +2599,7 @@ impl Cpu386 {
                 Ok(outcome) => {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
-                    // Batched: run_straight_line flushes the run-local into
-                    // perf.instructions once per run.
-                    *retired += 1;
+                    self.perf.instructions += 1;
                     Ok(CycleOutcome {
                         core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                         halted: outcome.halted,
