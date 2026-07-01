@@ -4328,6 +4328,44 @@ impl Cpu386 {
     /// only for 0xe4/0xe5 vs 0xe6/0xe7, respectively; 0 = IN, 1 = unused for the 0xec range where
     /// bit 1 distinguishes direction: see comments per arm). Clocks match the fused arms verbatim
     /// (12 for IN, 10 for OUT).
+    /// In V86 (or protected mode with CPL > IOPL), `IN`/`OUT` consult the TSS
+    /// I/O-permission bitmap: the access is allowed only if every bit for ports
+    /// `port..port+width` is 0. A bit at or beyond the TSS limit is treated as set
+    /// (not permitted). A denied access faults `#GP(0)` to the monitor.
+    fn check_io_permission<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        port: u16,
+        width: BusWidth,
+    ) -> ExecResult<()> {
+        if !self.is_v86_mode() && self.current_privilege_level() <= self.iopl() {
+            return Ok(());
+        }
+        let io_base =
+            bus.read_memory(self.tr.base + 0x66, BusWidth::Word, BusAccessKind::DataRead)?;
+        for p in u32::from(port)..u32::from(port) + width.bytes() {
+            let byte_index = io_base + p / 8;
+            if byte_index > self.tr.limit {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0),
+                });
+            }
+            let byte = bus.read_memory(
+                self.tr.base + byte_index,
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            )? as u8;
+            if byte & (1 << (p % 8)) != 0 {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn execute_port_io_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
@@ -4338,6 +4376,7 @@ impl Cpu386 {
             0xe4 => {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 let value = bus.read_io(port, BusWidth::Byte)? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
@@ -4345,6 +4384,7 @@ impl Cpu386 {
             0xe5 => {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 let value = bus.read_io(port, operand_size.bus_width())?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
@@ -4352,12 +4392,14 @@ impl Cpu386 {
             0xe6 => {
                 // OUT imm8, AL: byte port output from AL.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
                 Ok(clocks(10))
             }
             0xe7 => {
                 // OUT imm8, AX/EAX: word/dword port output from the accumulator.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -4368,6 +4410,7 @@ impl Cpu386 {
             0xec => {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 let value = bus.read_io(port, BusWidth::Byte)? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
@@ -4375,6 +4418,7 @@ impl Cpu386 {
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 let value = bus.read_io(port, operand_size.bus_width())?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
@@ -4382,12 +4426,14 @@ impl Cpu386 {
             0xee => {
                 // OUT DX, AL: byte port output addressed by DX.
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
                 Ok(clocks(10))
             }
             0xef => {
                 // OUT DX, AX/EAX: word/dword port output addressed by DX.
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -6897,22 +6943,74 @@ impl Cpu386 {
         let gate_high = self.read_system_linear_u32(bus, gate_address + 4)?;
         let selector = ((gate_low >> 16) & 0xffff) as u16;
         let offset = (gate_low & 0x0000_ffff) | (gate_high & 0xffff_0000);
+        let is_interrupt_gate = (gate_high >> 8) & 0x0f == 0x0e; // 0x0e int gate, 0x0f trap gate
 
         // Settle deferred arithmetic flags so the eflags image pushed for the handler is live.
         self.materialize_flags();
-        self.push(bus, self.registers.eflags, OperandSize::Dword)?;
-        self.push(
-            bus,
-            u32::from(self.registers.cs().selector),
-            OperandSize::Dword,
-        )?;
-        self.push(bus, self.registers.eip, OperandSize::Dword)?;
+        let saved_eflags = self.registers.eflags;
+        let saved_cs = self.registers.cs().selector;
+        let saved_eip = self.registers.eip;
+        let source_v86 = self.is_v86_mode();
+        let cpl = self.current_privilege_level();
+
+        // Drop V86 up front so every segment loaded from here on (the inner SS from the
+        // TSS, then CS) is decoded as a protected-mode descriptor rather than an 8086
+        // base = selector << 4. The pushed EFLAGS image already captured VM=1 above.
+        if source_v86 {
+            self.registers.eflags &= !FLAG_VM;
+        }
+
+        // The target CS descriptor's DPL decides whether the entry crosses to an inner
+        // ring; a V86 source always crosses (a V86 task runs at CPL 3 and the monitor
+        // handler at ring 0).
+        let (_tl, th) = self.read_transfer_descriptor(bus, selector)?;
+        let target_access = (th >> 8) & 0xff;
+        let target_dpl = ((target_access >> 5) & 3) as u8;
+
+        if source_v86 || target_dpl < cpl {
+            // Inter-privilege entry: load the inner stack from the TSS, then push the
+            // outer SS:ESP so IRET can restore it. For a V86 source the four data
+            // segments are pushed above SS:ESP (the V86 interrupt frame) and the CPU
+            // returns to real-mode-style segments on IRET.
+            let (ds, es, fs, gs) = (
+                self.registers.segment(SegmentIndex::Ds).selector,
+                self.registers.segment(SegmentIndex::Es).selector,
+                self.registers.segment(SegmentIndex::Fs).selector,
+                self.registers.segment(SegmentIndex::Gs).selector,
+            );
+            let (old_ss, old_esp) = self.switch_to_inner_stack(bus, target_dpl)?;
+            if source_v86 {
+                self.push(bus, u32::from(gs), OperandSize::Dword)?;
+                self.push(bus, u32::from(fs), OperandSize::Dword)?;
+                self.push(bus, u32::from(ds), OperandSize::Dword)?;
+                self.push(bus, u32::from(es), OperandSize::Dword)?;
+            }
+            self.push(bus, u32::from(old_ss), OperandSize::Dword)?;
+            self.push(bus, old_esp, OperandSize::Dword)?;
+        }
+        self.push(bus, saved_eflags, OperandSize::Dword)?;
+        self.push(bus, u32::from(saved_cs), OperandSize::Dword)?;
+        self.push(bus, saved_eip, OperandSize::Dword)?;
         // The error code is pushed only for the vectors that carry one, regardless of
         // what the caller supplied: 8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC.
         if vector_pushes_error_code(vector) {
             self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
-        self.set_flag(FLAG_IF | FLAG_TF, false);
+
+        // Entering the handler clears VM/NT/TF; an interrupt gate (not a trap gate) also
+        // clears IF.
+        self.set_flag(FLAG_VM | FLAG_NT | FLAG_TF, false);
+        if is_interrupt_gate {
+            self.set_flag(FLAG_IF, false);
+        }
+        // Leaving V86 drops the guest's real-mode data segments; the handler starts with
+        // null selectors and reloads its own.
+        if source_v86 {
+            self.load_segment_real(SegmentIndex::Ds, 0);
+            self.load_segment_real(SegmentIndex::Es, 0);
+            self.load_segment_real(SegmentIndex::Fs, 0);
+            self.load_segment_real(SegmentIndex::Gs, 0);
+        }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset);
         Ok(())
@@ -6952,6 +7050,42 @@ impl Cpu386 {
                 let eip = self.pop(bus, OperandSize::Dword)?;
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
+
+                if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
+                    // Return INTO a V86 task: pop the V86 tail and reload real-mode segments.
+                    let esp = self.pop(bus, OperandSize::Dword)?;
+                    let ss = self.pop(bus, OperandSize::Dword)? as u16;
+                    let es = self.pop(bus, OperandSize::Dword)? as u16;
+                    let ds = self.pop(bus, OperandSize::Dword)? as u16;
+                    let fs = self.pop(bus, OperandSize::Dword)? as u16;
+                    let gs = self.pop(bus, OperandSize::Dword)? as u16;
+                    self.load_flags(flags, OperandSize::Dword); // flags carry VM=1 (guarded above)
+                    self.load_segment_real(SegmentIndex::Cs, cs);
+                    self.load_segment_real(SegmentIndex::Ss, ss);
+                    self.load_segment_real(SegmentIndex::Ds, ds);
+                    self.load_segment_real(SegmentIndex::Es, es);
+                    self.load_segment_real(SegmentIndex::Fs, fs);
+                    self.load_segment_real(SegmentIndex::Gs, gs);
+                    self.set_eip(eip);
+                    self.registers.set_esp(esp);
+                    return Ok(());
+                }
+
+                if (cs & 3) as u8 > self.current_privilege_level() {
+                    // V86 is handled above; a returned V86 CS has arbitrary low bits, so this
+                    // ring check must not see it. Inter-privilege return to a less-privileged
+                    // (non-V86) ring: pop SS:ESP.
+                    let esp = self.pop(bus, OperandSize::Dword)?;
+                    let ss = self.pop(bus, OperandSize::Dword)? as u16;
+                    self.load_segment(bus, SegmentIndex::Cs, cs)?;
+                    self.load_segment(bus, SegmentIndex::Ss, ss)?;
+                    self.set_eip(eip);
+                    self.registers.set_esp(esp);
+                    self.load_flags(flags, OperandSize::Dword);
+                    return Ok(());
+                }
+
+                // Same privilege (existing behavior).
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.set_eip(eip);
                 self.load_flags(flags, OperandSize::Dword);
@@ -24349,6 +24483,311 @@ mod tests {
         assert!(
             fadd_i486 > 0,
             "FADD must charge at least 1 scaled clock at I486 (got {fadd_i486})"
+        );
+    }
+
+    // ---- V86 monitor test harness -------------------------------------------------
+    // Memory map (physical == linear, identity paged):
+    //   0x00000 IVT area; 0x01000 page directory; 0x02000 page table 0 (identity,
+    //   present+rw+user); 0x03000 GDT; 0x04000 IDT; 0x05000 TSS (+ I/O bitmap);
+    //   ESP0 = 0x07000 (ring-0 stack, flat SS base 0); 0x08000 monitor code;
+    //   V86 guest: SS=0x0900, CS=0x0A00 (code at phys 0xA000).
+    // GDT selectors: 0x08 ring0 code (32-bit), 0x10 ring0 data/stack, 0x18 TSS.
+    const GDT: u32 = 0x3000;
+    const IDT: u32 = 0x4000;
+    const TSS: u32 = 0x5000;
+    const R0_CS: u16 = 0x08;
+    const R0_SS: u16 = 0x10;
+    const TSS_SEL: u16 = 0x18;
+    const MON_CODE: u32 = 0x8000;
+    const ESP0: u32 = 0x7000;
+
+    fn put32(m: &mut [u8], off: u32, v: u32) {
+        m[off as usize..off as usize + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    fn put16(m: &mut [u8], off: u32, v: u16) {
+        m[off as usize..off as usize + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    fn descriptor(base: u32, limit: u32, access: u8, gran: u8) -> [u8; 8] {
+        let mut d = [0u8; 8];
+        d[0..2].copy_from_slice(&(limit as u16).to_le_bytes());
+        d[2..4].copy_from_slice(&(base as u16).to_le_bytes());
+        d[4] = (base >> 16) as u8;
+        d[5] = access;
+        d[6] = ((limit >> 16) as u8 & 0x0f) | (gran & 0xf0);
+        d[7] = (base >> 24) as u8;
+        d
+    }
+    fn int_gate(m: &mut [u8], vector: u8, offset: u32) {
+        let base = IDT + u32::from(vector) * 8;
+        put16(m, base, offset as u16);
+        put16(m, base + 2, R0_CS);
+        m[base as usize + 4] = 0;
+        m[base as usize + 5] = 0x8e; // present, DPL0, 32-bit interrupt gate
+        put16(m, base + 6, (offset >> 16) as u16);
+    }
+    fn cpu_mem(bus: &TestBus, addr: u32) -> [u8; 4] {
+        let a = addr as usize;
+        [
+            bus.memory[a],
+            bus.memory[a + 1],
+            bus.memory[a + 2],
+            bus.memory[a + 3],
+        ]
+    }
+
+    /// Build the world; CPU sits in protected mode + paging with TR/GDTR/IDTR loaded.
+    fn v86_world(monitor: &[u8], guest: &[u8], io_bitmap: &[u8]) -> (Cpu386, TestBus) {
+        let mut m = vec![0u8; 0x20000];
+        // Identity paging: PDE[0] -> PT at 0x2000; first 0x20 pages identity present+rw+user.
+        put32(&mut m, 0x1000, 0x2000 | 0x7);
+        for i in 0..0x20u32 {
+            put32(&mut m, 0x2000 + i * 4, (i << 12) | 0x7);
+        }
+        // GDT: null (offset 0), ring0 code 0x9b (sel 0x08), ring0 data 0x93 (sel 0x10),
+        // TSS 0x89 (sel 0x18).
+        let d = descriptor(0, 0xfffff, 0x9b, 0xc0);
+        m[(GDT + 0x08) as usize..(GDT + 0x08) as usize + 8].copy_from_slice(&d);
+        let d = descriptor(0, 0xfffff, 0x93, 0xc0);
+        m[(GDT + 0x10) as usize..(GDT + 0x10) as usize + 8].copy_from_slice(&d);
+        let tss_limit = 0x68 + io_bitmap.len() as u32;
+        let d = descriptor(TSS, tss_limit, 0x89, 0x00);
+        m[(GDT + 0x18) as usize..(GDT + 0x18) as usize + 8].copy_from_slice(&d);
+        // TSS: ESP0, SS0, I/O-map base (word at TSS+0x66), bitmap.
+        put32(&mut m, TSS + 4, ESP0);
+        put16(&mut m, TSS + 8, R0_SS);
+        put16(&mut m, TSS + 0x66, 0x68);
+        m[(TSS + 0x68) as usize..(TSS + 0x68) as usize + io_bitmap.len()]
+            .copy_from_slice(io_bitmap);
+        // IDT: #GP (13) and INT 0x21 -> monitor.
+        int_gate(&mut m, 13, MON_CODE);
+        int_gate(&mut m, 0x21, MON_CODE);
+        m[MON_CODE as usize..MON_CODE as usize + monitor.len()].copy_from_slice(monitor);
+        m[0xA000..0xA000 + guest.len()].copy_from_slice(guest);
+
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.gdtr.base = GDT;
+        cpu.gdtr.limit = 0xff;
+        cpu.idtr.base = IDT;
+        cpu.idtr.limit = 0xfff;
+        cpu.tr = SegmentRegister {
+            selector: TSS_SEL,
+            base: TSS,
+            limit: tss_limit,
+            access: 0x89,
+            default_size_32: false,
+        };
+        let bus = TestBus::with_memory(m);
+        (cpu, bus)
+    }
+
+    /// Put `cpu` into a V86 task at CS:IP=0x0A00:ip, SS:SP=0x0900:sp, IOPL 0.
+    /// DS/ES/FS/GS are seeded with sensible defaults; a caller may overwrite them
+    /// afterward to probe the V86 segment frame (none of them are load-bearing here).
+    fn enter_v86_direct(cpu: &mut Cpu386, ip: u32, sp: u32) {
+        cpu.registers.eflags = (cpu.registers.eflags & !0x3000) | FLAG_VM | 0x2;
+        cpu.registers.eip = ip;
+        cpu.registers.set_esp(sp);
+        cpu.load_segment_real(SegmentIndex::Cs, 0x0A00);
+        cpu.load_segment_real(SegmentIndex::Ss, 0x0900);
+        cpu.load_segment_real(SegmentIndex::Ds, 0x0A00);
+        cpu.load_segment_real(SegmentIndex::Es, 0x0A00);
+        cpu.load_segment_real(SegmentIndex::Fs, 0);
+        cpu.load_segment_real(SegmentIndex::Gs, 0);
+    }
+
+    #[test]
+    fn deliver_exception_from_v86_builds_the_v86_frame_on_ring0_stack() {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+        cpu.load_segment_real(SegmentIndex::Ds, 0x1111);
+        cpu.load_segment_real(SegmentIndex::Es, 0x2222);
+        cpu.load_segment_real(SegmentIndex::Fs, 0x3333);
+        cpu.load_segment_real(SegmentIndex::Gs, 0x4444);
+        let saved_eflags = cpu.registers.eflags;
+
+        cpu.deliver_exception(&mut bus, 13, Some(0)).unwrap();
+
+        assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, R0_SS);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0);
+        let esp = cpu.registers.esp();
+        let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, esp + o));
+        // From the handler's ESP upward: [err], EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS.
+        assert_eq!(rd(0), 0, "error code");
+        assert_eq!(rd(4), 0x10, "V86 EIP");
+        assert_eq!(rd(8) & 0xffff, 0x0A00, "V86 CS");
+        assert_eq!(rd(12) & FLAG_VM, FLAG_VM, "pushed EFLAGS carries VM=1");
+        assert_eq!(rd(12), saved_eflags, "pushed EFLAGS is the pre-clear image");
+        assert_eq!(rd(16), 0x1000, "V86 ESP");
+        assert_eq!(rd(20) & 0xffff, 0x0900, "V86 SS");
+        assert_eq!(rd(24) & 0xffff, 0x2222, "V86 ES");
+        assert_eq!(rd(28) & 0xffff, 0x1111, "V86 DS");
+        assert_eq!(rd(32) & 0xffff, 0x3333, "V86 FS");
+        assert_eq!(rd(36) & 0xffff, 0x4444, "V86 GS");
+    }
+
+    #[test]
+    fn iret_into_v86_restores_the_task() {
+        // Monitor at CPL0 with a V86 return frame on its stack; IRET must re-enter V86.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        // Build the 32-bit V86 IRET frame (push high-to-low): GS,FS,DS,ES,SS,ESP,EFLAGS,CS,EIP.
+        let vm_eflags = FLAG_VM | 0x2;
+        for v in [
+            0x4444u32, 0x3333, 0x1111, 0x2222, 0x0900, 0x1000, vm_eflags, 0x0A00, 0x0010,
+        ] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+
+        assert!(cpu.is_v86_mode(), "IRET with popped VM=1 must re-enter V86");
+        assert_eq!(cpu.registers.eip, 0x0010);
+        assert_eq!(cpu.registers.cs().selector, 0x0A00);
+        assert_eq!(
+            cpu.registers.cs().base,
+            0x0A00 << 4,
+            "real-mode base=sel<<4"
+        );
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x0900);
+        assert_eq!(cpu.registers.esp(), 0x1000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x1111);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Es).selector, 0x2222);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0x3333);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0x4444);
+        assert_eq!(cpu.current_privilege_level(), 3, "V86 is always CPL 3");
+    }
+
+    #[test]
+    fn iret_inter_privilege_return_to_ring3() {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // Ring-3 code (access 0xfb) + data (0xf3) at GDT slots 0x20 / 0x28.
+        let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+        let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+        bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+        bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+        let r3_cs = 0x23u16; // 0x20 | RPL3
+        let r3_ss = 0x2Bu16; // 0x28 | RPL3
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        // Inter-privilege IRET frame (high-to-low): SS, ESP, EFLAGS, CS, EIP.
+        for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
+        assert!(!cpu.is_v86_mode());
+        assert_eq!(cpu.registers.eip, 0x1234);
+        assert_eq!(cpu.registers.cs().selector, r3_cs);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
+        assert_eq!(cpu.registers.esp(), 0x2000);
+    }
+
+    #[test]
+    fn v86_out_consults_the_io_permission_bitmap() {
+        // Guest at 0x0A00:0 does `OUT 0x21, AL` (E6 21). Bitmap traps port 0x21.
+        let mut bitmap = vec![0u8; 0x20 + 1]; // ports 0..0x100 + terminator byte
+        bitmap[0x21 / 8] |= 1 << (0x21 % 8);
+        let guest = [0xe6, 0x21, 0xf4]; // out 0x21, al ; hlt
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &bitmap);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        let outcome = cpu.cycle(&mut bus);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !cpu.is_v86_mode(),
+            "trapped OUT must land in the ring-0 monitor"
+        );
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+    }
+
+    #[test]
+    fn v86_out_to_a_permitted_port_runs_the_io() {
+        let bitmap = vec![0u8; 0x20 + 1]; // all-zero: everything permitted
+        let guest = [0xe6, 0x21, 0xf4]; // out 0x21, al ; hlt
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &bitmap);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.is_v86_mode(), "permitted OUT stays in V86");
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoWrite && c.address == 0x21),
+            "permitted OUT should reach the I/O bus"
+        );
+    }
+
+    #[test]
+    fn v86_monitor_round_trip_go_no_go() {
+        // Guest: STI (fb) ; OUT 0x80,AL (e6 80) ; INT 0x21 (cd 21) ; HLT (f4).
+        let guest = [0xfb, 0xe6, 0x80, 0xcd, 0x21, 0xf4];
+        let monitor = [0xf4]; // unused: we emulate the monitor from Rust below.
+        let bitmap = vec![0u8; 0x20 + 1]; // all-zero: ports 0..0x100 permitted (+ terminator byte)
+        let (mut cpu, mut bus) = v86_world(&monitor, &guest, &bitmap);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        let mut traps = 0;
+        let mut guest_hlt = false;
+        for _ in 0..64 {
+            let outcome = cpu.cycle(&mut bus).unwrap();
+            if !cpu.is_v86_mode() && cpu.registers.cs().selector == R0_CS {
+                // In the monitor because the guest faulted. Read the V86 #GP(13) frame,
+                // advance the guest EIP past the faulting instruction, IRET back to V86.
+                // Both STI and INT 0x21 arrive here as #GP(13): each is IOPL-sensitive and
+                // faults because the V86 task runs at IOPL 0 < 3 (check_v86_iopl). INT 0x21
+                // does NOT dispatch through its own IDT gate — it is intercepted before
+                // delivery, so every trap in this test is vector 13.
+                traps += 1;
+                // Discard the error code (vector 13 pushes one) so IRET pops from EIP.
+                // Frame layout from the handler's ESP upward is [err], EIP, CS, ... (see the
+                // sibling deliver_exception test); after skipping the 4-byte error code the
+                // V86 EIP is at the top of stack, so cpu_mem(&bus, esp) reads it directly.
+                let esp = cpu.registers.esp() + 4;
+                cpu.registers.set_esp(esp);
+                let guest_eip = u32::from_le_bytes(cpu_mem(&bus, esp));
+                // The guest is loaded at phys 0xA000 == V86 CS(0x0A00) << 4, so guest_eip
+                // (a segment offset) indexes the guest code bytes directly. This literal
+                // tracks v86_world's guest load base and enter_v86_direct's V86 CS.
+                let opcode = bus.memory[(0xA000 + guest_eip) as usize];
+                let len = match opcode {
+                    0xfb => 1, // STI
+                    0xcd => 2, // INT imm8
+                    other => {
+                        panic!("unexpected trap on opcode {other:#x} at guest eip {guest_eip:#x}")
+                    }
+                };
+                bus.memory[esp as usize..esp as usize + 4]
+                    .copy_from_slice(&(guest_eip + len).to_le_bytes());
+                cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+                continue;
+            }
+            if outcome.halted && cpu.is_v86_mode() {
+                guest_hlt = true;
+                break;
+            }
+        }
+
+        assert!(guest_hlt, "guest never reached its terminal HLT");
+        assert_eq!(traps, 2, "STI and INT 0x21 must each trap once");
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoWrite && c.address == 0x80),
+            "permitted OUT 0x80 should have run in V86"
         );
     }
 }
