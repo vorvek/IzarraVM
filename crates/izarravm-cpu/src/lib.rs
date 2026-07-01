@@ -2138,6 +2138,37 @@ impl Cpu386 {
     }
 
     #[inline]
+    fn read_direct_byte_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u8>> {
+        if let Some(entry) = self.data_read_pages.get(physical) {
+            bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+            self.record_data_read(kind, true);
+            self.perf.direct_data_pointer_reads += 1;
+            let offset = (physical & 0x0fff) as usize;
+            return Ok(Some(unsafe { *entry.ptr.add(offset) }));
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if offset >= page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_read_pages.insert(page);
+        bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+        self.record_data_read(kind, true);
+        self.perf.direct_data_pointer_reads += 1;
+        Ok(Some(unsafe { *page.ptr.add(offset) }))
+    }
+
+    #[inline]
     fn write_direct_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -2177,6 +2208,44 @@ impl Cpu386 {
             width,
             value,
         );
+        self.record_data_write(kind, true);
+        self.perf.direct_data_pointer_writes += 1;
+        Ok(true)
+    }
+
+    #[inline]
+    fn write_direct_byte_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<bool> {
+        if let Some(entry) = self.data_write_pages.get(physical) {
+            bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+            let offset = (physical & 0x0fff) as usize;
+            unsafe {
+                *entry.ptr.add(offset) = value;
+            }
+            self.record_data_write(kind, true);
+            self.perf.direct_data_pointer_writes += 1;
+            return Ok(true);
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if !page.writable || offset >= page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_write_pages.insert(page);
+        bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+        unsafe {
+            *page.ptr.add(offset) = value;
+        }
         self.record_data_write(kind, true);
         self.perf.direct_data_pointer_writes += 1;
         Ok(true)
@@ -6927,8 +6996,8 @@ impl Cpu386 {
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
         let physical = self.translate_segmented(bus, segment, offset, 1, false)?;
-        if let Some(value) = self.read_direct_page_cached(bus, physical, BusWidth::Byte, kind)? {
-            return Ok(value as u8);
+        if let Some(value) = self.read_direct_byte_page_cached(bus, physical, kind)? {
+            return Ok(value);
         }
         let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, read.direct);
@@ -6944,7 +7013,7 @@ impl Cpu386 {
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         let physical = self.translate_segmented(bus, segment, offset, 1, true)?;
-        if self.write_direct_page_cached(bus, physical, BusWidth::Byte, u32::from(value), kind)? {
+        if self.write_direct_byte_page_cached(bus, physical, value, kind)? {
             return Ok(());
         }
         let write = bus.write_memory_direct(physical, BusWidth::Byte, u32::from(value), kind)?;
