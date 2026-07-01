@@ -146,8 +146,8 @@ pub fn xmstest_com() -> &'static [u8] {
 
 /// The SP-4b M3 UMB e2e fixture: with DOS=UMB, set the high-first allocation
 /// strategy, AH=48h-allocate a block, assert it landed in upper memory (segment
-/// >= 0xC800) with real RAM behind it (write/read a pattern) — proving TOKAEMM
-/// page-mapped extended RAM into the upper holes and FreeDOS's DOS=UMB consumed it.
+/// 0xC800 or above) with real RAM behind it (write/read a pattern) — proving
+/// TOKAEMM page-mapped extended RAM into the upper holes and DOS=UMB consumed it.
 /// Runs in V86; signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
 pub fn umbtest_com() -> &'static [u8] {
     UMBTEST_COM
