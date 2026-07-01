@@ -1,21 +1,22 @@
 ; v86spike.asm — SP-4b M0 Task 2 standalone V86 spike.
 ;
-; Increment 2: adds the ring-0 monitor. The V86 stub runs IOPL-sensitive
-; instructions (CLI/STI/PUSHF/POPF) that #GP to a monitor via an IDT gate; the
-; monitor emulates them against a virtual IF (VIF) byte and resumes. The stub
-; self-checks VIF through PUSHF and signals 0xA5 on success, 0xFE on mismatch;
-; the monitor signals 0xFD if it ever sees an opcode it doesn't handle.
+; Increment 3: the monitor now also REFLECTS software interrupts to the V86
+; real-mode IVT and unwinds IRET. The V86 stub installs an IVT[0x80] handler,
+; does INT 0x80 (#GP -> monitor reflects -> handler runs in V86 -> IRET -> #GP ->
+; monitor unwinds), and checks a marker the handler set. It also re-checks the
+; CLI/STI/PUSHF virtual-IF path from increment 2. Signals 0xA5 on success.
+;
+; Split into a 512-byte boot sector (real-mode setup) + a stage2 (PM monitor +
+; V86 stub) at 0x8000, because the monitor no longer fits in one sector.
 ;
 ; Physical map (identity-paged, < 1 MiB):
-;   0x00800 VIF byte            0x01000 PD      0x02000 PT (identity, 1 MiB)
-;   0x03000 GDT (null/08 code/10 data/18 TSS)  0x04000 IDT
-;   0x05000 TSS (SS0:ESP0 + all-zero I/O bitmap)
-;   0x06000 V86 stack top       0x07000 ring-0 (monitor) stack top (ESP0)
-;   0x07c00 this boot code + monitor + V86 stub
+;   0x00800 VIF byte   0x00810 marker byte   0x01000 PD   0x02000 PT (1 MiB)
+;   0x03000 GDT   0x04000 IDT   0x05000 TSS(+bitmap)   0x06000 V86 stack top
+;   0x07000 ring-0 stack top (ESP0)   0x07c00 boot sector   0x08000 stage2
 cpu 386
-bits 16
-org 0x7c00
 
+section .boot vstart=0x7c00
+bits 16
 start:
     cli
     cld
@@ -25,14 +26,13 @@ start:
     mov ss, ax
     mov sp, 0x7000
 
-    ; zero 0x0800..0x6000 (VIF + tables)
-    mov di, 0x0800
+    mov di, 0x0800                          ; zero VIF/marker + tables
     mov cx, (0x6000 - 0x0800) / 2
     xor ax, ax
     rep stosw
 
     mov dword [0x1000], 0x2000 | 7          ; PD[0] -> PT
-    mov di, 0x2000                          ; PT: 256 identity entries
+    mov di, 0x2000
     mov eax, 0x0000_0007
     mov cx, 256
 .fill_pt:
@@ -46,18 +46,17 @@ start:
     mov dword [0x3010], 0x0000FFFF          ; [10] ring0 data
     mov dword [0x3014], 0x00CF9300
     mov dword [0x3018], 0x50000088          ; [18] TSS base 0x5000 limit 0x88
-    mov dword [0x301C], 0x00008900          ; access 0x89
+    mov dword [0x301C], 0x00008900
 
     mov dword [0x5004], 0x7000              ; ESP0
     mov word  [0x5008], 0x0010              ; SS0
-    mov word  [0x5066], 0x0068              ; I/O-map base (bitmap all zero)
+    mov word  [0x5066], 0x0068              ; I/O-map base
 
-    ; IDT[13] = #GP -> monitor (sel 0x08, 32-bit interrupt gate, DPL 0)
-    mov word [0x4000 + 13*8],     monitor
+    mov word [0x4000 + 13*8],     monitor   ; IDT[13] #GP -> monitor
     mov word [0x4000 + 13*8 + 2], 0x0008
     mov byte [0x4000 + 13*8 + 4], 0
     mov byte [0x4000 + 13*8 + 5], 0x8E
-    mov word [0x4000 + 13*8 + 6], 0         ; monitor offset < 64K, hi = 0
+    mov word [0x4000 + 13*8 + 6], 0
 
     lgdt [gdtr]
     lidt [idtr]
@@ -68,6 +67,17 @@ start:
     mov cr0, eax
     jmp dword 0x08:pm_entry
 
+gdtr:
+    dw 0x1F
+    dd 0x3000
+idtr:
+    dw 0xFF
+    dd 0x4000
+
+    times 510 - ($ - $$) db 0
+    dw 0xAA55
+
+section .stage2 follows=.boot vstart=0x8000
 bits 32
 pm_entry:
     mov ax, 0x10
@@ -77,26 +87,24 @@ pm_entry:
     mov esp, 0x7000
     mov ax, 0x18
     ltr ax
-    ; V86 IRET frame (push GS,FS,DS,ES,SS,ESP,EFLAGS,CS,EIP)
     push dword 0                            ; GS
     push dword 0                            ; FS
     push dword 0                            ; DS
     push dword 0                            ; ES
     push dword 0                            ; SS = 0
-    push dword 0x6000                       ; ESP (V86 stack top)
-    push dword 0x00020002                   ; EFLAGS: VM | bit1, IOPL 0
+    push dword 0x6000                       ; V86 ESP
+    push dword 0x00020002                   ; EFLAGS VM | bit1, IOPL 0
     push dword 0                            ; CS = 0
-    push dword v86_stub                     ; EIP (linear; CS base 0)
+    push dword v86_stub                     ; EIP (linear)
     iretd
 
-; ---- ring-0 monitor: emulate one IOPL-sensitive V86 instruction, then resume ----
-; entry stack: [esp]=err, +4=EIP, +8=CS, +12=EFLAGS, +16=ESP, +20=SS, +24=ES ...
+; ---- ring-0 monitor. entry: [esp]=err,+4=EIP,+8=CS,+12=EFLAGS,+16=ESP,+20=SS ----
 monitor:
     mov eax, [esp+8]                        ; V86 CS
     shl eax, 4
-    movzx ebx, word [esp+4]                 ; V86 EIP (16-bit)
-    add eax, ebx
-    movzx edx, byte [eax]                   ; faulting opcode
+    movzx ebx, word [esp+4]
+    add eax, ebx                            ; eax = linear of faulting opcode
+    movzx edx, byte [eax]
     cmp dl, 0xFA
     je .cli
     cmp dl, 0xFB
@@ -105,7 +113,11 @@ monitor:
     je .pushf
     cmp dl, 0x9D
     je .popf
-    mov al, 0xFD                            ; unhandled opcode -> fail
+    cmp dl, 0xCD
+    je .intn
+    cmp dl, 0xCF
+    je .iret_op
+    mov al, 0xFD                            ; unhandled -> fail
     jmp signal32
 .cli:
     mov byte [0x0800], 0
@@ -117,38 +129,93 @@ monitor:
     add esp, 4
     iretd
 .pushf:
-    mov ax, [esp+12]                        ; V86 flags low16
-    and ax, 0xFDFF                          ; clear IF
+    mov ax, [esp+12]
+    and ax, 0xFDFF
     cmp byte [0x0800], 0
     je .pf_store
-    or ax, 0x0200                           ; IF := VIF
+    or ax, 0x0200
 .pf_store:
-    sub word [esp+16], 2                    ; V86 SP -= 2
-    mov ebx, [esp+20]                       ; V86 SS
+    sub word [esp+16], 2
+    mov ebx, [esp+20]
     shl ebx, 4
     movzx ecx, word [esp+16]
-    add ebx, ecx
-    mov [ebx], ax                           ; push flags image
+    mov [ebx+ecx], ax
     inc word [esp+4]
     add esp, 4
     iretd
 .popf:
-    mov ebx, [esp+20]                       ; V86 SS
+    mov ebx, [esp+20]
     shl ebx, 4
     movzx ecx, word [esp+16]
-    add ebx, ecx
-    mov ax, [ebx]                           ; popped value
-    add word [esp+16], 2                    ; V86 SP += 2
-    test ax, 0x0200                         ; VIF := popped IF
+    mov ax, [ebx+ecx]
+    add word [esp+16], 2
+    test ax, 0x0200
     setnz cl
     mov [0x0800], cl
-    and ax, 0xFDFF                          ; store flags with IF held by monitor
-    mov word [esp+12], ax                   ; low16 only -> preserves VM
+    and ax, 0xFDFF
+    mov word [esp+12], ax
     inc word [esp+4]
     add esp, 4
     iretd
+.intn:
+    ; opcode 0xCD imm8 at eax; reflect INT n to real-mode IVT.
+    movzx esi, byte [eax+1]                 ; n
+    mov ebx, [esp+20]                        ; V86 SS
+    shl ebx, 4
+    ; push FLAGS (IF := VIF)
+    mov ax, [esp+12]
+    and ax, 0xFDFF
+    cmp byte [0x0800], 0
+    je .i_flags
+    or ax, 0x0200
+.i_flags:
+    sub word [esp+16], 2
+    movzx ecx, word [esp+16]
+    mov [ebx+ecx], ax
+    ; push CS
+    mov ax, [esp+8]
+    sub word [esp+16], 2
+    movzx ecx, word [esp+16]
+    mov [ebx+ecx], ax
+    ; push return IP = EIP + 2
+    mov ax, [esp+4]
+    add ax, 2
+    sub word [esp+16], 2
+    movzx ecx, word [esp+16]
+    mov [ebx+ecx], ax
+    ; load CS:IP from IVT[n] (linear n*4)
+    mov edi, esi
+    shl edi, 2
+    movzx eax, word [edi]                    ; new IP
+    mov word [esp+4], ax
+    movzx eax, word [edi+2]                  ; new CS
+    mov word [esp+8], ax
+    mov byte [0x0800], 0                     ; interrupt gate clears VIF
+    add esp, 4
+    iretd
+.iret_op:
+    ; pop IP, CS, FLAGS from V86 stack back into the frame.
+    mov ebx, [esp+20]
+    shl ebx, 4
+    movzx ecx, word [esp+16]
+    mov ax, [ebx+ecx]                        ; IP
+    mov word [esp+4], ax
+    add word [esp+16], 2
+    movzx ecx, word [esp+16]
+    mov ax, [ebx+ecx]                        ; CS
+    mov word [esp+8], ax
+    add word [esp+16], 2
+    movzx ecx, word [esp+16]
+    mov ax, [ebx+ecx]                        ; FLAGS
+    add word [esp+16], 2
+    test ax, 0x0200
+    setnz cl
+    mov [0x0800], cl
+    and ax, 0xFDFF
+    mov word [esp+12], ax
+    add esp, 4
+    iretd
 
-; signal exit code AL via the unit-tester port and stop (ring-0; I/O permitted at CPL0)
 signal32:
     mov ah, al
     mov al, 12
@@ -161,16 +228,28 @@ signal32:
 
 bits 16
 v86_stub:
-    cli                                     ; -> monitor VIF=0
-    pushf                                   ; -> monitor pushes flags (IF=0)
+    xor ax, ax
+    mov ds, ax
+    mov ss, ax
+    mov sp, 0x6000
+    ; increment-2 regression: CLI -> IF clear
+    cli
+    pushf
     pop ax
     test ax, 0x0200
     jnz .fail
-    sti                                     ; -> monitor VIF=1
-    pushf                                   ; -> monitor pushes flags (IF=1)
+    sti                                     ; IF set
+    pushf
     pop ax
     test ax, 0x0200
     jz .fail
+    ; increment-3: INT reflection + IRET unwind
+    mov word [0x200], int80_handler         ; IVT[0x80] IP (CS base 0)
+    mov word [0x202], 0                      ; IVT[0x80] CS
+    mov byte [0x810], 0                      ; marker
+    int 0x80
+    cmp byte [0x810], 0xCC
+    jne .fail
     mov al, 0xA5
     jmp .signal
 .fail:
@@ -185,12 +264,6 @@ v86_stub:
     out 0xE6, al
 .h: jmp .h
 
-gdtr:
-    dw 0x1F
-    dd 0x3000
-idtr:
-    dw 0xFF
-    dd 0x4000
-
-    times 510 - ($ - $$) db 0
-    dw 0xAA55
+int80_handler:
+    mov byte [0x810], 0xCC
+    iret
