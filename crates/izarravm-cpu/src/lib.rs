@@ -2407,12 +2407,10 @@ impl Cpu386 {
         let start_cs = self.registers.cs().selector;
         let profiling = self.profile.enabled;
         if !profiling {
-            return match self.charge_cached_fetch(bus, lin, insn.len).and_then(|()| {
-                match self.execute_hot_cached_decoded(insn) {
-                    Some(outcome) => Ok(outcome),
-                    None => self.execute_decoded(insn, bus),
-                }
-            }) {
+            return match self
+                .charge_cached_fetch(bus, lin, insn.len)
+                .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus))
+            {
                 Ok(outcome) => {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
@@ -2428,12 +2426,9 @@ impl Cpu386 {
             };
         }
         let profile_start = self.profile.sample_start();
-        let result = self.charge_cached_fetch(bus, lin, insn.len).and_then(|()| {
-            match self.execute_hot_cached_decoded(insn) {
-                Some(outcome) => Ok(outcome),
-                None => self.execute_decoded(insn, bus),
-            }
-        });
+        let result = self
+            .charge_cached_fetch(bus, lin, insn.len)
+            .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus));
         self.finish_instruction(
             bus,
             result,
@@ -2442,6 +2437,23 @@ impl Cpu386 {
             profiling.then_some(insn.group),
             profile_start,
         )
+    }
+
+    #[inline]
+    fn execute_hot_cached_or_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        if let Some(outcome) = self.execute_hot_cached_decoded(insn) {
+            return Ok(outcome);
+        }
+        if matches!(insn.group, DecodeGroup::Stack) {
+            if let Some(outcome) = self.execute_hot_cached_stack(insn, bus)? {
+                return Ok(outcome);
+            }
+        }
+        self.execute_decoded(insn, bus)
     }
 
     /// Hot cached-instruction subset that never touches the bus and cannot fault. EIP has already
@@ -2794,6 +2806,37 @@ impl Cpu386 {
         }
 
         Some(clocks(2))
+    }
+
+    #[inline]
+    fn execute_hot_cached_stack<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<Option<CycleOutcome>> {
+        let opcode = insn.opcode as u8;
+        let operand_size = insn.operand_size;
+        match opcode {
+            0x50..=0x57 => {
+                let value = self.read_gpr_sized(opcode - 0x50, operand_size);
+                self.push(bus, value, operand_size)?;
+                Ok(Some(clocks(2)))
+            }
+            0x58..=0x5f => {
+                let value = self.pop(bus, operand_size)?;
+                self.write_gpr_sized(opcode - 0x58, operand_size, value);
+                Ok(Some(clocks(4)))
+            }
+            0x68 => {
+                self.push(bus, insn.imm, operand_size)?;
+                Ok(Some(clocks(2)))
+            }
+            0x6a => {
+                self.push(bus, sign_extend_u8(insn.imm as u8), operand_size)?;
+                Ok(Some(clocks(2)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The single routing authority for the decode/execute split: classify an opcode into the
@@ -17717,6 +17760,43 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Cx), 0xfffe);
         assert_eq!(cpu.read_reg16(Reg16::Dx), 0x0034);
         assert_eq!(cpu.read_reg16(Reg16::Si), 0x0107);
+    }
+
+    #[test]
+    fn straight_line_run_executes_hot_stack_cached_forms() {
+        // MOV AX,0x1234 ; PUSH AX ; POP BX ; PUSH 0x55aa ; POP CX ; PUSH -1 ; POP DX ; HLT.
+        // The warm second run keeps stack memory access on the existing push/pop helpers while
+        // skipping the decoded stack dispatch for register and immediate forms.
+        let code = [
+            0xb8, 0x34, 0x12, // MOV AX, 0x1234
+            0x50, // PUSH AX
+            0x5b, // POP BX
+            0x68, 0xaa, 0x55, // PUSH 0x55aa
+            0x59, // POP CX
+            0x6a, 0xff, // PUSH -1
+            0x5a, // POP DX
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ebx(0);
+        cpu.registers.set_ecx(0);
+        cpu.registers.set_edx(0);
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.registers.eip, 0x0c, "run stopped at HLT");
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234);
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x55aa);
+        assert_eq!(cpu.read_reg16(Reg16::Dx), 0xffff);
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x0200);
     }
 
     #[test]
