@@ -8938,15 +8938,14 @@ impl Cpu386 {
             self.registers.eflags &= !flag;
         }
         self.registers.eflags |= 0x2;
-        // `flag` is a compile-time-constant mask at every call site, so this folds away
-        // everywhere except the (cold) AC writers.
+        // `flag` is a compile-time-constant mask at every call site; expected to fold once
+        // set_flag inlines (set_flag_live is #[inline]). Measured: FORCING set_flag inline
+        // cost 1-3% wall via code bloat, so do not re-add #[inline] there for this check.
         if flag & FLAG_AC != 0 {
             self.recompute_alignment_armed();
         }
     }
 
-    // Inlined so the constant `flag` masks reach set_flag_live's AC check and fold it away.
-    #[inline]
     fn set_flag(&mut self, flag: u32, enabled: bool) {
         const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
         if self.pending_flags.is_some() {
