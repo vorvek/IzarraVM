@@ -908,33 +908,76 @@ fn emulate(
         if budget > 0 {
             let before = machine.elapsed_clocks();
             let stall_before = machine.io_stall_clocks();
-            let stop = tick_machine(&mut machine, budget);
+            let approximate = machine.active_mode().timing_class() == TimingClass::Approximate;
+            let stop = if approximate {
+                // Approximate class (486/586): time is already an approximation, so
+                // sub-slice the budget in ~1ms quanta and stop issuing quanta once
+                // the slice's wall deadline passes. On a host too slow to emulate
+                // the mode at full speed, the CPU retires what it can and the unrun
+                // remainder is topped up below, so audio/PIT hold realtime instead
+                // of starving behind an ever-longer slice. The Accurate class
+                // (286/386) keeps the single full-budget call: sub-slicing changes
+                // device-advance boundaries and its cadence is frozen.
+                let quantum = (clock_hz / 1000).max(1);
+                let deadline = now + Duration::from_secs_f64(budget as f64 / clock_hz as f64);
+                let mut stop = None;
+                loop {
+                    let ran_so_far = machine.elapsed_clocks().saturating_sub(before);
+                    let remaining = budget.saturating_sub(ran_so_far);
+                    if remaining == 0 {
+                        break;
+                    }
+                    stop = tick_machine(&mut machine, quantum.min(remaining));
+                    if stop.is_some() || Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                stop
+            } else {
+                tick_machine(&mut machine, budget)
+            };
             let ran = machine.elapsed_clocks().saturating_sub(before);
             // Of those clocks, some may be a device-I/O stall (a floppy seek/read)
             // that jumped the clock without executing instructions. Drain the full
             // ran from the credit so the stall still costs wall-clock time, but
             // exclude it from the speed measurement below.
             let stalled = machine.io_stall_clocks().saturating_sub(stall_before);
-            credit -= i64::try_from(ran).unwrap_or(i64::MAX);
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
             // framebuffer is presented instead.
+            let mut topped_up = 0u64;
             if matches!(stop, Some(StopReason::Halted)) {
                 machine.advance_devices_clocks(budget);
-            } else if machine.active_mode().timing_class() == TimingClass::Approximate
-                && stalled > 0
-            {
-                // Approximate class (486/586): a device I/O stall (floppy/CD seek)
-                // jumped the master clock without advancing the devices, so fill the
-                // device gap to match and audio keeps playing through a disk grind
-                // instead of the sink starving. The master clock is NOT bumped here:
-                // stall_for already advanced it by the stall, and re-adding it gave
-                // the audio pump a cumulative lead over wall time. The Accurate
-                // class (286/386) keeps exact main behavior (devices resume from
-                // the next instruction's own advance).
-                machine.advance_devices_clocks(stalled);
+            } else if approximate {
+                if stalled > 0 {
+                    // A device I/O stall (floppy/CD seek) jumped the master clock
+                    // without advancing the devices, so fill the device gap to match
+                    // and audio keeps playing through a disk grind instead of the
+                    // sink starving. The master clock is NOT bumped here: stall_for
+                    // already advanced it by the stall, and re-adding it gave the
+                    // audio pump a cumulative lead over wall time. The Accurate
+                    // class (286/386) keeps exact main behavior (devices resume from
+                    // the next instruction's own advance).
+                    machine.advance_devices_clocks(stalled);
+                }
+                if stop.is_none() {
+                    // The host ran out of wall time before the budget was consumed
+                    // (the deadline bail-out above). Top up devices AND the master
+                    // clock by the genuinely unrun remainder so guest time keeps
+                    // tracking wall time; the shortfall is wall-backed by
+                    // construction, so draining credit for it below is correct.
+                    // Stall jumps already count as progress in `ran`, so they are
+                    // not double-counted here. Fatal stops (CpuError/DosExit/
+                    // TestExit) skip the top-up and keep devices frozen.
+                    let shortfall = budget.saturating_sub(ran);
+                    if shortfall > 0 {
+                        machine.advance_wall_shortfall(shortfall);
+                        topped_up = shortfall;
+                    }
+                }
             }
+            credit -= i64::try_from(ran.saturating_add(topped_up)).unwrap_or(i64::MAX);
             if let Some(sink) = &sink {
                 pump_audio(
                     &mut machine,

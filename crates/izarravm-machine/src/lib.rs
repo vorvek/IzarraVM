@@ -9087,6 +9087,17 @@ impl Machine {
         self.advance_devices(clocks);
     }
 
+    /// Advance device time AND the master clock by `clocks` without running the
+    /// CPU. Used by the GUI in the Approximate class when the host could not
+    /// execute the full wall-clock budget: guest time keeps tracking wall time so
+    /// audio/PIT hold realtime; the CPU simply retires fewer instructions per
+    /// guest second (the DOSBox-style degradation). Never called in the Accurate
+    /// class.
+    pub fn advance_wall_shortfall(&mut self, clocks: u64) {
+        self.advance_devices(clocks);
+        self.elapsed_clocks += clocks;
+    }
+
     /// Rebuild the DSP resampler when the programmed sample rate changes, so it
     /// always runs rate_hz -> 44100.
     fn sync_dsp_resampler(&mut self) {
@@ -18221,6 +18232,24 @@ mod tests {
             machine.elapsed_clocks(),
             before,
             "advance_devices_clocks must advance device time only, never the master clock"
+        );
+    }
+
+    #[test]
+    fn wall_shortfall_advances_devices_and_master_clock_together() {
+        // The GUI's Approximate-class wall-clock top-up relies on this: when the
+        // host could not execute the full budget, the unrun remainder must move
+        // BOTH device time and the master clock, so the audio pump (which paces
+        // off elapsed_clocks deltas) keeps tracking wall time. Contrast with
+        // device_fill_never_moves_the_master_clock above: that path fills a gap
+        // the master clock already jumped over; this one creates the time.
+        let mut machine = test_machine();
+        let before = machine.elapsed_clocks();
+        machine.advance_wall_shortfall(1000);
+        assert_eq!(
+            machine.elapsed_clocks(),
+            before + 1000,
+            "advance_wall_shortfall must advance the master clock by exactly `clocks`"
         );
     }
 
