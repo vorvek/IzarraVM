@@ -12152,6 +12152,17 @@ impl CpuBus for MachineBus<'_> {
             return Ok(value);
         }
 
+        if let Some((start, end)) = self.direct_ram_range(address, width) {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            let data = &self.memory.as_slice()[start..end];
+            return Ok(match width {
+                BusWidth::Byte => u32::from(data[0]),
+                BusWidth::Word => u32::from(u16::from_le_bytes([data[0], data[1]])),
+                BusWidth::Dword => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            });
+        }
+
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
 
@@ -12198,6 +12209,16 @@ impl CpuBus for MachineBus<'_> {
                 )?;
             }
             return Ok(());
+        }
+
+        if let Some((start, _)) = self.direct_ram_range(address, width) {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            return match width {
+                BusWidth::Byte => self.memory.write_u8(start, value as u8),
+                BusWidth::Word => self.memory.write_u16(start, value as u16),
+                BusWidth::Dword => self.memory.write_u32(start, value),
+            };
         }
 
         let ws = self.data_access_wait_states(address, width);
@@ -13612,6 +13633,29 @@ impl MachineBus<'_> {
         } else {
             address & A20_MASK
         }
+    }
+
+    #[inline]
+    fn direct_ram_range(&self, address: u32, width: BusWidth) -> Option<(usize, usize)> {
+        let start = address as usize;
+        let end = start.checked_add(width.bytes() as usize)?;
+        if end > self.memory.len() {
+            return None;
+        }
+        if end <= 0x000A_0000 {
+            return Some((start, end));
+        }
+        if self.is_device_window(address, width) {
+            return None;
+        }
+        if let Some(ems) = self.ems {
+            let last = address + width.bytes() - 1;
+            if ems.in_frame(address) || ems.in_frame(last) {
+                return None;
+            }
+        }
+        // ponytail: flat RAM only; a real page-pointer table can replace this if profiling justifies it.
+        Some((start, end))
     }
 
     /// The plane-window offset for an access that the guest-selected GC06 graphics
