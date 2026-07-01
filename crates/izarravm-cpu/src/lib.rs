@@ -4317,6 +4317,44 @@ impl Cpu386 {
     /// only for 0xe4/0xe5 vs 0xe6/0xe7, respectively; 0 = IN, 1 = unused for the 0xec range where
     /// bit 1 distinguishes direction: see comments per arm). Clocks match the fused arms verbatim
     /// (12 for IN, 10 for OUT).
+    /// In V86 (or protected mode with CPL > IOPL), `IN`/`OUT` consult the TSS
+    /// I/O-permission bitmap: the access is allowed only if every bit for ports
+    /// `port..port+width` is 0. A bit at or beyond the TSS limit is treated as set
+    /// (not permitted). A denied access faults `#GP(0)` to the monitor.
+    fn check_io_permission<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        port: u16,
+        width: BusWidth,
+    ) -> ExecResult<()> {
+        if !self.is_v86_mode() && self.current_privilege_level() <= self.iopl() {
+            return Ok(());
+        }
+        let io_base =
+            bus.read_memory(self.tr.base + 0x66, BusWidth::Word, BusAccessKind::DataRead)?;
+        for p in u32::from(port)..u32::from(port) + width.bytes() {
+            let byte_index = io_base + p / 8;
+            if byte_index > self.tr.limit {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0),
+                });
+            }
+            let byte = bus.read_memory(
+                self.tr.base + byte_index,
+                BusWidth::Byte,
+                BusAccessKind::DataRead,
+            )? as u8;
+            if byte & (1 << (p % 8)) != 0 {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn execute_port_io_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
@@ -4327,6 +4365,7 @@ impl Cpu386 {
             0xe4 => {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 let value = bus.read_io(port, BusWidth::Byte)? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
@@ -4334,6 +4373,7 @@ impl Cpu386 {
             0xe5 => {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 let value = bus.read_io(port, operand_size.bus_width())?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
@@ -4341,12 +4381,14 @@ impl Cpu386 {
             0xe6 => {
                 // OUT imm8, AL: byte port output from AL.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
                 Ok(clocks(10))
             }
             0xe7 => {
                 // OUT imm8, AX/EAX: word/dword port output from the accumulator.
                 let port = insn.imm as u16;
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -4357,6 +4399,7 @@ impl Cpu386 {
             0xec => {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 let value = bus.read_io(port, BusWidth::Byte)? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
@@ -4364,6 +4407,7 @@ impl Cpu386 {
             0xed => {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 let value = bus.read_io(port, operand_size.bus_width())?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
@@ -4371,12 +4415,14 @@ impl Cpu386 {
             0xee => {
                 // OUT DX, AL: byte port output addressed by DX.
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, BusWidth::Byte)?;
                 bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
                 Ok(clocks(10))
             }
             0xef => {
                 // OUT DX, AX/EAX: word/dword port output addressed by DX.
                 let port = self.read_gpr16(2);
+                self.check_io_permission(bus, port, operand_size.bus_width())?;
                 bus.write_io(
                     port,
                     operand_size.bus_width(),
@@ -24594,5 +24640,41 @@ mod tests {
         assert_eq!(cpu.registers.cs().selector, r3_cs);
         assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
         assert_eq!(cpu.registers.esp(), 0x2000);
+    }
+
+    #[test]
+    fn v86_out_consults_the_io_permission_bitmap() {
+        // Guest at 0x0A00:0 does `OUT 0x21, AL` (E6 21). Bitmap traps port 0x21.
+        let mut bitmap = vec![0u8; 0x20 + 1]; // ports 0..0x100 + terminator byte
+        bitmap[0x21 / 8] |= 1 << (0x21 % 8);
+        let guest = [0xe6, 0x21, 0xf4]; // out 0x21, al ; hlt
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &bitmap);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        let outcome = cpu.cycle(&mut bus);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !cpu.is_v86_mode(),
+            "trapped OUT must land in the ring-0 monitor"
+        );
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+    }
+
+    #[test]
+    fn v86_out_to_a_permitted_port_runs_the_io() {
+        let bitmap = vec![0u8; 0x20 + 1]; // all-zero: everything permitted
+        let guest = [0xe6, 0x21, 0xf4]; // out 0x21, al ; hlt
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &bitmap);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.is_v86_mode(), "permitted OUT stays in V86");
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoWrite && c.address == 0x21),
+            "permitted OUT should reach the I/O bus"
+        );
     }
 }
