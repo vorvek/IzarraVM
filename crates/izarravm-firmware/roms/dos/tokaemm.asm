@@ -62,6 +62,19 @@ XMS_HANDLES equ 32
 XMS_SLOT    equ 8
 xms_table: times XMS_HANDLES*XMS_SLOT db 0
 
+; SP-4b M3 UMB: the free upper window 0xC8000-0xEFFFF (above the VGA BIOS, below
+; system ROM), 160 KB, page-mapped at INIT to extended RAM just above the HMA. The
+; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, 0xF000).
+UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
+UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
+UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
+UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment)
+UMB_SEG_PARAS equ 0x2800          ; 160 KB / 16 = paragraphs in the window
+; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
+UMB_SLOTS equ 8
+UMB_SLOT  equ 6
+umb_table: times UMB_SLOTS*UMB_SLOT db 0
+
 strategy:
     mov [cs:rh_ptr], bx
     mov [cs:rh_ptr+2], es
@@ -104,9 +117,9 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
-    ; --- SP-4b M1: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
-    ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Pool = [1 MB + 64 KB
-    ; HMA, 1 MB + min(ext, 15 MB)) so it stays inside the monitor's 0..16 MB map.
+    ; --- SP-4b M1/M3: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
+    ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
+    ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
     mov ah, 0x88
     int 0x15                      ; AX = extended KB (real mode, before V86)
     movzx eax, ax
@@ -115,11 +128,11 @@ init:
     mov eax, 15*1024
 .pool_ok:
     sub eax, 64                   ; drop the HMA (first 64 KB of extended memory)
-    shl eax, 10                   ; KB -> bytes = pool length
-    mov ebx, 0x00110000           ; base = 1 MB + 64 KB (above the HMA)
-    mov [cs:xms_pool_base], ebx
-    add eax, ebx
+    shl eax, 10                   ; KB -> bytes
+    add eax, 0x00110000           ; eax = top of extended (pool_end, unchanged from M1)
     mov [cs:xms_pool_end], eax
+    ; The 160 KB UMB backing sits just above the HMA (SP-4b M3); XMS starts past it.
+    mov dword [cs:xms_pool_base], UMB_PHYS_BASE + UMB_BYTES
     ; Hook INT 2Fh: save the old vector, install our handler (IVT at linear 0).
     push ds
     xor ax, ax
@@ -768,6 +781,17 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     add eax, 0x1000
     add edi, 4
     loop .pt
+    ; SP-4b M3: page the free upper window 0xC8000-0xEFFFF to extended RAM (the
+    ; EMM386 trick). Those holes have no RAM of their own -> the guest reads them as
+    ; open bus (0xFF) without this. ROM/video PTEs stay identity; only these 40 move.
+    lea edi, [ebp + 0x1000 + (UMB_LIN_BASE >> 12) * 4]  ; PT0 entry for 0xC8000
+    mov eax, UMB_PHYS_BASE | 7                          ; backing base, present/rw/user
+    mov ecx, UMB_BYTES >> 12                            ; 40 pages
+.umb_map:
+    mov [edi], eax
+    add eax, 0x1000
+    add edi, 4
+    loop .umb_map
     mov cr3, ebp
     mov eax, cr0
     or eax, 0x80000000            ; paging on
