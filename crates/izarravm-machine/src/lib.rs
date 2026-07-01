@@ -17231,6 +17231,36 @@ mod tests {
     }
 
     #[test]
+    fn program_runtime_reintercepts_dos_vectors_for_the_raw_program_loader() {
+        // The raw-program runtime (new_raw_program) still services INT 20h/21h/27h
+        // itself (terminate + minimal console I/O), so interrupt_acknowledge must
+        // record those vectors when program_runtime is set — even though the
+        // retired HLE no longer intercepts them for a normal boot. This pins the
+        // exact branch the SP-3 seam deletion added to interrupt_acknowledge.
+        let prog: &[u8] = &[0xcd, 0x20]; // int 20h
+        let mut raw =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        for vector in [0x20u8, 0x21, 0x27] {
+            raw.pending_soft_int = None;
+            raw.make_bus().interrupt_acknowledge(vector, 0).unwrap();
+            assert_eq!(
+                raw.pending_soft_int,
+                Some(vector),
+                "INT {vector:02X}h is intercepted for the raw-program runtime"
+            );
+        }
+
+        // A normal (non-program-runtime) machine passes them straight through.
+        let mut boot = int15_machine(16);
+        boot.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        assert_eq!(
+            boot.pending_soft_int, None,
+            "INT 21h passes through for a normal boot (no raw-program runtime)"
+        );
+    }
+
+    #[test]
     fn absent_resident_api_vectors_intercept_only_default_iret() {
         let mut m = int15_machine(16);
 
