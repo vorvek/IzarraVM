@@ -16,6 +16,39 @@
 
 use std::collections::HashMap;
 
+/// The backing region reserved for EMS at the top of extended RAM: its physical
+/// base and how many 16 KiB pages it holds. (Relocated from the retired xms.rs.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmsRegion {
+    pub base: u32,
+    pub total_pages: u16,
+}
+
+/// Linear base of extended memory (first byte above 1 MB) and the HMA size in KB,
+/// used to place the EMS region at the top of extended RAM.
+const EXTENDED_MEMORY_BASE: u32 = 0x10_0000;
+const HMA_SIZE_KB: u32 = 64;
+
+/// Carve `ems_want_kb` (rounded down to whole 16 KiB pages, clamped to what
+/// extended memory above the HMA can spare) off the TOP of extended RAM for EMS.
+/// Returns the region, or None when EMS gets no pages. XMS (now the guest driver)
+/// takes everything below it.
+pub fn ems_region(memory_mib: u16, ems_want_kb: u32) -> Option<EmsRegion> {
+    let total_kb = u32::from(memory_mib) * 1024;
+    let extended_kb = total_kb.saturating_sub(1024);
+    let usable_kb = extended_kb.saturating_sub(HMA_SIZE_KB);
+    let ems_kb = (ems_want_kb.min(usable_kb) / 16) * 16;
+    if ems_kb == 0 {
+        return None;
+    }
+    let pool_base = EXTENDED_MEMORY_BASE + HMA_SIZE_KB * 1024;
+    let xms_pool_kb = usable_kb - ems_kb;
+    Some(EmsRegion {
+        base: pool_base + xms_pool_kb * 1024,
+        total_pages: (ems_kb / 16) as u16,
+    })
+}
+
 /// A logical/physical expanded-memory page is 16 KiB.
 pub const EMS_PAGE_SIZE: u32 = 16 * 1024;
 /// The page frame is four 16 KiB physical pages (slots 0-3).
