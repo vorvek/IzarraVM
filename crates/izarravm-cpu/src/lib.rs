@@ -6993,6 +6993,40 @@ impl Cpu386 {
                 let eip = self.pop(bus, OperandSize::Dword)?;
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
+
+                if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
+                    // Return INTO a V86 task: pop the V86 tail and reload real-mode segments.
+                    let esp = self.pop(bus, OperandSize::Dword)?;
+                    let ss = self.pop(bus, OperandSize::Dword)? as u16;
+                    let es = self.pop(bus, OperandSize::Dword)? as u16;
+                    let ds = self.pop(bus, OperandSize::Dword)? as u16;
+                    let fs = self.pop(bus, OperandSize::Dword)? as u16;
+                    let gs = self.pop(bus, OperandSize::Dword)? as u16;
+                    self.load_flags(flags, OperandSize::Dword); // sets VM=1
+                    self.load_segment_real(SegmentIndex::Cs, cs);
+                    self.load_segment_real(SegmentIndex::Ss, ss);
+                    self.load_segment_real(SegmentIndex::Ds, ds);
+                    self.load_segment_real(SegmentIndex::Es, es);
+                    self.load_segment_real(SegmentIndex::Fs, fs);
+                    self.load_segment_real(SegmentIndex::Gs, gs);
+                    self.set_eip(eip);
+                    self.registers.set_esp(esp);
+                    return Ok(());
+                }
+
+                if (cs & 3) as u8 > self.current_privilege_level() {
+                    // Inter-privilege return to a less-privileged (non-V86) ring: pop SS:ESP.
+                    let esp = self.pop(bus, OperandSize::Dword)?;
+                    let ss = self.pop(bus, OperandSize::Dword)? as u16;
+                    self.load_segment(bus, SegmentIndex::Cs, cs)?;
+                    self.load_segment(bus, SegmentIndex::Ss, ss)?;
+                    self.set_eip(eip);
+                    self.registers.set_esp(esp);
+                    self.load_flags(flags, OperandSize::Dword);
+                    return Ok(());
+                }
+
+                // Same privilege (existing behavior).
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.set_eip(eip);
                 self.load_flags(flags, OperandSize::Dword);
@@ -24496,5 +24530,40 @@ mod tests {
         assert_eq!(rd(28) & 0xffff, 0x1111, "V86 DS");
         assert_eq!(rd(32) & 0xffff, 0x3333, "V86 FS");
         assert_eq!(rd(36) & 0xffff, 0x4444, "V86 GS");
+    }
+
+    #[test]
+    fn iret_into_v86_restores_the_task() {
+        // Monitor at CPL0 with a V86 return frame on its stack; IRET must re-enter V86.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        // Build the 32-bit V86 IRET frame (push high-to-low): GS,FS,DS,ES,SS,ESP,EFLAGS,CS,EIP.
+        let vm_eflags = FLAG_VM | 0x2;
+        for v in [
+            0x4444u32, 0x3333, 0x1111, 0x2222, 0x0900, 0x1000, vm_eflags, 0x0A00, 0x0010,
+        ] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+
+        assert!(cpu.is_v86_mode(), "IRET with popped VM=1 must re-enter V86");
+        assert_eq!(cpu.registers.eip, 0x0010);
+        assert_eq!(cpu.registers.cs().selector, 0x0A00);
+        assert_eq!(
+            cpu.registers.cs().base,
+            0x0A00 << 4,
+            "real-mode base=sel<<4"
+        );
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x0900);
+        assert_eq!(cpu.registers.esp(), 0x1000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x1111);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Es).selector, 0x2222);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0x3333);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0x4444);
+        assert_eq!(cpu.current_privilege_level(), 3, "V86 is always CPL 3");
     }
 }
