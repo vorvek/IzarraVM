@@ -2719,7 +2719,13 @@ impl Cpu386 {
                 Some(clocks(3))
             }
             0x70..=0x7f | 0x0f80..=0x0f8f => {
-                if self.condition((insn.opcode & 0x0f) as u8) {
+                let cc = (insn.opcode & 0x0f) as u8;
+                let taken = match cc {
+                    0x4 => self.flag(FLAG_ZF),
+                    0x5 => !self.flag(FLAG_ZF),
+                    _ => self.condition(cc),
+                };
+                if taken {
                     self.relative_jump(insn.imm as i32, insn.operand_size);
                 }
                 Some(clocks(3))
@@ -18416,6 +18422,44 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Bx), 1, "taken JNZ skipped dead MOV");
         assert_eq!(cpu.read_reg16(Reg16::Cx), 1, "MOV imm then DEC ran");
         assert!(!cpu.flag(FLAG_ZF), "DEC CX from 2 to 1 leaves ZF clear");
+    }
+
+    #[test]
+    fn straight_line_cached_zf_branches_keep_test_flags_lazy() {
+        for (opcode, ax) in [(0x74, 0u8), (0x75, 1u8)] {
+            // MOV AX,ax ; TEST AX,AX ; JZ/JNZ target ; MOV BX,dead ; target: MOV BX,1234 ; HLT.
+            let code = [
+                0xb8, ax, 0x00, // MOV AX, ax
+                0x85, 0xc0, // TEST AX, AX
+                opcode, 0x03, // JZ/JNZ +3 -> target
+                0xbb, 0xad, 0xde, // MOV BX, 0xDEAD (skipped)
+                0xbb, 0x34, 0x12, // target: MOV BX, 0x1234
+                0xf4, // HLT
+            ];
+            let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+            let mut bus = TestBus::with_memory(memory);
+            drive_straight_line_runs(&mut cpu, &mut bus);
+
+            cpu.registers.eip = 0;
+            cpu.registers.set_eax(0);
+            cpu.registers.set_ebx(0);
+            cpu.pending_flags = None;
+            cpu.halted = false;
+            cpu.reset_perf_counters();
+
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted, "HLT remains the run terminator");
+            assert_eq!(cpu.registers.eip, 0x0d, "run stopped at HLT");
+            assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234, "branch was taken");
+            assert!(
+                cpu.pending_flags.is_some(),
+                "TEST flags should remain deferred after JZ/JNZ reads ZF"
+            );
+            assert_eq!(
+                cpu.perf.flag_materializations, 0,
+                "JZ/JNZ should read pending ZF without materializing"
+            );
+        }
     }
 
     #[test]
