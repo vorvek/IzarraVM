@@ -2481,4 +2481,61 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
              a 0xEn code names the failed step.\n{text}"
         );
     }
+
+    /// SP-4b M3 mechanism test: drives TOKAEMM's XMS 10h/11h/12h directly (no
+    /// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach — the
+    /// too-big probe, alloc, grow, release, reuse-after-free — plus a write/read of
+    /// the paged RAM. UMBMECH signals 0xA5; a 0xEn code names the failed step.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_m3_umb_direct_xms_in_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_m3d_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nUMBMECH\r\n".to_vec();
+
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.emm386 = izarravm_core::Emm386Mode::NoEms;
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "UMBMECH.COM".to_string(),
+                        izarravm_firmware::umbmech_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "UMB mechanism round-trip did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
 }
