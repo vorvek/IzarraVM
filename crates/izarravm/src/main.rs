@@ -2594,6 +2594,63 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// SP-4b M2 coexistence: with DEVICE=TOKAEMM.SYS RAM *and* DOS=UMB, the UMB
+    /// window ends below the EMS page frame (umb_win_end = 0xE000) and DOS=UMB
+    /// still links and allocates upper memory from the carved window — the frame
+    /// and the UMBs share the upper area under the guest driver's own bookkeeping.
+    /// Reuses the M3 UMBTEST fixture (seg >= 0xC800 + write/read pattern).
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_m2_umb_coexists_with_ems_frame_in_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_m2u_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nUMBTEST\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "UMBTEST.COM".to_string(),
+                        izarravm_firmware::umbtest_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "UMB alongside the EMS frame did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
+
     /// SP-4b M2 default-off contract: a bare DEVICE=TOKAEMM.SYS (no RAM argument)
     /// presents a FRAMELESS manager — INT 67h answers present/version 4.0, the
     /// frame query returns 80h, page counts are zero, and allocation is refused
