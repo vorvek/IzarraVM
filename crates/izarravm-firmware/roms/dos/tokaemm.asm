@@ -236,8 +236,8 @@ xms_2f_handler:
 ; (AX=1 success / AX=0 + BL=error). Register-safe table dispatch (only BX is
 ; touched, then restored, so CX/DX/SI/DI/BP/DS inputs survive to the handler).
 xms_entry:
-    cmp ah, 0x0F
-    ja .unimpl                   ; 10h+ (UMB) : not implemented in M1 (guest UMB = M3)
+    cmp ah, 0x12
+    ja .unimpl                   ; 13h+ : not implemented
     push bx
     movzx bx, ah
     add bx, bx
@@ -247,13 +247,14 @@ xms_entry:
     jmp [cs:xms_disp]
 .unimpl:
     xor ax, ax
-    mov bl, 0xB1                  ; no UMB available / not implemented
+    mov bl, 0x80                  ; function not implemented
     retf
 xms_jt:
     dw xf_version, xf_req_hma,   xf_rel_hma,  xf_a20_gon
     dw xf_a20_goff, xf_a20_lon,  xf_a20_loff, xf_a20_query
     dw xf_query_free, xf_alloc,  xf_free,     xf_move
     dw xf_lock,    xf_unlock,    xf_info,     xf_resize
+    dw xf_req_umb, xf_rel_umb,   xf_realloc_umb
 
 ; shared tails
 xms_ok:
@@ -720,6 +721,214 @@ resolve:
     pop si
     mov al, 2
     stc
+    ret
+
+; --- SP-4b M3 UMB (XMS 10h/11h/12h) over the paged window [UMB_SEG_BASE, +PARAS) --
+
+; 10h Request UMB: DX = paragraphs. First-fit a free run; on success mark a slot.
+;   success: AX=1, BX=segment, DX=paras. smaller-only: AX=0, BL=0xB0, DX=largest.
+;   none: AX=0, BL=0xB1, DX=0.
+xf_req_umb:
+    push si
+    call umb_free_run             ; DX=need -> BX=seg, CF clear; or CF set
+    jc .toobig
+    mov si, umb_table             ; find a free slot for the block record
+    push cx
+    mov cx, UMB_SLOTS
+.slot:
+    cmp byte [cs:si], 0
+    je .got
+    add si, UMB_SLOT
+    loop .slot
+    pop cx                        ; no slot (DOS grabs once, so unexpected)
+    xor dx, dx
+    mov bl, 0xB1
+    pop si
+    jmp xms_fail
+.got:
+    pop cx
+    mov byte [cs:si], 1
+    mov [cs:si+2], bx             ; seg
+    mov [cs:si+4], dx             ; paras
+    pop si
+    mov ax, 1                     ; BX=seg, DX=paras already set
+    retf
+.toobig:
+    call umb_largest              ; AX = largest free run (paras)
+    test ax, ax
+    jz .none
+    mov dx, ax                    ; DX = largest
+    mov bl, 0xB0
+    xor ax, ax
+    pop si
+    retf
+.none:
+    xor dx, dx
+    mov bl, 0xB1
+    xor ax, ax
+    pop si
+    retf
+
+; 11h Release UMB: DX = segment.
+xf_rel_umb:
+    push si
+    call umb_slot_of_seg          ; DX=seg -> SI=slot, CF clear; or CF set (BL=0xB2)
+    jc .bad
+    mov byte [cs:si], 0
+    pop si
+    jmp xms_ok
+.bad:
+    pop si
+    jmp xms_fail
+
+; 12h Reallocate UMB: BX = new paras, DX = segment. Shrink always; grow if the
+; space above the block is free. Grow-fail: AX=0, BL=0xB0, DX=largest growable.
+xf_realloc_umb:
+    push si
+    call umb_slot_of_seg
+    jc .bad
+    cmp bx, [cs:si+4]             ; new <= old?
+    jbe .set
+    call umb_max_grow             ; SI=slot -> AX = max paras from this seg
+    cmp bx, ax                    ; new <= maxgrow?
+    ja .nofit
+.set:
+    mov [cs:si+4], bx
+    pop si
+    jmp xms_ok
+.nofit:
+    mov dx, ax                    ; DX = largest growable
+    mov bl, 0xB0
+    pop si
+    xor ax, ax
+    retf
+.bad:
+    pop si
+    jmp xms_fail
+
+; First-fit free run of DX paras in [UMB_SEG_BASE, +UMB_SEG_PARAS). Restart-on-
+; overlap (mirrors find_gap). out: BX = seg, CF clear; or CF set. Preserves DX;
+; clobbers ax, cx, si.
+umb_free_run:
+    push cx
+    push si
+    cmp dx, UMB_SEG_PARAS         ; bigger than the whole window? can't fit (dodges
+    ja .none                      ; the 16-bit wrap on cursor+need for huge probes).
+    mov bx, UMB_SEG_BASE
+.restart:
+    mov ax, bx
+    add ax, dx                    ; cursor + need
+    cmp ax, UMB_SEG_BASE + UMB_SEG_PARAS
+    ja .none
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.scan:
+    cmp byte [cs:si], 0
+    je .next
+    mov ax, [cs:si+2]
+    add ax, [cs:si+4]             ; b.top = seg + paras
+    cmp ax, bx                    ; b.top <= cursor? (below)
+    jbe .next
+    mov ax, bx
+    add ax, dx                    ; cursor + need
+    cmp [cs:si+2], ax             ; b.seg >= cursor+need? (above)
+    jae .next
+    mov bx, [cs:si+2]             ; overlap: cursor = b.top, restart
+    add bx, [cs:si+4]
+    jmp .restart
+.next:
+    add si, UMB_SLOT
+    loop .scan
+    pop si
+    pop cx
+    clc
+    ret
+.none:
+    pop si
+    pop cx
+    stc
+    ret
+
+; Largest free run in paras. Approximated as the run from the highest block top to
+; the window end (exact for first-fit-from-base without middle frees, which is how
+; DOS=UMB uses it). ponytail: an exact largest-gap needs a sorted walk.
+; out: AX = largest free paras. clobbers cx, dx, si.
+umb_largest:
+    push cx
+    push si
+    push dx
+    mov ax, UMB_SEG_BASE          ; highest top so far
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.l:
+    cmp byte [cs:si], 0
+    je .n
+    mov dx, [cs:si+2]
+    add dx, [cs:si+4]             ; b.top
+    cmp dx, ax
+    jbe .n
+    mov ax, dx
+.n:
+    add si, UMB_SLOT
+    loop .l
+    neg ax
+    add ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; window_end - highest_top
+    pop dx
+    pop si
+    pop cx
+    ret
+
+; DX = seg -> SI = slot offset, CF clear; or CF set (BL=0xB2). Clobbers ax, cx.
+umb_slot_of_seg:
+    push cx
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.f:
+    cmp byte [cs:si], 0
+    je .n
+    mov ax, [cs:si+2]
+    cmp ax, dx
+    je .hit
+.n:
+    add si, UMB_SLOT
+    loop .f
+    pop cx
+    mov bl, 0xB2                  ; invalid UMB segment
+    stc
+    ret
+.hit:
+    pop cx
+    clc
+    ret
+
+; Max paras the block at SI can grow to (nearest higher block seg, or window end,
+; minus this seg). in: SI = slot. out: AX. preserves SI/BX/CX/DX.
+umb_max_grow:
+    push bx
+    push cx
+    push di
+    mov di, [cs:si+2]             ; our seg
+    mov ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; nearest boundary = window end
+    push si
+    mov si, umb_table
+    mov cx, UMB_SLOTS
+.s:
+    cmp byte [cs:si], 0
+    je .n
+    mov bx, [cs:si+2]             ; other seg
+    cmp bx, di                    ; other <= our seg? (self or below)
+    jbe .n
+    cmp bx, ax                    ; other < nearest?
+    jae .n
+    mov ax, bx
+.n:
+    add si, UMB_SLOT
+    loop .s
+    pop si
+    sub ax, di                    ; max paras = nearest - our seg
+    pop di
+    pop cx
+    pop bx
     ret
 
 align 8
