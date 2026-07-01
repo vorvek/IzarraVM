@@ -2732,9 +2732,7 @@ impl Cpu386 {
                     let DecodedOperand::Mem(addr) = insn.operand? else {
                         return None;
                     };
-                    let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                        return None;
-                    };
+                    let memory = self.resolve_memory_addr_mode(&addr);
                     self.write_gpr_sized(modrm.reg, insn.operand_size, memory.offset);
                     Some(clocks(2))
                 }
@@ -2920,9 +2918,7 @@ impl Cpu386 {
         let Some(DecodedOperand::Mem(addr)) = insn.operand else {
             return Ok(None);
         };
-        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-            return Ok(None);
-        };
+        let memory = self.resolve_memory_addr_mode(&addr);
 
         let op = (opcode >> 3) & 0x07;
         let write_back = op != 7;
@@ -3095,9 +3091,7 @@ impl Cpu386 {
         let Some(DecodedOperand::Mem(addr)) = insn.operand else {
             return Ok(None);
         };
-        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-            return Ok(None);
-        };
+        let memory = self.resolve_memory_addr_mode(&addr);
 
         match opcode {
             0x80 | 0x82 => {
@@ -3160,9 +3154,7 @@ impl Cpu386 {
         let Some(DecodedOperand::Mem(addr)) = insn.operand else {
             return Ok(None);
         };
-        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-            return Ok(None);
-        };
+        let memory = self.resolve_memory_addr_mode(&addr);
 
         match opcode {
             0x88 => {
@@ -3227,9 +3219,7 @@ impl Cpu386 {
                 let Some(DecodedOperand::Mem(addr)) = insn.operand else {
                     return Ok(None);
                 };
-                let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                    return Ok(None);
-                };
+                let memory = self.resolve_memory_addr_mode(&addr);
                 let value = self.read_memory_u8(
                     bus,
                     memory.segment,
@@ -3247,9 +3237,7 @@ impl Cpu386 {
                 let Some(DecodedOperand::Mem(addr)) = insn.operand else {
                     return Ok(None);
                 };
-                let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                    return Ok(None);
-                };
+                let memory = self.resolve_memory_addr_mode(&addr);
                 let value = self.read_memory_sized(
                     bus,
                     memory.segment,
@@ -4338,9 +4326,7 @@ impl Cpu386 {
                 match insn.operand.expect("MOV r/m8,r8 decoded with an operand") {
                     DecodedOperand::Reg(index) => self.write_gpr8(index, value),
                     DecodedOperand::Mem(addr) => {
-                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                            unreachable!("memory descriptor resolved to register")
-                        };
+                        let memory = self.resolve_memory_addr_mode(&addr);
                         self.write_memory_u8(
                             bus,
                             memory.segment,
@@ -4361,9 +4347,7 @@ impl Cpu386 {
                         self.write_gpr_sized(index, operand_size, value);
                     }
                     DecodedOperand::Mem(addr) => {
-                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                            unreachable!("memory descriptor resolved to register")
-                        };
+                        let memory = self.resolve_memory_addr_mode(&addr);
                         self.write_memory_sized(
                             bus,
                             memory.segment,
@@ -4382,9 +4366,7 @@ impl Cpu386 {
                 let value = match insn.operand.expect("MOV r8,r/m8 decoded with an operand") {
                     DecodedOperand::Reg(index) => self.read_gpr8(index),
                     DecodedOperand::Mem(addr) => {
-                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                            unreachable!("memory descriptor resolved to register")
-                        };
+                        let memory = self.resolve_memory_addr_mode(&addr);
                         self.read_memory_u8(
                             bus,
                             memory.segment,
@@ -4402,9 +4384,7 @@ impl Cpu386 {
                 let value = match insn.operand.expect("MOV r,r/m decoded with an operand") {
                     DecodedOperand::Reg(index) => self.read_gpr_sized(index, operand_size),
                     DecodedOperand::Mem(addr) => {
-                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                            unreachable!("memory descriptor resolved to register")
-                        };
+                        let memory = self.resolve_memory_addr_mode(&addr);
                         self.read_memory_sized(
                             bus,
                             memory.segment,
@@ -5072,9 +5052,7 @@ impl Cpu386 {
                 {
                     DecodedOperand::Reg(index) => self.read_gpr8(index),
                     DecodedOperand::Mem(addr) => {
-                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                            unreachable!("memory descriptor resolved to register")
-                        };
+                        let memory = self.resolve_memory_addr_mode(&addr);
                         self.read_memory_u8(
                             bus,
                             memory.segment,
@@ -5093,9 +5071,7 @@ impl Cpu386 {
                 let value = match insn.operand.expect("TEST r/m,reg decoded with an operand") {
                     DecodedOperand::Reg(index) => self.read_gpr_sized(index, operand_size),
                     DecodedOperand::Mem(addr) => {
-                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
-                            unreachable!("memory descriptor resolved to register")
-                        };
+                        let memory = self.resolve_memory_addr_mode(&addr);
                         self.read_memory_sized(
                             bus,
                             memory.segment,
@@ -6724,7 +6700,7 @@ impl Cpu386 {
     /// and index registers now. Reads only general registers (no instruction bytes), so it is
     /// safe to call repeatedly on a cached descriptor.
     #[inline]
-    fn resolve_addr_mode(&self, addr: &AddrMode) -> RmOperand {
+    fn resolve_memory_addr_mode(&self, addr: &AddrMode) -> MemoryOperand {
         let disp = addr.disp as u32;
         let offset = match addr.address_size {
             AddressSize::Word => {
@@ -6758,10 +6734,15 @@ impl Cpu386 {
                 base.wrapping_add(index).wrapping_add(disp)
             }
         };
-        RmOperand::Memory(MemoryOperand {
+        MemoryOperand {
             segment: addr.segment,
             offset,
-        })
+        }
+    }
+
+    #[inline]
+    fn resolve_addr_mode(&self, addr: &AddrMode) -> RmOperand {
+        RmOperand::Memory(self.resolve_memory_addr_mode(addr))
     }
 
     fn parse_16bit_address<B: CpuBus>(
