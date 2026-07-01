@@ -132,9 +132,12 @@ pub fn exit42_com() -> &'static [u8] {
     EXIT42_COM
 }
 
-/// TOKAEMM.SYS (SP-4b M0): a minimal char device driver whose INIT runs at
-/// SYSINIT, leaves a console marker, and reports no resident code so DOS unloads
-/// it. Overlaid onto C: and loaded via `DEVICE=C:\TOKAEMM.SYS`.
+/// TOKAEMM.SYS (SP-4b M0): a bespoke memory-manager char device. Its INIT runs
+/// at SYSINIT, builds a load-relative protected-mode + paging + ring-0 monitor
+/// environment in its own resident memory, then IRETDs the running kernel into
+/// virtual-8086 mode — so the rest of DOS boots and runs virtualized under the
+/// monitor. It stays resident permanently. Overlaid onto C: and loaded via
+/// `DEVICE=C:\TOKAEMM.SYS`.
 pub fn tokaemm_sys() -> &'static [u8] {
     TOKAEMM_SYS
 }

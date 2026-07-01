@@ -1959,6 +1959,12 @@ impl Cpu386 {
     /// interrupt servicing (`handle_int10`/`handle_int13`/…, which assume a
     /// real-mode INT frame at SS:SP) while this holds, so the HLE runs only once
     /// the monitor has reflected the INT back into the V86 guest.
+    ///
+    /// ASSUMPTION: today "ring-0 PM" is *only* the TOKAEMM monitor — every stock
+    /// HLE-served BIOS INT (10h–1Ah) is issued from real mode, so this reads false
+    /// there. A future protected-mode guest that legitimately issued an HLE INT at
+    /// CPL 0 would have it deferred until it next left ring-0 PM; revisit this gate
+    /// when PM DOS-extender / DPMI support lands.
     pub fn is_ring0_protected(&self) -> bool {
         self.is_protected_mode() && !self.is_v86_mode() && self.current_privilege_level() == 0
     }
