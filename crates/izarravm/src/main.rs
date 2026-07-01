@@ -2260,4 +2260,73 @@ del PREEXIST.TXT\r\n";
             "the program's DOS exit code must reach the host process"
         );
     }
+
+    /// SP-4b M0 Task 1: prove the bespoke `.SYS` device-driver seam end to end.
+    /// A minimal TOKAEMM.SYS is overlaid onto C: and loaded via `DEVICE=` in a
+    /// CONFIG.SYS override. Its INIT runs at SYSINIT (real mode, no V86), prints a
+    /// marker through INT 29h, and reports "no resident code" (r_endaddr = header
+    /// seg:0) so DOS unloads it again. The gate: the marker reaches the screen AND
+    /// FreeDOS still boots to C:\>.
+    ///
+    /// CONFIG.SYS and TOKAEMM.SYS are both passed as `mount_hdd_folder_with`
+    /// overrides (which replace/append onto the committed system files). The host
+    /// `dir` stays empty: a CONFIG.SYS written there would collide with the
+    /// system CONFIG.SYS whose 8.3 name is reserved first, and lose the `~n` fold.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokaemm_sys_init_runs_at_sysinit() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_t1_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // The stock CONFIG.SYS (from the committed image) plus a DEVICE= line for
+        // the bespoke driver. Passed as an override so it replaces the system copy.
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during TOKAEMM boot: {msg}\nstop={stop:?}\n{text}");
+        }
+
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            text.contains("TOKAEMM M0 task1: INIT ran"),
+            "INIT marker not on screen (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            text.contains(":\\>"),
+            "no DOS prompt — boot didn't finish (stop={stop:?}).\n{text}"
+        );
+    }
 }
