@@ -32,6 +32,7 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 const MTEST_COM: &[u8] = include_bytes!("fixtures/MTEST.COM");
 const CBLEAK_COM: &[u8] = include_bytes!("fixtures/CBLEAK.COM");
 const GFXCUR_COM: &[u8] = include_bytes!("fixtures/GFXCUR.COM");
+const SEGKEEP_COM: &[u8] = include_bytes!("fixtures/SEGKEEP.COM");
 // WHEELTEST.COM, assembled from tests/fixtures/wheeltest.asm and committed
 // alongside it (same rebuild contract as MTEST.COM). Exercises the SP-3b
 // scroll-wheel path end-to-end: INT 33h fn 0x11 (wheel API) + fn 0x03 BH.
@@ -43,6 +44,7 @@ const WHEELTEST_COM: &[u8] = include_bytes!("fixtures/WHEELTEST.COM");
 const AUTOEXEC: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nMTEST\r\n";
 const AUTOEXEC_CBLEAK: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nCBLEAK\r\n";
 const AUTOEXEC_GFXCUR: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nGFXCUR\r\n";
+const AUTOEXEC_SEGKEEP: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nSEGKEEP\r\n";
 const AUTOEXEC_WHEEL: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nWHEELTEST\r\n";
 
 /// Install Toka-DOS onto a fresh temp C:, drop MTEST.COM at the root, write the
@@ -95,6 +97,23 @@ fn boot_with_gfxcur() -> (Machine, tempfile::TempDir) {
     izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format).unwrap();
     std::fs::write(dir.path().join("GFXCUR.COM"), GFXCUR_COM).unwrap();
     std::fs::write(dir.path().join("AUTOEXEC.BAT"), AUTOEXEC_GFXCUR).unwrap();
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        izarra_bios(),
+    )
+    .unwrap();
+    machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+    machine.set_toka_c_root(dir.path().to_path_buf());
+    (machine, dir)
+}
+
+fn boot_with_segkeep() -> (Machine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let files = izarravm_firmware::toka_dos_system_files();
+    izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format).unwrap();
+    std::fs::write(dir.path().join("SEGKEEP.COM"), SEGKEEP_COM).unwrap();
+    std::fs::write(dir.path().join("AUTOEXEC.BAT"), AUTOEXEC_SEGKEEP).unwrap();
 
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
@@ -305,5 +324,40 @@ fn mouse_driver_does_not_draw_text_cursor_in_graphics_modes() {
              2=graphics-mode Show Cursor wrote through B800)"
         ),
         other => panic!("expected GFXCUR to exit through the unit tester, got {other:?}"),
+    }
+}
+
+#[test]
+fn mouse_callback_preserves_interrupted_segment_registers() {
+    let (mut machine, _dir) = boot_with_segkeep();
+
+    const CHUNK: u64 = 2_000_000;
+    const MAX_CHUNKS: usize = 120;
+    let mut final_reason = None;
+    for _ in 0..MAX_CHUNKS {
+        match machine.run_until_halt_or_cycles(CHUNK).unwrap() {
+            StopReason::TestExit { code } => {
+                final_reason = Some(StopReason::TestExit { code });
+                break;
+            }
+            StopReason::CycleLimit { .. } => machine.inject_mouse(8, 0, 0x00),
+            other => {
+                final_reason = Some(other);
+                break;
+            }
+        }
+    }
+
+    match final_reason {
+        Some(StopReason::TestExit { code: 0 }) => {}
+        Some(StopReason::TestExit { code: 1 }) => {
+            panic!("SEGKEEP never saw its mouse callback")
+        }
+        Some(StopReason::TestExit { code: 2 }) => {
+            panic!("mouse callback leaked ES into interrupted code")
+        }
+        Some(StopReason::TestExit { code }) => panic!("SEGKEEP failed with code {code}"),
+        Some(other) => panic!("expected SEGKEEP to Exit with code 0, got {other:?}"),
+        None => panic!("SEGKEEP never exited within {MAX_CHUNKS} chunks"),
     }
 }

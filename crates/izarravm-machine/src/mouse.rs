@@ -51,6 +51,33 @@ impl Ps2Mouse {
         self.intellimouse = true;
     }
 
+    pub(crate) fn set_sample_rate_code(&mut self, code: u8) -> bool {
+        let rate = match code {
+            0 => 10,
+            1 => 20,
+            2 => 40,
+            3 => 60,
+            4 => 80,
+            5 => 100,
+            6 => 200,
+            _ => return false,
+        };
+        self.set_sample_rate(rate);
+        true
+    }
+
+    fn set_sample_rate(&mut self, rate: u8) {
+        self.sample_rate = rate;
+        self.rate_history = [self.rate_history[1], self.rate_history[2], rate];
+        if self.rate_history == [200, 100, 80] {
+            self.enable_wheel();
+        }
+    }
+
+    pub(crate) fn sample_rate(&self) -> u8 {
+        self.sample_rate
+    }
+
     /// Test seam: whether the device is in IntelliMouse 4-byte (wheel) mode.
     #[cfg(test)]
     pub(crate) fn is_intellimouse(&self) -> bool {
@@ -65,11 +92,7 @@ impl Ps2Mouse {
             match cmd {
                 // 0xF3 set sample rate, 0xE8 set resolution: record the parameter.
                 0xF3 => {
-                    self.sample_rate = value;
-                    self.rate_history = [self.rate_history[1], self.rate_history[2], value];
-                    if self.rate_history == [200, 100, 80] {
-                        self.enable_wheel();
-                    }
+                    self.set_sample_rate(value);
                 }
                 0xE8 => self.resolution = value,
                 _ => {}

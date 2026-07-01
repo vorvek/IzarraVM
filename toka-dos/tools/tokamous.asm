@@ -1021,6 +1021,7 @@ packet_handler:
     push si
     push di
     push ds
+    push es
     push cs
     pop ds                            ; resident state is in CS
 
@@ -1261,9 +1262,10 @@ packet_handler:
     ; there is no application caller whose DS to restore, so we deliberately do not
     ; restore one here. Revisit only if a corpus program needs it.
     call far [cb_off]                 ; far-call cb_seg:cb_off via the stored pair
-    mov byte [in_callback], 0
+    mov byte [cs:in_callback], 0
 .no_callback:
 
+    pop es
     pop ds
     pop di
     pop si
@@ -1291,6 +1293,9 @@ install:
     pop es
     mov ax, 0xC205
     mov bx, 0x0300
+    int 0x15
+    mov ax, 0xC202
+    mov bx, 0x0600                    ; sample-rate code 6 = 200 Hz
     int 0x15
     mov ax, 0xC207
     push cs

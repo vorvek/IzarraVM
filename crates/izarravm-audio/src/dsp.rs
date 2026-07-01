@@ -115,9 +115,10 @@ impl SbDsp {
     fn command_arity(command: u8) -> usize {
         match command {
             0x10 | 0xE4 => 1, // direct DAC / test-register write
-            0x40 => 1,        // set time constant (Task 5)
-            0x41 => 2,        // set sample rate (Task 5)
-            0x48 => 2,        // set block size (Task 5)
+            0x40 => 1,        // set time constant
+            0x41 => 2,        // set sample rate
+            0x14 => 2,        // 8-bit single-cycle DMA output, length low/high
+            0x48 => 2,        // set block size for auto-init/high-speed modes
             // The SB16 0xBx family (16-bit DMA output/input, single + auto-init)
             // takes a mode byte plus a 2-byte transfer count.
             0xB0..=0xBF => 3,
@@ -194,8 +195,13 @@ impl SbDsp {
                     self.block_size = count;
                 }
             }
-            0x14 => self.arm_dma(false), // 8-bit single output, normal speed
-            0x1C => self.arm_dma(true),  // 8-bit auto-init output, normal speed
+            0x14 => {
+                if args.len() >= 2 {
+                    self.block_size = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
+                }
+                self.arm_dma(false);
+            }
+            0x1C => self.arm_dma(true), // 8-bit auto-init output, normal speed
             // 0x90/0x91 are the SB Pro high-speed variants of auto-init/single.
             // Limit: high-speed command-lockout (DSP ignores commands until
             // reset) not modeled; games exit via the DSP reset handled below.
@@ -589,10 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn dma_single_output_arms_with_block_size() {
+    fn dma_single_output_arms_with_inline_length() {
         let mut dsp = SbDsp::default();
-        write_cmd(&mut dsp, &[0x48, 0xFF, 0x00]); // block size 0x00FF -> 256
-        write_cmd(&mut dsp, &[0x14]); // 8-bit DMA single output
+        write_cmd(&mut dsp, &[0x14, 0xFF, 0x00]); // length 0x00FF -> 256 samples
         assert!(dsp.is_playing());
         assert!(!dsp.is_auto_init());
         assert_eq!(dsp.block_remaining(), 256);
@@ -630,7 +635,7 @@ mod tests {
     #[test]
     fn single_mode_stops_at_end_of_block() {
         let mut dsp = SbDsp::default();
-        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x48, 0x01, 0x00, 0x14]); // block 2, single
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x14, 0x01, 0x00]); // block 2, single
         let _ = dsp.render_sample(|| Some(0x80));
         let _ = dsp.render_sample(|| Some(0x80)); // TC -> single stops
         assert!(!dsp.is_playing(), "single mode halts after the block");
@@ -722,7 +727,7 @@ mod tests {
     #[test]
     fn render_frame_8bit_mono_duplicated_to_both_channels() {
         let mut dsp = SbDsp::default();
-        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x48, 0x01, 0x00, 0x14]); // 8-bit mono single
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x14, 0x01, 0x00]); // 8-bit mono single
         let f = dsp.render_frame(|| Some(0x80), || panic!("word fetch unused in 8-bit mode"));
         assert_eq!(f, Some((0, 0)), "0x80 -> silence on both channels");
     }
@@ -782,7 +787,7 @@ mod tests {
     #[test]
     fn sbpro_8bit_stereo_consumes_two_bytes_and_yields_distinct_l_r() {
         let mut dsp = SbDsp::default();
-        write_cmd(&mut dsp, &[0x48, 0x03, 0x00, 0x14]); // block 4 bytes, 8-bit single
+        write_cmd(&mut dsp, &[0x14, 0x03, 0x00]); // block 4 bytes, 8-bit single
         assert!(!dsp.is_sbpro_stereo(), "SB Pro stereo off by default");
         dsp.set_sbpro_stereo(true);
         assert!(dsp.is_sbpro_stereo(), "set_sbpro_stereo(true) latches");
@@ -813,7 +818,7 @@ mod tests {
         // so the block drains in 2 frames. Half fires when remaining <= 2 (after
         // frame 1), end fires when remaining == 0 (after frame 2), then single
         // mode stops.
-        write_cmd(&mut dsp, &[0x48, 0x03, 0x00, 0x14]); // block 4
+        write_cmd(&mut dsp, &[0x14, 0x03, 0x00]); // block 4
         dsp.set_sbpro_stereo(true);
         let mut feed = || Some(0x80u8);
         // Frame 1: remaining 4 -> 2, half IRQ.
@@ -853,7 +858,7 @@ mod tests {
         write_cmd(&mut dsp, &[0x40, 0xD3]);
         let byte_rate = dsp.rate_hz();
         // 8-bit mono: per-channel rate is the programmed rate.
-        write_cmd(&mut dsp, &[0x14]);
+        write_cmd(&mut dsp, &[0x14, 0x00, 0x00]);
         assert_eq!(dsp.output_frame_rate(), byte_rate, "8-bit mono is unhalved");
         // 8-bit stereo: the time constant is the byte rate, so each channel halves.
         dsp.set_sbpro_stereo(true);
@@ -879,7 +884,7 @@ mod tests {
         // channel-count pre-multiply), so SB Pro stereo must NOT halve it.
         let mut dsp = SbDsp::default();
         write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 0x2B11 = 11025 Hz, per-channel
-        write_cmd(&mut dsp, &[0x14]); // 8-bit single
+        write_cmd(&mut dsp, &[0x14, 0x00, 0x00]); // 8-bit single
         dsp.set_sbpro_stereo(true);
         assert_eq!(
             dsp.output_frame_rate(),
