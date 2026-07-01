@@ -7002,7 +7002,7 @@ impl Cpu386 {
                     let ds = self.pop(bus, OperandSize::Dword)? as u16;
                     let fs = self.pop(bus, OperandSize::Dword)? as u16;
                     let gs = self.pop(bus, OperandSize::Dword)? as u16;
-                    self.load_flags(flags, OperandSize::Dword); // sets VM=1
+                    self.load_flags(flags, OperandSize::Dword); // flags carry VM=1 (guarded above)
                     self.load_segment_real(SegmentIndex::Cs, cs);
                     self.load_segment_real(SegmentIndex::Ss, ss);
                     self.load_segment_real(SegmentIndex::Ds, ds);
@@ -7015,7 +7015,9 @@ impl Cpu386 {
                 }
 
                 if (cs & 3) as u8 > self.current_privilege_level() {
-                    // Inter-privilege return to a less-privileged (non-V86) ring: pop SS:ESP.
+                    // V86 is handled above; a returned V86 CS has arbitrary low bits, so this
+                    // ring check must not see it. Inter-privilege return to a less-privileged
+                    // (non-V86) ring: pop SS:ESP.
                     let esp = self.pop(bus, OperandSize::Dword)?;
                     let ss = self.pop(bus, OperandSize::Dword)? as u16;
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
@@ -24565,5 +24567,32 @@ mod tests {
         assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0x3333);
         assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0x4444);
         assert_eq!(cpu.current_privilege_level(), 3, "V86 is always CPL 3");
+    }
+
+    #[test]
+    fn iret_inter_privilege_return_to_ring3() {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // Ring-3 code (access 0xfb) + data (0xf3) at GDT slots 0x20 / 0x28.
+        let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+        let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+        bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+        bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+        let r3_cs = 0x23u16; // 0x20 | RPL3
+        let r3_ss = 0x2Bu16; // 0x28 | RPL3
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        // Inter-privilege IRET frame (high-to-low): SS, ESP, EFLAGS, CS, EIP.
+        for v in [u32::from(r3_ss), 0x2000, 0x2, u32::from(r3_cs), 0x1234] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
+        assert!(!cpu.is_v86_mode());
+        assert_eq!(cpu.registers.eip, 0x1234);
+        assert_eq!(cpu.registers.cs().selector, r3_cs);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
+        assert_eq!(cpu.registers.esp(), 0x2000);
     }
 }
