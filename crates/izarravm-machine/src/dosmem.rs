@@ -1,8 +1,21 @@
 //! The DOS upper-memory-block (UMB) arena + MCB-chain primitives, extracted from
-//! the retired `izarravm-dos` crate. This is the live memory-manager the XMS UMB
-//! services (INT 2Fh/XMS fns 0x10/0x11/0x12 Request/Release/Reallocate UMB) and
-//! the IEMM upper-memory setup (`furnish_dos_upper_memory`, which runs on every
-//! `Machine::new`) depend on — it is NOT part of the HLE DOS kernel.
+//! the retired `izarravm-dos` crate. This is the live memory-manager the IEMM
+//! upper-memory setup (`furnish_dos_upper_memory`, which runs on every
+//! `Machine::new`) depends on — it is NOT part of the HLE DOS kernel.
+//!
+//! The Request/Release/Reallocate UMB entry points (`request_umb`/`release_umb`/
+//! `resize_umb`, their `DosMemory` wrappers, and the `UmbArena` allocate/free/
+//! resize engine they drive) carve from the same MCB chain as AH=48h-high. Both of
+//! their callers are now gone — the HLE's AH=48h-high went with the retired DOS
+//! kernel, and the host XMS driver's AH=10h/11h/12h dispatch went with `xms.rs` in
+//! SP-4b M1. They stay `#[allow(dead_code)]` (compiler-confirmed dead) rather than
+//! being deleted here because retiring the dosmem UMB-HLE is scoped to SP-4b M3
+//! (guest paging-based UMB in TOKAEMM.SYS); pulling that deletion into M1's XMS
+//! retirement would expand its blast radius into the MCB internals the live
+//! `set_umb_region`/`furnish_dos_upper_memory` path shares. M3 removes (or, if it
+//! reuses the MCB engine, revives) this block. The live upper-memory setup
+//! (`furnish_dos_upper_memory` → `set_umb_region`, which only writes the arena MCB
+//! header) is untouched.
 //!
 //! This is a byte-for-byte MOVE of the UMB-relevant closure out of
 //! `izarravm-dos`'s `memory.rs`, not a redesign: the arena still walks and mutates
@@ -19,12 +32,14 @@ use izarravm_bus::{BusError, Memory};
 /// The top of conventional memory in paragraphs: the 640 KiB line (0xA000
 /// paragraphs = 0xA0000 bytes) where the video aperture begins. The UMB code needs
 /// it only as the MCB-walk safety cap; the arena itself lives above it.
+#[allow(dead_code)] // only feeds MCB_WALK_CAP, itself dead post-M1 (see module docs).
 const ARENA_TOP: u16 = 0xa000;
 
 /// The 8-byte MCB owner name for a blank (free / manager-owned) block.
 const NO_NAME: &[u8; 8] = b"\0\0\0\0\0\0\0\0";
 
 /// AH=4Ah resize result details shared by conventional and upper-memory blocks.
+#[allow(dead_code)] // only constructed by resize_umb, dead post-M1 (see module docs).
 enum ResizeError {
     TooBig(u16), // largest paragraphs that would fit
     InvalidBlock,
@@ -74,6 +89,7 @@ struct UmbArena {
     top: u16,
 }
 
+#[allow(dead_code)] // only reached through request/release/resize_umb; see module docs.
 impl UmbArena {
     fn contains_data(self, seg: u16) -> bool {
         (self.first_mcb..self.top).contains(&seg)
@@ -133,6 +149,7 @@ fn set_umb_region(
 
 /// XMS function 10h Request UMB: carve `paras` paragraphs from the same upper
 /// MCB chain used by AH=48h-high allocations.
+#[allow(dead_code)] // dead since M1 retired the host XMS driver; removed/revived at M3 (see module docs).
 fn request_umb(
     umb: Option<UmbArena>,
     paras: u16,
@@ -145,6 +162,7 @@ fn request_umb(
 }
 
 /// XMS function 11h Release UMB.
+#[allow(dead_code)] // dead since M1 retired the host XMS driver; removed/revived at M3 (see module docs).
 fn release_umb(
     umb: Option<UmbArena>,
     seg: u16,
@@ -158,6 +176,7 @@ fn release_umb(
 
 /// XMS function 12h Reallocate UMB. `Err(Some(largest))` is the too-big case;
 /// `Err(None)` means `seg` is not a live UMB block.
+#[allow(dead_code)] // dead since M1 retired the host XMS driver; removed/revived at M3 (see module docs).
 fn resize_umb(
     umb: Option<UmbArena>,
     seg: u16,
@@ -451,6 +470,7 @@ impl DosMemory {
     /// pool is full)), Err(BusError) on a memory fault. Independent of the AH=5803h
     /// link: XMS Request UMB is the manager primitive, available whenever the pool
     /// exists.
+    #[allow(dead_code)] // dead since M1 retired the host XMS driver; removed/revived at M3 (see module docs).
     pub fn request_umb(
         &mut self,
         paras: u16,
@@ -461,6 +481,7 @@ impl DosMemory {
 
     /// XMS function 11h Release UMB: free the upper-memory block whose segment is
     /// `seg`. Ok(Ok(())), or Ok(Err(())) when `seg` is not a UMB block.
+    #[allow(dead_code)] // dead since M1 retired the host XMS driver; removed/revived at M3 (see module docs).
     pub fn release_umb(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, BusError> {
         release_umb(self.umb, seg, mem)
     }
@@ -469,6 +490,7 @@ impl DosMemory {
     /// `paras`. Ok(Ok(())); Ok(Err(Some(largest))) when a grow does not fit (the
     /// caller maps it to B0h with the largest size); Ok(Err(None)) when `seg` is not
     /// a UMB block (B2h).
+    #[allow(dead_code)] // dead since M1 retired the host XMS driver; removed/revived at M3 (see module docs).
     pub fn resize_umb(
         &mut self,
         seg: u16,

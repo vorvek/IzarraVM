@@ -2359,4 +2359,67 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             "VER did not run at the V86 prompt (expected a second C:\\>).\n{after}"
         );
     }
+
+    /// SP-4b M1 GO/NO-GO: a guest program install-checks XMS, allocates a 64 KB EMB,
+    /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
+    /// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
+    /// the monitor's flat memcpy). XMSTEST.COM signals 0xA5 (success) via the
+    /// unit-tester exit port; any other code names the step that broke.
+    ///
+    /// The config is NOEMS so host EMS reserves no extended RAM and the guest XMS
+    /// driver owns all of it (the M2 EMS-coexistence reconciliation is separate).
+    /// XMSTEST runs from AUTOEXEC, so the machine stops as soon as it signals — no
+    /// interactive settling needed.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_m1_xms_alloc_move_free_in_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_m1_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nXMSTEST\r\n".to_vec();
+
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.emm386 = izarravm_core::Emm386Mode::NoEms;
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "XMSTEST.COM".to_string(),
+                        izarravm_firmware::xmstest_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "XMS round-trip did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
 }

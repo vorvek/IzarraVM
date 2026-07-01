@@ -24,7 +24,7 @@ org 0
     dw 0x8000                     ; dh_attr = char device
     dw strategy
     dw interrupt
-    db 'TOKAEMM '
+    db 'XMSXXXX0'                 ; char-device name: HIMEM-class XMS provider
 
 rh_ptr:  dd 0                     ; saved ES:BX (request header)
 drv_seg: dw 0                     ; our load segment (CS)
@@ -43,6 +43,24 @@ k_ip: dw 0                        ; EXECRH far-return IP
 
 vif: db 1                         ; virtual IF (guest's view; DOS boots with IF=1)
 vip: db 0                         ; virtual interrupt pending: bit0=IRQ0, bit1=IRQ1
+
+; ---- SP-4b M1 XMS state (resident; reached via cs: overrides from V86) ----
+old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
+xms_pool_base: dd 0               ; first linear byte the EMB allocator hands out
+xms_pool_end:  dd 0               ; one past the last (capped to the 16 MB map)
+hma_owned: db 0                   ; 1 once a guest (DOS=HIGH) claims the HMA
+a20_count: dw 0                   ; XMS local-A20 enable nesting (fns 05h/06h)
+xms_disp:  dw 0                   ; dispatch scratch (register-safe table jump)
+xms_mv_len: dd 0                  ; 0Bh move: byte count / src linear / dst linear
+xms_mv_src: dd 0
+xms_mv_dst: dd 0
+xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
+
+; 32 EMB handles. handle h (1-based) -> slot at xms_table + (h-1)*XMS_SLOT.
+; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_linear(dd)
+XMS_HANDLES equ 32
+XMS_SLOT    equ 8
+xms_table: times XMS_HANDLES*XMS_SLOT db 0
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -85,6 +103,33 @@ init:
     mov word [es:bx+14], resident_end
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
+
+    ; --- SP-4b M1: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
+    ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Pool = [1 MB + 64 KB
+    ; HMA, 1 MB + min(ext, 15 MB)) so it stays inside the monitor's 0..16 MB map.
+    mov ah, 0x88
+    int 0x15                      ; AX = extended KB (real mode, before V86)
+    movzx eax, ax
+    cmp eax, 15*1024              ; cap to the 15 MB above 1 MB the map covers
+    jbe .pool_ok
+    mov eax, 15*1024
+.pool_ok:
+    sub eax, 64                   ; drop the HMA (first 64 KB of extended memory)
+    shl eax, 10                   ; KB -> bytes = pool length
+    mov ebx, 0x00110000           ; base = 1 MB + 64 KB (above the HMA)
+    mov [cs:xms_pool_base], ebx
+    add eax, ebx
+    mov [cs:xms_pool_end], eax
+    ; Hook INT 2Fh: save the old vector, install our handler (IVT at linear 0).
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov eax, [ds:0x2F*4]
+    mov [cs:old_2f], eax
+    mov word [ds:0x2F*4], xms_2f_handler
+    mov [ds:0x2F*4+2], cs
+    pop ds
+    ; --- end M1 INIT additions ---
 
     mov [drv_seg], cs
     xor eax, eax
@@ -151,6 +196,519 @@ init:
     mov cr0, eax
     jmp dword 0x08:pm_init        ; code sel base = base -> linear base+pm_init
 
+; ============================================================================
+; SP-4b M1 — guest XMS driver (16-bit real mode / V86). Reached only via the INT
+; 2Fh hook (install-check / get-entry) and the far-callable control entry, never
+; by fall-through (INIT above ends in a far jump). Own data via cs: overrides
+; because the far-callable entry runs with the caller's DS.
+; ============================================================================
+
+; INT 2Fh multiplex hook: XMS install-check (4300) / get-entry (4310); chain else.
+xms_2f_handler:
+    cmp ax, 0x4300
+    je .install
+    cmp ax, 0x4310
+    je .entry
+    jmp far [cs:old_2f]
+.install:
+    mov al, 0x80                 ; XMS present
+    iret
+.entry:
+    push cs
+    pop es
+    mov bx, xms_entry            ; ES:BX -> control entry
+    iret
+
+; Far-callable XMS control function. AH = function; XMS 3.0 conventions
+; (AX=1 success / AX=0 + BL=error). Register-safe table dispatch (only BX is
+; touched, then restored, so CX/DX/SI/DI/BP/DS inputs survive to the handler).
+xms_entry:
+    cmp ah, 0x0F
+    ja .unimpl                   ; 10h+ (UMB) : not implemented in M1 (guest UMB = M3)
+    push bx
+    movzx bx, ah
+    add bx, bx
+    mov bx, [cs:xms_jt + bx]
+    mov [cs:xms_disp], bx
+    pop bx
+    jmp [cs:xms_disp]
+.unimpl:
+    xor ax, ax
+    mov bl, 0xB1                  ; no UMB available / not implemented
+    retf
+xms_jt:
+    dw xf_version, xf_req_hma,   xf_rel_hma,  xf_a20_gon
+    dw xf_a20_goff, xf_a20_lon,  xf_a20_loff, xf_a20_query
+    dw xf_query_free, xf_alloc,  xf_free,     xf_move
+    dw xf_lock,    xf_unlock,    xf_info,     xf_resize
+
+; shared tails
+xms_ok:
+    mov ax, 1
+    xor bl, bl
+    retf
+xms_fail:                        ; enter with BL = error code
+    xor ax, ax
+    retf
+
+; 00h get version: AX=3.00, BX=revision, DX=HMA-exists. Never fails.
+xf_version:
+    mov ax, 0x0300
+    mov bx, 0x0300
+    mov dx, 1
+    retf
+
+; 01h request HMA / 02h release HMA (a flag; no /HMAMIN gate in M1).
+xf_req_hma:
+    cmp byte [cs:hma_owned], 0
+    jne .inuse
+    mov byte [cs:hma_owned], 1
+    jmp xms_ok
+.inuse:
+    mov bl, 0x91                 ; HMA already in use
+    jmp xms_fail
+xf_rel_hma:
+    cmp byte [cs:hma_owned], 0
+    je .no
+    mov byte [cs:hma_owned], 0
+    jmp xms_ok
+.no:
+    mov bl, 0x93                 ; HMA not allocated
+    jmp xms_fail
+
+; 03h/04h global A20; 05h/06h local A20 (nesting, drive gate only on 0<->1).
+xf_a20_gon:
+    call a20_on
+    jmp xms_ok
+xf_a20_goff:
+    call a20_off
+    jmp xms_ok
+xf_a20_lon:
+    inc word [cs:a20_count]
+    cmp word [cs:a20_count], 1
+    jne xms_ok
+    call a20_on
+    jmp xms_ok
+xf_a20_loff:
+    cmp word [cs:a20_count], 0
+    je .drive                    ; already 0: a disable still drives it off
+    dec word [cs:a20_count]
+    jnz xms_ok
+.drive:
+    call a20_off
+    jmp xms_ok
+; 07h query A20: AX=1 enabled / 0 disabled, BL=0.
+xf_a20_query:
+    in al, 0x92
+    test al, 2
+    setnz al
+    movzx ax, al
+    xor bl, bl
+    retf
+
+a20_on:
+    in al, 0x92
+    or al, 2
+    out 0x92, al
+    ret
+a20_off:
+    in al, 0x92
+    and al, 0xFD
+    out 0x92, al
+    ret
+
+; 08h query free extended memory: AX=largest free KB, DX=total free KB, BL=0.
+; ponytail: largest is approximated as total (a first-fit pool rarely fragments,
+; and over-reporting only turns a would-be-large alloc into an A0h failure).
+xf_query_free:
+    push cx
+    push si
+    mov eax, [cs:xms_pool_end]
+    sub eax, [cs:xms_pool_base]
+    shr eax, 10                  ; pool size KB
+    mov si, xms_table
+    mov cx, XMS_HANDLES
+.sum:
+    cmp byte [cs:si], 0
+    je .skip
+    movzx ebx, word [cs:si+2]
+    sub eax, ebx
+.skip:
+    add si, XMS_SLOT
+    loop .sum
+    cmp eax, 0xFFFF
+    jbe .cap
+    mov eax, 0xFFFF
+.cap:
+    mov dx, ax                   ; total free KB
+    xor bl, bl                   ; AX (=largest) already = total
+    pop si
+    pop cx
+    retf
+
+; 09h allocate EMB: DX=KB in -> DX=handle. First-fit gap + first free slot.
+xf_alloc:
+    push cx
+    push si
+    push di
+    push bp
+    movzx eax, dx
+    shl eax, 10
+    mov [cs:xms_mv_len], eax      ; need bytes
+    call find_gap                 ; -> EDI = base, or CF (oom)
+    jc .oom
+    mov si, xms_table
+    mov cx, XMS_HANDLES
+    xor bp, bp                    ; handle counter (1-based)
+.slot:
+    inc bp
+    cmp byte [cs:si], 0
+    je .got
+    add si, XMS_SLOT
+    loop .slot
+    mov bl, 0xA1                  ; out of handles
+    jmp .fail
+.got:
+    mov byte [cs:si], 1
+    mov byte [cs:si+1], 0
+    mov eax, [cs:xms_mv_len]
+    shr eax, 10
+    mov [cs:si+2], ax             ; size_kb
+    mov [cs:si+4], edi            ; base_linear
+    mov dx, bp                    ; handle out
+    pop bp
+    pop di
+    pop si
+    pop cx
+    jmp xms_ok
+.oom:
+    mov bl, 0xA0
+.fail:
+    pop bp
+    pop di
+    pop si
+    pop cx
+    jmp xms_fail
+
+; 0Ah free EMB: DX=handle.
+xf_free:
+    push si
+    call slot_of                  ; -> SI = slot, or CF + BL=0xA2
+    jc .bad
+    cmp byte [cs:si+1], 0         ; locked?
+    jne .locked
+    mov byte [cs:si], 0
+    pop si
+    jmp xms_ok
+.locked:
+    mov bl, 0xAB
+    pop si
+    jmp xms_fail
+.bad:
+    pop si
+    jmp xms_fail
+
+; 0Ch lock EMB: DX=handle -> DX:BX = 32-bit linear base, lock++.
+xf_lock:
+    push si
+    call slot_of
+    jc .bad
+    cmp byte [cs:si+1], 0xFF
+    je .ovf
+    inc byte [cs:si+1]
+    mov edx, [cs:si+4]
+    mov ebx, edx
+    shr edx, 16                   ; DX:BX = linear (BX = low word of ebx)
+    pop si
+    mov ax, 1
+    retf
+.ovf:
+    mov bl, 0xAC
+    pop si
+    jmp xms_fail
+.bad:
+    pop si
+    jmp xms_fail
+
+; 0Dh unlock EMB: DX=handle.
+xf_unlock:
+    push si
+    call slot_of
+    jc .bad
+    cmp byte [cs:si+1], 0
+    je .notlocked
+    dec byte [cs:si+1]
+    pop si
+    jmp xms_ok
+.notlocked:
+    mov bl, 0xAA
+    pop si
+    jmp xms_fail
+.bad:
+    pop si
+    jmp xms_fail
+
+; 0Eh handle info: DX=handle -> BH=lock, BL=free handles, DX=size_kb, AX=1.
+xf_info:
+    push si
+    push cx
+    call slot_of
+    jc .bad
+    mov bh, [cs:si+1]             ; lock count
+    push si
+    mov si, xms_table
+    mov cx, XMS_HANDLES
+    xor al, al                    ; free-handle count
+.cnt:
+    cmp byte [cs:si], 0
+    jne .used
+    inc al
+.used:
+    add si, XMS_SLOT
+    loop .cnt
+    pop si
+    mov bl, al                    ; free handles
+    mov dx, [cs:si+2]             ; size_kb
+    pop cx
+    pop si
+    mov ax, 1
+    retf
+.bad:
+    pop cx
+    pop si
+    jmp xms_fail
+
+; 0Fh resize EMB: BX=new KB, DX=handle. Free + re-place; restore on failure.
+; ponytail: re-places without copying the old contents to the new base — data is
+; preserved only when find_gap returns the same base (no fragmentation). This
+; mirrors the retired FlatEmbAllocator::resize (the M1 goal was HLE parity); a
+; copy-on-relocate (via the INT 0xC0 memcpy) is a future-milestone fidelity item.
+xf_resize:
+    push cx
+    push si
+    push di
+    call slot_of
+    jc .bad
+    mov [cs:xms_slot_save], si    ; find_gap clobbers SI; keep the slot offset
+    cmp byte [cs:si+1], 0         ; locked?
+    jne .locked
+    cmp bx, [cs:si+2]             ; same size?
+    je .ok
+    push word [cs:si+2]           ; save old size_kb
+    push dword [cs:si+4]          ; save old base
+    mov byte [cs:si], 0           ; temporarily free the slot
+    movzx eax, bx
+    shl eax, 10
+    mov [cs:xms_mv_len], eax
+    call find_gap
+    mov si, [cs:xms_slot_save]    ; restore the slot offset (find_gap clobbered SI)
+    jc .restore
+    mov byte [cs:si], 1
+    mov byte [cs:si+1], 0
+    mov eax, [cs:xms_mv_len]      ; size_kb from need bytes (find_gap clobbered BX)
+    shr eax, 10
+    mov [cs:si+2], ax
+    mov [cs:si+4], edi
+    add sp, 6                     ; discard saved old (dword + word)
+.ok:
+    pop di
+    pop si
+    pop cx
+    jmp xms_ok
+.restore:
+    pop eax                       ; old base
+    mov [cs:si+4], eax
+    pop ax                        ; old size_kb
+    mov [cs:si+2], ax
+    mov byte [cs:si], 1
+    mov bl, 0xA0
+    pop di
+    pop si
+    pop cx
+    jmp xms_fail
+.locked:
+    mov bl, 0xAB
+    pop di
+    pop si
+    pop cx
+    jmp xms_fail
+.bad:
+    pop di
+    pop si
+    pop cx
+    jmp xms_fail
+
+; 0Bh move EMB: DS:SI -> descriptor {len(dd) srcH(w) srcOff(dd) dstH(w) dstOff(dd)}.
+; Resolve both endpoints to linear, then trap to the monitor for the flat copy.
+xf_move:
+    push cx
+    push si
+    push di
+    push bp
+    mov eax, [si]                 ; length (DS:SI +0)
+    test eax, eax
+    jz .zero                      ; zero length = legal no-op success
+    test eax, 1
+    jnz .badlen                   ; odd length -> A7h
+    mov [cs:xms_mv_len], eax
+    mov bx, [si+4]                ; src handle
+    mov edx, [si+6]               ; src offset
+    call resolve                  ; -> EAX = linear, or CF + AL=1(handle)/2(offset)
+    jc .src_err
+    mov [cs:xms_mv_src], eax
+    mov bx, [si+10]               ; dst handle
+    mov edx, [si+12]              ; dst offset
+    call resolve
+    jc .dst_err
+    mov [cs:xms_mv_dst], eax
+    mov esi, [cs:xms_mv_src]
+    mov edi, [cs:xms_mv_dst]
+    mov ecx, [cs:xms_mv_len]
+    mov edx, 0x544D              ; monitor-call cookie 'TM'
+    int 0xC0                     ; ring-0 flat memcpy: ES:EDI <- DS:ESI, ECX bytes
+    pop bp
+    pop di
+    pop si
+    pop cx
+    jmp xms_ok
+.zero:
+    pop bp
+    pop di
+    pop si
+    pop cx
+    jmp xms_ok
+.badlen:
+    mov bl, 0xA7
+    jmp .fail
+.src_err:
+    cmp al, 1
+    je .src_h
+    mov bl, 0xA4                  ; bad src offset
+    jmp .fail
+.src_h:
+    mov bl, 0xA3                  ; bad src handle
+    jmp .fail
+.dst_err:
+    cmp al, 1
+    je .dst_h
+    mov bl, 0xA6                  ; bad dst offset
+    jmp .fail
+.dst_h:
+    mov bl, 0xA5                  ; bad dst handle
+.fail:
+    pop bp
+    pop di
+    pop si
+    pop cx
+    jmp xms_fail
+
+; --- helpers ---------------------------------------------------------------
+; DX = handle -> SI = slot offset (cs-relative), CF clear; or CF set + BL=0xA2.
+; Clobbers AX.
+slot_of:
+    cmp dx, 1
+    jb .bad
+    cmp dx, XMS_HANDLES
+    ja .bad
+    mov ax, dx
+    dec ax
+    shl ax, 3                     ; * XMS_SLOT
+    add ax, xms_table
+    mov si, ax
+    cmp byte [cs:si], 0           ; inuse?
+    je .bad
+    clc
+    ret
+.bad:
+    mov bl, 0xA2                  ; invalid handle
+    stc
+    ret
+
+; First-fit gap for [cs:xms_mv_len] bytes over [pool_base, pool_end). Restart-on-
+; overlap. out: EDI = base, CF clear; or CF set (out of memory).
+; Clobbers eax, ebx, edx, cx, si.
+find_gap:
+    mov edi, [cs:xms_pool_base]
+.restart:
+    mov eax, edi
+    add eax, [cs:xms_mv_len]
+    cmp eax, [cs:xms_pool_end]
+    ja .oom
+    mov si, xms_table
+    mov cx, XMS_HANDLES
+.scan:
+    cmp byte [cs:si], 0
+    je .next
+    mov ebx, [cs:si+4]            ; b.base
+    movzx eax, word [cs:si+2]
+    shl eax, 10
+    add eax, ebx                  ; b.top
+    cmp eax, edi                  ; b.top <= cursor? (block below)
+    jbe .next
+    mov edx, edi
+    add edx, [cs:xms_mv_len]      ; cursor + need
+    cmp ebx, edx                  ; b.base >= cursor+need? (block above)
+    jae .next
+    mov edi, eax                  ; overlap: cursor = b.top, restart
+    jmp .restart
+.next:
+    add si, XMS_SLOT
+    loop .scan
+    clc
+    ret
+.oom:
+    stc
+    ret
+
+; Resolve a move endpoint. in: BX=handle, EDX=offset, [cs:xms_mv_len]=length.
+; out: EAX = linear, CF clear; or CF set + AL=1 (bad handle) / AL=2 (bad offset).
+; Handle 0 => EDX is a real-mode seg:off (high=seg, low=off). Clobbers eax,ebx,edx.
+resolve:
+    test bx, bx
+    jnz .handle
+    mov eax, edx
+    shr eax, 16                   ; segment
+    and edx, 0xFFFF               ; offset
+    shl eax, 4
+    add eax, edx                  ; seg*16 + off
+    clc
+    ret
+.handle:
+    cmp bx, XMS_HANDLES
+    ja .badh
+    push si
+    mov ax, bx
+    dec ax
+    shl ax, 3
+    add ax, xms_table
+    mov si, ax
+    cmp byte [cs:si], 0           ; inuse?
+    je .badh_pop
+    movzx eax, word [cs:si+2]
+    shl eax, 10                   ; size bytes
+    cmp edx, eax                  ; offset > size?
+    ja .bado_pop
+    sub eax, edx                  ; remaining = size - offset
+    mov ebx, [cs:xms_mv_len]
+    cmp ebx, eax                  ; length > remaining?
+    ja .bado_pop
+    mov eax, [cs:si+4]            ; base_linear
+    add eax, edx                  ; + offset
+    pop si
+    clc
+    ret
+.badh_pop:
+    pop si
+.badh:
+    mov al, 1
+    stc
+    ret
+.bado_pop:
+    pop si
+    mov al, 2
+    stc
+    ret
+
 align 8
 gdt:
     dq 0
@@ -191,12 +749,20 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     mov es, ax
     mov ss, ax
     mov esp, ebx                  ; monitor ring-0 stack (driver-resident)
-    lea eax, [ebp + 0x1000]       ; PD[0] -> PT (= PD + 0x1000)
+    ; PD[0..3] -> the four PTs that follow the PD (each PT maps 4 MiB), so the
+    ; identity map covers 0..16 MiB and the XMS-move memcpy can reach every EMB.
+    lea eax, [ebp + 0x1000]       ; first PT linear = PD + 0x1000
     or eax, 7
-    mov [ebp], eax
-    lea edi, [ebp + 0x1000]       ; PT: 1024 identity entries (0..4 MiB)
+    mov edi, ebp                  ; write PD entries
+    mov ecx, 4
+.pde:
+    mov [edi], eax
+    add eax, 0x1000               ; next PT is one page further
+    add edi, 4
+    loop .pde
+    lea edi, [ebp + 0x1000]       ; 4096 identity entries (0..16 MiB), present/rw/user
     mov eax, 7
-    mov ecx, 1024
+    mov ecx, 4096
 .pt:
     mov [edi], eax
     add eax, 0x1000
@@ -309,6 +875,14 @@ monitor:
     jmp .done_gp
 .intn:
     movzx ebx, byte [eax+1]      ; INT vector operand
+    cmp bl, 0xC0                 ; TOKAEMM-private monitor call (XMS-move memcpy)?
+    jne .intn_reflect
+    cmp word [esp+20], 0x544D    ; guest DX == 'TM' cookie? (pushad EDX slot)
+    jne .intn_reflect            ; not our cookie: reflect INT 0xC0 like any other
+    add word [ebp], 2            ; skip past INT 0xC0
+    call flat_memcpy
+    jmp .done_gp
+.intn_reflect:
     add word [ebp], 2            ; return IP = past INT n
     call reflect_vector
     jmp .done_gp
@@ -429,6 +1003,30 @@ maybe_deliver:
 .none:
     ret
 
+; Ring-0 flat memcpy for the XMS block MOVE (INT 0xC0 monitor service). The guest
+; driver put dst linear in EDI, src linear in ESI, byte count in ECX (all live in
+; the pushad frame), and enabled A20 first. deliver_exception NULLED ES/DS/FS/GS on
+; the V86->ring0 entry, and a null selector faults a PM memory access, so reload ES
+; to the flat selector (DS is already 0x10 from monitor entry). Reads the three
+; args from the pushad slots (this routine was `call`ed, so +4 for the return addr:
+; guest EDI=[esp+4], ESI=[esp+8], ECX=[esp+28]). The frame is only read, never
+; written, so .done_gp's popad restores the guest's registers afterwards.
+flat_memcpy:
+    mov ax, 0x10
+    mov es, ax                    ; ES = flat (base 0); DS already 0x10
+    mov edi, [esp + 4]            ; guest EDI = dst linear
+    mov esi, [esp + 8]            ; guest ESI = src linear
+    mov ecx, [esp + 28]           ; guest ECX = byte count
+    in al, 0x92                   ; save port 0x92 + force A20 on: EMBs above the HMA
+    mov ah, al                    ; have bit 20 set, so the flat physical access needs
+    or al, 2                      ; A20 or it wraps at 1 MB (apply_a20 masks bit 20).
+    out 0x92, al
+    cld
+    rep movsb                     ; DS:ESI -> ES:EDI, both flat
+    mov al, ah
+    out 0x92, al                  ; restore A20 to the guest's prior state
+    ret
+
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:
     mov ah, al
@@ -451,5 +1049,7 @@ mon_stack_top:
 
 align 4096
 tables:
-    times 0x3000 db 0
+    ; PD (1 page) + 4 PT (4 pages) = 0x5000, plus up to 0xFF0 of page-rounding slack
+    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned) -> 0x6000.
+    times 0x6000 db 0
 resident_end:
