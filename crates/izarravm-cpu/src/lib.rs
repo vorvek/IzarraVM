@@ -1438,6 +1438,32 @@ fn block_straight_line(g: DecodeGroup) -> bool {
     )
 }
 
+/// Whether a decoded instruction may run as a cached continuation. Group-keyed for the
+/// straight-line groups (`block_straight_line`); additionally admits, BY OPCODE within the
+/// `ControlFlow` group, the near transfers that cannot halt, touch a port, or change CS:
+/// near RET (0xC3), near RET imm16 (0xC2), and the 0xFF group-5 near indirect CALL (/2)
+/// and near indirect JMP (/4). Still ending the run: far RET (0xCA/0xCB), the far directs
+/// (0x9A/0xEA), the far indirects (0xFF /3 and /5), INT3/INT n/INTO (0xCC-0xCE), IRET
+/// (0xCF), and the remaining 0xFF forms — they load CS, dispatch through the IDT, or stay
+/// on the terminator path by design. The continuation follows the new EIP exactly as taken
+/// relative branches already do; every per-continuation break check (step break, interrupt
+/// transition, clock cap, decode-cache re-peek at the new linear EIP, page-local decode)
+/// is unchanged, and a faulting stack read or segment-limit hit still routes through
+/// `finish_instruction`'s rewind-and-deliver exactly as on the one-instruction path.
+fn block_continuable(insn: &DecodedInsn) -> bool {
+    if block_straight_line(insn.group) {
+        return true;
+    }
+    if insn.group != DecodeGroup::ControlFlow {
+        return false;
+    }
+    match insn.opcode {
+        0xc2 | 0xc3 => true,
+        0xff => matches!(insn.modrm, Some(m) if m.reg == 2 || m.reg == 4),
+        _ => false,
+    }
+}
+
 impl CpuProfileState {
     fn enable(&mut self, sample_stride: u64) {
         *self = Self {
@@ -2494,10 +2520,11 @@ impl Cpu386 {
     /// Run a straight-line run of instructions in one cross-crate call instead of bouncing to the
     /// machine batch loop once per instruction. The first instruction always goes through the normal
     /// single-instruction path (`cycle_no_interrupt_check`), which handles a decode miss, a fault, and
-    /// halt. Each continuation runs ONLY when the next instruction is already in the decode cache, is
-    /// a straight-line group, and stays inside the current 4 KB page; any miss, non-straight-line
-    /// group, or page cross ends the run, and that terminator then runs through the normal path on the
-    /// next machine-loop entry. `cap` bounds the run in scaled core clocks.
+    /// halt. Each continuation runs ONLY when the next instruction is already in the decode cache,
+    /// passes the `block_continuable` gate (the straight-line groups plus the near RET / near
+    /// indirect CALL/JMP transfers), and stays inside the current 4 KB page; any miss, gated
+    /// opcode, or page cross ends the run, and that terminator then runs through the normal path on
+    /// the next machine-loop entry. `cap` bounds the run in scaled core clocks.
     ///
     /// This is the lean recompiler path: it needs no block cache. Self-modifying code is handled for
     /// free because every continuation re-peeks `decode_cache.get(lin)`. A guest write that modifies a
@@ -2528,8 +2555,7 @@ impl Cpu386 {
                 let lin = self.linear_eip();
                 let insn = match self.decode_cache.get(lin) {
                     Some(i)
-                        if block_straight_line(i.group)
-                            && (lin & 0xfff) + u32::from(i.len) <= 0x1000 =>
+                        if block_continuable(&i) && (lin & 0xfff) + u32::from(i.len) <= 0x1000 =>
                     {
                         i
                     }
@@ -19084,16 +19110,17 @@ mod tests {
 
     #[test]
     fn straight_line_run_executes_cached_near_call_continuation() {
-        // CALL near is a relative branch plus a normal stack push, so it can run as a cached
-        // continuation while RET remains the terminator.
+        // CALL near is a relative branch plus a normal stack push, and near RET is now a
+        // continuable near transfer too, so the warm run chains CALL -> body -> RET -> return
+        // site all the way to the HLT.
         //
         //   0x00: B8 01 00     MOV AX, 1
         //   0x03: E8 03 00     CALL 0x09        ; return address 0x06
-        //   0x06: 40           INC AX           ; return site, not reached in this run
+        //   0x06: 40           INC AX           ; return site, reached through the chained RET
         //   0x07: F4           HLT
         //   0x08: 90           NOP
         //   0x09: 40           INC AX           ; subroutine
-        //   0x0A: C3           RET              ; existing stop boundary
+        //   0x0A: C3           RET              ; chained continuation
         let code = [
             0xb8, 0x01, 0x00, // MOV AX, 1
             0xe8, 0x03, 0x00, // CALL +3 -> 0x09
@@ -19114,55 +19141,121 @@ mod tests {
         cpu.write_reg16(Reg16::Sp, 0x0200);
         cpu.halted = false;
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
-        assert!(!outcome.halted);
-        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
-        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01fe);
+        assert!(!outcome.halted, "the run stops AT the HLT terminator");
         assert_eq!(
-            u16::from_le_bytes([bus.memory[0x01fe], bus.memory[0x01ff]]),
-            0x0006
+            cpu.read_reg16(Reg16::Ax),
+            3,
+            "subroutine and return site both ran"
         );
         assert_eq!(
-            cpu.registers.eip, 0x0a,
-            "cached CALL reached the subroutine RET, which remains a terminator"
+            cpu.read_reg16(Reg16::Sp),
+            0x0200,
+            "RET released the return address"
+        );
+        assert_eq!(
+            cpu.registers.eip, 0x07,
+            "cached CALL chained through the RET back to the return site up to the HLT"
         );
     }
 
     #[test]
-    fn straight_line_run_stops_before_ret_control_flow_terminator() {
-        // RET changes SP and transfers through memory, so it remains a ControlFlow terminator. A hot
-        // run reaches the cached RET but leaves it for the next runner entry.
+    fn straight_line_run_chains_a_near_ret_procedure_in_one_run() {
+        // The P1b chaining property: a warm CALL rel16 -> body -> near RET procedure executes as
+        // ONE run (no brk[branch] break at the RET), proven via the run/break perf counters.
+        //
+        //   0x00: B8 02 00     MOV CX, 2   (via B9)
+        //   0x03: E8 05 00     CALL 0x0B        ; return address 0x06
+        //   0x06: 49           DEC CX
+        //   0x07: 75 FA        JNZ 0x03         ; call again
+        //   0x09: F4           HLT
+        //   0x0A: 90           NOP
+        //   0x0B: 40           INC AX           ; body
+        //   0x0C: C3           RET
+        let code = [
+            0xb9, 0x02, 0x00, // MOV CX, 2
+            0xe8, 0x05, 0x00, // CALL +5 -> 0x0B
+            0x49, // DEC CX
+            0x75, 0xfa, // JNZ -6 -> 0x03
+            0xf4, // HLT
+            0x90, // NOP
+            0x40, // INC AX (body)
+            0xc3, // RET
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.write_reg16(Reg16::Cx, 0);
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        cpu.halted = false;
+        cpu.reset_perf_counters();
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        // The run chains both CALL -> body -> RET round trips and stops only at the HLT
+        // (HLT is Misc, still a terminator that runs on the next runner entry).
+        assert!(
+            !outcome.halted,
+            "the run stops AT the HLT, which runs next entry"
+        );
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 2, "the body ran on both calls");
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x0200,
+            "both RETs released their frames"
+        );
+        assert_eq!(cpu.registers.eip, 0x09, "one run reached the HLT");
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.straight_line_runs, 1,
+            "one runner entry covered the whole procedure"
+        );
+        assert_eq!(
+            p.brk_decode_or_branch, 1,
+            "only the HLT terminator broke the run; the near RETs chained (eip pins that \
+             the break was at 0x09, past both RETs)"
+        );
+        assert_eq!(p.brk_halt, 0, "HLT was not executed inside the run");
+    }
+
+    #[test]
+    fn straight_line_run_still_breaks_at_far_ret() {
+        // The contrast case: far RET loads CS, so it stays a run terminator even warm.
         //
         //   0x00: 40           INC AX
-        //   0x01: 40           INC AX
-        //   0x02: C3           RET        ; stack target 0x06
-        //   0x03: 40           INC AX     ; skipped after RET
+        //   0x01: CB           RETF       ; stack target 0000:0006
+        //   0x02: 40 40 40 90  (skipped)
         //   0x06: F4           HLT
         let code = [
             0x40, // INC AX
-            0x40, // INC AX
-            0xc3, // RET
-            0x40, // INC AX (skipped)
-            0x40, // INC AX (skipped)
-            0x40, // INC AX (skipped)
+            0xcb, // RETF
+            0x40, 0x40, 0x40, 0x90, // skipped
             0xf4, // HLT
         ];
         let (mut cpu, mut memory) = real_mode_cpu(&code, 1024);
-        memory[0x100..0x102].copy_from_slice(&0x0006u16.to_le_bytes());
+        memory[0x100..0x104].copy_from_slice(&[0x06, 0x00, 0x00, 0x00]); // 0000:0006
         cpu.write_reg16(Reg16::Sp, 0x0100);
         let mut bus = TestBus::with_memory(memory);
         drive_straight_line_runs(&mut cpu, &mut bus);
 
-        bus.memory[0x100..0x102].copy_from_slice(&0x0006u16.to_le_bytes());
+        bus.memory[0x100..0x104].copy_from_slice(&[0x06, 0x00, 0x00, 0x00]);
         cpu.registers.eip = 0;
         cpu.write_reg16(Reg16::Ax, 0);
         cpu.write_reg16(Reg16::Sp, 0x0100);
         cpu.halted = false;
+        cpu.reset_perf_counters();
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
         assert!(!outcome.halted);
-        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 1);
         assert_eq!(
-            cpu.registers.eip, 0x02,
-            "RET must not run as a continuation"
+            cpu.registers.eip, 0x01,
+            "far RET must not run as a continuation"
+        );
+        assert_eq!(
+            cpu.perf_counters().brk_decode_or_branch,
+            1,
+            "the warm run broke at the cached RETF"
         );
     }
 
