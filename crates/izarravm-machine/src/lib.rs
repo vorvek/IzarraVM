@@ -2723,11 +2723,15 @@ impl Machine {
         self.video.set_mode_0dh();
     }
 
-    /// Select a VGA planar mode by its INT 10h number from the host side. Returns
+    /// Select a VGA graphics mode by its INT 10h number from the host side. Returns
     /// false for an unimplemented number. On success it hands the display back to
     /// the VGA core by clearing the Margo latch.
     pub fn set_vga_mode(&mut self, mode: u8) -> bool {
-        let ok = self.video.set_mode(mode);
+        self.set_vga_mode_with_clear(mode, false)
+    }
+
+    fn set_vga_mode_with_clear(&mut self, mode: u8, clear: bool) -> bool {
+        let ok = self.video.set_mode_with_clear(mode, clear);
         if ok {
             self.margo_active = false;
             self.distira.disable_display();
@@ -2747,18 +2751,12 @@ impl Machine {
         let mode = requested_mode & 0x7F;
         let clear = requested_mode & 0x80 == 0;
         match mode {
-            0x0D..=0x12 => {
-                if !self.set_vga_mode(mode) {
+            0x0D..=0x13 => {
+                if !self.set_vga_mode_with_clear(mode, clear) {
                     return false;
                 }
-                let cols = if mode == 0x0D { 40 } else { 80 };
+                let cols = if matches!(mode, 0x0D | 0x13) { 40 } else { 80 };
                 self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
-            }
-            0x13 => {
-                self.video.set_mode13h();
-                self.margo_active = false;
-                self.distira.disable_display();
-                self.set_bda_video_mode(requested_mode, 40, Self::video_text_rows(mode));
             }
             0x04..=0x06 => {
                 self.video.set_cga_mode_with_clear(mode, clear);
@@ -26506,7 +26504,7 @@ mod tests {
     }
 
     #[test]
-    fn set_vga_mode_selects_planar_geometry_per_number() {
+    fn set_vga_mode_selects_graphics_geometry_per_number() {
         let mut machine = test_machine();
 
         assert!(machine.set_vga_mode(0x0E));
@@ -26517,6 +26515,11 @@ mod tests {
         assert!(machine.set_vga_mode(0x12));
         assert_eq!(machine.video().raster_width(), 640);
         assert_eq!(machine.video().raster_height(), 525);
+
+        assert!(machine.set_vga_mode(0x13));
+        assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+        assert_eq!(machine.video().raster_width(), 320);
+        assert_eq!(machine.video().raster_height(), 449);
 
         assert!(!machine.set_vga_mode(0x99));
     }
@@ -26673,6 +26676,32 @@ mod tests {
             assert!(bus.read_io(0x3BA, BusWidth::Byte).is_ok());
         }
         assert_eq!(machine.video().pending_start_address(), Some(0x1234));
+    }
+
+    #[test]
+    fn int10_vga_graphics_modes_honor_clear_and_preserve_flag() {
+        let mut machine = int15_machine(16);
+
+        machine.cpu.registers.set_eax(0x0013);
+        machine.handle_int10();
+        machine.write_physical_u8(VGA_MODE13H_BASE, 0x5a);
+        machine.cpu.registers.set_eax(0x0093);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x5a);
+        machine.cpu.registers.set_eax(0x0013);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x00);
+
+        machine.cpu.registers.set_eax(0x0010);
+        machine.handle_int10();
+        machine.video_mut().cpu_write(0, 0xa5);
+        assert_eq!(machine.video().plane_byte(0, 0), 0xa5);
+        machine.cpu.registers.set_eax(0x0090);
+        machine.handle_int10();
+        assert_eq!(machine.video().plane_byte(0, 0), 0xa5);
+        machine.cpu.registers.set_eax(0x0010);
+        machine.handle_int10();
+        assert_eq!(machine.video().plane_byte(0, 0), 0x00);
     }
 
     #[test]
