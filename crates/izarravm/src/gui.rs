@@ -2526,6 +2526,9 @@ struct WinitApp {
     // that drops numpad releases on the cooked WindowEvent path); the cooked path
     // is the fallback only until/unless raw events appear (e.g. on Wayland).
     raw_keys: bool,
+    // Host shortcuts are withheld from the guest; remember their trigger key so
+    // repeats and the matching release edge are swallowed too.
+    host_hotkeys_down: Vec<winit::keyboard::KeyCode>,
     window: Option<Arc<Window>>,
     wgpu: Option<WgpuState>,
     egui_ctx: egui::Context,
@@ -2624,7 +2627,7 @@ impl WinitApp {
     /// guest); a pending rebind capture swallows the next key; everything else
     /// goes through HostKeyboard and on to the emulation thread. Used by both the
     /// raw DeviceEvent::Key path and the cooked WindowEvent fallback.
-    fn handle_guest_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) {
+    fn handle_guest_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool, repeat: bool) {
         use winit::keyboard::KeyCode;
         // Track modifiers (still forwarded to the guest below).
         match code {
@@ -2646,24 +2649,39 @@ impl WinitApp {
         let name = format!("{code:?}");
         let (ctrl, shift, alt) = (self.ctrl_down, self.shift_down, self.alt_down);
 
+        if !pressed {
+            if let Some(index) = self.host_hotkeys_down.iter().position(|held| *held == code) {
+                self.host_hotkeys_down.swap_remove(index);
+                return;
+            }
+        } else if self.host_hotkeys_down.contains(&code) {
+            return;
+        }
+
         // The config dialog is capturing a rebind: take the next non-modifier key
         // as the new combo and swallow it.
         if pressed && !is_modifier && self.gui.is_capturing_bind() {
             self.gui.record_bind(&name, ctrl, shift, alt);
             return;
         }
-        if pressed && self.gui.input_release.matches(&name, ctrl, shift, alt) {
+        if pressed
+            && !repeat
+            && self.gui.input_captured
+            && self.gui.input_release.matches(&name, ctrl, shift, alt)
+        {
+            self.host_hotkeys_down.push(code);
             if let Some(window) = self.window.clone() {
                 self.gui.toggle_capture(&window, &mut self.host_kbd);
             }
             return;
         }
-        if pressed && self.gui.fullscreen_key.matches(&name, ctrl, shift, alt) {
+        if pressed && !repeat && self.gui.fullscreen_key.matches(&name, ctrl, shift, alt) {
+            self.host_hotkeys_down.push(code);
             self.toggle_fullscreen();
             return;
         }
 
-        let codes = self.host_kbd.key(code, pressed);
+        let codes = self.host_kbd.key_with_repeat(code, pressed, repeat);
         self.gui.send_keys_to_guest(codes);
     }
 
@@ -2759,7 +2777,11 @@ impl ApplicationHandler for WinitApp {
         {
             if !self.raw_keys {
                 if let PhysicalKey::Code(code) = key_event.physical_key {
-                    self.handle_guest_key(code, key_event.state == ElementState::Pressed);
+                    self.handle_guest_key(
+                        code,
+                        key_event.state == ElementState::Pressed,
+                        key_event.repeat,
+                    );
                 }
             }
             return;
@@ -2771,6 +2793,9 @@ impl ApplicationHandler for WinitApp {
                 // alt-tab (Shift, in a game) does not stick in the guest.
                 self.gui.send_keys_to_guest(self.host_kbd.release_all());
                 self.ctrl_down = false;
+                self.shift_down = false;
+                self.alt_down = false;
+                self.host_hotkeys_down.clear();
                 return;
             }
             // Focused(true): fall through so egui also observes regained focus.
@@ -2832,10 +2857,13 @@ impl ApplicationHandler for WinitApp {
             // per physical key, immune to the cooked-path NumLock/fake-shift
             // mangling that drops numpad releases. This is the guest keyboard.
             DeviceEvent::Key(raw) => {
+                let first_raw = !self.raw_keys;
                 self.raw_keys = true;
                 if self.focused {
                     if let PhysicalKey::Code(code) = raw.physical_key {
-                        self.handle_guest_key(code, raw.state == ElementState::Pressed);
+                        let pressed = raw.state == ElementState::Pressed;
+                        let repeat = pressed && !first_raw && self.host_kbd.is_held(code);
+                        self.handle_guest_key(code, pressed, repeat);
                     }
                 }
             }
@@ -3028,6 +3056,7 @@ pub fn run(
         is_fullscreen: false,
         focused: true,
         raw_keys: false,
+        host_hotkeys_down: Vec::new(),
         window: None,
         wgpu: None,
         egui_ctx,
