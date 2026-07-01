@@ -120,6 +120,18 @@ fn code_id(make: u8, extended: bool) -> u16 {
     u16::from(make) | (u16::from(extended) << 8)
 }
 
+fn repeats(code: KeyCode) -> bool {
+    !matches!(
+        code,
+        KeyCode::ControlLeft
+            | KeyCode::ControlRight
+            | KeyCode::ShiftLeft
+            | KeyCode::ShiftRight
+            | KeyCode::AltLeft
+            | KeyCode::AltRight
+    )
+}
+
 /// Translates winit physical key events into Set 1 scancode bytes and remembers
 /// which keys are held, so everything can be released at once on focus loss or
 /// capture release. Pure: no windowing, no OS calls.
@@ -133,21 +145,22 @@ impl HostKeyboard {
     /// keys. Empty for keys outside the DOS set, and for a press of a key already
     /// held.
     ///
-    /// A press of an already-held key is a hardware/OS auto-repeat make and is
-    /// dropped: the guest tracks its own down state until the break, so repeats
-    /// only flood the 8042, burying a later break (a released key never reaching
-    /// the guest) and lagging everything behind the backlog. Deduping on the
-    /// held set (rather than a repeat flag) works for the raw-input path too,
-    /// which delivers a fresh make per typematic tick with no repeat marker.
-    /// Real typematic is the keyboard's job and belongs in 8042 emulation.
+    /// A press of an already-held key is dropped unless the caller marks it as a
+    /// typematic repeat. Modifiers do not repeat.
     pub fn key(&mut self, code: KeyCode, pressed: bool) -> Vec<u8> {
+        self.key_with_repeat(code, pressed, false)
+    }
+
+    pub fn key_with_repeat(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> Vec<u8> {
         let Some((make, extended)) = keycode_to_set1(code) else {
             return Vec::new();
         };
         let id = code_id(make, extended);
         let mut out = Vec::with_capacity(2);
         if pressed {
-            if !self.held.insert(id) {
+            let fresh_press = self.held.insert(id);
+            let allowed_repeat = repeat && repeats(code);
+            if !fresh_press && !allowed_repeat {
                 return Vec::new();
             }
             if extended {
@@ -162,6 +175,12 @@ impl HostKeyboard {
             out.push(make | 0x80);
         }
         out
+    }
+
+    pub fn is_held(&self, code: KeyCode) -> bool {
+        keycode_to_set1(code)
+            .map(|(make, extended)| self.held.contains(&code_id(make, extended)))
+            .unwrap_or(false)
     }
 
     /// Break codes for every held key, then forget them all.
@@ -226,6 +245,37 @@ mod tests {
         assert_eq!(kb.key(KeyCode::KeyA, false), vec![0x9e]);
         // After release a fresh press emits the make again.
         assert_eq!(kb.key(KeyCode::KeyA, true), vec![0x1e]);
+    }
+
+    #[test]
+    fn held_non_modifier_can_emit_typematic_make() {
+        let mut kb = HostKeyboard::default();
+        assert_eq!(kb.key_with_repeat(KeyCode::KeyS, true, false), vec![0x1f]);
+        assert_eq!(kb.key_with_repeat(KeyCode::KeyS, true, true), vec![0x1f]);
+        assert_eq!(kb.key_with_repeat(KeyCode::KeyS, false, false), vec![0x9f]);
+    }
+
+    #[test]
+    fn held_modifier_does_not_repeat() {
+        let mut kb = HostKeyboard::default();
+        assert_eq!(
+            kb.key_with_repeat(KeyCode::ControlLeft, true, false),
+            vec![0x1d]
+        );
+        assert!(
+            kb.key_with_repeat(KeyCode::ControlLeft, true, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reports_whether_key_is_held() {
+        let mut kb = HostKeyboard::default();
+        assert!(!kb.is_held(KeyCode::KeyS));
+        kb.key(KeyCode::KeyS, true);
+        assert!(kb.is_held(KeyCode::KeyS));
+        kb.key(KeyCode::KeyS, false);
+        assert!(!kb.is_held(KeyCode::KeyS));
     }
 
     #[test]
