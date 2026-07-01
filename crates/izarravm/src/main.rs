@@ -37,6 +37,7 @@ const DEFAULT_BOOT_FLOPPY_CYCLES: u64 = 50_000_000;
 /// image (MBR -> VBR -> kernel -> CONFIG.SYS -> shell) needs much more headroom
 /// than the bare floppy boot-sector run; --cycles tunes it for investigation.
 const DEFAULT_BOOT_HDD_CYCLES: u64 = 500_000_000;
+const CPU_OPCODE_PROFILE_PRINT_LIMIT: usize = 24;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "IzarraVM emulator scaffold")]
@@ -785,6 +786,52 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
             group.samples,
         );
     }
+
+    let mut opcodes = snapshot.opcodes.clone();
+    opcodes.sort_by_key(|opcode| Reverse((opcode.sample_wall_ns, opcode.instructions)));
+    println!();
+    println!(
+        "=== cpu opcodes (top {}, sample_stride={}) ===",
+        CPU_OPCODE_PROFILE_PRINT_LIMIT, snapshot.sample_stride
+    );
+    println!(
+        "{:<8} {:<18} {:>13} {:>8} {:>13} {:>8} {:>12} {:>8} {:>9}",
+        "opcode",
+        "group",
+        "instr",
+        "instr%",
+        "guest_clk",
+        "guest%",
+        "sample_ms",
+        "sample%",
+        "samples"
+    );
+    for opcode in opcodes
+        .iter()
+        .filter(|opcode| opcode.instructions > 0 || opcode.samples > 0)
+        .take(CPU_OPCODE_PROFILE_PRINT_LIMIT)
+    {
+        println!(
+            "{:<8} {:<18} {:>13} {:>7.2}% {:>13} {:>7.2}% {:>12.3} {:>7.2}% {:>9}",
+            format_profile_opcode(opcode.opcode),
+            opcode.group,
+            opcode.instructions,
+            100.0 * opcode.instructions as f64 / total_instructions as f64,
+            opcode.guest_core_clocks,
+            100.0 * opcode.guest_core_clocks as f64 / total_guest as f64,
+            opcode.sample_wall_ns as f64 / 1_000_000.0,
+            100.0 * opcode.sample_wall_ns as f64 / total_sample as f64,
+            opcode.samples,
+        );
+    }
+}
+
+fn format_profile_opcode(opcode: u16) -> String {
+    if opcode & 0xff00 == 0x0f00 {
+        format!("0F {:02X}", opcode as u8)
+    } else {
+        format!("{:02X}", opcode as u8)
+    }
 }
 
 fn write_profile_json(
@@ -811,6 +858,8 @@ fn write_profile_json(
     machine_phases.sort_by_key(|phase| Reverse(phase.wall_ns));
     let mut cpu_groups = profiled.cpu_profile.groups.clone();
     cpu_groups.sort_by_key(|group| Reverse(group.sample_wall_ns));
+    let mut cpu_opcodes = profiled.cpu_profile.opcodes.clone();
+    cpu_opcodes.sort_by_key(|opcode| Reverse((opcode.sample_wall_ns, opcode.instructions)));
     let report = json!({
         "schema": "izarravm-profile-v1",
         "exe": exe_path.display().to_string(),
@@ -837,6 +886,15 @@ fn write_profile_json(
                 "guest_core_clocks": group.guest_core_clocks,
                 "sample_wall_ns": group.sample_wall_ns,
                 "samples": group.samples,
+            })).collect::<Vec<_>>(),
+            "cpu_opcodes": cpu_opcodes.iter().map(|opcode| json!({
+                "opcode": format_profile_opcode(opcode.opcode),
+                "opcode_raw": opcode.opcode,
+                "group": opcode.group,
+                "instructions": opcode.instructions,
+                "guest_core_clocks": opcode.guest_core_clocks,
+                "sample_wall_ns": opcode.sample_wall_ns,
+                "samples": opcode.samples,
             })).collect::<Vec<_>>(),
             "perf": perf_counters_json(&profiled.perf),
         },
