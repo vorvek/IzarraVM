@@ -2,7 +2,7 @@ use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::{GswMode, TimingClass};
 use izarravm_input::HostKeyboard;
-use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
+use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
 use std::cell::Cell;
 use std::error::Error;
@@ -936,12 +936,12 @@ fn emulate(
             } else {
                 tick_machine(&mut machine, budget)
             };
-            let ran = machine.elapsed_clocks().saturating_sub(before);
+            let mut ran = machine.elapsed_clocks().saturating_sub(before);
             // Of those clocks, some may be a device-I/O stall (a floppy seek/read)
             // that jumped the clock without executing instructions. Drain the full
             // ran from the credit so the stall still costs wall-clock time, but
             // exclude it from the speed measurement below.
-            let stalled = machine.io_stall_clocks().saturating_sub(stall_before);
+            let mut stalled = machine.io_stall_clocks().saturating_sub(stall_before);
             let mut topped_up = 0u64;
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
@@ -970,10 +970,63 @@ fn emulate(
                     // Stall jumps already count as progress in `ran`, so they are
                     // not double-counted here. Fatal stops (CpuError/DosExit/
                     // TestExit) skip the top-up and keep devices frozen.
-                    let shortfall = budget.saturating_sub(ran);
-                    if shortfall > 0 {
-                        machine.advance_wall_shortfall(shortfall);
-                        topped_up = shortfall;
+                    //
+                    // The top-up is consumed edge-aware: advance_wall_shortfall
+                    // stops at each VGA vertical-retrace start edge inside the
+                    // span (a bare top-up sweeps the beam across a whole mode-13h
+                    // frame with zero instructions executing, so a guest polling
+                    // 0x3DA caught only 12.8 percent of the windows), and the CPU
+                    // gets a small peek quantum at every stop so the window is
+                    // observable. The peek is REAL executed guest time backed by
+                    // the wall time spent running it, so it is folded into `ran`
+                    // and drained from credit like any other execution; the slice
+                    // may thus consume slightly more than `budget` (at most a few
+                    // peeks' worth), which the credit bucket absorbs. This applies
+                    // in text modes too: uniform behavior, and a non-polling guest
+                    // pays only ~70 edge-stops + peeks per wall second (~0.2
+                    // percent of a 486 slice).
+                    let mut remaining = budget.saturating_sub(ran);
+                    // Defensive termination cap: normal VGA frames are 60-70 Hz,
+                    // so a slice's shortfall (<= 50ms of clocks) sees a handful of
+                    // edges. Budget one stop per 10ms of shortfall plus slack; a
+                    // pathological guest-programmed CRTC (kHz-rate frames) then
+                    // degrades to an unclamped top-up instead of livelocking the
+                    // emulate thread in peeks.
+                    let mut stops_left = remaining / (clock_hz / 100).max(1) + 2;
+                    while remaining > 0 {
+                        let consumed = machine.advance_wall_shortfall(remaining);
+                        topped_up += consumed;
+                        remaining = remaining.saturating_sub(consumed.max(1));
+                        if remaining == 0 {
+                            break;
+                        }
+                        if stops_left == 0 {
+                            machine.advance_wall_clocks(remaining);
+                            topped_up += remaining;
+                            break;
+                        }
+                        stops_left -= 1;
+                        // Stopped at a vretrace start edge (bit 3 of 0x3DA already
+                        // reads set): let the guest run a peek so a polling loop
+                        // observes the window before the top-up sweeps past it.
+                        let peek_before = machine.elapsed_clocks();
+                        let peek_stop = tick_machine(&mut machine, VRETRACE_PEEK_CLOCKS);
+                        ran += machine.elapsed_clocks().saturating_sub(peek_before);
+                        if peek_stop.is_some() {
+                            // Halted or fatal mid-peek: stop topping up; the unrun
+                            // remainder stays as credit for the next slice, which
+                            // sees the new machine state per its own stop handling.
+                            break;
+                        }
+                    }
+                    // A peek can itself hit a device-I/O stall (a guest kicking
+                    // off a disk read at the edge): fill the device gap the same
+                    // way the slice fill above did, and fold it into `stalled` so
+                    // the speed metric keeps excluding intentional waits.
+                    let stalled_total = machine.io_stall_clocks().saturating_sub(stall_before);
+                    if stalled_total > stalled {
+                        machine.advance_devices_clocks(stalled_total - stalled);
+                        stalled = stalled_total;
                     }
                 }
             }
