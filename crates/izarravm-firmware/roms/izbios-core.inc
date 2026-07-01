@@ -192,6 +192,8 @@ irq_stub_slave:
 int74:
     push ax
     push bx
+    push cx
+    push dx
     push si
     push ds
     mov ax, EBDA_SEG
@@ -224,6 +226,8 @@ int74:
     out PORT_PIC_CMD, al             ; EOI master cascade (IR2)
     pop ds
     pop si
+    pop dx
+    pop cx
     pop bx
     pop ax
     iret
