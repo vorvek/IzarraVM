@@ -2547,6 +2547,9 @@ impl Cpu386 {
             if matches!(opcode, 0x80..=0x83) {
                 return self.execute_hot_cached_group1(insn, opcode);
             }
+            if matches!(opcode, 0xc0 | 0xc1 | 0xd0..=0xd3) {
+                return self.execute_hot_cached_group2(insn, opcode);
+            }
         }
 
         match insn.opcode {
@@ -2980,6 +2983,43 @@ impl Cpu386 {
                 }
             }
             _ => return None,
+        }
+
+        Some(clocks(2))
+    }
+
+    #[inline]
+    fn execute_hot_cached_group2(
+        &mut self,
+        insn: &DecodedInsn,
+        opcode: u8,
+    ) -> Option<CycleOutcome> {
+        let modrm = insn.modrm?;
+        let DecodedOperand::Reg(index) = insn.operand? else {
+            return None;
+        };
+        let count = match opcode {
+            0xc0 | 0xc1 => insn.imm as u8,
+            0xd0 | 0xd1 => 1,
+            _ => (self.registers.ecx() & 0xff) as u8,
+        };
+
+        if opcode & 1 == 0 {
+            let result = self.shift_rotate(
+                modrm.reg,
+                u32::from(self.read_gpr8(index)),
+                count,
+                BusWidth::Byte,
+            ) as u8;
+            self.write_gpr8(index, result);
+        } else {
+            let result = self.shift_rotate(
+                modrm.reg,
+                self.read_gpr_sized(index, insn.operand_size),
+                count,
+                insn.operand_size.bus_width(),
+            );
+            self.write_gpr_sized(index, insn.operand_size, result);
         }
 
         Some(clocks(2))
@@ -18158,8 +18198,9 @@ mod tests {
     #[test]
     fn straight_line_run_executes_hot_alu_group_cached_forms() {
         // MOV AX,10 ; MOV BX,3 ; ADD AX,BX ; SUB AX,1 ; CMP AX,12 ; JNZ dead ;
-        // OR AL,1 ; XOR AL,1 ; AND AX,0x00ff ; HLT. The warm second run exercises cached ALU
-        // reg/reg, accumulator immediate, group-1 register immediate, CMP no-writeback, and flags.
+        // OR AL,1 ; XOR AL,1 ; AND AX,0x00ff ; SHL AX,1 ; SHR AX,1 ; HLT. The warm second run
+        // exercises cached ALU reg/reg, accumulator immediate, group-1 and group-2 register forms,
+        // CMP no-writeback, and flags.
         let code = [
             0xb8, 0x0a, 0x00, // MOV AX, 10
             0xbb, 0x03, 0x00, // MOV BX, 3
@@ -18170,6 +18211,8 @@ mod tests {
             0x0c, 0x01, // OR AL, 1
             0x34, 0x01, // XOR AL, 1
             0x25, 0xff, 0x00, // AND AX, 0x00ff
+            0xd1, 0xe0, // SHL AX, 1
+            0xd1, 0xe8, // SHR AX, 1
             0xf4, // HLT
             0xb8, 0xad, 0xde, // dead: MOV AX, 0xDEAD
         ];
@@ -18183,7 +18226,7 @@ mod tests {
         cpu.halted = false;
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
         assert!(!outcome.halted);
-        assert_eq!(cpu.registers.eip, 0x17, "run stopped at HLT");
+        assert_eq!(cpu.registers.eip, 0x1b, "run stopped at HLT");
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x000c);
         assert_eq!(cpu.read_reg16(Reg16::Bx), 3);
         assert!(!cpu.flag(FLAG_ZF), "final AND leaves a nonzero result");
