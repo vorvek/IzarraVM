@@ -30,6 +30,7 @@ mod ata;
 mod atapi;
 mod cdimage;
 mod dma;
+mod dosmem;
 mod ems;
 mod fat12;
 mod fat32;
@@ -1144,6 +1145,9 @@ pub struct Machine {
     // machine mirrors the new bytes onto the framebuffer so the screen shows them.
     dos_screen_shown: usize,
     dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
+    // The live DOS UMB/MCB memory-manager, extracted from `izarravm-dos`. Drives the
+    // XMS UMB services and `furnish_dos_upper_memory`; independent of the HLE `dos`.
+    dosmem: dosmem::DosMemory,
     /// True only for a `new_raw_program` machine: routes INT 20h/21h/27h to
     /// `handle_raw_program_int` instead of `handle_dos_int`. See
     /// `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3a.
@@ -1626,6 +1630,7 @@ impl Machine {
             in_device_call: false,
             dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
+            dosmem: dosmem::DosMemory::default(),
             program_runtime: false,
             program_output: Vec::new(),
             rom,
@@ -2284,11 +2289,6 @@ impl Machine {
         let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
         debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
         let mode = self.profile.emm386;
-        // Tell the DOS kernel whether the EMMXXXX0 device is present, so a guest's
-        // open-by-name or device-chain detection matches the EMM386 mode. The device
-        // is installed whenever the manager answers (RAM or NOEMS); only HIMEM-only
-        // (Unloaded) has no manager, so this mirrors the built `ems` Option.
-        self.dos.set_ems_present(self.ems.is_some());
         // RAM mode reserves the EMS page frame first, at the configured FRAME
         // segment when present, so the UMB pool carves around it. If the configured
         // address is not available, fall back to a first-fit hole.
@@ -2315,8 +2315,8 @@ impl Machine {
         } else {
             (0, 0)
         };
-        let Machine { dos, memory, .. } = self;
-        dos.set_umb_region(seg, paras, memory)?;
+        let Machine { dosmem, memory, .. } = self;
+        dosmem.set_umb_region(seg, paras, memory)?;
         Ok(())
     }
 
@@ -6813,8 +6813,8 @@ impl Machine {
             0x10 => {
                 let paras = self.cpu.registers.edx() as u16;
                 let result = {
-                    let Machine { dos, memory, .. } = self;
-                    dos.request_umb(paras, memory)
+                    let Machine { dosmem, memory, .. } = self;
+                    dosmem.request_umb(paras, memory)
                 };
                 match result {
                     Ok(Ok(seg)) => {
@@ -6846,8 +6846,8 @@ impl Machine {
             0x11 => {
                 let seg = self.cpu.registers.edx() as u16;
                 let result = {
-                    let Machine { dos, memory, .. } = self;
-                    dos.release_umb(seg, memory)
+                    let Machine { dosmem, memory, .. } = self;
+                    dosmem.release_umb(seg, memory)
                 };
                 match result {
                     Ok(Ok(())) => self.xms_success(),
@@ -6860,8 +6860,8 @@ impl Machine {
                 let paras = self.cpu.registers.ebx() as u16;
                 let seg = self.cpu.registers.edx() as u16;
                 let result = {
-                    let Machine { dos, memory, .. } = self;
-                    dos.resize_umb(seg, paras, memory)
+                    let Machine { dosmem, memory, .. } = self;
+                    dosmem.resize_umb(seg, paras, memory)
                 };
                 match result {
                     Ok(Ok(())) => self.xms_success(),
@@ -16161,6 +16161,96 @@ mod tests {
         m.cpu.registers.set_eax(0x0800);
         m.handle_xms();
         assert_eq!(m.cpu.registers.edx() as u16, total_before, "KB returned");
+    }
+
+    #[test]
+    fn xms_umb_request_release_reallocate_round_trip() {
+        // Exercise the extracted DOS UMB memory-manager end-to-end through the real
+        // XMS handler. Applying the RAM-mode EMM386 config runs SYSINIT's
+        // `furnish_dos_upper_memory` -> `dosmem.set_umb_region`, standing up the
+        // upper-memory arena the XMS UMB calls (fns 10h/11h/12h) carve from. This is
+        // the safety net that replaced the deleted HLE-based UMB test.
+        let mut m = int15_machine(16);
+        m.set_emm386_mode(Emm386Mode::Ram).unwrap();
+
+        // 10h Request UMB: DX = paragraphs. Success => AX=1, BX=segment, DX=paras.
+        m.cpu.registers.set_eax(0x1000);
+        m.cpu.registers.set_edx(0x0100);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 1, "request succeeds");
+        let seg = m.cpu.registers.ebx() as u16;
+        assert!(
+            (0xc000..0xf000).contains(&seg),
+            "the UMB sits in the upper window, got {seg:#06x}"
+        );
+        assert_eq!(
+            m.cpu.registers.edx() as u16,
+            0x0100,
+            "granted size echoes the request"
+        );
+
+        // The block is RAM the guest can use.
+        let addr = (u32::from(seg) << 4) + 4;
+        m.write_physical_u8(addr, 0x5a);
+        assert_eq!(m.read_physical_u8(addr), 0x5a);
+
+        // A request larger than the pool reports the largest available (B0h).
+        m.cpu.registers.set_eax(0x1000);
+        m.cpu.registers.set_edx(0x9000);
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0,
+            "an over-large request fails"
+        );
+        assert_eq!(
+            m.cpu.registers.ebx() & 0xff,
+            0xb0,
+            "BL=B0h smaller available"
+        );
+        assert!(m.cpu.registers.edx() as u16 > 0, "DX = largest available");
+
+        // 12h Reallocate UMB: BX = new paragraphs, DX = segment. Grow it (the free
+        // successor is available), then shrink it — both change the block's size.
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0200);
+        m.cpu.registers.set_edx(u32::from(seg));
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            1,
+            "reallocate (grow) succeeds"
+        );
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0040);
+        m.cpu.registers.set_edx(u32::from(seg));
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            1,
+            "reallocate (shrink) succeeds"
+        );
+
+        // A reallocate of a segment that is not a UMB is B2h (invalid segment).
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0010);
+        m.cpu.registers.set_edx(0x0050);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "bogus reallocate fails");
+        assert_eq!(m.cpu.registers.ebx() & 0xff, 0xb2, "BL=B2h invalid segment");
+
+        // 11h Release UMB: DX = segment.
+        m.cpu.registers.set_eax(0x1100);
+        m.cpu.registers.set_edx(u32::from(seg));
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 1, "release succeeds");
+
+        // Releasing a segment that is not a UMB is B2h.
+        m.cpu.registers.set_eax(0x1100);
+        m.cpu.registers.set_edx(0x0050);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "bogus release fails");
+        assert_eq!(m.cpu.registers.ebx() & 0xff, 0xb2, "BL=B2h invalid segment");
     }
 
     #[test]
