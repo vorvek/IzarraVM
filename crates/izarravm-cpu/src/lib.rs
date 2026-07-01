@@ -2444,7 +2444,7 @@ impl Cpu386 {
                 if self.registers.cs().selector != start_cs {
                     self.load_segment_real(SegmentIndex::Cs, start_cs);
                 }
-                self.deliver_exception(bus, vector, error_code)
+                self.deliver_exception(bus, vector, error_code, false)
                     .map_err(|fault| match fault {
                         InternalFault::Cpu(error) => error,
                         InternalFault::Exception { vector, .. } => CpuError::IdtLimit { vector },
@@ -7941,7 +7941,7 @@ impl Cpu386 {
     fn software_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
         if self.is_protected_mode() {
-            self.deliver_exception(bus, vector, None)
+            self.deliver_exception(bus, vector, None, true)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -7972,7 +7972,7 @@ impl Cpu386 {
     // (the video mode-set), not the INTA handshake, which the PIC handled already.
     fn hardware_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
         if self.is_protected_mode() {
-            self.deliver_exception(bus, vector, None)
+            self.deliver_exception(bus, vector, None, true)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -7983,6 +7983,10 @@ impl Cpu386 {
         bus: &mut B,
         vector: u8,
         error_code: Option<u32>,
+        // External hardware interrupts and software `INT n` never push an error code,
+        // even on a vector that a CPU exception would carry one for (e.g. IRQ0 remapped
+        // to vector 8, #DF). Only a genuine CPU exception pushes one.
+        is_external: bool,
     ) -> ExecResult<()> {
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
@@ -8045,9 +8049,10 @@ impl Cpu386 {
         self.push(bus, saved_eflags, OperandSize::Dword)?;
         self.push(bus, u32::from(saved_cs), OperandSize::Dword)?;
         self.push(bus, saved_eip, OperandSize::Dword)?;
-        // The error code is pushed only for the vectors that carry one, regardless of
-        // what the caller supplied: 8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC.
-        if vector_pushes_error_code(vector) {
+        // The error code is pushed only for a CPU exception on a vector that carries one
+        // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
+        // hardware interrupt or software `INT n`, even when it lands on such a vector.
+        if !is_external && vector_pushes_error_code(vector) {
             self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
 
@@ -26200,7 +26205,7 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Gs, 0x4444);
         let saved_eflags = cpu.registers.eflags;
 
-        cpu.deliver_exception(&mut bus, 13, Some(0)).unwrap();
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
 
         assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
         assert_eq!(cpu.registers.cs().selector, R0_CS);
@@ -26222,6 +26227,28 @@ mod tests {
         assert_eq!(rd(28) & 0xffff, 0x1111, "V86 DS");
         assert_eq!(rd(32) & 0xffff, 0x3333, "V86 FS");
         assert_eq!(rd(36) & 0xffff, 0x4444, "V86 GS");
+    }
+
+    #[test]
+    fn v86_external_interrupt_on_vector_8_pushes_no_error_code() {
+        // A real DOS boot under a V86 monitor keeps the PIC at base 0x08, so IRQ0
+        // lands on vector 8 (#DF). An EXTERNAL interrupt must NOT push an error code
+        // even there — only a genuine CPU exception does. (is_external = true.)
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        int_gate(&mut bus.memory, 8, MON_CODE);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+        cpu.deliver_exception(&mut bus, 8, None, true).unwrap();
+
+        // In the monitor: the top of the ring-0 stack is the V86 EIP, not an error
+        // code (the frame is EIP, CS, EFLAGS, ... with no error code beneath EIP).
+        let esp = cpu.registers.esp();
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(
+            u32::from_le_bytes(cpu_mem(&bus, esp)),
+            0x10,
+            "external interrupt on vector 8 must not push an error code"
+        );
     }
 
     #[test]
