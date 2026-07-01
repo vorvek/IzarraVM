@@ -68,6 +68,9 @@ struct Cli {
     headless_boot_suite: bool,
     #[arg(long)]
     headless_bench: bool,
+    /// Run one supplied DOS EXE through the raw-program bench harness in GSW-586.
+    #[arg(long)]
+    headless_bench_exe: Option<PathBuf>,
     #[arg(long)]
     headless_bandwidth: bool,
     #[arg(long)]
@@ -152,6 +155,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_bench {
         return run_bench(&hardware);
+    }
+
+    if let Some(path) = &cli.headless_bench_exe {
+        return run_bench_exe(path, &hardware);
     }
 
     if cli.headless_bandwidth {
@@ -282,15 +289,15 @@ struct BenchRun {
 /// How a benchmark payload is loaded: baked into the Neurketa boot image and
 /// chosen by a selector byte, or a freestanding DOS .EXE.
 #[derive(Debug)]
-enum BenchSource {
+enum BenchSource<'a> {
     BootSelector(u8),
-    DosExe(&'static [u8]),
+    DosExe(&'a [u8]),
 }
 
 fn run_bench_one(
     hardware: &HardwareProfile,
     mode: GswMode,
-    source: &BenchSource,
+    source: &BenchSource<'_>,
     budget: u64,
 ) -> Result<BenchRun, Box<dyn Error>> {
     let profile = MachineProfile::from_hardware_profile(hardware);
@@ -313,12 +320,14 @@ fn run_bench_one(
         )
         .into());
     }
+    let mut perf = machine.cpu().perf_counters().clone();
+    perf.cache_tier_lookups = machine.cache_tier_lookups();
     Ok(BenchRun {
         clocks: machine.elapsed_clocks(),
         iterations: machine.bench_iterations(),
         aux: machine.bench_aux(),
         wall,
-        perf: machine.cpu().perf_counters().clone(),
+        perf,
     })
 }
 
@@ -327,7 +336,7 @@ fn run_bench_one(
 /// they start at 486.
 struct Bench {
     name: &'static str,
-    source: BenchSource,
+    source: BenchSource<'static>,
     min_mode: GswMode,
     /// Floating-point operations per reported iteration. When set, the harness
     /// reports `MFLOPS = iters_per_sec * flops_per_iter / 1e6` and bands against it
@@ -488,7 +497,10 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
         println!(
             "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
-             brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}",
+             brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
+             data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
+             page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
+             map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -499,8 +511,71 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             perf.brk_interrupt,
             perf.brk_cap,
             perf.brk_halt,
+            perf.data_direct_reads,
+            perf.data_slow_reads,
+            perf.data_direct_writes,
+            perf.data_slow_writes,
+            perf.direct_data_pointer_reads,
+            perf.direct_data_pointer_writes,
+            perf.direct_page_hits,
+            perf.direct_page_misses,
+            perf.fetch_page_hits,
+            perf.fetch_page_misses,
+            perf.slow_prefetch_refills,
+            perf.direct_map_invalidations,
+            perf.rep_string_fast_iterations,
+            perf.rep_string_iterations,
+            perf.flag_materializations,
+            perf.cache_tier_lookups,
         );
     }
+    Ok(())
+}
+
+fn run_bench_exe(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    const BENCH_BUDGET: u64 = 50_000_000_000;
+    let exe = std::fs::read(path)?;
+    let mode = GswMode::Gsw586;
+    let run = run_bench_one(hardware, mode, &BenchSource::DosExe(&exe), BENCH_BUDGET)?;
+    let iters = u64::from(run.iterations.max(1));
+    let cyc_per_iter = run.clocks as f64 / iters as f64;
+    let guest_secs = run.clocks as f64 / mode.clock_hz() as f64;
+    let iters_per_sec = if guest_secs > 0.0 {
+        iters as f64 / guest_secs
+    } else {
+        0.0
+    };
+    let wall_secs = run.wall.as_secs_f64();
+    let rt = if wall_secs > 0.0 {
+        guest_secs / wall_secs
+    } else {
+        0.0
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("exe");
+    println!(
+        "{:<10} {:<5} {:>12} {:>8} {:>9} {:>12} {:>10} {:>9} {:>10}",
+        "bench",
+        "mode",
+        "cyc/iter",
+        "iters",
+        "aux",
+        "iters/sec",
+        "guest_ms",
+        "wall_ms",
+        "rt_factor"
+    );
+    println!(
+        "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
+        name,
+        mode.canonical_name(),
+        cyc_per_iter,
+        run.iterations,
+        run.aux,
+        iters_per_sec,
+        guest_secs * 1000.0,
+        wall_secs * 1000.0,
+        rt,
+    );
     Ok(())
 }
 

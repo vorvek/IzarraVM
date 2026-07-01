@@ -7,7 +7,10 @@ pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{
     Ad1848, Ad1848Config, AdpcmConfig, OplChip, Resampler, SbDsp, SbMixer, YamahaAdpcmChip,
 };
-use izarravm_bus::{BusAccessKind, BusError, BusTrace, BusWidth, CpuBus, Memory, TracingMode};
+use izarravm_bus::{
+    BusAccessKind, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead, DirectMemoryWrite,
+    DirectPage, Memory, TracingMode,
+};
 use izarravm_core::{
     ConfigSysMemory, Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard,
     WssConfig, YamahaAdpcmConfig,
@@ -913,6 +916,55 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CacheLevelConfig {
+    l1_mask: u32,
+    l2_mask: u32,
+}
+
+const CACHE_TIER_DISABLED_MASK: u32 = u32::MAX;
+
+const fn build_cache_level_config(level: CpuLevel) -> CacheLevelConfig {
+    let g = cache_geometry(level);
+    let l1_lines = if g.l1_bytes == 0 {
+        0
+    } else {
+        g.l1_bytes / CACHE_LINE_BYTES
+    };
+    let l2_lines = if g.l2_bytes == 0 {
+        0
+    } else {
+        g.l2_bytes / CACHE_LINE_BYTES
+    };
+    CacheLevelConfig {
+        l1_mask: if l1_lines == 0 {
+            CACHE_TIER_DISABLED_MASK
+        } else {
+            l1_lines - 1
+        },
+        l2_mask: if l2_lines == 0 {
+            CACHE_TIER_DISABLED_MASK
+        } else {
+            l2_lines - 1
+        },
+    }
+}
+
+const CACHE_CONFIG_286: CacheLevelConfig = build_cache_level_config(CpuLevel::I286);
+const CACHE_CONFIG_386: CacheLevelConfig = build_cache_level_config(CpuLevel::I386);
+const CACHE_CONFIG_486: CacheLevelConfig = build_cache_level_config(CpuLevel::I486);
+const CACHE_CONFIG_586: CacheLevelConfig = build_cache_level_config(CpuLevel::I586);
+
+#[inline(always)]
+const fn cache_level_config(level: CpuLevel) -> CacheLevelConfig {
+    match level {
+        CpuLevel::I286 => CACHE_CONFIG_286,
+        CpuLevel::I386 => CACHE_CONFIG_386,
+        CpuLevel::I486 => CACHE_CONFIG_486,
+        CpuLevel::I586 => CACHE_CONFIG_586,
+    }
+}
+
 /// Per-mode CODE-fetch wait-state seam: extra wait-states added to the 2-clock base
 /// bus access for an instruction byte fetched from cacheable RAM (an I-cache hit).
 /// It is its own per-mode dial, DECOUPLED from the data cache tiers (`tier_cost`)
@@ -955,8 +1007,9 @@ enum Tier {
 /// per-mode wait-state).
 #[derive(Debug)]
 struct CacheModel {
-    l1_tags: Box<[u32]>, // sized to the largest L1 line count (586: 1024)
+    l1_tags: Box<[u32]>, // sized to the largest L1 line count (586: 512)
     l2_tags: Box<[u32]>, // sized to the largest L2 line count (586: 8192)
+    lookups: u64,
 }
 
 /// Sentinel tag that cannot be a valid line number, so a freshly filled array is
@@ -969,6 +1022,7 @@ impl CacheModel {
         Self {
             l1_tags: vec![CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES].into_boxed_slice(),
             l2_tags: vec![CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES].into_boxed_slice(),
+            lookups: 0,
         }
     }
 
@@ -976,47 +1030,46 @@ impl CacheModel {
     /// line into the cheaper tiers on a miss (modeling an inclusive fill). A 0-size
     /// tier is skipped: the 286 has neither tier (always RAM); the 386 has no L1.
     ///
-    /// Performance fallback if the wiring task shows this is too costly: replace the
-    /// tag arrays with a high-water-mark span model -- track the min/max touched
-    /// physical data address since the last reset, then classify span <= L1 -> L1,
-    /// span <= L2 -> L2, else RAM. Same signature, cheaper, and exact for the
-    /// contiguous sweeps the benchmark uses.
+    #[cfg(test)]
     fn data_tier(&mut self, level: CpuLevel, phys: u32) -> Tier {
+        self.data_tier_with_config(cache_level_config(level), phys)
+    }
+
+    #[inline(always)]
+    fn data_tier_with_config(&mut self, config: CacheLevelConfig, phys: u32) -> Tier {
+        self.lookups += 1;
         let line = phys >> 6;
-        let g = cache_geometry(level);
-        if g.l1_bytes != 0 {
-            let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
-            let idx = (line & (l1_lines - 1)) as usize;
+        if config.l1_mask != CACHE_TIER_DISABLED_MASK {
+            let idx = (line & config.l1_mask) as usize;
             if self.l1_tags[idx] == line {
                 return Tier::L1;
             }
         }
-        if g.l2_bytes != 0 {
-            let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
-            let idx = (line & (l2_lines - 1)) as usize;
+        if config.l2_mask != CACHE_TIER_DISABLED_MASK {
+            let idx = (line & config.l2_mask) as usize;
             if self.l2_tags[idx] == line {
                 // L2 hit: pull the line up into L1 (if L1 exists) for next time.
-                self.install_l1(g, line);
+                self.install_l1(config, line);
                 return Tier::L2;
             }
         }
         // Miss in both: serve from RAM and fill the existing tiers.
-        self.install_l1(g, line);
-        self.install_l2(g, line);
+        self.install_l1(config, line);
+        self.install_l2(config, line);
         Tier::Ram
     }
 
-    fn install_l1(&mut self, g: CacheGeometry, line: u32) {
-        if g.l1_bytes != 0 {
-            let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
-            self.l1_tags[(line & (l1_lines - 1)) as usize] = line;
+    #[inline(always)]
+    fn install_l1(&mut self, config: CacheLevelConfig, line: u32) {
+        if config.l1_mask != CACHE_TIER_DISABLED_MASK {
+            self.l1_tags[(line & config.l1_mask) as usize] = line;
         }
     }
 
-    fn install_l2(&mut self, g: CacheGeometry, line: u32) {
-        if g.l2_bytes != 0 {
-            let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
-            self.l2_tags[(line & (l2_lines - 1)) as usize] = line;
+    #[inline(always)]
+    fn install_l2(&mut self, config: CacheLevelConfig, line: u32) {
+        if config.l2_mask != CACHE_TIER_DISABLED_MASK {
+            self.l2_tags[(line & config.l2_mask) as usize] = line;
         }
     }
 
@@ -1028,9 +1081,11 @@ impl CacheModel {
     /// `data_access_wait_states` already routed ROM/MMIO accesses to
     /// `memory_wait_states` before reaching here, so this only ever sees cacheable
     /// RAM.
+    #[inline(always)]
     fn data_wait_states(&mut self, level: CpuLevel, phys: u32, _width: BusWidth) -> u8 {
+        let config = cache_level_config(level);
         let cost = tier_cost(level);
-        match self.data_tier(level, phys) {
+        match self.data_tier_with_config(config, phys) {
             Tier::L1 => cost.l1,
             Tier::L2 => cost.l2,
             Tier::Ram => cost.ram,
@@ -1054,6 +1109,10 @@ impl CacheModel {
     fn reset(&mut self) {
         self.l1_tags.fill(CACHE_EMPTY_TAG);
         self.l2_tags.fill(CACHE_EMPTY_TAG);
+    }
+
+    fn lookups(&self) -> u64 {
+        self.lookups
     }
 }
 
@@ -1106,6 +1165,9 @@ pub struct Machine {
     // which bypasses the CPU's self-modifying-code tracking. The run loop tells the CPU to drop its
     // prefetch + decode cache at end of step so staged code is never replayed stale.
     device_wrote_memory: bool,
+    // Set when the RAM direct-map table changes, so cached host pointers in the CPU are dropped
+    // before any later guest access can use a stale RAM page classification.
+    direct_map_changed: bool,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
     // the resulting status is read back at 0xE3.
@@ -1459,6 +1521,7 @@ impl Machine {
             pending_soft_int: None,
             io_touched: false,
             device_wrote_memory: false,
+            direct_map_changed: false,
             pending_toka_service: None,
             toka_service_status: 0,
             katea_root: None,
@@ -2338,6 +2401,7 @@ impl Machine {
             cache: &mut self.cache_model,
             io_touched: &mut self.io_touched,
             device_wrote_memory: &mut self.device_wrote_memory,
+            direct_map_changed: &mut self.direct_map_changed,
         }
     }
 
@@ -8414,6 +8478,10 @@ impl Machine {
         self.active_mode
     }
 
+    pub fn cache_tier_lookups(&self) -> u64 {
+        self.cache_model.lookups()
+    }
+
     /// Measure pure memory read timing for a block by driving the bus directly.
     ///
     /// Resets the modeled cache, then does enough sequential dword-read passes
@@ -9128,6 +9196,10 @@ impl Machine {
         requested: u64,
     ) -> Result<StopReason, MachineError> {
         while self.elapsed_clocks < deadline {
+            if self.direct_map_changed {
+                self.cpu.note_direct_map_changed();
+                self.direct_map_changed = false;
+            }
             self.pending_soft_int = None;
             self.io_touched = false;
             self.device_wrote_memory = false;
@@ -9197,6 +9269,7 @@ impl Machine {
                     pci,
                     io_touched,
                     device_wrote_memory,
+                    direct_map_changed,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -9246,6 +9319,7 @@ impl Machine {
                     cache: cache_model,
                     io_touched,
                     device_wrote_memory,
+                    direct_map_changed,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -9428,6 +9502,10 @@ impl Machine {
                     if self.device_wrote_memory {
                         self.cpu.note_device_memory_write();
                     }
+                    if self.direct_map_changed {
+                        self.cpu.note_direct_map_changed();
+                        self.direct_map_changed = false;
+                    }
                 }
                 Err(error) => return Ok(StopReason::CpuError(error.to_string())),
             }
@@ -9505,6 +9583,7 @@ struct MachineBus<'a> {
     // state exact. Memory/MMIO (framebuffer blits, the hot path) does not set it.
     io_touched: &'a mut bool,
     device_wrote_memory: &'a mut bool,
+    direct_map_changed: &'a mut bool,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -9533,6 +9612,157 @@ const fn io_word_sub_port(port: u16, index: u32) -> u16 {
 }
 
 impl CpuBus for MachineBus<'_> {
+    fn read_memory_direct(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<DirectMemoryRead, BusError> {
+        if let Some((address, start, end)) =
+            self.direct_page_ram_bytes(address, width.bytes() as usize, width)
+        {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            let data = &self.memory.as_slice()[start..end];
+            let value = match width {
+                BusWidth::Byte => u32::from(data[0]),
+                BusWidth::Word => u32::from(u16::from_le_bytes([data[0], data[1]])),
+                BusWidth::Dword => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            };
+            return Ok(DirectMemoryRead {
+                value,
+                direct: true,
+            });
+        }
+        self.read_memory(address, width, kind)
+            .map(|value| DirectMemoryRead {
+                value,
+                direct: false,
+            })
+    }
+
+    fn write_memory_direct(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> Result<DirectMemoryWrite, BusError> {
+        if let Some((address, start, _)) =
+            self.direct_page_ram_bytes(address, width.bytes() as usize, width)
+        {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            match width {
+                BusWidth::Byte => self.memory.write_u8(start, value as u8)?,
+                BusWidth::Word => self.memory.write_u16(start, value as u16)?,
+                BusWidth::Dword => self.memory.write_u32(start, value)?,
+            }
+            return Ok(DirectMemoryWrite { direct: true });
+        }
+        self.write_memory(address, width, value, kind)
+            .map(|()| DirectMemoryWrite { direct: false })
+    }
+
+    fn read_memory_bytes_direct(
+        &mut self,
+        address: u32,
+        out: &mut [u8],
+        access_width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<usize, BusError> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let access = access_width.bytes() as usize;
+        if out.len() % access != 0 {
+            return Ok(0);
+        }
+        let Some((address, start, end)) =
+            self.direct_page_ram_bytes(address, out.len(), access_width)
+        else {
+            return Ok(0);
+        };
+        for offset in (0..out.len()).step_by(access) {
+            let at = address + offset as u32;
+            let ws = self.data_access_wait_states(at, access_width);
+            self.trace.record(kind, at, access_width, ws);
+        }
+        out.copy_from_slice(&self.memory.as_slice()[start..end]);
+        Ok(out.len())
+    }
+
+    fn write_memory_bytes_direct(
+        &mut self,
+        address: u32,
+        data: &[u8],
+        access_width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<usize, BusError> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let access = access_width.bytes() as usize;
+        if data.len() % access != 0 {
+            return Ok(0);
+        }
+        let Some((address, start, end)) =
+            self.direct_page_ram_bytes(address, data.len(), access_width)
+        else {
+            return Ok(0);
+        };
+        for offset in (0..data.len()).step_by(access) {
+            let at = address + offset as u32;
+            let ws = self.data_access_wait_states(at, access_width);
+            self.trace.record(kind, at, access_width, ws);
+        }
+        self.memory.as_mut_slice()[start..end].copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn direct_memory_bytes(&self, address: u32, bytes: usize, access_width: BusWidth) -> usize {
+        self.direct_page_ram_bytes(address, bytes, access_width)
+            .map_or(0, |(_, start, end)| end - start)
+    }
+
+    #[inline]
+    fn direct_page(
+        &mut self,
+        address: u32,
+        kind: BusAccessKind,
+    ) -> Result<Option<DirectPage>, BusError> {
+        let gated = self.apply_a20(address);
+        if gated != address {
+            return Ok(None);
+        }
+        let physical_page = gated & !(RAM_LOOKUP_PAGE_MASK as u32);
+        let Some((start, end)) = self.direct_ram_bytes(physical_page, RAM_LOOKUP_PAGE_SIZE) else {
+            return Ok(None);
+        };
+        if end - start != RAM_LOOKUP_PAGE_SIZE {
+            return Ok(None);
+        }
+        Ok(Some(DirectPage {
+            physical_page,
+            ptr: unsafe { self.memory.as_mut_ptr().add(start) },
+            len: RAM_LOOKUP_PAGE_SIZE,
+            writable: matches!(kind, BusAccessKind::DataWrite),
+        }))
+    }
+
+    #[inline]
+    fn charge_direct_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        let address = self.apply_a20(address);
+        let ws = self.data_access_wait_states(address, width);
+        self.trace.record(kind, address, width, ws);
+        Ok(())
+    }
+
     fn read_memory(
         &mut self,
         address: u32,
@@ -9919,6 +10149,7 @@ impl CpuBus for MachineBus<'_> {
         if self.pci.write_io(port, width, value) {
             if self.pci.distira_memory_decode_key() != pci_decode {
                 self.ram_lookup.rebuild(self.memory.len(), self.pci);
+                *self.direct_map_changed = true;
             }
             return Ok(());
         }
@@ -11026,6 +11257,26 @@ impl MachineBus<'_> {
         self.ram_lookup.direct_bytes(address, bytes)
     }
 
+    #[inline]
+    fn direct_page_ram_bytes(
+        &self,
+        address: u32,
+        bytes: usize,
+        access_width: BusWidth,
+    ) -> Option<(u32, usize, usize)> {
+        let gated = self.apply_a20(address);
+        if gated != address || bytes == 0 {
+            return None;
+        }
+        if should_split(gated, access_width)
+            || ((gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE)
+        {
+            return None;
+        }
+        self.direct_ram_bytes(gated, bytes)
+            .map(|(start, end)| (gated, start, end))
+    }
+
     /// The plane-window offset for an access that the guest-selected GC06 graphics
     /// aperture redirects. Only graphics modes consult the aperture; text and CGA
     /// keep the fixed B8000 decode.
@@ -11565,6 +11816,38 @@ mod tests {
     // model resolves L1/L2/RAM correctly per the per-mode geometry, not the specific
     // costs.
     #[test]
+    fn cache_level_config_matches_geometry() {
+        for level in [
+            CpuLevel::I286,
+            CpuLevel::I386,
+            CpuLevel::I486,
+            CpuLevel::I586,
+        ] {
+            let g = cache_geometry(level);
+            let config = cache_level_config(level);
+            let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
+            let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
+
+            assert_eq!(
+                config.l1_mask,
+                if l1_lines == 0 {
+                    CACHE_TIER_DISABLED_MASK
+                } else {
+                    l1_lines - 1
+                }
+            );
+            assert_eq!(
+                config.l2_mask,
+                if l2_lines == 0 {
+                    CACHE_TIER_DISABLED_MASK
+                } else {
+                    l2_lines - 1
+                }
+            );
+        }
+    }
+
+    #[test]
     fn cache_model_resolves_tiers_by_working_set() {
         let mut c = CacheModel::new();
         let warm = |c: &mut CacheModel, base: u32, len: u32| {
@@ -12043,6 +12326,50 @@ mod tests {
                 .unwrap();
         let reason = m.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0x2a });
+    }
+
+    #[test]
+    fn raw_program_uses_direct_page_data_and_fetch_caches() {
+        let mut prog = vec![
+            0xb9, 0x20, 0x00, // mov cx,32
+            0xa1, 0x20, 0x01, // loop: mov ax,[0120h]
+            0xa3, 0x22, 0x01, // mov [0122h],ax
+            0xe2, 0xf8, // loop loop
+            0xcd, 0x20, // int 20h
+        ];
+        prog.resize(0x20, 0);
+        prog.extend_from_slice(&0xBEEFu16.to_le_bytes());
+        prog.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &prog)
+                .unwrap();
+        m.cpu.reset_perf_counters();
+        let reason = m.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let data_addr = (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x0122;
+        assert_eq!(
+            m.memory.read_u16(data_addr as usize).unwrap(),
+            0xBEEF,
+            "the loop copied the direct-read word to the direct-write slot"
+        );
+        let perf = m.cpu.perf_counters();
+        assert!(
+            perf.direct_data_pointer_reads > 0,
+            "scalar RAM reads should use cached page pointers"
+        );
+        assert!(
+            perf.direct_data_pointer_writes > 0,
+            "scalar RAM writes should use cached page pointers"
+        );
+        assert!(
+            perf.fetch_page_hits > 0,
+            "instruction decode should hit the direct fetch page"
+        );
+        assert_eq!(
+            perf.slow_prefetch_refills, 0,
+            "RAM instruction fetch should not need copied prefetch refills"
+        );
     }
 
     #[test]
@@ -19257,6 +19584,7 @@ mod tests {
             cache: &mut machine.cache_model,
             io_touched: &mut machine.io_touched,
             device_wrote_memory: &mut machine.device_wrote_memory,
+            direct_map_changed: &mut machine.direct_map_changed,
         };
         f(&mut bus)
     }
@@ -19272,11 +19600,27 @@ mod tests {
         machine.memory.write_u8(RAM_ADDR as usize, 0x5a).unwrap();
 
         with_bus(&mut machine, |bus| {
+            assert!(
+                bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_some(),
+                "extended RAM starts direct"
+            );
             let config_addr = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x10;
             bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, config_addr)
                 .unwrap();
             bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_ADDR)
                 .unwrap();
+            assert!(
+                bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_none(),
+                "Distira BAR overlap removes the direct page"
+            );
+            assert!(
+                *bus.direct_map_changed,
+                "BAR relocation marks CPU direct caches stale"
+            );
             bus.write_memory(RAM_ADDR, BusWidth::Byte, 0xa5, BusAccessKind::DataWrite)
                 .unwrap();
         });
@@ -19285,6 +19629,135 @@ mod tests {
             machine.memory.read_u8(RAM_ADDR as usize).unwrap(),
             0x5a,
             "Distira BAR relocation must invalidate direct-RAM lookup entries"
+        );
+    }
+
+    #[test]
+    fn direct_memory_helpers_accept_only_page_local_ram() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+        machine.memory.write_u32(0x2000, 0x1234_5678).unwrap();
+
+        with_bus(&mut machine, |bus| {
+            let read_page = bus
+                .direct_page(0x2000, BusAccessKind::DataRead)
+                .unwrap()
+                .expect("ordinary RAM page is direct");
+            assert_eq!(read_page.physical_page, 0x2000);
+            assert_eq!(read_page.len, RAM_LOOKUP_PAGE_SIZE);
+            assert!(!read_page.ptr.is_null());
+            assert!(!read_page.writable, "read lookup is not a write grant");
+            assert!(
+                bus.direct_page(0x2000, BusAccessKind::DataWrite)
+                    .unwrap()
+                    .expect("ordinary RAM write page is direct")
+                    .writable,
+                "write lookup grants writes"
+            );
+            let ram = bus
+                .read_memory_direct(0x2000, BusWidth::Dword, BusAccessKind::DataRead)
+                .unwrap();
+            assert!(ram.direct, "ordinary RAM is direct");
+            assert_eq!(ram.value, 0x1234_5678);
+            assert!(
+                bus.write_memory_direct(
+                    0x2004,
+                    BusWidth::Dword,
+                    0xDEAD_BEEF,
+                    BusAccessKind::DataWrite
+                )
+                .unwrap()
+                .direct,
+                "ordinary RAM writes are direct"
+            );
+            assert_eq!(
+                bus.direct_memory_bytes(0x2ff0, 16, BusWidth::Byte),
+                16,
+                "same-page RAM span is direct"
+            );
+
+            assert_eq!(
+                bus.direct_memory_bytes(0x2fff, 2, BusWidth::Byte),
+                0,
+                "cross-page spans fall back"
+            );
+            assert_eq!(
+                bus.direct_memory_bytes(0x2001, 2, BusWidth::Word),
+                0,
+                "split word spans fall back"
+            );
+            assert!(
+                !bus.read_memory_direct(LOW_BIOS_BASE, BusWidth::Dword, BusAccessKind::DataRead)
+                    .unwrap()
+                    .direct,
+                "ROM falls back"
+            );
+            assert!(
+                bus.direct_page(LOW_BIOS_BASE, BusAccessKind::InstructionPrefetch)
+                    .unwrap()
+                    .is_none(),
+                "ROM has no direct page"
+            );
+            assert!(
+                !bus.write_memory_direct(
+                    VGA_TEXT_BASE,
+                    BusWidth::Byte,
+                    b'X'.into(),
+                    BusAccessKind::DataWrite
+                )
+                .unwrap()
+                .direct,
+                "VGA memory falls back"
+            );
+            assert!(
+                bus.direct_page(VGA_TEXT_BASE, BusAccessKind::DataWrite)
+                    .unwrap()
+                    .is_none(),
+                "VGA memory has no direct page"
+            );
+            assert_eq!(
+                bus.direct_memory_bytes(EMS_FRAME_DEFAULT_BASE, 4, BusWidth::Dword),
+                0,
+                "upper-memory/EMS frame area falls back"
+            );
+            assert!(
+                bus.direct_page(EMS_FRAME_DEFAULT_BASE, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_none(),
+                "EMS frame has no direct page"
+            );
+        });
+
+        machine.keyboard.set_a20(false);
+        with_bus(&mut machine, |bus| {
+            assert!(
+                !bus.read_memory_direct(0x10_0000, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap()
+                    .direct,
+                "A20-folded accesses fall back"
+            );
+            assert!(
+                bus.direct_page(0x10_0000, BusAccessKind::DataRead)
+                    .unwrap()
+                    .is_none(),
+                "A20-folded pages are not direct"
+            );
+        });
+    }
+
+    #[test]
+    fn ram_lookup_does_not_expose_partial_final_pages_as_full_pages() {
+        let pci = PciConfig::new(false);
+        let lookup = RamPageLookup::new(RAM_LOOKUP_PAGE_SIZE + 17, &pci);
+        assert!(lookup.direct_bytes(0, RAM_LOOKUP_PAGE_SIZE).is_some());
+        assert!(
+            lookup
+                .direct_bytes(RAM_LOOKUP_PAGE_SIZE as u32, RAM_LOOKUP_PAGE_SIZE)
+                .is_none(),
+            "a final partial page cannot back a full direct-page pointer"
         );
     }
 

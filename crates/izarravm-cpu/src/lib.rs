@@ -1,4 +1,4 @@
-use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
+use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus, DirectPage};
 use thiserror::Error;
 
 mod fpu;
@@ -475,6 +475,7 @@ impl CpuLevel {
 const TLB_ENTRIES: usize = 64;
 const PREFETCH_WINDOW_BYTES: usize = 32;
 const TRACKED_WRITE_PAGES: usize = 8;
+const DIRECT_PAGE_CACHE_LINES: usize = 64;
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -568,6 +569,83 @@ impl std::fmt::Debug for Tlb {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DirectPageCacheEntry {
+    physical_page: u32,
+    ptr: *mut u8,
+}
+
+impl Default for DirectPageCacheEntry {
+    fn default() -> Self {
+        Self {
+            physical_page: u32::MAX,
+            ptr: std::ptr::null_mut(),
+        }
+    }
+}
+
+struct DirectPageCache {
+    entries: [DirectPageCacheEntry; DIRECT_PAGE_CACHE_LINES],
+}
+
+impl Default for DirectPageCache {
+    fn default() -> Self {
+        Self {
+            entries: [DirectPageCacheEntry::default(); DIRECT_PAGE_CACHE_LINES],
+        }
+    }
+}
+
+impl DirectPageCache {
+    #[inline]
+    fn slot(page: u32) -> usize {
+        ((page >> 12) as usize) & (DIRECT_PAGE_CACHE_LINES - 1)
+    }
+
+    #[inline]
+    fn get(&self, physical: u32) -> Option<DirectPageCacheEntry> {
+        let page = physical & !0x0fff;
+        let entry = self.entries[Self::slot(page)];
+        if entry.physical_page == page {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, page: DirectPage) {
+        self.entries[Self::slot(page.physical_page)] = DirectPageCacheEntry {
+            physical_page: page.physical_page,
+            ptr: page.ptr,
+        };
+    }
+
+    #[inline]
+    fn invalidate(&mut self) {
+        self.entries.fill(DirectPageCacheEntry::default());
+    }
+}
+
+impl Clone for DirectPageCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for DirectPageCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for DirectPageCache {}
+
+impl std::fmt::Debug for DirectPageCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DirectPageCache")
+    }
+}
+
 #[derive(Clone, Default)]
 struct CodePageCache {
     valid: bool,
@@ -645,20 +723,109 @@ impl std::fmt::Debug for PrefetchWindow {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FetchPageCacheEntry {
+    valid: bool,
+    cs: SegmentRegister,
+    linear_page: u32,
+    physical_page: u32,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Default for FetchPageCacheEntry {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            cs: SegmentRegister::default(),
+            linear_page: 0,
+            physical_page: 0,
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct FetchPageCache {
+    entry: FetchPageCacheEntry,
+}
+
+impl FetchPageCache {
+    #[inline]
+    fn get(&self, cs: SegmentRegister, linear: u32) -> Option<(u8, u32)> {
+        let offset = (linear & 0x0fff) as usize;
+        let entry = self.entry;
+        if entry.valid
+            && entry.cs == cs
+            && entry.linear_page == (linear & !0x0fff)
+            && offset < entry.len
+        {
+            let value = unsafe { *entry.ptr.add(offset) };
+            Some((value, entry.physical_page + offset as u32))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn put(&mut self, cs: SegmentRegister, linear: u32, page: DirectPage) {
+        self.entry = FetchPageCacheEntry {
+            valid: true,
+            cs,
+            linear_page: linear & !0x0fff,
+            physical_page: page.physical_page,
+            ptr: page.ptr,
+            len: page.len,
+        };
+    }
+
+    fn invalidate(&mut self) {
+        self.entry.valid = false;
+    }
+}
+
+impl Clone for FetchPageCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for FetchPageCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for FetchPageCache {}
+
+impl std::fmt::Debug for FetchPageCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FetchPageCache")
+    }
+}
+
 /// A deferred ADD or SUB whose six arithmetic flags (CF/PF/AF/ZF/SF/OF) have not been computed yet.
 /// `a`/`b` are the width-masked operands, `result` the width-masked result, exactly as `alu_add`/
 /// `alu_sub` computed them. While this is `Some`, the six arithmetic-flag bits in `registers.eflags`
 /// are STALE; this descriptor is the source of truth for them. Control flags in `eflags` stay live.
-/// Only carry-free ADD and borrow-free SUB/CMP are representable: `b` is the raw second operand
-/// (NOT b+carry / b+borrow), so ADC/SBB with a non-zero carry/borrow must NOT be deferred until this
-/// struct gains a carry field.
+/// Carry-free ADD/SUB/CMP, CF-preserving INC/DEC, and logical ops are representable:
+/// `b` is the raw second operand (NOT b+carry / b+borrow), so ADC/SBB with a
+/// non-zero carry/borrow stay eager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LazyFlagOp {
+    Add,
+    Sub,
+    Logic,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LazyFlags {
     a: u32,
     b: u32,
     result: u32,
     width: BusWidth,
-    is_sub: bool,
+    op: LazyFlagOp,
+    cf_override: Option<bool>,
 }
 
 /// Host-side performance counters: pure diagnostics for `--headless-bench`, NOT
@@ -685,6 +852,22 @@ pub struct PerfCounters {
     pub brk_interrupt: u64, // an instruction made a maskable interrupt serviceable
     pub brk_cap: u64,  // the run reached the scaled-clock cap
     pub brk_halt: u64, // the run executed HLT
+    pub data_direct_reads: u64,
+    pub data_slow_reads: u64,
+    pub data_direct_writes: u64,
+    pub data_slow_writes: u64,
+    pub direct_page_hits: u64,
+    pub direct_page_misses: u64,
+    pub direct_data_pointer_reads: u64,
+    pub direct_data_pointer_writes: u64,
+    pub fetch_page_hits: u64,
+    pub fetch_page_misses: u64,
+    pub slow_prefetch_refills: u64,
+    pub direct_map_invalidations: u64,
+    pub rep_string_iterations: u64,
+    pub rep_string_fast_iterations: u64,
+    pub flag_materializations: u64,
+    pub cache_tier_lookups: u64,
 }
 
 impl PartialEq for PerfCounters {
@@ -729,6 +912,9 @@ pub struct Cpu386 {
     tlb: Tlb,
     code_page: CodePageCache,
     prefetch: PrefetchWindow,
+    data_read_pages: DirectPageCache,
+    data_write_pages: DirectPageCache,
+    fetch_page: FetchPageCache,
     written_pages: [Option<u32>; TRACKED_WRITE_PAGES],
     written_pages_overflow: bool,
     // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
@@ -815,6 +1001,12 @@ enum StringOp {
     Lods,
     Ins,
     Outs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FastStringResult {
+    iterations: u32,
+    stop: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1313,24 +1505,31 @@ impl Cpu386 {
         };
         let mask = width_mask(p.width);
         let sign = width_sign(p.width);
-        let (cf, of, af) = if p.is_sub {
-            (
+        let (cf, of, af, clear) = match p.op {
+            LazyFlagOp::Sub => (
                 u64::from(p.a) < u64::from(p.b),
                 ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
                 ((p.a ^ p.b ^ p.result) & 0x10) != 0,
-            )
-        } else {
-            (
+                FLAG_CF | FLAG_OF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_PF,
+            ),
+            LazyFlagOp::Add => (
                 u64::from(p.a) + u64::from(p.b) > u64::from(mask),
                 ((p.a ^ p.result) & (p.b ^ p.result) & sign) != 0,
                 ((p.a ^ p.b ^ p.result) & 0x10) != 0,
-            )
+                FLAG_CF | FLAG_OF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_PF,
+            ),
+            LazyFlagOp::Logic => (
+                false,
+                false,
+                self.registers.eflags & FLAG_AF != 0,
+                FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF | FLAG_PF,
+            ),
         };
+        let cf = p.cf_override.unwrap_or(cf);
         let zf = p.result & mask == 0;
         let sf = p.result & sign != 0;
         let pf = parity(p.result as u8);
-        let mut e =
-            self.registers.eflags & !(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_PF);
+        let mut e = self.registers.eflags & !clear;
         if cf {
             e |= FLAG_CF;
         }
@@ -1357,6 +1556,7 @@ impl Cpu386 {
         if self.pending_flags.is_some() {
             self.registers.eflags = self.materialized_eflags();
             self.pending_flags = None;
+            self.perf.flag_materializations += 1;
         }
     }
 
@@ -1370,10 +1570,17 @@ impl Cpu386 {
     fn invalidate_code_caches(&mut self) {
         self.code_page.valid = false;
         self.prefetch.invalidate();
+        self.fetch_page.invalidate();
         // Every CS-base change (CS load) and paging remap (via flush_tlb_and_code_caches) routes
         // through here, so this is the structural hook for the decode cache too: a remap can make
         // the same linear address decode differently (D-bit aliasing, page remap), so invalidate.
         self.decode_cache.invalidate();
+    }
+
+    fn invalidate_direct_pages(&mut self) {
+        self.data_read_pages.invalidate();
+        self.data_write_pages.invalidate();
+        self.fetch_page.invalidate();
     }
 
     fn flush_tlb_and_code_caches(&mut self) {
@@ -1404,6 +1611,13 @@ impl Cpu386 {
     /// bytes) would otherwise replay stale content, so invalidate both. Rare; a coarse flush is fine.
     pub fn note_a20_changed(&mut self) {
         self.invalidate_code_caches();
+        self.invalidate_direct_pages();
+    }
+
+    pub fn note_direct_map_changed(&mut self) {
+        self.invalidate_code_caches();
+        self.invalidate_direct_pages();
+        self.perf.direct_map_invalidations += 1;
     }
 
     /// The decode cache's current generation. Advances on every cache invalidation (CS/paging/mode
@@ -1431,6 +1645,7 @@ impl Cpu386 {
     fn note_code_write(&mut self, physical: u32, width: u32) {
         if self.decode_cache.range_hits_code(physical, width) {
             self.decode_cache.invalidate();
+            self.fetch_page.invalidate();
         }
     }
 
@@ -1516,6 +1731,157 @@ impl Cpu386 {
     /// Zero the host-side performance counters.
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
+    }
+
+    #[inline]
+    fn record_data_read(&mut self, kind: BusAccessKind, direct: bool) {
+        if kind == BusAccessKind::DataRead {
+            if direct {
+                self.perf.data_direct_reads += 1;
+            } else {
+                self.perf.data_slow_reads += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn record_data_write(&mut self, kind: BusAccessKind, direct: bool) {
+        if kind == BusAccessKind::DataWrite {
+            if direct {
+                self.perf.data_direct_writes += 1;
+            } else {
+                self.perf.data_slow_writes += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn read_direct_entry(entry: DirectPageCacheEntry, physical: u32, width: BusWidth) -> u32 {
+        let offset = (physical & 0x0fff) as usize;
+        let ptr = unsafe { entry.ptr.add(offset) };
+        match width {
+            BusWidth::Byte => unsafe { u32::from(*ptr) },
+            BusWidth::Word => unsafe {
+                u32::from(u16::from_le(std::ptr::read_unaligned(ptr.cast::<u16>())))
+            },
+            BusWidth::Dword => unsafe { u32::from_le(std::ptr::read_unaligned(ptr.cast::<u32>())) },
+        }
+    }
+
+    #[inline]
+    fn write_direct_entry(entry: DirectPageCacheEntry, physical: u32, width: BusWidth, value: u32) {
+        let offset = (physical & 0x0fff) as usize;
+        let ptr = unsafe { entry.ptr.add(offset) };
+        match width {
+            BusWidth::Byte => unsafe {
+                *ptr = value as u8;
+            },
+            BusWidth::Word => unsafe {
+                std::ptr::write_unaligned(ptr.cast::<u16>(), (value as u16).to_le());
+            },
+            BusWidth::Dword => unsafe {
+                std::ptr::write_unaligned(ptr.cast::<u32>(), value.to_le());
+            },
+        }
+    }
+
+    #[inline]
+    fn direct_access_page_local(physical: u32, width: BusWidth) -> bool {
+        let offset = (physical & 0x0fff) as usize;
+        if offset + width.bytes() as usize > 0x1000 {
+            return false;
+        }
+        match width {
+            BusWidth::Byte => true,
+            BusWidth::Word => physical & 1 == 0,
+            BusWidth::Dword => physical & 3 == 0,
+        }
+    }
+
+    #[inline]
+    fn read_direct_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u32>> {
+        if !Self::direct_access_page_local(physical, width) {
+            return Ok(None);
+        }
+        if let Some(entry) = self.data_read_pages.get(physical) {
+            bus.charge_direct_memory(physical, width, kind)?;
+            self.record_data_read(kind, true);
+            self.perf.direct_data_pointer_reads += 1;
+            return Ok(Some(Self::read_direct_entry(entry, physical, width)));
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if offset + width.bytes() as usize > page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_read_pages.insert(page);
+        bus.charge_direct_memory(physical, width, kind)?;
+        self.record_data_read(kind, true);
+        self.perf.direct_data_pointer_reads += 1;
+        Ok(Some(Self::read_direct_entry(
+            DirectPageCacheEntry {
+                physical_page: page.physical_page,
+                ptr: page.ptr,
+            },
+            physical,
+            width,
+        )))
+    }
+
+    #[inline]
+    fn write_direct_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<bool> {
+        if !Self::direct_access_page_local(physical, width) {
+            return Ok(false);
+        }
+        if let Some(entry) = self.data_write_pages.get(physical) {
+            bus.charge_direct_memory(physical, width, kind)?;
+            Self::write_direct_entry(entry, physical, width, value);
+            self.record_data_write(kind, true);
+            self.perf.direct_data_pointer_writes += 1;
+            return Ok(true);
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if !page.writable || offset + width.bytes() as usize > page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_write_pages.insert(page);
+        bus.charge_direct_memory(physical, width, kind)?;
+        Self::write_direct_entry(
+            DirectPageCacheEntry {
+                physical_page: page.physical_page,
+                ptr: page.ptr,
+            },
+            physical,
+            width,
+            value,
+        );
+        self.record_data_write(kind, true);
+        self.perf.direct_data_pointer_writes += 1;
+        Ok(true)
     }
 
     pub fn is_paging_enabled(&self) -> bool {
@@ -4907,6 +5273,7 @@ impl Cpu386 {
         if len == 0 {
             return Err(BusError::UnmappedMemory { address: physical }.into());
         }
+        self.perf.slow_prefetch_refills += 1;
         self.prefetch.bytes[..len].copy_from_slice(&bytes[..len]);
         self.prefetch.cs = cs;
         self.prefetch.linear_base = linear;
@@ -4919,9 +5286,32 @@ impl Cpu386 {
         let offset = self.registers.eip;
         let cs = self.registers.cs();
         let linear = self.code_linear_for_offset(offset, 1)?;
-        if self.prefetch.get(cs, linear).is_none() {
-            self.refill_prefetch(bus, offset, linear)?;
+        if let Some((value, physical)) = self.fetch_page.get(cs, linear) {
+            self.perf.fetch_page_hits += 1;
+            bus.charge_instruction_fetch(physical)?;
+            self.registers.eip = self.registers.eip.wrapping_add(1);
+            return Ok(value);
         }
+        self.perf.fetch_page_misses += 1;
+        if let Some((value, physical)) = self.prefetch.get(cs, linear) {
+            bus.charge_instruction_fetch(physical)?;
+            self.registers.eip = self.registers.eip.wrapping_add(1);
+            return Ok(value);
+        }
+        let physical = self.translate_code_linear(bus, linear)?;
+        if let Some(page) = bus.direct_page(physical, BusAccessKind::InstructionPrefetch)? {
+            self.perf.direct_page_hits += 1;
+            self.fetch_page.put(cs, linear, page);
+            let (value, physical) = self
+                .fetch_page
+                .get(cs, linear)
+                .expect("fetch page refilled");
+            bus.charge_instruction_fetch(physical)?;
+            self.registers.eip = self.registers.eip.wrapping_add(1);
+            return Ok(value);
+        }
+        self.perf.direct_page_misses += 1;
+        self.refill_prefetch(bus, offset, linear)?;
         let (value, physical) = self.prefetch.get(cs, linear).expect("prefetch refilled");
         bus.charge_instruction_fetch(physical)?;
         self.registers.eip = self.registers.eip.wrapping_add(1);
@@ -5224,7 +5614,12 @@ impl Cpu386 {
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
         let physical = self.translate_segmented(bus, segment, offset, 1, false)?;
-        Ok(bus.read_memory(physical, BusWidth::Byte, kind)? as u8)
+        if let Some(value) = self.read_direct_page_cached(bus, physical, BusWidth::Byte, kind)? {
+            return Ok(value as u8);
+        }
+        let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
+        self.record_data_read(kind, read.direct);
+        Ok(read.value as u8)
     }
 
     fn write_memory_u8<B: CpuBus>(
@@ -5236,7 +5631,11 @@ impl Cpu386 {
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         let physical = self.translate_segmented(bus, segment, offset, 1, true)?;
-        bus.write_memory(physical, BusWidth::Byte, u32::from(value), kind)?;
+        if self.write_direct_page_cached(bus, physical, BusWidth::Byte, u32::from(value), kind)? {
+            return Ok(());
+        }
+        let write = bus.write_memory_direct(physical, BusWidth::Byte, u32::from(value), kind)?;
+        self.record_data_write(kind, write.direct);
         Ok(())
     }
 
@@ -5250,7 +5649,12 @@ impl Cpu386 {
     ) -> ExecResult<u32> {
         self.check_alignment(offset, size.bytes())?;
         let physical = self.translate_segmented(bus, segment, offset, size.bytes(), false)?;
-        Ok(bus.read_memory(physical, size.bus_width(), kind)?)
+        if let Some(value) = self.read_direct_page_cached(bus, physical, size.bus_width(), kind)? {
+            return Ok(value);
+        }
+        let read = bus.read_memory_direct(physical, size.bus_width(), kind)?;
+        self.record_data_read(kind, read.direct);
+        Ok(read.value)
     }
 
     fn write_memory_sized<B: CpuBus>(
@@ -5264,7 +5668,11 @@ impl Cpu386 {
     ) -> ExecResult<()> {
         self.check_alignment(offset, size.bytes())?;
         let physical = self.translate_segmented(bus, segment, offset, size.bytes(), true)?;
-        bus.write_memory(physical, size.bus_width(), value, kind)?;
+        if self.write_direct_page_cached(bus, physical, size.bus_width(), value, kind)? {
+            return Ok(());
+        }
+        let write = bus.write_memory_direct(physical, size.bus_width(), value, kind)?;
+        self.record_data_write(kind, write.direct);
         Ok(())
     }
 
@@ -5566,13 +5974,17 @@ impl Cpu386 {
     }
 
     fn decrement_string_count(&mut self, address_size: AddressSize) {
+        self.decrement_string_count_by(address_size, 1);
+    }
+
+    fn decrement_string_count_by(&mut self, address_size: AddressSize, amount: u32) {
         match address_size {
             AddressSize::Word => {
-                let cx = self.read_gpr16(1).wrapping_sub(1);
+                let cx = self.read_gpr16(1).wrapping_sub(amount as u16);
                 self.write_gpr16(1, cx);
             }
             AddressSize::Dword => {
-                let ecx = self.read_gpr32(1).wrapping_sub(1);
+                let ecx = self.read_gpr32(1).wrapping_sub(amount);
                 self.write_gpr32(1, ecx);
             }
         }
@@ -5588,7 +6000,14 @@ impl Cpu386 {
         let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
         let offset = self.index_offset(6, address_size); // SI / ESI
         let physical = self.translate_segmented(bus, segment, offset, width.bytes(), false)?;
-        Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
+        if let Some(value) =
+            self.read_direct_page_cached(bus, physical, width, BusAccessKind::DataRead)?
+        {
+            return Ok(value);
+        }
+        let read = bus.read_memory_direct(physical, width, BusAccessKind::DataRead)?;
+        self.record_data_read(BusAccessKind::DataRead, read.direct);
+        Ok(read.value)
     }
 
     fn read_string_dst<B: CpuBus>(
@@ -5600,7 +6019,14 @@ impl Cpu386 {
         let offset = self.index_offset(7, address_size); // DI / EDI
         let physical =
             self.translate_segmented(bus, SegmentIndex::Es, offset, width.bytes(), false)?;
-        Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
+        if let Some(value) =
+            self.read_direct_page_cached(bus, physical, width, BusAccessKind::DataRead)?
+        {
+            return Ok(value);
+        }
+        let read = bus.read_memory_direct(physical, width, BusAccessKind::DataRead)?;
+        self.record_data_read(BusAccessKind::DataRead, read.direct);
+        Ok(read.value)
     }
 
     fn acc_read(&self, width: BusWidth) -> u32 {
@@ -5629,8 +6055,76 @@ impl Cpu386 {
         let offset = self.index_offset(7, address_size); // DI / EDI
         let physical =
             self.translate_segmented(bus, SegmentIndex::Es, offset, width.bytes(), true)?;
-        bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
+        if self.write_direct_page_cached(bus, physical, width, value, BusAccessKind::DataWrite)? {
+            return Ok(());
+        }
+        let write = bus.write_memory_direct(physical, width, value, BusAccessKind::DataWrite)?;
+        self.record_data_write(BusAccessKind::DataWrite, write.direct);
         Ok(())
+    }
+
+    fn segment_linear_unchecked(&self, segment: SegmentIndex, offset: u32) -> u32 {
+        self.registers.segment(segment).base.wrapping_add(offset)
+    }
+
+    fn string_forward_chunk_iterations(
+        &self,
+        segment: SegmentIndex,
+        offset: u32,
+        address_size: AddressSize,
+        width: BusWidth,
+        count: u32,
+    ) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let bytes = width.bytes() as usize;
+        let mut max_bytes = count as usize * bytes;
+        let address_remaining = match address_size {
+            AddressSize::Word => 0x1_0000usize - (offset as usize & 0xffff),
+            AddressSize::Dword => (u32::MAX - offset) as usize + 1,
+        };
+        max_bytes = max_bytes.min(address_remaining);
+
+        let descriptor = self.registers.segment(segment);
+        if descriptor.base != 0 || descriptor.limit != u32::MAX {
+            if offset > descriptor.limit {
+                return 0;
+            }
+            max_bytes = max_bytes.min((descriptor.limit - offset) as usize + 1);
+        }
+
+        let linear = descriptor.base.wrapping_add(offset);
+        max_bytes = max_bytes.min(0x1000 - (linear as usize & 0x0fff));
+        (max_bytes / bytes).min(count as usize) as u32
+    }
+
+    fn read_direct_string_value<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+    ) -> Result<Option<u32>, BusError> {
+        if bus.direct_memory_bytes(physical, width.bytes() as usize, width)
+            != width.bytes() as usize
+        {
+            return Ok(None);
+        }
+        let read = bus.read_memory_direct(physical, width, BusAccessKind::DataRead)?;
+        self.record_data_read(BusAccessKind::DataRead, read.direct);
+        if read.direct {
+            Ok(Some(read.value))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn ranges_overlap(a: u32, b: u32, bytes: usize) -> bool {
+        let a = a as usize;
+        let b = b as usize;
+        let a_end = a.saturating_add(bytes);
+        let b_end = b.saturating_add(bytes);
+        a < b_end && b < a_end
     }
 
     fn string_step<B: CpuBus>(
@@ -5688,6 +6182,265 @@ impl Cpu386 {
         Ok(())
     }
 
+    fn try_run_string_fast<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        op: StringOp,
+        width: BusWidth,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        rep: RepKind,
+    ) -> ExecResult<Option<FastStringResult>> {
+        if self.flag(FLAG_DF) || self.is_paging_enabled() {
+            return Ok(None);
+        }
+
+        let count = self.string_count(address_size);
+        if count == 0 {
+            return Ok(Some(FastStringResult {
+                iterations: 0,
+                stop: false,
+            }));
+        }
+
+        let access = width.bytes() as usize;
+        match op {
+            StringOp::Movs => {
+                let src_segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+                let src_off = self.index_offset(6, address_size);
+                let dst_off = self.index_offset(7, address_size);
+                let iterations = self
+                    .string_forward_chunk_iterations(
+                        src_segment,
+                        src_off,
+                        address_size,
+                        width,
+                        count,
+                    )
+                    .min(self.string_forward_chunk_iterations(
+                        SegmentIndex::Es,
+                        dst_off,
+                        address_size,
+                        width,
+                        count,
+                    ));
+                if iterations == 0 {
+                    return Ok(None);
+                }
+                let bytes = iterations as usize * access;
+                let src = self.segment_linear_unchecked(src_segment, src_off);
+                let dst = self.segment_linear_unchecked(SegmentIndex::Es, dst_off);
+                if Self::ranges_overlap(src, dst, bytes)
+                    || bus.direct_memory_bytes(src, bytes, width) != bytes
+                    || bus.direct_memory_bytes(dst, bytes, width) != bytes
+                {
+                    return Ok(None);
+                }
+
+                let mut buf = [0u8; 4096];
+                let got = bus.read_memory_bytes_direct(
+                    src,
+                    &mut buf[..bytes],
+                    width,
+                    BusAccessKind::DataRead,
+                )?;
+                if got != bytes {
+                    return Ok(None);
+                }
+                let put = bus.write_memory_bytes_direct(
+                    dst,
+                    &buf[..bytes],
+                    width,
+                    BusAccessKind::DataWrite,
+                )?;
+                if put != bytes {
+                    return Ok(None);
+                }
+                self.note_code_write(dst, bytes as u32);
+                self.record_write_page(dst);
+                self.adjust_index_register(6, address_size, bytes as u32);
+                self.adjust_index_register(7, address_size, bytes as u32);
+                self.decrement_string_count_by(address_size, iterations);
+                self.perf.data_direct_reads += u64::from(iterations);
+                self.perf.data_direct_writes += u64::from(iterations);
+                Ok(Some(FastStringResult {
+                    iterations,
+                    stop: false,
+                }))
+            }
+            StringOp::Stos => {
+                let dst_off = self.index_offset(7, address_size);
+                let iterations = self.string_forward_chunk_iterations(
+                    SegmentIndex::Es,
+                    dst_off,
+                    address_size,
+                    width,
+                    count,
+                );
+                if iterations == 0 {
+                    return Ok(None);
+                }
+                let bytes = iterations as usize * access;
+                let dst = self.segment_linear_unchecked(SegmentIndex::Es, dst_off);
+                if bus.direct_memory_bytes(dst, bytes, width) != bytes {
+                    return Ok(None);
+                }
+
+                let value = self.acc_read(width);
+                let mut pattern = [0u8; 4];
+                match width {
+                    BusWidth::Byte => pattern[0] = value as u8,
+                    BusWidth::Word => pattern[..2].copy_from_slice(&(value as u16).to_le_bytes()),
+                    BusWidth::Dword => pattern.copy_from_slice(&value.to_le_bytes()),
+                }
+                let mut buf = [0u8; 4096];
+                for chunk in buf[..bytes].chunks_mut(access) {
+                    chunk.copy_from_slice(&pattern[..access]);
+                }
+                let put = bus.write_memory_bytes_direct(
+                    dst,
+                    &buf[..bytes],
+                    width,
+                    BusAccessKind::DataWrite,
+                )?;
+                if put != bytes {
+                    return Ok(None);
+                }
+                self.note_code_write(dst, bytes as u32);
+                self.record_write_page(dst);
+                self.adjust_index_register(7, address_size, bytes as u32);
+                self.decrement_string_count_by(address_size, iterations);
+                self.perf.data_direct_writes += u64::from(iterations);
+                Ok(Some(FastStringResult {
+                    iterations,
+                    stop: false,
+                }))
+            }
+            StringOp::Lods => {
+                let src_segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+                let src_off = self.index_offset(6, address_size);
+                let iterations = self.string_forward_chunk_iterations(
+                    src_segment,
+                    src_off,
+                    address_size,
+                    width,
+                    count,
+                );
+                if iterations == 0 {
+                    return Ok(None);
+                }
+                let bytes = iterations as usize * access;
+                let src = self.segment_linear_unchecked(src_segment, src_off);
+                if bus.direct_memory_bytes(src, bytes, width) != bytes {
+                    return Ok(None);
+                }
+
+                let mut buf = [0u8; 4096];
+                let got = bus.read_memory_bytes_direct(
+                    src,
+                    &mut buf[..bytes],
+                    width,
+                    BusAccessKind::DataRead,
+                )?;
+                if got != bytes {
+                    return Ok(None);
+                }
+                let last = &buf[bytes - access..bytes];
+                let value = match width {
+                    BusWidth::Byte => u32::from(last[0]),
+                    BusWidth::Word => u32::from(u16::from_le_bytes([last[0], last[1]])),
+                    BusWidth::Dword => u32::from_le_bytes([last[0], last[1], last[2], last[3]]),
+                };
+                self.acc_write(width, value);
+                self.adjust_index_register(6, address_size, bytes as u32);
+                self.decrement_string_count_by(address_size, iterations);
+                self.perf.data_direct_reads += u64::from(iterations);
+                Ok(Some(FastStringResult {
+                    iterations,
+                    stop: false,
+                }))
+            }
+            StringOp::Cmps => {
+                let src_segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+                let src_off = self.index_offset(6, address_size);
+                let dst_off = self.index_offset(7, address_size);
+                if self.string_forward_chunk_iterations(
+                    src_segment,
+                    src_off,
+                    address_size,
+                    width,
+                    1,
+                ) == 0
+                    || self.string_forward_chunk_iterations(
+                        SegmentIndex::Es,
+                        dst_off,
+                        address_size,
+                        width,
+                        1,
+                    ) == 0
+                {
+                    return Ok(None);
+                }
+                let src = self.segment_linear_unchecked(src_segment, src_off);
+                let dst = self.segment_linear_unchecked(SegmentIndex::Es, dst_off);
+                if bus.direct_memory_bytes(src, access, width) != access
+                    || bus.direct_memory_bytes(dst, access, width) != access
+                {
+                    return Ok(None);
+                }
+                let Some(a) = self.read_direct_string_value(bus, src, width)? else {
+                    return Ok(None);
+                };
+                let Some(b) = self.read_direct_string_value(bus, dst, width)? else {
+                    return Ok(None);
+                };
+                self.alu_sub(a, b, 0, width);
+                self.adjust_index_register(6, address_size, width.bytes());
+                self.adjust_index_register(7, address_size, width.bytes());
+                self.decrement_string_count(address_size);
+                let zf = self.flag(FLAG_ZF);
+                let stop = match rep {
+                    RepKind::Repe => !zf,
+                    RepKind::Repne => zf,
+                };
+                Ok(Some(FastStringResult {
+                    iterations: 1,
+                    stop,
+                }))
+            }
+            StringOp::Scas => {
+                let dst_off = self.index_offset(7, address_size);
+                if self.string_forward_chunk_iterations(
+                    SegmentIndex::Es,
+                    dst_off,
+                    address_size,
+                    width,
+                    1,
+                ) == 0
+                {
+                    return Ok(None);
+                }
+                let dst = self.segment_linear_unchecked(SegmentIndex::Es, dst_off);
+                let Some(b) = self.read_direct_string_value(bus, dst, width)? else {
+                    return Ok(None);
+                };
+                self.alu_sub(self.acc_read(width), b, 0, width);
+                self.adjust_index_register(7, address_size, width.bytes());
+                self.decrement_string_count(address_size);
+                let zf = self.flag(FLAG_ZF);
+                let stop = match rep {
+                    RepKind::Repe => !zf,
+                    RepKind::Repne => zf,
+                };
+                Ok(Some(FastStringResult {
+                    iterations: 1,
+                    stop,
+                }))
+            }
+            StringOp::Ins | StringOp::Outs => Ok(None),
+        }
+    }
+
     fn run_string<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -5702,7 +6455,18 @@ impl Cpu386 {
                 if self.string_count(address_size) == 0 {
                     break;
                 }
+                if let Some(fast) =
+                    self.try_run_string_fast(bus, op, width, prefixes, address_size, kind)?
+                {
+                    self.perf.rep_string_iterations += u64::from(fast.iterations);
+                    self.perf.rep_string_fast_iterations += u64::from(fast.iterations);
+                    if fast.stop {
+                        break;
+                    }
+                    continue;
+                }
                 self.string_step(bus, op, width, prefixes, address_size)?;
+                self.perf.rep_string_iterations += 1;
                 self.decrement_string_count(address_size);
                 // CMPS/SCAS also end the repeat on the ZF condition. REPE continues while
                 // ZF is set; REPNE continues while ZF is clear. MOVS/STOS/LODS ignore ZF.
@@ -6536,10 +7300,21 @@ impl Cpu386 {
             FLAG_ZF => p.result & mask == 0,
             FLAG_SF => p.result & sign != 0,
             FLAG_PF => parity(p.result as u8),
+            FLAG_AF if p.op == LazyFlagOp::Logic => self.registers.eflags & FLAG_AF != 0,
             FLAG_AF => ((p.a ^ p.b ^ p.result) & 0x10) != 0,
-            FLAG_CF if p.is_sub => u64::from(p.a) < u64::from(p.b),
-            FLAG_CF => u64::from(p.a) + u64::from(p.b) > u64::from(mask),
-            FLAG_OF if p.is_sub => ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
+            FLAG_CF => {
+                if let Some(cf) = p.cf_override {
+                    cf
+                } else if p.op == LazyFlagOp::Logic {
+                    false
+                } else if p.op == LazyFlagOp::Sub {
+                    u64::from(p.a) < u64::from(p.b)
+                } else {
+                    u64::from(p.a) + u64::from(p.b) > u64::from(mask)
+                }
+            }
+            FLAG_OF if p.op == LazyFlagOp::Logic => false,
+            FLAG_OF if p.op == LazyFlagOp::Sub => ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
             FLAG_OF => ((p.a ^ p.result) & (p.b ^ p.result) & sign) != 0,
             _ => self.registers.eflags & flag != 0, // unreachable under flag()'s guard; defensive
         }
@@ -6566,21 +7341,15 @@ impl Cpu386 {
             5 | 7 => self.alu_sub(a, b, 0, width),
             1 => {
                 let result = (a | b) & mask;
-                self.set_flag(FLAG_CF | FLAG_OF, false);
-                self.set_szp(result, width);
-                result
+                self.alu_logic(result, width)
             }
             4 => {
                 let result = (a & b) & mask;
-                self.set_flag(FLAG_CF | FLAG_OF, false);
-                self.set_szp(result, width);
-                result
+                self.alu_logic(result, width)
             }
             6 => {
                 let result = (a ^ b) & mask;
-                self.set_flag(FLAG_CF | FLAG_OF, false);
-                self.set_szp(result, width);
-                result
+                self.alu_logic(result, width)
             }
             _ => unreachable!("alu op {op}"),
         }
@@ -6733,7 +7502,11 @@ impl Cpu386 {
         } else {
             self.alu_add(value, 1, 0, width)
         };
-        self.set_flag(FLAG_CF, carry);
+        if let Some(p) = &mut self.pending_flags {
+            p.cf_override = Some(carry);
+        } else {
+            self.set_flag(FLAG_CF, carry);
+        }
         result
     }
 
@@ -6764,7 +7537,8 @@ impl Cpu386 {
             b,
             result,
             width,
-            is_sub: false,
+            op: LazyFlagOp::Add,
+            cf_override: None,
         });
         result
     }
@@ -6796,7 +7570,28 @@ impl Cpu386 {
             b,
             result,
             width,
-            is_sub: true,
+            op: LazyFlagOp::Sub,
+            cf_override: None,
+        });
+        result
+    }
+
+    fn alu_logic(&mut self, result: u32, width: BusWidth) -> u32 {
+        let result = result & width_mask(width);
+        let af = self.flag(FLAG_AF);
+        if af {
+            self.registers.eflags |= FLAG_AF;
+        } else {
+            self.registers.eflags &= !FLAG_AF;
+        }
+        self.registers.eflags |= 0x2;
+        self.pending_flags = Some(LazyFlags {
+            a: 0,
+            b: 0,
+            result,
+            width,
+            op: LazyFlagOp::Logic,
+            cf_override: None,
         });
         result
     }
@@ -9101,6 +9896,7 @@ impl Cpu386 {
 mod tests {
     use super::*;
     use izarravm_bus::{BusCycle, BusTrace, BusWidth};
+    use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
 
     #[test]
     fn scale_clocks_batches_exactly() {
@@ -9216,6 +10012,106 @@ mod tests {
                 }
             }
             Ok(())
+        }
+
+        fn read_memory_direct(
+            &mut self,
+            address: u32,
+            width: BusWidth,
+            kind: BusAccessKind,
+        ) -> Result<DirectMemoryRead, BusError> {
+            if self.direct_memory_bytes(address, width.bytes() as usize, width)
+                == width.bytes() as usize
+            {
+                return self
+                    .read_memory(address, width, kind)
+                    .map(|value| DirectMemoryRead {
+                        value,
+                        direct: true,
+                    });
+            }
+            self.read_memory(address, width, kind)
+                .map(|value| DirectMemoryRead {
+                    value,
+                    direct: false,
+                })
+        }
+
+        fn write_memory_direct(
+            &mut self,
+            address: u32,
+            width: BusWidth,
+            value: u32,
+            kind: BusAccessKind,
+        ) -> Result<DirectMemoryWrite, BusError> {
+            if self.direct_memory_bytes(address, width.bytes() as usize, width)
+                == width.bytes() as usize
+            {
+                self.write_memory(address, width, value, kind)?;
+                return Ok(DirectMemoryWrite { direct: true });
+            }
+            self.write_memory(address, width, value, kind)?;
+            Ok(DirectMemoryWrite { direct: false })
+        }
+
+        fn read_memory_bytes_direct(
+            &mut self,
+            address: u32,
+            out: &mut [u8],
+            width: BusWidth,
+            kind: BusAccessKind,
+        ) -> Result<usize, BusError> {
+            if self.direct_memory_bytes(address, out.len(), width) != out.len() {
+                return Ok(0);
+            }
+            let access = width.bytes() as usize;
+            for offset in (0..out.len()).step_by(access) {
+                self.trace
+                    .push(BusCycle::new(kind, address + offset as u32, width, 0));
+            }
+            let start = address as usize;
+            out.copy_from_slice(&self.memory[start..start + out.len()]);
+            Ok(out.len())
+        }
+
+        fn write_memory_bytes_direct(
+            &mut self,
+            address: u32,
+            data: &[u8],
+            width: BusWidth,
+            kind: BusAccessKind,
+        ) -> Result<usize, BusError> {
+            if self.direct_memory_bytes(address, data.len(), width) != data.len() {
+                return Ok(0);
+            }
+            let access = width.bytes() as usize;
+            for offset in (0..data.len()).step_by(access) {
+                self.trace
+                    .push(BusCycle::new(kind, address + offset as u32, width, 0));
+            }
+            let start = address as usize;
+            self.memory[start..start + data.len()].copy_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn direct_memory_bytes(&self, address: u32, bytes: usize, width: BusWidth) -> usize {
+            if bytes == 0 || (address as usize & 0x0fff) + bytes > 0x1000 {
+                return 0;
+            }
+            if matches!(width, BusWidth::Word) && address & 1 != 0
+                || matches!(width, BusWidth::Dword) && address & 3 != 0
+            {
+                return 0;
+            }
+            let start = address as usize;
+            if start
+                .checked_add(bytes)
+                .is_some_and(|end| end <= self.memory.len())
+            {
+                bytes
+            } else {
+                0
+            }
         }
 
         fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
@@ -10900,6 +11796,34 @@ mod tests {
         assert_eq!(cpu.registers.esi(), 0x103);
         assert_eq!(cpu.registers.edi(), 0x203);
         assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.perf_counters().rep_string_iterations, 3);
+        assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 3);
+    }
+
+    #[test]
+    fn rep_movsb_df_set_uses_correct_slow_path() {
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xf3, 0xa4]);
+        memory[0x100..0x104].copy_from_slice(&[1, 2, 3, 4]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, true);
+        cpu.registers.set_esi(0x103);
+        cpu.registers.set_edi(0x203);
+        cpu.registers.set_ecx(4);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(&bus.memory[0x200..0x204], &[1, 2, 3, 4]);
+        assert_eq!(cpu.registers.esi(), 0x0ff);
+        assert_eq!(cpu.registers.edi(), 0x1ff);
+        assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.perf_counters().rep_string_iterations, 4);
+        assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 0);
     }
 
     #[test]
@@ -10995,6 +11919,92 @@ mod tests {
         assert!(cpu.flag(FLAG_ZF));
         assert_eq!(cpu.registers.edi(), 0x201);
         assert_eq!(cpu.registers.esi(), 0x100); // SCAS does not touch SI
+    }
+
+    #[test]
+    fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
+        let memory = vec![0; 2048];
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.write_gpr8(0, 0x7e);
+        cpu.registers.set_edi(0x300);
+        cpu.registers.set_ecx(4);
+        cpu.run_string(
+            &mut bus,
+            StringOp::Stos,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repe),
+                ..Default::default()
+            },
+            AddressSize::Word,
+        )
+        .unwrap();
+        assert_eq!(&bus.memory[0x300..0x304], &[0x7e; 4]);
+        assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 4);
+
+        cpu.reset_perf_counters();
+        bus.memory[0x400..0x403].copy_from_slice(&[1, 2, 3]);
+        cpu.registers.set_esi(0x400);
+        cpu.registers.set_ecx(3);
+        cpu.run_string(
+            &mut bus,
+            StringOp::Lods,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repe),
+                ..Default::default()
+            },
+            AddressSize::Word,
+        )
+        .unwrap();
+        assert_eq!(cpu.read_gpr8(0), 3);
+        assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 3);
+
+        cpu.reset_perf_counters();
+        bus.memory[0x500..0x503].copy_from_slice(&[1, 2, 9]);
+        bus.memory[0x600..0x603].copy_from_slice(&[1, 2, 3]);
+        cpu.registers.set_esi(0x500);
+        cpu.registers.set_edi(0x600);
+        cpu.registers.set_ecx(3);
+        cpu.run_string(
+            &mut bus,
+            StringOp::Cmps,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repe),
+                ..Default::default()
+            },
+            AddressSize::Word,
+        )
+        .unwrap();
+        assert!(!cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 3);
+
+        cpu.reset_perf_counters();
+        bus.memory[0x700..0x703].copy_from_slice(&[1, 2, 3]);
+        cpu.write_gpr8(0, 2);
+        cpu.registers.set_edi(0x700);
+        cpu.registers.set_ecx(3);
+        cpu.run_string(
+            &mut bus,
+            StringOp::Scas,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repne),
+                ..Default::default()
+            },
+            AddressSize::Word,
+        )
+        .unwrap();
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.ecx(), 1);
+        assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 2);
     }
 
     #[test]
@@ -22642,7 +23652,8 @@ mod tests {
                 b: 0x01,
                 result: r,
                 width: BusWidth::Byte,
-                is_sub: false,
+                op: LazyFlagOp::Add,
+                cf_override: None,
             }),
             ..Default::default()
         };
@@ -22687,7 +23698,12 @@ mod tests {
                         b: b & width_mask(w),
                         result: r,
                         width: w,
-                        is_sub,
+                        op: if is_sub {
+                            LazyFlagOp::Sub
+                        } else {
+                            LazyFlagOp::Add
+                        },
+                        cf_override: None,
                     }),
                     ..Default::default()
                 };
@@ -22751,7 +23767,8 @@ mod tests {
                 b: 0x80,
                 result: r,
                 width: BusWidth::Byte,
-                is_sub: false,
+                op: LazyFlagOp::Add,
+                cf_override: None,
             }),
             ..Default::default()
         };
@@ -22763,6 +23780,43 @@ mod tests {
         lazy.materialize_flags();
         assert!(lazy.pending_flags.is_none());
         assert_eq!(lazy.registers.eflags, eager.registers.eflags);
+    }
+
+    #[test]
+    fn alu_logic_defers_flags_and_preserves_aux() {
+        let mut cpu = Cpu386::default();
+        cpu.set_flag(FLAG_AF | FLAG_CF | FLAG_OF, true);
+        let result = cpu.alu(4, 0xf0, 0x0f, BusWidth::Byte);
+        assert_eq!(result, 0);
+        assert!(cpu.pending_flags.is_some(), "logic flags stay lazy");
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_AF), "AF remains the previous undefined value");
+        cpu.materialize_flags();
+        assert_eq!(cpu.registers.eflags & (FLAG_CF | FLAG_OF), 0);
+        assert_ne!(cpu.registers.eflags & FLAG_AF, 0);
+    }
+
+    #[test]
+    fn inc_dec_defers_flags_while_preserving_carry() {
+        let mut cpu = Cpu386::default();
+        cpu.set_flag(FLAG_CF, true);
+        let result = cpu.inc_dec(0xffff, false, BusWidth::Word);
+        assert_eq!(result, 0);
+        assert!(
+            cpu.pending_flags.is_some(),
+            "INC should not materialize just to keep CF"
+        );
+        assert!(cpu.flag(FLAG_CF), "INC preserves CF");
+        assert!(cpu.flag(FLAG_ZF));
+
+        cpu.set_flag(FLAG_CF, false);
+        let result = cpu.inc_dec(0, true, BusWidth::Byte);
+        assert_eq!(result, 0xff);
+        assert!(cpu.pending_flags.is_some(), "DEC should stay lazy");
+        assert!(!cpu.flag(FLAG_CF), "DEC preserves CF");
+        assert!(cpu.flag(FLAG_SF));
     }
 
     #[test]

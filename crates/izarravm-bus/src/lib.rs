@@ -104,6 +104,14 @@ impl Memory {
         &self.data
     }
 
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+
     fn out_of_bounds(&self, address: usize, width: usize) -> BusError {
         BusError::MemoryOutOfBounds {
             address,
@@ -148,6 +156,25 @@ pub enum BusAccessKind {
     IoRead,
     IoWrite,
     InterruptAcknowledge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectMemoryRead {
+    pub value: u32,
+    pub direct: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectMemoryWrite {
+    pub direct: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectPage {
+    pub physical_page: u32,
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +414,71 @@ pub trait CpuBus {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<(), BusError>;
+
+    fn read_memory_direct(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<DirectMemoryRead, BusError> {
+        self.read_memory(address, width, kind)
+            .map(|value| DirectMemoryRead {
+                value,
+                direct: false,
+            })
+    }
+
+    fn write_memory_direct(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> Result<DirectMemoryWrite, BusError> {
+        self.write_memory(address, width, value, kind)
+            .map(|()| DirectMemoryWrite { direct: false })
+    }
+
+    fn read_memory_bytes_direct(
+        &mut self,
+        _address: u32,
+        _out: &mut [u8],
+        _access_width: BusWidth,
+        _kind: BusAccessKind,
+    ) -> Result<usize, BusError> {
+        Ok(0)
+    }
+
+    fn write_memory_bytes_direct(
+        &mut self,
+        _address: u32,
+        _data: &[u8],
+        _access_width: BusWidth,
+        _kind: BusAccessKind,
+    ) -> Result<usize, BusError> {
+        Ok(0)
+    }
+
+    fn direct_memory_bytes(&self, _address: u32, _bytes: usize, _access_width: BusWidth) -> usize {
+        0
+    }
+
+    fn direct_page(
+        &mut self,
+        _address: u32,
+        _kind: BusAccessKind,
+    ) -> Result<Option<DirectPage>, BusError> {
+        Ok(None)
+    }
+
+    fn charge_direct_memory(
+        &mut self,
+        _address: u32,
+        _width: BusWidth,
+        _kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        Ok(())
+    }
 
     /// Copy physical instruction bytes into `out` without charging bus clocks.
     /// The CPU charges each consumed fetch byte separately so prefetch snapshots
