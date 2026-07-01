@@ -2742,8 +2742,12 @@ impl Cpu386 {
                         return None;
                     };
                     let value = self.read_gpr8(index);
-                    let reg = self.read_gpr8(modrm.reg);
-                    self.alu_logic(u32::from(value & reg), BusWidth::Byte);
+                    let result = if index == modrm.reg {
+                        value
+                    } else {
+                        value & self.read_gpr8(modrm.reg)
+                    };
+                    self.alu_logic(u32::from(result), BusWidth::Byte);
                     Some(clocks(2))
                 }
                 0x85 => {
@@ -2752,8 +2756,12 @@ impl Cpu386 {
                         return None;
                     };
                     let value = self.read_gpr_sized(index, insn.operand_size);
-                    let reg = self.read_gpr_sized(modrm.reg, insn.operand_size);
-                    self.alu_logic(value & reg, insn.operand_size.bus_width());
+                    let result = if index == modrm.reg {
+                        value
+                    } else {
+                        value & self.read_gpr_sized(modrm.reg, insn.operand_size)
+                    };
+                    self.alu_logic(result, insn.operand_size.bus_width());
                     Some(clocks(2))
                 }
                 0x88 => {
