@@ -1440,16 +1440,19 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 
 /// Whether a decoded instruction may run as a cached continuation. Group-keyed for the
 /// straight-line groups (`block_straight_line`); additionally admits, BY OPCODE within the
-/// `ControlFlow` group, the near transfers that cannot halt, touch a port, or change CS:
-/// near RET (0xC3), near RET imm16 (0xC2), and the 0xFF group-5 near indirect CALL (/2)
-/// and near indirect JMP (/4). Still ending the run: far RET (0xCA/0xCB), the far directs
-/// (0x9A/0xEA), the far indirects (0xFF /3 and /5), INT3/INT n/INTO (0xCC-0xCE), IRET
-/// (0xCF), and the remaining 0xFF forms — they load CS, dispatch through the IDT, or stay
-/// on the terminator path by design. The continuation follows the new EIP exactly as taken
-/// relative branches already do; every per-continuation break check (step break, interrupt
-/// transition, clock cap, decode-cache re-peek at the new linear EIP, page-local decode)
-/// is unchanged, and a faulting stack read or segment-limit hit still routes through
-/// `finish_instruction`'s rewind-and-deliver exactly as on the one-instruction path.
+/// `ControlFlow` group, the forms that cannot halt, touch a port, or change CS:
+/// near RET (0xC3), near RET imm16 (0xC2), and the 0xFF group-5 forms that stay near —
+/// the plain fall-through INC r/m (/0), DEC r/m (/1), and PUSH r/m (/6) plus the near
+/// indirect CALL (/2) and JMP (/4). (The bench probe showed /6 PUSH r/m alone was ~360k
+/// of whetstone's ~360k run breaks: procedure-argument pushes, not transfers at all.)
+/// Still ending the run: far RET (0xCA/0xCB), the far directs (0x9A/0xEA), the far
+/// indirects (0xFF /3 and /5), the undefined /7 (#UD path), and INT3/INT n/INTO
+/// (0xCC-0xCE) / IRET (0xCF) — they load CS or dispatch through the IDT. The continuation
+/// follows the new EIP exactly as taken relative branches already do; every
+/// per-continuation break check (step break, interrupt transition, clock cap,
+/// decode-cache re-peek at the new linear EIP, page-local decode) is unchanged, and a
+/// faulting stack read or segment-limit hit still routes through `finish_instruction`'s
+/// rewind-and-deliver exactly as on the one-instruction path.
 fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> bool {
     if block_straight_line(group) {
         return true;
@@ -1458,7 +1461,7 @@ fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> b
         return false;
     }
     matches!(opcode, 0xc2 | 0xc3)
-        || (opcode == 0xff && matches!(modrm, Some(m) if m.reg == 2 || m.reg == 4))
+        || (opcode == 0xff && matches!(modrm, Some(m) if matches!(m.reg, 0 | 1 | 2 | 4 | 6)))
 }
 
 impl CpuProfileState {
