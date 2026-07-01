@@ -6723,25 +6723,39 @@ impl Cpu386 {
     /// Resolve an addressing-mode descriptor into a live memory operand by reading the base
     /// and index registers now. Reads only general registers (no instruction bytes), so it is
     /// safe to call repeatedly on a cached descriptor.
+    #[inline]
     fn resolve_addr_mode(&self, addr: &AddrMode) -> RmOperand {
+        let disp = addr.disp as u32;
         let offset = match addr.address_size {
             AddressSize::Word => {
-                let base = addr
-                    .base
-                    .map_or(0u32, |reg| u32::from(self.read_gpr16(reg)));
-                let index = addr
-                    .index
-                    .map_or(0u32, |reg| u32::from(self.read_gpr16(reg)));
-                let sum = base
-                    .wrapping_add(index.wrapping_mul(u32::from(addr.scale)))
-                    .wrapping_add(addr.disp as u32);
+                let base = match addr.base {
+                    Some(reg) => u32::from(self.read_gpr16(reg)),
+                    None => 0,
+                };
+                let index = match addr.index {
+                    Some(reg) => u32::from(self.read_gpr16(reg)),
+                    None => 0,
+                };
+                let sum = base.wrapping_add(index).wrapping_add(disp);
                 (sum as u16) as u32
             }
             AddressSize::Dword => {
-                let base = addr.base.map_or(0u32, |reg| self.read_gpr32(reg));
-                let index = addr.index.map_or(0u32, |reg| self.read_gpr32(reg));
-                base.wrapping_add(index.wrapping_mul(u32::from(addr.scale)))
-                    .wrapping_add(addr.disp as u32)
+                let base = match addr.base {
+                    Some(reg) => self.read_gpr32(reg),
+                    None => 0,
+                };
+                let index = match addr.index {
+                    Some(reg) => {
+                        let value = self.read_gpr32(reg);
+                        if addr.scale == 1 {
+                            value
+                        } else {
+                            value.wrapping_mul(u32::from(addr.scale))
+                        }
+                    }
+                    None => 0,
+                };
+                base.wrapping_add(index).wrapping_add(disp)
             }
         };
         RmOperand::Memory(MemoryOperand {
