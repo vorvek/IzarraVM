@@ -468,6 +468,10 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     );
     // Collected for the host-side perf summary printed after the table.
     let mut perf_rows: Vec<(&'static str, GswMode, PerfCounters)> = Vec::new();
+    // Only an Accurate-class (286/386) out-of-band row fails the process; the
+    // Approximate fast modes (486/586) are informational (see TimingClass and
+    // bench_reference.rs), so their verdicts print but never flip this flag.
+    let mut accurate_out_of_band = false;
     for bench in BENCHES {
         for mode in modes {
             if mode_rank(mode) < mode_rank(bench.min_mode) {
@@ -515,10 +519,18 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 wall_secs * 1000.0,
                 rt,
             );
-            // Soft reporter: tag each row against the era reference band. This is
-            // observability only and never changes the exit code. After B-T9
-            // calibration every row tags [in band] (the compute caps the bus model
-            // cannot reach were relaxed to best-effort; see bench_reference.rs).
+            // Soft reporter: tag each row against the era reference band. Accurate
+            // modes (286/386) gate the process exit on an out-of-band verdict; the
+            // Approximate fast modes (486/586) are informational only (their bands
+            // were widened for this in bench_reference.rs), so they always print
+            // their tag but never fail the run. See TimingClass.
+            if mode.timing_class() == izarravm_core::TimingClass::Accurate
+                && bench_reference::band_for(bench.name, mode).is_some_and(|band| {
+                    band.verdict(band_value) != bench_reference::BandVerdict::InBand
+                })
+            {
+                accurate_out_of_band = true;
+            }
             println!(
                 "{}{}",
                 mflops_suffix,
@@ -568,6 +580,13 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             perf.rep_string_iterations,
             perf.flag_materializations,
             perf.cache_tier_lookups,
+        );
+    }
+    if accurate_out_of_band {
+        return Err(
+            "an Accurate-class (286/386) bench row is out of its era reference band"
+                .to_string()
+                .into(),
         );
     }
     Ok(())
