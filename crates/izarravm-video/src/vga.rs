@@ -1247,7 +1247,7 @@ impl Vga {
     }
 
     /// Install a planar mode's timing and reset the beam to the top of frame.
-    fn set_planar_mode(&mut self, mode: u8, timing: CrtcTiming) {
+    fn set_planar_mode(&mut self, mode: u8, timing: CrtcTiming, clear: bool) {
         // A mode change alters the scanout interpretation even between two graphics
         // modes of identical raster dims (e.g. 0Dh<->13h, both 320x449), which the
         // dimension fold in `Machine::frame_generation` cannot see. Bump so the host
@@ -1270,6 +1270,9 @@ impl Vga {
         self.last_line = 0;
         self.mode = VideoMode::Planar;
         self.planar_bios_mode = mode;
+        if clear {
+            self.vram.fill(0);
+        }
         self.presented = None; // drop any stale frame from a prior mode
         self.reset_palette_defaults(mode);
         self.seed_vgabios_attr_readback(mode);
@@ -1279,12 +1282,18 @@ impl Vga {
     /// Switch to mode 0Dh. Kept as an alias so existing callers do not churn;
     /// new call sites can use `set_mode(0x0D)`.
     pub fn set_mode_0dh(&mut self) {
-        self.set_planar_mode(0x0D, CrtcTiming::mode_0dh());
+        self.set_planar_mode(0x0D, CrtcTiming::mode_0dh(), false);
     }
 
-    /// Select a planar mode by its INT 10h number. Returns false for a number this
+    /// Select a VGA graphics mode by its INT 10h number. Returns false for a number this
     /// slice does not implement, leaving the current mode untouched.
     pub fn set_mode(&mut self, mode: u8) -> bool {
+        self.set_mode_with_clear(mode, false)
+    }
+
+    /// Select a VGA graphics mode and optionally clear VGA graphics memory, matching
+    /// INT 10h AH=00h's bit-7 clear/preserve flag.
+    pub fn set_mode_with_clear(&mut self, mode: u8, clear: bool) -> bool {
         let timing = match mode {
             0x0D => CrtcTiming::mode_0dh(),
             0x0E => CrtcTiming::mode_0eh(),
@@ -1292,9 +1301,13 @@ impl Vga {
             0x10 => CrtcTiming::mode_10h(),
             0x11 => CrtcTiming::mode_11h(),
             0x12 => CrtcTiming::mode_12h(),
+            0x13 => {
+                self.set_mode13h_with_clear(clear);
+                return true;
+            }
             _ => return false,
         };
-        self.set_planar_mode(mode, timing);
+        self.set_planar_mode(mode, timing, clear);
         true
     }
 
@@ -2764,6 +2777,12 @@ impl Vga {
     /// as the planar and mode-X modes). Chain-4 is the mode-13h-specific CPU
     /// write decode; the CRTC display scanout is shared with mode X.
     pub fn set_mode13h(&mut self) {
+        self.set_mode13h_with_clear(false);
+    }
+
+    /// Switch to mode 13h and optionally clear VGA graphics memory, matching
+    /// INT 10h AH=00h's bit-7 clear/preserve flag.
+    pub fn set_mode13h_with_clear(&mut self, clear: bool) {
         // A mode change alters the scanout even at identical raster dims (0Dh<->13h are
         // both 320x449); the dimension fold can't see it, so bump the content gen.
         self.bump_content_gen();
@@ -2778,6 +2797,9 @@ impl Vga {
         self.beam = 0;
         self.last_line = 0;
         self.mode = VideoMode::Mode13h;
+        if clear {
+            self.vram.fill(0);
+        }
         self.presented = None; // drop any stale frame from a prior mode
         self.reset_palette_defaults(0x13);
         self.seed_vgabios_attr_readback(0x13);
@@ -5126,10 +5148,10 @@ mod tests {
     }
 
     #[test]
-    fn set_mode13h_switches_active_mode() {
+    fn set_mode_selects_mode13h() {
         let mut video = Vga::default();
         assert_eq!(video.active_mode(), VideoMode::Text);
-        video.set_mode13h();
+        assert!(video.set_mode(0x13));
         assert_eq!(video.active_mode(), VideoMode::Mode13h);
     }
 
@@ -5139,7 +5161,7 @@ mod tests {
         // and the gray ramp at 0x10..0x1F. (This is the value an EGA mode used
         // to wrongly inherit, turning brown attributes gray.)
         let mut vga = Vga::default();
-        vga.set_mode13h();
+        assert!(vga.set_mode(0x13));
         assert_eq!(vga.dac.entry(0x06), [0x2a, 0x15, 0x00]);
         assert_eq!(vga.dac.entry(0x14), [0x0e, 0x0e, 0x0e]); // gray ramp, not brown
 
@@ -5189,7 +5211,7 @@ mod tests {
     #[test]
     fn mode13h_mode_set_installs_chain4_and_a000_graphics_defaults() {
         let mut video = Vga::default();
-        video.set_mode13h();
+        assert!(video.set_mode(0x13));
 
         assert_eq!(video.seq.map_mask, 0x0F);
         assert_eq!(video.seq.memory_mode, 0x0E);
@@ -5292,7 +5314,7 @@ mod tests {
     }
 
     #[test]
-    fn set_mode_selects_geometry_for_each_planar_number() {
+    fn set_mode_selects_geometry_for_each_graphics_number() {
         let mut vga = Vga::default();
 
         assert!(vga.set_mode(0x0E));
@@ -5311,6 +5333,11 @@ mod tests {
         assert!(vga.set_mode(0x0D));
         assert_eq!(vga.raster_width(), 320);
         assert_eq!(vga.raster_height(), 449);
+
+        assert!(vga.set_mode(0x13));
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.raster_height(), 449);
+        assert_eq!(vga.active_mode(), VideoMode::Mode13h);
 
         assert!(!vga.set_mode(0x99)); // unknown number leaves a false result
     }
