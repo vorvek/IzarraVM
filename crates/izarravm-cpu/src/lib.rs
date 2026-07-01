@@ -888,10 +888,21 @@ pub struct CpuProfileBucket {
     pub samples: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuOpcodeProfileBucket {
+    pub opcode: u16,
+    pub group: &'static str,
+    pub instructions: u64,
+    pub guest_core_clocks: u64,
+    pub sample_wall_ns: u64,
+    pub samples: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CpuProfileSnapshot {
     pub sample_stride: u64,
     pub groups: Vec<CpuProfileBucket>,
+    pub opcodes: Vec<CpuOpcodeProfileBucket>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -902,12 +913,19 @@ struct CpuProfileBucketState {
     samples: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CpuOpcodeProfileBucketState {
+    group: DecodeGroup,
+    bucket: CpuProfileBucketState,
+}
+
 #[derive(Clone)]
 struct CpuProfileState {
     enabled: bool,
     sample_stride: u64,
     until_sample: u64,
     groups: [CpuProfileBucketState; CPU_PROFILE_GROUPS],
+    opcodes: std::collections::HashMap<u16, CpuOpcodeProfileBucketState>,
 }
 
 impl Default for CpuProfileState {
@@ -917,6 +935,7 @@ impl Default for CpuProfileState {
             sample_stride: 1,
             until_sample: 1,
             groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
+            opcodes: std::collections::HashMap::new(),
         }
     }
 }
@@ -1394,6 +1413,7 @@ impl CpuProfileState {
             sample_stride: sample_stride.max(1),
             until_sample: 1,
             groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
+            opcodes: std::collections::HashMap::new(),
         };
     }
 
@@ -1410,20 +1430,37 @@ impl CpuProfileState {
     fn record(
         &mut self,
         group: DecodeGroup,
+        opcode: u16,
         guest_core_clocks: u64,
         start: Option<std::time::Instant>,
     ) {
         if !self.enabled {
             return;
         }
+        let sample_wall_ns = start.map(|start| duration_ns_u64(start.elapsed()));
         let bucket = &mut self.groups[group.profile_index()];
         bucket.instructions += 1;
         bucket.guest_core_clocks += guest_core_clocks;
-        if let Some(start) = start {
+        if let Some(sample_wall_ns) = sample_wall_ns {
             bucket.samples += 1;
-            bucket.sample_wall_ns = bucket
+            bucket.sample_wall_ns = bucket.sample_wall_ns.saturating_add(sample_wall_ns);
+        }
+
+        let opcode_bucket = self
+            .opcodes
+            .entry(opcode)
+            .or_insert(CpuOpcodeProfileBucketState {
+                group,
+                bucket: CpuProfileBucketState::default(),
+            });
+        opcode_bucket.bucket.instructions += 1;
+        opcode_bucket.bucket.guest_core_clocks += guest_core_clocks;
+        if let Some(sample_wall_ns) = sample_wall_ns {
+            opcode_bucket.bucket.samples += 1;
+            opcode_bucket.bucket.sample_wall_ns = opcode_bucket
+                .bucket
                 .sample_wall_ns
-                .saturating_add(duration_ns_u64(start.elapsed()));
+                .saturating_add(sample_wall_ns);
         }
         self.until_sample = if self.until_sample <= 1 {
             self.sample_stride
@@ -1433,6 +1470,19 @@ impl CpuProfileState {
     }
 
     fn snapshot(&self) -> CpuProfileSnapshot {
+        let mut opcodes = self
+            .opcodes
+            .iter()
+            .map(|(&opcode, state)| CpuOpcodeProfileBucket {
+                opcode,
+                group: state.group.profile_name(),
+                instructions: state.bucket.instructions,
+                guest_core_clocks: state.bucket.guest_core_clocks,
+                sample_wall_ns: state.bucket.sample_wall_ns,
+                samples: state.bucket.samples,
+            })
+            .collect::<Vec<_>>();
+        opcodes.sort_by_key(|bucket| bucket.opcode);
         CpuProfileSnapshot {
             sample_stride: self.sample_stride,
             groups: DecodeGroup::ALL
@@ -1448,6 +1498,7 @@ impl CpuProfileState {
                     }
                 })
                 .collect(),
+            opcodes,
         }
     }
 }
@@ -2236,17 +2287,17 @@ impl Cpu386 {
         } else {
             None
         };
-        let mut group = None;
+        let mut profile_key = None;
         let result = match self.fetch_decoded(bus, lin) {
             Ok(insn) => {
                 if profiling {
-                    group = Some(insn.group);
+                    profile_key = Some((insn.group, insn.opcode));
                 }
                 self.execute_decoded(&insn, bus)
             }
             Err(fault) => Err(fault),
         };
-        self.finish_instruction(bus, result, start_eip, start_cs, group, profile_start)
+        self.finish_instruction(bus, result, start_eip, start_cs, profile_key, profile_start)
     }
 
     /// The shared rewind / deliver / scale tail of a single instruction's execution. It owns ONLY
@@ -2265,7 +2316,7 @@ impl Cpu386 {
         result: ExecResult<CycleOutcome>,
         start_eip: u32,
         start_cs: u16,
-        group: Option<DecodeGroup>,
+        profile_key: Option<(DecodeGroup, u16)>,
         profile_start: Option<std::time::Instant>,
     ) -> Result<CycleOutcome, CpuError> {
         let outcome = match result {
@@ -2291,8 +2342,8 @@ impl Cpu386 {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += 1;
-        if let Some(group) = group {
-            self.profile.record(group, charged, profile_start);
+        if let Some((group, opcode)) = profile_key {
+            self.profile.record(group, opcode, charged, profile_start);
         }
         Ok(CycleOutcome {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
@@ -2434,7 +2485,7 @@ impl Cpu386 {
             result,
             start_eip,
             start_cs,
-            profiling.then_some(insn.group),
+            profiling.then_some((insn.group, insn.opcode)),
             profile_start,
         )
     }
@@ -11575,6 +11626,14 @@ mod tests {
             .expect("profile bucket exists")
     }
 
+    fn profile_opcode(snapshot: &CpuProfileSnapshot, opcode: u16) -> &CpuOpcodeProfileBucket {
+        snapshot
+            .opcodes
+            .iter()
+            .find(|bucket| bucket.opcode == opcode)
+            .expect("profile opcode bucket exists")
+    }
+
     #[test]
     fn cpu_profile_disabled_records_no_groups() {
         let (mut cpu, mut bus) = profile_test_cpu(&[0x40]); // inc ax
@@ -11588,6 +11647,10 @@ mod tests {
                 && bucket.samples == 0
                 && bucket.sample_wall_ns == 0),
             "profiling must be inert until explicitly enabled"
+        );
+        assert!(
+            snapshot.opcodes.is_empty(),
+            "opcode profiling must be inert until explicitly enabled"
         );
     }
 
@@ -11611,6 +11674,11 @@ mod tests {
             assert_eq!(bucket.instructions, 1, "{name} instruction count");
             assert_eq!(bucket.samples, 1, "{name} sampled every instruction");
         }
+        for opcode in [0x05, 0x8b, 0xd9] {
+            let bucket = profile_opcode(&snapshot, opcode);
+            assert_eq!(bucket.instructions, 1, "opcode {opcode:#x} count");
+            assert_eq!(bucket.samples, 1, "opcode {opcode:#x} samples");
+        }
     }
 
     #[test]
@@ -11626,6 +11694,9 @@ mod tests {
         let bucket = profile_bucket(&snapshot, "flags_misc");
         assert_eq!(bucket.instructions, 4);
         assert_eq!(bucket.samples, 2);
+        let opcode = profile_opcode(&snapshot, 0x40);
+        assert_eq!(opcode.instructions, 4);
+        assert_eq!(opcode.samples, 2);
     }
 
     #[test]
