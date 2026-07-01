@@ -2407,10 +2407,12 @@ impl Cpu386 {
         let start_cs = self.registers.cs().selector;
         let profiling = self.profile.enabled;
         if !profiling {
-            return match self
-                .charge_cached_fetch(bus, lin, insn.len)
-                .and_then(|()| self.execute_decoded(insn, bus))
-            {
+            return match self.charge_cached_fetch(bus, lin, insn.len).and_then(|()| {
+                match self.execute_hot_cached_decoded(insn) {
+                    Some(outcome) => Ok(outcome),
+                    None => self.execute_decoded(insn, bus),
+                }
+            }) {
                 Ok(outcome) => {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
@@ -2426,9 +2428,12 @@ impl Cpu386 {
             };
         }
         let profile_start = self.profile.sample_start();
-        let result = self
-            .charge_cached_fetch(bus, lin, insn.len)
-            .and_then(|()| self.execute_decoded(insn, bus));
+        let result = self.charge_cached_fetch(bus, lin, insn.len).and_then(|()| {
+            match self.execute_hot_cached_decoded(insn) {
+                Some(outcome) => Ok(outcome),
+                None => self.execute_decoded(insn, bus),
+            }
+        });
         self.finish_instruction(
             bus,
             result,
@@ -2437,6 +2442,154 @@ impl Cpu386 {
             profiling.then_some(insn.group),
             profile_start,
         )
+    }
+
+    /// Hot cached-instruction subset that never touches the bus and cannot fault. EIP has already
+    /// advanced past the instruction by `charge_cached_fetch`, matching the normal decoded executor.
+    #[inline]
+    fn execute_hot_cached_decoded(&mut self, insn: &DecodedInsn) -> Option<CycleOutcome> {
+        match insn.opcode {
+            0x70..=0x7f | 0x0f80..=0x0f8f => {
+                if self.condition((insn.opcode & 0x0f) as u8) {
+                    self.relative_jump(insn.imm as i32, insn.operand_size);
+                }
+                Some(clocks(3))
+            }
+            opcode if opcode <= 0xff => match opcode as u8 {
+                0x40..=0x4f => {
+                    let index = insn.opcode as u8 & 0x07;
+                    let value = self.read_gpr_sized(index, insn.operand_size);
+                    let result = self.inc_dec(
+                        value,
+                        insn.opcode as u8 >= 0x48,
+                        insn.operand_size.bus_width(),
+                    );
+                    self.write_gpr_sized(index, insn.operand_size, result);
+                    Some(clocks(2))
+                }
+                0x84 => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Reg(index) = insn.operand? else {
+                        return None;
+                    };
+                    let value = self.read_gpr8(index);
+                    let reg = self.read_gpr8(modrm.reg);
+                    self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
+                    Some(clocks(2))
+                }
+                0x85 => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Reg(index) = insn.operand? else {
+                        return None;
+                    };
+                    let value = self.read_gpr_sized(index, insn.operand_size);
+                    let reg = self.read_gpr_sized(modrm.reg, insn.operand_size);
+                    self.alu(4, value, reg, insn.operand_size.bus_width());
+                    Some(clocks(2))
+                }
+                0x88 => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Reg(index) = insn.operand? else {
+                        return None;
+                    };
+                    self.write_gpr8(index, self.read_gpr8(modrm.reg));
+                    Some(clocks(2))
+                }
+                0x89 => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Reg(index) = insn.operand? else {
+                        return None;
+                    };
+                    self.write_gpr_sized(
+                        index,
+                        insn.operand_size,
+                        self.read_gpr_sized(modrm.reg, insn.operand_size),
+                    );
+                    Some(clocks(2))
+                }
+                0x8a => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Reg(index) = insn.operand? else {
+                        return None;
+                    };
+                    self.write_gpr8(modrm.reg, self.read_gpr8(index));
+                    Some(clocks(2))
+                }
+                0x8b => {
+                    let modrm = insn.modrm?;
+                    let DecodedOperand::Reg(index) = insn.operand? else {
+                        return None;
+                    };
+                    self.write_gpr_sized(
+                        modrm.reg,
+                        insn.operand_size,
+                        self.read_gpr_sized(index, insn.operand_size),
+                    );
+                    Some(clocks(2))
+                }
+                0xb0..=0xb7 => {
+                    self.write_gpr8(insn.opcode as u8 - 0xb0, insn.imm as u8);
+                    Some(clocks(2))
+                }
+                0xb8..=0xbf => {
+                    self.write_gpr_sized(insn.opcode as u8 - 0xb8, insn.operand_size, insn.imm);
+                    Some(clocks(2))
+                }
+                0xe0 | 0xe1 => {
+                    let count_nonzero = match insn.address_size {
+                        AddressSize::Word => {
+                            let next = self.read_gpr16(1).wrapping_sub(1);
+                            self.write_gpr16(1, next);
+                            next != 0
+                        }
+                        AddressSize::Dword => {
+                            let next = self.registers.ecx().wrapping_sub(1);
+                            self.registers.set_ecx(next);
+                            next != 0
+                        }
+                    };
+                    let zf = self.flag(FLAG_ZF);
+                    if count_nonzero && (if insn.opcode as u8 == 0xe1 { zf } else { !zf }) {
+                        self.relative_jump(insn.imm as i32, insn.operand_size);
+                    }
+                    Some(clocks(11))
+                }
+                0xe2 => {
+                    let taken = match insn.address_size {
+                        AddressSize::Word => {
+                            let next = self.read_gpr16(1).wrapping_sub(1);
+                            self.write_gpr16(1, next);
+                            next != 0
+                        }
+                        AddressSize::Dword => {
+                            let next = self.registers.ecx().wrapping_sub(1);
+                            self.registers.set_ecx(next);
+                            next != 0
+                        }
+                    };
+                    if taken {
+                        self.relative_jump(insn.imm as i32, insn.operand_size);
+                    }
+                    Some(clocks(11))
+                }
+                0xe3 => {
+                    let taken = match insn.address_size {
+                        AddressSize::Word => self.read_gpr16(1) == 0,
+                        AddressSize::Dword => self.registers.ecx() == 0,
+                    };
+                    if taken {
+                        self.relative_jump(insn.imm as i32, insn.operand_size);
+                    }
+                    Some(clocks(9))
+                }
+                0xe9 | 0xeb => {
+                    self.relative_jump(insn.imm as i32, insn.operand_size);
+                    Some(clocks(7))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// The single routing authority for the decode/execute split: classify an opcode into the
@@ -17228,6 +17381,67 @@ mod tests {
              instructions"
         );
         assert_eq!(runs, 5, "cached LOOP should stay inside the hot run");
+    }
+
+    #[test]
+    fn straight_line_run_executes_hot_register_cached_forms() {
+        // MOV AX,1 ; TEST AX,AX ; JNZ target ; MOV BX,dead ; target: MOV CX,2 ; MOV BX,AX ; DEC CX
+        // HLT. The warm second run exercises cached continuation fast paths for TEST reg/reg, JNZ,
+        // MOV reg,imm, MOV reg,reg, and DEC reg. The skipped MOV proves the branch target, not the
+        // contiguous bytes, drives the next continuation.
+        let code = [
+            0xb8, 0x01, 0x00, // MOV AX, 1
+            0x85, 0xc0, // TEST AX, AX
+            0x75, 0x03, // JNZ +3 -> 0x0A
+            0xbb, 0xad, 0xde, // MOV BX, 0xDEAD (skipped)
+            0xb9, 0x02, 0x00, // MOV CX, 2
+            0x89, 0xc3, // MOV BX, AX
+            0x49, // DEC CX
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ebx(0);
+        cpu.registers.set_ecx(0);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted, "HLT remains a terminator");
+        assert_eq!(cpu.registers.eip, 0x10, "run stopped at HLT");
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 1);
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 1, "taken JNZ skipped dead MOV");
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 1, "MOV imm then DEC ran");
+        assert!(!cpu.flag(FLAG_ZF), "DEC CX from 2 to 1 leaves ZF clear");
+    }
+
+    #[test]
+    fn hot_cached_forms_do_not_alias_two_byte_opcodes() {
+        // 0F 44 C3 is CMOVE AX,BX. Its low byte is 0x44, which is INC SP in the single-byte map; the
+        // hot cached single-byte table must not see it. With ZF clear, CMOVE leaves AX and SP alone.
+        let code = [
+            0xb8, 0x05, 0x00, // MOV AX, 5
+            0xbb, 0x03, 0x00, // MOV BX, 3
+            0x0f, 0x44, 0xc3, // CMOVE AX, BX
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.write_reg16(Reg16::Bx, 0);
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        cpu.set_flag(FLAG_ZF, false);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 5, "CMOVE false leaves AX");
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x0100, "CMOVE is not INC SP");
     }
 
     #[test]
