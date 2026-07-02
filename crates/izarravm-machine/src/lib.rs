@@ -24208,15 +24208,19 @@ mod tests {
         // cycles, so this budget must clear it.
         machine.run_until_halt_or_cycles(20_000_000).unwrap();
 
-        // Down moves the highlight from Time (row 0) to Keyboard (row 1).
+        // Down moves the highlight from Time (row 0) to Keyboard (row 1). Each
+        // keystroke repaints the whole page (title + boxed menu + help footer) on
+        // the Margo LFB; the per-pixel unreal-mode box/fill primitives cost more
+        // guest cycles than the old mode-13h gfx_clear + gfx_text redraw, so these
+        // budgets are larger than the pre-LFB page needed.
         machine.inject_key_scancodes(&[0x50, 0xd0]); // Down
-        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
         // Right cycles the keyboard layout forward (en-US -> UK).
         machine.inject_key_scancodes(&[0x4d, 0xcd]); // Right
-        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
         // F10 saves: writes CMOS 0x10/0x12, refreshes the checksum, and exits.
         machine.inject_key_scancodes(&[0x44, 0xc4]); // F10
-        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        machine.run_until_halt_or_cycles(4_000_000).unwrap();
 
         assert_eq!(
             machine.cmos_byte(0x10),

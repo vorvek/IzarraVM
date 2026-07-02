@@ -111,6 +111,14 @@
 %define BLIT_COLOR     (BIOS_SCRATCH + 0x0c)   ; fill color (byte)
 %define BLIT_RUN_LEFT  BLIT_STRIDE     ; lfb_blit_rle: pixels remaining in the current RLE run (word)
 %define BLIT_RUN_VAL   BLIT_COLOR      ; lfb_blit_rle: the current run's palette index (byte)
+; lfb_box working words (segment 0), just above the blit scratch. Six bytes/
+; words, 0x052D..0x0536; BIOS_SCRATCH still has headroom to 0x053F.
+%define BOX_X          (BIOS_SCRATCH + 0x0d)   ; left x
+%define BOX_Y          (BIOS_SCRATCH + 0x0f)   ; top y
+%define BOX_W          (BIOS_SCRATCH + 0x11)   ; width
+%define BOX_H          (BIOS_SCRATCH + 0x13)   ; height
+%define BOX_IN         (BIOS_SCRATCH + 0x15)   ; interior color (byte)
+%define BOX_BD         (BIOS_SCRATCH + 0x16)   ; border color (byte)
 
 ; --- Graceful POST screen (Amiga/Mac-style: white field, black text, red logo).
 ; These DAC indices are reprogrammed by gfx_post_palette before the screen draws,

@@ -1,13 +1,15 @@
-; setup-ui.inc - STREAM D: the mode-13h setup page. Owns this file and the
+; setup-ui.inc - STREAM D: the Margo-LFB setup page. Owns this file and the
 ; SETUP_SCRATCH region (segment 0, 256 bytes). Core calls setup_maybe_enter after
 ; run_post and before enter_setup_or_boot.
 ;
 ; Flow: peek the keyboard for a brief window. If the setup hotkey (Del, scancode
 ; SETUP_HOTKEY) is not waiting, return and let the BIOS boot. If it is, switch to
-; mode 13h and draw the main menu. The menu is navigated by Up/Down (highlight),
-; Left/Right (edit the inline rows: keyboard layout and GSW mode), Enter (open a
-; sub-page or fire a Save/Discard action), and Esc (back out, treated as Discard
-; on the main menu).
+; the Margo LFB mode (0x150, 320x240x8 - the graphical POST's own mode) and draw
+; the main menu inside a bordered box, matching the POST screen's palette. The
+; menu is navigated by Up/Down (highlight), Left/Right (edit the inline rows:
+; keyboard layout and GSW mode), Enter (open a sub-page or fire a Save/Discard
+; action), and Esc (back out, treated as Discard on the main menu). A one-line
+; context-sensitive help string under the box changes with the highlighted row.
 ;
 ; The page edits a working copy held in SETUP_SCRATCH and seeded at entry from the
 ; live hardware and CMOS NVRAM. Nothing is committed until Save: Save writes the
@@ -17,9 +19,10 @@
 ; of that untouched. Both exits return to the boot path.
 ;
 ; The peripherals page re-runs the POST probe routines live (they are
-; non-destructive) and shows each as PASS/FAIL or a MEASURE value, rather than
-; parsing the VDTS result block by name in 16-bit code. The health page shows
-; voltage rails and temperatures with a small per-refresh jitter from an LFSR.
+; non-destructive) and shows each as PASS/FAIL in a boxed table with an aligned
+; status column. The health page shows voltage rails and temperatures with a
+; small per-refresh jitter from an LFSR, each drawn as a labeled bar plus its
+; value, inside a box.
 
 ; --- SETUP_SCRATCH layout (segment 0) --------------------------------------
 %define SU_WORKING_MODE   SETUP_SCRATCH + 0    ; edited GSW mode (0/1/2/3)
@@ -35,6 +38,8 @@
 %define SU_TIME_YEAR      SETUP_SCRATCH + 10   ; two-digit year (0..99)
 %define SU_LFSR_LO        SETUP_SCRATCH + 12   ; health-page jitter LFSR (word)
 %define SU_HEALTH_TICK    SETUP_SCRATCH + 14   ; last BDA tick the health page drew (word)
+%define SU_RAIL_SCALE     SETUP_SCRATCH + 16   ; su_draw_rail: full-scale whole volts (byte)
+%define SU_RAIL_WHOLE     SETUP_SCRATCH + 17   ; su_draw_rail: reading's whole-number volts (byte)
 
 ; Main-menu selectable rows, in highlight order.
 %define SU_ROW_TIME       0
@@ -87,18 +92,47 @@
 ; Hotkey poll budget: how many peek iterations to wait for Del before booting.
 %define SU_HOTKEY_SPINS   0x0200
 
-; Menu layout (mode 13h pixels).
-%define SU_MENU_X         16
-%define SU_MENU_Y         40
+; --- Colours (art palette indices; the setup page shares the POST screen's
+; palette so it reads as one continuous system, like the Tab boot menu does).
+%define SU_C_FIELD        ART_FIELD_INDEX   ; cream field / interior
+%define SU_C_INK           ART_INK_INDEX     ; near-black body text / border
+%define SU_C_TITLE         ART_RED_INDEX     ; red title bar text
+%define SU_C_DISABLED      ART_GREY_INDEX    ; mid-grey info / help text
+%define SU_C_PASS          10                ; sage-green PASS / rail bar fill (art_palette[10])
+%define SU_C_FAIL          ART_RED_INDEX     ; red FAIL
+
+; --- Menu layout (LFB pixels, 320x240 field) --------------------------------
+%define SU_BOX_X          8
+%define SU_BOX_Y          16
+%define SU_BOX_W          304
+%define SU_BOX_H          192
+%define SU_TITLE_X        8
+%define SU_TITLE_Y         4
+%define SU_MENU_X         18
+%define SU_MENU_Y         26
 %define SU_ROW_DY         12
-%define SU_VALUE_X        160
-%define SU_COLOR_HEAD     0x0e        ; yellow heading
-%define SU_COLOR_INFO     0x07        ; light grey body text
-%define SU_COLOR_ROW      0x0f        ; white (unselected selectable row)
-%define SU_COLOR_HILITE   0x0b        ; bright cyan (highlighted row)
-%define SU_COLOR_PASS     0x0a        ; bright green
-%define SU_COLOR_FAIL     0x0c        ; bright red
-%define SU_COLOR_VALUE    0x0b        ; bright cyan (a measured/edited value)
+%define SU_VALUE_X        180
+%define SU_HELP1_Y        212
+%define SU_HELP2_Y         226
+%define SU_HELP_X          8
+; Health-page layout: label, then a small horizontal bar, then the value, so
+; the longest value string ("+12.99 V", 8 chars = 64px) has clear room before
+; the box's right border at SU_BOX_X + SU_BOX_W = 312.
+%define SU_BAR_X          110
+%define SU_BAR_W           90
+%define SU_BAR_H            6
+%define SU_HEALTH_VALUE_X 210
+
+; su_enter_setup_lfb: install the Margo LFB mode (0x150) and load the art
+; palette. The POST screen already left the LFB mode active and the palette
+; loaded in the normal boot path, so this is a belt-and-braces call: it makes
+; setup_maybe_enter safe to call from any screen state, not just fresh POST.
+; No DAC hack is needed here (unlike the old mode-13h path) because the art
+; palette is exactly what this page wants.
+su_enter_setup_lfb:
+    call lfb_set_mode
+    call lfb_load_palette
+    ret
 
 ; setup_maybe_enter: the core hook. During the POST poll window it watches for two
 ; hotkeys: Del opens the setup page, Tab opens the boot-device menu. Returns with no
@@ -237,11 +271,11 @@ su_take_latched_hotkey:
 
 ; su_post_note: draw a short status line on the still-visible graphical POST
 ; screen (the Margo LFB) when a hotkey is caught, so the press gets immediate
-; feedback before the setup page or boot menu mode-switches over it. SI =
-; CS-relative ASCIIZ on entry. It overwrites the two key-hint rows with the note,
-; ink on the field. Preserves the caller's registers (the hotkey path re-sets the
-; CF/AL it returns after this call). NOTE: the BIOS is in the LFB mode here, so
-; this must use lfb_* primitives -- mode-13h gfx_* writes would be invisible.
+; feedback before the setup page or boot menu redraws over it. SI = CS-relative
+; ASCIIZ on entry. It overwrites the two key-hint rows with the note, ink on the
+; field. Preserves the caller's registers (the hotkey path re-sets the CF/AL it
+; returns after this call). The BIOS is in the LFB mode here, so this must use
+; lfb_* primitives -- mode-13h gfx_* writes would be invisible.
 su_post_note:
     pusha
     mov bp, si                      ; BP = note string pointer (survives the wipe)
@@ -646,179 +680,258 @@ su_commit:
     out PORT_LOTURA_MODE, al
     ret
 
-; su_enter_mode13h: set mode 13h, then force DAC index 0 (the setup background) to
-; black. The graceful POST screen reprograms index 0 to white, and INT 10h AH=00
-; does not restore the DAC here, so the setup page would otherwise draw its white
-; labels onto a white field. Setting index 0 black restores the standard mode-13h
-; field this page assumes; every other index it uses is at its mode-13h default.
-su_enter_mode13h:
-    call set_mode13h
-    push ax
-    push bx
-    push cx
-    push dx
-    mov bx, COLOR_BG                ; DAC index 0
-    xor dh, dh                      ; R = 0
-    xor ch, ch                      ; G = 0
-    xor cl, cl                      ; B = 0
-    call gfx_set_palette
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
-
 ; ============================ Main-menu drawing ============================
-; su_draw: paint the main menu from scratch. Heading, the seven selectable rows
-; (Time/Layout/GSW with their values, Peripherals/Health, Save/Discard), and a
-; footer hint. Sets DS = CS for the ROM strings; reads SU_CURSOR and the working
-; values from segment 0.
+; su_draw: paint the main menu from scratch. Title bar, a bordered box holding
+; the eight selectable rows (Time/Layout/GSW with their values, Peripherals/
+; Health, Repair/Save/Discard), and a two-line context-sensitive help footer
+; below the box. Sets DS = CS for the ROM strings; reads SU_CURSOR and the
+; working values from segment 0.
 su_draw:
-    call su_enter_mode13h
-    mov al, COLOR_BG
-    call gfx_clear
+    call su_enter_setup_lfb
+    mov al, COLOR_BG                ; clear the whole screen so no stale POST
+    call lfb_clear                  ; content (wordmark/mascot/text) bleeds through
+    ; Title bar (red on field).
     push cs
     pop ds                          ; DS = CS for the label strings
-
-    ; Title.
     mov si, su_str_title
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y - SU_ROW_DY * 2
-    mov bl, SU_COLOR_HEAD
-    mov bh, COLOR_BG
-    call gfx_text
+    mov di, SU_TITLE_X
+    mov ax, SU_TITLE_Y
+    mov bl, SU_C_TITLE
+    mov bh, SU_C_FIELD
+    call lfb_text
+
+    ; Main box: ink border, cream interior.
+    mov di, SU_BOX_X
+    mov si, SU_BOX_Y
+    mov cx, SU_BOX_W
+    mov dx, SU_BOX_H
+    mov bl, SU_C_FIELD
+    mov bh, SU_C_INK
+    call lfb_box
 
     ; Time row (label + HH:MM:SS).
     mov bl, SU_ROW_TIME
-    call su_row_color
+    call su_row_colors
     mov si, su_str_time
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y
-    mov bh, COLOR_BG
-    call gfx_text
-    call su_draw_time_value         ; small HH:MM:SS next to the label
+    call lfb_text
+    call su_draw_time_value          ; small HH:MM:SS next to the label
 
     ; Keyboard layout row (label + name).
     mov bl, SU_ROW_LAYOUT
-    call su_row_color
+    call su_row_colors
     mov si, su_str_layout
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
     call su_draw_layout_value
 
     ; GSW mode row (label + name).
     mov bl, SU_ROW_GSW
-    call su_row_color
+    call su_row_colors
     mov si, su_str_gsw
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 2
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
     call su_draw_mode_value
 
     ; Peripherals row.
     mov bl, SU_ROW_PERIPH
-    call su_row_color
+    call su_row_colors
     mov si, su_str_periph
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 3
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
 
     ; Health row.
     mov bl, SU_ROW_HEALTH
-    call su_row_color
+    call su_row_colors
     mov si, su_str_health
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 4
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
 
     ; Repair Toka-DOS row.
     mov bl, SU_ROW_REPAIR
-    call su_row_color
+    call su_row_colors
     mov si, su_str_repair
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 5
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
 
     ; Save row.
     mov bl, SU_ROW_SAVE
-    call su_row_color
+    call su_row_colors
     mov si, su_str_save
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 6
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
 
     ; Discard row.
     mov bl, SU_ROW_DISCARD
-    call su_row_color
+    call su_row_colors
     mov si, su_str_discard
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 7
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
 
-    ; Footer hint.
+    ; Context-sensitive help line 1, and the static dead-key note on line 2,
+    ; both below the box.
+    call su_draw_help
+    ret
+
+; su_draw_help: wipe and redraw the two-line help footer below the box. Line 1
+; changes with the highlighted row (su_help_str_for_row); line 2 is the static
+; dead-key note. DS bounces; leaves DS = CS.
+su_draw_help:
     push cs
     pop ds
-    mov si, su_str_hint
-    mov di, 8                       ; from x=8 so the line fits inside 320 px
-    mov ax, SU_MENU_Y + SU_ROW_DY * 9 + 4
-    mov bl, SU_COLOR_INFO
+    mov di, SU_HELP_X
+    mov si, SU_HELP1_Y
+    mov cx, SU_BOX_W
+    mov dx, 22
+    mov bl, COLOR_BG                ; the screen field outside the box (black)
+    call lfb_fill_rect
+    xor cx, cx
+    mov ds, cx
+    mov bl, [SU_CURSOR]
+    call su_help_str_for_row        ; DS:SI = CS:help string for this row
+    mov di, SU_HELP_X
+    mov ax, SU_HELP1_Y
+    mov bl, SU_C_DISABLED
     mov bh, COLOR_BG
-    call gfx_text
-    ; Keyboard note: the non-US layouts have no dead-key composition this slice, so
-    ; a key that is a dead key on real hardware emits its base character.
+    call lfb_text
     push cs
     pop ds
     mov si, su_str_deadnote
-    mov di, 8
-    mov ax, SU_MENU_Y + SU_ROW_DY * 10 + 4
-    mov bl, SU_COLOR_INFO
+    mov di, SU_HELP_X
+    mov ax, SU_HELP2_Y
+    mov bl, SU_C_DISABLED
     mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
     ret
 
-; su_service_note: draw a one-line Repair result at SI (CS string) in the row
-; below Discard, bright cyan. Persists until the next key repaints. Sets DS = CS.
+; su_help_str_for_row: BL = main-menu row index -> DS:SI = CS:help string.
+; Sets DS = CS. Clobbers AX.
+su_help_str_for_row:
+    push cs
+    pop ds
+    cmp bl, SU_ROW_TIME
+    je .time
+    cmp bl, SU_ROW_LAYOUT
+    je .layout
+    cmp bl, SU_ROW_GSW
+    je .gsw
+    cmp bl, SU_ROW_PERIPH
+    je .periph
+    cmp bl, SU_ROW_HEALTH
+    je .health
+    cmp bl, SU_ROW_REPAIR
+    je .repair
+    cmp bl, SU_ROW_SAVE
+    je .save
+    mov si, su_str_help_discard
+    ret
+.time:
+    mov si, su_str_help_time
+    ret
+.layout:
+    mov si, su_str_help_layout
+    ret
+.gsw:
+    mov si, su_str_help_gsw
+    ret
+.periph:
+    mov si, su_str_help_periph
+    ret
+.health:
+    mov si, su_str_help_health
+    ret
+.repair:
+    mov si, su_str_help_repair
+    ret
+.save:
+    mov si, su_str_help_save
+    ret
+
+; su_service_note: draw a one-line Repair result in the help band (line 1),
+; bright ink, overwriting the context help until the next key repaints. DS = CS.
 ; Clobbers AX, DI.
 su_service_note:
     push cs
     pop ds
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 8
-    mov bl, SU_COLOR_VALUE
+    push si
+    mov di, SU_HELP_X
+    mov si, SU_HELP1_Y
+    mov cx, SU_BOX_W
+    mov dx, 11
+    mov bl, COLOR_BG
+    call lfb_fill_rect
+    pop si
+    push cs
+    pop ds
+    mov di, SU_HELP_X
+    mov ax, SU_HELP1_Y
+    mov bl, SU_C_TITLE
     mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
     ret
 
-; su_row_color: BL = selectable-row index on entry; returns BL = the highlight
-; color if that row is the cursor, else the plain row color. Restores DS = CS for
-; the caller's gfx_text. Clobbers AX, CX.
-su_row_color:
+; su_row_colors: BL = selectable-row index on entry; returns BL = foreground,
+; BH = background for that row's label (ink-on-field normally, field-on-ink
+; inverse when it is the highlighted row -- the same focused-band look the Tab
+; boot menu uses). When focused, also paints the ink highlight band under the
+; row before returning, so the caller's lfb_text lands on top of it. The
+; caller sets DI/AX (x/y) *before* calling this, for its own following
+; lfb_text call, so DI/AX/SI/CX/DX are all fully preserved here (saved on the
+; stack around the highlight-band math and the lfb_fill_rect call, which needs
+; its own DI/SI/CX/DX). Restores DS = CS for the caller's lfb_text.
+su_row_colors:
+    push ax
     push cx
+    push dx
+    push si
+    push di
     mov cl, bl                      ; save the input row index across the DS:BX load
     xor ax, ax
     mov ds, ax
     mov bx, SU_CURSOR
     mov al, [bx]
     cmp al, cl
-    mov bl, SU_COLOR_ROW
-    jne .done
-    mov bl, SU_COLOR_HILITE
+    jne .plain
+    ; Highlighted: paint the ink band across the row.
+    movzx ax, cl
+    mov si, SU_ROW_DY
+    mul si                          ; ax = row * SU_ROW_DY (unsigned mul16, 8086-safe)
+    add ax, SU_MENU_Y - 2
+    mov si, ax                      ; si = band y
+    mov di, SU_MENU_X - 6
+    mov cx, SU_BOX_W - (SU_MENU_X - 6 - SU_BOX_X) * 2
+    mov dx, SU_ROW_DY
+    mov bl, SU_C_INK
+    call lfb_fill_rect
+    mov bl, SU_C_FIELD               ; fg = field (inverse)
+    mov bh, SU_C_INK                 ; bg = ink band
+    jmp .done
+.plain:
+    mov bl, SU_C_INK                 ; fg = ink
+    mov bh, SU_C_FIELD                ; bg = field
 .done:
-    pop cx
     push cs
-    pop ds                          ; restore DS = CS for the caller's gfx_text
+    pop ds                           ; restore DS = CS for the caller's lfb_text
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop ax
     ret
 
 ; su_draw_mode_value: draw the working GSW mode's name (386/486/586/286) at the
 ; value column on the GSW row. Reads SU_WORKING_MODE; uses DS = CS for the string.
+; Uses the same fg/bh the row label got from su_row_colors (passed in via BL/BH
+; from the caller's last su_row_colors call, re-derived here to keep this
+; routine self-contained).
 su_draw_mode_value:
     push cx
     xor cx, cx
@@ -846,9 +959,9 @@ su_draw_mode_value:
 .put:
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 2
-    mov bl, SU_COLOR_VALUE
-    mov bh, COLOR_BG
-    call gfx_text
+    mov bl, SU_ROW_GSW
+    call su_row_colors
+    call lfb_text
     pop cx
     ret
 
@@ -872,9 +985,9 @@ su_draw_layout_value:
     mov si, [su_layout_names + bx]
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY
-    mov bl, SU_COLOR_VALUE
-    mov bh, COLOR_BG
-    call gfx_text
+    mov bl, SU_ROW_LAYOUT
+    call su_row_colors
+    call lfb_text
     pop cx
     ret
 
@@ -892,6 +1005,32 @@ su_draw_time_value:
     mov bx, SU_TIME_SEC
     call su_put2                    ; SS
     pop cx
+    ret
+
+; su_time_row_colors: return BL=fg, BH=bg for the Time row's value glyphs,
+; matching su_row_colors' highlighted-vs-plain look, but WITHOUT touching DS --
+; su_row_colors always hands back DS=CS for a CS-relative label, which is wrong
+; for these callers' segment-0 BIOS_VALBUF/colon-buffer strings. The highlight
+; band itself is already painted by the Time row's own su_row_colors call in
+; su_draw/su_draw_time_value, so this only needs to pick the two colors, not
+; paint anything. Preserves all registers except BL/BH.
+su_time_row_colors:
+    push ax
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov al, [SU_CURSOR]
+    cmp al, SU_ROW_TIME
+    jne .plain
+    mov bl, SU_C_FIELD               ; fg = field (inverse, on the ink band)
+    mov bh, SU_C_INK
+    jmp .done
+.plain:
+    mov bl, SU_C_INK                 ; fg = ink
+    mov bh, SU_C_FIELD
+.done:
+    pop ds
+    pop ax
     ret
 
 ; su_put2: draw the two-digit decimal of the byte at segment-0 [BX] at DI on the
@@ -914,9 +1053,8 @@ su_put2:
     mov si, BIOS_VALBUF             ; DS:SI = the two-digit string (DS still 0)
     push di
     mov ax, SU_MENU_Y
-    mov bl, SU_COLOR_VALUE
-    mov bh, COLOR_BG
-    call gfx_text
+    call su_time_row_colors         ; BL/BH only; DS stays 0 for lfb_text's DS:SI
+    call lfb_text
     pop di
     add di, 16
     pop si
@@ -925,19 +1063,39 @@ su_put2:
     ret
 
 ; su_put_colon: draw a ':' separator at DI on the Time row, advancing DI by 8 px.
+; DS = CS for the ROM ':' string, so this picks its own fg/bg without disturbing
+; DS the way su_row_colors/su_time_row_colors would (both assume a specific DS
+; for the caller's following lfb_text, and this caller's is CS, not 0).
 su_put_colon:
+    push ax
     push si
     push cs
     pop ds
     mov si, su_str_colon
     push di
+    ; Fg/bg: inverse (field-on-ink) when Time is the highlighted row, else plain.
+    push bx
+    xor ax, ax
+    push ds
+    mov ds, ax
+    mov al, [SU_CURSOR]
+    pop ds
+    cmp al, SU_ROW_TIME
+    jne .plain
+    mov bl, SU_C_FIELD
+    mov bh, SU_C_INK
+    jmp .have_color
+.plain:
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+.have_color:
     mov ax, SU_MENU_Y
-    mov bl, SU_COLOR_VALUE
-    mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
+    pop bx
     pop di
     add di, 8
     pop si
+    pop ax
     ret
 
 ; ============================ Time sub-page ============================
@@ -1085,23 +1243,32 @@ su_time_adjust:
     mov [bx], al
     ret
 
-; su_time_draw: paint the time sub-page. Heading, the editable HH:MM:SS line and
-; the DD/MM/YY date line with the highlighted field in cyan, and a hint footer.
+; su_time_draw: paint the time sub-page. Title, a box holding the editable
+; HH:MM:SS line and the DD/MM/YY date line with the highlighted field in the
+; inverse band, and a hint footer below the box.
 su_time_draw:
-    call su_enter_mode13h
+    call su_enter_setup_lfb
     mov al, COLOR_BG
-    call gfx_clear
+    call lfb_clear
     push cs
     pop ds
     mov si, su_str_time_title
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y - SU_ROW_DY
-    mov bl, SU_COLOR_HEAD
-    mov bh, COLOR_BG
-    call gfx_text
+    mov di, SU_TITLE_X
+    mov ax, SU_TITLE_Y
+    mov bl, SU_C_TITLE
+    mov bh, SU_C_FIELD
+    call lfb_text
+    ; Sub-page box, shorter than the main menu box (just the two lines).
+    mov di, SU_BOX_X
+    mov si, SU_BOX_Y
+    mov cx, SU_BOX_W
+    mov dx, 56
+    mov bl, SU_C_FIELD
+    mov bh, SU_C_INK
+    call lfb_box
     ; Time line: HH:MM:SS, each field colored by whether it is highlighted.
     mov di, SU_MENU_X
-    mov bp, SU_MENU_Y + SU_ROW_DY
+    mov bp, SU_BOX_Y + 12
     mov bl, SU_TF_HOUR
     mov si, SU_TIME_HOUR
     call su_time_field
@@ -1115,7 +1282,7 @@ su_time_draw:
     call su_time_field
     ; Date line: DD / MM / YY.
     mov di, SU_MENU_X
-    mov bp, SU_MENU_Y + SU_ROW_DY * 3
+    mov bp, SU_BOX_Y + 32
     mov bl, SU_TF_DAY
     mov si, SU_TIME_DAY
     call su_time_field
@@ -1127,34 +1294,58 @@ su_time_draw:
     mov bl, SU_TF_YEAR
     mov si, SU_TIME_YEAR
     call su_time_field
-    ; Hint.
+    ; Hint footer, below the box.
     push cs
     pop ds
+    mov di, SU_HELP_X
+    mov si, SU_HELP1_Y
+    mov cx, SU_BOX_W
+    mov dx, 11
+    mov bl, COLOR_BG
+    call lfb_fill_rect
     mov si, su_str_time_hint
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 6
-    mov bl, SU_COLOR_INFO
+    mov di, SU_HELP_X
+    mov ax, SU_HELP1_Y
+    mov bl, SU_C_DISABLED
     mov bh, COLOR_BG
-    call gfx_text
+    call lfb_text
     ret
 
 ; su_time_field: draw the two-digit value at segment-0 offset SI at pixel DI/BP,
-; in cyan if field index BL is the highlighted field else white. Advances DI by
-; 16 px. DS bounces 0/CS internally. Clobbers AX, CX.
+; in an inverse ink band if field index BL is the highlighted field else plain
+; ink-on-field. Advances DI by 16 px. DS bounces 0/CS internally. lfb_fill_rect
+; is pusha/popa internally, so DI/SI/BX/CX/DX all survive that call for free.
+; Clobbers AX, CX.
 su_time_field:
     push si
     push dx
     xor ax, ax
     mov ds, ax                      ; DS = 0 for the field state, value, and buffer
-    ; DL = chosen foreground: cyan when this field is highlighted, else white.
+    ; DH = highlighted field index; decide plain vs. inverse.
     push bx
     mov bx, SU_TIME_FIELD
-    mov dh, [bx]                    ; DH = highlighted field index
+    mov dh, [bx]
     pop bx
-    mov dl, SU_COLOR_ROW
     cmp bl, dh
-    jne .have_color
-    mov dl, SU_COLOR_HILITE
+    jne .plain
+    ; Highlighted: paint a small ink band under this field (DI/SI still hold the
+    ; caller's x/bp-relative y going in; lfb_fill_rect preserves them via popa).
+    push si
+    mov si, bp
+    dec si
+    mov cx, 14
+    mov dx, 10
+    push bx
+    mov bl, SU_C_INK
+    call lfb_fill_rect
+    pop bx
+    pop si
+    mov dl, SU_C_FIELD               ; fg = field
+    mov dh, SU_C_INK                 ; bg = ink
+    jmp .have_color
+.plain:
+    mov dl, SU_C_INK                 ; fg = ink
+    mov dh, SU_C_FIELD                ; bg = field
 .have_color:
     ; Format the two-digit value at [SI] into BIOS_VALBUF.
     mov al, [si]
@@ -1168,9 +1359,9 @@ su_time_field:
     mov byte [BIOS_VALBUF + 2], 0
     mov si, BIOS_VALBUF
     mov bl, dl                      ; BL = chosen foreground
-    mov bh, COLOR_BG
+    mov bh, dh                      ; BH = chosen background
     mov ax, bp                      ; y
-    call gfx_text                   ; DS = 0, SI = buffer
+    call lfb_text                   ; DS = 0, SI = buffer
     add di, 16
     pop dx
     pop si
@@ -1189,10 +1380,10 @@ su_time_slash:
     pop ds
     mov si, su_str_slash
 su_time_sep_common:
-    mov bl, SU_COLOR_ROW
-    mov bh, COLOR_BG
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
     mov ax, bp
-    call gfx_text
+    call lfb_text
     add di, 8
     pop si
     ret
@@ -1208,9 +1399,9 @@ su_time_sep_common:
     mov si, %1
     mov di, SU_MENU_X
     mov ax, SU_MENU_Y + SU_ROW_DY * %3
-    mov bl, SU_COLOR_INFO
-    mov bh, COLOR_BG
-    call gfx_text
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+    call lfb_text
     mov ax, BDA_SEG
     mov ds, ax                      ; probe contract: DS = BDA on entry
     call %2                         ; AL = HRES_* on return
@@ -1219,34 +1410,47 @@ su_time_sep_common:
     cmp al, HRES_FAIL
     je %%fail
     mov si, su_str_pass
-    mov bl, SU_COLOR_PASS
+    mov bl, SU_C_PASS
     jmp %%put
 %%fail:
     mov si, su_str_fail
-    mov bl, SU_COLOR_FAIL
+    mov bl, SU_C_FAIL
 %%put:
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY * %3
-    mov bh, COLOR_BG
-    call gfx_text
+    mov bh, SU_C_FIELD
+    call lfb_text
 %endmacro
 
 ; su_periph_page: re-run each POST probe live (they are non-destructive) and list
-; its PASS/FAIL or MEASURE value. Esc returns. The probe handlers follow the POST
-; contract: AL = HRES_PASS/FAIL/MEASURE on return; MEASURE leaves SI = a segment-0
-; ASCIIZ value offset. We enter each with DS = BDA_SEG to match that contract.
+; its PASS/FAIL as a boxed table with an aligned status column. Esc returns. The
+; probe handlers follow the POST contract: AL = HRES_PASS/FAIL/MEASURE on return;
+; MEASURE leaves SI = a segment-0 ASCIIZ value offset (unused here -- none of
+; these seven probes return MEASURE in practice). We enter each with DS = BDA_SEG
+; to match that contract.
 su_periph_page:
-    call su_enter_mode13h
+    call su_enter_setup_lfb
     mov al, COLOR_BG
-    call gfx_clear
+    call lfb_clear
     push cs
     pop ds
     mov si, su_str_periph_title
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y - SU_ROW_DY
-    mov bl, SU_COLOR_HEAD
-    mov bh, COLOR_BG
-    call gfx_text
+    mov di, SU_TITLE_X
+    mov ax, SU_TITLE_Y
+    mov bl, SU_C_TITLE
+    mov bh, SU_C_FIELD
+    call lfb_text
+    ; Table box sized for the 7 probe rows.
+    mov di, SU_BOX_X
+    mov si, SU_BOX_Y
+    mov cx, SU_BOX_W
+    mov dx, SU_ROW_DY * 7 + 12
+    mov bl, SU_C_FIELD
+    mov bh, SU_C_INK
+    call lfb_box
+    ; A thin rule under the header band separating the title row from the probes
+    ; would need another box primitive call; skipped to keep this lean -- the row
+    ; color contrast already reads as a table.
 
     ; One row per probe. SU_PROBE macro: name string, handler label, row index.
     SU_PROBE su_str_p_lotura, probe_lotura, 0
@@ -1256,6 +1460,22 @@ su_periph_page:
     SU_PROBE su_str_p_sbdsp,  probe_sbdsp, 4
     SU_PROBE su_str_p_opl,    probe_opl, 5
     SU_PROBE su_str_p_margo,  probe_margo, 6
+
+    ; Hint footer, below the box.
+    push cs
+    pop ds
+    mov di, SU_HELP_X
+    mov si, SU_HELP1_Y
+    mov cx, SU_BOX_W
+    mov dx, 11
+    mov bl, COLOR_BG
+    call lfb_fill_rect
+    mov si, su_str_periph_hint
+    mov di, SU_HELP_X
+    mov ax, SU_HELP1_Y
+    mov bl, SU_C_DISABLED
+    mov bh, COLOR_BG
+    call lfb_text
 
     sti
 .loop:
@@ -1272,7 +1492,8 @@ su_periph_page:
 
 ; ============================ Health sub-page ============================
 ; su_health_page: show the voltage rails and temperatures with a small per-refresh
-; jitter from the LFSR. Esc returns; any other key re-jitters and repaints at once.
+; jitter from the LFSR, each as a labeled horizontal bar plus its value, inside a
+; box. Esc returns; any other key re-jitters and repaints at once.
 ; The values are fixed bases plus a signed wobble so the page looks alive without a
 ; real hardware monitor port.
 ;
@@ -1361,48 +1582,71 @@ su_lfsr_step:
     mov ax, dx
     ret
 
-; su_health_draw: paint the health page. Each rail or temperature is a label plus a
-; jittered value. su_draw_rail / su_draw_temp do one line each; the labels and the
-; row Y are passed in registers so the page is a flat list of calls.
+; su_health_draw: paint the health page. Title, a box holding a labeled bar plus
+; value for each rail/temperature. su_draw_rail / su_draw_temp do one line each;
+; the labels and the row Y are passed in registers so the page is a flat list of
+; calls.
 su_health_draw:
-    call su_enter_mode13h
+    call su_enter_setup_lfb
     mov al, COLOR_BG
-    call gfx_clear
+    call lfb_clear
     push cs
     pop ds
     mov si, su_str_health_title
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y - SU_ROW_DY
-    mov bl, SU_COLOR_HEAD
-    mov bh, COLOR_BG
-    call gfx_text
+    mov di, SU_TITLE_X
+    mov ax, SU_TITLE_Y
+    mov bl, SU_C_TITLE
+    mov bh, SU_C_FIELD
+    call lfb_text
+    ; Box tall enough for 5 rails + 2 temps with a small gap between the groups.
+    mov di, SU_BOX_X
+    mov si, SU_BOX_Y
+    mov cx, SU_BOX_W
+    mov dx, SU_ROW_DY * 9 + 6
+    mov bl, SU_C_FIELD
+    mov bh, SU_C_INK
+    call lfb_box
 
     ; Rails. su_draw_rail: SI = label, DX = prefix string ("<sign>WHOLE."),
-    ; CL = base hundredths, BP = row Y. The hundredths get the LFSR jitter.
+    ; CL = base hundredths, CH = the prefix's whole-number magnitude (unsigned,
+    ; matching the digit(s) already baked into the DX string -- CH, not DH: DX
+    ; is a 16-bit ROM address here, so its high byte cannot double as a small
+    ; integer), BP = row Y, BH = full-scale whole volts for the bar length (the
+    ; rails span different natural ranges, so each gets its own scale).
     mov si, su_str_r_5v
     mov dx, su_str_v_5
     mov cl, 0
+    mov ch, 5
     mov bp, SU_MENU_Y
+    mov bh, 5
     call su_draw_rail
     mov si, su_str_r_33v
     mov dx, su_str_v_33
     mov cl, 30
+    mov ch, 3
     mov bp, SU_MENU_Y + SU_ROW_DY
+    mov bh, 5
     call su_draw_rail
     mov si, su_str_r_12v
     mov dx, su_str_v_12
     mov cl, 0
+    mov ch, 12
     mov bp, SU_MENU_Y + SU_ROW_DY * 2
+    mov bh, 12
     call su_draw_rail
     mov si, su_str_r_n12v
     mov dx, su_str_v_n12
     mov cl, 0
+    mov ch, 12
     mov bp, SU_MENU_Y + SU_ROW_DY * 3
+    mov bh, 12
     call su_draw_rail
     mov si, su_str_r_vcore
     mov dx, su_str_v_vcore
     mov cl, 90
+    mov ch, 2
     mov bp, SU_MENU_Y + SU_ROW_DY * 4
+    mov bh, 3
     call su_draw_rail
 
     ; Temperatures. su_draw_temp: SI = label, CL = base degrees, BP = row Y.
@@ -1414,21 +1658,56 @@ su_health_draw:
     mov cl, 35
     mov bp, SU_MENU_Y + SU_ROW_DY * 7
     call su_draw_temp
+
+    ; Hint footer, below the box.
+    push cs
+    pop ds
+    mov di, SU_HELP_X
+    mov si, SU_HELP1_Y
+    mov cx, SU_BOX_W
+    mov dx, 11
+    mov bl, COLOR_BG
+    call lfb_fill_rect
+    mov si, su_str_health_hint
+    mov di, SU_HELP_X
+    mov ax, SU_HELP1_Y
+    mov bl, SU_C_DISABLED
+    mov bh, COLOR_BG
+    call lfb_text
     ret
 
-; su_draw_rail: draw one voltage rail line. SI = CS label, DX = CS prefix string
-; ("<sign>WHOLE.", e.g. "+5."), CL = base hundredths, BP = row Y. Builds
-; "<prefix>FF V" in BIOS_VALBUF and draws label + value. Preserves caller registers.
+; su_draw_rail: draw one voltage rail line: label, a small horizontal bar
+; (length proportional to the jittered reading against a BH-volt full scale),
+; and the "<prefix>FF V" value text. SI = CS label, DX = CS prefix string
+; ("<sign>WHOLE.", e.g. "+5."), CL = base hundredths, CH = the prefix's
+; whole-number magnitude (unsigned, matching the digit(s) baked into the DX
+; string -- CH, not DH: DX is consumed whole as the prefix-string address
+; below, so its high byte cannot double as a small integer), BP = row Y,
+; BH = full-scale whole volts for the bar length. Preserves caller registers.
 su_draw_rail:
     pusha
+    ; Stash BH (full-scale volts) and CH (whole-number magnitude) in segment-0
+    ; scratch before they are clobbered below (BH as a background-color
+    ; argument to lfb_text, CH along with the rest of CX by the digit-split
+    ; div later); the bar-length math needs both at the end of this routine.
+    push ax
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov al, bh
+    mov [SU_RAIL_SCALE], al
+    mov al, ch
+    mov [SU_RAIL_WHOLE], al
+    pop ds
+    pop ax
     ; Label.
     push cs
     pop ds
     mov di, SU_MENU_X
     mov ax, bp
-    mov bl, SU_COLOR_INFO
-    mov bh, COLOR_BG
-    call gfx_text                   ; SI = label
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+    call lfb_text                   ; SI = label
     ; Copy the prefix into BIOS_VALBUF, tracking the free index in DI.
     push cs
     pop ds
@@ -1452,6 +1731,7 @@ su_draw_rail:
 .copied:
     ; Two fraction digits = (base + jitter), then " V".
     call su_lfsr_step               ; AL = 0..4 (DS = 0 after)
+    mov dl, al                      ; DL = jitter, stashed across the digit split
     add al, cl                      ; base hundredths + jitter
     mov ah, 0
     mov bl, 10
@@ -1466,25 +1746,70 @@ su_draw_rail:
     mov byte [bx + 4], 0
     ; Draw the value.
     mov si, BIOS_VALBUF
-    mov di, SU_VALUE_X
+    mov di, SU_HEALTH_VALUE_X
     mov ax, bp
-    mov bl, SU_COLOR_VALUE
-    mov bh, COLOR_BG
-    call gfx_text                   ; DS = 0, SI = buffer
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+    call lfb_text                   ; DS = 0, SI = buffer
+    ; Bar: length = (whole*100 + base + jitter) hundredths-of-a-volt scaled
+    ; against (full-scale-volts * 100) hundredths, clamped to the band's pixel
+    ; width. A simple, readable fraction rather than exact physical scaling --
+    ; this is cosmetic jitter, not a real sensor.
+    ;
+    ; reading_hundredths = whole*100 + base_hundredths + jitter (fits in AX: the
+    ; largest rail here is 12V, 1200 + 99 + 4 = 1303).
+    xor ax, ax
+    mov al, [SU_RAIL_WHOLE]
+    mov bx, 100
+    mul bx                          ; ax = whole * 100 (dx = 0, whole <= 12)
+    mov bh, 0
+    mov bl, cl
+    add ax, bx                      ; ax += base hundredths
+    add al, dl                      ; ax += jitter (0..4)
+    adc ah, 0
+    ; pixels = reading_hundredths * SU_BAR_W / (full_scale_volts * 100). The
+    ; product (up to ~1303 * 90 = 117270) does not fit AX alone, so this uses
+    ; the native 32-bit mul->div chain: mul leaves the full product in DX:AX,
+    ; and div takes DX:AX as its dividend.
+    mov bx, SU_BAR_W
+    mul bx                          ; dx:ax = reading_hundredths * SU_BAR_W
+    push ax
+    push dx
+    xor ax, ax
+    mov al, [SU_RAIL_SCALE]
+    mov bx, 100
+    mul bx                          ; ax = full_scale_volts * 100 (divisor, fits 16 bits)
+    mov bx, ax
+    pop dx
+    pop ax
+    div bx                          ; ax = pixels (dx:ax / bx)
+    cmp ax, SU_BAR_W
+    jbe .bar_ok
+    mov ax, SU_BAR_W
+.bar_ok:
+    mov cx, ax
+    inc cx                          ; at least a 1px sliver so a 0 reading is visible
+    mov di, SU_BAR_X
+    mov si, bp
+    add si, 1
+    mov dx, SU_BAR_H
+    mov bl, SU_C_PASS
+    call lfb_fill_rect
     popa
     ret
 
-; su_draw_temp: draw one temperature line. SI = CS label, CL = base degrees, BP =
-; row Y. Builds "<DD> C" in BIOS_VALBUF. Preserves caller registers.
+; su_draw_temp: draw one temperature line: label, a bar, and "<DD> C" in
+; BIOS_VALBUF. SI = CS label, CL = base degrees, BP = row Y. Preserves caller
+; registers.
 su_draw_temp:
     pusha
     push cs
     pop ds
     mov di, SU_MENU_X
     mov ax, bp
-    mov bl, SU_COLOR_INFO
-    mov bh, COLOR_BG
-    call gfx_text                   ; SI = label
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+    call lfb_text                   ; SI = label
     call su_lfsr_step               ; AL = 0..4 (DS = 0 after)
     ; Clamp the temperature wobble to +/-1 degree: (AL mod 3) - 1 gives -1/0/+1,
     ; tighter than the voltage rails, which keep their wider raw ripple.
@@ -1494,6 +1819,7 @@ su_draw_temp:
     mov al, ah
     dec al                          ; -1, 0, or +1
     add al, cl                      ; base degrees +/- 1
+    mov dl, al                      ; DL = the drawn degrees value, for the bar
     mov ah, 0
     mov bl, 10
     div bl                          ; AL = tens, AH = units
@@ -1505,11 +1831,29 @@ su_draw_temp:
     mov byte [BIOS_VALBUF + 3], 'C'
     mov byte [BIOS_VALBUF + 4], 0
     mov si, BIOS_VALBUF
-    mov di, SU_VALUE_X
+    mov di, SU_HEALTH_VALUE_X
     mov ax, bp
-    mov bl, SU_COLOR_VALUE
-    mov bh, COLOR_BG
-    call gfx_text
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+    call lfb_text
+    ; Bar: length proportional to degrees against a 0..60 C span.
+    movzx ax, dl
+    mov bx, SU_BAR_W
+    mul bx
+    mov bl, 60
+    div bl
+    cmp al, SU_BAR_W
+    jbe .bar_ok
+    mov al, SU_BAR_W
+.bar_ok:
+    movzx cx, al
+    inc cx
+    mov di, SU_BAR_X
+    mov si, bp
+    add si, 1
+    mov dx, SU_BAR_H
+    mov bl, SU_C_FAIL
+    call lfb_fill_rect
     popa
     ret
 
@@ -1525,8 +1869,16 @@ su_str_repaired:     db 'Toka-DOS repaired', 0
 su_str_svc_fail:     db 'No Toka-DOS image', 0
 su_str_save:         db 'SAVE AND EXIT', 0
 su_str_discard:      db 'DISCARD AND EXIT', 0
-su_str_hint:         db 'Up/Dn move  L/R edit  Enter  Esc back', 0
 su_str_deadnote:     db 'Note: dead keys emit base character', 0
+; Context-sensitive help line 1, one per main-menu row.
+su_str_help_time:    db 'Enter: set clock  Up/Dn move  Esc back', 0
+su_str_help_layout:  db 'Left/Right: change keyboard  Enter: open', 0
+su_str_help_gsw:     db 'Left/Right: change CPU speed  Enter: open', 0
+su_str_help_periph:  db 'Enter: check devices  Up/Dn move  Esc back', 0
+su_str_help_health:  db 'Enter: view sensors  Up/Dn move  Esc back', 0
+su_str_help_repair:  db 'Enter: reinstall Toka-DOS  Up/Dn move', 0
+su_str_help_save:    db 'Enter/F10: save and reboot  Up/Dn move', 0
+su_str_help_discard: db 'Enter/Esc: discard and reboot  Up/Dn move', 0
 ; POST hotkey feedback (Bug 4). Drawn on the white POST field, so kept short.
 su_str_enter_setup:  db 'Entering configuration...', 0
 su_str_enter_boot:   db 'Entering boot menu...', 0
@@ -1568,6 +1920,7 @@ su_str_time_title:   db 'SET TIME AND DATE', 0
 su_str_time_hint:    db 'L/R field  Up/Dn change  Esc back', 0
 
 su_str_periph_title: db 'PERIPHERAL CHECK', 0
+su_str_periph_hint:  db 'Esc: back to menu', 0
 su_str_pass:         db 'PASS', 0
 su_str_fail:         db 'FAIL', 0
 su_str_p_lotura:     db 'LOTURA', 0
@@ -1579,6 +1932,7 @@ su_str_p_opl:        db 'OPL FM', 0
 su_str_p_margo:      db 'MARGO VGA', 0
 
 su_str_health_title: db 'SYSTEM HEALTH', 0
+su_str_health_hint:  db 'Esc: back to menu  any key: refresh', 0
 su_str_r_5v:         db '+5V RAIL', 0
 su_str_r_33v:        db '+3.3V RAIL', 0
 su_str_r_12v:        db '+12V RAIL', 0

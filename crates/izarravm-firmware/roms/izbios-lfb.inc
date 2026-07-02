@@ -191,6 +191,89 @@ lfb_fill_rect:
     popa
     ret
 
+; lfb_box: DI=x, SI(word)=y, CX=w, DX=h, BL=interior color, BH=border color.
+; A 1px border rectangle with a filled interior, built from four lfb_fill_rect
+; calls (top edge, bottom edge, then the left+right border folded into two
+; side slivers around a shrunk interior fill) rather than baked art, so
+; setup-ui's boxed panels need no new RLE assets. The geometry lives in the
+; BOX_* segment-0 scratch (mirroring lfb_blit_1bpp) so each lfb_fill_rect call
+; is free to clobber DI/SI/CX/DX/BX. Boxes narrower/shorter than 2px in either
+; axis skip the interior fill (nothing to fill). Preserves caller registers.
+lfb_box:
+    pusha
+    push ds
+    xor ax, ax
+    mov ds, ax
+    mov [BOX_X], di
+    mov [BOX_Y], si
+    mov [BOX_W], cx
+    mov [BOX_H], dx
+    mov [BOX_IN], bl             ; interior color
+    mov [BOX_BD], bh             ; border color
+    ; Top edge: (x, y, w, 1).
+    mov di, [BOX_X]
+    mov si, [BOX_Y]
+    mov cx, [BOX_W]
+    mov dx, 1
+    mov bl, [BOX_BD]
+    call lfb_fill_rect
+    ; Bottom edge: (x, y+h-1, w, 1). Skipped when h < 2 (the top edge covers it).
+    cmp word [BOX_H], 2
+    jb .no_bottom
+    mov di, [BOX_X]
+    mov si, [BOX_Y]
+    add si, [BOX_H]
+    dec si
+    mov cx, [BOX_W]
+    mov dx, 1
+    mov bl, [BOX_BD]
+    call lfb_fill_rect
+.no_bottom:
+    ; Left edge: (x, y+1, 1, h-2). Skipped when h < 3 (nothing between top/bottom).
+    cmp word [BOX_H], 3
+    jb .no_sides
+    mov di, [BOX_X]
+    mov si, [BOX_Y]
+    inc si
+    mov cx, 1
+    mov dx, [BOX_H]
+    sub dx, 2
+    mov bl, [BOX_BD]
+    call lfb_fill_rect
+    ; Right edge: (x+w-1, y+1, 1, h-2). Skipped when w < 2 (the left edge covers it).
+    cmp word [BOX_W], 2
+    jb .no_sides
+    mov di, [BOX_X]
+    add di, [BOX_W]
+    dec di
+    mov si, [BOX_Y]
+    inc si
+    mov cx, 1
+    mov dx, [BOX_H]
+    sub dx, 2
+    mov bl, [BOX_BD]
+    call lfb_fill_rect
+.no_sides:
+    ; Interior: (x+1, y+1, w-2, h-2). Skipped when w < 3 or h < 3.
+    cmp word [BOX_W], 3
+    jb .done
+    cmp word [BOX_H], 3
+    jb .done
+    mov di, [BOX_X]
+    inc di
+    mov si, [BOX_Y]
+    inc si
+    mov cx, [BOX_W]
+    sub cx, 2
+    mov dx, [BOX_H]
+    sub dx, 2
+    mov bl, [BOX_IN]
+    call lfb_fill_rect
+.done:
+    pop ds
+    popa
+    ret
+
 ; lfb_blit_1bpp: draw a 1-bpp ROM bitmap; set bits painted in color BL, clear
 ; bits leave the background. CS:SI=bitmap top row, DI=x, AX=y, CX=width(px),
 ; DX=height(rows), BH=stride(bytes/row). Uses the BLIT_* segment-0 scratch.

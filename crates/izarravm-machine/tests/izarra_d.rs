@@ -1,4 +1,4 @@
-// STREAM D integration test: the mode-13h setup page.
+// STREAM D integration test: the Margo-LFB setup page.
 //
 // Drives the public Machine API only. The setup page is a multi-row menu; the GSW
 // compatibility mode is the third selectable row (Time, Keyboard, CPU mode, ...),
@@ -9,6 +9,8 @@
 //   2. With the hotkey, navigating to the CPU-mode row, editing it, and Save (F10),
 //      the live Lotura write switches active_mode() to the chosen GswMode.
 //   3. Discard (Esc) leaves the live mode untouched.
+//   4. The setup page draws on the Margo LFB (mode 0x150), like the graphical POST
+//      screen and the Tab boot menu: the red title bar renders inside the box.
 //
 // Keys are fed as Set 1 scancodes via inject_key_scancodes. The menu blocks on a
 // keyboard read between keystrokes, so a whole burst injected up front is consumed
@@ -16,7 +18,7 @@
 
 use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
-use izarravm_machine::{Machine, MachineProfile, StopReason};
+use izarravm_machine::{ActiveDisplay, MARGO_LFB_BASE, Machine, MachineProfile, StopReason};
 
 // Set 1 make/break codes used by the setup page.
 const DEL_MAKE: u8 = 0x53;
@@ -125,10 +127,15 @@ fn setup_discard_keeps_boot_mode() {
 }
 
 #[test]
-fn setup_save_then_setup_draws_mode13h() {
-    // After a Save the BIOS is halted with the setup page on screen in mode 13h.
-    // Advance the beam and confirm a 320-wide raster is presented (the page used the
-    // foundation mode-13h primitives).
+fn setup_save_then_setup_draws_the_lfb() {
+    // After a Save the BIOS commits the change and cold-resets (the setup page's
+    // documented exit); POST then runs again and, finding no further hotkey,
+    // boots straight through to the idle loop. Both POST and the setup page
+    // present on the Margo LFB (mode 0x150), so the display mode stays LFB
+    // across the reset, and the chosen GSW mode is the one that was saved
+    // (proving the reset replayed POST at the new live speed rather than
+    // leaving some stale mode-13h/text state behind, the way the old mode-13h
+    // page could).
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[
         DEL_MAKE,
@@ -143,15 +150,47 @@ fn setup_save_then_setup_draws_mode13h() {
         F10_BREAK, // Save
     ]);
     machine.run_until_halt_or_cycles(30_000_000).unwrap();
-    // Save switched the live mode to 486 (66 MHz), so a full mode-13h frame takes
-    // more CPU clocks to scan than at the 386 boot clock. Advance generously so the
-    // raster engine completes at least one frame before the snapshot.
-    machine.advance_devices_clocks(112_000_000);
-    let raster = machine
-        .vga_raster()
-        .expect("the setup page leaves mode 13h presented");
-    assert_eq!(raster.width, 320);
+
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::MargoLfb,
+        "the post-save reboot leaves the Margo LFB presented"
+    );
     assert_eq!(machine.active_mode(), GswMode::Gsw486);
+}
+
+#[test]
+fn setup_menu_draws_the_title_on_the_lfb() {
+    // While the setup menu is open (before any Save/Discard resets the machine)
+    // it draws its own screen on the Margo LFB: a red title bar reading "IZARRA
+    // 3000 SETUP" at the top-left, inside the bordered menu box. The graphical
+    // POST screen never paints red text in that exact band (its own title sits
+    // elsewhere and the wordmark/mascot art is further right), so red pixels
+    // there prove the setup page's own chrome drew over the LFB, not just that
+    // POST happened to leave the LFB active.
+    let mut machine = boot_machine();
+    machine.inject_key_scancodes(&[DEL_MAKE, DEL_BREAK]); // enter setup, then block on a key
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
+
+    assert_eq!(
+        machine.active_display(),
+        ActiveDisplay::MargoLfb,
+        "the setup menu draws on the Margo LFB"
+    );
+    // Title band y 4..12, x 8..152 ("IZARRA 3000 SETUP", red index ART_RED_INDEX
+    // = 24): scan for red glyph pixels.
+    let mut red = 0;
+    for y in 4..12u32 {
+        for x in 8..152u32 {
+            if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 24 {
+                red += 1;
+            }
+        }
+    }
+    assert!(
+        red > 20,
+        "the red setup title is on the LFB, found {red} red pixels"
+    );
 }
 
 #[test]
