@@ -22,7 +22,7 @@ $fd    = Join-Path $root 'freedos'
 $kdir  = Join-Path $fd 'kernel'
 $fcdir = Join-Path $fd 'freecom'
 
-# Open Watcom env (mirror toka-dos/build.ps1).
+# Open Watcom env.
 $env:WATCOM  = 'D:\DevTools\OpenWatcom'
 $env:PATH    = "$env:WATCOM\binnt;$env:WATCOM\binw;$env:PATH"
 $env:INCLUDE = "$env:WATCOM\h"
@@ -171,12 +171,44 @@ $sortExe = Join-Path $sortdir 'sort.exe'
 if (-not (Test-Path $sortExe)) { throw "sort.exe not produced" }
 Write-Host "SORT.EXE: $((Get-Item $sortExe).Length) bytes"
 
+# --- FreeDOS userland: MEM (Open Watcom wcl, native Win64; no owwin/gmake) ---
+# Same recipe shape as move/sort above, but MEM's own source/mkfiles/watcom.mak
+# gives the reference flags: small memory model (-ms; kitten.c has a
+# sizeof(void*)==2 static-assert-style array that only holds under -ms),
+# -oahls -s -wx -we -zq -fm. mem.c #includes mem2.c itself (one translation
+# unit); MEM.EXE separately links its own prf.c (abbreviated printf) and
+# kitten.c (its own catgets-alike, NOT the move/sort kitten -- incompatible
+# APIs) -- no tnyprntf dependency here.
+$memdir = Join-Path $fd 'mem\source'
+$memCf = @('-bt=DOS','-oahls','-s','-wx','-we','-zq','-fm','-ms')
+Push-Location $memdir
+try {
+    & wcl @memCf -fo=prf    -c prf.c
+    if ($LASTEXITCODE) { throw "wcl prf (mem) failed" }
+    & wcl @memCf -fo=kitten -c kitten.c
+    if ($LASTEXITCODE) { throw "wcl kitten (mem) failed" }
+    & wcl @memCf -fe=mem mem.c prf.obj kitten.obj
+    if ($LASTEXITCODE) { throw "wcl mem failed" }
+} finally { Pop-Location }
+$memExe = Join-Path $memdir 'mem.exe'
+if (-not (Test-Path $memExe)) { throw "mem.exe not produced" }
+Write-Host "MEM.EXE: $((Get-Item $memExe).Length) bytes"
+
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 $tokamous = Join-Path $root 'build-freedos-tokamous.com'
 & nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous
 if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
 Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
+
+# --- GSWMODE (runtime CPU-speed switch via Lotura port 0xE1; committed source
+# lives in the firmware crate alongside the other small DOS .COM fixtures) ---
+$gswmodeSrc = Join-Path $root '..\crates\izarravm-firmware\roms\dos\gswmode.asm'
+$gswmodeOut = Join-Path $root '..\crates\izarravm-firmware\roms\dos\gswmode.com'
+& nasm -f bin $gswmodeSrc -o $gswmodeOut
+if ($LASTEXITCODE) { throw "nasm gswmode failed" }
+if (-not (Test-Path $gswmodeOut)) { throw "GSWMODE not produced" }
+Write-Host "GSWMODE.COM: $((Get-Item $gswmodeOut).Length) bytes"
 
 # --- Assemble the committed image (FAT32 HDD) ---
 & python (Join-Path $root '..\scripts\build-freedos-hdd-image.py')

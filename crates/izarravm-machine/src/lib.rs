@@ -2803,6 +2803,11 @@ impl Machine {
         self.set_eax_al(0x1B);
     }
 
+    /// INT 10h AH=12h BL=30h: record the BIOS's preferred scanline count for
+    /// the *next* mode set. This is BDA/mode-set policy bookkeeping only (feeds
+    /// `text_scanlines_for_mode`/`video_char_height` below) and is independent
+    /// of `Vga::set_char_height`, which reprograms the live CRTC Maximum Scan
+    /// Line register from AH=11h font-load calls.
     fn set_selected_text_scanlines(&mut self, al: u8) -> bool {
         let mut flags = self.read_physical_u8(0x489);
         let mut switches = self.read_physical_u8(0x488) & 0xF0;
