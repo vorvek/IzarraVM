@@ -2,7 +2,7 @@ use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::{GswMode, TimingClass};
 use izarravm_input::HostKeyboard;
-use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
+use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
 use std::cell::Cell;
 use std::error::Error;
@@ -124,6 +124,66 @@ fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
         Ok(reason) => Some(reason),
         Err(err) => Some(StopReason::CpuError(err.to_string())),
     }
+}
+
+/// Result of `top_up_shortfall`: `topped_up` is device+master-clock time created
+/// without executing instructions (wall-backed by construction); `peeked` is
+/// REAL executed guest time the vretrace peeks ran. The caller drains credit for
+/// both, folding `peeked` into its executed-clock accounting.
+struct TopUp {
+    topped_up: u64,
+    peeked: u64,
+}
+
+/// Consume an Approximate-class wall-pacing shortfall, edge-aware.
+///
+/// advance_wall_shortfall stops at each VGA vertical-retrace start edge inside
+/// the span (a bare top-up sweeps the beam across a whole mode-13h frame with
+/// zero instructions executing, so a guest polling 0x3DA caught only 12.8
+/// percent of the windows), and the CPU gets a small peek quantum at every stop
+/// so the window is observable. The slice may thus consume slightly more than
+/// its budget (at most a few peeks' worth), which the credit bucket absorbs.
+/// This applies in text modes too: uniform behavior, and a non-polling guest
+/// pays only ~70 edge-stops + peeks per wall second (~0.2 percent of a 486
+/// slice).
+///
+/// Termination: advance_wall_shortfall consumes >= 1 clock per call, and a
+/// defensive stop cap bounds the peek work. Normal VGA frames are 60-70 Hz, so
+/// a slice's shortfall (<= 50ms of clocks) sees a handful of edges; the cap
+/// budgets one stop per 10ms of shortfall plus slack, and a pathological
+/// guest-programmed CRTC (kHz-rate frames) then degrades to an unclamped
+/// top-up instead of livelocking the emulate thread in peeks. A peek that
+/// halts or faults aborts the top-up; the unrun remainder stays as credit for
+/// the next slice, which sees the new machine state per its own stop handling.
+fn top_up_shortfall(machine: &mut Machine, mut remaining: u64) -> TopUp {
+    let clock_hz = machine.active_mode().clock_hz();
+    let mut stops_left = remaining / (clock_hz / 100).max(1) + 2;
+    let mut topped_up = 0u64;
+    let mut peeked = 0u64;
+    while remaining > 0 {
+        let consumed = machine.advance_wall_shortfall(remaining);
+        topped_up += consumed;
+        remaining = remaining.saturating_sub(consumed.max(1));
+        if remaining == 0 {
+            break;
+        }
+        if stops_left == 0 {
+            machine.advance_wall_clocks(remaining);
+            topped_up += remaining;
+            break;
+        }
+        stops_left -= 1;
+        // Stopped at a vretrace start edge (bit 3 of 0x3DA already reads set):
+        // let the guest run a peek so a polling loop observes the window before
+        // the top-up sweeps past it.
+        let peek_before = machine.elapsed_clocks();
+        let peek_stop = tick_machine(machine, VRETRACE_PEEK_CLOCKS);
+        peeked += machine.elapsed_clocks().saturating_sub(peek_before);
+        if peek_stop.is_some() {
+            break;
+        }
+    }
+    TopUp { topped_up, peeked }
 }
 
 /// The active display as native-resolution 0x00RRGGBB words plus its size.
@@ -908,33 +968,88 @@ fn emulate(
         if budget > 0 {
             let before = machine.elapsed_clocks();
             let stall_before = machine.io_stall_clocks();
-            let stop = tick_machine(&mut machine, budget);
-            let ran = machine.elapsed_clocks().saturating_sub(before);
+            let approximate = machine.active_mode().timing_class() == TimingClass::Approximate;
+            let stop = if approximate {
+                // Approximate class (486/586): time is already an approximation, so
+                // sub-slice the budget in ~1ms quanta and stop issuing quanta once
+                // the slice's wall deadline passes. On a host too slow to emulate
+                // the mode at full speed, the CPU retires what it can and the unrun
+                // remainder is topped up below, so audio/PIT hold realtime instead
+                // of starving behind an ever-longer slice. The Accurate class
+                // (286/386) keeps the single full-budget call: sub-slicing changes
+                // device-advance boundaries and its cadence is frozen.
+                let quantum = (clock_hz / 1000).max(1);
+                let deadline = now + Duration::from_secs_f64(budget as f64 / clock_hz as f64);
+                let mut stop = None;
+                loop {
+                    let ran_so_far = machine.elapsed_clocks().saturating_sub(before);
+                    let remaining = budget.saturating_sub(ran_so_far);
+                    if remaining == 0 {
+                        break;
+                    }
+                    stop = tick_machine(&mut machine, quantum.min(remaining));
+                    if stop.is_some() || Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                stop
+            } else {
+                tick_machine(&mut machine, budget)
+            };
+            let mut ran = machine.elapsed_clocks().saturating_sub(before);
             // Of those clocks, some may be a device-I/O stall (a floppy seek/read)
             // that jumped the clock without executing instructions. Drain the full
             // ran from the credit so the stall still costs wall-clock time, but
             // exclude it from the speed measurement below.
-            let stalled = machine.io_stall_clocks().saturating_sub(stall_before);
-            credit -= i64::try_from(ran).unwrap_or(i64::MAX);
+            let mut stalled = machine.io_stall_clocks().saturating_sub(stall_before);
+            let mut topped_up = 0u64;
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
             // framebuffer is presented instead.
             if matches!(stop, Some(StopReason::Halted)) {
                 machine.advance_devices_clocks(budget);
-            } else if machine.active_mode().timing_class() == TimingClass::Approximate
-                && stalled > 0
-            {
-                // Approximate class (486/586): a device I/O stall (floppy/CD seek)
-                // jumped the master clock without advancing the devices, so fill the
-                // device gap to match and audio keeps playing through a disk grind
-                // instead of the sink starving. The master clock is NOT bumped here:
-                // stall_for already advanced it by the stall, and re-adding it gave
-                // the audio pump a cumulative lead over wall time. The Accurate
-                // class (286/386) keeps exact main behavior (devices resume from
-                // the next instruction's own advance).
-                machine.advance_devices_clocks(stalled);
+            } else if approximate {
+                if stalled > 0 {
+                    // A device I/O stall (floppy/CD seek) jumped the master clock
+                    // without advancing the devices, so fill the device gap to match
+                    // and audio keeps playing through a disk grind instead of the
+                    // sink starving. The master clock is NOT bumped here: stall_for
+                    // already advanced it by the stall, and re-adding it gave the
+                    // audio pump a cumulative lead over wall time. The Accurate
+                    // class (286/386) keeps exact main behavior (devices resume from
+                    // the next instruction's own advance).
+                    machine.advance_devices_clocks(stalled);
+                }
+                if stop.is_none() {
+                    // The host ran out of wall time before the budget was consumed
+                    // (the deadline bail-out above). Top up devices AND the master
+                    // clock by the genuinely unrun remainder so guest time keeps
+                    // tracking wall time; the shortfall is wall-backed by
+                    // construction, so draining credit for it below is correct.
+                    // Stall jumps already count as progress in `ran`, so they are
+                    // not double-counted here. Fatal stops (CpuError/DosExit/
+                    // TestExit) skip the top-up and keep devices frozen.
+                    //
+                    // The top-up stops at VGA vretrace start edges and peeks the
+                    // CPU there (see top_up_shortfall). The peek is REAL executed
+                    // guest time backed by the wall time spent running it, so it
+                    // folds into `ran` and drains credit like any other execution.
+                    let top_up = top_up_shortfall(&mut machine, budget.saturating_sub(ran));
+                    topped_up += top_up.topped_up;
+                    ran += top_up.peeked;
+                    // A peek can itself hit a device-I/O stall (a guest kicking
+                    // off a disk read at the edge): fill the device gap the same
+                    // way the slice fill above did, and fold it into `stalled` so
+                    // the speed metric keeps excluding intentional waits.
+                    let stalled_total = machine.io_stall_clocks().saturating_sub(stall_before);
+                    if stalled_total > stalled {
+                        machine.advance_devices_clocks(stalled_total - stalled);
+                        stalled = stalled_total;
+                    }
+                }
             }
+            credit -= i64::try_from(ran.saturating_add(topped_up)).unwrap_or(i64::MAX);
             if let Some(sink) = &sink {
                 pump_audio(
                     &mut machine,
@@ -3127,6 +3242,96 @@ mod tests {
         // After enough wall time the debt clears and the guest runs again.
         credit = refill_credit(credit, 0.5, clock, cap);
         assert!(credit > 0, "debt repaid once wall-clock catches up");
+    }
+
+    #[test]
+    fn top_up_escape_hatch_caps_edge_stops_for_a_pathological_crtc() {
+        // A guest-programmed CRTC with kHz-rate frames would put hundreds of
+        // vretrace edges inside one slice's shortfall; the defensive cap must
+        // bound the peek work and consume the remainder unclamped instead of
+        // livelocking the emulate thread.
+        // ROM: reset far-jumps to F000:0000 which spins forever (jmp $), so the
+        // peeks execute real instructions and never stop early.
+        let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
+        rom[0] = 0xEB; // jmp $
+        rom[1] = 0xFE;
+        rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+            rom,
+        )
+        .unwrap();
+        // Mode 13h, then shrink the frame to 20 scanlines (~0.64ms, ~1570
+        // edges/s): unprotect + vretrace end 14, overflow 0, vtotal 18+2,
+        // vdisp end 9+1, vretrace start 12.
+        let vga = machine.video_mut();
+        assert!(vga.set_mode(0x13));
+        for (index, value) in [
+            (0x11u8, 0x0Eu8),
+            (0x07, 0x00),
+            (0x06, 18),
+            (0x12, 9),
+            (0x10, 12),
+        ] {
+            vga.write_port(0x3D4, index);
+            vga.write_port(0x3D5, value);
+        }
+        let clock_hz = machine.active_mode().clock_hz();
+        let asked = clock_hz / 10; // 100ms of shortfall: ~157 edges, cap is 12
+        let before = machine.elapsed_clocks();
+        let top_up = top_up_shortfall(&mut machine, asked);
+        assert_eq!(
+            top_up.topped_up, asked,
+            "the escape hatch must still consume the full shortfall"
+        );
+        assert_eq!(
+            machine.elapsed_clocks() - before,
+            asked + top_up.peeked,
+            "master clock advances by the shortfall plus the executed peeks"
+        );
+        // The cap allows asked/10ms + 2 = 12 stops; each peek runs about
+        // VRETRACE_PEEK_CLOCKS (allow 2x for run-loop batch overshoot). An
+        // uncapped loop would have peeked ~157 times.
+        let max_stops = asked / (clock_hz / 100) + 2;
+        assert!(
+            top_up.peeked <= max_stops * VRETRACE_PEEK_CLOCKS * 2,
+            "peek work must be bounded by the stop cap (peeked {} over {} stops max)",
+            top_up.peeked,
+            max_stops
+        );
+    }
+
+    #[test]
+    fn top_up_aborts_when_the_peek_halts() {
+        // ROM: reset far-jumps to F000:0000 which runs CLI; HLT, so the very
+        // first vretrace-edge peek halts the guest. The top-up must break
+        // instead of continuing to create time against a halted machine (the
+        // next slice's own Halted handling takes over).
+        let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
+        rom[0] = 0xFA; // cli
+        rom[1] = 0xF4; // hlt
+        rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+            rom,
+        )
+        .unwrap();
+        let clock_hz = machine.active_mode().clock_hz();
+        let asked = clock_hz; // one guest second: dozens of frames
+        let top_up = top_up_shortfall(&mut machine, asked);
+        assert!(
+            top_up.topped_up < asked / 2,
+            "a halted peek must abort the top-up (topped up {} of {asked})",
+            top_up.topped_up
+        );
+        assert!(
+            top_up.peeked > 0,
+            "the aborting peek itself executed guest time"
+        );
+        assert!(
+            matches!(tick_machine(&mut machine, 1_000), Some(StopReason::Halted)),
+            "the machine is halted after the aborted top-up"
+        );
     }
 
     #[test]

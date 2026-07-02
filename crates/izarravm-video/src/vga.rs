@@ -952,6 +952,35 @@ impl Vga {
         self.crtc.frame_dots()
     }
 
+    /// Dots from the current beam position to the next vertical-retrace START
+    /// edge (the first dot of scanline `vretrace_start`). Pure geometry from the
+    /// live `CrtcTiming` and the beam; the beam itself is not moved.
+    ///
+    /// If the beam sits at or past the edge on this frame (on the edge, inside
+    /// the retrace window, or in the bottom border below it), the result is the
+    /// NEXT frame's edge, up to a full frame ahead, so the returned distance is
+    /// always >= 1. Returns `None` when the CRTC is not programmed (zero-dot
+    /// frame) or the retrace edge falls outside the frame, so callers skip
+    /// edge-aware scheduling.
+    pub fn dots_until_vretrace_start(&self) -> Option<u64> {
+        let frame = self.frame_dots();
+        if frame == 0 {
+            return None;
+        }
+        let edge = u64::from(self.crtc.vretrace_start) * htotal_dots(&self.crtc);
+        if edge >= frame {
+            return None;
+        }
+        // A mode switch to a smaller frame can leave `beam` beyond the new
+        // frame until the next advance() wraps it; normalize first.
+        let beam = self.beam % frame;
+        Some(if beam < edge {
+            edge - beam
+        } else {
+            frame - beam + edge
+        })
+    }
+
     pub fn dot_clock_hz(&self) -> u64 {
         match (self.misc_output >> 2) & 0x03 {
             0x01 => VGA_DOT_CLOCK_28_HZ,
@@ -4425,6 +4454,44 @@ mod tests {
         vga.advance(frame * 2 + 7); // just past two frames in one call
         assert_eq!(vga.beam_dots(), 7); // (2*frame+7) mod frame
         assert_eq!(vga.frames_completed(), 2);
+    }
+
+    #[test]
+    fn dots_until_vretrace_start_measures_to_the_edge_from_any_beam_position() {
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x13));
+        let htotal = htotal_dots(&vga.crtc);
+        let frame = vga.frame_dots();
+        let edge = u64::from(vga.crtc.vretrace_start) * htotal;
+
+        // From the top of the frame the distance is the edge position itself.
+        vga.beam = 0;
+        assert_eq!(vga.dots_until_vretrace_start(), Some(edge));
+
+        // One dot before the edge.
+        vga.beam = edge - 1;
+        assert_eq!(vga.dots_until_vretrace_start(), Some(1));
+
+        // Exactly ON the edge (inside the window): the NEXT edge, a full frame
+        // ahead, never zero. This is the termination guarantee edge-aware
+        // schedulers rely on.
+        vga.beam = edge;
+        assert_eq!(vga.dots_until_vretrace_start(), Some(frame));
+
+        // Inside the window, one line in: next frame's edge.
+        vga.beam = edge + htotal;
+        assert_eq!(vga.dots_until_vretrace_start(), Some(frame - htotal));
+
+        // Advancing by the reported distance lands the beam on the edge, where
+        // the vretrace status bit reads set.
+        vga.beam = 12_345 % frame;
+        let to_edge = vga.dots_until_vretrace_start().unwrap();
+        vga.advance(to_edge);
+        assert!(
+            beam_vretrace(&vga.crtc, vga.beam),
+            "beam must land inside the vretrace window"
+        );
+        assert_eq!(vga.beam, edge);
     }
 
     #[test]

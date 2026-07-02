@@ -710,6 +710,19 @@ pub enum ActiveDisplay {
     Distira,
 }
 
+/// Execution quantum a wall-pacing caller grants the CPU after
+/// `advance_wall_shortfall` stops at a VGA vertical-retrace start edge, so a
+/// guest polling port 0x3DA observes the window before the top-up resumes.
+///
+/// Sizing: one 0x3DA poll iteration (IN + TEST + Jcc) costs roughly 3-30 clocks
+/// across the Approximate modes, so 2000 clocks is 60-600 poll iterations,
+/// ample to see bit 3 set. It is also negligible against a frame: 0.2 percent
+/// of the ~941k clocks per 14.4 ms mode-13h frame at 66 MHz (486), less at 586,
+/// and smaller than the ~4200-clock retrace window itself at 486, so the beam
+/// is still inside the window for the whole peek. At most ~70 edge-stops per
+/// wall second, so a guest that never polls pays ~140k clocks/s (~0.2 percent).
+pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
+
 /// Per-clock conversion factors, recomputed once whenever the active mode (clock)
 /// changes, so the per-instruction device pacing multiplies instead of dividing.
 #[derive(Debug, Clone, Copy)]
@@ -8113,9 +8126,77 @@ impl Machine {
     /// Drive the internal per-clock device advance (PIT, OPL, DSP reset-settle,
     /// and the clock-driven DMA playback producer). Exposed so a host test or a
     /// frontend can flush device time without running the CPU, and so the DMA
-    /// host goldens can advance the clock that now paces playback.
+    /// host goldens can advance the clock that now paces playback. Does NOT
+    /// advance the master clock; see `advance_wall_clocks` for the variant that
+    /// moves both.
     pub fn advance_devices_clocks(&mut self, clocks: u64) {
         self.advance_devices(clocks);
+    }
+
+    /// Advance device time AND the master clock by `clocks` without running the
+    /// CPU. Used by the GUI in the Approximate class when the host could not
+    /// execute the full wall-clock budget: guest time keeps tracking wall time so
+    /// audio/PIT hold realtime; the CPU simply retires fewer instructions per
+    /// guest second (the DOSBox-style degradation). Never called in the Accurate
+    /// class. Unconditional: prefer `advance_wall_shortfall`, which stops at VGA
+    /// vertical-retrace start edges so a polling guest can observe them; this
+    /// variant is the escape hatch behind the caller's defensive edge-stop cap.
+    pub fn advance_wall_clocks(&mut self, clocks: u64) {
+        self.advance_devices(clocks);
+        self.elapsed_clocks += clocks;
+    }
+
+    /// Advance device time AND the master clock by AT MOST `clocks` without
+    /// running the CPU, and return the clocks actually consumed.
+    ///
+    /// Contract: if the next VGA vertical-retrace START edge falls strictly
+    /// inside the span, the advance stops AT that edge (the beam lands on the
+    /// first dot of the retrace window, so a port 0x3DA read already returns
+    /// bit 3 set) and the consumed count is returned; the caller tops up the
+    /// remainder in further calls, typically granting the CPU a small execution
+    /// quantum in between so a guest polling 0x3DA observes the window. With no
+    /// intervening edge the full `clocks` is consumed.
+    ///
+    /// Why: a 16 ms wall-pacing top-up sweeps the beam across more than a whole
+    /// mode-13h frame (14.3 ms) with zero instructions executing, so a guest
+    /// double-polling 0x3DA for the 2-scanline vretrace window deterministically
+    /// missed every window that opened and closed inside a top-up (measured
+    /// catch rate 12.8 percent at a 1/8 execution share). Stopping at each start
+    /// edge makes every window observable.
+    ///
+    /// Termination guarantee: the returned count is >= 1 whenever `clocks` >= 1.
+    /// When the beam already sits on the edge or inside the retrace window, the
+    /// next start edge is a full frame ahead (see
+    /// `Vga::dots_until_vretrace_start`), so back-to-back calls always make
+    /// progress and a caller looping `remaining -= consumed` terminates. The
+    /// stop honors the fractional `vga_dots` accumulator, overshooting the edge
+    /// by at most a few dots (well inside the ~1600-dot window). One caveat: a
+    /// 1-ulp rounding mismatch in the dots-to-clocks conversion could in
+    /// principle land the beam a dot short of the edge; the caller's peek
+    /// executes instructions whose own device advance carries the beam into the
+    /// window, so the contract holds for observers either way.
+    pub fn advance_wall_shortfall(&mut self, clocks: u64) -> u64 {
+        let consume = match self.clocks_to_vretrace_start() {
+            Some(edge_clocks) => edge_clocks.min(clocks),
+            None => clocks,
+        };
+        self.advance_wall_clocks(consume);
+        consume
+    }
+
+    /// Clocks of device time until the VGA beam reaches the next vertical-
+    /// retrace start edge, converted from beam dots at the live TimingFactors
+    /// and accounting for the fractional `vga_dots` accumulator: delivering the
+    /// returned count to `advance_devices` moves the beam onto (or a dot or two
+    /// past) the edge. `None` when the CRTC has no usable frame geometry.
+    fn clocks_to_vretrace_start(&self) -> Option<u64> {
+        let edge_dots = self.video.dots_until_vretrace_start()?;
+        let dots_per_clock = self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
+        if dots_per_clock <= 0.0 {
+            return None;
+        }
+        let needed = ((edge_dots as f64 - self.vga_dots) / dots_per_clock).ceil();
+        Some((needed as u64).max(1))
     }
 
     /// Rebuild the DSP resampler when the programmed sample rate changes, so it
@@ -16339,6 +16420,192 @@ mod tests {
             machine.elapsed_clocks(),
             before,
             "advance_devices_clocks must advance device time only, never the master clock"
+        );
+    }
+
+    #[test]
+    fn wall_shortfall_advances_devices_and_master_clock_together() {
+        // The GUI's Approximate-class wall-clock top-up relies on this: when the
+        // host could not execute the full budget, the unrun remainder must move
+        // BOTH device time and the master clock, so the audio pump (which paces
+        // off elapsed_clocks deltas) keeps tracking wall time. Contrast with
+        // device_fill_never_moves_the_master_clock above: that path fills a gap
+        // the master clock already jumped over; this one creates the time.
+        let mut machine = test_machine();
+        fn latched_count(m: &mut Machine) -> u16 {
+            let mut bus = m.make_bus();
+            bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
+            let lo = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            lo | (hi << 8)
+        }
+        {
+            // Program PIT counter 0 (mode 3, reload 0 = 65536) so it counts; the
+            // test ROM machine never ran the POST timer setup.
+            let mut bus = machine.make_bus();
+            bus.write_io(0x43, BusWidth::Byte, 0x36).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+        }
+        let before = machine.elapsed_clocks();
+        let pit_before = latched_count(&mut machine);
+        // 100_000 clocks at the 386 mode rate is ~4.5ms, thousands of PIT ticks,
+        // and well short of the first vretrace start edge (the boot text-mode
+        // beam sits at dot 0; the edge is ~289k clocks away), so the span has no
+        // edge and must be consumed in full.
+        let consumed = machine.advance_wall_shortfall(100_000);
+        assert_eq!(
+            consumed, 100_000,
+            "a span with no intervening vretrace edge is consumed in full"
+        );
+        assert_eq!(
+            machine.elapsed_clocks(),
+            before + 100_000,
+            "advance_wall_shortfall must advance the master clock by exactly the consumed clocks"
+        );
+        assert_ne!(
+            latched_count(&mut machine),
+            pit_before,
+            "advance_wall_shortfall must advance device time (PIT counter 0 moved)"
+        );
+    }
+
+    #[test]
+    fn wall_shortfall_stops_at_a_vretrace_start_edge_and_then_makes_progress() {
+        // The P4d clamp: a top-up spanning a vretrace start edge must stop AT the
+        // edge (vretrace bit 3 already readable) and report the shorter consume,
+        // so the GUI can grant a polling guest an execution quantum there instead
+        // of sweeping the whole window past it unobserved.
+        let mut machine = test_machine();
+        let clock_hz = machine.active_mode().clock_hz();
+        let before = machine.elapsed_clocks();
+        // A full guest second: dozens of frames, so an edge is guaranteed inside.
+        let consumed = machine.advance_wall_shortfall(clock_hz);
+        assert!(
+            consumed < clock_hz,
+            "a span crossing a vretrace start edge must stop early (consumed {consumed})"
+        );
+        assert!(consumed > 0, "the stop must still make progress");
+        assert_eq!(
+            machine.elapsed_clocks(),
+            before + consumed,
+            "the master clock advances by exactly the consumed clocks"
+        );
+        assert_ne!(
+            machine.video_mut().read_status1() & 0x08,
+            0,
+            "the beam must land inside the vretrace window (bit 3 set at the stop)"
+        );
+
+        // Termination pin: with the beam ON the edge (inside the window), the
+        // next call must not return 0. A short span still inside the window has
+        // no NEXT start edge within it (that edge is a full frame ahead), so it
+        // is consumed in full.
+        let consumed_inside = machine.advance_wall_shortfall(10);
+        assert_eq!(
+            consumed_inside, 10,
+            "on-edge/inside-window spans consume fully instead of stalling"
+        );
+
+        // And a long span from inside the window stops at the NEXT frame's edge,
+        // roughly one frame period away, never zero.
+        let consumed_next = machine.advance_wall_shortfall(clock_hz);
+        assert!(consumed_next > 0 && consumed_next < clock_hz);
+        assert_ne!(
+            machine.video_mut().read_status1() & 0x08,
+            0,
+            "each stop lands inside the vretrace window"
+        );
+    }
+
+    #[test]
+    fn paced_wall_topup_lets_a_polling_guest_catch_vretrace_windows() {
+        // Permanent port of the P4d investigation repro. A mode-13h guest
+        // double-polling port 0x3DA (wait for vretrace to clear, then wait for
+        // it to set) is driven with the GUI's Approximate-class pacing pattern
+        // at a 1/8 execution share: run 1/8 of each ~1ms quantum, then top the
+        // remainder up wall-style. Unfixed (single unclamped top-up per
+        // quantum), the guest caught 12.8-18.9 percent of the vretrace windows,
+        // because a top-up sweeps the whole 2-scanline window past it with zero
+        // instructions executing. With the edge clamp + peek it must catch
+        // nearly all of them. Window count derives from beam geometry (frames
+        // completed; each frame crosses exactly one vretrace start edge), so
+        // the test is host-speed-independent and deterministic.
+        let code = [
+            0xB8, 0x13, 0x00, // mov ax, 0x0013 (mode 13h)
+            0xCD, 0x10, // int 0x10
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // mov word [0x7000], 0 (catch counter)
+            0xBA, 0xDA, 0x03, // mov dx, 0x03DA
+            // wait_clear (0x12): spin while the vretrace bit is set
+            0xEC, // in al, dx
+            0xA8, 0x08, // test al, 0x08
+            0x75, 0xFB, // jnz wait_clear
+            // wait_set (0x17): spin until the vretrace bit sets
+            0xEC, // in al, dx
+            0xA8, 0x08, // test al, 0x08
+            0x74, 0xFB, // jz wait_set
+            0xFF, 0x06, 0x00, 0x70, // inc word [0x7000] (window caught)
+            0xEB, 0xF0, // jmp wait_clear
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw486); // Approximate class, 66 MHz
+        let clock_hz = machine.active_mode().clock_hz();
+        let quantum = clock_hz / 1000; // the GUI's ~1ms sub-slice
+
+        // Warm up at full speed until the guest set mode 13h and is inside the
+        // poll loop, then baseline the counters.
+        machine.run_cycles(quantum).unwrap();
+        let counter = |m: &Machine| m.memory.read_u16(0x7000).unwrap();
+        let counter_base = u64::from(counter(&machine));
+        let frames_base = machine.video().frames_completed();
+
+        // One guest second of the paced pattern: ~70 mode-13h frames, plenty of
+        // statistical power for a 90 percent threshold against a 13-19 percent
+        // unfixed baseline, at half the runtime of a two-second run.
+        for _ in 0..1000 {
+            let before = machine.elapsed_clocks();
+            machine.run_cycles(quantum / 8).unwrap();
+            let ran = machine.elapsed_clocks().saturating_sub(before);
+            let mut remaining = quantum.saturating_sub(ran);
+            let mut stops = 0u32;
+            while remaining > 0 {
+                let consumed = machine.advance_wall_shortfall(remaining);
+                assert!(consumed > 0, "termination: every call must make progress");
+                remaining = remaining.saturating_sub(consumed);
+                if remaining == 0 {
+                    break;
+                }
+                // Stopped at a vretrace start edge: grant the peek so the
+                // polling guest observes the window, exactly like the GUI.
+                stops += 1;
+                assert!(
+                    stops <= 4,
+                    "termination: at most one edge fits in a 1ms quantum (plus slack)"
+                );
+                machine.run_cycles(VRETRACE_PEEK_CLOCKS).unwrap();
+            }
+        }
+
+        let windows_opened = machine.video().frames_completed() - frames_base;
+        let caught = u64::from(counter(&machine)) - counter_base;
+        assert!(
+            windows_opened >= 60,
+            "geometry sanity: expected ~70 frames in 1 guest second, saw {windows_opened}"
+        );
+        assert!(
+            caught <= windows_opened + 1,
+            "sanity: cannot catch more windows than opened ({caught} vs {windows_opened})"
+        );
+        assert!(
+            caught * 10 >= windows_opened * 9,
+            "guest caught {caught} of {windows_opened} vretrace windows (< 90 percent); \
+             unfixed baseline was 12.8-18.9 percent"
         );
     }
 
