@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod keyboard;
 pub use keyboard::HostKeyboard;
 
