@@ -2,6 +2,15 @@
 
 pub const I386DX25_TEST_ROM: &[u8] = include_bytes!("../roms/i386dx25-test.bin");
 pub const I386DX25_TEST_ROM_SOURCE: &str = include_str!("../roms/i386dx25-test.asm");
+/// Distira driver-plan slice 1: a standalone flat-ROM guest program that finds
+/// the Distira 3D card via real PCI configuration space, maps BAR0, and draws
+/// one flat-shaded triangle through direct SST-1 register pokes (the same
+/// wire format real DOS Glide uses), no Glide involved. See
+/// dev_docs/2026-07-02-distira-driver-plan.md slice 1 and
+/// crates/izarravm-machine/tests/distira.rs's distira_guest_* tests, whose
+/// hand-assembled-bytes pattern this promotes to a buildable source file.
+pub const DISTTRI_BIN: &[u8] = include_bytes!("../roms/disttri.bin");
+pub const DISTTRI_SOURCE: &str = include_str!("../roms/disttri.asm");
 pub const X86_BOOT_TEST_IMAGE: &[u8] = include_bytes!("../roms/boot-suite/izarravm-test.img");
 pub const X86_BOOT_TEST_BOOT_SOURCE: &str = include_str!("../roms/boot-suite/boot.asm");
 pub const X86_BOOT_TEST_STAGE2_SOURCE: &str = include_str!("../roms/boot-suite/stage2.asm");

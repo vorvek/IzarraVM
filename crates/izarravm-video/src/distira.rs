@@ -19,6 +19,13 @@ pub const DISTIRA_RENDER_THREAD_CHOICES: [u8; 3] = [1, 2, 4];
 pub const DISTIRA_MAX_WIDTH: u32 = 640;
 pub const DISTIRA_MAX_HEIGHT: u32 = 480;
 
+/// Total scanlines per frame for the lightweight `advance_frame_phase` beam
+/// counter (a 640x480@60Hz-shaped total, not tied to the live display size).
+const FRAME_PHASE_TOTAL_LINES: u32 = 525;
+/// Scanlines at the bottom of the frame treated as the vertical retrace
+/// window (matches a typical VGA-shaped ~8% vblank fraction).
+const FRAME_PHASE_VRETRACE_LINES: u32 = 45;
+
 pub const DISTIRA_CAPS_TRIANGLE: u32 = 1 << 0;
 pub const DISTIRA_CAPS_DITHER: u32 = 1 << 1;
 pub const DISTIRA_CAPS_TMU1: u32 = 1 << 2;
@@ -143,6 +150,8 @@ pub const SST_FBI_INIT2: usize = 0x218;
 pub const SST_FBI_INIT3: usize = 0x21c;
 pub const SST_H_SYNC: usize = 0x220;
 pub const SST_V_SYNC: usize = 0x224;
+pub const SST_CLUT_DATA: usize = 0x228;
+pub const SST_DAC_DATA: usize = 0x22c;
 pub const SST_HV_RETRACE: usize = 0x240;
 pub const SST_FBI_INIT5: usize = 0x244;
 pub const SST_FBI_INIT6: usize = 0x248;
@@ -323,6 +332,35 @@ pub const FBIINIT3_REMAP: u32 = 1;
 pub const FBIINIT5_MULTI_CVG: u32 = 1 << 14;
 pub const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
 
+/// `initEnable` bit that remaps `fbiInit2` readback onto the DAC readback
+/// latch instead of the stored `fbiInit2` value. This is `initEnable` bit 2
+/// (`SST_FBIINIT23_REMAP` in the Glide init source), written through PCI
+/// config space (offset 0x40 in this codebase's PCI function) rather than
+/// through the MMIO register window, matching real SST-1 hardware where
+/// `initEnable` is a PCI-config-only register.
+pub const INIT_ENABLE_REMAP: u32 = 1 << 2;
+
+/// `dacData` write bit 11 (`SST_DACDATA_RD` in the Glide init source):
+/// requests a DAC read cycle instead of a write cycle.
+pub const DACDATA_RD: u32 = 1 << 11;
+/// `dacData` address field shift: bits 8-10 select the DAC's internal
+/// register index (`SST_DACDATA_ADDR_SHIFT`).
+pub const DACDATA_ADDR_SHIFT: u32 = 8;
+/// The ICS5342 GENDAC PLL sub-register index (`dacData`'s addressed
+/// register 5), used to reach the clock-synthesizer sub-registers
+/// (`GCLK1`/`VCLK1`/`VCLK7`) that `sst1InitDacDetectICS` probes.
+const DAC_REG_PLL: u32 = 5;
+/// ICS5342 GENDAC PLL sub-register indices for the three clocks the ICS
+/// detection probe reads, and their known power-on-default byte values
+/// (`sst1InitDacDetectICS`, matching the real chip and 86Box's
+/// `vid_voodoo.c` `SST_dacData` handler).
+const ICS_PLL_VCLK1: u8 = 0x01;
+const ICS_PLL_VCLK7: u8 = 0x07;
+const ICS_PLL_GCLK1: u8 = 0x0b;
+const ICS_DEFAULT_VCLK1: u8 = 0x55;
+const ICS_DEFAULT_VCLK7: u8 = 0x71;
+const ICS_DEFAULT_GCLK1: u8 = 0x79;
+
 pub fn normalize_distira_render_threads(threads: u8) -> u8 {
     if DISTIRA_RENDER_THREAD_CHOICES.contains(&threads) {
         threads
@@ -471,10 +509,43 @@ pub struct Distira {
     cmd_fifo_amax: u32,
     cmd_fifo_holes: u32,
     fbi_init: [u32; 8],
+    init_enable: u32,
     back_porch: u32,
     video_dimensions: u32,
     h_sync: u32,
     v_sync: u32,
+    /// The DAC's 8 indexed registers (`dac_data[0..=7]`), matching the ICS
+    /// GENDAC layout 86Box models: `dac_data[4]` is the PLL sub-register
+    /// address latch and `dac_data[5]` is the PLL sub-register write port
+    /// (odd/even byte selected by `dac_reg_ff`); `dac_data[7]` doubles as
+    /// the ICS-detect probe's own addressed-register storage.
+    dac_data: [u8; 8],
+    /// The DAC register index most recently addressed by a `dacData` write
+    /// (bits 8-10 of the write value).
+    dac_reg: u32,
+    /// The value `SST_DAC_DATA` was armed with on the last read-cycle write,
+    /// latched for readback through `fbiInit2` while `initEnable`'s remap
+    /// bit is set (mirrors 86Box's `dac_readdata`).
+    dac_readdata: u8,
+    /// The ICS PLL sub-registers (16 clock synthesizer registers), indexed
+    /// by `dac_data[4] & 0xf` and written a byte at a time via the
+    /// high/low toggle `dac_reg_ff`.
+    dac_pll_regs: [u16; 16],
+    dac_reg_ff: bool,
+    /// Byte-merge target for an in-progress `SST_DAC_DATA` dword write; the
+    /// write's side effect (address decode, PLL register update, or ICS
+    /// probe response) runs once the whole dword has been assembled.
+    dac_data_write: u32,
+    /// A monotonically increasing beam-position counter, in scanline units,
+    /// advanced by `advance_frame_phase`. This is a lightweight frame-phase
+    /// clock rather than true dot-clock beam coupling (the plan's
+    /// "acceptable" fallback): real hardware ties `SST_vRetrace`/
+    /// `SST_hvRetrace`/`SST_STATUS`'s vsync bit to the actual CRTC beam
+    /// position, but Distira's own scanout does not model a dot clock, so
+    /// this just needs to make forward progress and periodically enter/exit
+    /// a "retrace" window so a `grSstVRetrace()`-shaped poll loop (wait for
+    /// either edge) always terminates.
+    frame_phase_line: u32,
     texture_mode: u32,
     texture_mode_tmu1: u32,
     texture_lod: u32,
@@ -569,10 +640,18 @@ impl Distira {
             cmd_fifo_amax: 0,
             cmd_fifo_holes: 0,
             fbi_init: [0; 8],
+            init_enable: 0,
             back_porch: 0,
             video_dimensions: 0,
             h_sync: 0,
             v_sync: 0,
+            dac_data: [0; 8],
+            dac_reg: 0,
+            dac_readdata: 0,
+            dac_pll_regs: [0; 16],
+            dac_reg_ff: false,
+            dac_data_write: 0,
+            frame_phase_line: 0,
             texture_mode: 0,
             texture_mode_tmu1: 0,
             texture_lod: 0,
@@ -595,6 +674,36 @@ impl Distira {
 
     pub const fn tmu_count(&self) -> u32 {
         DISTIRA_TMU_COUNT
+    }
+
+    /// Set the SST `initEnable` value. On real hardware and in this
+    /// codebase's PCI function, `initEnable` lives in PCI config space
+    /// (offset 0x40) rather than the MMIO register window; the machine
+    /// crate calls this whenever the guest writes that config dword so
+    /// `SST_FBI_INIT2`'s readback can honor the remap bit
+    /// (`INIT_ENABLE_REMAP`) the same way `sst1InitDacDetect()` expects.
+    pub fn set_init_enable(&mut self, value: u32) {
+        self.init_enable = value;
+    }
+
+    /// Advance the beam-position counter `clocks` device clocks. This is
+    /// the "simple frame-phase counter advanced by device clocks" the
+    /// compatibility plan calls acceptable in place of true dot-clock beam
+    /// coupling: it exists only so `SST_V_RETRACE`/`SST_HV_RETRACE`/
+    /// `SST_STATUS`'s vsync bit make forward progress and periodically
+    /// enter/exit retrace, so a real `grSstVRetrace()`-shaped poll loop
+    /// (wait for either edge) always terminates instead of hanging on a
+    /// permanently hardcoded bit. One clock advances one scanline; the
+    /// scale is arbitrary since no guest-visible contract ties Distira's
+    /// scanout to a specific dot clock yet.
+    pub fn advance_frame_phase(&mut self, clocks: u64) {
+        let total = u64::from(FRAME_PHASE_TOTAL_LINES);
+        let line = (u64::from(self.frame_phase_line) + clocks) % total;
+        self.frame_phase_line = line as u32;
+    }
+
+    fn in_vretrace(&self) -> bool {
+        self.frame_phase_line >= FRAME_PHASE_TOTAL_LINES - FRAME_PHASE_VRETRACE_LINES
     }
 
     pub const fn chip_names(&self) -> [&'static str; 2] {
@@ -1313,6 +1422,12 @@ impl Distira {
             SST_FBI_INIT3 => merge_byte(&mut self.fbi_init[3], byte, value),
             SST_H_SYNC => merge_byte(&mut self.h_sync, byte, value),
             SST_V_SYNC => merge_byte(&mut self.v_sync, byte, value),
+            SST_DAC_DATA => {
+                merge_byte(&mut self.dac_data_write, byte, value);
+                if byte == 3 {
+                    self.run_dac_data_write(self.dac_data_write);
+                }
+            }
             SST_FBI_INIT5 => merge_byte(&mut self.fbi_init[5], byte, value),
             SST_FBI_INIT6 => merge_byte(&mut self.fbi_init[6], byte, value),
             SST_FBI_INIT7 => merge_byte(&mut self.fbi_init[7], byte, value),
@@ -1532,6 +1647,50 @@ impl Distira {
         (self.cmd_fifo_base >> 12) | ((self.cmd_fifo_end >> 12) << 16)
     }
 
+    /// Run the `SST_DAC_DATA` write side effect. This ports the real
+    /// hardware protocol 86Box's `vid_voodoo.c` `SST_dacData` case models,
+    /// which is itself the register-mapped addr/data bridge
+    /// `sst1InitDacRd`/`sst1InitDacWr` poke (dac.c) rather than raw I2C
+    /// bit-banging: bits 8-10 select one of 8 indexed DAC registers, bit 11
+    /// requests a read cycle (latching a result byte for later `fbiInit2`
+    /// readback), and register 5 is special-cased as the ICS5342 GENDAC's
+    /// PLL sub-register port. `sst1InitDacDetectICS` (dac.c) probes PLL
+    /// sub-registers `VCLK1`/`VCLK7`/`GCLK1` and checks the values below,
+    /// which are that chip's power-on defaults.
+    fn run_dac_data_write(&mut self, value: u32) {
+        self.dac_reg = (value >> DACDATA_ADDR_SHIFT) & 7;
+        self.dac_readdata = 0xff;
+        if value & DACDATA_RD != 0 {
+            if self.dac_reg == DAC_REG_PLL {
+                self.dac_readdata = match self.dac_data[7] {
+                    ICS_PLL_VCLK1 => ICS_DEFAULT_VCLK1,
+                    ICS_PLL_VCLK7 => ICS_DEFAULT_VCLK7,
+                    ICS_PLL_GCLK1 => ICS_DEFAULT_GCLK1,
+                    _ => 0xff,
+                };
+            } else {
+                self.dac_readdata = self.dac_data[(self.dac_readdata & 7) as usize];
+            }
+            return;
+        }
+        if self.dac_reg == DAC_REG_PLL {
+            let pll_index = (self.dac_data[4] & 0xf) as usize;
+            let byte = (value & 0xff) as u16;
+            if !self.dac_reg_ff {
+                self.dac_pll_regs[pll_index] = (self.dac_pll_regs[pll_index] & 0xff00) | byte;
+            } else {
+                self.dac_pll_regs[pll_index] = (self.dac_pll_regs[pll_index] & 0xff) | (byte << 8);
+            }
+            self.dac_reg_ff = !self.dac_reg_ff;
+            if !self.dac_reg_ff {
+                self.dac_data[4] = self.dac_data[4].wrapping_add(1);
+            }
+        } else {
+            self.dac_data[self.dac_reg as usize] = (value & 0xff) as u8;
+            self.dac_reg_ff = false;
+        }
+    }
+
     fn write_palette_registers(&mut self, chip: usize, odd: bool, byte: usize, value: u8) {
         if chip & CHIP_TREX0 != 0 {
             self.write_palette_register(0, odd, byte, value);
@@ -1665,16 +1824,28 @@ impl Distira {
             SST_CMD_FIFO_DEPTH => self.command_fifo.len() as u32,
             SST_CMD_FIFO_HOLES => self.cmd_fifo_holes,
             SST_FBI_INIT4 => self.fbi_init[4],
-            SST_V_RETRACE => 0,
+            SST_V_RETRACE => self.frame_phase_line & 0x1fff,
             SST_BACK_PORCH => self.back_porch,
             SST_VIDEO_DIMENSIONS => self.video_dimensions,
             SST_FBI_INIT0 => self.fbi_init[0],
             SST_FBI_INIT1 => self.fbi_init[1],
-            SST_FBI_INIT2 => self.fbi_init[2],
+            SST_FBI_INIT2 => {
+                if self.init_enable & INIT_ENABLE_REMAP != 0 {
+                    u32::from(self.dac_readdata)
+                } else {
+                    self.fbi_init[2]
+                }
+            }
             SST_FBI_INIT3 => self.fbi_init[3] | (1 << 10) | (2 << 8),
             SST_H_SYNC => self.h_sync,
             SST_V_SYNC => self.v_sync,
-            SST_HV_RETRACE => 0,
+            // Real hardware packs a horizontal line-time fraction into the
+            // low bits and the current scanline into the high bits
+            // (SST_hvRetrace, gsst.c); this frame-phase counter has no
+            // sub-line horizontal position to report, so it exposes the
+            // scanline alone shifted into the same field. Any real vsync
+            // poll only needs this nonzero and moving, not sub-line exact.
+            SST_HV_RETRACE => self.frame_phase_line << 16,
             SST_FBI_INIT5 => self.fbi_init[5] & !0x1ff,
             SST_FBI_INIT6 => self.fbi_init[6],
             SST_FBI_INIT7 => self.fbi_init[7] & !0xff,
@@ -1706,7 +1877,14 @@ impl Distira {
         // 86Box reports a large free FIFO count plus low empty bits when idle.
         // This synchronous first slice keeps work in a host-drained queue, so
         // expose the same busy bit shape while any FIFO entry is pending.
+        // Bit 6 (0x40) is the vsync status bit: 86Box's SST_status handler
+        // sets it when NOT in vertical retrace ("if (!voodoo->v_retrace)
+        // temp |= 0x40"), so it is part of the base mask here and cleared
+        // while advance_frame_phase has the beam inside the retrace window.
         let mut status = 0x0fff_f07f;
+        if self.in_vretrace() {
+            status &= !0x40;
+        }
         if !self.fifo_is_empty() {
             status |= 0x380;
         }
@@ -1969,17 +2147,35 @@ impl Distira {
             .triangle_vertices
             .map(|(x, y)| (fixed_vertex_to_f32(x), fixed_vertex_to_f32(y)));
         let (origin_x, origin_y) = coords[0];
-        let depths = coords.map(|(x, y)| {
-            fixed_depth_at(
-                self.triangle_depth,
-                self.triangle_depth_dx,
-                self.triangle_depth_dy,
-                x,
-                y,
-                origin_x,
-                origin_y,
-            )
-        });
+        let depths = if self.fbz_mode & FBZ_W_BUFFER != 0 {
+            coords.map(|(x, y)| {
+                let w = fixed_texture_coord_at(
+                    self.triangle_tex_coord[2],
+                    self.triangle_tex_coord_dx[2],
+                    self.triangle_tex_coord_dy[2],
+                    x,
+                    y,
+                    origin_x,
+                    origin_y,
+                );
+                // wfloat_depth already returns the same "raw, pre depth_to_u16
+                // divide-by-4096" units fixed_depth_at produces for Z, so both
+                // paths feed the shared depth_to_u16 conversion unchanged.
+                f32::from(wfloat_depth(w)) * 4096.0
+            })
+        } else {
+            coords.map(|(x, y)| {
+                fixed_depth_at(
+                    self.triangle_depth,
+                    self.triangle_depth_dx,
+                    self.triangle_depth_dy,
+                    x,
+                    y,
+                    origin_x,
+                    origin_y,
+                )
+            })
+        };
         let vertices = coords.map(|(x, y)| DistiraVertex {
             x,
             y,
@@ -2931,6 +3127,44 @@ fn fixed_texture_coord_at(
     start as i32 as f32 / 16384.0
         + dx as i32 as f32 / 16384.0 * (x - origin_x)
         + dy as i32 as f32 / 16384.0 * (y - origin_y)
+}
+
+/// Convert an iterated 1/w value to the SST-1 W-buffer's 16-bit floating
+/// point depth code. This ports the *behavior* of 86Box's `vid_voodoo_render.c`
+/// wfloat encode (itself the real SST-1 hardware algorithm: a
+/// leading-zero-count exponent plus a 12-bit inverted mantissa, producing a
+/// code where a larger 1/w — i.e. a nearer vertex — yields a SMALLER code,
+/// the same "smaller code wins under DEPTHOP_LESSTHAN" convention the
+/// fixed-point Z path already uses). 86Box represents the iterated W as a
+/// 48-bit `.32` fixed-point accumulator (`state->w`, built from
+/// `startW = w_float * 2^32`) and looks at bits 16-47; this port takes the
+/// interpolated `f32` W value this codebase already produces (the same wire
+/// value `SST_START_W`/`SST_DW_DX`/`SST_DW_DY` carry for texture
+/// perspective) and reconstructs the equivalent 48-bit fixed value before
+/// running the identical exponent/mantissa extraction, so the two
+/// implementations agree bit-for-bit on any representable input.
+fn wfloat_depth(w: f32) -> u16 {
+    if !w.is_finite() || w <= 0.0 {
+        return 0; // Non-positive/non-finite 1/w: treat as "at infinity", code 0.
+    }
+    // Reconstruct 86Box's `state->w`: a 48-bit-significant `.32` fixed-point
+    // value of the float 1/w, clamped into range rather than wrapping.
+    let fixed = (f64::from(w) * 4294967296.0).clamp(0.0, u64::MAX as f64) as u64;
+    if fixed & 0xffff_0000_0000 != 0 {
+        // Bits 32-47 set: 1/w overflowed the representable range (too far).
+        return 0;
+    }
+    let upper16 = ((fixed >> 16) & 0xffff) as u16;
+    if upper16 == 0 {
+        // Bits 16-31 all clear: 1/w is too large (too near) to represent.
+        return 0xf001;
+    }
+    // voodoo_fls: count of leading zero bits in the 16-bit value (0..=15
+    // here, since upper16 != 0).
+    let exp = upper16.leading_zeros();
+    let mant = ((!fixed as u32) >> (19 - exp)) & 0xfff;
+    let code = (exp << 12) + mant + 1;
+    code.min(0xffff) as u16
 }
 
 fn fixed_depth_at(

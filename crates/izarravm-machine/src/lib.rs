@@ -589,6 +589,10 @@ impl PciConfig {
             && ((self.address >> 11) & 0x1f) as u8 == DISTIRA_PCI_SLOT
             && ((self.address >> 8) & 0x07) == 0
     }
+
+    fn distira_init_enable(&self) -> u32 {
+        self.distira_init_enable
+    }
 }
 
 #[derive(Debug)]
@@ -8084,6 +8088,12 @@ impl Machine {
         self.margo.advance_busy(whole_ns as u64);
         self.margo_ns -= whole_ns;
 
+        // Distira has no dot-clock beam model of its own (see
+        // Distira::advance_frame_phase); feed it CPU clocks directly so
+        // SST_V_RETRACE/SST_HV_RETRACE/SST_STATUS's vsync bit make forward
+        // progress and a real vsync poll loop cannot hang.
+        self.distira.advance_frame_phase(clocks);
+
         let (whole, remainder) = self.predict_dots(clocks, self.vga_dots);
         self.video.advance(whole);
         self.vga_dots = remainder;
@@ -10014,6 +10024,12 @@ impl CpuBus for MachineBus<'_> {
                 self.ram_lookup.rebuild(self.memory.len(), self.pci);
                 *self.direct_map_changed = true;
             }
+            // initEnable lives in PCI config space (offset 0x40) on real SST-1
+            // hardware, not the MMIO window, but Distira's own fbiInit2/dacData
+            // DAC-detect handshake needs to see its remap bit. Mirror it into
+            // the device on every config-space write so it never drifts from
+            // the PciConfig copy of record.
+            self.distira.set_init_enable(self.pci.distira_init_enable());
             return Ok(());
         }
 
