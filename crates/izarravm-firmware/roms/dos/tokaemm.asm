@@ -45,6 +45,17 @@ k_cs: dw 0                        ; EXECRH far-return CS
 k_ip: dw 0                        ; EXECRH far-return IP
 
 vif: db 1                         ; virtual IF (guest's view; DOS boots with IF=1)
+va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
+                                  ; forced on at INIT and never drops under V86:
+                                  ; the monitor and the paged UMB/EMS backing
+                                  ; live above 1 MB and a real A20-off would fold
+                                  ; them onto low RAM (DOS=HIGH,UMB corruption).
+                                  ; Port 0x92 is trapped via the TSS I/O bitmap
+                                  ; and the guest's A20 becomes a paging illusion
+                                  ; over the 1 MB..1 MB+64K window — the EMM386
+                                  ; approach. (INT 15h AH=24xx / 8042 A20 paths
+                                  ; are not virtualized; XMS+port 0x92 is what
+                                  ; FreeDOS and period software use.)
 align 2
 vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
                                   ; line N, master 0-7 + slave 8-15; SP-4b M4)
@@ -205,6 +216,17 @@ init:
 .p_done:
     pop ds
 
+    ; --- SP-4b M4: signon banner (real mode, INT 29h per char — the proven M0
+    ; marker method; INT 21h AH=09h is unreliable at device-INIT time). ---
+    mov si, banner
+.bl:
+    lodsb                         ; DS = CS here
+    test al, al
+    jz .bdone
+    int 0x29
+    jmp .bl
+.bdone:
+
     ; --- SP-4b M1/M3: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
     ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
     ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
@@ -298,14 +320,15 @@ init:
     add eax, idt
     mov [idtr + 2], eax
 
-    push es                       ; zero the TSS (ES still = request header seg here)
+    push es                       ; zero the TSS + I/O bitmap (ES = header seg here)
     push di
     push cs
     pop es                        ; ES = our segment so STOSW targets our TSS
     mov di, tss
-    mov cx, 0x90 / 2
+    mov cx, 0x2070 / 2
     xor ax, ax
     rep stosw
+    mov byte [tss + 0x68 + 0x2000], 0xFF  ; the Intel bitmap terminator byte
     pop di
     pop es
     mov eax, [base_lin]           ; ESP0 = monitor stack top in driver memory
@@ -314,6 +337,13 @@ init:
     mov ebx, eax                  ; carry monitor ESP into PM (survives PT build)
     mov word  [tss + 8], 0x0010   ; SS0 = flat data selector
     mov word  [tss + 0x66], 0x0068 ; I/O-map base (all-zero bitmap = permissive)
+    ; SP-4b M4: trap port 0x92 so the monitor virtualizes the guest's A20 (the
+    ; only bit set in the otherwise-permissive map), and force the REAL gate on
+    ; for good — the monitor + the paged UMB/EMS backing sit above 1 MB.
+    or byte [tss + 0x68 + (0x92/8)], 1 << (0x92 % 8)
+    in al, 0x92
+    or al, 2
+    out 0x92, al
 
     mov ebp, [pd_lin]             ; carry pd_lin + drv_seg into PM
     movzx esi, word [drv_seg]
@@ -1504,7 +1534,10 @@ gdt:
     dq 0
     dq 0x00CF9B000000FFFF         ; [08] code, base patched
     dq 0x00CF93000000FFFF         ; [10] data, base 0 (flat)
-    dq 0x0000890000000088         ; [18] TSS, base patched, limit 0x88
+    dq 0x0000890000002068         ; [18] TSS, base patched, limit 0x2068: the
+                                  ; I/O bitmap at +0x68 covers the FULL 64K port
+                                  ; space (a port past the limit is DENIED, and
+                                  ; V86 guests hit sound/VGA ports >= 0x100)
     dq 0x00CF93000000FFFF         ; [20] data, base patched (= base, driver data)
 gdtr:
     dw 0x27                       ; 5 descriptors
@@ -1696,7 +1729,54 @@ monitor_body:
     je .intn
     cmp dl, 0xCF
     je .iret_op
+    cmp dl, 0xE6                  ; OUT imm8, AL — the trapped port 0x92 (A20)
+    je .out92_imm
+    cmp dl, 0xEE                  ; OUT DX, AL
+    je .out92_dx
+    cmp dl, 0xE4                  ; IN AL, imm8
+    je .in92_imm
+    cmp dl, 0xEC                  ; IN AL, DX
+    je .in92_dx
     mov al, dl                    ; unhandled sensitive instruction: signal its opcode
+    jmp signal32
+
+; ---- virtualized port 0x92: the guest's A20 gate. Only 0x92 is set in the
+; I/O bitmap, so any other port reaching here is a monitor bug -> signal. The
+; guest AL lives in the pushad frame at [esp+28]; guest DX at [esp+20]. ----
+.out92_imm:
+    cmp byte [eax+1], 0x92
+    jne .unhandled_io
+    add word [ebp], 2             ; skip OUT imm8, AL
+    jmp .a20_write
+.out92_dx:
+    cmp word [esp+20], 0x0092     ; guest DX
+    jne .unhandled_io
+    inc word [ebp]                ; skip OUT DX, AL
+.a20_write:
+    mov cl, [esp+28]              ; guest AL: bit 1 = A20 (bit 0, fast reset,
+    shr cl, 1                     ; is ignored — nothing period pulses it)
+    and cl, 1
+    cmp [fs:va20], cl
+    je .done_gp
+    mov [fs:va20], cl
+    call a20_apply
+    jmp .done_gp
+.in92_imm:
+    cmp byte [eax+1], 0x92
+    jne .unhandled_io
+    add word [ebp], 2             ; skip IN AL, imm8
+    jmp .a20_read
+.in92_dx:
+    cmp word [esp+20], 0x0092
+    jne .unhandled_io
+    inc word [ebp]                ; skip IN AL, DX
+.a20_read:
+    mov cl, [fs:va20]
+    add cl, cl                    ; bit 1 = the virtual A20 state
+    mov [esp+28], cl              ; guest AL (byte write: AH.. preserved)
+    jmp .done_gp
+.unhandled_io:
+    mov al, dl
     jmp signal32
 .cli:
     mov byte [fs:vif], 0
@@ -1943,14 +2023,8 @@ flat_memcpy:
     mov edi, [esp + 4]            ; guest EDI = dst linear
     mov esi, [esp + 8]            ; guest ESI = src linear
     mov ecx, [esp + 28]           ; guest ECX = byte count
-    in al, 0x92                   ; save port 0x92 + force A20 on: EMBs above the HMA
-    mov ah, al                    ; have bit 20 set, so the flat physical access needs
-    or al, 2                      ; A20 or it wraps at 1 MB (apply_a20 masks bit 20).
-    out 0x92, al
-    cld
-    rep movsb                     ; DS:ESI -> ES:EDI, both flat
-    mov al, ah
-    out 0x92, al                  ; restore A20 to the guest's prior state
+    cld                           ; (the REAL A20 gate is forced on at INIT and
+    rep movsb                     ; never drops — EMBs above 1 MB never fold)
     ret
 
 ; Ring-0 EMS frame remap (INT 0xC0 'PM'). Guest EBX = frame-slot linear base,
@@ -1989,6 +2063,33 @@ frame_remap:
     mov cr3, eax
     ret
 
+; Ring-0 virtual-A20 window remap: linear [0x100000, 0x110000) becomes identity
+; (va20 = 1) or folds onto phys [0, 0x10000) (va20 = 0) — the 8086 1 MB wrap the
+; guest expects, as pure paging illusion while the REAL gate stays on (real
+; EMM386's approach; a real A20-off would also fold the extended-RAM-backed
+; UMB/EMS windows and corrupt DOS=UMB state, which is the bug this fixes).
+; 16 PTEs in PT0 + CR3 reload. in: FS = driver data. Clobbers eax, ecx, edx.
+a20_apply:
+    mov eax, [fs:pd_lin]
+    add eax, 0x1000 + 0x100*4     ; &PT0[0x100] (linear 0x100000)
+    xor edx, edx                  ; fold target: phys 0
+    cmp byte [fs:va20], 0
+    je .have
+    mov edx, 0x00100000           ; identity: phys 0x100000
+.have:
+    or edx, 7                     ; present/rw/user
+    mov ecx, 16
+.pte:
+    mov [eax], edx
+    add eax, 4
+    add edx, 0x1000
+    loop .pte
+    mov eax, cr3
+    mov cr3, eax
+    ret
+
+banner: db 'TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
+
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:
     mov ah, al
@@ -2001,8 +2102,9 @@ signal32:
 .h: jmp .h
 
 align 16
-tss:
-    times 0x90 db 0
+tss:                              ; 0x68 TSS fields + 0x2000 I/O bitmap (all
+    times 0x2070 db 0             ; zero = permissive; 0x92 set at INIT) + the
+                                  ; 0xFF terminator byte, rounded up
 
 align 4
 mon_stack:
