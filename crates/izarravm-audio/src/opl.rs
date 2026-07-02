@@ -1023,6 +1023,18 @@ impl OplChip {
         self.status_bits(t1_expired, t2_expired)
     }
 
+    /// Peek at timer 1's `expired_after` (P4a Slice 3 Task 3.3). Exposed for
+    /// the machine crate's carry-pinning differential test, which needs to
+    /// locate an overflow step boundary without reimplementing `Timer`'s step
+    /// arithmetic; NOT `#[cfg(test)]` because that test lives in a downstream
+    /// crate (`izarravm-machine`), where a `cfg(test)` item in this crate's
+    /// non-dev dependency graph would not exist to link against. Not part of
+    /// the chip's production API, same precedent as `envelope_level` above.
+    #[doc(hidden)]
+    pub fn timer1_expired_after(&self, micros_elapsed: u64) -> bool {
+        self.timer1.expired_after(micros_elapsed)
+    }
+
     /// Pure bit computation for the OPL status byte, off caller-supplied
     /// timer-expired flags instead of the live `self.timer1`/`self.timer2`.
     /// The mask bits (register 0x04 bits 6/5) come from `self.registers`,

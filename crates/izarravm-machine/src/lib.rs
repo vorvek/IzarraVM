@@ -19954,6 +19954,265 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lazy_opl_status_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+        // P4a Slice 3 Task 3.2, mirroring the 3DA/3BA/3C2 and 0x61 cases: in the
+        // Approximate class (486/586) an OPL status read (0x388/0x38A and their
+        // SB16 mirrors) must NOT end the batch (io_touched stays false), while
+        // the Accurate class (286/386) keeps the exact prior behavior
+        // (io_touched set). Covers every alias `opl_port` maps to a status
+        // read: the native 0x388/0x38A and the SB16 mirrors 0x220/0x222/0x228.
+        let status_ports = [0x388u16, 0x38a, 0x220, 0x222, 0x228];
+
+        let mut accurate = test_machine(); // Gsw386 by construction
+        for &port in &status_ports {
+            with_bus(&mut accurate, |bus| {
+                *bus.io_touched = false;
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    *bus.io_touched,
+                    "port {port:#06X}: the Accurate class must still set \
+                     io_touched on an OPL status read"
+                );
+            });
+        }
+
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        for &port in &status_ports {
+            with_bus(&mut approximate, |bus| {
+                *bus.io_touched = false;
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    !*bus.io_touched,
+                    "port {port:#06X}: the Approximate class must NOT set \
+                     io_touched on an OPL status read (the lazy path)"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn lazy_opl_status_read_returns_the_same_byte_a_non_lazy_read_would_at_batch_start() {
+        // At batch start (zero in-batch clocks, predicted_opl_status degenerates
+        // to the batch-entry live status() exactly, the OPL counterpart of
+        // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy
+        // status byte must be byte-identical to what the pre-Task-3.2 read
+        // would have returned for the same live OPL state.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // latch reg 0x04
+            bus.write_io(0x389, BusWidth::Byte, 0x80).unwrap(); // reset IRQ flags
+            bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // latch reg 0x02
+            bus.write_io(0x389, BusWidth::Byte, 0xff).unwrap(); // timer 1 preset
+            bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // latch reg 0x04
+            bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+        });
+        machine.run_cycles(5_000).unwrap();
+
+        let expected = machine.opl.status();
+
+        let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
+            let value = bus.read_io(0x388, BusWidth::Byte, 0).unwrap();
+            (value, *bus.io_touched)
+        });
+
+        assert!(
+            !io_touched,
+            "sanity: this is the lazy path (Approximate class)"
+        );
+        assert_eq!(
+            lazy_value,
+            u32::from(expected),
+            "the lazy OPL status byte must equal the non-lazy read at batch \
+             start (zero in-batch clocks)"
+        );
+    }
+
+    #[test]
+    fn adlib_detection_idiom_only_the_address_write_ends_the_batch() {
+        // The AdLib detection idiom (Ralf Brown's canonical probe): one
+        // address-port write followed by up to six status-port reads in the
+        // same polling session. Before Slice 3 every one of those 7 accesses
+        // ended a CPU batch; after this slice only the write does, so a poll
+        // loop chains as run_straight_line continuations exactly like the
+        // 3DA/0x61 idioms.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+
+        with_bus(&mut machine, |bus| {
+            *bus.io_touched = false;
+            let _ = bus.write_io(0x388, BusWidth::Byte, 0x04); // address write
+            assert!(
+                *bus.io_touched,
+                "the address-port write must still set io_touched (writes \
+                 stay batch-ending)"
+            );
+
+            *bus.io_touched = false; // reset the flag, as the plan's idiom check does
+            for _ in 0..6 {
+                let _ = bus.read_io(0x388, BusWidth::Byte, 0).unwrap();
+            }
+            assert!(
+                !*bus.io_touched,
+                "up to six status-port reads in one continuous polling \
+                 session must never set io_touched in the Approximate class"
+            );
+        });
+    }
+
+    #[test]
+    fn predicted_opl_status_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
+        // Differential no-time-travel test, the OPL counterpart of
+        // predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n
+        // and predicted_pit_out_after_n_clocks_matches_...: build two
+        // identically-driven machines, snapshot one into a MachineBus, compute
+        // predicted_opl_status for a given in-batch clock total, and call
+        // advance_devices for real on the other with the same total (expressed
+        // in the same core+scaled-bus units) -- the two must agree exactly.
+        // The timer is left RUNNING (armed but not yet expired) and the T
+        // sweep straddles the overflow crossing, so both the pre- and
+        // post-expiry status bytes are exercised.
+        for prior_runs_core_clocks in [0u64, 61, 33_000] {
+            for core_clocks_so_far in [0u64, 100, 12_345, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(GswMode::Gsw486);
+                with_bus(&mut predicted_machine, |bus| {
+                    bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // reg 0x02
+                    bus.write_io(0x389, BusWidth::Byte, 0xf0).unwrap(); // preset
+                    bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // reg 0x04
+                    bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+                });
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(GswMode::Gsw486);
+                with_bus(&mut real_machine, |bus| {
+                    bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap();
+                    bus.write_io(0x389, BusWidth::Byte, 0xf0).unwrap();
+                    bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap();
+                    bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap();
+                });
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.opl, real_machine.opl);
+
+                let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+                    let before = bus.trace.elapsed_clocks();
+                    if core_clocks_so_far > 0 {
+                        bus.trace.record_instruction_fetch_run(0, 1, 0);
+                    }
+                    let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+                    bus.prior_runs_core_clocks = prior_runs_core_clocks;
+                    bus.core_clocks_so_far = core_clocks_so_far;
+                    (bus.predicted_opl_status(), raw_bus_clocks)
+                });
+
+                let step = prior_runs_core_clocks
+                    + core_clocks_so_far
+                    + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+
+                assert_eq!(
+                    predicted,
+                    real_machine.opl.status(),
+                    "predicted_opl_status(prior={prior_runs_core_clocks}, \
+                     core={core_clocks_so_far}) must match a real \
+                     advance_devices of the same core+scaled-bus clock total"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_opl_conversion_honors_the_batch_entry_fractional_carry() {
+        // Carry-pinning differential (the Slice 2 review's FIX 2, carried
+        // forward to Slice 3): a sweep test alone can pass even with
+        // `elapsed_opl_micros`' carry zeroed, if its (T, carry) pairs rarely
+        // land where the carry decides the floor. This test CONSTRUCTS such a
+        // pair: seed the fractional accumulator near 1.0 on both machines,
+        // pick an elapsed-microsecond count `k` sitting exactly on timer 1's
+        // overflow step (step_us=80), then pick a T whose product crosses the
+        // k-th integer only WITH the carry (floor(carry + T*rate) == k but
+        // floor(0 + T*rate) == k-1). Mutation-verified: with
+        // `elapsed_opl_micros` passing 0.0 instead of
+        // `opl_micros_at_batch_start` this fails; restored, passes.
+        let carry = 0.999_f64;
+        let mut predicted_machine = test_machine();
+        predicted_machine.set_mode(GswMode::Gsw486); // Approximate: the lazy path
+        let mut real_machine = test_machine();
+        real_machine.set_mode(GswMode::Gsw486);
+        for machine in [&mut predicted_machine, &mut real_machine] {
+            with_bus(machine, |bus| {
+                bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // reg 0x02
+                bus.write_io(0x389, BusWidth::Byte, 0xfe).unwrap(); // preset 0xfe: one step from overflow
+                bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // reg 0x04
+                bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+            });
+            // A tiny guest-clock nudge, not enough to cross even one 80us
+            // step at 66 MHz (486): keeps the timer's own accumulated_us near
+            // zero so the overflow step search below stays close to k=80.
+            machine.run_cycles(100).unwrap();
+            machine.opl_micros = carry; // the deliberate batch-entry carry seed
+        }
+        assert_eq!(predicted_machine.opl, real_machine.opl, "identical drive");
+
+        // The smallest elapsed-microsecond count sitting on timer 1's overflow
+        // step (preset 0xfe means one step away from crossing 0xff).
+        let step_us = 80u64;
+        let k = (1..=step_us * 4)
+            .find(|&k| {
+                predicted_machine.opl.timer1_expired_after(k)
+                    != predicted_machine.opl.timer1_expired_after(k - 1)
+            })
+            .expect("timer 1 (step_us=80) overflows within a few steps");
+        let expired_with_carry = predicted_machine.opl.timer1_expired_after(k);
+        let expired_without_carry = predicted_machine.opl.timer1_expired_after(k - 1);
+        assert_ne!(
+            expired_with_carry, expired_without_carry,
+            "k is the overflow step"
+        );
+
+        // A core-clock total T whose elapsed-microsecond floor lands on k only
+        // WITH the seeded carry, computed with the exact shared formula.
+        let rate = predicted_machine.timing.micros_per_clock;
+        let t = (1..=200_000u64)
+            .find(|&t| {
+                advance_fractional(carry, t, rate).0 == k
+                    && advance_fractional(0.0, t, rate).0 == k - 1
+            })
+            .expect("a carry-deciding T exists");
+
+        let (lazy_value, lazy_elapsed, io_touched) = with_bus(&mut predicted_machine, |bus| {
+            bus.core_clocks_so_far = t;
+            let elapsed = bus.elapsed_opl_micros();
+            let value = bus.read_io(0x388, BusWidth::Byte, t).unwrap();
+            (value as u8, elapsed, *bus.io_touched)
+        });
+        assert!(!io_touched, "sanity: the lazy path");
+        assert_eq!(
+            lazy_elapsed, k,
+            "the lazy conversion must honor the batch-entry carry: elapsed \
+             must be k (carry crosses the integer), not k-1 (carry dropped)"
+        );
+        assert_eq!(
+            (lazy_value >> 6) & 1,
+            u8::from(expired_with_carry),
+            "bit 6 (timer-1 flag) must reflect expiry at k (carry honored), \
+             which differs from the state at k-1 (carry dropped)"
+        );
+
+        // The ground truth: a real advance_devices of the same T, then the
+        // non-lazy status(), must agree with the lazy byte bit for bit.
+        real_machine.advance_devices(t);
+        let real_value = real_machine.opl.status();
+        assert_eq!(
+            lazy_value, real_value,
+            "lazy at T == a real advance_devices(T) then read, on the \
+             carry-deciding (T, carry) pair"
+        );
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         // Captured before the struct literal below since video/trace are also

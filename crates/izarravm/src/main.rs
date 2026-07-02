@@ -485,6 +485,69 @@ const MICROBENCHES: &[Microbench] = &[
         ],
     },
     Microbench {
+        name: "adlib-detect",
+        // The canonical AdLib detection idiom (Ralf Brown's probe, mirrored
+        // from OplChip's own `adlib_detection_sequence_reports_present` unit
+        // test): reset both timers, arm timer 1 to overflow in one 80us step,
+        // start it, then poll the status port for the timer-1 flag. Before
+        // P4a Slice 3 every one of the loop's status reads ended a CPU batch;
+        // after Slice 3 only the one setup write per OUT (address port,
+        // 0x388) does, so this is the lazy-status-read counterpart of
+        // poll-3da/poll-61 -- 1 address write + up to 6 status reads/session
+        // per the plan's idiom shape, though this fixture polls forever (no
+        // halt) so the same handful of address-port writes repeats only in
+        // the one-time setup, and the hot loop is pure status reads.
+        //
+        // Byte layout (hand-checked, see the poll-61 lesson: a IN AL,imm8's
+        // 2-byte encoding vs IN AL,DX's 1-byte moved the branch target and
+        // silently turned that fixture into a port-free loop for one commit):
+        //   0  BA 88 03        mov dx, 0x0388
+        //   3  B0 04           mov al, 0x04
+        //   5  EE              out dx, al         ; latch reg 4
+        //   6  42              inc dx             ; dx = 0x0389
+        //   7  B0 60           mov al, 0x60
+        //   9  EE              out dx, al         ; mask both timers
+        //  10  4A              dec dx             ; dx = 0x0388
+        //  11  B0 04           mov al, 0x04
+        //  13  EE              out dx, al         ; latch reg 4
+        //  14  42              inc dx             ; dx = 0x0389
+        //  15  B0 80           mov al, 0x80
+        //  17  EE              out dx, al         ; reset IRQ flags
+        //  18  4A              dec dx             ; dx = 0x0388
+        //  19  B0 02           mov al, 0x02
+        //  21  EE              out dx, al         ; latch reg 2 (timer1 preset)
+        //  22  42              inc dx             ; dx = 0x0389
+        //  23  B0 FF           mov al, 0xff
+        //  25  EE              out dx, al         ; preset 0xff: overflow in 1 step
+        //  26  4A              dec dx             ; dx = 0x0388
+        //  27  B0 04           mov al, 0x04
+        //  29  EE              out dx, al         ; latch reg 4
+        //  30  42              inc dx             ; dx = 0x0389
+        //  31  B0 21           mov al, 0x21
+        //  33  EE              out dx, al         ; start timer1, mask timer2
+        //  34  4A              dec dx             ; dx = 0x0388 (status port)
+        //  35  EC        wait: in al, dx
+        //  36  A8 40           test al, 0x40      ; timer-1 flag
+        //  38  74 FB           jz wait            ; rel8 = 35 - 40 = -5 (0xFB)
+        //  40  EB F9           jmp wait           ; rel8 = 35 - 42 = -7 (0xF9)
+        code: &[
+            0xBA, 0x88, 0x03, // mov dx, 0x0388
+            0xB0, 0x04, 0xEE, // mov al, 0x04 ; out dx, al
+            0x42, 0xB0, 0x60, 0xEE, // inc dx ; mov al, 0x60 ; out dx, al
+            0x4A, 0xB0, 0x04, 0xEE, // dec dx ; mov al, 0x04 ; out dx, al
+            0x42, 0xB0, 0x80, 0xEE, // inc dx ; mov al, 0x80 ; out dx, al
+            0x4A, 0xB0, 0x02, 0xEE, // dec dx ; mov al, 0x02 ; out dx, al
+            0x42, 0xB0, 0xFF, 0xEE, // inc dx ; mov al, 0xff ; out dx, al
+            0x4A, 0xB0, 0x04, 0xEE, // dec dx ; mov al, 0x04 ; out dx, al
+            0x42, 0xB0, 0x21, 0xEE, // inc dx ; mov al, 0x21 ; out dx, al
+            0x4A, // dec dx
+            0xEC, // wait: in al, dx
+            0xA8, 0x40, // test al, 0x40
+            0x74, 0xFB, // jz wait
+            0xEB, 0xF9, // jmp wait
+        ],
+    },
+    Microbench {
         name: "vram-write",
         // mov ax, 0x0013 ; int 0x10          (mode 13h: 0xA0000 is the LFB)
         // mov ax, 0xA000 ; mov es, ax
