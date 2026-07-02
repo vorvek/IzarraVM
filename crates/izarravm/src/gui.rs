@@ -1340,17 +1340,22 @@ impl GuiApp {
         };
         app.start();
         // Mount a CD once the emulation thread is up. An explicit config-file
-        // cd_image wins; otherwise fall back to the remembered prefs mount if
-        // that file still exists on disk (silently skipped if missing, like the
-        // floppy restore).
-        let cd_image = cd_image.or_else(|| {
-            app.prefs
-                .last_cd_image
-                .clone()
-                .filter(|path| path.is_file())
-        });
+        // cd_image wins; otherwise fall back to whichever remembered prefs
+        // mount is set (an ISO/CUE path or a folder), preferring the image if
+        // both are somehow set since the two are meant to be mutually
+        // exclusive. A remembered source that no longer exists on disk is
+        // silently skipped (like the floppy restore), leaving the drive empty.
         if let Some(path) = cd_image {
             app.mount_cd_from_path(&path);
+        } else if let Some(path) = app
+            .prefs
+            .last_cd_image
+            .clone()
+            .filter(|path| path.is_file())
+        {
+            app.mount_cd_from_path(&path);
+        } else if let Some(dir) = app.prefs.last_cd_folder.clone().filter(|dir| dir.is_dir()) {
+            app.mount_cd_from_folder(&dir);
         }
         app
     }
@@ -2256,10 +2261,12 @@ impl GuiApp {
                 {
                     self.load_cd_image();
                 }
-                // Folder-to-ISO is not built yet; the button is present but
-                // disabled. Wire it when the backend lands.
-                ui.add_enabled(false, egui::Button::new("Load folder"))
-                    .on_disabled_hover_text("Folder mounting is not available for the CD yet");
+                if ui
+                    .add_enabled(running, egui::Button::new("Load folder"))
+                    .clicked()
+                {
+                    self.load_cd_folder();
+                }
             });
         });
 
@@ -2300,6 +2307,7 @@ impl GuiApp {
         }
         self.cd_label = None;
         self.prefs.last_cd_image = None;
+        self.prefs.last_cd_folder = None;
         self.save_prefs();
     }
 
@@ -2377,7 +2385,57 @@ impl GuiApp {
             .unwrap_or_else(|| path.display().to_string());
         emu.mount_cd(image);
         self.cd_label = Some(label);
+        // An ISO/CUE mount and a folder mount are mutually exclusive in the
+        // CD drive, so recording one clears the other.
         self.prefs.last_cd_image = Some(path.to_path_buf());
+        self.prefs.last_cd_folder = None;
+        self.save_prefs();
+    }
+
+    /// Pick a host folder and mount it as a CD-ROM: an ISO9660 image is built
+    /// in memory (metadata only; file contents are read from the host folder
+    /// lazily as the guest requests sectors, so a large folder does not get
+    /// copied in up front).
+    fn load_cd_folder(&mut self) {
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        self.mount_cd_from_folder(&dir);
+    }
+
+    /// Build and mount the folder at `dir` as a CD-ROM, and remember it in
+    /// prefs so it is restored (rebuilt) next launch. Errors -- including the
+    /// ~650 MB CD-ROM capacity guard -- are logged the same way a bad ISO/CUE
+    /// mount is, and leave the drive unchanged. Used by the Load folder button
+    /// and the prefs restore on startup.
+    fn mount_cd_from_folder(&mut self, dir: &Path) {
+        let built = match izarravm_machine::build_cd_folder(dir) {
+            Ok(built) => built,
+            Err(err) => {
+                error!(%err, dir = %dir.display(), "failed to build a CD image from the folder");
+                return;
+            }
+        };
+        let image = match izarravm_machine::CdImage::from_folder(built) {
+            Ok(image) => image,
+            Err(err) => {
+                error!(%err, dir = %dir.display(), "failed to mount the folder as a CD image");
+                return;
+            }
+        };
+        let Some(emu) = &self.emu else {
+            return;
+        };
+        let label = format!(
+            "{} (folder)",
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string())
+        );
+        emu.mount_cd(image);
+        self.cd_label = Some(label);
+        self.prefs.last_cd_folder = Some(dir.to_path_buf());
+        self.prefs.last_cd_image = None;
         self.save_prefs();
     }
 }
