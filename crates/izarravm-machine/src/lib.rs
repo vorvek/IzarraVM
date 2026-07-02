@@ -7774,6 +7774,22 @@ impl Machine {
         // render_frame edges is forwarded to the PIC here, so playback timing and
         // IRQ5 no longer depend on the host frontend pulling audio. The host path
         // (render_dsp_audio) only drains what the clock already produced.
+        //
+        // MULTI-EDGE CONTRACT (holds for this DSP loop and the WSS/ADPCM loops
+        // below, which mirror it): take_irq is drained INSIDE the producer loop,
+        // at the sample tick that edged it, so every block edge reaches the PIC
+        // within the advance in which it occurred and none is ever parked in the
+        // device-side latch across a step (where a later gate, e.g. is_playing
+        // going false at a single-cycle block end, could strand it). When one
+        // advance spans N edges the PIC receives N requests, but the CPU does not
+        // execute during advance_devices, so the guest cannot acknowledge between
+        // them: the 8259 latches each request into IRR and a request on a
+        // still-set IRR bit is absorbed, exactly as real hardware absorbs a new
+        // pulse on a line whose interrupt is still pending. N intra-step edges
+        // therefore deliver ONE guest interrupt by construction; that is the
+        // architecturally correct coalescing, not a loss. What the run loop must
+        // (and does, see the Approximate batch cap) arrange is that batches end
+        // at block-edge instants when the guest needs one interrupt PER edge.
         // The mixer's SB Pro stereo bit (0x0E bit1) selects 8-bit byte
         // interleaving, which halves the per-channel frame rate; sample it before
         // computing the rate the DSP frames at.
@@ -7801,11 +7817,13 @@ impl Machine {
                 } else {
                     dsp.tick_sample(|| dma.read_byte(dma8, memory), || None);
                 }
-            }
-            if self.dsp.take_irq() {
-                let is_16bit = self.dsp.is_16bit();
-                self.mixer.set_irq_status(is_16bit);
-                self.pic.request(irq_line);
+                // Forward the half/end-buffer edge at the tick that produced it
+                // (see the multi-edge contract above).
+                if self.dsp.take_irq() {
+                    let is_16bit = self.dsp.is_16bit();
+                    self.mixer.set_irq_status(is_16bit);
+                    self.pic.request(irq_line);
+                }
             }
         }
 
@@ -7859,9 +7877,11 @@ impl Machine {
                         wss.tick_sample(|| dma.read_byte(wss_dma, memory));
                     }
                     wss.advance_autocal();
-                }
-                if self.wss.take_irq() {
-                    self.pic.request(wss_irq);
+                    // Forward the terminal-count edge at the frame that produced
+                    // it (see the DSP loop's multi-edge contract above).
+                    if self.wss.take_irq() {
+                        self.pic.request(wss_irq);
+                    }
                 }
             }
         }
@@ -7886,9 +7906,11 @@ impl Machine {
                         ..
                     } = self;
                     yamaha_adpcm.tick_sample(|| dma.read_byte(adpcm_dma, memory));
-                }
-                if self.yamaha_adpcm.take_irq() {
-                    self.pic.request(adpcm_irq);
+                    // Forward the half/end block edge at the frame that produced
+                    // it (see the DSP loop's multi-edge contract above).
+                    if self.yamaha_adpcm.take_irq() {
+                        self.pic.request(adpcm_irq);
+                    }
                 }
             }
         }
@@ -7902,6 +7924,9 @@ impl Machine {
         let edges =
             self.pit
                 .tick_recording_out_transitions(whole as u64, 2, &mut self.speaker_transitions);
+        // Per-edge forwarding, same multi-edge contract as the DSP loop above:
+        // N channel-0 edges in one step issue N requests and the PIC's IRR
+        // coalesces them into the one interrupt the guest can actually take.
         for _ in 0..edges {
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
@@ -7923,6 +7948,13 @@ impl Machine {
         self.keyboard
             .advance_mouse_pacing(clocks as f64 * self.timing.micros_per_clock);
 
+        // The take_irq latches below are single-edge bools, which is safe for
+        // these devices even across a multi-sample step: each is a completion
+        // edge that can fire at most once per guest-initiated operation (a
+        // scancode/aux byte entering the 8042 output buffer, a UART event, an
+        // LPT -ACK strobe, an FDC/IDE/ATA command completion), and the next
+        // operation requires guest port I/O, which ends the CPU batch. No
+        // periodic producer feeds them, so one advance can never span two edges.
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
@@ -7983,6 +8015,9 @@ impl Machine {
             // an enabled alarm compares against the new time. tick_interrupts
             // returns true only on the rising edge of IRQF (a guest that has not
             // read Register C to ack keeps the line asserted without a new edge).
+            // A single-edge bool is safe here: IRQF sources are seconds-scale
+            // (far coarser than any batch) and the line stays asserted until the
+            // Register C ack, so one advance cannot span two IRQ8 edges.
             if self.rtc.tick_interrupts(secs) {
                 self.pic.request(8); // IRQ8: RTC periodic/alarm/update interrupt
             }
@@ -17642,6 +17677,174 @@ mod tests {
         // It mixes into the combined audio render path as another sound source.
         let mixed = machine.render_audio(64);
         assert!(!mixed.is_empty(), "chip feeds the mixer");
+    }
+
+    #[test]
+    fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
+        // Multi-edge contract (see advance_devices): every block edge reaches
+        // the PIC inside the advance whose sample tick produced it, and edges
+        // that land while the previous request is still latched coalesce in the
+        // 8259's IRR. The CPU does not execute during advance_devices, so the
+        // guest cannot acknowledge between intra-step edges; the IRR absorbing
+        // the extra requests is exactly the hardware's still-asserted-line
+        // behavior, not a loss. After the guest-style ack sequence the NEXT
+        // step's edges must raise the line again: nothing may stay parked in
+        // the DSP's take_irq latch across steps.
+        let mut machine = test_machine();
+        // 16-byte auto-init DMA loop on ch1 feeding an 8-sample auto-init DSP
+        // block: one 200k-clock advance at 22 MHz (~9 ms, ~99 frames at
+        // 11025 Hz) spans MANY half/end block edges.
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // PIC base 0x08 (IRQ5 -> vector 0x0D), all lines unmasked.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap();
+            // DMA ch1: auto-init read of 16 bytes at 0x1_0000 (mode 0x59).
+            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            // DSP: rate 11025 Hz, block size 8, 8-bit auto-init output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x07, 0x00, 0x1C] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.dsp.is_playing(),
+            "auto-init keeps the block looping"
+        );
+        assert!(
+            machine.pic.irr_bit(5),
+            "the block edges latched IRR5 within their own step"
+        );
+        assert!(
+            !machine.dsp.take_irq(),
+            "no edge stays parked in the DSP latch after the step"
+        );
+        // Guest ISR: PIC acknowledge, device ack (0x22E read), then EOI.
+        with_bus(&mut machine, |bus| {
+            assert_eq!(bus.acknowledge_interrupt(), Some(0x0D));
+            bus.read_io(0x22E, BusWidth::Byte).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x20).unwrap(); // OCW2 EOI
+        });
+        assert!(!machine.pic.irr_bit(5), "IRR clear after the acknowledge");
+        // Later edges arrive in a later advance and re-request the line: the
+        // edge stream survives the ack instead of being lost with it.
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.pic.irr_bit(5),
+            "the next step's block edges re-request IRQ5"
+        );
+    }
+
+    #[test]
+    fn wss_terminal_count_edge_forwards_within_its_advance() {
+        // Same multi-edge contract as the DSP loop: the codec's terminal-count
+        // edge is drained per output frame inside the producer loop, so it
+        // reaches the PIC within the advance whose frame produced it and never
+        // parks in the take_irq latch across steps.
+        let mut machine = test_machine();
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x80);
+        }
+        with_bus(&mut machine, |bus| {
+            wss_arm_8bit_mono(bus, 31); // TC after 32 frames (~0.67 ms at 48 kHz)
+        });
+        // One advance spanning the whole 32-frame window plus slack.
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.pic.irr_bit(7),
+            "the terminal-count edge latched IRR7 within the step"
+        );
+        assert!(
+            !machine.wss.take_irq(),
+            "no edge stays parked in the codec latch after the step"
+        );
+    }
+
+    #[test]
+    fn adpcm_half_and_end_edges_forward_within_one_advance() {
+        // The ADPCM-B producer drains take_irq per frame (the DSP multi-edge
+        // contract): a single advance spanning a block's half edge AND end edge
+        // must leave the request latched in IRR10 and nothing parked in the
+        // chip's latch, with single-cycle playback halted at terminal count.
+        let mut machine = test_machine();
+        // 64 arbitrary ADPCM bytes at 0x03_0000 for DMA channel 3.
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x3_0000 + i, (i as u8).wrapping_mul(37) | 1);
+        }
+        with_bus(&mut machine, |bus| {
+            // 8237 ch3: single-cycle read of the 64-byte buffer.
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 63).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            // Chip: rate 11025 Hz, block 128 nibbles (one byte = two mono
+            // samples), ADPCM-B mono, START.
+            for &(port, value) in &[
+                (0x240u16, 1u8), // address: RATE_LOW
+                (0x241, 0x11),
+                (0x240, 2), // address: RATE_HIGH
+                (0x241, 0x2B),
+                (0x240, 4), // address: COUNT_LOW
+                (0x241, 127),
+                (0x240, 5), // address: COUNT_HIGH
+                (0x241, 0),
+                (0x240, 3), // address: FORMAT (ADPCM-B mono)
+                (0x241, 0x00),
+                (0x240, 0),    // address: CONTROL
+                (0x241, 0x01), // START
+            ] {
+                bus.write_io(port, BusWidth::Byte, u32::from(value))
+                    .unwrap();
+            }
+        });
+        // 400k clocks at 22 MHz (~18 ms) spans the whole 128-frame block at
+        // 11025 Hz (~11.6 ms): the half edge and the end edge land in ONE step.
+        machine.advance_devices_clocks(400_000);
+        assert!(
+            !machine.yamaha_adpcm.is_playing(),
+            "single-cycle block reached terminal count inside the step"
+        );
+        assert!(
+            machine.pic.irr_bit(10),
+            "the block edges latched IRR10 within the step"
+        );
+        assert!(
+            !machine.yamaha_adpcm.take_irq(),
+            "no edge stays parked in the chip latch after the step"
+        );
+    }
+
+    #[test]
+    fn pit_channel0_multi_edge_advance_latches_irq0() {
+        // Channel 0 is the per-edge exemplar (a request per OUT rising edge,
+        // issued inside the producer): several mode-2 periods inside ONE
+        // advance coalesce in the IRR, and the request is present at step end.
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x34).unwrap(); // ch0 mode 2
+            bus.write_io(0x40, BusWidth::Byte, 100).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0).unwrap();
+        });
+        // ~325 PIT ticks at 22 MHz: three-plus full periods in one advance.
+        machine.advance_devices_clocks(6_000);
+        assert!(
+            machine.pic.irr_bit(0),
+            "channel-0 edges latched IRQ0 within the multi-period step"
+        );
     }
 
     /// Program DMA channel 0 (the WSS default) for a single-cycle 8-bit read of
