@@ -6387,7 +6387,16 @@ impl Cpu386 {
     /// the `read_prefixes` 66h/67h gate below: TOKAEMM's monitor is chipset-side, not guest
     /// software, and it is 32-bit-default code that uses MOVZX/MOVSX/BSF/etc freely. V86 tasks are
     /// always CPL 3 architecturally, so this can never leak into guest-facing V86 code, and it
-    /// reads false in real mode (not protected). Guest-facing 286 fidelity is unchanged.
+    /// reads false in real mode (not protected). V86 and real-mode fidelity are unchanged.
+    ///
+    /// ASSUMPTION (same as `is_ring0_protected()`'s own doc): today ring-0 PM is ONLY the
+    /// chipset-side TOKAEMM monitor. A guest OS running its own ring-0 protected mode on a
+    /// throttled persona (OS/2 1.x or Windows standard mode on the 286 persona), or a future
+    /// VCPI client (which runs ring-0 PM by design), would get the full core ISA here -- including
+    /// the 586-only additions this same short-circuit skips on the 386/486 personas -- where real
+    /// hardware would #UD. Correct-by-design for the monitor (same precedent as the blanket
+    /// firmware-ROM exemption); revisit when VCPI/DPMI lands, likely by scoping the exemption to
+    /// monitor identity (e.g. a CS-range check like `cs_in_firmware_rom`) instead of privilege.
     ///
     /// `decode` applies this once, right after reading the second 0F byte — the same logical point
     /// (and eip) the fused path faulted at — so both the converted split path and the un-converted
@@ -6562,8 +6571,16 @@ impl Cpu386 {
                 // CPUID arrived on the late 486 and is standard on the 586. At the 286 and
                 // 386 guest levels it does not exist, so raise #UD. (The 286-level gate above
                 // already blocks it; this also covers the 386 level, which keeps the rest of
-                // the 0F group but still has no CPUID.) Firmware in the BIOS ROM is exempt.
-                if !self.level.has_cpuid() && !self.cs_in_firmware_rom() {
+                // the 0F group but still has no CPUID.) Firmware in the BIOS ROM is exempt,
+                // and so is ring-0 protected mode -- the same chipset-side-monitor exemption
+                // (and the same ASSUMPTION/revisit trigger) as the two ISA gates in
+                // read_prefixes and check_two_byte_isa_gate; without it, future ring-0
+                // monitor code executing CPUID on a sub-486 persona would die by the same
+                // unpopulated-low-vector cascade the gate exemptions fixed.
+                if !self.level.has_cpuid()
+                    && !self.cs_in_firmware_rom()
+                    && !self.is_ring0_protected()
+                {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -6676,6 +6693,15 @@ impl Cpu386 {
                 // 32-bit-default entry code (e.g. `vec13_entry`'s `66 B8 .. / mov
                 // ds, ax`) runs, and the resulting #UD cascades into a worse fault
                 // because TOKAEMM's IDT does not populate the low exception vectors.
+                //
+                // ASSUMPTION (same as `is_ring0_protected()`'s own doc): today
+                // ring-0 PM is ONLY the chipset-side TOKAEMM monitor. A guest OS
+                // running its own ring-0 protected mode on the 286 persona (OS/2
+                // 1.x, Windows standard mode), or a future VCPI client (ring-0 PM
+                // by design), would get 386+ ISA here where a real 286 #UDs.
+                // Correct-by-design for the monitor; revisit when VCPI/DPMI lands,
+                // likely by scoping this to monitor identity instead of privilege.
+                // See check_two_byte_isa_gate's doc for the full statement.
                 0x66 | 0x67
                     if self.level.is_pre_386()
                         && !self.cs_in_firmware_rom()
@@ -18869,6 +18895,49 @@ mod tests {
         ));
         assert!(run_at_level(&code, CpuLevel::I486).is_ok());
         assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    #[test]
+    fn cpuid_runs_in_ring0_protected_mode_below_486() {
+        // The exec-time CPUID gate carries the same ring-0 protected-mode
+        // exemption as the prefix and 0F-extended gates: chipset-side ring-0
+        // monitor code gets the full core ISA even when the guest persona has
+        // no CPUID (I286/I386). Same flat CPL-0 code segment shape as
+        // `cpl3_code`, but with an RPL-0 selector. I386 is the interesting
+        // level: the I286 two-byte gate does not apply, so only the CPUID
+        // gate decides. (At I486/I586 `has_cpuid()` is true and the gate is
+        // moot for everyone.)
+        let mut memory = vec![0u8; 256];
+        memory[..2].copy_from_slice(&[0x0f, 0xa2]);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(CpuLevel::I386);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0008,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: true,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        assert!(
+            exec_one_split(&mut cpu, &mut bus).is_ok(),
+            "CPUID must execute in ring-0 protected mode at the I386 level"
+        );
+
+        // Guest-facing code is still gated: CPL-3 protected mode at I386 #UDs.
+        let (mut cpu3, mut bus3) = cpl3_code(&[0x0f, 0xa2]);
+        cpu3.set_level(CpuLevel::I386);
+        let fault = exec_one_split(&mut cpu3, &mut bus3).unwrap_err();
+        assert!(
+            matches!(fault, InternalFault::Exception { vector: 6, .. }),
+            "CPUID must still #UD for CPL-3 guest code at the I386 level"
+        );
+        // (Real-mode #UD at I286/I386 is pinned by cpuid_is_undefined_opcode_below_486.)
     }
 
     #[test]
