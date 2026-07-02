@@ -2342,6 +2342,10 @@ impl Machine {
         // mutably borrowed by other fields in that same literal.
         let beam_at_batch_start = self.video.beam_dots();
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
+        // Read from self.cpu.level(), the same source scale_bus reads from, not
+        // cpu_level_for_mode(self.active_mode) -- see run_until_clock's matching
+        // capture for why the two can diverge.
+        let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
         MachineBus {
             memory: &mut self.memory,
             ram_lookup: &mut self.ram_lookup,
@@ -2395,6 +2399,9 @@ impl Machine {
             beam_at_batch_start,
             trace_elapsed_at_batch_start,
             bus_rem_at_batch_start: self.bus_rem,
+            inv_clock_at_batch_start: self.timing.inv_clock,
+            bus_num_at_batch_start,
+            bus_den_at_batch_start,
         }
     }
 
@@ -8039,17 +8046,20 @@ impl Machine {
 
     /// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
     /// fractional-dot accumulator `dots_owed`. Pure: does not mutate `self`. The
-    /// SAME function both `advance_devices` (the real, mutating step above) and a
-    /// future lazy port-read peek (Slice 1) call, so the two paths cannot
-    /// structurally diverge: "no time travel" (a lazy read predicting state the
-    /// later real advance would contradict) becomes a property of sharing one
-    /// implementation, not an invariant maintained by hand across two call sites.
-    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3.
+    /// SAME arithmetic (via `predict_dots_core`) both `advance_devices` (the real,
+    /// mutating step above) and the Slice 1 lazy port-read peek
+    /// (`MachineBus::predicted_beam`) apply, so the two paths cannot structurally
+    /// diverge: "no time travel" (a lazy read predicting state the later real
+    /// advance would contradict) becomes a property of sharing one implementation,
+    /// not an invariant maintained by hand across two call sites.
+    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3/1.2.
     fn predict_dots(&self, clocks: u64, dots_owed: f64) -> (u64, f64) {
-        let raw =
-            dots_owed + clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
-        let whole = raw.floor();
-        (whole as u64, raw - whole)
+        predict_dots_core(
+            clocks,
+            dots_owed,
+            self.video.dot_clock_hz(),
+            self.timing.inv_clock,
+        )
     }
 
     /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
@@ -8631,6 +8641,14 @@ impl Machine {
             let beam_at_batch_start = self.video.beam_dots();
             let trace_elapsed_at_batch_start = trace_before;
             let bus_rem_at_batch_start = self.bus_rem;
+            let inv_clock_at_batch_start = self.timing.inv_clock;
+            // bus_timing's (num, den), read from the SAME source scale_bus reads
+            // from (self.cpu.level()) -- not cpu_level_for_mode(self.active_mode).
+            // The two can diverge: the CPU's live level only tracks active_mode
+            // from a set_mode (Lotura 0xE1) call onward; at construction the CPU
+            // starts at its own default level until the first mode switch. Reading
+            // active_mode here would silently mispredict during that window.
+            let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
             // A20 is a machine-layer event the CPU never sees directly, yet toggling it changes
             // which physical bytes back a linear address near the 1 MB wrap. Any A20 write (port
             // 0x92, the 8042, INT 15h, XMS) sets io_touched or is an HLE INT, so it ends this step;
@@ -8767,6 +8785,9 @@ impl Machine {
                     beam_at_batch_start,
                     trace_elapsed_at_batch_start,
                     bus_rem_at_batch_start,
+                    inv_clock_at_batch_start,
+                    bus_num_at_batch_start,
+                    bus_den_at_batch_start,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -9097,6 +9118,26 @@ struct MachineBus<'a> {
     trace_elapsed_at_batch_start: u64,
     #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
     bus_rem_at_batch_start: u64,
+    // The active mode's `1 / clock_hz` factor (Machine::timing.inv_clock), copied
+    // at bus construction like the five batch-entry snapshots above. Needed by
+    // `predicted_beam` (Task 1.2) to call the shared `predict_dots_core` formula;
+    // MachineBus has no `&Machine` to read `self.timing` from directly. A copy
+    // field rather than a per-call recompute: `TimingFactors::for_clock` only
+    // changes on a Lotura mode write (`set_mode`), so it is batch-entry-stable
+    // exactly like `active_mode` above it.
+    #[allow(dead_code)] // consumed by Task 1.3, to be removed then
+    inv_clock_at_batch_start: f64,
+    // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from
+    // the SAME source `scale_bus` reads (`self.cpu.level()`), NOT derived from
+    // `active_mode` here: the CPU's live level only tracks `active_mode` from a
+    // `set_mode` call onward, so at construction (before any Lotura 0xE1 write)
+    // the two can disagree. `predicted_beam` (Task 1.2) must scale in-batch bus
+    // clocks with exactly this ratio to match what the real end-of-batch
+    // `scale_bus` call will use.
+    #[allow(dead_code)] // consumed by Task 1.3, to be removed then
+    bus_num_at_batch_start: u32,
+    #[allow(dead_code)] // consumed by Task 1.3, to be removed then
+    bus_den_at_batch_start: u32,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -9935,6 +9976,63 @@ impl MachineBus<'_> {
         let seg = self.memory.read_u16(address + 2)?;
         Ok(off == 0 && seg == BIOS_ROM_IRET_SEG)
     }
+
+    /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
+    /// call's `core_clocks_so_far` plus the bus clocks recorded into `trace` since
+    /// batch entry add up to -- WITHOUT mutating any device state (`video`,
+    /// `vga_dots`, `bus_rem` on the owning `Machine` are all untouched). This is
+    /// the P4a Slice 1 lazy port-read peek (dev_docs/2026-07-02-p4a-lazy-port-
+    /// device-time-plan.md Task 1.2); wiring it into `read_io` is Task 1.3.
+    ///
+    /// Units combined, matching exactly what the real batch-end step in
+    /// `run_until_clock`/`advance_devices` will later consume:
+    /// - `core_clocks_so_far`: CPU core clocks charged by prior instructions of
+    ///   this straight-line run (excludes the in-flight instruction's own
+    ///   charge -- see the `core_clocks_so_far` field doc).
+    /// - the bus portion: `trace.elapsed_clocks() - trace_elapsed_at_batch_start`
+    ///   raw bus clocks recorded so far this batch, scaled by the SAME (num, den)
+    ///   `bus_timing` ratio and the SAME fractional carry (`bus_rem_at_batch_start`)
+    ///   the real end-of-batch `scale_bus` call will start from -- no `scale_bus`
+    ///   call happens between batch entry and batch end, so the batch-entry carry
+    ///   IS the carry the real call uses. This mirrors `scale_bus`'s arithmetic
+    ///   shape exactly but reads `bus_rem_at_batch_start` instead of the live
+    ///   `bus_rem` and does not write the carry back anywhere (no mutation).
+    ///
+    /// The in-flight instruction's own fetch/data bus clocks may already be
+    /// partially recorded into `trace` by the time this runs; that is fine and
+    /// intentional -- the real batch-end total (computed once the whole
+    /// instruction has retired) is always a superset of what is recorded here, so
+    /// the clock total this predicts from is monotone within the batch and never
+    /// exceeds the batch's eventual final total. It never overshoots what the
+    /// real advance would show for the same clock total, because it uses the same
+    /// formula.
+    ///
+    /// Predicts POSITION ONLY: the dots-per-frame modulo wrap, never the
+    /// frame-boundary side effects (`finalize_frame`, the frame counter) that
+    /// `Vga::advance` performs -- those stay exclusively in the real
+    /// `advance_devices` at batch end. Shares the exact `predict_dots_core`
+    /// arithmetic `Machine::predict_dots` uses (same operation order, same
+    /// floor/subtract sequence), so a mid-batch peek can never structurally
+    /// diverge from what the later real advance will show for the same clocks.
+    #[allow(dead_code)] // consumed by Task 1.3
+    fn predicted_beam(&mut self) -> u64 {
+        let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
+        let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
+            + self.bus_rem_at_batch_start;
+        let scaled_bus_clocks = scaled / u64::from(self.bus_den_at_batch_start);
+        let in_batch_clocks = self.core_clocks_so_far + scaled_bus_clocks;
+        let (whole_dots, _remainder) = predict_dots_core(
+            in_batch_clocks,
+            self.vga_dots_at_batch_start,
+            self.video.dot_clock_hz(),
+            self.inv_clock_at_batch_start,
+        );
+        let frame = self.video.frame_dots();
+        if frame == 0 {
+            return self.beam_at_batch_start; // guard: un-programmed CRTC, mirrors Vga::advance
+        }
+        (self.beam_at_batch_start + whole_dots) % frame
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10067,6 +10165,21 @@ fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
         GswMode::Gsw486 => CpuLevel::I486,
         GswMode::Gsw586 => CpuLevel::I586,
     }
+}
+
+/// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
+/// fractional-dot accumulator `dots_owed`, the VGA's live dot-clock rate, and the
+/// active mode's `1 / clock_hz` factor. Pure free function: the one shared
+/// arithmetic core `Machine::predict_dots` (the real `advance_devices` step) and
+/// `MachineBus::predicted_beam` (the Slice 1 lazy port-read peek) both call, so a
+/// mid-batch prediction and the later real advance can never structurally diverge
+/// in rounding. Kept textually identical to the arithmetic it was extracted from
+/// (same operation order, same floor/subtract sequence) -- do not "simplify" this
+/// without re-checking both callers' bit-for-bit tests.
+fn predict_dots_core(clocks: u64, dots_owed: f64, dot_clock_hz: u64, inv_clock: f64) -> (u64, f64) {
+    let raw = dots_owed + clocks as f64 * dot_clock_hz as f64 * inv_clock;
+    let whole = raw.floor();
+    (whole as u64, raw - whole)
 }
 
 /// Map a CPU I/O port to the OPL register port (0x388-0x38B) it addresses, or
@@ -18759,12 +18872,102 @@ mod tests {
         });
     }
 
+    #[test]
+    fn predicted_beam_at_batch_start_equals_the_unmutated_beam() {
+        // At core_clocks_so_far = 0 with zero in-batch bus clocks (the very first
+        // instruction of a batch, before any fetch/data access has been recorded
+        // into the trace this batch), the lazy formula must degenerate to exactly
+        // the batch-entry beam: no in-batch advance has happened yet. This pins the
+        // P4a Slice 1 peek's first-instruction safety argument as a test.
+        let mut machine = test_machine();
+        machine.run_cycles(5_000).unwrap();
+        let expected_beam = machine.video.beam_dots();
+        with_bus(&mut machine, |bus| {
+            // core_clocks_so_far defaults to 0 (no read_io call has run yet on this
+            // bus) and trace.elapsed_clocks() at this instant equals
+            // trace_elapsed_at_batch_start (nothing has been recorded since
+            // construction), so in-batch clocks are zero on both terms.
+            assert_eq!(
+                bus.predicted_beam(),
+                expected_beam,
+                "zero in-batch clocks must predict exactly the batch-entry beam"
+            );
+        });
+    }
+
+    #[test]
+    fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
+        // Differential no-time-travel test: build two identically-driven machines
+        // (the established pattern, see
+        // predict_vga_dots_matches_the_real_advance_devices_accumulator_step). Run
+        // both forward an odd cycle count first so vga_dots is fractional and
+        // bus_rem is nonzero at batch entry (the Task 1.1 shape: vga_dots
+        // ~0.4397, bus_rem 24 after 5000 cycles). Snapshot one into a MachineBus
+        // and compute predicted_beam for a given in-batch clock total; call
+        // advance_devices for real on the other with the same total (expressed in
+        // the same core+scaled-bus units predicted_beam consumes) and assert the
+        // beam positions agree exactly. Several (core_clocks_so_far, fetch_count)
+        // pairs cover: the trivial zero path, a small in-batch delta that stays
+        // inside one scanline, and a large one that crosses several scanlines and
+        // a frame wrap (position must still agree modulo frame; the real
+        // machine's frame counter may bump, which is expected and not asserted).
+        for core_clocks_so_far in [0u64, 100, 12_345] {
+            for fetch_count in [0u32, 1, 4_096] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.run_cycles(5_000).unwrap();
+                let mut real_machine = test_machine();
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.vga_dots, real_machine.vga_dots);
+                assert_eq!(predicted_machine.bus_rem, real_machine.bus_rem);
+                assert_eq!(
+                    predicted_machine.video.beam_dots(),
+                    real_machine.video.beam_dots()
+                );
+
+                let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+                    // Simulate fetch_count bytes' worth of bus traffic having been
+                    // recorded into the trace since batch entry (prior
+                    // instructions of this straight-line run, or this
+                    // instruction's own fetch), at zero wait-states, then read
+                    // back the actual raw clocks the trace charged for it so the
+                    // real-machine side below combines the exact same total (not
+                    // an assumed one) -- record_instruction_fetch_run's per-byte
+                    // cost is an internal BusCycle detail this test must not
+                    // hardcode.
+                    let before = bus.trace.elapsed_clocks();
+                    if fetch_count > 0 {
+                        bus.trace.record_instruction_fetch_run(0, fetch_count, 0);
+                    }
+                    let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+                    bus.core_clocks_so_far = core_clocks_so_far;
+                    (bus.predicted_beam(), raw_bus_clocks)
+                });
+
+                // The real batch-end step (run_until_clock / advance_devices):
+                // bus_clocks is what the trace recorded since batch entry
+                // (mirrored here by raw_bus_clocks), scaled through scale_bus's
+                // exact carry arithmetic, then summed with the batch's core
+                // clocks.
+                let step = core_clocks_so_far + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+
+                assert_eq!(
+                    predicted,
+                    real_machine.video.beam_dots(),
+                    "predicted_beam(core={core_clocks_so_far}, fetch_count={fetch_count}) must \
+                     match a real advance_devices of the same core+scaled-bus clock total"
+                );
+            }
+        }
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         // Captured before the struct literal below since video/trace are also
         // mutably borrowed by other fields in that same literal.
         let beam_at_batch_start = machine.video.beam_dots();
         let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
+        let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
         let mut bus = MachineBus {
             memory: &mut machine.memory,
             ram_lookup: &mut machine.ram_lookup,
@@ -18818,6 +19021,9 @@ mod tests {
             beam_at_batch_start,
             trace_elapsed_at_batch_start,
             bus_rem_at_batch_start: machine.bus_rem,
+            inv_clock_at_batch_start: machine.timing.inv_clock,
+            bus_num_at_batch_start,
+            bus_den_at_batch_start,
         };
         f(&mut bus)
     }
