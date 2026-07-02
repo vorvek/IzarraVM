@@ -1,18 +1,19 @@
 use izarravm_core::VideoCard;
-use izarravm_firmware::I386DX25_TEST_ROM;
+use izarravm_firmware::{DISTTRI_BIN, I386DX25_TEST_ROM};
 use izarravm_machine::{
     ActiveDisplay, BIOS_ROM_SIZE, DISTIRA_LFB_BASE, DISTIRA_MMIO_BASE, Machine, MachineProfile,
     StopReason,
 };
 use izarravm_video::{
     ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
-    DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
-    FBZCP_TEXTURE_ENABLED, LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565,
-    LFB_READ_BACK, LFB_WRITE_BACK, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y,
-    SST_COLOR1, SST_FASTFILL_CMD, SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE,
-    SST_START_A, SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD,
-    SST_TEX_BASE_ADDR, SST_TEXTURE_MODE, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY,
-    SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY, TEX_R5G6B5,
+    DACDATA_ADDR_SHIFT, DACDATA_RD, DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK,
+    FBZ_RGB_WMASK, FBZCP_TEXTURE_ENABLED, INIT_ENABLE_REMAP, LFB_ENABLE_PIXEL_PIPELINE,
+    LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565, LFB_READ_BACK, LFB_WRITE_BACK, SST_ALPHA_MODE,
+    SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_FASTFILL_CMD,
+    SST_FBI_INIT2, SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE, SST_START_A,
+    SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR,
+    SST_TEXTURE_MODE, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY,
+    SST_VERTEX_CX, SST_VERTEX_CY, TEX_R5G6B5,
 };
 
 fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
@@ -700,4 +701,127 @@ fn distira_cmdfifo_type5_framebuffer_packet_writes_lfb() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
+}
+
+#[test]
+fn distira_guest_dac_detect_ics_probe_reaches_fbi_init2_through_pci_init_enable() {
+    // A real DAC-detect handshake needs two PCI-config-space writes
+    // (command/BAR0, already exercised elsewhere) plus a third: initEnable
+    // at PCI config offset 0x40, which real hardware and this codebase's
+    // PCI function both keep in config space rather than the MMIO window.
+    // Prove initEnable's remap bit reaches the device from real guest x86
+    // code and that fbiInit2's readback answers the ICS GCLK1 probe.
+    const ASSIGNED_BAR: u32 = 0xe700_0000;
+
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    // initEnable (offset 0x40): set the fbiInit2 DAC-remap bit.
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
+    push_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_REMAP);
+    // Address DAC register 7 with the GCLK1 PLL sub-register index (0x0b).
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_DAC_DATA as u32,
+        (7 << DACDATA_ADDR_SHIFT) | 0x0b,
+    );
+    // Issue a read cycle against DAC register 5 (the PLL port).
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_DAC_DATA as u32,
+        (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
+    );
+    push_load_eax_moffs(&mut code, ASSIGNED_BAR + SST_FBI_INIT2 as u32);
+    push_store_eax_moffs(&mut code, 0x2200);
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        protected_flat_rom(&code),
+    )
+    .unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    assert_eq!(
+        read_guest_u32(&mut machine, 0x2200) & 0xff,
+        0x79,
+        "GCLK1 should read back the ICS5342 power-on default 0x79"
+    );
+}
+
+#[test]
+fn distira_v_retrace_poll_loop_terminates_as_device_clocks_advance() {
+    // A grSstVRetrace()-shaped poll loop waits on SST_STATUS bit 6 (0x40)
+    // flipping. Drive the machine's device-clock advance (the same path
+    // advance_devices uses every batch) and confirm the bit is observed in
+    // both states, i.e. a real wait-for-either-edge loop cannot hang.
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    let clock_hz = machine.active_mode().clock_hz();
+    let mut saw_set = false;
+    let mut saw_clear = false;
+    for _ in 0..200 {
+        machine.advance_devices_clocks(clock_hz / 1000);
+        let status = read_reg(&mut machine, SST_STATUS);
+        if status & 0x40 != 0 {
+            saw_set = true;
+        } else {
+            saw_clear = true;
+        }
+    }
+
+    assert!(saw_set, "the vsync status bit must be observed set");
+    assert!(saw_clear, "the vsync status bit must be observed clear");
+}
+
+#[test]
+fn disttri_guest_program_finds_distira_via_pci_and_draws_a_triangle() {
+    // Slice 1 of dev_docs/2026-07-02-distira-driver-plan.md: a standalone
+    // buildable flat-ROM guest program (crates/izarravm-firmware/roms/
+    // disttri.asm), loaded exactly like a real BIOS image, that performs its
+    // own real PCI bus scan (not a machine-test shortcut with a hardcoded
+    // slot), programs BAR0, and rasterizes one flat green triangle through
+    // direct SST register writes before signaling success via the
+    // unit-tester exit port. This is the guest-visible compatibility
+    // evidence the plan calls for, as opposed to a Rust test poking the
+    // device directly.
+    let mut machine =
+        Machine::new(MachineProfile::gsw_386(16, VideoCard::Distira), DISTTRI_BIN).unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+
+    assert_eq!(
+        reason,
+        StopReason::TestExit { code: 0xa5 },
+        "the guest program must find the card, draw, and signal EXIT_OK"
+    );
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (4, 4));
+    // The right triangle (0,0)-(4,0)-(0,4) covers the standard half-frame
+    // staircase under this codebase's pixel-center rasterization rule (see
+    // the analogous triangle_rasterizes_to_the_back_buffer_with_rgb565_scanout
+    // video-crate test): opaque green (0x0000ff00) inside the triangle,
+    // untouched black (clear color) outside it.
+    let green = 0x0000_ff00u32;
+    let black = 0x0000_0000u32;
+    #[rustfmt::skip]
+    let expected = [
+        green, green, green, green,
+        green, green, green, black,
+        green, green, black, black,
+        green, black, black, black,
+    ];
+    assert_eq!(
+        frame, expected,
+        "unexpected triangle coverage pattern in the 4x4 frame: {frame:#010x?}"
+    );
 }

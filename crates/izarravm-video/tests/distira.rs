@@ -1,15 +1,17 @@
 use izarravm_video::{
-    BIG_DISTIRA_CHIP_NAME, DEPTHOP_ALWAYS, DEPTHOP_LESSTHAN, Distira, DistiraVertex, FBZ_CHROMAKEY,
-    FBZ_DEPTH_ENABLE, FBZ_DEPTH_OP_SHIFT, FBZ_DEPTH_WMASK, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
-    LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE, SST_CHROMA_KEY,
-    SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DR_DX, SST_DR_DY, SST_FASTFILL_CMD,
-    SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7, SST_FBI_ZFUNC_FAIL,
-    SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_FDR_DX, SST_FDR_DY, SST_FDZ_DX, SST_FOG_COLOR,
-    SST_FOG_MODE, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R, SST_FSTART_Z, SST_FTRIANGLE_CMD,
-    SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX, SST_FVERTEX_BY, SST_FVERTEX_CX, SST_FVERTEX_CY,
-    SST_LFB_MODE, SST_START_B, SST_START_G, SST_START_R, SST_START_Z, SST_STATUS,
-    SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX,
-    SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
+    BIG_DISTIRA_CHIP_NAME, DACDATA_ADDR_SHIFT, DACDATA_RD, DEPTHOP_ALWAYS, DEPTHOP_LESSTHAN,
+    Distira, DistiraVertex, FBZ_CHROMAKEY, FBZ_DEPTH_ENABLE, FBZ_DEPTH_OP_SHIFT, FBZ_DEPTH_WMASK,
+    FBZ_DRAW_BACK, FBZ_RGB_WMASK, FBZ_W_BUFFER, INIT_ENABLE_REMAP, LFB_FORMAT_ARGB8888,
+    LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE, SST_CHROMA_KEY, SST_CLIP_LEFT_RIGHT,
+    SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_DR_DX, SST_DR_DY, SST_DW_DX, SST_DW_DY,
+    SST_FASTFILL_CMD, SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7,
+    SST_FBI_ZFUNC_FAIL, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_FDR_DX, SST_FDR_DY, SST_FDZ_DX,
+    SST_FOG_COLOR, SST_FOG_MODE, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R, SST_FSTART_Z,
+    SST_FTRIANGLE_CMD, SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX, SST_FVERTEX_BY,
+    SST_FVERTEX_CX, SST_FVERTEX_CY, SST_HV_RETRACE, SST_LFB_MODE, SST_START_B, SST_START_G,
+    SST_START_R, SST_START_W, SST_START_Z, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD,
+    SST_V_RETRACE, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX,
+    SST_VERTEX_CY,
 };
 
 fn read_reg(distira: &Distira, reg: usize) -> u32 {
@@ -3266,4 +3268,296 @@ fn ordered_dither_changes_low_colors_by_pixel_position() {
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_0000);
     assert_eq!(frame[1], 0x0008_0408);
+}
+
+#[test]
+fn dac_data_ics_probe_answers_gclk1_vclk1_vclk7_through_fbi_init2() {
+    // Mirrors sst1InitDacDetectICS (dac.c): the guest addresses DAC register
+    // 7 with the ICS PLL sub-register index to probe (VCLK1=0x01, VCLK7=0x07,
+    // GCLK1=0x0b), then issues a read cycle against DAC register 5 (the PLL
+    // port) and expects fbiInit2's readback (gated by initEnable's remap
+    // bit) to answer with that sub-register's ICS5342 power-on default.
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_REMAP);
+
+    let probe = |distira: &mut Distira, pll_index: u32| -> u32 {
+        // Address DAC register 7 (write cycle, no SST_DACDATA_RD) and load
+        // the PLL sub-register index into it.
+        write_reg(distira, SST_DAC_DATA, (7 << DACDATA_ADDR_SHIFT) | pll_index);
+        // Now issue a read cycle against DAC register 5 (the PLL port).
+        write_reg(
+            distira,
+            SST_DAC_DATA,
+            (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
+        );
+        read_reg(distira, SST_FBI_INIT2) & 0xff
+    };
+
+    assert_eq!(
+        probe(&mut distira, 0x01),
+        0x55,
+        "VCLK1 should read back 0x55"
+    );
+    assert_eq!(
+        probe(&mut distira, 0x07),
+        0x71,
+        "VCLK7 should read back 0x71"
+    );
+    assert_eq!(
+        probe(&mut distira, 0x0b),
+        0x79,
+        "GCLK1 should read back 0x79"
+    );
+}
+
+#[test]
+fn dac_data_write_side_effects_are_accepted_without_special_casing() {
+    // Writing an arbitrary DAC register (not the PLL port, not a read cycle)
+    // stores the byte and does not panic or corrupt other DAC state; a read
+    // cycle against the PLL port with an unprobed index falls through to
+    // the default 0xff, matching 86Box's dac_readdata reset-then-maybe-
+    // overwritten shape. This is the "accepted/ignored gracefully" contract
+    // the plan calls for beyond the three known ICS registers.
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_REMAP);
+
+    write_reg(&mut distira, SST_DAC_DATA, (2 << DACDATA_ADDR_SHIFT) | 0x42);
+    write_reg(&mut distira, SST_DAC_DATA, (7 << DACDATA_ADDR_SHIFT) | 0x99);
+    write_reg(
+        &mut distira,
+        SST_DAC_DATA,
+        (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
+    );
+    assert_eq!(read_reg(&distira, SST_FBI_INIT2) & 0xff, 0xff);
+}
+
+#[test]
+fn fbi_init2_reads_raw_storage_when_remap_bit_is_clear() {
+    // Without initEnable's remap bit, fbiInit2 behaves like every other
+    // fbiInit register: plain byte-mergeable storage, and a DAC read cycle
+    // does not leak into it.
+    let mut distira = Distira::new();
+    write_reg(&mut distira, SST_FBI_INIT2, 0x0000_0200);
+
+    write_reg(&mut distira, SST_DAC_DATA, (7 << DACDATA_ADDR_SHIFT) | 0x0b);
+    write_reg(
+        &mut distira,
+        SST_DAC_DATA,
+        (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
+    );
+
+    assert_eq!(read_reg(&distira, SST_FBI_INIT2), 0x0000_0200);
+}
+
+#[test]
+fn w_buffer_mode_orders_depth_by_nearer_reciprocal_w() {
+    // FBZ_W_BUFFER (SST_WBUFFER, bit 3 of fbzMode): when selected, the depth
+    // test/write path uses the iterated 1/w value instead of the
+    // fixed-point Z path. Drives the same shape as the existing
+    // triangle_cmd_depth_test_rejects_farther_pixels test through the W
+    // registers (SST_START_W/SST_DW_DX/DY) instead of SST_START_Z, and
+    // checks the nearer (larger 1/w) triangle wins under the LESSTHAN op.
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_W_BUFFER
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+    // A small 1/w (0.01, register units are 14.18-scale like the S/T
+    // texture coordinates the W wire format shares): far away.
+    write_reg(&mut distira, SST_START_W, 164);
+    write_reg(&mut distira, SST_DW_DX, 0);
+    write_reg(&mut distira, SST_DW_DY, 0);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_W_BUFFER
+            | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_START_R, 0);
+    write_reg(&mut distira, SST_START_B, 0xff << 12);
+    // A larger 1/w (0.5): nearer. Must win and overwrite the far red triangle.
+    write_reg(&mut distira, SST_START_W, 8192);
+    write_reg(&mut distira, SST_DW_DX, 0);
+    write_reg(&mut distira, SST_DW_DY, 0);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(
+        frame[0], 0x0000_00ff,
+        "the nearer (larger 1/w) triangle must win"
+    );
+    assert_eq!(frame[1], 0x0000_00ff);
+}
+
+#[test]
+fn z_buffer_mode_is_unaffected_by_the_w_buffer_wiring() {
+    // Regression guard: adding W-buffer support must not change Z-buffer
+    // behavior when FBZ_W_BUFFER is clear. Same shape as the existing
+    // triangle_cmd_depth_test_rejects_farther_pixels_and_counts_failures
+    // test, kept here as a direct before/after comparison point.
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+    write_reg(&mut distira, SST_START_Z, 0x0100 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_START_R, 0);
+    write_reg(&mut distira, SST_START_B, 0xff << 12);
+    write_reg(&mut distira, SST_START_Z, 0x0200 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x00ff_0000);
+    assert_eq!(frame[1], 0x00ff_0000);
+    assert_ne!(read_reg(&distira, SST_FBI_ZFUNC_FAIL), 0);
+}
+
+#[test]
+fn v_retrace_and_status_bit_toggle_so_a_poll_loop_terminates() {
+    // SST_V_RETRACE/SST_HV_RETRACE/SST_STATUS's vsync bit (bit 6, per
+    // 86Box's vid_voodoo.c SST_status handler: "temp |= 0x40" when NOT in
+    // retrace) were previously hardcoded, which would hang a real
+    // grSstVRetrace()-style poll loop forever on whichever edge it waits
+    // for. Advancing the device's frame-phase clock must move the beam
+    // through both a "not retracing" and a "retracing" phase, so a guest
+    // polling loop waiting on either edge observes it and terminates.
+    let mut distira = Distira::new();
+    distira.set_frame_size(64, 48);
+
+    let mut saw_not_retracing = (read_reg(&distira, SST_STATUS) & 0x40) != 0;
+    let mut saw_retracing = (read_reg(&distira, SST_STATUS) & 0x40) == 0;
+    let initial_v_retrace = read_reg(&distira, SST_V_RETRACE);
+    let mut v_retrace_changed = false;
+    let mut hv_retrace_nonzero = false;
+
+    for _ in 0..2000 {
+        distira.advance_frame_phase(10_000);
+        let status = read_reg(&distira, SST_STATUS);
+        if status & 0x40 != 0 {
+            saw_not_retracing = true;
+        } else {
+            saw_retracing = true;
+        }
+        if read_reg(&distira, SST_V_RETRACE) != initial_v_retrace {
+            v_retrace_changed = true;
+        }
+        if read_reg(&distira, SST_HV_RETRACE) != 0 {
+            hv_retrace_nonzero = true;
+        }
+    }
+
+    assert!(
+        saw_not_retracing,
+        "the beam must spend time outside retrace"
+    );
+    assert!(saw_retracing, "the beam must spend time inside retrace");
+    assert!(
+        v_retrace_changed,
+        "SST_V_RETRACE must advance, not stay fixed"
+    );
+    assert!(
+        hv_retrace_nonzero,
+        "SST_HV_RETRACE must report a nonzero line/time value at some point"
+    );
+}
+
+#[test]
+fn frame_buffer_writes_beyond_the_configured_size_do_not_alias() {
+    // The 86Box-modeled memory-sizing probe (fbiMemSize, info.c) writes
+    // marker values at LFB offsets chosen to land only in an installed
+    // upper memory bank, then reads them back to confirm survival. That
+    // only works if unbacked addresses genuinely don't respond (open bus)
+    // rather than wrapping/aliasing onto backing that IS present. Assert
+    // the actual boundary behavior: the last valid framebuffer offset
+    // round-trips, one byte past it is silently dropped.
+    use izarravm_video::DISTIRA_FB_SIZE;
+
+    let mut distira = Distira::new();
+    let last_offset = DISTIRA_FB_SIZE - 1;
+    distira.write_lfb_u8(last_offset, 0xaa);
+    assert_eq!(distira.read_lfb_u8(last_offset), 0xaa);
+
+    let past_end = DISTIRA_FB_SIZE;
+    distira.write_lfb_u8(past_end, 0x55);
+    assert_eq!(
+        distira.read_lfb_u8(past_end),
+        0,
+        "a write past the configured framebuffer size must not alias onto backed memory"
+    );
+}
+
+#[test]
+fn texture_memory_writes_beyond_the_configured_size_do_not_alias() {
+    // Same non-aliasing contract as the framebuffer, for TMU memory: the
+    // TMU sense-pattern probe (sst1InitGetTmuMemory, info.c) relies on
+    // unbacked texture addresses not echoing back a previously-written
+    // sense pattern from backed memory.
+    use izarravm_video::DISTIRA_TEX_SIZE;
+
+    let mut distira = Distira::new();
+    let last_dword = DISTIRA_TEX_SIZE - 4;
+    distira.write_texture_u32(last_dword, 0xdead_beef);
+    assert_eq!(distira.read_texture_u32(last_dword), 0xdead_beef);
+
+    let past_end = DISTIRA_TEX_SIZE;
+    distira.write_texture_u32(past_end, 0x5a5a_5a5a);
+    assert_eq!(
+        distira.read_texture_u32(past_end),
+        0,
+        "a write past the configured texture memory size must not alias onto backed memory"
+    );
 }
