@@ -3118,47 +3118,28 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     }
 
     /// GSWMODE 286 while TOKAEMM's ring-0 monitor is resident — the risk case
-    /// flagged when this tool was built (coverage audit item 18). CONFIRMED
-    /// NO-GO, root-caused by direct instrumentation (small-step EIP/CS trace);
-    /// `izarravm-cpu` is frozen for this work (another agent owns it), so the
-    /// fix is out of scope here.
+    /// flagged when this tool was built (coverage audit item 18). This is the
+    /// inverted (survives) shape of the retired pinned-limitation test
+    /// `tokaemm_gswmode_286_switch_hits_the_known_monitor_limit`; it needs TWO
+    /// fixes to pass, landing in separate PRs:
     ///
-    /// Evidence: the fault fires the instruction after `active_mode()` flips to
-    /// `Gsw286`, at EIP=0x0000133B CS=0x0008 (`vec13_entry` — TOKAEMM's shared
-    /// #GP/IRQ5 monitor entry, see roms/dos/tokaemm.asm), `in_v86()`=false (the
-    /// CPU is executing the ring-0 monitor itself, not guest V86 code):
-    /// `general protection fault while loading selector 0x0000`.
+    ///  1. izarravm-cpu: the I286 guest ISA gate (66h/67h prefixes + 386-only
+    ///     0F opcodes) must exempt ring-0 protected mode (`is_ring0_protected`)
+    ///     the way it exempts firmware ROM, so TOKAEMM's 32-bit monitor keeps
+    ///     running below the V86 guest (branch vorvek/i286-monitor-gate).
+    ///  2. TOKAEMM itself: the guest-facing V86 code (XMS/EMS/UMB entry points)
+    ///     must be 286-clean — V86 and real mode stay at true-286 ISA fidelity,
+    ///     so a MOVZX there (e.g. the old `movzx bx, ah` in ems_int67, hit by
+    ///     EMS-presence probing on every EXEC) raises #UD, cascades through
+    ///     TOKAEMM's unpopulated low IDT gates, and kills the machine (this PR;
+    ///     the whole V86 section now assembles under `cpu 286`).
     ///
-    /// Root cause: TOKAEMM's monitor code is 32-bit-default (`vec13_entry` opens
-    /// with `pushad` then `66 B8 10 00 / mov ds, ax` — the `66` operand-size
-    /// prefix is required just to load a 16-bit segment register from 32-bit-
-    /// default code). `crates/izarravm-cpu/src/lib.rs` decode_prefixes rejects
-    /// `0x66`/`0x67` with #UD (vector 6) at the I286 guest level unless the
-    /// fetch address is in the firmware ROM (`cs_in_firmware_rom()`) — and the
-    /// monitor runs from TOKAEMM's own resident memory, not ROM, so it is not
-    /// exempt. Delivering that #UD then faults a second time: TOKAEMM's IDT
-    /// (`roms/dos/tokaemm.asm` around line 1559) only populates gates for
-    /// vector 8 upward (IRQ0..IRQ15); vectors 0-7, including 6, were never
-    /// built, so the CPU reads a zeroed/garbage gate for vector 6 and GP-faults
-    /// loading its null code selector — matching the observed "selector 0x0000".
-    ///
-    /// In short: `set_level` gates 32-bit *guest* ISA on the Lotura mode, but
-    /// TOKAEMM's own 32-bit ring-0 monitor is not exempt the way firmware ROM
-    /// is, and the monitor has no #UD handler to catch the consequence. Fixing
-    /// this needs either an `izarravm-cpu` exemption for ring-0 protected-mode
-    /// monitor code (parallel to `cs_in_firmware_rom`), or an `izarravm-cpu`-side
-    /// policy decision that the guest ISA gate should not apply while
-    /// `is_ring0_protected()` is true, or a TOKAEMM-side fix (build the low
-    /// exception vectors and/or make `vec13_entry` 286-clean) — none of which
-    /// this task should attempt (cpu is frozen; TOKAEMM is SP-4b-owned code
-    /// outside this task's brief).
-    /// PINS THE KNOWN LIMITATION: this test asserts the fault HAPPENS, so the
-    /// --ignored suite stays green while the bug is open. When the exemption
-    /// lands, invert it to the survives-and-returns-to-586 shape of its 486
-    /// sibling above.
+    /// Sequence mirrors the 486 sibling above: GSWMODE 286 (the EXEC's own EMS
+    /// probe already exercises ems_int67 at I286), VER at the 286 level, then
+    /// GSWMODE 586 (a second EXEC at I286) to prove switching back works.
     #[test]
     #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-    fn tokaemm_gswmode_286_switch_hits_the_known_monitor_limit() {
+    fn tokaemm_gswmode_286_switch_survives_the_monitor() {
         let dir = std::env::temp_dir().join(format!(
             "tokaemm_gsw286_{}_{}",
             std::process::id(),
@@ -3199,24 +3180,298 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let stop = machine
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault after the GSWMODE 286 switch while TOKAEMM's ring-0 \
+                 monitor was resident: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
 
-        // The switch itself lands (the mode is 286)...
+        assert_eq!(
+            machine.active_mode(),
+            GswMode::Gsw586,
+            "GSWMODE 286 then GSWMODE 586 should leave the machine back at 586 \
+             (stop={stop:?}).\n{text}"
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("switched to 286") && lower.contains("switched to 586"),
+            "GSWMODE confirmation output missing for one of the two switches.\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the GSWMODE 286/VER/GSWMODE 586 sequence \
+             (stop={stop:?}).\n{text}"
+        );
+    }
+
+    /// UDPROBE.COM: a 62-byte guest fixture that installs its own INT 06h
+    /// handler and then executes a 386-only opcode (`movzx ax, bl`). At the
+    /// 286 ISA level the opcode raises #UD; a faithful V86 monitor reflects
+    /// vector 6 to the guest IVT and the handler prints "UDPROBE CAUGHT". On
+    /// a 386+ level the opcode simply executes and it prints "UDPROBE MISSED"
+    /// (so running it at the wrong level is visible). NASM source:
+    /// ```text
+    /// cpu 286
+    /// org 0x100
+    /// start:  mov ax, 0x2506          ; DOS set INT 06h -> DS:DX (DS=CS in a .COM)
+    ///         mov dx, handler
+    ///         int 0x21
+    ///         db 0x0F, 0xB6, 0xC3     ; movzx ax, bl -- 386-only, #UD at 286
+    ///         mov dx, msg_missed      ; fell through: the opcode executed
+    ///         jmp print_exit
+    /// handler: mov dx, msg_caught     ; reflected #UD lands here; never IRETs back
+    /// print_exit:
+    ///         mov ah, 9
+    ///         int 0x21
+    ///         mov ax, 0x4C00
+    ///         int 0x21
+    /// msg_caught: db 'UDPROBE CAUGHT', 0x0D, 0x0A, '$'
+    /// msg_missed: db 'UDPROBE MISSED', 0x0D, 0x0A, '$'
+    /// ```
+    const UDPROBE_COM: [u8; 62] = [
+        0xb8, 0x06, 0x25, 0xba, 0x10, 0x01, 0xcd, 0x21, 0x0f, 0xb6, 0xc3, 0xba, 0x2d, 0x01, 0xeb,
+        0x03, 0xba, 0x1c, 0x01, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0x55, 0x44,
+        0x50, 0x52, 0x4f, 0x42, 0x45, 0x20, 0x43, 0x41, 0x55, 0x47, 0x48, 0x54, 0x0d, 0x0a, 0x24,
+        0x55, 0x44, 0x50, 0x52, 0x4f, 0x42, 0x45, 0x20, 0x4d, 0x49, 0x53, 0x53, 0x45, 0x44, 0x0d,
+        0x0a, 0x24,
+    ];
+
+    /// A guest PROGRAM hitting a 386-only instruction at GSWMODE 286 must not
+    /// kill the machine: TOKAEMM's monitor now has IDT gates for the CPU
+    /// exceptions V86 code can raise (#DE/#UD/#NM) and reflects them to the
+    /// guest's real-mode IVT — period-faithful (DOS-era INT 06h handling: the
+    /// program deals with it or dies; the system survives). Before those gates
+    /// existed, the #UD hit a zeroed IDT descriptor and the whole machine died
+    /// with "general protection fault while loading selector 0x0000".
+    /// Same dependency as the test above: needs the izarravm-cpu ring-0 gate
+    /// exemption (PR #387) so the monitor itself runs at I286.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_gswmode_286_guest_ud_reflects_to_the_ivt() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_udreflect_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nGSWMODE 286\r\nUDPROBE\r\nGSWMODE 586\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "GSWMODE.COM".to_string(),
+                        izarravm_firmware::gswmode_com().to_vec(),
+                    ),
+                    ("UDPROBE.COM".to_string(), UDPROBE_COM.to_vec()),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault: a guest-program #UD at the 286 level must reflect to \
+                 the IVT, not kill the machine: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("udprobe caught"),
+            "UDPROBE's INT 06h handler never ran — the #UD was not reflected to \
+             the guest IVT (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            !lower.contains("udprobe missed"),
+            "UDPROBE fell through the MOVZX — the CPU was not at the 286 ISA \
+             level when it ran (stop={stop:?}).\n{text}"
+        );
+        assert_eq!(
+            machine.active_mode(),
+            GswMode::Gsw586,
+            "the run should end back at 586 (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the UDPROBE sequence (stop={stop:?}).\n{text}"
+        );
+    }
+
+    /// A cold boot in GSW-286 mode must reach a working prompt. POST applies
+    /// the CMOS-seeded mode (port 0xE1) before INT 19h, so the whole boot
+    /// chain runs at the true-286 ISA level — and the Katea boot chain (the
+    /// repo MBR + the FreeDOS FAT32-LBA VBR inside tokados-hdd.img) was 386
+    /// code executing from RAM: the MBR's first `66`-prefixed instruction
+    /// (`mov eax, [si+8]`, linear 0x642) raised #UD into IVT[6] = a bare IRET
+    /// stub, which returned to the same instruction — an infinite fault loop
+    /// with a blank screen. The kernel itself is XCPU=86 (8086-compiled), so
+    /// the boot sectors were the only 386 code in the chain; both are now
+    /// 8086/286-clean (word-pair LBA math). This matters because the Del
+    /// setup panel offers 286 as a saved boot mode.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn gsw286_cold_boot_reaches_a_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "diag286_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nVER\r\n".to_vec();
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.cpu = GswMode::Gsw286;
+        profile.clock_hz = GswMode::Gsw286.clock_hz();
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                ],
+            )
+            .expect("mount");
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during a GSW-286 cold boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
         assert_eq!(
             machine.active_mode(),
             GswMode::Gsw286,
-            "GSWMODE 286 should have written the live Lotura register \
+            "the machine should still be in the saved 286 mode (stop={stop:?}).\n{text}"
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("toka-dos version"),
+            "VER output missing after a 286 cold boot (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after a 286 cold boot (stop={stop:?}).\n{text}"
+        );
+    }
+
+    /// A 286 cold boot with DEVICE=TOKAEMM.SYS in CONFIG.SYS: TOKAEMM's INIT
+    /// is inherently 386-only (its whole job is building the 386 PM/paging
+    /// monitor), so on a pre-386 level it must decline like real EMM386 on a
+    /// 286 — read the Lotura mode register (port 0xE1, code 3 = 286), print a
+    /// "requires a 386" line, return a failed INIT with nothing resident —
+    /// and DOS then boots on bare metal (no V86, no XMS/UMB), which is what a
+    /// real 286 box looks like. Without the guard, INIT's first MOVZX raises
+    /// #UD into the IVT's bare-IRET default and the boot hangs forever.
+    /// Needs no CPU-side exemption: the monitor never installs.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokaemm_init_bails_gracefully_on_a_286_boot() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_286boot_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // No DOS=HIGH,UMB: with TOKAEMM declining to install there is no XMS
+        // provider, and this test is about the INIT bail, not kernel warnings.
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\TOKAEMM.SYS NOEMS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nVER\r\n".to_vec();
+
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.cpu = GswMode::Gsw286;
+        profile.clock_hz = GswMode::Gsw286.clock_hz();
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault during a 286-mode boot: TOKAEMM INIT must detect the \
+                 pre-386 level and decline, not execute 386 code: {msg}\n\
+                 stop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("requires a 386"),
+            "TOKAEMM INIT's pre-386 bail message is missing (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            !lower.contains("system running in v86"),
+            "TOKAEMM printed its signon banner — it must not install on a 286 \
              (stop={stop:?}).\n{text}"
         );
-        // ...and the monitor then faults. If this assertion starts FAILING
-        // because the run survived, the limitation is fixed: invert the test.
         assert!(
-            matches!(&stop, StopReason::CpuError(_)),
-            "expected the documented ring-0 monitor fault at the I286 level; \
-             the run survived instead -- the exemption must have landed, so \
-             invert this test to the 486 sibling's survives shape \
-             (stop={stop:?}).\n{text}"
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the 286-mode boot (stop={stop:?}).\n{text}"
         );
     }
 

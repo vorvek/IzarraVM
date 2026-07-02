@@ -14,10 +14,12 @@
 ; filesystem stage). Only using 1 sector for FreeDOS makes multi-booting
 ; of FreeDOS and Windows on the same filesystem easier.
 ;
-; Requirements: LBA BIOS and 386 or better CPU. Use the older CHS-only
-; boot sector if you want FAT32 on really old PCs (problems: you cannot
-; boot from > 8 GB boundary, cannot move / resize / ... without applying
-; SYS again if you use the CHS-only FAT32 boot sector).
+; Requirements: LBA BIOS and 186 or better CPU. (Toka-DOS: the upstream
+; sector required a 386; this copy does all its 32-bit LBA/cluster math as
+; 16-bit word pairs so a GSW-286 cold boot — where the Lotura gate holds
+; guest code to a true-286 ISA and a 66h prefix raises #UD — can still get
+; through the boot chain. `cpu 286` below makes NASM enforce the boundary;
+; the only 186+ features used are push-immediate and shift-by-imm8.)
 ;
 ; FAT12 / FAT16 hints: Use the older CHS-only boot sector unless you
 ; have to boot from > 8 GB. The LBA-and-CHS FAT12 / FAT16 boot sector
@@ -51,6 +53,7 @@
 
 segment	.text
 
+		cpu	286		; see the requirements note above
 		org	0x7c00		; this is a boot sector
 
 Entry:		jmp	short real_start
@@ -95,6 +98,10 @@ Entry:		jmp	short real_start
 					; (overwriting unused bytes)
 %define data_start	bp+0x4c		; first data sector (dd)
 					; (overwriting unused bytes)
+%define cur_clust	bp+0x34		; current cluster in the walk (dd)
+					; (overwriting reserved bytes)
+%define sect_left	bp+0x38		; sectors left in the cluster (db)
+					; (overwriting reserved bytes)
 
 		times   52h - ($ - $$) db 0
 		; The filesystem ID is used by lDOS's instsect (by ecm)
@@ -142,23 +149,33 @@ cont:		mov	ds, ax
 ; -------------
 
 ;	CALCPARAMS: figure out where FAT and DATA area starts
-;	(modifies EAX EDX, sets fat_start and data_start variables)
+;	(modifies AX DX CX, sets fat_start and data_start variables)
+;	All 32-bit values live in memory dwords handled as word pairs.
 
-calc_params:	xor	eax, eax
-		mov	[fat_sector], eax	; init buffer status
+calc_params:	xor	ax, ax
+		mov	[fat_sector], ax	; init buffer status: sector 0 is
+		mov	[fat_sector+2], ax	; never a FAT sector (reserved>0)
 
-		; first, find fat_start:
-		mov	ax, [bsResSectors]	; no movzx eax, word... needed
-		add	eax, [nHidden]
-		mov 	[fat_start], eax	; first FAT sector
-		mov	[data_start], eax	; (only first part of value)
+		; first, find fat_start = bsResSectors + nHidden:
+		mov	ax, [bsResSectors]
+		xor	dx, dx
+		add	ax, [nHidden]
+		adc	dx, [nHidden+2]
+		mov 	[fat_start], ax		; first FAT sector
+		mov 	[fat_start+2], dx
+		mov	[data_start], ax
+		mov	[data_start+2], dx
 
-		; next, find data_start:
-		mov	eax, [bsFATs]		; no movzx ... byte needed:
-		; the 2 dw after the bsFATs db are 0 by FAT32 definition :-).
-		imul	dword [xsectPerFat]	; (also changes edx)
-		add	[data_start], eax	; first DATA sector
-						; (adding in RAM is shorter!)
+		; next, data_start += bsFATs * xsectPerFat, one add per FAT
+		; (bsFATs is 1 or 2; a loop beats a 32x16 multiply here).
+		; CH is 0: the relocation rep movsw above ran CX down to zero
+		; and nothing since has touched it.
+		mov	cl, [bsFATs]
+add_fat:	mov	ax, [xsectPerFat]
+		mov	dx, [xsectPerFat+2]
+		add	[data_start], ax	; first DATA sector
+		adc	[data_start+2], dx
+		loop	add_fat
 
 		; finally, find fat_secshift:
 		mov	ax, 512	; default sector size (means default shift)
@@ -176,65 +193,58 @@ fatss_found:
 ; -------------
 
 ; FINDFILE:	Searches for the file in the root directory.
-; Returns:	EAX = first cluster of file
+; Returns:	DX:AX = first cluster of file
+; Cluster numbers travel in DX:AX; convert_cluster parks the cluster being
+; walked in [cur_clust] and next_cluster reads it back from there
+; (readDisk/cmpsb need the registers).
 
-		mov	eax, [xrootClst]	; root dir cluster
+		mov	ax, [xrootClst]		; root dir cluster
+		mov	dx, [xrootClst+2]
 
-ff_next_clust:	push	eax			; save cluster
-		call	convert_cluster
+ff_next_clust:	call	convert_cluster
 		jc	boot_error		; EOC encountered
-		; EDX is clust/sector, EAX is sector
-				
-ff_next_sector:	les	bx, [loadsegoff_60]	; load to loadseg:0
-		call	readDisk
-;---		push	eax			; save sector
+		; DX:AX is the sector, [sect_left] sectors per cluster
 
-;---		xor	ax, ax		; first dir. entry in this sector
+ff_next_sector:	les	bx, [loadsegoff_60]	; load to loadseg:0
+		call	readDisk		; advances DX:AX to the next sector
+
 		xor	di, di			;XXX
 
 		; Search for KERNEL.SYS file name, and find start cluster.
 ff_next_entry:	mov	cx, 11
 		mov	si, filename
-;---		mov	di, ax
 		repe	cmpsb
 		jz	ff_done		; note that di now is at dirent+11
 
-;---		add	ax, 0x20		; next directory entry
-;---		cmp 	ax, [bsBytesPerSec]	; end of sector reached?
 		add	di, byte 0x20		;XXX
 		and	di, byte -0x20 ; 0xffe0	;XXX
 		cmp	di, [bsBytesPerSec]	;XXX
 		jnz	ff_next_entry
 
-;---		pop	eax		; restore sector
-		dec 	dx		; next sector in cluster
+		dec 	byte [sect_left]	; next sector in cluster
 		jnz	ff_next_sector
 
-ff_walk_fat:	pop	eax			; restore current cluster
-		call	next_cluster		; find next cluster
-		jmp	ff_next_clust
+ff_walk_fat:	call	next_cluster		; find next cluster
+		jmp	short ff_next_clust	; (reads [cur_clust] itself)
 
-ff_done:	push	word [es:di+0x14-11]	; get cluster number HI
-		push	word [es:di+0x1A-11]	; get cluster number LO
-		pop	eax			; convert to 32bit
+ff_done:	mov	ax, [es:di+0x1A-11]	; get cluster number LO
+		mov	dx, [es:di+0x14-11]	; get cluster number HI
 
 		sub	bx, bx			; ES points to LOADSEG
 						; (kernel -> ES:BX)
 
 ; -------------
 
-read_kernel:	push	eax
-		call	convert_cluster
+read_kernel:	call	convert_cluster
 		jc	boot_success		; EOC encountered - done
-		; EDX is sectors in cluster, EAX is sector
+		; DX:AX is the sector, [sect_left] sectors per cluster
 
 rk_in_cluster:	call	readDisk
-		dec	dx
+		dec	byte [sect_left]
 		jnz	rk_in_cluster		; loop over sect. in cluster
 
-rk_walk_fat:	pop	eax
-		call	next_cluster
-		jmp	read_kernel
+rk_walk_fat:	call	next_cluster
+		jmp	short read_kernel
 		
 ;-----------------------------------------------------------------------
 
@@ -254,12 +264,15 @@ reboot:		int	0x19			; reboot the machine
 
 ; given a cluster number, find the number of the next cluster in
 ; the FAT chain. Needs fat_secshift and fat_start.
-; input:	EAX - cluster
-; output:	EAX - next cluster
+; input:	[cur_clust] - cluster (parked there by convert_cluster)
+; output:	DX:AX - next cluster
+; (modifies CL: callers re-derive their counts from convert_cluster)
 
 next_cluster:	push	es
 		push	di
 		push	bx
+		mov	ax, [cur_clust]
+		mov	dx, [cur_clust+2]
 
 		mov	di, ax
 		shl	di, 2			; 32bit FAT
@@ -270,23 +283,32 @@ next_cluster:	push	es
 		and	di, ax			; mask to sector size
 		pop	ax
 
-		shr	eax, 7			; e.g. 9-2 for 512 by/sect.
+		mov	cl, 7			; e.g. 9-2 for 512 by/sect.
 fat_afterss:	; selfmodifying code: previous byte is patched!
 		; (to hold the fat_secshift value)
+cn_shift:	shr	dx, 1			; DX:AX >>= fat_secshift, as a
+		rcr	ax, 1			; word-pair loop (8086-safe)
+		dec	cl
+		jnz	cn_shift
 
-		add	eax, [fat_start]	; absolute sector number now
+		add	ax, [fat_start]		; absolute sector number now
+		adc	dx, [fat_start+2]
 
 		mov	bx, FATSEG
 		mov	es, bx
 		sub	bx, bx
 
-		cmp	eax, [fat_sector]	; already buffered?
+		cmp	ax, [fat_sector]	; already buffered?
+		jnz	cn_load
+		cmp	dx, [fat_sector+2]
 		jz	cn_buffered
-		mov	[fat_sector],eax	; number of buffered sector
+cn_load:	mov	[fat_sector], ax	; number of buffered sector
+		mov	[fat_sector+2], dx
 		call	readDisk
 
-cn_buffered:	and	byte [es:di+3],0x0f	; mask out top 4 bits
-		mov	eax, [es:di]		; read next cluster number
+cn_buffered:	mov	ax, [es:di]		; read next cluster number
+		mov	dx, [es:di+2]
+		and	dh, 0x0f		; mask out the top 4 bits
 
 		pop	bx
 		pop 	di
@@ -298,25 +320,36 @@ cn_buffered:	and	byte [es:di+3],0x0f	; mask out top 4 bits
 
 ; Convert cluster number to the absolute sector number
 ; ... or return carry if EndOfChain! Needs data_start.
-; input:	EAX - target cluster
-; output:	EAX - absolute sector
-;		EDX - [bsSectPerClust] (byte)
+; input:	DX:AX - target cluster
+; output:	DX:AX - absolute sector
+;		[sect_left] - [bsSectPerClust] (byte)
 ;		carry clear
-;		(if carry set, EAX/EDX unchanged, end of chain)
+;		(if carry set, DX:AX unchanged, end of chain)
 
 convert_cluster:
-		cmp	eax, 0x0ffffff8	; if end of cluster chain...
-		jnb	end_of_chain
-
+		mov	[cur_clust], ax	; park the cluster: ff/rk_walk_fat's
+		mov	[cur_clust+2], dx ; next_cluster reads it back
+		cmp	dx, 0x0fff	; if end of cluster chain...
+		jb	cc_in_chain	; (EOC = high word 0x0FFF with low >=
+		cmp	ax, 0xfff8	; 0xFFF8; next_cluster masks the top
+		jnb	end_of_chain	; nibble so the high word can't exceed
+cc_in_chain:				; 0x0FFF)
 		; sector = (cluster-2) * clustersize + data_start
-		dec	eax
-		dec	eax
+		sub	ax, 2
+		sbb	dx, 0
 
-		movzx	edx, byte [bsSecPerClust]
-		push	edx
-		mul	edx
-		pop	edx
-		add	eax, [data_start]
+		; sectors/cluster is a power of two by the FAT specification,
+		; so the multiply is a word-pair shift by log2(spc).
+		mov	cl, [bsSecPerClust]
+		mov	[sect_left], cl	; per-cluster count for the callers
+cc_mul:		shr	cl, 1
+		jz	cc_mul_done	; spc=1 shifts zero times
+		shl	ax, 1
+		rcl	dx, 1
+		jmp	short cc_mul
+cc_mul_done:
+		add	ax, [data_start]
+		adc	dx, [data_start+2]
 		; here, carry is unset (unless parameters are wrong)
 		ret
 
@@ -339,24 +372,24 @@ print:		lodsb			; get token
 ;-----------------------------------------------------------------------
 
 ; Read a sector from disk, using LBA
-; input:	EAX - 32-bit DOS sector number
+; input:	DX:AX - 32-bit DOS sector number
 ;		ES:BX - destination buffer
 ;		(will be filled with 1 sector of data)
 ; output:	ES:BX points one byte after the last byte read.
-;		EAX - next sector
+;		DX:AX - next sector
+; (CX untouched; SI/DI preserved)
 
-readDisk:	push	dx
-		push	si
+readDisk:	push	si
 		push	di
 
-read_next:	push	eax	; would ax be enough?
+read_next:	push	dx	; save the sector for retry / increment
+		push	ax
 		mov	di, sp	; remember parameter block end
 
-;---		db	0x66	; operand size override (push dword)
-		push	byte 0	;XXX	; other half of the 32 bits at [C]
-				; (did not trust "o32 push byte 0" opcode)
-		push	byte 0	; [C] sector number high 32bit
-		push	eax	; [8] sector number low 32bit
+		push	0	; [E] sector number high 32bit, upper word
+		push	0	; [C] sector number high 32bit, lower word
+		push	dx	; [A] sector number low 32bit, upper word
+		push	ax	; [8] sector number low 32bit, lower word
 		push	es	; [6] buffer segment
 		push	bx	; [4] buffer offset
 		push	byte 1	; [2] 1 sector (word)
@@ -364,32 +397,33 @@ read_next:	push	eax	; would ax be enough?
 		mov	si, sp
 		mov	dl, [drive]
 		mov	ah, 42h	; disk read
-		int	0x13	
+		int	0x13
 
 		mov	sp, di	; remove parameter block from stack
 				; (without changing flags!)
-		pop	eax	; would ax be enough?
+		jc	rd_retry	; on error: reset and retry
 
-		jnc	read_ok		; jump if no error
-
-		push	ax			; !!
-		xor	ah, ah		; else, reset and retry
-		int	0x13
-		pop	ax			; !!
-		jmp	read_next
-
-read_ok:	inc 	eax			; next sector
-		add	bx, word [bsBytesPerSec]
+		pop	ax	; restore the sector number...
+		pop	dx
+		inc	ax	; ...and advance to the next one
+		jnz	rd_no_hi
+		inc	dx
+rd_no_hi:	add	bx, word [bsBytesPerSec]
 		jnc	no_incr_es		; if overflow...
 
-		mov	dx, es
-		add	dh, 0x10		; ...add 1000h to ES
-		mov	es, dx
+		mov	si, es
+		add	si, 0x1000		; ...add 1000h to ES
+		mov	es, si
 
 no_incr_es:	pop	di
 		pop 	si
-		pop	dx
 		ret
+
+rd_retry:	xor	ah, ah	; disk reset; DL is still the drive number
+		int	0x13	; (the BIOS preserves it across AH=42h)
+		pop	ax	; restore the sector number
+		pop	dx
+		jmp	short read_next
 
 ;-----------------------------------------------------------------------
 
