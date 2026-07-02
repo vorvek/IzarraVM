@@ -3,4 +3,20 @@ site_description: A Rust emulator for the Izarra 3000, a DOS-era games computer.
 repo_url: https://github.com/vorvek/IzarraVM
 theme:
   name: readthedocs
-# nav is auto-generated from docs/. Add an explicit nav here when the ordering matters.
+nav:
+  - Home: index.md
+  - Izarra 3000:
+      - User manual: izarra-3000/user-manual.md
+      - Company story: izarra-3000/company-story.md
+  - Toka-DOS:
+      - Using Toka-DOS: toka-dos/using-toka-dos.md
+      - Command reference: toka-dos/commands.md
+  - TOKAEMM memory manager: tokaemm/manual.md
+  - IZBIOS Configuration Panel: izbios/configuration-panel.md
+  - ReSonique 2 sound card: resonique2/manual.md
+  - IzarraVM GUI guide: izarravm-gui/guide.md
+  - Troubleshooting & FAQ: troubleshooting.md
+  - VGA core: vga-core/README.md
+  - VEGA (Margo / Distira):
+      - Programmer's guide: vega/vega-programmers-guide.md
+      - Technical reference: vega/vega-technical-reference.md
