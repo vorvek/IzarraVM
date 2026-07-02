@@ -9788,8 +9788,15 @@ impl CpuBus for MachineBus<'_> {
         // either.
         if port == 0x61 {
             if self.lazy_port_reads {
-                let ch1 = self.predicted_pit_out(1);
-                let ch2 = self.predicted_pit_out(2);
+                // Both channels share the SAME elapsed-PIT-clocks conversion
+                // (same rate, same batch-entry carry): computed once here rather
+                // than twice inside two separate predicted_pit_out calls, since
+                // that redundant second predict_dots_core call was pure waste on
+                // this hot path (measured: it erased most of the batch-chaining
+                // win in the P4a Task 2.3 A/B, see the microbench report).
+                let elapsed_pit_clocks = self.elapsed_pit_clocks();
+                let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
+                let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
                 if let (Some(ch1_out), Some(ch2_out)) = (ch1, ch2) {
                     let value = (self.speaker.control_bits() & 0x03)
                         | (u8::from(ch1_out) << 4)
@@ -10214,10 +10221,14 @@ impl MachineBus<'_> {
         self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks
     }
 
-    /// Peek `channel`'s live PIT OUT level "now" -- mid-batch, WITHOUT stepping
-    /// `pit` or mutating `pit_clocks` (P4a Task 2.3: the lazy port 0x61 bits 4/5
-    /// read). `None` when the channel's counter is BCD (see `Counter::out_after`
-    /// via `Pit::out_after`); the caller falls back to a real read in that case.
+    /// Elapsed PIT input CLKs "now" -- mid-batch, WITHOUT mutating `pit_clocks`
+    /// (P4a Task 2.3: the lazy port 0x61 bits 4/5 read). Shared by every channel
+    /// a caller peeks in the same read (0x61 needs both channel 1 and channel
+    /// 2), so a caller that needs more than one channel should compute this ONCE
+    /// and pass it to `Pit::out_after` per channel, not call `predicted_pit_out`
+    /// (below) once per channel -- the two calls would otherwise redo this exact
+    /// conversion redundantly (measured: that redundancy erased most of the
+    /// batch-chaining win in the P4a Task 2.3 A/B, see the microbench report).
     ///
     /// Converts the shared in-batch clock total `T` (`in_batch_clocks`, the same
     /// T `predicted_beam` peeks with) into elapsed PIT input clocks using the
@@ -10229,7 +10240,7 @@ impl MachineBus<'_> {
     /// the live `pit_clocks` value the real call will start folding T's clocks
     /// into: no time travel, this predicts exactly what a real `advance_devices`
     /// at T followed by a read would produce.
-    fn predicted_pit_out(&self, channel: usize) -> Option<bool> {
+    fn elapsed_pit_clocks(&self) -> u64 {
         let in_batch_clocks = self.in_batch_clocks();
         let (elapsed_pit_clocks, _remainder) = predict_dots_core(
             in_batch_clocks,
@@ -10237,7 +10248,19 @@ impl MachineBus<'_> {
             u64::from(PIT_INPUT_HZ),
             self.inv_clock_at_batch_start,
         );
-        self.pit.out_after(channel, elapsed_pit_clocks)
+        elapsed_pit_clocks
+    }
+
+    /// Peek `channel`'s live PIT OUT level "now" -- mid-batch, WITHOUT stepping
+    /// `pit` or mutating `pit_clocks`. `None` when the channel's counter is BCD
+    /// (see `Counter::out_after` via `Pit::out_after`); the caller falls back to
+    /// a real read in that case. Convenience wrapper over `elapsed_pit_clocks`
+    /// for a single-channel peek (tests, and any future single-channel lazy
+    /// port); the production 0x61 read arm needs both channels and calls
+    /// `elapsed_pit_clocks` directly instead, per the note above.
+    #[cfg(test)]
+    fn predicted_pit_out(&self, channel: usize) -> Option<bool> {
+        self.pit.out_after(channel, self.elapsed_pit_clocks())
     }
 }
 
