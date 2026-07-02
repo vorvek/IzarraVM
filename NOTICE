@@ -5,4 +5,7 @@ Modified by the Toka-DOS project (2026). Corresponding source: toka-dos/freedos/
 Full license: GPL-3.0 (see LICENSE).
 FreeDOS MOVE: © 1997-2002 Joe Cosentino, © 2003-2004 Imre Leber, GPLv2-or-later.
 FreeDOS SORT: © 1995 Jim Lynch, updated 2003-2004 Eric Auer, GPLv2-or-later.
+FreeDOS MEM: © 1997 Express Software / Joseph Cosentino, © 2001 Bart Oldeman,
+updated through 2006 by Eric Auer and others, GPLv2-or-later. Modified by the
+Toka-DOS project (2026): /P also implies /FULL (program size+segment listing).
 kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: © 1995 Pasquale J. Villani, GPLv2+.

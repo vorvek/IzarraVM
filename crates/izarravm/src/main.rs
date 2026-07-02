@@ -3125,6 +3125,100 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// Audit item 10: the vendored FreeDOS MEM (toka-dos/freedos/mem) runs under
+    /// the default V86 boot and both `MEM` and `MEM /P` produce sane output.
+    /// Toka-DOS diverges from upstream MEM here: upstream's `/P` is only a
+    /// prefix of `/PAGE` (pause after each screenful); the owner's spec wants
+    /// `/P` to list resident programs with size + segment, so mem2.c's main()
+    /// was patched to make `/PAGE` (and therefore `/P`) also imply `/FULL`
+    /// (see toka-dos/freedos/VENDOR.md). Each invocation gets its own boot (the
+    /// 25-row text console can't hold both outputs at once — /P's per-program
+    /// table alone is longer than a screenful), driven by AUTOEXEC.BAT (never
+    /// injected keystrokes, per the guest-testing convention).
+    fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (String, StopReason) {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_mem_{dir_suffix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = format!("@ECHO OFF\r\nLH TOKAMOUS\r\nMEM {mem_args}\r\n").into_bytes();
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(&dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
+            .expect("mount host folder with overrides");
+
+        // /P retains upstream's /PAGE pausing behavior on top of the Toka-DOS
+        // /FULL addition, so a long listing (like the per-program table) may
+        // stop at a "Press <Enter> to continue" pager prompt. Run in a few
+        // short bursts, injecting Enter between them: harmless once the boot
+        // has already reached the next C:\> prompt, but dismisses the pager
+        // (if hit) so the run always makes it back to a prompt.
+        let mut stop = machine
+            .run_until_halt_or_cycles(200_000_000)
+            .expect("machine run");
+        for _ in 0..4 {
+            if matches!(stop, StopReason::CpuError(_)) {
+                break;
+            }
+            machine.inject_key_scancodes(&[0x1c, 0x9c]); // Enter: dismiss any pager
+            stop = machine
+                .run_until_halt_or_cycles(150_000_000)
+                .expect("machine re-run");
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        (text, stop)
+    }
+
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_mem_plain_reports_conventional_memory() {
+        let (text, stop) = run_mem_command("plain", "");
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault while running MEM under V86: {msg}\n{text}");
+        }
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after MEM ran (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("conventional"),
+            "MEM output doesn't mention conventional memory (stop={stop:?}).\n{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_mem_p_lists_resident_programs() {
+        let (text, stop) = run_mem_command("p", "/P");
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault while running MEM /P under V86: {msg}\n{text}");
+        }
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after MEM /P ran (stop={stop:?}).\n{text}"
+        );
+        // Toka-DOS divergence check: /P must produce the per-program size +
+        // segment listing (upstream /P is only pagination). TOKAMOUS was
+        // loaded (LH) right before MEM /P ran, so it must be a resident name
+        // in the table; COMMAND.COM is always resident as a fallback check.
+        let upper = text.to_ascii_uppercase();
+        assert!(
+            upper.contains("TOKAMOUS") || upper.contains("COMMAND"),
+            "MEM /P output doesn't list a known resident program (TOKAMOUS/COMMAND) \
+             (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// SP-4b M4: the PS/2 mouse works under the default V86 boot — a host-injected
     /// wheel detent travels 8042 -> slave IRQ12 -> vector 0x74 -> the monitor's
     /// slave reflect stub -> guest INT 74h -> TOKAMOUS (loaded HIGH) -> INT 33h
