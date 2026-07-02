@@ -10509,6 +10509,9 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x0080..=0x008f, // DMA page registers
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
+        0x0280..=0x028f, // C/MS Game Blaster alternate-base probe range (Prince of
+        // Persia's sound detect reads 0x283 and must see open bus,
+        // not a fault -- the port-0x201 joystick-stub precedent)
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
     ];
