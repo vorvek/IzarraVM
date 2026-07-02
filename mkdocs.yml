@@ -1,0 +1,6 @@
+site_name: IzarraVM
+site_description: A Rust emulator for the Izarra 3000, a DOS-era games computer.
+repo_url: https://github.com/vorvek/IzarraVM
+theme:
+  name: readthedocs
+# nav is auto-generated from docs/. Add an explicit nav here when the ordering matters.
