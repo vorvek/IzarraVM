@@ -821,6 +821,62 @@ pub fn beam_vretrace(t: &CrtcTiming, dots: u64) -> bool {
     line >= t.vretrace_start && line < t.vretrace_end
 }
 
+/// Per-scanline text scanout parameters decoded once per row by
+/// `Vga::text_row_scan` and consumed by both `render_text_row`'s cell loop and
+/// the single-pixel `text_pixel` sampler. See those methods for the register
+/// semantics behind each field.
+struct TextRowScan {
+    cga_text: bool,
+    char_row: usize,
+    font_line: usize,
+    char_width: usize,
+    pan: usize,
+    byte_pan: usize,
+    start_cells: usize,
+    blink_enabled: bool,
+    blink_hide_phase: bool,
+    table_a: usize,
+    table_b: usize,
+    dual_font: bool,
+    cursor_disabled: bool,
+    cursor_hidden: bool,
+    cursor_byte: usize,
+    start_line: usize,
+    end_line: usize,
+    text_aperture_size: usize,
+}
+
+/// One resolved text cell's pixel-generation inputs (`Vga::text_cell_pixels`):
+/// enough to produce any of the cell's `char_width` pixels without re-reading
+/// the character/attribute pair or the font.
+struct TextCellPixels {
+    fg: u8,
+    bg: u8,
+    glyph_row: u8,
+    hide_fg: bool,
+    extend_ninth: bool,
+}
+
+impl TextCellPixels {
+    /// The cell's pel at column `px` (0-based within the cell). Bit 7 of the
+    /// glyph row is the leftmost pel; the 9th column (px == 8, 9-dot mode)
+    /// replicates the 8th (bit 0) for the box-drawing glyphs 0xC0-0xDF and is
+    /// the background otherwise.
+    #[inline]
+    fn pixel(&self, px: usize) -> u8 {
+        let lit = if px < 8 {
+            (self.glyph_row >> (7 - px)) & 1 != 0
+        } else {
+            self.extend_ninth && (self.glyph_row & 0x01 != 0)
+        };
+        if lit && !self.hide_fg {
+            self.fg
+        } else {
+            self.bg
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
@@ -1579,10 +1635,26 @@ impl Vga {
         }
         let line = beam_line(&self.crtc, beam);
         let dot = beam_dot(&self.crtc, beam) as usize;
+        // Sample ONLY the one pel under the beam, through the same shared
+        // per-pixel/per-cell implementations the full row renderers loop over
+        // (`active_pixel`/`color256_pixel`/`text_cell_pixels`), so the sampled
+        // value is bit-identical to `render_*_row(line)[dot]` -- pinned by
+        // `status_mux_single_pixel_sample_matches_the_full_row_render` -- with
+        // no per-read row render or heap allocation (measured ~10x of a 3DA
+        // poll's wall cost before this). `beam_display_enable` above guarantees
+        // dot < hdisp_end, the exact domain the row indexing covered.
         let color = match self.mode {
-            VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(line)[dot],
-            VideoMode::Text => self.render_text_row(line)[dot],
-            VideoMode::Planar => self.render_active_row(line)[dot],
+            VideoMode::Mode13h | VideoMode::ModeX => {
+                let (row_base, row_scan, below_split) = self.graphics_row_geometry(line);
+                let pan = (self.pel_pan(below_split) & 0x03) as u32;
+                self.color256_pixel(row_base, row_scan, pan, dot)
+            }
+            VideoMode::Text => self.text_pixel(line, dot),
+            VideoMode::Planar => {
+                let (row_base, row_scan, below_split) = self.graphics_row_geometry(line);
+                let pan = self.pel_pan(below_split);
+                self.active_pixel(row_base, row_scan, pan, dot)
+            }
             VideoMode::Cga => 0,
         };
         let pair = match (self.attr.plane_enable >> 4) & 0x03 {
@@ -1600,41 +1672,62 @@ impl Vga {
     /// doubled mode holds each VRAM row for two scanlines.
     pub fn render_active_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
-        // Line Compare split (CRTC 18h + 07h.4 + 09h.6). The comparison is in
-        // scan-counter units, so it is not divided by the double-scan factor.
-        let below_split = self.below_split(counter_line);
-        let (start, first_line) = self.split_origin(counter_line);
+        let (row_base, row_scan, below_split) = self.graphics_row_geometry(counter_line);
         let pan = self.pel_pan(below_split);
-        let row_scan = counter_line - first_line + self.preset_row_scan(below_split);
-        let source_row = row_scan / self.scan_factor();
-        // The per-scanline counter increment is offset*2 in every addressing mode; the
-        // byte/word/doubleword transform lives in display_offset, not the stride.
-        let row_base = start + source_row * self.crtc.offset * 2 + self.byte_pan(below_split);
         let mut row = vec![0u8; width];
         for (x, slot) in row.iter_mut().enumerate() {
-            let px = x + pan;
-            let byte = px / 8;
-            let bit = 7 - (px % 8);
-            let ma = display_counter(
-                self.crtc.mode_control,
-                self.crtc.underline_loc,
-                row_base,
-                byte as u32,
-            );
-            let off = display_offset_row(
-                self.crtc.mode_control,
-                self.crtc.underline_loc,
-                ma,
-                row_scan,
-            );
-            let mut index = 0u8;
-            for plane in 0..VGA_PLANES {
-                let b = self.vram[plane * VGA_PLANE_SIZE + off];
-                index |= ((b >> bit) & 1) << plane;
-            }
-            *slot = self.dac_index(self.attr_lookup(self.planar_scanout_attr_index(index)));
+            *slot = self.active_pixel(row_base, row_scan, pan, x);
         }
         row
+    }
+
+    /// Shared per-row scanout geometry for the graphics paths (16-color planar
+    /// and 256-color): the Line Compare split (CRTC 18h + 07h.4 + 09h.6, in
+    /// scan-counter units so it is not divided by the double-scan factor), the
+    /// origin, the row scan (with preset row scan), and the row base address.
+    /// The per-scanline counter increment is offset*2 in every addressing mode;
+    /// the byte/word/doubleword transform lives in display_offset, not the
+    /// stride. Returns (row_base, row_scan, below_split); the caller derives
+    /// its own pel-pan (the 256-color path masks it to 0-3).
+    fn graphics_row_geometry(&self, counter_line: u32) -> (u32, u32, bool) {
+        let below_split = self.below_split(counter_line);
+        let (start, first_line) = self.split_origin(counter_line);
+        // The split branch returns first_line = line_compare + 1 and is taken
+        // only when counter_line > line_compare, so counter_line >= first_line
+        // holds: the subtraction never underflows.
+        let row_scan = counter_line - first_line + self.preset_row_scan(below_split);
+        let source_row = row_scan / self.scan_factor();
+        let row_base = start + source_row * self.crtc.offset * 2 + self.byte_pan(below_split);
+        (row_base, row_scan, below_split)
+    }
+
+    /// One 16-color planar pixel at column `x` of the row described by
+    /// (`row_base`, `row_scan`, `pan`). The single implementation both
+    /// `render_active_row`'s per-pixel loop and the ISR1 video-status-mux
+    /// sampler call, so the two can never diverge.
+    #[inline]
+    fn active_pixel(&self, row_base: u32, row_scan: u32, pan: usize, x: usize) -> u8 {
+        let px = x + pan;
+        let byte = px / 8;
+        let bit = 7 - (px % 8);
+        let ma = display_counter(
+            self.crtc.mode_control,
+            self.crtc.underline_loc,
+            row_base,
+            byte as u32,
+        );
+        let off = display_offset_row(
+            self.crtc.mode_control,
+            self.crtc.underline_loc,
+            ma,
+            row_scan,
+        );
+        let mut index = 0u8;
+        for plane in 0..VGA_PLANES {
+            let b = self.vram[plane * VGA_PLANE_SIZE + off];
+            index |= ((b >> bit) & 1) << plane;
+        }
+        self.dac_index(self.attr_lookup(self.planar_scanout_attr_index(index)))
     }
 
     /// Assemble one 256-color scanline, shared by chained mode 13h and unchained
@@ -1656,37 +1749,39 @@ impl Vga {
     /// is set.
     pub fn render_256color_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
-        let below_split = self.below_split(counter_line);
-        let (start, first_line) = self.split_origin(counter_line);
-        // The split branch returns first_line = line_compare + 1 and is taken only when
-        // counter_line > line_compare, so counter_line >= first_line holds: the
-        // subtraction never underflows.
-        let row_scan = counter_line - first_line + self.preset_row_scan(below_split);
-        let source_row = row_scan / self.scan_factor();
-        let row_base = start + source_row * self.crtc.offset * 2 + self.byte_pan(below_split);
+        let (row_base, row_scan, below_split) = self.graphics_row_geometry(counter_line);
         // Mode-X pel-pan: one plane per pel, so the fine range is 0-3 (a pan of 4
         // equals a start-address bump). The below-split forcing is shared with the
         // 16-color path through pel_pan.
         let pan = (self.pel_pan(below_split) & 0x03) as u32;
         let mut row = vec![0u8; width];
         for (x, slot) in row.iter_mut().enumerate() {
-            let x_eff = x as u32 + pan;
-            let plane = (x_eff & 3) as usize;
-            let ma = display_counter(
-                self.crtc.mode_control,
-                self.crtc.underline_loc,
-                row_base,
-                x_eff >> 2,
-            );
-            let off = display_offset_row(
-                self.crtc.mode_control,
-                self.crtc.underline_loc,
-                ma,
-                row_scan,
-            );
-            *slot = self.vram[plane * VGA_PLANE_SIZE + off] & self.pel_mask;
+            *slot = self.color256_pixel(row_base, row_scan, pan, x);
         }
         row
+    }
+
+    /// One 256-color pixel at column `x` of the row described by (`row_base`,
+    /// `row_scan`, `pan`). The single implementation both
+    /// `render_256color_row`'s per-pixel loop and the ISR1 video-status-mux
+    /// sampler call, so the two can never diverge.
+    #[inline]
+    fn color256_pixel(&self, row_base: u32, row_scan: u32, pan: u32, x: usize) -> u8 {
+        let x_eff = x as u32 + pan;
+        let plane = (x_eff & 3) as usize;
+        let ma = display_counter(
+            self.crtc.mode_control,
+            self.crtc.underline_loc,
+            row_base,
+            x_eff >> 2,
+        );
+        let off = display_offset_row(
+            self.crtc.mode_control,
+            self.crtc.underline_loc,
+            ma,
+            row_scan,
+        );
+        self.vram[plane * VGA_PLANE_SIZE + off] & self.pel_mask
     }
 
     /// Assemble one text-mode scanline (counter line) into `hdisp_end` DAC
@@ -1707,6 +1802,53 @@ impl Vga {
         if cga_text && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0 {
             return vec![CGA_BLACK; width];
         }
+        let p = self.text_row_scan(counter_line);
+        let mut row = vec![0u8; width];
+        // Render one extra cell column so a non-zero pan's right edge pulls in the
+        // next cell's leading pixels; the left edge clips cell 0's scrolled-off
+        // leading pixels.
+        for dc in 0..=self.text_columns {
+            let cell = self.text_cell_pixels(&p, dc);
+            // Place the cell shifted left by `pan` pels. Use signed math so cell 0's
+            // leading `pan` pels (which scroll off the left edge) clip to negative
+            // positions instead of underflowing usize.
+            let cell_origin = dc as isize * p.char_width as isize;
+            for px in 0..p.char_width {
+                let x = cell_origin + px as isize - p.pan as isize;
+                if x < 0 || x as usize >= width {
+                    continue;
+                }
+                row[x as usize] = cell.pixel(px);
+            }
+        }
+        row
+    }
+
+    /// One text-mode pixel at column `x` of `counter_line`, byte-identical to
+    /// `render_text_row(counter_line)[x]` for every x < hdisp_end: the row
+    /// renderer places cell `dc`'s pel `px` at `x = dc*char_width + px - pan`,
+    /// each visible x written by exactly one (dc, px) pair, so inverting that
+    /// placement gives `dc = (x + pan) / char_width`, `px = (x + pan) %
+    /// char_width`. Shares `text_row_scan`/`text_cell_pixels` with the row
+    /// renderer, so the cell logic cannot diverge; the ISR1 video-status-mux
+    /// sampler calls this instead of rendering (and heap-allocating) a whole
+    /// row to read one pixel.
+    fn text_pixel(&self, counter_line: u32, x: usize) -> u8 {
+        let cga_text = self.is_cga_text_mode();
+        if cga_text && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0 {
+            return CGA_BLACK;
+        }
+        let p = self.text_row_scan(counter_line);
+        let shifted = x + p.pan;
+        let dc = shifted / p.char_width;
+        let px = shifted % p.char_width;
+        self.text_cell_pixels(&p, dc).pixel(px)
+    }
+
+    /// Per-scanline text scanout parameters, decoded once per row and shared by
+    /// `render_text_row`'s cell loop and the single-pixel `text_pixel` sampler.
+    fn text_row_scan(&self, counter_line: u32) -> TextRowScan {
+        let cga_text = self.is_cga_text_mode();
         let rows_per_char = self.crtc.max_scan + 1;
         // The display origin scrolls with the CRTC Start Address (0C/0Dh). Above
         // the line-compare split the origin is `start_address`; at and below the
@@ -1794,101 +1936,111 @@ impl Vga {
         let cursor_byte = ((self.cursor_offset as usize + skew as usize) * 2) % text_aperture_size;
         let start_line = (self.cursor_start & 0x1F) as usize;
         let end_line = (self.cursor_end & 0x1F) as usize;
-        let mut row = vec![0u8; width];
-        // Render one extra cell column so a non-zero pan's right edge pulls in the
-        // next cell's leading pixels; the left edge clips cell 0's scrolled-off
-        // leading pixels.
-        for dc in 0..=self.text_columns {
-            // Absolute cell index (char/attr pair) scrolled by the start address;
-            // the CRTC byte pan (08h bits 6-5) adds a byte offset to the origin,
-            // so a pan of 2 shifts one whole cell and a pan of 1 lands on the
-            // attribute byte (the real-hardware half-cell scramble).
-            let base =
-                (self.text_cell_base(start_cells, char_row, dc) + byte_pan) % text_aperture_size;
-            let char_byte = self.text_byte(base);
-            let attr = self.text_byte(base + 1);
-            let blink_attr = attr & 0x80 != 0;
-            // 512-glyph mode: when the Sequencer selects two distinct font tables
-            // (map A != map B), attribute bit 3 becomes the per-cell font selector
-            // and is no longer foreground intensity, so the foreground is masked to
-            // 8 colors. See A4 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
-            let font_select = (attr >> 3) & 1 != 0;
-            let font_table = if dual_font && font_select {
-                table_b
-            } else {
-                table_a
-            };
-            let fg_index = if dual_font {
-                (attr & 0x07) as usize
-            } else {
-                (attr & 0x0F) as usize
-            };
-            let bg_index = if blink_enabled && blink_attr {
-                ((attr >> 4) & 0x07) as usize
-            } else {
-                ((attr >> 4) & 0x0F) as usize
-            };
-            let mut fg = if cga_text {
-                fg_index as u8
-            } else {
-                self.dac_index(self.attr_lookup(fg_index as u8))
-            };
-            let mut bg = if cga_text {
-                bg_index as u8
-            } else {
-                self.dac_index(self.attr_lookup(bg_index as u8))
-            };
-            let hide_fg = blink_enabled && blink_attr && blink_hide_phase;
-            // Hardware text cursor (CRTC 0A/0B): on the cursor cell, swap fg/bg
-            // on the active scanlines for reverse video. 0A bit 5 disables the
-            // cursor; bits 0-4 of 0A/0B bound the scanline range (start > end
-            // wraps). The cursor blinks on the same hide phase as attribute
-            // blink, but is not gated on the attribute-blink enable. The cursor
-            // location register (0E/0Fh) is a cell index, so its byte address is
-            // cursor_offset*2; it fires when the displayed cell's byte offset
-            // matches, scrolling with the start address. The Cursor Skew (0Bh
-            // bits 6-5) delays the onset by that many character clocks, so the
-            // effective cursor cell is cursor_offset + skew (FreeVGA crtcreg.htm
-            // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). See A5 in
-            // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md. The skew,
-            // cursor byte, disable bit, and scanline range are decoded once per
-            // scanline above the loop.
-            let cursor_here = base == cursor_byte;
-            let in_range = if start_line <= end_line {
-                font_line >= start_line && font_line <= end_line
-            } else {
-                font_line >= start_line || font_line <= end_line
-            };
-            if cursor_here && !cursor_disabled && in_range && !cursor_hidden {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            // VGA reads the active writable font table. CGA has a fixed 8x8 ROM
-            // character generator, not VGA plane-2 font RAM.
-            let glyph_row = if cga_text {
-                crate::font::VGAFONT_8X8[char_byte as usize * 8 + font_line.min(7)]
-            } else {
-                self.font[font_table][char_byte as usize * 32 + font_line.min(31)]
-            };
-            let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
-            // Place the cell shifted left by `pan` pels. Use signed math so cell 0's
-            // leading `pan` pels (which scroll off the left edge) clip to negative
-            // positions instead of underflowing usize.
-            let cell_origin = dc as isize * char_width as isize;
-            for px in 0..char_width {
-                let x = cell_origin + px as isize - pan as isize;
-                if x < 0 || x as usize >= width {
-                    continue;
-                }
-                let lit = if px < 8 {
-                    (glyph_row >> (7 - px)) & 1 != 0
-                } else {
-                    // 9th column: replicate the 8th (bit 0) for box glyphs.
-                    extend_ninth && (glyph_row & 0x01 != 0)
-                };
-                row[x as usize] = if lit && !hide_fg { fg } else { bg };
-            }
+        TextRowScan {
+            cga_text,
+            char_row,
+            font_line,
+            char_width,
+            pan,
+            byte_pan,
+            start_cells,
+            blink_enabled,
+            blink_hide_phase,
+            table_a,
+            table_b,
+            dual_font,
+            cursor_disabled,
+            cursor_hidden,
+            cursor_byte,
+            start_line,
+            end_line,
+            text_aperture_size,
         }
-        row
+    }
+
+    /// Resolve displayed cell `dc` of the scanline described by `p` into its
+    /// pixel-generation inputs (fg/bg colors, glyph row, blink hide, 9th-column
+    /// extension). The single implementation both `render_text_row`'s cell loop
+    /// and the `text_pixel` sampler call, so the two can never diverge.
+    fn text_cell_pixels(&self, p: &TextRowScan, dc: usize) -> TextCellPixels {
+        // Absolute cell index (char/attr pair) scrolled by the start address;
+        // the CRTC byte pan (08h bits 6-5) adds a byte offset to the origin,
+        // so a pan of 2 shifts one whole cell and a pan of 1 lands on the
+        // attribute byte (the real-hardware half-cell scramble).
+        let base = (self.text_cell_base(p.start_cells, p.char_row, dc) + p.byte_pan)
+            % p.text_aperture_size;
+        let char_byte = self.text_byte(base);
+        let attr = self.text_byte(base + 1);
+        let blink_attr = attr & 0x80 != 0;
+        // 512-glyph mode: when the Sequencer selects two distinct font tables
+        // (map A != map B), attribute bit 3 becomes the per-cell font selector
+        // and is no longer foreground intensity, so the foreground is masked to
+        // 8 colors. See A4 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        let font_select = (attr >> 3) & 1 != 0;
+        let font_table = if p.dual_font && font_select {
+            p.table_b
+        } else {
+            p.table_a
+        };
+        let fg_index = if p.dual_font {
+            (attr & 0x07) as usize
+        } else {
+            (attr & 0x0F) as usize
+        };
+        let bg_index = if p.blink_enabled && blink_attr {
+            ((attr >> 4) & 0x07) as usize
+        } else {
+            ((attr >> 4) & 0x0F) as usize
+        };
+        let mut fg = if p.cga_text {
+            fg_index as u8
+        } else {
+            self.dac_index(self.attr_lookup(fg_index as u8))
+        };
+        let mut bg = if p.cga_text {
+            bg_index as u8
+        } else {
+            self.dac_index(self.attr_lookup(bg_index as u8))
+        };
+        let hide_fg = p.blink_enabled && blink_attr && p.blink_hide_phase;
+        // Hardware text cursor (CRTC 0A/0B): on the cursor cell, swap fg/bg
+        // on the active scanlines for reverse video. 0A bit 5 disables the
+        // cursor; bits 0-4 of 0A/0B bound the scanline range (start > end
+        // wraps). The cursor blinks on the same hide phase as attribute
+        // blink, but is not gated on the attribute-blink enable. The cursor
+        // location register (0E/0Fh) is a cell index, so its byte address is
+        // cursor_offset*2; it fires when the displayed cell's byte offset
+        // matches, scrolling with the start address. The Cursor Skew (0Bh
+        // bits 6-5) delays the onset by that many character clocks, so the
+        // effective cursor cell is cursor_offset + skew (FreeVGA crtcreg.htm
+        // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). See A5 in
+        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md. The skew,
+        // cursor byte, disable bit, and scanline range are decoded once per
+        // scanline in text_row_scan.
+        let cursor_here = base == p.cursor_byte;
+        let in_range = if p.start_line <= p.end_line {
+            p.font_line >= p.start_line && p.font_line <= p.end_line
+        } else {
+            p.font_line >= p.start_line || p.font_line <= p.end_line
+        };
+        if cursor_here && !p.cursor_disabled && in_range && !p.cursor_hidden {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        // VGA reads the active writable font table. CGA has a fixed 8x8 ROM
+        // character generator, not VGA plane-2 font RAM.
+        let glyph_row = if p.cga_text {
+            crate::font::VGAFONT_8X8[char_byte as usize * 8 + p.font_line.min(7)]
+        } else {
+            self.font[font_table][char_byte as usize * 32 + p.font_line.min(31)]
+        };
+        let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
+        TextCellPixels {
+            fg,
+            bg,
+            glyph_row,
+            hide_fg,
+            extend_ninth,
+        }
     }
 
     fn region_color(&self, scan_line: u32) -> u8 {
@@ -5203,6 +5355,125 @@ mod tests {
         vga.vram[0] = 0xC0;
         vga.attr.plane_enable = 0x3F;
         assert_eq!(vga.read_status1() & 0x30, 0x00);
+    }
+
+    #[test]
+    fn status_mux_single_pixel_sample_matches_the_full_row_render() {
+        // Differential oracle for the thinned video_status_mux_bits: the old
+        // implementation rendered the ENTIRE row (render_*_row, a Vec per
+        // read) and indexed the beam's pixel; the new one samples exactly one
+        // pel through the shared per-pixel/per-cell helpers. The row renderers
+        // are still production code (catch_up/render_scanline loop over them),
+        // so this oracle IS the old computation, recomputed verbatim, and the
+        // sweep asserts bit identity across the four raster modes, beams in
+        // every scanline region (active, horizontal blank, vertical blank,
+        // retrace), all four mux selects, split screen, pel pan, and
+        // non-trivial VRAM/text content.
+        fn oracle_mux_bits(vga: &Vga, beam: u64) -> u8 {
+            if vga.is_cga_personality() || !beam_display_enable(&vga.crtc, beam) {
+                return 0;
+            }
+            let line = beam_line(&vga.crtc, beam);
+            let dot = beam_dot(&vga.crtc, beam) as usize;
+            let color = match vga.mode {
+                VideoMode::Mode13h | VideoMode::ModeX => vga.render_256color_row(line)[dot],
+                VideoMode::Text => vga.render_text_row(line)[dot],
+                VideoMode::Planar => vga.render_active_row(line)[dot],
+                VideoMode::Cga => 0,
+            };
+            let pair = match (vga.attr.plane_enable >> 4) & 0x03 {
+                0x00 => (((color >> 2) & 1) << 1) | (color & 1),
+                0x01 => (color >> 4) & 0x03,
+                0x02 => (((color >> 3) & 1) << 1) | ((color >> 1) & 1),
+                _ => (color >> 6) & 0x03,
+            };
+            pair << 4
+        }
+
+        let mut fixtures: Vec<(&str, Vga)> = Vec::new();
+
+        // Text mode (the default), with varied char/attr content (blink and
+        // 512-glyph-relevant attribute bits included via the *7 stride) and a
+        // cursor parked mid-screen so the cursor-swap path is sampled.
+        let mut text = Vga::default();
+        for i in 0..(80 * 25) {
+            text.write_u8(i * 2, (i % 251) as u8).unwrap();
+            text.write_u8(i * 2 + 1, (i * 7 % 256) as u8).unwrap();
+        }
+        text.set_cursor_offset(80 * 12 + 33);
+        fixtures.push(("text", text));
+
+        // Chained mode 13h with a line-compare split mid-screen.
+        let mut m13 = Vga::default();
+        m13.set_mode13h();
+        m13.crtc.line_compare = 100;
+        fixtures.push(("mode13h+split", m13));
+
+        // Planar 16-color (mode 0Dh) with a nonzero fine pel pan.
+        let mut planar = Vga::default();
+        planar.set_mode_0dh();
+        planar.attr.pixel_pan = 2;
+        fixtures.push(("planar+pan", planar));
+
+        // Unchained mode X (chain-4 cleared from 13h).
+        let mut modex = Vga::default();
+        modex.set_mode13h();
+        modex.write_port(0x3C4, 0x04);
+        modex.write_port(0x3C5, 0x06);
+        assert_eq!(modex.active_mode(), VideoMode::ModeX);
+        fixtures.push(("modeX", modex));
+
+        for (name, mut vga) in fixtures {
+            // Non-trivial plane content for the graphics paths (the text path
+            // reads text_memory + font, filled above).
+            for (i, b) in vga.vram.iter_mut().enumerate() {
+                *b = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
+            }
+            let htotal = htotal_dots(&vga.crtc);
+            // Active lines swept at EVERY dot (a sparse dot grid provably lacks
+            // teeth: a px-derivation mutation in the text sampler survived one),
+            // spanning the top, both sides of the middle/split, and the last
+            // active line, so every per-cell pel position and both split
+            // regions are compared.
+            let full_lines = [
+                0,
+                1,
+                vga.crtc.vdisp_end / 2,
+                vga.crtc.vdisp_end / 2 + 1,
+                vga.crtc.vdisp_end - 1,
+            ];
+            // Out-of-display probes: the mux must read 0 through both paths.
+            let blank_probes = [
+                (vga.crtc.vdisp_end, 0),      // vertical blank
+                (vga.crtc.vretrace_start, 5), // retrace
+                (vga.crtc.vtotal - 1, 7),     // bottom of the frame
+                (0, vga.crtc.hdisp_end),      // horizontal blank
+                (1, htotal as u32 - 1),       // end of scanline
+            ];
+            for mux in [0x00u8, 0x10, 0x20, 0x30] {
+                vga.attr.plane_enable = 0x0F | mux;
+                for line in full_lines {
+                    for dot in 0..vga.crtc.hdisp_end {
+                        let beam = u64::from(line) * htotal + u64::from(dot);
+                        assert_eq!(
+                            vga.video_status_mux_bits(beam),
+                            oracle_mux_bits(&vga, beam),
+                            "{name}: single-pixel mux sample diverged from the \
+                             full row render at line {line} dot {dot} mux {mux:#04X}"
+                        );
+                    }
+                }
+                for (line, dot) in blank_probes {
+                    let beam = u64::from(line) * htotal + u64::from(dot);
+                    assert_eq!(
+                        vga.video_status_mux_bits(beam),
+                        oracle_mux_bits(&vga, beam),
+                        "{name}: blank/retrace probe diverged at line {line} \
+                         dot {dot} mux {mux:#04X}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
