@@ -2290,7 +2290,7 @@ impl Machine {
     #[cfg(test)]
     fn read_io_port_u8(&mut self, port: u16) -> u8 {
         let mut bus = self.make_bus();
-        bus.read_io(port, BusWidth::Byte).unwrap_or(0) as u8
+        bus.read_io(port, BusWidth::Byte, 0).unwrap_or(0) as u8
     }
 
     #[cfg(test)]
@@ -2311,7 +2311,7 @@ impl Machine {
     fn enable_8042_irq12(&mut self) {
         let mut bus = self.make_bus();
         bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
-        let ccb = bus.read_io(0x60, BusWidth::Byte).unwrap() as u8;
+        let ccb = bus.read_io(0x60, BusWidth::Byte, 0).unwrap() as u8;
         bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
         bus.write_io(0x60, BusWidth::Byte, u32::from(ccb | 0x01 | 0x02))
             .unwrap();
@@ -2385,6 +2385,7 @@ impl Machine {
             io_touched: &mut self.io_touched,
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
+            core_clocks_so_far: 0,
         }
     }
 
@@ -8020,12 +8021,26 @@ impl Machine {
         self.margo.advance_busy(whole_ns as u64);
         self.margo_ns -= whole_ns;
 
-        self.vga_dots += clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
-        let whole = self.vga_dots.floor();
-        self.video.advance(whole as u64);
-        self.vga_dots -= whole;
+        let (whole, remainder) = self.predict_dots(clocks, self.vga_dots);
+        self.video.advance(whole);
+        self.vga_dots = remainder;
 
         self.pump_pusher();
+    }
+
+    /// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
+    /// fractional-dot accumulator `dots_owed`. Pure: does not mutate `self`. The
+    /// SAME function both `advance_devices` (the real, mutating step above) and a
+    /// future lazy port-read peek (Slice 1) call, so the two paths cannot
+    /// structurally diverge: "no time travel" (a lazy read predicting state the
+    /// later real advance would contradict) becomes a property of sharing one
+    /// implementation, not an invariant maintained by hand across two call sites.
+    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3.
+    fn predict_dots(&self, clocks: u64, dots_owed: f64) -> (u64, f64) {
+        let raw =
+            dots_owed + clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
+        let whole = raw.floor();
+        (whole as u64, raw - whole)
     }
 
     /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
@@ -8728,6 +8743,7 @@ impl Machine {
                     io_touched,
                     device_wrote_memory,
                     direct_map_changed,
+                    core_clocks_so_far: 0,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -9034,6 +9050,14 @@ struct MachineBus<'a> {
     io_touched: &'a mut bool,
     device_wrote_memory: &'a mut bool,
     direct_map_changed: &'a mut bool,
+    // A copy of the current read_io call's core_clocks_so_far argument (CPU core
+    // clocks charged by prior instructions in this straight-line run, not
+    // including the in-flight IN). Written at the top of every read_io call so a
+    // future lazy-port arm can read it without its own plumbing. Not read by any
+    // arm yet; Slice 0 is pure seam-threading (dev_docs/2026-07-02-p4a-lazy-port-
+    // device-time-plan.md Task 0.2). Initialized to 0 at bus construction; the
+    // first read_io call overwrites it before any arm can observe it.
+    core_clocks_so_far: u64,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -9479,7 +9503,16 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
-    fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
+    fn read_io(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        core_clocks_so_far: u64,
+    ) -> Result<u32, BusError> {
+        // A copy, mirroring `active_mode`: available to any lazy-read arm without
+        // re-threading the parameter, per dev_docs/2026-07-02-p4a-lazy-port-device-
+        // time-plan.md Task 0.2. Not read by any arm yet (Slice 0 is pure plumbing).
+        self.core_clocks_so_far = core_clocks_so_far;
         *self.io_touched = true;
         self.trace.record(
             BusAccessKind::IoRead,
@@ -9501,7 +9534,11 @@ impl CpuBus for MachineBus<'_> {
             // index and its datum - which used to halt the VM with WidthMismatch.
             let mut value = 0u32;
             for i in 0..width.bytes() {
-                let byte = self.read_io(io_word_sub_port(port, i), BusWidth::Byte)?;
+                let byte = self.read_io(
+                    io_word_sub_port(port, i),
+                    BusWidth::Byte,
+                    core_clocks_so_far,
+                )?;
                 value |= (byte & 0xff) << (8 * i);
             }
             return Ok(value);
@@ -11724,6 +11761,45 @@ mod tests {
         machine
     }
 
+    #[test]
+    fn predict_vga_dots_matches_the_real_advance_devices_accumulator_step() {
+        // predict_dots must be textually identical arithmetic to the vga_dots
+        // block it was extracted from (Task 0.3), so its output, fed through the
+        // same Vga::advance + vga_dots-subtract sequence advance_devices already
+        // uses, reproduces the real post-advance_devices state exactly: not just
+        // numerically close, bit-for-bit (same operation order, same rounding).
+        let mut expected = test_machine();
+        let mut actual = test_machine();
+        let clocks = 12_345u64;
+        let vga_dots_before = actual.vga_dots;
+
+        // The real, mutating step (what advance_devices does today).
+        expected.advance_devices(clocks);
+
+        // The shared pure function, applied by hand the same way advance_devices
+        // applies it internally.
+        let (whole, remainder) = actual.predict_dots(clocks, vga_dots_before);
+        actual.video.advance(whole);
+        actual.vga_dots = remainder;
+
+        assert_eq!(
+            actual.video.beam_dots(),
+            expected.video.beam_dots(),
+            "predict_dots's whole-dots output must move the beam identically \
+             to advance_devices's real step"
+        );
+        assert_eq!(
+            actual.vga_dots, expected.vga_dots,
+            "predict_dots's fractional remainder must match the real accumulator"
+        );
+        assert_eq!(
+            actual.video.frames_completed(),
+            expected.video.frames_completed(),
+            "frame-boundary bookkeeping (finalize_frame/frames) must also agree \
+             when applied by hand through the same Vga::advance call"
+        );
+    }
+
     fn int15_machine(mem_mib: u16) -> Machine {
         Machine::new(
             MachineProfile::gsw_386(mem_mib, VideoCard::Et4000Ax),
@@ -11736,7 +11812,7 @@ mod tests {
         let mut bus = machine.make_bus();
         bus.write_io(0x3D4, BusWidth::Byte, u32::from(index))
             .unwrap();
-        bus.read_io(0x3D5, BusWidth::Byte).unwrap() as u8
+        bus.read_io(0x3D5, BusWidth::Byte, 0).unwrap() as u8
     }
 
     #[test]
@@ -11768,8 +11844,8 @@ mod tests {
         fn latched_count(m: &mut Machine) -> u16 {
             let mut bus = m.make_bus();
             bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
-            let lo = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
-            let hi = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            let lo = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
             lo | (hi << 8)
         }
         let before = latched_count(&mut m);
@@ -12566,7 +12642,7 @@ mod tests {
             let mut bus = m.make_bus();
             bus.write_io(0x0092, BusWidth::Byte, 0x00).unwrap();
             assert_eq!(
-                bus.read_io(0x0092, BusWidth::Byte).unwrap(),
+                bus.read_io(0x0092, BusWidth::Byte, 0).unwrap(),
                 0x00,
                 "port 0x92 A20 off"
             );
@@ -12584,7 +12660,7 @@ mod tests {
             let mut bus = m.make_bus();
             bus.write_io(0x0092, BusWidth::Byte, 0x02).unwrap();
             assert_eq!(
-                bus.read_io(0x0092, BusWidth::Byte).unwrap(),
+                bus.read_io(0x0092, BusWidth::Byte, 0).unwrap(),
                 0x02,
                 "port 0x92 A20 on"
             );
@@ -13234,9 +13310,9 @@ mod tests {
         let mut m = int15_machine(16);
         let mut bus = m.make_bus();
         bus.write_io(0x02ff, BusWidth::Byte, 0xa5).unwrap();
-        assert_eq!(bus.read_io(0x02ff, BusWidth::Byte).unwrap(), 0xa5);
+        assert_eq!(bus.read_io(0x02ff, BusWidth::Byte, 0).unwrap(), 0xa5);
         // COM1 stays separate: writing COM2 did not disturb COM1's scratch.
-        assert_eq!(bus.read_io(0x03ff, BusWidth::Byte).unwrap(), 0x00);
+        assert_eq!(bus.read_io(0x03ff, BusWidth::Byte, 0).unwrap(), 0x00);
     }
 
     #[test]
@@ -13245,9 +13321,9 @@ mod tests {
         let mut m = int15_machine(16);
         let mut bus = m.make_bus();
         bus.write_io(0x0278, BusWidth::Byte, 0x42).unwrap();
-        assert_eq!(bus.read_io(0x0278, BusWidth::Byte).unwrap(), 0x42);
+        assert_eq!(bus.read_io(0x0278, BusWidth::Byte, 0).unwrap(), 0x42);
         // The LPT2 status port reports the always-ready idle byte.
-        assert_eq!(bus.read_io(0x0279, BusWidth::Byte).unwrap(), 0xdf);
+        assert_eq!(bus.read_io(0x0279, BusWidth::Byte, 0).unwrap(), 0xdf);
     }
 
     #[test]
@@ -13316,8 +13392,8 @@ mod tests {
         assert_eq!(m.read_physical_u8(VGA_TEXT_BASE), b'R');
         {
             let mut bus = m.make_bus();
-            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte).unwrap(), 1);
-            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte).unwrap() & 0x02, 0);
+            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte, 0).unwrap(), 1);
+            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte, 0).unwrap() & 0x02, 0);
         }
 
         m.cpu.registers.set_eax(0x1200);
@@ -14249,7 +14325,7 @@ mod tests {
             bus.write_io(0xE4, BusWidth::Byte, 8).unwrap(); // index = REG_CRC
             let mut crc = [0u8; 4];
             for byte in &mut crc {
-                *byte = bus.read_io(0xE5, BusWidth::Byte).unwrap() as u8;
+                *byte = bus.read_io(0xE5, BusWidth::Byte, 0).unwrap() as u8;
             }
             u32::from_le_bytes(crc)
         });
@@ -16041,7 +16117,7 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             bus.write_io(0x1F2, BusWidth::Byte, 0x55).unwrap();
-            let v = bus.read_io(0x1F7, BusWidth::Byte).unwrap();
+            let v = bus.read_io(0x1F7, BusWidth::Byte, 0).unwrap();
             assert_eq!(v, 0xFF, "empty channel reads open bus");
         });
     }
@@ -16053,8 +16129,8 @@ mod tests {
         with_bus(&mut machine, |bus| {
             // IDENTIFY DEVICE on the command port, then drain word 0 of the block.
             bus.write_io(0x1F7, BusWidth::Byte, 0xEC).unwrap();
-            let lo = bus.read_io(0x1F0, BusWidth::Byte).unwrap();
-            let hi = bus.read_io(0x1F0, BusWidth::Byte).unwrap();
+            let lo = bus.read_io(0x1F0, BusWidth::Byte, 0).unwrap();
+            let hi = bus.read_io(0x1F0, BusWidth::Byte, 0).unwrap();
             let word0 = u16::from(lo as u8) | (u16::from(hi as u8) << 8);
             assert_eq!(word0, 0x0040, "fixed ATA device general config");
         });
@@ -16531,8 +16607,8 @@ mod tests {
         fn latched_count(m: &mut Machine) -> u16 {
             let mut bus = m.make_bus();
             bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
-            let lo = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
-            let hi = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            let lo = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
             lo | (hi << 8)
         }
         {
@@ -16720,7 +16796,7 @@ mod tests {
             bus.write_io(0x60, BusWidth::Byte, 0x03).unwrap(); // IRQ1 + IRQ12 enabled
             bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap(); // next byte to aux
             bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap(); // enable data reporting
-            assert_eq!(bus.read_io(0x60, BusWidth::Byte).unwrap(), 0xFA); // mouse ACK
+            assert_eq!(bus.read_io(0x60, BusWidth::Byte, 0).unwrap(), 0xFA); // mouse ACK
         }
         // The ACK read armed the keyboard controller's aux settle window (see
         // AUX_BYTE_SETTLE_US in keyboard.rs); advance past it -- comfortably
@@ -16758,7 +16834,7 @@ mod tests {
             let mut bus = machine.make_bus();
             // Read CCB (0x20) -> 0x60, OR in IRQ1 (bit0) + IRQ12 (bit1), write back.
             bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
-            let ccb = bus.read_io(0x60, BusWidth::Byte).unwrap() as u8;
+            let ccb = bus.read_io(0x60, BusWidth::Byte, 0).unwrap() as u8;
             let new_ccb = ccb | 0x01 | 0x02;
             bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
             bus.write_io(0x60, BusWidth::Byte, new_ccb as u32).unwrap();
@@ -16778,11 +16854,11 @@ mod tests {
             bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap();
             bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap();
             // Drain the AUX ACK (0xFA): it must arrive flagged as an AUX byte.
-            let status = bus.read_io(0x64, BusWidth::Byte).unwrap() as u8;
+            let status = bus.read_io(0x64, BusWidth::Byte, 0).unwrap() as u8;
             assert_eq!(status & 0x01, 0x01, "ACK waiting (OBF)");
             assert_eq!(status & 0x20, 0x20, "ACK is an AUX byte, not a key");
             assert_eq!(
-                bus.read_io(0x60, BusWidth::Byte).unwrap(),
+                bus.read_io(0x60, BusWidth::Byte, 0).unwrap(),
                 0xFA,
                 "mouse ACK"
             );
@@ -17064,7 +17140,7 @@ mod tests {
         // (0x224/0x225 are now the CT1745 mixer, 0x388 the OPL chip).
         let mut machine = test_machine();
         let value = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0226, BusWidth::Byte).unwrap()
+            bus.read_io(0x0226, BusWidth::Byte, 0).unwrap()
         });
 
         assert_eq!(value, 0xff);
@@ -17083,7 +17159,7 @@ mod tests {
         // index register, whose read returns the latched index (0 at reset).
         let mut machine = test_machine();
         let index_read = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0224, BusWidth::Byte).unwrap()
+            bus.read_io(0x0224, BusWidth::Byte, 0).unwrap()
         });
         assert_eq!(index_read, 0x00, "0x224 returns the latched mixer index");
         // Programming register 0x80 (IRQ7) round-trips through 0x225.
@@ -17093,7 +17169,7 @@ mod tests {
         });
         let routed = with_bus(&mut machine, |bus| {
             bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            bus.read_io(0x225, BusWidth::Byte).unwrap()
+            bus.read_io(0x225, BusWidth::Byte, 0).unwrap()
         });
         assert_eq!(routed, 0x04, "IRQ7 latched in mixer register 0x80");
     }
@@ -17127,11 +17203,11 @@ mod tests {
         // Advance emulated time past the ~100us DSP settle window.
         machine.advance_dsp_micros(200);
         let status = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22E, BusWidth::Byte).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22E, BusWidth::Byte, 0).unwrap()).unwrap()
         });
         assert_eq!(status & 0x80, 0x80, "data available after reset");
         let ack = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0).unwrap()).unwrap()
         });
         assert_eq!(ack, 0xAA);
     }
@@ -17143,10 +17219,10 @@ mod tests {
             bus.write_io(0x22C, BusWidth::Byte, 0xE1).unwrap(); // read version
         });
         let hi = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0).unwrap()).unwrap()
         });
         let lo = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0).unwrap()).unwrap()
         });
         assert_eq!([hi, lo], [4, 5]);
     }
@@ -17265,7 +17341,7 @@ mod tests {
             bus.write_io(0x225, BusWidth::Byte, 0x01).unwrap();
             // A guest reset restores the hardware IRQ5 default, not the host config.
             bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            let byte = bus.read_io(0x225, BusWidth::Byte).unwrap();
+            let byte = bus.read_io(0x225, BusWidth::Byte, 0).unwrap();
             assert_eq!(byte, 0x02);
         });
     }
@@ -17284,9 +17360,9 @@ mod tests {
         assert_eq!(machine.sb_selected_irq(), 7);
         let (irq_byte, dma_byte) = with_bus(&mut machine, |bus| {
             bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            let irq = u8::try_from(bus.read_io(0x225, BusWidth::Byte).unwrap()).unwrap();
+            let irq = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0).unwrap()).unwrap();
             bus.write_io(0x224, BusWidth::Byte, 0x81).unwrap();
-            let dma = u8::try_from(bus.read_io(0x225, BusWidth::Byte).unwrap()).unwrap();
+            let dma = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0).unwrap()).unwrap();
             (irq, dma)
         });
         assert_eq!(irq_byte, 0x04, "register 0x80 boots on IRQ7");
@@ -17699,11 +17775,11 @@ mod tests {
             }
 
             // Status bit0 (playing) reads back through the guest-visible port.
-            let status = bus.read_io(0x240, BusWidth::Byte).unwrap() as u8;
+            let status = bus.read_io(0x240, BusWidth::Byte, 0).unwrap() as u8;
             assert!(status & 0x01 != 0, "chip reports playing through its port");
 
             // Resource readback: high nibble IRQ (10), low nibble DMA (3).
-            let resources = bus.read_io(0x242, BusWidth::Byte).unwrap() as u8;
+            let resources = bus.read_io(0x242, BusWidth::Byte, 0).unwrap() as u8;
             assert_eq!(resources >> 4, 10, "IRQ readback");
             assert_eq!(resources & 0x0F, 3, "DMA readback");
         });
@@ -17794,7 +17870,7 @@ mod tests {
         // Guest ISR: PIC acknowledge, device ack (0x22E read), then EOI.
         with_bus(&mut machine, |bus| {
             assert_eq!(bus.acknowledge_interrupt(), Some(0x0D));
-            bus.read_io(0x22E, BusWidth::Byte).unwrap();
+            bus.read_io(0x22E, BusWidth::Byte, 0).unwrap();
             bus.write_io(0x20, BusWidth::Byte, 0x20).unwrap(); // OCW2 EOI
         });
         assert!(!machine.pic.irr_bit(5), "IRR clear after the acknowledge");
@@ -18269,7 +18345,7 @@ mod tests {
             // I12 revision) must not decode either.
             assert!(
                 matches!(
-                    bus.read_io(WSS_DATA, BusWidth::Byte),
+                    bus.read_io(WSS_DATA, BusWidth::Byte, 0),
                     Err(BusError::UnsupportedPort { port }) if port == WSS_DATA
                 ),
                 "disabled WSS data read does not decode"
@@ -18277,7 +18353,7 @@ mod tests {
             // The window edges (base+7) are likewise undecoded.
             assert!(
                 matches!(
-                    bus.read_io(0x537, BusWidth::Byte),
+                    bus.read_io(0x537, BusWidth::Byte, 0),
                     Err(BusError::UnsupportedPort { port }) if port == 0x537
                 ),
                 "disabled WSS upper window edge does not decode"
@@ -18290,7 +18366,7 @@ mod tests {
         with_bus(&mut enabled, |bus| {
             bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C).unwrap(); // select I12
             assert_eq!(
-                bus.read_io(WSS_DATA, BusWidth::Byte).unwrap(),
+                bus.read_io(WSS_DATA, BusWidth::Byte, 0).unwrap(),
                 0x0A,
                 "enabled WSS answers the I12 revision read"
             );
@@ -18513,24 +18589,24 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             assert_eq!(
-                bus.read_io(0x531, BusWidth::Byte).unwrap(),
+                bus.read_io(0x531, BusWidth::Byte, 0).unwrap(),
                 0x70,
                 "config region reads the IRQ7/DMA0 jumper byte"
             );
             assert!(
-                bus.read_io(0x537, BusWidth::Byte).is_ok(),
+                bus.read_io(0x537, BusWidth::Byte, 0).is_ok(),
                 "base+7 is the last decoded WSS port"
             );
             assert!(
                 matches!(
-                    bus.read_io(0x538, BusWidth::Byte),
+                    bus.read_io(0x538, BusWidth::Byte, 0),
                     Err(BusError::UnsupportedPort { port }) if port == 0x538
                 ),
                 "base+8 is past the 8-port window"
             );
             assert!(
                 matches!(
-                    bus.read_io(0x52F, BusWidth::Byte),
+                    bus.read_io(0x52F, BusWidth::Byte, 0),
                     Err(BusError::UnsupportedPort { port }) if port == 0x52F
                 ),
                 "base-1 is below the window"
@@ -18654,6 +18730,7 @@ mod tests {
             io_touched: &mut machine.io_touched,
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,
+            core_clocks_so_far: 0,
         };
         f(&mut bus)
     }
@@ -18968,7 +19045,7 @@ mod tests {
             bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap(); // select seconds
             bus.write_io(0x71, BusWidth::Byte, 42).unwrap();
             bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap();
-            let secs = bus.read_io(0x70 + 1, BusWidth::Byte).unwrap();
+            let secs = bus.read_io(0x70 + 1, BusWidth::Byte, 0).unwrap();
             assert_eq!(secs, 42);
         });
     }
@@ -19076,7 +19153,7 @@ mod tests {
         let clock_hz = machine.profile.clock_hz;
         machine.advance_devices_clocks(clock_hz / 100_000); // ~10 us
         let b = with_bus(&mut machine, |bus| {
-            bus.read_io(0x61, BusWidth::Byte).unwrap() as u8
+            bus.read_io(0x61, BusWidth::Byte, 0).unwrap() as u8
         });
         assert_eq!(
             (b >> 5) & 1,
@@ -19098,7 +19175,7 @@ mod tests {
         for _ in 0..40 {
             machine.advance_devices_clocks(per_pit_clock);
             let bit4 = with_bus(&mut machine, |bus| {
-                (bus.read_io(0x61, BusWidth::Byte).unwrap() as u8 >> 4) & 1
+                (bus.read_io(0x61, BusWidth::Byte, 0).unwrap() as u8 >> 4) & 1
             });
             if bit4 == 1 {
                 saw_high = true;
@@ -19508,8 +19585,8 @@ mod tests {
             // --- Drive the FDC.
             bus.write_io(0x3F2, BusWidth::Byte, 0x1C).unwrap(); // DOR: motor A, gate, out of reset, drive 0
             bus.write_io(0x3F5, BusWidth::Byte, 0x08).unwrap(); // SENSE INT (clear power-up irq)
-            while bus.read_io(0x3F4, BusWidth::Byte).unwrap() & 0x40 != 0 {
-                bus.read_io(0x3F5, BusWidth::Byte).unwrap();
+            while bus.read_io(0x3F4, BusWidth::Byte, 0).unwrap() & 0x40 != 0 {
+                bus.read_io(0x3F5, BusWidth::Byte, 0).unwrap();
             }
             // READ DATA: HDS+DS=0, C=2, H=0, R=3, N=2(512), EOT=3, GPL=0x1B, DTL=0xFF.
             for &b in &[0xE6u8, 0x00, 0x02, 0x00, 0x03, 0x02, 0x03, 0x1B, 0xFF] {
@@ -19542,8 +19619,8 @@ mod tests {
         // The result phase is seven status bytes ending at sector 3.
         let result = with_bus(&mut machine, |bus| {
             let mut out = Vec::new();
-            while bus.read_io(0x3F4, BusWidth::Byte).unwrap() & 0x40 != 0 {
-                out.push(bus.read_io(0x3F5, BusWidth::Byte).unwrap() as u8);
+            while bus.read_io(0x3F4, BusWidth::Byte, 0).unwrap() & 0x40 != 0 {
+                out.push(bus.read_io(0x3F5, BusWidth::Byte, 0).unwrap() as u8);
             }
             out
         });
@@ -19568,7 +19645,7 @@ mod tests {
                 bus.write_io(port, BusWidth::Byte, value).unwrap();
             }
             // The data port reads back the mask, not the passive 0xff stub.
-            bus.read_io(0x21, BusWidth::Byte).unwrap()
+            bus.read_io(0x21, BusWidth::Byte, 0).unwrap()
         });
         assert_eq!(mask, 0xab);
     }
@@ -20139,7 +20216,7 @@ mod tests {
         machine.advance_devices(machine.profile().clock_hz / 10_000);
 
         let status = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0388, BusWidth::Byte).unwrap()
+            bus.read_io(0x0388, BusWidth::Byte, 0).unwrap()
         });
         assert_eq!(
             status & 0xe0,
@@ -20795,8 +20872,8 @@ mod tests {
         assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'R');
         {
             let mut bus = machine.make_bus();
-            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte).unwrap(), 1);
-            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte).unwrap() & 0x02, 0);
+            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte, 0).unwrap(), 1);
+            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte, 0).unwrap() & 0x02, 0);
         }
         let misc = machine.video_mut().read_port(0x3CC).unwrap();
         assert!(machine.video_mut().write_port(0x3C2, misc | 0x02));
@@ -20905,8 +20982,8 @@ mod tests {
             let mut bus = machine.make_bus();
             bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
             bus.write_io(0x3D9, BusWidth::Byte, 0x35).unwrap();
-            assert_eq!(bus.read_io(0x3D8, BusWidth::Byte).unwrap(), 0xFF);
-            assert_eq!(bus.read_io(0x3D9, BusWidth::Byte).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D8, BusWidth::Byte, 0).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D9, BusWidth::Byte, 0).unwrap(), 0xFF);
         }
 
         assert_eq!(machine.video().active_mode(), VideoMode::Cga);
@@ -20921,17 +20998,17 @@ mod tests {
             bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
             bus.write_io(0x3D0, BusWidth::Byte, 0x01).unwrap();
             bus.write_io(0x3D1, BusWidth::Byte, 0x20).unwrap();
-            assert_eq!(bus.read_io(0x3D2, BusWidth::Byte).unwrap(), 0xFF);
-            assert_eq!(bus.read_io(0x3D3, BusWidth::Byte).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D2, BusWidth::Byte, 0).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D3, BusWidth::Byte, 0).unwrap(), 0xFF);
 
             bus.write_io(0x3D6, BusWidth::Byte, 0x0A).unwrap();
             bus.write_io(0x3D7, BusWidth::Byte, 0x06).unwrap();
-            assert_eq!(bus.read_io(0x3D4, BusWidth::Byte).unwrap(), 0xFF);
-            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D4, BusWidth::Byte, 0).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte, 0).unwrap(), 0xFF);
 
             bus.write_io(0x3D4, BusWidth::Byte, 0x0E).unwrap();
             bus.write_io(0x3D5, BusWidth::Byte, 0x12).unwrap();
-            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte).unwrap(), 0x12);
+            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte, 0).unwrap(), 0x12);
         }
 
         assert_eq!(machine.video().active_mode(), VideoMode::Cga);
@@ -21887,7 +21964,7 @@ mod tests {
             bus.write_io(0x3B5, BusWidth::Byte, 0x12).unwrap();
             bus.write_io(0x3B4, BusWidth::Byte, 0x0D).unwrap();
             bus.write_io(0x3B5, BusWidth::Byte, 0x34).unwrap();
-            assert!(bus.read_io(0x3BA, BusWidth::Byte).is_ok());
+            assert!(bus.read_io(0x3BA, BusWidth::Byte, 0).is_ok());
         }
         assert_eq!(machine.video().pending_start_address(), Some(0x1234));
     }
@@ -23526,11 +23603,11 @@ mod tests {
         .unwrap();
         assert_eq!(machine.active_mode(), GswMode::Gsw386); // boot mode
         let id = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e0, BusWidth::Byte).unwrap() as u8
+            bus.read_io(0x00e0, BusWidth::Byte, 0).unwrap() as u8
         });
         assert_eq!(id, LOTURA_ID_VALUE);
         let code = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e1, BusWidth::Byte).unwrap() as u8
+            bus.read_io(0x00e1, BusWidth::Byte, 0).unwrap() as u8
         });
         assert_eq!(code, 0);
         // An out-of-range write records no pending switch.
@@ -23543,7 +23620,7 @@ mod tests {
         machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
         let code = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e1, BusWidth::Byte).unwrap() as u8
+            bus.read_io(0x00e1, BusWidth::Byte, 0).unwrap() as u8
         });
         assert_eq!(code, 2);
     }
@@ -23839,12 +23916,12 @@ mod tests {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         let fast = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e2, BusWidth::Byte).unwrap() as u8
+            bus.read_io(0x00e2, BusWidth::Byte, 0).unwrap() as u8
         });
         assert_eq!(fast, 1, "fast POST is the default");
         machine.set_fast_post(false);
         let full = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e2, BusWidth::Byte).unwrap() as u8
+            bus.read_io(0x00e2, BusWidth::Byte, 0).unwrap() as u8
         });
         assert_eq!(full, 0, "clearing the flag selects the full-pacing path");
     }

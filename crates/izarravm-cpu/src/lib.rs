@@ -992,6 +992,18 @@ pub struct Cpu386 {
     pub ldtr: SegmentRegister,
     pub tr: SegmentRegister,
     pub elapsed_clocks: u64,
+    // Core clocks charged by prior instructions in the CURRENT run_straight_line
+    // run, not including the in-flight instruction. Mirrors run_straight_line's
+    // local `total` at the point just before that instruction executes, so a port
+    // read reached from inside `execute_decoded` can read it directly without a
+    // new parameter threaded through every intermediate call (fetch_decoded,
+    // execute_decoded, execute_port_io_decoded, ...). Set once per instruction at
+    // the top of run_straight_line's loop body / cycle_no_interrupt_check; read by
+    // CpuBus::read_io call sites. Zero-initialized by the struct's derive(Default);
+    // a hand-written Default impl must keep it 0 (cycle_no_interrupt_check's
+    // reset-to-0 assumes a fresh CPU starts there). See dev_docs/
+    // 2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.2.
+    core_clocks_so_far: u64,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
     timing_rem: u64,
@@ -2458,6 +2470,13 @@ impl Cpu386 {
         bus: &mut B,
     ) -> Result<CycleOutcome, CpuError> {
         self.interrupt_shadow = false;
+        // This is always either a standalone single-step (no prior instructions in
+        // "this run") or run_straight_line's FIRST instruction (total == 0 at that
+        // point, by construction): both cases mean core_clocks_so_far is 0 here.
+        // Continuations inside run_straight_line go through run_one_cached instead,
+        // which does not reset this field; run_straight_line sets it explicitly
+        // before each continuation call.
+        self.core_clocks_so_far = 0;
 
         self.begin_instruction();
         let start_eip = self.registers.eip;
@@ -2581,6 +2600,11 @@ impl Cpu386 {
                         break;
                     }
                 };
+                // A continuation skips cycle_no_interrupt_check (which resets this
+                // field to 0 for a fresh first instruction), so set it explicitly:
+                // total is exactly the prior instructions' charge in this run, not
+                // including the continuation about to execute.
+                self.core_clocks_so_far = total;
                 self.run_one_cached(bus, &insn, lin)?
             };
             total += u64::from(outcome.core_clocks);
@@ -5447,7 +5471,7 @@ impl Cpu386 {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                let value = bus.read_io(port, BusWidth::Byte)? as u8;
+                let value = bus.read_io(port, BusWidth::Byte, self.core_clocks_so_far)? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
             }
@@ -5455,7 +5479,7 @@ impl Cpu386 {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, operand_size.bus_width())?;
-                let value = bus.read_io(port, operand_size.bus_width())?;
+                let value = bus.read_io(port, operand_size.bus_width(), self.core_clocks_so_far)?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
             }
@@ -5481,7 +5505,7 @@ impl Cpu386 {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                let value = bus.read_io(port, BusWidth::Byte)? as u8;
+                let value = bus.read_io(port, BusWidth::Byte, self.core_clocks_so_far)? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
             }
@@ -5489,7 +5513,7 @@ impl Cpu386 {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, operand_size.bus_width())?;
-                let value = bus.read_io(port, operand_size.bus_width())?;
+                let value = bus.read_io(port, operand_size.bus_width(), self.core_clocks_so_far)?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
             }
@@ -7699,7 +7723,7 @@ impl Cpu386 {
             }
             StringOp::Ins => {
                 // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
-                let value = bus.read_io(self.read_gpr16(2), width)?;
+                let value = bus.read_io(self.read_gpr16(2), width, self.core_clocks_so_far)?;
                 self.write_string_dst(bus, address_size, width, value)?;
                 self.adjust_index_register(7, address_size, bytes);
             }
@@ -11663,6 +11687,10 @@ mod tests {
         // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
         // reports the same step-break edge the real bus does.
         io_touched: bool,
+        // Records the `core_clocks_so_far` value the CPU threaded into the most recent
+        // `read_io` call, so tests can assert on it directly (see
+        // `core_clocks_so_far_reflects_prior_instructions_not_the_in_flight_one`).
+        last_read_io_core_clocks_so_far: Option<u64>,
     }
 
     impl TestBus {
@@ -11672,6 +11700,7 @@ mod tests {
                 trace: BusTrace::default(),
                 pending_irq: None,
                 io_touched: false,
+                last_read_io_core_clocks_so_far: None,
             }
         }
     }
@@ -11847,8 +11876,14 @@ mod tests {
             Ok(())
         }
 
-        fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
+        fn read_io(
+            &mut self,
+            port: u16,
+            width: BusWidth,
+            core_clocks_so_far: u64,
+        ) -> Result<u32, BusError> {
             self.io_touched = true;
+            self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoRead,
                 u32::from(port),
@@ -11900,6 +11935,93 @@ mod tests {
         assert_eq!(cpu.registers.cs().base, 0xffff_0000);
         assert_eq!(cpu.registers.eip, 0xfff0);
         assert_eq!(cpu.linear_eip(), 0xffff_fff0);
+    }
+
+    #[test]
+    fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction() {
+        // `DecodeGroup::PortIo` is not in `block_continuable`'s admitted set (see
+        // that function's comment: "INS/OUTS are Misc and stay terminators", true
+        // of plain IN/OUT too, by the same reasoning: every port access sets
+        // `io_touched` today, ending the run right after it runs, so PortIo has
+        // never needed to be a continuation). That means an IN/OUT can ONLY ever
+        // be `run_straight_line`'s FIRST instruction, never a continuation, in
+        // TODAY's architecture: this test pins that as the reason
+        // core_clocks_so_far is unconditionally 0 for every read_io call reachable
+        // right now, confirming Task 0.2's threading is a true no-op until Slice 1
+        // additionally makes PortIo continuable for the lazy-port case (a second
+        // seam change beyond the io_touched narrowing the plan already names;
+        // flagged here for Slice 1, out of Task 0.2's scope).
+        let code = [0xec]; // in al,dx
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        let mut bus = TestBus::with_memory(memory);
+
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+        assert_eq!(
+            bus.last_read_io_core_clocks_so_far,
+            Some(0),
+            "an IN that is the run's first (and, today, only possible) \
+             instruction position sees core_clocks_so_far == 0"
+        );
+        assert!(
+            outcome.core_clocks > 0,
+            "the IN itself still charges clocks"
+        );
+    }
+
+    #[test]
+    fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation() {
+        // Directly pins the mechanism Task 0.2 adds (a Cpu386 field set to
+        // run_straight_line's running `total` before every continuation dispatch,
+        // read by read_io) using a continuable instruction group (INC, DataMove/
+        // Alu-adjacent -- specifically Group) as the observation point, since
+        // PortIo itself cannot reach the continuation path (see the sibling test).
+        // Two INCs then a third INC: after the run, core_clocks_so_far must equal
+        // whatever `total` was immediately before the LAST instruction executed
+        // (i.e. the first two INCs' combined charge), proving the field tracks
+        // the running total across continuations, not just "always 0" by
+        // accident of PortIo's continuability gate.
+        let code = [0x40, 0x40, 0x40]; // inc ax; inc ax; inc ax
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I286);
+        let mut bus = TestBus::with_memory(memory);
+        // Warm the decode cache one instruction at a time (INC is continuable, so
+        // once warm all three chain in a single run_straight_line call).
+        for _ in 0..3 {
+            let _ = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        }
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.reset_perf_counters();
+
+        // Independently capture "the first two INCs' combined charge" by cloning
+        // the CPU right here (so its warmed-up `timing_rem` fractional-clock
+        // carry, accumulated over the 3 warm-up runs, matches exactly) and
+        // driving the clone through two `cycle()` single-steps.
+        let two_incs_total = {
+            let mut solo = cpu.clone();
+            let mut solo_bus = TestBus::with_memory(vec![0x40, 0x40]);
+            let a = solo.cycle(&mut solo_bus).unwrap().core_clocks;
+            let b = solo.cycle(&mut solo_bus).unwrap().core_clocks;
+            a + b
+        };
+
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+        assert_eq!(
+            cpu.perf_counters().straight_line_runs,
+            1,
+            "one chained run: three INCs, no port access to break it early"
+        );
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 3, "all three INCs retired");
+        // core_clocks_so_far was set to `total` right before the run's LAST
+        // continuation (the third INC) dispatched, so it must equal exactly the
+        // first two INCs' combined charge, independently measured above.
+        assert_eq!(cpu.core_clocks_so_far, u64::from(two_incs_total));
+        assert!(
+            u64::from(outcome.core_clocks) > u64::from(two_incs_total),
+            "the third INC's own charge must be included in the run total"
+        );
     }
 
     #[test]

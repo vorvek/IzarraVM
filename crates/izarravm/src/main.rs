@@ -421,6 +421,164 @@ const BENCHES: &[Bench] = &[
 /// units constant; the physical 586/486 ratio lives in fp_timing(I586).
 const WHETSTONE_FLOPS_PER_SWEEP: f64 = 26000.0;
 
+/// Permanent poll-loop microbench fixture (P4a Task 0.4). Reproduces the three
+/// diagnosis patterns behind the P4a lazy-port-device-time initiative (see
+/// dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md): a tight 0x3DA
+/// vsync-wait poll (the named worst case, ~131 ns/access at 586 on the
+/// original diagnosis), a VRAM write loop (memory-bound, no port I/O, isolates
+/// the poll's cost from a plain hot loop), and a register-only loop (the
+/// compute-only floor, no memory or port access at all). Each payload is a
+/// small hand-assembled real-mode code array injected directly as the boot ROM
+/// (mirrors `paced_wall_topup_lets_a_polling_guest_catch_vretrace_windows`'s
+/// `rom_with_code` pattern), run for a fixed guest-clock budget via
+/// `Machine::new` + `run_until_halt_or_cycles` -- NOT `Machine::new_raw_program`
+/// (the DOS-loader path) and NOT a new `neurketa` selector (that payload is a
+/// NASM-built, pre-baked binary blob; adding a selector there would need an
+/// assembly-toolchain rebuild step this fixture should not depend on). None of
+/// the three payloads ever halts or exits, so there is no iteration count to
+/// self-report the way the unit-tester-backed `BENCHES` table's payloads do;
+/// this fixture reports guest_ms/wall_ms/rt_factor only, the same shape the
+/// original diagnosis numbers used (58M batches/guest-s, ~131 ns/access).
+struct Microbench {
+    name: &'static str,
+    code: &'static [u8],
+}
+
+// Small enough that the slowest pattern (poll-3da, which pays a full batch
+// epilogue per iteration pre-Slice-1) still finishes in a couple of seconds at
+// 486/586, large enough for a stable rt_factor (thousands of guest batches
+// even in the worst case).
+const MICROBENCH_BUDGET: u64 = 20_000_000;
+
+const MICROBENCHES: &[Microbench] = &[
+    Microbench {
+        name: "poll-3da",
+        // mov dx, 0x3DA
+        // wait: in al, dx
+        //       test al, 0x08
+        //       jz wait          (spin while the vretrace bit is clear)
+        //       jmp wait         (re-poll once seen set, an unconditional spin)
+        // The worst case named in the plan: 58M batches/guest-s at the original
+        // diagnosis baseline.
+        code: &[
+            0xBA, 0xDA, 0x03, // mov dx, 0x03DA
+            0xEC, // wait: in al, dx
+            0xA8, 0x08, // test al, 0x08
+            0x74, 0xFB, // jz wait
+            0xEB, 0xF9, // jmp wait
+        ],
+    },
+    Microbench {
+        name: "vram-write",
+        // mov ax, 0x0013 ; int 0x10          (mode 13h: 0xA0000 is the LFB)
+        // mov ax, 0xA000 ; mov es, ax
+        // xor di, di
+        // write: mov [es:di], al ; inc di ; jmp write
+        // No port I/O at all: an isolated memory-bound hot loop, the
+        // counterpart the plan's decision 4 step 7 checks stays UNCHANGED by
+        // any later port-laziness slice (it never touches a lazy port).
+        code: &[
+            0xB8, 0x13, 0x00, // mov ax, 0x0013
+            0xCD, 0x10, // int 0x10
+            0xB8, 0x00, 0xA0, // mov ax, 0xA000
+            0x8E, 0xC0, // mov es, ax
+            0x31, 0xFF, // xor di, di
+            0x26, 0x88, 0x05, // write: mov [es:di], al
+            0x47, // inc di
+            0xEB, 0xFA, // jmp write
+        ],
+    },
+    Microbench {
+        name: "register-only",
+        // xor ax, ax ; loop: inc ax ; jmp loop. Pure ALU + branch, the
+        // compute-only floor: no memory or port access whatsoever.
+        code: &[
+            0x31, 0xC0, // xor ax, ax
+            0x40, // loop: inc ax
+            0xEB, 0xFD, // jmp loop
+        ],
+    },
+];
+
+/// Wrap `code` as a bare boot ROM: the payload at offset 0 (physical 0xF0000,
+/// where CS:IP F000:0000 lands after reset), an IRET stub at 0xF000 (some
+/// BIOS-intercepted service vectors return through it), and a far jump at the
+/// reset vector (0xFFF0) into the payload. Mirrors
+/// `paced_wall_topup_lets_a_polling_guest_catch_vretrace_windows`'s
+/// `rom_with_code` test helper (izarravm-machine/src/lib.rs).
+fn microbench_rom(code: &[u8]) -> Vec<u8> {
+    let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
+    rom[..code.len()].copy_from_slice(code);
+    rom[0xF000] = 0xCF; // IRET
+    rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]); // jmp F000:0000
+    rom
+}
+
+/// Run the poll-loop microbench fixture (Task 0.4): all three patterns, in
+/// every GSW mode, for a fixed clock budget each (none of the payloads halts
+/// or exits, so there is nothing to run "to completion"). Prints rt_factor per
+/// mode per pattern in the same columns `run_bench` uses for its guest_ms/
+/// wall_ms/rt_factor fields. Every row carries an ` [info]` marker (the
+/// ` [approx]` suffix precedent): these rows never gate the process exit,
+/// even when read without the section header in view. Banding runs through
+/// `band_tag`, which no-ops for a payload name with no reference band, so no
+/// microbench row can ever fail the run -- same policy as the
+/// Approximate-class rows in the main table, per Phase 3 of
+/// dev_docs/2026-07-01-cpu-timing-classes-plan.md. A row whose run ended on
+/// anything other than the clock budget is tagged ` [early-stop: <reason>]`,
+/// since its rt_factor measured a truncated run.
+fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    println!();
+    println!("=== poll-loop microbench (informational; P4a Task 0.4) ===");
+    println!(
+        "{:<14} {:<5} {:>10} {:>9} {:>10}",
+        "pattern", "mode", "guest_ms", "wall_ms", "rt_factor"
+    );
+    let modes = [
+        GswMode::Gsw286,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ];
+    for bench in MICROBENCHES {
+        for mode in modes {
+            let profile = MachineProfile::from_hardware_profile(hardware);
+            let mut machine = Machine::new(profile, microbench_rom(bench.code))?;
+            machine.set_mode(mode);
+            let started = std::time::Instant::now();
+            let stop = machine.run_until_halt_or_cycles(MICROBENCH_BUDGET)?;
+            let wall = started.elapsed();
+            let guest_secs = machine.elapsed_clocks() as f64 / mode.clock_hz() as f64;
+            let wall_secs = wall.as_secs_f64();
+            let rt = if wall_secs > 0.0 {
+                guest_secs / wall_secs
+            } else {
+                0.0
+            };
+            // The payloads never halt or exit by design, so the only clean stop
+            // is the clock budget running out. Anything else (an early HLT, a
+            // fault, a stray DOS/test exit) means the row measured a truncated
+            // run and its rt_factor is skewed: mark it visibly so a permanent
+            // fixture can never silently report corrupted numbers.
+            let early_stop = match stop {
+                StopReason::CycleLimit { .. } => String::new(),
+                other => format!(" [early-stop: {other:?}]"),
+            };
+            println!(
+                "{:<14} {:<5} {:>10.3} {:>9.3} {:>10.3} [info]{}{}",
+                bench.name,
+                mode.canonical_name(),
+                guest_secs * 1000.0,
+                wall_secs * 1000.0,
+                rt,
+                band_tag(bench.name, mode, rt),
+                early_stop,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Rank the modes from slowest to fastest so a benchmark's min_mode gates which
 /// modes it runs in.
 fn mode_rank(mode: GswMode) -> u8 {
@@ -538,6 +696,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             );
         }
     }
+    run_microbench(hardware)?;
     // Host-side perf summary (RPCS3 idea #1): decode-cache hit rate, average
     // straight-line run length, and why each run ended. Diagnostics only; lines are
     // prefixed "perf" so they never parse as a bench row. The counters are host-side
