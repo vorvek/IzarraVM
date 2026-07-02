@@ -298,7 +298,7 @@ enum Command {
     /// Positive is scroll-up, negative is scroll-down. Capture only.
     MouseWheel(i32),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
-    /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
+    /// rewrite a dirty image to on eject.
     MountFloppy {
         bytes: Vec<u8>,
         flush_path: Option<PathBuf>,
@@ -811,9 +811,9 @@ impl Emulator {
     }
 }
 
-/// Eject the A: floppy, writing a dirty image back to its source IMG. A folder
-/// mount (no flush path) or a clean image is ejected without touching the host.
-/// Clears the flush path so a later eject does not rewrite a stale file.
+/// Eject the A: floppy, writing a dirty image back to its source IMG. A clean
+/// image is ejected without touching the host. Clears the flush path so a
+/// later eject does not rewrite a stale file.
 fn flush_floppy(machine: &mut Machine, flush_path: &mut Option<PathBuf>) {
     let dirty = machine.floppy_dirty();
     let Some(bytes) = machine.eject_floppy() else {
@@ -902,9 +902,8 @@ fn emulate(
     let mut last_frame_gen: Option<u64> = None;
 
     let cmos_path = rtc_setup.cmos_path.clone();
-    // The source IMG path of the mounted floppy, when it is a writable image
-    // mount. A dirty image is flushed here on eject and on shutdown. Folder mounts
-    // are read-only and leave this None.
+    // The source IMG path of the mounted floppy. A dirty image is flushed here
+    // on eject and on shutdown.
     let mut floppy_flush_path: Option<PathBuf> = None;
     loop {
         loop {
@@ -1118,29 +1117,17 @@ fn emulate(
     }
 }
 
-/// What is in drive A:, remembered so a Reset can remount the same media. Image
-/// mounts replay from the source IMG (a reset flushes dirty guest writes back to
-/// it first, so the re-read keeps them); folder mounts rebuild from the folder.
-enum FloppySource {
-    Image(PathBuf),
-    Folder(PathBuf),
-}
+/// What is in drive A:, remembered so a Reset can remount the same media. A
+/// reset flushes dirty guest writes back to the source IMG first, so the
+/// re-read keeps them.
+struct FloppySource(PathBuf);
 
-/// Pick the floppy mount to restore from saved prefs, if its source still exists.
-/// A recorded image wins over a folder when both are present; a path that has
-/// since been deleted or moved is skipped (the drive starts empty).
+/// Pick the floppy mount to restore from saved prefs, if its source still
+/// exists. A path that has since been deleted or moved is skipped (the drive
+/// starts empty).
 fn restore_floppy_source(prefs: &GuiPrefs) -> Option<FloppySource> {
-    if let Some(path) = &prefs.last_floppy_image {
-        if path.is_file() {
-            return Some(FloppySource::Image(path.clone()));
-        }
-    }
-    if let Some(dir) = &prefs.last_floppy_folder {
-        if dir.is_dir() {
-            return Some(FloppySource::Folder(dir.clone()));
-        }
-    }
-    None
+    let path = prefs.last_floppy_image.as_ref()?;
+    path.is_file().then(|| FloppySource(path.clone()))
 }
 
 pub struct GuiApp {
@@ -1302,8 +1289,7 @@ impl GuiApp {
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
         let gain = SharedGain::new(volume_gain(volume));
-        // Restore the last mount if the source still exists on disk. An image
-        // takes priority over a folder when both are recorded.
+        // Restore the last floppy mount if the source still exists on disk.
         let floppy_source = restore_floppy_source(&prefs);
         let panel_open = prefs.panel_open;
         let mut app = Self {
@@ -1353,17 +1339,18 @@ impl GuiApp {
             logo: None,
         };
         app.start();
-        // Mount a config-provided CD image once the emulation thread is up.
+        // Mount a CD once the emulation thread is up. An explicit config-file
+        // cd_image wins; otherwise fall back to the remembered prefs mount if
+        // that file still exists on disk (silently skipped if missing, like the
+        // floppy restore).
+        let cd_image = cd_image.or_else(|| {
+            app.prefs
+                .last_cd_image
+                .clone()
+                .filter(|path| path.is_file())
+        });
         if let Some(path) = cd_image {
-            match load_cd_image_from_path(&path) {
-                Ok(image) => {
-                    if let Some(emu) = &app.emu {
-                        emu.mount_cd(image);
-                    }
-                    app.cd_label = path.file_name().map(|n| n.to_string_lossy().into_owned());
-                }
-                Err(err) => error!(%err, path = %path.display(), "failed to mount config CD image"),
-            }
+            app.mount_cd_from_path(&path);
         }
         app
     }
@@ -2215,12 +2202,6 @@ impl GuiApp {
                 {
                     self.load_floppy_img();
                 }
-                if ui
-                    .add_enabled(running, egui::Button::new("Load folder"))
-                    .clicked()
-                {
-                    self.load_floppy_folder();
-                }
             });
         });
 
@@ -2266,7 +2247,7 @@ impl GuiApp {
                     self.load_cd_image();
                 }
                 // Folder-to-ISO is not built yet; the button is present but
-                // disabled so the two bays match. Wire it when the backend lands.
+                // disabled. Wire it when the backend lands.
                 ui.add_enabled(false, egui::Button::new("Load folder"))
                     .on_disabled_hover_text("Folder mounting is not available for the CD yet");
             });
@@ -2285,8 +2266,8 @@ impl GuiApp {
             if ui.button("Open C: folder").clicked() {
                 open_in_file_manager(&self.c_drive);
             }
-            // ponytail: blank line holds the box at its prior height now that the
-            // path label is gone.
+            // Blank line holds the box at its prior height now that the path
+            // label is gone.
             ui.label(egui::RichText::new(" ").size(11.0));
         });
     }
@@ -2299,16 +2280,17 @@ impl GuiApp {
         self.floppy_label = None;
         self.floppy_source = None;
         self.prefs.last_floppy_image = None;
-        self.prefs.last_floppy_folder = None;
         self.save_prefs();
     }
 
-    /// Eject the CD.
+    /// Eject the CD and forget the mount so it is not restored next launch.
     fn eject_cd_action(&mut self) {
         if let Some(emu) = &self.emu {
             emu.eject_cd();
         }
         self.cd_label = None;
+        self.prefs.last_cd_image = None;
+        self.save_prefs();
     }
 
     /// Pick a floppy IMG and mount it live. The image is writable in memory and
@@ -2320,73 +2302,33 @@ impl GuiApp {
         else {
             return;
         };
-        self.mount_floppy_source(FloppySource::Image(path));
+        self.mount_floppy_source(FloppySource(path));
     }
 
-    /// Pick a host folder, synthesize a FAT12 image from it, and mount it live.
-    /// Folder mounts are read-only, so there is no flush path back to the host.
-    fn load_floppy_folder(&mut self) {
-        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
-        self.mount_floppy_source(FloppySource::Folder(dir));
-    }
-
-    /// Read or build the image for `source`, mount it into the live emulation
-    /// thread, and remember it so a Reset can remount the same media. Errors are
-    /// logged and leave the drive unchanged. Used by both the Load buttons and
-    /// the remount on Reset.
+    /// Read the image for `source`, mount it into the live emulation thread,
+    /// and remember it so a Reset can remount the same media. Errors are
+    /// logged and leave the drive unchanged. Used by both the Load IMG button
+    /// and the remount on Reset.
     fn mount_floppy_source(&mut self, source: FloppySource) {
-        let (bytes, flush_path, label) = match &source {
-            FloppySource::Image(path) => {
-                let bytes = match std::fs::read(path) {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        error!(%err, path = %path.display(), "failed to read floppy image");
-                        return;
-                    }
-                };
-                let label = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                (bytes, Some(path.clone()), label)
-            }
-            FloppySource::Folder(dir) => {
-                let bytes = match izarravm_machine::build_fat12(dir) {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        error!(%err, dir = %dir.display(), "failed to build a FAT12 image from the folder");
-                        return;
-                    }
-                };
-                let label = format!(
-                    "{} (folder)",
-                    dir.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| dir.display().to_string())
-                );
-                (bytes, None, label)
+        let FloppySource(path) = &source;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%err, path = %path.display(), "failed to read floppy image");
+                return;
             }
         };
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
         let Some(emu) = &self.emu else {
             return;
         };
-        emu.mount_floppy(bytes, flush_path);
+        emu.mount_floppy(bytes, Some(path.clone()));
         self.floppy_label = Some(label);
-        // Remember the mount in prefs so it is restored next launch. An image and
-        // a folder are mutually exclusive in drive A:, so recording one clears the
-        // other.
-        match &source {
-            FloppySource::Image(path) => {
-                self.prefs.last_floppy_image = Some(path.clone());
-                self.prefs.last_floppy_folder = None;
-            }
-            FloppySource::Folder(dir) => {
-                self.prefs.last_floppy_folder = Some(dir.clone());
-                self.prefs.last_floppy_image = None;
-            }
-        }
+        // Remember the mount in prefs so it is restored next launch.
+        self.prefs.last_floppy_image = Some(path.clone());
         self.save_prefs();
         self.floppy_source = Some(source);
     }
@@ -2401,7 +2343,15 @@ impl GuiApp {
         else {
             return;
         };
-        let image = match load_cd_image_from_path(&path) {
+        self.mount_cd_from_path(&path);
+    }
+
+    /// Read or build the CD image at `path`, mount it into the live emulation
+    /// thread, and remember it in prefs so it is restored next launch. Errors
+    /// are logged and leave the drive unchanged. Used by the Load ISO button,
+    /// the config-file `cd_image` mount, and the prefs restore on startup.
+    fn mount_cd_from_path(&mut self, path: &Path) {
+        let image = match load_cd_image_from_path(path) {
             Ok(image) => image,
             Err(err) => {
                 error!(%err, path = %path.display(), "failed to load CD image");
@@ -2417,6 +2367,8 @@ impl GuiApp {
             .unwrap_or_else(|| path.display().to_string());
         emu.mount_cd(image);
         self.cd_label = Some(label);
+        self.prefs.last_cd_image = Some(path.to_path_buf());
+        self.save_prefs();
     }
 }
 

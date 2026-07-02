@@ -115,7 +115,7 @@ fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize
         // metadata (not symlink_metadata): we already skip symlinks below.
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_symlink() {
-            continue; // ponytail: no symlink following in M1 (loop-safe)
+            continue; // No symlink following in M1 (loop-safe)
         }
         let path = e.path();
         if ft.is_dir() {
@@ -586,8 +586,6 @@ pub(crate) struct KateaTreeVolume {
     runs: Vec<(u32, u32, Role)>,
     /// Sparse write overlay: guest writes land here, reads consult it first. Held
     /// until eject (no eviction in M2). RAM is bounded by bytes written this session.
-    // ponytail: overlay-until-eject; the upgrade is per-file host-redirect eviction
-    // (M2.5) if multi-GB in-session writes ever matter.
     overlay: HashMap<u32, [u8; SECTOR]>,
     /// Directory first-cluster -> its host-filesystem path. Seeded from the tree;
     /// extended on guest MKDIR. Reconcile materializes a file in this directory to

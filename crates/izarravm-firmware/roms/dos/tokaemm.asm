@@ -106,8 +106,7 @@ EMS_HANDLES   equ 32
 ; handle slot: +0 inuse(b) +1 saved(b) +2 npages(w) +4 first(w) +6 pad(w)
 ;              +8 saved_map(4w). Backing runs are CONTIGUOUS per handle
 ; (logical page L -> backing page first+L); contiguity is invisible to apps.
-; ponytail: a fragmented pool can 88h an alloc that per-page bookkeeping would
-; satisfy; switch to per-page lists if a real consumer hits it.
+; Limit: a fragmented pool can 88h an alloc that per-page bookkeeping would satisfy.
 EMS_SLOT      equ 16
 ems_on:      db 0                 ; 1 = RAM argument seen and pages provisioned
 ems_pages:   dw 0                 ; total 16 KB pages (<= EMS_MAX_PAGES)
@@ -478,8 +477,8 @@ a20_off:
     ret
 
 ; 08h query free extended memory: AX=largest free KB, DX=total free KB, BL=0.
-; ponytail: largest is approximated as total (a first-fit pool rarely fragments,
-; and over-reporting only turns a would-be-large alloc into an A0h failure).
+; Largest is approximated as total (a first-fit pool rarely fragments, and
+; over-reporting only turns a would-be-large alloc into an A0h failure).
 xf_query_free:
     push cx
     push si
@@ -639,7 +638,7 @@ xf_info:
     jmp xms_fail
 
 ; 0Fh resize EMB: BX=new KB, DX=handle. Free + re-place; restore on failure.
-; ponytail: re-places without copying the old contents to the new base — data is
+; Re-places without copying the old contents to the new base — data is
 ; preserved only when find_gap returns the same base (no fragmentation). This
 ; mirrors the retired FlatEmbAllocator::resize (the M1 goal was HLE parity); a
 ; copy-on-relocate (via the INT 0xC0 memcpy) is a future-milestone fidelity item.
@@ -1001,7 +1000,7 @@ umb_free_run:
 
 ; Largest free run in paras. Approximated as the run from the highest block top to
 ; the window end (exact for first-fit-from-base without middle frees, which is how
-; DOS=UMB uses it). ponytail: an exact largest-gap needs a sorted walk.
+; DOS=UMB uses it). An exact largest-gap needs a sorted walk.
 ; out: AX = largest free paras. clobbers cx, dx, si.
 umb_largest:
     push cx

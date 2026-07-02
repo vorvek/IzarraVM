@@ -123,6 +123,19 @@ bios_start:
     call result_init           ; lay the empty VDTS header
     sti
     call run_post              ; walk the POST step table, append each record
+    ; Apply the saved CPU speed (CMOS 0x12) to the live Lotura register so a
+    ; Save from the setup panel or boot menu survives a reboot. This lands
+    ; after the probes on purpose: a mode write gates the CPU level down, and
+    ; the probes (CPUID) must run at the full power-on ISA. The host seeds the
+    ; byte from the boot profile, so a fresh CMOS is a same-mode write; values
+    ; above 3 (corrupt NVRAM) leave the current mode untouched.
+    mov al, SU_NVRAM_GSW
+    out 0x70, al
+    in al, 0x71
+    cmp al, 3
+    ja .gsw_keep
+    out PORT_LOTURA_MODE, al
+.gsw_keep:
     call setup_maybe_enter     ; STREAM D setup-page hook (foundation stub: ret)
     ; Load the boot code-page font (CMOS 0x13) into the VGA character generator.
     ; This runs after POST so the BDA character height (0040:0085) is settled and

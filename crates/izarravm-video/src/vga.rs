@@ -984,8 +984,7 @@ impl Vga {
     pub fn dot_clock_hz(&self) -> u64 {
         match (self.misc_output >> 2) & 0x03 {
             0x01 => VGA_DOT_CLOCK_28_HZ,
-            // ponytail: external/reserved VGA clocks fall back to the stock 25 MHz
-            // clock until VEGA exposes a programmable clock generator.
+            // External/reserved VGA clocks fall back to the stock 25 MHz clock.
             _ => VGA_DOT_CLOCK_25_HZ,
         }
     }
