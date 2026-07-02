@@ -6383,11 +6383,17 @@ impl Cpu386 {
     /// level. Code fetched from the BIOS ROM is exempt (see `cs_in_firmware_rom`), so the gate only
     /// ever holds guest code that selected a lower GSW mode.
     ///
+    /// Ring-0 protected-mode code (`is_ring0_protected()`) is exempt too, for the same reason as
+    /// the `read_prefixes` 66h/67h gate below: TOKAEMM's monitor is chipset-side, not guest
+    /// software, and it is 32-bit-default code that uses MOVZX/MOVSX/BSF/etc freely. V86 tasks are
+    /// always CPL 3 architecturally, so this can never leak into guest-facing V86 code, and it
+    /// reads false in real mode (not protected). Guest-facing 286 fidelity is unchanged.
+    ///
     /// `decode` applies this once, right after reading the second 0F byte — the same logical point
     /// (and eip) the fused path faulted at — so both the converted split path and the un-converted
     /// fused fallback share a single gate.
     fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<()> {
-        if self.cs_in_firmware_rom() {
+        if self.cs_in_firmware_rom() || self.is_ring0_protected() {
             return Ok(());
         }
         if (self.level.is_pre_386() && is_386plus_two_byte(second))
@@ -6653,7 +6659,28 @@ impl Cpu386 {
                 // raises #UD for them, which faithfully blocks every 32-bit
                 // operation reached through a prefix. Code fetched from the BIOS ROM
                 // is exempt (see cs_in_firmware_rom), so firmware is never blocked.
-                0x66 | 0x67 if self.level.is_pre_386() && !self.cs_in_firmware_rom() => {
+                //
+                // Ring-0 protected-mode code (`is_ring0_protected()`: PE set, CPL 0,
+                // not V86) is exempt too, parallel to the firmware exemption. That
+                // state is TOKAEMM's own monitor -- chipset-side code that runs
+                // underneath the guest, not guest software -- so it is never subject
+                // to the guest-facing ISA level the player selected. The level gate
+                // exists to make the emulated machine LOOK like a 286 to the guest;
+                // it must bind guest-facing execution only. V86 tasks are
+                // architecturally always CPL 3, so `is_ring0_protected()` (which
+                // requires !is_v86_mode()) can never accidentally exempt them: V86
+                // guest code stays gated exactly as before. Real mode is likewise
+                // unaffected (`is_protected_mode()` is false there, so
+                // `is_ring0_protected()` is false too). Without this, a 286-mode
+                // session with TOKAEMM resident dies the instant the monitor's
+                // 32-bit-default entry code (e.g. `vec13_entry`'s `66 B8 .. / mov
+                // ds, ax`) runs, and the resulting #UD cascades into a worse fault
+                // because TOKAEMM's IDT does not populate the low exception vectors.
+                0x66 | 0x67
+                    if self.level.is_pre_386()
+                        && !self.cs_in_firmware_rom()
+                        && !self.is_ring0_protected() =>
+                {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,

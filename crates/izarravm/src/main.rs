@@ -3209,6 +3209,169 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// The minimal, CPU-side-only companion to the full-boot sibling above:
+    /// pins the izarravm-cpu ring-0 ISA-gate exemption in isolation, with no
+    /// GSWMODE.COM EXEC and no XMS/EMS traffic involved, so a regression in
+    /// the CPU gate is distinguishable from a regression in TOKAEMM's
+    /// guest-facing 286-clean code (each has its own test).
+    ///
+    /// FORMERLY A KNOWN LIMITATION (see the CPU-side fix): TOKAEMM's monitor
+    /// code is 32-bit-default (`vec13_entry` opens with `pushad` then
+    /// `66 B8 10 00 / mov ds, ax` -- the `66` operand-size prefix is required
+    /// just to load a 16-bit segment register from 32-bit-default code). The
+    /// I286-level guest ISA gate in `crates/izarravm-cpu/src/lib.rs`
+    /// (`read_prefixes`, `check_two_byte_isa_gate`) used to reject
+    /// `0x66`/`0x67` and 386+ 0F opcodes with #UD (vector 6) for ANY
+    /// non-firmware-ROM fetch, including the monitor's own ring-0
+    /// protected-mode code -- which then faulted a second time because
+    /// TOKAEMM's IDT only populates gates for vector 8 upward (IRQ0..IRQ15),
+    /// so vector 6 read a zeroed/garbage gate and GP-faulted loading a null
+    /// code selector.
+    ///
+    /// FIXED: the gate now also exempts ring-0 protected-mode fetches
+    /// (`is_ring0_protected()`: PE set, CPL 0, not V86) -- the monitor is
+    /// chipset-side code, not guest software, so the guest-facing 286 ISA
+    /// boundary should never apply to it. V86 and real-mode code stay gated
+    /// exactly as before; the exemption ASSUMES ring-0 PM is only ever the
+    /// chipset-side monitor (see the gate comments in izarravm-cpu for the
+    /// full assumption + the VCPI/DPMI revisit trigger). Proven directly
+    /// below by driving the monitor entry point (a reflected IRQ) at the
+    /// I286 level with no DOS session involved.
+    ///
+    /// (A second, separate gap this test deliberately avoided -- TOKAEMM's
+    /// guest-facing V86 XMS/EMS code used 386-only instructions, so a full
+    /// 286 DOS session died in `ems_int67` on the first EXEC's EMS probe --
+    /// was RESOLVED by PR #388, which made the whole V86-facing section
+    /// assemble under `cpu 286`. The full-boot sibling above now covers that
+    /// path end to end.)
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_gswmode_286_monitor_entry_survives_at_i286() {
+        // Minimal, EMS/XMS-free repro of the ring-0 monitor path the CPU fix
+        // covers: boot normally (TOKAEMM resident, default speed, so
+        // init/SYSINIT run at full ISA and the monitor is live), THEN drop
+        // straight to I286 with `Machine::set_mode` (bypassing GSWMODE.COM's
+        // EXEC and all XMS/EMS traffic), and inject a keystroke.
+        // A keypress raises IRQ1, which the monitor's `reflect_vector` machinery
+        // (entered via `vec13_entry`, the same ring-0 entry point the fault used
+        // to hit) must service and reflect into the V86 guest's INT 09h -- all
+        // while the CPU is throttled to the I286 ISA. Before the fix this GP
+        // faulted with "loading selector 0x0000" at CS=0x0008 (vec13_entry
+        // itself); after the fix the reflect completes and the guest is still
+        // alive and still in V86.
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_gsw286mon_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during the default V86 boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let boot_text = machine.screen_text().as_text();
+        assert!(
+            boot_text.to_ascii_lowercase().contains("c:\\>"),
+            "no C:\\> prompt on the default boot (stop={stop:?}).\n{boot_text}"
+        );
+        // The cycle budget can expire while the CPU is transiently inside the
+        // ring-0 monitor (a reflected IRQ), where in_v86() reads false on a
+        // healthy boot (same re-sampling pattern as the M4 default-boot test).
+        let mut in_v86 = machine.in_v86();
+        for _ in 0..4 {
+            if in_v86 {
+                break;
+            }
+            machine
+                .run_until_halt_or_cycles(1_000_000)
+                .expect("machine re-sample run");
+            in_v86 = machine.in_v86();
+        }
+        assert!(
+            in_v86,
+            "the default boot must leave the guest running in V86.\n{boot_text}"
+        );
+
+        // Drop to true 286 ISA (no Lotura port write, no GSWMODE.COM EXEC --
+        // isolates the CPU gate from the still-open TOKAEMM EMS/XMS gap).
+        // `set_mode` drives `cpu.set_level` internally (see
+        // `set_mode_drives_cpu_level_and_cache_table` in izarravm-machine).
+        machine.set_mode(GswMode::Gsw286);
+        assert_eq!(machine.active_mode(), GswMode::Gsw286);
+
+        // A keypress raises IRQ1, routing through the monitor's reflect path.
+        machine.inject_key_scancodes(&[0x1e, 0x9e]); // 'a' make + break
+        let mut stop = machine
+            .run_until_halt_or_cycles(20_000_000)
+            .expect("machine run after the I286 switch");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault reflecting a keyboard IRQ through TOKAEMM's ring-0 \
+                 monitor at the I286 level: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("C:\\>a"),
+            "the reflected keystroke never reached the guest prompt \
+             (stop={stop:?}).\n{text}"
+        );
+        // Same transient re-sample as above: in_v86() can read false while the
+        // CPU is inside the monitor servicing the tail of the reflected IRQ.
+        let mut in_v86 = machine.in_v86();
+        for _ in 0..4 {
+            if in_v86 || matches!(stop, StopReason::CpuError(_)) {
+                break;
+            }
+            stop = machine
+                .run_until_halt_or_cycles(1_000_000)
+                .expect("machine re-sample run after the I286 switch");
+            in_v86 = machine.in_v86();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        if let StopReason::CpuError(msg) = &stop {
+            panic!(
+                "CPU fault reflecting a keyboard IRQ through TOKAEMM's ring-0 \
+                 monitor at the I286 level: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
+        assert!(
+            in_v86,
+            "the guest must still be running in V86 after the I286 switch \
+             and a reflected IRQ (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// UDPROBE.COM: a 62-byte guest fixture that installs its own INT 06h
     /// handler and then executes a 386-only opcode (`movzx ax, bl`). At the
     /// 286 ISA level the opcode raises #UD; a faithful V86 monitor reflects
