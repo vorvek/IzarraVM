@@ -211,6 +211,13 @@ impl SbDsp {
             0xD0 => self.playing = false,   // halt DMA (position kept)
             0xD4 => self.playing = true,    // continue DMA
             0xDA => self.auto_init = false, // exit auto-init: stop at next TC
+            0xF2 => {
+                // Request the 8-bit interrupt immediately (the documented DSP
+                // IRQ-probe command drivers use to verify the IRQ wiring). Same
+                // pending state a DMA block boundary raises; acknowledged by
+                // reading port 0x22E.
+                self.irq_pending = true;
+            }
             _ => {}
         }
     }
@@ -748,6 +755,15 @@ mod tests {
         write_cmd(&mut dsp, &[0x91]); // SB Pro high-speed 8-bit single
         assert!(dsp.is_playing());
         assert!(!dsp.is_auto_init(), "high-speed 0x91 is single-cycle");
+    }
+
+    #[test]
+    fn command_f2_raises_the_8bit_irq_immediately() {
+        let mut dsp = SbDsp::default();
+        assert!(!dsp.take_irq(), "no IRQ pending before the command");
+        dsp.write_command_byte(0xF2);
+        assert!(dsp.take_irq(), "F2 requests the 8-bit interrupt");
+        assert!(!dsp.take_irq(), "take_irq clears the pending state");
     }
 
     #[test]

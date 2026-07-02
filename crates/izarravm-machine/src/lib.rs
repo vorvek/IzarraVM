@@ -1472,8 +1472,8 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
 const USER_OWNED_OR_DEMO: &[&str] = &["HELLO.TXT", "CONFIG.SYS", "AUTOEXEC.BAT"];
 
 /// The payload files overlaid in user-folder mode: the binaries (KERNEL.SYS,
-/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM) but not the demo file or the user's
-/// CONFIG.SYS/AUTOEXEC.BAT.
+/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM, TOKAEMM.SYS) but not the demo file
+/// or the user's CONFIG.SYS/AUTOEXEC.BAT.
 fn user_folder_overlay(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
     files
         .into_iter()
@@ -2508,6 +2508,13 @@ impl Machine {
     /// display back to VGA text before booting an OS.
     pub fn margo_active(&self) -> bool {
         self.margo_active
+    }
+
+    /// Whether the guest is executing in virtual-8086 mode (under the TOKAEMM
+    /// ring-0 monitor). Exposed so the SP-4b M4 default-boot e2e can assert the
+    /// default CONFIG.SYS really put the system in V86.
+    pub fn in_v86(&self) -> bool {
+        self.cpu.is_v86_mode()
     }
 
     fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
@@ -7825,6 +7832,16 @@ impl Machine {
                     self.pic.request(irq_line);
                 }
             }
+        }
+        // Forward a pending DSP interrupt with playback idle too: the 0xF2
+        // IRQ-request command raises it without a transfer running (drivers
+        // probe their IRQ wiring that way) — the real chip asserts the line
+        // regardless. take_irq is a test-and-clear latch, so this never
+        // double-delivers an edge the per-tick forward above already took.
+        if self.dsp.take_irq() {
+            let is_16bit = self.dsp.is_16bit();
+            self.mixer.set_irq_status(is_16bit);
+            self.pic.request(irq_line);
         }
 
         // AD1848 / Windows Sound System playback, clock-driven exactly like the

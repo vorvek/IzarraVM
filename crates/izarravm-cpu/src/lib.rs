@@ -2322,8 +2322,10 @@ impl Cpu386 {
     }
 
     /// Virtual-8086 mode: the VM flag set while in protected mode. A V86 task runs
-    /// 8086 code with real-mode segment addressing but always at CPL 3.
-    fn is_v86_mode(&self) -> bool {
+    /// 8086 code with real-mode segment addressing but always at CPL 3. Public for
+    /// the machine's `in_v86()` (the SP-4b M4 default-boot e2e asserts the guest
+    /// runs virtualized) — the visibility-only counterpart of `is_ring0_protected`.
+    pub fn is_v86_mode(&self) -> bool {
         self.is_protected_mode() && self.registers.eflags & FLAG_VM != 0
     }
 

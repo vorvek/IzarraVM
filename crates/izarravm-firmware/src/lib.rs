@@ -26,6 +26,10 @@ pub const EMSTEST_COM: &[u8] = include_bytes!("../roms/dos/emstest.com");
 pub const EMSTEST_COM_SOURCE: &str = include_str!("../roms/dos/emstest.asm");
 pub const EMSNONE_COM: &[u8] = include_bytes!("../roms/dos/emsnone.com");
 pub const EMSNONE_COM_SOURCE: &str = include_str!("../roms/dos/emsnone.asm");
+pub const MOUSETST_COM: &[u8] = include_bytes!("../roms/dos/mousetst.com");
+pub const MOUSETST_COM_SOURCE: &str = include_str!("../roms/dos/mousetst.asm");
+pub const SNDTST_COM: &[u8] = include_bytes!("../roms/dos/sndtst.com");
+pub const SNDTST_COM_SOURCE: &str = include_str!("../roms/dos/sndtst.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
@@ -166,6 +170,21 @@ pub fn umbtest_com() -> &'static [u8] {
 /// frame. Signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
 pub fn emstest_com() -> &'static [u8] {
     EMSTEST_COM
+}
+
+/// The SP-4b M4 mouse-under-V86 fixture: after LH TOKAMOUS, polls the INT 33h
+/// wheel counter for a host-injected detent — proving slave IRQ12 -> vector
+/// 0x74 -> INT 74h reflection under the monitor. Signals 0xA5 / 0xEn.
+pub fn mousetst_com() -> &'static [u8] {
+    MOUSETST_COM
+}
+
+/// The SP-4b M4 SB16-IRQ5-under-V86 fixture: hooks INT 0Dh, resets the DSP,
+/// and requests immediate 8-bit IRQs (DSP 0xF2) inside a CLI/STI-dense loop —
+/// IRQ5 deliveries interleave with #GPs on the shared vector 13, exercising
+/// the monitor's discriminator. Signals 0xA5 / 0xEn.
+pub fn sndtst_com() -> &'static [u8] {
+    SNDTST_COM
 }
 
 /// The SP-4b M2 default-off contract fixture (bare DEVICE=C:\TOKAEMM.SYS): the
