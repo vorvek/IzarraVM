@@ -3234,6 +3234,88 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// Audit items 3+10 external tool batch (toka-dos/freedos/VENDOR.md): smoke
+    /// tests three of the newly-vendored tools in one boot -- ATTRIB (set +
+    /// query the read-only flag), CHOICE (piped default answer), and FIND
+    /// (string match against a text file) -- each producing assertable screen
+    /// output. The rest of the batch (MORE, LABEL, DELTREE) are covered by "the
+    /// image builds and boots" (the default-boot e2e test above stays green).
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_tool_batch_attrib_choice_find_smoke() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_toolbatch_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // A two-line text file so FIND's match is unambiguous against the
+        // non-matching line right next to it.
+        let hello_txt = b"Hello from Toka-DOS\r\nWelcome to the IZARRA 3000\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\n\
+ATTRIB +R HELLO.TXT\r\n\
+ATTRIB HELLO.TXT\r\n\
+ECHO Y | CHOICE /C:YN Continue\r\n\
+FIND \"IZARRA\" HELLO.TXT\r\n"
+            .to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    ("HELLO.TXT".to_string(), hello_txt),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(400_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault while running the tool batch under V86: {msg}\n{text}");
+        }
+
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the tool batch ran (stop={stop:?}).\n{text}"
+        );
+
+        // ATTRIB: the second invocation (plain query, no +/-) must show the R
+        // flag the first invocation just set. Attribute column order is
+        // D,H,S,R,A (attr2str in ATTRIB.C), so a read-only, non-hidden,
+        // non-system, archived file prints "[---RA]".
+        let upper = text.to_ascii_uppercase();
+        assert!(
+            upper.contains("[---RA]"),
+            "ATTRIB HELLO.TXT didn't show the R flag set by ATTRIB +R \
+             (stop={stop:?}).\n{text}"
+        );
+
+        // CHOICE: piped "Y" must be accepted (not left hanging on a prompt);
+        // the prompt text itself must have appeared on screen.
+        assert!(
+            upper.contains("CONTINUE"),
+            "CHOICE prompt text didn't appear on screen (stop={stop:?}).\n{text}"
+        );
+
+        // FIND: must print the matching line, not the non-matching one.
+        assert!(
+            upper.contains("IZARRA 3000"),
+            "FIND didn't print the matching line (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// SP-4b M4: the PS/2 mouse works under the default V86 boot — a host-injected
     /// wheel detent travels 8042 -> slave IRQ12 -> vector 0x74 -> the monitor's
     /// slave reflect stub -> guest INT 74h -> TOKAMOUS (loaded HIGH) -> INT 33h

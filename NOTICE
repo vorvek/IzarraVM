@@ -8,4 +8,13 @@ FreeDOS SORT: © 1995 Jim Lynch, updated 2003-2004 Eric Auer, GPLv2-or-later.
 FreeDOS MEM: © 1997 Express Software / Joseph Cosentino, © 2001 Bart Oldeman,
 updated through 2006 by Eric Auer and others, GPLv2-or-later. Modified by the
 Toka-DOS project (2026): /P also implies /FULL (program size+segment listing).
+FreeDOS ATTRIB: © 1998 Phil Brutsche, maintained by Brian E. Reifsnyder,
+GPLv2-or-later. Modified by the Toka-DOS project (2026): two small Open
+Watcom portability fixes (explicit cast, portable stpcpy), no behavior change.
+FreeDOS CHOICE: © 1994-2003 Jim Hall, GPLv2-or-later.
+FreeDOS MORE: © 1994-2002 Jim Hall, GPLv2-or-later.
+FreeDOS FIND: © 1994-2002 Jim Hall, © 2003 Eric Auer, GPLv2-or-later.
+Modified by the Toka-DOS project (2026): product-name banner rebrand.
+FreeDOS LABEL: © Joe Cosentino, Brian E. Reifsnyder, Eric Auer, GPLv2-or-later.
+FreeDOS DELTREE: © 1998-2003 Charles Dye, GPLv2-or-later.
 kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: © 1995 Pasquale J. Villani, GPLv2+.
