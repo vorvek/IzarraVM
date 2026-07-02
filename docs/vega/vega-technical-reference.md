@@ -434,4 +434,86 @@ same memory. That coupling is approximated, not modeled exactly.
 
 ## 10. Distira (3D)
 
-Reserved. Documented in a later revision.
+Distira is the second half of VEGA: a fixed-function 3D rasterizer sharing the
+frame store and RAMDAC with Margo. Where Margo speaks a chipset-specific
+register interface, Distira speaks a compatible dialect of a real one: it
+targets the same PCI, MMIO, framebuffer, and register contract as the 3dfx
+Voodoo Graphics generation (the SST-1 chipset), so period Glide-based
+software can find and drive it the way it drives real Voodoo hardware. This
+is a compatibility target, not a licensed design; it is built from public
+documentation and behavioral study of that generation of hardware, in the
+same clean-room spirit as the rest of the Izarra 3000.
+
+### 10.1 The board: BigDistira and SmallDistira
+
+A Distira card carries two identical rendering chips, wired together the way
+a Voodoo Graphics board wires its 3D chip and texelFX units. Izarra's lab
+notes name them **BigDistira** and **SmallDistira**. These are the two chips
+on the board, not two products; a Distira card is always both of them working
+together, presented to software as one device with two texture mapping
+units (TMUs). There is no host-selectable "which Distira" choice, in the same
+way a Voodoo Graphics board is not sold as its 3D chip and its TMU chip
+separately.
+
+### 10.2 Identification and memory
+
+| Item | Value |
+|------|-------|
+| PCI vendor ID | `0x121A` |
+| PCI device ID | `0x0001` |
+| BAR0 size | 16 MB (MMIO and LFB windows within it) |
+| MMIO window | 64 KB, register-mapped |
+| Framebuffer | 2 MB, dedicated (not shared with Margo's 4 MB frame store) |
+| Texture memory | 2 MB per TMU |
+| TMU count | 2 |
+| Native ID register | `0x44540100` ("DT", version 1.00) |
+
+Unlike Margo, Distira does not share Margo's 4 MB frame store; it has its own
+framebuffer and its own per-TMU texture memory, reached through its own PCI
+base address register rather than a fixed physical range. A driver finds it
+by PCI configuration scan (ports `0x0CF8`/`0x0CFC`), reads the vendor and
+device IDs above to confirm it, and programs BAR0 to place the board's MMIO
+and framebuffer windows in the address space it wants, exactly as it would
+for real Voodoo Graphics hardware.
+
+### 10.3 Register interface
+
+Distira answers the real SST-1 register set at the offsets Voodoo Graphics
+software expects: status, the vertex and gradient registers (integer and
+floating point), `triangleCMD`/`fTriangleCMD`, the pixel pipeline controls
+(`fbzColorPath`, `fogMode`, `alphaMode`, `fbzMode`, `lfbMode`), clipping,
+`fastfillCMD`, `swapbufferCMD`, the `fbiInit0`-`fbiInit7` initialization
+registers, the DAC data port, and the per-TMU texture mode, LOD, base
+address, and NCC table registers. This is the same register contract real
+Glide 2.x drivers and DOS Glide software program directly; Distira does not
+invent a new API for it to speak.
+
+Alongside the SST-1-compatible block, a small native front door at MMIO
+offset `0xF000` carries an `ID`, `CAPS`, `STATUS`, `CONTROL`, `MODEL`, and a
+handful of framebuffer-geometry and clear/command registers, in the same
+spirit as Margo's `ID`/`CAPS` pair: a place for Izarra-aware software to
+confirm the chip and its capabilities without walking the full SST-1 map.
+
+The pixel pipeline supports the common linear frame buffer pixel formats
+(RGB565, RGB555, ARGB1555, RGB888, ARGB8888) and combined depth/color LFB
+writes, and the rasterizer performs real triangle setup and edge functions,
+barycentric-interpolated color and texture coordinates, depth test, alpha
+test and blend, chroma key, fog, per-TMU texture sampling across the LIM
+formats DOS Glide 2.x software uses, and dithering.
+
+### 10.4 Software status
+
+The device side is implemented in depth: the register, PCI, MMIO, LFB, and
+FIFO contracts are in place, and the rasterizer draws real triangles with
+depth, alpha, fog, chroma key, and textures. A hardware proof program
+(built from the same register sequence real Glide 2.x uses, but written
+directly against the SST-1 registers rather than through the Glide library)
+exercises the device end to end as a regression check.
+
+What does not exist yet is a guest driver: no DOS Glide 2.x driver ships or
+has been written for Distira. A game that expects to load `GLIDE2X.OVL` and
+call into it has nothing to load. Driver work is in the planning stage,
+scoped against the real DOS Glide 2.x source to make sure the eventual
+driver's initialization sequence and register use match what Distira already
+answers. Until that lands, Distira is a card the hardware can see and probe,
+not yet one a Glide game can render through.
