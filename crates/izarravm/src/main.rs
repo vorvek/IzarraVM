@@ -2919,7 +2919,6 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
                 .expect("machine re-sample run");
             in_v86 = machine.in_v86();
         }
-        std::fs::remove_dir_all(&dir).ok();
         assert!(
             lower.contains("c:\\>"),
             "no C:\\> prompt on the default boot (stop={stop:?}).\n{text}"
@@ -2931,6 +2930,29 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         assert!(
             in_v86,
             "the default boot must leave the guest running in V86 (stop={stop:?}).\n{text}"
+        );
+
+        // Presentation leak guard (audit item 9): run `ver /w` at the live prompt,
+        // which used to print FreeDOS/Tim-Norman/sourceforge.net copyright text
+        // straight from FreeCOM's DEFAULT.lng. The whole in-universe boot+shell
+        // transcript (banner through the VER output) must stay leak-free.
+        for ch in "ver /w\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            let _ = machine.run_until_halt_or_cycles(20_000_000);
+        }
+        let _ = machine.run_until_halt_or_cycles(60_000_000);
+        let ver_text = machine.screen_text().as_text();
+        let ver_lower = ver_text.to_ascii_lowercase();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !ver_lower.contains("freedos"),
+            "boot/VER transcript leaks \"FreeDOS\" branding.\n{ver_text}"
+        );
+        assert!(
+            !ver_lower.contains("sourceforge"),
+            "boot/VER transcript leaks a sourceforge.net URL.\n{ver_text}"
         );
     }
 
