@@ -40,6 +40,14 @@ pub enum ConfigError {
         "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. WSS IRQ7 vs SB16 IRQ5)"
     )]
     WssSbIrqCollision(u8),
+    #[error(
+        "audio.yamaha_adpcm.base {0:#06x} places the 4-port ADPCM window [{0:#06x}, {1:#06x}) over a fixed chipset/device port range; use the default base (0x240) or another free window"
+    )]
+    InvalidAdpcmBase(u16, u16),
+    #[error(
+        "audio.yamaha_adpcm.base {0:#06x} places the 4-port ADPCM window [{0:#06x}, {1:#06x}) over the audio.wss.base window [{2:#06x}, {3:#06x}); the AD1848 and the Yamaha ADPCM-B DAC must decode disjoint port ranges"
+    )]
+    AdpcmWssBaseCollision(u16, u16, u16, u16),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,6 +571,29 @@ impl AppConfig {
             }
         }
 
+        if self.audio.yamaha_adpcm.enabled {
+            self.audio.yamaha_adpcm.validate_base()?;
+
+            // The ADPCM DAC and the WSS codec each own their own port window
+            // (read_io checks wss_offset before the ADPCM offset); a config that
+            // points both at overlapping bases would let one silently shadow the
+            // other, so reject it here instead.
+            if self.audio.wss.enabled {
+                let (adpcm_lo, adpcm_hi) = self.audio.yamaha_adpcm.window();
+                let (wss_lo, wss_hi) = self.audio.wss.window();
+                if windows_overlap(
+                    u32::from(adpcm_lo),
+                    u32::from(adpcm_hi),
+                    u32::from(wss_lo),
+                    u32::from(wss_hi),
+                ) {
+                    return Err(ConfigError::AdpcmWssBaseCollision(
+                        adpcm_lo, adpcm_hi, wss_lo, wss_hi,
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -708,52 +739,89 @@ impl Default for WssConfig {
     }
 }
 
-impl WssConfig {
-    /// Fixed I/O port ranges the WSS window must not shadow. The codec decode is
-    /// checked before the 8237 DMA controller, PIT, PIC, and the SB16/OPL/IDE/FDC
-    /// decoders in `MachineBus::read_io`/`write_io`, so a window overlapping any of
-    /// these would silently steal those ports with no diagnostic. Validating the
-    /// base here turns a dangerous config into a load-time error instead.
-    const RESERVED_RANGES: &'static [(u16, u16)] = &[
-        (0x0000, 0x001f), // 8237 DMA controller 1 + aliases
-        (0x0020, 0x003f), // PIC 1
-        (0x0040, 0x005f), // PIT
-        (0x0060, 0x006f), // 8042 keyboard controller / system control ports
-        (0x0070, 0x007f), // RTC / NMI mask
-        (0x0080, 0x009f), // DMA page registers
-        (0x00a0, 0x00bf), // PIC 2
-        (0x00c0, 0x00df), // 8237 DMA controller 2
-        (0x00e0, 0x00ef), // Lotura system controller
-        (0x01f0, 0x01f7), // IDE/ATA primary task file
-        (0x0220, 0x022f), // Sound Blaster base + CT1745 mixer
-        (0x0278, 0x027f), // LPT2 parallel port
-        (0x02f8, 0x02ff), // COM2 serial port (16450 UART)
-        (0x0378, 0x037f), // LPT1 parallel port
-        (0x0388, 0x038b), // OPL2/OPL3
-        (0x03b0, 0x03df), // MDA/CGA/EGA/VGA registers
-        (0x03f0, 0x03f7), // FDC + IDE alias
-        (0x03f8, 0x03ff), // COM1 serial port (16450 UART)
-    ];
+/// Fixed I/O port ranges that a configurable device base (WSS, Yamaha ADPCM,
+/// ...) must not shadow. These mirror the fixed-port dispatch arms checked
+/// ahead of the configurable-base decoders in `MachineBus::read_io`/`write_io`
+/// (crates/izarravm-machine/src/lib.rs): the 8237 DMA controllers, PIT, PIC,
+/// 8042 keyboard controller, RTC, Lotura system controller, IDE/ATA, Sound
+/// Blaster + CT1745 mixer, LPT1/LPT2, COM1/COM2, OPL2/OPL3, and VGA/FDC. A
+/// configurable window overlapping any of these would silently steal those
+/// ports, with the winner decided by if-chain arm order rather than by the
+/// config. Validating every configurable base against this table at load time
+/// turns that into a load-time error instead.
+const RESERVED_PORT_RANGES: &[(u16, u16)] = &[
+    (0x0000, 0x001f), // 8237 DMA controller 1 + aliases
+    (0x0020, 0x003f), // PIC 1
+    (0x0040, 0x005f), // PIT
+    (0x0060, 0x006f), // 8042 keyboard controller / system control ports
+    (0x0070, 0x007f), // RTC / NMI mask
+    (0x0080, 0x009f), // DMA page registers (covers port 0x92, system control A)
+    (0x00a0, 0x00bf), // PIC 2
+    (0x00c0, 0x00df), // 8237 DMA controller 2
+    (0x00e0, 0x00ef), // Lotura system controller
+    (0x01f0, 0x01f7), // IDE/ATA primary task file
+    (0x0220, 0x022f), // Sound Blaster base + CT1745 mixer
+    (0x0278, 0x027f), // LPT2 parallel port
+    (0x02f8, 0x02ff), // COM2 serial port (16450 UART)
+    (0x0378, 0x037f), // LPT1 parallel port
+    (0x0388, 0x038b), // OPL2/OPL3
+    (0x03b0, 0x03df), // MDA/CGA/EGA/VGA registers
+    (0x03f0, 0x03f7), // FDC + IDE alias
+    (0x03f8, 0x03ff), // COM1 serial port (16450 UART)
+];
 
+/// Whether the half-open port window `[a_start, a_end)` overlaps `[b_start, b_end)`.
+const fn windows_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Whether the half-open port window `[start, end)` overlaps any fixed
+/// chipset/device port range (see `RESERVED_PORT_RANGES`).
+fn overlaps_reserved_range(start: u32, end: u32) -> bool {
+    RESERVED_PORT_RANGES
+        .iter()
+        .any(|&(lo, hi)| windows_overlap(start, end, u32::from(lo), u32::from(hi) + 1))
+}
+
+impl WssConfig {
     /// The eight-port WSS window `[base, base + 8)`, saturating at 0xFFFF.
     pub const fn window(&self) -> (u16, u16) {
         (self.base, self.base.saturating_add(8))
     }
 
     /// Reject a `base` whose eight-port window overlaps any fixed chipset/device
-    /// port range (see `RESERVED_RANGES`). The documented WSS bases (0x530,
+    /// port range (see `RESERVED_PORT_RANGES`). The documented WSS bases (0x530,
     /// 0x604, 0xE80, 0xF40) all pass; a low or occupied base does not.
     pub fn validate_base(&self) -> Result<(), ConfigError> {
         let win_start = u32::from(self.base);
         let win_end = win_start + 8; // exclusive; cannot overflow u32
-        for &(lo, hi) in Self::RESERVED_RANGES {
-            // Two half-open ranges overlap iff start < other_end && other_start < end.
-            if win_start <= u32::from(hi) && u32::from(lo) < win_end {
-                return Err(ConfigError::InvalidWssBase(
-                    self.base,
-                    self.base.saturating_add(8),
-                ));
-            }
+        if overlaps_reserved_range(win_start, win_end) {
+            return Err(ConfigError::InvalidWssBase(
+                self.base,
+                self.base.saturating_add(8),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl YamahaAdpcmConfig {
+    /// The four-port ADPCM window `[base, base + 4)`, saturating at 0xFFFF.
+    pub const fn window(&self) -> (u16, u16) {
+        (self.base, self.base.saturating_add(4))
+    }
+
+    /// Reject a `base` whose four-port window overlaps any fixed chipset/device
+    /// port range (see `RESERVED_PORT_RANGES`). The default base (0x240) passes;
+    /// a base over a fixed port range does not.
+    pub fn validate_base(&self) -> Result<(), ConfigError> {
+        let win_start = u32::from(self.base);
+        let win_end = win_start + 4; // exclusive; cannot overflow u32
+        if overlaps_reserved_range(win_start, win_end) {
+            return Err(ConfigError::InvalidAdpcmBase(
+                self.base,
+                self.base.saturating_add(4),
+            ));
         }
         Ok(())
     }
@@ -1275,6 +1343,79 @@ mod tests {
                 Err(ConfigError::InvalidWssBase(0x0278, _))
             ),
             "a WSS base over LPT2 must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_adpcm_base_that_shadows_fixed_ports() {
+        // The default ADPCM base validates.
+        let config = AppConfig::default();
+        assert!(
+            config.validate().is_ok(),
+            "default ADPCM base {:#06x} must validate",
+            config.audio.yamaha_adpcm.base
+        );
+
+        // A base whose four-port window shadows the keyboard controller
+        // (0x060-0x06F) is rejected so it cannot silently steal those ports.
+        let mut config = AppConfig::default();
+        config.audio.yamaha_adpcm.base = 0x0060;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAdpcmBase(0x0060, 0x0064))
+        ));
+
+        // A base whose window straddles the Sound Blaster base (0x21E..0x222
+        // overlaps 0x220) is caught.
+        config.audio.yamaha_adpcm.base = 0x021E;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidAdpcmBase(0x021E, 0x0222))
+        ));
+
+        // A disabled ADPCM device is not validated, so even a dangerous base is
+        // allowed.
+        config.audio.yamaha_adpcm.enabled = false;
+        config.audio.yamaha_adpcm.base = 0x0000;
+        assert!(
+            config.validate().is_ok(),
+            "disabled ADPCM device skips base validation"
+        );
+    }
+
+    #[test]
+    fn rejects_adpcm_base_overlapping_wss_base() {
+        // The default configuration (WSS 0x530, ADPCM 0x240) is disjoint.
+        let config = AppConfig::default();
+        assert!(config.validate().is_ok(), "disjoint defaults validate");
+
+        // Pointing the ADPCM base just below the (default) WSS base overlaps it:
+        // an ADPCM base of 0x52E has a window [0x52E, 0x532) overlapping the WSS
+        // window [0x530, 0x538).
+        let mut config = AppConfig::default();
+        config.audio.yamaha_adpcm.base = 0x052E;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::AdpcmWssBaseCollision(
+                0x052E, 0x0532, 0x0530, 0x0538
+            ))
+        ));
+
+        // With the WSS codec disabled there is no contention, so an otherwise
+        // "colliding" ADPCM base validates (as long as it clears the fixed map).
+        config.audio.wss.enabled = false;
+        assert!(
+            config.validate().is_ok(),
+            "disabled WSS skips the ADPCM/WSS overlap check"
+        );
+
+        // With the ADPCM device disabled there is likewise no contention.
+        let mut config = AppConfig::default();
+        config.audio.yamaha_adpcm.base = 0x052E;
+        config.audio.yamaha_adpcm.enabled = false;
+        assert!(
+            config.validate().is_ok(),
+            "disabled ADPCM device skips the ADPCM/WSS overlap check"
         );
     }
 
