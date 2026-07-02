@@ -20,9 +20,7 @@
 ;
 ; The peripherals page re-runs the POST probe routines live (they are
 ; non-destructive) and shows each as PASS/FAIL in a boxed table with an aligned
-; status column. The health page shows voltage rails and temperatures with a
-; small per-refresh jitter from an LFSR, each drawn as a labeled bar plus its
-; value, inside a box.
+; status column.
 
 ; --- SETUP_SCRATCH layout (segment 0) --------------------------------------
 %define SU_WORKING_MODE   SETUP_SCRATCH + 0    ; edited GSW mode (0/1/2/3)
@@ -36,21 +34,16 @@
 %define SU_TIME_DAY       SETUP_SCRATCH + 8
 %define SU_TIME_MONTH     SETUP_SCRATCH + 9
 %define SU_TIME_YEAR      SETUP_SCRATCH + 10   ; two-digit year (0..99)
-%define SU_LFSR_LO        SETUP_SCRATCH + 12   ; health-page jitter LFSR (word)
-%define SU_HEALTH_TICK    SETUP_SCRATCH + 14   ; last BDA tick the health page drew (word)
-%define SU_RAIL_SCALE     SETUP_SCRATCH + 16   ; su_draw_rail: full-scale whole volts (byte)
-%define SU_RAIL_WHOLE     SETUP_SCRATCH + 17   ; su_draw_rail: reading's whole-number volts (byte)
 
 ; Main-menu selectable rows, in highlight order.
 %define SU_ROW_TIME       0
 %define SU_ROW_LAYOUT     1
 %define SU_ROW_GSW        2
 %define SU_ROW_PERIPH     3
-%define SU_ROW_HEALTH     4
-%define SU_ROW_REPAIR     5
-%define SU_ROW_SAVE       6
-%define SU_ROW_DISCARD    7
-%define SU_SEL_COUNT      8
+%define SU_ROW_REPAIR     4
+%define SU_ROW_SAVE       5
+%define SU_ROW_DISCARD    6
+%define SU_SEL_COUNT      7
 
 ; Time sub-page fields, in Left/Right edit order.
 %define SU_TF_HOUR        0
@@ -98,7 +91,7 @@
 %define SU_C_INK           ART_INK_INDEX     ; near-black body text / border
 %define SU_C_TITLE         ART_RED_INDEX     ; red title bar text
 %define SU_C_DISABLED      ART_GREY_INDEX    ; mid-grey info / help text
-%define SU_C_PASS          10                ; sage-green PASS / rail bar fill (art_palette[10])
+%define SU_C_PASS          10                ; sage-green PASS (art_palette[10])
 %define SU_C_FAIL          ART_RED_INDEX     ; red FAIL
 
 ; --- Menu layout (LFB pixels, 320x240 field) --------------------------------
@@ -115,13 +108,6 @@
 %define SU_HELP1_Y        212
 %define SU_HELP2_Y         226
 %define SU_HELP_X          8
-; Health-page layout: label, then a small horizontal bar, then the value, so
-; the longest value string ("+12.99 V", 8 chars = 64px) has clear room before
-; the box's right border at SU_BOX_X + SU_BOX_W = 312.
-%define SU_BAR_X          110
-%define SU_BAR_W           90
-%define SU_BAR_H            6
-%define SU_HEALTH_VALUE_X 210
 
 ; su_enter_setup_lfb: install the Margo LFB mode (0x150) and load the art
 ; palette. The POST screen already left the LFB mode active and the palette
@@ -305,7 +291,7 @@ su_run_menu:
     sti                             ; the keyboard ring fills on IRQ1
     call su_seed
     mov byte [SU_CURSOR], SU_ROW_TIME   ; DS = 0 left set by su_seed
-    call su_draw
+    call su_draw_fresh
 .loop:
     ; Non-blocking, modeled on the bootbox loop: peek the ring each pass, fall
     ; through and re-loop when it is empty, consume and handle a waiting key. The
@@ -355,8 +341,6 @@ su_run_menu:
     je .open_time
     cmp al, SU_ROW_PERIPH
     je .open_periph
-    cmp al, SU_ROW_HEALTH
-    je .open_health
     cmp al, SU_ROW_REPAIR
     je .repair
     cmp al, SU_ROW_SAVE
@@ -389,15 +373,11 @@ su_run_menu:
     jmp .loop
 .open_time:
     call su_time_page
-    call su_draw                    ; repaint the main menu on return
+    call su_draw_fresh              ; repaint the main menu on return; clear the sub-page first
     jmp .loop
 .open_periph:
     call su_periph_page
-    call su_draw
-    jmp .loop
-.open_health:
-    call su_health_page
-    call su_draw
+    call su_draw_fresh
     jmp .loop
 .save:
     call su_commit
@@ -456,13 +436,6 @@ su_seed:
     mov [bx], al
     mov byte [SU_TIME_FIELD], SU_TF_HOUR
     mov byte [SU_TIME_EDITED], 0
-    ; Seed the LFSR from the live seconds count so the health jitter differs run
-    ; to run; force it nonzero so the shift register never locks at 0.
-    mov al, SU_RTC_SEC
-    call su_cmos_read
-    mov ah, 0xa3
-    or al, 1
-    mov [SU_LFSR_LO], ax
     ret
 
 ; su_cmos_read: AL = CMOS register index on entry -> AL = the byte. Selects the
@@ -686,10 +659,18 @@ su_commit:
 ; Health, Repair/Save/Discard), and a two-line context-sensitive help footer
 ; below the box. Sets DS = CS for the ROM strings; reads SU_CURSOR and the
 ; working values from segment 0.
-su_draw:
+; su_draw_fresh clears the whole framebuffer (and re-asserts the LFB mode +
+; palette) before painting. That reset is only needed when arriving from POST or a
+; sub-page, where pixels sit outside the regions the in-place repaint covers.
+; Cursor moves and inline value edits stay on this page, so their hot path calls
+; su_draw directly: the box interior fill, per-row repaint, and help-line wipe
+; already overwrite everything an edit changes. Re-clearing 76,800 px plus a mode
+; reset on every keystroke was the slow-redraw cause.
+su_draw_fresh:
     call su_enter_setup_lfb
     mov al, COLOR_BG                ; clear the whole screen so no stale POST
     call lfb_clear                  ; content (wordmark/mascot/text) bleeds through
+su_draw:
     ; Title bar (red on field).
     push cs
     pop ds                          ; DS = CS for the label strings
@@ -744,20 +725,12 @@ su_draw:
     mov ax, SU_MENU_Y + SU_ROW_DY * 3
     call lfb_text
 
-    ; Health row.
-    mov bl, SU_ROW_HEALTH
-    call su_row_colors
-    mov si, su_str_health
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 4
-    call lfb_text
-
     ; Repair Toka-DOS row.
     mov bl, SU_ROW_REPAIR
     call su_row_colors
     mov si, su_str_repair
     mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 5
+    mov ax, SU_MENU_Y + SU_ROW_DY * 4
     call lfb_text
 
     ; Save row.
@@ -765,7 +738,7 @@ su_draw:
     call su_row_colors
     mov si, su_str_save
     mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 6
+    mov ax, SU_MENU_Y + SU_ROW_DY * 5
     call lfb_text
 
     ; Discard row.
@@ -773,7 +746,7 @@ su_draw:
     call su_row_colors
     mov si, su_str_discard
     mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 7
+    mov ax, SU_MENU_Y + SU_ROW_DY * 6
     call lfb_text
 
     ; Context-sensitive help line 1, and the static dead-key note on line 2,
@@ -825,8 +798,6 @@ su_help_str_for_row:
     je .gsw
     cmp bl, SU_ROW_PERIPH
     je .periph
-    cmp bl, SU_ROW_HEALTH
-    je .health
     cmp bl, SU_ROW_REPAIR
     je .repair
     cmp bl, SU_ROW_SAVE
@@ -844,9 +815,6 @@ su_help_str_for_row:
     ret
 .periph:
     mov si, su_str_help_periph
-    ret
-.health:
-    mov si, su_str_help_health
     ret
 .repair:
     mov si, su_str_help_repair
@@ -1104,7 +1072,7 @@ su_put_colon:
 ; SU_TIME_EDITED so su_commit knows to write the RTC. DS bounces between 0 and CS.
 su_time_page:
     sti
-    call su_time_draw
+    call su_time_draw_fresh
 .loop:
     ; Non-blocking peek loop (Bug 5), matching su_run_menu and the bootbox model.
     mov ah, 0x01
@@ -1246,10 +1214,14 @@ su_time_adjust:
 ; su_time_draw: paint the time sub-page. Title, a box holding the editable
 ; HH:MM:SS line and the DD/MM/YY date line with the highlighted field in the
 ; inverse band, and a hint footer below the box.
-su_time_draw:
+; su_time_draw_fresh clears first (used on entry from the main menu, whose larger
+; box must be wiped). The field-edit hot path calls su_time_draw for an in-place
+; repaint, skipping the redundant full clear + mode reset.
+su_time_draw_fresh:
     call su_enter_setup_lfb
     mov al, COLOR_BG
     call lfb_clear
+su_time_draw:
     push cs
     pop ds
     mov si, su_str_time_title
@@ -1490,380 +1462,12 @@ su_periph_page:
     jne .loop
     ret
 
-; ============================ Health sub-page ============================
-; su_health_page: show the voltage rails and temperatures with a small per-refresh
-; jitter from the LFSR, each as a labeled horizontal bar plus its value, inside a
-; box. Esc returns; any other key re-jitters and repaints at once.
-; The values are fixed bases plus a signed wobble so the page looks alive without a
-; real hardware monitor port.
-;
-; Non-blocking poll loop (Bug 5), modeled on the bootbox loop: each pass peeks the
-; keyboard, then checks the BDA timer tick word at 0040:006C. When the tick has
-; advanced past SU_HEALTH_TICK the sensors are re-read (re-jittered) and the page
-; redraws, so the readouts animate on the timer with no keypress. The tick is then
-; stored so the next advance triggers the next frame. This replaces the old
-; hlt-based wait, matching the peek model the rest of the setup pages now use.
-su_health_page:
-    sti                             ; the keyboard ring and the BDA tick run on IRQs
-    call su_health_draw
-    call su_health_seed_tick
-.loop:
-    mov ah, 0x01
-    call kb_getkey                  ; peek: CF=1 if the ring is empty
-    jc .tick
-    cmp ah, SC_ESC
-    je .back
-    xor ah, ah
-    call kb_getkey                  ; drain the key; any key re-jitters and repaints
-    call su_health_draw
-    call su_health_seed_tick
-    jmp .loop
-.tick:
-    ; Redraw once the BDA tick has advanced, so the readouts animate ~18 times a
-    ; second without input. The tick word is volatile (INT 08h owns it), so read it
-    ; under DS = BDA then bounce back to segment 0 for SU_HEALTH_TICK.
-    push ds
-    push ax
-    push bx
-    mov bx, BDA_SEG
-    mov ds, bx
-    mov ax, [BDA_TICKS]             ; low word of the running tick count
-    xor bx, bx
-    mov ds, bx
-    cmp ax, [SU_HEALTH_TICK]
-    pop bx
-    pop ax
-    pop ds
-    je .loop                        ; tick unchanged: keep polling
-    call su_health_draw
-    call su_health_seed_tick
-    jmp .loop
-.back:
-    xor ah, ah
-    call kb_getkey                  ; consume the Esc make
-    ret
-
-; su_health_seed_tick: store the current BDA tick low word so the health loop can
-; tell when about a second has elapsed. DS bounces 0040 -> 0.
-su_health_seed_tick:
-    push ds
-    push ax
-    push bx
-    mov bx, BDA_SEG
-    mov ds, bx
-    mov ax, [BDA_TICKS]
-    xor bx, bx
-    mov ds, bx
-    mov [SU_HEALTH_TICK], ax
-    pop bx
-    pop ax
-    pop ds
-    ret
-
-; su_lfsr_step: advance the 16-bit Galois LFSR at SU_LFSR_LO and return AL = a
-; small unsigned jitter in 0..4. The reading wobbles upward from its nominal each
-; refresh, which is enough to look like a live sensor and avoids an underflow when
-; the nominal fraction is 0. DS = 0. Clobbers AX, BX, DX.
-su_lfsr_step:
-    xor bx, bx
-    mov ds, bx
-    mov bx, SU_LFSR_LO
-    mov ax, [bx]
-    shr ax, 1
-    jnc .no_xor
-    xor ax, 0xb400                  ; taps 16,14,13,11 (a maximal-length set)
-.no_xor:
-    mov [bx], ax
-    ; Map the low bits to 0..4: ax mod 5.
-    and ax, 0x000f
-    xor dx, dx
-    mov bx, 5
-    div bx                          ; DX = ax % 5 in 0..4
-    mov ax, dx
-    ret
-
-; su_health_draw: paint the health page. Title, a box holding a labeled bar plus
-; value for each rail/temperature. su_draw_rail / su_draw_temp do one line each;
-; the labels and the row Y are passed in registers so the page is a flat list of
-; calls.
-su_health_draw:
-    call su_enter_setup_lfb
-    mov al, COLOR_BG
-    call lfb_clear
-    push cs
-    pop ds
-    mov si, su_str_health_title
-    mov di, SU_TITLE_X
-    mov ax, SU_TITLE_Y
-    mov bl, SU_C_TITLE
-    mov bh, SU_C_FIELD
-    call lfb_text
-    ; Box tall enough for 5 rails + 2 temps with a small gap between the groups.
-    mov di, SU_BOX_X
-    mov si, SU_BOX_Y
-    mov cx, SU_BOX_W
-    mov dx, SU_ROW_DY * 9 + 6
-    mov bl, SU_C_FIELD
-    mov bh, SU_C_INK
-    call lfb_box
-
-    ; Rails. su_draw_rail: SI = label, DX = prefix string ("<sign>WHOLE."),
-    ; CL = base hundredths, CH = the prefix's whole-number magnitude (unsigned,
-    ; matching the digit(s) already baked into the DX string -- CH, not DH: DX
-    ; is a 16-bit ROM address here, so its high byte cannot double as a small
-    ; integer), BP = row Y, BH = full-scale whole volts for the bar length (the
-    ; rails span different natural ranges, so each gets its own scale).
-    mov si, su_str_r_5v
-    mov dx, su_str_v_5
-    mov cl, 0
-    mov ch, 5
-    mov bp, SU_MENU_Y
-    mov bh, 5
-    call su_draw_rail
-    mov si, su_str_r_33v
-    mov dx, su_str_v_33
-    mov cl, 30
-    mov ch, 3
-    mov bp, SU_MENU_Y + SU_ROW_DY
-    mov bh, 5
-    call su_draw_rail
-    mov si, su_str_r_12v
-    mov dx, su_str_v_12
-    mov cl, 0
-    mov ch, 12
-    mov bp, SU_MENU_Y + SU_ROW_DY * 2
-    mov bh, 12
-    call su_draw_rail
-    mov si, su_str_r_n12v
-    mov dx, su_str_v_n12
-    mov cl, 0
-    mov ch, 12
-    mov bp, SU_MENU_Y + SU_ROW_DY * 3
-    mov bh, 12
-    call su_draw_rail
-    mov si, su_str_r_vcore
-    mov dx, su_str_v_vcore
-    mov cl, 90
-    mov ch, 2
-    mov bp, SU_MENU_Y + SU_ROW_DY * 4
-    mov bh, 3
-    call su_draw_rail
-
-    ; Temperatures. su_draw_temp: SI = label, CL = base degrees, BP = row Y.
-    mov si, su_str_t_cpu
-    mov cl, 42
-    mov bp, SU_MENU_Y + SU_ROW_DY * 6
-    call su_draw_temp
-    mov si, su_str_t_sys
-    mov cl, 35
-    mov bp, SU_MENU_Y + SU_ROW_DY * 7
-    call su_draw_temp
-
-    ; Hint footer, below the box.
-    push cs
-    pop ds
-    mov di, SU_HELP_X
-    mov si, SU_HELP1_Y
-    mov cx, SU_BOX_W
-    mov dx, 11
-    mov bl, COLOR_BG
-    call lfb_fill_rect
-    mov si, su_str_health_hint
-    mov di, SU_HELP_X
-    mov ax, SU_HELP1_Y
-    mov bl, SU_C_DISABLED
-    mov bh, COLOR_BG
-    call lfb_text
-    ret
-
-; su_draw_rail: draw one voltage rail line: label, a small horizontal bar
-; (length proportional to the jittered reading against a BH-volt full scale),
-; and the "<prefix>FF V" value text. SI = CS label, DX = CS prefix string
-; ("<sign>WHOLE.", e.g. "+5."), CL = base hundredths, CH = the prefix's
-; whole-number magnitude (unsigned, matching the digit(s) baked into the DX
-; string -- CH, not DH: DX is consumed whole as the prefix-string address
-; below, so its high byte cannot double as a small integer), BP = row Y,
-; BH = full-scale whole volts for the bar length. Preserves caller registers.
-su_draw_rail:
-    pusha
-    ; Stash BH (full-scale volts) and CH (whole-number magnitude) in segment-0
-    ; scratch before they are clobbered below (BH as a background-color
-    ; argument to lfb_text, CH along with the rest of CX by the digit-split
-    ; div later); the bar-length math needs both at the end of this routine.
-    push ax
-    push ds
-    xor ax, ax
-    mov ds, ax
-    mov al, bh
-    mov [SU_RAIL_SCALE], al
-    mov al, ch
-    mov [SU_RAIL_WHOLE], al
-    pop ds
-    pop ax
-    ; Label.
-    push cs
-    pop ds
-    mov di, SU_MENU_X
-    mov ax, bp
-    mov bl, SU_C_INK
-    mov bh, SU_C_FIELD
-    call lfb_text                   ; SI = label
-    ; Copy the prefix into BIOS_VALBUF, tracking the free index in DI.
-    push cs
-    pop ds
-    mov si, dx                      ; prefix source
-    mov di, BIOS_VALBUF
-.copy:
-    mov al, [si]
-    inc si
-    test al, al
-    jz .copied
-    push si
-    xor bx, bx
-    mov ds, bx
-    mov bx, di
-    mov [bx], al
-    pop si
-    inc di
-    push cs
-    pop ds
-    jmp .copy
-.copied:
-    ; Two fraction digits = (base + jitter), then " V".
-    call su_lfsr_step               ; AL = 0..4 (DS = 0 after)
-    mov dl, al                      ; DL = jitter, stashed across the digit split
-    add al, cl                      ; base hundredths + jitter
-    mov ah, 0
-    mov bl, 10
-    div bl                          ; AL = tens, AH = units
-    add al, '0'
-    add ah, '0'
-    mov bx, di
-    mov [bx], al
-    mov byte [bx + 1], ah
-    mov byte [bx + 2], ' '
-    mov byte [bx + 3], 'V'
-    mov byte [bx + 4], 0
-    ; Draw the value.
-    mov si, BIOS_VALBUF
-    mov di, SU_HEALTH_VALUE_X
-    mov ax, bp
-    mov bl, SU_C_INK
-    mov bh, SU_C_FIELD
-    call lfb_text                   ; DS = 0, SI = buffer
-    ; Bar: length = (whole*100 + base + jitter) hundredths-of-a-volt scaled
-    ; against (full-scale-volts * 100) hundredths, clamped to the band's pixel
-    ; width. A simple, readable fraction rather than exact physical scaling --
-    ; this is cosmetic jitter, not a real sensor.
-    ;
-    ; reading_hundredths = whole*100 + base_hundredths + jitter (fits in AX: the
-    ; largest rail here is 12V, 1200 + 99 + 4 = 1303).
-    xor ax, ax
-    mov al, [SU_RAIL_WHOLE]
-    mov bx, 100
-    mul bx                          ; ax = whole * 100 (dx = 0, whole <= 12)
-    mov bh, 0
-    mov bl, cl
-    add ax, bx                      ; ax += base hundredths
-    add al, dl                      ; ax += jitter (0..4)
-    adc ah, 0
-    ; pixels = reading_hundredths * SU_BAR_W / (full_scale_volts * 100). The
-    ; product (up to ~1303 * 90 = 117270) does not fit AX alone, so this uses
-    ; the native 32-bit mul->div chain: mul leaves the full product in DX:AX,
-    ; and div takes DX:AX as its dividend.
-    mov bx, SU_BAR_W
-    mul bx                          ; dx:ax = reading_hundredths * SU_BAR_W
-    push ax
-    push dx
-    xor ax, ax
-    mov al, [SU_RAIL_SCALE]
-    mov bx, 100
-    mul bx                          ; ax = full_scale_volts * 100 (divisor, fits 16 bits)
-    mov bx, ax
-    pop dx
-    pop ax
-    div bx                          ; ax = pixels (dx:ax / bx)
-    cmp ax, SU_BAR_W
-    jbe .bar_ok
-    mov ax, SU_BAR_W
-.bar_ok:
-    mov cx, ax
-    inc cx                          ; at least a 1px sliver so a 0 reading is visible
-    mov di, SU_BAR_X
-    mov si, bp
-    add si, 1
-    mov dx, SU_BAR_H
-    mov bl, SU_C_PASS
-    call lfb_fill_rect
-    popa
-    ret
-
-; su_draw_temp: draw one temperature line: label, a bar, and "<DD> C" in
-; BIOS_VALBUF. SI = CS label, CL = base degrees, BP = row Y. Preserves caller
-; registers.
-su_draw_temp:
-    pusha
-    push cs
-    pop ds
-    mov di, SU_MENU_X
-    mov ax, bp
-    mov bl, SU_C_INK
-    mov bh, SU_C_FIELD
-    call lfb_text                   ; SI = label
-    call su_lfsr_step               ; AL = 0..4 (DS = 0 after)
-    ; Clamp the temperature wobble to +/-1 degree: (AL mod 3) - 1 gives -1/0/+1,
-    ; tighter than the voltage rails, which keep their wider raw ripple.
-    mov ah, 0
-    mov bl, 3
-    div bl                          ; AH = AL mod 3 (0..2)
-    mov al, ah
-    dec al                          ; -1, 0, or +1
-    add al, cl                      ; base degrees +/- 1
-    mov dl, al                      ; DL = the drawn degrees value, for the bar
-    mov ah, 0
-    mov bl, 10
-    div bl                          ; AL = tens, AH = units
-    add al, '0'
-    add ah, '0'
-    mov [BIOS_VALBUF + 0], al
-    mov [BIOS_VALBUF + 1], ah
-    mov byte [BIOS_VALBUF + 2], ' '
-    mov byte [BIOS_VALBUF + 3], 'C'
-    mov byte [BIOS_VALBUF + 4], 0
-    mov si, BIOS_VALBUF
-    mov di, SU_HEALTH_VALUE_X
-    mov ax, bp
-    mov bl, SU_C_INK
-    mov bh, SU_C_FIELD
-    call lfb_text
-    ; Bar: length proportional to degrees against a 0..60 C span.
-    movzx ax, dl
-    mov bx, SU_BAR_W
-    mul bx
-    mov bl, 60
-    div bl
-    cmp al, SU_BAR_W
-    jbe .bar_ok
-    mov al, SU_BAR_W
-.bar_ok:
-    movzx cx, al
-    inc cx
-    mov di, SU_BAR_X
-    mov si, bp
-    add si, 1
-    mov dx, SU_BAR_H
-    mov bl, SU_C_FAIL
-    call lfb_fill_rect
-    popa
-    ret
-
 ; ============================ Strings ============================
 su_str_title:        db 'IZARRA 3000 SETUP', 0
 su_str_time:         db 'TIME', 0
 su_str_layout:       db 'KEYBOARD', 0
 su_str_gsw:          db 'CPU MODE', 0
 su_str_periph:       db 'PERIPHERALS', 0
-su_str_health:       db 'HEALTH', 0
 su_str_repair:       db 'REPAIR TOKA-DOS', 0
 su_str_repaired:     db 'Toka-DOS repaired', 0
 su_str_svc_fail:     db 'No Toka-DOS image', 0
@@ -1875,7 +1479,6 @@ su_str_help_time:    db 'Enter: set clock  Up/Dn move  Esc back', 0
 su_str_help_layout:  db 'Left/Right: change keyboard  Enter: open', 0
 su_str_help_gsw:     db 'Left/Right: change CPU speed  Enter: open', 0
 su_str_help_periph:  db 'Enter: check devices  Up/Dn move  Esc back', 0
-su_str_help_health:  db 'Enter: view sensors  Up/Dn move  Esc back', 0
 su_str_help_repair:  db 'Enter: reinstall Toka-DOS  Up/Dn move', 0
 su_str_help_save:    db 'Enter/F10: save and reboot  Up/Dn move', 0
 su_str_help_discard: db 'Enter/Esc: discard and reboot  Up/Dn move', 0
@@ -1930,19 +1533,3 @@ su_str_p_com1:       db 'COM1 UART', 0
 su_str_p_sbdsp:      db 'SB DSP', 0
 su_str_p_opl:        db 'OPL FM', 0
 su_str_p_margo:      db 'MARGO VGA', 0
-
-su_str_health_title: db 'SYSTEM HEALTH', 0
-su_str_health_hint:  db 'Esc: back to menu  any key: refresh', 0
-su_str_r_5v:         db '+5V RAIL', 0
-su_str_r_33v:        db '+3.3V RAIL', 0
-su_str_r_12v:        db '+12V RAIL', 0
-su_str_r_n12v:       db '-12V RAIL', 0
-su_str_r_vcore:      db 'VCORE', 0
-su_str_t_cpu:        db 'CPU TEMP', 0
-su_str_t_sys:        db 'SYS TEMP', 0
-; Rail value prefixes: "<sign>WHOLE." The two jittered hundredths and " V" follow.
-su_str_v_5:          db '+5.', 0
-su_str_v_33:         db '+3.', 0
-su_str_v_12:         db '+12.', 0
-su_str_v_n12:        db '-12.', 0
-su_str_v_vcore:      db '+2.', 0

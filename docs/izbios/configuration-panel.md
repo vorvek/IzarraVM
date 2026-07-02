@@ -12,7 +12,7 @@ working copy — nothing reaches CMOS until you choose **Save and Exit**.
 
 ## Main menu
 
-Eight rows, moved between with Up/Down. A one-line help string under the box
+Seven rows, moved between with Up/Down. A one-line help string under the box
 updates to describe whichever row is highlighted; a second, static line
 below it reminds you that dead keys emit their base character on this
 screen (useful context if your keyboard layout uses them).
@@ -23,7 +23,6 @@ screen (useful context if your keyboard layout uses them).
 | KEYBOARD | Left/Right/Enter | `Left/Right: change keyboard  Enter: open` |
 | CPU MODE | Left/Right/Enter | `Left/Right: change CPU speed  Enter: open` |
 | PERIPHERALS | Enter | `Enter: check devices  Up/Dn move  Esc back` |
-| HEALTH | Enter | `Enter: view sensors  Up/Dn move  Esc back` |
 | REPAIR TOKA-DOS | Enter | `Enter: reinstall Toka-DOS  Up/Dn move` |
 | SAVE AND EXIT | Enter or F10 | `Enter/F10: save and reboot  Up/Dn move` |
 | DISCARD AND EXIT | Enter or Esc | `Enter/Esc: discard and reboot  Up/Dn move` |
@@ -78,17 +77,6 @@ LOTURA      PIT TIMER    SB DSP     MARGO VGA
 PASS is shown in sage green, FAIL in red. This is a diagnostic screen only
 — there is nothing here to configure, just a live re-check without a full
 reboot.
-
-## HEALTH
-
-Title: **SYSTEM HEALTH**. Hint: `Esc: back to menu  any key: refresh`.
-
-Shows five voltage rails (+5V, +3.3V, +12V, -12V, VCORE) and two
-temperatures (CPU, system), each drawn as a labeled bar plus its numeric
-value, refreshed continuously with a small amount of jitter so the display
-reads as live. On the real Izarra 3000 this would be a hardware monitor
-chip; in IzarraVM it is a cosmetic readout with plausible values rather than
-a simulation of any actual thermal or power model.
 
 ## REPAIR TOKA-DOS
 
