@@ -469,6 +469,22 @@ const MICROBENCHES: &[Microbench] = &[
         ],
     },
     Microbench {
+        name: "poll-61",
+        // wait: in al, 0x61
+        //       test al, 0x10
+        //       jz wait          (spin while the DRAM-refresh heartbeat bit is clear)
+        //       jmp wait         (re-poll once seen set, an unconditional spin)
+        // Mirrors poll-3da's shape but against port 0x61 bits 4/5 (PIT channel
+        // 1/2 OUT), the P4a Task 2.3 lazy-read target: a real boot-time DRAM-
+        // refresh detection loop polls exactly this bit.
+        code: &[
+            0xE4, 0x61, // wait: in al, 0x61
+            0xA8, 0x10, // test al, 0x10
+            0x74, 0xFB, // jz wait
+            0xEB, 0xF9, // jmp wait
+        ],
+    },
+    Microbench {
         name: "vram-write",
         // mov ax, 0x0013 ; int 0x10          (mode 13h: 0xA0000 is the LFB)
         // mov ax, 0xA000 ; mov es, ax
