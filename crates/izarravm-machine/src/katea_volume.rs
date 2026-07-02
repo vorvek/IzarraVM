@@ -330,12 +330,40 @@ mod tests {
             "LICENSE.TXT carries the full GPL text"
         );
 
-        // TOKAMOUS.COM ships as a synthesized binary; the default AUTOEXEC loads it.
+        // TOKAMOUS.COM ships as a synthesized binary; the default AUTOEXEC loads it
+        // HIGH into a TOKAEMM UMB (SP-4b M4).
         assert!(by_name.contains_key("TOKAMOUS.COM"), "TOKAMOUS.COM present");
         let autoexec = by_name.get("AUTOEXEC.BAT").expect("AUTOEXEC.BAT present");
         assert!(
             String::from_utf8_lossy(autoexec).contains("SET BLASTER=A220 I5 D1 H5 T6"),
             "default AUTOEXEC advertises the Sound Blaster"
+        );
+        assert!(
+            String::from_utf8_lossy(autoexec).contains("LH TOKAMOUS"),
+            "default AUTOEXEC loads the mouse driver high"
+        );
+
+        // SP-4b M4: TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
+        // loads it (frameless NOEMS) with DOS=HIGH,UMB — every default boot runs
+        // FreeDOS in V86 under the guest memory manager.
+        assert_eq!(
+            by_name.get("TOKAEMM.SYS").map(|d| d.len()),
+            Some(izarravm_firmware::tokaemm_sys().len()),
+            "TOKAEMM.SYS on the payload matches the committed driver"
+        );
+        let config = by_name.get("CONFIG.SYS").expect("CONFIG.SYS present");
+        let config_text = String::from_utf8_lossy(config);
+        assert!(
+            config_text.contains("DEVICE=C:\\TOKAEMM.SYS NOEMS"),
+            "default CONFIG.SYS loads TOKAEMM"
+        );
+        assert!(
+            config_text.contains("DOS=HIGH,UMB"),
+            "default CONFIG.SYS uses the HMA + UMBs"
+        );
+        assert!(
+            config_text.contains("LASTDRIVE=D"),
+            "default CONFIG.SYS caps LASTDRIVE at D (A: floppy, C: HDD, D: CD)"
         );
 
         // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
