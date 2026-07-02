@@ -114,6 +114,7 @@ start:
     mov ah, 0x44
     mov al, 1
     mov bx, 0xFFFF
+    mov dx, [handle]              ; the unmap form still requires a valid handle
     int 0x67
     or ah, ah
     jnz f_unmap

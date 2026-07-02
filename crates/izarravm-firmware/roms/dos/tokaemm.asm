@@ -72,8 +72,8 @@ xms_table: times XMS_HANDLES*XMS_SLOT db 0
 UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
 UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
-UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment)
-UMB_SEG_PARAS equ 0x2800          ; 160 KB / 16 = paragraphs in the window
+UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment); the window
+                                  ; ends at the runtime umb_win_end (SP-4b M2)
 ; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
 UMB_SLOTS equ 8
 UMB_SLOT  equ 6
@@ -226,7 +226,7 @@ init:
     je .ems_done
     mov eax, [cs:xms_pool_end]
     cmp eax, EMS_PHYS_BASE + 0x4000  ; at least one 16 KB page available?
-    jbe .ems_off                     ; degenerate small-RAM box: stay frameless
+    jb .ems_off                      ; degenerate small-RAM box: stay frameless
     sub eax, EMS_PHYS_BASE
     shr eax, 14                      ; bytes -> 16 KB pages
     cmp eax, EMS_MAX_PAGES
@@ -920,7 +920,7 @@ xf_realloc_umb:
     pop si
     jmp xms_fail
 
-; First-fit free run of DX paras in [UMB_SEG_BASE, +UMB_SEG_PARAS). Restart-on-
+; First-fit free run of DX paras in [UMB_SEG_BASE, umb_win_end). Restart-on-
 ; overlap (mirrors find_gap). out: BX = seg, CF clear; or CF set. Preserves DX;
 ; clobbers ax, cx, si.
 umb_free_run:
@@ -934,6 +934,8 @@ umb_free_run:
 .restart:
     mov ax, bx
     add ax, dx                    ; cursor + need
+    jc .none                      ; 16-bit wrap: the cursor (a block top near the
+                                  ; window end) + need passed 0xFFFF -> cannot fit
     cmp ax, [cs:umb_win_end]
     ja .none
     mov si, umb_table
@@ -1107,6 +1109,8 @@ ef_alloc:
     ja .total
     cmp bx, [cs:ems_free]
     ja .nofree
+    push ax                       ; ems_find_run clobbers AX; AL is not an output
+    push dx                       ; DX is an output only on success (the handle)
     push si
     push cx
     push di
@@ -1124,6 +1128,8 @@ ef_alloc:
     pop di
     pop cx
     pop si
+    pop dx                        ; restore the caller's DX (the counter ran over it)
+    pop ax
     mov ah, 0x85                  ; no more handles
     iret
 .got:
@@ -1135,12 +1141,16 @@ ef_alloc:
     pop di
     pop cx
     pop si
-    xor ah, ah                    ; DX = handle
+    add sp, 2                     ; discard the saved DX: DX = the new handle
+    pop ax
+    xor ah, ah
     iret
 .frag:
     pop di
     pop cx
     pop si
+    pop dx
+    pop ax
 .nofree:
     mov ah, 0x88                  ; insufficient free pages
     iret
@@ -1159,10 +1169,10 @@ ef_map:
     ja .badphys
     push si
     push cx
+    call ems_slot_of              ; DX -> SI, or CF + AH=0x83 (LIM: the unmap
+    jc .bad                       ; form still requires a valid handle)
     cmp bx, 0xFFFF
     je .unmap
-    call ems_slot_of              ; DX -> SI, or CF + AH=0x83
-    jc .bad
     cmp bx, [cs:si+2]             ; logical >= npages?
     jae .badlog
     mov cx, [cs:si+4]
@@ -1381,7 +1391,8 @@ ef_pages:
 ; --- EMS helpers --------------------------------------------------------------
 
 ; DX = EMS handle -> SI = slot offset, CF clear; or CF set + AH = 0x83.
-; Callers save SI. Preserves everything else.
+; Callers save SI. Preserves everything else. Handle 0 (the LIM OS handle) is
+; reserved-not-modeled, so it answers 83h like an unknown handle.
 ems_slot_of:
     cmp dx, 1
     jb .bad
