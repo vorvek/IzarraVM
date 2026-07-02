@@ -8030,12 +8030,26 @@ impl Machine {
         self.margo.advance_busy(whole_ns as u64);
         self.margo_ns -= whole_ns;
 
-        self.vga_dots += clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
-        let whole = self.vga_dots.floor();
-        self.video.advance(whole as u64);
-        self.vga_dots -= whole;
+        let (whole, remainder) = self.predict_dots(clocks, self.vga_dots);
+        self.video.advance(whole);
+        self.vga_dots = remainder;
 
         self.pump_pusher();
+    }
+
+    /// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
+    /// fractional-dot accumulator `dots_owed`. Pure: does not mutate `self`. The
+    /// SAME function both `advance_devices` (the real, mutating step above) and a
+    /// future lazy port-read peek (Slice 1) call, so the two paths cannot
+    /// structurally diverge: "no time travel" (a lazy read predicting state the
+    /// later real advance would contradict) becomes a property of sharing one
+    /// implementation, not an invariant maintained by hand across two call sites.
+    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3.
+    fn predict_dots(&self, clocks: u64, dots_owed: f64) -> (u64, f64) {
+        let raw =
+            dots_owed + clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
+        let whole = raw.floor();
+        (whole as u64, raw - whole)
     }
 
     /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
@@ -11754,6 +11768,45 @@ mod tests {
         .unwrap();
         machine.set_bus_trace_detailed(true);
         machine
+    }
+
+    #[test]
+    fn predict_vga_dots_matches_the_real_advance_devices_accumulator_step() {
+        // predict_dots must be textually identical arithmetic to the vga_dots
+        // block it was extracted from (Task 0.3), so its output, fed through the
+        // same Vga::advance + vga_dots-subtract sequence advance_devices already
+        // uses, reproduces the real post-advance_devices state exactly: not just
+        // numerically close, bit-for-bit (same operation order, same rounding).
+        let mut expected = test_machine();
+        let mut actual = test_machine();
+        let clocks = 12_345u64;
+        let vga_dots_before = actual.vga_dots;
+
+        // The real, mutating step (what advance_devices does today).
+        expected.advance_devices(clocks);
+
+        // The shared pure function, applied by hand the same way advance_devices
+        // applies it internally.
+        let (whole, remainder) = actual.predict_dots(clocks, vga_dots_before);
+        actual.video.advance(whole);
+        actual.vga_dots = remainder;
+
+        assert_eq!(
+            actual.video.beam_dots(),
+            expected.video.beam_dots(),
+            "predict_dots's whole-dots output must move the beam identically \
+             to advance_devices's real step"
+        );
+        assert_eq!(
+            actual.vga_dots, expected.vga_dots,
+            "predict_dots's fractional remainder must match the real accumulator"
+        );
+        assert_eq!(
+            actual.video.frames_completed(),
+            expected.video.frames_completed(),
+            "frame-boundary bookkeeping (finalize_frame/frames) must also agree \
+             when applied by hand through the same Vga::advance call"
+        );
     }
 
     fn int15_machine(mem_mib: u16) -> Machine {
