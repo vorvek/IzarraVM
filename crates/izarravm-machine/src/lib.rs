@@ -9740,9 +9740,16 @@ impl CpuBus for MachineBus<'_> {
                 if let Some(value) = self.video.read_status_port_lazy(port, beam) {
                     return Ok(u32::from(value));
                 }
-                // Inactive alias (e.g. 3BA polled in a color setup): no side effects,
-                // matching `Vga::read_port`'s existing `status1_port_selected` gate.
-                // Fall through to the same fallback chain the non-lazy path uses.
+                // Inactive alias (e.g. 3BA polled in a color setup): no side
+                // effects, matching `Vga::read_port`'s existing
+                // `status1_port_selected` gate, and -- since this arm's static
+                // port set is disjoint from every other device's decoded ports
+                // (grep-confirmed: nothing else claims 0x3B0..=0x3DF) -- the same
+                // 0xFF the non-lazy path's fallthrough to `device_ports`'s passive
+                // table would eventually produce. Returned directly, without
+                // setting io_touched, so an inactive-alias poll stays lazy too
+                // instead of silently falling back to the old behavior.
+                return Ok(0xff);
             } else {
                 *self.io_touched = true;
                 if let Some(value) = self.video.read_port(port) {
@@ -19173,6 +19180,281 @@ mod tests {
             "the boot run must contain at least one multi-run batch whose later run \
              saw a nonzero prior-runs core total; if this stops holding, drive the \
              machine differently rather than weakening the assert"
+        );
+    }
+
+    #[test]
+    fn lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+        // The P4a Task 1.3 behavior change: in the Approximate class (486/586) a
+        // 0x3DA/0x3BA/0x3C2 read must NOT end the batch (io_touched stays false),
+        // while the Accurate class (286/386) keeps the exact prior behavior
+        // (io_touched set on every status-port read). Covers all three ports.
+        for port in [0x3DAu16, 0x3BA, 0x3C2] {
+            // Accurate class: unchanged behavior, io_touched set.
+            let mut accurate = test_machine(); // Gsw386 by construction
+            with_bus(&mut accurate, |bus| {
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    *bus.io_touched,
+                    "port {port:#06X}: the Accurate class must still set io_touched \
+                     on a status-port read"
+                );
+            });
+
+            // Approximate class: the new lazy behavior, io_touched stays false.
+            let mut approximate = test_machine();
+            approximate.set_mode(GswMode::Gsw486);
+            with_bus(&mut approximate, |bus| {
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    !*bus.io_touched,
+                    "port {port:#06X}: the Approximate class must NOT set io_touched \
+                     on a status-port read (the lazy path)"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn lazy_3da_read_still_resets_the_attribute_flip_flop_and_calls_catch_up() {
+        // A lazy 0x3DA read must perform the exact same guest-visible side effects
+        // as the non-lazy read (catch_up + the Attribute Controller address/data
+        // flip-flop reset), even though io_touched stays false. `Attribute`'s
+        // flip_flop_data field is pub(crate) to izarravm-video, not reachable
+        // directly from this crate, so this observes the flip-flop indirectly
+        // through 0x3C0's own read-back semantics: a first 0x3C0 write always sets
+        // the index (armed as pending data); if the flip-flop is still "data"
+        // after the 3DA read, a second 0x3C0 write would be consumed as a data
+        // write to the FIRST index rather than a new index, and 0x3C0's own
+        // read-back (`Some(attr.index | pas<<5)`) would show the stale value.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        with_bus(&mut machine, |bus| {
+            // First 0x3C0 write: sets index = 0x05, arms the flip-flop to "data".
+            bus.write_io(0x3C0, BusWidth::Byte, 0x05).unwrap();
+            assert_eq!(
+                bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
+                0x05,
+                "sanity: the index write took effect"
+            );
+            // Re-arm to "data" again since the readback above is a read of 0x3C0's
+            // INDEX register (a separate port from the flip-flopped write path),
+            // not a read through the flip-flop itself; write once more so the
+            // flip-flop is definitely in the "data" phase going into the lazy read.
+            bus.write_io(0x3C0, BusWidth::Byte, 0x05).unwrap();
+            // The setup writes above are ordinary (non-lazy) port writes and
+            // unconditionally set io_touched; clear it so the sanity check below
+            // observes only the upcoming 3DA read's own effect on the flag.
+            *bus.io_touched = false;
+
+            // The lazy 3DA read: must reset the flip-flop to "index" despite not
+            // setting io_touched.
+            let _ = bus.read_io(0x3DA, BusWidth::Byte, 0).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "sanity: this is the lazy path (Approximate class)"
+            );
+
+            // A second 0x3C0 write with a DIFFERENT value: if the flip-flop was
+            // correctly reset to "index" by the 3DA read, this sets a NEW index
+            // (0x0A after masking to 5 bits), observable via 0x3C0's read-back.
+            bus.write_io(0x3C0, BusWidth::Byte, 0x0A).unwrap();
+            assert_eq!(
+                bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
+                0x0A,
+                "the 3DA read must have reset the attribute flip-flop to \"index\", \
+                 so the next 0x3C0 write is treated as a new index (0x0A), not a \
+                 data write to the stale index 0x05"
+            );
+        });
+    }
+
+    #[test]
+    fn lazy_3da_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
+        // At batch start (zero in-batch clocks, predicted_beam degenerates to the
+        // batch-entry beam exactly, per
+        // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy
+        // status1 bits must be byte-identical to what the pre-Task-1.3
+        // read_status1 would have returned for the same live beam. Compared
+        // within a SINGLE Approximate-class machine (not across two differently
+        // clocked machines, whose beams would drift apart independently of this
+        // task's change): clone the live Vga state before either read touches
+        // it, compute the accurate read_status1() on the clone, then compute the
+        // lazy value through the real bus, both starting from the identical
+        // device state.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        machine.run_cycles(5_000).unwrap();
+
+        let mut accurate_clone = machine.video.clone();
+        let expected = accurate_clone.read_status1();
+
+        let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
+            let value = bus.read_io(0x3DA, BusWidth::Byte, 0).unwrap();
+            (value, *bus.io_touched)
+        });
+
+        assert!(
+            !io_touched,
+            "sanity: this is the lazy path (Approximate class)"
+        );
+        assert_eq!(
+            lazy_value,
+            u32::from(expected),
+            "a lazy 3DA read at batch start must return byte-identical bits to a \
+             non-lazy read of the same live beam"
+        );
+    }
+
+    #[test]
+    fn lazy_reads_chain_into_far_fewer_batches_than_poll_iterations_with_monotone_observations() {
+        // End-to-end no-time-travel test: a real mode-13h guest tightly polls
+        // 0x3DA in a loop (the same port the P4d cadence test polls) and
+        // maintains, in guest memory, a running sample count and a toggle count
+        // of the vretrace bit (0x08) across every sample it has ever taken --
+        // not just a bounded ring, so the toggle observation cannot be an
+        // artifact of a capture window that happens to miss an edge. Asserts (a)
+        // the Approximate-class run collapses many poll iterations into far
+        // fewer `run_straight_line` calls (each 0x3DA IN no longer ends the
+        // batch), and (b) the vretrace bit toggled at least once across the
+        // whole run -- proving the lazy per-read prediction actually tracked
+        // beam motion across many samples rather than reading a frozen value.
+        //
+        // Guest memory layout: [0x7000] sample count, [0x7004] toggle count,
+        // [0x7006] last-observed vretrace bit (byte).
+        let code = [
+            0xB8, 0x13, 0x00, // 0: mov ax, 0x0013 (mode 13h)
+            0xCD, 0x10, // 3: int 0x10
+            0x31, 0xC0, // 5: xor ax, ax
+            0x8E, 0xD8, // 7: mov ds, ax
+            0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // 9: mov word [0x7000], 0 (sample count)
+            0xC7, 0x06, 0x04, 0x70, 0x00, 0x00, // 15: mov word [0x7004], 0 (toggle count)
+            0xC6, 0x06, 0x06, 0x70, 0xFF, // 21: mov byte [0x7006], 0xFF (no prior sample)
+            0xBA, 0xDA, 0x03, // 26: mov dx, 0x03DA
+            // poll (29): read status, isolate the vretrace bit, compare against
+            // the last-observed bit, bump the toggle count on a change, stash
+            // the new last-observed bit, bump the sample count, loop forever.
+            0xEC, // 29: in al, dx
+            0x24, 0x08, // 30: and al, 0x08 (isolate the vretrace bit)
+            0x3A, 0x06, 0x06, 0x70, // 32: cmp al, [0x7006]
+            0x74, 0x04, // 36: jz same (+4: skip the toggle bump)
+            0xFF, 0x06, 0x04, 0x70, // 38: inc word [0x7004] (toggle count)
+            // same (42):
+            0xA2, 0x06, 0x70, // 42: mov [0x7006], al
+            0xFF, 0x06, 0x00, 0x70, // 45: inc word [0x7000] (sample count)
+            0xEB, 0xEA, // 49: jmp poll (displacement -22: poll=29, jmp ends at 51)
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+
+        // Warm up until mode 13h is set and the guest is inside the poll loop.
+        machine.run_cycles(50_000).unwrap();
+        machine.cpu.reset_perf_counters();
+        let sample_count_before = machine.memory.read_u16(0x7000).unwrap();
+
+        // Run enough guest clocks to complete several frames' worth of polling.
+        let clock_hz = machine.active_mode().clock_hz();
+        machine.run_cycles(clock_hz / 20).unwrap(); // 50ms of guest time
+
+        // `straight_line_runs` counts every `run_straight_line` call (opening a
+        // new run OR chaining continuations); each poll iteration is one IN, so
+        // without continuation-chaining this would grow roughly 1:1 with the
+        // sample count. With lazy reads admitted as continuations, many samples
+        // land inside a single run.
+        let runs = machine.cpu.perf_counters().straight_line_runs;
+        let sample_count_after = machine.memory.read_u16(0x7000).unwrap();
+        let samples_taken = sample_count_after.wrapping_sub(sample_count_before);
+        let toggles = machine.memory.read_u16(0x7004).unwrap();
+
+        assert!(
+            samples_taken > 1000,
+            "sanity: the poll loop must have run many iterations in 50ms of \
+             guest time, saw {samples_taken}"
+        );
+        assert!(
+            runs < u64::from(samples_taken) / 4,
+            "lazy reads must chain many poll iterations per run_straight_line \
+             call: saw {runs} runs for {samples_taken} samples (expected far \
+             fewer runs than samples)"
+        );
+        assert!(
+            toggles > 0,
+            "the vretrace bit must have toggled at least once across the whole \
+             run's samples in 50ms of guest time (multiple frames), or the lazy \
+             prediction never actually tracked beam motion; saw {toggles} \
+             toggles across {samples_taken} samples"
+        );
+    }
+
+    #[test]
+    fn lazy_read_after_an_interrupt_service_charge_sees_the_batch_scoped_total() {
+        // Carried-forward review note: the first lazy read of a batch that opened
+        // with an interrupt-service charge (the once-per-batch IRQ dispatch cost
+        // added to batch_core before the first run_straight_line call) must see a
+        // clock total that includes that charge -- prior_runs_core_clocks is
+        // republished from batch_core before every run, and the very first
+        // publish (before run 1) already carries the service charge. Observable
+        // via the cfg(test) log seam: the FIRST prior-runs push of a batch that
+        // serviced an interrupt must be nonzero.
+        //
+        // Reuses approximate_class_delivers_pit_irq0_during_long_compute_stretches'
+        // exact setup (a pure `sti; jmp $` compute loop after arming the PIC/PIT
+        // for ~3.43ms IRQ0 ticks) so an interrupt is serviced at a KNOWN, reliable
+        // cadence rather than depending on incidental BIOS/POST timing.
+        let code = [
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xB0, 0x11, 0xE6, 0x20, // ICW1
+            0xB0, 0x08, 0xE6, 0x21, // ICW2: vector base 0x08
+            0xB0, 0x04, 0xE6, 0x21, // ICW3
+            0xB0, 0x01, 0xE6, 0x21, // ICW4
+            0xB0, 0x00, 0xE6, 0x21, // unmask all lines
+            0xB0, 0x34, 0xE6, 0x43, // PIT ch0 mode 2, LSB/MSB
+            0xB0, 0x00, 0xE6, 0x40, // reload low 0x00
+            0xB0, 0x10, 0xE6, 0x40, // reload high 0x10 -> 4096 ticks (~3.43 ms)
+            0xFB, // sti
+            0xEB, 0xFE, // jmp $ (pure compute, no port I/O)
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        // IRQ0 handler at 0x0700: mov al,0x20; out 0x20,al; iret (EOI only, no
+        // guest-visible port I/O beyond that, which keeps the batch shape simple).
+        let handler: [u8; 5] = [0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x08] (IRQ0 at PIC base 0x08) -> 0000:0700.
+        machine.write_physical_u8(0x20, 0x00);
+        machine.write_physical_u8(0x21, 0x07);
+        machine.write_physical_u8(0x22, 0x00);
+        machine.write_physical_u8(0x23, 0x00);
+        // A few periods of 4096 PIT ticks at the Gsw486 clock rate, comfortably
+        // enough for several IRQ0 edges (and thus several interrupt-opened
+        // batches) to land.
+        machine.run_cycles(5_000_000).unwrap();
+
+        assert!(
+            !machine.test_prior_core_pushes.is_empty(),
+            "the run must have executed at least one batch"
+        );
+        let saw_batch_with_serviced_interrupt_charge = machine
+            .test_prior_core_pushes
+            .iter()
+            .any(|pushes| pushes.first().is_some_and(|&first| first > 0));
+        assert!(
+            saw_batch_with_serviced_interrupt_charge,
+            "at least one batch's FIRST prior-runs publish (before its first \
+             run_straight_line call) must be nonzero, proving an interrupt- \
+             service charge from batch entry is visible to the first lazy read \
+             of that batch's first run, not just to later runs"
         );
     }
 
