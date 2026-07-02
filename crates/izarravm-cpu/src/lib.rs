@@ -869,6 +869,14 @@ pub struct PerfCounters {
     pub rep_string_fast_iterations: u64,
     pub flag_materializations: u64,
     pub cache_tier_lookups: u64,
+    /// V86 trap tax measurement (dev_docs/2026-07-02-v86-trap-tax): every entry into
+    /// the ring-0 monitor via vector 13 (a V86 sensitive-instruction #GP or a real
+    /// IRQ5), counted at `deliver_exception`. One "trip" per TOKAEMM round-trip.
+    /// Combine with `brk_step` (already tracked above) for the batch-breaking
+    /// share the trap tax measures: `brk_step / monitor_trips_vec13` is the mean
+    /// number of port accesses that ended a batch per trip (was ~2, the vec13
+    /// PIC OCW3 select write and its readback; near 0 after the Part 1 fix).
+    pub monitor_trips_vec13: u64,
 }
 
 impl PartialEq for PerfCounters {
@@ -8345,6 +8353,12 @@ impl Cpu386 {
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset);
+        // V86 trap tax measurement (dev_docs/2026-07-02-v86-trap-tax): a successful
+        // vector-13 delivery out of V86 is exactly one TOKAEMM round-trip (a V86
+        // sensitive-instruction #GP or a real IRQ5, both share this vector).
+        if source_v86 && vector == 13 {
+            self.perf.monitor_trips_vec13 += 1;
+        }
         Ok(())
     }
 

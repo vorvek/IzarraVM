@@ -4065,4 +4065,75 @@ DIR DEST\r\n"
              a 0xEn code names the failed step.\n{text}"
         );
     }
+
+    /// V86 trap tax (dev_docs/2026-07-02-v86-trap-tax) owner measurement: not a CI
+    /// gate, a local one-off ad hoc report. Boots a real corpus game (Prince of
+    /// Persia) through the Katea host-folder facade at a given GSW mode and prints
+    /// the vec13 monitor-trip rate, the monitor-resident core-clock share, and the
+    /// framebuffer-progress rate, comparing before/after the trap-tax fix. Skips
+    /// (does not fail) when the local corpus path is absent, since it is
+    /// machine-local, not a repo fixture.
+    #[test]
+    #[ignore = "owner measurement only; needs a local corpus path, not a CI fixture"]
+    fn v86_trap_tax_prince_of_persia_measurement() {
+        let corpus_dir = std::path::Path::new(
+            "R:\\La Colecci\u{f3}n by Neville\\dosroot\\Prince of Persia (Castellano)",
+        );
+        if !corpus_dir.is_dir() {
+            eprintln!("skipping: corpus dir not found at {}", corpus_dir.display());
+            return;
+        }
+        for (label, mode) in [("486", GswMode::Gsw486), ("586", GswMode::Gsw586)] {
+            let profile = MachineProfile {
+                cpu: mode,
+                clock_hz: mode.clock_hz(),
+                ..MachineProfile::gsw_386(16, VideoCard::Et4000Ax)
+            };
+            let mut machine =
+                Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+            machine
+                .mount_hdd_folder(corpus_dir)
+                .expect("mount corpus folder");
+            // Same guest-seconds budget at every mode (clock_hz differs 486 vs 586),
+            // so the comparison covers the same amount of simulated game time, not
+            // an artifact of one mode's higher clock_hz consuming its cycle budget
+            // faster in wall-guest-time.
+            let guest_seconds_budget = 12.0f64;
+            let budget = (guest_seconds_budget * mode.clock_hz() as f64) as u64;
+            let stop = machine
+                .run_until_halt_or_cycles(budget)
+                .expect("machine run");
+            let perf = machine.cpu().perf_counters();
+            let elapsed = machine.elapsed_clocks();
+            let guest_seconds = elapsed as f64 / mode.clock_hz() as f64;
+            let trips_per_s = perf.monitor_trips_vec13 as f64 / guest_seconds;
+            // Guest architectural clocks are NOT the right lens for the batch-
+            // breaking mechanism this measures: batch splits are a host-dispatch
+            // cost, not a guest-visible timing change (confirmed: identical guest
+            // clock counters before/after the Part 1 fix). straight_line_runs is
+            // the host-side batch/run count (one CPU batch entry may run several
+            // straight_line_runs, but every batch-ending port access -- the vec13
+            // PIC probe's out/in included -- shows up as a brk_step increment), so
+            // brk_step is the direct proxy for "how many times did a port access
+            // end this batch" -- the mechanism the fix targets.
+            let runs_per_s = perf.straight_line_runs as f64 / guest_seconds;
+            let brk_step_per_s = perf.brk_step as f64 / guest_seconds;
+            // brk_step per trip: today (after the fix) this should be near 1 (the
+            // I/O bitmap-denied probe or a genuine guest port access), vs. near 2
+            // before the fix (the PIC OCW3 select write AND the readback each
+            // ending the batch).
+            let brk_step_per_trip = perf.brk_step as f64 / perf.monitor_trips_vec13.max(1) as f64;
+            let frames = machine.video().frames_completed();
+            let fb_rate = frames as f64 / guest_seconds;
+            println!(
+                "cpu={label} stop={stop:?} trips/s={trips_per_s:.1} \
+                 straight_line_runs/s={runs_per_s:.1} brk_step/s={brk_step_per_s:.1} \
+                 brk_step/trip={brk_step_per_trip:.3} \
+                 fb_frames={frames} fb_rate/s={fb_rate:.2} \
+                 monitor_trips={} instructions={} straight_line_runs={} brk_step={} \
+                 elapsed_clocks={elapsed}",
+                perf.monitor_trips_vec13, perf.instructions, perf.straight_line_runs, perf.brk_step,
+            );
+        }
+    }
 }
