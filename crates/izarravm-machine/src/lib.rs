@@ -2407,6 +2407,7 @@ impl Machine {
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
             flat_data_cost: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
+            lazy_port_reads: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut self.io_touched,
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
@@ -8799,6 +8800,7 @@ impl Machine {
                     wait_states: profile.wait_states,
                     cache: cache_model,
                     flat_data_cost: matches!(active_mode.timing_class(), TimingClass::Approximate),
+                    lazy_port_reads: matches!(active_mode.timing_class(), TimingClass::Approximate),
                     io_touched,
                     device_wrote_memory,
                     direct_map_changed,
@@ -8874,11 +8876,15 @@ impl Machine {
                         // top and see a batch-total that is monotone across run
                         // boundaries. See MachineBus::prior_runs_core_clocks.
                         bus.prior_runs_core_clocks = u64::from(batch_core);
+                        // Logs the bus field itself (not an independent `batch_core`
+                        // read) so `batch_loop_publishes_prior_runs_core_clocks_before_every_run`
+                        // actually fails if the store above is ever deleted or the
+                        // publish drifts from the field a lazy prediction reads.
                         #[cfg(test)]
                         test_prior_core_pushes
                             .last_mut()
                             .expect("opened at batch entry")
-                            .push(u64::from(batch_core));
+                            .push(bus.prior_runs_core_clocks);
                         match cpu.run_straight_line(&mut bus, remaining) {
                             Ok(o) => {
                                 batch_core = batch_core.saturating_add(o.core_clocks);
@@ -9128,6 +9134,15 @@ struct MachineBus<'a> {
     /// class (286/386) and forced false by the bandwidth diagnostic so its tier
     /// curve stays on the accurate model.
     flat_data_cost: bool,
+    /// True in the Approximate timing class (486/586), computed identically to
+    /// `flat_data_cost` (same `active_mode.timing_class()` match, same
+    /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`
+    /// (P4a Task 1.3): when true, a status-port read does not set `io_touched`
+    /// and computes its returned bits from `predicted_beam()` instead of the
+    /// live device beam; when false (Accurate class, 286/386) the port keeps
+    /// the byte-identical pre-Task-1.3 behavior. A single bool test at the top
+    /// of the one arm that branches on it, not a per-access classification.
+    lazy_port_reads: bool,
     // Set true by any port I/O this batch. The run loop batches straight-line
     // instructions and services devices once per batch; a port access (a PIT
     // latch read, 0x3DA retrace poll, RTC read, a PIT/PIC/DSP/mode write) reads
@@ -9160,38 +9175,36 @@ struct MachineBus<'a> {
     // Five batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
     // Task 1.1: dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Each is a
     // copy of the corresponding live Machine/BusTrace value at the moment this
-    // bus is constructed (once per batch), never mutated afterward. Not yet read
-    // by any arm; Task 1.2/1.3 consumes them to predict the VGA beam position
-    // mid-batch without mutating device state.
-    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
+    // bus is constructed (once per batch), never mutated afterward.
+    // `vga_dots_at_batch_start`/`beam_at_batch_start`/`trace_elapsed_at_batch_start`/
+    // `bus_rem_at_batch_start` are consumed by `predicted_beam`, which the lazy
+    // 3DA/3BA/3C2 arm in `read_io` calls (Task 1.3). `elapsed_clocks_at_batch_start`
+    // is not needed by that formula (predicted_beam derives its clock total from
+    // core_clocks + trace bus clocks directly, not from elapsed_clocks); it stays
+    // for construction-site symmetry and is pinned directly by
+    // `predicted_beam_at_batch_start_equals_the_unmutated_beam`.
+    #[allow(dead_code)] // pinned by its own test, not read by predicted_beam's formula
     elapsed_clocks_at_batch_start: u64,
-    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
     vga_dots_at_batch_start: f64,
-    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
     beam_at_batch_start: u64,
-    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
     trace_elapsed_at_batch_start: u64,
-    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
     bus_rem_at_batch_start: u64,
     // The active mode's `1 / clock_hz` factor (Machine::timing.inv_clock), copied
     // at bus construction like the five batch-entry snapshots above. Needed by
-    // `predicted_beam` (Task 1.2) to call the shared `predict_dots_core` formula;
-    // MachineBus has no `&Machine` to read `self.timing` from directly. A copy
-    // field rather than a per-call recompute: `TimingFactors::for_clock` only
-    // changes on a Lotura mode write (`set_mode`), so it is batch-entry-stable
-    // exactly like `active_mode` above it.
-    #[allow(dead_code)] // consumed by Task 1.3, to be removed then
+    // `predicted_beam` to call the shared `predict_dots_core` formula; MachineBus
+    // has no `&Machine` to read `self.timing` from directly. A copy field rather
+    // than a per-call recompute: `TimingFactors::for_clock` only changes on a
+    // Lotura mode write (`set_mode`), so it is batch-entry-stable exactly like
+    // `active_mode` above it.
     inv_clock_at_batch_start: f64,
     // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from
     // the SAME source `scale_bus` reads (`self.cpu.level()`), NOT derived from
     // `active_mode` here: the CPU's live level only tracks `active_mode` from a
     // `set_mode` call onward, so at construction (before any Lotura 0xE1 write)
-    // the two can disagree. `predicted_beam` (Task 1.2) must scale in-batch bus
-    // clocks with exactly this ratio to match what the real end-of-batch
-    // `scale_bus` call will use.
-    #[allow(dead_code)] // consumed by Task 1.3, to be removed then
+    // the two can disagree. `predicted_beam` must scale in-batch bus clocks with
+    // exactly this ratio to match what the real end-of-batch `scale_bus` call
+    // will use.
     bus_num_at_batch_start: u32,
-    #[allow(dead_code)] // consumed by Task 1.3, to be removed then
     bus_den_at_batch_start: u32,
 }
 
@@ -9646,9 +9659,11 @@ impl CpuBus for MachineBus<'_> {
     ) -> Result<u32, BusError> {
         // A copy, mirroring `active_mode`: available to any lazy-read arm without
         // re-threading the parameter, per dev_docs/2026-07-02-p4a-lazy-port-device-
-        // time-plan.md Task 0.2. Not read by any arm yet (Slice 0 is pure plumbing).
+        // time-plan.md Task 0.2. Read by the lazy 3DA/3BA/3C2 arm below (Task 1.3).
         self.core_clocks_so_far = core_clocks_so_far;
-        *self.io_touched = true;
+        // Bus-clock trace recording stays unconditional for every port, both timing
+        // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
+        // here, so a lazy read that skipped this would under-predict its own beam.
         self.trace.record(
             BusAccessKind::IoRead,
             u32::from(port),
@@ -9657,6 +9672,7 @@ impl CpuBus for MachineBus<'_> {
         );
 
         if let Some(value) = self.pci.read_io(port, width) {
+            *self.io_touched = true;
             return Ok(value);
         }
 
@@ -9667,6 +9683,8 @@ impl CpuBus for MachineBus<'_> {
             // the IDE/ATA data registers on the same port). This is the canonical VGA
             // mode-set path - a single 16-bit `OUT 0x3C4`/`0x3CE`/`0x3D4` sets an
             // index and its datum - which used to halt the VM with WidthMismatch.
+            // Per-byte io_touched/lazy dispatch happens in the recursive calls below
+            // (each byte re-enters read_io), so nothing to set here directly.
             let mut value = 0u32;
             for i in 0..width.bytes() {
                 let byte = self.read_io(
@@ -9680,26 +9698,67 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if self.video_io_disabled_for_port(port) {
+            *self.io_touched = true;
             return Ok(0xff);
         }
 
         if let Some(value) = self.serial.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
         if let Some(value) = self.serial2.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
         if let Some(value) = self.lpt.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
         if let Some(value) = self.lpt2.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
-        if self.video_io_enabled_for_port(port) {
+        // The VGA status ports (3DA/3BA/3C2) are the ONLY arm in this function that
+        // does not unconditionally set io_touched -- the P4a lazy-read case: in the
+        // Approximate timing class they must NOT end the batch (io_touched stays
+        // false) so a poll loop chains as `run_straight_line` continuations. Static
+        // per-port dispatch: these three port numbers always land here, whether or
+        // not lazy_port_reads is set, so the branch is a single bool test, never a
+        // per-access classification.
+        //
+        // DECISION (batch-retroactive-rate subtlety): a batch shaped [lazy 3DA polls
+        // ... OUT 0x3C2 lowering the dot clock] applies the new dot-clock rate to the
+        // WHOLE batch at batch end (the pre-existing retroactive-rate behavior of
+        // advance_devices/scale_bus), so the batch-end beam can land behind the last
+        // lazy-predicted value this loop observed. Accepted as-is, no compensation:
+        // a dot-clock switch is not beam-continuous on real hardware either, and the
+        // write itself sets io_touched and ends the batch, so no further lazy read
+        // can observe the stale prediction within the same batch.
+        if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.video_io_enabled_for_port(port) {
+            if self.lazy_port_reads {
+                let beam = self.predicted_beam();
+                if let Some(value) = self.video.read_status_port_lazy(port, beam) {
+                    return Ok(u32::from(value));
+                }
+                // Inactive alias (e.g. 3BA polled in a color setup): no side effects,
+                // matching `Vga::read_port`'s existing `status1_port_selected` gate.
+                // Fall through to the same fallback chain the non-lazy path uses.
+            } else {
+                *self.io_touched = true;
+                if let Some(value) = self.video.read_port(port) {
+                    return Ok(u32::from(value));
+                }
+            }
+        } else if self.video_io_enabled_for_port(port) {
             if let Some(value) = self.video.read_port(port) {
+                *self.io_touched = true;
                 return Ok(u32::from(value));
             }
         }
+        // Every arm from here down is unchanged from before Task 1.3: a single
+        // unconditional set covers all of them, exactly like the old top-of-function
+        // set did, since none of them is the lazy 3DA/3BA/3C2 arm handled above.
+        *self.io_touched = true;
         if let Some(opl_port) = opl_port(port) {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
@@ -10076,7 +10135,6 @@ impl MachineBus<'_> {
     /// arithmetic `Machine::predict_dots` uses (same operation order, same
     /// floor/subtract sequence), so a mid-batch peek can never structurally
     /// diverge from what the later real advance will show for the same clocks.
-    #[allow(dead_code)] // consumed by Task 1.3
     fn predicted_beam(&self) -> u64 {
         let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
@@ -19169,6 +19227,7 @@ mod tests {
             wait_states: machine.profile.wait_states,
             cache: &mut machine.cache_model,
             flat_data_cost: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
+            lazy_port_reads: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut machine.io_touched,
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,

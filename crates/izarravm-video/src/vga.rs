@@ -1556,12 +1556,16 @@ impl Vga {
         }
     }
 
-    fn video_status_mux_bits(&self) -> u8 {
-        if self.is_cga_personality() || !beam_display_enable(&self.crtc, self.beam) {
+    /// Off `beam` rather than `self.beam` so `status1_bits`'s lazy caller can
+    /// pass a predicted beam position. Recomputes the pixel color live from
+    /// current VRAM/register state (`render_*_row` read no cached raster), so
+    /// it never depends on `catch_up` having already rendered the given line.
+    fn video_status_mux_bits(&self, beam: u64) -> u8 {
+        if self.is_cga_personality() || !beam_display_enable(&self.crtc, beam) {
             return 0;
         }
-        let line = beam_line(&self.crtc, self.beam);
-        let dot = beam_dot(&self.crtc, self.beam) as usize;
+        let line = beam_line(&self.crtc, beam);
+        let dot = beam_dot(&self.crtc, beam) as usize;
         let color = match self.mode {
             VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(line)[dot],
             VideoMode::Text => self.render_text_row(line)[dot],
@@ -2217,15 +2221,46 @@ impl Vga {
     ///
     /// Reading this register also resets the Attribute Controller address/data
     /// flip-flop so that the next write to 3C0 is treated as an index.
+    ///
+    /// Composed of `status1_side_effects` (the two guest-visible mutations: the
+    /// raster catch-up and the attribute flip-flop reset) plus `status1_bits`
+    /// (the pure bit computation off `self.beam`). The P4a lazy port-read path
+    /// (`MachineBus::read_io`, Approximate timing class) calls the same two
+    /// pieces but passes a predicted beam position to `status1_bits` instead of
+    /// `self.beam`, so both callers share exactly one bit-computation
+    /// implementation.
     pub fn read_status1(&mut self) -> u8 {
+        self.status1_side_effects();
+        let beam = self.beam;
+        self.status1_bits(beam)
+    }
+
+    /// The guest-visible side effects of a 3DA/3BA read: catch the raster up to
+    /// the live beam (like a register write) and reset the Attribute Controller
+    /// address/data flip-flop. Every 3DA/3BA read performs these regardless of
+    /// timing class or lazy/non-lazy dispatch; only the returned status BITS
+    /// differ between the accurate (`self.beam`) and lazy (predicted beam) paths.
+    pub fn status1_side_effects(&mut self) {
         self.catch_up(); // a 3DA read catches the raster up, like a register write
         self.attr.flip_flop_data = false; // reading 3DA resets the flip-flop
+    }
+
+    /// Pure bit computation for Input Status Register 1, off a caller-supplied
+    /// beam dot position instead of the live `self.beam`. The lazy port-read
+    /// path (Approximate timing class) calls this with `MachineBus::predicted_beam()`
+    /// after running `status1_side_effects`; `read_status1` calls it with the
+    /// live `self.beam` unchanged. `video_status_mux_bits` (the DAC pixel
+    /// readback bits) recomputes its color live from current VRAM/register
+    /// state for the given beam rather than reading the `catch_up`-rendered
+    /// `self.work` buffer, so it is equally valid for a beam ahead of what
+    /// `catch_up` has actually rendered.
+    pub fn status1_bits(&self, beam: u64) -> u8 {
         let mut status = 0u8;
         let display_disabled = !self.display_refresh_enabled
             || !self.attr.pas
             || !self.sequencer_outputs_enabled()
             || (self.is_cga_personality() && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0);
-        let display_inactive = display_disabled || !beam_display_enable(&self.crtc, self.beam);
+        let display_inactive = display_disabled || !beam_display_enable(&self.crtc, beam);
         if display_inactive {
             status |= 0x01; // display inactive / safe VRAM window
         }
@@ -2235,10 +2270,10 @@ impl Vga {
             }
             status |= 0x04; // no light pen switch is pressed/attached
         }
-        if beam_vretrace(&self.crtc, self.beam) {
+        if beam_vretrace(&self.crtc, beam) {
             status |= 0x08; // vertical retrace
         }
-        status |= self.video_status_mux_bits();
+        status |= self.video_status_mux_bits(beam);
         status
     }
 
@@ -2246,16 +2281,54 @@ impl Vga {
     ///
     /// Bit 4: the display switch sense bit selected by Misc Output bits 3-2.
     /// Bit 7: vertical retrace active (the CRT interrupt status the BIOS polls).
+    ///
+    /// Composed of `catch_up` (the only guest-visible side effect of a 3C2
+    /// read) plus `status0_bits` (the pure bit computation), mirroring
+    /// `read_status1`/`status1_bits` so the lazy port-read path shares the same
+    /// bit logic.
     pub fn read_status0(&mut self) -> u8 {
         self.catch_up(); // a 3C2 read catches the raster up, like 3DA
+        let beam = self.beam;
+        self.status0_bits(beam)
+    }
+
+    /// Pure bit computation for Input Status Register 0, off a caller-supplied
+    /// beam dot position. See `status1_bits` for why this is safe to call with a
+    /// beam ahead of the live `self.beam`.
+    pub fn status0_bits(&self, beam: u64) -> u8 {
         let mut status = 0u8;
         if self.switch_sense_bit() {
             status |= 0x10;
         }
-        if beam_vretrace(&self.crtc, self.beam) {
+        if beam_vretrace(&self.crtc, beam) {
             status |= 0x80; // vertical retrace -> CRT interrupt status
         }
         status
+    }
+
+    /// Lazy-path status-port read (P4a Task 1.3, Approximate timing class only):
+    /// handles exactly 3DA/3BA/3C2, the same three ports `read_port` routes to
+    /// `read_status1`/`read_status0`, but computes the returned bits from a
+    /// caller-supplied predicted beam (`MachineBus::predicted_beam()`) instead
+    /// of the live `self.beam`. Performs the identical guest-visible side
+    /// effects every read (`status1_side_effects`/`catch_up`) regardless of
+    /// which alias is live, so a poll on the currently-inactive alias (e.g.
+    /// 3BA in a color setup) still gets the side effects but reads back `None`,
+    /// matching `read_port`'s existing `status1_port_selected` gating exactly.
+    /// Returns `None` for any other port (never reached by the caller, which
+    /// dispatches by static port number before calling this).
+    pub fn read_status_port_lazy(&mut self, port: u16, beam: u64) -> Option<u8> {
+        match port {
+            0x3C2 => {
+                self.catch_up();
+                Some(self.status0_bits(beam))
+            }
+            port if self.status1_port_selected(port) => {
+                self.status1_side_effects();
+                Some(self.status1_bits(beam))
+            }
+            _ => None,
+        }
     }
 
     /// Write to a VGA I/O port. Calls `catch_up()` first so any lines already
