@@ -99,7 +99,6 @@ box changes to describe whatever row is highlighted.
 | **Keyboard** | Cycles the active keyboard layout with Left/Right (or Enter). Seventeen layouts are available (US, UK, Spanish, French, German, Italian, and others). |
 | **CPU Mode** | Cycles the boot-time CPU speed with Left/Right (or Enter): 386, 486, 586, then 286, wrapping — the same four classes as the Tab boot menu, in the same order the hardware answers them. |
 | **Peripherals** | Opens a sub-page that re-runs the POST hardware checks live (they are non-destructive) and lists each as PASS or FAIL: Lotura, 8042 KBD, PIT Timer, COM1 UART, SB DSP, OPL FM, and Margo VGA. |
-| **Health** | Opens a sub-page showing voltage rails (+5V, +3.3V, +12V, -12V, VCORE) and two temperatures (CPU, system) as labeled bars with live values. |
 | **Repair Toka-DOS** | Reinstalls Toka-DOS onto the hard disk from the ROM's built-in image, for when the installed copy is damaged or missing. Reports "Toka-DOS repaired" on success. See [Repair Toka-DOS](../toka-dos/using-toka-dos.md#repair-toka-dos) for exactly what this touches. |
 | **Save and Exit** | Commits the working copy — keyboard layout and CPU mode to CMOS, the clock to the real-time clock if you changed it — and reboots. |
 | **Discard and Exit** | Throws away any changes and reboots. Esc on the main menu does the same thing. |
