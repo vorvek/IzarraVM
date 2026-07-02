@@ -572,6 +572,33 @@ impl Timer {
             }
         }
     }
+
+    /// Pure peek (P4a Slice 3 Task 3.1): would `self.expired` be true after
+    /// `micros_elapsed` more microseconds of chip time, without mutating
+    /// `self`? `expired` is sticky (only a register-0x04 bit7 write clears it,
+    /// via `OplChip::write_bank`), so the answer is `self.expired` already, OR
+    /// -- when running -- whether the count would cross 0xff within
+    /// `micros_elapsed`. Mirrors `advance`'s exact step arithmetic
+    /// (accumulated_us + micros, divided by step_us, whole steps added to
+    /// count) without the loop: since only the CROSSING matters (not the
+    /// reload value, which `expired_after` never needs), this is one division
+    /// instead of `advance`'s per-step subtraction loop.
+    fn expired_after(&self, micros_elapsed: u64) -> bool {
+        if self.expired {
+            return true;
+        }
+        if !self.running {
+            return false;
+        }
+        // Saturating u64 arithmetic keeps the function total: a narrowing
+        // `steps as u32` would wrap for steps >= 2^32 (~4 days of guest time in
+        // one peek, unreachable under the ~1 ms batch cap, but saturation costs
+        // nothing), and saturation can only ever err toward `true`, which the
+        // sticky-expired semantics make the correct limit answer anyway.
+        let total_us = self.accumulated_us.saturating_add(micros_elapsed);
+        let steps = total_us / self.step_us;
+        u64::from(self.count).saturating_add(steps) > 0xff
+    }
 }
 
 impl Default for OplChip {
@@ -977,13 +1004,54 @@ impl OplChip {
     /// OPL status byte: bit7 IRQ, bit6 timer-1 flag, bit5 timer-2 flag.
     /// A timer's overflow flag is always reported; the mask bits in register
     /// 0x04 (bit6 = timer 1, bit5 = timer 2) only gate the IRQ line.
+    ///
+    /// Composed of `status_bits` (the pure bit computation) off the live
+    /// timers' `expired` flags. The P4a lazy port-read path (`MachineBus::
+    /// read_io`, Approximate timing class) calls the same pure function with
+    /// timer `expired_after` peeks instead of the live flags, so both callers
+    /// share exactly one bit-composition implementation (the `Vga::
+    /// status1_bits` precedent).
     pub fn status(&self) -> u8 {
+        self.status_bits(self.timer1.expired, self.timer2.expired)
+    }
+
+    /// Lazy-path status byte (P4a Task 3.2, Approximate timing class only):
+    /// the OPL status byte `micros_elapsed` microseconds of chip time from now,
+    /// without stepping either timer. Peeks each timer's `expired_after`
+    /// (Task 3.1) instead of reading the live `expired` flag, then composes the
+    /// result through the same `status_bits` the live `status()` call uses, so
+    /// the two paths can never structurally diverge in bit logic -- only in
+    /// which `expired` inputs they feed it.
+    pub fn status_after(&self, micros_elapsed: u64) -> u8 {
+        let t1_expired = self.timer1.expired_after(micros_elapsed);
+        let t2_expired = self.timer2.expired_after(micros_elapsed);
+        self.status_bits(t1_expired, t2_expired)
+    }
+
+    /// Peek at timer 1's `expired_after` (P4a Slice 3 Task 3.3). Exposed for
+    /// the machine crate's carry-pinning differential test, which needs to
+    /// locate an overflow step boundary without reimplementing `Timer`'s step
+    /// arithmetic; NOT `#[cfg(test)]` because that test lives in a downstream
+    /// crate (`izarravm-machine`), where a `cfg(test)` item in this crate's
+    /// non-dev dependency graph would not exist to link against. Not part of
+    /// the chip's production API, same precedent as `envelope_level` above.
+    #[doc(hidden)]
+    pub fn timer1_expired_after(&self, micros_elapsed: u64) -> bool {
+        self.timer1.expired_after(micros_elapsed)
+    }
+
+    /// Pure bit computation for the OPL status byte, off caller-supplied
+    /// timer-expired flags instead of the live `self.timer1`/`self.timer2`.
+    /// The mask bits (register 0x04 bits 6/5) come from `self.registers`,
+    /// which only a write can change; a write always ends the batch (Task
+    /// 3.2), so a mid-batch predicted status read can never observe a mask
+    /// mid-batch write races with -- the mask is exactly as batch-entry-stable
+    /// here as it is for the live `status()` call above.
+    fn status_bits(&self, t1_expired: bool, t2_expired: bool) -> u8 {
         let control = self.registers[0][0x04];
-        let t1_irq = self.timer1.expired && control & 0x40 == 0;
-        let t2_irq = self.timer2.expired && control & 0x20 == 0;
-        ((t1_irq || t2_irq) as u8) << 7
-            | (self.timer1.expired as u8) << 6
-            | (self.timer2.expired as u8) << 5
+        let t1_irq = t1_expired && control & 0x40 == 0;
+        let t2_irq = t2_expired && control & 0x20 == 0;
+        ((t1_irq || t2_irq) as u8) << 7 | (t1_expired as u8) << 6 | (t2_expired as u8) << 5
     }
 
     pub fn read_port(&self, port: u16) -> Option<u8> {
@@ -1009,6 +1077,91 @@ impl OplChip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Differential test for `Timer::expired_after` (P4a Slice 3 Task 3.1): for
+    /// every `Timer` state in the sweep and every `micros_elapsed`, peeking must
+    /// report the exact same `expired` a real `.advance(micros_elapsed, preset)`
+    /// on a clone would produce, without mutating the original. Sweeps running/
+    /// stopped, already-expired, a spread of accumulated_us/step_us/count/preset,
+    /// and elapsed values straddling the overflow boundary (including 0).
+    #[test]
+    fn expired_after_matches_a_real_advance_on_a_clone() {
+        let step_us_values = [80u64, 320u64];
+        // count never actually reaches 0x100 in reachable Timer state:
+        // `advance` resets it to the preset in the same step that crosses
+        // 0xff, so the invariant is count <= 0xff always.
+        let count_values = [0u16, 1, 0xfe, 0xff];
+        let accumulated_us_values = [0u64, 1, 39, 79, 80, 319, 320];
+        let preset_values = [0u8, 1, 0x7f, 0xfe, 0xff];
+        let elapsed_values = [0u64, 1, 39, 79, 80, 81, 159, 160, 319, 320, 321, 5_000];
+
+        for &step_us in &step_us_values {
+            for &running in &[false, true] {
+                for &already_expired in &[false, true] {
+                    for &count in &count_values {
+                        for &accumulated_us in &accumulated_us_values {
+                            for &preset in &preset_values {
+                                let timer = Timer {
+                                    step_us,
+                                    count,
+                                    accumulated_us,
+                                    running,
+                                    expired: already_expired,
+                                };
+                                for &elapsed in &elapsed_values {
+                                    let mut clone = timer.clone();
+                                    clone.advance(elapsed, preset);
+                                    let expected = clone.expired;
+                                    let got = timer.expired_after(elapsed);
+                                    assert_eq!(
+                                        got, expected,
+                                        "step_us={step_us} running={running} \
+                                         already_expired={already_expired} \
+                                         count={count} accumulated_us={accumulated_us} \
+                                         preset={preset} elapsed={elapsed}: \
+                                         expired_after must match a real advance"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Differential test for `OplChip::status_after` (P4a Slice 3 Task 3.2): the
+    /// predicted status byte at T microseconds from now must equal what a real
+    /// `advance_micros(T)` followed by `status()` would produce, across both
+    /// timers running, various presets/masks, and T values straddling the
+    /// overflow boundary.
+    #[test]
+    fn status_after_matches_a_real_advance_micros_then_status() {
+        let t_values = [0u64, 1, 39, 79, 80, 81, 319, 320, 321, 5_000];
+        let masks = [0x00u8, 0x20, 0x40, 0x60];
+
+        for &mask in &masks {
+            let mut opl = OplChip::default();
+            opl.write_register(0x02, 0xf0); // timer 1 preset
+            opl.write_register(0x03, 0xe0); // timer 2 preset
+            opl.write_register(0x04, 0x80); // reset IRQ flags
+            opl.write_register(0x04, mask | 0x03); // start both timers, apply mask
+
+            for &t in &t_values {
+                let predicted = opl.status_after(t);
+
+                let mut real = opl.clone();
+                real.advance_micros(t);
+                let expected = real.status();
+
+                assert_eq!(
+                    predicted, expected,
+                    "mask={mask:#04x} t={t}: status_after must match a real \
+                     advance_micros(t) then status()"
+                );
+            }
+        }
+    }
 
     #[test]
     fn exp_of_logsin_reconstructs_the_sine_quarter_wave() {

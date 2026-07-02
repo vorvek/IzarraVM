@@ -226,6 +226,165 @@ impl Counter {
         }
     }
 
+    /// The OUT level `clocks` input CLKs from now, without stepping. O(1): a small
+    /// constant number of arithmetic ops and at most one modulo, never a loop over
+    /// `clocks`. Reuses `rise_from`'s per-mode case analysis (the phase math is the
+    /// same; this walks the SAME state machine, just answering "what level" instead
+    /// of "how long until the next rise"). BCD counters return None (see
+    /// `clocks_until_out_rise`: no PC software clocks the PIT in BCD, so this
+    /// conservatively declines rather than modeling decimal half-cycles); a caller
+    /// falls back to the non-lazy path exactly as it already does for a BCD rise
+    /// query. GATE low mid-batch cannot happen without an intervening port write
+    /// (`set_gate` is only reachable from a write path, which already ends the
+    /// batch), so this assumes GATE stays at its current level for the whole
+    /// `clocks` span, matching the batch-boundary contract `predicted_beam` and
+    /// `clocks_until_out_rise` already rely on.
+    ///
+    /// Wired to production via `Pit::out_after` (P4a Task 2.3): the lazy port
+    /// 0x61 bits 4/5 read peeks channel 1 and channel 2 through it.
+    fn out_after(&self, clocks: u64) -> Option<bool> {
+        if self.bcd {
+            return None;
+        }
+        match self.state {
+            // No live count: OUT cannot move without a guest write (arms a new
+            // count) or a GATE edge (neither is a CLK), so it holds its level for
+            // any `clocks` span within one batch.
+            CounterState::Inactive | CounterState::WaitGate => Some(self.out),
+            CounterState::LoadDelay => {
+                if !self.gate {
+                    return Some(self.out);
+                }
+                if clocks == 0 {
+                    return Some(self.out);
+                }
+                // One CLK loads (no edge); the rest counts from the reload value.
+                // Mode 0's LoadDelay always enters with OUT low (write_count forces
+                // it there for the LSB-then-MSB first byte, and write_control does
+                // for every mode), matching step's own load-then-count sequencing.
+                let reload = u64::from(self.effective_reload());
+                Some(Self::counting_out_after(
+                    self.mode,
+                    reload,
+                    reload,
+                    self.out,
+                    clocks - 1,
+                ))
+            }
+            CounterState::Counting => {
+                if !self.gate {
+                    return Some(self.out);
+                }
+                Some(Self::counting_out_after(
+                    self.mode,
+                    u64::from(self.count),
+                    u64::from(self.effective_reload()),
+                    self.out,
+                    clocks,
+                ))
+            }
+        }
+    }
+
+    /// OUT level `clocks` CLKs after a Counting state with counting element
+    /// `value` at level `out`, per mode. Binary radix, GATE already high (the
+    /// caller handles Inactive/WaitGate/GATE-low/BCD). Mirrors `rise_from`'s case
+    /// split mode for mode so the two stay obviously in sync; unlike `rise_from`
+    /// this never returns early on "no more edges" (modes 0/1/4/5 with OUT already
+    /// high) because the level itself, not a distance to the next edge, is being
+    /// asked for -- once OUT settles it just holds at that level.
+    ///
+    /// Relies on the state-machine invariant (true for every state `step_counting`
+    /// actually produces, verified against the oracle): `value <= 1` at a Counting
+    /// state boundary implies `out == false` in modes 2 and 3. The chip only sets
+    /// `out = false` in the same step that decrements the counting element to 1
+    /// (mode 2) or trims it into the `<= 1` range on an OUT-low half-clock (mode
+    /// 3), so a stored state never has both `value <= 1` and `out == true`
+    /// together; an out-of-spec reload of 0 or 1 still falls out of these
+    /// equations without a panic (reload 0 is impossible, `effective_reload`
+    /// always returns 0x10000 for a raw 0; reload 1 is the datasheet's own
+    /// "illegal" case, handled explicitly below).
+    fn counting_out_after(mode: u8, value: u64, reload: u64, out: bool, clocks: u64) -> bool {
+        if clocks == 0 {
+            return out;
+        }
+        match mode {
+            // Modes 0/1: OUT rises once, at terminal count, and then holds (mode 0
+            // keeps counting with OUT high; a mode-1 pulse's Counting state ends
+            // there). OUT already high, or a degenerate v == 0 entry (mirrors
+            // rise_from's None -- no rise within the modeled range) holds forever.
+            0 | 1 => {
+                if out || value == 0 {
+                    out
+                } else {
+                    clocks >= value
+                }
+            }
+            2 => {
+                if reload <= 1 {
+                    // The datasheet's illegal input (reload 0 is impossible via
+                    // effective_reload; reload 1 reloads every CLK): OUT never
+                    // drops, mirroring rise_from's own "Illegal reload 1" branch.
+                    return true;
+                }
+                // Invariant: value <= 1 at a stored Counting state implies out ==
+                // false (see the doc comment above). So out == true here means
+                // value > 1: find the CLK where the counting element reaches 1
+                // (the one low CLK per period), then fold the remainder into one
+                // period of length `reload`.
+                let next_low_at = if out { value - 1 } else { reload };
+                if clocks < next_low_at {
+                    return true;
+                }
+                let phase = (clocks - next_low_at) % reload;
+                phase != 0
+            }
+            3 => {
+                // CLKs until the current half-cycle's toggle, then fold the rest
+                // of `clocks` into at most one full period (high half + low half,
+                // which the odd-count asymmetry still sums to exactly `reload`
+                // per mode3_odd_count_period_is_exact) via one modulo, then at
+                // most one more half-length comparison -- O(1), never a loop over
+                // `clocks` or over elapsed periods.
+                let to_toggle = Self::mode3_half(value, out);
+                if clocks < to_toggle {
+                    return out;
+                }
+                let rem = clocks - to_toggle;
+                let level = !out;
+                if reload <= 1 {
+                    // The datasheet's illegal mode-3 input (count 2 is the
+                    // minimum legal reload): mode3_half floors both phases to 1
+                    // clock each, so the real period is 2 CLKs (one high, one
+                    // low), not `reload`'s single clock -- the "halves sum to
+                    // reload" identity the general branch leans on does not hold
+                    // here, so this folds the remainder by 2 directly instead.
+                    return if rem % 2 == 0 { level } else { !level };
+                }
+                let phase = rem % reload;
+                let half = Self::mode3_half(reload, level);
+                if phase < half { level } else { !level }
+            }
+            // Modes 4/5: count down with OUT high, strobe low for one CLK at
+            // terminal (the clock where the count reaches 0), then rise on the
+            // CLK after and hold (the one-shot's Counting state ends there).
+            4 | 5 => {
+                if !out {
+                    true
+                } else if value == 0 {
+                    out // degenerate entry, mirrors rise_from's None: never strobes
+                } else {
+                    match clocks.cmp(&value) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => false,
+                        std::cmp::Ordering::Greater => true,
+                    }
+                }
+            }
+            _ => out,
+        }
+    }
+
     fn write_control(&mut self, value: u8) {
         let rw_field = (value >> 4) & 0x3;
         if rw_field == 0 {
@@ -648,6 +807,15 @@ impl Pit {
     pub(crate) fn channel_out(&self, channel: usize) -> bool {
         self.counters.get(channel).map(|c| c.out).unwrap_or(false)
     }
+
+    /// The analytic live OUT level of `channel` `clocks` input CLKs from now,
+    /// without stepping (P4a Task 2.3: the lazy port 0x61 bits 4/5 read).
+    /// `None` when the channel is out of range or the counter is BCD (see
+    /// `Counter::out_after`); the caller falls back to a real `tick` in either
+    /// case.
+    pub(crate) fn out_after(&self, channel: usize, clocks: u64) -> Option<bool> {
+        self.counters.get(channel).and_then(|c| c.out_after(clocks))
+    }
 }
 
 #[cfg(test)]
@@ -841,6 +1009,192 @@ mod tests {
                 pit.clocks_until_channel0_irq()
             );
             pit.tick(1);
+        }
+    }
+
+    /// Brute-force oracle for the analytic out_after: clone and step `clocks`
+    /// times, returning the OUT level afterward. Unbounded in `clocks` (unlike
+    /// `simulated_rise`, which only needs to find the first edge) since the
+    /// differential test below queries multi-period distances directly.
+    fn simulated_out_after(counter: &Counter, clocks: u64) -> bool {
+        let mut probe = counter.clone();
+        for _ in 0..clocks {
+            probe.step();
+        }
+        probe.out
+    }
+
+    #[test]
+    fn analytic_out_after_matches_the_step_simulation_across_modes_and_phases() {
+        // Task 2.1 spike: every mode x a spread of reloads (even, odd, minimum
+        // legal, illegal, full-range) x every phase across two-plus periods x a
+        // sweep of queried distances (0, 1, boundary-adjacent, a large
+        // multi-period jump), matching out_after against clone-and-step.
+        for mode in 0..=5u8 {
+            for reload in [2u16, 3, 4, 5, 6, 7, 18, 100, 101, 255, 1, 0] {
+                let mut pit = Pit::default();
+                pit.write_port(0x43, 0x30 | (mode << 1));
+                if matches!(mode, 1 | 5) {
+                    pit.set_gate(0, false); // arm the trigger edge below
+                }
+                pit.write_port(0x40, (reload & 0xff) as u8);
+                pit.write_port(0x40, (reload >> 8) as u8);
+                if matches!(mode, 1 | 5) {
+                    pit.set_gate(0, true); // rising edge starts the one-shot
+                }
+                let phases = if reload == 0 {
+                    6
+                } else {
+                    (2 * u64::from(reload) + 6).min(120)
+                };
+                let period = if reload == 0 {
+                    65536
+                } else {
+                    u64::from(reload)
+                };
+                let sweeps: Vec<u64> = [
+                    0,
+                    1,
+                    2,
+                    period.saturating_sub(1),
+                    period,
+                    period + 1,
+                    2 * period,
+                    2 * period + 1,
+                    5 * period + 3,
+                ]
+                .into_iter()
+                .collect();
+                for phase in 0..phases {
+                    for &clocks in &sweeps {
+                        assert_eq!(
+                            pit.counters[0].out_after(clocks),
+                            Some(simulated_out_after(&pit.counters[0], clocks)),
+                            "mode {mode} reload {reload} phase {phase} clocks {clocks}"
+                        );
+                    }
+                    pit.tick(1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_out_after_zero_clocks_is_the_current_level() {
+        // clocks == 0 must be a pure readback, in every state: Inactive,
+        // WaitGate, LoadDelay, and Counting.
+        let mut pit = Pit::default(); // fresh counter 0 is Inactive
+        assert_eq!(pit.counters[0].out_after(0), Some(pit.counters[0].out));
+
+        pit.write_port(0x43, CW_MODE1); // arms WaitGate
+        assert_eq!(pit.counters[0].out_after(0), Some(pit.counters[0].out));
+
+        program_ch0(&mut pit, CW_MODE3, 4); // LoadDelay immediately after the count write
+        assert_eq!(pit.counters[0].out_after(0), Some(pit.counters[0].out));
+
+        pit.tick(1); // now Counting
+        assert_eq!(pit.counters[0].out_after(0), Some(pit.counters[0].out));
+    }
+
+    #[test]
+    fn analytic_out_after_holds_while_gate_is_low() {
+        // GATE low pauses counting in every mode this model runs (0, 2, 3, 4);
+        // out_after must hold the current level for any queried distance, since
+        // only a port write (which already ends the batch) can raise GATE again.
+        for mode in [0u8, 2, 3, 4] {
+            let mut pit = Pit::default();
+            pit.write_port(0x43, 0x30 | (mode << 1));
+            pit.write_port(0x40, 50);
+            pit.write_port(0x40, 0);
+            pit.tick(5);
+            pit.set_gate(0, false);
+            let level = pit.counters[0].out;
+            for clocks in [0u64, 1, 100, 100_000] {
+                assert_eq!(
+                    pit.counters[0].out_after(clocks),
+                    Some(level),
+                    "mode {mode} clocks {clocks}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_out_after_matches_after_a_gate_retrigger_in_modes_1_and_5() {
+        // Modes 1/5 are retriggerable one-shots: a GATE rising edge mid-batch
+        // starts a fresh pulse from a Counting (not LoadDelay) state. out_after
+        // must track the post-retrigger phase, not the pre-trigger one.
+        for (cw, mode) in [(CW_MODE1, 1u8), (CW_MODE5, 5u8)] {
+            let mut pit = Pit::default();
+            program_ch0(&mut pit, cw, 6);
+            pit.set_gate(0, false);
+            pit.set_gate(0, true); // first trigger
+            pit.tick(3); // partway through the first pulse
+            pit.set_gate(0, false);
+            pit.set_gate(0, true); // retrigger: count reloads to 6, Counting again
+            for clocks in [0u64, 1, 2, 5, 6, 7, 12, 13] {
+                assert_eq!(
+                    pit.counters[0].out_after(clocks),
+                    Some(simulated_out_after(&pit.counters[0], clocks)),
+                    "mode {mode} clocks {clocks}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_out_after_holds_in_wait_gate() {
+        // Modes 1/5 armed but never triggered: WaitGate holds OUT at its current
+        // level for any queried distance, agreeing with the oracle (no CLK moves
+        // an untriggered one-shot).
+        for cw in [CW_MODE1, CW_MODE5] {
+            let mut pit = Pit::default();
+            program_ch0(&mut pit, cw, 6);
+            pit.tick(1); // WaitGate: GATE never rose
+            let level = pit.counters[0].out;
+            for clocks in [0u64, 1, 100, 100_000] {
+                assert_eq!(pit.counters[0].out_after(clocks), Some(level));
+                assert_eq!(simulated_out_after(&pit.counters[0], clocks), level);
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_out_after_declines_bcd_counters() {
+        // BCD is declined by design, same precedent as clocks_until_out_rise: a
+        // conservative None sends the caller back to the non-lazy path.
+        let mut pit = Pit::default();
+        pit.write_port(0x43, CW_MODE2 | 1); // ch0 mode 2, BCD
+        pit.write_port(0x40, 0x50);
+        pit.write_port(0x40, 0x00);
+        pit.tick(1);
+        assert_eq!(pit.counters[0].out_after(10), None);
+    }
+
+    #[test]
+    fn analytic_out_after_matches_on_channel1_and_channel2_defaults() {
+        // The actual Slice-2 call sites: channel 1 (DRAM refresh, mode 2) and
+        // channel 2 (speaker, mode 3), the two channels port 0x61 bits 4/5 read.
+        let mut pit = Pit::default(); // channel 1 pre-seeded mode 2 count 18
+        for clocks in [0u64, 1, 5, 17, 18, 19, 36, 37, 90, 91] {
+            assert_eq!(
+                pit.counters[1].out_after(clocks),
+                Some(simulated_out_after(&pit.counters[1], clocks)),
+                "channel 1 clocks {clocks}"
+            );
+        }
+
+        pit.write_port(0x43, 0xB6); // counter 2, LSB+MSB, mode 3, binary
+        pit.set_gate(2, true);
+        pit.write_port(0x42, 0x18); // 0x1518, an odd reload like PoP's speaker driver
+        pit.write_port(0x42, 0x15);
+        pit.tick(1);
+        for clocks in [0u64, 1, 2, 100, 0x1518 / 2, 0x1518, 0x1518 * 2 + 7] {
+            assert_eq!(
+                pit.counters[2].out_after(clocks),
+                Some(simulated_out_after(&pit.counters[2], clocks)),
+                "channel 2 clocks {clocks}"
+            );
         }
     }
 

@@ -1414,6 +1414,19 @@ pub struct Machine {
     // Where the unit tester's Snapshot command writes PPM frames, set by the
     // host. None disables snapshots (the command becomes a no-op).
     test_snapshot_path: Option<std::path::PathBuf>,
+    // Test-only observation seam for the batch loop's prior_runs_core_clocks
+    // updates (P4a Slice 1 Task 1.2 review finding 1). One inner Vec per batch
+    // (pushed at batch entry); each element is the value the loop pushed into
+    // `MachineBus::prior_runs_core_clocks` before one `run_straight_line` call.
+    // Compiled out of release builds entirely, so the hot loop pays nothing.
+    #[cfg(test)]
+    test_prior_core_pushes: Vec<Vec<u64>>,
+    // Test-only: the final batch core total (`outcome.core_clocks`, the core
+    // component of the batch-end `step`) per batch, parallel to
+    // `test_prior_core_pushes`. Lets the pin test check every per-run push stayed
+    // within the total that later fed advance_devices.
+    #[cfg(test)]
+    test_batch_core_totals: Vec<u64>,
 }
 
 /// The GUI virtual pointer space the relative-delta synthesis spans: x 0..639,
@@ -1669,6 +1682,10 @@ impl Machine {
             last_abs: (MOUSE_GUEST_CENTER_X, MOUSE_GUEST_CENTER_Y),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
+            #[cfg(test)]
+            test_prior_core_pushes: Vec::new(),
+            #[cfg(test)]
+            test_batch_core_totals: Vec::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -2342,6 +2359,14 @@ impl Machine {
     }
 
     fn make_bus(&mut self) -> MachineBus<'_> {
+        // Captured before the struct literal below since video/trace are also
+        // mutably borrowed by other fields in that same literal.
+        let beam_at_batch_start = self.video.beam_dots();
+        let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
+        // Read from self.cpu.level(), the same source scale_bus reads from, not
+        // cpu_level_for_mode(self.active_mode) -- see run_until_clock's matching
+        // capture for why the two can diverge.
+        let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
         MachineBus {
             memory: &mut self.memory,
             ram_lookup: &mut self.ram_lookup,
@@ -2386,10 +2411,24 @@ impl Machine {
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
             flat_data_cost: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
+            lazy_port_reads: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut self.io_touched,
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
             core_clocks_so_far: 0,
+            prior_runs_core_clocks: 0,
+            elapsed_clocks_at_batch_start: self.elapsed_clocks,
+            vga_dots_at_batch_start: self.vga_dots,
+            beam_at_batch_start,
+            trace_elapsed_at_batch_start,
+            bus_rem_at_batch_start: self.bus_rem,
+            inv_clock_at_batch_start: self.timing.inv_clock,
+            bus_num_at_batch_start,
+            bus_den_at_batch_start,
+            pit_clocks_at_batch_start: self.pit_clocks,
+            pit_per_clock_at_batch_start: self.timing.pit_per_clock,
+            opl_micros_at_batch_start: self.opl_micros,
+            micros_per_clock_at_batch_start: self.timing.micros_per_clock,
         }
     }
 
@@ -7747,17 +7786,28 @@ impl Machine {
     /// remainders forward for the OPL timers (microseconds), the PIT counters,
     /// and the Margo blit engine (nanoseconds).
     fn advance_devices(&mut self, clocks: u64) {
-        self.opl_micros += clocks as f64 * self.timing.micros_per_clock;
-        let whole = self.opl_micros.floor();
-        self.opl.advance_micros(whole as u64);
-        self.opl_micros -= whole;
+        // The one shared fractional-advance formula (`advance_fractional`), same
+        // discipline as the PIT block below: the lazy OPL status peek
+        // (`MachineBus::elapsed_opl_micros`) calls the same function with the
+        // same batch-entry carry and micros_per_clock, so its mid-batch answer
+        // floors exactly where this real advance will.
+        let (whole, remainder) =
+            advance_fractional(self.opl_micros, clocks, self.timing.micros_per_clock);
+        self.opl.advance_micros(whole);
+        self.opl_micros = remainder;
 
         // The DSP reset-settle countdown advances with emulated time so a
-        // detection routine's delay loop sees 0xAA become available.
-        self.dsp_micros += clocks as f64 * self.timing.micros_per_clock;
-        let whole = self.dsp_micros.floor();
-        self.dsp.advance_micros(whole);
-        self.dsp_micros -= whole;
+        // detection routine's delay loop sees 0xAA become available. No lazy
+        // twin yet; routed through the shared formula anyway so the last
+        // hand-synchronized copy of its arithmetic is gone. `Dsp::
+        // advance_micros` takes f64, and `whole as f64` reproduces the old
+        // directly-passed `.floor()` value exactly: the u64 round-trip is
+        // lossless for any integral value below 2^53 (~104 days of guest
+        // microseconds in a single advance, unreachable under the batch caps).
+        let (whole, remainder) =
+            advance_fractional(self.dsp_micros, clocks, self.timing.micros_per_clock);
+        self.dsp.advance_micros(whole as f64);
+        self.dsp_micros = remainder;
 
         // DMA playback is clock-driven: accrue DSP sample phases per CPU clock
         // and, for each whole sample, advance the block and buffer the rendered
@@ -7918,13 +7968,17 @@ impl Machine {
 
         let ch2_before = self.pit.channel_out(2);
         let pit_fraction_before = self.pit_clocks;
-        self.pit_clocks += clocks as f64 * self.timing.pit_per_clock;
-        let whole = self.pit_clocks.floor();
-        self.pit_clocks -= whole;
+        // The one shared fractional-advance formula (`advance_fractional`): the
+        // lazy port 0x61 peek (`MachineBus::elapsed_pit_clocks`) calls the same
+        // function with the same batch-entry carry and pit_per_clock, so its
+        // mid-batch answer floors exactly where this real advance will.
+        let (whole, remainder) =
+            advance_fractional(self.pit_clocks, clocks, self.timing.pit_per_clock);
+        self.pit_clocks = remainder;
         self.speaker_transitions.clear();
         let edges =
             self.pit
-                .tick_recording_out_transitions(whole as u64, 2, &mut self.speaker_transitions);
+                .tick_recording_out_transitions(whole, 2, &mut self.speaker_transitions);
         // Per-edge forwarding, same multi-edge contract as the DSP loop above:
         // N channel-0 edges in one step issue N requests and the PIC's IRR
         // coalesces them into the one interrupt the guest can actually take.
@@ -8039,17 +8093,20 @@ impl Machine {
 
     /// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
     /// fractional-dot accumulator `dots_owed`. Pure: does not mutate `self`. The
-    /// SAME function both `advance_devices` (the real, mutating step above) and a
-    /// future lazy port-read peek (Slice 1) call, so the two paths cannot
-    /// structurally diverge: "no time travel" (a lazy read predicting state the
-    /// later real advance would contradict) becomes a property of sharing one
-    /// implementation, not an invariant maintained by hand across two call sites.
-    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3.
+    /// SAME arithmetic (via `predict_dots_core`) both `advance_devices` (the real,
+    /// mutating step above) and the Slice 1 lazy port-read peek
+    /// (`MachineBus::predicted_beam`) apply, so the two paths cannot structurally
+    /// diverge: "no time travel" (a lazy read predicting state the later real
+    /// advance would contradict) becomes a property of sharing one implementation,
+    /// not an invariant maintained by hand across two call sites.
+    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3/1.2.
     fn predict_dots(&self, clocks: u64, dots_owed: f64) -> (u64, f64) {
-        let raw =
-            dots_owed + clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
-        let whole = raw.floor();
-        (whole as u64, raw - whole)
+        predict_dots_core(
+            clocks,
+            dots_owed,
+            self.video.dot_clock_hz(),
+            self.timing.inv_clock,
+        )
     }
 
     /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
@@ -8629,6 +8686,30 @@ impl Machine {
             self.io_touched = false;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
+            // Batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
+            // Task 1.1). Captured here, before the fields below are moved into the
+            // destructure, so they reflect live machine state at the moment this
+            // batch's MachineBus is built (the one that matters for Slice 1).
+            let elapsed_clocks_at_batch_start = self.elapsed_clocks;
+            let vga_dots_at_batch_start = self.vga_dots;
+            let beam_at_batch_start = self.video.beam_dots();
+            let trace_elapsed_at_batch_start = trace_before;
+            let bus_rem_at_batch_start = self.bus_rem;
+            let inv_clock_at_batch_start = self.timing.inv_clock;
+            let pit_clocks_at_batch_start = self.pit_clocks;
+            let pit_per_clock_at_batch_start = self.timing.pit_per_clock;
+            let opl_micros_at_batch_start = self.opl_micros;
+            let micros_per_clock_at_batch_start = self.timing.micros_per_clock;
+            // bus_timing's (num, den), read from the SAME source scale_bus reads
+            // from (self.cpu.level()) -- not cpu_level_for_mode(self.active_mode).
+            // The two can diverge: the CPU's live level only tracks active_mode
+            // from a set_mode (Lotura 0xE1) call onward; at construction the CPU
+            // starts at its own default level until the first mode switch. Reading
+            // active_mode here would silently mispredict during that window.
+            let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
+            // Test seam: open this batch's per-run prior_runs_core_clocks push log.
+            #[cfg(test)]
+            self.test_prior_core_pushes.push(Vec::new());
             // A20 is a machine-layer event the CPU never sees directly, yet toggling it changes
             // which physical bytes back a linear address near the 1 MB wrap. Any A20 write (port
             // 0x92, the 8042, INT 15h, XMS) sets io_touched or is an HLE INT, so it ends this step;
@@ -8710,6 +8791,8 @@ impl Machine {
                     io_touched,
                     device_wrote_memory,
                     direct_map_changed,
+                    #[cfg(test)]
+                    test_prior_core_pushes,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -8756,10 +8839,24 @@ impl Machine {
                     wait_states: profile.wait_states,
                     cache: cache_model,
                     flat_data_cost: matches!(active_mode.timing_class(), TimingClass::Approximate),
+                    lazy_port_reads: matches!(active_mode.timing_class(), TimingClass::Approximate),
                     io_touched,
                     device_wrote_memory,
                     direct_map_changed,
                     core_clocks_so_far: 0,
+                    prior_runs_core_clocks: 0,
+                    elapsed_clocks_at_batch_start,
+                    vga_dots_at_batch_start,
+                    beam_at_batch_start,
+                    trace_elapsed_at_batch_start,
+                    bus_rem_at_batch_start,
+                    inv_clock_at_batch_start,
+                    bus_num_at_batch_start,
+                    bus_den_at_batch_start,
+                    pit_clocks_at_batch_start,
+                    pit_per_clock_at_batch_start,
+                    opl_micros_at_batch_start,
+                    micros_per_clock_at_batch_start,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -8814,6 +8911,23 @@ impl Machine {
                         // RUN at the edge, and the machine's check below ends the BATCH so the next
                         // batch services the interrupt. Both are needed.
                         let remaining = cap.saturating_sub(u64::from(batch_core));
+                        // Publish the batch-scoped core clocks accumulated so far
+                        // (the interrupt-service charge + every prior run of this
+                        // batch, exactly the core component the batch-end step
+                        // will combine) so a lazy port-read prediction inside the
+                        // coming run can add the RUN-scoped core_clocks_so_far on
+                        // top and see a batch-total that is monotone across run
+                        // boundaries. See MachineBus::prior_runs_core_clocks.
+                        bus.prior_runs_core_clocks = u64::from(batch_core);
+                        // Logs the bus field itself (not an independent `batch_core`
+                        // read) so `batch_loop_publishes_prior_runs_core_clocks_before_every_run`
+                        // actually fails if the store above is ever deleted or the
+                        // publish drifts from the field a lazy prediction reads.
+                        #[cfg(test)]
+                        test_prior_core_pushes
+                            .last_mut()
+                            .expect("opened at batch entry")
+                            .push(bus.prior_runs_core_clocks);
                         match cpu.run_straight_line(&mut bus, remaining) {
                             Ok(o) => {
                                 batch_core = batch_core.saturating_add(o.core_clocks);
@@ -8854,6 +8968,11 @@ impl Machine {
 
             match outcome {
                 Ok(outcome) => {
+                    // Test seam: the final core total the batch-end step consumes,
+                    // parallel to this batch's test_prior_core_pushes entry.
+                    #[cfg(test)]
+                    self.test_batch_core_totals
+                        .push(u64::from(outcome.core_clocks));
                     let bus_clocks = self.trace.elapsed_clocks() - trace_before;
                     // Scale the bus portion per mode (B-T10). core_clocks is already
                     // scaled by the CPU's level_timing; this applies the third lever
@@ -9058,6 +9177,15 @@ struct MachineBus<'a> {
     /// class (286/386) and forced false by the bandwidth diagnostic so its tier
     /// curve stays on the accurate model.
     flat_data_cost: bool,
+    /// True in the Approximate timing class (486/586), computed identically to
+    /// `flat_data_cost` (same `active_mode.timing_class()` match, same
+    /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`
+    /// (P4a Task 1.3): when true, a status-port read does not set `io_touched`
+    /// and computes its returned bits from `predicted_beam()` instead of the
+    /// live device beam; when false (Accurate class, 286/386) the port keeps
+    /// the byte-identical pre-Task-1.3 behavior. A single bool test at the top
+    /// of the one arm that branches on it, not a per-access classification.
+    lazy_port_reads: bool,
     // Set true by any port I/O this batch. The run loop batches straight-line
     // instructions and services devices once per batch; a port access (a PIT
     // latch read, 0x3DA retrace poll, RTC read, a PIT/PIC/DSP/mode write) reads
@@ -9074,6 +9202,92 @@ struct MachineBus<'a> {
     // device-time-plan.md Task 0.2). Initialized to 0 at bus construction; the
     // first read_io call overwrites it before any arm can observe it.
     core_clocks_so_far: u64,
+    // CPU core clocks accumulated by everything BEFORE the current straight-line
+    // run of this batch: the once-per-batch interrupt-service charge plus every
+    // completed run_straight_line call's core_clocks. `core_clocks_so_far` above
+    // is RUN-scoped (it resets to 0 at the first instruction of every run), but a
+    // batch chains many runs and only the batch total feeds the batch-end `step`;
+    // a prediction that used the run-scoped term alone would silently drop the
+    // earlier runs' core clocks and go non-monotone across run boundaries.
+    // Initialized 0 at batch entry; the batch loop rewrites it with the live
+    // `batch_core` accumulator immediately before each run_straight_line call, so
+    // `prior_runs_core_clocks + core_clocks_so_far` is always the batch-scoped
+    // core total as of the in-flight instruction, mirroring exactly the core
+    // component of the batch-end step (nothing more, nothing less).
+    prior_runs_core_clocks: u64,
+    // Five batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
+    // Task 1.1: dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Each is a
+    // copy of the corresponding live Machine/BusTrace value at the moment this
+    // bus is constructed (once per batch), never mutated afterward.
+    // `vga_dots_at_batch_start`/`beam_at_batch_start`/`trace_elapsed_at_batch_start`/
+    // `bus_rem_at_batch_start` are consumed by `predicted_beam`, which the lazy
+    // 3DA/3BA/3C2 arm in `read_io` calls (Task 1.3). `elapsed_clocks_at_batch_start`
+    // is not needed by that formula (predicted_beam derives its clock total from
+    // core_clocks + trace bus clocks directly, not from elapsed_clocks); it stays
+    // for construction-site symmetry and is pinned directly by
+    // `predicted_beam_at_batch_start_equals_the_unmutated_beam`.
+    #[allow(dead_code)] // pinned by its own test, not read by predicted_beam's formula
+    elapsed_clocks_at_batch_start: u64,
+    vga_dots_at_batch_start: f64,
+    beam_at_batch_start: u64,
+    trace_elapsed_at_batch_start: u64,
+    bus_rem_at_batch_start: u64,
+    // The active mode's `1 / clock_hz` factor (Machine::timing.inv_clock), copied
+    // at bus construction like the five batch-entry snapshots above. Needed by
+    // `predicted_beam` to call the shared `predict_dots_core` formula; MachineBus
+    // has no `&Machine` to read `self.timing` from directly. A copy field rather
+    // than a per-call recompute: `TimingFactors::for_clock` only changes on a
+    // Lotura mode write (`set_mode`), so it is batch-entry-stable exactly like
+    // `active_mode` above it.
+    inv_clock_at_batch_start: f64,
+    // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from
+    // the SAME source `scale_bus` reads (`self.cpu.level()`), NOT derived from
+    // `active_mode` here: the CPU's live level only tracks `active_mode` from a
+    // `set_mode` call onward, so at construction (before any Lotura 0xE1 write)
+    // the two can disagree. `predicted_beam` must scale in-batch bus clocks with
+    // exactly this ratio to match what the real end-of-batch `scale_bus` call
+    // will use.
+    bus_num_at_batch_start: u32,
+    bus_den_at_batch_start: u32,
+    // The fractional PIT-input-clock accumulator (Machine::pit_clocks), copied at
+    // bus construction like the snapshots above (P4a Task 2.3: the lazy port 0x61
+    // bits 4/5 read). `advance_devices` is the only place that mutates
+    // `pit_clocks` or steps `self.pit`, and it only runs at batch end / wake step
+    // (never mid-batch), so this snapshot plus the in-batch clock total
+    // (identical construction to `predicted_beam`'s) is enough to reproduce
+    // exactly the elapsed-PIT-clocks `whole` value the real `advance_devices`
+    // would compute for the same total, via the shared `advance_fractional`
+    // formula.
+    pit_clocks_at_batch_start: f64,
+    // The active mode's PIT_INPUT_HZ / clock_hz factor (Machine::timing.
+    // pit_per_clock), copied at bus construction like `inv_clock_at_batch_start`
+    // above and for the same reason (batch-entry-stable, only a Lotura mode
+    // write recomputes TimingFactors). Snapshotted RATHER than recomputed from
+    // PIT_INPUT_HZ and inv_clock: the real `advance_devices` multiplies by this
+    // exact pre-divided f64, and re-deriving it as `PIT_INPUT_HZ as f64 *
+    // inv_clock` is a DIFFERENT factoring whose product floor-diverges from the
+    // real one at the IEEE-f64 level (see `advance_fractional`'s doc comment).
+    pit_per_clock_at_batch_start: f64,
+    // The fractional OPL-timer-microsecond accumulator (Machine::opl_micros),
+    // copied at bus construction like `pit_clocks_at_batch_start` above (P4a
+    // Slice 3 Task 3.2: the lazy OPL status read). `advance_devices` is the
+    // only place that mutates `opl_micros` or steps `self.opl`'s timers, and it
+    // only runs at batch end / wake step (never mid-batch), so this snapshot
+    // plus the in-batch clock total (`in_batch_clocks`, the same T
+    // `predicted_beam`/`elapsed_pit_clocks` use) is enough to reproduce exactly
+    // the elapsed-OPL-microseconds `whole` value the real `advance_devices`
+    // would compute for the same total, via the shared `advance_fractional`
+    // formula.
+    opl_micros_at_batch_start: f64,
+    // The active mode's micros-per-clock factor (Machine::timing.
+    // micros_per_clock), copied at bus construction like
+    // `pit_per_clock_at_batch_start` above and for the same reason
+    // (batch-entry-stable, only a Lotura mode write recomputes TimingFactors).
+    // The real `advance_devices` OPL step multiplies by exactly this field, so
+    // a lazy peek must snapshot it rather than re-derive an equal-valued
+    // product through a different factoring (see `advance_fractional`'s doc
+    // comment on why that would floor-diverge).
+    micros_per_clock_at_batch_start: f64,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -9527,9 +9741,11 @@ impl CpuBus for MachineBus<'_> {
     ) -> Result<u32, BusError> {
         // A copy, mirroring `active_mode`: available to any lazy-read arm without
         // re-threading the parameter, per dev_docs/2026-07-02-p4a-lazy-port-device-
-        // time-plan.md Task 0.2. Not read by any arm yet (Slice 0 is pure plumbing).
+        // time-plan.md Task 0.2. Read by the lazy 3DA/3BA/3C2 arm below (Task 1.3).
         self.core_clocks_so_far = core_clocks_so_far;
-        *self.io_touched = true;
+        // Bus-clock trace recording stays unconditional for every port, both timing
+        // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
+        // here, so a lazy read that skipped this would under-predict its own beam.
         self.trace.record(
             BusAccessKind::IoRead,
             u32::from(port),
@@ -9538,6 +9754,7 @@ impl CpuBus for MachineBus<'_> {
         );
 
         if let Some(value) = self.pci.read_io(port, width) {
+            *self.io_touched = true;
             return Ok(value);
         }
 
@@ -9548,6 +9765,8 @@ impl CpuBus for MachineBus<'_> {
             // the IDE/ATA data registers on the same port). This is the canonical VGA
             // mode-set path - a single 16-bit `OUT 0x3C4`/`0x3CE`/`0x3D4` sets an
             // index and its datum - which used to halt the VM with WidthMismatch.
+            // Per-byte io_touched/lazy dispatch happens in the recursive calls below
+            // (each byte re-enters read_io), so nothing to set here directly.
             let mut value = 0u32;
             for i in 0..width.bytes() {
                 let byte = self.read_io(
@@ -9561,30 +9780,140 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if self.video_io_disabled_for_port(port) {
+            *self.io_touched = true;
             return Ok(0xff);
         }
 
         if let Some(value) = self.serial.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
         if let Some(value) = self.serial2.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
         if let Some(value) = self.lpt.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
         if let Some(value) = self.lpt2.read_port(port) {
+            *self.io_touched = true;
             return Ok(u32::from(value));
         }
-        if self.video_io_enabled_for_port(port) {
+        // The VGA status ports (3DA/3BA/3C2) are the ONLY arm in this function that
+        // does not unconditionally set io_touched -- the P4a lazy-read case: in the
+        // Approximate timing class they must NOT end the batch (io_touched stays
+        // false) so a poll loop chains as `run_straight_line` continuations. Static
+        // per-port dispatch: these three port numbers always land here, whether or
+        // not lazy_port_reads is set, so the branch is a single bool test, never a
+        // per-access classification.
+        //
+        // DECISION (batch-retroactive-rate subtlety): a batch shaped [lazy 3DA polls
+        // ... OUT 0x3C2 lowering the dot clock] applies the new dot-clock rate to the
+        // WHOLE batch at batch end (the pre-existing retroactive-rate behavior of
+        // advance_devices/scale_bus), so the batch-end beam can land behind the last
+        // lazy-predicted value this loop observed. Accepted as-is, no compensation:
+        // a dot-clock switch is not beam-continuous on real hardware either, and the
+        // write itself sets io_touched and ends the batch, so no further lazy read
+        // can observe the stale prediction within the same batch.
+        if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.video_io_enabled_for_port(port) {
+            if self.lazy_port_reads {
+                let beam = self.predicted_beam();
+                if let Some(value) = self.video.read_status_port_lazy(port, beam) {
+                    return Ok(u32::from(value));
+                }
+                // Inactive alias (e.g. 3BA polled in a color setup): no side
+                // effects, matching `Vga::read_port`'s existing
+                // `status1_port_selected` gate, and -- since this arm's static
+                // port set is disjoint from every other device's decoded ports
+                // (grep-confirmed: nothing else claims 0x3B0..=0x3DF) -- the same
+                // 0xFF the non-lazy path's fallthrough to `device_ports`'s passive
+                // table would eventually produce. Returned directly, without
+                // setting io_touched, so an inactive-alias poll stays lazy too
+                // instead of silently falling back to the old behavior.
+                return Ok(0xff);
+            } else {
+                *self.io_touched = true;
+                if let Some(value) = self.video.read_port(port) {
+                    return Ok(u32::from(value));
+                }
+            }
+        } else if self.video_io_enabled_for_port(port) {
             if let Some(value) = self.video.read_port(port) {
+                *self.io_touched = true;
                 return Ok(u32::from(value));
             }
         }
-        if let Some(opl_port) = opl_port(port) {
-            // The chip drives only the status byte on reads; data ports read open-bus.
-            return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
+        // Port 0x61 bits 4/5 (P4a Task 2.3): the second lazy read arm, same static
+        // per-port dispatch discipline as 3DA/3BA/3C2 above -- 0x61 always lands
+        // here whether or not lazy_port_reads is set. Bits 0/1 (speaker gate/data)
+        // are plain register state that cannot change mid-batch: the only writer
+        // is `write_io`, which unconditionally sets io_touched and so ends the
+        // batch before a later lazy read in the same batch could observe a stale
+        // value. Bits 4/5 come from PIT channels 1/2 OUT, which `out_after`'s
+        // GATE-stays-level assumption also depends on: GATE2 is wired from this
+        // same port's bit 0, and its only writer is that same batch-ending
+        // write_io, so GATE cannot move between this read and the batch end
+        // either.
+        if port == 0x61 {
+            if self.lazy_port_reads {
+                // Both channels share the SAME elapsed-PIT-clocks conversion
+                // (same rate, same batch-entry carry): computed once here rather
+                // than twice inside two separate predicted_pit_out calls, since
+                // that redundant second predict_dots_core call was pure waste on
+                // this hot path (measured: it erased most of the batch-chaining
+                // win in the P4a Task 2.3 A/B, see the microbench report).
+                let elapsed_pit_clocks = self.elapsed_pit_clocks();
+                let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
+                let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
+                if let (Some(ch1_out), Some(ch2_out)) = (ch1, ch2) {
+                    let value = (self.speaker.control_bits() & 0x03)
+                        | (u8::from(ch1_out) << 4)
+                        | (u8::from(ch2_out) << 5);
+                    return Ok(u32::from(value));
+                }
+                // BCD fallback: at least one of channel 1/2 is BCD-programmed, so
+                // `out_after` conservatively declined. Fall through to the exact
+                // non-lazy path below (io_touched set, today's live read) rather
+                // than a second implementation of the same bit composition.
+            }
+            *self.io_touched = true;
+            // Bit 4 is the DRAM-refresh heartbeat: PIT channel 1 OUT (the AT
+            // refresh timer, mode 2), not the speaker's standalone toggle. The PIT
+            // seeds channel 1 at power-on so this pulses without guest programming.
+            let value = (self.speaker.control_bits() & 0x03)
+                | (u8::from(self.pit.channel_out(1)) << 4)
+                | (u8::from(self.pit.channel_out(2)) << 5);
+            return Ok(u32::from(value));
         }
+        // OPL status reads on 0x388/0x38A and their SB16 mirrors (P4a Slice 3
+        // Task 3.2): the third lazy read arm, same static per-port dispatch
+        // discipline as 3DA/3BA/3C2 and 0x61 above -- dispatch is on the
+        // RESOLVED port (`opl_port`, which folds every alias -- 0x220-0x223,
+        // 0x228-0x229 -- onto the canonical 0x388-0x38B range) so a poll
+        // through any mirror gets the same lazy treatment, not just the native
+        // AdLib address. Only a status read (resolved port 0x388 or 0x38A) is
+        // lazy; a resolved data-port read (0x389/0x38B, open-bus per
+        // `OplChip::read_port`) falls through unchanged below, matching
+        // `read_port`'s existing behavior. The register-0x04 mask bits
+        // `status_after` reads cannot change mid-batch: the only writer is
+        // `write_port` via `write_io`, which unconditionally sets io_touched
+        // and so ends the batch before a later lazy read in the same batch
+        // could observe a stale value -- the same batch-entry-stable argument
+        // as 0x61's GATE bits above.
+        if let Some(resolved) = opl_port(port) {
+            if matches!(resolved, 0x0388 | 0x038a) && self.lazy_port_reads {
+                return Ok(u32::from(self.predicted_opl_status()));
+            }
+            *self.io_touched = true;
+            // The chip drives only the status byte on reads; data ports read open-bus.
+            return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
+        }
+        // Every arm from here down is unchanged from before Task 1.3: a single
+        // unconditional set covers all of them, exactly like the old top-of-function
+        // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61, OPL status)
+        // handled above.
+        *self.io_touched = true;
         if let Some(value) = self.mixer.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -9634,15 +9963,6 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.dma.read_port(port) {
-            return Ok(u32::from(value));
-        }
-        if port == 0x61 {
-            // Bit 4 is the DRAM-refresh heartbeat: PIT channel 1 OUT (the AT
-            // refresh timer, mode 2), not the speaker's standalone toggle. The PIT
-            // seeds channel 1 at power-on so this pulses without guest programming.
-            let value = (self.speaker.control_bits() & 0x03)
-                | (u8::from(self.pit.channel_out(1)) << 4)
-                | (u8::from(self.pit.channel_out(2)) << 5);
             return Ok(u32::from(value));
         }
         if port == 0x00e0 {
@@ -9912,6 +10232,157 @@ impl MachineBus<'_> {
         let seg = self.memory.read_u16(address + 2)?;
         Ok(off == 0 && seg == BIOS_ROM_IRET_SEG)
     }
+
+    /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
+    /// batch's accumulated core clocks plus the bus clocks recorded into `trace`
+    /// since batch entry add up to -- WITHOUT mutating any device state (`video`,
+    /// `vga_dots`, `bus_rem` on the owning `Machine` are all untouched; `&self`
+    /// makes that compiler-enforced). This is the P4a Slice 1 lazy port-read peek
+    /// (dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 1.2); wiring
+    /// it into `read_io` is Task 1.3.
+    ///
+    /// Units combined, matching exactly what the real batch-end step in
+    /// `run_until_clock`/`advance_devices` will later consume:
+    /// - the core portion, BATCH-scoped: `prior_runs_core_clocks` (the
+    ///   interrupt-service charge plus every completed straight-line run of this
+    ///   batch, republished by the batch loop before each run) plus
+    ///   `core_clocks_so_far` (the current run's prior instructions, excluding
+    ///   the in-flight instruction's own charge). One batch chains many runs and
+    ///   only the batch total feeds the batch-end step, so the run-scoped term
+    ///   alone would drop earlier runs' core clocks and jump backward at every
+    ///   run boundary; the monotonicity claim below rests on this batch-scoping,
+    ///   not on a port read ending the run.
+    /// - the bus portion: `trace.elapsed_clocks() - trace_elapsed_at_batch_start`
+    ///   raw bus clocks recorded so far this batch, scaled by the SAME (num, den)
+    ///   `bus_timing` ratio and the SAME fractional carry (`bus_rem_at_batch_start`)
+    ///   the real end-of-batch `scale_bus` call will start from -- no `scale_bus`
+    ///   call happens between batch entry and batch end, so the batch-entry carry
+    ///   IS the carry the real call uses. This mirrors `scale_bus`'s arithmetic
+    ///   shape exactly but reads `bus_rem_at_batch_start` instead of the live
+    ///   `bus_rem` and does not write the carry back anywhere (no mutation).
+    ///
+    /// The in-flight instruction's own fetch/data bus clocks may already be
+    /// partially recorded into `trace` by the time this runs; that is fine and
+    /// intentional -- the real batch-end total (computed once the whole
+    /// instruction has retired) is always a superset of what is recorded here, so
+    /// the clock total this predicts from is monotone within the batch and never
+    /// exceeds the batch's eventual final total. It never overshoots what the
+    /// real advance would show for the same clock total, because it uses the same
+    /// formula.
+    ///
+    /// Predicts POSITION ONLY: the dots-per-frame modulo wrap, never the
+    /// frame-boundary side effects (`finalize_frame`, the frame counter) that
+    /// `Vga::advance` performs -- those stay exclusively in the real
+    /// `advance_devices` at batch end. Shares the exact `predict_dots_core`
+    /// arithmetic `Machine::predict_dots` uses (same operation order, same
+    /// floor/subtract sequence), so a mid-batch peek can never structurally
+    /// diverge from what the later real advance will show for the same clocks.
+    fn predicted_beam(&self) -> u64 {
+        let in_batch_clocks = self.in_batch_clocks();
+        let (whole_dots, _remainder) = predict_dots_core(
+            in_batch_clocks,
+            self.vga_dots_at_batch_start,
+            self.video.dot_clock_hz(),
+            self.inv_clock_at_batch_start,
+        );
+        let frame = self.video.frame_dots();
+        if frame == 0 {
+            return self.beam_at_batch_start; // guard: un-programmed CRTC, mirrors Vga::advance
+        }
+        (self.beam_at_batch_start + whole_dots) % frame
+    }
+
+    /// The batch-scoped CPU clock total elapsed as of "now" (mid-batch), the
+    /// shared T both `predicted_beam` and `predicted_pit_clocks` build on: batch-
+    /// scoped core clocks (`prior_runs_core_clocks + core_clocks_so_far`) plus
+    /// in-batch bus clocks recorded into `trace` since batch entry, scaled by the
+    /// SAME (num, den) `bus_timing` ratio and fractional carry
+    /// (`bus_rem_at_batch_start`) the real end-of-batch `scale_bus` call will
+    /// start from. Extracted from `predicted_beam` (P4a Task 2.3) so the PIT lazy
+    /// read consumes byte-for-byte the same clock total the beam peek does,
+    /// rather than a second hand-rolled copy of this arithmetic.
+    fn in_batch_clocks(&self) -> u64 {
+        let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
+        let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
+            + self.bus_rem_at_batch_start;
+        let scaled_bus_clocks = scaled / u64::from(self.bus_den_at_batch_start);
+        self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks
+    }
+
+    /// Elapsed PIT input CLKs "now" -- mid-batch, WITHOUT mutating `pit_clocks`
+    /// (P4a Task 2.3: the lazy port 0x61 bits 4/5 read). Shared by every channel
+    /// a caller peeks in the same read (0x61 needs both channel 1 and channel
+    /// 2), so a caller that needs more than one channel should compute this ONCE
+    /// and pass it to `Pit::out_after` per channel, not call `predicted_pit_out`
+    /// (below) once per channel -- the two calls would otherwise redo this exact
+    /// conversion redundantly (measured: that redundancy erased most of the
+    /// batch-chaining win in the P4a Task 2.3 A/B, see the microbench report).
+    ///
+    /// Converts the shared in-batch clock total `T` (`in_batch_clocks`, the same
+    /// T `predicted_beam` peeks with) into elapsed PIT input clocks by calling
+    /// the SAME `advance_fractional` function the real `advance_devices` PIT
+    /// step calls, with `pit_clocks_at_batch_start` standing in for the live
+    /// accumulator and `pit_per_clock_at_batch_start` for the live rate. NOT
+    /// `predict_dots_core` with PIT_INPUT_HZ standing in for the dot clock:
+    /// that formula's `clocks * rate_hz * inv_clock` factoring floor-diverges
+    /// from the real advance's pre-divided `clocks * pit_per_clock` product at
+    /// the IEEE-f64 level (see `advance_fractional`'s doc comment), which would
+    /// let a lazy read report an OUT level one PIT clock ahead of or behind
+    /// what batch end establishes. `advance_devices` only runs at batch end /
+    /// wake step, never mid-batch, so `pit_clocks_at_batch_start` IS the live
+    /// `pit_clocks` value the real call will start folding T's clocks into: no
+    /// time travel, this predicts exactly what a real `advance_devices` at T
+    /// followed by a read would produce.
+    fn elapsed_pit_clocks(&self) -> u64 {
+        let (elapsed_pit_clocks, _remainder) = advance_fractional(
+            self.pit_clocks_at_batch_start,
+            self.in_batch_clocks(),
+            self.pit_per_clock_at_batch_start,
+        );
+        elapsed_pit_clocks
+    }
+
+    /// Peek `channel`'s live PIT OUT level "now" -- mid-batch, WITHOUT stepping
+    /// `pit` or mutating `pit_clocks`. `None` when the channel's counter is BCD
+    /// (see `Counter::out_after` via `Pit::out_after`); the caller falls back to
+    /// a real read in that case. Convenience wrapper over `elapsed_pit_clocks`
+    /// for a single-channel peek (tests, and any future single-channel lazy
+    /// port); the production 0x61 read arm needs both channels and calls
+    /// `elapsed_pit_clocks` directly instead, per the note above.
+    #[cfg(test)]
+    fn predicted_pit_out(&self, channel: usize) -> Option<bool> {
+        self.pit.out_after(channel, self.elapsed_pit_clocks())
+    }
+
+    /// Elapsed OPL-timer microseconds "now" -- mid-batch, WITHOUT mutating
+    /// `opl_micros` (P4a Slice 3 Task 3.2: the lazy OPL status read).
+    /// Converts the shared in-batch clock total `T` (`in_batch_clocks`, the
+    /// same T `predicted_beam`/`elapsed_pit_clocks` peek with) into elapsed
+    /// microseconds by calling the SAME `advance_fractional` function the real
+    /// `advance_devices` OPL step calls, with `opl_micros_at_batch_start`
+    /// standing in for the live accumulator and `micros_per_clock_at_batch_start`
+    /// for the live rate. `advance_devices` only runs at batch end / wake step,
+    /// never mid-batch, so `opl_micros_at_batch_start` IS the live `opl_micros`
+    /// value the real call will start folding T's clocks into: no time travel,
+    /// this predicts exactly what a real `advance_devices` at T followed by a
+    /// status read would produce.
+    fn elapsed_opl_micros(&self) -> u64 {
+        let (elapsed_opl_micros, _remainder) = advance_fractional(
+            self.opl_micros_at_batch_start,
+            self.in_batch_clocks(),
+            self.micros_per_clock_at_batch_start,
+        );
+        elapsed_opl_micros
+    }
+
+    /// Peek the live OPL status byte "now" -- mid-batch, WITHOUT stepping
+    /// `opl`'s timers or mutating `opl_micros`. Convenience wrapper over
+    /// `elapsed_opl_micros` plus `OplChip::status_after`, used by both the
+    /// production lazy status-read arm in `read_io` and the differential test
+    /// below.
+    fn predicted_opl_status(&self) -> u8 {
+        self.opl.status_after(self.elapsed_opl_micros())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10044,6 +10515,44 @@ fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
         GswMode::Gsw486 => CpuLevel::I486,
         GswMode::Gsw586 => CpuLevel::I586,
     }
+}
+
+/// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
+/// fractional-dot accumulator `dots_owed`, the VGA's live dot-clock rate, and the
+/// active mode's `1 / clock_hz` factor. Pure free function: the one shared
+/// arithmetic core `Machine::predict_dots` (the real `advance_devices` step) and
+/// `MachineBus::predicted_beam` (the Slice 1 lazy port-read peek) both call, so a
+/// mid-batch prediction and the later real advance can never structurally diverge
+/// in rounding. Kept textually identical to the arithmetic it was extracted from
+/// (same operation order, same floor/subtract sequence) -- do not "simplify" this
+/// without re-checking both callers' bit-for-bit tests.
+fn predict_dots_core(clocks: u64, dots_owed: f64, dot_clock_hz: u64, inv_clock: f64) -> (u64, f64) {
+    let raw = dots_owed + clocks as f64 * dot_clock_hz as f64 * inv_clock;
+    let whole = raw.floor();
+    (whole as u64, raw - whole)
+}
+
+/// Whole device clocks elapsed for `clocks` CPU clocks at a PRE-COMBINED
+/// per-CPU-clock rate, given the live fractional carry. Pure free function: the
+/// one shared arithmetic core every real `advance_devices` fractional block
+/// (PIT, OPL, DSP) and every mid-batch lazy peek (`MachineBus::
+/// elapsed_pit_clocks`, the P4a Task 2.3 lazy port 0x61 read;
+/// `MachineBus::elapsed_opl_micros`, the P4a Slice 3 lazy OPL status read)
+/// calls, so a mid-batch prediction and the later real advance can never
+/// diverge in rounding. NOT interchangeable with `predict_dots_core` above
+/// even where the rates are mathematically equal: that formula multiplies
+/// `clocks * rate_hz as f64 * inv_clock` (two roundings, left-associated),
+/// while the PIT path has always multiplied by the pre-divided
+/// `pit_per_clock = PIT_INPUT_HZ / clock_hz` factor (one rounding) -- the two
+/// factorings floor-diverge at the IEEE-f64 level for reachable (carry, clocks)
+/// pairs, which is exactly the seam this extraction closes. Kept textually
+/// identical to the `advance_devices` arithmetic it was extracted from (carry
+/// plus product, floor, subtract) -- do not "simplify" this without re-checking
+/// all callers' bit-for-bit tests.
+fn advance_fractional(carry: f64, clocks: u64, rate_per_clock: f64) -> (u64, f64) {
+    let raw = carry + clocks as f64 * rate_per_clock;
+    let whole = raw.floor();
+    (whole as u64, raw - whole)
 }
 
 /// Map a CPU I/O port to the OPL register port (0x388-0x38B) it addresses, or
@@ -18779,8 +19288,1049 @@ mod tests {
         }
     }
 
+    #[test]
+    fn machine_bus_snapshots_batch_entry_state() {
+        // Run the machine forward a bit first so elapsed_clocks/vga_dots/beam/
+        // bus_rem are not all trivially zero, then check that a freshly-built
+        // MachineBus's five batch-entry snapshot fields equal the live machine
+        // state at the moment the bus is constructed (P4a Slice 1 Task 1.1:
+        // dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Nothing
+        // consumes these fields yet; this only pins the wiring.
+        let mut machine = test_machine();
+        machine.run_cycles(5_000).unwrap();
+        let expected_elapsed = machine.elapsed_clocks;
+        let expected_vga_dots = machine.vga_dots;
+        let expected_beam = machine.video.beam_dots();
+        let expected_trace_elapsed = machine.trace.elapsed_clocks();
+        let expected_bus_rem = machine.bus_rem;
+        with_bus(&mut machine, |bus| {
+            assert_eq!(
+                bus.elapsed_clocks_at_batch_start, expected_elapsed,
+                "elapsed_clocks_at_batch_start must mirror Machine::elapsed_clocks at construction"
+            );
+            assert_eq!(
+                bus.vga_dots_at_batch_start, expected_vga_dots,
+                "vga_dots_at_batch_start must mirror Machine::vga_dots at construction"
+            );
+            assert_eq!(
+                bus.beam_at_batch_start, expected_beam,
+                "beam_at_batch_start must mirror the VGA beam dot counter at construction"
+            );
+            assert_eq!(
+                bus.trace_elapsed_at_batch_start, expected_trace_elapsed,
+                "trace_elapsed_at_batch_start must mirror BusTrace::elapsed_clocks at construction"
+            );
+            assert_eq!(
+                bus.bus_rem_at_batch_start, expected_bus_rem,
+                "bus_rem_at_batch_start must mirror Machine::bus_rem at construction"
+            );
+        });
+    }
+
+    #[test]
+    fn predicted_beam_at_batch_start_equals_the_unmutated_beam() {
+        // At core_clocks_so_far = 0 with zero in-batch bus clocks (the very first
+        // instruction of a batch, before any fetch/data access has been recorded
+        // into the trace this batch), the lazy formula must degenerate to exactly
+        // the batch-entry beam: no in-batch advance has happened yet. This pins the
+        // P4a Slice 1 peek's first-instruction safety argument as a test.
+        let mut machine = test_machine();
+        machine.run_cycles(5_000).unwrap();
+        let expected_beam = machine.video.beam_dots();
+        with_bus(&mut machine, |bus| {
+            // core_clocks_so_far and prior_runs_core_clocks default to 0 (no
+            // read_io call has run yet on this bus, no prior run this batch) and
+            // trace.elapsed_clocks() at this instant equals
+            // trace_elapsed_at_batch_start (nothing has been recorded since
+            // construction), so in-batch clocks are zero on all terms.
+            assert_eq!(
+                bus.predicted_beam(),
+                expected_beam,
+                "zero in-batch clocks must predict exactly the batch-entry beam"
+            );
+        });
+    }
+
+    #[test]
+    fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
+        // Differential no-time-travel test: build two identically-driven machines
+        // (the established pattern, see
+        // predict_vga_dots_matches_the_real_advance_devices_accumulator_step). Run
+        // both forward an odd cycle count first so vga_dots is fractional and
+        // bus_rem is nonzero at batch entry (the Task 1.1 shape: vga_dots
+        // ~0.4397, bus_rem 24 after 5000 cycles). Snapshot one into a MachineBus
+        // and compute predicted_beam for a given in-batch clock total; call
+        // advance_devices for real on the other with the same total (expressed in
+        // the same core+scaled-bus units predicted_beam consumes) and assert the
+        // beam positions agree exactly. The sweep covers: the trivial zero path,
+        // small deltas inside one scanline, larger multi-scanline ones, a
+        // 450_000-core case whose dot total exceeds the ~404k-dot frame so the
+        // modulo wrap REALLY happens (asserted below via frames_completed), and
+        // nonzero prior_runs_core_clocks values so the batch-scoped core term
+        // (prior runs of the same batch) is exercised, not just the run-scoped
+        // one. Task 1.3's lazy-read tests will drive the prior-runs seam
+        // end-to-end through read_io; here the field is set directly, paired with
+        // the batch-loop pin test below
+        // (batch_loop_publishes_prior_runs_core_clocks_before_every_run).
+        let mut any_wrap = false;
+        for prior_runs_core_clocks in [0u64, 61, 33_000] {
+            for core_clocks_so_far in [0u64, 100, 12_345, 450_000] {
+                for fetch_count in [0u32, 1, 4_096] {
+                    let mut predicted_machine = test_machine();
+                    predicted_machine.run_cycles(5_000).unwrap();
+                    let mut real_machine = test_machine();
+                    real_machine.run_cycles(5_000).unwrap();
+                    assert_eq!(predicted_machine.vga_dots, real_machine.vga_dots);
+                    assert_eq!(predicted_machine.bus_rem, real_machine.bus_rem);
+                    assert_eq!(
+                        predicted_machine.video.beam_dots(),
+                        real_machine.video.beam_dots()
+                    );
+
+                    let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+                        // Simulate fetch_count bytes' worth of bus traffic having
+                        // been recorded into the trace since batch entry (prior
+                        // instructions of this straight-line run, or this
+                        // instruction's own fetch), at zero wait-states, then read
+                        // back the actual raw clocks the trace charged for it so
+                        // the real-machine side below combines the exact same
+                        // total (not an assumed one) --
+                        // record_instruction_fetch_run's per-byte cost is an
+                        // internal BusCycle detail this test must not hardcode.
+                        let before = bus.trace.elapsed_clocks();
+                        if fetch_count > 0 {
+                            bus.trace.record_instruction_fetch_run(0, fetch_count, 0);
+                        }
+                        let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+                        bus.prior_runs_core_clocks = prior_runs_core_clocks;
+                        bus.core_clocks_so_far = core_clocks_so_far;
+                        (bus.predicted_beam(), raw_bus_clocks)
+                    });
+
+                    // The real batch-end step (run_until_clock / advance_devices):
+                    // core is the batch total (prior runs + the current run's
+                    // clocks), bus_clocks is what the trace recorded since batch
+                    // entry (mirrored here by raw_bus_clocks), scaled through
+                    // scale_bus's exact carry arithmetic.
+                    let step = prior_runs_core_clocks
+                        + core_clocks_so_far
+                        + real_machine.scale_bus(raw_bus_clocks);
+                    // Compute whether this step wraps the frame, from the same
+                    // pure formula, BEFORE the mutating advance: the prediction
+                    // only claims position, but the wrap cases must be shown to
+                    // really wrap (frames_completed bumps) or the coverage claim
+                    // above is hollow.
+                    let (whole_dots, _) = real_machine.predict_dots(step, real_machine.vga_dots);
+                    let frame = real_machine.video.frame_dots();
+                    let wraps = frame > 0 && real_machine.video.beam_dots() + whole_dots >= frame;
+                    let frames_before = real_machine.video.frames_completed();
+                    real_machine.advance_devices(step);
+
+                    assert_eq!(
+                        predicted,
+                        real_machine.video.beam_dots(),
+                        "predicted_beam(prior={prior_runs_core_clocks}, \
+                         core={core_clocks_so_far}, fetch_count={fetch_count}) must match a \
+                         real advance_devices of the same core+scaled-bus clock total"
+                    );
+                    if wraps {
+                        any_wrap = true;
+                        assert!(
+                            real_machine.video.frames_completed() > frames_before,
+                            "a wrapping step must bump the real machine's frame counter \
+                             (prior={prior_runs_core_clocks}, core={core_clocks_so_far}, \
+                             fetch_count={fetch_count})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            any_wrap,
+            "the sweep must include at least one case that crosses a frame boundary, \
+             or the wrap coverage this test claims is not exercised"
+        );
+    }
+
+    #[test]
+    fn batch_loop_publishes_prior_runs_core_clocks_before_every_run() {
+        // Pins the run_until_clock batch loop's prior_runs_core_clocks updates
+        // through the cfg(test) push logs: before every run_straight_line call the
+        // loop must republish the batch-scoped core accumulator (interrupt-service
+        // charge + prior runs) into the bus, so a mid-run lazy prediction sees a
+        // clock total that is monotone across run boundaries and bounded by the
+        // core total the batch-end step later consumes. Nothing reads the field
+        // from read_io yet (Task 1.3 wires that end-to-end); this pins the
+        // loop-update mechanics directly: per batch, pushes are non-decreasing
+        // prefix sums of the final batch core total, they reset at batch entry,
+        // and real ROM execution produces multi-run batches where a later run
+        // observes a NONZERO prior-runs value (the case the run-scoped
+        // core_clocks_so_far alone would get wrong).
+        let mut machine = test_machine();
+        machine.run_cycles(300_000).unwrap();
+        assert_eq!(
+            machine.test_prior_core_pushes.len(),
+            machine.test_batch_core_totals.len(),
+            "one push log and one core total per completed batch"
+        );
+        assert!(
+            !machine.test_prior_core_pushes.is_empty(),
+            "the run must have executed at least one batch"
+        );
+        let mut saw_multi_run_nonzero_prior = false;
+        for (batch, (pushes, total)) in machine
+            .test_prior_core_pushes
+            .iter()
+            .zip(&machine.test_batch_core_totals)
+            .enumerate()
+        {
+            let mut prev = 0u64;
+            for &push in pushes {
+                assert!(
+                    push >= prev,
+                    "batch {batch}: prior_runs_core_clocks pushes must be non-decreasing \
+                     (a later run saw a smaller prior-core total: {push} after {prev})"
+                );
+                assert!(
+                    push <= *total,
+                    "batch {batch}: a push ({push}) exceeded the final batch core total \
+                     ({total}) that fed the batch-end step"
+                );
+                prev = push;
+            }
+            if pushes.len() >= 2 && *pushes.last().unwrap() > 0 {
+                saw_multi_run_nonzero_prior = true;
+            }
+        }
+        assert!(
+            saw_multi_run_nonzero_prior,
+            "the boot run must contain at least one multi-run batch whose later run \
+             saw a nonzero prior-runs core total; if this stops holding, drive the \
+             machine differently rather than weakening the assert"
+        );
+    }
+
+    #[test]
+    fn lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+        // The P4a Task 1.3 behavior change: in the Approximate class (486/586) a
+        // 0x3DA/0x3BA/0x3C2 read must NOT end the batch (io_touched stays false),
+        // while the Accurate class (286/386) keeps the exact prior behavior
+        // (io_touched set on every status-port read). Covers all three ports.
+        for port in [0x3DAu16, 0x3BA, 0x3C2] {
+            // Accurate class: unchanged behavior, io_touched set.
+            let mut accurate = test_machine(); // Gsw386 by construction
+            with_bus(&mut accurate, |bus| {
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    *bus.io_touched,
+                    "port {port:#06X}: the Accurate class must still set io_touched \
+                     on a status-port read"
+                );
+            });
+
+            // Approximate class: the new lazy behavior, io_touched stays false.
+            let mut approximate = test_machine();
+            approximate.set_mode(GswMode::Gsw486);
+            with_bus(&mut approximate, |bus| {
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    !*bus.io_touched,
+                    "port {port:#06X}: the Approximate class must NOT set io_touched \
+                     on a status-port read (the lazy path)"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn lazy_3da_read_still_resets_the_attribute_flip_flop_and_calls_catch_up() {
+        // A lazy 0x3DA read must perform the exact same guest-visible side effects
+        // as the non-lazy read (catch_up + the Attribute Controller address/data
+        // flip-flop reset), even though io_touched stays false. `Attribute`'s
+        // flip_flop_data field is pub(crate) to izarravm-video, not reachable
+        // directly from this crate, so this observes the flip-flop indirectly
+        // through 0x3C0's own read-back semantics: a first 0x3C0 write always sets
+        // the index (armed as pending data); if the flip-flop is still "data"
+        // after the 3DA read, a second 0x3C0 write would be consumed as a data
+        // write to the FIRST index rather than a new index, and 0x3C0's own
+        // read-back (`Some(attr.index | pas<<5)`) would show the stale value.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        with_bus(&mut machine, |bus| {
+            // ONE 0x3C0 write: consumed in the index phase (sets index = 0x05)
+            // and leaves the flip-flop armed in the DATA phase. Exactly one
+            // write, deliberately: `write_attr` toggles the flip-flop on EVERY
+            // write, so a second "re-arm" write would itself consume the data
+            // phase and put the flip-flop back at "index" regardless of whether
+            // the 3DA reset fires -- which would make this test pass even with
+            // the reset deleted (a mutation the spec review actually ran).
+            bus.write_io(0x3C0, BusWidth::Byte, 0x05).unwrap();
+            // Reading 0x3C0 returns `attr.index | pas << 5` and does NOT touch
+            // the flip-flop, so this sanity check leaves the data phase armed.
+            assert_eq!(
+                bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
+                0x05,
+                "sanity: the index write took effect"
+            );
+            // The setup write above is an ordinary (non-lazy) port write and
+            // unconditionally sets io_touched; clear it so the sanity check below
+            // observes only the upcoming 3DA read's own effect on the flag.
+            *bus.io_touched = false;
+
+            // The lazy 3DA read: must reset the flip-flop to "index" despite not
+            // setting io_touched.
+            let _ = bus.read_io(0x3DA, BusWidth::Byte, 0).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "sanity: this is the lazy path (Approximate class)"
+            );
+
+            // A second 0x3C0 write with a DIFFERENT value. If the 3DA read reset
+            // the flip-flop to "index", this is an index write (index becomes
+            // 0x0A) and the read-back shows 0x0A. If the reset did NOT fire, the
+            // flip-flop is still in the data phase, so this write lands as DATA
+            // for the stale index 0x05 (palette[5] = 0x0A) and the read-back
+            // still shows 0x05, failing the assertion. Mutation-verified: with
+            // `flip_flop_data = false` deleted from status1_side_effects this
+            // assertion fails; restored, it passes.
+            bus.write_io(0x3C0, BusWidth::Byte, 0x0A).unwrap();
+            assert_eq!(
+                bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
+                0x0A,
+                "the 3DA read must have reset the attribute flip-flop to \"index\", \
+                 so the next 0x3C0 write is treated as a new index (0x0A), not a \
+                 data write to the stale index 0x05"
+            );
+        });
+    }
+
+    #[test]
+    fn lazy_3da_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
+        // At batch start (zero in-batch clocks, predicted_beam degenerates to the
+        // batch-entry beam exactly, per
+        // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy
+        // status1 bits must be byte-identical to what the pre-Task-1.3
+        // read_status1 would have returned for the same live beam. Compared
+        // within a SINGLE Approximate-class machine (not across two differently
+        // clocked machines, whose beams would drift apart independently of this
+        // task's change): clone the live Vga state before either read touches
+        // it, compute the accurate read_status1() on the clone, then compute the
+        // lazy value through the real bus, both starting from the identical
+        // device state.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        machine.run_cycles(5_000).unwrap();
+
+        let mut accurate_clone = machine.video.clone();
+        let expected = accurate_clone.read_status1();
+
+        let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
+            let value = bus.read_io(0x3DA, BusWidth::Byte, 0).unwrap();
+            (value, *bus.io_touched)
+        });
+
+        assert!(
+            !io_touched,
+            "sanity: this is the lazy path (Approximate class)"
+        );
+        assert_eq!(
+            lazy_value,
+            u32::from(expected),
+            "a lazy 3DA read at batch start must return byte-identical bits to a \
+             non-lazy read of the same live beam"
+        );
+    }
+
+    #[test]
+    fn lazy_reads_chain_into_far_fewer_batches_than_poll_iterations_with_monotone_observations() {
+        // End-to-end no-time-travel test: a real mode-13h guest tightly polls
+        // 0x3DA in a loop (the same port the P4d cadence test polls) and
+        // maintains, in guest memory, a running sample count and a toggle count
+        // of the vretrace bit (0x08) across every sample it has ever taken --
+        // not just a bounded ring, so the toggle observation cannot be an
+        // artifact of a capture window that happens to miss an edge. Asserts (a)
+        // the Approximate-class run collapses many poll iterations into far
+        // fewer `run_straight_line` calls (each 0x3DA IN no longer ends the
+        // batch), and (b) the vretrace bit toggled at least once across the
+        // whole run -- proving the lazy per-read prediction actually tracked
+        // beam motion across many samples rather than reading a frozen value.
+        //
+        // Guest memory layout: [0x7000] sample count, [0x7004] toggle count,
+        // [0x7006] last-observed vretrace bit (byte).
+        let code = [
+            0xB8, 0x13, 0x00, // 0: mov ax, 0x0013 (mode 13h)
+            0xCD, 0x10, // 3: int 0x10
+            0x31, 0xC0, // 5: xor ax, ax
+            0x8E, 0xD8, // 7: mov ds, ax
+            0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // 9: mov word [0x7000], 0 (sample count)
+            0xC7, 0x06, 0x04, 0x70, 0x00, 0x00, // 15: mov word [0x7004], 0 (toggle count)
+            0xC6, 0x06, 0x06, 0x70, 0xFF, // 21: mov byte [0x7006], 0xFF (no prior sample)
+            0xBA, 0xDA, 0x03, // 26: mov dx, 0x03DA
+            // poll (29): read status, isolate the vretrace bit, compare against
+            // the last-observed bit, bump the toggle count on a change, stash
+            // the new last-observed bit, bump the sample count, loop forever.
+            0xEC, // 29: in al, dx
+            0x24, 0x08, // 30: and al, 0x08 (isolate the vretrace bit)
+            0x3A, 0x06, 0x06, 0x70, // 32: cmp al, [0x7006]
+            0x74, 0x04, // 36: jz same (+4: skip the toggle bump)
+            0xFF, 0x06, 0x04, 0x70, // 38: inc word [0x7004] (toggle count)
+            // same (42):
+            0xA2, 0x06, 0x70, // 42: mov [0x7006], al
+            0xFF, 0x06, 0x00, 0x70, // 45: inc word [0x7000] (sample count)
+            0xEB, 0xEA, // 49: jmp poll (displacement -22: poll=29, jmp ends at 51)
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+
+        // Warm up until mode 13h is set and the guest is inside the poll loop.
+        machine.run_cycles(50_000).unwrap();
+        machine.cpu.reset_perf_counters();
+        let sample_count_before = machine.memory.read_u16(0x7000).unwrap();
+
+        // Run enough guest clocks to complete several frames' worth of polling.
+        let clock_hz = machine.active_mode().clock_hz();
+        machine.run_cycles(clock_hz / 20).unwrap(); // 50ms of guest time
+
+        // `straight_line_runs` counts every `run_straight_line` call (opening a
+        // new run OR chaining continuations); each poll iteration is one IN, so
+        // without continuation-chaining this would grow roughly 1:1 with the
+        // sample count. With lazy reads admitted as continuations, many samples
+        // land inside a single run.
+        let runs = machine.cpu.perf_counters().straight_line_runs;
+        let sample_count_after = machine.memory.read_u16(0x7000).unwrap();
+        let samples_taken = sample_count_after.wrapping_sub(sample_count_before);
+        let toggles = machine.memory.read_u16(0x7004).unwrap();
+
+        assert!(
+            samples_taken > 1000,
+            "sanity: the poll loop must have run many iterations in 50ms of \
+             guest time, saw {samples_taken}"
+        );
+        assert!(
+            runs < u64::from(samples_taken) / 4,
+            "lazy reads must chain many poll iterations per run_straight_line \
+             call: saw {runs} runs for {samples_taken} samples (expected far \
+             fewer runs than samples)"
+        );
+        assert!(
+            toggles > 0,
+            "the vretrace bit must have toggled at least once across the whole \
+             run's samples in 50ms of guest time (multiple frames), or the lazy \
+             prediction never actually tracked beam motion; saw {toggles} \
+             toggles across {samples_taken} samples"
+        );
+        // Upper bound (spec-review hardening): a prediction jittering BACKWARD
+        // across the vretrace edge would inflate the toggle count and still
+        // satisfy toggles > 0, so bound it by the physically possible edge
+        // count. Derivation: the measured window is 50ms of guest time; mode
+        // 13h runs ~70 frames/s, so ~3.5 frames, and the vretrace bit toggles
+        // exactly twice per frame (set at retrace start, clear at its end) =
+        // ~7 toggles. Plus the 50_000-clock warm-up (< 1ms, at most one edge
+        // pair -- the counter accumulates from boot) and +1 from the guest's
+        // 0xFF last-bit sentinel mismatching the first real sample. Total
+        // expected <= ~10; 20 leaves generous slack while still failing on any
+        // per-read jitter (which would produce hundreds of spurious toggles
+        // across >1000 samples).
+        assert!(
+            toggles < 20,
+            "the vretrace bit toggled {toggles} times across {samples_taken} \
+             samples in ~3.5 frames of guest time; more than ~2 per frame (+ \
+             slack) means the lazy prediction is jittering back and forth \
+             across the retrace edge instead of advancing monotonically"
+        );
+    }
+
+    #[test]
+    fn lazy_read_after_an_interrupt_service_charge_sees_the_batch_scoped_total() {
+        // Carried-forward review note: the first lazy read of a batch that opened
+        // with an interrupt-service charge (the once-per-batch IRQ dispatch cost
+        // added to batch_core before the first run_straight_line call) must see a
+        // clock total that includes that charge -- prior_runs_core_clocks is
+        // republished from batch_core before every run, and the very first
+        // publish (before run 1) already carries the service charge. Observable
+        // via the cfg(test) log seam: the FIRST prior-runs push of a batch that
+        // serviced an interrupt must be nonzero.
+        //
+        // Reuses approximate_class_delivers_pit_irq0_during_long_compute_stretches'
+        // exact setup (a pure `sti; jmp $` compute loop after arming the PIC/PIT
+        // for ~3.43ms IRQ0 ticks) so an interrupt is serviced at a KNOWN, reliable
+        // cadence rather than depending on incidental BIOS/POST timing.
+        let code = [
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xB0, 0x11, 0xE6, 0x20, // ICW1
+            0xB0, 0x08, 0xE6, 0x21, // ICW2: vector base 0x08
+            0xB0, 0x04, 0xE6, 0x21, // ICW3
+            0xB0, 0x01, 0xE6, 0x21, // ICW4
+            0xB0, 0x00, 0xE6, 0x21, // unmask all lines
+            0xB0, 0x34, 0xE6, 0x43, // PIT ch0 mode 2, LSB/MSB
+            0xB0, 0x00, 0xE6, 0x40, // reload low 0x00
+            0xB0, 0x10, 0xE6, 0x40, // reload high 0x10 -> 4096 ticks (~3.43 ms)
+            0xFB, // sti
+            0xEB, 0xFE, // jmp $ (pure compute, no port I/O)
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        // IRQ0 handler at 0x0700: mov al,0x20; out 0x20,al; iret (EOI only, no
+        // guest-visible port I/O beyond that, which keeps the batch shape simple).
+        let handler: [u8; 5] = [0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x08] (IRQ0 at PIC base 0x08) -> 0000:0700.
+        machine.write_physical_u8(0x20, 0x00);
+        machine.write_physical_u8(0x21, 0x07);
+        machine.write_physical_u8(0x22, 0x00);
+        machine.write_physical_u8(0x23, 0x00);
+        // A few periods of 4096 PIT ticks at the Gsw486 clock rate, comfortably
+        // enough for several IRQ0 edges (and thus several interrupt-opened
+        // batches) to land.
+        machine.run_cycles(5_000_000).unwrap();
+
+        assert!(
+            !machine.test_prior_core_pushes.is_empty(),
+            "the run must have executed at least one batch"
+        );
+        let saw_batch_with_serviced_interrupt_charge = machine
+            .test_prior_core_pushes
+            .iter()
+            .any(|pushes| pushes.first().is_some_and(|&first| first > 0));
+        assert!(
+            saw_batch_with_serviced_interrupt_charge,
+            "at least one batch's FIRST prior-runs publish (before its first \
+             run_straight_line call) must be nonzero, proving an interrupt- \
+             service charge from batch entry is visible to the first lazy read \
+             of that batch's first run, not just to later runs"
+        );
+    }
+
+    #[test]
+    fn lazy_61_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+        // The P4a Task 2.3 behavior change, mirroring the 3DA/3BA/3C2 case: in
+        // the Approximate class (486/586) a port 0x61 read must NOT end the
+        // batch (io_touched stays false), while the Accurate class (286/386)
+        // keeps the exact prior behavior (io_touched set).
+        let mut accurate = test_machine(); // Gsw386 by construction
+        with_bus(&mut accurate, |bus| {
+            let _ = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            assert!(
+                *bus.io_touched,
+                "the Accurate class must still set io_touched on a port 0x61 read"
+            );
+        });
+
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        with_bus(&mut approximate, |bus| {
+            let _ = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "the Approximate class must NOT set io_touched on a port 0x61 \
+                 read (the lazy path)"
+            );
+        });
+    }
+
+    #[test]
+    fn lazy_61_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
+        // At batch start (zero in-batch clocks, predicted_pit_out degenerates to
+        // the batch-entry live channel_out exactly, the PIT counterpart of
+        // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy 0x61
+        // byte must be byte-identical to what the pre-Task-2.3 read would have
+        // returned for the same live PIT/speaker state.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        machine.run_cycles(5_000).unwrap();
+
+        let expected = (machine.speaker.control_bits() & 0x03)
+            | (u8::from(machine.pit.channel_out(1)) << 4)
+            | (u8::from(machine.pit.channel_out(2)) << 5);
+
+        let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
+            let value = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            (value, *bus.io_touched)
+        });
+
+        assert!(
+            !io_touched,
+            "sanity: this is the lazy path (Approximate class)"
+        );
+        assert_eq!(
+            lazy_value,
+            u32::from(expected),
+            "the lazy 0x61 byte must equal the non-lazy read at batch start \
+             (zero in-batch clocks)"
+        );
+    }
+
+    #[test]
+    fn predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
+        // Differential no-time-travel test, the PIT counterpart of
+        // predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n:
+        // build two identically-driven machines, snapshot one into a MachineBus,
+        // compute predicted_pit_out for a given in-batch clock total, and call
+        // advance_devices for real on the other with the same total (expressed
+        // in the same core+scaled-bus units) -- the two must agree exactly.
+        // Mode-2 (channel 1, the AT refresh timer, pre-seeded at power-on) and
+        // mode-3 (channel 2, PC speaker) channels are both covered, including
+        // totals crossing several OUT edges, so the sweep exercises both this
+        // slice's channels at both the periods the real machine actually uses.
+        for prior_runs_core_clocks in [0u64, 61, 33_000] {
+            for core_clocks_so_far in [0u64, 100, 12_345, 450_000] {
+                for channel in [1usize, 2] {
+                    let mut predicted_machine = test_machine();
+                    predicted_machine.set_mode(GswMode::Gsw486);
+                    if channel == 2 {
+                        // Arm channel 2 in mode 3 (square wave) with a short
+                        // divisor so several OUT edges land inside the swept
+                        // clock range; GATE2 comes from port 0x61 bit 0.
+                        with_bus(&mut predicted_machine, |bus| {
+                            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap(); // ch2, lo/hi, mode 3
+                            bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap(); // divisor low
+                            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap(); // divisor high (16)
+                            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap(); // GATE2 + data
+                        });
+                    }
+                    predicted_machine.run_cycles(5_000).unwrap();
+                    let mut real_machine = test_machine();
+                    real_machine.set_mode(GswMode::Gsw486);
+                    if channel == 2 {
+                        with_bus(&mut real_machine, |bus| {
+                            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
+                            bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap();
+                            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
+                            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+                        });
+                    }
+                    real_machine.run_cycles(5_000).unwrap();
+                    assert_eq!(predicted_machine.pit_clocks, real_machine.pit_clocks);
+                    assert_eq!(
+                        predicted_machine.pit.channel_out(channel),
+                        real_machine.pit.channel_out(channel)
+                    );
+
+                    let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+                        let before = bus.trace.elapsed_clocks();
+                        if core_clocks_so_far > 0 {
+                            // A cheap stand-in for real bus traffic: any nonzero
+                            // fetch count exercises the scaled-bus term the same
+                            // way predicted_beam's twin test does.
+                            bus.trace.record_instruction_fetch_run(0, 1, 0);
+                        }
+                        let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+                        bus.prior_runs_core_clocks = prior_runs_core_clocks;
+                        bus.core_clocks_so_far = core_clocks_so_far;
+                        (bus.predicted_pit_out(channel), raw_bus_clocks)
+                    });
+
+                    let step = prior_runs_core_clocks
+                        + core_clocks_so_far
+                        + real_machine.scale_bus(raw_bus_clocks);
+                    real_machine.advance_devices(step);
+
+                    assert_eq!(
+                        predicted,
+                        Some(real_machine.pit.channel_out(channel)),
+                        "predicted_pit_out(channel={channel}, prior={prior_runs_core_clocks}, \
+                         core={core_clocks_so_far}) must match a real advance_devices \
+                         of the same core+scaled-bus clock total"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
+        // BCD fallback (P4a Task 2.3): out_after conservatively declines for a
+        // BCD-programmed counter, so the lazy 0x61 arm must fall all the way
+        // back to the exact non-lazy path -- io_touched set, today's live read
+        // -- rather than a second implementation of the bit composition.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path would
+        // otherwise apply.
+        with_bus(&mut machine, |bus| {
+            // Program channel 1 as BCD, mode 2: SC=01, RW=11, mode=010, BCD=1.
+            bus.write_io(0x43, BusWidth::Byte, 0x75).unwrap();
+            bus.write_io(0x41, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x41, BusWidth::Byte, 0x01).unwrap();
+            *bus.io_touched = false; // clear the setup writes' own effect
+
+            let expected = (bus.speaker.control_bits() & 0x03)
+                | (u8::from(bus.pit.channel_out(1)) << 4)
+                | (u8::from(bus.pit.channel_out(2)) << 5);
+            let value = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            assert!(
+                *bus.io_touched,
+                "a BCD-programmed channel must fall back to the non-lazy path, \
+                 which sets io_touched"
+            );
+            assert_eq!(
+                value,
+                u32::from(expected),
+                "the BCD fallback must return exactly today's live read"
+            );
+        });
+    }
+
+    #[test]
+    fn lazy_pit_conversion_honors_the_batch_entry_fractional_carry() {
+        // Carry-pinning differential (the Slice 2 review's FIX 2): the sweep test
+        // above passes even with `elapsed_pit_clocks`' carry zeroed, because its
+        // (T, carry) pairs rarely land where the carry decides the floor. This
+        // test CONSTRUCTS such a pair: seed the fractional accumulator near 1.0
+        // on both machines, pick an elapsed-PIT-clock count `k` sitting exactly
+        // on a channel-2 OUT toggle edge, then pick a T whose product crosses
+        // the k-th integer only WITH the carry (floor(carry + T*rate) == k but
+        // floor(0 + T*rate) == k-1). The lazy byte's bit 5 then flips iff the
+        // carry is honored. Mutation-verified: with `elapsed_pit_clocks` passing
+        // 0.0 instead of pit_clocks_at_batch_start this fails; restored, passes.
+        let carry = 0.999_f64;
+        let mut predicted_machine = test_machine();
+        predicted_machine.set_mode(GswMode::Gsw486); // Approximate: the lazy path
+        let mut real_machine = test_machine();
+        real_machine.set_mode(GswMode::Gsw486);
+        for machine in [&mut predicted_machine, &mut real_machine] {
+            with_bus(machine, |bus| {
+                // Channel 2, mode 3 (square wave), divisor 16: OUT toggles every
+                // 8 PIT input clocks, so toggle edges are dense in the probe
+                // range. GATE2 + data enable via port 0x61 bits 0/1.
+                bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
+                bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap();
+                bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
+                bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+            });
+            machine.run_cycles(5_000).unwrap();
+            machine.pit_clocks = carry; // the deliberate batch-entry carry seed
+        }
+        assert_eq!(predicted_machine.pit, real_machine.pit, "identical drive");
+
+        // The smallest elapsed-PIT-clock count sitting on an OUT toggle edge.
+        let k = (1..=64u64)
+            .find(|&k| {
+                predicted_machine.pit.out_after(2, k) != predicted_machine.pit.out_after(2, k - 1)
+            })
+            .expect("a mode-3 divisor-16 counter toggles within 64 input clocks");
+        let out_with_carry = predicted_machine.pit.out_after(2, k).unwrap();
+        let out_without_carry = predicted_machine.pit.out_after(2, k - 1).unwrap();
+        assert_ne!(out_with_carry, out_without_carry, "k is a toggle edge");
+
+        // A core-clock total T whose elapsed-PIT-clock floor lands on k only
+        // WITH the seeded carry, computed with the exact shared formula.
+        let rate = predicted_machine.timing.pit_per_clock;
+        let t = (1..=200_000u64)
+            .find(|&t| {
+                advance_fractional(carry, t, rate).0 == k
+                    && advance_fractional(0.0, t, rate).0 == k - 1
+            })
+            .expect("a carry-deciding T exists (the carry spans ~55 core clocks at 486)");
+
+        let (lazy_value, lazy_elapsed, io_touched) = with_bus(&mut predicted_machine, |bus| {
+            bus.core_clocks_so_far = t;
+            let elapsed = bus.elapsed_pit_clocks();
+            let value = bus.read_io(0x61, BusWidth::Byte, t).unwrap();
+            (value as u8, elapsed, *bus.io_touched)
+        });
+        assert!(!io_touched, "sanity: the lazy path");
+        assert_eq!(
+            lazy_elapsed, k,
+            "the lazy conversion must honor the batch-entry carry: elapsed must \
+             be k (carry crosses the integer), not k-1 (carry dropped)"
+        );
+        assert_eq!(
+            (lazy_value >> 5) & 1,
+            u8::from(out_with_carry),
+            "bit 5 must be the OUT level at k (carry honored), which differs \
+             from the level at k-1 (carry dropped)"
+        );
+
+        // The ground truth: a real advance_devices of the same T, then the
+        // non-lazy composition, must agree with the lazy byte bit for bit.
+        real_machine.advance_devices(t);
+        let real_value = (real_machine.speaker.control_bits() & 0x03)
+            | (u8::from(real_machine.pit.channel_out(1)) << 4)
+            | (u8::from(real_machine.pit.channel_out(2)) << 5);
+        assert_eq!(
+            lazy_value, real_value,
+            "lazy at T == a real advance_devices(T) then read, on the \
+             carry-deciding (T, carry) pair"
+        );
+    }
+
+    #[test]
+    fn lazy_opl_status_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
+        // P4a Slice 3 Task 3.2, mirroring the 3DA/3BA/3C2 and 0x61 cases: in the
+        // Approximate class (486/586) an OPL status read (0x388/0x38A and their
+        // SB16 mirrors) must NOT end the batch (io_touched stays false), while
+        // the Accurate class (286/386) keeps the exact prior behavior
+        // (io_touched set). Covers every alias `opl_port` maps to a status
+        // read: the native 0x388/0x38A and the SB16 mirrors 0x220/0x222/0x228.
+        let status_ports = [0x388u16, 0x38a, 0x220, 0x222, 0x228];
+
+        let mut accurate = test_machine(); // Gsw386 by construction
+        for &port in &status_ports {
+            with_bus(&mut accurate, |bus| {
+                *bus.io_touched = false;
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    *bus.io_touched,
+                    "port {port:#06X}: the Accurate class must still set \
+                     io_touched on an OPL status read"
+                );
+            });
+        }
+
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        for &port in &status_ports {
+            with_bus(&mut approximate, |bus| {
+                *bus.io_touched = false;
+                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                assert!(
+                    !*bus.io_touched,
+                    "port {port:#06X}: the Approximate class must NOT set \
+                     io_touched on an OPL status read (the lazy path)"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn lazy_opl_status_read_returns_the_same_byte_a_non_lazy_read_would_at_batch_start() {
+        // At batch start (zero in-batch clocks, predicted_opl_status degenerates
+        // to the batch-entry live status() exactly, the OPL counterpart of
+        // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy
+        // status byte must be byte-identical to what the pre-Task-3.2 read
+        // would have returned for the same live OPL state.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // latch reg 0x04
+            bus.write_io(0x389, BusWidth::Byte, 0x80).unwrap(); // reset IRQ flags
+            bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // latch reg 0x02
+            bus.write_io(0x389, BusWidth::Byte, 0xff).unwrap(); // timer 1 preset
+            bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // latch reg 0x04
+            bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+        });
+        machine.run_cycles(5_000).unwrap();
+
+        let expected = machine.opl.status();
+
+        let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
+            let value = bus.read_io(0x388, BusWidth::Byte, 0).unwrap();
+            (value, *bus.io_touched)
+        });
+
+        assert!(
+            !io_touched,
+            "sanity: this is the lazy path (Approximate class)"
+        );
+        assert_eq!(
+            lazy_value,
+            u32::from(expected),
+            "the lazy OPL status byte must equal the non-lazy read at batch \
+             start (zero in-batch clocks)"
+        );
+    }
+
+    #[test]
+    fn adlib_detection_idiom_only_the_address_write_ends_the_batch() {
+        // The AdLib detection idiom (Ralf Brown's canonical probe): one
+        // address-port write followed by up to six status-port reads in the
+        // same polling session. Before Slice 3 every one of those 7 accesses
+        // ended a CPU batch; after this slice only the write does, so a poll
+        // loop chains as run_straight_line continuations exactly like the
+        // 3DA/0x61 idioms.
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
+
+        with_bus(&mut machine, |bus| {
+            *bus.io_touched = false;
+            let _ = bus.write_io(0x388, BusWidth::Byte, 0x04); // address write
+            assert!(
+                *bus.io_touched,
+                "the address-port write must still set io_touched (writes \
+                 stay batch-ending)"
+            );
+
+            *bus.io_touched = false; // reset the flag, as the plan's idiom check does
+            for _ in 0..6 {
+                let _ = bus.read_io(0x388, BusWidth::Byte, 0).unwrap();
+            }
+            assert!(
+                !*bus.io_touched,
+                "up to six status-port reads in one continuous polling \
+                 session must never set io_touched in the Approximate class"
+            );
+        });
+    }
+
+    #[test]
+    fn predicted_opl_status_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() {
+        // Differential no-time-travel test, the OPL counterpart of
+        // predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n
+        // and predicted_pit_out_after_n_clocks_matches_...: build two
+        // identically-driven machines, snapshot one into a MachineBus, compute
+        // predicted_opl_status for a given in-batch clock total, and call
+        // advance_devices for real on the other with the same total (expressed
+        // in the same core+scaled-bus units) -- the two must agree exactly.
+        // The timer is left RUNNING (armed but not yet expired) and the T
+        // sweep straddles the overflow crossing, so both the pre- and
+        // post-expiry status bytes are exercised.
+        for prior_runs_core_clocks in [0u64, 61, 33_000] {
+            for core_clocks_so_far in [0u64, 100, 12_345, 450_000] {
+                let mut predicted_machine = test_machine();
+                predicted_machine.set_mode(GswMode::Gsw486);
+                with_bus(&mut predicted_machine, |bus| {
+                    bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // reg 0x02
+                    bus.write_io(0x389, BusWidth::Byte, 0xf0).unwrap(); // preset
+                    bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // reg 0x04
+                    bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+                });
+                predicted_machine.run_cycles(5_000).unwrap();
+
+                let mut real_machine = test_machine();
+                real_machine.set_mode(GswMode::Gsw486);
+                with_bus(&mut real_machine, |bus| {
+                    bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap();
+                    bus.write_io(0x389, BusWidth::Byte, 0xf0).unwrap();
+                    bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap();
+                    bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap();
+                });
+                real_machine.run_cycles(5_000).unwrap();
+                assert_eq!(predicted_machine.opl, real_machine.opl);
+
+                let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+                    let before = bus.trace.elapsed_clocks();
+                    if core_clocks_so_far > 0 {
+                        bus.trace.record_instruction_fetch_run(0, 1, 0);
+                    }
+                    let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+                    bus.prior_runs_core_clocks = prior_runs_core_clocks;
+                    bus.core_clocks_so_far = core_clocks_so_far;
+                    (bus.predicted_opl_status(), raw_bus_clocks)
+                });
+
+                let step = prior_runs_core_clocks
+                    + core_clocks_so_far
+                    + real_machine.scale_bus(raw_bus_clocks);
+                real_machine.advance_devices(step);
+
+                assert_eq!(
+                    predicted,
+                    real_machine.opl.status(),
+                    "predicted_opl_status(prior={prior_runs_core_clocks}, \
+                     core={core_clocks_so_far}) must match a real \
+                     advance_devices of the same core+scaled-bus clock total"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_opl_conversion_honors_the_batch_entry_fractional_carry() {
+        // Carry-pinning differential (the Slice 2 review's FIX 2, carried
+        // forward to Slice 3): a sweep test alone can pass even with
+        // `elapsed_opl_micros`' carry zeroed, if its (T, carry) pairs rarely
+        // land where the carry decides the floor. This test CONSTRUCTS such a
+        // pair: seed the fractional accumulator near 1.0 on both machines,
+        // pick an elapsed-microsecond count `k` sitting exactly on timer 1's
+        // overflow step (step_us=80), then pick a T whose product crosses the
+        // k-th integer only WITH the carry (floor(carry + T*rate) == k but
+        // floor(0 + T*rate) == k-1). Mutation-verified: with
+        // `elapsed_opl_micros` passing 0.0 instead of
+        // `opl_micros_at_batch_start` this fails; restored, passes.
+        let carry = 0.999_f64;
+        let mut predicted_machine = test_machine();
+        predicted_machine.set_mode(GswMode::Gsw486); // Approximate: the lazy path
+        let mut real_machine = test_machine();
+        real_machine.set_mode(GswMode::Gsw486);
+        for machine in [&mut predicted_machine, &mut real_machine] {
+            with_bus(machine, |bus| {
+                bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // reg 0x02
+                bus.write_io(0x389, BusWidth::Byte, 0xfe).unwrap(); // preset 0xfe: one step from overflow
+                bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // reg 0x04
+                bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+            });
+            // A tiny guest-clock nudge, not enough to cross even one 80us
+            // step at 66 MHz (486): keeps the timer's own accumulated_us near
+            // zero so the overflow step search below stays close to k=80.
+            machine.run_cycles(100).unwrap();
+            machine.opl_micros = carry; // the deliberate batch-entry carry seed
+        }
+        assert_eq!(predicted_machine.opl, real_machine.opl, "identical drive");
+
+        // The smallest elapsed-microsecond count sitting on timer 1's overflow
+        // step (preset 0xfe means one step away from crossing 0xff).
+        let step_us = 80u64;
+        let k = (1..=step_us * 4)
+            .find(|&k| {
+                predicted_machine.opl.timer1_expired_after(k)
+                    != predicted_machine.opl.timer1_expired_after(k - 1)
+            })
+            .expect("timer 1 (step_us=80) overflows within a few steps");
+        let expired_with_carry = predicted_machine.opl.timer1_expired_after(k);
+        let expired_without_carry = predicted_machine.opl.timer1_expired_after(k - 1);
+        assert_ne!(
+            expired_with_carry, expired_without_carry,
+            "k is the overflow step"
+        );
+
+        // A core-clock total T whose elapsed-microsecond floor lands on k only
+        // WITH the seeded carry, computed with the exact shared formula.
+        let rate = predicted_machine.timing.micros_per_clock;
+        let t = (1..=200_000u64)
+            .find(|&t| {
+                advance_fractional(carry, t, rate).0 == k
+                    && advance_fractional(0.0, t, rate).0 == k - 1
+            })
+            .expect("a carry-deciding T exists");
+
+        let (lazy_value, lazy_elapsed, io_touched) = with_bus(&mut predicted_machine, |bus| {
+            bus.core_clocks_so_far = t;
+            let elapsed = bus.elapsed_opl_micros();
+            let value = bus.read_io(0x388, BusWidth::Byte, t).unwrap();
+            (value as u8, elapsed, *bus.io_touched)
+        });
+        assert!(!io_touched, "sanity: the lazy path");
+        assert_eq!(
+            lazy_elapsed, k,
+            "the lazy conversion must honor the batch-entry carry: elapsed \
+             must be k (carry crosses the integer), not k-1 (carry dropped)"
+        );
+        assert_eq!(
+            (lazy_value >> 6) & 1,
+            u8::from(expired_with_carry),
+            "bit 6 (timer-1 flag) must reflect expiry at k (carry honored), \
+             which differs from the state at k-1 (carry dropped)"
+        );
+
+        // The ground truth: a real advance_devices of the same T, then the
+        // non-lazy status(), must agree with the lazy byte bit for bit.
+        real_machine.advance_devices(t);
+        let real_value = real_machine.opl.status();
+        assert_eq!(
+            lazy_value, real_value,
+            "lazy at T == a real advance_devices(T) then read, on the \
+             carry-deciding (T, carry) pair"
+        );
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
+        // Captured before the struct literal below since video/trace are also
+        // mutably borrowed by other fields in that same literal.
+        let beam_at_batch_start = machine.video.beam_dots();
+        let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
+        let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
         let mut bus = MachineBus {
             memory: &mut machine.memory,
             ram_lookup: &mut machine.ram_lookup,
@@ -18825,10 +20375,24 @@ mod tests {
             wait_states: machine.profile.wait_states,
             cache: &mut machine.cache_model,
             flat_data_cost: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
+            lazy_port_reads: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut machine.io_touched,
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,
             core_clocks_so_far: 0,
+            prior_runs_core_clocks: 0,
+            elapsed_clocks_at_batch_start: machine.elapsed_clocks,
+            vga_dots_at_batch_start: machine.vga_dots,
+            beam_at_batch_start,
+            trace_elapsed_at_batch_start,
+            bus_rem_at_batch_start: machine.bus_rem,
+            inv_clock_at_batch_start: machine.timing.inv_clock,
+            bus_num_at_batch_start,
+            bus_den_at_batch_start,
+            pit_clocks_at_batch_start: machine.pit_clocks,
+            pit_per_clock_at_batch_start: machine.timing.pit_per_clock,
+            opl_micros_at_batch_start: machine.opl_micros,
+            micros_per_clock_at_batch_start: machine.timing.micros_per_clock,
         };
         f(&mut bus)
     }

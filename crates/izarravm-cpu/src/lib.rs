@@ -1466,7 +1466,43 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// decode-cache re-peek at the new linear EIP, page-local decode) is unchanged, and a
 /// faulting stack read or segment-limit hit still routes through `finish_instruction`'s
 /// rewind-and-deliver exactly as on the one-instruction path.
-fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> bool {
+///
+/// P4a Task 1.3 additionally admits the IN forms (0xe4 IN AL,imm8; 0xe5 IN AX/EAX,imm8;
+/// 0xec IN AL,DX; 0xed IN AX/EAX,DX) within `DecodeGroup::PortIo`, but ONLY when `level`
+/// is in the Approximate timing class (I486/I586): a lazy port read (`MachineBus::read_io`)
+/// no longer sets `io_touched` for the VGA status ports, so an IN reaching those ports no
+/// longer needs to end the run to keep device state exact, letting a poll loop chain as
+/// continuations instead of paying a full run restart every iteration. The OUT forms
+/// (0xe6/0xe7/0xee/0xef) stay terminators: a write always sets `io_touched` (no lazy write
+/// path exists), so admitting them would end the run right after anyway while widening the
+/// blast radius for no benefit. INS/OUTS stay terminators too.
+///
+/// The same Approximate-class gate also admits the TEST accumulator-immediate forms
+/// (0xa8 TEST AL,imm8; 0xa9 TEST AX/EAX,imm) within `DecodeGroup::Misc`. Their Misc
+/// routing is a decode-classification artifact of the odd opcode neighborhood they share
+/// with the BCD/string/HLT one-offs (see `route_group`'s A14 block), not a semantic
+/// property: they are pure flag-writing ALU ops (AND-for-flags, no write-back), no memory,
+/// no ModRM, no port, no control transfer, and their immediate is fully pre-parsed at
+/// decode -- strictly simpler than the ALU forms `block_straight_line` already admits.
+/// They matter because the canonical vretrace poll idiom is `IN; TEST AL,imm8; Jcc; JMP`:
+/// with IN admitted but TEST still a terminator, every poll iteration ends its run at the
+/// TEST and pays a full run restart, which measured at about the cost of the batch
+/// epilogue the lazy port read had just eliminated (P4a A/B, poll-3da flat at 0.204/0.051).
+/// NO other Misc opcode is admitted: the BCD adjusts, AAM/AAD (#DE path), SALC/XLAT
+/// (memory read), INS/OUTS (port + string), and HLT all stay terminators.
+///
+/// Gated on `level` (not a runtime bus flag) so the Accurate class (I286/I386) keeps
+/// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
+/// per decode, and `Cpu386::set_level` unconditionally invalidates the decode cache
+/// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
+/// admission re-resolved -- after any level change. There is no stale-entry window where an
+/// I286-level IN or TEST could carry an I586-level admission decision forward.
+fn block_continuable(
+    group: DecodeGroup,
+    opcode: u16,
+    modrm: Option<ModRm>,
+    level: CpuLevel,
+) -> bool {
     if block_straight_line(group) {
         return true;
     }
@@ -1479,6 +1515,15 @@ fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> b
     // rewind exactly as on the one-instruction path.
     if group == DecodeGroup::StringOps {
         return true;
+    }
+    if group == DecodeGroup::PortIo {
+        // Only the IN forms, only in the Approximate class; see the doc comment above.
+        return level >= CpuLevel::I486 && matches!(opcode, 0xe4 | 0xe5 | 0xec | 0xed);
+    }
+    if group == DecodeGroup::Misc {
+        // Only TEST AL/AX/EAX,imm, only in the Approximate class; see the doc
+        // comment above. Everything else in the Misc bucket stays a terminator.
+        return level >= CpuLevel::I486 && matches!(opcode, 0xa8 | 0xa9);
     }
     if group != DecodeGroup::ControlFlow {
         return false;
@@ -4226,7 +4271,7 @@ impl Cpu386 {
         insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
         // Resolve the continuation gate once per decode (the ModRM is in by now), so the
         // per-continuation check in `run_straight_line` reads a single cached flag.
-        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm);
+        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm, self.level);
 
         Ok(insn)
     }
@@ -11687,6 +11732,13 @@ mod tests {
         // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
         // reports the same step-break edge the real bus does.
         io_touched: bool,
+        // When true, `read_io` does NOT set `io_touched`, modeling the machine's
+        // Approximate-class lazy status-port path (MachineBus::read_io's
+        // 3DA/3BA/3C2 arm), so poll-loop chaining across an IN can be exercised
+        // through the CPU alone. Writes still set io_touched (no lazy write path
+        // exists on the machine either). Default false: the classic every-port-
+        // access-breaks behavior.
+        lazy_io_reads: bool,
         // Records the `core_clocks_so_far` value the CPU threaded into the most recent
         // `read_io` call, so tests can assert on it directly (see
         // `core_clocks_so_far_reflects_prior_instructions_not_the_in_flight_one`).
@@ -11700,6 +11752,7 @@ mod tests {
                 trace: BusTrace::default(),
                 pending_irq: None,
                 io_touched: false,
+                lazy_io_reads: false,
                 last_read_io_core_clocks_so_far: None,
             }
         }
@@ -11882,7 +11935,9 @@ mod tests {
             width: BusWidth,
             core_clocks_so_far: u64,
         ) -> Result<u32, BusError> {
-            self.io_touched = true;
+            if !self.lazy_io_reads {
+                self.io_touched = true;
+            }
             self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoRead,
@@ -11938,21 +11993,20 @@ mod tests {
     }
 
     #[test]
-    fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction() {
-        // `DecodeGroup::PortIo` is not in `block_continuable`'s admitted set (see
-        // that function's comment: "INS/OUTS are Misc and stay terminators", true
-        // of plain IN/OUT too, by the same reasoning: every port access sets
-        // `io_touched` today, ending the run right after it runs, so PortIo has
-        // never needed to be a continuation). That means an IN/OUT can ONLY ever
-        // be `run_straight_line`'s FIRST instruction, never a continuation, in
-        // TODAY's architecture: this test pins that as the reason
-        // core_clocks_so_far is unconditionally 0 for every read_io call reachable
-        // right now, confirming Task 0.2's threading is a true no-op until Slice 1
-        // additionally makes PortIo continuable for the lazy-port case (a second
-        // seam change beyond the io_touched narrowing the plan already names;
-        // flagged here for Slice 1, out of Task 0.2's scope).
+    fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_accurate_class() {
+        // In the Accurate class (I286/I386) `block_continuable` never admits
+        // `DecodeGroup::PortIo` (see that function's doc comment: the P4a Task 1.3
+        // IN admission is gated on the Approximate class only), so an IN can ONLY
+        // ever be `run_straight_line`'s FIRST instruction there, never a
+        // continuation -- every port access still sets `io_touched` unconditionally
+        // in the Accurate class's read_io dispatch, ending the run right after it
+        // runs. This test pins core_clocks_so_far == 0 for that first-instruction
+        // position, explicitly on I386 so it does not silently start exercising the
+        // Approximate-class continuation path if the CPU's default level ever
+        // changes. See the sibling test for the Approximate-class continuation case.
         let code = [0xec]; // in al,dx
         let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I386);
         let mut bus = TestBus::with_memory(memory);
 
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
@@ -11960,12 +12014,251 @@ mod tests {
         assert_eq!(
             bus.last_read_io_core_clocks_so_far,
             Some(0),
-            "an IN that is the run's first (and, today, only possible) \
-             instruction position sees core_clocks_so_far == 0"
+            "an IN that is the run's first (and, in the Accurate class, only \
+             possible) instruction position sees core_clocks_so_far == 0"
         );
         assert!(
             outcome.core_clocks > 0,
             "the IN itself still charges clocks"
+        );
+    }
+
+    #[test]
+    fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approximate_class_continuation()
+     {
+        // P4a Task 1.3: in the Approximate class (I486/I586) `block_continuable`
+        // admits the IN forms (0xe4/0xe5/0xec/0xed), so an IN reached as a
+        // continuation (not the run's first instruction) must see
+        // core_clocks_so_far equal to the running total of every prior
+        // instruction in the run, exactly like the Group/DataMove continuation
+        // case pinned in `core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation`.
+        // Eight INCs then an IN: the IN's core_clocks_so_far must equal the eight
+        // INCs' combined charge. Eight (not two, unlike the sibling Accurate-class
+        // test) because I586's `level_timing` factor is (1, 12) -- a single cheap
+        // INC can legitimately round to 0 charged clocks under the fractional
+        // remainder carry (see `scale_clocks`'s doc comment), so a short run risks
+        // a degenerate all-zero total that cannot distinguish "tracks the running
+        // total" from "always reads 0". Eight instructions guarantees the carry
+        // has produced a nonzero total well before the IN.
+        let code = [0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xec]; // inc ax x8; in al,dx
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        // real_mode_cpu's default level (Cpu386::default()) is already I586
+        // (Approximate); set it explicitly so this test does not silently change
+        // meaning if the default ever moves.
+        cpu.set_level(CpuLevel::I586);
+        let mut bus = TestBus::with_memory(memory);
+        // Warm the decode cache one instruction at a time via single-step `cycle`
+        // (not `run_straight_line`): once the IN is continuable, a warm-up call
+        // to `run_straight_line` may itself chain multiple instructions per call,
+        // so the number of `run_straight_line` calls needed to warm exactly 9
+        // addresses is no longer deterministic. `cycle` always decodes and
+        // advances exactly one instruction per call, so 9 calls warms exactly
+        // addresses 0..9 regardless of continuability.
+        for _ in 0..9 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.reset_perf_counters();
+        // The warm-up's IN (address 8) set TestBus::io_touched, which never
+        // self-clears (unlike the real machine batch loop, which opens each batch
+        // with a fresh false). Clear it here so the measurement run below is not
+        // ended by stale warm-up state on its very first instruction.
+        bus.io_touched = false;
+
+        // Independently capture "the eight INCs' combined charge" the same way
+        // the sibling Group-continuation test does: clone the warmed-up CPU (so
+        // its `timing_rem` fractional-clock carry matches) and single-step eight
+        // INCs on a clone bus.
+        let eight_incs_total = {
+            let mut solo = cpu.clone();
+            let mut solo_bus = TestBus::with_memory(vec![0x40; 8]);
+            let mut total = 0u32;
+            for _ in 0..8 {
+                total += solo.cycle(&mut solo_bus).unwrap().core_clocks;
+            }
+            total
+        };
+        assert!(
+            eight_incs_total > 0,
+            "sanity: eight INCs must have produced a nonzero charge under the \
+             remainder carry, or this test cannot distinguish the running total \
+             from a degenerate always-0 read"
+        );
+
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+        assert_eq!(
+            cpu.perf_counters().straight_line_runs,
+            1,
+            "one chained run: eight INCs then the IN, all continuable in the \
+             Approximate class"
+        );
+        assert_eq!(
+            bus.last_read_io_core_clocks_so_far,
+            Some(eight_incs_total.into()),
+            "the IN reached as the run's ninth instruction (a continuation) must \
+             see core_clocks_so_far equal to the eight INCs' combined charge, not 0"
+        );
+        assert!(
+            outcome.core_clocks > eight_incs_total,
+            "the IN's own charge must be included in the run total"
+        );
+    }
+
+    #[test]
+    fn poll_loop_with_test_imm_chains_end_to_end_in_the_approximate_class() {
+        // The canonical vretrace poll idiom: IN; TEST AL,imm8; JZ back; (JMP back,
+        // unreachable here since AL reads 0 so ZF is always set). With 0xa8
+        // admitted alongside the IN forms in the Approximate class, the WHOLE
+        // loop must chain as one run_straight_line call up to the clock cap --
+        // no run restart per iteration. The bus models the machine's lazy
+        // status-port path (lazy_io_reads: reads do not set io_touched), since
+        // chaining across the IN is only reachable when the port read is lazy.
+        let code = [
+            0xEC, // 0: in al, dx (TestBus returns 0 -> AL = 0)
+            0xA8, 0x08, // 1: test al, 0x08 (AL=0 -> ZF set)
+            0x74, 0xFB, // 3: jz -5 -> back to 0 (always taken)
+            0xEB, 0xF9, // 5: jmp -7 -> back to 0 (unreachable, decode fodder only)
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I586);
+        let mut bus = TestBus::with_memory(memory);
+        bus.lazy_io_reads = true;
+        // Warm the decode cache: one single-step per loop instruction (IN, TEST,
+        // JZ -- the JMP is unreachable and irrelevant to the chain).
+        for _ in 0..3 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.registers.eip, 0, "warm-up looped back to the IN");
+        cpu.reset_perf_counters();
+
+        // A finite cap: the loop never exits on its own, so the ONLY clean end
+        // for a fully-chained run is the cap. Big enough for many iterations.
+        let outcome = cpu.run_straight_line(&mut bus, 1_000).unwrap();
+
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.straight_line_runs, 1,
+            "the whole poll loop must chain inside ONE run_straight_line call"
+        );
+        assert_eq!(
+            p.brk_cap, 1,
+            "the run must end on the clock cap, not on a step break or a \
+             non-continuable terminator (brk_step={}, brk_branch={})",
+            p.brk_step, p.brk_decode_or_branch
+        );
+        assert!(
+            p.instructions > 100,
+            "hundreds of poll iterations must fit under the cap once the loop \
+             chains (saw {} instructions)",
+            p.instructions
+        );
+        assert!(
+            bus.last_read_io_core_clocks_so_far.unwrap() > 0,
+            "a late-iteration IN reached as a continuation must see the running \
+             (nonzero) core-clock total, proving the INs chained mid-run"
+        );
+        assert!(
+            u64::from(outcome.core_clocks) >= 1_000,
+            "the chained run must have consumed the whole cap"
+        );
+    }
+
+    #[test]
+    fn poll_loop_test_imm_still_terminates_the_run_in_the_accurate_class() {
+        // The complementary Accurate-class pin: at I386 neither the IN (0xec)
+        // nor the TEST (0xa8) is continuable, so even with the bus's lazy-read
+        // knob on (no io_touched step break at all), the same poll loop must
+        // stop at the first continuation attempt: the run is exactly the one IN,
+        // ended by TEST's non-admission. This is the byte-identical run-shape
+        // guarantee for 286/386.
+        let code = [
+            0xEC, // 0: in al, dx
+            0xA8, 0x08, // 1: test al, 0x08
+            0x74, 0xFB, // 3: jz -5 -> back to 0
+            0xEB, 0xF9, // 5: jmp -7 -> back to 0
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I386);
+        let mut bus = TestBus::with_memory(memory);
+        bus.lazy_io_reads = true;
+        for _ in 0..3 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.registers.eip, 0, "warm-up looped back to the IN");
+        cpu.reset_perf_counters();
+
+        let _ = cpu.run_straight_line(&mut bus, 1_000).unwrap();
+
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.straight_line_runs, 1,
+            "one run_straight_line call was made"
+        );
+        assert_eq!(
+            p.instructions, 1,
+            "the Accurate class must retire exactly the IN and stop at the \
+             non-continuable TEST (no io_touched break was available to end it, \
+             so this pins the admission gate itself)"
+        );
+        assert_eq!(
+            p.brk_decode_or_branch, 1,
+            "the run must end on the continuation-admission check, not a step \
+             break (brk_step={})",
+            p.brk_step
+        );
+    }
+
+    #[test]
+    fn in_stays_a_run_terminator_not_a_continuation_in_the_accurate_class() {
+        // Pins the IN half of the Approximate-class admission gate, which the
+        // sibling poll-loop test cannot: there the run ends at the TEST before
+        // any continuation attempt ever reaches an IN, so deleting the level
+        // gate from the PortIo arm alone would not fail it (the spec review
+        // proved the earlier Accurate-class test -- a single IN at eip 0,
+        // trivially the run's first instruction -- pinned nothing). Here two
+        // continuable INCs precede the IN: at I386 the run must chain the INCs
+        // and stop at the continuation-admission check BEFORE the IN executes,
+        // observable as read_io never having been called during the run. The
+        // bus's lazy-read knob is on, so no io_touched step break could end the
+        // run in the gate's place. Mutation-verified: with the level gate
+        // removed from the PortIo arm the IN chains and read_io fires, failing
+        // the None assertion; with the gate intact it passes.
+        let code = [0x40, 0x40, 0xec]; // inc ax; inc ax; in al,dx
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I386);
+        let mut bus = TestBus::with_memory(memory);
+        bus.lazy_io_reads = true;
+        // Warm all three decode-cache lines via single-steps (the IN included,
+        // so its cached `continuable` flag is what gates the measured run).
+        for _ in 0..3 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        cpu.registers.eip = 0;
+        cpu.reset_perf_counters();
+        // The warm-up executed the IN once; clear its trace so the assertion
+        // below observes only the measured run.
+        bus.last_read_io_core_clocks_so_far = None;
+
+        let _ = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.instructions, 2,
+            "the Accurate class must retire exactly the two INCs and stop at \
+             the non-continuable IN"
+        );
+        assert_eq!(
+            bus.last_read_io_core_clocks_so_far, None,
+            "read_io must NOT have been called: the run stopped BEFORE the IN, \
+             at the continuation-admission check"
+        );
+        assert_eq!(
+            p.brk_decode_or_branch, 1,
+            "the run must end on the continuation-admission check, not a step \
+             break (brk_step={})",
+            p.brk_step
         );
     }
 
