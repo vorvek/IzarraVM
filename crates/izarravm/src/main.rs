@@ -3209,6 +3209,124 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// UDPROBE.COM: a 62-byte guest fixture that installs its own INT 06h
+    /// handler and then executes a 386-only opcode (`movzx ax, bl`). At the
+    /// 286 ISA level the opcode raises #UD; a faithful V86 monitor reflects
+    /// vector 6 to the guest IVT and the handler prints "UDPROBE CAUGHT". On
+    /// a 386+ level the opcode simply executes and it prints "UDPROBE MISSED"
+    /// (so running it at the wrong level is visible). NASM source:
+    /// ```text
+    /// cpu 286
+    /// org 0x100
+    /// start:  mov ax, 0x2506          ; DOS set INT 06h -> DS:DX (DS=CS in a .COM)
+    ///         mov dx, handler
+    ///         int 0x21
+    ///         db 0x0F, 0xB6, 0xC3     ; movzx ax, bl -- 386-only, #UD at 286
+    ///         mov dx, msg_missed      ; fell through: the opcode executed
+    ///         jmp print_exit
+    /// handler: mov dx, msg_caught     ; reflected #UD lands here; never IRETs back
+    /// print_exit:
+    ///         mov ah, 9
+    ///         int 0x21
+    ///         mov ax, 0x4C00
+    ///         int 0x21
+    /// msg_caught: db 'UDPROBE CAUGHT', 0x0D, 0x0A, '$'
+    /// msg_missed: db 'UDPROBE MISSED', 0x0D, 0x0A, '$'
+    /// ```
+    const UDPROBE_COM: [u8; 62] = [
+        0xb8, 0x06, 0x25, 0xba, 0x10, 0x01, 0xcd, 0x21, 0x0f, 0xb6, 0xc3, 0xba, 0x2d, 0x01, 0xeb,
+        0x03, 0xba, 0x1c, 0x01, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0x55, 0x44,
+        0x50, 0x52, 0x4f, 0x42, 0x45, 0x20, 0x43, 0x41, 0x55, 0x47, 0x48, 0x54, 0x0d, 0x0a, 0x24,
+        0x55, 0x44, 0x50, 0x52, 0x4f, 0x42, 0x45, 0x20, 0x4d, 0x49, 0x53, 0x53, 0x45, 0x44, 0x0d,
+        0x0a, 0x24,
+    ];
+
+    /// A guest PROGRAM hitting a 386-only instruction at GSWMODE 286 must not
+    /// kill the machine: TOKAEMM's monitor now has IDT gates for the CPU
+    /// exceptions V86 code can raise (#DE/#UD/#NM) and reflects them to the
+    /// guest's real-mode IVT — period-faithful (DOS-era INT 06h handling: the
+    /// program deals with it or dies; the system survives). Before those gates
+    /// existed, the #UD hit a zeroed IDT descriptor and the whole machine died
+    /// with "general protection fault while loading selector 0x0000".
+    /// Same dependency as the test above: needs the izarravm-cpu ring-0 gate
+    /// exemption (PR #387) so the monitor itself runs at I286.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_gswmode_286_guest_ud_reflects_to_the_ivt() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_udreflect_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nGSWMODE 286\r\nUDPROBE\r\nGSWMODE 586\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "GSWMODE.COM".to_string(),
+                        izarravm_firmware::gswmode_com().to_vec(),
+                    ),
+                    ("UDPROBE.COM".to_string(), UDPROBE_COM.to_vec()),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault: a guest-program #UD at the 286 level must reflect to \
+                 the IVT, not kill the machine: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("udprobe caught"),
+            "UDPROBE's INT 06h handler never ran — the #UD was not reflected to \
+             the guest IVT (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            !lower.contains("udprobe missed"),
+            "UDPROBE fell through the MOVZX — the CPU was not at the 286 ISA \
+             level when it ran (stop={stop:?}).\n{text}"
+        );
+        assert_eq!(
+            machine.active_mode(),
+            GswMode::Gsw586,
+            "the run should end back at 586 (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the UDPROBE sequence (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// Audit item 10: the vendored FreeDOS MEM (toka-dos/freedos/mem) runs under
     /// the default V86 boot and both `MEM` and `MEM /P` produce sane output.
     /// Toka-DOS diverges from upstream MEM here: upstream's `/P` is only a

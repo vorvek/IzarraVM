@@ -171,6 +171,11 @@ interrupt:
     retf
 
 init:
+    ; NOTE: INIT is inherently 386-only (it builds the PM/paging monitor). A
+    ; pre-386 guard (read Lotura port 0xE1, decline with a "requires a 386"
+    ; message like real EMM386) is deferred: a GSW-286 cold boot currently
+    ; hangs before CONFIG.SYS with or without TOKAEMM (machine/BIOS-level),
+    ; so the guard's bail path cannot be exercised end-to-end yet.
     ; Report resident size FIRST, while ES:BX still points at the request header
     ; (the setup below clobbers BX). r_endaddr = drv_seg:resident_end covers the
     ; driver's code + tables, which stay resident under the monitor permanently.
@@ -1630,7 +1635,14 @@ gdtr:
 %endmacro
 align 8
 idt:
-    times 8*8 db 0                ; 0..7
+    IDTGATE exc_de                ; 0    #DE divide error -> reflect to IVT[0]
+    times 5*8 db 0                ; 1..5 unbuilt: no expected V86 source (NMI
+                                  ;      unused; debug vectors need a resident
+                                  ;      debugger; BOUND is vanishingly rare)
+    IDTGATE exc_ud                ; 6    #UD invalid opcode -> reflect to IVT[6]
+                                  ;      (a guest program using 386-only ops at
+                                  ;      GSWMODE 286 dies alone, not the system)
+    IDTGATE exc_nm                ; 7    #NM no-FPU trap -> reflect to IVT[7]
     IDTGATE irq_m0                ; 8    IRQ0 timer
     IDTGATE irq_m1                ; 9    IRQ1 keyboard
     IDTGATE irq_m2                ; 10   IRQ2 cascade (never raw; stub for safety)
@@ -1978,6 +1990,33 @@ irq_body:                         ; vec13_entry joins here (segs already set)
     iretd
 .go:
     call irq_reflect_line
+    popad
+    iretd
+
+; ---- CPU exceptions raised by V86 guest code (#DE 0, #UD 6, #NM 7 — the
+; no-error-code faults a real-mode program can produce). Reflect to the guest
+; IVT exactly like a hardware INT: the frame EIP already points at the
+; faulting instruction (286+ fault semantics, what DOS-era INT 00h/06h/07h
+; handlers expect). No EOI — exceptions have no PIC line. A guest with no
+; handler of its own inherits the BIOS IVT default, same as real hardware. ----
+exc_de:
+    pushad
+    mov ebx, 0
+    jmp exc_common
+exc_ud:
+    pushad
+    mov ebx, 6
+    jmp exc_common
+exc_nm:
+    pushad
+    mov ebx, 7
+exc_common:
+    mov ax, 0x10
+    mov ds, ax
+    mov ax, 0x20
+    mov fs, ax
+    lea ebp, [esp + 32]
+    call reflect_vector
     popad
     iretd
 
