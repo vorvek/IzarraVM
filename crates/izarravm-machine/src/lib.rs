@@ -8446,6 +8446,12 @@ impl Machine {
     /// when unmasked/deliverable; the result is the soonest of the applicable
     /// wakes, clamped to the deadline and to at least one clock so the run loop
     /// always makes progress.
+    ///
+    /// Known gap: there is no Yamaha ADPCM-B wake term, so a guest halted with
+    /// ONLY the ADPCM block IRQ armed never wakes (HLT reports a genuine halt).
+    /// Left as-is on purpose: adding the term would shift HLT wake instants,
+    /// and the Accurate class's byte-identical contract pins this path. The
+    /// Approximate batch cap (approx_batch_cap) does include an ADPCM term.
     fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
         if !self.cpu.interrupts_enabled() {
             return None;
@@ -8523,8 +8529,9 @@ impl Machine {
     /// per-batch mask query buys no alignment.
     ///
     /// The PIT tick -> CPU clock conversion ignores the pit_clocks fractional
-    /// accumulator (up to one PIT tick of skew) and the audio estimators are
-    /// conservative for 16-bit stereo; both sit inside this class's license
+    /// accumulator (up to one PIT tick of skew; the same div_ceil idiom
+    /// next_timer_wake already uses for the HLT wake) and the audio estimators
+    /// are conservative for 16-bit stereo; both sit inside this class's license
     /// (results bit-exact, time approximate). Device-time exactness within a
     /// batch is unchanged: devices see the exact batch clock total, the speaker
     /// integrates PIT transitions sub-step, and the sample-phase producers emit
@@ -8542,9 +8549,12 @@ impl Machine {
                 cap = cap.min(clocks);
             }
         }
-        // Next audio block-IRQ edge. The rates mirror the wake estimators in
-        // next_timer_wake: the DSP block counter drains at the raw byte/word
-        // rate (rate_hz), the WSS and ADPCM counters at their frame rates.
+        // Next audio block-IRQ edge. The DSP/WSS rates mirror the wake
+        // estimators in next_timer_wake (the DSP block counter drains at the
+        // raw byte/word rate, rate_hz; the WSS counter at its frame rate). The
+        // ADPCM term is ADDITIONAL, at its frame rate: next_timer_wake has no
+        // ADPCM wake (a pre-existing gap, noted there), and closing it there
+        // would shift HLT wake instants, which byte-identity forbids here.
         if let Some(clocks) = self.dsp.clocks_until_next_irq(self.dsp.rate_hz(), clock_hz) {
             cap = cap.min(clocks);
         }

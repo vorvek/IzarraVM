@@ -160,6 +160,13 @@ impl Counter {
             // Modes 0/1: OUT rises once, when the count reaches zero. A high
             // OUT never rises again (mode 0 keeps counting with OUT high; a
             // mode-1 pulse ends by going Inactive).
+            // Divergence flag: in mode 0 a SINGLE-BYTE (LSB-only/MSB-only RW)
+            // count rewrite after terminal count does not drop OUT in this
+            // model (only the LSB-then-MSB first byte forces it low, see
+            // write_count), so the reloaded count runs with OUT high and never
+            // edges; the 8254 datasheet drops OUT on any new initial count.
+            // step_counting encodes the same behavior, so this estimator and
+            // the tick path stay behaviorally equivalent.
             0 | 1 => {
                 if self.out || v == 0 {
                     None
