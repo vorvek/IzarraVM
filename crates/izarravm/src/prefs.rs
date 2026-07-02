@@ -113,6 +113,10 @@ pub struct GuiPrefs {
     /// Last CD image (.iso/.cue/.bin) mounted, re-mounted on startup if it still
     /// exists. A config-file `cd_image` takes priority when both are present.
     pub last_cd_image: Option<PathBuf>,
+    /// Last host folder mounted as a CD, re-mounted (rebuilt) on startup if it
+    /// still exists. Mutually exclusive with `last_cd_image`: setting one
+    /// clears the other, since the CD drive holds one medium at a time.
+    pub last_cd_folder: Option<PathBuf>,
     /// Whether the beige control panel is expanded. Persisted so the collapse
     /// state survives a restart. Defaults to open.
     pub panel_open: bool,
@@ -128,6 +132,7 @@ impl Default for GuiPrefs {
             fullscreen: KeyBinding::new(true, false, false, "F11"),
             last_floppy_image: None,
             last_cd_image: None,
+            last_cd_folder: None,
             panel_open: true,
         }
     }
@@ -198,6 +203,7 @@ mod tests {
             fullscreen: KeyBinding::new(false, false, true, "Enter"),
             last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
             last_cd_image: Some(PathBuf::from("/tmp/game.iso")),
+            last_cd_folder: None,
             panel_open: false,
         };
         let text = toml::to_string_pretty(&prefs).expect("serialize");

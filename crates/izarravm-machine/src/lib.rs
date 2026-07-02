@@ -37,6 +37,7 @@ mod fat_name;
 mod fdc;
 mod floppy;
 mod ide;
+mod iso9660;
 mod katea_names;
 mod katea_tree;
 mod katea_volume;
@@ -54,6 +55,7 @@ mod uart;
 mod unittester;
 
 pub use cdimage::CdImage;
+pub use iso9660::{MAX_IMAGE_BYTES as CD_FOLDER_MAX_BYTES, build as build_cd_folder};
 pub use memmap::{
     CONVENTIONAL_TOP, HMA_BASE, HMA_TOP, MemRegion, SYSTEM_ROM_BASE, UPPER_MEMORY_BASE,
     VIDEO_RAM_BASE, classify, is_hma, is_umb_window,
@@ -20121,6 +20123,90 @@ mod tests {
         let status = machine.read_guest_word(header + 3);
         assert_eq!(status & 0x8000, 0, "no error bit");
         assert_ne!(status & 0x0100, 0, "done bit set");
+    }
+
+    #[test]
+    fn atapi_read10_on_a_folder_mount_returns_a_known_files_bytes() {
+        // Mount a small host folder as a CD (the ISO9660 metadata is
+        // synthesized in memory, file bytes stay on the host), then drive a
+        // real READ(10) through the ATAPI PACKET port handshake exactly like
+        // ide.rs's packet_read10 helper, proving the lazy folder backing works
+        // through the same device path a real driver uses.
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"hello from a folder-mounted CD-ROM, izarra style";
+        std::fs::write(dir.path().join("HELLO.TXT"), content).unwrap();
+
+        let built = crate::iso9660::build(dir.path()).unwrap();
+        let image = CdImage::from_folder(built).unwrap();
+        let mut machine = test_machine();
+        machine.mount_cd(image);
+
+        // Walk the root directory (through read_data_sector, the same path
+        // the ATAPI device serves) to find HELLO.TXT;1's extent LBA.
+        let pvd = machine
+            .ide
+            .device()
+            .image()
+            .unwrap()
+            .read_data_sector(16)
+            .unwrap();
+        let root_lba = u32::from_le_bytes(pvd[156 + 2..156 + 6].try_into().unwrap());
+        let root_sector = machine
+            .ide
+            .device()
+            .image()
+            .unwrap()
+            .read_data_sector(root_lba)
+            .unwrap();
+        let mut offset = 0usize;
+        let mut file_lba = None;
+        while offset < root_sector.len() {
+            let len = usize::from(root_sector[offset]);
+            if len == 0 {
+                break;
+            }
+            let name_len = usize::from(root_sector[offset + 32]);
+            let name = &root_sector[offset + 33..offset + 33 + name_len];
+            if name == b"HELLO.TXT;1" {
+                file_lba = Some(u32::from_le_bytes(
+                    root_sector[offset + 2..offset + 6].try_into().unwrap(),
+                ));
+            }
+            offset += len;
+        }
+        let file_lba = file_lba.expect("HELLO.TXT;1 must be in the root directory");
+
+        // Clear the post-mount unit attention with a TEST UNIT READY packet.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap();
+            for b in [0u8; 12] {
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+
+        // READ(10) one sector at the file's LBA over the real ATAPI packet
+        // ports, then drain the data-in phase.
+        let sector = with_bus(&mut machine, |bus| {
+            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap(); // PACKET
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x28; // READ(10)
+            cdb[2..6].copy_from_slice(&file_lba.to_be_bytes());
+            cdb[8] = 1; // one sector
+            for b in cdb {
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+            let mut out = Vec::with_capacity(cdimage::DATA_SECTOR);
+            for _ in 0..cdimage::DATA_SECTOR {
+                out.push(bus.read_io(0x170, BusWidth::Byte, 0).unwrap() as u8);
+            }
+            out
+        });
+
+        assert_eq!(&sector[..content.len()], &content[..]);
+        assert!(
+            sector[content.len()..].iter().all(|&b| b == 0),
+            "the rest of the sector is zero-padded"
+        );
     }
 
     #[test]

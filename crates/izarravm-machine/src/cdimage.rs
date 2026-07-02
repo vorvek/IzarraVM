@@ -14,6 +14,12 @@
 //! header, and ECC/EDC, so the user data sits at byte offset 16 of the frame.
 //! `read_data_sector` unwraps that so the ATAPI READ commands always hand back
 //! 2048-byte logical sectors regardless of the on-disc framing.
+//!
+//! A third source, [`CdImage::from_folder`], mounts a host folder: the
+//! `iso9660` module materializes the metadata (PVD, path tables, directory
+//! records) into a small in-memory image, but file *contents* are read lazily
+//! from the host filesystem on each sector access rather than being copied in
+//! up front. This is a single data track, same as a plain ISO.
 
 /// Bytes in a logical (MODE1) data sector handed to the guest.
 pub const DATA_SECTOR: usize = 2048;
@@ -70,10 +76,25 @@ impl Track {
     }
 }
 
+/// Where a `CdImage`'s sector bytes actually live.
+#[derive(Debug, Clone)]
+enum Backing {
+    /// The whole image is resident in memory (a plain ISO or a CUE+BIN pair).
+    Bytes(Vec<u8>),
+    /// A folder mount: `meta` holds the synthesized ISO9660 metadata sectors
+    /// (PVD, path tables, directory records), and each entry in `extents`
+    /// maps a contiguous LBA range past the metadata to a host file that is
+    /// read lazily, sector by sector, rather than copied in up front.
+    Folder {
+        meta: Vec<u8>,
+        extents: Vec<crate::iso9660::FileExtent>,
+    },
+}
+
 /// A mounted CD image: the backing bytes plus the parsed track table.
 #[derive(Debug, Clone)]
 pub struct CdImage {
-    bytes: Vec<u8>,
+    backing: Backing,
     tracks: Vec<Track>,
     /// Total user sectors across all tracks (the disc capacity).
     total_sectors: u32,
@@ -98,9 +119,34 @@ impl CdImage {
             image_offset: 0,
         };
         Ok(Self {
-            bytes,
+            backing: Backing::Bytes(bytes),
             tracks: vec![track],
             total_sectors: sectors,
+        })
+    }
+
+    /// Mount a host folder as a single-track data disc. The folder's contents
+    /// are laid out as ISO9660 metadata (see [`crate::iso9660::build`]); file
+    /// bytes are not copied in, they are read from the host lazily as sectors
+    /// are requested. Refuses folders whose total content exceeds the CD-ROM
+    /// capacity guard (see [`crate::iso9660::MAX_IMAGE_BYTES`]).
+    pub fn from_folder(built: crate::iso9660::BuiltImage) -> Result<Self, String> {
+        let crate::iso9660::BuiltImage {
+            meta,
+            extents,
+            total_sectors,
+        } = built;
+        let track = Track {
+            number: 1,
+            mode: TrackMode::Mode1_2048,
+            start_lba: 0,
+            sectors: total_sectors,
+            image_offset: 0,
+        };
+        Ok(Self {
+            backing: Backing::Folder { meta, extents },
+            tracks: vec![track],
+            total_sectors,
         })
     }
 
@@ -152,7 +198,7 @@ impl CdImage {
         }
 
         Ok(Self {
-            bytes: bin,
+            backing: Backing::Bytes(bin),
             tracks,
             total_sectors,
         })
@@ -177,34 +223,46 @@ impl CdImage {
     /// Read one 2048-byte logical data sector at `lba`. Returns None when the LBA
     /// lands outside any track or in an AUDIO track (data reads of audio fail on
     /// hardware too). MODE1/2352 frames are unwrapped to their 2048-byte payload.
+    ///
+    /// For a folder mount, a host file read error never panics the device path:
+    /// it is logged and served as a zero-filled sector instead.
     pub fn read_data_sector(&self, lba: u32) -> Option<[u8; DATA_SECTOR]> {
         let track = self.track_at_lba(lba)?;
         if track.mode.is_audio() {
             return None;
         }
-        let raw = track.mode.raw_size();
-        let frame_off = track.image_offset + (lba - track.start_lba) as usize * raw;
-        // MODE1/2352 stores the 2048-byte user data at offset 16 (12 sync + 4
-        // header); MODE1/2048 stores it at the frame start.
-        let payload_off = match track.mode {
-            TrackMode::Mode1_2352 => frame_off + 16,
-            _ => frame_off,
-        };
-        let slice = self.bytes.get(payload_off..payload_off + DATA_SECTOR)?;
-        let mut out = [0u8; DATA_SECTOR];
-        out.copy_from_slice(slice);
-        Some(out)
+        match &self.backing {
+            Backing::Bytes(bytes) => {
+                let raw = track.mode.raw_size();
+                let frame_off = track.image_offset + (lba - track.start_lba) as usize * raw;
+                // MODE1/2352 stores the 2048-byte user data at offset 16 (12
+                // sync + 4 header); MODE1/2048 stores it at the frame start.
+                let payload_off = match track.mode {
+                    TrackMode::Mode1_2352 => frame_off + 16,
+                    _ => frame_off,
+                };
+                let slice = bytes.get(payload_off..payload_off + DATA_SECTOR)?;
+                let mut out = [0u8; DATA_SECTOR];
+                out.copy_from_slice(slice);
+                Some(out)
+            }
+            Backing::Folder { meta, extents } => Some(read_folder_sector(meta, extents, lba)),
+        }
     }
 
     /// Read one raw 2352-byte audio frame at `lba`, used by the CD-Audio mixer.
-    /// Returns None outside an AUDIO track or past the image.
+    /// Returns None outside an AUDIO track or past the image. A folder mount has
+    /// no audio track, so this always returns None for it.
     pub fn read_audio_frame(&self, lba: u32) -> Option<[u8; RAW_SECTOR]> {
         let track = self.track_at_lba(lba)?;
         if !track.mode.is_audio() {
             return None;
         }
+        let Backing::Bytes(bytes) = &self.backing else {
+            return None;
+        };
         let frame_off = track.image_offset + (lba - track.start_lba) as usize * RAW_SECTOR;
-        let slice = self.bytes.get(frame_off..frame_off + RAW_SECTOR)?;
+        let slice = bytes.get(frame_off..frame_off + RAW_SECTOR)?;
         let mut out = [0u8; RAW_SECTOR];
         out.copy_from_slice(slice);
         Some(out)
@@ -213,6 +271,62 @@ impl CdImage {
     pub fn track_count(&self) -> u8 {
         self.tracks.len() as u8
     }
+}
+
+/// Serve one data sector of a folder mount: from the resident `meta` bytes if
+/// `lba` falls inside them, otherwise by seeking into whichever host file's
+/// extent covers `lba` and reading its sector directly (never the whole
+/// file). A read past a file's own length, or a host I/O error, yields a
+/// zero-filled sector rather than a panic: the device path must stay up even
+/// if a file was moved or deleted out from under a live mount.
+fn read_folder_sector(
+    meta: &[u8],
+    extents: &[crate::iso9660::FileExtent],
+    lba: u32,
+) -> [u8; DATA_SECTOR] {
+    let meta_sectors = (meta.len() / DATA_SECTOR) as u32;
+    if lba < meta_sectors {
+        let off = lba as usize * DATA_SECTOR;
+        let mut out = [0u8; DATA_SECTOR];
+        out.copy_from_slice(&meta[off..off + DATA_SECTOR]);
+        return out;
+    }
+    let Some(extent) = extents
+        .iter()
+        .find(|e| lba >= e.start_lba && lba < e.start_lba + e.sectors)
+    else {
+        return [0u8; DATA_SECTOR];
+    };
+    let sector_index = (lba - extent.start_lba) as u64;
+    let byte_off = sector_index * DATA_SECTOR as u64;
+    let mut out = [0u8; DATA_SECTOR];
+    if byte_off >= extent.len {
+        // Fully past the file's real content (a zero-fill tail sector that
+        // exists only to round the extent up to a whole sector).
+        return out;
+    }
+    let want = (extent.len - byte_off).min(DATA_SECTOR as u64) as usize;
+    match read_file_range(&extent.host_path, byte_off, want) {
+        Ok(data) => out[..data.len()].copy_from_slice(&data),
+        Err(err) => {
+            eprintln!(
+                "cdimage: failed to read {} at offset {byte_off}: {err}",
+                extent.host_path.display()
+            );
+        }
+    }
+    out
+}
+
+/// Read exactly `want` bytes from `path` starting at `offset`, without
+/// loading the whole file into memory.
+fn read_file_range(path: &std::path::Path, offset: u64, want: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; want];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 /// A track as read from the CUE before sector counts are derived.
