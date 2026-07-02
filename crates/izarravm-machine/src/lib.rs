@@ -9095,7 +9095,9 @@ impl Machine {
     /// Drive the internal per-clock device advance (PIT, OPL, DSP reset-settle,
     /// and the clock-driven DMA playback producer). Exposed so a host test or a
     /// frontend can flush device time without running the CPU, and so the DMA
-    /// host goldens can advance the clock that now paces playback.
+    /// host goldens can advance the clock that now paces playback. Does NOT
+    /// advance the master clock; see `advance_wall_clocks` for the variant that
+    /// moves both.
     pub fn advance_devices_clocks(&mut self, clocks: u64) {
         self.advance_devices(clocks);
     }
@@ -9137,7 +9139,11 @@ impl Machine {
     /// `Vga::dots_until_vretrace_start`), so back-to-back calls always make
     /// progress and a caller looping `remaining -= consumed` terminates. The
     /// stop honors the fractional `vga_dots` accumulator, overshooting the edge
-    /// by at most a few dots (well inside the ~1600-dot window).
+    /// by at most a few dots (well inside the ~1600-dot window). One caveat: a
+    /// 1-ulp rounding mismatch in the dots-to-clocks conversion could in
+    /// principle land the beam a dot short of the edge; the caller's peek
+    /// executes instructions whose own device advance carries the beam into the
+    /// window, so the contract holds for observers either way.
     pub fn advance_wall_shortfall(&mut self, clocks: u64) -> u64 {
         let consume = match self.clocks_to_vretrace_start() {
             Some(edge_clocks) => edge_clocks.min(clocks),
@@ -18441,8 +18447,10 @@ mod tests {
         let counter_base = u64::from(counter(&machine));
         let frames_base = machine.video().frames_completed();
 
-        // Two guest seconds of the paced pattern: ~139 mode-13h frames.
-        for _ in 0..2000 {
+        // One guest second of the paced pattern: ~70 mode-13h frames, plenty of
+        // statistical power for a 90 percent threshold against a 13-19 percent
+        // unfixed baseline, at half the runtime of a two-second run.
+        for _ in 0..1000 {
             let before = machine.elapsed_clocks();
             machine.run_cycles(quantum / 8).unwrap();
             let ran = machine.elapsed_clocks().saturating_sub(before);
@@ -18469,8 +18477,8 @@ mod tests {
         let windows_opened = machine.video().frames_completed() - frames_base;
         let caught = u64::from(counter(&machine)) - counter_base;
         assert!(
-            windows_opened >= 100,
-            "geometry sanity: expected ~139 frames in 2 guest seconds, saw {windows_opened}"
+            windows_opened >= 60,
+            "geometry sanity: expected ~70 frames in 1 guest second, saw {windows_opened}"
         );
         assert!(
             caught <= windows_opened + 1,
