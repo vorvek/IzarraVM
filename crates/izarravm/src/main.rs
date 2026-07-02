@@ -3316,6 +3316,84 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
         );
     }
 
+    /// XCOPY (toka-dos/tools-src/xcopy/xcopy.c, an original Toka-DOS project
+    /// tool, not vendored -- see toka-dos/msdos4/VENDOR.md): builds a small
+    /// source tree (a top-level file plus a subdirectory with its own file),
+    /// copies it recursively with `/S /Y`, then verifies the copy landed at
+    /// the right depth (TYPE on the nested file) and that DIR + the XCOPY
+    /// summary line both show up on screen.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_tool_xcopy_recursive_smoke() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_xcopy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = b"@ECHO OFF\r\n\
+MD SRC\r\n\
+ECHO hello > SRC\\A.TXT\r\n\
+MD SRC\\SUB\r\n\
+ECHO world > SRC\\SUB\\B.TXT\r\n\
+XCOPY SRC DEST /S /Y\r\n\
+TYPE DEST\\SUB\\B.TXT\r\n\
+DIR DEST\r\n"
+            .to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(&dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault while running the XCOPY batch under V86: {msg}\n{text}");
+        }
+
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the XCOPY batch ran (stop={stop:?}).\n{text}"
+        );
+
+        let upper = text.to_ascii_uppercase();
+
+        // TYPE DEST\SUB\B.TXT: the nested file was copied to the right depth
+        // and its contents are intact.
+        assert!(
+            lower.contains("world"),
+            "TYPE didn't print the recursively-copied nested file's contents \
+             (stop={stop:?}).\n{text}"
+        );
+
+        // DIR DEST: the top-level copied file and the copied subdirectory
+        // both show up in the destination.
+        assert!(
+            upper.contains("A.TXT") && upper.contains("SUB"),
+            "DIR DEST didn't list the copied file and subdirectory \
+             (stop={stop:?}).\n{text}"
+        );
+
+        // XCOPY prints a final "N File(s) copied" summary; two files (A.TXT,
+        // SUB\B.TXT) were copied.
+        assert!(
+            upper.contains("2 FILE(S) COPIED"),
+            "XCOPY's File(s) copied summary line didn't show the expected count \
+             (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// SP-4b M4: the PS/2 mouse works under the default V86 boot — a host-injected
     /// wheel detent travels 8042 -> slave IRQ12 -> vector 0x74 -> the monitor's
     /// slave reflect stub -> guest INT 74h -> TOKAMOUS (loaded HIGH) -> INT 33h

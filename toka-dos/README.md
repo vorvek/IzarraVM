@@ -17,6 +17,9 @@ switch) are Izarra-specific additions layered on top of stock FreeDOS.
 - `freedos/` vendored FreeDOS source trees (`kernel`, `freecom`, `move`, `sort`),
   each with its own `.github`/build scripts from upstream plus the local
   rebrand patches described in `freedos/VENDOR.md`.
+- `tools-src/` original (not vendored) Toka-DOS project tools, GPL-3, written
+  from documented command-line behavior rather than ported from another
+  project — see `tools-src/README.md`.
 - `tools/tokamous.asm` the INT 33h PS/2 mouse driver TSR (hand-written NASM,
   not vendored FreeDOS), assembled straight into `TOKAMOUS.COM`.
 - `build-freedos.ps1` the build script: builds the FreeDOS kernel + FreeCOM
@@ -71,3 +74,10 @@ regenerated without a full Open Watcom rebuild.
   upstream tag/commit recorded, local patches noted per file), add a build
   step to `build-freedos.ps1` mirroring the existing `move`/`sort` steps, and
   wire the built binary into `build-freedos-hdd-image.py` the same way.
+- An original (not vendored) tool, written from documented command-line
+  behavior rather than ported from another project: put its source under
+  `toka-dos/tools-src/<tool>/` (see `tools-src/README.md`; this is
+  project-authored GPL-3 code, unlike `freedos/`'s GPL-2-only vendored
+  sources), add a build step to `build-freedos.ps1` mirroring the `xcopy`
+  step, and wire the built binary into `build-freedos-hdd-image.py` the same
+  way.
