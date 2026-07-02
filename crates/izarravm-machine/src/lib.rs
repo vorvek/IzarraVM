@@ -7774,6 +7774,22 @@ impl Machine {
         // render_frame edges is forwarded to the PIC here, so playback timing and
         // IRQ5 no longer depend on the host frontend pulling audio. The host path
         // (render_dsp_audio) only drains what the clock already produced.
+        //
+        // MULTI-EDGE CONTRACT (holds for this DSP loop and the WSS/ADPCM loops
+        // below, which mirror it): take_irq is drained INSIDE the producer loop,
+        // at the sample tick that edged it, so every block edge reaches the PIC
+        // within the advance in which it occurred and none is ever parked in the
+        // device-side latch across a step (where a later gate, e.g. is_playing
+        // going false at a single-cycle block end, could strand it). When one
+        // advance spans N edges the PIC receives N requests, but the CPU does not
+        // execute during advance_devices, so the guest cannot acknowledge between
+        // them: the 8259 latches each request into IRR and a request on a
+        // still-set IRR bit is absorbed, exactly as real hardware absorbs a new
+        // pulse on a line whose interrupt is still pending. N intra-step edges
+        // therefore deliver ONE guest interrupt by construction; that is the
+        // architecturally correct coalescing, not a loss. What the run loop must
+        // (and does, see the Approximate batch cap) arrange is that batches end
+        // at block-edge instants when the guest needs one interrupt PER edge.
         // The mixer's SB Pro stereo bit (0x0E bit1) selects 8-bit byte
         // interleaving, which halves the per-channel frame rate; sample it before
         // computing the rate the DSP frames at.
@@ -7801,11 +7817,13 @@ impl Machine {
                 } else {
                     dsp.tick_sample(|| dma.read_byte(dma8, memory), || None);
                 }
-            }
-            if self.dsp.take_irq() {
-                let is_16bit = self.dsp.is_16bit();
-                self.mixer.set_irq_status(is_16bit);
-                self.pic.request(irq_line);
+                // Forward the half/end-buffer edge at the tick that produced it
+                // (see the multi-edge contract above).
+                if self.dsp.take_irq() {
+                    let is_16bit = self.dsp.is_16bit();
+                    self.mixer.set_irq_status(is_16bit);
+                    self.pic.request(irq_line);
+                }
             }
         }
 
@@ -7859,9 +7877,11 @@ impl Machine {
                         wss.tick_sample(|| dma.read_byte(wss_dma, memory));
                     }
                     wss.advance_autocal();
-                }
-                if self.wss.take_irq() {
-                    self.pic.request(wss_irq);
+                    // Forward the terminal-count edge at the frame that produced
+                    // it (see the DSP loop's multi-edge contract above).
+                    if self.wss.take_irq() {
+                        self.pic.request(wss_irq);
+                    }
                 }
             }
         }
@@ -7886,9 +7906,11 @@ impl Machine {
                         ..
                     } = self;
                     yamaha_adpcm.tick_sample(|| dma.read_byte(adpcm_dma, memory));
-                }
-                if self.yamaha_adpcm.take_irq() {
-                    self.pic.request(adpcm_irq);
+                    // Forward the half/end block edge at the frame that produced
+                    // it (see the DSP loop's multi-edge contract above).
+                    if self.yamaha_adpcm.take_irq() {
+                        self.pic.request(adpcm_irq);
+                    }
                 }
             }
         }
@@ -7902,6 +7924,9 @@ impl Machine {
         let edges =
             self.pit
                 .tick_recording_out_transitions(whole as u64, 2, &mut self.speaker_transitions);
+        // Per-edge forwarding, same multi-edge contract as the DSP loop above:
+        // N channel-0 edges in one step issue N requests and the PIC's IRR
+        // coalesces them into the one interrupt the guest can actually take.
         for _ in 0..edges {
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
@@ -7923,6 +7948,13 @@ impl Machine {
         self.keyboard
             .advance_mouse_pacing(clocks as f64 * self.timing.micros_per_clock);
 
+        // The take_irq latches below are single-edge bools, which is safe for
+        // these devices even across a multi-sample step: each is a completion
+        // edge that can fire at most once per guest-initiated operation (a
+        // scancode/aux byte entering the 8042 output buffer, a UART event, an
+        // LPT -ACK strobe, an FDC/IDE/ATA command completion), and the next
+        // operation requires guest port I/O, which ends the CPU batch. No
+        // periodic producer feeds them, so one advance can never span two edges.
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
@@ -7983,6 +8015,9 @@ impl Machine {
             // an enabled alarm compares against the new time. tick_interrupts
             // returns true only on the rising edge of IRQF (a guest that has not
             // read Register C to ack keeps the line asserted without a new edge).
+            // A single-edge bool is safe here: IRQF sources are seconds-scale
+            // (far coarser than any batch) and the line stays asserted until the
+            // Register C ack, so one advance cannot span two IRQ8 edges.
             if self.rtc.tick_interrupts(secs) {
                 self.pic.request(8); // IRQ8: RTC periodic/alarm/update interrupt
             }
@@ -8411,6 +8446,12 @@ impl Machine {
     /// when unmasked/deliverable; the result is the soonest of the applicable
     /// wakes, clamped to the deadline and to at least one clock so the run loop
     /// always makes progress.
+    ///
+    /// Known gap: there is no Yamaha ADPCM-B wake term, so a guest halted with
+    /// ONLY the ADPCM block IRQ armed never wakes (HLT reports a genuine halt).
+    /// Left as-is on purpose: adding the term would shift HLT wake instants,
+    /// and the Accurate class's byte-identical contract pins this path. The
+    /// Approximate batch cap (approx_batch_cap) does include an ADPCM term.
     fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
         if !self.cpu.interrupts_enabled() {
             return None;
@@ -8461,6 +8502,77 @@ impl Machine {
         Some(wake.max(1).min(remaining))
     }
 
+    /// The Approximate-class (486/586) batch cap: CPU clocks until the next due
+    /// device event, instead of the Accurate class's one-DAC-sample lockstep.
+    ///
+    /// Contract. Interrupts are serviced at batch entry and devices advance at
+    /// batch end, so this cap is what bounds Approximate-class IRQ latency:
+    /// - the next PIT channel 0 (IRQ0) or channel 2 (speaker/game timing) OUT
+    ///   rising edge ends the batch at (within a PIT tick of) its instant, so
+    ///   timer-driven cadences hold;
+    /// - the next DSP/WSS/ADPCM block-IRQ edge does the same for audio blocks,
+    ///   which also keeps one guest interrupt per block edge (see the
+    ///   multi-edge contract in advance_devices);
+    /// - a ~1 ms ceiling (clock_hz / 1000) bounds the latency of everything
+    ///   else (a line masked now and unmasked later, a declined estimator);
+    /// - the DAC-sample floor means no batch is ever SHORTER than the Accurate
+    ///   cap: a sub-sample edge estimate degrades to exactly the Accurate
+    ///   class's up-to-one-sample delivery latency instead of shrinking
+    ///   batches, and a degenerate estimator can never stall progress.
+    ///
+    /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
+    /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
+    /// bind every batch below even the Accurate cap and cancel this fast path
+    /// outright. Its OUT is only guest-visible through a port 0x61 read, which
+    /// ends the batch anyway. PIC masking is likewise ignored on purpose: an
+    /// edge on a masked line latches IRR at the same advance either way, so the
+    /// per-batch mask query buys no alignment.
+    ///
+    /// The PIT tick -> CPU clock conversion ignores the pit_clocks fractional
+    /// accumulator (up to one PIT tick of skew; the same div_ceil idiom
+    /// next_timer_wake already uses for the HLT wake) and the audio estimators
+    /// are conservative for 16-bit stereo; both sit inside this class's license
+    /// (results bit-exact, time approximate). Device-time exactness within a
+    /// batch is unchanged: devices see the exact batch clock total, the speaker
+    /// integrates PIT transitions sub-step, and the sample-phase producers emit
+    /// exactly the frames the elapsed clocks call for, whatever the split.
+    fn approx_batch_cap(&self, remaining: u64) -> u64 {
+        let clock_hz = self.active_mode.clock_hz();
+        // The ~1 ms latency ceiling.
+        let mut cap = (clock_hz / 1000).max(1);
+        // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
+        // speaker/GATE timing games poll. (Channel 1: see above.)
+        for channel in [0usize, 2] {
+            if let Some(ticks) = self.pit.clocks_until_out_rise(channel) {
+                let clocks = ((u128::from(ticks) * u128::from(clock_hz))
+                    .div_ceil(u128::from(PIT_INPUT_HZ))) as u64;
+                cap = cap.min(clocks);
+            }
+        }
+        // Next audio block-IRQ edge. The DSP/WSS rates mirror the wake
+        // estimators in next_timer_wake (the DSP block counter drains at the
+        // raw byte/word rate, rate_hz; the WSS counter at its frame rate). The
+        // ADPCM term is ADDITIONAL, at its frame rate: next_timer_wake has no
+        // ADPCM wake (a pre-existing gap, noted there), and closing it there
+        // would shift HLT wake instants, which byte-identity forbids here.
+        if let Some(clocks) = self.dsp.clocks_until_next_irq(self.dsp.rate_hz(), clock_hz) {
+            cap = cap.min(clocks);
+        }
+        if self.wss_enabled
+            && let Some(clocks) = self.wss.clocks_until_next_irq(self.wss.rate_hz(), clock_hz)
+        {
+            cap = cap.min(clocks);
+        }
+        if self.adpcm_enabled
+            && let Some(clocks) = self
+                .yamaha_adpcm
+                .clocks_until_next_irq(self.yamaha_adpcm.output_frame_rate(), clock_hz)
+        {
+            cap = cap.min(clocks);
+        }
+        cap.max(self.timing.clocks_per_audio_sample).min(remaining)
+    }
+
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
         let deadline = self.elapsed_clocks.saturating_add(cycles);
         self.run_until_clock(deadline, cycles)
@@ -8502,16 +8614,31 @@ impl Machine {
             // invalidate its prefetch + decode cache before the next batch runs.
             let a20_before = self.keyboard.a20_enabled();
             // Run a batch of straight-line instructions against one MachineBus,
-            // then service devices once. The cap holds the batch to at most one
-            // DAC sample of CPU time so the per-clock fine-samplers stay exact; a
-            // port access, an HLE INT, a HLT, or a fault ends it sooner. This is
-            // the global-TSC / event-batched model (research item 2.3): it drops
-            // the per-instruction bus rebuild + 14-device fan-out that dominated
-            // the old loop, and is the prerequisite for the recompiler (item 2.2).
-            let cap = self
-                .timing
-                .clocks_per_audio_sample
-                .min(deadline - self.elapsed_clocks);
+            // then service devices once; a port access, an HLE INT, a HLT, or a
+            // fault ends the batch sooner. This is the global-TSC / event-batched
+            // model (research item 2.3): it drops the per-instruction bus rebuild
+            // + 14-device fan-out that dominated the old loop.
+            //
+            // The batch cap is per timing class:
+            // - Accurate (286/386): exactly one DAC sample of CPU time, so the
+            //   per-clock fine-samplers stay in lockstep. BYTE-IDENTICAL
+            //   contract (bench cyc/iter + aux, boot suite, device cadence):
+            //   do not touch.
+            // - Approximate (486/586): up to the next due device event, bounded
+            //   by a ~1 ms latency ceiling and floored at the DAC-sample cap;
+            //   approx_batch_cap holds the full contract. Batch splits move the
+            //   f64 device accumulators through different partial sums, so
+            //   device event instants may microshift against the Accurate
+            //   splitting; that is licensed in this class (results stay
+            //   bit-exact, time is approximate; see TimingClass). Computed once
+            //   per batch entry: the run loop sits on a measured code-layout
+            //   cliff, so nothing here may run per instruction.
+            let remaining = deadline - self.elapsed_clocks;
+            let cap = if matches!(self.active_mode.timing_class(), TimingClass::Approximate) {
+                self.approx_batch_cap(remaining)
+            } else {
+                self.timing.clocks_per_audio_sample.min(remaining)
+            };
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -8615,8 +8742,9 @@ impl Machine {
                 // service step (device advance, CD stall, pending INT/mode/Toka/
                 // unittester, console flush, HLT fast-forward) is unchanged:
                 // core_clocks is the batch sum, halted is set iff the batch ended
-                // on a HLT. core_clocks can't overflow u32 (cap is ~one audio
-                // sample, a few thousand clocks at most).
+                // on a HLT. core_clocks can't overflow u32 (the cap is at most
+                // ~1 ms of guest clocks in the Approximate class, a few hundred
+                // thousand at 586).
                 let mut batch_core = 0u32;
                 let mut halted = false;
                 let mut fault = None;
@@ -17642,6 +17770,291 @@ mod tests {
         // It mixes into the combined audio render path as another sound source.
         let mixed = machine.render_audio(64);
         assert!(!mixed.is_empty(), "chip feeds the mixer");
+    }
+
+    #[test]
+    fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
+        // Multi-edge contract (see advance_devices): every block edge reaches
+        // the PIC inside the advance whose sample tick produced it, and edges
+        // that land while the previous request is still latched coalesce in the
+        // 8259's IRR. The CPU does not execute during advance_devices, so the
+        // guest cannot acknowledge between intra-step edges; the IRR absorbing
+        // the extra requests is exactly the hardware's still-asserted-line
+        // behavior, not a loss. After the guest-style ack sequence the NEXT
+        // step's edges must raise the line again: nothing may stay parked in
+        // the DSP's take_irq latch across steps.
+        let mut machine = test_machine();
+        // 16-byte auto-init DMA loop on ch1 feeding an 8-sample auto-init DSP
+        // block: one 200k-clock advance at 22 MHz (~9 ms, ~99 frames at
+        // 11025 Hz) spans MANY half/end block edges.
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // PIC base 0x08 (IRQ5 -> vector 0x0D), all lines unmasked.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap();
+            // DMA ch1: auto-init read of 16 bytes at 0x1_0000 (mode 0x59).
+            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            // DSP: rate 11025 Hz, block size 8, 8-bit auto-init output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x07, 0x00, 0x1C] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.dsp.is_playing(),
+            "auto-init keeps the block looping"
+        );
+        assert!(
+            machine.pic.irr_bit(5),
+            "the block edges latched IRR5 within their own step"
+        );
+        assert!(
+            !machine.dsp.take_irq(),
+            "no edge stays parked in the DSP latch after the step"
+        );
+        // Guest ISR: PIC acknowledge, device ack (0x22E read), then EOI.
+        with_bus(&mut machine, |bus| {
+            assert_eq!(bus.acknowledge_interrupt(), Some(0x0D));
+            bus.read_io(0x22E, BusWidth::Byte).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x20).unwrap(); // OCW2 EOI
+        });
+        assert!(!machine.pic.irr_bit(5), "IRR clear after the acknowledge");
+        // Later edges arrive in a later advance and re-request the line: the
+        // edge stream survives the ack instead of being lost with it.
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.pic.irr_bit(5),
+            "the next step's block edges re-request IRQ5"
+        );
+    }
+
+    #[test]
+    fn wss_terminal_count_edge_forwards_within_its_advance() {
+        // Same multi-edge contract as the DSP loop: the codec's terminal-count
+        // edge is drained per output frame inside the producer loop, so it
+        // reaches the PIC within the advance whose frame produced it and never
+        // parks in the take_irq latch across steps.
+        let mut machine = test_machine();
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x80);
+        }
+        with_bus(&mut machine, |bus| {
+            wss_arm_8bit_mono(bus, 31); // TC after 32 frames (~0.67 ms at 48 kHz)
+        });
+        // One advance spanning the whole 32-frame window plus slack.
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.pic.irr_bit(7),
+            "the terminal-count edge latched IRR7 within the step"
+        );
+        assert!(
+            !machine.wss.take_irq(),
+            "no edge stays parked in the codec latch after the step"
+        );
+    }
+
+    #[test]
+    fn adpcm_half_and_end_edges_forward_within_one_advance() {
+        // The ADPCM-B producer drains take_irq per frame (the DSP multi-edge
+        // contract): a single advance spanning a block's half edge AND end edge
+        // must leave the request latched in IRR10 and nothing parked in the
+        // chip's latch, with single-cycle playback halted at terminal count.
+        let mut machine = test_machine();
+        // 64 arbitrary ADPCM bytes at 0x03_0000 for DMA channel 3.
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x3_0000 + i, (i as u8).wrapping_mul(37) | 1);
+        }
+        with_bus(&mut machine, |bus| {
+            // 8237 ch3: single-cycle read of the 64-byte buffer.
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 63).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            // Chip: rate 11025 Hz, block 128 nibbles (one byte = two mono
+            // samples), ADPCM-B mono, START.
+            for &(port, value) in &[
+                (0x240u16, 1u8), // address: RATE_LOW
+                (0x241, 0x11),
+                (0x240, 2), // address: RATE_HIGH
+                (0x241, 0x2B),
+                (0x240, 4), // address: COUNT_LOW
+                (0x241, 127),
+                (0x240, 5), // address: COUNT_HIGH
+                (0x241, 0),
+                (0x240, 3), // address: FORMAT (ADPCM-B mono)
+                (0x241, 0x00),
+                (0x240, 0),    // address: CONTROL
+                (0x241, 0x01), // START
+            ] {
+                bus.write_io(port, BusWidth::Byte, u32::from(value))
+                    .unwrap();
+            }
+        });
+        // 400k clocks at 22 MHz (~18 ms) spans the whole 128-frame block at
+        // 11025 Hz (~11.6 ms): the half edge and the end edge land in ONE step.
+        machine.advance_devices_clocks(400_000);
+        assert!(
+            !machine.yamaha_adpcm.is_playing(),
+            "single-cycle block reached terminal count inside the step"
+        );
+        assert!(
+            machine.pic.irr_bit(10),
+            "the block edges latched IRR10 within the step"
+        );
+        assert!(
+            !machine.yamaha_adpcm.take_irq(),
+            "no edge stays parked in the chip latch after the step"
+        );
+    }
+
+    #[test]
+    fn pit_channel0_multi_edge_advance_latches_irq0() {
+        // Channel 0 is the per-edge exemplar (a request per OUT rising edge,
+        // issued inside the producer): several mode-2 periods inside ONE
+        // advance coalesce in the IRR, and the request is present at step end.
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x34).unwrap(); // ch0 mode 2
+            bus.write_io(0x40, BusWidth::Byte, 100).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0).unwrap();
+        });
+        // ~325 PIT ticks at 22 MHz: three-plus full periods in one advance.
+        machine.advance_devices_clocks(6_000);
+        assert!(
+            machine.pic.irr_bit(0),
+            "channel-0 edges latched IRQ0 within the multi-period step"
+        );
+    }
+
+    #[test]
+    fn approx_batch_cap_tracks_the_next_device_event() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        let clock_hz = machine.active_mode().clock_hz();
+        let ceiling = clock_hz / 1000;
+        let floor = machine.timing.clocks_per_audio_sample;
+
+        // Nothing scheduled: the ~1 ms latency ceiling binds. The always-running
+        // channel-1 refresh heartbeat (mode 2, reload 18, ~15 us) must NOT
+        // bind, or this cap could never exceed the Accurate DAC-sample cap.
+        assert_eq!(machine.approx_batch_cap(u64::MAX), ceiling);
+
+        // The remaining-deadline clamp wins when nearer.
+        assert_eq!(machine.approx_batch_cap(123), 123);
+
+        // A running channel-0 (IRQ0) counter binds the cap to its next OUT rise.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x34).unwrap(); // ch0 mode 2
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x04).unwrap(); // reload 0x0400
+        });
+        let ticks = machine.pit.clocks_until_out_rise(0).unwrap();
+        let expected =
+            ((u128::from(ticks) * u128::from(clock_hz)).div_ceil(u128::from(PIT_INPUT_HZ))) as u64;
+        assert!(expected < ceiling && expected > floor);
+        assert_eq!(machine.approx_batch_cap(u64::MAX), expected);
+
+        // A sub-sample edge floors at the DAC-sample cap: an Approximate batch
+        // is never SHORTER than an Accurate one.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x40, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap(); // reload 8 (~7 us)
+        });
+        assert_eq!(machine.approx_batch_cap(u64::MAX), floor);
+    }
+
+    #[test]
+    fn approx_batch_cap_ends_at_the_next_dsp_block_edge() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        let clock_hz = machine.active_mode().clock_hz();
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // The 16-frame 8-bit single-cycle golden: at 11025 Hz the half edge
+            // (8 frames, ~726 us) is the next due event, under the ~1 ms
+            // ceiling and above the DAC-sample floor.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let expected = machine
+            .dsp
+            .clocks_until_next_irq(machine.dsp.rate_hz(), clock_hz)
+            .unwrap();
+        assert!(expected < clock_hz / 1000, "half edge under the ceiling");
+        assert!(expected > machine.timing.clocks_per_audio_sample);
+        assert_eq!(machine.approx_batch_cap(u64::MAX), expected);
+    }
+
+    #[test]
+    fn approximate_class_delivers_pit_irq0_during_long_compute_stretches() {
+        // P4c end to end: in the Approximate class a guest that computes for
+        // many milliseconds without any port I/O still sees IRQ0 at the
+        // programmed cadence. Each edge is requested by advance_devices in the
+        // batch that spans it, the cap ends that batch at (about) the edge
+        // instant, and the next batch entry services the interrupt.
+        let code = [
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // mov word [0x7000], 0
+            0xB0, 0x11, 0xE6, 0x20, // ICW1
+            0xB0, 0x08, 0xE6, 0x21, // ICW2: vector base 0x08
+            0xB0, 0x04, 0xE6, 0x21, // ICW3
+            0xB0, 0x01, 0xE6, 0x21, // ICW4
+            0xB0, 0x00, 0xE6, 0x21, // unmask all lines
+            0xB0, 0x34, 0xE6, 0x43, // PIT ch0 mode 2, LSB/MSB
+            0xB0, 0x00, 0xE6, 0x40, // reload low 0x00
+            0xB0, 0x10, 0xE6, 0x40, // reload high 0x10 -> 4096 ticks (~3.43 ms)
+            0xFB, // sti
+            0xEB, 0xFE, // jmp $ (pure compute, no port I/O)
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw586); // Approximate class, 200 MHz
+        // IRQ0 handler at 0x0700: inc word [0x7000]; mov al,0x20; out 0x20,al; iret.
+        let handler: [u8; 9] = [0xff, 0x06, 0x00, 0x70, 0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x08] (IRQ0 at PIC base 0x08) -> 0000:0700.
+        machine.write_physical_u8(0x20, 0x00);
+        machine.write_physical_u8(0x21, 0x07);
+        machine.write_physical_u8(0x22, 0x00);
+        machine.write_physical_u8(0x23, 0x00);
+        // ~20 periods of 4096 PIT ticks at 200 MHz (~686.6k clocks each).
+        machine.run_cycles(14_000_000).unwrap();
+        let ticks = u16::from(machine.read_physical_u8(0x7000))
+            | (u16::from(machine.read_physical_u8(0x7001)) << 8);
+        assert!(
+            (15..=22).contains(&ticks),
+            "expected ~20 IRQ0 ticks across the compute stretch, saw {ticks}"
+        );
     }
 
     /// Program DMA channel 0 (the WSS default) for a single-cycle 8-bit read of
