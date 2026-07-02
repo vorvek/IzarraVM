@@ -240,10 +240,8 @@ impl Counter {
     /// `clocks` span, matching the batch-boundary contract `predicted_beam` and
     /// `clocks_until_out_rise` already rely on.
     ///
-    /// Not yet called from production code: this is the Task 2.1 spike result
-    /// (sizing the function, promoted by its differential test), wiring a lazy
-    /// port 0x61 bits 4/5 read to it is Task 2.3, gated on this promotion.
-    #[allow(dead_code)]
+    /// Wired to production via `Pit::out_after` (P4a Task 2.3): the lazy port
+    /// 0x61 bits 4/5 read peeks channel 1 and channel 2 through it.
     fn out_after(&self, clocks: u64) -> Option<bool> {
         if self.bcd {
             return None;
@@ -808,6 +806,15 @@ impl Pit {
     /// Out-of-range channels read false.
     pub(crate) fn channel_out(&self, channel: usize) -> bool {
         self.counters.get(channel).map(|c| c.out).unwrap_or(false)
+    }
+
+    /// The analytic live OUT level of `channel` `clocks` input CLKs from now,
+    /// without stepping (P4a Task 2.3: the lazy port 0x61 bits 4/5 read).
+    /// `None` when the channel is out of range or the counter is BCD (see
+    /// `Counter::out_after`); the caller falls back to a real `tick` in either
+    /// case.
+    pub(crate) fn out_after(&self, channel: usize, clocks: u64) -> Option<bool> {
+        self.counters.get(channel).and_then(|c| c.out_after(clocks))
     }
 }
 
