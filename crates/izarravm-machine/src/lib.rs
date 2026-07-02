@@ -20,10 +20,10 @@ use izarravm_cpu::{
 };
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, MARGO_MMIO_SIZE,
-    MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE,
-    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, font,
-    pixel_format, vbe_mode,
+    CGA_FB_SIZE, DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, HGC_FB_SIZE,
+    MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE,
+    VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga,
+    VgaRaster, VideoMode, bytes_per_pixel, font, pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -11262,10 +11262,43 @@ impl MachineBus<'_> {
     }
 
     fn video_text_offset(&self, address: u32, width: usize) -> Option<usize> {
+        // The Hercules personality has its own dedicated B0000-BFFFF decode
+        // (`hgc_offset`, checked first by both callers below): it must not
+        // also fall through to this single-sliding-window text/CGA decode,
+        // which would let an unpaged-in B8000 access reach `text_memory` as
+        // an MDA/CGA text write instead of correctly missing.
+        if self.video.is_hercules_personality() {
+            return None;
+        }
         self.video
             .video_memory_enabled()
             .then(|| video_text_offset(self.video.text_memory_base(), address, width))
             .flatten()
+    }
+
+    /// The Hercules graphics window, B0000-BFFFF: unlike the single sliding
+    /// 32K window `video_text_offset` decodes for text/CGA, both Hercules pages
+    /// are simultaneously addressable at their real hardware addresses (page 0
+    /// always at B0000, page 1 at B8000 once 3BFh pages it in), independent of
+    /// which page the CRTC is currently scanning out. Only live while the
+    /// Hercules personality is active; text mode 07h (also mono, also
+    /// B0000-based) keeps using `video_text_offset` as before.
+    fn hgc_offset(&self, address: u32, width: usize) -> Option<usize> {
+        if !self.video.video_memory_enabled() || !self.video.is_hercules_personality() {
+            return None;
+        }
+        let end = VGA_MONO_TEXT_BASE + (HGC_FB_SIZE as u32 * 2);
+        if !(VGA_MONO_TEXT_BASE..end).contains(&address) || address + width as u32 > end {
+            return None;
+        }
+        let offset = (address - VGA_MONO_TEXT_BASE) as usize;
+        // Page 1 (B8000-BFFFF, offset 0x8000..0x10000) only decodes once 3BFh
+        // has paged it in; otherwise that half is open bus (unmapped), matching
+        // real hardware where the second bank simply is not there.
+        if offset >= HGC_FB_SIZE && !self.video.hgc_page1_addressable() {
+            return None;
+        }
+        Some(offset)
     }
 
     /// Apply the A20 gate to a physical address before it reaches memory. The gate
@@ -11329,7 +11362,7 @@ impl MachineBus<'_> {
                 let ap = self.video.gfx_aperture();
                 vga_gfx_aperture_offset(ap.base, ap.length, address, width)
             }
-            VideoMode::Text | VideoMode::Cga => None,
+            VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => None,
         }
     }
 
@@ -11365,6 +11398,16 @@ impl MachineBus<'_> {
                     VideoMode::Mode13h => self.video.cpu_read_chain4(offset + i),
                     _ => self.video.cpu_read(offset + i),
                 };
+            }
+            return Ok(());
+        }
+
+        // Hercules graphics: both B0000 (page 0) and B8000 (page 1, once paged
+        // in) are live simultaneously, unlike the single sliding text/CGA
+        // window below, so this is checked first and independently.
+        if let Some(offset) = self.hgc_offset(address, width) {
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = self.video.hgc_read(offset + index);
             }
             return Ok(());
         }
@@ -11410,8 +11453,8 @@ impl MachineBus<'_> {
                         }
                         return Ok(());
                     }
-                    // Text and CGA do not decode the A0000 window; fall through.
-                    VideoMode::Text | VideoMode::Cga => {}
+                    // Text, CGA, and Hercules do not decode the A0000 window; fall through.
+                    VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => {}
                 }
             }
         }
@@ -11477,6 +11520,12 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        // Hercules graphics: see the matching check in `read_phys`.
+        if let Some(offset) = self.hgc_offset(address, 1) {
+            self.video.hgc_write(offset, value);
+            return Ok(());
+        }
+
         if let Some(offset) = self.video_text_offset(address, 1) {
             // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
             // framebuffer; in text mode it is the character/attribute buffer.
@@ -11510,8 +11559,8 @@ impl MachineBus<'_> {
                         self.video.cpu_write_chain4(offset, value);
                         return Ok(());
                     }
-                    // Text and CGA do not decode the A0000 window; fall through.
-                    VideoMode::Text | VideoMode::Cga => {}
+                    // Text, CGA, and Hercules do not decode the A0000 window; fall through.
+                    VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => {}
                 }
             }
         }
@@ -22797,6 +22846,87 @@ mod tests {
             machine.read_physical_u8(VGA_TEXT_BASE + CGA_FB_SIZE as u32),
             b'V'
         );
+    }
+
+    #[test]
+    fn hercules_graphics_routes_b0000_and_b8000_through_the_machine() {
+        // Real Hercules software sets BIOS mode 07h (MDA-compatible text) and
+        // then bangs ports 3B8h/3BFh directly: there is no INT 10h graphics
+        // mode number for it.
+        let mut machine = test_machine();
+        machine.video_mut().set_mono_text_mode();
+
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3BF, BusWidth::Byte, 0x01).unwrap(); // allow graphics
+            bus.write_io(0x3B8, BusWidth::Byte, 0x0A).unwrap(); // GRPH + video enable
+        }
+        assert_eq!(machine.video().active_mode(), VideoMode::Hercules);
+        assert_eq!(machine.video().raster_width(), 720);
+        assert_eq!(machine.video().raster_height(), 370);
+
+        // Page 0 lives at B0000 and is always addressable.
+        machine.write_physical_u8(VGA_MONO_TEXT_BASE, 0b1000_0000);
+        assert_eq!(machine.read_physical_u8(VGA_MONO_TEXT_BASE), 0b1000_0000);
+        let raster = machine.video_mut().render_full_frame();
+        assert_eq!(raster.pixels[0], 1);
+
+        // Page 1 (B8000) is not yet paged in: a write there does not land in
+        // the Hercules framebuffer (falls through to the flat RAM array
+        // underneath, like any other unclaimed MMIO window in this bus), so
+        // it is invisible to the Hercules scanout.
+        assert!(!machine.video().hgc_page1_addressable());
+        machine.write_physical_u8(VGA_MONO_TEXT_BASE + HGC_FB_SIZE as u32, 0xFF);
+        assert_eq!(machine.video_mut().hgc_read(HGC_FB_SIZE), 0);
+
+        // Page in the second bank through 3BFh and flip Mode Control's page
+        // select (bit 7): the CRTC now scans out B8000 instead of B0000.
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3BF, BusWidth::Byte, 0x03).unwrap(); // allow graphics + page 1
+            bus.write_io(0x3B8, BusWidth::Byte, 0x8A).unwrap(); // GRPH + video + page select
+        }
+        machine.write_physical_u8(VGA_MONO_TEXT_BASE + HGC_FB_SIZE as u32, 0b0100_0000);
+        assert_eq!(
+            machine.read_physical_u8(VGA_MONO_TEXT_BASE + HGC_FB_SIZE as u32),
+            0b0100_0000
+        );
+        let raster = machine.video_mut().render_full_frame();
+        assert_eq!(raster.pixels[0], 0); // page 0's bit no longer scanned out
+        assert_eq!(raster.pixels[1], 1); // page 1's bit shows instead
+    }
+
+    #[test]
+    fn hercules_config_switch_refuses_graphics_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mono_text_mode();
+
+        // 3B8h GRPH with no 3BFh unlock: the card stays in text mode, and the
+        // Hercules 64K graphics window does not decode (falls through to the
+        // ordinary mono text B0000 aperture instead).
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3B8, BusWidth::Byte, 0x0A).unwrap();
+        }
+        assert_eq!(machine.video().active_mode(), VideoMode::Text);
+        machine.write_physical_u8(VGA_MONO_TEXT_BASE, 0xDB);
+        assert_eq!(machine.read_physical_u8(VGA_MONO_TEXT_BASE), 0xDB);
+    }
+
+    #[test]
+    fn hercules_detection_status_port_survives_the_machine_bus() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mono_text_mode();
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3BF, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x3B8, BusWidth::Byte, 0x0A).unwrap();
+        }
+        assert_eq!(machine.video().active_mode(), VideoMode::Hercules);
+
+        let mut bus = machine.make_bus();
+        let outside_vsync = bus.read_io(0x3BA, BusWidth::Byte, 0).unwrap() & 0x80;
+        assert_eq!(outside_vsync, 0x80);
     }
 
     #[test]

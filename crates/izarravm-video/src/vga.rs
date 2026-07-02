@@ -319,6 +319,36 @@ impl CrtcTiming {
     pub fn frame_dots(&self) -> u64 {
         (self.htotal_chars * self.char_width) as u64 * self.vtotal as u64
     }
+
+    /// Hercules Graphics Card 720x348 graphics mode, derived from the HGC's stock
+    /// 6845 register set (R0=35h R1=2Dh R2=2Eh R3=07h R4=5Bh R5=02h R6=57h R7=57h
+    /// R8=02h R9=03h; seasip.info "Hercules Graphics Card Plus Notes"). 16-dot
+    /// characters (R1=2Dh -> 45 char columns * 16 = 720 active dots); 4 scanlines
+    /// per character row (R9=03h) with R6=57h (87 rows) giving 348 active
+    /// scanlines, and R4/R5 giving 370 scanlines total -- matching the card's
+    /// well-documented ~50 Hz refresh at its 16.257 MHz dot clock (864 dots/line
+    /// * 370 lines). 90 bytes/scanline (720 pixels / 8, 1bpp).
+    pub fn hgc_720x348() -> Self {
+        Self {
+            htotal_chars: 54,
+            char_width: 16,
+            hdisp_end: 720,
+            vtotal: 370,
+            vdisp_end: 348,
+            vblank_start: 348,
+            vblank_end: 366,
+            vretrace_start: 348,
+            vretrace_end: 350,
+            max_scan: 3,
+            double_scan: false,
+            start_address: 0,
+            offset: 90,
+            mode_control: 0xA3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+            preset_row_scan: 0,
+        }
+    }
 }
 
 const CGA_MODE_80_COLUMNS: u8 = 0x01;
@@ -700,6 +730,78 @@ impl Default for Cga {
     }
 }
 
+// Hercules Mode Control register (port 3B8h) bits (seasip.info "Hercules
+// Graphics Card Plus Notes"): bit 1 selects graphics vs text, bit 3 gates
+// video output, bit 5 picks blink vs high-intensity background in text mode,
+// bit 7 picks which 32K page (B0000 or B8000) the CRTC scans out.
+const HGC_MODE_GRAPHICS: u8 = 0x02;
+const HGC_MODE_VIDEO_ENABLE: u8 = 0x08;
+const HGC_MODE_PAGE1: u8 = 0x80;
+
+// Hercules Configuration Switch register (port 3BFh, write-only): bit 0
+// allows the Mode Control register's graphics bit to take effect and unlocks
+// the B1000h-B7FFFh half of the first page; bit 1 pages the second 32K bank
+// in at B8000h. A real HGC's graphics mode is refused (stays text) unless the
+// guest has first unlocked it here -- this is the two-step "configure then
+// switch" sequence Hercules software issues before painting graphics.
+const HGC_CONFIG_ALLOW_GRAPHICS: u8 = 0x01;
+const HGC_CONFIG_ENABLE_PAGE1: u8 = 0x02;
+
+/// Hercules graphics state: the two 32K pages (B0000 and B8000) plus the
+/// Mode Control (3B8h) and Configuration Switch (3BFh) latches. Mirrors `Cga`
+/// for the third legacy personality this raster core hosts.
+#[derive(Debug, Clone)]
+pub struct Hgc {
+    /// Both 32K pages back to back: page 0 (B0000) at offset 0, page 1
+    /// (B8000) at offset 0x8000. Real hardware only backs page 1 with RAM
+    /// when a full (non-"Plus") HGC or an HGC+ with the RAM option is fitted;
+    /// this core always backs it so a guest that pages it in before checking
+    /// for it (a common detection shortcut) sees ordinary RAM, not open bus.
+    pub fb: Vec<u8>,
+    pub mode_control: u8,  // port 0x3B8 output latch
+    pub config_switch: u8, // port 0x3BF output latch
+}
+
+pub const HGC_FB_SIZE: usize = 32 * 1024;
+pub const HGC_PAGE1_OFFSET: usize = 0x8000;
+/// Byte offset of interleave bank N (0..=3) inside one 32K Hercules page.
+/// Scanline `y` maps to bank `y & 3` at `(y & 3) * HGC_BANK_SIZE`, the
+/// four-way generalization of CGA's two-bank even/odd interleave.
+pub const HGC_BANK_SIZE: usize = 0x2000;
+/// Hercules graphics bytes per scanline: 720 pixels / 8 bits-per-byte.
+pub const HGC_BYTES_PER_LINE: usize = 90;
+
+impl Default for Hgc {
+    fn default() -> Self {
+        Self {
+            fb: vec![0; HGC_FB_SIZE * 2],
+            mode_control: 0x00,
+            config_switch: 0x00,
+        }
+    }
+}
+
+impl Hgc {
+    fn graphics_allowed(&self) -> bool {
+        self.config_switch & HGC_CONFIG_ALLOW_GRAPHICS != 0
+    }
+
+    fn page1_enabled(&self) -> bool {
+        self.config_switch & HGC_CONFIG_ENABLE_PAGE1 != 0
+    }
+
+    /// Which 32K page (0 or 1) the CRTC currently scans out: Mode Control bit
+    /// 7, but a page-1 select only takes effect once 3BFh has paged it in
+    /// (real hardware: the second bank is simply not there otherwise).
+    fn active_page(&self) -> usize {
+        if self.mode_control & HGC_MODE_PAGE1 != 0 && self.page1_enabled() {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// The 16 EGA/CGA color numbers as DAC indices. On the stock VGA palette the
 /// first 16 entries are the EGA colors, so a CGA color number is its own DAC
 /// index. Named for the four-color and two-color palette tables below.
@@ -878,6 +980,17 @@ impl TextCellPixels {
     }
 }
 
+/// True when the beam is inside the horizontal blanking/retrace interval:
+/// past the active dots on the current scan line. `CrtcTiming` does not carry
+/// a separate horizontal retrace start/width (only the CGA/MDA/VGA personalities
+/// this core hosts need it, and none of their timing tables model it finer than
+/// "past hdisp_end"), so this is the whole non-active portion of the line --
+/// good enough for a status bit a detection loop polls for a toggle, which is
+/// its only consumer (`read_hgc_status`).
+pub fn beam_hsync(t: &CrtcTiming, dots: u64) -> bool {
+    beam_dot(t, dots) >= t.hdisp_end
+}
+
 #[derive(Debug, Clone)]
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
@@ -928,6 +1041,7 @@ pub struct Vga {
     pub(crate) default_palette_loading_enabled: bool,
     pub(crate) grayscale_summing_enabled: bool,
     pub(crate) cga: Cga,
+    pub(crate) hgc: Hgc,
     // Content-generation counter for the host-side dirty-framebuffer cache. Bumped
     // inside every display mutator on this Vga: the VRAM writers, the register/DAC
     // write port, and the start-address latch at vsync. Putting it here (not on the
@@ -991,6 +1105,7 @@ impl Default for Vga {
             default_palette_loading_enabled: true,
             grayscale_summing_enabled: false,
             cga: Cga::default(),
+            hgc: Hgc::default(),
             content_gen: 0,
         };
         // Size the work buffer for the boot text mode so the raster is published
@@ -1633,7 +1748,10 @@ impl Vga {
     /// acceptance shape as the documented dot-clock retroactivity decision on
     /// the lazy arm in MachineBus::read_io.
     fn video_status_mux_bits(&self, beam: u64) -> u8 {
-        if self.is_cga_personality() || !beam_display_enable(&self.crtc, beam) {
+        if self.is_cga_personality()
+            || self.is_hercules_personality()
+            || !beam_display_enable(&self.crtc, beam)
+        {
             return 0;
         }
         let line = beam_line(&self.crtc, beam);
@@ -1658,7 +1776,7 @@ impl Vga {
                 let pan = self.pel_pan(below_split);
                 self.active_pixel(row_base, row_scan, pan, dot)
             }
-            VideoMode::Cga => 0,
+            VideoMode::Cga | VideoMode::Hercules => 0,
         };
         let pair = match (self.attr.plane_enable >> 4) & 0x03 {
             0x00 => (((color >> 2) & 1) << 1) | (color & 1),
@@ -2299,6 +2417,9 @@ impl Vga {
         if self.is_cga_personality() && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0 {
             return CGA_BLACK;
         }
+        if self.is_hercules_personality() && self.hgc.mode_control & HGC_MODE_VIDEO_ENABLE == 0 {
+            return CGA_BLACK;
+        }
         if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
             if self.is_cga_text_mode() {
                 return self.cga.background_index();
@@ -2308,6 +2429,9 @@ impl Vga {
                     CgaMode::Graphics320x200 => self.cga.background_index(),
                     CgaMode::Graphics640x200 => CGA_BLACK,
                 };
+            }
+            if self.mode == VideoMode::Hercules {
+                return CGA_BLACK;
             }
             self.attr.overscan & 0x3F // border = overscan color
         } else {
@@ -2330,6 +2454,7 @@ impl Vga {
                     VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
                     VideoMode::Text => self.render_text_row(counter_line),
                     VideoMode::Cga => self.render_cga_row(counter_line),
+                    VideoMode::Hercules => self.render_hgc_row(counter_line),
                     _ => self.render_active_row(counter_line),
                 }
             } else {
@@ -2626,6 +2751,49 @@ impl Vga {
         }
     }
 
+    /// Read the Hercules CRT status register (port 3BAh). Unlike the VGA/MDA
+    /// status1 layout this shares the 3BAh address with, real Hercules hardware
+    /// puts unrelated bits here (seasip.info "Hercules Graphics Card Plus
+    /// Notes"):
+    ///
+    /// Bit 0: horizontal retrace active.
+    /// Bit 1: light pen switch triggered (this core has no light pen; always 0).
+    /// Bit 3: video pixel output (the current beam position is lit, i.e. the
+    ///   framebuffer bit at the beam's dot is set) -- only meaningful while the
+    ///   beam is in the active display area.
+    /// Bits 6-4: card ID (0 here; this core does not claim HGC+ id 001b).
+    /// Bit 7: vertical sync, active LOW (0 during vsync, 1 otherwise) -- the
+    ///   inverse polarity of the VGA/CGA status1 vertical-retrace bit, and the
+    ///   bit the classic HGC detection loop polls for a 0->1 (or 1->0) edge.
+    fn read_hgc_status(&mut self) -> u8 {
+        self.catch_up();
+        let beam = self.beam;
+        self.hgc_status_bits(beam)
+    }
+
+    /// Pure HGC 3BAh bit computation off a caller-supplied beam, mirroring the
+    /// `status1_bits` split so the lazy port-read path can pass a predicted
+    /// beam (a detection loop polling bit 7 must see it toggle within a lazy
+    /// batch). The bit-3 pixel sample renders a full row per read; HGC polls
+    /// are not a performance target, so no per-pixel sampler exists for it.
+    fn hgc_status_bits(&self, beam: u64) -> u8 {
+        let mut status = 0u8;
+        if beam_hsync(&self.crtc, beam) {
+            status |= 0x01;
+        }
+        if beam_display_enable(&self.crtc, beam) {
+            let line = beam_line(&self.crtc, beam);
+            let dot = beam_dot(&self.crtc, beam) as usize;
+            if self.render_hgc_row(line).get(dot).copied().unwrap_or(0) != 0 {
+                status |= 0x08;
+            }
+        }
+        if !beam_vretrace(&self.crtc, beam) {
+            status |= 0x80;
+        }
+        status
+    }
+
     /// Read Input Status Register 1 (port 3DAh).
     ///
     /// Bit 0: display inactive. Attribute PAS blanking and CGA 3D8h video-disable
@@ -2646,6 +2814,9 @@ impl Vga {
     /// `self.beam`, so both callers share exactly one bit-computation
     /// implementation.
     pub fn read_status1(&mut self) -> u8 {
+        if self.is_hercules_personality() {
+            return self.read_hgc_status();
+        }
         self.status1_side_effects();
         let beam = self.beam;
         self.status1_bits(beam)
@@ -2742,6 +2913,13 @@ impl Vga {
                 Some(self.status0_bits(beam))
             }
             port if self.status1_port_selected(port) => {
+                if self.is_hercules_personality() {
+                    // HGC has no attribute flip-flop; the catch-up is the only
+                    // side effect, and the bits come from the predicted beam
+                    // like the VGA path so lazy poll loops observe the toggle.
+                    self.catch_up();
+                    return Some(self.hgc_status_bits(beam));
+                }
                 self.status1_side_effects();
                 Some(self.status1_bits(beam))
             }
@@ -2853,6 +3031,18 @@ impl Vga {
             }
             0x3DC => {
                 self.latch_cga_light_pen();
+                true
+            }
+            // Hercules Mode Control (3B8h) and Configuration Switch (3BFh) are
+            // specific mono-alias addresses on real hardware: they decode
+            // regardless of the Misc Output color-emulation bit, unlike the
+            // 3B4/3B5/3BA <-> 3D4/3D5/3DA aliasing pairs above.
+            0x3B8 => {
+                self.write_hgc_mode_control(value);
+                true
+            }
+            0x3BF => {
+                self.hgc.config_switch = value & 0x03;
                 true
             }
             _ => false,
@@ -3379,6 +3569,50 @@ impl Vga {
         true
     }
 
+    /// Write the Hercules Mode Control register (port 3B8h). Real HGC software
+    /// always sets BIOS mode 07h first (MDA-compatible 80x25 mono text, already
+    /// installed by `set_mono_text_mode`) and then bangs this port directly --
+    /// there was never an INT 10h graphics mode number for Hercules graphics.
+    /// The GRPH bit (bit 1) only takes effect once the Configuration Switch
+    /// (3BFh) has set its allow-graphics bit; otherwise the card stays in
+    /// whatever text/blank state it was in, matching real hardware where 3BFh
+    /// gates what 3B8h may do. Video-enable (bit 3), blink (bit 5), and page
+    /// select (bit 7) are always latched, even while graphics is refused.
+    fn write_hgc_mode_control(&mut self, value: u8) {
+        self.hgc.mode_control = value;
+        if value & HGC_MODE_GRAPHICS != 0 && self.hgc.graphics_allowed() {
+            if self.mode != VideoMode::Hercules {
+                self.crtc = CrtcTiming::hgc_720x348();
+                self.crtc_regs = CrtcRegs::from_timing(self.crtc);
+                self.set_misc_mode_bits(1, false, 0x02);
+                self.mode = VideoMode::Hercules;
+                self.presented = None;
+                self.pending_start = None;
+                self.reset_palette_defaults(0x07);
+                self.install_hgc_phosphor_palette();
+                self.resize_work();
+            }
+        } else if self.mode == VideoMode::Hercules {
+            // GRPH cleared (or graphics not/no-longer allowed): fall back to the
+            // mono text personality, matching what real HGC software does after
+            // it drops out of graphics (re-issue mode 07h).
+            self.set_mono_text_mode();
+        }
+    }
+
+    /// Install a monochrome phosphor DAC preset for Hercules graphics: index 0
+    /// is black (background), index 1 is the classic P39 long-persistence green
+    /// phosphor. Only DAC indices 0/1 are ever sampled by the 1bpp Hercules
+    /// scanout (see `render_hgc_row`), so this is the whole palette that
+    /// matters; text mode 07h is untouched (it keeps its own identity palette).
+    fn install_hgc_phosphor_palette(&mut self) {
+        if !self.default_palette_loading_enabled {
+            return;
+        }
+        self.dac.set_entry(0, 0x00, 0x00, 0x00);
+        self.dac.set_entry(1, 0x08, 0x2A, 0x0C); // P39 green phosphor
+    }
+
     fn write_cga_mode_control(&mut self, value: u8) {
         let value = value & 0x3F;
         let old_control = self.cga.mode_control;
@@ -3823,6 +4057,75 @@ impl Vga {
             }
         }
         row
+    }
+
+    pub fn is_hercules_personality(&self) -> bool {
+        self.mode == VideoMode::Hercules
+    }
+
+    /// True while a B8000 access should reach the second Hercules page: the
+    /// Configuration Switch (3BFh) has paged it in. Consulted by the machine
+    /// bus so it can decode B0000-B7FFF (page 0, always addressable in this
+    /// personality) separately from B8000-BFFFF (page 1, gated).
+    pub fn hgc_page1_addressable(&self) -> bool {
+        self.hgc.page1_enabled()
+    }
+
+    /// Write one byte into the 64K Hercules graphics window: `offset` is
+    /// B0000-relative (0..0x10000), page 0 at 0..0x8000, page 1 at
+    /// 0x8000..0x10000. Both pages are simultaneously addressable on real
+    /// hardware; only the CRTC scanout (`render_hgc_row`) is limited to one at
+    /// a time. The four-way scanline interleave lives in the layout the guest
+    /// writes, so the store is a flat copy, matching how `cga_write` works.
+    pub fn hgc_write(&mut self, offset: usize, value: u8) {
+        self.bump_content_gen();
+        if let Some(slot) = self.hgc.fb.get_mut(offset & (HGC_FB_SIZE * 2 - 1)) {
+            *slot = value;
+        }
+    }
+
+    /// Read one byte from the 64K Hercules graphics window (see `hgc_write`).
+    pub fn hgc_read(&self, offset: usize) -> u8 {
+        self.hgc
+            .fb
+            .get(offset & (HGC_FB_SIZE * 2 - 1))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Assemble one Hercules graphics scanline into 720 DAC indices (index 0
+    /// black, index 1 the phosphor color). The HGC's four-way interleave maps
+    /// display scanline `y` to framebuffer bank `(y & 3) * HGC_BANK_SIZE`
+    /// within the active page, generalizing CGA's two-bank even/odd scheme to
+    /// four banks; 90 bytes/scanline, 1 bit per pixel, MSB first.
+    pub fn render_hgc_row(&self, counter_line: u32) -> Vec<u8> {
+        let width = HGC_BYTES_PER_LINE * 8;
+        if self.hgc.mode_control & HGC_MODE_VIDEO_ENABLE == 0 {
+            return vec![0u8; width];
+        }
+        let y = counter_line as usize;
+        let bank = (y & 3) * HGC_BANK_SIZE;
+        let base = self.hgc.active_page() * HGC_PAGE1_OFFSET;
+        let row_base = base + bank + (y >> 2) * HGC_BYTES_PER_LINE;
+        let mut row = vec![0u8; width];
+        for byte_col in 0..HGC_BYTES_PER_LINE {
+            let byte = self.hgc.fb.get(row_base + byte_col).copied().unwrap_or(0);
+            for bit in 0..8 {
+                let x = byte_col * 8 + bit;
+                if x < width {
+                    row[x] = u8::from((byte >> (7 - bit)) & 1 != 0);
+                }
+            }
+        }
+        row
+    }
+
+    pub fn hgc_mode_control(&self) -> u8 {
+        self.hgc.mode_control
+    }
+
+    pub fn hgc_config_switch(&self) -> u8 {
+        self.hgc.config_switch
     }
 
     /// Derive the absolute vertical timing in `crtc` from the raw register bytes in
@@ -5502,6 +5805,195 @@ mod tests {
         assert_eq!(vga.render_text_row(0)[0], 0x0F);
     }
 
+    // -- Hercules Graphics Card (HGC) personality --
+    //
+    // Real Hercules software always sets BIOS mode 07h first (MDA-compatible
+    // 80x25 mono text), then bangs ports 3B8h/3BFh directly to switch to
+    // 720x348 graphics: there was never an INT 10h mode number for it.
+
+    #[test]
+    fn hgc_config_switch_gates_the_graphics_bit() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+
+        // 3B8h GRPH is refused: 3BFh has not allowed it yet, so the card stays
+        // in text mode.
+        assert!(vga.write_port(0x3B8, 0x02));
+        assert_eq!(vga.active_mode(), VideoMode::Text);
+        assert_eq!(vga.hgc_mode_control(), 0x02); // the latch still stores it
+
+        // Unlock graphics through the config switch, then re-issue the mode
+        // control write: now it takes effect.
+        assert!(vga.write_port(0x3BF, 0x01));
+        assert!(vga.write_port(0x3B8, 0x0A)); // GRPH + video enable
+        assert_eq!(vga.active_mode(), VideoMode::Hercules);
+        assert_eq!(vga.raster_width(), 720);
+        assert_eq!(vga.raster_height(), 370);
+        assert_eq!(vga.crtc.vdisp_end, 348);
+
+        // Dropping GRPH falls back to mono text.
+        assert!(vga.write_port(0x3B8, 0x08));
+        assert_eq!(vga.active_mode(), VideoMode::Text);
+    }
+
+    #[test]
+    fn hgc_page1_only_addressable_once_config_switch_enables_it() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01); // allow graphics, page 1 still not enabled
+        vga.write_port(
+            0x3B8,
+            HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE | HGC_MODE_PAGE1,
+        );
+        assert_eq!(vga.active_mode(), VideoMode::Hercules);
+        // Mode Control asked for page 1, but 3BFh never enabled it: scanout
+        // stays on page 0.
+        vga.hgc_write(0, 0xFF); // page 0, byte 0
+        vga.hgc_write(HGC_FB_SIZE, 0xAA); // page 1, byte 0 (still writable/readable as RAM)
+        assert_eq!(vga.render_hgc_row(0)[0], 1); // page 0's bit shows
+
+        vga.write_port(0x3BF, 0x03); // allow graphics + enable page 1
+        vga.write_port(
+            0x3B8,
+            HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE | HGC_MODE_PAGE1,
+        );
+        assert_eq!(vga.render_hgc_row(0)[0], 1); // page 1's 0xAA -> bit 7 set
+        assert_eq!(vga.render_hgc_row(0)[1], 0); // 0xAA bit 6 clear
+    }
+
+    #[test]
+    fn hgc_mode_control_page_select_flips_scanout_page() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x03); // allow graphics + enable page 1
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE); // page 0
+
+        vga.hgc_write(0, 0b1000_0000); // page 0 scanline 0, first pixel lit
+        vga.hgc_write(HGC_FB_SIZE, 0b0100_0000); // page 1 scanline 0, second pixel lit
+        assert_eq!(vga.render_hgc_row(0)[0], 1);
+        assert_eq!(vga.render_hgc_row(0)[1], 0);
+
+        vga.write_port(
+            0x3B8,
+            HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE | HGC_MODE_PAGE1,
+        );
+        assert_eq!(vga.render_hgc_row(0)[0], 0);
+        assert_eq!(vga.render_hgc_row(0)[1], 1);
+    }
+
+    #[test]
+    fn hgc_four_bank_interleave_maps_scanlines_to_the_right_offsets() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01);
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE);
+
+        // Scanlines 0,1,2,3 map to banks 0x0000,0x2000,0x4000,0x6000; scanline
+        // 4 wraps back to bank 0 at the next row (byte HGC_BYTES_PER_LINE in).
+        vga.hgc_write(0, 0x80); // bank 0, row 0, byte 0 -> scanline 0
+        vga.hgc_write(HGC_BANK_SIZE, 0x40); // bank 1, row 0, byte 0 -> scanline 1
+        vga.hgc_write(HGC_BANK_SIZE * 2, 0x20); // bank 2, row 0, byte 0 -> scanline 2
+        vga.hgc_write(HGC_BANK_SIZE * 3, 0x10); // bank 3, row 0, byte 0 -> scanline 3
+        vga.hgc_write(HGC_BYTES_PER_LINE, 0x08); // bank 0, row 1, byte 0 -> scanline 4
+
+        assert_eq!(vga.render_hgc_row(0)[0], 1);
+        assert_eq!(vga.render_hgc_row(0)[1], 0);
+        assert_eq!(vga.render_hgc_row(1)[1], 1);
+        assert_eq!(vga.render_hgc_row(2)[2], 1);
+        assert_eq!(vga.render_hgc_row(3)[3], 1);
+        assert_eq!(vga.render_hgc_row(4)[4], 1);
+    }
+
+    #[test]
+    fn hgc_720x348_raster_geometry() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01);
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE);
+
+        assert_eq!(vga.raster_width(), 720);
+        let raster = vga.render_full_frame();
+        assert_eq!(raster.width, 720);
+        assert_eq!(raster.height, 370);
+        assert_eq!(raster.display_height, 348);
+    }
+
+    #[test]
+    fn hgc_video_disable_blanks_the_scanout() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01);
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE);
+        vga.hgc_write(0, 0xFF);
+        assert_eq!(vga.render_hgc_row(0)[0], 1);
+
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS); // clear video enable
+        assert_eq!(vga.render_hgc_row(0)[0], 0);
+    }
+
+    #[test]
+    fn hgc_phosphor_palette_installs_green_on_black() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01);
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE);
+
+        assert_eq!(vga.dac_entry(0), [0x00, 0x00, 0x00]);
+        assert_eq!(vga.dac_entry(1), [0x08, 0x2A, 0x0C]);
+    }
+
+    #[test]
+    fn hgc_status_port_bit7_is_the_classic_detection_poll_target() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01);
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE);
+
+        // The classic HGC-detection idiom polls 3BAh bit 7 in a tight loop
+        // (up to ~0x8000 iterations) and declares the card present once the
+        // bit is observed to change. Confirm both states are reachable and
+        // that polling from outside vsync eventually observes the toggle.
+        assert!(vga.dots_until_vretrace_start().is_some());
+
+        vga.advance(0); // beam at dot 0: not in vretrace
+        let initial = vga.read_port(0x3BA).unwrap() & 0x80;
+        assert_eq!(initial, 0x80); // bit 7 high outside vsync
+
+        // Jump the beam into the vertical retrace window.
+        let into_vretrace = u64::from(vga.crtc.vretrace_start) * htotal_dots(&vga.crtc);
+        vga.advance(into_vretrace);
+        let during = vga.read_port(0x3BA).unwrap() & 0x80;
+        assert_eq!(during, 0x00); // bit 7 low during vsync: detection sees the edge
+        assert_ne!(initial, during);
+    }
+
+    #[test]
+    fn hgc_status_port_bit0_tracks_horizontal_retrace() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+        vga.write_port(0x3BF, 0x01);
+        vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE);
+
+        vga.advance(0);
+        assert_eq!(vga.read_port(0x3BA).unwrap() & 0x01, 0x00); // active display: no hsync
+
+        let past_active = u64::from(vga.crtc.hdisp_end) + 4;
+        vga.advance(past_active);
+        assert_eq!(vga.read_port(0x3BA).unwrap() & 0x01, 0x01); // past hdisp_end: hsync
+    }
+
+    #[test]
+    fn hgc_ports_decode_regardless_of_color_emulation_bit() {
+        let mut vga = Vga::default();
+        // Force color emulation on (as if a color card were also present);
+        // the Hercules-specific 3B8/3BF addresses must still decode, unlike
+        // the shared 3B4/3B5/3BA aliasing pair.
+        vga.write_port(0x3C2, vga.misc_output | 0x01);
+        assert!(vga.write_port(0x3BF, 0x01));
+        assert!(vga.write_port(0x3B8, HGC_MODE_GRAPHICS | HGC_MODE_VIDEO_ENABLE));
+        assert_eq!(vga.active_mode(), VideoMode::Hercules);
+    }
+
     #[test]
     fn pel_mask_round_trips_3c6() {
         let mut vga = Vga::default();
@@ -5630,7 +6122,7 @@ mod tests {
                 VideoMode::Mode13h | VideoMode::ModeX => vga.render_256color_row(line)[dot],
                 VideoMode::Text => vga.render_text_row(line)[dot],
                 VideoMode::Planar => vga.render_active_row(line)[dot],
-                VideoMode::Cga => 0,
+                VideoMode::Cga | VideoMode::Hercules => 0,
             };
             let pair = match (vga.attr.plane_enable >> 4) & 0x03 {
                 0x00 => (((color >> 2) & 1) << 1) | (color & 1),
