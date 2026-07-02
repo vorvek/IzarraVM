@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use izarravm_core::{AudioConfig, MidiBackend};
 
 mod dsp;

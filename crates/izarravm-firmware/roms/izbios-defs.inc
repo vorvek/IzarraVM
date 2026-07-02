@@ -69,6 +69,11 @@
 ; The boot menu seeds its default highlight from this byte.
 %define BOOT_CMOS_ORDER 0x11
 
+; CMOS NVRAM byte 0x12 holds the saved GSW speed code (0 386, 1 486, 2 586,
+; 3 286). Written by the setup panel and the boot menu on Save/Accept; applied
+; to the live Lotura register at POST bring-up so the choice survives reboot.
+%define SU_NVRAM_GSW 0x12
+
 ; Boot-device choice (segment 0 byte), written by the boot menu and read by
 ; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives in the
 ; free tail of the foundation BIOS_SCRATCH region (BLIT_* ends at 0x052D), so it

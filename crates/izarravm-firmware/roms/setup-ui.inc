@@ -22,7 +22,7 @@
 ; voltage rails and temperatures with a small per-refresh jitter from an LFSR.
 
 ; --- SETUP_SCRATCH layout (segment 0) --------------------------------------
-%define SU_WORKING_MODE   SETUP_SCRATCH + 0    ; edited GSW mode (0/1/2)
+%define SU_WORKING_MODE   SETUP_SCRATCH + 0    ; edited GSW mode (0/1/2/3)
 %define SU_WORKING_LAYOUT SETUP_SCRATCH + 1    ; edited keyboard layout (0..16)
 %define SU_CURSOR         SETUP_SCRATCH + 2    ; highlighted main-menu row
 %define SU_TIME_FIELD     SETUP_SCRATCH + 3    ; highlighted time field (0..5)
@@ -67,8 +67,8 @@
 %define SU_RTC_YEAR       0x09
 
 ; CMOS NVRAM bytes (the Izarra general area; see the RTC device map).
+; SU_NVRAM_GSW (0x12) lives in izbios-defs.inc: the POST bring-up applies it too.
 %define SU_NVRAM_LAYOUT   0x10
-%define SU_NVRAM_GSW      0x12
 
 ; Number of selectable keyboard layouts (US/UK/SP/FR/GR/IT/BE/CF/DK/NL/NO/PO/SF/SG/SU/SV/LA).
 ; The active table selection lives in CMOS 0x10; the layout-switching ISR is a separate
@@ -378,9 +378,9 @@ su_run_menu:
 su_seed:
     xor cx, cx
     mov ds, cx                      ; DS = 0 for the scratch region
-    ; GSW mode from the live Lotura register, clamped to 0..2.
+    ; GSW mode from the live Lotura register, clamped to 0..3.
     in al, PORT_LOTURA_MODE
-    cmp al, 2
+    cmp al, 3
     jbe .mode_ok
     xor al, al
 .mode_ok:
@@ -499,8 +499,10 @@ su_cursor_inc:
     ret
 
 ; su_edit_left / su_edit_right: Left/Right on the main menu edit the inline rows.
-; LAYOUT cycles the keyboard layout 0..16; GSW cycles the mode 0..2. Other rows are
-; not inline-editable, so the keys are ignored there. DS = 0. Clobbers AX, BX.
+; LAYOUT cycles the keyboard layout 0..16; GSW cycles the mode 0..3 (386/486/586/286,
+; wrapping; 286 is the slowest, cycling after 586, mirroring the bootbox SSlow row).
+; Other rows are not inline-editable, so the keys are ignored there. DS = 0. Clobbers
+; AX, BX.
 su_edit_left:
     xor ax, ax
     mov ds, ax
@@ -526,7 +528,7 @@ su_edit_left:
     mov al, [bx]
     test al, al
     jnz .gsw_store
-    mov al, 3
+    mov al, 4
 .gsw_store:
     dec al
     mov [bx], al
@@ -556,7 +558,7 @@ su_edit_right:
     mov bx, SU_WORKING_MODE
     mov al, [bx]
     inc al
-    cmp al, 3
+    cmp al, 4
     jb .gsw_store
     xor al, al
 .gsw_store:
@@ -815,8 +817,8 @@ su_row_color:
     pop ds                          ; restore DS = CS for the caller's gfx_text
     ret
 
-; su_draw_mode_value: draw the working GSW mode's name (386/486/586) at the value
-; column on the GSW row. Reads SU_WORKING_MODE; uses DS = CS for the string.
+; su_draw_mode_value: draw the working GSW mode's name (386/486/586/286) at the
+; value column on the GSW row. Reads SU_WORKING_MODE; uses DS = CS for the string.
 su_draw_mode_value:
     push cx
     xor cx, cx
@@ -829,13 +831,18 @@ su_draw_mode_value:
     je .m386
     cmp al, 1
     je .m486
-    mov si, su_str_mode586
+    cmp al, 2
+    je .m586
+    mov si, su_str_mode286
     jmp .put
 .m386:
     mov si, su_str_mode386
     jmp .put
 .m486:
     mov si, su_str_mode486
+    jmp .put
+.m586:
+    mov si, su_str_mode586
 .put:
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 2
@@ -1529,6 +1536,7 @@ su_str_slash:        db '/', 0
 su_str_mode386:      db '386', 0
 su_str_mode486:      db '486', 0
 su_str_mode586:      db '586', 0
+su_str_mode286:      db '286', 0
 
 ; Keyboard layout names, indexed by CMOS 0x10 (0 US .. 16 LA).
 ; Codes match the MS-DOS KEYB tool identifiers.

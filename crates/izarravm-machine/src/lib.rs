@@ -1,4 +1,3 @@
-pub use fat12::build_fat12;
 pub use fat32::{
     FAT_ATTR_DIRECTORY, FAT32_EOC, Fat32Geometry, Fat32Table, fat32_boot_sector, fat32_dir_entry,
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
@@ -32,7 +31,6 @@ mod ata;
 mod atapi;
 mod cdimage;
 mod dma;
-mod fat12;
 mod fat32;
 mod fat32_volume;
 mod fat_name;
@@ -1572,7 +1570,7 @@ impl Machine {
         rom[BIOS_MASTER_IRQ_ISR_ROM_OFFSET
             ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
             .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
-        let machine = Self {
+        let mut machine = Self {
             memory,
             ram_lookup,
             profile,
@@ -1676,6 +1674,10 @@ impl Machine {
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
+        // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
+        // profile so a fresh CMOS reproduces the profile's speed; a loaded
+        // cmos.bin then overwrites it with the user's saved choice.
+        machine.set_cmos_byte(0x12, gsw_mode_code(machine.active_mode));
         Ok(machine)
     }
 
@@ -8446,18 +8448,13 @@ impl Machine {
 
     /// CPU clocks to advance while halted so the next wake-capable IRQ lands, or
     /// None if nothing can wake the CPU (so HLT is a genuine halt). A halted guest
-    /// is woken by any of three sources: IRQ0 (PIT channel 0 OUT edge), IRQ5 (the
-    /// SB16 DSP half/end-buffer edge, clock-driven), or the AD1848/WSS codec's
-    /// terminal-count edge on its own (config) IRQ line. Each is considered only
-    /// when unmasked/deliverable; the result is the soonest of the applicable
-    /// wakes, clamped to the deadline and to at least one clock so the run loop
-    /// always makes progress.
-    ///
-    /// Known gap: there is no Yamaha ADPCM-B wake term, so a guest halted with
-    /// ONLY the ADPCM block IRQ armed never wakes (HLT reports a genuine halt).
-    /// Left as-is on purpose: adding the term would shift HLT wake instants,
-    /// and the Accurate class's byte-identical contract pins this path. The
-    /// Approximate batch cap (approx_batch_cap) does include an ADPCM term.
+    /// is woken by any of four sources: IRQ0 (PIT channel 0 OUT edge), IRQ5 (the
+    /// SB16 DSP half/end-buffer edge, clock-driven), the AD1848/WSS codec's
+    /// terminal-count edge, or the Yamaha ADPCM-B block edge, the latter two on
+    /// their own (config) IRQ lines. Each is considered only when
+    /// unmasked/deliverable; the result is the soonest of the applicable wakes,
+    /// clamped to the deadline and to at least one clock so the run loop always
+    /// makes progress.
     fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
         if !self.cpu.interrupts_enabled() {
             return None;
@@ -8503,8 +8500,22 @@ impl Machine {
         } else {
             None
         };
+        // The Yamaha ADPCM-B block edge, on its own (config) IRQ line. Like the
+        // WSS, its counter drains one per output frame.
+        let adpcm_wake =
+            if self.adpcm_enabled && self.pic.deliverable(self.yamaha_adpcm.config().irq) {
+                self.yamaha_adpcm.clocks_until_next_irq(
+                    self.yamaha_adpcm.output_frame_rate(),
+                    self.active_mode.clock_hz(),
+                )
+            } else {
+                None
+            };
         // The sooner of whichever wakes apply; None only when none can fire.
-        let wake = [pit_wake, dsp_wake, wss_wake].into_iter().flatten().min()?;
+        let wake = [pit_wake, dsp_wake, wss_wake, adpcm_wake]
+            .into_iter()
+            .flatten()
+            .min()?;
         Some(wake.max(1).min(remaining))
     }
 
@@ -8555,12 +8566,10 @@ impl Machine {
                 cap = cap.min(clocks);
             }
         }
-        // Next audio block-IRQ edge. The DSP/WSS rates mirror the wake
+        // Next audio block-IRQ edge. The DSP/WSS/ADPCM rates mirror the wake
         // estimators in next_timer_wake (the DSP block counter drains at the
-        // raw byte/word rate, rate_hz; the WSS counter at its frame rate). The
-        // ADPCM term is ADDITIONAL, at its frame rate: next_timer_wake has no
-        // ADPCM wake (a pre-existing gap, noted there), and closing it there
-        // would shift HLT wake instants, which byte-identity forbids here.
+        // raw byte/word rate, rate_hz; the WSS and ADPCM counters at their
+        // frame rates).
         if let Some(clocks) = self.dsp.clocks_until_next_irq(self.dsp.rate_hz(), clock_hz) {
             cap = cap.min(clocks);
         }
@@ -18267,6 +18276,88 @@ mod tests {
         assert!(
             machine.elapsed_clocks() < 5_000,
             "a genuine halt does not fast-forward across the masked codec window"
+        );
+    }
+
+    #[test]
+    fn adpcm_block_edge_wakes_a_halted_cpu() {
+        // A halted CPU with ONLY the Yamaha ADPCM-B block IRQ armed (PIT
+        // unprogrammed, DSP/WSS idle) must fast-forward to the terminal-count
+        // edge and run the IRQ10 handler, same as the DSP/WSS wake sources.
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
+            rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
+        )
+        .unwrap();
+        // 64 bytes of ADPCM data at 0x03_0000 for DMA channel 3.
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x3_0000 + i, 0x11);
+        }
+        // IRQ10 handler at 0x0700: inc word [0x0610]; EOI slave; EOI master; iret.
+        let handler: [u8; 11] = [
+            0xff, 0x06, 0x10, 0x06, 0xb0, 0x20, 0xe6, 0xa0, 0xe6, 0x20, 0xcf,
+        ];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x72] (slave base 0x70, line 2 = IRQ10) -> 0000:0700; clear counter.
+        machine.write_physical_u8(0x72 * 4, 0x00);
+        machine.write_physical_u8(0x72 * 4 + 1, 0x07);
+        machine.write_physical_u8(0x72 * 4 + 2, 0x00);
+        machine.write_physical_u8(0x72 * 4 + 3, 0x00);
+        machine.write_physical_u8(0x0610, 0x00);
+        machine.write_physical_u8(0x0611, 0x00);
+        with_bus(&mut machine, |bus| {
+            // Master PIC base 0x08, slave at IR2 base 0x70, everything unmasked.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0xA0, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x70).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x02).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x00).unwrap();
+            // 8237 DMA channel 3: single-cycle read of the 64-byte buffer.
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 63).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            // Program the chip: 11025 Hz, 128-sample block, ADPCM-B mono, START.
+            let block = 128u16;
+            for &(port, value) in &[
+                (0x240u16, 1u8),
+                (0x241, 0x11),
+                (0x240, 2),
+                (0x241, 0x2B),
+                (0x240, 4),
+                (0x241, (block - 1) as u8),
+                (0x240, 5),
+                (0x241, ((block - 1) >> 8) as u8),
+                (0x240, 3),
+                (0x241, 0x00),
+                (0x240, 0),
+                (0x241, 0x01),
+            ] {
+                bus.write_io(port, BusWidth::Byte, u32::from(value))
+                    .unwrap();
+            }
+        });
+        let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ticks = u16::from(machine.read_physical_u8(0x0610))
+            | (u16::from(machine.read_physical_u8(0x0611)) << 8);
+        assert!(ticks >= 1, "the ADPCM IRQ10 handler should have run");
+        // 128 frames at 11025 Hz is ~11.6 ms -- the fast-forward crossed a real
+        // block window, not a no-op halt.
+        assert!(
+            machine.elapsed_clocks() > 10_000,
+            "the fast-forward should advance emulated time across the ADPCM block"
         );
     }
 
