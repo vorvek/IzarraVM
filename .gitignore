@@ -46,3 +46,6 @@ toka-dos/freedos/sort/**/*.err
 # TOKAMOUS.COM staged output (build-freedos.ps1). Source is tokamous.asm; only
 # the output binary is gitignored (Task 6 image builder reads this path).
 toka-dos/build-freedos-tokamous.com
+
+# MkDocs build output
+/site/
