@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 0.2.0). Dry run only — no tag is created and the draft release is not published.'
+        required: true
+        default: '0.0.0-dryrun'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: cargo build --release -p izarravm --locked
+
+      - name: Write README-dist.txt
+        shell: bash
+        run: |
+          cat > README-dist.txt <<'EOF'
+          IzarraVM — Windows x86_64 build
+          ================================
+
+          HOW TO RUN
+             Double-click izarravm.exe, or run it from a terminal:
+                izarravm.exe
+
+          WHERE YOUR FILES LIVE
+             By default IzarraVM keeps its C: drive image, cmos.bin (NVRAM),
+             and izarravm.conf (GUI preferences) in a per-user folder:
+                %USERPROFILE%\.izarravm\
+             This lets you move or reinstall the izarravm.exe binary without
+             losing your virtual machine's disk contents or settings.
+
+          PORTABLE MODE
+             Run with --portable to keep everything next to the executable
+             instead of your user profile:
+                izarravm.exe --portable
+             This creates a c_drive folder, cmos.bin, and izarravm.conf
+             beside izarravm.exe — handy for a USB stick or an install that
+             should not touch the host user profile at all.
+
+          LICENSE
+             IzarraVM is licensed under the GNU General Public License v3.0.
+             See license.txt in this archive for the full text.
+
+          SOURCE
+             https://github.com/vorvek/IzarraVM
+          EOF
+
+      - name: Package zip
+        shell: bash
+        run: |
+          set -e
+          version="${{ steps.ver.outputs.version }}"
+          stage="dist/izarravm-${version}-windows-x86_64"
+          mkdir -p "$stage"
+          cp target/release/izarravm.exe "$stage/"
+          cp LICENSE "$stage/license.txt"
+          cp README-dist.txt "$stage/"
+          (cd dist && 7z a "izarravm-${version}-windows-x86_64.zip" "izarravm-${version}-windows-x86_64")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/izarravm-*-windows-x86_64.zip
+          if-no-files-found: error
+
+  linux:
+    name: linux-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install system packages
+        # GUI stack is winit (X11 via x11rb + Wayland via smithay-client-toolkit)
+        # + wgpu (Vulkan via ash, dlopen'd EGL) + cpal/midir (ALSA) + gilrs (udev).
+        # x11rb/wayland-sys/khronos-egl dlopen their libraries at runtime rather
+        # than linking at build time, but the runtime .so's plus pkg-config and
+        # the X11/Wayland/XCB headers are included here defensively since this
+        # job has not been validated on a real ubuntu-latest runner yet.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libudev-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: cargo build --release -p izarravm --locked
+
+      - name: Write README-dist.txt
+        run: |
+          cat > README-dist.txt <<'EOF'
+          IzarraVM — Linux x86_64 build
+          ==============================
+
+          HOW TO RUN
+             Extract this archive, then from a terminal:
+                chmod +x izarravm
+                ./izarravm
+
+          WHERE YOUR FILES LIVE
+             By default IzarraVM keeps its C: drive image, cmos.bin (NVRAM),
+             and izarravm.conf (GUI preferences) in a per-user folder:
+                $HOME/.izarravm/
+             This lets you move or reinstall the izarravm binary without
+             losing your virtual machine's disk contents or settings.
+
+          PORTABLE MODE
+             Run with --portable to keep everything next to the executable
+             instead of your home directory:
+                ./izarravm --portable
+             This creates a c_drive folder, cmos.bin, and izarravm.conf
+             beside the izarravm binary.
+
+          LICENSE
+             IzarraVM is licensed under the GNU General Public License v3.0.
+             See license.txt in this archive for the full text.
+
+          SOURCE
+             https://github.com/vorvek/IzarraVM
+
+          NOTE
+             This Linux build is produced by CI but has not yet been manually
+             verified on a Linux desktop by the maintainers. If IzarraVM fails
+             to start, please open an issue with your distro, desktop
+             (X11/Wayland), and GPU driver details.
+          EOF
+
+      - name: Package tarball
+        run: |
+          set -e
+          version="${{ steps.ver.outputs.version }}"
+          stage="dist/izarravm-${version}-linux-x86_64"
+          mkdir -p "$stage"
+          cp target/release/izarravm "$stage/"
+          cp LICENSE "$stage/license.txt"
+          cp README-dist.txt "$stage/"
+          tar -C dist -czf "dist/izarravm-${version}-linux-x86_64.tar.gz" "izarravm-${version}-linux-x86_64"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/izarravm-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  source:
+    name: source-archive
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install 7z
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build source archive
+        run: |
+          set -e
+          version="${{ steps.ver.outputs.version }}"
+          mkdir -p dist
+          # git archive writes a tar of the tracked tree at HEAD (no .git, no
+          # build artifacts, respects .gitignore-tracked-state automatically
+          # since only tracked files are included); pipe straight into 7z.
+          git archive --format=tar --prefix="izarravm-${version}-source/" HEAD | \
+            7z a -si "dist/izarravm-${version}-source.7z"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-archive
+          path: dist/izarravm-*-source.7z
+          if-no-files-found: error
+
+  publish:
+    name: draft-release
+    needs: [windows, linux, source]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          files: |
+            dist/izarravm-*-windows-x86_64.zip
+            dist/izarravm-*-linux-x86_64.tar.gz
+            dist/izarravm-*-source.7z

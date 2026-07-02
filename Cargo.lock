@@ -1629,7 +1629,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "izarravm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "egui",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "izarravm-audio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cpal",
  "izarravm-core",
@@ -1667,14 +1667,14 @@ dependencies = [
 
 [[package]]
 name = "izarravm-bus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "izarravm-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "izarravm-corpus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "serde",
@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "izarravm-cpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "izarravm-bus",
  "serde",
@@ -1705,14 +1705,14 @@ dependencies = [
 
 [[package]]
 name = "izarravm-firmware"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "izarravm-video",
 ]
 
 [[package]]
 name = "izarravm-input"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gilrs",
  "winit",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "izarravm-machine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "izarravm-audio",
  "izarravm-bus",
@@ -1734,7 +1734,7 @@ dependencies = [
 
 [[package]]
 name = "izarravm-video"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "izarravm-core",
  "thiserror 2.0.18",
