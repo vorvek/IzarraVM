@@ -45,7 +45,9 @@ k_cs: dw 0                        ; EXECRH far-return CS
 k_ip: dw 0                        ; EXECRH far-return IP
 
 vif: db 1                         ; virtual IF (guest's view; DOS boots with IF=1)
-vip: db 0                         ; virtual interrupt pending: bit0=IRQ0, bit1=IRQ1
+align 2
+vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
+                                  ; line N, master 0-7 + slave 8-15; SP-4b M4)
 
 ; ---- SP-4b M1 XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
@@ -1508,23 +1510,38 @@ gdtr:
     dw 0x27                       ; 5 descriptors
     dd 0
 
-; IDT (static gates; offsets are driver-relative, selector = PM code 0x08).
-; Only the vectors that fire in M0 are present: 8 = IRQ0 timer, 9 = IRQ1
-; keyboard, 13 = #GP (sensitive-instruction trap). base patched at runtime.
+; IDT (static gates; offsets are driver-relative, selector = PM code 0x08;
+; base patched at runtime). SP-4b M4: the default boot runs the WHOLE system in
+; V86, so every device IRQ the machine can raise needs a gate — master IRQ0-7 on
+; vectors 8-15 (the DOS PIC base) and slave IRQ8-15 on 0x70-0x77. Vector 13 is
+; BOTH #GP and IRQ5 (SB16): vec13_entry disambiguates. The exception overlaps on
+; 8/10-12/14 (#DF/#TS/#NP/#SS/#PF) have no source here: identity-mapped
+; always-present pages and no PM selector loads from V86.
+%macro IDTGATE 1
+    dw %1, 0x0008                 ; offset-low, PM code selector (driver < 64K)
+    db 0, 0x8E                    ; present, ring-0 32-bit interrupt gate
+    dw 0                          ; offset-high
+%endmacro
 align 8
 idt:
     times 8*8 db 0                ; 0..7
-    dw irq8, 0x0008               ; 8  IRQ0 timer (offset-high = 0, driver < 64K)
-    db 0, 0x8E
-    dw 0
-    dw irq9, 0x0008             ; 9  IRQ1 keyboard
-    db 0, 0x8E
-    dw 0
-    times 3*8 db 0               ; 10..12
-    dw monitor, 0x0008          ; 13 #GP -> sensitive-instruction monitor
-    db 0, 0x8E
-    dw 0
-    times 18*8 db 0             ; 14..31
+    IDTGATE irq_m0                ; 8    IRQ0 timer
+    IDTGATE irq_m1                ; 9    IRQ1 keyboard
+    IDTGATE irq_m2                ; 10   IRQ2 cascade (never raw; stub for safety)
+    IDTGATE irq_m3                ; 11   IRQ3 COM2
+    IDTGATE irq_m4                ; 12   IRQ4 COM1
+    IDTGATE vec13_entry           ; 13   #GP monitor OR IRQ5 (SB16)
+    IDTGATE irq_m6                ; 14   IRQ6 FDC
+    IDTGATE irq_m7                ; 15   IRQ7 LPT / PIC-spurious
+    times (0x70 - 16)*8 db 0      ; 16..0x6F
+    IDTGATE irq_s8                ; 0x70 IRQ8  RTC
+    IDTGATE irq_s9                ; 0x71 IRQ9
+    IDTGATE irq_s10               ; 0x72 IRQ10
+    IDTGATE irq_s11               ; 0x73 IRQ11
+    IDTGATE irq_s12               ; 0x74 IRQ12 PS/2 mouse
+    IDTGATE irq_s13               ; 0x75 IRQ13
+    IDTGATE irq_s14               ; 0x76 IRQ14 ATA
+    IDTGATE irq_s15               ; 0x77 IRQ15 / slave-spurious
 idt_end:
 idtr:
     dw idt_end - idt - 1
@@ -1611,13 +1628,56 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ;   [ebp+0]=EIP [ebp+4]=CS [ebp+8]=EFLAGS [ebp+12]=V86 ESP [ebp+16]=V86 SS ...
 ; ============================================================================
 
-; ---- #GP (vector 13): a sensitive instruction faulted. Has an error code. ----
-monitor:
+; ---- vector 13: #GP (sensitive instruction, error-code frame) OR IRQ5 (the
+; SB16, no error code). Discriminate in layers (SP-4b M4):
+;   1. master-PIC ISR bit 5 clear (OCW3 read) -> a plain #GP: an IRQ5 delivery
+;      always sets in-service first.
+;   2. bit set: an IRQ5 delivery, UNLESS this is a #GP raised inside the
+;      guest's own IRQ5 ISR (in-service until its EOI). Our V86 #GPs push
+;      error code 0 where the IRQ frame carries the guest EIP -> a nonzero
+;      slot at [esp+32] means IRQ5.
+;   3. zero slot: peek the #GP-candidate CS:IP byte — only the sensitive set
+;      {CLI,STI,PUSHF,POPF,INT n,IRET} raises #GP from a healthy V86 guest.
+; Residual: an IRQ5 arriving with guest IP == 0 whose garbled candidate peek
+; ALSO hits a sensitive byte is mis-handled as #GP (the line stays un-EOI'd) —
+; a double coincidence we accept and document.
+vec13_entry:
     pushad
-    mov ax, 0x10                  ; flat 4 GiB DS to reach the guest's high stacks
+    mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
+    mov al, 0x0B                  ; OCW3: next master data read = ISR
+    out 0x20, al
+    in al, 0x20
+    test al, 0x20                 ; IRQ5 in service?
+    jz monitor_body               ; no -> a plain #GP
+    cmp dword [esp+32], 0         ; #GP error-code slot vs IRQ frame EIP
+    jne .irq5
+    movzx eax, word [esp+40]      ; #GP-candidate CS
+    shl eax, 4
+    movzx ecx, word [esp+36]      ; #GP-candidate IP
+    add eax, ecx
+    mov al, [eax]                 ; the would-be faulting opcode
+    cmp al, 0xFA
+    je monitor_body
+    cmp al, 0xFB
+    je monitor_body
+    cmp al, 0x9C
+    je monitor_body
+    cmp al, 0x9D
+    je monitor_body
+    cmp al, 0xCD
+    je monitor_body
+    cmp al, 0xCF
+    je monitor_body
+.irq5:
+    mov ebx, 5
+    jmp irq_body                  ; no-error-code frame path
+
+; ---- #GP monitor body: a sensitive instruction faulted. Error-code frame;
+; entered from vec13_entry with pushad done and DS/FS loaded. ----
+monitor_body:
     lea ebp, [esp + 32 + 4]       ; skip pushad(32) + error code(4)
     movzx eax, word [ebp+4]       ; guest CS
     shl eax, 4
@@ -1722,45 +1782,72 @@ monitor:
     add esp, 4                   ; discard the #GP error code
     iretd
 
-; ---- IRQ0 timer (vector 8) / IRQ1 keyboard (vector 9). No error code. ----
-irq8:
+; ---- Hardware IRQs (no error code). Per-line stubs load the 8259 line number
+; and share one body: reflect to the guest IVT when VIF is set, else hold the
+; line in the vip mask and EOI immediately (coalesce; deliver on the next
+; STI/POPF/IRET). Master lines 0-7 (vectors 8-15, 5 via vec13_entry), slave
+; lines 8-15 (vectors 0x70-0x77). ----
+%assign line 0
+%rep 8
+irq_m%[line]:
     pushad
+    mov ebx, line
+    jmp irq_common
+%assign line line+1
+%endrep
+%assign line 8
+%rep 8
+irq_s%[line]:
+    pushad
+    mov ebx, line
+    jmp irq_common
+%assign line line+1
+%endrep
+
+irq_common:                       ; pushad done, EBX = IRQ line
     mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
+irq_body:                         ; vec13_entry joins here (segs already set)
     lea ebp, [esp + 32]
     cmp byte [fs:vif], 0
     jne .go
-    or byte [fs:vip], 1          ; VIF clear: coalesce pending, but EOI now so the
-    mov al, 0x20                 ; PIC keeps delivering (deliver on the next STI/POPF)
-    out 0x20, al
+    mov ecx, ebx                  ; VIF clear: hold the line, EOI now so the
+    mov ax, 1                     ; PIC keeps delivering
+    shl ax, cl
+    or [fs:vip], ax
+    call irq_eoi
     popad
     iretd
 .go:
-    mov ebx, 8
-    call reflect_vector
+    call irq_reflect_line
     popad
     iretd
-irq9:
-    pushad
-    mov ax, 0x10
-    mov ds, ax
-    mov ax, 0x20
-    mov fs, ax
-    lea ebp, [esp + 32]
-    cmp byte [fs:vif], 0
-    jne .go
-    or byte [fs:vip], 2          ; coalesce pending + EOI now (see irq8)
+
+; EOI the chip(s) for line EBX. The just-delivered line is the highest in
+; service on its chip, so the non-specific EOI clears the right bit; slave
+; lines also EOI the master's cascade. Clobbers AL.
+irq_eoi:
+    cmp ebx, 8
+    jb .master
+    mov al, 0x20
+    out 0xA0, al
+.master:
     mov al, 0x20
     out 0x20, al
-    popad
-    iretd
-.go:
-    mov ebx, 9
-    call reflect_vector
-    popad
-    iretd
+    ret
+
+; Reflect line EBX to its guest IVT vector: master N -> INT 08h+N, slave N ->
+; INT 70h+(N-8), the DOS-default PIC mapping. Tail-jumps reflect_vector.
+irq_reflect_line:
+    cmp ebx, 8
+    jb .master
+    add ebx, 0x70 - 8
+    jmp reflect_vector
+.master:
+    add ebx, 8
+    jmp reflect_vector
 
 ; Reflect an interrupt into the guest's real-mode IVT handler.
 ;   in: EBX = vector, EBP = &frame.eip, FS = driver data.  clobbers eax,ecx,edx,edi
@@ -1793,23 +1880,52 @@ reflect_vector:
     mov byte [fs:vif], 0        ; entering the ISR clears VIF
     ret
 
-; If VIF is set and an IRQ is pending, deliver the highest-priority one.
+; If VIF is set and lines are pending, deliver the highest-priority one per
+; call (the reflect clears VIF; the guest ISR's IRET re-runs us, draining the
+; queue). Priority = 8259 fully-nested with the slave cascaded at IR2:
+; 0, 1, 8..15, then 2..7 (a raw line 2 cannot occur — cascade INTA resolves to
+; the slave vectors — but the walk covers it so a held bit can never stick).
 ;   in: EBP = &frame.eip, FS = driver data.  clobbers eax,ebx,ecx,edx,edi
 maybe_deliver:
     cmp byte [fs:vif], 0
     je .none
-    movzx ebx, byte [fs:vip]
-    test bl, bl
+    movzx edx, word [fs:vip]
+    test dx, dx
     jz .none
-    test bl, 1
-    jz .try9
-    and byte [fs:vip], 0xFE
-    mov ebx, 8
-    jmp reflect_vector           ; tail: ret returns to maybe_deliver's caller
-.try9:
-    and byte [fs:vip], 0xFD
-    mov ebx, 9
-    jmp reflect_vector
+    xor ebx, ebx                  ; line 0
+    test dl, 1
+    jnz .hit
+    mov ebx, 1                    ; line 1
+    test dl, 2
+    jnz .hit
+    mov ebx, 8                    ; slave lines 8..15 (the cascade slot)
+.slave:
+    mov ecx, ebx
+    mov ax, 1
+    shl ax, cl
+    test dx, ax
+    jnz .hit
+    inc ebx
+    cmp ebx, 16
+    jb .slave
+    mov ebx, 2                    ; remaining master lines 2..7
+.low:
+    mov ecx, ebx
+    mov ax, 1
+    shl ax, cl
+    test dx, ax
+    jnz .hit
+    inc ebx
+    cmp ebx, 8
+    jb .low
+    ret                           ; unreachable: dx was nonzero
+.hit:
+    mov ecx, ebx
+    mov ax, 1
+    shl ax, cl
+    not ax
+    and [fs:vip], ax              ; claim the line
+    jmp irq_reflect_line          ; tail: ret returns to maybe_deliver's caller
 .none:
     ret
 
