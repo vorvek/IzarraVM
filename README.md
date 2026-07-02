@@ -2,8 +2,8 @@
 
 IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era games computer that
 almost shipped in 1997. It models one fixed machine: custom video and audio
-around an MS-DOS compatible core, with Toka Disk System as its ROM shell and
-launcher.
+around an MS-DOS compatible core, booting Toka-DOS — a real FreeDOS-based
+system running in virtual-8086 mode under the machine's own memory manager.
 
 <p align="center">
   <img src="docs/izarra-3000-chassis.jpg" alt="The Izarra 3000 desktop tower" width="300">
@@ -12,9 +12,9 @@ launcher.
 </p>
 
 The goal is to run early to mid 1990s DOS games as if the Izarra had reached
-store shelves. Some games already run, but the VM is far for complete, and performance
-is lacking in a few areas, most importantly on the CPU. The 486 Mode @66 MHz is borderline,
-and the full speed mode is not yet usable.
+store shelves. A growing set of games already runs, and the throttled CPU modes
+run at or near real-time on a modern host; the full-speed 586 mode is still
+being tuned.
 
 ## Origin
 
@@ -43,7 +43,7 @@ reproduces the Izarra 3000 exactly as it was built.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
-| CPU | GSW-586, a Pentium MMX @200MHz part on a 66 MHz bus. Toka can throttle it to 486DX2 66 MHz or 386DX 25 MHz without rebooting. |
+| CPU | GSW-586, a Pentium MMX @200MHz part on a 66 MHz bus. The BIOS or the bundled GSWMODE tool can throttle it to 486DX2 66 MHz, 386DX 25 MHz, or a 286 @8 MHz without rebooting. |
 | Memory | 24 MB SDRAM, with Toka mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio, OPL3 FM, MPU-401 MIDI, wavetable daughterboard, and Yamaha ADPCM-B playback. |
@@ -52,10 +52,24 @@ reproduces the Izarra 3000 exactly as it was built.
 | Firmware | 2 MB ROM with the Izarra BIOS, Toka-DOS (FreeDOS-based), and bundled tools. |
 | I/O | PS/2 keyboard and mouse, serial, parallel, VGA, line out, line in, and MIDI/game port. |
 
+## How it works
+
+The firmware is a clean-room BIOS with a graphical POST, a boot menu, and a
+full setup panel. It boots a real FreeDOS kernel and shell (rebranded
+Toka-DOS 3.0) inside virtual-8086 mode under TOKAEMM, a guest-side memory
+manager that provides XMS, EMS, and UMBs through the CPU's own paging — the
+same way a period memory manager did it. The C: drive is a folder on the host,
+served to the guest as a real ATA disk; the classic external DOS tools
+(XCOPY, ATTRIB, FIND, MORE, MEM, CHOICE, DELTREE, MOVE, SORT, LABEL, and more)
+ship on it, built from FreeDOS sources or written for the project.
+
 ## Current State
 
-IzarraVM is early. The emulator boots its own BIOS and Toka-DOS path, and some
-simple DOS software may work, but it is not a dependable DOS game runner yet.
+The emulator boots to a usable DOS with sound, mouse, CD-ROM (ISO, CUE/BIN, or
+a host folder mounted as a disc), and floppy images. Legacy video personalities
+(CGA, EGA, VGA, Hercules) are modeled down to the register level, and the
+display goes through an optional, subtle CRT shader. Plenty of games run;
+plenty more don't yet — compatibility work is ongoing.
 
 ## Quick Start
 
