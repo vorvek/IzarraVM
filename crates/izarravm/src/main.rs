@@ -3327,6 +3327,154 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// A cold boot in GSW-286 mode must reach a working prompt. POST applies
+    /// the CMOS-seeded mode (port 0xE1) before INT 19h, so the whole boot
+    /// chain runs at the true-286 ISA level — and the Katea boot chain (the
+    /// repo MBR + the FreeDOS FAT32-LBA VBR inside tokados-hdd.img) was 386
+    /// code executing from RAM: the MBR's first `66`-prefixed instruction
+    /// (`mov eax, [si+8]`, linear 0x642) raised #UD into IVT[6] = a bare IRET
+    /// stub, which returned to the same instruction — an infinite fault loop
+    /// with a blank screen. The kernel itself is XCPU=86 (8086-compiled), so
+    /// the boot sectors were the only 386 code in the chain; both are now
+    /// 8086/286-clean (word-pair LBA math). This matters because the Del
+    /// setup panel offers 286 as a saved boot mode.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn gsw286_cold_boot_reaches_a_prompt() {
+        let dir = std::env::temp_dir().join(format!(
+            "diag286_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nVER\r\n".to_vec();
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.cpu = GswMode::Gsw286;
+        profile.clock_hz = GswMode::Gsw286.clock_hz();
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                ],
+            )
+            .expect("mount");
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during a GSW-286 cold boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            machine.active_mode(),
+            GswMode::Gsw286,
+            "the machine should still be in the saved 286 mode (stop={stop:?}).\n{text}"
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("toka-dos version"),
+            "VER output missing after a 286 cold boot (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after a 286 cold boot (stop={stop:?}).\n{text}"
+        );
+    }
+
+    /// A 286 cold boot with DEVICE=TOKAEMM.SYS in CONFIG.SYS: TOKAEMM's INIT
+    /// is inherently 386-only (its whole job is building the 386 PM/paging
+    /// monitor), so on a pre-386 level it must decline like real EMM386 on a
+    /// 286 — read the Lotura mode register (port 0xE1, code 3 = 286), print a
+    /// "requires a 386" line, return a failed INIT with nothing resident —
+    /// and DOS then boots on bare metal (no V86, no XMS/UMB), which is what a
+    /// real 286 box looks like. Without the guard, INIT's first MOVZX raises
+    /// #UD into the IVT's bare-IRET default and the boot hangs forever.
+    /// Needs no CPU-side exemption: the monitor never installs.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokaemm_init_bails_gracefully_on_a_286_boot() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_286boot_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // No DOS=HIGH,UMB: with TOKAEMM declining to install there is no XMS
+        // provider, and this test is about the INIT bail, not kernel warnings.
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\TOKAEMM.SYS NOEMS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nVER\r\n".to_vec();
+
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.cpu = GswMode::Gsw286;
+        profile.clock_hz = GswMode::Gsw286.clock_hz();
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault during a 286-mode boot: TOKAEMM INIT must detect the \
+                 pre-386 level and decline, not execute 386 code: {msg}\n\
+                 stop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("requires a 386"),
+            "TOKAEMM INIT's pre-386 bail message is missing (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            !lower.contains("system running in v86"),
+            "TOKAEMM printed its signon banner — it must not install on a 286 \
+             (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the 286-mode boot (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// Audit item 10: the vendored FreeDOS MEM (toka-dos/freedos/mem) runs under
     /// the default V86 boot and both `MEM` and `MEM /P` produce sane output.
     /// Toka-DOS diverges from upstream MEM here: upstream's `/P` is only a

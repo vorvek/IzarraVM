@@ -171,11 +171,30 @@ interrupt:
     retf
 
 init:
-    ; NOTE: INIT is inherently 386-only (it builds the PM/paging monitor). A
-    ; pre-386 guard (read Lotura port 0xE1, decline with a "requires a 386"
-    ; message like real EMM386) is deferred: a GSW-286 cold boot currently
-    ; hangs before CONFIG.SYS with or without TOKAEMM (machine/BIOS-level),
-    ; so the guard's bail path cannot be exercised end-to-end yet.
+    ; Pre-386 guard FIRST, in 8086-safe code: INIT's whole job is building the
+    ; 386 PM/paging monitor, so on a pre-386 level decline like real EMM386 on
+    ; a 286 — message, failed status, nothing resident (its first MOVZX would
+    ; otherwise #UD into the IVT's bare-IRET default and hang the boot). The
+    ; live ISA level is the Lotura GSW mode register (port 0xE1; 3 = GSW-286
+    ; Super Slow): the classic FLAGS-bits-12..15 probe is not modeled by the
+    ; emulator's level gate, the port is the machine's own truth.
+    in al, 0xE1
+    cmp al, 3                     ; GSW-286?
+    jne .cpu_ok
+    mov si, msg386
+.gl:
+    lodsb                         ; DS = CS (set by `interrupt` above)
+    test al, al
+    jz .gdone
+    int 0x29
+    jmp .gl
+.gdone:
+    mov word [es:bx+14], 0        ; r_endaddr = CS:0000 — keep nothing resident
+    mov word [es:bx+16], cs
+    mov word [es:bx+3], 0x810C    ; r_status = S_ERROR | S_DONE | general failure
+    sti
+    retf
+.cpu_ok:
     ; Report resident size FIRST, while ES:BX still points at the request header
     ; (the setup below clobbers BX). r_endaddr = drv_seg:resident_end covers the
     ; driver's code + tables, which stay resident under the monitor permanently.
@@ -2203,6 +2222,7 @@ a20_apply:
     ret
 
 banner: db 'TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
+msg386: db 'TOKAEMM requires a 386 or better; not installed.', 0x0D, 0x0A, 0
 
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:

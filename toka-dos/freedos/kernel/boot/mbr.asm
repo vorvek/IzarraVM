@@ -14,6 +14,8 @@
 ;
 ; Assemble: nasm mbr.asm -o mbr.bin   (exactly 512 bytes, 0x55AA at 510/511).
 
+        cpu     8086            ; must run at the GSW-286 ISA gate (and below);
+                                ; NASM enforces the boundary
         org     0x600           ; we relocate to here before running
 
 %define ORIG    0x7c00          ; where the BIOS/INT 19h loaded us
@@ -63,9 +65,15 @@ reloc_entry:
 
 .found:
         ; SI -> active partition entry. Its RelSect (start LBA) is at offset 8.
+        ; Copied as two word moves: this MBR must stay 8086-clean, because a
+        ; GSW-286 cold boot runs it at the true-286 ISA level where a
+        ; 66h-prefixed 32-bit move raises #UD (and the IVT default handler is
+        ; a bare IRET, turning that into an infinite fault loop).
         push    si                  ; preserve entry pointer for the chain jump
-        mov     eax, [si + 8]       ; partition start LBA (dword)
-        mov     [dap_lba], eax
+        mov     ax, [si + 8]        ; partition start LBA (dword), low word
+        mov     [dap_lba], ax
+        mov     ax, [si + 10]       ; high word
+        mov     [dap_lba + 2], ax
 
         ; --- read the VBR (1 sector) via INT 13h AH=42h (EDD/LBA) ---
         mov     ah, 0x42
