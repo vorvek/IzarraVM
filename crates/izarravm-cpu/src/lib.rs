@@ -1466,7 +1466,29 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// decode-cache re-peek at the new linear EIP, page-local decode) is unchanged, and a
 /// faulting stack read or segment-limit hit still routes through `finish_instruction`'s
 /// rewind-and-deliver exactly as on the one-instruction path.
-fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> bool {
+///
+/// P4a Task 1.3 additionally admits the IN forms (0xe4 IN AL,imm8; 0xe5 IN AX/EAX,imm8;
+/// 0xec IN AL,DX; 0xed IN AX/EAX,DX) within `DecodeGroup::PortIo`, but ONLY when `level`
+/// is in the Approximate timing class (I486/I586): a lazy port read (`MachineBus::read_io`)
+/// no longer sets `io_touched` for the VGA status ports, so an IN reaching those ports no
+/// longer needs to end the run to keep device state exact, letting a poll loop chain as
+/// continuations instead of paying a full run restart every iteration. The OUT forms
+/// (0xe6/0xe7/0xee/0xef) stay terminators: a write always sets `io_touched` (no lazy write
+/// path exists), so admitting them would end the run right after anyway while widening the
+/// blast radius for no benefit. INS/OUTS stay on `Misc` and are unaffected.
+///
+/// Gated on `level` (not a runtime bus flag) so the Accurate class (I286/I386) keeps
+/// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
+/// per decode, and `Cpu386::set_level` unconditionally invalidates the decode cache
+/// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded — and this
+/// admission re-resolved — after any level change. There is no stale-entry window where an
+/// I286-level IN could carry an I586-level admission decision forward.
+fn block_continuable(
+    group: DecodeGroup,
+    opcode: u16,
+    modrm: Option<ModRm>,
+    level: CpuLevel,
+) -> bool {
     if block_straight_line(group) {
         return true;
     }
@@ -1479,6 +1501,10 @@ fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> b
     // rewind exactly as on the one-instruction path.
     if group == DecodeGroup::StringOps {
         return true;
+    }
+    if group == DecodeGroup::PortIo {
+        // Only the IN forms, only in the Approximate class; see the doc comment above.
+        return level >= CpuLevel::I486 && matches!(opcode, 0xe4 | 0xe5 | 0xec | 0xed);
     }
     if group != DecodeGroup::ControlFlow {
         return false;
@@ -4226,7 +4252,7 @@ impl Cpu386 {
         insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
         // Resolve the continuation gate once per decode (the ModRM is in by now), so the
         // per-continuation check in `run_straight_line` reads a single cached flag.
-        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm);
+        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm, self.level);
 
         Ok(insn)
     }
@@ -11938,21 +11964,20 @@ mod tests {
     }
 
     #[test]
-    fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction() {
-        // `DecodeGroup::PortIo` is not in `block_continuable`'s admitted set (see
-        // that function's comment: "INS/OUTS are Misc and stay terminators", true
-        // of plain IN/OUT too, by the same reasoning: every port access sets
-        // `io_touched` today, ending the run right after it runs, so PortIo has
-        // never needed to be a continuation). That means an IN/OUT can ONLY ever
-        // be `run_straight_line`'s FIRST instruction, never a continuation, in
-        // TODAY's architecture: this test pins that as the reason
-        // core_clocks_so_far is unconditionally 0 for every read_io call reachable
-        // right now, confirming Task 0.2's threading is a true no-op until Slice 1
-        // additionally makes PortIo continuable for the lazy-port case (a second
-        // seam change beyond the io_touched narrowing the plan already names;
-        // flagged here for Slice 1, out of Task 0.2's scope).
+    fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_accurate_class() {
+        // In the Accurate class (I286/I386) `block_continuable` never admits
+        // `DecodeGroup::PortIo` (see that function's doc comment: the P4a Task 1.3
+        // IN admission is gated on the Approximate class only), so an IN can ONLY
+        // ever be `run_straight_line`'s FIRST instruction there, never a
+        // continuation -- every port access still sets `io_touched` unconditionally
+        // in the Accurate class's read_io dispatch, ending the run right after it
+        // runs. This test pins core_clocks_so_far == 0 for that first-instruction
+        // position, explicitly on I386 so it does not silently start exercising the
+        // Approximate-class continuation path if the CPU's default level ever
+        // changes. See the sibling test for the Approximate-class continuation case.
         let code = [0xec]; // in al,dx
         let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I386);
         let mut bus = TestBus::with_memory(memory);
 
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
@@ -11960,12 +11985,95 @@ mod tests {
         assert_eq!(
             bus.last_read_io_core_clocks_so_far,
             Some(0),
-            "an IN that is the run's first (and, today, only possible) \
-             instruction position sees core_clocks_so_far == 0"
+            "an IN that is the run's first (and, in the Accurate class, only \
+             possible) instruction position sees core_clocks_so_far == 0"
         );
         assert!(
             outcome.core_clocks > 0,
             "the IN itself still charges clocks"
+        );
+    }
+
+    #[test]
+    fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approximate_class_continuation()
+     {
+        // P4a Task 1.3: in the Approximate class (I486/I586) `block_continuable`
+        // admits the IN forms (0xe4/0xe5/0xec/0xed), so an IN reached as a
+        // continuation (not the run's first instruction) must see
+        // core_clocks_so_far equal to the running total of every prior
+        // instruction in the run, exactly like the Group/DataMove continuation
+        // case pinned in `core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation`.
+        // Eight INCs then an IN: the IN's core_clocks_so_far must equal the eight
+        // INCs' combined charge. Eight (not two, unlike the sibling Accurate-class
+        // test) because I586's `level_timing` factor is (1, 12) -- a single cheap
+        // INC can legitimately round to 0 charged clocks under the fractional
+        // remainder carry (see `scale_clocks`'s doc comment), so a short run risks
+        // a degenerate all-zero total that cannot distinguish "tracks the running
+        // total" from "always reads 0". Eight instructions guarantees the carry
+        // has produced a nonzero total well before the IN.
+        let code = [0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xec]; // inc ax x8; in al,dx
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        // real_mode_cpu's default level (Cpu386::default()) is already I586
+        // (Approximate); set it explicitly so this test does not silently change
+        // meaning if the default ever moves.
+        cpu.set_level(CpuLevel::I586);
+        let mut bus = TestBus::with_memory(memory);
+        // Warm the decode cache one instruction at a time via single-step `cycle`
+        // (not `run_straight_line`): once the IN is continuable, a warm-up call
+        // to `run_straight_line` may itself chain multiple instructions per call,
+        // so the number of `run_straight_line` calls needed to warm exactly 9
+        // addresses is no longer deterministic. `cycle` always decodes and
+        // advances exactly one instruction per call, so 9 calls warms exactly
+        // addresses 0..9 regardless of continuability.
+        for _ in 0..9 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.reset_perf_counters();
+        // The warm-up's IN (address 8) set TestBus::io_touched, which never
+        // self-clears (unlike the real machine batch loop, which opens each batch
+        // with a fresh false). Clear it here so the measurement run below is not
+        // ended by stale warm-up state on its very first instruction.
+        bus.io_touched = false;
+
+        // Independently capture "the eight INCs' combined charge" the same way
+        // the sibling Group-continuation test does: clone the warmed-up CPU (so
+        // its `timing_rem` fractional-clock carry matches) and single-step eight
+        // INCs on a clone bus.
+        let eight_incs_total = {
+            let mut solo = cpu.clone();
+            let mut solo_bus = TestBus::with_memory(vec![0x40; 8]);
+            let mut total = 0u32;
+            for _ in 0..8 {
+                total += solo.cycle(&mut solo_bus).unwrap().core_clocks;
+            }
+            total
+        };
+        assert!(
+            eight_incs_total > 0,
+            "sanity: eight INCs must have produced a nonzero charge under the \
+             remainder carry, or this test cannot distinguish the running total \
+             from a degenerate always-0 read"
+        );
+
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+        assert_eq!(
+            cpu.perf_counters().straight_line_runs,
+            1,
+            "one chained run: eight INCs then the IN, all continuable in the \
+             Approximate class"
+        );
+        assert_eq!(
+            bus.last_read_io_core_clocks_so_far,
+            Some(eight_incs_total.into()),
+            "the IN reached as the run's ninth instruction (a continuation) must \
+             see core_clocks_so_far equal to the eight INCs' combined charge, not 0"
+        );
+        assert!(
+            outcome.core_clocks > eight_incs_total,
+            "the IN's own charge must be included in the run total"
         );
     }
 
