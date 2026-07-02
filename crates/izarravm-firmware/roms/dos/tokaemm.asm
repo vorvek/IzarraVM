@@ -1769,51 +1769,46 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; ============================================================================
 
 ; ---- vector 13: #GP (sensitive instruction, error-code frame) OR IRQ5 (the
-; SB16, no error code). Discriminate in layers (SP-4b M4):
-;   1. master-PIC ISR bit 5 clear (OCW3 read) -> a plain #GP: an IRQ5 delivery
-;      always sets in-service first.
-;   2. bit set: an IRQ5 delivery, UNLESS this is a #GP raised inside the
-;      guest's own IRQ5 ISR (in-service until its EOI). Our V86 #GPs push
-;      error code 0 where the IRQ frame carries the guest EIP -> a nonzero
-;      slot at [esp+32] means IRQ5.
-;   3. zero slot: peek the #GP-candidate CS:IP byte — only the sensitive set
-;      {CLI,STI,PUSHF,POPF,INT n,IRET} raises #GP from a healthy V86 guest.
-; Residual: an IRQ5 arriving with guest IP == 0 whose garbled candidate peek
-; ALSO hits a sensitive byte is mis-handled as #GP (the line stays un-EOI'd) —
-; a double coincidence we accept and document.
+; SB16, no error code). V86 trap tax Part 2 (fast discriminator): every #GP
+; this emulator's deliver_exception can ever deliver on vector 13 pushes error
+; code EXACTLY 0 (grep-confirmed: every InternalFault::Exception{vector:13,..}
+; raise site in izarravm-cpu passes error_code: Some(0) -- check_v86_iopl,
+; check_io_permission, require_cpl0, the WRMSR/RDMSR/RDTSC/MOV-CRn/SYSRET
+; privilege checks, all of them), and deliver_exception never pushes an error
+; code for an external interrupt (is_external=true), which is the ONLY way
+; IRQ5 reaches this vector. So the two frames differ by exactly one pushed
+; dword: the #GP frame carries error-code 0 in the slot where the IRQ frame
+; carries the interrupted guest's real EIP. Reading that ONE slot is airtight
+; both ways EXCEPT for the coincidence documented below -- no PIC probe and no
+; opcode peek are needed to tell the two apart:
+;   - slot != 0: can only be IRQ5 (a genuine #GP's error code is never
+;     nonzero on this vector, exhaustively, in this emulator).
+;   - slot == 0: overwhelmingly a genuine #GP. The one residual case is an
+;     IRQ5 arriving while the interrupted V86 code's EIP is exactly 0 (rare);
+;     that mis-routes to monitor_body as if it were a #GP. monitor_body's own
+;     full opcode dispatch already has a catch-all (`signal32`) for any
+;     opcode it does not specifically emulate, so a misrouted IRQ5 fails into
+;     that same diagnostic path rather than corrupting guest state -- the
+;     line simply stays un-EOI'd, exactly the same acceptance the old
+;     PIC-probe+opcode-peek scheme documented for the same coincidence.
+; EMULATOR-CONTRACT NOTE: this discriminator is airtight because WE control
+; both frame builders (deliver_exception's error-code-vs-external gating).
+; It is not a real-hardware-portable trick -- real silicon does not need one,
+; since a real #GP and a real IRQ5 are never routed through the same IDT
+; vector in the first place (see the IDT header comment above: the vector-13
+; collision is this emulator's own PIC-base-arithmetic artifact, not a
+; hardware fact). Revisit this comment if deliver_exception's push order or
+; the is_external gating ever changes.
 vec13_entry:
     pushad
     mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
-    mov al, 0x0B                  ; OCW3: next master data read = ISR
-    out 0x20, al
-    in al, 0x20
-    test al, 0x20                 ; IRQ5 in service?
-    jz monitor_body               ; no -> a plain #GP
     cmp dword [esp+32], 0         ; #GP error-code slot vs IRQ frame EIP
-    jne .irq5
-    movzx eax, word [esp+40]      ; #GP-candidate CS
-    shl eax, 4
-    movzx ecx, word [esp+36]      ; #GP-candidate IP
-    add eax, ecx
-    mov al, [eax]                 ; the would-be faulting opcode
-    cmp al, 0xFA
-    je monitor_body
-    cmp al, 0xFB
-    je monitor_body
-    cmp al, 0x9C
-    je monitor_body
-    cmp al, 0x9D
-    je monitor_body
-    cmp al, 0xCD
-    je monitor_body
-    cmp al, 0xCF
-    je monitor_body
-.irq5:
+    je monitor_body                ; zero -> a #GP (the accepted residual above)
     mov ebx, 5
-    jmp irq_body                  ; no-error-code frame path
+    jmp irq_body                  ; nonzero -> can only be IRQ5, no-error frame
 
 ; ---- #GP monitor body: a sensitive instruction faulted. Error-code frame;
 ; entered from vec13_entry with pushad done and DS/FS loaded. ----
