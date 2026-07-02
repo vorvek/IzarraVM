@@ -45,7 +45,20 @@ k_cs: dw 0                        ; EXECRH far-return CS
 k_ip: dw 0                        ; EXECRH far-return IP
 
 vif: db 1                         ; virtual IF (guest's view; DOS boots with IF=1)
-vip: db 0                         ; virtual interrupt pending: bit0=IRQ0, bit1=IRQ1
+va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
+                                  ; forced on at INIT and never drops under V86:
+                                  ; the monitor and the paged UMB/EMS backing
+                                  ; live above 1 MB and a real A20-off would fold
+                                  ; them onto low RAM (DOS=HIGH,UMB corruption).
+                                  ; Port 0x92 is trapped via the TSS I/O bitmap
+                                  ; and the guest's A20 becomes a paging illusion
+                                  ; over the 1 MB..1 MB+64K window — the EMM386
+                                  ; approach. (INT 15h AH=24xx / 8042 A20 paths
+                                  ; are not virtualized; XMS+port 0x92 is what
+                                  ; FreeDOS and period software use.)
+align 2
+vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
+                                  ; line N, master 0-7 + slave 8-15; SP-4b M4)
 
 ; ---- SP-4b M1 XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
@@ -203,6 +216,17 @@ init:
 .p_done:
     pop ds
 
+    ; --- SP-4b M4: signon banner (real mode, INT 29h per char — the proven M0
+    ; marker method; INT 21h AH=09h is unreliable at device-INIT time). ---
+    mov si, banner
+.bl:
+    lodsb                         ; DS = CS here
+    test al, al
+    jz .bdone
+    int 0x29
+    jmp .bl
+.bdone:
+
     ; --- SP-4b M1/M3: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
     ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
     ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
@@ -296,14 +320,15 @@ init:
     add eax, idt
     mov [idtr + 2], eax
 
-    push es                       ; zero the TSS (ES still = request header seg here)
+    push es                       ; zero the TSS + I/O bitmap (ES = header seg here)
     push di
     push cs
     pop es                        ; ES = our segment so STOSW targets our TSS
     mov di, tss
-    mov cx, 0x90 / 2
+    mov cx, 0x2070 / 2
     xor ax, ax
     rep stosw
+    mov byte [tss + 0x68 + 0x2000], 0xFF  ; the Intel bitmap terminator byte
     pop di
     pop es
     mov eax, [base_lin]           ; ESP0 = monitor stack top in driver memory
@@ -312,6 +337,13 @@ init:
     mov ebx, eax                  ; carry monitor ESP into PM (survives PT build)
     mov word  [tss + 8], 0x0010   ; SS0 = flat data selector
     mov word  [tss + 0x66], 0x0068 ; I/O-map base (all-zero bitmap = permissive)
+    ; SP-4b M4: trap port 0x92 so the monitor virtualizes the guest's A20 (the
+    ; only bit set in the otherwise-permissive map), and force the REAL gate on
+    ; for good — the monitor + the paged UMB/EMS backing sit above 1 MB.
+    or byte [tss + 0x68 + (0x92/8)], 1 << (0x92 % 8)
+    in al, 0x92
+    or al, 2
+    out 0x92, al
 
     mov ebp, [pd_lin]             ; carry pd_lin + drv_seg into PM
     movzx esi, word [drv_seg]
@@ -1502,29 +1534,47 @@ gdt:
     dq 0
     dq 0x00CF9B000000FFFF         ; [08] code, base patched
     dq 0x00CF93000000FFFF         ; [10] data, base 0 (flat)
-    dq 0x0000890000000088         ; [18] TSS, base patched, limit 0x88
+    dq 0x0000890000002068         ; [18] TSS, base patched, limit 0x2068: the
+                                  ; I/O bitmap at +0x68 covers the FULL 64K port
+                                  ; space (a port past the limit is DENIED, and
+                                  ; V86 guests hit sound/VGA ports >= 0x100)
     dq 0x00CF93000000FFFF         ; [20] data, base patched (= base, driver data)
 gdtr:
     dw 0x27                       ; 5 descriptors
     dd 0
 
-; IDT (static gates; offsets are driver-relative, selector = PM code 0x08).
-; Only the vectors that fire in M0 are present: 8 = IRQ0 timer, 9 = IRQ1
-; keyboard, 13 = #GP (sensitive-instruction trap). base patched at runtime.
+; IDT (static gates; offsets are driver-relative, selector = PM code 0x08;
+; base patched at runtime). SP-4b M4: the default boot runs the WHOLE system in
+; V86, so every device IRQ the machine can raise needs a gate — master IRQ0-7 on
+; vectors 8-15 (the DOS PIC base) and slave IRQ8-15 on 0x70-0x77. Vector 13 is
+; BOTH #GP and IRQ5 (SB16): vec13_entry disambiguates. The exception overlaps on
+; 8/10-12/14 (#DF/#TS/#NP/#SS/#PF) have no source here: identity-mapped
+; always-present pages and no PM selector loads from V86.
+%macro IDTGATE 1
+    dw %1, 0x0008                 ; offset-low, PM code selector (driver < 64K)
+    db 0, 0x8E                    ; present, ring-0 32-bit interrupt gate
+    dw 0                          ; offset-high
+%endmacro
 align 8
 idt:
     times 8*8 db 0                ; 0..7
-    dw irq8, 0x0008               ; 8  IRQ0 timer (offset-high = 0, driver < 64K)
-    db 0, 0x8E
-    dw 0
-    dw irq9, 0x0008             ; 9  IRQ1 keyboard
-    db 0, 0x8E
-    dw 0
-    times 3*8 db 0               ; 10..12
-    dw monitor, 0x0008          ; 13 #GP -> sensitive-instruction monitor
-    db 0, 0x8E
-    dw 0
-    times 18*8 db 0             ; 14..31
+    IDTGATE irq_m0                ; 8    IRQ0 timer
+    IDTGATE irq_m1                ; 9    IRQ1 keyboard
+    IDTGATE irq_m2                ; 10   IRQ2 cascade (never raw; stub for safety)
+    IDTGATE irq_m3                ; 11   IRQ3 COM2
+    IDTGATE irq_m4                ; 12   IRQ4 COM1
+    IDTGATE vec13_entry           ; 13   #GP monitor OR IRQ5 (SB16)
+    IDTGATE irq_m6                ; 14   IRQ6 FDC
+    IDTGATE irq_m7                ; 15   IRQ7 LPT / PIC-spurious
+    times (0x70 - 16)*8 db 0      ; 16..0x6F
+    IDTGATE irq_s8                ; 0x70 IRQ8  RTC
+    IDTGATE irq_s9                ; 0x71 IRQ9
+    IDTGATE irq_s10               ; 0x72 IRQ10
+    IDTGATE irq_s11               ; 0x73 IRQ11
+    IDTGATE irq_s12               ; 0x74 IRQ12 PS/2 mouse
+    IDTGATE irq_s13               ; 0x75 IRQ13
+    IDTGATE irq_s14               ; 0x76 IRQ14 ATA
+    IDTGATE irq_s15               ; 0x77 IRQ15 / slave-spurious
 idt_end:
 idtr:
     dw idt_end - idt - 1
@@ -1611,13 +1661,56 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ;   [ebp+0]=EIP [ebp+4]=CS [ebp+8]=EFLAGS [ebp+12]=V86 ESP [ebp+16]=V86 SS ...
 ; ============================================================================
 
-; ---- #GP (vector 13): a sensitive instruction faulted. Has an error code. ----
-monitor:
+; ---- vector 13: #GP (sensitive instruction, error-code frame) OR IRQ5 (the
+; SB16, no error code). Discriminate in layers (SP-4b M4):
+;   1. master-PIC ISR bit 5 clear (OCW3 read) -> a plain #GP: an IRQ5 delivery
+;      always sets in-service first.
+;   2. bit set: an IRQ5 delivery, UNLESS this is a #GP raised inside the
+;      guest's own IRQ5 ISR (in-service until its EOI). Our V86 #GPs push
+;      error code 0 where the IRQ frame carries the guest EIP -> a nonzero
+;      slot at [esp+32] means IRQ5.
+;   3. zero slot: peek the #GP-candidate CS:IP byte — only the sensitive set
+;      {CLI,STI,PUSHF,POPF,INT n,IRET} raises #GP from a healthy V86 guest.
+; Residual: an IRQ5 arriving with guest IP == 0 whose garbled candidate peek
+; ALSO hits a sensitive byte is mis-handled as #GP (the line stays un-EOI'd) —
+; a double coincidence we accept and document.
+vec13_entry:
     pushad
-    mov ax, 0x10                  ; flat 4 GiB DS to reach the guest's high stacks
+    mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
+    mov al, 0x0B                  ; OCW3: next master data read = ISR
+    out 0x20, al
+    in al, 0x20
+    test al, 0x20                 ; IRQ5 in service?
+    jz monitor_body               ; no -> a plain #GP
+    cmp dword [esp+32], 0         ; #GP error-code slot vs IRQ frame EIP
+    jne .irq5
+    movzx eax, word [esp+40]      ; #GP-candidate CS
+    shl eax, 4
+    movzx ecx, word [esp+36]      ; #GP-candidate IP
+    add eax, ecx
+    mov al, [eax]                 ; the would-be faulting opcode
+    cmp al, 0xFA
+    je monitor_body
+    cmp al, 0xFB
+    je monitor_body
+    cmp al, 0x9C
+    je monitor_body
+    cmp al, 0x9D
+    je monitor_body
+    cmp al, 0xCD
+    je monitor_body
+    cmp al, 0xCF
+    je monitor_body
+.irq5:
+    mov ebx, 5
+    jmp irq_body                  ; no-error-code frame path
+
+; ---- #GP monitor body: a sensitive instruction faulted. Error-code frame;
+; entered from vec13_entry with pushad done and DS/FS loaded. ----
+monitor_body:
     lea ebp, [esp + 32 + 4]       ; skip pushad(32) + error code(4)
     movzx eax, word [ebp+4]       ; guest CS
     shl eax, 4
@@ -1636,7 +1729,54 @@ monitor:
     je .intn
     cmp dl, 0xCF
     je .iret_op
+    cmp dl, 0xE6                  ; OUT imm8, AL — the trapped port 0x92 (A20)
+    je .out92_imm
+    cmp dl, 0xEE                  ; OUT DX, AL
+    je .out92_dx
+    cmp dl, 0xE4                  ; IN AL, imm8
+    je .in92_imm
+    cmp dl, 0xEC                  ; IN AL, DX
+    je .in92_dx
     mov al, dl                    ; unhandled sensitive instruction: signal its opcode
+    jmp signal32
+
+; ---- virtualized port 0x92: the guest's A20 gate. Only 0x92 is set in the
+; I/O bitmap, so any other port reaching here is a monitor bug -> signal. The
+; guest AL lives in the pushad frame at [esp+28]; guest DX at [esp+20]. ----
+.out92_imm:
+    cmp byte [eax+1], 0x92
+    jne .unhandled_io
+    add word [ebp], 2             ; skip OUT imm8, AL
+    jmp .a20_write
+.out92_dx:
+    cmp word [esp+20], 0x0092     ; guest DX
+    jne .unhandled_io
+    inc word [ebp]                ; skip OUT DX, AL
+.a20_write:
+    mov cl, [esp+28]              ; guest AL: bit 1 = A20 (bit 0, fast reset,
+    shr cl, 1                     ; is ignored — nothing period pulses it)
+    and cl, 1
+    cmp [fs:va20], cl
+    je .done_gp
+    mov [fs:va20], cl
+    call a20_apply
+    jmp .done_gp
+.in92_imm:
+    cmp byte [eax+1], 0x92
+    jne .unhandled_io
+    add word [ebp], 2             ; skip IN AL, imm8
+    jmp .a20_read
+.in92_dx:
+    cmp word [esp+20], 0x0092
+    jne .unhandled_io
+    inc word [ebp]                ; skip IN AL, DX
+.a20_read:
+    mov cl, [fs:va20]
+    add cl, cl                    ; bit 1 = the virtual A20 state
+    mov [esp+28], cl              ; guest AL (byte write: AH.. preserved)
+    jmp .done_gp
+.unhandled_io:
+    mov al, dl
     jmp signal32
 .cli:
     mov byte [fs:vif], 0
@@ -1722,45 +1862,72 @@ monitor:
     add esp, 4                   ; discard the #GP error code
     iretd
 
-; ---- IRQ0 timer (vector 8) / IRQ1 keyboard (vector 9). No error code. ----
-irq8:
+; ---- Hardware IRQs (no error code). Per-line stubs load the 8259 line number
+; and share one body: reflect to the guest IVT when VIF is set, else hold the
+; line in the vip mask and EOI immediately (coalesce; deliver on the next
+; STI/POPF/IRET). Master lines 0-7 (vectors 8-15, 5 via vec13_entry), slave
+; lines 8-15 (vectors 0x70-0x77). ----
+%assign line 0
+%rep 8
+irq_m%[line]:
     pushad
+    mov ebx, line
+    jmp irq_common
+%assign line line+1
+%endrep
+%assign line 8
+%rep 8
+irq_s%[line]:
+    pushad
+    mov ebx, line
+    jmp irq_common
+%assign line line+1
+%endrep
+
+irq_common:                       ; pushad done, EBX = IRQ line
     mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
+irq_body:                         ; vec13_entry joins here (segs already set)
     lea ebp, [esp + 32]
     cmp byte [fs:vif], 0
     jne .go
-    or byte [fs:vip], 1          ; VIF clear: coalesce pending, but EOI now so the
-    mov al, 0x20                 ; PIC keeps delivering (deliver on the next STI/POPF)
-    out 0x20, al
+    mov ecx, ebx                  ; VIF clear: hold the line, EOI now so the
+    mov ax, 1                     ; PIC keeps delivering
+    shl ax, cl
+    or [fs:vip], ax
+    call irq_eoi
     popad
     iretd
 .go:
-    mov ebx, 8
-    call reflect_vector
+    call irq_reflect_line
     popad
     iretd
-irq9:
-    pushad
-    mov ax, 0x10
-    mov ds, ax
-    mov ax, 0x20
-    mov fs, ax
-    lea ebp, [esp + 32]
-    cmp byte [fs:vif], 0
-    jne .go
-    or byte [fs:vip], 2          ; coalesce pending + EOI now (see irq8)
+
+; EOI the chip(s) for line EBX. The just-delivered line is the highest in
+; service on its chip, so the non-specific EOI clears the right bit; slave
+; lines also EOI the master's cascade. Clobbers AL.
+irq_eoi:
+    cmp ebx, 8
+    jb .master
+    mov al, 0x20
+    out 0xA0, al
+.master:
     mov al, 0x20
     out 0x20, al
-    popad
-    iretd
-.go:
-    mov ebx, 9
-    call reflect_vector
-    popad
-    iretd
+    ret
+
+; Reflect line EBX to its guest IVT vector: master N -> INT 08h+N, slave N ->
+; INT 70h+(N-8), the DOS-default PIC mapping. Tail-jumps reflect_vector.
+irq_reflect_line:
+    cmp ebx, 8
+    jb .master
+    add ebx, 0x70 - 8
+    jmp reflect_vector
+.master:
+    add ebx, 8
+    jmp reflect_vector
 
 ; Reflect an interrupt into the guest's real-mode IVT handler.
 ;   in: EBX = vector, EBP = &frame.eip, FS = driver data.  clobbers eax,ecx,edx,edi
@@ -1793,23 +1960,52 @@ reflect_vector:
     mov byte [fs:vif], 0        ; entering the ISR clears VIF
     ret
 
-; If VIF is set and an IRQ is pending, deliver the highest-priority one.
+; If VIF is set and lines are pending, deliver the highest-priority one per
+; call (the reflect clears VIF; the guest ISR's IRET re-runs us, draining the
+; queue). Priority = 8259 fully-nested with the slave cascaded at IR2:
+; 0, 1, 8..15, then 2..7 (a raw line 2 cannot occur — cascade INTA resolves to
+; the slave vectors — but the walk covers it so a held bit can never stick).
 ;   in: EBP = &frame.eip, FS = driver data.  clobbers eax,ebx,ecx,edx,edi
 maybe_deliver:
     cmp byte [fs:vif], 0
     je .none
-    movzx ebx, byte [fs:vip]
-    test bl, bl
+    movzx edx, word [fs:vip]
+    test dx, dx
     jz .none
-    test bl, 1
-    jz .try9
-    and byte [fs:vip], 0xFE
-    mov ebx, 8
-    jmp reflect_vector           ; tail: ret returns to maybe_deliver's caller
-.try9:
-    and byte [fs:vip], 0xFD
-    mov ebx, 9
-    jmp reflect_vector
+    xor ebx, ebx                  ; line 0
+    test dl, 1
+    jnz .hit
+    mov ebx, 1                    ; line 1
+    test dl, 2
+    jnz .hit
+    mov ebx, 8                    ; slave lines 8..15 (the cascade slot)
+.slave:
+    mov ecx, ebx
+    mov ax, 1
+    shl ax, cl
+    test dx, ax
+    jnz .hit
+    inc ebx
+    cmp ebx, 16
+    jb .slave
+    mov ebx, 2                    ; remaining master lines 2..7
+.low:
+    mov ecx, ebx
+    mov ax, 1
+    shl ax, cl
+    test dx, ax
+    jnz .hit
+    inc ebx
+    cmp ebx, 8
+    jb .low
+    ret                           ; unreachable: dx was nonzero
+.hit:
+    mov ecx, ebx
+    mov ax, 1
+    shl ax, cl
+    not ax
+    and [fs:vip], ax              ; claim the line
+    jmp irq_reflect_line          ; tail: ret returns to maybe_deliver's caller
 .none:
     ret
 
@@ -1827,14 +2023,8 @@ flat_memcpy:
     mov edi, [esp + 4]            ; guest EDI = dst linear
     mov esi, [esp + 8]            ; guest ESI = src linear
     mov ecx, [esp + 28]           ; guest ECX = byte count
-    in al, 0x92                   ; save port 0x92 + force A20 on: EMBs above the HMA
-    mov ah, al                    ; have bit 20 set, so the flat physical access needs
-    or al, 2                      ; A20 or it wraps at 1 MB (apply_a20 masks bit 20).
-    out 0x92, al
-    cld
-    rep movsb                     ; DS:ESI -> ES:EDI, both flat
-    mov al, ah
-    out 0x92, al                  ; restore A20 to the guest's prior state
+    cld                           ; (the REAL A20 gate is forced on at INIT and
+    rep movsb                     ; never drops — EMBs above 1 MB never fold)
     ret
 
 ; Ring-0 EMS frame remap (INT 0xC0 'PM'). Guest EBX = frame-slot linear base,
@@ -1873,6 +2063,33 @@ frame_remap:
     mov cr3, eax
     ret
 
+; Ring-0 virtual-A20 window remap: linear [0x100000, 0x110000) becomes identity
+; (va20 = 1) or folds onto phys [0, 0x10000) (va20 = 0) — the 8086 1 MB wrap the
+; guest expects, as pure paging illusion while the REAL gate stays on (real
+; EMM386's approach; a real A20-off would also fold the extended-RAM-backed
+; UMB/EMS windows and corrupt DOS=UMB state, which is the bug this fixes).
+; 16 PTEs in PT0 + CR3 reload. in: FS = driver data. Clobbers eax, ecx, edx.
+a20_apply:
+    mov eax, [fs:pd_lin]
+    add eax, 0x1000 + 0x100*4     ; &PT0[0x100] (linear 0x100000)
+    xor edx, edx                  ; fold target: phys 0
+    cmp byte [fs:va20], 0
+    je .have
+    mov edx, 0x00100000           ; identity: phys 0x100000
+.have:
+    or edx, 7                     ; present/rw/user
+    mov ecx, 16
+.pte:
+    mov [eax], edx
+    add eax, 4
+    add edx, 0x1000
+    loop .pte
+    mov eax, cr3
+    mov cr3, eax
+    ret
+
+banner: db 'TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
+
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:
     mov ah, al
@@ -1885,8 +2102,9 @@ signal32:
 .h: jmp .h
 
 align 16
-tss:
-    times 0x90 db 0
+tss:                              ; 0x68 TSS fields + 0x2000 I/O bitmap (all
+    times 0x2070 db 0             ; zero = permissive; 0x92 set at INIT) + the
+                                  ; 0xFF terminator byte, rounded up
 
 align 4
 mon_stack:

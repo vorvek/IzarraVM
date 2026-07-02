@@ -136,30 +136,104 @@ def fsinfo_sector(free_count, next_free):
     return s
 
 
+def extract_from_image(img):
+    """Pull the MBR, VBR, and root files back out of a built image — the python
+    mirror of katea_volume::extract_system_payload. Lets the image be rebuilt
+    (config/payload changes) without the gitignored Open Watcom build artifacts:
+    the binaries round-trip byte-identical from the previous committed image."""
+    part_off = PART_START * BPS
+    vbr = img[part_off:part_off + 512]
+    spc = vbr[0x0D]
+    reserved = struct.unpack_from("<H", vbr, 0x0E)[0]
+    nfats = vbr[0x10]
+    fatsz = struct.unpack_from("<I", vbr, 0x24)[0]
+    root_clu = struct.unpack_from("<I", vbr, 0x2C)[0]
+    fat_off = part_off + reserved * BPS
+    data_off = part_off + (reserved + nfats * fatsz) * BPS
+    cluster_bytes = spc * BPS
+
+    def fat_entry(c):
+        return struct.unpack_from("<I", img, fat_off + c * 4)[0] & 0x0FFFFFFF
+
+    def chain_bytes(first, size):
+        out = bytearray()
+        c = first
+        # Bound the walk like the Rust extractor: a corrupt/cyclic FAT must
+        # fail loudly, never under-read or spin.
+        for _ in range(len(img) // BPS):
+            if len(out) >= size or not 2 <= c < 0x0FFFFFF8:
+                break
+            off = data_off + (c - 2) * cluster_bytes
+            out += img[off:off + cluster_bytes]
+            c = fat_entry(c)
+        assert len(out) >= size, f"FAT chain shorter than the directory size ({len(out)} < {size})"
+        return bytes(out[:size])
+
+    files = []
+    c = root_clu
+    while 2 <= c < 0x0FFFFFF8:
+        off = data_off + (c - 2) * cluster_bytes
+        for e in range(0, cluster_bytes, 32):
+            de = img[off + e:off + e + 32]
+            if de[0] == 0x00:
+                break
+            if de[0] == 0xE5 or de[11] == 0x0F or de[11] & 0x08:
+                continue
+            base = de[0:8].decode("ascii").rstrip()
+            ext = de[8:11].decode("ascii").rstrip()
+            name = f"{base}.{ext}" if ext else base
+            first = (struct.unpack_from("<H", de, 0x14)[0] << 16) | \
+                struct.unpack_from("<H", de, 0x1A)[0]
+            size = struct.unpack_from("<I", de, 0x1C)[0]
+            files.append((name, chain_bytes(first, size)))
+        c = fat_entry(c)
+    return bytearray(img[0:512]), bytearray(vbr), dict(files)
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(here)
     kdir = os.path.join(repo, "toka-dos", "freedos", "kernel")
     fcdir = os.path.join(repo, "toka-dos", "freedos", "freecom")
+    out = os.path.join(repo, "crates", "izarravm-firmware", "roms", "tokados-hdd.img")
 
-    mbr = bytearray(open(os.path.join(kdir, "boot", "mbr.bin"), "rb").read())
+    if os.path.exists(os.path.join(kdir, "bin", "kernel.sys")):
+        # Full-build path: fresh artifacts from toka-dos/build-freedos.ps1.
+        mbr = bytearray(open(os.path.join(kdir, "boot", "mbr.bin"), "rb").read())
+        vbr = bytearray(open(os.path.join(kdir, "boot", "fat32lba.bin"), "rb").read())
+        kernel = open(os.path.join(kdir, "bin", "kernel.sys"), "rb").read()
+        shell = open(os.path.join(fcdir, "command.com"), "rb").read()
+        tokamous = open(
+            os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb"
+        ).read()
+    else:
+        # From-image path: source the binaries from the current committed image.
+        prev = open(out, "rb").read()
+        mbr, vbr, prev_files = extract_from_image(prev)
+        kernel = prev_files["KERNEL.SYS"]
+        shell = prev_files["COMMAND.COM"]
+        tokamous = prev_files["TOKAMOUS.COM"]
+        print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
-    vbr = bytearray(open(os.path.join(kdir, "boot", "fat32lba.bin"), "rb").read())
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
-    kernel = open(os.path.join(kdir, "bin", "kernel.sys"), "rb").read()
-    shell = open(os.path.join(fcdir, "command.com"), "rb").read()
-    tokamous = open(
-        os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb"
-    ).read()
+    # TOKAEMM.SYS is a committed binary (built from tokaemm.asm), never extracted.
+    tokaemm = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "tokaemm.sys"), "rb").read()
 
-    # CONFIG.SYS / AUTOEXEC point at C: (the HDD), unlike the A: floppy variant.
-    config_sys = (b"FILES=40\r\nLASTDRIVE=Z\r\n"
+    # CONFIG.SYS / AUTOEXEC point at C: (the HDD). SP-4b M4 defaults: TOKAEMM
+    # loads as the memory manager (frameless NOEMS; the system runs in V86 under
+    # its monitor), DOS=HIGH,UMB uses the HMA + TOKAEMM's UMBs, LASTDRIVE=D
+    # covers A: floppy / C: HDD / D: CD-ROM without wasting CDS entries.
+    config_sys = (b"FILES=40\r\nLASTDRIVE=D\r\n"
+                  b"DEVICE=C:\\TOKAEMM.SYS NOEMS\r\n"
+                  b"DOS=HIGH,UMB\r\n"
                   b"SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     # Defaults the user owns (mount_hdd_folder seeds these if missing). SET BLASTER
     # advertises the emulated SB16 (base 0x220, IRQ5, DMA1, high DMA5, type 6 SB16);
-    # no P (MPU-401) param -- no MPU is emulated. TOKAMOUS loads the INT 33h mouse.
+    # no P (MPU-401) param -- no MPU is emulated. LH loads the INT 33h mouse into
+    # a TOKAEMM UMB (LOADHIGH falls back to a low load if none fits).
     autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\n"
-                b"SET BLASTER=A220 I5 D1 H5 T6\r\nTOKAMOUS\r\n")
+                b"SET BLASTER=A220 I5 D1 H5 T6\r\nLH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
     # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
     license_txt = build_license_txt(repo)
@@ -210,6 +284,7 @@ def main():
         ("CONFIG.SYS", config_sys),
         ("AUTOEXEC.BAT", autoexec),
         ("TOKAMOUS.COM", tokamous),
+        ("TOKAEMM.SYS", tokaemm),
         ("HELLO.TXT", hello_txt),
         ("LICENSE.TXT", license_txt),
     ]
@@ -273,7 +348,6 @@ def main():
     assert img[part_off + 0x1FE] == 0x55 and img[part_off + 0x1FF] == 0xAA, "VBR signature missing"
     assert len(img) == DISK_SECTORS * BPS
 
-    out = os.path.join(repo, "crates", "izarravm-firmware", "roms", "tokados-hdd.img")
     with open(out, "wb") as f:
         f.write(img)
     print(f"tokados-hdd.img: {len(img)} bytes "

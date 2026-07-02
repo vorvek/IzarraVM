@@ -2706,4 +2706,178 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
              a 0xEn code names the failed step.\n{text}"
         );
     }
+
+    /// SP-4b M4 GO/NO-GO: a fresh (empty) user folder gets the NEW defaults seeded
+    /// (`ensure_user_config`) — DEVICE=TOKAEMM.SYS NOEMS + DOS=HIGH,UMB + LH
+    /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
+    /// TOKAEMM monitor, with the driver's signon banner on screen.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_m4_default_boot_runs_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_m4_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+
+        // The seeding wrote real, editable defaults into the user folder.
+        let seeded = std::fs::read_to_string(dir.join("CONFIG.SYS")).expect("seeded CONFIG.SYS");
+        assert!(
+            seeded.contains("DEVICE=C:\\TOKAEMM.SYS NOEMS") && seeded.contains("DOS=HIGH,UMB"),
+            "seeded CONFIG.SYS lacks the M4 defaults:\n{seeded}"
+        );
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during the default V86 boot: {msg}\n{text}");
+        }
+        let text = machine.screen_text().as_text();
+        let lower = text.to_ascii_lowercase();
+        // The cycle budget can expire while the CPU is transiently inside the
+        // ring-0 monitor (a reflected IRQ), where in_v86() reads false on a
+        // healthy boot. Re-sample over a few short bursts rather than
+        // asserting one instant.
+        let mut in_v86 = machine.in_v86();
+        for _ in 0..4 {
+            if in_v86 {
+                break;
+            }
+            machine
+                .run_until_halt_or_cycles(1_000_000)
+                .expect("machine re-sample run");
+            in_v86 = machine.in_v86();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt on the default boot (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            lower.contains("tokaemm:"),
+            "the TOKAEMM signon banner is missing.\n{text}"
+        );
+        assert!(
+            in_v86,
+            "the default boot must leave the guest running in V86 (stop={stop:?}).\n{text}"
+        );
+    }
+
+    /// SP-4b M4: the PS/2 mouse works under the default V86 boot — a host-injected
+    /// wheel detent travels 8042 -> slave IRQ12 -> vector 0x74 -> the monitor's
+    /// slave reflect stub -> guest INT 74h -> TOKAMOUS (loaded HIGH) -> INT 33h
+    /// fn 03h, where MOUSETST polls it. Signals 0xA5; a 0xEn names the step.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_m4_mouse_wheel_under_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_m4m_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = b"@ECHO OFF\r\nLH TOKAMOUS\r\nMOUSETST\r\n".to_vec();
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "MOUSETST.COM".to_string(),
+                        izarravm_firmware::mousetst_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        // Run in chunks, injecting a wheel detent between them: the fixture polls
+        // fn 03h in a bounded loop, so extra/early detents are harmless and a late
+        // boot still sees one.
+        let mut stop = machine
+            .run_until_halt_or_cycles(200_000_000)
+            .expect("machine run");
+        for _ in 0..10 {
+            if matches!(stop, StopReason::TestExit { .. } | StopReason::CpuError(_)) {
+                break;
+            }
+            machine.inject_mouse_wheel(1);
+            stop = machine
+                .run_until_halt_or_cycles(200_000_000)
+                .expect("machine run");
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "mouse wheel under V86 did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
+
+    /// SP-4b M4: SB16 IRQ5 under V86 — IRQ5 lands on vector 13, shared with #GP,
+    /// and the monitor's discriminator must route each correctly. SNDTST hooks
+    /// INT 0Dh, resets the DSP, then requests immediate 8-bit IRQs (DSP 0xF2)
+    /// inside a CLI/STI-dense loop. Signals 0xA5; a 0xEn names the step.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_m4_sb16_irq5_under_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_m4s_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = b"@ECHO OFF\r\nSNDTST\r\n".to_vec();
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "SNDTST.COM".to_string(),
+                        izarravm_firmware::sndtst_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "SB16 IRQ5 under V86 did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
 }

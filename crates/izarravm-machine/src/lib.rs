@@ -12,7 +12,7 @@ use izarravm_bus::{
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard, WssConfig,
+    GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard, WssConfig,
     YamahaAdpcmConfig,
 };
 pub use izarravm_cpu::PerfCounters;
@@ -53,7 +53,6 @@ mod raw_program;
 mod rtc;
 mod speaker;
 mod uart;
-mod uma;
 mod unittester;
 
 pub use cdimage::CdImage;
@@ -61,14 +60,11 @@ pub use memmap::{
     CONVENTIONAL_TOP, HMA_BASE, HMA_TOP, MemRegion, SYSTEM_ROM_BASE, UPPER_MEMORY_BASE,
     VIDEO_RAM_BASE, classify, is_hma, is_umb_window,
 };
-pub use uma::{UmaReservation, UmaReservationMap, UmaUse};
 
 /// The video BIOS ROM sits in the first 32 KiB of the upper-memory window on a
-/// VGA machine (0xC0000-0xC7FFF). It is reserved in the UMA map so no upper-memory
-/// consumer is handed space over it, matching where a real adapter's option ROM
+/// VGA machine (0xC0000-0xC7FFF), matching where a real adapter's option ROM
 /// lives even though this machine does not yet map a BIOS image into that span.
 const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
-const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
 const VGA_BIOS_SEGMENT: u16 = (VGA_BIOS_BASE >> 4) as u16; // 0xC000
 const VGA_BIOS_INT1D_VIDEO_TABLE_OFF: u16 = 0x1000;
 const VGA_BIOS_INT1D_VIDEO_TABLE_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1D_VIDEO_TABLE_OFF as u32;
@@ -351,8 +347,6 @@ pub struct MachineProfile {
     pub wait_states: WaitStateProfile,
     pub address_pipelining: bool,
     pub cache_enabled: bool,
-    /// The IZEMM EMM386-role state (UMB / EMS provisioning); see `Emm386Mode`.
-    pub emm386: Emm386Mode,
 }
 
 impl MachineProfile {
@@ -368,7 +362,6 @@ impl MachineProfile {
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
-            emm386: Emm386Mode::default(),
         }
     }
 
@@ -384,7 +377,6 @@ impl MachineProfile {
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
-            emm386: profile.emm386,
         }
     }
 }
@@ -1422,10 +1414,6 @@ pub struct Machine {
     // Where the unit tester's Snapshot command writes PPM frames, set by the
     // host. None disables snapshots (the command becomes a no-op).
     test_snapshot_path: Option<std::path::PathBuf>,
-    // The UMA reservation map: the single authority over the 0xC0000-0xEFFFF
-    // upper-memory window. ROM is reserved up front. Memory services (XMS, UMB,
-    // EMS) are the guest TOKAEMM driver's now, not host state.
-    uma: UmaReservationMap,
 }
 
 /// The GUI virtual pointer space the relative-delta synthesis spans: x 0..639,
@@ -1472,8 +1460,8 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
 const USER_OWNED_OR_DEMO: &[&str] = &["HELLO.TXT", "CONFIG.SYS", "AUTOEXEC.BAT"];
 
 /// The payload files overlaid in user-folder mode: the binaries (KERNEL.SYS,
-/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM) but not the demo file or the user's
-/// CONFIG.SYS/AUTOEXEC.BAT.
+/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM, TOKAEMM.SYS) but not the demo file
+/// or the user's CONFIG.SYS/AUTOEXEC.BAT.
 fn user_folder_overlay(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
     files
         .into_iter()
@@ -1681,7 +1669,6 @@ impl Machine {
             last_abs: (MOUSE_GUEST_CENTER_X, MOUSE_GUEST_CENTER_Y),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
-            uma: UmaReservationMap::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -2122,19 +2109,6 @@ impl Machine {
         let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_TAIL, off);
     }
 
-    // Test-exercised only since SP-4b M2 retired the last runtime caller
-    // (set_emm386_config); M4 retires the residual UMA plumbing altogether.
-    #[allow(dead_code)]
-    fn furnish_dos_upper_memory(&mut self) -> Result<(), MachineError> {
-        self.uma.reset();
-        let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
-        debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
-        // Nothing else is carved here any more: TOKAEMM page-maps extended RAM into
-        // the free upper holes and serves UMBs itself (SP-4b M3), and the EMS page
-        // frame is the guest driver's too (SP-4b M2).
-        Ok(())
-    }
-
     /// Set the CPU to a loaded raw program's entry from its six-field
     /// `raw_program::ProgramEntry` (CS/DS/ES/SS + IP/SP).
     fn apply_raw_program_entry(&mut self, entry: raw_program::ProgramEntry) {
@@ -2508,6 +2482,13 @@ impl Machine {
     /// display back to VGA text before booting an OS.
     pub fn margo_active(&self) -> bool {
         self.margo_active
+    }
+
+    /// Whether the guest is executing in virtual-8086 mode (under the TOKAEMM
+    /// ring-0 monitor). Exposed so the SP-4b M4 default-boot e2e can assert the
+    /// default CONFIG.SYS really put the system in V86.
+    pub fn in_v86(&self) -> bool {
+        self.cpu.is_v86_mode()
     }
 
     fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
@@ -7825,6 +7806,16 @@ impl Machine {
                     self.pic.request(irq_line);
                 }
             }
+        }
+        // Forward a pending DSP interrupt with playback idle too: the 0xF2
+        // IRQ-request command raises it without a transfer running (drivers
+        // probe their IRQ wiring that way) — the real chip asserts the line
+        // regardless. take_irq is a test-and-clear latch, so this never
+        // double-delivers an edge the per-tick forward above already took.
+        if self.dsp.take_irq() {
+            let is_16bit = self.dsp.is_16bit();
+            self.mixer.set_irq_status(is_16bit);
+            self.pic.request(irq_line);
         }
 
         // AD1848 / Windows Sound System playback, clock-driven exactly like the
@@ -14123,28 +14114,6 @@ mod tests {
     }
 
     #[test]
-    fn refurnishing_resets_the_upper_arena_like_a_warm_reboot() {
-        const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
-        let p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
-        // Re-furnish: it must re-lay the window from scratch, not accumulate
-        // reservations across calls (TOKAEMM, not the host, now owns UMBs and the
-        // EMS frame — see SP-4b M3/M2).
-        machine.furnish_dos_upper_memory().unwrap();
-        machine.furnish_dos_upper_memory().unwrap();
-        let kinds: Vec<_> = machine.uma.reservations().iter().map(|r| r.kind).collect();
-        assert_eq!(
-            kinds.iter().filter(|k| **k == UmaUse::Rom).count(),
-            1,
-            "no duplicate ROM reservation after re-furnish"
-        );
-        assert!(
-            !kinds.contains(&UmaUse::Umb),
-            "the host no longer carves a UMB pool"
-        );
-    }
-
-    #[test]
     fn rejects_non_64k_roms() {
         let err =
             Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
@@ -14432,7 +14401,6 @@ mod tests {
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
-            emm386: Emm386Mode::default(),
         };
         let budget = profile.clock_hz / 5;
         let mut machine =

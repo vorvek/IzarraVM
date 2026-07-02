@@ -186,121 +186,6 @@ impl FromStr for VideoCard {
     }
 }
 
-/// The state of the EMM386-equivalent role of the IZEMM memory manager, the way a
-/// period CONFIG.SYS selects it. HIMEM (XMS + the HMA) is a separate, always-on
-/// facility; this governs only upper memory and expanded memory, the part a 386
-/// needs the manager's address remapping for:
-/// - `Unloaded`: HIMEM only, no EMM386. No UMBs and no EMS (a 386 cannot map the
-///   upper area without the manager). This is the `DEVICE=HIMEM.SYS` block.
-/// - `NoEms`: EMM386 with NOEMS. UMBs plus a frameless EMS manager: the
-///   EMMXXXX0 device and INT 67h answer (status present, version 4.0), but there
-///   is no page frame and zero backing pages, so allocation fails.
-/// - `Ram`: EMM386 with RAM. UMBs plus the LIM EMS 4.0 page frame and INT 67h.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Emm386Mode {
-    #[serde(rename = "unloaded")]
-    Unloaded,
-    #[serde(rename = "noems")]
-    NoEms,
-    #[serde(rename = "ram")]
-    #[default]
-    Ram,
-}
-
-impl Emm386Mode {
-    pub const fn canonical_name(self) -> &'static str {
-        match self {
-            Self::Unloaded => "unloaded",
-            Self::NoEms => "noems",
-            Self::Ram => "ram",
-        }
-    }
-
-    /// Whether upper memory blocks are provided (EMM386 loaded in either mode).
-    pub const fn provides_umb(self) -> bool {
-        matches!(self, Self::NoEms | Self::Ram)
-    }
-
-    /// Whether the EMS page frame and INT 67h expanded memory are provided.
-    pub const fn provides_ems(self) -> bool {
-        matches!(self, Self::Ram)
-    }
-}
-
-impl fmt::Display for Emm386Mode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.canonical_name())
-    }
-}
-
-impl FromStr for Emm386Mode {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match normalize(value).as_str() {
-            "unloaded" | "off" | "none" | "himemonly" => Ok(Self::Unloaded),
-            "noems" => Ok(Self::NoEms),
-            "ram" | "ems" | "on" => Ok(Self::Ram),
-            _ => Err(ConfigError::UnknownPreset {
-                kind: "emm386",
-                value: value.to_owned(),
-            }),
-        }
-    }
-}
-
-/// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
-pub const DEFAULT_LASTDRIVE: u8 = 5;
-/// DOS default FILES count from the shipped CONFIG.SYS.
-pub const DEFAULT_FILES: u16 = 40;
-/// DOS default BUFFERS count from the shipped CONFIG.SYS.
-pub const DEFAULT_BUFFERS: u16 = 20;
-
-/// The subset of CONFIG.SYS directives the HLE SYSINIT maps into machine state:
-/// the EMM386/IZEMM mode its DEVICE= lines select, whether DOS=UMB asks for the
-/// UMB area to be linked, EMS sizing knobs, and boot-scalar DOS settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigSysMemory {
-    pub emm386: Emm386Mode,
-    pub dos_umb: bool,
-    /// Highest DOS drive index, A: = 1. Defaults to E: like the shipped config.
-    pub lastdrive: u8,
-    /// CONFIG.SYS FILES= count. This caps modeled system file entries.
-    pub files: u16,
-    /// CONFIG.SYS BUFFERS= count. Stored for the DOS buffer model.
-    pub buffers: u16,
-    /// Optional EMS page-frame segment from an IZEMM/EMM386 `FRAME=` token.
-    /// The token is written in hexadecimal like real EMM386 CONFIG.SYS lines.
-    pub ems_frame_seg: Option<u16>,
-    /// Optional expanded-memory backing-pool size in KiB. Real EMM386 accepts a
-    /// bare decimal number on its DEVICE line; IZEMM follows that convention.
-    pub ems_pool_kb: Option<u32>,
-}
-
-fn parse_iemm_frame_token(token: &str) -> Option<u16> {
-    let value = token.strip_prefix("FRAME=")?;
-    let value = value.strip_prefix("0X").unwrap_or(value);
-    u16::from_str_radix(value, 16).ok()
-}
-
-fn parse_iemm_pool_token(token: &str) -> Option<u32> {
-    if token.chars().all(|character| character.is_ascii_digit()) {
-        token.parse().ok()
-    } else {
-        None
-    }
-}
-
-fn parse_lastdrive_token(value: &str) -> Option<u8> {
-    let value = value.trim();
-    let bytes = value.as_bytes();
-    if bytes.len() == 1 && bytes[0].is_ascii_uppercase() {
-        Some(bytes[0] - b'A' + 1)
-    } else {
-        None
-    }
-}
-
 fn split_device_path_and_args(rest: &str) -> (&str, &str) {
     let rest = rest.trim_start();
     if let Some(quoted) = rest.strip_prefix('"') {
@@ -312,99 +197,8 @@ fn split_device_path_and_args(rest: &str) -> (&str, &str) {
     (&rest[..path_end], rest[path_end..].trim_start())
 }
 
-/// Read the memory-manager intent out of a CONFIG.SYS. The IZEMM memory manager
-/// (filed as IZEMM.EXE in Toka-DOS, or the real-DOS EMM386.EXE) provides upper
-/// memory only when HIMEM.SYS loads first, matching real DOS, so an IZEMM/EMM386
-/// line with no preceding HIMEM line (or no such line at all) yields Unloaded:
-/// - HIMEM.SYS only -> Unloaded (XMS, no UMB/EMS)
-/// - HIMEM.SYS + IZEMM.EXE NOEMS -> NoEms (UMBs, no EMS frame)
-/// - HIMEM.SYS + IZEMM.EXE RAM (or no arg) -> Ram (UMBs + EMS frame)
-///
-/// EMM386.EXE is accepted as an alias so a pasted real-DOS CONFIG.SYS still works.
-///
-/// `FRAME=hhhh` selects the EMS page-frame segment and a bare decimal number on
-/// the manager line selects the EMS backing-pool size in KiB. DOS=UMB (or
-/// DOS=HIGH,UMB) sets `dos_umb`. LASTDRIVE=letter sets the drive count published
-/// through the DOS SysVars table.
-pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
-    let mut himem = false;
-    let mut emm386 = None;
-    let mut dos_umb = false;
-    let mut lastdrive = DEFAULT_LASTDRIVE;
-    let mut files = DEFAULT_FILES;
-    let mut buffers = DEFAULT_BUFFERS;
-    let mut ems_frame_seg = None;
-    let mut ems_pool_kb = None;
-    for line in text.lines() {
-        let upper = line.trim().to_ascii_uppercase();
-        let device = upper
-            .strip_prefix("DEVICEHIGH=")
-            .or_else(|| upper.strip_prefix("DEVICE="));
-        if let Some(rest) = device {
-            let (path, args) = split_device_path_and_args(rest);
-            let name = dos_basename(path);
-            if name == "HIMEM.SYS" {
-                himem = true;
-            } else if (name == "IZEMM.EXE"
-                || name == "IZEMM"
-                || name == "IEMM.EXE"
-                || name == "IEMM"
-                || name == "EMM386.EXE"
-                || name == "EMM386")
-                && himem
-            {
-                // IZEMM (the Toka-DOS manager) or its real-DOS alias EMM386 loads
-                // only with a prior HIMEM. NOEMS omits the EMS frame.
-                let mut line_frame_seg = None;
-                let mut line_pool_kb = None;
-                let noems = args.split_whitespace().any(|token| token == "NOEMS");
-                for token in args.split_whitespace() {
-                    if let Some(frame_seg) = parse_iemm_frame_token(token) {
-                        line_frame_seg = Some(frame_seg);
-                    }
-                    if let Some(pool_kb) = parse_iemm_pool_token(token) {
-                        line_pool_kb = Some(pool_kb);
-                    }
-                }
-                ems_frame_seg = line_frame_seg;
-                ems_pool_kb = line_pool_kb;
-                emm386 = Some(if noems {
-                    Emm386Mode::NoEms
-                } else {
-                    Emm386Mode::Ram
-                });
-            }
-        } else if let Some(rest) = upper.strip_prefix("DOS=") {
-            if rest.split([',', ' ']).any(|token| token.trim() == "UMB") {
-                dos_umb = true;
-            }
-        } else if let Some(rest) = upper.strip_prefix("LASTDRIVE=") {
-            if let Some(parsed) = parse_lastdrive_token(rest) {
-                lastdrive = parsed;
-            }
-        } else if let Some(rest) = upper.strip_prefix("FILES=") {
-            if let Ok(parsed) = rest.trim().parse() {
-                files = parsed;
-            }
-        } else if let Some(rest) = upper.strip_prefix("BUFFERS=") {
-            if let Ok(parsed) = rest.trim().parse() {
-                buffers = parsed;
-            }
-        }
-    }
-    ConfigSysMemory {
-        emm386: emm386.unwrap_or(Emm386Mode::Unloaded),
-        dos_umb,
-        lastdrive,
-        files,
-        buffers,
-        ems_frame_seg,
-        ems_pool_kb,
-    }
-}
-
 /// One DEVICE=/DEVICEHIGH= line from CONFIG.SYS, in file order, with the path and
-/// argument tail kept in their original case. `parse_config_sys` uppercases for
+/// argument tail kept in their original case. Uppercased internally for
 /// matching, but a driver path and its switches must keep case to load and run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigDeviceLine {
@@ -413,8 +207,7 @@ pub struct ConfigDeviceLine {
     pub high: bool,
 }
 
-/// The filename of a DOS path, after the last `\` or `/`. Shared with the
-/// memory-manager line matching in `parse_config_sys`.
+/// The filename of a DOS path, after the last `\` or `/`.
 pub fn dos_basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
@@ -808,9 +601,11 @@ pub struct MachineConfig {
     pub cpu: GswMode,
     pub memory_mib: u16,
     pub video: VideoCard,
-    /// The IZEMM EMM386-role state: unloaded (HIMEM only), noems (UMBs only), or
-    /// ram (UMBs plus the EMS page frame). Defaults to the do-it-right `ram` box.
-    pub emm386: Emm386Mode,
+    /// Retired (SP-4b M4): the TOKAEMM guest driver provides XMS/UMB/EMS from
+    /// the default CONFIG.SYS now. Accepted and ignored so pre-M4 conf files
+    /// still parse; never written back.
+    #[serde(default, skip_serializing)]
+    pub emm386: Option<String>,
 }
 
 impl Default for MachineConfig {
@@ -819,7 +614,7 @@ impl Default for MachineConfig {
             cpu: GswMode::Gsw386,
             memory_mib: 24, // Izarra 3000: 24 MB, 3 x 8 MB DIMMs
             video: VideoCard::Et4000Ax,
-            emm386: Emm386Mode::Ram,
+            emm386: None,
         }
     }
 }
@@ -1093,7 +888,6 @@ pub struct HardwareProfile {
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
     pub yamaha_adpcm: YamahaAdpcmConfig,
-    pub emm386: Emm386Mode,
 }
 
 impl HardwareProfile {
@@ -1108,7 +902,6 @@ impl HardwareProfile {
             sound_blaster: config.audio.sound_blaster,
             wss: config.audio.wss,
             yamaha_adpcm: config.audio.yamaha_adpcm,
-            emm386: config.machine.emm386,
         })
     }
 }
@@ -1195,118 +988,21 @@ mod tests {
     }
 
     #[test]
-    fn emm386_mode_parses_and_gates_features() {
-        assert_eq!(Emm386Mode::default(), Emm386Mode::Ram);
-        assert_eq!("noems".parse::<Emm386Mode>().unwrap(), Emm386Mode::NoEms);
-        assert_eq!(
-            "unloaded".parse::<Emm386Mode>().unwrap(),
-            Emm386Mode::Unloaded
-        );
-        assert!("bogus".parse::<Emm386Mode>().is_err());
-        // RAM provides both UMBs and EMS; NOEMS only UMBs; unloaded neither.
-        assert!(Emm386Mode::Ram.provides_ems() && Emm386Mode::Ram.provides_umb());
-        assert!(!Emm386Mode::NoEms.provides_ems() && Emm386Mode::NoEms.provides_umb());
-        assert!(!Emm386Mode::Unloaded.provides_umb());
-        // The [machine] table accepts the mode; a config without it defaults to ram.
+    fn emm386_conf_key_parses_and_is_ignored() {
+        // Pre-M4 izarravm.conf files carried `emm386 = "..."`; the key is
+        // accepted and ignored so those conf files still parse under M4's
+        // deny_unknown_fields MachineConfig.
         let cfg: AppConfig = toml::from_str("[machine]\nemm386 = \"noems\"\n").unwrap();
-        assert_eq!(cfg.machine.emm386, Emm386Mode::NoEms);
-        assert_eq!(AppConfig::default().machine.emm386, Emm386Mode::Ram);
-    }
+        assert_eq!(cfg.machine.emm386, Some("noems".to_string()));
 
-    #[test]
-    fn config_sys_drives_the_emm386_mode() {
-        let ram = parse_config_sys(
-            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\EMM386.EXE RAM\r\nDOS=HIGH,UMB\r\n",
-        );
-        assert_eq!(ram.emm386, Emm386Mode::Ram);
-        assert!(ram.dos_umb);
+        // Everything else in the parsed config is untouched.
+        assert_eq!(cfg.machine.cpu, MachineConfig::default().cpu);
+        assert_eq!(cfg.machine.memory_mib, MachineConfig::default().memory_mib);
+        assert_eq!(cfg.machine.video, MachineConfig::default().video);
 
-        let noems = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=EMM386.EXE NOEMS\r\nDOS=HIGH\r\n");
-        assert_eq!(noems.emm386, Emm386Mode::NoEms);
-        assert!(!noems.dos_umb);
-
-        // HIMEM alone provides no UMB/EMS manager.
-        assert_eq!(
-            parse_config_sys("DEVICE=C:\\DOS\\HIMEM.SYS\r\n").emm386,
-            Emm386Mode::Unloaded
-        );
-        // EMM386 without a preceding HIMEM cannot load.
-        assert_eq!(
-            parse_config_sys("DEVICE=EMM386.EXE RAM\r\n").emm386,
-            Emm386Mode::Unloaded
-        );
-        // An empty CONFIG.SYS is the no-manager case.
-        assert_eq!(
-            parse_config_sys("FILES=40\r\n").emm386,
-            Emm386Mode::Unloaded
-        );
-
-        // IZEMM.EXE is the Toka-DOS memory manager name; it drives the mode the
-        // same way EMM386.EXE does. Both the full and the bare name work.
-        let iemm_ram = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM.EXE RAM\r\n");
-        assert_eq!(iemm_ram.emm386, Emm386Mode::Ram);
-        let iemm_noems = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM.EXE NOEMS\r\n");
-        assert_eq!(iemm_noems.emm386, Emm386Mode::NoEms);
-        let iemm_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM\r\n");
-        assert_eq!(iemm_bare.emm386, Emm386Mode::Ram);
-        // The real-DOS EMM386 name stays accepted (a pasted real-DOS config works).
-        let emm386_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=EMM386\r\n");
-        assert_eq!(emm386_bare.emm386, Emm386Mode::Ram);
-        // IEMM (legacy alias, still accepted) without a preceding HIMEM cannot load either.
-        assert_eq!(
-            parse_config_sys("DEVICE=IEMM.EXE RAM\r\n").emm386,
-            Emm386Mode::Unloaded
-        );
-    }
-
-    #[test]
-    fn config_sys_recognizes_izemm_and_keeps_legacy_iemm() {
-        // New canonical name selects the EMM mode.
-        let izemm = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM.EXE RAM\r\n");
-        assert_eq!(izemm.emm386, Emm386Mode::Ram);
-        let izemm_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM\r\n");
-        assert_eq!(izemm_bare.emm386, Emm386Mode::Ram);
-        // Legacy IEMM name is still tolerated so an untouched CONFIG.SYS keeps working.
-        let iemm = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM.EXE RAM\r\n");
-        assert_eq!(iemm.emm386, Emm386Mode::Ram);
-    }
-
-    #[test]
-    fn config_sys_parses_iemm_frame_and_pool_size_knobs() {
-        let config = parse_config_sys(
-            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IZEMM.EXE RAM FRAME=D000 4096\r\nDOS=HIGH,UMB\r\n",
-        );
-
-        assert_eq!(config.emm386, Emm386Mode::Ram);
-        assert_eq!(config.ems_frame_seg, Some(0xd000));
-        assert_eq!(config.ems_pool_kb, Some(4096));
-        assert!(config.dos_umb);
-    }
-
-    #[test]
-    fn config_sys_accepts_quoted_device_paths() {
-        let config = parse_config_sys(
-            "DEVICE=\"C:\\DOS\\HIMEM.SYS\" /TESTMEM:OFF\r\nDEVICEHIGH=\"C:\\DOS\\IZEMM.EXE\" RAM FRAME=D000 4096\r\n",
-        );
-
-        assert_eq!(config.emm386, Emm386Mode::Ram);
-        assert_eq!(config.ems_frame_seg, Some(0xd000));
-        assert_eq!(config.ems_pool_kb, Some(4096));
-    }
-
-    #[test]
-    fn config_sys_parses_lastdrive() {
-        let config = parse_config_sys("LASTDRIVE=Z\r\n");
-
-        assert_eq!(config.lastdrive, 26);
-    }
-
-    #[test]
-    fn config_sys_parses_files_and_buffers() {
-        let config = parse_config_sys("FILES=37\r\nBUFFERS=12\r\n");
-
-        assert_eq!(config.files, 37);
-        assert_eq!(config.buffers, 12);
+        // The retired key is never written back out.
+        let serialized = toml::to_string(&AppConfig::default()).unwrap();
+        assert!(!serialized.contains("emm386"));
     }
 
     #[test]
