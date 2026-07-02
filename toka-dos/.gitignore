@@ -1,5 +1,5 @@
-# Intermediate build artifacts. The committed source of truth is the packed
-# tokados.rom under crates/izarravm-firmware/roms, produced by build.ps1.
-/build/
-# The authoring-only packer's Rust build output.
-/pack/target/
+# Intermediate build artifacts from build-freedos.ps1. The committed sources of
+# truth are the FreeDOS-built binaries under crates/izarravm-firmware/roms
+# (tokados-hdd.img, gswmode.com, tokaemm.sys) plus the vendored FreeDOS trees'
+# own .gitignore rules under freedos/.
+/build-freedos-tokamous.com

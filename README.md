@@ -49,7 +49,7 @@ reproduces the Izarra 3000 exactly as it was built.
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio, OPL3 FM, MPU-401 MIDI, wavetable daughterboard, and Yamaha ADPCM-B playback. |
 | Storage | 3.6 GB IDE hard disk, 12x ATAPI CD-ROM with CD audio, and a 1.44 MB floppy drive. |
 | Display | 15-inch CRT, up to 1024x768@75hz. |
-| Firmware | 2 MB ROM with the Izarra BIOS, Toka Disk System, IZCMD, and bundled tools. |
+| Firmware | 2 MB ROM with the Izarra BIOS, Toka-DOS (FreeDOS-based), and bundled tools. |
 | I/O | PS/2 keyboard and mouse, serial, parallel, VGA, line out, line in, and MIDI/game port. |
 
 ## Current State

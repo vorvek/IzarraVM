@@ -195,6 +195,9 @@ def main():
     repo = os.path.dirname(here)
     kdir = os.path.join(repo, "toka-dos", "freedos", "kernel")
     fcdir = os.path.join(repo, "toka-dos", "freedos", "freecom")
+    movedir = os.path.join(repo, "toka-dos", "freedos", "move", "src")
+    sortdir = os.path.join(repo, "toka-dos", "freedos", "sort", "src")
+    memdir = os.path.join(repo, "toka-dos", "freedos", "mem", "source")
     out = os.path.join(repo, "crates", "izarravm-firmware", "roms", "tokados-hdd.img")
 
     if os.path.exists(os.path.join(kdir, "bin", "kernel.sys")):
@@ -206,6 +209,9 @@ def main():
         tokamous = open(
             os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb"
         ).read()
+        move = open(os.path.join(movedir, "move.exe"), "rb").read()
+        sort = open(os.path.join(sortdir, "sort.exe"), "rb").read()
+        mem = open(os.path.join(memdir, "mem.exe"), "rb").read()
     else:
         # From-image path: source the binaries from the current committed image.
         prev = open(out, "rb").read()
@@ -213,12 +219,19 @@ def main():
         kernel = prev_files["KERNEL.SYS"]
         shell = prev_files["COMMAND.COM"]
         tokamous = prev_files["TOKAMOUS.COM"]
+        move = prev_files["MOVE.EXE"]
+        sort = prev_files["SORT.EXE"]
+        mem = prev_files["MEM.EXE"]
         print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
-    # TOKAEMM.SYS is a committed binary (built from tokaemm.asm), never extracted.
+    # TOKAEMM.SYS and GSWMODE.COM are committed binaries (built straight from NASM
+    # source by toka-dos/build-freedos.ps1 into the firmware crate), never extracted
+    # from the previous image.
     tokaemm = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokaemm.sys"), "rb").read()
+    gswmode = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). SP-4b M4 defaults: TOKAEMM
     # loads as the memory manager (frameless NOEMS; the system runs in V86 under
@@ -228,11 +241,12 @@ def main():
                   b"DEVICE=C:\\TOKAEMM.SYS NOEMS\r\n"
                   b"DOS=HIGH,UMB\r\n"
                   b"SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
-    # Defaults the user owns (mount_hdd_folder seeds these if missing). SET BLASTER
-    # advertises the emulated SB16 (base 0x220, IRQ5, DMA1, high DMA5, type 6 SB16);
-    # no P (MPU-401) param -- no MPU is emulated. LH loads the INT 33h mouse into
-    # a TOKAEMM UMB (LOADHIGH falls back to a low load if none fits).
-    autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\n"
+    # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH lets
+    # the external commands (MOVE/SORT/MEM) resolve from any current directory.
+    # SET BLASTER advertises the emulated SB16 (base 0x220, IRQ5, DMA1, high DMA5,
+    # type 6 SB16); no P (MPU-401) param -- no MPU is emulated. LH loads the INT
+    # 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load if none fits).
+    autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\\r\n"
                 b"SET BLASTER=A220 I5 D1 H5 T6\r\nLH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
     # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
@@ -285,6 +299,10 @@ def main():
         ("AUTOEXEC.BAT", autoexec),
         ("TOKAMOUS.COM", tokamous),
         ("TOKAEMM.SYS", tokaemm),
+        ("GSWMODE.COM", gswmode),
+        ("MOVE.EXE", move),
+        ("SORT.EXE", sort),
+        ("MEM.EXE", mem),
         ("HELLO.TXT", hello_txt),
         ("LICENSE.TXT", license_txt),
     ]

@@ -43,6 +43,13 @@ toka-dos/freedos/sort/**/*.map
 toka-dos/freedos/move/**/*.err
 toka-dos/freedos/sort/**/*.err
 
+# FreeDOS userland MEM build outputs (build-freedos.ps1, Open Watcom wcl), same
+# pattern as move/sort above.
+toka-dos/freedos/mem/**/*.obj
+toka-dos/freedos/mem/**/*.exe
+toka-dos/freedos/mem/**/*.map
+toka-dos/freedos/mem/**/*.err
+
 # TOKAMOUS.COM staged output (build-freedos.ps1). Source is tokamous.asm; only
 # the output binary is gitignored (Task 6 image builder reads this path).
 toka-dos/build-freedos-tokamous.com

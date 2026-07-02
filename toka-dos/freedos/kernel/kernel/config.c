@@ -2165,8 +2165,10 @@ STATIC void config_init_buffers(int wantedbuffers)
   if (FP_SEG(pbuffer) == 0xffff)
   {
     buffers++;
+#ifdef DEBUG
     printf("Kernel: allocated %d Diskbuffers = %u Bytes in HMA\n",
            buffers, buffers * sizeof(struct buffer));
+#endif
   }
 }
 

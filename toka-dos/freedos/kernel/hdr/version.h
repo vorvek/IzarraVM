@@ -41,12 +41,14 @@
 
 /* Used for version information displayed to user at boot (& stored in os_release string) */
 #ifndef KERNEL_VERSION
-#define KERNEL_VERSION "- GIT "
+#define KERNEL_VERSION ""
 #endif
 
-/* Modified by the Toka-DOS project, 2026: changed display banner from "FreeDOS kernel" to "Toka-DOS 3.0 kernel". */
+/* Modified by the Toka-DOS project, 2026: changed display banner from "FreeDOS kernel" to "Toka-DOS 3.0 kernel",
+   and dropped the "- GIT " / raw OEM-id decoration for a cleaner user-facing string (build number only).
+   This is string cosmetics only -- OEM_ID and the values reported via int 21 AH=30h/33FFh are unchanged. */
 /* actual version string */
-#define KVS(v,s,o) "Toka-DOS 3.0 kernel " v "(build 20" #s " OEM:" #o ") [compiled " __DATE__ "]\n"
+#define KVS(v,s,o) "Toka-DOS 3.0 kernel " v "(build 20" #s ") [compiled " __DATE__ "]\n"
 #define xKVS(v,s,o) KVS(v,s,o)
 #define KERNEL_VERSION_STRING xKVS(KERNEL_VERSION, REVISION_SEQ, OEM_ID)
 

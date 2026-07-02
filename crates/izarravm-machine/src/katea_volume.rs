@@ -308,14 +308,19 @@ mod tests {
         // The files, in directory order, with their known sizes.
         let by_name: std::collections::HashMap<&str, &Vec<u8>> =
             payload.files.iter().map(|(n, d)| (n.as_str(), d)).collect();
+        // Sizes shifted from prior builds after audit item 9 (presentation-leak
+        // cleanup): KERNEL.SYS shrank because the boot-time Diskbuffers message
+        // is now #ifdef DEBUG-gated (dropping its printf + format string in a
+        // non-debug build); COMMAND.COM shrank because DEFAULT.lng's VER
+        // /W,/D,/C copyright blocks were rewritten to drop FreeDOS branding.
         assert_eq!(
             by_name.get("KERNEL.SYS").map(|d| d.len()),
-            Some(70130),
+            Some(70062),
             "KERNEL.SYS size"
         );
         assert_eq!(
             by_name.get("COMMAND.COM").map(|d| d.len()),
-            Some(87652),
+            Some(87422),
             "COMMAND.COM size"
         );
         assert!(by_name.contains_key("CONFIG.SYS"), "CONFIG.SYS present");
