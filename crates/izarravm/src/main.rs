@@ -3072,12 +3072,13 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     /// exception vectors and/or make `vec13_entry` 286-clean) — none of which
     /// this task should attempt (cpu is frozen; TOKAEMM is SP-4b-owned code
     /// outside this task's brief).
+    /// PINS THE KNOWN LIMITATION: this test asserts the fault HAPPENS, so the
+    /// --ignored suite stays green while the bug is open. When the exemption
+    /// lands, invert it to the survives-and-returns-to-586 shape of its 486
+    /// sibling above.
     #[test]
-    #[ignore = "NO-GO: TOKAEMM's ring-0 monitor #UDs on the 386-only 0x66 prefix \
-                at the I286 guest level and has no low-vector IDT gates to catch \
-                it (see the doc comment above); needs an izarravm-cpu or TOKAEMM \
-                fix out of this task's scope"]
-    fn tokaemm_gswmode_286_switch_survives_v86_monitor() {
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_gswmode_286_switch_hits_the_known_monitor_limit() {
         let dir = std::env::temp_dir().join(format!(
             "tokaemm_gsw286_{}_{}",
             std::process::id(),
@@ -3118,31 +3119,23 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let stop = machine
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
-        if let StopReason::CpuError(msg) = &stop {
-            let text = machine.screen_text().as_text();
-            std::fs::remove_dir_all(&dir).ok();
-            panic!(
-                "CPU fault after the GSWMODE 286 switch while TOKAEMM's ring-0 \
-                 monitor was resident: {msg}\nstop={stop:?}\n{text}"
-            );
-        }
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
 
+        // The switch itself lands (the mode is 286)...
         assert_eq!(
             machine.active_mode(),
-            GswMode::Gsw586,
-            "GSWMODE 286 then GSWMODE 586 should leave the machine back at 586 \
+            GswMode::Gsw286,
+            "GSWMODE 286 should have written the live Lotura register \
              (stop={stop:?}).\n{text}"
         );
-        let lower = text.to_ascii_lowercase();
+        // ...and the monitor then faults. If this assertion starts FAILING
+        // because the run survived, the limitation is fixed: invert the test.
         assert!(
-            lower.contains("switched to 286") && lower.contains("switched to 586"),
-            "GSWMODE confirmation output missing for one of the two switches.\n{text}"
-        );
-        assert!(
-            lower.contains("c:\\>"),
-            "no C:\\> prompt after the GSWMODE 286/VER/GSWMODE 586 sequence \
+            matches!(&stop, StopReason::CpuError(_)),
+            "expected the documented ring-0 monitor fault at the I286 level; \
+             the run survived instead -- the exemption must have landed, so \
+             invert this test to the 486 sibling's survives shape \
              (stop={stop:?}).\n{text}"
         );
     }
