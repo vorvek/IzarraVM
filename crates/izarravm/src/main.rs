@@ -1655,6 +1655,7 @@ fn print_video_summary(machine: &mut Machine) {
         VideoMode::Planar => "planar (EGA/VGA 16-color)",
         VideoMode::ModeX => "mode X (unchained 256-color)",
         VideoMode::Cga => "CGA graphics (320x200x4 / 640x200x2)",
+        VideoMode::Hercules => "Hercules graphics (720x348 monochrome)",
     };
     println!("video mode: {mode_name}");
 
