@@ -3118,47 +3118,28 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     }
 
     /// GSWMODE 286 while TOKAEMM's ring-0 monitor is resident — the risk case
-    /// flagged when this tool was built (coverage audit item 18). CONFIRMED
-    /// NO-GO, root-caused by direct instrumentation (small-step EIP/CS trace);
-    /// `izarravm-cpu` is frozen for this work (another agent owns it), so the
-    /// fix is out of scope here.
+    /// flagged when this tool was built (coverage audit item 18). This is the
+    /// inverted (survives) shape of the retired pinned-limitation test
+    /// `tokaemm_gswmode_286_switch_hits_the_known_monitor_limit`; it needs TWO
+    /// fixes to pass, landing in separate PRs:
     ///
-    /// Evidence: the fault fires the instruction after `active_mode()` flips to
-    /// `Gsw286`, at EIP=0x0000133B CS=0x0008 (`vec13_entry` — TOKAEMM's shared
-    /// #GP/IRQ5 monitor entry, see roms/dos/tokaemm.asm), `in_v86()`=false (the
-    /// CPU is executing the ring-0 monitor itself, not guest V86 code):
-    /// `general protection fault while loading selector 0x0000`.
+    ///  1. izarravm-cpu: the I286 guest ISA gate (66h/67h prefixes + 386-only
+    ///     0F opcodes) must exempt ring-0 protected mode (`is_ring0_protected`)
+    ///     the way it exempts firmware ROM, so TOKAEMM's 32-bit monitor keeps
+    ///     running below the V86 guest (branch vorvek/i286-monitor-gate).
+    ///  2. TOKAEMM itself: the guest-facing V86 code (XMS/EMS/UMB entry points)
+    ///     must be 286-clean — V86 and real mode stay at true-286 ISA fidelity,
+    ///     so a MOVZX there (e.g. the old `movzx bx, ah` in ems_int67, hit by
+    ///     EMS-presence probing on every EXEC) raises #UD, cascades through
+    ///     TOKAEMM's unpopulated low IDT gates, and kills the machine (this PR;
+    ///     the whole V86 section now assembles under `cpu 286`).
     ///
-    /// Root cause: TOKAEMM's monitor code is 32-bit-default (`vec13_entry` opens
-    /// with `pushad` then `66 B8 10 00 / mov ds, ax` — the `66` operand-size
-    /// prefix is required just to load a 16-bit segment register from 32-bit-
-    /// default code). `crates/izarravm-cpu/src/lib.rs` decode_prefixes rejects
-    /// `0x66`/`0x67` with #UD (vector 6) at the I286 guest level unless the
-    /// fetch address is in the firmware ROM (`cs_in_firmware_rom()`) — and the
-    /// monitor runs from TOKAEMM's own resident memory, not ROM, so it is not
-    /// exempt. Delivering that #UD then faults a second time: TOKAEMM's IDT
-    /// (`roms/dos/tokaemm.asm` around line 1559) only populates gates for
-    /// vector 8 upward (IRQ0..IRQ15); vectors 0-7, including 6, were never
-    /// built, so the CPU reads a zeroed/garbage gate for vector 6 and GP-faults
-    /// loading its null code selector — matching the observed "selector 0x0000".
-    ///
-    /// In short: `set_level` gates 32-bit *guest* ISA on the Lotura mode, but
-    /// TOKAEMM's own 32-bit ring-0 monitor is not exempt the way firmware ROM
-    /// is, and the monitor has no #UD handler to catch the consequence. Fixing
-    /// this needs either an `izarravm-cpu` exemption for ring-0 protected-mode
-    /// monitor code (parallel to `cs_in_firmware_rom`), or an `izarravm-cpu`-side
-    /// policy decision that the guest ISA gate should not apply while
-    /// `is_ring0_protected()` is true, or a TOKAEMM-side fix (build the low
-    /// exception vectors and/or make `vec13_entry` 286-clean) — none of which
-    /// this task should attempt (cpu is frozen; TOKAEMM is SP-4b-owned code
-    /// outside this task's brief).
-    /// PINS THE KNOWN LIMITATION: this test asserts the fault HAPPENS, so the
-    /// --ignored suite stays green while the bug is open. When the exemption
-    /// lands, invert it to the survives-and-returns-to-586 shape of its 486
-    /// sibling above.
+    /// Sequence mirrors the 486 sibling above: GSWMODE 286 (the EXEC's own EMS
+    /// probe already exercises ems_int67 at I286), VER at the 286 level, then
+    /// GSWMODE 586 (a second EXEC at I286) to prove switching back works.
     #[test]
     #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-    fn tokaemm_gswmode_286_switch_hits_the_known_monitor_limit() {
+    fn tokaemm_gswmode_286_switch_survives_the_monitor() {
         let dir = std::env::temp_dir().join(format!(
             "tokaemm_gsw286_{}_{}",
             std::process::id(),
@@ -3199,23 +3180,31 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let stop = machine
             .run_until_halt_or_cycles(800_000_000)
             .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault after the GSWMODE 286 switch while TOKAEMM's ring-0 \
+                 monitor was resident: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
 
-        // The switch itself lands (the mode is 286)...
         assert_eq!(
             machine.active_mode(),
-            GswMode::Gsw286,
-            "GSWMODE 286 should have written the live Lotura register \
+            GswMode::Gsw586,
+            "GSWMODE 286 then GSWMODE 586 should leave the machine back at 586 \
              (stop={stop:?}).\n{text}"
         );
-        // ...and the monitor then faults. If this assertion starts FAILING
-        // because the run survived, the limitation is fixed: invert the test.
+        let lower = text.to_ascii_lowercase();
         assert!(
-            matches!(&stop, StopReason::CpuError(_)),
-            "expected the documented ring-0 monitor fault at the I286 level; \
-             the run survived instead -- the exemption must have landed, so \
-             invert this test to the 486 sibling's survives shape \
+            lower.contains("switched to 286") && lower.contains("switched to 586"),
+            "GSWMODE confirmation output missing for one of the two switches.\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the GSWMODE 286/VER/GSWMODE 586 sequence \
              (stop={stop:?}).\n{text}"
         );
     }

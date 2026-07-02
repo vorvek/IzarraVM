@@ -17,6 +17,16 @@
 ;                                             saved kernel context, via FS)
 ; On a V86 fault the CPU nulls DS/ES/FS/GS; the monitor reads guest memory + the
 ; real-mode IVT through the null DS (base 0 == flat) and its own data through FS.
+;
+; ISA split (GSWMODE 286): the guest can throttle the live CPU to a true 286
+; instruction boundary at runtime, and V86/real-mode code is held to it (only
+; the ring-0 monitor is exempt). So the guest-facing section — everything the
+; XMS/EMS/UMB entry points reach — assembles under `cpu 286` (NASM enforces the
+; boundary), works in 16-bit KB units internally (the 16 MB map keeps every KB
+; count under 0x4000), and passes 32-bit arguments to the INT 0xC0 monitor
+; services through driver-resident scratch dwords the monitor reads via FS
+; instead of 32-bit registers. INIT (which builds the 386 PM/paging monitor —
+; there is no 286 equivalent of that job) and the monitor itself stay `cpu 386`.
 cpu 386
 org 0
 
@@ -68,12 +78,16 @@ hma_owned: db 0                   ; 1 once a guest (DOS=HIGH) claims the HMA
 a20_count: dw 0                   ; XMS local-A20 enable nesting (fns 05h/06h)
 xms_disp:  dw 0                   ; dispatch scratch (register-safe table jump)
 xms_mv_len: dd 0                  ; 0Bh move: byte count / src linear / dst linear
-xms_mv_src: dd 0
-xms_mv_dst: dd 0
+xms_mv_src: dd 0                  ; (the INT 0xC0 'TM' memcpy reads these three
+xms_mv_dst: dd 0                  ;  via FS — the 286-clean V86 side has no
+                                  ;  32-bit registers to pass them in)
 xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
+xms_rv_off: dd 0                  ; resolve input: the endpoint's 32-bit offset
+xms_need_kb: dw 0                 ; find_gap input: KB wanted
 
 ; 32 EMB handles. handle h (1-based) -> slot at xms_table + (h-1)*XMS_SLOT.
-; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_linear(dd)
+; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_kb(w) +6 pad. Bases are
+; KB-granular (find_gap allocates in KB units); linear = base_kb << 10.
 XMS_HANDLES equ 32
 XMS_SLOT    equ 8
 xms_table: times XMS_HANDLES*XMS_SLOT db 0
@@ -116,6 +130,11 @@ umb_win_end: dw 0xF000            ; UMB window end segment (0xE000 with EMS on)
 ems_table: times EMS_HANDLES*EMS_SLOT db 0
 ; live frame map: backing page index per physical slot, 0xFFFF = unmapped
 ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
+; INT 0xC0 'PM' remap args (monitor reads via FS): slot linear base + backing
+; physical base (0 = restore the INIT mapping). Separate from the xms_mv_*
+; scratch so an ISR-driven remap can't race a move being staged.
+ems_rm_lin:  dd 0
+ems_rm_phys: dd 0
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -359,7 +378,14 @@ init:
 ; 2Fh hook (install-check / get-entry) and the far-callable control entry, never
 ; by fall-through (INIT above ends in a far jump). Own data via cs: overrides
 ; because the far-callable entry runs with the caller's DS.
+;
+; Everything from here to the monitor (`bits 32`) is guest-facing V86 code and
+; must stay 286-clean: GSWMODE 286 throttles the live CPU to a true 286 ISA
+; boundary and V86/real mode are held to it (66h/67h prefixes and 386-only 0F
+; opcodes #UD there — and TOKAEMM's IDT has no low exception gates, so that
+; #UD is fatal). `cpu 286` makes NASM the enforcer.
 ; ============================================================================
+cpu 286
 
 ; INT 2Fh multiplex hook: XMS install-check (4300) / get-entry (4310); chain else.
 xms_2f_handler:
@@ -384,7 +410,8 @@ xms_entry:
     cmp ah, 0x12
     ja .unimpl                   ; 13h+ : not implemented
     push bx
-    movzx bx, ah
+    mov bl, ah                   ; zero-extend AH 286-style
+    xor bh, bh
     add bx, bx
     mov bx, [cs:xms_jt + bx]
     mov [cs:xms_disp], bx
@@ -459,9 +486,8 @@ xf_a20_loff:
 ; 07h query A20: AX=1 enabled / 0 disabled, BL=0.
 xf_a20_query:
     in al, 0x92
-    test al, 2
-    setnz al
-    movzx ax, al
+    shr al, 1                    ; bit 1 (A20) -> bit 0
+    and ax, 1                    ; AX = 0/1 (clears AH too)
     xor bl, bl
     retf
 
@@ -479,28 +505,33 @@ a20_off:
 ; 08h query free extended memory: AX=largest free KB, DX=total free KB, BL=0.
 ; Largest is approximated as total (a first-fit pool rarely fragments, and
 ; over-reporting only turns a would-be-large alloc into an A0h failure).
+; 16-bit KB arithmetic throughout: the pool tops out at the 16 MB map, so
+; every KB count fits comfortably under 0x4000 (no 0xFFFF cap needed).
 xf_query_free:
     push cx
     push si
-    mov eax, [cs:xms_pool_end]
-    sub eax, [cs:xms_pool_base]
-    shr eax, 10                  ; pool size KB
+    mov ax, [cs:xms_pool_end]     ; end KB = (dword >> 10) via the word pair
+    mov bx, [cs:xms_pool_end+2]
+    shr ax, 10
+    shl bx, 6
+    or ax, bx
+    mov dx, [cs:xms_pool_base]    ; base KB likewise
+    mov bx, [cs:xms_pool_base+2]
+    shr dx, 10
+    shl bx, 6
+    or dx, bx
+    sub ax, dx                   ; pool size KB
     mov si, xms_table
     mov cx, XMS_HANDLES
 .sum:
     cmp byte [cs:si], 0
     je .skip
-    movzx ebx, word [cs:si+2]
-    sub eax, ebx
+    sub ax, [cs:si+2]
 .skip:
     add si, XMS_SLOT
     loop .sum
-    cmp eax, 0xFFFF
-    jbe .cap
-    mov eax, 0xFFFF
-.cap:
-    mov dx, ax                   ; total free KB
-    xor bl, bl                   ; AX (=largest) already = total
+    mov dx, ax                   ; total free KB (AX = largest = total)
+    xor bl, bl
     pop si
     pop cx
     retf
@@ -511,11 +542,10 @@ xf_alloc:
     push si
     push di
     push bp
-    movzx eax, dx
-    shl eax, 10
-    mov [cs:xms_mv_len], eax      ; need bytes
-    call find_gap                 ; -> EDI = base, or CF (oom)
+    mov [cs:xms_need_kb], dx
+    call find_gap                 ; -> AX = base KB, or CF (oom)
     jc .oom
+    mov di, ax                    ; hold the base KB across the slot scan
     mov si, xms_table
     mov cx, XMS_HANDLES
     xor bp, bp                    ; handle counter (1-based)
@@ -530,10 +560,9 @@ xf_alloc:
 .got:
     mov byte [cs:si], 1
     mov byte [cs:si+1], 0
-    mov eax, [cs:xms_mv_len]
-    shr eax, 10
-    mov [cs:si+2], ax             ; size_kb
-    mov [cs:si+4], edi            ; base_linear
+    mov ax, [cs:xms_need_kb]      ; size_kb (find_gap clobbered DX)
+    mov [cs:si+2], ax
+    mov [cs:si+4], di             ; base_kb
     mov dx, bp                    ; handle out
     pop bp
     pop di
@@ -575,9 +604,10 @@ xf_lock:
     cmp byte [cs:si+1], 0xFF
     je .ovf
     inc byte [cs:si+1]
-    mov edx, [cs:si+4]
-    mov ebx, edx
-    shr edx, 16                   ; DX:BX = linear (BX = low word of ebx)
+    mov bx, [cs:si+4]             ; base_kb
+    mov dx, bx
+    shl bx, 10                    ; DX:BX = base_kb << 10 (the linear base)
+    shr dx, 6
     pop si
     mov ax, 1
     retf
@@ -654,29 +684,27 @@ xf_resize:
     cmp bx, [cs:si+2]             ; same size?
     je .ok
     push word [cs:si+2]           ; save old size_kb
-    push dword [cs:si+4]          ; save old base
+    push word [cs:si+4]           ; save old base_kb
     mov byte [cs:si], 0           ; temporarily free the slot
-    movzx eax, bx
-    shl eax, 10
-    mov [cs:xms_mv_len], eax
+    mov [cs:xms_need_kb], bx
     call find_gap
     mov si, [cs:xms_slot_save]    ; restore the slot offset (find_gap clobbered SI)
     jc .restore
     mov byte [cs:si], 1
     mov byte [cs:si+1], 0
-    mov eax, [cs:xms_mv_len]      ; size_kb from need bytes (find_gap clobbered BX)
-    shr eax, 10
+    mov di, ax                    ; new base_kb
+    mov ax, [cs:xms_need_kb]      ; size_kb (find_gap clobbered BX)
     mov [cs:si+2], ax
-    mov [cs:si+4], edi
-    add sp, 6                     ; discard saved old (dword + word)
+    mov [cs:si+4], di
+    add sp, 4                     ; discard saved old (two words)
 .ok:
     pop di
     pop si
     pop cx
     jmp xms_ok
 .restore:
-    pop eax                       ; old base
-    mov [cs:si+4], eax
+    pop ax                        ; old base_kb
+    mov [cs:si+4], ax
     pop ax                        ; old size_kb
     mov [cs:si+2], ax
     mov byte [cs:si], 1
@@ -699,32 +727,41 @@ xf_resize:
 
 ; 0Bh move EMB: DS:SI -> descriptor {len(dd) srcH(w) srcOff(dd) dstH(w) dstOff(dd)}.
 ; Resolve both endpoints to linear, then trap to the monitor for the flat copy.
+; The monitor reads src/dst/len from [fs:xms_mv_*] (this side has no 32-bit regs).
 xf_move:
     push cx
     push si
     push di
     push bp
-    mov eax, [si]                 ; length (DS:SI +0)
-    test eax, eax
+    mov ax, [si]                  ; length (DS:SI +0), word pair
+    mov dx, [si+2]
+    mov cx, ax
+    or cx, dx
     jz .zero                      ; zero length = legal no-op success
-    test eax, 1
+    test al, 1
     jnz .badlen                   ; odd length -> A7h
-    mov [cs:xms_mv_len], eax
+    mov [cs:xms_mv_len], ax
+    mov [cs:xms_mv_len+2], dx
+    mov ax, [si+6]                ; src offset -> resolve's input scratch
+    mov dx, [si+8]
+    mov [cs:xms_rv_off], ax
+    mov [cs:xms_rv_off+2], dx
     mov bx, [si+4]                ; src handle
-    mov edx, [si+6]               ; src offset
-    call resolve                  ; -> EAX = linear, or CF + AL=1(handle)/2(offset)
+    call resolve                  ; -> DX:AX = linear, or CF + AL=1(handle)/2(offset)
     jc .src_err
-    mov [cs:xms_mv_src], eax
+    mov [cs:xms_mv_src], ax
+    mov [cs:xms_mv_src+2], dx
+    mov ax, [si+12]               ; dst offset
+    mov dx, [si+14]
+    mov [cs:xms_rv_off], ax
+    mov [cs:xms_rv_off+2], dx
     mov bx, [si+10]               ; dst handle
-    mov edx, [si+12]              ; dst offset
     call resolve
     jc .dst_err
-    mov [cs:xms_mv_dst], eax
-    mov esi, [cs:xms_mv_src]
-    mov edi, [cs:xms_mv_dst]
-    mov ecx, [cs:xms_mv_len]
-    mov edx, 0x544D              ; monitor-call cookie 'TM'
-    int 0xC0                     ; ring-0 flat memcpy: ES:EDI <- DS:ESI, ECX bytes
+    mov [cs:xms_mv_dst], ax
+    mov [cs:xms_mv_dst+2], dx
+    mov dx, 0x544D               ; monitor-call cookie 'TM'
+    int 0xC0                     ; ring-0 flat memcpy of [fs:xms_mv_*]
     pop bp
     pop di
     pop si
@@ -783,53 +820,65 @@ slot_of:
     stc
     ret
 
-; First-fit gap for [cs:xms_mv_len] bytes over [pool_base, pool_end). Restart-on-
-; overlap. out: EDI = base, CF clear; or CF set (out of memory).
-; Clobbers eax, ebx, edx, cx, si.
+; First-fit gap for [cs:xms_need_kb] KB over [pool_base, pool_end). Restart-on-
+; overlap. All KB units in 16-bit registers (pool KB counts stay under 0x4000;
+; only a caller-supplied need can push cursor+need past 0xFFFF, caught by JC).
+; out: AX = base KB, CF clear; or CF set (out of memory).
+; Clobbers bx, cx, dx, si, di.
 find_gap:
-    mov edi, [cs:xms_pool_base]
+    mov ax, [cs:xms_pool_end]     ; pool end KB = (dword >> 10) via the word pair
+    mov dx, [cs:xms_pool_end+2]
+    shr ax, 10
+    shl dx, 6
+    or dx, ax                     ; DX = pool end KB
+    mov ax, [cs:xms_pool_base]
+    mov di, [cs:xms_pool_base+2]
+    shr ax, 10
+    shl di, 6
+    or di, ax                     ; DI = cursor KB
 .restart:
-    mov eax, edi
-    add eax, [cs:xms_mv_len]
-    cmp eax, [cs:xms_pool_end]
+    mov ax, di
+    add ax, [cs:xms_need_kb]      ; cursor + need
+    jc .oom                       ; 16-bit wrap: a huge request can't fit
+    cmp ax, dx
     ja .oom
     mov si, xms_table
     mov cx, XMS_HANDLES
 .scan:
     cmp byte [cs:si], 0
     je .next
-    mov ebx, [cs:si+4]            ; b.base
-    movzx eax, word [cs:si+2]
-    shl eax, 10
-    add eax, ebx                  ; b.top
-    cmp eax, edi                  ; b.top <= cursor? (block below)
+    mov bx, [cs:si+4]             ; b.base KB
+    add bx, [cs:si+2]             ; b.top KB
+    cmp bx, di                    ; b.top <= cursor? (block below)
     jbe .next
-    mov edx, edi
-    add edx, [cs:xms_mv_len]      ; cursor + need
-    cmp ebx, edx                  ; b.base >= cursor+need? (block above)
+    cmp [cs:si+4], ax             ; b.base >= cursor+need? (block above)
     jae .next
-    mov edi, eax                  ; overlap: cursor = b.top, restart
+    mov di, bx                    ; overlap: cursor = b.top, restart
     jmp .restart
 .next:
     add si, XMS_SLOT
     loop .scan
+    mov ax, di                    ; found: AX = base KB
     clc
     ret
 .oom:
     stc
     ret
 
-; Resolve a move endpoint. in: BX=handle, EDX=offset, [cs:xms_mv_len]=length.
-; out: EAX = linear, CF clear; or CF set + AL=1 (bad handle) / AL=2 (bad offset).
-; Handle 0 => EDX is a real-mode seg:off (high=seg, low=off). Clobbers eax,ebx,edx.
+; Resolve a move endpoint. in: BX=handle, [cs:xms_rv_off]=32-bit offset,
+; [cs:xms_mv_len]=length. out: DX:AX = linear, CF clear; or CF set +
+; AL=1 (bad handle) / AL=2 (bad offset). Handle 0 => the offset dword is a
+; real-mode seg:off (high=seg, low=off). 32-bit values as word pairs (286-clean).
+; Clobbers ax, bx, dx.
 resolve:
     test bx, bx
     jnz .handle
-    mov eax, edx
-    shr eax, 16                   ; segment
-    and edx, 0xFFFF               ; offset
-    shl eax, 4
-    add eax, edx                  ; seg*16 + off
+    mov ax, [cs:xms_rv_off+2]     ; segment
+    mov dx, ax
+    shr dx, 12                    ; seg<<4 high bits -> linear bits 16..19
+    shl ax, 4
+    add ax, [cs:xms_rv_off]       ; + offset
+    adc dx, 0                     ; DX:AX = seg*16 + off
     clc
     ret
 .handle:
@@ -843,16 +892,34 @@ resolve:
     mov si, ax
     cmp byte [cs:si], 0           ; inuse?
     je .badh_pop
-    movzx eax, word [cs:si+2]
-    shl eax, 10                   ; size bytes
-    cmp edx, eax                  ; offset > size?
+    mov ax, [cs:si+2]             ; size bytes = size_kb << 10, as DX:AX
+    mov dx, ax
+    shr dx, 6
+    shl ax, 10
+    mov bx, [cs:xms_rv_off+2]     ; offset > size? (32-bit compare, high first)
+    cmp bx, dx
     ja .bado_pop
-    sub eax, edx                  ; remaining = size - offset
-    mov ebx, [cs:xms_mv_len]
-    cmp ebx, eax                  ; length > remaining?
+    jb .off_ok
+    mov bx, [cs:xms_rv_off]
+    cmp bx, ax
     ja .bado_pop
-    mov eax, [cs:si+4]            ; base_linear
-    add eax, edx                  ; + offset
+.off_ok:
+    sub ax, [cs:xms_rv_off]       ; remaining = size - offset
+    sbb dx, [cs:xms_rv_off+2]
+    mov bx, [cs:xms_mv_len+2]     ; length > remaining?
+    cmp bx, dx
+    ja .bado_pop
+    jb .len_ok
+    mov bx, [cs:xms_mv_len]
+    cmp bx, ax
+    ja .bado_pop
+.len_ok:
+    mov ax, [cs:si+4]             ; linear = (base_kb << 10) + offset
+    mov dx, ax
+    shr dx, 6
+    shl ax, 10
+    add ax, [cs:xms_rv_off]
+    adc dx, [cs:xms_rv_off+2]
     pop si
     clc
     ret
@@ -1093,7 +1160,8 @@ ems_int67:
     cmp ah, 0x4C
     ja ef_undef
     push bx
-    movzx bx, ah
+    mov bl, ah                    ; zero-extend AH 286-style
+    xor bh, bh
     sub bx, 0x40
     add bx, bx
     mov bx, [cs:ems_jt + bx]
@@ -1209,7 +1277,8 @@ ef_map:
     mov cx, [cs:si+4]
     add cx, bx                    ; backing page = first + logical
 .do:
-    movzx si, al
+    mov si, ax                    ; slot index: AL validated <= 3, mask AH away
+    and si, 3
     add si, si
     mov [cs:ems_frame_map + si], cx
     call ems_remap_slot           ; AL=slot, CX=page|0xFFFF (preserves regs)
@@ -1246,10 +1315,10 @@ ef_free:
     mov di, [cs:si+4]             ; DI = first freed page
     mov dx, di
     add dx, [cs:si+2]             ; DX = end (exclusive)
-    xor bx, bx                    ; BL = physical slot 0..3
+    xor bx, bx                    ; BX = physical slot 0..3
 .slots:
     push si
-    movzx si, bl
+    mov si, bx
     add si, si
     mov cx, [cs:ems_frame_map + si]
     cmp cx, di
@@ -1356,9 +1425,9 @@ ef_restore:
     push bx
     push cx
     push di
-    xor bx, bx                    ; BL = physical slot 0..3
+    xor bx, bx                    ; BX = physical slot 0..3
 .rs:
-    movzx di, bl
+    mov di, bx
     add di, di
     push si
     add si, di
@@ -1481,29 +1550,34 @@ ems_find_run:
 
 ; Monitor remap of one frame slot. AL = slot 0-3, CX = backing page index or
 ; 0xFFFF to restore the INIT (UMB-backing) mapping. Preserves all registers.
+; The two 32-bit args (slot linear base, backing physical base) are staged in
+; [cs:ems_rm_*] as word pairs; the monitor reads them via FS (286-clean side).
 ems_remap_slot:
-    push eax
-    push ebx
-    push ecx
-    push edx
-    movzx ebx, al
-    shl ebx, 14
-    add ebx, EMS_FRAME_LIN        ; EBX = slot linear base
+    push dx
+    mov dx, ax
+    and dx, 3                     ; slot linear = EMS_FRAME_LIN + slot*16K:
+    shl dx, 14                    ; low word = slot << 14,
+    mov [cs:ems_rm_lin], dx
+    mov word [cs:ems_rm_lin+2], EMS_FRAME_LIN >> 16   ; high word = 0x000E
     cmp cx, 0xFFFF
     je .unmap
-    movzx ecx, cx
-    shl ecx, 14
-    add ecx, EMS_PHYS_BASE        ; ECX = backing physical base
+    mov dx, cx                    ; backing = EMS_PHYS_BASE + page*16K:
+    shr dx, 2                     ; high word = (page >> 2) + base high
+    add dx, EMS_PHYS_BASE >> 16
+    mov [cs:ems_rm_phys+2], dx
+    mov dx, cx
+    shl dx, 14                    ; low word = (page << 14) + base low, with
+    add dx, EMS_PHYS_BASE & 0xFFFF
+    mov [cs:ems_rm_phys], dx
+    adc word [cs:ems_rm_phys+2], 0 ; the add's carry folded into the high word
     jmp .go
 .unmap:
-    xor ecx, ecx                  ; 0 = restore the INIT mapping
+    mov word [cs:ems_rm_phys], 0  ; 0 = restore the INIT mapping
+    mov word [cs:ems_rm_phys+2], 0
 .go:
-    mov edx, 0x4D50               ; 'PM' monitor-call cookie
+    mov dx, 0x4D50                ; 'PM' monitor-call cookie
     int 0xC0
-    pop edx
-    pop ecx
-    pop ebx
-    pop eax
+    pop dx
     ret
 
 ; Classify AL for the INIT command-line parse: AH = 0 ordinary char,
@@ -1579,6 +1653,9 @@ idtr:
     dw idt_end - idt - 1
     dd 0
 
+; Ring-0 monitor from here down: exempt from the guest ISA gate (it services
+; the V86 guest from ring-0 protected mode at any GSW level), so full 386.
+cpu 386
 bits 32
 pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     mov ax, 0x10
@@ -2009,35 +2086,34 @@ maybe_deliver:
     ret
 
 ; Ring-0 flat memcpy for the XMS block MOVE (INT 0xC0 monitor service). The guest
-; driver put dst linear in EDI, src linear in ESI, byte count in ECX (all live in
-; the pushad frame), and enabled A20 first. deliver_exception NULLED ES/DS/FS/GS on
-; the V86->ring0 entry, and a null selector faults a PM memory access, so reload ES
-; to the flat selector (DS is already 0x10 from monitor entry). Reads the three
-; args from the pushad slots (this routine was `call`ed, so +4 for the return addr:
-; guest EDI=[esp+4], ESI=[esp+8], ECX=[esp+28]). The frame is only read, never
-; written, so .done_gp's popad restores the guest's registers afterwards.
+; driver staged src/dst linear + byte count in its resident [xms_mv_*] dwords
+; (the V86 side is 286-clean and cannot pass 32-bit registers) and enabled A20
+; first; read them via FS = driver data (0x20). deliver_exception NULLED
+; ES/DS/FS/GS on the V86->ring0 entry, and a null selector faults a PM memory
+; access, so reload ES to the flat selector (DS is already 0x10 from monitor
+; entry). The frame is untouched, so .done_gp's popad restores the guest.
 flat_memcpy:
     mov ax, 0x10
     mov es, ax                    ; ES = flat (base 0); DS already 0x10
-    mov edi, [esp + 4]            ; guest EDI = dst linear
-    mov esi, [esp + 8]            ; guest ESI = src linear
-    mov ecx, [esp + 28]           ; guest ECX = byte count
+    mov edi, [fs:xms_mv_dst]      ; dst linear
+    mov esi, [fs:xms_mv_src]      ; src linear
+    mov ecx, [fs:xms_mv_len]      ; byte count
     cld                           ; (the REAL A20 gate is forced on at INIT and
     rep movsb                     ; never drops — EMBs above 1 MB never fold)
     ret
 
-; Ring-0 EMS frame remap (INT 0xC0 'PM'). Guest EBX = frame-slot linear base,
-; guest ECX = backing physical base, or 0 to restore the INIT mapping (the
-; UMB-backing bytes the INIT .umb_map loop pointed this window at). Rewrites
-; the slot's 4 PTEs in PT0 and reloads CR3 — the 386 full-TLB-flush idiom.
-; Private, cookie-gated, single caller (ems_remap_slot) validates -> no arg
-; checks. Args from the pushad slots via the call frame: EBX=[esp+20],
-; ECX=[esp+28] (cf. flat_memcpy). DS is already flat 0x10 from monitor entry;
-; FS = 0x20 (driver data) for pd_lin. The frame is only read, so .done_gp's
-; popad restores the guest registers.
+; Ring-0 EMS frame remap (INT 0xC0 'PM'). [ems_rm_lin] = frame-slot linear
+; base, [ems_rm_phys] = backing physical base, or 0 to restore the INIT
+; mapping (the UMB-backing bytes the INIT .umb_map loop pointed this window
+; at) — staged by ems_remap_slot in driver data, read via FS (cf. flat_memcpy;
+; the 286-clean V86 side cannot pass 32-bit registers). Rewrites the slot's 4
+; PTEs in PT0 and reloads CR3 — the 386 full-TLB-flush idiom. Private,
+; cookie-gated, single caller (ems_remap_slot) validates -> no arg checks.
+; DS is already flat 0x10 from monitor entry; FS = 0x20 (driver data) for
+; pd_lin. The frame is untouched, so .done_gp's popad restores the guest.
 frame_remap:
-    mov ebx, [esp+20]             ; guest EBX = slot linear base
-    mov ecx, [esp+28]             ; guest ECX = backing phys (0 = unmap)
+    mov ebx, [fs:ems_rm_lin]      ; slot linear base
+    mov ecx, [fs:ems_rm_phys]     ; backing phys (0 = unmap)
     test ecx, ecx
     jnz .have
     mov ecx, ebx                  ; restore INIT mapping: UMB backing for this lin
