@@ -72,7 +72,12 @@ impl CpuBus for FlatBus {
         Ok(())
     }
 
-    fn read_io(&mut self, _port: u16, _width: BusWidth) -> Result<u32, BusError> {
+    fn read_io(
+        &mut self,
+        _port: u16,
+        _width: BusWidth,
+        _core_clocks_so_far: u64,
+    ) -> Result<u32, BusError> {
         Ok(0)
     }
 

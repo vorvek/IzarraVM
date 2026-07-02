@@ -499,7 +499,19 @@ pub trait CpuBus {
         Ok(())
     }
 
-    fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError>;
+    /// `core_clocks_so_far`: CPU core clocks charged by prior instructions in the
+    /// current straight-line run, NOT including the in-flight instruction issuing
+    /// this read (the batch-break boundary today always falls after an IN's own
+    /// charge, so this matches "now" as any batch break has always meant). Lets a
+    /// future lazy port read compute time-derived device state without ending the
+    /// batch; unused by every implementor until a port switches to the lazy path
+    /// (see dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Slice 0/1).
+    fn read_io(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        core_clocks_so_far: u64,
+    ) -> Result<u32, BusError>;
 
     fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError>;
 
