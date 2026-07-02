@@ -194,6 +194,69 @@ $memExe = Join-Path $memdir 'mem.exe'
 if (-not (Test-Path $memExe)) { throw "mem.exe not produced" }
 Write-Host "MEM.EXE: $((Get-Item $memExe).Length) bytes"
 
+# --- FreeDOS userland: CHOICE, MORE, FIND, LABEL (Open Watcom wcl, native
+# Win64; no owwin/gmake). Same recipe shape as move/sort/mem above: each
+# upstream repo vendors its own kitten (NLS) submodule pin (choice/more/find
+# share commit 62654352; label pins the same kitten as move, 3b9947fc) plus
+# the shared tnyprntf (450ab904, identical bytes to move/tnyprntf) -- see
+# VENDOR.md. Flags mirror the house style already used for move/sort/mem
+# rather than upstream's own build.sh (which targets a Linux/dosemu Watcom
+# layout, e.g. its "-lr" is not a real combined wcl flag on this host).
+$cf4 = @('-bt=DOS','-bcl=DOS','-D__MSDOS__','-zp1','-ms','-oas','-s','-wx','-we','-zq','-fm')
+
+function Build-KittenTool($name, $cfiles) {
+    $dir = Join-Path $fd "$name\src"
+    Push-Location $dir
+    try {
+        & wcl @cf4 -fo=kitten -c ..\kitten\kitten.c
+        if ($LASTEXITCODE) { throw "wcl kitten ($name) failed" }
+        & wcl @cf4 -fo=tnyprntf -c ..\tnyprntf\tnyprntf.c
+        if ($LASTEXITCODE) { throw "wcl tnyprntf ($name) failed" }
+        & wcl @cf4 "-fe=$name" @cfiles kitten.obj tnyprntf.obj
+        if ($LASTEXITCODE) { throw "wcl $name failed" }
+    } finally { Pop-Location }
+    $exe = Join-Path $dir "$name.exe"
+    if (-not (Test-Path $exe)) { throw "$name.exe not produced" }
+    Write-Host "$($name.ToUpper()).EXE: $((Get-Item $exe).Length) bytes"
+}
+
+Build-KittenTool 'choice' @('choice.c')
+Build-KittenTool 'more'   @('more.c')
+Build-KittenTool 'find'   @('find.c', 'find_str.c')
+Build-KittenTool 'label'  @('label.c')
+
+# --- FreeDOS userland: ATTRIB (Open Watcom wcl, native Win64). Upstream ships
+# only a Turbo C build (CC.BAT/TURBOC.CFG, Borland-specific runtime shims in
+# malloc.inc/setvbuf.inc/setupio.inc guarded by #ifdef __BORLANDC__, so those
+# never compile here). Two small Toka-DOS patches make the single source file
+# Watcom-clean (see the "modified by the Toka-DOS project, 2026" comments in
+# ATTRIB.C): an explicit (ATTR) cast on the ~0u init (Turbo C accepted the
+# truncation silently; Watcom's -we does not) and a portable stpcpy()
+# replacement (a GNU libc extension Turbo C's runtime happened to expose but
+# Watcom's DOS target doesn't declare). No kitten/tnyprntf dependency.
+$attribDir = Join-Path $fd 'attrib'
+Push-Location $attribDir
+try {
+    & wcl @cf4 -fe=attrib ATTRIB.C
+    if ($LASTEXITCODE) { throw "wcl attrib failed" }
+} finally { Pop-Location }
+$attribExe = Join-Path $attribDir 'attrib.exe'
+if (-not (Test-Path $attribExe)) { throw "attrib.exe not produced" }
+Write-Host "ATTRIB.EXE: $((Get-Item $attribExe).Length) bytes"
+
+# --- FreeDOS userland: DELTREE (pure NASM, no C toolchain). Upstream's own
+# header comment gives the exact recipe (`NASM DELTREE.S -O DELTREE.COM`); we
+# build the full-featured (non-DEFANGED) variant so DELTREE's /Y switch and
+# interactive Y/N confirmation match real MS-DOS DELTREE behavior, per the
+# project's fidelity policy -- DEFANGED only removes /Y, it doesn't change
+# the default confirmation prompt.
+$deltreeDir = Join-Path $fd 'deltree'
+$deltreeCom = Join-Path $deltreeDir 'deltree.com'
+& nasm (Join-Path $deltreeDir 'deltree.asm') -o $deltreeCom
+if ($LASTEXITCODE) { throw "nasm deltree failed" }
+if (-not (Test-Path $deltreeCom)) { throw "deltree.com not produced" }
+Write-Host "DELTREE.COM: $((Get-Item $deltreeCom).Length) bytes"
+
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 $tokamous = Join-Path $root 'build-freedos-tokamous.com'
 & nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous

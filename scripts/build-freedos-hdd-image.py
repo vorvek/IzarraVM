@@ -198,6 +198,12 @@ def main():
     movedir = os.path.join(repo, "toka-dos", "freedos", "move", "src")
     sortdir = os.path.join(repo, "toka-dos", "freedos", "sort", "src")
     memdir = os.path.join(repo, "toka-dos", "freedos", "mem", "source")
+    attribdir = os.path.join(repo, "toka-dos", "freedos", "attrib")
+    choicedir = os.path.join(repo, "toka-dos", "freedos", "choice", "src")
+    moredir = os.path.join(repo, "toka-dos", "freedos", "more", "src")
+    finddir = os.path.join(repo, "toka-dos", "freedos", "find", "src")
+    labeldir = os.path.join(repo, "toka-dos", "freedos", "label", "src")
+    deltreedir = os.path.join(repo, "toka-dos", "freedos", "deltree")
     out = os.path.join(repo, "crates", "izarravm-firmware", "roms", "tokados-hdd.img")
 
     if os.path.exists(os.path.join(kdir, "bin", "kernel.sys")):
@@ -212,6 +218,12 @@ def main():
         move = open(os.path.join(movedir, "move.exe"), "rb").read()
         sort = open(os.path.join(sortdir, "sort.exe"), "rb").read()
         mem = open(os.path.join(memdir, "mem.exe"), "rb").read()
+        attrib = open(os.path.join(attribdir, "attrib.exe"), "rb").read()
+        choice = open(os.path.join(choicedir, "choice.exe"), "rb").read()
+        more = open(os.path.join(moredir, "more.exe"), "rb").read()
+        find = open(os.path.join(finddir, "find.exe"), "rb").read()
+        label = open(os.path.join(labeldir, "label.exe"), "rb").read()
+        deltree = open(os.path.join(deltreedir, "deltree.com"), "rb").read()
     else:
         # From-image path: source the binaries from the current committed image.
         prev = open(out, "rb").read()
@@ -222,6 +234,12 @@ def main():
         move = prev_files["MOVE.EXE"]
         sort = prev_files["SORT.EXE"]
         mem = prev_files["MEM.EXE"]
+        attrib = prev_files["ATTRIB.EXE"]
+        choice = prev_files["CHOICE.EXE"]
+        more = prev_files["MORE.EXE"]
+        find = prev_files["FIND.EXE"]
+        label = prev_files["LABEL.EXE"]
+        deltree = prev_files["DELTREE.COM"]
         print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
@@ -303,6 +321,13 @@ def main():
         ("MOVE.EXE", move),
         ("SORT.EXE", sort),
         ("MEM.EXE", mem),
+        # Audit items 3+10 external tool batch (see VENDOR.md).
+        ("ATTRIB.EXE", attrib),
+        ("CHOICE.EXE", choice),
+        ("MORE.EXE", more),
+        ("FIND.EXE", find),
+        ("LABEL.EXE", label),
+        ("DELTREE.COM", deltree),
         ("HELLO.TXT", hello_txt),
         ("LICENSE.TXT", license_txt),
     ]
@@ -316,9 +341,17 @@ def main():
             c = start + i
             fat[c] = FAT32_EOC if i == nclu - 1 else c + 1
 
-    # Root directory occupies cluster 2 (one cluster is plenty for 7 entries).
-    fat[ROOT_CLUSTER] = FAT32_EOC
-    next_free = ROOT_CLUSTER + 1
+    # Root directory: reserve enough clusters up front for every file entry
+    # (32 bytes each), THEN allocate file data clusters after it, so the root
+    # chain's own length doesn't shift under file data placed earlier. One
+    # cluster held every file while the payload was small (audit item 10 and
+    # earlier); the audit item 3+10 tool batch grew the root past 16 entries
+    # (this image's cluster size is 1 sector = 512 bytes = 16 dir entries), so
+    # the root directory is now a real multi-cluster chain like any other file.
+    entries_per_cluster = cluster_bytes // 32
+    root_clusters = max(1, -(-len(files) // entries_per_cluster))  # ceil div
+    alloc_chain(ROOT_CLUSTER, root_clusters)
+    next_free = ROOT_CLUSTER + root_clusters
     root = bytearray()
 
     for fn, data in files:
@@ -341,7 +374,12 @@ def main():
         struct.pack_into("<I", de, 0x1C, len(data))               # file size
         root += de
 
-    # Write the root directory into cluster 2.
+    assert len(root) <= root_clusters * cluster_bytes, \
+        f"root directory ({len(root)} bytes) overflows its {root_clusters}-cluster chain"
+
+    # Write the root directory starting at cluster 2. Its clusters
+    # (2 .. 2+root_clusters-1) are contiguous (allocated first, above), so one
+    # write spanning `len(root)` bytes lands correctly across the whole chain.
     root_off = data_off + (ROOT_CLUSTER - ROOT_CLUSTER) * cluster_bytes
     img[root_off:root_off + len(root)] = root
 

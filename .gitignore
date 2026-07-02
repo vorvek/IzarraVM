@@ -50,6 +50,31 @@ toka-dos/freedos/mem/**/*.exe
 toka-dos/freedos/mem/**/*.map
 toka-dos/freedos/mem/**/*.err
 
+# Audit items 3+10 external tool batch build outputs (build-freedos.ps1, Open
+# Watcom wcl for attrib/choice/more/find/label, NASM for deltree), same
+# gitignore pattern as move/sort/mem above.
+toka-dos/freedos/attrib/**/*.obj
+toka-dos/freedos/attrib/**/*.exe
+toka-dos/freedos/attrib/**/*.map
+toka-dos/freedos/attrib/**/*.err
+toka-dos/freedos/choice/**/*.obj
+toka-dos/freedos/choice/**/*.exe
+toka-dos/freedos/choice/**/*.map
+toka-dos/freedos/choice/**/*.err
+toka-dos/freedos/more/**/*.obj
+toka-dos/freedos/more/**/*.exe
+toka-dos/freedos/more/**/*.map
+toka-dos/freedos/more/**/*.err
+toka-dos/freedos/find/**/*.obj
+toka-dos/freedos/find/**/*.exe
+toka-dos/freedos/find/**/*.map
+toka-dos/freedos/find/**/*.err
+toka-dos/freedos/label/**/*.obj
+toka-dos/freedos/label/**/*.exe
+toka-dos/freedos/label/**/*.map
+toka-dos/freedos/label/**/*.err
+toka-dos/freedos/deltree/**/*.com
+
 # TOKAMOUS.COM staged output (build-freedos.ps1). Source is tokamous.asm; only
 # the output binary is gitignored (Task 6 image builder reads this path).
 toka-dos/build-freedos-tokamous.com
