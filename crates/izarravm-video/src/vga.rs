@@ -1231,6 +1231,9 @@ impl Vga {
     /// Set the text character height: CRTC Maximum Scan Line (index 09h) low five
     /// bits = height - 1, reprogramming the renderer's rows-per-character divide.
     /// Used by the INT 10h AH=11h 1x variants that reprogram the scan lines.
+    /// Distinct from the machine's `set_selected_text_scanlines` (AH=12h BL=30h),
+    /// which only records BIOS mode-set policy in the BDA and does not touch
+    /// this CRTC register.
     pub fn set_char_height(&mut self, height: u8) {
         self.crtc.max_scan = u32::from(height.saturating_sub(1));
     }
