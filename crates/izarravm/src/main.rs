@@ -2934,6 +2934,197 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// GSWMODE (coverage audit item 18): a runtime CPU-speed switch guest tool.
+    /// Default V86 boot (TOKAEMM resident, DOS=HIGH,UMB), then AUTOEXEC drives
+    /// `GSWMODE 486` — a downgrade from the default 586 that, unlike 286, keeps
+    /// the CPU at `has_pentium_isa()`-adjacent 386+ ISA (no 32-bit-prefix #UD
+    /// gate; see the 286 test below for why that gate matters). Then `VER` to
+    /// prove DOS still works post-switch, then `GSWMODE 586` to prove switching
+    /// back also works. Driven entirely through AUTOEXEC.BAT bytes (not injected
+    /// keystrokes): the default keyboard layout is European, so scancode
+    /// injection can garble punctuation, and this test needs none of that.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_gswmode_486_switch_survives_v86_monitor() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_gsw486_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nGSWMODE 486\r\nVER\r\nGSWMODE 586\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "GSWMODE.COM".to_string(),
+                        izarravm_firmware::gswmode_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault after the GSWMODE 486 switch while TOKAEMM's ring-0 \
+                 monitor was resident: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            machine.active_mode(),
+            GswMode::Gsw586,
+            "GSWMODE 486 then GSWMODE 586 should leave the machine back at 586 \
+             (stop={stop:?}).\n{text}"
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("switched to 486") && lower.contains("switched to 586"),
+            "GSWMODE confirmation output missing for one of the two switches.\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the GSWMODE 486/VER/GSWMODE 586 sequence \
+             (stop={stop:?}).\n{text}"
+        );
+    }
+
+    /// GSWMODE 286 while TOKAEMM's ring-0 monitor is resident — the risk case
+    /// flagged when this tool was built (coverage audit item 18). CONFIRMED
+    /// NO-GO, root-caused by direct instrumentation (small-step EIP/CS trace);
+    /// `izarravm-cpu` is frozen for this work (another agent owns it), so the
+    /// fix is out of scope here.
+    ///
+    /// Evidence: the fault fires the instruction after `active_mode()` flips to
+    /// `Gsw286`, at EIP=0x0000133B CS=0x0008 (`vec13_entry` — TOKAEMM's shared
+    /// #GP/IRQ5 monitor entry, see roms/dos/tokaemm.asm), `in_v86()`=false (the
+    /// CPU is executing the ring-0 monitor itself, not guest V86 code):
+    /// `general protection fault while loading selector 0x0000`.
+    ///
+    /// Root cause: TOKAEMM's monitor code is 32-bit-default (`vec13_entry` opens
+    /// with `pushad` then `66 B8 10 00 / mov ds, ax` — the `66` operand-size
+    /// prefix is required just to load a 16-bit segment register from 32-bit-
+    /// default code). `crates/izarravm-cpu/src/lib.rs` decode_prefixes rejects
+    /// `0x66`/`0x67` with #UD (vector 6) at the I286 guest level unless the
+    /// fetch address is in the firmware ROM (`cs_in_firmware_rom()`) — and the
+    /// monitor runs from TOKAEMM's own resident memory, not ROM, so it is not
+    /// exempt. Delivering that #UD then faults a second time: TOKAEMM's IDT
+    /// (`roms/dos/tokaemm.asm` around line 1559) only populates gates for
+    /// vector 8 upward (IRQ0..IRQ15); vectors 0-7, including 6, were never
+    /// built, so the CPU reads a zeroed/garbage gate for vector 6 and GP-faults
+    /// loading its null code selector — matching the observed "selector 0x0000".
+    ///
+    /// In short: `set_level` gates 32-bit *guest* ISA on the Lotura mode, but
+    /// TOKAEMM's own 32-bit ring-0 monitor is not exempt the way firmware ROM
+    /// is, and the monitor has no #UD handler to catch the consequence. Fixing
+    /// this needs either an `izarravm-cpu` exemption for ring-0 protected-mode
+    /// monitor code (parallel to `cs_in_firmware_rom`), or an `izarravm-cpu`-side
+    /// policy decision that the guest ISA gate should not apply while
+    /// `is_ring0_protected()` is true, or a TOKAEMM-side fix (build the low
+    /// exception vectors and/or make `vec13_entry` 286-clean) — none of which
+    /// this task should attempt (cpu is frozen; TOKAEMM is SP-4b-owned code
+    /// outside this task's brief).
+    #[test]
+    #[ignore = "NO-GO: TOKAEMM's ring-0 monitor #UDs on the 386-only 0x66 prefix \
+                at the I286 guest level and has no low-vector IDT gates to catch \
+                it (see the doc comment above); needs an izarravm-cpu or TOKAEMM \
+                fix out of this task's scope"]
+    fn tokaemm_gswmode_286_switch_survives_v86_monitor() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_gsw286_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nGSWMODE 286\r\nVER\r\nGSWMODE 586\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "GSWMODE.COM".to_string(),
+                        izarravm_firmware::gswmode_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "CPU fault after the GSWMODE 286 switch while TOKAEMM's ring-0 \
+                 monitor was resident: {msg}\nstop={stop:?}\n{text}"
+            );
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            machine.active_mode(),
+            GswMode::Gsw586,
+            "GSWMODE 286 then GSWMODE 586 should leave the machine back at 586 \
+             (stop={stop:?}).\n{text}"
+        );
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            lower.contains("switched to 286") && lower.contains("switched to 586"),
+            "GSWMODE confirmation output missing for one of the two switches.\n{text}"
+        );
+        assert!(
+            lower.contains("c:\\>"),
+            "no C:\\> prompt after the GSWMODE 286/VER/GSWMODE 586 sequence \
+             (stop={stop:?}).\n{text}"
+        );
+    }
+
     /// SP-4b M4: the PS/2 mouse works under the default V86 boot — a host-injected
     /// wheel detent travels 8042 -> slave IRQ12 -> vector 0x74 -> the monitor's
     /// slave reflect stub -> guest INT 74h -> TOKAMOUS (loaded HIGH) -> INT 33h

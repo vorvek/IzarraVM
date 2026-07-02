@@ -216,9 +216,13 @@ def main():
         print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
-    # TOKAEMM.SYS is a committed binary (built from tokaemm.asm), never extracted.
+    # TOKAEMM.SYS and GSWMODE.COM are committed binaries (built straight from NASM
+    # source by toka-dos/build-freedos.ps1 into the firmware crate), never extracted
+    # from the previous image.
     tokaemm = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokaemm.sys"), "rb").read()
+    gswmode = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). SP-4b M4 defaults: TOKAEMM
     # loads as the memory manager (frameless NOEMS; the system runs in V86 under
@@ -285,6 +289,7 @@ def main():
         ("AUTOEXEC.BAT", autoexec),
         ("TOKAMOUS.COM", tokamous),
         ("TOKAEMM.SYS", tokaemm),
+        ("GSWMODE.COM", gswmode),
         ("HELLO.TXT", hello_txt),
         ("LICENSE.TXT", license_txt),
     ]
