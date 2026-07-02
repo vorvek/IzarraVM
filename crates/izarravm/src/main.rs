@@ -480,8 +480,8 @@ const MICROBENCHES: &[Microbench] = &[
         code: &[
             0xE4, 0x61, // wait: in al, 0x61
             0xA8, 0x10, // test al, 0x10
-            0x74, 0xFB, // jz wait
-            0xEB, 0xF9, // jmp wait
+            0x74, 0xFA, // jz wait (rel8 -6: wait=0, jz ends at 6)
+            0xEB, 0xF8, // jmp wait (rel8 -8: wait=0, jmp ends at 8)
         ],
     },
     Microbench {
