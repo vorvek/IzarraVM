@@ -1475,14 +1475,28 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// continuations instead of paying a full run restart every iteration. The OUT forms
 /// (0xe6/0xe7/0xee/0xef) stay terminators: a write always sets `io_touched` (no lazy write
 /// path exists), so admitting them would end the run right after anyway while widening the
-/// blast radius for no benefit. INS/OUTS stay on `Misc` and are unaffected.
+/// blast radius for no benefit. INS/OUTS stay terminators too.
+///
+/// The same Approximate-class gate also admits the TEST accumulator-immediate forms
+/// (0xa8 TEST AL,imm8; 0xa9 TEST AX/EAX,imm) within `DecodeGroup::Misc`. Their Misc
+/// routing is a decode-classification artifact of the odd opcode neighborhood they share
+/// with the BCD/string/HLT one-offs (see `route_group`'s A14 block), not a semantic
+/// property: they are pure flag-writing ALU ops (AND-for-flags, no write-back), no memory,
+/// no ModRM, no port, no control transfer, and their immediate is fully pre-parsed at
+/// decode -- strictly simpler than the ALU forms `block_straight_line` already admits.
+/// They matter because the canonical vretrace poll idiom is `IN; TEST AL,imm8; Jcc; JMP`:
+/// with IN admitted but TEST still a terminator, every poll iteration ends its run at the
+/// TEST and pays a full run restart, which measured at about the cost of the batch
+/// epilogue the lazy port read had just eliminated (P4a A/B, poll-3da flat at 0.204/0.051).
+/// NO other Misc opcode is admitted: the BCD adjusts, AAM/AAD (#DE path), SALC/XLAT
+/// (memory read), INS/OUTS (port + string), and HLT all stay terminators.
 ///
 /// Gated on `level` (not a runtime bus flag) so the Accurate class (I286/I386) keeps
 /// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
 /// per decode, and `Cpu386::set_level` unconditionally invalidates the decode cache
 /// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded — and this
 /// admission re-resolved — after any level change. There is no stale-entry window where an
-/// I286-level IN could carry an I586-level admission decision forward.
+/// I286-level IN or TEST could carry an I586-level admission decision forward.
 fn block_continuable(
     group: DecodeGroup,
     opcode: u16,
@@ -1505,6 +1519,11 @@ fn block_continuable(
     if group == DecodeGroup::PortIo {
         // Only the IN forms, only in the Approximate class; see the doc comment above.
         return level >= CpuLevel::I486 && matches!(opcode, 0xe4 | 0xe5 | 0xec | 0xed);
+    }
+    if group == DecodeGroup::Misc {
+        // Only TEST AL/AX/EAX,imm, only in the Approximate class; see the doc
+        // comment above. Everything else in the Misc bucket stays a terminator.
+        return level >= CpuLevel::I486 && matches!(opcode, 0xa8 | 0xa9);
     }
     if group != DecodeGroup::ControlFlow {
         return false;
@@ -11713,6 +11732,13 @@ mod tests {
         // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
         // reports the same step-break edge the real bus does.
         io_touched: bool,
+        // When true, `read_io` does NOT set `io_touched`, modeling the machine's
+        // Approximate-class lazy status-port path (MachineBus::read_io's
+        // 3DA/3BA/3C2 arm), so poll-loop chaining across an IN can be exercised
+        // through the CPU alone. Writes still set io_touched (no lazy write path
+        // exists on the machine either). Default false: the classic every-port-
+        // access-breaks behavior.
+        lazy_io_reads: bool,
         // Records the `core_clocks_so_far` value the CPU threaded into the most recent
         // `read_io` call, so tests can assert on it directly (see
         // `core_clocks_so_far_reflects_prior_instructions_not_the_in_flight_one`).
@@ -11726,6 +11752,7 @@ mod tests {
                 trace: BusTrace::default(),
                 pending_irq: None,
                 io_touched: false,
+                lazy_io_reads: false,
                 last_read_io_core_clocks_so_far: None,
             }
         }
@@ -11908,7 +11935,9 @@ mod tests {
             width: BusWidth,
             core_clocks_so_far: u64,
         ) -> Result<u32, BusError> {
-            self.io_touched = true;
+            if !self.lazy_io_reads {
+                self.io_touched = true;
+            }
             self.last_read_io_core_clocks_so_far = Some(core_clocks_so_far);
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoRead,
@@ -12074,6 +12103,110 @@ mod tests {
         assert!(
             outcome.core_clocks > eight_incs_total,
             "the IN's own charge must be included in the run total"
+        );
+    }
+
+    #[test]
+    fn poll_loop_with_test_imm_chains_end_to_end_in_the_approximate_class() {
+        // The canonical vretrace poll idiom: IN; TEST AL,imm8; JZ back; (JMP back,
+        // unreachable here since AL reads 0 so ZF is always set). With 0xa8
+        // admitted alongside the IN forms in the Approximate class, the WHOLE
+        // loop must chain as one run_straight_line call up to the clock cap --
+        // no run restart per iteration. The bus models the machine's lazy
+        // status-port path (lazy_io_reads: reads do not set io_touched), since
+        // chaining across the IN is only reachable when the port read is lazy.
+        let code = [
+            0xEC, // 0: in al, dx (TestBus returns 0 -> AL = 0)
+            0xA8, 0x08, // 1: test al, 0x08 (AL=0 -> ZF set)
+            0x74, 0xFB, // 3: jz -5 -> back to 0 (always taken)
+            0xEB, 0xF9, // 5: jmp -7 -> back to 0 (unreachable, decode fodder only)
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I586);
+        let mut bus = TestBus::with_memory(memory);
+        bus.lazy_io_reads = true;
+        // Warm the decode cache: one single-step per loop instruction (IN, TEST,
+        // JZ -- the JMP is unreachable and irrelevant to the chain).
+        for _ in 0..3 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.registers.eip, 0, "warm-up looped back to the IN");
+        cpu.reset_perf_counters();
+
+        // A finite cap: the loop never exits on its own, so the ONLY clean end
+        // for a fully-chained run is the cap. Big enough for many iterations.
+        let outcome = cpu.run_straight_line(&mut bus, 1_000).unwrap();
+
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.straight_line_runs, 1,
+            "the whole poll loop must chain inside ONE run_straight_line call"
+        );
+        assert_eq!(
+            p.brk_cap, 1,
+            "the run must end on the clock cap, not on a step break or a \
+             non-continuable terminator (brk_step={}, brk_branch={})",
+            p.brk_step, p.brk_decode_or_branch
+        );
+        assert!(
+            p.instructions > 100,
+            "hundreds of poll iterations must fit under the cap once the loop \
+             chains (saw {} instructions)",
+            p.instructions
+        );
+        assert!(
+            bus.last_read_io_core_clocks_so_far.unwrap() > 0,
+            "a late-iteration IN reached as a continuation must see the running \
+             (nonzero) core-clock total, proving the INs chained mid-run"
+        );
+        assert!(
+            u64::from(outcome.core_clocks) >= 1_000,
+            "the chained run must have consumed the whole cap"
+        );
+    }
+
+    #[test]
+    fn poll_loop_test_imm_still_terminates_the_run_in_the_accurate_class() {
+        // The complementary Accurate-class pin: at I386 neither the IN (0xec)
+        // nor the TEST (0xa8) is continuable, so even with the bus's lazy-read
+        // knob on (no io_touched step break at all), the same poll loop must
+        // stop at the first continuation attempt: the run is exactly the one IN,
+        // ended by TEST's non-admission. This is the byte-identical run-shape
+        // guarantee for 286/386.
+        let code = [
+            0xEC, // 0: in al, dx
+            0xA8, 0x08, // 1: test al, 0x08
+            0x74, 0xFB, // 3: jz -5 -> back to 0
+            0xEB, 0xF9, // 5: jmp -7 -> back to 0
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I386);
+        let mut bus = TestBus::with_memory(memory);
+        bus.lazy_io_reads = true;
+        for _ in 0..3 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.registers.eip, 0, "warm-up looped back to the IN");
+        cpu.reset_perf_counters();
+
+        let _ = cpu.run_straight_line(&mut bus, 1_000).unwrap();
+
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.straight_line_runs, 1,
+            "one run_straight_line call was made"
+        );
+        assert_eq!(
+            p.instructions, 1,
+            "the Accurate class must retire exactly the IN and stop at the \
+             non-continuable TEST (no io_touched break was available to end it, \
+             so this pins the admission gate itself)"
+        );
+        assert_eq!(
+            p.brk_decode_or_branch, 1,
+            "the run must end on the continuation-admission check, not a step \
+             break (brk_step={})",
+            p.brk_step
         );
     }
 
