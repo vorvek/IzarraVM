@@ -1494,8 +1494,8 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// Gated on `level` (not a runtime bus flag) so the Accurate class (I286/I386) keeps
 /// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
 /// per decode, and `Cpu386::set_level` unconditionally invalidates the decode cache
-/// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded — and this
-/// admission re-resolved — after any level change. There is no stale-entry window where an
+/// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
+/// admission re-resolved -- after any level change. There is no stale-entry window where an
 /// I286-level IN or TEST could carry an I586-level admission decision forward.
 fn block_continuable(
     group: DecodeGroup,

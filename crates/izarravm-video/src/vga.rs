@@ -1671,6 +1671,11 @@ impl Vga {
     /// and the attribute palette. `counter_line` is the scanline in scan-counter
     /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
     /// doubled mode holds each VRAM row for two scanlines.
+    ///
+    /// A parallel per-pixel implementation exists for the lazy ISR1 mux sampler
+    /// (`graphics_row_geometry` + `active_pixel`); kept in sync by
+    /// `status_mux_single_pixel_sample_matches_the_full_row_render`. Edits to
+    /// this loop's arithmetic must update both.
     pub fn render_active_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         // Line Compare split (CRTC 18h + 07h.4 + 09h.6). The comparison is in
@@ -1783,6 +1788,11 @@ impl Vga {
     /// pel, four pels per plane-offset address) through the shared `pel_pan`,
     /// which also forces it to 0 below the split when AC Mode Control (10h) bit 5
     /// is set.
+    ///
+    /// A parallel per-pixel implementation exists for the lazy ISR1 mux sampler
+    /// (`graphics_row_geometry` + `color256_pixel`); kept in sync by
+    /// `status_mux_single_pixel_sample_matches_the_full_row_render`. Edits to
+    /// this loop's arithmetic must update both.
     pub fn render_256color_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         let below_split = self.below_split(counter_line);
@@ -1854,6 +1864,11 @@ impl Vga {
     /// bit 7 is background intensity instead. In 9-dot mode the 9th pixel column
     /// replicates the 8th for the box-drawing glyphs 0xC0-0xDF (a solid line join)
     /// and is the background otherwise (Abrash, Graphics Programming Black Book).
+    ///
+    /// A parallel per-pixel implementation exists for the lazy ISR1 mux sampler
+    /// (`text_row_scan` + `text_cell_pixels` + `text_pixel`); kept in sync by
+    /// `status_mux_single_pixel_sample_matches_the_full_row_render`. Edits to
+    /// this prologue or cell loop's arithmetic must update both.
     pub fn render_text_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         let cga_text = self.is_cga_text_mode();
