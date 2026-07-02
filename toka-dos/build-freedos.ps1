@@ -171,6 +171,29 @@ $sortExe = Join-Path $sortdir 'sort.exe'
 if (-not (Test-Path $sortExe)) { throw "sort.exe not produced" }
 Write-Host "SORT.EXE: $((Get-Item $sortExe).Length) bytes"
 
+# --- FreeDOS userland: MEM (Open Watcom wcl, native Win64; no owwin/gmake) ---
+# Same recipe shape as move/sort above, but MEM's own source/mkfiles/watcom.mak
+# gives the reference flags: small memory model (-ms; kitten.c has a
+# sizeof(void*)==2 static-assert-style array that only holds under -ms),
+# -oahls -s -wx -we -zq -fm. mem.c #includes mem2.c itself (one translation
+# unit); MEM.EXE separately links its own prf.c (abbreviated printf) and
+# kitten.c (its own catgets-alike, NOT the move/sort kitten -- incompatible
+# APIs) -- no tnyprntf dependency here.
+$memdir = Join-Path $fd 'mem\source'
+$memCf = @('-bt=DOS','-oahls','-s','-wx','-we','-zq','-fm','-ms')
+Push-Location $memdir
+try {
+    & wcl @memCf -fo=prf    -c prf.c
+    if ($LASTEXITCODE) { throw "wcl prf (mem) failed" }
+    & wcl @memCf -fo=kitten -c kitten.c
+    if ($LASTEXITCODE) { throw "wcl kitten (mem) failed" }
+    & wcl @memCf -fe=mem mem.c prf.obj kitten.obj
+    if ($LASTEXITCODE) { throw "wcl mem failed" }
+} finally { Pop-Location }
+$memExe = Join-Path $memdir 'mem.exe'
+if (-not (Test-Path $memExe)) { throw "mem.exe not produced" }
+Write-Host "MEM.EXE: $((Get-Item $memExe).Length) bytes"
+
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 $tokamous = Join-Path $root 'build-freedos-tokamous.com'
 & nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous
