@@ -6,7 +6,7 @@ pub mod distira;
 pub mod font;
 pub mod margo;
 pub mod vga;
-pub use vga::{CGA_FB_SIZE, VGA_PLANAR_SIZE, Vga, VgaRaster};
+pub use vga::{CGA_FB_SIZE, HGC_FB_SIZE, VGA_PLANAR_SIZE, Vga, VgaRaster};
 
 pub use distira::*;
 
@@ -84,6 +84,10 @@ pub enum VideoMode {
     /// CGA graphics: 320x200x4 (modes 04h/05h) or 640x200x2 (mode 06h), the
     /// B800 framebuffer with the classic even/odd scanline interleave.
     Cga,
+    /// Hercules Graphics Card 720x348 monochrome graphics, entered by banging
+    /// ports 3B8h/3BFh directly (there is no INT 10h mode number for it). The
+    /// B0000/B8000 32K page holds a four-way interleaved framebuffer.
+    Hercules,
 }
 
 pub const DAC_ENTRIES: usize = 256;
