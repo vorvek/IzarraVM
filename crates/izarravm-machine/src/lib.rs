@@ -2422,6 +2422,7 @@ impl Machine {
             bus_num_at_batch_start,
             bus_den_at_batch_start,
             pit_clocks_at_batch_start: self.pit_clocks,
+            pit_per_clock_at_batch_start: self.timing.pit_per_clock,
         }
     }
 
@@ -7945,13 +7946,17 @@ impl Machine {
 
         let ch2_before = self.pit.channel_out(2);
         let pit_fraction_before = self.pit_clocks;
-        self.pit_clocks += clocks as f64 * self.timing.pit_per_clock;
-        let whole = self.pit_clocks.floor();
-        self.pit_clocks -= whole;
+        // The one shared fractional-advance formula (`advance_fractional`): the
+        // lazy port 0x61 peek (`MachineBus::elapsed_pit_clocks`) calls the same
+        // function with the same batch-entry carry and pit_per_clock, so its
+        // mid-batch answer floors exactly where this real advance will.
+        let (whole, remainder) =
+            advance_fractional(self.pit_clocks, clocks, self.timing.pit_per_clock);
+        self.pit_clocks = remainder;
         self.speaker_transitions.clear();
         let edges =
             self.pit
-                .tick_recording_out_transitions(whole as u64, 2, &mut self.speaker_transitions);
+                .tick_recording_out_transitions(whole, 2, &mut self.speaker_transitions);
         // Per-edge forwarding, same multi-edge contract as the DSP loop above:
         // N channel-0 edges in one step issue N requests and the PIC's IRR
         // coalesces them into the one interrupt the guest can actually take.
@@ -8663,6 +8668,7 @@ impl Machine {
             let bus_rem_at_batch_start = self.bus_rem;
             let inv_clock_at_batch_start = self.timing.inv_clock;
             let pit_clocks_at_batch_start = self.pit_clocks;
+            let pit_per_clock_at_batch_start = self.timing.pit_per_clock;
             // bus_timing's (num, den), read from the SAME source scale_bus reads
             // from (self.cpu.level()) -- not cpu_level_for_mode(self.active_mode).
             // The two can diverge: the CPU's live level only tracks active_mode
@@ -8817,6 +8823,7 @@ impl Machine {
                     bus_num_at_batch_start,
                     bus_den_at_batch_start,
                     pit_clocks_at_batch_start,
+                    pit_per_clock_at_batch_start,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -9216,9 +9223,18 @@ struct MachineBus<'a> {
     // (never mid-batch), so this snapshot plus the in-batch clock total
     // (identical construction to `predicted_beam`'s) is enough to reproduce
     // exactly the elapsed-PIT-clocks `whole` value the real `advance_devices`
-    // would compute for the same total, via the shared `predict_dots_core`
-    // formula (PIT_INPUT_HZ standing in for the VGA dot-clock rate).
+    // would compute for the same total, via the shared `advance_fractional`
+    // formula.
     pit_clocks_at_batch_start: f64,
+    // The active mode's PIT_INPUT_HZ / clock_hz factor (Machine::timing.
+    // pit_per_clock), copied at bus construction like `inv_clock_at_batch_start`
+    // above and for the same reason (batch-entry-stable, only a Lotura mode
+    // write recomputes TimingFactors). Snapshotted RATHER than recomputed from
+    // PIT_INPUT_HZ and inv_clock: the real `advance_devices` multiplies by this
+    // exact pre-divided f64, and re-deriving it as `PIT_INPUT_HZ as f64 *
+    // inv_clock` is a DIFFERENT factoring whose product floor-diverges from the
+    // real one at the IEEE-f64 level (see `advance_fractional`'s doc comment).
+    pit_per_clock_at_batch_start: f64,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -10231,22 +10247,25 @@ impl MachineBus<'_> {
     /// batch-chaining win in the P4a Task 2.3 A/B, see the microbench report).
     ///
     /// Converts the shared in-batch clock total `T` (`in_batch_clocks`, the same
-    /// T `predicted_beam` peeks with) into elapsed PIT input clocks using the
-    /// EXACT arithmetic `advance_devices` uses to compute its own `whole` value
-    /// from `Machine::pit_clocks` -- `predict_dots_core` with `PIT_INPUT_HZ`
-    /// standing in for the VGA dot-clock rate, `pit_clocks_at_batch_start`
-    /// standing in for `vga_dots_at_batch_start`. `advance_devices` only runs at
-    /// batch end / wake step, never mid-batch, so `pit_clocks_at_batch_start` IS
-    /// the live `pit_clocks` value the real call will start folding T's clocks
-    /// into: no time travel, this predicts exactly what a real `advance_devices`
-    /// at T followed by a read would produce.
+    /// T `predicted_beam` peeks with) into elapsed PIT input clocks by calling
+    /// the SAME `advance_fractional` function the real `advance_devices` PIT
+    /// step calls, with `pit_clocks_at_batch_start` standing in for the live
+    /// accumulator and `pit_per_clock_at_batch_start` for the live rate. NOT
+    /// `predict_dots_core` with PIT_INPUT_HZ standing in for the dot clock:
+    /// that formula's `clocks * rate_hz * inv_clock` factoring floor-diverges
+    /// from the real advance's pre-divided `clocks * pit_per_clock` product at
+    /// the IEEE-f64 level (see `advance_fractional`'s doc comment), which would
+    /// let a lazy read report an OUT level one PIT clock ahead of or behind
+    /// what batch end establishes. `advance_devices` only runs at batch end /
+    /// wake step, never mid-batch, so `pit_clocks_at_batch_start` IS the live
+    /// `pit_clocks` value the real call will start folding T's clocks into: no
+    /// time travel, this predicts exactly what a real `advance_devices` at T
+    /// followed by a read would produce.
     fn elapsed_pit_clocks(&self) -> u64 {
-        let in_batch_clocks = self.in_batch_clocks();
-        let (elapsed_pit_clocks, _remainder) = predict_dots_core(
-            in_batch_clocks,
+        let (elapsed_pit_clocks, _remainder) = advance_fractional(
             self.pit_clocks_at_batch_start,
-            u64::from(PIT_INPUT_HZ),
-            self.inv_clock_at_batch_start,
+            self.in_batch_clocks(),
+            self.pit_per_clock_at_batch_start,
         );
         elapsed_pit_clocks
     }
@@ -10407,6 +10426,27 @@ fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
 /// without re-checking both callers' bit-for-bit tests.
 fn predict_dots_core(clocks: u64, dots_owed: f64, dot_clock_hz: u64, inv_clock: f64) -> (u64, f64) {
     let raw = dots_owed + clocks as f64 * dot_clock_hz as f64 * inv_clock;
+    let whole = raw.floor();
+    (whole as u64, raw - whole)
+}
+
+/// Whole device clocks elapsed for `clocks` CPU clocks at a PRE-COMBINED
+/// per-CPU-clock rate, given the live fractional carry. Pure free function: the
+/// one shared arithmetic core the real `advance_devices` PIT step and
+/// `MachineBus::elapsed_pit_clocks` (the P4a Task 2.3 lazy port 0x61 peek) both
+/// call, so a mid-batch prediction and the later real advance can never diverge
+/// in rounding. NOT interchangeable with `predict_dots_core` above even where
+/// the rates are mathematically equal: that formula multiplies
+/// `clocks * rate_hz as f64 * inv_clock` (two roundings, left-associated),
+/// while the PIT path has always multiplied by the pre-divided
+/// `pit_per_clock = PIT_INPUT_HZ / clock_hz` factor (one rounding) -- the two
+/// factorings floor-diverge at the IEEE-f64 level for reachable (carry, clocks)
+/// pairs, which is exactly the seam this extraction closes. Kept textually
+/// identical to the `advance_devices` arithmetic it was extracted from (carry
+/// plus product, floor, subtract) -- do not "simplify" this without re-checking
+/// both callers' bit-for-bit tests.
+fn advance_fractional(carry: f64, clocks: u64, rate_per_clock: f64) -> (u64, f64) {
+    let raw = carry + clocks as f64 * rate_per_clock;
     let whole = raw.floor();
     (whole as u64, raw - whole)
 }
@@ -19755,6 +19795,90 @@ mod tests {
         });
     }
 
+    #[test]
+    fn lazy_pit_conversion_honors_the_batch_entry_fractional_carry() {
+        // Carry-pinning differential (the Slice 2 review's FIX 2): the sweep test
+        // above passes even with `elapsed_pit_clocks`' carry zeroed, because its
+        // (T, carry) pairs rarely land where the carry decides the floor. This
+        // test CONSTRUCTS such a pair: seed the fractional accumulator near 1.0
+        // on both machines, pick an elapsed-PIT-clock count `k` sitting exactly
+        // on a channel-2 OUT toggle edge, then pick a T whose product crosses
+        // the k-th integer only WITH the carry (floor(carry + T*rate) == k but
+        // floor(0 + T*rate) == k-1). The lazy byte's bit 5 then flips iff the
+        // carry is honored. Mutation-verified: with `elapsed_pit_clocks` passing
+        // 0.0 instead of pit_clocks_at_batch_start this fails; restored, passes.
+        let carry = 0.999_f64;
+        let mut predicted_machine = test_machine();
+        predicted_machine.set_mode(GswMode::Gsw486); // Approximate: the lazy path
+        let mut real_machine = test_machine();
+        real_machine.set_mode(GswMode::Gsw486);
+        for machine in [&mut predicted_machine, &mut real_machine] {
+            with_bus(machine, |bus| {
+                // Channel 2, mode 3 (square wave), divisor 16: OUT toggles every
+                // 8 PIT input clocks, so toggle edges are dense in the probe
+                // range. GATE2 + data enable via port 0x61 bits 0/1.
+                bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
+                bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap();
+                bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
+                bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+            });
+            machine.run_cycles(5_000).unwrap();
+            machine.pit_clocks = carry; // the deliberate batch-entry carry seed
+        }
+        assert_eq!(predicted_machine.pit, real_machine.pit, "identical drive");
+
+        // The smallest elapsed-PIT-clock count sitting on an OUT toggle edge.
+        let k = (1..=64u64)
+            .find(|&k| {
+                predicted_machine.pit.out_after(2, k) != predicted_machine.pit.out_after(2, k - 1)
+            })
+            .expect("a mode-3 divisor-16 counter toggles within 64 input clocks");
+        let out_with_carry = predicted_machine.pit.out_after(2, k).unwrap();
+        let out_without_carry = predicted_machine.pit.out_after(2, k - 1).unwrap();
+        assert_ne!(out_with_carry, out_without_carry, "k is a toggle edge");
+
+        // A core-clock total T whose elapsed-PIT-clock floor lands on k only
+        // WITH the seeded carry, computed with the exact shared formula.
+        let rate = predicted_machine.timing.pit_per_clock;
+        let t = (1..=200_000u64)
+            .find(|&t| {
+                advance_fractional(carry, t, rate).0 == k
+                    && advance_fractional(0.0, t, rate).0 == k - 1
+            })
+            .expect("a carry-deciding T exists (the carry spans ~55 core clocks at 486)");
+
+        let (lazy_value, lazy_elapsed, io_touched) = with_bus(&mut predicted_machine, |bus| {
+            bus.core_clocks_so_far = t;
+            let elapsed = bus.elapsed_pit_clocks();
+            let value = bus.read_io(0x61, BusWidth::Byte, t).unwrap();
+            (value as u8, elapsed, *bus.io_touched)
+        });
+        assert!(!io_touched, "sanity: the lazy path");
+        assert_eq!(
+            lazy_elapsed, k,
+            "the lazy conversion must honor the batch-entry carry: elapsed must \
+             be k (carry crosses the integer), not k-1 (carry dropped)"
+        );
+        assert_eq!(
+            (lazy_value >> 5) & 1,
+            u8::from(out_with_carry),
+            "bit 5 must be the OUT level at k (carry honored), which differs \
+             from the level at k-1 (carry dropped)"
+        );
+
+        // The ground truth: a real advance_devices of the same T, then the
+        // non-lazy composition, must agree with the lazy byte bit for bit.
+        real_machine.advance_devices(t);
+        let real_value = (real_machine.speaker.control_bits() & 0x03)
+            | (u8::from(real_machine.pit.channel_out(1)) << 4)
+            | (u8::from(real_machine.pit.channel_out(2)) << 5);
+        assert_eq!(
+            lazy_value, real_value,
+            "lazy at T == a real advance_devices(T) then read, on the \
+             carry-deciding (T, carry) pair"
+        );
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         // Captured before the struct literal below since video/trace are also
@@ -19821,6 +19945,7 @@ mod tests {
             bus_num_at_batch_start,
             bus_den_at_batch_start,
             pit_clocks_at_batch_start: machine.pit_clocks,
+            pit_per_clock_at_batch_start: machine.timing.pit_per_clock,
         };
         f(&mut bus)
     }
