@@ -5516,7 +5516,12 @@ impl Cpu386 {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                let value = bus.read_io(port, BusWidth::Byte, self.core_clocks_so_far)? as u8;
+                let value = bus.read_io(
+                    port,
+                    BusWidth::Byte,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
             }
@@ -5524,7 +5529,12 @@ impl Cpu386 {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, operand_size.bus_width())?;
-                let value = bus.read_io(port, operand_size.bus_width(), self.core_clocks_so_far)?;
+                let value = bus.read_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
             }
@@ -5532,7 +5542,12 @@ impl Cpu386 {
                 // OUT imm8, AL: byte port output from AL.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
+                bus.write_io(
+                    port,
+                    BusWidth::Byte,
+                    u32::from(self.read_gpr8(0)),
+                    self.is_ring0_protected(),
+                )?;
                 Ok(clocks(10))
             }
             0xe7 => {
@@ -5543,6 +5558,7 @@ impl Cpu386 {
                     port,
                     operand_size.bus_width(),
                     self.read_gpr_sized(0, operand_size),
+                    self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
             }
@@ -5550,7 +5566,12 @@ impl Cpu386 {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                let value = bus.read_io(port, BusWidth::Byte, self.core_clocks_so_far)? as u8;
+                let value = bus.read_io(
+                    port,
+                    BusWidth::Byte,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
             }
@@ -5558,7 +5579,12 @@ impl Cpu386 {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, operand_size.bus_width())?;
-                let value = bus.read_io(port, operand_size.bus_width(), self.core_clocks_so_far)?;
+                let value = bus.read_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
             }
@@ -5566,7 +5592,12 @@ impl Cpu386 {
                 // OUT DX, AL: byte port output addressed by DX.
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
+                bus.write_io(
+                    port,
+                    BusWidth::Byte,
+                    u32::from(self.read_gpr8(0)),
+                    self.is_ring0_protected(),
+                )?;
                 Ok(clocks(10))
             }
             0xef => {
@@ -5577,6 +5608,7 @@ impl Cpu386 {
                     port,
                     operand_size.bus_width(),
                     self.read_gpr_sized(0, operand_size),
+                    self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
             }
@@ -7838,14 +7870,19 @@ impl Cpu386 {
             }
             StringOp::Ins => {
                 // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
-                let value = bus.read_io(self.read_gpr16(2), width, self.core_clocks_so_far)?;
+                let value = bus.read_io(
+                    self.read_gpr16(2),
+                    width,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.write_string_dst(bus, address_size, width, value)?;
                 self.adjust_index_register(7, address_size, bytes);
             }
             StringOp::Outs => {
                 // OUTS: port[DX] <- [DS:SI] (segment overridable).
                 let value = self.read_string_src(bus, prefixes, address_size, width)?;
-                bus.write_io(self.read_gpr16(2), width, value)?;
+                bus.write_io(self.read_gpr16(2), width, value, self.is_ring0_protected())?;
                 self.adjust_index_register(6, address_size, bytes);
             }
         }
@@ -12004,6 +12041,7 @@ mod tests {
             port: u16,
             width: BusWidth,
             core_clocks_so_far: u64,
+            _cpu_is_ring0_pm: bool,
         ) -> Result<u32, BusError> {
             if !self.lazy_io_reads {
                 self.io_touched = true;
@@ -12018,7 +12056,13 @@ mod tests {
             Ok(0)
         }
 
-        fn write_io(&mut self, port: u16, width: BusWidth, _value: u32) -> Result<(), BusError> {
+        fn write_io(
+            &mut self,
+            port: u16,
+            width: BusWidth,
+            _value: u32,
+            _cpu_is_ring0_pm: bool,
+        ) -> Result<(), BusError> {
             self.io_touched = true;
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoWrite,

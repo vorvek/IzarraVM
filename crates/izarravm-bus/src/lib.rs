@@ -508,14 +508,33 @@ pub trait CpuBus {
     /// future lazy port read compute time-derived device state without ending the
     /// batch; unused by every implementor until a port switches to the lazy path
     /// (see dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Slice 0/1).
+    ///
+    /// `cpu_is_ring0_pm`: true when the CPU issuing this access is executing
+    /// ring-0 protected-mode code that is not a V86 task (`Cpu::is_ring0_protected`)
+    /// AT THE INSTANT of this call. Passed as a live per-call argument, not cached
+    /// on the bus, because ring state can change mid-batch: a V86 sensitive-
+    /// instruction #GP delivers into the ring-0 monitor, or the monitor's IRETD
+    /// returns into V86, entirely inside a single `run_straight_line` run (neither
+    /// transition sets `io_touched` or otherwise ends the run), so a value sampled
+    /// once at bus construction would go stale before a later port access in the
+    /// same batch observes it. Every call site already has `&self` in scope
+    /// (mirroring `core_clocks_so_far`), so this is a live read, not new state.
     fn read_io(
         &mut self,
         port: u16,
         width: BusWidth,
         core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError>;
 
-    fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError>;
+    /// `cpu_is_ring0_pm`: see `read_io`'s doc comment. Same live-per-call contract.
+    fn write_io(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        value: u32,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<(), BusError>;
 
     fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError>;
 
