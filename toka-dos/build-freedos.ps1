@@ -22,7 +22,7 @@ $fd    = Join-Path $root 'freedos'
 $kdir  = Join-Path $fd 'kernel'
 $fcdir = Join-Path $fd 'freecom'
 
-# Open Watcom env (mirror toka-dos/build.ps1).
+# Open Watcom env.
 $env:WATCOM  = 'D:\DevTools\OpenWatcom'
 $env:PATH    = "$env:WATCOM\binnt;$env:WATCOM\binw;$env:PATH"
 $env:INCLUDE = "$env:WATCOM\h"
@@ -177,6 +177,15 @@ $tokamous = Join-Path $root 'build-freedos-tokamous.com'
 if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
 Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
+
+# --- GSWMODE (runtime CPU-speed switch via Lotura port 0xE1; committed source
+# lives in the firmware crate alongside the other small DOS .COM fixtures) ---
+$gswmodeSrc = Join-Path $root '..\crates\izarravm-firmware\roms\dos\gswmode.asm'
+$gswmodeOut = Join-Path $root '..\crates\izarravm-firmware\roms\dos\gswmode.com'
+& nasm -f bin $gswmodeSrc -o $gswmodeOut
+if ($LASTEXITCODE) { throw "nasm gswmode failed" }
+if (-not (Test-Path $gswmodeOut)) { throw "GSWMODE not produced" }
+Write-Host "GSWMODE.COM: $((Get-Item $gswmodeOut).Length) bytes"
 
 # --- Assemble the committed image (FAT32 HDD) ---
 & python (Join-Path $root '..\scripts\build-freedos-hdd-image.py')

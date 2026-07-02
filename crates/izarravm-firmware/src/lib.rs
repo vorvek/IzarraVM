@@ -32,6 +32,8 @@ pub const SNDTST_COM: &[u8] = include_bytes!("../roms/dos/sndtst.com");
 pub const SNDTST_COM_SOURCE: &str = include_str!("../roms/dos/sndtst.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
+pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
+pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
 /// The freestanding Dhrystone 2.1 benchmark, built as a small-model DOS .EXE.
@@ -192,6 +194,16 @@ pub fn sndtst_com() -> &'static [u8] {
 /// 41h returns 80h, allocation refused with 87h. Signals 0xA5 / 0xEn.
 pub fn emsnone_com() -> &'static [u8] {
     EMSNONE_COM
+}
+
+/// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at
+/// runtime by writing the Lotura mode register (port 0xE1). `GSWMODE
+/// 286|386|486|586` (case-insensitive) switches; no argument or a bad argument
+/// prints usage plus the current mode (read back from 0xE1) and writes
+/// nothing. Runtime-only: never touches CMOS, so the BIOS boot default is
+/// unaffected. Ships on the Toka-DOS image (see build-freedos-hdd-image.py).
+pub fn gswmode_com() -> &'static [u8] {
+    GSWMODE_COM
 }
 
 /// The SP-4b M3 UMB *mechanism* fixture: drives XMS 10h/11h/12h directly (no
