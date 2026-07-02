@@ -999,8 +999,10 @@ pub struct Cpu386 {
     // new parameter threaded through every intermediate call (fetch_decoded,
     // execute_decoded, execute_port_io_decoded, ...). Set once per instruction at
     // the top of run_straight_line's loop body / cycle_no_interrupt_check; read by
-    // CpuBus::read_io call sites. See dev_docs/2026-07-02-p4a-lazy-port-device-
-    // time-plan.md Task 0.2.
+    // CpuBus::read_io call sites. Zero-initialized by the struct's derive(Default);
+    // a hand-written Default impl must keep it 0 (cycle_no_interrupt_check's
+    // reset-to-0 assumes a fresh CPU starts there). See dev_docs/
+    // 2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.2.
     core_clocks_so_far: u64,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.

@@ -518,10 +518,15 @@ fn microbench_rom(code: &[u8]) -> Vec<u8> {
 /// every GSW mode, for a fixed clock budget each (none of the payloads halts
 /// or exits, so there is nothing to run "to completion"). Prints rt_factor per
 /// mode per pattern in the same columns `run_bench` uses for its guest_ms/
-/// wall_ms/rt_factor fields; banded informationally only via `band_tag` (which
-/// no-ops for a payload name with no reference band, so these rows can never
-/// fail the process -- same policy as the Approximate-class rows in the main
-/// table, per Phase 3 of dev_docs/2026-07-01-cpu-timing-classes-plan.md).
+/// wall_ms/rt_factor fields. Every row carries an ` [info]` marker (the
+/// ` [approx]` suffix precedent): these rows never gate the process exit,
+/// even when read without the section header in view. Banding runs through
+/// `band_tag`, which no-ops for a payload name with no reference band, so no
+/// microbench row can ever fail the run -- same policy as the
+/// Approximate-class rows in the main table, per Phase 3 of
+/// dev_docs/2026-07-01-cpu-timing-classes-plan.md. A row whose run ended on
+/// anything other than the clock budget is tagged ` [early-stop: <reason>]`,
+/// since its rt_factor measured a truncated run.
 fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!();
     println!("=== poll-loop microbench (informational; P4a Task 0.4) ===");
@@ -541,7 +546,7 @@ fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             let mut machine = Machine::new(profile, microbench_rom(bench.code))?;
             machine.set_mode(mode);
             let started = std::time::Instant::now();
-            machine.run_until_halt_or_cycles(MICROBENCH_BUDGET)?;
+            let stop = machine.run_until_halt_or_cycles(MICROBENCH_BUDGET)?;
             let wall = started.elapsed();
             let guest_secs = machine.elapsed_clocks() as f64 / mode.clock_hz() as f64;
             let wall_secs = wall.as_secs_f64();
@@ -550,14 +555,24 @@ fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             } else {
                 0.0
             };
+            // The payloads never halt or exit by design, so the only clean stop
+            // is the clock budget running out. Anything else (an early HLT, a
+            // fault, a stray DOS/test exit) means the row measured a truncated
+            // run and its rt_factor is skewed: mark it visibly so a permanent
+            // fixture can never silently report corrupted numbers.
+            let early_stop = match stop {
+                StopReason::CycleLimit { .. } => String::new(),
+                other => format!(" [early-stop: {other:?}]"),
+            };
             println!(
-                "{:<14} {:<5} {:>10.3} {:>9.3} {:>10.3}{}",
+                "{:<14} {:<5} {:>10.3} {:>9.3} {:>10.3} [info]{}{}",
                 bench.name,
                 mode.canonical_name(),
                 guest_secs * 1000.0,
                 wall_secs * 1000.0,
                 rt,
                 band_tag(bench.name, mode, rt),
+                early_stop,
             );
         }
     }
