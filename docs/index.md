@@ -11,7 +11,5 @@ store shelves.
 See the [README](https://github.com/vorvek/IzarraVM) for build and usage
 instructions. These pages collect the design and reference documentation:
 
-- [Clean-room audio](clean-room-audio.md)
-- [Clean-room DOS](clean-room-dos.md)
 - [VGA core](vga-core/README.md)
 - [Vega programmer's guide](vega/vega-programmers-guide.md)
