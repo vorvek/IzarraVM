@@ -204,6 +204,7 @@ def main():
     finddir = os.path.join(repo, "toka-dos", "freedos", "find", "src")
     labeldir = os.path.join(repo, "toka-dos", "freedos", "label", "src")
     deltreedir = os.path.join(repo, "toka-dos", "freedos", "deltree")
+    xcopydir = os.path.join(repo, "toka-dos", "tools-src", "xcopy")
     out = os.path.join(repo, "crates", "izarravm-firmware", "roms", "tokados-hdd.img")
 
     if os.path.exists(os.path.join(kdir, "bin", "kernel.sys")):
@@ -224,6 +225,7 @@ def main():
         find = open(os.path.join(finddir, "find.exe"), "rb").read()
         label = open(os.path.join(labeldir, "label.exe"), "rb").read()
         deltree = open(os.path.join(deltreedir, "deltree.com"), "rb").read()
+        xcopy = open(os.path.join(xcopydir, "xcopy.exe"), "rb").read()
     else:
         # From-image path: source the binaries from the current committed image.
         prev = open(out, "rb").read()
@@ -240,6 +242,14 @@ def main():
         find = prev_files["FIND.EXE"]
         label = prev_files["LABEL.EXE"]
         deltree = prev_files["DELTREE.COM"]
+        # XCOPY.EXE is a standalone tool-src build (like TOKAEMM.SYS/GSWMODE.COM
+        # below); prefer a freshly-built binary if present, falling back to the
+        # previous image's copy (absent on the first image that ships XCOPY).
+        xcopy_fresh = os.path.join(xcopydir, "xcopy.exe")
+        if os.path.exists(xcopy_fresh):
+            xcopy = open(xcopy_fresh, "rb").read()
+        else:
+            xcopy = prev_files["XCOPY.EXE"]
         print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
@@ -328,6 +338,9 @@ def main():
         ("FIND.EXE", find),
         ("LABEL.EXE", label),
         ("DELTREE.COM", deltree),
+        # Original Toka-DOS project tool (GPL-3, not vendored) -- see
+        # toka-dos/tools-src/README.md and toka-dos/msdos4/VENDOR.md.
+        ("XCOPY.EXE", xcopy),
         ("HELLO.TXT", hello_txt),
         ("LICENSE.TXT", license_txt),
     ]

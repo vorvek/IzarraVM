@@ -75,6 +75,13 @@ toka-dos/freedos/label/**/*.map
 toka-dos/freedos/label/**/*.err
 toka-dos/freedos/deltree/**/*.com
 
+# Original (not vendored) Toka-DOS project tools build outputs
+# (build-freedos.ps1, Open Watcom wcl), same pattern as move/sort/mem above.
+toka-dos/tools-src/**/*.obj
+toka-dos/tools-src/**/*.exe
+toka-dos/tools-src/**/*.map
+toka-dos/tools-src/**/*.err
+
 # TOKAMOUS.COM staged output (build-freedos.ps1). Source is tokamous.asm; only
 # the output binary is gitignored (Task 6 image builder reads this path).
 toka-dos/build-freedos-tokamous.com

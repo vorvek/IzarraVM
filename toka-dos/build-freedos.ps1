@@ -257,6 +257,21 @@ if ($LASTEXITCODE) { throw "nasm deltree failed" }
 if (-not (Test-Path $deltreeCom)) { throw "deltree.com not produced" }
 Write-Host "DELTREE.COM: $((Get-Item $deltreeCom).Length) bytes"
 
+# --- XCOPY (original Toka-DOS project source, GPL-3; not vendored FreeDOS/
+# MS-DOS source -- see toka-dos/tools-src/README.md and
+# toka-dos/msdos4/VENDOR.md for why porting the real MS-DOS 4.0 XCOPY was
+# investigated and rejected). Same wcl recipe shape as the other small C
+# tools above; no kitten/tnyprntf dependency, self-contained single file.
+$xcopyDir = Join-Path $root 'tools-src\xcopy'
+Push-Location $xcopyDir
+try {
+    & wcl @cf4 -fe=xcopy xcopy.c
+    if ($LASTEXITCODE) { throw "wcl xcopy failed" }
+} finally { Pop-Location }
+$xcopyExe = Join-Path $xcopyDir 'xcopy.exe'
+if (-not (Test-Path $xcopyExe)) { throw "xcopy.exe not produced" }
+Write-Host "XCOPY.EXE: $((Get-Item $xcopyExe).Length) bytes"
+
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 $tokamous = Join-Path $root 'build-freedos-tokamous.com'
 & nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous
