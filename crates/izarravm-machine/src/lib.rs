@@ -1414,6 +1414,19 @@ pub struct Machine {
     // Where the unit tester's Snapshot command writes PPM frames, set by the
     // host. None disables snapshots (the command becomes a no-op).
     test_snapshot_path: Option<std::path::PathBuf>,
+    // Test-only observation seam for the batch loop's prior_runs_core_clocks
+    // updates (P4a Slice 1 Task 1.2 review finding 1). One inner Vec per batch
+    // (pushed at batch entry); each element is the value the loop pushed into
+    // `MachineBus::prior_runs_core_clocks` before one `run_straight_line` call.
+    // Compiled out of release builds entirely, so the hot loop pays nothing.
+    #[cfg(test)]
+    test_prior_core_pushes: Vec<Vec<u64>>,
+    // Test-only: the final batch core total (`outcome.core_clocks`, the core
+    // component of the batch-end `step`) per batch, parallel to
+    // `test_prior_core_pushes`. Lets the pin test check every per-run push stayed
+    // within the total that later fed advance_devices.
+    #[cfg(test)]
+    test_batch_core_totals: Vec<u64>,
 }
 
 /// The GUI virtual pointer space the relative-delta synthesis spans: x 0..639,
@@ -1669,6 +1682,10 @@ impl Machine {
             last_abs: (MOUSE_GUEST_CENTER_X, MOUSE_GUEST_CENTER_Y),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
+            #[cfg(test)]
+            test_prior_core_pushes: Vec::new(),
+            #[cfg(test)]
+            test_batch_core_totals: Vec::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -2394,6 +2411,7 @@ impl Machine {
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
             core_clocks_so_far: 0,
+            prior_runs_core_clocks: 0,
             elapsed_clocks_at_batch_start: self.elapsed_clocks,
             vga_dots_at_batch_start: self.vga_dots,
             beam_at_batch_start,
@@ -8649,6 +8667,9 @@ impl Machine {
             // starts at its own default level until the first mode switch. Reading
             // active_mode here would silently mispredict during that window.
             let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
+            // Test seam: open this batch's per-run prior_runs_core_clocks push log.
+            #[cfg(test)]
+            self.test_prior_core_pushes.push(Vec::new());
             // A20 is a machine-layer event the CPU never sees directly, yet toggling it changes
             // which physical bytes back a linear address near the 1 MB wrap. Any A20 write (port
             // 0x92, the 8042, INT 15h, XMS) sets io_touched or is an HLE INT, so it ends this step;
@@ -8730,6 +8751,8 @@ impl Machine {
                     io_touched,
                     device_wrote_memory,
                     direct_map_changed,
+                    #[cfg(test)]
+                    test_prior_core_pushes,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -8780,6 +8803,7 @@ impl Machine {
                     device_wrote_memory,
                     direct_map_changed,
                     core_clocks_so_far: 0,
+                    prior_runs_core_clocks: 0,
                     elapsed_clocks_at_batch_start,
                     vga_dots_at_batch_start,
                     beam_at_batch_start,
@@ -8842,6 +8866,19 @@ impl Machine {
                         // RUN at the edge, and the machine's check below ends the BATCH so the next
                         // batch services the interrupt. Both are needed.
                         let remaining = cap.saturating_sub(u64::from(batch_core));
+                        // Publish the batch-scoped core clocks accumulated so far
+                        // (the interrupt-service charge + every prior run of this
+                        // batch, exactly the core component the batch-end step
+                        // will combine) so a lazy port-read prediction inside the
+                        // coming run can add the RUN-scoped core_clocks_so_far on
+                        // top and see a batch-total that is monotone across run
+                        // boundaries. See MachineBus::prior_runs_core_clocks.
+                        bus.prior_runs_core_clocks = u64::from(batch_core);
+                        #[cfg(test)]
+                        test_prior_core_pushes
+                            .last_mut()
+                            .expect("opened at batch entry")
+                            .push(u64::from(batch_core));
                         match cpu.run_straight_line(&mut bus, remaining) {
                             Ok(o) => {
                                 batch_core = batch_core.saturating_add(o.core_clocks);
@@ -8882,6 +8919,11 @@ impl Machine {
 
             match outcome {
                 Ok(outcome) => {
+                    // Test seam: the final core total the batch-end step consumes,
+                    // parallel to this batch's test_prior_core_pushes entry.
+                    #[cfg(test)]
+                    self.test_batch_core_totals
+                        .push(u64::from(outcome.core_clocks));
                     let bus_clocks = self.trace.elapsed_clocks() - trace_before;
                     // Scale the bus portion per mode (B-T10). core_clocks is already
                     // scaled by the CPU's level_timing; this applies the third lever
@@ -9102,6 +9144,19 @@ struct MachineBus<'a> {
     // device-time-plan.md Task 0.2). Initialized to 0 at bus construction; the
     // first read_io call overwrites it before any arm can observe it.
     core_clocks_so_far: u64,
+    // CPU core clocks accumulated by everything BEFORE the current straight-line
+    // run of this batch: the once-per-batch interrupt-service charge plus every
+    // completed run_straight_line call's core_clocks. `core_clocks_so_far` above
+    // is RUN-scoped (it resets to 0 at the first instruction of every run), but a
+    // batch chains many runs and only the batch total feeds the batch-end `step`;
+    // a prediction that used the run-scoped term alone would silently drop the
+    // earlier runs' core clocks and go non-monotone across run boundaries.
+    // Initialized 0 at batch entry; the batch loop rewrites it with the live
+    // `batch_core` accumulator immediately before each run_straight_line call, so
+    // `prior_runs_core_clocks + core_clocks_so_far` is always the batch-scoped
+    // core total as of the in-flight instruction, mirroring exactly the core
+    // component of the batch-end step (nothing more, nothing less).
+    prior_runs_core_clocks: u64,
     // Five batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
     // Task 1.1: dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Each is a
     // copy of the corresponding live Machine/BusTrace value at the moment this
@@ -9978,17 +10033,24 @@ impl MachineBus<'_> {
     }
 
     /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
-    /// call's `core_clocks_so_far` plus the bus clocks recorded into `trace` since
-    /// batch entry add up to -- WITHOUT mutating any device state (`video`,
-    /// `vga_dots`, `bus_rem` on the owning `Machine` are all untouched). This is
-    /// the P4a Slice 1 lazy port-read peek (dev_docs/2026-07-02-p4a-lazy-port-
-    /// device-time-plan.md Task 1.2); wiring it into `read_io` is Task 1.3.
+    /// batch's accumulated core clocks plus the bus clocks recorded into `trace`
+    /// since batch entry add up to -- WITHOUT mutating any device state (`video`,
+    /// `vga_dots`, `bus_rem` on the owning `Machine` are all untouched; `&self`
+    /// makes that compiler-enforced). This is the P4a Slice 1 lazy port-read peek
+    /// (dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 1.2); wiring
+    /// it into `read_io` is Task 1.3.
     ///
     /// Units combined, matching exactly what the real batch-end step in
     /// `run_until_clock`/`advance_devices` will later consume:
-    /// - `core_clocks_so_far`: CPU core clocks charged by prior instructions of
-    ///   this straight-line run (excludes the in-flight instruction's own
-    ///   charge -- see the `core_clocks_so_far` field doc).
+    /// - the core portion, BATCH-scoped: `prior_runs_core_clocks` (the
+    ///   interrupt-service charge plus every completed straight-line run of this
+    ///   batch, republished by the batch loop before each run) plus
+    ///   `core_clocks_so_far` (the current run's prior instructions, excluding
+    ///   the in-flight instruction's own charge). One batch chains many runs and
+    ///   only the batch total feeds the batch-end step, so the run-scoped term
+    ///   alone would drop earlier runs' core clocks and jump backward at every
+    ///   run boundary; the monotonicity claim below rests on this batch-scoping,
+    ///   not on a port read ending the run.
     /// - the bus portion: `trace.elapsed_clocks() - trace_elapsed_at_batch_start`
     ///   raw bus clocks recorded so far this batch, scaled by the SAME (num, den)
     ///   `bus_timing` ratio and the SAME fractional carry (`bus_rem_at_batch_start`)
@@ -10015,12 +10077,13 @@ impl MachineBus<'_> {
     /// floor/subtract sequence), so a mid-batch peek can never structurally
     /// diverge from what the later real advance will show for the same clocks.
     #[allow(dead_code)] // consumed by Task 1.3
-    fn predicted_beam(&mut self) -> u64 {
+    fn predicted_beam(&self) -> u64 {
         let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
             + self.bus_rem_at_batch_start;
         let scaled_bus_clocks = scaled / u64::from(self.bus_den_at_batch_start);
-        let in_batch_clocks = self.core_clocks_so_far + scaled_bus_clocks;
+        let in_batch_clocks =
+            self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks;
         let (whole_dots, _remainder) = predict_dots_core(
             in_batch_clocks,
             self.vga_dots_at_batch_start,
@@ -18883,10 +18946,11 @@ mod tests {
         machine.run_cycles(5_000).unwrap();
         let expected_beam = machine.video.beam_dots();
         with_bus(&mut machine, |bus| {
-            // core_clocks_so_far defaults to 0 (no read_io call has run yet on this
-            // bus) and trace.elapsed_clocks() at this instant equals
+            // core_clocks_so_far and prior_runs_core_clocks default to 0 (no
+            // read_io call has run yet on this bus, no prior run this batch) and
+            // trace.elapsed_clocks() at this instant equals
             // trace_elapsed_at_batch_start (nothing has been recorded since
-            // construction), so in-batch clocks are zero on both terms.
+            // construction), so in-batch clocks are zero on all terms.
             assert_eq!(
                 bus.predicted_beam(),
                 expected_beam,
@@ -18906,59 +18970,152 @@ mod tests {
         // and compute predicted_beam for a given in-batch clock total; call
         // advance_devices for real on the other with the same total (expressed in
         // the same core+scaled-bus units predicted_beam consumes) and assert the
-        // beam positions agree exactly. Several (core_clocks_so_far, fetch_count)
-        // pairs cover: the trivial zero path, a small in-batch delta that stays
-        // inside one scanline, and a large one that crosses several scanlines and
-        // a frame wrap (position must still agree modulo frame; the real
-        // machine's frame counter may bump, which is expected and not asserted).
-        for core_clocks_so_far in [0u64, 100, 12_345] {
-            for fetch_count in [0u32, 1, 4_096] {
-                let mut predicted_machine = test_machine();
-                predicted_machine.run_cycles(5_000).unwrap();
-                let mut real_machine = test_machine();
-                real_machine.run_cycles(5_000).unwrap();
-                assert_eq!(predicted_machine.vga_dots, real_machine.vga_dots);
-                assert_eq!(predicted_machine.bus_rem, real_machine.bus_rem);
-                assert_eq!(
-                    predicted_machine.video.beam_dots(),
-                    real_machine.video.beam_dots()
-                );
+        // beam positions agree exactly. The sweep covers: the trivial zero path,
+        // small deltas inside one scanline, larger multi-scanline ones, a
+        // 450_000-core case whose dot total exceeds the ~404k-dot frame so the
+        // modulo wrap REALLY happens (asserted below via frames_completed), and
+        // nonzero prior_runs_core_clocks values so the batch-scoped core term
+        // (prior runs of the same batch) is exercised, not just the run-scoped
+        // one. Task 1.3's lazy-read tests will drive the prior-runs seam
+        // end-to-end through read_io; here the field is set directly, paired with
+        // the batch-loop pin test below
+        // (batch_loop_publishes_prior_runs_core_clocks_before_every_run).
+        let mut any_wrap = false;
+        for prior_runs_core_clocks in [0u64, 61, 33_000] {
+            for core_clocks_so_far in [0u64, 100, 12_345, 450_000] {
+                for fetch_count in [0u32, 1, 4_096] {
+                    let mut predicted_machine = test_machine();
+                    predicted_machine.run_cycles(5_000).unwrap();
+                    let mut real_machine = test_machine();
+                    real_machine.run_cycles(5_000).unwrap();
+                    assert_eq!(predicted_machine.vga_dots, real_machine.vga_dots);
+                    assert_eq!(predicted_machine.bus_rem, real_machine.bus_rem);
+                    assert_eq!(
+                        predicted_machine.video.beam_dots(),
+                        real_machine.video.beam_dots()
+                    );
 
-                let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
-                    // Simulate fetch_count bytes' worth of bus traffic having been
-                    // recorded into the trace since batch entry (prior
-                    // instructions of this straight-line run, or this
-                    // instruction's own fetch), at zero wait-states, then read
-                    // back the actual raw clocks the trace charged for it so the
-                    // real-machine side below combines the exact same total (not
-                    // an assumed one) -- record_instruction_fetch_run's per-byte
-                    // cost is an internal BusCycle detail this test must not
-                    // hardcode.
-                    let before = bus.trace.elapsed_clocks();
-                    if fetch_count > 0 {
-                        bus.trace.record_instruction_fetch_run(0, fetch_count, 0);
+                    let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
+                        // Simulate fetch_count bytes' worth of bus traffic having
+                        // been recorded into the trace since batch entry (prior
+                        // instructions of this straight-line run, or this
+                        // instruction's own fetch), at zero wait-states, then read
+                        // back the actual raw clocks the trace charged for it so
+                        // the real-machine side below combines the exact same
+                        // total (not an assumed one) --
+                        // record_instruction_fetch_run's per-byte cost is an
+                        // internal BusCycle detail this test must not hardcode.
+                        let before = bus.trace.elapsed_clocks();
+                        if fetch_count > 0 {
+                            bus.trace.record_instruction_fetch_run(0, fetch_count, 0);
+                        }
+                        let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
+                        bus.prior_runs_core_clocks = prior_runs_core_clocks;
+                        bus.core_clocks_so_far = core_clocks_so_far;
+                        (bus.predicted_beam(), raw_bus_clocks)
+                    });
+
+                    // The real batch-end step (run_until_clock / advance_devices):
+                    // core is the batch total (prior runs + the current run's
+                    // clocks), bus_clocks is what the trace recorded since batch
+                    // entry (mirrored here by raw_bus_clocks), scaled through
+                    // scale_bus's exact carry arithmetic.
+                    let step = prior_runs_core_clocks
+                        + core_clocks_so_far
+                        + real_machine.scale_bus(raw_bus_clocks);
+                    // Compute whether this step wraps the frame, from the same
+                    // pure formula, BEFORE the mutating advance: the prediction
+                    // only claims position, but the wrap cases must be shown to
+                    // really wrap (frames_completed bumps) or the coverage claim
+                    // above is hollow.
+                    let (whole_dots, _) = real_machine.predict_dots(step, real_machine.vga_dots);
+                    let frame = real_machine.video.frame_dots();
+                    let wraps = frame > 0 && real_machine.video.beam_dots() + whole_dots >= frame;
+                    let frames_before = real_machine.video.frames_completed();
+                    real_machine.advance_devices(step);
+
+                    assert_eq!(
+                        predicted,
+                        real_machine.video.beam_dots(),
+                        "predicted_beam(prior={prior_runs_core_clocks}, \
+                         core={core_clocks_so_far}, fetch_count={fetch_count}) must match a \
+                         real advance_devices of the same core+scaled-bus clock total"
+                    );
+                    if wraps {
+                        any_wrap = true;
+                        assert!(
+                            real_machine.video.frames_completed() > frames_before,
+                            "a wrapping step must bump the real machine's frame counter \
+                             (prior={prior_runs_core_clocks}, core={core_clocks_so_far}, \
+                             fetch_count={fetch_count})"
+                        );
                     }
-                    let raw_bus_clocks = bus.trace.elapsed_clocks() - before;
-                    bus.core_clocks_so_far = core_clocks_so_far;
-                    (bus.predicted_beam(), raw_bus_clocks)
-                });
-
-                // The real batch-end step (run_until_clock / advance_devices):
-                // bus_clocks is what the trace recorded since batch entry
-                // (mirrored here by raw_bus_clocks), scaled through scale_bus's
-                // exact carry arithmetic, then summed with the batch's core
-                // clocks.
-                let step = core_clocks_so_far + real_machine.scale_bus(raw_bus_clocks);
-                real_machine.advance_devices(step);
-
-                assert_eq!(
-                    predicted,
-                    real_machine.video.beam_dots(),
-                    "predicted_beam(core={core_clocks_so_far}, fetch_count={fetch_count}) must \
-                     match a real advance_devices of the same core+scaled-bus clock total"
-                );
+                }
             }
         }
+        assert!(
+            any_wrap,
+            "the sweep must include at least one case that crosses a frame boundary, \
+             or the wrap coverage this test claims is not exercised"
+        );
+    }
+
+    #[test]
+    fn batch_loop_publishes_prior_runs_core_clocks_before_every_run() {
+        // Pins the run_until_clock batch loop's prior_runs_core_clocks updates
+        // through the cfg(test) push logs: before every run_straight_line call the
+        // loop must republish the batch-scoped core accumulator (interrupt-service
+        // charge + prior runs) into the bus, so a mid-run lazy prediction sees a
+        // clock total that is monotone across run boundaries and bounded by the
+        // core total the batch-end step later consumes. Nothing reads the field
+        // from read_io yet (Task 1.3 wires that end-to-end); this pins the
+        // loop-update mechanics directly: per batch, pushes are non-decreasing
+        // prefix sums of the final batch core total, they reset at batch entry,
+        // and real ROM execution produces multi-run batches where a later run
+        // observes a NONZERO prior-runs value (the case the run-scoped
+        // core_clocks_so_far alone would get wrong).
+        let mut machine = test_machine();
+        machine.run_cycles(300_000).unwrap();
+        assert_eq!(
+            machine.test_prior_core_pushes.len(),
+            machine.test_batch_core_totals.len(),
+            "one push log and one core total per completed batch"
+        );
+        assert!(
+            !machine.test_prior_core_pushes.is_empty(),
+            "the run must have executed at least one batch"
+        );
+        let mut saw_multi_run_nonzero_prior = false;
+        for (batch, (pushes, total)) in machine
+            .test_prior_core_pushes
+            .iter()
+            .zip(&machine.test_batch_core_totals)
+            .enumerate()
+        {
+            let mut prev = 0u64;
+            for &push in pushes {
+                assert!(
+                    push >= prev,
+                    "batch {batch}: prior_runs_core_clocks pushes must be non-decreasing \
+                     (a later run saw a smaller prior-core total: {push} after {prev})"
+                );
+                assert!(
+                    push <= *total,
+                    "batch {batch}: a push ({push}) exceeded the final batch core total \
+                     ({total}) that fed the batch-end step"
+                );
+                prev = push;
+            }
+            if pushes.len() >= 2 && *pushes.last().unwrap() > 0 {
+                saw_multi_run_nonzero_prior = true;
+            }
+        }
+        assert!(
+            saw_multi_run_nonzero_prior,
+            "the boot run must contain at least one multi-run batch whose later run \
+             saw a nonzero prior-runs core total; if this stops holding, drive the \
+             machine differently rather than weakening the assert"
+        );
     }
 
     // Run one closure against a freshly-borrowed bus over the whole machine.
@@ -19016,6 +19173,7 @@ mod tests {
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,
             core_clocks_so_far: 0,
+            prior_runs_core_clocks: 0,
             elapsed_clocks_at_batch_start: machine.elapsed_clocks,
             vga_dots_at_batch_start: machine.vga_dots,
             beam_at_batch_start,
