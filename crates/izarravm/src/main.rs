@@ -3569,6 +3569,74 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// Regression for the V86 IRET/IOPL gate (vorvek/v86-iret-iopl): TOKAEMM
+    /// virtualizes IF by trapping CLI/STI/PUSHF/POPF/INT n/IRET to the monitor
+    /// and stamping the guest IRET frame's image-IF from its own VIF (often 0 in
+    /// ISR context). If IRET is not IOPL-gated like its siblings, a V86 guest's
+    /// own IRET pops that monitor-stamped image straight into REAL EFLAGS via
+    /// load_flags (no IOPL gating) -- killing real IF inside V86 so interrupts
+    /// never deliver again (this was the Prince of Persia livelock root cause).
+    /// This test samples real IF at several points across a real TOKAEMM boot
+    /// and asserts it is never 0 while the guest is in V86 mode -- the invariant
+    /// that would have caught this whole class of bug. Cheap: reuses the MEM
+    /// harness's boot (LH TOKAMOUS + MEM reaches a prompt in ~200-350M cycles),
+    /// split into small bursts so the sample points fall throughout the run
+    /// rather than only at the very end.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_ifinvariant_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = b"@ECHO OFF\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(&dir, vec![("AUTOEXEC.BAT".to_string(), autoexec)])
+            .expect("mount host folder with overrides");
+
+        const FLAG_IF: u32 = 0x0000_0200;
+        const BURST: u64 = 20_000_000;
+        const BURSTS: u32 = 25; // 500M cycles total, well past the MEM prompt
+
+        let mut saw_v86 = false;
+        let mut stop = StopReason::CycleLimit { requested: 0 };
+        for _ in 0..BURSTS {
+            if matches!(stop, StopReason::CpuError(_)) {
+                break;
+            }
+            stop = machine
+                .run_until_halt_or_cycles(BURST)
+                .expect("machine run");
+            if machine.in_v86() {
+                saw_v86 = true;
+                assert_ne!(
+                    machine.cpu().registers.eflags & FLAG_IF,
+                    0,
+                    "real IF was 0 while the guest was in V86 mode (stop={stop:?})"
+                );
+            }
+        }
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault during the IF-invariant boot: {msg}\n{text}");
+        }
+        assert!(
+            saw_v86,
+            "the boot never entered V86 mode; the invariant was never exercised"
+        );
+    }
+
     /// Audit items 3+10 external tool batch (toka-dos/freedos/VENDOR.md): smoke
     /// tests three of the newly-vendored tools in one boot -- ATTRIB (set +
     /// query the read-only flag), CHOICE (piped default answer), and FIND

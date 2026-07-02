@@ -6258,6 +6258,10 @@ impl Cpu386 {
                 }
             }
             0xcf => {
+                // IRET is IOPL-sensitive in V86 (386 PRM): #GP(0) below IOPL 3, so the
+                // V86 monitor's .iret_op performs the virtualized pop (VIF from the
+                // image, real IF stays 1). Mirrors CLI/STI/PUSHF/POPF.
+                self.check_v86_iopl()?;
                 self.iret(bus, operand_size)?;
                 Ok(clocks(22))
             }
@@ -21993,6 +21997,51 @@ mod tests {
         let mut bus = TestBus::with_memory(memory);
         cpu.cycle(&mut bus).unwrap();
         assert!(!cpu.flag(FLAG_IF), "CLI cleared IF");
+    }
+
+    #[test]
+    fn iret_faults_in_v86_below_iopl3() {
+        // IRET (0xCF) in a V86 task with IOPL 0 traps to the monitor with #GP(0), exactly
+        // like CLI/STI/PUSHF/POPF. This is the TOKAEMM root-cause fix: a V86 guest's IRET
+        // must be IOPL-gated so the monitor can virtualize the flags pop (VIF), instead of
+        // popping a monitor-stamped IF=0 image straight into real EFLAGS.
+        let (mut cpu, memory) = real_mode_cpu(&[0xcf], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM; // IOPL 0
+        let esp_before = cpu.registers.esp();
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 13, .. }));
+        assert_eq!(
+            cpu.registers.esp(),
+            esp_before,
+            "faulted IRET must not pop the stack"
+        );
+    }
+
+    #[test]
+    fn iret_runs_in_v86_at_iopl3() {
+        // With IOPL 3 the V86 task may execute a native 8086-style IRET directly: pop
+        // IP/CS/FLAGS from the stack with no monitor round-trip.
+        let (mut cpu, memory) = real_mode_cpu(&[0xcf], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+        cpu.registers.set_esp(0x20);
+        let mut bus = TestBus::with_memory(memory);
+        // 16-bit IRET frame at SS:0x20 (IP, CS, FLAGS), popped low-to-high.
+        bus.memory[0x20..0x22].copy_from_slice(&0x1234u16.to_le_bytes());
+        bus.memory[0x22..0x24].copy_from_slice(&0x0050u16.to_le_bytes());
+        let popped_flags = (0x2 | FLAG_VM | 0x3000 | FLAG_IF) as u16;
+        bus.memory[0x24..0x26].copy_from_slice(&popped_flags.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.is_v86_mode(), "IRET at IOPL 3 must stay in V86");
+        assert_eq!(cpu.registers.eip, 0x1234);
+        assert_eq!(cpu.registers.cs().selector, 0x0050);
+        assert_eq!(cpu.registers.esp(), 0x26, "IRET must pop all three words");
+        assert!(
+            cpu.flag(FLAG_IF),
+            "native IRET loads IF straight from the popped image"
+        );
     }
 
     // ---- Stack-group golden battery (A4) ----
