@@ -590,9 +590,14 @@ impl Timer {
         if !self.running {
             return false;
         }
-        let total_us = self.accumulated_us + micros_elapsed;
+        // Saturating u64 arithmetic keeps the function total: a narrowing
+        // `steps as u32` would wrap for steps >= 2^32 (~4 days of guest time in
+        // one peek, unreachable under the ~1 ms batch cap, but saturation costs
+        // nothing), and saturation can only ever err toward `true`, which the
+        // sticky-expired semantics make the correct limit answer anyway.
+        let total_us = self.accumulated_us.saturating_add(micros_elapsed);
         let steps = total_us / self.step_us;
-        u32::from(self.count) + steps as u32 > 0xff
+        u64::from(self.count).saturating_add(steps) > 0xff
     }
 }
 

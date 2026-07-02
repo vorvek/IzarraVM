@@ -7777,17 +7777,28 @@ impl Machine {
     /// remainders forward for the OPL timers (microseconds), the PIT counters,
     /// and the Margo blit engine (nanoseconds).
     fn advance_devices(&mut self, clocks: u64) {
-        self.opl_micros += clocks as f64 * self.timing.micros_per_clock;
-        let whole = self.opl_micros.floor();
-        self.opl.advance_micros(whole as u64);
-        self.opl_micros -= whole;
+        // The one shared fractional-advance formula (`advance_fractional`), same
+        // discipline as the PIT block below: the lazy OPL status peek
+        // (`MachineBus::elapsed_opl_micros`) calls the same function with the
+        // same batch-entry carry and micros_per_clock, so its mid-batch answer
+        // floors exactly where this real advance will.
+        let (whole, remainder) =
+            advance_fractional(self.opl_micros, clocks, self.timing.micros_per_clock);
+        self.opl.advance_micros(whole);
+        self.opl_micros = remainder;
 
         // The DSP reset-settle countdown advances with emulated time so a
-        // detection routine's delay loop sees 0xAA become available.
-        self.dsp_micros += clocks as f64 * self.timing.micros_per_clock;
-        let whole = self.dsp_micros.floor();
-        self.dsp.advance_micros(whole);
-        self.dsp_micros -= whole;
+        // detection routine's delay loop sees 0xAA become available. No lazy
+        // twin yet; routed through the shared formula anyway so the last
+        // hand-synchronized copy of its arithmetic is gone. `Dsp::
+        // advance_micros` takes f64, and `whole as f64` reproduces the old
+        // directly-passed `.floor()` value exactly: the u64 round-trip is
+        // lossless for any integral value below 2^53 (~104 days of guest
+        // microseconds in a single advance, unreachable under the batch caps).
+        let (whole, remainder) =
+            advance_fractional(self.dsp_micros, clocks, self.timing.micros_per_clock);
+        self.dsp.advance_micros(whole as f64);
+        self.dsp_micros = remainder;
 
         // DMA playback is clock-driven: accrue DSP sample phases per CPU clock
         // and, for each whole sample, advance the block and buffer the rendered
@@ -10507,11 +10518,13 @@ fn predict_dots_core(clocks: u64, dots_owed: f64, dot_clock_hz: u64, inv_clock: 
 
 /// Whole device clocks elapsed for `clocks` CPU clocks at a PRE-COMBINED
 /// per-CPU-clock rate, given the live fractional carry. Pure free function: the
-/// one shared arithmetic core the real `advance_devices` PIT step and
-/// `MachineBus::elapsed_pit_clocks` (the P4a Task 2.3 lazy port 0x61 peek) both
-/// call, so a mid-batch prediction and the later real advance can never diverge
-/// in rounding. NOT interchangeable with `predict_dots_core` above even where
-/// the rates are mathematically equal: that formula multiplies
+/// one shared arithmetic core every real `advance_devices` fractional block
+/// (PIT, OPL, DSP) and every mid-batch lazy peek (`MachineBus::
+/// elapsed_pit_clocks`, the P4a Task 2.3 lazy port 0x61 read;
+/// `MachineBus::elapsed_opl_micros`, the P4a Slice 3 lazy OPL status read)
+/// calls, so a mid-batch prediction and the later real advance can never
+/// diverge in rounding. NOT interchangeable with `predict_dots_core` above
+/// even where the rates are mathematically equal: that formula multiplies
 /// `clocks * rate_hz as f64 * inv_clock` (two roundings, left-associated),
 /// while the PIT path has always multiplied by the pre-divided
 /// `pit_per_clock = PIT_INPUT_HZ / clock_hz` factor (one rounding) -- the two
@@ -10519,7 +10532,7 @@ fn predict_dots_core(clocks: u64, dots_owed: f64, dot_clock_hz: u64, inv_clock: 
 /// pairs, which is exactly the seam this extraction closes. Kept textually
 /// identical to the `advance_devices` arithmetic it was extracted from (carry
 /// plus product, floor, subtract) -- do not "simplify" this without re-checking
-/// both callers' bit-for-bit tests.
+/// all callers' bit-for-bit tests.
 fn advance_fractional(carry: f64, clocks: u64, rate_per_clock: f64) -> (u64, f64) {
     let raw = carry + clocks as f64 * rate_per_clock;
     let whole = raw.floor();
