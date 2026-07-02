@@ -9994,6 +9994,15 @@ impl CpuBus for MachineBus<'_> {
             // port is the single source of truth). Other bits read 0.
             return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
         }
+        if port == 0x0201 {
+            // Game port with no joystick attached: the four one-shot axis timers
+            // (bits 0-3) have no pots to charge through so they read expired (0),
+            // and the button inputs (bits 4-7) float high (open switches,
+            // active-low) -- the same absent-joystick answer INT 15h AH=84h gives.
+            // A routine joystick probe must see "no joystick", not an
+            // UnsupportedPort fault that halts the machine.
+            return Ok(0xf0);
+        }
         if let Some(value) = self.unittester.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -10117,6 +10126,11 @@ impl CpuBus for MachineBus<'_> {
             // Fast A20 gate: bit 1 drives A20, routed through the 8042 so every A20
             // method agrees. Bit 0 (fast CPU reset) is not modeled.
             self.keyboard.set_a20(value & 0x02 != 0);
+            return Ok(());
+        }
+        if port == 0x0201 {
+            // Game port: an OUT fires the four axis one-shots. With no joystick
+            // they expire immediately, so there is no state to keep.
             return Ok(());
         }
         if port == 0x00e1 {
@@ -13914,6 +13928,19 @@ mod tests {
         assert_eq!(bus.read_io(0x0278, BusWidth::Byte, 0).unwrap(), 0x42);
         // The LPT2 status port reports the always-ready idle byte.
         assert_eq!(bus.read_io(0x0279, BusWidth::Byte, 0).unwrap(), 0xdf);
+    }
+
+    #[test]
+    fn game_port_reports_no_joystick() {
+        // Port 0x201: a routine joystick probe (OUT to fire the one-shots, then
+        // IN) must see the absent-joystick byte -- axis bits 0-3 clear (timers
+        // already expired), button bits 4-7 set (open switches, active-low) --
+        // not an UnsupportedPort fault that halts the machine.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0).unwrap(), 0xf0);
+        bus.write_io(0x0201, BusWidth::Byte, 0xff).unwrap();
+        assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0).unwrap(), 0xf0);
     }
 
     #[test]
