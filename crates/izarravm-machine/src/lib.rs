@@ -19230,20 +19230,23 @@ mod tests {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
         with_bus(&mut machine, |bus| {
-            // First 0x3C0 write: sets index = 0x05, arms the flip-flop to "data".
+            // ONE 0x3C0 write: consumed in the index phase (sets index = 0x05)
+            // and leaves the flip-flop armed in the DATA phase. Exactly one
+            // write, deliberately: `write_attr` toggles the flip-flop on EVERY
+            // write, so a second "re-arm" write would itself consume the data
+            // phase and put the flip-flop back at "index" regardless of whether
+            // the 3DA reset fires -- which would make this test pass even with
+            // the reset deleted (a mutation the spec review actually ran).
             bus.write_io(0x3C0, BusWidth::Byte, 0x05).unwrap();
+            // Reading 0x3C0 returns `attr.index | pas << 5` and does NOT touch
+            // the flip-flop, so this sanity check leaves the data phase armed.
             assert_eq!(
                 bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
                 0x05,
                 "sanity: the index write took effect"
             );
-            // Re-arm to "data" again since the readback above is a read of 0x3C0's
-            // INDEX register (a separate port from the flip-flopped write path),
-            // not a read through the flip-flop itself; write once more so the
-            // flip-flop is definitely in the "data" phase going into the lazy read.
-            bus.write_io(0x3C0, BusWidth::Byte, 0x05).unwrap();
-            // The setup writes above are ordinary (non-lazy) port writes and
-            // unconditionally set io_touched; clear it so the sanity check below
+            // The setup write above is an ordinary (non-lazy) port write and
+            // unconditionally sets io_touched; clear it so the sanity check below
             // observes only the upcoming 3DA read's own effect on the flag.
             *bus.io_touched = false;
 
@@ -19255,9 +19258,14 @@ mod tests {
                 "sanity: this is the lazy path (Approximate class)"
             );
 
-            // A second 0x3C0 write with a DIFFERENT value: if the flip-flop was
-            // correctly reset to "index" by the 3DA read, this sets a NEW index
-            // (0x0A after masking to 5 bits), observable via 0x3C0's read-back.
+            // A second 0x3C0 write with a DIFFERENT value. If the 3DA read reset
+            // the flip-flop to "index", this is an index write (index becomes
+            // 0x0A) and the read-back shows 0x0A. If the reset did NOT fire, the
+            // flip-flop is still in the data phase, so this write lands as DATA
+            // for the stale index 0x05 (palette[5] = 0x0A) and the read-back
+            // still shows 0x05, failing the assertion. Mutation-verified: with
+            // `flip_flop_data = false` deleted from status1_side_effects this
+            // assertion fails; restored, it passes.
             bus.write_io(0x3C0, BusWidth::Byte, 0x0A).unwrap();
             assert_eq!(
                 bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
@@ -19387,6 +19395,25 @@ mod tests {
              run's samples in 50ms of guest time (multiple frames), or the lazy \
              prediction never actually tracked beam motion; saw {toggles} \
              toggles across {samples_taken} samples"
+        );
+        // Upper bound (spec-review hardening): a prediction jittering BACKWARD
+        // across the vretrace edge would inflate the toggle count and still
+        // satisfy toggles > 0, so bound it by the physically possible edge
+        // count. Derivation: the measured window is 50ms of guest time; mode
+        // 13h runs ~70 frames/s, so ~3.5 frames, and the vretrace bit toggles
+        // exactly twice per frame (set at retrace start, clear at its end) =
+        // ~7 toggles. Plus the 50_000-clock warm-up (< 1ms, at most one edge
+        // pair -- the counter accumulates from boot) and +1 from the guest's
+        // 0xFF last-bit sentinel mismatching the first real sample. Total
+        // expected <= ~10; 20 leaves generous slack while still failing on any
+        // per-read jitter (which would produce hundreds of spurious toggles
+        // across >1000 samples).
+        assert!(
+            toggles < 20,
+            "the vretrace bit toggled {toggles} times across {samples_taken} \
+             samples in ~3.5 frames of guest time; more than ~2 per frame (+ \
+             slack) means the lazy prediction is jittering back and forth \
+             across the retrace edge instead of advancing monotonically"
         );
     }
 

@@ -1560,6 +1560,19 @@ impl Vga {
     /// pass a predicted beam position. Recomputes the pixel color live from
     /// current VRAM/register state (`render_*_row` read no cached raster), so
     /// it never depends on `catch_up` having already rendered the given line.
+    ///
+    /// DECISION (lazy reads vs frame-latched state): the sampled pixel depends
+    /// on state latched at frame boundaries -- `crtc.start_address` is latched
+    /// by `finalize_frame` (via the pending-start vretrace latch) and the text
+    /// cursor/attribute blink phase derives from `self.frames`. A lazy read
+    /// whose predicted beam wrapped past a frame boundary the device has not
+    /// actually advanced through yet computes these bits with the PREVIOUS
+    /// frame's latch and blink phase. Accepted as-is, no compensation: the
+    /// divergence is confined to the diagnostic mux bits 4-5 (never the
+    /// vretrace/display-enable bits games poll), it is bounded by the ~1ms
+    /// Approximate-class batch cap (well under a frame), and it has the same
+    /// acceptance shape as the documented dot-clock retroactivity decision on
+    /// the lazy arm in MachineBus::read_io.
     fn video_status_mux_bits(&self, beam: u64) -> u8 {
         if self.is_cga_personality() || !beam_display_enable(&self.crtc, beam) {
             return 0;
@@ -2310,13 +2323,15 @@ impl Vga {
     /// handles exactly 3DA/3BA/3C2, the same three ports `read_port` routes to
     /// `read_status1`/`read_status0`, but computes the returned bits from a
     /// caller-supplied predicted beam (`MachineBus::predicted_beam()`) instead
-    /// of the live `self.beam`. Performs the identical guest-visible side
-    /// effects every read (`status1_side_effects`/`catch_up`) regardless of
-    /// which alias is live, so a poll on the currently-inactive alias (e.g.
-    /// 3BA in a color setup) still gets the side effects but reads back `None`,
-    /// matching `read_port`'s existing `status1_port_selected` gating exactly.
-    /// Returns `None` for any other port (never reached by the caller, which
-    /// dispatches by static port number before calling this).
+    /// of the live `self.beam`. The handled arms perform the identical
+    /// guest-visible side effects a non-lazy read would
+    /// (`status1_side_effects`/`catch_up`). A poll on the currently-inactive
+    /// status1 alias (e.g. 3BA in a color setup) returns `None` and performs
+    /// NO side effects at all, exactly matching `read_port`'s existing
+    /// `status1_port_selected` gating, where the inactive alias never reaches
+    /// `read_status1` either. Also returns `None` for any other port (never
+    /// reached by the caller, which dispatches by static port number before
+    /// calling this).
     pub fn read_status_port_lazy(&mut self, port: u16, beam: u64) -> Option<u8> {
         match port {
             0x3C2 => {

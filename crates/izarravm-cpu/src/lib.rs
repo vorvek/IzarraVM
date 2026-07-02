@@ -12211,6 +12211,58 @@ mod tests {
     }
 
     #[test]
+    fn in_stays_a_run_terminator_not_a_continuation_in_the_accurate_class() {
+        // Pins the IN half of the Approximate-class admission gate, which the
+        // sibling poll-loop test cannot: there the run ends at the TEST before
+        // any continuation attempt ever reaches an IN, so deleting the level
+        // gate from the PortIo arm alone would not fail it (the spec review
+        // proved the earlier Accurate-class test -- a single IN at eip 0,
+        // trivially the run's first instruction -- pinned nothing). Here two
+        // continuable INCs precede the IN: at I386 the run must chain the INCs
+        // and stop at the continuation-admission check BEFORE the IN executes,
+        // observable as read_io never having been called during the run. The
+        // bus's lazy-read knob is on, so no io_touched step break could end the
+        // run in the gate's place. Mutation-verified: with the level gate
+        // removed from the PortIo arm the IN chains and read_io fires, failing
+        // the None assertion; with the gate intact it passes.
+        let code = [0x40, 0x40, 0xec]; // inc ax; inc ax; in al,dx
+        let (mut cpu, memory) = real_mode_cpu(&code, 32);
+        cpu.set_level(CpuLevel::I386);
+        let mut bus = TestBus::with_memory(memory);
+        bus.lazy_io_reads = true;
+        // Warm all three decode-cache lines via single-steps (the IN included,
+        // so its cached `continuable` flag is what gates the measured run).
+        for _ in 0..3 {
+            let _ = cpu.cycle(&mut bus).unwrap();
+        }
+        cpu.registers.eip = 0;
+        cpu.reset_perf_counters();
+        // The warm-up executed the IN once; clear its trace so the assertion
+        // below observes only the measured run.
+        bus.last_read_io_core_clocks_so_far = None;
+
+        let _ = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+        let p = cpu.perf_counters();
+        assert_eq!(
+            p.instructions, 2,
+            "the Accurate class must retire exactly the two INCs and stop at \
+             the non-continuable IN"
+        );
+        assert_eq!(
+            bus.last_read_io_core_clocks_so_far, None,
+            "read_io must NOT have been called: the run stopped BEFORE the IN, \
+             at the continuation-admission check"
+        );
+        assert_eq!(
+            p.brk_decode_or_branch, 1,
+            "the run must end on the continuation-admission check, not a step \
+             break (brk_step={})",
+            p.brk_step
+        );
+    }
+
+    #[test]
     fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation() {
         // Directly pins the mechanism Task 0.2 adds (a Cpu386 field set to
         // run_straight_line's running `total` before every continuation dispatch,
