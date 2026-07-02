@@ -4083,6 +4083,17 @@ DIR DEST\r\n"
             eprintln!("skipping: corpus dir not found at {}", corpus_dir.display());
             return;
         }
+        // FNV-1a over the VGA graphics window (0xA0000) plus a text-window slab
+        // (0xB8000): the framebuffer-progress hash. A change between two slices
+        // means the game drew something new, whatever mode it is in.
+        fn vram_hash(machine: &mut Machine) -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for addr in (0xA0000u32..0xB0000).chain(0xB8000..0xB9000) {
+                h ^= u64::from(machine.read_physical_u8(addr));
+                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            h
+        }
         for (label, mode) in [("486", GswMode::Gsw486), ("586", GswMode::Gsw586)] {
             let profile = MachineProfile {
                 cpu: mode,
@@ -4091,49 +4102,91 @@ DIR DEST\r\n"
             };
             let mut machine =
                 Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+            // Launch the game: PRINCE ADLIB is Prince of Persia's own command
+            // line (ADLIB selects AdLib sound), run from AUTOEXEC so the measured
+            // window is the game's title/attract sequence, not the DOS prompt.
             machine
-                .mount_hdd_folder(corpus_dir)
+                .mount_hdd_folder_with(
+                    corpus_dir,
+                    vec![(
+                        "AUTOEXEC.BAT".to_string(),
+                        b"@ECHO OFF\r\nPRINCE ADLIB\r\n".to_vec(),
+                    )],
+                )
                 .expect("mount corpus folder");
-            // Same guest-seconds budget at every mode (clock_hz differs 486 vs 586),
-            // so the comparison covers the same amount of simulated game time, not
-            // an artifact of one mode's higher clock_hz consuming its cycle budget
-            // faster in wall-guest-time.
-            let guest_seconds_budget = 12.0f64;
-            let budget = (guest_seconds_budget * mode.clock_hz() as f64) as u64;
-            let stop = machine
-                .run_until_halt_or_cycles(budget)
-                .expect("machine run");
-            let perf = machine.cpu().perf_counters();
-            let elapsed = machine.elapsed_clocks();
-            let guest_seconds = elapsed as f64 / mode.clock_hz() as f64;
-            let trips_per_s = perf.monitor_trips_vec13 as f64 / guest_seconds;
-            // Guest architectural clocks are NOT the right lens for the batch-
-            // breaking mechanism this measures: batch splits are a host-dispatch
-            // cost, not a guest-visible timing change (confirmed: identical guest
-            // clock counters before/after the Part 1 fix). straight_line_runs is
-            // the host-side batch/run count (one CPU batch entry may run several
-            // straight_line_runs, but every batch-ending port access -- the vec13
-            // PIC probe's out/in included -- shows up as a brk_step increment), so
-            // brk_step is the direct proxy for "how many times did a port access
-            // end this batch" -- the mechanism the fix targets.
-            let runs_per_s = perf.straight_line_runs as f64 / guest_seconds;
-            let brk_step_per_s = perf.brk_step as f64 / guest_seconds;
-            // brk_step per trip: today (after the fix) this should be near 1 (the
-            // I/O bitmap-denied probe or a genuine guest port access), vs. near 2
-            // before the fix (the PIC OCW3 select write AND the readback each
-            // ending the batch).
-            let brk_step_per_trip = perf.brk_step as f64 / perf.monitor_trips_vec13.max(1) as f64;
-            let frames = machine.video().frames_completed();
-            let fb_rate = frames as f64 / guest_seconds;
-            println!(
-                "cpu={label} stop={stop:?} trips/s={trips_per_s:.1} \
-                 straight_line_runs/s={runs_per_s:.1} brk_step/s={brk_step_per_s:.1} \
-                 brk_step/trip={brk_step_per_trip:.3} \
-                 fb_frames={frames} fb_rate/s={fb_rate:.2} \
-                 monitor_trips={} instructions={} straight_line_runs={} brk_step={} \
-                 elapsed_clocks={elapsed}",
-                perf.monitor_trips_vec13, perf.instructions, perf.straight_line_runs, perf.brk_step,
+            // Phase 1: skip the boot + intro start (BIOS, FreeDOS boot, PRINCE.EXE
+            // load, first title fade-in) so the measured window is steady-state
+            // title/attract animation, not one-time setup. Same guest-seconds at
+            // every mode (clock_hz differs), so both modes measure the same
+            // simulated game time.
+            let intro_skip_s = 10.0f64;
+            let measure_s = 12.0f64;
+            let intro_stop = machine
+                .run_cycles((intro_skip_s * mode.clock_hz() as f64) as u64)
+                .expect("intro skip run");
+            assert!(
+                matches!(intro_stop, StopReason::CycleLimit { .. }),
+                "the game must still be running at the end of the intro skip \
+                 (a halt/fault here means the workload died, e.g. an unmapped \
+                 probe port faulting the VM): {intro_stop:?}\n{}",
+                machine.screen_text().as_text()
             );
+            // Snapshot the cumulative counters at the start of the measured window.
+            let perf0 = machine.cpu().perf_counters().clone();
+            let elapsed0 = machine.elapsed_clocks();
+            let mut hash = vram_hash(&mut machine);
+            let mut fb_changes = 0u64;
+            // Phase 2: the measured window, in 100 slices, hashing the VGA window
+            // after each slice. Wall time brackets ONLY this window.
+            let slices = 100u64;
+            let slice_cycles = (measure_s * mode.clock_hz() as f64) as u64 / slices;
+            let wall0 = std::time::Instant::now();
+            for _ in 0..slices {
+                machine.run_cycles(slice_cycles).expect("measured slice");
+                let next = vram_hash(&mut machine);
+                if next != hash {
+                    fb_changes += 1;
+                    hash = next;
+                }
+            }
+            let wall = wall0.elapsed();
+            let perf1 = machine.cpu().perf_counters().clone();
+            let elapsed1 = machine.elapsed_clocks();
+
+            let elapsed = elapsed1 - elapsed0;
+            let guest_seconds = elapsed as f64 / mode.clock_hz() as f64;
+            let wall_seconds = wall.as_secs_f64();
+            let trips = perf1.monitor_trips_vec13 - perf0.monitor_trips_vec13;
+            let monitor_clocks =
+                perf1.monitor_resident_core_clocks - perf0.monitor_resident_core_clocks;
+            let brk_step = perf1.brk_step - perf0.brk_step;
+            let trips_per_s = trips as f64 / guest_seconds;
+            let monitor_share = monitor_clocks as f64 / elapsed.max(1) as f64;
+            let clocks_per_trip = monitor_clocks as f64 / trips.max(1) as f64;
+            let brk_step_per_trip = brk_step as f64 / trips.max(1) as f64;
+            // Game pace: per guest second it MUST match before/after (guest timing
+            // is unchanged by design); per WALL second is the user-felt pace the
+            // trap tax was suppressing.
+            let fb_per_guest_s = fb_changes as f64 / guest_seconds;
+            let fb_per_wall_s = fb_changes as f64 / wall_seconds;
+            let rt_factor = guest_seconds / wall_seconds;
+            println!(
+                "cpu={label} window={measure_s}s(after {intro_skip_s}s intro) \
+                 trips/s={trips_per_s:.1} monitor_share={monitor_share:.4} \
+                 core_clocks/trip={clocks_per_trip:.1} brk_step/trip={brk_step_per_trip:.3} \
+                 fb_changes={fb_changes} fb/guest_s={fb_per_guest_s:.2} \
+                 fb/wall_s={fb_per_wall_s:.2} wall_ms={:.1} rt_factor={rt_factor:.3} \
+                 trips={trips} monitor_clocks={monitor_clocks} brk_step={brk_step} \
+                 elapsed_clocks={elapsed}",
+                wall_seconds * 1000.0,
+            );
+            if fb_changes == 0 {
+                // The measured window saw no drawing: dump the text screen so the
+                // report can say where the machine actually was.
+                println!("--- screen at window end ---\n{}", {
+                    machine.screen_text().as_text()
+                });
+            }
         }
     }
 }

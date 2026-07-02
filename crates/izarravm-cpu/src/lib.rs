@@ -877,6 +877,15 @@ pub struct PerfCounters {
     /// number of port accesses that ended a batch per trip (was ~2, the vec13
     /// PIC OCW3 select write and its readback; near 0 after the Part 1 fix).
     pub monitor_trips_vec13: u64,
+    /// Guest CORE clocks charged to instructions that retired while
+    /// `is_ring0_protected()` was true: the V86-#GP-entry-to-IRETD-back residency
+    /// in core-clock terms (the just-delivered trap's own exception charge is
+    /// included, since the attribution check runs after the inline
+    /// `deliver_exception`; the IRETD back into V86 lands in the guest bucket, a
+    /// one-instruction undercount per trip). NOTE this is core clocks only: the
+    /// monitor's ISA-priced port-access WAIT states travel through the bus-clock
+    /// trace, not core clocks, and are not in this bucket.
+    pub monitor_resident_core_clocks: u64,
 }
 
 impl PartialEq for PerfCounters {
@@ -2600,6 +2609,10 @@ impl Cpu386 {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += 1;
+        // V86 trap tax residency: see PerfCounters::monitor_resident_core_clocks.
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
         if let Some((group, opcode, form)) = profile_key {
             self.profile
                 .record(group, opcode, form, charged, profile_start);
@@ -2726,6 +2739,13 @@ impl Cpu386 {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     self.perf.instructions += 1;
+                    // V86 trap tax residency: the monitor's own straight-line
+                    // instructions chain through this cached fast tail, not
+                    // finish_instruction, so the residency attribution must
+                    // live here too or the monitor body goes uncounted.
+                    if self.is_ring0_protected() {
+                        self.perf.monitor_resident_core_clocks += charged;
+                    }
                     Ok(CycleOutcome {
                         core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                         halted: outcome.halted,
