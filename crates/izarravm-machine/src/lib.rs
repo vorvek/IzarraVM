@@ -8496,6 +8496,73 @@ impl Machine {
         Some(wake.max(1).min(remaining))
     }
 
+    /// The Approximate-class (486/586) batch cap: CPU clocks until the next due
+    /// device event, instead of the Accurate class's one-DAC-sample lockstep.
+    ///
+    /// Contract. Interrupts are serviced at batch entry and devices advance at
+    /// batch end, so this cap is what bounds Approximate-class IRQ latency:
+    /// - the next PIT channel 0 (IRQ0) or channel 2 (speaker/game timing) OUT
+    ///   rising edge ends the batch at (within a PIT tick of) its instant, so
+    ///   timer-driven cadences hold;
+    /// - the next DSP/WSS/ADPCM block-IRQ edge does the same for audio blocks,
+    ///   which also keeps one guest interrupt per block edge (see the
+    ///   multi-edge contract in advance_devices);
+    /// - a ~1 ms ceiling (clock_hz / 1000) bounds the latency of everything
+    ///   else (a line masked now and unmasked later, a declined estimator);
+    /// - the DAC-sample floor means no batch is ever SHORTER than the Accurate
+    ///   cap: a sub-sample edge estimate degrades to exactly the Accurate
+    ///   class's up-to-one-sample delivery latency instead of shrinking
+    ///   batches, and a degenerate estimator can never stall progress.
+    ///
+    /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
+    /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
+    /// bind every batch below even the Accurate cap and cancel this fast path
+    /// outright. Its OUT is only guest-visible through a port 0x61 read, which
+    /// ends the batch anyway. PIC masking is likewise ignored on purpose: an
+    /// edge on a masked line latches IRR at the same advance either way, so the
+    /// per-batch mask query buys no alignment.
+    ///
+    /// The PIT tick -> CPU clock conversion ignores the pit_clocks fractional
+    /// accumulator (up to one PIT tick of skew) and the audio estimators are
+    /// conservative for 16-bit stereo; both sit inside this class's license
+    /// (results bit-exact, time approximate). Device-time exactness within a
+    /// batch is unchanged: devices see the exact batch clock total, the speaker
+    /// integrates PIT transitions sub-step, and the sample-phase producers emit
+    /// exactly the frames the elapsed clocks call for, whatever the split.
+    fn approx_batch_cap(&self, remaining: u64) -> u64 {
+        let clock_hz = self.active_mode.clock_hz();
+        // The ~1 ms latency ceiling.
+        let mut cap = (clock_hz / 1000).max(1);
+        // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
+        // speaker/GATE timing games poll. (Channel 1: see above.)
+        for channel in [0usize, 2] {
+            if let Some(ticks) = self.pit.clocks_until_out_rise(channel) {
+                let clocks = ((u128::from(ticks) * u128::from(clock_hz))
+                    .div_ceil(u128::from(PIT_INPUT_HZ))) as u64;
+                cap = cap.min(clocks);
+            }
+        }
+        // Next audio block-IRQ edge. The rates mirror the wake estimators in
+        // next_timer_wake: the DSP block counter drains at the raw byte/word
+        // rate (rate_hz), the WSS and ADPCM counters at their frame rates.
+        if let Some(clocks) = self.dsp.clocks_until_next_irq(self.dsp.rate_hz(), clock_hz) {
+            cap = cap.min(clocks);
+        }
+        if self.wss_enabled
+            && let Some(clocks) = self.wss.clocks_until_next_irq(self.wss.rate_hz(), clock_hz)
+        {
+            cap = cap.min(clocks);
+        }
+        if self.adpcm_enabled
+            && let Some(clocks) = self
+                .yamaha_adpcm
+                .clocks_until_next_irq(self.yamaha_adpcm.output_frame_rate(), clock_hz)
+        {
+            cap = cap.min(clocks);
+        }
+        cap.max(self.timing.clocks_per_audio_sample).min(remaining)
+    }
+
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
         let deadline = self.elapsed_clocks.saturating_add(cycles);
         self.run_until_clock(deadline, cycles)
@@ -8537,16 +8604,31 @@ impl Machine {
             // invalidate its prefetch + decode cache before the next batch runs.
             let a20_before = self.keyboard.a20_enabled();
             // Run a batch of straight-line instructions against one MachineBus,
-            // then service devices once. The cap holds the batch to at most one
-            // DAC sample of CPU time so the per-clock fine-samplers stay exact; a
-            // port access, an HLE INT, a HLT, or a fault ends it sooner. This is
-            // the global-TSC / event-batched model (research item 2.3): it drops
-            // the per-instruction bus rebuild + 14-device fan-out that dominated
-            // the old loop, and is the prerequisite for the recompiler (item 2.2).
-            let cap = self
-                .timing
-                .clocks_per_audio_sample
-                .min(deadline - self.elapsed_clocks);
+            // then service devices once; a port access, an HLE INT, a HLT, or a
+            // fault ends the batch sooner. This is the global-TSC / event-batched
+            // model (research item 2.3): it drops the per-instruction bus rebuild
+            // + 14-device fan-out that dominated the old loop.
+            //
+            // The batch cap is per timing class:
+            // - Accurate (286/386): exactly one DAC sample of CPU time, so the
+            //   per-clock fine-samplers stay in lockstep. BYTE-IDENTICAL
+            //   contract (bench cyc/iter + aux, boot suite, device cadence):
+            //   do not touch.
+            // - Approximate (486/586): up to the next due device event, bounded
+            //   by a ~1 ms latency ceiling and floored at the DAC-sample cap;
+            //   approx_batch_cap holds the full contract. Batch splits move the
+            //   f64 device accumulators through different partial sums, so
+            //   device event instants may microshift against the Accurate
+            //   splitting; that is licensed in this class (results stay
+            //   bit-exact, time is approximate; see TimingClass). Computed once
+            //   per batch entry: the run loop sits on a measured code-layout
+            //   cliff, so nothing here may run per instruction.
+            let remaining = deadline - self.elapsed_clocks;
+            let cap = if matches!(self.active_mode.timing_class(), TimingClass::Approximate) {
+                self.approx_batch_cap(remaining)
+            } else {
+                self.timing.clocks_per_audio_sample.min(remaining)
+            };
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -8650,8 +8732,9 @@ impl Machine {
                 // service step (device advance, CD stall, pending INT/mode/Toka/
                 // unittester, console flush, HLT fast-forward) is unchanged:
                 // core_clocks is the batch sum, halted is set iff the batch ended
-                // on a HLT. core_clocks can't overflow u32 (cap is ~one audio
-                // sample, a few thousand clocks at most).
+                // on a HLT. core_clocks can't overflow u32 (the cap is at most
+                // ~1 ms of guest clocks in the Approximate class, a few hundred
+                // thousand at 586).
                 let mut batch_core = 0u32;
                 let mut halted = false;
                 let mut fault = None;
@@ -17844,6 +17927,123 @@ mod tests {
         assert!(
             machine.pic.irr_bit(0),
             "channel-0 edges latched IRQ0 within the multi-period step"
+        );
+    }
+
+    #[test]
+    fn approx_batch_cap_tracks_the_next_device_event() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        let clock_hz = machine.active_mode().clock_hz();
+        let ceiling = clock_hz / 1000;
+        let floor = machine.timing.clocks_per_audio_sample;
+
+        // Nothing scheduled: the ~1 ms latency ceiling binds. The always-running
+        // channel-1 refresh heartbeat (mode 2, reload 18, ~15 us) must NOT
+        // bind, or this cap could never exceed the Accurate DAC-sample cap.
+        assert_eq!(machine.approx_batch_cap(u64::MAX), ceiling);
+
+        // The remaining-deadline clamp wins when nearer.
+        assert_eq!(machine.approx_batch_cap(123), 123);
+
+        // A running channel-0 (IRQ0) counter binds the cap to its next OUT rise.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x34).unwrap(); // ch0 mode 2
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x04).unwrap(); // reload 0x0400
+        });
+        let ticks = machine.pit.clocks_until_out_rise(0).unwrap();
+        let expected =
+            ((u128::from(ticks) * u128::from(clock_hz)).div_ceil(u128::from(PIT_INPUT_HZ))) as u64;
+        assert!(expected < ceiling && expected > floor);
+        assert_eq!(machine.approx_batch_cap(u64::MAX), expected);
+
+        // A sub-sample edge floors at the DAC-sample cap: an Approximate batch
+        // is never SHORTER than an Accurate one.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x40, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap(); // reload 8 (~7 us)
+        });
+        assert_eq!(machine.approx_batch_cap(u64::MAX), floor);
+    }
+
+    #[test]
+    fn approx_batch_cap_ends_at_the_next_dsp_block_edge() {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw586);
+        let clock_hz = machine.active_mode().clock_hz();
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // The 16-frame 8-bit single-cycle golden: at 11025 Hz the half edge
+            // (8 frames, ~726 us) is the next due event, under the ~1 ms
+            // ceiling and above the DAC-sample floor.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let expected = machine
+            .dsp
+            .clocks_until_next_irq(machine.dsp.rate_hz(), clock_hz)
+            .unwrap();
+        assert!(expected < clock_hz / 1000, "half edge under the ceiling");
+        assert!(expected > machine.timing.clocks_per_audio_sample);
+        assert_eq!(machine.approx_batch_cap(u64::MAX), expected);
+    }
+
+    #[test]
+    fn approximate_class_delivers_pit_irq0_during_long_compute_stretches() {
+        // P4c end to end: in the Approximate class a guest that computes for
+        // many milliseconds without any port I/O still sees IRQ0 at the
+        // programmed cadence. Each edge is requested by advance_devices in the
+        // batch that spans it, the cap ends that batch at (about) the edge
+        // instant, and the next batch entry services the interrupt.
+        let code = [
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x00, 0x70, 0x00, 0x00, // mov word [0x7000], 0
+            0xB0, 0x11, 0xE6, 0x20, // ICW1
+            0xB0, 0x08, 0xE6, 0x21, // ICW2: vector base 0x08
+            0xB0, 0x04, 0xE6, 0x21, // ICW3
+            0xB0, 0x01, 0xE6, 0x21, // ICW4
+            0xB0, 0x00, 0xE6, 0x21, // unmask all lines
+            0xB0, 0x34, 0xE6, 0x43, // PIT ch0 mode 2, LSB/MSB
+            0xB0, 0x00, 0xE6, 0x40, // reload low 0x00
+            0xB0, 0x10, 0xE6, 0x40, // reload high 0x10 -> 4096 ticks (~3.43 ms)
+            0xFB, // sti
+            0xEB, 0xFE, // jmp $ (pure compute, no port I/O)
+        ];
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&code),
+        )
+        .unwrap();
+        machine.set_mode(GswMode::Gsw586); // Approximate class, 200 MHz
+        // IRQ0 handler at 0x0700: inc word [0x7000]; mov al,0x20; out 0x20,al; iret.
+        let handler: [u8; 9] = [0xff, 0x06, 0x00, 0x70, 0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x08] (IRQ0 at PIC base 0x08) -> 0000:0700.
+        machine.write_physical_u8(0x20, 0x00);
+        machine.write_physical_u8(0x21, 0x07);
+        machine.write_physical_u8(0x22, 0x00);
+        machine.write_physical_u8(0x23, 0x00);
+        // ~20 periods of 4096 PIT ticks at 200 MHz (~686.6k clocks each).
+        machine.run_cycles(14_000_000).unwrap();
+        let ticks = u16::from(machine.read_physical_u8(0x7000))
+            | (u16::from(machine.read_physical_u8(0x7001)) << 8);
+        assert!(
+            (15..=22).contains(&ticks),
+            "expected ~20 IRQ0 ticks across the compute stretch, saw {ticks}"
         );
     }
 

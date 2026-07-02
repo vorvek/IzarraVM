@@ -115,6 +115,110 @@ impl Counter {
         }
     }
 
+    /// Input CLK pulses until this counter's next OUT rising edge, or None
+    /// when no rise can occur without new guest input (inactive, awaiting a
+    /// GATE trigger, paused by a low GATE, an OUT that never rises again, or a
+    /// degenerate count). Derived analytically from the same mode equations
+    /// step_counting walks, so a caller can afford it once per CPU batch (the
+    /// clone-and-step clocks_until_channel0_irq costs up to 65537 steps); the
+    /// differential test pins this function to that simulation. BCD counters
+    /// return a conservative None: no PC software clocks the PIT in BCD, and a
+    /// None only relaxes the caller's batch cap (the edges themselves are
+    /// counted exactly by tick_recording_out_transitions either way).
+    fn clocks_until_out_rise(&self) -> Option<u64> {
+        if self.bcd {
+            return None;
+        }
+        match self.state {
+            CounterState::Inactive | CounterState::WaitGate => None,
+            // The pending count loads on the next CLK (one step, no edge) and
+            // counting starts from the reload value. A low GATE still loads but
+            // then pauses, and only guest port I/O can raise it again.
+            CounterState::LoadDelay => {
+                if !self.gate {
+                    return None;
+                }
+                self.rise_from(self.effective_reload())
+                    .map(|steps| steps + 1)
+            }
+            CounterState::Counting => {
+                if !self.gate {
+                    return None;
+                }
+                self.rise_from(self.count)
+            }
+        }
+    }
+
+    /// CLKs until the next OUT rising edge counting from `value` at the current
+    /// OUT level, per the step_counting mode equations (binary radix, GATE
+    /// high, already counting).
+    fn rise_from(&self, value: u32) -> Option<u64> {
+        let v = u64::from(value);
+        let reload = u64::from(self.effective_reload());
+        match self.mode {
+            // Modes 0/1: OUT rises once, when the count reaches zero. A high
+            // OUT never rises again (mode 0 keeps counting with OUT high; a
+            // mode-1 pulse ends by going Inactive).
+            0 | 1 => {
+                if self.out || v == 0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+            2 => {
+                if !self.out {
+                    // OUT is low for exactly the count==1 clock; the next CLK
+                    // reloads and rises.
+                    Some(1)
+                } else if v >= 2 {
+                    // The count reaches 1 (OUT drops) after v-1 CLKs; one more
+                    // reloads and rises.
+                    Some(v)
+                } else if reload >= 2 {
+                    // Out-of-spec count <= 1 with OUT high: the next CLK
+                    // reloads without an edge, then a full period runs.
+                    Some(1 + reload)
+                } else {
+                    // Illegal reload 1: every CLK reloads, OUT never drops.
+                    None
+                }
+            }
+            3 => {
+                if self.out {
+                    Some(Self::mode3_half(v, true) + Self::mode3_half(reload, false))
+                } else {
+                    Some(Self::mode3_half(v, false))
+                }
+            }
+            // Modes 4/5: count down with OUT high, strobe low for one CLK at
+            // terminal, rise on the CLK after.
+            4 | 5 => {
+                if !self.out {
+                    Some(1)
+                } else if v == 0 {
+                    None
+                } else {
+                    Some(v + 1)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Mode 3: CLKs until OUT toggles, counting from `value` in the half-cycle
+    /// whose OUT level is `out`. The counting element steps by two, with an odd
+    /// count trimmed on the first CLK of the half (by one with OUT high, by
+    /// three with OUT low), so an odd period splits (N+1)/2 high, (N-1)/2 low.
+    fn mode3_half(value: u64, out: bool) -> u64 {
+        if value % 2 == 0 || !out {
+            (value / 2).max(1)
+        } else {
+            value.div_ceil(2)
+        }
+    }
+
     fn write_control(&mut self, value: u8) {
         let rw_field = (value >> 4) & 0x3;
         if rw_field == 0 {
@@ -516,6 +620,16 @@ impl Pit {
         (1..=65537u64).find(|&_clocks| probe.step())
     }
 
+    /// Input CLK pulses until `channel`'s next OUT rising edge, or None when it
+    /// cannot rise without new guest input. Analytic (O(1)); used by the
+    /// Approximate-class batch cap once per CPU batch. Out-of-range channels
+    /// report None.
+    pub(crate) fn clocks_until_out_rise(&self, channel: usize) -> Option<u64> {
+        self.counters
+            .get(channel)
+            .and_then(|counter| counter.clocks_until_out_rise())
+    }
+
     pub(crate) fn set_gate(&mut self, channel: usize, level: bool) {
         if let Some(counter) = self.counters.get_mut(channel) {
             counter.set_gate(level);
@@ -613,6 +727,113 @@ mod tests {
             assert!(pit.clocks_until_channel0_irq().is_some());
             assert_eq!(pit.tick(6), 1); // one strobe/edge then done
             assert_eq!(pit.tick(1000), 0);
+        }
+    }
+
+    /// Brute-force oracle for the analytic clocks_until_out_rise: clone and
+    /// step until the next OUT rising edge. Scans slightly past the longest
+    /// real distance (mode 4 in LoadDelay with the full-range reload: the load
+    /// CLK + 65536 counts + the strobe-return CLK = 65538), so unlike the
+    /// production clocks_until_channel0_irq (whose 65537 cap conservatively
+    /// declines that one corner) the oracle sees every edge the counter fires.
+    fn simulated_rise(counter: &Counter) -> Option<u64> {
+        let mut probe = counter.clone();
+        (1..=65539u64).find(|&_clocks| probe.step())
+    }
+
+    #[test]
+    fn analytic_out_rise_matches_the_step_simulation_across_modes_and_phases() {
+        // Every mode x a spread of reloads x every phase across two-plus
+        // periods (capped for the full-range reloads to keep the oracle
+        // affordable), walked through the real tick path so both OUT phases
+        // and the post-reload states are visited.
+        for mode in 0..=5u8 {
+            for reload in [2u16, 3, 4, 5, 7, 18, 100, 101, 255, 0] {
+                let mut pit = Pit::default();
+                pit.write_port(0x43, 0x30 | (mode << 1));
+                if matches!(mode, 1 | 5) {
+                    pit.set_gate(0, false); // arm the trigger edge below
+                }
+                pit.write_port(0x40, (reload & 0xff) as u8);
+                pit.write_port(0x40, (reload >> 8) as u8);
+                if matches!(mode, 1 | 5) {
+                    pit.set_gate(0, true); // rising edge starts the one-shot
+                }
+                let phases = if reload == 0 {
+                    8
+                } else {
+                    (2 * u64::from(reload) + 6).min(300)
+                };
+                for phase in 0..phases {
+                    assert_eq!(
+                        pit.counters[0].clocks_until_out_rise(),
+                        simulated_rise(&pit.counters[0]),
+                        "mode {mode} reload {reload} phase {phase}"
+                    );
+                    pit.tick(1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn analytic_out_rise_is_none_while_gate_pauses_or_arms() {
+        // GATE low pauses counting (all modes in this model): no rise without
+        // guest input, so the analytic reports None, agreeing with the oracle.
+        for mode in [0u8, 2, 3, 4] {
+            let mut pit = Pit::default();
+            pit.write_port(0x43, 0x30 | (mode << 1));
+            pit.write_port(0x40, 50);
+            pit.write_port(0x40, 0);
+            pit.tick(5);
+            pit.set_gate(0, false);
+            assert_eq!(
+                pit.counters[0].clocks_until_out_rise(),
+                None,
+                "mode {mode} paused"
+            );
+            assert_eq!(simulated_rise(&pit.counters[0]), None, "mode {mode} oracle");
+        }
+        // Modes 1/5 armed but never triggered: None until the GATE rising edge.
+        for mode in [1u8, 5] {
+            let mut pit = Pit::default();
+            pit.write_port(0x43, 0x30 | (mode << 1));
+            pit.write_port(0x40, 50);
+            pit.write_port(0x40, 0);
+            pit.tick(1);
+            assert_eq!(
+                pit.counters[0].clocks_until_out_rise(),
+                None,
+                "mode {mode} awaiting trigger"
+            );
+        }
+    }
+
+    #[test]
+    fn analytic_out_rise_declines_bcd_counters() {
+        // BCD is declined by design (a conservative None relaxes the batch cap;
+        // the edge itself still fires through the tick path).
+        let mut pit = Pit::default();
+        pit.write_port(0x43, CW_MODE2 | 1); // ch0 mode 2, BCD
+        pit.write_port(0x40, 0x50);
+        pit.write_port(0x40, 0x00);
+        pit.tick(1);
+        assert_eq!(pit.counters[0].clocks_until_out_rise(), None);
+        assert!(simulated_rise(&pit.counters[0]).is_some());
+    }
+
+    #[test]
+    fn analytic_out_rise_agrees_with_the_channel0_hlt_oracle() {
+        // Channel-0 states must agree with clocks_until_channel0_irq (the HLT
+        // fast-forward's clone-and-step estimator), pinning the two together.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE2, 100);
+        for _ in 0..250 {
+            assert_eq!(
+                pit.counters[0].clocks_until_out_rise(),
+                pit.clocks_until_channel0_irq()
+            );
+            pit.tick(1);
         }
     }
 
