@@ -2338,6 +2338,10 @@ impl Machine {
     }
 
     fn make_bus(&mut self) -> MachineBus<'_> {
+        // Captured before the struct literal below since video/trace are also
+        // mutably borrowed by other fields in that same literal.
+        let beam_at_batch_start = self.video.beam_dots();
+        let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
         MachineBus {
             memory: &mut self.memory,
             ram_lookup: &mut self.ram_lookup,
@@ -2386,6 +2390,11 @@ impl Machine {
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
             core_clocks_so_far: 0,
+            elapsed_clocks_at_batch_start: self.elapsed_clocks,
+            vga_dots_at_batch_start: self.vga_dots,
+            beam_at_batch_start,
+            trace_elapsed_at_batch_start,
+            bus_rem_at_batch_start: self.bus_rem,
         }
     }
 
@@ -8613,6 +8622,15 @@ impl Machine {
             self.io_touched = false;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
+            // Batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
+            // Task 1.1). Captured here, before the fields below are moved into the
+            // destructure, so they reflect live machine state at the moment this
+            // batch's MachineBus is built (the one that matters for Slice 1).
+            let elapsed_clocks_at_batch_start = self.elapsed_clocks;
+            let vga_dots_at_batch_start = self.vga_dots;
+            let beam_at_batch_start = self.video.beam_dots();
+            let trace_elapsed_at_batch_start = trace_before;
+            let bus_rem_at_batch_start = self.bus_rem;
             // A20 is a machine-layer event the CPU never sees directly, yet toggling it changes
             // which physical bytes back a linear address near the 1 MB wrap. Any A20 write (port
             // 0x92, the 8042, INT 15h, XMS) sets io_touched or is an HLE INT, so it ends this step;
@@ -8744,6 +8762,11 @@ impl Machine {
                     device_wrote_memory,
                     direct_map_changed,
                     core_clocks_so_far: 0,
+                    elapsed_clocks_at_batch_start,
+                    vga_dots_at_batch_start,
+                    beam_at_batch_start,
+                    trace_elapsed_at_batch_start,
+                    bus_rem_at_batch_start,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -9058,6 +9081,22 @@ struct MachineBus<'a> {
     // device-time-plan.md Task 0.2). Initialized to 0 at bus construction; the
     // first read_io call overwrites it before any arm can observe it.
     core_clocks_so_far: u64,
+    // Five batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
+    // Task 1.1: dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Each is a
+    // copy of the corresponding live Machine/BusTrace value at the moment this
+    // bus is constructed (once per batch), never mutated afterward. Not yet read
+    // by any arm; Task 1.2/1.3 consumes them to predict the VGA beam position
+    // mid-batch without mutating device state.
+    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
+    elapsed_clocks_at_batch_start: u64,
+    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
+    vga_dots_at_batch_start: f64,
+    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
+    beam_at_batch_start: u64,
+    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
+    trace_elapsed_at_batch_start: u64,
+    #[allow(dead_code)] // consumed by Slice 1 Task 1.2/1.3, to be removed then
+    bus_rem_at_batch_start: u64,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -18681,8 +18720,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn machine_bus_snapshots_batch_entry_state() {
+        // Run the machine forward a bit first so elapsed_clocks/vga_dots/beam/
+        // bus_rem are not all trivially zero, then check that a freshly-built
+        // MachineBus's five batch-entry snapshot fields equal the live machine
+        // state at the moment the bus is constructed (P4a Slice 1 Task 1.1:
+        // dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Nothing
+        // consumes these fields yet; this only pins the wiring.
+        let mut machine = test_machine();
+        machine.run_cycles(5_000).unwrap();
+        let expected_elapsed = machine.elapsed_clocks;
+        let expected_vga_dots = machine.vga_dots;
+        let expected_beam = machine.video.beam_dots();
+        let expected_trace_elapsed = machine.trace.elapsed_clocks();
+        let expected_bus_rem = machine.bus_rem;
+        with_bus(&mut machine, |bus| {
+            assert_eq!(
+                bus.elapsed_clocks_at_batch_start, expected_elapsed,
+                "elapsed_clocks_at_batch_start must mirror Machine::elapsed_clocks at construction"
+            );
+            assert_eq!(
+                bus.vga_dots_at_batch_start, expected_vga_dots,
+                "vga_dots_at_batch_start must mirror Machine::vga_dots at construction"
+            );
+            assert_eq!(
+                bus.beam_at_batch_start, expected_beam,
+                "beam_at_batch_start must mirror the VGA beam dot counter at construction"
+            );
+            assert_eq!(
+                bus.trace_elapsed_at_batch_start, expected_trace_elapsed,
+                "trace_elapsed_at_batch_start must mirror BusTrace::elapsed_clocks at construction"
+            );
+            assert_eq!(
+                bus.bus_rem_at_batch_start, expected_bus_rem,
+                "bus_rem_at_batch_start must mirror Machine::bus_rem at construction"
+            );
+        });
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
+        // Captured before the struct literal below since video/trace are also
+        // mutably borrowed by other fields in that same literal.
+        let beam_at_batch_start = machine.video.beam_dots();
+        let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
         let mut bus = MachineBus {
             memory: &mut machine.memory,
             ram_lookup: &mut machine.ram_lookup,
@@ -18731,6 +18813,11 @@ mod tests {
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,
             core_clocks_so_far: 0,
+            elapsed_clocks_at_batch_start: machine.elapsed_clocks,
+            vga_dots_at_batch_start: machine.vga_dots,
+            beam_at_batch_start,
+            trace_elapsed_at_batch_start,
+            bus_rem_at_batch_start: machine.bus_rem,
         };
         f(&mut bus)
     }
