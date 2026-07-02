@@ -2423,6 +2423,8 @@ impl Machine {
             bus_den_at_batch_start,
             pit_clocks_at_batch_start: self.pit_clocks,
             pit_per_clock_at_batch_start: self.timing.pit_per_clock,
+            opl_micros_at_batch_start: self.opl_micros,
+            micros_per_clock_at_batch_start: self.timing.micros_per_clock,
         }
     }
 
@@ -8669,6 +8671,8 @@ impl Machine {
             let inv_clock_at_batch_start = self.timing.inv_clock;
             let pit_clocks_at_batch_start = self.pit_clocks;
             let pit_per_clock_at_batch_start = self.timing.pit_per_clock;
+            let opl_micros_at_batch_start = self.opl_micros;
+            let micros_per_clock_at_batch_start = self.timing.micros_per_clock;
             // bus_timing's (num, den), read from the SAME source scale_bus reads
             // from (self.cpu.level()) -- not cpu_level_for_mode(self.active_mode).
             // The two can diverge: the CPU's live level only tracks active_mode
@@ -8824,6 +8828,8 @@ impl Machine {
                     bus_den_at_batch_start,
                     pit_clocks_at_batch_start,
                     pit_per_clock_at_batch_start,
+                    opl_micros_at_batch_start,
+                    micros_per_clock_at_batch_start,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -9235,6 +9241,26 @@ struct MachineBus<'a> {
     // inv_clock` is a DIFFERENT factoring whose product floor-diverges from the
     // real one at the IEEE-f64 level (see `advance_fractional`'s doc comment).
     pit_per_clock_at_batch_start: f64,
+    // The fractional OPL-timer-microsecond accumulator (Machine::opl_micros),
+    // copied at bus construction like `pit_clocks_at_batch_start` above (P4a
+    // Slice 3 Task 3.2: the lazy OPL status read). `advance_devices` is the
+    // only place that mutates `opl_micros` or steps `self.opl`'s timers, and it
+    // only runs at batch end / wake step (never mid-batch), so this snapshot
+    // plus the in-batch clock total (`in_batch_clocks`, the same T
+    // `predicted_beam`/`elapsed_pit_clocks` use) is enough to reproduce exactly
+    // the elapsed-OPL-microseconds `whole` value the real `advance_devices`
+    // would compute for the same total, via the shared `advance_fractional`
+    // formula.
+    opl_micros_at_batch_start: f64,
+    // The active mode's micros-per-clock factor (Machine::timing.
+    // micros_per_clock), copied at bus construction like
+    // `pit_per_clock_at_batch_start` above and for the same reason
+    // (batch-entry-stable, only a Lotura mode write recomputes TimingFactors).
+    // The real `advance_devices` OPL step multiplies by exactly this field, so
+    // a lazy peek must snapshot it rather than re-derive an equal-valued
+    // product through a different factoring (see `advance_fractional`'s doc
+    // comment on why that would floor-diverge).
+    micros_per_clock_at_batch_start: f64,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -9833,15 +9859,34 @@ impl CpuBus for MachineBus<'_> {
                 | (u8::from(self.pit.channel_out(2)) << 5);
             return Ok(u32::from(value));
         }
+        // OPL status reads on 0x388/0x38A and their SB16 mirrors (P4a Slice 3
+        // Task 3.2): the third lazy read arm, same static per-port dispatch
+        // discipline as 3DA/3BA/3C2 and 0x61 above -- dispatch is on the
+        // RESOLVED port (`opl_port`, which folds every alias -- 0x220-0x223,
+        // 0x228-0x229 -- onto the canonical 0x388-0x38B range) so a poll
+        // through any mirror gets the same lazy treatment, not just the native
+        // AdLib address. Only a status read (resolved port 0x388 or 0x38A) is
+        // lazy; a resolved data-port read (0x389/0x38B, open-bus per
+        // `OplChip::read_port`) falls through unchanged below, matching
+        // `read_port`'s existing behavior. The register-0x04 mask bits
+        // `status_after` reads cannot change mid-batch: the only writer is
+        // `write_port` via `write_io`, which unconditionally sets io_touched
+        // and so ends the batch before a later lazy read in the same batch
+        // could observe a stale value -- the same batch-entry-stable argument
+        // as 0x61's GATE bits above.
+        if let Some(resolved) = opl_port(port) {
+            if matches!(resolved, 0x0388 | 0x038a) && self.lazy_port_reads {
+                return Ok(u32::from(self.predicted_opl_status()));
+            }
+            *self.io_touched = true;
+            // The chip drives only the status byte on reads; data ports read open-bus.
+            return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
+        }
         // Every arm from here down is unchanged from before Task 1.3: a single
         // unconditional set covers all of them, exactly like the old top-of-function
-        // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61) handled
-        // above.
+        // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61, OPL status)
+        // handled above.
         *self.io_touched = true;
-        if let Some(opl_port) = opl_port(port) {
-            // The chip drives only the status byte on reads; data ports read open-bus.
-            return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
-        }
         if let Some(value) = self.mixer.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -10280,6 +10325,36 @@ impl MachineBus<'_> {
     #[cfg(test)]
     fn predicted_pit_out(&self, channel: usize) -> Option<bool> {
         self.pit.out_after(channel, self.elapsed_pit_clocks())
+    }
+
+    /// Elapsed OPL-timer microseconds "now" -- mid-batch, WITHOUT mutating
+    /// `opl_micros` (P4a Slice 3 Task 3.2: the lazy OPL status read).
+    /// Converts the shared in-batch clock total `T` (`in_batch_clocks`, the
+    /// same T `predicted_beam`/`elapsed_pit_clocks` peek with) into elapsed
+    /// microseconds by calling the SAME `advance_fractional` function the real
+    /// `advance_devices` OPL step calls, with `opl_micros_at_batch_start`
+    /// standing in for the live accumulator and `micros_per_clock_at_batch_start`
+    /// for the live rate. `advance_devices` only runs at batch end / wake step,
+    /// never mid-batch, so `opl_micros_at_batch_start` IS the live `opl_micros`
+    /// value the real call will start folding T's clocks into: no time travel,
+    /// this predicts exactly what a real `advance_devices` at T followed by a
+    /// status read would produce.
+    fn elapsed_opl_micros(&self) -> u64 {
+        let (elapsed_opl_micros, _remainder) = advance_fractional(
+            self.opl_micros_at_batch_start,
+            self.in_batch_clocks(),
+            self.micros_per_clock_at_batch_start,
+        );
+        elapsed_opl_micros
+    }
+
+    /// Peek the live OPL status byte "now" -- mid-batch, WITHOUT stepping
+    /// `opl`'s timers or mutating `opl_micros`. Convenience wrapper over
+    /// `elapsed_opl_micros` plus `OplChip::status_after`, used by both the
+    /// production lazy status-read arm in `read_io` and the differential test
+    /// below.
+    fn predicted_opl_status(&self) -> u8 {
+        self.opl.status_after(self.elapsed_opl_micros())
     }
 }
 
@@ -19946,6 +20021,8 @@ mod tests {
             bus_den_at_batch_start,
             pit_clocks_at_batch_start: machine.pit_clocks,
             pit_per_clock_at_batch_start: machine.timing.pit_per_clock,
+            opl_micros_at_batch_start: machine.opl_micros,
+            micros_per_clock_at_batch_start: machine.timing.micros_per_clock,
         };
         f(&mut bus)
     }

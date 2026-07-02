@@ -583,11 +583,6 @@ impl Timer {
     /// count) without the loop: since only the CROSSING matters (not the
     /// reload value, which `expired_after` never needs), this is one division
     /// instead of `advance`'s per-step subtraction loop.
-    ///
-    /// Not yet called from production code: this is the Task 3.1 promotion
-    /// (sized by its differential test above), wiring a lazy OPL status read to
-    /// it is Task 3.2, gated on this promotion.
-    #[allow(dead_code)]
     fn expired_after(&self, micros_elapsed: u64) -> bool {
         if self.expired {
             return true;
@@ -1004,13 +999,42 @@ impl OplChip {
     /// OPL status byte: bit7 IRQ, bit6 timer-1 flag, bit5 timer-2 flag.
     /// A timer's overflow flag is always reported; the mask bits in register
     /// 0x04 (bit6 = timer 1, bit5 = timer 2) only gate the IRQ line.
+    ///
+    /// Composed of `status_bits` (the pure bit computation) off the live
+    /// timers' `expired` flags. The P4a lazy port-read path (`MachineBus::
+    /// read_io`, Approximate timing class) calls the same pure function with
+    /// timer `expired_after` peeks instead of the live flags, so both callers
+    /// share exactly one bit-composition implementation (the `Vga::
+    /// status1_bits` precedent).
     pub fn status(&self) -> u8 {
+        self.status_bits(self.timer1.expired, self.timer2.expired)
+    }
+
+    /// Lazy-path status byte (P4a Task 3.2, Approximate timing class only):
+    /// the OPL status byte `micros_elapsed` microseconds of chip time from now,
+    /// without stepping either timer. Peeks each timer's `expired_after`
+    /// (Task 3.1) instead of reading the live `expired` flag, then composes the
+    /// result through the same `status_bits` the live `status()` call uses, so
+    /// the two paths can never structurally diverge in bit logic -- only in
+    /// which `expired` inputs they feed it.
+    pub fn status_after(&self, micros_elapsed: u64) -> u8 {
+        let t1_expired = self.timer1.expired_after(micros_elapsed);
+        let t2_expired = self.timer2.expired_after(micros_elapsed);
+        self.status_bits(t1_expired, t2_expired)
+    }
+
+    /// Pure bit computation for the OPL status byte, off caller-supplied
+    /// timer-expired flags instead of the live `self.timer1`/`self.timer2`.
+    /// The mask bits (register 0x04 bits 6/5) come from `self.registers`,
+    /// which only a write can change; a write always ends the batch (Task
+    /// 3.2), so a mid-batch predicted status read can never observe a mask
+    /// mid-batch write races with -- the mask is exactly as batch-entry-stable
+    /// here as it is for the live `status()` call above.
+    fn status_bits(&self, t1_expired: bool, t2_expired: bool) -> u8 {
         let control = self.registers[0][0x04];
-        let t1_irq = self.timer1.expired && control & 0x40 == 0;
-        let t2_irq = self.timer2.expired && control & 0x20 == 0;
-        ((t1_irq || t2_irq) as u8) << 7
-            | (self.timer1.expired as u8) << 6
-            | (self.timer2.expired as u8) << 5
+        let t1_irq = t1_expired && control & 0x40 == 0;
+        let t2_irq = t2_expired && control & 0x20 == 0;
+        ((t1_irq || t2_irq) as u8) << 7 | (t1_expired as u8) << 6 | (t2_expired as u8) << 5
     }
 
     pub fn read_port(&self, port: u16) -> Option<u8> {
@@ -1085,6 +1109,39 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Differential test for `OplChip::status_after` (P4a Slice 3 Task 3.2): the
+    /// predicted status byte at T microseconds from now must equal what a real
+    /// `advance_micros(T)` followed by `status()` would produce, across both
+    /// timers running, various presets/masks, and T values straddling the
+    /// overflow boundary.
+    #[test]
+    fn status_after_matches_a_real_advance_micros_then_status() {
+        let t_values = [0u64, 1, 39, 79, 80, 81, 319, 320, 321, 5_000];
+        let masks = [0x00u8, 0x20, 0x40, 0x60];
+
+        for &mask in &masks {
+            let mut opl = OplChip::default();
+            opl.write_register(0x02, 0xf0); // timer 1 preset
+            opl.write_register(0x03, 0xe0); // timer 2 preset
+            opl.write_register(0x04, 0x80); // reset IRQ flags
+            opl.write_register(0x04, mask | 0x03); // start both timers, apply mask
+
+            for &t in &t_values {
+                let predicted = opl.status_after(t);
+
+                let mut real = opl.clone();
+                real.advance_micros(t);
+                let expected = real.status();
+
+                assert_eq!(
+                    predicted, expected,
+                    "mask={mask:#04x} t={t}: status_after must match a real \
+                     advance_micros(t) then status()"
+                );
             }
         }
     }
