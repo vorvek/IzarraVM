@@ -11938,7 +11938,7 @@ mod tests {
     #[test]
     fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction() {
         // `DecodeGroup::PortIo` is not in `block_continuable`'s admitted set (see
-        // that function's comment: "INS/OUTS are Misc and stay terminators" — true
+        // that function's comment: "INS/OUTS are Misc and stay terminators", true
         // of plain IN/OUT too, by the same reasoning: every port access sets
         // `io_touched` today, ending the run right after it runs, so PortIo has
         // never needed to be a continuation). That means an IN/OUT can ONLY ever
