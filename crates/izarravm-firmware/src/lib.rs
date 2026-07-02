@@ -22,6 +22,10 @@ pub const UMBTEST_COM: &[u8] = include_bytes!("../roms/dos/umbtest.com");
 pub const UMBTEST_COM_SOURCE: &str = include_str!("../roms/dos/umbtest.asm");
 pub const UMBMECH_COM: &[u8] = include_bytes!("../roms/dos/umbmech.com");
 pub const UMBMECH_COM_SOURCE: &str = include_str!("../roms/dos/umbmech.asm");
+pub const EMSTEST_COM: &[u8] = include_bytes!("../roms/dos/emstest.com");
+pub const EMSTEST_COM_SOURCE: &str = include_str!("../roms/dos/emstest.asm");
+pub const EMSNONE_COM: &[u8] = include_bytes!("../roms/dos/emsnone.com");
+pub const EMSNONE_COM_SOURCE: &str = include_str!("../roms/dos/emsnone.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
@@ -153,6 +157,22 @@ pub fn xmstest_com() -> &'static [u8] {
 /// Runs in V86; signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
 pub fn umbtest_com() -> &'static [u8] {
     UMBTEST_COM
+}
+
+/// The SP-4b M2 EMS e2e fixture (needs TOKAEMM loaded with the RAM argument):
+/// version, frame segment, page counts, allocate, then map logical pages
+/// through the frame slots writing distinct patterns and reading them back
+/// through other slots — proving the runtime page remap through the paged
+/// frame. Signals 0xA5 (or a 0xEn step code) via the unit-tester exit port.
+pub fn emstest_com() -> &'static [u8] {
+    EMSTEST_COM
+}
+
+/// The SP-4b M2 default-off contract fixture (bare DEVICE=C:\TOKAEMM.SYS): the
+/// manager must answer INT 67h frameless — present, version 4.0, zero pages,
+/// 41h returns 80h, allocation refused with 87h. Signals 0xA5 / 0xEn.
+pub fn emsnone_com() -> &'static [u8] {
+    EMSNONE_COM
 }
 
 /// The SP-4b M3 UMB *mechanism* fixture: drives XMS 10h/11h/12h directly (no

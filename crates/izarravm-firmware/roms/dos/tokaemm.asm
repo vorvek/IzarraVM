@@ -24,7 +24,10 @@ org 0
     dw 0x8000                     ; dh_attr = char device
     dw strategy
     dw interrupt
-    db 'XMSXXXX0'                 ; char-device name: HIMEM-class XMS provider
+    db 'EMMXXXX0'                 ; char-device name: all-in-one EMM386-class
+                                  ; manager. LIM EMS detection compares these 8
+                                  ; bytes at [IVT67-seg:000A]; XMS detection is
+                                  ; INT 2Fh AX=4300 and doesn't read the name.
 
 rh_ptr:  dd 0                     ; saved ES:BX (request header)
 drv_seg: dw 0                     ; our load segment (CS)
@@ -64,16 +67,43 @@ xms_table: times XMS_HANDLES*XMS_SLOT db 0
 
 ; SP-4b M3 UMB: the free upper window 0xC8000-0xEFFFF (above the VGA BIOS, below
 ; system ROM), 160 KB, page-mapped at INIT to extended RAM just above the HMA. The
-; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, 0xF000).
+; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, umb_win_end)
+; — the window ends at 0xF000, or 0xE000 when the EMS page frame is on (SP-4b M2).
 UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
 UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
-UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment)
-UMB_SEG_PARAS equ 0x2800          ; 160 KB / 16 = paragraphs in the window
+UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment); the window
+                                  ; ends at the runtime umb_win_end (SP-4b M2)
 ; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
 UMB_SLOTS equ 8
 UMB_SLOT  equ 6
 umb_table: times UMB_SLOTS*UMB_SLOT db 0
+
+; ---- SP-4b M2 EMS state (resident; reached via cs: overrides from V86) ----
+; Default-off: DEVICE=C:\TOKAEMM.SYS presents a frameless manager (INT 67h
+; answers present/version/0 pages, like EMM386 NOEMS); the RAM argument
+; provisions the page frame [0xE000,0xF000) + a backing pool carved from
+; extended RAM just past the UMB backing, and the UMB window shrinks to
+; end below the frame.
+EMS_PHYS_BASE equ 0x00138000      ; backing pool base (= UMB_PHYS_BASE+UMB_BYTES)
+EMS_MAX_PAGES equ 256             ; 4 MB pool ceiling (16 KB pages)
+EMS_FRAME_SEG equ 0xE000          ; page frame segment (4 slots x 16 KB)
+EMS_FRAME_LIN equ 0x000E0000
+EMS_HANDLES   equ 32
+; handle slot: +0 inuse(b) +1 saved(b) +2 npages(w) +4 first(w) +6 pad(w)
+;              +8 saved_map(4w). Backing runs are CONTIGUOUS per handle
+; (logical page L -> backing page first+L); contiguity is invisible to apps.
+; ponytail: a fragmented pool can 88h an alloc that per-page bookkeeping would
+; satisfy; switch to per-page lists if a real consumer hits it.
+EMS_SLOT      equ 16
+ems_on:      db 0                 ; 1 = RAM argument seen and pages provisioned
+ems_pages:   dw 0                 ; total 16 KB pages (<= EMS_MAX_PAGES)
+ems_free:    dw 0                 ; free pages
+ems_disp:    dw 0                 ; dispatch scratch (mirrors xms_disp)
+umb_win_end: dw 0xF000            ; UMB window end segment (0xE000 with EMS on)
+ems_table: times EMS_HANDLES*EMS_SLOT db 0
+; live frame map: backing page index per physical slot, 0xFFFF = unmapped
+ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -117,6 +147,62 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
+    ; --- SP-4b M2: parse the DEVICE= tail for a whole-token "RAM" argument.
+    ; r_bpbptr (+18) points at the raw command line, driver path first
+    ; (FreeDOS init_device). Case-insensitive; NOEMS/anything else = default off.
+    push ds
+    lds si, [es:bx+18]
+.p_path:                          ; skip the path token
+    lodsb
+    call cls_al                   ; -> AH: 0 ordinary, 1 separator, 2 line end
+    cmp ah, 0
+    je .p_path
+    cmp ah, 2
+    je .p_done
+.p_gap:                           ; skip separators to the next token start
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF                  ; token first char, upcased
+    cmp al, 'R'
+    jne .p_skiptok
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap                     ; token was just "R"
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF
+    cmp al, 'A'
+    jne .p_skiptok
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF
+    cmp al, 'M'
+    jne .p_skiptok
+    lodsb                         ; the char after "RAM" must end the token
+    call cls_al
+    cmp ah, 0
+    je .p_skiptok                 ; longer token (e.g. RAMX): not ours
+    mov byte [cs:ems_on], 1
+    jmp .p_done
+.p_skiptok:                       ; consume the rest of the current token
+    lodsb
+    call cls_al
+    cmp ah, 0
+    je .p_skiptok
+    cmp ah, 1
+    je .p_gap
+.p_done:
+    pop ds
+
     ; --- SP-4b M1/M3: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
     ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
     ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
@@ -133,7 +219,33 @@ init:
     mov [cs:xms_pool_end], eax
     ; The 160 KB UMB backing sits just above the HMA (SP-4b M3); XMS starts past it.
     mov dword [cs:xms_pool_base], UMB_PHYS_BASE + UMB_BYTES
-    ; Hook INT 2Fh: save the old vector, install our handler (IVT at linear 0).
+
+    ; --- SP-4b M2: with RAM, carve the EMS pool [EMS_PHYS_BASE, +pages*16K),
+    ; shift the XMS pool past it, and end the UMB window below the page frame.
+    cmp byte [cs:ems_on], 0
+    je .ems_done
+    mov eax, [cs:xms_pool_end]
+    cmp eax, EMS_PHYS_BASE + 0x4000  ; at least one 16 KB page available?
+    jb .ems_off                      ; degenerate small-RAM box: stay frameless
+    sub eax, EMS_PHYS_BASE
+    shr eax, 14                      ; bytes -> 16 KB pages
+    cmp eax, EMS_MAX_PAGES
+    jbe .ems_clamped
+    mov eax, EMS_MAX_PAGES
+.ems_clamped:
+    mov [cs:ems_pages], ax
+    mov [cs:ems_free], ax
+    shl eax, 14
+    add eax, EMS_PHYS_BASE
+    mov [cs:xms_pool_base], eax      ; XMS pool starts past the EMS pool
+    mov word [cs:umb_win_end], EMS_FRAME_SEG
+    jmp .ems_done
+.ems_off:
+    mov byte [cs:ems_on], 0
+.ems_done:
+
+    ; Hook INT 2Fh (chain) + own INT 67h outright (IVT at linear 0). The EMS
+    ; manager answers in BOTH modes: frameless is EMM386-NOEMS's contract.
     push ds
     xor ax, ax
     mov ds, ax
@@ -141,6 +253,8 @@ init:
     mov [cs:old_2f], eax
     mov word [ds:0x2F*4], xms_2f_handler
     mov [ds:0x2F*4+2], cs
+    mov word [ds:0x67*4], ems_int67
+    mov [ds:0x67*4+2], cs
     pop ds
     ; --- end M1 INIT additions ---
 
@@ -806,19 +920,23 @@ xf_realloc_umb:
     pop si
     jmp xms_fail
 
-; First-fit free run of DX paras in [UMB_SEG_BASE, +UMB_SEG_PARAS). Restart-on-
+; First-fit free run of DX paras in [UMB_SEG_BASE, umb_win_end). Restart-on-
 ; overlap (mirrors find_gap). out: BX = seg, CF clear; or CF set. Preserves DX;
 ; clobbers ax, cx, si.
 umb_free_run:
     push cx
     push si
-    cmp dx, UMB_SEG_PARAS         ; bigger than the whole window? can't fit (dodges
+    mov ax, [cs:umb_win_end]      ; window end (drops to 0xE000 when the EMS
+    sub ax, UMB_SEG_BASE          ; page frame carves the top; SP-4b M2)
+    cmp dx, ax                    ; bigger than the whole window? can't fit (dodges
     ja .none                      ; the 16-bit wrap on cursor+need for huge probes).
     mov bx, UMB_SEG_BASE
 .restart:
     mov ax, bx
     add ax, dx                    ; cursor + need
-    cmp ax, UMB_SEG_BASE + UMB_SEG_PARAS
+    jc .none                      ; 16-bit wrap: the cursor (a block top near the
+                                  ; window end) + need passed 0xFFFF -> cannot fit
+    cmp ax, [cs:umb_win_end]
     ja .none
     mov si, umb_table
     mov cx, UMB_SLOTS
@@ -872,7 +990,7 @@ umb_largest:
     add si, UMB_SLOT
     loop .l
     neg ax
-    add ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; window_end - highest_top
+    add ax, [cs:umb_win_end]      ; window_end - highest_top
     pop dx
     pop si
     pop cx
@@ -908,7 +1026,7 @@ umb_max_grow:
     push cx
     push di
     mov di, [cs:si+2]             ; our seg
-    mov ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; nearest boundary = window end
+    mov ax, [cs:umb_win_end]      ; nearest boundary = window end
     push si
     mov si, umb_table
     mov cx, UMB_SLOTS
@@ -929,6 +1047,454 @@ umb_max_grow:
     pop di
     pop cx
     pop bx
+    ret
+
+; ============================================================================
+; SP-4b M2 — guest EMS (INT 67h, LIM 4.0 subset; V86 code, cs: overrides).
+; Hooked at INIT; apps find the manager by comparing "EMMXXXX0" at
+; [IVT67-seg:000A] = our device-header name. Status in AH (0 = OK); registers
+; other than documented outputs are preserved. Functions outside the
+; implemented set return 84h like a real manager that lacks them.
+; ============================================================================
+ems_int67:
+    cmp ah, 0x40
+    jb ef_undef
+    cmp ah, 0x4C
+    ja ef_undef
+    push bx
+    movzx bx, ah
+    sub bx, 0x40
+    add bx, bx
+    mov bx, [cs:ems_jt + bx]
+    mov [cs:ems_disp], bx
+    pop bx
+    jmp [cs:ems_disp]
+ems_jt:
+    dw ef_status, ef_frame, ef_counts, ef_alloc     ; 40h-43h
+    dw ef_map, ef_free, ef_version, ef_save         ; 44h-47h
+    dw ef_restore, ef_undef, ef_undef, ef_count     ; 48h-4Bh (49/4A reserved)
+    dw ef_pages                                     ; 4Ch
+
+ef_undef:
+    mov ah, 0x84                  ; undefined function
+    iret
+ef_status:                        ; 40h get manager status
+    xor ah, ah
+    iret
+ef_frame:                         ; 41h get page-frame segment -> BX
+    cmp byte [cs:ems_on], 0
+    je .noframe
+    mov bx, EMS_FRAME_SEG
+    xor ah, ah
+    iret
+.noframe:
+    xor bx, bx
+    mov ah, 0x80                  ; frameless: EMM386-NOEMS convention
+    iret
+ef_counts:                        ; 42h get page counts: BX=free, DX=total
+    mov bx, [cs:ems_free]
+    mov dx, [cs:ems_pages]
+    xor ah, ah
+    iret
+ef_version:                       ; 46h get version -> AL = BCD 4.0
+    mov al, 0x40
+    xor ah, ah
+    iret
+
+; 43h allocate: BX = pages -> DX = handle. Contiguous first-fit run.
+ef_alloc:
+    test bx, bx
+    jz .zero
+    cmp bx, [cs:ems_pages]
+    ja .total
+    cmp bx, [cs:ems_free]
+    ja .nofree
+    push ax                       ; ems_find_run clobbers AX; AL is not an output
+    push dx                       ; DX is an output only on success (the handle)
+    push si
+    push cx
+    push di
+    call ems_find_run             ; BX=need -> DI=first page, CF=no run
+    jc .frag
+    mov si, ems_table             ; first free handle slot
+    mov cx, EMS_HANDLES
+    xor dx, dx                    ; handle counter (1-based below)
+.slot:
+    inc dx
+    cmp byte [cs:si], 0
+    je .got
+    add si, EMS_SLOT
+    loop .slot
+    pop di
+    pop cx
+    pop si
+    pop dx                        ; restore the caller's DX (the counter ran over it)
+    pop ax
+    mov ah, 0x85                  ; no more handles
+    iret
+.got:
+    mov byte [cs:si], 1           ; inuse
+    mov byte [cs:si+1], 0         ; saved = 0
+    mov [cs:si+2], bx             ; npages
+    mov [cs:si+4], di             ; first backing page
+    sub [cs:ems_free], bx
+    pop di
+    pop cx
+    pop si
+    add sp, 2                     ; discard the saved DX: DX = the new handle
+    pop ax
+    xor ah, ah
+    iret
+.frag:
+    pop di
+    pop cx
+    pop si
+    pop dx
+    pop ax
+.nofree:
+    mov ah, 0x88                  ; insufficient free pages
+    iret
+.total:
+    mov ah, 0x87                  ; more than the manager's total
+    iret
+.zero:
+    mov ah, 0x89                  ; zero pages
+    iret
+
+; 44h map: AL = physical slot 0-3, BX = logical page (0xFFFF unmaps),
+; DX = handle. The bookkeeping is here; the PTE rewrite + TLB flush is the
+; monitor's INT 0xC0 'PM' service (ring-0 work, like the M1 XMS-move memcpy).
+ef_map:
+    cmp al, 3
+    ja .badphys
+    push si
+    push cx
+    call ems_slot_of              ; DX -> SI, or CF + AH=0x83 (LIM: the unmap
+    jc .bad                       ; form still requires a valid handle)
+    cmp bx, 0xFFFF
+    je .unmap
+    cmp bx, [cs:si+2]             ; logical >= npages?
+    jae .badlog
+    mov cx, [cs:si+4]
+    add cx, bx                    ; backing page = first + logical
+.do:
+    movzx si, al
+    add si, si
+    mov [cs:ems_frame_map + si], cx
+    call ems_remap_slot           ; AL=slot, CX=page|0xFFFF (preserves regs)
+    pop cx
+    pop si
+    xor ah, ah
+    iret
+.unmap:
+    mov cx, 0xFFFF
+    jmp .do
+.badlog:
+    mov ah, 0x8A                  ; logical page out of range
+.bad:
+    pop cx
+    pop si
+    iret
+.badphys:
+    mov ah, 0x8B                  ; physical page out of range
+    iret
+
+; 45h release: DX = handle. Unmaps its frame slots, scrubs its pages from
+; every saved_map (a freed-and-reassigned page must not be reinstated by a
+; later 48h restore — mirrors the retired HLE's invalidate_freed), then
+; returns the run to the pool.
+ef_free:
+    push si
+    call ems_slot_of
+    jc .badh
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    mov di, [cs:si+4]             ; DI = first freed page
+    mov dx, di
+    add dx, [cs:si+2]             ; DX = end (exclusive)
+    xor bx, bx                    ; BL = physical slot 0..3
+.slots:
+    push si
+    movzx si, bl
+    add si, si
+    mov cx, [cs:ems_frame_map + si]
+    cmp cx, di
+    jb .ns
+    cmp cx, dx
+    jae .ns
+    mov word [cs:ems_frame_map + si], 0xFFFF
+    mov al, bl
+    mov cx, 0xFFFF
+    call ems_remap_slot           ; restore the INIT mapping
+.ns:
+    pop si
+    inc bx
+    cmp bx, 4
+    jb .slots
+    push si                       ; scrub [DI,DX) from every saved_map
+    mov si, ems_table
+    mov cx, EMS_HANDLES
+.scrub:
+    cmp byte [cs:si+1], 0         ; saved?
+    je .nh
+    push cx
+    push si
+    add si, 8                     ; saved_map
+    mov cx, 4
+.sm:
+    mov ax, [cs:si]
+    cmp ax, di
+    jb .smn
+    cmp ax, dx
+    jae .smn
+    mov word [cs:si], 0xFFFF
+.smn:
+    add si, 2
+    loop .sm
+    pop si
+    pop cx
+.nh:
+    add si, EMS_SLOT
+    loop .scrub
+    pop si
+    mov ax, [cs:si+2]             ; release the run + the slot (its own saved
+    add [cs:ems_free], ax         ; context dies with saved=0)
+    mov byte [cs:si], 0
+    mov byte [cs:si+1], 0
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.badh:
+    pop si
+    iret                          ; AH = 0x83 from ems_slot_of
+
+; 47h save / 48h restore the frame map under DX = handle.
+ef_save:
+    push si
+    call ems_slot_of
+    jc .badh
+    cmp byte [cs:si+1], 0
+    jne .already
+    push ax
+    push cx
+    push di
+    mov di, 4                     ; four slots
+    xor cx, cx                    ; word offset 0,2,4,6
+.cp:
+    push si
+    mov si, cx
+    mov ax, [cs:ems_frame_map + si]
+    pop si
+    push si
+    add si, cx
+    mov [cs:si+8], ax
+    pop si
+    add cx, 2
+    dec di
+    jnz .cp
+    mov byte [cs:si+1], 1
+    pop di
+    pop cx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.already:
+    pop si
+    mov ah, 0x8D                  ; context already saved
+    iret
+.badh:
+    pop si
+    iret
+
+ef_restore:
+    push si
+    call ems_slot_of
+    jc .badh
+    cmp byte [cs:si+1], 0
+    je .none
+    push ax
+    push bx
+    push cx
+    push di
+    xor bx, bx                    ; BL = physical slot 0..3
+.rs:
+    movzx di, bl
+    add di, di
+    push si
+    add si, di
+    mov cx, [cs:si+8]             ; saved word (page or 0xFFFF)
+    pop si
+    push si
+    mov si, di
+    mov [cs:ems_frame_map + si], cx
+    pop si
+    mov al, bl
+    call ems_remap_slot           ; maps or restores per CX
+    inc bx
+    cmp bx, 4
+    jb .rs
+    mov byte [cs:si+1], 0
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.none:
+    pop si
+    mov ah, 0x8E                  ; no saved context
+    iret
+.badh:
+    pop si
+    iret
+
+; 4Bh open-handle count -> BX. 4Ch handle pages: DX = handle -> BX.
+ef_count:
+    push si
+    push cx
+    xor bx, bx
+    mov si, ems_table
+    mov cx, EMS_HANDLES
+.c:
+    cmp byte [cs:si], 0
+    je .n
+    inc bx
+.n:
+    add si, EMS_SLOT
+    loop .c
+    pop cx
+    pop si
+    xor ah, ah
+    iret
+ef_pages:
+    push si
+    call ems_slot_of
+    jc .badh
+    mov bx, [cs:si+2]
+    pop si
+    xor ah, ah
+    iret
+.badh:
+    pop si
+    iret
+
+; --- EMS helpers --------------------------------------------------------------
+
+; DX = EMS handle -> SI = slot offset, CF clear; or CF set + AH = 0x83.
+; Callers save SI. Preserves everything else. Handle 0 (the LIM OS handle) is
+; reserved-not-modeled, so it answers 83h like an unknown handle.
+ems_slot_of:
+    cmp dx, 1
+    jb .bad
+    cmp dx, EMS_HANDLES
+    ja .bad
+    push ax
+    mov ax, dx
+    dec ax
+    shl ax, 4                     ; * EMS_SLOT
+    add ax, ems_table
+    mov si, ax
+    pop ax
+    cmp byte [cs:si], 0           ; inuse?
+    je .bad
+    clc
+    ret
+.bad:
+    mov ah, 0x83                  ; invalid handle
+    stc
+    ret
+
+; First-fit contiguous run of BX pages -> DI = first page, or CF set.
+; Restart-on-overlap over the handle slots (mirrors find_gap). Clobbers ax,cx,si.
+ems_find_run:
+    xor di, di                    ; cursor
+.restart:
+    mov ax, di
+    add ax, bx
+    cmp ax, [cs:ems_pages]
+    ja .none
+    mov si, ems_table
+    mov cx, EMS_HANDLES
+.scan:
+    cmp byte [cs:si], 0
+    je .next
+    mov ax, [cs:si+4]
+    add ax, [cs:si+2]             ; b.top = first + npages
+    cmp ax, di
+    jbe .next                     ; block below the cursor
+    mov ax, di
+    add ax, bx
+    cmp [cs:si+4], ax
+    jae .next                     ; block above cursor+need
+    mov di, [cs:si+4]
+    add di, [cs:si+2]             ; overlap: cursor = b.top, restart
+    jmp .restart
+.next:
+    add si, EMS_SLOT
+    loop .scan
+    clc
+    ret
+.none:
+    stc
+    ret
+
+; Monitor remap of one frame slot. AL = slot 0-3, CX = backing page index or
+; 0xFFFF to restore the INIT (UMB-backing) mapping. Preserves all registers.
+ems_remap_slot:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    movzx ebx, al
+    shl ebx, 14
+    add ebx, EMS_FRAME_LIN        ; EBX = slot linear base
+    cmp cx, 0xFFFF
+    je .unmap
+    movzx ecx, cx
+    shl ecx, 14
+    add ecx, EMS_PHYS_BASE        ; ECX = backing physical base
+    jmp .go
+.unmap:
+    xor ecx, ecx                  ; 0 = restore the INIT mapping
+.go:
+    mov edx, 0x4D50               ; 'PM' monitor-call cookie
+    int 0xC0
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+; Classify AL for the INIT command-line parse: AH = 0 ordinary char,
+; 1 separator (space/tab), 2 line end (CR/LF/NUL). Preserves AL.
+cls_al:
+    cmp al, ' '
+    je .sep
+    cmp al, 9
+    je .sep
+    cmp al, 0x0D
+    je .end
+    cmp al, 0x0A
+    je .end
+    test al, al
+    jz .end
+    xor ah, ah
+    ret
+.sep:
+    mov ah, 1
+    ret
+.end:
+    mov ah, 2
     ret
 
 align 8
@@ -1111,12 +1677,20 @@ monitor:
     jmp .done_gp
 .intn:
     movzx ebx, byte [eax+1]      ; INT vector operand
-    cmp bl, 0xC0                 ; TOKAEMM-private monitor call (XMS-move memcpy)?
+    cmp bl, 0xC0                 ; TOKAEMM-private monitor call?
     jne .intn_reflect
-    cmp word [esp+20], 0x544D    ; guest DX == 'TM' cookie? (pushad EDX slot)
-    jne .intn_reflect            ; not our cookie: reflect INT 0xC0 like any other
+    cmp word [esp+20], 0x544D    ; guest DX == 'TM' (XMS-move memcpy)?
+    je .intn_memcpy
+    cmp word [esp+20], 0x4D50    ; guest DX == 'PM' (EMS frame remap)?
+    je .intn_remap
+    jmp .intn_reflect            ; foreign INT 0xC0: reflect like any other
+.intn_memcpy:
     add word [ebp], 2            ; skip past INT 0xC0
     call flat_memcpy
+    jmp .done_gp
+.intn_remap:
+    add word [ebp], 2
+    call frame_remap
     jmp .done_gp
 .intn_reflect:
     add word [ebp], 2            ; return IP = past INT n
@@ -1261,6 +1835,42 @@ flat_memcpy:
     rep movsb                     ; DS:ESI -> ES:EDI, both flat
     mov al, ah
     out 0x92, al                  ; restore A20 to the guest's prior state
+    ret
+
+; Ring-0 EMS frame remap (INT 0xC0 'PM'). Guest EBX = frame-slot linear base,
+; guest ECX = backing physical base, or 0 to restore the INIT mapping (the
+; UMB-backing bytes the INIT .umb_map loop pointed this window at). Rewrites
+; the slot's 4 PTEs in PT0 and reloads CR3 — the 386 full-TLB-flush idiom.
+; Private, cookie-gated, single caller (ems_remap_slot) validates -> no arg
+; checks. Args from the pushad slots via the call frame: EBX=[esp+20],
+; ECX=[esp+28] (cf. flat_memcpy). DS is already flat 0x10 from monitor entry;
+; FS = 0x20 (driver data) for pd_lin. The frame is only read, so .done_gp's
+; popad restores the guest registers.
+frame_remap:
+    mov ebx, [esp+20]             ; guest EBX = slot linear base
+    mov ecx, [esp+28]             ; guest ECX = backing phys (0 = unmap)
+    test ecx, ecx
+    jnz .have
+    mov ecx, ebx                  ; restore INIT mapping: UMB backing for this lin
+    sub ecx, UMB_LIN_BASE
+    add ecx, UMB_PHYS_BASE
+.have:
+    or ecx, 7                     ; present/rw/user
+    mov eax, [fs:pd_lin]
+    add eax, 0x1000               ; PT0 linear
+    mov edx, ebx
+    shr edx, 12
+    and edx, 0x3FF
+    lea eax, [eax + edx*4]        ; &PT0[slot's first page] (flat DS)
+    mov edx, 4
+.pte:
+    mov [eax], ecx
+    add eax, 4
+    add ecx, 0x1000
+    dec edx
+    jnz .pte
+    mov eax, cr3                  ; full TLB flush, 386-style
+    mov cr3, eax
     ret
 
 ; Debug failure signal via the unit-tester exit port (AL = code).

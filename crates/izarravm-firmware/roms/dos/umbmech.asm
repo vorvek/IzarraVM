@@ -85,6 +85,32 @@ start:
     or ax, ax
     jz f_rel
 
+    ; SP-4b M2 regression (the umb_free_run 16-bit wrap): fill the whole window,
+    ; then probe with a large-but-not-over-window need. The scan cursor advances
+    ; to the fill block's top (0xF000); without the carry guard, cursor+need
+    ; wrapped past 0xFFFF, slipped the window-end check, and a bogus run at/above
+    ; the window end (ROM space) came back. Correct: no-fit, AX=0, BL=0xB1, DX=0.
+    mov ah, 0x10
+    mov dx, 0x2800               ; the whole frameless window
+    call far [entry]
+    or ax, ax
+    jz f_wrap
+    mov [seg1], bx
+    mov ah, 0x10
+    mov dx, 0x1000               ; passes the entry guard; must not wrap-succeed
+    call far [entry]
+    or ax, ax
+    jnz f_wrap                   ; a success here is the wrap bug
+    cmp bl, 0xB1
+    jne f_wrap
+    or dx, dx
+    jnz f_wrap
+    mov ah, 0x11                 ; release the fill block
+    mov dx, [seg1]
+    call far [entry]
+    or ax, ax
+    jz f_rel
+
     mov al, OK
     jmp sig
 
@@ -101,6 +127,8 @@ f_grow:  mov al, 0xE4
 f_rel:   mov al, 0xE5
          jmp sig
 f_reuse: mov al, 0xE6
+         jmp sig
+f_wrap:  mov al, 0xE7
 
 sig:
     mov ah, al

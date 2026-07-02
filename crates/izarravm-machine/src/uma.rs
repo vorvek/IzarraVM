@@ -1,13 +1,12 @@
 //! The UMA-hole reservation map: a paragraph-granular allocator over the
 //! UMB-able upper-memory window (0xC0000-0xEFFFF, the `is_umb_window` band of
 //! the region classifier). It is the single authority that hands out upper
-//! memory blocks (P5 UMBs) and the LIM EMS 4.0 page frame (P6), so no two
-//! consumers can ever claim the same paragraph. Option or system ROM mapped into
-//! the window is reserved up front and is never handed out.
+//! memory blocks (P5 UMBs), so no two consumers can ever claim the same
+//! paragraph. Option or system ROM mapped into the window is reserved up front
+//! and is never handed out.
 //!
 //! This is pure bookkeeping: it tracks reserved spans and computes the free holes
-//! between them. It does not touch the bus or guest RAM. A later slice wires real
-//! UMBs and the EMS frame onto the addresses it returns.
+//! between them. It does not touch the bus or guest RAM.
 
 use crate::memmap::{SYSTEM_ROM_BASE, UPPER_MEMORY_BASE};
 
@@ -17,10 +16,6 @@ const WINDOW_END: u32 = SYSTEM_ROM_BASE;
 
 /// A paragraph is 16 bytes; UMBs and MCBs are paragraph-granular.
 const PARAGRAPH: u32 = 16;
-/// The LIM EMS 4.0 page frame is four 16 KiB pages.
-pub const EMS_FRAME_SIZE: u32 = 64 * 1024;
-/// The page frame aligns to a 16 KiB page boundary within the window.
-const EMS_FRAME_ALIGN: u32 = 16 * 1024;
 
 /// Round `x` up to the next multiple of `align`, or None if that overflows u32.
 fn align_up(x: u32, align: u32) -> Option<u32> {
@@ -34,8 +29,6 @@ pub enum UmaUse {
     Rom,
     /// An upper memory block handed to the DOS arena.
     Umb,
-    /// The LIM EMS 4.0 64 KiB page frame.
-    EmsFrame,
 }
 
 /// One reserved span: the half-open range [base, base + size), within the window.
@@ -74,9 +67,9 @@ impl UmaReservationMap {
         self.reservations.clear();
     }
 
-    /// Mark a fixed ROM span occupied so it is never handed out as a UMB or the
-    /// EMS frame. Returns false (and reserves nothing) if the span falls outside
-    /// the window or overlaps an existing reservation.
+    /// Mark a fixed ROM span occupied so it is never handed out as a UMB.
+    /// Returns false (and reserves nothing) if the span falls outside the
+    /// window or overlaps an existing reservation.
     pub fn reserve_rom(&mut self, base: u32, size: u32) -> bool {
         if size == 0 || base < WINDOW_BASE {
             return false;
@@ -110,41 +103,9 @@ impl UmaReservationMap {
         self.alloc(size, PARAGRAPH, UmaUse::Umb)
     }
 
-    /// Reserve the 64 KiB LIM EMS 4.0 page frame in the first 16 KiB-aligned hole
-    /// that fits it. Returns its base, or None when no hole is large enough. The
-    /// frame is placed here rather than picked independently, so it cannot land
-    /// on top of a UMB or ROM.
-    pub fn alloc_ems_frame(&mut self) -> Option<u32> {
-        self.alloc(EMS_FRAME_SIZE, EMS_FRAME_ALIGN, UmaUse::EmsFrame)
-    }
-
-    /// Reserve the 64 KiB EMS page frame at a specific 16 KiB-aligned base, the way
-    /// a memory manager honors a `FRAME=` directive. Returns the base on success, or
-    /// None (reserving nothing) if it is misaligned, out of the window, or overlaps
-    /// an existing reservation. Prefer this over `alloc_ems_frame` when the frame
-    /// address is configured rather than auto-placed.
-    pub fn reserve_ems_frame_at(&mut self, base: u32) -> Option<u32> {
-        if base % EMS_FRAME_ALIGN != 0 || base < WINDOW_BASE {
-            return None;
-        }
-        match base.checked_add(EMS_FRAME_SIZE) {
-            Some(end) if end <= WINDOW_END => {}
-            _ => return None,
-        }
-        if self.overlaps(base, EMS_FRAME_SIZE) {
-            return None;
-        }
-        self.insert(UmaReservation {
-            base,
-            size: EMS_FRAME_SIZE,
-            kind: UmaUse::EmsFrame,
-        });
-        Some(base)
-    }
-
-    /// Release a previously handed-out UMB or EMS frame at `base`, returning its
-    /// space to the free holes. ROM reservations are permanent: freeing one (or a
-    /// base that is not reserved) returns false and changes nothing.
+    /// Release a previously handed-out UMB at `base`, returning its space to the
+    /// free holes. ROM reservations are permanent: freeing one (or a base that is
+    /// not reserved) returns false and changes nothing.
     pub fn free(&mut self, base: u32) -> bool {
         if let Some(i) = self
             .reservations
@@ -283,23 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn ems_frame_is_64k_and_16k_aligned_and_disjoint_from_umbs() {
-        let mut map = UmaReservationMap::new();
-        // Interleave a UMB, the EMS frame, and another UMB: the P6 gate scenario.
-        let _u1 = map.alloc_umb(0x2000).expect("first UMB");
-        let frame = map.alloc_ems_frame().expect("the 64 KiB frame fits");
-        let _u2 = map.alloc_umb(0x2000).expect("second UMB");
-        assert_eq!(frame % EMS_FRAME_ALIGN, 0, "frame is 16 KiB-aligned");
-        let placed = map
-            .reservations()
-            .iter()
-            .find(|r| r.kind == UmaUse::EmsFrame)
-            .unwrap();
-        assert_eq!(placed.size, EMS_FRAME_SIZE);
-        assert_no_overlap(&map);
-    }
-
-    #[test]
     fn free_returns_a_umb_but_not_a_rom() {
         let mut map = UmaReservationMap::new();
         assert!(map.reserve_rom(WINDOW_BASE, 0x4000));
@@ -316,13 +260,13 @@ mod tests {
     #[test]
     fn the_window_runs_out_of_space() {
         let mut map = UmaReservationMap::new();
-        // Three 64 KiB frames tile the 192 KiB window exactly (0xC0000-0xEFFFF).
-        assert!(map.alloc_ems_frame().is_some());
-        assert!(map.alloc_ems_frame().is_some());
-        assert!(map.alloc_ems_frame().is_some());
+        // Three 64 KiB UMBs tile the 192 KiB window exactly (0xC0000-0xEFFFF).
+        assert!(map.alloc_umb(0x1_0000).is_some());
+        assert!(map.alloc_umb(0x1_0000).is_some());
+        assert!(map.alloc_umb(0x1_0000).is_some());
         // The window is now full.
         assert_eq!(map.total_free(), 0);
-        assert!(map.alloc_ems_frame().is_none(), "no fourth frame");
+        assert!(map.alloc_umb(0x1_0000).is_none(), "no fourth block");
         assert!(map.alloc_umb(PARAGRAPH).is_none(), "no room for a UMB");
         assert_no_overlap(&map);
     }
@@ -351,19 +295,6 @@ mod tests {
             .alloc_umb(0x1000)
             .expect("re-alloc into the reclaimed hole");
         assert_eq!(second, first);
-        assert_no_overlap(&map);
-    }
-
-    #[test]
-    fn ems_frame_skips_to_the_next_16k_boundary_past_an_unaligned_rom() {
-        let mut map = UmaReservationMap::new();
-        // A 0x5000 ROM (not 16 KiB-aligned) ends at 0xC5000; the frame must skip
-        // up to the next 16 KiB boundary, 0xC8000.
-        assert!(map.reserve_rom(WINDOW_BASE, 0x5000));
-        let frame = map.alloc_ems_frame().expect("the frame fits past the ROM");
-        assert!(frame >= WINDOW_BASE + 0x5000, "frame starts past the ROM");
-        assert_eq!(frame % EMS_FRAME_ALIGN, 0, "frame is 16 KiB-aligned");
-        assert_eq!(frame, WINDOW_BASE + 0x8000);
         assert_no_overlap(&map);
     }
 }
