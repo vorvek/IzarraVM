@@ -6122,7 +6122,7 @@ mod tests {
                 VideoMode::Mode13h | VideoMode::ModeX => vga.render_256color_row(line)[dot],
                 VideoMode::Text => vga.render_text_row(line)[dot],
                 VideoMode::Planar => vga.render_active_row(line)[dot],
-                VideoMode::Cga => 0,
+                VideoMode::Cga | VideoMode::Hercules => 0,
             };
             let pair = match (vga.attr.plane_enable >> 4) & 0x03 {
                 0x00 => (((color >> 2) & 1) << 1) | (color & 1),
