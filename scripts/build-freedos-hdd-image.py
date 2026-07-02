@@ -158,10 +158,15 @@ def extract_from_image(img):
     def chain_bytes(first, size):
         out = bytearray()
         c = first
-        while len(out) < size and 2 <= c < 0x0FFFFFF8:
+        # Bound the walk like the Rust extractor: a corrupt/cyclic FAT must
+        # fail loudly, never under-read or spin.
+        for _ in range(len(img) // BPS):
+            if len(out) >= size or not 2 <= c < 0x0FFFFFF8:
+                break
             off = data_off + (c - 2) * cluster_bytes
             out += img[off:off + cluster_bytes]
             c = fat_entry(c)
+        assert len(out) >= size, f"FAT chain shorter than the directory size ({len(out)} < {size})"
         return bytes(out[:size])
 
     files = []

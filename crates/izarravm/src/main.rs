@@ -2746,7 +2746,20 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         }
         let text = machine.screen_text().as_text();
         let lower = text.to_ascii_lowercase();
-        let in_v86 = machine.in_v86();
+        // The cycle budget can expire while the CPU is transiently inside the
+        // ring-0 monitor (a reflected IRQ), where in_v86() reads false on a
+        // healthy boot. Re-sample over a few short bursts rather than
+        // asserting one instant.
+        let mut in_v86 = machine.in_v86();
+        for _ in 0..4 {
+            if in_v86 {
+                break;
+            }
+            machine
+                .run_until_halt_or_cycles(1_000_000)
+                .expect("machine re-sample run");
+            in_v86 = machine.in_v86();
+        }
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             lower.contains("c:\\>"),
