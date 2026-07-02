@@ -572,6 +572,33 @@ impl Timer {
             }
         }
     }
+
+    /// Pure peek (P4a Slice 3 Task 3.1): would `self.expired` be true after
+    /// `micros_elapsed` more microseconds of chip time, without mutating
+    /// `self`? `expired` is sticky (only a register-0x04 bit7 write clears it,
+    /// via `OplChip::write_bank`), so the answer is `self.expired` already, OR
+    /// -- when running -- whether the count would cross 0xff within
+    /// `micros_elapsed`. Mirrors `advance`'s exact step arithmetic
+    /// (accumulated_us + micros, divided by step_us, whole steps added to
+    /// count) without the loop: since only the CROSSING matters (not the
+    /// reload value, which `expired_after` never needs), this is one division
+    /// instead of `advance`'s per-step subtraction loop.
+    ///
+    /// Not yet called from production code: this is the Task 3.1 promotion
+    /// (sized by its differential test above), wiring a lazy OPL status read to
+    /// it is Task 3.2, gated on this promotion.
+    #[allow(dead_code)]
+    fn expired_after(&self, micros_elapsed: u64) -> bool {
+        if self.expired {
+            return true;
+        }
+        if !self.running {
+            return false;
+        }
+        let total_us = self.accumulated_us + micros_elapsed;
+        let steps = total_us / self.step_us;
+        u32::from(self.count) + steps as u32 > 0xff
+    }
 }
 
 impl Default for OplChip {
@@ -1009,6 +1036,58 @@ impl OplChip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Differential test for `Timer::expired_after` (P4a Slice 3 Task 3.1): for
+    /// every `Timer` state in the sweep and every `micros_elapsed`, peeking must
+    /// report the exact same `expired` a real `.advance(micros_elapsed, preset)`
+    /// on a clone would produce, without mutating the original. Sweeps running/
+    /// stopped, already-expired, a spread of accumulated_us/step_us/count/preset,
+    /// and elapsed values straddling the overflow boundary (including 0).
+    #[test]
+    fn expired_after_matches_a_real_advance_on_a_clone() {
+        let step_us_values = [80u64, 320u64];
+        // count never actually reaches 0x100 in reachable Timer state:
+        // `advance` resets it to the preset in the same step that crosses
+        // 0xff, so the invariant is count <= 0xff always.
+        let count_values = [0u16, 1, 0xfe, 0xff];
+        let accumulated_us_values = [0u64, 1, 39, 79, 80, 319, 320];
+        let preset_values = [0u8, 1, 0x7f, 0xfe, 0xff];
+        let elapsed_values = [0u64, 1, 39, 79, 80, 81, 159, 160, 319, 320, 321, 5_000];
+
+        for &step_us in &step_us_values {
+            for &running in &[false, true] {
+                for &already_expired in &[false, true] {
+                    for &count in &count_values {
+                        for &accumulated_us in &accumulated_us_values {
+                            for &preset in &preset_values {
+                                let timer = Timer {
+                                    step_us,
+                                    count,
+                                    accumulated_us,
+                                    running,
+                                    expired: already_expired,
+                                };
+                                for &elapsed in &elapsed_values {
+                                    let mut clone = timer.clone();
+                                    clone.advance(elapsed, preset);
+                                    let expected = clone.expired;
+                                    let got = timer.expired_after(elapsed);
+                                    assert_eq!(
+                                        got, expected,
+                                        "step_us={step_us} running={running} \
+                                         already_expired={already_expired} \
+                                         count={count} accumulated_us={accumulated_us} \
+                                         preset={preset} elapsed={elapsed}: \
+                                         expired_after must match a real advance"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn exp_of_logsin_reconstructs_the_sine_quarter_wave() {
