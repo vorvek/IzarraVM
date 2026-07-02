@@ -6031,6 +6031,12 @@ impl Cpu386 {
                 // MOV reg, CR: whole-32-bit read of the selected control register. The ModRM is a
                 // register form (`mode == 3`); any other `mode` is an invalid encoding (#UD). The
                 // `reg` field is the CR number, `rm` the destination GPR.
+                //
+                // Privileged, like every other 0F 00/01 system-register op (LLDT/LTR/LMSW/CLTS
+                // all gate on require_cpl0 above). This was missing the gate: a CPL-3 guest
+                // (including a V86 task, which is architecturally always CPL 3) could read CR0
+                // straight through. #GP(0) outside CPL 0.
+                self.require_cpl0()?;
                 let modrm = insn.modrm.expect("MOV reg,CR decoded with a ModRM");
                 if modrm.mode != 3 {
                     return Err(CpuError::UnsupportedTwoByteOpcode {
@@ -6054,6 +6060,13 @@ impl Cpu386 {
                 // MOV CR, reg: whole-32-bit write of the selected control register. CR0 (paging
                 // enable / WP) and CR3 (page-table base) change translations, so flush the TLB
                 // (and code caches) via the unchanged helper; CR2/CR4 do not.
+                //
+                // Privileged (same require_cpl0 gate as LLDT/LTR/LMSW/CLTS). This was the
+                // prerequisite gap the owner flagged for VCPI work: without it, a ring-3 V86
+                // guest could silently write CR0 (e.g. flip PE/PG) or CR3 (repoint the page
+                // tables), which is a guest-fidelity and monitor-security hole. #GP(0) outside
+                // CPL 0.
+                self.require_cpl0()?;
                 let modrm = insn.modrm.expect("MOV CR,reg decoded with a ModRM");
                 if modrm.mode != 3 {
                     return Err(CpuError::UnsupportedTwoByteOpcode {
@@ -17796,6 +17809,41 @@ mod tests {
         assert_eq!(cpu.control.cr4, CR4_TSD);
         cpu.cycle(&mut bus).unwrap();
         assert_eq!(cpu.registers.ebx(), CR4_TSD);
+    }
+
+    #[test]
+    fn mov_cr_write_faults_at_cpl3() {
+        // 0F 22 C0 = MOV CR0, EAX (reg=0, rm=EAX). A ring-3 write to CR0 must
+        // never silently succeed -- it is a privileged instruction like every
+        // other 0F 00/01 system-register op (LLDT/LTR/LMSW/CLTS all gate on
+        // require_cpl0). Mirrors the cpl3_code + vector-13 shape used by the
+        // RDMSR/RDTSC privilege tests above.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x22, 0xc0]);
+        cpu.registers.set_eax(CR0_PE);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn mov_cr_read_faults_at_cpl3() {
+        // 0F 20 C0 = MOV EAX, CR0 (reg=0, rm=EAX). The read side has the same
+        // gap as the write side; a ring-3 guest must not be able to probe CR0
+        // either.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x20, 0xc0]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
     }
 
     #[test]
