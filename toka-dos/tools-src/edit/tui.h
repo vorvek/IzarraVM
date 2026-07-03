@@ -2,6 +2,9 @@
 #ifndef TUI_H
 #define TUI_H
 
+/* Screen-coordinate domain: row 0..24, col 0..79. Callers must stay in
+ * range; out-of-range row/col is undefined (cell_off math assumes it). */
+
 void scr_init(void);                 /* force mode 3 */
 void scr_exit(void);                 /* set mode 3 again (clears screen) */
 void scr_put(int row, int col, const char *s, unsigned char attr);
