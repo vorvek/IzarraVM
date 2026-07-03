@@ -8354,6 +8354,19 @@ impl Cpu386 {
         // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
         // hardware interrupt or software `INT n`, even when it lands on such a vector.
         if !is_external && vector_pushes_error_code(vector) {
+            // TOKAEMM's vec13 discriminator (emulator contract): every #GP this
+            // core can deliver on vector 13 pushes error code EXACTLY 0, so a
+            // nonzero value in the frame slot at [esp+32] after the monitor's
+            // pushad can only be an external IRQ frame's EIP. Every current
+            // vector-13 raise site passes Some(0); this tripwire catches a
+            // future selector-carrying #GP (e.g. DPMI-grade descriptor faults)
+            // before it silently breaks the monitor's frame-shape check --
+            // update tokaemm.asm's vec13_entry BEFORE relaxing this.
+            debug_assert!(
+                vector != 13 || error_code.unwrap_or(0) == 0,
+                "vector-13 #GP with a nonzero error code ({error_code:?}) breaks \
+                 the TOKAEMM vec13 frame-shape discriminator"
+            );
             self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
 
