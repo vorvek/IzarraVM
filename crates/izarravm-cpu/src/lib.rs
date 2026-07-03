@@ -1,9 +1,21 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus, DirectPage};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 mod fpu;
 mod mmx;
 pub use fpu::X87;
+
+/// Gate for the opt-in `#UD` diagnostic trace (T1.5: making a reflected #UD
+/// observable, see `Cpu386::trace_ud_if_enabled`). Mirrors
+/// `izarravm_machine::fault_trace_enabled` (same env var), cached after the
+/// first check so a #UD storm costs one atomic load per fault rather than a
+/// syscall. Measurement-only: this crate has no other env dependency, and the
+/// gate is read only on the cold vector-6 delivery path, never per-instruction.
+fn ud_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_FAULT_TRACE").is_some())
+}
 
 const FLAG_CF: u32 = 0x0000_0001;
 const FLAG_PF: u32 = 0x0000_0004;
@@ -8279,6 +8291,63 @@ impl Cpu386 {
         }
     }
 
+    /// T1.5 diagnostic: log a `#UD` (vector 6) at the moment it is about to be
+    /// reflected to the guest's own IDT handler. Two real V86 EMM managers
+    /// (386MAX, JEMMEX) raise `#UD` during their own init and spin forever in
+    /// their handler; the CPU reflects it cleanly (no fatal `CpuError`), so the
+    /// existing `IZARRAVM_FAULT_TRACE` machine-level trace (which only fires on
+    /// a fatal `CpuError` or the 0xE6 `CMD_EXIT` port) prints nothing. This is
+    /// the single choke point for every #UD raise site (decoder
+    /// unimplemented-opcode fallback and every semantic #UD check): by the time
+    /// `deliver_exception` runs, `finish_instruction` has already rewound
+    /// `eip`/`cs` to the faulting instruction's first byte (see
+    /// `finish_instruction`), so `self.registers.cs()/eip` here IS the actual
+    /// faulting guest CS:IP, not a monitor's. Gated on `ud_trace_enabled()`
+    /// (same `IZARRAVM_FAULT_TRACE` env var as the machine crate's fault
+    /// trace); a no-op call on the cold vector-6-only path when off.
+    fn trace_ud_if_enabled<B: CpuBus>(&mut self, bus: &mut B) {
+        if !ud_trace_enabled() {
+            return;
+        }
+        let cs = self.registers.cs();
+        let eip = self.registers.eip;
+        // Read the raw bytes at the faulting linear address fresh (rather than
+        // reusing whatever the decoder buffered) so this covers BOTH #UD
+        // origins uniformly: the decoder's unimplemented-opcode fallback and a
+        // semantic #UD raised after decode. Best-effort: stop at the first
+        // unreadable byte (e.g. a page boundary fault) rather than erroring --
+        // this is a diagnostic read, it must never itself fault the guest.
+        const MAX_BYTES: u32 = 12;
+        let mut bytes = Vec::with_capacity(MAX_BYTES as usize);
+        for i in 0..MAX_BYTES {
+            let linear = cs.base.wrapping_add(eip).wrapping_add(i);
+            let Ok(phys) = self.translate_linear(bus, linear, false) else {
+                break;
+            };
+            let Ok(byte) =
+                bus.read_memory(phys, BusWidth::Byte, BusAccessKind::InstructionPrefetch)
+            else {
+                break;
+            };
+            bytes.push(byte as u8);
+        }
+        let byte_str = bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "fault trace: #UD at CS:IP={:#06x}:{:#010x} bytes=[{byte_str}] \
+             cr0={:#010x} eflags={:#010x} vm={} cpl={}",
+            cs.selector,
+            eip,
+            self.control.cr0,
+            self.registers.eflags,
+            self.is_v86_mode(),
+            self.current_privilege_level(),
+        );
+    }
+
     fn deliver_exception<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -8289,6 +8358,9 @@ impl Cpu386 {
         // to vector 8, #DF). Only a genuine CPU exception pushes one.
         is_external: bool,
     ) -> ExecResult<()> {
+        if vector == 6 && !is_external {
+            self.trace_ud_if_enabled(bus);
+        }
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
         }
