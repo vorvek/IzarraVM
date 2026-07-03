@@ -1,9 +1,9 @@
 # Using Toka-DOS
 
 Toka-DOS is the Izarra 3000's bundled operating system: a FreeDOS-based
-DOS built to General Simulation Works's own product identity, shipped
-pre-installed on the hard disk. This page covers what you get at the C:\>
-prompt and how the disk is laid out.
+DOS built to General Simulation Works's own product identity, shipped in the
+machine's system ROM and mounted onto the hard disk at boot. This page covers
+what you get at the C:\> prompt and how the disk is laid out.
 
 ## Boot banner
 
@@ -47,6 +47,23 @@ C:\DOS\
 `AUTOEXEC.BAT` puts `C:\DOS` on the `PATH`, so every tool runs from any
 directory by name. See the [DOS command reference](commands.md) for what each
 one does.
+
+## The system ROM
+
+Toka-DOS does not really live on the hard disk. It ships inside the Izarra
+3000's system ROM and is mounted onto C: at power-on, so the operating system
+comes up the same on every boot no matter what the last program did to the
+disk. General Simulation Works built the ROM to be reflashed for updates, but
+none ever shipped, so Toka-DOS ended up immutable: the hidden `KERNEL.SYS`, the
+shell, and everything under `C:\DOS` are mounted read-only and cannot be
+deleted or overwritten from DOS. Most DOS machines of the era ran the whole
+system off a writable disk; the Izarra 3000 kept it in ROM instead.
+
+`CONFIG.SYS` and `AUTOEXEC.BAT` are the two exceptions. The machine writes
+editable copies of them to C: the first time it boots and then leaves them
+alone, so your startup configuration is yours to change while the system files
+underneath it never drift. [Repair Toka-DOS](#repair-toka-dos) resets just
+those two files to the ROM defaults if you want the stock startup back.
 
 ## Drive letters
 
