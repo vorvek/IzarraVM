@@ -101,7 +101,7 @@ sit on the `PATH`, so you run them by name from any directory.
 ## XCOPY
 
 Copies files and directory trees. Toka-DOS's XCOPY is original project code
-written to XCOPY's documented behavior, not a ported FreeDOS binary — it
+written to XCOPY's documented behavior, not a ported FreeDOS binary. It
 implements a deliberately smaller switch set than real MS-DOS XCOPY.
 
 ```
@@ -120,7 +120,7 @@ XCOPY source [destination] [/S] [/E] [/P] [/V] [/W] [/Y] [/-Y]
 
 Not implemented: `/C`, `/D`, `/H`, `/K`, `/N`, `/O`, `/T`, `/U`, `/L`, `/Z`.
 Unlike real XCOPY, Toka-DOS's XCOPY never asks "(F = file, D = directory)?"
-for an ambiguous destination — it infers file-versus-directory from `/S`,
+for an ambiguous destination. It infers file-versus-directory from `/S`,
 `/E`, or a multi-file wildcard source instead of prompting.
 
 Exit codes: 0 success, 1 no files found, 4 initialization error (bad usage,
@@ -137,7 +137,7 @@ MEM [/P] [/FULL] [/DEBUG] [/PAGE] [...]
 
 By default, `MEM` prints the usual conventional/upper/extended summary.
 Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE` (pause after
-each screenful) — the per-program size-and-segment listing normally needs
+each screenful). The per-program size-and-segment listing normally needs
 `/FULL` or `/DEBUG` instead. **Toka-DOS divergence:** `MEM /P` pauses *and*
 lists every program in memory with its size and position, folding `/FULL`'s
 behavior into `/P` so the one switch does what a Toka-DOS user would expect
@@ -162,7 +162,7 @@ ATTRIB { options | [path\][file] | /@[list] }
 | `/D` | Process directory names for wildcard arguments. |
 | `/@` | Process the files listed in the given file (or stdin). |
 
-A leading comma before a filename (`,file`) clears all attributes at once —
+A leading comma before a filename (`,file`) clears all attributes at once,
 an undocumented but real behavior carried over from real MS-DOS ATTRIB.
 
 ## CHOICE
@@ -223,7 +223,7 @@ DELTREE [/Y] [/V]
 
 `/Y` deletes without the usual per-item Y/N confirmation. `/V` reports item
 counts and totals when it finishes. Without `/Y`, DELTREE asks for
-confirmation before removing anything — matching real MS-DOS DELTREE rather
+confirmation before removing anything, matching real MS-DOS DELTREE rather
 than deleting silently.
 
 ## LABEL
@@ -268,7 +268,7 @@ SORT [/R] [/+num] [/A] [/?] [file]
 | `/R` | Reverse the sort order. |
 | `/+num` | Start sorting at column `num` (1-based). |
 | `/A` | Sort by raw ASCII order instead of the active country/collation table. |
-| `/N` | Force country-aware (NLS) collation — the default even without it. |
+| `/N` | Force country-aware (NLS) collation, the default even without it. |
 
 ## GSWMODE
 
@@ -297,8 +297,8 @@ GSWMODE: switched to <mode>.
 
 This is a **runtime-only** switch: it never touches CMOS, so the BIOS's
 saved boot-time speed (set from the [Tab boot menu](../izarra-3000/user-manual.md#the-tab-boot-menu)
-or the [Del setup panel](../izbios/configuration-panel.md)) is unaffected —
-your next cold boot still starts at whatever speed you saved there.
+or the [Del setup panel](../izbios/configuration-panel.md)) is unaffected.
+Your next cold boot still starts at whatever speed you saved there.
 
 ## TOKAMOUS
 
@@ -310,7 +310,7 @@ compatible, plus the CuteMouse wheel extension).
 TOKAMOUS
 ```
 
-No arguments — it installs itself and returns to the prompt, or is loaded
+No arguments: it installs itself and returns to the prompt, or is loaded
 from `AUTOEXEC.BAT` with `LH TOKAMOUS` to load high into a
 [TOKAEMM](../tokaemm/manual.md) upper memory block when one is free. Once
 resident, it prints:
@@ -319,13 +319,13 @@ resident, it prints:
 Toka-DOS mouse driver installed.
 ```
 
-and any mouse-aware DOS program talks to it through `INT 33h` from then on
-— cursor show/hide, position and button state, motion callbacks, and the
+and any mouse-aware DOS program talks to it through `INT 33h` from then on:
+cursor show/hide, position and button state, motion callbacks, and the
 wheel functions software checks for via CuteMouse's `AX=0x11` detection.
 
 ## Next
 
-- [Using Toka-DOS](using-toka-dos.md) — the shell, the disk layout, and what
+- [Using Toka-DOS](using-toka-dos.md): the shell, the disk layout, and what
   boots by default.
-- [The TOKAEMM manual](../tokaemm/manual.md) — the memory manager these
+- [The TOKAEMM manual](../tokaemm/manual.md): the memory manager these
   commands and the shell run on top of.

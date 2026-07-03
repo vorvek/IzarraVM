@@ -17,7 +17,7 @@ See C:\LICENSE.TXT for more.
 `C:\LICENSE.TXT` explains what Toka-DOS is actually built from: the FreeDOS
 kernel and FreeCOM shell, plus MOVE, SORT, MEM, and other tools from the
 FreeDOS project, all free software under the GNU GPL. General Simulation
-Works's own additions — `GSWMODE`, `TOKAMOUS`, `TOKAEMM.SYS` — are layered on
+Works's own additions (`GSWMODE`, `TOKAMOUS`, `TOKAEMM.SYS`) are layered on
 top of that stock FreeDOS base; the shell and kernel underneath are
 otherwise unmodified.
 
@@ -31,7 +31,7 @@ C:\
     CONFIG.SYS      AUTOEXEC.BAT    LICENSE.TXT     DOS\
 ```
 
-`KERNEL.SYS` lives in the root too — the boot sector loads it by name — but it
+`KERNEL.SYS` lives in the root too, because the boot sector loads it by name, but it
 is hidden, so a plain `DIR` of C:\ shows only `CONFIG.SYS`, `AUTOEXEC.BAT`,
 `LICENSE.TXT`, and the `DOS` folder. Everything you actually run lives in
 `C:\DOS`:
@@ -70,7 +70,7 @@ those two files to the ROM defaults if you want the stock startup back.
 | Drive | What it is |
 | --- | --- |
 | **A:** | The floppy drive. Mount a `.img`/`.ima`/`.flp` image from the IzarraVM GUI. |
-| **C:** | The hard disk — in IzarraVM, a real host folder presented as a FAT disk. |
+| **C:** | The hard disk. In IzarraVM, a real host folder presented as a FAT disk. |
 | **D:** | The ATAPI CD-ROM. Mount an ISO, a CUE/BIN pair, or a host folder as a data disc from the GUI. |
 
 `CONFIG.SYS` sets `LASTDRIVE=D`, matching exactly these three drives with
@@ -111,9 +111,9 @@ SET BLASTER=A220 I5 D1 H5 T6
 LH TOKAMOUS
 ```
 
-`SET BLASTER` advertises the ReSonique 2's Sound Blaster–compatible digital
+`SET BLASTER` advertises the ReSonique 2's Sound Blaster-compatible digital
 audio to any program that looks for the environment variable (base 0x220,
-IRQ 5, 8-bit DMA 1, 16-bit DMA 5) — see the
+IRQ 5, 8-bit DMA 1, 16-bit DMA 5). See the
 [ReSonique 2 manual](../resonique2/manual.md) for what those numbers mean.
 `LH TOKAMOUS` loads the mouse driver high, into an upper memory block if
 [TOKAEMM](../tokaemm/manual.md) has one free, falling back to a normal load
@@ -121,8 +121,8 @@ otherwise.
 
 ## Repair Toka-DOS
 
-If the installed copy is damaged — files deleted, `COMMAND.COM` overwritten,
-whatever went wrong — the [IZBIOS setup panel](../izbios/configuration-panel.md)
+If the installed copy is damaged (files deleted, `COMMAND.COM` overwritten,
+whatever went wrong), the [IZBIOS setup panel](../izbios/configuration-panel.md)
 has a **Repair Toka-DOS** row that reinstalls this same disk layout from the
 image built into ROM. It only touches the Toka-DOS system files; anything
 else you've put on C: is left alone. This is a repair action, not a full
@@ -132,9 +132,9 @@ overwritten.
 
 ## Next
 
-- [DOS command reference](commands.md) — every shipped external command,
+- [DOS command reference](commands.md): every shipped external command,
   with its switches.
-- [The TOKAEMM manual](../tokaemm/manual.md) — memory management: XMS, EMS,
+- [The TOKAEMM manual](../tokaemm/manual.md): memory management, covering XMS, EMS,
   UMBs, and the V86 monitor underneath it.
-- [GSWMODE](commands.md#gswmode) — change CPU speed class without leaving
+- [GSWMODE](commands.md#gswmode): change CPU speed class without leaving
   DOS.
