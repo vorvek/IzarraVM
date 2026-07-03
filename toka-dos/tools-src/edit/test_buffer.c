@@ -76,6 +76,33 @@ static void test_line_cap(void) {
     buf_free(&b);
 }
 
+static void test_range_get_delete_insert(void) {
+    Buf b = load("alpha\r\nbeta\r\ngamma\r\n");
+    Range r = {0, 2, 2, 3};                    /* "pha\r\nbeta\r\ngam" */
+    char *cut;
+    int er, ec;
+    cut = buf_get_range(&b, &r);
+    assert(cut && strcmp(cut, "pha\r\nbeta\r\ngam") == 0);
+    assert(buf_delete_range(&b, &r));
+    assert(b.nlines == 1 && strcmp(b.lines[0], "alma") == 0);
+    assert(buf_insert_text(&b, 0, 2, cut, &er, &ec)); /* paste it back */
+    assert(b.nlines == 3 && er == 2 && ec == 3);
+    assert(strcmp(b.lines[0], "alpha") == 0);
+    assert(strcmp(b.lines[1], "beta") == 0);
+    assert(strcmp(b.lines[2], "gamma") == 0);
+    free(cut); buf_free(&b);
+}
+
+static void test_single_line_range(void) {
+    Buf b = load("abcdef\r\n");
+    Range r = {0, 1, 0, 4};
+    char *s = buf_get_range(&b, &r);
+    assert(s && strcmp(s, "bcd") == 0);
+    assert(buf_delete_range(&b, &r));
+    assert(strcmp(b.lines[0], "aef") == 0);
+    free(s); buf_free(&b);
+}
+
 int main(void) {
     test_load_save_roundtrip();
     test_lf_only_tabs_and_eof_char();
@@ -83,6 +110,8 @@ int main(void) {
     test_insert_and_split();
     test_delete_and_join();
     test_line_cap();
+    test_range_get_delete_insert();
+    test_single_line_range();
     puts("buffer core: OK");
     return 0;
 }

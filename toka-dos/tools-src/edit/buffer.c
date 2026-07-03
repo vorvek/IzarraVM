@@ -173,19 +173,198 @@ int buf_split_line(Buf *b, int row, int col) {
 }
 
 char *buf_get_range(const Buf *b, const Range *r) {
-    (void)b; (void)r;
-    return NULL;
+    long total; char *out; char *p; int row;
+    if (r->r1 == r->r2) {
+        int len = r->c2 - r->c1;
+        char *s = malloc((size_t)len + 1);
+        if (!s) return NULL;
+        memcpy(s, b->lines[r->r1] + r->c1, (size_t)len);
+        s[len] = 0;
+        return s;
+    }
+    total = (long)(b->lens[r->r1] - r->c1) + 2;
+    for (row = r->r1 + 1; row < r->r2; row++) total += b->lens[row] + 2;
+    total += r->c2;
+    out = malloc((size_t)total + 1);
+    if (!out) return NULL;
+    p = out;
+    memcpy(p, b->lines[r->r1] + r->c1, (size_t)(b->lens[r->r1] - r->c1));
+    p += b->lens[r->r1] - r->c1;
+    *p++ = '\r'; *p++ = '\n';
+    for (row = r->r1 + 1; row < r->r2; row++) {
+        memcpy(p, b->lines[row], (size_t)b->lens[row]);
+        p += b->lens[row];
+        *p++ = '\r'; *p++ = '\n';
+    }
+    memcpy(p, b->lines[r->r2], (size_t)r->c2);
+    p += r->c2;
+    *p = 0;
+    return out;
 }
 
 int buf_delete_range(Buf *b, const Range *r) {
-    (void)b; (void)r;
-    return 0;
+    if (r->r1 == r->r2) {
+        int len = b->lens[r->r1];
+        int cutlen = r->c2 - r->c1;
+        memmove(b->lines[r->r1] + r->c1, b->lines[r->r1] + r->c2,
+                (size_t)(len - r->c2) + 1);
+        b->lens[r->r1] = len - cutlen;
+        b->dirty = 1;
+        return 1;
+    }
+    {
+        int headlen, tailfromlen, nlen, i, gap;
+        char *nl;
+        headlen = r->c1;
+        tailfromlen = b->lens[r->r2] - r->c2;
+        nlen = headlen + tailfromlen;
+        if (nlen > BUF_MAX_LINE) return 0;
+        nl = malloc((size_t)nlen + 1);
+        if (!nl) return 0;
+        memcpy(nl, b->lines[r->r1], (size_t)headlen);
+        memcpy(nl + headlen, b->lines[r->r2] + r->c2, (size_t)tailfromlen);
+        nl[nlen] = 0;
+        free(b->lines[r->r1]);
+        b->lines[r->r1] = nl;
+        b->lens[r->r1] = nlen;
+        for (i = r->r1 + 1; i <= r->r2; i++) free(b->lines[i]);
+        gap = r->r2 - r->r1;
+        for (i = r->r1 + 1; i < b->nlines - gap; i++) {
+            b->lines[i] = b->lines[i + gap];
+            b->lens[i] = b->lens[i + gap];
+        }
+        b->nlines -= gap;
+        b->dirty = 1;
+        return 1;
+    }
 }
 
 int buf_insert_text(Buf *b, int row, int col, const char *text,
                      int *end_row, int *end_col) {
-    (void)b; (void)row; (void)col; (void)text; (void)end_row; (void)end_col;
-    return 0;
+    int nsegs = 1;
+    const char *p;
+    int i;
+    const char **seg_start; int *seg_len;
+    int headlen, taillen, ok;
+
+    /* count segments (split on \n, skip \r) */
+    for (p = text; *p; p++) if (*p == '\n') nsegs++;
+
+    seg_start = malloc((size_t)nsegs * sizeof(char *));
+    seg_len = malloc((size_t)nsegs * sizeof(int));
+    if (!seg_start || !seg_len) { free(seg_start); free(seg_len); return 0; }
+
+    {
+        int idx = 0;
+        const char *segbeg = text;
+        for (p = text; ; p++) {
+            if (*p == '\n' || *p == 0) {
+                int len = (int)(p - segbeg);
+                /* trim trailing \r from this segment */
+                if (len > 0 && segbeg[len - 1] == '\r') len--;
+                seg_start[idx] = segbeg;
+                seg_len[idx] = len;
+                idx++;
+                if (*p == 0) break;
+                segbeg = p + 1;
+            }
+        }
+    }
+
+    headlen = col;
+    taillen = b->lens[row] - col;
+
+    /* validate lengths first */
+    ok = 1;
+    if (nsegs == 1) {
+        if (headlen + seg_len[0] + taillen > BUF_MAX_LINE) ok = 0;
+    } else {
+        if (headlen + seg_len[0] > BUF_MAX_LINE) ok = 0;
+        for (i = 1; i < nsegs - 1; i++)
+            if (seg_len[i] > BUF_MAX_LINE) ok = 0;
+        if (seg_len[nsegs - 1] + taillen > BUF_MAX_LINE) ok = 0;
+    }
+    if (!ok) { free(seg_start); free(seg_len); return 0; }
+
+    if (nsegs == 1) {
+        int newlen = headlen + seg_len[0] + taillen;
+        char *nl = realloc(b->lines[row], (size_t)newlen + 1);
+        if (!nl) { free(seg_start); free(seg_len); return 0; }
+        memmove(nl + headlen + seg_len[0], nl + headlen, (size_t)taillen);
+        memcpy(nl + headlen, seg_start[0], (size_t)seg_len[0]);
+        nl[newlen] = 0;
+        b->lines[row] = nl;
+        b->lens[row] = newlen;
+        *end_row = row;
+        *end_col = headlen + seg_len[0];
+    } else {
+        char *tail_orig; int tail_orig_len;
+        int newlines_to_add;
+        int wr;
+
+        tail_orig_len = taillen;
+        tail_orig = malloc((size_t)tail_orig_len + 1);
+        if (!tail_orig) { free(seg_start); free(seg_len); return 0; }
+        memcpy(tail_orig, b->lines[row] + col, (size_t)tail_orig_len);
+        tail_orig[tail_orig_len] = 0;
+
+        newlines_to_add = nsegs - 1;
+        if (!buf_reserve(b, b->nlines + newlines_to_add)) {
+            free(tail_orig); free(seg_start); free(seg_len);
+            return 0;
+        }
+
+        /* shift existing lines after row down by newlines_to_add */
+        for (i = b->nlines - 1; i > row; i--) {
+            b->lines[i + newlines_to_add] = b->lines[i];
+            b->lens[i + newlines_to_add] = b->lens[i];
+        }
+        b->nlines += newlines_to_add;
+
+        /* line row: head + seg0 */
+        {
+            int newlen0 = headlen + seg_len[0];
+            char *nl0 = realloc(b->lines[row], (size_t)newlen0 + 1);
+            if (!nl0) { free(tail_orig); free(seg_start); free(seg_len); return 0; }
+            memcpy(nl0 + headlen, seg_start[0], (size_t)seg_len[0]);
+            nl0[newlen0] = 0;
+            b->lines[row] = nl0;
+            b->lens[row] = newlen0;
+        }
+
+        /* middle segments become new lines row+1..row+nsegs-2 */
+        wr = row + 1;
+        for (i = 1; i < nsegs - 1; i++) {
+            char *ml = malloc((size_t)seg_len[i] + 1);
+            if (!ml) { free(tail_orig); free(seg_start); free(seg_len); return 0; }
+            memcpy(ml, seg_start[i], (size_t)seg_len[i]);
+            ml[seg_len[i]] = 0;
+            b->lines[wr] = ml;
+            b->lens[wr] = seg_len[i];
+            wr++;
+        }
+
+        /* last segment + original tail becomes line row+nsegs-1 */
+        {
+            int lastlen = seg_len[nsegs - 1] + tail_orig_len;
+            char *ll = malloc((size_t)lastlen + 1);
+            if (!ll) { free(tail_orig); free(seg_start); free(seg_len); return 0; }
+            memcpy(ll, seg_start[nsegs - 1], (size_t)seg_len[nsegs - 1]);
+            memcpy(ll + seg_len[nsegs - 1], tail_orig, (size_t)tail_orig_len);
+            ll[lastlen] = 0;
+            b->lines[wr] = ll;
+            b->lens[wr] = lastlen;
+        }
+
+        *end_row = row + nsegs - 1;
+        *end_col = seg_len[nsegs - 1];
+        free(tail_orig);
+    }
+
+    free(seg_start);
+    free(seg_len);
+    b->dirty = 1;
+    return 1;
 }
 
 int buf_find(const Buf *b, int row, int col, const char *needle, int fold,
