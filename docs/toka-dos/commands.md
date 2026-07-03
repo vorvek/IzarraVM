@@ -1,9 +1,102 @@
 # DOS Command Reference
 
-Every external command Toka-DOS ships, with the switches it actually
-implements. Most of these are FreeDOS tools carried over with a Toka-DOS
-rebrand; a few are General Simulation Works's own additions. Where Toka-DOS
-diverges from the command's usual behavior, this page says so.
+Toka-DOS commands come in two kinds. The **built-in commands** (`DIR`, `COPY`,
+`DEL`, and the rest) live inside `COMMAND.COM` and are always available. The
+**external commands** are the programs in `C:\DOS` (`XCOPY`, `MEM`, `ATTRIB`,
+and so on), each a real file, most carried over from FreeDOS with a Toka-DOS
+rebrand and a few written by General Simulation Works. This page lists the
+built-ins first, then documents each external command with the switches it
+actually implements. Where Toka-DOS diverges from a command's usual behavior,
+it says so.
+
+## Built-in commands
+
+These are part of `COMMAND.COM` itself, not separate files on disk. They are
+available at the `C:\>` prompt and in batch files even before `PATH` is set or
+if `C:\DOS` is missing, because the shell carries them in memory. Add `/?` to
+any of them for its full built-in help.
+
+Some have a short and a long spelling that do the same thing: `MD`/`MKDIR`,
+`RD`/`RMDIR`, `CD`/`CHDIR`, `DEL`/`ERASE`, `REN`/`RENAME`, and `LH`/`LOADHIGH`.
+
+### Files and directories
+
+| Command | Syntax | What it does |
+| --- | --- | --- |
+| `COPY` | `COPY [/A\|/B] source [+ src ...] [dest] [/V] [/Y\|/-Y]` | Copy files, or join several into one with `src1+src2`. `/A` ASCII, `/B` binary, `/V` verify, `/Y` overwrite without asking, `/-Y` ask first. |
+| `DEL` / `ERASE` | `DEL [path]file [/P] [/V]` | Delete files (wildcards allowed). `/P` confirm each, `/V` list what was deleted. |
+| `REN` / `RENAME` | `REN [path]oldname newname` | Rename a file or directory. |
+| `TYPE` | `TYPE [path]file` | Print a text file to the screen. |
+| `DIR` | `DIR [path][file] [/P] [/W] [/A[:attrs]] [/O[:order]] [/S] [/B] [/L]` | List files. `/P` page, `/W` wide, `/S` recurse, `/B` bare names, `/A` filter by attribute, `/O` sort. Defaults come from the `DIRCMD` variable. |
+| `MD` / `MKDIR` | `MD [drive:]path` | Create a directory. |
+| `RD` / `RMDIR` | `RD [drive:]path` | Remove an empty directory. |
+| `CD` / `CHDIR` | `CD [drive:][path]` | Show or change the current directory; `CD -` returns to the previous one. |
+| `CDD` | `CDD [drive:][path]` | Change the current directory and drive together. |
+| `TRUENAME` | `TRUENAME [path]` | Show the full, canonical path of a name. |
+| `VOL` | `VOL [drive:]` | Show a disk's volume label and serial number. |
+
+### Batch and scripting
+
+| Command | Syntax | What it does |
+| --- | --- | --- |
+| `ECHO` | `ECHO [ON\|OFF]` / `ECHO message` / `ECHO.` | Print a message, or turn command echo on/off. `ECHO.` prints a blank line. |
+| `REM` | `REM [comment]` | A comment line in a batch file or `CONFIG.SYS`. (`TITLE` is accepted as a synonym; DOS has no window title to set.) |
+| `IF` | `IF [NOT] ERRORLEVEL n cmd` / `IF [NOT] a==b cmd` / `IF [NOT] EXIST file cmd` | Run `cmd` when a condition holds. `IF /I` compares text case-insensitively. |
+| `FOR` | `FOR %v IN (set) DO cmd` | Repeat `cmd` for each item in `set` (write `%%v` in a batch file). |
+| `GOTO` | `GOTO label` | Jump to a `:label` line in a batch file. |
+| `CALL` | `CALL [path]file [args]` | Run another batch file and return afterward. |
+| `SHIFT` | `SHIFT [DOWN]` | Shift the `%1 %2 ...` batch parameters along. |
+| `PAUSE` | `PAUSE [message]` | Wait for a keypress ("Press any key to continue..."). |
+| `EXIT` | `EXIT` | Leave this shell. The boot shell starts with `/P`, so it ignores `EXIT`. |
+
+### Environment and shell
+
+| Command | Syntax | What it does |
+| --- | --- | --- |
+| `SET` | `SET [/P] [/C] [var[=value]]` | Show, set, or clear environment variables. `/P` reads the value from the user. `SET var` with no value removes it. |
+| `PATH` | `PATH [dir[;...]]` | Show or set the program search path. |
+| `PROMPT` | `PROMPT [text]` | Change the prompt (the default is `$P$G`). |
+| `ALIAS` | `ALIAS [name[=]string]` | Show, set, or remove command aliases. |
+| `VER` | `VER [/R] [/W] [/D] [/C]` | Show the version. `/R` adds kernel details; `/W`, `/D`, `/C` show warranty, redistribution, and contributors. |
+| `DATE` | `DATE [/D] [date]` | Show or set the date. `/D` skips the interactive prompt. |
+| `TIME` | `TIME [/T] [time]` | Show or set the time. `/T` skips the prompt. |
+| `CHCP` | `CHCP [nnn]` | Show or set the active code page. |
+| `VERIFY` | `VERIFY [ON\|OFF]` | Turn write-after-verify on or off. |
+| `BREAK` | `BREAK [ON\|OFF]` | Turn extended Ctrl+C checking on or off. |
+| `CLS` | `CLS` | Clear the screen. |
+| `BEEP` | `BEEP` | Beep the speaker. |
+| `CTTY` | `CTTY device` | Move console input and output to another device, such as `COM1`. |
+
+### Loading programs high
+
+| Command | Syntax | What it does |
+| --- | --- | --- |
+| `LH` / `LOADHIGH` | `LH [path]file [args]` | Load a program into an upper memory block. Needs [TOKAEMM](../tokaemm/manual.md) UMBs; falls back to a normal load if none are free. |
+| `LOADFIX` | `LOADFIX [path]file [args]` | Load a program above the first 64 KB, for old programs that fail there with "Packed file corrupt". |
+
+### History and the directory stack
+
+| Command | Syntax | What it does |
+| --- | --- | --- |
+| `DOSKEY` | `DOSKEY` | Command-line recall and editing, built into the shell: Up/Down recall previous lines, Tab completes filenames. |
+| `HISTORY` | `HISTORY [size]` | Show the command history, or resize its buffer. |
+| `PUSHD` | `PUSHD [path]` | Save the current directory on a stack, optionally changing to `path`. |
+| `POPD` | `POPD` | Return to the directory last saved by `PUSHD`. |
+| `DIRS` | `DIRS` | Show the directory stack. |
+
+### Help and diagnostics
+
+| Command | Syntax | What it does |
+| --- | --- | --- |
+| `?` | `?` | List every built-in command. |
+| `WHICH` | `WHICH command...` | Show which program a command name would run. |
+| `LFNFOR` | `LFNFOR [ON\|OFF]` | Turn long-filename expansion in `FOR` on or off. |
+| `MEMORY` | `MEMORY` | Report the shell's own internal memory use. This is not [MEM](#mem), the external memory report. |
+
+## External commands
+
+The rest of this page documents the programs in `C:\DOS`, one per section. They
+sit on the `PATH`, so you run them by name from any directory.
 
 ## XCOPY
 
