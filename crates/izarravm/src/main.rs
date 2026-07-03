@@ -101,6 +101,15 @@ struct Cli {
     /// The folder's top-level files are surfaced read-only beside the OS.
     #[arg(long)]
     hdd_folder: Option<PathBuf>,
+    /// With --hdd-folder, print a machine-readable result block after stop:
+    /// stop reason, CS:IP, full register state, and the 80x25 text page. For
+    /// headless benchmark/timedemo runs whose result lands in text mode.
+    #[arg(long)]
+    dump_result: bool,
+    /// With --hdd-folder, write the final framebuffer to this PPM (P6) path.
+    /// For headless benchmark/timedemo runs whose result lands in graphics mode.
+    #[arg(long)]
+    result_ppm: Option<PathBuf>,
     /// Boot real FreeDOS from a temp Katea disk and run a single DOS program,
     /// exiting with its DOS exit code (the Katea replacement for --headless-run).
     #[arg(long)]
@@ -210,7 +219,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(dir) = &cli.hdd_folder {
-        return run_boot_hdd_folder(dir, cli.cycles, &hardware);
+        return run_boot_hdd_folder(
+            dir,
+            cli.cycles,
+            &hardware,
+            cli.dump_result,
+            cli.result_ppm.as_deref(),
+        );
     }
 
     if let Some(prog) = &cli.katea_run {
@@ -1611,6 +1626,8 @@ fn run_boot_hdd_folder(
     dir: &Path,
     cycles: Option<u64>,
     hardware: &HardwareProfile,
+    dump_result: bool,
+    result_ppm: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let mut machine = Machine::new(
         MachineProfile::from_hardware_profile(hardware),
@@ -1637,6 +1654,76 @@ fn run_boot_hdd_folder(
         println!("boot: still in the BIOS (no boot, or read error)");
     }
     print_video_summary(&mut machine);
+    if dump_result {
+        print_dump_result(&mut machine, &stop_reason);
+    }
+    if let Some(path) = result_ppm {
+        write_framebuffer_ppm(&mut machine, path)?;
+        println!("screenshot: {}", path.display());
+    }
+    Ok(())
+}
+
+/// Print a machine-readable result block for a headless benchmark/timedemo run:
+/// stop reason, CS:IP, full register state, and the full 80x25 text page. A
+/// caller greps between the BEGIN/END markers for a benchmark's own reported
+/// numbers (e.g. Doom's "timed N gametics in M realtics" or an fps line).
+fn print_dump_result(machine: &mut Machine, stop_reason: &StopReason) {
+    let regs = &machine.cpu().registers;
+    let cs = regs.cs().selector;
+    let ip = regs.eip as u16;
+    println!("--- BEGIN RESULT ---");
+    println!("stop: {stop_reason:?}");
+    println!("CS:IP = {cs:04X}:{ip:04X}");
+    println!(
+        "EAX={:08X} EBX={:08X} ECX={:08X} EDX={:08X}",
+        regs.eax(),
+        regs.ebx(),
+        regs.ecx(),
+        regs.edx()
+    );
+    println!(
+        "ESP={:08X} EBP={:08X} ESI={:08X} EDI={:08X}",
+        regs.esp(),
+        regs.ebp(),
+        regs.esi(),
+        regs.edi()
+    );
+    println!("EIP={:08X} EFLAGS={:08X}", regs.eip, regs.eflags);
+    println!(
+        "CS={:04X} DS={:04X} ES={:04X} SS={:04X} FS={:04X} GS={:04X}",
+        cs,
+        regs.segment(izarravm_cpu::SegmentIndex::Ds).selector,
+        regs.segment(izarravm_cpu::SegmentIndex::Es).selector,
+        regs.segment(izarravm_cpu::SegmentIndex::Ss).selector,
+        regs.segment(izarravm_cpu::SegmentIndex::Fs).selector,
+        regs.segment(izarravm_cpu::SegmentIndex::Gs).selector,
+    );
+    println!("--- text page (80x25) ---");
+    println!("{}", machine.screen_text().as_text());
+    println!("--- END RESULT ---");
+}
+
+/// Write the current framebuffer to a binary PPM (P6) file: the full raw
+/// pixel dump a graphics-mode benchmark result (e.g. 3DBench2's fps readout)
+/// lands in. Resolves DAC indices through the 6-bit VGA palette to 8-bit RGB.
+fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+
+    let raster = machine.video_mut().render_full_frame();
+    let height = raster.display_height.min(raster.height);
+    let width = raster.width;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write!(out, "P6\n{width} {height}\n255\n")?;
+    for row in 0..height as usize {
+        let start = row * width as usize;
+        let end = start + width as usize;
+        for &index in &raster.pixels[start..end] {
+            let [r, g, b] = machine.video().dac_entry(index);
+            // 6-bit VGA DAC component (0..=63) to 8-bit (0..=255).
+            out.write_all(&[r << 2 | r >> 4, g << 2 | g >> 4, b << 2 | b >> 4])?;
+        }
+    }
     Ok(())
 }
 
@@ -1911,6 +1998,38 @@ mod tests {
         assert_eq!(ascii_to_set1('!'), vec![0x2a, 0x02, 0x82, 0xaa]);
         // Characters with no US-layout key produce nothing.
         assert!(ascii_to_set1('\u{00f1}').is_empty());
+    }
+
+    #[test]
+    fn write_framebuffer_ppm_writes_a_valid_p6_header() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        let dir = std::env::temp_dir().join(format!(
+            "izarravm_ppm_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("frame.ppm");
+
+        write_framebuffer_ppm(&mut machine, &path).expect("write ppm");
+        let bytes = std::fs::read(&path).expect("read ppm back");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(bytes.starts_with(b"P6\n"));
+        let header = String::from_utf8_lossy(&bytes[..32.min(bytes.len())]);
+        let mut parts = header.split_whitespace();
+        assert_eq!(parts.next(), Some("P6"));
+        let width: usize = parts.next().unwrap().parse().unwrap();
+        let height: usize = parts.next().unwrap().parse().unwrap();
+        assert!(width > 0);
+        assert!(height > 0);
     }
 
     #[test]
