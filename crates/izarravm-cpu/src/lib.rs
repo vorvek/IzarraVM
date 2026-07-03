@@ -3656,11 +3656,24 @@ impl Cpu386 {
                 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 => DecodeGroup::SystemSeg,
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
                 // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
-                // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); and the whole MMX block
-                // (`is_mmx_two_byte`). 0F AA (RSM) is unimplemented and stays TwoByteFallback.
-                0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa2 | 0xc7 | 0xc8..=0xcf => {
-                    DecodeGroup::Misc
-                }
+                // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
+                // (A0/A1/A8/A9, 386+, mirroring the one-byte ES/SS/DS segment push/pop arms in
+                // `execute_stack_decoded`); and the whole MMX block (`is_mmx_two_byte`). 0F AA
+                // (RSM) is unimplemented and stays TwoByteFallback.
+                0x05
+                | 0x07
+                | 0x08
+                | 0x09
+                | 0x30
+                | 0x31
+                | 0x32
+                | 0xa0
+                | 0xa1
+                | 0xa2
+                | 0xa8
+                | 0xa9
+                | 0xc7
+                | 0xc8..=0xcf => DecodeGroup::Misc,
                 second if is_mmx_two_byte(second as u8) => DecodeGroup::Misc,
                 _ => DecodeGroup::TwoByteFallback,
             };
@@ -4392,9 +4405,10 @@ impl Cpu386 {
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
-                // Hand the second byte to `execute_two_byte`; every opcode it still handles takes no
-                // encoded operand, so it re-reads nothing (the second byte is never re-read).
-                self.execute_two_byte(insn.opcode as u8, insn.operand_size)
+                // Hand the second byte to `execute_two_byte`; every opcode it still handles reads no
+                // further instruction bytes (the second byte is never re-read). PUSH/POP FS/GS do
+                // touch the stack, so `bus` is passed through.
+                self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size)
             }
             DecodeGroup::Fallback => {
                 // Fallback is now a pure dead-end: after Stage A every IMPLEMENTED single-byte opcode
@@ -6498,13 +6512,16 @@ impl Cpu386 {
     /// and as a leaf call from `execute_misc_decoded` for the no-operand 0F members. The converted 0F
     /// groups (MOVZX/MOVSX and the rest) bypass this entirely via `route_group`/`execute_decoded`.
     ///
-    /// Every opcode that remains here takes NO encoded operand (it reads no instruction bytes), so
-    /// the heterogeneous `Misc` group (task A14) also leaf-calls this for its no-operand 0F members
-    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them — the
-    /// bus, prefixes, and address size are therefore no longer parameters. The genuinely
-    /// unimplemented 0F bytes still fall through to the `UnsupportedTwoByteOpcode` arm and #UD.
-    fn execute_two_byte(
+    /// Most opcodes handled here re-read no further instruction bytes, so the heterogeneous
+    /// `Misc` group (task A14) also leaf-calls this for its 0F members
+    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them.
+    /// PUSH/POP FS/GS (0F A0/A1/A8/A9) are Misc members too: like their one-byte ES/SS/DS
+    /// counterparts in `execute_stack_decoded`, they touch the stack, so `bus` is threaded
+    /// through. The genuinely unimplemented 0F bytes still fall through to the
+    /// `UnsupportedTwoByteOpcode` arm and #UD.
+    fn execute_two_byte<B: CpuBus>(
         &mut self,
+        bus: &mut B,
         opcode: u8,
         operand_size: OperandSize,
     ) -> ExecResult<CycleOutcome> {
@@ -6721,6 +6738,42 @@ impl Cpu386 {
                     self.write_gpr32(reg, value.swap_bytes());
                 }
                 Ok(clocks(1))
+            }
+            // PUSH FS / PUSH GS (0F A0 / 0F A8): 386+ additions, otherwise identical to the
+            // one-byte PUSH ES/CS/SS/DS handlers in `execute_stack_decoded` (0x06/0x0e/0x16/
+            // 0x1e) -- push the 16-bit selector, always at `OperandSize::Word` regardless of
+            // the current operand-size attribute (a segment selector is always 16 bits; a
+            // 32-bit-operand-size PUSH FS still only writes/advances by 2, matching real
+            // 386+ silicon and the existing ES/SS/DS arms). Same clock cost (2) as those.
+            0xa0 => {
+                self.push(
+                    bus,
+                    u32::from(self.registers.segment(SegmentIndex::Fs).selector),
+                    OperandSize::Word,
+                )?;
+                Ok(clocks(2))
+            }
+            0xa8 => {
+                self.push(
+                    bus,
+                    u32::from(self.registers.segment(SegmentIndex::Gs).selector),
+                    OperandSize::Word,
+                )?;
+                Ok(clocks(2))
+            }
+            // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
+            // 16-bit selector off the stack, then run it through the same `load_segment`
+            // descriptor-load path (which raises the identical #GP/#SS a bad or null selector
+            // would on POP DS). Same clock cost (7) as those.
+            0xa1 => {
+                let value = self.pop(bus, OperandSize::Word)? as u16;
+                self.load_segment(bus, SegmentIndex::Fs, value)?;
+                Ok(clocks(7))
+            }
+            0xa9 => {
+                let value = self.pop(bus, OperandSize::Word)? as u16;
+                self.load_segment(bus, SegmentIndex::Gs, value)?;
+                Ok(clocks(7))
             }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
@@ -9895,6 +9948,8 @@ const fn is_386plus_two_byte(opcode: u8) -> bool {
         0x08 | 0x09 | 0xb0 | 0xb1 | 0xc0 | 0xc1 | 0xc8..=0xcf
         // MOV to/from CR (386).
         | 0x20 | 0x22
+        // PUSH/POP FS/GS (386): FS and GS do not exist before the 386.
+        | 0xa0 | 0xa1 | 0xa8 | 0xa9
         // Jcc rel16/32 and SETcc (386).
         | 0x80..=0x8f | 0x90..=0x9f
         // CPUID (gated again by level below; 286 has no CPUID either way).
@@ -10315,10 +10370,11 @@ impl Cpu386 {
             op if op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
                 self.execute_mmx_decoded(insn, bus)
             }
-            // The remaining 0F system/serializing/CPU-id ops carry no encoded operand and re-read no
-            // instruction bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL
-            // (05), SYSRET (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), CPUID (A2),
-            // BSWAP (C8-CF). `decode` already read + gated the second byte; this never re-reads it.
+            // The remaining 0F system/serializing/CPU-id/stack ops re-read no further instruction
+            // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL (05), SYSRET
+            // (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), PUSH FS/GS (A0/A8), CPUID
+            // (A2), POP FS/GS (A1/A9), BSWAP (C8-CF). `decode` already read + gated the second
+            // byte; this never re-reads it.
             0x0f05
             | 0x0f07
             | 0x0f08
@@ -10326,8 +10382,12 @@ impl Cpu386 {
             | 0x0f30
             | 0x0f31
             | 0x0f32
+            | 0x0fa0
+            | 0x0fa1
             | 0x0fa2
-            | 0x0fc8..=0x0fcf => self.execute_two_byte(insn.opcode as u8, insn.operand_size),
+            | 0x0fa8
+            | 0x0fa9
+            | 0x0fc8..=0x0fcf => self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size),
             opcode => unreachable!("misc opcode {opcode:#x}"),
         }
     }
@@ -18844,8 +18904,9 @@ mod tests {
             | 0x40..=0x4f | 0x90..=0x9f | 0xaf
             // SystemSeg
             | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22
-            // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP (Misc)
-            | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa2 | 0xc7 | 0xc8..=0xcf
+            // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
+            | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
+            | 0xc7 | 0xc8..=0xcf
         );
         routed || is_mmx_two_byte(second)
     }
@@ -21898,6 +21959,208 @@ mod tests {
                 ),
                 "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
             );
+        }
+    }
+
+    // ---- PUSH/POP FS/GS (0F A0/A1/A8/A9) ----
+
+    /// Real-mode CPU with SP parked at 0x1f0 (mirrors `stack_seed`) and 0x200 bytes of memory,
+    /// so PUSH/POP FS/GS have room on the stack. Used for the real-mode + 16/32-bit-operand-size
+    /// arms of the new opcodes; the protected-mode descriptor-load arms use `protected_cpu` below.
+    fn fs_gs_stack_cpu(code: &[u8]) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; 0x200];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x01f0);
+        (cpu, memory)
+    }
+
+    #[test]
+    fn push_fs_pushes_the_selector_in_real_mode() {
+        // PUSH FS (0F A0). Mirrors PUSH DS (0x1e): pushes the 16-bit selector, SP -= 2.
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa0]);
+        cpu.registers
+            .set_segment(SegmentIndex::Fs, SegmentRegister::real(0x1234));
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01ee, "SP must decrement by 2");
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
+            0x1234,
+            "FS selector must land on the stack"
+        );
+    }
+
+    #[test]
+    fn push_gs_pushes_the_selector_in_real_mode() {
+        // PUSH GS (0F A8). Mirrors PUSH DS (0x1e).
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa8]);
+        cpu.registers
+            .set_segment(SegmentIndex::Gs, SegmentRegister::real(0x5678));
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01ee, "SP must decrement by 2");
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
+            0x5678,
+            "GS selector must land on the stack"
+        );
+    }
+
+    #[test]
+    fn push_fs_gs_ignore_the_32_bit_operand_size_prefix() {
+        // 66 0F A0 / 66 0F A8: a segment selector is always 16 bits, so a 32-bit operand-size
+        // override must still only push 2 bytes and move SP by 2 -- exactly like the one-byte
+        // PUSH ES/CS/SS/DS arms, which hardcode `OperandSize::Word` regardless of `operand_size`.
+        for (code, segment, value) in [
+            ([0x66u8, 0x0f, 0xa0].as_slice(), SegmentIndex::Fs, 0x1234u16),
+            ([0x66, 0x0f, 0xa8].as_slice(), SegmentIndex::Gs, 0x5678u16),
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(code);
+            cpu.registers
+                .set_segment(segment, SegmentRegister::real(value));
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01ee,
+                "SP must still only move by 2 with a 32-bit operand-size prefix"
+            );
+            assert_eq!(
+                u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
+                value,
+                "the pushed word must be the 16-bit selector, not a 32-bit zero-extension"
+            );
+        }
+    }
+
+    #[test]
+    fn pop_fs_loads_the_selector_in_real_mode() {
+        // POP FS (0F A1). Mirrors POP DS (0x1f): pops a 16-bit selector and loads it, SP += 2.
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa1]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f2, "SP must increment by 2");
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0xbeef);
+    }
+
+    #[test]
+    fn pop_gs_loads_the_selector_in_real_mode() {
+        // POP GS (0F A9). Mirrors POP DS (0x1f).
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa9]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f2, "SP must increment by 2");
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0xbeef);
+    }
+
+    #[test]
+    fn pop_fs_gs_load_a_valid_descriptor_in_protected_mode() {
+        // Data segment access 0x92 (present, data, writable), byte-granular limit 0xffff,
+        // base 0 -- the same descriptor shape `verr_sets_zf_for_a_readable_segment` and
+        // `lar_and_lsl_read_descriptor_fields` use. Selector 0x0008 (GDT index 1, RPL 0).
+        for (code, segment) in [
+            ([0x0fu8, 0xa1].as_slice(), SegmentIndex::Fs), // POP FS
+            ([0x0f, 0xa9].as_slice(), SegmentIndex::Gs),   // POP GS
+        ] {
+            let (mut cpu, memory) = protected_cpu(code, 0x0000_ffff, 0x0000_9200);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.write_reg16(Reg16::Sp, 0x01f0);
+            bus.memory[0x1f0..0x1f2].copy_from_slice(&0x0008u16.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0x0008,
+                "{segment:?} selector must load"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).base,
+                0,
+                "{segment:?} base must come from the descriptor"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).limit,
+                0xffff,
+                "{segment:?} limit must come from the descriptor"
+            );
+            assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f2, "SP must advance by 2");
+        }
+    }
+
+    #[test]
+    fn pop_fs_gs_fault_on_a_bad_selector_in_protected_mode() {
+        // Selector 0x0028 (index 5, byte offset 40) is past the GDT limit of 0x1f (31), which
+        // only covers offsets 0 (null) and 8 (the one installed descriptor), so the descriptor
+        // load must #GP -- the same fault a bad POP DS selector raises.
+        for (code, name) in [
+            ([0x0fu8, 0xa1].as_slice(), "POP FS"),
+            ([0x0f, 0xa9].as_slice(), "POP GS"),
+        ] {
+            let (mut cpu, memory) = protected_cpu(code, 0x0000_ffff, 0x0000_9200);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.write_reg16(Reg16::Sp, 0x01f0);
+            bus.memory[0x1f0..0x1f2].copy_from_slice(&0x0028u16.to_le_bytes());
+            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0028 })
+                ),
+                "{name} with an out-of-limit selector must #GP, got {err:?}"
+            );
+        }
+    }
+
+    /// Like `run_at_level`, but seeds SP at 0x1f0 (mirroring `fs_gs_stack_cpu`/`stack_seed`) so
+    /// the PUSH FS/GS arms have room on the stack instead of wrapping SP into unmapped memory.
+    /// POP FS/GS only ever read what PUSH just wrote (or zero), so no separate POP variant needed.
+    fn run_at_level_with_stack(
+        code: &[u8],
+        level: CpuLevel,
+    ) -> Result<CycleOutcome, InternalFault> {
+        let mut memory = vec![0; 1024];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(level);
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x01f0);
+        let mut bus = TestBus::with_memory(memory);
+        exec_one_split(&mut cpu, &mut bus)
+    }
+
+    #[test]
+    fn push_pop_fs_gs_raise_ud_at_i286() {
+        // FS/GS are 386+ only. At the I286 level the check_two_byte_isa_gate must #UD all four
+        // opcodes (via is_386plus_two_byte), the same gate MOVZX/BSF/etc go through, and they
+        // must run cleanly from I386 up.
+        for code in [
+            [0x0fu8, 0xa0], // PUSH FS
+            [0x0f, 0xa1],   // POP FS
+            [0x0f, 0xa8],   // PUSH GS
+            [0x0f, 0xa9],   // POP GS
+        ] {
+            assert!(
+                matches!(
+                    run_at_level_with_stack(&code, CpuLevel::I286).unwrap_err(),
+                    InternalFault::Exception { vector: 6, .. }
+                ),
+                "{code:02x?} must #UD at I286"
+            );
+            assert!(
+                run_at_level_with_stack(&code, CpuLevel::I386).is_ok(),
+                "{code:02x?} must run at I386"
+            );
+            assert!(run_at_level_with_stack(&code, CpuLevel::I486).is_ok());
+            assert!(run_at_level_with_stack(&code, CpuLevel::I586).is_ok());
         }
     }
 
