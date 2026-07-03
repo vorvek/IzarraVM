@@ -272,6 +272,35 @@ $xcopyExe = Join-Path $xcopyDir 'xcopy.exe'
 if (-not (Test-Path $xcopyExe)) { throw "xcopy.exe not produced" }
 Write-Host "XCOPY.EXE: $((Get-Item $xcopyExe).Length) bytes"
 
+# TokaEdit buffer-core self-check (native Win32 build of the ANSI core).
+$editDir = Join-Path $root 'tools-src\edit'
+Push-Location $editDir
+try {
+    $env:INCLUDE = "$env:WATCOM\h;$env:WATCOM\h\nt"
+    & wcl386 -bt=nt -zq -we -wx -dBUF_TEST_ALLOC -fe=buftest test_buffer.c buffer.c
+    if ($LASTEXITCODE) { throw "wcl386 buftest build failed" }
+    & .\buftest.exe
+    if ($LASTEXITCODE) { throw "TokaEdit buffer self-check FAILED" }
+    $env:INCLUDE = "$env:WATCOM\h"
+} finally { Pop-Location }
+
+# --- TOKAEDIT / EDIT.COM (original Toka-DOS project source, GPL-3; see
+# toka-dos/tools-src/README.md). Large memory model: the document buffer
+# lives on the far heap; every other tool here is -ms/-mc. The MZ exe ships
+# named EDIT.COM -- faithful to real MS-DOS, whose EDIT.COM is an MZ exe
+# (DOS dispatches on the MZ signature, not the extension).
+# NOTE: this line does not yet include ui.c -- that file arrives in a later
+# task; whoever adds it updates this line.
+$editCf = @('-bt=DOS','-bcl=DOS','-D__MSDOS__','-zp1','-ml','-oas','-s','-wx','-we','-zq','-fm')
+Push-Location $editDir
+try {
+    & wcl @editCf -fe=edit buffer.c tui.c edit.c
+    if ($LASTEXITCODE) { throw "wcl edit failed" }
+} finally { Pop-Location }
+$editExe = Join-Path $editDir 'edit.exe'
+if (-not (Test-Path $editExe)) { throw "edit.exe not produced" }
+Write-Host "EDIT.COM: $((Get-Item $editExe).Length) bytes"
+
 # --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 $tokamous = Join-Path $root 'build-freedos-tokamous.com'
 & nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous
