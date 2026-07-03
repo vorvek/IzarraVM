@@ -9051,7 +9051,7 @@ impl Cpu386 {
             // A V86 task addresses memory like the 8086: base = selector << 4, 64 KB.
             self.load_segment_real(segment, selector);
         } else if self.is_protected_mode() {
-            let register = self.load_protected_segment(bus, selector)?;
+            let register = self.load_protected_segment(bus, segment, selector)?;
             self.registers.set_segment(segment, register);
             if segment == SegmentIndex::Cs {
                 self.invalidate_code_caches();
@@ -9073,13 +9073,40 @@ impl Cpu386 {
     fn load_protected_segment<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        segment: SegmentIndex,
         selector: u16,
     ) -> ExecResult<SegmentRegister> {
+        // A null selector (index 0, TI clear) loaded into a data segment (ES/DS/FS/GS) is
+        // legal: it installs a null/unusable segment with no fault at load time. A later
+        // memory access through it faults with #GP(0) (via the base=0/limit=0 default
+        // segment failing the limit check in `segment_linear_byte`). CS and SS must still
+        // #GP on a null selector -- CS reaches here via RETF/IRET/interrupt-gate delivery,
+        // not just far-jump/call -- mirroring the TSS segment-load precedent above
+        // (`selector & !0x7 == 0 && !matches!(segment, Cs | Ss)`). The mask must also require
+        // TI=0: `selector & 0xfffc` folds in the index bits only, so a TI=1 index-0 selector
+        // (0x0004, LDT[0]) is correctly excluded from this null short-circuit and falls
+        // through to resolve against the LDT below.
+        if selector & 0xfffc == 0 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss) {
+            return Ok(SegmentRegister {
+                selector,
+                ..Default::default()
+            });
+        }
+        let in_ldt = selector & 0x4 != 0;
         let index = u32::from(selector & !0x7);
-        if index == 0 || index + 7 > u32::from(self.gdtr.limit) {
+        let (table_base, table_limit) = if in_ldt {
+            (self.ldtr.base, self.ldtr.limit)
+        } else {
+            (self.gdtr.base, u32::from(self.gdtr.limit))
+        };
+        // Index 0 is reserved only in the GDT (the processor never uses GDT[0], per the PRM);
+        // an LDT selector with index 0 (TI=1, e.g. 0x0004) is an ordinary, resolvable entry --
+        // the null-selector short-circuit above already handled the true null case (index 0,
+        // TI 0), so an in_ldt selector reaching here is never null.
+        if (index == 0 && !in_ldt) || index + 7 > table_limit {
             return Err(CpuError::GeneralProtection { selector }.into());
         }
-        let descriptor_address = self.gdtr.base + index;
+        let descriptor_address = table_base + index;
         let low = bus.read_memory(descriptor_address, BusWidth::Dword, BusAccessKind::DataRead)?;
         let high = bus.read_memory(
             descriptor_address + 4,
@@ -22176,6 +22203,207 @@ mod tests {
         assert_eq!(cpu.ldtr.selector, 0x0008);
         assert_eq!(cpu.ldtr.base, 0x0004_0000);
         assert_eq!(cpu.ldtr.limit, 0x0fff);
+    }
+
+    #[test]
+    fn null_selector_loads_into_data_segments_without_fault() {
+        // MOV DS/ES/FS/GS, AX with AX = 0 (a null selector: index 0, TI 0). The 386 lets a
+        // null selector load into a data segment with no fault; only a later memory access
+        // through it #GPs. Descriptor bytes are irrelevant here (never read for a null load).
+        for (opcode_reg, segment) in [
+            (0xc0u8, SegmentIndex::Es), // MOV ES, AX (8E C0)
+            (0xd8, SegmentIndex::Ds),   // MOV DS, AX (8E D8)
+            (0xe0, SegmentIndex::Fs),   // MOV FS, AX (8E E0)
+            (0xe8, SegmentIndex::Gs),   // MOV GS, AX (8E E8)
+        ] {
+            let (mut cpu, memory) = protected_cpu(&[0x8e, opcode_reg], 0x0000_ffff, 0x0000_9200);
+            cpu.write_reg16(Reg16::Ax, 0x0000);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0x0000,
+                "{segment:?} must load the null selector"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).access & 0x80,
+                0,
+                "{segment:?} must install a not-present/unusable segment"
+            );
+        }
+    }
+
+    #[test]
+    fn access_through_a_null_data_segment_faults() {
+        // MOV DS, AX (8E D8) with AX = 0 loads DS as null (no fault); a following memory
+        // access through DS (MOV AL, [SI], opcode 8A 04) must then #GP -- the null segment's
+        // base=0/limit=0 default fails the segment-limit check for any nonzero offset.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8, 0x8a, 0x04], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        cpu.write_reg16(Reg16::Si, 0x0010);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // MOV DS, AX: loads null, no fault.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::SegmentLimit {
+                    segment: SegmentIndex::Ds,
+                    ..
+                })
+            ),
+            "access through a null DS must fault, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn null_selector_into_ss_still_faults() {
+        // MOV SS, AX (8E D0) with AX = 0. Unlike the data segments, a null selector loaded
+        // into SS must still #GP -- the stack segment can never be null.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd0], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+            ),
+            "a null selector into SS must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn ldt_selector_resolves_against_the_ldt_not_the_gdt() {
+        // Install an LDT (via LLDT) whose own descriptor lives at GDT selector 0x08, then load
+        // DS from an LDT selector (TI=1, index 1: selector 0x000c) whose descriptor lives at
+        // LDT offset 8. The GDT selector 0x08 descriptor is deliberately a system (LDT)
+        // descriptor, not a data segment: if a test regression accidentally indexed the GDT
+        // instead of the LDT for the DS load, it would read this LDT-type descriptor and the
+        // base/limit assertions below would fail.
+        let mut memory = vec![0u8; 0x400];
+        // GDT at 0x100 (base/limit set by protected_cpu below): selector 0x08 is the LDT
+        // system descriptor (base 0x0000_0200, limit 0x0f, access 0x82 = present, LDT type).
+        let ldt_desc_low = 0x0200_000f; // limit low = 0x0f, base[15:0] = 0x0200
+        let ldt_desc_high = 0x0000_8200; // base[31:24]=0, base[23:16]=0, access = 0x82 (present LDT)
+        let (mut cpu, mut code) =
+            protected_cpu(&[0x0f, 0x00, 0xd0, 0x8e, 0xd9], ldt_desc_low, ldt_desc_high);
+        code.resize(0x400, 0);
+        // LDT lives at 0x200 (matches the descriptor base above). LDT selector 0x000c is
+        // index 1 (byte offset 8) inside the LDT: a data segment, base 0x0005_0000, limit
+        // 0x00ff, access 0x92 (present, data, writable).
+        let ldt_base = 0x200usize;
+        code[ldt_base + 8..ldt_base + 12].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+        code[ldt_base + 12..ldt_base + 16].copy_from_slice(&0x0000_9205u32.to_le_bytes());
+        memory[..code.len()].copy_from_slice(&code);
+        cpu.write_reg16(Reg16::Ax, 0x0008); // LLDT AX: load LDTR from GDT selector 0x08.
+        cpu.write_reg16(Reg16::Cx, 0x000c); // MOV DS, CX: load DS from LDT selector 0x000c.
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // LLDT AX
+        assert_eq!(cpu.ldtr.base, 0x0000_0200);
+        cpu.cycle(&mut bus).unwrap(); // MOV DS, CX
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x000c);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ds).base,
+            0x0005_0000,
+            "DS must resolve against the LDT descriptor, not the GDT"
+        );
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).limit, 0x00ff);
+    }
+
+    #[test]
+    fn gdt_selector_still_loads_after_the_ldt_fix() {
+        // A plain GDT selector (TI=0) must still resolve against the GDT: regression guard for
+        // the TI-bit fix in `load_protected_segment`.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0008);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x0008);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).base, 0);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).limit, 0xffff);
+    }
+
+    #[test]
+    fn out_of_limit_selector_still_faults() {
+        // Selector 0x0028 (index 5) is past the GDT limit of 0x1f installed by `protected_cpu`
+        // (which only covers offsets 0 and 8): a genuinely invalid, non-null selector must
+        // still #GP, unaffected by the null-selector and LDT fixes.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0028);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0028 })
+            ),
+            "an out-of-limit selector must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn retf_popping_a_null_selector_into_cs_faults() {
+        // RETF (0xcb) in protected mode with the stacked far pointer's selector word set to
+        // 0x0000 (null, index 0, TI 0). Unlike a data segment, CS must never be null: this
+        // exercises load_segment(..., SegmentIndex::Cs, ...) through the real RETF path
+        // (return_far -> load_segment -> load_protected_segment), not a synthetic direct call,
+        // so it also confirms IRET/interrupt-gate delivery's CS reload would fault the same way.
+        let (mut cpu, mut memory) = protected_cpu(&[0xcb], 0x0000_ffff, 0x0000_9200);
+        memory.resize(0x200, 0);
+        cpu.registers.set_esp(0x0100);
+        // Stacked far pointer at ss:0x0100: offset 0x1234, then selector 0x0000 (null).
+        memory[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes());
+        memory[0x102..0x104].copy_from_slice(&0x0000u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+            ),
+            "RETF popping a null selector into CS must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn ti_bit_set_index_zero_selector_resolves_against_the_ldt_not_treated_as_null() {
+        // Selector 0x0004: index 0, TI=1. This is NOT a null selector (only index 0 AND TI 0
+        // is null) -- it must resolve against LDT offset 0, not short-circuit into the
+        // null/unusable path. Install an LDT (via LLDT, GDT selector 0x08) whose first entry
+        // (offset 0) is a normal data descriptor, then load DS from selector 0x0004 and check
+        // the resulting base/limit came from that LDT descriptor.
+        let mut memory = vec![0u8; 0x400];
+        // GDT selector 0x08: LDT system descriptor, base 0x0000_0300, limit 0x0f, access 0x82.
+        let ldt_desc_low = 0x0300_000f;
+        let ldt_desc_high = 0x0000_8200;
+        let (mut cpu, mut code) =
+            protected_cpu(&[0x0f, 0x00, 0xd0, 0x8e, 0xd9], ldt_desc_low, ldt_desc_high);
+        code.resize(0x400, 0);
+        // LDT at 0x300 (matches the descriptor base above). LDT offset 0 (selector 0x0004,
+        // index 0, TI 1): data segment, base 0x0006_0000, limit 0x00aa, access 0x92.
+        let ldt_base = 0x300usize;
+        code[ldt_base..ldt_base + 4].copy_from_slice(&0x0000_00aau32.to_le_bytes());
+        code[ldt_base + 4..ldt_base + 8].copy_from_slice(&0x0000_9206u32.to_le_bytes());
+        memory[..code.len()].copy_from_slice(&code);
+        cpu.write_reg16(Reg16::Ax, 0x0008); // LLDT AX.
+        cpu.write_reg16(Reg16::Cx, 0x0004); // MOV DS, CX: selector 0x0004 (index 0, TI 1).
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // LLDT AX
+        assert_eq!(cpu.ldtr.base, 0x0000_0300);
+        cpu.cycle(&mut bus).unwrap(); // MOV DS, CX
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x0004);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ds).base,
+            0x0006_0000,
+            "index-0/TI-1 selector 0x0004 must resolve against LDT[0], not be treated as null"
+        );
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).limit, 0x00aa);
+        assert_ne!(
+            cpu.registers.segment(SegmentIndex::Ds).access & 0x80,
+            0,
+            "a resolved LDT descriptor load must install a present segment, not the null/unusable default"
+        );
     }
 
     #[test]
