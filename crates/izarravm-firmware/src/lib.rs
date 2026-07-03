@@ -41,6 +41,8 @@ pub const MOUSETST_COM: &[u8] = include_bytes!("../roms/dos/mousetst.com");
 pub const MOUSETST_COM_SOURCE: &str = include_str!("../roms/dos/mousetst.asm");
 pub const SNDTST_COM: &[u8] = include_bytes!("../roms/dos/sndtst.com");
 pub const SNDTST_COM_SOURCE: &str = include_str!("../roms/dos/sndtst.asm");
+pub const IRQ5IP0_COM: &[u8] = include_bytes!("../roms/dos/irq5ip0.com");
+pub const IRQ5IP0_COM_SOURCE: &str = include_str!("../roms/dos/irq5ip0.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -198,6 +200,15 @@ pub fn mousetst_com() -> &'static [u8] {
 /// the monitor's discriminator. Signals 0xA5 / 0xEn.
 pub fn sndtst_com() -> &'static [u8] {
     SNDTST_COM
+}
+
+/// The IRQ5-at-IP==0 discriminator regression fixture (V86 trap tax): arms SB16
+/// auto-init DMA for a continuous IRQ5 stream, then parks on a `jmp $` at
+/// seg:0000 so those IRQ5 frames carry return-IP 0 -- the one case the vec13
+/// frame-shape check cannot decide alone. RED on the buggy slot-only monitor,
+/// GREEN on the three-layer fix.
+pub fn irq5ip0_com() -> &'static [u8] {
+    IRQ5IP0_COM
 }
 
 /// The SP-4b M2 default-off contract fixture (bare DEVICE=C:\TOKAEMM.SYS): the

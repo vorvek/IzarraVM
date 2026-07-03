@@ -1769,48 +1769,87 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
 ; ============================================================================
 
 ; ---- vector 13: #GP (sensitive instruction, error-code frame) OR IRQ5 (the
-; SB16, no error code). Discriminate in layers (SP-4b M4):
-;   1. master-PIC ISR bit 5 clear (OCW3 read) -> a plain #GP: an IRQ5 delivery
-;      always sets in-service first.
-;   2. bit set: an IRQ5 delivery, UNLESS this is a #GP raised inside the
-;      guest's own IRQ5 ISR (in-service until its EOI). Our V86 #GPs push
-;      error code 0 where the IRQ frame carries the guest EIP -> a nonzero
-;      slot at [esp+32] means IRQ5.
-;   3. zero slot: peek the #GP-candidate CS:IP byte — only the sensitive set
-;      {CLI,STI,PUSHF,POPF,INT n,IRET} raises #GP from a healthy V86 guest.
-; Residual: an IRQ5 arriving with guest IP == 0 whose garbled candidate peek
-; ALSO hits a sensitive byte is mis-handled as #GP (the line stays un-EOI'd) —
-; a double coincidence we accept and document.
+; SB16, no error code). V86 trap tax Part 2, the three-layer discriminator:
+;
+; LAYER 1 (frame shape, I/O-free, airtight one way): every #GP this emulator's
+; deliver_exception can ever deliver on vector 13 pushes error code EXACTLY 0
+; (grep-confirmed: every InternalFault::Exception{vector:13,..} raise site in
+; izarravm-cpu passes error_code: Some(0) -- check_v86_iopl,
+; check_io_permission, require_cpl0, the WRMSR/RDMSR/RDTSC/MOV-CRn/SYSRET
+; privilege checks, all of them; deliver_exception pins this with a
+; debug_assert), and deliver_exception never pushes an error code for an
+; external interrupt (is_external=true), the ONLY way IRQ5 reaches this
+; vector. So the slot at [esp+32] holds the #GP's error code (always 0) or
+; the IRQ frame's interrupted EIP. NONZERO slot -> can only be IRQ5. Done.
+;
+; LAYER 2 (opcode peek, I/O-free, the hot #GP case): slot == 0 is
+; overwhelmingly a genuine #GP -- but NOT always: an IRQ5 can interrupt the
+; guest at IP == 0, which is cheaply reachable (a handler entered at
+; seg:0000, a .COM ret to PSP:0000), not a freak event. So peek the byte at
+; the frame's CS:IP: one of the sensitive set monitor_body emulates
+; {CLI,STI,PUSHF,POPF,INT n,IRET, and the trapped-port IN/OUT forms} -> take
+; the emulate path. Every real sensitive-instruction trap (the ~100k-700k/s
+; hot case) resolves here with NO port I/O at all.
+;
+; LAYER 3 (PIC probe, cold only): slot == 0 AND a non-sensitive byte at
+; CS:IP. Either a garbage/unhandled #GP (diagnostic-bound) or an IRQ5 that
+; landed on IP == 0 -- indistinguishable without asking the PIC, so ask the
+; PIC: OCW3 read of the master ISR, exactly the old scheme, but now only on
+; this cold path (and with the ring-0 port exemption it no longer even ends
+; the CPU batch). IRQ5 in service -> .irq5; else fall through to
+; monitor_body's own dispatch, whose catch-all (`signal32`) is the same
+; diagnostic ending the old scheme had.
+;
+; Residual (same as the OLD scheme's documented double-coincidence, no
+; regression): an IRQ5 at IP == 0 whose CS:0 byte happens to BE sensitive
+; (~10/256 of byte space) is mis-emulated against the IRQ frame; the line
+; stays un-EOI'd. Accepted then, accepted now.
+;
+; EMULATOR-CONTRACT NOTE: layer 1 is airtight because WE control both frame
+; builders (deliver_exception's error-code-vs-external gating). It is not a
+; real-hardware-portable trick -- real silicon never routes a #GP and an IRQ
+; through the same vector in the first place (the vector-13 collision is this
+; emulator's PIC-base-arithmetic artifact). Revisit if deliver_exception's
+; push order or the is_external gating ever changes; the debug_assert there
+; is the tripwire.
 vec13_entry:
     pushad
     mov ax, 0x10
     mov ds, ax
     mov ax, 0x20
     mov fs, ax
-    mov al, 0x0B                  ; OCW3: next master data read = ISR
-    out 0x20, al
-    in al, 0x20
-    test al, 0x20                 ; IRQ5 in service?
-    jz monitor_body               ; no -> a plain #GP
-    cmp dword [esp+32], 0         ; #GP error-code slot vs IRQ frame EIP
-    jne .irq5
-    movzx eax, word [esp+40]      ; #GP-candidate CS
+    cmp dword [esp+32], 0         ; LAYER 1: #GP error code (0) vs IRQ frame EIP
+    jne .irq5                     ; nonzero -> can only be IRQ5
+    movzx eax, word [esp+40]      ; LAYER 2: peek the frame CS:IP byte
     shl eax, 4
-    movzx ecx, word [esp+36]      ; #GP-candidate IP
+    movzx ecx, word [esp+36]
     add eax, ecx
     mov al, [eax]                 ; the would-be faulting opcode
-    cmp al, 0xFA
+    cmp al, 0xFA                  ; CLI
     je monitor_body
-    cmp al, 0xFB
+    cmp al, 0xFB                  ; STI
     je monitor_body
-    cmp al, 0x9C
+    cmp al, 0x9C                  ; PUSHF
     je monitor_body
-    cmp al, 0x9D
+    cmp al, 0x9D                  ; POPF
     je monitor_body
-    cmp al, 0xCD
+    cmp al, 0xCD                  ; INT n
     je monitor_body
-    cmp al, 0xCF
+    cmp al, 0xCF                  ; IRET
     je monitor_body
+    cmp al, 0xE6                  ; OUT imm8, AL (trapped port 0x92)
+    je monitor_body
+    cmp al, 0xEE                  ; OUT DX, AL
+    je monitor_body
+    cmp al, 0xE4                  ; IN AL, imm8
+    je monitor_body
+    cmp al, 0xEC                  ; IN AL, DX
+    je monitor_body
+    mov al, 0x0B                  ; LAYER 3 (cold): OCW3, next master data
+    out 0x20, al                  ; read = ISR
+    in al, 0x20
+    test al, 0x20                 ; IRQ5 in service?
+    jz monitor_body               ; no -> a plain (unhandled) #GP, diagnose
 .irq5:
     mov ebx, 5
     jmp irq_body                  ; no-error-code frame path

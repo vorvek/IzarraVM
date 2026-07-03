@@ -350,11 +350,17 @@ mod tests {
 
         // SP-4b M4: TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
         // loads it (frameless NOEMS) with DOS=HIGH,UMB — every default boot runs
-        // FreeDOS in V86 under the guest memory manager.
+        // FreeDOS in V86 under the guest memory manager. BYTE compare, not a
+        // length compare: the driver's resident envelope is padded to a fixed
+        // size, so two different builds are routinely the same length — a stale
+        // tokados-hdd.img sailed through the old length check while every real
+        // boot silently ran the previous monitor (V86 trap tax review finding).
         assert_eq!(
-            by_name.get("TOKAEMM.SYS").map(|d| d.len()),
-            Some(izarravm_firmware::tokaemm_sys().len()),
-            "TOKAEMM.SYS on the payload matches the committed driver"
+            by_name.get("TOKAEMM.SYS").map(|d| d.as_slice()),
+            Some(izarravm_firmware::tokaemm_sys()),
+            "TOKAEMM.SYS on the payload must be byte-identical to the committed \
+             driver (regenerate roms/tokados-hdd.img via \
+             scripts/build-freedos-hdd-image.py after any tokaemm.asm rebuild)"
         );
         let config = by_name.get("CONFIG.SYS").expect("CONFIG.SYS present");
         let config_text = String::from_utf8_lossy(config);

@@ -869,6 +869,23 @@ pub struct PerfCounters {
     pub rep_string_fast_iterations: u64,
     pub flag_materializations: u64,
     pub cache_tier_lookups: u64,
+    /// V86 trap tax measurement (dev_docs/2026-07-02-v86-trap-tax): every entry into
+    /// the ring-0 monitor via vector 13 (a V86 sensitive-instruction #GP or a real
+    /// IRQ5), counted at `deliver_exception`. One "trip" per TOKAEMM round-trip.
+    /// Combine with `brk_step` (already tracked above) for the batch-breaking
+    /// share the trap tax measures: `brk_step / monitor_trips_vec13` is the mean
+    /// number of port accesses that ended a batch per trip (was ~2, the vec13
+    /// PIC OCW3 select write and its readback; near 0 after the Part 1 fix).
+    pub monitor_trips_vec13: u64,
+    /// Guest CORE clocks charged to instructions that retired while
+    /// `is_ring0_protected()` was true: the V86-#GP-entry-to-IRETD-back residency
+    /// in core-clock terms (the just-delivered trap's own exception charge is
+    /// included, since the attribution check runs after the inline
+    /// `deliver_exception`; the IRETD back into V86 lands in the guest bucket, a
+    /// one-instruction undercount per trip). NOTE this is core clocks only: the
+    /// monitor's ISA-priced port-access WAIT states travel through the bus-clock
+    /// trace, not core clocks, and are not in this bucket.
+    pub monitor_resident_core_clocks: u64,
 }
 
 impl PartialEq for PerfCounters {
@@ -2592,6 +2609,10 @@ impl Cpu386 {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += 1;
+        // V86 trap tax residency: see PerfCounters::monitor_resident_core_clocks.
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
         if let Some((group, opcode, form)) = profile_key {
             self.profile
                 .record(group, opcode, form, charged, profile_start);
@@ -2718,6 +2739,13 @@ impl Cpu386 {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     self.perf.instructions += 1;
+                    // V86 trap tax residency: the monitor's own straight-line
+                    // instructions chain through this cached fast tail, not
+                    // finish_instruction, so the residency attribution must
+                    // live here too or the monitor body goes uncounted.
+                    if self.is_ring0_protected() {
+                        self.perf.monitor_resident_core_clocks += charged;
+                    }
                     Ok(CycleOutcome {
                         core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                         halted: outcome.halted,
@@ -5516,7 +5544,12 @@ impl Cpu386 {
                 // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                let value = bus.read_io(port, BusWidth::Byte, self.core_clocks_so_far)? as u8;
+                let value = bus.read_io(
+                    port,
+                    BusWidth::Byte,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
             }
@@ -5524,7 +5557,12 @@ impl Cpu386 {
                 // IN AX/EAX, imm8: word/dword port input into the accumulator.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, operand_size.bus_width())?;
-                let value = bus.read_io(port, operand_size.bus_width(), self.core_clocks_so_far)?;
+                let value = bus.read_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
             }
@@ -5532,7 +5570,12 @@ impl Cpu386 {
                 // OUT imm8, AL: byte port output from AL.
                 let port = insn.imm as u16;
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
+                bus.write_io(
+                    port,
+                    BusWidth::Byte,
+                    u32::from(self.read_gpr8(0)),
+                    self.is_ring0_protected(),
+                )?;
                 Ok(clocks(10))
             }
             0xe7 => {
@@ -5543,6 +5586,7 @@ impl Cpu386 {
                     port,
                     operand_size.bus_width(),
                     self.read_gpr_sized(0, operand_size),
+                    self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
             }
@@ -5550,7 +5594,12 @@ impl Cpu386 {
                 // IN AL, DX: byte port input. Port number in DX (GPR 2).
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                let value = bus.read_io(port, BusWidth::Byte, self.core_clocks_so_far)? as u8;
+                let value = bus.read_io(
+                    port,
+                    BusWidth::Byte,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )? as u8;
                 self.write_gpr8(0, value);
                 Ok(clocks(12))
             }
@@ -5558,7 +5607,12 @@ impl Cpu386 {
                 // IN AX/EAX, DX: word/dword port input addressed by DX.
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, operand_size.bus_width())?;
-                let value = bus.read_io(port, operand_size.bus_width(), self.core_clocks_so_far)?;
+                let value = bus.read_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.write_gpr_sized(0, operand_size, value);
                 Ok(clocks(12))
             }
@@ -5566,7 +5620,12 @@ impl Cpu386 {
                 // OUT DX, AL: byte port output addressed by DX.
                 let port = self.read_gpr16(2);
                 self.check_io_permission(bus, port, BusWidth::Byte)?;
-                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
+                bus.write_io(
+                    port,
+                    BusWidth::Byte,
+                    u32::from(self.read_gpr8(0)),
+                    self.is_ring0_protected(),
+                )?;
                 Ok(clocks(10))
             }
             0xef => {
@@ -5577,6 +5636,7 @@ impl Cpu386 {
                     port,
                     operand_size.bus_width(),
                     self.read_gpr_sized(0, operand_size),
+                    self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
             }
@@ -7838,14 +7898,19 @@ impl Cpu386 {
             }
             StringOp::Ins => {
                 // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
-                let value = bus.read_io(self.read_gpr16(2), width, self.core_clocks_so_far)?;
+                let value = bus.read_io(
+                    self.read_gpr16(2),
+                    width,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.write_string_dst(bus, address_size, width, value)?;
                 self.adjust_index_register(7, address_size, bytes);
             }
             StringOp::Outs => {
                 // OUTS: port[DX] <- [DS:SI] (segment overridable).
                 let value = self.read_string_src(bus, prefixes, address_size, width)?;
-                bus.write_io(self.read_gpr16(2), width, value)?;
+                bus.write_io(self.read_gpr16(2), width, value, self.is_ring0_protected())?;
                 self.adjust_index_register(6, address_size, bytes);
             }
         }
@@ -8289,6 +8354,19 @@ impl Cpu386 {
         // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
         // hardware interrupt or software `INT n`, even when it lands on such a vector.
         if !is_external && vector_pushes_error_code(vector) {
+            // TOKAEMM's vec13 discriminator (emulator contract): every #GP this
+            // core can deliver on vector 13 pushes error code EXACTLY 0, so a
+            // nonzero value in the frame slot at [esp+32] after the monitor's
+            // pushad can only be an external IRQ frame's EIP. Every current
+            // vector-13 raise site passes Some(0); this tripwire catches a
+            // future selector-carrying #GP (e.g. DPMI-grade descriptor faults)
+            // before it silently breaks the monitor's frame-shape check --
+            // update tokaemm.asm's vec13_entry BEFORE relaxing this.
+            debug_assert!(
+                vector != 13 || error_code.unwrap_or(0) == 0,
+                "vector-13 #GP with a nonzero error code ({error_code:?}) breaks \
+                 the TOKAEMM vec13 frame-shape discriminator"
+            );
             self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
 
@@ -8308,6 +8386,12 @@ impl Cpu386 {
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset);
+        // V86 trap tax measurement (dev_docs/2026-07-02-v86-trap-tax): a successful
+        // vector-13 delivery out of V86 is exactly one TOKAEMM round-trip (a V86
+        // sensitive-instruction #GP or a real IRQ5, both share this vector).
+        if source_v86 && vector == 13 {
+            self.perf.monitor_trips_vec13 += 1;
+        }
         Ok(())
     }
 
@@ -12004,6 +12088,7 @@ mod tests {
             port: u16,
             width: BusWidth,
             core_clocks_so_far: u64,
+            _cpu_is_ring0_pm: bool,
         ) -> Result<u32, BusError> {
             if !self.lazy_io_reads {
                 self.io_touched = true;
@@ -12018,7 +12103,13 @@ mod tests {
             Ok(0)
         }
 
-        fn write_io(&mut self, port: u16, width: BusWidth, _value: u32) -> Result<(), BusError> {
+        fn write_io(
+            &mut self,
+            port: u16,
+            width: BusWidth,
+            _value: u32,
+            _cpu_is_ring0_pm: bool,
+        ) -> Result<(), BusError> {
             self.io_touched = true;
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoWrite,

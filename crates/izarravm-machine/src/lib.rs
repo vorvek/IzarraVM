@@ -2097,9 +2097,9 @@ impl Machine {
         // polls the timer for a delay doesn't spin forever.
         {
             let mut bus = machine.make_bus();
-            let _ = bus.write_io(0x43, BusWidth::Byte, 0x34);
-            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
-            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
+            let _ = bus.write_io(0x43, BusWidth::Byte, 0x34, false);
+            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00, false);
+            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00, false);
         }
         Ok(machine)
     }
@@ -2180,7 +2180,7 @@ impl Machine {
                 (0x21, 0xfd), // master IMR: unmask IRQ1 only
                 (0xa1, 0xff), // slave IMR: all masked
             ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value))?;
+                bus.write_io(port, BusWidth::Byte, u32::from(value), false)?;
             }
         }
         Ok(())
@@ -2315,7 +2315,7 @@ impl Machine {
     #[cfg(test)]
     fn read_io_port_u8(&mut self, port: u16) -> u8 {
         let mut bus = self.make_bus();
-        bus.read_io(port, BusWidth::Byte, 0).unwrap_or(0) as u8
+        bus.read_io(port, BusWidth::Byte, 0, false).unwrap_or(0) as u8
     }
 
     #[cfg(test)]
@@ -2335,10 +2335,10 @@ impl Machine {
     #[cfg(test)]
     fn enable_8042_irq12(&mut self) {
         let mut bus = self.make_bus();
-        bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
-        let ccb = bus.read_io(0x60, BusWidth::Byte, 0).unwrap() as u8;
-        bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
-        bus.write_io(0x60, BusWidth::Byte, u32::from(ccb | 0x01 | 0x02))
+        bus.write_io(0x64, BusWidth::Byte, 0x20, false).unwrap();
+        let ccb = bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap() as u8;
+        bus.write_io(0x64, BusWidth::Byte, 0x60, false).unwrap();
+        bus.write_io(0x60, BusWidth::Byte, u32::from(ccb | 0x01 | 0x02), false)
             .unwrap();
     }
 
@@ -9748,11 +9748,26 @@ impl CpuBus for MachineBus<'_> {
         port: u16,
         width: BusWidth,
         core_clocks_so_far: u64,
+        cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError> {
         // A copy, mirroring `active_mode`: available to any lazy-read arm without
         // re-threading the parameter, per dev_docs/2026-07-02-p4a-lazy-port-device-
         // time-plan.md Task 0.2. Read by the lazy 3DA/3BA/3C2 arm below (Task 1.3).
         self.core_clocks_so_far = core_clocks_so_far;
+        // Ring-0-monitor port-time exemption (V86 trap tax, Part 1): the TOKAEMM
+        // monitor's own device pokes (the vec13 discriminator's PIC OCW3 probe,
+        // chiefly) are chipset-side bookkeeping done on the guest's behalf, not
+        // guest-visible device activity in their own right. Ending the CPU batch
+        // around them (the normal io_touched contract) triples the guest-visible
+        // cost of every V86 trap for no fidelity gain: device time is still exact
+        // because the batch still ends at the next approx_batch_cap edge or the
+        // next GUEST port access, and OCW3's read-select is pure register state
+        // (see pic.rs -- `read_isr` is a mode bit, not time-derived), so deferring
+        // exactly when it is consumed relative to batch-end timing is safe. Gated
+        // on `lazy_port_reads` (Approximate class only, i.e. 486/586): the
+        // Accurate class (286/386) keeps byte-identical batch semantics, matching
+        // every other P4a lazy gate in this function.
+        let skip_io_touched = cpu_is_ring0_pm && self.lazy_port_reads;
         // Bus-clock trace recording stays unconditional for every port, both timing
         // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
         // here, so a lazy read that skipped this would under-predict its own beam.
@@ -9764,7 +9779,9 @@ impl CpuBus for MachineBus<'_> {
         );
 
         if let Some(value) = self.pci.read_io(port, width) {
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             return Ok(value);
         }
 
@@ -9783,6 +9800,7 @@ impl CpuBus for MachineBus<'_> {
                     io_word_sub_port(port, i),
                     BusWidth::Byte,
                     core_clocks_so_far,
+                    cpu_is_ring0_pm,
                 )?;
                 value |= (byte & 0xff) << (8 * i);
             }
@@ -9790,24 +9808,34 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if self.video_io_disabled_for_port(port) {
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             return Ok(0xff);
         }
 
         if let Some(value) = self.serial.read_port(port) {
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             return Ok(u32::from(value));
         }
         if let Some(value) = self.serial2.read_port(port) {
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             return Ok(u32::from(value));
         }
         if let Some(value) = self.lpt.read_port(port) {
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             return Ok(u32::from(value));
         }
         if let Some(value) = self.lpt2.read_port(port) {
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             return Ok(u32::from(value));
         }
         // The VGA status ports (3DA/3BA/3C2) are the ONLY arm in this function that
@@ -9843,14 +9871,18 @@ impl CpuBus for MachineBus<'_> {
                 // instead of silently falling back to the old behavior.
                 return Ok(0xff);
             } else {
-                *self.io_touched = true;
+                if !skip_io_touched {
+                    *self.io_touched = true;
+                }
                 if let Some(value) = self.video.read_port(port) {
                     return Ok(u32::from(value));
                 }
             }
         } else if self.video_io_enabled_for_port(port) {
             if let Some(value) = self.video.read_port(port) {
-                *self.io_touched = true;
+                if !skip_io_touched {
+                    *self.io_touched = true;
+                }
                 return Ok(u32::from(value));
             }
         }
@@ -9887,7 +9919,9 @@ impl CpuBus for MachineBus<'_> {
                 // non-lazy path below (io_touched set, today's live read) rather
                 // than a second implementation of the same bit composition.
             }
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             // Bit 4 is the DRAM-refresh heartbeat: PIT channel 1 OUT (the AT
             // refresh timer, mode 2), not the speaker's standalone toggle. The PIT
             // seeds channel 1 at power-on so this pulses without guest programming.
@@ -9915,15 +9949,21 @@ impl CpuBus for MachineBus<'_> {
             if matches!(resolved, 0x0388 | 0x038a) && self.lazy_port_reads {
                 return Ok(u32::from(self.predicted_opl_status()));
             }
-            *self.io_touched = true;
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
         }
         // Every arm from here down is unchanged from before Task 1.3: a single
         // unconditional set covers all of them, exactly like the old top-of-function
         // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61, OPL status)
-        // handled above.
-        *self.io_touched = true;
+        // handled above. This is also where the ring-0-monitor PIC OCW3 probe (port
+        // 0x20/0xA0) lands (V86 trap tax, Part 1), so it takes the same
+        // skip_io_touched gate as everything else in this function.
+        if !skip_io_touched {
+            *self.io_touched = true;
+        }
         if let Some(value) = self.mixer.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -10018,8 +10058,31 @@ impl CpuBus for MachineBus<'_> {
             .ok_or(BusError::UnsupportedPort { port })
     }
 
-    fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError> {
-        *self.io_touched = true;
+    fn write_io(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        value: u32,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<(), BusError> {
+        // See read_io's matching comment (V86 trap tax, Part 1): the ring-0
+        // monitor's own device pokes (e.g. the vec13 discriminator's PIC OCW3
+        // select write) are chipset bookkeeping, not guest-visible activity, so
+        // they are exempted from ending the batch in the Approximate class only.
+        //
+        // A20 carve-out: the batch loop's A20 seam ("any A20 write ... ends this
+        // step" -- the before/after compare at batch entry) depends on EVERY
+        // write that can move the A20 gate ending the batch, ring-0 or not.
+        // Ports 0x92 (system control A), 0x60/0x64 (the 8042 path) can; keep
+        // them batch-ending unconditionally. TOKAEMM's a20_apply is PTE-based
+        // today (the real gate never drops), so this is belt-and-braces for a
+        // future monitor that pokes the real gate, at zero hot-path cost (the
+        // monitor's hot pokes are the PIC/EOI ports, not these three).
+        let skip_io_touched =
+            cpu_is_ring0_pm && self.lazy_port_reads && !matches!(port, 0x60 | 0x64 | 0x92);
+        if !skip_io_touched {
+            *self.io_touched = true;
+        }
         self.trace.record(
             BusAccessKind::IoWrite,
             u32::from(port),
@@ -10050,7 +10113,12 @@ impl CpuBus for MachineBus<'_> {
             // `0x3CE`/`0x3D4`) depends on this; it used to halt the VM with
             // WidthMismatch.
             for i in 0..width.bytes() {
-                self.write_io(io_word_sub_port(port, i), BusWidth::Byte, value >> (8 * i))?;
+                self.write_io(
+                    io_word_sub_port(port, i),
+                    BusWidth::Byte,
+                    value >> (8 * i),
+                    cpu_is_ring0_pm,
+                )?;
             }
             return Ok(());
         }
@@ -10451,6 +10519,9 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x0080..=0x008f, // DMA page registers
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
+        0x0280..=0x028f, // C/MS Game Blaster alternate-base probe range (Prince of
+        // Persia's sound detect reads 0x283 and must see open bus,
+        // not a fault -- the port-0x201 joystick-stub precedent)
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
     ];
@@ -12414,9 +12485,9 @@ mod tests {
 
     fn color_crtc_reg(machine: &mut Machine, index: u8) -> u8 {
         let mut bus = machine.make_bus();
-        bus.write_io(0x3D4, BusWidth::Byte, u32::from(index))
+        bus.write_io(0x3D4, BusWidth::Byte, u32::from(index), false)
             .unwrap();
-        bus.read_io(0x3D5, BusWidth::Byte, 0).unwrap() as u8
+        bus.read_io(0x3D5, BusWidth::Byte, 0, false).unwrap() as u8
     }
 
     #[test]
@@ -12430,7 +12501,7 @@ mod tests {
         {
             let mut bus = m.make_bus();
             // AX = 0x420F: CRTC index 0x0F (cursor location low), data 0x42.
-            bus.write_io(0x3D4, BusWidth::Word, 0x420F).unwrap();
+            bus.write_io(0x3D4, BusWidth::Word, 0x420F, false).unwrap();
         }
         // The low byte set the index, the high byte wrote the data at 0x3D5.
         assert_eq!(color_crtc_reg(&mut m, 0x0F), 0x42);
@@ -12447,9 +12518,9 @@ mod tests {
                 .unwrap();
         fn latched_count(m: &mut Machine) -> u16 {
             let mut bus = m.make_bus();
-            bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
-            let lo = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
-            let hi = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
+            bus.write_io(0x43, BusWidth::Byte, 0x00, false).unwrap(); // latch counter 0
+            let lo = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap() as u16;
             lo | (hi << 8)
         }
         let before = latched_count(&mut m);
@@ -13244,9 +13315,9 @@ mod tests {
         // Disable A20 through the fast-A20 port; it reads back off.
         {
             let mut bus = m.make_bus();
-            bus.write_io(0x0092, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x0092, BusWidth::Byte, 0x00, false).unwrap();
             assert_eq!(
-                bus.read_io(0x0092, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(0x0092, BusWidth::Byte, 0, false).unwrap(),
                 0x00,
                 "port 0x92 A20 off"
             );
@@ -13262,9 +13333,9 @@ mod tests {
         // Enable through the port again; bit 1 reads back set.
         {
             let mut bus = m.make_bus();
-            bus.write_io(0x0092, BusWidth::Byte, 0x02).unwrap();
+            bus.write_io(0x0092, BusWidth::Byte, 0x02, false).unwrap();
             assert_eq!(
-                bus.read_io(0x0092, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(0x0092, BusWidth::Byte, 0, false).unwrap(),
                 0x02,
                 "port 0x92 A20 on"
             );
@@ -13913,10 +13984,10 @@ mod tests {
         // serial2 port arm exactly the way COM1's (0x3FF) does.
         let mut m = int15_machine(16);
         let mut bus = m.make_bus();
-        bus.write_io(0x02ff, BusWidth::Byte, 0xa5).unwrap();
-        assert_eq!(bus.read_io(0x02ff, BusWidth::Byte, 0).unwrap(), 0xa5);
+        bus.write_io(0x02ff, BusWidth::Byte, 0xa5, false).unwrap();
+        assert_eq!(bus.read_io(0x02ff, BusWidth::Byte, 0, false).unwrap(), 0xa5);
         // COM1 stays separate: writing COM2 did not disturb COM1's scratch.
-        assert_eq!(bus.read_io(0x03ff, BusWidth::Byte, 0).unwrap(), 0x00);
+        assert_eq!(bus.read_io(0x03ff, BusWidth::Byte, 0, false).unwrap(), 0x00);
     }
 
     #[test]
@@ -13924,10 +13995,10 @@ mod tests {
         // The LPT2 data latch at 0x278 reads back through the lpt2 port arm.
         let mut m = int15_machine(16);
         let mut bus = m.make_bus();
-        bus.write_io(0x0278, BusWidth::Byte, 0x42).unwrap();
-        assert_eq!(bus.read_io(0x0278, BusWidth::Byte, 0).unwrap(), 0x42);
+        bus.write_io(0x0278, BusWidth::Byte, 0x42, false).unwrap();
+        assert_eq!(bus.read_io(0x0278, BusWidth::Byte, 0, false).unwrap(), 0x42);
         // The LPT2 status port reports the always-ready idle byte.
-        assert_eq!(bus.read_io(0x0279, BusWidth::Byte, 0).unwrap(), 0xdf);
+        assert_eq!(bus.read_io(0x0279, BusWidth::Byte, 0, false).unwrap(), 0xdf);
     }
 
     #[test]
@@ -13938,9 +14009,9 @@ mod tests {
         // not an UnsupportedPort fault that halts the machine.
         let mut m = int15_machine(16);
         let mut bus = m.make_bus();
-        assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0).unwrap(), 0xf0);
-        bus.write_io(0x0201, BusWidth::Byte, 0xff).unwrap();
-        assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0).unwrap(), 0xf0);
+        assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+        bus.write_io(0x0201, BusWidth::Byte, 0xff, false).unwrap();
+        assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xf0);
     }
 
     #[test]
@@ -14009,8 +14080,11 @@ mod tests {
         assert_eq!(m.read_physical_u8(VGA_TEXT_BASE), b'R');
         {
             let mut bus = m.make_bus();
-            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte, 0).unwrap(), 1);
-            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte, 0).unwrap() & 0x02, 0);
+            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte, 0, false).unwrap(), 1);
+            assert_eq!(
+                bus.read_io(0x3CC, BusWidth::Byte, 0, false).unwrap() & 0x02,
+                0
+            );
         }
 
         m.cpu.registers.set_eax(0x1200);
@@ -14939,10 +15013,10 @@ mod tests {
         machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
         let reported = with_bus(&mut machine, |bus| {
-            bus.write_io(0xE4, BusWidth::Byte, 8).unwrap(); // index = REG_CRC
+            bus.write_io(0xE4, BusWidth::Byte, 8, false).unwrap(); // index = REG_CRC
             let mut crc = [0u8; 4];
             for byte in &mut crc {
-                *byte = bus.read_io(0xE5, BusWidth::Byte, 0).unwrap() as u8;
+                *byte = bus.read_io(0xE5, BusWidth::Byte, 0, false).unwrap() as u8;
             }
             u32::from_le_bytes(crc)
         });
@@ -16733,8 +16807,8 @@ mod tests {
         // probe sees no device, and a write is harmlessly dropped.
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x1F2, BusWidth::Byte, 0x55).unwrap();
-            let v = bus.read_io(0x1F7, BusWidth::Byte, 0).unwrap();
+            bus.write_io(0x1F2, BusWidth::Byte, 0x55, false).unwrap();
+            let v = bus.read_io(0x1F7, BusWidth::Byte, 0, false).unwrap();
             assert_eq!(v, 0xFF, "empty channel reads open bus");
         });
     }
@@ -16745,9 +16819,9 @@ mod tests {
         machine.mount_hdd(vec![0u8; 4032 * 512]);
         with_bus(&mut machine, |bus| {
             // IDENTIFY DEVICE on the command port, then drain word 0 of the block.
-            bus.write_io(0x1F7, BusWidth::Byte, 0xEC).unwrap();
-            let lo = bus.read_io(0x1F0, BusWidth::Byte, 0).unwrap();
-            let hi = bus.read_io(0x1F0, BusWidth::Byte, 0).unwrap();
+            bus.write_io(0x1F7, BusWidth::Byte, 0xEC, false).unwrap();
+            let lo = bus.read_io(0x1F0, BusWidth::Byte, 0, false).unwrap();
+            let hi = bus.read_io(0x1F0, BusWidth::Byte, 0, false).unwrap();
             let word0 = u16::from(lo as u8) | (u16::from(hi as u8) << 8);
             assert_eq!(word0, 0x0040, "fixed ATA device general config");
         });
@@ -17223,18 +17297,18 @@ mod tests {
         let mut machine = test_machine();
         fn latched_count(m: &mut Machine) -> u16 {
             let mut bus = m.make_bus();
-            bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
-            let lo = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
-            let hi = bus.read_io(0x40, BusWidth::Byte, 0).unwrap() as u16;
+            bus.write_io(0x43, BusWidth::Byte, 0x00, false).unwrap(); // latch counter 0
+            let lo = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte, 0, false).unwrap() as u16;
             lo | (hi << 8)
         }
         {
             // Program PIT counter 0 (mode 3, reload 0 = 65536) so it counts; the
             // test ROM machine never ran the POST timer setup.
             let mut bus = machine.make_bus();
-            bus.write_io(0x43, BusWidth::Byte, 0x36).unwrap();
-            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
         }
         let before = machine.elapsed_clocks();
         let pit_before = latched_count(&mut machine);
@@ -17409,11 +17483,11 @@ mod tests {
         // Drive the controller through the bus the way the CPU would.
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap(); // write command byte
-            bus.write_io(0x60, BusWidth::Byte, 0x03).unwrap(); // IRQ1 + IRQ12 enabled
-            bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap(); // next byte to aux
-            bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap(); // enable data reporting
-            assert_eq!(bus.read_io(0x60, BusWidth::Byte, 0).unwrap(), 0xFA); // mouse ACK
+            bus.write_io(0x64, BusWidth::Byte, 0x60, false).unwrap(); // write command byte
+            bus.write_io(0x60, BusWidth::Byte, 0x03, false).unwrap(); // IRQ1 + IRQ12 enabled
+            bus.write_io(0x64, BusWidth::Byte, 0xD4, false).unwrap(); // next byte to aux
+            bus.write_io(0x60, BusWidth::Byte, 0xF4, false).unwrap(); // enable data reporting
+            assert_eq!(bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap(), 0xFA); // mouse ACK
         }
         // The ACK read armed the keyboard controller's aux settle window (see
         // AUX_BYTE_SETTLE_US in keyboard.rs); advance past it -- comfortably
@@ -17450,11 +17524,12 @@ mod tests {
         {
             let mut bus = machine.make_bus();
             // Read CCB (0x20) -> 0x60, OR in IRQ1 (bit0) + IRQ12 (bit1), write back.
-            bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
-            let ccb = bus.read_io(0x60, BusWidth::Byte, 0).unwrap() as u8;
+            bus.write_io(0x64, BusWidth::Byte, 0x20, false).unwrap();
+            let ccb = bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap() as u8;
             let new_ccb = ccb | 0x01 | 0x02;
-            bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
-            bus.write_io(0x60, BusWidth::Byte, new_ccb as u32).unwrap();
+            bus.write_io(0x64, BusWidth::Byte, 0x60, false).unwrap();
+            bus.write_io(0x60, BusWidth::Byte, new_ccb as u32, false)
+                .unwrap();
         }
         // Drain the IRQ1 edge the CCB read above itself arms in
         // respond_immediately (a pre-existing quirk unrelated to AUX enable:
@@ -17468,14 +17543,14 @@ mod tests {
         {
             let mut bus = machine.make_bus();
             // Enable AUX data reporting: 0xD4 routes 0xF4 to the mouse.
-            bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap();
-            bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap();
+            bus.write_io(0x64, BusWidth::Byte, 0xD4, false).unwrap();
+            bus.write_io(0x60, BusWidth::Byte, 0xF4, false).unwrap();
             // Drain the AUX ACK (0xFA): it must arrive flagged as an AUX byte.
-            let status = bus.read_io(0x64, BusWidth::Byte, 0).unwrap() as u8;
+            let status = bus.read_io(0x64, BusWidth::Byte, 0, false).unwrap() as u8;
             assert_eq!(status & 0x01, 0x01, "ACK waiting (OBF)");
             assert_eq!(status & 0x20, 0x20, "ACK is an AUX byte, not a key");
             assert_eq!(
-                bus.read_io(0x60, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap(),
                 0xFA,
                 "mouse ACK"
             );
@@ -17612,8 +17687,8 @@ mod tests {
         machine.register_mouse_handler_for_test(0, 0); // null handler still exercises dispatch
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x21, BusWidth::Byte, 0xfb).unwrap(); // master: IRQ2 only
-            bus.write_io(0xa1, BusWidth::Byte, 0xef).unwrap(); // slave: IRQ12 only
+            bus.write_io(0x21, BusWidth::Byte, 0xfb, false).unwrap(); // master: IRQ2 only
+            bus.write_io(0xa1, BusWidth::Byte, 0xef, false).unwrap(); // slave: IRQ12 only
         }
 
         machine
@@ -17757,7 +17832,7 @@ mod tests {
         // (0x224/0x225 are now the CT1745 mixer, 0x388 the OPL chip).
         let mut machine = test_machine();
         let value = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0226, BusWidth::Byte, 0).unwrap()
+            bus.read_io(0x0226, BusWidth::Byte, 0, false).unwrap()
         });
 
         assert_eq!(value, 0xff);
@@ -17776,17 +17851,17 @@ mod tests {
         // index register, whose read returns the latched index (0 at reset).
         let mut machine = test_machine();
         let index_read = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0224, BusWidth::Byte, 0).unwrap()
+            bus.read_io(0x0224, BusWidth::Byte, 0, false).unwrap()
         });
         assert_eq!(index_read, 0x00, "0x224 returns the latched mixer index");
         // Programming register 0x80 (IRQ7) round-trips through 0x225.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x04, false).unwrap();
         });
         let routed = with_bus(&mut machine, |bus| {
-            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            bus.read_io(0x225, BusWidth::Byte, 0).unwrap()
+            bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
+            bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap()
         });
         assert_eq!(routed, 0x04, "IRQ7 latched in mixer register 0x80");
     }
@@ -17797,13 +17872,13 @@ mod tests {
         // Seed memory at physical 0x01_0010 (page 0x01, offset 0x0010).
         machine.write_physical_u8(0x0001_0010, 0x77);
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1: single, read
-            bus.write_io(0x02, BusWidth::Byte, 0x10).unwrap(); // address LSB
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // address MSB -> 0x0010
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count LSB
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count MSB -> 0 (1 transfer)
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0010
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask channel 1
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap(); // mode ch1: single, read
+            bus.write_io(0x02, BusWidth::Byte, 0x10, false).unwrap(); // address LSB
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap(); // address MSB -> 0x0010
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap(); // count LSB
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap(); // count MSB -> 0 (1 transfer)
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0010
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask channel 1
         });
         let byte = machine.dma_read_byte(1).expect("a byte from channel 1");
         assert_eq!(byte, 0x77);
@@ -17814,17 +17889,17 @@ mod tests {
         let mut machine = test_machine();
         // Reset: write 1, then 0 to the DSP reset port 0x226.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x226, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x226, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0x00, false).unwrap();
         });
         // Advance emulated time past the ~100us DSP settle window.
         machine.advance_dsp_micros(200);
         let status = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22E, BusWidth::Byte, 0).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap()).unwrap()
         });
         assert_eq!(status & 0x80, 0x80, "data available after reset");
         let ack = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0, false).unwrap()).unwrap()
         });
         assert_eq!(ack, 0xAA);
     }
@@ -17833,13 +17908,13 @@ mod tests {
     fn sb_dsp_version_and_status_route_through_the_bus() {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x22C, BusWidth::Byte, 0xE1).unwrap(); // read version
+            bus.write_io(0x22C, BusWidth::Byte, 0xE1, false).unwrap(); // read version
         });
         let hi = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0, false).unwrap()).unwrap()
         });
         let lo = with_bus(&mut machine, |bus| {
-            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0).unwrap()).unwrap()
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte, 0, false).unwrap()).unwrap()
         });
         assert_eq!([hi, lo], [4, 5]);
     }
@@ -17852,15 +17927,16 @@ mod tests {
             machine.write_physical_u8(0x1_0000 + i as u32, b);
         }
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let before = with_bus(&mut machine, |bus| bus.interrupt_pending());
@@ -17883,24 +17959,25 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // Route the DSP IRQ on IRQ7 (mixer register 0x80 = 0x04).
-            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x04, false).unwrap();
             // PIC base 0x08 so IRQ7 -> vector 0x0F; mask everything except IR7.
-            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x7F).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x7F, false).unwrap();
             // DMA ch1 + DSP 8-bit single-cycle, exactly like the IRQ5 golden.
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         machine.advance_devices_clocks(200_000);
@@ -17917,19 +17994,20 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // Route the 8-bit DMA through DMA3 (mixer register 0x81 = 0x08).
-            bus.write_io(0x224, BusWidth::Byte, 0x81).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x81, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x08, false).unwrap();
             // DMA ch3: page 0x82, byte addr 0, count 15 (16 bytes), single read.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x82, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap();
             // DSP: 11025 Hz, block 16, single-cycle 8-bit DMA output.
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let out = {
@@ -17952,13 +18030,13 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             // Route the IRQ on IRQ7, then reset the mixer (any value to 0x00).
-            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x224, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x01, false).unwrap();
             // A guest reset restores the hardware IRQ5 default, not the host config.
-            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            let byte = bus.read_io(0x225, BusWidth::Byte, 0).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
+            let byte = bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap();
             assert_eq!(byte, 0x02);
         });
     }
@@ -17976,10 +18054,10 @@ mod tests {
         // The mixer boots on the configured routing, not the hardware IRQ5/DMA1/DMA5.
         assert_eq!(machine.sb_selected_irq(), 7);
         let (irq_byte, dma_byte) = with_bus(&mut machine, |bus| {
-            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
-            let irq = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0).unwrap()).unwrap();
-            bus.write_io(0x224, BusWidth::Byte, 0x81).unwrap();
-            let dma = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0).unwrap()).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x80, false).unwrap();
+            let irq = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap()).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x81, false).unwrap();
+            let dma = u8::try_from(bus.read_io(0x225, BusWidth::Byte, 0, false).unwrap()).unwrap();
             (irq, dma)
         });
         assert_eq!(irq_byte, 0x04, "register 0x80 boots on IRQ7");
@@ -17996,16 +18074,17 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // DMA ch1: address 0x0000, page 0x01, count 15, single read.
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap(); // mode ch1
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
             // DSP: 11025 Hz, block 16, single 8-bit DMA output.
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let out = {
@@ -18036,26 +18115,27 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // DMA ch1: address 0x0000, page 0x01, count 15, single read.
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap(); // mode ch1
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap(); // page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
             // Mixer register 0x0E bit1: SB Pro stereo.
-            bus.write_io(0x224, BusWidth::Byte, 0x0E).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x02).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x0E, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x02, false).unwrap();
             // Voice volume to unity so the decoded L/R samples survive the mixer.
-            bus.write_io(0x224, BusWidth::Byte, 0x32).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
-            bus.write_io(0x224, BusWidth::Byte, 0x33).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
             // DSP: set the interleaved byte rate via the 0x40 TIME CONSTANT
             // (tc 0xD3 -> 1_000_000/45 = 22_222 byte/s; SB Pro stereo halves it
             // to the per-channel frame rate), block 16, single 8-bit DMA output.
             for &b in &[0x40u8, 0xD3, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         // Advance well past the 16-byte block (8 stereo frames at 2 bytes/frame).
@@ -18098,22 +18178,23 @@ mod tests {
         with_bus(&mut machine, |bus| {
             // Slave ch5 (local ch1): word addr 0, page 0x8B=0x01, count 15 (16
             // words), auto-init read.
-            bus.write_io(0xD6, BusWidth::Byte, 0x59).unwrap(); // slave ch1 mode: auto-init, read
-            bus.write_io(0xC4, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0xC4, BusWidth::Byte, 0x00).unwrap(); // word addr 0
-            bus.write_io(0xC6, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0xC6, BusWidth::Byte, 0x00).unwrap(); // count 15 -> 16 words
-            bus.write_io(0x8B, BusWidth::Byte, 0x01).unwrap(); // page -> byte base 0x2_0000
-            bus.write_io(0xD4, BusWidth::Byte, 0x01).unwrap(); // unmask slave ch1
+            bus.write_io(0xD6, BusWidth::Byte, 0x59, false).unwrap(); // slave ch1 mode: auto-init, read
+            bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap(); // word addr 0
+            bus.write_io(0xC6, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap(); // count 15 -> 16 words
+            bus.write_io(0x8B, BusWidth::Byte, 0x01, false).unwrap(); // page -> byte base 0x2_0000
+            bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap(); // unmask slave ch1
             // Voice volume to unity (0 dB) so the exact -1/+1 samples survive the
             // CT1745 voice attenuation and the test stays about 16-bit decoding.
-            bus.write_io(0x224, BusWidth::Byte, 0x32).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
-            bus.write_io(0x224, BusWidth::Byte, 0x33).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x32, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x33, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F, false).unwrap();
             // DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15.
             for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let out = {
@@ -18146,9 +18227,9 @@ mod tests {
     /// Write one AD1848 indirect register through the codec's R0 (index) + R1
     /// (data) direct ports on the machine bus.
     fn wss_write_indirect(bus: &mut MachineBus, index: u8, value: u8) {
-        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(index))
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(index), false)
             .unwrap();
-        bus.write_io(WSS_DATA, BusWidth::Byte, u32::from(value))
+        bus.write_io(WSS_DATA, BusWidth::Byte, u32::from(value), false)
             .unwrap();
     }
 
@@ -18169,20 +18250,21 @@ mod tests {
             // DMA ch0 (the WSS default): byte addr 0x0000, page 0x01 -> 0x01_0000,
             // count 31 (32 bytes), single read. Channel 0 ports: addr 0x00,
             // count 0x01, mode 0x0B, page 0x87, single-mask 0x0A.
-            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap(); // mode ch0: single, read
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap(); // addr 0x0000
-            bus.write_io(0x01, BusWidth::Byte, 0x1F).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap(); // count 31 -> 32 bytes
-            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap(); // ch0 page -> 0x01_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
+            bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap(); // mode ch0: single, read
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap(); // addr 0x0000
+            bus.write_io(0x01, BusWidth::Byte, 0x1F, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap(); // count 31 -> 32 bytes
+            bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap(); // ch0 page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap(); // unmask ch0
 
             // Program the codec for 16-bit signed stereo at 48000 Hz (XTAL1 CFS6).
             // I8 = FMT(0x40) | S/M(0x10) | CFS6(0x0C) -> 0x5C, MCE-gated.
-            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
                 .unwrap(); // R0: MCE | index 8
-            bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C).unwrap();
-            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C, false).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+                .unwrap(); // clear MCE
             // Enable the external INT pin (I10 IEN, bit1) so terminal count forwards.
             wss_write_indirect(bus, 10, 0x02);
             // Base count 7 -> underflow at frame 8 (N+1 cadence).
@@ -18251,33 +18333,35 @@ mod tests {
 
         with_bus(&mut machine, |bus| {
             // --- SB16 DMA ch1 + DSP (IRQ5/DMA1, ports 0x220-0x22F) ---
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1: single, read
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x02).unwrap(); // ch1 page -> 0x02_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap(); // mode ch1: single, read
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x02, false).unwrap(); // ch1 page -> 0x02_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap(); // unmask ch1
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
             // OPL: key a full sustained tone on channel 0 (modulator + carrier +
             // key-on) so the OPL stream is genuinely audible, not just touched.
             program_tone(bus, 0x388, 0x389);
 
             // --- WSS DMA ch0 + codec (IRQ7/DMA0, ports 0x530-0x537) ---
-            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap(); // mode ch0: single, read
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap(); // ch0 page -> 0x01_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
+            bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap(); // mode ch0: single, read
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap(); // ch0 page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap(); // unmask ch0
             // Codec: 8-bit unsigned PCM mono at 48000 Hz (I8 = CFS6 only -> 0x0C).
-            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
                 .unwrap();
-            bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C).unwrap();
-            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C, false).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+                .unwrap();
             wss_write_indirect(bus, 10, 0x02); // IEN
             wss_write_indirect(bus, 15, 0x07); // count low
             wss_write_indirect(bus, 14, 0x00); // count high
@@ -18359,14 +18443,19 @@ mod tests {
 
         with_bus(&mut machine, |bus| {
             // 8237 DMA channel 3: single-cycle read of the whole buffer.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap(); // ch3 single read
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap(); // address low
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap(); // address high
-            bus.write_io(0x07, BusWidth::Byte, u32::from((adpcm.len() - 1) as u8))
-                .unwrap(); // count low
-            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap(); // count high
-            bus.write_io(0x82, BusWidth::Byte, 0x03).unwrap(); // ch3 page -> 0x03_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap(); // unmask ch3
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap(); // ch3 single read
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap(); // address low
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap(); // address high
+            bus.write_io(
+                0x07,
+                BusWidth::Byte,
+                u32::from((adpcm.len() - 1) as u8),
+                false,
+            )
+            .unwrap(); // count low
+            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap(); // count high
+            bus.write_io(0x82, BusWidth::Byte, 0x03, false).unwrap(); // ch3 page -> 0x03_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap(); // unmask ch3
 
             // Program the chip through its address/data latch at base 0x240:
             // rate 11025 Hz (0x2B11), block = input.len() nibbles, ADPCM-B mono,
@@ -18387,16 +18476,16 @@ mod tests {
                 (0x240, 0),                        // address: CONTROL
                 (0x241, 0x01),                     // START
             ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value))
+                bus.write_io(port, BusWidth::Byte, u32::from(value), false)
                     .unwrap();
             }
 
             // Status bit0 (playing) reads back through the guest-visible port.
-            let status = bus.read_io(0x240, BusWidth::Byte, 0).unwrap() as u8;
+            let status = bus.read_io(0x240, BusWidth::Byte, 0, false).unwrap() as u8;
             assert!(status & 0x01 != 0, "chip reports playing through its port");
 
             // Resource readback: high nibble IRQ (10), low nibble DMA (3).
-            let resources = bus.read_io(0x242, BusWidth::Byte, 0).unwrap() as u8;
+            let resources = bus.read_io(0x242, BusWidth::Byte, 0, false).unwrap() as u8;
             assert_eq!(resources >> 4, 10, "IRQ readback");
             assert_eq!(resources & 0x0F, 3, "DMA readback");
         });
@@ -18453,22 +18542,23 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // PIC base 0x08 (IRQ5 -> vector 0x0D), all lines unmasked.
-            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00, false).unwrap();
             // DMA ch1: auto-init read of 16 bytes at 0x1_0000 (mode 0x59).
-            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x59, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             // DSP: rate 11025 Hz, block size 8, 8-bit auto-init output.
             for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x07, 0x00, 0x1C] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         machine.advance_devices_clocks(200_000);
@@ -18487,8 +18577,8 @@ mod tests {
         // Guest ISR: PIC acknowledge, device ack (0x22E read), then EOI.
         with_bus(&mut machine, |bus| {
             assert_eq!(bus.acknowledge_interrupt(), Some(0x0D));
-            bus.read_io(0x22E, BusWidth::Byte, 0).unwrap();
-            bus.write_io(0x20, BusWidth::Byte, 0x20).unwrap(); // OCW2 EOI
+            bus.read_io(0x22E, BusWidth::Byte, 0, false).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x20, false).unwrap(); // OCW2 EOI
         });
         assert!(!machine.pic.irr_bit(5), "IRR clear after the acknowledge");
         // Later edges arrive in a later advance and re-request the line: the
@@ -18538,13 +18628,13 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // 8237 ch3: single-cycle read of the 64-byte buffer.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 63).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x82, BusWidth::Byte, 0x03).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 63, false).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x03, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap();
             // Chip: rate 11025 Hz, block 128 nibbles (one byte = two mono
             // samples), ADPCM-B mono, START.
             for &(port, value) in &[
@@ -18561,7 +18651,7 @@ mod tests {
                 (0x240, 0),    // address: CONTROL
                 (0x241, 0x01), // START
             ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value))
+                bus.write_io(port, BusWidth::Byte, u32::from(value), false)
                     .unwrap();
             }
         });
@@ -18589,9 +18679,9 @@ mod tests {
         // advance coalesce in the IRR, and the request is present at step end.
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x43, BusWidth::Byte, 0x34).unwrap(); // ch0 mode 2
-            bus.write_io(0x40, BusWidth::Byte, 100).unwrap();
-            bus.write_io(0x40, BusWidth::Byte, 0).unwrap();
+            bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap(); // ch0 mode 2
+            bus.write_io(0x40, BusWidth::Byte, 100, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0, false).unwrap();
         });
         // ~325 PIT ticks at 22 MHz: three-plus full periods in one advance.
         machine.advance_devices_clocks(6_000);
@@ -18619,9 +18709,9 @@ mod tests {
 
         // A running channel-0 (IRQ0) counter binds the cap to its next OUT rise.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x43, BusWidth::Byte, 0x34).unwrap(); // ch0 mode 2
-            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x40, BusWidth::Byte, 0x04).unwrap(); // reload 0x0400
+            bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap(); // ch0 mode 2
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x04, false).unwrap(); // reload 0x0400
         });
         let ticks = machine.pit.clocks_until_out_rise(0).unwrap();
         let expected =
@@ -18632,8 +18722,8 @@ mod tests {
         // A sub-sample edge floors at the DAC-sample cap: an Approximate batch
         // is never SHORTER than an Accurate one.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x40, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap(); // reload 8 (~7 us)
+            bus.write_io(0x40, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap(); // reload 8 (~7 us)
         });
         assert_eq!(machine.approx_batch_cap(u64::MAX), floor);
     }
@@ -18650,15 +18740,16 @@ mod tests {
             // The 16-frame 8-bit single-cycle golden: at 11025 Hz the half edge
             // (8 frames, ~726 us) is the next due event, under the ~1 ms
             // ceiling and above the DAC-sample floor.
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let expected = machine
@@ -18723,19 +18814,20 @@ mod tests {
     /// 8-bit unsigned mono at 48000 Hz with IEN set and `count` base count.
     fn wss_arm_8bit_mono(bus: &mut MachineBus, count: u8) {
         // DMA ch0: mode single+read, addr 0x0000, count, page 0x01, unmask.
-        bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap();
-        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-        bus.write_io(0x01, BusWidth::Byte, u32::from(count))
+        bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, u32::from(count), false)
             .unwrap();
-        bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
-        bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
-        bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
         // Codec: 8-bit unsigned PCM mono at 48000 Hz (I8 = CFS6 -> 0x0C), MCE-gated.
-        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
             .unwrap();
-        bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C).unwrap();
-        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap(); // clear MCE
         wss_write_indirect(bus, 10, 0x02); // I10 IEN
         wss_write_indirect(bus, 15, count); // I15 lower count
         wss_write_indirect(bus, 14, 0x00); // I14 upper count (loads current)
@@ -18776,11 +18868,11 @@ mod tests {
         machine.write_physical_u8(0x0611, 0x00);
         with_bus(&mut machine, |bus| {
             // PIC base 0x08 so IRQ7 -> vector 0x0F; all IRQs unmasked.
-            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap(); // unmask all
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00, false).unwrap(); // unmask all
             // Base count 31 -> terminal count after 32 frames.
             wss_arm_8bit_mono(bus, 31);
         });
@@ -18858,11 +18950,11 @@ mod tests {
         with_bus(&mut machine, |bus| {
             // PIC base 0x08, then mask ALL lines (IMR = 0xFF) so only the codec is
             // armed and nothing can wake the CPU.
-            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0xFF).unwrap(); // mask every line
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0xFF, false).unwrap(); // mask every line
             wss_arm_8bit_mono(bus, 31);
         });
         // Run long enough that, were the WSS line a wake source, the codec would
@@ -18918,24 +19010,24 @@ mod tests {
         machine.write_physical_u8(0x0611, 0x00);
         with_bus(&mut machine, |bus| {
             // Master PIC base 0x08, slave at IR2 base 0x70, everything unmasked.
-            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0xA0, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x70).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x02).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0xA0, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x70, false).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x02, false).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0xA1, BusWidth::Byte, 0x00, false).unwrap();
             // 8237 DMA channel 3: single-cycle read of the 64-byte buffer.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 63).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x82, BusWidth::Byte, 0x03).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 63, false).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x03, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap();
             // Program the chip: 11025 Hz, 128-sample block, ADPCM-B mono, START.
             let block = 128u16;
             for &(port, value) in &[
@@ -18952,7 +19044,7 @@ mod tests {
                 (0x240, 0),
                 (0x241, 0x01),
             ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value))
+                bus.write_io(port, BusWidth::Byte, u32::from(value), false)
                     .unwrap();
             }
         });
@@ -18985,17 +19077,18 @@ mod tests {
         with_bus(&mut machine, |bus| {
             // DMA ch0 for 32 bytes at 0x01_0000, 8-bit unsigned mono at 48 kHz, but
             // with IEN CLEAR (I10 = 0) so the underflow forwards no pin edge.
-            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x1F).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+            bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x1F, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
                 .unwrap();
-            bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C).unwrap();
-            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C, false).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+                .unwrap();
             wss_write_indirect(bus, 10, 0x00); // IEN CLEAR
             wss_write_indirect(bus, 15, 0x1F); // base count 31 -> TC after 32 frames
             wss_write_indirect(bus, 14, 0x00);
@@ -19035,7 +19128,7 @@ mod tests {
             // A write to the index port must not decode.
             assert!(
                 matches!(
-                    bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C),
+                    bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C, false),
                     Err(BusError::UnsupportedPort { port }) if port == WSS_CODEC
                 ),
                 "disabled WSS index write does not decode"
@@ -19044,7 +19137,7 @@ mod tests {
             // I12 revision) must not decode either.
             assert!(
                 matches!(
-                    bus.read_io(WSS_DATA, BusWidth::Byte, 0),
+                    bus.read_io(WSS_DATA, BusWidth::Byte, 0, false),
                     Err(BusError::UnsupportedPort { port }) if port == WSS_DATA
                 ),
                 "disabled WSS data read does not decode"
@@ -19052,7 +19145,7 @@ mod tests {
             // The window edges (base+7) are likewise undecoded.
             assert!(
                 matches!(
-                    bus.read_io(0x537, BusWidth::Byte, 0),
+                    bus.read_io(0x537, BusWidth::Byte, 0, false),
                     Err(BusError::UnsupportedPort { port }) if port == 0x537
                 ),
                 "disabled WSS upper window edge does not decode"
@@ -19063,9 +19156,10 @@ mod tests {
         // disabled assertions above are a genuine contrast, not a vacuous pass.
         let mut enabled = test_machine();
         with_bus(&mut enabled, |bus| {
-            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C).unwrap(); // select I12
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C, false)
+                .unwrap(); // select I12
             assert_eq!(
-                bus.read_io(WSS_DATA, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(WSS_DATA, BusWidth::Byte, 0, false).unwrap(),
                 0x0A,
                 "enabled WSS answers the I12 revision read"
             );
@@ -19095,13 +19189,13 @@ mod tests {
             // Program DMA ch0 (a separate decoder, still live) so the producer loop,
             // had it run the codec, would have data to read. The codec ports do not
             // decode while disabled, so we do not touch them here.
-            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x3F).unwrap();
-            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x3F, false).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
         });
         // The disabled producer branch must be a no-op: this runs cleanly and queues
         // no codec frames.
@@ -19123,20 +19217,21 @@ mod tests {
     /// IEN set, drawing `frames` frames (4 bytes each) at physical 0x01_0000.
     fn wss_arm_16bit_stereo(bus: &mut MachineBus, frames: u8) {
         let byte_count = u16::from(frames) * 4 - 1; // count is bytes-1
-        bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap(); // mode ch0: single, read
-        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-        bus.write_io(0x01, BusWidth::Byte, u32::from(byte_count & 0xFF))
+        bus.write_io(0x0B, BusWidth::Byte, 0x48, false).unwrap(); // mode ch0: single, read
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, u32::from(byte_count & 0xFF), false)
             .unwrap();
-        bus.write_io(0x01, BusWidth::Byte, u32::from(byte_count >> 8))
+        bus.write_io(0x01, BusWidth::Byte, u32::from(byte_count >> 8), false)
             .unwrap();
-        bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
-        bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
         // I8 = FMT(0x40) | S/M(0x10) | CFS6(0x0C) -> 0x5C, MCE-gated.
-        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
             .unwrap();
-        bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C).unwrap();
-        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap(); // clear MCE
         wss_write_indirect(bus, 10, 0x02); // IEN
         let count = u16::from(frames) - 1;
         wss_write_indirect(bus, 15, (count & 0xFF) as u8);
@@ -19207,10 +19302,10 @@ mod tests {
         with_bus(&mut machine, |bus| {
             // Hard-mute the CT1745 master (0x30/0x31 = 0) -- this scales OPL+DSP to
             // exactly zero but, per the contract, must NOT touch the WSS stream.
-            bus.write_io(0x224, BusWidth::Byte, 0x30).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x224, BusWidth::Byte, 0x31).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x30, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x31, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00, false).unwrap();
             // Key a loud OPL tone: with the master muted it must contribute zero.
             program_tone(bus, 0x388, 0x389);
             wss_arm_16bit_stereo(bus, 64);
@@ -19227,10 +19322,10 @@ mod tests {
         // so the non-silence above is the raw WSS sum and not a leaking OPL tone.
         let mut control = test_machine();
         with_bus(&mut control, |bus| {
-            bus.write_io(0x224, BusWidth::Byte, 0x30).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x224, BusWidth::Byte, 0x31).unwrap();
-            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x30, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x31, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00, false).unwrap();
             program_tone(bus, 0x388, 0x389);
         });
         control.advance_devices_clocks(200_000);
@@ -19254,10 +19349,11 @@ mod tests {
             // Select an UNSUPPORTED rate: I8 = CFS4 (bits3:1 = 4 -> 0x08), CSS=0
             // (XTAL1). rate_hz() decodes this to 0. Set MCE to latch I8, then clear
             // MCE to assert ACI.
-            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08), false)
                 .unwrap(); // MCE | index 8
-            bus.write_io(WSS_DATA, BusWidth::Byte, 0x08).unwrap(); // CFS4, XTAL1 -> 0 Hz
-            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE -> ACI
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x08, false).unwrap(); // CFS4, XTAL1 -> 0 Hz
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+                .unwrap(); // clear MCE -> ACI
         });
         assert!(
             machine.wss.autocal_active(),
@@ -19288,24 +19384,24 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             assert_eq!(
-                bus.read_io(0x531, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(0x531, BusWidth::Byte, 0, false).unwrap(),
                 0x70,
                 "config region reads the IRQ7/DMA0 jumper byte"
             );
             assert!(
-                bus.read_io(0x537, BusWidth::Byte, 0).is_ok(),
+                bus.read_io(0x537, BusWidth::Byte, 0, false).is_ok(),
                 "base+7 is the last decoded WSS port"
             );
             assert!(
                 matches!(
-                    bus.read_io(0x538, BusWidth::Byte, 0),
+                    bus.read_io(0x538, BusWidth::Byte, 0, false),
                     Err(BusError::UnsupportedPort { port }) if port == 0x538
                 ),
                 "base+8 is past the 8-port window"
             );
             assert!(
                 matches!(
-                    bus.read_io(0x52F, BusWidth::Byte, 0),
+                    bus.read_io(0x52F, BusWidth::Byte, 0, false),
                     Err(BusError::UnsupportedPort { port }) if port == 0x52F
                 ),
                 "base-1 is below the window"
@@ -19328,19 +19424,19 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // Channel 0 source address 0x1000, channel 1 dest address 0x1100.
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap(); // ch0 addr LSB
-            bus.write_io(0x00, BusWidth::Byte, 0x10).unwrap(); // ch0 addr MSB -> 0x1000
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // ch1 addr LSB
-            bus.write_io(0x02, BusWidth::Byte, 0x11).unwrap(); // ch1 addr MSB -> 0x1100
-            bus.write_io(0x03, BusWidth::Byte, 0x03).unwrap(); // ch1 count LSB
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // ch1 count MSB -> 3 (4 bytes)
-            bus.write_io(0x87, BusWidth::Byte, 0x00).unwrap(); // ch0 page 0
-            bus.write_io(0x83, BusWidth::Byte, 0x00).unwrap(); // ch1 page 0
-            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0 (the requester)
-            bus.write_io(0x08, BusWidth::Byte, 0x01).unwrap(); // command: mem-to-mem enable
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap(); // ch0 addr LSB
+            bus.write_io(0x00, BusWidth::Byte, 0x10, false).unwrap(); // ch0 addr MSB -> 0x1000
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap(); // ch1 addr LSB
+            bus.write_io(0x02, BusWidth::Byte, 0x11, false).unwrap(); // ch1 addr MSB -> 0x1100
+            bus.write_io(0x03, BusWidth::Byte, 0x03, false).unwrap(); // ch1 count LSB
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap(); // ch1 count MSB -> 3 (4 bytes)
+            bus.write_io(0x87, BusWidth::Byte, 0x00, false).unwrap(); // ch0 page 0
+            bus.write_io(0x83, BusWidth::Byte, 0x00, false).unwrap(); // ch1 page 0
+            bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap(); // unmask ch0 (the requester)
+            bus.write_io(0x08, BusWidth::Byte, 0x01, false).unwrap(); // command: mem-to-mem enable
             // Arm the software DREQ on channel 0: bit2 set, channel bits 0-1 = 0.
             // This write triggers the block copy.
-            bus.write_io(0x09, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x09, BusWidth::Byte, 0x04, false).unwrap();
         });
         for (i, &b) in src.iter().enumerate() {
             assert_eq!(
@@ -19362,14 +19458,14 @@ mod tests {
             machine.write_physical_u8(SRC + i, 0xAB);
         }
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x10).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x03).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
-            bus.write_io(0x09, BusWidth::Byte, 0x04).unwrap(); // arm, but command bit0 not set
+            bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x10, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x03, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap(); // unmask ch0
+            bus.write_io(0x09, BusWidth::Byte, 0x04, false).unwrap(); // arm, but command bit0 not set
         });
         for i in 0..4 {
             assert_eq!(
@@ -19612,7 +19708,7 @@ mod tests {
             // Accurate class: unchanged behavior, io_touched set.
             let mut accurate = test_machine(); // Gsw386 by construction
             with_bus(&mut accurate, |bus| {
-                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
                 assert!(
                     *bus.io_touched,
                     "port {port:#06X}: the Accurate class must still set io_touched \
@@ -19624,7 +19720,7 @@ mod tests {
             let mut approximate = test_machine();
             approximate.set_mode(GswMode::Gsw486);
             with_bus(&mut approximate, |bus| {
-                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
                 assert!(
                     !*bus.io_touched,
                     "port {port:#06X}: the Approximate class must NOT set io_touched \
@@ -19632,6 +19728,99 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn ring0_monitor_port_access_does_not_set_io_touched_in_approximate_class() {
+        // V86 trap tax, Part 1: a port access made by the ring-0 monitor
+        // (cpu_is_ring0_pm = true, the TOKAEMM vec13 discriminator's PIC OCW3
+        // probe being the motivating case) must NOT end the batch in the
+        // Approximate class (486/586) -- the io_touched flag stays false on
+        // both the read AND the write half of the OCW3 select-then-read idiom.
+        // A guest (non-monitor) access to the same port keeps the old
+        // unconditional-set behavior, both timing classes.
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        with_bus(&mut approximate, |bus| {
+            // OCW3: select ISR readback (0x0B) on the master PIC. Monitor access.
+            bus.write_io(0x20, BusWidth::Byte, 0x0B, true).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "a ring-0-monitor OCW3 select write must NOT set io_touched \
+                 in the Approximate class"
+            );
+            let _ = bus.read_io(0x20, BusWidth::Byte, 0, true).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "a ring-0-monitor PIC read must NOT set io_touched in the \
+                 Approximate class"
+            );
+        });
+    }
+
+    #[test]
+    fn ring0_monitor_port_access_still_sets_io_touched_in_accurate_class() {
+        // The Accurate class (286/386) keeps byte-identical batch semantics:
+        // the ring-0-monitor exemption is Approximate-only, matching every
+        // other P4a lazy gate in read_io/write_io.
+        let mut accurate = test_machine(); // Gsw386 by construction
+        with_bus(&mut accurate, |bus| {
+            bus.write_io(0x20, BusWidth::Byte, 0x0B, true).unwrap();
+            assert!(
+                *bus.io_touched,
+                "a ring-0-monitor OCW3 select write must still set io_touched \
+                 in the Accurate class"
+            );
+            *bus.io_touched = false;
+            let _ = bus.read_io(0x20, BusWidth::Byte, 0, true).unwrap();
+            assert!(
+                *bus.io_touched,
+                "a ring-0-monitor PIC read must still set io_touched in the \
+                 Accurate class"
+            );
+        });
+    }
+
+    #[test]
+    fn guest_port_access_still_sets_io_touched_regardless_of_ring0_pm_flag() {
+        // A false cpu_is_ring0_pm (the ordinary guest/V86 case) must keep the
+        // exact pre-Part-1 behavior in BOTH timing classes -- the exemption is
+        // opt-in per access, never a global relaxation.
+        for mode in [GswMode::Gsw386, GswMode::Gsw486] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            with_bus(&mut machine, |bus| {
+                bus.write_io(0x20, BusWidth::Byte, 0x0B, false).unwrap();
+                assert!(
+                    *bus.io_touched,
+                    "{mode:?}: a guest OCW3 select write must set io_touched"
+                );
+                *bus.io_touched = false;
+                let _ = bus.read_io(0x20, BusWidth::Byte, 0, false).unwrap();
+                assert!(
+                    *bus.io_touched,
+                    "{mode:?}: a guest PIC read must set io_touched"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn ring0_monitor_wide_port_access_stays_lazy_across_byte_decomposition() {
+        // The width != Byte decomposition path in both read_io and write_io
+        // recurses per byte; cpu_is_ring0_pm must survive that recursion so a
+        // (hypothetical) wide ring-0-monitor access stays exempt on every byte,
+        // not just the first.
+        let mut approximate = test_machine();
+        approximate.set_mode(GswMode::Gsw486);
+        with_bus(&mut approximate, |bus| {
+            bus.write_io(0x20, BusWidth::Word, 0x0B0B, true).unwrap();
+            assert!(
+                !*bus.io_touched,
+                "a wide ring-0-monitor write must NOT set io_touched in the \
+                 Approximate class, on any decomposed byte"
+            );
+        });
     }
 
     #[test]
@@ -19656,11 +19845,11 @@ mod tests {
             // phase and put the flip-flop back at "index" regardless of whether
             // the 3DA reset fires -- which would make this test pass even with
             // the reset deleted (a mutation the spec review actually ran).
-            bus.write_io(0x3C0, BusWidth::Byte, 0x05).unwrap();
+            bus.write_io(0x3C0, BusWidth::Byte, 0x05, false).unwrap();
             // Reading 0x3C0 returns `attr.index | pas << 5` and does NOT touch
             // the flip-flop, so this sanity check leaves the data phase armed.
             assert_eq!(
-                bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(0x3C0, BusWidth::Byte, 0, false).unwrap(),
                 0x05,
                 "sanity: the index write took effect"
             );
@@ -19671,7 +19860,7 @@ mod tests {
 
             // The lazy 3DA read: must reset the flip-flop to "index" despite not
             // setting io_touched.
-            let _ = bus.read_io(0x3DA, BusWidth::Byte, 0).unwrap();
+            let _ = bus.read_io(0x3DA, BusWidth::Byte, 0, false).unwrap();
             assert!(
                 !*bus.io_touched,
                 "sanity: this is the lazy path (Approximate class)"
@@ -19685,9 +19874,9 @@ mod tests {
             // still shows 0x05, failing the assertion. Mutation-verified: with
             // `flip_flop_data = false` deleted from status1_side_effects this
             // assertion fails; restored, it passes.
-            bus.write_io(0x3C0, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3C0, BusWidth::Byte, 0x0A, false).unwrap();
             assert_eq!(
-                bus.read_io(0x3C0, BusWidth::Byte, 0).unwrap(),
+                bus.read_io(0x3C0, BusWidth::Byte, 0, false).unwrap(),
                 0x0A,
                 "the 3DA read must have reset the attribute flip-flop to \"index\", \
                  so the next 0x3C0 write is treated as a new index (0x0A), not a \
@@ -19717,7 +19906,7 @@ mod tests {
         let expected = accurate_clone.read_status1();
 
         let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
-            let value = bus.read_io(0x3DA, BusWidth::Byte, 0).unwrap();
+            let value = bus.read_io(0x3DA, BusWidth::Byte, 0, false).unwrap();
             (value, *bus.io_touched)
         });
 
@@ -19912,7 +20101,7 @@ mod tests {
         // keeps the exact prior behavior (io_touched set).
         let mut accurate = test_machine(); // Gsw386 by construction
         with_bus(&mut accurate, |bus| {
-            let _ = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            let _ = bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap();
             assert!(
                 *bus.io_touched,
                 "the Accurate class must still set io_touched on a port 0x61 read"
@@ -19922,7 +20111,7 @@ mod tests {
         let mut approximate = test_machine();
         approximate.set_mode(GswMode::Gsw486);
         with_bus(&mut approximate, |bus| {
-            let _ = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            let _ = bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap();
             assert!(
                 !*bus.io_touched,
                 "the Approximate class must NOT set io_touched on a port 0x61 \
@@ -19947,7 +20136,7 @@ mod tests {
             | (u8::from(machine.pit.channel_out(2)) << 5);
 
         let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
-            let value = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            let value = bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap();
             (value, *bus.io_touched)
         });
 
@@ -19985,10 +20174,10 @@ mod tests {
                         // divisor so several OUT edges land inside the swept
                         // clock range; GATE2 comes from port 0x61 bit 0.
                         with_bus(&mut predicted_machine, |bus| {
-                            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap(); // ch2, lo/hi, mode 3
-                            bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap(); // divisor low
-                            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap(); // divisor high (16)
-                            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap(); // GATE2 + data
+                            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
+                            bus.write_io(0x42, BusWidth::Byte, 0x10, false).unwrap(); // divisor low
+                            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap(); // divisor high (16)
+                            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap(); // GATE2 + data
                         });
                     }
                     predicted_machine.run_cycles(5_000).unwrap();
@@ -19996,10 +20185,10 @@ mod tests {
                     real_machine.set_mode(GswMode::Gsw486);
                     if channel == 2 {
                         with_bus(&mut real_machine, |bus| {
-                            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
-                            bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap();
-                            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
-                            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+                            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+                            bus.write_io(0x42, BusWidth::Byte, 0x10, false).unwrap();
+                            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+                            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
                         });
                     }
                     real_machine.run_cycles(5_000).unwrap();
@@ -20051,15 +20240,15 @@ mod tests {
         // otherwise apply.
         with_bus(&mut machine, |bus| {
             // Program channel 1 as BCD, mode 2: SC=01, RW=11, mode=010, BCD=1.
-            bus.write_io(0x43, BusWidth::Byte, 0x75).unwrap();
-            bus.write_io(0x41, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x41, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x43, BusWidth::Byte, 0x75, false).unwrap();
+            bus.write_io(0x41, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x41, BusWidth::Byte, 0x01, false).unwrap();
             *bus.io_touched = false; // clear the setup writes' own effect
 
             let expected = (bus.speaker.control_bits() & 0x03)
                 | (u8::from(bus.pit.channel_out(1)) << 4)
                 | (u8::from(bus.pit.channel_out(2)) << 5);
-            let value = bus.read_io(0x61, BusWidth::Byte, 0).unwrap();
+            let value = bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap();
             assert!(
                 *bus.io_touched,
                 "a BCD-programmed channel must fall back to the non-lazy path, \
@@ -20095,10 +20284,10 @@ mod tests {
                 // Channel 2, mode 3 (square wave), divisor 16: OUT toggles every
                 // 8 PIT input clocks, so toggle edges are dense in the probe
                 // range. GATE2 + data enable via port 0x61 bits 0/1.
-                bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
-                bus.write_io(0x42, BusWidth::Byte, 0x10).unwrap();
-                bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
-                bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+                bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+                bus.write_io(0x42, BusWidth::Byte, 0x10, false).unwrap();
+                bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+                bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
             });
             machine.run_cycles(5_000).unwrap();
             machine.pit_clocks = carry; // the deliberate batch-entry carry seed
@@ -20128,7 +20317,7 @@ mod tests {
         let (lazy_value, lazy_elapsed, io_touched) = with_bus(&mut predicted_machine, |bus| {
             bus.core_clocks_so_far = t;
             let elapsed = bus.elapsed_pit_clocks();
-            let value = bus.read_io(0x61, BusWidth::Byte, t).unwrap();
+            let value = bus.read_io(0x61, BusWidth::Byte, t, false).unwrap();
             (value as u8, elapsed, *bus.io_touched)
         });
         assert!(!io_touched, "sanity: the lazy path");
@@ -20171,7 +20360,7 @@ mod tests {
         for &port in &status_ports {
             with_bus(&mut accurate, |bus| {
                 *bus.io_touched = false;
-                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
                 assert!(
                     *bus.io_touched,
                     "port {port:#06X}: the Accurate class must still set \
@@ -20185,7 +20374,7 @@ mod tests {
         for &port in &status_ports {
             with_bus(&mut approximate, |bus| {
                 *bus.io_touched = false;
-                let _ = bus.read_io(port, BusWidth::Byte, 0).unwrap();
+                let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
                 assert!(
                     !*bus.io_touched,
                     "port {port:#06X}: the Approximate class must NOT set \
@@ -20205,19 +20394,19 @@ mod tests {
         let mut machine = test_machine();
         machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // latch reg 0x04
-            bus.write_io(0x389, BusWidth::Byte, 0x80).unwrap(); // reset IRQ flags
-            bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // latch reg 0x02
-            bus.write_io(0x389, BusWidth::Byte, 0xff).unwrap(); // timer 1 preset
-            bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // latch reg 0x04
-            bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+            bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // latch reg 0x04
+            bus.write_io(0x389, BusWidth::Byte, 0x80, false).unwrap(); // reset IRQ flags
+            bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap(); // latch reg 0x02
+            bus.write_io(0x389, BusWidth::Byte, 0xff, false).unwrap(); // timer 1 preset
+            bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // latch reg 0x04
+            bus.write_io(0x389, BusWidth::Byte, 0x01, false).unwrap(); // start timer 1
         });
         machine.run_cycles(5_000).unwrap();
 
         let expected = machine.opl.status();
 
         let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
-            let value = bus.read_io(0x388, BusWidth::Byte, 0).unwrap();
+            let value = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
             (value, *bus.io_touched)
         });
 
@@ -20246,7 +20435,7 @@ mod tests {
 
         with_bus(&mut machine, |bus| {
             *bus.io_touched = false;
-            let _ = bus.write_io(0x388, BusWidth::Byte, 0x04); // address write
+            let _ = bus.write_io(0x388, BusWidth::Byte, 0x04, false); // address write
             assert!(
                 *bus.io_touched,
                 "the address-port write must still set io_touched (writes \
@@ -20255,7 +20444,7 @@ mod tests {
 
             *bus.io_touched = false; // reset the flag, as the plan's idiom check does
             for _ in 0..6 {
-                let _ = bus.read_io(0x388, BusWidth::Byte, 0).unwrap();
+                let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
             }
             assert!(
                 !*bus.io_touched,
@@ -20282,20 +20471,20 @@ mod tests {
                 let mut predicted_machine = test_machine();
                 predicted_machine.set_mode(GswMode::Gsw486);
                 with_bus(&mut predicted_machine, |bus| {
-                    bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // reg 0x02
-                    bus.write_io(0x389, BusWidth::Byte, 0xf0).unwrap(); // preset
-                    bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // reg 0x04
-                    bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+                    bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap(); // reg 0x02
+                    bus.write_io(0x389, BusWidth::Byte, 0xf0, false).unwrap(); // preset
+                    bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // reg 0x04
+                    bus.write_io(0x389, BusWidth::Byte, 0x01, false).unwrap(); // start timer 1
                 });
                 predicted_machine.run_cycles(5_000).unwrap();
 
                 let mut real_machine = test_machine();
                 real_machine.set_mode(GswMode::Gsw486);
                 with_bus(&mut real_machine, |bus| {
-                    bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap();
-                    bus.write_io(0x389, BusWidth::Byte, 0xf0).unwrap();
-                    bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap();
-                    bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap();
+                    bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap();
+                    bus.write_io(0x389, BusWidth::Byte, 0xf0, false).unwrap();
+                    bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap();
+                    bus.write_io(0x389, BusWidth::Byte, 0x01, false).unwrap();
                 });
                 real_machine.run_cycles(5_000).unwrap();
                 assert_eq!(predicted_machine.opl, real_machine.opl);
@@ -20347,10 +20536,10 @@ mod tests {
         real_machine.set_mode(GswMode::Gsw486);
         for machine in [&mut predicted_machine, &mut real_machine] {
             with_bus(machine, |bus| {
-                bus.write_io(0x388, BusWidth::Byte, 0x02).unwrap(); // reg 0x02
-                bus.write_io(0x389, BusWidth::Byte, 0xfe).unwrap(); // preset 0xfe: one step from overflow
-                bus.write_io(0x388, BusWidth::Byte, 0x04).unwrap(); // reg 0x04
-                bus.write_io(0x389, BusWidth::Byte, 0x01).unwrap(); // start timer 1
+                bus.write_io(0x388, BusWidth::Byte, 0x02, false).unwrap(); // reg 0x02
+                bus.write_io(0x389, BusWidth::Byte, 0xfe, false).unwrap(); // preset 0xfe: one step from overflow
+                bus.write_io(0x388, BusWidth::Byte, 0x04, false).unwrap(); // reg 0x04
+                bus.write_io(0x389, BusWidth::Byte, 0x01, false).unwrap(); // start timer 1
             });
             // A tiny guest-clock nudge, not enough to cross even one 80us
             // step at 66 MHz (486): keeps the timer's own accumulated_us near
@@ -20389,7 +20578,7 @@ mod tests {
         let (lazy_value, lazy_elapsed, io_touched) = with_bus(&mut predicted_machine, |bus| {
             bus.core_clocks_so_far = t;
             let elapsed = bus.elapsed_opl_micros();
-            let value = bus.read_io(0x388, BusWidth::Byte, t).unwrap();
+            let value = bus.read_io(0x388, BusWidth::Byte, t, false).unwrap();
             (value as u8, elapsed, *bus.io_touched)
         });
         assert!(!io_touched, "sanity: the lazy path");
@@ -20551,9 +20740,9 @@ mod tests {
                 "extended RAM starts direct"
             );
             let config_addr = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x10;
-            bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, config_addr)
+            bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, config_addr, false)
                 .unwrap();
-            bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_ADDR)
+            bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_ADDR, false)
                 .unwrap();
             assert!(
                 bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
@@ -20796,10 +20985,10 @@ mod tests {
     fn rtc_ports_round_trip_through_the_bus() {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap(); // select seconds
-            bus.write_io(0x71, BusWidth::Byte, 42).unwrap();
-            bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap();
-            let secs = bus.read_io(0x70 + 1, BusWidth::Byte, 0).unwrap();
+            bus.write_io(0x70, BusWidth::Byte, 0x00, false).unwrap(); // select seconds
+            bus.write_io(0x71, BusWidth::Byte, 42, false).unwrap();
+            bus.write_io(0x70, BusWidth::Byte, 0x00, false).unwrap();
+            let secs = bus.read_io(0x70 + 1, BusWidth::Byte, 0, false).unwrap();
             assert_eq!(secs, 42);
         });
     }
@@ -20830,10 +21019,10 @@ mod tests {
         // Guest writes a layout byte and a boot-order byte, then refreshes the
         // checksum the way the setup page would.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x70, BusWidth::Byte, 0x10).unwrap();
-            bus.write_io(0x71, BusWidth::Byte, 3).unwrap(); // FR layout
-            bus.write_io(0x70, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x71, BusWidth::Byte, 1).unwrap(); // disk-first
+            bus.write_io(0x70, BusWidth::Byte, 0x10, false).unwrap();
+            bus.write_io(0x71, BusWidth::Byte, 3, false).unwrap(); // FR layout
+            bus.write_io(0x70, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x71, BusWidth::Byte, 1, false).unwrap(); // disk-first
         });
         assert!(
             machine.take_cmos_dirty(),
@@ -20852,10 +21041,10 @@ mod tests {
     fn pc_speaker_renders_a_square_wave() {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap(); // ch2, lo/hi, mode 3
-            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap(); // divisor low
-            bus.write_io(0x42, BusWidth::Byte, 0x04).unwrap(); // divisor high (0x0400)
-            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap(); // GATE2 + data enable
+            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
+            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap(); // divisor low
+            bus.write_io(0x42, BusWidth::Byte, 0x04, false).unwrap(); // divisor high (0x0400)
+            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap(); // GATE2 + data enable
         });
         let clock_hz = machine.profile.clock_hz;
         let chunk = clock_hz / 100_000; // ~10 us, mimicking per-instruction advance
@@ -20873,10 +21062,10 @@ mod tests {
     fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap(); // ch2, lo/hi, mode 3
-            bus.write_io(0x42, BusWidth::Byte, 0x02).unwrap(); // divisor low
-            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap(); // divisor high
-            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap(); // GATE2 + data enable
+            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap(); // ch2, lo/hi, mode 3
+            bus.write_io(0x42, BusWidth::Byte, 0x02, false).unwrap(); // divisor low
+            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap(); // divisor high
+            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap(); // GATE2 + data enable
         });
         let clock_hz = machine.profile.clock_hz;
         let chunk = clock_hz / 100_000; // ~10 us, mimicking per-instruction advance
@@ -20899,15 +21088,15 @@ mod tests {
     fn port_61_reports_out_gate_enable_and_refresh() {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
-            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x42, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
         });
         let clock_hz = machine.profile.clock_hz;
         machine.advance_devices_clocks(clock_hz / 100_000); // ~10 us
         let b = with_bus(&mut machine, |bus| {
-            bus.read_io(0x61, BusWidth::Byte, 0).unwrap() as u8
+            bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap() as u8
         });
         assert_eq!(
             (b >> 5) & 1,
@@ -20929,7 +21118,7 @@ mod tests {
         for _ in 0..40 {
             machine.advance_devices_clocks(per_pit_clock);
             let bit4 = with_bus(&mut machine, |bus| {
-                (bus.read_io(0x61, BusWidth::Byte, 0).unwrap() as u8 >> 4) & 1
+                (bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap() as u8 >> 4) & 1
             });
             if bit4 == 1 {
                 saw_high = true;
@@ -20951,8 +21140,9 @@ mod tests {
     // port pair (so the same routine can drive the native and aliased ports).
     fn program_tone(bus: &mut MachineBus, addr: u16, data: u16) {
         let mut write = |reg: u8, value: u8| {
-            bus.write_io(addr, BusWidth::Byte, u32::from(reg)).unwrap();
-            bus.write_io(data, BusWidth::Byte, u32::from(value))
+            bus.write_io(addr, BusWidth::Byte, u32::from(reg), false)
+                .unwrap();
+            bus.write_io(data, BusWidth::Byte, u32::from(value), false)
                 .unwrap();
         };
         write(0x20, 0x01); // modulator: multiple x1
@@ -21195,21 +21385,22 @@ mod tests {
         machine.write_physical_u8(0x0611, 0x00);
         with_bus(&mut machine, |bus| {
             // PIC base 0x08 (ICW1..ICW4) so IRQ5 -> vector 0x0D; all IRQs unmasked.
-            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
             // DMA ch1: page 0x01, byte addr 0, count 15 (16 bytes), single read.
-            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             // DSP: 11025 Hz, block 16, single-cycle 8-bit DMA output.
             for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
@@ -21248,9 +21439,9 @@ mod tests {
         )
         .unwrap();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x43, BusWidth::Byte, 0x36).unwrap(); // counter 0, mode 3
-            bus.write_io(0x40, BusWidth::Byte, 0x04).unwrap(); // count low
-            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap(); // count high -> 4
+            bus.write_io(0x43, BusWidth::Byte, 0x36, false).unwrap(); // counter 0, mode 3
+            bus.write_io(0x40, BusWidth::Byte, 0x04, false).unwrap(); // count low
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap(); // count high -> 4
         });
         machine.run_cycles(4000).unwrap();
         let pending = with_bus(&mut machine, |bus| bus.interrupt_pending());
@@ -21325,26 +21516,27 @@ mod tests {
 
         with_bus(&mut machine, |bus| {
             // --- Program DMA channel 2: device->memory (write), single, count 512.
-            bus.write_io(0x0B, BusWidth::Byte, 0x46).unwrap(); // mode ch2: single, write
-            bus.write_io(0x0C, BusWidth::Byte, 0x00).unwrap(); // clear the flip-flop
-            bus.write_io(0x04, BusWidth::Byte, u32::from(BUF & 0xFF))
+            bus.write_io(0x0B, BusWidth::Byte, 0x46, false).unwrap(); // mode ch2: single, write
+            bus.write_io(0x0C, BusWidth::Byte, 0x00, false).unwrap(); // clear the flip-flop
+            bus.write_io(0x04, BusWidth::Byte, u32::from(BUF & 0xFF), false)
                 .unwrap();
-            bus.write_io(0x04, BusWidth::Byte, u32::from(BUF >> 8))
+            bus.write_io(0x04, BusWidth::Byte, u32::from(BUF >> 8), false)
                 .unwrap();
-            bus.write_io(0x81, BusWidth::Byte, 0x00).unwrap(); // page (A16-A23) = 0
-            bus.write_io(0x05, BusWidth::Byte, 0xFF).unwrap(); // count low (511)
-            bus.write_io(0x05, BusWidth::Byte, 0x01).unwrap(); // count high -> 0x01FF
-            bus.write_io(0x0A, BusWidth::Byte, 0x02).unwrap(); // unmask channel 2
+            bus.write_io(0x81, BusWidth::Byte, 0x00, false).unwrap(); // page (A16-A23) = 0
+            bus.write_io(0x05, BusWidth::Byte, 0xFF, false).unwrap(); // count low (511)
+            bus.write_io(0x05, BusWidth::Byte, 0x01, false).unwrap(); // count high -> 0x01FF
+            bus.write_io(0x0A, BusWidth::Byte, 0x02, false).unwrap(); // unmask channel 2
 
             // --- Drive the FDC.
-            bus.write_io(0x3F2, BusWidth::Byte, 0x1C).unwrap(); // DOR: motor A, gate, out of reset, drive 0
-            bus.write_io(0x3F5, BusWidth::Byte, 0x08).unwrap(); // SENSE INT (clear power-up irq)
-            while bus.read_io(0x3F4, BusWidth::Byte, 0).unwrap() & 0x40 != 0 {
-                bus.read_io(0x3F5, BusWidth::Byte, 0).unwrap();
+            bus.write_io(0x3F2, BusWidth::Byte, 0x1C, false).unwrap(); // DOR: motor A, gate, out of reset, drive 0
+            bus.write_io(0x3F5, BusWidth::Byte, 0x08, false).unwrap(); // SENSE INT (clear power-up irq)
+            while bus.read_io(0x3F4, BusWidth::Byte, 0, false).unwrap() & 0x40 != 0 {
+                bus.read_io(0x3F5, BusWidth::Byte, 0, false).unwrap();
             }
             // READ DATA: HDS+DS=0, C=2, H=0, R=3, N=2(512), EOT=3, GPL=0x1B, DTL=0xFF.
             for &b in &[0xE6u8, 0x00, 0x02, 0x00, 0x03, 0x02, 0x03, 0x1B, 0xFF] {
-                bus.write_io(0x3F5, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x3F5, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
 
@@ -21373,8 +21565,8 @@ mod tests {
         // The result phase is seven status bytes ending at sector 3.
         let result = with_bus(&mut machine, |bus| {
             let mut out = Vec::new();
-            while bus.read_io(0x3F4, BusWidth::Byte, 0).unwrap() & 0x40 != 0 {
-                out.push(bus.read_io(0x3F5, BusWidth::Byte, 0).unwrap() as u8);
+            while bus.read_io(0x3F4, BusWidth::Byte, 0, false).unwrap() & 0x40 != 0 {
+                out.push(bus.read_io(0x3F5, BusWidth::Byte, 0, false).unwrap() as u8);
             }
             out
         });
@@ -21396,10 +21588,10 @@ mod tests {
                 (0x21, 0x01),
                 (0x21, 0xab),
             ] {
-                bus.write_io(port, BusWidth::Byte, value).unwrap();
+                bus.write_io(port, BusWidth::Byte, value, false).unwrap();
             }
             // The data port reads back the mask, not the passive 0xff stub.
-            bus.read_io(0x21, BusWidth::Byte, 0).unwrap()
+            bus.read_io(0x21, BusWidth::Byte, 0, false).unwrap()
         });
         assert_eq!(mask, 0xab);
     }
@@ -21409,7 +21601,7 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             for (port, value) in [(0x20u16, 0x11u32), (0x21, 0x08), (0x21, 0x04), (0x21, 0x01)] {
-                bus.write_io(port, BusWidth::Byte, value).unwrap();
+                bus.write_io(port, BusWidth::Byte, value, false).unwrap();
             }
         });
         machine.request_irq(0);
@@ -21481,21 +21673,22 @@ mod tests {
         // Open the CD volume to full (5-bit registers 0x36/0x37) via the mixer.
         with_bus(&mut machine, |bus| {
             for (index, value) in [(0x36u32, 31u32), (0x37, 31)] {
-                bus.write_io(0x224, BusWidth::Byte, index).unwrap();
-                bus.write_io(0x225, BusWidth::Byte, value).unwrap();
+                bus.write_io(0x224, BusWidth::Byte, index, false).unwrap();
+                bus.write_io(0x225, BusWidth::Byte, value, false).unwrap();
             }
         });
         // Issue PLAY AUDIO(10) over the secondary-channel ATAPI ports: PACKET
         // command, then the 12-byte CDB. Play from LBA 1 (audio start) for 16
         // frames.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap(); // PACKET command
+            bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap(); // PACKET command
             let mut cdb = [0u8; 12];
             cdb[0] = 0x45; // PLAY AUDIO(10)
             cdb[5] = 1; // starting LBA 1
             cdb[8] = 16; // 16 frames
             for b in cdb {
-                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         assert!(machine.cd_loaded());
@@ -21512,13 +21705,14 @@ mod tests {
         machine.mount_cd(audio_cd(20));
         // Leave CD volume at its muted default (0). Start playback.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap();
+            bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap();
             let mut cdb = [0u8; 12];
             cdb[0] = 0x45;
             cdb[5] = 1;
             cdb[8] = 16;
             for b in cdb {
-                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         let pcm = machine.render_audio(2000);
@@ -21834,26 +22028,28 @@ mod tests {
 
         // Clear the post-mount unit attention with a TEST UNIT READY packet.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap();
+            bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap();
             for b in [0u8; 12] {
-                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
 
         // READ(10) one sector at the file's LBA over the real ATAPI packet
         // ports, then drain the data-in phase.
         let sector = with_bus(&mut machine, |bus| {
-            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap(); // PACKET
+            bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap(); // PACKET
             let mut cdb = [0u8; 12];
             cdb[0] = 0x28; // READ(10)
             cdb[2..6].copy_from_slice(&file_lba.to_be_bytes());
             cdb[8] = 1; // one sector
             for b in cdb {
-                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
             let mut out = Vec::with_capacity(cdimage::DATA_SECTOR);
             for _ in 0..cdimage::DATA_SECTOR {
-                out.push(bus.read_io(0x170, BusWidth::Byte, 0).unwrap() as u8);
+                out.push(bus.read_io(0x170, BusWidth::Byte, 0, false).unwrap() as u8);
             }
             out
         });
@@ -21925,16 +22121,17 @@ mod tests {
         }
         with_bus(&mut machine, |bus| {
             // DMA ch1: page 0x01, address 0, count 255, auto-init read.
-            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0xFF).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x59, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0xFF, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             // DSP: 11025 Hz, block 256, auto-init 8-bit output.
             for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0xFF, 0x00, 0x1C] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
         // The OPL is silent (no voices keyed), so the steady output is the DSP DC
@@ -21966,23 +22163,24 @@ mod tests {
             machine.write_physical_u8(0x1_0000 + i, 0x40);
         }
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0xFF).unwrap();
-            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0B, BusWidth::Byte, 0x59, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0xFF, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
             for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0xFF, 0x00, 0x1C] {
-                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
             }
         });
 
         fn set_reg(machine: &mut Machine, index: u8, value: u8) {
             with_bus(machine, |bus| {
-                bus.write_io(0x224, BusWidth::Byte, u32::from(index))
+                bus.write_io(0x224, BusWidth::Byte, u32::from(index), false)
                     .unwrap();
-                bus.write_io(0x225, BusWidth::Byte, u32::from(value))
+                bus.write_io(0x225, BusWidth::Byte, u32::from(value), false)
                     .unwrap();
             });
         }
@@ -22039,9 +22237,9 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             let mut write = |reg: u8, value: u8| {
-                bus.write_io(0x0388, BusWidth::Byte, u32::from(reg))
+                bus.write_io(0x0388, BusWidth::Byte, u32::from(reg), false)
                     .unwrap();
-                bus.write_io(0x0389, BusWidth::Byte, u32::from(value))
+                bus.write_io(0x0389, BusWidth::Byte, u32::from(value), false)
                     .unwrap();
             };
             write(0x04, 0x60); // mask both timers
@@ -22054,7 +22252,7 @@ mod tests {
         machine.advance_devices(machine.profile().clock_hz / 10_000);
 
         let status = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0388, BusWidth::Byte, 0).unwrap()
+            bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap()
         });
         assert_eq!(
             status & 0xe0,
@@ -22710,8 +22908,11 @@ mod tests {
         assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'R');
         {
             let mut bus = machine.make_bus();
-            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte, 0).unwrap(), 1);
-            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte, 0).unwrap() & 0x02, 0);
+            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte, 0, false).unwrap(), 1);
+            assert_eq!(
+                bus.read_io(0x3CC, BusWidth::Byte, 0, false).unwrap() & 0x02,
+                0
+            );
         }
         let misc = machine.video_mut().read_port(0x3CC).unwrap();
         assert!(machine.video_mut().write_port(0x3C2, misc | 0x02));
@@ -22798,7 +22999,7 @@ mod tests {
 
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3D8, BusWidth::Byte, 0x0A, false).unwrap();
         }
         assert_eq!(machine.video().active_mode(), VideoMode::Cga);
         assert_eq!(machine.video().render_cga_row(0)[0], 2);
@@ -22807,7 +23008,7 @@ mod tests {
 
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3D8, BusWidth::Byte, 0x28).unwrap();
+            bus.write_io(0x3D8, BusWidth::Byte, 0x28, false).unwrap();
         }
         assert_eq!(machine.video().active_mode(), VideoMode::Text);
         assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), 0b01_01_01_01);
@@ -22818,10 +23019,10 @@ mod tests {
         let mut machine = test_machine();
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
-            bus.write_io(0x3D9, BusWidth::Byte, 0x35).unwrap();
-            assert_eq!(bus.read_io(0x3D8, BusWidth::Byte, 0).unwrap(), 0xFF);
-            assert_eq!(bus.read_io(0x3D9, BusWidth::Byte, 0).unwrap(), 0xFF);
+            bus.write_io(0x3D8, BusWidth::Byte, 0x0A, false).unwrap();
+            bus.write_io(0x3D9, BusWidth::Byte, 0x35, false).unwrap();
+            assert_eq!(bus.read_io(0x3D8, BusWidth::Byte, 0, false).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D9, BusWidth::Byte, 0, false).unwrap(), 0xFF);
         }
 
         assert_eq!(machine.video().active_mode(), VideoMode::Cga);
@@ -22833,20 +23034,20 @@ mod tests {
         let mut machine = test_machine();
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
-            bus.write_io(0x3D0, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x3D1, BusWidth::Byte, 0x20).unwrap();
-            assert_eq!(bus.read_io(0x3D2, BusWidth::Byte, 0).unwrap(), 0xFF);
-            assert_eq!(bus.read_io(0x3D3, BusWidth::Byte, 0).unwrap(), 0xFF);
+            bus.write_io(0x3D8, BusWidth::Byte, 0x0A, false).unwrap();
+            bus.write_io(0x3D0, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x3D1, BusWidth::Byte, 0x20, false).unwrap();
+            assert_eq!(bus.read_io(0x3D2, BusWidth::Byte, 0, false).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D3, BusWidth::Byte, 0, false).unwrap(), 0xFF);
 
-            bus.write_io(0x3D6, BusWidth::Byte, 0x0A).unwrap();
-            bus.write_io(0x3D7, BusWidth::Byte, 0x06).unwrap();
-            assert_eq!(bus.read_io(0x3D4, BusWidth::Byte, 0).unwrap(), 0xFF);
-            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte, 0).unwrap(), 0xFF);
+            bus.write_io(0x3D6, BusWidth::Byte, 0x0A, false).unwrap();
+            bus.write_io(0x3D7, BusWidth::Byte, 0x06, false).unwrap();
+            assert_eq!(bus.read_io(0x3D4, BusWidth::Byte, 0, false).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte, 0, false).unwrap(), 0xFF);
 
-            bus.write_io(0x3D4, BusWidth::Byte, 0x0E).unwrap();
-            bus.write_io(0x3D5, BusWidth::Byte, 0x12).unwrap();
-            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte, 0).unwrap(), 0x12);
+            bus.write_io(0x3D4, BusWidth::Byte, 0x0E, false).unwrap();
+            bus.write_io(0x3D5, BusWidth::Byte, 0x12, false).unwrap();
+            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte, 0, false).unwrap(), 0x12);
         }
 
         assert_eq!(machine.video().active_mode(), VideoMode::Cga);
@@ -22885,8 +23086,8 @@ mod tests {
 
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3BF, BusWidth::Byte, 0x01).unwrap(); // allow graphics
-            bus.write_io(0x3B8, BusWidth::Byte, 0x0A).unwrap(); // GRPH + video enable
+            bus.write_io(0x3BF, BusWidth::Byte, 0x01, false).unwrap(); // allow graphics
+            bus.write_io(0x3B8, BusWidth::Byte, 0x0A, false).unwrap(); // GRPH + video enable
         }
         assert_eq!(machine.video().active_mode(), VideoMode::Hercules);
         assert_eq!(machine.video().raster_width(), 720);
@@ -22910,8 +23111,8 @@ mod tests {
         // select (bit 7): the CRTC now scans out B8000 instead of B0000.
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3BF, BusWidth::Byte, 0x03).unwrap(); // allow graphics + page 1
-            bus.write_io(0x3B8, BusWidth::Byte, 0x8A).unwrap(); // GRPH + video + page select
+            bus.write_io(0x3BF, BusWidth::Byte, 0x03, false).unwrap(); // allow graphics + page 1
+            bus.write_io(0x3B8, BusWidth::Byte, 0x8A, false).unwrap(); // GRPH + video + page select
         }
         machine.write_physical_u8(VGA_MONO_TEXT_BASE + HGC_FB_SIZE as u32, 0b0100_0000);
         assert_eq!(
@@ -22933,7 +23134,7 @@ mod tests {
         // ordinary mono text B0000 aperture instead).
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3B8, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3B8, BusWidth::Byte, 0x0A, false).unwrap();
         }
         assert_eq!(machine.video().active_mode(), VideoMode::Text);
         machine.write_physical_u8(VGA_MONO_TEXT_BASE, 0xDB);
@@ -22946,13 +23147,13 @@ mod tests {
         machine.video_mut().set_mono_text_mode();
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3BF, BusWidth::Byte, 0x01).unwrap();
-            bus.write_io(0x3B8, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3BF, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x3B8, BusWidth::Byte, 0x0A, false).unwrap();
         }
         assert_eq!(machine.video().active_mode(), VideoMode::Hercules);
 
         let mut bus = machine.make_bus();
-        let outside_vsync = bus.read_io(0x3BA, BusWidth::Byte, 0).unwrap() & 0x80;
+        let outside_vsync = bus.read_io(0x3BA, BusWidth::Byte, 0, false).unwrap() & 0x80;
         assert_eq!(outside_vsync, 0x80);
     }
 
@@ -23587,8 +23788,8 @@ mod tests {
         // write-index / data ports.
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3C8, BusWidth::Byte, 0x00).unwrap(); // DAC write index 0
-            bus.write_io(0x3C9, BusWidth::Byte, 0x3F).unwrap(); // red component
+            bus.write_io(0x3C8, BusWidth::Byte, 0x00, false).unwrap(); // DAC write index 0
+            bus.write_io(0x3C9, BusWidth::Byte, 0x3F, false).unwrap(); // red component
         }
         let gen2 = machine.frame_generation().expect("still graphics");
         assert_ne!(gen2, gen1, "a VGA port write bumps the generation");
@@ -23879,11 +24080,11 @@ mod tests {
 
         {
             let mut bus = machine.make_bus();
-            bus.write_io(0x3B4, BusWidth::Byte, 0x0C).unwrap();
-            bus.write_io(0x3B5, BusWidth::Byte, 0x12).unwrap();
-            bus.write_io(0x3B4, BusWidth::Byte, 0x0D).unwrap();
-            bus.write_io(0x3B5, BusWidth::Byte, 0x34).unwrap();
-            assert!(bus.read_io(0x3BA, BusWidth::Byte, 0).is_ok());
+            bus.write_io(0x3B4, BusWidth::Byte, 0x0C, false).unwrap();
+            bus.write_io(0x3B5, BusWidth::Byte, 0x12, false).unwrap();
+            bus.write_io(0x3B4, BusWidth::Byte, 0x0D, false).unwrap();
+            bus.write_io(0x3B5, BusWidth::Byte, 0x34, false).unwrap();
+            assert!(bus.read_io(0x3BA, BusWidth::Byte, 0, false).is_ok());
         }
         assert_eq!(machine.video().pending_start_address(), Some(0x1234));
     }
@@ -25522,16 +25723,16 @@ mod tests {
         .unwrap();
         assert_eq!(machine.active_mode(), GswMode::Gsw386); // boot mode
         let id = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e0, BusWidth::Byte, 0).unwrap() as u8
+            bus.read_io(0x00e0, BusWidth::Byte, 0, false).unwrap() as u8
         });
         assert_eq!(id, LOTURA_ID_VALUE);
         let code = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e1, BusWidth::Byte, 0).unwrap() as u8
+            bus.read_io(0x00e1, BusWidth::Byte, 0, false).unwrap() as u8
         });
         assert_eq!(code, 0);
         // An out-of-range write records no pending switch.
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x00e1, BusWidth::Byte, 9).unwrap()
+            bus.write_io(0x00e1, BusWidth::Byte, 9, false).unwrap()
         });
         assert!(machine.pending_mode.is_none());
         assert_eq!(machine.active_mode(), GswMode::Gsw386);
@@ -25539,7 +25740,7 @@ mod tests {
         machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
         let code = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e1, BusWidth::Byte, 0).unwrap() as u8
+            bus.read_io(0x00e1, BusWidth::Byte, 0, false).unwrap() as u8
         });
         assert_eq!(code, 2);
     }
@@ -25790,9 +25991,9 @@ mod tests {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         with_bus(&mut machine, |bus| {
-            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'H'))
+            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'H'), false)
                 .unwrap();
-            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'i'))
+            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'i'), false)
                 .unwrap();
         });
         assert!(machine.serial_text().ends_with("Hi"));
@@ -25835,12 +26036,12 @@ mod tests {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         let fast = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e2, BusWidth::Byte, 0).unwrap() as u8
+            bus.read_io(0x00e2, BusWidth::Byte, 0, false).unwrap() as u8
         });
         assert_eq!(fast, 1, "fast POST is the default");
         machine.set_fast_post(false);
         let full = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e2, BusWidth::Byte, 0).unwrap() as u8
+            bus.read_io(0x00e2, BusWidth::Byte, 0, false).unwrap() as u8
         });
         assert_eq!(full, 0, "clearing the flag selects the full-pacing path");
     }

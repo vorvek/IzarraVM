@@ -4065,4 +4065,187 @@ DIR DEST\r\n"
              a 0xEn code names the failed step.\n{text}"
         );
     }
+
+    /// V86 trap tax regression: IRQ5 delivered while the interrupted code sits
+    /// at IP == 0. The vec13 frame-shape check cannot decide this case alone --
+    /// the error-code slot reads 0 for a #GP AND for an IRQ frame whose return
+    /// EIP is 0 -- so the monitor must fall through to its opcode-peek + cold
+    /// PIC-probe layers. A slot-only discriminator mis-routed such a delivery
+    /// into the #GP path, hit the non-sensitive byte at CS:0, and hard-killed
+    /// the VM (the review probe); this pins the three-layer scheme.
+    ///
+    /// IRQ5IP0 makes IP == 0 the common case with SB16 auto-init DMA (NOT the
+    /// one-shot DSP 0xF2, whose re-arm races the ISR -- see the fixture header):
+    /// once armed, the DMA block boundary raises IRQ5 continuously on the card's
+    /// own schedule while the guest simply parks on a `jmp $` at offset 0 of a
+    /// segment, so deliveries land at IP == 0 with no re-arm. This test is RED
+    /// on the buggy slot-only monitor (the VM dies, a foreign TestExit code) and
+    /// GREEN only on the three-layer fix.
+    #[test]
+    #[ignore = "boots a full FreeDOS image (slow); run with --ignored"]
+    fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_ip0_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = b"@ECHO OFF\r\nIRQ5IP0\r\n".to_vec();
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "IRQ5IP0.COM".to_string(),
+                        izarravm_firmware::irq5ip0_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "IRQ5 at IP==0 under V86 did not report success (stop={stop:?}); \
+             0xE1 = DSP reset failed, a hang/CycleLimit or a foreign TestExit \
+             code means the discriminator mis-routed the delivery.\n{text}"
+        );
+    }
+
+    /// V86 trap tax (dev_docs/2026-07-02-v86-trap-tax) owner measurement: not a CI
+    /// gate, a local one-off ad hoc report. Boots a real corpus game (Prince of
+    /// Persia) through the Katea host-folder facade at a given GSW mode and prints
+    /// the vec13 monitor-trip rate, the monitor-resident core-clock share, and the
+    /// framebuffer-progress rate, comparing before/after the trap-tax fix. Skips
+    /// (does not fail) when the local corpus path is absent, since it is
+    /// machine-local, not a repo fixture.
+    #[test]
+    #[ignore = "owner measurement only; needs a local corpus path, not a CI fixture"]
+    fn v86_trap_tax_prince_of_persia_measurement() {
+        let corpus_dir = std::path::Path::new(
+            "R:\\La Colecci\u{f3}n by Neville\\dosroot\\Prince of Persia (Castellano)",
+        );
+        if !corpus_dir.is_dir() {
+            eprintln!("skipping: corpus dir not found at {}", corpus_dir.display());
+            return;
+        }
+        // FNV-1a over the VGA graphics window (0xA0000) plus a text-window slab
+        // (0xB8000): the framebuffer-progress hash. A change between two slices
+        // means the game drew something new, whatever mode it is in.
+        fn vram_hash(machine: &mut Machine) -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for addr in (0xA0000u32..0xB0000).chain(0xB8000..0xB9000) {
+                h ^= u64::from(machine.read_physical_u8(addr));
+                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            h
+        }
+        for (label, mode) in [("486", GswMode::Gsw486), ("586", GswMode::Gsw586)] {
+            let profile = MachineProfile {
+                cpu: mode,
+                clock_hz: mode.clock_hz(),
+                ..MachineProfile::gsw_386(16, VideoCard::Et4000Ax)
+            };
+            let mut machine =
+                Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+            // Launch the game: PRINCE ADLIB is Prince of Persia's own command
+            // line (ADLIB selects AdLib sound), run from AUTOEXEC so the measured
+            // window is the game's title/attract sequence, not the DOS prompt.
+            machine
+                .mount_hdd_folder_with(
+                    corpus_dir,
+                    vec![(
+                        "AUTOEXEC.BAT".to_string(),
+                        b"@ECHO OFF\r\nPRINCE ADLIB\r\n".to_vec(),
+                    )],
+                )
+                .expect("mount corpus folder");
+            // Phase 1: skip the boot + intro start (BIOS, FreeDOS boot, PRINCE.EXE
+            // load, first title fade-in) so the measured window is steady-state
+            // title/attract animation, not one-time setup. Same guest-seconds at
+            // every mode (clock_hz differs), so both modes measure the same
+            // simulated game time.
+            let intro_skip_s = 10.0f64;
+            let measure_s = 12.0f64;
+            let intro_stop = machine
+                .run_cycles((intro_skip_s * mode.clock_hz() as f64) as u64)
+                .expect("intro skip run");
+            assert!(
+                matches!(intro_stop, StopReason::CycleLimit { .. }),
+                "the game must still be running at the end of the intro skip \
+                 (a halt/fault here means the workload died, e.g. an unmapped \
+                 probe port faulting the VM): {intro_stop:?}\n{}",
+                machine.screen_text().as_text()
+            );
+            // Snapshot the cumulative counters at the start of the measured window.
+            let perf0 = machine.cpu().perf_counters().clone();
+            let elapsed0 = machine.elapsed_clocks();
+            let mut hash = vram_hash(&mut machine);
+            let mut fb_changes = 0u64;
+            // Phase 2: the measured window, in 100 slices, hashing the VGA window
+            // after each slice. Wall time brackets ONLY this window.
+            let slices = 100u64;
+            let slice_cycles = (measure_s * mode.clock_hz() as f64) as u64 / slices;
+            let wall0 = std::time::Instant::now();
+            for _ in 0..slices {
+                machine.run_cycles(slice_cycles).expect("measured slice");
+                let next = vram_hash(&mut machine);
+                if next != hash {
+                    fb_changes += 1;
+                    hash = next;
+                }
+            }
+            let wall = wall0.elapsed();
+            let perf1 = machine.cpu().perf_counters().clone();
+            let elapsed1 = machine.elapsed_clocks();
+
+            let elapsed = elapsed1 - elapsed0;
+            let guest_seconds = elapsed as f64 / mode.clock_hz() as f64;
+            let wall_seconds = wall.as_secs_f64();
+            let trips = perf1.monitor_trips_vec13 - perf0.monitor_trips_vec13;
+            let monitor_clocks =
+                perf1.monitor_resident_core_clocks - perf0.monitor_resident_core_clocks;
+            let brk_step = perf1.brk_step - perf0.brk_step;
+            let trips_per_s = trips as f64 / guest_seconds;
+            let monitor_share = monitor_clocks as f64 / elapsed.max(1) as f64;
+            let clocks_per_trip = monitor_clocks as f64 / trips.max(1) as f64;
+            let brk_step_per_trip = brk_step as f64 / trips.max(1) as f64;
+            // Game pace: per guest second it MUST match before/after (guest timing
+            // is unchanged by design); per WALL second is the user-felt pace the
+            // trap tax was suppressing.
+            let fb_per_guest_s = fb_changes as f64 / guest_seconds;
+            let fb_per_wall_s = fb_changes as f64 / wall_seconds;
+            let rt_factor = guest_seconds / wall_seconds;
+            println!(
+                "cpu={label} window={measure_s}s(after {intro_skip_s}s intro) \
+                 trips/s={trips_per_s:.1} monitor_share={monitor_share:.4} \
+                 core_clocks/trip={clocks_per_trip:.1} brk_step/trip={brk_step_per_trip:.3} \
+                 fb_changes={fb_changes} fb/guest_s={fb_per_guest_s:.2} \
+                 fb/wall_s={fb_per_wall_s:.2} wall_ms={:.1} rt_factor={rt_factor:.3} \
+                 trips={trips} monitor_clocks={monitor_clocks} brk_step={brk_step} \
+                 elapsed_clocks={elapsed}",
+                wall_seconds * 1000.0,
+            );
+            if fb_changes == 0 {
+                // The measured window saw no drawing: dump the text screen so the
+                // report can say where the machine actually was.
+                println!("--- screen at window end ---\n{}", {
+                    machine.screen_text().as_text()
+                });
+            }
+        }
+    }
 }
