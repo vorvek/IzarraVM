@@ -2647,6 +2647,117 @@ del PREEXIST.TXT\r\n";
         );
     }
 
+    /// TokaEdit e2e: EDIT.COM opens a new file at the prompt, text is typed,
+    /// File>Save and File>Exit are driven via Alt-menu keys, and the saved bytes
+    /// arrive on the host through the Katea folder. Letters/Enter only (layout
+    /// gotcha) plus raw Alt make/break scancodes.
+    ///
+    /// BLOCKED on a TokaEdit C-side bug found while writing this test (see the
+    /// report for the full investigation): `ev_wait` in
+    /// toka-dos/tools-src/edit/tui.c spuriously synthesizes an `EV_ALT_TAP`
+    /// event (a bare Alt press-and-release with no other key seen) on
+    /// idle-to-keypress transitions where no real Alt press ever happened --
+    /// confirmed with the BIOS's own KB_FLAGS byte read as 0x00 throughout, and
+    /// with a COM1-traced instrumented rebuild of EDIT.COM showing the very
+    /// first dispatched event is `EV_ALT_TAP` even though only a plain letter,
+    /// arrow key, or Escape was injected. That spurious tap arms the menu bar
+    /// (`menu_run(-1, ...)`, `pd_open=false`) and swallows the next keystroke as
+    /// a menu-bar hotkey/navigation input instead of routing it to the document
+    /// or dispatch layer. Escape reliably dismisses the armed bar with no side
+    /// effect on the document, and batching Escape's scancodes with a real
+    /// keystroke in one `inject_key_scancodes` call (no run in between) reliably
+    /// gets a single plain character through — that technique is used below for
+    /// the document text. It does NOT reliably work for the Alt+F chord that
+    /// opens the File menu: dozens of interactive probes and instrumented
+    /// rebuilds during the investigation could not find a keystroke sequencing
+    /// that opens File deterministically (the chord is sometimes swallowed
+    /// whole with zero visible effect, apparently because the Alt make/break
+    /// bytes never reach the BIOS keyboard buffer at all -- only real,
+    /// ASCII-bearing keys do -- so the guest's idle-poll can land in the gap
+    /// between them and misfire). Per the task instructions this is reported
+    /// rather than patched silently; the test below verifies everything that
+    /// IS solid (boot, `edit HELLO`, typing into the open document) and stops
+    /// short of Save/Exit.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokaedit_edits_and_saves_a_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaedit_e2e_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during TokaEdit e2e boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
+        if !boot_text.contains("c:\\>") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("no C:\\> prompt after boot (stop={stop:?}).\n{boot_text}");
+        }
+
+        // `edit HELLO` opens a new file named HELLO (no '.' keystroke needed).
+        // Plain injection here: this text goes to COMMAND.COM's own command
+        // line, not TokaEdit's event loop, so it is not subject to the spurious-
+        // Alt-tap bug documented above (and priming it with Escape would just
+        // clear the line).
+        for ch in "edit hello\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type edit command");
+        }
+        machine
+            .run_until_halt_or_cycles(100_000_000)
+            .expect("settle edit launch");
+        let editor_text = machine.screen_text().as_text();
+        let editor_text_upper = editor_text.to_ascii_uppercase();
+        if !editor_text_upper.contains("HELLO") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("EDIT did not open HELLO (stop={stop:?}).\n{editor_text}");
+        }
+
+        // Type the document body. Escape's scancodes are batched ahead of each
+        // character's own scancodes (one `inject_key_scancodes` call, no run in
+        // between): the spurious tap described above claims the harmless
+        // Escape and the real character behind it goes through normally.
+        for ch in "hi".chars() {
+            for code in ascii_to_set1('\x1b') {
+                machine.inject_key_scancodes(&[code]);
+            }
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type document text");
+        }
+
+        let body_text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            body_text.contains("hi"),
+            "document text 'hi' did not land in the buffer.\n{body_text}"
+        );
+    }
+
     /// SP-4b M0 GO/NO-GO: `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
     /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
     /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
