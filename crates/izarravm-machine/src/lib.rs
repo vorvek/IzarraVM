@@ -1227,6 +1227,15 @@ fn duration_ns_u64(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+/// Gate for the opt-in per-fault / diagnostic-port trace (see `Machine::log_fault_trace`
+/// and the unit-tester `CMD_EXIT` trace in `perform_unittester`). Default off: checked
+/// only on the cold paths (a fatal CPU error, or a guest OUT to the unit-tester exit
+/// port), never per-instruction or per-cycle, so leaving it unset costs one env lookup
+/// on those rare events and nothing anywhere else.
+fn fault_trace_enabled() -> bool {
+    std::env::var_os("IZARRAVM_FAULT_TRACE").is_some()
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -7631,9 +7640,47 @@ impl Machine {
                 }
                 None
             }
-            unittester::CMD_EXIT => Some(self.unittester.exit_code()),
+            unittester::CMD_EXIT => {
+                // Diagnostic trace only (IZARRAVM_FAULT_TRACE=1): the Doom repro
+                // needs to know whether the exit was a deliberate port write from
+                // the running guest or a stray fetch. The run loop's OUT to 0xE6
+                // always ends the batch before this deferred command executes
+                // (write_io sets io_touched unconditionally), so CS:IP here is the
+                // guest instruction right after the OUT, the closest reachable
+                // point to the origin without threading CS:IP through CpuBus.
+                if fault_trace_enabled() {
+                    let cs = self.cpu.registers.cs().selector;
+                    let eip = self.cpu.registers.eip;
+                    eprintln!(
+                        "fault trace: OUT 0xE6 CMD_EXIT val={cmd:#04x} \
+                         next-guest-CS:IP={cs:#06x}:{eip:#010x} v86={} ring0={}",
+                        self.cpu.is_v86_mode(),
+                        self.cpu.is_ring0_protected(),
+                    );
+                }
+                Some(self.unittester.exit_code())
+            }
             _ => None, // unknown command: ignore, like an unused port write
         }
+    }
+
+    /// Log a fatal `CpuError` that stopped the run loop (env-gated, see
+    /// `fault_trace_enabled`). Reports whatever CS:IP the CPU shows at the
+    /// error site: for the V86-sensitive-op / selector-load faults this is the
+    /// faulting guest instruction directly (the error is raised before any
+    /// exception delivery runs), and for a fault raised while the TOKAEMM
+    /// monitor is running ring-0 PM code it is the monitor's own CS:IP (the
+    /// V86 guest CS:IP the monitor was servicing is on its stack, not
+    /// reachable here without walking the ring-0 stack frame -- noted as the
+    /// gap rather than adding a paging-aware stack walk to this trace).
+    fn log_fault_trace(&self, error: &CpuError) {
+        let cs = self.cpu.registers.cs().selector;
+        let eip = self.cpu.registers.eip;
+        eprintln!(
+            "fault trace: {error} at CS:IP={cs:#06x}:{eip:#010x} v86={} ring0={}",
+            self.cpu.is_v86_mode(),
+            self.cpu.is_ring0_protected(),
+        );
     }
 
     /// Write the current frame to `path` as a binary PPM (P6). PPM keeps a PNG
@@ -9117,7 +9164,12 @@ impl Machine {
                         self.direct_map_changed = false;
                     }
                 }
-                Err(error) => return Ok(StopReason::CpuError(error.to_string())),
+                Err(error) => {
+                    if fault_trace_enabled() {
+                        self.log_fault_trace(&error);
+                    }
+                    return Ok(StopReason::CpuError(error.to_string()));
+                }
             }
         }
 
@@ -10524,6 +10576,15 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         // not a fault -- the port-0x201 joystick-stub precedent)
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
+        0x5658..=0x565b, // VMware backdoor probe (DX=0x5658, EAX='VMXh'): real,
+        // non-VMware hardware has nothing at this port, so a guest's `IN
+        // EAX, DX` detection probe must read open bus (all-ones), never the
+        // VMware magic response and never an UnsupportedPort fault. A dword
+        // IN decomposes into four byte reads at 0x5658-0x565b (the same
+        // io_word_sub_port widening as every other wide port access), so all
+        // four bytes are covered here. JEMMEX runs this probe during its own
+        // hypervisor-presence check and used to halt the machine with
+        // CpuError("unsupported I/O port 0x5658") before this stub existed.
     ];
     ranges.into_iter().flatten()
 }
@@ -14035,6 +14096,41 @@ mod tests {
         assert!(matches!(
             bus.read_io(0x0290, BusWidth::Byte, 0, false),
             Err(BusError::UnsupportedPort { port }) if port == 0x0290
+        ));
+    }
+
+    #[test]
+    fn vmware_backdoor_probe_reads_open_bus_not_a_fault() {
+        // Port 0x5658 is the VMware backdoor detection port: real VMware sets
+        // EAX/EBX/ECX/EDX on `IN EAX, DX` (DX=0x5658, EAX='VMXh'); real,
+        // non-VMware hardware has nothing there, so the guest must see open
+        // bus (all-ones) and conclude "not VMware" -- not an UnsupportedPort
+        // fault that halts the machine. JEMMEX runs this probe and used to
+        // crash with CpuError("unsupported I/O port 0x5658") before this stub
+        // existed; regression guard for the passive-port entry.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        assert_eq!(
+            bus.read_io(0x5658, BusWidth::Dword, 0, false).unwrap(),
+            0xffff_ffff,
+            "VMware backdoor port must read open bus on a dword IN, not the VMXh response"
+        );
+        for port in [0x5658u16, 0x5659, 0x565a, 0x565b] {
+            assert_eq!(
+                bus.read_io(port, BusWidth::Byte, 0, false).unwrap(),
+                0xff,
+                "port {port:#06x} must read open bus"
+            );
+        }
+        // OUT is accepted, matching every other passive stub (the generic
+        // passive-port table is a plain read/write latch with no VMware
+        // magic-number behavior grafted on).
+        bus.write_io(0x5658, BusWidth::Dword, 0x564d_5868, false)
+            .unwrap();
+        // The stub stays bounded: one past the top still faults.
+        assert!(matches!(
+            bus.read_io(0x565c, BusWidth::Byte, 0, false),
+            Err(BusError::UnsupportedPort { port }) if port == 0x565c
         ));
     }
 
