@@ -3,7 +3,7 @@
 IzarraVM's desktop application wraps the emulated Izarra 3000 in a control
 panel: a display, a beige panel of controls below it, and a config modal for
 the things you don't need to reach every session. This page covers the host
-application, not the emulated machine — see the [Izarra 3000 user
+application, not the emulated machine. See the [Izarra 3000 user
 manual](../izarra-3000/user-manual.md) for what happens inside the guest.
 
 ## Starting it
@@ -39,8 +39,8 @@ launch.
 The C: drive path itself is set at startup, not from inside the GUI: via
 `--c-drive`, `--dosroot`, or the `dos.c_drive` key in a `--config` TOML file
 such as `examples/izarravm.toml`. The GUI's "Open C: folder" control just
-opens your host file manager on whatever path is already configured — handy
-for dropping files onto the guest's hard disk, not a way to switch drives.
+opens your host file manager on whatever path is already configured (handy
+for dropping files onto the guest's hard disk, not a way to switch drives).
 
 ## izarravm.conf
 
@@ -61,11 +61,11 @@ cleanly after an upgrade.
 
 Opened from the control panel, the config modal has two sections:
 
-**Input** — rebind the "Input release" hotkey (the key combination that
+**Input**: rebind the "Input release" hotkey (the key combination that
 gives keyboard and mouse focus back to the host) and the "Full screen"
 toggle hotkey.
 
-**Display** — the number of Voodoo/Distira render threads, and **CRT
+**Display**: the number of Voodoo/Distira render threads, and **CRT
 emulation**, a three-way choice:
 
 | On-screen label | What it does |
@@ -78,10 +78,10 @@ Accept applies your changes and closes the modal; Cancel discards them.
 
 ## Mounting removable media
 
-**Floppy (A:)** — accepts `.img`, `.ima`, and `.flp` disk images through a
+**Floppy (A:)**: accepts `.img`, `.ima`, and `.flp` disk images through a
 file picker.
 
-**CD-ROM (D:)** — accepts three sources:
+**CD-ROM (D:)** accepts three sources:
 
 - An **ISO** image, mounted as a single data track.
 - A **CUE/BIN** pair, with the `.cue` parsed against its matching `.bin`.
@@ -89,7 +89,7 @@ file picker.
   lazily from the folder as the guest requests sectors, rather than copied
   up front, up to about 650 MB.
 
-A CD image and a CD folder are mutually exclusive — mounting one clears the
+A CD image and a CD folder are mutually exclusive. Mounting one clears the
 other. There is no equivalent host-folder option for the floppy drive; A:
 only takes image files.
 
@@ -98,18 +98,18 @@ only takes image files.
 - A collapsible beige control panel below the display, with activity LEDs
   for the floppy and the C: drive.
 - A master volume slider.
-- A COM1 serial log window — a floating, resizable panel showing what the
+- A COM1 serial log window: a floating, resizable panel showing what the
   guest has written to the emulated serial port, useful for anything that
   logs there instead of the screen.
 - An About window with license information.
 
 There is no drag-and-drop support for mounting media, and no built-in
-screenshot capture — use your host OS's own screenshot tool against the
+screenshot capture. Use your host OS's own screenshot tool against the
 IzarraVM window.
 
 ## Next
 
-- [Izarra 3000 user manual](../izarra-3000/user-manual.md) — the emulated
+- [Izarra 3000 user manual](../izarra-3000/user-manual.md): the emulated
   machine this application drives.
-- [Using Toka-DOS](../toka-dos/using-toka-dos.md) — what to expect once the
+- [Using Toka-DOS](../toka-dos/using-toka-dos.md): what to expect once the
   guest boots.

@@ -1,6 +1,6 @@
 # IZBIOS Configuration Panel Guide
 
-A per-screen walkthrough of the Del setup panel — the Izarra-BIOS's
+A per-screen walkthrough of the Del setup panel, the Izarra-BIOS's
 graphical configuration tool. For the quick tour, see the [user
 manual](../izarra-3000/user-manual.md#the-del-setup-panel); this page goes
 one screen deeper.
@@ -8,7 +8,7 @@ one screen deeper.
 Press **Del** during POST to open it. The panel draws on the same Margo
 linear frame buffer mode the POST screen uses, so it shares its palette:
 cream field, near-black text, red titles. Everything you change here is a
-working copy — nothing reaches CMOS until you choose **Save and Exit**.
+working copy: nothing reaches CMOS until you choose **Save and Exit**.
 
 ## Main menu
 
@@ -46,7 +46,7 @@ it to the RTC; if you never touch this screen, the clock is left alone.
 ## KEYBOARD
 
 Cycles through the machine's 17 selectable keyboard layouts (US, UK,
-Spanish, French, German, Italian, and more) directly on the main menu — no
+Spanish, French, German, Italian, and more) directly on the main menu, with no
 sub-page. The chosen layout takes effect immediately for feedback, and is
 written to CMOS on Save, together with the matching boot code page for that
 layout's characters.
@@ -55,7 +55,7 @@ layout's characters.
 
 Cycles the boot-time CPU speed directly on the main menu, in the order
 `386` → `486` → `586` → `286`, wrapping back to `386`. This sets the speed
-class the machine will boot at next time, saved to CMOS on Save — it's the
+class the machine will boot at next time, saved to CMOS on Save. It's the
 same four classes and the same underlying value as the [Tab boot
 menu](../izarra-3000/user-manual.md#the-tab-boot-menu), just reachable from
 inside setup instead. It does not change the machine's speed live; for
@@ -74,8 +74,8 @@ LOTURA      PIT TIMER    SB DSP     MARGO VGA
 8042 KBD    COM1 UART    OPL FM
 ```
 
-PASS is shown in sage green, FAIL in red. This is a diagnostic screen only
-— there is nothing here to configure, just a live re-check without a full
+PASS is shown in sage green, FAIL in red. This is a diagnostic screen only.
+There is nothing here to configure, just a live re-check without a full
 reboot.
 
 ## REPAIR TOKA-DOS
@@ -96,8 +96,8 @@ for exactly what this leaves alone versus what it replaces.
 **Save and Exit** commits the working copy: keyboard layout and CPU mode go
 to CMOS, the clock goes to the real-time clock if the Time screen was
 edited, a checksum is recomputed over the saved settings, and the machine
-reboots. **Discard and Exit** — or Esc from the main menu, which does the
-same thing — throws every change away and reboots with whatever was already
+reboots. **Discard and Exit** (or Esc from the main menu, which does the
+same thing) throws every change away and reboots with whatever was already
 saved.
 
 ## What persists across reboots
@@ -106,14 +106,14 @@ Only two settings are written by this panel: the **keyboard layout** (CMOS
 offset `0x10`) and the **CPU mode** (CMOS offset `0x12`). The clock is
 written to the real-time clock hardware directly, not CMOS, when the Time
 screen was used. The Tab boot menu writes the CPU mode and the boot device
-order (CMOS offset `0x11`) independently of this panel — the two entry
+order (CMOS offset `0x11`) independently of this panel. The two entry
 points share the same underlying CMOS fields where they overlap. A stored
 checksum protects the saved block; if it doesn't match at boot, the BIOS
 falls back to defaults rather than trusting corrupted settings.
 
 ## Next
 
-- [Izarra 3000 user manual](../izarra-3000/user-manual.md) — the machine
+- [Izarra 3000 user manual](../izarra-3000/user-manual.md): the machine
   overview, POST screen, and boot menu.
-- [Using Toka-DOS](../toka-dos/using-toka-dos.md) — what boots once setup is
+- [Using Toka-DOS](../toka-dos/using-toka-dos.md): what boots once setup is
   done.

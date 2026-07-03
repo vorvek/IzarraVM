@@ -73,15 +73,15 @@ writing the card's own ports directly:
 |-------|----------------------|--------|------|
 | 3B8h  | Mode Control         | write  | bit 1 GRPH (graphics vs text), bit 3 video enable, bit 5 blink (text mode only), bit 7 page select (0 = B0000, 1 = B8000) |
 | 3BFh  | Configuration Switch | write  | bit 0 allow GRPH, bit 1 enable the B8000 page |
-| 3BAh  | CRT status           | read   | bit 0 horizontal retrace, bit 3 video pixel output, bit 7 vertical sync (active LOW — the inverse of the VGA/CGA status1 polarity) |
+| 3BAh  | CRT status           | read   | bit 0 horizontal retrace, bit 3 video pixel output, bit 7 vertical sync (active LOW, the inverse of the VGA/CGA status1 polarity) |
 
 3BFh gates what 3B8h may do: setting the GRPH bit in Mode Control has no
 effect until the Configuration Switch has set its allow-graphics bit, and the
 second 32K page only decodes at B8000 once the switch's page-enable bit is
 also set. Page 0 (B0000) is always addressable. Both pages can hold data
 simultaneously; Mode Control's page-select bit only picks which one the CRTC
-scans out. The classic software detection idiom — poll 3BAh bit 7 in a tight
-loop (traditionally up to ~0x8000 iterations) until it is seen to change —
+scans out. The classic software detection idiom is to poll 3BAh bit 7 in a tight
+loop (traditionally up to ~0x8000 iterations) until it is seen to change. It
 works against the beam-coupled vertical retrace state, the same way the VGA
 status ports do.
 

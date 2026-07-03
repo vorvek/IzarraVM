@@ -3,7 +3,7 @@
 The Izarra 3000 is a fixed machine. This manual describes it as built: what
 you see when you power it on, what the boot menu and setup panel offer, and
 what each control does. None of the hardware here is user-selectable in the
-way a real PC's BIOS setup lets you swap parts — IzarraVM reproduces one
+way a real PC's BIOS setup lets you swap parts. IzarraVM reproduces one
 machine, and this manual reproduces its manual.
 
 ## Tech specs
@@ -39,8 +39,8 @@ Diagnostics run in a fixed order, each pausing briefly so the check is
 visible rather than flickering past: CPU identity, Margo video, RAM count-up,
 the Lotura chipset, the 8042 keyboard controller, the PIT timer, the COM1
 UART, the Sound Blaster DSP, the OPL FM synth, the floppy controller, the
-hard disk, and the ATAPI optical drive. A part that fails stays grey — its
-icon never lights — and the machine carries on to the next check rather than
+hard disk, and the ATAPI optical drive. A part that fails stays grey (its
+icon never lights) and the machine carries on to the next check rather than
 stopping cold.
 
 Two hints sit under the header for the whole POST sequence:
@@ -62,11 +62,11 @@ stacked sections and an Accept row. Move between rows with Up/Down; Enter
 marks a row or fires Accept; F10 also accepts; Esc cancels back to the saved
 boot order without changing anything.
 
-**Boot device** — three rows: Hard Disk, Floppy A:, and CD-ROM. The floppy
+**Boot device**: three rows are Hard Disk, Floppy A:, and CD-ROM. The floppy
 is always selectable. Hard disk and CD-ROM are only selectable when the boot
 menu finds media to boot from; an unavailable row is drawn in grey.
 
-**CPU speed** — four rows, from fastest to slowest:
+**CPU speed** has four rows, from fastest to slowest:
 
 | Row | Speed class | Port/CMOS code |
 | --- | --- | --- |
@@ -76,7 +76,7 @@ menu finds media to boot from; an unavailable row is drawn in grey.
 | SSlow 286 | 286-equivalent, the slowest tier | 3 |
 
 Accepting the menu writes the chosen speed to the Lotura chipset's mode port
-immediately — the CPU actually changes speed class right there — and saves
+immediately (the CPU actually changes speed class right there) and saves
 both the boot device order and the CPU speed to CMOS as the new defaults for
 future cold boots. There is no separate reboot: the machine falls straight
 through to booting the chosen device at the chosen speed.
@@ -97,10 +97,10 @@ box changes to describe whatever row is highlighted.
 | --- | --- |
 | **Time** | Opens a sub-page to set the clock: hour, minute, second, day, month, year. Left/Right picks the field, Up/Down (or Enter) changes it, Esc returns. |
 | **Keyboard** | Cycles the active keyboard layout with Left/Right (or Enter). Seventeen layouts are available (US, UK, Spanish, French, German, Italian, and others). |
-| **CPU Mode** | Cycles the boot-time CPU speed with Left/Right (or Enter): 386, 486, 586, then 286, wrapping — the same four classes as the Tab boot menu, in the same order the hardware answers them. |
+| **CPU Mode** | Cycles the boot-time CPU speed with Left/Right (or Enter): 386, 486, 586, then 286, wrapping, the same four classes as the Tab boot menu, in the same order the hardware answers them. |
 | **Peripherals** | Opens a sub-page that re-runs the POST hardware checks live (they are non-destructive) and lists each as PASS or FAIL: Lotura, 8042 KBD, PIT Timer, COM1 UART, SB DSP, OPL FM, and Margo VGA. |
 | **Repair Toka-DOS** | Reinstalls Toka-DOS onto the hard disk from the ROM's built-in image, for when the installed copy is damaged or missing. Reports "Toka-DOS repaired" on success. See [Repair Toka-DOS](../toka-dos/using-toka-dos.md#repair-toka-dos) for exactly what this touches. |
-| **Save and Exit** | Commits the working copy — keyboard layout and CPU mode to CMOS, the clock to the real-time clock if you changed it — and reboots. |
+| **Save and Exit** | Commits the working copy (keyboard layout and CPU mode to CMOS, the clock to the real-time clock if you changed it) and reboots. |
 | **Discard and Exit** | Throws away any changes and reboots. Esc on the main menu does the same thing. |
 
 ### What CMOS remembers
@@ -114,6 +114,6 @@ back to defaults rather than booting on garbage.
 
 ## Next
 
-- [Using Toka-DOS](../toka-dos/using-toka-dos.md) — what happens after POST hands off to the disk.
-- [IZBIOS Configuration Panel guide](../izbios/configuration-panel.md) — a closer look at each setup screen.
-- [The IzarraVM GUI guide](../izarravm-gui/guide.md) — the host application around the emulated machine.
+- [Using Toka-DOS](../toka-dos/using-toka-dos.md): what happens after POST hands off to the disk.
+- [IZBIOS Configuration Panel guide](../izbios/configuration-panel.md): a closer look at each setup screen.
+- [The IzarraVM GUI guide](../izarravm-gui/guide.md): the host application around the emulated machine.

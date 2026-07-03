@@ -13,33 +13,33 @@ installation instructions. These pages are the machine's manuals.
 
 ## Start here
 
-- **[Izarra 3000 user manual](izarra-3000/user-manual.md)** — the machine
+- **[Izarra 3000 user manual](izarra-3000/user-manual.md)**, the machine
   itself: powering on, the POST screen, the boot menu, and the setup panel.
-- **[Company story](izarra-3000/company-story.md)** — where the Izarra 3000
+- **[Company story](izarra-3000/company-story.md)**: where the Izarra 3000
   and Toka-DOS came from.
-- **[Using Toka-DOS](toka-dos/using-toka-dos.md)** — the bundled operating
+- **[Using Toka-DOS](toka-dos/using-toka-dos.md)**: the bundled operating
   system, its shell, and its disk layout.
-- **[DOS command reference](toka-dos/commands.md)** — every shipped
+- **[DOS command reference](toka-dos/commands.md)**: every shipped
   command, with its switches.
-- **[IzarraVM GUI guide](izarravm-gui/guide.md)** — the host application:
+- **[IzarraVM GUI guide](izarravm-gui/guide.md)**, the host application:
   config, mounting media, and where your files live.
-- **[Troubleshooting & FAQ](troubleshooting.md)** — common problems and what
+- **[Troubleshooting & FAQ](troubleshooting.md)**: common problems and what
   to try.
 
 ## Hardware manuals
 
-- **[IZBIOS Configuration Panel guide](izbios/configuration-panel.md)** — a
+- **[IZBIOS Configuration Panel guide](izbios/configuration-panel.md)**: a
   per-screen walkthrough of the Del setup panel.
-- **[TOKAEMM.SYS memory manager](tokaemm/manual.md)** — XMS, EMS, UMBs, and
+- **[TOKAEMM.SYS memory manager](tokaemm/manual.md)**: XMS, EMS, UMBs, and
   the V86 monitor underneath Toka-DOS.
-- **[ReSonique 2 sound card manual](resonique2/manual.md)** — the audio
+- **[ReSonique 2 sound card manual](resonique2/manual.md)**: the audio
   hardware and what it does and doesn't support today.
 
 ## Technical references
 
-- **[VGA core](vga-core/README.md)** — the IBM VGA-compatible video path,
+- **[VGA core](vga-core/README.md)**: the IBM VGA-compatible video path,
   including its Hercules and CGA personalities.
-- **[VEGA programmer's guide](vega/vega-programmers-guide.md)** — a working
+- **[VEGA programmer's guide](vega/vega-programmers-guide.md)**: a working
   guide to drawing through the VEGA chipset (Margo, the 2D engine).
-- **[VEGA technical reference](vega/vega-technical-reference.md)** — the
+- **[VEGA technical reference](vega/vega-technical-reference.md)**: the
   register-level contract for Margo and Distira (3D).

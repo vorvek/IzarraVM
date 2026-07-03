@@ -27,8 +27,8 @@ IzarraVM is what survived in the lab notes.
 
 ## General Simulation Works (software)
 
-The system software — Toka Disk Operating System, the GSW-586 CPU, and the
-`GSWMODE` speed switch — carries a different name: General Simulation Works.
+The system software (Toka Disk Operating System, the GSW-586 CPU, and the
+`GSWMODE` speed switch) carries a different name: General Simulation Works.
 It shows up once, in Toka-DOS's own boot banner:
 
 ```
@@ -36,7 +36,7 @@ Toka-DOS 3.0 (C) 1997 General Simulation Works - tongue firmly in cheek.
 ```
 
 General Simulation Works is Izarra's software arm, or its software supplier,
-depending on which lab note you believe — the record is thin, because the
+depending on which lab note you believe. The record is thin, because the
 company didn't outlive the hardware it was written for. What is clear from
 the product itself: the "GSW" in GSW-586 is their initials, not a
 coincidence, and the throttle-without-rebooting trick that lets one CPU
@@ -49,8 +49,8 @@ IzarraVM's documentation is written from inside this fiction: pages read as
 manuals for real 1997 hardware and software, because holding that voice
 consistently is more useful than breaking it every few paragraphs to remind
 you it's an emulator. Where the emulator's actual behavior differs from what
-the in-universe hardware would do — an unimplemented feature, a timing
-shortcut, a placeholder — the relevant page says so plainly. See the [VEGA
+the in-universe hardware would do (an unimplemented feature, a timing
+shortcut, a placeholder), the relevant page says so plainly. See the [VEGA
 Technical Reference, section 9](../vega/vega-technical-reference.md#9-timing-and-fidelity)
 for the model this documentation follows: the fiction is a voice, not a
 cover story.

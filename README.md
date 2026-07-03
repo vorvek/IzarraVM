@@ -2,7 +2,7 @@
 
 IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era games computer that
 almost shipped in 1997. It models one fixed machine: custom video and audio
-around an MS-DOS compatible core, booting Toka-DOS — a real FreeDOS-based
+around an MS-DOS compatible core, booting Toka-DOS: a real FreeDOS-based
 system running in virtual-8086 mode under the machine's own memory manager.
 
 <p align="center">
@@ -57,7 +57,7 @@ reproduces the Izarra 3000 exactly as it was built.
 The firmware is a clean-room BIOS with a graphical POST, a boot menu, and a
 full setup panel. It boots a real FreeDOS kernel and shell (rebranded
 Toka-DOS 3.0) inside virtual-8086 mode under TOKAEMM, a guest-side memory
-manager that provides XMS, EMS, and UMBs through the CPU's own paging — the
+manager that provides XMS, EMS, and UMBs through the CPU's own paging, the
 same way a period memory manager did it. The C: drive is a folder on the host,
 served to the guest as a real ATA disk; the classic external DOS tools
 (XCOPY, ATTRIB, FIND, MORE, MEM, CHOICE, DELTREE, MOVE, SORT, LABEL, and more)
@@ -69,7 +69,7 @@ The emulator boots to a usable DOS with sound, mouse, CD-ROM (ISO, CUE/BIN, or
 a host folder mounted as a disc), and floppy images. Legacy video personalities
 (CGA, EGA, VGA, Hercules) are modeled down to the register level, and the
 display goes through an optional, subtle CRT shader. Plenty of games run;
-plenty more don't yet — compatibility work is ongoing.
+plenty more don't yet. Compatibility work is ongoing.
 
 ## Quick Start
 
