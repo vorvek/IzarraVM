@@ -14015,6 +14015,30 @@ mod tests {
     }
 
     #[test]
+    fn cms_probe_range_reads_open_bus_not_a_fault() {
+        // Ports 0x280-0x28F are the C/MS Game Blaster's alternate probe base.
+        // With no card there, a read must see open bus (0xFF) so a sound-detect
+        // routine concludes "nothing present" -- not an UnsupportedPort fault
+        // that halts the machine headless. Prince of Persia (PRINCE ADLIB) reads
+        // 0x283 during its scan; regression guard for the passive-port entry.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        for port in [0x0280u16, 0x0283, 0x028f] {
+            assert_eq!(
+                bus.read_io(port, BusWidth::Byte, 0, false).unwrap(),
+                0xff,
+                "port {port:#06x} must read open bus"
+            );
+        }
+        // The stub stays bounded: one past the top still faults, so genuinely
+        // unclaimed ISA reads elsewhere keep surfacing as real faults.
+        assert!(matches!(
+            bus.read_io(0x0290, BusWidth::Byte, 0, false),
+            Err(BusError::UnsupportedPort { port }) if port == 0x0290
+        ));
+    }
+
+    #[test]
     fn int11_equipment_word_tracks_floppy_mount() {
         let mut m = int15_machine(16);
         // Mounting sets the floppy-installed bit; ejecting clears the floppy field.
