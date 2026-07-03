@@ -725,6 +725,19 @@ static void mouse_event(const Event *e) {
             return;
         }
         if (e->kind == EV_MOUSE_DRAG && mouse_text_down) {
+            /* Edge auto-scroll: the mouse can never leave the window, so
+             * mouse_to_doc alone can't push the cursor past the edge and
+             * clamp_scroll would never fire. Nudge the scroll origin one
+             * step first (like PgUp/PgDn, the end-of-loop clamp settles
+             * the rest), then map the drag cell. */
+            if (e->mrow == TEXT_TOP && top_row > 0)
+                top_row--;
+            else if (e->mrow == TEXT_BOTTOM && top_row < doc.nlines - 1)
+                top_row++;
+            if (e->mcol == 0 && left_col > 0)
+                left_col--;
+            else if (e->mcol == 78 && left_col < 255)
+                left_col++;
             mouse_to_doc(e->mrow, e->mcol, &cur_row, &cur_col);
             if (cur_row != anch_row || cur_col != anch_col)
                 sel_active = 1;
