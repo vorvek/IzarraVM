@@ -138,41 +138,105 @@ static int append_line(Buf *b, const char *s, int len) {
     return 1;
 }
 
+/* Shared per-character state machine driving both buf_load (from a memory
+ * block) and buf_load_stream (from a FILE*): line accumulator + tab
+ * expansion + CR skip + LF commit. */
+typedef struct {
+    Buf *b;
+    char cur[BUF_MAX_LINE + 1];
+    int  col;
+} Loader;
+
+static void loader_init(Loader *ld, Buf *b) {
+    ld->b = b;
+    ld->col = 0;
+}
+
+/* 1 ok, 0 refused (line too long/oom) */
+static int loader_feed(Loader *ld, char ch) {
+    if (ch == '\r') return 1;                   /* CRLF: LF ends the line */
+    if (ch == '\n') {
+        if (!append_line(ld->b, ld->cur, ld->col)) return 0;
+        ld->col = 0;
+        return 1;
+    }
+    if (ch == '\t') {                            /* expand to the next 8-col stop */
+        int stop = (ld->col / 8 + 1) * 8;
+        if (stop > BUF_MAX_LINE) return 0;
+        while (ld->col < stop) ld->cur[ld->col++] = ' ';
+        return 1;
+    }
+    if (ld->col >= BUF_MAX_LINE) return 0;
+    ld->cur[ld->col++] = ch;
+    return 1;
+}
+
+/* A trailing partial line with no final newline still becomes a line;
+ * input ending in \n contributes nothing further (already appended). */
+static int loader_finish(Loader *ld) {
+    if (ld->col > 0 || ld->b->nlines == 0) {
+        if (!append_line(ld->b, ld->cur, ld->col)) return 0;
+    }
+    return 1;
+}
+
+static void loader_discard_existing(Buf *b) {
+    int oldn = b->nlines, k;                     /* free every existing line, */
+    for (k = 0; k < oldn; k++) buf_free_mem(b->lines[k]); /* not just [0] */
+    b->nlines = 0;                                /* rebuild from scratch */
+}
+
 /* May be called on any initialized Buf, fresh or already loaded; it
  * discards the current content and replaces it. */
 int buf_load(Buf *b, const char *data, long n) {
-    char cur[BUF_MAX_LINE + 1];
-    int col = 0;
+    Loader ld;
     long i;
-    int oldn, k;
     if (n > BUF_MAX_LOAD) return 0;
     if (n > 0 && data[n - 1] == 0x1A) n--;     /* one trailing DOS EOF char */
-    oldn = b->nlines;                            /* free every existing line, */
-    for (k = 0; k < oldn; k++) buf_free_mem(b->lines[k]); /* not just [0] */
-    b->nlines = 0;                               /* rebuild from scratch */
-    for (i = 0; i < n; i++) {
-        char ch = data[i];
-        if (ch == '\r') continue;               /* CRLF: LF ends the line */
-        if (ch == '\n') {
-            if (!append_line(b, cur, col)) return 0;
-            col = 0;
-            continue;
-        }
-        if (ch == '\t') {                       /* expand to the next 8-col stop */
-            int stop = (col / 8 + 1) * 8;
-            if (stop > BUF_MAX_LINE) return 0;
-            while (col < stop) cur[col++] = ' ';
-            continue;
-        }
-        if (col >= BUF_MAX_LINE) return 0;
-        cur[col++] = ch;
-    }
-    /* A trailing partial line with no final newline still becomes a line;
-     * input ending in \n contributes nothing further (already appended). */
-    if (col > 0 || b->nlines == 0) {
-        if (!append_line(b, cur, col)) return 0;
-    }
+    loader_discard_existing(b);
+    loader_init(&ld, b);
+    for (i = 0; i < n; i++)
+        if (!loader_feed(&ld, data[i])) return 0;
+    if (!loader_finish(&ld)) return 0;
     b->dirty = 0;
+    return 1;
+}
+
+/* Streams from f in small chunks: no whole-file staging allocation (a
+ * single malloc cannot exceed 64 KB on the 16-bit DOS build). A 0x1A byte
+ * stops reading immediately (treated as end-of-input), matching the
+ * period-correct DOS text-file convention; see buffer.h. */
+int buf_load_stream(Buf *b, FILE *f) {
+    Loader ld;
+    char chunk[512];
+    long total = 0;
+    size_t got, k;
+    int stopped = 0;
+
+    loader_discard_existing(b);
+    loader_init(&ld, b);
+    while (!stopped && (got = fread(chunk, 1, sizeof chunk, f)) > 0) {
+        for (k = 0; k < got; k++) {
+            char ch = chunk[k];
+            if (ch == 0x1A) { stopped = 1; break; }
+            if (++total > BUF_MAX_LOAD) return 0;
+            if (!loader_feed(&ld, ch)) return 0;
+        }
+    }
+    if (ferror(f)) return 0;
+    if (!loader_finish(&ld)) return 0;
+    b->dirty = 0;
+    return 1;
+}
+
+int buf_save_stream(const Buf *b, FILE *f) {
+    int i;
+    for (i = 0; i < b->nlines; i++) {
+        if (b->lens[i] > 0 &&
+            fwrite(b->lines[i], 1, (size_t)b->lens[i], f) != (size_t)b->lens[i])
+            return 0;
+        if (fwrite("\r\n", 1, 2, f) != 2) return 0;
+    }
     return 1;
 }
 

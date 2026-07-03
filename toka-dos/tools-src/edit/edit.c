@@ -299,10 +299,12 @@ static void word_right(void) {
 
 static int load_file(const char *path) {
     FILE *f;
-    char *data;
-    long n;
+    int ok;
 
-    strcpy(docname, path);
+    if (path != docname) {
+        strncpy(docname, path, sizeof(docname) - 1);
+        docname[sizeof(docname) - 1] = '\0';
+    }
     f = fopen(path, "rb");
     if (!f) {
         cur_row = cur_col = 0;
@@ -311,25 +313,14 @@ static int load_file(const char *path) {
         return 1; /* new file: keep empty buffer */
     }
 
-    data = (char *)malloc(BUF_MAX_LOAD + 1);
-    if (!data) {
-        fclose(f);
-        /* Task 8: dlg_msg */
-        scr_put(24, 0, "Out of memory loading file.", AT_BAR);
-        return 0;
-    }
-
-    n = (long)fread(data, 1, BUF_MAX_LOAD + 1, f);
+    ok = buf_load_stream(&doc, f);
     fclose(f);
 
-    if (n > BUF_MAX_LOAD || !buf_load(&doc, data, n)) {
-        free(data);
-        /* Task 8: dlg_msg */
-        scr_put(24, 0, "File too large or invalid.", AT_BAR);
+    if (!ok) {
+        /* Task 8: replace with dlg_msg for dialogs-era open */
         return 0;
     }
 
-    free(data);
     cur_row = cur_col = 0;
     top_row = left_col = 0;
     sel_active = 0;
@@ -337,40 +328,27 @@ static int load_file(const char *path) {
 }
 
 static int save_file(void) {
-    long sz;
-    char *out;
     FILE *f;
+    int ok;
 
     if (!docname[0]) {
         /* Task 8: Save As dialog */
         return 0;
     }
 
-    sz = buf_save_size(&doc);
-    out = (char *)malloc((size_t)sz);
-    if (!out) {
-        /* Task 8: dlg_msg */
-        scr_put(24, 0, "Out of memory saving file.", AT_BAR);
-        return 0;
-    }
-    buf_serialize(&doc, out);
-
     f = fopen(docname, "wb");
     if (!f) {
-        free(out);
         /* Task 8: dlg_msg */
         scr_put(24, 0, "Could not write file.", AT_BAR);
         return 0;
     }
-    if (fwrite(out, 1, (size_t)sz, f) != (size_t)sz) {
-        fclose(f);
-        free(out);
+    ok = buf_save_stream(&doc, f);
+    if (fclose(f) != 0) ok = 0;      /* buffered writes flush at fclose */
+    if (!ok) {
         /* Task 8: dlg_msg */
         scr_put(24, 0, "Write error.", AT_BAR);
         return 0;
     }
-    fclose(f);
-    free(out);
     doc.dirty = 0;
     return 1;
 }
@@ -581,7 +559,10 @@ int main(int argc, char *argv[]) {
         strncpy(docname, argv[1], sizeof(docname) - 1);
         docname[sizeof(docname) - 1] = '\0';
         strupr(docname);
-        load_file(docname);
+        if (!load_file(docname)) {
+            printf("EDIT: cannot load %s (too large?)\n", docname);
+            return 1;
+        }
     }
 
     /* keeps save_file referenced until Task 7 wires it to the File menu */

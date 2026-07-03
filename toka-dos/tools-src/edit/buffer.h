@@ -2,6 +2,8 @@
 #ifndef BUFFER_H
 #define BUFFER_H
 
+#include <stdio.h>
+
 #define BUF_MAX_LINE 255
 #define BUF_MAX_LOAD 409600L /* 400 KB */
 /* Fits a 16-bit int with headroom. A 400 KB document can in theory exceed
@@ -29,9 +31,22 @@ void buf_free(Buf *b);
  * are valid strings); the only additional requirement after a refusal is
  * that buf_free or another buf_load work correctly, and both do. */
 int  buf_load(Buf *b, const char *data, long n);
-/* serialized size (every line + CRLF) and serialization for save */
+/* serialized size (every line + CRLF) and serialization for save.
+ * Memory-block helpers: used by the host test harness, NOT by the DOS
+ * save path (a single malloc cannot exceed 64 KB in the 16-bit build). */
 long buf_save_size(const Buf *b);
 void buf_serialize(const Buf *b, char *out); /* writes exactly buf_save_size bytes */
+
+/* stream I/O: no whole-file staging (a single allocation cannot exceed
+ * 64 KB on the 16-bit DOS build). Same semantics as buf_load/serialize.
+ * buf_load_stream: 1 ok, 0 oom/too-big/line-too-long/read-error.
+ * buf_save_stream: 1 ok, 0 write error.
+ * Difference from buf_load: the stream loader treats 0x1A as end-of-input
+ * (stops reading at the FIRST 0x1A, rather than stripping one trailing
+ * 0x1A from an in-memory block); for a text editor this is period-correct
+ * DOS behavior. */
+int buf_load_stream(Buf *b, FILE *f);
+int buf_save_stream(const Buf *b, FILE *f);
 
 /* editing (row 0-based, col 0..len; all return 1 ok, 0 refused/oom) */
 int  buf_insert_char(Buf *b, int row, int col, char ch);

@@ -163,6 +163,106 @@ static void test_insert_text_oom_atomic(void) {
 }
 #endif
 
+/* tmpfile() opens in TEXT mode on this host CRT, which mangles 0x1A and
+ * CRLF bytes on readback; the stream I/O under test is byte-exact and
+ * must be tested through a BINARY-mode temp file instead. Callers close
+ * with close_tmp_binary(), which also removes the backing file. */
+static char tmp_name[L_tmpnam];
+static FILE *open_tmp_binary(void) {
+    FILE *f;
+    assert(tmpnam(tmp_name));
+    f = fopen(tmp_name, "wb+");
+    assert(f);
+    return f;
+}
+static void close_tmp_binary(FILE *f) {
+    fclose(f);
+    remove(tmp_name);
+}
+
+static void assert_bufs_equal(const Buf *a, const Buf *b) {
+    int i;
+    assert(a->nlines == b->nlines);
+    for (i = 0; i < a->nlines; i++) {
+        assert(a->lens[i] == b->lens[i]);
+        assert(memcmp(a->lines[i], b->lines[i], (size_t)a->lens[i]) == 0);
+    }
+}
+
+static void test_stream_roundtrip(void) {
+    Buf a, c;
+    FILE *tf;
+    char *big;
+    long i, col;
+
+    /* small multi-line case with tab-expanded content */
+    a = load("one\r\ntwo\tthree\r\n\r\nlast line no newline");
+    tf = open_tmp_binary();
+    assert(buf_save_stream(&a, tf));
+    rewind(tf);
+    assert(buf_init(&c));
+    assert(buf_load_stream(&c, tf));
+    assert_bufs_equal(&a, &c);
+    buf_free(&c);
+    close_tmp_binary(tf);
+    buf_free(&a);
+
+    /* >70,000 bytes total: 300 lines x 250 chars, pins streaming + byte
+     * counting past what a single 16-bit malloc could ever stage. */
+    big = malloc((size_t)(300 * 251) + 1);
+    assert(big);
+    col = 0;
+    for (i = 0; i < 300; i++) {
+        int j;
+        for (j = 0; j < 250; j++) big[col++] = (char)('A' + (j % 26));
+        big[col++] = '\n';
+    }
+    big[col] = 0;
+    assert(buf_init(&a));
+    assert(buf_load(&a, big, col));
+    free(big);
+
+    tf = open_tmp_binary();
+    assert(buf_save_stream(&a, tf));
+    rewind(tf);
+    assert(buf_init(&c));
+    assert(buf_load_stream(&c, tf));
+    assert_bufs_equal(&a, &c);
+    buf_free(&c);
+    close_tmp_binary(tf);
+    buf_free(&a);
+}
+
+static void test_stream_stops_at_eof_char(void) {
+    FILE *tf = open_tmp_binary();
+    Buf b;
+    fwrite("abc\r\n\x1a" "def\r\n", 1, 11, tf);
+    rewind(tf);
+    assert(buf_init(&b));
+    assert(buf_load_stream(&b, tf));
+    assert(b.nlines == 1);
+    assert(strcmp(b.lines[0], "abc") == 0);
+    buf_free(&b);
+    close_tmp_binary(tf);
+}
+
+static void test_stream_refuses_too_large(void) {
+    FILE *tf = open_tmp_binary();
+    Buf b;
+    char chunk[1024];
+    long written = 0;
+    memset(chunk, 'x', sizeof chunk);
+    while (written < 410000L) {
+        fwrite(chunk, 1, sizeof chunk, tf);
+        written += (long)sizeof chunk;
+    }
+    rewind(tf);
+    assert(buf_init(&b));
+    assert(!buf_load_stream(&b, tf)); /* refused, not a crash */
+    buf_free(&b);
+    close_tmp_binary(tf);
+}
+
 static void test_find(void) {
     Buf b = load("The cat\r\nsat on the CAT\r\n");
     int fr, fc;
@@ -188,6 +288,9 @@ int main(void) {
 #ifdef BUF_TEST_ALLOC
     test_insert_text_oom_atomic();
 #endif
+    test_stream_roundtrip();
+    test_stream_stops_at_eof_char();
+    test_stream_refuses_too_large();
     test_find();
 #ifdef BUF_TEST_ALLOC
     assert(buf_test_alloc_balance() == 0);
