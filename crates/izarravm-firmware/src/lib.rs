@@ -211,7 +211,7 @@ pub fn irq5ip0_com() -> &'static [u8] {
     IRQ5IP0_COM
 }
 
-/// The SP-4b M2 default-off contract fixture (bare DEVICE=C:\TOKAEMM.SYS): the
+/// The SP-4b M2 default-off contract fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): the
 /// manager must answer INT 67h frameless — present, version 4.0, zero pages,
 /// 41h returns 80h, allocation refused with 87h. Signals 0xA5 / 0xEn.
 pub fn emsnone_com() -> &'static [u8] {
@@ -240,8 +240,8 @@ pub fn umbmech_com() -> &'static [u8] {
 /// at SYSINIT, builds a load-relative protected-mode + paging + ring-0 monitor
 /// environment in its own resident memory, then IRETDs the running kernel into
 /// virtual-8086 mode — so the rest of DOS boots and runs virtualized under the
-/// monitor. It stays resident permanently. Overlaid onto C: and loaded via
-/// `DEVICE=C:\TOKAEMM.SYS`.
+/// monitor. It stays resident permanently. Overlaid into C:\DOS and loaded via
+/// `DEVICE=C:\DOS\TOKAEMM.SYS`.
 pub fn tokaemm_sys() -> &'static [u8] {
     TOKAEMM_SYS
 }

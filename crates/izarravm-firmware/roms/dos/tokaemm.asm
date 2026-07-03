@@ -107,7 +107,7 @@ UMB_SLOT  equ 6
 umb_table: times UMB_SLOTS*UMB_SLOT db 0
 
 ; ---- SP-4b M2 EMS state (resident; reached via cs: overrides from V86) ----
-; Default-off: DEVICE=C:\TOKAEMM.SYS presents a frameless manager (INT 67h
+; Default-off: DEVICE=C:\DOS\TOKAEMM.SYS presents a frameless manager (INT 67h
 ; answers present/version/0 pages, like EMM386 NOEMS); the RAM argument
 ; provisions the page frame [0xE000,0xF000) + a backing pool carved from
 ; extended RAM just past the UMB backing, and the UMB window shrinks to

@@ -1,5 +1,5 @@
 ; emstest.com — SP-4b M2 EMS e2e fixture. Runs in V86 under TOKAEMM loaded with
-; DEVICE=C:\TOKAEMM.SYS RAM (the page frame provisioned).
+; DEVICE=C:\DOS\TOKAEMM.SYS RAM (the page frame provisioned).
 ;
 ; version -> frame segment -> page counts -> allocate 4 pages -> map logical
 ; pages through the frame slots, writing distinct patterns and reading them

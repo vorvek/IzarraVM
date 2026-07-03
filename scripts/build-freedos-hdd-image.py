@@ -10,8 +10,10 @@ Layout:
                                 disk-absolute. FSInfo at +1, backup boot at +6.
   PART_START + reserved         FAT #1, then FAT #2.
   data region                   root directory (cluster 2) holds KERNEL.SYS FIRST
-                                (FreeDOS requires it), then the shell, CONFIG.SYS,
-                                AUTOEXEC.BAT, and HELLO.TXT.
+                                (hidden; FreeDOS requires it in the root), then
+                                CONFIG.SYS, AUTOEXEC.BAT, LICENSE.TXT, and a DOS
+                                subdirectory. C:\\DOS holds COMMAND.COM and every
+                                command-line tool, so the root stays uncluttered.
 
 The FAT32 BPB field values follow the same fatgen103 math as
 crates/izarravm-machine/src/fat32.rs (the Rust reference): DskTableFAT32 cluster
@@ -169,24 +171,35 @@ def extract_from_image(img):
         assert len(out) >= size, f"FAT chain shorter than the directory size ({len(out)} < {size})"
         return bytes(out[:size])
 
+    # Walk a directory's cluster chain, flattening files by bare 8.3 name and
+    # recursing one level into subdirectories (the C:\DOS system folder). Files in
+    # different directories have distinct names here, so flattening is unambiguous.
     files = []
-    c = root_clu
-    while 2 <= c < 0x0FFFFFF8:
-        off = data_off + (c - 2) * cluster_bytes
-        for e in range(0, cluster_bytes, 32):
-            de = img[off + e:off + e + 32]
-            if de[0] == 0x00:
-                break
-            if de[0] == 0xE5 or de[11] == 0x0F or de[11] & 0x08:
-                continue
-            base = de[0:8].decode("ascii").rstrip()
-            ext = de[8:11].decode("ascii").rstrip()
-            name = f"{base}.{ext}" if ext else base
-            first = (struct.unpack_from("<H", de, 0x14)[0] << 16) | \
-                struct.unpack_from("<H", de, 0x1A)[0]
-            size = struct.unpack_from("<I", de, 0x1C)[0]
-            files.append((name, chain_bytes(first, size)))
-        c = fat_entry(c)
+
+    def walk_dir(dir_clu):
+        c = dir_clu
+        while 2 <= c < 0x0FFFFFF8:
+            off = data_off + (c - 2) * cluster_bytes
+            for e in range(0, cluster_bytes, 32):
+                de = img[off + e:off + e + 32]
+                if de[0] == 0x00:
+                    return  # no further entries in this directory
+                if de[0] == 0xE5 or de[11] == 0x0F or de[11] & 0x08:
+                    continue  # deleted, LFN fragment, or volume label
+                base = de[0:8].decode("ascii").rstrip()
+                ext = de[8:11].decode("ascii").rstrip()
+                name = f"{base}.{ext}" if ext else base
+                first = (struct.unpack_from("<H", de, 0x14)[0] << 16) | \
+                    struct.unpack_from("<H", de, 0x1A)[0]
+                if de[11] & 0x10:  # subdirectory
+                    if base not in (".", ".."):
+                        walk_dir(first)
+                    continue
+                size = struct.unpack_from("<I", de, 0x1C)[0]
+                files.append((name, chain_bytes(first, size)))
+            c = fat_entry(c)
+
+    walk_dir(root_clu)
     return bytearray(img[0:512]), bytearray(vbr), dict(files)
 
 
@@ -264,17 +277,20 @@ def main():
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). SP-4b M4 defaults: TOKAEMM
     # loads as the memory manager (frameless NOEMS; the system runs in V86 under
     # its monitor), DOS=HIGH,UMB uses the HMA + TOKAEMM's UMBs, LASTDRIVE=D
-    # covers A: floppy / C: HDD / D: CD-ROM without wasting CDS entries.
+    # covers A: floppy / C: HDD / D: CD-ROM without wasting CDS entries. The system
+    # binaries live in C:\DOS (see the file layout below), so DEVICE= and SHELL=
+    # name that subdirectory; only CONFIG.SYS/AUTOEXEC.BAT stay in the root. The
+    # SHELL= dir argument (C:\DOS) is where FreeCOM builds COMSPEC from.
     config_sys = (b"FILES=40\r\nLASTDRIVE=D\r\n"
-                  b"DEVICE=C:\\TOKAEMM.SYS NOEMS\r\n"
+                  b"DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n"
                   b"DOS=HIGH,UMB\r\n"
-                  b"SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
-    # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH lets
-    # the external commands (MOVE/SORT/MEM) resolve from any current directory.
-    # SET BLASTER advertises the emulated SB16 (base 0x220, IRQ5, DMA1, high DMA5,
-    # type 6 SB16); no P (MPU-401) param -- no MPU is emulated. LH loads the INT
-    # 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load if none fits).
-    autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\\r\n"
+                  b"SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
+    # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS
+    # lets the command-line tools (MOVE/SORT/MEM/...) and TOKAMOUS resolve from any
+    # current directory. SET BLASTER advertises the emulated SB16 (base 0x220, IRQ5,
+    # DMA1, high DMA5, type 6 SB16); no P (MPU-401) param -- no MPU is emulated. LH
+    # loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load).
+    autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n"
                 b"SET BLASTER=A220 I5 D1 H5 T6\r\nLH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
     # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
@@ -319,34 +335,49 @@ def main():
     bk_off = part_off + BACKUP_BOOT_SECTOR * BPS
     img[bk_off:bk_off + 512] = vbr
 
-    # --- files (KERNEL.SYS first) ---------------------------------------------
-    files = [
-        ("KERNEL.SYS", kernel),
-        ("COMMAND.COM", shell),
-        ("CONFIG.SYS", config_sys),
-        ("AUTOEXEC.BAT", autoexec),
-        ("TOKAMOUS.COM", tokamous),
-        ("TOKAEMM.SYS", tokaemm),
-        ("GSWMODE.COM", gswmode),
-        ("MOVE.EXE", move),
-        ("SORT.EXE", sort),
-        ("MEM.EXE", mem),
+    # --- files -----------------------------------------------------------------
+    # Only KERNEL.SYS, CONFIG.SYS and AUTOEXEC.BAT are truly forced to the root:
+    # the boot sector loads KERNEL.SYS by root-directory name, and the kernel opens
+    # CONFIG.SYS (then, via SHELL=, AUTOEXEC.BAT) from the boot-drive root. LICENSE.TXT
+    # stays at root too, because the kernel signon points at "See C:\LICENSE.TXT".
+    # Everything else -- COMMAND.COM and the command-line tools -- lives in C:\DOS so
+    # a plain DIR of the root isn't buried under system files. KERNEL.SYS carries the
+    # hidden+system+read-only attributes (0x27, the DOS convention for IO.SYS/
+    # MSDOS.SYS) so it doesn't show in DIR either; the boot sector matches it by name
+    # and never reads the attribute byte, so hiding it is safe.
+    ATTR_ARCHIVE = 0x20
+    ATTR_HIDDEN_SYS = 0x27  # archive | read-only | hidden | system
+    ATTR_SUBDIR = 0x10
+    root_files = [
+        ("KERNEL.SYS", kernel, ATTR_HIDDEN_SYS),  # first, per FreeDOS SYS convention
+        ("CONFIG.SYS", config_sys, ATTR_ARCHIVE),
+        ("AUTOEXEC.BAT", autoexec, ATTR_ARCHIVE),
+        ("LICENSE.TXT", license_txt, ATTR_ARCHIVE),
+    ]
+    dos_files = [
+        ("COMMAND.COM", shell, ATTR_ARCHIVE),
+        ("TOKAMOUS.COM", tokamous, ATTR_ARCHIVE),
+        ("TOKAEMM.SYS", tokaemm, ATTR_ARCHIVE),
+        ("GSWMODE.COM", gswmode, ATTR_ARCHIVE),
+        ("MOVE.EXE", move, ATTR_ARCHIVE),
+        ("SORT.EXE", sort, ATTR_ARCHIVE),
+        ("MEM.EXE", mem, ATTR_ARCHIVE),
         # Audit items 3+10 external tool batch (see VENDOR.md).
-        ("ATTRIB.EXE", attrib),
-        ("CHOICE.EXE", choice),
-        ("MORE.EXE", more),
-        ("FIND.EXE", find),
-        ("LABEL.EXE", label),
-        ("DELTREE.COM", deltree),
+        ("ATTRIB.EXE", attrib, ATTR_ARCHIVE),
+        ("CHOICE.EXE", choice, ATTR_ARCHIVE),
+        ("MORE.EXE", more, ATTR_ARCHIVE),
+        ("FIND.EXE", find, ATTR_ARCHIVE),
+        ("LABEL.EXE", label, ATTR_ARCHIVE),
+        ("DELTREE.COM", deltree, ATTR_ARCHIVE),
         # Original Toka-DOS project tool (GPL-3, not vendored) -- see
         # toka-dos/tools-src/README.md and toka-dos/msdos4/VENDOR.md.
-        ("XCOPY.EXE", xcopy),
-        ("HELLO.TXT", hello_txt),
-        ("LICENSE.TXT", license_txt),
+        ("XCOPY.EXE", xcopy, ATTR_ARCHIVE),
+        ("HELLO.TXT", hello_txt, ATTR_ARCHIVE),
     ]
 
     # Allocate cluster chains, write file data into the data region, and build the
-    # root directory entries (the root is itself a cluster chain starting at 2).
+    # two directories: the root (a cluster chain starting at ROOT_CLUSTER=2) and the
+    # DOS subdirectory (its own chain, allocated right after the root).
     fat = {0: 0x0FFFFFF8, 1: FAT32_EOC}  # FAT[0] media + EOC bits, FAT[1] EOC
 
     def alloc_chain(start, nclu):
@@ -354,47 +385,76 @@ def main():
             c = start + i
             fat[c] = FAT32_EOC if i == nclu - 1 else c + 1
 
-    # Root directory: reserve enough clusters up front for every file entry
-    # (32 bytes each), THEN allocate file data clusters after it, so the root
-    # chain's own length doesn't shift under file data placed earlier. One
-    # cluster held every file while the payload was small (audit item 10 and
-    # earlier); the audit item 3+10 tool batch grew the root past 16 entries
-    # (this image's cluster size is 1 sector = 512 bytes = 16 dir entries), so
-    # the root directory is now a real multi-cluster chain like any other file.
-    entries_per_cluster = cluster_bytes // 32
-    root_clusters = max(1, -(-len(files) // entries_per_cluster))  # ceil div
-    alloc_chain(ROOT_CLUSTER, root_clusters)
-    next_free = ROOT_CLUSTER + root_clusters
-    root = bytearray()
-
-    for fn, data in files:
+    def write_file_data(first, data):
+        """Write `data` into the contiguous cluster run starting at `first`, set its
+        FAT chain, and return the cluster count consumed."""
         nclu = max(1, (len(data) + cluster_bytes - 1) // cluster_bytes)
-        first = next_free
-        assert first + nclu - 1 <= count_of_clusters + 1, f"out of clusters writing {fn}"
+        assert first + nclu - 1 <= count_of_clusters + 1, "out of clusters"
         alloc_chain(first, nclu)
         for i in range(nclu):
             c = first + i
             off = data_off + (c - ROOT_CLUSTER) * cluster_bytes
             chunk = data[i * cluster_bytes:(i + 1) * cluster_bytes]
             img[off:off + len(chunk)] = chunk
-        next_free += nclu
-        # 32-byte directory entry: 8.3 name, archive attr, cluster split hi/lo, size.
+        return nclu
+
+    def dir_entry(name11_field, first, size, attr):
+        """A 32-byte directory entry from a pre-folded 11-byte name field."""
         de = bytearray(32)
-        de[0:11] = name11(fn)
-        de[11] = 0x20  # archive
+        de[0:11] = name11_field
+        de[11] = attr
         struct.pack_into("<H", de, 0x14, (first >> 16) & 0xFFFF)  # FstClusHI
         struct.pack_into("<H", de, 0x1A, first & 0xFFFF)          # FstClusLO
-        struct.pack_into("<I", de, 0x1C, len(data))               # file size
-        root += de
+        struct.pack_into("<I", de, 0x1C, size)                    # file size
+        return de
+
+    entries_per_cluster = cluster_bytes // 32
+
+    # Reserve both directory chains up front (root at 2, then DOS), THEN allocate
+    # file-data clusters after them, so a directory chain's length never shifts under
+    # file data placed earlier. This image's cluster size is 1 sector = 512 bytes =
+    # 16 dir entries, so a directory past 16 entries is a real multi-cluster chain.
+    root_entries = len(root_files) + 1  # + the DOS subdir entry
+    root_clusters = max(1, -(-root_entries // entries_per_cluster))
+    alloc_chain(ROOT_CLUSTER, root_clusters)
+    next_free = ROOT_CLUSTER + root_clusters
+
+    dos_first = next_free
+    dos_entries = 2 + len(dos_files)  # '.' + '..' + the files
+    dos_clusters = max(1, -(-dos_entries // entries_per_cluster))
+    alloc_chain(dos_first, dos_clusters)
+    next_free += dos_clusters
+
+    # Root directory: each root file, then the DOS subdir entry.
+    root = bytearray()
+    for name, data, attr in root_files:
+        first = next_free
+        next_free += write_file_data(first, data)
+        root += dir_entry(name11(name), first, len(data), attr)
+    root += dir_entry(name11("DOS"), dos_first, 0, ATTR_SUBDIR)
+
+    # DOS directory: '.' (own cluster) + '..' (0, since the parent is the root, per
+    # fatgen103 6.5) + each tool. Its clusters were reserved above, so writing one
+    # span across them lands correctly.
+    dos = bytearray()
+    dos += dir_entry(b".          ", dos_first, 0, ATTR_SUBDIR)
+    dos += dir_entry(b"..         ", 0, 0, ATTR_SUBDIR)
+    for name, data, attr in dos_files:
+        first = next_free
+        next_free += write_file_data(first, data)
+        dos += dir_entry(name11(name), first, len(data), attr)
 
     assert len(root) <= root_clusters * cluster_bytes, \
         f"root directory ({len(root)} bytes) overflows its {root_clusters}-cluster chain"
+    assert len(dos) <= dos_clusters * cluster_bytes, \
+        f"DOS directory ({len(dos)} bytes) overflows its {dos_clusters}-cluster chain"
 
-    # Write the root directory starting at cluster 2. Its clusters
-    # (2 .. 2+root_clusters-1) are contiguous (allocated first, above), so one
-    # write spanning `len(root)` bytes lands correctly across the whole chain.
+    # Both directory chains are contiguous (allocated first, in order), so each is one
+    # write spanning its full byte length.
     root_off = data_off + (ROOT_CLUSTER - ROOT_CLUSTER) * cluster_bytes
     img[root_off:root_off + len(root)] = root
+    dos_off = data_off + (dos_first - ROOT_CLUSTER) * cluster_bytes
+    img[dos_off:dos_off + len(dos)] = dos
 
     # --- serialize both FATs --------------------------------------------------
     fat_bytes = bytearray(fatsz * BPS)

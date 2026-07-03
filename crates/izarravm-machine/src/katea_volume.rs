@@ -132,21 +132,25 @@ pub struct SystemPayload {
     pub mbr: [u8; SECTOR],
     /// The FAT32 VBR at `PART_START`.
     pub vbr: [u8; SECTOR],
-    /// Root-directory files in directory order as `(8.3 name, contents)`.
+    /// Every file on the volume as `(8.3 name, contents)`: the root files, then
+    /// each subdirectory's files (the `C:\DOS` system folder). Flattened by bare
+    /// name — names are unique across the layout, and the overlay re-derives
+    /// placement from [`crate::katea_tree`]'s system-binary list.
     pub files: Vec<(String, Vec<u8>)>,
 }
 
 /// Pull the system payload back out of a whole-disk FAT32 image laid out exactly
 /// like `tokados-hdd.img` — the inverse of the Python image builder. Returns the
-/// MBR (LBA 0), the partition's VBR (the sector at `PART_START`), and the root
-/// files in directory order.
+/// MBR (LBA 0), the partition's VBR (the sector at `PART_START`), and every file,
+/// walking the root and descending one level into subdirectories (`C:\DOS`).
 ///
 /// This reads the BPB straight from the image rather than trusting the module
 /// constants, so a malformed or unexpected image surfaces as a panic here rather
 /// than a silent mismatch: it reads RESERVED, NUM_FATS, FATSz32, RootClus, and
 /// spc out of the VBR and walks the on-disk FAT chains, concatenating cluster
 /// bytes truncated to each entry's file size. LFN (attr 0x0F), volume-label
-/// (attr bit 0x08), free (0x00), and deleted (0xE5) entries are skipped.
+/// (attr bit 0x08), free (0x00), and deleted (0xE5) entries are skipped, and
+/// `.`/`..` subdirectory links are not followed.
 ///
 /// Panics only on a truncated/garbled image (the embedded one is well formed, and
 /// the round-trip test guards regressions).
@@ -211,27 +215,42 @@ pub fn extract_system_payload(image: &[u8]) -> SystemPayload {
         panic!("katea: cluster chain from {first} exceeds the disk; corrupt FAT")
     };
 
-    // Walk the root directory (a cluster chain starting at RootClus), parsing
-    // 32-byte entries.
-    let root_bytes = read_chain(root_clus);
+    // Walk the root directory (a cluster chain starting at RootClus) and descend one
+    // level into any subdirectory (the C:\DOS system folder), parsing 32-byte
+    // entries. `visited` bounds the walk against a cyclic/guest-crafted tree.
     let mut files = Vec::new();
-    for entry in root_bytes.chunks_exact(32) {
-        match entry[0] {
-            0x00 => break,    // no further entries in this directory
-            0xE5 => continue, // deleted
-            _ => {}
-        }
-        let attr = entry[11];
-        if attr == 0x0F || attr & 0x08 != 0 {
-            // LFN fragment or the volume label: not a file.
+    let mut work = vec![root_clus];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(dir_clus) = work.pop() {
+        if !visited.insert(dir_clus) {
             continue;
         }
-        let name = decode_83(&entry[0..11]);
-        let first = (le16(entry, 0x14) as u32) << 16 | le16(entry, 0x1A) as u32;
-        let size = le32(entry, 0x1C);
-        let mut data = read_chain(first);
-        data.truncate(size as usize);
-        files.push((name, data));
+        let dir_bytes = read_chain(dir_clus);
+        for entry in dir_bytes.chunks_exact(32) {
+            match entry[0] {
+                0x00 => break,    // no further entries in this directory
+                0xE5 => continue, // deleted
+                _ => {}
+            }
+            let attr = entry[11];
+            if attr == 0x0F || attr & 0x08 != 0 {
+                // LFN fragment or the volume label: not a file.
+                continue;
+            }
+            let name = decode_83(&entry[0..11]);
+            let first = (le16(entry, 0x14) as u32) << 16 | le16(entry, 0x1A) as u32;
+            if attr & 0x10 != 0 {
+                // Subdirectory: descend, but never follow the '.'/'..' links.
+                if name != "." && name != ".." {
+                    work.push(first);
+                }
+                continue;
+            }
+            let size = le32(entry, 0x1C);
+            let mut data = read_chain(first);
+            data.truncate(size as usize);
+            files.push((name, data));
+        }
     }
 
     SystemPayload { mbr, vbr, files }
@@ -365,8 +384,8 @@ mod tests {
         let config = by_name.get("CONFIG.SYS").expect("CONFIG.SYS present");
         let config_text = String::from_utf8_lossy(config);
         assert!(
-            config_text.contains("DEVICE=C:\\TOKAEMM.SYS NOEMS"),
-            "default CONFIG.SYS loads TOKAEMM"
+            config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS"),
+            "default CONFIG.SYS loads TOKAEMM from C:\\DOS"
         );
         assert!(
             config_text.contains("DOS=HIGH,UMB"),

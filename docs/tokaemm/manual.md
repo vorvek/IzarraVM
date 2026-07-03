@@ -10,13 +10,13 @@ and upper memory blocks (UMBs), in the tradition of EMM386.EXE on a real
 `CONFIG.SYS` loads TOKAEMM as a device driver, before `DOS=HIGH,UMB`:
 
 ```
-DEVICE=C:\TOKAEMM.SYS [NOEMS | RAM]
+DEVICE=C:\DOS\TOKAEMM.SYS [NOEMS | RAM]
 ```
 
 The Toka-DOS default ships as:
 
 ```
-DEVICE=C:\TOKAEMM.SYS NOEMS
+DEVICE=C:\DOS\TOKAEMM.SYS NOEMS
 DOS=HIGH,UMB
 ```
 
@@ -65,7 +65,7 @@ rather than faking it.
 
 ## EMS 4.0 (the RAM keyword)
 
-`DEVICE=C:\TOKAEMM.SYS RAM` turns on Lotus/Intel/Microsoft Expanded Memory
+`DEVICE=C:\DOS\TOKAEMM.SYS RAM` turns on Lotus/Intel/Microsoft Expanded Memory
 Specification 4.0 support: a 64 KB page frame at segment `E000`, mapped in
 16 KB pages backed by a 4 MB pool of extended memory. Software that checks
 for EMS the standard way — looking for the `EMMXXXX0` device name — finds
@@ -82,7 +82,7 @@ it on for software that specifically wants EMS pages rather than XMS.
 the HMA (moving most of the resident kernel above the 1 MB line, out of
 conventional memory) and enables the UMB loading described above. Both
 depend on TOKAEMM already being loaded as a device driver, which is why
-`DEVICE=C:\TOKAEMM.SYS` comes before the `DOS=` line.
+`DEVICE=C:\DOS\TOKAEMM.SYS` comes before the `DOS=` line.
 
 ## A20
 

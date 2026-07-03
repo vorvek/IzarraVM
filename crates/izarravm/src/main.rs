@@ -2161,9 +2161,11 @@ mod tokados_smoke {
             "VER not echoed at the C: prompt.\n{ver_text}"
         );
 
-        // DIR C: must list the test file from the FAT32 root directory, proving the
-        // kernel read the volume's filesystem.
-        for ch in "dir c:\\\r".chars() {
+        // DIR C:\DOS must list a system binary from the DOS subdirectory, proving
+        // the kernel read the volume's filesystem AND descended into the subdir where
+        // the tools now live (the root itself holds only KERNEL.SYS (hidden),
+        // CONFIG.SYS, AUTOEXEC.BAT and LICENSE.TXT).
+        for ch in "dir c:\\dos\r".chars() {
             for code in ascii_to_set1(ch) {
                 machine.inject_key_scancodes(&[code]);
             }
@@ -2176,8 +2178,8 @@ mod tokados_smoke {
             .expect("settle dir");
         let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
         assert!(
-            dir_text.contains("hello"),
-            "DIR C: did not list HELLO.TXT off the FAT32 volume.\n{dir_text}"
+            dir_text.contains("command"),
+            "DIR C:\\DOS did not list COMMAND.COM off the FAT32 volume.\n{dir_text}"
         );
     }
 
@@ -2645,7 +2647,7 @@ del PREEXIST.TXT\r\n";
         );
     }
 
-    /// SP-4b M0 GO/NO-GO: `DEVICE=C:\TOKAEMM.SYS` puts the running kernel into V86
+    /// SP-4b M0 GO/NO-GO: `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
     /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
     /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
     /// onward runs virtualized. The gate: the DOS prompt reaches the screen.
@@ -2669,8 +2671,8 @@ del PREEXIST.TXT\r\n";
 
         // The stock CONFIG.SYS (from the committed image) plus a DEVICE= line for
         // the bespoke driver. Passed as an override so it replaces the system copy.
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
 
         let mut machine = Machine::new(
@@ -2741,10 +2743,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nXMSTEST\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nXMSTEST\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -2799,10 +2801,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nUMBTEST\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -2855,10 +2857,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nUMBMECH\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBMECH\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -2913,10 +2915,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS RAM\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nEMSTEST\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSTEST\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -2970,10 +2972,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\TOKAEMM.SYS RAM\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nUMBTEST\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -3026,10 +3028,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nEMSNONE\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSNONE\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -3090,7 +3092,7 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         // The seeding wrote real, editable defaults into the user folder.
         let seeded = std::fs::read_to_string(dir.join("CONFIG.SYS")).expect("seeded CONFIG.SYS");
         assert!(
-            seeded.contains("DEVICE=C:\\TOKAEMM.SYS NOEMS") && seeded.contains("DOS=HIGH,UMB"),
+            seeded.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS") && seeded.contains("DOS=HIGH,UMB"),
             "seeded CONFIG.SYS lacks the M4 defaults:\n{seeded}"
         );
 
@@ -3178,10 +3180,11 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
         let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
-DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nGSWMODE 486\r\nVER\r\nGSWMODE 586\r\n".to_vec();
+        let autoexec =
+            b"@ECHO OFF\r\nPATH C:\\DOS\r\nGSWMODE 486\r\nVER\r\nGSWMODE 586\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -3270,10 +3273,11 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
         let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
-DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nGSWMODE 286\r\nVER\r\nGSWMODE 586\r\n".to_vec();
+        let autoexec =
+            b"@ECHO OFF\r\nPATH C:\\DOS\r\nGSWMODE 286\r\nVER\r\nGSWMODE 586\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -3388,8 +3392,8 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let config = b"FILES=40\r\nLASTDRIVE=D\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+        let config = b"FILES=40\r\nLASTDRIVE=D\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
@@ -3546,10 +3550,11 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
         let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
-DEVICE=C:\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nGSWMODE 286\r\nUDPROBE\r\nGSWMODE 586\r\n".to_vec();
+        let autoexec =
+            b"@ECHO OFF\r\nPATH C:\\DOS\r\nGSWMODE 286\r\nUDPROBE\r\nGSWMODE 586\r\n".to_vec();
 
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
@@ -3633,9 +3638,9 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nVER\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVER\r\n".to_vec();
         let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         profile.cpu = GswMode::Gsw286;
         profile.clock_hz = GswMode::Gsw286.clock_hz();
@@ -3702,10 +3707,10 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         // No DOS=HIGH,UMB: with TOKAEMM declining to install there is no XMS
         // provider, and this test is about the INIT bail, not kernel warnings.
         let config = b"FILES=40\r\nLASTDRIVE=D\r\n\
-DEVICE=C:\\TOKAEMM.SYS NOEMS\r\n\
-SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
-        let autoexec = b"@ECHO OFF\r\nVER\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVER\r\n".to_vec();
 
         let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         profile.cpu = GswMode::Gsw286;
@@ -3778,7 +3783,8 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let autoexec = format!("@ECHO OFF\r\nLH TOKAMOUS\r\nMEM {mem_args}\r\n").into_bytes();
+        let autoexec =
+            format!("@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM {mem_args}\r\n").into_bytes();
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -3877,7 +3883,7 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let autoexec = b"@ECHO OFF\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -3941,7 +3947,7 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         // A two-line text file so FIND's match is unambiguous against the
         // non-matching line right next to it.
         let hello_txt = b"Hello from Toka-DOS\r\nWelcome to the IZARRA 3000\r\n".to_vec();
-        let autoexec = b"@ECHO OFF\r\n\
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\n\
 ATTRIB +R HELLO.TXT\r\n\
 ATTRIB HELLO.TXT\r\n\
 ECHO Y | CHOICE /C:YN Continue\r\n\
@@ -4020,7 +4026,7 @@ FIND \"IZARRA\" HELLO.TXT\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let autoexec = b"@ECHO OFF\r\n\
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\n\
 MD SRC\r\n\
 ECHO hello > SRC\\A.TXT\r\n\
 MD SRC\\SUB\r\n\
@@ -4096,7 +4102,7 @@ DIR DEST\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let autoexec = b"@ECHO OFF\r\nLH TOKAMOUS\r\nMOUSETST\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMOUSETST\r\n".to_vec();
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -4155,7 +4161,7 @@ DIR DEST\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let autoexec = b"@ECHO OFF\r\nSNDTST\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nSNDTST\r\n".to_vec();
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -4213,7 +4219,7 @@ DIR DEST\r\n"
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
 
-        let autoexec = b"@ECHO OFF\r\nIRQ5IP0\r\n".to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nIRQ5IP0\r\n".to_vec();
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -4288,7 +4294,7 @@ DIR DEST\r\n"
                     corpus_dir,
                     vec![(
                         "AUTOEXEC.BAT".to_string(),
-                        b"@ECHO OFF\r\nPRINCE ADLIB\r\n".to_vec(),
+                        b"@ECHO OFF\r\nPATH C:\\DOS\r\nPRINCE ADLIB\r\n".to_vec(),
                     )],
                 )
                 .expect("mount corpus folder");

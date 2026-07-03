@@ -70,25 +70,86 @@ pub(crate) struct HostTree {
     pub root: TreeDir,
 }
 
-/// Build the tree from a host folder, overlaying the in-memory system files at
-/// the root first (so the disk still boots). Metadata only — never reads host
-/// file contents. Cluster fields are zero here; Task 4 assigns them.
+/// The Toka-DOS system binaries that the overlay places in a synthetic `C:\DOS`
+/// folder rather than the boot-drive root, so the host-folder root isn't buried
+/// under system files. This is the executable subset of the committed image's
+/// `dos_files` (`scripts/build-freedos-hdd-image.py`). NOT here — and therefore
+/// left at the root — are the boot/kernel-required files (KERNEL.SYS, CONFIG.SYS,
+/// AUTOEXEC.BAT), LICENSE.TXT (the kernel signon points at `C:\LICENSE.TXT`), and
+/// any user or runner file (which stays where it was dropped). HELLO.TXT is
+/// excluded too: it is a data file, so a caller-supplied one stays at the root
+/// where the guest expects it (the image's own demo HELLO.TXT is filtered out of
+/// the overlay before it ever reaches here). Matched case-insensitively against the
+/// overlay's 8.3 names.
+const DOS_FOLDER_BINARIES: &[&str] = &[
+    "COMMAND.COM",
+    "TOKAMOUS.COM",
+    "TOKAEMM.SYS",
+    "GSWMODE.COM",
+    "MOVE.EXE",
+    "SORT.EXE",
+    "MEM.EXE",
+    "ATTRIB.EXE",
+    "CHOICE.EXE",
+    "MORE.EXE",
+    "FIND.EXE",
+    "LABEL.EXE",
+    "DELTREE.COM",
+    "XCOPY.EXE",
+];
+
+/// Build the tree from a host folder, overlaying the in-memory system files (so the
+/// disk still boots). The Toka-DOS binaries land in a synthetic `C:\DOS` subdir;
+/// KERNEL.SYS / CONFIG.SYS / AUTOEXEC.BAT / LICENSE.TXT and any user/runner file
+/// stay at the root. Metadata only — never reads host file contents. Cluster fields
+/// are zero here; Task 4 assigns them.
 pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> HostTree {
     let mut names = NameTable::new();
     let mut dir = TreeDir {
         host_path: root.to_path_buf(),
         ..TreeDir::default()
     };
+    // The synthetic C:\DOS folder. Its files are all InMemory and covered by
+    // `system_names`, so reconcile classifies them Skip and never materializes them:
+    // this folder never touches the host filesystem unless the guest itself writes a
+    // non-system file into C:\DOS.
+    // ponytail: a guest write into C:\DOS would try to materialize under
+    // root/DOS/<file>; atomic_write holds it if that host dir is absent. Fine for the
+    // read-only system folder; revisit only if guests routinely write there.
+    let mut dos = TreeDir {
+        host_path: root.join("DOS"),
+        ..TreeDir::default()
+    };
 
-    // System files first, with their canonical 8.3 names reserved.
+    // System files, with their canonical 8.3 names, split by placement.
     for (name, bytes) in system_files {
         let n = fold_literal_83(name);
-        names.reserve(n);
-        dir.files.push(TreeFile {
+        let file = TreeFile {
             name: n,
             source: FileSource::InMemory(bytes.clone()),
             first_cluster: 0,
             cluster_count: 0,
+        };
+        if DOS_FOLDER_BINARIES
+            .iter()
+            .any(|b| name.eq_ignore_ascii_case(b))
+        {
+            dos.files.push(file);
+        } else {
+            names.reserve(n); // root system files must not be shadowed by a host file
+            dir.files.push(file);
+        }
+    }
+
+    // Attach the C:\DOS folder (reserving its name at the root so a host subfolder
+    // named DOS can't collide), but only when it actually holds binaries — an empty
+    // overlay (e.g. a test with no system files) leaves the root free of a stray DOS.
+    if !dos.files.is_empty() {
+        let dos_name = fold_literal_83("DOS");
+        names.reserve(dos_name);
+        dir.subdirs.push(TreeSubdir {
+            name: dos_name,
+            dir: dos,
         });
     }
 
@@ -738,10 +799,21 @@ impl KateaTreeVolume {
             }
         }
         seed(&tree.root, &mut dir_paths, &mut mirrored);
-        let system_names: HashSet<[u8; 11]> = system_files
+        let mut system_names: HashSet<[u8; 11]> = system_files
             .iter()
             .map(|(name, _)| fold_literal_83(name))
             .collect();
+        // The synthetic C:\DOS folder build_tree creates for the system binaries must
+        // also never be materialized as a real host directory: protect its name so
+        // reconcile's classify() skips the DOS subdir entry (exactly the condition
+        // under which build_tree attaches the folder).
+        if system_files.iter().any(|(name, _)| {
+            DOS_FOLDER_BINARIES
+                .iter()
+                .any(|b| name.eq_ignore_ascii_case(b))
+        }) {
+            system_names.insert(fold_literal_83("DOS"));
+        }
 
         // --- flatten the tree into dirs/files + the sorted run table -----------
         let mut dirs = Vec::new();
@@ -1439,6 +1511,12 @@ mod tests {
         vol.reconcile();
         let got = std::fs::read(root.join("NEW.TXT")).expect("NEW.TXT materialized");
         assert_eq!(got, b"created\r\n");
+        // fresh_vol overlays COMMAND.COM, which lands in the synthetic C:\DOS folder.
+        // That folder is InMemory-only and must never be materialized on the host.
+        assert!(
+            !root.join("DOS").exists(),
+            "the synthetic C:\\DOS folder must not become a real host directory"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1623,22 +1701,41 @@ mod tests {
         fs::create_dir_all(root.join("GAMES/HELLO")).unwrap();
         fs::write(root.join("GAMES/HELLO/HELLO.COM"), vec![0u8; 600]).unwrap();
 
-        // Two in-memory "system" files overlaid at the root (as mount does).
+        // Two in-memory "system" files overlaid (as mount does): KERNEL.SYS stays at
+        // the root, COMMAND.COM is relocated into the synthetic C:\DOS folder.
         let sys = vec![
             ("KERNEL.SYS".to_string(), vec![0xEBu8; 70]),
             ("COMMAND.COM".to_string(), vec![0u8; 50]),
         ];
         let tree = build_tree(&root, &sys);
 
-        // Root: 2 system files + hello.txt + the GAMES subdir.
-        assert_eq!(tree.root.files.len(), 3, "2 system + hello.txt");
-        assert_eq!(tree.root.subdirs.len(), 1, "GAMES");
-        assert_eq!(&tree.root.subdirs[0].name, b"GAMES      ");
+        // Root: KERNEL.SYS + hello.txt, plus the DOS and GAMES subdirs.
+        assert_eq!(tree.root.files.len(), 2, "KERNEL.SYS + hello.txt");
+        assert_eq!(&tree.root.files[0].name, b"KERNEL  SYS");
+        assert_eq!(tree.root.subdirs.len(), 2, "DOS + GAMES");
+        // COMMAND.COM lives in the synthetic DOS folder, not the root.
+        let dos = tree
+            .root
+            .subdirs
+            .iter()
+            .find(|s| &s.name == b"DOS        ")
+            .expect("a synthetic DOS subdir");
+        assert_eq!(dos.dir.files.len(), 1);
+        assert_eq!(&dos.dir.files[0].name, b"COMMAND COM");
+        assert!(
+            !tree.root.files.iter().any(|f| &f.name == b"COMMAND COM"),
+            "COMMAND.COM is not left at the root"
+        );
 
         // GAMES -> HELLO -> HELLO.COM, len read from metadata (not contents).
-        let games = &tree.root.subdirs[0].dir;
-        assert_eq!(games.subdirs.len(), 1);
-        let hello = &games.subdirs[0].dir;
+        let games = tree
+            .root
+            .subdirs
+            .iter()
+            .find(|s| &s.name == b"GAMES      ")
+            .expect("the host GAMES subdir");
+        assert_eq!(games.dir.subdirs.len(), 1);
+        let hello = &games.dir.subdirs[0].dir;
         assert_eq!(hello.files.len(), 1);
         assert_eq!(&hello.files[0].name, b"HELLO   COM");
         assert_eq!(hello.files[0].source.len(), 600);

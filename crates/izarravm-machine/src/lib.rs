@@ -10577,14 +10577,14 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
         0x5658..=0x565b, // VMware backdoor probe (DX=0x5658, EAX='VMXh'): real,
-        // non-VMware hardware has nothing at this port, so a guest's `IN
-        // EAX, DX` detection probe must read open bus (all-ones), never the
-        // VMware magic response and never an UnsupportedPort fault. A dword
-        // IN decomposes into four byte reads at 0x5658-0x565b (the same
-        // io_word_sub_port widening as every other wide port access), so all
-        // four bytes are covered here. JEMMEX runs this probe during its own
-        // hypervisor-presence check and used to halt the machine with
-        // CpuError("unsupported I/O port 0x5658") before this stub existed.
+                         // non-VMware hardware has nothing at this port, so a guest's `IN
+                         // EAX, DX` detection probe must read open bus (all-ones), never the
+                         // VMware magic response and never an UnsupportedPort fault. A dword
+                         // IN decomposes into four byte reads at 0x5658-0x565b (the same
+                         // io_word_sub_port widening as every other wide port access), so all
+                         // four bytes are covered here. JEMMEX runs this probe during its own
+                         // hypervisor-presence check and used to halt the machine with
+                         // CpuError("unsupported I/O port 0x5658") before this stub existed.
     ];
     ranges.into_iter().flatten()
 }

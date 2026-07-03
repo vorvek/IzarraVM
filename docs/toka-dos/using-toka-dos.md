@@ -23,18 +23,30 @@ otherwise unmodified.
 
 ## What's on the disk
 
-The C: drive root holds everything Toka-DOS needs to run, flat — no
-subdirectories:
+The C: drive root stays sparse: only the files DOS needs there, plus a `DOS`
+directory that holds the command interpreter and every tool.
 
 ```
-KERNEL.SYS      CONFIG.SYS      TOKAMOUS.COM    ATTRIB.EXE
-COMMAND.COM     AUTOEXEC.BAT    TOKAEMM.SYS     CHOICE.EXE
-GSWMODE.COM     MOVE.EXE        SORT.EXE        MORE.EXE
-MEM.EXE         FIND.EXE        LABEL.EXE       DELTREE.COM
-XCOPY.EXE       HELLO.TXT       LICENSE.TXT
+C:\
+    CONFIG.SYS      AUTOEXEC.BAT    LICENSE.TXT     DOS\
 ```
 
-See the [DOS command reference](commands.md) for what each tool does.
+`KERNEL.SYS` lives in the root too — the boot sector loads it by name — but it
+is hidden, so a plain `DIR` of C:\ shows only `CONFIG.SYS`, `AUTOEXEC.BAT`,
+`LICENSE.TXT`, and the `DOS` folder. Everything you actually run lives in
+`C:\DOS`:
+
+```
+C:\DOS\
+    COMMAND.COM     GSWMODE.COM     MEM.EXE         FIND.EXE
+    TOKAMOUS.COM    MOVE.EXE        ATTRIB.EXE      LABEL.EXE
+    TOKAEMM.SYS     SORT.EXE        CHOICE.EXE      DELTREE.COM
+                    MORE.EXE        XCOPY.EXE       HELLO.TXT
+```
+
+`AUTOEXEC.BAT` puts `C:\DOS` on the `PATH`, so every tool runs from any
+directory by name. See the [DOS command reference](commands.md) for what each
+one does.
 
 ## Drive letters
 
@@ -63,7 +75,7 @@ FreeCOM shell works normally:
   set.
 - **Batch files**: `.BAT` scripts with the usual `%1`-style parameters,
   `IF`/`GOTO`/`FOR`, and `CALL`. `CONFIG.SYS` boots straight into one via
-  `SHELL=C:\COMMAND.COM C:\ /E:2048 /P=C:\AUTOEXEC.BAT`.
+  `SHELL=C:\DOS\COMMAND.COM C:\DOS /E:2048 /P=C:\AUTOEXEC.BAT`.
 - **Redirection and pipes**: `>`, `>>`, `<`, and `|` all work, which is what
   makes `MORE` and `FIND` useful as filters (see the
   [command reference](commands.md)).
@@ -77,7 +89,7 @@ The stock startup script is short:
 ```
 @ECHO OFF
 PROMPT $P$G
-PATH C:\
+PATH C:\DOS
 SET BLASTER=A220 I5 D1 H5 T6
 LH TOKAMOUS
 ```
