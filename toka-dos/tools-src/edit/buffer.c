@@ -1,7 +1,35 @@
 /* TokaEdit text buffer core implementation. Part of the Toka-DOS project, GPL-3.0-only. Copyright (c) 2026 the IzarraVM project. */
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include "buffer.h"
+
+static int chareq(char a, char b, int fold) {
+    if (fold) return tolower((unsigned char)a) == tolower((unsigned char)b);
+    return a == b;
+}
+
+static int line_match_at(const char *line, int linelen, int col,
+                          const char *needle, int needlelen, int fold) {
+    int i;
+    if (col + needlelen > linelen) return 0;
+    for (i = 0; i < needlelen; i++)
+        if (!chareq(line[col + i], needle[i], fold)) return 0;
+    return 1;
+}
+
+static int scan_line_from(const Buf *b, int row, int startcol,
+                           const char *needle, int needlelen, int fold,
+                           int *fc) {
+    int col;
+    for (col = startcol; col <= b->lens[row] - needlelen; col++) {
+        if (line_match_at(b->lines[row], b->lens[row], col, needle, needlelen, fold)) {
+            *fc = col;
+            return 1;
+        }
+    }
+    return 0;
+}
 
 int buf_init(Buf *b) {
     b->cap = 64;
@@ -369,6 +397,29 @@ int buf_insert_text(Buf *b, int row, int col, const char *text,
 
 int buf_find(const Buf *b, int row, int col, const char *needle, int fold,
              int *fr, int *fc) {
-    (void)b; (void)row; (void)col; (void)needle; (void)fold; (void)fr; (void)fc;
+    int needlelen = (int)strlen(needle);
+    int r;
+
+    if (needlelen == 0) return 0;
+
+    /* rest of the start row, from col+1 */
+    if (scan_line_from(b, row, col + 1, needle, needlelen, fold, fc)) {
+        *fr = row;
+        return 1;
+    }
+    /* following lines to the end */
+    for (r = row + 1; r < b->nlines; r++) {
+        if (scan_line_from(b, r, 0, needle, needlelen, fold, fc)) {
+            *fr = r;
+            return 1;
+        }
+    }
+    /* wrap: row 0 through the start row inclusive */
+    for (r = 0; r <= row; r++) {
+        if (scan_line_from(b, r, 0, needle, needlelen, fold, fc)) {
+            *fr = r;
+            return 1;
+        }
+    }
     return 0;
 }

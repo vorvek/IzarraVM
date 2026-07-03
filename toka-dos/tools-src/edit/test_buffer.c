@@ -103,6 +103,17 @@ static void test_single_line_range(void) {
     free(s); buf_free(&b);
 }
 
+static void test_find(void) {
+    Buf b = load("The cat\r\nsat on the CAT\r\n");
+    int fr, fc;
+    assert(buf_find(&b, 0, 0, "cat", 1, &fr, &fc) && fr == 0 && fc == 4);
+    assert(buf_find(&b, fr, fc, "cat", 1, &fr, &fc) && fr == 1 && fc == 11);
+    assert(buf_find(&b, fr, fc, "cat", 1, &fr, &fc) && fr == 0 && fc == 4); /* wrap */
+    assert(!buf_find(&b, 0, 0, "dog", 1, &fr, &fc));
+    assert(!buf_find(&b, 0, 0, "CAT", 0, &fr, &fc) || fr == 1); /* case-sensitive */
+    buf_free(&b);
+}
+
 int main(void) {
     test_load_save_roundtrip();
     test_lf_only_tabs_and_eof_char();
@@ -112,6 +123,7 @@ int main(void) {
     test_line_cap();
     test_range_get_delete_insert();
     test_single_line_range();
+    test_find();
     puts("buffer core: OK");
     return 0;
 }
