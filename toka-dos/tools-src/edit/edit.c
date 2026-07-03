@@ -34,7 +34,7 @@ static int  top_row, left_col;  /* scroll origin */
 static int  sel_active;         /* selection anchor valid */
 static int  anch_row, anch_col; /* selection anchor */
 static char *clipboard;         /* malloc'd CRLF text or NULL */
-static char last_find[64];      /* for F3 (find dialog itself is Task 8) */
+static char last_find[64];      /* remembered across Find and F3/repeat */
 static int  overwrite;          /* Ins toggle */
 static int  quit;
 
@@ -230,8 +230,8 @@ static int do_copy(void) {
     free(clipboard);
     clipboard = buf_get_range(&doc, &r);
     if (!clipboard) {
-        /* range over BUF_MAX_RANGE or oom -- Task 8: dlg_msg */
-        scr_put(24, 0, "Selection too large to copy.", AT_BAR);
+        /* range over BUF_MAX_RANGE or oom */
+        dlg_msg("Edit", "Selection too large to copy.");
         return 0;
     }
     return 1;
@@ -304,6 +304,15 @@ static void word_right(void) {
 
 /* ---- file plumbing ---- */
 
+static int save_file(void); /* forward: save_as() calls back into it */
+
+/* reset cursor/scroll/selection after loading a fresh buffer */
+static void reset_view(void) {
+    cur_row = cur_col = 0;
+    top_row = left_col = 0;
+    sel_active = 0;
+}
+
 static int load_file(const char *path) {
     FILE *f;
     int ok;
@@ -314,46 +323,56 @@ static int load_file(const char *path) {
     }
     f = fopen(path, "rb");
     if (!f) {
-        cur_row = cur_col = 0;
-        top_row = left_col = 0;
-        sel_active = 0;
+        reset_view();
         return 1; /* new file: keep empty buffer */
     }
 
     ok = buf_load_stream(&doc, f);
     fclose(f);
 
-    if (!ok) {
-        /* Task 8: replace with dlg_msg for dialogs-era open */
+    if (!ok)
         return 0;
-    }
 
-    cur_row = cur_col = 0;
-    top_row = left_col = 0;
-    sel_active = 0;
+    reset_view();
     return 1;
+}
+
+/* prompts for a new file name and, if given, saves under it; returns 1 on
+ * a completed save, 0 on cancel/refusal (dlg_run already reported errors) */
+static int save_as(void) {
+    char field[64];
+    static const char *btns[2] = { "OK", "Cancel" };
+    int r;
+
+    strncpy(field, docname, sizeof(field) - 1);
+    field[sizeof(field) - 1] = '\0';
+
+    r = dlg_run("Save As", "File Name:", field, sizeof(field), btns, 2);
+    if (r != 0 || !field[0])
+        return 0;
+
+    strupr(field);
+    strncpy(docname, field, sizeof(docname) - 1);
+    docname[sizeof(docname) - 1] = '\0';
+    return save_file();
 }
 
 static int save_file(void) {
     FILE *f;
     int ok;
 
-    if (!docname[0]) {
-        /* Task 8: Save As dialog */
-        return 0;
-    }
+    if (!docname[0])
+        return save_as();
 
     f = fopen(docname, "wb");
     if (!f) {
-        /* Task 8: dlg_msg */
-        scr_put(24, 0, "Could not write file.", AT_BAR);
+        dlg_msg("Save", "Could not write file.");
         return 0;
     }
     ok = buf_save_stream(&doc, f);
     if (fclose(f) != 0) ok = 0;      /* buffered writes flush at fclose */
     if (!ok) {
-        /* Task 8: dlg_msg */
-        scr_put(24, 0, "Write error.", AT_BAR);
+        dlg_msg("Save", "Write error.");
         return 0;
     }
     doc.dirty = 0;
@@ -373,8 +392,150 @@ static void repeat_find(void) {
             cur_row = fr;
             cur_col = fc + mlen;
             sel_active = 1;
+        } else {
+            dlg_msg("Find", "Match not found");
         }
     }
+}
+
+/* returns 1 if it is OK to proceed (discard/replace the buffer), 0 if the
+ * caller should abort the pending action (user chose Cancel) */
+static int unsaved_check(void) {
+    int r;
+    if (!doc.dirty)
+        return 1;
+    r = dlg_yesnocancel("EDIT", "Loaded file is not saved. Save it now?");
+    if (r == 0) /* Yes */
+        return save_file();
+    if (r == 1) /* No */
+        return 1;
+    return 0; /* Cancel */
+}
+
+static void do_open(void) {
+    char field[64];
+    static const char *btns[2] = { "OK", "Cancel" };
+    int r;
+
+    if (!unsaved_check())
+        return;
+
+    field[0] = '\0';
+    r = dlg_run("Open", "File Name:", field, sizeof(field), btns, 2);
+    if (r != 0 || !field[0])
+        return;
+
+    strupr(field);
+    if (!load_file(field)) {
+        dlg_msg("Open", "Cannot load file.");
+        return;
+    }
+}
+
+static void do_find(void) {
+    char field[64];
+    static const char *btns[2] = { "OK", "Cancel" };
+    int r;
+
+    strncpy(field, last_find, sizeof(field) - 1);
+    field[sizeof(field) - 1] = '\0';
+
+    r = dlg_run("Find", "Find What:", field, sizeof(field), btns, 2);
+    if (r != 0 || !field[0])
+        return;
+
+    strncpy(last_find, field, sizeof(last_find) - 1);
+    last_find[sizeof(last_find) - 1] = '\0';
+    repeat_find();
+}
+
+static void do_change(void) {
+    char findbuf[64];
+    char replbuf[64];
+    static const char *ok_btn[2] = { "OK", "Cancel" };
+    static const char *chg_btn[4] = { "Change", "Skip", "Change All", "Cancel" };
+    int r;
+    int count = 0;
+    int all = 0;
+    int first_r = -1, first_c = -1;
+    int sr, sc;
+    char msg[40];
+
+    findbuf[0] = '\0';
+    r = dlg_run("Change", "Find What:", findbuf, sizeof(findbuf), ok_btn, 2);
+    if (r != 0 || !findbuf[0])
+        return;
+
+    replbuf[0] = '\0';
+    r = dlg_run("Change", "Change To:", replbuf, sizeof(replbuf), ok_btn, 2);
+    if (r != 0)
+        return;
+
+    sr = cur_row;
+    sc = cur_col;
+
+    for (;;) {
+        int fr, fc, mlen;
+        int er, ec;
+
+        if (!buf_find(&doc, sr, sc, findbuf, 1, &fr, &fc))
+            break; /* no more matches at all */
+
+        /* wrap-once guarantee: stop when the search returns to the first
+         * match we already visited */
+        if (first_r < 0) {
+            first_r = fr;
+            first_c = fc;
+        } else if (fr == first_r && fc == first_c) {
+            break;
+        }
+
+        mlen = (int)strlen(findbuf);
+        anch_row = fr;
+        anch_col = fc;
+        cur_row = fr;
+        cur_col = fc + mlen;
+        sel_active = 1;
+
+        if (!all) {
+            redraw();
+            r = dlg_run("Change", NULL, NULL, 0, chg_btn, 4);
+            if (r < 0 || r == 3) /* Esc or Cancel */
+                break;
+            if (r == 1) { /* Skip */
+                sr = fr;
+                sc = fc + mlen;
+                continue;
+            }
+            if (r == 2) /* Change All: fall through to replace, then stop asking */
+                all = 1;
+            /* r == 0: Change -- fall through to replace */
+        }
+
+        {
+            Range rng;
+            rng.r1 = fr; rng.c1 = fc;
+            rng.r2 = fr; rng.c2 = fc + mlen;
+            if (buf_delete_range(&doc, &rng) &&
+                buf_insert_text(&doc, fr, fc, replbuf, &er, &ec)) {
+                count++;
+                sr = er;
+                sc = ec;
+                cur_row = er;
+                cur_col = ec;
+                sel_active = 0;
+            } else {
+                /* refused (line-too-long etc): leave text as-is, advance
+                 * past the unmodified match so we don't loop forever */
+                sr = fr;
+                sc = fc + mlen;
+            }
+        }
+    }
+
+    sel_active = 0;
+    sprintf(msg, "%d change(s) made", count);
+    dlg_msg("Change", msg);
 }
 
 static int item_enabled(int id) {
@@ -396,7 +557,8 @@ static void act(int id) {
     case 0:
         break;
     case MI_NEW:
-        /* Task 8: unsaved-changes prompt */
+        if (!unsaved_check())
+            break;
         buf_free(&doc);
         buf_init(&doc);
         docname[0] = '\0';
@@ -407,16 +569,17 @@ static void act(int id) {
         overwrite = 0;
         break;
     case MI_OPEN:
-        /* Task 8 */
+        do_open();
         break;
     case MI_SAVE:
         save_file();
         break;
     case MI_SAVEAS:
-        /* Task 8 */
+        save_as();
         break;
     case MI_EXIT:
-        /* Task 8: unsaved-changes prompt */
+        if (!unsaved_check())
+            break;
         quit = 1;
         break;
     case MI_CUT:
@@ -432,16 +595,16 @@ static void act(int id) {
         delete_selection();
         break;
     case MI_FIND:
-        /* Task 8 */
+        do_find();
         break;
     case MI_FINDNEXT:
         repeat_find();
         break;
     case MI_CHANGE:
-        /* Task 8 */
+        do_change();
         break;
     case MI_ABOUT:
-        /* Task 8 */
+        dlg_msg("About", "TokaEdit  Version 1.0\nCopyright 1997 General Simulation Works");
         break;
     default:
         break;

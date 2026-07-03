@@ -24,4 +24,16 @@ int menu_run(int open_menu, int (*enabled)(int id));
 void menu_draw_bar(void);
 /* menu index under a bar click, or -1 */
 int menu_hit(int col);
+
+/* Modal dialog: centered box, one optional text field, 1..4 buttons.
+ * Returns the 0-based index of the pressed button, or -1 for Esc.
+ * If field is non-NULL it is an in/out buffer (edited in place, fieldcap
+ * bytes incl. NUL) shown above the buttons. prompt may contain one '\n'
+ * to split into two lines (used by About). */
+int dlg_run(const char *title, const char *prompt,
+            char *field, int fieldcap,
+            const char **buttons, int nbuttons);
+/* conveniences built on dlg_run */
+void dlg_msg(const char *title, const char *text);            /* [OK] */
+int  dlg_yesnocancel(const char *title, const char *text);    /* 0=Yes 1=No 2=Cancel; Esc=2 */
 #endif
