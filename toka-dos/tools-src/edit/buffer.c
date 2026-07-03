@@ -4,6 +4,59 @@
 #include <string.h>
 #include "buffer.h"
 
+#ifdef BUF_TEST_ALLOC
+/* Test-only allocation shim: lets the host test harness force the Nth
+ * allocation to fail, and tracks an outstanding-allocation balance so
+ * leaks show up as a nonzero balance at the end of the test run. */
+static long buf_alloc_count = 0;
+static long buf_alloc_fail_at = -1; /* -1 = never fail */
+static long buf_alloc_balance = 0;
+
+void buf_test_alloc_reset(void) {
+    buf_alloc_count = 0;
+    buf_alloc_fail_at = -1;
+}
+
+void buf_test_alloc_fail_at(long n) {
+    buf_alloc_count = 0;
+    buf_alloc_fail_at = n;
+}
+
+long buf_test_alloc_balance(void) {
+    return buf_alloc_balance;
+}
+
+static int buf_alloc_should_fail(void) {
+    buf_alloc_count++;
+    return buf_alloc_fail_at >= 0 && buf_alloc_count == buf_alloc_fail_at;
+}
+
+static void *buf_malloc(size_t n) {
+    void *p;
+    if (buf_alloc_should_fail()) return NULL;
+    p = malloc(n);
+    if (p) buf_alloc_balance++;
+    return p;
+}
+
+static void *buf_realloc(void *old, size_t n) {
+    void *p;
+    if (buf_alloc_should_fail()) return NULL;
+    p = realloc(old, n);
+    if (p && !old) buf_alloc_balance++;
+    return p;
+}
+
+static void buf_free_mem(void *p) {
+    if (p) buf_alloc_balance--;
+    free(p);
+}
+#else
+#define buf_malloc malloc
+#define buf_realloc realloc
+#define buf_free_mem free
+#endif
+
 static int chareq(char a, char b, int fold) {
     if (fold) return tolower((unsigned char)a) == tolower((unsigned char)b);
     return a == b;
@@ -35,10 +88,10 @@ int buf_init(Buf *b) {
     b->cap = 64;
     b->nlines = 1;
     b->dirty = 0;
-    b->lines = malloc((size_t)b->cap * sizeof(char *));
-    b->lens  = malloc((size_t)b->cap * sizeof(int));
+    b->lines = buf_malloc((size_t)b->cap * sizeof(char *));
+    b->lens  = buf_malloc((size_t)b->cap * sizeof(int));
     if (!b->lines || !b->lens) return 0;
-    b->lines[0] = malloc(1);
+    b->lines[0] = buf_malloc(1);
     if (!b->lines[0]) return 0;
     b->lines[0][0] = 0;
     b->lens[0] = 0;
@@ -47,9 +100,9 @@ int buf_init(Buf *b) {
 
 void buf_free(Buf *b) {
     int i;
-    for (i = 0; i < b->nlines; i++) free(b->lines[i]);
-    free(b->lines);
-    free(b->lens);
+    for (i = 0; i < b->nlines; i++) buf_free_mem(b->lines[i]);
+    buf_free_mem(b->lines);
+    buf_free_mem(b->lens);
     b->lines = NULL;
     b->lens = NULL;
     b->nlines = 0;
@@ -58,12 +111,14 @@ void buf_free(Buf *b) {
 
 static int buf_reserve(Buf *b, int n) {
     char **nl; int *nn; int c = b->cap;
+    if (n > BUF_MAX_LINES) return 0;
     if (n <= c) return 1;
     while (c < n) c *= 2;
-    nl = realloc(b->lines, (size_t)c * sizeof(char *));
+    if (c > BUF_MAX_LINES) c = BUF_MAX_LINES;
+    nl = buf_realloc(b->lines, (size_t)c * sizeof(char *));
     if (!nl) return 0;
     b->lines = nl;
-    nn = realloc(b->lens, (size_t)c * sizeof(int));
+    nn = buf_realloc(b->lens, (size_t)c * sizeof(int));
     if (!nn) return 0;
     b->lens = nn;
     b->cap = c;
@@ -71,8 +126,10 @@ static int buf_reserve(Buf *b, int n) {
 }
 
 static int append_line(Buf *b, const char *s, int len) {
-    char *dup = malloc((size_t)len + 1);
-    if (!dup || !buf_reserve(b, b->nlines + 1)) { free(dup); return 0; }
+    char *dup;
+    if (!buf_reserve(b, b->nlines + 1)) return 0;
+    dup = buf_malloc((size_t)len + 1);
+    if (!dup) return 0;
     memcpy(dup, s, (size_t)len);
     dup[len] = 0;
     b->lines[b->nlines] = dup;
@@ -81,14 +138,18 @@ static int append_line(Buf *b, const char *s, int len) {
     return 1;
 }
 
+/* May be called on any initialized Buf, fresh or already loaded; it
+ * discards the current content and replaces it. */
 int buf_load(Buf *b, const char *data, long n) {
     char cur[BUF_MAX_LINE + 1];
     int col = 0;
     long i;
+    int oldn, k;
     if (n > BUF_MAX_LOAD) return 0;
     if (n > 0 && data[n - 1] == 0x1A) n--;     /* one trailing DOS EOF char */
-    b->nlines = 0;                              /* rebuild over the init line */
-    free(b->lines[0]);
+    oldn = b->nlines;                            /* free every existing line, */
+    for (k = 0; k < oldn; k++) buf_free_mem(b->lines[k]); /* not just [0] */
+    b->nlines = 0;                               /* rebuild from scratch */
     for (i = 0; i < n; i++) {
         char ch = data[i];
         if (ch == '\r') continue;               /* CRLF: LF ends the line */
@@ -106,6 +167,8 @@ int buf_load(Buf *b, const char *data, long n) {
         if (col >= BUF_MAX_LINE) return 0;
         cur[col++] = ch;
     }
+    /* A trailing partial line with no final newline still becomes a line;
+     * input ending in \n contributes nothing further (already appended). */
     if (col > 0 || b->nlines == 0) {
         if (!append_line(b, cur, col)) return 0;
     }
@@ -133,7 +196,7 @@ int buf_insert_char(Buf *b, int row, int col, char ch) {
     int len; char *nl;
     len = b->lens[row];
     if (len >= BUF_MAX_LINE) return 0;
-    nl = realloc(b->lines[row], (size_t)len + 2);
+    nl = buf_realloc(b->lines[row], (size_t)len + 2);
     if (!nl) return 0;
     b->lines[row] = nl;
     memmove(nl + col + 1, nl + col, (size_t)(len - col) + 1);
@@ -158,13 +221,13 @@ int buf_delete_char(Buf *b, int row, int col) {
     if (b->lens[row] + b->lens[row + 1] > BUF_MAX_LINE) return 0;
     {
         int nlen = b->lens[row] + b->lens[row + 1];
-        char *nl = realloc(b->lines[row], (size_t)nlen + 1);
+        char *nl = buf_realloc(b->lines[row], (size_t)nlen + 1);
         if (!nl) return 0;
         b->lines[row] = nl;
         memcpy(nl + b->lens[row], b->lines[row + 1], (size_t)b->lens[row + 1] + 1);
         b->lens[row] = nlen;
     }
-    free(b->lines[row + 1]);
+    buf_free_mem(b->lines[row + 1]);
     for (i = row + 1; i < b->nlines - 1; i++) {
         b->lines[i] = b->lines[i + 1];
         b->lens[i] = b->lens[i + 1];
@@ -179,13 +242,13 @@ int buf_split_line(Buf *b, int row, int col) {
     char *tail, *head;
     len = b->lens[row];
     taillen = len - col;
-    tail = malloc((size_t)taillen + 1);
+    tail = buf_malloc((size_t)taillen + 1);
     if (!tail) return 0;
     memcpy(tail, b->lines[row] + col, (size_t)taillen);
     tail[taillen] = 0;
-    if (!buf_reserve(b, b->nlines + 1)) { free(tail); return 0; }
-    head = realloc(b->lines[row], (size_t)col + 1);
-    if (!head) { free(tail); return 0; }
+    if (!buf_reserve(b, b->nlines + 1)) { buf_free_mem(tail); return 0; }
+    head = buf_realloc(b->lines[row], (size_t)col + 1);
+    if (!head) { buf_free_mem(tail); return 0; }
     head[col] = 0;
     b->lines[row] = head;
     b->lens[row] = col;
@@ -200,6 +263,8 @@ int buf_split_line(Buf *b, int row, int col) {
     return 1;
 }
 
+/* Caller-owned output, freed by the caller with plain free() per
+ * buffer.h; deliberately not routed through the buf_malloc test shim. */
 char *buf_get_range(const Buf *b, const Range *r) {
     long total; char *out; char *p; int row;
     if (r->r1 == r->r2) {
@@ -247,15 +312,15 @@ int buf_delete_range(Buf *b, const Range *r) {
         tailfromlen = b->lens[r->r2] - r->c2;
         nlen = headlen + tailfromlen;
         if (nlen > BUF_MAX_LINE) return 0;
-        nl = malloc((size_t)nlen + 1);
+        nl = buf_malloc((size_t)nlen + 1);
         if (!nl) return 0;
         memcpy(nl, b->lines[r->r1], (size_t)headlen);
         memcpy(nl + headlen, b->lines[r->r2] + r->c2, (size_t)tailfromlen);
         nl[nlen] = 0;
-        free(b->lines[r->r1]);
+        buf_free_mem(b->lines[r->r1]);
         b->lines[r->r1] = nl;
         b->lens[r->r1] = nlen;
-        for (i = r->r1 + 1; i <= r->r2; i++) free(b->lines[i]);
+        for (i = r->r1 + 1; i <= r->r2; i++) buf_free_mem(b->lines[i]);
         gap = r->r2 - r->r1;
         for (i = r->r1 + 1; i < b->nlines - gap; i++) {
             b->lines[i] = b->lines[i + gap];
@@ -267,20 +332,33 @@ int buf_delete_range(Buf *b, const Range *r) {
     }
 }
 
+/* Allocate-all-then-commit: every new line string this call needs is
+ * allocated into a local temporary first. Only once ALL allocations (and
+ * the capacity reserve) have succeeded do we touch b->lines/b->lens/
+ * b->nlines. On any failure every temporary is freed and the buffer is
+ * returned completely untouched. */
 int buf_insert_text(Buf *b, int row, int col, const char *text,
                      int *end_row, int *end_col) {
-    int nsegs = 1;
+    long nsegs_l = 1;
+    int nsegs;
     const char *p;
     int i;
     const char **seg_start; int *seg_len;
     int headlen, taillen, ok;
+    char **new_lines; int *new_lens; /* temporaries: one per new line owned by this call */
 
-    /* count segments (split on \n, skip \r) */
-    for (p = text; *p; p++) if (*p == '\n') nsegs++;
+    /* count segments (split on \n, skip \r), guarding against overflowing
+     * the buffer's total line count before nsegs itself is even used as
+     * an int (16-bit int on the DOS build). */
+    for (p = text; *p; p++) if (*p == '\n') nsegs_l++;
+    if ((long)b->nlines - 1 + nsegs_l > BUF_MAX_LINES) return 0;
+    nsegs = (int)nsegs_l;
 
-    seg_start = malloc((size_t)nsegs * sizeof(char *));
-    seg_len = malloc((size_t)nsegs * sizeof(int));
-    if (!seg_start || !seg_len) { free(seg_start); free(seg_len); return 0; }
+    seg_start = buf_malloc((size_t)nsegs * sizeof(char *));
+    seg_len = buf_malloc((size_t)nsegs * sizeof(int));
+    if (!seg_start || !seg_len) {
+        buf_free_mem(seg_start); buf_free_mem(seg_len); return 0;
+    }
 
     {
         int idx = 0;
@@ -312,85 +390,108 @@ int buf_insert_text(Buf *b, int row, int col, const char *text,
             if (seg_len[i] > BUF_MAX_LINE) ok = 0;
         if (seg_len[nsegs - 1] + taillen > BUF_MAX_LINE) ok = 0;
     }
-    if (!ok) { free(seg_start); free(seg_len); return 0; }
+    if (!ok) { buf_free_mem(seg_start); buf_free_mem(seg_len); return 0; }
 
     if (nsegs == 1) {
         int newlen = headlen + seg_len[0] + taillen;
-        char *nl = realloc(b->lines[row], (size_t)newlen + 1);
-        if (!nl) { free(seg_start); free(seg_len); return 0; }
-        memmove(nl + headlen + seg_len[0], nl + headlen, (size_t)taillen);
+        char *nl = buf_malloc((size_t)newlen + 1);
+        if (!nl) { buf_free_mem(seg_start); buf_free_mem(seg_len); return 0; }
+        memcpy(nl, b->lines[row], (size_t)headlen);
         memcpy(nl + headlen, seg_start[0], (size_t)seg_len[0]);
+        memcpy(nl + headlen + seg_len[0], b->lines[row] + col, (size_t)taillen);
         nl[newlen] = 0;
+        /* commit: single-line case cannot fail from here on */
+        buf_free_mem(b->lines[row]);
         b->lines[row] = nl;
         b->lens[row] = newlen;
         *end_row = row;
         *end_col = headlen + seg_len[0];
-    } else {
-        char *tail_orig; int tail_orig_len;
-        int newlines_to_add;
-        int wr;
+        buf_free_mem(seg_start);
+        buf_free_mem(seg_len);
+        b->dirty = 1;
+        return 1;
+    }
 
-        tail_orig_len = taillen;
-        tail_orig = malloc((size_t)tail_orig_len + 1);
-        if (!tail_orig) { free(seg_start); free(seg_len); return 0; }
-        memcpy(tail_orig, b->lines[row] + col, (size_t)tail_orig_len);
-        tail_orig[tail_orig_len] = 0;
+    /* multi-segment: build every new line into temporaries first. There
+     * are nsegs lines total covering row..row+nsegs-1: line 0 (head+seg0),
+     * middle lines 1..nsegs-2 (seg_i verbatim), last line (seg_last+tail). */
+    new_lines = buf_malloc((size_t)nsegs * sizeof(char *));
+    new_lens  = buf_malloc((size_t)nsegs * sizeof(int));
+    if (!new_lines || !new_lens) {
+        buf_free_mem(new_lines); buf_free_mem(new_lens);
+        buf_free_mem(seg_start); buf_free_mem(seg_len);
+        return 0;
+    }
+    for (i = 0; i < nsegs; i++) new_lines[i] = NULL; /* so cleanup can free safely */
 
-        newlines_to_add = nsegs - 1;
-        if (!buf_reserve(b, b->nlines + newlines_to_add)) {
-            free(tail_orig); free(seg_start); free(seg_len);
-            return 0;
+    ok = 1;
+    {
+        int newlen0 = headlen + seg_len[0];
+        char *nl0 = buf_malloc((size_t)newlen0 + 1);
+        if (!nl0) { ok = 0; }
+        else {
+            memcpy(nl0, b->lines[row], (size_t)headlen);
+            memcpy(nl0 + headlen, seg_start[0], (size_t)seg_len[0]);
+            nl0[newlen0] = 0;
+            new_lines[0] = nl0;
+            new_lens[0] = newlen0;
         }
+    }
+    for (i = 1; ok && i < nsegs - 1; i++) {
+        char *ml = buf_malloc((size_t)seg_len[i] + 1);
+        if (!ml) { ok = 0; break; }
+        memcpy(ml, seg_start[i], (size_t)seg_len[i]);
+        ml[seg_len[i]] = 0;
+        new_lines[i] = ml;
+        new_lens[i] = seg_len[i];
+    }
+    if (ok) {
+        int lastlen = seg_len[nsegs - 1] + taillen;
+        char *ll = buf_malloc((size_t)lastlen + 1);
+        if (!ll) { ok = 0; }
+        else {
+            memcpy(ll, seg_start[nsegs - 1], (size_t)seg_len[nsegs - 1]);
+            memcpy(ll + seg_len[nsegs - 1], b->lines[row] + col, (size_t)taillen);
+            ll[lastlen] = 0;
+            new_lines[nsegs - 1] = ll;
+            new_lens[nsegs - 1] = lastlen;
+        }
+    }
+    /* reserve capacity for the net new lines (nsegs - 1 more than before) */
+    if (ok && !buf_reserve(b, b->nlines + (nsegs - 1))) ok = 0;
 
-        /* shift existing lines after row down by newlines_to_add */
+    if (!ok) {
+        for (i = 0; i < nsegs; i++) buf_free_mem(new_lines[i]);
+        buf_free_mem(new_lines); buf_free_mem(new_lens);
+        buf_free_mem(seg_start); buf_free_mem(seg_len);
+        return 0;
+    }
+
+    /* commit: everything is allocated and capacity is reserved, so the
+     * rest cannot fail. */
+    {
+        int newlines_to_add = nsegs - 1;
+        int wr;
         for (i = b->nlines - 1; i > row; i--) {
             b->lines[i + newlines_to_add] = b->lines[i];
             b->lens[i + newlines_to_add] = b->lens[i];
         }
+        buf_free_mem(b->lines[row]); /* replaced by new_lines[0] */
         b->nlines += newlines_to_add;
-
-        /* line row: head + seg0 */
-        {
-            int newlen0 = headlen + seg_len[0];
-            char *nl0 = realloc(b->lines[row], (size_t)newlen0 + 1);
-            if (!nl0) { free(tail_orig); free(seg_start); free(seg_len); return 0; }
-            memcpy(nl0 + headlen, seg_start[0], (size_t)seg_len[0]);
-            nl0[newlen0] = 0;
-            b->lines[row] = nl0;
-            b->lens[row] = newlen0;
-        }
-
-        /* middle segments become new lines row+1..row+nsegs-2 */
-        wr = row + 1;
-        for (i = 1; i < nsegs - 1; i++) {
-            char *ml = malloc((size_t)seg_len[i] + 1);
-            if (!ml) { free(tail_orig); free(seg_start); free(seg_len); return 0; }
-            memcpy(ml, seg_start[i], (size_t)seg_len[i]);
-            ml[seg_len[i]] = 0;
-            b->lines[wr] = ml;
-            b->lens[wr] = seg_len[i];
+        wr = row;
+        for (i = 0; i < nsegs; i++) {
+            b->lines[wr] = new_lines[i];
+            b->lens[wr] = new_lens[i];
             wr++;
         }
-
-        /* last segment + original tail becomes line row+nsegs-1 */
-        {
-            int lastlen = seg_len[nsegs - 1] + tail_orig_len;
-            char *ll = malloc((size_t)lastlen + 1);
-            if (!ll) { free(tail_orig); free(seg_start); free(seg_len); return 0; }
-            memcpy(ll, seg_start[nsegs - 1], (size_t)seg_len[nsegs - 1]);
-            memcpy(ll + seg_len[nsegs - 1], tail_orig, (size_t)tail_orig_len);
-            ll[lastlen] = 0;
-            b->lines[wr] = ll;
-            b->lens[wr] = lastlen;
-        }
-
         *end_row = row + nsegs - 1;
         *end_col = seg_len[nsegs - 1];
-        free(tail_orig);
     }
 
-    free(seg_start);
-    free(seg_len);
+    buf_free_mem(new_lines);
+    buf_free_mem(new_lens);
+    buf_free_mem(seg_start);
+    buf_free_mem(seg_len);
     b->dirty = 1;
     return 1;
 }

@@ -5,6 +5,14 @@
 #include <string.h>
 #include "buffer.h"
 
+#ifdef BUF_TEST_ALLOC
+/* Test-only allocation shim hooks, defined in buffer.c under the same
+ * BUF_TEST_ALLOC guard. Not part of the public buffer.h API. */
+extern void buf_test_alloc_reset(void);
+extern void buf_test_alloc_fail_at(long n);
+extern long buf_test_alloc_balance(void);
+#endif
+
 static Buf load(const char *bytes) {
     Buf b;
     assert(buf_init(&b));
@@ -103,6 +111,58 @@ static void test_single_line_range(void) {
     free(s); buf_free(&b);
 }
 
+static void test_too_many_lines_refused(void) {
+    long count = 17000;
+    char *big;
+    long i;
+    Buf b;
+    big = malloc((size_t)count + 1);
+    assert(big);
+    for (i = 0; i < count; i++) big[i] = '\n';
+    big[count] = 0;
+    assert(buf_init(&b));
+    assert(!buf_load(&b, big, count)); /* refused, not a crash */
+    buf_free(&b); /* must not crash on the partially-grown buffer */
+    free(big);
+}
+
+static void test_load_replaces_existing_content(void) {
+    Buf b = load("first\r\nsecond\r\n");
+    assert(buf_load(&b, "third\r\n", 7)); /* second load must win, not leak-append */
+    assert(b.nlines == 1);
+    assert(strcmp(b.lines[0], "third") == 0);
+    buf_free(&b);
+}
+
+#ifdef BUF_TEST_ALLOC
+static void test_insert_text_oom_atomic(void) {
+    const char *original = "alpha\r\nbeta\r\ngamma\r\n";
+    const char *paste = "X\nY\nZ"; /* multi-segment insert */
+    long fail_n;
+
+    for (fail_n = 1; fail_n <= 40; fail_n++) {
+        Buf b = load(original);
+        char *before;
+        int er, ec;
+        int rc;
+
+        before = save(&b);
+        buf_test_alloc_fail_at(fail_n);
+        rc = buf_insert_text(&b, 1, 2, paste, &er, &ec);
+        buf_test_alloc_reset();
+
+        if (!rc) {
+            char *after = save(&b);
+            assert(strcmp(before, after) == 0); /* buffer untouched */
+            free(after);
+        }
+        free(before);
+        buf_free(&b);
+        assert(buf_test_alloc_balance() == 0); /* no leak on this iteration */
+    }
+}
+#endif
+
 static void test_find(void) {
     Buf b = load("The cat\r\nsat on the CAT\r\n");
     int fr, fc;
@@ -123,7 +183,15 @@ int main(void) {
     test_line_cap();
     test_range_get_delete_insert();
     test_single_line_range();
+    test_too_many_lines_refused();
+    test_load_replaces_existing_content();
+#ifdef BUF_TEST_ALLOC
+    test_insert_text_oom_atomic();
+#endif
     test_find();
+#ifdef BUF_TEST_ALLOC
+    assert(buf_test_alloc_balance() == 0);
+#endif
     puts("buffer core: OK");
     return 0;
 }

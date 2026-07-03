@@ -4,6 +4,11 @@
 
 #define BUF_MAX_LINE 255
 #define BUF_MAX_LOAD 409600L /* 400 KB */
+/* Fits a 16-bit int with headroom. A 400 KB document can in theory exceed
+ * this many lines, but 16000 separate line mallocs is already far beyond
+ * what fits in DOS conventional memory, so the cap never bites first in
+ * practice. */
+#define BUF_MAX_LINES 16000
 
 typedef struct {
     char **lines;   /* nlines malloc'd NUL-terminated strings */
@@ -17,7 +22,12 @@ typedef struct {
 int  buf_init(Buf *b);                       /* 1 ok, 0 out of memory */
 void buf_free(Buf *b);
 /* load from raw file bytes: splits CRLF (tolerates LF), expands tabs to
- * 8-col stops, strips one trailing 0x1A. 1 ok, 0 oom/too-big/line-too-long. */
+ * 8-col stops, strips one trailing 0x1A. 1 ok, 0 oom/too-big/line-too-long.
+ * b must already be buf_init'd; may be called again on a buffer that
+ * already holds content (fresh or previously loaded) to replace it. On
+ * refusal the buffer is left valid-but-partial (all of lines 0..nlines-1
+ * are valid strings); the only additional requirement after a refusal is
+ * that buf_free or another buf_load work correctly, and both do. */
 int  buf_load(Buf *b, const char *data, long n);
 /* serialized size (every line + CRLF) and serialization for save */
 long buf_save_size(const Buf *b);
@@ -29,6 +39,8 @@ int  buf_delete_char(Buf *b, int row, int col);  /* Del at (row,col); joins line
 int  buf_split_line(Buf *b, int row, int col);   /* Enter */
 
 /* range = normalized selection, end exclusive on the column */
+/* Caller must pass a normalized, in-bounds range: r1<=r2; each c within
+ * its line's length; c1<=c2 when r1==r2. The core does not validate. */
 typedef struct { int r1, c1, r2, c2; } Range;
 /* extract range as CRLF-joined malloc'd string (caller frees); NULL on oom */
 char *buf_get_range(const Buf *b, const Range *r);
