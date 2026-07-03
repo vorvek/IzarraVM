@@ -281,8 +281,10 @@ try {
     if ($LASTEXITCODE) { throw "wcl386 buftest build failed" }
     & .\buftest.exe
     if ($LASTEXITCODE) { throw "TokaEdit buffer self-check FAILED" }
+} finally {
     $env:INCLUDE = "$env:WATCOM\h"
-} finally { Pop-Location }
+    Pop-Location
+}
 
 # --- TOKAEDIT / EDIT.COM (original Toka-DOS project source, GPL-3; see
 # toka-dos/tools-src/README.md). Large memory model: the document buffer

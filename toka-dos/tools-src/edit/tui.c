@@ -146,18 +146,15 @@ static void mouse_status(int *buttons, int *row, int *col) {
 /* ---- input ---- */
 
 void ev_wait(Event *e) {
-    int prev_alt_down;
-    int key_seen_while_alt;
-    int prev_btn;
-    int prev_row, prev_col;
-    int have_prev_mouse;
-
-    prev_alt_down = 0;
-    key_seen_while_alt = 0;
-    prev_btn = 0;
-    prev_row = 0;
-    prev_col = 0;
-    have_prev_mouse = 0;
+    /* Edge-detection state must survive across calls: ev_wait returns after
+     * ONE event, but an Alt tap or a mouse press-drag-release spans several
+     * returned events. Automatic locals here would re-arm on every call
+     * (spurious ALT_TAP after Alt+letter, DOWN refiring instead of DRAG/UP). */
+    static int prev_alt_down = 0;
+    static int key_seen_while_alt = 0;
+    static int prev_btn = 0;
+    static int prev_row = 0, prev_col = 0;
+    static int have_prev_mouse = 0;
 
     for (;;) {
         int shift_state;
