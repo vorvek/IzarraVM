@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include "buffer.h"
 #include "tui.h"
+#include "ui.h"
 
 #define AT_TEXT 0x07
 #define AT_SEL  0x70
@@ -112,9 +113,8 @@ static void redraw(void) {
         }
     }
 
-    /* menu bar row 0 (static) */
-    scr_fill(0, 0, 80, 1, ' ', AT_BAR);
-    scr_put(0, 1, "  File  Edit  Search  Help", AT_BAR);
+    /* menu bar row 0 */
+    menu_draw_bar();
 
     /* title bar row 1 */
     scr_fill(1, 0, 80, 1, ' ', AT_BAR);
@@ -353,18 +353,105 @@ static int save_file(void) {
     return 1;
 }
 
-/* save_file is not yet wired to a key: Save lives on the File menu (Task 7).
- * Keep it referenced (and thus -we clean) via this function pointer, which
- * the menu wiring in Task 7 will replace with a real call site. */
-static int (*save_file_entry)(void) = save_file;
+/* ---- menu action plumbing ---- */
+
+/* shared by the F3 key and the Search|Repeat Last Find menu item */
+static void repeat_find(void) {
+    if (last_find[0]) {
+        int fr, fc;
+        if (buf_find(&doc, cur_row, cur_col, last_find, 1, &fr, &fc)) {
+            int mlen = (int)strlen(last_find);
+            anch_row = fr;
+            anch_col = fc;
+            cur_row = fr;
+            cur_col = fc + mlen;
+            sel_active = 1;
+        }
+    }
+}
+
+static int item_enabled(int id) {
+    Range r;
+    switch (id) {
+    case MI_CUT:
+    case MI_COPY:
+    case MI_CLEAR:
+        return get_sel(&r);
+    case MI_PASTE:
+        return clipboard != NULL;
+    default:
+        return 1;
+    }
+}
+
+static void act(int id) {
+    switch (id) {
+    case 0:
+        break;
+    case MI_NEW:
+        /* Task 8: unsaved-changes prompt */
+        buf_free(&doc);
+        buf_init(&doc);
+        docname[0] = '\0';
+        cur_row = cur_col = 0;
+        top_row = left_col = 0;
+        sel_active = 0;
+        anch_row = anch_col = 0;
+        overwrite = 0;
+        break;
+    case MI_OPEN:
+        /* Task 8 */
+        break;
+    case MI_SAVE:
+        save_file();
+        break;
+    case MI_SAVEAS:
+        /* Task 8 */
+        break;
+    case MI_EXIT:
+        /* Task 8: unsaved-changes prompt */
+        quit = 1;
+        break;
+    case MI_CUT:
+        do_cut();
+        break;
+    case MI_COPY:
+        do_copy();
+        break;
+    case MI_PASTE:
+        do_paste();
+        break;
+    case MI_CLEAR:
+        delete_selection();
+        break;
+    case MI_FIND:
+        /* Task 8 */
+        break;
+    case MI_FINDNEXT:
+        repeat_find();
+        break;
+    case MI_CHANGE:
+        /* Task 8 */
+        break;
+    case MI_ABOUT:
+        /* Task 8 */
+        break;
+    default:
+        break;
+    }
+}
 
 /* ---- key dispatch ---- */
 
 static void dispatch(const Event *e) {
     int shift, ctrl, alt;
 
+    if (e->kind == EV_ALT_TAP) {
+        act(menu_run(-1, item_enabled));
+        return;
+    }
     if (e->kind != EV_KEY)
-        return; /* EV_MOUSE_*, EV_ALT_TAP: Tasks 7/9 */
+        return; /* EV_MOUSE_*: Task 9 */
 
     shift = e->mods & 1;
     ctrl  = e->mods & 2;
@@ -457,31 +544,32 @@ static void dispatch(const Event *e) {
         }
         return;
     case 0x3D: /* F3 */
-        if (last_find[0]) {
-            int fr, fc;
-            if (buf_find(&doc, cur_row, cur_col, last_find, 1, &fr, &fc)) {
-                int mlen = (int)strlen(last_find);
-                anch_row = fr;
-                anch_col = fc;
-                cur_row = fr;
-                cur_col = fc + mlen;
-                sel_active = 1;
-            }
-        }
+        repeat_find();
         return;
     default:
         break;
     }
 
-    /* alt combos: ignore for now except the temporary quit binding */
-    if (alt && e->scan == 0x2D) {
-        /* temporary until Task 7 menu Exit */
-        /* Task 8: unsaved-changes prompt */
-        quit = 1;
-        return;
-    }
+    /* alt combos: Alt+F/E/S/H open the matching pulldown directly (ascii
+     * can be 0 with Alt held, so dispatch on scancode); any other Alt+key
+     * is the mouse/menu layer's concern (Task 9) or unbound */
     if (alt) {
-        return; /* Alt+letter: Task 7 */
+        switch (e->scan) {
+        case 0x21: /* Alt+F */
+            act(menu_run(0, item_enabled));
+            return;
+        case 0x12: /* Alt+E */
+            act(menu_run(1, item_enabled));
+            return;
+        case 0x1F: /* Alt+S */
+            act(menu_run(2, item_enabled));
+            return;
+        case 0x23: /* Alt+H */
+            act(menu_run(3, item_enabled));
+            return;
+        default:
+            return;
+        }
     }
 
     switch (e->ascii) {
@@ -564,9 +652,6 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
-
-    /* keeps save_file referenced until Task 7 wires it to the File menu */
-    (void)save_file_entry;
 
     scr_init();
     mouse_init();

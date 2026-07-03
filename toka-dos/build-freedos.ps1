@@ -291,12 +291,10 @@ try {
 # lives on the far heap; every other tool here is -ms/-mc. The MZ exe ships
 # named EDIT.COM -- faithful to real MS-DOS, whose EDIT.COM is an MZ exe
 # (DOS dispatches on the MZ signature, not the extension).
-# NOTE: this line does not yet include ui.c -- that file arrives in a later
-# task; whoever adds it updates this line.
 $editCf = @('-bt=DOS','-bcl=DOS','-D__MSDOS__','-zp1','-ml','-oas','-s','-wx','-we','-zq','-fm')
 Push-Location $editDir
 try {
-    & wcl @editCf -fe=edit buffer.c tui.c edit.c
+    & wcl @editCf -fe=edit buffer.c tui.c ui.c edit.c
     if ($LASTEXITCODE) { throw "wcl edit failed" }
 } finally { Pop-Location }
 $editExe = Join-Path $editDir 'edit.exe'
