@@ -223,17 +223,24 @@ static void delete_selection(void) {
     sel_active = 0;
 }
 
-static void do_copy(void) {
+static int do_copy(void) {
     Range r;
     if (!get_sel(&r))
-        return;
+        return 0;
     free(clipboard);
     clipboard = buf_get_range(&doc, &r);
+    if (!clipboard) {
+        /* range over BUF_MAX_RANGE or oom -- Task 8: dlg_msg */
+        scr_put(24, 0, "Selection too large to copy.", AT_BAR);
+        return 0;
+    }
+    return 1;
 }
 
 static void do_cut(void) {
-    do_copy();
-    delete_selection();
+    /* only delete what actually reached the clipboard */
+    if (do_copy())
+        delete_selection();
 }
 
 static void do_paste(void) {
