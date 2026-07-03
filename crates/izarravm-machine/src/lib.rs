@@ -1227,6 +1227,15 @@ fn duration_ns_u64(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+/// Gate for the opt-in per-fault / diagnostic-port trace (see `Machine::log_fault_trace`
+/// and the unit-tester `CMD_EXIT` trace in `perform_unittester`). Default off: checked
+/// only on the cold paths (a fatal CPU error, or a guest OUT to the unit-tester exit
+/// port), never per-instruction or per-cycle, so leaving it unset costs one env lookup
+/// on those rare events and nothing anywhere else.
+fn fault_trace_enabled() -> bool {
+    std::env::var_os("IZARRAVM_FAULT_TRACE").is_some()
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -7631,9 +7640,47 @@ impl Machine {
                 }
                 None
             }
-            unittester::CMD_EXIT => Some(self.unittester.exit_code()),
+            unittester::CMD_EXIT => {
+                // Diagnostic trace only (IZARRAVM_FAULT_TRACE=1): the Doom repro
+                // needs to know whether the exit was a deliberate port write from
+                // the running guest or a stray fetch. The run loop's OUT to 0xE6
+                // always ends the batch before this deferred command executes
+                // (write_io sets io_touched unconditionally), so CS:IP here is the
+                // guest instruction right after the OUT, the closest reachable
+                // point to the origin without threading CS:IP through CpuBus.
+                if fault_trace_enabled() {
+                    let cs = self.cpu.registers.cs().selector;
+                    let eip = self.cpu.registers.eip;
+                    eprintln!(
+                        "fault trace: OUT 0xE6 CMD_EXIT val={cmd:#04x} \
+                         next-guest-CS:IP={cs:#06x}:{eip:#010x} v86={} ring0={}",
+                        self.cpu.is_v86_mode(),
+                        self.cpu.is_ring0_protected(),
+                    );
+                }
+                Some(self.unittester.exit_code())
+            }
             _ => None, // unknown command: ignore, like an unused port write
         }
+    }
+
+    /// Log a fatal `CpuError` that stopped the run loop (env-gated, see
+    /// `fault_trace_enabled`). Reports whatever CS:IP the CPU shows at the
+    /// error site: for the V86-sensitive-op / selector-load faults this is the
+    /// faulting guest instruction directly (the error is raised before any
+    /// exception delivery runs), and for a fault raised while the TOKAEMM
+    /// monitor is running ring-0 PM code it is the monitor's own CS:IP (the
+    /// V86 guest CS:IP the monitor was servicing is on its stack, not
+    /// reachable here without walking the ring-0 stack frame -- noted as the
+    /// gap rather than adding a paging-aware stack walk to this trace).
+    fn log_fault_trace(&self, error: &CpuError) {
+        let cs = self.cpu.registers.cs().selector;
+        let eip = self.cpu.registers.eip;
+        eprintln!(
+            "fault trace: {error} at CS:IP={cs:#06x}:{eip:#010x} v86={} ring0={}",
+            self.cpu.is_v86_mode(),
+            self.cpu.is_ring0_protected(),
+        );
     }
 
     /// Write the current frame to `path` as a binary PPM (P6). PPM keeps a PNG
@@ -9117,7 +9164,12 @@ impl Machine {
                         self.direct_map_changed = false;
                     }
                 }
-                Err(error) => return Ok(StopReason::CpuError(error.to_string())),
+                Err(error) => {
+                    if fault_trace_enabled() {
+                        self.log_fault_trace(&error);
+                    }
+                    return Ok(StopReason::CpuError(error.to_string()));
+                }
             }
         }
 
