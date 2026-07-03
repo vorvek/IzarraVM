@@ -6952,12 +6952,15 @@ impl Cpu386 {
         if offset > descriptor.limit
             || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
         {
-            return Err(CpuError::SegmentLimit {
-                segment: SegmentIndex::Cs,
-                offset,
-                width,
-            }
-            .into());
+            // 386 PRM 9.9.13: exceeding the CS limit on an instruction fetch is an
+            // ordinary #GP(0), not a host-fatal error. This must reach `finish_instruction`
+            // as `InternalFault::Exception` (rewind + `deliver_exception`, which already
+            // reflects faults into a V86 monitor) rather than `InternalFault::Cpu`, whose
+            // `SegmentLimit` variant propagates straight out of `cycle` and halts the machine.
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
         }
         Ok(descriptor.base.wrapping_add(offset))
     }
@@ -27944,6 +27947,58 @@ mod tests {
         assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0x3333);
         assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0x4444);
         assert_eq!(cpu.current_privilege_level(), 3, "V86 is always CPL 3");
+    }
+
+    #[test]
+    fn iret_into_v86_with_dirty_high_word_eip_faults_not_hangs() {
+        // Same 32-bit V86 IRET frame as `iret_into_v86_restores_the_task`, but the popped
+        // EIP carries a nonzero high word (0x0001_0000): a real far call/return sequence
+        // can leave EIP sitting exactly on the CS limit boundary this way. `iret` must not
+        // silently truncate or mask the value -- it loads the full 32-bit EIP (correct: V86
+        // CS is always a 16-bit real-mode-style segment, so the very next fetch is expected
+        // to raise #GP(0) via `code_linear_for_offset`, not crash the host).
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        let vm_eflags = FLAG_VM | 0x2;
+        for v in [
+            0x4444u32,
+            0x3333,
+            0x1111,
+            0x2222,
+            0x0900,
+            0x1000,
+            vm_eflags,
+            0x0A00,
+            0x0001_0000,
+        ] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+
+        assert!(cpu.is_v86_mode(), "IRET with popped VM=1 must re-enter V86");
+        assert_eq!(
+            cpu.registers.eip, 0x0001_0000,
+            "iret loads the full popped EIP untruncated"
+        );
+        assert_eq!(cpu.registers.cs().selector, 0x0A00);
+
+        // The next fetch is offset 0x10000 against a 16-bit CS limit of 0xffff: this must
+        // deliver #GP(0) through the normal exception path (reflected into the ring-0
+        // monitor), not return a fatal InternalFault::Cpu that kills the machine.
+        let outcome = cpu.cycle(&mut bus);
+        assert!(
+            outcome.is_ok(),
+            "CS-limit violation on fetch must be a delivered fault, not a fatal error: {outcome:?}"
+        );
+        assert!(
+            !cpu.is_v86_mode(),
+            "the #GP(0) must be reflected into the ring-0 monitor"
+        );
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
     }
 
     #[test]
