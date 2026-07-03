@@ -4066,6 +4066,65 @@ DIR DEST\r\n"
         );
     }
 
+    /// V86 trap tax regression: IRQ5 delivered while the interrupted code sits
+    /// at IP == 0. The vec13 frame-shape check cannot decide this case alone --
+    /// the error-code slot reads 0 for a #GP AND for an IRQ frame whose return
+    /// EIP is 0 -- so the monitor must fall through to its opcode-peek + cold
+    /// PIC-probe layers. A slot-only discriminator mis-routed such a delivery
+    /// into the #GP path, hit the non-sensitive byte at CS:0, and hard-killed
+    /// the VM (the review probe); this pins the three-layer scheme.
+    ///
+    /// IRQ5IP0 makes IP == 0 the common case with SB16 auto-init DMA (NOT the
+    /// one-shot DSP 0xF2, whose re-arm races the ISR -- see the fixture header):
+    /// once armed, the DMA block boundary raises IRQ5 continuously on the card's
+    /// own schedule while the guest simply parks on a `jmp $` at offset 0 of a
+    /// segment, so deliveries land at IP == 0 with no re-arm. This test is RED
+    /// on the buggy slot-only monitor (the VM dies, a foreign TestExit code) and
+    /// GREEN only on the three-layer fix.
+    #[test]
+    #[ignore = "boots a full FreeDOS image (slow); run with --ignored"]
+    fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_ip0_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let autoexec = b"@ECHO OFF\r\nIRQ5IP0\r\n".to_vec();
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "IRQ5IP0.COM".to_string(),
+                        izarravm_firmware::irq5ip0_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "IRQ5 at IP==0 under V86 did not report success (stop={stop:?}); \
+             0xE1 = DSP reset failed, a hang/CycleLimit or a foreign TestExit \
+             code means the discriminator mis-routed the delivery.\n{text}"
+        );
+    }
+
     /// V86 trap tax (dev_docs/2026-07-02-v86-trap-tax) owner measurement: not a CI
     /// gate, a local one-off ad hoc report. Boots a real corpus game (Prince of
     /// Persia) through the Katea host-folder facade at a given GSW mode and prints
