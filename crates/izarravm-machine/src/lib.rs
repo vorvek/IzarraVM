@@ -10069,7 +10069,17 @@ impl CpuBus for MachineBus<'_> {
         // monitor's own device pokes (e.g. the vec13 discriminator's PIC OCW3
         // select write) are chipset bookkeeping, not guest-visible activity, so
         // they are exempted from ending the batch in the Approximate class only.
-        let skip_io_touched = cpu_is_ring0_pm && self.lazy_port_reads;
+        //
+        // A20 carve-out: the batch loop's A20 seam ("any A20 write ... ends this
+        // step" -- the before/after compare at batch entry) depends on EVERY
+        // write that can move the A20 gate ending the batch, ring-0 or not.
+        // Ports 0x92 (system control A), 0x60/0x64 (the 8042 path) can; keep
+        // them batch-ending unconditionally. TOKAEMM's a20_apply is PTE-based
+        // today (the real gate never drops), so this is belt-and-braces for a
+        // future monitor that pokes the real gate, at zero hot-path cost (the
+        // monitor's hot pokes are the PIC/EOI ports, not these three).
+        let skip_io_touched =
+            cpu_is_ring0_pm && self.lazy_port_reads && !matches!(port, 0x60 | 0x64 | 0x92);
         if !skip_io_touched {
             *self.io_touched = true;
         }
