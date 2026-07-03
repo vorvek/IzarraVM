@@ -40,6 +40,22 @@ static int  quit;
 
 static int imax(int a, int b) { return a > b ? a : b; }
 
+/* shared by redraw() and the scrollbar click handler so the thumb position
+ * used for hit-testing can never drift from the one that gets painted */
+static int vthumb_row(void) {
+    int t = 3 + (int)((long)top_row * 18L / (long)imax(1, doc.nlines - 1));
+    if (t < 3) t = 3;
+    if (t > 21) t = 21;
+    return t;
+}
+
+static int hthumb_col(void) {
+    int t = 1 + (int)((long)left_col * 76L / 255L);
+    if (t < 1) t = 1;
+    if (t > 77) t = 77;
+    return t;
+}
+
 /* ---- selection ---- */
 
 /* normalize anchor/cursor into r; returns 1 if a real (non-empty) selection */
@@ -147,11 +163,7 @@ static void redraw(void) {
     scr_putc(TEXT_BOTTOM, 79, (char)SB_DOWN, AT_BAR);
     for (row = TEXT_TOP + 1; row < TEXT_BOTTOM; row++)
         scr_putc(row, 79, (char)SB_TRACK, AT_BAR);
-    thumb = 3 + (int)((long)top_row * 18L / (long)imax(1, doc.nlines - 1));
-    if (thumb < 3)
-        thumb = 3;
-    if (thumb > 21)
-        thumb = 21;
+    thumb = vthumb_row();
     scr_putc(thumb, 79, (char)SB_THUMB, AT_BAR);
 
     /* horizontal scrollbar, row 23 */
@@ -159,11 +171,7 @@ static void redraw(void) {
     scr_putc(23, 78, (char)SB_RIGHT, AT_BAR);
     for (col = 1; col < 78; col++)
         scr_putc(23, col, (char)SB_TRACK, AT_BAR);
-    thumb = 1 + (int)((long)left_col * 76L / 255L);
-    if (thumb < 1)
-        thumb = 1;
-    if (thumb > 77)
-        thumb = 77;
+    thumb = hthumb_col();
     scr_putc(23, thumb, (char)SB_THUMB, AT_BAR);
 
     scr_cursor(TEXT_TOP + cur_row - top_row, cur_col - left_col);
@@ -653,6 +661,128 @@ static void act(int id) {
     }
 }
 
+/* ---- mouse ---- */
+
+/* true while the button is down and the press started in the text area;
+ * gates EV_MOUSE_DRAG so drags starting on a scrollbar/menu don't select */
+static int mouse_text_down;
+
+/* map a text-area mouse cell to a clamped document position */
+static void mouse_to_doc(int mrow, int mcol, int *out_row, int *out_col) {
+    int row = top_row + mrow - TEXT_TOP;
+    int col;
+    if (row < 0)
+        row = 0;
+    if (row > doc.nlines - 1)
+        row = doc.nlines - 1;
+    col = left_col + mcol;
+    if (col > doc.lens[row])
+        col = doc.lens[row];
+    if (col < 0)
+        col = 0;
+    *out_row = row;
+    *out_col = col;
+}
+
+/* after a scrollbar click moves top_row/left_col, keep the cursor inside
+ * the newly visible window instead of leaving it off-screen */
+static void keep_cursor_in_view(void) {
+    if (cur_row < top_row)
+        cur_row = top_row;
+    if (cur_row > top_row + TEXT_ROWS - 1)
+        cur_row = top_row + TEXT_ROWS - 1;
+    if (cur_row > doc.nlines - 1)
+        cur_row = doc.nlines - 1;
+    if (cur_row < 0)
+        cur_row = 0;
+    if (cur_col < left_col)
+        cur_col = left_col;
+    if (cur_col > left_col + 78)
+        cur_col = left_col + 78;
+}
+
+static void mouse_event(const Event *e) {
+    if (e->kind == EV_MOUSE_UP) {
+        mouse_text_down = 0;
+        return;
+    }
+
+    if (e->kind == EV_MOUSE_DOWN && e->mrow == 0) {
+        int mi = menu_hit(e->mcol);
+        if (mi >= 0)
+            act(menu_run(mi, item_enabled));
+        return;
+    }
+
+    /* text area: rows TEXT_TOP..TEXT_BOTTOM, cols 0..78 */
+    if (e->mrow >= TEXT_TOP && e->mrow <= TEXT_BOTTOM && e->mcol >= 0 && e->mcol <= 78) {
+        if (e->kind == EV_MOUSE_DOWN) {
+            mouse_text_down = 1;
+            mouse_to_doc(e->mrow, e->mcol, &cur_row, &cur_col);
+            sel_active = 0;
+            anch_row = cur_row;
+            anch_col = cur_col;
+            return;
+        }
+        if (e->kind == EV_MOUSE_DRAG && mouse_text_down) {
+            mouse_to_doc(e->mrow, e->mcol, &cur_row, &cur_col);
+            if (cur_row != anch_row || cur_col != anch_col)
+                sel_active = 1;
+            return;
+        }
+        return;
+    }
+
+    /* only DOWN acts on scrollbars; drags off a scrollbar are ignored
+     * because mouse_text_down stays 0 for presses that start here */
+    if (e->kind != EV_MOUSE_DOWN)
+        return;
+
+    /* vertical scrollbar, col 79, rows TEXT_TOP..TEXT_BOTTOM */
+    if (e->mcol == 79 && e->mrow >= TEXT_TOP && e->mrow <= TEXT_BOTTOM) {
+        if (e->mrow == TEXT_TOP) {
+            top_row--;
+        } else if (e->mrow == TEXT_BOTTOM) {
+            top_row++;
+        } else {
+            int thumb = vthumb_row();
+            if (e->mrow < thumb)
+                top_row -= TEXT_ROWS;
+            else if (e->mrow > thumb)
+                top_row += TEXT_ROWS;
+        }
+        if (top_row < 0)
+            top_row = 0;
+        if (top_row > doc.nlines - 1)
+            top_row = doc.nlines - 1;
+        keep_cursor_in_view();
+        return;
+    }
+
+    /* horizontal scrollbar, row 23, cols 0..78 */
+    if (e->mrow == 23 && e->mcol >= 0 && e->mcol <= 78) {
+        if (e->mcol == 0) {
+            left_col--;
+        } else if (e->mcol == 78) {
+            left_col++;
+        } else {
+            int thumb = hthumb_col();
+            if (e->mcol < thumb)
+                left_col -= TEXT_COLS;
+            else if (e->mcol > thumb)
+                left_col += TEXT_COLS;
+        }
+        if (left_col < 0)
+            left_col = 0;
+        if (left_col > 255)
+            left_col = 255;
+        keep_cursor_in_view();
+        return;
+    }
+
+    /* row 1 (title) and other dead zones: no-op */
+}
+
 /* ---- key dispatch ---- */
 
 static void dispatch(const Event *e) {
@@ -662,8 +792,10 @@ static void dispatch(const Event *e) {
         act(menu_run(-1, item_enabled));
         return;
     }
-    if (e->kind != EV_KEY)
-        return; /* EV_MOUSE_*: Task 9 */
+    if (e->kind != EV_KEY) {
+        mouse_event(e);
+        return;
+    }
 
     shift = e->mods & 1;
     ctrl  = e->mods & 2;
@@ -854,6 +986,7 @@ int main(int argc, char *argv[]) {
     last_find[0] = '\0';
     overwrite = 0;
     quit = 0;
+    mouse_text_down = 0;
 
     if (argc > 1) {
         strncpy(docname, argv[1], sizeof(docname) - 1);
