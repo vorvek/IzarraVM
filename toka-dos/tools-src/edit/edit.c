@@ -458,6 +458,8 @@ static void do_change(void) {
     int count = 0;
     int all = 0;
     int sr, sc;
+    int fr, fc, mlen, rlen;
+    int have_match;
     char msg[40];
 
     findbuf[0] = '\0';
@@ -470,12 +472,29 @@ static void do_change(void) {
     if (r != 0)
         return;
 
-    /* Scan origin: matches strictly after the cursor are found (buf_find
-     * itself searches from col+1), so a match starting exactly at the
-     * cursor is not included. Real EDIT's Change also runs forward from
-     * the cursor, so this matches user expectation. */
+    /* Scan origin. buf_find itself searches from col+1, which would skip
+     * a match starting exactly at the cursor -- the common "Ctrl+Home
+     * then Change All" flow -- so probe that one position by hand. */
     sr = cur_row;
     sc = cur_col;
+    mlen = (int)strlen(findbuf);
+    rlen = (int)strlen(replbuf);
+    have_match = 0;
+    if (sr < doc.nlines && sc + mlen <= doc.lens[sr]) {
+        int i;
+        have_match = 1;
+        for (i = 0; i < mlen; i++) {
+            if (tolower((unsigned char)doc.lines[sr][sc + i]) !=
+                tolower((unsigned char)findbuf[i])) {
+                have_match = 0;
+                break;
+            }
+        }
+        if (have_match) {
+            fr = sr;
+            fc = sc;
+        }
+    }
 
     /*
      * Strictly-forward, no-wrap scan. buf_find always wraps to the top
@@ -497,16 +516,17 @@ static void do_change(void) {
      * (a user wanting the whole document should Ctrl+Home first).
      */
     for (;;) {
-        int fr, fc, mlen;
         int er, ec;
 
-        if (!buf_find(&doc, sr, sc, findbuf, 1, &fr, &fc))
-            break; /* no more matches at all */
+        if (!have_match) {
+            if (!buf_find(&doc, sr, sc, findbuf, 1, &fr, &fc))
+                break; /* no more matches at all */
 
-        if (fr < sr || (fr == sr && fc <= sc))
-            break; /* wrapped back to/before the scan origin: stop */
+            if (fr < sr || (fr == sr && fc <= sc))
+                break; /* wrapped back to/before the scan origin: stop */
+        }
+        have_match = 0;
 
-        mlen = (int)strlen(findbuf);
         anch_row = fr;
         anch_col = fc;
         cur_row = fr;
@@ -532,7 +552,11 @@ static void do_change(void) {
             Range rng;
             rng.r1 = fr; rng.c1 = fc;
             rng.r2 = fr; rng.c2 = fc + mlen;
-            if (buf_delete_range(&doc, &rng) &&
+            /* Validate the grown length BEFORE deleting: a delete that
+             * succeeds followed by an insert that refuses would lose the
+             * matched text with nothing put back. */
+            if (doc.lens[fr] - mlen + rlen <= BUF_MAX_LINE &&
+                buf_delete_range(&doc, &rng) &&
                 buf_insert_text(&doc, fr, fc, replbuf, &er, &ec)) {
                 count++;
                 sr = er;
