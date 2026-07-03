@@ -10576,6 +10576,15 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         // not a fault -- the port-0x201 joystick-stub precedent)
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
+        0x5658..=0x565b, // VMware backdoor probe (DX=0x5658, EAX='VMXh'): real,
+        // non-VMware hardware has nothing at this port, so a guest's `IN
+        // EAX, DX` detection probe must read open bus (all-ones), never the
+        // VMware magic response and never an UnsupportedPort fault. A dword
+        // IN decomposes into four byte reads at 0x5658-0x565b (the same
+        // io_word_sub_port widening as every other wide port access), so all
+        // four bytes are covered here. JEMMEX runs this probe during its own
+        // hypervisor-presence check and used to halt the machine with
+        // CpuError("unsupported I/O port 0x5658") before this stub existed.
     ];
     ranges.into_iter().flatten()
 }
@@ -14087,6 +14096,41 @@ mod tests {
         assert!(matches!(
             bus.read_io(0x0290, BusWidth::Byte, 0, false),
             Err(BusError::UnsupportedPort { port }) if port == 0x0290
+        ));
+    }
+
+    #[test]
+    fn vmware_backdoor_probe_reads_open_bus_not_a_fault() {
+        // Port 0x5658 is the VMware backdoor detection port: real VMware sets
+        // EAX/EBX/ECX/EDX on `IN EAX, DX` (DX=0x5658, EAX='VMXh'); real,
+        // non-VMware hardware has nothing there, so the guest must see open
+        // bus (all-ones) and conclude "not VMware" -- not an UnsupportedPort
+        // fault that halts the machine. JEMMEX runs this probe and used to
+        // crash with CpuError("unsupported I/O port 0x5658") before this stub
+        // existed; regression guard for the passive-port entry.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        assert_eq!(
+            bus.read_io(0x5658, BusWidth::Dword, 0, false).unwrap(),
+            0xffff_ffff,
+            "VMware backdoor port must read open bus on a dword IN, not the VMXh response"
+        );
+        for port in [0x5658u16, 0x5659, 0x565a, 0x565b] {
+            assert_eq!(
+                bus.read_io(port, BusWidth::Byte, 0, false).unwrap(),
+                0xff,
+                "port {port:#06x} must read open bus"
+            );
+        }
+        // OUT is accepted, matching every other passive stub (the generic
+        // passive-port table is a plain read/write latch with no VMware
+        // magic-number behavior grafted on).
+        bus.write_io(0x5658, BusWidth::Dword, 0x564d_5868, false)
+            .unwrap();
+        // The stub stays bounded: one past the top still faults.
+        assert!(matches!(
+            bus.read_io(0x565c, BusWidth::Byte, 0, false),
+            Err(BusError::UnsupportedPort { port }) if port == 0x565c
         ));
     }
 
