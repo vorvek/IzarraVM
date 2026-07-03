@@ -457,7 +457,6 @@ static void do_change(void) {
     int r;
     int count = 0;
     int all = 0;
-    int first_r = -1, first_c = -1;
     int sr, sc;
     char msg[40];
 
@@ -471,9 +470,32 @@ static void do_change(void) {
     if (r != 0)
         return;
 
+    /* Scan origin: matches strictly after the cursor are found (buf_find
+     * itself searches from col+1), so a match starting exactly at the
+     * cursor is not included. Real EDIT's Change also runs forward from
+     * the cursor, so this matches user expectation. */
     sr = cur_row;
     sc = cur_col;
 
+    /*
+     * Strictly-forward, no-wrap scan. buf_find always wraps to the top
+     * when it runs off the end of the document, so we must detect a
+     * wrapped result ourselves and stop instead of accepting it: a
+     * wrapped match is positioned at or before the point we searched
+     * from, i.e. (fr < sr) || (fr == sr && fc <= sc).
+     *
+     * Termination: each iteration either (a) advances (sr,sc) strictly
+     * forward -- Skip and refusal both set sr/sc to just past the
+     * matched needle -- or (b) performs a replacement, which either
+     * grows the document (sr/sc still advances past the replacement,
+     * strictly forward of fc) or shrinks/holds it (bounded below).
+     * Since buf_find never returns a position at or before the search
+     * origin without that being treated as "no more matches" (wrap
+     * rejected below), the scan origin is always strictly increasing
+     * within the bounded document, so the loop always terminates. No
+     * wrap: Change covers cursor..end-of-document only, deliberately
+     * (a user wanting the whole document should Ctrl+Home first).
+     */
     for (;;) {
         int fr, fc, mlen;
         int er, ec;
@@ -481,14 +503,8 @@ static void do_change(void) {
         if (!buf_find(&doc, sr, sc, findbuf, 1, &fr, &fc))
             break; /* no more matches at all */
 
-        /* wrap-once guarantee: stop when the search returns to the first
-         * match we already visited */
-        if (first_r < 0) {
-            first_r = fr;
-            first_c = fc;
-        } else if (fr == first_r && fc == first_c) {
-            break;
-        }
+        if (fr < sr || (fr == sr && fc <= sc))
+            break; /* wrapped back to/before the scan origin: stop */
 
         mlen = (int)strlen(findbuf);
         anch_row = fr;
@@ -504,7 +520,7 @@ static void do_change(void) {
                 break;
             if (r == 1) { /* Skip */
                 sr = fr;
-                sc = fc + mlen;
+                sc = fc + mlen - 1; /* buf_find resumes at sc+1 == fc+mlen */
                 continue;
             }
             if (r == 2) /* Change All: fall through to replace, then stop asking */
@@ -520,7 +536,9 @@ static void do_change(void) {
                 buf_insert_text(&doc, fr, fc, replbuf, &er, &ec)) {
                 count++;
                 sr = er;
-                sc = ec;
+                sc = ec - 1; /* buf_find resumes at sc+1 == ec, just past
+                              * the inserted replacement (ec==0 is safe:
+                              * col+1==0 in buf_find scans from col 0) */
                 cur_row = er;
                 cur_col = ec;
                 sel_active = 0;
@@ -528,7 +546,7 @@ static void do_change(void) {
                 /* refused (line-too-long etc): leave text as-is, advance
                  * past the unmodified match so we don't loop forever */
                 sr = fr;
-                sc = fc + mlen;
+                sc = fc + mlen - 1;
             }
         }
     }
