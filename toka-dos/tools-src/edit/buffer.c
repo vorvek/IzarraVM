@@ -102,18 +102,74 @@ void buf_serialize(const Buf *b, char *out) {
 }
 
 int buf_insert_char(Buf *b, int row, int col, char ch) {
-    (void)b; (void)row; (void)col; (void)ch;
-    return 0;
+    int len; char *nl;
+    len = b->lens[row];
+    if (len >= BUF_MAX_LINE) return 0;
+    nl = realloc(b->lines[row], (size_t)len + 2);
+    if (!nl) return 0;
+    b->lines[row] = nl;
+    memmove(nl + col + 1, nl + col, (size_t)(len - col) + 1);
+    nl[col] = ch;
+    b->lens[row] = len + 1;
+    b->dirty = 1;
+    return 1;
 }
 
 int buf_delete_char(Buf *b, int row, int col) {
-    (void)b; (void)row; (void)col;
-    return 0;
+    int len, i;
+    len = b->lens[row];
+    if (col < len) {
+        memmove(b->lines[row] + col, b->lines[row] + col + 1,
+                (size_t)(len - col));
+        b->lens[row] = len - 1;
+        b->dirty = 1;
+        return 1;
+    }
+    /* col == len: EOL, join with next line */
+    if (row + 1 >= b->nlines) return 0;
+    if (b->lens[row] + b->lens[row + 1] > BUF_MAX_LINE) return 0;
+    {
+        int nlen = b->lens[row] + b->lens[row + 1];
+        char *nl = realloc(b->lines[row], (size_t)nlen + 1);
+        if (!nl) return 0;
+        b->lines[row] = nl;
+        memcpy(nl + b->lens[row], b->lines[row + 1], (size_t)b->lens[row + 1] + 1);
+        b->lens[row] = nlen;
+    }
+    free(b->lines[row + 1]);
+    for (i = row + 1; i < b->nlines - 1; i++) {
+        b->lines[i] = b->lines[i + 1];
+        b->lens[i] = b->lens[i + 1];
+    }
+    b->nlines--;
+    b->dirty = 1;
+    return 1;
 }
 
 int buf_split_line(Buf *b, int row, int col) {
-    (void)b; (void)row; (void)col;
-    return 0;
+    int len, taillen, i;
+    char *tail, *head;
+    len = b->lens[row];
+    taillen = len - col;
+    tail = malloc((size_t)taillen + 1);
+    if (!tail) return 0;
+    memcpy(tail, b->lines[row] + col, (size_t)taillen);
+    tail[taillen] = 0;
+    if (!buf_reserve(b, b->nlines + 1)) { free(tail); return 0; }
+    head = realloc(b->lines[row], (size_t)col + 1);
+    if (!head) { free(tail); return 0; }
+    head[col] = 0;
+    b->lines[row] = head;
+    b->lens[row] = col;
+    for (i = b->nlines; i > row + 1; i--) {
+        b->lines[i] = b->lines[i - 1];
+        b->lens[i] = b->lens[i - 1];
+    }
+    b->lines[row + 1] = tail;
+    b->lens[row + 1] = taillen;
+    b->nlines++;
+    b->dirty = 1;
+    return 1;
 }
 
 char *buf_get_range(const Buf *b, const Range *r) {

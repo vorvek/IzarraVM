@@ -48,10 +48,41 @@ static void test_empty_buffer_is_one_line(void) {
     free(s); buf_free(&b);
 }
 
+static void test_insert_and_split(void) {
+    Buf b = load("helo\r\n");
+    assert(buf_insert_char(&b, 0, 3, 'l'));
+    assert(strcmp(b.lines[0], "hello") == 0 && b.dirty);
+    assert(buf_split_line(&b, 0, 2));          /* he | llo */
+    assert(b.nlines == 2);
+    assert(strcmp(b.lines[0], "he") == 0 && strcmp(b.lines[1], "llo") == 0);
+    buf_free(&b);
+}
+
+static void test_delete_and_join(void) {
+    Buf b = load("ab\r\ncd\r\n");
+    assert(buf_delete_char(&b, 0, 0));         /* Del 'a' */
+    assert(strcmp(b.lines[0], "b") == 0);
+    assert(buf_delete_char(&b, 0, 1));         /* Del at EOL joins */
+    assert(b.nlines == 1 && strcmp(b.lines[0], "bcd") == 0);
+    buf_free(&b);
+}
+
+static void test_line_cap(void) {
+    Buf b = load("");
+    int i;
+    for (i = 0; i < BUF_MAX_LINE; i++) assert(buf_insert_char(&b, 0, i, 'x'));
+    assert(!buf_insert_char(&b, 0, BUF_MAX_LINE, 'x')); /* refused, not crash */
+    assert(b.lens[0] == BUF_MAX_LINE);
+    buf_free(&b);
+}
+
 int main(void) {
     test_load_save_roundtrip();
     test_lf_only_tabs_and_eof_char();
     test_empty_buffer_is_one_line();
+    test_insert_and_split();
+    test_delete_and_join();
+    test_line_cap();
     puts("buffer core: OK");
     return 0;
 }
