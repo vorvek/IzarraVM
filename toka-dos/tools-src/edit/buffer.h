@@ -6,6 +6,9 @@
 
 #define BUF_MAX_LINE 255
 #define BUF_MAX_LOAD 409600L /* 400 KB */
+/* Largest single extracted range (clipboard block): must fit one malloc,
+ * which the DOS build's 16-bit size_t caps below 64 KB. */
+#define BUF_MAX_RANGE 60000L
 /* Fits a 16-bit int with headroom. A 400 KB document can in theory exceed
  * this many lines, but 16000 separate line mallocs is already far beyond
  * what fits in DOS conventional memory, so the cap never bites first in
@@ -57,7 +60,8 @@ int  buf_split_line(Buf *b, int row, int col);   /* Enter */
 /* Caller must pass a normalized, in-bounds range: r1<=r2; each c within
  * its line's length; c1<=c2 when r1==r2. The core does not validate. */
 typedef struct { int r1, c1, r2, c2; } Range;
-/* extract range as CRLF-joined malloc'd string (caller frees); NULL on oom */
+/* extract range as CRLF-joined malloc'd string (caller frees); NULL on oom
+ * or when the range exceeds BUF_MAX_RANGE */
 char *buf_get_range(const Buf *b, const Range *r);
 int   buf_delete_range(Buf *b, const Range *r);
 /* insert possibly-multi-line CRLF/LF text at (row,col); reports end position */

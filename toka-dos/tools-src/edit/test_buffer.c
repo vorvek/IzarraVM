@@ -263,6 +263,32 @@ static void test_stream_refuses_too_large(void) {
     close_tmp_binary(tf);
 }
 
+static void test_range_too_large_refused(void) {
+    /* > BUF_MAX_RANGE extracted in one block would truncate through the
+     * DOS build's 16-bit size_t in malloc; buf_get_range must refuse. */
+    Buf b;
+    Range r;
+    int i;
+    char line[201];
+    assert(buf_init(&b));
+    memset(line, 'y', 200);
+    line[200] = 0;
+    for (i = 0; i < 350; i++) {           /* ~350 * 202 bytes > 60000 */
+        int er, ec;
+        assert(buf_insert_text(&b, b.nlines - 1, 0, line, &er, &ec));
+        assert(buf_split_line(&b, b.nlines - 1, 200));
+    }
+    r.r1 = 0; r.c1 = 0; r.r2 = b.nlines - 1; r.c2 = 0;
+    assert(buf_get_range(&b, &r) == NULL); /* refused, not truncated */
+    r.r2 = 2; r.c2 = 5;                    /* small range still works */
+    {
+        char *s = buf_get_range(&b, &r);
+        assert(s != NULL);
+        free(s);
+    }
+    buf_free(&b);
+}
+
 static void test_find(void) {
     Buf b = load("The cat\r\nsat on the CAT\r\n");
     int fr, fc;
@@ -291,6 +317,7 @@ int main(void) {
     test_stream_roundtrip();
     test_stream_stops_at_eof_char();
     test_stream_refuses_too_large();
+    test_range_too_large_refused();
     test_find();
 #ifdef BUF_TEST_ALLOC
     assert(buf_test_alloc_balance() == 0);

@@ -342,6 +342,9 @@ char *buf_get_range(const Buf *b, const Range *r) {
     total = (long)(b->lens[r->r1] - r->c1) + 2;
     for (row = r->r1 + 1; row < r->r2; row++) total += b->lens[row] + 2;
     total += r->c2;
+    /* One clipboard block must stay under the 16-bit DOS size_t: a bigger
+     * range would truncate in malloc below and overflow the heap. Refuse. */
+    if (total > BUF_MAX_RANGE) return NULL;
     out = malloc((size_t)total + 1);
     if (!out) return NULL;
     p = out;
