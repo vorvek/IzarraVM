@@ -1,9 +1,21 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus, DirectPage};
+use std::sync::OnceLock;
 use thiserror::Error;
 
 mod fpu;
 mod mmx;
 pub use fpu::X87;
+
+/// Gate for the opt-in `#UD` diagnostic trace (T1.5: making a reflected #UD
+/// observable, see `Cpu386::trace_ud_if_enabled`). Mirrors
+/// `izarravm_machine::fault_trace_enabled` (same env var), cached after the
+/// first check so a #UD storm costs one atomic load per fault rather than a
+/// syscall. Measurement-only: this crate has no other env dependency, and the
+/// gate is read only on the cold vector-6 delivery path, never per-instruction.
+fn ud_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_FAULT_TRACE").is_some())
+}
 
 const FLAG_CF: u32 = 0x0000_0001;
 const FLAG_PF: u32 = 0x0000_0004;
@@ -3644,11 +3656,24 @@ impl Cpu386 {
                 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 => DecodeGroup::SystemSeg,
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
                 // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
-                // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); and the whole MMX block
-                // (`is_mmx_two_byte`). 0F AA (RSM) is unimplemented and stays TwoByteFallback.
-                0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa2 | 0xc7 | 0xc8..=0xcf => {
-                    DecodeGroup::Misc
-                }
+                // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
+                // (A0/A1/A8/A9, 386+, mirroring the one-byte ES/SS/DS segment push/pop arms in
+                // `execute_stack_decoded`); and the whole MMX block (`is_mmx_two_byte`). 0F AA
+                // (RSM) is unimplemented and stays TwoByteFallback.
+                0x05
+                | 0x07
+                | 0x08
+                | 0x09
+                | 0x30
+                | 0x31
+                | 0x32
+                | 0xa0
+                | 0xa1
+                | 0xa2
+                | 0xa8
+                | 0xa9
+                | 0xc7
+                | 0xc8..=0xcf => DecodeGroup::Misc,
                 second if is_mmx_two_byte(second as u8) => DecodeGroup::Misc,
                 _ => DecodeGroup::TwoByteFallback,
             };
@@ -4380,9 +4405,10 @@ impl Cpu386 {
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
-                // Hand the second byte to `execute_two_byte`; every opcode it still handles takes no
-                // encoded operand, so it re-reads nothing (the second byte is never re-read).
-                self.execute_two_byte(insn.opcode as u8, insn.operand_size)
+                // Hand the second byte to `execute_two_byte`; every opcode it still handles reads no
+                // further instruction bytes (the second byte is never re-read). PUSH/POP FS/GS do
+                // touch the stack, so `bus` is passed through.
+                self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size)
             }
             DecodeGroup::Fallback => {
                 // Fallback is now a pure dead-end: after Stage A every IMPLEMENTED single-byte opcode
@@ -6486,13 +6512,16 @@ impl Cpu386 {
     /// and as a leaf call from `execute_misc_decoded` for the no-operand 0F members. The converted 0F
     /// groups (MOVZX/MOVSX and the rest) bypass this entirely via `route_group`/`execute_decoded`.
     ///
-    /// Every opcode that remains here takes NO encoded operand (it reads no instruction bytes), so
-    /// the heterogeneous `Misc` group (task A14) also leaf-calls this for its no-operand 0F members
-    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them — the
-    /// bus, prefixes, and address size are therefore no longer parameters. The genuinely
-    /// unimplemented 0F bytes still fall through to the `UnsupportedTwoByteOpcode` arm and #UD.
-    fn execute_two_byte(
+    /// Most opcodes handled here re-read no further instruction bytes, so the heterogeneous
+    /// `Misc` group (task A14) also leaf-calls this for its 0F members
+    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them.
+    /// PUSH/POP FS/GS (0F A0/A1/A8/A9) are Misc members too: like their one-byte ES/SS/DS
+    /// counterparts in `execute_stack_decoded`, they touch the stack, so `bus` is threaded
+    /// through. The genuinely unimplemented 0F bytes still fall through to the
+    /// `UnsupportedTwoByteOpcode` arm and #UD.
+    fn execute_two_byte<B: CpuBus>(
         &mut self,
+        bus: &mut B,
         opcode: u8,
         operand_size: OperandSize,
     ) -> ExecResult<CycleOutcome> {
@@ -6709,6 +6738,42 @@ impl Cpu386 {
                     self.write_gpr32(reg, value.swap_bytes());
                 }
                 Ok(clocks(1))
+            }
+            // PUSH FS / PUSH GS (0F A0 / 0F A8): 386+ additions, otherwise identical to the
+            // one-byte PUSH ES/CS/SS/DS handlers in `execute_stack_decoded` (0x06/0x0e/0x16/
+            // 0x1e) -- push the 16-bit selector, always at `OperandSize::Word` regardless of
+            // the current operand-size attribute (a segment selector is always 16 bits; a
+            // 32-bit-operand-size PUSH FS still only writes/advances by 2, matching real
+            // 386+ silicon and the existing ES/SS/DS arms). Same clock cost (2) as those.
+            0xa0 => {
+                self.push(
+                    bus,
+                    u32::from(self.registers.segment(SegmentIndex::Fs).selector),
+                    OperandSize::Word,
+                )?;
+                Ok(clocks(2))
+            }
+            0xa8 => {
+                self.push(
+                    bus,
+                    u32::from(self.registers.segment(SegmentIndex::Gs).selector),
+                    OperandSize::Word,
+                )?;
+                Ok(clocks(2))
+            }
+            // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
+            // 16-bit selector off the stack, then run it through the same `load_segment`
+            // descriptor-load path (which raises the identical #GP/#SS a bad or null selector
+            // would on POP DS). Same clock cost (7) as those.
+            0xa1 => {
+                let value = self.pop(bus, OperandSize::Word)? as u16;
+                self.load_segment(bus, SegmentIndex::Fs, value)?;
+                Ok(clocks(7))
+            }
+            0xa9 => {
+                let value = self.pop(bus, OperandSize::Word)? as u16;
+                self.load_segment(bus, SegmentIndex::Gs, value)?;
+                Ok(clocks(7))
             }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
@@ -8279,6 +8344,63 @@ impl Cpu386 {
         }
     }
 
+    /// T1.5 diagnostic: log a `#UD` (vector 6) at the moment it is about to be
+    /// reflected to the guest's own IDT handler. Two real V86 EMM managers
+    /// (386MAX, JEMMEX) raise `#UD` during their own init and spin forever in
+    /// their handler; the CPU reflects it cleanly (no fatal `CpuError`), so the
+    /// existing `IZARRAVM_FAULT_TRACE` machine-level trace (which only fires on
+    /// a fatal `CpuError` or the 0xE6 `CMD_EXIT` port) prints nothing. This is
+    /// the single choke point for every #UD raise site (decoder
+    /// unimplemented-opcode fallback and every semantic #UD check): by the time
+    /// `deliver_exception` runs, `finish_instruction` has already rewound
+    /// `eip`/`cs` to the faulting instruction's first byte (see
+    /// `finish_instruction`), so `self.registers.cs()/eip` here IS the actual
+    /// faulting guest CS:IP, not a monitor's. Gated on `ud_trace_enabled()`
+    /// (same `IZARRAVM_FAULT_TRACE` env var as the machine crate's fault
+    /// trace); a no-op call on the cold vector-6-only path when off.
+    fn trace_ud_if_enabled<B: CpuBus>(&mut self, bus: &mut B) {
+        if !ud_trace_enabled() {
+            return;
+        }
+        let cs = self.registers.cs();
+        let eip = self.registers.eip;
+        // Read the raw bytes at the faulting linear address fresh (rather than
+        // reusing whatever the decoder buffered) so this covers BOTH #UD
+        // origins uniformly: the decoder's unimplemented-opcode fallback and a
+        // semantic #UD raised after decode. Best-effort: stop at the first
+        // unreadable byte (e.g. a page boundary fault) rather than erroring --
+        // this is a diagnostic read, it must never itself fault the guest.
+        const MAX_BYTES: u32 = 12;
+        let mut bytes = Vec::with_capacity(MAX_BYTES as usize);
+        for i in 0..MAX_BYTES {
+            let linear = cs.base.wrapping_add(eip).wrapping_add(i);
+            let Ok(phys) = self.translate_linear(bus, linear, false) else {
+                break;
+            };
+            let Ok(byte) =
+                bus.read_memory(phys, BusWidth::Byte, BusAccessKind::InstructionPrefetch)
+            else {
+                break;
+            };
+            bytes.push(byte as u8);
+        }
+        let byte_str = bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "fault trace: #UD at CS:IP={:#06x}:{:#010x} bytes=[{byte_str}] \
+             cr0={:#010x} eflags={:#010x} vm={} cpl={}",
+            cs.selector,
+            eip,
+            self.control.cr0,
+            self.registers.eflags,
+            self.is_v86_mode(),
+            self.current_privilege_level(),
+        );
+    }
+
     fn deliver_exception<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -8289,6 +8411,9 @@ impl Cpu386 {
         // to vector 8, #DF). Only a genuine CPU exception pushes one.
         is_external: bool,
     ) -> ExecResult<()> {
+        if vector == 6 && !is_external {
+            self.trace_ud_if_enabled(bus);
+        }
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
         }
@@ -8926,7 +9051,7 @@ impl Cpu386 {
             // A V86 task addresses memory like the 8086: base = selector << 4, 64 KB.
             self.load_segment_real(segment, selector);
         } else if self.is_protected_mode() {
-            let register = self.load_protected_segment(bus, selector)?;
+            let register = self.load_protected_segment(bus, segment, selector)?;
             self.registers.set_segment(segment, register);
             if segment == SegmentIndex::Cs {
                 self.invalidate_code_caches();
@@ -8948,13 +9073,40 @@ impl Cpu386 {
     fn load_protected_segment<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        segment: SegmentIndex,
         selector: u16,
     ) -> ExecResult<SegmentRegister> {
+        // A null selector (index 0, TI clear) loaded into a data segment (ES/DS/FS/GS) is
+        // legal: it installs a null/unusable segment with no fault at load time. A later
+        // memory access through it faults with #GP(0) (via the base=0/limit=0 default
+        // segment failing the limit check in `segment_linear_byte`). CS and SS must still
+        // #GP on a null selector -- CS reaches here via RETF/IRET/interrupt-gate delivery,
+        // not just far-jump/call -- mirroring the TSS segment-load precedent above
+        // (`selector & !0x7 == 0 && !matches!(segment, Cs | Ss)`). The mask must also require
+        // TI=0: `selector & 0xfffc` folds in the index bits only, so a TI=1 index-0 selector
+        // (0x0004, LDT[0]) is correctly excluded from this null short-circuit and falls
+        // through to resolve against the LDT below.
+        if selector & 0xfffc == 0 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss) {
+            return Ok(SegmentRegister {
+                selector,
+                ..Default::default()
+            });
+        }
+        let in_ldt = selector & 0x4 != 0;
         let index = u32::from(selector & !0x7);
-        if index == 0 || index + 7 > u32::from(self.gdtr.limit) {
+        let (table_base, table_limit) = if in_ldt {
+            (self.ldtr.base, self.ldtr.limit)
+        } else {
+            (self.gdtr.base, u32::from(self.gdtr.limit))
+        };
+        // Index 0 is reserved only in the GDT (the processor never uses GDT[0], per the PRM);
+        // an LDT selector with index 0 (TI=1, e.g. 0x0004) is an ordinary, resolvable entry --
+        // the null-selector short-circuit above already handled the true null case (index 0,
+        // TI 0), so an in_ldt selector reaching here is never null.
+        if (index == 0 && !in_ldt) || index + 7 > table_limit {
             return Err(CpuError::GeneralProtection { selector }.into());
         }
-        let descriptor_address = self.gdtr.base + index;
+        let descriptor_address = table_base + index;
         let low = bus.read_memory(descriptor_address, BusWidth::Dword, BusAccessKind::DataRead)?;
         let high = bus.read_memory(
             descriptor_address + 4,
@@ -9823,6 +9975,8 @@ const fn is_386plus_two_byte(opcode: u8) -> bool {
         0x08 | 0x09 | 0xb0 | 0xb1 | 0xc0 | 0xc1 | 0xc8..=0xcf
         // MOV to/from CR (386).
         | 0x20 | 0x22
+        // PUSH/POP FS/GS (386): FS and GS do not exist before the 386.
+        | 0xa0 | 0xa1 | 0xa8 | 0xa9
         // Jcc rel16/32 and SETcc (386).
         | 0x80..=0x8f | 0x90..=0x9f
         // CPUID (gated again by level below; 286 has no CPUID either way).
@@ -10243,10 +10397,11 @@ impl Cpu386 {
             op if op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
                 self.execute_mmx_decoded(insn, bus)
             }
-            // The remaining 0F system/serializing/CPU-id ops carry no encoded operand and re-read no
-            // instruction bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL
-            // (05), SYSRET (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), CPUID (A2),
-            // BSWAP (C8-CF). `decode` already read + gated the second byte; this never re-reads it.
+            // The remaining 0F system/serializing/CPU-id/stack ops re-read no further instruction
+            // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL (05), SYSRET
+            // (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), PUSH FS/GS (A0/A8), CPUID
+            // (A2), POP FS/GS (A1/A9), BSWAP (C8-CF). `decode` already read + gated the second
+            // byte; this never re-reads it.
             0x0f05
             | 0x0f07
             | 0x0f08
@@ -10254,8 +10409,12 @@ impl Cpu386 {
             | 0x0f30
             | 0x0f31
             | 0x0f32
+            | 0x0fa0
+            | 0x0fa1
             | 0x0fa2
-            | 0x0fc8..=0x0fcf => self.execute_two_byte(insn.opcode as u8, insn.operand_size),
+            | 0x0fa8
+            | 0x0fa9
+            | 0x0fc8..=0x0fcf => self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size),
             opcode => unreachable!("misc opcode {opcode:#x}"),
         }
     }
@@ -18772,8 +18931,9 @@ mod tests {
             | 0x40..=0x4f | 0x90..=0x9f | 0xaf
             // SystemSeg
             | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22
-            // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP (Misc)
-            | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa2 | 0xc7 | 0xc8..=0xcf
+            // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
+            | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
+            | 0xc7 | 0xc8..=0xcf
         );
         routed || is_mmx_two_byte(second)
     }
@@ -21829,6 +21989,208 @@ mod tests {
         }
     }
 
+    // ---- PUSH/POP FS/GS (0F A0/A1/A8/A9) ----
+
+    /// Real-mode CPU with SP parked at 0x1f0 (mirrors `stack_seed`) and 0x200 bytes of memory,
+    /// so PUSH/POP FS/GS have room on the stack. Used for the real-mode + 16/32-bit-operand-size
+    /// arms of the new opcodes; the protected-mode descriptor-load arms use `protected_cpu` below.
+    fn fs_gs_stack_cpu(code: &[u8]) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; 0x200];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x01f0);
+        (cpu, memory)
+    }
+
+    #[test]
+    fn push_fs_pushes_the_selector_in_real_mode() {
+        // PUSH FS (0F A0). Mirrors PUSH DS (0x1e): pushes the 16-bit selector, SP -= 2.
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa0]);
+        cpu.registers
+            .set_segment(SegmentIndex::Fs, SegmentRegister::real(0x1234));
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01ee, "SP must decrement by 2");
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
+            0x1234,
+            "FS selector must land on the stack"
+        );
+    }
+
+    #[test]
+    fn push_gs_pushes_the_selector_in_real_mode() {
+        // PUSH GS (0F A8). Mirrors PUSH DS (0x1e).
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa8]);
+        cpu.registers
+            .set_segment(SegmentIndex::Gs, SegmentRegister::real(0x5678));
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01ee, "SP must decrement by 2");
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
+            0x5678,
+            "GS selector must land on the stack"
+        );
+    }
+
+    #[test]
+    fn push_fs_gs_ignore_the_32_bit_operand_size_prefix() {
+        // 66 0F A0 / 66 0F A8: a segment selector is always 16 bits, so a 32-bit operand-size
+        // override must still only push 2 bytes and move SP by 2 -- exactly like the one-byte
+        // PUSH ES/CS/SS/DS arms, which hardcode `OperandSize::Word` regardless of `operand_size`.
+        for (code, segment, value) in [
+            ([0x66u8, 0x0f, 0xa0].as_slice(), SegmentIndex::Fs, 0x1234u16),
+            ([0x66, 0x0f, 0xa8].as_slice(), SegmentIndex::Gs, 0x5678u16),
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(code);
+            cpu.registers
+                .set_segment(segment, SegmentRegister::real(value));
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01ee,
+                "SP must still only move by 2 with a 32-bit operand-size prefix"
+            );
+            assert_eq!(
+                u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
+                value,
+                "the pushed word must be the 16-bit selector, not a 32-bit zero-extension"
+            );
+        }
+    }
+
+    #[test]
+    fn pop_fs_loads_the_selector_in_real_mode() {
+        // POP FS (0F A1). Mirrors POP DS (0x1f): pops a 16-bit selector and loads it, SP += 2.
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa1]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f2, "SP must increment by 2");
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0xbeef);
+    }
+
+    #[test]
+    fn pop_gs_loads_the_selector_in_real_mode() {
+        // POP GS (0F A9). Mirrors POP DS (0x1f).
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x0f, 0xa9]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f2, "SP must increment by 2");
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0xbeef);
+    }
+
+    #[test]
+    fn pop_fs_gs_load_a_valid_descriptor_in_protected_mode() {
+        // Data segment access 0x92 (present, data, writable), byte-granular limit 0xffff,
+        // base 0 -- the same descriptor shape `verr_sets_zf_for_a_readable_segment` and
+        // `lar_and_lsl_read_descriptor_fields` use. Selector 0x0008 (GDT index 1, RPL 0).
+        for (code, segment) in [
+            ([0x0fu8, 0xa1].as_slice(), SegmentIndex::Fs), // POP FS
+            ([0x0f, 0xa9].as_slice(), SegmentIndex::Gs),   // POP GS
+        ] {
+            let (mut cpu, memory) = protected_cpu(code, 0x0000_ffff, 0x0000_9200);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.write_reg16(Reg16::Sp, 0x01f0);
+            bus.memory[0x1f0..0x1f2].copy_from_slice(&0x0008u16.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0x0008,
+                "{segment:?} selector must load"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).base,
+                0,
+                "{segment:?} base must come from the descriptor"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).limit,
+                0xffff,
+                "{segment:?} limit must come from the descriptor"
+            );
+            assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f2, "SP must advance by 2");
+        }
+    }
+
+    #[test]
+    fn pop_fs_gs_fault_on_a_bad_selector_in_protected_mode() {
+        // Selector 0x0028 (index 5, byte offset 40) is past the GDT limit of 0x1f (31), which
+        // only covers offsets 0 (null) and 8 (the one installed descriptor), so the descriptor
+        // load must #GP -- the same fault a bad POP DS selector raises.
+        for (code, name) in [
+            ([0x0fu8, 0xa1].as_slice(), "POP FS"),
+            ([0x0f, 0xa9].as_slice(), "POP GS"),
+        ] {
+            let (mut cpu, memory) = protected_cpu(code, 0x0000_ffff, 0x0000_9200);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.write_reg16(Reg16::Sp, 0x01f0);
+            bus.memory[0x1f0..0x1f2].copy_from_slice(&0x0028u16.to_le_bytes());
+            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0028 })
+                ),
+                "{name} with an out-of-limit selector must #GP, got {err:?}"
+            );
+        }
+    }
+
+    /// Like `run_at_level`, but seeds SP at 0x1f0 (mirroring `fs_gs_stack_cpu`/`stack_seed`) so
+    /// the PUSH FS/GS arms have room on the stack instead of wrapping SP into unmapped memory.
+    /// POP FS/GS only ever read what PUSH just wrote (or zero), so no separate POP variant needed.
+    fn run_at_level_with_stack(
+        code: &[u8],
+        level: CpuLevel,
+    ) -> Result<CycleOutcome, InternalFault> {
+        let mut memory = vec![0; 1024];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(level);
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x01f0);
+        let mut bus = TestBus::with_memory(memory);
+        exec_one_split(&mut cpu, &mut bus)
+    }
+
+    #[test]
+    fn push_pop_fs_gs_raise_ud_at_i286() {
+        // FS/GS are 386+ only. At the I286 level the check_two_byte_isa_gate must #UD all four
+        // opcodes (via is_386plus_two_byte), the same gate MOVZX/BSF/etc go through, and they
+        // must run cleanly from I386 up.
+        for code in [
+            [0x0fu8, 0xa0], // PUSH FS
+            [0x0f, 0xa1],   // POP FS
+            [0x0f, 0xa8],   // PUSH GS
+            [0x0f, 0xa9],   // POP GS
+        ] {
+            assert!(
+                matches!(
+                    run_at_level_with_stack(&code, CpuLevel::I286).unwrap_err(),
+                    InternalFault::Exception { vector: 6, .. }
+                ),
+                "{code:02x?} must #UD at I286"
+            );
+            assert!(
+                run_at_level_with_stack(&code, CpuLevel::I386).is_ok(),
+                "{code:02x?} must run at I386"
+            );
+            assert!(run_at_level_with_stack(&code, CpuLevel::I486).is_ok());
+            assert!(run_at_level_with_stack(&code, CpuLevel::I586).is_ok());
+        }
+    }
+
     #[test]
     fn lldt_loads_the_descriptor() {
         // LDT descriptor at selector 0x08: base 0x0004_0000, limit 0x0fff, access 0x82.
@@ -21841,6 +22203,207 @@ mod tests {
         assert_eq!(cpu.ldtr.selector, 0x0008);
         assert_eq!(cpu.ldtr.base, 0x0004_0000);
         assert_eq!(cpu.ldtr.limit, 0x0fff);
+    }
+
+    #[test]
+    fn null_selector_loads_into_data_segments_without_fault() {
+        // MOV DS/ES/FS/GS, AX with AX = 0 (a null selector: index 0, TI 0). The 386 lets a
+        // null selector load into a data segment with no fault; only a later memory access
+        // through it #GPs. Descriptor bytes are irrelevant here (never read for a null load).
+        for (opcode_reg, segment) in [
+            (0xc0u8, SegmentIndex::Es), // MOV ES, AX (8E C0)
+            (0xd8, SegmentIndex::Ds),   // MOV DS, AX (8E D8)
+            (0xe0, SegmentIndex::Fs),   // MOV FS, AX (8E E0)
+            (0xe8, SegmentIndex::Gs),   // MOV GS, AX (8E E8)
+        ] {
+            let (mut cpu, memory) = protected_cpu(&[0x8e, opcode_reg], 0x0000_ffff, 0x0000_9200);
+            cpu.write_reg16(Reg16::Ax, 0x0000);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0x0000,
+                "{segment:?} must load the null selector"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).access & 0x80,
+                0,
+                "{segment:?} must install a not-present/unusable segment"
+            );
+        }
+    }
+
+    #[test]
+    fn access_through_a_null_data_segment_faults() {
+        // MOV DS, AX (8E D8) with AX = 0 loads DS as null (no fault); a following memory
+        // access through DS (MOV AL, [SI], opcode 8A 04) must then #GP -- the null segment's
+        // base=0/limit=0 default fails the segment-limit check for any nonzero offset.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8, 0x8a, 0x04], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        cpu.write_reg16(Reg16::Si, 0x0010);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // MOV DS, AX: loads null, no fault.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::SegmentLimit {
+                    segment: SegmentIndex::Ds,
+                    ..
+                })
+            ),
+            "access through a null DS must fault, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn null_selector_into_ss_still_faults() {
+        // MOV SS, AX (8E D0) with AX = 0. Unlike the data segments, a null selector loaded
+        // into SS must still #GP -- the stack segment can never be null.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd0], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+            ),
+            "a null selector into SS must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn ldt_selector_resolves_against_the_ldt_not_the_gdt() {
+        // Install an LDT (via LLDT) whose own descriptor lives at GDT selector 0x08, then load
+        // DS from an LDT selector (TI=1, index 1: selector 0x000c) whose descriptor lives at
+        // LDT offset 8. The GDT selector 0x08 descriptor is deliberately a system (LDT)
+        // descriptor, not a data segment: if a test regression accidentally indexed the GDT
+        // instead of the LDT for the DS load, it would read this LDT-type descriptor and the
+        // base/limit assertions below would fail.
+        let mut memory = vec![0u8; 0x400];
+        // GDT at 0x100 (base/limit set by protected_cpu below): selector 0x08 is the LDT
+        // system descriptor (base 0x0000_0200, limit 0x0f, access 0x82 = present, LDT type).
+        let ldt_desc_low = 0x0200_000f; // limit low = 0x0f, base[15:0] = 0x0200
+        let ldt_desc_high = 0x0000_8200; // base[31:24]=0, base[23:16]=0, access = 0x82 (present LDT)
+        let (mut cpu, mut code) =
+            protected_cpu(&[0x0f, 0x00, 0xd0, 0x8e, 0xd9], ldt_desc_low, ldt_desc_high);
+        code.resize(0x400, 0);
+        // LDT lives at 0x200 (matches the descriptor base above). LDT selector 0x000c is
+        // index 1 (byte offset 8) inside the LDT: a data segment, base 0x0005_0000, limit
+        // 0x00ff, access 0x92 (present, data, writable).
+        let ldt_base = 0x200usize;
+        code[ldt_base + 8..ldt_base + 12].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+        code[ldt_base + 12..ldt_base + 16].copy_from_slice(&0x0000_9205u32.to_le_bytes());
+        memory[..code.len()].copy_from_slice(&code);
+        cpu.write_reg16(Reg16::Ax, 0x0008); // LLDT AX: load LDTR from GDT selector 0x08.
+        cpu.write_reg16(Reg16::Cx, 0x000c); // MOV DS, CX: load DS from LDT selector 0x000c.
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // LLDT AX
+        assert_eq!(cpu.ldtr.base, 0x0000_0200);
+        cpu.cycle(&mut bus).unwrap(); // MOV DS, CX
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x000c);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ds).base,
+            0x0005_0000,
+            "DS must resolve against the LDT descriptor, not the GDT"
+        );
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).limit, 0x00ff);
+    }
+
+    #[test]
+    fn gdt_selector_still_loads_after_the_ldt_fix() {
+        // A plain GDT selector (TI=0) must still resolve against the GDT: regression guard for
+        // the TI-bit fix in `load_protected_segment`.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0008);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x0008);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).base, 0);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).limit, 0xffff);
+    }
+
+    #[test]
+    fn out_of_limit_selector_still_faults() {
+        // Selector 0x0028 (index 5) is past the GDT limit of 0x1f installed by `protected_cpu`
+        // (which only covers offsets 0 and 8): a genuinely invalid, non-null selector must
+        // still #GP, unaffected by the null-selector and LDT fixes.
+        let (mut cpu, memory) = protected_cpu(&[0x8e, 0xd8], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0028);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0028 })
+            ),
+            "an out-of-limit selector must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn retf_popping_a_null_selector_into_cs_faults() {
+        // RETF (0xcb) in protected mode with the stacked far pointer's selector word set to
+        // 0x0000 (null, index 0, TI 0). Unlike a data segment, CS must never be null: this
+        // exercises load_segment(..., SegmentIndex::Cs, ...) through the real RETF path
+        // (return_far -> load_segment -> load_protected_segment), not a synthetic direct call,
+        // so it also confirms IRET/interrupt-gate delivery's CS reload would fault the same way.
+        let (mut cpu, mut memory) = protected_cpu(&[0xcb], 0x0000_ffff, 0x0000_9200);
+        memory.resize(0x200, 0);
+        cpu.registers.set_esp(0x0100);
+        // Stacked far pointer at ss:0x0100: offset 0x1234, then selector 0x0000 (null).
+        memory[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes());
+        memory[0x102..0x104].copy_from_slice(&0x0000u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+            ),
+            "RETF popping a null selector into CS must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn ti_bit_set_index_zero_selector_resolves_against_the_ldt_not_treated_as_null() {
+        // Selector 0x0004: index 0, TI=1. This is NOT a null selector (only index 0 AND TI 0
+        // is null) -- it must resolve against LDT offset 0, not short-circuit into the
+        // null/unusable path. Install an LDT (via LLDT, GDT selector 0x08) whose first entry
+        // (offset 0) is a normal data descriptor, then load DS from selector 0x0004 and check
+        // the resulting base/limit came from that LDT descriptor.
+        let mut memory = vec![0u8; 0x400];
+        // GDT selector 0x08: LDT system descriptor, base 0x0000_0300, limit 0x0f, access 0x82.
+        let ldt_desc_low = 0x0300_000f;
+        let ldt_desc_high = 0x0000_8200;
+        let (mut cpu, mut code) =
+            protected_cpu(&[0x0f, 0x00, 0xd0, 0x8e, 0xd9], ldt_desc_low, ldt_desc_high);
+        code.resize(0x400, 0);
+        // LDT at 0x300 (matches the descriptor base above). LDT offset 0 (selector 0x0004,
+        // index 0, TI 1): data segment, base 0x0006_0000, limit 0x00aa, access 0x92.
+        let ldt_base = 0x300usize;
+        code[ldt_base..ldt_base + 4].copy_from_slice(&0x0000_00aau32.to_le_bytes());
+        code[ldt_base + 4..ldt_base + 8].copy_from_slice(&0x0000_9206u32.to_le_bytes());
+        memory[..code.len()].copy_from_slice(&code);
+        cpu.write_reg16(Reg16::Ax, 0x0008); // LLDT AX.
+        cpu.write_reg16(Reg16::Cx, 0x0004); // MOV DS, CX: selector 0x0004 (index 0, TI 1).
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // LLDT AX
+        assert_eq!(cpu.ldtr.base, 0x0000_0300);
+        cpu.cycle(&mut bus).unwrap(); // MOV DS, CX
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x0004);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ds).base,
+            0x0006_0000,
+            "index-0/TI-1 selector 0x0004 must resolve against LDT[0], not be treated as null"
+        );
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).limit, 0x00aa);
+        assert_ne!(
+            cpu.registers.segment(SegmentIndex::Ds).access & 0x80,
+            0,
+            "a resolved LDT descriptor load must install a present segment, not the null/unusable default"
+        );
     }
 
     #[test]
