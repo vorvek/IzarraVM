@@ -3,18 +3,11 @@
 //! The CT1745 mixer lives next to this in the machine crate. ADPCM, input/ADC,
 //! and MIDI/MPU-401 are not modeled yet.
 
-use crate::pcm::{sample_i16, sample_u8, sample_u16};
+use crate::pcm::{push_frame_capped, sample_i16, sample_u8, sample_u16};
 use std::collections::VecDeque;
 
 pub const DSP_VERSION_HI: u8 = 4;
 pub const DSP_VERSION_LO: u8 = 5;
-
-/// Bounded length of the rendered-frame ring, in stereo frames (~0.37 s at
-/// 22 kHz). The ring is a rate-match buffer between the per-CPU-clock producer
-/// (in `advance_devices`) and the host drainer (`render_dsp_audio`). On push
-/// when full it drops the oldest frame: audio fidelity may glitch, but the
-/// block counter and IRQ timing stay correct, which is the point of the split.
-const DSP_RING_CAP: usize = 8192;
 
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
@@ -55,7 +48,9 @@ pub struct SbDsp {
     // output frame (left then right). Set from the mixer each producer tick.
     sbpro_stereo: bool,
     // Rendered stereo frames produced by the per-CPU-clock producer, drained by
-    // the host audio path. See DSP_RING_CAP for the cap/drop-oldest policy.
+    // the host audio path. Rate-match buffer: on push when full the oldest
+    // frame drops (fidelity may glitch, block counter/IRQ timing stay
+    // correct). Cap and policy live in `pcm::push_frame_capped`.
     rendered: VecDeque<(i16, i16)>,
 }
 
@@ -313,10 +308,7 @@ impl SbDsp {
         W: FnMut() -> Option<u16>,
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
-            if self.rendered.len() >= DSP_RING_CAP {
-                self.rendered.pop_front();
-            }
-            self.rendered.push_back(frame);
+            push_frame_capped(&mut self.rendered, frame);
         }
     }
 
@@ -512,6 +504,12 @@ impl SbDsp {
                     self.half_reached = false;
                     self.irq_pending = false;
                     self.pending = None;
+                    // The mode latches must clear too, or the idle 16-bit
+                    // guard in render_frame keeps direct DAC dead after any
+                    // 16-bit session.
+                    self.dma_16bit = false;
+                    self.stereo = false;
+                    self.sample_signed = false;
                 }
                 true
             }
@@ -585,6 +583,23 @@ mod tests {
         let mut dsp = SbDsp::default();
         write_cmd(&mut dsp, &[0x10, 0x80]);
         assert_eq!(dsp.direct_dac_byte(), Some(0x80));
+    }
+
+    #[test]
+    fn reset_clears_the_16bit_mode_latch_so_direct_dac_works_again() {
+        let mut dsp = SbDsp::default();
+        // Arm a 16-bit signed stereo auto-init playback (0xB6, mode 0x30).
+        write_cmd(&mut dsp, &[0xB6, 0x30, 0x07, 0x00]);
+        // Game resets the DSP (halt playback), then falls back to direct DAC.
+        dsp.write_port(0x226, 0x01);
+        dsp.write_port(0x226, 0x00);
+        write_cmd(&mut dsp, &[0x10, 0x80]);
+        let frame = dsp.render_frame(|| None, || None);
+        assert_eq!(
+            frame,
+            Some((0, 0)),
+            "direct DAC byte 0x80 (midpoint) must render after a reset"
+        );
     }
 
     #[test]

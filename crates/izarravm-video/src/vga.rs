@@ -1477,6 +1477,7 @@ impl Vga {
             self.vram.fill(0);
         }
         self.presented = None; // drop any stale frame from a prior mode
+        self.pending_start = None; // the mode set reprograms the start address
         self.reset_palette_defaults(mode);
         self.seed_vgabios_attr_readback(mode);
         self.resize_work();
@@ -3423,13 +3424,14 @@ impl Vga {
         {
             match index {
                 0x06 => self.crtc_regs.r06 = value,
-                0x07 => self.crtc_regs.r07 = value,
-                0x09 => self.crtc_regs.r09 = value,
                 0x10 => self.crtc_regs.r10 = value,
-                0x11 => self.crtc_regs.r11 = value,
                 0x12 => self.crtc_regs.r12 = value,
                 0x15 => self.crtc_regs.r15 = value,
                 0x16 => self.crtc_regs.r16 = value,
+                // 0x07/0x09/0x11 are already stored (with their line-compare
+                // side effects) by the main match above; they only need the
+                // vertical-timing recompute here.
+                0x07 | 0x09 | 0x11 => {}
                 _ => unreachable!(),
             }
             self.recompute_vertical_timing();
@@ -3511,6 +3513,7 @@ impl Vga {
             self.vram.fill(0);
         }
         self.presented = None; // drop any stale frame from a prior mode
+        self.pending_start = None; // the mode set reprograms the start address
         self.reset_palette_defaults(0x13);
         self.seed_vgabios_attr_readback(0x13);
         self.resize_work();
@@ -5592,6 +5595,23 @@ mod tests {
         vga.set_start_address(0x4000);
         vga.advance(vga.frame_dots());
         assert_eq!(vga.crtc.start_address, 0x4000, "no two-frame lag");
+    }
+
+    #[test]
+    fn mode_set_discards_a_stale_pending_start_address() {
+        // A BIOS mode set reprograms the start address, so a page-flip latch
+        // from the prior mode must not be applied at the next frame boundary.
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.set_start_address(0x2000); // flip latched, not yet applied
+        vga.set_mode13h();
+        vga.advance(vga.frame_dots());
+        assert_eq!(vga.crtc.start_address, 0, "13h scanout starts at 0");
+
+        vga.set_start_address(0x4000);
+        vga.set_mode_0dh();
+        vga.advance(vga.frame_dots());
+        assert_eq!(vga.crtc.start_address, 0, "0Dh scanout starts at 0");
     }
 
     #[test]

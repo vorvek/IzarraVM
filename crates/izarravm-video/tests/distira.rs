@@ -1,17 +1,17 @@
 use izarravm_video::{
     BIG_DISTIRA_CHIP_NAME, DACDATA_ADDR_SHIFT, DACDATA_RD, DEPTHOP_ALWAYS, DEPTHOP_LESSTHAN,
-    Distira, DistiraVertex, FBZ_CHROMAKEY, FBZ_DEPTH_ENABLE, FBZ_DEPTH_OP_SHIFT, FBZ_DEPTH_WMASK,
-    FBZ_DRAW_BACK, FBZ_RGB_WMASK, FBZ_W_BUFFER, INIT_ENABLE_REMAP, LFB_FORMAT_ARGB8888,
-    LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE, SST_CHROMA_KEY, SST_CLIP_LEFT_RIGHT,
-    SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_DR_DX, SST_DR_DY, SST_DW_DX, SST_DW_DY,
-    SST_FASTFILL_CMD, SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7,
-    SST_FBI_ZFUNC_FAIL, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_FDR_DX, SST_FDR_DY, SST_FDZ_DX,
-    SST_FOG_COLOR, SST_FOG_MODE, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R, SST_FSTART_Z,
-    SST_FTRIANGLE_CMD, SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX, SST_FVERTEX_BY,
-    SST_FVERTEX_CX, SST_FVERTEX_CY, SST_HV_RETRACE, SST_LFB_MODE, SST_START_B, SST_START_G,
-    SST_START_R, SST_START_W, SST_START_Z, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD,
-    SST_V_RETRACE, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX,
-    SST_VERTEX_CY,
+    Distira, DistiraVertex, FBZ_CHROMAKEY, FBZ_CLIP_ENABLE, FBZ_DEPTH_ENABLE, FBZ_DEPTH_OP_SHIFT,
+    FBZ_DEPTH_WMASK, FBZ_DRAW_BACK, FBZ_RGB_WMASK, FBZ_W_BUFFER, INIT_ENABLE_REMAP,
+    LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE, SST_CHROMA_KEY,
+    SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_DR_DX, SST_DR_DY,
+    SST_DW_DX, SST_DW_DY, SST_FASTFILL_CMD, SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2,
+    SST_FBI_INIT3, SST_FBI_INIT7, SST_FBI_ZFUNC_FAIL, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_FDR_DX,
+    SST_FDR_DY, SST_FDZ_DX, SST_FOG_COLOR, SST_FOG_MODE, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R,
+    SST_FSTART_Z, SST_FTRIANGLE_CMD, SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX,
+    SST_FVERTEX_BY, SST_FVERTEX_CX, SST_FVERTEX_CY, SST_HV_RETRACE, SST_LFB_MODE, SST_START_B,
+    SST_START_G, SST_START_R, SST_START_W, SST_START_Z, SST_STATUS, SST_SWAPBUFFER_CMD,
+    SST_TRIANGLE_CMD, SST_V_RETRACE, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY,
+    SST_VERTEX_CX, SST_VERTEX_CY,
 };
 
 fn read_reg(distira: &Distira, reg: usize) -> u32 {
@@ -214,6 +214,44 @@ fn triangle_cmd_rasterizes_flat_untextured_triangle_from_integer_registers() {
     assert_eq!(frame[5], 0x00ff_0000);
     assert_eq!(frame[6], 0x0000_0000);
     assert_eq!(frame[8], 0x00ff_0000);
+}
+
+#[test]
+fn triangle_cmd_honors_the_clip_rectangle_when_enabled() {
+    // fbzMode bit 0 enables the clip rectangle for rendering; fastfill
+    // already uses it as its extent, triangles must intersect with it.
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_CLIP_ENABLE,
+    );
+    write_reg(&mut distira, SST_CLIP_LEFT_RIGHT, (1 << 16) | 3);
+    write_reg(&mut distira, SST_CLIP_LOW_Y_HIGH_Y, (1 << 16) | 3);
+    // Triangle large enough to cover the whole 4x4 target.
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 8 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 8 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0, "outside clip (0,0) untouched");
+    assert_eq!(frame[3], 0, "outside clip (3,0) untouched");
+    assert_eq!(frame[4], 0, "outside clip (0,1) untouched");
+    assert_eq!(frame[5], 0x00ff_0000, "inside clip (1,1) filled");
+    assert_eq!(frame[10], 0x00ff_0000, "inside clip (2,2) filled");
+    assert_eq!(frame[15], 0, "outside clip (3,3) untouched");
 }
 
 #[test]
@@ -3329,6 +3367,27 @@ fn dac_data_write_side_effects_are_accepted_without_special_casing() {
         (5 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
     );
     assert_eq!(read_reg(&distira, SST_FBI_INIT2) & 0xff, 0xff);
+}
+
+#[test]
+fn dac_read_cycle_returns_the_addressed_register() {
+    // A read cycle against a non-PLL DAC register must answer with THAT
+    // register's byte, not whatever dac_data[7] (the PLL index latch) holds.
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_REMAP);
+
+    write_reg(&mut distira, SST_DAC_DATA, (2 << DACDATA_ADDR_SHIFT) | 0x42);
+    write_reg(&mut distira, SST_DAC_DATA, (7 << DACDATA_ADDR_SHIFT) | 0x99);
+    write_reg(
+        &mut distira,
+        SST_DAC_DATA,
+        (2 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
+    );
+    assert_eq!(
+        read_reg(&distira, SST_FBI_INIT2) & 0xff,
+        0x42,
+        "register 2 reads back its own byte"
+    );
 }
 
 #[test]
