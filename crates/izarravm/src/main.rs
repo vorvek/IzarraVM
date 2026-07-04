@@ -2649,35 +2649,40 @@ del PREEXIST.TXT\r\n";
 
     /// TokaEdit e2e: EDIT.COM opens a new file at the prompt, text is typed,
     /// File>Save and File>Exit are driven via Alt-menu keys, and the saved bytes
-    /// arrive on the host through the Katea folder. Letters/Enter only (layout
-    /// gotcha) plus raw Alt make/break scancodes.
+    /// arrive on the host through the Katea folder.
     ///
-    /// BLOCKED on a TokaEdit C-side bug found while writing this test (see the
-    /// report for the full investigation): `ev_wait` in
-    /// toka-dos/tools-src/edit/tui.c spuriously synthesizes an `EV_ALT_TAP`
-    /// event (a bare Alt press-and-release with no other key seen) on
-    /// idle-to-keypress transitions where no real Alt press ever happened --
-    /// confirmed with the BIOS's own KB_FLAGS byte read as 0x00 throughout, and
-    /// with a COM1-traced instrumented rebuild of EDIT.COM showing the very
-    /// first dispatched event is `EV_ALT_TAP` even though only a plain letter,
-    /// arrow key, or Escape was injected. That spurious tap arms the menu bar
-    /// (`menu_run(-1, ...)`, `pd_open=false`) and swallows the next keystroke as
-    /// a menu-bar hotkey/navigation input instead of routing it to the document
-    /// or dispatch layer. Escape reliably dismisses the armed bar with no side
-    /// effect on the document, and batching Escape's scancodes with a real
-    /// keystroke in one `inject_key_scancodes` call (no run in between) reliably
-    /// gets a single plain character through — that technique is used below for
-    /// the document text. It does NOT reliably work for the Alt+F chord that
-    /// opens the File menu: dozens of interactive probes and instrumented
-    /// rebuilds during the investigation could not find a keystroke sequencing
-    /// that opens File deterministically (the chord is sometimes swallowed
-    /// whole with zero visible effect, apparently because the Alt make/break
-    /// bytes never reach the BIOS keyboard buffer at all -- only real,
-    /// ASCII-bearing keys do -- so the guest's idle-poll can land in the gap
-    /// between them and misfire). Per the task instructions this is reported
-    /// rather than patched silently; the test below verifies everything that
-    /// IS solid (boot, `edit HELLO`, typing into the open document) and stops
-    /// short of Save/Exit.
+    /// Root-caused a real, if rare, phantom-Alt bug (not the startup
+    /// `EV_ALT_TAP` a prior investigation suspected -- that edge detector is
+    /// fine, and a live COM1 trace showed it never fired here). The actual
+    /// mechanism, isolated with a `dispatch()`-side COM1 trace: a single
+    /// `_bios_keybrd(_KEYBRD_SHIFTSTATUS)` (`int 16h ah=02h`) call -- and even
+    /// a direct peek of the BDA `KB_FLAGS` byte (0x417) itself, bypassing INT
+    /// 16h entirely -- can occasionally read the Alt bit set for exactly one
+    /// poll iteration coinciding with an ordinary keystroke (observed: 'h',
+    /// scancode 0x23), with no sustained held key behind it and nothing
+    /// visible to external host-side sampling even at 2500-cycle granularity.
+    /// `ev_wait` then reports that key as Alt+H, which `dispatch()` treats as
+    /// the Alt+H menu hotkey, opening Help instead of typing the letter. This
+    /// reproduces deterministically with the committed image (fails 8/8,
+    /// passed with an earlier image build whose embedded FreeDOS
+    /// kernel-build timestamp shifted every downstream byte offset) -- a
+    /// genuine timing-sensitive glitch in the keyboard delivery path, not a
+    /// logic bug in the BIOS assembly (`kbd-bios-core.inc`'s `.flags` handler
+    /// is a plain `mov al,[KB_FLAGS]`), the CPU's INT/IRET/IRQ dispatch
+    /// (independently audited clean: IRQ1 only lands at instruction
+    /// boundaries and never touches AX), the 8042 model, or the mouse driver
+    /// (the glitch reproduces with TOKAMOUS unloaded too). A same-iteration
+    /// debounce (reading shift status twice and ANDing) was tried and
+    /// rejected: the glitch is wide enough to survive two back-to-back INT
+    /// 16h calls, and the debounce then started eating the *real* Alt+F
+    /// chord too. Fixed on the editor side in `ev_wait`
+    /// (toka-dos/tools-src/edit/tui.c) with a cross-poll confirmation
+    /// counter per modifier bit: a bit only counts toward `e->mods` once it
+    /// has read high on two consecutive `ev_wait` *loop iterations* (not two
+    /// reads within one), which a one-poll glitch cannot satisfy but a
+    /// genuinely held key (down across many polls) satisfies almost
+    /// instantly. Spacing each of the four Alt+F scancodes with its own
+    /// `run_until_halt_or_cycles` call (below) lets the menu open reliably.
     #[test]
     #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
     fn tokaedit_edits_and_saves_a_file() {
@@ -2712,10 +2717,6 @@ del PREEXIST.TXT\r\n";
         }
 
         // `edit HELLO` opens a new file named HELLO (no '.' keystroke needed).
-        // Plain injection here: this text goes to COMMAND.COM's own command
-        // line, not TokaEdit's event loop, so it is not subject to the spurious-
-        // Alt-tap bug documented above (and priming it with Escape would just
-        // clear the line).
         for ch in "edit hello\r".chars() {
             for code in ascii_to_set1(ch) {
                 machine.inject_key_scancodes(&[code]);
@@ -2734,14 +2735,8 @@ del PREEXIST.TXT\r\n";
             panic!("EDIT did not open HELLO (stop={stop:?}).\n{editor_text}");
         }
 
-        // Type the document body. Escape's scancodes are batched ahead of each
-        // character's own scancodes (one `inject_key_scancodes` call, no run in
-        // between): the spurious tap described above claims the harmless
-        // Escape and the real character behind it goes through normally.
+        // Type the document body: plain characters, one at a time.
         for ch in "hi".chars() {
-            for code in ascii_to_set1('\x1b') {
-                machine.inject_key_scancodes(&[code]);
-            }
             for code in ascii_to_set1(ch) {
                 machine.inject_key_scancodes(&[code]);
             }
@@ -2751,10 +2746,67 @@ del PREEXIST.TXT\r\n";
         }
 
         let body_text = machine.screen_text().as_text();
+        if !body_text.contains("hi") {
+            let trace = String::from_utf8_lossy(machine.serial_output()).into_owned();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "document text 'hi' did not land in the buffer.\n{body_text}\n=== COM1 ===\n{trace}"
+            );
+        }
+
+        // File > Save: Alt+F opens the File menu, then 's' picks "&Save".
+        // Each scancode gets its own run slice -- see the root-cause note
+        // above for why a single batched injection can't deliver this chord.
+        for code in [0x38u8, 0x21, 0xa1, 0xb8] {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("alt+f chord step");
+        }
+        let menu_text = machine.screen_text().as_text();
+        if !menu_text.contains("Save") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("File menu did not open after Alt+F.\n{menu_text}");
+        }
+        for code in ascii_to_set1('s') {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("save hotkey step");
+        }
+        machine
+            .run_until_halt_or_cycles(50_000_000)
+            .expect("settle save");
+
+        // File > Exit: Alt+F, then 'x' picks "E&xit".
+        for code in [0x38u8, 0x21, 0xa1, 0xb8] {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("alt+f chord step (exit)");
+        }
+        for code in ascii_to_set1('x') {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("exit hotkey step");
+        }
+        machine
+            .run_until_halt_or_cycles(100_000_000)
+            .expect("settle exit");
+
+        let after_exit = machine.screen_text().as_text().to_ascii_lowercase();
+        if !after_exit.contains("c:\\>") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("did not return to the C:\\> prompt after Save/Exit.\n{after_exit}");
+        }
+
+        machine.flush_hdd_folder();
+        let saved = std::fs::read(dir.join("HELLO")).expect("HELLO written to host folder");
         std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            body_text.contains("hi"),
-            "document text 'hi' did not land in the buffer.\n{body_text}"
+        assert_eq!(
+            saved, b"hi\r\n",
+            "saved HELLO bytes did not match the typed document body"
         );
     }
 

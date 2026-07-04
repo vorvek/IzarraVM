@@ -155,6 +155,15 @@ void ev_wait(Event *e) {
     static int prev_btn = 0;
     static int prev_row = 0, prev_col = 0;
     static int have_prev_mouse = 0;
+    /* Cross-poll confirmation counters for the shift/ctrl/alt bits used in a
+     * key event's mods (see the long comment below for why this exists). A
+     * bit only counts as "held" once it has read high on two consecutive
+     * ev_wait loop iterations; count resets to 0 the instant a poll reads it
+     * low. A genuinely held modifier key stays down across many polls and
+     * confirms almost immediately; a one-shot glitch never reaches 2. */
+    static int shift_confirm = 0;
+    static int ctrl_confirm = 0;
+    static int alt_confirm = 0;
 
     for (;;) {
         int shift_state;
@@ -163,6 +172,14 @@ void ev_wait(Event *e) {
 
         shift_state = _bios_keybrd(_KEYBRD_SHIFTSTATUS);
         alt_down = (shift_state & 0x08) ? 1 : 0;
+
+        /* Update the cross-poll confirmation counters every iteration (not
+         * just when a key is ready), so a modifier held down WHILE waiting
+         * for the next key is already confirmed by the time that key
+         * arrives. */
+        shift_confirm = (shift_state & 0x03) ? (shift_confirm < 2 ? shift_confirm + 1 : 2) : 0;
+        ctrl_confirm  = (shift_state & 0x04) ? (ctrl_confirm  < 2 ? ctrl_confirm  + 1 : 2) : 0;
+        alt_confirm   = (shift_state & 0x08) ? (alt_confirm   < 2 ? alt_confirm   + 1 : 2) : 0;
 
         if (_bios_keybrd(_KEYBRD_READY)) {
             unsigned key;
@@ -179,13 +196,28 @@ void ev_wait(Event *e) {
                 key_seen_while_alt = 1;
             }
 
+            /* Root cause (see the task's investigation notes): a single
+             * _bios_keybrd(SHIFTSTATUS) read -- and even the BDA 0x417 byte
+             * itself, read directly -- can occasionally show a modifier bit
+             * (observed: Alt) for exactly one poll iteration coinciding with
+             * an ordinary keystroke, with no sustained held key behind it;
+             * BIOS assembly, the CPU's INT/IRET/IRQ dispatch, the 8042 model,
+             * and the mouse driver were all independently audited clean, and
+             * the glitch reproduces with the mouse driver unloaded, so it is
+             * some other transient in the keyboard delivery timing rather
+             * than a logic bug in any single one of those layers. A bit is
+             * only trusted for e->mods if it has been observed for 2
+             * consecutive polls (see the confirm counters above): a real
+             * held modifier is down across many polls and satisfies this
+             * almost instantly, while a one-poll glitch never does.
+             */
             e->kind = EV_KEY;
             e->scan = scan;
             e->ascii = ascii;
             e->mods = 0;
-            if (shift_state & 0x03) e->mods |= 0x01;
-            if (shift_state & 0x04) e->mods |= 0x02;
-            if (shift_state & 0x08) e->mods |= 0x04;
+            if (shift_confirm >= 2) e->mods |= 0x01;
+            if (ctrl_confirm >= 2) e->mods |= 0x02;
+            if (alt_confirm >= 2) e->mods |= 0x04;
             e->mrow = 0;
             e->mcol = 0;
             return;
