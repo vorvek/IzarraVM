@@ -5016,24 +5016,16 @@ impl Cpu386 {
                     }
                     .into());
                 }
-                // 386 PRM POP operation: "DEST <- (SS:ESP); ESP <- ESP + 4" -- the stack
-                // pointer is already advanced by the time the destination is addressed. When
-                // the r/m destination is itself (E)SP-relative (e.g. `pop dword [esp+4]`),
-                // its effective address must be computed from the POST-increment (E)SP, not
-                // the pre-pop value. `resolve_decoded_modrm_operand` reads live GPRs, so it
-                // must run after `self.pop`, not before (the PUSH r/m32-with-ESP-base analog
-                // -- see the PUSH SP note in the same manual -- is the mirror-image caution:
-                // that source read happens before the decrement, so PUSH keeps its EA-then-op
-                // order and only POP's is swapped here).
-                // 386 PRM POP operation: "DEST <- (SS:ESP); ESP <- ESP + 4" -- the stack
-                // pointer is already advanced by the time the destination is addressed. When
-                // the r/m destination is itself (E)SP-relative (e.g. `pop dword [esp+4]`),
-                // its effective address must be computed from the POST-increment (E)SP, not
-                // the pre-pop value. `resolve_decoded_modrm_operand` reads live GPRs, so it
-                // must run after `self.pop`, not before (the PUSH r/m32-with-ESP-base analog
-                // -- see the PUSH SP note in the same manual -- is the mirror-image caution:
-                // that source read happens before the decrement, so PUSH keeps its EA-then-op
-                // order and only POP's is swapped here).
+                // The 386 PRM's POP pseudocode ("DEST <- (SS:ESP); ESP <- ESP + 4") does not
+                // say when the destination EA is computed relative to the increment. The
+                // modern Intel SDM is explicit: "the POP instruction computes the effective
+                // address of the operand after it increments the ESP register." Real silicon
+                // agrees: JEMM's DisableInts `pop [esp+4]` gadget only works if the EA is
+                // resolved from the POST-increment (E)SP. `resolve_decoded_modrm_operand`
+                // reads live GPRs, so it must run after `self.pop`, not before (the PUSH
+                // r/m32-with-ESP-base analog -- see the PUSH SP note in the same manual -- is
+                // the mirror-image caution: that source read happens before the decrement, so
+                // PUSH keeps its EA-then-op order and only POP's is swapped here).
                 let esp_before = self.registers.esp();
                 let value = self.pop(bus, operand_size)?;
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
