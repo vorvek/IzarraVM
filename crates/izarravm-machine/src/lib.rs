@@ -78,6 +78,11 @@ const VGA_BIOS_INT1F_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1F_FONT_OFF as
 /// free space inside the VGA BIOS span (0xC0000-0xC7FFF); the VGA BIOS only
 /// uses through ~0xC3C00, so 0xC4000 is available without a new UMA reservation.
 const CODEPAGE_FONT_WINDOW: u32 = 0xC4000;
+/// Size of the video option ROM span this machine backs with flat RAM
+/// (INT 10h/1D/43/44/1F tables plus the code-page font bank): 32 KiB, matching
+/// where a real VGA adapter's option ROM lives. One past this, at 0xC8000, is
+/// the first byte of open, unoccupied upper memory.
+const VGA_BIOS_SPAN_SIZE: u32 = 0x8000;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
@@ -10385,13 +10390,19 @@ impl CpuBus for MachineBus<'_> {
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
         //
-        // In booter-inert mode the DOS multiplex vector (INT 2Fh) stands down so a
-        // self-booting disk owns it through the IVT; the BIOS hardware services
-        // (0x10-0x1A) stay intercepted. (The pure DOS vectors 0x20-0x2E are no
-        // longer intercepted at all — the Rust DOS kernel that serviced them was
-        // retired in SP-3 — and INT 67h is no longer intercepted either: the
-        // TOKAEMM guest driver owns the EMS API since SP-4b M2.)
-        let dos_multiplex = vector == 0x2F;
+        // The DOS multiplex vector (INT 2Fh) HLE -- including the AX=1686h/1687h
+        // DPMI-install check -- only stands in for a real handler when none
+        // exists. If the guest has hooked IVT[0x2F] itself (a DPMI host such as
+        // JEMMEX or DOS/32A's stub installing over it), that real handler must
+        // run instead, the same way the absent-resident-API vectors below stand
+        // down once something takes their vector over. In booter-inert mode it
+        // also stands down so a self-booting disk owns it through the IVT; the
+        // BIOS hardware services (0x10-0x1A) stay intercepted regardless. (The
+        // pure DOS vectors 0x20-0x2E are no longer intercepted at all — the Rust
+        // DOS kernel that serviced them was retired in SP-3 — and INT 67h is no
+        // longer intercepted either: the TOKAEMM guest driver owns the EMS API
+        // since SP-4b M2.)
+        let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
         let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
             && self.vector_points_at_rom_iret(vector)?;
         // A `new_raw_program` machine keeps INT 20h/21h/27h intercepted so the run
@@ -10400,21 +10411,11 @@ impl CpuBus for MachineBus<'_> {
         let raw_program_vector = self.program_runtime && matches!(vector, 0x20 | 0x21 | 0x27);
         let intercepted = matches!(
             vector,
-            0x10 | 0x11
-                | 0x12
-                | 0x13
-                | 0x14
-                | 0x15
-                | 0x17
-                | 0x18
-                | 0x19
-                | 0x1A
-                | 0x2F
-                | 0x40
-                | 0x42
+            0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x17 | 0x18 | 0x19 | 0x1A | 0x40 | 0x42
         ) || raw_program_vector
-            || absent_resident_api;
-        if intercepted && !(self.booter_inert && dos_multiplex) {
+            || absent_resident_api
+            || dos_multiplex;
+        if intercepted && !(self.booter_inert && vector == 0x2F) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -11683,6 +11684,13 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        if is_open_bus_uma(address, width) {
+            // Unoccupied upper memory: open bus reads as 0xFF, matching a real
+            // machine's floating data bus over an adapter-free UMA hole.
+            out.fill(0xff);
+            return Ok(());
+        }
+
         let end = address as usize + width;
         if end <= self.memory.len() {
             out.copy_from_slice(&self.memory.as_slice()[address as usize..end]);
@@ -11698,6 +11706,12 @@ impl MachineBus<'_> {
         }
 
         if rom_offset(address, 1).is_some() {
+            return Ok(());
+        }
+
+        if is_open_bus_uma(address, 1) {
+            // Unoccupied upper memory: open bus, a write with nothing wired to
+            // receive it.
             return Ok(());
         }
 
@@ -11995,6 +12009,28 @@ fn rom_offset(address: u32, width: usize) -> Option<usize> {
     } as usize;
 
     (offset + width <= BIOS_ROM_SIZE).then_some(offset)
+}
+
+/// True if `address` (for an access of `width` bytes, entirely) falls in the
+/// unoccupied part of the upper-memory area: the UMB-able holes between the
+/// video option ROM span and the system BIOS, 0xC8000-0xEFFFF. On a real
+/// machine nothing answers there unless an adapter or a memory manager's
+/// page-frame claims it; this machine's own occupants (VGA BIOS data tables,
+/// the code-page font bank, TOKAEMM's linear-to-extended-RAM UMB remap) all
+/// live below 0xC8000 or are reached through paging at a physical address
+/// above 1 MiB, so this range check never needs to special-case them.
+///
+/// Guests that probe the UMA for a free window (JEMMEX and other EMS/UMB
+/// managers scanning for a page frame) rely on this reading as open bus
+/// (conventionally 0xFF, writes ignored), exactly like the existing
+/// 0x201/0x280-0x28F/0x5658 open-bus port conventions but for memory instead
+/// of I/O space.
+fn is_open_bus_uma(address: u32, width: usize) -> bool {
+    let uma_occupied_end = UPPER_MEMORY_BASE + VGA_BIOS_SPAN_SIZE;
+    let Some(end) = address.checked_add(width as u32) else {
+        return false;
+    };
+    address >= uma_occupied_end && end <= SYSTEM_ROM_BASE
 }
 
 fn video_text_offset(base: u32, address: u32, width: usize) -> Option<usize> {
@@ -13531,6 +13567,57 @@ mod tests {
                 "the aliased write left the extended cell alone"
             );
         }
+    }
+
+    #[test]
+    fn unoccupied_upper_memory_reads_open_bus() {
+        // 0xC8000-0xEFFFF are the UMB-able holes above the VGA option ROM span
+        // and below the system BIOS. Nothing on this machine's default boot
+        // claims them, so a probe (JEMMEX and other EMS/UMB managers scan the
+        // UMA for a free page frame) must see open bus, not RAM that happens
+        // to hold whatever was last written there.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        for addr in [0xC8000u32, 0xC8001, 0xE0000, 0xEFFFF] {
+            assert_eq!(
+                bus.read_memory(addr, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap(),
+                0xff,
+                "address {addr:#08x} must read open bus"
+            );
+        }
+        // A write finds nothing wired to receive it: read-back still 0xFF.
+        bus.write_memory(0xD0000, BusWidth::Byte, 0x42, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0xD0000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xff,
+            "an open-bus write must not stick"
+        );
+        // The occupied VGA BIOS span (0xC0000-0xC7FFF) is unaffected: it is
+        // genuinely backed and keeps its written content.
+        bus.write_memory(0xC5000, BusWidth::Byte, 0x99, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0xC5000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0x99,
+            "the VGA BIOS span is still flat-RAM-backed, not open bus"
+        );
+        // The system BIOS ROM shadow at 0xF0000 is unaffected: a write is a
+        // silent no-op (ROM), not open bus 0xFF read-back of arbitrary content.
+        let before = bus
+            .read_memory(0xF0000, BusWidth::Byte, BusAccessKind::DataRead)
+            .unwrap();
+        bus.write_memory(0xF0000, BusWidth::Byte, !before, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0xF0000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            before,
+            "the BIOS ROM shadow ignores writes and keeps its ROM content"
+        );
     }
 
     #[test]
@@ -17072,6 +17159,36 @@ mod tests {
         assert_eq!(
             m.pending_soft_int, None,
             "an un-intercepted vector is ignored"
+        );
+    }
+
+    #[test]
+    fn int2f_stands_down_when_a_guest_dpmi_host_hooks_the_vector() {
+        let mut m = int15_machine(16);
+
+        // Default boot: IVT[0x2F] is still the ROM IRET stub, so the multiplex
+        // HLE intercepts as always.
+        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x2f),
+            "default boot: INT 2Fh is intercepted (no guest hook present)"
+        );
+        m.pending_soft_int = None;
+
+        // Simulate a guest DPMI host (e.g. JEMMEX) hooking IVT[0x2F] to point at
+        // its own handler in guest RAM instead of the ROM IRET stub.
+        {
+            let bus = m.make_bus();
+            bus.memory.write_u16(0x2f * 4, 0x128e).unwrap();
+            bus.memory.write_u16(0x2f * 4 + 2, 0x00d8).unwrap();
+        }
+        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int, None,
+            "guest-hooked INT 2Fh: the HLE stands down so the guest's own handler runs \
+             (this is what lets a real DPMI host answer AX=1686h/1687h instead of the \
+             HLE's stale \"no host\" answer)"
         );
     }
 

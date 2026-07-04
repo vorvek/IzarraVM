@@ -126,6 +126,40 @@ const CPUID_EXT_FEATURES_EDX: u32 = CPUID_FEATURE_TSC
 // outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
 const CR4_TSD: u32 = 0x0000_0004;
 
+// The full set of CR4 bits this GSW-586 (K6-class) persona defines at all, per the AMD-K6
+// BIOS and Software Tools Developers Guide S: 3.7 (Control Register 4 (CR4) Extensions,
+// Figure 13 / Table 19): VME(0), PVI(1), TSD(2), DE(3), PSE(4), MCE(6), GPE(7, the K6's
+// name for what later became PGE). Bit 5 and bits 31:8 are reserved on real K6 hardware.
+// Only TSD is behaviorally wired up (see CR4_TSD above); VME/PVI/DE/PSE/MCE/GPE are not
+// emulated (the matching CPUID feature bits stay clear, matching the leaf-1 comment
+// above), but a guest is still allowed to set/clear/read them back as inert storage --
+// real firmware and memory managers probe CR4 this way. Bits outside this mask are
+// rejected on write: the same K6 guide's MOV-to/from-CR4 exception table (S: MOV to and
+// from CR4) lists a fault "If 1 is written to any reserved bits" in Real, Virtual-8086,
+// and Protected mode alike, and the Pentium Vol. 3 instruction reference repeats it
+// verbatim ("#GP(0)"/"Interrupt 13 if an attempt is made to write a 1 to any reserved
+// bits of CR4"). So a reserved-bit write faults with #GP(0), the same as EFER/STAR.
+const CR4_DEFINED_MASK: u32 = 0x0000_009f; // bits 0-4, 6-7
+
+// DR6 (debug status): bits 0-3 are B0-B3 (which breakpoint condition matched), bit 13
+// is BD (an attempt to access a debug register while GD was set), bit 14 is BS (the
+// trap flag caused this #DB), bit 15 is BT (a task switch caused this #DB). 386 PRM
+// ch12 (Debug Registers) documents bits 4-11 and 16-31 as defined-1 on reset and not
+// guaranteed to read as written -- this core stores whatever is written to keep MOV DR6
+// round-tripping simple, which is sufficient because breakpoint matching (the only thing
+// that would actually set B0-B3/BS/BT/BD) is not implemented yet (ledger row 26,
+// deferred). DR6 reset value per the PRM is 0xFFFF_0FF0.
+const DR6_RESET: u32 = 0xffff_0ff0;
+
+// DR7 (debug control): bits 0-7 are the L0-L3/G0-G3 local/global breakpoint enables,
+// bit 8 LE and bit 9 GE are the (obsolete-by-386) exact-breakpoint-cycle enables, bit 13
+// is GD (general detect -- traps any MOV DR), bits 16-31 are the four LEN/R-W condition
+// fields for DR0-DR3. Bits 10, 12, 14-15 are hardwired: 386 PRM ch12 defines bit 10 as
+// always 1; the others are reserved-as-0 here since this core does not model LE/GE cycle
+// exactness. Reset value per the PRM is 0x0000_0400 (bit 10 set, everything else clear).
+const DR7_RESET: u32 = 0x0000_0400;
+const DR7_FIXED_ONE: u32 = 0x0000_0400; // bit 10, always reads back as 1
+
 // K6 model-specific register addresses (the value the RDMSR/WRMSR ECX selector carries).
 // This is the full software-visible set from the AMD-K6 BIOS and Software Tools guide:
 // the two machine-check registers, the time-stamp counter, the AMD extended-feature and
@@ -409,7 +443,7 @@ impl Registers {
 // correctly CR0 bit 18, so it powers up masked at zero. Bit 4 is ET, which an old
 // 386 reset forced on; here it stays 0 since no x87 FPU is emulated, so the default
 // is a plain zero (derived).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlRegisters {
     pub cr0: u32,
     pub cr2: u32,
@@ -418,6 +452,29 @@ pub struct ControlRegisters {
     // RDTSC outside CPL 0); the rest is plain read/write storage so MOV CR4 round-
     // trips. Reset is all zero.
     pub cr4: u32,
+    // DR0-DR3: linear breakpoint addresses (386 PRM ch12). Storage only -- no
+    // breakpoint matching or #DB generation is implemented (ledger row 26, deferred).
+    pub dr0_3: [u32; 4],
+    // DR6 (debug status) and DR7 (debug control). See DR6_RESET/DR7_RESET/DR7_FIXED_ONE
+    // above for the bit layout and reset values. DR4/DR5 alias these two on a 386 or on
+    // any later part with CR4.DE clear (the default here, since DE is not behaviorally
+    // wired up) -- see the 0x0f21/0x0f23 handlers.
+    pub dr6: u32,
+    pub dr7: u32,
+}
+
+impl Default for ControlRegisters {
+    fn default() -> Self {
+        ControlRegisters {
+            cr0: 0,
+            cr2: 0,
+            cr3: 0,
+            cr4: 0,
+            dr0_3: [0; 4],
+            dr6: DR6_RESET,
+            dr7: DR7_RESET,
+        }
+    }
 }
 
 /// The K6 model-specific register file behind RDMSR/WRMSR. MCAR/MCTR/WHCR are plain
@@ -3774,12 +3831,11 @@ impl Cpu386 {
                 0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
                 // System / descriptor-table / segment block (task A12), 0F forms: the descriptor
                 // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06),
-                // MOV reg,CR / MOV CR,reg (0F 20/22), and LSS/LFS/LGS (0F B2/B4/B5, a far-pointer
-                // load like LES/LDS but into SS/FS/GS). 0F 21/23 (MOV reg,DR / MOV DR,reg) are
-                // unimplemented and stay TwoByteFallback.
-                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5 => {
-                    DecodeGroup::SystemSeg
-                }
+                // MOV reg,CR / MOV CR,reg (0F 20/22), MOV reg,DR / MOV DR,reg (0F 21/23, ledger
+                // row 25), and LSS/LFS/LGS (0F B2/B4/B5, a far-pointer load like LES/LDS but into
+                // SS/FS/GS).
+                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x21 | 0x22 | 0x23 | 0xb2 | 0xb4
+                | 0xb5 => DecodeGroup::SystemSeg,
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
                 // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
                 // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
@@ -4329,12 +4385,13 @@ impl Cpu386 {
                 match insn.opcode {
                     // CLTS: no encoded operand.
                     0x0f06 => {}
-                    // MOV reg,CR / MOV CR,reg (0F 20/22): the ModRM is always a register form (the
-                    // `reg` field is the CR number, `rm` the GPR). The fused path fetches ONLY the
-                    // ModRM byte and #UDs when `mode != 3` BEFORE touching any addressing byte, so
-                    // do the same here: fetch the ModRM, store it, and DO NOT parse an addressing
-                    // mode (a non-register `mode` is rejected in the executor with no extra fetch).
-                    0x0f20 | 0x0f22 => {
+                    // MOV reg,CR / MOV CR,reg (0F 20/22) and MOV reg,DR / MOV DR,reg (0F 21/23):
+                    // the ModRM is always a register form (the `reg` field is the CR/DR number,
+                    // `rm` the GPR). The fused path fetches ONLY the ModRM byte and #UDs when
+                    // `mode != 3` BEFORE touching any addressing byte, so do the same here: fetch
+                    // the ModRM, store it, and DO NOT parse an addressing mode (a non-register
+                    // `mode` is rejected in the executor with no extra fetch).
+                    0x0f20..=0x0f23 => {
                         let modrm = self.fetch_modrm(bus)?;
                         insn.modrm = Some(modrm);
                     }
@@ -4964,51 +5021,63 @@ impl Cpu386 {
 
         match opcode {
             0x06 => {
+                // PUSH ES. 386 PRM: with a 32-bit operand size (D=1 code segment or a 66h
+                // prefix), PUSH sreg decrements ESP by 4 and writes the 16-bit selector
+                // zero-extended to a dword; with a 16-bit operand size it is the classic
+                // 2-byte push. `u32::from(selector)` already zero-extends, so honoring
+                // `operand_size` here (instead of hardcoding Word) covers both cases.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Es).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x07 => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                // POP ES. 386 PRM: a 32-bit operand size pops a full dword and loads the
+                // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Es, value)?;
                 Ok(clocks(7))
             }
             0x0e => {
+                // PUSH CS. Same 386 PRM operand-size rule as PUSH ES above.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Cs).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x16 => {
+                // PUSH SS. Same 386 PRM operand-size rule as PUSH ES above.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Ss).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x17 => {
                 // POP SS. Arms the one-instruction interrupt shadow like MOV SS (386 PRM 11-16),
                 // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                // Same 386 PRM operand-size rule as POP ES above.
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
                 Ok(clocks(7))
             }
             0x1e => {
+                // PUSH DS. Same 386 PRM operand-size rule as PUSH ES above.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Ds).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x1f => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                // POP DS. Same 386 PRM operand-size rule as POP ES above.
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Ds, value)?;
                 Ok(clocks(7))
             }
@@ -6144,6 +6213,13 @@ impl Cpu386 {
                             }
                             2 | 3 => {
                                 // LGDT (/2) / LIDT (/3): load the GDTR/IDTR from a 6-byte image.
+                                // 386 PRM 5.1 ("Privilege Levels"): LGDT/LIDT reload the
+                                // descriptor-table base/limit registers that the whole
+                                // protection model rests on, so like LLDT/LTR/LMSW/CLTS above
+                                // they are privileged instructions -- #GP(0) outside CPL 0.
+                                // Real mode has no protection, so CPL is always 0 there and
+                                // this gate is a no-op for real-mode boot code.
+                                self.require_cpl0()?;
                                 let limit = self.read_memory_sized(
                                     bus,
                                     memory.segment,
@@ -6249,12 +6325,16 @@ impl Cpu386 {
                 if modrm.mode != 3 {
                     return Err(undefined_opcode());
                 }
+                // 386 PRM 12.2.4 / table 12-1: only CR0, CR2, CR3 (and, on this 586-class
+                // persona, CR4) are architecturally defined. CR1/CR5/CR6/CR7 have no backing
+                // register at all -- referencing one is an invalid encoding (#UD), not a
+                // silent read of 0.
                 let value = match modrm.reg {
                     0 => self.control.cr0,
                     2 => self.control.cr2,
                     3 => self.control.cr3,
                     4 => self.control.cr4,
-                    _ => 0,
+                    _ => return Err(undefined_opcode()),
                 };
                 self.write_gpr32(modrm.rm, value);
                 Ok(clocks(6))
@@ -6274,20 +6354,118 @@ impl Cpu386 {
                 if modrm.mode != 3 {
                     return Err(undefined_opcode());
                 }
+                // 386 PRM 12.2.4 / table 12-1: same undefined-register check as MOV reg,CR
+                // above -- CR1/CR5/CR6/CR7 have no backing store, so writing one is #UD, not
+                // a silent no-op.
+                if !matches!(modrm.reg, 0 | 2 | 3 | 4) {
+                    return Err(undefined_opcode());
+                }
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
                     0 => {
+                        // 386 PRM 5.2.1 / 12.3.1: PG (bit 31) requires PE (bit 0) -- paged
+                        // linear addressing only makes sense once protection (and with it
+                        // segment/privilege checking) is active. Setting PG while PE is (or
+                        // would remain) clear is an invalid combination -- #GP(0), the
+                        // register is left unmodified. This also rejects the "set both PE
+                        // and PG at once with PE=0 in the new value" case, since PE is taken
+                        // from the value being written, not the old CR0.
+                        if value & CR0_PG != 0 && value & CR0_PE == 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
                         self.control.cr0 = value;
                         self.recompute_alignment_armed();
                         self.flush_tlb_and_code_caches();
                     }
                     2 => self.control.cr2 = value,
                     3 => {
-                        self.control.cr3 = value & 0xffff_f000;
+                        // CR3 (the Page Directory Base Register) holds the page-directory
+                        // physical base in bits 31:12 per 386 PRM 5.2.2. Bits 4:3 are PWT/PCD,
+                        // a 486-and-later addition absent from the 386 PRM -- defined here per
+                        // Pentium Vol. 3 S9 (register description) and S18.3 (PCD/PWT Bits),
+                        // which this 586-class persona implements as cache-control hints, and
+                        // bits 2:0 are reserved. The page-table base used by the walker keeps
+                        // masking to `cr3 & 0xFFFFF000` at the use site -- only the stored
+                        // value gains PWT/PCD so a guest that sets them can read them back.
+                        self.control.cr3 = value & 0xffff_f018;
                         self.flush_tlb_and_code_caches();
                     }
-                    4 => self.control.cr4 = value,
-                    _ => {}
+                    4 => {
+                        // 386 PRM has no CR4 (a 486/586 addition); on this GSW-586 (K6-class)
+                        // persona only TSD (bit 2) has a modeled effect and only VME/PVI/TSD/
+                        // DE/PSE/MCE/GPE (bits 0-4, 6-7) are architecturally defined at all
+                        // per the AMD-K6 BIOS and Software Tools Developers Guide S: 3.7
+                        // (Control Register 4 (CR4) Extensions, Figure 13/Table 19). The same
+                        // guide's MOV-to/from-CR4 exception table, and the Pentium Vol. 3
+                        // instruction reference, both document a hard fault ("#GP(0)" in
+                        // protected mode, "Interrupt 13" in real mode) if a 1 is written to
+                        // any reserved bit -- so a write outside CR4_DEFINED_MASK faults
+                        // instead of silently dropping the bits, matching EFER/STAR above.
+                        if value & !CR4_DEFINED_MASK != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.control.cr4 = value;
+                    }
+                    _ => unreachable!("undefined CR numbers are rejected by the check above"),
+                }
+                Ok(clocks(6))
+            }
+            0x0f21 => {
+                // MOV reg, DR: whole-32-bit read of the selected debug register. Same shape as
+                // MOV reg,CR above -- ModRM register form only (`mode == 3`; any other mode is
+                // #UD), privileged (386 PRM ch12: debug-register access is CPL-0-only, #GP(0)
+                // otherwise), `reg` selects the DR number, `rm` the destination GPR.
+                //
+                // DR4/DR5 alias DR6/DR7 by default (CR4.DE clear, which this core never sets
+                // behaviorally -- see CR4_TSD/CR4_DEFINED_MASK above) per 386 PRM ch12 and the
+                // 486/586 successors; a guest that references DR4/DR5 expecting DR6/DR7 (as
+                // DOS/32A's exception reporter does) gets the alias instead of #UD.
+                //
+                // Storage only: no breakpoint matching or #DB generation is modeled (ledger
+                // row 26, deferred). This just stops MOV DR6/DR7 from raising #UD, which is
+                // what DOS/32A's VCPI init and exception reporter need.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV reg,DR decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                let value = match modrm.reg {
+                    0..=3 => self.control.dr0_3[modrm.reg as usize],
+                    4 => self.control.dr6,
+                    5 => self.control.dr7,
+                    6 => self.control.dr6,
+                    7 => self.control.dr7,
+                    _ => return Err(undefined_opcode()),
+                };
+                self.write_gpr32(modrm.rm, value);
+                Ok(clocks(6))
+            }
+            0x0f23 => {
+                // MOV DR, reg: whole-32-bit write of the selected debug register. Same shape as
+                // MOV CR,reg above; see 0x0f21 for the privilege/aliasing rationale.
+                //
+                // Reserved-bit handling per 386 PRM ch12: DR7 bit 10 is hardwired to 1 (it is
+                // not settable by the guest); this core does not model LE/GE cycle-exactness or
+                // the L/G breakpoint enables beyond plain storage, so every other bit is stored
+                // as written. DR6 has no core-enforced reserved bits either (this is storage
+                // only, not breakpoint matching), so it round-trips whatever is written.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV DR,reg decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                let value = self.read_gpr32(modrm.rm);
+                match modrm.reg {
+                    0..=3 => self.control.dr0_3[modrm.reg as usize] = value,
+                    4 | 6 => self.control.dr6 = value,
+                    5 | 7 => self.control.dr7 = (value & !DR7_FIXED_ONE) | DR7_FIXED_ONE,
+                    _ => return Err(undefined_opcode()),
                 }
                 Ok(clocks(6))
             }
@@ -6893,15 +7071,16 @@ impl Cpu386 {
             }
             // PUSH FS / PUSH GS (0F A0 / 0F A8): 386+ additions, otherwise identical to the
             // one-byte PUSH ES/CS/SS/DS handlers in `execute_stack_decoded` (0x06/0x0e/0x16/
-            // 0x1e) -- push the 16-bit selector, always at `OperandSize::Word` regardless of
-            // the current operand-size attribute (a segment selector is always 16 bits; a
-            // 32-bit-operand-size PUSH FS still only writes/advances by 2, matching real
-            // 386+ silicon and the existing ES/SS/DS arms). Same clock cost (2) as those.
+            // 0x1e). 386 PRM: PUSH sreg with a 32-bit operand size (66h prefix or D=1 code
+            // segment) decrements ESP by 4 and writes the 16-bit selector zero-extended to a
+            // dword; with a 16-bit operand size it is the classic 2-byte push. Honor
+            // `operand_size` here instead of hardcoding Word, matching the ES/SS/DS fix.
+            // Same clock cost (2) as those.
             0xa0 => {
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Fs).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
@@ -6909,21 +7088,23 @@ impl Cpu386 {
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Gs).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
-            // 16-bit selector off the stack, then run it through the same `load_segment`
+            // selector off the stack, then run it through the same `load_segment`
             // descriptor-load path (which raises the identical #GP/#SS a bad or null selector
-            // would on POP DS). Same clock cost (7) as those.
+            // would on POP DS). 386 PRM: a 32-bit operand size pops a full dword and loads the
+            // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
+            // Same clock cost (7) as those.
             0xa1 => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Fs, value)?;
                 Ok(clocks(7))
             }
             0xa9 => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Gs, value)?;
                 Ok(clocks(7))
             }
@@ -7506,7 +7687,7 @@ impl Cpu386 {
         offset: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
-        let linear = self.segment_linear_byte(segment, offset)?;
+        let linear = self.segment_linear_byte(segment, offset, false)?;
         let physical = if self.control.cr0 & CR0_PG == 0 {
             linear
         } else {
@@ -7528,7 +7709,7 @@ impl Cpu386 {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
-        let linear = self.segment_linear_byte(segment, offset)?;
+        let linear = self.segment_linear_byte(segment, offset, true)?;
         let physical = if self.control.cr0 & CR0_PG == 0 {
             self.record_write_page(linear);
             linear
@@ -7544,13 +7725,72 @@ impl Cpu386 {
         Ok(())
     }
 
+    /// Validate a data access's *kind* against the segment descriptor's type field: a
+    /// write through a read-only data segment, or any access through an execute-only
+    /// code segment loaded into a data-segment register, is #GP (386 PRM 5-12, "Data
+    /// segments can be read-only or read/write... Code segments can be execute-only or
+    /// execute/read"). Real mode and V86 mode always carry the fully-permissive
+    /// `access = 0x93` (`SegmentRegister::real`), so this only ever rejects something in
+    /// protected mode; the caller gates on that to skip the check entirely otherwise.
+    /// Instruction fetch never routes through here (it uses `code_linear_for_offset`),
+    /// so CS's own readability never needs checking on this path -- only the case of a
+    /// *data* segment register (DS/ES/FS/GS/SS) that happens to hold a code descriptor.
+    fn check_segment_access_kind(
+        &self,
+        segment: SegmentIndex,
+        access: u8,
+        write: bool,
+    ) -> ExecResult<()> {
+        if !self.is_protected_mode() || self.is_v86_mode() {
+            return Ok(());
+        }
+        let is_code = access & 0x08 != 0; // descriptor type bit 3
+        let ok = if is_code {
+            // A code descriptor addressed as data: legal only for a read, and only if
+            // the code segment's readable bit (type bit 1) is set.
+            !write && access & 0x02 != 0
+        } else {
+            // A data descriptor: legal for a read always; a write needs the writable
+            // bit (type bit 1) set.
+            !write || access & 0x02 != 0
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(segment_limit_fault(segment))
+        }
+    }
+
     #[inline]
-    fn segment_linear_byte(&self, segment: SegmentIndex, offset: u32) -> ExecResult<u32> {
+    fn segment_linear_byte(
+        &self,
+        segment: SegmentIndex,
+        offset: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
+        self.check_segment_access_kind(segment, descriptor.access, write)?;
         if descriptor.base == 0 && descriptor.limit == u32::MAX {
             return Ok(offset);
         }
-        if offset > descriptor.limit {
+        let expand_down = self.is_protected_mode()
+            && !self.is_v86_mode()
+            && descriptor.access & 0x18 == 0x10
+            && descriptor.access & 0x04 != 0;
+        let in_limit = if expand_down {
+            // 386 PRM 5-12: an expand-down segment's valid offsets are those ABOVE the
+            // limit (up to 0xffff, or 0xffff_ffff for a 32-bit-default segment), the
+            // reverse of the normal sense.
+            let ceiling = if descriptor.default_size_32 {
+                u32::MAX
+            } else {
+                0xffff
+            };
+            offset > descriptor.limit && offset <= ceiling
+        } else {
+            offset <= descriptor.limit
+        };
+        if !in_limit {
             return Err(segment_limit_fault(segment));
         }
         Ok(descriptor.base.wrapping_add(offset))
@@ -7640,12 +7880,26 @@ impl Cpu386 {
         write: bool,
     ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
+        self.check_segment_access_kind(segment, descriptor.access, write)?;
         let linear = if descriptor.base == 0 && descriptor.limit == u32::MAX {
             offset
         } else {
-            if offset > descriptor.limit
-                || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
-            {
+            let last = offset.saturating_add(width.saturating_sub(1));
+            let expand_down = self.is_protected_mode()
+                && !self.is_v86_mode()
+                && descriptor.access & 0x18 == 0x10
+                && descriptor.access & 0x04 != 0;
+            let in_limit = if expand_down {
+                let ceiling = if descriptor.default_size_32 {
+                    u32::MAX
+                } else {
+                    0xffff
+                };
+                offset > descriptor.limit && last <= ceiling
+            } else {
+                offset <= descriptor.limit && last <= descriptor.limit
+            };
+            if !in_limit {
                 return Err(segment_limit_fault(segment));
             }
             descriptor.base.wrapping_add(offset)
@@ -8857,7 +9111,11 @@ impl Cpu386 {
                     let esp = self.pop(bus, OperandSize::Dword)?;
                     let ss = self.pop(bus, OperandSize::Dword)? as u16;
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
-                    self.load_segment(bus, SegmentIndex::Ss, ss)?;
+                    // The outer SS is a mechanical side effect of this IRET's ring
+                    // change, not a direct MOV/POP SS: `self.cpl` above is still the
+                    // pre-IRET (inner) level, so the plain-path CPL check would compare
+                    // against the wrong privilege level. See `load_segment_system`.
+                    self.load_segment_system(bus, SegmentIndex::Ss, ss)?;
                     self.set_eip(eip);
                     // 386 PRM 17-80: "Load SS:eSP from stack" -- eSP is B-keyed (17-12).
                     // Onto a B=0 (16-bit) outer stack, only SP takes the popped value;
@@ -9245,7 +9503,12 @@ impl Cpu386 {
         let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
         let new_esp = self.read_system_linear_u32(bus, esp_addr)?;
         let new_ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
-        self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
+        // The TSS-supplied SS for `target_dpl` is validated by the gate's own privilege
+        // rules (the gate/target DPL check already run in `far_call_gate`), not the
+        // plain-path CPL check: `self.cpl` here is still the outer (higher) level, since
+        // the caller sets it to `target_dpl` only after this call returns. See
+        // `load_segment_system`.
+        self.load_segment_system(bus, SegmentIndex::Ss, new_ss)?;
         // 386 PRM 17-43/17-74: "Load new SS:eSP value from TSS" -- eSP is B-keyed
         // (17-12), not always the full ESP. The just-loaded SS's B bit governs: a
         // 16-bit (B=0) ring-0 stack takes the TSS value into SP only, and ESP's
@@ -9365,7 +9628,12 @@ impl Cpu386 {
                     },
                 );
             } else {
-                self.load_segment(bus, *segment, selector)?;
+                // Task-switch register restore is a system-managed reload, not a plain
+                // MOV/POP Sreg: ES (first in TASK_SEGMENTS) loads before CS updates
+                // `self.cpl` to the incoming task's level below, so the plain-path
+                // CPL-vs-DPL check would run against the outgoing task's stale CPL for
+                // at least that register. See `load_segment_system`.
+                self.load_segment_system(bus, *segment, selector)?;
             }
             if *segment == SegmentIndex::Cs {
                 // PRM transition point: a hardware task switch can land the incoming task
@@ -9430,17 +9698,46 @@ impl Cpu386 {
         Ok(())
     }
 
+    /// The plain MOV Sreg/POP Sreg/LDS-family data-segment-load path: applies the full
+    /// PRM 6.7/9.1 privilege check (max(CPL, RPL) <= DPL for a non-conforming target).
     fn load_segment<B: CpuBus>(
         &mut self,
         bus: &mut B,
         segment: SegmentIndex,
         selector: u16,
     ) -> ExecResult<()> {
+        self.load_segment_checked(bus, segment, selector, true)
+    }
+
+    /// A segment reload that is itself the mechanical side effect of a privilege
+    /// transition the caller has already validated by its own rules: IRET's outer-stack
+    /// SS pop, the call-gate inner-stack switch, and the TSS register-restore loop.
+    /// `self.cpl` at the point of this call is mid-transition (still the old level, or
+    /// -- for the TSS loop's ES, loaded before CS -- not yet meaningful at all), so the
+    /// ordinary CPL-vs-DPL check does not apply; the descriptor type/writability check
+    /// still does (a system-managed load must still resolve to a legal data/stack
+    /// segment, just not one gated on the stale CPL).
+    fn load_segment_system<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        selector: u16,
+    ) -> ExecResult<()> {
+        self.load_segment_checked(bus, segment, selector, false)
+    }
+
+    fn load_segment_checked<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        selector: u16,
+        check_privilege: bool,
+    ) -> ExecResult<()> {
         if self.is_v86_mode() {
             // A V86 task addresses memory like the 8086: base = selector << 4, 64 KB.
             self.load_segment_real(segment, selector);
         } else if self.is_protected_mode() {
-            let register = self.load_protected_segment(bus, segment, selector)?;
+            let register = self.load_protected_segment(bus, segment, selector, check_privilege)?;
             self.registers.set_segment(segment, register);
             if segment == SegmentIndex::Cs {
                 self.invalidate_code_caches();
@@ -9464,6 +9761,7 @@ impl Cpu386 {
         bus: &mut B,
         segment: SegmentIndex,
         selector: u16,
+        check_privilege: bool,
     ) -> ExecResult<SegmentRegister> {
         // A null selector (index 0, TI clear) loaded into a data segment (ES/DS/FS/GS) is
         // legal: it installs a null/unusable segment with no fault at load time. A later
@@ -9504,6 +9802,50 @@ impl Cpu386 {
         let low = self.read_system_linear_u32(bus, descriptor_address)?;
         let high = self.read_system_linear_u32(bus, descriptor_address + 4)?;
         let access = ((high >> 8) & 0xff) as u8;
+        let is_segment = access & 0x10 != 0; // S bit: 1 = code/data, 0 = system
+        let descriptor_type = access & 0x0f;
+        let is_code = is_segment && descriptor_type & 0x8 != 0;
+        // 386 PRM 5.2/6.2 (table 5-1's code/data type matrix): a segment register may
+        // only be loaded with a code or data descriptor of the kind it can hold. A
+        // system-segment or gate descriptor (S clear -- LDT, TSS, call/task/trap/
+        // interrupt gate) is never legal in a segment register load; #GP regardless of
+        // which register. Otherwise CS accepts only a code descriptor; SS accepts only
+        // a writable data descriptor (a stack must be read/write, PRM 5-12); DS/ES/FS/GS
+        // accept a readable code descriptor or any data descriptor. This is the plain
+        // MOV Sreg/POP Sreg/LDS-family data-segment-load path -- CS loads through a
+        // call gate or a conforming/non-conforming far transfer are already checked by
+        // `far_call_gate`/`far_jump_gate`/`return_far` and are not duplicated here.
+        let type_legal = match segment {
+            SegmentIndex::Cs => is_code,
+            SegmentIndex::Ss => is_segment && !is_code && descriptor_type & 0x2 != 0,
+            _ => is_segment && (!is_code || descriptor_type & 0x2 != 0),
+        };
+        if !type_legal {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, in_ldt, false)),
+            });
+        }
+        // Privilege (386 PRM 6.7/9.1): a non-conforming load needs max(CPL, RPL) <= DPL.
+        // Conforming code (reachable at any caller privilege, PRM 5-13) and CS itself
+        // (whose CPL/RPL/DPL interplay is handled by the gate and far-transfer paths
+        // that call `load_segment` for CS, not this plain data-path check) are exempt.
+        // `check_privilege` is false for the system-managed reloads that route through
+        // `load_segment_system` (see its doc comment): those have already had their own
+        // privilege rules applied by the caller against a CPL that has not yet settled
+        // to its post-transition value here.
+        let conforming = is_code && descriptor_type & 0x4 != 0;
+        if check_privilege && segment != SegmentIndex::Cs && !conforming {
+            let dpl = (access >> 5) & 3;
+            let cpl = self.current_privilege_level();
+            let rpl = (selector & 3) as u8;
+            if dpl < cpl.max(rpl) {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(selector_error_code(selector, in_ldt, false)),
+                });
+            }
+        }
         if access & 0x80 == 0 {
             // A present-bit-clear descriptor: #NP (vector 11) for every segment except SS,
             // which is #SS (vector 12) instead (386 PRM 9.3's "the SS register is being
@@ -9514,6 +9856,18 @@ impl Cpu386 {
                 vector,
                 error_code: Some(selector_error_code(selector, in_ldt, false)),
             });
+        }
+        // Mark the descriptor Accessed (bit 0 of the type field, PRM 5-12/5-13) on a
+        // successful load, same read-modify-write shape as `set_tss_busy`'s busy-bit
+        // toggle. Skipped when already set -- the common case once a segment has been
+        // touched once -- to avoid a write-back on every reload of a hot selector.
+        if access & 0x01 == 0 {
+            self.write_system_linear(
+                bus,
+                descriptor_address + 5,
+                BusWidth::Byte,
+                u32::from(access | 0x01),
+            )?;
         }
         Ok(self.descriptor_to_segment(selector, low, high))
     }
@@ -13383,6 +13737,66 @@ mod tests {
         assert_eq!(
             cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
             0x5000
+        );
+    }
+
+    #[test]
+    fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
+        // 386 PRM 5-24 / 15-6: a V86 task always executes at CPL 3, so paging
+        // privilege (PRM ch5's U/S check) must classify every V86 access as user --
+        // independent of the V86 CS selector's low two bits, which are NOT an RPL (a
+        // V86 CS is a real-mode-style segment, not a descriptor selector; see
+        // `current_privilege_level`'s doc comment). A monitor that maps its own
+        // pages supervisor-only (U/S=0) must be unreachable from V86 even when the
+        // guest's CS happens to read a multiple of 4 (RPL bits 00).
+        //
+        // Same page tables as `user_mode_paging_respects_the_supervisor_bit`: PD at
+        // 0x1000, PT at 0x2000, linear 0x3000 -> present/writable/supervisor-only
+        // frame 0x5000.
+        let mut memory = vec![0; 0x6000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE: PT, present+rw+user
+        memory[0x200c..0x2010].copy_from_slice(&0x0000_5003u32.to_le_bytes()); // PTE[3]: frame, present+rw, U/S=0
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        let mut bus = TestBus::with_memory(memory);
+
+        // Enter V86 with a real-mode-style CS whose low bits are 0, not 3 -- the
+        // exact case a live `CS.selector & 3` formula would misclassify as
+        // supervisor. `current_privilege_level` must still answer 3 here because
+        // `self.cpl` is the transition-pinned cache, not a live read of CS.
+        cpu.registers.eflags |= FLAG_VM;
+        cpu.load_segment_real(SegmentIndex::Cs, 0xF000); // selector low bits == 0b00
+        cpu.cpl = 3; // what every real V86 transition (IRET/task-switch) sets
+        assert!(cpu.is_v86_mode());
+        assert_eq!(
+            cpu.registers.cs().selector & 3,
+            0,
+            "CS RPL bits are 00, not 11"
+        );
+
+        let faulted = cpu.translate_linear(&mut bus, 0x3000, false);
+        assert!(
+            matches!(
+                faulted,
+                Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(0x5)
+                })
+            ),
+            "a V86 access to a supervisor-only page must #PF like any other user access: {faulted:?}"
+        );
+        assert_eq!(cpu.control.cr2, 0x3000);
+
+        // Same V86 task, a user-accessible page (frame 0x4000 via PTE[2], U/S=1):
+        // translation succeeds, proving the fault above was the supervisor bit and
+        // not some unrelated V86 restriction.
+        let mut memory = bus.memory;
+        memory[0x2008..0x200c].copy_from_slice(&0x0000_4007u32.to_le_bytes());
+        bus = TestBus::with_memory(memory);
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x2000, false).unwrap(),
+            0x4000
         );
     }
 
@@ -19405,6 +19819,292 @@ mod tests {
         ));
     }
 
+    // --- Batch F: LGDT/LIDT privilege, MOV CR0 PG/PE, undefined CR#, CR4 mask, CR3 PWT/PCD ---
+
+    #[test]
+    fn lgdt_faults_at_cpl3() {
+        // 0F 01 16 xx xx = LGDT [disp16]. 386 PRM 5.1: LGDT is privileged like every other
+        // 0F 00/01 system-register op, so a ring-3 guest must get #GP(0), not a silent
+        // table reload.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x01, 0x16, 0x40, 0x00]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn lidt_faults_at_cpl3() {
+        // 0F 01 1E xx xx = LIDT [disp16]. Same gate as LGDT above.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x01, 0x1e, 0x40, 0x00]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn lgdt_lidt_run_at_cpl0_in_real_mode() {
+        // Real mode has no protection, so CPL is always 0 there; the new require_cpl0 gate
+        // on LGDT/LIDT must not regress the existing 286-boot-code path (mirrors
+        // lgdt_still_runs_at_286 above, but exercised here as the CPL0-unaffected half of
+        // the row-22 contract).
+        let mut memory = vec![0; 1024];
+        // LGDT [0x0020] (5 bytes: opcode+modrm+disp16); LIDT [0x0026] starts right after.
+        memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x16, 0x20, 0x00]);
+        memory[5..10].copy_from_slice(&[0x0f, 0x01, 0x1e, 0x26, 0x00]);
+        memory[0x20..0x26].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
+        memory[0x26..0x2c].copy_from_slice(&[0xff, 0x01, 0x00, 0x20, 0x00, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
+        assert_eq!(cpu.gdtr.base, 0x0000_1000);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
+        assert_eq!(cpu.idtr.base, 0x0000_2000);
+    }
+
+    #[test]
+    fn mov_cr0_setting_pg_without_pe_is_general_protection() {
+        // 0F 22 C0 = MOV CR0, EAX. 386 PRM 5.2.1: PG (bit 31) with PE (bit 0) clear is an
+        // invalid combination -- paging requires protection. Run at CPL 0 (real mode) so
+        // the fault is specifically the PG/PE check, not the row-23 privilege gate.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xc0], 0x20);
+        cpu.registers.set_eax(CR0_PG);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+        // The rejected write must not have taken effect.
+        assert_eq!(cpu.control.cr0 & CR0_PG, 0);
+    }
+
+    #[test]
+    fn mov_cr0_setting_pg_with_pe_succeeds() {
+        // The companion case: PG with PE both set in the same write is the normal way
+        // protected-mode paging turns on and must not fault.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xc0], 0x20);
+        cpu.registers.set_eax(CR0_PE | CR0_PG);
+        let mut bus = TestBus::with_memory(memory);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
+        assert_eq!(cpu.control.cr0 & (CR0_PE | CR0_PG), CR0_PE | CR0_PG);
+    }
+
+    #[test]
+    fn mov_from_undefined_cr_is_undefined_opcode() {
+        // 0F 20 C8 = MOV EAX, CR1 (reg=1, rm=EAX). CR1/CR5/CR6/CR7 have no backing
+        // register on the 386/486/586 architecture; referencing one is #UD, not a
+        // silent read of 0.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x20, 0xc8], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn mov_to_undefined_cr_is_undefined_opcode() {
+        // 0F 22 F8 = MOV CR7, EAX (reg=7, rm=EAX). Same undefined-register contract as
+        // the read side, checked on the write path.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xf8], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn mov_cr4_accepts_defined_bits() {
+        // 0F 22 E0 = MOV CR4, EAX; 0F 20 E3 = MOV EBX, CR4. Only the bits this GSW-586
+        // persona defines (VME/PVI/TSD/DE/PSE/MCE/GPE, CR4_DEFINED_MASK) exist; writing
+        // exactly that set round-trips.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0, 0x0f, 0x20, 0xe3], 0x20);
+        cpu.registers.set_eax(CR4_DEFINED_MASK);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr4, CR4_DEFINED_MASK);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), CR4_DEFINED_MASK);
+    }
+
+    #[test]
+    fn mov_cr4_rejects_reserved_bits() {
+        // 0F 22 E0 = MOV CR4, EAX. The AMD-K6 guide's MOV-to/from-CR4 exception table and
+        // the Pentium Vol. 3 instruction reference both fault ("#GP(0)"/"Interrupt 13")
+        // if a 1 is written to any reserved bit -- including one way outside the defined
+        // byte, like bit 31 -- in every mode, not just protected mode. CR4 is left
+        // unmodified (the same convention as CR0's PG/PE gate above).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0], 0x20);
+        cpu.registers.set_eax(0xffff_ffff);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+        assert_eq!(cpu.control.cr4, 0);
+    }
+
+    // --- Ledger row 25: MOV to/from debug registers (0F 21/0F 23) ---
+
+    #[test]
+    fn mov_dr7_round_trips() {
+        // 0F 23 F8 = MOV DR7, EAX (reg=7, rm=EAX); 0F 21 FB = MOV EBX, DR7 (reg=7, rm=EBX).
+        // Bit 10 is hardwired to 1 (DR7_FIXED_ONE) per 386 PRM ch12, so it must read back
+        // set even though the write below does not include it.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xf8, 0x0f, 0x21, 0xfb], 0x20);
+        cpu.registers.set_eax(0x0000_0155); // L0/G0/L1/G1/L2 enables, bit 10 not set
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr7, 0x0000_0155 | DR7_FIXED_ONE);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_0155 | DR7_FIXED_ONE);
+    }
+
+    #[test]
+    fn mov_dr6_round_trips_with_reserved_bit_behavior() {
+        // 0F 23 F0 = MOV DR6, EAX (reg=6, rm=EAX); 0F 21 F3 = MOV EBX, DR6 (reg=6, rm=EBX).
+        // DR6 is plain storage here (breakpoint matching is ledger row 26, deferred), so
+        // whatever is written reads back byte-for-byte, including into the high bits the
+        // PRM defines as fixed-1 on reset -- this core does not re-force them on write.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xf0, 0x0f, 0x21, 0xf3], 0x20);
+        cpu.registers.set_eax(0x0000_000f); // B0-B3 all set
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr6, 0x0000_000f);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_000f);
+    }
+
+    #[test]
+    fn mov_dr6_reset_value_matches_prm() {
+        // 386 PRM ch12: DR6 powers up as 0xFFFF_0FF0.
+        let cpu = Cpu386::default();
+        assert_eq!(cpu.control.dr6, 0xffff_0ff0);
+    }
+
+    #[test]
+    fn mov_dr7_reset_value_matches_prm() {
+        // 386 PRM ch12: DR7 powers up as 0x0000_0400 (bit 10 set, everything else clear).
+        let cpu = Cpu386::default();
+        assert_eq!(cpu.control.dr7, 0x0000_0400);
+    }
+
+    #[test]
+    fn mov_dr4_aliases_dr6() {
+        // 0F 23 E0 = MOV DR4, EAX (reg=4); 0F 21 E3 = MOV EBX, DR4. With CR4.DE clear (the
+        // default -- never behaviorally set by this core), DR4 aliases DR6.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xe0, 0x0f, 0x21, 0xe3], 0x20);
+        cpu.registers.set_eax(0x0000_000a);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr6, 0x0000_000a);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_000a);
+    }
+
+    #[test]
+    fn mov_dr5_aliases_dr7() {
+        // 0F 23 E8 = MOV DR5, EAX (reg=5); 0F 21 EB = MOV EBX, DR5. Aliases DR7, same as
+        // DR4 aliases DR6 above.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xe8, 0x0f, 0x21, 0xeb], 0x20);
+        cpu.registers.set_eax(0x0000_0001);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr7, 0x0000_0001 | DR7_FIXED_ONE);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_0001 | DR7_FIXED_ONE);
+    }
+
+    #[test]
+    fn mov_dr0_3_round_trip() {
+        // 0F 23 D8 = MOV DR3, EAX (reg=3); 0F 21 DB = MOV EBX, DR3. Linear breakpoint
+        // address storage only, no matching implemented.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xd8, 0x0f, 0x21, 0xdb], 0x20);
+        cpu.registers.set_eax(0xdead_beef);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr0_3[3], 0xdead_beef);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0xdead_beef);
+    }
+
+    #[test]
+    fn mov_dr_write_faults_at_cpl3() {
+        // 0F 23 F8 = MOV DR7, EAX. Debug-register access is privileged (386 PRM ch12):
+        // a ring-3 guest must get #GP(0), not a silent write.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x23, 0xf8]);
+        cpu.registers.set_eax(0);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn mov_dr_read_faults_at_cpl3() {
+        // 0F 21 F8 = MOV EAX, DR7. Same gate on the read side.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x21, 0xf8]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn mov_dr_memory_operand_is_undefined_opcode() {
+        // 0F 21 00 = MOV [BX+SI], DR0 with mode=0 (memory operand) instead of mode=3
+        // (register). Debug-register moves are register-form only; any other ModRM mode
+        // is an invalid encoding (#UD), same convention as MOV CR.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x21, 0x00], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn mov_cr3_round_trips_pwt_and_pcd() {
+        // 0F 22 D8 = MOV CR3, EAX (reg=3, rm=EAX); 0F 20 DB = MOV EBX, CR3 (reg=3, rm=EBX).
+        // 386 PRM 5.2.2 defines the page-directory base in bits 31:12; PWT/PCD (bits 4:3)
+        // are a 486+ addition (Pentium Vol. 3 S9/S18.3) this persona implements as
+        // cache-control hints. A guest that sets PWT/PCD must read them back; only bits
+        // 2:0 (always reserved/0) and the base-alignment bits outside 31:12 are not
+        // preserved by the base itself.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xd8, 0x0f, 0x20, 0xdb], 0x20);
+        // Base 0x00123000 with PWT (bit 3) and PCD (bit 4) both set, plus reserved bits
+        // 2:0 set to confirm those stay masked off.
+        cpu.registers.set_eax(0x0012_3007 | 0x18);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr3, 0x0012_3018);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0012_3018);
+    }
+
     #[test]
     fn cpuid_leaf1_reports_tsc_and_msr() {
         let edx = run_cpuid(1).registers.edx();
@@ -20182,7 +20882,7 @@ mod tests {
             // CMOVcc / SETcc / IMUL (CondMove)
             | 0x40..=0x4f | 0x90..=0x9f | 0xaf
             // SystemSeg
-            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5
+            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x21 | 0x22 | 0x23 | 0xb2 | 0xb4 | 0xb5
             // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
             | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
             | 0xc7 | 0xc8..=0xcf
@@ -20281,34 +20981,33 @@ mod tests {
             }
         }
 
-        // A representative un-implemented 0F byte from each kind of gap that falls through to the
-        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg). Each routes to
-        // TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F B2/B4/B5 LSS/LFS/LGS are now
-        // implemented -- see the SystemSeg coverage test below. 0F AA RSM also routes to
-        // TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
+        // A representative un-implemented 0F byte that falls through to the generic catch-all:
+        // 0x0a (unmapped). It routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F
+        // B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV reg,DR / MOV DR,reg are now implemented -- see the
+        // SystemSeg coverage test below and the ledger-row-25 `mov_dr*` tests. 0F AA RSM also routes
+        // to TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
         // vector 6 because no SMM is modeled -- it is "implemented", just always invalid -- so it is
         // not part of this generic-catch-all sweep.)
-        for second in [0x0au8, 0x21, 0x23] {
-            assert!(
-                !implemented_two_byte(second),
-                "test bug: 0F {second:#04x} is actually implemented"
-            );
-            let mut cpu = Cpu386::default();
-            cpu.load_segment_real(SegmentIndex::Cs, 0);
-            cpu.registers.eip = 0;
-            let mut bus = TestBus::with_memory(vec![0x0f, second, 0xc0, 0, 0]);
-            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    InternalFault::Exception {
-                        vector: 6,
-                        error_code: None
-                    }
-                ),
-                "two-byte opcode 0F {second:#04x} must #UD, got {err:?}"
-            );
-        }
+        let second = 0x0au8;
+        assert!(
+            !implemented_two_byte(second),
+            "test bug: 0F {second:#04x} is actually implemented"
+        );
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, second, 0xc0, 0, 0]);
+        let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
+            ),
+            "two-byte opcode 0F {second:#04x} must #UD, got {err:?}"
+        );
     }
 
     #[test]
@@ -23228,29 +23927,24 @@ mod tests {
     fn a12_unimplemented_neighbours_stay_undefined() {
         // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
         // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
-        // the routing so a future edit can't silently capture them. 0F 21/23 (MOV reg,DR / MOV DR,reg)
-        // and 0x63 (ARPL) all #UD (vector 6, no error code) through the split, never a panic. (0F
-        // B2/B4/B5 LSS/LFS/LGS moved OFF this list once implemented -- see the `lss`/`lfs`/`lgs`
-        // tests below.)
-        for code in [
-            &[0x0f, 0x21, 0xc0][..], // MOV EAX, DR0
-            &[0x0f, 0x23, 0xc0][..], // MOV DR0, EAX
-            &[0x63, 0xc0][..],       // ARPL AX, AX
-        ] {
-            let (mut cpu, memory) = real_mode_cpu(code, 0x40);
-            let mut bus = TestBus::with_memory(memory);
-            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    InternalFault::Exception {
-                        vector: 6,
-                        error_code: None
-                    }
-                ),
-                "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
-            );
-        }
+        // the routing so a future edit can't silently capture them. 0x63 (ARPL) #UDs (vector 6, no
+        // error code) through the split, never a panic. (0F B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV
+        // reg,DR / MOV DR,reg moved OFF this list once implemented -- see the `lss`/`lfs`/`lgs` tests
+        // below and the ledger-row-25 `mov_dr*` tests above.)
+        let code = &[0x63, 0xc0][..]; // ARPL AX, AX
+        let (mut cpu, memory) = real_mode_cpu(code, 0x40);
+        let mut bus = TestBus::with_memory(memory);
+        let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
+            ),
+            "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
+        );
     }
 
     // ---- PUSH/POP FS/GS (0F A0/A1/A8/A9) ----
@@ -23303,10 +23997,10 @@ mod tests {
     }
 
     #[test]
-    fn push_fs_gs_ignore_the_32_bit_operand_size_prefix() {
-        // 66 0F A0 / 66 0F A8: a segment selector is always 16 bits, so a 32-bit operand-size
-        // override must still only push 2 bytes and move SP by 2 -- exactly like the one-byte
-        // PUSH ES/CS/SS/DS arms, which hardcode `OperandSize::Word` regardless of `operand_size`.
+    fn push_fs_gs_zero_extend_under_the_32_bit_operand_size_prefix() {
+        // 66 0F A0 / 66 0F A8: 386 PRM -- PUSH sreg with a 32-bit operand size decrements
+        // ESP by 4 and writes the 16-bit selector zero-extended to a dword (the SDM PUSH
+        // operation note). Same rule as the one-byte PUSH ES/CS/SS/DS arms.
         for (code, segment, value) in [
             ([0x66u8, 0x0f, 0xa0].as_slice(), SegmentIndex::Fs, 0x1234u16),
             ([0x66, 0x0f, 0xa8].as_slice(), SegmentIndex::Gs, 0x5678u16),
@@ -23318,13 +24012,164 @@ mod tests {
             cpu.cycle(&mut bus).unwrap();
             assert_eq!(
                 cpu.read_reg16(Reg16::Sp),
-                0x01ee,
-                "SP must still only move by 2 with a 32-bit operand-size prefix"
+                0x01ec,
+                "SP must move by 4 with a 32-bit operand-size prefix"
             );
             assert_eq!(
-                u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
-                value,
-                "the pushed word must be the 16-bit selector, not a 32-bit zero-extension"
+                u32::from_le_bytes(bus.memory[0x01ec..0x01f0].try_into().unwrap()),
+                u32::from(value),
+                "the pushed dword must be the 16-bit selector zero-extended"
+            );
+        }
+    }
+
+    #[test]
+    fn pop_fs_gs_discard_the_upper_word_under_the_32_bit_operand_size_prefix() {
+        // 66 0F A1 / 66 0F A9: 386 PRM -- POP sreg with a 32-bit operand size pops a full
+        // dword, loads the low 16 bits into the segment register, and discards the upper 16.
+        // Same rule as the one-byte POP ES/SS/DS arms.
+        for (code, segment) in [
+            ([0x66u8, 0x0f, 0xa1].as_slice(), SegmentIndex::Fs),
+            ([0x66, 0x0f, 0xa9].as_slice(), SegmentIndex::Gs),
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.memory[0x1f0..0x1f4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f4, "SP must advance by 4");
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0xbeef,
+                "{segment:?} must load only the low 16 bits, discarding 0xdead"
+            );
+        }
+    }
+
+    #[test]
+    fn push_pop_one_byte_sreg_zero_extend_under_the_32_bit_operand_size_prefix() {
+        // 66 06 / 66 0E / 66 16 / 66 1E (PUSH ES/CS/SS/DS) and 66 07 / 66 1F (POP ES/DS):
+        // the one-byte segment-register push/pop opcodes follow the identical 386 PRM
+        // operand-size rule as PUSH/POP FS/GS above. POP SS (66 17) is covered separately
+        // below because it arms the MOV-SS interrupt shadow.
+        for (push_code, pop_code, segment, value) in [
+            (
+                [0x66u8, 0x06].as_slice(),
+                [0x66u8, 0x07].as_slice(),
+                SegmentIndex::Es,
+                0x1111u16,
+            ),
+            (
+                [0x66, 0x1e].as_slice(),
+                [0x66, 0x1f].as_slice(),
+                SegmentIndex::Ds,
+                0x2222,
+            ),
+        ] {
+            // PUSH: selector zero-extended to a dword, ESP -= 4.
+            let (mut cpu, memory) = fs_gs_stack_cpu(push_code);
+            cpu.registers
+                .set_segment(segment, SegmentRegister::real(value));
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01ec,
+                "{push_code:02x?}: SP must move by 4 with a 32-bit operand-size prefix"
+            );
+            assert_eq!(
+                u32::from_le_bytes(bus.memory[0x01ec..0x01f0].try_into().unwrap()),
+                u32::from(value),
+                "{push_code:02x?}: the pushed dword must be the selector zero-extended"
+            );
+
+            // POP: full dword popped, only the low 16 bits loaded.
+            let (mut cpu, memory) = fs_gs_stack_cpu(pop_code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.memory[0x1f0..0x1f4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01f4,
+                "{pop_code:02x?}: SP must advance by 4"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0xbeef,
+                "{pop_code:02x?}: {segment:?} must load only the low 16 bits"
+            );
+        }
+    }
+
+    #[test]
+    fn push_pop_ss_zero_extends_under_the_32_bit_operand_size_prefix() {
+        // 66 16 (PUSH SS) / 66 17 (POP SS): same 386 PRM operand-size rule, but POP SS also
+        // arms the one-instruction interrupt shadow (`load_segment_arming_ss_shadow`), so it
+        // gets its own test rather than folding into the ES/DS table above. Unlike PUSH
+        // FS/ES/DS, PUSH SS cannot push an arbitrary probe value into SS without also
+        // relocating the stack it is about to push onto, so this asserts against
+        // `fs_gs_stack_cpu`'s real-mode SS selector (0) instead.
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x66, 0x16]);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x01ec,
+            "PUSH SS must move SP by 4"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x01ec..0x01f0].try_into().unwrap()),
+            0x0000,
+            "PUSH SS must zero-extend the selector to a dword"
+        );
+
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x66, 0x17]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x1f0..0x1f4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x01f4,
+            "POP SS must advance SP by 4"
+        );
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ss).selector,
+            0xbeef,
+            "POP SS must load only the low 16 bits"
+        );
+    }
+
+    #[test]
+    fn push_pop_one_byte_sreg_unchanged_at_16_bit_operand_size() {
+        // Without a 66h prefix, PUSH/POP ES/CS/SS/DS (and FS/GS) stay the classic 2-byte
+        // real-mode DOS behavior -- this is the frozen-class-sensitivity check: no bench or
+        // real-mode DOS code observes a behavior change from the operand_size fix.
+        for code in [
+            [0x06u8, 0x90], // PUSH ES; NOP pad
+            [0x0e, 0x90],   // PUSH CS; NOP pad
+            [0x16, 0x90],   // PUSH SS; NOP pad
+            [0x1e, 0x90],   // PUSH DS; NOP pad
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(&code);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01ee,
+                "{code:02x?}: 16-bit-operand-size PUSH sreg must still only move SP by 2"
+            );
+        }
+        for code in [
+            [0x07u8, 0x90], // POP ES; NOP pad
+            [0x1f, 0x90],   // POP DS; NOP pad
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(&code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.memory[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01f2,
+                "{code:02x?}: 16-bit-operand-size POP sreg must still only move SP by 2"
             );
         }
     }
