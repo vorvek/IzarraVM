@@ -1714,10 +1714,6 @@ fn duration_ns_u64(duration: std::time::Duration) -> u64 {
 /// it is kept small and dense (see DecodeCache).
 #[derive(Debug, Clone, Copy)]
 struct DecodedInsn {
-    /// eip of the first byte of the instruction (before any prefixes). Carried as the `eip` field of
-    /// the `UnsupportedOpcode` #UD the dead-end `Fallback` arm raises, and used by `cycle` to rewind
-    /// to the instruction start on a delivered exception.
-    start_eip: u32,
     len: u8,
     prefixes: Prefixes,
     opcode: u16,
@@ -1934,6 +1930,58 @@ enum InternalFault {
 impl From<BusError> for InternalFault {
     fn from(value: BusError) -> Self {
         CpuError::Bus(value).into()
+    }
+}
+
+/// #DE (divide error): DIV/IDIV divide-by-zero or quotient overflow, and AAM with a
+/// zero base. Vector 0, no error code (386 PRM 9.7 table 9-2: only selector-related
+/// faults and #PF carry one).
+const fn divide_error() -> InternalFault {
+    InternalFault::Exception {
+        vector: 0,
+        error_code: None,
+    }
+}
+
+/// #UD (invalid opcode): an unimplemented single-byte opcode, an unimplemented 0F-prefixed
+/// opcode, or an unimplemented group-opcode extension. Vector 6, no error code. The
+/// diagnostic opcode/CS/EIP/extension detail the old `CpuError` variants carried is not
+/// lost: `deliver_exception` calls `trace_ud_if_enabled` for every vector-6 delivery,
+/// which dumps CS:IP, the surrounding bytes, CR0, EFLAGS, V86, and CPL.
+const fn undefined_opcode() -> InternalFault {
+    InternalFault::Exception {
+        vector: 6,
+        error_code: None,
+    }
+}
+
+/// Build the selector-fault error code pushed for a #GP/#NP/#SS/#TS on a segment
+/// selector (386 PRM 9.7, table 9-2): bits 15:3 the selector's index, bit 2 (TI) set
+/// when the selector names the LDT, bit 1 (IDT) set when the fault references an IDT
+/// gate rather than a GDT/LDT descriptor, bit 0 (EXT) set when the fault was provoked
+/// by an event external to the currently-executing program (never the case for the
+/// synchronous descriptor/gate/segment-load faults this core raises). `selector`'s own
+/// low 3 bits (RPL and part of TI) are irrelevant here; only the index is folded in,
+/// per the table's "the selector index" wording -- TI is passed separately so callers
+/// resolving against the LDT don't have to reconstruct it from the selector bits.
+const fn selector_error_code(selector: u16, in_ldt: bool, in_idt: bool) -> u32 {
+    ((selector as u32) & 0xfff8) | ((in_ldt as u32) << 2) | ((in_idt as u32) << 1)
+}
+
+/// A data access (not a segment *load*) that runs off the end of its segment: #SS
+/// (vector 12) for SS, #GP (vector 13, error code 0) for every other segment. 386 PRM
+/// 9.10/9.11: an ordinary limit violation during a memory reference is not attributed
+/// to a selector, so the error code is 0 either way (table 9-2's selector-index error
+/// code is only for a segment *load* that names a bad descriptor, handled separately
+/// by `selector_error_code`).
+const fn segment_limit_fault(segment: SegmentIndex) -> InternalFault {
+    InternalFault::Exception {
+        vector: if matches!(segment, SegmentIndex::Ss) {
+            12
+        } else {
+            13
+        },
+        error_code: Some(0),
     }
 }
 
@@ -3979,7 +4027,6 @@ impl Cpu386 {
         let group = Self::route_group(opcode, prefixes);
 
         let mut insn = DecodedInsn {
-            start_eip,
             // `len` is a placeholder here; the single finalize after the group pre-parse below
             // overwrites it with the real consumed length (prefixes + opcode + operands).
             len: 0,
@@ -4492,12 +4539,13 @@ impl Cpu386 {
                 // Fallback is now a pure dead-end: after Stage A every IMPLEMENTED single-byte opcode
                 // is routed to a dedicated split group, so the only opcodes that land here are the
                 // genuinely-unimplemented ones (0x63 ARPL, 0xF1 ICEBP) and — as a decode-bug guard —
-                // any prefix byte `read_prefixes` failed to consume. Raise the same `UnsupportedOpcode`
-                // the legacy fused dispatch did, carrying the instruction-start eip (`insn.start_eip`)
-                // exactly as the old `instruction_eip` field. `execute_two_byte` still STAYS — it is
-                // the leaf for the no-operand 0F ops (`execute_misc_decoded`) and the TwoByteFallback
-                // #UD handler above — but the single-byte fused dispatch is gone.
-                Err(self.unsupported_single_byte_opcode(insn.opcode as u8, insn.start_eip))
+                // any prefix byte `read_prefixes` failed to consume. Raise the architectural #UD
+                // (vector 6); `deliver_exception` traces CS:IP/bytes/CR0/EFLAGS for it when #UD
+                // tracing is enabled, so the diagnostic detail the old `UnsupportedOpcode` error
+                // fields carried is not lost. `execute_two_byte` still STAYS — it is the leaf for
+                // the no-operand 0F ops (`execute_misc_decoded`) and the TwoByteFallback #UD handler
+                // above — but the single-byte fused dispatch is gone.
+                Err(self.unsupported_single_byte_opcode())
             }
         }
     }
@@ -4790,10 +4838,13 @@ impl Cpu386 {
                     4 => SegmentIndex::Fs,
                     5 => SegmentIndex::Gs,
                     _ => {
-                        return Err(CpuError::GeneralProtection {
-                            selector: value as u16,
-                        }
-                        .into());
+                        // Not a bad-descriptor fault (no selector to blame): the illegal
+                        // encoding is the destination register field itself (CS or reg>5),
+                        // so the error code is 0, not a selector index.
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
                     }
                 };
                 self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
@@ -4876,11 +4927,7 @@ impl Cpu386 {
                 // unparsed for any other reg field, so re-raise the identical group-opcode error.
                 let modrm = insn.modrm.expect("group-11 form decoded with a ModRM");
                 if modrm.reg != 0 {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: modrm.reg,
-                    }
-                    .into());
+                    return Err(undefined_opcode());
                 }
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 self.write_operand_u8(bus, operand, insn.imm as u8)?;
@@ -4890,11 +4937,7 @@ impl Cpu386 {
                 // MOV r/m16/32, imm16/32 (group 11). Same reg=000 gate as 0xc6.
                 let modrm = insn.modrm.expect("group-11 form decoded with a ModRM");
                 if modrm.reg != 0 {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: modrm.reg,
-                    }
-                    .into());
+                    return Err(undefined_opcode());
                 }
                 let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 self.write_operand_sized(bus, operand, operand_size, insn.imm)?;
@@ -5033,11 +5076,7 @@ impl Cpu386 {
                 // re-raise the identical error with the same bytes consumed.
                 let modrm = insn.modrm.expect("POP r/m decoded with a ModRM");
                 if modrm.reg != 0 {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: modrm.reg,
-                    }
-                    .into());
+                    return Err(undefined_opcode());
                 }
                 // The 386 PRM's POP pseudocode ("DEST <- (SS:ESP); ESP <- ESP + 4") does not
                 // say when the destination EA is computed relative to the increment. The
@@ -5246,11 +5285,7 @@ impl Cpu386 {
                     6 => self.div(value, false, BusWidth::Byte)?, // DIV
                     7 => self.div(value, true, BusWidth::Byte)?, // IDIV
                     _ => {
-                        return Err(CpuError::UnsupportedGroupOpcode {
-                            opcode: 0xf6,
-                            extension: modrm.reg,
-                        }
-                        .into());
+                        return Err(undefined_opcode());
                     }
                 }
                 Ok(clocks(2))
@@ -5278,11 +5313,7 @@ impl Cpu386 {
                     6 => self.div(value, false, operand_size.bus_width())?, // DIV
                     7 => self.div(value, true, operand_size.bus_width())?, // IDIV
                     _ => {
-                        return Err(CpuError::UnsupportedGroupOpcode {
-                            opcode: 0xf7,
-                            extension: modrm.reg,
-                        }
-                        .into());
+                        return Err(undefined_opcode());
                     }
                 }
                 Ok(clocks(2))
@@ -5297,11 +5328,7 @@ impl Cpu386 {
                         self.write_operand_u8(bus, operand, result)?;
                         Ok(clocks(2))
                     }
-                    extension => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: 0xfe,
-                        extension,
-                    }
-                    .into()),
+                    _extension => Err(undefined_opcode()),
                 }
             }
             _ => unreachable!("group opcode {opcode:#x}"),
@@ -6060,11 +6087,7 @@ impl Cpu386 {
                         self.set_flag(FLAG_ZF, ok);
                         Ok(clocks(10))
                     }
-                    reg => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: insn.opcode as u8,
-                        extension: reg,
-                    }
-                    .into()),
+                    _reg => Err(undefined_opcode()),
                 }
             }
             0x0f01 => {
@@ -6155,11 +6178,7 @@ impl Cpu386 {
                                 self.flush_tlb_and_code_caches();
                                 Ok(clocks(12))
                             }
-                            _ => Err(CpuError::UnsupportedGroupOpcode {
-                                opcode: insn.opcode as u8,
-                                extension: reg,
-                            }
-                            .into()),
+                            _ => Err(undefined_opcode()),
                         }
                     }
                 }
@@ -6228,12 +6247,7 @@ impl Cpu386 {
                 self.require_cpl0()?;
                 let modrm = insn.modrm.expect("MOV reg,CR decoded with a ModRM");
                 if modrm.mode != 3 {
-                    return Err(CpuError::UnsupportedTwoByteOpcode {
-                        opcode: insn.opcode as u8,
-                        cs: self.registers.cs().selector,
-                        eip: self.registers.eip,
-                    }
-                    .into());
+                    return Err(undefined_opcode());
                 }
                 let value = match modrm.reg {
                     0 => self.control.cr0,
@@ -6258,12 +6272,7 @@ impl Cpu386 {
                 self.require_cpl0()?;
                 let modrm = insn.modrm.expect("MOV CR,reg decoded with a ModRM");
                 if modrm.mode != 3 {
-                    return Err(CpuError::UnsupportedTwoByteOpcode {
-                        opcode: insn.opcode as u8,
-                        cs: self.registers.cs().selector,
-                        eip: self.registers.eip,
-                    }
-                    .into());
+                    return Err(undefined_opcode());
                 }
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
@@ -6587,11 +6596,7 @@ impl Cpu386 {
                         }
                         Ok(clocks(11))
                     }
-                    extension => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: 0xff,
-                        extension,
-                    }
-                    .into()),
+                    _extension => Err(undefined_opcode()),
                 }
             }
             opcode => unreachable!("control-flow opcode {opcode:#x}"),
@@ -6606,13 +6611,8 @@ impl Cpu386 {
     /// `UnsupportedOpcode` the fused path produced: `opcode` is the byte, `cs` the current selector,
     /// and `eip` the instruction's start (the byte before any ModRM/immediate would sit), matching
     /// the legacy error fields exactly.
-    fn unsupported_single_byte_opcode(&self, opcode: u8, instruction_eip: u32) -> InternalFault {
-        CpuError::UnsupportedOpcode {
-            opcode,
-            cs: self.registers.cs().selector,
-            eip: instruction_eip,
-        }
-        .into()
+    fn unsupported_single_byte_opcode(&self) -> InternalFault {
+        undefined_opcode()
     }
 
     /// The guest-level ISA #UD gate for the whole 0F-extended group. At the 286 level the core
@@ -6927,12 +6927,7 @@ impl Cpu386 {
                 self.load_segment(bus, SegmentIndex::Gs, value)?;
                 Ok(clocks(7))
             }
-            _ => Err(CpuError::UnsupportedTwoByteOpcode {
-                opcode,
-                cs: self.registers.cs().selector,
-                eip: self.registers.eip,
-            }
-            .into()),
+            _ => Err(undefined_opcode()),
         }
     }
 
@@ -7556,12 +7551,7 @@ impl Cpu386 {
             return Ok(offset);
         }
         if offset > descriptor.limit {
-            return Err(CpuError::SegmentLimit {
-                segment,
-                offset,
-                width: 1,
-            }
-            .into());
+            return Err(segment_limit_fault(segment));
         }
         Ok(descriptor.base.wrapping_add(offset))
     }
@@ -7656,12 +7646,7 @@ impl Cpu386 {
             if offset > descriptor.limit
                 || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
             {
-                return Err(CpuError::SegmentLimit {
-                    segment,
-                    offset,
-                    width,
-                }
-                .into());
+                return Err(segment_limit_fault(segment));
             }
             descriptor.base.wrapping_add(offset)
         };
@@ -8659,18 +8644,21 @@ impl Cpu386 {
         // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
         // hardware interrupt or software `INT n`, even when it lands on such a vector.
         if !is_external && vector_pushes_error_code(vector) {
-            // TOKAEMM's vec13 discriminator (emulator contract): every #GP this
-            // core can deliver on vector 13 pushes error code EXACTLY 0, so a
-            // nonzero value in the frame slot at [esp+32] after the monitor's
-            // pushad can only be an external IRQ frame's EIP. Every current
-            // vector-13 raise site passes Some(0); this tripwire catches a
-            // future selector-carrying #GP (e.g. DPMI-grade descriptor faults)
-            // before it silently breaks the monitor's frame-shape check --
-            // update tokaemm.asm's vec13_entry BEFORE relaxing this.
+            // TOKAEMM's vec13 discriminator (emulator contract) only ever inspects a
+            // V86-ORIGIN vector-13 delivery: a V86 sensitive-instruction #GP (always
+            // error code 0 -- there is no selector to blame, the fault is on the
+            // instruction itself) or a real IRQ5 reflected onto the same vector. It is
+            // never reached by a PROTECTED-MODE selector #GP, which is delivered through
+            // the CURRENT IDT -- the guest's own (e.g. DOS4GW's), not TOKAEMM's monitor
+            // -- and can legitimately carry a nonzero selector-index error code (Batch
+            // A's descriptor/gate/segment-load sweep). So the tripwire is scoped to
+            // `source_v86`: a V86-origin #GP must still push exactly 0, but a pmode
+            // selector #GP is free to carry a real code. Update tokaemm.asm's
+            // vec13_entry BEFORE relaxing the V86-origin half of this.
             debug_assert!(
-                vector != 13 || error_code.unwrap_or(0) == 0,
-                "vector-13 #GP with a nonzero error code ({error_code:?}) breaks \
-                 the TOKAEMM vec13 frame-shape discriminator"
+                !source_v86 || vector != 13 || error_code.unwrap_or(0) == 0,
+                "V86-origin vector-13 #GP with a nonzero error code ({error_code:?}) \
+                 breaks the TOKAEMM vec13 frame-shape discriminator"
             );
             self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
@@ -9020,7 +9008,10 @@ impl Cpu386 {
                 let tss_selector = ((low >> 16) & 0xffff) as u16;
                 self.task_switch(bus, tss_selector, is_call)
             }
-            _ => Err(CpuError::GeneralProtection { selector }.into()),
+            _ => Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, selector & 0x4 != 0, false)),
+            }),
         }
     }
 
@@ -9039,7 +9030,10 @@ impl Cpu386 {
             (self.gdtr.base, u32::from(self.gdtr.limit))
         };
         if index == 0 || index + 7 > limit {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, in_ldt, false)),
+            });
         }
         let addr = base + index;
         let low = self.read_system_linear_u32(bus, addr)?;
@@ -9076,29 +9070,41 @@ impl Cpu386 {
         let access = (high >> 8) & 0xff;
         let gate_type = access & 0x0f;
         if gate_type != 0x0c && gate_type != 0x04 {
-            return Err(CpuError::GeneralProtection {
-                selector: gate_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    gate_selector,
+                    gate_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let gate_dpl = ((access >> 5) & 3) as u8;
         let cpl = self.current_privilege_level();
         let rpl = (gate_selector & 3) as u8;
         if access & 0x80 == 0 || gate_dpl < cpl.max(rpl) {
-            return Err(CpuError::GeneralProtection {
-                selector: gate_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    gate_selector,
+                    gate_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let (target_selector, gate_offset, op, param_count) = Self::decode_call_gate(low, high);
         let (tl, th) = self.read_transfer_descriptor(bus, target_selector)?;
         let target_access = (th >> 8) & 0xff;
         // Target must be a present code segment (S = 1 and the executable bit set).
         if target_access & 0x80 == 0 || target_access & 0x18 != 0x18 {
-            return Err(CpuError::GeneralProtection {
-                selector: target_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    target_selector,
+                    target_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let target_dpl = ((target_access >> 5) & 3) as u8;
         let conforming = target_access & 0x04 != 0;
@@ -9170,38 +9176,54 @@ impl Cpu386 {
         let access = (high >> 8) & 0xff;
         let gate_type = access & 0x0f;
         if gate_type != 0x0c && gate_type != 0x04 {
-            return Err(CpuError::GeneralProtection {
-                selector: gate_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    gate_selector,
+                    gate_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let gate_dpl = ((access >> 5) & 3) as u8;
         let cpl = self.current_privilege_level();
         let rpl = (gate_selector & 3) as u8;
         if access & 0x80 == 0 || gate_dpl < cpl.max(rpl) {
-            return Err(CpuError::GeneralProtection {
-                selector: gate_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    gate_selector,
+                    gate_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let (target_selector, gate_offset, op, _) = Self::decode_call_gate(low, high);
         let (tl, th) = self.read_transfer_descriptor(bus, target_selector)?;
         let target_access = (th >> 8) & 0xff;
         if target_access & 0x80 == 0 || target_access & 0x18 != 0x18 {
-            return Err(CpuError::GeneralProtection {
-                selector: target_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    target_selector,
+                    target_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let target_dpl = ((target_access >> 5) & 3) as u8;
         let conforming = target_access & 0x04 != 0;
         // A JMP through a gate cannot change privilege: a non-conforming target must be
         // at the current level; a conforming one no more privileged.
         if (!conforming && target_dpl != cpl) || (conforming && target_dpl > cpl) {
-            return Err(CpuError::GeneralProtection {
-                selector: target_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    target_selector,
+                    target_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let mut target = self.descriptor_to_segment(target_selector, tl, th);
         target.selector = (target_selector & !3) | u16::from(cpl);
@@ -9253,10 +9275,14 @@ impl Cpu386 {
         let access = (high >> 8) & 0xff;
         // Present, available 386 TSS (type 0x09). Busy or wrong type is #GP.
         if access & 0x80 == 0 || access & 0x1f != 0x09 {
-            return Err(CpuError::GeneralProtection {
-                selector: new_selector,
-            }
-            .into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(
+                    new_selector,
+                    new_selector & 0x4 != 0,
+                    false,
+                )),
+            });
         }
         let new_tss = self.descriptor_to_segment(new_selector, low, high);
         let old_selector = self.tr.selector;
@@ -9465,16 +9491,29 @@ impl Cpu386 {
         // Index 0 is reserved only in the GDT (the processor never uses GDT[0], per the PRM);
         // an LDT selector with index 0 (TI=1, e.g. 0x0004) is an ordinary, resolvable entry --
         // the null-selector short-circuit above already handled the true null case (index 0,
-        // TI 0), so an in_ldt selector reaching here is never null.
+        // TI 0), so an in_ldt selector reaching here is never null. A bad/out-of-limit
+        // selector is #GP regardless of which segment is being loaded (386 PRM 9.3): there is
+        // no descriptor to be "not present", so this branch never takes the #NP/#SS fork below.
         if (index == 0 && !in_ldt) || index + 7 > table_limit {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, in_ldt, false)),
+            });
         }
         let descriptor_address = table_base + index;
         let low = self.read_system_linear_u32(bus, descriptor_address)?;
         let high = self.read_system_linear_u32(bus, descriptor_address + 4)?;
         let access = ((high >> 8) & 0xff) as u8;
         if access & 0x80 == 0 {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            // A present-bit-clear descriptor: #NP (vector 11) for every segment except SS,
+            // which is #SS (vector 12) instead (386 PRM 9.3's "the SS register is being
+            // loaded" carve-out -- the same vector `segment_limit_fault` uses for a stack
+            // limit violation).
+            let vector = if segment == SegmentIndex::Ss { 12 } else { 11 };
+            return Err(InternalFault::Exception {
+                vector,
+                error_code: Some(selector_error_code(selector, in_ldt, false)),
+            });
         }
         Ok(self.descriptor_to_segment(selector, low, high))
     }
@@ -10071,7 +10110,7 @@ impl Cpu386 {
         // quotient overflow are checked BEFORE any register write and return DivideError
         // (real-mode #DE delivery is deferred). Arithmetic flags are left undefined.
         if operand & width_mask(width) == 0 {
-            return Err(CpuError::DivideError.into());
+            return Err(divide_error());
         }
         match (width, signed) {
             (BusWidth::Byte, false) => {
@@ -10079,7 +10118,7 @@ impl Cpu386 {
                 let divisor = u32::from(operand as u8);
                 let quotient = dividend / divisor;
                 if quotient > 0xff {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 self.write_gpr8(0, quotient as u8);
                 self.write_gpr8(4, (dividend % divisor) as u8);
@@ -10090,10 +10129,10 @@ impl Cpu386 {
                 let (Some(quotient), Some(remainder)) =
                     (dividend.checked_div(divisor), dividend.checked_rem(divisor))
                 else {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 };
                 if !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&quotient) {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 self.write_gpr8(0, quotient as u8);
                 self.write_gpr8(4, remainder as u8);
@@ -10104,7 +10143,7 @@ impl Cpu386 {
                 let divisor = u32::from(operand as u16);
                 let quotient = dividend / divisor;
                 if quotient > 0xffff {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 self.write_gpr16(0, quotient as u16);
                 self.write_gpr16(2, (dividend % divisor) as u16);
@@ -10116,10 +10155,10 @@ impl Cpu386 {
                 let (Some(quotient), Some(remainder)) =
                     (dividend.checked_div(divisor), dividend.checked_rem(divisor))
                 else {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 };
                 if !(i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&quotient) {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 self.write_gpr16(0, quotient as u16);
                 self.write_gpr16(2, remainder as u16);
@@ -10130,7 +10169,7 @@ impl Cpu386 {
                 let divisor = u64::from(operand);
                 let quotient = dividend / divisor;
                 if quotient > 0xffff_ffff {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 self.write_gpr32(0, quotient as u32);
                 self.write_gpr32(2, (dividend % divisor) as u32);
@@ -10142,10 +10181,10 @@ impl Cpu386 {
                 let (Some(quotient), Some(remainder)) =
                     (dividend.checked_div(divisor), dividend.checked_rem(divisor))
                 else {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 };
                 if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&quotient) {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 self.write_gpr32(0, quotient as u32);
                 self.write_gpr32(2, remainder as u32);
@@ -10674,7 +10713,7 @@ impl Cpu386 {
                 // `decode` fetched the imm8 base into `insn.imm`; a base of 0 raises #DE.
                 let divisor = insn.imm as u8;
                 if divisor == 0 {
-                    return Err(CpuError::DivideError.into());
+                    return Err(divide_error());
                 }
                 let al = self.read_gpr8(0);
                 self.write_gpr8(4, al / divisor);
@@ -11460,13 +11499,8 @@ impl Cpu386 {
         self.fpu.set_condition(c3, c2, sign, c0);
     }
 
-    fn fpu_unsupported(&self, opcode: u8) -> ExecResult<CycleOutcome> {
-        Err(CpuError::UnsupportedOpcode {
-            opcode,
-            cs: self.registers.cs().selector,
-            eip: self.registers.eip,
-        }
-        .into())
+    fn fpu_unsupported(&self, _opcode: u8) -> ExecResult<CycleOutcome> {
+        Err(undefined_opcode())
     }
 
     fn read_real32<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
@@ -12226,7 +12260,10 @@ impl Cpu386 {
     ) -> ExecResult<(u32, u32)> {
         let index = u32::from(selector & !0x7);
         if index == 0 || index + 7 > u32::from(self.gdtr.limit) {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
         }
         let addr = self.gdtr.base + index;
         let low = self.read_system_linear_u32(bus, addr)?;
@@ -12263,7 +12300,10 @@ impl Cpu386 {
     fn load_ldtr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
         if selector & 0x4 != 0 {
             // The LDT descriptor must live in the GDT (TI = 0).
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, true, false)),
+            });
         }
         if selector & !0x7 == 0 {
             // A null selector marks the LDTR invalid.
@@ -12277,7 +12317,10 @@ impl Cpu386 {
         let access = (high >> 8) & 0xff;
         // Present LDT system descriptor (S = 0, type = 2).
         if access & 0x80 == 0 || access & 0x1f != 0x02 {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
         }
         self.ldtr = self.descriptor_to_segment(selector, low, high);
         Ok(())
@@ -12285,14 +12328,20 @@ impl Cpu386 {
 
     fn load_tr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
         if selector & 0x4 != 0 || selector & !0x7 == 0 {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, selector & 0x4 != 0, false)),
+            });
         }
         let (low, high) = self.read_gdt_descriptor(bus, selector)?;
         let access = (high >> 8) & 0xff;
         let descriptor_type = access & 0x1f;
         // Present available TSS: type 1 (286) or 9 (386).
         if access & 0x80 == 0 || (descriptor_type != 0x01 && descriptor_type != 0x09) {
-            return Err(CpuError::GeneralProtection { selector }.into());
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, false, false)),
+            });
         }
         let mut segment = self.descriptor_to_segment(selector, low, high);
         // Mark the TSS busy, both in the cache and back in the GDT descriptor.
@@ -12485,14 +12534,20 @@ mod tests {
             kind: BusAccessKind,
         ) -> Result<(), BusError> {
             self.trace.push(BusCycle::new(kind, address, width, 0));
-            let address = address as usize;
+            let start = address as usize;
+            let end = start
+                .checked_add(width.bytes() as usize)
+                .ok_or(BusError::UnmappedMemory { address })?;
+            if end > self.memory.len() {
+                return Err(BusError::UnmappedMemory { address });
+            }
             match width {
-                BusWidth::Byte => self.memory[address] = value as u8,
+                BusWidth::Byte => self.memory[start] = value as u8,
                 BusWidth::Word => {
-                    self.memory[address..address + 2].copy_from_slice(&(value as u16).to_le_bytes())
+                    self.memory[start..start + 2].copy_from_slice(&(value as u16).to_le_bytes())
                 }
                 BusWidth::Dword => {
-                    self.memory[address..address + 4].copy_from_slice(&value.to_le_bytes())
+                    self.memory[start..start + 4].copy_from_slice(&value.to_le_bytes())
                 }
             }
             Ok(())
@@ -14597,35 +14652,65 @@ mod tests {
         assert_eq!((cpu.read_reg16(Reg16::Ax) >> 8) & 0xff, 0xfe); // ah = -2
     }
 
+    /// Give a real-mode `TestBus` a full 1 MiB image (room for a wrap-safe stack and every
+    /// vector's IVT slot) and point vector 0 (#DE) at a distinguishing trap address, then run
+    /// one `cycle` and assert the CPU landed there -- i.e. the fault was DELIVERED through
+    /// `real_mode_interrupt`, not raised as a host-fatal error. Batch A converted #DE from
+    /// `CpuError::DivideError` (host-fatal) to `InternalFault::Exception { vector: 0, .. }`
+    /// (guest-deliverable), so a real-mode DIV-by-zero now runs to completion (`cycle` returns
+    /// `Ok`) with CS:IP retargeted at the IVT's vector-0 entry instead of erroring `cycle` itself.
+    const DE_TRAP_CS: u16 = 0x0200;
+    const DE_TRAP_IP: u16 = 0x0010;
+    // Code origin for the de_trap_bus helpers: away from offset 0, which is the vector-0 IVT
+    // slot these buses populate (code and the IVT slot must not overlap).
+    const DE_CODE_ORIGIN: u32 = 0x20;
+
+    fn expect_de_delivered<B: CpuBus>(cpu: &mut Cpu386, bus: &mut B) {
+        let outcome = cpu
+            .cycle(bus)
+            .expect("a delivered #DE must not error `cycle`");
+        assert!(!outcome.halted);
+        assert_eq!(cpu.registers.cs().selector, DE_TRAP_CS);
+        assert_eq!(cpu.registers.eip, u32::from(DE_TRAP_IP));
+    }
+
+    fn de_trap_bus(code: &[u8]) -> TestBus {
+        let mut memory = vec![0u8; 0x1_0000];
+        let origin = DE_CODE_ORIGIN as usize;
+        memory[origin..origin + code.len()].copy_from_slice(code);
+        // IVT[0] (bytes 0..4): IP then CS, little-endian.
+        memory[0..2].copy_from_slice(&DE_TRAP_IP.to_le_bytes());
+        memory[2..4].copy_from_slice(&DE_TRAP_CS.to_le_bytes());
+        TestBus::with_memory(memory)
+    }
+
     #[test]
     fn div_by_zero_returns_error_without_writes() {
-        // div bl with bl=0 -> DivideError; ax unchanged.
-        let mut memory = vec![0; 16];
-        memory[0..2].copy_from_slice(&[0xf6, 0xf3]);
+        // div bl with bl=0 -> #DE delivered through the real-mode IVT; ax unchanged.
         let mut cpu = Cpu386::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
-        cpu.registers.eip = 0;
+        cpu.registers.eip = DE_CODE_ORIGIN;
+        cpu.registers.set_esp(0x2000);
         cpu.write_reg16(Reg16::Ax, 0x1234);
         cpu.write_reg16(Reg16::Bx, 0x0000);
-        let mut bus = TestBus::with_memory(memory);
+        let mut bus = de_trap_bus(&[0xf6, 0xf3]);
 
-        assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
+        expect_de_delivered(&mut cpu, &mut bus);
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234); // no writes
     }
 
     #[test]
     fn div_quotient_overflow_returns_error() {
-        // div bl: ax=0xffff, bl=0x01 -> quotient 0xffff > 0xff -> DivideError.
-        let mut memory = vec![0; 16];
-        memory[0..2].copy_from_slice(&[0xf6, 0xf3]);
+        // div bl: ax=0xffff, bl=0x01 -> quotient 0xffff > 0xff -> #DE delivered.
         let mut cpu = Cpu386::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
-        cpu.registers.eip = 0;
+        cpu.registers.eip = DE_CODE_ORIGIN;
+        cpu.registers.set_esp(0x2000);
         cpu.write_reg16(Reg16::Ax, 0xffff);
         cpu.write_reg16(Reg16::Bx, 0x0001);
-        let mut bus = TestBus::with_memory(memory);
+        let mut bus = de_trap_bus(&[0xf6, 0xf3]);
 
-        assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
+        expect_de_delivered(&mut cpu, &mut bus);
     }
 
     #[test]
@@ -14651,18 +14736,17 @@ mod tests {
     #[test]
     fn idiv_dword_min_over_negative_one_is_divide_error() {
         // idiv ebx (0x66 0xf7 /7, modrm 0xfb). edx:eax = i64::MIN, ebx = -1.
-        // checked_div catches the overflow so this is #DE, not a panic.
-        let mut memory = vec![0; 16];
-        memory[0..3].copy_from_slice(&[0x66, 0xf7, 0xfb]);
+        // checked_div catches the overflow so this is #DE (delivered), not a panic.
         let mut cpu = Cpu386::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
-        cpu.registers.eip = 0;
+        cpu.registers.eip = DE_CODE_ORIGIN;
+        cpu.registers.set_esp(0x2000);
         cpu.registers.set_edx(0x8000_0000);
         cpu.registers.set_eax(0x0000_0000);
         cpu.registers.set_ebx(0xffff_ffff);
-        let mut bus = TestBus::with_memory(memory);
+        let mut bus = de_trap_bus(&[0x66, 0xf7, 0xfb]);
 
-        assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
+        expect_de_delivered(&mut cpu, &mut bus);
     }
 
     #[test]
@@ -15375,9 +15459,12 @@ mod tests {
         assert!(
             matches!(
                 fault,
-                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+                InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                }
             ),
-            "a null selector into SS via LSS must #GP, got {fault:?}"
+            "a null selector into SS via LSS must #GP(0), got {fault:?}"
         );
     }
 
@@ -15793,24 +15880,30 @@ mod tests {
 
     #[test]
     fn pop_rm_reg_nonzero_is_illegal() {
-        // 8F with reg != 0 is an illegal group encoding (group 1A reserves only /0).
+        // 8F with reg != 0 is an illegal group encoding (group 1A reserves only /0), delivered as
+        // a #UD through the real-mode IVT. Code is placed away from offset 0 so it doesn't
+        // overlap the vector-0 IVT slot this test doesn't use, and vector 6's slot is populated
+        // with a distinguishing trap address.
+        const ORIGIN: usize = 0x10;
+        const UD_TRAP_CS: u16 = 0x0300;
+        const UD_TRAP_IP: u16 = 0x0020;
         let mut memory = vec![0; 1024];
-        memory[0..2].copy_from_slice(&[0x8f, 0xcb]); // mod=11 reg=001 rm=011
+        memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0x8f, 0xcb]); // mod=11 reg=001 rm=011
+        memory[6 * 4..6 * 4 + 2].copy_from_slice(&UD_TRAP_IP.to_le_bytes());
+        memory[6 * 4 + 2..6 * 4 + 4].copy_from_slice(&UD_TRAP_CS.to_le_bytes());
         let mut cpu = Cpu386::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.load_segment_real(SegmentIndex::Ss, 0);
-        cpu.registers.eip = 0;
-        cpu.registers.set_esp(0x0100);
+        cpu.registers.eip = ORIGIN as u32;
+        cpu.registers.set_esp(0x0300);
         let mut bus = TestBus::with_memory(memory);
 
-        let err = cpu.cycle(&mut bus).unwrap_err();
-        assert!(matches!(
-            err,
-            CpuError::UnsupportedGroupOpcode {
-                opcode: 0x8f,
-                extension: 1
-            }
-        ));
+        let outcome = cpu
+            .cycle(&mut bus)
+            .expect("a delivered #UD must not error `cycle`");
+        assert!(!outcome.halted);
+        assert_eq!(cpu.registers.cs().selector, UD_TRAP_CS);
+        assert_eq!(cpu.registers.eip, u32::from(UD_TRAP_IP));
     }
 
     #[test]
@@ -18002,16 +18095,18 @@ mod tests {
 
     #[test]
     fn aam_zero_divisor_is_divide_error() {
-        // aam (0xd4 0x00): divide by zero -> DivideError.
-        let mut memory = vec![0; 64];
-        memory[0..2].copy_from_slice(&[0xd4, 0x00]);
-        let mut cpu = Cpu386::default();
-        cpu.load_segment_real(SegmentIndex::Cs, 0);
-        cpu.registers.eip = 0;
+        // aam (0xd4 0x00): divide by zero -> #DE, delivered through the real-mode IVT.
+        const ORIGIN: usize = 0x10;
+        let (mut cpu, mut memory) = real_mode_cpu(&[], 0x1_0000);
+        memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xd4, 0x00]);
+        memory[0..2].copy_from_slice(&DE_TRAP_IP.to_le_bytes());
+        memory[2..4].copy_from_slice(&DE_TRAP_CS.to_le_bytes());
+        cpu.registers.eip = ORIGIN as u32;
+        cpu.registers.set_esp(0x2000);
         cpu.write_reg16(Reg16::Ax, 0x004b);
         let mut bus = TestBus::with_memory(memory);
 
-        assert!(matches!(cpu.cycle(&mut bus), Err(CpuError::DivideError)));
+        expect_de_delivered(&mut cpu, &mut bus);
     }
 
     #[test]
@@ -20176,10 +20271,12 @@ mod tests {
                 assert!(
                     matches!(
                         err,
-                        InternalFault::Cpu(CpuError::UnsupportedOpcode { opcode, cs, .. })
-                            if opcode == op && cs == 0
+                        InternalFault::Exception {
+                            vector: 6,
+                            error_code: None
+                        }
                     ),
-                    "single-byte opcode {op:#04x} must #UD as UnsupportedOpcode, got {err:?}"
+                    "single-byte opcode {op:#04x} must #UD, got {err:?}"
                 );
             }
         }
@@ -20204,10 +20301,12 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    InternalFault::Cpu(CpuError::UnsupportedTwoByteOpcode { opcode, cs, .. })
-                        if opcode == second && cs == 0
+                    InternalFault::Exception {
+                        vector: 6,
+                        error_code: None
+                    }
                 ),
-                "two-byte opcode 0F {second:#04x} must #UD as UnsupportedTwoByteOpcode, got {err:?}"
+                "two-byte opcode 0F {second:#04x} must #UD, got {err:?}"
             );
         }
     }
@@ -20226,13 +20325,12 @@ mod tests {
         assert!(
             matches!(
                 err,
-                InternalFault::Cpu(CpuError::UnsupportedOpcode {
-                    opcode: 0xf1,
-                    cs: 0,
-                    eip: 0
-                })
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
             ),
-            "0xF1 must raise UnsupportedOpcode at CS:EIP 0:0, got {err:?}"
+            "0xF1 must raise #UD, got {err:?}"
         );
     }
 
@@ -21025,22 +21123,32 @@ mod tests {
     #[test]
     fn straight_line_run_faults_on_cached_continuation_keeping_earlier_effects() {
         // A fault raised by a CACHED straight-line instruction running as a continuation
-        // (run_one_cached) must route through the SAME tail the per-instruction path uses: a CPU-class
-        // fault (#DE divide-by-zero) propagates out of the run, and the earlier straight-line
-        // instruction's effects are kept. DIV is data-dependent, so it can be cached with a good
-        // divisor and then fault on a later run with a zero divisor - exactly the case where the
-        // faulting instruction is a valid cache hit (a delivered IVT exception would reload CS and
-        // flush the cache, so a register-input fault is the way to reach the cached-continuation path).
+        // (run_one_cached) must route through the SAME tail the per-instruction path uses: a
+        // delivered #DE (divide-by-zero) retargets CS:IP at the guest's own IVT handler, and the
+        // earlier straight-line instruction's effects are kept. DIV is data-dependent, so it can
+        // be cached with a good divisor and then fault on a later run with a zero divisor -
+        // exactly the case where the faulting instruction is a valid cache hit (a delivered IVT
+        // exception reloads CS and flushes the cache, so a register-input fault -- not a decode
+        // change -- is the way to reach the cached-continuation path).
         //
-        //   0x00: 40           INC AX     ; straight-line, runs before the DIV in the same run
-        //   0x01: F6 F3        DIV BL     ; AX / BL ; #DE when BL = 0
-        //   0x03: F4           HLT
+        //   0x10: 40           INC AX     ; straight-line, runs before the DIV in the same run
+        //   0x11: F6 F3        DIV BL     ; AX / BL ; #DE when BL = 0
+        //   0x13: F4           HLT
+        //
+        // Code starts at 0x10 (not 0x00) so it does not overlap the real-mode IVT's vector-0 slot
+        // (bytes 0..4), which this test populates with a trap handler address.
+        const ORIGIN: usize = 0x10;
         let code = [
             0x40, // INC AX
             0xf6, 0xf3, // DIV BL
             0xf4, // HLT
         ];
-        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let (mut cpu, mut memory) = real_mode_cpu(&[], 0x1_0000);
+        memory[ORIGIN..ORIGIN + code.len()].copy_from_slice(&code);
+        memory[0..2].copy_from_slice(&DE_TRAP_IP.to_le_bytes());
+        memory[2..4].copy_from_slice(&DE_TRAP_CS.to_le_bytes());
+        cpu.registers.eip = ORIGIN as u32;
+        cpu.registers.set_esp(0x2000);
         let mut bus = TestBus::with_memory(memory);
 
         // Warming pass with a good divisor: AX = 11, BL = 2. This caches both INC and DIV in the live
@@ -21049,21 +21157,21 @@ mod tests {
         cpu.write_reg16(Reg16::Bx, 0x0002);
         drive_straight_line_runs(&mut cpu, &mut bus);
         assert!(
-            cpu.decode_cache.get(0x01).is_some(),
+            cpu.decode_cache.get(ORIGIN as u32 + 1).is_some(),
             "DIV must be cached after the warming pass"
         );
 
         // Now poke the divisor to 0 and run from the top: INC is the run's first instruction, then the
-        // CACHED DIV runs as a straight-line continuation and faults with #DE.
-        cpu.registers.eip = 0;
+        // CACHED DIV runs as a straight-line continuation and delivers #DE.
+        cpu.registers.eip = ORIGIN as u32;
         cpu.registers.set_eax(10);
         cpu.write_reg16(Reg16::Bx, 0x0000);
-        let err = cpu.run_straight_line(&mut bus, u64::MAX).unwrap_err();
-        assert_eq!(
-            err,
-            CpuError::DivideError,
-            "the cached DIV continuation must propagate #DE"
-        );
+        let outcome = cpu
+            .run_straight_line(&mut bus, u64::MAX)
+            .expect("the cached DIV continuation must deliver #DE, not error the run");
+        assert!(!outcome.halted);
+        assert_eq!(cpu.registers.cs().selector, DE_TRAP_CS);
+        assert_eq!(cpu.registers.eip, u32::from(DE_TRAP_IP));
         // INC AX ran before the fault and its effect is kept (AX = 11).
         assert_eq!(cpu.read_reg16(Reg16::Ax), 11);
     }
@@ -22446,7 +22554,7 @@ mod tests {
         // data-move path the goldens can't cover: decode DEFERS parsing the operand/immediate when
         // reg != 0 and the executor re-raises the error. Drive it through the split (which returns
         // the raw fault without eip rewind) and assert two things:
-        //   1. the fault is UnsupportedGroupOpcode { opcode: 0xc6, extension: 1 }, and
+        //   1. the fault is a deliverable #UD (vector 6, no error code), and
         //   2. eip advanced to exactly 2 (opcode + ModRM) — proving decode did NOT over-consume the
         //      trailing imm8 (0x55) on the fault path, so the bytes charged match the fused handler.
         let (mut cpu, memory) = real_mode_cpu(&[0xc6, 0xc9, 0x55], 0x20);
@@ -22456,10 +22564,10 @@ mod tests {
         assert!(
             matches!(
                 fault,
-                InternalFault::Cpu(CpuError::UnsupportedGroupOpcode {
-                    opcode: 0xc6,
-                    extension: 1
-                })
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
             ),
             "{fault:?}"
         );
@@ -23121,9 +23229,9 @@ mod tests {
         // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
         // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
         // the routing so a future edit can't silently capture them. 0F 21/23 (MOV reg,DR / MOV DR,reg)
-        // #UD as `UnsupportedTwoByteOpcode`; 0x63 (ARPL) #UDs as `UnsupportedOpcode`. All surface
-        // through the split as a CpuError, never a panic. (0F B2/B4/B5 LSS/LFS/LGS moved OFF this
-        // list once implemented -- see the `lss`/`lfs`/`lgs` tests below.)
+        // and 0x63 (ARPL) all #UD (vector 6, no error code) through the split, never a panic. (0F
+        // B2/B4/B5 LSS/LFS/LGS moved OFF this list once implemented -- see the `lss`/`lfs`/`lgs`
+        // tests below.)
         for code in [
             &[0x0f, 0x21, 0xc0][..], // MOV EAX, DR0
             &[0x0f, 0x23, 0xc0][..], // MOV DR0, EAX
@@ -23135,10 +23243,10 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    InternalFault::Cpu(
-                        CpuError::UnsupportedTwoByteOpcode { .. }
-                            | CpuError::UnsupportedOpcode { .. }
-                    )
+                    InternalFault::Exception {
+                        vector: 6,
+                        error_code: None
+                    }
                 ),
                 "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
             );
@@ -23293,9 +23401,12 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0028 })
+                    InternalFault::Exception {
+                        vector: 13,
+                        error_code: Some(40)
+                    }
                 ),
-                "{name} with an out-of-limit selector must #GP, got {err:?}"
+                "{name} with an out-of-limit selector must #GP(0x28), got {err:?}"
             );
         }
     }
@@ -23403,10 +23514,10 @@ mod tests {
         assert!(
             matches!(
                 fault,
-                InternalFault::Cpu(CpuError::SegmentLimit {
-                    segment: SegmentIndex::Ds,
-                    ..
-                })
+                InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                }
             ),
             "access through a null DS must fault, got {fault:?}"
         );
@@ -23423,7 +23534,10 @@ mod tests {
         assert!(
             matches!(
                 fault,
-                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+                InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                }
             ),
             "a null selector into SS must #GP, got {fault:?}"
         );
@@ -23492,9 +23606,12 @@ mod tests {
         assert!(
             matches!(
                 fault,
-                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0028 })
+                InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(40)
+                }
             ),
-            "an out-of-limit selector must #GP, got {fault:?}"
+            "an out-of-limit selector must #GP(0x28), got {fault:?}"
         );
     }
 
@@ -23516,7 +23633,10 @@ mod tests {
         assert!(
             matches!(
                 fault,
-                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+                InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0)
+                }
             ),
             "RETF popping a null selector into CS must #GP, got {fault:?}"
         );
@@ -25077,12 +25197,15 @@ mod tests {
         // The DIV-by-zero #DE fault path (goldens capture success only, so it needs an explicit
         // test). `div bl` (F6 /6, mod=11 rm=011) with BL = 0 must raise the divide error. The
         // group 3 fused arm is deleted on this branch, so this drives the decode/execute split
-        // (exec_one_split) directly and asserts the fault is CpuError::DivideError. The `div`
-        // helper checks divide-by-zero BEFORE any register write, and `decode` consumes exactly
-        // the F6 + ModRM bytes (no immediate for /6), so we also assert eip advanced by 2. The
-        // InstructionPrefetch count (3, one read-ahead past the 2-byte op — see the non-faulting
-        // `div bl` golden, which also reports 3) confirms decode charged the fetch and the
-        // executor faulted with no extra fetch.
+        // (exec_one_split) directly and asserts the raw fault is the deliverable
+        // `InternalFault::Exception { vector: 0, .. }` (#DE, no error code) -- `exec_one_split`
+        // runs below `finish_instruction`/`deliver_exception`, so this checks the raise site
+        // itself, not the delivered frame. The `div` helper checks divide-by-zero BEFORE any
+        // register write, and `decode` consumes exactly the F6 + ModRM bytes (no immediate for
+        // /6), so we also assert eip advanced by 2. The InstructionPrefetch count (3, one
+        // read-ahead past the 2-byte op — see the non-faulting `div bl` golden, which also
+        // reports 3) confirms decode charged the fetch and the executor faulted with no extra
+        // fetch.
         let code = [0xf6, 0xf3]; // div bl
         let mut mem = vec![0u8; 0x40];
         mem[..code.len()].copy_from_slice(&code);
@@ -25097,8 +25220,14 @@ mod tests {
         let split_err = exec_one_split(&mut split, &mut sbus).unwrap_err();
 
         assert!(
-            matches!(split_err, InternalFault::Cpu(CpuError::DivideError)),
-            "split DIV-by-zero must raise CpuError::DivideError, got {split_err:?}"
+            matches!(
+                split_err,
+                InternalFault::Exception {
+                    vector: 0,
+                    error_code: None
+                }
+            ),
+            "split DIV-by-zero must raise a deliverable #DE, got {split_err:?}"
         );
         // AX must be untouched: the #DE is raised before any quotient/remainder write-back.
         assert_eq!(
@@ -25721,12 +25850,12 @@ mod tests {
         assert!(
             matches!(
                 err,
-                InternalFault::Cpu(CpuError::UnsupportedGroupOpcode {
-                    opcode: 0xff,
-                    extension: 7
-                })
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
             ),
-            "FF /7 must raise the undefined group-opcode error, got {err:?}"
+            "FF /7 must raise a deliverable #UD, got {err:?}"
         );
     }
 
@@ -28832,9 +28961,12 @@ mod tests {
         assert!(
             matches!(
                 exec_one_split(&mut cpu, &mut bus),
-                Err(InternalFault::Cpu(CpuError::DivideError))
+                Err(InternalFault::Exception {
+                    vector: 0,
+                    error_code: None
+                })
             ),
-            "AAM base 0 must raise #DE through the split"
+            "AAM base 0 must raise a deliverable #DE through the split"
         );
     }
 
