@@ -1340,9 +1340,11 @@ enum DecodeGroup {
     /// selector; LAR (0F 02) and LSL (0F 03), which read descriptor access-rights / limit into a
     /// register; CLTS (0F 06), which clears CR0.TS with no encoded operand; MOV reg,CR / MOV CR,reg
     /// (0F 20/22), whole-32-bit control-register moves whose ModRM is a register form (`mod` treated
-    /// as 3, `reg` selects the CR number); and the single-byte BOUND r,m (0x62; #BR on an out-of-range
-    /// index, mod=3 is #UD) and LES/LDS (0xC4/0xC5; load a far pointer m16:16/32 into ES/DS + reg,
-    /// mod=3 is #UD).
+    /// as 3, `reg` selects the CR number); LSS/LFS/LGS (0F B2/B4/B5), which load a far pointer
+    /// m16:16/32 into SS/FS/GS + reg (mod=3 is #UD; LSS additionally arms the one-instruction
+    /// interrupt shadow, the same as MOV SS/POP SS); and the single-byte BOUND r,m (0x62; #BR on
+    /// an out-of-range index, mod=3 is #UD) and LES/LDS (0xC4/0xC5; load a far pointer m16:16/32
+    /// into ES/DS + reg, mod=3 is #UD).
     ///
     /// Every ModRM form has its ModRM + addressing descriptor parsed once in `decode` (instruction
     /// bytes only, so it stays cacheable); none carry an immediate after the ModRM. The CR/segment/
@@ -1350,11 +1352,14 @@ enum DecodeGroup {
     /// `load_ldtr`, `load_tr`, `verify_segment`, `store_descriptor_table`, `flush_tlb_and_code_caches`,
     /// `try_read_descriptor`/`descriptor_accessible`), so the TLB/code-cache invalidation hooks that
     /// Stage B depends on still fire exactly as before. The far pointer for LES/LDS is read FROM
-    /// MEMORY at execute time (against live registers), never pre-read at decode. Folded into
-    /// `insn.opcode` as 0x0F00 | second for the 0F forms and dispatched off the full u16. The
-    /// genuinely-unimplemented neighbours (0F 21/23 MOV reg,DR / MOV DR,reg, 0F B2/B4/B5 LSS/LFS/LGS,
-    /// 0x63 ARPL) are NOT routed here — they stay on Fallback / TwoByteFallback (the fused path #UDs
-    /// them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
+    /// MEMORY at execute time (against live registers), never pre-read at decode; LSS/LFS/LGS
+    /// (0F B2/B4/B5) share that same far-pointer shape, loading SS/FS/GS instead of ES/DS, and
+    /// LSS additionally arms the one-instruction interrupt shadow (the same shadow MOV SS/POP SS
+    /// arm) so a following instruction cannot be interrupted between the offset and selector
+    /// halves of the pointer settling. Folded into `insn.opcode` as 0x0F00 | second for the 0F
+    /// forms and dispatched off the full u16. The genuinely-unimplemented neighbours (0F 21/23 MOV
+    /// reg,DR / MOV DR,reg, 0x63 ARPL) are NOT routed here -- they stay on Fallback / TwoByteFallback
+    /// (the fused path #UDs them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
     SystemSeg,
     /// The x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF plus WAIT/FWAIT (0x9B).
     /// Each escape opcode carries a ModRM whose `mod` field selects the form — `mod != 3` is a
@@ -2115,10 +2120,22 @@ impl Cpu386 {
     }
 
     pub fn is_protected_mode(&self) -> bool {
-        // Stack code also uses this as a proxy for the SS B-bit (stack width): real
-        // mode always has a 16-bit stack. Replace with a real SS.B check when 32-bit
-        // protected-mode stacks land.
         self.control.cr0 & CR0_PE != 0
+    }
+
+    /// Whether implicit stack references (PUSH/POP/CALL/RET/interrupts) use the
+    /// full 32-bit ESP or wrap within the 16-bit SP, per the loaded SS descriptor's
+    /// B bit (386 PRM 16.2: "the size of stack pointer ... used by the processor
+    /// for implicit stack references" is controlled by SS.B, independent of
+    /// operand size, gate size, or CS's D bit). Real mode and V86 always load SS
+    /// through `load_segment_real`/`SegmentRegister::real`, which sets
+    /// `default_size_32: false`, so this is 16-bit there too -- one rule covers
+    /// every mode. Backed by the cached `SegmentRegister.default_size_32` field
+    /// (populated from descriptor bit 22 in `descriptor_to_segment`), so this is a
+    /// field read, not a descriptor decode: safe in the push/pop hot path.
+    #[inline]
+    fn stack_is_32bit(&self) -> bool {
+        self.registers.segment(SegmentIndex::Ss).default_size_32
     }
 
     /// True while executing ring-0 protected-mode code that is not a V86 task —
@@ -3708,10 +3725,13 @@ impl Cpu386 {
                 // IMUL reg,r/m (AF, 386-class). All are ModRM r/m forms with no immediate.
                 0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
                 // System / descriptor-table / segment block (task A12), 0F forms: the descriptor
-                // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06), and
-                // MOV reg,CR / MOV CR,reg (0F 20/22). 0F 21/23 (MOV reg,DR / MOV DR,reg) and 0F B2/
-                // B4/B5 (LSS/LFS/LGS) are unimplemented in the fused path and stay TwoByteFallback.
-                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 => DecodeGroup::SystemSeg,
+                // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06),
+                // MOV reg,CR / MOV CR,reg (0F 20/22), and LSS/LFS/LGS (0F B2/B4/B5, a far-pointer
+                // load like LES/LDS but into SS/FS/GS). 0F 21/23 (MOV reg,DR / MOV DR,reg) are
+                // unimplemented and stay TwoByteFallback.
+                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5 => {
+                    DecodeGroup::SystemSeg
+                }
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
                 // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
                 // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
@@ -4760,6 +4780,7 @@ impl Cpu386 {
                 // MOV Sreg, r/m16. Reads a word r/m, then loads the segment register through the
                 // shared segment-load path (which can fault and, in protected mode, reload the
                 // descriptor). CS (reg=1) and reg>5 are invalid and #GP, matching the fused handler.
+                // Loading SS this way arms the one-instruction interrupt shadow (386 PRM 11-16).
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
                 let segment = match modrm.reg {
@@ -4775,7 +4796,7 @@ impl Cpu386 {
                         .into());
                     }
                 };
-                self.load_segment(bus, segment, value as u16)?;
+                self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
                 Ok(clocks(7))
             }
             0x90 => {
@@ -4929,8 +4950,10 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0x17 => {
+                // POP SS. Arms the one-instruction interrupt shadow like MOV SS (386 PRM 11-16),
+                // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
                 let value = self.pop(bus, OperandSize::Word)? as u16;
-                self.load_segment(bus, SegmentIndex::Ss, value)?;
+                self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
                 Ok(clocks(7))
             }
             0x1e => {
@@ -4983,10 +5006,10 @@ impl Cpu386 {
                     let value = self.pop(bus, operand_size)?;
                     self.write_gpr_sized(index, operand_size, value);
                 }
-                // On a 16-bit stack, POPAD leaves SP advanced but lets the discarded
-                // saved-ESP slot's high half land in ESP[31:16]. Verified against the
-                // 80386 vectors; the register loads above are unaffected.
-                if !self.is_protected_mode() && matches!(operand_size, OperandSize::Dword) {
+                // On a 16-bit stack (SS.B=0), POPAD leaves SP advanced but lets the
+                // discarded saved-ESP slot's high half land in ESP[31:16]. Verified
+                // against the 80386 vectors; the register loads above are unaffected.
+                if !self.stack_is_32bit() && matches!(operand_size, OperandSize::Dword) {
                     let advanced = self.registers.esp();
                     self.registers
                         .set_esp((discarded & 0xffff_0000) | (advanced & 0xffff));
@@ -5016,9 +5039,26 @@ impl Cpu386 {
                     }
                     .into());
                 }
-                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                // The 386 PRM's POP pseudocode ("DEST <- (SS:ESP); ESP <- ESP + 4") does not
+                // say when the destination EA is computed relative to the increment. The
+                // modern Intel SDM is explicit: "the POP instruction computes the effective
+                // address of the operand after it increments the ESP register." Real silicon
+                // agrees: JEMM's DisableInts `pop [esp+4]` gadget only works if the EA is
+                // resolved from the POST-increment (E)SP. `resolve_decoded_modrm_operand`
+                // reads live GPRs, so it must run after `self.pop`, not before (the PUSH
+                // r/m32-with-ESP-base analog -- see the PUSH SP note in the same manual -- is
+                // the mirror-image caution: that source read happens before the decrement, so
+                // PUSH keeps its EA-then-op order and only POP's is swapped here).
+                let esp_before = self.registers.esp();
                 let value = self.pop(bus, operand_size)?;
-                self.write_operand_sized(bus, operand, operand_size, value)?;
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                if let Err(err) = self.write_operand_sized(bus, operand, operand_size, value) {
+                    // The pop already advanced ESP; a faulting write must leave the
+                    // instruction restartable, so undo that advance before propagating,
+                    // matching the IRET esp_before fault-unwind convention.
+                    self.registers.set_esp(esp_before);
+                    return Err(err);
+                }
                 Ok(clocks(5))
             }
             0x9c => {
@@ -5051,7 +5091,14 @@ impl Cpu386 {
                 let size = operand_size.bytes();
                 let frame_bp = self.read_gpr_sized(5, operand_size);
                 self.push(bus, frame_bp, operand_size)?;
-                let frame_temp = self.read_gpr_sized(4, operand_size);
+                // frame-ptr <- eSP (386 PRM 17-62): the saved stack pointer is read at
+                // StackAddrSize (SS.B), not the operand size -- on a B=0 stack it is the
+                // 16-bit SP, even for an ENTER with a 32-bit operand size.
+                let frame_temp = if self.stack_is_32bit() {
+                    self.registers.esp()
+                } else {
+                    u32::from(self.read_gpr16(4))
+                };
                 if level > 0 {
                     // Copy the display: the saved frame pointers of the enclosing scopes.
                     let mut bp = self.read_gpr_sized(5, operand_size);
@@ -5070,33 +5117,31 @@ impl Cpu386 {
                     self.push(bus, frame_temp, operand_size)?;
                 }
                 self.write_gpr_sized(5, operand_size, frame_temp);
-                match operand_size {
-                    OperandSize::Word => {
-                        let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                        self.write_gpr16(4, sp);
-                    }
-                    OperandSize::Dword => {
-                        if self.is_protected_mode() {
-                            let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
-                            self.registers.set_esp(esp);
-                        } else {
-                            let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                            self.write_gpr16(4, sp);
-                        }
-                    }
+                // The final allocation is an implicit stack reference (no memory
+                // access here, just the SP/ESP update), so it follows SS.B like
+                // push/pop -- not the operand size.
+                if self.stack_is_32bit() {
+                    let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
+                    self.registers.set_esp(esp);
+                } else {
+                    let sp = self.read_gpr16(4).wrapping_sub(alloc);
+                    self.write_gpr16(4, sp);
                 }
                 Ok(clocks(10))
             }
             0xc9 => {
-                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move follows
-                // the stack width: a 16-bit real-mode stack moves only SP and keeps
-                // ESP[31:16]; a 32-bit stack moves the full ESP. The operand size still
-                // selects BP vs EBP for the popped frame pointer.
-                let frame = self.read_gpr_sized(5, operand_size);
-                if self.is_protected_mode() {
-                    self.write_gpr_sized(4, operand_size, frame);
+                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop (386 PRM 17-96). Both the
+                // read of BP/EBP and the write to SP/ESP are keyed on SS.B, not operand
+                // size: a B=1 stack moves the FULL EBP into the FULL ESP even for a
+                // 16-bit operand size (StackAddrSize=32 => ESP <- EBP, no truncation);
+                // a B=0 stack moves only BP into SP and leaves ESP's high word alone.
+                // The operand size only selects BP vs EBP for the popped frame pointer.
+                if self.stack_is_32bit() {
+                    let frame = self.read_gpr32(5);
+                    self.registers.set_esp(frame);
                 } else {
-                    self.write_gpr16(4, frame as u16);
+                    let frame = self.read_gpr16(5);
+                    self.write_gpr16(4, frame);
                 }
                 let saved = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(5, operand_size, saved);
@@ -6318,6 +6363,55 @@ impl Cpu386 {
                     SegmentIndex::Ds
                 };
                 self.load_segment(bus, segment, selector)?;
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
+            0x0fb2 | 0x0fb4 | 0x0fb5 => {
+                // LSS (0F B2) / LFS (0F B4) / LGS (0F B5): 386 PRM 17-56 -- same far-pointer
+                // shape as LES/LDS above (mod=3 is #UD, the offset is read first, then the
+                // selector word right after it, both against the LIVE registers), loading the
+                // offset into the reg operand and the selector into SS/FS/GS through the
+                // unchanged `load_segment` (so the existing null-selector/#GP/#NP rules and the
+                // SS.B cache refresh all apply exactly as they do for any other segment load).
+                // LSS additionally arms the one-instruction interrupt shadow via
+                // `load_segment_arming_ss_shadow`, exactly like MOV SS/POP SS: 386 PRM 11-16
+                // treats "load SS, then load (E)SP" as one atomic unit against interrupts, NMI,
+                // and single-step, and LSS is that idiom in a single instruction.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = match insn.opcode {
+                    0x0fb2 => SegmentIndex::Ss,
+                    0x0fb4 => SegmentIndex::Fs,
+                    _ => SegmentIndex::Gs,
+                };
+                if segment == SegmentIndex::Ss {
+                    self.load_segment_arming_ss_shadow(bus, segment, selector)?;
+                } else {
+                    self.load_segment(bus, segment, selector)?;
+                }
                 self.write_gpr_sized(modrm.reg, operand_size, offset);
                 Ok(clocks(7))
             }
@@ -7770,90 +7864,63 @@ impl Cpu386 {
         value: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
-        match operand_size {
-            OperandSize::Word => {
-                let sp = self.read_gpr16(4).wrapping_sub(2);
-                self.write_gpr16(4, sp);
-                self.write_memory_sized(
-                    bus,
-                    SegmentIndex::Ss,
-                    u32::from(sp),
-                    OperandSize::Word,
-                    value,
-                    BusAccessKind::DataWrite,
-                )
-            }
-            OperandSize::Dword => {
-                if self.is_protected_mode() {
-                    let esp = self.registers.esp().wrapping_sub(4);
-                    self.registers.set_esp(esp);
-                    self.write_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        esp,
-                        OperandSize::Dword,
-                        value,
-                        BusAccessKind::DataWrite,
-                    )
-                } else {
-                    // A real-mode stack is 16 bits: the address comes from SP, only SP
-                    // advances, and ESP[31:16] is preserved. The SS B-bit-accurate
-                    // version arrives with 32-bit protected-mode stacks.
-                    let sp = self.read_gpr16(4).wrapping_sub(4);
-                    self.write_gpr16(4, sp);
-                    self.write_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        u32::from(sp),
-                        OperandSize::Dword,
-                        value,
-                        BusAccessKind::DataWrite,
-                    )
-                }
-            }
+        let width = operand_size.bytes();
+        if self.stack_is_32bit() {
+            // SS.B=1: implicit stack references use the full 32-bit ESP, for both
+            // 16-bit and 32-bit operand-size pushes (386 PRM 16.2: the B bit picks
+            // the stack-pointer width, independent of operand size).
+            let esp = self.registers.esp().wrapping_sub(width);
+            self.registers.set_esp(esp);
+            self.write_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                esp,
+                operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )
+        } else {
+            // SS.B=0 (real mode, V86, or a 16-bit protected-mode stack): the address
+            // comes from SP only, only SP advances, and ESP's high word is preserved
+            // (real silicon wraps SP, not ESP, on this stack).
+            let sp = self.read_gpr16(4).wrapping_sub(width as u16);
+            self.write_gpr16(4, sp);
+            self.write_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                u32::from(sp),
+                operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )
         }
     }
 
     fn pop<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<u32> {
-        match operand_size {
-            OperandSize::Word => {
-                let sp = self.read_gpr16(4);
-                let value = self.read_memory_sized(
-                    bus,
-                    SegmentIndex::Ss,
-                    u32::from(sp),
-                    OperandSize::Word,
-                    BusAccessKind::DataRead,
-                )?;
-                self.write_gpr16(4, sp.wrapping_add(2));
-                Ok(value)
-            }
-            OperandSize::Dword => {
-                if self.is_protected_mode() {
-                    let esp = self.registers.esp();
-                    let value = self.read_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        esp,
-                        OperandSize::Dword,
-                        BusAccessKind::DataRead,
-                    )?;
-                    self.registers.set_esp(esp.wrapping_add(4));
-                    Ok(value)
-                } else {
-                    // Real-mode 16-bit stack: read from SP and advance only SP.
-                    let sp = self.read_gpr16(4);
-                    let value = self.read_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        u32::from(sp),
-                        OperandSize::Dword,
-                        BusAccessKind::DataRead,
-                    )?;
-                    self.write_gpr16(4, sp.wrapping_add(4));
-                    Ok(value)
-                }
-            }
+        let width = operand_size.bytes();
+        if self.stack_is_32bit() {
+            let esp = self.registers.esp();
+            let value = self.read_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                esp,
+                operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.registers.set_esp(esp.wrapping_add(width));
+            Ok(value)
+        } else {
+            // SS.B=0: read from SP and advance only SP, preserving ESP's high word.
+            let sp = self.read_gpr16(4);
+            let value = self.read_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                u32::from(sp),
+                operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.write_gpr16(4, sp.wrapping_add(width as u16));
+            Ok(value)
         }
     }
 
@@ -8804,7 +8871,16 @@ impl Cpu386 {
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
                     self.load_segment(bus, SegmentIndex::Ss, ss)?;
                     self.set_eip(eip);
-                    self.registers.set_esp(esp);
+                    // 386 PRM 17-80: "Load SS:eSP from stack" -- eSP is B-keyed (17-12).
+                    // Onto a B=0 (16-bit) outer stack, only SP takes the popped value;
+                    // ESP's high word carries over from the inner stack untouched (the
+                    // documented real-silicon ESP-high-word leak on a 16-bit ring
+                    // transition). A B=1 outer stack takes the full popped dword.
+                    if self.stack_is_32bit() {
+                        self.registers.set_esp(esp);
+                    } else {
+                        self.write_gpr16(4, esp as u16);
+                    }
                     self.load_flags(flags, OperandSize::Dword, false);
                     // PRM transition point: the target RPL (checked above, non-V86) is the
                     // new CPL.
@@ -8883,10 +8959,10 @@ impl Cpu386 {
 
     fn release_stack(&mut self, count: u16) {
         // The immediate return forms release `count` bytes of arguments after the
-        // pop. The stack pointer width follows the stack, not the operand size: a
-        // real-mode 16-bit stack moves only SP and preserves ESP[31:16]. The SS
-        // B-bit-accurate version arrives with 32-bit protected-mode stacks.
-        if self.is_protected_mode() {
+        // pop. The stack pointer width follows SS.B, not the operand size: a
+        // 16-bit stack (SS.B=0, which includes real mode and V86) moves only SP
+        // and preserves ESP[31:16].
+        if self.stack_is_32bit() {
             let esp = self.registers.esp().wrapping_add(u32::from(count));
             self.registers.set_esp(esp);
         } else {
@@ -9033,14 +9109,27 @@ impl Cpu386 {
         if !conforming && target_dpl < cpl {
             // Inter-privilege call: copy parameters off the outer stack, switch to the
             // inner stack from the TSS, then rebuild the frame there.
+            //
+            // The outer stack's top is SS:SP, per the old SS's own B bit (386 PRM
+            // 17-42): a B=0 outer stack wraps the per-slot offset within 16 bits and
+            // leaves ESP's high word alone, rather than adding into the full ESP. This
+            // matters for the DOS4GW/VCPI case: a 32-bit call gate onto a B=0 outer
+            // stack with nonzero ESP[31:16] must still read params at the wrapped SP.
             let mut params = [0u32; 32];
             let psize = op.bytes();
             let outer_esp = self.registers.esp();
+            let outer_stack_32 = self.stack_is_32bit();
             for (k, slot) in params.iter_mut().enumerate().take(param_count) {
+                let offset = k as u32 * psize;
+                let addr = if outer_stack_32 {
+                    outer_esp.wrapping_add(offset)
+                } else {
+                    u32::from((outer_esp as u16).wrapping_add(offset as u16))
+                };
                 *slot = self.read_memory_sized(
                     bus,
                     SegmentIndex::Ss,
-                    outer_esp + k as u32 * psize,
+                    addr,
                     op,
                     BusAccessKind::DataRead,
                 )?;
@@ -9135,7 +9224,17 @@ impl Cpu386 {
         let new_esp = self.read_system_linear_u32(bus, esp_addr)?;
         let new_ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
         self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
-        self.registers.set_esp(new_esp);
+        // 386 PRM 17-43/17-74: "Load new SS:eSP value from TSS" -- eSP is B-keyed
+        // (17-12), not always the full ESP. The just-loaded SS's B bit governs: a
+        // 16-bit (B=0) ring-0 stack takes the TSS value into SP only, and ESP's
+        // high word carries over from the interrupted context untouched (the same
+        // wrap-preserving-high-word rule `push`/`pop` use). A B=1 stack takes the
+        // TSS value as the full 32-bit ESP.
+        if self.stack_is_32bit() {
+            self.registers.set_esp(new_esp);
+        } else {
+            self.write_gpr16(4, new_esp as u16);
+        }
         Ok((old_ss, old_esp))
     }
 
@@ -9279,6 +9378,30 @@ impl Cpu386 {
 
     fn relative_jump(&mut self, relative: i32, operand_size: OperandSize) {
         self.set_eip(self.registers.eip.wrapping_add(relative as u32) & operand_size.mask());
+    }
+
+    /// `load_segment` for the three instructions that load SS directly from the instruction
+    /// stream (MOV SS, POP SS, LSS): 386 PRM 11-16 says loading SS this way inhibits interrupts,
+    /// NMI, and single-step traps until the next instruction boundary, so a pointer's offset and
+    /// stack segment can be loaded as one atomic unit even if an interrupt lands between the two
+    /// halves. This is the SAME one-instruction shadow STI arms (`interrupt_shadow`); reused here
+    /// rather than duplicated. Only armed on success -- a faulting load (null selector, bad
+    /// descriptor) must not suppress the interrupt check. Every OTHER `load_segment(.., Ss, ..)`
+    /// call site (IRET's outer-stack pop, the inner-stack switch on a privilege-level change, the
+    /// TSS register-restore loop) reloads SS as a side effect of a control transfer, not as the
+    /// direct target of one of these three opcodes, and must not arm the shadow -- callers use the
+    /// plain `load_segment` for those.
+    fn load_segment_arming_ss_shadow<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        selector: u16,
+    ) -> ExecResult<()> {
+        self.load_segment(bus, segment, selector)?;
+        if segment == SegmentIndex::Ss {
+            self.interrupt_shadow = true;
+        }
+        Ok(())
     }
 
     fn load_segment<B: CpuBus>(
@@ -15010,6 +15133,283 @@ mod tests {
     }
 
     #[test]
+    fn lss_real_mode_16bit_loads_offset_and_ss_and_arms_shadow() {
+        // lss bx, [0x200]  (0F B2 1E 00 02). Loads the far pointer at DS:0x200:
+        // BX <- word[0x200], SS <- word[0x202]. No flags change, but LSS arms the
+        // one-instruction interrupt shadow (386 PRM 11-16), exactly like MOV SS/POP SS.
+        // No interrupt is pending going in (IF true with nothing pending is the ordinary
+        // case); the deferred-delivery behavior itself is `lss_interrupt_shadow_defers_
+        // a_pending_irq_by_one_instruction` below.
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb2, 0x1e, 0x00, 0x02]);
+        memory[0x200] = 0x34; // offset low
+        memory[0x201] = 0x12; // offset high -> 0x1234
+        memory[0x202] = 0x00; // selector low
+        memory[0x203] = 0x90; // selector high -> 0x9000
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_IF, true);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x9000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).base, 0x9000 << 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+        assert!(
+            cpu.interrupt_shadow,
+            "LSS must arm the one-instruction interrupt shadow"
+        );
+    }
+
+    #[test]
+    fn lss_interrupt_shadow_defers_a_pending_irq_by_one_instruction() {
+        // Same shape as `sti_interrupt_shadow_defers_interrupt_by_one_instruction`, but the
+        // shadow is armed by LSS instead of STI: a pending IRQ must not be taken until the
+        // instruction AFTER LSS has run.
+        let mut memory = vec![0u8; 0x300];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb2, 0x1e, 0x00, 0x02]); // lss bx, [0x200]
+        memory[5] = 0x90; // NOP -- executes before the interrupt is taken (shadow)
+        memory[6] = 0x90; // NOP -- not reached; interrupt taken instead
+        memory[0x200] = 0x00; // offset -> 0x0000
+        memory[0x201] = 0x00;
+        memory[0x202] = 0x00; // selector -> 0x0000 (SS stays flat at base 0 in real mode)
+        memory[0x203] = 0x00;
+        // IVT entry for vector 0x08 (IRQ0) at byte offset 0x20: offset=0x0208, segment=0.
+        memory[0x20..0x22].copy_from_slice(&0x0208u16.to_le_bytes());
+        memory[0x22..0x24].copy_from_slice(&0x0000u16.to_le_bytes());
+        memory[0x208] = 0xcf; // IRET at the handler target (not reached in this test)
+
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        cpu.set_flag(FLAG_IF, true);
+
+        let mut bus = TestBus::with_memory(memory);
+        // No interrupt pending yet: it "arrives" during LSS's execution window, which is
+        // exactly the case the shadow exists to cover -- an IRQ landing between the LSS
+        // and the next instruction boundary must wait for that boundary.
+
+        // Cycle 1: LSS. SS reloads; the shadow arms. eip advances normally.
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eip, 5,
+            "eip must be 5 after LSS -- NOP not yet executed"
+        );
+        assert!(
+            cpu.interrupt_shadow,
+            "the shadow must be armed immediately after LSS runs"
+        );
+        // The IRQ arrives now, after LSS has already committed.
+        bus.pending_irq = Some(8);
+
+        // Cycle 2: NOP. Shadow consumed at cycle start -> interrupt check skipped -> NOP
+        // executes -> eip advances to 6. IRQ still pending.
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eip, 6,
+            "eip must be 6 after NOP -- shadow let NOP through"
+        );
+        assert!(
+            bus.pending_irq.is_some(),
+            "interrupt must still be pending after NOP (shadow consumed, interrupt check skipped)"
+        );
+
+        // Cycle 3: no shadow, IF set, IRQ pending -> interrupt is acknowledged before fetch.
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            bus.pending_irq.is_none(),
+            "interrupt must be taken after the shadow expires"
+        );
+    }
+
+    #[test]
+    fn lss_32bit_operand_size_loads_esp_wide_offset() {
+        // 66 0F B2 1E 00 02 -- lss ebx, [0x200] (operand-size override to 32-bit).
+        // EBX <- dword[0x200], SS <- word[0x204].
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..6].copy_from_slice(&[0x66, 0x0f, 0xb2, 0x1e, 0x00, 0x02]);
+        memory[0x200..0x204].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        memory[0x204..0x206].copy_from_slice(&0x9000u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.ebx(), 0x1122_3344);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x9000);
+    }
+
+    #[test]
+    fn lfs_loads_offset_and_fs() {
+        // lfs bx, [0x200]  (0F B4 1E 00 02). No interrupt shadow -- only LSS arms it.
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb4, 0x1e, 0x00, 0x02]);
+        memory[0x200] = 0x34;
+        memory[0x201] = 0x12;
+        memory[0x202] = 0x00;
+        memory[0x203] = 0x70;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.set_flag(FLAG_IF, true);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0x7000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).base, 0x7000 << 4);
+        assert!(
+            !cpu.interrupt_shadow,
+            "LFS must not arm the SS interrupt shadow"
+        );
+    }
+
+    #[test]
+    fn lgs_loads_offset_and_gs() {
+        // lgs bx, [0x200]  (0F B5 1E 00 02).
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb5, 0x1e, 0x00, 0x02]);
+        memory[0x200] = 0x34;
+        memory[0x201] = 0x12;
+        memory[0x202] = 0x00;
+        memory[0x203] = 0x60;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0x6000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).base, 0x6000 << 4);
+        assert!(
+            !cpu.interrupt_shadow,
+            "LGS must not arm the SS interrupt shadow"
+        );
+    }
+
+    #[test]
+    fn lss_with_register_operand_delivers_ud() {
+        // lss bx, ax encoded with mod=3 (0F B2 C3) is an invalid encoding -> #UD (vector 6).
+        // IVT[6] at 0x18 points to IP 0x00ee, CS 0; the CPU vectors there.
+        let mut memory = vec![0u8; 1024];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb2, 0xc3]);
+        memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
+    fn lfs_with_register_operand_delivers_ud() {
+        // lfs bx, ax (0F B4 C3, mod=3) -> #UD (vector 6).
+        let mut memory = vec![0u8; 1024];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb4, 0xc3]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
+    fn lgs_with_register_operand_delivers_ud() {
+        // lgs bx, ax (0F B5 C3, mod=3) -> #UD (vector 6).
+        let mut memory = vec![0u8; 1024];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb5, 0xc3]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
+    fn lss_null_selector_faults_general_protection() {
+        // In protected mode, LSS with a null selector must #GP -- SS can never be null,
+        // the same rule any other SS load enforces (`null_selector_into_ss_still_faults`).
+        let (mut cpu, mut memory) = protected_cpu(&[0x0f, 0xb2, 0x1e, 0x80, 0x01], 0, 0);
+        // Far pointer at 0x180: offset 0x1234, selector 0x0000 (null).
+        memory[0x180..0x182].copy_from_slice(&0x1234u16.to_le_bytes());
+        memory[0x182..0x184].copy_from_slice(&0x0000u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+            ),
+            "a null selector into SS via LSS must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn lss_protected_mode_refreshes_the_ss_b_bit() {
+        // Load SS via LSS from a 32-bit (B=1) data descriptor (selector 0x08, GDT). The cached
+        // `default_size_32` (the B bit) must flip to match the new descriptor -- it comes free
+        // through `load_segment` -> `descriptor_to_segment`, exactly like any other segment load.
+        let descriptor_low = 0x0000_ffffu32; // limit low = 0xffff, base = 0
+        let descriptor_high = 0x00cf_9200u32; // access=0x92 (present, data, writable), B=1, G=1
+        let (mut cpu, mut memory) = protected_cpu(
+            &[0x0f, 0xb2, 0x1e, 0x80, 0x01],
+            descriptor_low,
+            descriptor_high,
+        );
+        assert!(
+            !cpu.registers.segment(SegmentIndex::Ss).default_size_32,
+            "test setup: SS must start 16-bit (B=0) so the flip is observable"
+        );
+        // Far pointer at 0x180: offset 0x1234, selector 0x08.
+        memory[0x180..0x182].copy_from_slice(&0x1234u16.to_le_bytes());
+        memory[0x182..0x184].copy_from_slice(&0x0008u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x0008);
+        assert!(
+            cpu.registers.segment(SegmentIndex::Ss).default_size_32,
+            "LSS must refresh SS.B to the loaded descriptor's B bit"
+        );
+    }
+
+    #[test]
     fn cbw_sign_extends_al_into_ax() {
         // cbw (0x98): al = 0x80 (-128) -> ax = 0xff80.
         let mut memory = vec![0; 64];
@@ -15414,6 +15814,206 @@ mod tests {
     }
 
     #[test]
+    fn pop_rm32_esp_relative_destination_uses_post_increment_esp() {
+        // The falsifier: push A; push B; pop dword [esp+4] must write B to the
+        // POST-increment [esp+4] (the original pre-push top of stack, 0x0200) --
+        // not the pre-pop [esp+4] (0x01fc, the slot that holds A), which is what
+        // resolving the EA before the pop would compute.
+        //
+        // 0x66 0x67 8F /0 mod=01 rm=100 (SIB: base=ESP, no index) disp8=0x04:
+        // POP dword [esp+4], 32-bit operand + 32-bit address override in real mode.
+        let mut memory = vec![0; 1024];
+        memory[0..6].copy_from_slice(&[0x66, 0x67, 0x8f, 0x44, 0x24, 0x04]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        // push A; push B (32-bit pushes on the 32-bit-addressed stack).
+        cpu.push(&mut bus, 0xaaaa_aaaa, OperandSize::Dword).unwrap();
+        cpu.push(&mut bus, 0xbbbb_bbbb, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.registers.esp(), 0x01f8);
+        // Stack image: [0x01f8]=B (top), [0x01fc]=A.
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // The pop reads B from 0x01f8 and advances esp to 0x01fc first; [esp+4]
+        // computed AFTER that lands at 0x0200 (untouched before this instruction),
+        // not at the pre-pop [esp+4] == 0x01fc (the slot holding A).
+        assert_eq!(cpu.registers.esp(), 0x01fc, "pop advanced esp by 4");
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x0200..0x0204].try_into().unwrap()),
+            0xbbbb_bbbb,
+            "post-increment EA wrote B to the pre-push top of stack, not A's slot"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x01fc..0x0200].try_into().unwrap()),
+            0xaaaa_aaaa,
+            "A's slot is untouched: a pre-pop EA would have overwritten it with B"
+        );
+    }
+
+    #[test]
+    fn pop_rm16_esp_relative_destination_uses_post_increment_esp() {
+        // 16-bit variant of the falsifier above. 8F /0 mod=01 rm=100 (SIB: base=SP
+        // is not directly encodable in 16-bit addressing -- 16-bit ModRM has no SIB
+        // byte -- so this uses 32-bit addressing with a 16-bit operand: 0x67 8F /0
+        // mod=01 rm=100 disp8=0x02, POP word [esp+2].
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x67, 0x8f, 0x44, 0x24, 0x02]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.push(&mut bus, 0xaaaa, OperandSize::Word).unwrap();
+        cpu.push(&mut bus, 0xbbbb, OperandSize::Word).unwrap();
+        assert_eq!(cpu.registers.esp(), 0x01fc);
+        // Stack image: [0x01fc]=B (top), [0x01fe]=A.
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // The pop reads B from 0x01fc and advances esp to 0x01fe first; [esp+2]
+        // computed AFTER that lands at 0x0200 (untouched before this instruction),
+        // not at the pre-pop [esp+2] == 0x01fe (the slot holding A).
+        assert_eq!(cpu.registers.esp(), 0x01fe, "pop advanced esp by 2");
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x0200..0x0202].try_into().unwrap()),
+            0xbbbb,
+            "post-increment EA wrote B to the pre-push top of stack, not A's slot"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x01fe..0x0200].try_into().unwrap()),
+            0xaaaa,
+            "A's slot is untouched: a pre-pop EA would have overwritten it with B"
+        );
+    }
+
+    #[test]
+    fn pop_rm32_esp_relative_destination_restores_esp_on_page_fault() {
+        // (c) A faulting destination write must leave ESP exactly as it was before
+        // the instruction started: the pop's ESP advance must be unwound so the
+        // instruction is cleanly restartable after the guest's #PF handler fixes up
+        // the mapping.
+        //
+        // PD at 0x1000, PT at 0x2000. Linear page 0 (code + the stack the pop reads
+        // from) is identity-mapped present+writable. Linear page 0x3000 (where the
+        // post-increment `[esp+4]` destination lands) has NO PTE at all, so the
+        // destination write takes a #PF.
+        let mut memory = vec![0; 0x4000];
+        // Code at linear 0: POP dword [esp+4] (32-bit operand + 32-bit address
+        // override in real mode).
+        memory[0..6].copy_from_slice(&[0x66, 0x67, 0x8f, 0x44, 0x24, 0x04]);
+        // The stack top read by the pop, at linear 0x2ffc: value B.
+        memory[0x2ffc..0x3000].copy_from_slice(&0xbbbb_bbbbu32.to_le_bytes());
+        // PDE[0] -> PT at 0x2000, present+rw+user.
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        // PTE[0] (linear 0x0000-0x0fff: code + the read side of the stack) -> identity, present+rw.
+        memory[0x2000..0x2004].copy_from_slice(&0x0000_0007u32.to_le_bytes());
+        // PTE[2] (linear 0x2000-0x2fff, covers 0x2ffc) -> identity, present+rw.
+        memory[0x2008..0x200c].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        // PTE[3] (linear 0x3000-0x3fff, the POP destination) intentionally left 0 (not present).
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.control.cr3 = 0x1000;
+        cpu.control.cr0 |= CR0_PG;
+        // ESP = 0x2ffc: the pop reads from here (mapped), advances to 0x3000, and
+        // the destination EA [esp+4] (post-increment) is 0x3004 -- inside the
+        // unmapped page 0x3000, so the write faults.
+        cpu.registers.set_esp(0x2ffc);
+        let esp_before = cpu.registers.esp();
+        let mut bus = TestBus::with_memory(memory);
+
+        // Use the raw decode/execute split (no exception delivery) so the assert
+        // below observes ESP exactly as `execute_decoded` left it, not after a
+        // real-mode #PF delivery has also pushed flags/CS/IP onto that same stack.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(_)
+                }
+            ),
+            "{fault:?}"
+        );
+        assert_eq!(
+            cpu.registers.esp(),
+            esp_before,
+            "a faulting destination write must leave esp exactly pre-instruction"
+        );
+    }
+
+    #[test]
+    fn push_rm32_esp_source_reads_before_decrement() {
+        // (d) PUSH r/m32 with an ESP-based memory source (JEMM's V86_MonitorEx
+        // executes `push dword [esp]`) must read the source BEFORE the decrement:
+        // the value pushed is the current top of stack, duplicating it, not
+        // whatever ends up below the new top.
+        //
+        // 0x66 0x67 FF /6 mod=00 rm=100 (SIB: base=ESP, no index, no disp): PUSH
+        // dword [esp], 32-bit operand + 32-bit address override in real mode.
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x66, 0x67, 0xff, 0x34, 0x24]);
+        memory[0x0200..0x0204].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.esp(), 0x01fc, "push decremented esp by 4");
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x01fc..0x0200].try_into().unwrap()),
+            0xdead_beef,
+            "the duplicated top-of-stack value, read before the decrement"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x0200..0x0204].try_into().unwrap()),
+            0xdead_beef,
+            "the original top-of-stack slot is untouched"
+        );
+    }
+
+    #[test]
+    fn pop_rm32_non_esp_base_is_unchanged() {
+        // (e) A non-ESP base (EBX here) is unaffected by the pop-then-resolve
+        // reorder: the destination EA never depended on ESP in the first place.
+        //
+        // 0x66 0x67 8F /0 mod=01 rm=011 disp8=0x10: POP dword [ebx+0x10].
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x66, 0x67, 0x8f, 0x43, 0x10]);
+        memory[0x0100..0x0104].copy_from_slice(&0xcafe_babeu32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.registers.set_ebx(0x0300);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.esp(), 0x0104);
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x0310..0x0314].try_into().unwrap()),
+            0xcafe_babe,
+            "ebx+0x10 destination, unaffected by esp timing"
+        );
+    }
+
+    #[test]
     fn retf_pops_offset_then_segment() {
         // retf (0xcb). Stack at ss:0x0100 holds ip 0x0100 then cs 0x3000.
         let mut memory = vec![0; 1024];
@@ -15529,6 +16129,216 @@ mod tests {
         cpu.release_stack(4);
 
         assert_eq!(cpu.registers.esp(), 0xbeef_0002);
+    }
+
+    /// Load a protected-mode SS segment register directly (bypassing GDT resolution)
+    /// with the given B bit, for exercising `stack_is_32bit()` in isolation.
+    fn set_protected_ss(cpu: &mut Cpu386, base: u32, default_size_32: bool) {
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x10,
+                base,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32,
+            },
+        );
+    }
+
+    #[test]
+    fn push_dword_on_a_16bit_protected_mode_stack_wraps_sp_and_preserves_high_esp() {
+        // The DOS4GW/VCPI scenario: protected mode, a 32-bit push, but SS.B=0 (a
+        // 16-bit stack segment). Only SP must wrap; ESP[31:16] survives untouched,
+        // and the write lands at SS.base + the wrapped SP, not at SS.base + ESP.
+        let memory = vec![0u8; 0x1_0002];
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, false);
+        cpu.registers.set_esp(0xbeef_0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.push(&mut bus, 0x1122_3344, OperandSize::Dword).unwrap();
+
+        // sp 0x0002 -> wraps to 0xfffe; ESP high half (0xbeef) preserved.
+        assert_eq!(cpu.registers.esp(), 0xbeef_fffe);
+        let read = bus
+            .read_memory_direct(0xfffe, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(read.value, 0x1122_3344);
+    }
+
+    #[test]
+    fn pop_dword_on_a_16bit_protected_mode_stack_wraps_sp_and_preserves_high_esp() {
+        // Mirror of the push case: SS.B=0 in protected mode reads from the wrapped
+        // SP and advances only SP, leaving ESP[31:16] alone.
+        let mut memory = vec![0u8; 0x1_0002];
+        memory[0xfffe..0x1_0002].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, false);
+        cpu.registers.set_esp(0xbeef_fffe);
+        let mut bus = TestBus::with_memory(memory);
+
+        let value = cpu.pop(&mut bus, OperandSize::Dword).unwrap();
+
+        assert_eq!(value, 0x1122_3344);
+        // sp 0xfffe -> +4 wraps to 0x0002; ESP high half preserved.
+        assert_eq!(cpu.registers.esp(), 0xbeef_0002);
+    }
+
+    #[test]
+    fn push_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
+        // SS.B=1 (the TOKAEMM monitor's stack shape): full-ESP arithmetic, no wrap
+        // at the 16-bit boundary, matching today's protected-mode behavior.
+        let memory = vec![0u8; 0x2_0000];
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, true);
+        cpu.registers.set_esp(0x0001_0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.push(&mut bus, 0xaabb_ccdd, OperandSize::Dword).unwrap();
+
+        assert_eq!(cpu.registers.esp(), 0x0000_fffe);
+        let read = bus
+            .read_memory_direct(0x0000_fffe, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(read.value, 0xaabb_ccdd);
+    }
+
+    #[test]
+    fn pop_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
+        let mut memory = vec![0u8; 0x2_0000];
+        memory[0x0000_fffe..0x0001_0002].copy_from_slice(&0xaabb_ccddu32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, true);
+        cpu.registers.set_esp(0x0000_fffe);
+        let mut bus = TestBus::with_memory(memory);
+
+        let value = cpu.pop(&mut bus, OperandSize::Dword).unwrap();
+
+        assert_eq!(value, 0xaabb_ccdd);
+        assert_eq!(cpu.registers.esp(), 0x0001_0002);
+    }
+
+    #[test]
+    fn ss_load_populates_the_cached_b_bit_from_the_descriptor() {
+        // A GDT-resolved SS load must cache B from descriptor bit 22, and a
+        // subsequent real-mode load must clear it back to false.
+        let mut memory = vec![0u8; 4096];
+        // GDT at 0, entry 1 (selector 0x08): base 0, limit 0xfffff (4K gran), B=1
+        // data segment, present, DPL 0. Access byte 0x93 (present, data, r/w).
+        // High dword: limit high nibble 0xf | G=1,D/B=1 -> 0xc0 | 0x0f = 0xcf in bits 16-23,
+        // access in bits 8-15.
+        let low: u32 = 0xffff; // limit low
+        let high: u32 = 0x00cf_9300u32; // G=1,B=1,limit_high=0xf,access=0x93
+        memory[8..12].copy_from_slice(&low.to_le_bytes());
+        memory[12..16].copy_from_slice(&high.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.gdtr.base = 0;
+        cpu.gdtr.limit = 0xffff;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, 0x08).unwrap();
+        assert!(cpu.stack_is_32bit());
+
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        assert!(!cpu.stack_is_32bit());
+    }
+
+    /// A flat protected-mode CPU with code at linear 0, CS.D from `code_d32`, and SS.B
+    /// from `stack_b32` -- for exercising ENTER/LEAVE's SS.B-vs-operand-size split.
+    fn protected_cpu_with_cs_d_and_ss_b(
+        code: &[u8],
+        mem_len: usize,
+        code_d32: bool,
+        stack_b32: bool,
+    ) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; mem_len];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x08,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: code_d32,
+            },
+        );
+        set_protected_ss(&mut cpu, 0, stack_b32);
+        cpu.registers.eip = 0;
+        (cpu, memory)
+    }
+
+    #[test]
+    fn leave_on_a_32bit_stack_moves_full_esp_even_with_a_16bit_operand_size() {
+        // LEAVE with a 0x66 operand-size prefix (word EBP/BP pop) on an SS.B=1 stack.
+        // Per PRM 17-96, StackAddrSize=32 => ESP <- EBP unconditionally: the full
+        // register, not the low word, regardless of the operand size. EBP carries a
+        // high word (0x0002) distinct from ESP's stale high word (0xdead) that must
+        // land in ESP whole; a truncating write would leave ESP's stale 0xdead high
+        // half instead of EBP's 0x0002.
+        let (mut cpu, memory) =
+            protected_cpu_with_cs_d_and_ss_b(&[0x66, 0xc9], 0x3_0000, true, true);
+        cpu.write_gpr32(5, 0x0002_0100); // EBP
+        cpu.registers.set_esp(0xdead_0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0002_0100 + 2,
+            "ESP <- full EBP, then +2 from the 16-bit pop"
+        );
+    }
+
+    #[test]
+    fn leave_on_a_16bit_stack_moves_only_sp_and_preserves_high_esp() {
+        // Mirror on an SS.B=0 stack (real mode's rule, still true in protected mode):
+        // only SP takes BP's value; ESP's high word is untouched.
+        let (mut cpu, memory) = protected_cpu_with_cs_d_and_ss_b(&[0xc9], 0x1_0000, false, false);
+        cpu.write_gpr16(5, 0x0200); // BP
+        cpu.registers.set_esp(0xbeef_0080);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // SP <- 0x0200, then +2 from the pop = 0x0202; high half preserved.
+        assert_eq!(cpu.registers.esp(), 0xbeef_0202);
+    }
+
+    #[test]
+    fn enter_op32_on_a_16bit_stack_saves_frame_ptr_from_sp_not_esp() {
+        // ENTER imm16,1 (op32) on an SS.B=0 stack: frame-ptr <- eSP is the 16-bit SP
+        // (386 PRM 17-62), not the full (garbage-laden) ESP. With nesting level 1 the
+        // frame-ptr is pushed once more, so the pushed dword must carry the wrapped SP
+        // zero-extended, not ESP's high garbage.
+        let (mut cpu, memory) =
+            protected_cpu_with_cs_d_and_ss_b(&[0xc8, 0x04, 0x00, 0x01], 0x1_0000, true, false);
+        cpu.registers.set_esp(0xbeef_0100);
+        cpu.write_gpr32(5, 0); // EBP, arbitrary
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // Push(EBP) at SP 0x0100 -> SP=0x00fc; frame-ptr = SP = 0x00fc (not
+        // 0xbeef_00fc); level>0 so frame-ptr is pushed again at SP=0x00f8; final
+        // alloc SP -= 4 = 0x00f4. High half of ESP preserved throughout.
+        let frame_ptr_slot = u32::from_le_bytes(bus.memory[0xf8..0xfc].try_into().unwrap());
+        assert_eq!(
+            frame_ptr_slot, 0x00fc,
+            "pushed frame-ptr is the 16-bit SP, zero-extended, not ESP-high garbage"
+        );
+        assert_eq!(cpu.registers.esp(), 0xbeef_00f4);
+        assert_eq!(
+            cpu.read_gpr32(5),
+            0x00fc,
+            "EBP <- frame-ptr (zero-extended)"
+        );
     }
 
     #[test]
@@ -19277,7 +20087,7 @@ mod tests {
             // CMOVcc / SETcc / IMUL (CondMove)
             | 0x40..=0x4f | 0x90..=0x9f | 0xaf
             // SystemSeg
-            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22
+            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5
             // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
             | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
             | 0xc7 | 0xc8..=0xcf
@@ -19375,12 +20185,13 @@ mod tests {
         }
 
         // A representative un-implemented 0F byte from each kind of gap that falls through to the
-        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg), 0xb2 (LSS),
-        // 0xb4 (LFS), 0xb5 (LGS). Each routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode.
-        // (0F AA RSM also routes to TwoByteFallback but is an EXPLICITLY handled arm in
-        // `execute_two_byte` that #UDs with vector 6 because no SMM is modeled — it is "implemented",
-        // just always invalid — so it is not part of this generic-catch-all sweep.)
-        for second in [0x0au8, 0x21, 0x23, 0xb2, 0xb4, 0xb5] {
+        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg). Each routes to
+        // TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F B2/B4/B5 LSS/LFS/LGS are now
+        // implemented -- see the SystemSeg coverage test below. 0F AA RSM also routes to
+        // TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
+        // vector 6 because no SMM is modeled -- it is "implemented", just always invalid -- so it is
+        // not part of this generic-catch-all sweep.)
+        for second in [0x0au8, 0x21, 0x23] {
             assert!(
                 !implemented_two_byte(second),
                 "test bug: 0F {second:#04x} is actually implemented"
@@ -22310,15 +23121,13 @@ mod tests {
         // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
         // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
         // the routing so a future edit can't silently capture them. 0F 21/23 (MOV reg,DR / MOV DR,reg)
-        // and 0F B2/B4/B5 (LSS/LFS/LGS) #UD as `UnsupportedTwoByteOpcode`; 0x63 (ARPL) #UDs as
-        // `UnsupportedOpcode`. All surface through the split as a CpuError, never a panic.
+        // #UD as `UnsupportedTwoByteOpcode`; 0x63 (ARPL) #UDs as `UnsupportedOpcode`. All surface
+        // through the split as a CpuError, never a panic. (0F B2/B4/B5 LSS/LFS/LGS moved OFF this
+        // list once implemented -- see the `lss`/`lfs`/`lgs` tests below.)
         for code in [
-            &[0x0f, 0x21, 0xc0][..],             // MOV EAX, DR0
-            &[0x0f, 0x23, 0xc0][..],             // MOV DR0, EAX
-            &[0x0f, 0xb2, 0x1e, 0x00, 0x02][..], // LSS BX, [0x200]
-            &[0x0f, 0xb4, 0x1e, 0x00, 0x02][..], // LFS BX, [0x200]
-            &[0x0f, 0xb5, 0x1e, 0x00, 0x02][..], // LGS BX, [0x200]
-            &[0x63, 0xc0][..],                   // ARPL AX, AX
+            &[0x0f, 0x21, 0xc0][..], // MOV EAX, DR0
+            &[0x0f, 0x23, 0xc0][..], // MOV DR0, EAX
+            &[0x63, 0xc0][..],       // ARPL AX, AX
         ] {
             let (mut cpu, memory) = real_mode_cpu(code, 0x40);
             let mut bus = TestBus::with_memory(memory);
@@ -22968,6 +23777,67 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(bus.memory[0xe0..0xe4].try_into().unwrap()),
             0x1111
+        );
+    }
+
+    #[test]
+    fn call_gate_inter_privilege_reads_params_from_a_16bit_outer_stack_with_esp_high_garbage() {
+        // The DOS4GW/VCPI scenario: the outer (caller's) stack is SS.B=0 with garbage
+        // in ESP's high word. Per PRM 17-42 the old stack's top is SS:SP -- the param
+        // read must use the wrapped 16-bit SP, not outer_esp + k*psize on the full
+        // (garbage-laden) ESP, which would read from a bogus linear address entirely
+        // outside the intended stack page.
+        let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+        let gate_dpl1 = (0x30u16, 0x0008_0040, 0x0000_ec01); // DPL3 386 gate, 1 param
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(
+            &[0x9a, 0x00, 0x00, 0x30, 0x00],
+            &[RING0_CODE, ring0_data, gate_dpl1],
+        );
+        memory.resize(0x1_0004, 0);
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x1b,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xfb,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x23,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xf3,
+                default_size_32: false, // SS.B=0: the outer stack is 16-bit.
+            },
+        );
+        // SP = 0xfffe, but ESP's high word carries garbage that a full-ESP add would
+        // corrupt into a wrong linear address entirely -- the wrapped SP is the only
+        // correct read point. The single param sits at SP=0xfffe, well clear of the
+        // 5-byte CALL instruction at offset 0.
+        cpu.registers.set_esp(0xbeef_fffe);
+        cpu.cpl = 3;
+        memory[0xfffe..0x1_0002].copy_from_slice(&0x1111u32.to_le_bytes());
+        cpu.tr.base = 0x300;
+        memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
+        memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x08, "entered ring-0 code");
+        assert_eq!(cpu.registers.eip, 0x40);
+        // Frame on the new stack: return CS:EIP + old SS:ESP + 1 param = 5 dwords.
+        assert_eq!(cpu.registers.esp(), 0xf0 - 20);
+        // The param, pushed just above the return frame, must be the value at the
+        // wrapped SP 0xfffe, not whatever garbage a full-ESP read would have hit.
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0xe4..0xe8].try_into().unwrap()),
+            0x1111,
+            "param read from the wrapped SP, not full-ESP garbage"
         );
     }
 
@@ -28467,6 +29337,66 @@ mod tests {
     }
 
     #[test]
+    fn deliver_exception_onto_a_16bit_ring0_stack_wraps_sp_and_preserves_high_esp() {
+        // The exact fault scenario this task fixes: a 32-bit interrupt gate delivers
+        // onto a ring-0 stack whose SS descriptor has B=0 (a 16-bit stack segment,
+        // as DOS4GW/VCPI clients use). 386 PRM 17-43/17-74: "Load new SS:eSP value
+        // from TSS" is B-keyed (17-12) -- a B=0 target stack takes the TSS value
+        // into SP only, and ESP's high word carries over from the interrupted
+        // context untouched. The V86 interrupt frame (10 dwords) is then built at
+        // SP-wrapped addresses, only SP advancing.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // Flip the ring-0 data descriptor's B bit off (byte 6 bit 6 = 0x40). Give
+        // TSS ESP0 a nonzero high word (0x0001) to prove it is dropped (SP-only
+        // load), and enter V86 with ESP high word 0 so a leftover-high-word bug
+        // would be visible in the final ESP.
+        bus.memory[(GDT + 0x10 + 6) as usize] &= !0x40;
+        put32(&mut bus.memory, TSS + 4, 0x0001_0010);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+        assert!(!cpu.stack_is_32bit(), "the loaded SS0 must carry B=0");
+        assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0000_ffe8,
+            "SP takes only the TSS's low 16 bits, then wraps at the 16-bit \
+             boundary; the interrupted context's ESP high word (0) carries over, \
+             not the TSS's high word (0x0001)"
+        );
+        // The frame lives at SS0.base (0) + the wrapped 16-bit SP (0xffe8).
+        let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, 0xffe8 + o));
+        assert_eq!(rd(0), 0, "error code");
+        assert_eq!(rd(4), 0x10, "V86 EIP");
+        assert_eq!(rd(16), 0x1000, "V86 ESP");
+    }
+
+    #[test]
+    fn deliver_exception_onto_a_16bit_ring0_stack_preserves_interrupted_esp_high_word() {
+        // Companion to the case above: this time the interrupted V86 context's ESP
+        // has a nonzero high word, proving it survives the SP-only TSS load (rather
+        // than being replaced by the TSS's, or zeroed).
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        bus.memory[(GDT + 0x10 + 6) as usize] &= !0x40;
+        put32(&mut bus.memory, TSS + 4, 0x0000_0010);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+        cpu.registers.set_esp(0xbeef_1000);
+
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+        assert!(!cpu.stack_is_32bit(), "the loaded SS0 must carry B=0");
+        assert_eq!(
+            cpu.registers.esp(),
+            0xbeef_ffe8,
+            "the interrupted context's ESP high word (0xbeef) must carry over \
+             onto the new B=0 stack, with SP taken from the TSS and then wrapped"
+        );
+    }
+
+    #[test]
     fn v86_external_interrupt_on_vector_8_pushes_no_error_code() {
         // A real DOS boot under a V86 monitor keeps the PIC at base 0x08, so IRQ0
         // lands on vector 8 (#DF). An EXTERNAL interrupt must NOT push an error code
@@ -28610,6 +29540,52 @@ mod tests {
         assert_eq!(cpu.registers.cs().selector, r3_cs);
         assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
         assert_eq!(cpu.registers.esp(), 0x2000);
+    }
+
+    #[test]
+    fn iret_inter_privilege_return_to_a_16bit_stack_wraps_sp_and_preserves_high_esp() {
+        // 386 PRM 17-80: "Load SS:eSP from stack" is B-keyed (17-12). Returning to
+        // an outer ring whose SS descriptor has B=0 (the DPMI/DOS-extender 16-bit
+        // stack shape) must take the popped value into SP only, wrap at the
+        // 16-bit boundary, and leave ESP's high word as the inner stack's --
+        // exactly the documented real-silicon ESP-high-word leak on a 16-bit ring
+        // transition.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // Ring-3 code (access 0xfb) + a B=0 (16-bit) ring-3 data descriptor (0xf3,
+        // flags byte with the B bit, 0x40, cleared) at GDT slots 0x20 / 0x28.
+        let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+        let r3_data = descriptor(0, 0xffff, 0xf3, 0x00);
+        bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+        bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+        let r3_cs = 0x23u16; // 0x20 | RPL3
+        let r3_ss = 0x2Bu16; // 0x28 | RPL3
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        // Low half of ESP (0x6800) is the address `push` actually uses (the
+        // inner stack is B=1, so it addresses with full ESP); the high half
+        // (0x0001) must not leak onto the B=0 outer stack after IRET, and the
+        // physical address stays within the test's identity-mapped 0x20000
+        // bytes (0x0001_6800 < 0x20000).
+        cpu.registers.set_esp(0x0001_6800);
+        // Popped ESP has a different nonzero high word (0x0002); a B=0 target
+        // stack must drop it (SP-only load), not adopt it.
+        for v in [u32::from(r3_ss), 0x0002_0010, 0x2, u32::from(r3_cs), 0x1234] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
+        assert!(!cpu.stack_is_32bit(), "the loaded outer SS must carry B=0");
+        assert_eq!(cpu.registers.eip, 0x1234);
+        assert_eq!(cpu.registers.cs().selector, r3_cs);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0001_0010,
+            "SP takes the popped value's low 16 bits; ESP's high word carries \
+             over from the inner stack (0x0001), not the popped high word \
+             (0x0002)"
+        );
     }
 
     #[test]
