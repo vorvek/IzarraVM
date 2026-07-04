@@ -134,10 +134,11 @@ const CR4_TSD: u32 = 0x0000_0004;
 // emulated (the matching CPUID feature bits stay clear, matching the leaf-1 comment
 // above), but a guest is still allowed to set/clear/read them back as inert storage --
 // real firmware and memory managers probe CR4 this way. Bits outside this mask are
-// masked to 0 on write (MOV CR4 does not fault on them; reserved CR4 bits simply do not
-// exist on this persona, matching the "default state of CR4 is all zeros" / no
-// GP-on-reserved-CR4-bit language in the K6 guide -- unlike EFER, which does document a
-// hard #GP on any reserved bit).
+// rejected on write: the same K6 guide's MOV-to/from-CR4 exception table (S: MOV to and
+// from CR4) lists a fault "If 1 is written to any reserved bits" in Real, Virtual-8086,
+// and Protected mode alike, and the Pentium Vol. 3 instruction reference repeats it
+// verbatim ("#GP(0)"/"Interrupt 13 if an attempt is made to write a 1 to any reserved
+// bits of CR4"). So a reserved-bit write faults with #GP(0), the same as EFER/STAR.
 const CR4_DEFINED_MASK: u32 = 0x0000_009f; // bits 0-4, 6-7
 
 // K6 model-specific register addresses (the value the RDMSR/WRMSR ECX selector carries).
@@ -6327,13 +6328,14 @@ impl Cpu386 {
                     }
                     2 => self.control.cr2 = value,
                     3 => {
-                        // 386 PRM 5.2.2: CR3 (the Page Directory Base Register) holds the
-                        // page-directory physical base in bits 31:12; bits 4:3 are the
-                        // software PWT/PCD page-table-entry-style cache-control hints
-                        // (defined on this 586-class persona) and bits 2:0 are reserved.
-                        // The page-table base used by the walker keeps masking to
-                        // `cr3 & 0xFFFFF000` at the use site -- only the stored value
-                        // gains PWT/PCD so a guest that sets them can read them back.
+                        // CR3 (the Page Directory Base Register) holds the page-directory
+                        // physical base in bits 31:12 per 386 PRM 5.2.2. Bits 4:3 are PWT/PCD,
+                        // a 486-and-later addition absent from the 386 PRM -- defined here per
+                        // Pentium Vol. 3 S9 (register description) and S18.3 (PCD/PWT Bits),
+                        // which this 586-class persona implements as cache-control hints, and
+                        // bits 2:0 are reserved. The page-table base used by the walker keeps
+                        // masking to `cr3 & 0xFFFFF000` at the use site -- only the stored
+                        // value gains PWT/PCD so a guest that sets them can read them back.
                         self.control.cr3 = value & 0xffff_f018;
                         self.flush_tlb_and_code_caches();
                     }
@@ -6342,11 +6344,19 @@ impl Cpu386 {
                         // persona only TSD (bit 2) has a modeled effect and only VME/PVI/TSD/
                         // DE/PSE/MCE/GPE (bits 0-4, 6-7) are architecturally defined at all
                         // per the AMD-K6 BIOS and Software Tools Developers Guide S: 3.7
-                        // (Control Register 4 (CR4) Extensions, Figure 13/Table 19). Every
-                        // other bit is reserved on real hardware and reads back as 0, so mask
-                        // the write down to the defined set instead of storing raw reserved
-                        // bits the CPUID persona never advertises.
-                        self.control.cr4 = value & CR4_DEFINED_MASK;
+                        // (Control Register 4 (CR4) Extensions, Figure 13/Table 19). The same
+                        // guide's MOV-to/from-CR4 exception table, and the Pentium Vol. 3
+                        // instruction reference, both document a hard fault ("#GP(0)" in
+                        // protected mode, "Interrupt 13" in real mode) if a 1 is written to
+                        // any reserved bit -- so a write outside CR4_DEFINED_MASK faults
+                        // instead of silently dropping the bits, matching EFER/STAR above.
+                        if value & !CR4_DEFINED_MASK != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.control.cr4 = value;
                     }
                     _ => unreachable!("undefined CR numbers are rejected by the check above"),
                 }
@@ -19634,14 +19644,12 @@ mod tests {
     }
 
     #[test]
-    fn mov_cr4_masks_reserved_bits() {
+    fn mov_cr4_accepts_defined_bits() {
         // 0F 22 E0 = MOV CR4, EAX; 0F 20 E3 = MOV EBX, CR4. Only the bits this GSW-586
-        // persona defines (VME/PVI/TSD/DE/PSE/MCE/GPE, CR4_DEFINED_MASK) are stored;
-        // every reserved bit -- including ones way outside the defined byte, like bit 31
-        // -- must come back 0, matching real K6 hardware ("default state of CR4 is all
-        // zeros", no bit backing outside the defined set).
+        // persona defines (VME/PVI/TSD/DE/PSE/MCE/GPE, CR4_DEFINED_MASK) exist; writing
+        // exactly that set round-trips.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0, 0x0f, 0x20, 0xe3], 0x20);
-        cpu.registers.set_eax(0xffff_ffff);
+        cpu.registers.set_eax(CR4_DEFINED_MASK);
         let mut bus = TestBus::with_memory(memory);
         cpu.cycle(&mut bus).unwrap();
         assert_eq!(cpu.control.cr4, CR4_DEFINED_MASK);
@@ -19650,12 +19658,34 @@ mod tests {
     }
 
     #[test]
+    fn mov_cr4_rejects_reserved_bits() {
+        // 0F 22 E0 = MOV CR4, EAX. The AMD-K6 guide's MOV-to/from-CR4 exception table and
+        // the Pentium Vol. 3 instruction reference both fault ("#GP(0)"/"Interrupt 13")
+        // if a 1 is written to any reserved bit -- including one way outside the defined
+        // byte, like bit 31 -- in every mode, not just protected mode. CR4 is left
+        // unmodified (the same convention as CR0's PG/PE gate above).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0], 0x20);
+        cpu.registers.set_eax(0xffff_ffff);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+        assert_eq!(cpu.control.cr4, 0);
+    }
+
+    #[test]
     fn mov_cr3_round_trips_pwt_and_pcd() {
         // 0F 22 D8 = MOV CR3, EAX (reg=3, rm=EAX); 0F 20 DB = MOV EBX, CR3 (reg=3, rm=EBX).
-        // 386 PRM 5.2.2: CR3 holds the page-directory base in bits 31:12 plus the
-        // PWT/PCD cache-control hints in bits 4:3. A guest that sets PWT/PCD must read
-        // them back; only bits 2:0 (always reserved/0) and the base-alignment bits
-        // outside 31:12 are not preserved by the base itself.
+        // 386 PRM 5.2.2 defines the page-directory base in bits 31:12; PWT/PCD (bits 4:3)
+        // are a 486+ addition (Pentium Vol. 3 S9/S18.3) this persona implements as
+        // cache-control hints. A guest that sets PWT/PCD must read them back; only bits
+        // 2:0 (always reserved/0) and the base-alignment bits outside 31:12 are not
+        // preserved by the base itself.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xd8, 0x0f, 0x20, 0xdb], 0x20);
         // Base 0x00123000 with PWT (bit 3) and PCD (bit 4) both set, plus reserved bits
         // 2:0 set to confirm those stay masked off.
