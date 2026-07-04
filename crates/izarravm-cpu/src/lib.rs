@@ -5016,9 +5016,34 @@ impl Cpu386 {
                     }
                     .into());
                 }
-                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                // 386 PRM POP operation: "DEST <- (SS:ESP); ESP <- ESP + 4" -- the stack
+                // pointer is already advanced by the time the destination is addressed. When
+                // the r/m destination is itself (E)SP-relative (e.g. `pop dword [esp+4]`),
+                // its effective address must be computed from the POST-increment (E)SP, not
+                // the pre-pop value. `resolve_decoded_modrm_operand` reads live GPRs, so it
+                // must run after `self.pop`, not before (the PUSH r/m32-with-ESP-base analog
+                // -- see the PUSH SP note in the same manual -- is the mirror-image caution:
+                // that source read happens before the decrement, so PUSH keeps its EA-then-op
+                // order and only POP's is swapped here).
+                // 386 PRM POP operation: "DEST <- (SS:ESP); ESP <- ESP + 4" -- the stack
+                // pointer is already advanced by the time the destination is addressed. When
+                // the r/m destination is itself (E)SP-relative (e.g. `pop dword [esp+4]`),
+                // its effective address must be computed from the POST-increment (E)SP, not
+                // the pre-pop value. `resolve_decoded_modrm_operand` reads live GPRs, so it
+                // must run after `self.pop`, not before (the PUSH r/m32-with-ESP-base analog
+                // -- see the PUSH SP note in the same manual -- is the mirror-image caution:
+                // that source read happens before the decrement, so PUSH keeps its EA-then-op
+                // order and only POP's is swapped here).
+                let esp_before = self.registers.esp();
                 let value = self.pop(bus, operand_size)?;
-                self.write_operand_sized(bus, operand, operand_size, value)?;
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                if let Err(err) = self.write_operand_sized(bus, operand, operand_size, value) {
+                    // The pop already advanced ESP; a faulting write must leave the
+                    // instruction restartable, so undo that advance before propagating,
+                    // matching the IRET esp_before fault-unwind convention.
+                    self.registers.set_esp(esp_before);
+                    return Err(err);
+                }
                 Ok(clocks(5))
             }
             0x9c => {
@@ -15411,6 +15436,206 @@ mod tests {
                 extension: 1
             }
         ));
+    }
+
+    #[test]
+    fn pop_rm32_esp_relative_destination_uses_post_increment_esp() {
+        // The falsifier: push A; push B; pop dword [esp+4] must write B to the
+        // POST-increment [esp+4] (the original pre-push top of stack, 0x0200) --
+        // not the pre-pop [esp+4] (0x01fc, the slot that holds A), which is what
+        // resolving the EA before the pop would compute.
+        //
+        // 0x66 0x67 8F /0 mod=01 rm=100 (SIB: base=ESP, no index) disp8=0x04:
+        // POP dword [esp+4], 32-bit operand + 32-bit address override in real mode.
+        let mut memory = vec![0; 1024];
+        memory[0..6].copy_from_slice(&[0x66, 0x67, 0x8f, 0x44, 0x24, 0x04]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        // push A; push B (32-bit pushes on the 32-bit-addressed stack).
+        cpu.push(&mut bus, 0xaaaa_aaaa, OperandSize::Dword).unwrap();
+        cpu.push(&mut bus, 0xbbbb_bbbb, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.registers.esp(), 0x01f8);
+        // Stack image: [0x01f8]=B (top), [0x01fc]=A.
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // The pop reads B from 0x01f8 and advances esp to 0x01fc first; [esp+4]
+        // computed AFTER that lands at 0x0200 (untouched before this instruction),
+        // not at the pre-pop [esp+4] == 0x01fc (the slot holding A).
+        assert_eq!(cpu.registers.esp(), 0x01fc, "pop advanced esp by 4");
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x0200..0x0204].try_into().unwrap()),
+            0xbbbb_bbbb,
+            "post-increment EA wrote B to the pre-push top of stack, not A's slot"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x01fc..0x0200].try_into().unwrap()),
+            0xaaaa_aaaa,
+            "A's slot is untouched: a pre-pop EA would have overwritten it with B"
+        );
+    }
+
+    #[test]
+    fn pop_rm16_esp_relative_destination_uses_post_increment_esp() {
+        // 16-bit variant of the falsifier above. 8F /0 mod=01 rm=100 (SIB: base=SP
+        // is not directly encodable in 16-bit addressing -- 16-bit ModRM has no SIB
+        // byte -- so this uses 32-bit addressing with a 16-bit operand: 0x67 8F /0
+        // mod=01 rm=100 disp8=0x02, POP word [esp+2].
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x67, 0x8f, 0x44, 0x24, 0x02]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.push(&mut bus, 0xaaaa, OperandSize::Word).unwrap();
+        cpu.push(&mut bus, 0xbbbb, OperandSize::Word).unwrap();
+        assert_eq!(cpu.registers.esp(), 0x01fc);
+        // Stack image: [0x01fc]=B (top), [0x01fe]=A.
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // The pop reads B from 0x01fc and advances esp to 0x01fe first; [esp+2]
+        // computed AFTER that lands at 0x0200 (untouched before this instruction),
+        // not at the pre-pop [esp+2] == 0x01fe (the slot holding A).
+        assert_eq!(cpu.registers.esp(), 0x01fe, "pop advanced esp by 2");
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x0200..0x0202].try_into().unwrap()),
+            0xbbbb,
+            "post-increment EA wrote B to the pre-push top of stack, not A's slot"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bus.memory[0x01fe..0x0200].try_into().unwrap()),
+            0xaaaa,
+            "A's slot is untouched: a pre-pop EA would have overwritten it with B"
+        );
+    }
+
+    #[test]
+    fn pop_rm32_esp_relative_destination_restores_esp_on_page_fault() {
+        // (c) A faulting destination write must leave ESP exactly as it was before
+        // the instruction started: the pop's ESP advance must be unwound so the
+        // instruction is cleanly restartable after the guest's #PF handler fixes up
+        // the mapping.
+        //
+        // PD at 0x1000, PT at 0x2000. Linear page 0 (code + the stack the pop reads
+        // from) is identity-mapped present+writable. Linear page 0x3000 (where the
+        // post-increment `[esp+4]` destination lands) has NO PTE at all, so the
+        // destination write takes a #PF.
+        let mut memory = vec![0; 0x4000];
+        // Code at linear 0: POP dword [esp+4] (32-bit operand + 32-bit address
+        // override in real mode).
+        memory[0..6].copy_from_slice(&[0x66, 0x67, 0x8f, 0x44, 0x24, 0x04]);
+        // The stack top read by the pop, at linear 0x2ffc: value B.
+        memory[0x2ffc..0x3000].copy_from_slice(&0xbbbb_bbbbu32.to_le_bytes());
+        // PDE[0] -> PT at 0x2000, present+rw+user.
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        // PTE[0] (linear 0x0000-0x0fff: code + the read side of the stack) -> identity, present+rw.
+        memory[0x2000..0x2004].copy_from_slice(&0x0000_0007u32.to_le_bytes());
+        // PTE[2] (linear 0x2000-0x2fff, covers 0x2ffc) -> identity, present+rw.
+        memory[0x2008..0x200c].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        // PTE[3] (linear 0x3000-0x3fff, the POP destination) intentionally left 0 (not present).
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.control.cr3 = 0x1000;
+        cpu.control.cr0 |= CR0_PG;
+        // ESP = 0x2ffc: the pop reads from here (mapped), advances to 0x3000, and
+        // the destination EA [esp+4] (post-increment) is 0x3004 -- inside the
+        // unmapped page 0x3000, so the write faults.
+        cpu.registers.set_esp(0x2ffc);
+        let esp_before = cpu.registers.esp();
+        let mut bus = TestBus::with_memory(memory);
+
+        // Use the raw decode/execute split (no exception delivery) so the assert
+        // below observes ESP exactly as `execute_decoded` left it, not after a
+        // real-mode #PF delivery has also pushed flags/CS/IP onto that same stack.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(_)
+                }
+            ),
+            "{fault:?}"
+        );
+        assert_eq!(
+            cpu.registers.esp(),
+            esp_before,
+            "a faulting destination write must leave esp exactly pre-instruction"
+        );
+    }
+
+    #[test]
+    fn push_rm32_esp_source_reads_before_decrement() {
+        // (d) PUSH r/m32 with an ESP-based memory source (JEMM's V86_MonitorEx
+        // executes `push dword [esp]`) must read the source BEFORE the decrement:
+        // the value pushed is the current top of stack, duplicating it, not
+        // whatever ends up below the new top.
+        //
+        // 0x66 0x67 FF /6 mod=00 rm=100 (SIB: base=ESP, no index, no disp): PUSH
+        // dword [esp], 32-bit operand + 32-bit address override in real mode.
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x66, 0x67, 0xff, 0x34, 0x24]);
+        memory[0x0200..0x0204].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.esp(), 0x01fc, "push decremented esp by 4");
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x01fc..0x0200].try_into().unwrap()),
+            0xdead_beef,
+            "the duplicated top-of-stack value, read before the decrement"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x0200..0x0204].try_into().unwrap()),
+            0xdead_beef,
+            "the original top-of-stack slot is untouched"
+        );
+    }
+
+    #[test]
+    fn pop_rm32_non_esp_base_is_unchanged() {
+        // (e) A non-ESP base (EBX here) is unaffected by the pop-then-resolve
+        // reorder: the destination EA never depended on ESP in the first place.
+        //
+        // 0x66 0x67 8F /0 mod=01 rm=011 disp8=0x10: POP dword [ebx+0x10].
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x66, 0x67, 0x8f, 0x43, 0x10]);
+        memory[0x0100..0x0104].copy_from_slice(&0xcafe_babeu32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.registers.set_ebx(0x0300);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.esp(), 0x0104);
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x0310..0x0314].try_into().unwrap()),
+            0xcafe_babe,
+            "ebx+0x10 destination, unaffected by esp timing"
+        );
     }
 
     #[test]
