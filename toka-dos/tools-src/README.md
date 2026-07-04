@@ -11,3 +11,7 @@ command-line behavior only.
   documented simplifications). `toka-dos/msdos4/VENDOR.md` records why the
   real MS-DOS 4.0 XCOPY source was investigated and rejected as a port
   target.
+- `edit/` `EDIT.COM` ("TokaEdit"), a full-screen MS-DOS-EDIT-style editor:
+  menus, dialogs, mouse, clipboard. Open Watcom large-model C; the ANSI-clean
+  buffer core (`buffer.c`) is self-checked at build time by a native
+  `test_buffer.c` harness. Design: `dev_docs/2026-07-03-tokados-edit-design.md`.

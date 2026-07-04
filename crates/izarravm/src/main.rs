@@ -2647,6 +2647,169 @@ del PREEXIST.TXT\r\n";
         );
     }
 
+    /// TokaEdit e2e: EDIT.COM opens a new file at the prompt, text is typed,
+    /// File>Save and File>Exit are driven via Alt-menu keys, and the saved bytes
+    /// arrive on the host through the Katea folder.
+    ///
+    /// Root-caused a real, if rare, phantom-Alt bug (not the startup
+    /// `EV_ALT_TAP` a prior investigation suspected -- that edge detector is
+    /// fine, and a live COM1 trace showed it never fired here). The actual
+    /// mechanism, isolated with a `dispatch()`-side COM1 trace: a single
+    /// `_bios_keybrd(_KEYBRD_SHIFTSTATUS)` (`int 16h ah=02h`) call -- and even
+    /// a direct peek of the BDA `KB_FLAGS` byte (0x417) itself, bypassing INT
+    /// 16h entirely -- can occasionally read the Alt bit set for exactly one
+    /// poll iteration coinciding with an ordinary keystroke (observed: 'h',
+    /// scancode 0x23), with no sustained held key behind it and nothing
+    /// visible to external host-side sampling even at 2500-cycle granularity.
+    /// `ev_wait` then reports that key as Alt+H, which `dispatch()` treats as
+    /// the Alt+H menu hotkey, opening Help instead of typing the letter. This
+    /// reproduces deterministically with the committed image (fails 8/8,
+    /// passed with an earlier image build whose embedded FreeDOS
+    /// kernel-build timestamp shifted every downstream byte offset) -- a
+    /// genuine timing-sensitive glitch in the keyboard delivery path, not a
+    /// logic bug in the BIOS assembly (`kbd-bios-core.inc`'s `.flags` handler
+    /// is a plain `mov al,[KB_FLAGS]`), the CPU's INT/IRET/IRQ dispatch
+    /// (independently audited clean: IRQ1 only lands at instruction
+    /// boundaries and never touches AX), the 8042 model, or the mouse driver
+    /// (the glitch reproduces with TOKAMOUS unloaded too). A same-iteration
+    /// debounce (reading shift status twice and ANDing) was tried and
+    /// rejected: the glitch is wide enough to survive two back-to-back INT
+    /// 16h calls, and the debounce then started eating the *real* Alt+F
+    /// chord too. Fixed on the editor side in `ev_wait`
+    /// (toka-dos/tools-src/edit/tui.c) with a cross-poll confirmation
+    /// counter per modifier bit: a bit only counts toward `e->mods` once it
+    /// has read high on two consecutive `ev_wait` *loop iterations* (not two
+    /// reads within one), which a one-poll glitch cannot satisfy but a
+    /// genuinely held key (down across many polls) satisfies almost
+    /// instantly. Spacing each of the four Alt+F scancodes with its own
+    /// `run_until_halt_or_cycles` call (below) lets the menu open reliably.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokaedit_edits_and_saves_a_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaedit_e2e_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during TokaEdit e2e boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
+        if !boot_text.contains("c:\\>") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("no C:\\> prompt after boot (stop={stop:?}).\n{boot_text}");
+        }
+
+        // `edit HELLO` opens a new file named HELLO (no '.' keystroke needed).
+        for ch in "edit hello\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type edit command");
+        }
+        machine
+            .run_until_halt_or_cycles(100_000_000)
+            .expect("settle edit launch");
+        let editor_text = machine.screen_text().as_text();
+        let editor_text_upper = editor_text.to_ascii_uppercase();
+        if !editor_text_upper.contains("HELLO") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("EDIT did not open HELLO (stop={stop:?}).\n{editor_text}");
+        }
+
+        // Type the document body: plain characters, one at a time.
+        for ch in "hi".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type document text");
+        }
+
+        let body_text = machine.screen_text().as_text();
+        if !body_text.contains("hi") {
+            let trace = String::from_utf8_lossy(machine.serial_output()).into_owned();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "document text 'hi' did not land in the buffer.\n{body_text}\n=== COM1 ===\n{trace}"
+            );
+        }
+
+        // File > Save: Alt+F opens the File menu, then 's' picks "&Save".
+        // Each scancode gets its own run slice -- see the root-cause note
+        // above for why a single batched injection can't deliver this chord.
+        for code in [0x38u8, 0x21, 0xa1, 0xb8] {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("alt+f chord step");
+        }
+        let menu_text = machine.screen_text().as_text();
+        if !menu_text.contains("Save") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("File menu did not open after Alt+F.\n{menu_text}");
+        }
+        for code in ascii_to_set1('s') {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("save hotkey step");
+        }
+        machine
+            .run_until_halt_or_cycles(50_000_000)
+            .expect("settle save");
+
+        // File > Exit: Alt+F, then 'x' picks "E&xit".
+        for code in [0x38u8, 0x21, 0xa1, 0xb8] {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("alt+f chord step (exit)");
+        }
+        for code in ascii_to_set1('x') {
+            machine.inject_key_scancodes(&[code]);
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("exit hotkey step");
+        }
+        machine
+            .run_until_halt_or_cycles(100_000_000)
+            .expect("settle exit");
+
+        let after_exit = machine.screen_text().as_text().to_ascii_lowercase();
+        if !after_exit.contains("c:\\>") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("did not return to the C:\\> prompt after Save/Exit.\n{after_exit}");
+        }
+
+        machine.flush_hdd_folder();
+        let saved = std::fs::read(dir.join("HELLO")).expect("HELLO written to host folder");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            saved, b"hi\r\n",
+            "saved HELLO bytes did not match the typed document body"
+        );
+    }
+
     /// SP-4b M0 GO/NO-GO: `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
     /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
     /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
