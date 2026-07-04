@@ -1669,7 +1669,7 @@ impl Distira {
                     _ => 0xff,
                 };
             } else {
-                self.dac_readdata = self.dac_data[(self.dac_readdata & 7) as usize];
+                self.dac_readdata = self.dac_data[self.dac_reg as usize];
             }
             return;
         }

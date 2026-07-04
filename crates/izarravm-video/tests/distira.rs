@@ -3332,6 +3332,27 @@ fn dac_data_write_side_effects_are_accepted_without_special_casing() {
 }
 
 #[test]
+fn dac_read_cycle_returns_the_addressed_register() {
+    // A read cycle against a non-PLL DAC register must answer with THAT
+    // register's byte, not whatever dac_data[7] (the PLL index latch) holds.
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_REMAP);
+
+    write_reg(&mut distira, SST_DAC_DATA, (2 << DACDATA_ADDR_SHIFT) | 0x42);
+    write_reg(&mut distira, SST_DAC_DATA, (7 << DACDATA_ADDR_SHIFT) | 0x99);
+    write_reg(
+        &mut distira,
+        SST_DAC_DATA,
+        (2 << DACDATA_ADDR_SHIFT) | DACDATA_RD,
+    );
+    assert_eq!(
+        read_reg(&distira, SST_FBI_INIT2) & 0xff,
+        0x42,
+        "register 2 reads back its own byte"
+    );
+}
+
+#[test]
 fn fbi_init2_reads_raw_storage_when_remap_bit_is_clear() {
     // Without initEnable's remap bit, fbiInit2 behaves like every other
     // fbiInit register: plain byte-mergeable storage, and a DAC read cycle
