@@ -1913,6 +1913,15 @@ impl From<BusError> for InternalFault {
 
 type ExecResult<T> = Result<T, InternalFault>;
 
+/// Which privilege level a linear-to-physical translation is checked against.
+/// `Supervisor` forces `user = false` for the implicit system-structure reads
+/// described on `translate_linear_system`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagingAccessor {
+    Current,
+    Supervisor,
+}
+
 impl Cpu386 {
     pub fn reset(&mut self) {
         *self = Self::default();
@@ -5534,8 +5543,7 @@ impl Cpu386 {
         if !self.is_v86_mode() && self.current_privilege_level() <= self.iopl() {
             return Ok(());
         }
-        let io_base =
-            bus.read_memory(self.tr.base + 0x66, BusWidth::Word, BusAccessKind::DataRead)?;
+        let io_base = self.read_system_linear(bus, self.tr.base + 0x66, BusWidth::Word)?;
         for p in u32::from(port)..u32::from(port) + width.bytes() {
             let byte_index = io_base + p / 8;
             if byte_index > self.tr.limit {
@@ -5544,11 +5552,8 @@ impl Cpu386 {
                     error_code: Some(0),
                 });
             }
-            let byte = bus.read_memory(
-                self.tr.base + byte_index,
-                BusWidth::Byte,
-                BusAccessKind::DataRead,
-            )? as u8;
+            let byte =
+                self.read_system_linear(bus, self.tr.base + byte_index, BusWidth::Byte)? as u8;
             if byte & (1 << (p % 8)) != 0 {
                 return Err(InternalFault::Exception {
                     vector: 13,
@@ -6947,12 +6952,15 @@ impl Cpu386 {
         if offset > descriptor.limit
             || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
         {
-            return Err(CpuError::SegmentLimit {
-                segment: SegmentIndex::Cs,
-                offset,
-                width,
-            }
-            .into());
+            // 386 PRM 9.9.13: exceeding the CS limit on an instruction fetch is an
+            // ordinary #GP(0), not a host-fatal error. This must reach `finish_instruction`
+            // as `InternalFault::Exception` (rewind + `deliver_exception`, which already
+            // reflects faults into a V86 monitor) rather than `InternalFault::Cpu`, whose
+            // `SegmentLimit` variant propagates straight out of `cycle` and halts the machine.
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
         }
         Ok(descriptor.base.wrapping_add(offset))
     }
@@ -7530,6 +7538,35 @@ impl Cpu386 {
         linear: u32,
         write: bool,
     ) -> ExecResult<u32> {
+        self.translate_linear_checked(bus, linear, write, PagingAccessor::Current)
+    }
+
+    /// Like `translate_linear`, but for accesses to descriptor tables (GDT/LDT/IDT)
+    /// and TSS fields during exception delivery, segment loads, and task switches.
+    /// These are architecturally implicit supervisor accesses (386 PRM 6.2, 7.2):
+    /// the processor consults them to set up or validate a privilege transition, so
+    /// they must not be checked against the CPL of the code that triggered the
+    /// transition. A V86 task (always CPL 3) or a ring-3 CS delivering through an
+    /// interrupt gate must be able to read its own TSS/GDT even when those pages
+    /// are marked supervisor-only (U/S=0), exactly as real silicon does. Forcing
+    /// `user = false` here also means a WP-clear supervisor write (the 386 default)
+    /// is never blocked by a read-only system-structure page.
+    fn translate_linear_system<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
+        self.translate_linear_checked(bus, linear, write, PagingAccessor::Supervisor)
+    }
+
+    fn translate_linear_checked<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        write: bool,
+        accessor: PagingAccessor,
+    ) -> ExecResult<u32> {
         if !self.is_paging_enabled() {
             if write {
                 self.record_write_page(linear);
@@ -7537,8 +7574,15 @@ impl Cpu386 {
             return Ok(linear);
         }
 
-        // Paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor.
-        let user = self.is_protected_mode() && (self.registers.cs().selector & 3) == 3;
+        // Paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor. A
+        // system-structure access is forced supervisor regardless of the current
+        // CPL (see `translate_linear_system`).
+        let user = match accessor {
+            PagingAccessor::Current => {
+                self.is_protected_mode() && (self.registers.cs().selector & 3) == 3
+            }
+            PagingAccessor::Supervisor => false,
+        };
         // CR0.WP (a 486 addition) makes supervisor writes obey the page R/W bit too.
         // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
         let wp = self.control.cr0 & CR0_WP != 0;
@@ -8520,9 +8564,41 @@ impl Cpu386 {
         Ok(())
     }
 
+    /// Read a dword from a linear address through paging with implicit-supervisor
+    /// semantics (see `translate_linear_system`). Used for IDT/GDT/LDT descriptor
+    /// reads and TSS field access, none of which are checked against the current
+    /// CPL.
     fn read_system_linear_u32<B: CpuBus>(&mut self, bus: &mut B, linear: u32) -> ExecResult<u32> {
-        let physical = self.translate_linear(bus, linear, false)?;
+        let physical = self.translate_linear_system(bus, linear, false)?;
         Ok(bus.read_memory(physical, BusWidth::Dword, BusAccessKind::DataRead)?)
+    }
+
+    /// Read a byte or word from a linear address through paging with
+    /// implicit-supervisor semantics. See `read_system_linear_u32`.
+    fn read_system_linear<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+    ) -> ExecResult<u32> {
+        let physical = self.translate_linear_system(bus, linear, false)?;
+        Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
+    }
+
+    /// Write a value to a linear address through paging with implicit-supervisor
+    /// semantics. See `read_system_linear_u32`. Used for TSS busy-bit updates and
+    /// page-table-adjacent bookkeeping (accessed/dirty bits) done on the guest's
+    /// behalf while servicing a system-structure access.
+    fn write_system_linear<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        value: u32,
+    ) -> ExecResult<()> {
+        let physical = self.translate_linear_system(bus, linear, true)?;
+        bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
+        Ok(())
     }
 
     fn load_flags(&mut self, value: u32, operand_size: OperandSize) {
@@ -8553,11 +8629,36 @@ impl Cpu386 {
                 self.load_flags(flags, OperandSize::Word);
             }
             OperandSize::Dword => {
+                let esp_before = self.registers.esp();
                 let eip = self.pop(bus, OperandSize::Dword)?;
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
 
                 if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
+                    // 386 PRM STACK-RETURN-TO-V86: "instruction pointer not within code
+                    // segment limit THEN #GP(0)" is checked against the popped EIP before
+                    // EFLAGS/CS/EIP/ESP or any of the V86 data segments are committed -- the
+                    // pseudocode gates on it ahead of every `Pop()` in the V86-tail sequence.
+                    // A V86 CS is always a real-mode-style segment (fixed 0xffff limit via
+                    // `load_segment_real`/`SegmentRegister::real`), so an EIP with a nonzero
+                    // high word is always out of range. Faulting here -- with the monitor's
+                    // pre-IRET CS:EIP still live and the V86-tail dwords (ESP/SS/ES/DS/FS/GS)
+                    // still on the stack -- keeps the #GP(0) frame correct; committing the
+                    // V86 state first and letting the next fetch discover the limit violation
+                    // would push a fabricated V86 return address (this exact IRET's popped
+                    // CS:EIP) into the fault frame instead of resuming the monitor right after
+                    // its own IRET, with its own stack intact.
+                    if eip > 0xffff {
+                        // A fault leaves the instruction restartable: undo the three pops
+                        // so the monitor's ESP is exactly pre-IRET (finish_instruction only
+                        // rewinds EIP/CS, never ESP).
+                        self.registers.set_esp(esp_before);
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
+                    }
+
                     // Return INTO a V86 task: pop the V86 tail and reload real-mode segments.
                     let esp = self.pop(bus, OperandSize::Dword)?;
                     let ss = self.pop(bus, OperandSize::Dword)? as u16;
@@ -8712,8 +8813,8 @@ impl Cpu386 {
             return Err(CpuError::GeneralProtection { selector }.into());
         }
         let addr = base + index;
-        let low = bus.read_memory(addr, BusWidth::Dword, BusAccessKind::DataRead)?;
-        let high = bus.read_memory(addr + 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let low = self.read_system_linear_u32(bus, addr)?;
+        let high = self.read_system_linear_u32(bus, addr + 4)?;
         Ok((low, high))
     }
 
@@ -8874,8 +8975,8 @@ impl Cpu386 {
         let old_ss = self.registers.segment(SegmentIndex::Ss).selector;
         let old_esp = self.registers.esp();
         let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
-        let new_esp = bus.read_memory(esp_addr, BusWidth::Dword, BusAccessKind::DataRead)?;
-        let new_ss = bus.read_memory(esp_addr + 4, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        let new_esp = self.read_system_linear_u32(bus, esp_addr)?;
+        let new_ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
         self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
         self.registers.set_esp(new_esp);
         Ok((old_ss, old_esp))
@@ -8883,7 +8984,8 @@ impl Cpu386 {
 
     /// 386 hardware task switch. Saves the outgoing task's state into the current TSS,
     /// loads the incoming one, juggles the busy bits, and (for a CALL) links back to
-    /// the caller and sets NT. Limit: TSS memory is accessed unpaged, and the 286
+    /// the caller and sets NT. TSS memory is read/written through paging with
+    /// implicit-supervisor semantics (see `translate_linear_system`). Limit: the 286
     /// (short) TSS form is not modeled.
     fn task_switch<B: CpuBus>(
         &mut self,
@@ -8910,12 +9012,7 @@ impl Cpu386 {
         self.load_task_state(bus, new_tss.base)?;
         if is_call {
             // Write the back-link and set NT so the inner IRET returns to the caller.
-            bus.write_memory(
-                new_tss.base,
-                BusWidth::Word,
-                u32::from(old_selector),
-                BusAccessKind::DataWrite,
-            )?;
+            self.write_system_linear(bus, new_tss.base, BusWidth::Word, u32::from(old_selector))?;
             self.registers.eflags |= FLAG_NT;
         }
         self.set_tss_busy(bus, new_selector, true)?;
@@ -8929,59 +9026,42 @@ impl Cpu386 {
         // Settle deferred arithmetic flags so the eflags image saved into the outgoing TSS is live.
         self.materialize_flags();
         let base = self.tr.base;
-        bus.write_memory(
-            base + 32,
-            BusWidth::Dword,
-            self.registers.eip,
-            BusAccessKind::DataWrite,
-        )?;
-        bus.write_memory(
-            base + 36,
-            BusWidth::Dword,
-            self.registers.eflags,
-            BusAccessKind::DataWrite,
-        )?;
+        self.write_system_linear(bus, base + 32, BusWidth::Dword, self.registers.eip)?;
+        self.write_system_linear(bus, base + 36, BusWidth::Dword, self.registers.eflags)?;
         for i in 0..8u32 {
-            bus.write_memory(
-                base + 40 + i * 4,
-                BusWidth::Dword,
-                self.read_gpr32(i as u8),
-                BusAccessKind::DataWrite,
-            )?;
+            let value = self.read_gpr32(i as u8);
+            self.write_system_linear(bus, base + 40 + i * 4, BusWidth::Dword, value)?;
         }
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
-            bus.write_memory(
-                base + 72 + k as u32 * 4,
-                BusWidth::Word,
-                u32::from(self.registers.segment(*segment).selector),
-                BusAccessKind::DataWrite,
-            )?;
+            let selector = u32::from(self.registers.segment(*segment).selector);
+            self.write_system_linear(bus, base + 72 + k as u32 * 4, BusWidth::Word, selector)?;
         }
-        bus.write_memory(
+        self.write_system_linear(
+            bus,
             base + 96,
             BusWidth::Word,
             u32::from(self.ldtr.selector),
-            BusAccessKind::DataWrite,
         )?;
         Ok(())
     }
 
     fn load_task_state<B: CpuBus>(&mut self, bus: &mut B, base: u32) -> ExecResult<()> {
         if self.control.cr0 & CR0_PG != 0 {
-            self.control.cr3 =
-                bus.read_memory(base + 28, BusWidth::Dword, BusAccessKind::DataRead)?;
+            // Read through the outgoing task's still-active page tables: CR3 hasn't
+            // been reloaded yet, so this TSS field is translated under the old
+            // mapping, same as every other field read here.
+            self.control.cr3 = self.read_system_linear_u32(bus, base + 28)?;
             // The incoming task reloads CR3, so its page mappings replace the old
             // task's: drop the previous task's cached translations.
             self.flush_tlb_and_code_caches();
         }
         // The LDTR is loaded first so segment loads that reference the LDT resolve.
-        let ldtr = bus.read_memory(base + 96, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        let ldtr = self.read_system_linear(bus, base + 96, BusWidth::Word)? as u16;
         self.load_ldtr(bus, ldtr)?;
-        let eip = bus.read_memory(base + 32, BusWidth::Dword, BusAccessKind::DataRead)?;
-        let eflags = bus.read_memory(base + 36, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let eip = self.read_system_linear_u32(bus, base + 32)?;
+        let eflags = self.read_system_linear_u32(bus, base + 36)?;
         for i in 0..8u32 {
-            let value =
-                bus.read_memory(base + 40 + i * 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+            let value = self.read_system_linear_u32(bus, base + 40 + i * 4)?;
             self.write_gpr32(i as u8, value);
         }
         self.registers.eflags = eflags | 0x2;
@@ -8990,11 +9070,8 @@ impl Cpu386 {
         self.recompute_alignment_armed();
         self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
-            let selector = bus.read_memory(
-                base + 72 + k as u32 * 4,
-                BusWidth::Word,
-                BusAccessKind::DataRead,
-            )? as u16;
+            let selector =
+                self.read_system_linear(bus, base + 72 + k as u32 * 4, BusWidth::Word)? as u16;
             // A null data segment (ES/DS/FS/GS) is legal and just unusable; CS and SS
             // must be loadable.
             if selector & !0x7 == 0 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss) {
@@ -9022,18 +9099,13 @@ impl Cpu386 {
             return Ok(());
         }
         let addr = self.gdtr.base + u32::from(selector & !0x7) + 5;
-        let mut access = bus.read_memory(addr, BusWidth::Byte, BusAccessKind::DataRead)? as u8;
+        let mut access = self.read_system_linear(bus, addr, BusWidth::Byte)? as u8;
         if busy {
             access |= 0x02;
         } else {
             access &= !0x02;
         }
-        bus.write_memory(
-            addr,
-            BusWidth::Byte,
-            u32::from(access),
-            BusAccessKind::DataWrite,
-        )?;
+        self.write_system_linear(bus, addr, BusWidth::Byte, u32::from(access))?;
         Ok(())
     }
 
@@ -9107,12 +9179,8 @@ impl Cpu386 {
             return Err(CpuError::GeneralProtection { selector }.into());
         }
         let descriptor_address = table_base + index;
-        let low = bus.read_memory(descriptor_address, BusWidth::Dword, BusAccessKind::DataRead)?;
-        let high = bus.read_memory(
-            descriptor_address + 4,
-            BusWidth::Dword,
-            BusAccessKind::DataRead,
-        )?;
+        let low = self.read_system_linear_u32(bus, descriptor_address)?;
+        let high = self.read_system_linear_u32(bus, descriptor_address + 4)?;
         let access = ((high >> 8) & 0xff) as u8;
         if access & 0x80 == 0 {
             return Err(CpuError::GeneralProtection { selector }.into());
@@ -11837,8 +11905,8 @@ impl Cpu386 {
             return Ok(None);
         }
         let addr = base + index;
-        let low = bus.read_memory(addr, BusWidth::Dword, BusAccessKind::DataRead)?;
-        let high = bus.read_memory(addr + 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let low = self.read_system_linear_u32(bus, addr)?;
+        let high = self.read_system_linear_u32(bus, addr + 4)?;
         Ok(Some((low, high)))
     }
 
@@ -11853,8 +11921,8 @@ impl Cpu386 {
             return Err(CpuError::GeneralProtection { selector }.into());
         }
         let addr = self.gdtr.base + index;
-        let low = bus.read_memory(addr, BusWidth::Dword, BusAccessKind::DataRead)?;
-        let high = bus.read_memory(addr + 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let low = self.read_system_linear_u32(bus, addr)?;
+        let high = self.read_system_linear_u32(bus, addr + 4)?;
         Ok((low, high))
     }
 
@@ -11923,11 +11991,11 @@ impl Cpu386 {
         segment.access |= 0x02;
         let index = u32::from(selector & !0x7);
         let access_byte = (access | 0x02) as u8;
-        bus.write_memory(
+        self.write_system_linear(
+            bus,
             self.gdtr.base + index + 5,
             BusWidth::Byte,
             u32::from(access_byte),
-            BusAccessKind::DataWrite,
         )?;
         self.tr = segment;
         Ok(())
@@ -27907,6 +27975,68 @@ mod tests {
     }
 
     #[test]
+    fn iret_into_v86_with_dirty_high_word_eip_faults_before_committing_v86_state() {
+        // Same 32-bit V86 IRET frame as `iret_into_v86_restores_the_task`, but the popped
+        // EIP carries a nonzero high word (0x0001_0000). 386 PRM STACK-RETURN-TO-V86 checks
+        // "instruction pointer not within code segment limit" against the popped EIP and
+        // raises #GP(0) *before* EFLAGS/CS/EIP/ESP or the V86 data segments are committed --
+        // ahead of every `Pop()` in the pseudocode's V86-tail sequence. A V86 CS is always a
+        // 16-bit real-mode-style segment (fixed 0xffff limit), so this EIP is always out of
+        // range: `iret` must return the fault directly, leaving the ring-0 monitor's own
+        // CS/EIP/segments untouched (as if the IRET itself never executed), not commit a
+        // fabricated V86 frame and only discover the violation on the next fetch.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.registers.set_esp(0x6800);
+        let vm_eflags = FLAG_VM | 0x2;
+        for v in [
+            0x4444u32,
+            0x3333,
+            0x1111,
+            0x2222,
+            0x0900,
+            0x1000,
+            vm_eflags,
+            0x0A00,
+            0x0001_0000,
+        ] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+
+        let result = cpu.iret(&mut bus, OperandSize::Dword);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0),
+                })
+            ),
+            "out-of-limit popped EIP must fault #GP(0) directly from iret: {result:?}"
+        );
+        assert!(
+            !cpu.is_v86_mode(),
+            "a faulted IRET must not have entered V86"
+        );
+        assert_eq!(
+            cpu.registers.cs().selector,
+            R0_CS,
+            "the monitor's own CS must be untouched by the faulted IRET"
+        );
+        // 9 dwords were pushed to build the frame; the faulted IRET must restore ESP to
+        // that pre-IRET value (finish_instruction rewinds only EIP/CS, so iret itself
+        // must undo its three pops or the monitor's stack drifts 12 bytes per fault).
+        assert_eq!(
+            cpu.registers.esp(),
+            0x6800 - 9 * 4,
+            "a faulted IRET must leave ESP exactly pre-IRET"
+        );
+    }
+
+    #[test]
     fn iret_inter_privilege_return_to_ring3() {
         let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
         // Ring-3 code (access 0xfb) + data (0xf3) at GDT slots 0x20 / 0x28.
@@ -28028,5 +28158,125 @@ mod tests {
                 .any(|c| c.kind == BusAccessKind::IoWrite && c.address == 0x80),
             "permitted OUT 0x80 should have run in V86"
         );
+    }
+
+    // ---- Non-identity-mapped system structures (translate_linear_system) ----------
+    //
+    // `v86_world`'s page tables are identity-mapped, so TSS/GDT/IDT linear == physical
+    // there and every system-structure read would look correct even with the raw,
+    // unpaged `bus.read_memory` these tests were written to catch (the JEMMEX bug:
+    // its monitor sits at a high linear alias -- e.g. 0xf8017000 -- of low physical
+    // RAM). These tests add a *second* PDE mapping a high linear window onto the same
+    // physical TSS/GDT page, then address the TSS/GDT only through that alias, so a
+    // regression back to raw `bus.read_memory(self.tr.base + ..)` reads unmapped
+    // physical memory (or, in TestBus, the wrong bytes) instead of the real fields.
+
+    /// Linear window aliasing the TSS's physical page one PDE slot up (JEMMEX-style
+    /// high monitor mapping): PDE[1] -> the same page table as PDE[0], so linear
+    /// 0x00400000 + phys(0..0x1000) reads/writes the identical physical bytes as the
+    /// identity mapping at phys directly.
+    const ALIAS_BASE: u32 = 0x0040_0000;
+
+    /// Extend `v86_world`'s page directory with a second PDE (index 1) pointing at
+    /// the same page table as PDE[0], then move the TSS to be addressed only through
+    /// the alias: `cpu.tr.base` and the TSS GDT descriptor's base are both set to
+    /// `ALIAS_BASE + TSS`, while the bytes still live at physical `TSS`. A test that
+    /// reads/writes the TSS via a raw, unpaged `bus.read_memory(self.tr.base + ..)`
+    /// would touch physical `ALIAS_BASE + TSS` (zeroed, wrong data) instead of the
+    /// real TSS at physical `TSS`.
+    fn alias_tss_through_second_pde(bus: &mut TestBus, cpu: &mut Cpu386) {
+        // PDE[1] (linear 0x0040_0000..0x0080_0000) -> the same PT as PDE[0].
+        put32(&mut bus.memory, 0x1000 + 4, 0x2000 | 0x7);
+        let tss_limit = cpu.tr.limit;
+        cpu.tr.base = ALIAS_BASE + TSS;
+        // Repoint the TSS GDT descriptor's base at the alias too, so LTR-style
+        // re-reads and `set_tss_busy`'s GDT access-byte patch land on the alias.
+        let d = descriptor(ALIAS_BASE + TSS, tss_limit, 0x89, 0x00);
+        bus.memory[(GDT + 0x18) as usize..(GDT + 0x18) as usize + 8].copy_from_slice(&d);
+    }
+
+    #[test]
+    fn deliver_exception_from_v86_reads_esp0_ss0_through_a_non_identity_tss_mapping() {
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        alias_tss_through_second_pde(&mut bus, &mut cpu);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+        // ESP0/SS0 came from the TSS at its aliased linear address, not from
+        // unmapped physical memory at ALIAS_BASE + TSS + 4/+8 (which is zeroed).
+        assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ss).selector,
+            R0_SS,
+            "SS0 must come from the TSS through the paged (aliased) address"
+        );
+        // ESP0 from the TSS, minus the 10-dword V86 interrupt frame (err code, EIP,
+        // CS, EFLAGS, ESP, SS, ES, DS, FS, GS) pushed onto the new stack.
+        assert_eq!(
+            cpu.registers.esp(),
+            ESP0 - 40,
+            "ESP0 must come from the TSS through the paged (aliased) address"
+        );
+    }
+
+    #[test]
+    fn ltr_loads_a_gdt_tss_descriptor_through_a_non_identity_mapping() {
+        // Put the GDT itself behind the alias: GDT descriptors are read via
+        // `read_gdt_descriptor` -> `read_system_linear_u32`, so aliasing the GDT's
+        // page (not just the TSS's) exercises that path directly.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // PDE[1] -> the same PT as PDE[0] (GDT/TSS both live in the identity-mapped
+        // low pages, so one alias PDE covers both).
+        put32(&mut bus.memory, 0x1000 + 4, 0x2000 | 0x7);
+        cpu.gdtr.base = ALIAS_BASE + GDT;
+        cpu.registers.eflags = 0x2; // ring 0, no VM/IOPL surprises
+
+        cpu.load_tr(&mut bus, TSS_SEL).unwrap();
+
+        assert_eq!(cpu.tr.selector, TSS_SEL);
+        assert_eq!(
+            cpu.tr.base, TSS,
+            "LTR must decode the TSS descriptor's base field from the aliased GDT"
+        );
+        assert_eq!(
+            cpu.tr.access & 0x02,
+            0x02,
+            "LTR must mark the TSS busy in the cached descriptor"
+        );
+        // The busy bit patch-back must land on the real (aliased) GDT byte, not on
+        // unmapped physical memory.
+        let access_byte = bus.memory[(GDT + 0x18 + 5) as usize];
+        assert_eq!(
+            access_byte & 0x02,
+            0x02,
+            "GDT busy bit must be set in place"
+        );
+    }
+
+    #[test]
+    fn v86_io_bitmap_check_reads_through_a_non_identity_mapped_tss() {
+        // Bitmap traps port 0x21, but the TSS (and its I/O-map base word / bitmap
+        // bytes) is only reachable through the ALIAS_BASE linear window. A raw,
+        // unpaged read of `self.tr.base + 0x66` would read zeroed physical memory
+        // at ALIAS_BASE + TSS + 0x66 and see io_base = 0 with an all-zero bitmap,
+        // wrongly permitting the OUT.
+        let mut bitmap = vec![0u8; 0x20 + 1];
+        bitmap[0x21 / 8] |= 1 << (0x21 % 8);
+        let guest = [0xe6, 0x21, 0xf4]; // out 0x21, al ; hlt
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &bitmap);
+        alias_tss_through_second_pde(&mut bus, &mut cpu);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        let outcome = cpu.cycle(&mut bus);
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !cpu.is_v86_mode(),
+            "the I/O-bitmap trap must be read through the aliased TSS mapping"
+        );
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
     }
 }
