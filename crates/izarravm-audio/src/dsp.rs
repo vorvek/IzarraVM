@@ -3,18 +3,11 @@
 //! The CT1745 mixer lives next to this in the machine crate. ADPCM, input/ADC,
 //! and MIDI/MPU-401 are not modeled yet.
 
-use crate::pcm::{sample_i16, sample_u8, sample_u16};
+use crate::pcm::{push_frame_capped, sample_i16, sample_u8, sample_u16};
 use std::collections::VecDeque;
 
 pub const DSP_VERSION_HI: u8 = 4;
 pub const DSP_VERSION_LO: u8 = 5;
-
-/// Bounded length of the rendered-frame ring, in stereo frames (~0.37 s at
-/// 22 kHz). The ring is a rate-match buffer between the per-CPU-clock producer
-/// (in `advance_devices`) and the host drainer (`render_dsp_audio`). On push
-/// when full it drops the oldest frame: audio fidelity may glitch, but the
-/// block counter and IRQ timing stay correct, which is the point of the split.
-const DSP_RING_CAP: usize = 8192;
 
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
@@ -55,7 +48,9 @@ pub struct SbDsp {
     // output frame (left then right). Set from the mixer each producer tick.
     sbpro_stereo: bool,
     // Rendered stereo frames produced by the per-CPU-clock producer, drained by
-    // the host audio path. See DSP_RING_CAP for the cap/drop-oldest policy.
+    // the host audio path. Rate-match buffer: on push when full the oldest
+    // frame drops (fidelity may glitch, block counter/IRQ timing stay
+    // correct). Cap and policy live in `pcm::push_frame_capped`.
     rendered: VecDeque<(i16, i16)>,
 }
 
@@ -313,10 +308,7 @@ impl SbDsp {
         W: FnMut() -> Option<u16>,
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
-            if self.rendered.len() >= DSP_RING_CAP {
-                self.rendered.pop_front();
-            }
-            self.rendered.push_back(frame);
+            push_frame_capped(&mut self.rendered, frame);
         }
     }
 

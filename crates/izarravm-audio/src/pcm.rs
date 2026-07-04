@@ -3,6 +3,23 @@
 //! and A-law companding decoders the AD1848 (WSS) codec expands internally.
 //! Every converter returns a centered signed 16-bit value ready for the mixer.
 
+use std::collections::VecDeque;
+
+/// Rendered-frame ring capacity shared by the streaming DACs (SB DSP, WSS,
+/// ADPCM); the host audio path drains the ring, so an unread backlog is
+/// bounded by dropping the oldest frame (see [`push_frame_capped`]).
+pub(crate) const RENDER_RING_CAP: usize = 8192;
+
+/// Push one rendered stereo frame, dropping the oldest frame once the ring
+/// holds [`RENDER_RING_CAP`] entries. Single-sourced so the per-device DACs
+/// cannot drift on the cap/drop policy.
+pub(crate) fn push_frame_capped(ring: &mut VecDeque<(i16, i16)>, frame: (i16, i16)) {
+    if ring.len() >= RENDER_RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(frame);
+}
+
 /// Convert one 8-bit Sound Blaster PCM sample (unsigned) to a centered signed
 /// 16-bit value for the mixer: (byte - 128) * 256.
 pub(crate) fn sample_u8(byte: u8) -> i16 {

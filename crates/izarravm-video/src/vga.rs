@@ -3424,13 +3424,14 @@ impl Vga {
         {
             match index {
                 0x06 => self.crtc_regs.r06 = value,
-                0x07 => self.crtc_regs.r07 = value,
-                0x09 => self.crtc_regs.r09 = value,
                 0x10 => self.crtc_regs.r10 = value,
-                0x11 => self.crtc_regs.r11 = value,
                 0x12 => self.crtc_regs.r12 = value,
                 0x15 => self.crtc_regs.r15 = value,
                 0x16 => self.crtc_regs.r16 = value,
+                // 0x07/0x09/0x11 are already stored (with their line-compare
+                // side effects) by the main match above; they only need the
+                // vertical-timing recompute here.
+                0x07 | 0x09 | 0x11 => {}
                 _ => unreachable!(),
             }
             self.recompute_vertical_timing();

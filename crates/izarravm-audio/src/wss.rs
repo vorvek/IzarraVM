@@ -21,14 +21,9 @@
 use std::collections::VecDeque;
 use std::sync::LazyLock;
 
-use crate::pcm::{sample_alaw, sample_i16, sample_u8, sample_ulaw};
+use crate::pcm::{push_frame_capped, sample_alaw, sample_i16, sample_u8, sample_ulaw};
 
 /// Bounded length of the rendered-frame ring, in stereo frames. Mirrors the SB
-/// DSP ring: a rate-match buffer between the per-output-frame producer and the
-/// host drainer; on push when full it drops the oldest frame so the block
-/// counter and IRQ timing stay correct even if audio fidelity glitches.
-const DSP_RING_CAP: usize = 8192;
-
 /// R0 (Index Address) bit masks. `INIT` is read-only and `MCE`/`TRD` latch with
 /// the 4-bit index on a write.
 #[allow(
@@ -167,7 +162,8 @@ pub struct Ad1848 {
     current_count: u32,
     /// Whether the count has been armed (PEN set with a non-zero base count).
     playing: bool,
-    /// Rendered stereo frames, drained by the host audio path. See DSP_RING_CAP.
+    /// Rendered stereo frames, drained by the host audio path; capped by
+    /// `pcm::push_frame_capped` (drop-oldest rate-match buffer).
     rendered: VecDeque<(i16, i16)>,
 }
 
@@ -553,10 +549,7 @@ impl Ad1848 {
     /// for the caller to forward via `take_irq`.
     pub fn tick_sample<B: FnMut() -> Option<u8>>(&mut self, fetch: B) {
         if let Some(frame) = self.render_frame(fetch) {
-            if self.rendered.len() >= DSP_RING_CAP {
-                self.rendered.pop_front();
-            }
-            self.rendered.push_back(frame);
+            push_frame_capped(&mut self.rendered, frame);
         }
     }
 

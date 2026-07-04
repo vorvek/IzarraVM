@@ -16,13 +16,8 @@
 //! driver that programs it sees the same DMA/IRQ handshake the real Yamaha
 //! hardware gives a host.
 
+use crate::pcm::push_frame_capped;
 use std::collections::VecDeque;
-
-/// Bounded length of the rendered-frame ring, in stereo frames. Mirrors the SB
-/// DSP / AD1848 rings: a rate-match buffer between the per-CPU-clock producer
-/// and the host drainer; on push when full it drops the oldest frame so the
-/// block counter and IRQ timing stay correct even if audio fidelity glitches.
-const ADPCM_RING_CAP: usize = 8192;
 
 /// Initial ADPCM step size shared by every Yamaha ADPCM variant: 127.
 const INITIAL_STEP_SIZE: i32 = 127;
@@ -563,7 +558,7 @@ impl YamahaAdpcmChip {
             0 => self.address = value & 0x07,
             1 => self.write_register(self.address, value),
             2 => self.write_register(reg::CONTROL, value),
-            3 if self.fifo.len() < ADPCM_RING_CAP * 2 => {
+            3 if self.fifo.len() < crate::pcm::RENDER_RING_CAP * 2 => {
                 self.fifo.push_back(value);
             }
             _ => {}
@@ -657,10 +652,7 @@ impl YamahaAdpcmChip {
         F: FnMut() -> Option<u8>,
     {
         if let Some(frame) = self.render_frame(dma_fetch) {
-            if self.rendered.len() >= ADPCM_RING_CAP {
-                self.rendered.pop_front();
-            }
-            self.rendered.push_back(frame);
+            push_frame_capped(&mut self.rendered, frame);
         }
     }
 
