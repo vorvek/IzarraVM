@@ -355,6 +355,11 @@ int16:
     iret
 .read:
     sti
+    ; INT 16h must preserve every register but AX/FLAGS (IBM AT BIOS contract).
+    ; BX is this handler's ring-pointer scratch, so save the caller's copy: a
+    ; leaked BX bit real code (Watcom kept a local in BX across INT 16h AH=01h
+    ; and read back the ring head offset -- the TokaEdit phantom-Alt bug).
+    push bx
 .read_wait:
     push ds
     mov bx, BDA_SEG
@@ -364,9 +369,8 @@ int16:
     pop ds
     je .read_wait
     push ds
-    ; INT 16h must preserve CX (IBM AT BIOS contract: every register but AX/FLAGS).
-    ; FreeDOS's CONRead uses CX as its read-loop counter, so use BX (reloaded on the
-    ; next line) as the DS-load scratch here instead of clobbering CX.
+    ; FreeDOS's CONRead uses CX as its read-loop counter, so use BX (saved at
+    ; entry, reloaded on the next line) as the DS-load scratch, not CX.
     mov bx, BDA_SEG
     mov ds, bx
     mov bx, [KB_BUF_HEAD]
@@ -386,12 +390,14 @@ int16:
     jne .read_done
     xor al, al
 .read_done:
+    pop bx
     iret
 .read16:
     ; Enhanced read (AH=10h): same ring as AH=00h but never collapses the gray-key
     ; marker, so extended cursor-pad keys keep their full scancode in AH and the
     ; 0xE0 marker in AL.
     sti
+    push bx                ; caller's BX (see the AH=00h .read note)
 .read16_wait:
     push ds
     mov bx, BDA_SEG
@@ -413,8 +419,11 @@ int16:
 .read16_store:
     mov [KB_BUF_HEAD], bx
     pop ds
+    pop bx
     iret
 .peek:
+    push bx                ; caller's BX; popped before the FLAGS-image edit so
+                           ; the [bp+6] offsets below stay correct
     push ds
     mov bx, BDA_SEG
     mov ds, bx
@@ -423,6 +432,7 @@ int16:
     je .peek_empty
     mov ax, [bx]
     pop ds
+    pop bx
     ; Legacy peek collapses the gray-key marker the same way the legacy read does.
     cmp al, 0xe0
     jne .peek_done
@@ -436,6 +446,7 @@ int16:
     iret
 .peek_empty:
     pop ds
+    pop bx
     push bp
     mov bp, sp
     or word [bp + 6], 0x0041       ; CF=1, ZF=1: no key
@@ -443,6 +454,7 @@ int16:
     iret
 .peek16:
     ; Enhanced peek (AH=11h): leaves the key in the ring and keeps the 0xE0 marker.
+    push bx                ; caller's BX (see .peek)
     push ds
     mov bx, BDA_SEG
     mov ds, bx
@@ -451,6 +463,7 @@ int16:
     je .peek16_empty
     mov ax, [bx]
     pop ds
+    pop bx
     push bp
     mov bp, sp
     and word [bp + 6], 0xffbe      ; CF=0, ZF=0: key present
@@ -458,17 +471,20 @@ int16:
     iret
 .peek16_empty:
     pop ds
+    pop bx
     push bp
     mov bp, sp
     or word [bp + 6], 0x0041       ; CF=1, ZF=1: no key
     pop bp
     iret
 .flags:
+    push bx
     push ds
     mov bx, BDA_SEG
     mov ds, bx
     mov al, [KB_FLAGS]
     pop ds
+    pop bx
     xor ah, ah
     iret
 .flags12:
@@ -476,12 +492,14 @@ int16:
     ; same byte AH=02h returns). AH = the second shift-flags byte (KB_FLAGS_1):
     ; bit 0 left Ctrl, bit 1 left Alt, bit 2 right Ctrl, bit 3 right Alt, plus the
     ; lock-pressed bits the ISR keeps in bits 4-7. Returns AX.
+    push bx
     push ds
     mov bx, BDA_SEG
     mov ds, bx
     mov al, [KB_FLAGS]
     mov ah, [KB_FLAGS_1]
     pop ds
+    pop bx
     iret
 .keyclick:
     ; PCjr-only keyclick enable/disable. This AT-style keyboard has no clicker.
@@ -526,6 +544,7 @@ int16:
     jne .typ_done
     push ax
     push bx
+    push cx                 ; .typ_drain uses CX; the INT 16h contract keeps it
     ; The 0xF3 command and its rate byte each draw an ACK (0xFA) through the
     ; keyboard output buffer, which arms IRQ1. Mask IRQ1 and run with interrupts
     ; off so INT 09h cannot read the ACK and mistake it for a scancode, then
@@ -552,6 +571,7 @@ int16:
     pop ax                  ; AL = saved PIC mask
     out 0x21, al
     popf
+    pop cx
     pop bx
     pop ax
 .typ_done:
