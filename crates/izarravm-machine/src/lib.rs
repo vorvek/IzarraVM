@@ -78,6 +78,11 @@ const VGA_BIOS_INT1F_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1F_FONT_OFF as
 /// free space inside the VGA BIOS span (0xC0000-0xC7FFF); the VGA BIOS only
 /// uses through ~0xC3C00, so 0xC4000 is available without a new UMA reservation.
 const CODEPAGE_FONT_WINDOW: u32 = 0xC4000;
+/// Size of the video option ROM span this machine backs with flat RAM
+/// (INT 10h/1D/43/44/1F tables plus the code-page font bank): 32 KiB, matching
+/// where a real VGA adapter's option ROM lives. One past this, at 0xC8000, is
+/// the first byte of open, unoccupied upper memory.
+const VGA_BIOS_SPAN_SIZE: u32 = 0x8000;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
@@ -11683,6 +11688,13 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        if is_open_bus_uma(address, width) {
+            // Unoccupied upper memory: open bus reads as 0xFF, matching a real
+            // machine's floating data bus over an adapter-free UMA hole.
+            out.fill(0xff);
+            return Ok(());
+        }
+
         let end = address as usize + width;
         if end <= self.memory.len() {
             out.copy_from_slice(&self.memory.as_slice()[address as usize..end]);
@@ -11698,6 +11710,12 @@ impl MachineBus<'_> {
         }
 
         if rom_offset(address, 1).is_some() {
+            return Ok(());
+        }
+
+        if is_open_bus_uma(address, 1) {
+            // Unoccupied upper memory: open bus, a write with nothing wired to
+            // receive it.
             return Ok(());
         }
 
@@ -11995,6 +12013,28 @@ fn rom_offset(address: u32, width: usize) -> Option<usize> {
     } as usize;
 
     (offset + width <= BIOS_ROM_SIZE).then_some(offset)
+}
+
+/// True if `address` (for an access of `width` bytes, entirely) falls in the
+/// unoccupied part of the upper-memory area: the UMB-able holes between the
+/// video option ROM span and the system BIOS, 0xC8000-0xEFFFF. On a real
+/// machine nothing answers there unless an adapter or a memory manager's
+/// page-frame claims it; this machine's own occupants (VGA BIOS data tables,
+/// the code-page font bank, TOKAEMM's linear-to-extended-RAM UMB remap) all
+/// live below 0xC8000 or are reached through paging at a physical address
+/// above 1 MiB, so this range check never needs to special-case them.
+///
+/// Guests that probe the UMA for a free window (JEMMEX and other EMS/UMB
+/// managers scanning for a page frame) rely on this reading as open bus
+/// (conventionally 0xFF, writes ignored), exactly like the existing
+/// 0x201/0x280-0x28F/0x5658 open-bus port conventions but for memory instead
+/// of I/O space.
+fn is_open_bus_uma(address: u32, width: usize) -> bool {
+    let uma_occupied_end = UPPER_MEMORY_BASE + VGA_BIOS_SPAN_SIZE;
+    let Some(end) = address.checked_add(width as u32) else {
+        return false;
+    };
+    address >= uma_occupied_end && end <= SYSTEM_ROM_BASE
 }
 
 fn video_text_offset(base: u32, address: u32, width: usize) -> Option<usize> {
@@ -13531,6 +13571,57 @@ mod tests {
                 "the aliased write left the extended cell alone"
             );
         }
+    }
+
+    #[test]
+    fn unoccupied_upper_memory_reads_open_bus() {
+        // 0xC8000-0xEFFFF are the UMB-able holes above the VGA option ROM span
+        // and below the system BIOS. Nothing on this machine's default boot
+        // claims them, so a probe (JEMMEX and other EMS/UMB managers scan the
+        // UMA for a free page frame) must see open bus, not RAM that happens
+        // to hold whatever was last written there.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        for addr in [0xC8000u32, 0xC8001, 0xE0000, 0xEFFFF] {
+            assert_eq!(
+                bus.read_memory(addr, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap(),
+                0xff,
+                "address {addr:#08x} must read open bus"
+            );
+        }
+        // A write finds nothing wired to receive it: read-back still 0xFF.
+        bus.write_memory(0xD0000, BusWidth::Byte, 0x42, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0xD0000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xff,
+            "an open-bus write must not stick"
+        );
+        // The occupied VGA BIOS span (0xC0000-0xC7FFF) is unaffected: it is
+        // genuinely backed and keeps its written content.
+        bus.write_memory(0xC5000, BusWidth::Byte, 0x99, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0xC5000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0x99,
+            "the VGA BIOS span is still flat-RAM-backed, not open bus"
+        );
+        // The system BIOS ROM shadow at 0xF0000 is unaffected: a write is a
+        // silent no-op (ROM), not open bus 0xFF read-back of arbitrary content.
+        let before = bus
+            .read_memory(0xF0000, BusWidth::Byte, BusAccessKind::DataRead)
+            .unwrap();
+        bus.write_memory(0xF0000, BusWidth::Byte, !before, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0xF0000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            before,
+            "the BIOS ROM shadow ignores writes and keeps its ROM content"
+        );
     }
 
     #[test]
