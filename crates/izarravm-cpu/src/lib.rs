@@ -141,6 +141,25 @@ const CR4_TSD: u32 = 0x0000_0004;
 // bits of CR4"). So a reserved-bit write faults with #GP(0), the same as EFER/STAR.
 const CR4_DEFINED_MASK: u32 = 0x0000_009f; // bits 0-4, 6-7
 
+// DR6 (debug status): bits 0-3 are B0-B3 (which breakpoint condition matched), bit 13
+// is BD (an attempt to access a debug register while GD was set), bit 14 is BS (the
+// trap flag caused this #DB), bit 15 is BT (a task switch caused this #DB). 386 PRM
+// ch12 (Debug Registers) documents bits 4-11 and 16-31 as defined-1 on reset and not
+// guaranteed to read as written -- this core stores whatever is written to keep MOV DR6
+// round-tripping simple, which is sufficient because breakpoint matching (the only thing
+// that would actually set B0-B3/BS/BT/BD) is not implemented yet (ledger row 26,
+// deferred). DR6 reset value per the PRM is 0xFFFF_0FF0.
+const DR6_RESET: u32 = 0xffff_0ff0;
+
+// DR7 (debug control): bits 0-7 are the L0-L3/G0-G3 local/global breakpoint enables,
+// bit 8 LE and bit 9 GE are the (obsolete-by-386) exact-breakpoint-cycle enables, bit 13
+// is GD (general detect -- traps any MOV DR), bits 16-31 are the four LEN/R-W condition
+// fields for DR0-DR3. Bits 10, 12, 14-15 are hardwired: 386 PRM ch12 defines bit 10 as
+// always 1; the others are reserved-as-0 here since this core does not model LE/GE cycle
+// exactness. Reset value per the PRM is 0x0000_0400 (bit 10 set, everything else clear).
+const DR7_RESET: u32 = 0x0000_0400;
+const DR7_FIXED_ONE: u32 = 0x0000_0400; // bit 10, always reads back as 1
+
 // K6 model-specific register addresses (the value the RDMSR/WRMSR ECX selector carries).
 // This is the full software-visible set from the AMD-K6 BIOS and Software Tools guide:
 // the two machine-check registers, the time-stamp counter, the AMD extended-feature and
@@ -424,7 +443,7 @@ impl Registers {
 // correctly CR0 bit 18, so it powers up masked at zero. Bit 4 is ET, which an old
 // 386 reset forced on; here it stays 0 since no x87 FPU is emulated, so the default
 // is a plain zero (derived).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlRegisters {
     pub cr0: u32,
     pub cr2: u32,
@@ -433,6 +452,29 @@ pub struct ControlRegisters {
     // RDTSC outside CPL 0); the rest is plain read/write storage so MOV CR4 round-
     // trips. Reset is all zero.
     pub cr4: u32,
+    // DR0-DR3: linear breakpoint addresses (386 PRM ch12). Storage only -- no
+    // breakpoint matching or #DB generation is implemented (ledger row 26, deferred).
+    pub dr0_3: [u32; 4],
+    // DR6 (debug status) and DR7 (debug control). See DR6_RESET/DR7_RESET/DR7_FIXED_ONE
+    // above for the bit layout and reset values. DR4/DR5 alias these two on a 386 or on
+    // any later part with CR4.DE clear (the default here, since DE is not behaviorally
+    // wired up) -- see the 0x0f21/0x0f23 handlers.
+    pub dr6: u32,
+    pub dr7: u32,
+}
+
+impl Default for ControlRegisters {
+    fn default() -> Self {
+        ControlRegisters {
+            cr0: 0,
+            cr2: 0,
+            cr3: 0,
+            cr4: 0,
+            dr0_3: [0; 4],
+            dr6: DR6_RESET,
+            dr7: DR7_RESET,
+        }
+    }
 }
 
 /// The K6 model-specific register file behind RDMSR/WRMSR. MCAR/MCTR/WHCR are plain
@@ -3789,12 +3831,11 @@ impl Cpu386 {
                 0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
                 // System / descriptor-table / segment block (task A12), 0F forms: the descriptor
                 // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06),
-                // MOV reg,CR / MOV CR,reg (0F 20/22), and LSS/LFS/LGS (0F B2/B4/B5, a far-pointer
-                // load like LES/LDS but into SS/FS/GS). 0F 21/23 (MOV reg,DR / MOV DR,reg) are
-                // unimplemented and stay TwoByteFallback.
-                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5 => {
-                    DecodeGroup::SystemSeg
-                }
+                // MOV reg,CR / MOV CR,reg (0F 20/22), MOV reg,DR / MOV DR,reg (0F 21/23, ledger
+                // row 25), and LSS/LFS/LGS (0F B2/B4/B5, a far-pointer load like LES/LDS but into
+                // SS/FS/GS).
+                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x21 | 0x22 | 0x23 | 0xb2 | 0xb4
+                | 0xb5 => DecodeGroup::SystemSeg,
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
                 // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
                 // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
@@ -4344,12 +4385,13 @@ impl Cpu386 {
                 match insn.opcode {
                     // CLTS: no encoded operand.
                     0x0f06 => {}
-                    // MOV reg,CR / MOV CR,reg (0F 20/22): the ModRM is always a register form (the
-                    // `reg` field is the CR number, `rm` the GPR). The fused path fetches ONLY the
-                    // ModRM byte and #UDs when `mode != 3` BEFORE touching any addressing byte, so
-                    // do the same here: fetch the ModRM, store it, and DO NOT parse an addressing
-                    // mode (a non-register `mode` is rejected in the executor with no extra fetch).
-                    0x0f20 | 0x0f22 => {
+                    // MOV reg,CR / MOV CR,reg (0F 20/22) and MOV reg,DR / MOV DR,reg (0F 21/23):
+                    // the ModRM is always a register form (the `reg` field is the CR/DR number,
+                    // `rm` the GPR). The fused path fetches ONLY the ModRM byte and #UDs when
+                    // `mode != 3` BEFORE touching any addressing byte, so do the same here: fetch
+                    // the ModRM, store it, and DO NOT parse an addressing mode (a non-register
+                    // `mode` is rejected in the executor with no extra fetch).
+                    0x0f20..=0x0f23 => {
                         let modrm = self.fetch_modrm(bus)?;
                         insn.modrm = Some(modrm);
                     }
@@ -6359,6 +6401,59 @@ impl Cpu386 {
                         self.control.cr4 = value;
                     }
                     _ => unreachable!("undefined CR numbers are rejected by the check above"),
+                }
+                Ok(clocks(6))
+            }
+            0x0f21 => {
+                // MOV reg, DR: whole-32-bit read of the selected debug register. Same shape as
+                // MOV reg,CR above -- ModRM register form only (`mode == 3`; any other mode is
+                // #UD), privileged (386 PRM ch12: debug-register access is CPL-0-only, #GP(0)
+                // otherwise), `reg` selects the DR number, `rm` the destination GPR.
+                //
+                // DR4/DR5 alias DR6/DR7 by default (CR4.DE clear, which this core never sets
+                // behaviorally -- see CR4_TSD/CR4_DEFINED_MASK above) per 386 PRM ch12 and the
+                // 486/586 successors; a guest that references DR4/DR5 expecting DR6/DR7 (as
+                // DOS/32A's exception reporter does) gets the alias instead of #UD.
+                //
+                // Storage only: no breakpoint matching or #DB generation is modeled (ledger
+                // row 26, deferred). This just stops MOV DR6/DR7 from raising #UD, which is
+                // what DOS/32A's VCPI init and exception reporter need.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV reg,DR decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                let value = match modrm.reg {
+                    0..=3 => self.control.dr0_3[modrm.reg as usize],
+                    4 => self.control.dr6,
+                    5 => self.control.dr7,
+                    6 => self.control.dr6,
+                    7 => self.control.dr7,
+                    _ => return Err(undefined_opcode()),
+                };
+                self.write_gpr32(modrm.rm, value);
+                Ok(clocks(6))
+            }
+            0x0f23 => {
+                // MOV DR, reg: whole-32-bit write of the selected debug register. Same shape as
+                // MOV CR,reg above; see 0x0f21 for the privilege/aliasing rationale.
+                //
+                // Reserved-bit handling per 386 PRM ch12: DR7 bit 10 is hardwired to 1 (it is
+                // not settable by the guest); this core does not model LE/GE cycle-exactness or
+                // the L/G breakpoint enables beyond plain storage, so every other bit is stored
+                // as written. DR6 has no core-enforced reserved bits either (this is storage
+                // only, not breakpoint matching), so it round-trips whatever is written.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV DR,reg decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                let value = self.read_gpr32(modrm.rm);
+                match modrm.reg {
+                    0..=3 => self.control.dr0_3[modrm.reg as usize] = value,
+                    4 | 6 => self.control.dr6 = value,
+                    5 | 7 => self.control.dr7 = (value & !DR7_FIXED_ONE) | DR7_FIXED_ONE,
+                    _ => return Err(undefined_opcode()),
                 }
                 Ok(clocks(6))
             }
@@ -19851,6 +19946,131 @@ mod tests {
         assert_eq!(cpu.control.cr4, 0);
     }
 
+    // --- Ledger row 25: MOV to/from debug registers (0F 21/0F 23) ---
+
+    #[test]
+    fn mov_dr7_round_trips() {
+        // 0F 23 F8 = MOV DR7, EAX (reg=7, rm=EAX); 0F 21 FB = MOV EBX, DR7 (reg=7, rm=EBX).
+        // Bit 10 is hardwired to 1 (DR7_FIXED_ONE) per 386 PRM ch12, so it must read back
+        // set even though the write below does not include it.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xf8, 0x0f, 0x21, 0xfb], 0x20);
+        cpu.registers.set_eax(0x0000_0155); // L0/G0/L1/G1/L2 enables, bit 10 not set
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr7, 0x0000_0155 | DR7_FIXED_ONE);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_0155 | DR7_FIXED_ONE);
+    }
+
+    #[test]
+    fn mov_dr6_round_trips_with_reserved_bit_behavior() {
+        // 0F 23 F0 = MOV DR6, EAX (reg=6, rm=EAX); 0F 21 F3 = MOV EBX, DR6 (reg=6, rm=EBX).
+        // DR6 is plain storage here (breakpoint matching is ledger row 26, deferred), so
+        // whatever is written reads back byte-for-byte, including into the high bits the
+        // PRM defines as fixed-1 on reset -- this core does not re-force them on write.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xf0, 0x0f, 0x21, 0xf3], 0x20);
+        cpu.registers.set_eax(0x0000_000f); // B0-B3 all set
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr6, 0x0000_000f);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_000f);
+    }
+
+    #[test]
+    fn mov_dr6_reset_value_matches_prm() {
+        // 386 PRM ch12: DR6 powers up as 0xFFFF_0FF0.
+        let cpu = Cpu386::default();
+        assert_eq!(cpu.control.dr6, 0xffff_0ff0);
+    }
+
+    #[test]
+    fn mov_dr7_reset_value_matches_prm() {
+        // 386 PRM ch12: DR7 powers up as 0x0000_0400 (bit 10 set, everything else clear).
+        let cpu = Cpu386::default();
+        assert_eq!(cpu.control.dr7, 0x0000_0400);
+    }
+
+    #[test]
+    fn mov_dr4_aliases_dr6() {
+        // 0F 23 E0 = MOV DR4, EAX (reg=4); 0F 21 E3 = MOV EBX, DR4. With CR4.DE clear (the
+        // default -- never behaviorally set by this core), DR4 aliases DR6.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xe0, 0x0f, 0x21, 0xe3], 0x20);
+        cpu.registers.set_eax(0x0000_000a);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr6, 0x0000_000a);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_000a);
+    }
+
+    #[test]
+    fn mov_dr5_aliases_dr7() {
+        // 0F 23 E8 = MOV DR5, EAX (reg=5); 0F 21 EB = MOV EBX, DR5. Aliases DR7, same as
+        // DR4 aliases DR6 above.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xe8, 0x0f, 0x21, 0xeb], 0x20);
+        cpu.registers.set_eax(0x0000_0001);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr7, 0x0000_0001 | DR7_FIXED_ONE);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0000_0001 | DR7_FIXED_ONE);
+    }
+
+    #[test]
+    fn mov_dr0_3_round_trip() {
+        // 0F 23 D8 = MOV DR3, EAX (reg=3); 0F 21 DB = MOV EBX, DR3. Linear breakpoint
+        // address storage only, no matching implemented.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x23, 0xd8, 0x0f, 0x21, 0xdb], 0x20);
+        cpu.registers.set_eax(0xdead_beef);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.dr0_3[3], 0xdead_beef);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0xdead_beef);
+    }
+
+    #[test]
+    fn mov_dr_write_faults_at_cpl3() {
+        // 0F 23 F8 = MOV DR7, EAX. Debug-register access is privileged (386 PRM ch12):
+        // a ring-3 guest must get #GP(0), not a silent write.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x23, 0xf8]);
+        cpu.registers.set_eax(0);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn mov_dr_read_faults_at_cpl3() {
+        // 0F 21 F8 = MOV EAX, DR7. Same gate on the read side.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x21, 0xf8]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn mov_dr_memory_operand_is_undefined_opcode() {
+        // 0F 21 00 = MOV [BX+SI], DR0 with mode=0 (memory operand) instead of mode=3
+        // (register). Debug-register moves are register-form only; any other ModRM mode
+        // is an invalid encoding (#UD), same convention as MOV CR.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x21, 0x00], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
     #[test]
     fn mov_cr3_round_trips_pwt_and_pcd() {
         // 0F 22 D8 = MOV CR3, EAX (reg=3, rm=EAX); 0F 20 DB = MOV EBX, CR3 (reg=3, rm=EBX).
@@ -20647,7 +20867,7 @@ mod tests {
             // CMOVcc / SETcc / IMUL (CondMove)
             | 0x40..=0x4f | 0x90..=0x9f | 0xaf
             // SystemSeg
-            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5
+            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x21 | 0x22 | 0x23 | 0xb2 | 0xb4 | 0xb5
             // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
             | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
             | 0xc7 | 0xc8..=0xcf
@@ -20746,34 +20966,33 @@ mod tests {
             }
         }
 
-        // A representative un-implemented 0F byte from each kind of gap that falls through to the
-        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg). Each routes to
-        // TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F B2/B4/B5 LSS/LFS/LGS are now
-        // implemented -- see the SystemSeg coverage test below. 0F AA RSM also routes to
-        // TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
+        // A representative un-implemented 0F byte that falls through to the generic catch-all:
+        // 0x0a (unmapped). It routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F
+        // B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV reg,DR / MOV DR,reg are now implemented -- see the
+        // SystemSeg coverage test below and the ledger-row-25 `mov_dr*` tests. 0F AA RSM also routes
+        // to TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
         // vector 6 because no SMM is modeled -- it is "implemented", just always invalid -- so it is
         // not part of this generic-catch-all sweep.)
-        for second in [0x0au8, 0x21, 0x23] {
-            assert!(
-                !implemented_two_byte(second),
-                "test bug: 0F {second:#04x} is actually implemented"
-            );
-            let mut cpu = Cpu386::default();
-            cpu.load_segment_real(SegmentIndex::Cs, 0);
-            cpu.registers.eip = 0;
-            let mut bus = TestBus::with_memory(vec![0x0f, second, 0xc0, 0, 0]);
-            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    InternalFault::Exception {
-                        vector: 6,
-                        error_code: None
-                    }
-                ),
-                "two-byte opcode 0F {second:#04x} must #UD, got {err:?}"
-            );
-        }
+        let second = 0x0au8;
+        assert!(
+            !implemented_two_byte(second),
+            "test bug: 0F {second:#04x} is actually implemented"
+        );
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, second, 0xc0, 0, 0]);
+        let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
+            ),
+            "two-byte opcode 0F {second:#04x} must #UD, got {err:?}"
+        );
     }
 
     #[test]
@@ -23693,29 +23912,24 @@ mod tests {
     fn a12_unimplemented_neighbours_stay_undefined() {
         // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
         // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
-        // the routing so a future edit can't silently capture them. 0F 21/23 (MOV reg,DR / MOV DR,reg)
-        // and 0x63 (ARPL) all #UD (vector 6, no error code) through the split, never a panic. (0F
-        // B2/B4/B5 LSS/LFS/LGS moved OFF this list once implemented -- see the `lss`/`lfs`/`lgs`
-        // tests below.)
-        for code in [
-            &[0x0f, 0x21, 0xc0][..], // MOV EAX, DR0
-            &[0x0f, 0x23, 0xc0][..], // MOV DR0, EAX
-            &[0x63, 0xc0][..],       // ARPL AX, AX
-        ] {
-            let (mut cpu, memory) = real_mode_cpu(code, 0x40);
-            let mut bus = TestBus::with_memory(memory);
-            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    InternalFault::Exception {
-                        vector: 6,
-                        error_code: None
-                    }
-                ),
-                "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
-            );
-        }
+        // the routing so a future edit can't silently capture them. 0x63 (ARPL) #UDs (vector 6, no
+        // error code) through the split, never a panic. (0F B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV
+        // reg,DR / MOV DR,reg moved OFF this list once implemented -- see the `lss`/`lfs`/`lgs` tests
+        // below and the ledger-row-25 `mov_dr*` tests above.)
+        let code = &[0x63, 0xc0][..]; // ARPL AX, AX
+        let (mut cpu, memory) = real_mode_cpu(code, 0x40);
+        let mut bus = TestBus::with_memory(memory);
+        let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                }
+            ),
+            "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
+        );
     }
 
     // ---- PUSH/POP FS/GS (0F A0/A1/A8/A9) ----
