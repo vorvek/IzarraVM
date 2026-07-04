@@ -362,7 +362,8 @@ const CONTROL_RESET: u8 = 0x04;
 struct ChannelState {
     state: YmAdpcmState,
     state_a: YmaAdpcmState,
-    /// The byte whose high nibble was just decoded; the low nibble is pending.
+    /// The second nibble of the byte just fetched (format-dependent order);
+    /// decoded on the next call before another byte is pulled.
     pending_low: Option<i8>,
 }
 
@@ -372,9 +373,9 @@ impl ChannelState {
     }
 }
 
-/// Decode one sample for `ch`: on the high phase pull a byte from `fetch`,
-/// decode its high nibble, and buffer the low nibble for the next call; on the
-/// low phase decode the buffered nibble. Returns None only when a fetch is
+/// Decode one sample for `ch`: on the fetch phase pull a byte from `fetch`,
+/// decode its first nibble (high-first for B/YMZ/A, low-first for AICA), and
+/// buffer the other nibble for the next call. Returns None only when a fetch is
 /// needed and the source yields nothing (DMA/FIFO starved). A free function (not
 /// a method) so the caller can keep the byte source borrowing disjoint from the
 /// channel's predictor fields.
@@ -389,8 +390,15 @@ fn decode_channel(
     let byte = fetch()?;
     let hi = ((byte as i8) >> 4) & 0x0F;
     let lo = (byte as i8) & 0x0F;
-    ch.pending_low = Some(lo);
-    Some(decode_one(format, hi, &mut ch.state, &mut ch.state_a))
+    // AICA packs the LOW nibble first (see decode_aica); the other formats
+    // are high-nibble-first.
+    let (first, second) = if format == AdpcmFormat::Aica {
+        (lo, hi)
+    } else {
+        (hi, lo)
+    };
+    ch.pending_low = Some(second);
+    Some(decode_one(format, first, &mut ch.state, &mut ch.state_a))
 }
 
 /// One Yamaha ADPCM streaming DAC channel.
@@ -744,6 +752,23 @@ mod tests {
     use super::*;
 
     // ---- Codec library: bit-exact anchors against the C reference. ---------
+
+    #[test]
+    fn streaming_aica_decode_matches_the_reference_nibble_order() {
+        // AICA is low-nibble-first (see decode_aica); the live per-channel
+        // streaming decoder must emit the same samples for the same bytes.
+        let bytes = [0x18u8, 0x2F, 0x73, 0xC4];
+        let mut expected = [0i16; 8];
+        decode_aica(&bytes, &mut expected);
+        let mut ch = ChannelState::default();
+        let mut iter = bytes.iter().copied();
+        let mut fetch = || iter.next();
+        for (i, &want) in expected.iter().enumerate() {
+            let got = decode_channel(&mut ch, AdpcmFormat::Aica, &mut fetch)
+                .expect("byte source has data");
+            assert_eq!(got, want, "sample {i} diverges from decode_aica");
+        }
+    }
 
     #[test]
     fn adpcm_b_encoded_silence_round_trips_to_near_zero() {
