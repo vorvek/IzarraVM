@@ -2115,10 +2115,22 @@ impl Cpu386 {
     }
 
     pub fn is_protected_mode(&self) -> bool {
-        // Stack code also uses this as a proxy for the SS B-bit (stack width): real
-        // mode always has a 16-bit stack. Replace with a real SS.B check when 32-bit
-        // protected-mode stacks land.
         self.control.cr0 & CR0_PE != 0
+    }
+
+    /// Whether implicit stack references (PUSH/POP/CALL/RET/interrupts) use the
+    /// full 32-bit ESP or wrap within the 16-bit SP, per the loaded SS descriptor's
+    /// B bit (386 PRM 16.2: "the size of stack pointer ... used by the processor
+    /// for implicit stack references" is controlled by SS.B, independent of
+    /// operand size, gate size, or CS's D bit). Real mode and V86 always load SS
+    /// through `load_segment_real`/`SegmentRegister::real`, which sets
+    /// `default_size_32: false`, so this is 16-bit there too -- one rule covers
+    /// every mode. Backed by the cached `SegmentRegister.default_size_32` field
+    /// (populated from descriptor bit 22 in `descriptor_to_segment`), so this is a
+    /// field read, not a descriptor decode: safe in the push/pop hot path.
+    #[inline]
+    fn stack_is_32bit(&self) -> bool {
+        self.registers.segment(SegmentIndex::Ss).default_size_32
     }
 
     /// True while executing ring-0 protected-mode code that is not a V86 task —
@@ -4983,10 +4995,10 @@ impl Cpu386 {
                     let value = self.pop(bus, operand_size)?;
                     self.write_gpr_sized(index, operand_size, value);
                 }
-                // On a 16-bit stack, POPAD leaves SP advanced but lets the discarded
-                // saved-ESP slot's high half land in ESP[31:16]. Verified against the
-                // 80386 vectors; the register loads above are unaffected.
-                if !self.is_protected_mode() && matches!(operand_size, OperandSize::Dword) {
+                // On a 16-bit stack (SS.B=0), POPAD leaves SP advanced but lets the
+                // discarded saved-ESP slot's high half land in ESP[31:16]. Verified
+                // against the 80386 vectors; the register loads above are unaffected.
+                if !self.stack_is_32bit() && matches!(operand_size, OperandSize::Dword) {
                     let advanced = self.registers.esp();
                     self.registers
                         .set_esp((discarded & 0xffff_0000) | (advanced & 0xffff));
@@ -5087,30 +5099,26 @@ impl Cpu386 {
                     self.push(bus, frame_temp, operand_size)?;
                 }
                 self.write_gpr_sized(5, operand_size, frame_temp);
-                match operand_size {
-                    OperandSize::Word => {
-                        let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                        self.write_gpr16(4, sp);
-                    }
-                    OperandSize::Dword => {
-                        if self.is_protected_mode() {
-                            let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
-                            self.registers.set_esp(esp);
-                        } else {
-                            let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                            self.write_gpr16(4, sp);
-                        }
-                    }
+                // The final allocation is an implicit stack reference (no memory
+                // access here, just the SP/ESP update), so it follows SS.B like
+                // push/pop -- not the operand size.
+                if self.stack_is_32bit() {
+                    let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
+                    self.registers.set_esp(esp);
+                } else {
+                    let sp = self.read_gpr16(4).wrapping_sub(alloc);
+                    self.write_gpr16(4, sp);
                 }
                 Ok(clocks(10))
             }
             0xc9 => {
-                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move follows
-                // the stack width: a 16-bit real-mode stack moves only SP and keeps
-                // ESP[31:16]; a 32-bit stack moves the full ESP. The operand size still
-                // selects BP vs EBP for the popped frame pointer.
+                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move is an
+                // implicit stack reference, so it follows SS.B (a 16-bit stack moves only
+                // SP and keeps ESP[31:16]; a 32-bit stack moves the full ESP) rather than
+                // the operand size. The operand size still selects BP vs EBP for the
+                // popped frame pointer.
                 let frame = self.read_gpr_sized(5, operand_size);
-                if self.is_protected_mode() {
+                if self.stack_is_32bit() {
                     self.write_gpr_sized(4, operand_size, frame);
                 } else {
                     self.write_gpr16(4, frame as u16);
@@ -7787,90 +7795,63 @@ impl Cpu386 {
         value: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
-        match operand_size {
-            OperandSize::Word => {
-                let sp = self.read_gpr16(4).wrapping_sub(2);
-                self.write_gpr16(4, sp);
-                self.write_memory_sized(
-                    bus,
-                    SegmentIndex::Ss,
-                    u32::from(sp),
-                    OperandSize::Word,
-                    value,
-                    BusAccessKind::DataWrite,
-                )
-            }
-            OperandSize::Dword => {
-                if self.is_protected_mode() {
-                    let esp = self.registers.esp().wrapping_sub(4);
-                    self.registers.set_esp(esp);
-                    self.write_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        esp,
-                        OperandSize::Dword,
-                        value,
-                        BusAccessKind::DataWrite,
-                    )
-                } else {
-                    // A real-mode stack is 16 bits: the address comes from SP, only SP
-                    // advances, and ESP[31:16] is preserved. The SS B-bit-accurate
-                    // version arrives with 32-bit protected-mode stacks.
-                    let sp = self.read_gpr16(4).wrapping_sub(4);
-                    self.write_gpr16(4, sp);
-                    self.write_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        u32::from(sp),
-                        OperandSize::Dword,
-                        value,
-                        BusAccessKind::DataWrite,
-                    )
-                }
-            }
+        let width = operand_size.bytes();
+        if self.stack_is_32bit() {
+            // SS.B=1: implicit stack references use the full 32-bit ESP, for both
+            // 16-bit and 32-bit operand-size pushes (386 PRM 16.2: the B bit picks
+            // the stack-pointer width, independent of operand size).
+            let esp = self.registers.esp().wrapping_sub(width);
+            self.registers.set_esp(esp);
+            self.write_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                esp,
+                operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )
+        } else {
+            // SS.B=0 (real mode, V86, or a 16-bit protected-mode stack): the address
+            // comes from SP only, only SP advances, and ESP's high word is preserved
+            // (real silicon wraps SP, not ESP, on this stack).
+            let sp = self.read_gpr16(4).wrapping_sub(width as u16);
+            self.write_gpr16(4, sp);
+            self.write_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                u32::from(sp),
+                operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )
         }
     }
 
     fn pop<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<u32> {
-        match operand_size {
-            OperandSize::Word => {
-                let sp = self.read_gpr16(4);
-                let value = self.read_memory_sized(
-                    bus,
-                    SegmentIndex::Ss,
-                    u32::from(sp),
-                    OperandSize::Word,
-                    BusAccessKind::DataRead,
-                )?;
-                self.write_gpr16(4, sp.wrapping_add(2));
-                Ok(value)
-            }
-            OperandSize::Dword => {
-                if self.is_protected_mode() {
-                    let esp = self.registers.esp();
-                    let value = self.read_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        esp,
-                        OperandSize::Dword,
-                        BusAccessKind::DataRead,
-                    )?;
-                    self.registers.set_esp(esp.wrapping_add(4));
-                    Ok(value)
-                } else {
-                    // Real-mode 16-bit stack: read from SP and advance only SP.
-                    let sp = self.read_gpr16(4);
-                    let value = self.read_memory_sized(
-                        bus,
-                        SegmentIndex::Ss,
-                        u32::from(sp),
-                        OperandSize::Dword,
-                        BusAccessKind::DataRead,
-                    )?;
-                    self.write_gpr16(4, sp.wrapping_add(4));
-                    Ok(value)
-                }
-            }
+        let width = operand_size.bytes();
+        if self.stack_is_32bit() {
+            let esp = self.registers.esp();
+            let value = self.read_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                esp,
+                operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.registers.set_esp(esp.wrapping_add(width));
+            Ok(value)
+        } else {
+            // SS.B=0: read from SP and advance only SP, preserving ESP's high word.
+            let sp = self.read_gpr16(4);
+            let value = self.read_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                u32::from(sp),
+                operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.write_gpr16(4, sp.wrapping_add(width as u16));
+            Ok(value)
         }
     }
 
@@ -8900,10 +8881,10 @@ impl Cpu386 {
 
     fn release_stack(&mut self, count: u16) {
         // The immediate return forms release `count` bytes of arguments after the
-        // pop. The stack pointer width follows the stack, not the operand size: a
-        // real-mode 16-bit stack moves only SP and preserves ESP[31:16]. The SS
-        // B-bit-accurate version arrives with 32-bit protected-mode stacks.
-        if self.is_protected_mode() {
+        // pop. The stack pointer width follows SS.B, not the operand size: a
+        // 16-bit stack (SS.B=0, which includes real mode and V86) moves only SP
+        // and preserves ESP[31:16].
+        if self.stack_is_32bit() {
             let esp = self.registers.esp().wrapping_add(u32::from(count));
             self.registers.set_esp(esp);
         } else {
@@ -15746,6 +15727,121 @@ mod tests {
         cpu.release_stack(4);
 
         assert_eq!(cpu.registers.esp(), 0xbeef_0002);
+    }
+
+    /// Load a protected-mode SS segment register directly (bypassing GDT resolution)
+    /// with the given B bit, for exercising `stack_is_32bit()` in isolation.
+    fn set_protected_ss(cpu: &mut Cpu386, base: u32, default_size_32: bool) {
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x10,
+                base,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32,
+            },
+        );
+    }
+
+    #[test]
+    fn push_dword_on_a_16bit_protected_mode_stack_wraps_sp_and_preserves_high_esp() {
+        // The DOS4GW/VCPI scenario: protected mode, a 32-bit push, but SS.B=0 (a
+        // 16-bit stack segment). Only SP must wrap; ESP[31:16] survives untouched,
+        // and the write lands at SS.base + the wrapped SP, not at SS.base + ESP.
+        let memory = vec![0u8; 0x1_0002];
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, false);
+        cpu.registers.set_esp(0xbeef_0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.push(&mut bus, 0x1122_3344, OperandSize::Dword).unwrap();
+
+        // sp 0x0002 -> wraps to 0xfffe; ESP high half (0xbeef) preserved.
+        assert_eq!(cpu.registers.esp(), 0xbeef_fffe);
+        let read = bus
+            .read_memory_direct(0xfffe, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(read.value, 0x1122_3344);
+    }
+
+    #[test]
+    fn pop_dword_on_a_16bit_protected_mode_stack_wraps_sp_and_preserves_high_esp() {
+        // Mirror of the push case: SS.B=0 in protected mode reads from the wrapped
+        // SP and advances only SP, leaving ESP[31:16] alone.
+        let mut memory = vec![0u8; 0x1_0002];
+        memory[0xfffe..0x1_0002].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, false);
+        cpu.registers.set_esp(0xbeef_fffe);
+        let mut bus = TestBus::with_memory(memory);
+
+        let value = cpu.pop(&mut bus, OperandSize::Dword).unwrap();
+
+        assert_eq!(value, 0x1122_3344);
+        // sp 0xfffe -> +4 wraps to 0x0002; ESP high half preserved.
+        assert_eq!(cpu.registers.esp(), 0xbeef_0002);
+    }
+
+    #[test]
+    fn push_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
+        // SS.B=1 (the TOKAEMM monitor's stack shape): full-ESP arithmetic, no wrap
+        // at the 16-bit boundary, matching today's protected-mode behavior.
+        let memory = vec![0u8; 0x2_0000];
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, true);
+        cpu.registers.set_esp(0x0001_0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.push(&mut bus, 0xaabb_ccdd, OperandSize::Dword).unwrap();
+
+        assert_eq!(cpu.registers.esp(), 0x0000_fffe);
+        let read = bus
+            .read_memory_direct(0x0000_fffe, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(read.value, 0xaabb_ccdd);
+    }
+
+    #[test]
+    fn pop_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
+        let mut memory = vec![0u8; 0x2_0000];
+        memory[0x0000_fffe..0x0001_0002].copy_from_slice(&0xaabb_ccddu32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        set_protected_ss(&mut cpu, 0, true);
+        cpu.registers.set_esp(0x0000_fffe);
+        let mut bus = TestBus::with_memory(memory);
+
+        let value = cpu.pop(&mut bus, OperandSize::Dword).unwrap();
+
+        assert_eq!(value, 0xaabb_ccdd);
+        assert_eq!(cpu.registers.esp(), 0x0001_0002);
+    }
+
+    #[test]
+    fn ss_load_populates_the_cached_b_bit_from_the_descriptor() {
+        // A GDT-resolved SS load must cache B from descriptor bit 22, and a
+        // subsequent real-mode load must clear it back to false.
+        let mut memory = vec![0u8; 4096];
+        // GDT at 0, entry 1 (selector 0x08): base 0, limit 0xfffff (4K gran), B=1
+        // data segment, present, DPL 0. Access byte 0x93 (present, data, r/w).
+        // High dword: limit high nibble 0xf | G=1,D/B=1 -> 0xc0 | 0x0f = 0xcf in bits 16-23,
+        // access in bits 8-15.
+        let low: u32 = 0xffff; // limit low
+        let high: u32 = 0x00cf_9300u32; // G=1,B=1,limit_high=0xf,access=0x93
+        memory[8..12].copy_from_slice(&low.to_le_bytes());
+        memory[12..16].copy_from_slice(&high.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.gdtr.base = 0;
+        cpu.gdtr.limit = 0xffff;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, 0x08).unwrap();
+        assert!(cpu.stack_is_32bit());
+
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        assert!(!cpu.stack_is_32bit());
     }
 
     #[test]
@@ -28681,6 +28777,48 @@ mod tests {
         assert_eq!(rd(28) & 0xffff, 0x1111, "V86 DS");
         assert_eq!(rd(32) & 0xffff, 0x3333, "V86 FS");
         assert_eq!(rd(36) & 0xffff, 0x4444, "V86 GS");
+    }
+
+    #[test]
+    fn deliver_exception_onto_a_16bit_ring0_stack_wraps_sp_and_preserves_high_esp() {
+        // The exact fault scenario this task fixes: a 32-bit interrupt gate delivers
+        // onto a ring-0 stack whose SS descriptor has B=0 (a 16-bit stack segment,
+        // as DOS4GW/VCPI clients use), with ESP0's high word nonzero. The V86
+        // interrupt frame (10 dwords) must be built at SP-wrapped addresses, only SP
+        // advancing, not at raw ESP0 - 40.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // Flip the ring-0 data descriptor's B bit off (byte 6 bit 6 = 0x40) and give
+        // ESP0 a nonzero high word (0x0001) to make a full-ESP-arithmetic bug
+        // visible. Pick an SP just above the 16-bit wrap boundary: SP=0x0010, so
+        // SP-40 wraps to 0xffe8 (SS0.base is 0, identity, so that's also the
+        // physical write address -- real silicon addresses stack references with
+        // SP alone on a 16-bit stack, never combined with ESP's high word). The
+        // ESP *register* value afterward keeps the high word (0x0001_ffe8); a
+        // buggy full-ESP path would instead compute both the address and the
+        // register from 0x0001_0010 - 40 = 0x0000_ffe8, landing the frame at the
+        // same address by coincidence here but reporting the wrong ESP.
+        bus.memory[(GDT + 0x10 + 6) as usize] &= !0x40;
+        put32(&mut bus.memory, TSS + 4, 0x0001_0010);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+        assert!(!cpu.stack_is_32bit(), "the loaded SS0 must carry B=0");
+        assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0001_ffe8,
+            "SP must wrap at the 16-bit boundary, preserving ESP's high word"
+        );
+        // The frame lives at SS0.base (0) + the wrapped 16-bit SP (0xffe8), not at
+        // SS0.base + the reported ESP (which would be 0x1ffe8, well outside this
+        // test's mapped RAM and not where real hardware would have written it).
+        let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, 0xffe8 + o));
+        assert_eq!(rd(0), 0, "error code");
+        assert_eq!(rd(4), 0x10, "V86 EIP");
+        assert_eq!(rd(16), 0x1000, "V86 ESP");
     }
 
     #[test]
