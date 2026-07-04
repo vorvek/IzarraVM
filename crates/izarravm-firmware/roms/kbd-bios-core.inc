@@ -1,3 +1,8 @@
+; The single source for the INT 09h/INT 16h keyboard path. Included by
+; kbd-bios.asm and kbd-resident.asm directly, and by the full Izarra BIOS via
+; izbios-kbd.inc (which supplies these BDA defines from izbios-defs.inc and
+; the layout tables from its own frozen include list, hence both guards).
+%ifndef KB_BUF_START
 %define KB_BUF_START   0x001e      ; BDA: keyboard buffer
 %define KB_BUF_HEAD    0x001a      ; BDA: head pointer (offset into 0x40 seg)
 %define KB_BUF_TAIL    0x001c      ; BDA: tail pointer
@@ -10,6 +15,7 @@
 %define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
 %define KB_ALTGR       0x0098      ; right Alt held
 %define KB_DEAD        0x0099      ; BDA: pending dead-key accent id (0 = none)
+%endif
 
 ; INT 09h: keyboard hardware ISR
 int09:
@@ -598,4 +604,8 @@ kb_enqueue:
 keypad_num_ascii:
     db '7','8','9',0,'4','5','6',0,'1','2','3','0','.'
 
+; The Izarra BIOS pulls kbd-layouts.inc through its own frozen include list
+; (izarra-bios.asm); the standalone keyboard ROMs get it here.
+%ifndef KBD_CORE_OMIT_LAYOUTS
 %include "kbd-layouts.inc"
+%endif
