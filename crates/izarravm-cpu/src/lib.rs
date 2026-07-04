@@ -5080,7 +5080,14 @@ impl Cpu386 {
                 let size = operand_size.bytes();
                 let frame_bp = self.read_gpr_sized(5, operand_size);
                 self.push(bus, frame_bp, operand_size)?;
-                let frame_temp = self.read_gpr_sized(4, operand_size);
+                // frame-ptr <- eSP (386 PRM 17-62): the saved stack pointer is read at
+                // StackAddrSize (SS.B), not the operand size -- on a B=0 stack it is the
+                // 16-bit SP, even for an ENTER with a 32-bit operand size.
+                let frame_temp = if self.stack_is_32bit() {
+                    self.registers.esp()
+                } else {
+                    u32::from(self.read_gpr16(4))
+                };
                 if level > 0 {
                     // Copy the display: the saved frame pointers of the enclosing scopes.
                     let mut bp = self.read_gpr_sized(5, operand_size);
@@ -5112,16 +5119,18 @@ impl Cpu386 {
                 Ok(clocks(10))
             }
             0xc9 => {
-                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move is an
-                // implicit stack reference, so it follows SS.B (a 16-bit stack moves only
-                // SP and keeps ESP[31:16]; a 32-bit stack moves the full ESP) rather than
-                // the operand size. The operand size still selects BP vs EBP for the
-                // popped frame pointer.
-                let frame = self.read_gpr_sized(5, operand_size);
+                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop (386 PRM 17-96). Both the
+                // read of BP/EBP and the write to SP/ESP are keyed on SS.B, not operand
+                // size: a B=1 stack moves the FULL EBP into the FULL ESP even for a
+                // 16-bit operand size (StackAddrSize=32 => ESP <- EBP, no truncation);
+                // a B=0 stack moves only BP into SP and leaves ESP's high word alone.
+                // The operand size only selects BP vs EBP for the popped frame pointer.
                 if self.stack_is_32bit() {
-                    self.write_gpr_sized(4, operand_size, frame);
+                    let frame = self.read_gpr32(5);
+                    self.registers.set_esp(frame);
                 } else {
-                    self.write_gpr16(4, frame as u16);
+                    let frame = self.read_gpr16(5);
+                    self.write_gpr16(4, frame);
                 }
                 let saved = self.pop(bus, operand_size)?;
                 self.write_gpr_sized(5, operand_size, saved);
@@ -9031,14 +9040,27 @@ impl Cpu386 {
         if !conforming && target_dpl < cpl {
             // Inter-privilege call: copy parameters off the outer stack, switch to the
             // inner stack from the TSS, then rebuild the frame there.
+            //
+            // The outer stack's top is SS:SP, per the old SS's own B bit (386 PRM
+            // 17-42): a B=0 outer stack wraps the per-slot offset within 16 bits and
+            // leaves ESP's high word alone, rather than adding into the full ESP. This
+            // matters for the DOS4GW/VCPI case: a 32-bit call gate onto a B=0 outer
+            // stack with nonzero ESP[31:16] must still read params at the wrapped SP.
             let mut params = [0u32; 32];
             let psize = op.bytes();
             let outer_esp = self.registers.esp();
+            let outer_stack_32 = self.stack_is_32bit();
             for (k, slot) in params.iter_mut().enumerate().take(param_count) {
+                let offset = k as u32 * psize;
+                let addr = if outer_stack_32 {
+                    outer_esp.wrapping_add(offset)
+                } else {
+                    u32::from((outer_esp as u16).wrapping_add(offset as u16))
+                };
                 *slot = self.read_memory_sized(
                     bus,
                     SegmentIndex::Ss,
-                    outer_esp + k as u32 * psize,
+                    addr,
                     op,
                     BusAccessKind::DataRead,
                 )?;
@@ -15842,6 +15864,101 @@ mod tests {
 
         cpu.load_segment_real(SegmentIndex::Ss, 0);
         assert!(!cpu.stack_is_32bit());
+    }
+
+    /// A flat protected-mode CPU with code at linear 0, CS.D from `code_d32`, and SS.B
+    /// from `stack_b32` -- for exercising ENTER/LEAVE's SS.B-vs-operand-size split.
+    fn protected_cpu_with_cs_d_and_ss_b(
+        code: &[u8],
+        mem_len: usize,
+        code_d32: bool,
+        stack_b32: bool,
+    ) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; mem_len];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x08,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: code_d32,
+            },
+        );
+        set_protected_ss(&mut cpu, 0, stack_b32);
+        cpu.registers.eip = 0;
+        (cpu, memory)
+    }
+
+    #[test]
+    fn leave_on_a_32bit_stack_moves_full_esp_even_with_a_16bit_operand_size() {
+        // LEAVE with a 0x66 operand-size prefix (word EBP/BP pop) on an SS.B=1 stack.
+        // Per PRM 17-96, StackAddrSize=32 => ESP <- EBP unconditionally: the full
+        // register, not the low word, regardless of the operand size. EBP carries a
+        // high word (0x0002) distinct from ESP's stale high word (0xdead) that must
+        // land in ESP whole; a truncating write would leave ESP's stale 0xdead high
+        // half instead of EBP's 0x0002.
+        let (mut cpu, memory) =
+            protected_cpu_with_cs_d_and_ss_b(&[0x66, 0xc9], 0x3_0000, true, true);
+        cpu.write_gpr32(5, 0x0002_0100); // EBP
+        cpu.registers.set_esp(0xdead_0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0002_0100 + 2,
+            "ESP <- full EBP, then +2 from the 16-bit pop"
+        );
+    }
+
+    #[test]
+    fn leave_on_a_16bit_stack_moves_only_sp_and_preserves_high_esp() {
+        // Mirror on an SS.B=0 stack (real mode's rule, still true in protected mode):
+        // only SP takes BP's value; ESP's high word is untouched.
+        let (mut cpu, memory) = protected_cpu_with_cs_d_and_ss_b(&[0xc9], 0x1_0000, false, false);
+        cpu.write_gpr16(5, 0x0200); // BP
+        cpu.registers.set_esp(0xbeef_0080);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // SP <- 0x0200, then +2 from the pop = 0x0202; high half preserved.
+        assert_eq!(cpu.registers.esp(), 0xbeef_0202);
+    }
+
+    #[test]
+    fn enter_op32_on_a_16bit_stack_saves_frame_ptr_from_sp_not_esp() {
+        // ENTER imm16,1 (op32) on an SS.B=0 stack: frame-ptr <- eSP is the 16-bit SP
+        // (386 PRM 17-62), not the full (garbage-laden) ESP. With nesting level 1 the
+        // frame-ptr is pushed once more, so the pushed dword must carry the wrapped SP
+        // zero-extended, not ESP's high garbage.
+        let (mut cpu, memory) =
+            protected_cpu_with_cs_d_and_ss_b(&[0xc8, 0x04, 0x00, 0x01], 0x1_0000, true, false);
+        cpu.registers.set_esp(0xbeef_0100);
+        cpu.write_gpr32(5, 0); // EBP, arbitrary
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // Push(EBP) at SP 0x0100 -> SP=0x00fc; frame-ptr = SP = 0x00fc (not
+        // 0xbeef_00fc); level>0 so frame-ptr is pushed again at SP=0x00f8; final
+        // alloc SP -= 4 = 0x00f4. High half of ESP preserved throughout.
+        let frame_ptr_slot = u32::from_le_bytes(bus.memory[0xf8..0xfc].try_into().unwrap());
+        assert_eq!(
+            frame_ptr_slot, 0x00fc,
+            "pushed frame-ptr is the 16-bit SP, zero-extended, not ESP-high garbage"
+        );
+        assert_eq!(cpu.registers.esp(), 0xbeef_00f4);
+        assert_eq!(
+            cpu.read_gpr32(5),
+            0x00fc,
+            "EBP <- frame-ptr (zero-extended)"
+        );
     }
 
     #[test]
@@ -23281,6 +23398,67 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(bus.memory[0xe0..0xe4].try_into().unwrap()),
             0x1111
+        );
+    }
+
+    #[test]
+    fn call_gate_inter_privilege_reads_params_from_a_16bit_outer_stack_with_esp_high_garbage() {
+        // The DOS4GW/VCPI scenario: the outer (caller's) stack is SS.B=0 with garbage
+        // in ESP's high word. Per PRM 17-42 the old stack's top is SS:SP -- the param
+        // read must use the wrapped 16-bit SP, not outer_esp + k*psize on the full
+        // (garbage-laden) ESP, which would read from a bogus linear address entirely
+        // outside the intended stack page.
+        let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+        let gate_dpl1 = (0x30u16, 0x0008_0040, 0x0000_ec01); // DPL3 386 gate, 1 param
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(
+            &[0x9a, 0x00, 0x00, 0x30, 0x00],
+            &[RING0_CODE, ring0_data, gate_dpl1],
+        );
+        memory.resize(0x1_0004, 0);
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x1b,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xfb,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x23,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xf3,
+                default_size_32: false, // SS.B=0: the outer stack is 16-bit.
+            },
+        );
+        // SP = 0xfffe, but ESP's high word carries garbage that a full-ESP add would
+        // corrupt into a wrong linear address entirely -- the wrapped SP is the only
+        // correct read point. The single param sits at SP=0xfffe, well clear of the
+        // 5-byte CALL instruction at offset 0.
+        cpu.registers.set_esp(0xbeef_fffe);
+        cpu.cpl = 3;
+        memory[0xfffe..0x1_0002].copy_from_slice(&0x1111u32.to_le_bytes());
+        cpu.tr.base = 0x300;
+        memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
+        memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x08, "entered ring-0 code");
+        assert_eq!(cpu.registers.eip, 0x40);
+        // Frame on the new stack: return CS:EIP + old SS:ESP + 1 param = 5 dwords.
+        assert_eq!(cpu.registers.esp(), 0xf0 - 20);
+        // The param, pushed just above the return frame, must be the value at the
+        // wrapped SP 0xfffe, not whatever garbage a full-ESP read would have hit.
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0xe4..0xe8].try_into().unwrap()),
+            0x1111,
+            "param read from the wrapped SP, not full-ESP garbage"
         );
     }
 
