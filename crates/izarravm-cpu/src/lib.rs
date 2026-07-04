@@ -13386,6 +13386,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
+        // 386 PRM 5-24 / 15-6: a V86 task always executes at CPL 3, so paging
+        // privilege (PRM ch5's U/S check) must classify every V86 access as user --
+        // independent of the V86 CS selector's low two bits, which are NOT an RPL (a
+        // V86 CS is a real-mode-style segment, not a descriptor selector; see
+        // `current_privilege_level`'s doc comment). A monitor that maps its own
+        // pages supervisor-only (U/S=0) must be unreachable from V86 even when the
+        // guest's CS happens to read a multiple of 4 (RPL bits 00).
+        //
+        // Same page tables as `user_mode_paging_respects_the_supervisor_bit`: PD at
+        // 0x1000, PT at 0x2000, linear 0x3000 -> present/writable/supervisor-only
+        // frame 0x5000.
+        let mut memory = vec![0; 0x6000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE: PT, present+rw+user
+        memory[0x200c..0x2010].copy_from_slice(&0x0000_5003u32.to_le_bytes()); // PTE[3]: frame, present+rw, U/S=0
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        let mut bus = TestBus::with_memory(memory);
+
+        // Enter V86 with a real-mode-style CS whose low bits are 0, not 3 -- the
+        // exact case a live `CS.selector & 3` formula would misclassify as
+        // supervisor. `current_privilege_level` must still answer 3 here because
+        // `self.cpl` is the transition-pinned cache, not a live read of CS.
+        cpu.registers.eflags |= FLAG_VM;
+        cpu.load_segment_real(SegmentIndex::Cs, 0xF000); // selector low bits == 0b00
+        cpu.cpl = 3; // what every real V86 transition (IRET/task-switch) sets
+        assert!(cpu.is_v86_mode());
+        assert_eq!(
+            cpu.registers.cs().selector & 3,
+            0,
+            "CS RPL bits are 00, not 11"
+        );
+
+        let faulted = cpu.translate_linear(&mut bus, 0x3000, false);
+        assert!(
+            matches!(
+                faulted,
+                Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(0x5)
+                })
+            ),
+            "a V86 access to a supervisor-only page must #PF like any other user access: {faulted:?}"
+        );
+        assert_eq!(cpu.control.cr2, 0x3000);
+
+        // Same V86 task, a user-accessible page (frame 0x4000 via PTE[2], U/S=1):
+        // translation succeeds, proving the fault above was the supervisor bit and
+        // not some unrelated V86 restriction.
+        let mut memory = bus.memory;
+        memory[0x2008..0x200c].copy_from_slice(&0x0000_4007u32.to_le_bytes());
+        bus = TestBus::with_memory(memory);
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x2000, false).unwrap(),
+            0x4000
+        );
+    }
+
     // Paged-mode fetch throughput; the case the TLB targets. Run with:
     // cargo test --release -p izarravm-cpu -- --ignored --nocapture tlb_paged
     #[test]
