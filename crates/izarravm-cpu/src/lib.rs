@@ -188,6 +188,14 @@ pub enum CpuError {
     IdtLimit { vector: u8 },
     #[error("divide error (#DE): divide by zero or quotient overflow")]
     DivideError,
+    #[error(
+        "nested fault delivering vector {original_vector}: vector {nested_vector} \
+         raised while building the exception frame"
+    )]
+    NestedFaultDuringDelivery {
+        original_vector: u8,
+        nested_vector: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1084,6 +1092,18 @@ pub struct Cpu386 {
     /// method for the chokepoint inventory). `Default`/`reset` leave it `false`, matching
     /// the reset images (CR0 without AM, EFLAGS 0x2); `Clone` copies it consistently.
     alignment_armed: bool,
+    /// Current privilege level. Per the 386 PRM, CPL is a *cached* quantity carried in
+    /// (the hidden part of) CS, updated only at defined transition points -- it is not a
+    /// live formula over the current CS selector. Updated at: real mode / PE clear (0);
+    /// far JMP/CALL/RETF/IRET same- and inter-privilege transfers; call/task gates and
+    /// `task_switch` (to the target DPL); IRET-into-V86 (3); `deliver_exception` (to the
+    /// gate's target level, before the frame-push sequence begins -- see that function);
+    /// SYSCALL/SYSRET; reset (0). `current_privilege_level` returns this field directly;
+    /// see that method for why a live `CS.selector & 3` read is wrong during exception
+    /// delivery out of a V86 source (the source CS can carry arbitrary low bits before
+    /// the frame's own CS is loaded, which must not be mistaken for the CPL the pushes
+    /// execute under).
+    cpl: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2441,17 +2461,26 @@ impl Cpu386 {
         Ok(())
     }
 
-    /// Current privilege level. The CPL lives in the low two bits of the CS selector. Real
-    /// mode has no protection rings, so it is always CPL 0 there; a V86 task is always
-    /// CPL 3; otherwise protected mode can run at a lower privilege.
+    /// Current privilege level. Per the 386 PRM this is a *cached* quantity (`self.cpl`),
+    /// not a live read of `CS.selector & 3`: during exception delivery out of a V86 source,
+    /// the ring-0 stack pushes happen before the handler's own CS is loaded, so a live
+    /// formula would derive "user" from whatever RPL bits the *source* V86 CS happened to
+    /// carry (arbitrary, since V86 CS is a real-mode-style segment) instead of the level
+    /// the pushes actually execute at. See `deliver_exception` for the write-before-push
+    /// ordering that makes this correct.
+    ///
+    /// The debug assert cross-checks the cache against the historical live formula in the
+    /// two cases where they must always agree (real mode and V86, both fixed points); it is
+    /// intentionally NOT checked in protected non-V86 mode, where mid-instruction sequences
+    /// (like `deliver_exception`'s push sequence) transiently hold `self.cpl` at the target
+    /// level while `CS.selector` still names the source segment.
     fn current_privilege_level(&self) -> u8 {
-        if self.is_v86_mode() {
-            3
-        } else if self.is_protected_mode() {
-            (self.registers.cs().selector & 3) as u8
-        } else {
-            0
+        if !self.is_protected_mode() {
+            debug_assert_eq!(self.cpl, 0, "real mode is always CPL 0");
+        } else if self.is_v86_mode() {
+            debug_assert_eq!(self.cpl, 3, "a V86 task is always CPL 3");
         }
+        self.cpl
     }
 
     /// True when CS points into the BIOS ROM: the real-mode F-segment aperture
@@ -2528,7 +2557,17 @@ impl Cpu386 {
                 self.hardware_interrupt(bus, vector)
                     .map_err(|fault| match fault {
                         InternalFault::Cpu(error) => error,
-                        InternalFault::Exception { vector, .. } => CpuError::IdtLimit { vector },
+                        // A fault raised while `hardware_interrupt` (which calls
+                        // `deliver_exception`) was building the IRQ's own frame is a
+                        // genuinely nested fault, not an IDT-limit violation on `vector`
+                        // itself -- report it truthfully instead of relabeling it.
+                        InternalFault::Exception {
+                            vector: nested_vector,
+                            ..
+                        } => CpuError::NestedFaultDuringDelivery {
+                            original_vector: vector,
+                            nested_vector,
+                        },
                     })?;
                 let charged = self.scale_clocks(61);
                 self.elapsed_clocks += charged;
@@ -2617,7 +2656,16 @@ impl Cpu386 {
                 self.deliver_exception(bus, vector, error_code, false)
                     .map_err(|fault| match fault {
                         InternalFault::Cpu(error) => error,
-                        InternalFault::Exception { vector, .. } => CpuError::IdtLimit { vector },
+                        // As above: a fault raised while building `vector`'s own frame
+                        // (e.g. the ring-0 stack access that was the actual dossier bug)
+                        // is a nested fault, not an IDT-limit violation on `vector`.
+                        InternalFault::Exception {
+                            vector: nested_vector,
+                            ..
+                        } => CpuError::NestedFaultDuringDelivery {
+                            original_vector: vector,
+                            nested_vector,
+                        },
                     })?;
                 CycleOutcome {
                     core_clocks: 59,
@@ -5996,6 +6044,10 @@ impl Cpu386 {
                             self.control.cr0 = cr0;
                             self.recompute_alignment_armed();
                             self.flush_tlb_and_code_caches();
+                            // LMSW can only set PE (never clear it, masked out of
+                            // `switchable` above), and require_cpl0 above already forced
+                            // cpl == 0 -- entering protected mode this way starts at ring 0
+                            // per the PRM, and cpl was already 0, so no assignment needed.
                         }
                         Ok(clocks(3))
                     }
@@ -7578,9 +7630,12 @@ impl Cpu386 {
         // system-structure access is forced supervisor regardless of the current
         // CPL (see `translate_linear_system`).
         let user = match accessor {
-            PagingAccessor::Current => {
-                self.is_protected_mode() && (self.registers.cs().selector & 3) == 3
-            }
+            // CPL is the cached quantity (`current_privilege_level`/`self.cpl`), not a live
+            // read of CS.selector -- see that method for why a live formula misclassifies
+            // the monitor's own ring-0 stack pushes as user during V86-source exception
+            // delivery (source CS's RPL bits are irrelevant once cpl has already been set
+            // to the entered level).
+            PagingAccessor::Current => self.current_privilege_level() == 3,
             PagingAccessor::Supervisor => false,
         };
         // CR0.WP (a 486 addition) makes supervisor writes obey the page R/W bit too.
@@ -8494,8 +8549,21 @@ impl Cpu386 {
         let (_tl, th) = self.read_transfer_descriptor(bus, selector)?;
         let target_access = (th >> 8) & 0xff;
         let target_dpl = ((target_access >> 5) & 3) as u8;
+        let crosses_ring = source_v86 || target_dpl < cpl;
 
-        if source_v86 || target_dpl < cpl {
+        // PRM transition point, and the actual fix this field exists for: the entered
+        // level is set here, BEFORE the frame-push sequence begins, not after CS is
+        // loaded at the end of this function. Every push below (the outer SS:ESP, the
+        // V86 data segments, EFLAGS/CS/EIP, the error code) must execute as the level
+        // the handler is entering, not as whatever the source CS's selector bits say --
+        // for a V86 source those bits are the guest's own real-mode-style CS (arbitrary
+        // low bits, e.g. the DOS HMA stub at 0xFFFF) and are never the CPL the monitor's
+        // own stack accesses run under. Setting the cache here, ahead of `push`, is what
+        // makes `translate_linear_checked`'s `PagingAccessor::Current` classify these
+        // pushes as supervisor instead of spuriously faulting them as user.
+        self.cpl = if crosses_ring { target_dpl } else { cpl };
+
+        if crosses_ring {
             // Inter-privilege entry: load the inner stack from the TSS, then push the
             // outer SS:ESP so IRET can restore it. For a V86 source the four data
             // segments are pushed above SS:ESP (the V86 interrupt frame) and the CPU
@@ -8627,6 +8695,18 @@ impl Cpu386 {
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.set_eip(ip & 0xffff);
                 self.load_flags(flags, OperandSize::Word);
+                // The 16-bit form only implements a same-privilege / real-mode / V86
+                // return (no inter-privilege stack pop); the target level is exactly the
+                // just-loaded CS's RPL, or 3 if that load landed in V86 -- but real mode
+                // is unconditionally CPL 0 regardless of the selector's low bits (a real-
+                // mode CS is not a descriptor selector, so those bits carry no RPL).
+                self.cpl = if !self.is_protected_mode() {
+                    0
+                } else if self.is_v86_mode() {
+                    3
+                } else {
+                    (cs & 3) as u8
+                };
             }
             OperandSize::Dword => {
                 let esp_before = self.registers.esp();
@@ -8675,6 +8755,8 @@ impl Cpu386 {
                     self.load_segment_real(SegmentIndex::Gs, gs);
                     self.set_eip(eip);
                     self.registers.set_esp(esp);
+                    // PRM transition point: IRET-into-V86 always lands at CPL 3.
+                    self.cpl = 3;
                     return Ok(());
                 }
 
@@ -8689,6 +8771,9 @@ impl Cpu386 {
                     self.set_eip(eip);
                     self.registers.set_esp(esp);
                     self.load_flags(flags, OperandSize::Dword);
+                    // PRM transition point: the target RPL (checked above, non-V86) is the
+                    // new CPL.
+                    self.cpl = (cs & 3) as u8;
                     return Ok(());
                 }
 
@@ -8725,6 +8810,18 @@ impl Cpu386 {
         self.push(bus, self.registers.eip, operand_size)?;
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset & operand_size.mask());
+        // No DPL/CPL check is enforced on this direct (non-gate) path today (a
+        // pre-existing limitation, out of scope here); the cache just tracks whatever
+        // level the load landed at, matching the historical live formula exactly. Real
+        // mode is unconditionally CPL 0 -- a real-mode CS is not a descriptor selector,
+        // so its low bits carry no RPL and must not leak into the cache.
+        self.cpl = if !self.is_protected_mode() {
+            0
+        } else if self.is_v86_mode() {
+            3
+        } else {
+            (selector & 3) as u8
+        };
         Ok(())
     }
 
@@ -8735,6 +8832,17 @@ impl Cpu386 {
         let selector = self.pop(bus, operand_size)? as u16;
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset & operand_size.mask());
+        // RETF here only implements a same-privilege return (no ring-crossing SS:ESP
+        // pop, a pre-existing limitation out of scope); the cache tracks the loaded
+        // CS's RPL, or 3 if this landed back in V86 -- real mode forces CPL 0 (see
+        // `far_call`'s comment on why the selector's low bits don't apply there).
+        self.cpl = if !self.is_protected_mode() {
+            0
+        } else if self.is_v86_mode() {
+            3
+        } else {
+            (selector & 3) as u8
+        };
         Ok(())
     }
 
@@ -8768,6 +8876,16 @@ impl Cpu386 {
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset & operand_size.mask());
+        // Direct (non-gate) JMP: no DPL check enforced today (pre-existing limitation,
+        // out of scope); the cache tracks the loaded CS's RPL / V86. Real mode forces
+        // CPL 0 (see `far_call`'s comment on why the selector's low bits don't apply).
+        self.cpl = if !self.is_protected_mode() {
+            0
+        } else if self.is_v86_mode() {
+            3
+        } else {
+            (selector & 3) as u8
+        };
         Ok(())
     }
 
@@ -8893,6 +9011,10 @@ impl Cpu386 {
                 )?;
             }
             let (old_ss, old_esp) = self.switch_to_inner_stack(bus, target_dpl)?;
+            // PRM transition point: the call gate crosses to the inner ring here, before
+            // the return frame is built on the new stack -- the pushes below execute at
+            // the target level, not the caller's.
+            self.cpl = target_dpl;
             self.push(bus, u32::from(old_ss), op)?;
             self.push(bus, old_esp, op)?;
             for k in (0..param_count).rev() {
@@ -9084,6 +9206,17 @@ impl Cpu386 {
                 );
             } else {
                 self.load_segment(bus, *segment, selector)?;
+            }
+            if *segment == SegmentIndex::Cs {
+                // PRM transition point: a hardware task switch can land the incoming task
+                // in V86 (eflags.VM loaded above) or in an arbitrary protected-mode ring
+                // named by the incoming CS's RPL. Set the cache from the just-loaded state,
+                // the same rule `current_privilege_level` used to compute live.
+                self.cpl = if self.is_v86_mode() {
+                    3
+                } else {
+                    (selector & 3) as u8
+                };
             }
         }
         Ok(())
@@ -11837,6 +11970,8 @@ impl Cpu386 {
             SegmentIndex::Ss,
             SegmentRegister::flat(cs_sel.wrapping_add(8), 0x93),
         );
+        // PRM transition point: SYSCALL always enters at CPL 0.
+        self.cpl = 0;
         Ok(clocks(10))
     }
 
@@ -11867,6 +12002,17 @@ impl Cpu386 {
         self.invalidate_code_caches();
         self.registers
             .set_segment(SegmentIndex::Ss, SegmentRegister::flat(ss_sel, 0xf3));
+        // PRM transition point: SYSRET returns to CPL 3 -- but only in protected mode.
+        // SYSRET has "no privilege or mode checks" (see `syscall`'s doc comment) and can
+        // fire from real mode, where it loads a flat CS whose low bits happen to read 3
+        // without CR0.PE ever being touched; real mode has no ring concept, and the
+        // historical live formula (`current_privilege_level`'s old body) always answered
+        // 0 there regardless of CS's selector bits. Setting the cache to 3 unconditionally
+        // here would leak a false CPL-3 reading into whatever comes next while still in
+        // real mode; gate on `is_protected_mode()` so the cache matches that formula.
+        if self.is_protected_mode() {
+            self.cpl = 3;
+        }
         Ok(clocks(10))
     }
 
@@ -13004,6 +13150,7 @@ mod tests {
         // CPL 3: a user read of the supervisor page faults with #PF, error code
         // present|user (0b101 = 0x5), and cr2 set to the faulting linear address.
         cpu.registers.set_segment(SegmentIndex::Cs, flat_cs(0x0003));
+        cpu.cpl = 3; // this test flips CS directly, so seed the cached CPL to match
         let faulted = cpu.translate_linear(&mut bus, 0x3000, false);
         assert!(
             matches!(
@@ -13019,6 +13166,7 @@ mod tests {
 
         // CPL 0: a 386 has no CR0.WP, so supervisor reaches the same page fine.
         cpu.registers.set_segment(SegmentIndex::Cs, flat_cs(0x0000));
+        cpu.cpl = 0;
         assert_eq!(
             cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
             0x5000
@@ -17278,6 +17426,7 @@ mod tests {
             },
         );
         cpu.registers.eip = 0;
+        cpu.cpl = 3;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x08, 0, 0]);
 
         let result = exec_one_split(&mut cpu, &mut bus);
@@ -17310,6 +17459,7 @@ mod tests {
             },
         );
         cpu.registers.eip = 0;
+        cpu.cpl = 3;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x09, 0, 0]);
 
         let result = exec_one_split(&mut cpu, &mut bus);
@@ -17372,6 +17522,7 @@ mod tests {
             },
         );
         cpu.registers.eip = 0;
+        cpu.cpl = 3;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0x3e, 0x40, 0x00, 0, 0, 0]);
 
         // INVLPG (0F 01 /7) is converted to the decode/execute split (task A12); run it through the
@@ -17824,6 +17975,7 @@ mod tests {
             },
         );
         cpu.registers.eip = 0;
+        cpu.cpl = 3;
         (cpu, TestBus::with_memory(memory))
     }
 
@@ -17885,6 +18037,7 @@ mod tests {
         let mut ds = cpu.registers.segment(SegmentIndex::Ds);
         ds.selector = 0x0000;
         cpu.registers.set_segment(SegmentIndex::Ds, ds);
+        cpu.cpl = 0; // dropped CS's RPL to 0 above; seed the cached CPL to match
 
         assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
     }
@@ -18064,6 +18217,9 @@ mod tests {
             },
         );
         cpu.registers.eip = 0;
+        // This helper builds CPL-3 state directly (no transfer instruction runs), so the
+        // cached `cpl` must be seeded to match the CS RPL it just installed by hand.
+        cpu.cpl = 3;
         (cpu, TestBus::with_memory(memory))
     }
 
@@ -22748,6 +22904,7 @@ mod tests {
             },
         );
         cpu.registers.set_esp(0xc0);
+        cpu.cpl = 3; // this test sets CS/SS directly, so seed the cached CPL to match
         // Two parameters on the outer stack.
         memory[0xc0..0xc4].copy_from_slice(&0x1111u32.to_le_bytes());
         memory[0xc4..0xc8].copy_from_slice(&0x2222u32.to_le_bytes());
@@ -22776,6 +22933,142 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(bus.memory[0xe0..0xe4].try_into().unwrap()),
             0x1111
+        );
+    }
+
+    // ---- CPL transition unit tests (the `cpl` field, one per PRM transition-point
+    // class named in the VCPI substrate fix). Each drives a real transfer through
+    // `cycle`/`deliver_exception`/`iret` and asserts `current_privilege_level()`
+    // lands where the PRM says, not merely that a CS selector's low bits look right.
+
+    #[test]
+    fn cpl_transition_call_gate_inter_privilege_call_lowers_cpl_to_target_dpl() {
+        // Reuses the exact fixture from `call_gate_inter_privilege_switches_stack`:
+        // a ring-3 caller through a DPL-3 gate into ring-0 code. The cached CPL must
+        // read 0 once inside the gate's target, not just the CS selector's RPL.
+        let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+        let gate_dpl3 = (0x30u16, 0x0008_0040, 0x0000_ec02);
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(
+            &[0x9a, 0x00, 0x00, 0x30, 0x00],
+            &[RING0_CODE, ring0_data, gate_dpl3],
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x1b,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xfb,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x23,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xf3,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_esp(0xc0);
+        cpu.cpl = 3;
+        cpu.tr.base = 0x300;
+        memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
+        memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+
+        assert_eq!(cpu.current_privilege_level(), 3, "starts at CPL 3");
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.current_privilege_level(),
+            0,
+            "the call gate's target DPL (0) is the new CPL"
+        );
+    }
+
+    #[test]
+    fn cpl_transition_far_jmp_direct_tracks_the_loaded_cs_rpl() {
+        // A direct (non-gate) far JMP to a flat code segment: no privilege check is
+        // enforced on this path today, but the cached CPL must still track whatever
+        // CS RPL the jump landed on (same live-formula answer as before, just cached).
+        let target = (0x20u16, 0x0000_ffff, 0x00cf_fb00); // DPL 3 code segment
+        let (mut cpu, memory) = protected_cpu_with_gdt(
+            &[0xea, 0x00, 0x00, 0x23, 0x00], // JMP FAR 0x23:0 (RPL 3)
+            &[RING0_CODE, target],
+        );
+        let mut bus = TestBus::with_memory(memory);
+        assert_eq!(cpu.current_privilege_level(), 0, "starts at CPL 0");
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.cs().selector & 3, 3);
+        assert_eq!(
+            cpu.current_privilege_level(),
+            3,
+            "direct far JMP's cached CPL follows the loaded CS RPL"
+        );
+    }
+
+    #[test]
+    fn cpl_transition_iret_into_v86_forces_cpl_3() {
+        // A ring-0 IRET whose popped EFLAGS carries VM=1 always lands at CPL 3,
+        // regardless of the popped V86 CS's arbitrary selector bits.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        cpu.registers.eflags = 0x2; // ring 0, no VM
+        cpu.cpl = 0;
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        // 0x9000 is unused by `v86_world`'s memory map (PD/PT/GDT/IDT/TSS/ESP0/monitor
+        // code all sit below it, guest code at 0xA000 above); avoids clobbering the
+        // paging structures the way writing at 0x1000 (the PD itself) would.
+        cpu.registers.set_esp(0x9000);
+        // Build the V86-return IRET frame by hand: EIP, CS(0xFFFF, arbitrary low
+        // bits), EFLAGS(VM=1), ESP, SS, ES, DS, FS, GS.
+        // Lay out the frame in ascending-address (pop) order: IRET pops EIP, CS,
+        // EFLAGS, then (VM=1 detected) ESP, SS, ES, DS, FS, GS.
+        let mut write = |offset: u32, v: u32| {
+            put32(&mut bus.memory, 0x9000 + offset, v);
+        };
+        write(0, 0x10); // EIP
+        write(4, 0xffff); // CS (RPL bits arbitrary/irrelevant)
+        write(8, FLAG_VM | 0x2); // EFLAGS
+        write(12, 0x2000); // ESP
+        write(16, 0x0900); // SS
+        write(20, 0x1111); // ES
+        write(24, 0x2222); // DS
+        write(28, 0x3333); // FS
+        write(32, 0x4444); // GS
+
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+
+        assert!(cpu.is_v86_mode(), "returned into V86");
+        assert_eq!(
+            cpu.current_privilege_level(),
+            3,
+            "IRET-into-V86 always forces CPL 3"
+        );
+    }
+
+    #[test]
+    fn cpl_transition_pe_clear_resets_cpl_to_zero() {
+        // MOV CR0, EAX clearing PE (require_cpl0-gated, so CPL was already 0): the
+        // cache must stay 0 across the real-mode transition, matching real mode's
+        // fixed CPL 0.
+        let mut memory = vec![0u8; 16];
+        memory[..3].copy_from_slice(&[0x0f, 0x22, 0xc0]); // MOV CR0, EAX
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0); // clears PE
+        let mut bus = TestBus::with_memory(memory);
+
+        assert_eq!(cpu.current_privilege_level(), 0);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(!cpu.is_protected_mode(), "PE cleared");
+        assert_eq!(
+            cpu.current_privilege_level(),
+            0,
+            "real mode is always CPL 0"
         );
     }
 
@@ -27969,6 +28262,10 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Es, 0x0A00);
         cpu.load_segment_real(SegmentIndex::Fs, 0);
         cpu.load_segment_real(SegmentIndex::Gs, 0);
+        // This helper sets EFLAGS.VM directly (no IRET/task-switch transition runs), so
+        // the cached `cpl` must be seeded to the fixed V86 level by hand, same as a real
+        // transition would leave it.
+        cpu.cpl = 3;
     }
 
     #[test]
@@ -28307,6 +28604,96 @@ mod tests {
         // re-reads and `set_tss_busy`'s GDT access-byte patch land on the alias.
         let d = descriptor(ALIAS_BASE + TSS, tss_limit, 0x89, 0x00);
         bus.memory[(GDT + 0x18) as usize..(GDT + 0x18) as usize + 8].copy_from_slice(&d);
+    }
+
+    #[test]
+    fn deliver_exception_from_v86_with_cs_rpl3_does_not_fault_the_monitors_own_pushes() {
+        // Dossier reproduction: a V86 source whose CS selector carries RPL bits == 3
+        // (the DOS HMA stub lives at 0xFFFF, reached via an XMS chain-through) must not
+        // make `deliver_exception`'s own ring-0 stack pushes look like a user access.
+        // Before the fix, `current_privilege_level` derived "user" live from
+        // `CS.selector & 3` -- read at the moment of the push, i.e. still the V86
+        // source's arbitrary CS -- so a supervisor-only ESP0 page spuriously #PF'd on
+        // the monitor's own frame-push, with CR2 landing on the stack pointer itself.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // The frame's pushes land BELOW ESP0 (0x7000), on page 6 (0x6000..0x6FFF), not
+        // ESP0's own page: make that page supervisor-only (present+rw, U/S=0, dropping
+        // the 0x4 user bit `v86_world` sets by default).
+        put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x3);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+        // Load a V86 CS whose low bits are 3 -- a real-mode-style segment, so this is
+        // legal V86 state, just an unusual selector value (0xFFFF, the HMA stub).
+        cpu.load_segment_real(SegmentIndex::Cs, 0xffff);
+
+        let result = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+
+        assert!(
+            result.is_ok(),
+            "the monitor's own supervisor-stack pushes must not spuriously #PF: {result:?}"
+        );
+        assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ss).selector,
+            R0_SS,
+            "entry crossed to the ring-0 stack despite the V86 source CS's RPL bits"
+        );
+    }
+
+    #[test]
+    fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
+        // Companion to the reproduction above: when delivery genuinely nests a fault
+        // (here, ESP0's page is marked NOT PRESENT, so the frame push itself raises
+        // #PF), `cycle`'s error mapping must surface `NestedFaultDuringDelivery` with
+        // both vectors, not relabel it as a fabricated `IdtLimit` on the ORIGINAL vector
+        // (the pre-fix behavior, which discarded the nested vector entirely).
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // The frame's pushes land on page 6 (0x6000..0x6FFF), just below ESP0: clear
+        // that page's present bit entirely.
+        put32(&mut bus.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+        let outer = cpu.deliver_exception(&mut bus, 13, Some(0), false);
+        let inner_fault = outer.expect_err("the not-present ESP0 push must nest a fault");
+        let InternalFault::Exception {
+            vector: nested_vector,
+            ..
+        } = inner_fault
+        else {
+            panic!("expected a nested processor exception, got {inner_fault:?}");
+        };
+        assert_eq!(nested_vector, 14, "the nested fault is the write's own #PF");
+
+        // Drive the same scenario through `cycle`'s public error mapping (the call site
+        // this bug actually lived in) by raising vector 13 as the guest's own delivered
+        // exception via a HLT that is not privileged in V86 IOPL<3 -- reuse
+        // deliver_exception directly through the same `finish_instruction` tail instead,
+        // since that IS the call site under test (see `finish_instruction`).
+        let (mut cpu2, mut bus2) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        put32(&mut bus2.memory, 0x2000 + 6 * 4, 0x6000 | 0x6);
+        enter_v86_direct(&mut cpu2, 0x10, 0x1000);
+        let start_eip = cpu2.registers.eip;
+        let start_cs = cpu2.registers.cs().selector;
+        let result: Result<CycleOutcome, CpuError> = cpu2.finish_instruction(
+            &mut bus2,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            }),
+            start_eip,
+            start_cs,
+            None,
+            None,
+        );
+        assert_eq!(
+            result,
+            Err(CpuError::NestedFaultDuringDelivery {
+                original_vector: 13,
+                nested_vector: 14,
+            }),
+            "{result:?}"
+        );
     }
 
     #[test]
