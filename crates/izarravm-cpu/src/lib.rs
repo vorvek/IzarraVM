@@ -17542,8 +17542,8 @@ mod tests {
     #[test]
     fn v86_guest_hlt_is_general_protection() {
         // A V86 task is always CPL 3 (current_privilege_level), so the guest's own
-        // HLT now traps to the monitor instead of halting the machine directly —
-        // the companion behavior tokaemm.asm's `.hlt` handler emulates.
+        // HLT now traps to the monitor instead of halting the machine directly
+        // (the companion behavior tokaemm.asm's `.hlt` handler emulates).
         let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
         enter_v86_direct(&mut cpu, 0, 0x1000);
 
@@ -28220,7 +28220,7 @@ mod tests {
                 // STI, INT 0x21, and now HLT all arrive here as #GP(13): each is either
                 // IOPL-sensitive (check_v86_iopl) or CPL-sensitive (require_cpl0) and a
                 // V86 task always runs at IOPL 0 / CPL 3. INT 0x21 does NOT dispatch
-                // through its own IDT gate — it is intercepted before delivery, so every
+                // through its own IDT gate (it is intercepted before delivery), so every
                 // trap in this test is vector 13.
                 traps += 1;
                 // Discard the error code (vector 13 pushes one) so IRET pops from EIP.
