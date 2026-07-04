@@ -126,6 +126,20 @@ const CPUID_EXT_FEATURES_EDX: u32 = CPUID_FEATURE_TSC
 // outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
 const CR4_TSD: u32 = 0x0000_0004;
 
+// The full set of CR4 bits this GSW-586 (K6-class) persona defines at all, per the AMD-K6
+// BIOS and Software Tools Developers Guide S: 3.7 (Control Register 4 (CR4) Extensions,
+// Figure 13 / Table 19): VME(0), PVI(1), TSD(2), DE(3), PSE(4), MCE(6), GPE(7, the K6's
+// name for what later became PGE). Bit 5 and bits 31:8 are reserved on real K6 hardware.
+// Only TSD is behaviorally wired up (see CR4_TSD above); VME/PVI/DE/PSE/MCE/GPE are not
+// emulated (the matching CPUID feature bits stay clear, matching the leaf-1 comment
+// above), but a guest is still allowed to set/clear/read them back as inert storage --
+// real firmware and memory managers probe CR4 this way. Bits outside this mask are
+// masked to 0 on write (MOV CR4 does not fault on them; reserved CR4 bits simply do not
+// exist on this persona, matching the "default state of CR4 is all zeros" / no
+// GP-on-reserved-CR4-bit language in the K6 guide -- unlike EFER, which does document a
+// hard #GP on any reserved bit).
+const CR4_DEFINED_MASK: u32 = 0x0000_009f; // bits 0-4, 6-7
+
 // K6 model-specific register addresses (the value the RDMSR/WRMSR ECX selector carries).
 // This is the full software-visible set from the AMD-K6 BIOS and Software Tools guide:
 // the two machine-check registers, the time-stamp counter, the AMD extended-feature and
@@ -6144,6 +6158,13 @@ impl Cpu386 {
                             }
                             2 | 3 => {
                                 // LGDT (/2) / LIDT (/3): load the GDTR/IDTR from a 6-byte image.
+                                // 386 PRM 5.1 ("Privilege Levels"): LGDT/LIDT reload the
+                                // descriptor-table base/limit registers that the whole
+                                // protection model rests on, so like LLDT/LTR/LMSW/CLTS above
+                                // they are privileged instructions -- #GP(0) outside CPL 0.
+                                // Real mode has no protection, so CPL is always 0 there and
+                                // this gate is a no-op for real-mode boot code.
+                                self.require_cpl0()?;
                                 let limit = self.read_memory_sized(
                                     bus,
                                     memory.segment,
@@ -6249,12 +6270,16 @@ impl Cpu386 {
                 if modrm.mode != 3 {
                     return Err(undefined_opcode());
                 }
+                // 386 PRM 12.2.4 / table 12-1: only CR0, CR2, CR3 (and, on this 586-class
+                // persona, CR4) are architecturally defined. CR1/CR5/CR6/CR7 have no backing
+                // register at all -- referencing one is an invalid encoding (#UD), not a
+                // silent read of 0.
                 let value = match modrm.reg {
                     0 => self.control.cr0,
                     2 => self.control.cr2,
                     3 => self.control.cr3,
                     4 => self.control.cr4,
-                    _ => 0,
+                    _ => return Err(undefined_opcode()),
                 };
                 self.write_gpr32(modrm.rm, value);
                 Ok(clocks(6))
@@ -6274,20 +6299,56 @@ impl Cpu386 {
                 if modrm.mode != 3 {
                     return Err(undefined_opcode());
                 }
+                // 386 PRM 12.2.4 / table 12-1: same undefined-register check as MOV reg,CR
+                // above -- CR1/CR5/CR6/CR7 have no backing store, so writing one is #UD, not
+                // a silent no-op.
+                if !matches!(modrm.reg, 0 | 2 | 3 | 4) {
+                    return Err(undefined_opcode());
+                }
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
                     0 => {
+                        // 386 PRM 5.2.1 / 12.3.1: PG (bit 31) requires PE (bit 0) -- paged
+                        // linear addressing only makes sense once protection (and with it
+                        // segment/privilege checking) is active. Setting PG while PE is (or
+                        // would remain) clear is an invalid combination -- #GP(0), the
+                        // register is left unmodified. This also rejects the "set both PE
+                        // and PG at once with PE=0 in the new value" case, since PE is taken
+                        // from the value being written, not the old CR0.
+                        if value & CR0_PG != 0 && value & CR0_PE == 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
                         self.control.cr0 = value;
                         self.recompute_alignment_armed();
                         self.flush_tlb_and_code_caches();
                     }
                     2 => self.control.cr2 = value,
                     3 => {
-                        self.control.cr3 = value & 0xffff_f000;
+                        // 386 PRM 5.2.2: CR3 (the Page Directory Base Register) holds the
+                        // page-directory physical base in bits 31:12; bits 4:3 are the
+                        // software PWT/PCD page-table-entry-style cache-control hints
+                        // (defined on this 586-class persona) and bits 2:0 are reserved.
+                        // The page-table base used by the walker keeps masking to
+                        // `cr3 & 0xFFFFF000` at the use site -- only the stored value
+                        // gains PWT/PCD so a guest that sets them can read them back.
+                        self.control.cr3 = value & 0xffff_f018;
                         self.flush_tlb_and_code_caches();
                     }
-                    4 => self.control.cr4 = value,
-                    _ => {}
+                    4 => {
+                        // 386 PRM has no CR4 (a 486/586 addition); on this GSW-586 (K6-class)
+                        // persona only TSD (bit 2) has a modeled effect and only VME/PVI/TSD/
+                        // DE/PSE/MCE/GPE (bits 0-4, 6-7) are architecturally defined at all
+                        // per the AMD-K6 BIOS and Software Tools Developers Guide S: 3.7
+                        // (Control Register 4 (CR4) Extensions, Figure 13/Table 19). Every
+                        // other bit is reserved on real hardware and reads back as 0, so mask
+                        // the write down to the defined set instead of storing raw reserved
+                        // bits the CPUID persona never advertises.
+                        self.control.cr4 = value & CR4_DEFINED_MASK;
+                    }
+                    _ => unreachable!("undefined CR numbers are rejected by the check above"),
                 }
                 Ok(clocks(6))
             }
@@ -19463,6 +19524,147 @@ mod tests {
                 error_code: Some(0)
             }
         ));
+    }
+
+    // --- Batch F: LGDT/LIDT privilege, MOV CR0 PG/PE, undefined CR#, CR4 mask, CR3 PWT/PCD ---
+
+    #[test]
+    fn lgdt_faults_at_cpl3() {
+        // 0F 01 16 xx xx = LGDT [disp16]. 386 PRM 5.1: LGDT is privileged like every other
+        // 0F 00/01 system-register op, so a ring-3 guest must get #GP(0), not a silent
+        // table reload.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x01, 0x16, 0x40, 0x00]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn lidt_faults_at_cpl3() {
+        // 0F 01 1E xx xx = LIDT [disp16]. Same gate as LGDT above.
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x01, 0x1e, 0x40, 0x00]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn lgdt_lidt_run_at_cpl0_in_real_mode() {
+        // Real mode has no protection, so CPL is always 0 there; the new require_cpl0 gate
+        // on LGDT/LIDT must not regress the existing 286-boot-code path (mirrors
+        // lgdt_still_runs_at_286 above, but exercised here as the CPL0-unaffected half of
+        // the row-22 contract).
+        let mut memory = vec![0; 1024];
+        // LGDT [0x0020] (5 bytes: opcode+modrm+disp16); LIDT [0x0026] starts right after.
+        memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x16, 0x20, 0x00]);
+        memory[5..10].copy_from_slice(&[0x0f, 0x01, 0x1e, 0x26, 0x00]);
+        memory[0x20..0x26].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
+        memory[0x26..0x2c].copy_from_slice(&[0xff, 0x01, 0x00, 0x20, 0x00, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
+        assert_eq!(cpu.gdtr.base, 0x0000_1000);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
+        assert_eq!(cpu.idtr.base, 0x0000_2000);
+    }
+
+    #[test]
+    fn mov_cr0_setting_pg_without_pe_is_general_protection() {
+        // 0F 22 C0 = MOV CR0, EAX. 386 PRM 5.2.1: PG (bit 31) with PE (bit 0) clear is an
+        // invalid combination -- paging requires protection. Run at CPL 0 (real mode) so
+        // the fault is specifically the PG/PE check, not the row-23 privilege gate.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xc0], 0x20);
+        cpu.registers.set_eax(CR0_PG);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+        // The rejected write must not have taken effect.
+        assert_eq!(cpu.control.cr0 & CR0_PG, 0);
+    }
+
+    #[test]
+    fn mov_cr0_setting_pg_with_pe_succeeds() {
+        // The companion case: PG with PE both set in the same write is the normal way
+        // protected-mode paging turns on and must not fault.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xc0], 0x20);
+        cpu.registers.set_eax(CR0_PE | CR0_PG);
+        let mut bus = TestBus::with_memory(memory);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
+        assert_eq!(cpu.control.cr0 & (CR0_PE | CR0_PG), CR0_PE | CR0_PG);
+    }
+
+    #[test]
+    fn mov_from_undefined_cr_is_undefined_opcode() {
+        // 0F 20 C8 = MOV EAX, CR1 (reg=1, rm=EAX). CR1/CR5/CR6/CR7 have no backing
+        // register on the 386/486/586 architecture; referencing one is #UD, not a
+        // silent read of 0.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x20, 0xc8], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn mov_to_undefined_cr_is_undefined_opcode() {
+        // 0F 22 F8 = MOV CR7, EAX (reg=7, rm=EAX). Same undefined-register contract as
+        // the read side, checked on the write path.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xf8], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn mov_cr4_masks_reserved_bits() {
+        // 0F 22 E0 = MOV CR4, EAX; 0F 20 E3 = MOV EBX, CR4. Only the bits this GSW-586
+        // persona defines (VME/PVI/TSD/DE/PSE/MCE/GPE, CR4_DEFINED_MASK) are stored;
+        // every reserved bit -- including ones way outside the defined byte, like bit 31
+        // -- must come back 0, matching real K6 hardware ("default state of CR4 is all
+        // zeros", no bit backing outside the defined set).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0, 0x0f, 0x20, 0xe3], 0x20);
+        cpu.registers.set_eax(0xffff_ffff);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr4, CR4_DEFINED_MASK);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), CR4_DEFINED_MASK);
+    }
+
+    #[test]
+    fn mov_cr3_round_trips_pwt_and_pcd() {
+        // 0F 22 D8 = MOV CR3, EAX (reg=3, rm=EAX); 0F 20 DB = MOV EBX, CR3 (reg=3, rm=EBX).
+        // 386 PRM 5.2.2: CR3 holds the page-directory base in bits 31:12 plus the
+        // PWT/PCD cache-control hints in bits 4:3. A guest that sets PWT/PCD must read
+        // them back; only bits 2:0 (always reserved/0) and the base-alignment bits
+        // outside 31:12 are not preserved by the base itself.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xd8, 0x0f, 0x20, 0xdb], 0x20);
+        // Base 0x00123000 with PWT (bit 3) and PCD (bit 4) both set, plus reserved bits
+        // 2:0 set to confirm those stay masked off.
+        cpu.registers.set_eax(0x0012_3007 | 0x18);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr3, 0x0012_3018);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), 0x0012_3018);
     }
 
     #[test]
