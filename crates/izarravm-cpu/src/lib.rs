@@ -1340,9 +1340,11 @@ enum DecodeGroup {
     /// selector; LAR (0F 02) and LSL (0F 03), which read descriptor access-rights / limit into a
     /// register; CLTS (0F 06), which clears CR0.TS with no encoded operand; MOV reg,CR / MOV CR,reg
     /// (0F 20/22), whole-32-bit control-register moves whose ModRM is a register form (`mod` treated
-    /// as 3, `reg` selects the CR number); and the single-byte BOUND r,m (0x62; #BR on an out-of-range
-    /// index, mod=3 is #UD) and LES/LDS (0xC4/0xC5; load a far pointer m16:16/32 into ES/DS + reg,
-    /// mod=3 is #UD).
+    /// as 3, `reg` selects the CR number); LSS/LFS/LGS (0F B2/B4/B5), which load a far pointer
+    /// m16:16/32 into SS/FS/GS + reg (mod=3 is #UD; LSS additionally arms the one-instruction
+    /// interrupt shadow, the same as MOV SS/POP SS); and the single-byte BOUND r,m (0x62; #BR on
+    /// an out-of-range index, mod=3 is #UD) and LES/LDS (0xC4/0xC5; load a far pointer m16:16/32
+    /// into ES/DS + reg, mod=3 is #UD).
     ///
     /// Every ModRM form has its ModRM + addressing descriptor parsed once in `decode` (instruction
     /// bytes only, so it stays cacheable); none carry an immediate after the ModRM. The CR/segment/
@@ -1350,11 +1352,14 @@ enum DecodeGroup {
     /// `load_ldtr`, `load_tr`, `verify_segment`, `store_descriptor_table`, `flush_tlb_and_code_caches`,
     /// `try_read_descriptor`/`descriptor_accessible`), so the TLB/code-cache invalidation hooks that
     /// Stage B depends on still fire exactly as before. The far pointer for LES/LDS is read FROM
-    /// MEMORY at execute time (against live registers), never pre-read at decode. Folded into
-    /// `insn.opcode` as 0x0F00 | second for the 0F forms and dispatched off the full u16. The
-    /// genuinely-unimplemented neighbours (0F 21/23 MOV reg,DR / MOV DR,reg, 0F B2/B4/B5 LSS/LFS/LGS,
-    /// 0x63 ARPL) are NOT routed here — they stay on Fallback / TwoByteFallback (the fused path #UDs
-    /// them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
+    /// MEMORY at execute time (against live registers), never pre-read at decode; LSS/LFS/LGS
+    /// (0F B2/B4/B5) share that same far-pointer shape, loading SS/FS/GS instead of ES/DS, and
+    /// LSS additionally arms the one-instruction interrupt shadow (the same shadow MOV SS/POP SS
+    /// arm) so a following instruction cannot be interrupted between the offset and selector
+    /// halves of the pointer settling. Folded into `insn.opcode` as 0x0F00 | second for the 0F
+    /// forms and dispatched off the full u16. The genuinely-unimplemented neighbours (0F 21/23 MOV
+    /// reg,DR / MOV DR,reg, 0x63 ARPL) are NOT routed here -- they stay on Fallback / TwoByteFallback
+    /// (the fused path #UDs them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
     SystemSeg,
     /// The x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF plus WAIT/FWAIT (0x9B).
     /// Each escape opcode carries a ModRM whose `mod` field selects the form — `mod != 3` is a
@@ -3720,10 +3725,13 @@ impl Cpu386 {
                 // IMUL reg,r/m (AF, 386-class). All are ModRM r/m forms with no immediate.
                 0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
                 // System / descriptor-table / segment block (task A12), 0F forms: the descriptor
-                // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06), and
-                // MOV reg,CR / MOV CR,reg (0F 20/22). 0F 21/23 (MOV reg,DR / MOV DR,reg) and 0F B2/
-                // B4/B5 (LSS/LFS/LGS) are unimplemented in the fused path and stay TwoByteFallback.
-                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 => DecodeGroup::SystemSeg,
+                // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06),
+                // MOV reg,CR / MOV CR,reg (0F 20/22), and LSS/LFS/LGS (0F B2/B4/B5, a far-pointer
+                // load like LES/LDS but into SS/FS/GS). 0F 21/23 (MOV reg,DR / MOV DR,reg) are
+                // unimplemented and stay TwoByteFallback.
+                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5 => {
+                    DecodeGroup::SystemSeg
+                }
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
                 // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
                 // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
@@ -4772,6 +4780,7 @@ impl Cpu386 {
                 // MOV Sreg, r/m16. Reads a word r/m, then loads the segment register through the
                 // shared segment-load path (which can fault and, in protected mode, reload the
                 // descriptor). CS (reg=1) and reg>5 are invalid and #GP, matching the fused handler.
+                // Loading SS this way arms the one-instruction interrupt shadow (386 PRM 11-16).
                 let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
                 let segment = match modrm.reg {
@@ -4787,7 +4796,7 @@ impl Cpu386 {
                         .into());
                     }
                 };
-                self.load_segment(bus, segment, value as u16)?;
+                self.load_segment_arming_ss_shadow(bus, segment, value as u16)?;
                 Ok(clocks(7))
             }
             0x90 => {
@@ -4941,8 +4950,10 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0x17 => {
+                // POP SS. Arms the one-instruction interrupt shadow like MOV SS (386 PRM 11-16),
+                // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
                 let value = self.pop(bus, OperandSize::Word)? as u16;
-                self.load_segment(bus, SegmentIndex::Ss, value)?;
+                self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
                 Ok(clocks(7))
             }
             0x1e => {
@@ -6352,6 +6363,55 @@ impl Cpu386 {
                     SegmentIndex::Ds
                 };
                 self.load_segment(bus, segment, selector)?;
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
+            0x0fb2 | 0x0fb4 | 0x0fb5 => {
+                // LSS (0F B2) / LFS (0F B4) / LGS (0F B5): 386 PRM 17-56 -- same far-pointer
+                // shape as LES/LDS above (mod=3 is #UD, the offset is read first, then the
+                // selector word right after it, both against the LIVE registers), loading the
+                // offset into the reg operand and the selector into SS/FS/GS through the
+                // unchanged `load_segment` (so the existing null-selector/#GP/#NP rules and the
+                // SS.B cache refresh all apply exactly as they do for any other segment load).
+                // LSS additionally arms the one-instruction interrupt shadow via
+                // `load_segment_arming_ss_shadow`, exactly like MOV SS/POP SS: 386 PRM 11-16
+                // treats "load SS, then load (E)SP" as one atomic unit against interrupts, NMI,
+                // and single-step, and LSS is that idiom in a single instruction.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = match insn.opcode {
+                    0x0fb2 => SegmentIndex::Ss,
+                    0x0fb4 => SegmentIndex::Fs,
+                    _ => SegmentIndex::Gs,
+                };
+                if segment == SegmentIndex::Ss {
+                    self.load_segment_arming_ss_shadow(bus, segment, selector)?;
+                } else {
+                    self.load_segment(bus, segment, selector)?;
+                }
                 self.write_gpr_sized(modrm.reg, operand_size, offset);
                 Ok(clocks(7))
             }
@@ -9318,6 +9378,30 @@ impl Cpu386 {
 
     fn relative_jump(&mut self, relative: i32, operand_size: OperandSize) {
         self.set_eip(self.registers.eip.wrapping_add(relative as u32) & operand_size.mask());
+    }
+
+    /// `load_segment` for the three instructions that load SS directly from the instruction
+    /// stream (MOV SS, POP SS, LSS): 386 PRM 11-16 says loading SS this way inhibits interrupts,
+    /// NMI, and single-step traps until the next instruction boundary, so a pointer's offset and
+    /// stack segment can be loaded as one atomic unit even if an interrupt lands between the two
+    /// halves. This is the SAME one-instruction shadow STI arms (`interrupt_shadow`); reused here
+    /// rather than duplicated. Only armed on success -- a faulting load (null selector, bad
+    /// descriptor) must not suppress the interrupt check. Every OTHER `load_segment(.., Ss, ..)`
+    /// call site (IRET's outer-stack pop, the inner-stack switch on a privilege-level change, the
+    /// TSS register-restore loop) reloads SS as a side effect of a control transfer, not as the
+    /// direct target of one of these three opcodes, and must not arm the shadow -- callers use the
+    /// plain `load_segment` for those.
+    fn load_segment_arming_ss_shadow<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        selector: u16,
+    ) -> ExecResult<()> {
+        self.load_segment(bus, segment, selector)?;
+        if segment == SegmentIndex::Ss {
+            self.interrupt_shadow = true;
+        }
+        Ok(())
     }
 
     fn load_segment<B: CpuBus>(
@@ -15049,6 +15133,283 @@ mod tests {
     }
 
     #[test]
+    fn lss_real_mode_16bit_loads_offset_and_ss_and_arms_shadow() {
+        // lss bx, [0x200]  (0F B2 1E 00 02). Loads the far pointer at DS:0x200:
+        // BX <- word[0x200], SS <- word[0x202]. No flags change, but LSS arms the
+        // one-instruction interrupt shadow (386 PRM 11-16), exactly like MOV SS/POP SS.
+        // No interrupt is pending going in (IF true with nothing pending is the ordinary
+        // case); the deferred-delivery behavior itself is `lss_interrupt_shadow_defers_
+        // a_pending_irq_by_one_instruction` below.
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb2, 0x1e, 0x00, 0x02]);
+        memory[0x200] = 0x34; // offset low
+        memory[0x201] = 0x12; // offset high -> 0x1234
+        memory[0x202] = 0x00; // selector low
+        memory[0x203] = 0x90; // selector high -> 0x9000
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_IF, true);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x9000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).base, 0x9000 << 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+        assert!(
+            cpu.interrupt_shadow,
+            "LSS must arm the one-instruction interrupt shadow"
+        );
+    }
+
+    #[test]
+    fn lss_interrupt_shadow_defers_a_pending_irq_by_one_instruction() {
+        // Same shape as `sti_interrupt_shadow_defers_interrupt_by_one_instruction`, but the
+        // shadow is armed by LSS instead of STI: a pending IRQ must not be taken until the
+        // instruction AFTER LSS has run.
+        let mut memory = vec![0u8; 0x300];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb2, 0x1e, 0x00, 0x02]); // lss bx, [0x200]
+        memory[5] = 0x90; // NOP -- executes before the interrupt is taken (shadow)
+        memory[6] = 0x90; // NOP -- not reached; interrupt taken instead
+        memory[0x200] = 0x00; // offset -> 0x0000
+        memory[0x201] = 0x00;
+        memory[0x202] = 0x00; // selector -> 0x0000 (SS stays flat at base 0 in real mode)
+        memory[0x203] = 0x00;
+        // IVT entry for vector 0x08 (IRQ0) at byte offset 0x20: offset=0x0208, segment=0.
+        memory[0x20..0x22].copy_from_slice(&0x0208u16.to_le_bytes());
+        memory[0x22..0x24].copy_from_slice(&0x0000u16.to_le_bytes());
+        memory[0x208] = 0xcf; // IRET at the handler target (not reached in this test)
+
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        cpu.set_flag(FLAG_IF, true);
+
+        let mut bus = TestBus::with_memory(memory);
+        // No interrupt pending yet: it "arrives" during LSS's execution window, which is
+        // exactly the case the shadow exists to cover -- an IRQ landing between the LSS
+        // and the next instruction boundary must wait for that boundary.
+
+        // Cycle 1: LSS. SS reloads; the shadow arms. eip advances normally.
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eip, 5,
+            "eip must be 5 after LSS -- NOP not yet executed"
+        );
+        assert!(
+            cpu.interrupt_shadow,
+            "the shadow must be armed immediately after LSS runs"
+        );
+        // The IRQ arrives now, after LSS has already committed.
+        bus.pending_irq = Some(8);
+
+        // Cycle 2: NOP. Shadow consumed at cycle start -> interrupt check skipped -> NOP
+        // executes -> eip advances to 6. IRQ still pending.
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eip, 6,
+            "eip must be 6 after NOP -- shadow let NOP through"
+        );
+        assert!(
+            bus.pending_irq.is_some(),
+            "interrupt must still be pending after NOP (shadow consumed, interrupt check skipped)"
+        );
+
+        // Cycle 3: no shadow, IF set, IRQ pending -> interrupt is acknowledged before fetch.
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            bus.pending_irq.is_none(),
+            "interrupt must be taken after the shadow expires"
+        );
+    }
+
+    #[test]
+    fn lss_32bit_operand_size_loads_esp_wide_offset() {
+        // 66 0F B2 1E 00 02 -- lss ebx, [0x200] (operand-size override to 32-bit).
+        // EBX <- dword[0x200], SS <- word[0x204].
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..6].copy_from_slice(&[0x66, 0x0f, 0xb2, 0x1e, 0x00, 0x02]);
+        memory[0x200..0x204].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        memory[0x204..0x206].copy_from_slice(&0x9000u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.ebx(), 0x1122_3344);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x9000);
+    }
+
+    #[test]
+    fn lfs_loads_offset_and_fs() {
+        // lfs bx, [0x200]  (0F B4 1E 00 02). No interrupt shadow -- only LSS arms it.
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb4, 0x1e, 0x00, 0x02]);
+        memory[0x200] = 0x34;
+        memory[0x201] = 0x12;
+        memory[0x202] = 0x00;
+        memory[0x203] = 0x70;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.set_flag(FLAG_IF, true);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).selector, 0x7000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Fs).base, 0x7000 << 4);
+        assert!(
+            !cpu.interrupt_shadow,
+            "LFS must not arm the SS interrupt shadow"
+        );
+    }
+
+    #[test]
+    fn lgs_loads_offset_and_gs() {
+        // lgs bx, [0x200]  (0F B5 1E 00 02).
+        let mut memory = vec![0u8; 0x1000];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb5, 0x1e, 0x00, 0x02]);
+        memory[0x200] = 0x34;
+        memory[0x201] = 0x12;
+        memory[0x202] = 0x00;
+        memory[0x203] = 0x60;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).selector, 0x6000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Gs).base, 0x6000 << 4);
+        assert!(
+            !cpu.interrupt_shadow,
+            "LGS must not arm the SS interrupt shadow"
+        );
+    }
+
+    #[test]
+    fn lss_with_register_operand_delivers_ud() {
+        // lss bx, ax encoded with mod=3 (0F B2 C3) is an invalid encoding -> #UD (vector 6).
+        // IVT[6] at 0x18 points to IP 0x00ee, CS 0; the CPU vectors there.
+        let mut memory = vec![0u8; 1024];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb2, 0xc3]);
+        memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
+    fn lfs_with_register_operand_delivers_ud() {
+        // lfs bx, ax (0F B4 C3, mod=3) -> #UD (vector 6).
+        let mut memory = vec![0u8; 1024];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb4, 0xc3]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
+    fn lgs_with_register_operand_delivers_ud() {
+        // lgs bx, ax (0F B5 C3, mod=3) -> #UD (vector 6).
+        let mut memory = vec![0u8; 1024];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb5, 0xc3]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
+    fn lss_null_selector_faults_general_protection() {
+        // In protected mode, LSS with a null selector must #GP -- SS can never be null,
+        // the same rule any other SS load enforces (`null_selector_into_ss_still_faults`).
+        let (mut cpu, mut memory) = protected_cpu(&[0x0f, 0xb2, 0x1e, 0x80, 0x01], 0, 0);
+        // Far pointer at 0x180: offset 0x1234, selector 0x0000 (null).
+        memory[0x180..0x182].copy_from_slice(&0x1234u16.to_le_bytes());
+        memory[0x182..0x184].copy_from_slice(&0x0000u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::GeneralProtection { selector: 0x0000 })
+            ),
+            "a null selector into SS via LSS must #GP, got {fault:?}"
+        );
+    }
+
+    #[test]
+    fn lss_protected_mode_refreshes_the_ss_b_bit() {
+        // Load SS via LSS from a 32-bit (B=1) data descriptor (selector 0x08, GDT). The cached
+        // `default_size_32` (the B bit) must flip to match the new descriptor -- it comes free
+        // through `load_segment` -> `descriptor_to_segment`, exactly like any other segment load.
+        let descriptor_low = 0x0000_ffffu32; // limit low = 0xffff, base = 0
+        let descriptor_high = 0x00cf_9200u32; // access=0x92 (present, data, writable), B=1, G=1
+        let (mut cpu, mut memory) = protected_cpu(
+            &[0x0f, 0xb2, 0x1e, 0x80, 0x01],
+            descriptor_low,
+            descriptor_high,
+        );
+        assert!(
+            !cpu.registers.segment(SegmentIndex::Ss).default_size_32,
+            "test setup: SS must start 16-bit (B=0) so the flip is observable"
+        );
+        // Far pointer at 0x180: offset 0x1234, selector 0x08.
+        memory[0x180..0x182].copy_from_slice(&0x1234u16.to_le_bytes());
+        memory[0x182..0x184].copy_from_slice(&0x0008u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x0008);
+        assert!(
+            cpu.registers.segment(SegmentIndex::Ss).default_size_32,
+            "LSS must refresh SS.B to the loaded descriptor's B bit"
+        );
+    }
+
+    #[test]
     fn cbw_sign_extends_al_into_ax() {
         // cbw (0x98): al = 0x80 (-128) -> ax = 0xff80.
         let mut memory = vec![0; 64];
@@ -19726,7 +20087,7 @@ mod tests {
             // CMOVcc / SETcc / IMUL (CondMove)
             | 0x40..=0x4f | 0x90..=0x9f | 0xaf
             // SystemSeg
-            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22
+            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 | 0xb2 | 0xb4 | 0xb5
             // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
             | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
             | 0xc7 | 0xc8..=0xcf
@@ -19824,12 +20185,13 @@ mod tests {
         }
 
         // A representative un-implemented 0F byte from each kind of gap that falls through to the
-        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg), 0xb2 (LSS),
-        // 0xb4 (LFS), 0xb5 (LGS). Each routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode.
-        // (0F AA RSM also routes to TwoByteFallback but is an EXPLICITLY handled arm in
-        // `execute_two_byte` that #UDs with vector 6 because no SMM is modeled — it is "implemented",
-        // just always invalid — so it is not part of this generic-catch-all sweep.)
-        for second in [0x0au8, 0x21, 0x23, 0xb2, 0xb4, 0xb5] {
+        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg). Each routes to
+        // TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F B2/B4/B5 LSS/LFS/LGS are now
+        // implemented -- see the SystemSeg coverage test below. 0F AA RSM also routes to
+        // TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
+        // vector 6 because no SMM is modeled -- it is "implemented", just always invalid -- so it is
+        // not part of this generic-catch-all sweep.)
+        for second in [0x0au8, 0x21, 0x23] {
             assert!(
                 !implemented_two_byte(second),
                 "test bug: 0F {second:#04x} is actually implemented"
@@ -22759,15 +23121,13 @@ mod tests {
         // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
         // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
         // the routing so a future edit can't silently capture them. 0F 21/23 (MOV reg,DR / MOV DR,reg)
-        // and 0F B2/B4/B5 (LSS/LFS/LGS) #UD as `UnsupportedTwoByteOpcode`; 0x63 (ARPL) #UDs as
-        // `UnsupportedOpcode`. All surface through the split as a CpuError, never a panic.
+        // #UD as `UnsupportedTwoByteOpcode`; 0x63 (ARPL) #UDs as `UnsupportedOpcode`. All surface
+        // through the split as a CpuError, never a panic. (0F B2/B4/B5 LSS/LFS/LGS moved OFF this
+        // list once implemented -- see the `lss`/`lfs`/`lgs` tests below.)
         for code in [
-            &[0x0f, 0x21, 0xc0][..],             // MOV EAX, DR0
-            &[0x0f, 0x23, 0xc0][..],             // MOV DR0, EAX
-            &[0x0f, 0xb2, 0x1e, 0x00, 0x02][..], // LSS BX, [0x200]
-            &[0x0f, 0xb4, 0x1e, 0x00, 0x02][..], // LFS BX, [0x200]
-            &[0x0f, 0xb5, 0x1e, 0x00, 0x02][..], // LGS BX, [0x200]
-            &[0x63, 0xc0][..],                   // ARPL AX, AX
+            &[0x0f, 0x21, 0xc0][..], // MOV EAX, DR0
+            &[0x0f, 0x23, 0xc0][..], // MOV DR0, EAX
+            &[0x63, 0xc0][..],       // ARPL AX, AX
         ] {
             let (mut cpu, memory) = real_mode_cpu(code, 0x40);
             let mut bus = TestBus::with_memory(memory);
