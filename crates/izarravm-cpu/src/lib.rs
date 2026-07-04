@@ -27,6 +27,7 @@ const FLAG_IF: u32 = 0x0000_0200;
 const FLAG_DF: u32 = 0x0000_0400;
 const FLAG_OF: u32 = 0x0000_0800;
 const FLAG_NT: u32 = 0x0000_4000; // bit 14, nested task
+const FLAG_IOPL: u32 = 0x0000_3000; // bits 12-13, I/O privilege level
 const FLAG_VM: u32 = 0x0002_0000; // bit 17, virtual-8086 mode
 
 /// Segment-selector slots in a 386 TSS, in memory order from offset 72 (ES, CS, SS,
@@ -5039,7 +5040,7 @@ impl Cpu386 {
                 // POPF / POPFD: load the popped image through the shared flag-load.
                 self.check_v86_iopl()?;
                 let value = self.pop(bus, operand_size)?;
-                self.load_flags(value, operand_size);
+                self.load_flags(value, operand_size, false);
                 Ok(clocks(4))
             }
             0xc8 => {
@@ -8669,16 +8670,50 @@ impl Cpu386 {
         Ok(())
     }
 
-    fn load_flags(&mut self, value: u32, operand_size: OperandSize) {
-        match operand_size {
-            OperandSize::Word => {
-                self.registers.eflags =
-                    (self.registers.eflags & 0xffff_0000) | (value & 0xffff) | 0x2;
-            }
-            OperandSize::Dword => {
-                self.registers.eflags = value | 0x2;
-            }
+    /// Shared flag-load for POPF/POPFD and every IRET/IRETD return form, including the
+    /// dedicated return-into-V86 branch. Per the 386 PRM (POPF/POPFD, "386 DX Microprocessor
+    /// Instruction Set", opcode 9Dh, p.17-136): "The I/O privilege level is altered only when
+    /// executing at privilege level 0. The interrupt flag is altered only when executing at a
+    /// level at least as privileged as the I/O privilege level... bits 16 and 17 [VM and RF]
+    /// are not affected." IRET carries the identical IOPL/IF rule (section 9.7.1.2, p.9-37):
+    /// "The IOPL field of the EFLAGS register is restored only if the CPL is 0. The IF flag is
+    /// changed only if CPL <= IOPL."
+    ///
+    /// `self.cpl` at every call site is still the *pre-transition* privilege level (the
+    /// same-privilege IRET forms load flags before touching `self.cpl`), so a plain read of
+    /// `current_privilege_level()` here is exactly the "executing at" CPL the PRM means.
+    ///
+    /// In V86, `check_v86_iopl` traps POPF/POPFD/IRET upstream whenever IOPL < 3, so the only
+    /// V86 case that ever reaches this function via `allow_vm_load == false` has IOPL == 3,
+    /// CPL == 3 <= IOPL, and the IF gate is a no-op (IF always loads).
+    ///
+    /// `allow_vm_load` is true only for the ring-0 IRETD-into-V86 branch, which is the one
+    /// path allowed to set VM (CPL 0 there, matching the PRM's IOPL-restore gate); every other
+    /// caller (POPF/POPFD and the same-privilege/inter-privilege IRET forms) passes false so
+    /// VM keeps its live value, per the PRM text above.
+    fn load_flags(&mut self, value: u32, operand_size: OperandSize, allow_vm_load: bool) {
+        let cpl = self.current_privilege_level();
+        let old = self.registers.eflags;
+        let mut merged = match operand_size {
+            OperandSize::Word => (old & 0xffff_0000) | (value & 0xffff) | 0x2,
+            OperandSize::Dword => value | 0x2,
+        };
+        // IOPL: only a CPL-0 load may change it; otherwise keep the live value.
+        if cpl != 0 {
+            merged = (merged & !FLAG_IOPL) | (old & FLAG_IOPL);
         }
+        // IF: only alterable when CPL <= IOPL (checked against the *live* IOPL, which is the
+        // value just settled above); otherwise keep the live value.
+        let effective_iopl = ((merged >> 12) & 3) as u8;
+        if cpl > effective_iopl {
+            merged = (merged & !FLAG_IF) | (old & FLAG_IF);
+        }
+        // VM: masked back to its live value everywhere except the dedicated IRETD-into-V86
+        // caller, which passes the popped VM=1 through on purpose.
+        if !allow_vm_load {
+            merged = (merged & !FLAG_VM) | (old & FLAG_VM);
+        }
+        self.registers.eflags = merged;
         // The loaded image is the new truth for every flag bit; any deferred descriptor would
         // otherwise override the arithmetic bits we just wrote.
         self.pending_flags = None;
@@ -8694,7 +8729,7 @@ impl Cpu386 {
                 let flags = self.pop(bus, OperandSize::Word)?;
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.set_eip(ip & 0xffff);
-                self.load_flags(flags, OperandSize::Word);
+                self.load_flags(flags, OperandSize::Word, false);
                 // The 16-bit form only implements a same-privilege / real-mode / V86
                 // return (no inter-privilege stack pop); the target level is exactly the
                 // just-loaded CS's RPL, or 3 if that load landed in V86 -- but real mode
@@ -8746,7 +8781,7 @@ impl Cpu386 {
                     let ds = self.pop(bus, OperandSize::Dword)? as u16;
                     let fs = self.pop(bus, OperandSize::Dword)? as u16;
                     let gs = self.pop(bus, OperandSize::Dword)? as u16;
-                    self.load_flags(flags, OperandSize::Dword); // flags carry VM=1 (guarded above)
+                    self.load_flags(flags, OperandSize::Dword, true); // flags carry VM=1 (guarded above)
                     self.load_segment_real(SegmentIndex::Cs, cs);
                     self.load_segment_real(SegmentIndex::Ss, ss);
                     self.load_segment_real(SegmentIndex::Ds, ds);
@@ -8770,7 +8805,7 @@ impl Cpu386 {
                     self.load_segment(bus, SegmentIndex::Ss, ss)?;
                     self.set_eip(eip);
                     self.registers.set_esp(esp);
-                    self.load_flags(flags, OperandSize::Dword);
+                    self.load_flags(flags, OperandSize::Dword, false);
                     // PRM transition point: the target RPL (checked above, non-V86) is the
                     // new CPL.
                     self.cpl = (cs & 3) as u8;
@@ -8780,7 +8815,7 @@ impl Cpu386 {
                 // Same privilege (existing behavior).
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.set_eip(eip);
-                self.load_flags(flags, OperandSize::Dword);
+                self.load_flags(flags, OperandSize::Dword, false);
             }
         }
         Ok(())
@@ -23273,6 +23308,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0xcf], 0x40);
         cpu.control.cr0 |= CR0_PE;
         cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+        cpu.cpl = 3; // V86 is always CPL 3; load_flags reads the cached cpl.
         cpu.registers.set_esp(0x20);
         let mut bus = TestBus::with_memory(memory);
         // 16-bit IRET frame at SS:0x20 (IP, CS, FLAGS), popped low-to-high.
@@ -23289,6 +23325,134 @@ mod tests {
             cpu.flag(FLAG_IF),
             "native IRET loads IF straight from the popped image"
         );
+    }
+
+    #[test]
+    fn iret_in_v86_at_iopl3_cannot_drop_iopl() {
+        // The JEMMEX/TOKAEMM root cause: a V86 client is deliberately run at IOPL 3 so its
+        // own native (same-privilege, CPL 3) IRET never traps to the monitor. Per the 386
+        // PRM (section 9.7.1.2), "The IOPL field ... is restored only if the CPL is 0" -- at
+        // CPL 3 a stale/zeroed IOPL field in the popped image must never reach real EFLAGS.
+        let (mut cpu, memory) = real_mode_cpu(&[0xcf], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+        cpu.cpl = 3; // V86 is always CPL 3; load_flags reads the cached cpl.
+        cpu.registers.set_esp(0x20);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x20..0x22].copy_from_slice(&0x1234u16.to_le_bytes());
+        bus.memory[0x22..0x24].copy_from_slice(&0x0050u16.to_le_bytes());
+        // Popped image carries IOPL=0 (bits 12-13 clear) -- exactly the stale flags word
+        // traced in the field: a JEMM-internal in-V86 IRET popping 0x200.
+        let popped_flags = (0x2 | FLAG_VM | FLAG_IF) as u16;
+        bus.memory[0x24..0x26].copy_from_slice(&popped_flags.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.is_v86_mode());
+        assert_eq!(
+            cpu.registers.eflags & FLAG_IOPL,
+            FLAG_IOPL,
+            "IRET at CPL 3 must not lower live IOPL from the popped image"
+        );
+        assert!(
+            cpu.flag(FLAG_IF),
+            "CPL 3 <= (unchanged) IOPL 3, so IF still loads from the popped image"
+        );
+    }
+
+    #[test]
+    fn popf_in_v86_at_iopl3_cannot_drop_iopl() {
+        // Same PRM rule (POPF/POPFD, p.17-136), driven through POPF instead of IRET.
+        let (mut cpu, memory) = real_mode_cpu(&[0x9d], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+        cpu.cpl = 3; // V86 is always CPL 3; load_flags reads the cached cpl.
+        cpu.registers.set_esp(0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let popped_flags = (0x2 | FLAG_IF) as u16; // IOPL 0 in the popped image
+        bus.memory[0x20..0x22].copy_from_slice(&popped_flags.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eflags & FLAG_IOPL,
+            FLAG_IOPL,
+            "POPF at CPL 3 must not lower live IOPL from the popped image"
+        );
+        assert!(cpu.is_v86_mode(), "POPF must never clear VM");
+    }
+
+    #[test]
+    fn pmode_ring3_popf_below_iopl_preserves_if_and_iopl() {
+        // Non-V86 ring-3 POPF with IOPL < 3 reaches native load_flags directly (no V86 trap
+        // upstream) and per the PRM must leave both IF and IOPL untouched. Built like
+        // `cpl3_code`, but with a matching flat CPL-3 SS so POPF can pop the stack.
+        let mut memory = vec![0u8; 256];
+        memory[0] = 0x9d; // POPF
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: true,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32: true,
+            },
+        );
+        cpu.registers.eip = 0;
+        cpu.cpl = 3;
+        cpu.registers.eflags = 0x2 | FLAG_IF; // IOPL 0, IF set, CPL 3
+        cpu.registers.set_esp(0x80);
+        let mut bus = TestBus::with_memory(memory);
+        // CS.default_size_32 makes plain 9D a POPFD (32-bit pop). Popped image tries to
+        // clear IF and raise IOPL to 3.
+        let popped_flags = 0x2u32 | 0x3000;
+        bus.memory[0x80..0x84].copy_from_slice(&popped_flags.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            cpu.flag(FLAG_IF),
+            "CPL 3 > IOPL 0: IF must keep its live value, not the popped clear"
+        );
+        assert_eq!(
+            cpu.registers.eflags & FLAG_IOPL,
+            0,
+            "CPL 3 != 0: IOPL must keep its live value, not the popped raise"
+        );
+    }
+
+    #[test]
+    fn cpl0_popfd_still_loads_iopl_and_if_fully() {
+        // CPL 0 native POPFD is the one case the PRM lets change IOPL, and IF always loads
+        // there too (CPL 0 <= any IOPL). Existing full-load behavior must be unchanged.
+        let (mut cpu, memory) = real_mode_cpu(&[0x66, 0x9d], 0x40); // POPFD
+        cpu.registers.set_esp(0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let popped_flags = 0x2u32 | 0x3000 | FLAG_IF;
+        bus.memory[0x20..0x24].copy_from_slice(&popped_flags.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eflags & FLAG_IOPL, FLAG_IOPL);
+        assert!(cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn popfd_can_never_set_vm_at_any_cpl() {
+        // POPF/POPFD can never alter VM (bit 17) at any CPL -- real mode here is CPL 0,
+        // the most permissive case, and even it must not let VM turn on via a flags pop.
+        let (mut cpu, memory) = real_mode_cpu(&[0x66, 0x9d], 0x40); // POPFD
+        cpu.registers.set_esp(0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let popped_flags = 0x2u32 | FLAG_VM;
+        bus.memory[0x20..0x24].copy_from_slice(&popped_flags.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eflags & FLAG_VM, 0, "POPFD must never set VM");
     }
 
     // ---- Stack-group golden battery (A4) ----
