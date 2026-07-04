@@ -2647,6 +2647,64 @@ del PREEXIST.TXT\r\n";
         );
     }
 
+    /// The round-1 CRITICAL regression gate: a guest that does `sti; hlt` under the
+    /// default TOKAEMM boot must resume and exit cleanly, not crash the host. HLT is
+    /// privileged on real 386+ (CPL != 0 -> #GP(0)); a V86 task is always CPL 3, so
+    /// every guest HLT traps into TOKAEMM's monitor, which must emulate it (a real
+    /// ring-0 `sti; hlt`, IRQ-wake, then resume the guest past the F4 byte) without
+    /// misrouting the waking IRQ's ring-0 frame through the V86 reflect path (the
+    /// bug: `irq_body` reflected on the frame regardless of who was interrupted,
+    /// corrupting it and loading a guest IVT segment as a protected-mode selector).
+    #[test]
+    #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
+    fn katea_run_guest_hlt_resumes_and_exits_under_tokaemm() {
+        let dir = TempDir::new(std::env::temp_dir().join(format!(
+            "katea_run_hlt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )))
+        .unwrap();
+        let prog = dir.path().join("HLTTEST.COM");
+        std::fs::write(&prog, izarravm_firmware::hlttest_com()).unwrap();
+
+        let code =
+            katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+        assert_eq!(
+            code, 1,
+            "a guest sti;hlt must resume past the F4 byte and reach its own exit, \
+             not crash the host with a CpuError"
+        );
+    }
+
+    /// Same gate as above, repeated five times in a guest loop: catches drift across
+    /// repeated halts (a corrupted saved register or a stack-depth leak in TOKAEMM's
+    /// HLT emulation that only shows up on the second or later wake).
+    #[test]
+    #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
+    fn katea_run_repeated_guest_hlt_resumes_and_exits_under_tokaemm() {
+        let dir = TempDir::new(std::env::temp_dir().join(format!(
+            "katea_run_multihlt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )))
+        .unwrap();
+        let prog = dir.path().join("MULTIHLT.COM");
+        std::fs::write(&prog, izarravm_firmware::multihlt_com()).unwrap();
+
+        let code =
+            katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+        assert_eq!(
+            code, 7,
+            "five sequential guest HLTs must all resume cleanly under TOKAEMM"
+        );
+    }
+
     /// TokaEdit e2e: EDIT.COM opens a new file at the prompt, text is typed,
     /// File>Save and File>Exit are driven via Alt-menu keys, and the saved bytes
     /// arrive on the host through the Katea folder.
