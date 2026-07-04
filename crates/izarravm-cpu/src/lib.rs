@@ -10423,7 +10423,11 @@ impl Cpu386 {
                 Ok(clocks(5))
             }
             0xf4 => {
-                // HLT: stop fetching until the next interrupt. Sets the halted state.
+                // HLT: privileged on real 386+ (#GP(0) at CPL != 0). A V86 task is
+                // always CPL 3, so a guest HLT under a V86 monitor faults here instead
+                // of halting the whole machine; the monitor (if any) is responsible for
+                // emulating the guest's halt semantics on the resulting #GP.
+                self.require_cpl0()?;
                 self.halted = true;
                 Ok(CycleOutcome {
                     core_clocks: 5,
@@ -17494,6 +17498,90 @@ mod tests {
         cpu.set_flag(FLAG_IF, false);
         bus.pending_irq = Some(8);
         assert!(cpu.cycle(&mut bus).unwrap().halted);
+    }
+
+    #[test]
+    fn hlt_at_cpl0_protected_mode_halts() {
+        // HLT is privileged (CPL 0 only), but ring 0 in protected mode is exactly
+        // as permitted as real mode: require_cpl0 must not fault here.
+        let mut memory = vec![0u8; 256];
+        memory[0] = 0xf4; // hlt
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0008, // RPL 0
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: true,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        assert!(cpu.cycle(&mut bus).unwrap().halted);
+    }
+
+    #[test]
+    fn hlt_at_cpl3_protected_mode_is_general_protection() {
+        // Outside V86, a ring-3 HLT is the ordinary CPL check: #GP(0), same shape
+        // as WBINVD/SYSRET's existing CPL3 tests.
+        let (mut cpu, mut bus) = cpl3_code(&[0xf4]);
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn v86_guest_hlt_is_general_protection() {
+        // A V86 task is always CPL 3 (current_privilege_level), so the guest's own
+        // HLT now traps to the monitor instead of halting the machine directly —
+        // the companion behavior tokaemm.asm's `.hlt` handler emulates.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        let outcome = cpu.cycle(&mut bus);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !cpu.is_v86_mode(),
+            "a V86 guest's HLT must land in the ring-0 monitor, not halt directly"
+        );
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+    }
+
+    #[test]
+    fn v86_guest_hlt_resumes_after_the_f4_byte_under_monitor_emulation() {
+        // A monitor that emulates the trapped HLT (tokaemm.asm's `.hlt`: advance
+        // past the F4 byte, then IRET back to V86) must land the guest one byte
+        // past its HLT, still running, rather than leaving it stuck re-faulting on
+        // the same instruction.
+        let guest = [0xf4, 0x90]; // hlt ; nop
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &guest, &[0x00]);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        cpu.cycle(&mut bus).unwrap(); // guest HLT traps into the monitor
+        assert!(!cpu.is_v86_mode());
+        assert_eq!(cpu.registers.cs().selector, R0_CS);
+
+        // Emulate tokaemm.asm's `.hlt`: skip the error code, bump the frame's V86
+        // EIP past the single-byte F4, then IRET back to V86 (mirrors the trap
+        // round-trip in v86_monitor_round_trip_go_no_go).
+        let esp = cpu.registers.esp() + 4;
+        cpu.registers.set_esp(esp);
+        let guest_eip = u32::from_le_bytes(cpu_mem(&bus, esp));
+        assert_eq!(guest_eip, 0, "faulted at the guest's HLT");
+        bus.memory[esp as usize..esp as usize + 4].copy_from_slice(&(guest_eip + 1).to_le_bytes());
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+
+        assert!(cpu.is_v86_mode(), "IRET must return the guest to V86");
+        assert_eq!(cpu.registers.eip, 1, "guest resumes past the HLT byte");
     }
 
     // --- 486 read-modify-write opcodes: XADD and CMPXCHG ---
@@ -28102,6 +28190,14 @@ mod tests {
     #[test]
     fn v86_monitor_round_trip_go_no_go() {
         // Guest: STI (fb) ; OUT 0x80,AL (e6 80) ; INT 0x21 (cd 21) ; HLT (f4).
+        // HLT is now privileged (require_cpl0): a V86 task is always CPL 3, so the
+        // guest's HLT traps into the monitor exactly like STI and INT 0x21 rather
+        // than halting the machine directly. The monitor emulates it by advancing
+        // past the F4 byte and halting for real at ring 0 (mirroring TOKAEMM's
+        // `.hlt` handler in tokaemm.asm): that real HLT is what stops the machine,
+        // observed here as `outcome.halted` while CS is still the ring-0 monitor
+        // selector (not while `cpu.is_v86_mode()`, since the guest itself never
+        // executes HLT to completion anymore).
         let guest = [0xfb, 0xe6, 0x80, 0xcd, 0x21, 0xf4];
         let monitor = [0xf4]; // unused: we emulate the monitor from Rust below.
         let bitmap = vec![0u8; 0x20 + 1]; // all-zero: ports 0..0x100 permitted (+ terminator byte)
@@ -28109,16 +28205,23 @@ mod tests {
         enter_v86_direct(&mut cpu, 0, 0x1000);
 
         let mut traps = 0;
-        let mut guest_hlt = false;
+        let mut monitor_halted = false;
         for _ in 0..64 {
             let outcome = cpu.cycle(&mut bus).unwrap();
             if !cpu.is_v86_mode() && cpu.registers.cs().selector == R0_CS {
+                if outcome.halted {
+                    // The monitor's HLT-emulation path ran its own real HLT at ring 0
+                    // to idle the machine on the guest's behalf; nothing left to IRET.
+                    monitor_halted = true;
+                    break;
+                }
                 // In the monitor because the guest faulted. Read the V86 #GP(13) frame,
                 // advance the guest EIP past the faulting instruction, IRET back to V86.
-                // Both STI and INT 0x21 arrive here as #GP(13): each is IOPL-sensitive and
-                // faults because the V86 task runs at IOPL 0 < 3 (check_v86_iopl). INT 0x21
-                // does NOT dispatch through its own IDT gate — it is intercepted before
-                // delivery, so every trap in this test is vector 13.
+                // STI, INT 0x21, and now HLT all arrive here as #GP(13): each is either
+                // IOPL-sensitive (check_v86_iopl) or CPL-sensitive (require_cpl0) and a
+                // V86 task always runs at IOPL 0 / CPL 3. INT 0x21 does NOT dispatch
+                // through its own IDT gate — it is intercepted before delivery, so every
+                // trap in this test is vector 13.
                 traps += 1;
                 // Discard the error code (vector 13 pushes one) so IRET pops from EIP.
                 // Frame layout from the handler's ESP upward is [err], EIP, CS, ... (see the
@@ -28134,6 +28237,18 @@ mod tests {
                 let len = match opcode {
                     0xfb => 1, // STI
                     0xcd => 2, // INT imm8
+                    0xf4 => {
+                        // HLT: the guest's virtual IF is set (STI already ran), so a
+                        // faithful monitor would really halt here on the guest's behalf
+                        // (tokaemm.asm's `.hlt` runs `sti; hlt` at ring 0) rather than
+                        // resuming V86. This Rust stand-in for the monitor halts the CPU
+                        // directly instead of round-tripping through an IRET into V86
+                        // followed immediately by a real HLT trap: same observable
+                        // result (the machine halts with CS still the monitor selector),
+                        // fewer moving parts in the harness.
+                        cpu.halted = true;
+                        continue;
+                    }
                     other => {
                         panic!("unexpected trap on opcode {other:#x} at guest eip {guest_eip:#x}")
                     }
@@ -28143,14 +28258,13 @@ mod tests {
                 cpu.iret(&mut bus, OperandSize::Dword).unwrap();
                 continue;
             }
-            if outcome.halted && cpu.is_v86_mode() {
-                guest_hlt = true;
-                break;
-            }
         }
 
-        assert!(guest_hlt, "guest never reached its terminal HLT");
-        assert_eq!(traps, 2, "STI and INT 0x21 must each trap once");
+        assert!(
+            monitor_halted,
+            "the monitor never halted on the guest's HLT"
+        );
+        assert_eq!(traps, 3, "STI, INT 0x21, and HLT must each trap once");
         assert!(
             bus.trace
                 .cycles()
