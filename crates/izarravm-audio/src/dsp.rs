@@ -512,6 +512,12 @@ impl SbDsp {
                     self.half_reached = false;
                     self.irq_pending = false;
                     self.pending = None;
+                    // The mode latches must clear too, or the idle 16-bit
+                    // guard in render_frame keeps direct DAC dead after any
+                    // 16-bit session.
+                    self.dma_16bit = false;
+                    self.stereo = false;
+                    self.sample_signed = false;
                 }
                 true
             }
@@ -585,6 +591,23 @@ mod tests {
         let mut dsp = SbDsp::default();
         write_cmd(&mut dsp, &[0x10, 0x80]);
         assert_eq!(dsp.direct_dac_byte(), Some(0x80));
+    }
+
+    #[test]
+    fn reset_clears_the_16bit_mode_latch_so_direct_dac_works_again() {
+        let mut dsp = SbDsp::default();
+        // Arm a 16-bit signed stereo auto-init playback (0xB6, mode 0x30).
+        write_cmd(&mut dsp, &[0xB6, 0x30, 0x07, 0x00]);
+        // Game resets the DSP (halt playback), then falls back to direct DAC.
+        dsp.write_port(0x226, 0x01);
+        dsp.write_port(0x226, 0x00);
+        write_cmd(&mut dsp, &[0x10, 0x80]);
+        let frame = dsp.render_frame(|| None, || None);
+        assert_eq!(
+            frame,
+            Some((0, 0)),
+            "direct DAC byte 0x80 (midpoint) must render after a reset"
+        );
     }
 
     #[test]
