@@ -7577,7 +7577,7 @@ impl Cpu386 {
         offset: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
-        let linear = self.segment_linear_byte(segment, offset)?;
+        let linear = self.segment_linear_byte(segment, offset, false)?;
         let physical = if self.control.cr0 & CR0_PG == 0 {
             linear
         } else {
@@ -7599,7 +7599,7 @@ impl Cpu386 {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
-        let linear = self.segment_linear_byte(segment, offset)?;
+        let linear = self.segment_linear_byte(segment, offset, true)?;
         let physical = if self.control.cr0 & CR0_PG == 0 {
             self.record_write_page(linear);
             linear
@@ -7615,13 +7615,72 @@ impl Cpu386 {
         Ok(())
     }
 
+    /// Validate a data access's *kind* against the segment descriptor's type field: a
+    /// write through a read-only data segment, or any access through an execute-only
+    /// code segment loaded into a data-segment register, is #GP (386 PRM 5-12, "Data
+    /// segments can be read-only or read/write... Code segments can be execute-only or
+    /// execute/read"). Real mode and V86 mode always carry the fully-permissive
+    /// `access = 0x93` (`SegmentRegister::real`), so this only ever rejects something in
+    /// protected mode; the caller gates on that to skip the check entirely otherwise.
+    /// Instruction fetch never routes through here (it uses `code_linear_for_offset`),
+    /// so CS's own readability never needs checking on this path -- only the case of a
+    /// *data* segment register (DS/ES/FS/GS/SS) that happens to hold a code descriptor.
+    fn check_segment_access_kind(
+        &self,
+        segment: SegmentIndex,
+        access: u8,
+        write: bool,
+    ) -> ExecResult<()> {
+        if !self.is_protected_mode() || self.is_v86_mode() {
+            return Ok(());
+        }
+        let is_code = access & 0x08 != 0; // descriptor type bit 3
+        let ok = if is_code {
+            // A code descriptor addressed as data: legal only for a read, and only if
+            // the code segment's readable bit (type bit 1) is set.
+            !write && access & 0x02 != 0
+        } else {
+            // A data descriptor: legal for a read always; a write needs the writable
+            // bit (type bit 1) set.
+            !write || access & 0x02 != 0
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(segment_limit_fault(segment))
+        }
+    }
+
     #[inline]
-    fn segment_linear_byte(&self, segment: SegmentIndex, offset: u32) -> ExecResult<u32> {
+    fn segment_linear_byte(
+        &self,
+        segment: SegmentIndex,
+        offset: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
+        self.check_segment_access_kind(segment, descriptor.access, write)?;
         if descriptor.base == 0 && descriptor.limit == u32::MAX {
             return Ok(offset);
         }
-        if offset > descriptor.limit {
+        let expand_down = self.is_protected_mode()
+            && !self.is_v86_mode()
+            && descriptor.access & 0x18 == 0x10
+            && descriptor.access & 0x04 != 0;
+        let in_limit = if expand_down {
+            // 386 PRM 5-12: an expand-down segment's valid offsets are those ABOVE the
+            // limit (up to 0xffff, or 0xffff_ffff for a 32-bit-default segment), the
+            // reverse of the normal sense.
+            let ceiling = if descriptor.default_size_32 {
+                u32::MAX
+            } else {
+                0xffff
+            };
+            offset > descriptor.limit && offset <= ceiling
+        } else {
+            offset <= descriptor.limit
+        };
+        if !in_limit {
             return Err(segment_limit_fault(segment));
         }
         Ok(descriptor.base.wrapping_add(offset))
@@ -7711,12 +7770,26 @@ impl Cpu386 {
         write: bool,
     ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
+        self.check_segment_access_kind(segment, descriptor.access, write)?;
         let linear = if descriptor.base == 0 && descriptor.limit == u32::MAX {
             offset
         } else {
-            if offset > descriptor.limit
-                || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
-            {
+            let last = offset.saturating_add(width.saturating_sub(1));
+            let expand_down = self.is_protected_mode()
+                && !self.is_v86_mode()
+                && descriptor.access & 0x18 == 0x10
+                && descriptor.access & 0x04 != 0;
+            let in_limit = if expand_down {
+                let ceiling = if descriptor.default_size_32 {
+                    u32::MAX
+                } else {
+                    0xffff
+                };
+                offset > descriptor.limit && last <= ceiling
+            } else {
+                offset <= descriptor.limit && last <= descriptor.limit
+            };
+            if !in_limit {
                 return Err(segment_limit_fault(segment));
             }
             descriptor.base.wrapping_add(offset)
@@ -8928,7 +9001,11 @@ impl Cpu386 {
                     let esp = self.pop(bus, OperandSize::Dword)?;
                     let ss = self.pop(bus, OperandSize::Dword)? as u16;
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
-                    self.load_segment(bus, SegmentIndex::Ss, ss)?;
+                    // The outer SS is a mechanical side effect of this IRET's ring
+                    // change, not a direct MOV/POP SS: `self.cpl` above is still the
+                    // pre-IRET (inner) level, so the plain-path CPL check would compare
+                    // against the wrong privilege level. See `load_segment_system`.
+                    self.load_segment_system(bus, SegmentIndex::Ss, ss)?;
                     self.set_eip(eip);
                     // 386 PRM 17-80: "Load SS:eSP from stack" -- eSP is B-keyed (17-12).
                     // Onto a B=0 (16-bit) outer stack, only SP takes the popped value;
@@ -9316,7 +9393,12 @@ impl Cpu386 {
         let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
         let new_esp = self.read_system_linear_u32(bus, esp_addr)?;
         let new_ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
-        self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
+        // The TSS-supplied SS for `target_dpl` is validated by the gate's own privilege
+        // rules (the gate/target DPL check already run in `far_call_gate`), not the
+        // plain-path CPL check: `self.cpl` here is still the outer (higher) level, since
+        // the caller sets it to `target_dpl` only after this call returns. See
+        // `load_segment_system`.
+        self.load_segment_system(bus, SegmentIndex::Ss, new_ss)?;
         // 386 PRM 17-43/17-74: "Load new SS:eSP value from TSS" -- eSP is B-keyed
         // (17-12), not always the full ESP. The just-loaded SS's B bit governs: a
         // 16-bit (B=0) ring-0 stack takes the TSS value into SP only, and ESP's
@@ -9436,7 +9518,12 @@ impl Cpu386 {
                     },
                 );
             } else {
-                self.load_segment(bus, *segment, selector)?;
+                // Task-switch register restore is a system-managed reload, not a plain
+                // MOV/POP Sreg: ES (first in TASK_SEGMENTS) loads before CS updates
+                // `self.cpl` to the incoming task's level below, so the plain-path
+                // CPL-vs-DPL check would run against the outgoing task's stale CPL for
+                // at least that register. See `load_segment_system`.
+                self.load_segment_system(bus, *segment, selector)?;
             }
             if *segment == SegmentIndex::Cs {
                 // PRM transition point: a hardware task switch can land the incoming task
@@ -9501,17 +9588,46 @@ impl Cpu386 {
         Ok(())
     }
 
+    /// The plain MOV Sreg/POP Sreg/LDS-family data-segment-load path: applies the full
+    /// PRM 6.7/9.1 privilege check (max(CPL, RPL) <= DPL for a non-conforming target).
     fn load_segment<B: CpuBus>(
         &mut self,
         bus: &mut B,
         segment: SegmentIndex,
         selector: u16,
     ) -> ExecResult<()> {
+        self.load_segment_checked(bus, segment, selector, true)
+    }
+
+    /// A segment reload that is itself the mechanical side effect of a privilege
+    /// transition the caller has already validated by its own rules: IRET's outer-stack
+    /// SS pop, the call-gate inner-stack switch, and the TSS register-restore loop.
+    /// `self.cpl` at the point of this call is mid-transition (still the old level, or
+    /// -- for the TSS loop's ES, loaded before CS -- not yet meaningful at all), so the
+    /// ordinary CPL-vs-DPL check does not apply; the descriptor type/writability check
+    /// still does (a system-managed load must still resolve to a legal data/stack
+    /// segment, just not one gated on the stale CPL).
+    fn load_segment_system<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        selector: u16,
+    ) -> ExecResult<()> {
+        self.load_segment_checked(bus, segment, selector, false)
+    }
+
+    fn load_segment_checked<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        selector: u16,
+        check_privilege: bool,
+    ) -> ExecResult<()> {
         if self.is_v86_mode() {
             // A V86 task addresses memory like the 8086: base = selector << 4, 64 KB.
             self.load_segment_real(segment, selector);
         } else if self.is_protected_mode() {
-            let register = self.load_protected_segment(bus, segment, selector)?;
+            let register = self.load_protected_segment(bus, segment, selector, check_privilege)?;
             self.registers.set_segment(segment, register);
             if segment == SegmentIndex::Cs {
                 self.invalidate_code_caches();
@@ -9535,6 +9651,7 @@ impl Cpu386 {
         bus: &mut B,
         segment: SegmentIndex,
         selector: u16,
+        check_privilege: bool,
     ) -> ExecResult<SegmentRegister> {
         // A null selector (index 0, TI clear) loaded into a data segment (ES/DS/FS/GS) is
         // legal: it installs a null/unusable segment with no fault at load time. A later
@@ -9575,6 +9692,50 @@ impl Cpu386 {
         let low = self.read_system_linear_u32(bus, descriptor_address)?;
         let high = self.read_system_linear_u32(bus, descriptor_address + 4)?;
         let access = ((high >> 8) & 0xff) as u8;
+        let is_segment = access & 0x10 != 0; // S bit: 1 = code/data, 0 = system
+        let descriptor_type = access & 0x0f;
+        let is_code = is_segment && descriptor_type & 0x8 != 0;
+        // 386 PRM 5.2/6.2 (table 5-1's code/data type matrix): a segment register may
+        // only be loaded with a code or data descriptor of the kind it can hold. A
+        // system-segment or gate descriptor (S clear -- LDT, TSS, call/task/trap/
+        // interrupt gate) is never legal in a segment register load; #GP regardless of
+        // which register. Otherwise CS accepts only a code descriptor; SS accepts only
+        // a writable data descriptor (a stack must be read/write, PRM 5-12); DS/ES/FS/GS
+        // accept a readable code descriptor or any data descriptor. This is the plain
+        // MOV Sreg/POP Sreg/LDS-family data-segment-load path -- CS loads through a
+        // call gate or a conforming/non-conforming far transfer are already checked by
+        // `far_call_gate`/`far_jump_gate`/`return_far` and are not duplicated here.
+        let type_legal = match segment {
+            SegmentIndex::Cs => is_code,
+            SegmentIndex::Ss => is_segment && !is_code && descriptor_type & 0x2 != 0,
+            _ => is_segment && (!is_code || descriptor_type & 0x2 != 0),
+        };
+        if !type_legal {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(selector_error_code(selector, in_ldt, false)),
+            });
+        }
+        // Privilege (386 PRM 6.7/9.1): a non-conforming load needs max(CPL, RPL) <= DPL.
+        // Conforming code (reachable at any caller privilege, PRM 5-13) and CS itself
+        // (whose CPL/RPL/DPL interplay is handled by the gate and far-transfer paths
+        // that call `load_segment` for CS, not this plain data-path check) are exempt.
+        // `check_privilege` is false for the system-managed reloads that route through
+        // `load_segment_system` (see its doc comment): those have already had their own
+        // privilege rules applied by the caller against a CPL that has not yet settled
+        // to its post-transition value here.
+        let conforming = is_code && descriptor_type & 0x4 != 0;
+        if check_privilege && segment != SegmentIndex::Cs && !conforming {
+            let dpl = (access >> 5) & 3;
+            let cpl = self.current_privilege_level();
+            let rpl = (selector & 3) as u8;
+            if dpl < cpl.max(rpl) {
+                return Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(selector_error_code(selector, in_ldt, false)),
+                });
+            }
+        }
         if access & 0x80 == 0 {
             // A present-bit-clear descriptor: #NP (vector 11) for every segment except SS,
             // which is #SS (vector 12) instead (386 PRM 9.3's "the SS register is being
@@ -9585,6 +9746,18 @@ impl Cpu386 {
                 vector,
                 error_code: Some(selector_error_code(selector, in_ldt, false)),
             });
+        }
+        // Mark the descriptor Accessed (bit 0 of the type field, PRM 5-12/5-13) on a
+        // successful load, same read-modify-write shape as `set_tss_busy`'s busy-bit
+        // toggle. Skipped when already set -- the common case once a segment has been
+        // touched once -- to avoid a write-back on every reload of a hot selector.
+        if access & 0x01 == 0 {
+            self.write_system_linear(
+                bus,
+                descriptor_address + 5,
+                BusWidth::Byte,
+                u32::from(access | 0x01),
+            )?;
         }
         Ok(self.descriptor_to_segment(selector, low, high))
     }
