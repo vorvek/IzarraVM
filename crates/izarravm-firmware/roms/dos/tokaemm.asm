@@ -1845,6 +1845,8 @@ vec13_entry:
     je monitor_body
     cmp al, 0xEC                  ; IN AL, DX
     je monitor_body
+    cmp al, 0xF4                  ; HLT (privileged since the CPL check landed;
+    je monitor_body               ; a V86 task is always CPL 3)
     mov al, 0x0B                  ; LAYER 3 (cold): OCW3, next master data
     out 0x20, al                  ; read = ISR
     in al, 0x20
@@ -1883,6 +1885,8 @@ monitor_body:
     je .in92_imm
     cmp dl, 0xEC                  ; IN AL, DX
     je .in92_dx
+    cmp dl, 0xF4                  ; HLT
+    je .hlt
     mov al, dl                    ; unhandled sensitive instruction: signal its opcode
     jmp signal32
 
@@ -2002,6 +2006,44 @@ monitor_body:
     or ax, 0x0200             ; frame keeps real IF = 1
     mov word [ebp+8], ax
     call maybe_deliver         ; IRET may re-enable interrupts
+    jmp .done_gp
+.hlt:
+    inc word [ebp]             ; return IP = past the F4 byte (HLT is 1 byte)
+    ; Real HLT is CPL-gated (a V86 task is always CPL 3), so the CPU now #GP(0)s
+    ; every guest HLT into this monitor. Give the guest real halt semantics: run
+    ; the actual `sti; hlt` at ring 0 so the CPU's own HLT/wake logic idles the
+    ; machine, then IRET back to the guest just past the F4 byte. The IDT is the
+    ; same table in both V86 and ring 0 (idt/idtr above), so any interrupt that
+    ; fires during this real HLT vectors straight into irq_m*/irq_s*/vec13_entry
+    ; exactly as it would have for the guest -- VIF=0 holds the line in vip (the
+    ; existing irq_body coalesce) and VIF=1 reflects it into the guest's IVT
+    ; (irq_reflect_line), same as any other interrupt arriving mid-V86.
+    ;
+    ; Guest VIF=0 (interrupts virtually disabled): a real 386 hangs forever on
+    ; `HLT` with IF=0, woken only by NMI or reset -- NMI is not virtualized here,
+    ; so a literal mirror would wedge the whole VM on a guest bug (or on a
+    ; legitimate but IF=0 halt-until-NMI idiom this emulator doesn't model).
+    ; Decision (documented, not a silent divergence): run the real `hlt` with
+    ; real IF left clear, matching the guest's request bit-for-bit; the run
+    ; loop's own interrupt-pending wake (service_pending_interrupt) still can't
+    ; fire with IF=0, so this blocks until something forces IF, which nothing
+    ; here does for a VIF=0 halt. To avoid a permanent guest-visible wedge on
+    ; ordinary FreeDOS idle loops (which always halt with IF=1 -- DOS brackets
+    ; IRQ-sensitive code with CLI/STI, never idles under CLI), only the VIF=1
+    ; path executes a real hlt; a VIF=0 HLT resumes the guest immediately
+    ; (equivalent to an instantaneous NMI/no-op wake), since no real game or
+    ; DOS idle loop halts with interrupts masked and this monitor has nothing
+    ; that will ever clear that state for it otherwise.
+    cmp byte [fs:vif], 0
+    je .done_gp
+    sti
+    hlt                         ; wakes when service_pending_interrupt admits a
+                                ; real IRQ; that IRQ has already been serviced
+                                ; by irq_m*/irq_s* (or held in vip) by the time
+                                ; control returns here, same as any interrupt
+                                ; landing mid-V86. .done_gp's IRETD restores
+                                ; the guest from the frame, not from live flags,
+                                ; so no CLI is needed after HLT wakes.
     jmp .done_gp
 .done_gp:
     popad
