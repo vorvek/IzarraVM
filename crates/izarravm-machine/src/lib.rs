@@ -7673,14 +7673,60 @@ impl Machine {
     /// V86 guest CS:IP the monitor was servicing is on its stack, not
     /// reachable here without walking the ring-0 stack frame -- noted as the
     /// gap rather than adding a paging-aware stack walk to this trace).
-    fn log_fault_trace(&self, error: &CpuError) {
+    fn log_fault_trace(&mut self, error: &CpuError) {
         let cs = self.cpu.registers.cs().selector;
         let eip = self.cpu.registers.eip;
+        let cs_base = self.cpu.registers.cs().base;
         eprintln!(
             "fault trace: {error} at CS:IP={cs:#06x}:{eip:#010x} v86={} ring0={}",
             self.cpu.is_v86_mode(),
             self.cpu.is_ring0_protected(),
         );
+        eprintln!(
+            "fault trace: CS base={cs_base:#010x} limit={:#010x} linear EIP={:#010x}",
+            self.cpu.registers.cs().limit,
+            cs_base.wrapping_add(eip),
+        );
+        let linear_eip = cs_base.wrapping_add(eip);
+        let mut bytes_before = String::new();
+        let start = linear_eip.saturating_sub(32);
+        for addr in start..linear_eip {
+            bytes_before.push_str(&format!("{:02x} ", self.read_physical_u8(addr)));
+        }
+        eprintln!(
+            "fault trace: bytes before EIP [{start:#010x}..{linear_eip:#010x}): {bytes_before}"
+        );
+        let mut bytes_after = String::new();
+        for addr in linear_eip..linear_eip.saturating_add(32) {
+            bytes_after.push_str(&format!("{:02x} ", self.read_physical_u8(addr)));
+        }
+        eprintln!("fault trace: bytes at/after EIP [{linear_eip:#010x}..): {bytes_after}");
+        // Dump the guest stack (128 bytes each direction) using SS base + ESP.
+        let ss_base = self
+            .cpu
+            .registers
+            .segment(izarravm_cpu::SegmentIndex::Ss)
+            .base;
+        let esp = self.cpu.registers.esp();
+        let stack_linear = ss_base.wrapping_add(esp);
+        let mut stack_before = String::new();
+        let sb_start = stack_linear.saturating_sub(128);
+        for addr in (sb_start..stack_linear).step_by(4) {
+            stack_before.push_str(&format!("{:08x} ", self.read_physical_u32(addr)));
+        }
+        eprintln!(
+            "fault trace: SS:ESP={:#06x}:{esp:#010x} linear={stack_linear:#010x}",
+            self.cpu
+                .registers
+                .segment(izarravm_cpu::SegmentIndex::Ss)
+                .selector
+        );
+        eprintln!("fault trace: stack before ESP: {stack_before}");
+        let mut stack_after = String::new();
+        for addr in (stack_linear..stack_linear.saturating_add(128)).step_by(4) {
+            stack_after.push_str(&format!("{:08x} ", self.read_physical_u32(addr)));
+        }
+        eprintln!("fault trace: stack at/after ESP: {stack_after}");
     }
 
     /// Write the current frame to `path` as a binary PPM (P6). PPM keeps a PNG

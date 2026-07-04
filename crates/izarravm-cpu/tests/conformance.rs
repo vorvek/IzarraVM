@@ -1,5 +1,5 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
-use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{Cpu386, SegmentIndex, SegmentRegister};
 use serde::Deserialize;
 
 // Flags the CPU core models. AF is now modeled but is undefined for logic ops
@@ -423,57 +423,66 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> V
 enum Outcome {
     Pass,
     Fail(Vec<String>),
-    Unimplemented,
     Skipped,
-    // The CPU raised #DE (DivideError) on a vector the suite did not mark as an
-    // exception. Because divide-by-zero vectors always carry an exception field and
-    // are compared below, a DivideError here is always a quotient-overflow case where
-    // the 386 silicon produces a non-trapping result we do not model; our CPU follows
-    // Intel's documented #DE. Counted separately so the divergence stays visible.
-    DivideQuirk,
+    // A raw host-fatal `CpuError` reached the harness: unmapped memory, a nested-fault-
+    // during-delivery bookkeeping error, an IDT-limit violation, or (with no exception
+    // expected) a delivered vector the corpus's reference model did not raise. Post-Batch-A
+    // every architectural fault the corpus exercises is guest-deliverable, so this bucket is
+    // strictly a harness/model-invariant violation, never an expected-exception match.
     Errored(String),
-    // The test expected an architectural exception; the CPU raised one too, but on a
-    // different vector (or raised no fault, or errored some other way). Carries the
+    // The test expected an architectural exception; the CPU either delivered a different
+    // vector, ran to completion without faulting, or errored out some other way. Carries the
     // expected vector so callers can histogram by it. This is exactly the "host-fatal
     // instead of delivered" bucket Batch A's fault-delivery unification targets.
     VectorMismatch { expected: u8, got: String },
 }
 
-/// Map a host-fatal `CpuError` to the architectural exception vector it corresponds to,
-/// per the 80386 PRM. Returns `None` for errors with no single architectural vector
-/// (a bus error, a nested-delivery failure, or an IDT-limit case that is not itself
-/// one of the vectors the conformance corpus exercises) -- those are not vector
-/// mismatches, they are harness/model errors and stay in `Errored`.
-///
-/// This mirrors the CURRENT (pre-Batch-A) raise sites: every one of these is host-fatal
-/// today. Once Batch A converts them to `InternalFault::Exception` and routes them
-/// through `deliver_exception`, this mapping becomes unnecessary here (the vector
-/// would come from the delivered frame instead) -- kept narrow and comment-tagged so
-/// it is obvious to delete then.
-fn cpu_error_vector(error: &CpuError) -> Option<u8> {
-    match error {
-        // #DE: divide error (DIV/IDIV/AAM by zero, or a quotient overflow).
-        CpuError::DivideError => Some(0),
-        // #UD: undefined opcode, including the two-byte (0F) map and group extensions.
-        CpuError::UnsupportedOpcode { .. }
-        | CpuError::UnsupportedTwoByteOpcode { .. }
-        | CpuError::UnsupportedGroupOpcode { .. } => Some(6),
-        // #GP: a bad/limit-violating/wrong-type descriptor load.
-        CpuError::GeneralProtection { .. } => Some(13),
-        // A segment-limit violation on SS is #SS (12); every other segment is #GP (13).
-        CpuError::SegmentLimit { segment, .. } => {
-            if *segment == SegmentIndex::Ss {
-                Some(12)
-            } else {
-                Some(13)
-            }
-        }
-        // Not one architectural vector by itself (a bus error, an IDT-limit host
-        // invariant, or a nested-fault-during-delivery bookkeeping error).
-        CpuError::Bus(_)
-        | CpuError::IdtLimit { .. }
-        | CpuError::NestedFaultDuringDelivery { .. } => None,
+// Post-Batch-A, every architectural fault the corpus exercises (vectors 0, 6, 12, 13) is
+// guest-DELIVERABLE: `cycle` runs `deliver_exception`/`real_mode_interrupt` to completion and
+// returns `Ok`, retargeting CS:IP at the guest's own IVT handler instead of erroring. There is
+// no error type left to pattern-match for the vector, so the harness instead installs a
+// distinct, unmistakable CS:IP trampoline at the ONE IVT slot a given test's expected vector
+// uses (never all 256 -- the corpus's non-faulting tests legitimately read/write low memory
+// that overlaps most other IVT slots) and, after running the instruction, checks whether the
+// CPU landed on that trampoline.
+// Real-mode CS base 0xf8000..0xf8ff00: far above any address a 386 conformance vector's
+// code/data/registers plausibly reach (the corpus's `ram` writes and segment values are
+// small), so it is safe as a dedicated trap landing zone inside the 16 MiB `FlatBus`.
+//
+// Known harness limitation (2 of 664200 vectors, both pre-existing div-by-zero cases with
+// SS:SP deliberately parked at/near 0): the interrupt frame `real_mode_interrupt` pushes can
+// land ON TOP of the just-installed IVT slot before the delivery code reads it back -- this is
+// architecturally faithful (real 8086 silicon has the identical hazard), not a Batch A
+// correctness bug, so these two report `VectorMismatch` ("did not halt") rather than a false
+// pass or a spurious regression signal.
+const TRAP_SEGMENT_BASE: u16 = 0xf800;
+const TRAP_IP: u16 = 0x0000;
+
+fn trap_cs_for_vector(vector: u8) -> u16 {
+    // One CS per vector, all sharing IP 0 -- distinct and trivially decodable back to a vector.
+    TRAP_SEGMENT_BASE.wrapping_add(u16::from(vector))
+}
+
+fn install_vector_trap(bus: &mut FlatBus, vector: u8) {
+    let cs = trap_cs_for_vector(vector);
+    let slot = u32::from(vector) * 4;
+    bus.write_u8(slot, TRAP_IP as u8);
+    bus.write_u8(slot + 1, (TRAP_IP >> 8) as u8);
+    bus.write_u8(slot + 2, cs as u8);
+    bus.write_u8(slot + 3, (cs >> 8) as u8);
+}
+
+/// If the CPU is currently sitting on one of `install_vector_trap`'s trampolines, return the
+/// vector it corresponds to.
+fn delivered_vector(cpu: &Cpu386) -> Option<u8> {
+    if cpu.registers.eip != u32::from(TRAP_IP) {
+        return None;
     }
+    let cs = cpu.registers.cs().selector;
+    if cs < TRAP_SEGMENT_BASE {
+        return None;
+    }
+    u8::try_from(cs - TRAP_SEGMENT_BASE).ok()
 }
 
 fn run_test(test: &CpuTest) -> Outcome {
@@ -489,6 +498,17 @@ fn run_test(test: &CpuTest) -> Outcome {
 
     let expected_vector = test.exception.as_ref().map(|exception| exception.number);
 
+    // Install a trap ONLY for the specific vector this test expects, and only AFTER applying
+    // the corpus's captured state: the corpus's `ram` entries include whatever IVT the
+    // reference model's host OS had live during vector generation (real vectors, e.g. bytes
+    // 24..28 for vector 6), so writing every one of the 256 slots unconditionally clobbers
+    // operand bytes plenty of NON-faulting tests legitimately read/write in low memory. A
+    // faulting test's `final` memory state is never compared (the exception path returns
+    // before `diffs` runs), so overwriting just this one 4-byte IVT slot is safe.
+    if let Some(vector) = expected_vector {
+        install_vector_trap(&mut bus, vector);
+    }
+
     // Each vector is the instruction under test followed by a HLT terminator;
     // the captured final state is taken after the CPU halts (its eip is past
     // the HLT). Run until halt, guarding against a vector that never halts.
@@ -496,34 +516,38 @@ fn run_test(test: &CpuTest) -> Outcome {
     loop {
         match cpu.cycle(&mut bus) {
             Ok(outcome) => {
+                if let Some(got) = delivered_vector(&cpu) {
+                    return if let Some(expected) = expected_vector {
+                        if got == expected {
+                            Outcome::Pass
+                        } else {
+                            Outcome::VectorMismatch {
+                                expected,
+                                got: format!("vector {got}"),
+                            }
+                        }
+                    } else {
+                        // No exception was expected but the CPU delivered one anyway (e.g. a
+                        // decode-time #UD/#GP the corpus's reference model did not raise).
+                        Outcome::Errored(format!("unexpected delivered vector {got}"))
+                    };
+                }
                 if outcome.halted {
                     break;
                 }
             }
             Err(error) => {
-                let got_vector = cpu_error_vector(&error);
+                // Every architectural vector the corpus exercises is deliverable post-Batch-A;
+                // a raw `CpuError` reaching here is a genuinely host-fatal condition (unmapped
+                // memory, a nested-fault-during-delivery bookkeeping error, or an IDT-limit
+                // violation), never an expected-exception match.
                 if let Some(expected) = expected_vector {
-                    return if got_vector == Some(expected) {
-                        Outcome::Pass
-                    } else {
-                        Outcome::VectorMismatch {
-                            expected,
-                            got: got_vector
-                                .map(|v| format!("vector {v}"))
-                                .unwrap_or_else(|| error.to_string()),
-                        }
+                    return Outcome::VectorMismatch {
+                        expected,
+                        got: error.to_string(),
                     };
                 }
-                // No exception was expected: preserve the pre-Step-0 classification for
-                // these two special cases so the non-exception baseline (pass/fail/
-                // unimplemented/divide-quirk) does not shift.
-                return match error {
-                    CpuError::UnsupportedOpcode { .. }
-                    | CpuError::UnsupportedTwoByteOpcode { .. }
-                    | CpuError::UnsupportedGroupOpcode { .. } => Outcome::Unimplemented,
-                    CpuError::DivideError => Outcome::DivideQuirk,
-                    other => Outcome::Errored(other.to_string()),
-                };
+                return Outcome::Errored(error.to_string());
             }
         }
         guard += 1;
@@ -728,15 +752,13 @@ fn conformance_suite_report() {
         .collect();
     paths.sort();
 
-    let (mut total, mut pass, mut fail, mut unimpl, mut skip, mut quirk, mut errored) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut total, mut pass, mut fail, mut skip, mut errored) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut mismatch = 0u64;
     let mut mismatch_by_vector: std::collections::BTreeMap<u8, u64> =
         std::collections::BTreeMap::new();
     let mut failing_files: Vec<String> = Vec::new();
     let mut partial_files: Vec<String> = Vec::new();
     let mut first_failures: Vec<String> = Vec::new();
-    let mut quirk_samples: Vec<String> = Vec::new();
     let mut mismatch_samples: Vec<String> = Vec::new();
     let mut parse_errors = 0u64;
 
@@ -752,8 +774,7 @@ fn conformance_suite_report() {
         };
 
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let (mut file_pass, mut file_fail, mut file_unimpl, mut file_skip, mut file_quirk) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut file_pass, mut file_fail, mut file_skip) = (0u64, 0u64, 0u64);
         let mut file_mismatch = 0u64;
         for test in &tests {
             total += 1;
@@ -773,20 +794,9 @@ fn conformance_suite_report() {
                         ));
                     }
                 }
-                Outcome::Unimplemented => {
-                    unimpl += 1;
-                    file_unimpl += 1;
-                }
                 Outcome::Skipped => {
                     skip += 1;
                     file_skip += 1;
-                }
-                Outcome::DivideQuirk => {
-                    quirk += 1;
-                    file_quirk += 1;
-                    if quirk_samples.len() < 20 {
-                        quirk_samples.push(format!("{name} [{}]", test.name));
-                    }
                 }
                 Outcome::Errored(message) => {
                     errored += 1;
@@ -811,15 +821,13 @@ fn conformance_suite_report() {
             failing_files.push(format!(
                 "{name}: {file_pass} pass / {file_fail} fail / {file_mismatch} vector-mismatch"
             ));
-        } else if file_unimpl > 0 || file_skip > 0 || file_quirk > 0 {
-            partial_files.push(format!(
-                "{name}: {file_pass} pass, {file_unimpl} unimplemented, {file_skip} skipped, {file_quirk} divide-quirk"
-            ));
+        } else if file_skip > 0 {
+            partial_files.push(format!("{name}: {file_pass} pass, {file_skip} skipped"));
         }
     }
 
     println!(
-        "files={} parse_errors={parse_errors} total={total} pass={pass} fail={fail} unimplemented={unimpl} skipped={skip} divide_quirk={quirk} errored={errored} vector_mismatch={mismatch}",
+        "files={} parse_errors={parse_errors} total={total} pass={pass} fail={fail} skipped={skip} errored={errored} vector_mismatch={mismatch}",
         paths.len()
     );
     println!("vector_mismatch_by_expected_vector:");
@@ -831,9 +839,6 @@ fn conformance_suite_report() {
     }
     for line in &partial_files {
         println!("PARTIAL {line}");
-    }
-    for line in &quirk_samples {
-        println!("DIVIDE-QUIRK {line}");
     }
     for line in &mismatch_samples {
         println!("VECTOR-MISMATCH {line}");
