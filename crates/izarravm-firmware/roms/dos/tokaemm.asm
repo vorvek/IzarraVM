@@ -1960,6 +1960,11 @@ monitor_body:
     test ax, 0x0200             ; popped IF -> VIF
     setnz cl
     mov [fs:vif], cl
+    and ax, 0xCFFF               ; keep the monitor's frame at IOPL 0 (bits 12-13):
+                                  ; the ring-0 IRETD back into V86 restores IOPL
+                                  ; from this frame verbatim (CPL 0, full PRM
+                                  ; restore), so a guest-popped IOPL=3 here would
+                                  ; escape vif virtualization for good
     or ax, 0x0200               ; frame keeps real IF = 1
     mov word [ebp+8], ax        ; update guest flags (VM in high word preserved)
     inc word [ebp]              ; POPF is 1 byte
@@ -2003,6 +2008,8 @@ monitor_body:
     test ax, 0x0200            ; popped IF -> VIF
     setnz cl
     mov [fs:vif], cl
+    and ax, 0xCFFF              ; keep the monitor's frame at IOPL 0, same reason
+                                 ; as .popf above
     or ax, 0x0200             ; frame keeps real IF = 1
     mov word [ebp+8], ax
     call maybe_deliver         ; IRET may re-enable interrupts
