@@ -1661,6 +1661,12 @@ fn run_boot_hdd_folder(
         write_framebuffer_ppm(&mut machine, path)?;
         println!("screenshot: {}", path.display());
     }
+    // Reconcile guest writes back to the host folder. Katea's write engine
+    // buffers guest file changes until a flush; without this, anything the
+    // guest wrote (a `dir > log.txt` capture, a rebound executable) is
+    // silently discarded at exit, which defeats the mounted-folder contract
+    // and the guest-side debug channel it enables.
+    machine.flush_hdd_folder();
     Ok(())
 }
 
