@@ -194,6 +194,9 @@ pub const LFB_FORMAT_DEPTH: u32 = 15;
 pub const LFB_FORMAT_MASK: u32 = 15;
 pub const LFB_ENABLE_PIXEL_PIPELINE: u32 = 0x100;
 
+/// fbzMode bit 0: enable the clip rectangle for rendering (SST-1). Fastfill
+/// always uses the clip registers as its extent regardless of this bit.
+pub const FBZ_CLIP_ENABLE: u32 = 1 << 0;
 pub const FBZ_CHROMAKEY: u32 = 1 << 1;
 pub const FBZ_STIPPLE: u32 = 1 << 2;
 pub const FBZ_W_BUFFER: u32 = 1 << 3;
@@ -785,10 +788,16 @@ impl Distira {
             return 0;
         }
 
-        let min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as u32;
-        let min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as u32;
-        let max_x = a.x.max(b.x).max(c.x).ceil().min(self.display.width as f32) as u32;
-        let max_y = a.y.max(b.y).max(c.y).ceil().min(self.display.height as f32) as u32;
+        let mut min_x = a.x.min(b.x).min(c.x).floor().max(0.0) as u32;
+        let mut min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as u32;
+        let mut max_x = a.x.max(b.x).max(c.x).ceil().min(self.display.width as f32) as u32;
+        let mut max_y = a.y.max(b.y).max(c.y).ceil().min(self.display.height as f32) as u32;
+        if self.fbz_mode & FBZ_CLIP_ENABLE != 0 {
+            min_x = min_x.max(self.clip_left);
+            max_x = max_x.min(self.clip_right);
+            min_y = min_y.max(self.clip_low_y);
+            max_y = max_y.min(self.clip_high_y);
+        }
 
         let mut written = 0;
         for y in min_y..max_y {
