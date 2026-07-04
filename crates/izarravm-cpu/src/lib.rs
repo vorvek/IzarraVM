@@ -8811,7 +8811,16 @@ impl Cpu386 {
                     self.load_segment(bus, SegmentIndex::Cs, cs)?;
                     self.load_segment(bus, SegmentIndex::Ss, ss)?;
                     self.set_eip(eip);
-                    self.registers.set_esp(esp);
+                    // 386 PRM 17-80: "Load SS:eSP from stack" -- eSP is B-keyed (17-12).
+                    // Onto a B=0 (16-bit) outer stack, only SP takes the popped value;
+                    // ESP's high word carries over from the inner stack untouched (the
+                    // documented real-silicon ESP-high-word leak on a 16-bit ring
+                    // transition). A B=1 outer stack takes the full popped dword.
+                    if self.stack_is_32bit() {
+                        self.registers.set_esp(esp);
+                    } else {
+                        self.write_gpr16(4, esp as u16);
+                    }
                     self.load_flags(flags, OperandSize::Dword, false);
                     // PRM transition point: the target RPL (checked above, non-V86) is the
                     // new CPL.
@@ -9155,7 +9164,17 @@ impl Cpu386 {
         let new_esp = self.read_system_linear_u32(bus, esp_addr)?;
         let new_ss = self.read_system_linear(bus, esp_addr + 4, BusWidth::Word)? as u16;
         self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
-        self.registers.set_esp(new_esp);
+        // 386 PRM 17-43/17-74: "Load new SS:eSP value from TSS" -- eSP is B-keyed
+        // (17-12), not always the full ESP. The just-loaded SS's B bit governs: a
+        // 16-bit (B=0) ring-0 stack takes the TSS value into SP only, and ESP's
+        // high word carries over from the interrupted context untouched (the same
+        // wrap-preserving-high-word rule `push`/`pop` use). A B=1 stack takes the
+        // TSS value as the full 32-bit ESP.
+        if self.stack_is_32bit() {
+            self.registers.set_esp(new_esp);
+        } else {
+            self.write_gpr16(4, new_esp as u16);
+        }
         Ok((old_ss, old_esp))
     }
 
@@ -28961,20 +28980,16 @@ mod tests {
     fn deliver_exception_onto_a_16bit_ring0_stack_wraps_sp_and_preserves_high_esp() {
         // The exact fault scenario this task fixes: a 32-bit interrupt gate delivers
         // onto a ring-0 stack whose SS descriptor has B=0 (a 16-bit stack segment,
-        // as DOS4GW/VCPI clients use), with ESP0's high word nonzero. The V86
-        // interrupt frame (10 dwords) must be built at SP-wrapped addresses, only SP
-        // advancing, not at raw ESP0 - 40.
+        // as DOS4GW/VCPI clients use). 386 PRM 17-43/17-74: "Load new SS:eSP value
+        // from TSS" is B-keyed (17-12) -- a B=0 target stack takes the TSS value
+        // into SP only, and ESP's high word carries over from the interrupted
+        // context untouched. The V86 interrupt frame (10 dwords) is then built at
+        // SP-wrapped addresses, only SP advancing.
         let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
-        // Flip the ring-0 data descriptor's B bit off (byte 6 bit 6 = 0x40) and give
-        // ESP0 a nonzero high word (0x0001) to make a full-ESP-arithmetic bug
-        // visible. Pick an SP just above the 16-bit wrap boundary: SP=0x0010, so
-        // SP-40 wraps to 0xffe8 (SS0.base is 0, identity, so that's also the
-        // physical write address -- real silicon addresses stack references with
-        // SP alone on a 16-bit stack, never combined with ESP's high word). The
-        // ESP *register* value afterward keeps the high word (0x0001_ffe8); a
-        // buggy full-ESP path would instead compute both the address and the
-        // register from 0x0001_0010 - 40 = 0x0000_ffe8, landing the frame at the
-        // same address by coincidence here but reporting the wrong ESP.
+        // Flip the ring-0 data descriptor's B bit off (byte 6 bit 6 = 0x40). Give
+        // TSS ESP0 a nonzero high word (0x0001) to prove it is dropped (SP-only
+        // load), and enter V86 with ESP high word 0 so a leftover-high-word bug
+        // would be visible in the final ESP.
         bus.memory[(GDT + 0x10 + 6) as usize] &= !0x40;
         put32(&mut bus.memory, TSS + 4, 0x0001_0010);
         enter_v86_direct(&mut cpu, 0x10, 0x1000);
@@ -28987,16 +29002,38 @@ mod tests {
         assert_eq!(cpu.registers.eip, MON_CODE);
         assert_eq!(
             cpu.registers.esp(),
-            0x0001_ffe8,
-            "SP must wrap at the 16-bit boundary, preserving ESP's high word"
+            0x0000_ffe8,
+            "SP takes only the TSS's low 16 bits, then wraps at the 16-bit \
+             boundary; the interrupted context's ESP high word (0) carries over, \
+             not the TSS's high word (0x0001)"
         );
-        // The frame lives at SS0.base (0) + the wrapped 16-bit SP (0xffe8), not at
-        // SS0.base + the reported ESP (which would be 0x1ffe8, well outside this
-        // test's mapped RAM and not where real hardware would have written it).
+        // The frame lives at SS0.base (0) + the wrapped 16-bit SP (0xffe8).
         let rd = |o: u32| u32::from_le_bytes(cpu_mem(&bus, 0xffe8 + o));
         assert_eq!(rd(0), 0, "error code");
         assert_eq!(rd(4), 0x10, "V86 EIP");
         assert_eq!(rd(16), 0x1000, "V86 ESP");
+    }
+
+    #[test]
+    fn deliver_exception_onto_a_16bit_ring0_stack_preserves_interrupted_esp_high_word() {
+        // Companion to the case above: this time the interrupted V86 context's ESP
+        // has a nonzero high word, proving it survives the SP-only TSS load (rather
+        // than being replaced by the TSS's, or zeroed).
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        bus.memory[(GDT + 0x10 + 6) as usize] &= !0x40;
+        put32(&mut bus.memory, TSS + 4, 0x0000_0010);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+        cpu.registers.set_esp(0xbeef_1000);
+
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
+
+        assert!(!cpu.stack_is_32bit(), "the loaded SS0 must carry B=0");
+        assert_eq!(
+            cpu.registers.esp(),
+            0xbeef_ffe8,
+            "the interrupted context's ESP high word (0xbeef) must carry over \
+             onto the new B=0 stack, with SP taken from the TSS and then wrapped"
+        );
     }
 
     #[test]
@@ -29143,6 +29180,52 @@ mod tests {
         assert_eq!(cpu.registers.cs().selector, r3_cs);
         assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
         assert_eq!(cpu.registers.esp(), 0x2000);
+    }
+
+    #[test]
+    fn iret_inter_privilege_return_to_a_16bit_stack_wraps_sp_and_preserves_high_esp() {
+        // 386 PRM 17-80: "Load SS:eSP from stack" is B-keyed (17-12). Returning to
+        // an outer ring whose SS descriptor has B=0 (the DPMI/DOS-extender 16-bit
+        // stack shape) must take the popped value into SP only, wrap at the
+        // 16-bit boundary, and leave ESP's high word as the inner stack's --
+        // exactly the documented real-silicon ESP-high-word leak on a 16-bit ring
+        // transition.
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        // Ring-3 code (access 0xfb) + a B=0 (16-bit) ring-3 data descriptor (0xf3,
+        // flags byte with the B bit, 0x40, cleared) at GDT slots 0x20 / 0x28.
+        let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+        let r3_data = descriptor(0, 0xffff, 0xf3, 0x00);
+        bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+        bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+        let r3_cs = 0x23u16; // 0x20 | RPL3
+        let r3_ss = 0x2Bu16; // 0x28 | RPL3
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        // Low half of ESP (0x6800) is the address `push` actually uses (the
+        // inner stack is B=1, so it addresses with full ESP); the high half
+        // (0x0001) must not leak onto the B=0 outer stack after IRET, and the
+        // physical address stays within the test's identity-mapped 0x20000
+        // bytes (0x0001_6800 < 0x20000).
+        cpu.registers.set_esp(0x0001_6800);
+        // Popped ESP has a different nonzero high word (0x0002); a B=0 target
+        // stack must drop it (SP-only load), not adopt it.
+        for v in [u32::from(r3_ss), 0x0002_0010, 0x2, u32::from(r3_cs), 0x1234] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3, "returned to ring 3");
+        assert!(!cpu.stack_is_32bit(), "the loaded outer SS must carry B=0");
+        assert_eq!(cpu.registers.eip, 0x1234);
+        assert_eq!(cpu.registers.cs().selector, r3_cs);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0001_0010,
+            "SP takes the popped value's low 16 bits; ESP's high word carries \
+             over from the inner stack (0x0001), not the popped high word \
+             (0x0002)"
+        );
     }
 
     #[test]
