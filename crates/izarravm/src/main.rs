@@ -1479,6 +1479,10 @@ fn run_boot_floppy(
     // investigation passes --cycles to run further, so honor it when given.
     let budget = cycles.unwrap_or(DEFAULT_BOOT_FLOPPY_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
+    // that the run loop returned, or its last partial buffer's worth of lines -- most
+    // often exactly the tail we care about -- is silently lost at process exit.
+    izarravm_cpu::flush_diff_trace();
 
     let cs = machine.cpu().registers.cs().selector;
     let ip = machine.cpu().registers.eip as u16;
@@ -1636,6 +1640,11 @@ fn run_boot_hdd_folder(
     machine.mount_hdd_folder(dir)?;
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
+    // that the run loop returned, or its last partial buffer's worth of lines -- most
+    // often exactly the tail we care about -- is silently lost at process exit. This
+    // is the path extender/game repros run through, so the flush matters most here.
+    izarravm_cpu::flush_diff_trace();
 
     let cs = machine.cpu().registers.cs().selector;
     let ip = machine.cpu().registers.eip as u16;
