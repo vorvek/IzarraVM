@@ -10390,13 +10390,19 @@ impl CpuBus for MachineBus<'_> {
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
         //
-        // In booter-inert mode the DOS multiplex vector (INT 2Fh) stands down so a
-        // self-booting disk owns it through the IVT; the BIOS hardware services
-        // (0x10-0x1A) stay intercepted. (The pure DOS vectors 0x20-0x2E are no
-        // longer intercepted at all — the Rust DOS kernel that serviced them was
-        // retired in SP-3 — and INT 67h is no longer intercepted either: the
-        // TOKAEMM guest driver owns the EMS API since SP-4b M2.)
-        let dos_multiplex = vector == 0x2F;
+        // The DOS multiplex vector (INT 2Fh) HLE -- including the AX=1686h/1687h
+        // DPMI-install check -- only stands in for a real handler when none
+        // exists. If the guest has hooked IVT[0x2F] itself (a DPMI host such as
+        // JEMMEX or DOS/32A's stub installing over it), that real handler must
+        // run instead, the same way the absent-resident-API vectors below stand
+        // down once something takes their vector over. In booter-inert mode it
+        // also stands down so a self-booting disk owns it through the IVT; the
+        // BIOS hardware services (0x10-0x1A) stay intercepted regardless. (The
+        // pure DOS vectors 0x20-0x2E are no longer intercepted at all — the Rust
+        // DOS kernel that serviced them was retired in SP-3 — and INT 67h is no
+        // longer intercepted either: the TOKAEMM guest driver owns the EMS API
+        // since SP-4b M2.)
+        let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
         let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
             && self.vector_points_at_rom_iret(vector)?;
         // A `new_raw_program` machine keeps INT 20h/21h/27h intercepted so the run
@@ -10405,21 +10411,11 @@ impl CpuBus for MachineBus<'_> {
         let raw_program_vector = self.program_runtime && matches!(vector, 0x20 | 0x21 | 0x27);
         let intercepted = matches!(
             vector,
-            0x10 | 0x11
-                | 0x12
-                | 0x13
-                | 0x14
-                | 0x15
-                | 0x17
-                | 0x18
-                | 0x19
-                | 0x1A
-                | 0x2F
-                | 0x40
-                | 0x42
+            0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x17 | 0x18 | 0x19 | 0x1A | 0x40 | 0x42
         ) || raw_program_vector
-            || absent_resident_api;
-        if intercepted && !(self.booter_inert && dos_multiplex) {
+            || absent_resident_api
+            || dos_multiplex;
+        if intercepted && !(self.booter_inert && vector == 0x2F) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -17163,6 +17159,36 @@ mod tests {
         assert_eq!(
             m.pending_soft_int, None,
             "an un-intercepted vector is ignored"
+        );
+    }
+
+    #[test]
+    fn int2f_stands_down_when_a_guest_dpmi_host_hooks_the_vector() {
+        let mut m = int15_machine(16);
+
+        // Default boot: IVT[0x2F] is still the ROM IRET stub, so the multiplex
+        // HLE intercepts as always.
+        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x2f),
+            "default boot: INT 2Fh is intercepted (no guest hook present)"
+        );
+        m.pending_soft_int = None;
+
+        // Simulate a guest DPMI host (e.g. JEMMEX) hooking IVT[0x2F] to point at
+        // its own handler in guest RAM instead of the ROM IRET stub.
+        {
+            let bus = m.make_bus();
+            bus.memory.write_u16(0x2f * 4, 0x128e).unwrap();
+            bus.memory.write_u16(0x2f * 4 + 2, 0x00d8).unwrap();
+        }
+        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int, None,
+            "guest-hooked INT 2Fh: the HLE stands down so the guest's own handler runs \
+             (this is what lets a real DPMI host answer AX=1686h/1687h instead of the \
+             HLE's stale \"no host\" answer)"
         );
     }
 
