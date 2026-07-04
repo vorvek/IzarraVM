@@ -8629,11 +8629,36 @@ impl Cpu386 {
                 self.load_flags(flags, OperandSize::Word);
             }
             OperandSize::Dword => {
+                let esp_before = self.registers.esp();
                 let eip = self.pop(bus, OperandSize::Dword)?;
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
 
                 if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
+                    // 386 PRM STACK-RETURN-TO-V86: "instruction pointer not within code
+                    // segment limit THEN #GP(0)" is checked against the popped EIP before
+                    // EFLAGS/CS/EIP/ESP or any of the V86 data segments are committed -- the
+                    // pseudocode gates on it ahead of every `Pop()` in the V86-tail sequence.
+                    // A V86 CS is always a real-mode-style segment (fixed 0xffff limit via
+                    // `load_segment_real`/`SegmentRegister::real`), so an EIP with a nonzero
+                    // high word is always out of range. Faulting here -- with the monitor's
+                    // pre-IRET CS:EIP still live and the V86-tail dwords (ESP/SS/ES/DS/FS/GS)
+                    // still on the stack -- keeps the #GP(0) frame correct; committing the
+                    // V86 state first and letting the next fetch discover the limit violation
+                    // would push a fabricated V86 return address (this exact IRET's popped
+                    // CS:EIP) into the fault frame instead of resuming the monitor right after
+                    // its own IRET, with its own stack intact.
+                    if eip > 0xffff {
+                        // A fault leaves the instruction restartable: undo the three pops
+                        // so the monitor's ESP is exactly pre-IRET (finish_instruction only
+                        // rewinds EIP/CS, never ESP).
+                        self.registers.set_esp(esp_before);
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
+                    }
+
                     // Return INTO a V86 task: pop the V86 tail and reload real-mode segments.
                     let esp = self.pop(bus, OperandSize::Dword)?;
                     let ss = self.pop(bus, OperandSize::Dword)? as u16;
@@ -27950,13 +27975,16 @@ mod tests {
     }
 
     #[test]
-    fn iret_into_v86_with_dirty_high_word_eip_faults_not_hangs() {
+    fn iret_into_v86_with_dirty_high_word_eip_faults_before_committing_v86_state() {
         // Same 32-bit V86 IRET frame as `iret_into_v86_restores_the_task`, but the popped
-        // EIP carries a nonzero high word (0x0001_0000): a real far call/return sequence
-        // can leave EIP sitting exactly on the CS limit boundary this way. `iret` must not
-        // silently truncate or mask the value -- it loads the full 32-bit EIP (correct: V86
-        // CS is always a 16-bit real-mode-style segment, so the very next fetch is expected
-        // to raise #GP(0) via `code_linear_for_offset`, not crash the host).
+        // EIP carries a nonzero high word (0x0001_0000). 386 PRM STACK-RETURN-TO-V86 checks
+        // "instruction pointer not within code segment limit" against the popped EIP and
+        // raises #GP(0) *before* EFLAGS/CS/EIP/ESP or the V86 data segments are committed --
+        // ahead of every `Pop()` in the pseudocode's V86-tail sequence. A V86 CS is always a
+        // 16-bit real-mode-style segment (fixed 0xffff limit), so this EIP is always out of
+        // range: `iret` must return the fault directly, leaving the ring-0 monitor's own
+        // CS/EIP/segments untouched (as if the IRET itself never executed), not commit a
+        // fabricated V86 frame and only discover the violation on the next fetch.
         let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
         cpu.registers.eflags = 0x2;
         cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
@@ -27977,28 +28005,35 @@ mod tests {
             cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
         }
 
-        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+        let result = cpu.iret(&mut bus, OperandSize::Dword);
 
-        assert!(cpu.is_v86_mode(), "IRET with popped VM=1 must re-enter V86");
-        assert_eq!(
-            cpu.registers.eip, 0x0001_0000,
-            "iret loads the full popped EIP untruncated"
-        );
-        assert_eq!(cpu.registers.cs().selector, 0x0A00);
-
-        // The next fetch is offset 0x10000 against a 16-bit CS limit of 0xffff: this must
-        // deliver #GP(0) through the normal exception path (reflected into the ring-0
-        // monitor), not return a fatal InternalFault::Cpu that kills the machine.
-        let outcome = cpu.cycle(&mut bus);
         assert!(
-            outcome.is_ok(),
-            "CS-limit violation on fetch must be a delivered fault, not a fatal error: {outcome:?}"
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 13,
+                    error_code: Some(0),
+                })
+            ),
+            "out-of-limit popped EIP must fault #GP(0) directly from iret: {result:?}"
         );
         assert!(
             !cpu.is_v86_mode(),
-            "the #GP(0) must be reflected into the ring-0 monitor"
+            "a faulted IRET must not have entered V86"
         );
-        assert_eq!(cpu.registers.cs().selector, R0_CS);
+        assert_eq!(
+            cpu.registers.cs().selector,
+            R0_CS,
+            "the monitor's own CS must be untouched by the faulted IRET"
+        );
+        // 9 dwords were pushed to build the frame; the faulted IRET must restore ESP to
+        // that pre-IRET value (finish_instruction rewinds only EIP/CS, so iret itself
+        // must undo its three pops or the monitor's stack drifts 12 bytes per fault).
+        assert_eq!(
+            cpu.registers.esp(),
+            0x6800 - 9 * 4,
+            "a faulted IRET must leave ESP exactly pre-IRET"
+        );
     }
 
     #[test]
