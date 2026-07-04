@@ -106,7 +106,19 @@ struct CpuTest {
     #[serde(rename = "final")]
     final_state: TestState,
     #[serde(default)]
-    exception: Option<serde_json::Value>,
+    exception: Option<ExpectedException>,
+}
+
+/// The corpus's exception record. `number` is the architectural vector; `flag_address`
+/// is test-generator metadata (an address the reference model touched while raising the
+/// fault) and is not an error code, so it is parsed but never compared. The corpus never
+/// carries an error code field, so vector is the only thing Step 0 can check.
+#[derive(Debug, Deserialize)]
+struct ExpectedException {
+    number: u8,
+    #[serde(default)]
+    #[allow(dead_code)]
+    flag_address: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -415,17 +427,56 @@ enum Outcome {
     Skipped,
     // The CPU raised #DE (DivideError) on a vector the suite did not mark as an
     // exception. Because divide-by-zero vectors always carry an exception field and
-    // are skipped above, a DivideError here is always a quotient-overflow case where
+    // are compared below, a DivideError here is always a quotient-overflow case where
     // the 386 silicon produces a non-trapping result we do not model; our CPU follows
     // Intel's documented #DE. Counted separately so the divergence stays visible.
     DivideQuirk,
     Errored(String),
+    // The test expected an architectural exception; the CPU raised one too, but on a
+    // different vector (or raised no fault, or errored some other way). Carries the
+    // expected vector so callers can histogram by it. This is exactly the "host-fatal
+    // instead of delivered" bucket Batch A's fault-delivery unification targets.
+    VectorMismatch { expected: u8, got: String },
+}
+
+/// Map a host-fatal `CpuError` to the architectural exception vector it corresponds to,
+/// per the 80386 PRM. Returns `None` for errors with no single architectural vector
+/// (a bus error, a nested-delivery failure, or an IDT-limit case that is not itself
+/// one of the vectors the conformance corpus exercises) -- those are not vector
+/// mismatches, they are harness/model errors and stay in `Errored`.
+///
+/// This mirrors the CURRENT (pre-Batch-A) raise sites: every one of these is host-fatal
+/// today. Once Batch A converts them to `InternalFault::Exception` and routes them
+/// through `deliver_exception`, this mapping becomes unnecessary here (the vector
+/// would come from the delivered frame instead) -- kept narrow and comment-tagged so
+/// it is obvious to delete then.
+fn cpu_error_vector(error: &CpuError) -> Option<u8> {
+    match error {
+        // #DE: divide error (DIV/IDIV/AAM by zero, or a quotient overflow).
+        CpuError::DivideError => Some(0),
+        // #UD: undefined opcode, including the two-byte (0F) map and group extensions.
+        CpuError::UnsupportedOpcode { .. }
+        | CpuError::UnsupportedTwoByteOpcode { .. }
+        | CpuError::UnsupportedGroupOpcode { .. } => Some(6),
+        // #GP: a bad/limit-violating/wrong-type descriptor load.
+        CpuError::GeneralProtection { .. } => Some(13),
+        // A segment-limit violation on SS is #SS (12); every other segment is #GP (13).
+        CpuError::SegmentLimit { segment, .. } => {
+            if *segment == SegmentIndex::Ss {
+                Some(12)
+            } else {
+                Some(13)
+            }
+        }
+        // Not one architectural vector by itself (a bus error, an IDT-limit host
+        // invariant, or a nested-fault-during-delivery bookkeeping error).
+        CpuError::Bus(_)
+        | CpuError::IdtLimit { .. }
+        | CpuError::NestedFaultDuringDelivery { .. } => None,
+    }
 }
 
 fn run_test(test: &CpuTest) -> Outcome {
-    if test.exception.is_some() {
-        return Outcome::Skipped;
-    }
     if let Some(&first) = test.bytes.first()
         && matches!(first, 0xe4..=0xe7 | 0xec..=0xef)
     {
@@ -435,6 +486,8 @@ fn run_test(test: &CpuTest) -> Outcome {
     let mut cpu = Cpu386::default();
     let mut bus = FlatBus::new();
     apply_state(&mut cpu, &mut bus, &test.initial);
+
+    let expected_vector = test.exception.as_ref().map(|exception| exception.number);
 
     // Each vector is the instruction under test followed by a HLT terminator;
     // the captured final state is taken after the CPU halts (its eip is past
@@ -447,16 +500,51 @@ fn run_test(test: &CpuTest) -> Outcome {
                     break;
                 }
             }
-            Err(CpuError::UnsupportedOpcode { .. })
-            | Err(CpuError::UnsupportedTwoByteOpcode { .. })
-            | Err(CpuError::UnsupportedGroupOpcode { .. }) => return Outcome::Unimplemented,
-            Err(CpuError::DivideError) => return Outcome::DivideQuirk,
-            Err(other) => return Outcome::Errored(other.to_string()),
+            Err(error) => {
+                let got_vector = cpu_error_vector(&error);
+                if let Some(expected) = expected_vector {
+                    return if got_vector == Some(expected) {
+                        Outcome::Pass
+                    } else {
+                        Outcome::VectorMismatch {
+                            expected,
+                            got: got_vector
+                                .map(|v| format!("vector {v}"))
+                                .unwrap_or_else(|| error.to_string()),
+                        }
+                    };
+                }
+                // No exception was expected: preserve the pre-Step-0 classification for
+                // these two special cases so the non-exception baseline (pass/fail/
+                // unimplemented/divide-quirk) does not shift.
+                return match error {
+                    CpuError::UnsupportedOpcode { .. }
+                    | CpuError::UnsupportedTwoByteOpcode { .. }
+                    | CpuError::UnsupportedGroupOpcode { .. } => Outcome::Unimplemented,
+                    CpuError::DivideError => Outcome::DivideQuirk,
+                    other => Outcome::Errored(other.to_string()),
+                };
+            }
         }
         guard += 1;
         if guard > 1024 {
+            if let Some(expected) = expected_vector {
+                return Outcome::VectorMismatch {
+                    expected,
+                    got: "did not halt within 1024 instructions".to_string(),
+                };
+            }
             return Outcome::Errored("did not halt within 1024 instructions".to_string());
         }
+    }
+
+    // The CPU ran to completion (halted) without faulting. If the corpus expected an
+    // exception, that is a mismatch: our model needs to raise one and did not.
+    if let Some(expected) = expected_vector {
+        return Outcome::VectorMismatch {
+            expected,
+            got: "no fault raised (instruction completed)".to_string(),
+        };
     }
 
     let cl = (test.initial.regs.ecx.unwrap_or(0) & 0xff) as u8;
@@ -642,10 +730,14 @@ fn conformance_suite_report() {
 
     let (mut total, mut pass, mut fail, mut unimpl, mut skip, mut quirk, mut errored) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut mismatch = 0u64;
+    let mut mismatch_by_vector: std::collections::BTreeMap<u8, u64> =
+        std::collections::BTreeMap::new();
     let mut failing_files: Vec<String> = Vec::new();
     let mut partial_files: Vec<String> = Vec::new();
     let mut first_failures: Vec<String> = Vec::new();
     let mut quirk_samples: Vec<String> = Vec::new();
+    let mut mismatch_samples: Vec<String> = Vec::new();
     let mut parse_errors = 0u64;
 
     for path in &paths {
@@ -662,6 +754,7 @@ fn conformance_suite_report() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let (mut file_pass, mut file_fail, mut file_unimpl, mut file_skip, mut file_quirk) =
             (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut file_mismatch = 0u64;
         for test in &tests {
             total += 1;
             match run_test(test) {
@@ -701,10 +794,23 @@ fn conformance_suite_report() {
                         first_failures.push(format!("{name} [{}]: ERROR {message}", test.name));
                     }
                 }
+                Outcome::VectorMismatch { expected, got } => {
+                    mismatch += 1;
+                    file_mismatch += 1;
+                    *mismatch_by_vector.entry(expected).or_insert(0) += 1;
+                    if mismatch_samples.len() < 40 {
+                        mismatch_samples.push(format!(
+                            "{name} [{}]: expected vector {expected}, got {got}",
+                            test.name
+                        ));
+                    }
+                }
             }
         }
-        if file_fail > 0 {
-            failing_files.push(format!("{name}: {file_pass} pass / {file_fail} fail"));
+        if file_fail > 0 || file_mismatch > 0 {
+            failing_files.push(format!(
+                "{name}: {file_pass} pass / {file_fail} fail / {file_mismatch} vector-mismatch"
+            ));
         } else if file_unimpl > 0 || file_skip > 0 || file_quirk > 0 {
             partial_files.push(format!(
                 "{name}: {file_pass} pass, {file_unimpl} unimplemented, {file_skip} skipped, {file_quirk} divide-quirk"
@@ -713,9 +819,13 @@ fn conformance_suite_report() {
     }
 
     println!(
-        "files={} parse_errors={parse_errors} total={total} pass={pass} fail={fail} unimplemented={unimpl} skipped={skip} divide_quirk={quirk} errored={errored}",
+        "files={} parse_errors={parse_errors} total={total} pass={pass} fail={fail} unimplemented={unimpl} skipped={skip} divide_quirk={quirk} errored={errored} vector_mismatch={mismatch}",
         paths.len()
     );
+    println!("vector_mismatch_by_expected_vector:");
+    for (vector, count) in &mismatch_by_vector {
+        println!("  vector {vector}: {count}");
+    }
     for line in &failing_files {
         println!("FAIL {line}");
     }
@@ -724,6 +834,9 @@ fn conformance_suite_report() {
     }
     for line in &quirk_samples {
         println!("DIVIDE-QUIRK {line}");
+    }
+    for line in &mismatch_samples {
+        println!("VECTOR-MISMATCH {line}");
     }
     for line in &first_failures {
         println!("  {line}");
