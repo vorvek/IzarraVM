@@ -27,6 +27,10 @@ pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
 pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
 pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
+pub const HLTTEST_COM: &[u8] = include_bytes!("../roms/dos/hlttest.com");
+pub const HLTTEST_COM_SOURCE: &str = include_str!("../roms/dos/hlttest.asm");
+pub const MULTIHLT_COM: &[u8] = include_bytes!("../roms/dos/multihlt.com");
+pub const MULTIHLT_COM_SOURCE: &str = include_str!("../roms/dos/multihlt.asm");
 pub const XMSTEST_COM: &[u8] = include_bytes!("../roms/dos/xmstest.com");
 pub const XMSTEST_COM_SOURCE: &str = include_str!("../roms/dos/xmstest.asm");
 pub const UMBTEST_COM: &[u8] = include_bytes!("../roms/dos/umbtest.com");
@@ -159,6 +163,24 @@ pub fn runner_com() -> &'static [u8] {
 /// A test program that terminates with DOS exit code 42; the katea-run e2e fixture.
 pub fn exit42_com() -> &'static [u8] {
     EXIT42_COM
+}
+
+/// Enables interrupts, runs a real HLT, then exits with code 1: the katea-run e2e
+/// fixture for guest HLT under TOKAEMM's V86 monitor. HLT is privileged on real
+/// 386+ (CPL != 0 -> #GP(0)); a V86 task is always CPL 3, so this traps into
+/// TOKAEMM, which emulates the guest's halt with a real ring-0 `sti; hlt` and
+/// resumes the guest past the F4 byte once an IRQ wakes it. A non-1 exit or a
+/// stop other than `TestExit`/`DosExit` means that round trip broke.
+pub fn hlttest_com() -> &'static [u8] {
+    HLTTEST_COM
+}
+
+/// Like `hlttest_com`, but loops a real HLT five times before exiting with code
+/// 7. Catches drift across repeated guest halts (e.g. a corrupted saved
+/// register or a stack-depth leak in TOKAEMM's HLT emulation that only shows up
+/// on the second or later wake).
+pub fn multihlt_com() -> &'static [u8] {
+    MULTIHLT_COM
 }
 
 /// The SP-4b M1 XMS round-trip e2e fixture: install-check, get entry, version,

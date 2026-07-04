@@ -2038,12 +2038,16 @@ monitor_body:
     je .done_gp
     sti
     hlt                         ; wakes when service_pending_interrupt admits a
-                                ; real IRQ; that IRQ has already been serviced
-                                ; by irq_m*/irq_s* (or held in vip) by the time
-                                ; control returns here, same as any interrupt
-                                ; landing mid-V86. .done_gp's IRETD restores
-                                ; the guest from the frame, not from live flags,
-                                ; so no CLI is needed after HLT wakes.
+                                ; real IRQ. This hlt runs at ring 0 (VM=0), so
+                                ; irq_body's real-frame check (below) cannot
+                                ; treat the waking IRQ's 3-dword IRETD frame as
+                                ; a V86 frame; it holds the line in vip and
+                                ; EOIs, same as the VIF=0 coalesce path, then
+                                ; IRETDs straight back here. Drain it into the
+                                ; guest now that we're about to return to V86:
+                                ; maybe_deliver reflects the highest-priority
+                                ; held line through EBP's real V86 frame.
+    call maybe_deliver
     jmp .done_gp
 .done_gp:
     popad
@@ -2079,10 +2083,21 @@ irq_common:                       ; pushad done, EBX = IRQ line
     mov fs, ax
 irq_body:                         ; vec13_entry joins here (segs already set)
     lea ebp, [esp + 32]
+    test dword [ebp+8], 0x00020000 ; real EFLAGS VM bit of the INTERRUPTED
+    jz .hold                       ; frame: clear means ring 0 (the monitor's
+                                    ; own .hlt sti;hlt window is the only place
+                                    ; this can happen), so reflect_vector must
+                                    ; never run against that 3-dword ring-0
+                                    ; IRETD frame (no V86 SS:SP to scribble
+                                    ; into), regardless of vif. Hold the line
+                                    ; exactly like the VIF=0 coalesce path;
+                                    ; .hlt drains it via maybe_deliver once
+                                    ; back in V86.
     cmp byte [fs:vif], 0
     jne .go
-    mov ecx, ebx                  ; VIF clear: hold the line, EOI now so the
-    mov ax, 1                     ; PIC keeps delivering
+.hold:
+    mov ecx, ebx                  ; hold the line, EOI now so the PIC keeps
+    mov ax, 1                     ; delivering
     shl ax, cl
     or [fs:vip], ax
     call irq_eoi
