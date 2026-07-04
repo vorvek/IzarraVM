@@ -1,5 +1,6 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus, DirectPage};
-use std::sync::OnceLock;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 mod fpu;
@@ -15,6 +16,45 @@ pub use fpu::X87;
 fn ud_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_FAULT_TRACE").is_some())
+}
+
+/// Gate for the differential-oracle per-instruction trace prototype
+/// (`IZARRAVM_DIFF_TRACE`). Separate env var from `IZARRAVM_FAULT_TRACE`
+/// deliberately: that one fires on a handful of cold fault paths, this one
+/// fires on every retired instruction, so it must never share a code path
+/// that could accidentally widen the fault trace's cost. Cached after the
+/// first check, same pattern as `ud_trace_enabled`, so the steady-state cost
+/// when unset is one relaxed load per instruction, not a syscall.
+fn diff_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
+}
+
+/// Explicitly flush the diff-trace buffer. Call this once after a headless run loop
+/// returns (any `run_until_*` call), NOT per instruction. Measured gap without this:
+/// a run that fills the 64 KiB buffer but does not end on an exact flush boundary
+/// loses its last partial buffer's worth of lines silently on process exit, which
+/// is exactly the boot-sector tail a differential trace most needs (the run's last
+/// few hundred instructions, right where a HLT or an interesting divergence sits).
+pub fn flush_diff_trace() {
+    if let Ok(mut w) = diff_trace_writer().lock() {
+        let _ = w.flush();
+    }
+}
+
+/// Process-wide buffered stderr handle for `emit_diff_trace_line`. A bare `eprintln!`
+/// per instruction is one unbuffered syscall per line, which throttles a POST-length
+/// trace to a few thousand lines/sec; wrapping stderr in a `BufWriter` amortizes that
+/// to one syscall per buffer flush. Callers MUST call `flush_diff_trace()` after their
+/// run loop returns -- see that function's doc for what silently goes missing without it.
+fn diff_trace_writer() -> &'static Mutex<std::io::BufWriter<std::io::Stderr>> {
+    static WRITER: OnceLock<Mutex<std::io::BufWriter<std::io::Stderr>>> = OnceLock::new();
+    WRITER.get_or_init(|| {
+        Mutex::new(std::io::BufWriter::with_capacity(
+            64 * 1024,
+            std::io::stderr(),
+        ))
+    })
 }
 
 const FLAG_CF: u32 = 0x0000_0001;
@@ -2750,6 +2790,49 @@ impl Cpu386 {
         self.finish_instruction(bus, result, start_eip, start_cs, profile_key, profile_start)
     }
 
+    /// Emit one differential-oracle trace line for the instruction that just retired at
+    /// `start_cs:start_eip`, in the common trace format: `CS:IP EAX EBX ECX EDX ESI EDI EBP
+    /// ESP EFLAGS CS DS ES SS FS GS` (space-separated hex, no leading 0x). Gated on
+    /// `diff_trace_enabled()`; callers check the gate themselves so the common case (env
+    /// var unset) costs exactly one cached bool load and this function is never called.
+    /// Reads `self.registers` fresh, i.e. AFTER the instruction retired, matching a
+    /// reference emulator's post-step register dump.
+    ///
+    /// Prototype-only note: writes go through a process-wide buffered, mutex-guarded
+    /// stderr handle (`diff_trace_writer`) rather than a bare `eprintln!`. An unbuffered
+    /// `eprintln!` here cost one syscall per retired instruction, which measured at only
+    /// ~3300 lines/sec against a redirected file -- far too slow to trace even a single
+    /// BIOS POST, let alone anything DOS4GW-shaped. This is a diagnostic tool, not a hot
+    /// path, so a mutex per line is an acceptable cost; the buffering is what actually
+    /// matters for throughput.
+    #[cold]
+    fn emit_diff_trace_line(&self, start_cs: u16, start_eip: u32) {
+        let r = &self.registers;
+        let mut w = diff_trace_writer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = writeln!(
+            w,
+            "{start_cs:04x}:{start_eip:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} \
+             {:08x} {:08x} {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}",
+            r.eax(),
+            r.ebx(),
+            r.ecx(),
+            r.edx(),
+            r.esi(),
+            r.edi(),
+            r.ebp(),
+            r.esp(),
+            r.eflags,
+            r.cs().selector,
+            r.segment(SegmentIndex::Ds).selector,
+            r.segment(SegmentIndex::Es).selector,
+            r.segment(SegmentIndex::Ss).selector,
+            r.segment(SegmentIndex::Fs).selector,
+            r.segment(SegmentIndex::Gs).selector,
+        );
+    }
+
     /// The shared rewind / deliver / scale tail of a single instruction's execution. It owns ONLY
     /// what happens after `result` is produced: on a delivered exception it rewinds eip (and CS, if a
     /// far transfer moved it) to the faulting instruction and delivers the fault through
@@ -2808,6 +2891,9 @@ impl Cpu386 {
         if let Some((group, opcode, form)) = profile_key {
             self.profile
                 .record(group, opcode, form, charged, profile_start);
+        }
+        if diff_trace_enabled() {
+            self.emit_diff_trace_line(start_cs, start_eip);
         }
         Ok(CycleOutcome {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
@@ -2937,6 +3023,13 @@ impl Cpu386 {
                     // live here too or the monitor body goes uncounted.
                     if self.is_ring0_protected() {
                         self.perf.monitor_resident_core_clocks += charged;
+                    }
+                    // Same reasoning as the residency counter above: this fast
+                    // tail bypasses finish_instruction, so the diff-trace hook
+                    // must be duplicated here or every cached-path instruction
+                    // (the common case) goes untraced.
+                    if diff_trace_enabled() {
+                        self.emit_diff_trace_line(start_cs, start_eip);
                     }
                     Ok(CycleOutcome {
                         core_clocks: charged.min(u64::from(u32::MAX)) as u32,
