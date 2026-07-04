@@ -1653,11 +1653,27 @@ gdtr:
     dw 0                          ; offset-high
 %endmacro
 align 8
+; SP-4b/vcpi-substrate: after the PRM-correct load_flags IOPL gate, a V86 guest
+; that legitimately raises its live IOPL to 3 (Watcom-compiled Toka-DOS kernel/
+; EMM glue does this during MEM runs) stops trapping CLI/STI/PUSHF/POPF/INT/
+; IRET as sensitive ops (check_v86_iopl correctly waves them through, matching
+; real silicon) -- so a bare `INT n` now dispatches through THIS static IDT
+; directly, at ring 0, instead of through vec13_entry's opcode-peek emulation.
+; Every previously-null slot below was safe only because IOPL was pinned at 0;
+; it no longer is. A null gate's selector field is 0x0000: deliver_exception's
+; final `load_segment(bus, Cs, 0)` raises a fatal CpuError::GeneralProtection
+; that unwinds out of the emulator entirely, not a re-entrant #GP the monitor
+; can catch. So every slot must hold a real gate now. deflt_N/deflt_common give
+; every currently-null vector the same reflect_vector treatment exc_de/exc_ud/
+; exc_nm already use: bounce it to the guest's own real-mode IVT handler,
+; matching how real hardware would have serviced a software INT anyway.
 idt:
     IDTGATE exc_de                ; 0    #DE divide error -> reflect to IVT[0]
-    times 5*8 db 0                ; 1..5 unbuilt: no expected V86 source (NMI
-                                  ;      unused; debug vectors need a resident
-                                  ;      debugger; BOUND is vanishingly rare)
+    IDTGATE deflt_1               ; 1    #DB/INT1 (debug; no resident debugger)
+    IDTGATE deflt_2               ; 2    NMI (never raised by this emulator)
+    IDTGATE deflt_3               ; 3    INT3 (breakpoint opcode / software int)
+    IDTGATE deflt_4               ; 4    #OF (INTO overflow trap)
+    IDTGATE deflt_5               ; 5    #BR (BOUND range exceeded)
     IDTGATE exc_ud                ; 6    #UD invalid opcode -> reflect to IVT[6]
                                   ;      (a guest program using 386-only ops at
                                   ;      GSWMODE 286 dies alone, not the system)
@@ -1670,7 +1686,23 @@ idt:
     IDTGATE vec13_entry           ; 13   #GP monitor OR IRQ5 (SB16)
     IDTGATE irq_m6                ; 14   IRQ6 FDC
     IDTGATE irq_m7                ; 15   IRQ7 LPT / PIC-spurious
-    times (0x70 - 16)*8 db 0      ; 16..0x6F
+    IDTGATE deflt_16              ; 16   #MF x87 FPU error (no FPU emulated here;
+                                  ;      exc_nm already reflects the no-FPU trap
+                                  ;      at vector 7, so this is belt-and-braces
+                                  ;      for a bare `INT 16h` at IOPL=3)
+    IDTGATE deflt_ac              ; 17   #AC alignment check (error-code frame;
+                                  ;      AM/CR0.AM is never set here, so this
+                                  ;      emulator can't raise it, but a bare
+                                  ;      `INT 17h` from V86 at IOPL=3 dispatches
+                                  ;      through this same slot with NO error
+                                  ;      code -- deflt_ac must handle both shapes)
+%assign v 18
+%rep (0x70 - 18)
+    IDTGATE deflt_%[v]            ; 18..0x6F: no dedicated handler (mostly the
+                                  ;           BIOS/DOS software-INT range) ->
+                                  ;           reflect to the guest's own IVT
+%assign v v+1
+%endrep
     IDTGATE irq_s8                ; 0x70 IRQ8  RTC
     IDTGATE irq_s9                ; 0x71 IRQ9
     IDTGATE irq_s10               ; 0x72 IRQ10
@@ -1679,6 +1711,14 @@ idt:
     IDTGATE irq_s13               ; 0x75 IRQ13
     IDTGATE irq_s14               ; 0x76 IRQ14 ATA
     IDTGATE irq_s15               ; 0x77 IRQ15 / slave-spurious
+%assign v 0x78
+%rep (0x100 - 0x78)
+    IDTGATE deflt_%[v]            ; 0x78..0xFF: the rest of the software-INT
+                                  ;             space (DOS 0x20-0x2E, EMS 0x67,
+                                  ;             multiplex 0x2F, user vectors) ->
+                                  ;             reflect to the guest's own IVT
+%assign v v+1
+%endrep
 idt_end:
 idtr:
     dw idt_end - idt - 1
@@ -2141,6 +2181,69 @@ exc_common:
     call reflect_vector
     popad
     iretd
+
+; ---- Default gates for every vector this driver has no dedicated handler
+; for (1-5, 16, 18-0x6F, 0x78-0xFF -- see the idt: comment above). Before the
+; PRM-correct load_flags IOPL fix these slots were unreachable: IOPL was
+; pinned at 0, so every guest INT/IRET/PUSHF/POPF trapped as a sensitive
+; instruction through vec13_entry's opcode-peek emulation first. A guest that
+; legitimately raises its own IOPL to 3 (Watcom-compiled Toka-DOS kernel/EMM
+; glue, observed during MEM runs) makes these dispatch for real, straight
+; through this IDT. Reflect exactly like exc_de/exc_ud/exc_nm: bounce to the
+; guest's own real-mode IVT handler, the same thing real hardware's IDT-driven
+; INT dispatch would have done. No EOI -- these are software INTs / CPU traps,
+; not PIC lines. ----
+%assign v 1
+%rep 5
+deflt_%[v]:
+    pushad
+    mov ebx, v
+    jmp deflt_common
+%assign v v+1
+%endrep
+deflt_16:
+    pushad
+    mov ebx, 16
+    jmp deflt_common
+%assign v 18
+%rep (0x70 - 18)
+deflt_%[v]:
+    pushad
+    mov ebx, v
+    jmp deflt_common
+%assign v v+1
+%endrep
+%assign v 0x78
+%rep (0x100 - 0x78)
+deflt_%[v]:
+    pushad
+    mov ebx, v
+    jmp deflt_common
+%assign v v+1
+%endrep
+deflt_common:
+    mov ax, 0x10
+    mov ds, ax
+    mov ax, 0x20
+    mov fs, ax
+    lea ebp, [esp + 32]
+    call reflect_vector
+    popad
+    iretd
+
+; ---- Vector 17 (#AC alignment check): the ONLY newly-covered vector whose
+; CPU-exception form carries an error code. This emulator never sets CR0.AM
+; (no #AC raise site exists), so the error-code shape can never actually
+; arrive here in practice -- but a bare `INT 17h` from V86 dispatches with NO
+; error code (software INT, deliver_exception never pushes one for is_external
+; or a plain software INT regardless of vector), so this must behave exactly
+; like deflt_common's no-error-code frame. Kept as its own named gate (not
+; folded into the 18-0x6F run) to document the asymmetry rather than let it
+; hide inside a generated range. ----
+deflt_ac:
+    pushad
+    mov ebx, 17
+    jmp deflt_common
 
 ; EOI the chip(s) for line EBX. The just-delivered line is the highest in
 ; service on its chip, so the non-specific EOI clears the right bit; slave
