@@ -10911,20 +10911,28 @@ fn fpu_arith(op: u8, a: f64, b: f64) -> f64 {
     }
 }
 
-/// FIST/FISTP rounding. Limit: round-to-nearest-even only; the control-word RC
-/// field is not yet honored (it almost always is round-to-nearest anyway).
-fn fpu_round_to_i64(value: f64) -> i64 {
-    value.round_ties_even() as i64
+/// Round per the control word's RC field (bits 10-11): 00 nearest-even, 01 toward
+/// negative infinity, 10 toward positive infinity, 11 chop. DJGPP-compiled code
+/// (Quake among it) flips RC to chop around every C `(int)` cast, so FIST/FISTP/
+/// FRNDINT/FBSTP must honor it rather than always rounding to nearest.
+fn fpu_round_rc(control: u16, value: f64) -> f64 {
+    match (control >> 10) & 3 {
+        0 => value.round_ties_even(),
+        1 => value.floor(),
+        2 => value.ceil(),
+        _ => value.trunc(),
+    }
 }
 
 impl Cpu386 {
     // ============================ x87 FPU (387-class) ============================
     // Escape opcodes 0xD8-0xDF. Registers are f64 (see fpu.rs for the precision
-    // ceiling). Transcendental functions, 80-bit-extended and BCD memory operands,
-    // integer-operand arithmetic (the FIADD family on 0xDA/0xDE memory), FCMOVcc,
-    // and the environment save/restore set are not implemented yet and return
-    // UnsupportedOpcode so they stay visible rather than silently wrong. See
-    // dev_docs/coverage-roadmap.md phase 2.
+    // ceiling). Coverage now spans arithmetic (all D8/DC/DA/DE forms), the
+    // transcendentals, 80-bit-extended and BCD memory operands, FCMOVcc/FCOMI
+    // (Pentium-era), and the environment/state save-restore set. Known limits are
+    // documented at each site: precision control is ignored (everything computes in
+    // f64), stores ignore RC (FIST/FRNDINT/FBSTP honor it), stack over/underflow
+    // does not fault, and the env image's instruction/data pointers store as zero.
 
     /// The x87 FPU block (0xD8-0xDF) + WAIT/FWAIT (0x9B) through the decode/execute split (task
     /// A13). A THIN wrapper: `decode` already fetched the ModRM once (and the addressing descriptor
@@ -11711,7 +11719,8 @@ impl Cpu386 {
                 Ok(clocks(70))
             }
             0xfc => {
-                let v = self.fpu.get(0).round_ties_even();
+                // FRNDINT: round to integer per the control word's RC field.
+                let v = fpu_round_rc(self.fpu.control, self.fpu.get(0));
                 self.fpu.set(0, v);
                 Ok(clocks(20))
             }
@@ -12067,7 +12076,14 @@ impl Cpu386 {
         mem: MemoryOperand,
         value: f64,
     ) -> ExecResult<()> {
-        let v = fpu_round_to_i64(value) as i16 as u16;
+        let r = fpu_round_rc(self.fpu.control, value);
+        let v = if r.is_nan() || !(-32768.0..=32767.0).contains(&r) {
+            // Out of range: the masked #IA response is the integer indefinite.
+            self.fpu.raise_exception(0x01);
+            0x8000u16
+        } else {
+            r as i16 as u16
+        };
         self.write_memory_sized(
             bus,
             mem.segment,
@@ -12084,7 +12100,13 @@ impl Cpu386 {
         mem: MemoryOperand,
         value: f64,
     ) -> ExecResult<()> {
-        let v = fpu_round_to_i64(value) as i32 as u32;
+        let r = fpu_round_rc(self.fpu.control, value);
+        let v = if r.is_nan() || !(-2147483648.0..=2147483647.0).contains(&r) {
+            self.fpu.raise_exception(0x01);
+            0x8000_0000u32
+        } else {
+            r as i32 as u32
+        };
         self.write_memory_sized(
             bus,
             mem.segment,
@@ -12101,7 +12123,18 @@ impl Cpu386 {
         mem: MemoryOperand,
         value: f64,
     ) -> ExecResult<()> {
-        self.write_qword(bus, mem, fpu_round_to_i64(value) as u64)
+        let r = fpu_round_rc(self.fpu.control, value);
+        // 2^63 is exactly representable; anything at or beyond it (or NaN) is out of
+        // range for i64 and stores the integer indefinite.
+        let v = if r.is_nan()
+            || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r)
+        {
+            self.fpu.raise_exception(0x01);
+            0x8000_0000_0000_0000u64
+        } else {
+            r as i64 as u64
+        };
+        self.write_qword(bus, mem, v)
     }
 
     fn read_extended80<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
@@ -12331,8 +12364,11 @@ impl Cpu386 {
         offset: u32,
         value: f64,
     ) -> ExecResult<()> {
-        let negative = value.is_sign_negative();
-        let mut magnitude = fpu_round_to_i64(value.abs()).unsigned_abs();
+        let rounded = fpu_round_rc(self.fpu.control, value);
+        let negative = rounded.is_sign_negative();
+        // ponytail: BCD overflow past 18 digits is not detected (Quake never FBSTPs);
+        // add the packed-BCD indefinite if a title ever trips it.
+        let mut magnitude = rounded.abs() as u64;
         let mut raw = [0u8; 9];
         for slot in raw.iter_mut() {
             let lo = (magnitude % 10) as u8;
@@ -29360,6 +29396,84 @@ mod tests {
                 "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
                 g.name
             );
+        }
+    }
+
+    #[test]
+    fn fist_honors_rounding_control() {
+        // FISTP m32 [0x130] (DB 1E 30 01) under all four RC modes. DJGPP-compiled code
+        // (Quake) flips RC to chop around every C (int) cast; 80387 PRM table 15-2.
+        let cases: &[(u16, f64, u32)] = &[
+            (0b00, 2.5, 2), // nearest-even
+            (0b01, 2.5, 2), // toward -inf
+            (0b10, 2.5, 3), // toward +inf
+            (0b11, 2.5, 2), // chop
+            (0b00, -1.5, -2i32 as u32),
+            (0b01, -1.5, -2i32 as u32),
+            (0b10, -1.5, -1i32 as u32),
+            (0b11, -1.5, -1i32 as u32),
+        ];
+        for &(rc, input, expected) in cases {
+            let mut mem = vec![0u8; 0x200];
+            mem[..4].copy_from_slice(&[0xdb, 0x1e, 0x30, 0x01]);
+            let mut cpu = Cpu386::default();
+            fpu_seed(&mut cpu);
+            cpu.fpu.control = 0x037f | (rc << 10);
+            cpu.fpu.push(input);
+            let mut bus = TestBus::with_memory(mem);
+            exec_one_split(&mut cpu, &mut bus).unwrap();
+            let got = u32::from_le_bytes(bus.memory[0x130..0x134].try_into().unwrap());
+            assert_eq!(got, expected, "FISTP m32 of {input} with RC={rc:02b}");
+            assert_eq!(
+                cpu.fpu.status & 0x01,
+                0,
+                "no IE for the in-range FISTP of {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn fist_overflow_stores_integer_indefinite_and_raises_ie() {
+        // Out-of-range (and NaN) FIST stores the integer indefinite for the width and
+        // raises IE (masked #IA response), rather than Rust's saturating cast.
+        let m16: &[u8] = &[0xdf, 0x1e, 0x30, 0x01]; // FISTP m16
+        let m32: &[u8] = &[0xdb, 0x1e, 0x30, 0x01]; // FISTP m32
+        let m64: &[u8] = &[0xdf, 0x3e, 0x30, 0x01]; // FISTP m64
+        let cases: &[(&[u8], f64, Vec<u8>)] = &[
+            (m16, 40000.0, 0x8000u16.to_le_bytes().to_vec()),
+            (m16, -40000.0, 0x8000u16.to_le_bytes().to_vec()),
+            (m32, 3.0e9, 0x8000_0000u32.to_le_bytes().to_vec()),
+            (m64, 1.0e19, 0x8000_0000_0000_0000u64.to_le_bytes().to_vec()),
+            (m32, f64::NAN, 0x8000_0000u32.to_le_bytes().to_vec()),
+        ];
+        for (code, input, expected) in cases {
+            let mut mem = vec![0u8; 0x200];
+            mem[..code.len()].copy_from_slice(code);
+            let mut cpu = Cpu386::default();
+            fpu_seed(&mut cpu);
+            cpu.fpu.push(*input);
+            let mut bus = TestBus::with_memory(mem);
+            exec_one_split(&mut cpu, &mut bus).unwrap();
+            let got = &bus.memory[0x130..0x130 + expected.len()];
+            assert_eq!(got, expected, "indefinite for FISTP of {input}");
+            assert_ne!(cpu.fpu.status & 0x01, 0, "IE raised for FISTP of {input}");
+        }
+    }
+
+    #[test]
+    fn frndint_honors_rounding_control() {
+        for (rc, expected) in [(0u16, -2.0), (1, -2.0), (2, -1.0), (3, -1.0)] {
+            let mut cpu = Cpu386::default();
+            fpu_seed(&mut cpu);
+            cpu.fpu.control = 0x037f | (rc << 10);
+            cpu.fpu.push(-1.5);
+            let mut bus = TestBus::with_memory({
+                let mut mem = vec![0u8; 0x200];
+                mem[..2].copy_from_slice(&[0xd9, 0xfc]); // FRNDINT
+                mem
+            });
+            exec_one_split(&mut cpu, &mut bus).unwrap();
+            assert_eq!(cpu.fpu.get(0), expected, "FRNDINT of -1.5 with RC={rc:02b}");
         }
     }
 
