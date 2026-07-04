@@ -5021,51 +5021,63 @@ impl Cpu386 {
 
         match opcode {
             0x06 => {
+                // PUSH ES. 386 PRM: with a 32-bit operand size (D=1 code segment or a 66h
+                // prefix), PUSH sreg decrements ESP by 4 and writes the 16-bit selector
+                // zero-extended to a dword; with a 16-bit operand size it is the classic
+                // 2-byte push. `u32::from(selector)` already zero-extends, so honoring
+                // `operand_size` here (instead of hardcoding Word) covers both cases.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Es).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x07 => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                // POP ES. 386 PRM: a 32-bit operand size pops a full dword and loads the
+                // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Es, value)?;
                 Ok(clocks(7))
             }
             0x0e => {
+                // PUSH CS. Same 386 PRM operand-size rule as PUSH ES above.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Cs).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x16 => {
+                // PUSH SS. Same 386 PRM operand-size rule as PUSH ES above.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Ss).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x17 => {
                 // POP SS. Arms the one-instruction interrupt shadow like MOV SS (386 PRM 11-16),
                 // so a following POP (E)SP is guaranteed to run before any interrupt is taken.
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                // Same 386 PRM operand-size rule as POP ES above.
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment_arming_ss_shadow(bus, SegmentIndex::Ss, value)?;
                 Ok(clocks(7))
             }
             0x1e => {
+                // PUSH DS. Same 386 PRM operand-size rule as PUSH ES above.
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Ds).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             0x1f => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                // POP DS. Same 386 PRM operand-size rule as POP ES above.
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Ds, value)?;
                 Ok(clocks(7))
             }
@@ -7059,15 +7071,16 @@ impl Cpu386 {
             }
             // PUSH FS / PUSH GS (0F A0 / 0F A8): 386+ additions, otherwise identical to the
             // one-byte PUSH ES/CS/SS/DS handlers in `execute_stack_decoded` (0x06/0x0e/0x16/
-            // 0x1e) -- push the 16-bit selector, always at `OperandSize::Word` regardless of
-            // the current operand-size attribute (a segment selector is always 16 bits; a
-            // 32-bit-operand-size PUSH FS still only writes/advances by 2, matching real
-            // 386+ silicon and the existing ES/SS/DS arms). Same clock cost (2) as those.
+            // 0x1e). 386 PRM: PUSH sreg with a 32-bit operand size (66h prefix or D=1 code
+            // segment) decrements ESP by 4 and writes the 16-bit selector zero-extended to a
+            // dword; with a 16-bit operand size it is the classic 2-byte push. Honor
+            // `operand_size` here instead of hardcoding Word, matching the ES/SS/DS fix.
+            // Same clock cost (2) as those.
             0xa0 => {
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Fs).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
@@ -7075,21 +7088,23 @@ impl Cpu386 {
                 self.push(
                     bus,
                     u32::from(self.registers.segment(SegmentIndex::Gs).selector),
-                    OperandSize::Word,
+                    operand_size,
                 )?;
                 Ok(clocks(2))
             }
             // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
-            // 16-bit selector off the stack, then run it through the same `load_segment`
+            // selector off the stack, then run it through the same `load_segment`
             // descriptor-load path (which raises the identical #GP/#SS a bad or null selector
-            // would on POP DS). Same clock cost (7) as those.
+            // would on POP DS). 386 PRM: a 32-bit operand size pops a full dword and loads the
+            // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
+            // Same clock cost (7) as those.
             0xa1 => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Fs, value)?;
                 Ok(clocks(7))
             }
             0xa9 => {
-                let value = self.pop(bus, OperandSize::Word)? as u16;
+                let value = self.pop(bus, operand_size)? as u16;
                 self.load_segment(bus, SegmentIndex::Gs, value)?;
                 Ok(clocks(7))
             }
@@ -23982,10 +23997,10 @@ mod tests {
     }
 
     #[test]
-    fn push_fs_gs_ignore_the_32_bit_operand_size_prefix() {
-        // 66 0F A0 / 66 0F A8: a segment selector is always 16 bits, so a 32-bit operand-size
-        // override must still only push 2 bytes and move SP by 2 -- exactly like the one-byte
-        // PUSH ES/CS/SS/DS arms, which hardcode `OperandSize::Word` regardless of `operand_size`.
+    fn push_fs_gs_zero_extend_under_the_32_bit_operand_size_prefix() {
+        // 66 0F A0 / 66 0F A8: 386 PRM -- PUSH sreg with a 32-bit operand size decrements
+        // ESP by 4 and writes the 16-bit selector zero-extended to a dword (the SDM PUSH
+        // operation note). Same rule as the one-byte PUSH ES/CS/SS/DS arms.
         for (code, segment, value) in [
             ([0x66u8, 0x0f, 0xa0].as_slice(), SegmentIndex::Fs, 0x1234u16),
             ([0x66, 0x0f, 0xa8].as_slice(), SegmentIndex::Gs, 0x5678u16),
@@ -23997,13 +24012,164 @@ mod tests {
             cpu.cycle(&mut bus).unwrap();
             assert_eq!(
                 cpu.read_reg16(Reg16::Sp),
-                0x01ee,
-                "SP must still only move by 2 with a 32-bit operand-size prefix"
+                0x01ec,
+                "SP must move by 4 with a 32-bit operand-size prefix"
             );
             assert_eq!(
-                u16::from_le_bytes(bus.memory[0x1ee..0x1f0].try_into().unwrap()),
-                value,
-                "the pushed word must be the 16-bit selector, not a 32-bit zero-extension"
+                u32::from_le_bytes(bus.memory[0x01ec..0x01f0].try_into().unwrap()),
+                u32::from(value),
+                "the pushed dword must be the 16-bit selector zero-extended"
+            );
+        }
+    }
+
+    #[test]
+    fn pop_fs_gs_discard_the_upper_word_under_the_32_bit_operand_size_prefix() {
+        // 66 0F A1 / 66 0F A9: 386 PRM -- POP sreg with a 32-bit operand size pops a full
+        // dword, loads the low 16 bits into the segment register, and discards the upper 16.
+        // Same rule as the one-byte POP ES/SS/DS arms.
+        for (code, segment) in [
+            ([0x66u8, 0x0f, 0xa1].as_slice(), SegmentIndex::Fs),
+            ([0x66, 0x0f, 0xa9].as_slice(), SegmentIndex::Gs),
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.memory[0x1f0..0x1f4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01f4, "SP must advance by 4");
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0xbeef,
+                "{segment:?} must load only the low 16 bits, discarding 0xdead"
+            );
+        }
+    }
+
+    #[test]
+    fn push_pop_one_byte_sreg_zero_extend_under_the_32_bit_operand_size_prefix() {
+        // 66 06 / 66 0E / 66 16 / 66 1E (PUSH ES/CS/SS/DS) and 66 07 / 66 1F (POP ES/DS):
+        // the one-byte segment-register push/pop opcodes follow the identical 386 PRM
+        // operand-size rule as PUSH/POP FS/GS above. POP SS (66 17) is covered separately
+        // below because it arms the MOV-SS interrupt shadow.
+        for (push_code, pop_code, segment, value) in [
+            (
+                [0x66u8, 0x06].as_slice(),
+                [0x66u8, 0x07].as_slice(),
+                SegmentIndex::Es,
+                0x1111u16,
+            ),
+            (
+                [0x66, 0x1e].as_slice(),
+                [0x66, 0x1f].as_slice(),
+                SegmentIndex::Ds,
+                0x2222,
+            ),
+        ] {
+            // PUSH: selector zero-extended to a dword, ESP -= 4.
+            let (mut cpu, memory) = fs_gs_stack_cpu(push_code);
+            cpu.registers
+                .set_segment(segment, SegmentRegister::real(value));
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01ec,
+                "{push_code:02x?}: SP must move by 4 with a 32-bit operand-size prefix"
+            );
+            assert_eq!(
+                u32::from_le_bytes(bus.memory[0x01ec..0x01f0].try_into().unwrap()),
+                u32::from(value),
+                "{push_code:02x?}: the pushed dword must be the selector zero-extended"
+            );
+
+            // POP: full dword popped, only the low 16 bits loaded.
+            let (mut cpu, memory) = fs_gs_stack_cpu(pop_code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.memory[0x1f0..0x1f4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01f4,
+                "{pop_code:02x?}: SP must advance by 4"
+            );
+            assert_eq!(
+                cpu.registers.segment(segment).selector,
+                0xbeef,
+                "{pop_code:02x?}: {segment:?} must load only the low 16 bits"
+            );
+        }
+    }
+
+    #[test]
+    fn push_pop_ss_zero_extends_under_the_32_bit_operand_size_prefix() {
+        // 66 16 (PUSH SS) / 66 17 (POP SS): same 386 PRM operand-size rule, but POP SS also
+        // arms the one-instruction interrupt shadow (`load_segment_arming_ss_shadow`), so it
+        // gets its own test rather than folding into the ES/DS table above. Unlike PUSH
+        // FS/ES/DS, PUSH SS cannot push an arbitrary probe value into SS without also
+        // relocating the stack it is about to push onto, so this asserts against
+        // `fs_gs_stack_cpu`'s real-mode SS selector (0) instead.
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x66, 0x16]);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x01ec,
+            "PUSH SS must move SP by 4"
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x01ec..0x01f0].try_into().unwrap()),
+            0x0000,
+            "PUSH SS must zero-extend the selector to a dword"
+        );
+
+        let (mut cpu, memory) = fs_gs_stack_cpu(&[0x66, 0x17]);
+        let mut bus = TestBus::with_memory(memory);
+        bus.memory[0x1f0..0x1f4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x01f4,
+            "POP SS must advance SP by 4"
+        );
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ss).selector,
+            0xbeef,
+            "POP SS must load only the low 16 bits"
+        );
+    }
+
+    #[test]
+    fn push_pop_one_byte_sreg_unchanged_at_16_bit_operand_size() {
+        // Without a 66h prefix, PUSH/POP ES/CS/SS/DS (and FS/GS) stay the classic 2-byte
+        // real-mode DOS behavior -- this is the frozen-class-sensitivity check: no bench or
+        // real-mode DOS code observes a behavior change from the operand_size fix.
+        for code in [
+            [0x06u8, 0x90], // PUSH ES; NOP pad
+            [0x0e, 0x90],   // PUSH CS; NOP pad
+            [0x16, 0x90],   // PUSH SS; NOP pad
+            [0x1e, 0x90],   // PUSH DS; NOP pad
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(&code);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01ee,
+                "{code:02x?}: 16-bit-operand-size PUSH sreg must still only move SP by 2"
+            );
+        }
+        for code in [
+            [0x07u8, 0x90], // POP ES; NOP pad
+            [0x1f, 0x90],   // POP DS; NOP pad
+        ] {
+            let (mut cpu, memory) = fs_gs_stack_cpu(&code);
+            let mut bus = TestBus::with_memory(memory);
+            bus.memory[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+            cpu.cycle(&mut bus).unwrap();
+            assert_eq!(
+                cpu.read_reg16(Reg16::Sp),
+                0x01f2,
+                "{code:02x?}: 16-bit-operand-size POP sreg must still only move SP by 2"
             );
         }
     }
