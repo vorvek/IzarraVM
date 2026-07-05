@@ -3449,7 +3449,10 @@ impl Vga {
         } else {
             match self.attr.index {
                 0x00..=0x0F => self.attr.palette[self.attr.index as usize] = value & 0x3F,
-                0x10 => self.attr.mode_control = value,
+                0x10 => {
+                    self.attr.mode_control = value;
+                    self.maybe_enter_mode13h_from_registers();
+                }
                 0x11 => self.attr.overscan = value,
                 0x12 => self.attr.plane_enable = value,
                 0x13 => self.attr.pixel_pan = value & 0x0F,
@@ -4174,6 +4177,42 @@ impl Vga {
         self.crtc.vblank_end = vblank_end;
         self.crtc.max_scan = max_scan;
         self.crtc.double_scan = (r.r09 & 0x80 != 0) || max_scan == 1;
+        self.resize_work();
+    }
+
+    /// Register-banged 256-color entry. Real silicon has no mode numbers: writing
+    /// the standard 13h register set (ATC mode-control graphics bit 0 + 8-bit
+    /// color bit 6, SEQ memory-mode chain-4) IS the mode change, and DOS Quake
+    /// 1.06 sets 320x200x256 exactly this way (its vgamodes register tables, no
+    /// INT 10h). Act-on-write like the chain-4 mode-X toggle above: the ATC
+    /// mode-control write is the last register in the conventional modeset order,
+    /// so it is the decision point. Only the personality/scanout state flips -
+    /// the guest's own SEQ/GC/ATC/CRTC values stay untouched (no VGABIOS readback
+    /// seeding, no palette reset: a register-banging guest loads its own DAC).
+    /// ponytail: horizontal timing installs the canonical 13h values rather than
+    /// decoding the guest's CRTC horizontal registers (Quake writes the standard
+    /// ones); decode them if a title ever bangs a nonstandard-width 256-color
+    /// mode. The symmetric register-banged EXIT to text is also not derived -
+    /// every known title restores text via INT 10h.
+    fn maybe_enter_mode13h_from_registers(&mut self) {
+        let graphics = self.attr.mode_control & 0x01 != 0;
+        let eight_bit = self.attr.mode_control & 0x40 != 0;
+        let chain4 = self.seq.memory_mode & 0x08 != 0;
+        if !graphics
+            || !eight_bit
+            || !chain4
+            || !matches!(self.mode, VideoMode::Text | VideoMode::Planar)
+        {
+            return;
+        }
+        self.bump_content_gen();
+        self.crtc = CrtcTiming::mode13h();
+        self.recompute_vertical_timing(); // guest vertical CRTC writes win
+        self.beam = 0;
+        self.last_line = 0;
+        self.mode = VideoMode::Mode13h;
+        self.presented = None;
+        self.pending_start = None;
         self.resize_work();
     }
 
@@ -5742,6 +5781,33 @@ mod tests {
         vga.write_port(0x3C0, 0x13); // pixel pan index
         vga.write_port(0x3C0, 0x02); // value
         assert_eq!(vga.attr.pixel_pan, 0x02);
+    }
+
+    #[test]
+    fn register_banged_mode13h_entry_flips_the_personality() {
+        // DOS Quake 1.06 sets 320x200x256 by writing the full register set, no
+        // INT 10h: chain-4 on (SEQ 04h bit 3), then ATC 10h with graphics
+        // (bit 0) + 8-bit color (bit 6). The ATC mode-control write decides.
+        let mut vga = Vga::default();
+        assert_eq!(vga.active_mode(), VideoMode::Text);
+        vga.write_port(0x3C4, 0x04); // SEQ index: memory mode
+        vga.write_port(0x3C5, 0x0E); // chain-4 on
+        vga.read_status1(); // reset the ATC flip-flop
+        vga.write_port(0x3C0, 0x10); // ATC index: mode control
+        vga.write_port(0x3C0, 0x41); // graphics + 8-bit color
+        assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+    }
+
+    #[test]
+    fn atc_graphics_bits_without_chain4_stay_text() {
+        // A text-mode guest (or an INT 10h state restore) re-writing ATC 10h
+        // with the graphics bits must NOT flip the personality unless the
+        // sequencer is actually in chained 256-color memory mode.
+        let mut vga = Vga::default();
+        vga.read_status1();
+        vga.write_port(0x3C0, 0x10);
+        vga.write_port(0x3C0, 0x41); // graphics + 8-bit, but chain-4 off
+        assert_eq!(vga.active_mode(), VideoMode::Text);
     }
 
     #[test]
