@@ -3419,6 +3419,66 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// VCPI M2 DE01: under a bare DEVICE=TOKAEMM.SYS, Get Protected Mode
+    /// Interface fills the client page-table buffer (identity first-MB
+    /// entries, software bits 9-11 cleared, exactly 0x110 entries, DI
+    /// advanced), furnishes the three server GDT descriptors (32-bit CPL0
+    /// code / flat-4GB data / driver data sharing the code base), and
+    /// returns a nonzero in-segment PM entry offset. VCPIIF signals
+    /// 0xA5 / 0xEn. (The PM entry itself is exercised by the M3 switch
+    /// fixture — it can only be far-called from protected mode.)
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_vcpi_m2_de01_pm_interface() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_vcpi2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIIF\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "VCPIIF.COM".to_string(),
+                        izarravm_firmware::vcpiif_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "VCPI M2 DE01 interface contract did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
+
     /// SP-4b M4 GO/NO-GO: a fresh (empty) user folder gets the NEW defaults seeded
     /// (`ensure_user_config`) — DEVICE=TOKAEMM.SYS NOEMS + DOS=HIGH,UMB + LH
     /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
