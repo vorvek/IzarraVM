@@ -5188,15 +5188,31 @@ impl Cpu386 {
             }
             0x60 => {
                 // PUSHA / PUSHAD: push AX, CX, DX, BX, the pre-instruction SP, BP, SI, DI.
+                // A fault on ANY of the eight pushes restores (E)SP to the
+                // pre-instruction value (386 PRM: PUSHA restores ESP so the
+                // instruction restarts whole; individual committed sub-pushes
+                // are just re-written on the restart).
                 let sp_snapshot = self.read_gpr_sized(4, operand_size);
-                for index in [0u8, 1, 2, 3] {
-                    let value = self.read_gpr_sized(index, operand_size);
-                    self.push(bus, value, operand_size)?;
-                }
-                self.push(bus, sp_snapshot, operand_size)?;
-                for index in [5u8, 6, 7] {
-                    let value = self.read_gpr_sized(index, operand_size);
-                    self.push(bus, value, operand_size)?;
+                let esp_before = self.registers.esp();
+                let push_all = |cpu: &mut Self, bus: &mut B| -> ExecResult<()> {
+                    for index in [0u8, 1, 2, 3] {
+                        let value = cpu.read_gpr_sized(index, operand_size);
+                        cpu.push(bus, value, operand_size)?;
+                    }
+                    cpu.push(bus, sp_snapshot, operand_size)?;
+                    for index in [5u8, 6, 7] {
+                        let value = cpu.read_gpr_sized(index, operand_size);
+                        cpu.push(bus, value, operand_size)?;
+                    }
+                    Ok(())
+                };
+                if let Err(fault) = push_all(self, bus) {
+                    if self.stack_is_32bit() {
+                        self.registers.set_esp(esp_before);
+                    } else {
+                        self.write_gpr16(4, esp_before as u16);
+                    }
+                    return Err(fault);
                 }
                 Ok(clocks(18))
             }
@@ -8197,12 +8213,20 @@ impl Cpu386 {
         operand_size: OperandSize,
     ) -> ExecResult<()> {
         let width = operand_size.bytes();
+        // The write PRECEDES the (E)SP commit: a push whose stack write faults
+        // (#PF on a not-yet-committed stack page under a lazy-commit DPMI host,
+        // or a #GP/#SS limit violation) must leave (E)SP at its pre-instruction
+        // value so the post-handler restart re-executes cleanly. Committing
+        // first left ESP decremented across the fault; CWSDPMI's commit-and-
+        // retry stack growth then double-decremented, shifting every later
+        // stack slot one down and handing DJGPP code shifted callee-saved
+        // registers on the next epilogue (found via Quake's crt1
+        // setup_environment crash).
         if self.stack_is_32bit() {
             // SS.B=1: implicit stack references use the full 32-bit ESP, for both
             // 16-bit and 32-bit operand-size pushes (386 PRM 16.2: the B bit picks
             // the stack-pointer width, independent of operand size).
             let esp = self.registers.esp().wrapping_sub(width);
-            self.registers.set_esp(esp);
             self.write_memory_sized(
                 bus,
                 SegmentIndex::Ss,
@@ -8210,13 +8234,13 @@ impl Cpu386 {
                 operand_size,
                 value,
                 BusAccessKind::DataWrite,
-            )
+            )?;
+            self.registers.set_esp(esp);
         } else {
             // SS.B=0 (real mode, V86, or a 16-bit protected-mode stack): the address
             // comes from SP only, only SP advances, and ESP's high word is preserved
             // (real silicon wraps SP, not ESP, on this stack).
             let sp = self.read_gpr16(4).wrapping_sub(width as u16);
-            self.write_gpr16(4, sp);
             self.write_memory_sized(
                 bus,
                 SegmentIndex::Ss,
@@ -8224,8 +8248,10 @@ impl Cpu386 {
                 operand_size,
                 value,
                 BusAccessKind::DataWrite,
-            )
+            )?;
+            self.write_gpr16(4, sp);
         }
+        Ok(())
     }
 
     fn pop<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<u32> {
@@ -9282,8 +9308,22 @@ impl Cpu386 {
         // Direct far call (real mode, or a protected-mode code segment). Push CS first
         // (higher stack address), then the return offset. RETF pops offset then CS.
         // self.registers.eip already points past the instruction.
+        // A fault on the SECOND push restores (E)SP past the committed first
+        // one, so a PUSH-fault restarts from the pre-instruction stack pointer
+        // (same atomicity as `push` itself). Limit: a fault in the CS load
+        // BELOW still leaves both pushes committed - real silicon validates
+        // the target segment before pushing, a pre-existing ordering
+        // divergence this change does not touch.
+        let esp_before = self.registers.esp();
         self.push(bus, u32::from(self.registers.cs().selector), operand_size)?;
-        self.push(bus, self.registers.eip, operand_size)?;
+        if let Err(fault) = self.push(bus, self.registers.eip, operand_size) {
+            if self.stack_is_32bit() {
+                self.registers.set_esp(esp_before);
+            } else {
+                self.write_gpr16(4, esp_before as u16);
+            }
+            return Err(fault);
+        }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset & operand_size.mask());
         // No DPL/CPL check is enforced on this direct (non-gate) path today (a
@@ -29565,6 +29605,29 @@ mod tests {
     }
 
     #[test]
+    fn faulting_push_leaves_sp_unchanged() {
+        // A push whose stack write faults must leave (E)SP at its
+        // pre-instruction value so the restart after the handler re-executes
+        // cleanly (386 PRM fault-restart semantics). CWSDPMI grows the DJGPP
+        // stack by committing the page in its #PF handler and retrying; a
+        // committed-then-faulted ESP double-decrements on the retry.
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x8000); // stack target beyond the test memory
+        let mut mem = vec![0u8; 0x200];
+        mem[0] = 0x50; // PUSH AX
+        let mut bus = TestBus::with_memory(mem);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_err());
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x8000,
+            "SP unchanged after the faulting push"
+        );
+    }
+
+    #[test]
     fn fpatan_quadrants() {
         // FPATAN: ST1 = atan(ST1/ST0) with quadrant correction, then pop.
         // atan2(1, -1) = 3pi/4 (80387 PRM: operand signs select the quadrant).
@@ -29699,6 +29762,57 @@ mod tests {
         );
         assert_eq!(bus.memory[0x139], 0x80, "FBSTP sign byte for a negative");
         assert_eq!(cpu.fpu.top(), 0, "FBSTP popped");
+    }
+
+    #[test]
+    fn faulting_push_leaves_esp_unchanged_on_a_32bit_stack() {
+        // The SS.B=1 arm - the one a DPMI flat 32-bit stack (CWSDPMI/DJGPP)
+        // actually exercises: the full ESP must stay at its pre-instruction
+        // value when the push's write faults.
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x10,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32: true,
+            },
+        );
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0001_8000); // beyond the 0x200-byte test memory
+        let mut mem = vec![0u8; 0x200];
+        mem[0] = 0x50; // PUSH (E)AX
+        let mut bus = TestBus::with_memory(mem);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_err());
+        assert_eq!(
+            cpu.registers.esp(),
+            0x0001_8000,
+            "ESP unchanged after the faulting push on a 32-bit stack"
+        );
+    }
+
+    #[test]
+    fn faulting_pusha_restores_sp_past_committed_pushes() {
+        // PUSHA: the first two pushes land, the third faults; (E)SP must come
+        // back to the pre-instruction value (386 PRM: PUSHA restores ESP so
+        // the whole instruction restarts).
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x0004); // AX@2, CX@0 land; DX@0xfffe faults
+        let mut mem = vec![0u8; 0x200];
+        mem[0] = 0x60; // PUSHA
+        let mut bus = TestBus::with_memory(mem);
+        assert!(exec_one_split(&mut cpu, &mut bus).is_err());
+        assert_eq!(
+            cpu.read_reg16(Reg16::Sp),
+            0x0004,
+            "SP restored after the faulting PUSHA"
+        );
     }
 
     /// Regenerate `fpu_golden_cases` from the fused reference. Ignored by default. Run WHILE the
