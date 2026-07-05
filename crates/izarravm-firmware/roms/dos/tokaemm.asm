@@ -1864,6 +1864,7 @@ vec13_entry:
     shl eax, 4
     movzx ecx, word [esp+36]
     add eax, ecx
+    mov dl, [eax+1]               ; second byte too (the 0x66-prefix forms)
     mov al, [eax]                 ; the would-be faulting opcode
     cmp al, 0xFA                  ; CLI
     je monitor_body
@@ -1887,6 +1888,15 @@ vec13_entry:
     je monitor_body
     cmp al, 0xF4                  ; HLT (privileged since the CPL check landed;
     je monitor_body               ; a V86 task is always CPL 3)
+    cmp al, 0x66                  ; operand-size prefix: PUSHFD/POPFD/IRETD are
+    jne .layer3                   ; IOPL-sensitive in V86 exactly like the 16-bit
+    cmp dl, 0x9C                  ; forms (CWSDPMI's mode-switch path uses them)
+    je monitor_body
+    cmp dl, 0x9D
+    je monitor_body
+    cmp dl, 0xCF
+    je monitor_body
+.layer3:
     mov al, 0x0B                  ; LAYER 3 (cold): OCW3, next master data
     out 0x20, al                  ; read = ISR
     in al, 0x20
@@ -1927,8 +1937,77 @@ monitor_body:
     je .in92_dx
     cmp dl, 0xF4                  ; HLT
     je .hlt
+    cmp dl, 0x66                  ; operand-size prefix: the 32-bit flag/stack forms
+    je .prefix66
     mov al, dl                    ; unhandled sensitive instruction: signal its opcode
     jmp signal32
+
+; ---- 66-prefixed sensitive forms. PUSHFD/POPFD/IRETD are IOPL-sensitive in
+; V86 exactly like their 16-bit forms; CWSDPMI's V86 mode-switch path uses
+; them. The prefix byte is at [eax], the opcode at [eax+1]. Anything else
+; 66-prefixed stays a diagnostic exit, with AL = the second byte (not 0x66)
+; so the next gap names itself. ----
+.prefix66:
+    mov dl, [eax+1]
+    cmp dl, 0x9C
+    je .pushfd
+    cmp dl, 0x9D
+    je .popfd
+    cmp dl, 0xCF
+    je .iretd_op
+    mov al, dl
+    jmp signal32
+.pushfd:
+    ; 32-bit image: frame EFLAGS with IF := VIF and, per the PRM, VM and RF
+    ; cleared in the STORED image (the frame's own VM bit stays set).
+    mov eax, [ebp+8]
+    and eax, 0xFFFCFDFF           ; clear IF + VM(17) + RF(16) in the image
+    cmp byte [fs:vif], 0
+    je .pfd_store
+    or eax, 0x0200
+.pfd_store:
+    mov ebx, [ebp+16]             ; guest SS
+    shl ebx, 4
+    sub word [ebp+12], 4          ; guest SP -= 4
+    movzx ecx, word [ebp+12]
+    mov [ebx+ecx], eax
+    add word [ebp], 2             ; skip 66 9C
+    jmp .done_gp
+.popfd:
+    mov ebx, [ebp+16]             ; guest SS
+    shl ebx, 4
+    movzx ecx, word [ebp+12]
+    mov eax, [ebx+ecx]            ; popped EFLAGS dword
+    add word [ebp+12], 4
+    test ax, 0x0200               ; popped IF -> VIF
+    setnz cl
+    mov [fs:vif], cl
+    and ax, 0xCFFF                ; monitor frame stays IOPL 0 (same as .popf)
+    or ax, 0x0200                 ; frame keeps real IF = 1
+    mov word [ebp+8], ax          ; low word only: the frame's high word (VM=1)
+                                  ; is preserved, matching hardware POPFD in V86
+                                  ; (VM/RF/IOPL-class bits unchanged)
+    add word [ebp], 2             ; skip 66 9D
+    call maybe_deliver
+    jmp .done_gp
+.iretd_op:
+    mov ebx, [ebp+16]             ; guest SS
+    shl ebx, 4
+    movzx ecx, word [ebp+12]
+    mov eax, [ebx+ecx]            ; pop EIP (V86 IP is 16-bit; high half dropped)
+    mov word [ebp], ax
+    mov eax, [ebx+ecx+4]          ; pop CS
+    mov word [ebp+4], ax
+    mov eax, [ebx+ecx+8]          ; pop EFLAGS
+    add word [ebp+12], 12
+    test ax, 0x0200               ; popped IF -> VIF
+    setnz cl
+    mov [fs:vif], cl
+    and ax, 0xCFFF                ; monitor frame stays IOPL 0 (same as .iret_op)
+    or ax, 0x0200                 ; frame keeps real IF = 1
+    mov word [ebp+8], ax          ; low word only; frame VM=1 preserved
+    call maybe_deliver
+    jmp .done_gp
 
 ; ---- virtualized port 0x92: the guest's A20 gate. Only 0x92 is set in the
 ; I/O bitmap, so any other port reaching here is a monitor bug -> signal. The
