@@ -34,8 +34,8 @@ resume:
     jmp sig
 
 ; INT 0Dh handler. Stack: IP, CS, FLAGS (real-mode frame). Fault semantics:
-; the return IP must point AT lgdt_site; we advance it past the instruction
-; (7 bytes: 66 0F 01 16 disp16) and resume.
+; the return IP must point AT lgdt_site; we skip past the instruction
+; (6 bytes: 66 0F 01 16 + disp16) by loading the resume label directly.
 gp_handler:
     push bp
     mov bp, sp

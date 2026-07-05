@@ -1993,7 +1993,10 @@ monitor_body:
     cmp dl, 0x66                  ; operand-size prefix: the 32-bit flag/stack forms
     je .prefix66
     ; Unhandled #GP: reflect INT 0Dh to the guest IVT, the real-monitor
-    ; convention (JEMM V86_Exception, 386MAX INT0D both do exactly this).
+    ; convention (386MAX INT0D reflects vector 13; JEMM V86_Exc0D reflects
+    ; INT 06h by default and vector 13 under its V86EXC0D build option --
+    ; vector 13 is the literal #GP semantics and what DOS16M's hooked INT
+    ; 0Dh handler expects).
     ; Real programs depend on it: DOS16M (the DOS4G loader) hooks INT 0Dh,
     ; executes privileged instructions like LGDT during early preparation,
     ; and handles its own fault reflections -- on real hardware under any
