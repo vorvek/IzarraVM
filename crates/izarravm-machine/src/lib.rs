@@ -1310,6 +1310,11 @@ pub struct Machine {
     margo_active: bool,
     text_scanline_override: Option<u16>,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
+    // The vector of the last host-intercepted `INT n` opcode, stashed so the
+    // legacy shared FF00:0000 chain target can attribute a landing there (that
+    // address is shared by every vector, so the fetch seam cannot key it the
+    // way it keys the per-vector stub table). Consumed by `note_stub_fetch`.
+    last_int_vector: Option<u8>,
     // Set by MachineBus on any port I/O; the run loop's instruction batch reads
     // it to know when to stop and service devices (see run_until_clock). A field
     // rather than a loop local so make_bus's one-off host accesses share it.
@@ -1660,6 +1665,7 @@ impl Machine {
             margo_active: false,
             text_scanline_override: None,
             pending_soft_int: None,
+            last_int_vector: None,
             io_touched: false,
             device_wrote_memory: false,
             direct_map_changed: false,
@@ -2095,10 +2101,9 @@ impl Machine {
             return Err(MachineError::InvalidBootImageSize(image.len()));
         }
 
-        // The BIOS service vectors return through the ROM IRET at offset 0xF000
-        // (FF00:0000); supply it even on this synthetic boot ROM.
-        let mut rom = vec![0u8; BIOS_ROM_SIZE];
-        rom[0xF000] = 0xCF;
+        // Machine::base lays the FF00:0000 nop;iret and the per-vector stub
+        // table into every ROM, including this synthetic boot ROM.
+        let rom = vec![0u8; BIOS_ROM_SIZE];
         let mut machine = Self::base(profile, boot_sector_cpu(), rom)?;
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
@@ -2128,7 +2133,6 @@ impl Machine {
         let mut rom = vec![0u8; BIOS_ROM_SIZE];
         let kb = izarravm_firmware::kbd_resident_bios();
         rom[..kb.len()].copy_from_slice(kb);
-        rom[0xF000] = 0xCF;
         let mut machine = Self::base(profile, Cpu386::default(), rom)?;
         install_boot_bios_stubs(&mut machine.memory)?;
         machine.install_keyboard_bios()?;
@@ -2456,6 +2460,7 @@ impl Machine {
             ata: &mut self.ata,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
+            last_int_vector: &mut self.last_int_vector,
             active_mode: self.active_mode,
             pending_mode: &mut self.pending_mode,
             fast_post: self.fast_post,
@@ -8927,6 +8932,7 @@ impl Machine {
                     ata,
                     trace,
                     pending_soft_int,
+                    last_int_vector,
                     fast_post,
                     booter_inert,
                     program_runtime,
@@ -8974,6 +8980,7 @@ impl Machine {
                     ata,
                     trace,
                     pending_soft_int,
+                    last_int_vector,
                     active_mode: *active_mode,
                     pending_mode,
                     fast_post: *fast_post,
@@ -9339,6 +9346,7 @@ struct MachineBus<'a> {
     ata: &'a mut Option<ata::AtaDisk>,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
+    last_int_vector: &'a mut Option<u8>,
     active_mode: GswMode,                  // a copy, for the 0xE1 read
     pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
     fast_post: bool,                       // a copy, for the 0xE2 POST-pacing read
@@ -9869,11 +9877,12 @@ impl CpuBus for MachineBus<'_> {
         if count == 0 {
             return Ok(());
         }
-        // The stub table sits in high ROM, far above the conventional-RAM fast
-        // path below, so the trigger check runs on the run's START address only
-        // (a stub entry is always a fresh run: execution arrives by IVT far
-        // transfer or IRET return, never by falling through).
-        if start >= BIOS_INT_STUB_TABLE_PHYS {
+        // The stub table and the legacy FF00:0000 target sit in high ROM, far
+        // above the conventional-RAM fast path below, so the trigger check
+        // runs on the run's START address only (a stub entry is always a
+        // fresh run: execution arrives by IVT far transfer or IRET return,
+        // never by falling through).
+        if start >= BIOS_LEGACY_IRET_PHYS {
             self.note_stub_fetch(self.apply_a20(start));
         }
         // Fast path: a run that lies entirely in conventional RAM (below the
@@ -10476,34 +10485,39 @@ impl CpuBus for MachineBus<'_> {
             BusWidth::Byte,
             self.wait_states.io,
         );
-        // Record the software-INT vector for the deferred dispatch in the run loop,
-        // which has the CPU registers and memory to service it. 0x10 is the BIOS
-        // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
-        // only from a software INT today (the CPU never faults with vector 0x10);
-        // revisit if an x87 #MF is added.
+        // THE LANDING ADDRESS IS THE ONLY POSTER. A host-serviced BIOS INT is
+        // recognized where the dispatch LANDS (`note_stub_fetch` on a
+        // per-vector ROM stub), never at the `INT n` opcode: posting here as
+        // well double-serviced two standard dispatch shapes (a guest hook
+        // chaining to the saved default, and a copied vector landing on
+        // another vector's stub). Real-hardware semantics follow from
+        // landing-only posting: a hook that fully handles without chaining
+        // gets NO HLE service (the hook replaced the ROM), a hook that chains
+        // gets exactly one service at the landing, and a copied vector
+        // services as the LANDED vector, once.
         //
-        // The DOS multiplex vector (INT 2Fh) HLE -- including the AX=1686h/1687h
-        // DPMI-install check -- only stands in for a real handler when none
-        // exists. If the guest has hooked IVT[0x2F] itself (a DPMI host such as
-        // JEMMEX or DOS/32A's stub installing over it), that real handler must
-        // run instead, the same way the absent-resident-API vectors below stand
-        // down once something takes their vector over. In booter-inert mode it
-        // also stands down so a self-booting disk owns it through the IVT; the
-        // BIOS hardware services (0x10-0x1A) stay intercepted regardless. (The
-        // pure DOS vectors 0x20-0x2E are no longer intercepted at all — the Rust
-        // DOS kernel that serviced them was retired in SP-3 — and INT 67h is no
-        // longer intercepted either: the TOKAEMM guest driver owns the EMS API
-        // since SP-4b M2.)
-        // Exactly one poster per dispatch: when the vector still points at its
-        // OWN per-vector ROM stub, the INT's IVT dispatch is about to land
-        // there and the stub's fetch seam (`note_stub_fetch`) will post the
-        // service - posting here too would service the call twice. This arm
-        // posts only when the stub fetch cannot: a guest hook owns the vector
-        // (HLE-alongside-hook, the historical semantics), or a period booter
-        // hardcoded the legacy shared IRET FF00:0000 (which is vector 0x00's
-        // territory, so the per-vector seam cannot attribute it).
-        if self.soft_int_intercepted(vector)? && !self.vector_points_at_own_stub(vector)? {
+        // This arm still posts the two shapes whose landing the fetch seam
+        // cannot see:
+        // (a) raw-program INT 20h/21h: their IVT entries target the low-RAM
+        //     IRET at 0x600, not the per-vector table (0x27 IS table-seeded
+        //     and rides the fetch seam like everything else).
+        if self.program_runtime && matches!(vector, 0x20 | 0x21) {
             *self.pending_soft_int = Some(vector);
+            return Ok(());
+        }
+        // (b) the legacy shared chain target FF00:0000, which period booters
+        //     hardcode (IVT[0x13] -> FF00:0000, or a hook chaining there).
+        //     That single address serves every vector, so the fetch seam
+        //     cannot attribute a landing by address alone: stash the vector
+        //     here and let the FF00:0000 fetch post it (consumed there; a
+        //     per-vector stub landing also disarms it). Known corner, accepted
+        //     for this legacy-only path: a nested intercepted INT inside a
+        //     hook body overwrites the stash before the hook chains to
+        //     FF00:0000, dropping the outer service; and a stash left armed by
+        //     a non-chaining hook posts once if the guest later jumps to
+        //     FF00:0000 outside any INT context.
+        if self.soft_int_intercepted(vector)? {
+            *self.last_int_vector = Some(vector);
         }
         Ok(())
     }
@@ -10511,10 +10525,20 @@ impl CpuBus for MachineBus<'_> {
 
 impl MachineBus<'_> {
     /// The one interception predicate for host-serviced software interrupts,
-    /// shared by the two dispatch seams: `interrupt_acknowledge` (the `INT n`
-    /// opcode) and `note_stub_fetch` (execution reaching the vector's ROM stub
-    /// by any route - a DPMI host's simulate-real-mode-interrupt far dispatch,
-    /// or a guest chaining to a saved default vector).
+    /// shared by the two dispatch seams: `note_stub_fetch` (execution reaching
+    /// the vector's ROM stub by any route - an `INT n` opcode's IVT dispatch,
+    /// a DPMI host's simulate-real-mode-interrupt far dispatch, or a guest
+    /// chaining to a saved default vector) and `interrupt_acknowledge` (the
+    /// legacy-chain stash and the raw-program low-RAM vectors).
+    ///
+    /// The DOS multiplex vector (INT 2Fh) HLE -- including the AX=1686h/1687h
+    /// DPMI-install check -- only stands in for a real handler when none
+    /// exists: once a guest hooks IVT[0x2F] (JEMMEX, DOS/32A's stub) the hook
+    /// owns it, same for the absent-resident-API vectors. In booter-inert mode
+    /// 2Fh also stands down so a self-booting disk owns it through the IVT.
+    /// The pure DOS vectors 0x20-0x2E are not intercepted at all outside the
+    /// raw-program runtime (the Rust DOS kernel was retired in SP-3), and INT
+    /// 67h is never intercepted (the TOKAEMM guest driver owns the EMS API).
     fn soft_int_intercepted(&mut self, vector: u8) -> Result<bool, BusError> {
         let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
         let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
@@ -10533,27 +10557,57 @@ impl MachineBus<'_> {
     }
 
     /// The fetch-seam half of software-interrupt interception: execution has
-    /// reached a per-vector ROM stub entry (see BIOS_INT_STUB_TABLE_ROM_OFFSET).
-    /// Posts the vector for the run loop's deferred HLE dispatch. The stub's
-    /// leading NOP guarantees a post-instruction break fires before the IRET,
-    /// so the service still sees the INT frame on the stack. This is the ONLY
-    /// poster for a default vector (the `INT n` opcode path stands down when
-    /// the vector points at its own stub), so every dispatch route - INT
-    /// opcode, a DPMI host's simulated real-mode interrupt, a guest chaining
-    /// to a saved default - services exactly once. Repeated fetch charges of
-    /// the same visit are absorbed by the pending_soft_int.is_some() check
-    /// (the pending vector is only cleared at the next batch entry, after the
-    /// service ran and execution moved to the IRET byte, whose odd offset
-    /// never posts).
+    /// reached a per-vector ROM stub entry (see BIOS_INT_STUB_TABLE_ROM_OFFSET)
+    /// or the legacy shared chain target FF00:0000. Posts the vector for the
+    /// run loop's deferred HLE dispatch. Both landing shapes lead with a NOP,
+    /// which guarantees a post-instruction break fires before the IRET, so the
+    /// service still sees the INT frame on the stack. This is the ONLY poster
+    /// for every dispatch route - INT opcode, a DPMI host's simulated
+    /// real-mode interrupt, a guest chaining to a saved default - so each
+    /// dispatch services exactly once. Repeated fetch charges of the same
+    /// visit are absorbed by the pending_soft_int check (the pending vector is
+    /// only cleared at the next batch entry, after the service ran and
+    /// execution moved to the IRET byte, whose odd offset never posts).
+    ///
+    /// Keying caveat, recorded per review: the per-byte fetch seam
+    /// (`charge_instruction_fetch`) hands this a PHYSICAL address, the cached
+    /// run seam (`charge_instruction_fetch_run`) a LINEAR one. The two agree
+    /// everywhere real software runs (real mode, V86 identity-mapped ROM); a
+    /// hostile pmode guest paging some other linear page onto physical
+    /// 0xFF2xx, or the stub linears onto other frames, could post a bogus or
+    /// missed service. Accepted hostile-guest-only divergence.
     fn note_stub_fetch(&mut self, address: u32) {
+        if address == BIOS_LEGACY_IRET_PHYS {
+            // The legacy shared nop;iret at FF00:0000: one address for every
+            // vector, so attribution comes from the stash the `INT n` opcode
+            // arm left behind. Consumed here; a landing with no armed stash
+            // (a simulated jump with no preceding INT) stays a no-op.
+            let stashed = self.last_int_vector.take();
+            if self.pending_soft_int.is_none()
+                && let Some(vector) = stashed
+                && self.soft_int_intercepted(vector).unwrap_or(false)
+            {
+                *self.pending_soft_int = Some(vector);
+            }
+            return;
+        }
         let offset = address.wrapping_sub(BIOS_INT_STUB_TABLE_PHYS);
         if offset >= BIOS_INT_STUB_TABLE_LEN || offset & 1 != 0 {
             return; // outside the table, or the IRET byte (mid-stub resume)
         }
-        if self.pending_soft_int.is_some() {
+        let vector = (offset / 2) as u8;
+        // A per-vector landing supersedes any armed legacy stash: the dispatch
+        // the stash described has been attributed here by address instead.
+        *self.last_int_vector = None;
+        if let Some(pending) = *self.pending_soft_int {
+            // The dedup above is vector-blind; the only legitimate repeat is a
+            // re-charge of the SAME pending visit (review finding 3).
+            debug_assert!(
+                pending == vector,
+                "stub fetch posted vector {vector:#04x} while {pending:#04x} is still pending"
+            );
             return;
         }
-        let vector = (offset / 2) as u8;
         if self.soft_int_intercepted(vector).unwrap_or(false) {
             *self.pending_soft_int = Some(vector);
         }
@@ -10568,18 +10622,6 @@ impl MachineBus<'_> {
         // period booters hardcode that address (IVT[0x13] -> FF00:0000 to chain
         // disk calls), and pre-table guests may restore a saved default.
         Ok(seg == BIOS_ROM_IRET_SEG && (off == bios_int_stub_off(vector) || off == 0))
-    }
-
-    /// STRICT form of the default-vector check: true only when the IVT entry
-    /// points at this vector's own per-vector stub. Used by
-    /// `interrupt_acknowledge` to decide whether the fetch seam will see the
-    /// dispatch (own stub -> it will; a hook or the legacy shared FF00:0000
-    /// hardcode -> it will not, so the opcode path must post).
-    fn vector_points_at_own_stub(&mut self, vector: u8) -> Result<bool, BusError> {
-        let address = usize::from(vector) * 4;
-        let off = self.memory.read_u16(address)?;
-        let seg = self.memory.read_u16(address + 2)?;
-        Ok(seg == BIOS_ROM_IRET_SEG && off == bios_int_stub_off(vector))
     }
 
     /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
@@ -11147,6 +11189,14 @@ const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
 const BIOS_INT_STUB_TABLE_ROM_OFFSET: usize = 0xF200;
 const BIOS_INT_STUB_TABLE_PHYS: u32 = 0xFF200;
 const BIOS_INT_STUB_TABLE_LEN: u32 = 512;
+/// Physical address of the legacy shared chain target FF00:0000. Period
+/// booters hardcode it (IVT[0x13] -> FF00:0000, or a hook chaining there), so
+/// the machine writes the same `nop; iret` shape there that the per-vector
+/// stubs use: the NOP fetch posts the vector stashed by the `INT n` opcode arm
+/// (`last_int_vector`) and the post-instruction break services the HLE before
+/// the IRET pops the frame.
+const BIOS_LEGACY_IRET_PHYS: u32 = 0xFF000;
+const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
 
 const fn bios_int_stub_off(vector: u8) -> u16 {
     0x0200 + (vector as u16) * 2
@@ -11157,6 +11207,12 @@ fn write_bios_int_stub_table(rom: &mut [u8]) {
         rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2] = 0x90; // nop
         rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2 + 1] = 0xCF; // iret
     }
+    // The legacy shared chain target gets the same nop; iret shape (see
+    // BIOS_LEGACY_IRET_PHYS). Machine-written for every ROM: the Izarra BIOS
+    // reserves a bare IRET here followed by zero padding, and the synthetic
+    // HLE ROMs relied on the constructors writing the IRET byte.
+    rom[BIOS_LEGACY_IRET_ROM_OFFSET] = 0x90; // nop
+    rom[BIOS_LEGACY_IRET_ROM_OFFSET + 1] = 0xCF; // iret
 }
 
 const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;
@@ -12828,11 +12884,12 @@ mod tests {
     }
 
     /// Emulate a guest `INT n` end to end for interception-contract tests: the
-    /// opcode acknowledge, then the IVT dispatch landing wherever the vector
-    /// points. A default vector lands on its per-vector ROM stub, whose fetch
-    /// seam posts the service; a guest hook (or the legacy shared FF00:0000)
-    /// lands outside the per-vector table, where only the opcode path could
-    /// have posted.
+    /// opcode acknowledge (which posts only the raw-program low-RAM vectors
+    /// and stashes the legacy-chain attribution), then the IVT dispatch
+    /// landing wherever the vector points. A default vector lands on its
+    /// per-vector ROM stub, whose fetch seam posts the service; a guest hook
+    /// lands outside the table and gets NO HLE post (the hook owns the
+    /// vector); the legacy shared FF00:0000 posts the stashed vector.
     fn ack_and_dispatch(m: &mut Machine, vector: u8) {
         let mut bus = m.make_bus();
         bus.interrupt_acknowledge(vector, 0).unwrap();
@@ -21147,6 +21204,7 @@ mod tests {
             ata: &mut machine.ata,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
+            last_int_vector: &mut machine.last_int_vector,
             active_mode: machine.active_mode,
             pending_mode: &mut machine.pending_mode,
             fast_post: machine.fast_post,
@@ -26749,11 +26807,83 @@ mod tests {
     }
 
     #[test]
+    fn hook_chaining_to_the_saved_default_services_exactly_once() {
+        // Reviewer reproducer (finding 1): a guest hooks an intercepted vector
+        // and chains to the saved default (the per-vector stub). The hook gets
+        // no post at the opcode (it owns the vector); the chain landing posts
+        // exactly one service. A double poster advances the BDA cursor column
+        // twice.
+        let mut image_code = vec![
+            0x31, 0xc0, // xor ax, ax
+            0x8e, 0xd8, // mov ds, ax
+            // Save IVT[0x10] (the default per-vector stub) at 0000:7D80.
+            0xa1, 0x40, 0x00, // mov ax, [0x0040]
+            0xa3, 0x80, 0x7d, // mov [0x7D80], ax
+            0xa1, 0x42, 0x00, // mov ax, [0x0042]
+            0xa3, 0x82, 0x7d, // mov [0x7D82], ax
+            // Hook IVT[0x10] = 0000:7D00.
+            0xc7, 0x06, 0x40, 0x00, 0x00, 0x7d, // mov word [0x0040], 0x7D00
+            0xc7, 0x06, 0x42, 0x00, 0x00, 0x00, // mov word [0x0042], 0x0000
+            0xb8, 0x41, 0x0e, // mov ax, 0x0e41 ('A' teletype)
+            0xcd, 0x10, // int 0x10
+            0xfa, 0xf4, // cli; hlt
+        ];
+        image_code.resize(0x100, 0x90);
+        // The hook body at 0000:7D00 (boot-sector offset 0x100): chain to the
+        // saved default with a far jump through the saved pointer.
+        image_code.extend_from_slice(&[0xff, 0x2e, 0x80, 0x7d]); // jmp far [0x7D80]
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(&image_code),
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(0x450),
+            1,
+            "hook-then-chain must service the teletype exactly once (column 1, not 2)"
+        );
+    }
+
+    #[test]
+    fn copied_vector_services_once_as_the_landed_vector() {
+        // Reviewer reproducer (finding 2): a guest copies one intercepted
+        // vector's IVT entry over another (IVT[0x42] <- IVT[0x10]) and issues
+        // the copy. Real hardware runs the landed handler exactly once; a
+        // dispatch that posts at both the opcode (as 0x42) and the landing
+        // (as 0x10) services twice.
+        let code: &[u8] = &[
+            0x31, 0xc0, // xor ax, ax
+            0x8e, 0xd8, // mov ds, ax
+            0xa1, 0x40, 0x00, // mov ax, [0x0040]  (IVT[0x10] offset)
+            0xa3, 0x08, 0x01, // mov [0x0108], ax  (IVT[0x42] offset)
+            0xa1, 0x42, 0x00, // mov ax, [0x0042]  (IVT[0x10] segment)
+            0xa3, 0x0a, 0x01, // mov [0x010A], ax  (IVT[0x42] segment)
+            0xb8, 0x41, 0x0e, // mov ax, 0x0e41 ('A' teletype)
+            0xcd, 0x42, // int 0x42
+            0xfa, 0xf4, // cli; hlt
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(0x450),
+            1,
+            "a copied vector services once, as the landed vector (column 1, not 2)"
+        );
+    }
+
+    #[test]
     fn booter_hardcoded_legacy_iret_keeps_int13_serviced() {
-        // Period booters repoint IVT[0x13] at the legacy shared IRET FF00:0000
-        // (not the per-vector stub) and then issue INT 13h. The opcode path
-        // must still post the service for that legacy address (the fetch seam
-        // cannot attribute FF00:0000, which belongs to vector 0's stub).
+        // Period booters repoint IVT[0x13] at the legacy shared chain target
+        // FF00:0000 (not the per-vector stub) and then issue INT 13h. That
+        // address is shared by every vector, so the fetch seam attributes the
+        // landing through the vector the INT opcode stashed (last_int_vector).
         let rom = rom_with_code(&[
             // IVT[0x13] = FF00:0000, the hardcoded legacy chain target.
             0x31, 0xc0, // xor ax, ax
