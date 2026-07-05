@@ -1725,8 +1725,12 @@ impl Machine {
             },
             elapsed_clocks: 0,
             io_stall_clocks: 0,
-            dos_disk_handler: (BIOS_ROM_IRET_SEG, 0),
-            dos_disk_restore: (BIOS_ROM_IRET_SEG, 0),
+            // The INT 2Fh AH=13h "previous handler" default is INT 13h's own
+            // per-vector stub, so a guest invoking it via pushf+call far is
+            // serviced by address on every arrival route (the legacy shared
+            // FF00:0000 would need an armed stash the call path never sets).
+            dos_disk_handler: (BIOS_ROM_IRET_SEG, bios_int_stub_off(0x13)),
+            dos_disk_restore: (BIOS_ROM_IRET_SEG, bios_int_stub_off(0x13)),
             network_post_address: (0, 0),
             floppy: None,
             floppy_accesses: 0,
@@ -8826,11 +8830,12 @@ impl Machine {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
             }
-            // A V86 software INT that the TOKAEMM monitor is reflecting sets
-            // pending_soft_int in one batch (at the #GP to the monitor) but is only
-            // serviced a later batch, once the monitor has IRETed back into V86 with
-            // the real-mode frame in place. Preserve the pending vector across the
-            // monitor's batches — only reset it when NOT inside the ring-0 monitor.
+            // pending_soft_int is posted at a stub LANDING (V86 or real mode), so
+            // for a monitor-reflected V86 INT it is set only after the monitor has
+            // IRETed back into V86 with the real-mode frame in place, and serviced
+            // at that same batch's end. The ring-0 guard is kept defensively: if a
+            // pending vector ever survives into a ring-0 monitor batch (a landing
+            // interrupted before its break), preserve it until V86 resumes.
             if !self.cpu.is_ring0_protected() {
                 self.pending_soft_int = None;
             }
@@ -10606,19 +10611,27 @@ impl MachineBus<'_> {
             return; // outside the table, or the IRET byte (mid-stub resume)
         }
         let vector = (offset / 2) as u8;
-        // A per-vector landing supersedes any armed legacy stash: the dispatch
-        // the stash described has been attributed here by address instead.
-        *self.last_int_vector = None;
+        let intercepted = self.soft_int_intercepted(vector).unwrap_or(false);
+        // An INTERCEPTED landing supersedes any armed legacy stash: the
+        // dispatch the stash described has been attributed here by address
+        // instead. A NON-intercepted landing must leave the stash alone - its
+        // ack never armed it, and the machine's own timer ISR chains INT 1Ch
+        // (stub 0x1C) every tick, so an unconditional disarm would race a
+        // hardware IRQ against a live hook-chain attribution and drop the
+        // chained service (round-2 review finding 1).
+        if intercepted {
+            *self.last_int_vector = None;
+        }
         if let Some(pending) = *self.pending_soft_int {
             // The dedup above is vector-blind; the only legitimate repeat is a
-            // re-charge of the SAME pending visit (review finding 3).
+            // re-charge of the SAME pending visit (round-1 review finding 3).
             debug_assert!(
                 pending == vector,
                 "stub fetch posted vector {vector:#04x} while {pending:#04x} is still pending"
             );
             return;
         }
-        if self.soft_int_intercepted(vector).unwrap_or(false) {
+        if intercepted {
             *self.pending_soft_int = Some(vector);
         }
     }
@@ -11219,6 +11232,23 @@ const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
 const fn bios_int_stub_off(vector: u8) -> u16 {
     0x0200 + (vector as u16) * 2
 }
+
+// The fetch seam treats 0xFF000..0xFF400 as service-posting addresses, so no
+// machine-written ROM resident may grow into the window or span its start
+// (an immediate byte at an even table offset would post a bogus service).
+const _: () = {
+    assert!(DOS_CALL5_ROM_OFFSET + DOS_CALL5_ENTRY_STUB.len() <= BIOS_TIMER_ISR_ROM_OFFSET);
+    assert!(
+        BIOS_TIMER_ISR_ROM_OFFSET + BIOS_TIMER_ISR_STUB.len() <= BIOS_MASTER_IRQ_ISR_ROM_OFFSET
+    );
+    assert!(
+        BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()
+            <= BIOS_INT_STUB_TABLE_ROM_OFFSET
+    );
+    // The legacy nop;iret pair itself must sit below every other resident's
+    // start and inside the recognition window.
+    assert!(BIOS_LEGACY_IRET_ROM_OFFSET + 2 <= DOS_CALL5_ROM_OFFSET);
+};
 
 fn write_bios_int_stub_table(rom: &mut [u8]) {
     for vector in 0..=255usize {
@@ -14261,16 +14291,24 @@ mod tests {
         m.cpu.registers.set_ebx(0xBBBB_4444);
 
         assert!(m.handle_int2f(), "AH=13h first call handled");
+        // The defaults are INT 13h's own per-vector stub (serviced by address
+        // on every arrival route), not the legacy shared FF00:0000.
         assert_eq!(
             m.cpu.registers.segment(SegmentIndex::Ds).selector,
             BIOS_ROM_IRET_SEG
         );
-        assert_eq!(m.cpu.registers.edx(), 0xAAAA_0000);
+        assert_eq!(
+            m.cpu.registers.edx(),
+            0xAAAA_0000 | u32::from(bios_int_stub_off(0x13))
+        );
         assert_eq!(
             m.cpu.registers.segment(SegmentIndex::Es).selector,
             BIOS_ROM_IRET_SEG
         );
-        assert_eq!(m.cpu.registers.ebx(), 0xBBBB_0000);
+        assert_eq!(
+            m.cpu.registers.ebx(),
+            0xBBBB_0000 | u32::from(bios_int_stub_off(0x13))
+        );
 
         m.cpu.registers.set_eax(0xCAFE_1301);
         m.cpu
@@ -26893,6 +26931,45 @@ mod tests {
             machine.read_physical_u8(0x450),
             1,
             "a copied vector services once, as the landed vector (column 1, not 2)"
+        );
+    }
+
+    #[test]
+    fn hook_chain_to_legacy_iret_survives_an_uninterceded_stub_landing() {
+        // Round-2 review finding 1 (deterministic stand-in for the timer-tick
+        // race): a guest hooks INT 13h and its hook body dispatches a
+        // NON-intercepted interrupt (INT 1Ch here, exactly what the machine's
+        // own timer ISR chains every tick) before chaining to the hardcoded
+        // legacy FF00:0000. The 1Ch stub landing must NOT disarm the live
+        // 0x13 legacy stash, or the chained disk service is silently dropped.
+        let rom = rom_with_code(&[
+            0x31, 0xc0, // xor ax, ax
+            0x8e, 0xd8, // mov ds, ax
+            // IVT[0x13] = F000:0023 (the hook below, in this ROM).
+            0xc7, 0x06, 0x4c, 0x00, 0x23, 0x00, // mov word [0x4c], 0x0023
+            0xc7, 0x06, 0x4e, 0x00, 0x00, 0xf0, // mov word [0x4e], 0xf000
+            // A failing read on unbacked drive B sets the last status...
+            0xb4, 0x02, 0xb0, 0x01, // AH=02h read, AL=1 sector
+            0xb5, 0x00, 0xb1, 0x01, // CH=0, CL=1
+            0xb6, 0x00, 0xb2, 0x01, // DH=0, DL=1 (drive B:, unbacked)
+            0xcd, 0x13, // int 0x13
+            0xb4, 0x01, 0xcd, 0x13, // ...and AH=01h reads it back.
+            0xf4, // hlt (offset 0x22)
+            // hook (offset 0x23): tick-chain stand-in, then legacy chain.
+            0xcd, 0x1c, // int 0x1c   (lands stub 0x1C, not intercepted)
+            0xea, 0x00, 0x00, 0x00, 0xff, // jmp far FF00:0000
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(vec![0u8; 737_280]).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(
+            (ax >> 8) as u8,
+            0x80,
+            "the hook-chained INT 13h must survive an interleaved non-intercepted \
+             stub landing (AH = last status)"
         );
     }
 
