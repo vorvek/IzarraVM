@@ -871,6 +871,43 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
     }
 }
 
+/// Per-mode VIDEO-window wait-states for the Approximate class (486/586), the
+/// FOURTH timing lever, calibrated (2026-07-05) against the owner's real-hardware
+/// Doom `-timedemo demo3` fps targets (486 DX2-66 max detail 29-30 fps, P55C-200
+/// ~82 fps; cross-checked vs the Ertl doombench archive). Why it exists: a real
+/// VGA card sits across an expansion bus whose per-access latency does NOT scale
+/// with CPU speed, but the flat `WaitStateProfile.video = 1` rode `scale_bus`
+/// (486 x1/3, 586 x7/30), pricing a VRAM byte write at ~15 ns / ~3.5 ns where real
+/// VLB / PCI writes cost ~100-450 ns. Doom is framebuffer-bound (measured: ~61,500
+/// VRAM data accesses per frame at max detail), so the 486/586 personas ran demo3
+/// 1.27x / 1.56x too fast while every synthetic bench (no VRAM traffic) sat
+/// era-exact. These values are calibrated POST-`scale_bus`: the charged clocks are
+/// `(2 + ws) * bus_num/bus_den`. The shipped 586 value ws=62 -> ~14.9 clocks
+/// @ 200 MHz ~ 75 ns (PCI-class, ~13 MB/s byte-wise); the shipped 486 value stays
+/// at the flat 1 (see the arm comment: with honest tick delivery the DX2-66
+/// persona hits its target with no surcharge, so no VLB-class value ships). If
+/// `bus_timing` is ever retuned, recalibrate these with it. The Accurate class
+/// (286/386) keeps the frozen `WaitStateProfile.video` path bit-for-bit
+/// (byte-identity gate).
+const fn video_wait_states_approx(level: CpuLevel) -> u8 {
+    match level {
+        // Unreachable in practice (Accurate class takes the profile path), but
+        // keep the frozen classes on the profile default should routing change.
+        CpuLevel::I286 | CpuLevel::I386 => 1,
+        // The 486 keeps the flat profile value: once the batch cap counts bus
+        // clocks (no more coalesced IRQ0 ticks), the DX2-66 persona lands the
+        // owner's 29-30 fps demo3 target with NO video surcharge - its
+        // Dhrystone-pinned bus dial already prices every access fat enough that
+        // the real VLB video cost is absorbed. Charging the physical ~130 ns on
+        // top would undershoot the target (~27 fps). Composition infidelity
+        // accepted and recorded: the 486's Doom time leans more on ordinary bus
+        // than a real DX2-66's (which leans on the video bus); the NET frame
+        // rate is what is calibrated. Revisit alongside any bus_timing retune.
+        CpuLevel::I486 => 1,
+        CpuLevel::I586 => 62,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CacheLevelConfig {
     l1_mask: u32,
@@ -9010,6 +9047,32 @@ impl Machine {
                         // cap boundary always lands right after the STI (the shadow
                         // would block the per-batch check forever).
                         let can_take_before = cpu.can_take_interrupt();
+                        // The batch cap's contract is GUEST clocks (its PIT terms
+                        // are "clocks until the next OUT edge"), but core_clocks
+                        // alone under-counts a bus-heavy stretch: a framebuffer
+                        // blit can be several bus clocks per core clock, so a
+                        // core-only cap overshoots the next IRQ0 edge by that
+                        // ratio and the PIC coalesces the missed edges - a guest
+                        // timer ISR then loses ticks that a real PIT delivers
+                        // (each edge interrupts long before the next at any
+                        // realistic rate). Count the in-batch SCALED bus clocks
+                        // toward the cap in the Approximate class, checked at
+                        // loop top so an over-budget batch does not enter one
+                        // more run. APPROXIMATE ONLY: the Accurate class (frozen
+                        // 286/386) must keep not just the core-only comparison
+                        // but the historical batch GEOMETRY - the old post-run
+                        // check meant every batch executed at least one
+                        // instruction even when the interrupt-service charge
+                        // alone met the cap, and review showed the loop-top
+                        // relocation changes that (a gate-invisible but real
+                        // frozen-class delta). So Accurate skips this break and
+                        // relies solely on the restored post-run check below.
+                        let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();
+                        if spent >= cap
+                            && matches!(bus.active_mode.timing_class(), TimingClass::Approximate)
+                        {
+                            break;
+                        }
                         // Run a straight-line run of instructions inside the CPU in one call (the
                         // first via the normal single path, then cached straight-line continuations)
                         // instead of bouncing here per instruction. The run ends on a fault, halt, a
@@ -9018,7 +9081,7 @@ impl Machine {
                         // on the collapsed outcome: the executor's internal transition check ends the
                         // RUN at the edge, and the machine's check below ends the BATCH so the next
                         // batch services the interrupt. Both are needed.
-                        let remaining = cap.saturating_sub(u64::from(batch_core));
+                        let remaining = cap.saturating_sub(spent);
                         // Publish the batch-scoped core clocks accumulated so far
                         // (the interrupt-service charge + every prior run of this
                         // batch, exactly the core component the batch-end step
@@ -9052,6 +9115,11 @@ impl Machine {
                                 if !can_take_before && cpu.can_take_interrupt() {
                                     break;
                                 }
+                                // Historical post-run core-clock check: the sole
+                                // cap break for the Accurate class (preserving
+                                // its at-least-one-run batch geometry exactly);
+                                // for Approximate the loop-top guest-clock check
+                                // above fires first or at the same boundary.
                                 if u64::from(batch_core) >= cap {
                                     break;
                                 }
@@ -9598,6 +9666,21 @@ impl CpuBus for MachineBus<'_> {
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
         Ok(())
+    }
+
+    /// See the trait doc: the straight-line run loop adds this figure's growth
+    /// to its core total against the (guest-clock) run cap. Approximate class
+    /// only; the Accurate class returns 0 so its lockstep batches keep the
+    /// historical core-only check bit-for-bit (frozen 286/386 byte-identity).
+    /// Same arithmetic as `in_batch_clocks` minus the core terms the CPU
+    /// already tracks itself.
+    fn in_batch_scaled_bus_clocks(&self) -> u64 {
+        if matches!(self.active_mode.timing_class(), TimingClass::Accurate) {
+            return 0;
+        }
+        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
+        (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
+            / u64::from(self.bus_den_at_batch_start)
     }
 
     fn read_memory(
@@ -11984,7 +12067,15 @@ impl MachineBus<'_> {
             || self.distira_cmdfifo_offset(address, 1).is_some()
             || self.distira_mmio_offset(address, 1).is_some()
         {
-            self.wait_states.video
+            // The Approximate class charges the era bus latency of a real video
+            // card (see `video_wait_states_approx`); the Accurate class keeps the
+            // frozen profile value bit-for-bit.
+            match self.active_mode.timing_class() {
+                TimingClass::Accurate => self.wait_states.video,
+                TimingClass::Approximate => {
+                    video_wait_states_approx(cpu_level_for_mode(self.active_mode))
+                }
+            }
         } else {
             self.wait_states.ram
         }
