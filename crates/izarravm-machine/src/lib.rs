@@ -882,11 +882,13 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
 /// VRAM data accesses per frame at max detail), so the 486/586 personas ran demo3
 /// 1.27x / 1.56x too fast while every synthetic bench (no VRAM traffic) sat
 /// era-exact. These values are calibrated POST-`scale_bus`: the charged clocks are
-/// `(2 + ws) * bus_num/bus_den`, so 486 ws=24 -> ~8.7 clocks @ 66 MHz ~ 131 ns
-/// (VLB-class, ~7.6 MB/s byte-wise) and 586 ws=62 -> ~14.9 clocks @ 200 MHz ~ 75 ns
-/// (PCI-class, ~13 MB/s byte-wise). If `bus_timing` is ever retuned, recalibrate
-/// these with it. The Accurate class (286/386) keeps the frozen
-/// `WaitStateProfile.video` path bit-for-bit (byte-identity gate).
+/// `(2 + ws) * bus_num/bus_den`. The shipped 586 value ws=62 -> ~14.9 clocks
+/// @ 200 MHz ~ 75 ns (PCI-class, ~13 MB/s byte-wise); the shipped 486 value stays
+/// at the flat 1 (see the arm comment: with honest tick delivery the DX2-66
+/// persona hits its target with no surcharge, so no VLB-class value ships). If
+/// `bus_timing` is ever retuned, recalibrate these with it. The Accurate class
+/// (286/386) keeps the frozen `WaitStateProfile.video` path bit-for-bit
+/// (byte-identity gate).
 const fn video_wait_states_approx(level: CpuLevel) -> u8 {
     match level {
         // Unreachable in practice (Accurate class takes the profile path), but
@@ -9054,16 +9056,21 @@ impl Machine {
                         // timer ISR then loses ticks that a real PIT delivers
                         // (each edge interrupts long before the next at any
                         // realistic rate). Count the in-batch SCALED bus clocks
-                        // toward the cap in the Approximate class. Batch-start
-                        // num/den match the batch-end conversion; the sub-clock
-                        // bus_rem carry is deliberately ignored here (the exact
-                        // math still happens once at batch end). The Accurate
-                        // class keeps the core-only check bit-for-bit: its
-                        // one-DAC-sample batches sit far below a PIT period, and
-                        // the frozen 286/386 byte-identity gate pins its batch
-                        // geometry.
+                        // toward the cap in the Approximate class, checked at
+                        // loop top so an over-budget batch does not enter one
+                        // more run. APPROXIMATE ONLY: the Accurate class (frozen
+                        // 286/386) must keep not just the core-only comparison
+                        // but the historical batch GEOMETRY - the old post-run
+                        // check meant every batch executed at least one
+                        // instruction even when the interrupt-service charge
+                        // alone met the cap, and review showed the loop-top
+                        // relocation changes that (a gate-invisible but real
+                        // frozen-class delta). So Accurate skips this break and
+                        // relies solely on the restored post-run check below.
                         let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();
-                        if spent >= cap {
+                        if spent >= cap
+                            && matches!(bus.active_mode.timing_class(), TimingClass::Approximate)
+                        {
                             break;
                         }
                         // Run a straight-line run of instructions inside the CPU in one call (the
@@ -9108,8 +9115,14 @@ impl Machine {
                                 if !can_take_before && cpu.can_take_interrupt() {
                                     break;
                                 }
-                                // The loop-top `spent >= cap` check re-runs with
-                                // fresh core AND bus totals before the next run.
+                                // Historical post-run core-clock check: the sole
+                                // cap break for the Accurate class (preserving
+                                // its at-least-one-run batch geometry exactly);
+                                // for Approximate the loop-top guest-clock check
+                                // above fires first or at the same boundary.
+                                if u64::from(batch_core) >= cap {
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 fault = Some(e);
