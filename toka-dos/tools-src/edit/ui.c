@@ -651,8 +651,16 @@ int dlg_run(const char *title, const char *prompt,
         dlg_draw_border(row0, col0, boxw, boxh, title);
         scr_fill(row0 + 1, col0 + 1, interior, boxh - 2, ' ', AT_BAR);
 
-        if (nplines >= 1)
-            scr_put(row0 + 1, col0 + 1, prompt, AT_BAR);
+        if (nplines >= 1) {
+            /* Only the first line: prompt runs to NUL through any '\n', so
+             * bound it to p1len (scr_put stops at NUL, not at '\n'). */
+            char line1[80];
+            int n = p1len;
+            if (n > 78) n = 78;
+            memcpy(line1, prompt, n);
+            line1[n] = '\0';
+            scr_put(row0 + 1, col0 + 1, line1, AT_BAR);
+        }
         if (nplines == 2) {
             char line2[80];
             int n = p2len;
