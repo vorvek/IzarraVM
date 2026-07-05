@@ -1640,6 +1640,7 @@ impl Machine {
         rom[BIOS_MASTER_IRQ_ISR_ROM_OFFSET
             ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
             .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
+        write_bios_int_stub_table(&mut rom);
         let mut machine = Self {
             memory,
             ram_lookup,
@@ -9853,6 +9854,7 @@ impl CpuBus for MachineBus<'_> {
 
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
         let address = self.apply_a20(address);
+        self.note_stub_fetch(address);
         let ws = self.code_fetch_wait_states(address);
         self.trace.record(
             BusAccessKind::InstructionPrefetch,
@@ -9866,6 +9868,13 @@ impl CpuBus for MachineBus<'_> {
     fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
         if count == 0 {
             return Ok(());
+        }
+        // The stub table sits in high ROM, far above the conventional-RAM fast
+        // path below, so the trigger check runs on the run's START address only
+        // (a stub entry is always a fresh run: execution arrives by IVT far
+        // transfer or IRET return, never by falling through).
+        if start >= BIOS_INT_STUB_TABLE_PHYS {
+            self.note_stub_fetch(self.apply_a20(start));
         }
         // Fast path: a run that lies entirely in conventional RAM (below the
         // 0xA0000 video aperture). Every address below 0x100000 has bit 20 clear,
@@ -10485,6 +10494,28 @@ impl CpuBus for MachineBus<'_> {
         // DOS kernel that serviced them was retired in SP-3 — and INT 67h is no
         // longer intercepted either: the TOKAEMM guest driver owns the EMS API
         // since SP-4b M2.)
+        // Exactly one poster per dispatch: when the vector still points at its
+        // OWN per-vector ROM stub, the INT's IVT dispatch is about to land
+        // there and the stub's fetch seam (`note_stub_fetch`) will post the
+        // service - posting here too would service the call twice. This arm
+        // posts only when the stub fetch cannot: a guest hook owns the vector
+        // (HLE-alongside-hook, the historical semantics), or a period booter
+        // hardcoded the legacy shared IRET FF00:0000 (which is vector 0x00's
+        // territory, so the per-vector seam cannot attribute it).
+        if self.soft_int_intercepted(vector)? && !self.vector_points_at_own_stub(vector)? {
+            *self.pending_soft_int = Some(vector);
+        }
+        Ok(())
+    }
+}
+
+impl MachineBus<'_> {
+    /// The one interception predicate for host-serviced software interrupts,
+    /// shared by the two dispatch seams: `interrupt_acknowledge` (the `INT n`
+    /// opcode) and `note_stub_fetch` (execution reaching the vector's ROM stub
+    /// by any route - a DPMI host's simulate-real-mode-interrupt far dispatch,
+    /// or a guest chaining to a saved default vector).
+    fn soft_int_intercepted(&mut self, vector: u8) -> Result<bool, BusError> {
         let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
         let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
             && self.vector_points_at_rom_iret(vector)?;
@@ -10498,19 +10529,57 @@ impl CpuBus for MachineBus<'_> {
         ) || raw_program_vector
             || absent_resident_api
             || dos_multiplex;
-        if intercepted && !(self.booter_inert && vector == 0x2F) {
+        Ok(intercepted && !(self.booter_inert && vector == 0x2F))
+    }
+
+    /// The fetch-seam half of software-interrupt interception: execution has
+    /// reached a per-vector ROM stub entry (see BIOS_INT_STUB_TABLE_ROM_OFFSET).
+    /// Posts the vector for the run loop's deferred HLE dispatch. The stub's
+    /// leading NOP guarantees a post-instruction break fires before the IRET,
+    /// so the service still sees the INT frame on the stack. This is the ONLY
+    /// poster for a default vector (the `INT n` opcode path stands down when
+    /// the vector points at its own stub), so every dispatch route - INT
+    /// opcode, a DPMI host's simulated real-mode interrupt, a guest chaining
+    /// to a saved default - services exactly once. Repeated fetch charges of
+    /// the same visit are absorbed by the pending_soft_int.is_some() check
+    /// (the pending vector is only cleared at the next batch entry, after the
+    /// service ran and execution moved to the IRET byte, whose odd offset
+    /// never posts).
+    fn note_stub_fetch(&mut self, address: u32) {
+        let offset = address.wrapping_sub(BIOS_INT_STUB_TABLE_PHYS);
+        if offset >= BIOS_INT_STUB_TABLE_LEN || offset & 1 != 0 {
+            return; // outside the table, or the IRET byte (mid-stub resume)
+        }
+        if self.pending_soft_int.is_some() {
+            return;
+        }
+        let vector = (offset / 2) as u8;
+        if self.soft_int_intercepted(vector).unwrap_or(false) {
             *self.pending_soft_int = Some(vector);
         }
-        Ok(())
     }
-}
 
-impl MachineBus<'_> {
     fn vector_points_at_rom_iret(&mut self, vector: u8) -> Result<bool, BusError> {
         let address = usize::from(vector) * 4;
         let off = self.memory.read_u16(address)?;
         let seg = self.memory.read_u16(address + 2)?;
-        Ok(off == 0 && seg == BIOS_ROM_IRET_SEG)
+        // A vector is "still the BIOS default" when it points at its per-vector
+        // ROM stub. The legacy shared IRET at FF00:0000 is also accepted:
+        // period booters hardcode that address (IVT[0x13] -> FF00:0000 to chain
+        // disk calls), and pre-table guests may restore a saved default.
+        Ok(seg == BIOS_ROM_IRET_SEG && (off == bios_int_stub_off(vector) || off == 0))
+    }
+
+    /// STRICT form of the default-vector check: true only when the IVT entry
+    /// points at this vector's own per-vector stub. Used by
+    /// `interrupt_acknowledge` to decide whether the fetch seam will see the
+    /// dispatch (own stub -> it will; a hook or the legacy shared FF00:0000
+    /// hardcode -> it will not, so the opcode path must post).
+    fn vector_points_at_own_stub(&mut self, vector: u8) -> Result<bool, BusError> {
+        let address = usize::from(vector) * 4;
+        let off = self.memory.read_u16(address)?;
+        let seg = self.memory.read_u16(address + 2)?;
+        Ok(seg == BIOS_ROM_IRET_SEG && off == bios_int_stub_off(vector))
     }
 
     /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
@@ -11052,6 +11121,44 @@ const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
     0xcb, // retf
 ];
 
+/// Per-vector BIOS software-interrupt stub table: 256 two-byte `nop; iret`
+/// entries in ROM at FF00:0200 (physical 0xFF200), one per vector, seeded into
+/// the IVT as `FF00:(0x200 + 2*vector)`. The per-vector ENTRY ADDRESS is what
+/// lets the host recognize which BIOS service is being invoked from the
+/// instruction-FETCH seam, independent of HOW execution arrived: an `INT n`
+/// opcode (also caught by `interrupt_acknowledge`), a DPMI host's
+/// simulate-real-mode-interrupt dispatch that far-jumps through the IVT
+/// without any INT opcode (CWSDPMI servicing DJGPP `int86`, JEMM's
+/// Simulate_Int), or a guest chaining to a saved vector. The legacy shared
+/// IRET at FF00:0000 made all of those silent no-ops: Quake under CWSDPMI
+/// issued its INT 10h mode set and console teletype through the simulate path
+/// and the screen never left text mode.
+///
+/// The stub body is `nop; iret`, not a bare `iret`: the fetch-seam trigger
+/// posts `pending_soft_int`, which the run loop services at the next
+/// post-instruction break - after the NOP, BEFORE the IRET - so the
+/// real-mode INT frame is still on the stack when the HLE service runs
+/// (`set_int_frame_carry` patches CF in the saved FLAGS image). A bare IRET
+/// would pop the frame before the break.
+///
+/// Placed at 0x200 to stay clear of the machine-patched ROM residents below
+/// it (the shared legacy IRET at 0x0000, the CALL-5 adapter, the timer and
+/// master-IRQ ISR stubs at 0x0060/0x0080).
+const BIOS_INT_STUB_TABLE_ROM_OFFSET: usize = 0xF200;
+const BIOS_INT_STUB_TABLE_PHYS: u32 = 0xFF200;
+const BIOS_INT_STUB_TABLE_LEN: u32 = 512;
+
+const fn bios_int_stub_off(vector: u8) -> u16 {
+    0x0200 + (vector as u16) * 2
+}
+
+fn write_bios_int_stub_table(rom: &mut [u8]) {
+    for vector in 0..=255usize {
+        rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2] = 0x90; // nop
+        rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2 + 1] = 0xCF; // iret
+    }
+}
+
 const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;
 const BIOS_TIMER_ISR_ROM_OFFSET: usize = 0xf060;
 const BIOS_MASTER_IRQ_ISR_ROM_OFF: u16 = 0x0080;
@@ -11153,7 +11260,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // defaults. Guests and DOS can replace them through the IVT.
     for vector in 0x00usize..=0x07 {
         let address = vector * 4;
-        memory.write_u16(address, 0)?;
+        memory.write_u16(address, bios_int_stub_off(vector as u8))?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
     }
     // IRQ0 is real guest ISR code because the PIT can interrupt outside a BIOS
@@ -11201,7 +11308,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
         0xFE, 0xFF,
     ] {
         let address = vector * 4;
-        memory.write_u16(address, 0)?;
+        memory.write_u16(address, bios_int_stub_off(vector as u8))?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
     }
     // INT 70h (IRQ8) is a real hardware interrupt, not a host-serviced INT, so its
@@ -12460,7 +12567,10 @@ mod tests {
 
         for vector in 0x00u32..=0x07 {
             let base = vector * 4;
-            assert_eq!(read_u16(&mut machine, base), 0);
+            assert_eq!(
+                read_u16(&mut machine, base),
+                bios_int_stub_off(vector as u8)
+            );
             assert_eq!(read_u16(&mut machine, base + 2), BIOS_ROM_IRET_SEG);
         }
         assert_eq!(read_u16(&mut machine, 0x08 * 4), BIOS_TIMER_ISR_ROM_OFF);
@@ -12715,6 +12825,22 @@ mod tests {
             vec![0u8; BIOS_ROM_SIZE],
         )
         .unwrap()
+    }
+
+    /// Emulate a guest `INT n` end to end for interception-contract tests: the
+    /// opcode acknowledge, then the IVT dispatch landing wherever the vector
+    /// points. A default vector lands on its per-vector ROM stub, whose fetch
+    /// seam posts the service; a guest hook (or the legacy shared FF00:0000)
+    /// lands outside the per-vector table, where only the opcode path could
+    /// have posted.
+    fn ack_and_dispatch(m: &mut Machine, vector: u8) {
+        let mut bus = m.make_bus();
+        bus.interrupt_acknowledge(vector, 0).unwrap();
+        let base = usize::from(vector) * 4;
+        let off = bus.memory.read_u16(base).unwrap();
+        let seg = bus.memory.read_u16(base + 2).unwrap();
+        let target = (u32::from(seg) << 4) + u32::from(off);
+        bus.note_stub_fetch(target);
     }
 
     fn color_crtc_reg(machine: &mut Machine, index: u8) -> u8 {
@@ -13784,11 +13910,13 @@ mod tests {
         let mut bus = m.make_bus();
         bus.write_memory(0x10_0001, BusWidth::Word, 0xBEEF, BusAccessKind::DataWrite)
             .unwrap();
-        // Low memory is untouched; the word stays at the real HMA cells.
+        // Low memory is untouched; the word stays at the real HMA cells. Byte
+        // 0x1 is IVT[0]'s offset high byte, seeded to the per-vector ROM stub
+        // (bios_int_stub_off(0) = 0x0200 -> high byte 0x02).
         assert_eq!(
             bus.read_memory(0x1, BusWidth::Byte, BusAccessKind::DataRead)
                 .unwrap(),
-            0x00,
+            u32::from(bios_int_stub_off(0) >> 8),
             "0x1 untouched with A20 on"
         );
         assert_eq!(
@@ -17178,7 +17306,7 @@ mod tests {
         // The Rust DOS kernel that used to service INT 21h/25h/26h/27h/29h/2Ah/2Eh
         // was retired in SP-3, so those pure-DOS vectors are no longer intercepted
         // in EITHER mode; they always pass straight through to the guest's IVT.
-        m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x21);
         assert_eq!(
             m.pending_soft_int, None,
             "INT 21h is never intercepted (the DOS kernel was retired)"
@@ -17187,14 +17315,14 @@ mod tests {
         // The DOS multiplex vector (INT 2Fh) IS intercepted by default. INT 67h is
         // not intercepted at all any more: the TOKAEMM guest driver owns the EMS
         // API (SP-4b M2).
-        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x2f);
         assert_eq!(
             m.pending_soft_int,
             Some(0x2f),
             "INT 2Fh (multiplex) is intercepted by default"
         );
         m.pending_soft_int = None;
-        m.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x67);
         assert_eq!(
             m.pending_soft_int, None,
             "INT 67h (EMS) is never intercepted (the guest driver owns it)"
@@ -17204,40 +17332,40 @@ mod tests {
         // handlers run through the IVT.
         m.set_booter_inert(true);
         assert!(m.booter_inert());
-        m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x21);
         assert_eq!(
             m.pending_soft_int, None,
             "INT 21h is still not intercepted in booter mode"
         );
-        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x2f);
         assert_eq!(
             m.pending_soft_int, None,
             "INT 2Fh (multiplex) stands down too"
         );
 
         // The BIOS hardware services stay intercepted even in booter mode.
-        m.make_bus().interrupt_acknowledge(0x10, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x10);
         assert_eq!(
             m.pending_soft_int,
             Some(0x10),
             "INT 10h (BIOS video) stays intercepted"
         );
         m.pending_soft_int = None;
-        m.make_bus().interrupt_acknowledge(0x13, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x13);
         assert_eq!(
             m.pending_soft_int,
             Some(0x13),
             "INT 13h (BIOS disk) stays intercepted"
         );
         m.pending_soft_int = None;
-        m.make_bus().interrupt_acknowledge(0x40, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x40);
         assert_eq!(
             m.pending_soft_int,
             Some(0x40),
             "INT 40h (relocated floppy) stays intercepted"
         );
         m.pending_soft_int = None;
-        m.make_bus().interrupt_acknowledge(0x42, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x42);
         assert_eq!(
             m.pending_soft_int,
             Some(0x42),
@@ -17246,7 +17374,7 @@ mod tests {
 
         // A vector the HLE never intercepts is recorded in neither mode.
         m.pending_soft_int = None;
-        m.make_bus().interrupt_acknowledge(0x80, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x80);
         assert_eq!(
             m.pending_soft_int, None,
             "an un-intercepted vector is ignored"
@@ -17259,7 +17387,7 @@ mod tests {
 
         // Default boot: IVT[0x2F] is still the ROM IRET stub, so the multiplex
         // HLE intercepts as always.
-        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x2f);
         assert_eq!(
             m.pending_soft_int,
             Some(0x2f),
@@ -17274,7 +17402,7 @@ mod tests {
             bus.memory.write_u16(0x2f * 4, 0x128e).unwrap();
             bus.memory.write_u16(0x2f * 4 + 2, 0x00d8).unwrap();
         }
-        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x2f);
         assert_eq!(
             m.pending_soft_int, None,
             "guest-hooked INT 2Fh: the HLE stands down so the guest's own handler runs \
@@ -17296,7 +17424,7 @@ mod tests {
                 .unwrap();
         for vector in [0x20u8, 0x21, 0x27] {
             raw.pending_soft_int = None;
-            raw.make_bus().interrupt_acknowledge(vector, 0).unwrap();
+            ack_and_dispatch(&mut raw, vector);
             assert_eq!(
                 raw.pending_soft_int,
                 Some(vector),
@@ -17306,7 +17434,7 @@ mod tests {
 
         // A normal (non-program-runtime) machine passes them straight through.
         let mut boot = int15_machine(16);
-        boot.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        ack_and_dispatch(&mut boot, 0x21);
         assert_eq!(
             boot.pending_soft_int, None,
             "INT 21h passes through for a normal boot (no raw-program runtime)"
@@ -17318,14 +17446,14 @@ mod tests {
         let mut m = int15_machine(16);
 
         for vector in [0x5C, 0x60, 0x68, 0x6F, 0x7A, 0x86, 0xE4] {
-            m.make_bus().interrupt_acknowledge(vector, 0).unwrap();
+            ack_and_dispatch(&mut m, vector);
             assert_eq!(m.pending_soft_int, Some(vector), "INT {vector:02X}h");
             m.pending_soft_int = None;
         }
 
         m.memory.write_u16(0x60 * 4, 0x1234).unwrap();
         m.memory.write_u16(0x60 * 4 + 2, 0x5678).unwrap();
-        m.make_bus().interrupt_acknowledge(0x60, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x60);
 
         assert_eq!(
             m.pending_soft_int, None,
@@ -17469,7 +17597,7 @@ mod tests {
         let mut m = int15_machine(16);
         m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
         m.handle_int19();
-        m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        ack_and_dispatch(&mut m, 0x21);
         assert_eq!(
             m.pending_soft_int, None,
             "INT 21h stands down once a floppy has booted"
@@ -26568,14 +26696,102 @@ mod tests {
     }
 
     #[test]
+    fn simulated_int_dispatch_through_the_ivt_services_the_hle() {
+        // The Quake-under-CWSDPMI mechanism in miniature: a DPMI host services
+        // a real-mode interrupt request by PUSHF + far CALL through the IVT,
+        // never executing an INT opcode. The per-vector stub's fetch seam must
+        // service the HLE anyway. Here: a simulated INT 10h AX=0013 mode set.
+        let code: &[u8] = &[
+            0xb8, 0x13, 0x00, // mov ax, 0x0013
+            0x31, 0xdb, // xor bx, bx
+            0x8e, 0xdb, // mov ds, bx
+            0x9c, // pushf
+            0xff, 0x1e, 0x40, 0x00, // call far [0x0040]  (IVT[0x10])
+            0xfa, 0xf4, // cli; hlt
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(0x449),
+            0x13,
+            "the simulated INT 10h mode set must reach the HLE (BDA current mode)"
+        );
+    }
+
+    #[test]
+    fn int_opcode_dispatch_services_exactly_once() {
+        // INT 10h AH=0Eh teletype 'A' via the opcode path: the opcode arm
+        // stands down for a default vector (the stub fetch posts instead), so
+        // the character must appear exactly once (a double service advances
+        // the BDA cursor column twice).
+        let code: &[u8] = &[
+            0xb8, 0x41, 0x0e, // mov ax, 0x0e41 ('A' teletype)
+            0xcd, 0x10, // int 0x10
+            0xfa, 0xf4, // cli; hlt
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(0x450),
+            1,
+            "one teletype call advances the cursor column exactly once"
+        );
+    }
+
+    #[test]
+    fn booter_hardcoded_legacy_iret_keeps_int13_serviced() {
+        // Period booters repoint IVT[0x13] at the legacy shared IRET FF00:0000
+        // (not the per-vector stub) and then issue INT 13h. The opcode path
+        // must still post the service for that legacy address (the fetch seam
+        // cannot attribute FF00:0000, which belongs to vector 0's stub).
+        let rom = rom_with_code(&[
+            // IVT[0x13] = FF00:0000, the hardcoded legacy chain target.
+            0x31, 0xc0, // xor ax, ax
+            0x8e, 0xd8, // mov ds, ax
+            0xc7, 0x06, 0x4c, 0x00, 0x00, 0x00, // mov word [0x4c], 0x0000
+            0xc7, 0x06, 0x4e, 0x00, 0x00, 0xff, // mov word [0x4e], 0xff00
+            // A failing read on unbacked drive B: sets the last status...
+            0xb4, 0x02, 0xb0, 0x01, // AH=02h read, AL=1 sector
+            0xb5, 0x00, 0xb1, 0x01, // CH=0, CL=1
+            0xb6, 0x00, 0xb2, 0x01, // DH=0, DL=1 (drive B:, unbacked)
+            0xcd, 0x13, // int 0x13
+            0xb4, 0x01, 0xcd, 0x13, // ...and AH=01h reads it back.
+            0xf4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(vec![0u8; 737_280]).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(
+            (ax >> 8) as u8,
+            0x80,
+            "the hardcoded-legacy-vector INT 13h was still serviced (AH = last status)"
+        );
+    }
+
+    #[test]
     fn izarra_bios_isr_enqueues_injected_key() {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         // Run POST so the BIOS reaches its idle loop (past the setup hotkey window,
         // which would otherwise drain the key). Then inject a key: IRQ1 reaches the
         // installed INT 09h, which enqueues it into the BDA ring. The idle loop does
-        // not consume keys, so it stays there.
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // not consume keys, so it stays there. The budget tracks POST's length: the
+        // setup-page incremental-redraw work (f56c0197) pushed POST past the old
+        // 5M-cycle budget, which parked this test inside the hotkey window.
+        machine.run_until_halt_or_cycles(10_000_000).unwrap();
         machine.inject_key_scancodes(&[0x1e, 0x9e]);
         machine.run_until_halt_or_cycles(2_000_000).unwrap();
         let head = machine.memory_read_u16_for_test(0x41a);
@@ -26685,8 +26901,13 @@ mod tests {
             let target = (u32::from(seg) << 4) + u32::from(off);
             assert_eq!(
                 m.read_physical_u8(target),
+                0x90,
+                "INT {vector:02X}h target is its per-vector stub's NOP"
+            );
+            assert_eq!(
+                m.read_physical_u8(target + 1),
                 0xcf,
-                "INT {vector:02X}h target is an IRET"
+                "INT {vector:02X}h stub ends in an IRET"
             );
         }
     }
@@ -26713,8 +26934,13 @@ mod tests {
             let target = (u32::from(seg) << 4) + u32::from(off);
             assert_eq!(
                 m.read_physical_u8(target),
+                0x90,
+                "INT {vector:02X}h target is its per-vector stub's NOP"
+            );
+            assert_eq!(
+                m.read_physical_u8(target + 1),
                 0xcf,
-                "INT {vector:02X}h target is an IRET"
+                "INT {vector:02X}h stub ends in an IRET"
             );
         }
     }
