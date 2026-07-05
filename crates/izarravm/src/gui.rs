@@ -1459,19 +1459,9 @@ impl GuiApp {
         if self.crt_style == CrtStyle::YeOlde {
             ui.ctx().request_repaint();
         }
-        // Destination viewport size in physical output pixels, so the shader can
-        // scale the shadow-mask pitch and scanline profile with the actual
-        // magnification instead of aliasing at odd scales or under HiDPI.
-        let ppp = ui.ctx().pixels_per_point();
-        let dst_size = (rect.width() * ppp, rect.height() * ppp);
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
-            crate::crt::CrtCallback {
-                frame,
-                style,
-                time,
-                dst_size,
-            },
+            crate::crt::CrtCallback { frame, style, time },
         ));
         // Clicking the screen requests input capture (handled later by the event
         // loop, which owns the winit Window).
