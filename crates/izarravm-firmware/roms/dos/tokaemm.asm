@@ -2442,7 +2442,7 @@ vcpi_dispatch:
     dd .de00, .de01, .de02, .de03
     dd .de04, .de05, .de06, .de07
     dd .de08, .de09, .de0a, .de0b
-    dd .undef                       ; DE0C (mode switch) is the M3 rung
+    dd .de0c
 
 .de00:                            ; presence: AH=0, BX = version 1.0
     mov byte [esi+29], 0
@@ -2620,6 +2620,50 @@ vcpi_dispatch:
     mov byte [esi+29], 0x8F       ; undefined / not-yet-implemented subfunction
     ret
 
+; DE0C Switch From V86 Mode to Protected Mode (spec p.12; the exact flow
+; JEMM's traced handshake runs on this CPU). Guest ESI = first-MB linear of
+; the 6-field structure {CR3, &GDTR value, &IDTR value, LDTR, TR, CS:EIP}.
+; Interrupts are already off (interrupt gate). Spec register contract: EAX,
+; ESI, DS/ES/FS/GS destroyed; everything else must arrive at the client
+; entry intact -- restored from the pushad block below, since this path
+; never returns to .done_gp/popad. The V86 trap frame on the monitor stack
+; is abandoned: TSS.ESP0 is static, the next V86 entry starts fresh.
+;
+; Ordering per spec: CR3 first, then GDTR/IDTR read through the NEW paging
+; context via the linear pointers (the structure and both pseudo-descriptors
+; are first-MB, mapped identically in both contexts by the DE01 contract);
+; GDTR before LDTR/TR; the client TSS descriptor's busy bit cleared through
+; the flat data segment (base 0, 4GB limit -- the spec's required shape)
+; before LTR. The segment-descriptor caches carry DS/SS across the lgdt (the
+; spec relies on exactly this), so the monitor stack and flat reads keep
+; working until the far jump hands the client its own world.
+.de0c:
+    mov eax, [esi+4]              ; guest ESI = switch-structure linear
+    mov ecx, [eax]
+    mov cr3, ecx                  ; client paging context
+    mov edx, [eax+4]
+    lgdt [edx]                    ; client GDT (read post-switch, spec order)
+    mov edx, [eax+8]
+    lidt [edx]                    ; client IDT
+    movzx ecx, word [eax+0x0E]    ; TR selector
+    and ecx, 0xFFF8
+    jz .no_tr                     ; defensive: LTR(0) would #GP; clients
+    mov edx, [eax+4]              ; always furnish a TSS per spec
+    mov edx, [edx+2]              ; client GDT linear base
+    and byte [edx+ecx+5], 0xFD    ; clear the TSS-busy type bit
+    ltr word [eax+0x0E]
+.no_tr:
+    lldt word [eax+0x0C]          ; LLDT(0) is legal: null LDT
+    mov ebx, [esi+16]             ; hand the guest's registers through
+    mov ecx, [esi+24]
+    mov edx, [esi+20]
+    mov edi, [esi+0]
+    mov ebp, [esi+8]
+    jmp far dword [eax+0x10]      ; CS:EIP from the structure: the client's
+                                  ; protected-mode entry, interrupts off,
+                                  ; SS:ESP = this monitor stack (>=16 bytes
+                                  ; free; the client sets its own stack)
+
 ; Guest ES:DI (V86) -> EAX = buffer linear address for DE08/DE09.
 ; ES from the V86 trap frame at [ebp+20], DI from the pushad block.
 vcpi_dr_buf:
@@ -2693,6 +2737,9 @@ vcpi_page_free:
 ; mid-bitmap-update. FS is borrowed for driver data so vcpi_page_alloc/free
 ; are shared verbatim with the V86-path dispatch.
 vcpi_pm_entry:
+    cmp ax, 0xDE0C                ; the PM->V86 switch never returns: route
+    je vcpi_pm_to_v86             ; it before the prologue pushes so the
+                                  ; spec's stack-frame offsets hold
     push fs
     push ecx
     mov cx, cs
@@ -2759,6 +2806,43 @@ vcpi_pm_entry:
     pop ecx
     pop fs
     retf                          ; USE32 code segment: 32-bit far return
+
+; ---- DE0C Switch From Protected Mode to V86 Mode (spec p.15). Far-called
+; on the CLIENT's stack (spec: SS:ESP in the first megabyte -- the frame is
+; read with 32-bit addressing, relying on the spec-clean full ESP real
+; clients maintain for exactly this call; JEMM makes the same assumption
+; with real DOS4GW). Frame at entry: [esp+0]/[esp+4] the USE32 far-call
+; return address (discarded, this call never returns), then EIP, CS,
+; EFLAGS(reserved), ESP, SS, ES, DS, FS, GS as dwords -- deliberately the
+; hardware ring0->V86 IRETD frame, so after restoring the server context we
+; fill the EFLAGS slot, drop the return address, and IRETD straight off the
+; client's stack (it stays mapped across the CR3 switch: first MB is
+; identical in both contexts). Spec register contract: only EAX destroyed;
+; every segment register is reloaded by the IRETD itself. The monitor's
+; TSS-busy bit is cleared through the freshly-reloaded flat DS before LTR,
+; and vif is forced 0 so the resumed V86 side stays virtually masked until
+; it STIs (the spec's IF-cleared intent through the vif layer; the frame's
+; real IF stays 1, the monitor convention). ----
+vcpi_pm_to_v86:
+    cli                           ; enforce the spec's interrupts-off rule
+    mov eax, [cs:pd_lin]
+    mov cr3, eax                  ; server paging context
+    lgdt [cs:gdtr]                ; server GDT/IDT: the INIT-patched
+    lidt [cs:idtr]                ; pseudo-descriptors (absolute bases)
+    mov ax, 0x10
+    mov ds, ax                    ; flat data from the server GDT
+    mov eax, [cs:base_lin]
+    and byte [eax + gdt + 0x18 + 5], 0xFD ; clear our TSS-busy type bit
+    mov ax, 0x18
+    ltr ax
+    xor ax, ax
+    lldt ax                       ; the monitor uses no LDT
+    mov eax, [cs:base_lin]
+    mov byte [eax + vif], 0       ; V86 resumes virtually masked
+    mov dword [esp+0x10], 0x00020202 ; EFLAGS slot: VM=1, real IF=1,
+                                  ; IOPL=0, reserved bit 1
+    add esp, 8                    ; drop the far-call return address
+    iretd                         ; EIP,CS,EFLAGS,ESP,SS,ES,DS,FS,GS -> V86
 
 ; EOI the chip(s) for line EBX. The just-delivered line is the highest in
 ; service on its chip, so the non-specific EOI clears the right bit; slave

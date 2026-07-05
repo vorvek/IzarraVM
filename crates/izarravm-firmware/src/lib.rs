@@ -53,6 +53,8 @@ pub const VCPIMEM_COM: &[u8] = include_bytes!("../roms/dos/vcpimem.com");
 pub const VCPIMEM_COM_SOURCE: &str = include_str!("../roms/dos/vcpimem.asm");
 pub const VCPIIF_COM: &[u8] = include_bytes!("../roms/dos/vcpiif.com");
 pub const VCPIIF_COM_SOURCE: &str = include_str!("../roms/dos/vcpiif.asm");
+pub const VCPISW_COM: &[u8] = include_bytes!("../roms/dos/vcpisw.com");
+pub const VCPISW_COM_SOURCE: &str = include_str!("../roms/dos/vcpisw.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -271,6 +273,15 @@ pub fn vcpimem_com() -> &'static [u8] {
 /// and the in-segment PM entry offset. Signals 0xA5 / 0xEn.
 pub fn vcpiif_com() -> &'static [u8] {
     VCPIIF_COM
+}
+
+/// The VCPI M3 mode-switch fixture: a minimal REAL VCPI client. DE01
+/// interface setup, DE0C into 16-bit protected mode under its own
+/// CR3/GDT/TSS, PM far-calls to the server entry (DE03 vs the V86 baseline,
+/// DE04/DE05 round-trip), DE0C back to V86, marker-register and
+/// pool-balance verification. Signals 0xA5 / 0xEn.
+pub fn vcpisw_com() -> &'static [u8] {
+    VCPISW_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at
