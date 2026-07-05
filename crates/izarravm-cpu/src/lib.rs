@@ -8858,6 +8858,20 @@ impl Cpu386 {
     /// (same `IZARRAVM_FAULT_TRACE` env var as the machine crate's fault
     /// trace); a no-op call on the cold vector-6-only path when off.
     fn trace_ud_if_enabled<B: CpuBus>(&mut self, bus: &mut B) {
+        self.trace_fault_if_enabled(bus, 6, None);
+    }
+
+    /// The same diagnostic generalized: log a guest-bound exception delivery
+    /// with the faulting CS:IP and raw instruction bytes. Wired for #UD (6) and
+    /// #GP (13), the two vectors the game bring-up loop keeps needing. #PF is
+    /// deliberately NOT traced: CWSDPMI services page faults constantly and the
+    /// spam would bury the signal.
+    fn trace_fault_if_enabled<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u8,
+        error_code: Option<u32>,
+    ) {
         if !ud_trace_enabled() {
             return;
         }
@@ -8888,8 +8902,14 @@ impl Cpu386 {
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
             .join(" ");
+        let name = match vector {
+            6 => "#UD",
+            13 => "#GP",
+            other => return eprintln!("fault trace: unexpected trace vector {other}"),
+        };
+        let ec = error_code.map_or(String::new(), |e| format!(" ec={e:#06x}"));
         eprintln!(
-            "fault trace: #UD at CS:IP={:#06x}:{:#010x} bytes=[{byte_str}] \
+            "fault trace: {name} at CS:IP={:#06x}:{:#010x}{ec} bytes=[{byte_str}] \
              cr0={:#010x} eflags={:#010x} vm={} cpl={}",
             cs.selector,
             eip,
@@ -8912,6 +8932,12 @@ impl Cpu386 {
     ) -> ExecResult<()> {
         if vector == 6 && !is_external {
             self.trace_ud_if_enabled(bus);
+        }
+        // #GP deliveries bound for a protected-mode guest handler (the V86 ones
+        // are the monitor's routine trap traffic - hundreds of thousands per
+        // second - so only trace when the guest is NOT in V86).
+        if vector == 13 && !is_external && !self.is_v86_mode() {
+            self.trace_fault_if_enabled(bus, 13, error_code);
         }
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
