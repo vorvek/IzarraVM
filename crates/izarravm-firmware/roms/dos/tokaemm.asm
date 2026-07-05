@@ -2439,7 +2439,7 @@ vcpi_dispatch:
     ja .undef
     jmp dword [fs:.jt + eax*4]    ; offsets are driver-relative == CS-relative
 .jt:
-    dd .de00, .undef, .de02, .de03  ; DE01 (PM interface) is the M2 rung
+    dd .de00, .de01, .de02, .de03
     dd .de04, .de05, .de06, .de07
     dd .de08, .de09, .de0a, .de0b
     dd .undef                       ; DE0C (mode switch) is the M3 rung
@@ -2447,6 +2447,62 @@ vcpi_dispatch:
 .de00:                            ; presence: AH=0, BX = version 1.0
     mov byte [esi+29], 0
     mov word [esi+16], 0x0100
+    ret
+
+; DE01 Get Protected Mode Interface: initialize the client's 0th page table
+; (guest ES:DI) and three GDT descriptors (guest DS:SI), return the PM entry
+; offset in EBX. The copy covers PT0 entries 0..0x10F -- the whole V86
+; window this monitor furnishes (first MB + the 64K A20/HMA window), which
+; also maps the ENTIRE server (code, data, GDT, TSS, page tables are all
+; driver-resident conventional memory), so no extra above-1MB server
+; mappings are needed -- the structural gift of a low-resident monitor.
+; Software-defined PTE bits 9-11 are cleared in the copy (spec p.6; the
+; 386MAX COPY_PTE convention). The descriptors: +0 the server code segment
+; (base = base_lin, byte limit = resident_end-1, 32-bit CPL0 code -- entry
+; offsets are driver offsets), +8 a flat 4GB data mirror of selector 0x10,
+; +16 a driver-data mirror of selector 0x20; the PM entry reaches them as
+; CS+8 / CS+16 per the spec's consecutive-slot contract.
+.de01:
+    movzx eax, word [ebp+20]      ; guest ES
+    shl eax, 4
+    movzx ecx, word [esi+0]       ; guest DI
+    add eax, ecx                  ; EAX = page-table buffer linear
+    mov ecx, [fs:pd_lin]
+    add ecx, 0x1000               ; ECX = PT0 source linear
+    mov ebx, 0x110
+.pte_copy:
+    mov edx, [ecx]
+    and edx, 0xFFFFF1FF           ; clear software bits 9-11
+    mov [eax], edx
+    add ecx, 4
+    add eax, 4
+    dec ebx
+    jnz .pte_copy
+    add word [esi+0], 0x110*4     ; DI -> first unused page table entry
+    movzx eax, word [ebp+24]      ; guest DS
+    shl eax, 4
+    movzx ecx, word [esi+4]       ; guest SI
+    add eax, ecx                  ; EAX = &descriptor[0]
+    mov edx, [fs:base_lin]
+    mov word [eax], resident_end - 1  ; code: limit 15..0 (image < 64K)
+    mov [eax+2], dx               ; base 15..0
+    shr edx, 16
+    mov [eax+4], dl               ; base 23..16
+    mov byte [eax+5], 0x9B        ; present ring-0 exec/read code, accessed
+    mov byte [eax+6], 0x40        ; D=1 (USE32), G=0, limit 19..16 = 0
+    mov [eax+7], dh               ; base 31..24
+    mov dword [eax+8], 0x0000FFFF ; +8: flat 4GB data (selector 0x10 mirror)
+    mov dword [eax+12], 0x00CF9300
+    mov edx, [fs:base_lin]        ; +16: driver data (selector 0x20 mirror)
+    mov word [eax+16], 0xFFFF
+    mov [eax+18], dx
+    shr edx, 16
+    mov [eax+20], dl
+    mov byte [eax+21], 0x93       ; present ring-0 read/write data, accessed
+    mov byte [eax+22], 0xCF       ; G=1, B=1, limit 19..16 = 0xF (4GB)
+    mov [eax+23], dh
+    mov dword [esi+16], vcpi_pm_entry ; EBX = entry offset in the code seg
+    mov byte [esi+29], 0
     ret
 
 .de02:                            ; max physical memory address: EDX = the
@@ -2622,6 +2678,87 @@ vcpi_page_free:
 .bad:
     stc
     ret
+
+; ---- The protected-mode entry point: far-called USE32 by clients running
+; under THEIR OWN CR3/GDT/IDT at CPL 0, with CS = the server code descriptor
+; DE01 furnished. The monitor selectors 0x08-0x20 are MEANINGLESS here; the
+; only anchors are CS-relative addressing and the spec's consecutive-slot
+; contract: CS+8 = flat data, CS+16 = driver data (VCPI 1.0 spec p.6). The
+; server memory itself is reachable because the client's 0th page table was
+; copied from ours (everything driver-resident is below 1MB). All segment
+; registers are preserved (spec p.7); USE32 far return. Serves the PM set
+; that exists at this rung: DE00, DE03, DE04, DE05 (DE0C lands in M3);
+; everything else answers 8Fh. The pool ops run IF-masked: clients may call
+; with interrupts enabled and an ISR of theirs could reenter the interface
+; mid-bitmap-update. FS is borrowed for driver data so vcpi_page_alloc/free
+; are shared verbatim with the V86-path dispatch.
+vcpi_pm_entry:
+    push fs
+    push ecx
+    mov cx, cs
+    add cx, 0x10
+    mov fs, cx                    ; FS = driver data via the client's GDT
+    cmp ah, 0xDE
+    jne .undef
+    cmp al, 0x00
+    je .de00
+    cmp al, 0x03
+    je .de03
+    cmp al, 0x04
+    je .de04
+    cmp al, 0x05
+    je .de05
+.undef:
+    mov ah, 0x8F
+    jmp .out
+.de00:                            ; presence: AH=0, BX = version 1.0
+    mov bx, 0x0100
+    xor ah, ah
+    jmp .out
+.de03:                            ; free 4K page count -> EDX
+    pushfd
+    cli
+    movzx edx, word [fs:vcpi_free]
+    popfd
+    xor ah, ah
+    jmp .out
+.de04:                            ; allocate a 4K page -> EDX = physical
+    pushfd
+    cli
+    push eax                      ; AL must survive (only AH/EDX are outputs)
+    call vcpi_page_alloc          ; -> EAX = phys or CF; clobbers ecx, edx
+    jc .a_oom
+    mov edx, eax
+    pop eax
+    popfd
+    xor ah, ah
+    jmp .out
+.a_oom:
+    pop eax
+    popfd
+    mov ah, 0x88
+    jmp .out
+.de05:                            ; free the 4K page at physical EDX
+    pushfd
+    cli
+    push eax
+    mov eax, edx
+    and eax, 0xFFFFF000           ; spec: mask the 12 LSBs
+    call vcpi_page_free           ; clobbers only EAX; EDX stays intact
+    setc cl                       ; capture CF: the popfd below wipes flags
+    pop eax
+    popfd
+    test cl, cl
+    jnz .f_bad
+    xor ah, ah
+    jmp .out
+.f_bad:
+    mov ah, 0x8A
+    jmp .out
+.out:
+    pop ecx
+    pop fs
+    retf                          ; USE32 code segment: 32-bit far return
 
 ; EOI the chip(s) for line EBX. The just-delivered line is the highest in
 ; service on its chip, so the non-specific EOI clears the right bit; slave

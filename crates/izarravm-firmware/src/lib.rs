@@ -51,6 +51,8 @@ pub const VCPIDET_COM: &[u8] = include_bytes!("../roms/dos/vcpidet.com");
 pub const VCPIDET_COM_SOURCE: &str = include_str!("../roms/dos/vcpidet.asm");
 pub const VCPIMEM_COM: &[u8] = include_bytes!("../roms/dos/vcpimem.com");
 pub const VCPIMEM_COM_SOURCE: &str = include_str!("../roms/dos/vcpimem.asm");
+pub const VCPIIF_COM: &[u8] = include_bytes!("../roms/dos/vcpiif.com");
+pub const VCPIIF_COM_SOURCE: &str = include_str!("../roms/dos/vcpiif.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -260,6 +262,15 @@ pub fn vcpidet_com() -> &'static [u8] {
 /// Signals 0xA5 / 0xEn.
 pub fn vcpimem_com() -> &'static [u8] {
     VCPIMEM_COM
+}
+
+/// The VCPI M2 DE01 fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): validates the
+/// Get Protected Mode Interface call's V86-observable outputs — the 0x110-
+/// entry page-table copy (identity mappings, software bits 9-11 cleared,
+/// exact write extent, DI advance), the three furnished GDT descriptors,
+/// and the in-segment PM entry offset. Signals 0xA5 / 0xEn.
+pub fn vcpiif_com() -> &'static [u8] {
+    VCPIIF_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at
