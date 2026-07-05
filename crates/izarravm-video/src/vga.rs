@@ -4207,7 +4207,15 @@ impl Vga {
         }
         self.bump_content_gen();
         self.crtc = CrtcTiming::mode13h();
-        self.recompute_vertical_timing(); // guest vertical CRTC writes win
+        // Reseed the raw CRTC bytes from the canonical timing before the
+        // recompute: on a Text-origin bang the guest's vertical CRTC writes
+        // were DROPPED (the gated store block only accepts them in graphics
+        // personalities), so recomputing from the stale text bytes would be
+        // right only by the mode-3/13h timing coincidence. A Planar-origin
+        // bang did capture the guest's writes, but canonical 13h vertical
+        // timing is the correct 320x200x256 base either way.
+        self.crtc_regs = CrtcRegs::from_timing(self.crtc);
+        self.recompute_vertical_timing();
         self.beam = 0;
         self.last_line = 0;
         self.mode = VideoMode::Mode13h;
