@@ -3479,6 +3479,66 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// VCPI M3 DE0C: a minimal REAL VCPI client walks the full extender
+    /// lifecycle under a bare DEVICE=TOKAEMM.SYS — DE01 interface setup,
+    /// DE0C into 16-bit protected mode under its own CR3/GDT/TSS (the
+    /// JEMM-traced switch flow), far-calls to the server PM entry (DE03
+    /// equal to the V86 baseline, DE04/DE05 round-trip), DE0C back to V86,
+    /// with marker registers proving the spec's register-preservation
+    /// contract across both switches and the pool balanced at the end.
+    /// VCPISW signals 0xA5 / 0xEn.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_vcpi3_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "VCPISW.COM".to_string(),
+                        izarravm_firmware::vcpisw_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "VCPI M3 switch round-trip did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step (0xEF = DE0C returned).\n{text}"
+        );
+    }
+
     /// SP-4b M4 GO/NO-GO: a fresh (empty) user folder gets the NEW defaults seeded
     /// (`ensure_user_config`) — DEVICE=TOKAEMM.SYS NOEMS + DOS=HIGH,UMB + LH
     /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
