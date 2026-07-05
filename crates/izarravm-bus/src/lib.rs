@@ -503,6 +503,17 @@ pub trait CpuBus {
     /// Charge one byte of instruction-fetch bus time at `address`.
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError>;
 
+    /// Observe the LINEAR address of a code byte the CPU is about to consume
+    /// (called per fetched byte, alongside the physical charge). Purely an
+    /// observation seam: no bus time, no required side effects. The machine
+    /// keys its BIOS software-interrupt stub recognition on this, because the
+    /// stub table is an architectural (linear) address and a paging guest (an
+    /// EMM386-class monitor shadowing the BIOS F-page) may back it with a
+    /// different physical page, so the physical fetch address cannot identify
+    /// a stub landing. Default: no-op.
+    #[inline]
+    fn note_code_fetch_linear(&mut self, _linear: u32) {}
+
     /// Charge the instruction-fetch clocks for a run of `count` bytes starting at
     /// `start`. Equivalent to `count` calls to `charge_instruction_fetch(start + i)`,
     /// but an impl backed by region-uniform memory may charge it in one op. Default:

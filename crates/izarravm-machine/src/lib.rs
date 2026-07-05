@@ -9860,9 +9860,18 @@ impl CpuBus for MachineBus<'_> {
         Ok(copied)
     }
 
+    #[inline]
+    fn note_code_fetch_linear(&mut self, linear: u32) {
+        // One range compare (0xFF000..0xFF400: the legacy FF00:0000 target
+        // through the end of the per-vector stub table) keeps this out of the
+        // way of every ordinary fetch.
+        if linear.wrapping_sub(BIOS_LEGACY_IRET_LINEAR) < BIOS_STUB_WINDOW_LEN {
+            self.note_stub_fetch(linear);
+        }
+    }
+
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
         let address = self.apply_a20(address);
-        self.note_stub_fetch(address);
         let ws = self.code_fetch_wait_states(address);
         self.trace.record(
             BusAccessKind::InstructionPrefetch,
@@ -9877,13 +9886,13 @@ impl CpuBus for MachineBus<'_> {
         if count == 0 {
             return Ok(());
         }
-        // The stub table and the legacy FF00:0000 target sit in high ROM, far
-        // above the conventional-RAM fast path below, so the trigger check
-        // runs on the run's START address only (a stub entry is always a
-        // fresh run: execution arrives by IVT far transfer or IRET return,
-        // never by falling through).
-        if start >= BIOS_LEGACY_IRET_PHYS {
-            self.note_stub_fetch(self.apply_a20(start));
+        // Stub recognition, run-charge seam: the trigger check runs on the
+        // run's START address only (a stub entry is always a fresh run:
+        // execution arrives by IVT far transfer or IRET return, never by
+        // falling through). `start` here is the run's LINEAR address - the
+        // same domain `note_code_fetch_linear` observes on the cold path.
+        if start.wrapping_sub(BIOS_LEGACY_IRET_LINEAR) < BIOS_STUB_WINDOW_LEN {
+            self.note_stub_fetch(start);
         }
         // Fast path: a run that lies entirely in conventional RAM (below the
         // 0xA0000 video aperture). Every address below 0x100000 has bit 20 clear,
@@ -10569,15 +10578,16 @@ impl MachineBus<'_> {
     /// only cleared at the next batch entry, after the service ran and
     /// execution moved to the IRET byte, whose odd offset never posts).
     ///
-    /// Keying caveat, recorded per review: the per-byte fetch seam
-    /// (`charge_instruction_fetch`) hands this a PHYSICAL address, the cached
-    /// run seam (`charge_instruction_fetch_run`) a LINEAR one. The two agree
-    /// everywhere real software runs (real mode, V86 identity-mapped ROM); a
-    /// hostile pmode guest paging some other linear page onto physical
-    /// 0xFF2xx, or the stub linears onto other frames, could post a bogus or
-    /// missed service. Accepted hostile-guest-only divergence.
+    /// `address` is a LINEAR address on both seams (`note_code_fetch_linear`
+    /// per cold-fetched byte, `charge_instruction_fetch_run` per cached run):
+    /// the stub table's identity is architectural, and a paging guest that
+    /// shadows the BIOS F-page (JemmEx) still dispatches through linear
+    /// FF00:02xx while backing it with another physical page. Residual
+    /// divergence, recorded per review: a pmode guest running unrelated code
+    /// AT linear 0xFF0xx/0xFF2xx (mapped wherever) posts a bogus service;
+    /// deliberate-hostile only, no real DOS stack does this.
     fn note_stub_fetch(&mut self, address: u32) {
-        if address == BIOS_LEGACY_IRET_PHYS {
+        if address == BIOS_LEGACY_IRET_LINEAR {
             // The legacy shared nop;iret at FF00:0000: one address for every
             // vector, so attribution comes from the stash the `INT n` opcode
             // arm left behind. Consumed here; a landing with no armed stash
@@ -10591,7 +10601,7 @@ impl MachineBus<'_> {
             }
             return;
         }
-        let offset = address.wrapping_sub(BIOS_INT_STUB_TABLE_PHYS);
+        let offset = address.wrapping_sub(BIOS_INT_STUB_TABLE_LINEAR);
         if offset >= BIOS_INT_STUB_TABLE_LEN || offset & 1 != 0 {
             return; // outside the table, or the IRET byte (mid-stub resume)
         }
@@ -11187,15 +11197,23 @@ const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
 /// it (the shared legacy IRET at 0x0000, the CALL-5 adapter, the timer and
 /// master-IRQ ISR stubs at 0x0060/0x0080).
 const BIOS_INT_STUB_TABLE_ROM_OFFSET: usize = 0xF200;
-const BIOS_INT_STUB_TABLE_PHYS: u32 = 0xFF200;
+const BIOS_INT_STUB_TABLE_LINEAR: u32 = 0xFF200;
 const BIOS_INT_STUB_TABLE_LEN: u32 = 512;
-/// Physical address of the legacy shared chain target FF00:0000. Period
+/// Linear address of the legacy shared chain target FF00:0000. Period
 /// booters hardcode it (IVT[0x13] -> FF00:0000, or a hook chaining there), so
 /// the machine writes the same `nop; iret` shape there that the per-vector
 /// stubs use: the NOP fetch posts the vector stashed by the `INT n` opcode arm
 /// (`last_int_vector`) and the post-instruction break services the HLE before
 /// the IRET pops the frame.
-const BIOS_LEGACY_IRET_PHYS: u32 = 0xFF000;
+///
+/// Stub recognition is keyed on the LINEAR fetch address, never the physical
+/// one: an EMM386-class paging monitor (JemmEx) shadows the BIOS F-page, so
+/// the guest dispatches through linear FF00:02xx while the bytes are fetched
+/// from a copy in extended RAM. The linear address is the architectural
+/// identity of the stub; the physical backing is the guest's business.
+const BIOS_LEGACY_IRET_LINEAR: u32 = 0xFF000;
+/// One compare covers FF000 (legacy) through the stub table's end (FF3FF).
+const BIOS_STUB_WINDOW_LEN: u32 = 0x400;
 const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
 
 const fn bios_int_stub_off(vector: u8) -> u16 {
@@ -11208,7 +11226,7 @@ fn write_bios_int_stub_table(rom: &mut [u8]) {
         rom[BIOS_INT_STUB_TABLE_ROM_OFFSET + vector * 2 + 1] = 0xCF; // iret
     }
     // The legacy shared chain target gets the same nop; iret shape (see
-    // BIOS_LEGACY_IRET_PHYS). Machine-written for every ROM: the Izarra BIOS
+    // BIOS_LEGACY_IRET_LINEAR). Machine-written for every ROM: the Izarra BIOS
     // reserves a bare IRET here followed by zero padding, and the synthetic
     // HLE ROMs relied on the constructors writing the IRET byte.
     rom[BIOS_LEGACY_IRET_ROM_OFFSET] = 0x90; // nop
