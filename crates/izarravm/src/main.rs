@@ -341,7 +341,13 @@ fn run_bench_one(
     source: &BenchSource<'_>,
     budget: u64,
 ) -> Result<BenchRun, Box<dyn Error>> {
-    run_bench_one_profiled(hardware, mode, source, budget, None)
+    // Calibration census tool (mirrors run_boot_hdd_folder):
+    // IZARRAVM_CPU_PROFILE=<stride> samples the per-opcode CPU profile for
+    // every bench run; the caller prints it when the env is set.
+    let stride = std::env::var("IZARRAVM_CPU_PROFILE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    run_bench_one_profiled(hardware, mode, source, budget, stride)
 }
 
 fn run_bench_one_profiled(
@@ -730,6 +736,10 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 continue;
             }
             let run = run_bench_one(hardware, mode, &bench.source, BENCH_BUDGET)?;
+            if std::env::var_os("IZARRAVM_CPU_PROFILE").is_some() {
+                println!("--- census {} {} ---", bench.name, mode.canonical_name());
+                print_cpu_profile(&run.cpu_profile);
+            }
             perf_rows.push((bench.name, mode, run.perf.clone()));
             let baseline_clocks = match bench.source {
                 BenchSource::BootSelector(_) => baseline[mode_rank(mode) as usize],
@@ -1638,8 +1648,21 @@ fn run_boot_hdd_folder(
         izarravm_firmware::izarra_bios(),
     )?;
     machine.mount_hdd_folder(dir)?;
+    // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
+    // sampled per-opcode CPU profile the bench harness uses, dumped after the
+    // run. Reads the guest-clock attribution of e.g. the x87 opcode rows
+    // (D8-DF) for a timedemo without touching guest-visible state.
+    let cpu_profile_stride = std::env::var("IZARRAVM_CPU_PROFILE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(stride) = cpu_profile_stride {
+        machine.enable_host_profiling(stride);
+    }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    if cpu_profile_stride.is_some() {
+        print_cpu_profile(&machine.cpu().profile_snapshot());
+    }
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
     // often exactly the tail we care about -- is silently lost at process exit. This
