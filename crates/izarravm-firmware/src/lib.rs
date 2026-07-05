@@ -49,6 +49,8 @@ pub const IRQ5IP0_COM: &[u8] = include_bytes!("../roms/dos/irq5ip0.com");
 pub const IRQ5IP0_COM_SOURCE: &str = include_str!("../roms/dos/irq5ip0.asm");
 pub const VCPIDET_COM: &[u8] = include_bytes!("../roms/dos/vcpidet.com");
 pub const VCPIDET_COM_SOURCE: &str = include_str!("../roms/dos/vcpidet.asm");
+pub const VCPIMEM_COM: &[u8] = include_bytes!("../roms/dos/vcpimem.com");
+pub const VCPIMEM_COM_SOURCE: &str = include_str!("../roms/dos/vcpimem.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -249,6 +251,15 @@ pub fn emsnone_com() -> &'static [u8] {
 /// 0xA5 / 0xEn.
 pub fn vcpidet_com() -> &'static [u8] {
     VCPIDET_COM
+}
+
+/// The VCPI M1 query/page-pool fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS):
+/// exercises DE02-DE0B — pool count/alloc/free round-trip with 12-LSB
+/// masking, bad-free and double-free rejection, the V86 page-table query,
+/// CR0, the debug-register array, and the 8259 report/record round-trip.
+/// Signals 0xA5 / 0xEn.
+pub fn vcpimem_com() -> &'static [u8] {
+    VCPIMEM_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at
