@@ -1,9 +1,56 @@
 ; izbios-lfb.inc - STREAM F: linear-framebuffer draw primitives for the
 ; proprietary Margo mode 0x150 (320x240x8). All routines preserve caller
-; registers. Pixels go to LFB_BASE + y*LFB_PITCH + x via the unreal-mode flat FS
-; that unreal_init established (32-bit [fs:ebx], same pattern as ramtest_poke32).
-; The 8x8 CP437 font (bios_font) and the red wordmark (bios_logo_bitmap) are
-; shared with izbios-gfx.inc.
+; registers. Fills, clears, and text go through the Margo blit engine (the
+; MMIO register block at MARGO_MMIO, reached via the same unreal-mode flat FS
+; that unreal_init established) so the CPU never touches those pixels; the
+; two bitmap blitters still poke LFB_BASE + y*LFB_PITCH + x directly (32-bit
+; [fs:ebx], same pattern as ramtest_poke32). The 8x8 CP437 font (bios_font)
+; and the red wordmark (bios_logo_bitmap) are shared with izbios-gfx.inc.
+
+; Margo blit-engine MMIO registers (docs/vega/vega-programmers-guide.md).
+%define MARGO_MMIO     0xe0400000
+%define MG_STATUS      0x0008     ; bit 0 = BUSY
+%define MG_DST_BASE    0x0100     ; VRAM byte offset (0 = the visible screen)
+%define MG_DST_PITCH   0x0104
+%define MG_DEPTH       0x0110     ; bytes per pixel
+%define MG_DST_XY      0x0114     ; (y << 16) | x
+%define MG_DIM         0x011c     ; (h << 16) | w
+%define MG_FG_COLOR    0x0120
+%define MG_BG_COLOR    0x0124
+%define MG_ROP         0x0128     ; 0xF0 PATCOPY, 0xCC SRCCOPY
+%define MG_FLAGS       0x0130
+%define MG_COMMAND     0x0150     ; 0x01 FILL, 0x03 COLOR_EXPAND_DATA
+%define MG_MONO_DATA   0x0160     ; glyph bit stream, one dword per row
+
+; margo_wait: spin until the blit engine goes idle (STATUS.BUSY clear).
+margo_wait:
+    push eax
+    push ebx
+    mov ebx, MARGO_MMIO + MG_STATUS
+.spin:
+    mov eax, [fs:ebx]
+    test al, 1
+    jnz .spin
+    pop ebx
+    pop eax
+    ret
+
+; margo_dst_setup: latch the common destination registers for a mode-0x150
+; engine operation: the visible screen at VRAM offset 0, 320-byte pitch, 8bpp,
+; DST_XY from DI(x)/SI(y). Internal helper; enter with EBX = MARGO_MMIO after
+; a margo_wait. Clobbers EAX.
+margo_dst_setup:
+    xor eax, eax
+    mov [fs:ebx + MG_DST_BASE], eax
+    mov eax, LFB_PITCH
+    mov [fs:ebx + MG_DST_PITCH], eax
+    mov eax, 1
+    mov [fs:ebx + MG_DEPTH], eax
+    movzx eax, si
+    shl eax, 16
+    mov ax, di
+    mov [fs:ebx + MG_DST_XY], eax
+    ret
 
 ; lfb_set_mode: install the proprietary 320x240x8 mode via VBE 4F02h.
 lfb_set_mode:
@@ -18,24 +65,14 @@ lfb_set_mode:
 
 ; lfb_clear: fill the whole framebuffer with color index AL.
 lfb_clear:
-    push eax
-    push ebx
-    push ecx
-    movzx eax, al
-    mov ah, al                  ; replicate to all 4 bytes of EAX
-    mov ecx, eax
-    shl ecx, 16
-    or eax, ecx
-    mov ebx, LFB_BASE
-    mov ecx, LFB_PIXELS / 4
-.fill:
-    mov [fs:ebx], eax
-    add ebx, 4
-    dec ecx
-    jnz .fill
-    pop ecx
-    pop ebx
-    pop eax
+    pushad
+    mov bl, al                  ; whole-screen engine FILL
+    xor di, di
+    xor si, si
+    mov cx, LFB_W
+    mov dx, LFB_H
+    call lfb_fill_rect
+    popad
     ret
 
 ; lfb_pixel_addr: DI=x, AX=y -> EBX = LFB linear address of (x,y).
@@ -56,55 +93,40 @@ lfb_pixel_addr:
 ; lfb_glyph: draw one 8x8 glyph. AL=char, DI=x, SI(word)=y, BL=fg, BH=bg.
 ; Internal helper used by lfb_text. Preserves caller registers.
 ;
-; The top-left LFB address is computed ONCE into ESI (lfb_pixel_addr returns it in
-; EBX, which we move out so BX can keep fg/bg -- BL/BH are the low word of EBX and
-; would otherwise be destroyed). Each row advances ESI by the pitch and walks a
-; working copy in EDI. The pixel's fg/bg byte goes through DH, so DL stays free as
-; the row counter; CL is the column counter.
+; An opaque engine color expand: FG/BG latched, COLOR_EXPAND_DATA issued, then
+; the eight font rows streamed through MONO_DATA (one dword per row, bits in
+; the high byte, MSB first -- each row starts on a word boundary).
 lfb_glyph:
-    pusha
-    push eax
-    push ebx
-    push ecx
-    push edx
-    push esi
-    push edi
+    pushad
+    call margo_wait
     movzx bp, al
     shl bp, 3
     add bp, bios_font           ; CS:BP -> 8 glyph rows
-    push bx                     ; save BL=fg / BH=bg across the address calc
-    mov ax, si                  ; AX = y (lfb_pixel_addr reads DI=x, AX=y)
-    call lfb_pixel_addr         ; EBX = LFB addr of (x, y)
-    mov esi, ebx                ; ESI = running row address
-    pop bx                      ; BL=fg, BH=bg restored; EBX now free
-    mov dl, 8                   ; DL = rows remaining
+    push bx                     ; BL=fg / BH=bg, wanted after EBX is repointed
+    mov ebx, MARGO_MMIO
+    call margo_dst_setup        ; screen dst, DST_XY from DI/SI
+    mov eax, 0x00080008
+    mov [fs:ebx + MG_DIM], eax  ; 8x8
+    pop dx                      ; DL=fg, DH=bg
+    movzx eax, dl
+    mov [fs:ebx + MG_FG_COLOR], eax
+    movzx eax, dh
+    mov [fs:ebx + MG_BG_COLOR], eax
+    mov eax, 0xcc
+    mov [fs:ebx + MG_ROP], eax  ; SRCCOPY of the expanded source
+    xor eax, eax
+    mov [fs:ebx + MG_FLAGS], eax ; opaque: clear bits paint BG_COLOR
+    mov eax, 0x03
+    mov [fs:ebx + MG_COMMAND], eax ; COLOR_EXPAND_DATA
+    mov cx, 8                   ; stream the 8 rows
 .row:
-    mov al, [cs:bp]             ; this row's 8 bits
+    movzx eax, byte [cs:bp]
     inc bp
-    mov edi, esi                ; EDI = pixel address for this row
-    mov cl, 8                   ; CL = columns remaining
-.col:
-    shl al, 1                   ; MSB -> CF
-    jc .fg
-    mov dh, bh                  ; background index
-    jmp .put
-.fg:
-    mov dh, bl                  ; foreground index
-.put:
-    mov [fs:edi], dh
-    inc edi
-    dec cl
-    jnz .col
-    add esi, LFB_PITCH          ; next scanline
-    dec dl
-    jnz .row
-    pop edi
-    pop esi
-    pop edx
-    pop ecx
-    pop ebx
-    pop eax
-    popa
+    shl eax, 24                 ; row bits in the high byte
+    mov [fs:ebx + MG_MONO_DATA], eax
+    loop .row
+    call margo_wait
+    popad
     ret
 
 ; lfb_text: DS:SI=ASCIIZ, DI=x, AX=y, BL=fg, BH=bg. 8px advance per glyph.
@@ -157,38 +179,30 @@ lfb_putdec:
     popa
     ret
 
-; lfb_fill_rect: DI=x, SI(word)=y, CX=w, DX=h, BL=color. Solid rectangle.
-; The color is stashed in BP (which survives lfb_pixel_addr; BL is the low byte of
-; the EBX address it returns and would be destroyed). The per-pixel write goes
-; through DL while DX's real value (rows remaining) is parked on the stack.
+; lfb_fill_rect: DI=x, SI(word)=y, CX=w, DX=h, BL=color. Solid rectangle,
+; an engine FILL (PATCOPY of FG_COLOR). A zero width or height latches a
+; degenerate DIM and the engine paints nothing, matching the old loop.
 lfb_fill_rect:
-    pusha
-    movzx bp, bl                ; BP = fill color (survives lfb_pixel_addr)
-.row:
-    test dx, dx
-    jz .done
-    push cx
-    push di
-    push si
-    mov ax, si
-    call lfb_pixel_addr         ; EBX = addr of (di, si)
-    pop si
-    pop di
-    pop cx
-    push cx
-    push dx
-    mov dx, bp                  ; DL = color (DX restored from the stack below)
-.col:
-    mov [fs:ebx], dl
-    inc ebx
-    loop .col
-    pop dx
-    pop cx
-    inc si
-    dec dx
-    jmp .row
-.done:
-    popa
+    pushad
+    call margo_wait
+    push bx                     ; BL = color, wanted after EBX is repointed
+    mov ebx, MARGO_MMIO
+    call margo_dst_setup        ; screen dst, DST_XY from DI/SI
+    movzx eax, dx
+    shl eax, 16
+    mov ax, cx
+    mov [fs:ebx + MG_DIM], eax  ; (h << 16) | w
+    pop ax                      ; AL = color
+    movzx eax, al
+    mov [fs:ebx + MG_FG_COLOR], eax
+    mov eax, 0xf0
+    mov [fs:ebx + MG_ROP], eax  ; PATCOPY
+    xor eax, eax
+    mov [fs:ebx + MG_FLAGS], eax
+    mov eax, 0x01
+    mov [fs:ebx + MG_COMMAND], eax ; FILL
+    call margo_wait
+    popad
     ret
 
 ; lfb_box: DI=x, SI(word)=y, CX=w, DX=h, BL=interior color, BH=border color.

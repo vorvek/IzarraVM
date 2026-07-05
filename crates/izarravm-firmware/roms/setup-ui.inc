@@ -317,20 +317,33 @@ su_run_menu:
     je .enter
     jmp .loop
 .up:
-    call su_cursor_dec
-    call su_draw
-    jmp .loop
+    xor ax, ax
+    mov ds, ax
+    mov cl, [SU_CURSOR]             ; CL = the row losing the highlight
+    call su_cursor_dec              ; clobbers AX/BX only, CL survives
+    jmp .cursor_moved
 .down:
+    xor ax, ax
+    mov ds, ax
+    mov cl, [SU_CURSOR]
     call su_cursor_inc
-    call su_draw
+.cursor_moved:
+    ; Repaint only the two affected rows and the help footer.
+    mov bl, cl
+    call su_draw_row                ; old row, back to plain
+    xor ax, ax
+    mov ds, ax
+    mov bl, [SU_CURSOR]
+    call su_draw_row                ; new row, highlighted
+    call su_draw_help
     jmp .loop
 .left:
     call su_edit_left
-    call su_draw
+    call su_redraw_cursor_row
     jmp .loop
 .right:
     call su_edit_right
-    call su_draw
+    call su_redraw_cursor_row
     jmp .loop
 .enter:
     xor cx, cx
@@ -349,7 +362,7 @@ su_run_menu:
     je .discard
     ; LAYOUT and GSW are inline: Enter cycles them forward, like Right.
     call su_edit_right
-    call su_draw
+    call su_redraw_cursor_row
     jmp .loop
 .repair:
     mov al, 1                       ; Lotura service: Repair Toka-DOS
@@ -662,10 +675,10 @@ su_commit:
 ; su_draw_fresh clears the whole framebuffer (and re-asserts the LFB mode +
 ; palette) before painting. That reset is only needed when arriving from POST or a
 ; sub-page, where pixels sit outside the regions the in-place repaint covers.
-; Cursor moves and inline value edits stay on this page, so their hot path calls
-; su_draw directly: the box interior fill, per-row repaint, and help-line wipe
-; already overwrite everything an edit changes. Re-clearing 76,800 px plus a mode
-; reset on every keystroke was the slow-redraw cause.
+; Cursor moves and inline value edits stay on this page, so their hot paths skip
+; su_draw entirely and repaint only the affected rows via su_draw_row (plus the
+; help footer on cursor moves). Repainting the whole box (57K px of interior
+; fill plus every label) on every keystroke was the slow-redraw cause.
 su_draw_fresh:
     call su_enter_setup_lfb
     mov al, COLOR_BG                ; clear the whole screen so no stale POST
@@ -690,73 +703,77 @@ su_draw:
     mov bh, SU_C_INK
     call lfb_box
 
-    ; Time row (label + HH:MM:SS).
-    mov bl, SU_ROW_TIME
-    call su_row_colors
-    mov si, su_str_time
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y
-    call lfb_text
-    call su_draw_time_value          ; small HH:MM:SS next to the label
+    ; All seven rows.
+    xor bl, bl
+.rows:
+    push bx
+    call su_draw_row
+    pop bx
+    inc bl
+    cmp bl, SU_SEL_COUNT
+    jb .rows
 
-    ; Keyboard layout row (label + name).
-    mov bl, SU_ROW_LAYOUT
-    call su_row_colors
-    mov si, su_str_layout
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY
-    call lfb_text
-    call su_draw_layout_value
-
-    ; GSW mode row (label + name).
-    mov bl, SU_ROW_GSW
-    call su_row_colors
-    mov si, su_str_gsw
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 2
-    call lfb_text
-    call su_draw_mode_value
-
-    ; Peripherals row.
-    mov bl, SU_ROW_PERIPH
-    call su_row_colors
-    mov si, su_str_periph
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 3
-    call lfb_text
-
-    ; Repair Toka-DOS row.
-    mov bl, SU_ROW_REPAIR
-    call su_row_colors
-    mov si, su_str_repair
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 4
-    call lfb_text
-
-    ; Save row.
-    mov bl, SU_ROW_SAVE
-    call su_row_colors
-    mov si, su_str_save
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 5
-    call lfb_text
-
-    ; Discard row.
-    mov bl, SU_ROW_DISCARD
-    call su_row_colors
-    mov si, su_str_discard
-    mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 6
-    call lfb_text
-
-    ; Context-sensitive help line 1, and the static dead-key note on line 2,
-    ; both below the box.
+    ; Two-line context-sensitive help below the box.
     call su_draw_help
     ret
 
-; su_draw_help: wipe and redraw the two-line help footer below the box. Line 1
-; changes with the highlighted row (su_help_str_for_row); line 2 is the static
-; dead-key note. DS bounces; leaves DS = CS.
+; ROM table: main-menu row label strings, indexed by row.
+su_row_labels:  dw su_str_time, su_str_layout, su_str_gsw, su_str_periph
+                dw su_str_repair, su_str_save, su_str_discard
+
+; su_draw_row: repaint one main-menu row in place: wipe its band back to the
+; field colour (erasing a stale highlight), then the label (su_row_colors
+; re-paints the ink band when this is the focused row) and, for the Time/
+; Keyboard/CPU rows, the value column. BL = row index. This is the keystroke
+; hot path: a cursor move repaints two of these instead of the whole box.
+; Clobbers AX, BX, CX, DX, SI, DI and DS.
+su_draw_row:
+    push bx
+    ; Band wipe (same geometry as su_row_colors' highlight band).
+    movzx ax, bl
+    mov si, SU_ROW_DY
+    mul si                          ; ax = row * SU_ROW_DY
+    add ax, SU_MENU_Y - 2
+    mov si, ax                      ; si = band y
+    mov di, SU_MENU_X - 6
+    mov cx, SU_BOX_W - (SU_MENU_X - 6 - SU_BOX_X) * 2
+    mov dx, SU_ROW_DY
+    mov bl, SU_C_FIELD
+    call lfb_fill_rect
+    pop bx
+    ; Label: string from the ROM table, y from the row index.
+    push bx
+    movzx ax, bl
+    mov si, SU_ROW_DY
+    mul si
+    add ax, SU_MENU_Y               ; ax = label y
+    movzx si, bl
+    shl si, 1
+    mov si, [cs:su_row_labels + si]
+    mov di, SU_MENU_X
+    call su_row_colors              ; BL = row in -> BL/BH colours, DS = CS
+    call lfb_text
+    pop bx
+    ; Value column for the three inline rows (tail calls; each self-contained).
+    cmp bl, SU_ROW_TIME
+    je su_draw_time_value
+    cmp bl, SU_ROW_LAYOUT
+    je su_draw_layout_value
+    cmp bl, SU_ROW_GSW
+    je su_draw_mode_value
+    ret
+
+; su_redraw_cursor_row: repaint just the highlighted row (an inline value edit
+; changes nothing else on screen).
+su_redraw_cursor_row:
+    xor ax, ax
+    mov ds, ax
+    mov bl, [SU_CURSOR]
+    jmp su_draw_row
+
+; su_draw_help: wipe and redraw the two-line help footer below the box. Both
+; lines change with the highlighted row: su_help_str_for_row returns line 1,
+; and line 2 sits right after its NUL. DS bounces; leaves DS = CS.
 su_draw_help:
     push cs
     pop ds
@@ -774,14 +791,13 @@ su_draw_help:
     mov ax, SU_HELP1_Y
     mov bl, SU_C_DISABLED
     mov bh, COLOR_BG
-    call lfb_text
-    push cs
-    pop ds
-    mov si, su_str_deadnote
+    call lfb_text                   ; preserves SI (pusha/popa)
+.find_line2:
+    inc si
+    cmp byte [si - 1], 0
+    jne .find_line2                 ; SI -> line 2, past line 1's NUL
     mov di, SU_HELP_X
     mov ax, SU_HELP2_Y
-    mov bl, SU_C_DISABLED
-    mov bh, COLOR_BG
     call lfb_text
     ret
 
@@ -1211,17 +1227,14 @@ su_time_adjust:
     mov [bx], al
     ret
 
-; su_time_draw: paint the time sub-page. Title, a box holding the editable
-; HH:MM:SS line and the DD/MM/YY date line with the highlighted field in the
-; inverse band, and a hint footer below the box.
-; su_time_draw_fresh clears first (used on entry from the main menu, whose larger
-; box must be wiped). The field-edit hot path calls su_time_draw for an in-place
-; repaint, skipping the redundant full clear + mode reset.
+; su_time_draw: paint the time sub-page's editable fields. su_time_draw_fresh
+; clears first and draws the static chrome (title, box, hint footer), used on
+; entry from the main menu. The field-edit hot path calls su_time_draw, which
+; only wipes and repaints the two 64px field lines inside the box.
 su_time_draw_fresh:
     call su_enter_setup_lfb
     mov al, COLOR_BG
     call lfb_clear
-su_time_draw:
     push cs
     pop ds
     mov si, su_str_time_title
@@ -1238,6 +1251,35 @@ su_time_draw:
     mov bl, SU_C_FIELD
     mov bh, SU_C_INK
     call lfb_box
+    ; Hint footer, below the box.
+    mov di, SU_HELP_X
+    mov si, SU_HELP1_Y
+    mov cx, SU_BOX_W
+    mov dx, 11
+    mov bl, COLOR_BG
+    call lfb_fill_rect
+    mov si, su_str_time_hint
+    mov di, SU_HELP_X
+    mov ax, SU_HELP1_Y
+    mov bl, SU_C_DISABLED
+    mov bh, COLOR_BG
+    call lfb_text
+su_time_draw:
+    ; Wipe both field lines back to the box field colour (erases the previous
+    ; highlight band; each line is 3 fields * 16px + 2 separators * 8px = 64px,
+    ; bands run from y-1, 10 high).
+    mov di, SU_MENU_X
+    mov si, SU_BOX_Y + 11
+    mov cx, 64
+    mov dx, 10
+    mov bl, SU_C_FIELD
+    call lfb_fill_rect
+    mov di, SU_MENU_X
+    mov si, SU_BOX_Y + 31
+    mov cx, 64
+    mov dx, 10
+    mov bl, SU_C_FIELD
+    call lfb_fill_rect
     ; Time line: HH:MM:SS, each field colored by whether it is highlighted.
     mov di, SU_MENU_X
     mov bp, SU_BOX_Y + 12
@@ -1266,21 +1308,6 @@ su_time_draw:
     mov bl, SU_TF_YEAR
     mov si, SU_TIME_YEAR
     call su_time_field
-    ; Hint footer, below the box.
-    push cs
-    pop ds
-    mov di, SU_HELP_X
-    mov si, SU_HELP1_Y
-    mov cx, SU_BOX_W
-    mov dx, 11
-    mov bl, COLOR_BG
-    call lfb_fill_rect
-    mov si, su_str_time_hint
-    mov di, SU_HELP_X
-    mov ax, SU_HELP1_Y
-    mov bl, SU_C_DISABLED
-    mov bh, COLOR_BG
-    call lfb_text
     ret
 
 ; su_time_field: draw the two-digit value at segment-0 offset SI at pixel DI/BP,
@@ -1473,15 +1500,23 @@ su_str_repaired:     db 'Toka-DOS repaired', 0
 su_str_svc_fail:     db 'No Toka-DOS image', 0
 su_str_save:         db 'SAVE AND EXIT', 0
 su_str_discard:      db 'DISCARD AND EXIT', 0
-su_str_deadnote:     db 'Note: dead keys emit base character', 0
-; Context-sensitive help line 1, one per main-menu row.
-su_str_help_time:    db 'Enter: set clock  Up/Dn move  Esc back', 0
-su_str_help_layout:  db 'Left/Right: change keyboard  Enter: open', 0
-su_str_help_gsw:     db 'Left/Right: change CPU speed  Enter: open', 0
-su_str_help_periph:  db 'Enter: check devices  Up/Dn move  Esc back', 0
-su_str_help_repair:  db 'Enter: reinstall Toka-DOS  Up/Dn move', 0
-su_str_help_save:    db 'Enter/F10: save and reboot  Up/Dn move', 0
-su_str_help_discard: db 'Enter/Esc: discard and reboot  Up/Dn move', 0
+; Context-sensitive help, one dual-NUL pair per main-menu row: line 1, then
+; line 2 right after its terminator (su_draw_help draws both). Two short lines
+; because one long line overflows the 320px scanline and wraps.
+su_str_help_time:    db 'Enter: set clock', 0
+                     db 'Up/Dn move  Esc back', 0
+su_str_help_layout:  db 'Left/Right: change keyboard', 0
+                     db 'Enter: open', 0
+su_str_help_gsw:     db 'Left/Right: change CPU speed', 0
+                     db 'Enter: open', 0
+su_str_help_periph:  db 'Enter: check devices', 0
+                     db 'Up/Dn move  Esc back', 0
+su_str_help_repair:  db 'Enter: reinstall Toka-DOS', 0
+                     db 'Up/Dn move', 0
+su_str_help_save:    db 'Enter/F10: save and reboot', 0
+                     db 'Up/Dn move', 0
+su_str_help_discard: db 'Enter/Esc: discard and reboot', 0
+                     db 'Up/Dn move', 0
 ; POST hotkey feedback (Bug 4). Drawn on the white POST field, so kept short.
 su_str_enter_setup:  db 'Entering configuration...', 0
 su_str_enter_boot:   db 'Entering boot menu...', 0

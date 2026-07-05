@@ -12,20 +12,18 @@ working copy: nothing reaches CMOS until you choose **Save and Exit**.
 
 ## Main menu
 
-Seven rows, moved between with Up/Down. A one-line help string under the box
-updates to describe whichever row is highlighted; a second, static line
-below it reminds you that dead keys emit their base character on this
-screen (useful context if your keyboard layout uses them).
+Seven rows, moved between with Up/Down. A two-line help string under the box
+updates to describe whichever row is highlighted.
 
 | Row | Key(s) | Help text shown |
 | --- | --- | --- |
-| TIME | Enter | `Enter: set clock  Up/Dn move  Esc back` |
-| KEYBOARD | Left/Right/Enter | `Left/Right: change keyboard  Enter: open` |
-| CPU MODE | Left/Right/Enter | `Left/Right: change CPU speed  Enter: open` |
-| PERIPHERALS | Enter | `Enter: check devices  Up/Dn move  Esc back` |
-| REPAIR TOKA-DOS | Enter | `Enter: reinstall Toka-DOS  Up/Dn move` |
-| SAVE AND EXIT | Enter or F10 | `Enter/F10: save and reboot  Up/Dn move` |
-| DISCARD AND EXIT | Enter or Esc | `Enter/Esc: discard and reboot  Up/Dn move` |
+| TIME | Enter | `Enter: set clock` / `Up/Dn move  Esc back` |
+| KEYBOARD | Left/Right/Enter | `Left/Right: change keyboard` / `Enter: open` |
+| CPU MODE | Left/Right/Enter | `Left/Right: change CPU speed` / `Enter: open` |
+| PERIPHERALS | Enter | `Enter: check devices` / `Up/Dn move  Esc back` |
+| REPAIR TOKA-DOS | Enter | `Enter: reinstall Toka-DOS` / `Up/Dn move` |
+| SAVE AND EXIT | Enter or F10 | `Enter/F10: save and reboot` / `Up/Dn move` |
+| DISCARD AND EXIT | Enter or Esc | `Enter/Esc: discard and reboot` / `Up/Dn move` |
 
 KEYBOARD and CPU MODE are inline rows: their current value is drawn to the
 right of the label, and Left/Right (or Enter, which behaves like Right)
