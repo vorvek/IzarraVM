@@ -136,6 +136,25 @@ ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ems_rm_lin:  dd 0
 ems_rm_phys: dd 0
 
+; ---- VCPI server state (M1; monitor-side only, reached via FS). The page
+; pool is a STATIC carve of the XMS arena made at INIT: XMS keeps a fixed low
+; reserve for EMBs (stock DOS barely allocates any -- DOS=HIGH uses the HMA,
+; not EMBs), the VCPI bitmap owns everything above it. Disjoint from the EMS
+; pool and the XMS arena by construction: no double allocation is possible.
+; The bitmap indexes ABSOLUTE 4K page numbers over the full 16 MB map (4096
+; bits); only pages inside [vcpi_pool_base, vcpi_pool_end) can ever be set,
+; enforced by the range checks in vcpi_page_alloc/vcpi_page_free.
+VCPI_XMS_KEEP equ 0x200000        ; 2 MB stays XMS EMB arena
+align 4
+vcpi_pool_base: dd 0              ; first pool byte (4K-aligned)
+vcpi_pool_end:  dd 0              ; one past the last pool byte (4K-aligned)
+vcpi_free:      dw 0              ; free 4K pages
+vcpi_cursor:    dw 0              ; next-fit absolute-page scan cursor
+vcpi_pic_master: dw 8             ; DE0Ah/DE0Bh: current 8259 vector bases
+vcpi_pic_slave:  dw 0x70          ; (the DOS-default mapping until a client
+                                  ;  reports a remap; store-and-report only)
+vcpi_bmp: times 512 db 0          ; the absolute-page allocation bitmap
+
 strategy:
     mov [cs:rh_ptr], bx
     mov [cs:rh_ptr+2], es
@@ -309,6 +328,30 @@ init:
 .ems_off:
     mov byte [cs:ems_on], 0
 .ems_done:
+
+    ; --- VCPI M1: carve the page pool from the top of the (post-EMS) XMS
+    ; arena. XMS keeps VCPI_XMS_KEEP; the bitmap owns the rest. Shrinking
+    ; xms_pool_end here is what makes the two allocators disjoint. On a
+    ; degenerate small-RAM box the pool is simply empty (DE04 answers 88h).
+    mov eax, [cs:xms_pool_base]
+    add eax, VCPI_XMS_KEEP
+    add eax, 0xFFF
+    and eax, 0xFFFFF000           ; pool base: 4K-aligned above the reserve
+    mov ebx, [cs:xms_pool_end]
+    and ebx, 0xFFFFF000           ; pool end: 4K-aligned down
+    cmp eax, ebx
+    jbe .vcpi_carve
+    mov eax, ebx                  ; reserve doesn't fit: empty pool
+.vcpi_carve:
+    mov [cs:vcpi_pool_base], eax
+    mov [cs:vcpi_pool_end], ebx
+    mov [cs:xms_pool_end], eax    ; the XMS arena now ends at the pool base
+    mov ecx, ebx
+    sub ecx, eax
+    shr ecx, 12
+    mov [cs:vcpi_free], cx
+    shr eax, 12
+    mov [cs:vcpi_cursor], ax      ; next-fit cursor starts at the pool base
 
     ; Hook INT 2Fh (chain) + own INT 67h outright (IVT at linear 0). The EMS
     ; manager answers in BOTH modes: frameless is EMM386-NOEMS's contract.
@@ -2376,26 +2419,208 @@ int67_entry:
     mov ebx, 0x67
     jmp deflt_common              ; re-loads DS/FS: harmless
 
-; ---- VCPI 1.0 server dispatch (INT 67h AH=DEh, AL = subfunction). M0:
-; presence only; every not-yet-implemented subfunction answers 8Fh, the
-; spec's recommended "undefined subfunction code" (VCPI 1.0 spec p.5).
-; Presence is answered regardless of ems_on: a frameless manager still
-; provides VCPI (the EMM386 NOEMS / JEMM NOEMS precedent).
-;   in: ESI = pushad base (guest regs: EAX at +28, EBX at +16),
-;       EBP = &frame.eip (unused in M0), DS = flat, FS = driver data.
+; ---- VCPI 1.0 server dispatch (INT 67h AH=DEh, AL = subfunction). M1:
+; presence + the query/page-pool/system-register/PIC set (DE00, DE02-DE0B).
+; DE01/DE0C (the PM interface + mode switch) are later rungs; they and every
+; undefined subfunction answer 8Fh, the spec's recommended "undefined
+; subfunction code" (VCPI 1.0 spec p.5). Presence is answered regardless of
+; ems_on: a frameless manager still provides VCPI (the EMM386 NOEMS / JEMM
+; NOEMS precedent).
+;   in: ESI = pushad base (guest regs: EDI+0, EBX+16, EDX+20, ECX+24,
+;       EAX+28), EBP = &frame.eip (V86 frame: ES at +20, past EIP/CS/EFLAGS/
+;       ESP/SS), DS = flat, FS = driver data.
 ;   The CALLER advances the frame IP (the two entry paths differ: vec13's
 ;   fault frame points at the INT, the int67_entry gate frame is already
 ;   past it). Guest register writes go through the pushad block; live
 ;   eax/ecx/edx are popad-restored, so only [esi+..] writes are outputs. ----
 vcpi_dispatch:
-    mov al, [esi+28]              ; guest AL = VCPI subfunction
-    test al, al
-    jnz .undef
-    mov byte [esi+29], 0          ; DE00: AH = 0, VCPI present
-    mov word [esi+16], 0x0100     ; BX = version: BH=1 major, BL=0 minor
+    movzx eax, byte [esi+28]      ; guest AL = VCPI subfunction
+    cmp al, 0x0C
+    ja .undef
+    jmp dword [fs:.jt + eax*4]    ; offsets are driver-relative == CS-relative
+.jt:
+    dd .de00, .undef, .de02, .de03  ; DE01 (PM interface) is the M2 rung
+    dd .de04, .de05, .de06, .de07
+    dd .de08, .de09, .de0a, .de0b
+    dd .undef                       ; DE0C (mode switch) is the M3 rung
+
+.de00:                            ; presence: AH=0, BX = version 1.0
+    mov byte [esi+29], 0
+    mov word [esi+16], 0x0100
     ret
+
+.de02:                            ; max physical memory address: EDX = the
+    mov eax, [fs:vcpi_pool_end]   ; highest 4K page DE04 could ever return,
+    sub eax, 0x1000               ; 12 LSBs zero (spec: both sides mask)
+    mov [esi+20], eax
+    mov byte [esi+29], 0
+    ret
+
+.de03:                            ; free 4K page count -> EDX
+    movzx eax, word [fs:vcpi_free]
+    mov [esi+20], eax
+    mov byte [esi+29], 0
+    ret
+
+.de04:                            ; allocate a 4K page -> EDX = physical
+    call vcpi_page_alloc
+    jc .de04_oom
+    mov [esi+20], eax
+    mov byte [esi+29], 0
+    ret
+.de04_oom:
+    mov byte [esi+29], 0x88       ; pool exhausted
+    ret
+
+.de05:                            ; free the 4K page at physical EDX
+    mov eax, [esi+20]
+    and eax, 0xFFFFF000           ; spec: mask the 12 LSBs
+    call vcpi_page_free
+    jc .de05_bad
+    mov byte [esi+29], 0
+    ret
+.de05_bad:
+    mov byte [esi+29], 0x8A       ; outside the pool / not allocated
+    ret
+
+.de06:                            ; phys addr of V86 page CX -> EDX. The
+    movzx eax, word [esi+24]      ; window is what this server furnishes to
+    cmp eax, 0x110                ; clients: first MB + the 64K A20/HMA
+    jae .de06_bad                 ; window (PT0 entries 0..0x10F)
+    mov ecx, [fs:pd_lin]
+    mov eax, [ecx + 0x1000 + eax*4] ; PT0[page] via flat DS
+    and eax, 0xFFFFF000
+    mov [esi+20], eax
+    mov byte [esi+29], 0
+    ret
+.de06_bad:
+    mov byte [esi+29], 0x8B       ; invalid page number
+    ret
+
+.de07:                            ; read CR0 -> EBX
+    mov eax, cr0
+    mov [esi+16], eax
+    mov byte [esi+29], 0
+    ret
+
+; DE08/DE09: read/load the debug registers through an 8-dword array at guest
+; ES:DI (DR0 first, DR4/DR5 unused -- read back as zero, ignored on load).
+; The guest buffer is reached via flat DS at ES*16+DI: monitor paging applies,
+; so an HMA-resident buffer honors the va20 illusion like any guest access.
+.de08:
+    call vcpi_dr_buf              ; -> EAX = buffer linear
+    mov edx, dr0
+    mov [eax], edx
+    mov edx, dr1
+    mov [eax+4], edx
+    mov edx, dr2
+    mov [eax+8], edx
+    mov edx, dr3
+    mov [eax+12], edx
+    xor edx, edx
+    mov [eax+16], edx             ; DR4/DR5: unused per the interface
+    mov [eax+20], edx
+    mov edx, dr6
+    mov [eax+24], edx
+    mov edx, dr7
+    mov [eax+28], edx
+    mov byte [esi+29], 0
+    ret
+.de09:
+    call vcpi_dr_buf
+    mov edx, [eax]
+    mov dr0, edx
+    mov edx, [eax+4]
+    mov dr1, edx
+    mov edx, [eax+8]
+    mov dr2, edx
+    mov edx, [eax+12]
+    mov dr3, edx
+    mov edx, [eax+24]
+    mov dr6, edx
+    mov edx, [eax+28]
+    mov dr7, edx
+    mov byte [esi+29], 0
+    ret
+
+.de0a:                            ; get 8259 vector bases -> BX (master),
+    mov ax, [fs:vcpi_pic_master]  ; CX (slave)
+    mov [esi+16], ax
+    mov ax, [fs:vcpi_pic_slave]
+    mov [esi+24], ax
+    mov byte [esi+29], 0
+    ret
+
+.de0b:                            ; set (record) 8259 vector bases from
+    mov ax, [esi+16]              ; BX/CX. Store-and-report: the client did
+    mov [fs:vcpi_pic_master], ax  ; the actual PIC reprogramming itself, and
+    mov ax, [esi+24]              ; a remapped IRQ already reaches the guest
+    mov [fs:vcpi_pic_slave], ax   ; IVT through the null-IDT catch-all gates.
+    mov byte [esi+29], 0          ; Interrupts are off for the whole trap
+    ret                           ; (interrupt gate), satisfying the spec's
+                                  ; log-before-reflecting requirement.
+
 .undef:
-    mov byte [esi+29], 0x8F       ; undefined (not-yet-implemented) subfunction
+    mov byte [esi+29], 0x8F       ; undefined / not-yet-implemented subfunction
+    ret
+
+; Guest ES:DI (V86) -> EAX = buffer linear address for DE08/DE09.
+; ES from the V86 trap frame at [ebp+20], DI from the pushad block.
+vcpi_dr_buf:
+    movzx eax, word [ebp+20]
+    shl eax, 4
+    movzx edx, word [esi+0]
+    add eax, edx
+    ret
+
+; Allocate the lowest free pool page from the next-fit cursor. -> EAX = the
+; page's physical address, CF clear; or CF set (pool exhausted). The scan
+; terminates because vcpi_free > 0 guarantees a clear bit inside the pool
+; range. BT/BTS take the full bit index (bit-string form). Clobbers ecx, edx.
+vcpi_page_alloc:
+    cmp word [fs:vcpi_free], 0
+    je .none
+    movzx eax, word [fs:vcpi_cursor]
+    mov ecx, [fs:vcpi_pool_end]
+    shr ecx, 12                   ; end page number (exclusive)
+.scan:
+    cmp eax, ecx
+    jb .test
+    mov eax, [fs:vcpi_pool_base]  ; wrap to the pool base
+    shr eax, 12
+.test:
+    bt [fs:vcpi_bmp], eax
+    jnc .take
+    inc eax
+    jmp .scan
+.take:
+    bts [fs:vcpi_bmp], eax
+    dec word [fs:vcpi_free]
+    lea edx, [eax+1]
+    mov [fs:vcpi_cursor], dx
+    shl eax, 12
+    clc
+    ret
+.none:
+    stc
+    ret
+
+; Free the pool page at physical EAX (4K-aligned by the caller). CF set if
+; the address is outside the pool or the page is not allocated (double-free).
+vcpi_page_free:
+    cmp eax, [fs:vcpi_pool_base]
+    jb .bad
+    cmp eax, [fs:vcpi_pool_end]
+    jae .bad
+    shr eax, 12
+    bt [fs:vcpi_bmp], eax
+    jnc .bad
+    btr [fs:vcpi_bmp], eax
+    inc word [fs:vcpi_free]
+    clc
+    ret
+.bad:
+    stc
     ret
 
 ; EOI the chip(s) for line EBX. The just-delivered line is the highest in
