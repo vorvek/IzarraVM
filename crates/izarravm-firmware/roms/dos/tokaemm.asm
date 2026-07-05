@@ -1992,8 +1992,19 @@ monitor_body:
     je .hlt
     cmp dl, 0x66                  ; operand-size prefix: the 32-bit flag/stack forms
     je .prefix66
-    mov al, dl                    ; unhandled sensitive instruction: signal its opcode
-    jmp signal32
+    ; Unhandled #GP: reflect INT 0Dh to the guest IVT, the real-monitor
+    ; convention (386MAX INT0D reflects vector 13; JEMM V86_Exc0D reflects
+    ; INT 06h by default and vector 13 under its V86EXC0D build option --
+    ; vector 13 is the literal #GP semantics and what DOS16M's hooked INT
+    ; 0Dh handler expects).
+    ; Real programs depend on it: DOS16M (the DOS4G loader) hooks INT 0Dh,
+    ; executes privileged instructions like LGDT during early preparation,
+    ; and handles its own fault reflections -- on real hardware under any
+    ; V86 monitor that is normal operation, not a monitor bug. Fault
+    ; semantics: the frame IP still points AT the instruction.
+    mov ebx, 13
+    call reflect_vector
+    jmp .done_gp
 
 ; ---- 66-prefixed sensitive forms. PUSHFD/POPFD/IRETD are IOPL-sensitive in
 ; V86 exactly like their 16-bit forms; CWSDPMI's V86 mode-switch path uses
@@ -2008,8 +2019,10 @@ monitor_body:
     je .popfd
     cmp dl, 0xCF
     je .iretd_op
-    mov al, dl
-    jmp signal32
+    mov ebx, 13                   ; unhandled 66-prefixed op: reflect INT 0Dh
+    call reflect_vector           ; like the unprefixed catch-all (DOS16M's
+    jmp .done_gp                  ; o32 LGDT prep lands here); frame IP still
+                                  ; points at the 66 byte, fault semantics
 .pushfd:
     ; 32-bit image: frame EFLAGS with IF := VIF and, per the PRM, VM and RF
     ; cleared in the STORED image (the frame's own VM bit stays set).

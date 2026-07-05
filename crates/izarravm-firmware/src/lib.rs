@@ -55,6 +55,8 @@ pub const VCPIIF_COM: &[u8] = include_bytes!("../roms/dos/vcpiif.com");
 pub const VCPIIF_COM_SOURCE: &str = include_str!("../roms/dos/vcpiif.asm");
 pub const VCPISW_COM: &[u8] = include_bytes!("../roms/dos/vcpisw.com");
 pub const VCPISW_COM_SOURCE: &str = include_str!("../roms/dos/vcpisw.asm");
+pub const GPREFLCT_COM: &[u8] = include_bytes!("../roms/dos/gpreflct.com");
+pub const GPREFLCT_COM_SOURCE: &str = include_str!("../roms/dos/gpreflct.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -282,6 +284,14 @@ pub fn vcpiif_com() -> &'static [u8] {
 /// pool-balance verification. Signals 0xA5 / 0xEn.
 pub fn vcpisw_com() -> &'static [u8] {
     VCPISW_COM
+}
+
+/// The V86 #GP-reflection fixture (VCPI M4): hooks INT 0Dh, executes an o32
+/// LGDT (the literal DOS16M startup shape), and verifies the monitor
+/// reflects the fault to the guest handler with fault-IP semantics and that
+/// skip-and-resume works. Signals 0xA5 / 0xEn.
+pub fn gpreflct_com() -> &'static [u8] {
+    GPREFLCT_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at

@@ -3539,6 +3539,63 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         );
     }
 
+    /// VCPI M4 real-monitor contract: a V86 program that hooks INT 0Dh and
+    /// executes a privileged instruction the monitor does not emulate (the
+    /// literal DOS16M o32 LGDT startup shape) receives its own reflected
+    /// fault with fault-IP semantics and can skip-and-resume — instead of
+    /// the old signal32 diagnostic abort. GPREFLCT signals 0xA5 / 0xEn.
+    #[test]
+    #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+    fn tokaemm_vcpi_m4_unhandled_gp_reflects_to_guest() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_vcpi4_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGPREFLCT\r\n".to_vec();
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "GPREFLCT.COM".to_string(),
+                        izarravm_firmware::gpreflct_com().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(800_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "V86 #GP reflection contract did not report success (stop={stop:?}); \
+             a 0xEn code names the failed step.\n{text}"
+        );
+    }
+
     /// SP-4b M4 GO/NO-GO: a fresh (empty) user folder gets the NEW defaults seeded
     /// (`ensure_user_config`) — DEVICE=TOKAEMM.SYS NOEMS + DOS=HIGH,UMB + LH
     /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
