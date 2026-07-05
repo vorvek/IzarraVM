@@ -2025,9 +2025,19 @@ monitor_body:
                                   ; points at the 66 byte, fault semantics
 .pushfd:
     ; 32-bit image: frame EFLAGS with IF := VIF and, per the PRM, VM and RF
-    ; cleared in the STORED image (the frame's own VM bit stays set).
+    ; cleared in the STORED image (the frame's own VM bit stays set). The
+    ; image carries VIRTUAL IOPL = 3: the reference monitors expose IOPL 3
+    ; to their V86 tenants (JEMM runs clients at real IOPL 3; 386MAX
+    ; virtualizes the sensitive set the same way), and the VCPI spec S4.0
+    ; requires the IOPL-sensitive instructions be "available". Extenders
+    ; PROBE this: DOS16M reads the flags image to classify real-mode vs
+    ; V86-under-a-monitor, and an IOPL-0 image sent it down its raw
+    ; LGDT mode-switch path (fatal under any monitor). The real IOPL
+    ; stays 0 -- vif virtualization is unchanged; nothing at CPL 3 can
+    ; architecturally change IOPL, so the constant image is faithful.
     mov eax, [ebp+8]
     and eax, 0xFFFCFDFF           ; clear IF + VM(17) + RF(16) in the image
+    or eax, 0x3000                ; virtual IOPL = 3
     cmp byte [fs:vif], 0
     je .pfd_store
     or eax, 0x0200
@@ -2125,7 +2135,8 @@ monitor_body:
 .pushf:
     mov ax, [ebp+8]               ; frame EFLAGS
     and ax, 0xFDFF                ; IF := VIF for the pushed image
-    cmp byte [fs:vif], 0
+    or ax, 0x3000                 ; virtual IOPL = 3 (see .pushfd: extenders
+    cmp byte [fs:vif], 0          ; probe the image to classify the machine)
     je .pf_store
     or ax, 0x0200
 .pf_store:
@@ -2886,8 +2897,9 @@ irq_reflect_line:
 reflect_vector:
     mov edx, [ebp+16]            ; guest SS
     shl edx, 4                   ; edx = guest stack base (linear)
-    mov ax, [ebp+8]             ; guest flags, IF := VIF
-    and ax, 0xFDFF
+    mov ax, [ebp+8]             ; guest flags, IF := VIF, virtual IOPL = 3
+    and ax, 0xFDFF              ; (the image convention; see .pushfd)
+    or ax, 0x3000
     cmp byte [fs:vif], 0
     je .rf
     or ax, 0x0200
