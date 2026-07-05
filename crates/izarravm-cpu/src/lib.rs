@@ -29503,6 +29503,204 @@ mod tests {
         }
     }
 
+    /// Run one instruction against a fresh FPU seeded with the given stack (last
+    /// element becomes ST(0)) and return the CPU for state assertions. The x87
+    /// value-accuracy battery below uses manual-cited inputs per family; the
+    /// differential goldens above pin encodings, these pin VALUES.
+    fn fpu_exec(code: &[u8], stack: &[f64]) -> (Cpu386, TestBus) {
+        let mut mem = vec![0u8; 0x200];
+        mem[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.eflags = 0x02;
+        cpu.fpu.finit();
+        for &v in stack {
+            cpu.fpu.push(v);
+        }
+        let mut bus = TestBus::with_memory(mem);
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        (cpu, bus)
+    }
+
+    /// Condition codes C3/C2/C1/C0 from the status word, as a tuple.
+    fn cc(cpu: &Cpu386) -> (bool, bool, bool, bool) {
+        let s = cpu.fpu.status;
+        (
+            s & (1 << 14) != 0,
+            s & (1 << 10) != 0,
+            s & (1 << 9) != 0,
+            s & (1 << 8) != 0,
+        )
+    }
+
+    #[test]
+    fn fld_fstp_m80_round_trips_exact_values() {
+        // FLD m80 [0x100]: 1.5 in extended = sign 0, exponent 16383, mantissa
+        // 0xC000000000000000 (explicit integer bit + 0.5), 80387 PRM data formats.
+        let mut mem = vec![0u8; 0x200];
+        mem[..4].copy_from_slice(&[0xdb, 0x2e, 0x00, 0x01]); // FLD tbyte [0x100]
+        mem[0x100..0x108].copy_from_slice(&0xC000_0000_0000_0000u64.to_le_bytes());
+        mem[0x108..0x10a].copy_from_slice(&0x3FFFu16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        fpu_seed(&mut cpu);
+        let mut bus = TestBus::with_memory(mem);
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 1.5, "FLD m80 of extended 1.5");
+
+        // FSTP m80 [0x130] of -2.0: sign 1, exponent 16384, integer-bit-only mantissa.
+        let (_, bus) = fpu_exec(&[0xdb, 0x3e, 0x30, 0x01], &[-2.0]);
+        assert_eq!(
+            bus.memory[0x130..0x138],
+            0x8000_0000_0000_0000u64.to_le_bytes(),
+            "FSTP m80 mantissa of -2.0"
+        );
+        assert_eq!(
+            bus.memory[0x138..0x13a],
+            0xC000u16.to_le_bytes(),
+            "FSTP m80 sign+exponent of -2.0"
+        );
+    }
+
+    #[test]
+    fn fpatan_quadrants() {
+        // FPATAN: ST1 = atan(ST1/ST0) with quadrant correction, then pop.
+        // atan2(1, -1) = 3pi/4 (80387 PRM: operand signs select the quadrant).
+        let (cpu, _) = fpu_exec(&[0xd9, 0xf3], &[1.0, -1.0]); // ST1=1 (y), ST0=-1 (x)
+        let want = 3.0 * std::f64::consts::FRAC_PI_4;
+        assert!(
+            (cpu.fpu.get(0) - want).abs() < 1e-15,
+            "FPATAN(y=1, x=-1) = 3pi/4, got {}",
+            cpu.fpu.get(0)
+        );
+    }
+
+    #[test]
+    fn fprem_positive_quotient_low_bits_land_in_c0_c3_c1() {
+        // FPREM: 17 mod 5 = 2 with quotient 3; C0/C3/C1 = quotient bits 2/1/0 =
+        // 0/1/1, C2 = 0 (reduction complete). 80387 PRM FPREM description.
+        let (cpu, _) = fpu_exec(&[0xd9, 0xf8], &[5.0, 17.0]); // ST1=5, ST0=17
+        assert_eq!(cpu.fpu.get(0), 2.0, "17 rem 5");
+        let (c3, c2, c1, c0) = cc(&cpu);
+        assert!(!c2, "C2 clear: reduction complete");
+        assert!(!c0 && c3 && c1, "quotient 3 = 0b011 in C0/C3/C1");
+    }
+
+    #[test]
+    fn fprem1_uses_round_to_nearest_quotient() {
+        // FPREM1 separates from FPREM at 8 mod 5: the IEEE nearest quotient of
+        // 8/5 = 1.6 is 2, remainder -2 (FPREM's truncated quotient 1 leaves +3).
+        let (cpu, _) = fpu_exec(&[0xd9, 0xf5], &[5.0, 8.0]);
+        assert_eq!(cpu.fpu.get(0), -2.0, "FPREM1 8 rem 5 (nearest quotient 2)");
+        let (_, c2, _, _) = cc(&cpu);
+        assert!(!c2);
+    }
+
+    #[test]
+    fn fxtract_splits_exponent_and_significand() {
+        // FXTRACT on 6.0: exponent 2 replaces ST(0), significand 1.5 is pushed.
+        let (cpu, _) = fpu_exec(&[0xd9, 0xf4], &[6.0]);
+        assert_eq!(cpu.fpu.get(0), 1.5, "significand of 6.0");
+        assert_eq!(cpu.fpu.get(1), 2.0, "unbiased exponent of 6.0");
+    }
+
+    #[test]
+    fn fscale_truncates_the_scale_toward_zero() {
+        // FSCALE: ST0 = ST0 * 2^trunc(ST1); the fractional and negative scales
+        // truncate toward zero (the integer case is covered by
+        // `fscale_scales_by_power_of_two`). trunc(2.5) = 2 -> 12; trunc(-1.5) =
+        // -1 -> 1.5. 80387 PRM FSCALE.
+        let (cpu, _) = fpu_exec(&[0xd9, 0xfd], &[2.5, 3.0]);
+        assert_eq!(cpu.fpu.get(0), 12.0, "3.0 scaled by trunc(2.5)");
+        let (cpu, _) = fpu_exec(&[0xd9, 0xfd], &[-1.5, 3.0]);
+        assert_eq!(cpu.fpu.get(0), 1.5, "3.0 scaled by trunc(-1.5)");
+    }
+
+    #[test]
+    fn fxam_classifies_and_signs() {
+        // FXAM: C3/C2/C0 classify ST(0), C1 = sign. 80387 PRM table: zero = C3,
+        // NaN = C0, infinity = C2+C0, normal = C2, empty = C3+C0.
+        let cases: &[(f64, (bool, bool, bool))] = &[
+            (0.0, (true, false, false)),
+            (f64::NAN, (false, false, true)),
+            (f64::INFINITY, (false, true, true)),
+            (1.0, (false, true, false)),
+        ];
+        for &(v, (want_c3, want_c2, want_c0)) in cases {
+            let (cpu, _) = fpu_exec(&[0xd9, 0xe5], &[v]);
+            let (c3, c2, _, c0) = cc(&cpu);
+            assert_eq!((c3, c2, c0), (want_c3, want_c2, want_c0), "FXAM of {v}");
+        }
+        let (cpu, _) = fpu_exec(&[0xd9, 0xe5], &[-1.0]);
+        let (_, _, c1, _) = cc(&cpu);
+        assert!(c1, "FXAM C1 = sign of -1.0");
+        let (cpu, _) = fpu_exec(&[0xd9, 0xe5], &[]);
+        let (c3, _, _, c0) = cc(&cpu);
+        assert!(c3 && c0, "FXAM of an empty ST(0)");
+    }
+
+    #[test]
+    fn f2xm1_and_fyl2x_hit_exact_and_near_values() {
+        // F2XM1 on 0.5: 2^0.5 - 1 = sqrt(2) - 1.
+        let (cpu, _) = fpu_exec(&[0xd9, 0xf0], &[0.5]);
+        assert!(
+            (cpu.fpu.get(0) - (std::f64::consts::SQRT_2 - 1.0)).abs() < 1e-15,
+            "F2XM1(0.5)"
+        );
+        // FYL2X: ST1 * log2(ST0), pop. 3 * log2(8) = 9 exactly in f64.
+        let (cpu, _) = fpu_exec(&[0xd9, 0xf1], &[3.0, 8.0]); // ST1=3, ST0=8
+        assert_eq!(cpu.fpu.get(0), 9.0, "FYL2X exact case");
+        assert_eq!(cpu.fpu.top(), 7, "FYL2X popped once from a 2-deep stack");
+    }
+
+    #[test]
+    fn fsincos_pushes_cos_over_sin() {
+        // FSINCOS on 0.0: ST(1) = sin = 0, ST(0) = cos = 1, C2 = 0.
+        let (cpu, _) = fpu_exec(&[0xd9, 0xfb], &[0.0]);
+        assert_eq!(cpu.fpu.get(0), 1.0, "cos(0)");
+        assert_eq!(cpu.fpu.get(1), 0.0, "sin(0)");
+        let (_, c2, _, _) = cc(&cpu);
+        assert!(!c2, "C2 clear: argument in range");
+    }
+
+    #[test]
+    fn fcompp_compares_and_pops_both() {
+        // FCOMPP (DE D9): compare ST(0) with ST(1), pop both. 2 < 3 -> C0 set.
+        let (cpu, _) = fpu_exec(&[0xde, 0xd9], &[3.0, 2.0]); // ST1=3, ST0=2
+        let (c3, _, _, c0) = cc(&cpu);
+        assert!(c0 && !c3, "2 < 3 sets C0");
+        assert_eq!(cpu.fpu.top(), 0, "both operands popped");
+        assert!(cpu.fpu.is_empty(0), "stack empty after FCOMPP");
+    }
+
+    #[test]
+    fn fbld_fbstp_round_trip_packed_bcd() {
+        // FBLD [0x100] of packed BCD 1234567; FBSTP writes the digits back with
+        // the sign in bit 7 of byte 9. 80387 PRM packed-BCD format.
+        let mut mem = vec![0u8; 0x200];
+        mem[..4].copy_from_slice(&[0xdf, 0x26, 0x00, 0x01]); // FBLD [0x100]
+        mem[0x100] = 0x67;
+        mem[0x101] = 0x45;
+        mem[0x102] = 0x23;
+        mem[0x103] = 0x01;
+        let mut cpu = Cpu386::default();
+        fpu_seed(&mut cpu);
+        let mut bus = TestBus::with_memory(mem);
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 1234567.0, "FBLD 1234567");
+
+        let (cpu, bus) = fpu_exec(&[0xdf, 0x36, 0x30, 0x01], &[-1234567.0]); // FBSTP [0x130]
+        assert_eq!(
+            &bus.memory[0x130..0x134],
+            &[0x67, 0x45, 0x23, 0x01],
+            "FBSTP digits"
+        );
+        assert_eq!(bus.memory[0x139], 0x80, "FBSTP sign byte for a negative");
+        assert_eq!(cpu.fpu.top(), 0, "FBSTP popped");
+    }
+
     /// Regenerate `fpu_golden_cases` from the fused reference. Ignored by default. Run WHILE the
     /// x87 fused arms still exist (parent commit 0b928034):
     ///   git worktree add ../regen-a13 0b928034
