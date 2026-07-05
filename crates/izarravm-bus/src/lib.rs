@@ -473,6 +473,19 @@ pub trait CpuBus {
         Ok(None)
     }
 
+    /// Scaled bus clocks this batch has accumulated so far, in GUEST clocks.
+    /// The straight-line run loop adds the growth of this figure to its core
+    /// total when checking the run cap, so a bus-heavy run (a framebuffer
+    /// blit) cannot exhaust a guest-clock budget expressed in core clocks and
+    /// overshoot the next timer edge - the batch cap's PIT terms are guest
+    /// clocks, and a real PIT interrupts at every edge. Buses without batch
+    /// bus accounting (or ones whose cap really is core clocks, like the
+    /// Accurate-class lockstep) return 0, which reproduces the historical
+    /// core-only check bit-for-bit.
+    fn in_batch_scaled_bus_clocks(&self) -> u64 {
+        0
+    }
+
     fn charge_direct_memory(
         &mut self,
         _address: u32,

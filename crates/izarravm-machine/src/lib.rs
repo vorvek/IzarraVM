@@ -9062,16 +9062,7 @@ impl Machine {
                         // one-DAC-sample batches sit far below a PIT period, and
                         // the frozen 286/386 byte-identity gate pins its batch
                         // geometry.
-                        let scaled_bus_so_far =
-                            if matches!(bus.active_mode.timing_class(), TimingClass::Approximate) {
-                                let raw =
-                                    bus.trace.elapsed_clocks() - bus.trace_elapsed_at_batch_start;
-                                raw * u64::from(bus.bus_num_at_batch_start)
-                                    / u64::from(bus.bus_den_at_batch_start)
-                            } else {
-                                0
-                            };
-                        let spent = u64::from(batch_core) + scaled_bus_so_far;
+                        let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();
                         if spent >= cap {
                             break;
                         }
@@ -9662,6 +9653,21 @@ impl CpuBus for MachineBus<'_> {
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
         Ok(())
+    }
+
+    /// See the trait doc: the straight-line run loop adds this figure's growth
+    /// to its core total against the (guest-clock) run cap. Approximate class
+    /// only; the Accurate class returns 0 so its lockstep batches keep the
+    /// historical core-only check bit-for-bit (frozen 286/386 byte-identity).
+    /// Same arithmetic as `in_batch_clocks` minus the core terms the CPU
+    /// already tracks itself.
+    fn in_batch_scaled_bus_clocks(&self) -> u64 {
+        if matches!(self.active_mode.timing_class(), TimingClass::Accurate) {
+            return 0;
+        }
+        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
+        (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
+            / u64::from(self.bus_den_at_batch_start)
     }
 
     fn read_memory(

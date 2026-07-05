@@ -2929,6 +2929,15 @@ impl Cpu386 {
     ) -> Result<CycleOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
+        // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
+        // derives it from PIT-edge instants), but `total` counts core clocks
+        // only. Track the batch's scaled-bus growth across this run so a
+        // bus-heavy run (a framebuffer blit is several bus clocks per core
+        // clock) ends at the budget instead of overshooting the next timer
+        // edge by the bus:core ratio. Zero-cost where the bus reports 0 (the
+        // Accurate class and non-batching buses): the check degrades to the
+        // historical core-only comparison bit-for-bit.
+        let bus_at_entry = bus.in_batch_scaled_bus_clocks();
         self.perf.straight_line_runs += 1;
         loop {
             let can_take_before = self.can_take_interrupt();
@@ -2980,7 +2989,7 @@ impl Cpu386 {
                 self.perf.brk_interrupt += 1;
                 break;
             }
-            if total >= cap {
+            if total + (bus.in_batch_scaled_bus_clocks() - bus_at_entry) >= cap {
                 self.perf.brk_cap += 1;
                 break;
             }
