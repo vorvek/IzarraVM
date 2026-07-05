@@ -7459,6 +7459,10 @@ impl Cpu386 {
         let offset = self.registers.eip;
         let cs = self.registers.cs();
         let linear = self.code_linear_for_offset(offset, 1)?;
+        // Observation seam: the machine recognizes its BIOS INT stub landings
+        // by the LINEAR fetch address (a paging guest may shadow the stub
+        // page, so the physical address cannot identify it).
+        bus.note_code_fetch_linear(linear);
         if let Some((value, physical)) = self.fetch_page.get(cs, linear) {
             self.perf.fetch_page_hits += 1;
             bus.charge_instruction_fetch(physical)?;
