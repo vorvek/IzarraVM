@@ -118,6 +118,7 @@ start:
     mov cx, 16
     mov ax, 0xA5A5
     push di
+    cld
     rep stosw                     ; poison all 8 dwords (ES=CS=DS in a .COM)
     pop di
     mov ax, 0xDE08
