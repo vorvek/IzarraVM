@@ -52,6 +52,18 @@ start:
     jz f_cr3
     mov eax, cr2                  ; just must not fault
 
+    ; 4b. Aliasing check: the monitor uses ESI/EDI as scratch while emulating,
+    ;     so a MOV into ESI (rm=6) or EDI (rm=7) must still land in the guest's
+    ;     register (written to the pushad slot, not lost to the live scratch).
+    xor esi, esi
+    mov esi, cr0                  ; dest = ESI: rm collides with monitor scratch
+    test esi, 1                   ; must carry CR0's PE, not stay zero
+    jz f_alias
+    xor edi, edi
+    mov edi, cr3                  ; dest = EDI: rm collides with monitor scratch
+    test edi, 0xFFFFF000
+    jz f_alias
+
     ; 5. LMSW with PE cleared in the image: PE stays set
     mov ax, [saved_cr0]
     and ax, 0xFFFE                ; clear PE in the MSW image
@@ -74,6 +86,8 @@ f_cr0write: mov al, 0xE2
 f_clts:     mov al, 0xE3
             jmp sig
 f_cr3:      mov al, 0xE4
+            jmp sig
+f_alias:    mov al, 0xE6
             jmp sig
 f_lmsw:     mov al, 0xE5
 

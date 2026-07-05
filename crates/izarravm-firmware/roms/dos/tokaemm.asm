@@ -2372,7 +2372,9 @@ monitor_body:
     jmp .done_gp
 
 ; MOV r32, DRn (0F 21 /r) and MOV DRn, r32 (0F 23 /r). 386 debug registers;
-; DR0-3/6/7 (DR4/5 are undefined/aliased -- reflect). Read/write real.
+; DR0-3/6/7 (DR4/5 are undefined -- this monitor reflects them; the CPU
+; aliases DR4->DR6/DR5->DR7, a harmless divergence no V86 client exercises).
+; Read/write real.
 .op_mov_r_dr:
     movzx ecx, byte [eax+2]
     mov ebx, ecx
