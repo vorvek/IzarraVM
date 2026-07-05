@@ -57,6 +57,8 @@ pub const VCPISW_COM: &[u8] = include_bytes!("../roms/dos/vcpisw.com");
 pub const VCPISW_COM_SOURCE: &str = include_str!("../roms/dos/vcpisw.asm");
 pub const GPREFLCT_COM: &[u8] = include_bytes!("../roms/dos/gpreflct.com");
 pub const GPREFLCT_COM_SOURCE: &str = include_str!("../roms/dos/gpreflct.asm");
+pub const GPEMUL_COM: &[u8] = include_bytes!("../roms/dos/gpemul.com");
+pub const GPEMUL_COM_SOURCE: &str = include_str!("../roms/dos/gpemul.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -292,6 +294,14 @@ pub fn vcpisw_com() -> &'static [u8] {
 /// skip-and-resume works. Signals 0xA5 / 0xEn.
 pub fn gpreflct_com() -> &'static [u8] {
     GPREFLCT_COM
+}
+
+/// The V86 privileged-0F emulation fixture (386MAX-surface port): executes
+/// MOV r32,CR0/CR3/CR2, MOV CR0,r32 (PE|PG forced), CLTS, and LMSW from V86
+/// (all #GP at CPL 3) and verifies the monitor emulates them transparently
+/// instead of reflecting a fault. Signals 0xA5 / 0xEn.
+pub fn gpemul_com() -> &'static [u8] {
+    GPEMUL_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at

@@ -1992,6 +1992,8 @@ monitor_body:
     je .hlt
     cmp dl, 0x66                  ; operand-size prefix: the 32-bit flag/stack forms
     je .prefix66
+    cmp dl, 0x0F                  ; two-byte privileged op (MOV CRn/CLTS/LMSW)
+    je .prefix0f
     ; Unhandled #GP: reflect INT 0Dh to the guest IVT, the real-monitor
     ; convention (386MAX INT0D reflects vector 13; JEMM V86_Exc0D reflects
     ; INT 06h by default and vector 13 under its V86EXC0D build option --
@@ -2260,6 +2262,233 @@ monitor_body:
                                 ; maybe_deliver reflects the highest-priority
                                 ; held line through EBP's real V86 frame.
     call maybe_deliver
+    jmp .done_gp
+
+; ---- Two-byte privileged 0F ops (386MAX QMAX_I0D GP_ESCOD, adapted to the
+; Izarra 3000). A V86 task is CPL 3, so the CPU #GP(0)s every MOV CRn/DRn,
+; CLTS, and LMSW into this monitor; the reference managers EMULATE them
+; transparently (386MAX GP_MOV_*/GP_GRP7, JEMM ExtendedOp) rather than
+; reflect -- extenders read CR0 through this path during their real-mode-vs-
+; V86 probe. Restricted to the 386 privileged set that is both reachable and
+; assembles in this cpu-386 monitor region: the 486/586 members 386MAX also
+; handles (INVD/WBINVD, RDMSR/WRMSR/RDTSC/RDPMC) and the TRn/EISA/SYSROM/DPMI
+; paths are DROPPED -- on a throttled 386 those opcodes #UD at the guest
+; level (never reaching here), no proven client executes them in V86, and DR
+; state is already reachable through VCPI DE08/DE09. Anything outside the set
+; reflects INT 0Dh like the single-byte catch-all.
+;
+; Guest register i (ModRM rm/reg field) lives in the pushad block at
+; [esp + 28 - i*4] (EDI@0..EAX@28). ESP is stable here (no push/pop), and the
+; live eax/ebx/ecx/esi used as scratch are all popad-restored, so writing a
+; RESULT into the pushad slot is the only guest-visible effect.
+.prefix0f:
+    movzx ebx, byte [eax+1]       ; the second opcode byte
+    cmp bl, 0x06
+    je .op_clts
+    cmp bl, 0x20
+    je .op_mov_r_cr
+    cmp bl, 0x22
+    je .op_mov_cr_r
+    cmp bl, 0x21
+    je .op_mov_r_dr
+    cmp bl, 0x23
+    je .op_mov_dr_r
+    cmp bl, 0x01
+    je .op_grp7
+.op0f_reflect:
+    mov ebx, 13                   ; unemulated 0F: reflect like the catch-all
+    call reflect_vector
+    jmp .done_gp
+
+.op_clts:                         ; CLTS: clear CR0.TS at ring 0 (real)
+    clts
+    add word [ebp], 2
+    jmp .done_gp
+
+; MOV r32, CRn (0F 20 /r). ModRM at [eax+2]: reg = CR#, rm = dest GPR.
+.op_mov_r_cr:
+    movzx ecx, byte [eax+2]
+    mov ebx, ecx
+    shr ebx, 3
+    and ebx, 7                    ; CR number
+    cmp bl, 0
+    je .rcr0
+    cmp bl, 2
+    je .rcr2
+    cmp bl, 3
+    je .rcr3
+    jmp .op0f_reflect             ; CR4+ not modeled at 386: reflect
+.rcr0:
+    mov esi, cr0
+    jmp .rcr_store
+.rcr2:
+    mov esi, cr2
+    jmp .rcr_store
+.rcr3:
+    mov esi, cr3
+.rcr_store:
+    and ecx, 7                    ; rm = dest GPR
+    movzx edi, cl
+    shl edi, 2
+    neg edi
+    add edi, 28                   ; pushad offset = 28 - rm*4
+    mov [esp+edi], esi
+    add word [ebp], 3
+    jmp .done_gp
+
+; MOV CRn, r32 (0F 22 /r). CR0 write: force PE|PG on (a V86 client can toggle
+; EM/TS/MP/NW but must never un-protect or un-page the live machine -- the
+; 386MAX INS_MOV_CRn_R32B guard). CR2/CR3 pass through.
+.op_mov_cr_r:
+    movzx ecx, byte [eax+2]
+    mov ebx, ecx
+    shr ebx, 3
+    and ebx, 7                    ; CR number
+    and ecx, 7                    ; rm = source GPR
+    movzx edi, cl
+    shl edi, 2
+    neg edi
+    add edi, 28
+    mov esi, [esp+edi]            ; the value the guest wants to write
+    cmp bl, 0
+    je .wcr0
+    cmp bl, 2
+    je .wcr2
+    cmp bl, 3
+    je .wcr3
+    jmp .op0f_reflect
+.wcr0:
+    or esi, 0x80000001            ; PG|PE forced on
+    mov cr0, esi
+    jmp .wcr_done
+.wcr2:
+    mov cr2, esi
+    jmp .wcr_done
+.wcr3:
+    mov cr3, esi                  ; (reloads the guest's own paging: legal,
+                                  ; the client owns its mapping under VCPI)
+.wcr_done:
+    add word [ebp], 3
+    jmp .done_gp
+
+; MOV r32, DRn (0F 21 /r) and MOV DRn, r32 (0F 23 /r). 386 debug registers;
+; DR0-3/6/7 (DR4/5 are undefined/aliased -- reflect). Read/write real.
+.op_mov_r_dr:
+    movzx ecx, byte [eax+2]
+    mov ebx, ecx
+    shr ebx, 3
+    and ebx, 7                    ; DR number
+    cmp bl, 4
+    je .op0f_reflect
+    cmp bl, 5
+    je .op0f_reflect
+    cmp bl, 0
+    je .rdr0
+    cmp bl, 1
+    je .rdr1
+    cmp bl, 2
+    je .rdr2
+    cmp bl, 3
+    je .rdr3
+    cmp bl, 6
+    je .rdr6
+    mov esi, dr7
+    jmp .rdr_store
+.rdr0:
+    mov esi, dr0
+    jmp .rdr_store
+.rdr1:
+    mov esi, dr1
+    jmp .rdr_store
+.rdr2:
+    mov esi, dr2
+    jmp .rdr_store
+.rdr3:
+    mov esi, dr3
+    jmp .rdr_store
+.rdr6:
+    mov esi, dr6
+.rdr_store:
+    and ecx, 7
+    movzx edi, cl
+    shl edi, 2
+    neg edi
+    add edi, 28
+    mov [esp+edi], esi
+    add word [ebp], 3
+    jmp .done_gp
+
+.op_mov_dr_r:
+    movzx ecx, byte [eax+2]
+    mov ebx, ecx
+    shr ebx, 3
+    and ebx, 7                    ; DR number
+    and ecx, 7                    ; rm = source GPR
+    movzx edi, cl
+    shl edi, 2
+    neg edi
+    add edi, 28
+    mov esi, [esp+edi]
+    cmp bl, 4
+    je .op0f_reflect
+    cmp bl, 5
+    je .op0f_reflect
+    cmp bl, 0
+    je .wdr0
+    cmp bl, 1
+    je .wdr1
+    cmp bl, 2
+    je .wdr2
+    cmp bl, 3
+    je .wdr3
+    cmp bl, 6
+    je .wdr6
+    mov dr7, esi
+    jmp .wdr_done
+.wdr0:
+    mov dr0, esi
+    jmp .wdr_done
+.wdr1:
+    mov dr1, esi
+    jmp .wdr_done
+.wdr2:
+    mov dr2, esi
+    jmp .wdr_done
+.wdr3:
+    mov dr3, esi
+    jmp .wdr_done
+.wdr6:
+    mov dr6, esi
+.wdr_done:
+    add word [ebp], 3
+    jmp .done_gp
+
+; Group 7 (0F 01 /r). Only LMSW (/6) is privileged-and-emulable here; SGDT/
+; SIDT/SMSW are unprivileged (never trap), and LGDT/LIDT/INVLPG reflect (a
+; real V86 client that loads its own GDT is doing a mode switch -- our DE0C
+; is the sanctioned path, and DOS16M-style raw LGDT probes want the fault).
+; LMSW: OR PE into the value first (LMSW architecturally cannot clear PE) and
+; force it through the low word of CR0 without disturbing the high half.
+.op_grp7:
+    movzx ecx, byte [eax+2]       ; ModRM
+    mov ebx, ecx
+    shr ebx, 3
+    and ebx, 7                    ; /ext field
+    cmp bl, 6                     ; LMSW?
+    jne .op0f_reflect
+    mov bl, cl
+    and bl, 0xC0                  ; mod field: register form only (mod==11)?
+    cmp bl, 0xC0
+    jne .op0f_reflect             ; memory-form LMSW: reflect (rare, unneeded)
+    and ecx, 7                    ; rm = source GPR
+    movzx edi, cl
+    shl edi, 2
+    neg edi
+    add edi, 28
+    mov si, [esp+edi]             ; the 16-bit MSW image the guest supplies
+    or si, 1                      ; PE stays set
+    lmsw si
+    add word [ebp], 3
     jmp .done_gp
 .done_gp:
     popad

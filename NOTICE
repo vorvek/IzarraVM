@@ -21,3 +21,13 @@ kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: © 1995 Pasquale
 Distira's SST-1 DAC-backdoor handshake and W-buffer depth encoding follow the
 behavior of 86Box's Voodoo emulation (https://86box.net, © 2008-2020 Sarah
 Walker and contributors, GPLv2-or-later), reimplemented in Rust for IzarraVM.
+TOKAEMM.SYS (the XMS/UMB/EMS memory manager and V86 monitor) is a 386MAX
+adaptation: its VCPI 1.0 server and its V86 privileged-instruction emulation
+(the INT 67h AH=DEh handlers, the DE0C mode switch, and the MOV CRn/DRn /
+CLTS / LMSW emulation-vs-reflect surface) follow the mechanisms of 386MAX and
+its DPMIONE outgrowth (https://github.com/sudleyplace/386MAX, © 1987-98
+Qualitas, Inc. and © 1990-2012 Sudley Place Software / Bob Smith, GPLv3),
+adapted to the Izarra 3000's virtual hardware and reimplemented in NASM for
+IzarraVM. The VCPI 1.0 interface follows the Virtual Control Program
+Interface specification (© 1987-89 Phar Lap Software, Inc. and Quarterdeck
+Office Systems).
