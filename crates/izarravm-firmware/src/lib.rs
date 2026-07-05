@@ -47,6 +47,8 @@ pub const SNDTST_COM: &[u8] = include_bytes!("../roms/dos/sndtst.com");
 pub const SNDTST_COM_SOURCE: &str = include_str!("../roms/dos/sndtst.asm");
 pub const IRQ5IP0_COM: &[u8] = include_bytes!("../roms/dos/irq5ip0.com");
 pub const IRQ5IP0_COM_SOURCE: &str = include_str!("../roms/dos/irq5ip0.asm");
+pub const VCPIDET_COM: &[u8] = include_bytes!("../roms/dos/vcpidet.com");
+pub const VCPIDET_COM_SOURCE: &str = include_str!("../roms/dos/vcpidet.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
@@ -238,6 +240,15 @@ pub fn irq5ip0_com() -> &'static [u8] {
 /// 41h returns 80h, allocation refused with 87h. Signals 0xA5 / 0xEn.
 pub fn emsnone_com() -> &'static [u8] {
     EMSNONE_COM
+}
+
+/// The VCPI M0 presence fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): INT 67h
+/// AX=DE00h must answer AH=0/BX=0100h (VCPI 1.0 present, even frameless), a
+/// not-yet-implemented subfunction must answer 8Fh, untouched registers must
+/// survive, and plain EMS must keep answering on the shared vector. Signals
+/// 0xA5 / 0xEn.
+pub fn vcpidet_com() -> &'static [u8] {
+    VCPIDET_COM
 }
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at

@@ -1697,10 +1697,20 @@ idt:
                                   ;      through this same slot with NO error
                                   ;      code -- deflt_ac must handle both shapes)
 %assign v 18
-%rep (0x70 - 18)
-    IDTGATE deflt_%[v]            ; 18..0x6F: no dedicated handler (mostly the
+%rep (0x67 - 18)
+    IDTGATE deflt_%[v]            ; 18..0x66: no dedicated handler (mostly the
                                   ;           BIOS/DOS software-INT range) ->
                                   ;           reflect to the guest's own IVT
+%assign v v+1
+%endrep
+    IDTGATE int67_entry           ; 0x67 EMS/VCPI: reached directly only when
+                                  ;      the guest runs V86 at IOPL=3 (else the
+                                  ;      INT is IOPL-sensitive and arrives via
+                                  ;      vec13_entry). AH=DEh -> the monitor's
+                                  ;      VCPI server; else reflect like deflt.
+%assign v 0x68
+%rep (0x70 - 0x68)
+    IDTGATE deflt_%[v]            ; 0x68..0x6F: reflect to the guest's own IVT
 %assign v v+1
 %endrep
     IDTGATE irq_s8                ; 0x70 IRQ8  RTC
@@ -2091,6 +2101,15 @@ monitor_body:
     jmp .done_gp
 .intn:
     movzx ebx, byte [eax+1]      ; INT vector operand
+    cmp bl, 0x67                 ; INT 67h: EMS and VCPI share the vector.
+    jne .intn_not67              ; AH=DEh is the monitor-side VCPI server;
+    cmp byte [esp+29], 0xDE      ; anything else reflects to the guest EMS
+    jne .intn_reflect            ; driver as before. Guest AH = pushad EAX+1.
+    add word [ebp], 2            ; return IP = past INT 67h (fault frame
+    mov esi, esp                 ; points AT the instruction on this path)
+    call vcpi_dispatch           ; ESI = pushad base, EBP = &frame.eip
+    jmp .done_gp
+.intn_not67:
     cmp bl, 0xC0                 ; TOKAEMM-private monitor call?
     jne .intn_reflect
     cmp word [esp+20], 0x544D    ; guest DX == 'TM' (XMS-move memcpy)?
@@ -2285,7 +2304,15 @@ deflt_16:
     mov ebx, 16
     jmp deflt_common
 %assign v 18
-%rep (0x70 - 18)
+%rep (0x67 - 18)
+deflt_%[v]:
+    pushad
+    mov ebx, v
+    jmp deflt_common
+%assign v v+1
+%endrep
+%assign v 0x68
+%rep (0x70 - 0x68)
 deflt_%[v]:
     pushad
     mov ebx, v
@@ -2323,6 +2350,53 @@ deflt_ac:
     pushad
     mov ebx, 17
     jmp deflt_common
+
+; ---- Vector 0x67 (EMS + VCPI, which share the INT). Reached through the
+; static IDT only when the guest's live IOPL is 3 (otherwise INT n is
+; IOPL-sensitive in V86 and the call arrives through vec13_entry's .intn
+; path, which performs the same AH=DEh split). AH=DEh -> the monitor-side
+; VCPI server; anything else reflects to the guest's own IVT handler (the
+; V86 EMS driver) exactly like a deflt_ gate. The frame's saved CS:IP
+; already points past the INT instruction on this path (software-INT gate
+; dispatch), so no IP advance -- unlike .intn's fault frame. ----
+int67_entry:
+    pushad
+    mov ax, 0x10
+    mov ds, ax
+    mov ax, 0x20
+    mov fs, ax
+    cmp byte [esp+29], 0xDE       ; guest AH (pushad EAX at [esp+28])
+    jne .reflect
+    lea ebp, [esp + 32]           ; no error code on a software-INT frame
+    mov esi, esp                  ; pushad base
+    call vcpi_dispatch
+    popad
+    iretd
+.reflect:
+    mov ebx, 0x67
+    jmp deflt_common              ; re-loads DS/FS: harmless
+
+; ---- VCPI 1.0 server dispatch (INT 67h AH=DEh, AL = subfunction). M0:
+; presence only; every not-yet-implemented subfunction answers 8Fh, the
+; spec's recommended "undefined subfunction code" (VCPI 1.0 spec p.5).
+; Presence is answered regardless of ems_on: a frameless manager still
+; provides VCPI (the EMM386 NOEMS / JEMM NOEMS precedent).
+;   in: ESI = pushad base (guest regs: EAX at +28, EBX at +16),
+;       EBP = &frame.eip (unused in M0), DS = flat, FS = driver data.
+;   The CALLER advances the frame IP (the two entry paths differ: vec13's
+;   fault frame points at the INT, the int67_entry gate frame is already
+;   past it). Guest register writes go through the pushad block; live
+;   eax/ecx/edx are popad-restored, so only [esi+..] writes are outputs. ----
+vcpi_dispatch:
+    mov al, [esi+28]              ; guest AL = VCPI subfunction
+    test al, al
+    jnz .undef
+    mov byte [esi+29], 0          ; DE00: AH = 0, VCPI present
+    mov word [esi+16], 0x0100     ; BX = version: BH=1 major, BL=0 minor
+    ret
+.undef:
+    mov byte [esi+29], 0x8F       ; undefined (not-yet-implemented) subfunction
+    ret
 
 ; EOI the chip(s) for line EBX. The just-delivered line is the highest in
 ; service on its chip, so the non-specific EOI clears the right bit; slave
