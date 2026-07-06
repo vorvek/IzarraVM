@@ -1703,7 +1703,24 @@ fn run_boot_hdd_folder(
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     if cpu_profile_stride.is_some() {
-        print_cpu_profile(&machine.cpu().profile_snapshot());
+        let snapshot = machine.cpu().profile_snapshot();
+        print_cpu_profile(&snapshot);
+        // Dump the raw bytes around the hottest sampled address so the region compiler's
+        // target loop can be disassembled straight from the census. Identity-mapped read:
+        // DOS-extender arenas (the workloads this census exists for) map extended memory
+        // linear==physical; a non-identity guest just yields a mislabeled hexdump.
+        if let Some(&(top, _)) = snapshot.hot_addrs.first() {
+            let start = top.saturating_sub(0x40) & !0xf;
+            println!();
+            println!("=== bytes around hottest address {top:08X} (identity-assumed) ===");
+            for row in 0..0x18 {
+                let base = start + row * 16;
+                let bytes: Vec<String> = (0..16)
+                    .map(|i| format!("{:02X}", machine.read_physical_u8(base + i)))
+                    .collect();
+                println!("{base:08X}  {}", bytes.join(" "));
+            }
+        }
     }
     // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
     // always maintained, so unlike the sampled profile above this print costs nothing.
