@@ -32748,6 +32748,42 @@ mod tests {
             assert!(jit_cpu.perf_counters().jit_region_entries > 0);
         }
 
+        /// v2's inline slots (mov/add/shr) set gpr and flags natively; the brief flags
+        /// flag-state equality after EVERY exit (incl. mid-iteration) as the hard correctness property.
+        /// This test forces a cap-boundary exit at several points across the loop and compares the
+        /// MATERIALIZED eflags (not just Cpu386 equality, but the actual `eflags()` value that
+        /// resolves any pending descriptor the inline ADD left behind) between interpreter and JIT.
+        /// A divergence here would mean the inline ADD's lazy descriptor or the inline SHR's eager
+        /// materialization differs from the interpreter at the exit eip.
+        #[test]
+        fn region_inline_flag_state_matches_after_cap_exits() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+            // Run several iterations with caps that land exits at different slots, then compare the
+            // materialized eflags at every break.
+            for cap in [4u64, 8, 16, 31, 64, 100] {
+                arm_loop(&mut interp, &mut bus_i, 14);
+                arm_loop(&mut jit_cpu, &mut bus_j, 14);
+                drive_to_halt(&mut interp, &mut bus_i, cap);
+                drive_to_halt(&mut jit_cpu, &mut bus_j, cap);
+                // The materialized eflags resolve any pending descriptor the inline add/shr left.
+                assert_eq!(
+                    interp.eflags(),
+                    jit_cpu.eflags(),
+                    "cap {cap}: materialized eflags diverged after inline slots"
+                );
+                // And the raw pending-flag descriptor (if any) must match too.
+                assert_eq!(
+                    interp.pending_flags, jit_cpu.pending_flags,
+                    "cap {cap}: pending flag descriptor diverged"
+                );
+            }
+            assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+        }
+
         #[test]
         fn region_fault_mid_loop_delivers_identically() {
             // DS limit 0x5FF: the third iteration's `mov [edi],al` (edi = 0x640) raises #GP,
