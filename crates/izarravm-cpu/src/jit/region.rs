@@ -41,6 +41,14 @@ pub(crate) struct CompiledRegion {
     pub ctx: Box<RegionCtx>,
     pub entry_lin: u32,
     pub d: bool,
+    /// The region's physical byte span [phys_lo, phys_hi], captured at admission (single-page
+    /// by the matcher's containment rule, so contiguity holds). A narrow SMC kill inside it
+    /// stales the slot table; see `Cpu386::jit_smc_epoch`.
+    pub phys_lo: u32,
+    pub phys_hi: u32,
+    /// `Cpu386::jit_smc_epoch` at the last matcher validation of `ctx.slots`. Entry requires
+    /// equality with the live epoch.
+    pub valid_epoch: u32,
 }
 
 /// The region table. Index 0 is reserved (DecodeLine stores 1-based `NonZeroU32` indices so the
@@ -66,6 +74,15 @@ impl RegionTable {
 
     pub(crate) fn get_mut(&mut self, index: std::num::NonZeroU32) -> Option<&mut CompiledRegion> {
         self.regions.get_mut(index.get() as usize - 1)
+    }
+
+    /// Whether the written physical span intersects any installed region's span. Called from
+    /// the narrow-SMC path; the table holds a handful of regions by design.
+    pub(crate) fn covers_physical(&self, physical: u32, width: u32) -> bool {
+        let last = physical.wrapping_add(width.saturating_sub(1));
+        self.regions
+            .iter()
+            .any(|r| physical <= r.phys_hi && last >= r.phys_lo)
     }
 
     /// The already-installed region for this decode-line key, if any: the re-stamp path (an SMC
@@ -141,13 +158,16 @@ mod tests {
                 rem0: 0,
                 scale_num: 1,
                 scale_den: 1,
-                entry_generation: 0,
+                d: true,
                 exit: Default::default(),
                 fault: None,
                 halted: false,
             }),
             entry_lin,
             d,
+            phys_lo: entry_lin,
+            phys_hi: entry_lin + 0x32,
+            valid_epoch: 0,
         }
     }
 

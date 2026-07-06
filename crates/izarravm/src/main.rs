@@ -1260,6 +1260,7 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "rep_string_fast_iterations": perf.rep_string_fast_iterations,
         "flag_materializations": perf.flag_materializations,
         "cache_tier_lookups": perf.cache_tier_lookups,
+        "smc_narrow_kills": perf.smc_narrow_kills,
         "jit_region_entries": perf.jit_region_entries,
         "jit_region_insns": perf.jit_region_insns,
     })
@@ -1272,7 +1273,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
     println!(
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
          brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
-         inval[cs/smc/other]={}/{}/{}  \
+         inval[cs/smc/other]={}/{}/{} narrow={}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
@@ -1290,6 +1291,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
         perf.decode_inval_cs_load,
         perf.decode_inval_smc,
         perf.decode_inval_other,
+        perf.smc_narrow_kills,
         perf.data_direct_reads,
         perf.data_slow_reads,
         perf.data_direct_writes,

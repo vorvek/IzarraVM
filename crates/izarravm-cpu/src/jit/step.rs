@@ -82,10 +82,8 @@ pub(crate) struct RegionCtx {
     pub rem0: u64,
     pub scale_num: u32,
     pub scale_den: u32,
-    /// Decode-cache generation at entry. Any bump (SMC, paging, CS-base or mode change raised by
-    /// an executed slot) side-exits at that exact instruction boundary, where the interpreter's
-    /// next continuation probe would have missed.
-    pub entry_generation: u32,
+    /// The region's decode-line D bit, for the next-line liveness probe below.
+    pub d: bool,
 
     // Exit report.
     pub exit: RegionExitKind,
@@ -169,17 +167,25 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
             if total + (bus.in_batch_scaled_bus_clocks() - ctx.bus_at_run_start) >= ctx.cap {
                 return STOP;
             }
-            // Stands in for the next continuation's `decode_cache.get` probe: a generation bump
-            // (an executed slot wrote into watched code bytes, or otherwise invalidated decode)
-            // would make that probe miss and end the run here.
-            if cpu.decode_cache.generation != ctx.entry_generation {
-                return STOP;
-            }
+            // The next continuation's `decode_cache` probe, for real: a global invalidation
+            // (generation bump) or a NARROW SMC kill of exactly the next slot's line makes the
+            // interpreter's probe miss and end the run at this boundary, so the region must
+            // stop here too. Nothing can re-decode a line mid-region (no decode runs inside),
+            // so line-live implies the line still holds the insn the slot table captured.
             if k == ctx.jnz_slot {
                 if cpu.registers.eip == ctx.entry_eip {
+                    if !cpu.decode_cache.line_live(ctx.slots[0].lin, ctx.d) {
+                        return STOP;
+                    }
                     return CONTINUE; // taken: the emitted code loops to slot 0
                 }
                 ctx.exit = RegionExitKind::LoopDone;
+                return STOP;
+            }
+            if !cpu
+                .decode_cache
+                .line_live(ctx.slots[k as usize + 1].lin, ctx.d)
+            {
                 return STOP;
             }
             CONTINUE
