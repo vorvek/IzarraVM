@@ -4,6 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 
 mod fpu;
+#[cfg(feature = "jit")]
+mod jit;
 mod mmx;
 pub use fpu::X87;
 

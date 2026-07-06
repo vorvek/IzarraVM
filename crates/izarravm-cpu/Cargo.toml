@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# P3 template JIT. Off by default: the shipped binary runs the pure interpreter until the
+# JIT passes its zero-regression and bit-identity gates.
+jit = []
+
 [dependencies]
 thiserror.workspace = true
 izarravm-bus = { path = "../izarravm-bus" }
