@@ -1926,14 +1926,21 @@ fn decode_cache_lines() -> usize {
 /// a 64-byte-block watch flushes the whole cache on data/stack writes that merely sit near code
 /// (measured: dhrystone +45%). A byte-granular mark only flags an address as code when an
 /// instruction was actually decoded there, so a write to an adjacent data byte never false-triggers.
-/// Coverage is the low 2 MiB of physical space, which holds all real-mode code (conventional + UMB +
-/// HMA); a write or fetch above 2 MiB is treated as NOT code (no flush). That means self-modifying
-/// code located above 2 MiB is not caught, an exotic case (real-mode SMC, the realistic domain,
-/// lives below 1 MiB) accepted to keep the bitmap small and the common path free of false flushes.
+/// Byte-granular coverage is the low 2 MiB of physical space, which holds all real-mode code
+/// (conventional + UMB + HMA). ABOVE 2 MiB - where DOS-extender workloads load flat pmode code -
+/// a coarse 4 KiB-page mark set covers the FULL 4 GB physical space (2^20 pages / 64 = 2^14 `u64`
+/// = 128 KB): page granularity is safe there because flat pmode layouts do not interleave a hot
+/// stack with code the way the tiny model does, and the alternative is unbounded stale-code
+/// replay. That gap used to be masked by the per-CS-load whole-cache flush (one per ~38
+/// instructions on Doom); with CS loads no longer flushing (the decode-cache invalidation-storm
+/// fix), extended-memory SMC - e.g. Quake's self-patching software renderer - MUST be watched or
+/// a stale line replays indefinitely (stage-2 adversarial review finding 12).
 /// 2 MiB / 8 bits = 2^15 `u64` = 256 KB, allocated once per cache; only the words for live code and
 /// written bytes are ever touched, so its working set is a handful of lines.
 const SMC_BYTE_COVERAGE: u32 = 2 << 20;
 const SMC_BITMAP_WORDS: usize = (SMC_BYTE_COVERAGE / 64) as usize;
+/// One bit per 4 KiB physical page over the whole 4 GB space (see above).
+const SMC_PAGE_WORDS: usize = 1 << 14;
 
 /// One direct-mapped decode-cache line. `insn` is `None` until first filled. A filled line is a hit
 /// only when its `tag` matches the lookup linear address AND its `gen` matches the live generation,
@@ -1975,10 +1982,14 @@ struct DecodeCache {
     mask: u32,
     generation: u32,
     /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
-    /// been cached from. A write touching a marked byte advances the generation. Monotonic: marks
-    /// are never cleared, so there are no false negatives (every cached byte stays watched); a stale
-    /// mark only costs a harmless spurious generation bump if a former-code byte is later written.
+    /// been cached from. A write touching a marked byte advances the generation. Marks are cleared
+    /// whenever an SMC flush bumps the generation (no line survives, so live code re-marks on
+    /// re-decode); otherwise stale marks accumulate and once-code bytes reused as data flush the
+    /// cache forever (measured on Doom: 5.6M spurious flushes/timedemo).
     code_bytes: Box<[u64]>,
+    /// Coarse companion above `SMC_BYTE_COVERAGE`: 1 bit per 4 KiB physical page, whole 4 GB
+    /// space. See the SMC_BYTE_COVERAGE doc for why page granularity is correct there.
+    code_pages: Box<[u64]>,
 }
 
 impl DecodeCache {
@@ -1993,6 +2004,7 @@ impl DecodeCache {
             // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
             generation: 1,
             code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
+            code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
         }
     }
 
@@ -2005,16 +2017,23 @@ impl DecodeCache {
             let addr = physical.wrapping_add(i);
             if addr < SMC_BYTE_COVERAGE {
                 self.code_bytes[(addr >> 6) as usize] |= 1u64 << (addr & 63);
+            } else {
+                let page = addr >> 12;
+                self.code_pages[(page >> 6) as usize] |= 1u64 << (page & 63);
             }
         }
     }
 
-    /// Whether this physical byte was decoded as part of a cached instruction. Bytes above the
-    /// covered range answer `false`: SMC there is not tracked (an accepted, documented gap).
+    /// Whether this physical byte was decoded as part of a cached instruction: byte-granular
+    /// below `SMC_BYTE_COVERAGE`, 4 KiB-page-granular above it.
     #[inline]
     fn is_code_byte(&self, physical: u32) -> bool {
-        physical < SMC_BYTE_COVERAGE
-            && self.code_bytes[(physical >> 6) as usize] & (1u64 << (physical & 63)) != 0
+        if physical < SMC_BYTE_COVERAGE {
+            self.code_bytes[(physical >> 6) as usize] & (1u64 << (physical & 63)) != 0
+        } else {
+            let page = physical >> 12;
+            self.code_pages[(page >> 6) as usize] & (1u64 << (page & 63)) != 0
+        }
     }
 
     /// Whether any byte in `[physical, physical + width)` is a cached code byte.
@@ -2079,6 +2098,7 @@ impl DecodeCache {
     fn invalidate_and_clear_code_marks(&mut self) {
         self.invalidate();
         self.code_bytes.fill(0);
+        self.code_pages.fill(0);
     }
 }
 
@@ -21177,6 +21197,58 @@ mod tests {
         assert!(
             cpu.decode_cache.get(0x10, false).is_none(),
             "an exempt 66-prefixed decode (pre-386, ring 0) must not be cached"
+        );
+    }
+
+    #[test]
+    fn smc_above_the_byte_bitmap_coverage_invalidates_via_page_marks() {
+        // Stage-2 review finding 12: extended-memory code (where DOS-extender workloads live,
+        // e.g. Quake's self-patching renderer) sits above SMC_BYTE_COVERAGE. The byte bitmap
+        // does not reach there; the 4 KiB page marks must catch the write, or - now that CS
+        // loads no longer flush - a stale line replays FOREVER. Same shape as
+        // cross_page_write_into_cached_code_invalidates_it, relocated above 2 MiB.
+        const HI: usize = 0x0020_1000; // 2 MiB + 4 KiB
+        let mut memory = vec![0u8; 0x0020_3000];
+        memory[HI] = 0x40; // INC AX above the byte coverage
+        memory[0x2008] = 0xb0; // MOV AL, imm8
+        memory[0x2009] = 0x48; //   = 0x48 (DEC AX opcode)
+        memory[0x200a] = 0xa2; // MOV moffs, AL (moffs is 32-bit under the D=1 flat segment)
+        memory[0x200b..0x200f].copy_from_slice(&(HI as u32).to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        // Real-mode 64 KB limits cannot reach 2 MiB; run flat (the pmode shape that matters).
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x0008, 0x9b));
+        cpu.registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x0010, 0x93));
+        cpu.control.cr0 |= CR0_PE;
+        let mut bus = TestBus::with_memory(memory);
+
+        // 1. Run INC AX above 2 MiB: cached, page-marked.
+        cpu.registers.set_eax(0);
+        cpu.set_eip(HI as u32);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 1, "INC AX ran");
+        assert!(cpu.decode_cache.get(HI as u32, true).is_some(), "cached");
+
+        // 2. Store 0x48 (DEC AX) over it from low memory.
+        cpu.set_eip(0x2008);
+        cpu.cycle(&mut bus).unwrap(); // MOV AL, 0x48
+        cpu.cycle(&mut bus).unwrap(); // MOV [HI], AL -> page mark hits -> generation bump
+        assert!(
+            cpu.decode_cache.get(HI as u32, true).is_none(),
+            "a write into page-marked extended-memory code invalidated the cache"
+        );
+
+        // 3. Re-run: the NEW opcode (DEC AX) executes, not the stale INC AX.
+        cpu.registers.set_eax(5);
+        cpu.set_eip(HI as u32);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eax() & 0xffff,
+            4,
+            "the freshly written DEC AX ran, not the stale cached INC AX"
         );
     }
 
