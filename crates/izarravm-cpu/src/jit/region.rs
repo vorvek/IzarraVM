@@ -22,13 +22,23 @@
 //!   exact, the Doom/Quake anchors unmoved. The region's only legal observable is wall time.
 
 use super::exec_mem::ExecutableBuffer;
+use super::step::{RegionCtx, RegionEntryFn};
 
 /// One compiled loop-region. `entry_lin`/`d` mirror the decode-line key it was installed under:
 /// execution re-validates both (plus the live CS limit) before entering, exactly like a cached
 /// decode hit - a region can never be entered from a context its decode would not have hit in.
 pub(crate) struct CompiledRegion {
-    #[allow(dead_code)] // ponytail: read by the dispatch once the emitter lands
+    /// Kept alive for `Drop` (frees the W^X memory `entry` points into); never read after
+    /// construction.
+    #[allow(dead_code)]
     pub buf: ExecutableBuffer,
+    /// The emitted code's entry point, into `buf`.
+    pub entry: RegionEntryFn,
+    /// The region's slot table and per-entry mailbox. Boxed so its address is stable and
+    /// disjoint from the `Cpu386` allocation (the step function reborrows both mutably).
+    /// Re-stamping after an SMC patch replaces `ctx.slots` wholesale from fresh decodes; the
+    /// emitted bytes never change (they encode only the slot count).
+    pub ctx: Box<RegionCtx>,
     pub entry_lin: u32,
     pub d: bool,
 }
@@ -47,8 +57,25 @@ impl RegionTable {
         std::num::NonZeroU32::new(self.regions.len() as u32).expect("len >= 1 after push")
     }
 
+    /// Shared-borrow lookup; the dispatch itself uses `get_mut` (it resets the ctx), so this is
+    /// exercised by tests only today.
+    #[cfg(test)]
     pub(crate) fn get(&self, index: std::num::NonZeroU32) -> Option<&CompiledRegion> {
         self.regions.get(index.get() as usize - 1)
+    }
+
+    pub(crate) fn get_mut(&mut self, index: std::num::NonZeroU32) -> Option<&mut CompiledRegion> {
+        self.regions.get_mut(index.get() as usize - 1)
+    }
+
+    /// The already-installed region for this decode-line key, if any: the re-stamp path (an SMC
+    /// patch killed the line's stamp, the loop re-warmed) refreshes it instead of re-emitting.
+    /// A linear scan; the table holds a handful of regions by design.
+    pub(crate) fn find(&self, entry_lin: u32, d: bool) -> Option<std::num::NonZeroU32> {
+        self.regions
+            .iter()
+            .position(|r| r.entry_lin == entry_lin && r.d == d)
+            .map(|i| std::num::NonZeroU32::new(i as u32 + 1).expect("positions are 0-based"))
     }
 
     /// Drop every region (e.g. on a mode/level change so stale native code cannot linger even
@@ -88,21 +115,62 @@ impl std::fmt::Debug for RegionTable {
 mod tests {
     use super::*;
 
+    unsafe extern "C" fn stub_entry(
+        _cpu: *mut crate::Cpu386,
+        _bus: *mut std::ffi::c_void,
+        _ctx: *mut RegionCtx,
+    ) -> i64 {
+        0
+    }
+
+    fn stub_region(entry_lin: u32, d: bool) -> CompiledRegion {
+        CompiledRegion {
+            // A trivial valid buffer: a single RET (never called by these tests).
+            buf: ExecutableBuffer::new(&[0xc3]).expect("W^X alloc on a supported host"),
+            entry: stub_entry,
+            ctx: Box::new(RegionCtx {
+                step_fn: None,
+                slots: Vec::new(),
+                jnz_slot: 0,
+                entry_eip: 0,
+                raw_clocks: 0,
+                insn_count: 0,
+                run_total_at_entry: 0,
+                bus_at_run_start: 0,
+                cap: 0,
+                rem0: 0,
+                scale_num: 1,
+                scale_den: 1,
+                entry_generation: 0,
+                exit: Default::default(),
+                fault: None,
+                halted: false,
+            }),
+            entry_lin,
+            d,
+        }
+    }
+
     #[test]
     fn install_returns_one_based_indices_and_get_round_trips() {
         let mut table = RegionTable::default();
         assert_eq!(table.len(), 0);
-        // A trivial valid buffer: a single RET.
-        let buf = ExecutableBuffer::new(&[0xc3]).expect("W^X alloc on a supported host");
-        let idx = table.install(CompiledRegion {
-            buf,
-            entry_lin: 0x0011_0920,
-            d: true,
-        });
+        let idx = table.install(stub_region(0x0011_0920, true));
         assert_eq!(idx.get(), 1);
         let region = table.get(idx).expect("installed region is retrievable");
         assert_eq!(region.entry_lin, 0x0011_0920);
         assert!(region.d);
         assert!(table.get(std::num::NonZeroU32::new(2).unwrap()).is_none());
+        assert!(table.get_mut(idx).is_some());
+    }
+
+    #[test]
+    fn find_locates_a_region_by_its_decode_line_key() {
+        let mut table = RegionTable::default();
+        let idx = table.install(stub_region(0x0047_3DF8, true));
+        assert_eq!(table.find(0x0047_3DF8, true), Some(idx));
+        // Same address under the other D bit is a different key.
+        assert_eq!(table.find(0x0047_3DF8, false), None);
+        assert_eq!(table.find(0x0011_0920, true), None);
     }
 }

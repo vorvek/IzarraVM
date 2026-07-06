@@ -820,7 +820,8 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
              brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
-             map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}",
+             map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
+         jit[entries/insns]={}/{}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -847,6 +848,8 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             perf.rep_string_iterations,
             perf.flag_materializations,
             perf.cache_tier_lookups,
+            perf.jit_region_entries,
+            perf.jit_region_insns,
         );
     }
     if accurate_out_of_band {
@@ -1257,6 +1260,8 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "rep_string_fast_iterations": perf.rep_string_fast_iterations,
         "flag_materializations": perf.flag_materializations,
         "cache_tier_lookups": perf.cache_tier_lookups,
+        "jit_region_entries": perf.jit_region_entries,
+        "jit_region_insns": perf.jit_region_insns,
     })
 }
 
@@ -1270,7 +1275,8 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
          inval[cs/smc/other]={}/{}/{}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
-         map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}",
+         map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
+         jit[entries/insns]={}/{}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -1300,6 +1306,8 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
         perf.rep_string_iterations,
         perf.flag_materializations,
         perf.cache_tier_lookups,
+        perf.jit_region_entries,
+        perf.jit_region_insns,
     );
 }
 

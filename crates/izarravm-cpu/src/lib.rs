@@ -32,6 +32,19 @@ fn diff_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
 }
 
+/// The one linear address the spike's forced JIT admission compiles
+/// (IZARRAVM_JIT_REGION=<hex>, with or without 0x). `None` (the default) keeps the region
+/// compiler fully inert: the production admission policy comes after the win exists. Cached on
+/// first read, same pattern as `diff_trace_enabled`.
+#[cfg(feature = "jit")]
+fn jit_forced_region_lin() -> Option<u32> {
+    static FORCED: OnceLock<Option<u32>> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let value = std::env::var("IZARRAVM_JIT_REGION").ok()?;
+        u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+    })
+}
+
 /// Explicitly flush the diff-trace buffer. Call this once after a headless run loop
 /// returns (any `run_until_*` call), NOT per instruction. Measured gap without this:
 /// a run that fills the 64 KiB buffer but does not end on an exact flush boundary
@@ -983,6 +996,13 @@ pub struct PerfCounters {
     pub decode_inval_cs_load: u64,
     pub decode_inval_smc: u64,
     pub decode_inval_other: u64,
+    /// Compiled-region executions (one per `run_region` call that passed its entry
+    /// preconditions) and the instructions those executions retired. `jit_region_insns /
+    /// jit_region_entries` is the mean instructions per region entry; a Doom A/B run asserts
+    /// `jit_region_entries > 0` to prove the region actually executed. Always present (zero
+    /// without the `jit` feature) so perf-row consumers need no feature gymnastics.
+    pub jit_region_entries: u64,
+    pub jit_region_insns: u64,
     pub data_direct_reads: u64,
     pub data_slow_reads: u64,
     pub data_direct_writes: u64,
@@ -2099,6 +2119,18 @@ impl DecodeCache {
         }
     }
 
+    /// Stamp a compiled region's table index onto the live line for `lin`, so the continuation
+    /// loop's `region_at` probe finds it. A no-op when the line is not live for exactly this
+    /// key: stamping through a stale or mismatched line could attach the region to an address
+    /// it was not compiled for.
+    #[cfg(feature = "jit")]
+    fn stamp_region(&mut self, lin: u32, d: bool, idx: std::num::NonZeroU32) {
+        let line = &mut self.lines[(lin & self.mask) as usize];
+        if line.generation == self.generation && line.tag == lin && line.d == d {
+            line.jit_region = Some(idx);
+        }
+    }
+
     /// Invalidate every cached line by advancing the generation. O(1): stamped lines fail the
     /// generation check and re-decode on next use. Skips 0 on wrap so a fresh line never aliases.
     #[inline]
@@ -2525,6 +2557,18 @@ impl Cpu386 {
     fn scale_clocks(&mut self, clocks: u32) -> u64 {
         let (num, den) = level_timing(self.level);
         let scaled = u64::from(clocks) * u64::from(num) + self.timing_rem;
+        self.timing_rem = scaled % u64::from(den);
+        scaled / u64::from(den)
+    }
+
+    /// `scale_clocks` for a whole compiled-region run in one call: same exact long division,
+    /// u64 raw input because a region batch can exceed u32. Equal to summing per-instruction
+    /// `scale_clocks` results over the same charges (the remainder-carry identity pinned by
+    /// `scale_clocks_batches_exactly`).
+    #[cfg(feature = "jit")]
+    fn scale_clocks_batch(&mut self, clocks: u64) -> u64 {
+        let (num, den) = level_timing(self.level);
+        let scaled = clocks * u64::from(num) + self.timing_rem;
         self.timing_rem = scaled % u64::from(den);
         scaled / u64::from(den)
     }
@@ -3165,19 +3209,31 @@ impl Cpu386 {
                     }
                 };
                 // JIT admission: a compiled region stamped on this line runs natively instead of
-                // the interpreted continuation. Always `None` until the region compiler lands;
-                // this read+branch IS the whole per-continuation dispatch cost and stays in the
-                // measured A/B even as a no-op.
+                // the interpreted continuation, occupying one loop iteration; the loop's own
+                // break checks below then fire at exactly the boundary the region stopped at.
+                // The probe read+branch is the whole per-continuation dispatch cost.
                 #[cfg(feature = "jit")]
-                if let Some(_region) = self.decode_cache.region_at(lin, cs.default_size_32) {
-                    unreachable!("no region compiler installs regions yet");
+                let region_outcome = self.try_region_continuation(
+                    bus,
+                    lin,
+                    cs.default_size_32,
+                    total,
+                    bus_at_entry,
+                    cap,
+                )?;
+                #[cfg(not(feature = "jit"))]
+                let region_outcome: Option<CycleOutcome> = None;
+                match region_outcome {
+                    Some(outcome) => outcome,
+                    None => {
+                        // A continuation skips cycle_no_interrupt_check (which resets this
+                        // field to 0 for a fresh first instruction), so set it explicitly:
+                        // total is exactly the prior instructions' charge in this run, not
+                        // including the continuation about to execute.
+                        self.core_clocks_so_far = total;
+                        self.run_one_cached(bus, &insn, lin)?
+                    }
                 }
-                // A continuation skips cycle_no_interrupt_check (which resets this
-                // field to 0 for a fresh first instruction), so set it explicitly:
-                // total is exactly the prior instructions' charge in this run, not
-                // including the continuation about to execute.
-                self.core_clocks_so_far = total;
-                self.run_one_cached(bus, &insn, lin)?
             };
             total += u64::from(outcome.core_clocks);
             // The post-instruction break checks run in the SAME ORDER the old per-instruction machine
@@ -3217,6 +3273,168 @@ impl Cpu386 {
             core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,
         })
+    }
+
+    /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on
+    /// the forced admission address) try to compile/re-stamp one first. `Ok(None)` means "no
+    /// region ran"; the caller falls back to the interpreted continuation.
+    #[cfg(feature = "jit")]
+    fn try_region_continuation<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        d: bool,
+        total: u64,
+        bus_at_entry: u64,
+        cap: u64,
+    ) -> Result<Option<CycleOutcome>, CpuError> {
+        let idx = match self.decode_cache.region_at(lin, d) {
+            Some(idx) => idx,
+            None => {
+                // Forced admission (spike): only the IZARRAVM_JIT_REGION address is ever
+                // compiled, so this compare is the entire admission cost on the miss path.
+                if jit_forced_region_lin() != Some(lin) {
+                    return Ok(None);
+                }
+                let Some(idx) = jit::drawcolumn::try_admit(self, lin, d) else {
+                    return Ok(None);
+                };
+                self.decode_cache.stamp_region(lin, d, idx);
+                idx
+            }
+        };
+        self.run_region(bus, idx, lin, d, total, bus_at_entry, cap)
+    }
+
+    /// Execute a compiled region as one continuation of `run_straight_line`. On return the
+    /// loop's own post-checks (halted, step break, interrupt transition, cap) re-fire at the
+    /// exact boundary the region stopped at, so break attribution and batch semantics stay
+    /// interpreter-identical. `Ok(None)` = an entry precondition failed, interpret instead.
+    ///
+    /// Deferred-at-exit accounting (one `scale_clocks` batch, `elapsed_clocks`,
+    /// `perf.instructions`, ring-0 residency) is sound because no admitted shape reads any of
+    /// it mid-region (see the matcher's invariants in `jit::drawcolumn`) and the batch equals
+    /// the per-instruction sums by the remainder-carry identity.
+    #[cfg(feature = "jit")]
+    #[allow(clippy::too_many_arguments)]
+    fn run_region<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        idx: std::num::NonZeroU32,
+        lin: u32,
+        d: bool,
+        total: u64,
+        bus_at_entry: u64,
+        cap: u64,
+    ) -> Result<Option<CycleOutcome>, CpuError> {
+        // Preconditions the region cannot honor per instruction: profiling and diff-trace
+        // sample every instruction, and a live STI shadow could make an interrupt newly
+        // serviceable after the FIRST slot, a mid-region boundary the run loop cannot see.
+        if self.profile.enabled || diff_trace_enabled() || self.interrupt_shadow {
+            return Ok(None);
+        }
+        let eip = self.registers.eip;
+        let cs_limit = self.registers.cs().limit;
+        let generation = self.decode_cache.generation;
+        let ring0 = self.is_ring0_protected();
+        let (num, den) = level_timing(self.level);
+        let rem0 = self.timing_rem;
+        let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
+        let (entry, ctx_ptr) = {
+            let Some(region) = self.jit_regions.get_mut(idx) else {
+                return Ok(None);
+            };
+            if region.entry_lin != lin || region.d != d {
+                return Ok(None);
+            }
+            let ctx = &mut *region.ctx;
+            // Every slot must pass the same live CS-limit check its interpreted continuation
+            // would have (limits cannot change inside: no CS writer is admitted).
+            for slot in &ctx.slots {
+                let slot_eip = eip.wrapping_add(slot.lin.wrapping_sub(lin));
+                if !Self::fetch_within_limit(slot_eip, slot.insn.len, cs_limit) {
+                    return Ok(None);
+                }
+            }
+            ctx.step_fn = Some(step_fn);
+            ctx.entry_eip = eip;
+            ctx.raw_clocks = 0;
+            ctx.insn_count = 0;
+            ctx.run_total_at_entry = total;
+            ctx.bus_at_run_start = bus_at_entry;
+            ctx.cap = cap;
+            ctx.rem0 = rem0;
+            ctx.scale_num = num;
+            ctx.scale_den = den;
+            ctx.entry_generation = generation;
+            ctx.exit = jit::step::RegionExitKind::Boundary;
+            ctx.fault = None;
+            ctx.halted = false;
+            (region.entry, std::ptr::from_mut(ctx))
+        };
+        // SAFETY: the emitted code only forwards these pointers to `region_step::<B>`, whose
+        // contract this call establishes: `self` and `bus` stay live `&mut` for the whole call
+        // (no other reference to either exists here), `ctx` is the running region's boxed
+        // mailbox (a separate allocation from `self`, so the step function's two reborrows are
+        // disjoint; nothing reachable from the execute dispatch touches `jit_regions`), and `B`
+        // is the concrete bus type behind the erased pointer.
+        unsafe {
+            (entry)(
+                std::ptr::from_mut(self),
+                (std::ptr::from_mut(bus)).cast(),
+                ctx_ptr,
+            );
+        }
+        let (raw, count, halted, fault) = {
+            let region = self
+                .jit_regions
+                .get_mut(idx)
+                .expect("the region that just ran is still installed");
+            let ctx = &mut *region.ctx;
+            (ctx.raw_clocks, ctx.insn_count, ctx.halted, ctx.fault.take())
+        };
+        let charged = self.scale_clocks_batch(raw);
+        self.elapsed_clocks += charged;
+        self.perf.instructions += u64::from(count);
+        self.perf.jit_region_entries += 1;
+        self.perf.jit_region_insns += u64::from(count);
+        if ring0 {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        let mut out = charged;
+        if let Some((start_eip, fault)) = fault {
+            match fault {
+                InternalFault::Cpu(error) => return Err(error),
+                // finish_instruction's Exception arm, minus the CS restore (no admitted shape
+                // can change CS mid-region): rewind to the faulting instruction, deliver, and
+                // charge the interpreter's 59-clock delivery cost.
+                InternalFault::Exception { vector, error_code } => {
+                    self.set_eip(start_eip);
+                    self.deliver_exception(bus, vector, error_code, false)
+                        .map_err(|fault| match fault {
+                            InternalFault::Cpu(error) => error,
+                            InternalFault::Exception {
+                                vector: nested_vector,
+                                ..
+                            } => CpuError::NestedFaultDuringDelivery {
+                                original_vector: vector,
+                                nested_vector,
+                            },
+                        })?;
+                    let charged_fault = self.scale_clocks(59);
+                    self.elapsed_clocks += charged_fault;
+                    self.perf.instructions += 1;
+                    if self.is_ring0_protected() {
+                        self.perf.monitor_resident_core_clocks += charged_fault;
+                    }
+                    out += charged_fault;
+                }
+            }
+        }
+        Ok(Some(CycleOutcome {
+            core_clocks: out.min(u64::from(u32::MAX)) as u32,
+            halted,
+        }))
     }
 
     /// Execute one already-decoded cached instruction as a straight-line continuation. Consumes the
@@ -31920,5 +32138,501 @@ mod tests {
             "the I/O-bitmap trap must be read through the aliased TSS mapping"
         );
         assert_eq!(cpu.registers.cs().selector, R0_CS);
+    }
+
+    /// Differential tests for the compiled loop-region (spike 4): every observable the
+    /// interpreter produces (architectural state, bus trace, clock totals, perf attribution)
+    /// must be byte-identical with the region admitted. The guest program is the exact
+    /// R_DrawColumn shape from the Doom census, relocated to low memory.
+    #[cfg(feature = "jit")]
+    mod jit_region {
+        use super::*;
+
+        const ENTRY: u32 = 0x100;
+        const NOP_STARTER: u32 = 0xff;
+        const COUNT_ADDR: usize = 0x400;
+        const PATCHER: u32 = 0x140;
+        const STEP_IMM: u32 = 0x0133_7c00;
+        const PATCHED_IMM: u32 = 0x0066_7c00;
+
+        /// The 51-byte loop (see jit::drawcolumn's shape table), a HLT terminator at the
+        /// fall-through, and the two-store self-patcher at 0x140 that rewrites both
+        /// `add ebp,imm32` immediates exactly the way Doom's setup code does.
+        fn program() -> Vec<u8> {
+            let mut m = vec![0u8; 0x1000];
+            m[NOP_STARTER as usize] = 0x90;
+            let loop_bytes: [u8; 0x33] = [
+                0x8b, 0xcd, // mov ecx,ebp
+                0x81, 0xc5, 0x00, 0x7c, 0x33, 0x01, // add ebp,STEP_IMM (imm at 0x104)
+                0x88, 0x07, // mov [edi],al
+                0xc1, 0xe9, 0x19, // shr ecx,25
+                0x8b, 0xd5, // mov edx,ebp
+                0x81, 0xc5, 0x00, 0x7c, 0x33, 0x01, // add ebp,STEP_IMM (imm at 0x111)
+                0x88, 0x5f, 0x50, // mov [edi+0x50],bl
+                0xc1, 0xea, 0x19, // shr edx,25
+                0x8a, 0x04, 0x0e, // mov al,[esi+ecx]
+                0x81, 0xc7, 0xa0, 0x00, 0x00, 0x00, // add edi,0xa0
+                0x8a, 0x1c, 0x16, // mov bl,[esi+edx]
+                0xff, 0x0d, 0x00, 0x04, 0x00, 0x00, // dec dword [0x400]
+                0x8a, 0x00, // mov al,[eax]
+                0x8a, 0x1b, // mov bl,[ebx]
+                0x75, 0xcd, // jnz ENTRY (rel8 -0x33)
+            ];
+            m[ENTRY as usize..ENTRY as usize + 0x33].copy_from_slice(&loop_bytes);
+            m[0x133] = 0xf4; // HLT at the loop fall-through
+            // Patcher: mov dword [0x104],PATCHED_IMM ; mov dword [0x111],PATCHED_IMM ; HLT.
+            let p = PATCHER as usize;
+            m[p..p + 10]
+                .copy_from_slice(&[0xc7, 0x05, 0x04, 0x01, 0x00, 0x00, 0x00, 0x7c, 0x66, 0x00]);
+            m[p + 10..p + 20]
+                .copy_from_slice(&[0xc7, 0x05, 0x11, 0x01, 0x00, 0x00, 0x00, 0x7c, 0x66, 0x00]);
+            m[p + 20] = 0xf4;
+            // Texture bytes at 0x300..0x380 (indexed by ebp>>25) and the colormap they point
+            // into at 0x200..0x280 (the double indirection [eax]/[ebx] after AL/BL replace the
+            // low byte of 0x200).
+            for i in 0..0x80usize {
+                m[0x300 + i] = 0x20 + (i as u8 & 0x1f);
+                m[0x200 + i] = 0x80 ^ (i as u8);
+            }
+            // Real-mode IVT vector 13 (#GP) -> 0:0xB00, HLT handler (the fault test).
+            m[13 * 4..13 * 4 + 2].copy_from_slice(&0x0b00u16.to_le_bytes());
+            m[0xb00] = 0xf4;
+            m
+        }
+
+        fn fresh_cpu(ds_limit: u32) -> Cpu386 {
+            let mut cpu = Cpu386::default();
+            cpu.set_level(CpuLevel::I586);
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            let mut cs = cpu.registers.cs();
+            cs.default_size_32 = true; // the shape is d=32 code
+            cpu.registers.set_segment(SegmentIndex::Cs, cs);
+            let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+            ds.limit = ds_limit;
+            cpu.registers.set_segment(SegmentIndex::Ds, ds);
+            cpu
+        }
+
+        /// Reset the guest to the canonical loop entry state with `count` iterations to run.
+        fn arm_loop(cpu: &mut Cpu386, bus: &mut TestBus, count: u32) {
+            cpu.registers.eip = NOP_STARTER;
+            cpu.registers.set_esp(0x0700);
+            cpu.write_gpr32(0, 0x200); // eax
+            cpu.write_gpr32(1, 0); // ecx
+            cpu.write_gpr32(2, 0); // edx
+            cpu.write_gpr32(3, 0x200); // ebx
+            cpu.write_gpr32(5, 0x0100_0000); // ebp
+            cpu.write_gpr32(6, 0x300); // esi
+            cpu.write_gpr32(7, 0x500); // edi
+            bus.memory[COUNT_ADDR..COUNT_ADDR + 4].copy_from_slice(&count.to_le_bytes());
+        }
+
+        /// Drive `run_straight_line` (the machine batch seam) until a run halts. Returns the
+        /// per-call scaled clock totals so cap-boundary shapes can be compared A/B too.
+        fn drive_to_halt(cpu: &mut Cpu386, bus: &mut TestBus, cap: u64) -> Vec<(u32, u32)> {
+            let mut calls = Vec::new();
+            for _ in 0..10_000 {
+                let outcome = cpu.run_straight_line(bus, cap).expect("no hard bus error");
+                calls.push((outcome.core_clocks, cpu.registers.eip));
+                if outcome.halted {
+                    return calls;
+                }
+            }
+            panic!("guest never halted");
+        }
+
+        /// Warm both CPUs identically (fills the decode cache), admit + stamp the region on
+        /// `jit` only, and assert the warm phases were identical.
+        fn warm_and_admit(
+            interp: &mut Cpu386,
+            bus_i: &mut TestBus,
+            jit: &mut Cpu386,
+            bus_j: &mut TestBus,
+        ) -> std::num::NonZeroU32 {
+            arm_loop(interp, bus_i, 2);
+            arm_loop(jit, bus_j, 2);
+            drive_to_halt(interp, bus_i, u64::MAX);
+            drive_to_halt(jit, bus_j, u64::MAX);
+            assert_eq!(interp, jit, "warm phases must match before admission");
+            let idx = jit::drawcolumn::try_admit(jit, ENTRY, true)
+                .expect("the warmed decode cache matches the drawcolumn shape");
+            let region = jit.jit_regions.get_mut(idx).unwrap();
+            assert_eq!(region.ctx.slots[1].insn.imm, STEP_IMM);
+            assert_eq!(region.ctx.slots[5].insn.imm, STEP_IMM);
+            jit.decode_cache.stamp_region(ENTRY, true, idx);
+            idx
+        }
+
+        fn assert_identical(interp: &Cpu386, bus_i: &TestBus, jit_cpu: &Cpu386, bus_j: &TestBus) {
+            assert_eq!(interp, jit_cpu, "architectural + clock state diverged");
+            assert_eq!(
+                interp.elapsed_clocks, jit_cpu.elapsed_clocks,
+                "elapsed guest clocks diverged"
+            );
+            assert_eq!(
+                interp.timing_rem, jit_cpu.timing_rem,
+                "scale remainder diverged"
+            );
+            assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
+            assert_eq!(
+                bus_i.trace.cycles(),
+                bus_j.trace.cycles(),
+                "bus cycle trace diverged"
+            );
+            let (pi, pj) = (interp.perf_counters(), jit_cpu.perf_counters());
+            assert_eq!(
+                pi.instructions, pj.instructions,
+                "retired instruction count diverged"
+            );
+            assert_eq!(
+                (pi.brk_cap, pi.brk_step, pi.brk_halt, pi.brk_interrupt),
+                (pj.brk_cap, pj.brk_step, pj.brk_halt, pj.brk_interrupt),
+                "run break attribution diverged"
+            );
+        }
+
+        #[test]
+        fn region_run_is_byte_identical_to_the_interpreter() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+
+            arm_loop(&mut interp, &mut bus_i, 8);
+            arm_loop(&mut jit_cpu, &mut bus_j, 8);
+            let calls_i = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            let calls_j = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+
+            assert_eq!(calls_i, calls_j, "per-run outcomes diverged");
+            assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+            let perf = jit_cpu.perf_counters();
+            assert!(perf.jit_region_entries > 0, "the region never executed");
+            assert!(
+                perf.jit_region_insns >= 8 * 15,
+                "the region should have retired the loop's instructions, got {}",
+                perf.jit_region_insns
+            );
+            assert_eq!(interp.perf_counters().jit_region_entries, 0);
+        }
+
+        #[test]
+        fn region_breaks_at_the_interpreter_cap_boundary() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+
+            // Small caps force many mid-loop breaks; every break must land both executions on
+            // the same eip with the same charged total (compared per call via drive_to_halt's
+            // outcome log). Odd caps exercise the scale-remainder threading too.
+            for cap in [7u64, 13, 50] {
+                arm_loop(&mut interp, &mut bus_i, 14);
+                arm_loop(&mut jit_cpu, &mut bus_j, 14);
+                let calls_i = drive_to_halt(&mut interp, &mut bus_i, cap);
+                let calls_j = drive_to_halt(&mut jit_cpu, &mut bus_j, cap);
+                assert_eq!(calls_i, calls_j, "cap {cap}: break boundaries diverged");
+                assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+            }
+            assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+        }
+
+        #[test]
+        fn region_fault_mid_loop_delivers_identically() {
+            // DS limit 0x5FF: the third iteration's `mov [edi],al` (edi = 0x640) raises #GP,
+            // mid-region, on the write half of the unrolled pair. Both executions must rewind,
+            // deliver through IVT 13, and halt in the handler with identical state.
+            let mut interp = fresh_cpu(0x5ff);
+            let mut jit_cpu = fresh_cpu(0x5ff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+
+            arm_loop(&mut interp, &mut bus_i, 100);
+            arm_loop(&mut jit_cpu, &mut bus_j, 100);
+            let calls_i = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            let calls_j = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+
+            assert_eq!(calls_i, calls_j);
+            assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+            assert_eq!(
+                jit_cpu.registers.eip, 0xb01,
+                "both sides must halt inside the #GP handler"
+            );
+            assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+        }
+
+        #[test]
+        fn smc_repatch_restamps_with_fresh_immediates() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            let idx = warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+
+            // Run the loop with the region live, then execute the guest self-patcher: its
+            // stores hit watched code bytes, bump the decode generation, and kill the stamp.
+            arm_loop(&mut interp, &mut bus_i, 3);
+            arm_loop(&mut jit_cpu, &mut bus_j, 3);
+            drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+            let entries_before = jit_cpu.perf_counters().jit_region_entries;
+            assert!(entries_before > 0);
+            for (cpu, bus) in [(&mut interp, &mut bus_i), (&mut jit_cpu, &mut bus_j)] {
+                cpu.registers.eip = PATCHER;
+                drive_to_halt(cpu, bus, u64::MAX);
+            }
+            assert_eq!(bus_j.memory[0x104..0x108], PATCHED_IMM.to_le_bytes());
+
+            // Re-warm interpreted (the dead line means no region runs), then re-admit: the
+            // matcher must find the SAME region and refresh its slot table wholesale, patched
+            // immediates riding along in the fresh decodes.
+            arm_loop(&mut interp, &mut bus_i, 2);
+            arm_loop(&mut jit_cpu, &mut bus_j, 2);
+            drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+            assert_eq!(
+                jit_cpu.perf_counters().jit_region_entries,
+                entries_before,
+                "a dead stamp must keep the region cold until re-admission"
+            );
+            let idx2 = jit::drawcolumn::try_admit(&mut jit_cpu, ENTRY, true)
+                .expect("the re-warmed shape still matches");
+            assert_eq!(idx2, idx, "re-admission must reuse the installed region");
+            jit_cpu.decode_cache.stamp_region(ENTRY, true, idx2);
+            {
+                let region = jit_cpu.jit_regions.get_mut(idx2).unwrap();
+                assert_eq!(region.ctx.slots[1].insn.imm, PATCHED_IMM);
+                assert_eq!(region.ctx.slots[5].insn.imm, PATCHED_IMM);
+            }
+
+            arm_loop(&mut interp, &mut bus_i, 6);
+            arm_loop(&mut jit_cpu, &mut bus_j, 6);
+            let calls_i = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            let calls_j = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+            assert_eq!(calls_i, calls_j);
+            assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+            assert!(jit_cpu.perf_counters().jit_region_entries > entries_before);
+        }
+
+        #[test]
+        fn profiling_falls_back_to_the_interpreter() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+
+            jit_cpu.profile.enable(1_000_000);
+            arm_loop(&mut interp, &mut bus_i, 4);
+            arm_loop(&mut jit_cpu, &mut bus_j, 4);
+            drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+
+            assert_eq!(
+                jit_cpu.perf_counters().jit_region_entries,
+                0,
+                "profiled runs must not enter the region (per-instruction sampling)"
+            );
+            assert_eq!(interp.registers, jit_cpu.registers);
+            assert_eq!(bus_i.memory, bus_j.memory);
+        }
+
+        /// A `TestBus` wrapper adding the two machine-bus behaviors this port-free loop can never
+        /// raise on `TestBus` itself: `requires_step_break` arms on the Nth memory write
+        /// (standing in for the `io_touched` edge; the driver clears it per run like the machine
+        /// batch loop), and `in_batch_scaled_bus_clocks` reports a synthetic monotonic count (2
+        /// per bus access) so the run cap's bus-growth term is live, as it is at 486/586 on the
+        /// real machine bus.
+        struct InstrumentedBus {
+            inner: TestBus,
+            writes_until_break: u32,
+            armed: bool,
+            bus_clocks: u64,
+        }
+
+        impl InstrumentedBus {
+            fn new(memory: Vec<u8>) -> Self {
+                Self {
+                    inner: TestBus::with_memory(memory),
+                    writes_until_break: u32::MAX, // step break disarmed
+                    armed: false,
+                    bus_clocks: 0,
+                }
+            }
+        }
+
+        impl CpuBus for InstrumentedBus {
+            fn read_memory(
+                &mut self,
+                address: u32,
+                width: BusWidth,
+                kind: BusAccessKind,
+            ) -> Result<u32, BusError> {
+                self.bus_clocks += 2;
+                self.inner.read_memory(address, width, kind)
+            }
+            fn write_memory(
+                &mut self,
+                address: u32,
+                width: BusWidth,
+                value: u32,
+                kind: BusAccessKind,
+            ) -> Result<(), BusError> {
+                self.bus_clocks += 2;
+                if self.writes_until_break > 0 {
+                    self.writes_until_break -= 1;
+                    if self.writes_until_break == 0 {
+                        self.armed = true;
+                    }
+                }
+                self.inner.write_memory(address, width, value, kind)
+            }
+            fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
+                self.inner.prefetch_memory(address, out)
+            }
+            fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
+                self.bus_clocks += 2;
+                self.inner.charge_instruction_fetch(address)
+            }
+            fn in_batch_scaled_bus_clocks(&self) -> u64 {
+                self.bus_clocks
+            }
+            fn read_io(
+                &mut self,
+                port: u16,
+                width: BusWidth,
+                core_clocks_so_far: u64,
+                cpu_is_ring0_pm: bool,
+            ) -> Result<u32, BusError> {
+                self.inner
+                    .read_io(port, width, core_clocks_so_far, cpu_is_ring0_pm)
+            }
+            fn write_io(
+                &mut self,
+                port: u16,
+                width: BusWidth,
+                value: u32,
+                cpu_is_ring0_pm: bool,
+            ) -> Result<(), BusError> {
+                self.inner.write_io(port, width, value, cpu_is_ring0_pm)
+            }
+            fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError> {
+                self.inner.interrupt_acknowledge(vector, ax)
+            }
+            fn requires_step_break(&self) -> bool {
+                self.armed || self.inner.requires_step_break()
+            }
+        }
+
+        #[test]
+        fn region_breaks_at_the_step_break_boundary() {
+            // Arm the break on the 5th guest write: mid-iteration-2, on the region's slot-6
+            // store. Both executions must end that run at exactly that instruction boundary.
+            let run = |admit: bool| {
+                let mut cpu = fresh_cpu(0xffff);
+                let mut bus = InstrumentedBus::new(program());
+                arm_loop(&mut cpu, &mut bus.inner, 2);
+                for _ in 0..1000 {
+                    if cpu.run_straight_line(&mut bus, u64::MAX).unwrap().halted {
+                        break;
+                    }
+                }
+                if admit {
+                    let idx = jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).unwrap();
+                    cpu.decode_cache.stamp_region(ENTRY, true, idx);
+                }
+                arm_loop(&mut cpu, &mut bus.inner, 6);
+                bus.writes_until_break = 5;
+                let mut boundaries = Vec::new();
+                for _ in 0..1000 {
+                    bus.armed = false; // the machine batch loop clears io_touched per batch
+                    let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+                    boundaries.push((outcome.core_clocks, cpu.registers.eip));
+                    if outcome.halted {
+                        break;
+                    }
+                }
+                (boundaries, cpu, bus)
+            };
+            let (bounds_i, cpu_i, bus_i) = run(false);
+            let (bounds_j, cpu_j, bus_j) = run(true);
+            assert_eq!(bounds_i, bounds_j, "step-break boundaries diverged");
+            assert_eq!(cpu_i, cpu_j);
+            assert_eq!(bus_i.inner.memory, bus_j.inner.memory);
+            assert_eq!(bus_i.inner.trace.cycles(), bus_j.inner.trace.cycles());
+            assert!(cpu_j.perf_counters().jit_region_entries > 0);
+        }
+
+        #[test]
+        fn cap_bus_growth_term_breaks_identically_on_a_clock_reporting_bus() {
+            // The run cap check adds the bus's in-batch scaled clock GROWTH to the core total
+            // (nonzero on the real 486/586 machine bus). With the synthetic 2-clocks-per-access
+            // counter live, the region's per-slot cap check must break at exactly the
+            // interpreter's instruction boundary.
+            let run = |admit: bool, cap: u64| {
+                let mut cpu = fresh_cpu(0xffff);
+                let mut bus = InstrumentedBus::new(program());
+                arm_loop(&mut cpu, &mut bus.inner, 2);
+                for _ in 0..1000 {
+                    if cpu.run_straight_line(&mut bus, u64::MAX).unwrap().halted {
+                        break;
+                    }
+                }
+                if admit {
+                    let idx = jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).unwrap();
+                    cpu.decode_cache.stamp_region(ENTRY, true, idx);
+                }
+                arm_loop(&mut cpu, &mut bus.inner, 10);
+                let mut boundaries = Vec::new();
+                for _ in 0..10_000 {
+                    let outcome = cpu.run_straight_line(&mut bus, cap).unwrap();
+                    boundaries.push((outcome.core_clocks, cpu.registers.eip, bus.bus_clocks));
+                    if outcome.halted {
+                        break;
+                    }
+                }
+                (boundaries, cpu, bus)
+            };
+            for cap in [60u64, 145, 400] {
+                let (bounds_i, cpu_i, bus_i) = run(false, cap);
+                let (bounds_j, cpu_j, bus_j) = run(true, cap);
+                assert_eq!(
+                    bounds_i, bounds_j,
+                    "cap {cap}: bus-growth boundaries diverged"
+                );
+                assert_eq!(cpu_i, cpu_j);
+                assert_eq!(bus_i.inner.trace.cycles(), bus_j.inner.trace.cycles());
+                assert!(cpu_j.perf_counters().jit_region_entries > 0);
+            }
+        }
+
+        #[test]
+        fn matcher_rejects_a_mutated_shape() {
+            // Same program with the first SHR count byte changed (0x19 -> 0x18): still valid
+            // guest code, but not the pinned shape.
+            let mut memory = program();
+            memory[0x10c] = 0x18;
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(memory);
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            assert!(jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).is_none());
+        }
+
+        #[test]
+        fn cold_decode_lines_defer_admission() {
+            // Before any execution the decode cache is empty: admission must return None
+            // rather than reading guest memory itself.
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program());
+            arm_loop(&mut cpu, &mut bus, 1);
+            assert!(jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).is_none());
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            assert!(jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).is_some());
+        }
     }
 }
