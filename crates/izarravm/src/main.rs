@@ -1710,7 +1710,22 @@ fn run_boot_hdd_folder(
         // LINEAR addresses; walk the live page tables (a plain physical-read PDE/PTE walk,
         // 4 MB pages included) so a paged guest (JemmEx maps Doom NON-identity - the
         // identity-assumed first cut dumped unrelated data bytes) yields real code.
-        if let Some(&(top, _)) = snapshot.hot_addrs.first() {
+        // IZARRAVM_DUMP_LINEAR=<hex>[,<len-hex>] overrides the dump window (default: around
+        // the run's own hottest address). Needed because the hottest-address LIST wants a
+        // demo-COMPLETE budget, but the byte dump wants a mid-demo stop (the walk uses the
+        // stop-time CR3; a post-demo stop lands in a V86/monitor context that does not map
+        // the game's pages) - two different runs, so the second must be told where to look.
+        let dump_override = std::env::var("IZARRAVM_DUMP_LINEAR").ok().and_then(|v| {
+            let mut parts = v.split(',');
+            let addr = u32::from_str_radix(parts.next()?.trim_start_matches("0x"), 16).ok()?;
+            let len = parts
+                .next()
+                .and_then(|l| u32::from_str_radix(l.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0x180);
+            Some((addr, len))
+        });
+        let target = dump_override.or_else(|| snapshot.hot_addrs.first().map(|&(t, _)| (t, 0x180)));
+        if let Some((top, dump_len)) = target {
             let read_u32 = |machine: &mut Machine, addr: u32| -> u32 {
                 u32::from_le_bytes([
                     machine.read_physical_u8(addr),
@@ -1742,7 +1757,7 @@ fn run_boot_hdd_folder(
             let start = top.saturating_sub(0x40) & !0xf;
             println!();
             println!("=== bytes around hottest address {top:08X} (paging-walked linear) ===");
-            for row in 0..0x18 {
+            for row in 0..dump_len.div_ceil(16) {
                 let base = start + row * 16;
                 let bytes: Vec<String> = (0..16)
                     .map(|i| match read_linear(&mut machine, base + i) {
