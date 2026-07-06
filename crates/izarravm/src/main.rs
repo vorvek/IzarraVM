@@ -1114,6 +1114,28 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
             opcode.memory_instructions,
         );
     }
+
+    if !snapshot.hot_addrs.is_empty() {
+        let total_samples: u64 = snapshot
+            .hot_addrs
+            .iter()
+            .map(|&(_, s)| s)
+            .sum::<u64>()
+            .max(1);
+        println!();
+        println!(
+            "=== hot sampled addresses (top {}, sample_stride={}) ===",
+            snapshot.hot_addrs.len(),
+            snapshot.sample_stride
+        );
+        println!("{:<10} {:>9} {:>8}", "linear", "samples", "top64%");
+        for &(lin, samples) in &snapshot.hot_addrs {
+            println!(
+                "{lin:08X}   {samples:>9} {:>7.2}%",
+                100.0 * samples as f64 / total_samples as f64
+            );
+        }
+    }
 }
 
 fn format_profile_opcode(opcode: u16) -> String {

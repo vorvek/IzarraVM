@@ -1044,6 +1044,8 @@ pub struct CpuProfileSnapshot {
     pub sample_stride: u64,
     pub groups: Vec<CpuProfileBucket>,
     pub opcodes: Vec<CpuOpcodeProfileBucket>,
+    /// Hottest sampled instruction linear addresses, `(linear, samples)`, descending; top 64.
+    pub hot_addrs: Vec<(u32, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1089,6 +1091,9 @@ struct CpuProfileState {
     until_sample: u64,
     groups: [CpuProfileBucketState; CPU_PROFILE_GROUPS],
     opcodes: std::collections::HashMap<u16, CpuOpcodeProfileBucketState>,
+    /// Sampled instruction linear addresses (one entry per SAMPLED instruction, so one hash op
+    /// per stride, not per instruction): the hot-loop finder for the JIT's region selection.
+    addrs: std::collections::HashMap<u32, u64>,
 }
 
 impl Default for CpuProfileState {
@@ -1099,6 +1104,7 @@ impl Default for CpuProfileState {
             until_sample: 1,
             groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
             opcodes: std::collections::HashMap::new(),
+            addrs: std::collections::HashMap::new(),
         }
     }
 }
@@ -1694,6 +1700,7 @@ impl CpuProfileState {
             until_sample: 1,
             groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
             opcodes: std::collections::HashMap::new(),
+            addrs: std::collections::HashMap::new(),
         };
     }
 
@@ -1714,11 +1721,15 @@ impl CpuProfileState {
         form: CpuProfileOperandForm,
         guest_core_clocks: u64,
         start: Option<std::time::Instant>,
+        lin: u32,
     ) {
         if !self.enabled {
             return;
         }
         let sample_wall_ns = start.map(|start| duration_ns_u64(start.elapsed()));
+        if sample_wall_ns.is_some() {
+            *self.addrs.entry(lin).or_insert(0) += 1;
+        }
         let bucket = &mut self.groups[group.profile_index()];
         bucket.instructions += 1;
         bucket.guest_core_clocks += guest_core_clocks;
@@ -1782,6 +1793,13 @@ impl CpuProfileState {
             })
             .collect::<Vec<_>>();
         opcodes.sort_by_key(|bucket| bucket.opcode);
+        let mut hot_addrs = self
+            .addrs
+            .iter()
+            .map(|(&lin, &samples)| (lin, samples))
+            .collect::<Vec<_>>();
+        hot_addrs.sort_by_key(|&(lin, samples)| (std::cmp::Reverse(samples), lin));
+        hot_addrs.truncate(64);
         CpuProfileSnapshot {
             sample_stride: self.sample_stride,
             groups: DecodeGroup::ALL
@@ -1798,6 +1816,7 @@ impl CpuProfileState {
                 })
                 .collect(),
             opcodes,
+            hot_addrs,
         }
     }
 }
@@ -2916,8 +2935,13 @@ impl Cpu386 {
             self.perf.monitor_resident_core_clocks += charged;
         }
         if let Some((group, opcode, form)) = profile_key {
+            // The hot-address histogram wants the linear address of the instruction START.
+            // A far transfer already moved the CS base by now, mis-attributing that one
+            // sample; histogram noise, accepted (this is a host-side loop finder, not
+            // architectural state).
+            let lin = self.registers.cs().base.wrapping_add(start_eip);
             self.profile
-                .record(group, opcode, form, charged, profile_start);
+                .record(group, opcode, form, charged, profile_start, lin);
         }
         if diff_trace_enabled() {
             self.emit_diff_trace_line(start_cs, start_eip);
