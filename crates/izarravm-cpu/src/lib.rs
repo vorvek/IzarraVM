@@ -1876,6 +1876,13 @@ struct DecodeLine {
     tag: u32,
     generation: u32,
     insn: Option<DecodedInsn>,
+    /// 1-based index into the JIT's compiled-region table, `None` when no region starts at this
+    /// line's address. Lives IN the decode line (not a separate map) so region lookup rides the
+    /// `decode_cache.get` the run loop already does every continuation: admission costs zero
+    /// extra lookups (settled invariant 1 from the seed post-mortem). `put` clears it, so a
+    /// re-decode (generation bump, SMC) drops the stale region for free.
+    #[cfg(feature = "jit")]
+    jit_region: Option<std::num::NonZeroU32>,
 }
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
@@ -1960,7 +1967,23 @@ impl DecodeCache {
             tag: lin,
             generation: self.generation,
             insn: Some(insn),
+            #[cfg(feature = "jit")]
+            jit_region: None,
         };
+    }
+
+    /// The compiled-region index stamped on the live line for `lin`, if any. A second load of
+    /// the same direct-mapped line `get` just hit (still in L1), not a separate map: this is the
+    /// entire JIT admission check the continuation loop pays.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn region_at(&self, lin: u32) -> Option<std::num::NonZeroU32> {
+        let line = &self.lines[(lin & self.mask) as usize];
+        if line.generation == self.generation && line.tag == lin {
+            line.jit_region
+        } else {
+            None
+        }
     }
 
     /// Invalidate every cached line by advancing the generation. O(1): stamped lines fail the
@@ -2957,6 +2980,14 @@ impl Cpu386 {
                         break;
                     }
                 };
+                // JIT admission: a compiled region stamped on this line runs natively instead of
+                // the interpreted continuation. Always `None` until the region compiler lands;
+                // this read+branch IS the whole per-continuation dispatch cost and stays in the
+                // measured A/B even as a no-op.
+                #[cfg(feature = "jit")]
+                if let Some(_region) = self.decode_cache.region_at(lin) {
+                    unreachable!("no region compiler installs regions yet");
+                }
                 // A continuation skips cycle_no_interrupt_check (which resets this
                 // field to 0 for a fresh first instruction), so set it explicitly:
                 // total is exactly the prior instructions' charge in this run, not

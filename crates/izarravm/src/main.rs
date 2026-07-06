@@ -1666,6 +1666,8 @@ fn run_boot_hdd_folder(
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     if cpu_profile_stride.is_some() {
         print_cpu_profile(&machine.cpu().profile_snapshot());
+        // Run-shape side of the census: insns/run + break reasons for the same run.
+        print_perf_counter_row("hdd-folder", hardware.cpu, machine.cpu().perf_counters());
     }
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
