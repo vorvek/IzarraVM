@@ -10855,8 +10855,10 @@ enum FpOpClass {
     /// DB memory forms: 32-bit FILD/FIST(P) (+f80 loads/stores) - the class the
     /// Quake span rasterizer's fixed-point boundary lives in.
     IntConvert32,
-    /// DF/DA/DE memory forms: 16-bit integer loads/stores/arith (+BCD), the
-    /// conversion shape era compilers emit; far lighter pipe drain in practice.
+    /// DF/DA/DE memory forms: the era-compiler conversion families - DF int16
+    /// loads/stores (+m64 FILD/FISTP under /5 //7, +BCD), DE int16 arith, DA
+    /// int32 arith. Grouped as one calibration knob; the width in the name
+    /// records the dominant DF-int16 shape, not every member's encoding.
     IntConvert16,
     F32Mem,
     F64Mem,
@@ -11117,7 +11119,7 @@ impl Cpu386 {
         } else {
             match opcode {
                 0xdb => FpOpClass::IntConvert32,
-                // DF int16/BCD loads/stores, DA/DE int16-operand arith.
+                // DF int16/m64/BCD loads/stores, DE int16 arith, DA int32 arith.
                 0xda | 0xde | 0xdf => FpOpClass::IntConvert16,
                 0xd8 | 0xd9 => FpOpClass::F32Mem,
                 _ => FpOpClass::F64Mem, // 0xdc | 0xdd
@@ -30767,7 +30769,7 @@ mod tests {
         let fadd_i586 = fadd_elapsed(CpuLevel::I586);
 
         // Both modes share level_timing (1,12); the per-class FP dial is identity at
-        // I486 and Register-class x0.5 at I586 (P5 pairing/issue-rate honesty), so
+        // I486 and Register-class x0.25 at I586 (P5 pairing/issue-rate honesty), so
         // the register FADD charge at 586 must be at most the 486 charge and both
         // must stay nonzero (the fractional carry may not round a cheap op to a
         // permanent zero).

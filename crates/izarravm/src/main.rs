@@ -736,7 +736,11 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 continue;
             }
             let run = run_bench_one(hardware, mode, &bench.source, BENCH_BUDGET)?;
-            if std::env::var_os("IZARRAVM_CPU_PROFILE").is_some() {
+            if std::env::var("IZARRAVM_CPU_PROFILE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some()
+            {
                 println!("--- census {} {} ---", bench.name, mode.canonical_name());
                 print_cpu_profile(&run.cpu_profile);
             }
