@@ -1114,6 +1114,40 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
             opcode.memory_instructions,
         );
     }
+
+    if !snapshot.hot_addrs.is_empty() {
+        let total_samples: u64 = snapshot
+            .hot_addrs
+            .iter()
+            .map(|&(_, s)| s)
+            .sum::<u64>()
+            .max(1);
+        println!();
+        println!(
+            "=== hot sampled addresses (top {}, sample_stride={}) ===",
+            snapshot.hot_addrs.len(),
+            snapshot.sample_stride
+        );
+        println!("{:<10} {:>9} {:>8}", "linear", "samples", "top64%");
+        for &(lin, samples) in &snapshot.hot_addrs {
+            println!(
+                "{lin:08X}   {samples:>9} {:>7.2}%",
+                100.0 * samples as f64 / total_samples as f64
+            );
+        }
+    }
+
+    if !snapshot.smc_flush_blocks.is_empty() {
+        println!();
+        println!(
+            "=== smc flush sources (top {}, 64-byte physical blocks) ===",
+            snapshot.smc_flush_blocks.len()
+        );
+        println!("{:<10} {:>9}", "physical", "flushes");
+        for &(block, flushes) in &snapshot.smc_flush_blocks {
+            println!("{block:08X}   {flushes:>9}");
+        }
+    }
 }
 
 fn format_profile_opcode(opcode: u16) -> String {
@@ -1233,6 +1267,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
     println!(
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
          brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
+         inval[cs/smc/other]={}/{}/{}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}",
@@ -1246,6 +1281,9 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
         perf.brk_interrupt,
         perf.brk_cap,
         perf.brk_halt,
+        perf.decode_inval_cs_load,
+        perf.decode_inval_smc,
+        perf.decode_inval_other,
         perf.data_direct_reads,
         perf.data_slow_reads,
         perf.data_direct_writes,
@@ -1667,6 +1705,9 @@ fn run_boot_hdd_folder(
     if cpu_profile_stride.is_some() {
         print_cpu_profile(&machine.cpu().profile_snapshot());
     }
+    // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
+    // always maintained, so unlike the sampled profile above this print costs nothing.
+    print_perf_counter_row("hdd-folder", hardware.cpu, machine.cpu().perf_counters());
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
     // often exactly the tail we care about -- is silently lost at process exit. This
