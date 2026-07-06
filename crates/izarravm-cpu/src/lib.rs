@@ -2332,15 +2332,17 @@ impl Cpu386 {
         scaled / u64::from(den)
     }
 
-    /// Scale an x87 op's raw core clocks by the active level's FP-timing factor, carrying
-    /// the fractional remainder in `fp_rem` so a cheap FP op is not rounded to zero.
-    /// Mirrors `scale_clocks` exactly but uses `fp_timing` and `fp_rem`. With the current
-    /// identity (1, 1) factor this returns `clocks` unchanged.
-    fn scale_fp_clocks(&mut self, clocks: u32) -> u32 {
-        let (num, den) = fp_timing(self.level);
+    /// Scale an x87 op's raw core clocks by the active level's FP-timing factor for the
+    /// op's class, carrying the fractional remainder in `fp_rem` so a cheap FP op is not
+    /// rounded to zero. Mirrors `scale_clocks` but uses `fp_timing_class` and `fp_rem`;
+    /// every class ratio shares the same denominator (FP_TIMING_DEN), so the carried
+    /// remainder stays exact across ops of different classes. With an identity factor
+    /// this returns `clocks` unchanged.
+    fn scale_fp_clocks(&mut self, clocks: u32, class: FpOpClass) -> u32 {
+        let num = fp_timing_class(self.level, class);
         let scaled = u64::from(clocks) * u64::from(num) + self.fp_rem;
-        self.fp_rem = scaled % u64::from(den);
-        (scaled / u64::from(den)).min(u64::from(u32::MAX)) as u32
+        self.fp_rem = scaled % u64::from(FP_TIMING_DEN);
+        (scaled / u64::from(FP_TIMING_DEN)).min(u64::from(u32::MAX)) as u32
     }
 
     /// Reported (L1 KB, L2 KB) cache for the live level. The same geometry drives
@@ -10832,24 +10834,72 @@ const fn level_timing(level: CpuLevel) -> (u32, u32) {
     }
 }
 
-/// Per-mode FP-op-clock scalar as (numerator, denominator) — a SEPARATE dial from
-/// `level_timing` so the P55C's faster-than-486 x87 unit can be modeled at I586 without
-/// touching the integer-instruction compute ratio. Identity (1, 1) for 286/386/486 (their
-/// FP rides `level_timing` alone). I586 is `(31, 34)` — x87 ops cost 31/34 of their raw
-/// clocks — CALIBRATED so the Whetstone oracle lands the P55C's 34.5 MFLOPS at 200 MHz
-/// while the era-anchored 486 stays 6.5 (its factor is identity). The factor is near 1
-/// (not the ~1.75x the design predicted) because our Whetstone is bus/integer-bound, not
-/// transcendental-bound: the cheap-x87 timing already lets the 586's faster bus carry most
-/// of the 5.3x 586/486 ratio, so only a small FP nudge remains. Applied in
-/// `scale_fp_clocks` with fractional-remainder carry (exact long division), mirroring the
-/// `scale_clocks` / `timing_rem` pattern exactly. Integer benches (Dhrystone/Sieve) execute
-/// no x87 ops, so this dial leaves them bit-identical.
-const fn fp_timing(level: CpuLevel) -> (u32, u32) {
+/// x87 op classes for the per-class FP-timing dial. The class is derived at the
+/// FPU dispatch tail from (escape opcode, ModRM), so the classifier sees exactly
+/// what the census profiler's opcode rows see:
+/// - `IntConvert`: the int<->fp boundary — every DB/DF/DA MEMORY form (FILD,
+///   FIST(P), FBLD/FBSTP, integer-operand arithmetic). On a real P55C, FIST is
+///   unpairable and drains the FP pipe, exposing the full latency of the chain
+///   that produced the value; a sequential interpreter charges issue cost only,
+///   so this class carries an effective stall surcharge (the Quake span
+///   rasterizer's fixed-point boundary is exactly this traffic).
+/// - `F32Mem` / `F64Mem`: D8/D9 and DC/DD memory forms (f32/f64 load, store,
+///   memory-operand arithmetic).
+/// - `Register`: every mode==3 form — register arithmetic, FXCH, compares,
+///   constants, transcendentals, control ops. P5 pairing and the 1-clock
+///   FADD/FMUL issue rate make this class CHEAPER than the raw 387 clocks.
+/// - `Wait`: the 9B WAIT opcode (Whetstone-era code is full of FWAITs; real P5
+///   treats them as ~free once no exception is pending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FpOpClass {
+    /// DB memory forms: 32-bit FILD/FIST(P) (+f80 loads/stores) - the class the
+    /// Quake span rasterizer's fixed-point boundary lives in.
+    IntConvert32,
+    /// DF/DA/DE memory forms: the era-compiler conversion families - DF int16
+    /// loads/stores (+m64 FILD/FISTP under /5 //7, +BCD), DE int16 arith, DA
+    /// int32 arith. Grouped as one calibration knob; the width in the name
+    /// records the dominant DF-int16 shape, not every member's encoding.
+    IntConvert16,
+    F32Mem,
+    F64Mem,
+    Register,
+    Wait,
+}
+
+/// Common denominator for every `fp_timing_class` ratio: sharing one denominator
+/// keeps the single carried remainder (`fp_rem`) exact across ops of different
+/// classes (a per-op numerator over a fixed base, tunable in 1/8 steps).
+const FP_TIMING_DEN: u32 = 8;
+
+/// Per-mode, per-class FP-op-clock numerator over `FP_TIMING_DEN` — a SEPARATE
+/// dial from `level_timing` so the P55C's x87 pipeline can be modeled at I586
+/// without touching the integer-instruction compute ratio. Identity (8/8) for
+/// 286/386/486: their FP rides `level_timing` alone, keeping the frozen-class
+/// bench bytes and the 486 Whetstone anchor (6.5 MFLOPS) untouched.
+///
+/// The I586 values replace the old flat (31/34) scalar with the class shape the
+/// workload census demanded (dev_docs quake-fps-cal notes): Quake demo1's FP
+/// clocks are conversion/traffic-shaped (FILD/FIST + f32/f64 memory ops) while
+/// Whetstone's are register-arithmetic/transcendental-shaped, and the era
+/// anchors pull those classes in OPPOSITE directions (real P55C-200: Quake
+/// ~42 fps, Whetstone 34.5 MFLOPS). Register-class ops get CHEAPER than raw 387
+/// clocks (U/V pairing, 1-clock FADD/FMUL issue); the int<->fp boundary pays an
+/// effective stall surcharge (see FpOpClass::IntConvert). CALIBRATION
+/// CONSTRAINTS: Whetstone 586 = 34.5 MFLOPS and 486 = 6.5 stay era-exact;
+/// Dhrystone/Sieve run no x87 and stay bit-identical; 286/386 frozen.
+const fn fp_timing_class(level: CpuLevel, class: FpOpClass) -> u32 {
     match level {
-        CpuLevel::I286 => (1, 1),
-        CpuLevel::I386 => (1, 1),
-        CpuLevel::I486 => (1, 1),
-        CpuLevel::I586 => (31, 34),
+        CpuLevel::I286 | CpuLevel::I386 | CpuLevel::I486 => FP_TIMING_DEN,
+        CpuLevel::I586 => match class {
+            // Census-guided, empirically walked against the two era anchors
+            // (Whetstone 586 = 34.5 MFLOPS, Quake demo1 ~42 fps).
+            FpOpClass::IntConvert32 => 272, // x34: conversion drains the FP pipe
+            FpOpClass::IntConvert16 => 256, // x32: FIST16 drains the pipe too, a touch less
+            FpOpClass::F32Mem => 8,         // x1
+            FpOpClass::F64Mem => 8,         // x1
+            FpOpClass::Register => 2,       // x0.25: pairing/issue-rate honesty
+            FpOpClass::Wait => 1,           // x0.125: FWAIT is ~free on a P5
+        },
     }
 }
 
@@ -11038,7 +11088,7 @@ impl Cpu386 {
             // Fall through to the single tail so scale_fp_clocks is applied uniformly.
             let raw = clocks(6);
             return Ok(CycleOutcome {
-                core_clocks: self.scale_fp_clocks(raw.core_clocks),
+                core_clocks: self.scale_fp_clocks(raw.core_clocks, FpOpClass::Wait),
                 halted: raw.halted,
             });
         }
@@ -11061,8 +11111,20 @@ impl Cpu386 {
                 error_code: None,
             });
         }
-        // Single tail: apply the per-mode FP-timing scalar to every x87 op's raw clocks
-        // (WAIT included above). With fp_timing returning (1,1) this is a no-op.
+        // Single tail: apply the per-mode, per-class FP-timing factor to every x87
+        // op's raw clocks (WAIT handled above). Class derivation mirrors the census
+        // profiler's view: register forms vs the three memory-form families.
+        let fp_class = if modrm.mode == 3 {
+            FpOpClass::Register
+        } else {
+            match opcode {
+                0xdb => FpOpClass::IntConvert32,
+                // DF int16/m64/BCD loads/stores, DE int16 arith, DA int32 arith.
+                0xda | 0xde | 0xdf => FpOpClass::IntConvert16,
+                0xd8 | 0xd9 => FpOpClass::F32Mem,
+                _ => FpOpClass::F64Mem, // 0xdc | 0xdd
+            }
+        };
         let outcome = if modrm.mode == 3 {
             self.execute_fpu_register(opcode, modrm)?
         } else {
@@ -11077,7 +11139,7 @@ impl Cpu386 {
             self.execute_fpu_memory(bus, opcode, modrm.reg, mem, insn.operand_size)?
         };
         Ok(CycleOutcome {
-            core_clocks: self.scale_fp_clocks(outcome.core_clocks),
+            core_clocks: self.scale_fp_clocks(outcome.core_clocks, fp_class),
             halted: outcome.halted,
         })
     }
@@ -30706,15 +30768,15 @@ mod tests {
         let fadd_i486 = fadd_elapsed(CpuLevel::I486);
         let fadd_i586 = fadd_elapsed(CpuLevel::I586);
 
-        // Both modes share the same level_timing (1,12) and fp_timing (1,1), so the
-        // scaled FADD clock charge must be identical.
-        assert_eq!(
-            fadd_i486, fadd_i586,
-            "fp_timing identity: FADD elapsed at I486 ({fadd_i486}) must equal I586 ({fadd_i586})"
+        // Both modes share level_timing (1,12); the per-class FP dial is identity at
+        // I486 and Register-class x0.25 at I586 (P5 pairing/issue-rate honesty), so
+        // the register FADD charge at 586 must be at most the 486 charge and both
+        // must stay nonzero (the fractional carry may not round a cheap op to a
+        // permanent zero).
+        assert!(
+            fadd_i586 <= fadd_i486,
+            "per-class fp dial: register FADD at I586 ({fadd_i586}) must not exceed I486 ({fadd_i486})"
         );
-
-        // Sanity: the scaled charge must be > 0 (20 raw clocks × 1/12 carries correctly
-        // over many instructions, but a single FADD with a fresh timing_rem should charge ≥ 1).
         assert!(
             fadd_i486 > 0,
             "FADD must charge at least 1 scaled clock at I486 (got {fadd_i486})"
