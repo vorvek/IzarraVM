@@ -1872,6 +1872,23 @@ struct DecodedInsn {
 /// not the footprint limiter here and the line value is left dense rather than squeezed to 32 bytes.
 const DECODE_CACHE_LINES: usize = 2048;
 
+/// Sweep knob: `IZARRAVM_DECODE_CACHE_LINES=<power of two>` overrides the decode-cache size at
+/// construction. Host-side only (a bigger cache changes wall time, never guest state - hit or
+/// miss produces the identical DecodedInsn and identical clock charges). Read once, cached.
+/// Motivation: the Doom 586 census measured decode_hit=21% / insns/run=1.3 at 2048 lines - the
+/// direct-mapped cache thrashes on a 32-bit pmode code footprint; the bench-derived knee (2048,
+/// tiny real-mode payloads) does not transfer.
+fn decode_cache_lines() -> usize {
+    static LINES: OnceLock<usize> = OnceLock::new();
+    *LINES.get_or_init(|| {
+        std::env::var("IZARRAVM_DECODE_CACHE_LINES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two())
+            .unwrap_or(DECODE_CACHE_LINES)
+    })
+}
+
 /// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
 /// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
 /// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
@@ -2018,7 +2035,7 @@ impl DecodeCache {
 
 impl Default for DecodeCache {
     fn default() -> Self {
-        Self::new(DECODE_CACHE_LINES)
+        Self::new(decode_cache_lines())
     }
 }
 
