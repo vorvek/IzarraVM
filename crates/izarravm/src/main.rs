@@ -1706,17 +1706,49 @@ fn run_boot_hdd_folder(
         let snapshot = machine.cpu().profile_snapshot();
         print_cpu_profile(&snapshot);
         // Dump the raw bytes around the hottest sampled address so the region compiler's
-        // target loop can be disassembled straight from the census. Identity-mapped read:
-        // DOS-extender arenas (the workloads this census exists for) map extended memory
-        // linear==physical; a non-identity guest just yields a mislabeled hexdump.
+        // target loop can be disassembled straight from the census. The histogram records
+        // LINEAR addresses; walk the live page tables (a plain physical-read PDE/PTE walk,
+        // 4 MB pages included) so a paged guest (JemmEx maps Doom NON-identity - the
+        // identity-assumed first cut dumped unrelated data bytes) yields real code.
         if let Some(&(top, _)) = snapshot.hot_addrs.first() {
+            let read_u32 = |machine: &mut Machine, addr: u32| -> u32 {
+                u32::from_le_bytes([
+                    machine.read_physical_u8(addr),
+                    machine.read_physical_u8(addr.wrapping_add(1)),
+                    machine.read_physical_u8(addr.wrapping_add(2)),
+                    machine.read_physical_u8(addr.wrapping_add(3)),
+                ])
+            };
+            let read_linear = |machine: &mut Machine, lin: u32| -> Option<u8> {
+                if machine.cpu().control.cr0 & 0x8000_0000 == 0 {
+                    return Some(machine.read_physical_u8(lin));
+                }
+                let cr3 = machine.cpu().control.cr3 & !0xfff;
+                let pde = read_u32(machine, cr3 + (lin >> 22) * 4);
+                if pde & 1 == 0 {
+                    return None;
+                }
+                let physical = if pde & 0x80 != 0 {
+                    (pde & 0xffc0_0000) | (lin & 0x003f_ffff)
+                } else {
+                    let pte = read_u32(machine, (pde & !0xfff) + ((lin >> 12) & 0x3ff) * 4);
+                    if pte & 1 == 0 {
+                        return None;
+                    }
+                    (pte & !0xfff) | (lin & 0xfff)
+                };
+                Some(machine.read_physical_u8(physical))
+            };
             let start = top.saturating_sub(0x40) & !0xf;
             println!();
-            println!("=== bytes around hottest address {top:08X} (identity-assumed) ===");
+            println!("=== bytes around hottest address {top:08X} (paging-walked linear) ===");
             for row in 0..0x18 {
                 let base = start + row * 16;
                 let bytes: Vec<String> = (0..16)
-                    .map(|i| format!("{:02X}", machine.read_physical_u8(base + i)))
+                    .map(|i| match read_linear(&mut machine, base + i) {
+                        Some(byte) => format!("{byte:02X}"),
+                        None => "--".to_string(),
+                    })
                     .collect();
                 println!("{base:08X}  {}", bytes.join(" "));
             }
