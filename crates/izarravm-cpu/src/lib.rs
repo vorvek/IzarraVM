@@ -1990,6 +1990,12 @@ struct DecodeCache {
     /// Coarse companion above `SMC_BYTE_COVERAGE`: 1 bit per 4 KiB physical page, whole 4 GB
     /// space. See the SMC_BYTE_COVERAGE doc for why page granularity is correct there.
     code_pages: Box<[u64]>,
+    /// Indices of `code_bytes` / `code_pages` words holding marks from the CURRENT generation,
+    /// pushed on a word's 0 -> nonzero transition. Makes the mark clear proportional to the
+    /// marked working set (a few KB of word writes) instead of a 384 KB memset: Doom's 3.9M
+    /// SMC flushes/timedemo made the full memset a measured wall REGRESSION (~2.7% at 12G).
+    dirty_byte_words: Vec<u32>,
+    dirty_page_words: Vec<u32>,
 }
 
 impl DecodeCache {
@@ -2005,6 +2011,8 @@ impl DecodeCache {
             generation: 1,
             code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
             code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
+            dirty_byte_words: Vec::new(),
+            dirty_page_words: Vec::new(),
         }
     }
 
@@ -2016,10 +2024,18 @@ impl DecodeCache {
         for i in 0..u32::from(len) {
             let addr = physical.wrapping_add(i);
             if addr < SMC_BYTE_COVERAGE {
-                self.code_bytes[(addr >> 6) as usize] |= 1u64 << (addr & 63);
+                let word = (addr >> 6) as usize;
+                if self.code_bytes[word] == 0 {
+                    self.dirty_byte_words.push(word as u32);
+                }
+                self.code_bytes[word] |= 1u64 << (addr & 63);
             } else {
                 let page = addr >> 12;
-                self.code_pages[(page >> 6) as usize] |= 1u64 << (page & 63);
+                let word = (page >> 6) as usize;
+                if self.code_pages[word] == 0 {
+                    self.dirty_page_words.push(word as u32);
+                }
+                self.code_pages[word] |= 1u64 << (page & 63);
             }
         }
     }
@@ -2097,8 +2113,18 @@ impl DecodeCache {
     /// self-rate-limiting: once cleared, the stale bytes are unmarked and stop flushing.
     fn invalidate_and_clear_code_marks(&mut self) {
         self.invalidate();
-        self.code_bytes.fill(0);
-        self.code_pages.fill(0);
+        // Zero only the words marked since the last clear (the dirty lists), not the whole
+        // 384 KB: with millions of SMC flushes per timedemo the full memset was a measured
+        // wall regression. Every set bit lives in a dirty-listed word by construction
+        // (mark_code_range pushes on the word's 0 -> nonzero transition).
+        for &word in &self.dirty_byte_words {
+            self.code_bytes[word as usize] = 0;
+        }
+        for &word in &self.dirty_page_words {
+            self.code_pages[word as usize] = 0;
+        }
+        self.dirty_byte_words.clear();
+        self.dirty_page_words.clear();
     }
 }
 
