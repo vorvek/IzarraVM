@@ -1056,6 +1056,8 @@ pub struct CpuProfileSnapshot {
     pub opcodes: Vec<CpuOpcodeProfileBucket>,
     /// Hottest sampled instruction linear addresses, `(linear, samples)`, descending; top 64.
     pub hot_addrs: Vec<(u32, u64)>,
+    /// SMC whole-cache flush sources, `(physical 64-byte block, flushes)`, descending; top 16.
+    pub smc_flush_blocks: Vec<(u32, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1104,6 +1106,10 @@ struct CpuProfileState {
     /// Sampled instruction linear addresses (one entry per SAMPLED instruction, so one hash op
     /// per stride, not per instruction): the hot-loop finder for the JIT's region selection.
     addrs: std::collections::HashMap<u32, u64>,
+    /// SMC whole-cache flush sources: 64-byte physical block -> flush count (every flush, not
+    /// sampled - flushes are rare enough). Locates the code/data byte sharing behind a residual
+    /// SMC flush storm (Doom: 3.9M flushes/timedemo survive the stale-mark clear).
+    smc_flush_blocks: std::collections::HashMap<u32, u64>,
 }
 
 impl Default for CpuProfileState {
@@ -1115,6 +1121,7 @@ impl Default for CpuProfileState {
             groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
             opcodes: std::collections::HashMap::new(),
             addrs: std::collections::HashMap::new(),
+            smc_flush_blocks: std::collections::HashMap::new(),
         }
     }
 }
@@ -1711,6 +1718,7 @@ impl CpuProfileState {
             groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
             opcodes: std::collections::HashMap::new(),
             addrs: std::collections::HashMap::new(),
+            smc_flush_blocks: std::collections::HashMap::new(),
         };
     }
 
@@ -1810,6 +1818,13 @@ impl CpuProfileState {
             .collect::<Vec<_>>();
         hot_addrs.sort_by_key(|&(lin, samples)| (std::cmp::Reverse(samples), lin));
         hot_addrs.truncate(64);
+        let mut smc_flush_blocks = self
+            .smc_flush_blocks
+            .iter()
+            .map(|(&block, &flushes)| (block, flushes))
+            .collect::<Vec<_>>();
+        smc_flush_blocks.sort_by_key(|&(block, flushes)| (std::cmp::Reverse(flushes), block));
+        smc_flush_blocks.truncate(16);
         CpuProfileSnapshot {
             sample_stride: self.sample_stride,
             groups: DecodeGroup::ALL
@@ -1827,6 +1842,7 @@ impl CpuProfileState {
                 .collect(),
             opcodes,
             hot_addrs,
+            smc_flush_blocks,
         }
     }
 }
@@ -2365,6 +2381,15 @@ impl Cpu386 {
     fn note_code_write(&mut self, physical: u32, width: u32) {
         if self.decode_cache.range_hits_code(physical, width) {
             self.perf.decode_inval_smc += 1;
+            if self.profile.enabled {
+                // Flush-source census (64-byte physical blocks): locates the code/data byte
+                // sharing behind a residual SMC flush storm. Off the common path (flushes only).
+                *self
+                    .profile
+                    .smc_flush_blocks
+                    .entry(physical & !63)
+                    .or_insert(0) += 1;
+            }
             self.decode_cache.invalidate_and_clear_code_marks();
             self.fetch_page.invalidate();
         }

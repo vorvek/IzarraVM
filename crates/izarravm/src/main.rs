@@ -1136,6 +1136,18 @@ fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
             );
         }
     }
+
+    if !snapshot.smc_flush_blocks.is_empty() {
+        println!();
+        println!(
+            "=== smc flush sources (top {}, 64-byte physical blocks) ===",
+            snapshot.smc_flush_blocks.len()
+        );
+        println!("{:<10} {:>9}", "physical", "flushes");
+        for &(block, flushes) in &snapshot.smc_flush_blocks {
+            println!("{block:08X}   {flushes:>9}");
+        }
+    }
 }
 
 fn format_profile_opcode(opcode: u16) -> String {
