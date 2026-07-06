@@ -3540,6 +3540,22 @@ impl Cpu386 {
                 }
             }
             ctx.step_fn = Some(step_fn);
+            ctx.inline_step_fn =
+                Some(jit::step::region_inline_slot::<B> as jit::step::RegionStepFn);
+            // Raw fn pointers to the flag helpers. The cast through `as` is sound: each helper is
+            // `fn(&mut self, ...)` and we store it as `unsafe extern "C" fn(*mut Cpu386, ...)`,
+            // calling it with the cpu pointer the emitted code already holds; the `&mut` rebind
+            // inside is the same disjoint-reborrow pattern region_step uses.
+            ctx.set_pending_add_fn = Some(unsafe {
+                std::mem::transmute::<fn(&mut Cpu386, u32, u32), jit::step::SetPendingAddFn>(
+                    Self::jit_set_pending_add as fn(&mut Cpu386, u32, u32),
+                )
+            });
+            ctx.set_shift_flags_fn = Some(unsafe {
+                std::mem::transmute::<fn(&mut Cpu386, u32, u8), jit::step::SetShiftFlagsFn>(
+                    Self::jit_set_shift_flags_shr as fn(&mut Cpu386, u32, u8),
+                )
+            });
             ctx.entry_eip = eip;
             ctx.raw_clocks = 0;
             ctx.insn_count = 0;
@@ -13774,6 +13790,39 @@ mod tests {
         let eip_off = core::mem::offset_of!(Registers, eip);
         assert_eq!(eip_off, 32 + core::mem::size_of::<[SegmentRegister; 6]>());
         assert_eq!(core::mem::offset_of!(Registers, eflags), eip_off + 4);
+    }
+
+    /// The v2 region emitter bakes `offset_of!(Cpu386, registers)` into its emitted bytes (the
+    /// prologue computes `regs_ptr = cpu_ptr + regs_offset`, and inline slots address gpr as
+    /// `[regs_ptr + 4*i]`). Cpu386 is NOT repr(C), so rustc is free to reorder its fields; this
+    /// test pins the current offset so a rustc version bump that moved `registers` is caught here
+    /// (the emitter reads the offset at emit time, so a changed value still produces correct code,
+    /// but the assertion documents the layout and guards against a silent perf shift from a
+    /// changed cache-line placement of gpr).
+    #[test]
+    #[cfg(feature = "jit")]
+    fn cpu_registers_field_offset_is_stable() {
+        let off = core::mem::offset_of!(Cpu386, registers);
+        // The current layout places `registers` at a non-zero offset (rustc reorders Cpu386's
+        // fields for alignment). The emitter handles any value; this assertion freezes the known
+        // position so a change is visible. Update this constant only after confirming the emitter
+        // still produces correct results (re-run the differential suite).
+        assert_eq!(
+            off, 328,
+            "Cpu386.registers offset moved; update the emitter's baked offset"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "jit")]
+    fn region_ctx_fn_pointer_offsets() {
+        // The emitter bakes these offsets (ctx+0 step_fn, ctx+8 inline_step_fn, ctx+16
+        // set_pending_add_fn, ctx+24 set_shift_flags_fn). Pin them so a field reorder is caught.
+        use jit::step::RegionCtx;
+        assert_eq!(core::mem::offset_of!(RegionCtx, step_fn), 0);
+        assert_eq!(core::mem::offset_of!(RegionCtx, inline_step_fn), 8);
+        assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
+        assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     }
 
     /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the

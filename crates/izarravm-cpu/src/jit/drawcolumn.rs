@@ -38,11 +38,11 @@
 
 use std::num::NonZeroU32;
 
-use super::encoder::{Encoder, Reg};
+use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableBuffer;
 use super::region::CompiledRegion;
-use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot};
-use crate::{Cpu386, Prefixes};
+use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
+use crate::{Cpu386, DecodedInsn, Prefixes};
 
 /// One slot's structural requirements. `modrm` is (mode, reg, rm); `imm` pins a structural
 /// immediate (`None` = any value, the self-patched or don't-care slots).
@@ -89,6 +89,48 @@ fn drawcolumn_shape() -> [SlotSpec; 15] {
     ]
 }
 
+/// Classify a matched instruction into its emitted-code strategy. The register-only mov/add/shr
+/// forms (modrm mode 3) inline natively; everything else (memory operands, the back-edge Jcc) goes
+/// through the v1 per-slot step. The gpr indices and immediates are read from the captured decode
+/// so self-patched immediates (the add-imm slots) stay current across re-stamps.
+///
+/// Only the exact opcodes the drawcolumn shape admits reach here (the matcher already verified
+/// opcode + modrm), so the classification is exhaustive over the shape; a slot that matched the
+/// shape but is not one of the three inline-able register forms falls through to Memory.
+fn classify_slot(insn: &DecodedInsn) -> SlotKind {
+    let Some(m) = insn.modrm else {
+        // The only modrm-less slot in the shape is the final rel8 Jnz back-edge.
+        return SlotKind::BackEdge;
+    };
+    // mode 3 = register-only (no memory operand). The three inline-able opcode classes:
+    // 0x8B mov r32,r32 (reg=dst, rm=src); 0x81 /0 add r32,imm32 (reg=0, rm=dst); 0xC1 /5 shr
+    // r32,imm8 (reg=5, rm=dst). All are 32-bit operand size in this loop.
+    if m.mode == 3 {
+        match insn.opcode {
+            0x8B => {
+                return SlotKind::RegMov {
+                    dst: m.reg,
+                    src: m.rm,
+                };
+            }
+            0x81 if m.reg == 0 => {
+                return SlotKind::RegAddImm {
+                    dst: m.rm,
+                    imm: insn.imm,
+                };
+            }
+            0xC1 if m.reg == 5 => {
+                return SlotKind::RegShrImm {
+                    dst: m.rm,
+                    count: insn.imm as u8,
+                };
+            }
+            _ => {}
+        }
+    }
+    SlotKind::Memory
+}
+
 /// Walk the decode cache from `entry_lin` and match the shape. `None` when any slot is cold
 /// (the interpreter warms it naturally; admission just retries later) or does not match.
 pub(crate) fn match_drawcolumn(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<Vec<Slot>> {
@@ -119,7 +161,8 @@ pub(crate) fn match_drawcolumn(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<
                 return None;
             }
         }
-        slots.push(Slot { insn, lin });
+        let kind = classify_slot(&insn);
+        slots.push(Slot { insn, lin, kind });
         lin = lin.wrapping_add(u32::from(insn.len));
     }
     // The back-edge must land exactly on the entry. rel8 was sign-extended into `imm` at
@@ -132,23 +175,32 @@ pub(crate) fn match_drawcolumn(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<
     Some(slots)
 }
 
-/// Total bytes the prologue reserves below the four pushed callee-saved registers: 32 bytes of
-/// Win64 shadow space plus 8 pad bytes so every `call` site sees RSP % 16 == 0 (at entry
-/// RSP % 16 == 8 after the return-address push; 4 pushes make 40 more, still 8 mod 16; +40
-/// lands on 0). Harmless on SysV64.
-const STACK_RESERVE: u32 = 40;
+/// Total bytes the prologue reserves below the five pushed callee-saved registers, sized so every
+/// `call` site sees RSP % 16 == 0. At entry RSP % 16 == 8 (after the return-address push); 5 pushes
+/// subtract 40 (8 mod 16), landing RSP at 0 mod 16; subtracting a multiple of 16 keeps it there, so
+/// 32 bytes (the Win64 shadow space) is exactly right. v1 used 40 with 4 pushes (4 pushes left RSP
+/// at 8 mod 16, so +40 was needed to reach 0); the fifth callee-saved (R14, the regs pointer) flips
+/// the parity and 32 is now correct. Harmless on SysV64 (no shadow space, but the alignment holds).
+const STACK_RESERVE: u32 = 32;
 
-/// Emit the region chain for `n_slots` slots: pin cpu/bus/ctx in R12/R13/R15, load the step
-/// function from `[ctx + 0]` into RBX, then per slot re-load the three pointer args plus the
-/// slot index and `call rbx; test al,al; jnz exit`. Status 0 falls through; after the final
-/// slot (the back-edge Jcc's step returns 0 only when taken) an unconditional `jmp` closes the
-/// native loop. The emitted bytes depend on nothing but `n_slots`, which is what makes the
-/// buffer reusable across re-stamps.
-fn emit_region(n_slots: u32) -> Vec<u8> {
+/// Emit the region chain for `slots`: pin cpu/bus/ctx in R12/R13/R15 and the two step functions
+/// in RBX (Memory/BackEdge) and R14 (inline register-only), then per slot either inline the guest
+/// op natively (mov r,r / add r,imm / shr r,imm against gpr[] + a flag-helper call, followed by the
+/// inline bookkeeping call) or, for Memory/BackEdge slots, re-load the args and call the full v1
+/// step. After the final slot (the back-edge Jcc's step returns 0 only when taken) an unconditional
+/// `jmp` closes the native loop.
+///
+/// `regs_offset` is `offset_of!(Cpu386, registers)`, baked in so the inline slots address `gpr[]`
+/// as `[cpu + regs_offset + 4*i]` from the cpu pointer in R12. The emitted bytes depend on the slot
+/// kinds and their baked immediates, so the buffer is re-emitted on every fresh admission (the
+/// re-stamp path refreshes the slot table; the next fresh admission re-reads the immediates from
+/// the fresh decodes).
+fn emit_region(slots: &[Slot], regs_offset: u32) -> Vec<u8> {
     let mut e = Encoder::new();
     e.push(Reg::RBX);
     e.push(Reg::R12);
     e.push(Reg::R13);
+    e.push(Reg::R14);
     e.push(Reg::R15);
     #[cfg(windows)]
     {
@@ -164,39 +216,177 @@ fn emit_region(n_slots: u32) -> Vec<u8> {
     }
     e.sub_r64_imm32(Reg::RSP, STACK_RESERVE);
     e.load_r64_disp8(Reg::RBX, Reg::R15, 0); // ctx.step_fn (repr(C), first field)
+    e.load_r64_disp8(Reg::R14, Reg::R15, 8); // ctx.inline_step_fn (second field)
+    // R14 is reused below as the regs pointer for inline gpr access, so move inline_step_fn into a
+    // caller-saved scratch that survives across the inline body. We have no spare callee-saved
+    // register after RBX/R12/R13/R14/R15, so load inline_step_fn fresh per inline slot from ctx+8.
+    // Compute the regs base into R14 = cpu + regs_offset (regs_offset is 0 today, so this is just a
+    // copy; the add keeps it correct if Cpu386's layout ever shifts, tracked by the offset guard).
+    e.mov_r64_r64(Reg::R14, Reg::R12);
+    if regs_offset != 0 {
+        e.add_r64_imm32(Reg::R14, regs_offset);
+    }
 
     let loop_top = e.label();
     let exit = e.label();
     e.place(loop_top);
-    for k in 0..n_slots {
-        #[cfg(windows)]
-        {
-            e.mov_r64_r64(Reg::RCX, Reg::R12);
-            e.mov_r64_r64(Reg::RDX, Reg::R13);
-            e.mov_r64_r64(Reg::R8, Reg::R15);
-            e.mov_r32_imm32(Reg::R9, k);
+    for (k, slot) in slots.iter().enumerate() {
+        let k32 = k as u32;
+        match slot.kind {
+            SlotKind::RegMov { dst, src } => {
+                // Native: load gpr[src] into EAX, store EAX into gpr[dst]. No flags, no helper.
+                // gpr[i] is at [R14 + 4*i] (R14 = regs base).
+                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(src));
+                e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
+                // Then the inline bookkeeping call (fetch charge + eip advance + break checks).
+                emit_inline_bookkeeping_call(&mut e, k32, exit);
+            }
+            SlotKind::RegAddImm { dst, imm } => {
+                // Native: load gpr[dst] into EAX (this is `a`, the operand for the flag helper),
+                // add imm32, store result back to gpr[dst]. Then call jit_set_pending_add(cpu, a,
+                // imm) with the original value (still in a second scratch) and the immediate.
+                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst)); // RAX = a (old value)
+                // ECX = a (save for the helper arg; the add clobbers EAX).
+                e.mov_r32_r32(Reg::RCX, Reg::RAX);
+                e.add_r32_imm32(Reg::RAX, imm); // RAX = result
+                e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX); // write gpr[dst]
+                // Call jit_set_pending_add(cpu=R12, a=ECX, imm). imm is a compile-time constant;
+                // pass it in the third arg register.
+                emit_set_pending_add_call(&mut e, imm);
+                emit_inline_bookkeeping_call(&mut e, k32, exit);
+            }
+            SlotKind::RegShrImm { dst, count } => {
+                // Native: load gpr[dst] into EAX (the original value, for CF), shr by count, store
+                // result back. Then call jit_set_shift_flags_shr(cpu, value=EAX-saved, count).
+                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst)); // RAX = original value
+                e.mov_r32_r32(Reg::RCX, Reg::RAX); // ECX = original (helper arg)
+                e.shr_r32_imm8(Reg::RAX, count); // RAX = result
+                e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
+                emit_set_shift_flags_shr_call(&mut e, count);
+                emit_inline_bookkeeping_call(&mut e, k32, exit);
+            }
+            SlotKind::Memory | SlotKind::BackEdge => {
+                // The full v1 per-slot step (decode dispatch + bus-bound operand resolution).
+                emit_full_step_call(&mut e, k32);
+                e.test_al_al();
+                e.jnz(exit);
+            }
         }
-        #[cfg(not(windows))]
-        {
-            e.mov_r64_r64(Reg::RDI, Reg::R12);
-            e.mov_r64_r64(Reg::RSI, Reg::R13);
-            e.mov_r64_r64(Reg::RDX, Reg::R15);
-            e.mov_r32_imm32(Reg::RCX, k);
-        }
-        e.call_r64(Reg::RBX);
-        e.test_al_al();
-        e.jnz(exit);
     }
     e.jmp(loop_top);
     e.place(exit);
     e.add_r64_imm32(Reg::RSP, STACK_RESERVE);
     e.pop(Reg::R15);
+    e.pop(Reg::R14);
     e.pop(Reg::R13);
     e.pop(Reg::R12);
     e.pop(Reg::RBX);
     e.ret();
     e.finish()
 }
+
+/// Byte displacement of `gpr[i]` within `Registers` (i in 0..8): `4 * i`, fitting in an i8 disp8.
+fn gpr_disp(i: u8) -> i8 {
+    (i as i32 * 4) as i8
+}
+
+/// Reload cpu/bus/ctx and the slot index, then `call rbx` (the full region_step). Used by Memory
+/// and BackEdge slots.
+fn emit_full_step_call(e: &mut Encoder, k: u32) {
+    #[cfg(windows)]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R12);
+        e.mov_r64_r64(Reg::RDX, Reg::R13);
+        e.mov_r64_r64(Reg::R8, Reg::R15);
+        e.mov_r32_imm32(Reg::R9, k);
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R12);
+        e.mov_r64_r64(Reg::RSI, Reg::R13);
+        e.mov_r64_r64(Reg::RDX, Reg::R15);
+        e.mov_r32_imm32(Reg::RCX, k);
+    }
+    e.call_r64(Reg::RBX);
+}
+
+/// Reload cpu/bus/ctx and the slot index, then `call [ctx+8]` (region_inline_slot). The inline step
+/// pointer is loaded fresh per slot from `[ctx + 8]` (no spare callee-saved register holds it
+/// across the inline body). `exit` is the region exit label; the test+jnz after the call returns
+/// there on STOP.
+fn emit_inline_bookkeeping_call(e: &mut Encoder, k: u32, exit: Label) {
+    #[cfg(windows)]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R12);
+        e.mov_r64_r64(Reg::RDX, Reg::R13);
+        e.mov_r64_r64(Reg::R8, Reg::R15);
+        e.mov_r32_imm32(Reg::R9, k);
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R12);
+        e.mov_r64_r64(Reg::RSI, Reg::R13);
+        e.mov_r64_r64(Reg::RDX, Reg::R15);
+        e.mov_r32_imm32(Reg::RCX, k);
+    }
+    // Load inline_step_fn from [ctx+8] into a scratch (RAX is dead here: the native op already
+    // committed its result to gpr) and call it indirectly.
+    e.load_r64_disp8(Reg::RAX, Reg::R15, 8);
+    e.call_r64(Reg::RAX);
+    e.test_al_al();
+    e.jnz(exit);
+}
+
+/// Call `Cpu386::jit_set_pending_add(cpu, a, b)` with cpu in R12, `a` (the old gpr value) already
+/// in ECX, and `b` = `imm` loaded into the next arg register. Saves/restores the caller-saved
+/// scratch around the call so the inline bookkeeping call's arg setup is undisturbed.
+fn emit_set_pending_add_call(e: &mut Encoder, imm: u32) {
+    // The caller put the original gpr value (`a`) in ECX. Move it to its arg register BEFORE
+    // loading cpu into RCX (which would clobber it). Win64: arg0=RCX(cpu), arg1=RDX(a), arg2=R8(b).
+    // SysV: arg0=RDI(cpu), arg1=RSI(a), arg2=RDX(b).
+    #[cfg(windows)]
+    {
+        e.mov_r32_r32(Reg::RDX, Reg::RCX); // a -> RDX (arg1)
+        e.mov_r64_r64(Reg::RCX, Reg::R12); // cpu -> RCX (arg0)
+        e.mov_r32_imm32(Reg::R8, imm); // imm -> R8 (arg2)
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r32_r32(Reg::RSI, Reg::RCX); // a -> RSI (arg1)
+        e.mov_r64_r64(Reg::RDI, Reg::R12); // cpu -> RDI (arg0)
+        e.mov_r32_imm32(Reg::RDX, imm); // imm -> RDX (arg2)
+    }
+    // The helper is a Rust method; the emitter cannot address it by offset, so the dispatch stores
+    // a raw fn pointer in ctx and we load+call it indirectly.
+    e.load_r64_disp8(Reg::RAX, Reg::R15, SET_PENDING_ADD_FN_OFF);
+    e.call_r64(Reg::RAX);
+}
+
+/// Call `Cpu386::jit_set_shift_flags_shr(cpu, value, count)` with cpu in R12, the original value
+/// in RCX (moved to its arg reg), and `count` baked as an immediate.
+fn emit_set_shift_flags_shr_call(e: &mut Encoder, count: u8) {
+    #[cfg(windows)]
+    {
+        e.mov_r32_r32(Reg::RDX, Reg::RCX); // value -> RDX (arg1)
+        e.mov_r64_r64(Reg::RCX, Reg::R12); // cpu -> RCX (arg0)
+        e.mov_r32_imm32(Reg::R8, u32::from(count)); // count -> R8 (arg2)
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r32_r32(Reg::RSI, Reg::RCX); // value -> RSI (arg1)
+        e.mov_r64_r64(Reg::RDI, Reg::R12); // cpu -> RDI (arg0)
+        e.mov_r32_imm32(Reg::RDX, u32::from(count)); // count -> RDX (arg2)
+    }
+    e.load_r64_disp8(Reg::RAX, Reg::R15, SET_SHIFT_FLAGS_FN_OFF);
+    e.call_r64(Reg::RAX);
+}
+
+/// Byte offsets of the two flag-helper fn pointers within `RegionCtx` (set by the dispatch, loaded
+/// by the inline emit). These follow `step_fn` (off 0) and `inline_step_fn` (off 8), so they start
+/// at 16. Each `Option<unsafe extern "C" fn>` is one pointer wide (8 bytes) under the null-pointer
+/// optimization.
+const SET_PENDING_ADD_FN_OFF: i8 = 16;
+const SET_SHIFT_FLAGS_FN_OFF: i8 = 24;
 
 /// Try to admit a region at `entry_lin`: match the shape against the live decode cache, then
 /// either refresh the already-installed region's slot table (the re-stamp path after an SMC
@@ -217,6 +407,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
     let phys_lo = cpu.decode_cache.line_phys_start(entry_lin, d)?;
     let phys_hi = phys_lo + (span - 1);
     let epoch = cpu.decode_cache.jit_smc_epoch;
+    let regs_offset = core::mem::offset_of!(Cpu386, registers) as u32;
     if let Some(idx) = cpu.jit_regions.find(entry_lin, d) {
         let region = cpu
             .jit_regions
@@ -226,10 +417,28 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         region.phys_lo = phys_lo;
         region.phys_hi = phys_hi;
         region.valid_epoch = epoch;
+        // v2 bakes the slot kinds and the add-imm immediates into the emitted bytes (unlike v1,
+        // whose buffer encoded only the slot count). A self-patch changes an add slot's immediate,
+        // so the buffer must be re-emitted from the fresh slot table. The kinds themselves are
+        // shape-fixed (the matcher re-verified them), but the immediates and the regs offset are
+        // re-read here for correctness.
+        let code = emit_region(&region.ctx.slots, regs_offset);
+        if let Some(buf) = ExecutableBuffer::new(&code) {
+            // SAFETY: same transmute proof as the fresh-admission path below; `code` was produced
+            // by emit_region to exactly the RegionEntryFn convention.
+            region.entry =
+                unsafe { std::mem::transmute::<*const u8, RegionEntryFn>(buf.entry_ptr()) };
+            region.buf = buf;
+        } else {
+            // W^X alloc failed (unsupported host): drop the region so admission does not point at
+            // stale emitted bytes. The caller treats None as "not admitted" and interprets instead.
+            cpu.jit_regions.clear();
+            return None;
+        }
         return Some(idx);
     }
     let jnz_slot = (slots.len() - 1) as u32;
-    let code = emit_region(slots.len() as u32);
+    let code = emit_region(&slots, regs_offset);
     let buf = ExecutableBuffer::new(&code)?;
     // SAFETY: `code` was produced by `emit_region` to exactly the `RegionEntryFn` calling
     // convention (alignment proof at STACK_RESERVE); `entry_ptr` stays valid for `buf`'s life,
@@ -237,7 +446,10 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
     let entry: RegionEntryFn =
         unsafe { std::mem::transmute::<*const u8, RegionEntryFn>(buf.entry_ptr()) };
     let ctx = Box::new(RegionCtx {
-        step_fn: None, // written by the dispatch on every entry
+        step_fn: None,            // written by the dispatch on every entry
+        inline_step_fn: None,     // written by the dispatch on every entry
+        set_pending_add_fn: None, // written by the dispatch on every entry
+        set_shift_flags_fn: None, // written by the dispatch on every entry
         slots,
         jnz_slot,
         entry_eip: 0,

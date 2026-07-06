@@ -209,6 +209,63 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// `mov dst32, [base + disp8]` (8B /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// 32-bit-operand mirror of `load_r64_disp8`. Reads a 32-bit guest register (gpr[i]) from the
+    /// `Registers` array the v2 inline slots address by offset; no REX.W so the load zero-extends to
+    /// 64 bits (the host register's upper half is cleared, matching the x86-64 rule for 32-bit ops).
+    /// REX is emitted only when an extended register is used (a bare 0x40 REX with no bits set is
+    /// legal but wasteful; the 64-bit primitives always set W so this guard does not apply there).
+    pub(crate) fn load_r32_disp8(&mut self, dst: Reg, base: Reg, disp8: i8) {
+        if dst.ext() || base.ext() {
+            self.rex(false, dst.ext(), false, base.ext());
+        }
+        self.bytes.push(0x8B);
+        self.modrm(0b01, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `mov [base + disp8], src32` (89 /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// 32-bit-operand store mirror, for writing a computed guest gpr[i] back to the `Registers`
+    /// array.
+    pub(crate) fn store_r32_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
+        if src.ext() || base.ext() {
+            self.rex(false, src.ext(), false, base.ext());
+        }
+        self.bytes.push(0x89);
+        self.modrm(0b01, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `add dst32, imm32` (81 /0 id, no REX.W) -- the 32-bit-operand ADD-immmediate form the v2
+    /// inline `add r32, imm32` slot uses against a host scratch register holding the guest gpr
+    /// value. Sets the host flags, but those are not the guest flags (the guest flag update is a
+    /// separate helper call); the emitted code does not read host flags after this.
+    pub(crate) fn add_r32_imm32(&mut self, dst: Reg, imm: u32) {
+        if dst.ext() {
+            self.rex(false, false, false, dst.ext());
+        }
+        self.bytes.push(0x81);
+        self.modrm(0b11, 0, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `shr dst32, imm8` (C1 /5 ib, no REX.W) -- the 32-bit logical right shift by an immediate,
+    /// the v2 inline `shr r32, imm8` slot. Count is the pinned drawcolumn value (25) at emit time.
+    pub(crate) fn shr_r32_imm8(&mut self, dst: Reg, count: u8) {
+        if dst.ext() {
+            self.rex(false, false, false, dst.ext());
+        }
+        self.bytes.push(0xC1);
+        self.modrm(0b11, 5, dst.low3());
+        self.bytes.push(count);
+    }
+
     /// `xor dst64, dst64` (REX.W + 31 /r), the standard zero-register idiom.
     pub(crate) fn xor_r64_self(&mut self, dst: Reg) {
         self.rex(true, dst.ext(), false, dst.ext());
@@ -467,6 +524,41 @@ mod tests {
         // mov [r15+32], rax
         e.store_r64_disp8(Reg::R15, 32, Reg::RAX);
         assert_eq!(e.finish(), vec![0x49, 0x89, 0x47, 0x20]);
+    }
+
+    #[test]
+    fn load_r32_disp8_known_bytes() {
+        // mov eax, [r15+0] -- REX.B only (r15 extended), no REX.W (32-bit operand). The 32-bit load
+        // zero-extends to 64 bits, exactly what the inline slot wants when reading a guest gpr.
+        let mut e = Encoder::new();
+        e.load_r32_disp8(Reg::RAX, Reg::R15, 0);
+        assert_eq!(e.finish(), vec![0x41, 0x8B, 0x47, 0x00]);
+    }
+
+    #[test]
+    fn store_r32_disp8_known_bytes() {
+        // mov [r15+32], eax -- REX.B only (r15 extended), no REX.W.
+        let mut e = Encoder::new();
+        e.store_r32_disp8(Reg::R15, 32, Reg::RAX);
+        assert_eq!(e.finish(), vec![0x41, 0x89, 0x47, 0x20]);
+    }
+
+    #[test]
+    fn add_r32_imm32_known_bytes() {
+        // add eax, 0xa0 -- no REX (eax not extended), 81 /0 id. ModRM mod=11,reg=0(/0),rm=0(eax)
+        // = 11_000_000 = 0xC0.
+        let mut e = Encoder::new();
+        e.add_r32_imm32(Reg::RAX, 0xa0);
+        assert_eq!(e.finish(), vec![0x81, 0xC0, 0xA0, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn shr_r32_imm8_known_bytes() {
+        // shr ecx, 25 -- no REX (ecx not extended), C1 /5 ib. ModRM mod=11,reg=5(/5),rm=1(ecx)
+        // = 11_101_001 = 0xE9; count 25 = 0x19. This is the drawcolumn shift slot.
+        let mut e = Encoder::new();
+        e.shr_r32_imm8(Reg::RCX, 25);
+        assert_eq!(e.finish(), vec![0xC1, 0xE9, 0x19]);
     }
 
     #[test]
