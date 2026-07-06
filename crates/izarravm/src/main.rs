@@ -1260,6 +1260,8 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "rep_string_fast_iterations": perf.rep_string_fast_iterations,
         "flag_materializations": perf.flag_materializations,
         "cache_tier_lookups": perf.cache_tier_lookups,
+        "jit_region_entries": perf.jit_region_entries,
+        "jit_region_insns": perf.jit_region_insns,
     })
 }
 

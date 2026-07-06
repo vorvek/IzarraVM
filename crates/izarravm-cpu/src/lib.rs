@@ -32441,22 +32441,38 @@ mod tests {
             assert_eq!(bus_i.memory, bus_j.memory);
         }
 
-        /// A `TestBus` wrapper whose `requires_step_break` arms itself on the Nth memory write,
-        /// standing in for the machine's `io_touched` edge (which this port-free loop can never
-        /// raise on the real bus). The driver clears it per run, like the machine batch loop.
-        struct StepBreakBus {
+        /// A `TestBus` wrapper adding the two machine-bus behaviors this port-free loop can never
+        /// raise on `TestBus` itself: `requires_step_break` arms on the Nth memory write
+        /// (standing in for the `io_touched` edge; the driver clears it per run like the machine
+        /// batch loop), and `in_batch_scaled_bus_clocks` reports a synthetic monotonic count (2
+        /// per bus access) so the run cap's bus-growth term is live, as it is at 486/586 on the
+        /// real machine bus.
+        struct InstrumentedBus {
             inner: TestBus,
             writes_until_break: u32,
             armed: bool,
+            bus_clocks: u64,
         }
 
-        impl CpuBus for StepBreakBus {
+        impl InstrumentedBus {
+            fn new(memory: Vec<u8>) -> Self {
+                Self {
+                    inner: TestBus::with_memory(memory),
+                    writes_until_break: u32::MAX, // step break disarmed
+                    armed: false,
+                    bus_clocks: 0,
+                }
+            }
+        }
+
+        impl CpuBus for InstrumentedBus {
             fn read_memory(
                 &mut self,
                 address: u32,
                 width: BusWidth,
                 kind: BusAccessKind,
             ) -> Result<u32, BusError> {
+                self.bus_clocks += 2;
                 self.inner.read_memory(address, width, kind)
             }
             fn write_memory(
@@ -32466,6 +32482,7 @@ mod tests {
                 value: u32,
                 kind: BusAccessKind,
             ) -> Result<(), BusError> {
+                self.bus_clocks += 2;
                 if self.writes_until_break > 0 {
                     self.writes_until_break -= 1;
                     if self.writes_until_break == 0 {
@@ -32478,7 +32495,11 @@ mod tests {
                 self.inner.prefetch_memory(address, out)
             }
             fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
+                self.bus_clocks += 2;
                 self.inner.charge_instruction_fetch(address)
+            }
+            fn in_batch_scaled_bus_clocks(&self) -> u64 {
+                self.bus_clocks
             }
             fn read_io(
                 &mut self,
@@ -32513,11 +32534,7 @@ mod tests {
             // store. Both executions must end that run at exactly that instruction boundary.
             let run = |admit: bool| {
                 let mut cpu = fresh_cpu(0xffff);
-                let mut bus = StepBreakBus {
-                    inner: TestBus::with_memory(program()),
-                    writes_until_break: u32::MAX, // disarmed while warming
-                    armed: false,
-                };
+                let mut bus = InstrumentedBus::new(program());
                 arm_loop(&mut cpu, &mut bus.inner, 2);
                 for _ in 0..1000 {
                     if cpu.run_straight_line(&mut bus, u64::MAX).unwrap().halted {
@@ -32548,6 +32565,49 @@ mod tests {
             assert_eq!(bus_i.inner.memory, bus_j.inner.memory);
             assert_eq!(bus_i.inner.trace.cycles(), bus_j.inner.trace.cycles());
             assert!(cpu_j.perf_counters().jit_region_entries > 0);
+        }
+
+        #[test]
+        fn cap_bus_growth_term_breaks_identically_on_a_clock_reporting_bus() {
+            // The run cap check adds the bus's in-batch scaled clock GROWTH to the core total
+            // (nonzero on the real 486/586 machine bus). With the synthetic 2-clocks-per-access
+            // counter live, the region's per-slot cap check must break at exactly the
+            // interpreter's instruction boundary.
+            let run = |admit: bool, cap: u64| {
+                let mut cpu = fresh_cpu(0xffff);
+                let mut bus = InstrumentedBus::new(program());
+                arm_loop(&mut cpu, &mut bus.inner, 2);
+                for _ in 0..1000 {
+                    if cpu.run_straight_line(&mut bus, u64::MAX).unwrap().halted {
+                        break;
+                    }
+                }
+                if admit {
+                    let idx = jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).unwrap();
+                    cpu.decode_cache.stamp_region(ENTRY, true, idx);
+                }
+                arm_loop(&mut cpu, &mut bus.inner, 10);
+                let mut boundaries = Vec::new();
+                for _ in 0..10_000 {
+                    let outcome = cpu.run_straight_line(&mut bus, cap).unwrap();
+                    boundaries.push((outcome.core_clocks, cpu.registers.eip, bus.bus_clocks));
+                    if outcome.halted {
+                        break;
+                    }
+                }
+                (boundaries, cpu, bus)
+            };
+            for cap in [60u64, 145, 400] {
+                let (bounds_i, cpu_i, bus_i) = run(false, cap);
+                let (bounds_j, cpu_j, bus_j) = run(true, cap);
+                assert_eq!(
+                    bounds_i, bounds_j,
+                    "cap {cap}: bus-growth boundaries diverged"
+                );
+                assert_eq!(cpu_i, cpu_j);
+                assert_eq!(bus_i.inner.trace.cycles(), bus_j.inner.trace.cycles());
+                assert!(cpu_j.perf_counters().jit_region_entries > 0);
+            }
         }
 
         #[test]
