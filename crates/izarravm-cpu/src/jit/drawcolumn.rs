@@ -17,6 +17,11 @@
 //!   table. These make the region's deferred accounting sound: `can_take_interrupt` cannot
 //!   transition inside, and nothing reads `elapsed_clocks` mid-region. A future shape table must
 //!   preserve this exclusion list (`continuable` alone does NOT: STI is continuable).
+//! - No in-loop store may alias the region's own code bytes. The back-edge re-probes only the
+//!   entry slot's line, and the staleness epoch is checked at entry, not per iteration; a shape
+//!   that patches an EARLIER slot from inside the loop would re-run the stale slot snapshot on
+//!   the next iteration. The drawcolumn stores target the framebuffer and the column counter,
+//!   never the 51 code bytes (the self-patch comes from setup code outside the loop).
 //! - Every slot's decode is live in the cache (generation-current), unprefixed, `continuable`,
 //!   and stays inside its 4 KB page, mirroring the run loop's own continuation gate.
 //!
