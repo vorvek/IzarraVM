@@ -2233,8 +2233,11 @@ impl DecodeCache {
     }
 
     /// Whether the line for `lin` is live for exactly this key: the same condition `get` uses,
+    /// (Consumed by the jit region step and its tests; harmless dead code in base builds.)
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     /// without copying the insn. The region step probes this per slot, which is the
     /// interpreter's own next-continuation decode probe in miss-detection terms.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     #[inline]
     fn line_live(&self, lin: u32, d: bool) -> bool {
         let line = &self.lines[(lin & self.mask) as usize];
