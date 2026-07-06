@@ -205,12 +205,22 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         return None;
     }
     let slots = match_drawcolumn(cpu, entry_lin, d)?;
+    let last = &slots[slots.len() - 1];
+    let span = last.lin.wrapping_add(u32::from(last.insn.len)) - entry_lin;
+    // Physical span from the entry line (matcher-warmed, single page so contiguity holds);
+    // narrow SMC kills inside it stale the slot table via the epoch.
+    let phys_lo = cpu.decode_cache.line_phys_start(entry_lin, d)?;
+    let phys_hi = phys_lo + (span - 1);
+    let epoch = cpu.decode_cache.jit_smc_epoch;
     if let Some(idx) = cpu.jit_regions.find(entry_lin, d) {
         let region = cpu
             .jit_regions
             .get_mut(idx)
             .expect("find returned a live index");
         region.ctx.slots = slots;
+        region.phys_lo = phys_lo;
+        region.phys_hi = phys_hi;
+        region.valid_epoch = epoch;
         return Some(idx);
     }
     let jnz_slot = (slots.len() - 1) as u32;
@@ -234,7 +244,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         rem0: 0,
         scale_num: 1,
         scale_den: 1,
-        entry_generation: 0,
+        d,
         exit: RegionExitKind::Boundary,
         fault: None,
         halted: false,
@@ -245,6 +255,9 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         ctx,
         entry_lin,
         d,
+        phys_lo,
+        phys_hi,
+        valid_epoch: epoch,
     });
     Some(idx)
 }

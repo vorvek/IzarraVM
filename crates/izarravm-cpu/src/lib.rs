@@ -996,6 +996,10 @@ pub struct PerfCounters {
     pub decode_inval_cs_load: u64,
     pub decode_inval_smc: u64,
     pub decode_inval_other: u64,
+    /// Lines killed by the NARROW SMC path (a self-patch whose covering lines were
+    /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
+    /// global-flush fallbacks only, so the two together split the SMC write traffic.
+    pub smc_narrow_kills: u64,
     /// Compiled-region executions (one per `run_region` call that passed its entry
     /// preconditions) and the instructions those executions retired. `jit_region_insns /
     /// jit_region_entries` is the mean instructions per region entry; a Doom A/B run asserts
@@ -1980,6 +1984,11 @@ struct DecodeLine {
     /// part of the hit condition instead of CS loads flushing the whole cache. The fetch limit
     /// is the other such input; it is re-checked live at the hit sites, not stored.
     d: bool,
+    /// Physical address of the instruction's first byte at decode time, for the narrow SMC
+    /// path's covers-the-written-byte check. `phys_start..phys_start + len` is the physical
+    /// span; contiguity holds because pages holding a page-straddling instruction take the
+    /// global flush instead (see `PageCodeInfo::straddled`).
+    phys_start: u32,
     /// 1-based index into the JIT's compiled-region table, `None` when no region starts at this
     /// line's address. Lives IN the decode line (not a separate map) so region lookup rides the
     /// `decode_cache.get` the run loop already does every continuation: admission costs zero
@@ -1987,6 +1996,22 @@ struct DecodeLine {
     /// re-decode (generation bump, SMC) drops the stale region for free.
     #[cfg(feature = "jit")]
     jit_region: Option<std::num::NonZeroU32>,
+}
+
+/// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
+/// physical page was decoded through, plus the two conditions that force the sound global-flush
+/// fallback. Rebuilt from scratch after every global flush (cleared with the marks), so it never
+/// outlives the lines it describes.
+#[derive(Debug, Clone, Copy)]
+struct PageCodeInfo {
+    lin_page: u32,
+    /// A later decode saw a DIFFERENT linear page mapping this physical page: the
+    /// physical-to-linear reconstruction is ambiguous, so writes here must flush globally.
+    aliased: bool,
+    /// An instruction starting on this page crosses into the next page (or one crossed into this
+    /// page): physical contiguity of a line's span is not guaranteed, so writes here (and on the
+    /// neighbor, which sets its own flag) must flush globally.
+    straddled: bool,
 }
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
@@ -2021,6 +2046,17 @@ struct DecodeCache {
     /// SMC flushes/timedemo made the full memset a measured wall REGRESSION (~2.7% at 12G).
     dirty_byte_words: Vec<u32>,
     dirty_page_words: Vec<u32>,
+    /// Physical page -> the linear page its cached code was decoded through (the narrow SMC
+    /// path's physical-to-linear bridge). Populated by `put`, cleared with the marks, so it
+    /// exactly describes the currently markable lines.
+    code_page_lin: std::collections::HashMap<u32, PageCodeInfo>,
+    /// Bumped whenever a narrow SMC kill lands inside an installed JIT region's physical span:
+    /// the region's slot table may now be stale (the entry line's stamp can survive a kill of a
+    /// LATER slot's line). `run_region` refuses a region whose `valid_epoch` lags and unstamps
+    /// it, forcing matcher re-admission over the fresh decodes. Lives here (not on `Cpu386`)
+    /// because the whole cache is excluded from CPU equality; this is host bookkeeping.
+    #[cfg(feature = "jit")]
+    jit_smc_epoch: u32,
 }
 
 impl DecodeCache {
@@ -2038,6 +2074,9 @@ impl DecodeCache {
             code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
             dirty_byte_words: Vec::new(),
             dirty_page_words: Vec::new(),
+            code_page_lin: std::collections::HashMap::new(),
+            #[cfg(feature = "jit")]
+            jit_smc_epoch: 0,
         }
     }
 
@@ -2094,15 +2133,80 @@ impl DecodeCache {
     }
 
     #[inline]
-    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool) {
+    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) {
+        // Narrow-SMC bookkeeping: record (or verify) the linear page this physical page's code
+        // decodes through, and flag the two conditions that force the global-flush fallback. A
+        // page-straddling instruction flags BOTH pages (its span's physical contiguity is not
+        // guaranteed, and a write to either page could hit it).
+        let len = u32::from(insn.len);
+        let straddles = (lin & 0xfff) + len > 0x1000;
+        let pages: [Option<u32>; 2] = [
+            Some(phys >> 12),
+            straddles.then(|| phys.wrapping_add(len - 1) >> 12),
+        ];
+        for page in pages.into_iter().flatten() {
+            let lin_page = if page == phys >> 12 {
+                lin >> 12
+            } else {
+                (lin.wrapping_add(len - 1)) >> 12
+            };
+            match self.code_page_lin.entry(page) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(PageCodeInfo {
+                        lin_page,
+                        aliased: false,
+                        straddled: straddles,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let info = e.get_mut();
+                    info.aliased |= info.lin_page != lin_page;
+                    info.straddled |= straddles;
+                }
+            }
+        }
         self.lines[(lin & self.mask) as usize] = DecodeLine {
             tag: lin,
             generation: self.generation,
             insn: Some(insn),
             d,
+            phys_start: phys,
             #[cfg(feature = "jit")]
             jit_region: None,
         };
+    }
+
+    /// Try to invalidate ONLY the lines covering the written physical byte `physical` (already
+    /// known to be a marked code byte). Returns true when handled narrowly; false means the
+    /// caller must fall back to the whole-cache flush (unknown page, an aliased or straddled
+    /// page, or any other reason the physical-to-linear reconstruction is unsound). The mark
+    /// stays set either way: a stale mark only costs a future narrow attempt, never correctness.
+    #[inline]
+    fn narrow_invalidate(&mut self, physical: u32) -> Option<u32> {
+        let info = *self.code_page_lin.get(&(physical >> 12))?;
+        if info.aliased || info.straddled {
+            return None;
+        }
+        // Within one page the offset is mapping-invariant, so the code-side linear of the
+        // written byte is reconstructible without the writer's own linear (device/DMA writes
+        // narrow too). Any line covering the byte starts at most 14 bytes earlier (15-byte max
+        // instruction), under this same mapping (a different mapping would have set `aliased`).
+        let written_lin = (info.lin_page << 12) | (physical & 0xfff);
+        let mut killed = 0u32;
+        for candidate in written_lin.saturating_sub(14)..=written_lin {
+            let line = &mut self.lines[(candidate & self.mask) as usize];
+            if line.generation != self.generation || line.tag != candidate {
+                continue;
+            }
+            let len = line.insn.map_or(0, |i| u32::from(i.len));
+            if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
+                // Generation 0 can never match the live generation (invalidate skips 0 on
+                // wrap), so the line is dead until re-decoded; a JIT region stamp dies with it.
+                line.generation = 0;
+                killed += 1;
+            }
+        }
+        Some(killed)
     }
 
     /// The compiled-region index stamped on the live line for `lin`, if any. A second load of
@@ -2116,6 +2220,34 @@ impl DecodeCache {
             line.jit_region
         } else {
             None
+        }
+    }
+
+    /// The stored physical start of the live line for `lin`, for region admission (the matcher
+    /// walked these lines; the region's physical span derives from the entry line's).
+    #[cfg(feature = "jit")]
+    fn line_phys_start(&self, lin: u32, d: bool) -> Option<u32> {
+        let line = &self.lines[(lin & self.mask) as usize];
+        (line.generation == self.generation && line.tag == lin && line.d == d)
+            .then_some(line.phys_start)
+    }
+
+    /// Whether the line for `lin` is live for exactly this key: the same condition `get` uses,
+    /// without copying the insn. The region step probes this per slot, which is the
+    /// interpreter's own next-continuation decode probe in miss-detection terms.
+    #[inline]
+    fn line_live(&self, lin: u32, d: bool) -> bool {
+        let line = &self.lines[(lin & self.mask) as usize];
+        line.generation == self.generation && line.tag == lin && line.d == d
+    }
+
+    /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow
+    /// SMC kill inside its span; the next probe misses and re-admission refreshes the slots).
+    #[cfg(feature = "jit")]
+    fn unstamp_region(&mut self, lin: u32, d: bool) {
+        let line = &mut self.lines[(lin & self.mask) as usize];
+        if line.generation == self.generation && line.tag == lin && line.d == d {
+            line.jit_region = None;
         }
     }
 
@@ -2162,6 +2294,9 @@ impl DecodeCache {
         }
         self.dirty_byte_words.clear();
         self.dirty_page_words.clear();
+        // The narrow-SMC page map describes exactly the markable lines; no line survives a
+        // global flush, so it is rebuilt from scratch by the re-decodes.
+        self.code_page_lin.clear();
     }
 }
 
@@ -2464,7 +2599,6 @@ impl Cpu386 {
     #[inline]
     fn note_code_write(&mut self, physical: u32, width: u32) {
         if self.decode_cache.range_hits_code(physical, width) {
-            self.perf.decode_inval_smc += 1;
             if self.profile.enabled {
                 // Flush-source census (64-byte physical blocks): locates the code/data byte
                 // sharing behind a residual SMC flush storm. Off the common path (flushes only).
@@ -2474,7 +2608,36 @@ impl Cpu386 {
                     .entry(physical & !63)
                     .or_insert(0) += 1;
             }
-            self.decode_cache.invalidate_and_clear_code_marks();
+            // Narrow path: kill only the lines covering the written bytes, when the
+            // physical-to-linear reconstruction is unambiguous for EVERY written byte (per-byte
+            // decision; a multi-byte write crossing into an aliased/straddled/unknown page falls
+            // back for the whole write). The global generation is untouched on the narrow path,
+            // so every other cached line survives the self-patch.
+            let narrow = (0..width).try_fold(0u32, |acc, i| {
+                let byte = physical.wrapping_add(i);
+                if !self.decode_cache.is_code_byte(byte) {
+                    return Some(acc);
+                }
+                self.decode_cache.narrow_invalidate(byte).map(|k| acc + k)
+            });
+            match narrow {
+                Some(kills) => {
+                    self.perf.smc_narrow_kills += u64::from(kills);
+                    // A kill inside an installed region's physical span stales its slot table
+                    // even though the entry line's stamp may survive; bump the epoch so entry
+                    // re-validates through the matcher.
+                    #[cfg(feature = "jit")]
+                    if kills > 0 && self.jit_regions.covers_physical(physical, width) {
+                        self.decode_cache.jit_smc_epoch =
+                            self.decode_cache.jit_smc_epoch.wrapping_add(1);
+                    }
+                }
+                None => {
+                    self.perf.decode_inval_smc += 1;
+                    self.decode_cache.invalidate_and_clear_code_marks();
+                }
+            }
+            // The fetch-page snapshot may hold the written bytes under either outcome.
             self.fetch_page.invalidate();
         }
     }
@@ -3335,7 +3498,7 @@ impl Cpu386 {
         }
         let eip = self.registers.eip;
         let cs_limit = self.registers.cs().limit;
-        let generation = self.decode_cache.generation;
+        let epoch = self.decode_cache.jit_smc_epoch;
         let ring0 = self.is_ring0_protected();
         let (num, den) = level_timing(self.level);
         let rem0 = self.timing_rem;
@@ -3345,6 +3508,13 @@ impl Cpu386 {
                 return Ok(None);
             };
             if region.entry_lin != lin || region.d != d {
+                return Ok(None);
+            }
+            if region.valid_epoch != epoch {
+                // A narrow SMC kill landed inside this region's span since the slots were last
+                // matched: the stamp may outlive the killed slot lines, so drop it and let the
+                // forced-admission path re-run the matcher over the fresh decodes.
+                self.decode_cache.unstamp_region(lin, d);
                 return Ok(None);
             }
             let ctx = &mut *region.ctx;
@@ -3366,7 +3536,7 @@ impl Cpu386 {
             ctx.rem0 = rem0;
             ctx.scale_num = num;
             ctx.scale_den = den;
-            ctx.entry_generation = generation;
+            ctx.d = d;
             ctx.exit = jit::step::RegionExitKind::Boundary;
             ctx.fault = None;
             ctx.halted = false;
@@ -4561,7 +4731,8 @@ impl Cpu386 {
             // physical of its first page, which is the one remaining exotic gap.
             let physical = self.translate_code_linear(bus, lin)?;
             self.decode_cache.mark_code_range(physical, insn.len);
-            self.decode_cache.put(lin, insn, cs.default_size_32);
+            self.decode_cache
+                .put(lin, insn, cs.default_size_32, physical);
         }
         Ok(insn)
     }
@@ -21196,7 +21367,7 @@ mod tests {
         let mut cache = DecodeCache::new(4); // mask = 3
         let lin = 0x100;
         assert!(cache.get(lin, false).is_none(), "an empty line misses");
-        cache.put(lin, insn, false);
+        cache.put(lin, insn, false, lin);
         assert!(cache.get(lin, false).is_some(), "a filled line hits");
         // Same line, queried under the other D bit: must miss (a 16-bit decode must never be
         // replayed in a 32-bit code segment; the D bit is part of the hit condition).
@@ -21214,7 +21385,7 @@ mod tests {
             cache.get(lin, false).is_none(),
             "a generation bump invalidates every stamped line"
         );
-        cache.put(lin, insn, false);
+        cache.put(lin, insn, false, lin);
         assert!(
             cache.get(lin, false).is_some(),
             "re-filling after a bump hits again"
@@ -32608,6 +32779,76 @@ mod tests {
                 assert_eq!(bus_i.inner.trace.cycles(), bus_j.inner.trace.cycles());
                 assert!(cpu_j.perf_counters().jit_region_entries > 0);
             }
+        }
+
+        #[test]
+        fn narrow_smc_kills_only_the_covering_lines() {
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program());
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            assert!(cpu.decode_cache.line_live(ENTRY, true));
+            assert!(cpu.decode_cache.line_live(0x102, true));
+            let inval_before = cpu.perf_counters().decode_inval_smc;
+
+            // The guest self-patcher writes the two imm32s at 0x104/0x111: covering lines
+            // (0x102, 0x10f) die individually; every other loop line survives, and no
+            // whole-cache flush happens.
+            cpu.registers.eip = PATCHER;
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+
+            assert_eq!(cpu.perf_counters().decode_inval_smc, inval_before);
+            assert!(cpu.perf_counters().smc_narrow_kills >= 2);
+            assert!(
+                !cpu.decode_cache.line_live(0x102, true),
+                "covering line must die"
+            );
+            assert!(
+                !cpu.decode_cache.line_live(0x10f, true),
+                "covering line must die"
+            );
+            assert!(
+                cpu.decode_cache.line_live(ENTRY, true),
+                "neighbor must survive"
+            );
+            assert!(
+                cpu.decode_cache.line_live(0x108, true),
+                "neighbor must survive"
+            );
+            assert!(
+                cpu.decode_cache.line_live(0x131, true),
+                "neighbor must survive"
+            );
+        }
+
+        #[test]
+        fn narrow_smc_falls_back_globally_on_an_aliased_page() {
+            // Two linear pages decoding through the same physical page make the
+            // physical-to-linear reconstruction ambiguous: narrow_invalidate must refuse.
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program());
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            let insn = cpu.decode_cache.get(ENTRY, true).unwrap();
+            // A second mapping: linear 0x5100 claims the same physical 0x100.
+            cpu.decode_cache.put(0x5100, insn, true, ENTRY);
+            assert!(
+                cpu.decode_cache.narrow_invalidate(ENTRY).is_none(),
+                "an aliased physical page must force the global flush"
+            );
+        }
+
+        #[test]
+        fn narrow_smc_falls_back_globally_on_a_straddling_instruction() {
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program());
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            let insn = cpu.decode_cache.get(0x102, true).unwrap(); // 6-byte add
+            // Pretend it was decoded straddling the page edge at 0xffe: both pages flag.
+            cpu.decode_cache.put(0xffe, insn, true, 0xffe);
+            assert!(cpu.decode_cache.narrow_invalidate(0xffe).is_none());
+            assert!(cpu.decode_cache.narrow_invalidate(0x1001).is_none());
         }
 
         #[test]
