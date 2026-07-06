@@ -2287,9 +2287,10 @@ impl Cpu386 {
     /// address, and every other decode input a CS load could change is re-checked on each hit
     /// instead of being flushed away here: the D bit is part of the line (`DecodeLine::d`,
     /// compared in `get`), the fetch limit is re-checked at both hit sites (a violation misses
-    /// to `decode`, which raises the exact fault), and the two-byte ISA-gate exemptions
-    /// (firmware ROM / ring-0) mark their instructions no-cache at decode so a cached line never
-    /// carries an exemption across a privilege change. This matters because pmode workloads
+    /// to `decode`, which raises the exact fault), and the ISA-gate exemptions (firmware ROM /
+    /// ring-0, BOTH the two-byte gate and the pre-386 66/67 prefix gate) mark their
+    /// instructions no-cache at decode so a cached line never carries an exemption across a
+    /// privilege change. This matters because pmode workloads
     /// load CS at every interrupt edge and V86 monitor round-trip: the Doom 586 census measured
     /// 326M whole-cache CS-load flushes in a 12.4G-instruction timedemo (one per ~38
     /// instructions), pinning decode_hit at 21% regardless of cache size.
@@ -4386,7 +4387,13 @@ impl Cpu386 {
             // Placeholder; the finalize below resolves it once the ModRM (the 0xFF /ext
             // discriminator) has been pre-parsed.
             continuable: false,
-            no_cache: isa_gate_exempt,
+            // Both ISA-gate exemptions are context, not bytes, so neither may be cached: the
+            // two-byte gate reports its exemption directly; a 66/67 prefix at a pre-386 level
+            // can only have survived read_prefixes via the same firmware-ROM/ring-0 exemption
+            // (any other context #UDs there), so the prefix flags themselves are the signal.
+            no_cache: isa_gate_exempt
+                || (self.level.is_pre_386()
+                    && (prefixes.operand_size_override || prefixes.address_size_override)),
         };
 
         // Pre-parse the operands of converted groups, dispatching on the group resolved above.
@@ -21087,6 +21094,89 @@ mod tests {
         assert!(
             cpu.decode_cache.get(0x1000, false).is_some(),
             "a data write to a non-code page must not flush the decode cache"
+        );
+    }
+
+    #[test]
+    fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
+        // A CS load no longer flushes the decode cache, so the fetch limit must be re-checked
+        // live at every hit: cache INC AX at eip 0x10 under a 64 KB CS, reload CS with an
+        // identical base/D but a limit BELOW 0x10, and re-enter. The line is still in the cache
+        // (no flush) but must MISS to decode, which raises #GP on the out-of-limit fetch -- the
+        // stale INC AX must never run.
+        let mut memory = vec![0u8; 0x40];
+        memory[0x10] = 0x40; // INC AX
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.set_eip(0x10);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 1, "INC AX ran and was cached");
+        assert!(cpu.decode_cache.get(0x10, false).is_some());
+
+        // Same base and D, limit 0xF: eip 0x10 is now past the segment end.
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                limit: 0xf,
+                ..cpu.registers.cs()
+            },
+        );
+        cpu.invalidate_code_caches_for_cs_load();
+        assert!(
+            cpu.decode_cache.get(0x10, false).is_some(),
+            "the line itself survives the CS load (no flush)"
+        );
+        cpu.registers.set_eax(5);
+        cpu.set_eip(0x10);
+        let _ = cpu.cycle(&mut bus); // #GP on the fetch (delivery may error: no IDT set up)
+        assert_eq!(
+            cpu.registers.eax() & 0xffff,
+            5,
+            "the out-of-limit fetch faulted; the stale cached INC AX did NOT run"
+        );
+    }
+
+    #[test]
+    fn isa_gate_exempt_decodes_are_never_cached() {
+        // The firmware-ROM/ring-0 ISA-gate exemptions are context, not bytes. With CS loads no
+        // longer flushing the decode cache, an exempt decode entering the cache could replay at
+        // CPL 3 where the same bytes must #UD -- so both exemption channels must mark the
+        // decode no-cache. Ring-0 protected mode at level I286, both channels:
+        //   - 0F A2 CPUID: gated by is_386plus_two_byte at I286, passes via is_ring0_protected.
+        //   - 66 40 (INC EAX): the 66 prefix #UDs at pre-386 outside the exemption.
+        let mut memory = vec![0u8; 256];
+        memory[..2].copy_from_slice(&[0x0f, 0xa2]); // CPUID at linear 0
+        memory[0x10..0x12].copy_from_slice(&[0x66, 0x40]); // INC EAX at linear 0x10
+        let mut cpu = Cpu386::default();
+        cpu.set_level(CpuLevel::I286);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0008,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false, // 16-bit segment: the 66 prefix is a real override
+            },
+        );
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.registers.eip = 0;
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            cpu.decode_cache.get(0, false).is_none(),
+            "an exempt two-byte decode (CPUID at I286, ring 0) must not be cached"
+        );
+
+        cpu.set_eip(0x10);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            cpu.decode_cache.get(0x10, false).is_none(),
+            "an exempt 66-prefixed decode (pre-386, ring 0) must not be cached"
         );
     }
 
