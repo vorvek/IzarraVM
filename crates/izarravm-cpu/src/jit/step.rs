@@ -1,0 +1,192 @@
+//! The per-instruction step function a compiled loop-region calls, and the `RegionCtx` it
+//! communicates through. One call per guest instruction slot: the step does exactly what one
+//! `run_straight_line` continuation does (the `run_one_cached` prologue, the cached-fetch charge,
+//! the execute dispatch, and the post-instruction break checks, in the same order), so guest
+//! semantics, bus traffic, and clock accounting are interpreter-identical by construction. The
+//! emitted native code contributes only the call sequencing and the loop back-edge; it never
+//! computes guest state itself.
+//!
+//! What the region defers to its exit (see `Cpu386::run_region`): `scale_clocks` (one batch call,
+//! sound by the remainder-carry identity the batch-identity test pins), `elapsed_clocks`,
+//! `perf.instructions`, and ring-0 residency. Nothing executed inside an admitted region reads
+//! any of those mid-run: the shape matcher admits no RDTSC/WRMSR (the `elapsed_clocks` readers)
+//! and no IF-writer (so `can_take_interrupt` cannot transition inside, which is what makes the
+//! run loop's whole-region interrupt-transition check equivalent to the interpreter's per-
+//! instruction one). The dispatch additionally refuses entry while `interrupt_shadow` is set, so
+//! the first slot cannot consume a shadow the interpreter would have broken on.
+
+use std::ffi::c_void;
+
+use izarravm_bus::CpuBus;
+
+use crate::{Cpu386, DecodedInsn, InternalFault};
+
+/// One guest instruction slot of a compiled region: the decoded instruction (refreshed wholesale
+/// on every re-stamp, which is how self-patched immediates stay current) and the linear address
+/// of its first byte (fixed relative to the region entry; a region is only entered through the
+/// decode line it was stamped on, so the absolute linears cannot have moved).
+pub(crate) struct Slot {
+    pub insn: DecodedInsn,
+    pub lin: u32,
+}
+
+/// Why the region returned. `Boundary` covers every exit the run loop's own post-checks
+/// reproduce by re-testing live state (step break, cap, generation bump); the loop then breaks
+/// with the same `brk_*` attribution the interpreter would have used, or keeps interpreting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RegionExitKind {
+    #[default]
+    Boundary,
+    /// The final conditional branch fell through: the guest loop is done. The run continues
+    /// interpreted at the fall-through instruction, exactly as after a not-taken branch.
+    LoopDone,
+}
+
+/// The signature of `region_step` behind the ctx's function-pointer field. `Option` for the
+/// not-yet-entered state: the null-pointer optimization guarantees `Option<fn>` is one pointer
+/// wide with `None` as 0, so the emitted code's raw 8-byte load of `[ctx + 0]` reads the
+/// address directly.
+pub(crate) type RegionStepFn =
+    unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx, k: u32) -> u8;
+
+/// The mailbox between the dispatch (`Cpu386::run_region`), the emitted code, and `region_step`.
+/// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`; every
+/// other field is Rust-only. Boxed by the compile driver so its address is stable and disjoint
+/// from the `Cpu386` allocation (the step function holds `&mut` to both at once).
+#[repr(C)]
+pub(crate) struct RegionCtx {
+    /// `region_step::<B>` monomorphized for the live bus type, written by the dispatch on every
+    /// entry (a CPU can run under different bus types across calls; the compiled bytes are
+    /// bus-agnostic because they only forward this pointer).
+    pub step_fn: Option<RegionStepFn>,
+    pub slots: Vec<Slot>,
+    /// Index of the final slot (the back-edge Jcc). Taken = native back-edge; not taken =
+    /// `LoopDone`.
+    pub jnz_slot: u32,
+    /// eip of the region's first instruction at this entry (the back-edge target).
+    pub entry_eip: u32,
+
+    // Per-entry state, reset by the dispatch before each region call.
+    /// Raw (unscaled) core clocks accumulated by completed slots this entry.
+    pub raw_clocks: u64,
+    /// Instructions retired this entry (folded into `perf.instructions` at exit).
+    pub insn_count: u32,
+    /// `run_straight_line`'s scaled `total` at region entry.
+    pub run_total_at_entry: u64,
+    /// The run's `bus_at_entry` (NOT the region's): cap checking mirrors the loop exactly.
+    pub bus_at_run_start: u64,
+    pub cap: u64,
+    /// `timing_rem` at region entry plus the live `level_timing` factors: `scaled_prefix` is the
+    /// pure form of the interpreter's per-instruction `scale_clocks` sums (remainder-carry
+    /// identity), computed without mutating `timing_rem` mid-region.
+    pub rem0: u64,
+    pub scale_num: u32,
+    pub scale_den: u32,
+    /// Decode-cache generation at entry. Any bump (SMC, paging, CS-base or mode change raised by
+    /// an executed slot) side-exits at that exact instruction boundary, where the interpreter's
+    /// next continuation probe would have missed.
+    pub entry_generation: u32,
+
+    // Exit report.
+    pub exit: RegionExitKind,
+    /// A fault raised by a slot: the faulting instruction's start eip (for the
+    /// `finish_instruction`-mirror rewind) and the fault itself. The slot's execution already
+    /// unwound without committing (interpreter fault contract); it is NOT re-executed.
+    pub fault: Option<(u32, InternalFault)>,
+    pub halted: bool,
+}
+
+impl RegionCtx {
+    /// Scaled guest clocks for `raw` core clocks charged from this entry's starting remainder:
+    /// `floor((rem0 + raw*num) / den)`. Equals the sum the interpreter's per-instruction
+    /// `scale_clocks` calls would have produced, by the exact-division remainder carry.
+    #[inline]
+    pub(crate) fn scaled_prefix(&self, raw: u64) -> u64 {
+        (self.rem0 + raw * u64::from(self.scale_num)) / u64::from(self.scale_den)
+    }
+}
+
+/// The signature the emitted region code is called through.
+pub(crate) type RegionEntryFn =
+    unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx) -> i64;
+
+/// Status protocol with the emitted code: 0 = proceed (next slot, or the back-edge from the
+/// final slot); nonzero = return to the dispatch, which reads the details from the ctx.
+const CONTINUE: u8 = 0;
+const STOP: u8 = 1;
+
+/// Execute one region slot. Mirrors, in order: `run_straight_line`'s pre-continuation
+/// `core_clocks_so_far` update, `run_one_cached`'s prologue (shadow consume, `begin_instruction`)
+/// and body (cached-fetch charge + execute dispatch), then the run loop's post-instruction
+/// checks (halted, step break, cap) plus the generation re-check that stands in for the next
+/// continuation's decode probe. The interrupt-enable transition check is intentionally absent:
+/// no admitted shape contains an IF writer and entry requires a clear shadow, so the transition
+/// cannot occur inside a region (the run loop still performs its own check across the whole
+/// region call).
+///
+/// SAFETY: called only from region code invoked by `Cpu386::run_region`, which guarantees `cpu`
+/// and `bus` are live, non-aliased `&mut` for the whole region call, `ctx` is the boxed
+/// `RegionCtx` of the running region (a separate allocation from `Cpu386`, so the two `&mut`
+/// reborrows are disjoint; nothing reachable from the execute dispatch touches `jit_regions`),
+/// and `B` is the concrete bus type behind `bus`.
+pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
+    cpu: *mut Cpu386,
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    k: u32,
+) -> u8 {
+    // SAFETY: see the function-level contract.
+    let cpu = unsafe { &mut *cpu };
+    let bus = unsafe { &mut *(bus as *mut B) };
+    let ctx = unsafe { &mut *ctx };
+    let slot = &ctx.slots[k as usize];
+    let insn = slot.insn;
+    let lin = slot.lin;
+
+    cpu.interrupt_shadow = false;
+    cpu.begin_instruction();
+    let start_eip = cpu.registers.eip;
+    cpu.core_clocks_so_far = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+
+    match cpu
+        .charge_cached_fetch(bus, lin, insn.len)
+        .and_then(|()| cpu.execute_hot_cached_or_decoded(&insn, bus))
+    {
+        Ok(outcome) => {
+            ctx.raw_clocks += u64::from(outcome.core_clocks);
+            ctx.insn_count += 1;
+            // The run loop's break checks, in its exact order (halted, step, cap). All are
+            // re-derivable from live state at exit, so the exit kind stays `Boundary` and the
+            // loop re-attributes the break itself.
+            if outcome.halted {
+                ctx.halted = true;
+                return STOP;
+            }
+            if bus.requires_step_break() {
+                return STOP;
+            }
+            let total = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+            if total + (bus.in_batch_scaled_bus_clocks() - ctx.bus_at_run_start) >= ctx.cap {
+                return STOP;
+            }
+            // Stands in for the next continuation's `decode_cache.get` probe: a generation bump
+            // (an executed slot wrote into watched code bytes, or otherwise invalidated decode)
+            // would make that probe miss and end the run here.
+            if cpu.decode_cache.generation != ctx.entry_generation {
+                return STOP;
+            }
+            if k == ctx.jnz_slot {
+                if cpu.registers.eip == ctx.entry_eip {
+                    return CONTINUE; // taken: the emitted code loops to slot 0
+                }
+                ctx.exit = RegionExitKind::LoopDone;
+                return STOP;
+            }
+            CONTINUE
+        }
+        Err(fault) => {
+            ctx.fault = Some((start_eip, fault));
+            STOP
+        }
+    }
+}
