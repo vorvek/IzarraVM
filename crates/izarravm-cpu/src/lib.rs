@@ -11439,6 +11439,74 @@ impl Cpu386 {
             _ => !self.flag(FLAG_ZF) && (self.flag(FLAG_SF) == self.flag(FLAG_OF)),
         }
     }
+
+    // -------- JIT inline-slot flag helpers (feature `jit`) --------
+    //
+    // The v2 region inlines the register-only slots (mov r32,r32 / add r32,imm32 / shr r32,imm8)
+    // natively against gpr[] (addressed by offset, see the repr(C) Registers guard test). The mov
+    // slots touch no flags; the add and shr slots must update the lazy/eager flag state exactly as
+    // the interpreter's `alu_add` and `shift_rotate` would. These helpers are that exact update,
+    // factored so the emitted native code can call them with the operands it already has in host
+    // registers, skipping the interpreter's full decode/dispatch for the flag side effect.
+    //
+    // Each helper takes the SAME arguments the interpreter handler used (the operand values, not gpr
+    // indices) so the descriptor it constructs is byte-identical to what `alu_add`/`shift_rotate`
+    // would have produced. The native code has already written the result gpr by offset store; the
+    // helper only updates flags. A mid-region fault on a LATER memory slot therefore sees the same
+    // pending/live flag state the interpreter would have at that eip (the property the differential
+    // suite's flag-equality-after-every-exit test pins).
+
+    /// Set `pending_flags` as a deferred 32-bit ADD of `b` to `a`, exactly as `alu_add(a, b, 0,
+    /// BusWidth::Dword)` does. The caller (native inline code) has already computed and written the
+    /// result to gpr; this only records the flag descriptor. `a` and `b` are the width-masked (here
+    /// full 32-bit) operands, matching the lazy-flags contract: `b` is the raw second operand, not
+    /// b+carry (plain ADD, carry 0, so the lazy Add form applies).
+    #[cfg(feature = "jit")]
+    #[allow(dead_code)] // wired by the v2 region emitter (Phase 2/3); proven equivalent above
+    pub(crate) fn jit_set_pending_add(&mut self, a: u32, b: u32) {
+        let result = a.wrapping_add(b);
+        self.pending_flags = Some(LazyFlags {
+            a,
+            b,
+            result,
+            width: BusWidth::Dword,
+            op: LazyFlagOp::Add,
+            cf_override: None,
+        });
+    }
+
+    /// Update flags for a 32-bit SHR of `value` by `raw_count`, exactly as
+    /// `shift_rotate(5, value, raw_count, BusWidth::Dword)` followed by `set_shift_result_flags`
+    /// does. The caller has already written `value >> (count & 0x1f)` to gpr.
+    ///
+    /// Replicates the single-bit-shift loop's flag semantics precisely: CF is the last bit shifted
+    /// out (bit `count-1` of the original value, i.e. bit 24 for count 25). For count != 1, OF is
+    /// undefined and falls back to the live OF; AF is always preserved (read live before the
+    /// descriptor is dropped). Shifts never stay lazy, so this materializes: it folds any pending
+    /// descriptor's CF/OF/AF out, clears pending, and writes CF/OF/AF/SZP live.
+    #[cfg(feature = "jit")]
+    #[allow(dead_code)] // wired by the v2 region emitter (Phase 2/3); proven equivalent above
+    pub(crate) fn jit_set_shift_flags_shr(&mut self, value: u32, raw_count: u8) {
+        let count = u32::from(raw_count) & 0x1f;
+        // A zero count affects no flags at all (shift_rotate returns early); the inline path never
+        // calls this for count 0 (the matcher's SHR slots pin count to 25), but the guard keeps the
+        // helper a faithful replica of shift_rotate for any caller.
+        if count == 0 {
+            return;
+        }
+        let result = value >> count;
+        // CF = the last bit shifted out by the single-bit loop: after `count` right shifts, that is
+        // bit (count-1) of the original value.
+        let cf = (value >> (count - 1)) & 1 != 0;
+        // OF is defined only for count == 1: for SHR it is the MSB of the original value. For any
+        // other count, set_shift_result_flags receives None and falls back to the live OF.
+        let of = if count == 1 {
+            Some(value & 0x8000_0000 != 0)
+        } else {
+            None
+        };
+        self.set_shift_result_flags(Some(cf), of, result, BusWidth::Dword);
+    }
 }
 
 pub fn linear_address(segment: u16, offset: u16) -> usize {
@@ -13706,6 +13774,96 @@ mod tests {
         let eip_off = core::mem::offset_of!(Registers, eip);
         assert_eq!(eip_off, 32 + core::mem::size_of::<[SegmentRegister; 6]>());
         assert_eq!(core::mem::offset_of!(Registers, eflags), eip_off + 4);
+    }
+
+    /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
+    /// interpreter's `alu_add(a, b, 0, Dword)` does, so that a later flag read (or materialization)
+    /// sees the same six arithmetic bits. Swept across operand pairs that exercise the carry,
+    /// zero, sign, overflow, half-carry, and parity paths. The comparison goes through
+    /// `materialized_eflags`, the same reader the interpreter uses, so it is exact.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_set_pending_add_matches_alu_add() {
+        let probes = [
+            (0u32, 0u32),
+            (1, 1),
+            (0xffff_ffff, 1),
+            (0x7fff_ffff, 1),
+            (0x8000_0000, 0x8000_0000),
+            (0x0f, 0x01),
+            (0x1f, 0x01),
+            (0x1234_5678, 0x9abc_def0),
+            (0xffff_ffff, 0xffff_ffff),
+            (0x0000_00ff, 0x0000_0001),
+        ];
+        for &(a, b) in &probes {
+            let mut ref_cpu = Cpu386::default();
+            ref_cpu.alu_add(a, b, 0, BusWidth::Dword);
+            let ref_ef = ref_cpu.materialized_eflags();
+
+            let mut jit_cpu = Cpu386::default();
+            jit_cpu.jit_set_pending_add(a, b);
+            let jit_ef = jit_cpu.materialized_eflags();
+
+            assert_eq!(
+                jit_ef, ref_ef,
+                "jit_set_pending_add({a:#x}, {b:#x}) flags diverge from alu_add"
+            );
+            // The descriptor itself must match too (cf_override, op, width, result).
+            assert_eq!(
+                jit_cpu.pending_flags, ref_cpu.pending_flags,
+                "jit_set_pending_add({a:#x}, {b:#x}) descriptor diverges"
+            );
+        }
+    }
+
+    /// The JIT's `jit_set_shift_flags_shr` helper must leave the identical flag state the
+    /// interpreter's `shift_rotate(5, value, count, Dword)` does, for every count 0..=31 and a set
+    /// of values that exercise CF (last bit out), OF (count==1 MSB), ZF/SF/PF (result), and the
+    /// AF/OF-preserved paths (count != 1). This is the hardest correctness property of the inline
+    /// SHR slots: a divergence here would corrupt the jnz back-edge decision.
+    #[cfg(feature = "jit")]
+    #[test]
+    fn jit_set_shift_flags_shr_matches_shift_rotate() {
+        let values = [
+            0u32,
+            1,
+            0x8000_0000,
+            0xffff_ffff,
+            0x7fff_ffff,
+            0x4000_0000,
+            0x0200_0000, // bit 25 set: CF probe for count 26
+            0x0100_0000, // bit 24 set: CF probe for count 25 (the drawcolumn shift)
+            0x1234_5678,
+            0x0000_0001,
+        ];
+        for &value in &values {
+            for count in 0u8..=31 {
+                let mut ref_cpu = Cpu386::default();
+                // Seed a non-trivial pending descriptor first, so the slow path of
+                // set_shift_result_flags (fold-then-eager) is exercised, matching the real loop
+                // where an earlier add slot leaves a descriptor outstanding.
+                ref_cpu.alu_add(0x1000, 0x2000, 0, BusWidth::Dword);
+                ref_cpu.shift_rotate(5, value, count, BusWidth::Dword);
+                let ref_ef = ref_cpu.materialized_eflags();
+
+                let mut jit_cpu = Cpu386::default();
+                jit_cpu.alu_add(0x1000, 0x2000, 0, BusWidth::Dword);
+                jit_cpu.jit_set_shift_flags_shr(value, count);
+                let jit_ef = jit_cpu.materialized_eflags();
+
+                assert_eq!(
+                    jit_ef, ref_ef,
+                    "jit_set_shift_flags_shr({value:#x}, {count}) flags diverge from shift_rotate"
+                );
+                // No descriptor should be outstanding after a shift (shifts materialize eagerly).
+                assert_eq!(
+                    jit_cpu.pending_flags.is_some(),
+                    ref_cpu.pending_flags.is_some(),
+                    "jit_set_shift_flags_shr({value:#x}, {count}) pending-state diverges"
+                );
+            }
+        }
     }
 
     #[test]
