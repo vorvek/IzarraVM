@@ -338,7 +338,12 @@ impl SegmentIndex {
     }
 }
 
+// `repr(C)` pins the field order. SegmentRegister is nested in Registers (also repr(C)), and the
+// JIT's offset guard test computes the eip/eflags offsets through `size_of::<[SegmentRegister; 6]>`,
+// so its size must be stable. The derived layout the compiler chose happened to match this order;
+// repr(C) freezes it so a future rustc cannot silently move a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
 pub struct SegmentRegister {
     pub selector: u16,
     pub base: u32,
@@ -396,7 +401,13 @@ impl Default for DescriptorTable {
     }
 }
 
+// `repr(C)` pins `gpr` at offset 0 within `Registers`, so the JIT's emitted native code can read
+// and write `gpr[i]` as `[regs_ptr + 4*i]` without going through a Rust accessor. `registers` is
+// the first field of `Cpu386`; the dispatch passes a `*mut Registers` (derived from the cpu
+// pointer) into the region entry for this purpose. The offset guard test in `mod tests` freezes
+// the layout assumptions a rustc version bump could otherwise invalidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
 pub struct Registers {
     gpr: [u32; 8],
     segments: [SegmentRegister; 6],
@@ -13679,6 +13690,23 @@ mod tests {
     use super::*;
     use izarravm_bus::{BusCycle, BusTrace, BusWidth};
     use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
+
+    /// The JIT's emitted native code addresses `gpr[i]` as `[regs_ptr + 4*i]`, relying on
+    /// `Registers` being `repr(C)` with `gpr` as the first field. A rustc or field reorder that broke
+    /// this offset would silently corrupt guest state through wrong native loads/stores, so this
+    /// test freezes the layout assumption the JIT bakes into its emitted bytes. The eip offset is
+    /// asserted too (the dispatch reads it); eflags follows eip at +4.
+    #[test]
+    fn registers_repr_c_offsets_are_stable() {
+        // gpr is the first field of repr(C) Registers: offset 0, 4-byte element stride.
+        assert_eq!(core::mem::offset_of!(Registers, gpr), 0);
+        assert_eq!(core::mem::size_of::<u32>(), 4);
+        // eip sits after gpr (32 bytes) + segments ([SegmentRegister; 6]). repr(C) guarantees this
+        // declaration order is the memory order; eflags immediately follows eip at +4.
+        let eip_off = core::mem::offset_of!(Registers, eip);
+        assert_eq!(eip_off, 32 + core::mem::size_of::<[SegmentRegister; 6]>());
+        assert_eq!(core::mem::offset_of!(Registers, eflags), eip_off + 4);
+    }
 
     #[test]
     fn scale_clocks_batches_exactly() {
