@@ -4,3 +4,7 @@
 
 #[allow(dead_code)] // ponytail: consumed by the loop-region compiler in the next spike step
 mod exec_mem;
+#[allow(dead_code)] // ponytail: consumed by the compile driver + dispatch in the next commits
+mod region;
+
+pub(crate) use region::RegionTable;

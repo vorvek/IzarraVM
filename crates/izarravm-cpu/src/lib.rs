@@ -1194,6 +1194,11 @@ pub struct Cpu386 {
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
     // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
     decode_cache: DecodeCache,
+    /// Compiled loop-regions (feature `jit`). Installed by stamping a 1-based index into the
+    /// entry address's `DecodeLine::jit_region`; the table is a transparent accelerator with
+    /// the same equality/clone exclusions as the decode cache. See `jit::region`.
+    #[cfg(feature = "jit")]
+    jit_regions: jit::RegionTable,
     /// Host-side performance counters (diagnostics for `--headless-bench`). Excluded from
     /// equality via `PerfCounters`'s always-equal `PartialEq`, like the decode cache.
     perf: PerfCounters,
