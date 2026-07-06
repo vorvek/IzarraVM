@@ -11478,7 +11478,6 @@ impl Cpu386 {
     /// full 32-bit) operands, matching the lazy-flags contract: `b` is the raw second operand, not
     /// b+carry (plain ADD, carry 0, so the lazy Add form applies).
     #[cfg(feature = "jit")]
-    #[allow(dead_code)] // wired by the v2 region emitter (Phase 2/3); proven equivalent above
     pub(crate) fn jit_set_pending_add(&mut self, a: u32, b: u32) {
         let result = a.wrapping_add(b);
         self.pending_flags = Some(LazyFlags {
@@ -11501,7 +11500,6 @@ impl Cpu386 {
     /// descriptor is dropped). Shifts never stay lazy, so this materializes: it folds any pending
     /// descriptor's CF/OF/AF out, clears pending, and writes CF/OF/AF/SZP live.
     #[cfg(feature = "jit")]
-    #[allow(dead_code)] // wired by the v2 region emitter (Phase 2/3); proven equivalent above
     pub(crate) fn jit_set_shift_flags_shr(&mut self, value: u32, raw_count: u8) {
         let count = u32::from(raw_count) & 0x1f;
         // A zero count affects no flags at all (shift_rotate returns early); the inline path never
