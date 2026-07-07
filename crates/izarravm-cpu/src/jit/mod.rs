@@ -3,8 +3,8 @@
 //! time. Non-(Windows|Linux)-x86-64 hosts compile nothing and run the interpreter unchanged.
 
 pub(crate) mod drawcolumn;
-mod encoder;
-mod exec_mem;
+pub(crate) mod encoder;
+pub(crate) mod exec_mem;
 mod region;
 pub(crate) mod step;
 

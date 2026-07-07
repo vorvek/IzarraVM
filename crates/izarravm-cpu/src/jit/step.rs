@@ -85,8 +85,13 @@ pub(crate) type SetShiftFlagsFn = unsafe extern "C" fn(cpu: *mut Cpu386, value: 
 /// Signature of the charge-cached-fetch call-out. Advances eip by `len` and charges the bus for
 /// the instruction fetch. Returns 0 on success, 1 on fault (the fault is recorded in ctx).
 #[cfg(feature = "jit")]
-pub(crate) type ChargeFetchFn =
-    unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx, lin: u32, len: u32) -> u8;
+pub(crate) type ChargeFetchFn = unsafe extern "C" fn(
+    cpu: *mut Cpu386,
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    lin: u32,
+    len: u32,
+) -> u8;
 
 /// Signature of the scaled-bus-clocks call-out. Returns the live in-batch scaled bus clock count.
 #[cfg(feature = "jit")]

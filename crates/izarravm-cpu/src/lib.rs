@@ -1008,11 +1008,11 @@ pub struct PerfCounters {
     /// TEMPORARY instrumentation: split brk_decode_or_branch into its three causes.
     pub brk_cont_decode_miss: u64, // continuation: next insn not in the decode cache
     pub brk_cont_not_continuable: u64, // continuation: next insn is not continuable (OUT/far/INT/HLT)
-    pub brk_cont_page_cross: u64, // continuation: next insn crosses a 4KB page boundary
-    pub brk_step: u64, // port I/O or a pending HLE soft-int (requires_step_break)
-    pub brk_interrupt: u64, // an instruction made a maskable interrupt serviceable
-    pub brk_cap: u64,  // the run reached the scaled-clock cap
-    pub brk_halt: u64, // the run executed HLT
+    pub brk_cont_page_cross: u64,      // continuation: next insn crosses a 4KB page boundary
+    pub brk_step: u64,                 // port I/O or a pending HLE soft-int (requires_step_break)
+    pub brk_interrupt: u64,            // an instruction made a maskable interrupt serviceable
+    pub brk_cap: u64,                  // the run reached the scaled-clock cap
+    pub brk_halt: u64,                 // the run executed HLT
     /// Decode-cache invalidation diagnostics. `decode_inval_cs_load` counts CS LOADS (which no
     /// longer flush the decode cache: the D bit is in the hit condition and the fetch limit is
     /// re-checked per hit); `decode_inval_smc` counts SMC whole-cache flushes
@@ -2083,7 +2083,7 @@ struct DecodeCache {
     /// Physical page -> the linear page its cached code was decoded through (the narrow SMC
     /// path's physical-to-linear bridge). Populated by `put`, cleared with the marks, so it
     /// exactly describes the currently markable lines.
-    code_page_lin: std::collections::HashMap<u32, PageCodeInfo>,
+    code_page_lin: std::collections::HashMap<u32, PageCodeInfo, U32BuildHasher>,
     /// Bumped whenever a narrow SMC kill lands inside an installed JIT region's physical span:
     /// the region's slot table may now be stale (the entry line's stamp can survive a kill of a
     /// LATER slot's line). `run_region` refuses a region whose `valid_epoch` lags and unstamps
@@ -2092,6 +2092,29 @@ struct DecodeCache {
     #[cfg(feature = "jit")]
     jit_smc_epoch: u32,
 }
+
+/// A tiny multiplicative hasher for the decode cache's `u32`-keyed `code_page_lin` map, replacing
+/// std's SipHash (N2, 2026-07-07 perf plan). `put` runs it on every decode-cache miss-fill; SipHash's
+/// per-lookup cost is wasted on a small integer key. No new dependency: one Fibonacci-multiply on the
+/// `write_u32` path (the only path a `u32` key ever takes), with a byte fallback for completeness.
+#[derive(Default)]
+struct U32Hasher(u64);
+impl std::hash::Hasher for U32Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = (u64::from(i)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+}
+type U32BuildHasher = std::hash::BuildHasherDefault<U32Hasher>;
 
 impl DecodeCache {
     fn new(lines: usize) -> Self {
@@ -2108,7 +2131,7 @@ impl DecodeCache {
             code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
             dirty_byte_words: Vec::new(),
             dirty_page_words: Vec::new(),
-            code_page_lin: std::collections::HashMap::new(),
+            code_page_lin: std::collections::HashMap::default(),
             #[cfg(feature = "jit")]
             jit_smc_epoch: 0,
         }
@@ -3625,8 +3648,7 @@ impl Cpu386 {
             });
             ctx.charge_fetch_fn =
                 Some(jit::step::jit_charge_fetch::<B> as jit::step::ChargeFetchFn);
-            ctx.bus_clocks_fn =
-                Some(jit::step::jit_bus_clocks::<B> as jit::step::BusClocksFn);
+            ctx.bus_clocks_fn = Some(jit::step::jit_bus_clocks::<B> as jit::step::BusClocksFn);
             ctx.line_live_fn = Some(jit::step::jit_line_live as jit::step::LineLiveFn);
             ctx.entry_eip = eip;
             ctx.raw_clocks = 0;
@@ -13995,6 +14017,410 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// G0' CPU-ceiling probe (2026-07-07 JIT/perf plan): how much faster is fully register-allocated
+    /// native codegen of a hot loop than our interpreter? Runs a 32-bit flat drawcolumn-shaped loop
+    /// (15 instructions, 7 memory ops) through the REAL interpreter (`run_straight_line`) and through
+    /// a hand-emitted native version that keeps every guest register in a host register and folds the
+    /// texture base into a host pointer so each guest base+index memory operand lowers to one host SIB
+    /// access (no per-access address-add, which would clobber the loop's live flags). The two runs
+    /// execute on identical fresh memory and their framebuffers are compared byte-for-byte, so a
+    /// codegen bug fails the test instead of faking a speed number. The speedup is an OPTIMISTIC
+    /// ceiling (best-case register allocation + raw-pointer memory vs a lean TestBus interpreter); the
+    /// realistic dynarec lands below it. Run:
+    ///   cargo test -j8 -p izarravm-cpu --release --features jit g0_prime_cpu_ceiling -- --ignored --nocapture
+    #[cfg(feature = "jit")]
+    #[test]
+    #[ignore]
+    fn g0_prime_cpu_ceiling_probe() {
+        use crate::jit::encoder::{Encoder, Reg};
+        use crate::jit::exec_mem::ExecutableBuffer;
+        use std::time::Instant;
+
+        const CODE: u32 = 0x0000;
+        const TEX: u32 = 0x1000; // 512-byte texture region
+        const COUNT_ADDR: u32 = 0x3000;
+        const FB: u32 = 0x0010_0000; // framebuffer
+        const STRIDE: u32 = 0x50; // guest edi advance per iteration (bytes)
+        const STEP1: u32 = 0x0134_5677;
+        const STEP2: u32 = 0x0023_4561;
+        const EBP0: u32 = 0x1234_5678;
+        const ITERS: u32 = 200_000;
+        const TRIALS: usize = 7;
+        const FB_LEN: usize = ITERS as usize * STRIDE as usize;
+        const MEM_LEN: usize = FB as usize + FB_LEN + 0x1000;
+
+        // --- guest loop bytes (32-bit); a trailing HLT ends run_straight_line ---
+        let mut code: Vec<u8> = Vec::new();
+        code.extend_from_slice(&[0x8B, 0xCD]); // mov ecx,ebp
+        code.extend_from_slice(&[0x81, 0xC5]); // add ebp,STEP1
+        code.extend_from_slice(&STEP1.to_le_bytes());
+        code.extend_from_slice(&[0x89, 0x07]); // mov [edi],eax
+        code.extend_from_slice(&[0xC1, 0xE9, 0x18]); // shr ecx,24
+        code.extend_from_slice(&[0x8B, 0xD5]); // mov edx,ebp
+        code.extend_from_slice(&[0x81, 0xC5]); // add ebp,STEP2
+        code.extend_from_slice(&STEP2.to_le_bytes());
+        code.extend_from_slice(&[0x89, 0x5F, 0x04]); // mov [edi+4],ebx
+        code.extend_from_slice(&[0xC1, 0xEA, 0x18]); // shr edx,24
+        code.extend_from_slice(&[0x8B, 0x04, 0x0E]); // mov eax,[esi+ecx]
+        code.extend_from_slice(&[0x81, 0xC7]); // add edi,STRIDE
+        code.extend_from_slice(&STRIDE.to_le_bytes());
+        code.extend_from_slice(&[0x8B, 0x1C, 0x16]); // mov ebx,[esi+edx]
+        code.extend_from_slice(&[0xFF, 0x0D]); // dec dword [COUNT_ADDR]
+        code.extend_from_slice(&COUNT_ADDR.to_le_bytes());
+        code.extend_from_slice(&[0x8B, 0x04, 0x0E]); // mov eax,[esi+ecx]
+        code.extend_from_slice(&[0x8B, 0x1C, 0x16]); // mov ebx,[esi+edx]
+        let jnz_at = code.len();
+        let rel = (0i32 - (jnz_at as i32 + 2)) as i8; // back to CODE (offset 0)
+        code.extend_from_slice(&[0x75, rel as u8]); // jnz entry
+        code.push(0xF4); // hlt
+        assert!(
+            code.len() < TEX as usize,
+            "code overruns the texture region"
+        );
+
+        let build_mem = || {
+            let mut m = vec![0u8; MEM_LEN];
+            m[..code.len()].copy_from_slice(&code);
+            for i in 0..512u32 {
+                m[(TEX + i) as usize] = (i as u8).wrapping_mul(37).wrapping_add(11);
+            }
+            m[COUNT_ADDR as usize..COUNT_ADDR as usize + 4].copy_from_slice(&ITERS.to_le_bytes());
+            m
+        };
+
+        let seg = |selector: u16, access: u8| SegmentRegister {
+            selector,
+            base: 0,
+            limit: 0xffff_ffff,
+            access,
+            default_size_32: true,
+        };
+        let setup = |cpu: &mut Cpu386| {
+            cpu.control.cr0 |= CR0_PE;
+            cpu.registers.set_segment(SegmentIndex::Cs, seg(0x08, 0x9b)); // 32-bit code
+            cpu.registers.set_segment(SegmentIndex::Ds, seg(0x10, 0x93)); // data
+            cpu.registers.set_segment(SegmentIndex::Ss, seg(0x10, 0x93));
+            cpu.registers.set_segment(SegmentIndex::Es, seg(0x10, 0x93));
+            cpu.registers.eip = CODE;
+            cpu.registers.set_eax(0);
+            cpu.registers.set_ebx(0);
+            cpu.registers.set_ecx(0);
+            cpu.registers.set_edx(0);
+            cpu.registers.set_ebp(EBP0);
+            cpu.registers.set_esi(TEX);
+            cpu.registers.set_edi(FB);
+        };
+
+        // --- native emission: guest regs pinned in host regs, memory via host pointers ---
+        // ebp=R8 ecx=R9 edx=R10 eax=R11 ebx=RBX ; esi_host=R12 (ram+TEX) edi_host=R13 (ram+FB) count=R14
+        // arg0(RCX)=ram_base, arg1(RDX)=iters.
+        let native = {
+            let mut e = Encoder::new();
+            e.push(Reg::RBX);
+            e.push(Reg::R12);
+            e.push(Reg::R13);
+            e.push(Reg::R14);
+            e.mov_r64_r64(Reg::R12, Reg::RCX);
+            e.add_r64_imm32(Reg::R12, TEX); // esi_host = ram_base + TEX
+            e.mov_r64_r64(Reg::R13, Reg::RCX);
+            e.add_r64_imm32(Reg::R13, FB); // edi_host = ram_base + FB
+            e.mov_r32_r32(Reg::R14, Reg::RDX); // count = iters
+            e.mov_r32_imm32(Reg::R8, EBP0); // ebp
+            e.mov_r32_imm32(Reg::R9, 0); // ecx
+            e.mov_r32_imm32(Reg::R10, 0); // edx
+            e.mov_r32_imm32(Reg::R11, 0); // eax
+            e.mov_r32_imm32(Reg::RBX, 0); // ebx
+            let top = e.label();
+            e.place(top);
+            e.mov_r32_r32(Reg::R9, Reg::R8); // mov ecx,ebp
+            e.add_r32_imm32(Reg::R8, STEP1); // add ebp,STEP1
+            e.store_r32_disp8(Reg::R13, 0, Reg::R11); // mov [edi],eax
+            e.shr_r32_imm8(Reg::R9, 24); // shr ecx,24
+            e.mov_r32_r32(Reg::R10, Reg::R8); // mov edx,ebp
+            e.add_r32_imm32(Reg::R8, STEP2); // add ebp,STEP2
+            e.store_r32_disp8(Reg::R13, 4, Reg::RBX); // mov [edi+4],ebx
+            e.shr_r32_imm8(Reg::R10, 24); // shr edx,24
+            e.load_r32_sib(Reg::R11, Reg::R12, Reg::R9); // mov eax,[esi+ecx]
+            e.add_r64_imm32(Reg::R13, STRIDE); // add edi,STRIDE (host ptr)
+            e.load_r32_sib(Reg::RBX, Reg::R12, Reg::R10); // mov ebx,[esi+edx]
+            e.add_r32_imm32(Reg::R14, 0xFFFF_FFFF); // dec count (sets ZF)
+            e.load_r32_sib(Reg::R11, Reg::R12, Reg::R9); // mov eax,[esi+ecx] (no flag change)
+            e.load_r32_sib(Reg::RBX, Reg::R12, Reg::R10); // mov ebx,[esi+edx] (no flag change)
+            e.jnz(top); // jnz entry
+            e.pop(Reg::R14);
+            e.pop(Reg::R13);
+            e.pop(Reg::R12);
+            e.pop(Reg::RBX);
+            e.ret();
+            ExecutableBuffer::new(&e.finish()).expect("W^X alloc must succeed on the dev host")
+        };
+        type NativeFn = unsafe extern "C" fn(*mut u8, u32);
+        let native_fn: NativeFn = unsafe { std::mem::transmute(native.entry_ptr()) };
+
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let insns = 15u64 * ITERS as u64;
+        let mut interp_ns = Vec::new();
+        let mut native_ns = Vec::new();
+        for trial in 0..=TRIALS {
+            // interpreter: run_straight_line chains a bounded number of instructions per call then
+            // returns (a non-continuable insn / the final HLT ends the run), exactly as under the
+            // machine. Drive it until the guest loop counter reaches 0.
+            let mut cpu = Cpu386::default();
+            setup(&mut cpu);
+            let mut bus = TestBus::with_memory(build_mem());
+            // TestBus defaults to Full tracing (an unbounded per-access cycle Vec) — a test
+            // instrumentation cost the real MachineBus never pays. Disable it so the interpreter
+            // baseline is representative. (Residual caveat: TestBus still lacks MachineBus's cached
+            // raw-pointer direct-page path, so it is marginally slower than the real bus — a small
+            // bias in the native side's favor, noted in the results.)
+            bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+            let count_of = |bus: &TestBus| {
+                u32::from_le_bytes(
+                    bus.memory[COUNT_ADDR as usize..COUNT_ADDR as usize + 4]
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+            let t = Instant::now();
+            let mut calls = 0u64;
+            loop {
+                let out = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+                calls += 1;
+                if out.halted || count_of(&bus) == 0 {
+                    break;
+                }
+                assert!(
+                    calls < ITERS as u64 * 4 + 1000,
+                    "run_straight_line not converging (calls={calls}, left={})",
+                    count_of(&bus)
+                );
+            }
+            let ins = t.elapsed().as_secs_f64();
+            let left = count_of(&bus);
+            assert_eq!(
+                left, 0,
+                "loop did not run all {ITERS} iterations (count={left})"
+            );
+            if trial == 0 {
+                eprintln!(
+                    "(interp chaining: {calls} run_straight_line calls for {ITERS} iters = {:.1} insns/call)",
+                    insns as f64 / calls as f64
+                );
+            }
+
+            // native (identical fresh memory)
+            let mut memn = build_mem();
+            let t = Instant::now();
+            unsafe { native_fn(memn.as_mut_ptr(), ITERS) };
+            let nns = t.elapsed().as_secs_f64();
+
+            // correctness: framebuffers must be byte-identical
+            let a = &bus.memory[FB as usize..FB as usize + FB_LEN];
+            let b = &memn[FB as usize..FB as usize + FB_LEN];
+            if a != b {
+                let idx = a.iter().zip(b).position(|(x, y)| x != y).unwrap();
+                panic!(
+                    "native framebuffer diverges from interpreter at FB+{idx}: interp={} native={}",
+                    a[idx], b[idx]
+                );
+            }
+
+            if trial > 0 {
+                // discard trial 0 (cold host caches)
+                interp_ns.push(ins / insns as f64 * 1e9);
+                native_ns.push(nns / insns as f64 * 1e9);
+            }
+        }
+        let mi = median(interp_ns);
+        let mn = median(native_ns);
+        eprintln!("\n=== G0' CPU-ceiling probe ({ITERS} iters x 15 insns, median of {TRIALS}) ===");
+        eprintln!("interpreter : {mi:.3} ns/guest-insn");
+        eprintln!("native (best-case, reg-allocated + raw-ptr mem) : {mn:.3} ns/guest-insn");
+        eprintln!(
+            "SPEEDUP CEILING : {:.2}x   [4x = 'already very good' bar]",
+            mi / mn
+        );
+        eprintln!("=== end G0' (memory-mixed) ===\n");
+    }
+
+    /// G0' companion: an ARTIFACT-FREE dispatch-only ceiling. A 15-instruction register-only loop
+    /// (no memory operands at all, so ZERO bus involvement — the TestBus memory-path caveat cannot
+    /// apply) isolating the interpreter's pure per-instruction dispatch/decode/flag/clock-accounting
+    /// overhead vs native register ops. This anchors that the memory-mixed interpreter figure is real
+    /// and not a bus artifact. Correctness is checked by comparing final guest register values.
+    #[cfg(feature = "jit")]
+    #[test]
+    #[ignore]
+    fn g0_prime_dispatch_ceiling_probe() {
+        use crate::jit::encoder::{Encoder, Reg};
+        use crate::jit::exec_mem::ExecutableBuffer;
+        use std::time::Instant;
+
+        const STEP1: u32 = 0x0134_5677;
+        const STEP2: u32 = 0x0023_4561;
+        const EBP0: u32 = 0x1234_5678;
+        const ITERS: u32 = 300_000;
+        const TRIALS: usize = 7;
+
+        // register-only guest loop (counter in edi); trailing HLT.
+        let mut code: Vec<u8> = Vec::new();
+        code.extend_from_slice(&[0x8B, 0xCD]); // mov ecx,ebp
+        code.extend_from_slice(&[0x81, 0xC5]);
+        code.extend_from_slice(&STEP1.to_le_bytes()); // add ebp,STEP1
+        code.extend_from_slice(&[0xC1, 0xE9, 0x18]); // shr ecx,24
+        code.extend_from_slice(&[0x8B, 0xD5]); // mov edx,ebp
+        code.extend_from_slice(&[0x81, 0xC5]);
+        code.extend_from_slice(&STEP2.to_le_bytes()); // add ebp,STEP2
+        code.extend_from_slice(&[0xC1, 0xEA, 0x18]); // shr edx,24
+        code.extend_from_slice(&[0x8B, 0xC1]); // mov eax,ecx
+        code.extend_from_slice(&[0x81, 0xC0]);
+        code.extend_from_slice(&STEP1.to_le_bytes()); // add eax,STEP1
+        code.extend_from_slice(&[0xC1, 0xE8, 0x03]); // shr eax,3
+        code.extend_from_slice(&[0x8B, 0xDA]); // mov ebx,edx
+        code.extend_from_slice(&[0x81, 0xC3]);
+        code.extend_from_slice(&STEP2.to_le_bytes()); // add ebx,STEP2
+        code.extend_from_slice(&[0xC1, 0xEB, 0x03]); // shr ebx,3
+        code.extend_from_slice(&[0x81, 0xC6]);
+        code.extend_from_slice(&STEP1.to_le_bytes()); // add esi,STEP1
+        code.extend_from_slice(&[0x81, 0xC7]);
+        code.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // add edi,-1 (dec, sets ZF)
+        let jnz_at = code.len();
+        let rel = (0i32 - (jnz_at as i32 + 2)) as i8;
+        code.extend_from_slice(&[0x75, rel as u8]); // jnz entry
+        code.push(0xF4); // hlt
+
+        let seg = |selector: u16, access: u8| SegmentRegister {
+            selector,
+            base: 0,
+            limit: 0xffff_ffff,
+            access,
+            default_size_32: true,
+        };
+
+        // native register-only emission; final regs written to out[0..6] = eax,ebx,ecx,edx,ebp,esi.
+        let native = {
+            let mut e = Encoder::new();
+            e.push(Reg::RBX);
+            e.push(Reg::R12);
+            e.push(Reg::R14);
+            e.push(Reg::R15);
+            e.mov_r32_r32(Reg::R14, Reg::RCX); // count = iters (arg0)
+            e.mov_r64_r64(Reg::R15, Reg::RDX); // out ptr (arg1)
+            e.mov_r32_imm32(Reg::R8, EBP0); // ebp
+            e.mov_r32_imm32(Reg::R9, 0); // ecx
+            e.mov_r32_imm32(Reg::R10, 0); // edx
+            e.mov_r32_imm32(Reg::R11, 0); // eax
+            e.mov_r32_imm32(Reg::RBX, 0); // ebx
+            e.mov_r32_imm32(Reg::R12, 0); // esi
+            let top = e.label();
+            e.place(top);
+            e.mov_r32_r32(Reg::R9, Reg::R8); // mov ecx,ebp
+            e.add_r32_imm32(Reg::R8, STEP1);
+            e.shr_r32_imm8(Reg::R9, 24);
+            e.mov_r32_r32(Reg::R10, Reg::R8); // mov edx,ebp
+            e.add_r32_imm32(Reg::R8, STEP2);
+            e.shr_r32_imm8(Reg::R10, 24);
+            e.mov_r32_r32(Reg::R11, Reg::R9); // mov eax,ecx
+            e.add_r32_imm32(Reg::R11, STEP1);
+            e.shr_r32_imm8(Reg::R11, 3);
+            e.mov_r32_r32(Reg::RBX, Reg::R10); // mov ebx,edx
+            e.add_r32_imm32(Reg::RBX, STEP2);
+            e.shr_r32_imm8(Reg::RBX, 3);
+            e.add_r32_imm32(Reg::R12, STEP1); // add esi,STEP1
+            e.add_r32_imm32(Reg::R14, 0xFFFF_FFFF); // dec edi (counter), sets ZF
+            e.jnz(top);
+            e.store_r32_disp8(Reg::R15, 0, Reg::R11); // out[0]=eax
+            e.store_r32_disp8(Reg::R15, 4, Reg::RBX); // out[1]=ebx
+            e.store_r32_disp8(Reg::R15, 8, Reg::R9); // out[2]=ecx
+            e.store_r32_disp8(Reg::R15, 12, Reg::R10); // out[3]=edx
+            e.store_r32_disp8(Reg::R15, 16, Reg::R8); // out[4]=ebp
+            e.store_r32_disp8(Reg::R15, 20, Reg::R12); // out[5]=esi
+            e.pop(Reg::R15);
+            e.pop(Reg::R14);
+            e.pop(Reg::R12);
+            e.pop(Reg::RBX);
+            e.ret();
+            ExecutableBuffer::new(&e.finish()).expect("W^X alloc must succeed")
+        };
+        type NativeFn = unsafe extern "C" fn(u32, *mut u32);
+        let native_fn: NativeFn = unsafe { std::mem::transmute(native.entry_ptr()) };
+
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let insns = 15u64 * ITERS as u64;
+        let mut interp_ns = Vec::new();
+        let mut native_ns = Vec::new();
+        for trial in 0..=TRIALS {
+            let mut cpu = Cpu386::default();
+            cpu.control.cr0 |= CR0_PE;
+            cpu.registers.set_segment(SegmentIndex::Cs, seg(0x08, 0x9b));
+            cpu.registers.set_segment(SegmentIndex::Ds, seg(0x10, 0x93));
+            cpu.registers.set_segment(SegmentIndex::Ss, seg(0x10, 0x93));
+            cpu.registers.eip = 0;
+            cpu.registers.set_eax(0);
+            cpu.registers.set_ebx(0);
+            cpu.registers.set_ecx(0);
+            cpu.registers.set_edx(0);
+            cpu.registers.set_ebp(EBP0);
+            cpu.registers.set_esi(0);
+            cpu.registers.set_edi(ITERS);
+            let mut mem = vec![0u8; 0x1000];
+            mem[..code.len()].copy_from_slice(&code);
+            let mut bus = TestBus::with_memory(mem);
+            bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+            let t = Instant::now();
+            let mut calls = 0u64;
+            loop {
+                let out = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+                calls += 1;
+                if out.halted || cpu.registers.edi() == 0 {
+                    break;
+                }
+                assert!(calls < ITERS as u64 * 4 + 1000, "not converging");
+            }
+            let ins = t.elapsed().as_secs_f64();
+            assert_eq!(cpu.registers.edi(), 0, "loop did not complete");
+
+            let mut out = [0u32; 6];
+            let t = Instant::now();
+            unsafe { native_fn(ITERS, out.as_mut_ptr()) };
+            let nns = t.elapsed().as_secs_f64();
+
+            // correctness: final registers must match.
+            let interp_regs = [
+                cpu.registers.eax(),
+                cpu.registers.ebx(),
+                cpu.registers.ecx(),
+                cpu.registers.edx(),
+                cpu.registers.ebp(),
+                cpu.registers.esi(),
+            ];
+            assert_eq!(
+                out, interp_regs,
+                "native register-only result diverges from interpreter"
+            );
+
+            if trial > 0 {
+                interp_ns.push(ins / insns as f64 * 1e9);
+                native_ns.push(nns / insns as f64 * 1e9);
+            }
+        }
+        let mi = median(interp_ns);
+        let mn = median(native_ns);
+        eprintln!(
+            "\n=== G0' dispatch-only ceiling (register-only loop, NO memory/bus artifact) ==="
+        );
+        eprintln!("interpreter : {mi:.3} ns/guest-insn");
+        eprintln!("native      : {mn:.3} ns/guest-insn");
+        eprintln!("DISPATCH SPEEDUP CEILING : {:.2}x", mi / mn);
+        eprintln!("=== end G0' (dispatch-only) ===\n");
     }
 
     #[test]
