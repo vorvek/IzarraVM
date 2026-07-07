@@ -14467,6 +14467,76 @@ mod tests {
         }
     }
 
+    /// S0 (JIT/perf plan, council #1 finding): a compiled block that contains x87 ops carries a
+    /// SECOND remainder (`fp_rem`) besides the integer `timing_rem`, and it must batch into one
+    /// block-exit flush with the SAME carry as per-op scaling, or the block's guest cycle count
+    /// diverges from the interpreter. Unlike integer clocks (one per-level numerator), FP ops have
+    /// PER-CLASS numerators, so the batched form weights each op by its class before summing; the
+    /// shared `FP_TIMING_DEN` is what keeps the single `fp_rem` carry exact across mixed classes.
+    /// This pins `Σ scale_fp_clocks == floor((Σ clocks·num_class + rem0) / DEN)` with the final
+    /// remainder `(Σ clocks·num_class + rem0) % DEN` — the identity a future `scale_fp_clocks_batch`
+    /// (added with S2's x87 templates) must satisfy, and a guard that scale_fp_clocks never drops
+    /// the shared-denominator property the batch relies on.
+    #[test]
+    fn scale_fp_clocks_batches_exactly() {
+        use FpOpClass::{F32Mem, F64Mem, IntConvert16, IntConvert32, Register, Wait};
+        let seqs: [&[(u32, FpOpClass)]; 3] = [
+            &[
+                (4, IntConvert32),
+                (1, Register),
+                (3, F64Mem),
+                (2, IntConvert16),
+                (1, Register),
+            ],
+            &[(1, Register); 20],
+            &[
+                (7, F32Mem),
+                (2, IntConvert32),
+                (9, Register),
+                (1, Wait),
+                (5, IntConvert16),
+                (3, F64Mem),
+            ],
+        ];
+        for level in [
+            CpuLevel::I286,
+            CpuLevel::I386,
+            CpuLevel::I486,
+            CpuLevel::I586,
+        ] {
+            for start_rem in [0u64, 1, 5, 7] {
+                for seq in seqs {
+                    let mut indiv = Cpu386::default();
+                    indiv.set_level(level);
+                    indiv.fp_rem = start_rem;
+                    let sum_individual: u64 = seq
+                        .iter()
+                        .map(|&(c, cl)| u64::from(indiv.scale_fp_clocks(c, cl)))
+                        .sum();
+
+                    // Closed-form batched value: sum the per-op class-weighted numerators, then one
+                    // exact division with the single carried remainder.
+                    let weighted: u64 = seq
+                        .iter()
+                        .map(|&(c, cl)| u64::from(c) * u64::from(fp_timing_class(level, cl)))
+                        .sum();
+                    let scaled = weighted + start_rem;
+                    let batched = scaled / u64::from(FP_TIMING_DEN);
+                    let final_rem = scaled % u64::from(FP_TIMING_DEN);
+
+                    assert_eq!(
+                        sum_individual, batched,
+                        "level {level:?} rem {start_rem}: per-op FP sum != batched"
+                    );
+                    assert_eq!(
+                        indiv.fp_rem, final_rem,
+                        "level {level:?} rem {start_rem}: fp_rem carry diverged"
+                    );
+                }
+            }
+        }
+    }
+
     #[derive(Default)]
     struct TestBus {
         memory: Vec<u8>,
