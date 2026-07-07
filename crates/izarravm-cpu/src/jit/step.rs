@@ -134,10 +134,11 @@ pub(crate) struct RegionCtx {
     #[cfg(feature = "jit")]
     pub line_live_fn: Option<LineLiveFn>,
     pub slots: Vec<Slot>,
-    /// Index of the final slot (the back-edge Jcc). Taken = native back-edge; not taken =
-    /// `LoopDone`.
-    pub jnz_slot: u32,
-    /// eip of the region's first instruction at this entry (the back-edge target).
+    /// Index of the block's terminal slot. For a self-loop (`is_loop`) it is the back-edge branch:
+    /// taken = native back-edge, not taken = `LoopDone`. For a linear block it is the last slot:
+    /// after it the region always returns to the interpreter at the current EIP.
+    pub terminal_slot: u32,
+    /// eip of the region's first instruction at this entry (the self-loop back-edge target).
     pub entry_eip: u32,
 
     // Per-entry state, reset by the dispatch before each region call.
@@ -166,6 +167,11 @@ pub(crate) struct RegionCtx {
     /// unwound without committing (interpreter fault contract); it is NOT re-executed.
     pub fault: Option<(u32, InternalFault)>,
     pub halted: bool,
+    /// Whether the block is a self-loop (terminal slot is a relative branch back to the entry) or
+    /// a linear block. Read by `region_step` at the terminal slot to decide loop vs return. Placed
+    /// last so it does not shift any offset the emitted native code reads (fn pointers 0..48, the
+    /// timing fields 88..144); the emitter never reads this field.
+    pub is_loop: bool,
 }
 
 impl RegionCtx {
@@ -246,14 +252,23 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
             // interpreter's probe miss and end the run at this boundary, so the region must
             // stop here too. Nothing can re-decode a line mid-region (no decode runs inside),
             // so line-live implies the line still holds the insn the slot table captured.
-            if k == ctx.jnz_slot {
-                if cpu.registers.eip == ctx.entry_eip {
+            if k == ctx.terminal_slot {
+                // Self-loop, back-edge taken: the emitted code loops to slot 0, provided the entry
+                // line is still live (the interpreter's own re-probe of the loop head).
+                if ctx.is_loop && cpu.registers.eip == ctx.entry_eip {
                     if !cpu.decode_cache.line_live(ctx.slots[0].lin, ctx.d) {
                         return STOP;
                     }
                     return CONTINUE; // taken: the emitted code loops to slot 0
                 }
-                ctx.exit = RegionExitKind::LoopDone;
+                // A linear block, or a self-loop whose back-edge fell through: return to the
+                // interpreter at the current EIP. `LoopDone` for the fall-through of a loop (the
+                // guest loop finished), `Boundary` for a linear block that just ran to its end.
+                ctx.exit = if ctx.is_loop {
+                    RegionExitKind::LoopDone
+                } else {
+                    RegionExitKind::Boundary
+                };
                 return STOP;
             }
             if !cpu

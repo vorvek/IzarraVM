@@ -1,40 +1,46 @@
-//! Recognizes Doom's R_DrawColumn inner loop (the 15-instruction, 51-byte, 2-pixel-unrolled
-//! column rasterizer at linear 0x473DF8 in the shipped DOS build) from the decode cache, and
-//! compiles it as a loop-region: emitted native code that chains one `region_step` call per
-//! instruction slot with a native back-edge. This is intentionally a pattern match against ONE
-//! specific shape (spike 4 proves the machinery); coverage scales by adding shape tables, not by
-//! generalizing this one.
+//! Generic forward-decode basic-block builder (DYN-S1). Starting at any hot linear PC,
+//! `build_block` walks the decode cache forward, collecting continuable slots until the first
+//! block terminator, and `try_admit` compiles the result as a loop-region: emitted native code
+//! that chains one `region_step` call per slot, with a native back-edge for a self-loop and a
+//! return-to-interpreter for a linear block. Execution stays the proven v1/v2 trampoline (each
+//! slot runs through the interpreter's own dispatch, so per-slot SEMANTICS need no validation
+//! here); this stage delivers general block coverage plus the timing and terminator contracts,
+//! not the native-template speedup (that is S2).
 //!
-//! ## What the matcher must guarantee (the region's admission invariants)
+//! ## What the builder vouches for (the region's admission invariants)
 //!
-//! The step function executes each slot through the interpreter's own dispatch, so per-slot
-//! SEMANTICS need no validation here. What the matcher vouches for is the region's control-flow
-//! and environment assumptions:
-//! - Straight line: every slot but the last falls through to the next; the last is a rel8 Jcc
-//!   whose taken target is exactly the entry (rel == -span), so "taken" is the native back-edge
-//!   and "not taken" resumes interpretation at the fall-through.
-//! - No IF writers, no HLT, no TSC/MSR readers, no far transfers, no port I/O in the opcode
-//!   table. These make the region's deferred accounting sound: `can_take_interrupt` cannot
-//!   transition inside, and nothing reads `elapsed_clocks` mid-region. A future shape table must
-//!   preserve this exclusion list (`continuable` alone does NOT: STI is continuable).
-//! - No in-loop store may alias the region's own code bytes. The back-edge re-probes only the
-//!   entry slot's line, and the staleness epoch is checked at entry, not per iteration; a shape
-//!   that patches an EARLIER slot from inside the loop would re-run the stale slot snapshot on
-//!   the next iteration. The drawcolumn stores target the framebuffer and the column counter,
-//!   never the 51 code bytes (the self-patch comes from setup code outside the loop).
-//! - Every slot's decode is live in the cache (generation-current), unprefixed, `continuable`,
-//!   and stays inside its 4 KB page, mirroring the run loop's own continuation gate.
+//! - The block is a maximal run of interior-eligible slots. `continuable` (resolved once at decode,
+//!   `block_continuable`) covers MOST of the spec §2.9 terminator predicate, inverted: it excludes
+//!   control-flow mutators, CR/DR/segment/paging changers, HLT, far transfers, INT/IRET, MOV-CR/DR,
+//!   LGDT.., OUT, INS/OUTS, and the clock readers RDTSC/WRMSR (all non-continuable). IN and
+//!   TEST-acc-imm ARE admitted as interior continuations in the Approximate class (the P4a
+//!   poll-loop win); they are runtime step-breaks, NOT compile-time terminators, and
+//!   `region_step`'s per-slot `requires_step_break()` check ends the block when a real device is
+//!   actually touched.
+//! - Only the TERMINAL slot may transfer control OR change interrupt visibility. An interior slot
+//!   must fall through to `lin+len` (else the next slot's snapshot would not be what runs), so
+//!   branches / near RET / near indirect CALL/JMP always end the block. A relative branch whose
+//!   static target is the entry is a self-loop back-edge (the drawcolumn case, generalized).
+//! - `continuable` alone is NOT the terminator predicate: it admits STI/CLI/POPF and the SS-loads
+//!   (the interpreter runs them inline with a per-instruction interrupt check). The region defers
+//!   that check to the boundary, so those IF/shadow changers also end the block as its terminal
+//!   slot (`changes_interrupt_visibility`); the deferred post-region check then fires at exactly
+//!   the interpreter's boundary. This is the spec §2.9 behavioral predicate, enumerated from the
+//!   interpreter's own IF-writer and shadow-arming sites.
+//! - Every slot's decode is live in the cache (generation-current), unprefixed, and stays inside
+//!   its 4 KB page, mirroring the run loop's own continuation gate. The physical span is captured
+//!   at admission; a narrow-SMC kill inside it stales the slot table via the epoch.
+//! - The block key includes the CPU mode/size bitmask (`Cpu386::jit_mode_key`), validated at
+//!   entry, so a block compiled for one mode is never reused in another at the same phys/d
+//!   (spec §2.2).
 //!
-//! ## Self-patched immediates
+//! ## Self-patched immediates (unchanged from the drawcolumn spike)
 //!
-//! The rasterizer's setup code rewrites the two `add ebp,imm32` step values in place before
-//! column batches. Each patch bumps the decode generation (SMC watch), which kills the stamped
-//! line and with it the region stamp; the interpreter then re-decodes the loop on its next pass
-//! and admission re-runs this matcher against the FRESH decodes. `try_admit` finds the existing
-//! region and replaces its slot table wholesale, so the new immediates ride along in
-//! `DecodedInsn.imm` and the emitted buffer (which encodes only the slot count) is reused. The
-//! two imm32 slots therefore have `imm: None` (any value matches); the structurally fixed
-//! immediates (the shift counts, the destination stride) are pinned.
+//! A store that patches a slot's immediate bumps the decode generation (SMC watch), which kills
+//! the stamped line and the region stamp; the interpreter re-decodes and admission re-runs the
+//! builder against the FRESH decodes. `try_admit` finds the existing region, rebuilds its slot
+//! table wholesale (so patched immediates ride along in `DecodedInsn.imm`), and re-emits the
+//! buffer (v2 bakes the add-imm immediates into the emitted bytes).
 
 use std::num::NonZeroU32;
 
@@ -42,70 +48,34 @@ use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableBuffer;
 use super::region::CompiledRegion;
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
-use crate::{Cpu386, DecodedInsn, Prefixes};
+use crate::{Cpu386, DecodeGroup, DecodedInsn, OperandSize, Prefixes};
 
-/// One slot's structural requirements. `modrm` is (mode, reg, rm); `imm` pins a structural
-/// immediate (`None` = any value, the self-patched or don't-care slots).
-struct SlotSpec {
-    opcode: u16,
-    len: u8,
-    modrm: Option<(u8, u8, u8)>,
-    imm: Option<u32>,
-}
+/// Cap on a compiled block's slot count, to bound the emit and the compile pass. A block that
+/// reaches the cap ends linearly (its tail is interpreted); real hot loops are far smaller.
+const MAX_BLOCK_SLOTS: usize = 128;
 
-#[allow(non_snake_case)]
-fn S(opcode: u16, len: u8, modrm: Option<(u8, u8, u8)>, imm: Option<u32>) -> SlotSpec {
-    SlotSpec {
-        opcode,
-        len,
-        modrm,
-        imm,
-    }
-}
-
-/// The R_DrawColumn inner loop, as disassembled from the mid-demo census dump (kickoff brief):
-/// two unrolled texture-step/plot pairs, the colormap double-indirection, the in-memory count
-/// DEC, and the rel8 back-edge. The memory operands' exact base/index registers are NOT pinned
-/// here: execution follows the stored `DecodedInsn`, so a same-structure loop with different
-/// registers would compile and run just as correctly.
-#[rustfmt::skip]
-fn drawcolumn_shape() -> [SlotSpec; 15] {
-    [
-        S(0x8b, 2, Some((3, 1, 5)), None),       // mov ecx,ebp
-        S(0x81, 6, Some((3, 0, 5)), None),       // add ebp,imm32   (self-patched)
-        S(0x88, 2, Some((0, 0, 7)), None),       // mov [edi],al
-        S(0xc1, 3, Some((3, 5, 1)), Some(25)),   // shr ecx,25
-        S(0x8b, 2, Some((3, 2, 5)), None),       // mov edx,ebp
-        S(0x81, 6, Some((3, 0, 5)), None),       // add ebp,imm32   (self-patched)
-        S(0x88, 3, Some((1, 3, 7)), None),       // mov [edi+0x50],bl
-        S(0xc1, 3, Some((3, 5, 2)), Some(25)),   // shr edx,25
-        S(0x8a, 3, Some((0, 0, 4)), None),       // mov al,[esi+ecx]
-        S(0x81, 6, Some((3, 0, 7)), Some(0xa0)), // add edi,0xa0
-        S(0x8a, 3, Some((0, 3, 4)), None),       // mov bl,[esi+edx]
-        S(0xff, 6, Some((0, 1, 5)), None),       // dec dword [disp32]
-        S(0x8a, 2, Some((0, 0, 0)), None),       // mov al,[eax]
-        S(0x8a, 2, Some((0, 3, 3)), None),       // mov bl,[ebx]
-        S(0x75, 2, None, None),                  // jnz -> entry (rel checked below)
-    ]
-}
-
-/// Classify a matched instruction into its emitted-code strategy. The register-only mov/add/shr
-/// forms (modrm mode 3) inline natively; everything else (memory operands, the back-edge Jcc) goes
-/// through the v1 per-slot step. The gpr indices and immediates are read from the captured decode
-/// so self-patched immediates (the add-imm slots) stay current across re-stamps.
-///
-/// Only the exact opcodes the drawcolumn shape admits reach here (the matcher already verified
-/// opcode + modrm), so the classification is exhaustive over the shape; a slot that matched the
-/// shape but is not one of the three inline-able register forms falls through to Memory.
+/// Classify an interior slot into its emitted-code strategy. The register-only mov/add/shr forms
+/// (modrm mode 3) inline natively; everything else (memory operands, modrm-less ops) goes through
+/// the v1 per-slot step. The gpr indices and immediates are read from the captured decode so a
+/// self-patched immediate (the add-imm slots) stays current across re-stamps. Only interior slots
+/// pass through here: `build_block` classifies the terminal slot separately (a loop back-edge is
+/// `BackEdge`, a linear end is `Memory`), both of which run through the full step.
 fn classify_slot(insn: &DecodedInsn) -> SlotKind {
     let Some(m) = insn.modrm else {
-        // The only modrm-less slot in the shape is the final rel8 Jnz back-edge.
-        return SlotKind::BackEdge;
+        // A modrm-less interior op (push/pop/nop/int-free single-byte forms) has no inline
+        // template yet; run it through the full step. (The terminal back-edge Jcc is classified
+        // by build_block, never here.)
+        return SlotKind::Memory;
     };
     // mode 3 = register-only (no memory operand). The three inline-able opcode classes:
     // 0x8B mov r32,r32 (reg=dst, rm=src); 0x81 /0 add r32,imm32 (reg=0, rm=dst); 0xC1 /5 shr
-    // r32,imm8 (reg=5, rm=dst). All are 32-bit operand size in this loop.
-    if m.mode == 3 {
+    // r32,imm8 (reg=5, rm=dst). The inline emit is 32-bit ONLY (load_r32/add_r32_imm32/shr_r32
+    // and Dword flags), so it is correct only at 32-bit operand size. Operand size is mode-derived
+    // (`Cpu386::operand_size`): in a 32-bit code segment the r32 form is unprefixed and the r16
+    // form carries 0x66 (rejected by build_block); in a 16-bit code segment it is the OPPOSITE, so
+    // the unprefixed r16 form would reach here. Gating on `Dword` keeps those 16-bit forms on the
+    // full trampoline step (correct width, interpreter-identical) instead of a wrong-width inline.
+    if m.mode == 3 && insn.operand_size == OperandSize::Dword {
         match insn.opcode {
             0x8B => {
                 return SlotKind::RegMov {
@@ -131,48 +101,131 @@ fn classify_slot(insn: &DecodedInsn) -> SlotKind {
     SlotKind::Memory
 }
 
-/// Walk the decode cache from `entry_lin` and match the shape. `None` when any slot is cold
-/// (the interpreter warms it naturally; admission just retries later) or does not match.
-pub(crate) fn match_drawcolumn(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<Vec<Slot>> {
-    let shape = drawcolumn_shape();
-    let mut slots = Vec::with_capacity(shape.len());
-    let mut lin = entry_lin;
-    for spec in &shape {
-        let insn = cpu.decode_cache.get(lin, d)?;
-        if insn.opcode != spec.opcode || insn.len != spec.len {
-            return None;
+/// Whether an instruction transfers control (so it cannot be an interior slot: after it, EIP is
+/// not `lin+len`). These are exactly the `continuable` forms that do not fall through:
+/// - the whole Branch group (Jcc / JMP rel / LOOP / JCXZ / CALL rel),
+/// - near RET (0xC2/0xC3),
+/// - the near indirect CALL (0xFF /2) and JMP (0xFF /4) within ControlFlow (its /0 /1 /6 forms
+///   are INC/DEC/PUSH r/m, which DO fall through and stay interior).
+///
+/// Everything else `continuable` (ALU/DataMove/Stack/Group/FlagsMisc/BitManip/CondMove/Fpu/
+/// StringOps, plus the Approximate-class IN and TEST) falls through and is interior.
+pub(crate) fn is_control_transfer(insn: &DecodedInsn) -> bool {
+    match insn.group {
+        DecodeGroup::Branch => true,
+        DecodeGroup::ControlFlow => {
+            matches!(insn.opcode, 0xc2 | 0xc3)
+                || (insn.opcode == 0xff && matches!(insn.modrm.map(|m| m.reg), Some(2) | Some(4)))
         }
-        // Unprefixed and continuable, like the run loop's own gate; a page-crossing slot would
-        // fail that gate too, so the region must not cover it.
-        if insn.prefixes != Prefixes::default() || !insn.continuable {
-            return None;
-        }
-        if (lin & 0xfff) + u32::from(insn.len) > 0x1000 {
-            return None;
-        }
-        if let Some((mode, reg, rm)) = spec.modrm {
-            let m = insn.modrm?;
-            if m.mode != mode || m.reg != reg || m.rm != rm {
-                return None;
-            }
-        }
-        if let Some(imm) = spec.imm {
-            if insn.imm != imm {
-                return None;
-            }
-        }
-        let kind = classify_slot(&insn);
-        slots.push(Slot { insn, lin, kind });
-        lin = lin.wrapping_add(u32::from(insn.len));
+        _ => false,
     }
-    // The back-edge must land exactly on the entry. rel8 was sign-extended into `imm` at
-    // decode; eip-space arithmetic (target = eip-after-jnz + rel) reduces to rel == -span.
-    let span = lin.wrapping_sub(entry_lin);
-    let jnz = &slots[shape.len() - 1].insn;
-    if jnz.imm as i32 != -(span as i32) {
+}
+
+/// Whether an instruction changes interrupt visibility (IF/TF) or arms the one-instruction
+/// interrupt shadow. These are `continuable` (the interpreter runs them inline, with its
+/// per-instruction interrupt-transition check), but the region DEFERS that check to the whole-
+/// region boundary, so an IF-writer cannot sit INSIDE a region: a mid-region transition would be
+/// seen a slot too late. They therefore end the block as its TERMINAL slot (spec §2.9 category b):
+/// the region executes the change last and returns, so `run_straight_line`'s own post-region
+/// interrupt-transition check fires at exactly the boundary the interpreter would break at (for
+/// STI and the SS-loads, the armed shadow correctly suppresses that check until the next
+/// interpreted instruction consumes it). The set:
+/// - STI (0xFB) / CLI (0xFA): write IF (STI also arms the shadow).
+/// - POPF/POPFD (0x9D): write IF and TF from the stack.
+/// - POP SS (0x17), MOV SS (0x8E /2), LSS (0x0F B2): arm the SS-load shadow (386 PRM 11-16).
+///   Only the SS destination arms it, so MOV/POP to DS/ES/FS/GS stay interior.
+pub(crate) fn changes_interrupt_visibility(insn: &DecodedInsn) -> bool {
+    match insn.opcode {
+        0xfa | 0xfb | 0x9d | 0x17 | 0x0fb2 => true,
+        0x8e => matches!(insn.modrm.map(|m| m.reg), Some(2)),
+        _ => false,
+    }
+}
+
+/// Whether an instruction is eligible to be an INTERIOR slot of a compiled block: it falls through
+/// to the next instruction, changes no interrupt visibility, and the interpreter would run it as a
+/// straight-line continuation. This is the interior half of the §2.9 terminator predicate; a slot
+/// that fails it either ends the block (control transfer / IF-shadow change, as the terminal slot)
+/// or is a hard terminator (`!continuable`). Exposed for the terminator-contract test.
+#[cfg(test)]
+pub(crate) fn is_interior_eligible(insn: &DecodedInsn) -> bool {
+    insn.continuable
+        && insn.prefixes == Prefixes::default()
+        && !is_control_transfer(insn)
+        && !changes_interrupt_visibility(insn)
+}
+
+/// The static target of a relative branch that could be a self-loop back-edge, in linear space,
+/// or `None` when the instruction is not such a branch. The Branch-group relative forms (Jcc /
+/// JMP rel / LOOP / JCXZ) store the sign-extended displacement in `insn.imm`, so the target is
+/// `lin + len + imm`. CALL rel (0xE8) is excluded: it pushes a return address, so a "call to
+/// entry" is recursion, not a loop back-edge, and the native back-edge would drop the push.
+fn loop_back_edge_target(insn: &DecodedInsn, lin: u32) -> Option<u32> {
+    if insn.group != DecodeGroup::Branch || insn.opcode == 0xe8 {
         return None;
     }
-    Some(slots)
+    Some(lin.wrapping_add(u32::from(insn.len)).wrapping_add(insn.imm))
+}
+
+/// Forward-decode a basic block starting at `entry_lin`, returning its slot table and whether it
+/// is a self-loop. `None` when the entry is cold (the interpreter warms it; admission retries) or
+/// the entry itself is a terminator (nothing to compile). Mirrors `run_straight_line`'s own
+/// continuation gate per slot: warm, unprefixed, `continuable`, page-local.
+///
+/// The block extends until the first control transfer (which becomes the terminal slot) or until
+/// the next instruction is a terminator / page-crosses / is cold (the last sequential slot is then
+/// terminal). Interior slots are classified by `classify_slot`; the terminal slot runs through the
+/// full step (`BackEdge` for a self-loop, `Memory` otherwise) so `region_step`'s index-based
+/// terminal handling drives it.
+pub(crate) fn build_block(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<(Vec<Slot>, bool)> {
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut lin = entry_lin;
+    let is_loop = loop {
+        let insn = match cpu.decode_cache.get(lin, d) {
+            Some(i) => i,
+            None => break false, // cold ahead: the block is whatever we have so far (linear).
+        };
+        // The run loop's own continuation gate: unprefixed + continuable + page-local. A slot that
+        // fails it is a terminator; the block ends before it (linear).
+        if insn.prefixes != Prefixes::default() || !insn.continuable {
+            break false;
+        }
+        if (lin & 0xfff) + u32::from(insn.len) > 0x1000 {
+            break false;
+        }
+        // An instruction ends the block as its terminal slot if it transfers control (after it
+        // EIP is not `lin+len`) or changes interrupt visibility (the region defers its interrupt
+        // check to the boundary, so an IF/shadow change must be the last thing it does).
+        let ends_block = is_control_transfer(&insn) || changes_interrupt_visibility(&insn);
+        let this_lin = lin;
+        lin = lin.wrapping_add(u32::from(insn.len));
+        slots.push(Slot {
+            insn,
+            lin: this_lin,
+            kind: classify_slot(&insn),
+        });
+        if ends_block {
+            // Terminal slot. `is_loop` only when it is a relative branch back to the entry; an
+            // interrupt-visibility change is never a back-edge, so it ends a linear block.
+            break loop_back_edge_target(&insn, this_lin) == Some(entry_lin);
+        }
+        if slots.len() >= MAX_BLOCK_SLOTS {
+            break false; // cap reached; end linearly, the tail interprets.
+        }
+    };
+    if slots.is_empty() {
+        return None; // the entry is a terminator: nothing to compile.
+    }
+    // Force the terminal slot through the full step: a self-loop back-edge is `BackEdge`, a linear
+    // end is `Memory`. Both emit `emit_full_step_call`, and `region_step` handles the terminal by
+    // its index (`terminal_slot`), so the kind only steers the emitter away from an inline path.
+    let last = slots.len() - 1;
+    slots[last].kind = if is_loop {
+        SlotKind::BackEdge
+    } else {
+        SlotKind::Memory
+    };
+    Some((slots, is_loop))
 }
 
 /// Total bytes the prologue reserves below the five pushed callee-saved registers, sized so every
@@ -515,25 +568,34 @@ const SCALE_NUM_OFF: u32 = 128;
 #[allow(dead_code)]
 const SCALE_DEN_OFF: u32 = 132;
 
-/// Try to admit a region at `entry_lin`: match the shape against the live decode cache, then
-/// either refresh the already-installed region's slot table (the re-stamp path after an SMC
-/// patch; the self-patched immediates ride along in the fresh decodes) or emit + install a new
-/// one. Returns the table index for the caller to stamp into the decode line, or `None` when
-/// the shape does not (yet) match or the host has no W^X backend.
+/// Try to admit a region at `entry_lin`: build the block from the live decode cache, then either
+/// refresh the already-installed region for this key (the re-stamp path after an SMC patch or a
+/// mode change; the fresh decodes carry any patched immediates) or emit + install a new one.
+/// Returns the table index for the caller to stamp into the decode line, or `None` when the block
+/// is not (yet) buildable or the host has no W^X backend.
 pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
     // The BIOS HLE stub window is a no-compile zone (the fetch seam must see those fetches;
     // defensive here, since forced admission should never point at it).
     if (0xff000..0xff400).contains(&entry_lin) {
         return None;
     }
-    let slots = match_drawcolumn(cpu, entry_lin, d)?;
+    let (slots, is_loop) = build_block(cpu, entry_lin, d)?;
     let last = &slots[slots.len() - 1];
-    let span = last.lin.wrapping_add(u32::from(last.insn.len)) - entry_lin;
-    // Physical span from the entry line (matcher-warmed, single page so contiguity holds);
-    // narrow SMC kills inside it stale the slot table via the epoch.
+    // The block is a forward, non-wrapping linear run (build_block only extends forward and keeps
+    // every slot page-local), so `end > entry_lin` always holds here. Bail rather than underflow if
+    // a pathological block ever wraps the 4 GiB linear space (end <= entry_lin) or its physical
+    // span overflows u32; the caller then interprets, which is always correct.
+    let end = last.lin.wrapping_add(u32::from(last.insn.len));
+    if end <= entry_lin {
+        return None;
+    }
+    let span = end - entry_lin;
+    // Physical span from the entry line (builder-warmed, single page by the containment rule so
+    // contiguity holds); narrow SMC kills inside it stale the slot table via the epoch.
     let phys_lo = cpu.decode_cache.line_phys_start(entry_lin, d)?;
-    let phys_hi = phys_lo + (span - 1);
+    let phys_hi = phys_lo.checked_add(span - 1)?;
     let epoch = cpu.decode_cache.jit_smc_epoch;
+    let mode_key = cpu.jit_mode_key();
     let regs_offset = core::mem::offset_of!(Cpu386, registers) as u32;
     let (_scale_num, scale_den) = crate::level_timing(cpu.level);
     if let Some(idx) = cpu.jit_regions.find(entry_lin, d) {
@@ -542,14 +604,17 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
             .get_mut(idx)
             .expect("find returned a live index");
         region.ctx.slots = slots;
+        region.ctx.terminal_slot = (region.ctx.slots.len() - 1) as u32;
+        region.ctx.is_loop = is_loop;
         region.phys_lo = phys_lo;
         region.phys_hi = phys_hi;
         region.valid_epoch = epoch;
+        region.is_loop = is_loop;
+        region.mode_key = mode_key;
         // v2 bakes the slot kinds and the add-imm immediates into the emitted bytes (unlike v1,
         // whose buffer encoded only the slot count). A self-patch changes an add slot's immediate,
-        // so the buffer must be re-emitted from the fresh slot table. The kinds themselves are
-        // shape-fixed (the matcher re-verified them), but the immediates and the regs offset are
-        // re-read here for correctness.
+        // and a rebuild can change the block shape, so the buffer is re-emitted from the fresh slot
+        // table.
         let code = emit_region(&region.ctx.slots, regs_offset, scale_den);
         if let Some(buf) = ExecutableBuffer::new(&code) {
             // SAFETY: same transmute proof as the fresh-admission path below; `code` was produced
@@ -565,7 +630,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         }
         return Some(idx);
     }
-    let jnz_slot = (slots.len() - 1) as u32;
+    let terminal_slot = (slots.len() - 1) as u32;
     let code = emit_region(&slots, regs_offset, scale_den);
     let buf = ExecutableBuffer::new(&code)?;
     // SAFETY: `code` was produced by `emit_region` to exactly the `RegionEntryFn` calling
@@ -582,7 +647,8 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         bus_clocks_fn: None,      // written by the dispatch on every entry
         line_live_fn: None,       // written by the dispatch on every entry
         slots,
-        jnz_slot,
+        terminal_slot,
+        is_loop,
         entry_eip: 0,
         raw_clocks: 0,
         insn_count: 0,
@@ -606,6 +672,8 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         phys_lo,
         phys_hi,
         valid_epoch: epoch,
+        is_loop,
+        mode_key,
     });
     Some(idx)
 }

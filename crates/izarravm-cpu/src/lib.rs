@@ -2758,6 +2758,29 @@ impl Cpu386 {
         self.is_protected_mode() && !self.is_v86_mode() && self.current_privilege_level() == 0
     }
 
+    /// The CPU mode/size bitmask a compiled JIT block is keyed by (spec §2.2): a block compiled
+    /// for one mode must never be reused in another at the same phys/d. Packs the CS operand-size
+    /// default (D bit), protected mode (CR0.PE), V86, the SS stack big bit (B), and the ISA level.
+    /// A level change already invalidates the decode cache (`set_level`), but it is folded in here
+    /// too so the key is self-contained. Validated at every region entry (`run_region`).
+    #[cfg(feature = "jit")]
+    fn jit_mode_key(&self) -> u32 {
+        let mut key = 0u32;
+        if self.registers.cs().default_size_32 {
+            key |= 1 << 0;
+        }
+        if self.control.cr0 & CR0_PE != 0 {
+            key |= 1 << 1;
+        }
+        if self.is_v86_mode() {
+            key |= 1 << 2;
+        }
+        if self.registers.segment(SegmentIndex::Ss).default_size_32 {
+            key |= 1 << 3;
+        }
+        key | ((self.level as u32) << 8)
+    }
+
     /// The live instruction-set level the core presents to the guest.
     pub fn level(&self) -> CpuLevel {
         self.level
@@ -3558,11 +3581,13 @@ impl Cpu386 {
             Some(idx) => idx,
             None => {
                 // Forced admission (spike): only the IZARRAVM_JIT_REGION address is ever
-                // compiled, so this compare is the entire admission cost on the miss path.
+                // compiled, so this compare is the entire admission cost on the miss path. The
+                // builder is general (any hot PC compiles a real basic block); the hotness policy
+                // that would drive automatic admission is a later stage.
                 if jit_forced_region_lin() != Some(lin) {
                     return Ok(None);
                 }
-                let Some(idx) = jit::drawcolumn::try_admit(self, lin, d) else {
+                let Some(idx) = jit::block::try_admit(self, lin, d) else {
                     return Ok(None);
                 };
                 self.decode_cache.stamp_region(lin, d, idx);
@@ -3578,8 +3603,8 @@ impl Cpu386 {
     /// interpreter-identical. `Ok(None)` = an entry precondition failed, interpret instead.
     ///
     /// Deferred-at-exit accounting (one `scale_clocks` batch, `elapsed_clocks`,
-    /// `perf.instructions`, ring-0 residency) is sound because no admitted shape reads any of
-    /// it mid-region (see the matcher's invariants in `jit::drawcolumn`) and the batch equals
+    /// `perf.instructions`, ring-0 residency) is sound because no admitted block reads any of
+    /// it mid-region (see the builder's invariants in `jit::block`) and the batch equals
     /// the per-instruction sums by the remainder-carry identity.
     #[cfg(feature = "jit")]
     #[allow(clippy::too_many_arguments)]
@@ -3603,6 +3628,7 @@ impl Cpu386 {
         let cs_limit = self.registers.cs().limit;
         let epoch = self.decode_cache.jit_smc_epoch;
         let ring0 = self.is_ring0_protected();
+        let mode_key = self.jit_mode_key();
         let (num, den) = level_timing(self.level);
         let rem0 = self.timing_rem;
         let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
@@ -3613,10 +3639,18 @@ impl Cpu386 {
             if region.entry_lin != lin || region.d != d {
                 return Ok(None);
             }
+            if region.mode_key != mode_key {
+                // The same phys/d line is being entered in a different CPU mode/size than the block
+                // was compiled for (real vs pmode vs V86, or a size/level change). The block key
+                // includes the mode bitmask (spec §2.2), so this is a miss: drop the stamp and let
+                // the forced-admission path re-build the block for the current mode.
+                self.decode_cache.unstamp_region(lin, d);
+                return Ok(None);
+            }
             if region.valid_epoch != epoch {
                 // A narrow SMC kill landed inside this region's span since the slots were last
-                // matched: the stamp may outlive the killed slot lines, so drop it and let the
-                // forced-admission path re-run the matcher over the fresh decodes.
+                // built: the stamp may outlive the killed slot lines, so drop it and let the
+                // forced-admission path re-run the builder over the fresh decodes.
                 self.decode_cache.unstamp_region(lin, d);
                 return Ok(None);
             }
@@ -13896,11 +13930,12 @@ mod tests {
     fn cpu_registers_field_offset_is_stable() {
         let off = core::mem::offset_of!(Cpu386, registers);
         // The current layout places `registers` at a non-zero offset (rustc reorders Cpu386's
-        // fields for alignment). The emitter handles any value; this assertion freezes the known
-        // position so a change is visible. Update this constant only after confirming the emitter
-        // still produces correct results (re-run the differential suite).
+        // fields for alignment). The emitter handles any value (it bakes `offset_of!` at emit
+        // time, verified by the differential suites jit_region + jit_general); this assertion
+        // freezes the known position so a change is visible. The constant tracks the live layout
+        // (the prior 472 was stale before this branch ran the full `--features jit` suite).
         assert_eq!(
-            off, 472,
+            off, 456,
             "Cpu386.registers offset moved; update the emitter's baked offset"
         );
     }
@@ -33141,9 +33176,10 @@ mod tests {
         const STEP_IMM: u32 = 0x0133_7c00;
         const PATCHED_IMM: u32 = 0x0066_7c00;
 
-        /// The 51-byte loop (see jit::drawcolumn's shape table), a HLT terminator at the
-        /// fall-through, and the two-store self-patcher at 0x140 that rewrites both
-        /// `add ebp,imm32` immediates exactly the way Doom's setup code does.
+        /// The 51-byte R_DrawColumn loop, a HLT terminator at the fall-through, and the two-store
+        /// self-patcher at 0x140 that rewrites both `add ebp,imm32` immediates exactly the way
+        /// Doom's setup code does. The generic `build_block` must reproduce this exact 15-slot,
+        /// self-loop shape (kinds + count) so this whole differential suite still holds.
         fn program() -> Vec<u8> {
             let mut m = vec![0u8; 0x1000];
             m[NOP_STARTER as usize] = 0x90;
@@ -33242,8 +33278,8 @@ mod tests {
             drive_to_halt(interp, bus_i, u64::MAX);
             drive_to_halt(jit, bus_j, u64::MAX);
             assert_eq!(interp, jit, "warm phases must match before admission");
-            let idx = jit::drawcolumn::try_admit(jit, ENTRY, true)
-                .expect("the warmed decode cache matches the drawcolumn shape");
+            let idx = jit::block::try_admit(jit, ENTRY, true)
+                .expect("the warmed decode cache builds the drawcolumn block");
             let region = jit.jit_regions.get_mut(idx).unwrap();
             assert_eq!(region.ctx.slots[1].insn.imm, STEP_IMM);
             assert_eq!(region.ctx.slots[5].insn.imm, STEP_IMM);
@@ -33421,8 +33457,8 @@ mod tests {
                 entries_before,
                 "a dead stamp must keep the region cold until re-admission"
             );
-            let idx2 = jit::drawcolumn::try_admit(&mut jit_cpu, ENTRY, true)
-                .expect("the re-warmed shape still matches");
+            let idx2 = jit::block::try_admit(&mut jit_cpu, ENTRY, true)
+                .expect("the re-warmed block still builds");
             assert_eq!(idx2, idx, "re-admission must reuse the installed region");
             jit_cpu.decode_cache.stamp_region(ENTRY, true, idx2);
             {
@@ -33564,7 +33600,7 @@ mod tests {
                     }
                 }
                 if admit {
-                    let idx = jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).unwrap();
+                    let idx = jit::block::try_admit(&mut cpu, ENTRY, true).unwrap();
                     cpu.decode_cache.stamp_region(ENTRY, true, idx);
                 }
                 arm_loop(&mut cpu, &mut bus.inner, 6);
@@ -33605,7 +33641,7 @@ mod tests {
                     }
                 }
                 if admit {
-                    let idx = jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).unwrap();
+                    let idx = jit::block::try_admit(&mut cpu, ENTRY, true).unwrap();
                     cpu.decode_cache.stamp_region(ENTRY, true, idx);
                 }
                 arm_loop(&mut cpu, &mut bus.inner, 10);
@@ -33703,16 +33739,30 @@ mod tests {
         }
 
         #[test]
-        fn matcher_rejects_a_mutated_shape() {
-            // Same program with the first SHR count byte changed (0x19 -> 0x18): still valid
-            // guest code, but not the pinned shape.
+        fn builder_admits_a_different_but_valid_loop_shape() {
+            // Same program with the first SHR count byte changed (0x19 -> 0x18): a different but
+            // still valid continuable self-loop. The old matcher pinned the exact drawcolumn shape
+            // and rejected this; the generic builder admits ANY continuable basic block, so it now
+            // compiles it as a 15-slot self-loop (the point of the generalization).
             let mut memory = program();
             memory[0x10c] = 0x18;
             let mut cpu = fresh_cpu(0xffff);
             let mut bus = TestBus::with_memory(memory);
             arm_loop(&mut cpu, &mut bus, 2);
             drive_to_halt(&mut cpu, &mut bus, u64::MAX);
-            assert!(jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).is_none());
+            let idx = jit::block::try_admit(&mut cpu, ENTRY, true)
+                .expect("a valid continuable self-loop must build");
+            let region = cpu.jit_regions.get_mut(idx).unwrap();
+            assert_eq!(
+                region.ctx.slots.len(),
+                15,
+                "same shape, different shift count"
+            );
+            assert!(region.is_loop, "the back-edge still targets the entry");
+            assert_eq!(
+                region.ctx.slots[3].insn.imm, 24,
+                "the mutated shift count rode along into the slot"
+            );
         }
 
         #[test]
@@ -33722,9 +33772,474 @@ mod tests {
             let mut cpu = fresh_cpu(0xffff);
             let mut bus = TestBus::with_memory(program());
             arm_loop(&mut cpu, &mut bus, 1);
-            assert!(jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).is_none());
+            assert!(jit::block::try_admit(&mut cpu, ENTRY, true).is_none());
             drive_to_halt(&mut cpu, &mut bus, u64::MAX);
-            assert!(jit::drawcolumn::try_admit(&mut cpu, ENTRY, true).is_some());
+            assert!(jit::block::try_admit(&mut cpu, ENTRY, true).is_some());
+        }
+    }
+
+    /// DYN-S1: the generic block builder. These exercise coverage the single drawcolumn shape did
+    /// not: an x87-containing loop (the four-accumulator identity, incl. `fp_rem`), a self-loop
+    /// livelock guard, a LINEAR (non-loop) block, and the behavioral terminator predicate.
+    #[cfg(feature = "jit")]
+    mod jit_general {
+        use super::*;
+
+        /// Real mode with a 32-bit code segment (flat, 64 KB limit), at the 586 level so the FP
+        /// timing classes are non-identity and `fp_rem` actually carries.
+        fn fresh() -> Cpu386 {
+            let mut cpu = Cpu386::default();
+            cpu.set_level(CpuLevel::I586);
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            cpu.load_segment_real(SegmentIndex::Es, 0);
+            let mut cs = cpu.registers.cs();
+            cs.default_size_32 = true;
+            cpu.registers.set_segment(SegmentIndex::Cs, cs);
+            cpu
+        }
+
+        fn drive_to_halt(cpu: &mut Cpu386, bus: &mut TestBus) {
+            for _ in 0..10_000 {
+                if cpu.run_straight_line(bus, u64::MAX).unwrap().halted {
+                    return;
+                }
+            }
+            panic!("guest never halted");
+        }
+
+        // ---- 1. Four-accumulator identity on an x87-containing loop ----
+
+        const X87_START: u32 = 0x100;
+        const X87_LOOP: u32 = 0x101;
+        const X87_COUNT: usize = 0x400;
+
+        /// NOP starter, then a self-loop mixing an ALU op, a memory store, two x87 memory ops (the
+        /// IntConvert32 class, x34 at 586, so `fp_rem` carries hard) and an FNINIT (Register class,
+        /// x0.25) so the block spans two FP classes, a memory-counter DEC, and the rel8 back-edge.
+        /// FNINIT each iteration keeps the x87 stack balanced regardless of the reset FPU state.
+        fn x87_program() -> Vec<u8> {
+            let mut m = vec![0u8; 0x1000];
+            m[X87_START as usize] = 0x90; // nop starter, so X87_LOOP is reached as a continuation
+            let body: [u8; 18] = [
+                0xdb, 0xe3, // fninit                 (Register class)
+                0xdb, 0x06, // fild dword [esi]       (IntConvert32)
+                0xdb, 0x1f, // fistp dword [edi]      (IntConvert32)
+                0x83, 0xc3, 0x03, // add ebx,3        (ALU)
+                0x89, 0x5f, 0x04, // mov [edi+4],ebx  (memory store)
+                0xff, 0x0d, 0x00, 0x04, 0x00, 0x00, // dec dword [X87_COUNT] (memory RMW)
+            ];
+            m[X87_LOOP as usize..X87_LOOP as usize + body.len()].copy_from_slice(&body);
+            let jnz_at = X87_LOOP as usize + body.len();
+            let rel = (X87_LOOP as i32 - (jnz_at as i32 + 2)) as i8;
+            m[jnz_at] = 0x75; // jnz X87_LOOP
+            m[jnz_at + 1] = rel as u8;
+            m[jnz_at + 2] = 0xf4; // hlt at the loop fall-through
+            m[0x300..0x304].copy_from_slice(&1234u32.to_le_bytes()); // the int fild reads
+            m
+        }
+
+        fn x87_arm(cpu: &mut Cpu386, bus: &mut TestBus, count: u32) {
+            cpu.registers.eip = X87_START;
+            cpu.registers.set_esp(0x0700);
+            cpu.registers.set_eax(0);
+            cpu.registers.set_ebx(0);
+            cpu.registers.set_esi(0x300);
+            cpu.registers.set_edi(0x310);
+            bus.memory[X87_COUNT..X87_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+        }
+
+        fn count_of(bus: &TestBus) -> u32 {
+            u32::from_le_bytes(bus.memory[X87_COUNT..X87_COUNT + 4].try_into().unwrap())
+        }
+
+        /// Drive until the memory counter hits zero (the loop fall-through), which is BEFORE the
+        /// trailing HLT is executed as a fresh run's first instruction (that would reset
+        /// `core_clocks_so_far`). This is the point at which the four accumulators are meaningfully
+        /// compared.
+        fn drive_until_count_zero(cpu: &mut Cpu386, bus: &mut TestBus) {
+            for _ in 0..10_000 {
+                let out = cpu.run_straight_line(bus, u64::MAX).unwrap();
+                if count_of(bus) == 0 || out.halted {
+                    return;
+                }
+            }
+            panic!("counter never reached zero");
+        }
+
+        #[test]
+        fn general_block_four_accumulator_identity() {
+            let mut interp = fresh();
+            let mut jit_cpu = fresh();
+            let mut bus_i = TestBus::with_memory(x87_program());
+            let mut bus_j = TestBus::with_memory(x87_program());
+
+            // Warm both identically (fills the decode cache), then admit the loop on the jit CPU.
+            x87_arm(&mut interp, &mut bus_i, 2);
+            x87_arm(&mut jit_cpu, &mut bus_j, 2);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+            assert_eq!(interp, jit_cpu, "warm phases must match before admission");
+            assert_eq!(interp.fp_rem, jit_cpu.fp_rem, "warm fp_rem must match");
+
+            let idx = jit::block::try_admit(&mut jit_cpu, X87_LOOP, true)
+                .expect("the x87 loop must build");
+            {
+                let region = jit_cpu.jit_regions.get_mut(idx).unwrap();
+                assert!(region.is_loop, "the x87 block is a self-loop");
+                assert_eq!(
+                    region.ctx.slots.len(),
+                    7,
+                    "fninit+fild+fistp+add+mov+dec+jnz"
+                );
+            }
+            jit_cpu.decode_cache.stamp_region(X87_LOOP, true, idx);
+
+            // Measured run: eight iterations, driven to the loop fall-through.
+            x87_arm(&mut interp, &mut bus_i, 8);
+            x87_arm(&mut jit_cpu, &mut bus_j, 8);
+            drive_until_count_zero(&mut interp, &mut bus_i);
+            drive_until_count_zero(&mut jit_cpu, &mut bus_j);
+
+            // THE gate: all four accumulators byte-identical, region vs interpreter.
+            assert_eq!(
+                interp.elapsed_clocks, jit_cpu.elapsed_clocks,
+                "elapsed_clocks diverged"
+            );
+            assert_eq!(interp.timing_rem, jit_cpu.timing_rem, "timing_rem diverged");
+            assert_eq!(
+                interp.fp_rem, jit_cpu.fp_rem,
+                "fp_rem diverged (x87 batching)"
+            );
+            assert_eq!(
+                interp.core_clocks_so_far, jit_cpu.core_clocks_so_far,
+                "core_clocks_so_far diverged"
+            );
+            // And the full architectural state + guest memory.
+            assert_eq!(interp, jit_cpu, "architectural state diverged");
+            assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
+
+            // The test is only meaningful if the region actually ran and the FP path carried a
+            // remainder (a non-identity FP class was exercised).
+            assert!(
+                jit_cpu.perf_counters().jit_region_entries > 0,
+                "the region never executed"
+            );
+            assert_eq!(interp.perf_counters().jit_region_entries, 0);
+            assert!(
+                interp.fp_rem != 0,
+                "the FP timing remainder must be exercised (else the fp_rem check is vacuous)"
+            );
+        }
+
+        // ---- 2. Self-loop livelock guard (jmp $) ----
+
+        #[test]
+        fn self_loop_advances_the_clock_and_stops_at_the_cap() {
+            let mut cpu = fresh();
+            let mut mem = vec![0u8; 0x1000];
+            mem[0x100] = 0x90; // nop starter
+            mem[0x101] = 0xeb; // jmp $ (rel8 -2 -> 0x101)
+            mem[0x102] = 0xfe;
+            let mut bus = TestBus::with_memory(mem);
+
+            // Warm 0x100 and 0x101 (jmp $ never halts, so warm with a bounded finite-cap drive).
+            cpu.registers.eip = 0x100;
+            for _ in 0..8 {
+                let _ = cpu.run_straight_line(&mut bus, 50);
+            }
+
+            let idx = jit::block::try_admit(&mut cpu, 0x101, true)
+                .expect("jmp $ must build a 1-slot self-loop");
+            {
+                let region = cpu.jit_regions.get_mut(idx).unwrap();
+                assert!(region.is_loop);
+                assert_eq!(region.ctx.slots.len(), 1);
+            }
+            cpu.decode_cache.stamp_region(0x101, true, idx);
+
+            cpu.registers.eip = 0x101;
+            let before = cpu.elapsed_clocks;
+            let entries_before = cpu.perf_counters().jit_region_entries;
+            let out = cpu.run_straight_line(&mut bus, 1000).unwrap();
+
+            assert!(!out.halted, "jmp $ never halts");
+            assert!(
+                cpu.elapsed_clocks > before,
+                "the self-loop must advance the clock (no net-zero livelock)"
+            );
+            assert!(
+                cpu.perf_counters().jit_region_entries > entries_before,
+                "the region must have run"
+            );
+            assert_eq!(cpu.registers.eip, 0x101, "still looping at jmp $");
+        }
+
+        // ---- 3. A linear (non-loop) block runs identically to the interpreter ----
+
+        const LIN_START: u32 = 0x100;
+        const LIN_BODY: u32 = 0x101;
+
+        fn linear_program() -> Vec<u8> {
+            let mut m = vec![0u8; 0x1000];
+            m[LIN_START as usize] = 0x90; // nop starter -> LIN_BODY is a continuation
+            let body: [u8; 11] = [
+                0x83, 0xc0, 0x05, // add eax,5
+                0x83, 0xc3, 0x07, // add ebx,7
+                0x89, 0x07, // mov [edi],eax
+                0x83, 0xc1, 0x01, // add ecx,1
+            ];
+            m[LIN_BODY as usize..LIN_BODY as usize + body.len()].copy_from_slice(&body);
+            m[LIN_BODY as usize + body.len()] = 0xf4; // hlt terminates the block
+            m
+        }
+
+        fn lin_arm(cpu: &mut Cpu386) {
+            cpu.registers.eip = LIN_START;
+            cpu.registers.set_esp(0x0700);
+            cpu.registers.set_eax(0x1111);
+            cpu.registers.set_ebx(0x2222);
+            cpu.registers.set_ecx(0);
+            cpu.registers.set_edi(0x310);
+        }
+
+        #[test]
+        fn linear_block_matches_the_interpreter() {
+            let mut interp = fresh();
+            let mut jit_cpu = fresh();
+            let mut bus_i = TestBus::with_memory(linear_program());
+            let mut bus_j = TestBus::with_memory(linear_program());
+
+            lin_arm(&mut interp);
+            lin_arm(&mut jit_cpu);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+            assert_eq!(interp, jit_cpu, "warm phases must match before admission");
+
+            let idx = jit::block::try_admit(&mut jit_cpu, LIN_BODY, true)
+                .expect("the linear block must build");
+            {
+                let region = jit_cpu.jit_regions.get_mut(idx).unwrap();
+                assert!(!region.is_loop, "a straight-line block is not a self-loop");
+                assert_eq!(
+                    region.ctx.slots.len(),
+                    4,
+                    "add,add,mov,add (hlt is the terminator)"
+                );
+            }
+            jit_cpu.decode_cache.stamp_region(LIN_BODY, true, idx);
+
+            lin_arm(&mut interp);
+            lin_arm(&mut jit_cpu);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+
+            assert_eq!(
+                interp.elapsed_clocks, jit_cpu.elapsed_clocks,
+                "elapsed_clocks"
+            );
+            assert_eq!(interp.timing_rem, jit_cpu.timing_rem, "timing_rem");
+            assert_eq!(interp, jit_cpu, "architectural state diverged");
+            assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
+            assert!(
+                jit_cpu.perf_counters().jit_region_entries > 0,
+                "the linear block region never ran"
+            );
+        }
+
+        // ---- 4. The behavioral terminator predicate (§2.9) ----
+
+        fn decode_one(bytes: &[u8]) -> DecodedInsn {
+            let mut cpu = fresh();
+            let mut mem = vec![0u8; 0x100];
+            mem[..bytes.len()].copy_from_slice(bytes);
+            let mut bus = TestBus::with_memory(mem);
+            cpu.registers.eip = 0;
+            cpu.decode(&mut bus).expect("opcode decodes")
+        }
+
+        #[test]
+        fn terminator_predicate_covers_clock_device_and_interrupt_ops() {
+            // Interior-eligible ops: fall through, no interrupt-visibility change, continuable.
+            for (bytes, name) in [
+                (&[0x83, 0xc1, 0x01][..], "add ecx,1"),
+                (&[0x89, 0xd8][..], "mov eax,ebx"),
+                (&[0x8e, 0xd8][..], "mov ds,ax (not SS)"),
+                (
+                    &[0xec][..],
+                    "in al,dx (Approximate: runtime step-break, interior)",
+                ),
+                (&[0xd9, 0xe8][..], "fld1 (x87)"),
+            ] {
+                let insn = decode_one(bytes);
+                assert!(
+                    jit::block::is_interior_eligible(&insn),
+                    "{name} must be an interior slot"
+                );
+            }
+
+            // Hard terminators: not continuable at all (build_block stops before them).
+            for (bytes, name) in [
+                (&[0xf4][..], "hlt"),
+                (&[0xee][..], "out dx,al"),
+                (&[0xe6, 0x00][..], "out imm8,al"),
+                (&[0x6c][..], "insb"),
+                (&[0x6e][..], "outsb"),
+                (&[0x0f, 0x31][..], "rdtsc (reads elapsed_clocks)"),
+                (&[0x0f, 0x30][..], "wrmsr"),
+                (&[0x0f, 0x22, 0xc0][..], "mov cr0,eax"),
+                (&[0x0f, 0x01, 0x10][..], "lgdt [eax]"),
+                (&[0xcd, 0x21][..], "int 21h"),
+                (&[0xcf][..], "iret"),
+            ] {
+                let insn = decode_one(bytes);
+                assert!(
+                    !insn.continuable,
+                    "{name} must be a non-continuable hard terminator"
+                );
+                assert!(
+                    !jit::block::is_interior_eligible(&insn),
+                    "{name} must not be an interior slot"
+                );
+            }
+
+            // The load-bearing gap: IF/shadow changers are `continuable` (the interpreter runs
+            // them inline with a per-instruction interrupt check) but MUST be excluded from
+            // interior slots, because the region defers that check to the boundary.
+            for (bytes, name) in [
+                (&[0xfb][..], "sti"),
+                (&[0xfa][..], "cli"),
+                (&[0x9d][..], "popf"),
+                (&[0x17][..], "pop ss"),
+                (&[0x8e, 0xd0][..], "mov ss,ax"),
+            ] {
+                let insn = decode_one(bytes);
+                assert!(
+                    insn.continuable,
+                    "{name} is continuable (the whole point of the gap)"
+                );
+                assert!(
+                    jit::block::changes_interrupt_visibility(&insn),
+                    "{name} must be flagged as an interrupt-visibility change"
+                );
+                assert!(
+                    !jit::block::is_interior_eligible(&insn),
+                    "{name} must not be an interior slot"
+                );
+            }
+
+            // Control transfers are continuable but end the block as the terminal slot.
+            for (bytes, name) in [
+                (&[0xc3][..], "ret near"),
+                (&[0x75, 0x00][..], "jnz rel8"),
+                (&[0xeb, 0x00][..], "jmp rel8"),
+            ] {
+                let insn = decode_one(bytes);
+                assert!(insn.continuable, "{name} is continuable");
+                assert!(
+                    jit::block::is_control_transfer(&insn),
+                    "{name} must be flagged as a control transfer"
+                );
+                assert!(
+                    !jit::block::is_interior_eligible(&insn),
+                    "{name} must not be an interior slot"
+                );
+            }
+        }
+
+        // ---- 5. 16-bit register ops must not be inlined as 32-bit templates ----
+
+        /// Real mode with a 16-bit code segment (the default DOS-game target): CS.D is clear, so
+        /// the unprefixed mov/add/shr register forms are 16-bit ops.
+        fn fresh16() -> Cpu386 {
+            let mut cpu = Cpu386::default();
+            cpu.set_level(CpuLevel::I586);
+            cpu.load_segment_real(SegmentIndex::Cs, 0); // default_size_32 = false
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            cpu.load_segment_real(SegmentIndex::Es, 0);
+            cpu
+        }
+
+        #[test]
+        fn sixteen_bit_register_ops_are_not_inlined_as_wrong_width() {
+            // Regression for the operand-size gap: in a 16-bit segment the inline-able opcodes
+            // (0x8B mov r,r; 0x81 /0 add r,imm; 0xC1 /5 shr r,imm) are 16-bit, so they must run
+            // through the full trampoline step (correct width), NOT the 32-bit inline template
+            // (which would clobber the upper 16 bits and compute 32-bit flags).
+            let program = || {
+                let mut m = vec![0u8; 0x1000];
+                m[0x100] = 0x90; // nop starter, so 0x101 is reached as a continuation
+                let body: [u8; 15] = [
+                    0x8b, 0xc3, // mov ax,bx           (16-bit: keeps EAX[31:16])
+                    0x81, 0xc0, 0x34, 0x12, // add ax,0x1234       (16-bit add + 16-bit flags)
+                    0xc1, 0xe8, 0x01, // shr ax,1            (16-bit shr)
+                    0xff, 0x0e, 0x00, 0x04, // dec word [0x400]    (16-bit memory RMW)
+                    0x75, 0x00, // jnz (rel patched below)
+                ];
+                m[0x101..0x101 + body.len()].copy_from_slice(&body);
+                m[0x10f] = ((0x101i32 - 0x110i32) as i8) as u8; // jnz -> 0x101
+                m[0x110] = 0xf4; // hlt
+                m
+            };
+            let arm = |cpu: &mut Cpu386, bus: &mut TestBus, count: u16| {
+                cpu.registers.eip = 0x100;
+                cpu.registers.set_esp(0x0700);
+                cpu.registers.set_eax(0xAAAA_0000); // distinct upper half
+                cpu.registers.set_ebx(0xBBBB_2222);
+                bus.memory[0x400..0x402].copy_from_slice(&count.to_le_bytes());
+            };
+
+            let mut interp = fresh16();
+            let mut jit_cpu = fresh16();
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+
+            arm(&mut interp, &mut bus_i, 2);
+            arm(&mut jit_cpu, &mut bus_j, 2);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+            assert_eq!(interp, jit_cpu, "warm phases must match before admission");
+
+            // d = false (16-bit segment).
+            let idx = jit::block::try_admit(&mut jit_cpu, 0x101, false)
+                .expect("the 16-bit loop must build");
+            {
+                let region = jit_cpu.jit_regions.get_mut(idx).unwrap();
+                assert!(region.is_loop);
+                assert_eq!(region.ctx.slots.len(), 5);
+                // The fix in the flesh: no 16-bit slot is an inline 32-bit template.
+                for (i, s) in region.ctx.slots.iter().enumerate() {
+                    assert!(
+                        matches!(
+                            s.kind,
+                            jit::step::SlotKind::Memory | jit::step::SlotKind::BackEdge
+                        ),
+                        "16-bit slot {i} must run through the full step, got {:?}",
+                        s.kind
+                    );
+                }
+            }
+            jit_cpu.decode_cache.stamp_region(0x101, false, idx);
+
+            arm(&mut interp, &mut bus_i, 5);
+            arm(&mut jit_cpu, &mut bus_j, 5);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+
+            assert_eq!(
+                interp, jit_cpu,
+                "16-bit register ops diverged (wrong-width inline?)"
+            );
+            assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
+            // The 16-bit ops must have preserved the upper half of EAX in both paths.
+            assert_eq!(
+                jit_cpu.registers.eax() & 0xFFFF_0000,
+                0xAAAA_0000,
+                "the JIT clobbered EAX[31:16] with a 32-bit op"
+            );
+            assert!(jit_cpu.perf_counters().jit_region_entries > 0);
         }
     }
 }

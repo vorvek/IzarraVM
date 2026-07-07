@@ -47,9 +47,16 @@ pub(crate) struct CompiledRegion {
     /// stales the slot table; see `Cpu386::jit_smc_epoch`.
     pub phys_lo: u32,
     pub phys_hi: u32,
-    /// `Cpu386::jit_smc_epoch` at the last matcher validation of `ctx.slots`. Entry requires
+    /// `Cpu386::jit_smc_epoch` at the last builder validation of `ctx.slots`. Entry requires
     /// equality with the live epoch.
     pub valid_epoch: u32,
+    /// Whether the block is a self-loop (native back-edge) or linear. Copied into `ctx.is_loop` on
+    /// every entry; `region_step` reads it at the terminal slot.
+    pub is_loop: bool,
+    /// The CPU mode/size bitmask (`Cpu386::jit_mode_key`) the block was compiled for. Entry
+    /// requires equality with the live mode key, so a block compiled for one mode is never reused
+    /// in another at the same phys/d (spec §2.2). A mismatch is a miss: unstamp and re-admit.
+    pub mode_key: u32,
 }
 
 /// The region table. Index 0 is reserved (DecodeLine stores 1-based `NonZeroU32` indices so the
@@ -155,7 +162,8 @@ mod tests {
                 bus_clocks_fn: None,
                 line_live_fn: None,
                 slots: Vec::new(),
-                jnz_slot: 0,
+                terminal_slot: 0,
+                is_loop: true,
                 entry_eip: 0,
                 raw_clocks: 0,
                 insn_count: 0,
@@ -175,6 +183,8 @@ mod tests {
             phys_lo: entry_lin,
             phys_hi: entry_lin + 0x32,
             valid_epoch: 0,
+            is_loop: true,
+            mode_key: 0,
         }
     }
 
