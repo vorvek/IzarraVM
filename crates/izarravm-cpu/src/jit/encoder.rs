@@ -28,6 +28,8 @@ impl Reg {
     pub const RDI: Reg = Reg(7);
     pub const R8: Reg = Reg(8);
     pub const R9: Reg = Reg(9);
+    pub const R10: Reg = Reg(10);
+    pub const R11: Reg = Reg(11);
     pub const R12: Reg = Reg(12);
     pub const R13: Reg = Reg(13);
     pub const R14: Reg = Reg(14);
@@ -316,6 +318,23 @@ impl Encoder {
             self.bytes.push(0x24);
         }
         self.bytes.push(disp8 as u8);
+    }
+
+    /// `mov dst32, [base + index]` (8B /r, mod=00, rm=100 SIB, scale=1). No REX.W (32-bit load,
+    /// zero-extends to 64). The base must NOT be RBP/R13 (SIB base=101 with mod=00 means "disp32,
+    /// no base") and the index must NOT be RSP (SIB index=100 means "no index"). Used by the G0'
+    /// CPU-ceiling probe for the texture sample `mov eax,[esi_host + ecx]`, where esi_host is a host
+    /// pointer (the guest texture base folded in) so a guest base+index memory operand lowers to one
+    /// host SIB access with no extra address-add (which would clobber the loop's live flags).
+    pub(crate) fn load_r32_sib(&mut self, dst: Reg, base: Reg, index: Reg) {
+        assert!(base.low3() != 0b101, "SIB base RBP/R13 needs a disp form");
+        assert!(index.low3() != 0b100, "SIB index RSP means no-index");
+        if dst.ext() || index.ext() || base.ext() {
+            self.rex(false, dst.ext(), index.ext(), base.ext());
+        }
+        self.bytes.push(0x8B);
+        self.modrm(0b00, dst.low3(), 0b100); // rm=100 -> a SIB byte follows
+        self.bytes.push((index.low3() << 3) | base.low3()); // scale=00
     }
 
     /// `add dst32, imm32` (81 /0 id, no REX.W) -- the 32-bit-operand ADD-immmediate form the v2
@@ -641,6 +660,23 @@ mod tests {
         let mut e = Encoder::new();
         e.store_r32_disp8(Reg::R15, 32, Reg::RAX);
         assert_eq!(e.finish(), vec![0x41, 0x89, 0x47, 0x20]);
+    }
+
+    #[test]
+    fn load_r32_sib_known_bytes() {
+        // mov r11d, [r12 + r9] -- REX.W=0,R=1(r11),X=1(r9 index),B=1(r12 base) = 0100_0111 = 0x47;
+        // 8B; ModRM mod=00,reg=r11&7=3,rm=100(SIB) = 00_011_100 = 0x1C; SIB scale=0,index=r9&7=1,
+        // base=r12&7=4 = 00_001_100 = 0x0C.
+        let mut e = Encoder::new();
+        e.load_r32_sib(Reg::R11, Reg::R12, Reg::R9);
+        assert_eq!(e.finish(), vec![0x47, 0x8B, 0x1C, 0x0C]);
+
+        // mov eax, [esi + ecx] -- no extended regs, so no REX. 8B; ModRM mod=00,reg=eax(0),rm=100 =
+        // 0x04; SIB scale=0,index=ecx(1),base=esi(6) = 00_001_110 = 0x0E. Matches the guest bytes
+        // `8B 04 0E` the probe's interpreter side executes for the same operation.
+        let mut e = Encoder::new();
+        e.load_r32_sib(Reg::RAX, Reg::RSI, Reg::RCX);
+        assert_eq!(e.finish(), vec![0x8B, 0x04, 0x0E]);
     }
 
     #[test]

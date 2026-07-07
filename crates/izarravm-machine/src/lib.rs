@@ -8262,6 +8262,20 @@ impl Machine {
     /// so any nonzero size is safe). Each byte is bounds-checked against system RAM;
     /// an out-of-range byte reads as 0 (no panic, no wrap into other state).
     fn read_ring_word(&self, base: u32, size: u32, off: u32) -> u32 {
+        // Fast path (N2/N4 perf plan): when the 4 bytes neither wrap the ring boundary nor run
+        // off system RAM, read them as one slice instead of four bounds-checked byte fetches.
+        let start = off as usize % size as usize;
+        if start + 4 <= size as usize {
+            if let Some(slice) = self
+                .memory
+                .as_slice()
+                .get(base as usize + start..base as usize + start + 4)
+            {
+                return u32::from_le_bytes(slice.try_into().unwrap());
+            }
+        }
+        // Slow path: the word straddles the ring wrap or the RAM edge — per-byte with wrap, an
+        // out-of-range byte reading as 0 (unchanged semantics).
         let mut bytes = [0u8; 4];
         for (b, slot) in bytes.iter_mut().enumerate() {
             let ring_off = (off as usize + b) % size as usize;

@@ -578,9 +578,9 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         inline_step_fn: None,     // written by the dispatch on every entry
         set_pending_add_fn: None, // written by the dispatch on every entry
         set_shift_flags_fn: None, // written by the dispatch on every entry
-        charge_fetch_fn: None,   // written by the dispatch on every entry
-        bus_clocks_fn: None,     // written by the dispatch on every entry
-        line_live_fn: None,      // written by the dispatch on every entry
+        charge_fetch_fn: None,    // written by the dispatch on every entry
+        bus_clocks_fn: None,      // written by the dispatch on every entry
+        line_live_fn: None,       // written by the dispatch on every entry
         slots,
         jnz_slot,
         entry_eip: 0,
