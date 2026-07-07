@@ -872,23 +872,38 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
 }
 
 /// Per-mode VIDEO-window wait-states for the Approximate class (486/586), the
-/// FOURTH timing lever, calibrated (2026-07-05) against the owner's real-hardware
-/// Doom `-timedemo demo3` fps targets (486 DX2-66 max detail 29-30 fps, P55C-200
-/// ~82 fps; cross-checked vs the Ertl doombench archive). Why it exists: a real
-/// VGA card sits across an expansion bus whose per-access latency does NOT scale
-/// with CPU speed, but the flat `WaitStateProfile.video = 1` rode `scale_bus`
-/// (486 x1/3, 586 x7/30), pricing a VRAM byte write at ~15 ns / ~3.5 ns where real
-/// VLB / PCI writes cost ~100-450 ns. Doom is framebuffer-bound (measured: ~61,500
-/// VRAM data accesses per frame at max detail), so the 486/586 personas ran demo3
-/// 1.27x / 1.56x too fast while every synthetic bench (no VRAM traffic) sat
-/// era-exact. These values are calibrated POST-`scale_bus`: the charged clocks are
-/// `(2 + ws) * bus_num/bus_den`. The shipped 586 value ws=62 -> ~14.9 clocks
-/// @ 200 MHz ~ 75 ns (PCI-class, ~13 MB/s byte-wise); the shipped 486 value stays
-/// at the flat 1 (see the arm comment: with honest tick delivery the DX2-66
-/// persona hits its target with no surcharge, so no VLB-class value ships). If
-/// `bus_timing` is ever retuned, recalibrate these with it. The Accurate class
-/// (286/386) keeps the frozen `WaitStateProfile.video` path bit-for-bit
-/// (byte-identity gate).
+/// FOURTH timing lever, calibrated (2026-07-05, retuned 2026-07-06) against the
+/// owner's real-hardware Doom `-timedemo demo3` fps targets (486 DX2-66 max
+/// detail 29-30 fps, P55C-200 ~82 fps; cross-checked vs the Ertl doombench
+/// archive). Why it exists: a real VGA card sits across an expansion bus whose
+/// per-access latency does NOT scale with CPU speed, but the flat
+/// `WaitStateProfile.video = 1` rode `scale_bus` (486 x1/3, 586 x7/30), pricing a
+/// VRAM byte write at ~15 ns / ~3.5 ns where real VLB / PCI writes cost
+/// ~100-450 ns. Doom is framebuffer-bound (measured: ~61,500 VRAM data accesses
+/// per frame at max detail), so the 486/586 personas ran demo3 1.27x / 1.56x too
+/// fast while every synthetic bench (no VRAM traffic) sat era-exact. These values
+/// are calibrated POST-`scale_bus`: the charged clocks are `(2 + ws) *
+/// bus_num/bus_den`.
+///
+/// 586 retune (2026-07-06): the narrow-SMC fix (PR #431) lifted Doom demo3 from
+/// 907 to 773 realtics (96.6 fps), faster than the ~82 fps P55C target. The owner
+/// kept the SMC win and retuned this dial to restore era-apparent speed. ws=88 ->
+/// 913 realtics -> 81.8 fps (was ws=62 -> 773 realtics -> 96.6 fps). This is the
+/// Doom-isolated lever: a sweep confirmed the synthetic bench cyc/iter columns
+/// (sieve 120503.05, dhrystone 663.62, all four modes) are byte-identical across
+/// the sweep, because the benches do no VRAM traffic. The dial is not perfectly
+/// Quake-decoupled (Quake's software renderer does enough VRAM traffic to feel
+/// it): measured nosound demo1 went 42.4 fps (ws=62) -> 41.5 fps (ws=88), a -2.1%
+/// shift vs Doom's -15.3%, so Doom is ~16x more sensitive. The two era targets
+/// (Doom ~82, Quake ~43) are not simultaneously reachable with this single dial;
+/// Doom is the priority (it was 18% too fast; Quake shifted 2%). x87 timing work,
+/// which shifts Quake more than Doom, is deferred to a later round.
+///
+/// The shipped 486 value stays at the flat 1 (see the arm comment: with honest
+/// tick delivery the DX2-66 persona hits its target with no surcharge, so no
+/// VLB-class value ships). If `bus_timing` is ever retuned, recalibrate these with
+/// it. The Accurate class (286/386) keeps the frozen `WaitStateProfile.video`
+/// path bit-for-bit (byte-identity gate).
 const fn video_wait_states_approx(level: CpuLevel) -> u8 {
     match level {
         // Unreachable in practice (Accurate class takes the profile path), but
@@ -904,7 +919,9 @@ const fn video_wait_states_approx(level: CpuLevel) -> u8 {
         // than a real DX2-66's (which leans on the video bus); the NET frame
         // rate is what is calibrated. Revisit alongside any bus_timing retune.
         CpuLevel::I486 => 1,
-        CpuLevel::I586 => 62,
+        // Retuned 2026-07-06: ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
+        // See the function-level doc for the sweep data and the isolation proof.
+        CpuLevel::I586 => 88,
     }
 }
 

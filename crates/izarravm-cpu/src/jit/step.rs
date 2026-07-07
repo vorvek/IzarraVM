@@ -28,6 +28,29 @@ use crate::{Cpu386, DecodedInsn, InternalFault};
 pub(crate) struct Slot {
     pub insn: DecodedInsn,
     pub lin: u32,
+    /// How the emitted code handles this slot. The register-only kinds (mov/add/shr) are inlined
+    /// natively against `gpr[]` plus a flag-helper call, skipping the interpreter's full decode
+    /// dispatch; the Memory kind reuses the v1 per-slot step (the bus-bound memory operand
+    /// resolution cannot be inlined without a trampoline per access, out of scope for v2).
+    pub kind: SlotKind,
+}
+
+/// The emitted-code strategy for one slot. Set once by the matcher from the captured decode; the
+/// emitter reads it to decide between a native inline op and a `region_step` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotKind {
+    /// `mov r32, r32` (opcode 0x8B, modrm mode 3): native gpr load + store, no flags, no call.
+    RegMov { dst: u8, src: u8 },
+    /// `add r32, imm32` (opcode 0x81 /0, mode 3): native add + `jit_set_pending_add` call.
+    /// `imm` is read from the captured decode (self-patched slots refresh on re-stamp).
+    RegAddImm { dst: u8, imm: u32 },
+    /// `shr r32, imm8` (opcode 0xC1 /5, mode 3): native shr + `jit_set_shift_flags_shr` call.
+    RegShrImm { dst: u8, count: u8 },
+    /// A memory-operand slot (load/store/r-m-w): the full v1 `region_step` (decode dispatch +
+    /// bus-bound memory resolution + fault handling).
+    Memory,
+    /// The final rel8 Jcc back-edge (taken = loop, not-taken = LoopDone).
+    BackEdge,
 }
 
 /// Why the region returned. `Boundary` covers every exit the run loop's own post-checks
@@ -49,16 +72,39 @@ pub(crate) enum RegionExitKind {
 pub(crate) type RegionStepFn =
     unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx, k: u32) -> u8;
 
-/// The mailbox between the dispatch (`Cpu386::run_region`), the emitted code, and `region_step`.
-/// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`; every
-/// other field is Rust-only. Boxed by the compile driver so its address is stable and disjoint
-/// from the `Cpu386` allocation (the step function holds `&mut` to both at once).
+/// Signature of the `jit_set_pending_add` flag helper, stored as a raw fn pointer the inline
+/// emitter loads and calls indirectly (the helper is a Rust method the emitter cannot address by
+/// offset). `Option` for the same null-pointer-optimization reason as `RegionStepFn`.
+#[cfg(feature = "jit")]
+pub(crate) type SetPendingAddFn = unsafe extern "C" fn(cpu: *mut Cpu386, a: u32, b: u32);
+
+/// Signature of `jit_set_shift_flags_shr`, the SHR flag helper.
+#[cfg(feature = "jit")]
+pub(crate) type SetShiftFlagsFn = unsafe extern "C" fn(cpu: *mut Cpu386, value: u32, count: u8);
+
+/// The mailbox between the dispatch (`Cpu386::run_region`), the emitted code, and the step fns.
+/// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`;
+/// `inline_step_fn` is the second field, loaded from `[ctx + 8]`. Every other field is Rust-only.
+/// Boxed by the compile driver so its address is stable and disjoint from the `Cpu386` allocation
+/// (the step function holds `&mut` to both at once).
 #[repr(C)]
 pub(crate) struct RegionCtx {
     /// `region_step::<B>` monomorphized for the live bus type, written by the dispatch on every
     /// entry (a CPU can run under different bus types across calls; the compiled bytes are
-    /// bus-agnostic because they only forward this pointer).
+    /// bus-agnostic because they only forward this pointer). Used for Memory and BackEdge slots.
     pub step_fn: Option<RegionStepFn>,
+    /// `region_inline_slot::<B>` for the register-only inline slots, written by the dispatch on
+    /// every entry alongside `step_fn`. Loaded by the prologue from `[ctx + 8]` (the second
+    /// `Option<fn>` field; the null-pointer optimization keeps each one pointer-wide at 8 bytes).
+    pub inline_step_fn: Option<RegionStepFn>,
+    /// Raw fn pointer to `Cpu386::jit_set_pending_add`, loaded by the inline add slot's helper
+    /// call. At `[ctx + 16]` (third pointer field).
+    #[cfg(feature = "jit")]
+    pub set_pending_add_fn: Option<SetPendingAddFn>,
+    /// Raw fn pointer to `Cpu386::jit_set_shift_flags_shr`, loaded by the inline shr slot's helper
+    /// call. At `[ctx + 24]` (fourth pointer field).
+    #[cfg(feature = "jit")]
+    pub set_shift_flags_fn: Option<SetShiftFlagsFn>,
     pub slots: Vec<Slot>,
     /// Index of the final slot (the back-edge Jcc). Taken = native back-edge; not taken =
     /// `LoopDone`.
@@ -195,4 +241,79 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
             STOP
         }
     }
+}
+
+/// The bookkeeping for one register-only inline slot (mov r,r / add r,imm / shr r,imm): the emitted
+/// native code has already performed the guest computation (gpr read/compute/write and, for add and
+/// shr, the flag-helper call) BEFORE calling this. This function does the part that cannot be
+/// inlined because it is bus-trait-bound or touches run-loop state: the pre-instruction prologue
+/// (shadow consume, `begin_instruction`, `core_clocks_so_far`), the cached-fetch charge (the eip
+/// advance plus the bus's instruction-fetch clock charge), the per-slot clock accumulation (these
+/// opcodes are all 2 core_clocks), and the run loop's post-instruction break checks (halted, step,
+/// cap) plus the next-line liveness probe.
+///
+/// ORDERING NOTE: v1's `region_step` charges the fetch BEFORE executing; this is called AFTER the
+/// native execute. That reordering is observably identical for the admitted register-only shape:
+/// mov/add/shr read neither eip nor the fetch result, the slots are matcher-verified warm-cached
+/// (so `charge_cached_fetch` cannot fault mid-region), and the eip advance lands at the same value.
+/// The differential suite's state+trace identity test pins this.
+///
+/// Returns CONTINUE (0) to proceed to the next slot, STOP (1) to exit to the dispatch. The fault
+/// path is unreachable for a warm cached fetch in an admitted region but is handled for soundness.
+///
+/// SAFETY: same contract as `region_step`: called only from region code invoked by
+/// `Cpu386::run_region`; `cpu`/`bus` are live non-aliased `&mut`, `ctx` is the boxed RegionCtx, `B`
+/// is the concrete bus type.
+pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
+    cpu: *mut Cpu386,
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    k: u32,
+) -> u8 {
+    // SAFETY: see the function-level contract.
+    let cpu = unsafe { &mut *cpu };
+    let bus = unsafe { &mut *(bus as *mut B) };
+    let ctx = unsafe { &mut *ctx };
+    let slot = &ctx.slots[k as usize];
+    let insn = slot.insn;
+    let lin = slot.lin;
+
+    cpu.interrupt_shadow = false;
+    cpu.begin_instruction();
+    let start_eip = cpu.registers.eip;
+    cpu.core_clocks_so_far = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+
+    // The native code already executed the guest op (gpr compute + flags); charge the fetch (eip
+    // advance + bus clocks) and, if it faults (unreachable for a warm cached line, handled for
+    // soundness), report exactly as region_step would.
+    if let Err(fault) = cpu.charge_cached_fetch(bus, lin, insn.len) {
+        ctx.fault = Some((start_eip, fault));
+        return STOP;
+    }
+
+    // The opcodes inlined here (mov/add/shr register forms) are all 2 core_clocks (the same value
+    // execute_hot_cached_decoded returns for them); accumulate it and the retired-instruction count.
+    ctx.raw_clocks += 2;
+    ctx.insn_count += 1;
+
+    // The run loop's break checks, in the same order as region_step. Halted is always false for
+    // these opcodes (mov/add/shr do not halt), but the step-break (a device flag set during the
+    // fetch charge) and the cap are live and must be honored.
+    if bus.requires_step_break() {
+        return STOP;
+    }
+    let total = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+    if total + (bus.in_batch_scaled_bus_clocks() - ctx.bus_at_run_start) >= ctx.cap {
+        return STOP;
+    }
+    // The next continuation's decode probe: an inline slot can never be the back-edge slot (the
+    // matcher classifies the final Jcc as BackEdge, handled by region_step), so this is always the
+    // "is the next slot's line still live" check.
+    if !cpu
+        .decode_cache
+        .line_live(ctx.slots[k as usize + 1].lin, ctx.d)
+    {
+        return STOP;
+    }
+    CONTINUE
 }

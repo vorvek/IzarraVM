@@ -36,8 +36,9 @@ pub(crate) struct CompiledRegion {
     pub entry: RegionEntryFn,
     /// The region's slot table and per-entry mailbox. Boxed so its address is stable and
     /// disjoint from the `Cpu386` allocation (the step function reborrows both mutably).
-    /// Re-stamping after an SMC patch replaces `ctx.slots` wholesale from fresh decodes; the
-    /// emitted bytes never change (they encode only the slot count).
+    /// Re-stamping after an SMC patch replaces `ctx.slots` wholesale from fresh decodes AND re-
+    /// emits the buffer (v2 bakes the add-imm immediates into the emitted bytes, so a self-patch
+    /// that changes an immediate requires a fresh emit; see `try_admit`).
     pub ctx: Box<RegionCtx>,
     pub entry_lin: u32,
     pub d: bool,
@@ -147,6 +148,9 @@ mod tests {
             entry: stub_entry,
             ctx: Box::new(RegionCtx {
                 step_fn: None,
+                inline_step_fn: None,
+                set_pending_add_fn: None,
+                set_shift_flags_fn: None,
                 slots: Vec::new(),
                 jnz_slot: 0,
                 entry_eip: 0,
