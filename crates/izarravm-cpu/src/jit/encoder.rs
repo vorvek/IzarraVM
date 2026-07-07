@@ -142,6 +142,82 @@ impl Encoder {
         self.modrm(0b11, b.low3(), a.low3());
     }
 
+    /// `add dst, src` (REX.W + 01 /r, ADD r/m64, r64: dst += src). Same register/ModRM pattern as
+    /// `mov_r64_r64` with opcode 0x01. Used by the native cap check to sum the scaled-core and
+    /// bus-growth terms.
+    #[allow(dead_code)]
+    pub(crate) fn add_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x01);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `sub dst, src` (REX.W + 29 /r, SUB r/m64, r64: dst -= src). Mirrors `add_r64_r64` with
+    /// opcode 0x29.
+    #[allow(dead_code)]
+    pub(crate) fn sub_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x29);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `imul dst, src` (REX.W + 0F AF /r, IMUL r64, r/m64: dst *= src, signed). Used by the
+    /// native cap check to multiply by the scale denominator.
+    #[allow(dead_code)]
+    pub(crate) fn imul_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, dst.ext(), false, src.ext());
+        self.bytes.push(0x0F);
+        self.bytes.push(0xAF);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// `imul dst, imm32` (REX.W + 69 /r id, the three-operand IMUL r64, r/m64, imm32 form: dst =
+    /// dst * imm32). Used by the native cap check to multiply the bus delta by the scale
+    /// denominator (a small compile-time constant like 12 for 586).
+    pub(crate) fn imul_r64_imm32(&mut self, dst: Reg, imm: u32) {
+        self.rex(true, dst.ext(), false, dst.ext());
+        self.bytes.push(0x69);
+        self.modrm(0b11, dst.low3(), dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `mov dst64, [base + disp32]` (REX.W + 8B /r, mod=10 disp32, SIB if base is RSP/R12). The
+    /// 32-bit-displacement form for ctx fields past offset 127.
+    pub(crate) fn load_r64_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
+        self.rex(true, dst.ext(), false, base.ext());
+        self.bytes.push(0x8B);
+        self.modrm(0b10, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `mov [base + disp32], src64` (REX.W + 89 /r, mod=10 disp32, SIB if base is RSP/R12).
+    pub(crate) fn store_r64_disp32(&mut self, base: Reg, disp32: i32, src: Reg) {
+        self.rex(true, src.ext(), false, base.ext());
+        self.bytes.push(0x89);
+        self.modrm(0b10, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `mov [base + disp32], imm32` (REX.W + C7 /0 id, the store-immediate-to-memory form). Used
+    /// to initialize ctx fields from native code.
+    #[allow(dead_code)]
+    pub(crate) fn store_imm32_disp32(&mut self, base: Reg, disp32: i32, imm: u32) {
+        self.rex(true, false, false, base.ext());
+        self.bytes.push(0xC7);
+        self.modrm(0b10, 0, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `mov dst32, src32` (32-bit move, no REX.W; used for passing a small u32 arg). REX byte is
     /// emitted only if an extended register is involved. Unit-tested but not yet called by the
     /// strcpy block's emitter (its u32 args are all compile-time constants, emitted via
@@ -357,6 +433,30 @@ impl Encoder {
         self.bytes.push(0x87);
         self.bytes.extend_from_slice(&0i32.to_le_bytes());
         self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJcc, target);
+    }
+
+    /// `jae label` (near, unsigned above-or-equal, rel32; 0F 83 cd). CF=0, i.e. the unsigned >=
+    /// condition. Used by the native cap check (`rem0 + raw >= threshold`).
+    pub(crate) fn jae(&mut self, target: Label) {
+        let instr_start = self.bytes.len();
+        self.bytes.push(0x0F);
+        self.bytes.push(0x83);
+        self.bytes.extend_from_slice(&0i32.to_le_bytes());
+        self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJcc, target);
+    }
+
+    /// `xor rdx, rdx` then `div src` — unsigned divide RDX:RAX (= RAX zero-extended) by src.
+    /// Quotient in RAX, remainder in RDX. This is the two-instruction idiom for u64 / u64.
+    /// Requires RDX and RAX as caller-saved scratch; the divisor is `src`.
+    pub(crate) fn div_r64(&mut self, src: Reg) {
+        // xor rdx, rdx (REX.W + 31 /r, self-xor for zero)
+        self.rex(true, Reg::RDX.ext(), false, Reg::RDX.ext());
+        self.bytes.push(0x31);
+        self.modrm(0b11, Reg::RDX.low3(), Reg::RDX.low3());
+        // div src (REX.W + F7 /6)
+        self.rex(true, false, false, src.ext());
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 6, src.low3());
     }
 
     /// `jmp label` (near, rel32; E9 cd). Unit-tested but not called by the strcpy block's emitter
@@ -608,6 +708,56 @@ mod tests {
         let mut e = Encoder::new();
         e.cmp_r64_r64(Reg::R14, Reg::RBX);
         assert_eq!(e.finish(), vec![0x49, 0x39, 0xDE]);
+    }
+
+    #[test]
+    fn add_r64_r64_known_bytes() {
+        // add r14, rbx -- same register/REX/ModRM pattern as cmp, opcode 01 instead of 39.
+        let mut e = Encoder::new();
+        e.add_r64_r64(Reg::R14, Reg::RBX);
+        assert_eq!(e.finish(), vec![0x49, 0x01, 0xDE]);
+    }
+
+    #[test]
+    fn sub_r64_r64_known_bytes() {
+        // sub r14, rbx -- same pattern, opcode 29.
+        let mut e = Encoder::new();
+        e.sub_r64_r64(Reg::R14, Reg::RBX);
+        assert_eq!(e.finish(), vec![0x49, 0x29, 0xDE]);
+    }
+
+    #[test]
+    fn imul_r64_r64_known_bytes() {
+        // imul r14, rbx -- REX.W=1,R=1(r14 is reg/ext),B=0(rbx not ext) = 0100_1100 = 0x4C;
+        // opcode 0F AF; modrm mod=11,reg=r14&7=6,rm=rbx&7=3 -> 11_110_011 = 0xF3
+        let mut e = Encoder::new();
+        e.imul_r64_r64(Reg::R14, Reg::RBX);
+        assert_eq!(e.finish(), vec![0x4C, 0x0F, 0xAF, 0xF3]);
+    }
+
+    #[test]
+    fn imul_r64_imm32_known_bytes() {
+        // imul rax, rax, 12 -- REX.W=1, 69 /r id. modrm mod=11,reg=0(rax),rm=0(rax) = 0xC0.
+        let mut e = Encoder::new();
+        e.imul_r64_imm32(Reg::RAX, 12);
+        assert_eq!(e.finish(), vec![0x48, 0x69, 0xC0, 0x0C, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn load_r64_disp32_known_bytes() {
+        // mov rax, [r15 + 200] -- REX.W=1,R=0(rax),B=1(r15) = 0x49; 8B; mod=10,reg=rax&7=0,rm=r15&7=7
+        // = 10_000_111 = 0x87; disp32 = 200 = 0xC8 0x00 0x00 0x00.
+        let mut e = Encoder::new();
+        e.load_r64_disp32(Reg::RAX, Reg::R15, 200);
+        assert_eq!(e.finish(), vec![0x49, 0x8B, 0x87, 0xC8, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn store_r64_disp32_known_bytes() {
+        // mov [r15 + 200], rax -- same as load but opcode 89.
+        let mut e = Encoder::new();
+        e.store_r64_disp32(Reg::R15, 200, Reg::RAX);
+        assert_eq!(e.finish(), vec![0x49, 0x89, 0x87, 0xC8, 0x00, 0x00, 0x00]);
     }
 
     #[test]
