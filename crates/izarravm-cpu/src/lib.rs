@@ -14778,6 +14778,13 @@ mod tests {
         // `read_io` call, so tests can assert on it directly (see
         // `core_clocks_so_far_reflects_prior_instructions_not_the_in_flight_one`).
         last_read_io_core_clocks_so_far: Option<u64>,
+        // When true, `direct_page` hands out host-pointer pages into `memory` (mirroring the
+        // production MachineBus), so data accesses take the CPU's cached host-pointer deref path
+        // instead of the slow `read_memory_direct` fallback. Default false: the historical
+        // no-direct-page behavior every existing test relies on (data accesses push trace cycles).
+        // The JIT memory microbenchmark sets it true so its numbers reflect production, not the
+        // slow test path (which does not exist on the real bus).
+        direct_pages_enabled: bool,
     }
 
     impl TestBus {
@@ -14789,6 +14796,7 @@ mod tests {
                 io_touched: false,
                 lazy_io_reads: false,
                 last_read_io_core_clocks_so_far: None,
+                direct_pages_enabled: false,
             }
         }
     }
@@ -14968,6 +14976,44 @@ mod tests {
                 0,
             ));
             Ok(())
+        }
+
+        // The trait default charges a fetch run byte-by-byte (one cross-crate call + push per
+        // byte), whose call overhead dominates JIT-region wall-clock microbenchmarks. This override
+        // is bit-identical to that default loop in EVERY accounting field (clocks, access count,
+        // Full-mode detail) but does it in one op, so no existing test changes. It does NOT
+        // reproduce the production MachineBus, which collapses a cacheable-RAM run to ONE access at
+        // the code-fetch wait state (this keeps `count` byte accesses at wait-state 0); the
+        // microbenchmark runs tracing Off, so it measures wall clock, not the fetch-clock total.
+        // Do not treat this TestBus's instruction-fetch clock accounting as production-representative.
+        fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
+            self.trace.record_instruction_fetch_run(start, count, 0);
+            Ok(())
+        }
+
+        // Hand out a host-pointer page into `memory`, mirroring MachineBus::direct_page, so the
+        // CPU's data_read_pages/data_write_pages caches populate and subsequent accesses are host
+        // derefs. Gated: off by default (the default trait None keeps every existing test on the
+        // slow read_memory_direct path with its trace cycles), on only for the JIT microbenchmark.
+        fn direct_page(
+            &mut self,
+            address: u32,
+            kind: BusAccessKind,
+        ) -> Result<Option<DirectPage>, BusError> {
+            if !self.direct_pages_enabled {
+                return Ok(None);
+            }
+            let physical_page = address & !0x0fff;
+            let start = physical_page as usize;
+            if start + 0x1000 > self.memory.len() {
+                return Ok(None);
+            }
+            Ok(Some(DirectPage {
+                physical_page,
+                ptr: unsafe { self.memory.as_mut_ptr().add(start) },
+                len: 0x1000,
+                writable: matches!(kind, BusAccessKind::DataWrite),
+            }))
         }
 
         fn read_io(
@@ -34005,6 +34051,7 @@ mod tests {
                 m[..p.len()].copy_from_slice(&p);
                 let mut cpu = fresh_cpu(0xffff_ffff);
                 let mut bus = TestBus::with_memory(m);
+                bus.direct_pages_enabled = true; // host-pointer cache path, like production
                 bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
                 arm_loop(&mut cpu, &mut bus, 2);
                 drive_to_halt(&mut cpu, &mut bus, u64::MAX);
@@ -34039,6 +34086,69 @@ mod tests {
                 "      drawcolumn. Its cost is the 7 memory slots' execute dispatch (the S2.4 lever)."
             );
             eprintln!("=== end A/B ===\n");
+        }
+
+        /// The region trampoline must stay byte-identical to the interpreter on the host-pointer
+        /// direct-page path too: with `direct_pages_enabled` the bus hands out host pages, so data
+        /// accesses are cached derefs (`data_read_pages`/`data_write_pages`) rather than the slow
+        /// `read_memory_direct` fallback the rest of the differential suite exercises. This is the
+        /// production-representative memory path (MachineBus always hands out direct pages).
+        #[test]
+        fn region_is_byte_identical_on_the_direct_page_path() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            let mut bus_i = TestBus::with_memory(program());
+            let mut bus_j = TestBus::with_memory(program());
+            bus_i.direct_pages_enabled = true;
+            bus_j.direct_pages_enabled = true;
+            warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+            arm_loop(&mut interp, &mut bus_i, 8);
+            arm_loop(&mut jit_cpu, &mut bus_j, 8);
+            let ci = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            let cj = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+            assert_eq!(ci, cj, "direct-page path: per-run outcomes diverged");
+            assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+            assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+            assert!(
+                jit_cpu.perf_counters().direct_page_hits > 0,
+                "the direct-page (host-pointer) path was exercised"
+            );
+        }
+
+        /// Baseline drawcolumn region throughput on a production-representative harness (the one-op
+        /// instruction-fetch charge and host-pointer direct pages, both matching MachineBus). The
+        /// reference the eventual native-template build's A/B measures against. The full cost
+        /// decomposition, and why the incremental fast paths (S2.2 bookkeeping, S2.4 memory) are not
+        /// the lever, are in dev_docs/2026-07-08-s2.4-memory-fast-path-results.md: on this harness
+        /// the drawcolumn is ~165 ns/iter with a flat cost distribution (no single 50% lever), so
+        /// only a full native-template dynarec reaches the 6.7x target.
+        ///   cargo test -j8 -p izarravm-cpu --release --features jit drawcolumn_region_baseline -- --ignored --nocapture
+        #[test]
+        #[ignore]
+        fn drawcolumn_region_baseline() {
+            use std::time::Instant;
+            const ITERS: u32 = 200_000;
+            let mut m = vec![0u8; 64 << 20];
+            let p = program();
+            m[..p.len()].copy_from_slice(&p);
+            let mut cpu = fresh_cpu(0xffff_ffff);
+            let mut bus = TestBus::with_memory(m);
+            bus.direct_pages_enabled = true; // host-pointer cache path, like production
+            bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            let idx = jit::block::try_admit(&mut cpu, ENTRY, true).expect("admit");
+            cpu.decode_cache.stamp_region(ENTRY, true, idx);
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                arm_loop(&mut cpu, &mut bus, ITERS);
+                let t = Instant::now();
+                drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+                best = best.min(t.elapsed().as_secs_f64() / ITERS as f64 * 1e9);
+            }
+            eprintln!(
+                "drawcolumn region baseline: {best:.0} ns/iter (15 insns), representative harness"
+            );
         }
     }
 
