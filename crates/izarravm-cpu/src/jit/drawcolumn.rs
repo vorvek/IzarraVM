@@ -195,7 +195,7 @@ const STACK_RESERVE: u32 = 32;
 /// kinds and their baked immediates, so the buffer is re-emitted on every fresh admission (the
 /// re-stamp path refreshes the slot table; the next fresh admission re-reads the immediates from
 /// the fresh decodes).
-fn emit_region(slots: &[Slot], regs_offset: u32) -> Vec<u8> {
+fn emit_region(slots: &[Slot], regs_offset: u32, _scale_den: u32) -> Vec<u8> {
     let mut e = Encoder::new();
     e.push(Reg::RBX);
     e.push(Reg::R12);
@@ -381,12 +381,42 @@ fn emit_set_shift_flags_shr_call(e: &mut Encoder, count: u8) {
     e.call_r64(Reg::RAX);
 }
 
-/// Byte offsets of the two flag-helper fn pointers within `RegionCtx` (set by the dispatch, loaded
-/// by the inline emit). These follow `step_fn` (off 0) and `inline_step_fn` (off 8), so they start
-/// at 16. Each `Option<unsafe extern "C" fn>` is one pointer wide (8 bytes) under the null-pointer
-/// optimization.
+/// Byte offsets of the fn pointers within `RegionCtx` (set by the dispatch, loaded by the inline
+/// emit). Each `Option<unsafe extern "C" fn>` is 8 bytes (null-pointer optimization).
+/// Field order: step_fn(0), inline_step_fn(8), set_pending_add_fn(16), set_shift_flags_fn(24),
+/// charge_fetch_fn(32), bus_clocks_fn(40), line_live_fn(48).
+#[allow(dead_code)] // wired by the native cap-check emit (in progress)
 const SET_PENDING_ADD_FN_OFF: i8 = 16;
 const SET_SHIFT_FLAGS_FN_OFF: i8 = 24;
+#[allow(dead_code)]
+const CHARGE_FETCH_FN_OFF: i8 = 32;
+#[allow(dead_code)]
+const BUS_CLOCKS_FN_OFF: i8 = 40;
+#[allow(dead_code)]
+const LINE_LIVE_FN_OFF: i8 = 48;
+
+/// Byte offsets of the timing fields within `RegionCtx` (read by the native cap check).
+/// After the 7 fn pointers (56 bytes) + Vec<Slot> (24 bytes) = 80, then:
+/// jnz_slot(4), entry_eip(4), raw_clocks(8), insn_count(4), pad(4),
+/// run_total_at_entry(8), bus_at_run_start(8), cap(8), rem0(8),
+/// scale_num(4), scale_den(4).
+/// Computed via offset_of at compile time; the guard test pins them.
+#[allow(dead_code)]
+const RAW_CLOCKS_OFF: i8 = 88;
+#[allow(dead_code)]
+const RUN_TOTAL_OFF: i8 = 96;
+#[allow(dead_code)]
+const BUS_AT_RUN_START_OFF: i8 = 104;
+#[allow(dead_code)]
+const CAP_OFF: i8 = 112;
+#[allow(dead_code)]
+const REM0_OFF: i8 = 120;
+/// These offsets exceed i8 (127); the native cap check uses disp32 addressing (to be added).
+/// For now they're u32 constants used only in the (future) native cap-check emit.
+#[allow(dead_code)]
+const SCALE_NUM_OFF: u32 = 128;
+#[allow(dead_code)]
+const SCALE_DEN_OFF: u32 = 132;
 
 /// Try to admit a region at `entry_lin`: match the shape against the live decode cache, then
 /// either refresh the already-installed region's slot table (the re-stamp path after an SMC
@@ -408,6 +438,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
     let phys_hi = phys_lo + (span - 1);
     let epoch = cpu.decode_cache.jit_smc_epoch;
     let regs_offset = core::mem::offset_of!(Cpu386, registers) as u32;
+    let (_scale_num, scale_den) = crate::level_timing(cpu.level);
     if let Some(idx) = cpu.jit_regions.find(entry_lin, d) {
         let region = cpu
             .jit_regions
@@ -422,7 +453,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         // so the buffer must be re-emitted from the fresh slot table. The kinds themselves are
         // shape-fixed (the matcher re-verified them), but the immediates and the regs offset are
         // re-read here for correctness.
-        let code = emit_region(&region.ctx.slots, regs_offset);
+        let code = emit_region(&region.ctx.slots, regs_offset, scale_den);
         if let Some(buf) = ExecutableBuffer::new(&code) {
             // SAFETY: same transmute proof as the fresh-admission path below; `code` was produced
             // by emit_region to exactly the RegionEntryFn convention.
@@ -438,7 +469,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         return Some(idx);
     }
     let jnz_slot = (slots.len() - 1) as u32;
-    let code = emit_region(&slots, regs_offset);
+    let code = emit_region(&slots, regs_offset, scale_den);
     let buf = ExecutableBuffer::new(&code)?;
     // SAFETY: `code` was produced by `emit_region` to exactly the `RegionEntryFn` calling
     // convention (alignment proof at STACK_RESERVE); `entry_ptr` stays valid for `buf`'s life,
@@ -450,6 +481,9 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
         inline_step_fn: None,     // written by the dispatch on every entry
         set_pending_add_fn: None, // written by the dispatch on every entry
         set_shift_flags_fn: None, // written by the dispatch on every entry
+        charge_fetch_fn: None,   // written by the dispatch on every entry
+        bus_clocks_fn: None,     // written by the dispatch on every entry
+        line_live_fn: None,      // written by the dispatch on every entry
         slots,
         jnz_slot,
         entry_eip: 0,

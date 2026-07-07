@@ -3623,6 +3623,11 @@ impl Cpu386 {
                     Self::jit_set_shift_flags_shr as fn(&mut Cpu386, u32, u8),
                 )
             });
+            ctx.charge_fetch_fn =
+                Some(jit::step::jit_charge_fetch::<B> as jit::step::ChargeFetchFn);
+            ctx.bus_clocks_fn =
+                Some(jit::step::jit_bus_clocks::<B> as jit::step::BusClocksFn);
+            ctx.line_live_fn = Some(jit::step::jit_line_live as jit::step::LineLiveFn);
             ctx.entry_eip = eip;
             ctx.raw_clocks = 0;
             ctx.insn_count = 0;
@@ -13873,7 +13878,7 @@ mod tests {
         // position so a change is visible. Update this constant only after confirming the emitter
         // still produces correct results (re-run the differential suite).
         assert_eq!(
-            off, 328,
+            off, 472,
             "Cpu386.registers offset moved; update the emitter's baked offset"
         );
     }

@@ -82,6 +82,20 @@ pub(crate) type SetPendingAddFn = unsafe extern "C" fn(cpu: *mut Cpu386, a: u32,
 #[cfg(feature = "jit")]
 pub(crate) type SetShiftFlagsFn = unsafe extern "C" fn(cpu: *mut Cpu386, value: u32, count: u8);
 
+/// Signature of the charge-cached-fetch call-out. Advances eip by `len` and charges the bus for
+/// the instruction fetch. Returns 0 on success, 1 on fault (the fault is recorded in ctx).
+#[cfg(feature = "jit")]
+pub(crate) type ChargeFetchFn =
+    unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx, lin: u32, len: u32) -> u8;
+
+/// Signature of the scaled-bus-clocks call-out. Returns the live in-batch scaled bus clock count.
+#[cfg(feature = "jit")]
+pub(crate) type BusClocksFn = unsafe extern "C" fn(bus: *const c_void) -> u64;
+
+/// Signature of the decode-line liveness probe. Returns 1 if the slot's line is live, 0 otherwise.
+#[cfg(feature = "jit")]
+pub(crate) type LineLiveFn = unsafe extern "C" fn(cpu: *const Cpu386, lin: u32, d: bool) -> bool;
+
 /// The mailbox between the dispatch (`Cpu386::run_region`), the emitted code, and the step fns.
 /// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`;
 /// `inline_step_fn` is the second field, loaded from `[ctx + 8]`. Every other field is Rust-only.
@@ -105,6 +119,15 @@ pub(crate) struct RegionCtx {
     /// call. At `[ctx + 24]` (fourth pointer field).
     #[cfg(feature = "jit")]
     pub set_shift_flags_fn: Option<SetShiftFlagsFn>,
+    /// Fn pointer to the charge-cached-fetch call-out (advances eip + charges bus). At `[ctx+32]`.
+    #[cfg(feature = "jit")]
+    pub charge_fetch_fn: Option<ChargeFetchFn>,
+    /// Fn pointer to the scaled-bus-clocks call-out. At `[ctx+40]`.
+    #[cfg(feature = "jit")]
+    pub bus_clocks_fn: Option<BusClocksFn>,
+    /// Fn pointer to the decode-line liveness probe. At `[ctx+48]`.
+    #[cfg(feature = "jit")]
+    pub line_live_fn: Option<LineLiveFn>,
     pub slots: Vec<Slot>,
     /// Index of the final slot (the back-edge Jcc). Taken = native back-edge; not taken =
     /// `LoopDone`.
@@ -317,4 +340,52 @@ pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
         return STOP;
     }
     CONTINUE
+}
+
+// -------- Native cap-check call-outs (feature `jit`) --------
+//
+// These are the bus-trait-bound and cpu-bound operations the emitted native code calls via fn
+// pointers from the RegionCtx. They replace the per-slot `region_inline_slot` trampoline: the
+// emitted code does the native gpr op, then calls these for the bus-bound parts (fetch charge,
+// bus-clock read, line liveness), and does the cap-check arithmetic natively between calls.
+
+/// Charge the cached fetch for one slot: advance eip by `len` and charge the bus for the
+/// instruction-fetch clocks. Returns 0 on success, 1 on fault (records the fault in ctx).
+/// SAFETY: same contract as `region_step` — cpu/bus live non-aliased &mut, ctx is the boxed
+/// RegionCtx.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_charge_fetch<B: CpuBus>(
+    cpu: *mut Cpu386,
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    lin: u32,
+    len: u32,
+) -> u8 {
+    let cpu = unsafe { &mut *cpu };
+    let bus = unsafe { &mut *(bus as *mut B) };
+    let ctx = unsafe { &mut *ctx };
+    cpu.interrupt_shadow = false;
+    cpu.begin_instruction();
+    cpu.core_clocks_so_far = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+    if let Err(fault) = cpu.charge_cached_fetch(bus, lin, len as u8) {
+        ctx.fault = Some((cpu.registers.eip, fault));
+        return 1;
+    }
+    0
+}
+
+/// Read the live in-batch scaled bus clock count from the bus. A pure `&self` read.
+/// SAFETY: `bus` must be the live bus pointer the region was entered with.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_bus_clocks<B: CpuBus>(bus: *const c_void) -> u64 {
+    let bus = unsafe { &*(bus as *const B) };
+    bus.in_batch_scaled_bus_clocks()
+}
+
+/// Probe whether a decode line is live (generation-current, matching tag and D bit).
+/// SAFETY: `cpu` must be the live Cpu386 pointer the region was entered with.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn jit_line_live(cpu: *const Cpu386, lin: u32, d: bool) -> bool {
+    let cpu = unsafe { &*cpu };
+    cpu.decode_cache.line_live(lin, d)
 }

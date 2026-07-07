@@ -161,6 +161,16 @@ impl Encoder {
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// `imul dst, src` (REX.W + 0F AF /r, IMUL r64, r/m64: dst *= src, signed). Used by the
+    /// native cap check to multiply by the scale denominator.
+    #[allow(dead_code)]
+    pub(crate) fn imul_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, dst.ext(), false, src.ext());
+        self.bytes.push(0x0F);
+        self.bytes.push(0xAF);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
     /// `mov dst32, src32` (32-bit move, no REX.W; used for passing a small u32 arg). REX byte is
     /// emitted only if an extended register is involved. Unit-tested but not yet called by the
     /// strcpy block's emitter (its u32 args are all compile-time constants, emitted via
@@ -643,6 +653,15 @@ mod tests {
         let mut e = Encoder::new();
         e.sub_r64_r64(Reg::R14, Reg::RBX);
         assert_eq!(e.finish(), vec![0x49, 0x29, 0xDE]);
+    }
+
+    #[test]
+    fn imul_r64_r64_known_bytes() {
+        // imul r14, rbx -- REX.W=1,R=1(r14 is reg/ext),B=0(rbx not ext) = 0100_1100 = 0x4C;
+        // opcode 0F AF; modrm mod=11,reg=r14&7=6,rm=rbx&7=3 -> 11_110_011 = 0xF3
+        let mut e = Encoder::new();
+        e.imul_r64_r64(Reg::R14, Reg::RBX);
+        assert_eq!(e.finish(), vec![0x4C, 0x0F, 0xAF, 0xF3]);
     }
 
     #[test]
