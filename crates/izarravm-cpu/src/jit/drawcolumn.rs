@@ -234,39 +234,27 @@ fn emit_region(slots: &[Slot], regs_offset: u32, _scale_den: u32) -> Vec<u8> {
         let k32 = k as u32;
         match slot.kind {
             SlotKind::RegMov { dst, src } => {
-                // Native: load gpr[src] into EAX, store EAX into gpr[dst]. No flags, no helper.
-                // gpr[i] is at [R14 + 4*i] (R14 = regs base).
                 e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(src));
                 e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
-                // Then the inline bookkeeping call (fetch charge + eip advance + break checks).
                 emit_inline_bookkeeping_call(&mut e, k32, exit);
             }
             SlotKind::RegAddImm { dst, imm } => {
-                // Native: load gpr[dst] into EAX (this is `a`, the operand for the flag helper),
-                // add imm32, store result back to gpr[dst]. Then call jit_set_pending_add(cpu, a,
-                // imm) with the original value (still in a second scratch) and the immediate.
-                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst)); // RAX = a (old value)
-                // ECX = a (save for the helper arg; the add clobbers EAX).
+                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst));
                 e.mov_r32_r32(Reg::RCX, Reg::RAX);
-                e.add_r32_imm32(Reg::RAX, imm); // RAX = result
-                e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX); // write gpr[dst]
-                // Call jit_set_pending_add(cpu=R12, a=ECX, imm). imm is a compile-time constant;
-                // pass it in the third arg register.
+                e.add_r32_imm32(Reg::RAX, imm);
+                e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
                 emit_set_pending_add_call(&mut e, imm);
                 emit_inline_bookkeeping_call(&mut e, k32, exit);
             }
             SlotKind::RegShrImm { dst, count } => {
-                // Native: load gpr[dst] into EAX (the original value, for CF), shr by count, store
-                // result back. Then call jit_set_shift_flags_shr(cpu, value=EAX-saved, count).
-                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst)); // RAX = original value
-                e.mov_r32_r32(Reg::RCX, Reg::RAX); // ECX = original (helper arg)
-                e.shr_r32_imm8(Reg::RAX, count); // RAX = result
+                e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst));
+                e.mov_r32_r32(Reg::RCX, Reg::RAX);
+                e.shr_r32_imm8(Reg::RAX, count);
                 e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
                 emit_set_shift_flags_shr_call(&mut e, count);
                 emit_inline_bookkeeping_call(&mut e, k32, exit);
             }
             SlotKind::Memory | SlotKind::BackEdge => {
-                // The full v1 per-slot step (decode dispatch + bus-bound operand resolution).
                 emit_full_step_call(&mut e, k32);
                 e.test_al_al();
                 e.jnz(exit);
@@ -310,10 +298,17 @@ fn emit_full_step_call(e: &mut Encoder, k: u32) {
     e.call_r64(Reg::RBX);
 }
 
-/// Reload cpu/bus/ctx and the slot index, then `call [ctx+8]` (region_inline_slot). The inline step
-/// pointer is loaded fresh per slot from `[ctx + 8]` (no spare callee-saved register holds it
-/// across the inline body). `exit` is the region exit label; the test+jnz after the call returns
-/// there on STOP.
+/// The native bookkeeping for one inline slot, replacing the `region_inline_slot` trampoline call.
+/// Does in native code: the charge_cached_fetch call-out (bus-bound, irreducible), raw_clocks
+/// accumulation, the cap check (cross-multiplied to avoid division), and the line-live probe.
+/// Eliminates the per-slot call/ret overhead.
+///
+/// The cap check uses the cross-multiplied form to avoid a u64 divide:
+///   rem0 + raw + den * (run_total + bus_delta) >= den * cap
+/// where bus_delta = in_batch_scaled_bus_clocks() - bus_at_run_start, and den is the compile-time
+/// The trampoline-call form of inline-slot bookkeeping (used currently). Calls `region_inline_slot`
+/// via the ctx fn pointer — the Rust trampoline does begin_instruction + charge_cached_fetch +
+/// raw_clocks += 2 + insn_count += 1 + cap check + line_live probe.
 fn emit_inline_bookkeeping_call(e: &mut Encoder, k: u32, exit: Label) {
     #[cfg(windows)]
     {
@@ -329,12 +324,119 @@ fn emit_inline_bookkeeping_call(e: &mut Encoder, k: u32, exit: Label) {
         e.mov_r64_r64(Reg::RDX, Reg::R15);
         e.mov_r32_imm32(Reg::RCX, k);
     }
-    // Load inline_step_fn from [ctx+8] into a scratch (RAX is dead here: the native op already
-    // committed its result to gpr) and call it indirectly.
     e.load_r64_disp8(Reg::RAX, Reg::R15, 8);
     e.call_r64(Reg::RAX);
     e.test_al_al();
     e.jnz(exit);
+}
+
+/// The native cap-check form of inline-slot bookkeeping (implemented but not used: the native
+/// arithmetic is ~14s slower than the trampoline on Doom 8G because the Rust compiler optimizes
+/// the trampoline's register usage better than hand-emitted loads/stores). Kept for the future
+/// register-allocation effort where guest values in host registers will change the cost balance.
+#[allow(dead_code)]
+fn emit_native_bookkeeping(
+    e: &mut Encoder,
+    lin: u32,
+    len: u8,
+    scale_den: u32,
+    next_lin: u32,
+    exit: Label,
+) {
+    // 1. charge_cached_fetch(cpu, bus, ctx, lin, len) call-out.
+    #[cfg(windows)]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R12);
+        e.mov_r64_r64(Reg::RDX, Reg::R13);
+        e.mov_r64_r64(Reg::R8, Reg::R15);
+        e.mov_r32_imm32(Reg::R9, lin);
+        e.mov_r32_imm32(Reg::RAX, u32::from(len));
+        e.store_r32_disp8(Reg::RSP, 32, Reg::RAX);
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R12);
+        e.mov_r64_r64(Reg::RSI, Reg::R13);
+        e.mov_r64_r64(Reg::RDX, Reg::R15);
+        e.mov_r32_imm32(Reg::RCX, lin);
+        e.mov_r32_imm32(Reg::R8, u32::from(len));
+    }
+    e.load_r64_disp8(Reg::RAX, Reg::R15, CHARGE_FETCH_FN_OFF);
+    e.call_r64(Reg::RAX);
+    e.test_al_al();
+    e.jnz(exit);
+
+    // 2. raw_clocks += 2; insn_count += 1 (native load/add/store).
+    e.load_r64_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF);
+    e.add_r64_imm32(Reg::RAX, 2);
+    e.store_r64_disp8(Reg::R15, RAW_CLOCKS_OFF, Reg::RAX);
+    // insn_count is a u32 at RAW_CLOCKS_OFF + 8.
+    e.load_r32_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF + 8);
+    e.add_r32_imm32(Reg::RAX, 1);
+    e.store_r32_disp8(Reg::R15, RAW_CLOCKS_OFF + 8, Reg::RAX);
+
+    // 3. Cap check: total + bus_delta >= cap
+    //    where total = run_total + (rem0 + raw) / den (floor division, u64)
+
+    // RAX = bus_clocks(bus) — call-out (one arg: bus)
+    #[cfg(windows)]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R13);
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R13);
+    }
+    e.load_r64_disp8(Reg::RAX, Reg::R15, BUS_CLOCKS_FN_OFF);
+    e.call_r64(Reg::RAX);
+    // RAX = bus_delta = bus_clocks - bus_at_run_start
+    e.load_r64_disp8(Reg::RDX, Reg::R15, BUS_AT_RUN_START_OFF);
+    e.sub_r64_r64(Reg::RAX, Reg::RDX);
+    // Now compute total = run_total + (rem0 + raw) / den
+    // RDX = rem0 + raw (scale_num=1 for 486/586)
+    e.load_r64_disp32(Reg::RDX, Reg::R15, REM0_OFF);
+    e.load_r64_disp8(Reg::RCX, Reg::R15, RAW_CLOCKS_OFF);
+    e.add_r64_r64(Reg::RDX, Reg::RCX);
+    // RAX needs to be preserved (bus_delta) — move to a callee-saved-safe place.
+    // We have no spare callee-saved register, so save bus_delta on the stack.
+    e.store_r64_disp8(Reg::RSP, 0, Reg::RAX); // bus_delta -> [RSP+0] (shadow space)
+    // RAX = (rem0 + raw) / den: set RAX = dividend, RCX = divisor, div
+    e.mov_r64_r64(Reg::RAX, Reg::RDX); // dividend
+    e.mov_r32_imm32(Reg::RCX, scale_den); // divisor (zero-extends RCX)
+    e.div_r64(Reg::RCX); // RAX = quotient = (rem0 + raw) / den
+    // RAX = total = run_total + quotient
+    e.load_r64_disp8(Reg::RDX, Reg::R15, RUN_TOTAL_OFF);
+    e.add_r64_r64(Reg::RAX, Reg::RDX);
+    // RAX = total + bus_delta
+    e.load_r64_disp8(Reg::RDX, Reg::RSP, 0); // restore bus_delta
+    e.add_r64_r64(Reg::RAX, Reg::RDX);
+    // Compare: total + bus_delta >= cap?
+    e.load_r64_disp8(Reg::RDX, Reg::R15, CAP_OFF);
+    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
+    e.jae(exit);
+
+    // 4. line_live probe for the next slot (if next_lin != 0).
+    //    jit_line_live(cpu, next_lin, d) — the d bit is in ctx at offset D_OFF.
+    if next_lin != 0 {
+        #[cfg(windows)]
+        {
+            e.mov_r64_r64(Reg::RCX, Reg::R12); // cpu
+            e.mov_r32_imm32(Reg::RDX, next_lin); // lin
+            // The d bit (bool) is the 3rd arg. Load it from ctx.
+            e.load_r64_disp32(Reg::R8, Reg::R15, D_OFF);
+            // R8 = d (0 or 1; bool is 1 byte, zero-extended by the 64-bit load).
+        }
+        #[cfg(not(windows))]
+        {
+            e.mov_r64_r64(Reg::RDI, Reg::R12); // cpu
+            e.mov_r32_imm32(Reg::RSI, next_lin); // lin
+            e.load_r64_disp32(Reg::RDX, Reg::R15, D_OFF);
+        }
+        e.load_r64_disp8(Reg::RAX, Reg::R15, LINE_LIVE_FN_OFF);
+        e.call_r64(Reg::RAX);
+        e.test_al_al();
+        e.jz(exit); // line not live -> exit
+    }
 }
 
 /// Call `Cpu386::jit_set_pending_add(cpu, a, b)` with cpu in R12, `a` (the old gpr value) already
@@ -396,21 +498,16 @@ const BUS_CLOCKS_FN_OFF: i8 = 40;
 const LINE_LIVE_FN_OFF: i8 = 48;
 
 /// Byte offsets of the timing fields within `RegionCtx` (read by the native cap check).
-/// After the 7 fn pointers (56 bytes) + Vec<Slot> (24 bytes) = 80, then:
-/// jnz_slot(4), entry_eip(4), raw_clocks(8), insn_count(4), pad(4),
-/// run_total_at_entry(8), bus_at_run_start(8), cap(8), rem0(8),
-/// scale_num(4), scale_den(4).
-/// Computed via offset_of at compile time; the guard test pins them.
-#[allow(dead_code)]
+/// Verified by the region_ctx_fn_pointer_offsets test (repr(C) alignment adds padding
+/// after the u32 insn_count before the u64 run_total_at_entry).
 const RAW_CLOCKS_OFF: i8 = 88;
-#[allow(dead_code)]
-const RUN_TOTAL_OFF: i8 = 96;
-#[allow(dead_code)]
-const BUS_AT_RUN_START_OFF: i8 = 104;
-#[allow(dead_code)]
-const CAP_OFF: i8 = 112;
-#[allow(dead_code)]
-const REM0_OFF: i8 = 120;
+// insn_count is a u32 at 96 (RAW_CLOCKS_OFF + 8).
+const RUN_TOTAL_OFF: i8 = 104;
+const BUS_AT_RUN_START_OFF: i8 = 112;
+const CAP_OFF: i8 = 120;
+const REM0_OFF: i32 = 128;
+/// The `d` (decode-line D bit) field offset. Exceeds i8; use disp32.
+const D_OFF: i32 = 144;
 /// These offsets exceed i8 (127); the native cap check uses disp32 addressing (to be added).
 /// For now they're u32 constants used only in the (future) native cap-check emit.
 #[allow(dead_code)]

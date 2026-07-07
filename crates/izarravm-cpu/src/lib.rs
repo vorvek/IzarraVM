@@ -13886,13 +13886,25 @@ mod tests {
     #[test]
     #[cfg(feature = "jit")]
     fn region_ctx_fn_pointer_offsets() {
-        // The emitter bakes these offsets (ctx+0 step_fn, ctx+8 inline_step_fn, ctx+16
-        // set_pending_add_fn, ctx+24 set_shift_flags_fn). Pin them so a field reorder is caught.
+        // Pin ALL offsets the emitted native code reads/writes so a field reorder is caught.
         use jit::step::RegionCtx;
         assert_eq!(core::mem::offset_of!(RegionCtx, step_fn), 0);
         assert_eq!(core::mem::offset_of!(RegionCtx, inline_step_fn), 8);
         assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
         assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
+        assert_eq!(core::mem::offset_of!(RegionCtx, charge_fetch_fn), 32);
+        assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
+        assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
+        // Verify the timing-field offsets the native cap check uses.
+        let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
+        eprintln!("raw_clocks offset = {raw_off}");
+        assert_eq!(raw_off, 88);
+        let rt_off = core::mem::offset_of!(RegionCtx, run_total_at_entry);
+        eprintln!("run_total_at_entry offset = {rt_off}");
+        let cap_off = core::mem::offset_of!(RegionCtx, cap);
+        eprintln!("cap offset = {cap_off}");
+        let d_off = core::mem::offset_of!(RegionCtx, d);
+        eprintln!("d offset = {d_off}");
     }
 
     /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the

@@ -435,6 +435,30 @@ impl Encoder {
         self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJcc, target);
     }
 
+    /// `jae label` (near, unsigned above-or-equal, rel32; 0F 83 cd). CF=0, i.e. the unsigned >=
+    /// condition. Used by the native cap check (`rem0 + raw >= threshold`).
+    pub(crate) fn jae(&mut self, target: Label) {
+        let instr_start = self.bytes.len();
+        self.bytes.push(0x0F);
+        self.bytes.push(0x83);
+        self.bytes.extend_from_slice(&0i32.to_le_bytes());
+        self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJcc, target);
+    }
+
+    /// `xor rdx, rdx` then `div src` — unsigned divide RDX:RAX (= RAX zero-extended) by src.
+    /// Quotient in RAX, remainder in RDX. This is the two-instruction idiom for u64 / u64.
+    /// Requires RDX and RAX as caller-saved scratch; the divisor is `src`.
+    pub(crate) fn div_r64(&mut self, src: Reg) {
+        // xor rdx, rdx (REX.W + 31 /r, self-xor for zero)
+        self.rex(true, Reg::RDX.ext(), false, Reg::RDX.ext());
+        self.bytes.push(0x31);
+        self.modrm(0b11, Reg::RDX.low3(), Reg::RDX.low3());
+        // div src (REX.W + F7 /6)
+        self.rex(true, false, false, src.ext());
+        self.bytes.push(0xF7);
+        self.modrm(0b11, 6, src.low3());
+    }
+
     /// `jmp label` (near, rel32; E9 cd). Unit-tested but not called by the strcpy block's emitter
     /// (every exit from its loop body is a conditional branch -- `ja`/`jnz`/`jz` -- never an
     /// unconditional one). Kept for a future block whose control flow needs it.
