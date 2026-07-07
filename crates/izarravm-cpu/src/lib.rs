@@ -14979,10 +14979,13 @@ mod tests {
         }
 
         // The trait default charges a fetch run byte-by-byte (one cross-crate call + push per
-        // byte). `record_instruction_fetch_run` is bit-identical to that loop in all accounting
-        // fields (clocks, access count, Full-mode detail) but does it in one op, matching the
-        // production MachineBus's collapsed RAM charge. Without this override the per-byte loop
-        // dominates JIT-region microbenchmarks with a cost that does not exist on the real bus.
+        // byte), whose call overhead dominates JIT-region wall-clock microbenchmarks. This override
+        // is bit-identical to that default loop in EVERY accounting field (clocks, access count,
+        // Full-mode detail) but does it in one op, so no existing test changes. It does NOT
+        // reproduce the production MachineBus, which collapses a cacheable-RAM run to ONE access at
+        // the code-fetch wait state (this keeps `count` byte accesses at wait-state 0); the
+        // microbenchmark runs tracing Off, so it measures wall clock, not the fetch-clock total.
+        // Do not treat this TestBus's instruction-fetch clock accounting as production-representative.
         fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
             self.trace.record_instruction_fetch_run(start, count, 0);
             Ok(())
