@@ -1,8 +1,7 @@
 # ReSonique 2 Sound Card Manual
 
 ReSonique 2 is the Izarra 3000's audio hardware: a combo card built around a
-Sound Blaster 16 compatible digital audio path, an OPL3 FM synthesizer, and
-a Yamaha ADPCM-B streaming DAC as a second, independent playback device.
+Sound Blaster 16 compatible digital audio path and an OPL3 FM synthesizer.
 This manual covers what a DOS program actually finds when it probes the
 card.
 
@@ -12,14 +11,10 @@ card.
 | --- | --- | --- | --- | --- |
 | Digital audio | Sound Blaster 16 / CT1745 mixer | `0x220` | 5 | 8-bit: 1, 16-bit: 5 |
 | FM synthesis | OPL3 (Yamaha YMF262) | `0x388` | n/a | n/a |
-| Streaming DAC | Yamaha ADPCM-B | `0x240` (configurable) | 10 | 3 |
 
-The digital audio and FM sections sit at their standard, fixed Sound
-Blaster addresses, the way real SB16 hardware does. Software doesn't need
-to detect them beyond the usual Sound Blaster and AdLib probes. The ADPCM-B
-DAC is a separate, independently configurable device window, deliberately
-wired to defaults (`0x240`/IRQ 10/DMA 3) that stay clear of the SB16 and any
-Windows Sound System codec sharing the same machine.
+Both sections sit at their standard, fixed Sound Blaster addresses, the way
+real SB16 hardware does. Software doesn't need to detect them beyond the
+usual Sound Blaster and AdLib probes.
 
 ## The BLASTER variable
 
@@ -51,17 +46,15 @@ set on top of OPL2's two-operator patches, detected the same way real OPL3
 hardware is: by reading back its status and timer registers, the classic
 AdLib detection routine.
 
-## Streaming DAC (Yamaha ADPCM-B)
+## Creative ADPCM
 
-A second, independent digital audio path: a streaming ADPCM decoder
-modeled on the Yamaha ADPCM-B format (the same family used in the YM2608
-and Y8950), decoding 4-bit ADPCM data streamed in over DMA or a direct data
-port into 16-bit PCM, with its own half-buffer and end-of-buffer interrupts.
-This is the same shape of interrupt behavior a Sound Blaster DSP gives you,
-just on its own port window so it can run concurrently with the SB16 and
-OPL3 sections rather than competing with them. Software that specifically
-targets this path needs its own driver; it isn't detected through the
-standard Sound Blaster or AdLib probes.
+The DSP decodes Creative ADPCM the way a real SB16 does, as part of the
+digital audio path rather than a separate device. The 4-bit, 2.6-bit, and
+2-bit playback commands (`0x74`-`0x77`, `0x16`/`0x17`, and their auto-init
+variants) expand the compressed DMA stream to 8-bit samples through the
+DSP's adaptive predictor, with the same half-buffer and end-of-buffer
+interrupts as raw PCM playback. Nothing extra to detect or configure: a
+program that issues the ADPCM DSP commands just works.
 
 ## What ReSonique 2 does not have, yet
 
