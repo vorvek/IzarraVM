@@ -296,12 +296,13 @@ pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
     ctx.raw_clocks += 2;
     ctx.insn_count += 1;
 
-    // The run loop's break checks, in the same order as region_step. Halted is always false for
-    // these opcodes (mov/add/shr do not halt), but the step-break (a device flag set during the
-    // fetch charge) and the cap are live and must be honored.
-    if bus.requires_step_break() {
-        return STOP;
-    }
+    // The run loop's break checks. Halted is always false for these opcodes (mov/add/shr do not
+    // halt). The step-break check (requires_step_break) is elided: register-only slots do no port
+    // I/O (the only thing that sets io_touched), and no admitted shape contains an INT (the only
+    // thing that sets pending_soft_int), so requires_step_break is provably false here. The
+    // charge_cached_fetch above touches the bus for an instruction-fetch, which never sets
+    // io_touched (it goes through charge_instruction_fetch_run, not read_io/write_io). The cap
+    // check stays: the fetch charge can add bus clocks that push over the threshold.
     let total = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
     if total + (bus.in_batch_scaled_bus_clocks() - ctx.bus_at_run_start) >= ctx.cap {
         return STOP;

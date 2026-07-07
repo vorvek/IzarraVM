@@ -142,6 +142,25 @@ impl Encoder {
         self.modrm(0b11, b.low3(), a.low3());
     }
 
+    /// `add dst, src` (REX.W + 01 /r, ADD r/m64, r64: dst += src). Same register/ModRM pattern as
+    /// `mov_r64_r64` with opcode 0x01. Used by the native cap check to sum the scaled-core and
+    /// bus-growth terms.
+    #[allow(dead_code)]
+    pub(crate) fn add_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x01);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `sub dst, src` (REX.W + 29 /r, SUB r/m64, r64: dst -= src). Mirrors `add_r64_r64` with
+    /// opcode 0x29.
+    #[allow(dead_code)]
+    pub(crate) fn sub_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x29);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// `mov dst32, src32` (32-bit move, no REX.W; used for passing a small u32 arg). REX byte is
     /// emitted only if an extended register is involved. Unit-tested but not yet called by the
     /// strcpy block's emitter (its u32 args are all compile-time constants, emitted via
@@ -608,6 +627,22 @@ mod tests {
         let mut e = Encoder::new();
         e.cmp_r64_r64(Reg::R14, Reg::RBX);
         assert_eq!(e.finish(), vec![0x49, 0x39, 0xDE]);
+    }
+
+    #[test]
+    fn add_r64_r64_known_bytes() {
+        // add r14, rbx -- same register/REX/ModRM pattern as cmp, opcode 01 instead of 39.
+        let mut e = Encoder::new();
+        e.add_r64_r64(Reg::R14, Reg::RBX);
+        assert_eq!(e.finish(), vec![0x49, 0x01, 0xDE]);
+    }
+
+    #[test]
+    fn sub_r64_r64_known_bytes() {
+        // sub r14, rbx -- same pattern, opcode 29.
+        let mut e = Encoder::new();
+        e.sub_r64_r64(Reg::R14, Reg::RBX);
+        assert_eq!(e.finish(), vec![0x49, 0x29, 0xDE]);
     }
 
     #[test]
