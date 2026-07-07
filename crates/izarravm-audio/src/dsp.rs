@@ -1,13 +1,156 @@
 //! Sound Blaster 16-class DSP (CT1747) clean-room core: reset handshake,
-//! command/data protocol, and 8-bit plus 16-bit single/auto-init DMA playback.
-//! The CT1745 mixer lives next to this in the machine crate. ADPCM, input/ADC,
-//! and MIDI/MPU-401 are not modeled yet.
+//! command/data protocol, 8-bit plus 16-bit single/auto-init DMA playback, and
+//! Creative ADPCM (4-bit, 2.6-bit, 2-bit) decode on the 8-bit DMA path. The
+//! CT1745 mixer lives next to this in the machine crate. Input/ADC and
+//! MIDI/MPU-401 are not modeled yet.
 
 use crate::pcm::{push_frame_capped, sample_i16, sample_u8, sample_u16};
 use std::collections::VecDeque;
 
 pub const DSP_VERSION_HI: u8 = 4;
 pub const DSP_VERSION_LO: u8 = 5;
+
+// ===========================================================================
+//  Creative ADPCM decoder (DSP commands 0x74-0x77, 0x16/0x17, 0x1F/0x7D/0x7F).
+//
+//  The SB DSP decodes its own ADPCM: the DMA delivers packed codes and each
+//  encoded byte expands to 2 (4-bit), 3 (2.6-bit), or 4 (2-bit) 8-bit unsigned
+//  PCM samples through an adaptive predictor. The step/adjust tables and the
+//  predictor arithmetic are a 1:1 port of DOSBox-X's decode_ADPCM_* functions
+//  (src/hardware/sblaster.cpp, GPLv2-or-later); see NOTICE. DOSBox-X names the
+//  2.6-bit format "ADPCM_3" (three samples per byte), mirrored here as Bits26.
+// ===========================================================================
+
+/// 4-bit code -> reference delta, indexed by `code + step` (0..=63).
+const ADPCM4_SCALE: [i8; 64] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 0, -1, -2, -3, -4, -5, -6, -7, //
+    1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15, //
+    2, 6, 10, 14, 18, 22, 26, 30, -2, -6, -10, -14, -18, -22, -26, -30, //
+    4, 12, 20, 28, 36, 44, 52, 60, -4, -12, -20, -28, -36, -44, -52, -60,
+];
+/// 4-bit step adjustment (added mod 256), indexed by `code + step` (0..=63).
+const ADPCM4_ADJUST: [u8; 64] = [
+    0, 0, 0, 0, 0, 16, 16, 16, 0, 0, 0, 0, 0, 16, 16, 16, //
+    240, 0, 0, 0, 0, 16, 16, 16, 240, 0, 0, 0, 0, 16, 16, 16, //
+    240, 0, 0, 0, 0, 16, 16, 16, 240, 0, 0, 0, 0, 16, 16, 16, //
+    240, 0, 0, 0, 0, 0, 0, 0, 240, 0, 0, 0, 0, 0, 0, 0,
+];
+/// 2.6-bit (three-per-byte) reference delta, indexed by `code + step` (0..=39).
+const ADPCM3_SCALE: [i8; 40] = [
+    0, 1, 2, 3, 0, -1, -2, -3, //
+    1, 3, 5, 7, -1, -3, -5, -7, //
+    2, 6, 10, 14, -2, -6, -10, -14, //
+    4, 12, 20, 28, -4, -12, -20, -28, //
+    5, 15, 25, 35, -5, -15, -25, -35,
+];
+/// 2.6-bit step adjustment (added mod 256), indexed by `code + step` (0..=39).
+const ADPCM3_ADJUST: [u8; 40] = [
+    0, 0, 0, 8, 0, 0, 0, 8, //
+    248, 0, 0, 8, 248, 0, 0, 8, //
+    248, 0, 0, 8, 248, 0, 0, 8, //
+    248, 0, 0, 8, 248, 0, 0, 8, //
+    248, 0, 0, 0, 248, 0, 0, 0,
+];
+/// 2-bit reference delta, indexed by `code + step` (0..=23).
+const ADPCM2_SCALE: [i8; 24] = [
+    0, 1, 0, -1, 1, 3, -1, -3, //
+    2, 6, -2, -6, 4, 12, -4, -12, //
+    8, 24, -8, -24, 16, 48, -16, -48,
+];
+/// 2-bit step adjustment (added mod 256), indexed by `code + step` (0..=23).
+const ADPCM2_ADJUST: [u8; 24] = [
+    0, 4, 0, 4, //
+    252, 4, 252, 4, 252, 4, 252, 4, //
+    252, 4, 252, 4, 252, 4, 252, 4, //
+    252, 0, 252, 0,
+];
+
+/// Which Creative ADPCM packing the armed transfer uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdpcmMode {
+    /// 4-bit, two samples per byte (high nibble first).
+    Bits4,
+    /// 2.6-bit, three samples per byte (bits 7:5, 4:2, then 1:0 shifted up).
+    Bits26,
+    /// 2-bit, four samples per byte (high pair first).
+    Bits2,
+}
+
+impl AdpcmMode {
+    /// The (scale, adjust, max-index) triple for this packing.
+    fn tables(self) -> (&'static [i8], &'static [u8], i32) {
+        match self {
+            AdpcmMode::Bits4 => (&ADPCM4_SCALE, &ADPCM4_ADJUST, 63),
+            AdpcmMode::Bits26 => (&ADPCM3_SCALE, &ADPCM3_ADJUST, 39),
+            AdpcmMode::Bits2 => (&ADPCM2_SCALE, &ADPCM2_ADJUST, 23),
+        }
+    }
+}
+
+/// Running Creative ADPCM decode state for one armed transfer: the adaptive
+/// `reference` (the last decoded 8-bit sample), the `step` index bias, whether
+/// the next DMA byte is still the reference-init byte, and a small FIFO of
+/// already-decoded samples (one byte expands to up to four).
+#[derive(Debug, Clone, PartialEq)]
+struct AdpcmState {
+    mode: AdpcmMode,
+    reference: u8,
+    step: i32,
+    haveref: bool,
+    buf: VecDeque<u8>,
+}
+
+impl AdpcmState {
+    fn new(mode: AdpcmMode, haveref: bool) -> Self {
+        Self {
+            mode,
+            // Centered silence until a reference byte (if any) overwrites it.
+            reference: 0x80,
+            step: 0,
+            haveref,
+            buf: VecDeque::new(),
+        }
+    }
+
+    /// Decode one code, advancing the predictor. 1:1 with DOSBox-X's
+    /// decode_ADPCM_*_sample: `samp = code + step` clamped to the table range,
+    /// the reference moves by the scale delta (clamped 0..=255), and the step
+    /// index is bumped by the adjust value modulo 256.
+    fn decode_code(&mut self, code: u8) -> u8 {
+        let (scale_map, adjust_map, max_idx) = self.mode.tables();
+        let samp = (i32::from(code) + self.step).clamp(0, max_idx) as usize;
+        self.reference =
+            (i32::from(self.reference) + i32::from(scale_map[samp])).clamp(0, 255) as u8;
+        self.step = (self.step + i32::from(adjust_map[samp])) & 0xFF;
+        self.reference
+    }
+
+    /// Expand one encoded DMA byte into its 2/3/4 decoded samples.
+    fn decode_byte(&mut self, byte: u8) {
+        match self.mode {
+            AdpcmMode::Bits4 => {
+                let s = self.decode_code(byte >> 4);
+                self.buf.push_back(s);
+                let s = self.decode_code(byte & 0x0F);
+                self.buf.push_back(s);
+            }
+            AdpcmMode::Bits26 => {
+                let s = self.decode_code((byte >> 5) & 0x07);
+                self.buf.push_back(s);
+                let s = self.decode_code((byte >> 2) & 0x07);
+                self.buf.push_back(s);
+                let s = self.decode_code((byte & 0x03) << 1);
+                self.buf.push_back(s);
+            }
+            AdpcmMode::Bits2 => {
+                for shift in [6, 4, 2, 0] {
+                    let s = self.decode_code((byte >> shift) & 0x03);
+                    self.buf.push_back(s);
+                }
+            }
+        }
+    }
+}
 
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
@@ -47,6 +190,10 @@ pub struct SbDsp {
     // SB Pro 8-bit stereo (mixer register 0x0E bit1): interleaves two bytes per
     // output frame (left then right). Set from the mixer each producer tick.
     sbpro_stereo: bool,
+    // Creative ADPCM decode state when an ADPCM command armed the 8-bit path;
+    // None for plain PCM. Set by the 0x74/0x75/0x76/0x77/0x16/0x17/0x1F/0x7D/0x7F
+    // commands, cleared by any PCM arm or a DSP reset.
+    adpcm: Option<AdpcmState>,
     // Rendered stereo frames produced by the per-CPU-clock producer, drained by
     // the host audio path. Rate-match buffer: on push when full the oldest
     // frame drops (fidelity may glitch, block counter/IRQ timing stay
@@ -83,6 +230,7 @@ impl Default for SbDsp {
             stereo: false,
             sample_signed: false,
             sbpro_stereo: false,
+            adpcm: None,
             rendered: VecDeque::new(),
         }
     }
@@ -113,7 +261,11 @@ impl SbDsp {
             0x40 => 1,        // set time constant
             0x41 => 2,        // set sample rate
             0x14 => 2,        // 8-bit single-cycle DMA output, length low/high
-            0x48 => 2,        // set block size for auto-init/high-speed modes
+            // Single-cycle Creative ADPCM output: mode byte set by the opcode,
+            // 2-byte length inline (like 0x14). Auto-init ADPCM (0x1F/0x7D/0x7F)
+            // takes no args -- it uses the 0x48 block size.
+            0x74 | 0x75 | 0x76 | 0x77 | 0x16 | 0x17 => 2,
+            0x48 => 2, // set block size for auto-init/high-speed modes
             // The SB16 0xBx family (16-bit DMA output/input, single + auto-init)
             // takes a mode byte plus a 2-byte transfer count.
             0xB0..=0xBF => 3,
@@ -197,6 +349,29 @@ impl SbDsp {
                 self.arm_dma(false);
             }
             0x1C => self.arm_dma(true), // 8-bit auto-init output, normal speed
+            // Single-cycle Creative ADPCM: set the block size from the inline
+            // length (encoded-byte count) like 0x14, then arm the decoder. The
+            // reference variants (0x75/0x77/0x17) take the first DMA byte as the
+            // predictor seed.
+            0x74 | 0x75 | 0x76 | 0x77 | 0x16 | 0x17 => {
+                if args.len() >= 2 {
+                    self.block_size = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
+                }
+                let (mode, haveref) = match command {
+                    0x74 => (AdpcmMode::Bits4, false),
+                    0x75 => (AdpcmMode::Bits4, true),
+                    0x76 => (AdpcmMode::Bits26, false),
+                    0x77 => (AdpcmMode::Bits26, true),
+                    0x16 => (AdpcmMode::Bits2, false),
+                    _ => (AdpcmMode::Bits2, true), // 0x17
+                };
+                self.arm_adpcm(mode, haveref, false);
+            }
+            // Auto-init Creative ADPCM (always reference-seeded on the first
+            // block); the block size comes from the prior 0x48.
+            0x1F => self.arm_adpcm(AdpcmMode::Bits2, true, true),
+            0x7D => self.arm_adpcm(AdpcmMode::Bits4, true, true),
+            0x7F => self.arm_adpcm(AdpcmMode::Bits26, true, true),
             // 0x90/0x91 are the SB Pro high-speed variants of auto-init/single.
             // Limit: high-speed command-lockout (DSP ignores commands until
             // reset) not modeled; games exit via the DSP reset handled below.
@@ -218,10 +393,27 @@ impl SbDsp {
     }
 
     fn arm_dma(&mut self, auto_init: bool) {
-        // 8-bit DMA is mono unsigned PCM: clear the 16-bit/stereo/signed latches.
+        // 8-bit DMA is mono unsigned PCM: clear the 16-bit/stereo/signed latches
+        // and drop any ADPCM decode state so the raw-byte path runs.
         self.dma_16bit = false;
         self.stereo = false;
         self.sample_signed = false;
+        self.adpcm = None;
+        self.auto_init = auto_init;
+        self.playing = true;
+        self.block_remaining = self.block_size;
+        self.half_reached = false;
+    }
+
+    /// Arm the 8-bit DMA path as a Creative ADPCM transfer. Mono unsigned like
+    /// `arm_dma`, but the fetched bytes are decoded through `AdpcmState`. The
+    /// block counter still counts encoded DMA bytes (including the reference
+    /// seed byte), so the half/end IRQs land exactly as the raw 8-bit path.
+    fn arm_adpcm(&mut self, mode: AdpcmMode, haveref: bool, auto_init: bool) {
+        self.dma_16bit = false;
+        self.stereo = false;
+        self.sample_signed = false;
+        self.adpcm = Some(AdpcmState::new(mode, haveref));
         self.auto_init = auto_init;
         self.playing = true;
         self.block_remaining = self.block_size;
@@ -241,6 +433,8 @@ impl SbDsp {
         let mode = args.first().copied().unwrap_or(0);
         let stereo = mode & 0x20 != 0;
         let signed = mode & 0x10 != 0;
+        // A 16-bit PCM transfer never carries ADPCM state.
+        self.adpcm = None;
         // Count is low byte then high byte, value n means n+1 16-bit samples.
         let count_lo = u32::from(args.get(1).copied().unwrap_or(0));
         let count_hi = u32::from(args.get(2).copied().unwrap_or(0));
@@ -357,6 +551,13 @@ impl SbDsp {
         B: FnMut() -> Option<u8>,
         W: FnMut() -> Option<u16>,
     {
+        // Creative ADPCM (mono, 8-bit path) decodes one sample per frame,
+        // pulling an encoded byte only when its decoded-sample FIFO runs dry.
+        if self.adpcm.is_some() {
+            let sample = self.pop_adpcm_sample(&mut byte_fetch)?;
+            let s = sample_u8(sample);
+            return Some((s, s));
+        }
         if !self.playing {
             if self.dma_16bit {
                 return None;
@@ -389,6 +590,46 @@ impl SbDsp {
             let s = sample_u8(byte_fetch()?);
             self.advance_block(1);
             Some((s, s))
+        }
+    }
+
+    /// Pop the next decoded Creative ADPCM sample, fetching and decoding encoded
+    /// DMA bytes as needed. Each fetched byte advances the block counter by one
+    /// (bytes, not decoded samples, are what the DMA length counts) and edges the
+    /// half/end IRQ. The reference-init byte seeds the predictor and yields no
+    /// sample, so the loop fetches again. Returns None when the FIFO is empty and
+    /// the channel is stopped or the DMA source is starved; buffered samples from
+    /// the final byte still drain even after the block ends.
+    fn pop_adpcm_sample<B>(&mut self, byte_fetch: &mut B) -> Option<u8>
+    where
+        B: FnMut() -> Option<u8>,
+    {
+        loop {
+            match self.adpcm.as_mut() {
+                Some(state) => {
+                    if let Some(sample) = state.buf.pop_front() {
+                        return Some(sample);
+                    }
+                }
+                None => return None,
+            }
+            if !self.playing {
+                return None;
+            }
+            let byte = byte_fetch()?;
+            self.advance_block(1);
+            match self.adpcm.as_mut() {
+                Some(state) => {
+                    if state.haveref {
+                        state.haveref = false;
+                        state.reference = byte;
+                        state.step = 0;
+                    } else {
+                        state.decode_byte(byte);
+                    }
+                }
+                None => return None,
+            }
         }
     }
 
@@ -510,6 +751,9 @@ impl SbDsp {
                     self.dma_16bit = false;
                     self.stereo = false;
                     self.sample_signed = false;
+                    // Drop any in-flight ADPCM decode so a post-reset PCM or
+                    // direct-DAC path is not stuck decoding.
+                    self.adpcm = None;
                 }
                 true
             }
@@ -939,5 +1183,97 @@ mod tests {
         // end-of-buffer IRQ pending; 0x22F acks it.
         dsp.read_port(0x22F);
         assert!(!dsp.take_irq(), "0x22F cleared the pending IRQ");
+    }
+
+    // ---- Creative ADPCM ----------------------------------------------------
+
+    #[test]
+    fn creative_adpcm4_silence_holds_the_reference() {
+        // Reference 0x80 with all-zero 4-bit codes stays at 0x80 (centered
+        // silence): code 0 adds scaleMap[0]=0 and adjustMap[0]=0, so neither the
+        // reference nor the step index moves.
+        let mut st = AdpcmState::new(AdpcmMode::Bits4, false);
+        st.reference = 0x80;
+        for _ in 0..4 {
+            st.decode_byte(0x00);
+        }
+        assert!(
+            st.buf.iter().all(|&s| s == 0x80),
+            "0x80 + zero codes stays silent: {:?}",
+            st.buf
+        );
+    }
+
+    #[test]
+    fn creative_adpcm4_decode_matches_reference_arithmetic() {
+        // Byte 0x50 after reference 0x80 (step 0): hi nibble 5, lo nibble 0.
+        //  code 5, step 0: samp 5, scaleMap[5]=5  -> ref 0x85 (133); step += 16.
+        //  code 0, step 16: samp 16, scaleMap[16]=1 -> ref 134; adjustMap[16]=240
+        //   wraps the step index (16+240)&0xff back to 0.
+        let mut st = AdpcmState::new(AdpcmMode::Bits4, false);
+        st.reference = 0x80;
+        st.decode_byte(0x50);
+        assert_eq!(st.buf.pop_front(), Some(133));
+        assert_eq!(st.buf.pop_front(), Some(134));
+        assert_eq!(st.step, 0, "adjustMap[16]=240 wraps step 16 to 0");
+    }
+
+    #[test]
+    fn adpcm4_reference_command_seeds_predictor_and_counts_encoded_bytes() {
+        // 0x75 = 4-bit ADPCM with reference, inline length. Length 0x0002 means
+        // 3 DMA bytes: the reference seed plus two encoded bytes.
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
+        assert!(dsp.is_playing());
+        assert_eq!(dsp.block_remaining(), 3, "block counts encoded DMA bytes");
+        // Stream: reference 0x80 then two silence bytes.
+        let stream = [0x80u8, 0x00, 0x00];
+        let mut i = 0;
+        let mut fetch = || {
+            let b = stream.get(i).copied();
+            i += 1;
+            b
+        };
+        // First frame consumes the reference seed (no sample) then decodes the
+        // first encoded byte: 0x80 -> centered silence, so both channels are 0.
+        let f = dsp.render_frame(&mut fetch, || None);
+        assert_eq!(f, Some((0, 0)), "0x80 decodes to centered silence");
+        assert_eq!(
+            dsp.block_remaining(),
+            1,
+            "reference seed + one encoded byte both drained the counter"
+        );
+    }
+
+    #[test]
+    fn adpcm4_auto_init_uses_the_0x48_block_size() {
+        // 0x7D = 4-bit auto-init ADPCM: no inline length, block size from 0x48.
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x03, 0x00]); // 4 encoded bytes
+        write_cmd(&mut dsp, &[0x7D]);
+        assert!(dsp.is_playing() && dsp.is_auto_init());
+        assert_eq!(dsp.block_remaining(), 4);
+    }
+
+    #[test]
+    fn pcm_arm_clears_a_prior_adpcm_transfer() {
+        // Arming a plain PCM transfer after an ADPCM one must drop the decode
+        // state, or the raw-byte path stays stuck decoding.
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
+        assert!(dsp.adpcm.is_some(), "ADPCM armed");
+        write_cmd(&mut dsp, &[0x14, 0x01, 0x00]); // 8-bit PCM single
+        assert!(dsp.adpcm.is_none(), "PCM arm dropped ADPCM state");
+        let f = dsp.render_frame(|| Some(0x80), || None);
+        assert_eq!(f, Some((0, 0)), "raw 0x80 PCM byte -> silence");
+    }
+
+    #[test]
+    fn dsp_reset_clears_adpcm_state() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
+        assert!(dsp.adpcm.is_some());
+        dsp.write_port(0x226, 0x00); // reset settle
+        assert!(dsp.adpcm.is_none(), "reset drops ADPCM state");
     }
 }

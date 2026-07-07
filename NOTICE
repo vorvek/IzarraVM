@@ -18,6 +18,11 @@ Modified by the Toka-DOS project (2026): product-name banner rebrand.
 FreeDOS LABEL: © Joe Cosentino, Brian E. Reifsnyder, Eric Auer, GPLv2-or-later.
 FreeDOS DELTREE: © 1998-2003 Charles Dye, GPLv2-or-later.
 kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: © 1995 Pasquale J. Villani, GPLv2+.
+The SB16 DSP's Creative ADPCM decoder (4-bit, 2.6-bit, and 2-bit) ports the
+step/adjust tables and predictor arithmetic of DOSBox-X's decode_ADPCM_*
+functions (https://github.com/joncampbell123/dosbox-x, src/hardware/sblaster.cpp,
+(C) 2002-2020 The DOSBox Team and the DOSBox-X contributors, GPLv2-or-later),
+reimplemented in Rust for IzarraVM.
 Distira's SST-1 DAC-backdoor handshake and W-buffer depth encoding follow the
 behavior of 86Box's Voodoo emulation (https://86box.net, © 2008-2020 Sarah
 Walker and contributors, GPLv2-or-later), reimplemented in Rust for IzarraVM.

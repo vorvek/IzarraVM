@@ -40,14 +40,6 @@ pub enum ConfigError {
         "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. WSS IRQ7 vs SB16 IRQ5)"
     )]
     WssSbIrqCollision(u8),
-    #[error(
-        "audio.yamaha_adpcm.base {0:#06x} places the 4-port ADPCM window [{0:#06x}, {1:#06x}) over a fixed chipset/device port range; use the default base (0x240) or another free window"
-    )]
-    InvalidAdpcmBase(u16, u16),
-    #[error(
-        "audio.yamaha_adpcm.base {0:#06x} places the 4-port ADPCM window [{0:#06x}, {1:#06x}) over the audio.wss.base window [{2:#06x}, {3:#06x}); the AD1848 and the Yamaha ADPCM-B DAC must decode disjoint port ranges"
-    )]
-    AdpcmWssBaseCollision(u16, u16, u16, u16),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,29 +563,6 @@ impl AppConfig {
             }
         }
 
-        if self.audio.yamaha_adpcm.enabled {
-            self.audio.yamaha_adpcm.validate_base()?;
-
-            // The ADPCM DAC and the WSS codec each own their own port window
-            // (read_io checks wss_offset before the ADPCM offset); a config that
-            // points both at overlapping bases would let one silently shadow the
-            // other, so reject it here instead.
-            if self.audio.wss.enabled {
-                let (adpcm_lo, adpcm_hi) = self.audio.yamaha_adpcm.window();
-                let (wss_lo, wss_hi) = self.audio.wss.window();
-                if windows_overlap(
-                    u32::from(adpcm_lo),
-                    u32::from(adpcm_hi),
-                    u32::from(wss_lo),
-                    u32::from(wss_hi),
-                ) {
-                    return Err(ConfigError::AdpcmWssBaseCollision(
-                        adpcm_lo, adpcm_hi, wss_lo, wss_hi,
-                    ));
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -739,8 +708,8 @@ impl Default for WssConfig {
     }
 }
 
-/// Fixed I/O port ranges that a configurable device base (WSS, Yamaha ADPCM,
-/// ...) must not shadow. These mirror the fixed-port dispatch arms checked
+/// Fixed I/O port ranges that a configurable device base (WSS, ...) must not
+/// shadow. These mirror the fixed-port dispatch arms checked
 /// ahead of the configurable-base decoders in `MachineBus::read_io`/`write_io`
 /// (crates/izarravm-machine/src/lib.rs): the 8237 DMA controllers, PIT, PIC,
 /// 8042 keyboard controller, RTC, Lotura system controller, IDE/ATA, Sound
@@ -805,28 +774,6 @@ impl WssConfig {
     }
 }
 
-impl YamahaAdpcmConfig {
-    /// The four-port ADPCM window `[base, base + 4)`, saturating at 0xFFFF.
-    pub const fn window(&self) -> (u16, u16) {
-        (self.base, self.base.saturating_add(4))
-    }
-
-    /// Reject a `base` whose four-port window overlaps any fixed chipset/device
-    /// port range (see `RESERVED_PORT_RANGES`). The default base (0x240) passes;
-    /// a base over a fixed port range does not.
-    pub fn validate_base(&self) -> Result<(), ConfigError> {
-        let win_start = u32::from(self.base);
-        let win_end = win_start + 4; // exclusive; cannot overflow u32
-        if overlaps_reserved_range(win_start, win_end) {
-            return Err(ConfigError::InvalidAdpcmBase(
-                self.base,
-                self.base.saturating_add(4),
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
@@ -834,11 +781,11 @@ pub struct AudioConfig {
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
     pub opl3: bool,
-    /// Yamaha ADPCM-B streaming DAC (the chip ported from the `superctr/adpcm`
-    /// Yamaha ADPCM-B codec). An always-on second sound device on the ReSonique
-    /// 2, decoding 4-bit ADPCM streams concurrently with the SB16/OPL3/WSS.
-    #[serde(default)]
-    pub yamaha_adpcm: YamahaAdpcmConfig,
+    /// Retired: the standalone Yamaha ADPCM-B DAC was removed once the SB16 DSP
+    /// gained native Creative ADPCM. Accepted and ignored so conf files with an
+    /// old `[audio.yamaha_adpcm]` section still parse; never written back.
+    #[serde(default, skip_serializing)]
+    pub yamaha_adpcm: RetiredAudioSection,
     pub midi: MidiConfig,
 }
 
@@ -849,50 +796,17 @@ impl Default for AudioConfig {
             sound_blaster: SoundBlasterConfig::default(),
             wss: WssConfig::default(),
             opl3: true,
-            yamaha_adpcm: YamahaAdpcmConfig::default(),
+            yamaha_adpcm: RetiredAudioSection::default(),
             midi: MidiConfig::default(),
         }
     }
 }
 
-/// Board wiring for the Yamaha ADPCM-B streaming DAC: a fixed I/O base, IRQ
-/// line, and DMA channel the guest reads back to drive the chip like real
-/// hardware. Defaults (0x240 / IRQ10 / DMA3) avoid every other sound path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct YamahaAdpcmConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_yamaha_adpcm_base")]
-    pub base: u16,
-    #[serde(default = "default_yamaha_adpcm_irq")]
-    pub irq: u8,
-    #[serde(default = "default_yamaha_adpcm_dma")]
-    pub dma: u8,
-}
-
-impl Default for YamahaAdpcmConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            base: 0x0240,
-            irq: 10,
-            dma: 3,
-        }
-    }
-}
-
-fn default_yamaha_adpcm_base() -> u16 {
-    0x0240
-}
-
-fn default_yamaha_adpcm_irq() -> u8 {
-    10
-}
-
-fn default_yamaha_adpcm_dma() -> u8 {
-    3
-}
+/// A config section that no longer maps to any device. It deserializes any
+/// leftover keys and drops them (no `deny_unknown_fields`), so retiring a device
+/// does not break older conf files. Never serialized back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredAudioSection {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -957,7 +871,6 @@ pub struct HardwareProfile {
     pub video: VideoCard,
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
-    pub yamaha_adpcm: YamahaAdpcmConfig,
 }
 
 impl HardwareProfile {
@@ -971,7 +884,6 @@ impl HardwareProfile {
             video: config.machine.video,
             sound_blaster: config.audio.sound_blaster,
             wss: config.audio.wss,
-            yamaha_adpcm: config.audio.yamaha_adpcm,
         })
     }
 }
@@ -1343,79 +1255,6 @@ mod tests {
                 Err(ConfigError::InvalidWssBase(0x0278, _))
             ),
             "a WSS base over LPT2 must be rejected"
-        );
-    }
-
-    #[test]
-    fn rejects_adpcm_base_that_shadows_fixed_ports() {
-        // The default ADPCM base validates.
-        let config = AppConfig::default();
-        assert!(
-            config.validate().is_ok(),
-            "default ADPCM base {:#06x} must validate",
-            config.audio.yamaha_adpcm.base
-        );
-
-        // A base whose four-port window shadows the keyboard controller
-        // (0x060-0x06F) is rejected so it cannot silently steal those ports.
-        let mut config = AppConfig::default();
-        config.audio.yamaha_adpcm.base = 0x0060;
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidAdpcmBase(0x0060, 0x0064))
-        ));
-
-        // A base whose window straddles the Sound Blaster base (0x21E..0x222
-        // overlaps 0x220) is caught.
-        config.audio.yamaha_adpcm.base = 0x021E;
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidAdpcmBase(0x021E, 0x0222))
-        ));
-
-        // A disabled ADPCM device is not validated, so even a dangerous base is
-        // allowed.
-        config.audio.yamaha_adpcm.enabled = false;
-        config.audio.yamaha_adpcm.base = 0x0000;
-        assert!(
-            config.validate().is_ok(),
-            "disabled ADPCM device skips base validation"
-        );
-    }
-
-    #[test]
-    fn rejects_adpcm_base_overlapping_wss_base() {
-        // The default configuration (WSS 0x530, ADPCM 0x240) is disjoint.
-        let config = AppConfig::default();
-        assert!(config.validate().is_ok(), "disjoint defaults validate");
-
-        // Pointing the ADPCM base just below the (default) WSS base overlaps it:
-        // an ADPCM base of 0x52E has a window [0x52E, 0x532) overlapping the WSS
-        // window [0x530, 0x538).
-        let mut config = AppConfig::default();
-        config.audio.yamaha_adpcm.base = 0x052E;
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::AdpcmWssBaseCollision(
-                0x052E, 0x0532, 0x0530, 0x0538
-            ))
-        ));
-
-        // With the WSS codec disabled there is no contention, so an otherwise
-        // "colliding" ADPCM base validates (as long as it clears the fixed map).
-        config.audio.wss.enabled = false;
-        assert!(
-            config.validate().is_ok(),
-            "disabled WSS skips the ADPCM/WSS overlap check"
-        );
-
-        // With the ADPCM device disabled there is likewise no contention.
-        let mut config = AppConfig::default();
-        config.audio.yamaha_adpcm.base = 0x052E;
-        config.audio.yamaha_adpcm.enabled = false;
-        assert!(
-            config.validate().is_ok(),
-            "disabled ADPCM device skips the ADPCM/WSS overlap check"
         );
     }
 

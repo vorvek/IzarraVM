@@ -3,16 +3,13 @@ pub use fat32::{
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
 };
 pub use fat32_volume::{Fat32Volume, build_fat32};
-use izarravm_audio::{
-    Ad1848, Ad1848Config, AdpcmConfig, OplChip, Resampler, SbDsp, SbMixer, YamahaAdpcmChip,
-};
+use izarravm_audio::{Ad1848, Ad1848Config, OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{
     BusAccessKind, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead, DirectMemoryWrite,
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
     GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard, WssConfig,
-    YamahaAdpcmConfig,
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{
@@ -345,10 +342,6 @@ pub struct MachineProfile {
     /// The codec decodes its own resources concurrently with the SB16; disabling
     /// it leaves the SB16/OPL paths untouched.
     pub wss: WssConfig,
-    /// Yamaha ADPCM-B streaming DAC base/IRQ/DMA + enable flag. A second sound
-    /// device on the ReSonique 2 that decodes 4-bit Yamaha ADPCM streams,
-    /// concurrent with the SB16/OPL3/WSS on its own IRQ/DMA.
-    pub yamaha_adpcm: YamahaAdpcmConfig,
     pub wait_states: WaitStateProfile,
     pub address_pipelining: bool,
     pub cache_enabled: bool,
@@ -363,7 +356,6 @@ impl MachineProfile {
             video,
             sound_blaster: SoundBlasterConfig::default(),
             wss: WssConfig::default(),
-            yamaha_adpcm: YamahaAdpcmConfig::default(),
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -378,7 +370,6 @@ impl MachineProfile {
             video: profile.video,
             sound_blaster: profile.sound_blaster,
             wss: profile.wss,
-            yamaha_adpcm: profile.yamaha_adpcm,
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -1408,19 +1399,8 @@ pub struct Machine {
     wss_irq: u8,      // PIC line the codec's terminal-count interrupt forwards to
     wss_dma: usize,   // byte-wide DMA channel the codec pulls playback bytes from
     wss_enabled: bool, // false drops all WSS work (port decode, tick, IRQ, render)
-    /// Yamaha ADPCM-B streaming DAC. A second sound device on the ReSonique 2
-    /// that decodes 4-bit Yamaha ADPCM streams over its own DMA channel, fed to
-    /// the mixer independently of the SB16/OPL3/WSS paths.
-    yamaha_adpcm: YamahaAdpcmChip,
-    /// ADPCM PCM resampler (output_frame_rate -> 44100), rebuilt when the chip's
-    /// programmed rate changes. Summed with the OPL/DSP/WSS streams in
-    /// render_audio.
-    adpcm_resampler: Resampler,
-    adpcm_rate_hz: u32,
-    adpcm_sample_phase: f64,
-    adpcm_enabled: bool,
-    margo_ns: f64, // fractional nanoseconds owed to the Margo busy countdown
-    vga_dots: f64, // fractional VGA dot clocks owed to the beam advance
+    margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
+    vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
     // Of elapsed_clocks, the clocks consumed by device I/O stalls (floppy seek/
@@ -1636,16 +1616,6 @@ impl Machine {
             irq: wss_irq,
             dma: wss_dma as u8,
         });
-        // Build the Yamaha ADPCM-B DAC from its board config. It runs on its own
-        // base/IRQ/DMA, independent of the SB16 and WSS, so all three sound
-        // paths coexist without line contention.
-        let adpcm_enabled = profile.yamaha_adpcm.enabled;
-        let yamaha_adpcm = YamahaAdpcmChip::new(AdpcmConfig {
-            enabled: true,
-            base: profile.yamaha_adpcm.base,
-            irq: profile.yamaha_adpcm.irq,
-            dma: profile.yamaha_adpcm.dma,
-        });
         let active_mode = profile.cpu;
         let distira = Distira::new();
         let pci = PciConfig::new(profile.video == VideoCard::Distira);
@@ -1728,11 +1698,6 @@ impl Machine {
             wss_irq,
             wss_dma,
             wss_enabled,
-            yamaha_adpcm,
-            adpcm_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            adpcm_rate_hz: 0,
-            adpcm_sample_phase: 0.0,
-            adpcm_enabled,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: {
@@ -2475,8 +2440,6 @@ impl Machine {
             wss: &mut self.wss,
             wss_base: self.wss_base,
             wss_enabled: self.wss_enabled,
-            yamaha_adpcm: &mut self.yamaha_adpcm,
-            adpcm_enabled: self.adpcm_enabled,
             ide: &mut self.ide,
             ata: &mut self.ata,
             trace: &mut self.trace,
@@ -8103,35 +8066,6 @@ impl Machine {
             }
         }
 
-        // Yamaha ADPCM-B DAC playback, clock-driven exactly like the WSS codec
-        // above but on the chip's own base/IRQ/DMA. The chip pulls one ADPCM
-        // byte per two decoded samples per channel; the terminal-count IRQ
-        // forwards to the configured PIC line. Gated entirely on adpcm_enabled.
-        if self.adpcm_enabled {
-            let adpcm_rate = self.yamaha_adpcm.output_frame_rate();
-            if adpcm_rate > 0 && self.yamaha_adpcm.is_playing() {
-                self.adpcm_sample_phase +=
-                    clocks as f64 * adpcm_rate as f64 * self.timing.inv_clock;
-                let adpcm_dma = self.yamaha_adpcm.config().dma as usize;
-                let adpcm_irq = self.yamaha_adpcm.config().irq;
-                while self.adpcm_sample_phase >= 1.0 {
-                    self.adpcm_sample_phase -= 1.0;
-                    let Machine {
-                        yamaha_adpcm,
-                        dma,
-                        memory,
-                        ..
-                    } = self;
-                    yamaha_adpcm.tick_sample(|| dma.read_byte(adpcm_dma, memory));
-                    // Forward the half/end block edge at the frame that produced
-                    // it (see the DSP loop's multi-edge contract above).
-                    if self.yamaha_adpcm.take_irq() {
-                        self.pic.request(adpcm_irq);
-                    }
-                }
-            }
-        }
-
         let ch2_before = self.pit.channel_out(2);
         let pit_fraction_before = self.pit_clocks;
         // The one shared fractional-advance formula (`advance_fractional`): the
@@ -8376,32 +8310,6 @@ impl Machine {
         out
     }
 
-    /// Render `native_samples` of Yamaha ADPCM-B DAC output as stereo frames by
-    /// draining the chip's rendered-frame ring (filled by the clock-driven
-    /// producer in advance_devices). The chip applies its own per-channel volume
-    /// scalar inside the frames, so this needs no mixer scaling. An idle chip
-    /// drains nothing, contributing silence.
-    pub fn render_adpcm_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let mut out = Vec::with_capacity(native_samples);
-        for _ in 0..native_samples {
-            match self.yamaha_adpcm.drain_frame() {
-                Some(frame) => out.push(frame),
-                None => break,
-            }
-        }
-        out
-    }
-
-    /// Rebuild the ADPCM resampler when the chip's programmed rate changes, so
-    /// it always runs output_frame_rate -> 44100. Mirrors sync_wss_resampler.
-    fn sync_adpcm_resampler(&mut self) {
-        let rate = self.yamaha_adpcm.output_frame_rate().max(1);
-        if rate != self.adpcm_rate_hz {
-            self.adpcm_resampler = Resampler::new(rate, DAC_HZ);
-            self.adpcm_rate_hz = rate;
-        }
-    }
-
     /// Drive the internal per-clock device advance (PIT, OPL, DSP reset-settle,
     /// and the clock-driven DMA playback producer). Exposed so a host test or a
     /// frontend can flush device time without running the CPU, and so the DMA
@@ -8541,39 +8449,15 @@ impl Machine {
             Vec::new()
         };
 
-        // Yamaha ADPCM-B DAC: the same wall-clock window's worth of decoded
-        // frames, resampled to the DAC rate. The chip applies its own per-channel
-        // volume scalar inside the frames, so it is summed directly like the WSS
-        // stream (independent of the CT1745 mixer).
-        let adpcm_out = if self.adpcm_enabled {
-            self.sync_adpcm_resampler();
-            let n = (native_samples as f64 * self.yamaha_adpcm.output_frame_rate() as f64
-                / OPL_NATIVE_HZ as f64)
-                .round() as usize;
-            let stereo: Vec<(i32, i32)> = self
-                .render_adpcm_audio(n)
-                .iter()
-                .map(|&(l, r)| (i32::from(l), i32::from(r)))
-                .collect();
-            self.adpcm_resampler.process(&stereo)
-        } else {
-            Vec::new()
-        };
-
         // Apply master + output gain (0x30/0x31, 0x41/0x42) once to the summed
         // pair. The DSP frames already carry the voice gain from render_dsp_audio,
         // so this single scaling pass gives DSP·voice·master·outgain and
         // OPL·master·outgain. A silent (idle) DSP yields no frames, so the OPL
         // passes through (attenuated only by master/outgain) when no DMA is armed.
-        // The WSS and ADPCM streams are summed in raw afterward (independent of
-        // the mixer).
+        // The WSS stream is summed in raw afterward (independent of the mixer).
         let (master_l, master_r) = self.mixer.master_gain();
         let (outgain_l, outgain_r) = self.mixer.outgain_gain();
-        let len = opl_out
-            .len()
-            .max(dsp_out.len())
-            .max(wss_out.len())
-            .max(adpcm_out.len());
+        let len = opl_out.len().max(dsp_out.len()).max(wss_out.len());
         let spk = self.speaker.drain(len);
         // CD-Audio: pull the matching count of Red Book samples (44.1 kHz, the
         // DAC rate, so no resample) and attenuate by the CT1745 CD volume. A drive
@@ -8586,17 +8470,15 @@ impl Machine {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let (wl, wr) = wss_out.get(i).copied().unwrap_or((0, 0));
-                let (al, ar) = adpcm_out.get(i).copied().unwrap_or((0, 0));
                 let s = i32::from(spk[i]);
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let cl = (cl as f32 * cd_l_gain) as i32;
                 let cr = (cr as f32 * cd_r_gain) as i32;
-                // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec and
-                // the Yamaha ADPCM DAC are summed in raw (their own attenuation
-                // already applied), like the speaker and CD streams that bypass
-                // the SB16 mixer.
-                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + al + s + cl;
-                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + ar + s + cr;
+                // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec is
+                // summed in raw (its own attenuation already applied), like the
+                // speaker and CD streams that bypass the SB16 mixer.
+                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + s + cl;
+                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + s + cr;
                 (clamp_i16(l), clamp_i16(r))
             })
             .collect()
@@ -8736,22 +8618,8 @@ impl Machine {
         } else {
             None
         };
-        // The Yamaha ADPCM-B block edge, on its own (config) IRQ line. Like the
-        // WSS, its counter drains one per output frame.
-        let adpcm_wake =
-            if self.adpcm_enabled && self.pic.deliverable(self.yamaha_adpcm.config().irq) {
-                self.yamaha_adpcm.clocks_until_next_irq(
-                    self.yamaha_adpcm.output_frame_rate(),
-                    self.active_mode.clock_hz(),
-                )
-            } else {
-                None
-            };
         // The sooner of whichever wakes apply; None only when none can fire.
-        let wake = [pit_wake, dsp_wake, wss_wake, adpcm_wake]
-            .into_iter()
-            .flatten()
-            .min()?;
+        let wake = [pit_wake, dsp_wake, wss_wake].into_iter().flatten().min()?;
         Some(wake.max(1).min(remaining))
     }
 
@@ -8804,20 +8672,12 @@ impl Machine {
         }
         // Next audio block-IRQ edge. The DSP/WSS/ADPCM rates mirror the wake
         // estimators in next_timer_wake (the DSP block counter drains at the
-        // raw byte/word rate, rate_hz; the WSS and ADPCM counters at their
-        // frame rates).
+        // raw byte/word rate, rate_hz; the WSS counter at its frame rate).
         if let Some(clocks) = self.dsp.clocks_until_next_irq(self.dsp.rate_hz(), clock_hz) {
             cap = cap.min(clocks);
         }
         if self.wss_enabled
             && let Some(clocks) = self.wss.clocks_until_next_irq(self.wss.rate_hz(), clock_hz)
-        {
-            cap = cap.min(clocks);
-        }
-        if self.adpcm_enabled
-            && let Some(clocks) = self
-                .yamaha_adpcm
-                .clocks_until_next_irq(self.yamaha_adpcm.output_frame_rate(), clock_hz)
         {
             cap = cap.min(clocks);
         }
@@ -8948,8 +8808,6 @@ impl Machine {
                     wss,
                     wss_base,
                     wss_enabled,
-                    yamaha_adpcm,
-                    adpcm_enabled,
                     ide,
                     ata,
                     trace,
@@ -8996,8 +8854,6 @@ impl Machine {
                     wss,
                     wss_base: *wss_base,
                     wss_enabled: *wss_enabled,
-                    yamaha_adpcm,
-                    adpcm_enabled: *adpcm_enabled,
                     ide,
                     ata,
                     trace,
@@ -9359,11 +9215,6 @@ struct MachineBus<'a> {
     wss: &'a mut Ad1848,
     wss_base: u16,
     wss_enabled: bool,
-    // The Yamaha ADPCM-B DAC, on its own base/IRQ/DMA. The port decode routes the
-    // 4 ports in [base, base+4) to read_port/write_port when enabled; the DMA/IRQ
-    // feed lives on the owning Machine in advance_devices, like the WSS codec.
-    yamaha_adpcm: &'a mut YamahaAdpcmChip,
-    adpcm_enabled: bool,
     ide: &'a mut ide::IdeChannel,
     ata: &'a mut Option<ata::AtaDisk>,
     trace: &'a mut BusTrace,
@@ -10210,13 +10061,6 @@ impl CpuBus for MachineBus<'_> {
         if let Some(offset) = self.wss_offset(port) {
             return Ok(u32::from(self.wss.read_port(offset)));
         }
-        // Yamaha ADPCM-B DAC: 4 ports at its base (default 0x240). The chip
-        // owns its own window, disjoint from the SB16 (0x220) and WSS (0x530).
-        if self.adpcm_enabled {
-            if let Some(offset) = self.yamaha_adpcm.offset(port) {
-                return Ok(u32::from(self.yamaha_adpcm.read_port(offset)));
-            }
-        }
         if ide::IdeChannel::owns_port(port) {
             return Ok(u32::from(self.ide.read_port(port).unwrap_or(0xff)));
         }
@@ -10374,13 +10218,6 @@ impl CpuBus for MachineBus<'_> {
         if let Some(offset) = self.wss_offset(port) {
             self.wss.write_port(offset, value as u8);
             return Ok(());
-        }
-        // Yamaha ADPCM-B DAC write path (mirrors the WSS range check above).
-        if self.adpcm_enabled {
-            if let Some(offset) = self.yamaha_adpcm.offset(port) {
-                self.yamaha_adpcm.write_port(offset, value as u8);
-                return Ok(());
-            }
         }
         if ide::IdeChannel::owns_port(port) {
             self.ide.write_port(port, value as u8);
@@ -15719,7 +15556,6 @@ mod tests {
         assert!(serial.contains("PASS video.cga_graphics"));
         assert!(serial.contains("PASS video.ega_planar"));
         assert!(serial.contains("PASS video.vga_mode13h"));
-        assert!(serial.contains("PASS sound.sb_adpcm"));
         assert_eq!(
             usize::from(results.declared_record_count),
             results.records.len()
@@ -15747,10 +15583,6 @@ mod tests {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "sound.sb_16bit_dma"
         }));
-        assert!(results.records.iter().any(|record| {
-            record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                && record.name == "sound.sb_adpcm"
-        }));
     }
 
     #[test]
@@ -15766,7 +15598,6 @@ mod tests {
             video: VideoCard::Et4000Ax,
             sound_blaster: SoundBlasterConfig::default(),
             wss: WssConfig::default(),
-            yamaha_adpcm: YamahaAdpcmConfig::default(),
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -19052,109 +18883,6 @@ mod tests {
     }
 
     #[test]
-    fn yamaha_adpcm_chip_is_driven_like_real_hardware_via_dma_and_irq() {
-        // The Yamaha ADPCM-B DAC is a fourth sound device the VM exposes at its
-        // own I/O window (0x240), IRQ (10), and DMA channel (3). A guest driver
-        // programs it exactly like real Yamaha hardware: set the sample rate and
-        // block length through the address/data latch, stream ADPCM bytes over a
-        // host DMA channel, and service the terminal-count interrupt. This proves
-        // the chip is reachable through guest-visible ports and behaves like the
-        // real thing end to end.
-        let mut machine = test_machine();
-
-        // Encode a slow sine into 4-bit Yamaha ADPCM-B and place it in memory at
-        // 0x03_0000, where DMA channel 3 (the chip's default) will pull it.
-        let input: Vec<i16> = (0..128)
-            .map(|i| (2000.0 * (2.0 * std::f64::consts::PI * i as f64 / 64.0).sin()) as i16)
-            .collect();
-        let mut adpcm = vec![0u8; input.len() / 2];
-        izarravm_audio::encode_adpcm_b(&input, &mut adpcm);
-        for (i, &b) in adpcm.iter().enumerate() {
-            machine.write_physical_u8(0x3_0000 + i as u32, b);
-        }
-
-        with_bus(&mut machine, |bus| {
-            // 8237 DMA channel 3: single-cycle read of the whole buffer.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap(); // ch3 single read
-            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap(); // address low
-            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap(); // address high
-            bus.write_io(
-                0x07,
-                BusWidth::Byte,
-                u32::from((adpcm.len() - 1) as u8),
-                false,
-            )
-            .unwrap(); // count low
-            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap(); // count high
-            bus.write_io(0x82, BusWidth::Byte, 0x03, false).unwrap(); // ch3 page -> 0x03_0000
-            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap(); // unmask ch3
-
-            // Program the chip through its address/data latch at base 0x240:
-            // rate 11025 Hz (0x2B11), block = input.len() nibbles, ADPCM-B mono,
-            // then START. One byte of ADPCM yields two mono samples, so the block
-            // length is the sample count.
-            let block = input.len() as u16;
-            for &(port, value) in &[
-                (0x240u16, 1u8),                   // address: RATE_LOW
-                (0x241, 0x11),                     // RATE_LOW = 0x11
-                (0x240, 2),                        // address: RATE_HIGH
-                (0x241, 0x2B),                     // RATE_HIGH = 0x2B
-                (0x240, 4),                        // address: COUNT_LOW
-                (0x241, (block - 1) as u8),        // COUNT_LOW
-                (0x240, 5),                        // address: COUNT_HIGH
-                (0x241, ((block - 1) >> 8) as u8), // COUNT_HIGH
-                (0x240, 3),                        // address: FORMAT
-                (0x241, 0x00),                     // ADPCM-B mono
-                (0x240, 0),                        // address: CONTROL
-                (0x241, 0x01),                     // START
-            ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value), false)
-                    .unwrap();
-            }
-
-            // Status bit0 (playing) reads back through the guest-visible port.
-            let status = bus.read_io(0x240, BusWidth::Byte, 0, false).unwrap() as u8;
-            assert!(status & 0x01 != 0, "chip reports playing through its port");
-
-            // Resource readback: high nibble IRQ (10), low nibble DMA (3).
-            let resources = bus.read_io(0x242, BusWidth::Byte, 0, false).unwrap() as u8;
-            assert_eq!(resources >> 4, 10, "IRQ readback");
-            assert_eq!(resources & 0x0F, 3, "DMA readback");
-        });
-
-        // Advance enough device clocks to drain the whole block at 11025 Hz.
-        machine.advance_devices_clocks(400_000);
-
-        // The chip produced audible decoded output (drained from its ring).
-        let mut frames = Vec::new();
-        while let Some(f) = machine.yamaha_adpcm.drain_frame() {
-            frames.push(f);
-        }
-        assert!(!frames.is_empty(), "ADPCM chip rendered decoded frames");
-        assert!(
-            frames.iter().any(|&(l, _)| l != 0),
-            "decoded output is audible, not flat silence"
-        );
-
-        // The terminal-count interrupt forwarded to the PIC on the chip's own
-        // line (IRQ10), independent of the SB16 (IRQ5) and WSS (IRQ7) lines.
-        assert!(
-            machine.pic.irr_bit(10),
-            "ADPCM chip raised its own IRQ10 at terminal count"
-        );
-
-        // The chip reached terminal count and halted (single-cycle mode).
-        assert!(
-            !machine.yamaha_adpcm.is_playing(),
-            "single-cycle block reached terminal count"
-        );
-
-        // It mixes into the combined audio render path as another sound source.
-        let mixed = machine.render_audio(64);
-        assert!(!mixed.is_empty(), "chip feeds the mixer");
-    }
-
-    #[test]
     fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
         // Multi-edge contract (see advance_devices): every block edge reaches
         // the PIC inside the advance whose sample tick produced it, and edges
@@ -19244,63 +18972,6 @@ mod tests {
         assert!(
             !machine.wss.take_irq(),
             "no edge stays parked in the codec latch after the step"
-        );
-    }
-
-    #[test]
-    fn adpcm_half_and_end_edges_forward_within_one_advance() {
-        // The ADPCM-B producer drains take_irq per frame (the DSP multi-edge
-        // contract): a single advance spanning a block's half edge AND end edge
-        // must leave the request latched in IRR10 and nothing parked in the
-        // chip's latch, with single-cycle playback halted at terminal count.
-        let mut machine = test_machine();
-        // 64 arbitrary ADPCM bytes at 0x03_0000 for DMA channel 3.
-        for i in 0..64u32 {
-            machine.write_physical_u8(0x3_0000 + i, (i as u8).wrapping_mul(37) | 1);
-        }
-        with_bus(&mut machine, |bus| {
-            // 8237 ch3: single-cycle read of the 64-byte buffer.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 63, false).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0x82, BusWidth::Byte, 0x03, false).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap();
-            // Chip: rate 11025 Hz, block 128 nibbles (one byte = two mono
-            // samples), ADPCM-B mono, START.
-            for &(port, value) in &[
-                (0x240u16, 1u8), // address: RATE_LOW
-                (0x241, 0x11),
-                (0x240, 2), // address: RATE_HIGH
-                (0x241, 0x2B),
-                (0x240, 4), // address: COUNT_LOW
-                (0x241, 127),
-                (0x240, 5), // address: COUNT_HIGH
-                (0x241, 0),
-                (0x240, 3), // address: FORMAT (ADPCM-B mono)
-                (0x241, 0x00),
-                (0x240, 0),    // address: CONTROL
-                (0x241, 0x01), // START
-            ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value), false)
-                    .unwrap();
-            }
-        });
-        // 400k clocks at 22 MHz (~18 ms) spans the whole 128-frame block at
-        // 11025 Hz (~11.6 ms): the half edge and the end edge land in ONE step.
-        machine.advance_devices_clocks(400_000);
-        assert!(
-            !machine.yamaha_adpcm.is_playing(),
-            "single-cycle block reached terminal count inside the step"
-        );
-        assert!(
-            machine.pic.irr_bit(10),
-            "the block edges latched IRR10 within the step"
-        );
-        assert!(
-            !machine.yamaha_adpcm.take_irq(),
-            "no edge stays parked in the chip latch after the step"
         );
     }
 
@@ -19608,88 +19279,6 @@ mod tests {
         assert!(
             machine.elapsed_clocks() < 5_000,
             "a genuine halt does not fast-forward across the masked codec window"
-        );
-    }
-
-    #[test]
-    fn adpcm_block_edge_wakes_a_halted_cpu() {
-        // A halted CPU with ONLY the Yamaha ADPCM-B block IRQ armed (PIT
-        // unprogrammed, DSP/WSS idle) must fast-forward to the terminal-count
-        // edge and run the IRQ10 handler, same as the DSP/WSS wake sources.
-        let mut machine = Machine::new(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-            // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
-            rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
-        )
-        .unwrap();
-        // 64 bytes of ADPCM data at 0x03_0000 for DMA channel 3.
-        for i in 0..64u32 {
-            machine.write_physical_u8(0x3_0000 + i, 0x11);
-        }
-        // IRQ10 handler at 0x0700: inc word [0x0610]; EOI slave; EOI master; iret.
-        let handler: [u8; 11] = [
-            0xff, 0x06, 0x10, 0x06, 0xb0, 0x20, 0xe6, 0xa0, 0xe6, 0x20, 0xcf,
-        ];
-        for (i, &b) in handler.iter().enumerate() {
-            machine.write_physical_u8(0x0700 + i as u32, b);
-        }
-        // IVT[0x72] (slave base 0x70, line 2 = IRQ10) -> 0000:0700; clear counter.
-        machine.write_physical_u8(0x72 * 4, 0x00);
-        machine.write_physical_u8(0x72 * 4 + 1, 0x07);
-        machine.write_physical_u8(0x72 * 4 + 2, 0x00);
-        machine.write_physical_u8(0x72 * 4 + 3, 0x00);
-        machine.write_physical_u8(0x0610, 0x00);
-        machine.write_physical_u8(0x0611, 0x00);
-        with_bus(&mut machine, |bus| {
-            // Master PIC base 0x08, slave at IR2 base 0x70, everything unmasked.
-            bus.write_io(0x20, BusWidth::Byte, 0x11, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x08, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x04, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x01, false).unwrap();
-            bus.write_io(0x21, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0xA0, BusWidth::Byte, 0x11, false).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x70, false).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x02, false).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x01, false).unwrap();
-            bus.write_io(0xA1, BusWidth::Byte, 0x00, false).unwrap();
-            // 8237 DMA channel 3: single-cycle read of the 64-byte buffer.
-            bus.write_io(0x0B, BusWidth::Byte, 0x4B, false).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0x06, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 63, false).unwrap();
-            bus.write_io(0x07, BusWidth::Byte, 0x00, false).unwrap();
-            bus.write_io(0x82, BusWidth::Byte, 0x03, false).unwrap();
-            bus.write_io(0x0A, BusWidth::Byte, 0x03, false).unwrap();
-            // Program the chip: 11025 Hz, 128-sample block, ADPCM-B mono, START.
-            let block = 128u16;
-            for &(port, value) in &[
-                (0x240u16, 1u8),
-                (0x241, 0x11),
-                (0x240, 2),
-                (0x241, 0x2B),
-                (0x240, 4),
-                (0x241, (block - 1) as u8),
-                (0x240, 5),
-                (0x241, ((block - 1) >> 8) as u8),
-                (0x240, 3),
-                (0x241, 0x00),
-                (0x240, 0),
-                (0x241, 0x01),
-            ] {
-                bus.write_io(port, BusWidth::Byte, u32::from(value), false)
-                    .unwrap();
-            }
-        });
-        let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let ticks = u16::from(machine.read_physical_u8(0x0610))
-            | (u16::from(machine.read_physical_u8(0x0611)) << 8);
-        assert!(ticks >= 1, "the ADPCM IRQ10 handler should have run");
-        // 128 frames at 11025 Hz is ~11.6 ms -- the fast-forward crossed a real
-        // block window, not a no-op halt.
-        assert!(
-            machine.elapsed_clocks() > 10_000,
-            "the fast-forward should advance emulated time across the ADPCM block"
         );
     }
 
@@ -21271,8 +20860,6 @@ mod tests {
             wss: &mut machine.wss,
             wss_base: machine.wss_base,
             wss_enabled: machine.wss_enabled,
-            yamaha_adpcm: &mut machine.yamaha_adpcm,
-            adpcm_enabled: machine.adpcm_enabled,
             ide: &mut machine.ide,
             ata: &mut machine.ata,
             trace: &mut machine.trace,
@@ -21970,25 +21557,6 @@ mod tests {
     }
 
     #[test]
-    fn boot_suite_reports_adpcm_pass() {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-            izarravm_firmware::X86_BOOT_TEST_IMAGE,
-        )
-        .unwrap();
-        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-        assert!(
-            results.records.iter().any(|record| {
-                record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                    && record.name == "sound.sb_adpcm"
-            }),
-            "boot suite should report PASS sound.sb_adpcm (guest-visible Yamaha ADPCM-B DAC)"
-        );
-    }
-
-    #[test]
     fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
         // A guest arms 8-bit single-cycle DMA + IRQ5, then `sti;hlt`. The run loop
         // must fast-forward across the DSP sample window (the new IRQ5 wake) and
@@ -22048,6 +21616,56 @@ mod tests {
             machine.elapsed_clocks() > 15_000,
             "the fast-forward should advance emulated time across the DSP sample window"
         );
+    }
+
+    #[test]
+    fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
+        // End-to-end SB16 Creative ADPCM: a guest arms 4-bit ADPCM-with-reference
+        // (DSP command 0x75) over 8-bit DMA channel 1, the clock-driven producer
+        // pulls the encoded bytes, decodes them through the DSP, and raises the
+        // 8-bit IRQ (IRQ5, the mixer default) at terminal count. Exercises the
+        // real DMA -> DSP decode -> PIC path, not just the codec in isolation.
+        let mut machine = test_machine();
+        // 16 encoded DMA bytes at 0x01_0000 (page 0x01): a reference seed (0x80)
+        // followed by 15 non-zero code bytes so the decoded output is audible.
+        machine.write_physical_u8(0x1_0000, 0x80);
+        for i in 1..16u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x50);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: page 0x01, byte addr 0, count 15 (16 bytes), single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+            // DSP: 11025 Hz, then 0x75 (4-bit ADPCM + reference), length 0x000F ->
+            // 16 encoded bytes (the block counts DMA bytes, reference included).
+            for &b in &[0x41u8, 0x2B, 0x11, 0x75, 0x0F, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
+            }
+        });
+        // Drain the whole 16-byte block at 11025 Hz (~2.9 ms); 400k clocks spans it.
+        machine.advance_devices_clocks(400_000);
+        // The terminal-count IRQ latched on the SB16's default line (IRQ5).
+        assert!(
+            machine.pic.irr_bit(5),
+            "Creative ADPCM block raised the 8-bit IRQ5 at terminal count"
+        );
+        // Single-cycle playback stopped at the end of the block.
+        assert!(!machine.dsp.is_playing(), "single-cycle ADPCM halted at TC");
+        // The decoder produced audible (non-silent) frames on the DSP ring: the
+        // reference byte seeded 0x80 and the 0x50 code bytes moved it off center.
+        let mut audible = false;
+        while let Some((l, _)) = machine.dsp.drain_frame() {
+            if l != 0 {
+                audible = true;
+            }
+        }
+        assert!(audible, "decoded ADPCM is audible, not flat silence");
     }
 
     #[test]

@@ -9,7 +9,6 @@ mod output;
 mod pcm;
 mod resample;
 mod wss;
-mod yamaha_adpcm;
 
 pub use dsp::SbDsp;
 pub use mixer::SbMixer;
@@ -17,10 +16,6 @@ pub use opl::OplChip;
 pub use output::{AudioPlayer, AudioSink};
 pub use resample::Resampler;
 pub use wss::{Ad1848, Ad1848Config};
-pub use yamaha_adpcm::{
-    AdpcmConfig, AdpcmFormat, YamahaAdpcmChip, decode_adpcm_a, decode_adpcm_b, decode_aica,
-    decode_ymz280b, encode_adpcm_b,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDeviceKind {
@@ -28,7 +23,6 @@ pub enum AudioDeviceKind {
     SoundBlaster,
     Wss,
     Opl3,
-    YamahaAdpcm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

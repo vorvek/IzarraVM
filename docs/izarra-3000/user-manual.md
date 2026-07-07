@@ -13,7 +13,7 @@ machine, and this manual reproduces its manual.
 | CPU | GSW-586, a Pentium MMX-class part at 200 MHz on a 66 MHz bus. Toka-DOS can throttle it to 486DX2 66 MHz, 386DX 25 MHz, or a slower 286-class mode, without rebooting. |
 | Memory | 24 MB SDRAM, with Toka-DOS mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
-| Sound | ReSonique 2: Sound Blaster 16 compatible digital audio, OPL3 FM, and a Yamaha ADPCM-B DAC. |
+| Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), and OPL3 FM. |
 | Storage | IDE hard disk, ATAPI CD-ROM with CD audio, and a 1.44 MB floppy drive. |
 | Display | 15-inch CRT, up to 1024x768@75Hz. |
 | Firmware | 2 MB ROM with the Izarra BIOS, Toka-DOS (FreeDOS-based), and bundled tools. |
