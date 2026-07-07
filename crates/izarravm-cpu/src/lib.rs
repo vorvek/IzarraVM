@@ -34241,5 +34241,221 @@ mod tests {
             );
             assert!(jit_cpu.perf_counters().jit_region_entries > 0);
         }
+
+        // ---- S2.1: the per-op differential gate (template_diff) ----
+        //
+        // For each templated op, admit it as a single INTERIOR inline slot and run the region vs
+        // the interpreter across flag-corner operands, asserting byte-identical guest state,
+        // materialized eflags, all four accumulators, and guest memory. This is the gate every
+        // native template must pass (a divergence in a width/wrap/undefined-flag corner fails
+        // here); S2.3's templates each add a row. The op's flags must survive to the comparison,
+        // so the loop back-edge is LOOP (0xE2), which decrements ECX and branches WITHOUT touching
+        // the flags a `dec`/`jnz` counter would clobber.
+
+        /// nop starter at 0x100, then `<op>` (the interior slot under test) at 0x101, then
+        /// `loop 0x101` (the terminal back-edge, flag-neutral), then hlt at the fall-through.
+        fn template_diff_program(op: &[u8]) -> Vec<u8> {
+            let mut m = vec![0u8; 0x1000];
+            m[0x100] = 0x90; // nop starter -> 0x101 is reached as a continuation
+            let entry = 0x101usize;
+            let mut p = entry;
+            m[p..p + op.len()].copy_from_slice(op);
+            p += op.len();
+            let loop_at = p; // loop 0x101 (E2 rel8): ECX -= 1, branch if ECX != 0, sets NO flags
+            m[p] = 0xe2;
+            m[p + 1] = ((entry as i32) - (loop_at as i32 + 2)) as i8 as u8;
+            p += 2;
+            m[p] = 0xf4; // hlt
+            m
+        }
+
+        /// Drive to the loop fall-through (ECX == 0), i.e. BEFORE the trailing HLT is executed as a
+        /// fresh run's first instruction (which would reset core_clocks_so_far).
+        fn drive_until_ecx_zero(cpu: &mut Cpu386, bus: &mut TestBus) {
+            for _ in 0..10_000 {
+                let out = cpu.run_straight_line(bus, u64::MAX).unwrap();
+                if cpu.read_gpr32(1) == 0 || out.halted {
+                    return;
+                }
+            }
+            panic!("ECX never reached zero");
+        }
+
+        /// Run one templated op through the region and the interpreter under `arm` (which sets the
+        /// op's input registers, not ECX), and assert full identity. `expect_kind` pins that the
+        /// op was actually inlined as the intended template (not a Memory fallback).
+        fn assert_template_identity(
+            op: &[u8],
+            expect_kind: jit::step::SlotKind,
+            arm: &dyn Fn(&mut Cpu386),
+        ) {
+            let entry = 0x101u32;
+            let mut interp = fresh();
+            let mut jit_cpu = fresh();
+            let mut bus_i = TestBus::with_memory(template_diff_program(op));
+            let mut bus_j = TestBus::with_memory(template_diff_program(op));
+
+            let prep = |cpu: &mut Cpu386, ecx: u32| {
+                cpu.registers.eip = 0x100;
+                cpu.registers.set_esp(0x0700);
+                cpu.registers.set_ecx(ecx); // LOOP counter (address-size 32 -> ECX)
+                arm(cpu);
+                // Seed a non-trivial incoming arithmetic-flag pattern so the PRESERVING templates
+                // are tested against non-zero flags, not the default 0: a MOV that wrongly touched
+                // any flag, or a SHR that clobbered its preserved AF or forced OF on a multi-bit
+                // shift (both architecturally preserved / undefined), would otherwise be masked by
+                // an all-zero incoming state. ZF is left clear so ZF-preservation is also observable.
+                cpu.materialize_flags();
+                const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+                let seed = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_SF | FLAG_OF;
+                cpu.registers.eflags = (cpu.registers.eflags & !ARITH) | seed;
+            };
+            // Warm both (two iterations fill the decode cache), then admit on the jit CPU.
+            prep(&mut interp, 2);
+            prep(&mut jit_cpu, 2);
+            drive_until_ecx_zero(&mut interp, &mut bus_i);
+            drive_until_ecx_zero(&mut jit_cpu, &mut bus_j);
+            let idx = jit::block::try_admit(&mut jit_cpu, entry, true)
+                .unwrap_or_else(|| panic!("op {op:02x?} must build a self-loop"));
+            assert_eq!(
+                jit_cpu.jit_regions.get_mut(idx).unwrap().ctx.slots[0].kind,
+                expect_kind,
+                "op {op:02x?}: slot 0 must be the intended inline template"
+            );
+            jit_cpu.decode_cache.stamp_region(entry, true, idx);
+
+            // Measured: one iteration under the swept operand.
+            prep(&mut interp, 1);
+            prep(&mut jit_cpu, 1);
+            drive_until_ecx_zero(&mut interp, &mut bus_i);
+            drive_until_ecx_zero(&mut jit_cpu, &mut bus_j);
+
+            assert_eq!(interp, jit_cpu, "op {op:02x?}: guest state diverged");
+            assert_eq!(
+                interp.eflags(),
+                jit_cpu.eflags(),
+                "op {op:02x?}: materialized eflags diverged"
+            );
+            assert_eq!(
+                interp.elapsed_clocks, jit_cpu.elapsed_clocks,
+                "op {op:02x?}: elapsed_clocks diverged"
+            );
+            assert_eq!(
+                interp.timing_rem, jit_cpu.timing_rem,
+                "op {op:02x?}: timing_rem diverged"
+            );
+            assert_eq!(
+                interp.fp_rem, jit_cpu.fp_rem,
+                "op {op:02x?}: fp_rem diverged"
+            );
+            assert_eq!(
+                interp.core_clocks_so_far, jit_cpu.core_clocks_so_far,
+                "op {op:02x?}: core_clocks_so_far diverged"
+            );
+            assert_eq!(
+                bus_i.memory, bus_j.memory,
+                "op {op:02x?}: guest memory diverged"
+            );
+            assert!(
+                jit_cpu.perf_counters().jit_region_entries > 0,
+                "op {op:02x?}: region did not run"
+            );
+        }
+
+        #[test]
+        fn template_diff_add_r32_imm_across_flag_corners() {
+            // add eax, imm32 (81 /0, the RegAddImm template). Sweep eax and imm across the carry
+            // (0xffffffff+1), overflow (0x7fffffff+1, 0x80000000+0x80000000), sign, zero, and
+            // parity corners; region and interpreter must agree on state, eflags, and all four
+            // accumulators for every corner.
+            let corners: [u32; 5] = [0, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+            for &eax in &corners {
+                for &imm in &corners {
+                    let mut op = vec![0x81u8, 0xc0]; // add eax, imm32
+                    op.extend_from_slice(&imm.to_le_bytes());
+                    assert_template_identity(
+                        &op,
+                        jit::step::SlotKind::RegAddImm { dst: 0, imm },
+                        &|cpu: &mut Cpu386| cpu.registers.set_eax(eax),
+                    );
+                }
+            }
+            // Register-addressing coverage: the emit addresses gpr[i] as [R14 + 4*i], so every
+            // inline-eligible destination index must be exercised (skip ECX=1, the LOOP counter,
+            // and ESP=4, the stack). A wrong displacement for a high index would pass an EAX-only
+            // sweep.
+            for &dst in &[0u8, 2, 3, 5, 6, 7] {
+                let imm = 0x8000_0001u32; // carry + overflow + sign in one operand
+                let mut op = vec![0x81u8, 0xc0 + dst]; // add <dst>, imm32
+                op.extend_from_slice(&imm.to_le_bytes());
+                assert_template_identity(
+                    &op,
+                    jit::step::SlotKind::RegAddImm { dst, imm },
+                    &|cpu: &mut Cpu386| cpu.write_gpr32(dst, 0x8000_0001),
+                );
+            }
+        }
+
+        #[test]
+        fn template_diff_shr_r32_imm_across_shift_corners() {
+            // shr eax, imm8 (C1 /5, the RegShrImm template). Sweep the value and the count across
+            // the CF-from-last-bit-out, OF (count 1), sign, zero, and parity corners.
+            let vals: [u32; 6] = [0, 1, 0x8000_0001, 0xffff_ffff, 0x7fff_fffe, 0x0000_00ff];
+            let counts: [u8; 5] = [1, 2, 7, 25, 31];
+            for &eax in &vals {
+                for &count in &counts {
+                    let op = vec![0xc1u8, 0xe8, count]; // shr eax, count
+                    assert_template_identity(
+                        &op,
+                        jit::step::SlotKind::RegShrImm { dst: 0, count },
+                        &|cpu: &mut Cpu386| cpu.registers.set_eax(eax),
+                    );
+                }
+            }
+            // Register-addressing coverage across all inline-eligible destinations (with the
+            // incoming AF/OF seeded by `prep`, this also pins the preserved-flag path per index).
+            for &dst in &[0u8, 2, 3, 5, 6, 7] {
+                let count = 7u8; // multi-bit shift: OF falls back to live, AF is preserved
+                let op = vec![0xc1u8, 0xe8 + dst, count]; // shr <dst>, count
+                assert_template_identity(
+                    &op,
+                    jit::step::SlotKind::RegShrImm { dst, count },
+                    &|cpu: &mut Cpu386| cpu.write_gpr32(dst, 0x8000_0001),
+                );
+            }
+        }
+
+        #[test]
+        fn template_diff_mov_r32_r32_preserves_state() {
+            // mov eax, ebx (8B /r, the RegMov template). No flags; sweep the source value and
+            // confirm the destination is a faithful full-32-bit copy with flags untouched.
+            let vals: [u32; 5] = [0, 0xdead_beef, 0xffff_ffff, 0x8000_0000, 0x1234_5678];
+            for &ebx in &vals {
+                let op = vec![0x8bu8, 0xc3]; // mov eax, ebx
+                assert_template_identity(
+                    &op,
+                    jit::step::SlotKind::RegMov { dst: 0, src: 3 },
+                    &|cpu: &mut Cpu386| {
+                        cpu.registers.set_eax(0xaaaa_5555);
+                        cpu.registers.set_ebx(ebx);
+                    },
+                );
+            }
+            // Register-addressing coverage: distinct dst/src index pairs (never ECX=1), each dst !=
+            // src so the copy is observable, catching a wrong displacement or a dst/src swap that
+            // happens to work for the EAX<-EBX case. With `prep`'s seeded flags, this also confirms
+            // MOV touches no flag for every index.
+            for &(dst, src) in &[(0u8, 7u8), (2, 5), (3, 6), (5, 3), (6, 2), (7, 0)] {
+                let op = vec![0x8bu8, 0xc0 | (dst << 3) | src]; // mov <dst>, <src>
+                assert_template_identity(
+                    &op,
+                    jit::step::SlotKind::RegMov { dst, src },
+                    &|cpu: &mut Cpu386| {
+                        cpu.write_gpr32(dst, 0xaaaa_5555);
+                        cpu.write_gpr32(src, 0x1234_5678);
+                    },
+                );
+            }
+        }
     }
 }
