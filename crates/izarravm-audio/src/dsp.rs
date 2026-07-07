@@ -697,6 +697,15 @@ impl SbDsp {
         self.direct_dac_byte
     }
 
+    /// Whether the read-data port (0x22A) has a byte queued (the bit 0x80 a guest
+    /// polls on 0x22E). During DMA playback this is always false: the DMA path
+    /// never queues read-data bytes (only reset/version/copyright responses do).
+    /// The lazy 0x22E read uses this to answer the poll without setting
+    /// io_touched (see the machine's read_io lazy arm).
+    pub fn data_available(&self) -> bool {
+        self.data_available
+    }
+
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x22A => {
