@@ -868,6 +868,12 @@ impl std::fmt::Debug for PrefetchWindow {
     }
 }
 
+/// Number of entries in the instruction-fetch page cache (direct-mapped by linear page).
+/// A single entry thrashed at every EIP page-boundary crossing (60M misses on Doom demo3);
+/// 4 entries cover a function that spans up to 3 page boundaries (common at >4 KiB or when
+/// code sits near a page edge) without eviction. Power of two for the slot mask.
+const FETCH_PAGE_CACHE_ENTRIES: usize = 4;
+
 #[derive(Clone, Copy)]
 struct FetchPageCacheEntry {
     valid: bool,
@@ -893,14 +899,18 @@ impl Default for FetchPageCacheEntry {
 
 #[derive(Default)]
 struct FetchPageCache {
-    entry: FetchPageCacheEntry,
+    entries: [FetchPageCacheEntry; FETCH_PAGE_CACHE_ENTRIES],
 }
 
 impl FetchPageCache {
+    fn slot(linear: u32) -> usize {
+        ((linear >> 12) as usize) & (FETCH_PAGE_CACHE_ENTRIES - 1)
+    }
+
     #[inline]
     fn get(&self, cs: SegmentRegister, linear: u32) -> Option<(u8, u32)> {
         let offset = (linear & 0x0fff) as usize;
-        let entry = self.entry;
+        let entry = &self.entries[Self::slot(linear)];
         if entry.valid
             && entry.cs == cs
             && entry.linear_page == (linear & !0x0fff)
@@ -915,7 +925,7 @@ impl FetchPageCache {
 
     #[inline]
     fn put(&mut self, cs: SegmentRegister, linear: u32, page: DirectPage) {
-        self.entry = FetchPageCacheEntry {
+        self.entries[Self::slot(linear)] = FetchPageCacheEntry {
             valid: true,
             cs,
             linear_page: linear & !0x0fff,
@@ -926,7 +936,9 @@ impl FetchPageCache {
     }
 
     fn invalidate(&mut self) {
-        self.entry.valid = false;
+        for e in &mut self.entries {
+            e.valid = false;
+        }
     }
 }
 
