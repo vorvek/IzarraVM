@@ -10041,6 +10041,34 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
         }
+        // SB16 DSP status port (0x22E/0x22F) lazy read (Approximate class only, i.e.
+        // 486/586). The bit a guest polls -- 0x80 = read-data-port-has-a-byte -- is
+        // ALWAYS false during DMA playback (PCM, 16-bit, or Creative ADPCM): the DMA
+        // producer never queues read-data bytes; only reset/version/copyright command
+        // responses do, and those are batch-ending writes (0x226/0x22C set io_touched).
+        // So the status byte is batch-stable, and the read can return it without
+        // ending the run, exactly like the OPL status arm above.
+        //
+        // The ack side effects a real 0x22E read performs are deferred, not dropped,
+        // and that is safe:
+        //  (1) dsp.irq_pending = false: already a no-op at read time. advance_devices
+        //      drains it via take_irq() (a test-and-clear latch) at every batch
+        //      boundary when the DMA block edge fires, so irq_pending is always false
+        //      by the time the guest ISR reads 0x22E.
+        //  (2) mixer.clear_irq_status(): only zeroes the read-only 0x82 shadow. PIC
+        //      re-assertion flows through take_irq() -> pic.request(), fully
+        //      independent of irq_status. The only consequence of the deferral is a
+        //      stale 0x82 bit until the next advance_devices, which the next edge
+        //      overwrites -- a diagnostic register nothing consults for delivery.
+        // approx_batch_cap already bounds the batch to the next DMA block edge, so
+        // interrupt latency stays within the P4c contract.
+        if matches!(port, 0x22E | 0x22F) && self.lazy_port_reads {
+            return Ok(u32::from(if self.dsp.data_available() {
+                0x80u8
+            } else {
+                0x00u8
+            }));
+        }
         // Every arm from here down is unchanged from before Task 1.3: a single
         // unconditional set covers all of them, exactly like the old top-of-function
         // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61, OPL status)
