@@ -714,6 +714,95 @@ impl std::fmt::Debug for Tlb {
     }
 }
 
+/// A tiny cache of page-directory entries (PDEs), keyed by (CR3 frame, directory index).
+/// On a TLB miss the page walk reads a PDE then a PTE; a flat-model DPMI app (CWSDPMI,
+/// DOS4GW) reuses the same one or two PDEs for its entire 4-MiB-region working set, so
+/// caching them eliminates half the bus reads on most misses. Flushed alongside the TLB
+/// (CR3/task-switch); the accessed-bit writeback is skipped on a cached hit exactly as a
+/// TLB hit skips it (the PDE's A bit was set on the first walk that filled the cache).
+/// 4 entries cover 16 MiB of directory-index space with no collision for a typical guest.
+const PDE_CACHE_ENTRIES: usize = 4;
+
+#[derive(Clone, Copy)]
+struct PdeCacheEntry {
+    /// (CR3 frame) | (directory index) -- the full lookup key. Live only while `generation`
+    /// matches the owning cache's.
+    key: u32,
+    pde: u32,
+    generation: u32,
+}
+
+impl PdeCacheEntry {
+    const EMPTY: Self = Self {
+        key: 0,
+        pde: 0,
+        generation: 0,
+    };
+}
+
+/// Direct-mapped PDE cache. Transparent to Cpu386 equality (microarchitectural), flushed
+/// in lockstep with the TLB. See `PdeCacheEntry` for the rationale.
+#[derive(Clone)]
+struct PdeCache {
+    entries: [PdeCacheEntry; PDE_CACHE_ENTRIES],
+    generation: u32,
+}
+
+impl Default for PdeCache {
+    fn default() -> Self {
+        Self {
+            entries: [PdeCacheEntry::EMPTY; PDE_CACHE_ENTRIES],
+            generation: 1,
+        }
+    }
+}
+
+impl PdeCache {
+    fn key(cr3_frame: u32, linear: u32) -> u32 {
+        cr3_frame | ((linear >> 22) & 0x03ff)
+    }
+
+    fn slot(key: u32) -> usize {
+        (key as usize) & (PDE_CACHE_ENTRIES - 1)
+    }
+
+    fn lookup(&self, cr3_frame: u32, linear: u32) -> Option<u32> {
+        let key = Self::key(cr3_frame, linear);
+        let e = self.entries[Self::slot(key)];
+        (e.generation == self.generation && e.key == key).then_some(e.pde)
+    }
+
+    fn insert(&mut self, cr3_frame: u32, linear: u32, pde: u32) {
+        let key = Self::key(cr3_frame, linear);
+        self.entries[Self::slot(key)] = PdeCacheEntry {
+            key,
+            pde,
+            generation: self.generation,
+        };
+    }
+
+    fn flush(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.entries = [PdeCacheEntry::EMPTY; PDE_CACHE_ENTRIES];
+            self.generation = 1;
+        }
+    }
+}
+
+impl PartialEq for PdeCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PdeCache {}
+
+impl std::fmt::Debug for PdeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PdeCache {{ {PDE_CACHE_ENTRIES} entries }}")
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DirectPageCacheEntry {
     physical_page: u32,
@@ -1218,6 +1307,7 @@ pub struct Cpu386 {
     // extenders, Win9x) does not re-walk the two-level page table on every access.
     // Flushed on CR0/CR3 writes, task switch, and INVLPG.
     tlb: Tlb,
+    pde_cache: PdeCache,
     code_page: CodePageCache,
     prefetch: PrefetchWindow,
     data_read_pages: DirectPageCache,
@@ -2553,6 +2643,7 @@ impl Cpu386 {
 
     fn flush_tlb_and_code_caches(&mut self) {
         self.tlb.flush();
+        self.pde_cache.flush();
         self.invalidate_code_caches();
     }
 
@@ -8796,28 +8887,39 @@ impl Cpu386 {
         }
 
         let directory = self.control.cr3 & 0xffff_f000;
-        let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
-        let mut pde = bus.read_memory(
-            directory_address,
-            BusWidth::Dword,
-            BusAccessKind::PageWalkRead,
-        )?;
-        if pde & 1 == 0 {
-            self.control.cr2 = linear;
-            return Err(InternalFault::Exception {
-                vector: 14,
-                error_code: Some(page_fault_code(false, write, user)),
-            });
-        }
-        if pde & 0x20 == 0 {
-            pde |= 0x20;
-            bus.write_memory(
+        // PDE cache fast path: a flat-model DPMI app reuses the same one or two PDEs
+        // (each covers 4 MiB) for its whole working set. A cached PDE was already
+        // present-checked and accessed-bit-set on the walk that filled the cache, so a
+        // hit skips both the bus read and the writeback. Falls through to the full walk
+        // on a miss (which reads, validates, sets A, and inserts).
+        let pde = if let Some(cached) = self.pde_cache.lookup(directory, linear) {
+            cached
+        } else {
+            let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
+            let mut pde = bus.read_memory(
                 directory_address,
                 BusWidth::Dword,
-                pde,
-                BusAccessKind::PageWalkWrite,
+                BusAccessKind::PageWalkRead,
             )?;
-        }
+            if pde & 1 == 0 {
+                self.control.cr2 = linear;
+                return Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(page_fault_code(false, write, user)),
+                });
+            }
+            if pde & 0x20 == 0 {
+                pde |= 0x20;
+                bus.write_memory(
+                    directory_address,
+                    BusWidth::Dword,
+                    pde,
+                    BusAccessKind::PageWalkWrite,
+                )?;
+            }
+            self.pde_cache.insert(directory, linear, pde);
+            pde
+        };
 
         let table_address = (pde & 0xffff_f000) + (((linear >> 12) & 0x03ff) * 4);
         let mut pte =
