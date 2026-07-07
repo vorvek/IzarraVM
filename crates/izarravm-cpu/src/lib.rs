@@ -613,13 +613,23 @@ impl CpuLevel {
     }
 }
 
-/// Direct-mapped TLB size (entries). Covers TLB_ENTRIES * 4 KiB before two pages
-/// collide on a slot; a 386/486 had 32, this keeps a few more so a fetch/execute
-/// loop's interleaved code and data pages do not evict each other every step.
-const TLB_ENTRIES: usize = 64;
+/// TLB size (entries, power of two for the direct-mapped slot mask). 256 entries cover
+/// 1 MiB of linear space before two pages collide on a slot. A real 486 had 32 entries
+/// (fully associative); a Pentium had 64 (8-way for code, 8-way for data, but IzarraVM
+/// uses a unified TLB). The old 64-entry direct-mapped cache thrashed under CWSDPMI's
+/// wide working set (code, data, stack, and page-table pages colliding modulo 64); 256
+/// cuts the collision rate dramatically for the same O(1) lookup cost. Purely
+/// microarchitectural: the TLB is transparent to Cpu386 equality, so this change needs
+/// no conformance or regolden work.
+const TLB_ENTRIES: usize = 256;
 const PREFETCH_WINDOW_BYTES: usize = 32;
 const TRACKED_WRITE_PAGES: usize = 8;
-const DIRECT_PAGE_CACHE_LINES: usize = 64;
+/// Physical->host-pointer direct-map cache (avoids a bus callback per RAM access).
+/// 256 entries match the TLB size: a TLB hit resolves the physical page, then this cache
+/// resolves the host pointer. CWSDPMI's page-table pages and data pages alias under the
+/// old 64-entry direct-mapped cache (visible as high direct_page miss counts); 256 cuts
+/// the aliasing. Transparent to equality (microarchitectural).
+const DIRECT_PAGE_CACHE_LINES: usize = 256;
 const CPU_PROFILE_GROUPS: usize = 16;
 
 #[derive(Clone, Copy)]
