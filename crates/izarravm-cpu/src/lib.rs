@@ -14458,6 +14458,193 @@ mod tests {
         eprintln!("=== end G0' (dispatch-only) ===\n");
     }
 
+    /// S2.2 spike (owner chose "spike first"): the reg-cache alone is not the lever; the per-slot
+    /// fetch/cap CALLs back into Rust are the floor (the region is wall-neutral with the interpreter
+    /// precisely because native emitted code cannot inline the bus/cpu work the Rust trampoline
+    /// inlines). This measures the per-slot BOOKKEEPING cost (fetch charge + clock accumulate +
+    /// cross-multiplied cap check) under the three candidate models, the variable that decides the
+    /// S2 build. Combined with the G0' compute (~0.38 ns/insn dirty native) and interpreter
+    /// (~96 ns/insn) numbers, it gives the drawcolumn per-insn estimate for each model. Throwaway.
+    ///   cargo test -j8 -p izarravm-cpu --release --features jit s2_bookkeeping -- --ignored --nocapture
+    #[cfg(feature = "jit")]
+    #[test]
+    #[ignore]
+    fn s2_bookkeeping_model_spike() {
+        use crate::jit::encoder::{Encoder, Reg};
+        use crate::jit::exec_mem::ExecutableBuffer;
+        use std::time::Instant;
+
+        #[repr(C)]
+        struct SpikeState {
+            raw_clocks: u64, // off 0
+            bus_accum: u64,  // off 8
+            cap: u64,        // off 16
+            num: u64,        // off 24
+        }
+        const FETCH: u32 = 2; // representative RAM I-cache fetch wait-state (machine/lib.rs:9799)
+        const NUM: u32 = 1; // 586 timing numerator
+
+        // One slot's realistic bookkeeping: fetch charge + clock accumulate + cross-mult cap check.
+        unsafe extern "C" fn book_one(s: *mut SpikeState) -> u8 {
+            let s = unsafe { &mut *s };
+            s.bus_accum += FETCH as u64;
+            s.raw_clocks += 2;
+            u8::from(s.raw_clocks.wrapping_mul(s.num).wrapping_add(s.bus_accum) >= s.cap)
+        }
+        // The same, batched: n slots in one call (amortizes the CALL over the block iteration).
+        unsafe extern "C" fn book_batch(s: *mut SpikeState, n: u32) -> u8 {
+            let s = unsafe { &mut *s };
+            for _ in 0..n {
+                s.bus_accum += FETCH as u64;
+                s.raw_clocks += 2;
+                if s.raw_clocks.wrapping_mul(s.num).wrapping_add(s.bus_accum) >= s.cap {
+                    return 1;
+                }
+            }
+            0
+        }
+        let one_addr = (book_one as unsafe extern "C" fn(*mut SpikeState) -> u8) as usize as u64;
+        let batch_addr =
+            (book_batch as unsafe extern "C" fn(*mut SpikeState, u32) -> u8) as usize as u64;
+
+        // Model 1 (today's region): one Rust bookkeeping CALL per slot. win64 arg0=RCX(state).
+        let call_per_slot = {
+            let mut e = Encoder::new();
+            e.push(Reg::RBX);
+            e.push(Reg::R14);
+            e.push(Reg::R15);
+            e.sub_r64_imm32(Reg::RSP, 32); // shadow space; RSP 16-aligned before the CALL
+            e.mov_r64_r64(Reg::R15, Reg::RCX); // state
+            e.mov_r64_r64(Reg::R14, Reg::RDX); // iters
+            e.mov_r64_imm64(Reg::RBX, one_addr);
+            let top = e.label();
+            e.place(top);
+            e.mov_r64_r64(Reg::RCX, Reg::R15);
+            e.call_r64(Reg::RBX);
+            e.add_r64_imm32(Reg::R14, 0xFFFF_FFFF); // dec (sets ZF)
+            e.jnz(top);
+            e.add_r64_imm32(Reg::RSP, 32);
+            e.pop(Reg::R15);
+            e.pop(Reg::R14);
+            e.pop(Reg::RBX);
+            e.ret();
+            ExecutableBuffer::new(&e.finish()).expect("W^X on a supported host")
+        };
+
+        // Model 2 (Option A): bookkeeping inline, accumulators cached in host registers (no CALL).
+        let native_per_slot = {
+            let mut e = Encoder::new();
+            e.push(Reg::RSI);
+            e.push(Reg::R12);
+            e.push(Reg::R13);
+            e.push(Reg::R14);
+            e.push(Reg::R15);
+            e.mov_r64_r64(Reg::R15, Reg::RCX); // state
+            e.mov_r64_r64(Reg::R14, Reg::RDX); // iters
+            e.load_r64_disp8(Reg::R12, Reg::R15, 0); // raw_clocks
+            e.load_r64_disp8(Reg::R13, Reg::R15, 8); // bus_accum
+            e.load_r64_disp8(Reg::RSI, Reg::R15, 16); // cap
+            let top = e.label();
+            let exit = e.label();
+            e.place(top);
+            e.add_r64_imm32(Reg::R12, 2); // raw += 2
+            e.add_r64_imm32(Reg::R13, FETCH); // bus += fetch cost
+            e.mov_r64_r64(Reg::RAX, Reg::R12);
+            e.imul_r64_imm32(Reg::RAX, NUM); // raw * num
+            e.add_r64_r64(Reg::RAX, Reg::R13); // + bus term
+            e.cmp_r64_r64(Reg::RAX, Reg::RSI); // vs cap
+            e.jae(exit);
+            e.add_r64_imm32(Reg::R14, 0xFFFF_FFFF);
+            e.jnz(top);
+            e.place(exit);
+            e.store_r64_disp8(Reg::R15, 0, Reg::R12);
+            e.store_r64_disp8(Reg::R15, 8, Reg::R13);
+            e.pop(Reg::R15);
+            e.pop(Reg::R14);
+            e.pop(Reg::R13);
+            e.pop(Reg::R12);
+            e.pop(Reg::RSI);
+            e.ret();
+            ExecutableBuffer::new(&e.finish()).expect("W^X on a supported host")
+        };
+
+        // Model 3 (Option B): one Rust CALL per block-iteration doing n slots' bookkeeping.
+        let batched = {
+            let mut e = Encoder::new();
+            e.push(Reg::RBX);
+            e.push(Reg::R14);
+            e.push(Reg::R15);
+            e.sub_r64_imm32(Reg::RSP, 32);
+            e.mov_r64_r64(Reg::R15, Reg::RCX); // state
+            e.mov_r64_r64(Reg::R14, Reg::RDX); // iters (= SLOTS / 15)
+            e.mov_r64_imm64(Reg::RBX, batch_addr);
+            let top = e.label();
+            e.place(top);
+            e.mov_r64_r64(Reg::RCX, Reg::R15);
+            e.mov_r32_imm32(Reg::RDX, 15); // n slots / iteration
+            e.call_r64(Reg::RBX);
+            e.add_r64_imm32(Reg::R14, 0xFFFF_FFFF);
+            e.jnz(top);
+            e.add_r64_imm32(Reg::RSP, 32);
+            e.pop(Reg::R15);
+            e.pop(Reg::R14);
+            e.pop(Reg::RBX);
+            e.ret();
+            ExecutableBuffer::new(&e.finish()).expect("W^X on a supported host")
+        };
+
+        type Fn2 = unsafe extern "C" fn(*mut SpikeState, u64);
+        const SLOTS: u64 = 15_000_000;
+        const TRIALS: usize = 7;
+        let run = |buf: &ExecutableBuffer, iters: u64| -> f64 {
+            let f: Fn2 = unsafe { std::mem::transmute(buf.entry_ptr()) };
+            let mut st = SpikeState {
+                raw_clocks: 0,
+                bus_accum: 0,
+                cap: u64::MAX, // never fires: every model processes all SLOTS
+                num: NUM as u64,
+            };
+            let t = Instant::now();
+            unsafe { f(&mut st, iters) };
+            t.elapsed().as_secs_f64() / SLOTS as f64 * 1e9 // ns per slot
+        };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (mut c, mut n, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        for trial in 0..=TRIALS {
+            let tc = run(&call_per_slot, SLOTS);
+            let tn = run(&native_per_slot, SLOTS);
+            let tb = run(&batched, SLOTS / 15);
+            if trial > 0 {
+                c.push(tc);
+                n.push(tn);
+                b.push(tb);
+            }
+        }
+        let (mc, mn, mb) = (median(c), median(n), median(b));
+        eprintln!("\n=== S2.2 bookkeeping-model spike (ns per slot, median of {TRIALS}) ===");
+        eprintln!("1. call-per-slot  (today's region model)     : {mc:.3} ns/slot");
+        eprintln!("2. native-per-slot (Option A, cached accum)  : {mn:.3} ns/slot");
+        eprintln!("3. batched CALL/iter (Option B, 15 slots)    : {mb:.3} ns/slot");
+        eprintln!(
+            "--- drawcolumn per-insn estimate = ~0.38 ns native compute + bookkeeping/slot ---"
+        );
+        eprintln!("current region (wall-neutral w/ interp)      : ~96 ns/insn (G0')");
+        eprintln!(
+            "Option A (native per-slot)  : {:.2} ns/insn  => {:.0}x over current",
+            0.38 + mn,
+            96.0 / (0.38 + mn)
+        );
+        eprintln!(
+            "Option B (batched)          : {:.2} ns/insn  => {:.0}x over current  (+ omitted spill/reload)",
+            0.38 + mb,
+            96.0 / (0.38 + mb)
+        );
+        eprintln!("=== end S2.2 spike ===\n");
+    }
+
     #[test]
     fn scale_clocks_batches_exactly() {
         // The JIT accumulates raw core_clocks across a straight-line block and scales ONCE at
