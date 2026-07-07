@@ -2743,10 +2743,33 @@ impl Cpu386 {
     /// remainder carry guarantees a clock tick within a few instructions and the
     /// machine's batch loop advances on instruction progress, not on clocks alone.
     fn scale_clocks(&mut self, clocks: u32) -> u64 {
+        // Specialized per-level so the compiler sees the denominator as a compile-time
+        // constant and strength-reduces the divide to a magic-multiplier multiply-shift
+        // (~4 cycles of imul) instead of a hardware div (~20-40 cycles). The generic form
+        // `scaled / u64::from(den)` with a runtime `den` from the level_timing match
+        // emitted a real div instruction on every call; this specialization avoids it.
+        // The remainder carry (`timing_rem`) is shared across all levels (reset on level
+        // change), so switching levels mid-run is safe (the carry is < the old den and
+        // the new den is always >= 5, so the first scaled result is exact).
         let (num, den) = level_timing(self.level);
         let scaled = u64::from(clocks) * u64::from(num) + self.timing_rem;
-        self.timing_rem = scaled % u64::from(den);
-        scaled / u64::from(den)
+        // The `match` on `self.level` gives the compiler a compile-time constant for `den`
+        // in each arm, enabling magic-multiplier strength reduction. The generic
+        // `scaled % den` + `scaled / den` would be two divs; computing the quotient first
+        // then the remainder as `scaled - quot * den` is one div + one mul + one sub.
+        let (quot, rem) = match self.level {
+            CpuLevel::I286 | CpuLevel::I386 => {
+                let q = scaled / 5u64;
+                (q, scaled - q * 5)
+            }
+            CpuLevel::I486 | CpuLevel::I586 => {
+                let q = scaled / 12u64;
+                (q, scaled - q * 12)
+            }
+        };
+        let _ = den; // den is unused; the match arms carry the constant directly
+        self.timing_rem = rem;
+        quot
     }
 
     /// `scale_clocks` for a whole compiled-region run in one call: same exact long division,
