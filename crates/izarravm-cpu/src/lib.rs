@@ -1005,6 +1005,10 @@ pub struct PerfCounters {
     /// batch length. They sum to `straight_line_runs` except for the rare run that ends in
     /// a propagated hard `CpuError` (a fatal error records no break reason).
     pub brk_decode_or_branch: u64, // next insn not cached / not straight-line / page cross
+    /// TEMPORARY instrumentation: split brk_decode_or_branch into its three causes.
+    pub brk_cont_decode_miss: u64, // continuation: next insn not in the decode cache
+    pub brk_cont_not_continuable: u64, // continuation: next insn is not continuable (OUT/far/INT/HLT)
+    pub brk_cont_page_cross: u64, // continuation: next insn crosses a 4KB page boundary
     pub brk_step: u64, // port I/O or a pending HLE soft-int (requires_step_break)
     pub brk_interrupt: u64, // an instruction made a maskable interrupt serviceable
     pub brk_cap: u64,  // the run reached the scaled-clock cap
@@ -1236,6 +1240,11 @@ pub struct Cpu386 {
     data_write_pages: DirectPageCache,
     fetch_page: FetchPageCache,
     written_pages: [Option<u32>; TRACKED_WRITE_PAGES],
+    /// How many leading slots of `written_pages` are occupied (0 when no memory writes
+    /// happened this instruction, the common case for register-only ops). Lets
+    /// `begin_instruction` clear only the used slots instead of an unconditional 64-byte
+    /// memset every instruction.
+    written_count: u8,
     written_pages_overflow: bool,
     // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
@@ -1945,15 +1954,17 @@ struct DecodedInsn {
     no_cache: bool,
 }
 
-/// Number of direct-mapped lines in the decode cache. Power of two so the index is a mask. 4096 is
-/// the Stage B starting size (B7 tunes it); the footprint is the knob that matters on a normal
-/// (8-32 MB L3) machine, so it is kept small and dense.
-/// Direct-mapped decode-cache lines (power of two). A release best-of-6 sweep on dhrystone/sieve
-/// 586 found the knee at 2048: 1024 left ~2% on the table, while 4096 and 8192 were within
-/// measurement noise of 2048. At ~48 bytes per line (DecodeLine = tag + generation + DecodedInsn)
-/// that is ~96 KB, comfortably inside L2 on a normal (8-32 MB L3) machine, so the per-line size is
-/// not the footprint limiter here and the line value is left dense rather than squeezed to 32 bytes.
-const DECODE_CACHE_LINES: usize = 2048;
+/// Direct-mapped decode-cache lines (power of two so the index is a mask). A break-attribution
+/// measurement on Doom demo3 8G/586 (the real pmode target, not the tiny real-mode benches the
+/// earlier 2048 knee was derived from) showed 78% of run breaks were decode-cache misses on
+/// continuations at 2048 lines: the pmode code footprint thrashes a 2048-entry direct-mapped
+/// cache. Doubling to 4096 cut those misses by 53% (227M -> 106M breaks), boosted insns/run from
+/// 14.5 to 23.2 (+60%), and lifted decode_hit from 94.85% to 97.66%. 8192 gave diminishing
+/// returns (24.9 insns/run, +7% over 4096). At ~48 bytes per line (DecodeLine = tag + generation +
+/// DecodedInsn) 4096 lines is ~192 KB, still inside L2 on a normal (8-32 MB L3) machine.
+/// Purely microarchitectural: the decode cache is transparent to Cpu386 equality, so this needs
+/// no conformance/regolden work.
+const DECODE_CACHE_LINES: usize = 4096;
 
 /// Sweep knob: `IZARRAVM_DECODE_CACHE_LINES=<power of two>` overrides the decode-cache size at
 /// construction. Host-side only (a bigger cache changes wall time, never guest state - hit or
@@ -2580,6 +2591,7 @@ impl Cpu386 {
         }
         if let Some(slot) = self.written_pages.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(page);
+            self.written_count += 1;
         } else {
             self.written_pages_overflow = true;
         }
@@ -2672,12 +2684,20 @@ impl Cpu386 {
         // not observed until control flow or the next refill invalidates the queue.
         if self.written_pages_overflow {
             self.prefetch.invalidate();
-        } else if let Some(code_page) = self.prefetch.physical_page() {
-            if self.written_pages.contains(&Some(code_page)) {
-                self.prefetch.invalidate();
+        } else if self.written_count > 0 {
+            if let Some(code_page) = self.prefetch.physical_page() {
+                if self.written_pages.contains(&Some(code_page)) {
+                    self.prefetch.invalidate();
+                }
             }
         }
-        self.written_pages = [None; TRACKED_WRITE_PAGES];
+        // Clear only the slots that were actually written this instruction (most
+        // instructions are register-only and written_count is 0, so this is a no-op
+        // instead of an unconditional 64-byte memset).
+        for i in 0..self.written_count as usize {
+            self.written_pages[i] = None;
+        }
+        self.written_count = 0;
         self.written_pages_overflow = false;
     }
 
@@ -3407,15 +3427,27 @@ impl Cpu386 {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
                 let insn = match self.decode_cache.get(lin, cs.default_size_32) {
-                    Some(i)
-                        if i.continuable
-                            && (lin & 0xfff) + u32::from(i.len) <= 0x1000
-                            && Self::fetch_within_limit(self.registers.eip, i.len, cs.limit) =>
-                    {
+                    Some(i) => {
+                        if !i.continuable {
+                            self.perf.brk_decode_or_branch += 1;
+                            self.perf.brk_cont_not_continuable += 1;
+                            break;
+                        }
+                        if (lin & 0xfff) + u32::from(i.len) > 0x1000 {
+                            self.perf.brk_decode_or_branch += 1;
+                            self.perf.brk_cont_page_cross += 1;
+                            break;
+                        }
+                        if !Self::fetch_within_limit(self.registers.eip, i.len, cs.limit) {
+                            self.perf.brk_decode_or_branch += 1;
+                            self.perf.brk_cont_not_continuable += 1;
+                            break;
+                        }
                         i
                     }
-                    _ => {
+                    None => {
                         self.perf.brk_decode_or_branch += 1;
+                        self.perf.brk_cont_decode_miss += 1;
                         break;
                     }
                 };

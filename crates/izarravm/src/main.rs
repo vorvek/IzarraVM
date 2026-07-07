@@ -851,6 +851,12 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             perf.jit_region_entries,
             perf.jit_region_insns,
         );
+        // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
+        // miss investigation.
+        println!(
+            "  brk_attrib[decode_miss/not_continuable/page_cross]={}/{}/{}",
+            perf.brk_cont_decode_miss, perf.brk_cont_not_continuable, perf.brk_cont_page_cross,
+        );
     }
     if accurate_out_of_band {
         return Err(
@@ -1310,6 +1316,12 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
         perf.cache_tier_lookups,
         perf.jit_region_entries,
         perf.jit_region_insns,
+    );
+    // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
+    // miss investigation.
+    println!(
+        "  brk_attrib[decode_miss/not_continuable/page_cross]={}/{}/{}",
+        perf.brk_cont_decode_miss, perf.brk_cont_not_continuable, perf.brk_cont_page_cross,
     );
 }
 
