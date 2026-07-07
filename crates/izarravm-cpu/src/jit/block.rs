@@ -229,12 +229,21 @@ pub(crate) fn build_block(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<(Vec<
 }
 
 /// Total bytes the prologue reserves below the five pushed callee-saved registers, sized so every
-/// `call` site sees RSP % 16 == 0. At entry RSP % 16 == 8 (after the return-address push); 5 pushes
-/// subtract 40 (8 mod 16), landing RSP at 0 mod 16; subtracting a multiple of 16 keeps it there, so
-/// 32 bytes (the Win64 shadow space) is exactly right. v1 used 40 with 4 pushes (4 pushes left RSP
-/// at 8 mod 16, so +40 was needed to reach 0); the fifth callee-saved (R14, the regs pointer) flips
-/// the parity and 32 is now correct. Harmless on SysV64 (no shadow space, but the alignment holds).
-const STACK_RESERVE: u32 = 32;
+/// `call` site sees RSP % 16 == 0 AND leaves room for a 5th stack-passed argument. At entry
+/// RSP % 16 == 8 (after the return-address push); 5 pushes subtract 40 (8 mod 16), landing RSP at
+/// 0 mod 16; 48 keeps it there (48 is a multiple of 16). 32 is the Win64 shadow space (a callee's
+/// [RSP+0..32]); the native-bookkeeping path calls `jit_charge_fetch` (5 args on win64), whose 5th
+/// argument lands at [RSP+32], so the reserve must cover [0..40] at least - 48 gives that with
+/// alignment. Harmless on SysV64 (no shadow space, but the alignment holds).
+const STACK_RESERVE: u32 = 48;
+
+/// Throwaway A/B mode for the S2.2 end-to-end prototype (owner: "prototype first"): controls how
+/// `emit_region` compiles the inline slots' bookkeeping. 0 = the `region_inline_slot` trampoline
+/// CALL (today); 1 = native arithmetic (`emit_native_bookkeeping`, still 3 call-outs); 2 = SKIP the
+/// bookkeeping entirely (INCORRECT clocks - a timing-ceiling probe bounding how much inline
+/// bookkeeping can ever cost). Read only at emit time. Not wired to production admission.
+pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 
 /// Emit the region chain for `slots`: pin cpu/bus/ctx in R12/R13/R15 and the two step functions
 /// in RBX (Memory/BackEdge) and R14 (inline register-only), then per slot either inline the guest
@@ -248,7 +257,8 @@ const STACK_RESERVE: u32 = 32;
 /// kinds and their baked immediates, so the buffer is re-emitted on every fresh admission (the
 /// re-stamp path refreshes the slot table; the next fresh admission re-reads the immediates from
 /// the fresh decodes).
-fn emit_region(slots: &[Slot], regs_offset: u32, _scale_den: u32) -> Vec<u8> {
+fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32) -> Vec<u8> {
+    let mode = NATIVE_BOOKKEEPING.load(std::sync::atomic::Ordering::Relaxed);
     let mut e = Encoder::new();
     e.push(Reg::RBX);
     e.push(Reg::R12);
@@ -285,11 +295,21 @@ fn emit_region(slots: &[Slot], regs_offset: u32, _scale_den: u32) -> Vec<u8> {
     e.place(loop_top);
     for (k, slot) in slots.iter().enumerate() {
         let k32 = k as u32;
+        // The next slot's linear address, for the native path's line-live probe. Inline slots are
+        // never the terminal slot, so `k+1` always exists here.
+        let next_lin = slots.get(k + 1).map(|s| s.lin).unwrap_or(0);
+        let bookkeeping = |e: &mut Encoder| {
+            if mode == 1 {
+                emit_native_bookkeeping(e, slot.lin, slot.insn.len, scale_den, next_lin, exit);
+            } else {
+                emit_inline_bookkeeping_call(e, k32, exit);
+            }
+        };
         match slot.kind {
             SlotKind::RegMov { dst, src } => {
                 e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(src));
                 e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
-                emit_inline_bookkeeping_call(&mut e, k32, exit);
+                bookkeeping(&mut e);
             }
             SlotKind::RegAddImm { dst, imm } => {
                 e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst));
@@ -297,7 +317,7 @@ fn emit_region(slots: &[Slot], regs_offset: u32, _scale_den: u32) -> Vec<u8> {
                 e.add_r32_imm32(Reg::RAX, imm);
                 e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
                 emit_set_pending_add_call(&mut e, imm);
-                emit_inline_bookkeeping_call(&mut e, k32, exit);
+                bookkeeping(&mut e);
             }
             SlotKind::RegShrImm { dst, count } => {
                 e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(dst));
@@ -305,7 +325,7 @@ fn emit_region(slots: &[Slot], regs_offset: u32, _scale_den: u32) -> Vec<u8> {
                 e.shr_r32_imm8(Reg::RAX, count);
                 e.store_r32_disp8(Reg::R14, gpr_disp(dst), Reg::RAX);
                 emit_set_shift_flags_shr_call(&mut e, count);
-                emit_inline_bookkeeping_call(&mut e, k32, exit);
+                bookkeeping(&mut e);
             }
             SlotKind::Memory | SlotKind::BackEdge => {
                 emit_full_step_call(&mut e, k32);

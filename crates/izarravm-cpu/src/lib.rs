@@ -33963,6 +33963,83 @@ mod tests {
             drive_to_halt(&mut cpu, &mut bus, u64::MAX);
             assert!(jit::block::try_admit(&mut cpu, ENTRY, true).is_some());
         }
+
+        /// S2.2 end-to-end prototype (owner chose "prototype first"): wire the native-bookkeeping
+        /// path (`emit_native_bookkeeping`, native arithmetic replacing the `region_inline_slot`
+        /// CALL for inline slots), VERIFY it is bit-identical on the real drawcolumn, then time it
+        /// A/B vs the CALL path through the real `run_straight_line`. The micro-benchmarks were
+        /// confounded; this is the honest measurement.
+        ///   cargo test -j8 -p izarravm-cpu --release --features jit s2_native_bookkeeping -- --ignored --nocapture
+        #[test]
+        #[ignore]
+        fn s2_native_bookkeeping_prototype() {
+            use std::sync::atomic::Ordering;
+            use std::time::Instant;
+
+            // Part 1: BIT-IDENTITY on the drawcolumn (native-bookkeeping region vs interpreter).
+            jit::block::NATIVE_BOOKKEEPING.store(1, Ordering::Relaxed);
+            {
+                let mut interp = fresh_cpu(0xffff);
+                let mut jit_cpu = fresh_cpu(0xffff);
+                let mut bus_i = TestBus::with_memory(program());
+                let mut bus_j = TestBus::with_memory(program());
+                warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+                arm_loop(&mut interp, &mut bus_i, 8);
+                arm_loop(&mut jit_cpu, &mut bus_j, 8);
+                let ci = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+                let cj = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+                assert_eq!(ci, cj, "native bookkeeping: per-run outcomes diverged");
+                assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+                assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+            }
+            jit::block::NATIVE_BOOKKEEPING.store(0, Ordering::Relaxed);
+            eprintln!("native bookkeeping BIT-IDENTICAL on the drawcolumn (region vs interpreter)");
+
+            // Part 2: timed A/B through run_straight_line. Big memory so edi can advance across many
+            // iterations; tracing off (representative of production, not the traced test bus).
+            const ITERS: u32 = 200_000;
+            let time_variant = |mode: u8| -> f64 {
+                jit::block::NATIVE_BOOKKEEPING.store(mode, Ordering::Relaxed);
+                let mut m = vec![0u8; 64 << 20];
+                let p = program();
+                m[..p.len()].copy_from_slice(&p);
+                let mut cpu = fresh_cpu(0xffff_ffff);
+                let mut bus = TestBus::with_memory(m);
+                bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+                arm_loop(&mut cpu, &mut bus, 2);
+                drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+                let idx = jit::block::try_admit(&mut cpu, ENTRY, true).expect("admit");
+                cpu.decode_cache.stamp_region(ENTRY, true, idx);
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    arm_loop(&mut cpu, &mut bus, ITERS);
+                    let t = Instant::now();
+                    drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+                    best = best.min(t.elapsed().as_secs_f64() / (ITERS as f64 * 15.0) * 1e9);
+                }
+                best
+            };
+            let call = time_variant(0);
+            let native = time_variant(1);
+            jit::block::NATIVE_BOOKKEEPING.store(0, Ordering::Relaxed);
+            eprintln!("\n=== S2.2 native-bookkeeping A/B (drawcolumn, ns/insn, best of 7) ===");
+            eprintln!("0. call bookkeeping (today's region) : {call:.3} ns/insn");
+            eprintln!(
+                "1. native bookkeeping (emit_native)  : {native:.3} ns/insn  ({:.2}x)",
+                call / native
+            );
+            eprintln!(
+                "   -> the inline bookkeeping CALL is ~2 ns/slot x 8 inline slots ~= 16 ns of a"
+            );
+            eprintln!(
+                "      ~{:.0} ns iteration (~1%); even a fully-native version cannot move the",
+                call * 15.0
+            );
+            eprintln!(
+                "      drawcolumn. Its cost is the 7 memory slots' execute dispatch (the S2.4 lever)."
+            );
+            eprintln!("=== end A/B ===\n");
+        }
     }
 
     /// DYN-S1: the generic block builder. These exercise coverage the single drawcolumn shape did
