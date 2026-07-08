@@ -35123,27 +35123,30 @@ mod tests {
         }
 
         /// Fault injection: a mid-loop memory access runs off the DS limit and #GPs, delivering to the
-        /// IVT handler. The interpreter and the JIT must fault at the SAME instruction with identical
-        /// pushed state - the register file must be committed (not stale) at the fault, the trap the
-        /// re-plan's spill-on-every-fault-exit rule guards for the eventual native templates.
+        /// IVT handler FROM INSIDE THE LIVE REGION. The interpreter and the JIT must fault at the SAME
+        /// instruction with identical pushed state - the register file must be committed (not stale) at
+        /// the fault, the trap the re-plan's spill-on-every-fault-exit rule guards for the eventual
+        /// native templates. The fault MUST land after hotness admission (JIT_HOTNESS_THRESHOLD = 32
+        /// iterations) so the JIT's own fault-delivery path is what runs - not the interpreter during
+        /// warm-up. `expect_region: true` pins that the region actually admitted and ran before faulting.
         #[test]
         fn harness_mid_loop_fault_delivers_identically() {
-            // DS limit 0x2100: esi starts at 0x2000 and advances 1/iteration, so the load #GPs when
-            // esi first exceeds the limit (offset > limit), mid-loop, on both CPUs.
+            // DS base 0, limit 0x2000. esi=0x1000 (the LOAD stays well inside the limit for the whole
+            // run). edi=0x1FC0 advances 1/iteration, so the STORE `mov [edi],al` #GPs when edi first
+            // exceeds 0x2000 - at iteration ~66, comfortably past the 32-iteration admission threshold,
+            // so the fault is delivered by the running region. count=100 so the loop cannot finish first.
             let prog = {
                 let mut m = h_copy_program();
-                m[H_COUNT..H_COUNT + 4].copy_from_slice(&1000u32.to_le_bytes()); // long enough to fault first
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&100u32.to_le_bytes());
                 m
             };
             let arm = move |cpu: &mut Cpu386| {
-                h_arm(0x2000, 0x3000)(cpu);
+                h_arm(0x1000, 0x1fc0)(cpu);
                 let mut ds = cpu.registers.segment(SegmentIndex::Ds);
-                ds.limit = 0x2100;
+                ds.limit = 0x2000;
                 cpu.registers.set_segment(SegmentIndex::Ds, ds);
             };
-            // The region may or may not admit before the fault (the fault can arrive during warm-up),
-            // so do not require it; the point is identical fault delivery.
-            let interp = assert_shape_identical(prog, &arm, false);
+            let interp = assert_shape_identical(prog, &arm, true);
             // Confirm the shape ACTUALLY faulted (else it just ran to the loop-end HLT and tested
             // nothing): the guest must have halted in the #GP handler, far above the loop code.
             assert!(
