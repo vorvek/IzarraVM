@@ -20,14 +20,15 @@ const PREFS_FILE: &str = "izarravm.conf";
 const DEFAULT_VOLUME: f32 = 0.8;
 
 /// Default ReSonique 2 output amp gain, in tenths of a linear multiplier
-/// (30 = 3.0x). Models the card's analog output stage, which the digital mixer
+/// (120 = 12.0x). Models the card's analog output stage, which the digital mixer
 /// model does not represent, so a game that rides the -14 dB CT1745 volume
-/// default is audible.
-pub const DEFAULT_AMP_GAIN: u32 = 30;
+/// default is comfortably audible; peaks clamp.
+pub const DEFAULT_AMP_GAIN: u32 = 120;
 
-/// Upper bound for the amp gain (tenths); 200 = 20x. Guards a hand-edited value
-/// from pinning the output at a clipped roar.
-pub const AMP_GAIN_MAX: u32 = 200;
+/// Upper bound for the amp gain (tenths); 500 = 50x. Generous headroom above the
+/// default so a very quiet game can still be brought up, guarding only against an
+/// absurd hand-edited value.
+pub const AMP_GAIN_MAX: u32 = 500;
 
 /// A host hotkey: modifier flags plus a key name. `key` is the winit `KeyCode`
 /// debug name (e.g. "F2", "KeyA"), which the GUI compares against the live key

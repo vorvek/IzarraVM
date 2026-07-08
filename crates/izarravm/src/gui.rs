@@ -238,25 +238,34 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
 
 /// Render OPL audio for the emulated time elapsed since the last pump. `gain` is
 /// the host-side master gain (already curved), applied to each sample before it
-/// is queued, independent of the guest's own CT1745 mixer.
+/// is queued, independent of the guest's own CT1745 mixer. `amp` is the ReSonique
+/// 2 analog output-stage gain; the machine applies it to the card's own sources
+/// (not the PC speaker) inside `render_audio`, so it is set on the machine here
+/// rather than multiplied into every sample.
 fn pump_audio(
     machine: &mut Machine,
     sink: &AudioSink,
-    clock_hz: u64,
-    audio_clocks: &mut u64,
+    wall_dt: f64,
     debt: &mut f64,
     gain: f32,
+    amp: f32,
 ) {
-    let now = machine.elapsed_clocks();
-    let delta = now.saturating_sub(*audio_clocks);
-    *audio_clocks = now;
-    *debt += delta as f64 * OPL_NATIVE_HZ / clock_hz as f64;
+    machine.set_card_amp(amp);
+    // Produce audio for the WALL time elapsed, not the guest clocks elapsed. The
+    // sound device consumes at real time, so tying production to guest execution
+    // meant a below-real-time guest (a 386 at 22 MHz, or a 486/586 the host cannot
+    // emulate at full speed) fed the ring slower than it drained -> starvation ->
+    // crackle. A real OPL/DAC runs on its own clock regardless of CPU speed: the
+    // music just changes notes more slowly. Driving synthesis at real time
+    // reproduces that (smooth audio, slower tempo) and keeps the ring fed. When the
+    // guest DOES keep up, wall time and guest time advance together, so this is
+    // identical to the old behavior. The SB DMA ring is still filled at the guest
+    // rate, so effects degrade to gaps (not crackle) rather than being stretched.
+    *debt += wall_dt * OPL_NATIVE_HZ;
     let mut samples = debt.floor() as usize;
     *debt -= samples as f64;
-    // A floppy stall jumps the guest clock forward by its whole duration at once,
-    // so the catch-up here could ask for seconds of audio in one render. Cap it at
-    // roughly the sink's buffer (~0.5 s): the surplus is the paused drive grind,
-    // which carries no audio and would only be dropped at the queue anyway.
+    // A long host hitch could ask for a huge render in one call. Cap it at roughly
+    // the sink's buffer (~0.5 s); the surplus would only be dropped at the queue.
     let max_samples = OPL_NATIVE_HZ as usize / 2;
     if samples > max_samples {
         samples = max_samples;
@@ -265,10 +274,9 @@ fn pump_audio(
     if samples == 0 {
         return;
     }
+    // The card amp was applied inside render_audio (card sources only); `gain` here
+    // is just the host master volume, applied to the whole mix (card + speaker).
     let mut pcm = machine.render_audio(samples);
-    // `gain` already carries the ReSonique 2 amp multiplier (the UI folds it into
-    // the shared gain alongside the master volume), so one saturating pass applies
-    // both. It is never unity, so the old skip-when-1.0 shortcut no longer applies.
     for (l, r) in &mut pcm {
         *l = (*l as f32 * gain)
             .round()
@@ -752,6 +760,7 @@ impl Emulator {
         sink: Option<AudioSink>,
         rtc_setup: crate::cmos::RtcSetup,
         gain: SharedGain,
+        amp: SharedGain,
         glide_render_threads: u8,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
@@ -768,6 +777,7 @@ impl Emulator {
                     sink,
                     rtc_setup,
                     gain,
+                    amp,
                     glide_render_threads,
                     rx,
                     frame_thread,
@@ -854,6 +864,7 @@ fn emulate(
     sink: Option<AudioSink>,
     rtc_setup: crate::cmos::RtcSetup,
     gain: SharedGain,
+    amp: SharedGain,
     glide_render_threads: u8,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
@@ -894,7 +905,6 @@ fn emulate(
         load_margo_test_pattern(&mut machine);
     }
 
-    let mut audio_clocks = machine.elapsed_clocks();
     let mut audio_debt = 0.0;
     let mut speed_ratio = 0.0;
     // Pacing credit (guest clocks the guest is owed). Wall time refills it; the
@@ -1065,10 +1075,10 @@ fn emulate(
                 pump_audio(
                     &mut machine,
                     sink,
-                    clock_hz,
-                    &mut audio_clocks,
+                    dt,
                     &mut audio_debt,
                     gain.get(),
+                    amp.get(),
                 );
             }
             if dt > 0.0 {
@@ -1220,12 +1230,15 @@ pub struct GuiApp {
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
     // the emulation thread reads through `gain`.
     volume: f32,
-    // ReSonique 2 output amp gain, in tenths (30 = 3.0x). Folded into `gain`
-    // alongside the master volume. Edited in the config modal, persisted in prefs.
+    // ReSonique 2 output amp gain, in tenths (120 = 12.0x). Edited in the config
+    // modal, persisted in prefs. The multiplier form rides `amp` to the emu thread.
     amp_gain: u32,
-    // The shared gain handed to the emulation thread; the UI writes it whenever
-    // the slider or the amp gain changes so the audio path stays lock-free.
+    // The shared master gain (curved volume slider), read each audio pump.
     gain: SharedGain,
+    // The shared ReSonique 2 amp multiplier (amp_gain / 10), read each audio pump
+    // and applied to the card's sources only (not the PC speaker). Separate atomic
+    // from `gain` so the two stay lock-free and independently updatable.
+    amp: SharedGain,
     // Distira/Glide render worker count. Persisted in the GUI prefs and applied
     // live to the emulation thread.
     glide_render_threads: u8,
@@ -1306,7 +1319,8 @@ impl GuiApp {
         let crt_style = prefs.crt_style;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
-        let gain = SharedGain::new(volume_gain(volume) * amp_multiplier(amp_gain));
+        let gain = SharedGain::new(volume_gain(volume));
+        let amp = SharedGain::new(amp_multiplier(amp_gain));
         // Restore the last floppy mount if the source still exists on disk.
         let floppy_source = restore_floppy_source(&prefs);
         let panel_open = prefs.panel_open;
@@ -1347,6 +1361,7 @@ impl GuiApp {
             volume,
             amp_gain,
             gain,
+            amp,
             glide_render_threads,
             crt_style,
             input_release,
@@ -1393,6 +1408,7 @@ impl GuiApp {
             sink,
             self.rtc_setup.clone(),
             self.gain.clone(),
+            self.amp.clone(),
             self.glide_render_threads,
         ));
         self.frame_seq = u64::MAX;
@@ -1863,8 +1879,7 @@ impl GuiApp {
                     let slider =
                         ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
                     if slider.changed() {
-                        self.gain
-                            .set(volume_gain(self.volume) * amp_multiplier(self.amp_gain));
+                        self.gain.set(volume_gain(self.volume));
                         self.prefs.master_volume = self.volume;
                         self.save_prefs();
                     }
@@ -2062,13 +2077,13 @@ impl GuiApp {
         self.prefs.input_release = dialog.input_release.clone();
         self.prefs.fullscreen = dialog.fullscreen.clone();
         self.prefs.crt_style = dialog.crt_style;
-        // Amp gain: update the live value + prefs and refold it into the shared
-        // gain so the emulation thread's audio pump picks it up without a restart.
+        // Amp gain: update the live value + prefs and push the new multiplier to
+        // the shared amp atomic so the emulation thread's audio pump picks it up
+        // without a restart.
         if dialog.amp_gain != self.amp_gain {
             self.amp_gain = dialog.amp_gain;
             self.prefs.amp_gain = dialog.amp_gain;
-            self.gain
-                .set(volume_gain(self.volume) * amp_multiplier(self.amp_gain));
+            self.amp.set(amp_multiplier(self.amp_gain));
         }
         if dialog.glide_threads != self.glide_render_threads {
             // Updates the field, prefs, and emulation thread, and persists.
