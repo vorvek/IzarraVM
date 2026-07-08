@@ -714,6 +714,10 @@ impl std::fmt::Debug for Tlb {
     }
 }
 
+// repr(C) pins the field layout (physical_page at +0, ptr at +8, size 16) that the native memory
+// probe's emitted deref hardcodes; default repr may reorder these, which in a release build (no
+// debug_assert) would silently read the wrong field. See jit::block::emit_load_u8_probe.
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct DirectPageCacheEntry {
     physical_page: u32,
@@ -35502,6 +35506,149 @@ mod tests {
                 "the self-store must have triggered the SMC watch (narrow={}, global={})",
                 pc.smc_narrow_kills,
                 pc.decode_inval_smc
+            );
+        }
+
+        // ---- Round 3 native byte-LOAD probe (isolation test of the emitted assembly) ----
+
+        /// Emit `emit_load_u8_probe` wrapped in a callable prologue/epilogue (pin cpu in R12, regs base
+        /// in R14, per the template ABI), run it against the live CPU, and return whether it hit (the
+        /// page-cache probe found the page) or missed. On a hit the emitted code has written the loaded
+        /// byte into `gpr[dst]`'s byte lane.
+        fn run_load_probe(
+            cpu: &mut Cpu386,
+            base: u8,
+            index: Option<u8>,
+            disp: i32,
+            dst: u8,
+        ) -> bool {
+            use jit::encoder::{Encoder, Reg};
+            let regs_off = std::mem::offset_of!(Cpu386, registers) as u32;
+            let mut e = Encoder::new();
+            e.push(Reg::RBX);
+            e.push(Reg::R12);
+            e.push(Reg::R13);
+            e.push(Reg::R14);
+            e.push(Reg::R15);
+            #[cfg(windows)]
+            e.mov_r64_r64(Reg::R12, Reg::RCX); // win64 arg0 = cpu
+            #[cfg(not(windows))]
+            e.mov_r64_r64(Reg::R12, Reg::RDI); // sysv arg0 = cpu
+            e.mov_r64_r64(Reg::R14, Reg::R12);
+            if regs_off != 0 {
+                e.add_r64_imm32(Reg::R14, regs_off);
+            }
+            let miss = e.label();
+            let done = e.label();
+            jit::block::emit_load_u8_probe(&mut e, base, index, disp, dst, miss);
+            e.mov_r32_imm32(Reg::RAX, 1); // hit: fall through here (gpr already written)
+            e.jmp(done);
+            e.place(miss);
+            e.mov_r32_imm32(Reg::RAX, 0); // miss: nothing written
+            e.place(done);
+            e.pop(Reg::R15);
+            e.pop(Reg::R14);
+            e.pop(Reg::R13);
+            e.pop(Reg::R12);
+            e.pop(Reg::RBX);
+            e.ret();
+            let bytes = e.finish();
+            let buf = jit::exec_mem::ExecutableBuffer::new(&bytes).expect("W^X alloc must succeed");
+            let f: extern "C" fn(*mut Cpu386) -> i64 =
+                unsafe { std::mem::transmute(buf.entry_ptr()) };
+            f(cpu as *mut Cpu386) != 0
+        }
+
+        /// The probe assembly, run in isolation against a real `data_read_pages` entry: it must compute
+        /// the effective address for `[reg]` and `[base+index]`, probe the physical-keyed page cache,
+        /// deref the host pointer at the in-page offset, and write ONLY the destination byte lane
+        /// (write_gpr8 semantics) on a hit - and take the miss path when the page is not cached.
+        #[test]
+        fn native_load_probe_reads_the_right_byte() {
+            let mut page = vec![0u8; 0x1000];
+            page[3] = 0xAB;
+            page[0x10] = 0xCD;
+            let mut cpu = fresh();
+            cpu.data_read_pages.insert(izarravm_bus::DirectPage {
+                physical_page: 0x5000,
+                ptr: page.as_mut_ptr(),
+                len: 0x1000,
+                writable: false,
+            });
+
+            // `mov bl, [eax]` with eax = 0x5003 -> the byte at page offset 3 (0xAB) into BL, EBX's
+            // upper three bytes preserved.
+            cpu.write_gpr32(0, 0x5003); // eax
+            cpu.write_gpr32(3, 0xdead_be00); // ebx (dst BL)
+            assert!(
+                run_load_probe(&mut cpu, 0, None, 0, 3),
+                "must hit the cached page"
+            );
+            assert_eq!(
+                cpu.read_gpr32(3),
+                0xdead_beab,
+                "BL written from page[3]=0xAB, upper bytes preserved"
+            );
+
+            // `mov bl, [eax+ecx]` (SIB scale 1): eax=0x5000, ecx=0x10 -> page offset 0x10 (0xCD).
+            cpu.write_gpr32(0, 0x5000);
+            cpu.write_gpr32(1, 0x10); // ecx (index)
+            cpu.write_gpr32(3, 0x0000_0000);
+            assert!(
+                run_load_probe(&mut cpu, 0, Some(1), 0, 3),
+                "SIB form must hit"
+            );
+            assert_eq!(cpu.read_gpr32(3), 0x0000_00cd, "BL = page[0x10] = 0xCD");
+
+            // `mov bl, [eax+3]` (displacement, no index): eax=0x5000, disp=3 -> page offset 3 (0xAB).
+            // Pins that the `disp != 0` branch adds into the EA register (RAX), not a scratch.
+            cpu.write_gpr32(0, 0x5000);
+            cpu.write_gpr32(3, 0x0000_0000);
+            assert!(
+                run_load_probe(&mut cpu, 0, None, 3, 3),
+                "disp form must hit"
+            );
+            assert_eq!(
+                cpu.read_gpr32(3),
+                0x0000_00ab,
+                "BL = page[0x5000+3] = 0xAB via disp"
+            );
+
+            // `mov bl, [eax+ecx+3]` (index + displacement): eax=0x5000, ecx=0x0d, disp=3 -> offset 0x10.
+            cpu.write_gpr32(0, 0x5000);
+            cpu.write_gpr32(1, 0x0d); // ecx
+            cpu.write_gpr32(3, 0x0000_0000);
+            assert!(
+                run_load_probe(&mut cpu, 0, Some(1), 3, 3),
+                "index+disp must hit"
+            );
+            assert_eq!(
+                cpu.read_gpr32(3),
+                0x0000_00cd,
+                "BL = page[0x5000+0x0d+3] = 0xCD"
+            );
+
+            // A high byte destination (AH = gpr8 index 4 = byte 1 of EAX): write into bits 8-15.
+            cpu.write_gpr32(0, 0x5003); // eax base (also the AH target register)
+            assert!(run_load_probe(&mut cpu, 0, None, 0, 4), "must hit");
+            // EAX was 0x5003; AH (bits 8-15) becomes 0xAB -> 0x0000_ABxx with the low byte 0x03 kept.
+            assert_eq!(
+                cpu.read_gpr32(0) & 0xffff,
+                0xab03,
+                "AH set to 0xAB, AL (0x03) preserved"
+            );
+
+            // Miss: an address whose physical page is not cached -> the miss path, gpr untouched.
+            cpu.write_gpr32(0, 0x9003); // page 0x9000 not inserted
+            cpu.write_gpr32(3, 0x1234_5678);
+            assert!(
+                !run_load_probe(&mut cpu, 0, None, 0, 3),
+                "uncached page must miss"
+            );
+            assert_eq!(
+                cpu.read_gpr32(3),
+                0x1234_5678,
+                "miss leaves the gpr unchanged"
             );
         }
 
