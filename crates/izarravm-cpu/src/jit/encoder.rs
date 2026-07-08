@@ -443,6 +443,23 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// `cmp reg32, [base + disp8]` (3B /r, mod=01 disp8, no REX.W, SIB if `base` is RSP/R12) -- compare
+    /// a 32-bit register against a memory dword, setting flags (for a following `jnz`/`jz`). The native
+    /// memory probe uses this to compare the page-cache entry's `physical_page` field against the
+    /// computed guest page in a register, without spending a 4th scratch to load the field first. Same
+    /// ModRM/REX/SIB shape as `load_r32_disp8` (8B), opcode 0x3B (CMP r32, r/m32).
+    pub(crate) fn cmp_r32_disp8(&mut self, reg: Reg, base: Reg, disp8: i8) {
+        if reg.ext() || base.ext() {
+            self.rex(false, reg.ext(), false, base.ext());
+        }
+        self.bytes.push(0x3B);
+        self.modrm(0b01, reg.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
     /// `xor dst64, dst64` (REX.W + 31 /r), the standard zero-register idiom.
     pub(crate) fn xor_r64_self(&mut self, dst: Reg) {
         self.rex(true, dst.ext(), false, dst.ext());
@@ -892,6 +909,49 @@ mod tests {
             [0xEE, 0x7A, 0xEE],
             "only dst[1]'s low byte should change"
         );
+    }
+
+    #[test]
+    fn cmp_r32_disp8_known_bytes() {
+        // cmp ecx, [rdx+0] -- no REX, 3B /r. ModRM mod=01,reg=ecx(1),rm=rdx(2) = 0x4A; disp 0.
+        let mut e = Encoder::new();
+        e.cmp_r32_disp8(Reg::RCX, Reg::RDX, 0);
+        assert_eq!(e.finish(), vec![0x3B, 0x4A, 0x00]);
+        // cmp ecx, [r15+8] -- REX.B (r15 base extended). ModRM rm=r15&7=7 -> 0x4F; disp 8.
+        let mut e = Encoder::new();
+        e.cmp_r32_disp8(Reg::RCX, Reg::R15, 8);
+        assert_eq!(e.finish(), vec![0x41, 0x3B, 0x4F, 0x08]);
+        // cmp eax, [r12+0] -- r12&7=4 forces a SIB byte (0x24); REX.B. ModRM 0x44.
+        let mut e = Encoder::new();
+        e.cmp_r32_disp8(Reg::RAX, Reg::R12, 0);
+        assert_eq!(e.finish(), vec![0x41, 0x3B, 0x44, 0x24, 0x00]);
+    }
+
+    #[test]
+    fn cmp_r32_disp8_reads_the_memory_dword() {
+        // End-to-end: fn(ptr) -> i64 returns 1 iff *ptr == 0xCAFE, via cmp eax,[ptr] + jz. Proves the
+        // memory operand reads the right dword and sets ZF, not just the byte shape.
+        use super::super::exec_mem::ExecutableBuffer;
+        let mut e = Encoder::new();
+        e.mov_r32_imm32(Reg::RAX, 0xCAFE);
+        #[cfg(windows)]
+        e.cmp_r32_disp8(Reg::RAX, Reg::RCX, 0); // win64 arg0 = RCX
+        #[cfg(not(windows))]
+        e.cmp_r32_disp8(Reg::RAX, Reg::RDI, 0); // sysv arg0 = RDI
+        let hit = e.label();
+        e.jz(hit);
+        e.mov_r64_imm64(Reg::RAX, 0);
+        let end = e.label();
+        e.jmp(end);
+        e.place(hit);
+        e.mov_r64_imm64(Reg::RAX, 1);
+        e.place(end);
+        e.ret();
+        let bytes = e.finish();
+        let buf = ExecutableBuffer::new(&bytes).expect("alloc must succeed on a supported host");
+        let f: extern "C" fn(*const u32) -> i64 = unsafe { std::mem::transmute(buf.entry_ptr()) };
+        assert_eq!(f(&0xCAFEu32), 1);
+        assert_eq!(f(&0x1234u32), 0);
     }
 
     #[test]
