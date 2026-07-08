@@ -48,7 +48,7 @@ use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableBuffer;
 use super::region::{CompiledRegion, JIT_REGION_TABLE_CAP};
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
-use crate::{Cpu386, DecodeGroup, DecodedInsn, OperandSize, Prefixes};
+use crate::{Cpu386, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, Prefixes};
 
 /// Cap on a compiled block's slot count, to bound the emit and the compile pass. A block that
 /// reaches the cap ends linearly (its tail is interpreted); real hot loops are far smaller.
@@ -68,6 +68,12 @@ const MAX_BLOCK_SLOTS: usize = 128;
 /// function-pointer table keyed by opcode is deliberately NOT used - the enum keeps exhaustiveness
 /// checking and compiles to a jump table anyway, so it is the idiomatic dispatch for a single host.
 fn classify_slot(insn: &DecodedInsn) -> SlotKind {
+    // `mov r8, [mem]` (0x8A with a memory operand): route to the specialized byte-load executor
+    // (dispatch removal, Stage 1 of the Round 3 template). The register form (0x8A mode 3) has a
+    // Reg operand, not Mem, so it stays on the full step.
+    if insn.opcode == 0x8a && matches!(insn.operand, Some(DecodedOperand::Mem(_))) {
+        return SlotKind::MemLoadU8;
+    }
     let Some(m) = insn.modrm else {
         // A modrm-less interior op (push/pop/nop/int-free single-byte forms) has no inline
         // template yet; run it through the full step. (The terminal back-edge Jcc is classified
@@ -344,7 +350,7 @@ fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32) -> Vec<u8> {
                 emit_set_shift_flags_shr_call(&mut e, count);
                 bookkeeping(&mut e);
             }
-            SlotKind::Memory | SlotKind::BackEdge => {
+            SlotKind::Memory | SlotKind::BackEdge | SlotKind::MemLoadU8 => {
                 emit_full_step_call(&mut e, k32);
                 e.test_al_al();
                 e.jnz(exit);

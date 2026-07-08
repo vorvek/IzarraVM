@@ -49,6 +49,11 @@ pub(crate) enum SlotKind {
     /// A memory-operand slot (load/store/r-m-w): the full v1 `region_step` (decode dispatch +
     /// bus-bound memory resolution + fault handling).
     Memory,
+    /// A `mov r8, [mem]` byte load (opcode 0x8A, memory operand). Runs through `region_step` like a
+    /// `Memory` slot, but `region_step` calls the specialized `jit_execute_load_u8` (which skips the
+    /// group/opcode dispatch chain) instead of the general `execute_hot_cached_or_decoded`. Stage 1
+    /// of the Round 3 byte-load template: dispatch removal only, bit-identical in every mode.
+    MemLoadU8,
     /// The final rel8 Jcc back-edge (taken = loop, not-taken = LoopDone).
     BackEdge,
 }
@@ -220,6 +225,7 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
     let slot = &ctx.slots[k as usize];
     let insn = slot.insn;
     let lin = slot.lin;
+    let kind = slot.kind;
 
     cpu.interrupt_shadow = false;
     cpu.begin_instruction();
@@ -228,8 +234,12 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
 
     match cpu
         .charge_cached_fetch(bus, lin, insn.len)
-        .and_then(|()| cpu.execute_hot_cached_or_decoded(&insn, bus))
-    {
+        .and_then(|()| match kind {
+            // Byte-load slots skip the group/opcode dispatch chain via the specialized executor;
+            // every other slot takes the full dispatch. Both are interpreter-identical.
+            SlotKind::MemLoadU8 => cpu.jit_execute_load_u8(&insn, bus),
+            _ => cpu.execute_hot_cached_or_decoded(&insn, bus),
+        }) {
         Ok(outcome) => {
             ctx.raw_clocks += u64::from(outcome.core_clocks);
             ctx.insn_count += 1;
