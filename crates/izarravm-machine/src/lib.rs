@@ -10047,34 +10047,9 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
         }
-        // SB16 DSP status port (0x22E/0x22F) lazy read (Approximate class only, i.e.
-        // 486/586). The bit a guest polls -- 0x80 = read-data-port-has-a-byte -- is
-        // ALWAYS false during DMA playback (PCM, 16-bit, or Creative ADPCM): the DMA
-        // producer never queues read-data bytes; only reset/version/copyright command
-        // responses do, and those are batch-ending writes (0x226/0x22C set io_touched).
-        // So the status byte is batch-stable, and the read can return it without
-        // ending the run, exactly like the OPL status arm above.
-        //
-        // The ack side effects a real 0x22E read performs are deferred, not dropped,
-        // and that is safe:
-        //  (1) dsp.irq_pending = false: already a no-op at read time. advance_devices
-        //      drains it via take_irq() (a test-and-clear latch) at every batch
-        //      boundary when the DMA block edge fires, so irq_pending is always false
-        //      by the time the guest ISR reads 0x22E.
-        //  (2) mixer.clear_irq_status(): only zeroes the read-only 0x82 shadow. PIC
-        //      re-assertion flows through take_irq() -> pic.request(), fully
-        //      independent of irq_status. The only consequence of the deferral is a
-        //      stale 0x82 bit until the next advance_devices, which the next edge
-        //      overwrites -- a diagnostic register nothing consults for delivery.
-        // approx_batch_cap already bounds the batch to the next DMA block edge, so
-        // interrupt latency stays within the P4c contract.
-        if matches!(port, 0x22E | 0x22F) && self.lazy_port_reads {
-            return Ok(u32::from(if self.dsp.data_available() {
-                0x80u8
-            } else {
-                0x00u8
-            }));
-        }
+        // DSP status reads are intentionally exact. SB reset/probe code polls
+        // 0x22E for the reset ACK byte, so keeping that loop inside one
+        // approximate CPU batch can starve the DSP settle timer.
         // Every arm from here down is unchanged from before Task 1.3: a single
         // unconditional set covers all of them, exactly like the old top-of-function
         // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61, OPL status)
@@ -18401,6 +18376,24 @@ mod tests {
     }
 
     #[test]
+    fn sb_dsp_status_read_sets_io_touched_in_every_cpu_mode() {
+        for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            for port in [0x22Eu16, 0x22F] {
+                with_bus(&mut machine, |bus| {
+                    *bus.io_touched = false;
+                    let _ = bus.read_io(port, BusWidth::Byte, 0, false).unwrap();
+                    assert!(
+                        *bus.io_touched,
+                        "{mode:?}: DSP status port {port:#06X} must end the batch"
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
     fn sb_dsp_version_and_status_route_through_the_bus() {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
@@ -18457,6 +18450,35 @@ mod tests {
             after,
             "IRQ5 must be raised by the per-clock sample advance, not the host render path"
         );
+    }
+
+    #[test]
+    fn sb16_8bit_dma_command_c0_plays_and_raises_irq5() {
+        let mut machine = test_machine();
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+            // SB16 8-bit single-cycle output: command 0xC0, unsigned mono,
+            // count 15 -> 16 DMA bytes. Doom-style SB16 drivers may use this
+            // command family after detecting a DSP 4.x card.
+            for &b in &[0x41u8, 0x2B, 0x11, 0xC0, 0x00, 0x0F, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
+                    .unwrap();
+            }
+        });
+        machine.advance_devices_clocks(200_000);
+        let after = with_bus(&mut machine, |bus| bus.interrupt_pending());
+        assert!(after, "SB16 0xC0 DMA playback must raise IRQ5");
+        let out = machine.render_dsp_audio(16);
+        assert_eq!(out.len(), 16, "SB16 0xC0 playback drained DMA bytes");
     }
 
     #[test]
@@ -21338,21 +21360,27 @@ mod tests {
 
     #[test]
     fn boot_suite_reports_sb_dsp_reset_pass() {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-            izarravm_firmware::X86_BOOT_TEST_IMAGE,
-        )
-        .unwrap();
-        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-        assert!(
-            results.records.iter().any(|record| {
-                record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                    && record.name == "sound.sb_dsp_reset"
-            }),
-            "boot suite should report PASS sound.sb_dsp_reset"
-        );
+        for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
+            let mut machine = Machine::new_boot_image(
+                MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+                izarravm_firmware::X86_BOOT_TEST_IMAGE,
+            )
+            .unwrap();
+            machine.set_mode(mode);
+            let reason = machine
+                .run_until_halt_or_cycles(mode.clock_hz() / 4)
+                .unwrap();
+            assert_eq!(reason, StopReason::Halted);
+            let results =
+                izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+            assert!(
+                results.records.iter().any(|record| {
+                    record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                        && record.name == "sound.sb_dsp_reset"
+                }),
+                "boot suite should report PASS sound.sb_dsp_reset in {mode:?}"
+            );
+        }
     }
 
     #[test]

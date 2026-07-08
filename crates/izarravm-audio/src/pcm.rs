@@ -26,6 +26,11 @@ pub(crate) fn sample_u8(byte: u8) -> i16 {
     (i32::from(byte) - 128).clamp(-128, 127) as i16 * 256
 }
 
+/// Convert one signed 8-bit Sound Blaster PCM sample to 16-bit mixer range.
+pub(crate) fn sample_i8(byte: u8) -> i16 {
+    i16::from(byte as i8) * 256
+}
+
 /// Convert one signed 16-bit DMA sample directly (no centering): the SB16 16-bit
 /// path is already signed PCM, so the bit pattern maps straight to i16.
 pub(crate) fn sample_i16(word: u16) -> i16 {
@@ -133,6 +138,13 @@ mod tests {
         assert_eq!(sample_u8(0x00), -32_768, "0x00 -> full negative");
         assert_eq!(sample_u8(0x80), 0, "0x80 -> silence");
         assert_eq!(sample_u8(0xFF), 32_512, "0xFF -> near full positive");
+    }
+
+    #[test]
+    fn sample_i8_expands_signed_bytes() {
+        assert_eq!(sample_i8(0x80), -32_768, "0x80 -> full negative");
+        assert_eq!(sample_i8(0x00), 0, "0x00 -> silence");
+        assert_eq!(sample_i8(0x7F), 32_512, "0x7F -> near full positive");
     }
 
     #[test]

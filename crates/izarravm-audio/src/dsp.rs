@@ -4,7 +4,7 @@
 //! CT1745 mixer lives next to this in the machine crate. Input/ADC and
 //! MIDI/MPU-401 are not modeled yet.
 
-use crate::pcm::{push_frame_capped, sample_i16, sample_u8, sample_u16};
+use crate::pcm::{push_frame_capped, sample_i8, sample_i16, sample_u8, sample_u16};
 use std::collections::VecDeque;
 
 pub const DSP_VERSION_HI: u8 = 4;
@@ -266,9 +266,10 @@ impl SbDsp {
             // takes no args -- it uses the 0x48 block size.
             0x74 | 0x75 | 0x76 | 0x77 | 0x16 | 0x17 => 2,
             0x48 => 2, // set block size for auto-init/high-speed modes
-            // The SB16 0xBx family (16-bit DMA output/input, single + auto-init)
-            // takes a mode byte plus a 2-byte transfer count.
+            // The SB16 0xBx/0xCx families (16-bit/8-bit DMA output/input, single
+            // + auto-init) take a mode byte plus a 2-byte transfer count.
             0xB0..=0xBF => 3,
+            0xC0..=0xCF => 3,
             _ => 0,
         }
     }
@@ -378,6 +379,7 @@ impl SbDsp {
             0x90 => self.arm_dma(true),  // 8-bit auto-init, high-speed
             0x91 => self.arm_dma(false), // 8-bit single, high-speed
             0xB0..=0xBF => self.arm_16bit(command, args),
+            0xC0..=0xCF => self.arm_8bit_sb16(command, args),
             0xD0 => self.playing = false,   // halt DMA (position kept)
             0xD4 => self.playing = true,    // continue DMA
             0xDA => self.auto_init = false, // exit auto-init: stop at next TC
@@ -395,9 +397,13 @@ impl SbDsp {
     fn arm_dma(&mut self, auto_init: bool) {
         // 8-bit DMA is mono unsigned PCM: clear the 16-bit/stereo/signed latches
         // and drop any ADPCM decode state so the raw-byte path runs.
+        self.arm_8bit(auto_init, false, false);
+    }
+
+    fn arm_8bit(&mut self, auto_init: bool, stereo: bool, signed: bool) {
         self.dma_16bit = false;
-        self.stereo = false;
-        self.sample_signed = false;
+        self.stereo = stereo;
+        self.sample_signed = signed;
         self.adpcm = None;
         self.auto_init = auto_init;
         self.playing = true;
@@ -449,6 +455,23 @@ impl SbDsp {
         self.playing = true;
     }
 
+    /// Arm the SB16 8-bit DMA path from a 0xCx command (mode byte + 2-byte
+    /// count). Bit2 selects auto-init, bit3 selects input/ADC (ignored here),
+    /// and the mode byte selects signed/stereo playback.
+    fn arm_8bit_sb16(&mut self, command: u8, args: &[u8]) {
+        if command & 0x08 != 0 {
+            return;
+        }
+        let auto_init = command & 0x04 != 0;
+        let mode = args.first().copied().unwrap_or(0);
+        let stereo = mode & 0x20 != 0;
+        let signed = mode & 0x10 != 0;
+        let count_lo = u32::from(args.get(1).copied().unwrap_or(0));
+        let count_hi = u32::from(args.get(2).copied().unwrap_or(0));
+        self.block_size = (count_lo | (count_hi << 8)) + 1;
+        self.arm_8bit(auto_init, stereo, signed);
+    }
+
     pub fn rate_hz(&self) -> u32 {
         self.rate_hz
     }
@@ -466,7 +489,7 @@ impl SbDsp {
         self.dma_16bit
     }
 
-    /// Whether the armed DMA mode is stereo (two words per output frame).
+    /// Whether the armed DMA mode is stereo.
     pub fn is_stereo(&self) -> bool {
         self.stereo
     }
@@ -577,17 +600,17 @@ impl SbDsp {
             let words = if self.stereo { 2 } else { 1 };
             self.advance_block(words);
             Some((left, right))
-        } else if self.sbpro_stereo {
+        } else if self.stereo || self.sbpro_stereo {
             // SB Pro 8-bit stereo: two interleaved bytes per frame, left then
             // right, advancing the block counter by both bytes consumed.
             // The SB Pro silent-byte priming / L<->R channel-swap alignment quirk
             // is not modeled, so the first byte of each frame is always Left.
-            let left = sample_u8(byte_fetch()?);
-            let right = sample_u8(byte_fetch()?);
+            let left = self.sample_byte(byte_fetch()?);
+            let right = self.sample_byte(byte_fetch()?);
             self.advance_block(2);
             Some((left, right))
         } else {
-            let s = sample_u8(byte_fetch()?);
+            let s = self.sample_byte(byte_fetch()?);
             self.advance_block(1);
             Some((s, s))
         }
@@ -639,7 +662,7 @@ impl SbDsp {
     /// rate directly (no channel-count pre-multiply), so it must not be halved.
     /// Every other mode (mono, or any 16-bit) frames at the programmed rate.
     pub fn output_frame_rate(&self) -> u32 {
-        if self.sbpro_stereo && !self.dma_16bit && self.rate_is_byte_rate {
+        if (self.sbpro_stereo || self.stereo) && !self.dma_16bit && self.rate_is_byte_rate {
             // `rate_hz / 2` truncates on an odd byte rate; acceptable, since it
             // stays within the time-constant's own quantization.
             self.rate_hz / 2
@@ -654,6 +677,14 @@ impl SbDsp {
             sample_i16(word)
         } else {
             sample_u16(word)
+        }
+    }
+
+    fn sample_byte(&self, byte: u8) -> i16 {
+        if self.sample_signed {
+            sample_i8(byte)
+        } else {
+            sample_u8(byte)
         }
     }
 
@@ -972,6 +1003,50 @@ mod tests {
         write_cmd(&mut dsp, &[0xB8, 0x30, 0x07, 0x00]);
         assert!(!dsp.is_playing());
         assert!(!dsp.is_16bit());
+    }
+
+    #[test]
+    fn sb16_8bit_single_command_arms_with_mode_and_count() {
+        let mut dsp = SbDsp::default();
+        // 0xC0 = SB16 8-bit single-cycle output; mode 0x10 = signed mono.
+        write_cmd(&mut dsp, &[0xC0, 0x10, 0x01, 0x00]);
+        assert!(dsp.is_playing());
+        assert!(!dsp.is_auto_init());
+        assert!(!dsp.is_16bit());
+        assert_eq!(dsp.block_remaining(), 2);
+
+        let f = dsp.render_frame(|| Some(0xFF), || panic!("word fetch unused"));
+        assert_eq!(f, Some((-256, -256)), "signed 8-bit mono");
+    }
+
+    #[test]
+    fn sb16_8bit_auto_init_command_arms_and_stereo_deinterleaves() {
+        let mut dsp = SbDsp::default();
+        // 0xC6 = SB16 8-bit auto-init output; bit1/FIFO is accepted and ignored.
+        // Mode 0x20 = unsigned stereo.
+        write_cmd(&mut dsp, &[0xC6, 0x20, 0x03, 0x00]);
+        assert!(dsp.is_playing() && dsp.is_auto_init());
+        assert!(!dsp.is_16bit());
+        assert!(dsp.is_stereo());
+
+        let bytes = [0x00u8, 0x80, 0xFF, 0x40];
+        let mut i = 0usize;
+        let f = dsp.render_frame(
+            || {
+                let byte = bytes[i];
+                i += 1;
+                Some(byte)
+            },
+            || panic!("word fetch unused"),
+        );
+        assert_eq!(f, Some((-32_768, 0)), "unsigned 8-bit stereo L/R");
+    }
+
+    #[test]
+    fn sb16_8bit_input_command_arms_nothing() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0xC8, 0x00, 0x07, 0x00]);
+        assert!(!dsp.is_playing(), "ADC/input command is out of scope");
     }
 
     #[test]
