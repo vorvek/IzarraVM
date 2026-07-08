@@ -1386,6 +1386,10 @@ pub struct Machine {
     /// default; the GUI sets it from the config). Host-side loudness only, not
     /// guest-visible, so it never affects timing or the guest audio model.
     card_amp: f32,
+    /// PC speaker output volume (host-tunable), a linear attenuation applied in
+    /// render_audio to the speaker only. 1.0 = full (default), 0.0 = muted. Like
+    /// card_amp it is host-side loudness only, never guest-visible.
+    speaker_volume: f32,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
     dsp: SbDsp,
     /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
@@ -1692,6 +1696,7 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             card_amp: 1.0,
+            speaker_volume: 1.0,
             opl_micros: 0.0,
             dsp: SbDsp::default(),
             // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
@@ -8454,6 +8459,13 @@ impl Machine {
         self.card_amp = amp.max(0.0);
     }
 
+    /// Set the PC speaker output volume (host-side). Applied in
+    /// [`render_audio`](Self::render_audio) to the speaker only. Clamped to
+    /// 0.0..=1.0; 0.0 mutes the beeps, 1.0 is full.
+    pub fn set_speaker_volume(&mut self, volume: f32) {
+        self.speaker_volume = volume.clamp(0.0, 1.0);
+    }
+
     /// Render `native_samples` of mixed OPL3 + SB16 DSP audio at the 44100 Hz DAC
     /// rate (stereo, saturated to 16-bit). `native_samples` is counted in OPL
     /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
@@ -8465,6 +8477,7 @@ impl Machine {
     /// which is motherboard hardware that does not pass through the card's amp.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
         let card_amp = self.card_amp;
+        let speaker_volume = self.speaker_volume;
         let opl_native: Vec<(i32, i32)> = (0..native_samples)
             .map(|_| self.opl.render_sample())
             .collect();
@@ -8523,7 +8536,10 @@ impl Machine {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let (wl, wr) = wss_out.get(i).copied().unwrap_or((0, 0));
-                let s = i32::from(spk[i]);
+                // Host PC speaker volume: a straight attenuation on the beeper,
+                // independent of the card amp (0.0 mutes it). Unity leaves the mix
+                // bit-identical to before.
+                let s = (f32::from(spk[i]) * speaker_volume) as i32;
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let cl = (cl as f32 * cd_l_gain) as i32;
                 let cr = (cr as f32 * cd_r_gain) as i32;

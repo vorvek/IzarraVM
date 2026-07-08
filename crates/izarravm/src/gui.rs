@@ -33,6 +33,12 @@ fn amp_multiplier(amp_gain: u32) -> f32 {
     amp_gain as f32 / 10.0
 }
 
+/// The PC speaker volume as a linear gain, from the config's percent (100 -> 1.0,
+/// 0 -> muted). Applied host-side to the speaker only, independent of the card amp.
+fn speaker_multiplier(pc_speaker_volume: u32) -> f32 {
+    pc_speaker_volume as f32 / 100.0
+}
+
 /// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
 /// perceptual curve; swap it for a proper dB map if it ever matters.
 fn volume_gain(volume: f32) -> f32 {
@@ -249,8 +255,10 @@ fn pump_audio(
     debt: &mut f64,
     gain: f32,
     amp: f32,
+    speaker_vol: f32,
 ) {
     machine.set_card_amp(amp);
+    machine.set_speaker_volume(speaker_vol);
     // Produce audio for the WALL time elapsed, not the guest clocks elapsed. The
     // sound device consumes at real time, so tying production to guest execution
     // meant a below-real-time guest (a 386 at 22 MHz, or a 486/586 the host cannot
@@ -761,6 +769,7 @@ impl Emulator {
         rtc_setup: crate::cmos::RtcSetup,
         gain: SharedGain,
         amp: SharedGain,
+        speaker_vol: SharedGain,
         glide_render_threads: u8,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
@@ -778,6 +787,7 @@ impl Emulator {
                     rtc_setup,
                     gain,
                     amp,
+                    speaker_vol,
                     glide_render_threads,
                     rx,
                     frame_thread,
@@ -865,6 +875,7 @@ fn emulate(
     rtc_setup: crate::cmos::RtcSetup,
     gain: SharedGain,
     amp: SharedGain,
+    speaker_vol: SharedGain,
     glide_render_threads: u8,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
@@ -1079,6 +1090,7 @@ fn emulate(
                     &mut audio_debt,
                     gain.get(),
                     amp.get(),
+                    speaker_vol.get(),
                 );
             }
             if dt > 0.0 {
@@ -1233,12 +1245,18 @@ pub struct GuiApp {
     // ReSonique 2 output amp gain, in tenths (120 = 12.0x). Edited in the config
     // modal, persisted in prefs. The multiplier form rides `amp` to the emu thread.
     amp_gain: u32,
+    // PC speaker volume as a percent (100 = full, 0 = muted). Edited in the config
+    // modal, persisted in prefs. The gain form rides `speaker_vol` to the emu thread.
+    pc_speaker_volume: u32,
     // The shared master gain (curved volume slider), read each audio pump.
     gain: SharedGain,
     // The shared ReSonique 2 amp multiplier (amp_gain / 10), read each audio pump
     // and applied to the card's sources only (not the PC speaker). Separate atomic
     // from `gain` so the two stay lock-free and independently updatable.
     amp: SharedGain,
+    // The shared PC speaker gain (pc_speaker_volume / 100), read each audio pump
+    // and applied to the speaker only.
+    speaker_vol: SharedGain,
     // Distira/Glide render worker count. Persisted in the GUI prefs and applied
     // live to the emulation thread.
     glide_render_threads: u8,
@@ -1278,8 +1296,10 @@ struct ConfigDialog {
     fullscreen: KeyBinding,
     glide_threads: u8,
     crt_style: CrtStyle,
-    // ReSonique 2 amp gain in tenths (30 = 3.0x); see GuiApp::amp_gain.
+    // ReSonique 2 amp gain in tenths (120 = 12.0x); see GuiApp::amp_gain.
     amp_gain: u32,
+    // PC speaker volume percent (100 = full, 0 = muted); see GuiApp::pc_speaker_volume.
+    pc_speaker_volume: u32,
     // The binding awaiting a key press, set when the user clicks a rebind button.
     capturing: Option<BindTarget>,
 }
@@ -1321,6 +1341,8 @@ impl GuiApp {
         let fullscreen_key = prefs.fullscreen.clone();
         let gain = SharedGain::new(volume_gain(volume));
         let amp = SharedGain::new(amp_multiplier(amp_gain));
+        let pc_speaker_volume = prefs.pc_speaker_volume;
+        let speaker_vol = SharedGain::new(speaker_multiplier(pc_speaker_volume));
         // Restore the last floppy mount if the source still exists on disk.
         let floppy_source = restore_floppy_source(&prefs);
         let panel_open = prefs.panel_open;
@@ -1360,8 +1382,10 @@ impl GuiApp {
             show_license: false,
             volume,
             amp_gain,
+            pc_speaker_volume,
             gain,
             amp,
+            speaker_vol,
             glide_render_threads,
             crt_style,
             input_release,
@@ -1409,6 +1433,7 @@ impl GuiApp {
             self.rtc_setup.clone(),
             self.gain.clone(),
             self.amp.clone(),
+            self.speaker_vol.clone(),
             self.glide_render_threads,
         ));
         self.frame_seq = u64::MAX;
@@ -1921,6 +1946,7 @@ impl GuiApp {
             glide_threads: self.glide_render_threads,
             crt_style: self.crt_style,
             amp_gain: self.amp_gain,
+            pc_speaker_volume: self.pc_speaker_volume,
             capturing: None,
         });
     }
@@ -2044,6 +2070,24 @@ impl GuiApp {
                                  game's sound is too quiet, lower if it clips.",
                             );
                         });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("PC speaker volume");
+                            ui.add(
+                                egui::Slider::new(&mut dialog.pc_speaker_volume, 0..=100)
+                                    .custom_formatter(|n, _| {
+                                        if n <= 0.0 {
+                                            "Muted".to_string()
+                                        } else {
+                                            format!("{n:.0}%")
+                                        }
+                                    }),
+                            )
+                            .on_hover_text(
+                                "Volume of the motherboard PC speaker (the beeps), separate \
+                                 from the sound card. Set to 0 to mute it.",
+                            );
+                        });
                     });
 
                     ui.add_space(14.0);
@@ -2084,6 +2128,13 @@ impl GuiApp {
             self.amp_gain = dialog.amp_gain;
             self.prefs.amp_gain = dialog.amp_gain;
             self.amp.set(amp_multiplier(self.amp_gain));
+        }
+        // PC speaker volume: same live-update path as the amp gain.
+        if dialog.pc_speaker_volume != self.pc_speaker_volume {
+            self.pc_speaker_volume = dialog.pc_speaker_volume;
+            self.prefs.pc_speaker_volume = dialog.pc_speaker_volume;
+            self.speaker_vol
+                .set(speaker_multiplier(self.pc_speaker_volume));
         }
         if dialog.glide_threads != self.glide_render_threads {
             // Updates the field, prefs, and emulation thread, and persists.
