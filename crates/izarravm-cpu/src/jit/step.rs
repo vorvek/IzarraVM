@@ -54,6 +54,10 @@ pub(crate) enum SlotKind {
     /// group/opcode dispatch chain) instead of the general `execute_hot_cached_or_decoded`. Stage 1
     /// of the Round 3 byte-load template: dispatch removal only, bit-identical in every mode.
     MemLoadU8,
+    /// A `mov [mem], r8` byte store (opcode 0x88, memory operand). Like `MemLoadU8` but `region_step`
+    /// calls the specialized `jit_execute_store_u8`. `write_memory_u8` runs `note_code_write`, so the
+    /// SMC code-write watch is inherited; dispatch removal only, bit-identical in every mode.
+    MemStoreU8,
     /// The final rel8 Jcc back-edge (taken = loop, not-taken = LoopDone).
     BackEdge,
 }
@@ -235,9 +239,10 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
     match cpu
         .charge_cached_fetch(bus, lin, insn.len)
         .and_then(|()| match kind {
-            // Byte-load slots skip the group/opcode dispatch chain via the specialized executor;
-            // every other slot takes the full dispatch. Both are interpreter-identical.
+            // Byte load/store slots skip the group/opcode dispatch chain via the specialized
+            // executors; every other slot takes the full dispatch. All are interpreter-identical.
             SlotKind::MemLoadU8 => cpu.jit_execute_load_u8(&insn, bus),
+            SlotKind::MemStoreU8 => cpu.jit_execute_store_u8(&insn, bus),
             _ => cpu.execute_hot_cached_or_decoded(&insn, bus),
         }) {
         Ok(outcome) => {
