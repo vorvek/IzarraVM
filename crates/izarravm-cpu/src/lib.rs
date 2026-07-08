@@ -2320,13 +2320,20 @@ impl DecodeCache {
         line.generation == self.generation && line.tag == lin && line.d == d
     }
 
-    /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow
-    /// SMC kill inside its span; the next probe misses and re-admission refreshes the slots).
+    /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow SMC
+    /// kill inside its span or a mode-key mismatch; the next probe misses and re-admission refreshes
+    /// the slots). The line was hot enough to carry a region and is being unstamped because the
+    /// region went STALE, not because it cooled, so prime the hotness counter to re-fire admission on
+    /// the very next continuation (one interpreted iteration, then re-admit reusing the region's
+    /// table slot). Without this, the fire-once counter stays pinned at the threshold and, under pure
+    /// auto-admit (no forced address to re-trigger `try_admit`), a self-patching or mode-switching
+    /// loop would de-JIT permanently.
     #[cfg(feature = "jit")]
     fn unstamp_region(&mut self, lin: u32, d: bool) {
         let line = &mut self.lines[(lin & self.mask) as usize];
         if line.generation == self.generation && line.tag == lin && line.d == d {
             line.jit_region = None;
+            line.jit_hotness = JIT_HOTNESS_THRESHOLD.saturating_sub(1);
         }
     }
 
@@ -34278,6 +34285,44 @@ mod tests {
                 "a cleared table must leave no resolvable stamp"
             );
             assert_eq!(cpu.jit_regions.len(), 0);
+        }
+
+        /// `run_region` unstamps a stale region (SMC epoch / mode-key mismatch) while leaving the
+        /// entry line LIVE - no generation bump, no re-decode - so its hotness counter is NOT reset
+        /// by `put`. Without `unstamp_region` re-priming it, the fire-once counter stays pinned at
+        /// the threshold and, under pure auto-admit (no forced address to re-trigger `try_admit`),
+        /// the loop de-JITs permanently. This tests the primitive directly: an unstamp of a live,
+        /// hot line must leave it ready to re-fire admission on the very next miss. (An integration
+        /// test cannot reliably reach this state - the drawcolumn self-patcher and a segment reload
+        /// both bump the decode generation, which re-decodes the entry line and resets hotness via
+        /// `put`, masking the gap.)
+        #[test]
+        fn unstamp_reprimes_hotness_so_a_stale_region_re_admits() {
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program());
+            // Warm the ENTRY line so its decode is live (auto-admit off, so hotness stays 0).
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            // Drive the counter across the threshold (fires once), then confirm it is pinned.
+            let mut fired = false;
+            for _ in 0..64 {
+                fired |= cpu.decode_cache.note_hot_miss(ENTRY, true);
+            }
+            assert!(
+                fired,
+                "hotness crosses the threshold and fires admission once"
+            );
+            assert!(
+                !cpu.decode_cache.note_hot_miss(ENTRY, true),
+                "the fire-once counter is pinned after firing"
+            );
+            // Unstamping a live line (run_region's stale-region path) must re-prime it, so the very
+            // next miss re-fires. Without the fix this stays false and the loop never re-admits.
+            cpu.decode_cache.unstamp_region(ENTRY, true);
+            assert!(
+                cpu.decode_cache.note_hot_miss(ENTRY, true),
+                "unstamp re-primes hotness so the next miss re-fires admission"
+            );
         }
     }
 

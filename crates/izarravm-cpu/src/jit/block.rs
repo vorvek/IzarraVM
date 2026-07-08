@@ -661,8 +661,11 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
             region.buf = buf;
         } else {
             // W^X alloc failed (unsupported host): drop the region so admission does not point at
-            // stale emitted bytes. The caller treats None as "not admitted" and interprets instead.
+            // stale emitted bytes, and bump the decode generation so no other line keeps a stamp
+            // into the now-empty table (the clear() contract). The caller treats None as "not
+            // admitted" and interprets instead.
             cpu.jit_regions.clear();
+            cpu.decode_cache.invalidate();
             return None;
         }
         return Some(idx);
