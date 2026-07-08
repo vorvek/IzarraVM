@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Forward the CPU's P3 template JIT so a headless run can compile hot loops. Off by default.
+jit = ["izarravm-cpu/jit"]
+
 [dependencies]
 thiserror.workspace = true
 izarravm-audio = { path = "../izarravm-audio" }

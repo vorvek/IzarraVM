@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Build the binary with the CPU template JIT. `IZARRAVM_JIT=1` then turns on auto-admission at
+# runtime so the headless game anchors can be measured with the JIT active.
+jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
+
 [dependencies]
 clap.workspace = true
 egui.workspace = true
