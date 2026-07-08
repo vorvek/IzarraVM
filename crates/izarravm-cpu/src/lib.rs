@@ -1034,6 +1034,11 @@ pub struct PerfCounters {
     /// without the `jit` feature) so perf-row consumers need no feature gymnastics.
     pub jit_region_entries: u64,
     pub jit_region_insns: u64,
+    /// Times the compiled-region table hit its capacity and was dropped wholesale (a coarse GC;
+    /// see `JIT_REGION_TABLE_CAP`). Nonzero means the working set of hot loops exceeded the cap and
+    /// the JIT is re-warming - a signal to raise the cap or add per-entry eviction. Zero on the
+    /// single-phase anchors. Always present (zero without the `jit` feature).
+    pub jit_table_clears: u64,
     pub data_direct_reads: u64,
     pub data_slow_reads: u64,
     pub data_direct_writes: u64,
@@ -1983,6 +1988,13 @@ fn decode_cache_lines() -> usize {
     })
 }
 
+/// Continuation misses on one line before hotness-driven admission compiles it (feature `jit`).
+/// A hot self-loop head is hit once per iteration, so it admits after this many iterations; a cold
+/// one-shot line never reaches it. 32 is early enough to catch a real loop within one batch and high
+/// enough that transient warm-up code is not compiled. Only consulted when `jit_auto_admit` is on.
+#[cfg(feature = "jit")]
+const JIT_HOTNESS_THRESHOLD: u16 = 32;
+
 /// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
 /// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
 /// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
@@ -2030,6 +2042,12 @@ struct DecodeLine {
     /// re-decode (generation bump, SMC) drops the stale region for free.
     #[cfg(feature = "jit")]
     jit_region: Option<std::num::NonZeroU32>,
+    /// Miss counter for hotness-driven admission (feature `jit`): each continuation that reaches
+    /// this line without a stamped region bumps it, and admission fires once it hits
+    /// `JIT_HOTNESS_THRESHOLD`. Reset to 0 on every `put` (a re-decoded line restarts its count),
+    /// so a cold one-shot line never reaches the threshold.
+    #[cfg(feature = "jit")]
+    jit_hotness: u16,
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
@@ -2230,6 +2248,8 @@ impl DecodeCache {
             phys_start: phys,
             #[cfg(feature = "jit")]
             jit_region: None,
+            #[cfg(feature = "jit")]
+            jit_hotness: 0,
         };
     }
 
@@ -2319,6 +2339,26 @@ impl DecodeCache {
         let line = &mut self.lines[(lin & self.mask) as usize];
         if line.generation == self.generation && line.tag == lin && line.d == d {
             line.jit_region = Some(idx);
+        }
+    }
+
+    /// Bump the hotness miss counter for the live line at `lin` and report whether it just crossed
+    /// `JIT_HOTNESS_THRESHOLD`. Fires EXACTLY ONCE (at the crossing) and then pins the counter at the
+    /// threshold, so a line that fails to compile is not re-attempted every continuation. A no-op
+    /// returning false when the line is not live for this key (the caller has just decoded it via
+    /// `get`, so normally it is). Cheap: one array index + a compare + a conditional increment.
+    #[cfg(feature = "jit")]
+    fn note_hot_miss(&mut self, lin: u32, d: bool) -> bool {
+        let line = &mut self.lines[(lin & self.mask) as usize];
+        if line.generation == self.generation
+            && line.tag == lin
+            && line.d == d
+            && line.jit_hotness < JIT_HOTNESS_THRESHOLD
+        {
+            line.jit_hotness += 1;
+            line.jit_hotness == JIT_HOTNESS_THRESHOLD
+        } else {
+            false
         }
     }
 
@@ -3564,9 +3604,18 @@ impl Cpu386 {
         })
     }
 
-    /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on
-    /// the forced admission address) try to compile/re-stamp one first. `Ok(None)` means "no
-    /// region ran"; the caller falls back to the interpreted continuation.
+    /// Enable or disable hotness-driven JIT admission (feature `jit`). Off by default; the CLI/GUI
+    /// turns it on to run the JIT on real workloads. Independent of the forced-address override.
+    /// Lives on the region table (a transparent accelerator excluded from CPU equality), so setting
+    /// it never makes an otherwise-identical CPU compare unequal.
+    #[cfg(feature = "jit")]
+    pub fn set_jit_auto_admit(&mut self, on: bool) {
+        self.jit_regions.set_auto_admit(on);
+    }
+
+    /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
+    /// forced admission address, or once a line is hot enough) compile/re-stamp one first. `Ok(None)`
+    /// means "no region ran"; the caller falls back to the interpreted continuation.
     #[cfg(feature = "jit")]
     fn try_region_continuation<B: CpuBus>(
         &mut self,
@@ -3580,11 +3629,12 @@ impl Cpu386 {
         let idx = match self.decode_cache.region_at(lin, d) {
             Some(idx) => idx,
             None => {
-                // Forced admission (spike): only the IZARRAVM_JIT_REGION address is ever
-                // compiled, so this compare is the entire admission cost on the miss path. The
-                // builder is general (any hot PC compiles a real basic block); the hotness policy
-                // that would drive automatic admission is a later stage.
-                if jit_forced_region_lin() != Some(lin) {
+                // Admit when either the forced-address override names this line (the spike/test
+                // path) or hotness admission is enabled and this line's miss counter just crossed
+                // the threshold. Both are cheap: a compare and a counter bump. When neither fires,
+                // this branch is the whole per-continuation dispatch cost on the miss path.
+                let hot = self.jit_regions.auto_admit() && self.decode_cache.note_hot_miss(lin, d);
+                if jit_forced_region_lin() != Some(lin) && !hot {
                     return Ok(None);
                 }
                 let Some(idx) = jit::block::try_admit(self, lin, d) else {
@@ -13933,9 +13983,10 @@ mod tests {
         // fields for alignment). The emitter handles any value (it bakes `offset_of!` at emit
         // time, verified by the differential suites jit_region + jit_general); this assertion
         // freezes the known position so a change is visible. The constant tracks the live layout
-        // (the prior 472 was stale before this branch ran the full `--features jit` suite).
+        // (456 -> 464 when Round 1 added the `jit_table_clears` u64 to PerfCounters, which precedes
+        // `registers`; the emitter re-reads the offset, so this is a documentation update).
         assert_eq!(
-            off, 456,
+            off, 464,
             "Cpu386.registers offset moved; update the emitter's baked offset"
         );
     }
@@ -33455,6 +33506,15 @@ mod tests {
             m
         }
 
+        /// `program()` in a `size`-byte buffer, for loops that advance edi (stride 0xa0) past the
+        /// 0x1000 the bare program occupies - hotness needs to run more iterations than that fits.
+        fn program_in(size: usize) -> Vec<u8> {
+            let mut m = vec![0u8; size];
+            let p = program();
+            m[..p.len()].copy_from_slice(&p);
+            m
+        }
+
         fn fresh_cpu(ds_limit: u32) -> Cpu386 {
             let mut cpu = Cpu386::default();
             cpu.set_level(CpuLevel::I586);
@@ -34149,6 +34209,75 @@ mod tests {
             eprintln!(
                 "drawcolumn region baseline: {best:.0} ns/iter (15 insns), representative harness"
             );
+        }
+
+        /// Round 1 hotness admission: with `set_jit_auto_admit(true)` and NO manual `try_admit`, a
+        /// hot loop compiles itself once its entry line crosses JIT_HOTNESS_THRESHOLD, and the
+        /// auto-admitted region stays byte-identical to the interpreter. The interp CPU (auto-admit
+        /// off) never compiles, proving the flag gates it.
+        #[test]
+        fn hotness_admission_compiles_a_hot_loop_and_stays_identical() {
+            let mut interp = fresh_cpu(0xffff);
+            let mut jit_cpu = fresh_cpu(0xffff);
+            jit_cpu.set_jit_auto_admit(true);
+            // A 64 KB buffer holds the ~0x2D00 that edi reaches over 64 iterations (0x500 + 64*0xa0).
+            let mut bus_i = TestBus::with_memory(program_in(0x1_0000));
+            let mut bus_j = TestBus::with_memory(program_in(0x1_0000));
+            // 64 iterations: past the threshold (32), so the loop auto-admits mid-run and the region
+            // runs the remaining iterations.
+            arm_loop(&mut interp, &mut bus_i, 64);
+            arm_loop(&mut jit_cpu, &mut bus_j, 64);
+            let ci = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+            let cj = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
+            assert_eq!(ci, cj, "hotness admission: per-run outcomes diverged");
+            assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
+            assert!(
+                jit_cpu.perf_counters().jit_region_entries > 0,
+                "the hot loop auto-admitted and ran a region"
+            );
+            assert_eq!(
+                interp.perf_counters().jit_region_entries,
+                0,
+                "auto-admit off: the interpreter never compiles"
+            );
+        }
+
+        /// Auto-admit stays OFF by default: the same hot loop, without `set_jit_auto_admit`, never
+        /// compiles (so existing manual-admission tests and default runs are undisturbed).
+        #[test]
+        fn no_auto_admit_by_default() {
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program_in(0x1_0000));
+            arm_loop(&mut cpu, &mut bus, 64);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            assert_eq!(
+                cpu.perf_counters().jit_region_entries,
+                0,
+                "no region should compile without auto-admit or the forced address"
+            );
+        }
+
+        /// The capacity-GC primitive: `RegionTable::clear` + a decode-generation bump must leave NO
+        /// live stamp pointing into the emptied table, so `try_admit`'s clear-on-full can never
+        /// follow a dangling index. Admit a region, confirm it resolves, clear + invalidate, confirm
+        /// the stamp no longer resolves.
+        #[test]
+        fn clear_and_invalidate_drops_region_stamps() {
+            let mut cpu = fresh_cpu(0xffff);
+            let mut bus = TestBus::with_memory(program());
+            arm_loop(&mut cpu, &mut bus, 2);
+            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+            let idx = jit::block::try_admit(&mut cpu, ENTRY, true).expect("admit");
+            cpu.decode_cache.stamp_region(ENTRY, true, idx);
+            assert_eq!(cpu.decode_cache.region_at(ENTRY, true), Some(idx));
+            cpu.jit_regions.clear();
+            cpu.decode_cache.invalidate();
+            assert_eq!(
+                cpu.decode_cache.region_at(ENTRY, true),
+                None,
+                "a cleared table must leave no resolvable stamp"
+            );
+            assert_eq!(cpu.jit_regions.len(), 0);
         }
     }
 
