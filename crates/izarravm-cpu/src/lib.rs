@@ -4596,6 +4596,36 @@ impl Cpu386 {
         self.execute_hot_cached_or_decoded(insn, bus)
     }
 
+    /// Specialized `mov [mem], r8` (0x88) execute for a JIT `MemStoreU8` slot: the exact body of
+    /// `execute_hot_cached_datamove`'s 0x88 arm, reached WITHOUT the group/opcode dispatch chain.
+    /// Bit-identical to the interpreter by construction — same `resolve_memory_addr_mode` /
+    /// `read_gpr8` / `write_memory_u8` / `clocks(2)`. In particular `write_memory_u8` runs
+    /// `note_code_write` on every store, so the SMC code-write watch (Round 3 trap #2) is inherited
+    /// for free, along with the segment/paging/fault/BusTrace behavior, in every CPU mode. Any shape
+    /// the classifier did not intend falls back to the full dispatch, so the result is identical.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_execute_store_u8<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        if insn.opcode == 0x88 {
+            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
+                let memory = self.resolve_memory_addr_mode(&addr);
+                let value = self.read_gpr8(modrm.reg);
+                self.write_memory_u8(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    value,
+                    BusAccessKind::DataWrite,
+                )?;
+                return Ok(clocks(2));
+            }
+        }
+        self.execute_hot_cached_or_decoded(insn, bus)
+    }
+
     #[inline]
     fn execute_hot_cached_flags_misc<B: CpuBus>(
         &mut self,
@@ -35273,6 +35303,41 @@ mod tests {
                 interp.registers.eip >= H_GP_HANDLER,
                 "the byte load must have #GP'd into the handler, eip={:#x}",
                 interp.registers.eip
+            );
+        }
+
+        // ---- Round 3 byte-STORE template (stage 1: dispatch removal) ----
+
+        /// The classifier must route the loop's `mov [edi],al` (opcode 0x88, memory operand) to
+        /// `SlotKind::MemStoreU8`, so `jit_execute_store_u8` runs instead of the full dispatch. This
+        /// pins the routing itself is live. The store's FAULT path is exercised in-region by
+        /// `harness_mid_loop_fault_delivers_identically` (edi runs off the DS limit, so the faulting
+        /// access is the store, past the admission threshold). The SMC (note_code_write) behavior is
+        /// inherited STRUCTURALLY, not by a dynamic in-region test: `jit_execute_store_u8`'s only store
+        /// is `write_memory_u8`, which runs `note_code_write` unconditionally, so the template cannot
+        /// diverge on a code-write regardless of which path executes it;
+        /// `harness_self_modifying_store_stays_identical` covers the churn (the region may stay cold).
+        #[test]
+        fn byte_store_slot_is_classified_memstoreu8() {
+            let mut cpu = fresh();
+            let mut bus = TestBus::with_memory({
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&2u32.to_le_bytes());
+                m
+            });
+            h_arm(0x2000, 0x3000)(&mut cpu);
+            drive_to_halt(&mut cpu, &mut bus); // warm the loop's decode lines
+            let idx = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("admit the copy loop");
+            let region = cpu.jit_regions.get_mut(idx).unwrap();
+            let store_slots = region
+                .ctx
+                .slots
+                .iter()
+                .filter(|s| s.kind == jit::step::SlotKind::MemStoreU8)
+                .count();
+            assert_eq!(
+                store_slots, 1,
+                "the `mov [edi],al` slot must classify as MemStoreU8 (got {store_slots})"
             );
         }
     }

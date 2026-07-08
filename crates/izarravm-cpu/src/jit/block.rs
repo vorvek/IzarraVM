@@ -74,6 +74,11 @@ fn classify_slot(insn: &DecodedInsn) -> SlotKind {
     if insn.opcode == 0x8a && matches!(insn.operand, Some(DecodedOperand::Mem(_))) {
         return SlotKind::MemLoadU8;
     }
+    // `mov [mem], r8` (0x88 with a memory operand): the byte-store executor. The register form
+    // (0x88 mode 3) has a Reg operand, not Mem, so it stays on the full step.
+    if insn.opcode == 0x88 && matches!(insn.operand, Some(DecodedOperand::Mem(_))) {
+        return SlotKind::MemStoreU8;
+    }
     let Some(m) = insn.modrm else {
         // A modrm-less interior op (push/pop/nop/int-free single-byte forms) has no inline
         // template yet; run it through the full step. (The terminal back-edge Jcc is classified
@@ -350,7 +355,7 @@ fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32) -> Vec<u8> {
                 emit_set_shift_flags_shr_call(&mut e, count);
                 bookkeeping(&mut e);
             }
-            SlotKind::Memory | SlotKind::BackEdge | SlotKind::MemLoadU8 => {
+            SlotKind::Memory | SlotKind::BackEdge | SlotKind::MemLoadU8 | SlotKind::MemStoreU8 => {
                 emit_full_step_call(&mut e, k32);
                 e.test_al_al();
                 e.jnz(exit);
