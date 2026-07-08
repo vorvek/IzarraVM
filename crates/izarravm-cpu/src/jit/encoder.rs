@@ -361,6 +361,88 @@ impl Encoder {
         self.bytes.push(count);
     }
 
+    /// `and dst32, imm32` (81 /4 id, no REX.W) -- the 32-bit AND-immediate form. Used by the native
+    /// memory probe to page-align a guest address (`& !0x0fff`), extract a page offset (`& 0x0fff`),
+    /// and mask a page-cache slot index (`& (LINES-1)`). ModRM reg field is /4, distinct from add's
+    /// /0. Zero-extends the result to 64 bits (any 32-bit op clears the host register's upper half).
+    pub(crate) fn and_r32_imm32(&mut self, dst: Reg, imm: u32) {
+        if dst.ext() {
+            self.rex(false, false, false, dst.ext());
+        }
+        self.bytes.push(0x81);
+        self.modrm(0b11, 4, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `shl dst32, imm8` (C1 /4 ib, no REX.W) -- the 32-bit logical left shift by an immediate, the
+    /// mirror of `shr_r32_imm8` (ModRM reg /4 vs shr's /5). Used by the native memory probe to scale
+    /// a page-cache slot index by the entry size (`slot * 16` = `shl 4`).
+    pub(crate) fn shl_r32_imm8(&mut self, dst: Reg, count: u8) {
+        if dst.ext() {
+            self.rex(false, false, false, dst.ext());
+        }
+        self.bytes.push(0xC1);
+        self.modrm(0b11, 4, dst.low3());
+        self.bytes.push(count);
+    }
+
+    /// `add dst32, src32` (01 /r, no REX.W) -- the 32-bit register-register ADD, mirroring
+    /// `mov_r32_r32`'s register/ModRM pattern with opcode 0x01. Used by the native memory probe to
+    /// fold a `[base+index]` guest effective address (scale 1) into one host register. Sets host
+    /// flags, but the emitted probe does not read them.
+    pub(crate) fn add_r32_r32(&mut self, dst: Reg, src: Reg) {
+        if src.ext() || dst.ext() {
+            self.rex(false, src.ext(), false, dst.ext());
+        }
+        self.bytes.push(0x01);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W) -- load a
+    /// byte from `[base + index]` and zero-extend it to 32 bits (clearing the host register's upper 64
+    /// bits). The native byte-load probe uses this for the final deref off the host page pointer plus
+    /// the in-page offset. Same SIB constraints as `load_r32_sib`: base must not be RBP/R13 (SIB
+    /// base=101, mod=00 means "disp32, no base") and index must not be RSP (SIB index=100 means "no
+    /// index").
+    pub(crate) fn movzx_r32_byte_sib(&mut self, dst: Reg, base: Reg, index: Reg) {
+        assert!(base.low3() != 0b101, "SIB base RBP/R13 needs a disp form");
+        assert!(index.low3() != 0b100, "SIB index RSP means no-index");
+        if dst.ext() || index.ext() || base.ext() {
+            self.rex(false, dst.ext(), index.ext(), base.ext());
+        }
+        self.bytes.push(0x0F);
+        self.bytes.push(0xB6);
+        self.modrm(0b00, dst.low3(), 0b100); // rm=100 -> a SIB byte follows
+        self.bytes.push((index.low3() << 3) | base.low3()); // scale=00
+    }
+
+    /// `mov [base + disp8], src8` (88 /r, mod=01 disp8, SIB if `base` is RSP/R12) -- store the low
+    /// byte of `src` to `[base + disp8]`. The native byte-load probe uses this to write a loaded byte
+    /// into a guest register's byte lane in the `Registers` array (low byte at `4*i`, high byte at
+    /// `4*(i-4)+1`), which IS the `write_gpr8` semantics (the surrounding 24/16 bits are untouched).
+    /// `src` must be one of RAX/RCX/RDX/RBX (low3 < 4): those name AL/CL/DL/BL with no REX; a
+    /// register with low3 >= 4 (SPL/BPL/SIL/DIL) would need a REX prefix to name its low byte, which
+    /// this form does not emit (the probe only ever passes a scratch in that range).
+    pub(crate) fn store_r8_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
+        // A hard assert (not debug_assert), matching this file's SIB guards: the REX logic below only
+        // consults `base`, so a src with low3 >= 4 would silently encode the wrong byte register
+        // (e.g. RSI -> `mov [rax],dh` with no REX) - a wrong-code bug with no runtime signal. Must
+        // fail in release too, since the emitter runs in the release JIT.
+        assert!(
+            src.low3() < 4 && !src.ext(),
+            "store_r8_disp8 src must be AL/CL/DL/BL (no REX byte-register)"
+        );
+        if base.ext() {
+            self.rex(false, false, false, base.ext());
+        }
+        self.bytes.push(0x88);
+        self.modrm(0b01, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
     /// `xor dst64, dst64` (REX.W + 31 /r), the standard zero-register idiom.
     pub(crate) fn xor_r64_self(&mut self, dst: Reg) {
         self.rex(true, dst.ext(), false, dst.ext());
@@ -695,6 +777,121 @@ mod tests {
         let mut e = Encoder::new();
         e.shr_r32_imm8(Reg::RCX, 25);
         assert_eq!(e.finish(), vec![0xC1, 0xE9, 0x19]);
+    }
+
+    #[test]
+    fn and_r32_imm32_known_bytes() {
+        // and eax, 0xfffff000 -- no REX, 81 /4 id. ModRM mod=11,reg=4(/4),rm=0(eax) = 0xE0.
+        let mut e = Encoder::new();
+        e.and_r32_imm32(Reg::RAX, 0xffff_f000);
+        assert_eq!(e.finish(), vec![0x81, 0xE0, 0x00, 0xF0, 0xFF, 0xFF]);
+        // and r12d, 0xff -- REX.B (r12 extended). ModRM rm=r12&7=4 -> 0xE4.
+        let mut e = Encoder::new();
+        e.and_r32_imm32(Reg::R12, 0xff);
+        assert_eq!(e.finish(), vec![0x41, 0x81, 0xE4, 0xFF, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn shl_r32_imm8_known_bytes() {
+        // shl eax, 4 -- no REX, C1 /4 ib (reg field /4, vs shr's /5). ModRM 11_100_000 = 0xE0.
+        let mut e = Encoder::new();
+        e.shl_r32_imm8(Reg::RAX, 4);
+        assert_eq!(e.finish(), vec![0xC1, 0xE0, 0x04]);
+    }
+
+    #[test]
+    fn add_r32_r32_known_bytes() {
+        // add eax, ecx -- no REX, 01 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
+        let mut e = Encoder::new();
+        e.add_r32_r32(Reg::RAX, Reg::RCX);
+        assert_eq!(e.finish(), vec![0x01, 0xC8]);
+        // add r12d, r9d -- REX (R from src r9 ext, B from dst r12 ext) = 0x45. ModRM 11_001_100 = 0xCC.
+        let mut e = Encoder::new();
+        e.add_r32_r32(Reg::R12, Reg::R9);
+        assert_eq!(e.finish(), vec![0x45, 0x01, 0xCC]);
+    }
+
+    #[test]
+    fn movzx_r32_byte_sib_known_bytes() {
+        // movzx eax, byte [rsi+rcx] -- no REX. 0F B6; ModRM mod=00,reg=eax(0),rm=100(SIB)=0x04;
+        // SIB scale=0,index=rcx(1),base=rsi(6) = 0x0E.
+        let mut e = Encoder::new();
+        e.movzx_r32_byte_sib(Reg::RAX, Reg::RSI, Reg::RCX);
+        assert_eq!(e.finish(), vec![0x0F, 0xB6, 0x04, 0x0E]);
+        // movzx r11d, byte [r12+r9] -- REX.R(r11)+X(r9)+B(r12) = 0x47; ModRM reg=r11&7=3,rm=100 = 0x1C;
+        // SIB index=r9&7=1,base=r12&7=4 = 0x0C.
+        let mut e = Encoder::new();
+        e.movzx_r32_byte_sib(Reg::R11, Reg::R12, Reg::R9);
+        assert_eq!(e.finish(), vec![0x47, 0x0F, 0xB6, 0x1C, 0x0C]);
+    }
+
+    #[test]
+    fn store_r8_disp8_known_bytes() {
+        // mov [r14+8], al -- REX.B (r14 extended). 88; ModRM mod=01,reg=al(0),rm=r14&7=6 = 0x46; disp 8.
+        let mut e = Encoder::new();
+        e.store_r8_disp8(Reg::R14, 8, Reg::RAX);
+        assert_eq!(e.finish(), vec![0x41, 0x88, 0x46, 0x08]);
+        // mov [r12+8], al -- r12&7=4 forces a SIB byte (0x24). REX.B. ModRM 0x44.
+        let mut e = Encoder::new();
+        e.store_r8_disp8(Reg::R12, 8, Reg::RAX);
+        assert_eq!(e.finish(), vec![0x41, 0x88, 0x44, 0x24, 0x08]);
+        // mov [rax+1], cl -- no REX, no SIB. ModRM mod=01,reg=cl(1),rm=rax(0) = 0x48; disp 1.
+        let mut e = Encoder::new();
+        e.store_r8_disp8(Reg::RAX, 1, Reg::RCX);
+        assert_eq!(e.finish(), vec![0x88, 0x48, 0x01]);
+    }
+
+    #[test]
+    fn movzx_byte_sib_reads_the_right_byte() {
+        // End-to-end: fn(base, idx) -> i64 returns the zero-extended byte at [base+idx]. Proves the
+        // SIB addressing + zero-extension actually execute, not just the byte shape.
+        use super::super::exec_mem::ExecutableBuffer;
+        let mut e = Encoder::new();
+        #[cfg(windows)]
+        {
+            e.movzx_r32_byte_sib(Reg::RAX, Reg::RCX, Reg::RDX); // win64 arg0=RCX base, arg1=RDX idx
+        }
+        #[cfg(not(windows))]
+        {
+            e.movzx_r32_byte_sib(Reg::RAX, Reg::RDI, Reg::RSI); // sysv arg0=RDI base, arg1=RSI idx
+        }
+        e.ret();
+        let bytes = e.finish();
+        let buf = ExecutableBuffer::new(&bytes).expect("alloc must succeed on a supported host");
+        let f: extern "C" fn(*const u8, i64) -> i64 =
+            unsafe { std::mem::transmute(buf.entry_ptr()) };
+        let data = [0x11u8, 0x22, 0x33, 0xAB, 0x55];
+        assert_eq!(f(data.as_ptr(), 3), 0xAB);
+        assert_eq!(f(data.as_ptr(), 0), 0x11);
+    }
+
+    #[test]
+    fn store_r8_writes_only_the_low_byte() {
+        // End-to-end: fn(dst, val) stores the low byte of `val` to dst[1], leaving dst[0]/dst[2]
+        // untouched -- the write_gpr8 byte-lane semantics the probe relies on.
+        use super::super::exec_mem::ExecutableBuffer;
+        let mut e = Encoder::new();
+        #[cfg(windows)]
+        {
+            e.mov_r32_r32(Reg::RAX, Reg::RDX); // val -> EAX (AL = low byte); dst is RCX
+            e.store_r8_disp8(Reg::RCX, 1, Reg::RAX);
+        }
+        #[cfg(not(windows))]
+        {
+            e.mov_r32_r32(Reg::RAX, Reg::RSI); // val -> EAX (AL = low byte); dst is RDI
+            e.store_r8_disp8(Reg::RDI, 1, Reg::RAX);
+        }
+        e.ret();
+        let bytes = e.finish();
+        let buf = ExecutableBuffer::new(&bytes).expect("alloc must succeed on a supported host");
+        let f: extern "C" fn(*mut u8, i64) = unsafe { std::mem::transmute(buf.entry_ptr()) };
+        let mut data = [0xEEu8, 0xEE, 0xEE];
+        f(data.as_mut_ptr(), 0x1234_567A);
+        assert_eq!(
+            data,
+            [0xEE, 0x7A, 0xEE],
+            "only dst[1]'s low byte should change"
+        );
     }
 
     #[test]
