@@ -203,6 +203,7 @@ mod tests {
                 exit: Default::default(),
                 fault: None,
                 halted: false,
+                folded_raw_bus: 0,
             }),
             entry_lin,
             d,
