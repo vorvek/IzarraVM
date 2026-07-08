@@ -35376,6 +35376,135 @@ mod tests {
             );
         }
 
+        // ---- Round 3 PAGED differential harness ----
+        //
+        // The real-mode harness above runs with paging OFF (linear == physical). The Round 3 native
+        // memory probe's #1 correctness trap (re-plan trap #1) is that the direct-page cache is
+        // PHYSICAL-keyed while the guest address is LINEAR, so in paged mode a probe that indexes the
+        // cache with the linear address reads the WRONG physical frame. A harness with an IDENTITY map
+        // cannot catch that. This one runs the same byte-copy self-loop in 32-bit protected mode with
+        // paging ON and a deliberately NON-IDENTITY linear->physical map, so a linear-indexed probe
+        // would diverge. Today (trampoline, memory routed through the interpreter leaf) it is
+        // bit-identical incl. timing; it gates the paged probe when that lands. The Doom/Quake anchors
+        // run paged (137M page-table walks per Doom timedemo), so this is the mode the probe must win
+        // in - the unpaged fast path never runs on them.
+        //
+        // Physical image (256 KiB): page directory at 0x1000, page table at 0x2000 (PDE[0], covers
+        // linear 0..4 MiB), the code frame at 0x8000, the data frame at 0x9000. Linear 0x10000 maps to
+        // phys 0x8000 (page index 0x10 vs frame 0x8) and linear 0x30000 to phys 0x9000 (0x30 vs 0x9) -
+        // the indices differ, so the map is genuinely non-identity.
+        const PG_CODE_LIN: u32 = 0x10000;
+        const PG_CODE_PHYS: usize = 0x8000;
+        const PG_DATA_LIN: u32 = 0x30000;
+        const PG_DATA_PHYS: usize = 0x9000;
+        const PG_ENTRY_LIN: u32 = PG_CODE_LIN + 1; // loop head, after the nop starter
+        const PG_SRC_LIN: u32 = PG_DATA_LIN; // esi
+        const PG_DST_LIN: u32 = PG_DATA_LIN + 0x800; // edi
+        const PG_COUNT_LIN: u32 = PG_DATA_LIN + 0x400; // dec dword [PG_COUNT_LIN]
+
+        /// The `h_copy_program` byte-copy self-loop, assembled to run at `PG_CODE_LIN` in 32-bit
+        /// protected paged mode with the non-identity map above. `count` seeds the loop counter.
+        fn paged_copy_program(count: u32) -> Vec<u8> {
+            let mut m = vec![0u8; 0x40000];
+            // PDE[0] -> PT at phys 0x2000 (present + rw + user).
+            m[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+            // PTE[linear>>12] for the code and data pages (frame + present + rw + user).
+            let code_pte = 0x2000 + (PG_CODE_LIN as usize >> 12) * 4;
+            m[code_pte..code_pte + 4]
+                .copy_from_slice(&((PG_CODE_PHYS as u32) | 0x007).to_le_bytes());
+            let data_pte = 0x2000 + (PG_DATA_LIN as usize >> 12) * 4;
+            m[data_pte..data_pte + 4]
+                .copy_from_slice(&((PG_DATA_PHYS as u32) | 0x007).to_le_bytes());
+            // Code at phys 0x8000 (= linear 0x10000): nop starter, then the loop body.
+            m[PG_CODE_PHYS] = 0x90; // nop -> PG_ENTRY_LIN reached as a continuation
+            let body: [u8; 13] = [
+                0x8a, 0x06, // mov al,[esi]
+                0x88, 0x07, // mov [edi],al
+                0x46, // inc esi
+                0x47, // inc edi
+                0xff, 0x0d, 0x00, 0x00, 0x00, 0x00, // dec dword [disp32] (disp filled below)
+                0x75, // jnz rel8 (rel filled below)
+            ];
+            let body_at = PG_CODE_PHYS + 1;
+            m[body_at..body_at + body.len()].copy_from_slice(&body);
+            m[body_at + 8..body_at + 12].copy_from_slice(&PG_COUNT_LIN.to_le_bytes());
+            let rel_at = body_at + body.len(); // the rel8 byte
+            let after = PG_CODE_LIN as i32 + (rel_at as i32 - PG_CODE_PHYS as i32) + 1;
+            m[rel_at] = (PG_ENTRY_LIN as i32 - after) as i8 as u8;
+            m[rel_at + 1] = 0xf4; // hlt at the loop fall-through
+            let count_phys = PG_DATA_PHYS + (PG_COUNT_LIN - PG_DATA_LIN) as usize;
+            m[count_phys..count_phys + 4].copy_from_slice(&count.to_le_bytes());
+            m
+        }
+
+        /// Arm a CPU for `paged_copy_program`: flat 32-bit protected mode, paging on, CPL 0, esi/edi
+        /// at the given linear addresses, and the same non-trivial incoming flags as `h_arm`.
+        fn pg_arm(esi: u32, edi: u32) -> impl Fn(&mut Cpu386) {
+            move |cpu: &mut Cpu386| {
+                let flat = |access: u8| SegmentRegister {
+                    selector: 0x08,
+                    base: 0,
+                    limit: 0xffff_ffff,
+                    access,
+                    default_size_32: true,
+                };
+                cpu.registers.set_segment(SegmentIndex::Cs, flat(0x9b)); // code, exec/read
+                cpu.registers.set_segment(SegmentIndex::Ds, flat(0x93)); // data, r/w
+                cpu.registers.set_segment(SegmentIndex::Ss, flat(0x93));
+                cpu.registers.set_segment(SegmentIndex::Es, flat(0x93));
+                cpu.cpl = 0;
+                cpu.control.cr3 = 0x1000;
+                cpu.control.cr0 |= CR0_PE | CR0_PG;
+                cpu.registers.eip = PG_CODE_LIN;
+                cpu.registers.set_esp(PG_DATA_LIN + 0xf00); // mapped; the loop never touches it
+                cpu.write_gpr32(6, esi); // esi
+                cpu.write_gpr32(7, edi); // edi
+                cpu.materialize_flags();
+                const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+                cpu.registers.eflags =
+                    (cpu.registers.eflags & !ARITH) | FLAG_CF | FLAG_PF | FLAG_AF | FLAG_SF;
+            }
+        }
+
+        /// A 200-iteration byte copy under NON-IDENTITY paging stays byte-identical (state + timing)
+        /// between the interpreter and the auto-admitting JIT, and the JIT runs a real paged region.
+        /// This is the gating harness for the Round 3 paged memory probe: a probe that indexes the
+        /// physical page cache with the linear address (trap #1) would read the wrong frame here and
+        /// diverge, because the linear page and physical frame indices differ.
+        #[test]
+        fn harness_paged_copy_loop_is_identical() {
+            let interp = assert_shape_identical(
+                paged_copy_program(200),
+                &pg_arm(PG_SRC_LIN, PG_DST_LIN),
+                true,
+            );
+            assert!(
+                interp.is_paging_enabled(),
+                "the harness must run with paging enabled"
+            );
+        }
+
+        /// Self-modifying store under paging: `edi` == `esi` == the loop's own first opcode (linear
+        /// PG_ENTRY_LIN), so each iteration reads a code byte and writes it back to the SAME linear
+        /// address through the page tables - firing the physical-keyed SMC watch. The re-decode /
+        /// region re-admit churn must leave both CPUs identical. The region may stay cold under the
+        /// churn, so it is not required to run.
+        #[test]
+        fn harness_paged_self_modifying_store_stays_identical() {
+            let interp = assert_shape_identical(
+                paged_copy_program(40),
+                &pg_arm(PG_ENTRY_LIN, PG_ENTRY_LIN),
+                false,
+            );
+            let pc = interp.perf_counters();
+            assert!(
+                pc.smc_narrow_kills > 0 || pc.decode_inval_smc > 0,
+                "the self-store must have triggered the SMC watch (narrow={}, global={})",
+                pc.smc_narrow_kills,
+                pc.decode_inval_smc
+            );
+        }
+
         // ---- Round 3 byte-LOAD template (stage 1: dispatch removal) ----
 
         /// The classifier must actually route the loop's `mov al,[esi]` (opcode 0x8A, memory operand)
