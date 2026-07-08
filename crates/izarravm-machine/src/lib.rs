@@ -2052,7 +2052,11 @@ impl Machine {
     /// the saved time. Returns false if the image had a bad NVRAM checksum (the
     /// bytes are kept and the checksum is repaired), so the host can log it.
     pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
-        self.rtc.load_nvram(bytes)
+        let valid = self.rtc.load_nvram(bytes);
+        if let Some(mode) = gsw_mode_from_code(self.rtc.nvram_byte(0x12)) {
+            self.set_mode(mode);
+        }
+        valid
     }
 
     /// Whether the guest wrote a CMOS NVRAM byte since the last poll, clearing

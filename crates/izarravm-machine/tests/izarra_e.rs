@@ -185,6 +185,22 @@ fn saved_cmos_gsw_mode_is_applied_at_post() {
 }
 
 #[test]
+fn loaded_cmos_gsw_mode_is_active_before_post() {
+    let mut saved = boot_machine();
+    saved.set_cmos_byte(0x12, 3);
+    let cmos = saved.cmos_bytes();
+
+    let mut machine = boot_machine();
+    assert_eq!(machine.active_mode(), GswMode::Gsw386);
+    assert!(machine.load_cmos(&cmos));
+    assert_eq!(
+        machine.active_mode(),
+        GswMode::Gsw286,
+        "loading persisted CMOS should set the CPU mode before the BIOS runs"
+    );
+}
+
+#[test]
 fn fresh_cmos_seeds_the_profile_speed_code() {
     // The host seeds NVRAM 0x12 from the boot profile, so POST's apply is a
     // same-mode no-op until the user saves a different choice from the BIOS.
