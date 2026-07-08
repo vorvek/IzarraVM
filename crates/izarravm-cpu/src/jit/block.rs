@@ -392,6 +392,77 @@ fn gpr_disp(i: u8) -> i8 {
     (i as i32 * 4) as i8
 }
 
+/// Byte displacement of the 8-bit register `i` (0..8) within `Registers`: AL..BL (0..4) are the low
+/// byte of `gpr[i]` at `4*i`; AH..BH (4..8) are byte 1 of `gpr[i-4]` at `4*(i-4)+1`. Little-endian, so
+/// byte 0 is bits 0-7 and byte 1 is bits 8-15 - exactly the two lanes `write_gpr8` targets.
+#[allow(dead_code)] // used by emit_load_u8_probe, which is wired into emit_region next
+fn gpr8_disp(i: u8) -> i8 {
+    if i < 4 {
+        (i as i32 * 4) as i8
+    } else {
+        ((i - 4) as i32 * 4 + 1) as i8
+    }
+}
+
+/// Emit the native UNPAGED byte-load fast path for `mov r8, [EA]`, where EA is a flat-DS (base 0)
+/// address so linear == physical: `[base]` or `[base + index]` (SIB scale 1) plus a `disp`. The
+/// caller gates this on unpaged + flat DS + scale 1 (else it must emit the interpreter fallback).
+///
+/// ABI (as `emit_region`): R12 = cpu, R14 = regs base (cpu + regs_offset); scratch RAX/RCX/RDX. On a
+/// page-cache HIT it derefs the CPU-side `data_read_pages` host pointer and writes the loaded byte into
+/// `gpr[dst]`'s byte lane (the `write_gpr8` semantics); on a MISS (the physical page is not in the
+/// cache) it jumps to `miss`, where the caller emits the identical interpreter leaf. No bus charge is
+/// emitted here - the cost-fold accounts the fetch + data clocks separately.
+#[allow(dead_code)] // proven in isolation by native_load_probe_reads_the_right_byte; wired next
+pub(crate) fn emit_load_u8_probe(
+    e: &mut Encoder,
+    base: u8,
+    index: Option<u8>,
+    disp: i32,
+    dst: u8,
+    miss: Label,
+) {
+    // The emitted deref hardcodes the entry stride (shl 4 == *16) and the ptr field offset (+8); pin
+    // the layout it assumes so a struct change fails loudly here instead of reading a wrong pointer.
+    debug_assert_eq!(core::mem::size_of::<crate::DirectPageCacheEntry>(), 16);
+    debug_assert_eq!(
+        core::mem::offset_of!(crate::DirectPageCacheEntry, ptr),
+        8,
+        "the deref loads entry.ptr from [entry+8]"
+    );
+
+    // RAX = EA = base [+ index] [+ disp]  (linear == physical for an unpaged flat-DS access).
+    e.load_r32_disp8(Reg::RAX, Reg::R14, gpr_disp(base));
+    if let Some(idx) = index {
+        e.load_r32_disp8(Reg::RCX, Reg::R14, gpr_disp(idx));
+        e.add_r32_r32(Reg::RAX, Reg::RCX);
+    }
+    if disp != 0 {
+        e.add_r32_imm32(Reg::RAX, disp as u32);
+    }
+    // RCX = page = EA & !0x0fff.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.and_r32_imm32(Reg::RCX, 0xffff_f000);
+    // RDX = &data_read_pages.entries[(page >> 12) & (LINES-1)]  (entry stride 16 = shl 4).
+    e.mov_r32_r32(Reg::RDX, Reg::RCX);
+    e.shr_r32_imm8(Reg::RDX, 12);
+    e.and_r32_imm32(Reg::RDX, (crate::DIRECT_PAGE_CACHE_LINES as u32) - 1);
+    e.shl_r32_imm8(Reg::RDX, 4);
+    let entries_off = core::mem::offset_of!(Cpu386, data_read_pages) as u32
+        + core::mem::offset_of!(crate::DirectPageCache, entries) as u32;
+    e.add_r64_imm32(Reg::RDX, entries_off);
+    e.add_r64_r64(Reg::RDX, Reg::R12);
+    // Tag compare: page (RCX) vs entry.physical_page ([RDX+0]); miss on mismatch.
+    e.cmp_r32_disp8(Reg::RCX, Reg::RDX, 0);
+    e.jnz(miss);
+    // HIT: offset = EA & 0x0fff; ptr = entry.ptr ([RDX+8]); byte = *(ptr + offset); write gpr8.
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.and_r32_imm32(Reg::RCX, 0x0fff);
+    e.load_r64_disp8(Reg::RAX, Reg::RDX, 8);
+    e.movzx_r32_byte_sib(Reg::RAX, Reg::RAX, Reg::RCX);
+    e.store_r8_disp8(Reg::R14, gpr8_disp(dst), Reg::RAX);
+}
+
 /// Reload cpu/bus/ctx and the slot index, then `call rbx` (the full region_step). Used by Memory
 /// and BackEdge slots.
 fn emit_full_step_call(e: &mut Encoder, k: u32) {
