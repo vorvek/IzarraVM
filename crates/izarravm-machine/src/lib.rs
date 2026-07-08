@@ -25678,6 +25678,8 @@ mod tests {
     // The EXEC integration fixtures are nasm-assembled .COM programs (nasm 3.01,
     // -f bin, org 0x100). Their source is in the comment above each const so the
     // bytes are auditable without re-running the assembler.
+    const PMIRQ5_COM: &[u8] = include_bytes!("../tests/fixtures/pmirq5.com");
+    const VCPIPIC_COM: &[u8] = include_bytes!("../tests/fixtures/vcpipic.com");
 
     // --- BLASTER environment seeding ---
 
@@ -25850,6 +25852,104 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.program_output(), b"hi");
+    }
+
+    #[test]
+    fn tokados_sndtst_delivers_sb_irq5_under_v86() {
+        let dir = std::env::temp_dir().join(format!("katea_sndtst_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.set_cmos_byte(0x11, 1); // disk-first
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    (
+                        "SNDTST.COM".to_string(),
+                        izarravm_firmware::sndtst_com().to_vec(),
+                    ),
+                    (
+                        "AUTOEXEC.BAT".to_string(),
+                        b"@ECHO OFF\r\nSNDTST\r\n".to_vec(),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(250_000_000).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0xA5 },
+            "SNDTST.COM should complete under TOKAEMM V86, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn tokados_vcpi_de0b_remaps_sb_irq5_vector() {
+        let dir = std::env::temp_dir().join(format!("katea_vcpipic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.set_cmos_byte(0x11, 1); // disk-first
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                    ("VCPIPIC.COM".to_string(), VCPIPIC_COM.to_vec()),
+                    (
+                        "AUTOEXEC.BAT".to_string(),
+                        b"@ECHO OFF\r\nVCPIPIC\r\n".to_vec(),
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(250_000_000).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0xA5 },
+            "VCPIPIC.COM should receive SB IRQ5 on remapped vector 25h, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn protected_mode_sb_dma_irq5_reaches_client_idt() {
+        for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
+            let mut machine = Machine::new_raw_program(
+                MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+                PMIRQ5_COM,
+            )
+            .unwrap();
+            machine.set_mode(mode);
+            let reason = machine
+                .run_until_halt_or_cycles(mode.clock_hz() / 4)
+                .unwrap();
+            assert!(
+                matches!(reason, StopReason::TestExit { code: 0xA5 }),
+                "{mode:?}: protected-mode SB IRQ5 fixture stopped with {reason:?}"
+            );
+        }
     }
 
     #[test]

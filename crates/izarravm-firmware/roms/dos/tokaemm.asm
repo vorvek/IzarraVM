@@ -2631,7 +2631,13 @@ deflt_common:
     mov ax, 0x20
     mov fs, ax
     lea ebp, [esp + 32]
+    call remapped_pic_line
+    jc .irq
     call reflect_vector
+    popad
+    iretd
+.irq:
+    call irq_reflect_line
     popad
     iretd
 
@@ -2862,14 +2868,36 @@ vcpi_dispatch:
     mov byte [esi+29], 0
     ret
 
-.de0b:                            ; set (record) 8259 vector bases from
-    mov ax, [esi+16]              ; BX/CX. Store-and-report: the client did
-    mov [fs:vcpi_pic_master], ax  ; the actual PIC reprogramming itself, and
-    mov ax, [esi+24]              ; a remapped IRQ already reaches the guest
-    mov [fs:vcpi_pic_slave], ax   ; IVT through the null-IDT catch-all gates.
-    mov byte [esi+29], 0          ; Interrupts are off for the whole trap
-    ret                           ; (interrupt gate), satisfying the spec's
-                                  ; log-before-reflecting requirement.
+.de0b:                            ; set 8259 vector bases from BX/CX.
+    in al, 0x21                   ; preserve interrupt masks across ICW init
+    mov bl, al
+    in al, 0xA1
+    mov bh, al
+    mov ax, [esi+16]
+    mov [fs:vcpi_pic_master], ax
+    mov ax, [esi+24]
+    mov [fs:vcpi_pic_slave], ax
+
+    mov al, 0x11
+    out 0x20, al
+    out 0xA0, al
+    mov al, [fs:vcpi_pic_master]
+    out 0x21, al
+    mov al, [fs:vcpi_pic_slave]
+    out 0xA1, al
+    mov al, 0x04                  ; master: slave on IR2
+    out 0x21, al
+    mov al, 0x02                  ; slave id on cascade line 2
+    out 0xA1, al
+    mov al, 0x01                  ; 8086 mode
+    out 0x21, al
+    out 0xA1, al
+    mov al, bl
+    out 0x21, al
+    mov al, bh
+    out 0xA1, al
+    mov byte [esi+29], 0
+    ret
 
 .undef:
     mov byte [esi+29], 0x8F       ; undefined / not-yet-implemented subfunction
@@ -3112,15 +3140,75 @@ irq_eoi:
     out 0x20, al
     ret
 
-; Reflect line EBX to its guest IVT vector: master N -> INT 08h+N, slave N ->
-; INT 70h+(N-8), the DOS-default PIC mapping. Tail-jumps reflect_vector.
+; A default-gate vector can be a software INT or a hardware IRQ after a VCPI
+; client remaps the PIC away from the DOS defaults. If EBX is inside the current
+; master/slave base range and the corresponding PIC ISR bit is set, return CF=1
+; with EBX rewritten to the IRQ line. Otherwise CF=0 and EBX remains a vector.
+remapped_pic_line:
+    push eax
+    push ecx
+    push edx
+    movzx ecx, word [fs:vcpi_pic_master]
+    mov eax, ebx
+    sub eax, ecx
+    cmp eax, 8
+    jb .master
+    movzx ecx, word [fs:vcpi_pic_slave]
+    mov eax, ebx
+    sub eax, ecx
+    cmp eax, 8
+    jb .slave
+.no:
+    clc
+    pop edx
+    pop ecx
+    pop eax
+    ret
+.master:
+    mov ecx, eax                  ; candidate line 0..7
+    mov al, 0x0B                  ; OCW3: read ISR
+    out 0x20, al
+    in al, 0x20
+    movzx edx, al
+    mov eax, 1
+    shl eax, cl
+    test edx, eax
+    jz .no
+    mov ebx, ecx
+    stc
+    pop edx
+    pop ecx
+    pop eax
+    ret
+.slave:
+    mov ecx, eax                  ; candidate slave sub-line 0..7
+    mov al, 0x0B
+    out 0xA0, al
+    in al, 0xA0
+    movzx edx, al
+    mov eax, 1
+    shl eax, cl
+    test edx, eax
+    jz .no
+    lea ebx, [ecx + 8]
+    stc
+    pop edx
+    pop ecx
+    pop eax
+    ret
+
+; Reflect line EBX to its guest IVT vector using the current VCPI/PIC mapping.
+; Tail-jumps reflect_vector.
 irq_reflect_line:
     cmp ebx, 8
     jb .master
-    add ebx, 0x70 - 8
+    movzx eax, word [fs:vcpi_pic_slave]
+    add ebx, eax
+    sub ebx, 8
     jmp reflect_vector
 .master:
-    add ebx, 8
+    movzx eax, word [fs:vcpi_pic_master]
+    add ebx, eax
     jmp reflect_vector
 
 ; Reflect an interrupt into the guest's real-mode IVT handler.
