@@ -350,6 +350,15 @@ fn run_bench_one(
     run_bench_one_profiled(hardware, mode, source, budget, stride)
 }
 
+/// Whether the JIT should auto-admit hot loops this run, read from `IZARRAVM_JIT` (any value other
+/// than empty or "0" turns it on). Lets the headless game anchors be measured with the JIT active
+/// without a dedicated flag. A no-op unless the binary was built `--features jit`.
+fn jit_env_enabled() -> bool {
+    std::env::var("IZARRAVM_JIT")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
 fn run_bench_one_profiled(
     hardware: &HardwareProfile,
     mode: GswMode,
@@ -367,6 +376,7 @@ fn run_bench_one_profiled(
         BenchSource::DosExe(exe) => Machine::new_raw_program(profile, exe)?,
     };
     machine.set_mode(mode);
+    machine.set_jit_auto_admit(jit_env_enabled());
     if let Some(sample_stride) = sample_stride {
         machine.enable_host_profiling(sample_stride);
     }
@@ -1597,6 +1607,7 @@ fn run_boot_hdd(
         izarravm_firmware::izarra_bios(),
     )?;
     machine.mount_hdd(image);
+    machine.set_jit_auto_admit(jit_env_enabled());
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
 
@@ -1683,6 +1694,7 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
 
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios())?;
     machine.mount_hdd_folder_with(dir.path(), overrides)?;
+    machine.set_jit_auto_admit(jit_env_enabled());
     let stop = machine.run_until_halt_or_cycles(500_000_000)?;
     print!("{}", machine.screen_text().as_text());
 
@@ -1712,6 +1724,7 @@ fn run_boot_hdd_folder(
         izarravm_firmware::izarra_bios(),
     )?;
     machine.mount_hdd_folder(dir)?;
+    machine.set_jit_auto_admit(jit_env_enabled());
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
     // run. Reads the guest-clock attribution of e.g. the x87 opcode rows

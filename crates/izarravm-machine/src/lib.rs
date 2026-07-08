@@ -2242,6 +2242,16 @@ impl Machine {
         &self.cpu
     }
 
+    /// Turn on the JIT's hotness auto-admission (feature `jit`; a no-op unless the CPU was built
+    /// with it). Lets a headless run compile hot loops so the game anchors can be measured with the
+    /// JIT active. Off by default; the CLI flips it from the `IZARRAVM_JIT` env.
+    pub fn set_jit_auto_admit(&mut self, on: bool) {
+        #[cfg(feature = "jit")]
+        self.cpu.set_jit_auto_admit(on);
+        #[cfg(not(feature = "jit"))]
+        let _ = on;
+    }
+
     pub fn enable_host_profiling(&mut self, sample_stride: u64) {
         self.host_profile.enable();
         self.cpu.enable_profiling(sample_stride);
