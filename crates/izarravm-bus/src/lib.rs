@@ -394,6 +394,15 @@ impl BusTrace {
         self.elapsed_clocks
     }
 
+    /// Add `clocks` guest bus clocks to the running total in one shot, without a per-cycle record.
+    /// The JIT cost-fold uses this to flush a block's accumulated fetch/data bus cost (which it
+    /// computed from compile-time constants) at a flush point, instead of one `record` per access.
+    /// Only `elapsed_clocks` (what the device scheduler and batch-end step read) is affected; the
+    /// retained per-cycle detail is intentionally coarsened away for the folded run.
+    pub fn add_elapsed_clocks(&mut self, clocks: u64) {
+        self.elapsed_clocks += clocks;
+    }
+
     pub fn clear(&mut self) {
         self.cycles.clear();
         self.elapsed_clocks = 0;
@@ -494,6 +503,25 @@ pub trait CpuBus {
     ) -> Result<(), BusError> {
         Ok(())
     }
+
+    /// The clock cost this bus charges for ONE instruction-fetch access of cacheable RAM (the JIT
+    /// cost-fold's per-instruction fetch constant, read once per region entry and folded across the
+    /// block instead of charged per slot). Buses without bus timing return 0. See `charge_bus_clocks_bulk`.
+    fn jit_fetch_cost_clocks(&self) -> u64 {
+        0
+    }
+
+    /// The clock cost this bus charges for ONE byte-wide direct data access (the JIT cost-fold's
+    /// per-byte-access data constant). Buses without bus timing return 0.
+    fn jit_data_byte_cost_clocks(&self) -> u64 {
+        0
+    }
+
+    /// Charge `clocks` bus clocks in one shot (the JIT cost-fold's bulk flush). The folded block
+    /// accumulates fetch + data cost from the two constants above and flushes it here at a flush
+    /// point, keeping the device-scheduler-visible clock total correct without a per-access record.
+    /// Buses without bus timing do nothing.
+    fn charge_bus_clocks_bulk(&mut self, _clocks: u64) {}
 
     /// Copy physical instruction bytes into `out` without charging bus clocks.
     /// The CPU charges each consumed fetch byte separately so prefetch snapshots
@@ -783,6 +811,25 @@ mod tests {
                 "retained cycle detail must match in {mode:?} mode"
             );
         }
+    }
+
+    #[test]
+    fn add_elapsed_clocks_bumps_only_the_clock_total() {
+        // The JIT cost-fold's bulk flush must advance elapsed_clocks by exactly the amount given,
+        // and touch nothing else (no access-count bump, no per-cycle detail): it stands in for the
+        // clocks a run of already-accounted accesses would have added, recorded in one op.
+        let mut t = BusTrace::default();
+        t.record(BusAccessKind::DataRead, 0x1000, BusWidth::Byte, 1); // 3 clocks, 1 access
+        let clocks_before = t.elapsed_clocks();
+        let count_before = t.access_count();
+        let cycles_before = t.cycles().len();
+        t.add_elapsed_clocks(40);
+        assert_eq!(t.elapsed_clocks(), clocks_before + 40);
+        assert_eq!(t.access_count(), count_before, "no access-count bump");
+        assert_eq!(t.cycles().len(), cycles_before, "no per-cycle detail added");
+        // Additive.
+        t.add_elapsed_clocks(2);
+        assert_eq!(t.elapsed_clocks(), clocks_before + 42);
     }
 
     #[test]

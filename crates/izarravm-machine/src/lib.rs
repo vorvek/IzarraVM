@@ -9574,6 +9574,24 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
+    /// One instruction-fetch access of cacheable RAM: `clocks_for(_, code_fetch_wait_states)` = 2 +
+    /// the per-mode I-cache constant. Matches what `charge_instruction_fetch_run`'s cacheable-RAM
+    /// fast path records for one access (machine.rs ~9806). The JIT cost-fold folds this per slot.
+    fn jit_fetch_cost_clocks(&self) -> u64 {
+        2 + u64::from(self.cache.code_fetch_wait_states())
+    }
+
+    /// One byte-wide direct data access: `clocks_for(Byte, cost.l1)` = 2 + the flat L1 wait-state,
+    /// exactly what `charge_direct_memory` records for a direct-page hit in the Approximate class.
+    fn jit_data_byte_cost_clocks(&self) -> u64 {
+        2 + u64::from(self.cache.cost.l1)
+    }
+
+    /// Flush the JIT cost-fold's accumulated bus clocks into the trace's running total in one op.
+    fn charge_bus_clocks_bulk(&mut self, clocks: u64) {
+        self.trace.add_elapsed_clocks(clocks);
+    }
+
     /// See the trait doc: the straight-line run loop adds this figure's growth
     /// to its core total against the (guest-clock) run cap. Approximate class
     /// only; the Accurate class returns 0 so its lockstep batches keep the
