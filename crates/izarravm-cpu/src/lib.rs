@@ -35191,17 +35191,26 @@ mod tests {
             arm(&mut jit_cpu);
             drive_to_halt(&mut interp, &mut bus_i);
             drive_to_halt(&mut jit_cpu, &mut bus_j);
-            assert_eq!(interp, jit_cpu, "architectural state diverged");
+            assert_state_identical(&interp, &jit_cpu);
             assert_eq!(
                 interp.eflags(),
                 jit_cpu.eflags(),
                 "materialized eflags diverged"
             );
+            // Timing is still exact under the trampoline, so assert every accumulator
+            // (a divergence names the field). Round 3's cost-fold makes JIT-block timing
+            // approximate and relaxes these to drift-tolerant; the state assertion above
+            // (which ignores exactly these four fields) stays bit-exact.
             assert_eq!(
                 interp.elapsed_clocks, jit_cpu.elapsed_clocks,
                 "elapsed_clocks diverged"
             );
+            assert_eq!(
+                interp.core_clocks_so_far, jit_cpu.core_clocks_so_far,
+                "core_clocks_so_far diverged"
+            );
             assert_eq!(interp.timing_rem, jit_cpu.timing_rem, "timing_rem diverged");
+            assert_eq!(interp.fp_rem, jit_cpu.fp_rem, "fp_rem diverged");
             assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
             assert_eq!(
                 interp.perf_counters().jit_region_entries,
@@ -35215,6 +35224,61 @@ mod tests {
                 );
             }
             interp
+        }
+
+        /// Assert two CPUs are STATE-identical, ignoring the four timing accumulators
+        /// (`elapsed_clocks`, `core_clocks_so_far`, `timing_rem`, `fp_rem`).
+        ///
+        /// Under the S2 contract a compiled JIT block leaves guest architectural state
+        /// (GPRs, materialized EFLAGS, segments + hidden descriptors, control/system
+        /// regs, memory-mapped CPU state) BYTE-IDENTICAL to the interpreter, but its
+        /// cycle accounting is only approximate. This is the state-exact half of that
+        /// contract: it reuses the derived `PartialEq` by zeroing just the timing
+        /// fields on throwaway clones, so it covers every present and future state field
+        /// automatically without a hand-maintained list. Timing is asserted separately
+        /// by the caller (bit-exact today; drift-tolerant once the cost-fold lands).
+        fn assert_state_identical(interp: &Cpu386, jit: &Cpu386) {
+            assert!(
+                state_eq(interp, jit),
+                "architectural state diverged (timing fields ignored)"
+            );
+        }
+
+        /// Bool core of [`assert_state_identical`], for tests that want to check both
+        /// directions without catching a panic.
+        fn state_eq(interp: &Cpu386, jit: &Cpu386) -> bool {
+            let mut a = interp.clone();
+            let mut b = jit.clone();
+            for c in [&mut a, &mut b] {
+                c.elapsed_clocks = 0;
+                c.core_clocks_so_far = 0;
+                c.timing_rem = 0;
+                c.fp_rem = 0;
+            }
+            a == b
+        }
+
+        /// The state comparator must ignore ONLY the four timing accumulators and still
+        /// catch a real architectural divergence. If it silently ignored a state field,
+        /// every downstream template differential test would be compromised.
+        #[test]
+        fn state_comparator_ignores_timing_but_catches_state() {
+            let base = fresh();
+            let mut timing_only = base.clone();
+            timing_only.elapsed_clocks = 12_345;
+            timing_only.core_clocks_so_far = 999;
+            timing_only.timing_rem = 7;
+            timing_only.fp_rem = 3;
+            assert!(
+                state_eq(&base, &timing_only),
+                "a timing-only difference must compare state-identical"
+            );
+            let mut gpr_diff = base.clone();
+            gpr_diff.write_gpr32(0, 0xdead_beef);
+            assert!(
+                !state_eq(&base, &gpr_diff),
+                "a GPR difference must be caught"
+            );
         }
 
         /// Sets eip/esp/esi/edi and a non-trivial incoming flag pattern. The loop count lives in the
