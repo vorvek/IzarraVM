@@ -830,6 +830,7 @@ pub(crate) fn try_admit_gated(
         exit: RegionExitKind::Boundary,
         fault: None,
         halted: false,
+        folded_raw_bus: 0,
     });
     let idx = cpu.jit_regions.install(CompiledRegion {
         buf,

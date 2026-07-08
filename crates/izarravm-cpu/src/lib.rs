@@ -3764,6 +3764,9 @@ impl Cpu386 {
             ctx.exit = jit::step::RegionExitKind::Boundary;
             ctx.fault = None;
             ctx.halted = false;
+            // Cost-fold: start the folded-bus accumulator empty; region_step flushes it. (The
+            // per-entry fetch/data cost constants the native slots fold from land with the emit.)
+            ctx.folded_raw_bus = 0;
             (region.entry, std::ptr::from_mut(ctx))
         };
         // SAFETY: the emitted code only forwards these pointers to `region_step::<B>`, whose

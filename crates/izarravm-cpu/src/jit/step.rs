@@ -189,6 +189,15 @@ pub(crate) struct RegionCtx {
     /// last so it does not shift any offset the emitted native code reads (fn pointers 0..48, the
     /// timing fields 88..144); the emitter never reads this field.
     pub is_loop: bool,
+
+    // ---- Cost-fold state (the native-fold path; zero/unused under the trampoline) ----
+    /// Raw (unscaled) bus clocks a native slot has folded but not yet flushed into the bus trace.
+    /// A native memory/ALU slot adds its fetch (+ data) cost here instead of charging the bus per
+    /// slot; `region_step` flushes it (via `bus.charge_bus_clocks_bulk`) at its top, so every
+    /// region_step slot and the back-edge reconcile the device-visible clock total. Under the
+    /// trampoline (no native slots) it stays 0, so the flush is inert. Reset per entry. (The
+    /// per-instruction cost constants the native slots fold from land here alongside the emit.)
+    pub folded_raw_bus: u64,
 }
 
 impl RegionCtx {
@@ -234,6 +243,14 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
     let cpu = unsafe { &mut *cpu };
     let bus = unsafe { &mut *(bus as *mut B) };
     let ctx = unsafe { &mut *ctx };
+    // Cost-fold flush: reconcile any bus clocks the native slots folded into the running trace before
+    // this slot's own bookkeeping reads it (core_clocks_so_far below, the cap check, and - at the
+    // back-edge - the mandatory yield). region_step holds the bus, so no fn-pointer is needed. Under
+    // the trampoline (no native slots) folded_raw_bus is always 0, so this is inert.
+    if ctx.folded_raw_bus > 0 {
+        bus.charge_bus_clocks_bulk(ctx.folded_raw_bus);
+        ctx.folded_raw_bus = 0;
+    }
     let slot = &ctx.slots[k as usize];
     let insn = slot.insn;
     let lin = slot.lin;
