@@ -424,7 +424,11 @@ impl Encoder {
     /// register with low3 >= 4 (SPL/BPL/SIL/DIL) would need a REX prefix to name its low byte, which
     /// this form does not emit (the probe only ever passes a scratch in that range).
     pub(crate) fn store_r8_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
-        debug_assert!(
+        // A hard assert (not debug_assert), matching this file's SIB guards: the REX logic below only
+        // consults `base`, so a src with low3 >= 4 would silently encode the wrong byte register
+        // (e.g. RSI -> `mov [rax],dh` with no REX) - a wrong-code bug with no runtime signal. Must
+        // fail in release too, since the emitter runs in the release JIT.
+        assert!(
             src.low3() < 4 && !src.ext(),
             "store_r8_disp8 src must be AL/CL/DL/BL (no REX byte-register)"
         );
