@@ -507,12 +507,21 @@ pub trait CpuBus {
     /// The clock cost this bus charges for ONE instruction-fetch access of cacheable RAM (the JIT
     /// cost-fold's per-instruction fetch constant, read once per region entry and folded across the
     /// block instead of charged per slot). Buses without bus timing return 0. See `charge_bus_clocks_bulk`.
+    ///
+    /// CALLER OBLIGATION: this is the CACHEABLE-RAM fast-path constant. ROM / device-window / A20-edge
+    /// fetches charge differently (per byte, or address-classified), so the cost-fold must only fold
+    /// blocks whose code is conventional cacheable RAM - the constant is wrong otherwise.
     fn jit_fetch_cost_clocks(&self) -> u64 {
         0
     }
 
     /// The clock cost this bus charges for ONE byte-wide direct data access (the JIT cost-fold's
     /// per-byte-access data constant). Buses without bus timing return 0.
+    ///
+    /// CALLER OBLIGATION: this is the flat Approximate-class L1 constant. The Accurate class and
+    /// device-window accesses charge per-address, so the cost-fold must only fold Approximate-class
+    /// blocks whose data hits the direct-page cache (which the native probe already requires) - the
+    /// constant is wrong otherwise.
     fn jit_data_byte_cost_clocks(&self) -> u64 {
         0
     }
