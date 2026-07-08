@@ -22,6 +22,17 @@ use winit::window::{Window, WindowId};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 
+/// The ReSonique 2 output amp gain as a linear multiplier, from the config's
+/// tenths encoding (30 -> 3.0). Models the card's analog output stage (line
+/// driver / power amp) that the digital mixer model does not represent: a game
+/// like Doom that never programs the CT1745 volume runs on the power-on default
+/// (master and voice both -14 dB), so its digitized voice path lands at -28 dB
+/// and is inaudible played straight out of a host DAC with no analog gain. The
+/// user tunes it from the config menu; it is folded into the shared master gain.
+fn amp_multiplier(amp_gain: u32) -> f32 {
+    amp_gain as f32 / 10.0
+}
+
 /// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
 /// perceptual curve; swap it for a proper dB map if it ever matters.
 fn volume_gain(volume: f32) -> f32 {
@@ -255,15 +266,16 @@ fn pump_audio(
         return;
     }
     let mut pcm = machine.render_audio(samples);
-    if gain != 1.0 {
-        for (l, r) in &mut pcm {
-            *l = (*l as f32 * gain)
-                .round()
-                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            *r = (*r as f32 * gain)
-                .round()
-                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        }
+    // `gain` already carries the ReSonique 2 amp multiplier (the UI folds it into
+    // the shared gain alongside the master volume), so one saturating pass applies
+    // both. It is never unity, so the old skip-when-1.0 shortcut no longer applies.
+    for (l, r) in &mut pcm {
+        *l = (*l as f32 * gain)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        *r = (*r as f32 * gain)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
     sink.queue(&pcm);
 }
@@ -1208,8 +1220,11 @@ pub struct GuiApp {
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
     // the emulation thread reads through `gain`.
     volume: f32,
+    // ReSonique 2 output amp gain, in tenths (30 = 3.0x). Folded into `gain`
+    // alongside the master volume. Edited in the config modal, persisted in prefs.
+    amp_gain: u32,
     // The shared gain handed to the emulation thread; the UI writes it whenever
-    // the slider moves so the audio path stays lock-free.
+    // the slider or the amp gain changes so the audio path stays lock-free.
     gain: SharedGain,
     // Distira/Glide render worker count. Persisted in the GUI prefs and applied
     // live to the emulation thread.
@@ -1250,6 +1265,8 @@ struct ConfigDialog {
     fullscreen: KeyBinding,
     glide_threads: u8,
     crt_style: CrtStyle,
+    // ReSonique 2 amp gain in tenths (30 = 3.0x); see GuiApp::amp_gain.
+    amp_gain: u32,
     // The binding awaiting a key press, set when the user clicks a rebind button.
     capturing: Option<BindTarget>,
 }
@@ -1284,11 +1301,12 @@ impl GuiApp {
         let prefs_path = prefs::prefs_path(&c_drive);
         let prefs = GuiPrefs::load(&prefs_path);
         let volume = prefs.master_volume.clamp(0.0, 1.0);
+        let amp_gain = prefs.amp_gain;
         let glide_render_threads = prefs.glide_render_threads;
         let crt_style = prefs.crt_style;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
-        let gain = SharedGain::new(volume_gain(volume));
+        let gain = SharedGain::new(volume_gain(volume) * amp_multiplier(amp_gain));
         // Restore the last floppy mount if the source still exists on disk.
         let floppy_source = restore_floppy_source(&prefs);
         let panel_open = prefs.panel_open;
@@ -1327,6 +1345,7 @@ impl GuiApp {
             show_about: false,
             show_license: false,
             volume,
+            amp_gain,
             gain,
             glide_render_threads,
             crt_style,
@@ -1844,7 +1863,8 @@ impl GuiApp {
                     let slider =
                         ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
                     if slider.changed() {
-                        self.gain.set(volume_gain(self.volume));
+                        self.gain
+                            .set(volume_gain(self.volume) * amp_multiplier(self.amp_gain));
                         self.prefs.master_volume = self.volume;
                         self.save_prefs();
                     }
@@ -1885,6 +1905,7 @@ impl GuiApp {
             fullscreen: self.fullscreen_key.clone(),
             glide_threads: self.glide_render_threads,
             crt_style: self.crt_style,
+            amp_gain: self.amp_gain,
             capturing: None,
         });
     }
@@ -1994,6 +2015,22 @@ impl GuiApp {
                         });
                     });
 
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("AUDIO").color(LABEL).size(11.0));
+                    beige_group(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("ReSonique 2 amp gain");
+                            ui.add(
+                                egui::Slider::new(&mut dialog.amp_gain, 0..=prefs::AMP_GAIN_MAX)
+                                    .custom_formatter(|n, _| format!("{:.1}x", n / 10.0)),
+                            )
+                            .on_hover_text(
+                                "Output gain for the sound card's analog stage. Raise if a \
+                                 game's sound is too quiet, lower if it clips.",
+                            );
+                        });
+                    });
+
                     ui.add_space(14.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Accept").clicked() {
@@ -2025,6 +2062,14 @@ impl GuiApp {
         self.prefs.input_release = dialog.input_release.clone();
         self.prefs.fullscreen = dialog.fullscreen.clone();
         self.prefs.crt_style = dialog.crt_style;
+        // Amp gain: update the live value + prefs and refold it into the shared
+        // gain so the emulation thread's audio pump picks it up without a restart.
+        if dialog.amp_gain != self.amp_gain {
+            self.amp_gain = dialog.amp_gain;
+            self.prefs.amp_gain = dialog.amp_gain;
+            self.gain
+                .set(volume_gain(self.volume) * amp_multiplier(self.amp_gain));
+        }
         if dialog.glide_threads != self.glide_render_threads {
             // Updates the field, prefs, and emulation thread, and persists.
             self.set_glide_render_threads(dialog.glide_threads);
