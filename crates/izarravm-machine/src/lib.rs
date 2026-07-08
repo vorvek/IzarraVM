@@ -1327,6 +1327,12 @@ pub struct Machine {
     // it to know when to stop and service devices (see run_until_clock). A field
     // rather than a loop local so make_bus's one-off host accesses share it.
     io_touched: bool,
+    // Fixed ISA-bus time (in CPU clocks) accrued this batch by the OPL status poll,
+    // added to the batch's device advance in the Approximate class so a fast-CPU
+    // poll cannot outrun the 80 us OPL timer. See the batch-end use in
+    // run_until_clock and the accrual in read_io. Consumed (zeroed) each batch via
+    // mem::take.
+    isa_io_batch_clocks: u64,
     // Set by MachineBus when a device (DMA disk/floppy transfer, DMA block copy) writes guest RAM,
     // which bypasses the CPU's self-modifying-code tracking. The run loop tells the CPU to drop its
     // prefetch + decode cache at end of step so staged code is never replayed stale.
@@ -1654,6 +1660,7 @@ impl Machine {
             pending_soft_int: None,
             last_int_vector: None,
             io_touched: false,
+            isa_io_batch_clocks: 0,
             device_wrote_memory: false,
             direct_map_changed: false,
             host_profile: MachineHostProfile::default(),
@@ -2472,6 +2479,7 @@ impl Machine {
             flat_data_cost: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
             lazy_port_reads: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut self.io_touched,
+            isa_io_clocks: &mut self.isa_io_batch_clocks,
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
             core_clocks_so_far: 0,
@@ -8845,6 +8853,7 @@ impl Machine {
                     unittester,
                     pci,
                     io_touched,
+                    isa_io_batch_clocks,
                     device_wrote_memory,
                     direct_map_changed,
                     #[cfg(test)]
@@ -8896,6 +8905,7 @@ impl Machine {
                     flat_data_cost: matches!(active_mode.timing_class(), TimingClass::Approximate),
                     lazy_port_reads: matches!(active_mode.timing_class(), TimingClass::Approximate),
                     io_touched,
+                    isa_io_clocks: isa_io_batch_clocks,
                     device_wrote_memory,
                     direct_map_changed,
                     core_clocks_so_far: 0,
@@ -9062,7 +9072,27 @@ impl Machine {
                     // scaled by the CPU's level_timing; this applies the third lever
                     // to the fetch + data-access bus clocks so a fast part pulls away
                     // from the flat per-access floor.
-                    let step = u64::from(outcome.core_clocks) + self.scale_bus(bus_clocks);
+                    // ISA I/O bus time for the OPL status poll (Approximate class
+                    // only), accumulated per access in read_io. The ISA bus runs at a
+                    // fixed ~8 MHz, so an OPL status poll costs about a microsecond of
+                    // wall time no matter how fast the CPU is.
+                    // The per-mode bus scaler (scale_bus) instead prices the whole bus
+                    // portion DOWN in the fast modes (586 x7/30), driving a port access
+                    // toward zero guest-clocks, so a tight poll loop retires thousands
+                    // of iterations per microsecond. That silently breaks the AdLib
+                    // timer detection Doom runs before enabling FM music: the poll
+                    // outruns the 80 us OPL timer, the overflow bit never appears, and
+                    // music is disabled. Charging the real ISA period per poll lets the
+                    // timer overflow within the poll. This is added OUTSIDE the
+                    // io_touched batch-end gate on purpose: under TOKAEMM the poll runs
+                    // in the V86 monitor (ring-0 PM), where the monitor's own device
+                    // pokes are deliberately exempted from io_touched, so gating on it
+                    // would miss exactly the case that fails. The Accurate class
+                    // (286/386) never accumulates this (see read_io), so it stays
+                    // byte-identical; its slower clock already spans the 80 us window.
+                    let step = u64::from(outcome.core_clocks)
+                        + self.scale_bus(bus_clocks)
+                        + std::mem::take(&mut self.isa_io_batch_clocks);
                     self.elapsed_clocks += step;
                     // Advance the OPL timers so AdLib detection's delay loops see
                     // the overflow flag (the synthesis clock is driven separately
@@ -9277,6 +9307,10 @@ struct MachineBus<'a> {
     // or changes time-dependent device state, so it ends the batch to keep that
     // state exact. Memory/MMIO (framebuffer blits, the hot path) does not set it.
     io_touched: &'a mut bool,
+    // Accrues fixed ISA-bus time (CPU clocks) for the OPL status poll in the
+    // Approximate class; the run loop folds it into the batch's device advance.
+    // Points at `Machine::isa_io_batch_clocks`.
+    isa_io_clocks: &'a mut u64,
     device_wrote_memory: &'a mut bool,
     direct_map_changed: &'a mut bool,
     // A copy of the current read_io call's core_clocks_so_far argument (CPU core
@@ -10041,8 +10075,21 @@ impl CpuBus for MachineBus<'_> {
         // can starve the emulated timer progression enough to fail on fast CPU
         // modes. Keep every AdLib/SB OPL read batch-ending.
         if let Some(resolved) = opl_port(port) {
-            if !skip_io_touched {
-                *self.io_touched = true;
+            // Always end the batch on an OPL status read, even under the ring-0 PM
+            // monitor. The skip_io_touched exemption exists for the monitor's OWN
+            // chipset pokes (the vec13 PIC OCW3 probe), but an OPL poll reflected
+            // from a V86 guest is real guest device I/O: it must end the batch so the
+            // OPL timer advances BETWEEN polls. Without this the whole AdLib
+            // detection loop runs inside one batch, the timer only advances at batch
+            // end (after every poll already read a stale 0x00), and detection fails.
+            *self.io_touched = true;
+            // Charge the poll its real ISA bus time in the Approximate class so it
+            // cannot outrun the 80 us OPL timer on a fast CPU (folded into the batch
+            // device advance in run_until_clock). The Accurate class never accrues
+            // this, keeping its byte-identical batch cadence; it also does not need
+            // it (its slower clock already spans the window).
+            if self.lazy_port_reads {
+                *self.isa_io_clocks += isa_io_clocks(self.active_mode);
             }
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(resolved).unwrap_or(0xff)));
@@ -10811,6 +10858,15 @@ fn advance_fractional(carry: f64, clocks: u64, rate_per_clock: f64) -> (u64, f64
     let raw = carry + clocks as f64 * rate_per_clock;
     let whole = raw.floor();
     (whole as u64, raw - whole)
+}
+
+/// CPU clocks for one 8-bit ISA I/O bus cycle at the live mode's clock. The ISA
+/// bus runs at a fixed ~8 MHz, so an access costs roughly a microsecond of wall
+/// time no matter how fast the CPU is; charging that keeps a fast-CPU device poll
+/// from outrunning the hardware it polls (chiefly the 80 us OPL timer that AdLib
+/// detection waits on). At least one clock so it always makes progress.
+fn isa_io_clocks(mode: GswMode) -> u64 {
+    (mode.clock_hz() / 1_000_000).max(1)
 }
 
 /// Map a CPU I/O port to the OPL register port (0x388-0x38B) it addresses, or
@@ -20723,6 +20779,41 @@ mod tests {
         });
     }
 
+    #[test]
+    fn opl_status_poll_charges_isa_bus_time_only_in_approximate_class() {
+        // A fast CPU retires a tight IN loop so quickly that the 80 us OPL timer
+        // AdLib detection waits on never overflows, so Doom disables FM music. The
+        // fix charges each OPL status read one ISA bus period (~1 us), folded into
+        // the batch's device advance, so the poll cannot outrun the timer. The
+        // Approximate class (486/586) accrues it; the Accurate class (286/386) must
+        // not, keeping its byte-identical batch cadence (its slower clock already
+        // spans the window).
+        for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            machine.isa_io_batch_clocks = 0;
+            with_bus(&mut machine, |bus| {
+                let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
+            });
+            let expected = (mode.clock_hz() / 1_000_000).max(1);
+            assert_eq!(
+                machine.isa_io_batch_clocks, expected,
+                "{mode:?}: one OPL status poll charges one ISA bus period"
+            );
+        }
+
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw386);
+        machine.isa_io_batch_clocks = 0;
+        with_bus(&mut machine, |bus| {
+            let _ = bus.read_io(0x388, BusWidth::Byte, 0, false).unwrap();
+        });
+        assert_eq!(
+            machine.isa_io_batch_clocks, 0,
+            "the Accurate class must not charge ISA I/O time (byte-identical cadence)"
+        );
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         // Captured before the struct literal below since video/trace are also
@@ -20775,6 +20866,7 @@ mod tests {
             flat_data_cost: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
             lazy_port_reads: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut machine.io_touched,
+            isa_io_clocks: &mut machine.isa_io_batch_clocks,
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,
             core_clocks_so_far: 0,
