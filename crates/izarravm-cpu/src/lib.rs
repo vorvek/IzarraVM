@@ -4566,6 +4566,36 @@ impl Cpu386 {
         }
     }
 
+    /// Specialized `mov r8, [mem]` (0x8A) execute for a JIT `MemLoadU8` slot: the exact body of
+    /// `execute_hot_cached_datamove`'s 0x8A arm, reached WITHOUT the group/opcode dispatch chain
+    /// (`execute_hot_cached_decoded`'s register-only probe + the group match + the datamove opcode
+    /// match). Bit-identical to the interpreter by construction — it calls the same
+    /// `resolve_memory_addr_mode` / `read_memory_u8` / `write_gpr8` and returns the same `clocks(2)` —
+    /// so it inherits every segment/paging/fault/SMC/BusTrace behavior for free, in every CPU mode.
+    /// Any shape the classifier did not intend (defensive) falls back to the full dispatch, so the
+    /// result is identical regardless.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_execute_load_u8<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        if insn.opcode == 0x8a {
+            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
+                let memory = self.resolve_memory_addr_mode(&addr);
+                let value = self.read_memory_u8(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    BusAccessKind::DataRead,
+                )?;
+                self.write_gpr8(modrm.reg, value);
+                return Ok(clocks(2));
+            }
+        }
+        self.execute_hot_cached_or_decoded(insn, bus)
+    }
+
     #[inline]
     fn execute_hot_cached_flags_misc<B: CpuBus>(
         &mut self,
@@ -35184,6 +35214,65 @@ mod tests {
                 "the self-store must have triggered the SMC watch (narrow={}, global={})",
                 pc.smc_narrow_kills,
                 pc.decode_inval_smc
+            );
+        }
+
+        // ---- Round 3 byte-LOAD template (stage 1: dispatch removal) ----
+
+        /// The classifier must actually route the loop's `mov al,[esi]` (opcode 0x8A, memory operand)
+        /// to `SlotKind::MemLoadU8`, so the specialized `jit_execute_load_u8` runs instead of the full
+        /// dispatch. Without this assertion the harness tests would pass even if the classifier never
+        /// tagged the load (the trampoline is bit-identical either way), so the template would be dead.
+        #[test]
+        fn byte_load_slot_is_classified_memloadu8() {
+            let mut cpu = fresh();
+            let mut bus = TestBus::with_memory({
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&2u32.to_le_bytes());
+                m
+            });
+            h_arm(0x2000, 0x3000)(&mut cpu);
+            drive_to_halt(&mut cpu, &mut bus); // warm the loop's decode lines
+            let idx = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("admit the copy loop");
+            let region = cpu.jit_regions.get_mut(idx).unwrap();
+            let load_slots = region
+                .ctx
+                .slots
+                .iter()
+                .filter(|s| s.kind == jit::step::SlotKind::MemLoadU8)
+                .count();
+            assert_eq!(
+                load_slots, 1,
+                "the `mov al,[esi]` slot must classify as MemLoadU8 (got {load_slots})"
+            );
+        }
+
+        /// Fault injection ON THE BYTE LOAD itself: `esi` runs off the DS limit so `mov al,[esi]`
+        /// #GPs mid-region (before the store), delivering identically on the interpreter and the JIT.
+        /// The store-fault variant (`harness_mid_loop_fault_delivers_identically`) never exercises the
+        /// LOAD's fault path, which the MemLoadU8 executor now owns. The fault must land after the
+        /// 32-iteration admission threshold so the running region delivers it.
+        #[test]
+        fn byte_load_mid_loop_fault_delivers_identically() {
+            let prog = {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&100u32.to_le_bytes());
+                m
+            };
+            // esi=0x1FC0 advances 1/iteration, so the LOAD `mov al,[esi]` #GPs when esi first exceeds
+            // 0x2000 (iteration ~65, past the 32 admission threshold). edi=0x1000 keeps the store in
+            // limit, so the load is the faulting access. count=100 so the loop cannot finish first.
+            let arm = move |cpu: &mut Cpu386| {
+                h_arm(0x1fc0, 0x1000)(cpu);
+                let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+                ds.limit = 0x2000;
+                cpu.registers.set_segment(SegmentIndex::Ds, ds);
+            };
+            let interp = assert_shape_identical(prog, &arm, true);
+            assert!(
+                interp.registers.eip >= H_GP_HANDLER,
+                "the byte load must have #GP'd into the handler, eip={:#x}",
+                interp.registers.eip
             );
         }
     }
