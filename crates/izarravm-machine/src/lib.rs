@@ -7466,6 +7466,9 @@ impl Machine {
         for (index, &byte) in bytes.iter().enumerate() {
             self.write_physical_u8(addr + index as u32, byte);
         }
+        if !bytes.is_empty() {
+            self.device_wrote_memory = true;
+        }
     }
 
     fn read_guest_block(&mut self, addr: u32, len: usize) -> Vec<u8> {
@@ -14367,6 +14370,36 @@ mod tests {
         // One drive is mounted: DL reports 1, derived from the equipment word.
         assert_eq!(m.cpu.registers.edx() as u8, 0x01, "DL = floppy count");
         assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH = success");
+    }
+
+    #[test]
+    fn int13_read_over_executed_buffer_invalidates_decoded_bytes() {
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax,ax
+            0x8E, 0xD0, // mov ss,ax
+            0xBC, 0x00, 0x70, // mov sp,7000h
+            0x9A, 0x00, 0x7C, 0x00, 0x00, // call far 0000:7C00
+            0x31, 0xC0, // xor ax,ax
+            0x8E, 0xC0, // mov es,ax
+            0xBB, 0x00, 0x7C, // mov bx,7C00h
+            0xB8, 0x01, 0x02, // mov ax,0201h
+            0xB9, 0x01, 0x00, // mov cx,0001h
+            0x31, 0xD2, // xor dx,dx
+            0xCD, 0x13, // int 13h
+            0xEA, 0x00, 0x7C, 0x00, 0x00, // jmp far 0000:7C00
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.write_guest_block(0x7C00, &[0xB8, 0xAA, 0xAA, 0xCB]); // mov ax,AAAAh; retf
+
+        let mut image = vec![0u8; 1_474_560];
+        image[..5].copy_from_slice(&[0xFA, 0xB8, 0x34, 0x12, 0xF4]); // cli; mov ax,1234h; hlt
+        machine.mount_floppy(image).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x1234);
     }
 
     #[test]
