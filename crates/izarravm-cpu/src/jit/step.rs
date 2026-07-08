@@ -58,6 +58,14 @@ pub(crate) enum SlotKind {
     /// calls the specialized `jit_execute_store_u8`. `write_memory_u8` runs `note_code_write`, so the
     /// SMC code-write watch is inherited; dispatch removal only, bit-identical in every mode.
     MemStoreU8,
+    /// A `mov r16/r32, [mem]` sized load (opcode 0x8B, memory operand): `region_step` calls
+    /// `jit_execute_load_sized`. Dispatch removal only; word and dword both go through
+    /// `read_memory_sized`, so alignment/page-cross/segment behavior is inherited. Bit-identical.
+    MemLoadSized,
+    /// A `mov [mem], r16/r32` sized store (opcode 0x89, memory operand): `region_step` calls
+    /// `jit_execute_store_sized`. `write_memory_sized` runs `note_code_write`, so the SMC watch is
+    /// inherited; dispatch removal only, bit-identical in every mode.
+    MemStoreSized,
     /// The final rel8 Jcc back-edge (taken = loop, not-taken = LoopDone).
     BackEdge,
 }
@@ -243,6 +251,8 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
             // executors; every other slot takes the full dispatch. All are interpreter-identical.
             SlotKind::MemLoadU8 => cpu.jit_execute_load_u8(&insn, bus),
             SlotKind::MemStoreU8 => cpu.jit_execute_store_u8(&insn, bus),
+            SlotKind::MemLoadSized => cpu.jit_execute_load_sized(&insn, bus),
+            SlotKind::MemStoreSized => cpu.jit_execute_store_sized(&insn, bus),
             _ => cpu.execute_hot_cached_or_decoded(&insn, bus),
         }) {
         Ok(outcome) => {
