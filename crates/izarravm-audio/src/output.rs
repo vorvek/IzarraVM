@@ -99,22 +99,27 @@ where
 {
     let channels = config.channels as usize;
     let out_hz = config.sample_rate.0 as i64;
-    let mut held = (0i16, 0i16);
-    let mut phase: i64 = 0; // source position vs. output, scaled by out_hz
+    // Two straddling source frames (`cur`..`nxt`) plus a fractional read position
+    // between them. Interpolating linearly between the two is far smoother than
+    // the old zero-order hold, whose stair-stepping injected audible high-
+    // frequency imaging noise ("scratch") when up-sampling 44.1 kHz to a 48 kHz
+    // device. On underrun `nxt` holds its last value, so a starved ring fades to
+    // a held level rather than clicking.
+    let mut cur = (0i16, 0i16);
+    let mut nxt = (0i16, 0i16);
+    let mut phase: i64 = 0; // read position between cur and nxt, scaled by out_hz
     device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             let mut ring = ring.lock().expect("audio ring poisoned");
             for frame in data.chunks_mut(channels) {
-                // Advance the source read position by SOURCE_HZ/out_hz per output
-                // frame, popping a source frame each time it crosses an integer.
-                phase += SOURCE_HZ as i64;
-                while phase >= out_hz {
-                    phase -= out_hz;
-                    held = ring.pop_front().unwrap_or(held); // hold last on underrun
-                }
-                let l = T::from_sample(f32::from(held.0) / 32768.0);
-                let r = T::from_sample(f32::from(held.1) / 32768.0);
+                // Linear interpolation: `phase/out_hz` is how far the output time
+                // sits between `cur` and `nxt`.
+                let frac = phase as f32 / out_hz as f32;
+                let li = f32::from(cur.0) + (f32::from(nxt.0) - f32::from(cur.0)) * frac;
+                let ri = f32::from(cur.1) + (f32::from(nxt.1) - f32::from(cur.1)) * frac;
+                let l = T::from_sample(li / 32768.0);
+                let r = T::from_sample(ri / 32768.0);
                 if let Some(s) = frame.get_mut(0) {
                     *s = l;
                 }
@@ -123,6 +128,14 @@ where
                 }
                 for s in frame.iter_mut().skip(2) {
                     *s = T::from_sample(0.0);
+                }
+                // Advance the read position by SOURCE_HZ/out_hz per output frame,
+                // stepping cur<-nxt<-ring each time it crosses a source frame.
+                phase += SOURCE_HZ as i64;
+                while phase >= out_hz {
+                    phase -= out_hz;
+                    cur = nxt;
+                    nxt = ring.pop_front().unwrap_or(nxt); // hold last on underrun
                 }
             }
         },
