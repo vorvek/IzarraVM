@@ -59,14 +59,40 @@ pub(crate) struct CompiledRegion {
     pub mode_key: u32,
 }
 
+/// Upper bound on live compiled regions. `find()` reuses a line's entry on re-admission, so the
+/// table grows only with DISTINCT hot loops, not with re-decode churn; this caps that growth. When
+/// it is hit the table is dropped wholesale and the decode generation is bumped (so no stale stamp
+/// survives) - a coarse GC that also adapts to workload phase shifts (the post-clear table refills
+/// with whatever is hot now). The single-phase anchors have far fewer hot loops than this, so it
+/// never fires there.
+// ponytail: whole-table clear-on-full, not per-entry LRU. Upgrade to LRU eviction only if a
+// phase-shifting workload is measured re-warming often (jit_table_clears climbing).
+pub(crate) const JIT_REGION_TABLE_CAP: usize = 1024;
+
 /// The region table. Index 0 is reserved (DecodeLine stores 1-based `NonZeroU32` indices so the
 /// no-region case stays a niche-optimized `None`).
 #[derive(Default)]
 pub(crate) struct RegionTable {
     regions: Vec<CompiledRegion>,
+    /// Whether the continuation seam admits hot loops automatically. Off by default so
+    /// manual-admission tests and the forced-address path are undisturbed; the CLI/GUI turns it on
+    /// to run the JIT on real workloads. Lives here (not on `Cpu386`) so it is excluded from CPU
+    /// equality via this table's always-equal `PartialEq` - setting it never makes two otherwise
+    /// identical CPUs compare unequal, which the differential suite relies on.
+    auto_admit: bool,
 }
 
 impl RegionTable {
+    /// Whether hotness-driven admission is enabled (see `auto_admit`).
+    pub(crate) fn auto_admit(&self) -> bool {
+        self.auto_admit
+    }
+
+    /// Enable or disable hotness-driven admission.
+    pub(crate) fn set_auto_admit(&mut self, on: bool) {
+        self.auto_admit = on;
+    }
+
     /// Install a region and return the 1-based index to stamp into the entry's decode line.
     pub(crate) fn install(&mut self, region: CompiledRegion) -> std::num::NonZeroU32 {
         self.regions.push(region);
@@ -103,9 +129,9 @@ impl RegionTable {
             .map(|i| std::num::NonZeroU32::new(i as u32 + 1).expect("positions are 0-based"))
     }
 
-    /// Drop every region (e.g. on a mode/level change so stale native code cannot linger even
-    /// as unreachable table entries).
-    #[allow(dead_code)] // ponytail: wired up with the compile driver
+    /// Drop every region (W^X-alloc failure, mode/level change, or capacity GC in `try_admit`).
+    /// The caller MUST bump the decode generation afterward so no `DecodeLine` stamp still points
+    /// into the now-empty table.
     pub(crate) fn clear(&mut self) {
         self.regions.clear();
     }

@@ -46,7 +46,7 @@ use std::num::NonZeroU32;
 
 use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableBuffer;
-use super::region::CompiledRegion;
+use super::region::{CompiledRegion, JIT_REGION_TABLE_CAP};
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
 use crate::{Cpu386, DecodeGroup, DecodedInsn, OperandSize, Prefixes};
 
@@ -54,12 +54,19 @@ use crate::{Cpu386, DecodeGroup, DecodedInsn, OperandSize, Prefixes};
 /// reaches the cap ends linearly (its tail is interpreted); real hot loops are far smaller.
 const MAX_BLOCK_SLOTS: usize = 128;
 
-/// Classify an interior slot into its emitted-code strategy. The register-only mov/add/shr forms
-/// (modrm mode 3) inline natively; everything else (memory operands, modrm-less ops) goes through
-/// the v1 per-slot step. The gpr indices and immediates are read from the captured decode so a
-/// self-patched immediate (the add-imm slots) stays current across re-stamps. Only interior slots
-/// pass through here: `build_block` classifies the terminal slot separately (a loop back-edge is
-/// `BackEdge`, a linear end is `Memory`), both of which run through the full step.
+/// The (opcode, mode-derived operand size) -> template DISPATCH. Classify an interior slot into its
+/// emitted-code strategy: the register-only mov/add/shr forms (modrm mode 3, 32-bit) inline natively;
+/// everything else (memory operands, modrm-less ops) goes through the v1 per-slot step. The gpr
+/// indices and immediates are read from the captured decode so a self-patched immediate (the add-imm
+/// slots) stays current across re-stamps. Only interior slots pass through here: `build_block`
+/// classifies the terminal slot separately (a loop back-edge is `BackEdge`, a linear end is `Memory`),
+/// both of which run through the full step.
+///
+/// This function plus the `SlotKind` enum plus the `emit_region` match ARE the template dispatch: to
+/// add a native template for a new opcode, add a `SlotKind` variant, classify it here (gating on
+/// operand size / mode as the width-safety fix requires), and emit it in `emit_region`. A
+/// function-pointer table keyed by opcode is deliberately NOT used - the enum keeps exhaustiveness
+/// checking and compiles to a jump table anyway, so it is the idiomatic dispatch for a single host.
 fn classify_slot(insn: &DecodedInsn) -> SlotKind {
     let Some(m) = insn.modrm else {
         // A modrm-less interior op (push/pop/nop/int-free single-byte forms) has no inline
@@ -257,6 +264,16 @@ pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
 /// kinds and their baked immediates, so the buffer is re-emitted on every fresh admission (the
 /// re-stamp path refreshes the slot table; the next fresh admission re-reads the immediates from
 /// the fresh decodes).
+///
+/// TEMPLATE ABI (the contract a native slot template emits against; win64 + SysV64):
+/// - PINNED, do not clobber: R12=cpu, R13=bus, R15=ctx, R14=regs-base (=cpu+regs_offset), RBX=step_fn.
+/// - SCRATCH, free to use: RAX/RCX/RDX (volatile). No other host reg is safe across a call-out.
+/// - Guest gpr[i] lives at `[R14 + 4*i]` (`gpr_disp`); read/write it there, write-through (no
+///   residency yet - that is a later round, which will free some pins).
+/// - EARLY EXIT: a slot that must leave the block (fault or run boundary) jumps to the shared `exit`
+///   label. Today only Memory/BackEdge slots exit, via the step fn's nonzero return + `jnz exit`; a
+///   faulting NATIVE template (the Round 3 memory fast path) will jump to `exit` after spilling, per
+///   the re-plan's fault rule. A reg-only template never faults and never exits mid-body.
 fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32) -> Vec<u8> {
     let mode = NATIVE_BOOKKEEPING.load(std::sync::atomic::Ordering::Relaxed);
     let mut e = Encoder::new();
@@ -644,11 +661,23 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
             region.buf = buf;
         } else {
             // W^X alloc failed (unsupported host): drop the region so admission does not point at
-            // stale emitted bytes. The caller treats None as "not admitted" and interprets instead.
+            // stale emitted bytes, and bump the decode generation so no other line keeps a stamp
+            // into the now-empty table (the clear() contract). The caller treats None as "not
+            // admitted" and interprets instead.
             cpu.jit_regions.clear();
+            cpu.decode_cache.invalidate();
             return None;
         }
         return Some(idx);
+    }
+    // Fresh install (no reusable entry). If the table is at capacity, drop it wholesale and bump the
+    // decode generation so no stale stamp survives, then interpret this pass; the now-empty table
+    // re-admits on the next warm hit. Coarse but O(1) and correct (JIT_REGION_TABLE_CAP).
+    if cpu.jit_regions.len() >= JIT_REGION_TABLE_CAP {
+        cpu.jit_regions.clear();
+        cpu.decode_cache.invalidate();
+        cpu.perf.jit_table_clears += 1;
+        return None;
     }
     let terminal_slot = (slots.len() - 1) as u32;
     let code = emit_region(&slots, regs_offset, scale_den);
