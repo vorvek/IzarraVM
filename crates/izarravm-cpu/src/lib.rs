@@ -35600,6 +35600,34 @@ mod tests {
             );
             assert_eq!(cpu.read_gpr32(3), 0x0000_00cd, "BL = page[0x10] = 0xCD");
 
+            // `mov bl, [eax+3]` (displacement, no index): eax=0x5000, disp=3 -> page offset 3 (0xAB).
+            // Pins that the `disp != 0` branch adds into the EA register (RAX), not a scratch.
+            cpu.write_gpr32(0, 0x5000);
+            cpu.write_gpr32(3, 0x0000_0000);
+            assert!(
+                run_load_probe(&mut cpu, 0, None, 3, 3),
+                "disp form must hit"
+            );
+            assert_eq!(
+                cpu.read_gpr32(3),
+                0x0000_00ab,
+                "BL = page[0x5000+3] = 0xAB via disp"
+            );
+
+            // `mov bl, [eax+ecx+3]` (index + displacement): eax=0x5000, ecx=0x0d, disp=3 -> offset 0x10.
+            cpu.write_gpr32(0, 0x5000);
+            cpu.write_gpr32(1, 0x0d); // ecx
+            cpu.write_gpr32(3, 0x0000_0000);
+            assert!(
+                run_load_probe(&mut cpu, 0, Some(1), 3, 3),
+                "index+disp must hit"
+            );
+            assert_eq!(
+                cpu.read_gpr32(3),
+                0x0000_00cd,
+                "BL = page[0x5000+0x0d+3] = 0xCD"
+            );
+
             // A high byte destination (AH = gpr8 index 4 = byte 1 of EAX): write into bits 8-15.
             cpu.write_gpr32(0, 0x5003); // eax base (also the AH target register)
             assert!(run_load_probe(&mut cpu, 0, None, 0, 4), "must hit");
