@@ -4626,6 +4626,65 @@ impl Cpu386 {
         self.execute_hot_cached_or_decoded(insn, bus)
     }
 
+    /// Specialized `mov r16/r32, [mem]` (0x8B) execute for a JIT `MemLoadSized` slot: the exact body
+    /// of `execute_hot_cached_datamove`'s 0x8B arm, reached WITHOUT the group/opcode dispatch chain.
+    /// Bit-identical to the interpreter — same `resolve_memory_addr_mode` / `read_memory_sized`
+    /// (which does the alignment/#AC, page-cross and segment/paging checks for the width) /
+    /// `write_gpr_sized` / `clocks(2)`. `insn.operand_size` is the captured decode size (unprefixed in
+    /// a region, so it is the segment default), so word and dword loads are both correct. Any
+    /// unexpected shape falls back to the full dispatch.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_execute_load_sized<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        if insn.opcode == 0x8b {
+            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
+                let memory = self.resolve_memory_addr_mode(&addr);
+                let value = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    insn.operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                self.write_gpr_sized(modrm.reg, insn.operand_size, value);
+                return Ok(clocks(2));
+            }
+        }
+        self.execute_hot_cached_or_decoded(insn, bus)
+    }
+
+    /// Specialized `mov [mem], r16/r32` (0x89) execute for a JIT `MemStoreSized` slot: the exact body
+    /// of `execute_hot_cached_datamove`'s 0x89 arm, reached WITHOUT the group/opcode dispatch chain.
+    /// Bit-identical — same `resolve_memory_addr_mode` / `read_gpr_sized` / `write_memory_sized`
+    /// (which runs `note_code_write`, so the SMC watch and the alignment/page-cross/segment/paging
+    /// checks are inherited) / `clocks(2)`, in every mode. Any unexpected shape falls back.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_execute_store_sized<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        if insn.opcode == 0x89 {
+            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
+                let memory = self.resolve_memory_addr_mode(&addr);
+                let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
+                self.write_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    insn.operand_size,
+                    value,
+                    BusAccessKind::DataWrite,
+                )?;
+                return Ok(clocks(2));
+            }
+        }
+        self.execute_hot_cached_or_decoded(insn, bus)
+    }
+
     #[inline]
     fn execute_hot_cached_flags_misc<B: CpuBus>(
         &mut self,
@@ -35339,6 +35398,68 @@ mod tests {
                 store_slots, 1,
                 "the `mov [edi],al` slot must classify as MemStoreU8 (got {store_slots})"
             );
+        }
+
+        // ---- Round 3 sized (word/dword) mem-move template (stage 1: dispatch removal) ----
+
+        /// A dword-copy loop `mov eax,[esi]; mov [edi],eax; add esi,4; add edi,4; dec [cnt]; jnz`, in a
+        /// 64 KB image. `H_SIZED_CNT` holds the iteration count.
+        fn sized_copy_program(count: u32) -> Vec<u8> {
+            const H_SIZED_CNT: usize = 0x400;
+            let mut m = vec![0u8; 0x1_0000];
+            m[0x100] = 0x90; // nop starter -> 0x101 reached as a continuation
+            let body: [u8; 16] = [
+                0x8b, 0x06, // mov eax,[esi]   (MemLoadSized)
+                0x89, 0x07, // mov [edi],eax   (MemStoreSized)
+                0x83, 0xc6, 0x04, // add esi,4
+                0x83, 0xc7, 0x04, // add edi,4
+                0xff, 0x0d, 0x00, 0x04, 0x00, 0x00, // dec dword [0x400]
+            ];
+            m[0x101..0x101 + body.len()].copy_from_slice(&body);
+            let rel_at = 0x101 + body.len();
+            m[rel_at] = 0x75; // jnz 0x101
+            m[rel_at + 1] = ((0x101_i32) - (rel_at as i32 + 2)) as i8 as u8;
+            m[rel_at + 2] = 0xf4; // hlt at the fall-through
+            m[H_SIZED_CNT..H_SIZED_CNT + 4].copy_from_slice(&count.to_le_bytes());
+            m
+        }
+
+        fn sized_copy_arm(cpu: &mut Cpu386) {
+            cpu.registers.eip = 0x100;
+            cpu.registers.set_esp(0x0700);
+            cpu.write_gpr32(6, 0x2000); // esi
+            cpu.write_gpr32(7, 0x3000); // edi
+        }
+
+        /// The classifier must route `mov eax,[esi]` (0x8B mem) to `MemLoadSized` and `mov [edi],eax`
+        /// (0x89 mem) to `MemStoreSized` so the specialized sized executors run; the register forms
+        /// (0x8B/0x89 mode 3) carry a Reg operand and stay off this path.
+        #[test]
+        fn sized_mem_moves_are_classified() {
+            let mut cpu = fresh();
+            let mut bus = TestBus::with_memory(sized_copy_program(2));
+            sized_copy_arm(&mut cpu);
+            drive_to_halt(&mut cpu, &mut bus); // warm the loop's decode lines
+            let idx = jit::block::try_admit(&mut cpu, 0x101, true).expect("admit the dword loop");
+            let region = cpu.jit_regions.get_mut(idx).unwrap();
+            let kinds: Vec<_> = region.ctx.slots.iter().map(|s| s.kind).collect();
+            assert!(
+                kinds.contains(&jit::step::SlotKind::MemLoadSized),
+                "`mov eax,[esi]` must classify as MemLoadSized: {kinds:?}"
+            );
+            assert!(
+                kinds.contains(&jit::step::SlotKind::MemStoreSized),
+                "`mov [edi],eax` must classify as MemStoreSized: {kinds:?}"
+            );
+        }
+
+        /// The dword-copy loop runs many iterations to halt bit-identically with the sized executors
+        /// (dword load + dword store), and the JIT auto-admits and runs the region. Pins that the sized
+        /// templates reproduce the interpreter's `read_memory_sized`/`write_memory_sized` (dword width,
+        /// the alignment/page-cross/SMC behavior) exactly across the run.
+        #[test]
+        fn sized_mem_moves_run_identically() {
+            assert_shape_identical(sized_copy_program(200), &sized_copy_arm, true);
         }
     }
 }
