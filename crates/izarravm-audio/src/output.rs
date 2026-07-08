@@ -108,6 +108,13 @@ where
     let mut cur = (0i16, 0i16);
     let mut nxt = (0i16, 0i16);
     let mut phase: i64 = 0; // read position between cur and nxt, scaled by out_hz
+    // Opt-in underrun diagnostic (IZARRAVM_AUDIO_DEBUG): counts source frames the
+    // ring could not supply (the emulation produced audio slower than the device
+    // consumed it) and logs a rate once per output second. A high rate is the
+    // signature of the crackle when a guest runs below real time. Off = one bool.
+    let debug = std::env::var_os("IZARRAVM_AUDIO_DEBUG").is_some();
+    let mut underruns: u64 = 0;
+    let mut out_frames: u64 = 0;
     device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
@@ -135,7 +142,21 @@ where
                 while phase >= out_hz {
                     phase -= out_hz;
                     cur = nxt;
-                    nxt = ring.pop_front().unwrap_or(nxt); // hold last on underrun
+                    match ring.pop_front() {
+                        Some(f) => nxt = f,
+                        None => underruns += 1, // hold last (nxt) on underrun
+                    }
+                }
+            }
+            if debug {
+                out_frames += (data.len() / channels.max(1)) as u64;
+                if out_frames >= out_hz as u64 {
+                    eprintln!(
+                        "[AUDIO] underruns/s={underruns} ring_now={} (0 = keeping up)",
+                        ring.len()
+                    );
+                    underruns = 0;
+                    out_frames = 0;
                 }
             }
         },

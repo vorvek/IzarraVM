@@ -20,14 +20,20 @@ const PREFS_FILE: &str = "izarravm.conf";
 const DEFAULT_VOLUME: f32 = 0.8;
 
 /// Default ReSonique 2 output amp gain, in tenths of a linear multiplier
-/// (30 = 3.0x). Models the card's analog output stage, which the digital mixer
+/// (120 = 12.0x). Models the card's analog output stage, which the digital mixer
 /// model does not represent, so a game that rides the -14 dB CT1745 volume
-/// default is audible.
-pub const DEFAULT_AMP_GAIN: u32 = 30;
+/// default is comfortably audible; peaks clamp.
+pub const DEFAULT_AMP_GAIN: u32 = 120;
 
-/// Upper bound for the amp gain (tenths); 200 = 20x. Guards a hand-edited value
-/// from pinning the output at a clipped roar.
-pub const AMP_GAIN_MAX: u32 = 200;
+/// Upper bound for the amp gain (tenths); 500 = 50x. Generous headroom above the
+/// default so a very quiet game can still be brought up, guarding only against an
+/// absurd hand-edited value.
+pub const AMP_GAIN_MAX: u32 = 500;
+
+/// Default PC speaker volume, as a percent (100 = full). The speaker is separate
+/// from the ReSonique 2 card; this is a straight attenuation so it can be turned
+/// down or muted (0) independently of the card's amp gain.
+pub const DEFAULT_PC_SPEAKER_VOLUME: u32 = 100;
 
 /// A host hotkey: modifier flags plus a key name. `key` is the winit `KeyCode`
 /// debug name (e.g. "F2", "KeyA"), which the GUI compares against the live key
@@ -115,6 +121,10 @@ pub struct GuiPrefs {
     /// CT1745 volume (and so rides the -14 dB default) is audible. Applied
     /// host-side on top of the master volume; see `amp_multiplier`.
     pub amp_gain: u32,
+    /// PC speaker volume, as a percent (100 = full, 0 = muted). A linear
+    /// attenuation applied host-side to the speaker only, independent of the card
+    /// amp, so the beeps can be turned down or off.
+    pub pc_speaker_volume: u32,
     /// Distira Glide renderer worker count. Matches 86Box's choices: 1, 2, or 4.
     pub glide_render_threads: u8,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
@@ -142,6 +152,7 @@ impl Default for GuiPrefs {
         Self {
             master_volume: DEFAULT_VOLUME,
             amp_gain: DEFAULT_AMP_GAIN,
+            pc_speaker_volume: DEFAULT_PC_SPEAKER_VOLUME,
             glide_render_threads: DISTIRA_DEFAULT_RENDER_THREADS,
             crt_style: CrtStyle::Subtle,
             input_release: KeyBinding::new(true, false, false, "F2"),
@@ -179,6 +190,7 @@ impl GuiPrefs {
             Ok(mut prefs) => {
                 prefs.master_volume = prefs.master_volume.clamp(0.0, 1.0);
                 prefs.amp_gain = prefs.amp_gain.min(AMP_GAIN_MAX);
+                prefs.pc_speaker_volume = prefs.pc_speaker_volume.min(100);
                 prefs.glide_render_threads =
                     normalize_distira_render_threads(prefs.glide_render_threads);
                 prefs
@@ -215,6 +227,7 @@ mod tests {
         let prefs = GuiPrefs {
             master_volume: 0.65,
             amp_gain: 55,
+            pc_speaker_volume: 40,
             glide_render_threads: 4,
             crt_style: CrtStyle::YeOlde,
             input_release: KeyBinding::new(true, true, false, "F4"),
@@ -237,6 +250,7 @@ mod tests {
         assert_eq!(parsed, GuiPrefs::default());
         assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
         assert_eq!(parsed.amp_gain, DEFAULT_AMP_GAIN);
+        assert_eq!(parsed.pc_speaker_volume, DEFAULT_PC_SPEAKER_VOLUME);
         assert_eq!(parsed.glide_render_threads, 2);
         assert_eq!(
             parsed.crt_style,

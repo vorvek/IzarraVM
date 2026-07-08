@@ -1381,6 +1381,15 @@ pub struct Machine {
     fdc: fdc::Fdc,
     opl: OplChip,
     resampler: Resampler,
+    /// ReSonique 2 analog output-stage gain (host-tunable "amp gain"), applied in
+    /// render_audio to the card's sources but not the PC speaker. 1.0 = unity (the
+    /// default; the GUI sets it from the config). Host-side loudness only, not
+    /// guest-visible, so it never affects timing or the guest audio model.
+    card_amp: f32,
+    /// PC speaker output volume (host-tunable), a linear attenuation applied in
+    /// render_audio to the speaker only. 1.0 = full (default), 0.0 = muted. Like
+    /// card_amp it is host-side loudness only, never guest-visible.
+    speaker_volume: f32,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
     dsp: SbDsp,
     /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
@@ -1686,6 +1695,8 @@ impl Machine {
             fdc: fdc::Fdc::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            card_amp: 1.0,
+            speaker_volume: 1.0,
             opl_micros: 0.0,
             dsp: SbDsp::default(),
             // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
@@ -8441,11 +8452,32 @@ impl Machine {
         }
     }
 
+    /// Set the ReSonique 2 analog output-stage gain (the host "amp gain"). Applied
+    /// in [`render_audio`](Self::render_audio) to the card's sources only. Clamped
+    /// non-negative; 1.0 is unity.
+    pub fn set_card_amp(&mut self, amp: f32) {
+        self.card_amp = amp.max(0.0);
+    }
+
+    /// Set the PC speaker output volume (host-side). Applied in
+    /// [`render_audio`](Self::render_audio) to the speaker only. Clamped to
+    /// 0.0..=1.0; 0.0 mutes the beeps, 1.0 is full.
+    pub fn set_speaker_volume(&mut self, volume: f32) {
+        self.speaker_volume = volume.clamp(0.0, 1.0);
+    }
+
     /// Render `native_samples` of mixed OPL3 + SB16 DSP audio at the 44100 Hz DAC
     /// rate (stereo, saturated to 16-bit). `native_samples` is counted in OPL
     /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
     /// duration at its own rate. Each stream is resampled to 44100 and summed.
+    ///
+    /// The ReSonique 2 analog output-stage gain (`self.card_amp`, the host-tunable
+    /// "amp gain") is applied to the card's own sources (OPL, SB DSP, the WSS
+    /// codec, and CD-audio through the card's CD-in) but NOT to the PC speaker,
+    /// which is motherboard hardware that does not pass through the card's amp.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        let card_amp = self.card_amp;
+        let speaker_volume = self.speaker_volume;
         let opl_native: Vec<(i32, i32)> = (0..native_samples)
             .map(|_| self.opl.render_sample())
             .collect();
@@ -8504,16 +8536,31 @@ impl Machine {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let (wl, wr) = wss_out.get(i).copied().unwrap_or((0, 0));
-                let s = i32::from(spk[i]);
+                // Host PC speaker volume: a straight attenuation on the beeper,
+                // independent of the card amp (0.0 mutes it). Unity leaves the mix
+                // bit-identical to before.
+                let s = (f32::from(spk[i]) * speaker_volume) as i32;
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let cl = (cl as f32 * cd_l_gain) as i32;
                 let cr = (cr as f32 * cd_r_gain) as i32;
-                // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec is
-                // summed in raw (its own attenuation already applied), like the
-                // speaker and CD streams that bypass the SB16 mixer.
-                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + s + cl;
-                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + s + cr;
-                (clamp_i16(l), clamp_i16(r))
+                // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec and
+                // CD are summed in raw (their own attenuation already applied). All
+                // of these are ReSonique 2 card sources, so the analog output-stage
+                // gain (`card_amp`) scales their sum. The PC speaker (`s`) is
+                // motherboard hardware, not on the card, so it is added AFTER the
+                // amp at its own level.
+                // Sum the card sources exactly as before (SB16 part truncated, then
+                // the raw WSS + CD adds), scale that by the analog amp, then add the
+                // speaker. At card_amp == 1.0 this is bit-identical to the pre-amp
+                // mix (`... as i32 + wl + s + cl`), since a whole f32 casts back
+                // unchanged and integer addition commutes.
+                let card_l =
+                    (((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + cl) as f32 * card_amp;
+                let card_r =
+                    (((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + cr) as f32 * card_amp;
+                let l = clamp_i16(card_l as i32 + s);
+                let r = clamp_i16(card_r as i32 + s);
+                (l, r)
             })
             .collect()
     }
