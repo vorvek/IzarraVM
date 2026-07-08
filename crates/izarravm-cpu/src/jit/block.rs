@@ -629,18 +629,42 @@ const SCALE_NUM_OFF: u32 = 128;
 #[allow(dead_code)]
 const SCALE_DEN_OFF: u32 = 132;
 
+/// Try to admit a region at `entry_lin` (admits any block shape, linear or loop). Test-only helper;
+/// production auto-admission uses `try_admit_gated` with `reject_linear` set, and the forced-address
+/// override passes `reject_linear = false` directly.
+#[cfg(test)]
+pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
+    try_admit_gated(cpu, entry_lin, d, false)
+}
+
 /// Try to admit a region at `entry_lin`: build the block from the live decode cache, then either
 /// refresh the already-installed region for this key (the re-stamp path after an SMC patch or a
 /// mode change; the fresh decodes carry any patched immediates) or emit + install a new one.
 /// Returns the table index for the caller to stamp into the decode line, or `None` when the block
 /// is not (yet) buildable or the host has no W^X backend.
-pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
+///
+/// `reject_linear`: when set, a NON-loop (linear) block is refused. A linear block runs once per
+/// entry then returns to the interpreter, so the region's per-entry prologue/epilogue is pure
+/// overhead on top of the same instructions the interpreter would run — it can never be faster than
+/// interpreting. Hotness auto-admission sets this so it only compiles self-loops (which amortize the
+/// entry over many iterations); on Doom, unconditionally admitting the hot linear basic blocks was a
+/// ~2.9x wall regression (751M region entries, ~5 insns each, all entry/exit overhead). Refusing
+/// admission is always state-correct (the interpreter runs the block).
+pub(crate) fn try_admit_gated(
+    cpu: &mut Cpu386,
+    entry_lin: u32,
+    d: bool,
+    reject_linear: bool,
+) -> Option<NonZeroU32> {
     // The BIOS HLE stub window is a no-compile zone (the fetch seam must see those fetches;
     // defensive here, since forced admission should never point at it).
     if (0xff000..0xff400).contains(&entry_lin) {
         return None;
     }
     let (slots, is_loop) = build_block(cpu, entry_lin, d)?;
+    if reject_linear && !is_loop {
+        return None;
+    }
     let last = &slots[slots.len() - 1];
     // The block is a forward, non-wrapping linear run (build_block only extends forward and keeps
     // every slot page-local), so `end > entry_lin` always holds here. Bail rather than underflow if

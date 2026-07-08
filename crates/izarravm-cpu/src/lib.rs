@@ -3641,10 +3641,16 @@ impl Cpu386 {
                 // the threshold. Both are cheap: a compare and a counter bump. When neither fires,
                 // this branch is the whole per-continuation dispatch cost on the miss path.
                 let hot = self.jit_regions.auto_admit() && self.decode_cache.note_hot_miss(lin, d);
-                if jit_forced_region_lin() != Some(lin) && !hot {
+                let forced = jit_forced_region_lin() == Some(lin);
+                if !forced && !hot {
                     return Ok(None);
                 }
-                let Some(idx) = jit::block::try_admit(self, lin, d) else {
+                // Auto-admission (hotness) compiles ONLY self-loops: a linear block runs once per
+                // entry then returns, so its region prologue/epilogue is pure overhead over the same
+                // interpreted instructions and can never win (measured: broad linear-block admission
+                // was a ~2.9x Doom wall regression). The forced-address override still admits any
+                // block, for the spike/tests. Refusing is always state-correct.
+                let Some(idx) = jit::block::try_admit_gated(self, lin, d, !forced) else {
                     return Ok(None);
                 };
                 self.decode_cache.stamp_region(lin, d, idx);
@@ -35460,6 +35466,54 @@ mod tests {
         #[test]
         fn sized_mem_moves_run_identically() {
             assert_shape_identical(sized_copy_program(200), &sized_copy_arm, true);
+        }
+
+        // ---- Linear-block auto-admission gate ----
+
+        /// Auto-admission (hotness) must REFUSE a linear (non-self-loop) block: it runs once per entry
+        /// then returns, so the region prologue/epilogue is pure overhead over the same interpreted
+        /// instructions (measured: admitting the hot linear basic blocks was a ~2.9x Doom wall
+        /// regression). The forced/test path (`reject_linear = false`) still admits it, and a real
+        /// self-loop still admits under the gate. Refusal is always state-correct.
+        #[test]
+        fn auto_admit_gate_refuses_linear_but_keeps_loops() {
+            // A linear block: nop; mov eax,ebx; hlt -> build_block yields a 2-slot non-loop.
+            let mut lin = fresh();
+            let mut m = vec![0u8; 0x1000];
+            m[0x200] = 0x90; // nop
+            m[0x201] = 0x8b;
+            m[0x202] = 0xc3; // mov eax,ebx
+            m[0x203] = 0xf4; // hlt
+            let mut bus_l = TestBus::with_memory(m);
+            lin.registers.eip = 0x200;
+            drive_to_halt(&mut lin, &mut bus_l); // warm 0x200..0x203
+            assert!(
+                jit::block::try_admit_gated(&mut lin, 0x200, true, true).is_none(),
+                "auto-admission must refuse a linear block"
+            );
+            assert!(
+                jit::block::try_admit_gated(&mut lin, 0x200, true, false).is_some(),
+                "the forced/test path still admits the same linear block"
+            );
+
+            // A self-loop (the byte-copy loop) still admits with the gate on.
+            let mut lp = fresh();
+            let mut bus_p = TestBus::with_memory({
+                let mut mm = h_copy_program();
+                mm[H_COUNT..H_COUNT + 4].copy_from_slice(&2u32.to_le_bytes());
+                mm
+            });
+            h_arm(0x2000, 0x3000)(&mut lp);
+            drive_to_halt(&mut lp, &mut bus_p);
+            let region = jit::block::try_admit_gated(&mut lp, H_ENTRY, true, true);
+            assert!(
+                region.is_some(),
+                "a self-loop must still admit under the linear-block gate"
+            );
+            assert!(
+                lp.jit_regions.get_mut(region.unwrap()).unwrap().is_loop,
+                "the admitted region is a self-loop"
+            );
         }
     }
 }
