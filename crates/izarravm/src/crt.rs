@@ -12,9 +12,9 @@
 use egui_wgpu::CallbackTrait;
 
 // CRT look. Two styles selected at runtime by the `style` uniform (0 off,
-// 1 subtle, 2 Ye Olde). The subtle look is the approved tuner values; Ye Olde
-// adds visible scanlines + shadow mask, 0.02 barrel curvature, softer focus,
-// and faint animated grain. An aperture grille would be a mask-branch swap.
+// 1 subtle, 2 Ye Olde). Both styles model a high-resolution VGA monitor; Ye
+// Olde adds more glass, halation, fine mask texture, light curvature, and faint
+// grain without TV/composite artifacts.
 
 const SHADER: &str = r#"
 struct U {
@@ -57,13 +57,15 @@ fn sample_sharp(t: vec2<f32>, sharp: f32) -> vec3<f32> {
   return textureSample(tex, samp, s).rgb;
 }
 
-// 8-tap ring average for halation, radius in source texels.
+// 8-tap bright-source halation, radius in source texels. Dark samples add
+// nothing; they never average down neighboring bright phosphor.
 fn glow(t: vec2<f32>, radius: f32) -> vec3<f32> {
   var g = vec3<f32>(0.0);
   let r = radius / u.src_size;
   for (var i = 0; i < 8; i = i + 1) {
     let a = f32(i) / 8.0 * 6.2832;
-    g = g + textureSample(tex, samp, t + vec2<f32>(cos(a), sin(a)) * r).rgb;
+    let s = textureSample(tex, samp, t + vec2<f32>(cos(a), sin(a)) * r).rgb;
+    g = g + max(s - vec3<f32>(0.25), vec3<f32>(0.0));
   }
   return g / 8.0;
 }
@@ -102,16 +104,16 @@ fn to_linear(c: vec3<f32>) -> vec3<f32> {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   let yeolde = u.style > 1.5;
 
-  // Per-style parameters: subtle high-res SVGA vs heavier Ye Olde Screene.
-  let sharp         = select(4.0,  2.5,  yeolde);
-  let scan_depth    = select(0.03, 0.18, yeolde);
-  let beam          = select(0.40, 0.30, yeolde);
-  let mask_pitch    = select(2.0,  3.0,  yeolde);
-  let mask_strength = select(0.02, 0.12, yeolde);
-  let bloom         = select(0.10, 0.25, yeolde);
-  let glow_radius   = select(1.2,  1.8,  yeolde);
-  let brightness    = select(1.09, 1.22, yeolde);
-  let curv          = select(0.0,  0.02, yeolde);
+  // Per-style parameters: subtle VGA monitor vs stronger high-resolution glass.
+  let sharp         = select(2.5,   2.2,   yeolde);
+  let scan_depth    = select(0.015, 0.288, yeolde);
+  let beam          = select(0.45,  0.5,   yeolde);
+  let mask_pitch    = select(1.0,   1.0,   yeolde);
+  let mask_strength = select(0.004, 0.083, yeolde);
+  let bloom         = select(0.16,  0.3,   yeolde);
+  let glow_radius   = select(1.3,   2.0,   yeolde);
+  let brightness    = select(1.06,  1.15,  yeolde);
+  let curv          = select(0.0,   0.015, yeolde);
 
   // Ye Olde barrel curvature: warp the sample coord; pixels off the tube are
   // blacked out at the very end. We clamp the warped coord so the texture sample
@@ -138,14 +140,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fy = fract(t.y * u.src_size.y) - 0.5;
     let b = exp(-(fy * fy) / (2.0 * beam * beam));
     col = col * mix(1.0, b, scan_depth);
-    let g = max(glow(t, glow_radius) - vec3<f32>(0.25), vec3<f32>(0.0));
-    col = col + g * bloom * vec3<f32>(1.12, 0.98, 0.86);
+    col = col + glow(t, glow_radius) * bloom * vec3<f32>(1.12, 0.98, 0.86);
     col = shadow_mask(col, in.pos.xy, mask_pitch, mask_strength);
     col = col * brightness;
     if (yeolde) {
       // Faint grain reseeded every frame.
       let n = hash13(vec3<f32>(in.pos.xy, u.time * 100.0)) - 0.5;
-      col = col + vec3<f32>(n * 0.05);
+      col = col + vec3<f32>(n * 0.025);
     }
   }
   col = col * edge;

@@ -718,6 +718,9 @@ impl SbDsp {
                 self.data_available = !self.read_data.is_empty();
                 Some(byte)
             }
+            // 0x22C reads the write-buffer status; bit 7 clear means ready.
+            // Commands dispatch synchronously in this model, so it is never busy.
+            0x22C => Some(0x00),
             // 0x22E is the 8-bit read-buffer status port and the 8-bit DMA
             // interrupt-acknowledge port; 0x22F is its 16-bit counterpart. Only
             // one DMA mode runs at a time, so a read of either status port clears
@@ -807,6 +810,16 @@ mod tests {
             "mixer (0x224) stays out of scope"
         );
         assert!(dsp.write_port(0x226, 0x00), "reset is a DSP port");
+    }
+
+    #[test]
+    fn write_status_port_reports_ready() {
+        let mut dsp = SbDsp::default();
+        assert_eq!(
+            dsp.read_port(0x22C),
+            Some(0x00),
+            "bit 7 clear means command/data writes may proceed"
+        );
     }
 
     fn write_cmd(dsp: &mut SbDsp, bytes: &[u8]) {

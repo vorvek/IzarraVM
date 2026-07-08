@@ -18453,6 +18453,19 @@ mod tests {
     }
 
     #[test]
+    fn sb_dsp_write_status_does_not_read_as_open_bus() {
+        let mut machine = test_machine();
+        let status = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22C, BusWidth::Byte, 0, false).unwrap()).unwrap()
+        });
+        assert_eq!(
+            status & 0x80,
+            0x00,
+            "DSP write-status bit 7 clear means ready for commands"
+        );
+    }
+
+    #[test]
     fn sb_dma_irq5_fires_from_the_cpu_clock_without_host_audio_pull() {
         let mut machine = test_machine();
         // 8-bit ramp at 0x01_0000; arm DMA ch1 + DSP exactly like the playback golden.

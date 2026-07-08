@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IzarraVM CRT tuner</title>
+<style>
+  :root {
+    color-scheme: dark;
+    font-family: Segoe UI, system-ui, sans-serif;
+    background: #111;
+    color: #eee;
+  }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+  }
+  canvas {
+    width: 100%;
+    height: 100vh;
+    display: block;
+    background: #000;
+  }
+  aside {
+    height: 100vh;
+    box-sizing: border-box;
+    padding: 16px;
+    overflow: auto;
+    background: #1b1b1b;
+    border-left: 1px solid #333;
+  }
+  h1 {
+    margin: 0 0 14px;
+    font-size: 18px;
+    font-weight: 650;
+  }
+  .tabs, .row {
+    display: flex;
+    gap: 8px;
+  }
+  button {
+    color: #f5f5f5;
+    background: #2b2b2b;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 8px 10px;
+    cursor: pointer;
+  }
+  button.active {
+    background: #2d5a72;
+    border-color: #54a3c9;
+  }
+  label {
+    display: grid;
+    grid-template-columns: 1fr 64px;
+    gap: 10px;
+    align-items: center;
+    margin: 12px 0;
+    font-size: 13px;
+  }
+  input[type="range"] {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+  output {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: #cfd8dc;
+  }
+  textarea {
+    width: 100%;
+    min-height: 132px;
+    box-sizing: border-box;
+    margin-top: 12px;
+    color: #eee;
+    background: #101010;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 10px;
+    font: 12px/1.35 Consolas, monospace;
+  }
+  @media (max-width: 900px) {
+    body {
+      grid-template-columns: 1fr;
+    }
+    canvas {
+      height: 58vh;
+    }
+    aside {
+      height: auto;
+      border-left: 0;
+      border-top: 1px solid #333;
+    }
+  }
+</style>
+<body>
+  <canvas id="view"></canvas>
+  <aside>
+    <h1>CRT tuner</h1>
+    <div class="tabs">
+      <button id="subtle" class="active">Subtle</button>
+      <button id="yeolde">Ye Olde</button>
+      <button id="reset">Reset</button>
+    </div>
+    <div id="controls"></div>
+    <textarea id="out" readonly></textarea>
+  </aside>
+
+<script>
+const presets = {
+  subtle: {
+    sharp: 2.5, scan: 0.015, beam: 0.45, maskPitch: 1.0, maskStrength: 0.004,
+    bloom: 0.16, glowRadius: 1.3, brightness: 1.06, curvature: 0.0, grain: 0.0
+  },
+  yeolde: {
+    sharp: 2.2, scan: 0.288, beam: 0.5, maskPitch: 1.0, maskStrength: 0.083,
+    bloom: 0.3, glowRadius: 2.0, brightness: 1.15, curvature: 0.015, grain: 0.025
+  }
+};
+const values = structuredClone(presets);
+let style = "subtle";
+
+const sliders = [
+  ["sharp", "Sharp", 1, 6, 0.05],
+  ["scan", "Scanline depth", 0, 0.35, 0.001],
+  ["beam", "Beam width", 0.15, 0.8, 0.005],
+  ["maskPitch", "Mask pitch", 0.5, 6, 0.05],
+  ["maskStrength", "Mask strength", 0, 0.25, 0.001],
+  ["bloom", "Halation", 0, 0.5, 0.005],
+  ["glowRadius", "Halation radius", 0.2, 4, 0.05],
+  ["brightness", "Brightness", 0.8, 1.4, 0.005],
+  ["curvature", "Curvature", 0, 0.08, 0.001],
+  ["grain", "Grain", 0, 0.08, 0.001],
+];
+
+const controlRoot = document.getElementById("controls");
+for (const [key, name, min, max, step] of sliders) {
+  const label = document.createElement("label");
+  label.textContent = name;
+  const out = document.createElement("output");
+  const range = document.createElement("input");
+  range.type = "range";
+  range.min = min;
+  range.max = max;
+  range.step = step;
+  range.oninput = () => {
+    values[style][key] = Number(range.value);
+    out.value = fmt(values[style][key]);
+    render();
+  };
+  label.append(out, range);
+  controlRoot.append(label);
+}
+
+document.getElementById("subtle").onclick = () => setStyle("subtle");
+document.getElementById("yeolde").onclick = () => setStyle("yeolde");
+document.getElementById("reset").onclick = () => {
+  values[style] = structuredClone(presets[style]);
+  syncControls();
+  render();
+};
+
+const canvas = document.getElementById("view");
+const gl = canvas.getContext("webgl2", { antialias: false, premultipliedAlpha: false });
+if (!gl) throw new Error("WebGL2 unavailable");
+
+const source = document.createElement("canvas");
+source.width = 640;
+source.height = 480;
+drawPattern(source.getContext("2d"));
+
+const vertex = `#version 300 es
+const vec2 p[3] = vec2[3](vec2(-1,-1), vec2(3,-1), vec2(-1,3));
+out vec2 uv;
+void main() {
+  vec2 q = p[gl_VertexID];
+  gl_Position = vec4(q, 0.0, 1.0);
+  uv = vec2(q.x * 0.5 + 0.5, 1.0 - (q.y * 0.5 + 0.5));
+}`;
+
+const fragment = `#version 300 es
+precision highp float;
+uniform sampler2D tex;
+uniform vec2 srcSize;
+uniform float timeSec;
+uniform float sharp;
+uniform float scan;
+uniform float beam;
+uniform float maskPitch;
+uniform float maskStrength;
+uniform float bloom;
+uniform float glowRadius;
+uniform float brightness;
+uniform float curvature;
+uniform float grain;
+in vec2 uv;
+out vec4 fragColor;
+
+vec3 sampleSharp(vec2 t) {
+  vec2 px = t * srcSize - vec2(0.5);
+  vec2 tf = floor(px);
+  vec2 f = clamp((px - tf - 0.5) * sharp + 0.5, vec2(0.0), vec2(1.0));
+  return texture(tex, (tf + 0.5 + f) / srcSize).rgb;
+}
+
+vec3 glow(vec2 t) {
+  vec3 g = vec3(0.0);
+  vec2 r = vec2(glowRadius) / srcSize;
+  for (int i = 0; i < 8; i++) {
+    float a = float(i) * 0.78539816339;
+    vec3 s = texture(tex, t + vec2(cos(a), sin(a)) * r).rgb;
+    g += max(s - vec3(0.25), vec3(0.0));
+  }
+  return g * 0.125;
+}
+
+vec3 shadowMask(vec3 col, vec2 frag) {
+  float lo = 1.0 - maskStrength;
+  float row = mod(floor(frag.y / (maskPitch * 1.5)), 2.0);
+  float s = mod(floor(frag.x / maskPitch + row * 1.5), 3.0);
+  vec3 m = vec3(lo);
+  if (s < 0.5) m.r = 1.0;
+  else if (s < 1.5) m.g = 1.0;
+  else m.b = 1.0;
+  float gap = mix(1.0, lo, 0.5);
+  float hg = step(1.0, mod(floor(frag.y / (maskPitch * 0.75)), 2.0)) * 0.6;
+  return col * m * mix(1.0, gap, hg);
+}
+
+float hash13(vec3 p) {
+  vec3 q = fract(p * 0.1031);
+  q += dot(q, q.zyx + 31.32);
+  return fract((q.x + q.y) * q.z);
+}
+
+void main() {
+  vec2 t = uv;
+  float edge = 1.0;
+  if (curvature > 0.0) {
+    vec2 c = uv * 2.0 - 1.0;
+    vec2 w = (c + c * c.yx * c.yx * curvature) * 0.5 + 0.5;
+    vec2 d = min(w, vec2(1.0) - w);
+    vec2 aa = fwidth(w);
+    vec2 cov = clamp(d / max(aa, vec2(1e-6)), vec2(0.0), vec2(1.0));
+    edge = cov.x * cov.y;
+    t = clamp(w, vec2(0.0), vec2(1.0));
+  }
+  vec3 col = sampleSharp(t);
+  float fy = fract(t.y * srcSize.y) - 0.5;
+  float b = exp(-(fy * fy) / (2.0 * beam * beam));
+  col *= mix(1.0, b, scan);
+  col += glow(t) * bloom * vec3(1.12, 0.98, 0.86);
+  col = shadowMask(col, gl_FragCoord.xy);
+  col *= brightness;
+  col += vec3((hash13(vec3(gl_FragCoord.xy, timeSec * 100.0)) - 0.5) * grain);
+  fragColor = vec4(clamp(col * edge, vec3(0.0), vec3(1.0)), 1.0);
+}`;
+
+const program = makeProgram(vertex, fragment);
+gl.useProgram(program);
+const loc = Object.fromEntries(
+  ["srcSize", "timeSec", ...sliders.map(s => s[0])].map(name => [name, gl.getUniformLocation(program, name)])
+);
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+gl.uniform2f(loc.srcSize, source.width, source.height);
+
+function drawPattern(ctx) {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, 640, 480);
+  const bars = ["#fff", "#ff0", "#0ff", "#0f0", "#f0f", "#f00", "#00f", "#111"];
+  for (let i = 0; i < bars.length; i++) {
+    ctx.fillStyle = bars[i];
+    ctx.fillRect(i * 80, 0, 80, 96);
+  }
+  for (let x = 0; x < 640; x++) {
+    const g = Math.round(x / 639 * 255);
+    ctx.fillStyle = `rgb(${g},${g},${g})`;
+    ctx.fillRect(x, 104, 1, 56);
+  }
+  for (let x = 0; x < 640; x += 2) {
+    ctx.fillStyle = x % 4 === 0 ? "#fff" : "#000";
+    ctx.fillRect(x, 176, 2, 48);
+  }
+  for (let y = 240; y < 320; y++) {
+    ctx.fillStyle = y % 2 === 0 ? "#d7d7d7" : "#111";
+    ctx.fillRect(0, y, 640, 1);
+  }
+  for (let y = 336; y < 480; y += 16) {
+    for (let x = 0; x < 640; x += 16) {
+      ctx.fillStyle = ((x ^ y) & 16) ? "#202020" : "#e8e8e8";
+      ctx.fillRect(x, y, 16, 16);
+    }
+  }
+  ctx.fillStyle = "#000";
+  ctx.fillRect(36, 352, 568, 88);
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(36.5, 352.5, 567, 87);
+  ctx.fillStyle = "#fff";
+  ctx.font = "20px Consolas, monospace";
+  ctx.fillText("IZARRAVM CRT TEST  ABCDEFGHIJKLMNOPQRSTUVWXYZ", 56, 386);
+  ctx.fillText("0123456789  1px lines  color bleed  halation", 56, 420);
+}
+
+function makeProgram(vsSource, fsSource) {
+  const vs = compile(gl.VERTEX_SHADER, vsSource);
+  const fs = compile(gl.FRAGMENT_SHADER, fsSource);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+function compile(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
+  return shader;
+}
+
+function setStyle(next) {
+  style = next;
+  document.getElementById("subtle").classList.toggle("active", style === "subtle");
+  document.getElementById("yeolde").classList.toggle("active", style === "yeolde");
+  syncControls();
+  render();
+}
+
+function syncControls() {
+  const labels = [...controlRoot.querySelectorAll("label")];
+  sliders.forEach(([key], i) => {
+    const range = labels[i].querySelector("input");
+    const out = labels[i].querySelector("output");
+    range.value = values[style][key];
+    out.value = fmt(values[style][key]);
+  });
+}
+
+function fmt(n) {
+  return Number(n).toFixed(3).replace(/0+$/, "").replace(/\.$/, ".0");
+}
+
+function render() {
+  const ratio = devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(canvas.clientWidth * ratio));
+  const h = Math.max(1, Math.floor(canvas.clientHeight * ratio));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  gl.viewport(0, 0, w, h);
+  const v = values[style];
+  for (const [key] of sliders) gl.uniform1f(loc[key], v[key]);
+  gl.uniform1f(loc.timeSec, performance.now() / 1000);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  document.getElementById("out").value =
+`${style}
+sharp=${fmt(v.sharp)}
+scan_depth=${fmt(v.scan)}
+beam=${fmt(v.beam)}
+mask_pitch=${fmt(v.maskPitch)}
+mask_strength=${fmt(v.maskStrength)}
+bloom=${fmt(v.bloom)}
+glow_radius=${fmt(v.glowRadius)}
+brightness=${fmt(v.brightness)}
+curv=${fmt(v.curvature)}
+grain=${fmt(v.grain)}`;
+}
+
+syncControls();
+addEventListener("resize", render);
+setInterval(render, 1000 / 30);
+</script>
+</body>
+</html>
