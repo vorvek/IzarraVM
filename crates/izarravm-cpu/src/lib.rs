@@ -35005,5 +35005,186 @@ mod tests {
                 );
             }
         }
+
+        // ---- Round 3 GATING HARNESS: general multi-iteration + fault-injection + SMC differential ----
+        //
+        // The one-iteration `assert_template_identity` gate above is structurally blind to the bug
+        // classes Round 3's native memory templates introduce: cross-iteration flag/carry propagation
+        // over the back-edge, register spill on a mid-loop fault, and self-modifying-code refetch. This
+        // harness runs a block SHAPE to completion on the interpreter and the JIT (hotness auto-admit)
+        // and asserts full state + memory identity at the halt boundary, with variants that inject a
+        // mid-loop fault and a self-store. Every memory template that lands must pass it per shape.
+        // Today it validates the TRAMPOLINE (bit-identical), which proves the harness itself is sound.
+        // (When native templates make timing approximate, the elapsed_clocks/timing_rem asserts here
+        // relax to state-only; the state + memory asserts stay exact - that is the invariant.)
+
+        const H_ENTRY: u32 = 0x101;
+        const H_COUNT: usize = 0x400;
+        const H_GP_HANDLER: u32 = 0x0b00;
+
+        /// A self-loop `mov al,[esi] ; mov [edi],al ; inc esi ; inc edi ; dec [count] ; jnz` plus a
+        /// HLT at the fall-through, a #GP (vector 13) IVT entry to a HLT handler, and `handler` bytes.
+        /// A byte-copy loop with a memory load, a memory store, and a memory RMW counter - the exact
+        /// operand shapes Round 3 templates target.
+        fn h_copy_program() -> Vec<u8> {
+            let mut m = vec![0u8; 0x1_0000];
+            m[0x100] = 0x90; // nop starter -> H_ENTRY reached as a continuation
+            let body: [u8; 13] = [
+                0x8a, 0x06, // mov al,[esi]
+                0x88, 0x07, // mov [edi],al
+                0x46, // inc esi
+                0x47, // inc edi
+                0xff, 0x0d, 0x00, 0x04, 0x00, 0x00, // dec dword [H_COUNT]
+                0x75, // jnz rel8 (rel filled below)
+            ];
+            m[H_ENTRY as usize..H_ENTRY as usize + body.len()].copy_from_slice(&body);
+            let rel_at = H_ENTRY as usize + body.len(); // the rel8 byte
+            m[rel_at] = ((H_ENTRY as i32) - (rel_at as i32 + 1)) as i8 as u8;
+            m[rel_at + 1] = 0xf4; // hlt at the loop fall-through
+            // #GP (vector 13) -> 0:H_GP_HANDLER, a HLT (the fault-injection landing).
+            m[13 * 4..13 * 4 + 2].copy_from_slice(&(H_GP_HANDLER as u16).to_le_bytes());
+            m[H_GP_HANDLER as usize] = 0xf4;
+            m
+        }
+
+        /// Run `prog` to a halt on both an interpreter CPU and a hotness-auto-admitting JIT CPU under
+        /// `arm`, asserting full guest identity + memory + timing at the halt boundary. `expect_region`
+        /// pins that the JIT actually compiled and ran a region (drop it for shapes whose SMC churn may
+        /// keep the region cold). Returns the final interpreter CPU so a caller can assert its shape
+        /// actually exercised its scenario (the fault fired, SMC churned). Panics on any divergence.
+        fn assert_shape_identical(
+            prog: Vec<u8>,
+            arm: &dyn Fn(&mut Cpu386),
+            expect_region: bool,
+        ) -> Cpu386 {
+            let mut interp = fresh();
+            let mut jit_cpu = fresh();
+            jit_cpu.set_jit_auto_admit(true);
+            let mut bus_i = TestBus::with_memory(prog.clone());
+            let mut bus_j = TestBus::with_memory(prog);
+            arm(&mut interp);
+            arm(&mut jit_cpu);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+            assert_eq!(interp, jit_cpu, "architectural state diverged");
+            assert_eq!(
+                interp.eflags(),
+                jit_cpu.eflags(),
+                "materialized eflags diverged"
+            );
+            assert_eq!(
+                interp.elapsed_clocks, jit_cpu.elapsed_clocks,
+                "elapsed_clocks diverged"
+            );
+            assert_eq!(interp.timing_rem, jit_cpu.timing_rem, "timing_rem diverged");
+            assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
+            assert_eq!(
+                interp.perf_counters().jit_region_entries,
+                0,
+                "the interpreter CPU must never compile"
+            );
+            if expect_region {
+                assert!(
+                    jit_cpu.perf_counters().jit_region_entries > 0,
+                    "the JIT must have compiled and run a region"
+                );
+            }
+            interp
+        }
+
+        /// Sets eip/esp/esi/edi and a non-trivial incoming flag pattern. The loop count lives in the
+        /// program image (at `H_COUNT`), not here.
+        fn h_arm(esi: u32, edi: u32) -> impl Fn(&mut Cpu386) {
+            move |cpu: &mut Cpu386| {
+                cpu.registers.eip = 0x100;
+                cpu.registers.set_esp(0x0700);
+                cpu.write_gpr32(6, esi); // esi
+                cpu.write_gpr32(7, edi); // edi
+                // Seed non-trivial flags so a template that wrongly clobbers a preserved flag shows.
+                cpu.materialize_flags();
+                const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+                cpu.registers.eflags =
+                    (cpu.registers.eflags & !ARITH) | FLAG_CF | FLAG_PF | FLAG_AF | FLAG_SF;
+            }
+        }
+
+        /// Baseline: a long byte-copy loop (load + store + RMW counter) runs many iterations to halt
+        /// identically, and the JIT auto-admits and runs a region. Catches per-iteration divergence
+        /// that accumulates over the run (invisible to a single-iteration gate).
+        #[test]
+        fn harness_multi_iteration_copy_loop_is_identical() {
+            let build = |count: u32| -> Vec<u8> {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+                m
+            };
+            // 200 iterations, esi/edi in low RAM well inside the flat 64 KB segment limit.
+            assert_shape_identical(build(200), &h_arm(0x2000, 0x3000), true);
+        }
+
+        /// Fault injection: a mid-loop memory access runs off the DS limit and #GPs, delivering to the
+        /// IVT handler FROM INSIDE THE LIVE REGION. The interpreter and the JIT must fault at the SAME
+        /// instruction with identical pushed state - the register file must be committed (not stale) at
+        /// the fault, the trap the re-plan's spill-on-every-fault-exit rule guards for the eventual
+        /// native templates. The fault MUST land after hotness admission (JIT_HOTNESS_THRESHOLD = 32
+        /// iterations) so the JIT's own fault-delivery path is what runs - not the interpreter during
+        /// warm-up. `expect_region: true` pins that the region actually admitted and ran before faulting.
+        #[test]
+        fn harness_mid_loop_fault_delivers_identically() {
+            // DS base 0, limit 0x2000. esi=0x1000 (the LOAD stays well inside the limit for the whole
+            // run). edi=0x1FC0 advances 1/iteration, so the STORE `mov [edi],al` #GPs when edi first
+            // exceeds 0x2000 - at iteration ~66, comfortably past the 32-iteration admission threshold,
+            // so the fault is delivered by the running region. count=100 so the loop cannot finish first.
+            let prog = {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&100u32.to_le_bytes());
+                m
+            };
+            let arm = move |cpu: &mut Cpu386| {
+                h_arm(0x1000, 0x1fc0)(cpu);
+                let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+                ds.limit = 0x2000;
+                cpu.registers.set_segment(SegmentIndex::Ds, ds);
+            };
+            let interp = assert_shape_identical(prog, &arm, true);
+            // Confirm the shape ACTUALLY faulted (else it just ran to the loop-end HLT and tested
+            // nothing): the guest must have halted in the #GP handler, far above the loop code.
+            assert!(
+                interp.registers.eip >= H_GP_HANDLER,
+                "the memory access must have #GP'd into the handler, eip={:#x}",
+                interp.registers.eip
+            );
+        }
+
+        /// Self-modifying store: `edi` points at the loop's own first opcode byte and `al` is loaded to
+        /// equal that byte, so every iteration stores the SAME value into live code - firing the SMC
+        /// watch and forcing a re-decode / region re-admit each iteration without changing behavior.
+        /// State must stay identical across the write-then-refetch churn (and it stresses the Round 1
+        /// unstamp-reprimes-hotness re-admit fix). The region may stay cold under the churn, so it is
+        /// not required to run.
+        #[test]
+        fn harness_self_modifying_store_stays_identical() {
+            let prog = {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&40u32.to_le_bytes());
+                m
+            };
+            // esi points at H_ENTRY (whose byte is 0x8a, the loop's first opcode), so al = 0x8a each
+            // iteration; edi ALSO points at H_ENTRY, so the store rewrites that byte with its own value.
+            // Both esi and edi advance by 1/iteration (inc), so after the store the pointers move on -
+            // only the FIRST iteration self-writes, but the SMC epoch/generation churn it triggers must
+            // still leave both CPUs identical. (A fixed-pointer variant lands with the store template.)
+            let arm = h_arm(H_ENTRY, H_ENTRY);
+            let interp = assert_shape_identical(prog, &arm, false);
+            // Confirm the self-store ACTUALLY hit live code and triggered SMC handling (else it wrote
+            // only data and tested nothing): some SMC narrow-kill or global-flush must have fired.
+            let pc = interp.perf_counters();
+            assert!(
+                pc.smc_narrow_kills > 0 || pc.decode_inval_smc > 0,
+                "the self-store must have triggered the SMC watch (narrow={}, global={})",
+                pc.smc_narrow_kills,
+                pc.decode_inval_smc
+            );
+        }
     }
 }
