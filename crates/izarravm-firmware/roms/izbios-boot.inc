@@ -2,8 +2,8 @@
 ; POST the core calls setup_maybe_enter (which opens this menu on Tab) and then
 ; boot_entry. boot_entry reads the chosen device from BOOT_CHOICE and dispatches:
 ;   0 floppy  -> the floppy path below
-;   1 disk    -> Toka-DOS on C:, not installed yet
-;   2 CD-ROM  -> unavailable
+;   1 disk    -> ATA fixed disk MBR
+;   2 CD-ROM  -> no boot backend yet
 ; The floppy path resets the disk system, reads the first sector to 0000:7C00, and
 ; far jumps there with DL set to the boot drive. There is NO 0xAA55 signature check:
 ; the IBM PC/XT BIOS boots a floppy unconditionally, and period booters (the
@@ -100,8 +100,8 @@ bm_enter_mode13h:
     ret
 
 ; --- INT 19h bootstrap ------------------------------------------------------
-; boot_entry: dispatch on BOOT_CHOICE. Floppy boots; Disk and CD-ROM report and
-; return so the machine idles (the Tab menu handles them interactively, but a
+; boot_entry: dispatch on BOOT_CHOICE. Floppy and disk boot; CD-ROM reports and
+; returns so the machine idles (the Tab menu handles choices interactively, but a
 ; non-interactive boot lands here with whatever default was seeded).
 boot_entry:
     ; Do NOT repaint the POST screen here. The graphical screen is already on the
@@ -216,7 +216,7 @@ boot_entry:
     ; fall through into .cdrom
 
 .cdrom:
-    ; No CD-ROM drive is present. Report and idle (return to the caller's loop).
+    ; El Torito boot is not modeled yet. Report and idle (return to the caller's loop).
     mov si, bm_str_cd_msg
     call boot_status_line
     ret
@@ -246,6 +246,6 @@ bm_str_cdrom:    db 'CD-ROM', 0
 bm_str_cd_tag:   db '(unavailable)', 0
 bm_str_hint:     db 'Up/Dn move   Enter select   Esc cancel', 0
 bm_str_disk_msg: db 'No bootable disk', 0
-bm_str_cd_msg:   db 'CD-ROM drive not available', 0
+bm_str_cd_msg:   db 'No bootable CD-ROM', 0
 
 str_boot_error:  db 'FLOPPY READ ERROR', 0
