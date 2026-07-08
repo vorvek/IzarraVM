@@ -911,11 +911,35 @@ su_row_colors:
     pop ax
     ret
 
+; su_cs_row_text_colors: BL = selectable-row index on entry; returns BL = fg,
+; BH = bg for text already sitting on a row whose highlight band was painted by
+; su_row_colors. Unlike su_row_colors, this does not repaint the band, so inline
+; value redraws cannot erase the label. Restores DS = CS for lfb_text.
+su_cs_row_text_colors:
+    push ax
+    push cx
+    mov cl, bl
+    xor ax, ax
+    mov ds, ax
+    mov al, [SU_CURSOR]
+    push cs
+    pop ds
+    cmp al, cl
+    jne .plain
+    mov bl, SU_C_FIELD
+    mov bh, SU_C_INK
+    jmp .done
+.plain:
+    mov bl, SU_C_INK
+    mov bh, SU_C_FIELD
+.done:
+    pop cx
+    pop ax
+    ret
+
 ; su_draw_mode_value: draw the working GSW mode's name (386/486/586/286) at the
 ; value column on the GSW row. Reads SU_WORKING_MODE; uses DS = CS for the string.
-; Uses the same fg/bh the row label got from su_row_colors (passed in via BL/BH
-; from the caller's last su_row_colors call, re-derived here to keep this
-; routine self-contained).
+; Re-derives the row text colors without repainting the highlight band.
 su_draw_mode_value:
     push cx
     xor cx, cx
@@ -944,7 +968,7 @@ su_draw_mode_value:
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 2
     mov bl, SU_ROW_GSW
-    call su_row_colors
+    call su_cs_row_text_colors
     call lfb_text
     pop cx
     ret
@@ -970,7 +994,7 @@ su_draw_layout_value:
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY
     mov bl, SU_ROW_LAYOUT
-    call su_row_colors
+    call su_cs_row_text_colors
     call lfb_text
     pop cx
     ret
