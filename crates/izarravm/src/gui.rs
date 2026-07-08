@@ -22,6 +22,15 @@ use winit::window::{Window, WindowId};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 
+/// Fixed makeup gain on the SB16 mix, modeling the card's analog output stage
+/// (line driver / power amp) that the digital mixer model does not represent.
+/// A game like Doom that never programs the CT1745 volume registers runs on the
+/// power-on default (master and voice both -14 dB), so its digitized voice path
+/// lands at -28 dB and is inaudible once played straight out of a host DAC with
+/// no analog gain. This lifts the whole mix back to a usable level; peaks clamp.
+/// Tunable: raise for louder, lower if music clips.
+const SB_OUTPUT_MAKEUP: f32 = 3.0;
+
 /// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
 /// perceptual curve; swap it for a proper dB map if it ever matters.
 fn volume_gain(volume: f32) -> f32 {
@@ -255,15 +264,17 @@ fn pump_audio(
         return;
     }
     let mut pcm = machine.render_audio(samples);
-    if gain != 1.0 {
-        for (l, r) in &mut pcm {
-            *l = (*l as f32 * gain)
-                .round()
-                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-            *r = (*r as f32 * gain)
-                .round()
-                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        }
+    // Fold the analog-output makeup into the host master gain so the two apply in
+    // one saturating pass. Always active (the makeup is not 1.0), so the branch
+    // that skipped a unity slider no longer applies.
+    let effective = gain * SB_OUTPUT_MAKEUP;
+    for (l, r) in &mut pcm {
+        *l = (*l as f32 * effective)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        *r = (*r as f32 * effective)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
     sink.queue(&pcm);
 }
