@@ -83,14 +83,24 @@ bootbox_menu:
     ret
 
 ; ===========================================================================
-; State seeding: read CMOS 0x11 (order) and 0x12 (speed) into the marks, and
-; place initial focus on the marked device. Leaves DS = 0. Clobbers AX, BX, CX.
+; State seeding: probe boot-device availability, read CMOS 0x11 (order) and
+; 0x12 (speed) into the marks, and place initial focus on the marked device.
+; Leaves DS = 0. Clobbers AX, BX, CX, DX.
 ; ===========================================================================
 bx_seed:
     xor cx, cx
     mov ds, cx
-    ; No boot-menu probe for HDD/CD presence, so only the floppy is selectable.
     mov byte [BMX_AVAIL], 0
+    call probe_hdd
+    cmp al, HRES_PASS
+    jne .no_hdd
+    or byte [BMX_AVAIL], 0x01
+.no_hdd:
+    call probe_optical
+    cmp al, HRES_PASS
+    jne .no_cd
+    or byte [BMX_AVAIL], 0x02
+.no_cd:
     ; Marked device from CMOS 0x11: 1 (disk-first) -> HDD if available, else floppy.
     mov al, BOOT_CMOS_ORDER
     out 0x70, al

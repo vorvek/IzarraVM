@@ -16,6 +16,7 @@
 //   2. Tab then F10 (Accept) on the default Floppy boots the mounted image: the
 //      Wizardry III booter takes over and switches the card to CGA.
 //   3. Walking down to the 286 row and accepting switches the CPU tier live.
+//   4. HDD/CD device rows become markable only when their firmware probes pass.
 //
 // Keys are fed as Set 1 scancodes via inject_key_scancodes.
 
@@ -38,6 +39,7 @@ const ESC_BREAK: u8 = 0x81;
 // F10 (or Enter on the Accept row) commits the marked device and speed.
 const F10_MAKE: u8 = 0x44;
 const F10_BREAK: u8 = 0xc4;
+const BOOT_CHOICE_ADDR: u32 = 0x052e;
 
 // The real Wizardry III booter image. The headless boot-floppy smoke command uses
 // the same path; the test is skipped when the corpus is not present so it stays
@@ -218,5 +220,69 @@ fn tab_navigates_to_hard_disk_and_reports_unavailable() {
         machine.active_display(),
         ActiveDisplay::MargoLfb,
         "the unavailable Hard Disk row returned to the menu without booting"
+    );
+}
+
+#[test]
+fn tab_selects_available_hard_disk_and_boots_it() {
+    let mut machine = boot_machine();
+    let mut img = vec![0u8; 512 * 4];
+    let boot = [
+        0xFA, // cli
+        0xBB, 0x00, 0x05, // mov bx,0500h
+        0xB0, 0x42, // mov al,42h
+        0x88, 0x07, // mov [bx],al
+        0x88, 0x57, 0x01, // mov [bx+1],dl
+        0xF4, // hlt
+    ];
+    img[..boot.len()].copy_from_slice(&boot);
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    machine.mount_hdd(img);
+
+    machine.inject_key_scancodes(&[
+        TAB_MAKE,
+        TAB_BREAK, // open the menu (Floppy focused)
+        UP_MAKE,
+        UP_BREAK, // Floppy -> Hard Disk
+        ENTER_MAKE,
+        ENTER_BREAK, // mark Hard Disk
+        F10_MAKE,
+        F10_BREAK, // Accept
+    ]);
+    machine.run_until_halt_or_cycles(60_000_000).unwrap();
+
+    assert_eq!(machine.read_physical_u8(0x0500), 0x42, "the MBR ran");
+    assert_eq!(
+        machine.read_physical_u8(0x0501),
+        0x80,
+        "the MBR received DL=80h"
+    );
+    assert_eq!(
+        machine.cmos_byte(0x11),
+        1,
+        "Accept persisted disk-first boot order"
+    );
+}
+
+#[test]
+fn tab_selects_available_cd_rom_row() {
+    let mut machine = boot_machine();
+    machine.inject_key_scancodes(&[
+        TAB_MAKE,
+        TAB_BREAK, // open the menu (Floppy focused)
+        DOWN_MAKE,
+        DOWN_BREAK, // Floppy -> CD-ROM
+        ENTER_MAKE,
+        ENTER_BREAK, // mark CD-ROM
+        F10_MAKE,
+        F10_BREAK, // Accept
+    ]);
+    machine.run_until_halt_or_cycles(35_000_000).unwrap();
+
+    assert_eq!(
+        machine.read_physical_u8(BOOT_CHOICE_ADDR),
+        2,
+        "Accept committed CD-ROM as this session's boot device"
     );
 }
