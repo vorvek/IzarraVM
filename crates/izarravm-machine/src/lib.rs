@@ -7715,20 +7715,23 @@ impl Machine {
             let playing_at_valid_rate = programmed_rate > 0 && self.wss.is_playing();
             if wss_rate > 0 && (playing_at_valid_rate || autocal_active) {
                 self.wss_sample_phase += clocks as f64 * wss_rate as f64 * self.timing.inv_clock;
-                while self.wss_sample_phase >= 1.0 {
-                    self.wss_sample_phase -= 1.0;
-                    let Machine {
-                        wss, dma, memory, ..
-                    } = self;
-                    // The codec pulls the 1/2/4 bytes a frame needs internally; an
-                    // idle (unarmed) codec, or one running only to retire ACI under
-                    // an invalid rate, ignores the fetcher and renders nothing.
+                let n = self.wss_sample_phase as usize;
+                self.wss_sample_phase -= n as f64;
+                if n > 0 {
                     if playing_at_valid_rate {
-                        wss.tick_sample(|| dma.read_byte(wss_dma, memory));
+                        // Scoped destructure only for the DMA fetcher so the borrow
+                        // ends before later self.wss calls (consistent with DSP HLE path).
+                        let Machine {
+                            wss, dma, memory, ..
+                        } = self;
+                        wss.tick_n_samples(n, || dma.read_byte(wss_dma, memory));
                     }
-                    wss.advance_autocal();
-                    // Forward the terminal-count edge at the frame that produced
-                    // it (see the DSP loop's multi-edge contract above).
+                    for _ in 0..n {
+                        self.wss.advance_autocal();
+                    }
+                    // Forward any terminal-count edge produced in the batch (one
+                    // request after N frames follows the multi-edge coalescing
+                    // contract; see DSP path).
                     if self.wss.take_irq() {
                         self.pic.request(wss_irq);
                     }
