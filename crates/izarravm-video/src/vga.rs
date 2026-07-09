@@ -6283,14 +6283,22 @@ mod tests {
             (0x40, 0x30, 0x10),
         ] {
             vga.beam = 0;
-            vga.vram[0] = color;
+            if vga.active_mode() == VideoMode::Mode13h {
+                vga.cpu_write_chain4(0, color);
+            } else {
+                vga.vram[0] = color;
+            }
             vga.attr.plane_enable = 0x0F | mux;
             assert_eq!(vga.read_status1() & 0x30, expected);
         }
 
         let htotal = htotal_dots(&vga.crtc);
         vga.beam = htotal * u64::from(vga.crtc.vretrace_start);
-        vga.vram[0] = 0xC0;
+        if vga.active_mode() == VideoMode::Mode13h {
+            vga.cpu_write_chain4(0, 0xC0);
+        } else {
+            vga.vram[0] = 0xC0;
+        }
         vga.attr.plane_enable = 0x3F;
         assert_eq!(vga.read_status1() & 0x30, 0x00);
     }
@@ -6391,6 +6399,12 @@ mod tests {
             // reads text_memory + font, filled above).
             for (i, b) in vga.vram.iter_mut().enumerate() {
                 *b = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
+            }
+            if vga.active_mode() == VideoMode::Mode13h {
+                // Fill linear the same for HLE fast path test content.
+                for (i, b) in vga.mode13_linear.iter_mut().enumerate() {
+                    *b = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
+                }
             }
             let htotal = htotal_dots(&vga.crtc);
             // Active lines swept at EVERY dot (a sparse dot grid provably lacks
@@ -7628,8 +7642,8 @@ mod tests {
             let mut vga = Vga::default();
             vga.set_mode13h();
             let plane0_byte: [u8; VGA_PLANES] = [0x40, 0x50, 0x60, 0x70];
-            for (plane, &b) in plane0_byte.iter().enumerate() {
-                vga.vram[plane * VGA_PLANE_SIZE] = b;
+            for (i, &b) in plane0_byte.iter().enumerate() {
+                vga.cpu_write_chain4(i, b);
             }
             vga.crtc.line_compare = 100;
             vga.attr.pixel_pan = pan;
