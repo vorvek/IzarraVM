@@ -320,6 +320,37 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// `mov dst32, [base + disp32]` (8B /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// 32-bit-operand, 32-bit-displacement load. Reads a 32-bit field past the disp8 range (the native
+    /// fold path reads `Registers.eip` at offset ~128 through the regs-base register). Zero-extends to
+    /// 64 bits like `load_r32_disp8`.
+    pub(crate) fn load_r32_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
+        if dst.ext() || base.ext() {
+            self.rex(false, dst.ext(), false, base.ext());
+        }
+        self.bytes.push(0x8B);
+        self.modrm(0b10, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `mov [base + disp32], src32` (89 /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12) -- the
+    /// 32-bit store mirror of `load_r32_disp32`, for writing back a 32-bit field past the disp8 range
+    /// (the native fold path writes the advanced `Registers.eip`).
+    pub(crate) fn store_r32_disp32(&mut self, base: Reg, disp32: i32, src: Reg) {
+        if src.ext() || base.ext() {
+            self.rex(false, src.ext(), false, base.ext());
+        }
+        self.bytes.push(0x89);
+        self.modrm(0b10, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
     /// `mov dst32, [base + index]` (8B /r, mod=00, rm=100 SIB, scale=1). No REX.W (32-bit load,
     /// zero-extends to 64). The base must NOT be RBP/R13 (SIB base=101 with mod=00 means "disp32,
     /// no base") and the index must NOT be RSP (SIB index=100 means "no index"). Used by the G0'
@@ -759,6 +790,46 @@ mod tests {
         let mut e = Encoder::new();
         e.store_r32_disp8(Reg::R15, 32, Reg::RAX);
         assert_eq!(e.finish(), vec![0x41, 0x89, 0x47, 0x20]);
+    }
+
+    #[test]
+    fn load_store_r32_disp32_known_bytes() {
+        // mov eax, [r14+128] -- REX.B (r14 extended), no REX.W. 8B; ModRM mod=10,reg=eax(0),
+        // rm=r14&7=6 = 10_000_110 = 0x86; disp32 128 LE. The native fold path's eip read.
+        let mut e = Encoder::new();
+        e.load_r32_disp32(Reg::RAX, Reg::R14, 128);
+        assert_eq!(e.finish(), vec![0x41, 0x8B, 0x86, 0x80, 0x00, 0x00, 0x00]);
+        // mov [r14+128], eax -- 89; ModRM 0x86; same disp32.
+        let mut e = Encoder::new();
+        e.store_r32_disp32(Reg::R14, 128, Reg::RAX);
+        assert_eq!(e.finish(), vec![0x41, 0x89, 0x86, 0x80, 0x00, 0x00, 0x00]);
+        // mov eax, [r12+200] -- r12&7=4 forces a SIB byte (0x24); REX.B. ModRM mod=10 = 0x84.
+        let mut e = Encoder::new();
+        e.load_r32_disp32(Reg::RAX, Reg::R12, 200);
+        assert_eq!(
+            e.finish(),
+            vec![0x41, 0x8B, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn store_then_load_r32_disp32_round_trips() {
+        // End-to-end: reserve stack, store a dword to [rsp+128] via disp32, reload it into a
+        // different register, return it. Exercises the SIB-forced (RSP) disp32 store+load path.
+        use super::super::exec_mem::ExecutableBuffer;
+        let mut e = Encoder::new();
+        e.sub_r64_imm32(Reg::RSP, 256);
+        e.mov_r32_imm32(Reg::RAX, 0x1234_5678);
+        e.store_r32_disp32(Reg::RSP, 128, Reg::RAX);
+        e.mov_r32_imm32(Reg::RAX, 0); // clobber so the reload is observable
+        e.load_r32_disp32(Reg::RCX, Reg::RSP, 128);
+        e.mov_r32_r32(Reg::RAX, Reg::RCX);
+        e.add_r64_imm32(Reg::RSP, 256);
+        e.ret();
+        let bytes = e.finish();
+        let buf = ExecutableBuffer::new(&bytes).expect("alloc must succeed on a supported host");
+        let f: extern "C" fn() -> i64 = unsafe { std::mem::transmute(buf.entry_ptr()) };
+        assert_eq!(f(), 0x1234_5678);
     }
 
     #[test]
