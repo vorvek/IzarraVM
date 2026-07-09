@@ -4,305 +4,24 @@
 //! display-path hardware cursor, a scaled YUV video overlay, a DMA command pusher, and
 //! hardware dithering.
 
+mod modes;
+mod registers;
+
+use modes::{BAYER_4X4, decode_argb, quantize_channel, yuv_to_argb};
+pub use modes::{
+    Channel, MARGO_VBE_MODES, MargoDisplay, PixelFormat, VbeMode, bytes_per_pixel, pixel_format,
+    vbe_mode,
+};
+pub use registers::*;
+
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
-pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
-pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0fff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER, 11 DITHER
 
-/// Ordered 4x4 Bayer matrix (cells 0..15) for hardware dithering (section 7.10).
-const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VbeMode {
-    pub number: u16,
-    pub width: u32,
-    pub height: u32,
-    pub bpp: u32,
-}
-
-/// The modes Margo lists, reports, and sets. Includes 8-bit indexed modes
-/// (slice 2b) and hi-color/true-color modes (slice 8): 15bpp, 16bpp, and 32bpp.
-pub const MARGO_VBE_MODES: &[VbeMode] = &[
-    VbeMode {
-        number: 0x100,
-        width: 640,
-        height: 400,
-        bpp: 8,
-    },
-    VbeMode {
-        number: 0x101,
-        width: 640,
-        height: 480,
-        bpp: 8,
-    },
-    // Proprietary VEGA/Margo OEM mode: 320x240x256, line-doubled to the display
-    // by the monitor/scaler. Used by the Izarra-BIOS graphical POST screen.
-    VbeMode {
-        number: 0x150,
-        width: 320,
-        height: 240,
-        bpp: 8,
-    },
-    VbeMode {
-        number: 0x103,
-        width: 800,
-        height: 600,
-        bpp: 8,
-    },
-    VbeMode {
-        number: 0x105,
-        width: 1024,
-        height: 768,
-        bpp: 8,
-    },
-    VbeMode {
-        number: 0x110,
-        width: 640,
-        height: 480,
-        bpp: 15,
-    },
-    VbeMode {
-        number: 0x111,
-        width: 640,
-        height: 480,
-        bpp: 16,
-    },
-    VbeMode {
-        number: 0x113,
-        width: 800,
-        height: 600,
-        bpp: 15,
-    },
-    VbeMode {
-        number: 0x114,
-        width: 800,
-        height: 600,
-        bpp: 16,
-    },
-    VbeMode {
-        number: 0x116,
-        width: 1024,
-        height: 768,
-        bpp: 15,
-    },
-    VbeMode {
-        number: 0x117,
-        width: 1024,
-        height: 768,
-        bpp: 16,
-    },
-    VbeMode {
-        number: 0x14a,
-        width: 640,
-        height: 480,
-        bpp: 32,
-    },
-    VbeMode {
-        number: 0x14c,
-        width: 800,
-        height: 600,
-        bpp: 32,
-    },
-    VbeMode {
-        number: 0x14e,
-        width: 1024,
-        height: 768,
-        bpp: 32,
-    },
-];
-
-pub fn vbe_mode(number: u16) -> Option<VbeMode> {
-    MARGO_VBE_MODES
-        .iter()
-        .copied()
-        .find(|mode| mode.number == number)
-}
-
-/// Bytes a pixel of `bpp` occupies in the frame store: 8->1, 15->2, 16->2,
-/// 32->4. The 15bpp case is why this is not `bpp / 8`.
-pub fn bytes_per_pixel(bpp: u32) -> u32 {
-    bpp.div_ceil(8)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Channel {
-    pub pos: u32,  // bit position of the low bit
-    pub size: u32, // bit width
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PixelFormat {
-    pub r: Channel,
-    pub g: Channel,
-    pub b: Channel,
-    pub x: Channel, // unused/reserved bits; size 0 when none
-}
-
-/// Direct-color layout for `bpp`. 8bpp is indexed (palette), not a direct-color
-/// format, so it returns None, as do depths outside the mode table.
-pub fn pixel_format(bpp: u32) -> Option<PixelFormat> {
-    match bpp {
-        15 => Some(PixelFormat {
-            r: Channel { pos: 10, size: 5 },
-            g: Channel { pos: 5, size: 5 },
-            b: Channel { pos: 0, size: 5 },
-            x: Channel { pos: 15, size: 1 },
-        }),
-        16 => Some(PixelFormat {
-            r: Channel { pos: 11, size: 5 },
-            g: Channel { pos: 5, size: 6 },
-            b: Channel { pos: 0, size: 5 },
-            x: Channel { pos: 0, size: 0 },
-        }),
-        32 => Some(PixelFormat {
-            r: Channel { pos: 16, size: 8 },
-            g: Channel { pos: 8, size: 8 },
-            b: Channel { pos: 0, size: 8 },
-            x: Channel { pos: 24, size: 8 },
-        }),
-        _ => None,
-    }
-}
-
-/// Expand a `size`-bit color component to 8 bits by replicating the high bits
-/// into the low ones. Only called with size 5, 6, or 8 (the R/G/B widths here);
-/// the `2 * size - 8` shift assumes size >= 4.
-fn expand_to_8(value: u32, size: u32) -> u32 {
-    if size >= 8 {
-        return value & 0xff;
-    }
-    debug_assert!(
-        size >= 4,
-        "expand_to_8: size {size} below 4 underflows the replicate shift"
-    );
-    let v = value & ((1 << size) - 1);
-    (v << (8 - size)) | (v >> (2 * size - 8))
-}
-
-/// Decode one scanout pixel to host ARGB `0x00RRGGBB`. `bpp` selects the format,
-/// `raw` is the little-endian pixel value already assembled from 1/2/4 bytes,
-/// and `palette` resolves 8-bit indices. Unknown depths decode to black.
-fn decode_argb(bpp: u32, raw: u32, palette: &[u32; 256]) -> u32 {
-    if bpp == 8 {
-        return palette[(raw & 0xff) as usize];
-    }
-    let Some(fmt) = pixel_format(bpp) else {
-        return 0;
-    };
-    // expand_to_8 masks to `size` bits, so the raw shift needs no extra mask.
-    let r = expand_to_8(raw >> fmt.r.pos, fmt.r.size);
-    let g = expand_to_8(raw >> fmt.g.pos, fmt.g.size);
-    let b = expand_to_8(raw >> fmt.b.pos, fmt.b.size);
-    (r << 16) | (g << 8) | b
-}
-
-/// Convert one YUV triple to host ARGB 0x00RRGGBB by studio-swing ITU-R BT.601
-/// (Y 16..=235, chroma 16..=240), the canonical integer coefficients. Rounds with
-/// a +128 bias then an arithmetic shift, and clamps each channel to 0..=255. This
-/// is the overlay's conversion (section 7.8); it produces ARGB directly rather
-/// than going through `decode_argb`.
-fn yuv_to_argb(y: u8, u: u8, v: u8) -> u32 {
-    let c = y as i32 - 16;
-    let d = u as i32 - 128;
-    let e = v as i32 - 128;
-    let clamp = |x: i32| x.clamp(0, 255) as u32;
-    let r = clamp((298 * c + 409 * e + 128) >> 8);
-    let g = clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
-    let b = clamp((298 * c + 516 * d + 128) >> 8);
-    (r << 16) | (g << 8) | b
-}
-
-/// Reduce one 8-bit channel `v` to `bits` (5 or 6) for a 15/16-bit display, then
-/// bit-replicate back to 8 bits (matching `expand_to_8`, so the host sees exactly
-/// what an N-bit DAC would show). With `dither` off the channel is plainly
-/// truncated (the value the primary surface stores). With it on, the ordered 4x4
-/// Bayer cell offset (scaled to the dropped low bits) is added before truncating,
-/// spreading the quantization error spatially. `bits` is 5 or 6 here.
-fn quantize_channel(v: u32, bits: u32, cell: u32, dither: bool) -> u32 {
-    let shift = 8 - bits;
-    let offset = if dither { (cell << shift) / 16 } else { 0 };
-    let code = (v + offset).min(255) >> shift;
-    (code << shift) | (code >> (2 * bits - 8))
-}
-
-pub const REG_ID: usize = 0x0000;
-pub const REG_CAPS: usize = 0x0004;
-pub const REG_STATUS: usize = 0x0008;
-pub const REG_CONTROL: usize = 0x000c;
-pub const REG_DISP_MODE: usize = 0x0010;
-pub const REG_DISP_WIDTH: usize = 0x0014;
-pub const REG_DISP_HEIGHT: usize = 0x0018;
-pub const REG_DISP_BPP: usize = 0x001c;
-pub const REG_DISP_PITCH: usize = 0x0020;
-pub const REG_DISP_START: usize = 0x0024;
-pub const REG_CURSOR_CTRL: usize = 0x0028;
-pub const REG_CURSOR_ADDR: usize = 0x002c;
-pub const REG_CURSOR_POS: usize = 0x0030;
-pub const REG_CURSOR_FG: usize = 0x0034;
-pub const REG_CURSOR_BG: usize = 0x0038;
-pub const REG_OVL_CTRL: usize = 0x0040;
-pub const REG_OVL_SRC_Y: usize = 0x0044;
-pub const REG_OVL_SRC_PITCH: usize = 0x0048;
-pub const REG_OVL_SRC_DIM: usize = 0x004c;
-pub const REG_OVL_SRC_U: usize = 0x0050;
-pub const REG_OVL_SRC_V: usize = 0x0054;
-pub const REG_OVL_DST_XY: usize = 0x0058;
-pub const REG_OVL_DST_DIM: usize = 0x005c;
-pub const REG_OVL_COLORKEY: usize = 0x0060;
-
-pub const REG_PUSH_CTRL: usize = 0x0080;
-pub const REG_PUSH_BASE: usize = 0x0084;
-pub const REG_PUSH_SIZE: usize = 0x0088;
-pub const REG_PUSH_PUT: usize = 0x008c;
-pub const REG_PUSH_GET: usize = 0x0090;
-
-// Blit engine registers (section 7.3). All R/W; the engine reads the ones it
-// needs when COMMAND fires. The block 0x100..0x150 is a flat R/W store.
-pub const REG_DST_BASE: usize = 0x0100;
-pub const REG_DST_PITCH: usize = 0x0104;
-pub const REG_SRC_BASE: usize = 0x0108;
-pub const REG_SRC_PITCH: usize = 0x010c;
-pub const REG_DEPTH: usize = 0x0110;
-pub const REG_DST_XY: usize = 0x0114;
-pub const REG_SRC_XY: usize = 0x0118;
-pub const REG_DIM: usize = 0x011c;
-pub const REG_FG_COLOR: usize = 0x0120;
-pub const REG_BG_COLOR: usize = 0x0124;
-pub const REG_ROP: usize = 0x0128;
-pub const REG_COLORKEY: usize = 0x012c;
-pub const REG_FLAGS: usize = 0x0130;
-pub const REG_CLIP_TL: usize = 0x0134;
-pub const REG_CLIP_BR: usize = 0x0138;
-pub const REG_LINE_START: usize = 0x013c;
-pub const REG_LINE_END: usize = 0x0140;
-pub const REG_PAT_BASE: usize = 0x0144;
-pub const REG_COMMAND: usize = 0x0150;
-pub const REG_MONO_DATA: usize = 0x0160;
-
-const CURSOR_BASE: usize = 0x0028;
-const CURSOR_REGS: usize = 5; // 0x0028..0x003C: CTRL, ADDR, POS, FG, BG
-const OVL_BASE: usize = 0x0040;
-const OVL_REGS: usize = 9; // 0x0040..=0x0060: CTRL, SRC_Y, SRC_PITCH, SRC_DIM, SRC_U, SRC_V, DST_XY, DST_DIM, COLORKEY
-const PUSH_BASE_REG: usize = 0x0080;
-const PUSH_REGS: usize = 5; // 0x0080..=0x0090: CTRL, BASE, SIZE, PUT, GET
-const BLIT_BASE: usize = 0x0100;
-const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
 const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
 const EXPAND_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s color expand (section 1.1, fill class)
 const LINE_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s, one pixel per clock (section 1.1)
 const PATTERN_NS_PER_PIXEL: u64 = 5; // fill class, 200 Mpixels/s (section 1.1)
 const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MargoDisplay {
-    pub mode: u16,
-    pub width: u32,
-    pub height: u32,
-    pub bpp: u32,
-    pub pitch: u32,
-    pub start: u32,
-}
 
 /// Evaluate an 8-bit ROP3 code: the boolean function of pattern P, source S, and
 /// destination D, applied bitwise across the pixel value. Bit `4*P + 2*S + D` of
@@ -767,16 +486,6 @@ fn pattern(vram: &mut [u8], p: &PatternParams) -> u64 {
     written
 }
 
-/// The DMA pusher's register state, read by the machine that drives the engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PusherRegs {
-    pub enabled: bool,
-    pub base: u32,
-    pub size: u32,
-    pub put: u32,
-    pub get: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Margo {
     vram: Vec<u8>,
@@ -1216,22 +925,6 @@ impl Margo {
 
     fn overlay_reg(&self, offset: usize) -> u32 {
         self.overlay[(offset - OVL_BASE) / 4]
-    }
-
-    /// The DMA pusher registers, for the machine-level engine (section 7.9).
-    pub fn pusher(&self) -> PusherRegs {
-        PusherRegs {
-            enabled: self.pusher[0] & 0x1 != 0,
-            base: self.pusher[1],
-            size: self.pusher[2],
-            put: self.pusher[3],
-            get: self.pusher[4],
-        }
-    }
-
-    /// Advance the pusher's read offset PUSH_GET (engine-owned; read-only to the bus).
-    pub fn set_pusher_get(&mut self, get: u32) {
-        self.pusher[4] = get;
     }
 
     /// The remaining modeled busy time in nanoseconds. The pusher gates on this so
