@@ -74,7 +74,7 @@ impl AudioPlayer {
             _stream: stream,
             sink: AudioSink {
                 ring,
-                capacity: SOURCE_HZ as usize / 2, // ~0.5 s of backlog
+                capacity: SOURCE_HZ as usize, // ~1 s of backlog (larger ring for HLE drift tolerance)
             },
         })
     }

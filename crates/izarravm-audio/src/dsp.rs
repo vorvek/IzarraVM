@@ -177,6 +177,9 @@ pub struct SbDsp {
     rate_is_byte_rate: bool,
     block_size: u32,
     block_remaining: u32,
+    // HLE pre-fetched block data for command + buffer level production (Phase 4).
+    block_buffer: Option<Vec<u8>>,
+    block_buffer_pos: usize,
     auto_init: bool,
     playing: bool,
     irq_pending: bool,
@@ -222,6 +225,8 @@ impl Default for SbDsp {
             rate_is_byte_rate: true,
             block_size: 0,
             block_remaining: 0,
+            block_buffer: None,
+            block_buffer_pos: 0,
             auto_init: false,
             playing: false,
             irq_pending: false,
@@ -409,6 +414,8 @@ impl SbDsp {
         self.playing = true;
         self.block_remaining = self.block_size;
         self.half_reached = false;
+        self.block_buffer = None;
+        self.block_buffer_pos = 0;
     }
 
     /// Arm the 8-bit DMA path as a Creative ADPCM transfer. Mono unsigned like
@@ -453,6 +460,8 @@ impl SbDsp {
         self.block_remaining = count;
         self.half_reached = false;
         self.playing = true;
+        self.block_buffer = None;
+        self.block_buffer_pos = 0;
     }
 
     /// Arm the SB16 8-bit DMA path from a 0xCx command (mode byte + 2-byte
@@ -512,6 +521,10 @@ impl SbDsp {
         self.block_remaining
     }
 
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
     /// Advance the DMA playback by exactly one stereo frame and push the result
     /// onto the rendered-frame ring. This is the per-CPU-clock producer entry
     /// point: it wraps the existing [`render_frame`] (which advances the block
@@ -526,6 +539,18 @@ impl SbDsp {
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
             push_frame_capped(&mut self.rendered, frame);
+        }
+    }
+
+    /// Batch tick for HLE: tick n samples at once (each may push to rendered and
+    /// advance block/IRQ). Used to batch the phase accumulation in advance_devices.
+    pub fn tick_n_samples<B, W>(&mut self, n: usize, mut byte_fetch: B, mut word_fetch: W)
+    where
+        B: FnMut() -> Option<u8>,
+        W: FnMut() -> Option<u16>,
+    {
+        for _ in 0..n {
+            self.tick_sample(&mut byte_fetch, &mut word_fetch);
         }
     }
 
@@ -614,6 +639,55 @@ impl SbDsp {
             self.advance_block(1);
             Some((s, s))
         }
+    }
+
+    /// Batch render for HLE: produce up to n frames at once. Used to drive
+    /// production from guest elapsed time * rate in batch (Phase 4).
+    pub fn render_n_frames<B, W>(
+        &mut self,
+        n: usize,
+        mut byte_fetch: B,
+        mut word_fetch: W,
+    ) -> Vec<(i16, i16)>
+    where
+        B: FnMut() -> Option<u8>,
+        W: FnMut() -> Option<u16>,
+    {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            if let Some(f) = self.render_frame(&mut byte_fetch, &mut word_fetch) {
+                out.push(f);
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    // HLE buffer accessors for command + buffer level (Phase 4).
+    pub fn take_block_buffer(&mut self) -> Option<Vec<u8>> {
+        self.block_buffer.take()
+    }
+
+    pub fn set_block_buffer(&mut self, buf: Vec<u8>) {
+        self.block_buffer = Some(buf);
+        self.block_buffer_pos = 0;
+    }
+
+    pub fn block_buffer_pos(&self) -> usize {
+        self.block_buffer_pos
+    }
+
+    pub fn advance_block_buffer(&mut self, bytes: usize) {
+        self.block_buffer_pos += bytes;
+    }
+
+    pub fn block_buffer_len(&self) -> usize {
+        self.block_buffer.as_ref().map_or(0, |b| b.len())
+    }
+
+    pub fn block_buffer(&self) -> Option<&Vec<u8>> {
+        self.block_buffer.as_ref()
     }
 
     /// Pop the next decoded Creative ADPCM sample, fetching and decoding encoded

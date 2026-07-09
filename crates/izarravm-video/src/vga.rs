@@ -994,6 +994,9 @@ pub fn beam_hsync(t: &CrtcTiming, dots: u64) -> bool {
 #[derive(Debug, Clone)]
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
+    // HLE fast linear buffer for mode 13h (Phase 5 fast path for common games).
+    #[allow(dead_code)]
+    pub(crate) mode13_linear: Vec<u8>,
     pub(crate) crtc: CrtcTiming,
     pub(crate) crtc_regs: CrtcRegs,
     pub(crate) seq: Sequencer,
@@ -1063,6 +1066,7 @@ impl Default for Vga {
 
         let mut vga = Self {
             vram: vec![0; VGA_PLANAR_SIZE],
+            mode13_linear: vec![0; 0x10000],
             crtc: CrtcTiming::text_03h(),
             crtc_regs: CrtcRegs::default(),
             seq: Sequencer::default(),

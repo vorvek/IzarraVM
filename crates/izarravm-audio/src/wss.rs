@@ -553,6 +553,13 @@ impl Ad1848 {
         }
     }
 
+    /// Batch tick for HLE (Phase 4).
+    pub fn tick_n_samples<B: FnMut() -> Option<u8>>(&mut self, n: usize, mut fetch: B) {
+        for _ in 0..n {
+            self.tick_sample(&mut fetch);
+        }
+    }
+
     /// Pop the oldest rendered stereo frame for the host audio path, or `None`
     /// when the ring is empty.
     pub fn drain_frame(&mut self) -> Option<(i16, i16)> {
