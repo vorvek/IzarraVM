@@ -31,12 +31,18 @@ mod dma;
 mod pci;
 
 pub(crate) use pci::PciConfig;
+mod cache_config;
 mod ram_lookup;
 mod timing;
 mod video_params;
 
 pub(crate) use ram_lookup::RamPageLookup;
 pub(crate) use timing::{DAC_HZ, OPL_NATIVE_HZ, PIT_INPUT_HZ, WSS_AUTOCAL_FALLBACK_HZ};
+
+pub(crate) use cache_config::{
+    CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_TIER_DISABLED_MASK, CacheLevelConfig, TierCost,
+    cache_level_config, code_fetch_ws, tier_cost,
+};
 
 #[allow(unused_imports)]
 pub(crate) use video_params::{
@@ -287,121 +293,6 @@ impl TimingFactors {
 /// Bytes per modeled cache line: 64 bytes on every tier. (A real Pentium MMX uses
 /// 32-byte lines; the line size is kept as-is -- out of scope for the P55C timing
 /// retarget, which changed clock / L1 size / dials, not the line geometry.)
-const CACHE_LINE_BYTES: u32 = 64;
-/// Largest L1 across all modes (586 = 32 KB) in lines: 32 KB / 64 B = 512.
-const CACHE_L1_MAX_LINES: usize = (32 * 1024) / CACHE_LINE_BYTES as usize;
-/// Largest L2 across all modes (586 = 512 KB) in lines: 512 KB / 64 B = 8192.
-const CACHE_L2_MAX_LINES: usize = (512 * 1024) / CACHE_LINE_BYTES as usize;
-
-/// Per-mode modeled cache geometry (bytes); 0 means that tier does not exist.
-/// Mirrors `CpuLevel::cache_kb` (the CPUID/cache readout) so the timing model and
-/// the reported sizes never drift apart.
-#[derive(Clone, Copy)]
-struct CacheGeometry {
-    l1_bytes: u32,
-    l2_bytes: u32,
-}
-
-const fn cache_geometry(level: CpuLevel) -> CacheGeometry {
-    match level {
-        CpuLevel::I286 => CacheGeometry {
-            l1_bytes: 0,
-            l2_bytes: 0,
-        },
-        CpuLevel::I386 => CacheGeometry {
-            l1_bytes: 0,
-            l2_bytes: 64 * 1024,
-        },
-        CpuLevel::I486 => CacheGeometry {
-            l1_bytes: 16 * 1024,
-            l2_bytes: 128 * 1024,
-        },
-        CpuLevel::I586 => CacheGeometry {
-            l1_bytes: 32 * 1024,
-            l2_bytes: 512 * 1024,
-        },
-    }
-}
-
-/// Per-mode wait-states charged per access by tier (CALIBRATED, B-T10). `l1`/`l2`/
-/// `ram` are the wait-states added to the 2-clock base bus access. Since B-T10 the
-/// whole bus portion is then scaled per mode by `bus_timing` (`scale_bus`), so a
-/// tier's dword bandwidth is `4 bytes * clock_hz / ((2 + ws) * bus_num/bus_den) /
-/// 1e6` MB/s. `tier_cost` carries the RELATIVE L1<L2<RAM structure; `bus_timing`
-/// carries the absolute magnitude. Tiers descend (more wait-states for the slower
-/// tier): L1 < L2 < RAM.
-///
-/// SPLIT OF ROLES: the fast modes' L1 is dhry-coupled (Dhrystone, the PRIMARY
-/// oracle, is ~30% L1 data), so `l1` stays small to keep Dhrystone on target; that
-/// makes L1 bandwidth land above SpeedSys (the `bus_timing` < 1 scale-up the fast
-/// modes need also scales L1 bandwidth up). The L2/RAM tiers are DECOUPLED -- the
-/// benchmarks fit L1/L2 and never miss them -- so large miss penalties pull L2/RAM
-/// down toward the SpeedSys figures (486 L2/RAM land exactly; 586 L2/RAM floor a
-/// touch high because the u8 wait-state cap of 255, spread over a 16-dword line,
-/// limits the per-access average). `l1` also doubles as nothing here -- the code
-/// fetch uses its own `code_fetch_ws` dial. See bench_reference.rs for the bands
-/// and the recorded SpeedSys gaps.
-#[derive(Clone, Copy, Debug)]
-struct TierCost {
-    l1: u8,
-    l2: u8,
-    ram: u8,
-}
-
-const fn tier_cost(level: CpuLevel) -> TierCost {
-    match level {
-        // 286 @ 8.33 MHz: no cache, flat RAM. ws=0; with bus_timing 6/11 the RAM
-        // bandwidth is ~30.6 MB/s. RAM is dhry-coupled (286 has no cache, so all
-        // Dhrystone data is RAM), so the ws stays 0 to keep Dhrystone on target;
-        // the band is recentered on the achieved value (era SpeedSys ~16, gap ~1.9x
-        // from the bus scaler).
-        CpuLevel::I286 => TierCost {
-            l1: 0,
-            l2: 0,
-            ram: 0,
-        },
-        // 386 @ 22 MHz: L2 + RAM, no L1. The bandwidth sweep reads 16 dwords per
-        // 64-byte line; on a RAM miss the line is installed into L2 (no L1 here), so
-        // the next 15 dwords are L2 hits. RAM tier MB/s is thus set by
-        // (ram_miss_ws + 15*l2_ws)/16. L2 is dhry-coupled (386 Dhrystone fits L2),
-        // so l2=0 stays to keep Dhrystone on target -> L2 ~59 MB/s. RAM miss ws=3 ->
-        // avg 0.19 -> ~54 MB/s, descending below L2. Both ride above SpeedSys (era
-        // L2 ~44, RAM ~40, gap ~1.35x) by the bus scaler; bands recentered.
-        CpuLevel::I386 => TierCost {
-            l1: 0,
-            l2: 0,
-            ram: 3,
-        },
-        // 486 DX2 @ 66 MHz: L1 ws=2 (dhry-coupled, kept small) -> with bus_timing
-        // 1/3 -> ~198 MB/s L1 (above SpeedSys 70; the bus scale-up that hits the
-        // 486 Dhrystone target also lifts L1 bandwidth). NOTE the amortization: the
-        // sweep reads 16 dwords per 64-byte line; the first dword resolves the
-        // L2/RAM tier and installs the line into L1, so the next 15 dwords are L1
-        // hits. A miss tier's measured MB/s is therefore set by (miss_ws +
-        // 15*l1_ws)/16. L2 miss ws=191 -> ~50 MB/s (SpeedSys-exact); RAM miss ws=250
-        // -> ~41 MB/s (SpeedSys-exact). The large miss penalties model a real
-        // line-fill stall and only bite an actual cache miss; the L1-resident
-        // benchmarks (sieve 8 KB, dhry, fp-mandel) never pay them. Descending.
-        CpuLevel::I486 => TierCost {
-            l1: 2,
-            l2: 191,
-            ram: 250,
-        },
-        // 586 Pentium MMX-200 @ 200 MHz: L1 ws=0 (dhry-coupled) -> with bus_timing
-        // 7/30 -> ~1700 MB/s L1 (the bus scale that hits the 586 Dhrystone target also
-        // sets L1 bandwidth; irreducible while Dhrystone is on target, since both share
-        // the L1 + bus timing). Same 16-dwords-per-line amortization as the 486: L2
-        // miss ws=200 -> ~235 MB/s; RAM miss ws=255 -> ~191 MB/s. The u8 wait-state cap
-        // (255) over a 16-dword line bounds the per-access average against the 7/30 bus
-        // scale; bands recentered best-effort (Pentium-MMX-200-class). Descending.
-        CpuLevel::I586 => TierCost {
-            l1: 0,
-            l2: 200,
-            ram: 255,
-        },
-    }
-}
-
 /// Per-mode VIDEO-window wait-states for the Approximate class (486/586), the
 /// FOURTH timing lever, calibrated (2026-07-05, retuned 2026-07-06) against the
 /// owner's real-hardware Doom `-timedemo demo3` fps targets (486 DX2-66 max
@@ -453,75 +344,6 @@ const fn video_wait_states_approx(level: CpuLevel) -> u8 {
         // Retuned 2026-07-06: ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
         // See the function-level doc for the sweep data and the isolation proof.
         CpuLevel::I586 => 88,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CacheLevelConfig {
-    l1_mask: u32,
-    l2_mask: u32,
-}
-
-const CACHE_TIER_DISABLED_MASK: u32 = u32::MAX;
-
-const fn build_cache_level_config(level: CpuLevel) -> CacheLevelConfig {
-    let g = cache_geometry(level);
-    let l1_lines = if g.l1_bytes == 0 {
-        0
-    } else {
-        g.l1_bytes / CACHE_LINE_BYTES
-    };
-    let l2_lines = if g.l2_bytes == 0 {
-        0
-    } else {
-        g.l2_bytes / CACHE_LINE_BYTES
-    };
-    CacheLevelConfig {
-        l1_mask: if l1_lines == 0 {
-            CACHE_TIER_DISABLED_MASK
-        } else {
-            l1_lines - 1
-        },
-        l2_mask: if l2_lines == 0 {
-            CACHE_TIER_DISABLED_MASK
-        } else {
-            l2_lines - 1
-        },
-    }
-}
-
-const CACHE_CONFIG_286: CacheLevelConfig = build_cache_level_config(CpuLevel::I286);
-const CACHE_CONFIG_386: CacheLevelConfig = build_cache_level_config(CpuLevel::I386);
-const CACHE_CONFIG_486: CacheLevelConfig = build_cache_level_config(CpuLevel::I486);
-const CACHE_CONFIG_586: CacheLevelConfig = build_cache_level_config(CpuLevel::I586);
-
-#[inline(always)]
-const fn cache_level_config(level: CpuLevel) -> CacheLevelConfig {
-    match level {
-        CpuLevel::I286 => CACHE_CONFIG_286,
-        CpuLevel::I386 => CACHE_CONFIG_386,
-        CpuLevel::I486 => CACHE_CONFIG_486,
-        CpuLevel::I586 => CACHE_CONFIG_586,
-    }
-}
-
-/// Per-mode CODE-fetch wait-state seam: extra wait-states added to the 2-clock base
-/// bus access for an instruction byte fetched from cacheable RAM (an I-cache hit).
-/// It is its own per-mode dial, DECOUPLED from the data cache tiers (`tier_cost`)
-/// and from the bus magnitude lever (`bus_timing`/`scale_bus`): a real I-cache
-/// delivers instruction bytes far more cheaply than a data-tier miss, so code fetch
-/// gets its own knob rather than reusing the data L1 cost. The calibrated modes hit
-/// their Dhrystone era targets with this seam at 0 in every mode, so all entries are
-/// currently 0; the seam stays here so a future fetch-side penalty can be dialed in
-/// per mode without disturbing the data tiers or the bus scale.
-const fn code_fetch_ws(level: CpuLevel) -> u8 {
-    match level {
-        // Currently 0 in every mode: the data tiers + bus scale carry the timing,
-        // and the compute benchmarks land in band with no extra fetch-side cost.
-        CpuLevel::I286 => 0,
-        CpuLevel::I386 => 0,
-        CpuLevel::I486 => 0,
-        CpuLevel::I586 => 0,
     }
 }
 
@@ -7720,13 +7542,66 @@ impl Machine {
                 let n = self.wss_sample_phase as usize;
                 self.wss_sample_phase -= n as f64;
                 if n > 0 {
-                    if playing_at_valid_rate {
-                        // Scoped destructure only for the DMA fetcher so the borrow
-                        // ends before later self.wss calls (consistent with DSP HLE path).
-                        let Machine {
-                            wss, dma, memory, ..
-                        } = self;
-                        wss.tick_n_samples(n, || dma.read_byte(wss_dma, memory));
+                    // HLE block buffer pre-fetch + feeding for WSS (Phase 4), with
+                    // support for spanning multiple blocks within large n (refill
+                    // when auto-reload happens inside tick).
+                    let mut remaining = n;
+                    while remaining > 0 {
+                        if playing_at_valid_rate && self.wss.block_buffer().is_none() {
+                            let frames = self.wss.current_dma_count() as usize;
+                            let count = frames * self.wss.bytes_per_frame();
+                            if count > 0 {
+                                let mut buf = Vec::with_capacity(count);
+                                {
+                                    let Machine { dma, memory, .. } = self;
+                                    for _ in 0..count {
+                                        buf.push(dma.read_byte(wss_dma, memory).unwrap_or(0));
+                                    }
+                                }
+                                self.wss.set_block_buffer(buf);
+                            }
+                        }
+                        let mut consumed_from_buf: usize = 0;
+                        if playing_at_valid_rate {
+                            if let Some(buf) = self.wss.block_buffer().cloned() {
+                                let start_pos = self.wss.block_buffer_pos();
+                                let bytes_avail = buf.len().saturating_sub(start_pos);
+                                if bytes_avail > 0 {
+                                    let frames_this = bytes_avail.min(remaining);
+                                    self.wss.tick_n_samples(frames_this, || {
+                                        let p = start_pos + consumed_from_buf;
+                                        if p < buf.len() {
+                                            let b = buf[p];
+                                            consumed_from_buf += 1;
+                                            Some(b)
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                }
+                            } else {
+                                let frames_this = remaining;
+                                let Machine {
+                                    wss, dma, memory, ..
+                                } = self;
+                                wss.tick_n_samples(frames_this, || dma.read_byte(wss_dma, memory));
+                            }
+                        }
+                        if consumed_from_buf > 0 {
+                            self.wss.advance_block_buffer(consumed_from_buf);
+                        }
+                        if self.wss.block_buffer_pos() >= self.wss.block_buffer_len() {
+                            self.wss.take_block_buffer();
+                        }
+                        let did = if consumed_from_buf > 0 {
+                            consumed_from_buf
+                        } else {
+                            remaining
+                        };
+                        if did == 0 {
+                            break;
+                        }
+                        remaining = remaining.saturating_sub(did);
                     }
                     for _ in 0..n {
                         self.wss.advance_autocal();
@@ -12024,6 +11899,8 @@ mod tests {
     use izarravm_core::{SbDma8, SbDma16, SbIrq};
     use izarravm_firmware::I386DX25_TEST_ROM;
     use izarravm_video::{VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE};
+    // Re-exported from cache carve (Phase 3).
+    use super::cache_config::{CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK, cache_geometry};
 
     const BIOS_TEXT_WHITE: u8 = 0x3F;
 

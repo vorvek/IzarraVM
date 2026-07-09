@@ -165,6 +165,9 @@ pub struct Ad1848 {
     /// Rendered stereo frames, drained by the host audio path; capped by
     /// `pcm::push_frame_capped` (drop-oldest rate-match buffer).
     rendered: VecDeque<(i16, i16)>,
+    // HLE pre-fetched block data for WSS DMA (Phase 4 command/buffer level).
+    block_buffer: Option<Vec<u8>>,
+    block_buffer_pos: usize,
 }
 
 impl Default for Ad1848 {
@@ -199,6 +202,8 @@ impl Ad1848 {
             current_count: 0,
             playing: false,
             rendered: VecDeque::new(),
+            block_buffer: None,
+            block_buffer_pos: 0,
         }
     }
 
@@ -367,10 +372,14 @@ impl Ad1848 {
         if pen && self.base_count() > 0 {
             if !self.playing {
                 self.current_count = self.base_count();
+                self.block_buffer = None;
+                self.block_buffer_pos = 0;
             }
             self.playing = true;
         } else {
             self.playing = false;
+            self.block_buffer = None;
+            self.block_buffer_pos = 0;
         }
     }
 
@@ -395,8 +404,23 @@ impl Ad1848 {
     }
 
     /// True when I8 selects stereo (S/M bit set).
-    fn is_stereo(&self) -> bool {
+    pub fn is_stereo(&self) -> bool {
         self.regs[IDX_FORMAT] & I8_SM != 0
+    }
+
+    pub fn is_16bit(&self) -> bool {
+        self.format() == Format::Pcm16
+    }
+
+    /// Bytes the byte-fetcher will be called for per output frame, for HLE
+    /// block buffer sizing (Phase 4).
+    pub fn bytes_per_frame(&self) -> usize {
+        let per_sample = if self.is_16bit() { 2 } else { 1 };
+        if self.is_stereo() {
+            per_sample * 2
+        } else {
+            per_sample
+        }
     }
 
     /// Output sample rate in Hz, decoded from I8's CFS2:0 + CSS bits via the
@@ -437,6 +461,11 @@ impl Ad1848 {
     /// Whether playback is armed (PEN set + non-zero base count).
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    /// Current DMA count for HLE block-buffer pre-fetch decision (Phase 4).
+    pub fn current_dma_count(&self) -> u32 {
+        self.current_count
     }
 
     /// Whether the post-MCE autocalibrate (ACI) window is still retiring. The
@@ -564,6 +593,32 @@ impl Ad1848 {
     /// when the ring is empty.
     pub fn drain_frame(&mut self) -> Option<(i16, i16)> {
         self.rendered.pop_front()
+    }
+
+    // HLE buffer accessors for WSS command + buffer level DMA pre-fetch (Phase 4).
+    pub fn take_block_buffer(&mut self) -> Option<Vec<u8>> {
+        self.block_buffer.take()
+    }
+
+    pub fn set_block_buffer(&mut self, buf: Vec<u8>) {
+        self.block_buffer = Some(buf);
+        self.block_buffer_pos = 0;
+    }
+
+    pub fn block_buffer_pos(&self) -> usize {
+        self.block_buffer_pos
+    }
+
+    pub fn advance_block_buffer(&mut self, bytes: usize) {
+        self.block_buffer_pos += bytes;
+    }
+
+    pub fn block_buffer_len(&self) -> usize {
+        self.block_buffer.as_ref().map_or(0, |b| b.len())
+    }
+
+    pub fn block_buffer(&self) -> Option<&Vec<u8>> {
+        self.block_buffer.as_ref()
     }
 
     /// Advance the Current Count by one sample period. Per the datasheet, the
