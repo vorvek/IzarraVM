@@ -3843,14 +3843,27 @@ impl Cpu386 {
                 ctx_ptr,
             );
         }
-        let (raw, count, halted, fault) = {
+        let (raw, count, halted, fault, folded_bus) = {
             let region = self
                 .jit_regions
                 .get_mut(idx)
                 .expect("the region that just ran is still installed");
             let ctx = &mut *region.ctx;
-            (ctx.raw_clocks, ctx.insn_count, ctx.halted, ctx.fault.take())
+            (
+                ctx.raw_clocks,
+                ctx.insn_count,
+                ctx.halted,
+                ctx.fault.take(),
+                std::mem::take(&mut ctx.folded_raw_bus),
+            )
         };
+        // Flush any bus cost the tail native fold slots accumulated but did not hand to a region_step
+        // slot: a region that exits directly from a native LOAD's line_live probe (or an inline slot's
+        // cap check immediately after one) leaves the last fold unflushed. Bus-timing only (the core
+        // term rides raw_clocks below), keeping the device-visible clock total current at region exit.
+        if folded_bus > 0 {
+            bus.charge_bus_clocks_bulk(folded_bus);
+        }
         let charged = self.scale_clocks_batch(raw);
         self.elapsed_clocks += charged;
         self.perf.instructions += u64::from(count);
@@ -14322,8 +14335,15 @@ mod tests {
         eprintln!("run_total_at_entry offset = {rt_off}");
         let cap_off = core::mem::offset_of!(RegionCtx, cap);
         eprintln!("cap offset = {cap_off}");
+        // `d` is read by LIVE emitted code now (the native fold's line_live arg loads it via D_OFF=144),
+        // so pin it — a reorder that moved it while leaving the fold fields > 127 would slip past the
+        // other asserts and feed jit_line_live the wrong decode-line D bit.
         let d_off = core::mem::offset_of!(RegionCtx, d);
         eprintln!("d offset = {d_off}");
+        assert_eq!(
+            d_off, 144,
+            "RegionCtx.d moved; update D_OFF in jit/block.rs"
+        );
         // The native cost-fold reads these two by disp32 (both are past 127). The emit bakes
         // offset_of! at emit time, so a reorder still produces correct code; assert they stay in the
         // disp32 range so a future field placement that pulled them under 128 (silently switching the
