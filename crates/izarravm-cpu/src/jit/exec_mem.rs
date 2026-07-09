@@ -11,7 +11,7 @@ pub(crate) struct ExecutableBuffer {
 }
 
 // SAFETY: the buffer holds only plain code bytes; nothing here is interior-mutable shared state.
-// `Cpu386` (which owns these via `JitBlockCache`) is not itself required to be Send/Sync today,
+// `CpuGsw` (which owns these via `JitBlockCache`) is not itself required to be Send/Sync today,
 // but marking this Send/Sync keeps it from accidentally blocking a future requirement; the
 // pointer is never aliased outside this type.
 unsafe impl Send for ExecutableBuffer {}

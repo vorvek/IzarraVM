@@ -30,7 +30,7 @@
 //! - Every slot's decode is live in the cache (generation-current), unprefixed, and stays inside
 //!   its 4 KB page, mirroring the run loop's own continuation gate. The physical span is captured
 //!   at admission; a narrow-SMC kill inside it stales the slot table via the epoch.
-//! - The block key includes the CPU mode/size bitmask (`Cpu386::jit_mode_key`), validated at
+//! - The block key includes the CPU mode/size bitmask (`CpuGsw::jit_mode_key`), validated at
 //!   entry, so a block compiled for one mode is never reused in another at the same phys/d
 //!   (spec §2.2).
 //!
@@ -49,7 +49,7 @@ use super::exec_mem::ExecutableBuffer;
 use super::region::{CompiledRegion, JIT_REGION_TABLE_CAP};
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
 use crate::{
-    AddressSize, Cpu386, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, PerfCounters,
+    AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, PerfCounters,
     Prefixes, Registers, SegmentIndex,
 };
 
@@ -100,7 +100,7 @@ fn classify_slot(insn: &DecodedInsn) -> SlotKind {
     // 0x8B mov r32,r32 (reg=dst, rm=src); 0x81 /0 add r32,imm32 (reg=0, rm=dst); 0xC1 /5 shr
     // r32,imm8 (reg=5, rm=dst). The inline emit is 32-bit ONLY (load_r32/add_r32_imm32/shr_r32
     // and Dword flags), so it is correct only at 32-bit operand size. Operand size is mode-derived
-    // (`Cpu386::operand_size`): in a 32-bit code segment the r32 form is unprefixed and the r16
+    // (`CpuGsw::operand_size`): in a 32-bit code segment the r32 form is unprefixed and the r16
     // form carries 0x66 (rejected by build_block); in a 16-bit code segment it is the OPPOSITE, so
     // the unprefixed r16 form would reach here. Gating on `Dword` keeps those 16-bit forms on the
     // full trampoline step (correct width, interpreter-identical) instead of a wrong-width inline.
@@ -206,7 +206,7 @@ fn loop_back_edge_target(insn: &DecodedInsn, lin: u32) -> Option<u32> {
 /// terminal). Interior slots are classified by `classify_slot`; the terminal slot runs through the
 /// full step (`BackEdge` for a self-loop, `Memory` otherwise) so `region_step`'s index-based
 /// terminal handling drives it.
-pub(crate) fn build_block(cpu: &Cpu386, entry_lin: u32, d: bool) -> Option<(Vec<Slot>, bool)> {
+pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<Slot>, bool)> {
     let mut slots: Vec<Slot> = Vec::new();
     let mut lin = entry_lin;
     let is_loop = loop {
@@ -339,7 +339,7 @@ fn fold_store_eligible(insn: &DecodedInsn) -> Option<(u8, Option<u8>, i32, u8)> 
 /// supported Mem* , with batched bookkeeping + cross-mult cap check. Memory/BackEdge fall to full
 /// step (or native fold probe for u8 when enabled). After final slot a jmp closes the loop.
 ///
-/// `regs_offset` is `offset_of!(Cpu386, registers)`, baked in so the inline slots address `gpr[]`
+/// `regs_offset` is `offset_of!(CpuGsw, registers)`, baked in so the inline slots address `gpr[]`
 /// as `[cpu + regs_offset + 4*i]` from the cpu pointer in R12. The emitted bytes depend on the slot
 /// kinds and their baked immediates, so the buffer is re-emitted on every fresh admission (the
 /// re-stamp path refreshes the slot table; the next fresh admission re-reads the immediates from
@@ -763,7 +763,7 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, (crate::TLB_ENTRIES as u32) - 1);
     e.shl_r32_imm8(Reg::RDX, 4);
-    let tlb_ent_off = core::mem::offset_of!(Cpu386, tlb) as u32
+    let tlb_ent_off = core::mem::offset_of!(CpuGsw, tlb) as u32
         + core::mem::offset_of!(crate::Tlb, entries) as u32;
     e.add_r64_imm32(Reg::RDX, tlb_ent_off);
     e.add_r64_r64(Reg::RDX, Reg::R12); // RDX = &TlbEntry
@@ -773,15 +773,15 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
     e.jnz(miss);
 
     // gen match
-    let tlb_gen_off = core::mem::offset_of!(Cpu386, tlb) as u32
+    let tlb_gen_off = core::mem::offset_of!(CpuGsw, tlb) as u32
         + core::mem::offset_of!(crate::Tlb, generation) as u32;
     e.load_r32_disp32(Reg::RAX, Reg::R12, tlb_gen_off as i32);
     e.cmp_r32_disp8(Reg::RAX, Reg::RDX, 8);
     e.jnz(miss);
 
     // Protection and dirty checks (mirror translate_linear_checked hit path).
-    let cpl_off = core::mem::offset_of!(Cpu386, cpl) as i32;
-    let cr0_off = core::mem::offset_of!(Cpu386, control) as i32
+    let cpl_off = core::mem::offset_of!(CpuGsw, cpl) as i32;
+    let cr0_off = core::mem::offset_of!(CpuGsw, control) as i32
         + core::mem::offset_of!(crate::ControlRegisters, cr0) as i32;
 
     // user = (cpl == 3)
@@ -899,7 +899,7 @@ pub(crate) fn emit_load_u8_probe(
     e.shr_r32_imm8(Reg::RDX, 12);
     e.and_r32_imm32(Reg::RDX, (crate::DIRECT_PAGE_CACHE_LINES as u32) - 1);
     e.shl_r32_imm8(Reg::RDX, 4);
-    let entries_off = core::mem::offset_of!(Cpu386, data_read_pages) as u32
+    let entries_off = core::mem::offset_of!(CpuGsw, data_read_pages) as u32
         + core::mem::offset_of!(crate::DirectPageCache, entries) as u32;
     e.add_r64_imm32(Reg::RDX, entries_off);
     e.add_r64_r64(Reg::RDX, Reg::R12);
@@ -997,7 +997,7 @@ fn emit_store_u8_probe(
     e.shr_r32_imm8(Reg::RDX, 12);
     e.and_r32_imm32(Reg::RDX, (crate::DIRECT_PAGE_CACHE_LINES as u32) - 1);
     e.shl_r32_imm8(Reg::RDX, 4);
-    let entries_off = core::mem::offset_of!(Cpu386, data_write_pages) as u32
+    let entries_off = core::mem::offset_of!(CpuGsw, data_write_pages) as u32
         + core::mem::offset_of!(crate::DirectPageCache, entries) as u32;
     e.add_r64_imm32(Reg::RDX, entries_off);
     e.add_r64_r64(Reg::RDX, Reg::R12);
@@ -1069,7 +1069,7 @@ fn emit_native_store_fold(
 /// Emit `cpu.perf.<field at `perf_field_off`> += 1` — a native u64 RMW off R12 (=cpu). Used by the fold
 /// slots to count native LOAD/STORE hits (instrumentation for the anchor A/B + the test proofs).
 fn emit_native_hit_counter(e: &mut Encoder, perf_field_off: usize) {
-    let off = (core::mem::offset_of!(Cpu386, perf) + perf_field_off) as i32;
+    let off = (core::mem::offset_of!(CpuGsw, perf) + perf_field_off) as i32;
     e.load_r64_disp32(Reg::RAX, Reg::R12, off);
     e.add_r64_imm32(Reg::RAX, 1);
     e.store_r64_disp32(Reg::R12, off, Reg::RAX);
@@ -1101,7 +1101,7 @@ fn emit_fold_bookkeeping(
     // self-loop region (no admitted interior slot arms the shadow — the arming ops are terminal), but
     // clear it anyway to match the interpreter's per-slot write exactly (the state comparator compares
     // this field). Compute &interrupt_shadow = cpu + off and store a zero byte (DL) — off exceeds disp8.
-    let shadow_off = core::mem::offset_of!(Cpu386, interrupt_shadow) as u32;
+    let shadow_off = core::mem::offset_of!(CpuGsw, interrupt_shadow) as u32;
     e.mov_r64_r64(Reg::RAX, Reg::R12);
     e.add_r64_imm32(Reg::RAX, shadow_off);
     e.xor_r64_self(Reg::RDX);
@@ -1311,7 +1311,7 @@ fn emit_native_bookkeeping(
     }
 }
 
-/// Call `Cpu386::jit_set_shift_flags_shr(cpu, value, count)` with cpu in R12, the original value
+/// Call `CpuGsw::jit_set_shift_flags_shr(cpu, value, count)` with cpu in R12, the original value
 /// in RCX (moved to its arg reg), and `count` baked as an immediate.
 fn emit_set_shift_flags_shr_call(e: &mut Encoder, count: u8) {
     #[cfg(windows)]
@@ -1366,7 +1366,7 @@ const SCALE_DEN_OFF: u32 = 132;
 /// production auto-admission uses `try_admit_gated` with `reject_linear` set, and the forced-address
 /// override passes `reject_linear = false` directly.
 #[cfg(test)]
-pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
+pub(crate) fn try_admit(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
     try_admit_gated(cpu, entry_lin, d, false)
 }
 
@@ -1384,7 +1384,7 @@ pub(crate) fn try_admit(cpu: &mut Cpu386, entry_lin: u32, d: bool) -> Option<Non
 /// ~2.9x wall regression (751M region entries, ~5 insns each, all entry/exit overhead). Refusing
 /// admission is always state-correct (the interpreter runs the block).
 pub(crate) fn try_admit_gated(
-    cpu: &mut Cpu386,
+    cpu: &mut CpuGsw,
     entry_lin: u32,
     d: bool,
     reject_linear: bool,
@@ -1414,7 +1414,7 @@ pub(crate) fn try_admit_gated(
     let phys_hi = phys_lo.checked_add(span - 1)?;
     let epoch = cpu.decode_cache.jit_smc_epoch;
     let mode_key = cpu.jit_mode_key();
-    let regs_offset = core::mem::offset_of!(Cpu386, registers) as u32;
+    let regs_offset = core::mem::offset_of!(CpuGsw, registers) as u32;
     let (_scale_num, scale_den) = crate::level_timing(cpu.level);
     // Cost-fold native LOAD gate (read the toggle once here — the true emit site — so this admission's
     // decision, the emit, and `has_native_fold` all agree): ON only if `IZARRAVM_JIT_FOLD` is set AND

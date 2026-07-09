@@ -1,6 +1,4 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
-#[allow(unused_imports)]
-use izarravm_bus::DirectPage; // used by cpu_tests.rs (path-mod) for TestBus impls
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
@@ -19,13 +17,14 @@ pub(crate) use flags::{
     FLAG_SF, FLAG_TF, FLAG_VM, FLAG_ZF, LazyFlagOp, LazyFlags,
 };
 
+#[allow(unused_imports)]
 pub(crate) use paging::{
     CodePageCache, DIRECT_PAGE_CACHE_LINES, DirectPageCache, DirectPageCacheEntry, FetchPageCache,
     PREFETCH_WINDOW_BYTES, PrefetchWindow, TLB_ENTRIES, TRACKED_WRITE_PAGES, Tlb, TlbEntry,
 };
 
 /// Gate for the opt-in `#UD` diagnostic trace (T1.5: making a reflected #UD
-/// observable, see `Cpu386::trace_ud_if_enabled`). Mirrors
+/// observable, see `CpuGsw::trace_ud_if_enabled`). Mirrors
 /// `izarravm_machine::fault_trace_enabled` (same env var), cached after the
 /// first check so a #UD storm costs one atomic load per fault rather than a
 /// syscall. Measurement-only: this crate has no other env dependency, and the
@@ -402,7 +401,7 @@ impl Default for DescriptorTable {
 
 // `repr(C)` pins `gpr` at offset 0 within `Registers`, so the JIT's emitted native code can read
 // and write `gpr[i]` as `[regs_ptr + 4*i]` without going through a Rust accessor. `registers` is
-// the first field of `Cpu386`; the dispatch passes a `*mut Registers` (derived from the cpu
+// the first field of `CpuGsw`; the dispatch passes a `*mut Registers` (derived from the cpu
 // pointer) into the region entry for this purpose. The offset guard test in `mod tests` freezes
 // the layout assumptions a rustc version bump could otherwise invalidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,7 +618,7 @@ const CPU_PROFILE_GROUPS: usize = 16;
 
 /// Host-side performance counters: pure diagnostics for `--headless-bench`, NOT
 /// architectural state. Like the decode cache and TLB, this carries an always-equal
-/// `PartialEq` so it is excluded from `Cpu386` equality (conformance and golden-state
+/// `PartialEq` so it is excluded from `CpuGsw` equality (conformance and golden-state
 /// comparisons must ignore it). The only hot-path cost is one `instructions += 1` per
 /// retired instruction; everything else increments at cold per-run sites.
 #[derive(Debug, Clone, Default)]
@@ -722,7 +721,7 @@ pub struct PerfCounters {
 }
 
 impl PartialEq for PerfCounters {
-    // Diagnostic-only: never affects Cpu386 equality (conformance / goldens ignore it).
+    // Diagnostic-only: never affects CpuGsw equality (conformance / goldens ignore it).
     fn eq(&self, _other: &Self) -> bool {
         true
     }
@@ -843,7 +842,7 @@ impl std::fmt::Debug for CpuProfileState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Cpu386 {
+pub struct CpuGsw {
     pub registers: Registers,
     pub fpu: X87,
     pub control: ControlRegisters,
@@ -913,9 +912,9 @@ pub struct Cpu386 {
     /// Optional host-side profiling. Off for normal execution and excluded from equality.
     profile: CpuProfileState,
     /// Deferred arithmetic flags (lazy-flags optimization). While not none, the six arithmetic-flag
-    /// bits in `registers.eflags` are stale. Cpu386 equality is flag-representation-sensitive while a
+    /// bits in `registers.eflags` are stale. CpuGsw equality is flag-representation-sensitive while a
     /// deferral is outstanding; real flag comparisons go through `flag()` / `eflags()`, which
-    /// materialize. (Cpu386 `==` is currently unused.)
+    /// materialize. (CpuGsw `==` is currently unused.)
     ///
     /// Stored as the #[repr(C)] PendingFlags form so native emitted code can write it directly
     /// (v2 inlining). Legacy LazyFlags is only for conversion during the final migration of
@@ -1382,7 +1381,7 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 ///
 /// Gated on `level` (not a runtime bus flag) so the Accurate class (I286/I386) keeps
 /// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
-/// per decode, and `Cpu386::set_level` unconditionally invalidates the decode cache
+/// per decode, and `CpuGsw::set_level` unconditionally invalidates the decode cache
 /// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
 /// admission re-resolved -- after any level change. There is no stale-entry window where an
 /// I286-level IN or TEST could carry an I586-level admission decision forward.
@@ -1613,7 +1612,7 @@ struct DecodedInsn {
 /// 14.5 to 23.2 (+60%), and lifted decode_hit from 94.85% to 97.66%. 8192 gave diminishing
 /// returns (24.9 insns/run, +7% over 4096). At ~48 bytes per line (DecodeLine = tag + generation +
 /// DecodedInsn) 4096 lines is ~192 KB, still inside L2 on a normal (8-32 MB L3) machine.
-/// Purely microarchitectural: the decode cache is transparent to Cpu386 equality, so this needs
+/// Purely microarchitectural: the decode cache is transparent to CpuGsw equality, so this needs
 /// no conformance/regolden work.
 const DECODE_CACHE_LINES: usize = 4096;
 
@@ -1723,7 +1722,7 @@ struct PageCodeInfo {
 /// was cached from, and a write into a marked block advances the generation (cross-page SMC). The
 /// benchmark path has no SMC, and identical bench checksums verify nothing stale is served.
 ///
-/// Transparent accelerator, not architectural state: excluded from `Cpu386` equality (like
+/// Transparent accelerator, not architectural state: excluded from `CpuGsw` equality (like
 /// `PrefetchWindow`) and reset rather than copied on clone.
 struct DecodeCache {
     lines: Box<[DecodeLine]>,
@@ -1751,7 +1750,7 @@ struct DecodeCache {
     /// Bumped whenever a narrow SMC kill lands inside an installed JIT region's physical span:
     /// the region's slot table may now be stale (the entry line's stamp can survive a kill of a
     /// LATER slot's line). `run_region` refuses a region whose `valid_epoch` lags and unstamps
-    /// it, forcing matcher re-admission over the fresh decodes. Lives here (not on `Cpu386`)
+    /// it, forcing matcher re-admission over the fresh decodes. Lives here (not on `CpuGsw`)
     /// because the whole cache is excluded from CPU equality; this is host bookkeeping.
     #[cfg(feature = "jit")]
     jit_smc_epoch: u32,
@@ -2173,7 +2172,7 @@ enum PagingAccessor {
     Supervisor,
 }
 
-impl Cpu386 {
+impl CpuGsw {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -3452,17 +3451,17 @@ impl Cpu386 {
             ctx.inline_step_fn =
                 Some(jit::step::region_inline_slot::<B> as jit::step::RegionStepFn);
             // Raw fn pointers to the flag helpers. The cast through `as` is sound: each helper is
-            // `fn(&mut self, ...)` and we store it as `unsafe extern "C" fn(*mut Cpu386, ...)`,
+            // `fn(&mut self, ...)` and we store it as `unsafe extern "C" fn(*mut CpuGsw, ...)`,
             // calling it with the cpu pointer the emitted code already holds; the `&mut` rebind
             // inside is the same disjoint-reborrow pattern region_step uses.
             ctx.set_pending_add_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut Cpu386, u32, u32), jit::step::SetPendingAddFn>(
-                    Self::jit_set_pending_add as fn(&mut Cpu386, u32, u32),
+                std::mem::transmute::<fn(&mut CpuGsw, u32, u32), jit::step::SetPendingAddFn>(
+                    Self::jit_set_pending_add as fn(&mut CpuGsw, u32, u32),
                 )
             });
             ctx.set_shift_flags_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut Cpu386, u32, u8), jit::step::SetShiftFlagsFn>(
-                    Self::jit_set_shift_flags_shr as fn(&mut Cpu386, u32, u8),
+                std::mem::transmute::<fn(&mut CpuGsw, u32, u8), jit::step::SetShiftFlagsFn>(
+                    Self::jit_set_shift_flags_shr as fn(&mut CpuGsw, u32, u8),
                 )
             });
             ctx.charge_fetch_fn =
@@ -3470,8 +3469,8 @@ impl Cpu386 {
             ctx.bus_clocks_fn = Some(jit::step::jit_bus_clocks::<B> as jit::step::BusClocksFn);
             ctx.line_live_fn = Some(jit::step::jit_line_live as jit::step::LineLiveFn);
             ctx.store_finish_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut Cpu386, u32), jit::step::StoreFinishFn>(
-                    Self::jit_store_u8_finish as fn(&mut Cpu386, u32),
+                std::mem::transmute::<fn(&mut CpuGsw, u32), jit::step::StoreFinishFn>(
+                    Self::jit_store_u8_finish as fn(&mut CpuGsw, u32),
                 )
             });
             ctx.entry_eip = eip;
@@ -8711,7 +8710,7 @@ impl Cpu386 {
     ///   materialization, and the VM/NT/AF read-modify-writes never reach bit 18.
     ///
     /// `registers`/`control` are pub, so a direct field poke bypasses this; the only such
-    /// non-test writer in the tree (`boot_sector_cpu`) pokes a fresh `Cpu386::default()`
+    /// non-test writer in the tree (`boot_sector_cpu`) pokes a fresh `CpuGsw::default()`
     /// whose reset image has both bits clear, matching the default `false`.
     fn recompute_alignment_armed(&mut self) {
         self.alignment_armed =
@@ -11989,7 +11988,7 @@ fn fpu_round_rc(control: u16, value: f64) -> f64 {
     }
 }
 
-impl Cpu386 {
+impl CpuGsw {
     // ============================ x87 FPU (387-class) ============================
     // Escape opcodes 0xD8-0xDF. Registers are f64 (see fpu.rs for the precision
     // ceiling). Coverage now spans arithmetic (all D8/DC/DA/DE forms), the
@@ -13525,7 +13524,7 @@ const fn is_mmx_two_byte(opcode: u8) -> bool {
     )
 }
 
-impl Cpu386 {
+impl CpuGsw {
     // ================================ MMX ================================
     // 0F-extended integer SIMD on the eight 64-bit MMX registers (mmx.rs holds the
     // lane math). EMMS takes no operand; the shift-by-immediate forms (0F 71/72/73)
@@ -13680,7 +13679,7 @@ impl Cpu386 {
     }
 }
 
-impl Cpu386 {
+impl CpuGsw {
     // ===================== Protected-mode system instructions =====================
     // The 0F 00 / 0F 01 groups plus LAR/LSL/CLTS. LDTR/TR live in the CPU state; the
     // segment-verify and access-rights instructions read descriptors from the GDT or

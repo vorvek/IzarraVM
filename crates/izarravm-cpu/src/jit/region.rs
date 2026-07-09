@@ -35,7 +35,7 @@ pub(crate) struct CompiledRegion {
     /// The emitted code's entry point, into `buf`.
     pub entry: RegionEntryFn,
     /// The region's slot table and per-entry mailbox. Boxed so its address is stable and
-    /// disjoint from the `Cpu386` allocation (the step function reborrows both mutably).
+    /// disjoint from the `CpuGsw` allocation (the step function reborrows both mutably).
     /// Re-stamping after an SMC patch replaces `ctx.slots` wholesale from fresh decodes AND re-
     /// emits the buffer (v2 bakes the add-imm immediates into the emitted bytes, so a self-patch
     /// that changes an immediate requires a fresh emit; see `try_admit`).
@@ -44,16 +44,16 @@ pub(crate) struct CompiledRegion {
     pub d: bool,
     /// The region's physical byte span [phys_lo, phys_hi], captured at admission (single-page
     /// by the matcher's containment rule, so contiguity holds). A narrow SMC kill inside it
-    /// stales the slot table; see `Cpu386::jit_smc_epoch`.
+    /// stales the slot table; see `CpuGsw::jit_smc_epoch`.
     pub phys_lo: u32,
     pub phys_hi: u32,
-    /// `Cpu386::jit_smc_epoch` at the last builder validation of `ctx.slots`. Entry requires
+    /// `CpuGsw::jit_smc_epoch` at the last builder validation of `ctx.slots`. Entry requires
     /// equality with the live epoch.
     pub valid_epoch: u32,
     /// Whether the block is a self-loop (native back-edge) or linear. Copied into `ctx.is_loop` on
     /// every entry; `region_step` reads it at the terminal slot.
     pub is_loop: bool,
-    /// The CPU mode/size bitmask (`Cpu386::jit_mode_key`) the block was compiled for. Entry
+    /// The CPU mode/size bitmask (`CpuGsw::jit_mode_key`) the block was compiled for. Entry
     /// requires equality with the live mode key, so a block compiled for one mode is never reused
     /// in another at the same phys/d (spec §2.2). A mismatch is a miss: unstamp and re-admit.
     pub mode_key: u32,
@@ -87,7 +87,7 @@ pub(crate) struct RegionTable {
     regions: Vec<CompiledRegion>,
     /// Whether the continuation seam admits hot loops automatically. Off by default so
     /// manual-admission tests and the forced-address path are undisturbed; the CLI/GUI turns it on
-    /// to run the JIT on real workloads. Lives here (not on `Cpu386`) so it is excluded from CPU
+    /// to run the JIT on real workloads. Lives here (not on `CpuGsw`) so it is excluded from CPU
     /// equality via this table's always-equal `PartialEq` - setting it never makes two otherwise
     /// identical CPUs compare unequal, which the differential suite relies on.
     auto_admit: bool,
@@ -153,7 +153,7 @@ impl RegionTable {
 }
 
 // Transparent accelerator, not architectural state (the DecodeCache pattern): excluded from
-// `Cpu386` equality, cloned as empty (a cloned CPU re-compiles), Debug is a summary.
+// `CpuGsw` equality, cloned as empty (a cloned CPU re-compiles), Debug is a summary.
 impl PartialEq for RegionTable {
     fn eq(&self, _: &Self) -> bool {
         true
@@ -178,7 +178,7 @@ mod tests {
     use super::*;
 
     unsafe extern "C" fn stub_entry(
-        _cpu: *mut crate::Cpu386,
+        _cpu: *mut crate::CpuGsw,
         _bus: *mut std::ffi::c_void,
         _ctx: *mut RegionCtx,
     ) -> i64 {

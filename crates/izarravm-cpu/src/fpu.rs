@@ -32,7 +32,7 @@ pub struct X87 {
     mm: [u64; 8],
 }
 
-// Bit-wise equality so the containing Cpu386 can keep deriving Eq despite the
+// Bit-wise equality so the containing CpuGsw can keep deriving Eq despite the
 // f64 register file (f64 is not Eq because of NaN; comparing raw bits is).
 impl PartialEq for X87 {
     fn eq(&self, other: &Self) -> bool {

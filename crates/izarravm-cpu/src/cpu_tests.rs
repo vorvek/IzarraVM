@@ -1,5 +1,5 @@
 use super::*;
-use izarravm_bus::{BusCycle, BusTrace, BusWidth};
+use izarravm_bus::{BusCycle, BusTrace, BusWidth, DirectPage};
 use izarravm_bus::{DirectMemoryRead, DirectMemoryWrite};
 
 /// The JIT's emitted native code addresses `gpr[i]` as `[regs_ptr + 4*i]`, relying on
@@ -19,9 +19,9 @@ fn registers_repr_c_offsets_are_stable() {
     assert_eq!(core::mem::offset_of!(Registers, eflags), eip_off + 4);
 }
 
-/// The v2 region emitter bakes `offset_of!(Cpu386, registers)` into its emitted bytes (the
+/// The v2 region emitter bakes `offset_of!(CpuGsw, registers)` into its emitted bytes (the
 /// prologue computes `regs_ptr = cpu_ptr + regs_offset`, and inline slots address gpr as
-/// `[regs_ptr + 4*i]`). Cpu386 is NOT repr(C), so rustc is free to reorder its fields; this
+/// `[regs_ptr + 4*i]`). CpuGsw is NOT repr(C), so rustc is free to reorder its fields; this
 /// test pins the current offset so a rustc version bump that moved `registers` is caught here
 /// (the emitter reads the offset at emit time, so a changed value still produces correct code,
 /// but the assertion documents the layout and guards against a silent perf shift from a
@@ -29,8 +29,8 @@ fn registers_repr_c_offsets_are_stable() {
 #[test]
 #[cfg(feature = "jit")]
 fn cpu_registers_field_offset_is_stable() {
-    let off = core::mem::offset_of!(Cpu386, registers);
-    // The current layout places `registers` at a non-zero offset (rustc reorders Cpu386's
+    let off = core::mem::offset_of!(CpuGsw, registers);
+    // The current layout places `registers` at a non-zero offset (rustc reorders CpuGsw's
     // fields for alignment). The emitter handles any value (it bakes `offset_of!` at emit
     // time, verified by the differential suites jit_region + jit_general); this assertion
     // freezes the known position so a change is visible. The constant tracks the live layout
@@ -38,7 +38,7 @@ fn cpu_registers_field_offset_is_stable() {
     // `registers`; the emitter re-reads the offset, so this is a documentation update).
     assert_eq!(
         off, 464,
-        "Cpu386.registers offset moved; update the emitter's baked offset"
+        "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
 
@@ -55,7 +55,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
     assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
     // Pending flags offset for direct write in v2 inlining (slice 2+).
-    assert_eq!(core::mem::offset_of!(Cpu386, pending_flags), 3912);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3912);
     // Verify the timing-field offsets the native cap check uses.
     let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
     eprintln!("raw_clocks offset = {raw_off}");
@@ -113,11 +113,11 @@ fn jit_set_pending_add_matches_alu_add() {
         (0x0000_00ff, 0x0000_0001),
     ];
     for &(a, b) in &probes {
-        let mut ref_cpu = Cpu386::default();
+        let mut ref_cpu = CpuGsw::default();
         ref_cpu.alu_add(a, b, 0, BusWidth::Dword);
         let ref_ef = ref_cpu.materialized_eflags();
 
-        let mut jit_cpu = Cpu386::default();
+        let mut jit_cpu = CpuGsw::default();
         jit_cpu.jit_set_pending_add(a, b);
         let jit_ef = jit_cpu.materialized_eflags();
 
@@ -155,7 +155,7 @@ fn jit_set_shift_flags_shr_matches_shift_rotate() {
     ];
     for &value in &values {
         for count in 0u8..=31 {
-            let mut ref_cpu = Cpu386::default();
+            let mut ref_cpu = CpuGsw::default();
             // Seed a non-trivial pending descriptor first, so the slow path of
             // set_shift_result_flags (fold-then-eager) is exercised, matching the real loop
             // where an earlier add slot leaves a descriptor outstanding.
@@ -163,7 +163,7 @@ fn jit_set_shift_flags_shr_matches_shift_rotate() {
             ref_cpu.shift_rotate(5, value, count, BusWidth::Dword);
             let ref_ef = ref_cpu.materialized_eflags();
 
-            let mut jit_cpu = Cpu386::default();
+            let mut jit_cpu = CpuGsw::default();
             jit_cpu.alu_add(0x1000, 0x2000, 0, BusWidth::Dword);
             jit_cpu.jit_set_shift_flags_shr(value, count);
             let jit_ef = jit_cpu.materialized_eflags();
@@ -260,7 +260,7 @@ fn g0_prime_cpu_ceiling_probe() {
         access,
         default_size_32: true,
     };
-    let setup = |cpu: &mut Cpu386| {
+    let setup = |cpu: &mut CpuGsw| {
         cpu.control.cr0 |= CR0_PE;
         cpu.registers.set_segment(SegmentIndex::Cs, seg(0x08, 0x9b)); // 32-bit code
         cpu.registers.set_segment(SegmentIndex::Ds, seg(0x10, 0x93)); // data
@@ -333,7 +333,7 @@ fn g0_prime_cpu_ceiling_probe() {
         // interpreter: run_straight_line chains a bounded number of instructions per call then
         // returns (a non-continuable insn / the final HLT ends the run), exactly as under the
         // machine. Drive it until the guest loop counter reaches 0.
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         setup(&mut cpu);
         let mut bus = TestBus::with_memory(build_mem());
         // TestBus defaults to Full tracing (an unbounded per-access cycle Vec) — a test
@@ -521,7 +521,7 @@ fn g0_prime_dispatch_ceiling_probe() {
     let mut interp_ns = Vec::new();
     let mut native_ns = Vec::new();
     for trial in 0..=TRIALS {
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         cpu.control.cr0 |= CR0_PE;
         cpu.registers.set_segment(SegmentIndex::Cs, seg(0x08, 0x9b));
         cpu.registers.set_segment(SegmentIndex::Ds, seg(0x10, 0x93));
@@ -789,10 +789,10 @@ fn scale_clocks_batches_exactly() {
     ] {
         for start_rem in [0u64, 1, 7, 100] {
             for seq in seqs {
-                let mut indiv = Cpu386::default();
+                let mut indiv = CpuGsw::default();
                 indiv.set_level(level);
                 indiv.timing_rem = start_rem;
-                let mut batch = Cpu386::default();
+                let mut batch = CpuGsw::default();
                 batch.set_level(level);
                 batch.timing_rem = start_rem;
 
@@ -852,7 +852,7 @@ fn scale_fp_clocks_batches_exactly() {
     ] {
         for start_rem in [0u64, 1, 5, 7] {
             for seq in seqs {
-                let mut indiv = Cpu386::default();
+                let mut indiv = CpuGsw::default();
                 indiv.set_level(level);
                 indiv.fp_rem = start_rem;
                 let sum_individual: u64 = seq
@@ -1200,7 +1200,7 @@ impl CpuBus for TestBus {
 
 #[test]
 fn reset_state_starts_at_386_reset_vector() {
-    let cpu = Cpu386::default();
+    let cpu = CpuGsw::default();
 
     assert_eq!(cpu.registers.cs().selector, 0xf000);
     assert_eq!(cpu.registers.cs().base, 0xffff_0000);
@@ -1258,7 +1258,7 @@ fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approxima
     // has produced a nonzero total well before the IN.
     let code = [0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xec]; // inc ax x8; in al,dx
     let (mut cpu, memory) = real_mode_cpu(&code, 32);
-    // real_mode_cpu's default level (Cpu386::default()) is already I586
+    // real_mode_cpu's default level (CpuGsw::default()) is already I586
     // (Approximate); set it explicitly so this test does not silently change
     // meaning if the default ever moves.
     cpu.set_level(CpuLevel::I586);
@@ -1480,7 +1480,7 @@ fn in_stays_a_run_terminator_not_a_continuation_in_the_accurate_class() {
 
 #[test]
 fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation() {
-    // Directly pins the mechanism Task 0.2 adds (a Cpu386 field set to
+    // Directly pins the mechanism Task 0.2 adds (a CpuGsw field set to
     // run_straight_line's running `total` before every continuation dispatch,
     // read by read_io) using a continuable instruction group (INC, DataMove/
     // Alu-adjacent -- specifically Group) as the observation point, since
@@ -1535,7 +1535,7 @@ fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation()
 
 #[test]
 fn register_aliasing_updates_low_parts() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.registers.set_eax(0x1234_5678);
 
     cpu.write_reg16(Reg16::Ax, 0xabcd);
@@ -1549,7 +1549,7 @@ fn register_aliasing_updates_low_parts() {
 fn operand_prefix_allows_32bit_mov_in_real_mode() {
     let mut memory = vec![0; 32];
     memory[0..6].copy_from_slice(&[0x66, 0xb8, 0x78, 0x56, 0x34, 0x12]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(memory);
@@ -1564,7 +1564,7 @@ fn operand_prefix_allows_32bit_mov_in_real_mode() {
 fn modrm_direct_address_can_store_ax() {
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x89, 0x06, 0x00, 0x02, 0xf4]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -1584,7 +1584,7 @@ fn perf_counters_track_decode_hits_and_run_breaks() {
     // A tight loop: 0: inc ax (40); 1: inc ax (40); 2: jmp $-4 (EB FC) -> 0.
     let mut memory = vec![0u8; 1024];
     memory[0..4].copy_from_slice(&[0x40, 0x40, 0xeb, 0xfc]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -1628,10 +1628,10 @@ fn perf_counters_track_decode_hits_and_run_breaks() {
     );
 }
 
-fn profile_test_cpu(code: &[u8]) -> (Cpu386, TestBus) {
+fn profile_test_cpu(code: &[u8]) -> (CpuGsw, TestBus) {
     let mut memory = vec![0u8; 1024];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -1749,7 +1749,7 @@ fn moffs_loads_al_from_direct_offset() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xa0, 0x00, 0x02]);
     memory[0x200] = 0x7e;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -1771,7 +1771,7 @@ fn moffs_stores_al_to_direct_offset() {
     // leaves flags alone.
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xa2, 0x00, 0x02]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -1794,7 +1794,7 @@ fn page_translation_reads_identity_mapped_memory() {
     memory[0x1000..0x1004].copy_from_slice(&0x0000_2003u32.to_le_bytes());
     memory[0x2000..0x2004].copy_from_slice(&0x0000_3003u32.to_le_bytes());
     memory[0x3000] = 0x90;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.control.cr3 = 0x1000;
@@ -1813,7 +1813,7 @@ fn user_mode_paging_respects_the_supervisor_bit() {
     let mut memory = vec![0; 0x6000];
     memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE: PT, present+rw+user
     memory[0x200c..0x2010].copy_from_slice(&0x0000_5003u32.to_le_bytes()); // PTE[3]: frame, present+rw, U/S=0
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE | CR0_PG;
     cpu.control.cr3 = 0x1000;
     let flat_cs = |rpl| SegmentRegister {
@@ -1867,7 +1867,7 @@ fn v86_paging_is_always_user_regardless_of_cs_low_bits() {
     let mut memory = vec![0; 0x6000];
     memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE: PT, present+rw+user
     memory[0x200c..0x2010].copy_from_slice(&0x0000_5003u32.to_le_bytes()); // PTE[3]: frame, present+rw, U/S=0
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE | CR0_PG;
     cpu.control.cr3 = 0x1000;
     let mut bus = TestBus::with_memory(memory);
@@ -1923,7 +1923,7 @@ fn tlb_paged_fetch_throughput() {
         let off = 0x2000 + (i as usize) * 4;
         memory[off..off + 4].copy_from_slice(&((i << 12) | 0x007).to_le_bytes()); // identity PTEs
     }
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.control.cr3 = 0x1000;
@@ -1948,7 +1948,7 @@ fn tlb_caches_translations_and_is_non_snooping_until_flushed() {
     let mut memory = vec![0; 0x7000];
     memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE[0]
     memory[0x200c..0x2010].copy_from_slice(&0x0000_5007u32.to_le_bytes()); // PTE[3]
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PG;
     cpu.control.cr3 = 0x1000;
     let mut bus = TestBus::with_memory(memory);
@@ -1985,7 +1985,7 @@ fn cr0_wp_gates_supervisor_writes_to_read_only_pages() {
     let mut memory = vec![0; 0x6000];
     memory[0x1000..0x1004].copy_from_slice(&0x0000_2001u32.to_le_bytes()); // PDE: PT, present, R/W=0, U/S=0
     memory[0x200c..0x2010].copy_from_slice(&0x0000_5001u32.to_le_bytes()); // PTE[3]: frame, present, R/W=0, U/S=0
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE | CR0_PG;
     cpu.control.cr3 = 0x1000;
     // Supervisor: CPL 0.
@@ -2043,7 +2043,7 @@ fn cr0_wp_gates_supervisor_writes_to_read_only_pages() {
 fn stosb_writes_al_to_es_di() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xaa;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
     cpu.registers.eip = 0;
@@ -2062,7 +2062,7 @@ fn rep_stosb_fills_es_di() {
     // rep stosb (0xf3 0xaa), cx=3, al=0xee. Fills 3 bytes at es:di, cx -> 0, di += 3.
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xf3, 0xaa]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
     cpu.registers.eip = 0;
@@ -2085,7 +2085,7 @@ fn lodsw_loads_ax_and_advances_si() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xad;
     memory[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -2103,7 +2103,7 @@ fn lodsw_loads_ax_and_advances_si() {
 fn out_dx_al_uses_dx_port() {
     let mut memory = vec![0; 16];
     memory[0..6].copy_from_slice(&[0xba, 0xf8, 0x03, 0xb0, b'X', 0xee]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(memory);
@@ -2125,7 +2125,7 @@ fn test_byte_sets_sign_flag() {
     // test al, al with al = 0x80  (0x84 modrm 0xc0). SF must reflect bit 7.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0x84, 0xc0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x80);
@@ -2143,7 +2143,7 @@ fn test_word_immediate_group_f7() {
     // test bx, 0x0001  (0xf7 /0, modrm 0xc3, imm 0x0001). bx=0x0002 -> ZF set.
     let mut memory = vec![0; 16];
     memory[0..4].copy_from_slice(&[0xf7, 0xc3, 0x01, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x0002);
@@ -2160,7 +2160,7 @@ fn group81_add_memory_with_displacement_and_immediate() {
     let mut memory = vec![0; 1024];
     memory[0..6].copy_from_slice(&[0x81, 0x47, 0x10, 0x02, 0x01, 0xf4]);
     memory[0x210..0x212].copy_from_slice(&0x0003u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -2181,7 +2181,7 @@ fn group83_sign_extends_immediate() {
     // sub bx, -1  (0x83 /5, modrm 0xeb, imm 0xff -> -1)
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x83, 0xeb, 0xff]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x0005);
@@ -2198,7 +2198,7 @@ fn add_rm_reg_byte_writes_memory_with_displacement() {
     let mut memory = vec![0; 1024];
     memory[0..4].copy_from_slice(&[0x00, 0x47, 0x10, 0xf4]);
     memory[0x210] = 0x01; // [bx+0x10] initial
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -2217,7 +2217,7 @@ fn sub_reg_rm_sets_flags() {
     // sub al, bl  (opcode 0x2a, modrm 0xc3)
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0x2a, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x05); // al
@@ -2236,7 +2236,7 @@ fn cmp_does_not_write_back() {
     // cmp al, 0x10 is form via 0x3c (AL, imm8)
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0x3c, 0x10]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x10);
@@ -2250,7 +2250,7 @@ fn cmp_does_not_write_back() {
 
 #[test]
 fn alu_add_byte_sets_carry_zero_and_aux() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let result = cpu.alu(0, 0xff, 0x01, BusWidth::Byte);
     assert_eq!(result, 0x00);
     assert!(cpu.flag(FLAG_CF));
@@ -2261,7 +2261,7 @@ fn alu_add_byte_sets_carry_zero_and_aux() {
 
 #[test]
 fn alu_adc_uses_carry_in() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_flag(FLAG_CF, true);
     let result = cpu.alu(2, 0x01, 0x01, BusWidth::Word); // ADC 1,1 with CF=1 -> 3
     assert_eq!(result, 0x0003);
@@ -2270,7 +2270,7 @@ fn alu_adc_uses_carry_in() {
 
 #[test]
 fn alu_sub_byte_sets_borrow_and_sign() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let result = cpu.alu(5, 0x00, 0x01, BusWidth::Byte); // 0 - 1 = 0xff
     assert_eq!(result, 0xff);
     assert!(cpu.flag(FLAG_CF));
@@ -2280,7 +2280,7 @@ fn alu_sub_byte_sets_borrow_and_sign() {
 
 #[test]
 fn alu_sbb_uses_borrow_in() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_flag(FLAG_CF, true);
     let result = cpu.alu(3, 0x05, 0x02, BusWidth::Word); // 5 - 2 - 1 = 2
     assert_eq!(result, 0x0002);
@@ -2289,7 +2289,7 @@ fn alu_sbb_uses_borrow_in() {
 
 #[test]
 fn alu_logic_clears_carry_overflow_leaves_aux() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_flag(FLAG_AF, true);
     let result = cpu.alu(4, 0xf0, 0x0f, BusWidth::Byte); // AND -> 0
     assert_eq!(result, 0x00);
@@ -2301,7 +2301,7 @@ fn alu_logic_clears_carry_overflow_leaves_aux() {
 
 #[test]
 fn alu_add_byte_overflow_without_carry() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let result = cpu.alu(0, 0x7f, 0x01, BusWidth::Byte); // 127 + 1 -> 0x80
     assert_eq!(result, 0x80);
     assert!(cpu.flag(FLAG_OF)); // signed overflow, isolated from carry
@@ -2312,7 +2312,7 @@ fn alu_add_byte_overflow_without_carry() {
 
 #[test]
 fn alu_sbb_borrow_in_with_max_subtrahend() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_flag(FLAG_CF, true); // borrow in
     let result = cpu.alu(3, 0x00, 0xff, BusWidth::Byte); // 0 - 0xff - 1
     assert_eq!(result, 0x00);
@@ -2322,7 +2322,7 @@ fn alu_sbb_borrow_in_with_max_subtrahend() {
 
 #[test]
 fn alu_parity_uses_low_byte_only() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let result = cpu.alu(0, 0x00ff, 0x0001, BusWidth::Word); // -> 0x0100
     assert_eq!(result, 0x0100);
     assert!(cpu.flag(FLAG_PF)); // low byte 0x00 is even parity; full word would be odd
@@ -2330,7 +2330,7 @@ fn alu_parity_uses_low_byte_only() {
 
 #[test]
 fn alu_sign_flag_word_uses_bit15() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let result = cpu.alu(0, 0x8000, 0x0000, BusWidth::Word);
     assert_eq!(result, 0x8000);
     assert!(cpu.flag(FLAG_SF));
@@ -2341,7 +2341,7 @@ fn inc_reg_preserves_carry_flag() {
     // inc ax (0x40) with CF set: AX increments, CF stays set, AF set by 0xff+1.
     let mut memory = vec![0; 16];
     memory[0] = 0x40;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_CF, true);
@@ -2360,7 +2360,7 @@ fn dec_reg_sets_zero_and_keeps_carry_clear() {
     // dec ax (0x48) with CF clear: AX -> 0, ZF set, CF still clear.
     let mut memory = vec![0; 16];
     memory[0] = 0x48;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_CF, false);
@@ -2380,7 +2380,7 @@ fn inc_word_memory_via_ff_group() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xff, 0x07]);
     memory[0x200..0x202].copy_from_slice(&0x00ffu16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -2401,7 +2401,7 @@ fn call_near_indirect_register_pushes_return_and_jumps() {
     // call ax  (0xff /2, modrm 0xd0). Pushes return eip (2), jumps to ax.
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xff, 0xd0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -2424,7 +2424,7 @@ fn jmp_near_indirect_sets_eip_without_push() {
     // jmp bx  (0xff /4, modrm 0xe3).
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xff, 0xe3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -2443,7 +2443,7 @@ fn push_rm_writes_value_and_decrements_sp() {
     // push cx  (0xff /6, modrm 0xf1).
     let mut memory = vec![0; 256];
     memory[0..2].copy_from_slice(&[0xff, 0xf1]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -2466,7 +2466,7 @@ fn inc_byte_memory_with_displacement() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xfe, 0x47, 0x10]);
     memory[0x210] = 0x7f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -2486,7 +2486,7 @@ fn inc_word_overflow_sets_of_and_sf() {
     // inc ax (0x40) on 0x7fff: -> 0x8000, OF and SF set, CF preserved.
     let mut memory = vec![0; 16];
     memory[0] = 0x40;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_CF, true);
@@ -2507,7 +2507,7 @@ fn cmp_memory_form_issues_no_write() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0x38, 0x07, 0xf4]);
     memory[0x200] = 0x42;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -2532,7 +2532,7 @@ fn incdec_preserve_carry_both_directions() {
     // DEC with CF set leaves CF set.
     let mut memory = vec![0; 16];
     memory[0] = 0x48; // dec ax
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_CF, true);
@@ -2545,7 +2545,7 @@ fn incdec_preserve_carry_both_directions() {
     // INC with CF clear leaves CF clear.
     let mut memory = vec![0; 16];
     memory[0] = 0x40; // inc ax
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_CF, false);
@@ -2561,7 +2561,7 @@ fn dec_word_overflow_sets_of() {
     // dec ax (0x48) on 0x8000 -> 0x7fff: OF set, SF clear.
     let mut memory = vec![0; 16];
     memory[0] = 0x48;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x8000);
@@ -2579,7 +2579,7 @@ fn call_near_indirect_memory_displacement_return_addr() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xff, 0x57, 0x10]);
     memory[0x210..0x212].copy_from_slice(&0x0080u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -2600,7 +2600,7 @@ fn push_sp_uses_pre_decrement_value() {
     // push sp (0xff /6, modrm 0xf4): the 386 pushes SP before the decrement.
     let mut memory = vec![0; 256];
     memory[0..2].copy_from_slice(&[0xff, 0xf4]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -2619,7 +2619,7 @@ fn inc_dword_uses_32bit_width() {
     // 0x66 0x40 = inc eax (32-bit operand): 0x0000ffff -> 0x00010000.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0x66, 0x40]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x0000_ffff);
@@ -2635,7 +2635,7 @@ fn shl_word_by_one_sets_of_and_clears_cf() {
     // shl ax,1 (0xd1 /4, modrm 0xe0). 0x4000 -> 0x8000, CF=0 (old bit15), OF=1, SF=1.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xe0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x4000);
@@ -2654,7 +2654,7 @@ fn shr_word_by_one_sets_cf_and_of() {
     // shr ax,1 (0xd1 /5, modrm 0xe8). 0x8001 -> 0x4000, CF=1, OF=msb(orig)=1.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xe8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x8001);
@@ -2673,7 +2673,7 @@ fn shl_dword_by_one_via_operand_size_prefix() {
     // shl eax,1 (0x66 0xd1 /4, modrm 0xe0). 0x4000_0000 -> 0x8000_0000, CF=0, OF=1, SF=1.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x66, 0xd1, 0xe0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x4000_0000);
@@ -2694,7 +2694,7 @@ fn repeated_operand_size_prefix_stays_active() {
     // second 66 must not cancel the first, so this stays a 32-bit shift.
     let mut memory = vec![0; 16];
     memory[0..4].copy_from_slice(&[0x66, 0x66, 0xd1, 0xe0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x4000_0000);
@@ -2711,7 +2711,7 @@ fn sar_word_by_one_preserves_sign_and_clears_of() {
     // sar ax,1 (0xd1 /7, modrm 0xf8). 0x8001 -> 0xc000, CF=1, OF=0, SF=1.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xf8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x8001);
@@ -2730,7 +2730,7 @@ fn shl_byte_via_c0_imm_only_touches_low_byte() {
     // shl al,1 (0xc0 /4, modrm 0xe0, imm 0x01). ax=0xff81 -> al 0x81<<1=0x02, ah preserved.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0xc0, 0xe0, 0x01]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0xff81);
@@ -2748,7 +2748,7 @@ fn shl_word_by_imm_count() {
     // shl ax,4 (0xc1 /4, modrm 0xe0, imm 0x04). 0x0001 -> 0x0010.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0xc1, 0xe0, 0x04]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0001);
@@ -2765,7 +2765,7 @@ fn shift_count_masked_to_five_bits() {
     // shl ax,cl with cl=33 (0xd3 /4, modrm 0xe0). 33 & 0x1f == 1, so one shift.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd3, 0xe0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x4000);
@@ -2782,7 +2782,7 @@ fn shift_count_zero_touches_no_flags() {
     // shl ax,cl with cl=32 (0xd3 /4). 32 & 0x1f == 0: operand and flags unchanged.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd3, 0xe0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -2801,7 +2801,7 @@ fn rol_word_by_one() {
     // rol ax,1 (0xd1 /0, modrm 0xc0). 0x8000 -> 0x0001, CF=1, OF=msb^cf=0^1=1.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xc0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x8000);
@@ -2819,7 +2819,7 @@ fn ror_word_by_one() {
     // ror ax,1 (0xd1 /1, modrm 0xc8). 0x0001 -> 0x8000, CF=1, OF=msb^next=1^0=1.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xc8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0001);
@@ -2837,7 +2837,7 @@ fn rcl_word_rotates_through_carry() {
     // rcl ax,1 (0xd1 /2, modrm 0xd0). ax=0x0000, CF=1 -> 0x0001, CF=0 (old msb=0).
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xd0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0000);
@@ -2856,7 +2856,7 @@ fn rcr_word_rotates_through_carry() {
     // rcr ax,1 (0xd1 /3, modrm 0xd8). ax=0x0000, CF=1 -> 0x8000, CF=0 (old bit0=0).
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xd8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0000);
@@ -2876,7 +2876,7 @@ fn rotate_leaves_sign_zero_parity_untouched() {
     // rotate to a nonzero result and confirm ZF survives.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd1, 0xc0]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x8000);
@@ -2895,7 +2895,7 @@ fn ror_byte_by_cl_multi_bit() {
     // (msb 0x80, shift by bits-1=7) and a multi-bit count. al 0x01 ror 3 = 0x20.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xd2, 0xc8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0001);
@@ -2913,7 +2913,7 @@ fn not_byte_leaves_flags_untouched() {
     // not bl (0xf6 /2, modrm 0xd3). 0x0f -> 0xf0; NOT affects no flags.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xd3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x000f);
@@ -2933,7 +2933,7 @@ fn neg_byte_sets_carry_and_sign() {
     // neg bl (0xf6 /3, modrm 0xdb). 0x01 -> 0xff; CF set, SF set, ZF clear.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xdb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x0001);
@@ -2952,7 +2952,7 @@ fn neg_zero_clears_carry_and_sets_zero() {
     // neg bl of 0x00 -> 0x00; CF clear, ZF set.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xdb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x0000);
@@ -2970,7 +2970,7 @@ fn neg_byte_overflow_at_0x80() {
     // neg bl of 0x80 -> 0x80; OF set (only value that negates to itself), CF and SF set.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xdb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x0080);
@@ -2989,7 +2989,7 @@ fn not_word_via_f7_complements() {
     // not bx (0xf7 /2, modrm 0xd3). 0x0ff0 -> 0xf00f; flags unchanged.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf7, 0xd3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x0ff0);
@@ -3007,7 +3007,7 @@ fn mul_byte_sets_carry_when_high_nonzero() {
     // mul bl (0xf6 /4, modrm 0xe3). al=0x10, bl=0x10 -> ax=0x0100; CF/OF set (ah != 0).
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xe3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0010);
@@ -3026,7 +3026,7 @@ fn mul_byte_clears_carry_when_high_zero() {
     // mul bl. al=0x05, bl=0x03 -> ax=0x000f; CF/OF clear.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xe3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0005);
@@ -3046,7 +3046,7 @@ fn mul_word_writes_dx_ax_preserving_high_halves() {
     // ax=0x0000, dx=0x0001; CF/OF set. High 16 bits of EAX/EDX must survive.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf7, 0xe3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0xaaaa_1000);
@@ -3068,7 +3068,7 @@ fn imul_byte_clears_carry_when_result_fits() {
     // CF/OF clear because the high half is the sign extension of the low half.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xeb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x00ff);
@@ -3088,7 +3088,7 @@ fn imul_byte_sets_carry_when_result_overflows() {
     // its sign extension is 0x0000 != 0x0100, so CF/OF set.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xeb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0010);
@@ -3108,7 +3108,7 @@ fn mul_dword_writes_edx_eax() {
     // = 0x1_0000_0000 -> eax=0, edx=1; CF/OF set. Exercises the u64 dword path.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x66, 0xf7, 0xe3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x0001_0000);
@@ -3128,7 +3128,7 @@ fn div_byte_writes_quotient_and_remainder() {
     // div bl (0xf6 /6, modrm 0xf3). ax=0x0011(17), bl=0x05 -> al=3, ah=2.
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xf3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0011);
@@ -3145,7 +3145,7 @@ fn div_word_writes_ax_and_dx() {
     // div bx (0xf7 /6, modrm 0xf3). dx:ax = 0x0000:0x0011 (17), bx=5 -> ax=3 (quot), dx=2 (rem).
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf7, 0xf3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Dx, 0x0000);
@@ -3164,7 +3164,7 @@ fn idiv_byte_negative_dividend_truncates_toward_zero() {
     // idiv bl (0xf6 /7, modrm 0xfb). ax=-17=0xffef, bl=+5 -> quot=-3 (0xfd), rem=-2 (0xfe).
     let mut memory = vec![0; 16];
     memory[0..2].copy_from_slice(&[0xf6, 0xfb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0xffef);
@@ -3190,7 +3190,7 @@ const DE_TRAP_IP: u16 = 0x0010;
 // slot these buses populate (code and the IVT slot must not overlap).
 const DE_CODE_ORIGIN: u32 = 0x20;
 
-fn expect_de_delivered<B: CpuBus>(cpu: &mut Cpu386, bus: &mut B) {
+fn expect_de_delivered<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) {
     let outcome = cpu
         .cycle(bus)
         .expect("a delivered #DE must not error `cycle`");
@@ -3212,7 +3212,7 @@ fn de_trap_bus(code: &[u8]) -> TestBus {
 #[test]
 fn div_by_zero_returns_error_without_writes() {
     // div bl with bl=0 -> #DE delivered through the real-mode IVT; ax unchanged.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = DE_CODE_ORIGIN;
     cpu.registers.set_esp(0x2000);
@@ -3227,7 +3227,7 @@ fn div_by_zero_returns_error_without_writes() {
 #[test]
 fn div_quotient_overflow_returns_error() {
     // div bl: ax=0xffff, bl=0x01 -> quotient 0xffff > 0xff -> #DE delivered.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = DE_CODE_ORIGIN;
     cpu.registers.set_esp(0x2000);
@@ -3244,7 +3244,7 @@ fn div_dword_writes_eax_edx() {
     // -> quot=0x8000_0002, rem=1. Exercises the u64 dword path.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x66, 0xf7, 0xf3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_edx(0x0000_0001);
@@ -3262,7 +3262,7 @@ fn div_dword_writes_eax_edx() {
 fn idiv_dword_min_over_negative_one_is_divide_error() {
     // idiv ebx (0x66 0xf7 /7, modrm 0xfb). edx:eax = i64::MIN, ebx = -1.
     // checked_div catches the overflow so this is #DE (delivered), not a panic.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = DE_CODE_ORIGIN;
     cpu.registers.set_esp(0x2000);
@@ -3280,7 +3280,7 @@ fn movsb_copies_and_increments_when_df_clear() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xa4;
     memory[0x100] = 0x42;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3303,7 +3303,7 @@ fn movsb_decrements_when_df_set() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xa4;
     memory[0x100] = 0x42;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3326,7 +3326,7 @@ fn rep_movsb_copies_cx_bytes() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xf3, 0xa4]);
     memory[0x100..0x103].copy_from_slice(&[1, 2, 3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3352,7 +3352,7 @@ fn rep_movsb_df_set_uses_correct_slow_path() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xf3, 0xa4]);
     memory[0x100..0x104].copy_from_slice(&[1, 2, 3, 4]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3379,7 +3379,7 @@ fn rep_movsb_with_zero_count_does_nothing() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xf3, 0xa4]);
     memory[0x100] = 0x42;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3404,7 +3404,7 @@ fn cmpsb_equal_sets_zero_flag() {
     memory[0] = 0xa6;
     memory[0x100] = 0x55;
     memory[0x200] = 0x55;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3428,7 +3428,7 @@ fn cmpsb_unequal_clears_zero_flag() {
     memory[0] = 0xa6;
     memory[0x100] = 0x10;
     memory[0x200] = 0x20;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3452,7 +3452,7 @@ fn scasb_compares_al_with_es_di() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xae;
     memory[0x200] = 0x41;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
     cpu.registers.eip = 0;
@@ -3471,7 +3471,7 @@ fn scasb_compares_al_with_es_di() {
 #[test]
 fn rep_fast_paths_cover_stos_lods_cmps_and_scas() {
     let memory = vec![0; 2048];
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3563,7 +3563,7 @@ fn repe_cmpsb_stops_on_first_mismatch() {
     memory[0..2].copy_from_slice(&[0xf3, 0xa6]);
     memory[0x100..0x104].copy_from_slice(b"AABB");
     memory[0x200..0x204].copy_from_slice(b"AACC");
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3590,7 +3590,7 @@ fn repne_scasb_stops_on_match() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xf2, 0xae]);
     memory[0x200..0x204].copy_from_slice(b"AACA");
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
     cpu.registers.eip = 0;
@@ -3614,7 +3614,7 @@ fn movsb_honors_source_segment_override() {
     let mut memory = vec![0; 0x400];
     memory[0..2].copy_from_slice(&[0x26, 0xa4]);
     memory[0x210] = 0x99;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0x20); // base 0x200
@@ -3637,7 +3637,7 @@ fn lea_loads_effective_address() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0x8d, 0x5c, 0x10]);
     memory[0x110] = 0x99;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -3656,7 +3656,7 @@ fn lea_with_register_operand_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0x8d, 0xc0]);
     memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -3680,7 +3680,7 @@ fn lds_loads_offset_and_ds() {
     memory[0x0201] = 0x12; // offset high -> 0x1234
     memory[0x0202] = 0x00; // selector low
     memory[0x0203] = 0x90; // selector high -> 0x9000
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -3705,7 +3705,7 @@ fn les_loads_offset_and_es() {
     memory[0x0301] = 0x56; // offset high -> 0x5678
     memory[0x0302] = 0x00; // selector low
     memory[0x0303] = 0xb8; // selector high -> 0xb800
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -3729,7 +3729,7 @@ fn lds_with_register_operand_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xc5, 0xc3]);
     memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -3755,7 +3755,7 @@ fn lss_real_mode_16bit_loads_offset_and_ss_and_arms_shadow() {
     memory[0x201] = 0x12; // offset high -> 0x1234
     memory[0x202] = 0x00; // selector low
     memory[0x203] = 0x90; // selector high -> 0x9000
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -3794,7 +3794,7 @@ fn lss_interrupt_shadow_defers_a_pending_irq_by_one_instruction() {
     memory[0x22..0x24].copy_from_slice(&0x0000u16.to_le_bytes());
     memory[0x208] = 0xcf; // IRET at the handler target (not reached in this test)
 
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -3848,7 +3848,7 @@ fn lss_32bit_operand_size_loads_esp_wide_offset() {
     memory[0..6].copy_from_slice(&[0x66, 0x0f, 0xb2, 0x1e, 0x00, 0x02]);
     memory[0x200..0x204].copy_from_slice(&0x1122_3344u32.to_le_bytes());
     memory[0x204..0x206].copy_from_slice(&0x9000u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -3870,7 +3870,7 @@ fn lfs_loads_offset_and_fs() {
     memory[0x201] = 0x12;
     memory[0x202] = 0x00;
     memory[0x203] = 0x70;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -3898,7 +3898,7 @@ fn lgs_loads_offset_and_gs() {
     memory[0x201] = 0x12;
     memory[0x202] = 0x00;
     memory[0x203] = 0x60;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -3923,7 +3923,7 @@ fn lss_with_register_operand_delivers_ud() {
     let mut memory = vec![0u8; 1024];
     memory[0..3].copy_from_slice(&[0x0f, 0xb2, 0xc3]);
     memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -3941,7 +3941,7 @@ fn lfs_with_register_operand_delivers_ud() {
     let mut memory = vec![0u8; 1024];
     memory[0..3].copy_from_slice(&[0x0f, 0xb4, 0xc3]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -3959,7 +3959,7 @@ fn lgs_with_register_operand_delivers_ud() {
     let mut memory = vec![0u8; 1024];
     memory[0..3].copy_from_slice(&[0x0f, 0xb5, 0xc3]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4026,7 +4026,7 @@ fn cbw_sign_extends_al_into_ax() {
     // cbw (0x98): al = 0x80 (-128) -> ax = 0xff80.
     let mut memory = vec![0; 64];
     memory[0] = 0x98;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x80);
@@ -4042,7 +4042,7 @@ fn cwde_sign_extends_ax_into_eax() {
     // 0x66 0x98 (CWDE): ax = 0x8000 -> eax = 0xffff_8000.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x66, 0x98]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x0000_8000);
@@ -4058,7 +4058,7 @@ fn cwd_fills_dx_from_ax_sign() {
     // cwd (0x99): ax = 0x8000 (negative) -> dx = 0xffff, ax unchanged.
     let mut memory = vec![0; 64];
     memory[0] = 0x99;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x8000);
@@ -4075,7 +4075,7 @@ fn cwd_clears_dx_for_positive_ax() {
     // cwd (0x99): ax = 0x0001 (positive) -> dx = 0.
     let mut memory = vec![0; 64];
     memory[0] = 0x99;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0001);
@@ -4092,7 +4092,7 @@ fn cdq_fills_edx_from_eax_sign() {
     // 0x66 0x99 (CDQ): eax = 0x8000_0000 -> edx = 0xffff_ffff.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x66, 0x99]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x8000_0000);
@@ -4108,7 +4108,7 @@ fn sti_sets_interrupt_flag() {
     // sti (0xfb) sets IF.
     let mut memory = vec![0; 64];
     memory[0] = 0xfb;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_IF, false);
@@ -4124,7 +4124,7 @@ fn lahf_loads_flag_byte_into_ah() {
     // lahf (0x9f). CF=PF=AF=ZF=SF=1 -> AH = 0xD5 | 0x02 = 0xD7; AL unchanged.
     let mut memory = vec![0; 64];
     memory[0] = 0x9f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0000);
@@ -4146,7 +4146,7 @@ fn sahf_loads_flags_from_ah_leaving_overflow() {
     // sahf (0x9e). AH=0xD7 -> CF=PF=AF=ZF=SF=1; OF untouched (a set OF survives).
     let mut memory = vec![0; 64];
     memory[0] = 0x9e;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0xd700); // AH=0xD7, AL=0
@@ -4173,7 +4173,7 @@ fn stc_sets_carry_and_cmc_toggles_it() {
     // stc (0xf9) sets CF; cmc (0xf5) toggles it back to 0.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xf9, 0xf5]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_CF, false);
@@ -4193,7 +4193,7 @@ fn pushf_then_popf_restores_flags() {
     let mut memory = vec![0; 1024];
     memory[0] = 0x9c;
     memory[1] = 0x9d;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4216,7 +4216,7 @@ fn leave_restores_sp_and_bp() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xc9;
     memory[0x200..0x202].copy_from_slice(&0x1234u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4237,7 +4237,7 @@ fn pusha_then_popa_round_trips_and_saves_original_sp() {
     let mut memory = vec![0; 1024];
     memory[0] = 0x60;
     memory[1] = 0x61;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4277,7 +4277,7 @@ fn pushfd_pushes_only_defined_eflags_bits() {
     // set in the source, the dword on the stack is 0x0024_0493.
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0x66, 0x9c]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4303,7 +4303,7 @@ fn pushad_uses_16bit_sp_and_preserves_high_esp() {
     // is preserved. ESP = 0x0001_0010 -> SP 0x10 - 32 wraps to 0xfff0.
     let mut memory = vec![0; 0x2_0000];
     memory[0..2].copy_from_slice(&[0x66, 0x60]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4323,7 +4323,7 @@ fn popad_leaks_discarded_esp_high_half_on_16bit_stack() {
     memory[0..2].copy_from_slice(&[0x66, 0x61]);
     // The discard is the 4th dword, at SP + 12 = 0x20c.
     memory[0x20c..0x210].copy_from_slice(&0x5a04_6b18u32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4345,7 +4345,7 @@ fn pop_rm16_into_memory_disp16() {
     memory[0..4].copy_from_slice(&[0x8f, 0x06, 0x00, 0x02]);
     // Stack top at ss:0x0100 = 0xbeef.
     memory[0x100..0x102].copy_from_slice(&0xbeefu16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -4370,7 +4370,7 @@ fn pop_rm16_into_register() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0x8f, 0xc3]);
     memory[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4390,7 +4390,7 @@ fn pop_rm32_into_register_preserves_high_esp() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0x66, 0x8f, 0xc1]);
     memory[0x100..0x104].copy_from_slice(&0xcafe_f00du32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4416,7 +4416,7 @@ fn pop_rm_reg_nonzero_is_illegal() {
     memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0x8f, 0xcb]); // mod=11 reg=001 rm=011
     memory[6 * 4..6 * 4 + 2].copy_from_slice(&UD_TRAP_IP.to_le_bytes());
     memory[6 * 4 + 2..6 * 4 + 4].copy_from_slice(&UD_TRAP_CS.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = ORIGIN as u32;
@@ -4442,7 +4442,7 @@ fn pop_rm32_esp_relative_destination_uses_post_increment_esp() {
     // POP dword [esp+4], 32-bit operand + 32-bit address override in real mode.
     let mut memory = vec![0; 1024];
     memory[0..6].copy_from_slice(&[0x66, 0x67, 0x8f, 0x44, 0x24, 0x04]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4481,7 +4481,7 @@ fn pop_rm16_esp_relative_destination_uses_post_increment_esp() {
     // mod=01 rm=100 disp8=0x02, POP word [esp+2].
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x67, 0x8f, 0x44, 0x24, 0x02]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4535,7 +4535,7 @@ fn pop_rm32_esp_relative_destination_restores_esp_on_page_fault() {
     // PTE[2] (linear 0x2000-0x2fff, covers 0x2ffc) -> identity, present+rw.
     memory[0x2008..0x200c].copy_from_slice(&0x0000_2007u32.to_le_bytes());
     // PTE[3] (linear 0x3000-0x3fff, the POP destination) intentionally left 0 (not present).
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4581,7 +4581,7 @@ fn push_rm32_esp_source_reads_before_decrement() {
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x66, 0x67, 0xff, 0x34, 0x24]);
     memory[0x0200..0x0204].copy_from_slice(&0xdead_beefu32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4612,7 +4612,7 @@ fn pop_rm32_non_esp_base_is_unchanged() {
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x66, 0x67, 0x8f, 0x43, 0x10]);
     memory[0x0100..0x0104].copy_from_slice(&0xcafe_babeu32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -4637,7 +4637,7 @@ fn retf_pops_offset_then_segment() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xcb;
     memory[0x100..0x104].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4657,7 +4657,7 @@ fn far_call_then_retf_round_trips() {
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x9a, 0x10, 0x00, 0x00, 0x00]);
     memory[0x10] = 0xcb;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4678,7 +4678,7 @@ fn ret_near_imm16_pops_and_releases() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xc2, 0x04, 0x00]);
     memory[0x100..0x102].copy_from_slice(&0x0100u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4698,7 +4698,7 @@ fn ret_near_imm16_32bit_preserves_high_esp() {
     let mut memory = vec![0; 1024];
     memory[0..4].copy_from_slice(&[0x66, 0xc2, 0x04, 0x00]);
     memory[0x100..0x104].copy_from_slice(&0x0000_0100u32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4719,7 +4719,7 @@ fn retf_imm16_pops_far_and_releases() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xca, 0x04, 0x00]);
     memory[0x100..0x104].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4740,7 +4740,7 @@ fn release_stack_wraps_sp_and_preserves_high_esp_in_real_mode() {
     // real-mode 16-bit stack and wrap at the 16-bit boundary. ESP[31:16] must
     // not absorb the carry: a full-ESP add of 0xbeef_fffe + 4 would carry into
     // 0xbef0_0002, while the SP-only path gives 0xbeef_0002.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.set_esp(0xbeef_fffe);
 
@@ -4751,7 +4751,7 @@ fn release_stack_wraps_sp_and_preserves_high_esp_in_real_mode() {
 
 /// Load a protected-mode SS segment register directly (bypassing GDT resolution)
 /// with the given B bit, for exercising `stack_is_32bit()` in isolation.
-fn set_protected_ss(cpu: &mut Cpu386, base: u32, default_size_32: bool) {
+fn set_protected_ss(cpu: &mut CpuGsw, base: u32, default_size_32: bool) {
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Ss,
@@ -4771,7 +4771,7 @@ fn push_dword_on_a_16bit_protected_mode_stack_wraps_sp_and_preserves_high_esp() 
     // 16-bit stack segment). Only SP must wrap; ESP[31:16] survives untouched,
     // and the write lands at SS.base + the wrapped SP, not at SS.base + ESP.
     let memory = vec![0u8; 0x1_0002];
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     set_protected_ss(&mut cpu, 0, false);
     cpu.registers.set_esp(0xbeef_0002);
     let mut bus = TestBus::with_memory(memory);
@@ -4792,7 +4792,7 @@ fn pop_dword_on_a_16bit_protected_mode_stack_wraps_sp_and_preserves_high_esp() {
     // SP and advances only SP, leaving ESP[31:16] alone.
     let mut memory = vec![0u8; 0x1_0002];
     memory[0xfffe..0x1_0002].copy_from_slice(&0x1122_3344u32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     set_protected_ss(&mut cpu, 0, false);
     cpu.registers.set_esp(0xbeef_fffe);
     let mut bus = TestBus::with_memory(memory);
@@ -4809,7 +4809,7 @@ fn push_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
     // SS.B=1 (the TOKAEMM monitor's stack shape): full-ESP arithmetic, no wrap
     // at the 16-bit boundary, matching today's protected-mode behavior.
     let memory = vec![0u8; 0x2_0000];
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     set_protected_ss(&mut cpu, 0, true);
     cpu.registers.set_esp(0x0001_0002);
     let mut bus = TestBus::with_memory(memory);
@@ -4827,7 +4827,7 @@ fn push_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
 fn pop_dword_on_a_32bit_protected_mode_stack_uses_full_esp() {
     let mut memory = vec![0u8; 0x2_0000];
     memory[0x0000_fffe..0x0001_0002].copy_from_slice(&0xaabb_ccddu32.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     set_protected_ss(&mut cpu, 0, true);
     cpu.registers.set_esp(0x0000_fffe);
     let mut bus = TestBus::with_memory(memory);
@@ -4851,7 +4851,7 @@ fn ss_load_populates_the_cached_b_bit_from_the_descriptor() {
     let high: u32 = 0x00cf_9300u32; // G=1,B=1,limit_high=0xf,access=0x93
     memory[8..12].copy_from_slice(&low.to_le_bytes());
     memory[12..16].copy_from_slice(&high.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.gdtr.base = 0;
     cpu.gdtr.limit = 0xffff;
@@ -4871,10 +4871,10 @@ fn protected_cpu_with_cs_d_and_ss_b(
     mem_len: usize,
     code_d32: bool,
     stack_b32: bool,
-) -> (Cpu386, Vec<u8>) {
+) -> (CpuGsw, Vec<u8>) {
     let mut memory = vec![0u8; mem_len];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -4964,7 +4964,7 @@ fn far_call_pushes_return_and_loads_target() {
     // Pushes CS (0x0000) then the return IP (0x0005), then loads cs:eip.
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0x9a, 0x00, 0x01, 0x00, 0x30]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -4994,7 +4994,7 @@ fn far_call_via_memory_pushes_return_and_transfers() {
     let mut memory = vec![0; 1024];
     memory[0..4].copy_from_slice(&[0xff, 0x1e, 0x00, 0x02]);
     memory[0x200..0x204].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -5024,7 +5024,7 @@ fn far_jmp_via_memory_transfers_without_pushing() {
     let mut memory = vec![0; 1024];
     memory[0..4].copy_from_slice(&[0xff, 0x2e, 0x00, 0x02]);
     memory[0x200..0x204].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -5046,7 +5046,7 @@ fn far_call_via_register_operand_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xff, 0xd8]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -5068,7 +5068,7 @@ fn far_jmp_via_register_operand_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xff, 0xe8]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -5096,7 +5096,7 @@ fn far_call_via_memory_wraps_selector_offset_at_64k() {
     memory[ds_base + 0xfffe..ds_base + 0x1_0000].copy_from_slice(&0x0100u16.to_le_bytes());
     // selector at the wrapped ds:0x0000
     memory[ds_base..ds_base + 2].copy_from_slice(&0x3000u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0x2000);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -5122,7 +5122,7 @@ fn retf_32bit_pops_full_eip_and_preserves_high_esp() {
     memory[0..2].copy_from_slice(&[0x66, 0xcb]);
     memory[0x100..0x104].copy_from_slice(&0x0001_2345u32.to_le_bytes()); // EIP
     memory[0x104..0x108].copy_from_slice(&0x0000_3000u32.to_le_bytes()); // CS
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -5142,7 +5142,7 @@ fn movzx_byte_zero_extends_into_ax() {
     // movzx ax, bl  (0x0f 0xb6 0xc3, modrm mod=3 reg=ax rm=bl): bl=0x80 -> ax=0x0080.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xb6, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(3, 0x80); // bl
@@ -5158,7 +5158,7 @@ fn movzx_byte_zero_extends_into_eax_clearing_high_bits() {
     // 0x66 0x0f 0xb6 0xc3 (movzx eax, bl): bl=0x80, eax preset 0xffff_ffff -> eax=0x0000_0080.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb6, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0xffff_ffff);
@@ -5175,7 +5175,7 @@ fn movzx_word_zero_extends_into_eax() {
     // 0x66 0x0f 0xb7 0xc3 (movzx eax, bx): bx=0x8000, eax preset 0xffff_ffff -> eax=0x0000_8000.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb7, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0xffff_ffff);
@@ -5192,7 +5192,7 @@ fn movsx_byte_sign_extends_into_ax() {
     // movsx ax, bl (0x0f 0xbe 0xc3): bl=0x80 -> ax=0xff80.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbe, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(3, 0x80);
@@ -5208,7 +5208,7 @@ fn movsx_byte_sign_extends_into_eax() {
     // 0x66 0x0f 0xbe 0xc3 (movsx eax, bl): bl=0x80 -> eax=0xffff_ff80.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbe, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(3, 0x80);
@@ -5224,7 +5224,7 @@ fn movsx_word_sign_extends_into_eax() {
     // 0x66 0x0f 0xbf 0xc3 (movsx eax, bx): bx=0x8000 -> eax=0xffff_8000.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbf, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x8000);
@@ -5240,7 +5240,7 @@ fn movsx_byte_positive_source_zero_fills() {
     // movsx ax, bl (0x0f 0xbe 0xc3): bl=0x7f (positive) -> ax=0x007f, no sign fill.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbe, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(3, 0x7f);
@@ -5258,7 +5258,7 @@ fn movzx_word_into_16bit_dest_preserves_high_eax() {
     // write_gpr16.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xb7, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0xdead_0000);
@@ -5278,7 +5278,7 @@ fn movzx_reads_byte_from_memory_source() {
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0xb6, 0x06, 0x40, 0x00]);
     memory[0x40] = 0x80;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -5294,7 +5294,7 @@ fn setz_sets_byte_when_zf_set() {
     // setz bl (0x0f 0x94 0xc3): ZF=1 -> bl=1. bl preset 0xff to prove it is overwritten.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0x94, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(3, 0xff);
@@ -5313,7 +5313,7 @@ fn setz_clears_byte_when_zf_clear() {
     // setz bl (0x0f 0x94 0xc3): ZF=0 -> bl=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0x94, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(3, 0xff);
@@ -5331,7 +5331,7 @@ fn setnz_writes_memory_destination() {
     // ZF=0 -> !ZF true -> [ds:0x40]=1.
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0x95, 0x06, 0x40, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -5348,7 +5348,7 @@ fn imul_0f_af_16bit_fits_clears_carry_overflow() {
     // imul bx, cx (0x0f 0xaf 0xd9, modrm mod=3 reg=bx rm=cx): 3 * 4 = 12, CF=OF=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 3);
@@ -5368,7 +5368,7 @@ fn imul_0f_af_16bit_overflow_sets_carry_overflow() {
     // imul bx, cx (0x0f 0xaf 0xd9): 0x1000 * 0x10 = 0x10000, truncates to 0, CF=OF=1.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0x1000);
@@ -5387,7 +5387,7 @@ fn imul_0f_af_32bit_fits_clears_carry_overflow() {
     // 0x66 0x0f 0xaf 0xd9 (imul ebx, ecx): 1000 * 1000 = 1_000_000, CF=OF=0.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xaf, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(3, 1000); // ebx
@@ -5408,7 +5408,7 @@ fn imul_0f_af_32bit_overflow_sets_carry_overflow() {
     // truncates to 0, CF=OF=1.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xaf, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(3, 0x0001_0000); // ebx
@@ -5427,7 +5427,7 @@ fn imul_0f_af_signed_negative_result_fits() {
     // imul bx, cx (0x0f 0xaf 0xd9): -1 * 5 = -5 (0xfffb), fits signed 16-bit, CF=OF=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0xffff); // -1
@@ -5450,7 +5450,7 @@ fn imul_0f_af_signed_overflow_differs_from_unsigned() {
     // to the same 0x8000 but read as non-overflowing, so this distinguishes IMUL.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Bx, 0xffff); // -1
@@ -5469,7 +5469,7 @@ fn bsf_finds_lowest_set_bit() {
     // bsf bx, cx (0x0f 0xbc 0xd9): cx=0x0140 -> lowest set bit at index 6, ZF=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbc, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0140);
@@ -5487,7 +5487,7 @@ fn bsf_zero_source_sets_zf_and_leaves_dest() {
     // bsf bx, cx (0x0f 0xbc 0xd9): cx=0 -> ZF=1, bx unchanged (preset 0xbeef).
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbc, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0000);
@@ -5506,7 +5506,7 @@ fn bsf_32bit_finds_low_bit() {
     // 0x66 0x0f 0xbc 0xd9 (bsf ebx, ecx): ecx=0x8000_0000 -> index 31, ZF=0.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbc, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(1, 0x8000_0000); // ecx
@@ -5523,7 +5523,7 @@ fn bsr_finds_highest_set_bit() {
     // bsr bx, cx (0x0f 0xbd 0xd9): cx=0x0140 -> highest set bit at index 8, ZF=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbd, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0140);
@@ -5541,7 +5541,7 @@ fn bsr_32bit_finds_high_bit() {
     // 0x66 0x0f 0xbd 0xd9 (bsr ebx, ecx): ecx=0x8000_0000 -> index 31, ZF=0.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbd, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(1, 0x8000_0000); // ecx
@@ -5558,7 +5558,7 @@ fn bsr_zero_source_sets_zf_and_leaves_dest() {
     // bsr bx, cx (0x0f 0xbd 0xd9): cx=0 -> ZF=1, bx unchanged (preset 0x1234).
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbd, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0000);
@@ -5577,7 +5577,7 @@ fn bt_register_reads_set_bit() {
     // bt cx, bx (0x0f 0xa3 0xd9, modrm mod=3 reg=bx rm=cx): cx=0x0008 bit 3, bx=3 -> CF=1, cx unchanged.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xa3, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0008);
@@ -5596,7 +5596,7 @@ fn bt_register_reads_clear_bit() {
     // bt cx, bx: cx=0x0008, bx=2 (bit 2 clear) -> CF=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xa3, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0008);
@@ -5614,7 +5614,7 @@ fn bts_register_sets_bit_and_reads_old() {
     // bts cx, bx (0x0f 0xab 0xd9): cx=0x0000, bx=3 -> CF=0 (old bit), cx=0x0008.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xab, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0000);
@@ -5633,7 +5633,7 @@ fn btr_register_clears_bit_and_reads_old() {
     // btr cx, bx (0x0f 0xb3 0xd9): cx=0x0008, bx=3 -> CF=1 (old bit), cx=0x0000.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xb3, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0008);
@@ -5651,7 +5651,7 @@ fn btc_register_toggles_bit() {
     // btc cx, bx (0x0f 0xbb 0xd9): cx=0x0008, bx=3 -> CF=1 (old), cx=0x0000 (toggled off).
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xbb, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0008);
@@ -5670,7 +5670,7 @@ fn bts_memory_positive_index_walks_to_next_word() {
     // bx=17 -> block 1, bit 1 -> word at 0x42 (0x40+2). [0x42]=0 -> CF=0, [0x42]=0x0002.
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0xab, 0x1e, 0x40, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -5697,7 +5697,7 @@ fn bt_memory_negative_index_walks_to_previous_word() {
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0xa3, 0x1e, 0x40, 0x00]);
     memory[0x3e..0x40].copy_from_slice(&0x8000u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -5721,7 +5721,7 @@ fn btc_memory_negative_index_walks_and_toggles() {
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0xbb, 0x1e, 0x40, 0x00]);
     memory[0x3e..0x40].copy_from_slice(&0x8000u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -5743,7 +5743,7 @@ fn bts_32bit_register_sets_high_bit() {
     // 0x66 0x0f 0xab 0xd9 (bts ecx, ebx): ecx=0, ebx=20 -> CF=0, ecx bit 20 set.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xab, 0xd9]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(1, 0); // ecx
@@ -5761,7 +5761,7 @@ fn bt_immediate_reads_selected_bit() {
     // bt cx, 5 (0x0f 0xba 0xe1 0x05, modrm mod=3 reg=/4 rm=cx): cx=0x0020 bit 5 -> CF=1, cx unchanged.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xba, 0xe1, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0020);
@@ -5779,7 +5779,7 @@ fn btr_immediate_clears_selected_bit() {
     // btr cx, 5 (0x0f 0xba 0xf1 0x05, modrm mod=3 reg=/6 rm=cx): cx=0x0020 -> CF=1, cx=0x0000.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xba, 0xf1, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0x0020);
@@ -5798,7 +5798,7 @@ fn bts_immediate_memory_no_walk() {
     // imm bit 5, accesses [0x40] directly (no walk). [0x40]=0 -> CF=0, [0x40]=0x0020.
     let mut memory = vec![0; 128];
     memory[0..6].copy_from_slice(&[0x0f, 0xba, 0x2e, 0x40, 0x00, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -5820,7 +5820,7 @@ fn bt_immediate_reg_below_4_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..4].copy_from_slice(&[0x0f, 0xba, 0xc1, 0x05]);
     memory[0x18] = 0xee; // IVT[6] IP low byte -> IP 0x00ee
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -5840,7 +5840,7 @@ fn shld_imm_shifts_left_and_fills_from_source() {
     // ax=0x1234, bx=0x5678 -> ax=0x2345, CF=1 (bit shifted out of ax bit 12).
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x04]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -5859,7 +5859,7 @@ fn shrd_imm_shifts_right_and_fills_from_source() {
     // shrd ax, bx, 4 (0x0f 0xac 0xd8 0x04): ax=0x1234, bx=0x5678 -> ax=0x8123, CF=0.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xac, 0xd8, 0x04]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -5878,7 +5878,7 @@ fn shld_cl_uses_cl_count() {
     // shld ax, bx, cl (0x0f 0xa5 0xd8): cl=4 -> same as imm 4: ax=0x2345, CF=1.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xa5, 0xd8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -5898,7 +5898,7 @@ fn shrd_cl_uses_cl_count() {
     // shrd ax, bx, cl (0x0f 0xad 0xd8): cl=4 -> same as shrd imm 4: ax=0x8123, CF=0.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x0f, 0xad, 0xd8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -5919,7 +5919,7 @@ fn shld_32bit_imm() {
     // -> eax=0x3456_789a, CF=0.
     let mut memory = vec![0; 64];
     memory[0..5].copy_from_slice(&[0x66, 0x0f, 0xa4, 0xd8, 0x08]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(0, 0x1234_5678); // eax
@@ -5938,7 +5938,7 @@ fn shld_count_one_sets_overflow_on_sign_change() {
     // shld ax, bx, 1 (0x0f 0xa4 0xd8 0x01): ax=0x4000 -> ax=0x8000, sign flips, OF=1.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x01]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x4000);
@@ -5957,7 +5957,7 @@ fn shld_count_one_clears_overflow_without_sign_change() {
     // shld ax, bx, 1: ax=0x0001 -> ax=0x0002, sign unchanged, OF=0.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x01]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0001);
@@ -5976,7 +5976,7 @@ fn shld_count_zero_is_noop() {
     // shld ax, bx, 0 (0x0f 0xa4 0xd8 0x00): ax unchanged, flags unchanged.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -5999,7 +5999,7 @@ fn shld_count_past_width_rotates_source() {
     // The destination's prior value does not matter (preset 0xffff).
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x12]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0xffff);
@@ -6017,7 +6017,7 @@ fn shrd_count_past_width_rotates_source() {
     // right by 2. bx=0x1234 -> ax=0x048d.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0xac, 0xd8, 0x12]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0xffff);
@@ -6034,7 +6034,7 @@ fn xchg_byte_swaps_registers() {
     // xchg al, bl (0x86 0xc3, modrm mod=3 reg=al rm=bl). al=0x12, bl=0x34 -> al=0x34, bl=0x12.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x86, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0012);
@@ -6052,7 +6052,7 @@ fn xchg_word_swaps_registers() {
     // xchg bx, ax (0x87 0xc3, modrm reg=ax rm=bx). ax=0x1234, bx=0x5678 -> swapped.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x87, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -6072,7 +6072,7 @@ fn xchg_word_swaps_register_and_memory() {
     memory[0..4].copy_from_slice(&[0x87, 0x06, 0x40, 0x00]);
     memory[0x40] = 0xcd;
     memory[0x41] = 0xab; // word at 0x40 = 0xabcd
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6093,7 +6093,7 @@ fn xchg_dword_swaps_registers() {
     // 0x66 0x87 0xc3 (xchg ebx, eax). eax=0x1111_2222, ebx=0x3333_4444 -> swapped.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x66, 0x87, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(0, 0x1111_2222);
@@ -6111,7 +6111,7 @@ fn xchg_accumulator_swaps_ax_with_reg() {
     // xchg ax, cx (0x91). ax=0x1234, cx=0x5678 -> swapped.
     let mut memory = vec![0; 64];
     memory[0] = 0x91;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x1234);
@@ -6129,7 +6129,7 @@ fn xchg_accumulator_dword_swaps_eax_with_reg() {
     // 0x66 0x93 (xchg eax, ebx). eax=0x0001_0002, ebx=0x0003_0004 -> swapped.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x66, 0x93]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(0, 0x0001_0002);
@@ -6150,7 +6150,7 @@ fn xchg_byte_swaps_register_and_memory_with_displacement() {
     let mut memory = vec![0; 128];
     memory[0..3].copy_from_slice(&[0x86, 0x47, 0x10]);
     memory[0x30] = 0x99;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6170,7 +6170,7 @@ fn loopne_decrements_cx_and_branches_while_not_equal() {
     // loopne +5 (0xe0 0x05). cx=3, ZF=0 -> cx=2, taken: eip = 2 + 5 = 7.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe0, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 3);
@@ -6188,7 +6188,7 @@ fn loopne_falls_through_when_zero_flag_set() {
     // loopne +5: cx=3, ZF=1 -> cx=2, not taken (LOOPNE loops while ZF=0): eip = 2.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe0, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 3);
@@ -6206,7 +6206,7 @@ fn loopne_falls_through_when_count_reaches_zero() {
     // loopne +5: cx=1, ZF=0 -> cx=0, not taken (count zero): eip = 2.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe0, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 1);
@@ -6224,7 +6224,7 @@ fn loope_branches_while_equal() {
     // loope +5 (0xe1 0x05): cx=3, ZF=1 -> cx=2, taken: eip = 7.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe1, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 3);
@@ -6242,7 +6242,7 @@ fn loope_falls_through_when_zero_flag_clear() {
     // loope +5 (0xe1 0x05): cx=3, ZF=0 -> cx=2, not taken (LOOPE loops while ZF=1): eip = 2.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe1, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 3);
@@ -6260,7 +6260,7 @@ fn jcxz_branches_only_when_cx_zero() {
     // jcxz +5 (0xe3 0x05): cx=0 -> taken (eip=7), no decrement.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe3, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 0);
@@ -6277,7 +6277,7 @@ fn jcxz_falls_through_when_cx_nonzero() {
     // jcxz +5: cx=1 -> not taken: eip = 2.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xe3, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Cx, 1);
@@ -6294,7 +6294,7 @@ fn jecxz_uses_ecx_with_address_override() {
     // 0x67 jecxz +5 (0x67 0xe3 0x05): ecx=0 -> taken: eip = 3 + 5 = 8.
     let mut memory = vec![0; 64];
     memory[0..3].copy_from_slice(&[0x67, 0xe3, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr32(1, 0); // ecx = 0
@@ -6312,7 +6312,7 @@ fn xlat_reads_ds_table_indexed_by_al() {
     let mut memory = vec![0; 64];
     memory[0] = 0xd7;
     memory[0x15] = 0xab;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6333,7 +6333,7 @@ fn xlat_wraps_the_16bit_base_plus_index() {
     let mut memory = vec![0; 64];
     memory[0] = 0xd7;
     memory[0x01] = 0xcd;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6352,7 +6352,7 @@ fn xlat_honours_a_segment_override() {
     let mut memory = vec![0; 0x2000];
     memory[0..2].copy_from_slice(&[0x26, 0xd7]);
     memory[0x1015] = 0x99;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0x0100);
@@ -6371,7 +6371,7 @@ fn daa_low_nibble_correction() {
     // daa (0x27): AL=0x7C, CF=0, AF=0 -> AL=0x82 (low nibble +6), CF=0, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x27;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x007c);
@@ -6391,7 +6391,7 @@ fn daa_both_corrections_set_carry() {
     // daa: AL=0xAA -> +6 = 0xB0 (AF=1), then +0x60 = 0x10 (CF=1).
     let mut memory = vec![0; 64];
     memory[0] = 0x27;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x00aa);
@@ -6412,7 +6412,7 @@ fn daa_incoming_aux_carry_triggers_correction() {
     // AL=0x26, CF=0, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x27;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0020);
@@ -6432,7 +6432,7 @@ fn das_low_nibble_correction() {
     // das (0x2f): AL=0x4A, CF=0, AF=0 -> AL=0x44 (low nibble -6), CF=0, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x2f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x004a);
@@ -6452,7 +6452,7 @@ fn das_high_correction_on_incoming_carry() {
     // das: AL=0x00, CF=1, AF=0 -> -0x60 = 0xA0, CF=1, AF=0.
     let mut memory = vec![0; 64];
     memory[0] = 0x2f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0000);
@@ -6473,7 +6473,7 @@ fn aaa_adjusts_and_carries_into_ah() {
     // AX=0x0111 then AL=0x01 -> AX=0x0101; CF=1, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x37;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x000b);
@@ -6494,7 +6494,7 @@ fn aaa_no_adjust_clears_carry() {
     // aaa: AX=0x0005, AF=0 -> only AL &= 0x0f; CF=0, AF=0, AH unchanged.
     let mut memory = vec![0; 64];
     memory[0] = 0x37;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0005);
@@ -6516,7 +6516,7 @@ fn aas_adjusts_and_borrows_from_ah() {
     // 0x020B - 6 = 0x0205, AH-1 -> 0x0105, AL=0x05; CF=1, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x3f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x020b);
@@ -6537,7 +6537,7 @@ fn aas_no_adjust_clears_carry() {
     // aas: AX=0x0204, AF=0 -> only AL &= 0x0f; CF=0, AF=0, AH unchanged.
     let mut memory = vec![0; 64];
     memory[0] = 0x3f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0204);
@@ -6559,7 +6559,7 @@ fn aaa_aux_carry_triggers_adjust() {
     // AX=0x0001 + 0x106 = 0x0107, then AL &= 0x0f -> AX=0x0107; AL=0x07, AH=0x01, CF=1, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x37;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0001);
@@ -6582,7 +6582,7 @@ fn aas_aux_carry_triggers_adjust() {
     // AL=0x02, AH=0x01, CF=1, AF=1.
     let mut memory = vec![0; 64];
     memory[0] = 0x3f;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0208);
@@ -6603,7 +6603,7 @@ fn aam_splits_al_into_ah_and_al() {
     // aam (0xd4 0x0a): AL=0x4B (75) -> AH=7, AL=5. SF=0, ZF=0.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xd4, 0x0a]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x004b);
@@ -6638,7 +6638,7 @@ fn aad_folds_ah_into_al() {
     // aad (0xd5 0x0a): AX=0x0507 (AH=5, AL=7) -> AL = 7 + 5*10 = 57 = 0x39, AH=0.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0xd5, 0x0a]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_reg16(Reg16::Ax, 0x0507);
@@ -6658,7 +6658,7 @@ fn lock_add_to_memory_executes() {
     memory[0..5].copy_from_slice(&[0xf0, 0x01, 0x06, 0x40, 0x00]);
     memory[0x40] = 0x10;
     memory[0x41] = 0x00;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6678,7 +6678,7 @@ fn lock_bts_to_memory_executes() {
     // lock bts [0x40], ax (0xf0 0x0f 0xab 0x06 0x40 0x00). ax=3 -> set bit 3 of [0x40].
     let mut memory = vec![0; 128];
     memory[0..6].copy_from_slice(&[0xf0, 0x0f, 0xab, 0x06, 0x40, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6698,7 +6698,7 @@ fn lock_on_register_destination_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xf0, 0x01, 0xd8]);
     memory[0x18] = 0xee; // IVT[6] -> IP 0x00ee, CS 0
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -6718,7 +6718,7 @@ fn lock_xchg_register_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xf0, 0x87, 0xd8]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -6738,7 +6738,7 @@ fn lock_inc_register_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xf0, 0xfe, 0xc0]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -6758,7 +6758,7 @@ fn lock_cmp_memory_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0xf0, 0x39, 0x06, 0x40, 0x00]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -6779,7 +6779,7 @@ fn lock_non_lockable_opcode_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..3].copy_from_slice(&[0xf0, 0x89, 0xd8]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -6798,7 +6798,7 @@ fn lock_bts_imm_to_memory_executes() {
     // lock bts [0x40], 3 (0xf0 0x0f 0xba 0x2e 0x40 0x00 0x03, /5 = BTS). set bit 3 of [0x40].
     let mut memory = vec![0; 128];
     memory[0..7].copy_from_slice(&[0xf0, 0x0f, 0xba, 0x2e, 0x40, 0x00, 0x03]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6817,7 +6817,7 @@ fn lock_btc_imm_register_delivers_ud() {
     let mut memory = vec![0; 1024];
     memory[0..5].copy_from_slice(&[0xf0, 0x0f, 0xba, 0xfb, 0x05]);
     memory[0x18] = 0xee;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -6836,7 +6836,7 @@ fn bswap_reverses_dword_byte_order() {
     // bswap eax (0x0f 0xc8). eax = 0x12345678 -> 0x78563412 in 32-bit operand mode.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x0f, 0xc8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     // A 32-bit code segment so the default operand size is dword.
@@ -6861,7 +6861,7 @@ fn invd_and_wbinvd_noop_at_cpl0() {
     // they advance past their two bytes and touch no register or flag.
     let mut memory = vec![0; 64];
     memory[0..4].copy_from_slice(&[0x0f, 0x08, 0x0f, 0x09]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let flags_before = cpu.registers.eflags;
@@ -6877,7 +6877,7 @@ fn invd_and_wbinvd_noop_at_cpl0() {
 #[test]
 fn invd_at_cpl3_delivers_ud() {
     // invd (0x0f 0x08) at CPL 3 in protected mode raises #UD (vector 6).
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -6910,7 +6910,7 @@ fn invd_at_cpl3_delivers_ud() {
 #[test]
 fn wbinvd_at_cpl3_delivers_ud() {
     // wbinvd (0x0f 0x09) at CPL 3 in protected mode raises #UD (vector 6).
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -6948,7 +6948,7 @@ fn invlpg_memory_noop_at_cpl0() {
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x3e, 0x40, 0x00]);
     memory[0x40] = 0xaa;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -6963,7 +6963,7 @@ fn invlpg_memory_noop_at_cpl0() {
 #[test]
 fn invlpg_at_cpl3_delivers_ud() {
     // invlpg [0x40] at CPL 3 in protected mode raises #UD (vector 6).
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -7008,7 +7008,7 @@ fn invlpg_at_cpl3_delivers_ud() {
 #[test]
 fn invlpg_register_form_delivers_ud() {
     // 0F 01 /7 with a register operand (mod=3) is #UD. ModRM 0xff = mod 3, reg 7, rm 7.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0xff, 0, 0]);
@@ -7036,7 +7036,7 @@ fn hardware_irq_injects_when_if_enabled() {
     let mut memory = vec![0; 1024];
     memory[0] = 0x90; // nop that must NOT run
     memory[0x20] = 0xcc; // handler IP low byte
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -7059,7 +7059,7 @@ fn hardware_irq_held_off_when_if_clear() {
     let mut memory = vec![0; 1024];
     memory[0] = 0x90; // nop
     memory[0x20] = 0xcc;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_IF, false);
@@ -7077,7 +7077,7 @@ fn hlt_wakes_on_pending_irq() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xf4; // hlt
     memory[0x20] = 0xcc; // IVT[8] IP
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -7099,7 +7099,7 @@ fn hlt_wakes_on_pending_irq() {
 fn hlt_stays_halted_without_deliverable_irq() {
     let mut memory = vec![0; 1024];
     memory[0] = 0xf4; // hlt
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.set_flag(FLAG_IF, true);
@@ -7121,7 +7121,7 @@ fn hlt_at_cpl0_protected_mode_halts() {
     // as permitted as real mode: require_cpl0 must not fault here.
     let mut memory = vec![0u8; 256];
     memory[0] = 0xf4; // hlt
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -7207,7 +7207,7 @@ fn xadd_byte_swaps_and_adds_with_add_flags() {
     // dest = BL, src = AL. After: BL = BL + AL, AL = old BL, flags like ADD(BL, AL).
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x0f, 0xc0, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x01); // AL (src)
@@ -7231,7 +7231,7 @@ fn xadd_word_matches_add_flags() {
     // 0F C1 /r XADD r/m16, r16. ModRM C3: reg = AX(0), rm = BX(3).
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x0f, 0xc1, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr16(0, 0x7fff); // AX (src)
@@ -7255,7 +7255,7 @@ fn xadd_dword_matches_add_flags() {
     // ModRM C3: reg = EAX(0), rm = EBX(3).
     let mut memory = vec![0; 16];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xc1, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0x1111_1111); // src
@@ -7278,7 +7278,7 @@ fn cmpxchg_byte_equal_stores_source() {
     // AL == BL so ZF is set and the source (CL) is stored into BL; AL is unchanged.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x0f, 0xb0, 0xcb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x42); // AL (accumulator)
@@ -7298,7 +7298,7 @@ fn cmpxchg_byte_unequal_loads_destination() {
     // AL != BL: ZF clear, AL = BL, BL unchanged.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x0f, 0xb0, 0xcb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr8(0, 0x42); // AL
@@ -7321,7 +7321,7 @@ fn cmpxchg_word_equal_stores_source() {
     // 0F B1 /r CMPXCHG r/m16, r16. ModRM C3: reg = CX(1, src), rm = BX(3, dest).
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0x0f, 0xb1, 0xcb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.write_gpr16(0, 0x1234); // AX
@@ -7341,7 +7341,7 @@ fn cmpxchg_dword_unequal_loads_destination() {
     // 66 0F B1 /r CMPXCHG r/m32, r32. ModRM C3: reg = ECX(1, src), rm = EBX(3, dest).
     let mut memory = vec![0; 16];
     memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb1, 0xcb]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(0xaaaa_aaaa); // EAX
@@ -7363,7 +7363,7 @@ fn lock_xadd_to_memory_is_accepted() {
     let mut memory = vec![0; 1024];
     memory[0..6].copy_from_slice(&[0xf0, 0x0f, 0xc1, 0x06, 0x00, 0x02]);
     memory[0x200..0x202].copy_from_slice(&0x0010u16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -7386,7 +7386,7 @@ fn lock_xadd_to_register_is_undefined_opcode() {
     // so the decoder raises #UD (vector 6) before executing.
     let mut memory = vec![0; 16];
     memory[0..4].copy_from_slice(&[0xf0, 0x0f, 0xc1, 0xc3]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(memory);
@@ -7400,7 +7400,7 @@ fn lock_bswap_is_undefined_opcode() {
     // F0 0F C8: LOCK BSWAP EAX. BSWAP has no memory form, so LOCK is always #UD.
     let mut memory = vec![0; 16];
     memory[0..3].copy_from_slice(&[0xf0, 0x0f, 0xc8]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(memory);
@@ -7412,11 +7412,11 @@ fn lock_bswap_is_undefined_opcode() {
 // Build a CPL-3 protected-mode CPU whose CS and DS are flat user segments, running
 // MOV AX, moffs16 (0xa1) that reads a word from DS:moffs. The caller picks the
 // moffs so the access lands on an even or odd boundary.
-fn cpl3_word_read_at(moffs: u16) -> (Cpu386, TestBus) {
+fn cpl3_word_read_at(moffs: u16) -> (CpuGsw, TestBus) {
     let mut memory = vec![0; 256];
     memory[0] = 0xa1;
     memory[1..3].copy_from_slice(&moffs.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -7523,7 +7523,7 @@ fn eflags_ac_and_id_survive_pushf_popf_round_trip() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0x66, 0x9c]);
     memory[2..4].copy_from_slice(&[0x66, 0x9d]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -7541,12 +7541,12 @@ fn eflags_ac_and_id_survive_pushf_popf_round_trip() {
     assert!(cpu.flag(FLAG_ID));
 }
 
-fn run_cpuid(leaf: u32) -> Cpu386 {
+fn run_cpuid(leaf: u32) -> CpuGsw {
     // CPUID (0F A2) with the leaf selector in EAX. Returns the CPU after one step so the
     // caller can read EAX/EBX/ECX/EDX.
     let mut memory = vec![0; 64];
     memory[0..2].copy_from_slice(&[0x0f, 0xa2]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     cpu.registers.set_eax(leaf);
@@ -7626,7 +7626,7 @@ fn cpuid_brand_string_reports_genuine_gsw_80586() {
 fn cpuid_is_not_privileged_at_cpl3() {
     // CPUID runs at any privilege level. In protected mode at CPL 3 it must execute,
     // not fault, and still report the GSW-586 identity.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -7650,7 +7650,7 @@ fn cpuid_is_not_privileged_at_cpl3() {
 #[test]
 fn default_level_is_full_isa() {
     // The core resets to the full ISA so firmware POST is never restricted.
-    assert_eq!(Cpu386::default().level(), CpuLevel::I586);
+    assert_eq!(CpuGsw::default().level(), CpuLevel::I586);
 }
 
 #[test]
@@ -7663,12 +7663,12 @@ fn cpu_level_cache_table() {
 
 // --- Phase 5 Slice A: RDTSC, RDMSR/WRMSR, the K6 MSR set, CR4 ---
 
-fn cpl3_code(code: &[u8]) -> (Cpu386, TestBus) {
+fn cpl3_code(code: &[u8]) -> (CpuGsw, TestBus) {
     // Protected mode with a flat CPL-3 code segment (selector RPL 3), the same shape
     // the #AC/CPUID privilege tests use, but loaded with arbitrary code.
     let mut memory = vec![0u8; 256];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -7973,7 +7973,7 @@ fn lgdt_lidt_run_at_cpl0_in_real_mode() {
     memory[5..10].copy_from_slice(&[0x0f, 0x01, 0x1e, 0x26, 0x00]);
     memory[0x20..0x26].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
     memory[0x26..0x2c].copy_from_slice(&[0xff, 0x01, 0x00, 0x20, 0x00, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -8105,14 +8105,14 @@ fn mov_dr6_round_trips_with_reserved_bit_behavior() {
 #[test]
 fn mov_dr6_reset_value_matches_prm() {
     // 386 PRM ch12: DR6 powers up as 0xFFFF_0FF0.
-    let cpu = Cpu386::default();
+    let cpu = CpuGsw::default();
     assert_eq!(cpu.control.dr6, 0xffff_0ff0);
 }
 
 #[test]
 fn mov_dr7_reset_value_matches_prm() {
     // 386 PRM ch12: DR7 powers up as 0x0000_0400 (bit 10 set, everything else clear).
-    let cpu = Cpu386::default();
+    let cpu = CpuGsw::default();
     assert_eq!(cpu.control.dr7, 0x0000_0400);
 }
 
@@ -8526,7 +8526,7 @@ fn syscall_is_undefined_opcode_below_586() {
     // Even with SCE enabled, a throttled 486-level guest sees #UD from the 586 gate.
     let mut memory = vec![0u8; 64];
     memory[..2].copy_from_slice(&[0x0f, 0x05]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(CpuLevel::I486);
     cpu.msr.efer = EFER_SCE;
     cpu.load_segment_real(SegmentIndex::Cs, 0);
@@ -8541,7 +8541,7 @@ fn syscall_is_undefined_opcode_below_586() {
 /// directly on the result. This is the single per-instruction entry the test suite uses now that
 /// the transitional fused reference is gone: it is exactly what `cycle` runs, minus the
 /// interrupt-service prologue and the exception-delivery epilogue.
-fn exec_one_split<B: CpuBus>(cpu: &mut Cpu386, bus: &mut B) -> ExecResult<CycleOutcome> {
+fn exec_one_split<B: CpuBus>(cpu: &mut CpuGsw, bus: &mut B) -> ExecResult<CycleOutcome> {
     cpu.begin_instruction();
     let insn = cpu.decode(bus)?;
     cpu.execute_decoded(&insn, bus)
@@ -8673,7 +8673,7 @@ fn cross_page_write_into_cached_code_invalidates_it() {
     memory[0x200a] = 0xa2; // MOV moffs16, AL
     memory[0x200b] = 0x00;
     memory[0x200c] = 0x10; //   moffs = 0x1000
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -8722,7 +8722,7 @@ fn data_write_to_a_non_code_page_does_not_flush_the_cache() {
     memory[0x200a] = 0xa2; // MOV moffs16, AL
     memory[0x200b] = 0x50;
     memory[0x200c] = 0x30; //   moffs = 0x3050 (page 3, holds no code)
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -8750,7 +8750,7 @@ fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
     // stale INC AX must never run.
     let mut memory = vec![0u8; 0x40];
     memory[0x10] = 0x40; // INC AX
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.set_eip(0x10);
@@ -8794,7 +8794,7 @@ fn isa_gate_exempt_decodes_are_never_cached() {
     let mut memory = vec![0u8; 256];
     memory[..2].copy_from_slice(&[0x0f, 0xa2]); // CPUID at linear 0
     memory[0x10..0x12].copy_from_slice(&[0x66, 0x40]); // INC EAX at linear 0x10
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(CpuLevel::I286);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
@@ -8838,7 +8838,7 @@ fn smc_above_the_byte_bitmap_coverage_invalidates_via_page_marks() {
     memory[0x2009] = 0x48; //   = 0x48 (DEC AX opcode)
     memory[0x200a] = 0xa2; // MOV moffs, AL (moffs is 32-bit under the D=1 flat segment)
     memory[0x200b..0x200f].copy_from_slice(&(HI as u32).to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     // Real-mode 64 KB limits cannot reach 2 MiB; run flat (the pmode shape that matters).
@@ -8886,7 +8886,7 @@ fn d_bit_change_at_the_same_linear_address_re_decodes() {
     // that effect directly (set the 32-bit CS, then invalidate) to avoid a full GDT setup.
     let mut memory = vec![0u8; 0x100];
     memory[0..5].copy_from_slice(&[0xb8, 0x34, 0x12, 0x78, 0x56]); // B8 imm
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0); // 16-bit
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -8941,7 +8941,7 @@ fn a_fetch_page_made_not_present_re_faults_after_invalidation() {
     memory[0x6000..0x6004].copy_from_slice(&0x0000_7007u32.to_le_bytes()); // PD[0] -> PT 0x7000
     memory[0x7004..0x7008].copy_from_slice(&0x0000_5007u32.to_le_bytes()); // PT[1] (lin 0x1000) -> 0x5000
     memory[0x5000] = 0x40; // INC AX at linear 0x1000
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr3 = 0x6000;
     cpu.control.cr0 |= CR0_PE | CR0_PG;
     cpu.registers
@@ -8992,7 +8992,7 @@ fn note_a20_changed_invalidates_the_decode_cache() {
 fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
     let mut memory = vec![0; 1024];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(level);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -9036,7 +9036,7 @@ fn firmware_rom_cs_is_exempt_from_the_286_gate() {
     let mut memory = vec![0u8; 0x10_0000];
     let base = 0x000F_0000usize;
     memory[base..base + code.len()].copy_from_slice(&code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(CpuLevel::I286);
     cpu.load_segment_real(SegmentIndex::Cs, 0xF000);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -9071,7 +9071,7 @@ fn two_byte_convention_charges_the_second_byte_exactly_once() {
     let mut mem = vec![0u8; 64];
     mem[..code.len()].copy_from_slice(&code);
 
-    let mut split = Cpu386::default();
+    let mut split = CpuGsw::default();
     split.load_segment_real(SegmentIndex::Cs, 0);
     split.registers.eip = 0;
     split.elapsed_clocks = 42;
@@ -9173,7 +9173,7 @@ fn every_implemented_opcode_routes_off_the_legacy_fallback() {
 
     for byte in 0x00u16..=0xff {
         let unimplemented = UNIMPLEMENTED_SINGLE_BYTE.contains(&(byte as u8));
-        let group = Cpu386::route_group(byte, prefixes);
+        let group = CpuGsw::route_group(byte, prefixes);
         let is_fallback = matches!(group, DecodeGroup::Fallback);
         assert!(
             !matches!(group, DecodeGroup::TwoByteFallback),
@@ -9195,7 +9195,7 @@ fn every_implemented_opcode_routes_off_the_legacy_fallback() {
     for second in 0x00u16..=0xff {
         // `decode` folds the second byte into the opcode as 0x0F00 | second.
         let opcode = 0x0f00 | second;
-        let group = Cpu386::route_group(opcode, prefixes);
+        let group = CpuGsw::route_group(opcode, prefixes);
         let is_two_byte_fallback = matches!(group, DecodeGroup::TwoByteFallback);
         assert!(
             !matches!(group, DecodeGroup::Fallback),
@@ -9230,7 +9230,7 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
         // byte that is an *opcode*, never a prefix: ARPL (0x63) and ICEBP (0xf1). The prefix
         // bytes are covered by the routing-partition test above and the dedicated #UD guards.
         if matches!(op, 0x63 | 0xf1) {
-            let mut cpu = Cpu386::default();
+            let mut cpu = CpuGsw::default();
             cpu.load_segment_real(SegmentIndex::Cs, 0);
             cpu.registers.eip = 0;
             let mut bus = TestBus::with_memory(vec![op, 0, 0, 0]);
@@ -9260,7 +9260,7 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
         !implemented_two_byte(second),
         "test bug: 0F {second:#04x} is actually implemented"
     );
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(vec![0x0f, second, 0xc0, 0, 0]);
@@ -9283,7 +9283,7 @@ fn single_byte_f1_is_an_undefined_opcode() {
     // production split exactly like ARPL (0x63): `route_group` leaves it on Fallback and the
     // Fallback arm raises UnsupportedOpcode. Dedicated guard alongside the ARPL/prefix-byte
     // #UD tests so a future edit that mis-routes 0xF1 is caught here.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(vec![0xf1, 0, 0, 0]);
@@ -9345,7 +9345,7 @@ fn lgdt_still_runs_at_286() {
     memory[0..4].copy_from_slice(&[0x0f, 0x01, 0x16, 0x20]); // disp16 = 0x0020
     // 6-byte GDTR image at 0x0020: limit then 32-bit base.
     memory[0x20..0x26].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(CpuLevel::I286);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -9386,7 +9386,7 @@ fn cpuid_runs_in_ring0_protected_mode_below_486() {
     // moot for everyone.)
     let mut memory = vec![0u8; 256];
     memory[..2].copy_from_slice(&[0x0f, 0xa2]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(CpuLevel::I386);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
@@ -9458,7 +9458,7 @@ fn id_flag_toggle_detection_sequence_finds_cpuid() {
     memory[2..4].copy_from_slice(&[0x66, 0x9d]);
     // 0f a2 CPUID with EAX = 0 already loaded.
     memory[4..6].copy_from_slice(&[0x0f, 0xa2]);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -9484,10 +9484,10 @@ fn id_flag_toggle_detection_sequence_finds_cpuid() {
 
 // ---- Slice 1: real-mode integer opcode completion (see dev_docs/COVERAGE.md) ----
 
-fn real_mode_cpu(code: &[u8], mem_len: usize) -> (Cpu386, Vec<u8>) {
+fn real_mode_cpu(code: &[u8], mem_len: usize) -> (CpuGsw, Vec<u8>) {
     let mut memory = vec![0u8; mem_len];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -9499,7 +9499,7 @@ fn real_mode_cpu(code: &[u8], mem_len: usize) -> (Cpu386, Vec<u8>) {
 /// interrupts): keep starting a fresh run from the current eip until one halts or a generous step
 /// budget is exhausted. Returns the number of runs the executor produced, so a test can assert a
 /// hot loop actually collapsed into multi-instruction runs rather than one-instruction stutters.
-fn drive_straight_line_runs(cpu: &mut Cpu386, bus: &mut TestBus) -> usize {
+fn drive_straight_line_runs(cpu: &mut CpuGsw, bus: &mut TestBus) -> usize {
     let mut runs = 0;
     for _ in 0..10_000 {
         runs += 1;
@@ -9998,7 +9998,7 @@ fn straight_line_run_stops_at_a_page_crossing_instruction() {
         memory[0xffe] = 0xb0; // MOV AL,
         memory[0xfff] = 0x07; //   7
         memory[0x1000] = 0xf4; // HLT
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -10039,7 +10039,7 @@ fn straight_line_run_stops_at_a_page_crossing_instruction() {
         memory[0xfff] = 0xb0; // MOV AL,
         memory[0x1000] = 0x07; //   7  (this byte is on the next page)
         memory[0x1001] = 0xf4; // HLT
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -10581,7 +10581,7 @@ fn straight_line_run_ends_on_port_io_step_break() {
 
 /// Shared seed for the seam differential / golden batteries below: a fixed real-mode register
 /// set plus a known word at [0x20], so each instruction has stable inputs.
-fn seam_seed(cpu: &mut Cpu386) {
+fn seam_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -10619,7 +10619,7 @@ fn seam_matches_fused_path_across_addressing_forms() {
     mem[0] = 0xd7; // XLAT
     mem[0x12] = 0xab; // the XLAT lookup result planted at [BX+AL]=0x12 (BX=0x10, AL=0x02)
 
-    let mut split = Cpu386::default();
+    let mut split = CpuGsw::default();
     seam_seed(&mut split);
     let mut sbus = TestBus::with_memory(mem);
     exec_one_split(&mut split, &mut sbus).unwrap();
@@ -10923,7 +10923,7 @@ fn alu_split_matches_golden_across_ops() {
         mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         seam_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -10973,7 +10973,7 @@ fn regen_alu_goldens() {
         mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         seam_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -11258,7 +11258,7 @@ fn datamove_split_matches_golden_across_ops() {
         mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         seam_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -11300,7 +11300,7 @@ fn regen_datamove_goldens() {
         mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         seam_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -11352,7 +11352,7 @@ struct MovzxMovsxGolden {
 /// sources: byte 0x80 at [0x10] (= [BX]), word 0x8081 at [0x18] (= [BX+SI], BX=0x10 + SI=0x08),
 /// and word 0xBEEF at [0x20] (the direct-disp source). The 0x80/0x8081/0xBEEF high bits make
 /// zero- vs sign-extension visibly different.
-fn movzx_seed(cpu: &mut Cpu386, mem: &mut [u8]) {
+fn movzx_seed(cpu: &mut CpuGsw, mem: &mut [u8]) {
     seam_seed(cpu);
     mem[0x10] = 0x80;
     mem[0x18..0x1a].copy_from_slice(&0x8081u16.to_le_bytes());
@@ -11439,7 +11439,7 @@ fn movzx_movsx_split_matches_golden() {
     for g in movzx_movsx_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         mem[..g.code.len()].copy_from_slice(g.code);
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         movzx_seed(&mut split, &mut mem);
         let initial = mem.clone();
         let mut sbus = TestBus::with_memory(mem);
@@ -11481,7 +11481,7 @@ fn regen_movzx_movsx_goldens() {
     for g in movzx_movsx_golden_cases() {
         let mut mem = vec![0u8; 0x200];
         mem[..g.code.len()].copy_from_slice(g.code);
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         movzx_seed(&mut fused, &mut mem);
         let initial = mem.clone();
         let mut fbus = TestBus::with_memory(mem);
@@ -12102,12 +12102,12 @@ fn psllw_immediate_shifts_each_word() {
 
 /// Protected-mode CPU with a GDT (base 0x100, limit 0x1f) holding one descriptor
 /// at selector 0x08. CS selector 0 => CPL 0.
-fn protected_cpu(code: &[u8], descriptor_low: u32, descriptor_high: u32) -> (Cpu386, Vec<u8>) {
+fn protected_cpu(code: &[u8], descriptor_low: u32, descriptor_high: u32) -> (CpuGsw, Vec<u8>) {
     let mut memory = vec![0u8; 0x200];
     memory[..code.len()].copy_from_slice(code);
     memory[0x108..0x10c].copy_from_slice(&descriptor_low.to_le_bytes());
     memory[0x10c..0x110].copy_from_slice(&descriptor_high.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -12219,10 +12219,10 @@ fn a12_unimplemented_neighbours_stay_undefined() {
 /// Real-mode CPU with SP parked at 0x1f0 (mirrors `stack_seed`) and 0x200 bytes of memory,
 /// so PUSH/POP FS/GS have room on the stack. Used for the real-mode + 16/32-bit-operand-size
 /// arms of the new opcodes; the protected-mode descriptor-load arms use `protected_cpu` below.
-fn fs_gs_stack_cpu(code: &[u8]) -> (Cpu386, Vec<u8>) {
+fn fs_gs_stack_cpu(code: &[u8]) -> (CpuGsw, Vec<u8>) {
     let mut memory = vec![0u8; 0x200];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -12529,7 +12529,7 @@ fn pop_fs_gs_fault_on_a_bad_selector_in_protected_mode() {
 fn run_at_level_with_stack(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
     let mut memory = vec![0; 1024];
     memory[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_level(level);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -12887,7 +12887,7 @@ fn mf_is_suppressed_when_ne_is_clear() {
 
 /// Protected-mode CPU with a GDT at 0x100 holding the given (selector, low, high)
 /// descriptors. CS/SS default to ring 0 (real-mode shells, base 0); SP at 0x80.
-fn protected_cpu_with_gdt(code: &[u8], descriptors: &[(u16, u32, u32)]) -> (Cpu386, Vec<u8>) {
+fn protected_cpu_with_gdt(code: &[u8], descriptors: &[(u16, u32, u32)]) -> (CpuGsw, Vec<u8>) {
     let mut memory = vec![0u8; 0x400];
     memory[..code.len()].copy_from_slice(code);
     for &(sel, low, high) in descriptors {
@@ -12895,7 +12895,7 @@ fn protected_cpu_with_gdt(code: &[u8], descriptors: &[(u16, u32, u32)]) -> (Cpu3
         memory[off..off + 4].copy_from_slice(&low.to_le_bytes());
         memory[off + 4..off + 8].copy_from_slice(&high.to_le_bytes());
     }
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -13189,7 +13189,7 @@ fn cpl_transition_pe_clear_resets_cpl_to_zero() {
     // fixed CPL 0.
     let mut memory = vec![0u8; 16];
     memory[..3].copy_from_slice(&[0x0f, 0x22, 0xc0]); // MOV CR0, EAX
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
@@ -13484,7 +13484,7 @@ fn pmode_ring3_popf_below_iopl_preserves_if_and_iopl() {
     // `cpl3_code`, but with a matching flat CPL-3 SS so POPF can pop the stack.
     let mut memory = vec![0u8; 256];
     memory[0] = 0x9d; // POPF
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -13573,7 +13573,7 @@ struct StackGolden {
 /// Seed for the stack golden battery. Uses a 512-byte memory image with a stack at
 /// 0x1f0 (grows down into the low half) and known register values for non-stack GPRs.
 /// The instruction is placed at offset 0; the stack region starts at 0x1f0.
-fn stack_seed(cpu: &mut Cpu386) {
+fn stack_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -13885,7 +13885,7 @@ fn stack_split_matches_golden_across_ops() {
         }
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         stack_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -13925,7 +13925,7 @@ fn regen_stack_goldens() {
         }
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         stack_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -13975,7 +13975,7 @@ struct GroupGolden {
 /// Seed for the group golden battery: the same register file as `seam_seed` plus CL=4 (a small
 /// shift count) and CF pre-set in eflags so the INC/DEC CF-preservation is observable. CX is
 /// 0x0304 so CL = 0x04.
-fn group_seed(cpu: &mut Cpu386) {
+fn group_seed(cpu: &mut CpuGsw) {
     seam_seed(cpu);
     // Pre-set CF (bit 0) on top of the always-set reserved bit 1. This makes the group 4
     // INC/DEC CF-preservation visible (CF must still be set after) and feeds ADC/SBB/RCR.
@@ -14231,7 +14231,7 @@ fn group_split_matches_golden_across_ops() {
         group_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         group_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -14269,7 +14269,7 @@ fn regen_group_goldens() {
         group_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         group_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -14319,7 +14319,7 @@ fn group_div_by_zero_raises_de_through_the_split() {
     let mut mem = vec![0u8; 0x40];
     mem[..code.len()].copy_from_slice(&code);
 
-    let mut split = Cpu386::default();
+    let mut split = CpuGsw::default();
     split.load_segment_real(SegmentIndex::Cs, 0);
     split.load_segment_real(SegmentIndex::Ds, 0);
     split.registers.eip = 0;
@@ -14376,7 +14376,7 @@ struct BranchGolden {
 /// Seed for the branch golden battery. CS/DS/SS = 0, eip = 0, SP = 0x100 (a safe in-image stack
 /// so CALL's push lands in the 0x200-byte image), ZF pre-set (so the Jcc/LOOPcc condition cases
 /// are deterministic), and CX set per case (the caller overwrites it from `BranchGolden::cx`).
-fn branch_seed(cpu: &mut Cpu386, cx: u32) {
+fn branch_seed(cpu: &mut CpuGsw, cx: u32) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -14564,7 +14564,7 @@ fn branch_split_matches_golden_across_ops() {
         mem[..g.code.len()].copy_from_slice(g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         branch_seed(&mut split, g.cx);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -14603,7 +14603,7 @@ fn regen_branch_goldens() {
         mem[..g.code.len()].copy_from_slice(g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         branch_seed(&mut fused, g.cx);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -14661,7 +14661,7 @@ struct ControlFlowGolden {
 /// (a safe in-image stack), BX = 0x40 (so `[bx]` addresses the in-image FF r/m operand), and the
 /// OF/IF flags set so INTO traps and the interrupt deliveries record IF being cleared. The
 /// per-case `setup` closure lays down the memory image each form needs.
-fn controlflow_seed(cpu: &mut Cpu386) {
+fn controlflow_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -14867,7 +14867,7 @@ fn controlflow_split_matches_golden_across_ops() {
         (g.setup)(&mut mem);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         controlflow_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         split.cycle(&mut sbus).unwrap();
@@ -14915,7 +14915,7 @@ fn regen_controlflow_goldens() {
         (g.setup)(&mut mem);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         controlflow_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -14990,7 +14990,7 @@ struct FlagsMiscGolden {
 /// pre-set (so INC/DEC CF-preservation is visible and CMC/CLC/STC have a known starting CF),
 /// and AH=0xd7 (= 0b11010111: CF/PF/AF/ZF/SF all 1, bits 3/5 forced — so LAHF/SAHF transfer
 /// a non-trivial value). AH lives in the high byte of AX; write_gpr8(4, 0xd7) sets it.
-fn flags_misc_seed(cpu: &mut Cpu386) {
+fn flags_misc_seed(cpu: &mut CpuGsw) {
     seam_seed(cpu);
     // CF set (bit 0 on top of always-1 bit 1). Makes INC/DEC CF-preservation observable and
     // gives CMC/CLC/STC a known starting state.
@@ -15195,7 +15195,7 @@ fn flags_misc_split_matches_golden_across_ops() {
         let mut mem = vec![0u8; 0x200];
         flags_misc_seed_mem(&mut mem, g.code);
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         flags_misc_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -15227,7 +15227,7 @@ fn regen_flags_misc_goldens() {
         flags_misc_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         flags_misc_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -15282,7 +15282,7 @@ fn sti_interrupt_shadow_defers_interrupt_by_one_instruction() {
     // if the CPU tries to read into it).
     memory[0x200] = 0xcf;
 
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -15343,7 +15343,7 @@ struct StringGolden {
     code: &'static [u8],
     /// Per-case register seed applied after `string_seed` (SI/DI/CX/AX, the DF flag, segment
     /// bases for the override case), applied identically on the split and fused-reference paths.
-    regs: fn(&mut Cpu386),
+    regs: fn(&mut CpuGsw),
     /// Per-case memory image (the source and destination bytes), applied identically on both
     /// paths before the run.
     setup: fn(&mut [u8]),
@@ -15358,7 +15358,7 @@ struct StringGolden {
 /// Everything that varies per form (the index registers, the count, the accumulator, DF, and the
 /// ES base for the segment-override case) is set by each case's `regs` closure, so the seed itself
 /// stays minimal and every input is explicit at the case site.
-fn string_seed(cpu: &mut Cpu386) {
+fn string_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -15587,7 +15587,7 @@ fn string_split_matches_golden_across_ops() {
         mem[..g.code.len()].copy_from_slice(g.code);
         (g.setup)(&mut mem);
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         string_seed(&mut split);
         (g.regs)(&mut split);
         let mut sbus = TestBus::with_memory(mem);
@@ -15628,7 +15628,7 @@ fn regen_string_goldens() {
         (g.setup)(&mut mem);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         string_seed(&mut fused);
         (g.regs)(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
@@ -15778,7 +15778,7 @@ fn port_io_split_matches_golden_across_ops() {
         let mut mem = vec![0u8; 0x100];
         mem[..g.code.len()].copy_from_slice(g.code);
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         seam_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -15809,7 +15809,7 @@ fn regen_port_io_goldens() {
         let mut mem = vec![0u8; 0x100];
         mem[..g.code.len()].copy_from_slice(g.code);
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         seam_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -15858,7 +15858,7 @@ struct BitManipGolden {
 /// (so the BTR/BTC register cases find bit 3 already set), and a known pattern at the scratch
 /// region for the memory BT-walk cases. The instruction is placed at offset 0; the scratch
 /// region starts at 0x40.
-fn bitmanip_seed(cpu: &mut Cpu386) {
+fn bitmanip_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -16110,7 +16110,7 @@ fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
 /// operand the default seed doesn't cover (the BT-memory walk needs DX=16; the BSF zero-source
 /// case needs CX=0). Applied identically on both the split and the fused (regen) path so the
 /// goldens stay a faithful differential. Returns None when the default seed suffices.
-fn bitmanip_case_override(name: &str, cpu: &mut Cpu386) {
+fn bitmanip_case_override(name: &str, cpu: &mut CpuGsw) {
     match name {
         "bts [0x40],dx walk-to-next-word (0f ab 16 40 00)" => {
             // DX=16 so the bit index walks one 16-bit element past 0x40, into the word at 0x42.
@@ -16141,7 +16141,7 @@ fn bitmanip_split_matches_golden_across_ops() {
         bitmanip_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         bitmanip_seed(&mut split);
         bitmanip_case_override(g.name, &mut split);
         let mut sbus = TestBus::with_memory(mem);
@@ -16182,7 +16182,7 @@ fn regen_bitmanip_goldens() {
         bitmanip_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         bitmanip_seed(&mut fused);
         bitmanip_case_override(g.name, &mut fused);
         let mut fbus = TestBus::with_memory(mem);
@@ -16236,7 +16236,7 @@ struct CondMoveGolden {
 /// Seed for the condmove golden battery. Real-mode, DS=0, 16-bit addressing. AX=5, BX=3,
 /// CX=0x0100, DX=0x4000; eflags has ZF=0 (only the reserved bit-1). Scratch memory at
 /// 0x40 holds the word 0x0003 (CMOVcc memory source); byte at 0x50 is zero (SETcc mem dest).
-fn condmove_seed(cpu: &mut Cpu386) {
+fn condmove_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -16385,7 +16385,7 @@ fn condmove_split_matches_golden_across_ops() {
         condmove_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         condmove_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         let _ = split.cycle(&mut sbus);
@@ -16425,7 +16425,7 @@ fn regen_condmove_goldens() {
         condmove_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         condmove_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -16496,7 +16496,7 @@ struct SystemSegGolden {
 /// known values so the load ops (LGDT/LIDT/LLDT/LTR) and the store ops (SGDT/SIDT/SLDT/STR/SMSW)
 /// both have an observable before/after. Registers: CX=0x0008 (a selector operand for LAR/LSL/
 /// LLDT/LTR/VERR/VERW), the rest a fixed pattern.
-fn system_seg_seed(cpu: &mut Cpu386, protected: bool) {
+fn system_seg_seed(cpu: &mut CpuGsw, protected: bool) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Es, 0);
@@ -16944,7 +16944,7 @@ fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
 /// Per-case register overrides applied AFTER `system_seg_seed`. LLDT needs CX pointing at the
 /// LDT system descriptor (selector 0x18); BOUND and LES/LDS need their default seed. Applied
 /// identically on the split and the regen (fused) path so the goldens stay a faithful diff.
-fn system_seg_case_override(name: &str, cpu: &mut Cpu386) {
+fn system_seg_case_override(name: &str, cpu: &mut CpuGsw) {
     if name == "lldt cx=0x18 (0f 00 d1)" {
         cpu.write_reg16(Reg16::Cx, 0x18);
     }
@@ -16953,7 +16953,7 @@ fn system_seg_case_override(name: &str, cpu: &mut Cpu386) {
     }
 }
 
-fn assert_system_seg_state(cpu: &Cpu386, g: &SystemSegGolden) {
+fn assert_system_seg_state(cpu: &CpuGsw, g: &SystemSegGolden) {
     assert_eq!(cpu.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
     assert_eq!(cpu.eflags(), g.eflags, "eflags mismatch for {}", g.name);
     assert_eq!(cpu.registers.eip, g.eip, "eip mismatch for {}", g.name);
@@ -17019,7 +17019,7 @@ fn system_seg_split_matches_golden_across_ops() {
         system_seg_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         system_seg_seed(&mut split, g.protected);
         system_seg_case_override(g.name, &mut split);
         let mut sbus = TestBus::with_memory(mem);
@@ -17058,7 +17058,7 @@ fn regen_system_seg_goldens() {
         system_seg_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         system_seg_seed(&mut fused, g.protected);
         system_seg_case_override(g.name, &mut fused);
         let mut fbus = TestBus::with_memory(mem);
@@ -17124,7 +17124,7 @@ struct FpuGolden {
 /// non-default control word (0x027f, the FINIT default) and a status condition are left as the
 /// push set them. GPRs are a fixed pattern (AX..DI) so the FNSTSW-AX / integer-flag forms have an
 /// observable before/after.
-fn fpu_seed(cpu: &mut Cpu386) {
+fn fpu_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -17156,7 +17156,7 @@ fn fpu_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[0x120..0x122].copy_from_slice(&0x037fu16.to_le_bytes());
 }
 
-fn assert_fpu_state(cpu: &Cpu386, g: &FpuGolden) {
+fn assert_fpu_state(cpu: &CpuGsw, g: &FpuGolden) {
     assert_eq!(cpu.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
     assert_eq!(cpu.eflags(), g.eflags, "eflags mismatch for {}", g.name);
     assert_eq!(cpu.registers.eip, g.eip, "eip mismatch for {}", g.name);
@@ -17511,7 +17511,7 @@ fn fpu_split_matches_golden_across_ops() {
         fpu_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         fpu_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         exec_one_split(&mut split, &mut sbus).unwrap();
@@ -17551,7 +17551,7 @@ fn fist_honors_rounding_control() {
     for &(rc, input, expected) in cases {
         let mut mem = vec![0u8; 0x200];
         mem[..4].copy_from_slice(&[0xdb, 0x1e, 0x30, 0x01]);
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         fpu_seed(&mut cpu);
         cpu.fpu.control = 0x037f | (rc << 10);
         cpu.fpu.push(input);
@@ -17584,7 +17584,7 @@ fn fist_overflow_stores_integer_indefinite_and_raises_ie() {
     for (code, input, expected) in cases {
         let mut mem = vec![0u8; 0x200];
         mem[..code.len()].copy_from_slice(code);
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         fpu_seed(&mut cpu);
         cpu.fpu.push(*input);
         let mut bus = TestBus::with_memory(mem);
@@ -17598,7 +17598,7 @@ fn fist_overflow_stores_integer_indefinite_and_raises_ie() {
 #[test]
 fn frndint_honors_rounding_control() {
     for (rc, expected) in [(0u16, -2.0), (1, -2.0), (2, -1.0), (3, -1.0)] {
-        let mut cpu = Cpu386::default();
+        let mut cpu = CpuGsw::default();
         fpu_seed(&mut cpu);
         cpu.fpu.control = 0x037f | (rc << 10);
         cpu.fpu.push(-1.5);
@@ -17616,10 +17616,10 @@ fn frndint_honors_rounding_control() {
 /// element becomes ST(0)) and return the CPU for state assertions. The x87
 /// value-accuracy battery below uses manual-cited inputs per family; the
 /// differential goldens above pin encodings, these pin VALUES.
-fn fpu_exec(code: &[u8], stack: &[f64]) -> (Cpu386, TestBus) {
+fn fpu_exec(code: &[u8], stack: &[f64]) -> (CpuGsw, TestBus) {
     let mut mem = vec![0u8; 0x200];
     mem[..code.len()].copy_from_slice(code);
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -17635,7 +17635,7 @@ fn fpu_exec(code: &[u8], stack: &[f64]) -> (Cpu386, TestBus) {
 }
 
 /// Condition codes C3/C2/C1/C0 from the status word, as a tuple.
-fn cc(cpu: &Cpu386) -> (bool, bool, bool, bool) {
+fn cc(cpu: &CpuGsw) -> (bool, bool, bool, bool) {
     let s = cpu.fpu.status;
     (
         s & (1 << 14) != 0,
@@ -17653,7 +17653,7 @@ fn fld_fstp_m80_round_trips_exact_values() {
     mem[..4].copy_from_slice(&[0xdb, 0x2e, 0x00, 0x01]); // FLD tbyte [0x100]
     mem[0x100..0x108].copy_from_slice(&0xC000_0000_0000_0000u64.to_le_bytes());
     mem[0x108..0x10a].copy_from_slice(&0x3FFFu16.to_le_bytes());
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     fpu_seed(&mut cpu);
     let mut bus = TestBus::with_memory(mem);
     exec_one_split(&mut cpu, &mut bus).unwrap();
@@ -17680,7 +17680,7 @@ fn faulting_push_leaves_sp_unchanged() {
     // cleanly (386 PRM fault-restart semantics). CWSDPMI grows the DJGPP
     // stack by committing the page in its #PF handler and retrying; a
     // committed-then-faulted ESP double-decrements on the retry.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -17817,7 +17817,7 @@ fn fbld_fbstp_round_trip_packed_bcd() {
     mem[0x101] = 0x45;
     mem[0x102] = 0x23;
     mem[0x103] = 0x01;
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     fpu_seed(&mut cpu);
     let mut bus = TestBus::with_memory(mem);
     exec_one_split(&mut cpu, &mut bus).unwrap();
@@ -17838,7 +17838,7 @@ fn faulting_push_leaves_esp_unchanged_on_a_32bit_stack() {
     // The SS.B=1 arm - the one a DPMI flat 32-bit stack (CWSDPMI/DJGPP)
     // actually exercises: the full ESP must stay at its pre-instruction
     // value when the push's write faults.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.set_segment(
         SegmentIndex::Ss,
@@ -17868,7 +17868,7 @@ fn faulting_pusha_restores_sp_past_committed_pushes() {
     // PUSHA: the first two pushes land, the third faults; (E)SP must come
     // back to the pre-instruction value (386 PRM: PUSHA restores ESP so
     // the whole instruction restarts).
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
     cpu.registers.eip = 0;
@@ -17899,7 +17899,7 @@ fn regen_fpu_goldens() {
         fpu_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         fpu_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -17962,7 +17962,7 @@ struct MiscGolden {
 /// inputs. AL=0x29, AH=0x05 (so DAA/AAA/AAM/AAD/TEST exercise the adjust/flag paths); CF/AF preset
 /// so DAA/DAS see an incoming carry; BX=0x10 (XLAT base); CX/DX/SI/DI/BP fixed. EDX:EAX and ECX:EBX
 /// are also given known 32-bit halves for CMPXCHG8B (set after this via the high words below).
-fn misc_seed(cpu: &mut Cpu386) {
+fn misc_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -18381,7 +18381,7 @@ fn misc_split_matches_golden_across_ops() {
         misc_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut split = Cpu386::default();
+        let mut split = CpuGsw::default();
         misc_seed(&mut split);
         let mut sbus = TestBus::with_memory(mem);
         exec_one_split(&mut split, &mut sbus).unwrap();
@@ -18444,7 +18444,7 @@ fn regen_misc_goldens() {
         misc_seed_mem(&mut mem, g.code);
         let initial = mem.clone();
 
-        let mut fused = Cpu386::default();
+        let mut fused = CpuGsw::default();
         misc_seed(&mut fused);
         let mut fbus = TestBus::with_memory(mem);
         fused.begin_instruction();
@@ -18485,7 +18485,7 @@ fn regen_misc_goldens() {
 fn eager_flag_write_after_pending_is_correct() {
     // A pending ADD sets CF; a later CLC-like set_flag must clear CF while leaving the
     // pending-derived ZF intact, without forcing the rest of the lazy flags live.
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let r = cpu.alu_add_eager(0xff, 0x01, 0, BusWidth::Byte); // CF=1, ZF=1 (result 0x00)
     let lf = LazyFlags {
         a: 0xff,
@@ -18495,7 +18495,7 @@ fn eager_flag_write_after_pending_is_correct() {
         op: LazyFlagOp::Add,
         cf_override: None,
     };
-    let mut lazy = Cpu386 {
+    let mut lazy = CpuGsw {
         pending_flags: PendingFlags::from_legacy(&lf),
         ..Default::default()
     };
@@ -18518,7 +18518,7 @@ fn eager_flag_write_after_pending_is_correct() {
 
 #[test]
 fn non_arithmetic_flag_write_after_pending_stays_lazy() {
-    let mut lazy = Cpu386::default();
+    let mut lazy = CpuGsw::default();
     lazy.alu_sub(1, 1, 0, BusWidth::Byte); // pending ZF=1
     lazy.reset_perf_counters();
 
@@ -18553,7 +18553,7 @@ fn lazy_flag_read_matches_eager_for_add_and_sub() {
     ];
     for &(a, b, w) in cases {
         for is_sub in [false, true] {
-            let mut eager = Cpu386::default();
+            let mut eager = CpuGsw::default();
             let r = if is_sub {
                 eager.alu_sub_eager(a, b, 0, w)
             } else {
@@ -18571,7 +18571,7 @@ fn lazy_flag_read_matches_eager_for_add_and_sub() {
                 },
                 cf_override: None,
             };
-            let lazy = Cpu386 {
+            let lazy = CpuGsw {
                 pending_flags: PendingFlags::from_legacy(&lf),
                 ..Default::default()
             };
@@ -18593,9 +18593,9 @@ fn alu_add_defers_and_reads_back_identically() {
         (0xff_u32, 0x01_u32, BusWidth::Byte),
         (0x1234_5678_u32, 0x8765_4321_u32, BusWidth::Dword),
     ] {
-        let mut eager = Cpu386::default();
+        let mut eager = CpuGsw::default();
         let er = eager.alu_add_eager(a, b, 0, w);
-        let mut lazy = Cpu386::default();
+        let mut lazy = CpuGsw::default();
         let lr = lazy.alu_add(a, b, 0, w);
         assert_eq!(lr, er, "result");
         assert!(
@@ -18615,9 +18615,9 @@ fn alu_sub_defers_and_reads_back_identically() {
         (0x01_u32, 0xff_u32, BusWidth::Byte),
         (0x1234_5678_u32, 0x8765_4321_u32, BusWidth::Dword),
     ] {
-        let mut eager = Cpu386::default();
+        let mut eager = CpuGsw::default();
         let er = eager.alu_sub_eager(a, b, 0, w);
-        let mut lazy = Cpu386::default();
+        let mut lazy = CpuGsw::default();
         let lr = lazy.alu_sub(a, b, 0, w);
         assert_eq!(lr, er, "result");
         assert!(
@@ -18633,7 +18633,7 @@ fn alu_sub_defers_and_reads_back_identically() {
 #[test]
 fn whole_eflags_read_materializes_pending() {
     // Reading the whole eflags word (e.g. via eflags()) after a pending op must equal the eager result.
-    let mut eager = Cpu386::default();
+    let mut eager = CpuGsw::default();
     let r = eager.alu_add_eager(0x80, 0x80, 0, BusWidth::Byte); // CF=1, OF=1, ZF=1
     let lf = LazyFlags {
         a: 0x80,
@@ -18643,7 +18643,7 @@ fn whole_eflags_read_materializes_pending() {
         op: LazyFlagOp::Add,
         cf_override: None,
     };
-    let mut lazy = Cpu386 {
+    let mut lazy = CpuGsw {
         pending_flags: PendingFlags::from_legacy(&lf),
         ..Default::default()
     };
@@ -18659,7 +18659,7 @@ fn whole_eflags_read_materializes_pending() {
 
 #[test]
 fn alu_logic_defers_flags_and_preserves_aux() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_flag(FLAG_AF | FLAG_CF | FLAG_OF, true);
     let result = cpu.alu(4, 0xf0, 0x0f, BusWidth::Byte);
     assert_eq!(result, 0);
@@ -18678,7 +18678,7 @@ fn alu_logic_defers_flags_and_preserves_aux() {
 
 #[test]
 fn inc_dec_defers_flags_while_preserving_carry() {
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.set_flag(FLAG_CF, true);
     let result = cpu.inc_dec(0xffff, false, BusWidth::Word);
     assert_eq!(result, 0);
@@ -18708,13 +18708,13 @@ fn shift_after_pending_flags_matches_materialized_without_materializing() {
         (5, 0x8001, 2), // SHR
         (7, 0x8001, 2), // SAR
     ] {
-        let mut expected = Cpu386::default();
+        let mut expected = CpuGsw::default();
         expected.alu_add(0x7f, 0x01, 0, BusWidth::Byte); // pending OF+AF
         expected.materialize_flags();
         let expected_result = expected.shift_rotate(op, value, count, BusWidth::Word);
         let expected_flags = expected.eflags();
 
-        let mut lazy = Cpu386::default();
+        let mut lazy = CpuGsw::default();
         lazy.alu_add(0x7f, 0x01, 0, BusWidth::Byte);
         lazy.reset_perf_counters();
         let lazy_result = lazy.shift_rotate(op, value, count, BusWidth::Word);
@@ -18725,13 +18725,13 @@ fn shift_after_pending_flags_matches_materialized_without_materializing() {
         assert!(lazy.pending_flags.is_none(), "op={op} count={count}");
     }
 
-    let mut expected = Cpu386::default();
+    let mut expected = CpuGsw::default();
     expected.alu_add(0x7f, 0x01, 0, BusWidth::Byte);
     expected.materialize_flags();
     let expected_result = expected.double_shift(true, 0x0001, 0, 2, OperandSize::Word);
     let expected_flags = expected.eflags();
 
-    let mut lazy = Cpu386::default();
+    let mut lazy = CpuGsw::default();
     lazy.alu_add(0x7f, 0x01, 0, BusWidth::Byte);
     lazy.reset_perf_counters();
     let lazy_result = lazy.double_shift(true, 0x0001, 0, 2, OperandSize::Word);
@@ -18843,7 +18843,7 @@ fn cpu_mem(bus: &TestBus, addr: u32) -> [u8; 4] {
 }
 
 /// Build the world; CPU sits in protected mode + paging with TR/GDTR/IDTR loaded.
-fn v86_world(monitor: &[u8], guest: &[u8], io_bitmap: &[u8]) -> (Cpu386, TestBus) {
+fn v86_world(monitor: &[u8], guest: &[u8], io_bitmap: &[u8]) -> (CpuGsw, TestBus) {
     let mut m = vec![0u8; 0x20000];
     // Identity paging: PDE[0] -> PT at 0x2000; first 0x20 pages identity present+rw+user.
     put32(&mut m, 0x1000, 0x2000 | 0x7);
@@ -18870,7 +18870,7 @@ fn v86_world(monitor: &[u8], guest: &[u8], io_bitmap: &[u8]) -> (Cpu386, TestBus
     m[MON_CODE as usize..MON_CODE as usize + monitor.len()].copy_from_slice(monitor);
     m[0xA000..0xA000 + guest.len()].copy_from_slice(guest);
 
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE | CR0_PG;
     cpu.control.cr3 = 0x1000;
     cpu.gdtr.base = GDT;
@@ -18891,7 +18891,7 @@ fn v86_world(monitor: &[u8], guest: &[u8], io_bitmap: &[u8]) -> (Cpu386, TestBus
 /// Put `cpu` into a V86 task at CS:IP=0x0A00:ip, SS:SP=0x0900:sp, IOPL 0.
 /// DS/ES/FS/GS are seeded with sensible defaults; a caller may overwrite them
 /// afterward to probe the V86 segment frame (none of them are load-bearing here).
-fn enter_v86_direct(cpu: &mut Cpu386, ip: u32, sp: u32) {
+fn enter_v86_direct(cpu: &mut CpuGsw, ip: u32, sp: u32) {
     cpu.registers.eflags = (cpu.registers.eflags & !0x3000) | FLAG_VM | 0x2;
     cpu.registers.eip = ip;
     cpu.registers.set_esp(sp);
@@ -19176,7 +19176,7 @@ fn iret_to_outer_ring_nulls_data_segments_inaccessible_at_the_new_cpl() {
     }
     cpu.iret(&mut bus, OperandSize::Dword).unwrap();
     assert_eq!(cpu.current_privilege_level(), 3);
-    let sel = |cpu: &Cpu386, s| cpu.registers.segment(s).selector;
+    let sel = |cpu: &CpuGsw, s| cpu.registers.segment(s).selector;
     assert_eq!(sel(&cpu, SegmentIndex::Ds), 0, "ring-0 DS nulled");
     assert_eq!(sel(&cpu, SegmentIndex::Fs), 0, "ring-0 FS nulled");
     assert_eq!(sel(&cpu, SegmentIndex::Es), 0x2B, "ring-3 ES survives");
@@ -19380,7 +19380,7 @@ const ALIAS_BASE: u32 = 0x0040_0000;
 /// reads/writes the TSS via a raw, unpaged `bus.read_memory(self.tr.base + ..)`
 /// would touch physical `ALIAS_BASE + TSS` (zeroed, wrong data) instead of the
 /// real TSS at physical `TSS`.
-fn alias_tss_through_second_pde(bus: &mut TestBus, cpu: &mut Cpu386) {
+fn alias_tss_through_second_pde(bus: &mut TestBus, cpu: &mut CpuGsw) {
     // PDE[1] (linear 0x0040_0000..0x0080_0000) -> the same PT as PDE[0].
     put32(&mut bus.memory, 0x1000 + 4, 0x2000 | 0x7);
     let tss_limit = cpu.tr.limit;
@@ -19635,8 +19635,8 @@ mod jit_region {
         m
     }
 
-    fn fresh_cpu(ds_limit: u32) -> Cpu386 {
-        let mut cpu = Cpu386::default();
+    fn fresh_cpu(ds_limit: u32) -> CpuGsw {
+        let mut cpu = CpuGsw::default();
         cpu.set_level(CpuLevel::I586);
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -19651,7 +19651,7 @@ mod jit_region {
     }
 
     /// Reset the guest to the canonical loop entry state with `count` iterations to run.
-    fn arm_loop(cpu: &mut Cpu386, bus: &mut TestBus, count: u32) {
+    fn arm_loop(cpu: &mut CpuGsw, bus: &mut TestBus, count: u32) {
         cpu.registers.eip = NOP_STARTER;
         cpu.registers.set_esp(0x0700);
         cpu.write_gpr32(0, 0x200); // eax
@@ -19666,7 +19666,7 @@ mod jit_region {
 
     /// Drive `run_straight_line` (the machine batch seam) until a run halts. Returns the
     /// per-call scaled clock totals so cap-boundary shapes can be compared A/B too.
-    fn drive_to_halt(cpu: &mut Cpu386, bus: &mut TestBus, cap: u64) -> Vec<(u32, u32)> {
+    fn drive_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus, cap: u64) -> Vec<(u32, u32)> {
         let mut calls = Vec::new();
         for _ in 0..10_000 {
             let outcome = cpu.run_straight_line(bus, cap).expect("no hard bus error");
@@ -19681,9 +19681,9 @@ mod jit_region {
     /// Warm both CPUs identically (fills the decode cache), admit + stamp the region on
     /// `jit` only, and assert the warm phases were identical.
     fn warm_and_admit(
-        interp: &mut Cpu386,
+        interp: &mut CpuGsw,
         bus_i: &mut TestBus,
-        jit: &mut Cpu386,
+        jit: &mut CpuGsw,
         bus_j: &mut TestBus,
     ) -> std::num::NonZeroU32 {
         arm_loop(interp, bus_i, 2);
@@ -19700,7 +19700,7 @@ mod jit_region {
         idx
     }
 
-    fn assert_identical(interp: &Cpu386, bus_i: &TestBus, jit_cpu: &Cpu386, bus_j: &TestBus) {
+    fn assert_identical(interp: &CpuGsw, bus_i: &TestBus, jit_cpu: &CpuGsw, bus_j: &TestBus) {
         assert_eq!(interp, jit_cpu, "architectural + clock state diverged");
         assert_eq!(
             interp.elapsed_clocks, jit_cpu.elapsed_clocks,
@@ -19778,7 +19778,7 @@ mod jit_region {
     /// v2's inline slots (mov/add/shr) set gpr and flags natively; the brief flags
     /// flag-state equality after EVERY exit (incl. mid-iteration) as the hard correctness property.
     /// This test forces a cap-boundary exit at several points across the loop and compares the
-    /// MATERIALIZED eflags (not just Cpu386 equality, but the actual `eflags()` value that
+    /// MATERIALIZED eflags (not just CpuGsw equality, but the actual `eflags()` value that
     /// resolves any pending descriptor the inline ADD left behind) between interpreter and JIT.
     /// A divergence here would mean the inline ADD's lazy descriptor or the inline SHR's eager
     /// materialization differs from the interpreter at the exit eip.
@@ -20499,8 +20499,8 @@ mod jit_general {
 
     /// Real mode with a 32-bit code segment (flat, 64 KB limit), at the 586 level so the FP
     /// timing classes are non-identity and `fp_rem` actually carries.
-    fn fresh() -> Cpu386 {
-        let mut cpu = Cpu386::default();
+    fn fresh() -> CpuGsw {
+        let mut cpu = CpuGsw::default();
         cpu.set_level(CpuLevel::I586);
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -20512,7 +20512,7 @@ mod jit_general {
         cpu
     }
 
-    fn drive_to_halt(cpu: &mut Cpu386, bus: &mut TestBus) {
+    fn drive_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) {
         for _ in 0..10_000 {
             if cpu.run_straight_line(bus, u64::MAX).unwrap().halted {
                 return;
@@ -20552,7 +20552,7 @@ mod jit_general {
         m
     }
 
-    fn x87_arm(cpu: &mut Cpu386, bus: &mut TestBus, count: u32) {
+    fn x87_arm(cpu: &mut CpuGsw, bus: &mut TestBus, count: u32) {
         cpu.registers.eip = X87_START;
         cpu.registers.set_esp(0x0700);
         cpu.registers.set_eax(0);
@@ -20570,7 +20570,7 @@ mod jit_general {
     /// trailing HLT is executed as a fresh run's first instruction (that would reset
     /// `core_clocks_so_far`). This is the point at which the four accumulators are meaningfully
     /// compared.
-    fn drive_until_count_zero(cpu: &mut Cpu386, bus: &mut TestBus) {
+    fn drive_until_count_zero(cpu: &mut CpuGsw, bus: &mut TestBus) {
         for _ in 0..10_000 {
             let out = cpu.run_straight_line(bus, u64::MAX).unwrap();
             if count_of(bus) == 0 || out.halted {
@@ -20707,7 +20707,7 @@ mod jit_general {
         m
     }
 
-    fn lin_arm(cpu: &mut Cpu386) {
+    fn lin_arm(cpu: &mut CpuGsw) {
         cpu.registers.eip = LIN_START;
         cpu.registers.set_esp(0x0700);
         cpu.registers.set_eax(0x1111);
@@ -20864,8 +20864,8 @@ mod jit_general {
 
     /// Real mode with a 16-bit code segment (the default DOS-game target): CS.D is clear, so
     /// the unprefixed mov/add/shr register forms are 16-bit ops.
-    fn fresh16() -> Cpu386 {
-        let mut cpu = Cpu386::default();
+    fn fresh16() -> CpuGsw {
+        let mut cpu = CpuGsw::default();
         cpu.set_level(CpuLevel::I586);
         cpu.load_segment_real(SegmentIndex::Cs, 0); // default_size_32 = false
         cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -20895,7 +20895,7 @@ mod jit_general {
             m[0x110] = 0xf4; // hlt
             m
         };
-        let arm = |cpu: &mut Cpu386, bus: &mut TestBus, count: u16| {
+        let arm = |cpu: &mut CpuGsw, bus: &mut TestBus, count: u16| {
             cpu.registers.eip = 0x100;
             cpu.registers.set_esp(0x0700);
             cpu.registers.set_eax(0xAAAA_0000); // distinct upper half
@@ -20983,7 +20983,7 @@ mod jit_general {
 
     /// Drive to the loop fall-through (ECX == 0), i.e. BEFORE the trailing HLT is executed as a
     /// fresh run's first instruction (which would reset core_clocks_so_far).
-    fn drive_until_ecx_zero(cpu: &mut Cpu386, bus: &mut TestBus) {
+    fn drive_until_ecx_zero(cpu: &mut CpuGsw, bus: &mut TestBus) {
         for _ in 0..10_000 {
             let out = cpu.run_straight_line(bus, u64::MAX).unwrap();
             if cpu.read_gpr32(1) == 0 || out.halted {
@@ -20999,7 +20999,7 @@ mod jit_general {
     fn assert_template_identity(
         op: &[u8],
         expect_kind: jit::step::SlotKind,
-        arm: &dyn Fn(&mut Cpu386),
+        arm: &dyn Fn(&mut CpuGsw),
     ) {
         let entry = 0x101u32;
         let mut interp = fresh();
@@ -21007,7 +21007,7 @@ mod jit_general {
         let mut bus_i = TestBus::with_memory(template_diff_program(op));
         let mut bus_j = TestBus::with_memory(template_diff_program(op));
 
-        let prep = |cpu: &mut Cpu386, ecx: u32| {
+        let prep = |cpu: &mut CpuGsw, ecx: u32| {
             cpu.registers.eip = 0x100;
             cpu.registers.set_esp(0x0700);
             cpu.registers.set_ecx(ecx); // LOOP counter (address-size 32 -> ECX)
@@ -21088,7 +21088,7 @@ mod jit_general {
                 assert_template_identity(
                     &op,
                     jit::step::SlotKind::RegAddImm { dst: 0, imm },
-                    &|cpu: &mut Cpu386| cpu.registers.set_eax(eax),
+                    &|cpu: &mut CpuGsw| cpu.registers.set_eax(eax),
                 );
             }
         }
@@ -21103,7 +21103,7 @@ mod jit_general {
             assert_template_identity(
                 &op,
                 jit::step::SlotKind::RegAddImm { dst, imm },
-                &|cpu: &mut Cpu386| cpu.write_gpr32(dst, 0x8000_0001),
+                &|cpu: &mut CpuGsw| cpu.write_gpr32(dst, 0x8000_0001),
             );
         }
     }
@@ -21120,7 +21120,7 @@ mod jit_general {
                 assert_template_identity(
                     &op,
                     jit::step::SlotKind::RegShrImm { dst: 0, count },
-                    &|cpu: &mut Cpu386| cpu.registers.set_eax(eax),
+                    &|cpu: &mut CpuGsw| cpu.registers.set_eax(eax),
                 );
             }
         }
@@ -21132,7 +21132,7 @@ mod jit_general {
             assert_template_identity(
                 &op,
                 jit::step::SlotKind::RegShrImm { dst, count },
-                &|cpu: &mut Cpu386| cpu.write_gpr32(dst, 0x8000_0001),
+                &|cpu: &mut CpuGsw| cpu.write_gpr32(dst, 0x8000_0001),
             );
         }
     }
@@ -21147,7 +21147,7 @@ mod jit_general {
             assert_template_identity(
                 &op,
                 jit::step::SlotKind::RegMov { dst: 0, src: 3 },
-                &|cpu: &mut Cpu386| {
+                &|cpu: &mut CpuGsw| {
                     cpu.registers.set_eax(0xaaaa_5555);
                     cpu.registers.set_ebx(ebx);
                 },
@@ -21162,7 +21162,7 @@ mod jit_general {
             assert_template_identity(
                 &op,
                 jit::step::SlotKind::RegMov { dst, src },
-                &|cpu: &mut Cpu386| {
+                &|cpu: &mut CpuGsw| {
                     cpu.write_gpr32(dst, 0xaaaa_5555);
                     cpu.write_gpr32(src, 0x1234_5678);
                 },
@@ -21218,9 +21218,9 @@ mod jit_general {
     /// actually exercised its scenario (the fault fired, SMC churned). Panics on any divergence.
     fn assert_shape_identical(
         prog: Vec<u8>,
-        arm: &dyn Fn(&mut Cpu386),
+        arm: &dyn Fn(&mut CpuGsw),
         expect_region: bool,
-    ) -> Cpu386 {
+    ) -> CpuGsw {
         let mut interp = fresh();
         let mut jit_cpu = fresh();
         jit_cpu.set_jit_auto_admit(true);
@@ -21276,7 +21276,7 @@ mod jit_general {
     /// fields on throwaway clones, so it covers every present and future state field
     /// automatically without a hand-maintained list. Timing is asserted separately
     /// by the caller (bit-exact today; drift-tolerant once the cost-fold lands).
-    fn assert_state_identical(interp: &Cpu386, jit: &Cpu386) {
+    fn assert_state_identical(interp: &CpuGsw, jit: &CpuGsw) {
         assert!(
             state_eq(interp, jit),
             "architectural state diverged (timing fields ignored)"
@@ -21285,7 +21285,7 @@ mod jit_general {
 
     /// Bool core of [`assert_state_identical`], for tests that want to check both
     /// directions without catching a panic.
-    fn state_eq(interp: &Cpu386, jit: &Cpu386) -> bool {
+    fn state_eq(interp: &CpuGsw, jit: &CpuGsw) -> bool {
         let mut a = interp.clone();
         let mut b = jit.clone();
         for c in [&mut a, &mut b] {
@@ -21322,8 +21322,8 @@ mod jit_general {
 
     /// Sets eip/esp/esi/edi and a non-trivial incoming flag pattern. The loop count lives in the
     /// program image (at `H_COUNT`), not here.
-    fn h_arm(esi: u32, edi: u32) -> impl Fn(&mut Cpu386) {
-        move |cpu: &mut Cpu386| {
+    fn h_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {
+        move |cpu: &mut CpuGsw| {
             cpu.registers.eip = 0x100;
             cpu.registers.set_esp(0x0700);
             cpu.write_gpr32(6, esi); // esi
@@ -21368,7 +21368,7 @@ mod jit_general {
             m[H_COUNT..H_COUNT + 4].copy_from_slice(&100u32.to_le_bytes());
             m
         };
-        let arm = move |cpu: &mut Cpu386| {
+        let arm = move |cpu: &mut CpuGsw| {
             h_arm(0x1000, 0x1fc0)(cpu);
             let mut ds = cpu.registers.segment(SegmentIndex::Ds);
             ds.limit = 0x2000;
@@ -21476,8 +21476,8 @@ mod jit_general {
 
     /// Arm a CPU for `paged_copy_program`: flat 32-bit protected mode, paging on, CPL 0, esi/edi
     /// at the given linear addresses, and the same non-trivial incoming flags as `h_arm`.
-    fn pg_arm(esi: u32, edi: u32) -> impl Fn(&mut Cpu386) {
-        move |cpu: &mut Cpu386| {
+    fn pg_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {
+        move |cpu: &mut CpuGsw| {
             let flat = |access: u8| SegmentRegister {
                 selector: 0x08,
                 base: 0,
@@ -21547,9 +21547,9 @@ mod jit_general {
     /// Emit `emit_load_u8_probe` wrapped in a callable prologue/epilogue (pin cpu in R12, regs base
     /// in RBP per current emit_region v3 ABI), run it against the live CPU, and return whether it hit.
     /// On a hit the emitted code has written the loaded byte into `gpr[dst]`'s byte lane.
-    fn run_load_probe(cpu: &mut Cpu386, base: u8, index: Option<u8>, disp: i32, dst: u8) -> bool {
+    fn run_load_probe(cpu: &mut CpuGsw, base: u8, index: Option<u8>, disp: i32, dst: u8) -> bool {
         use jit::encoder::{Encoder, Reg};
-        let regs_off = std::mem::offset_of!(Cpu386, registers) as u32;
+        let regs_off = std::mem::offset_of!(CpuGsw, registers) as u32;
         let mut e = Encoder::new();
         e.push(Reg::RBX);
         e.push(Reg::RBP);
@@ -21582,8 +21582,8 @@ mod jit_general {
         e.ret();
         let bytes = e.finish();
         let buf = jit::exec_mem::ExecutableBuffer::new(&bytes).expect("W^X alloc must succeed");
-        let f: extern "C" fn(*mut Cpu386) -> i64 = unsafe { std::mem::transmute(buf.entry_ptr()) };
-        f(cpu as *mut Cpu386) != 0
+        let f: extern "C" fn(*mut CpuGsw) -> i64 = unsafe { std::mem::transmute(buf.entry_ptr()) };
+        f(cpu as *mut CpuGsw) != 0
     }
 
     /// The probe assembly, run in isolation against a real `data_read_pages` entry: it must compute
@@ -21724,7 +21724,7 @@ mod jit_general {
         // esi=0x1FC0 advances 1/iteration, so the LOAD `mov al,[esi]` #GPs when esi first exceeds
         // 0x2000 (iteration ~65, past the 32 admission threshold). edi=0x1000 keeps the store in
         // limit, so the load is the faulting access. count=100 so the loop cannot finish first.
-        let arm = move |cpu: &mut Cpu386| {
+        let arm = move |cpu: &mut CpuGsw| {
             h_arm(0x1fc0, 0x1000)(cpu);
             let mut ds = cpu.registers.segment(SegmentIndex::Ds);
             ds.limit = 0x2000;
@@ -21797,7 +21797,7 @@ mod jit_general {
         m
     }
 
-    fn sized_copy_arm(cpu: &mut Cpu386) {
+    fn sized_copy_arm(cpu: &mut CpuGsw) {
         cpu.registers.eip = 0x100;
         cpu.registers.set_esp(0x0700);
         cpu.write_gpr32(6, 0x2000); // esi
@@ -21917,8 +21917,8 @@ mod jit_general {
     /// `h_arm` plus a FLAT DS (base already 0 in real mode; force limit to max) so the byte-load is
     /// fold-eligible. This is the "flat real / unreal mode" a DOS extender sets up; without it a
     /// real-mode DS (limit 0xffff) is not flat and the probe is correctly gated off.
-    fn flat_ds_arm(esi: u32, edi: u32) -> impl Fn(&mut Cpu386) {
-        move |cpu: &mut Cpu386| {
+    fn flat_ds_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {
+        move |cpu: &mut CpuGsw| {
             h_arm(esi, edi)(cpu);
             let mut ds = cpu.registers.segment(SegmentIndex::Ds);
             ds.limit = u32::MAX;
@@ -21935,11 +21935,11 @@ mod jit_general {
     /// Returns the interpreter CPU. Panics on any divergence.
     fn assert_fold_state_identical(
         prog: Vec<u8>,
-        arm: &dyn Fn(&mut Cpu386),
+        arm: &dyn Fn(&mut CpuGsw),
         expect_native_hits: Option<bool>,
         expect_store_hits: Option<bool>,
         expect_region: bool,
-    ) -> Cpu386 {
+    ) -> CpuGsw {
         let _fold = FoldOn::new();
         let mut interp = fresh();
         let mut jit_cpu = fresh();
@@ -22052,7 +22052,7 @@ mod jit_general {
             m[H_COUNT..H_COUNT + 4].copy_from_slice(&200u32.to_le_bytes());
             m
         };
-        let arm = move |cpu: &mut Cpu386| {
+        let arm = move |cpu: &mut CpuGsw| {
             flat_ds_arm(0x2000, 0x3000)(cpu);
             cpu.write_gpr32(1, 0x40); // ecx = a fixed in-page index offset; load reads [esi+0x40]
         };
@@ -22087,7 +22087,7 @@ mod jit_general {
             m[H_COUNT..H_COUNT + 4].copy_from_slice(&200u32.to_le_bytes());
             m
         };
-        let arm = move |cpu: &mut Cpu386| {
+        let arm = move |cpu: &mut CpuGsw| {
             flat_ds_arm(0x2000, 0x3000)(cpu);
             cpu.write_gpr32(0, 0x1357); // eax feeds the mov/add/shr chain
         };
@@ -22152,7 +22152,7 @@ mod jit_general {
             access,
             default_size_32: true,
         };
-        let setup = |cpu: &mut Cpu386, ds_access: u8| {
+        let setup = |cpu: &mut CpuGsw, ds_access: u8| {
             cpu.registers.set_segment(SegmentIndex::Cs, flat(0x9b)); // exec/read
             cpu.registers.set_segment(SegmentIndex::Ds, flat(ds_access));
             cpu.registers.set_segment(SegmentIndex::Ss, flat(0x93)); // r/w stack

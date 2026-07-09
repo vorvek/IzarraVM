@@ -13,7 +13,7 @@ use izarravm_core::{
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{
-    Cpu386, CpuError, CpuLevel, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing,
+    CpuError, CpuGsw, CpuLevel, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing,
 };
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
@@ -27,17 +27,16 @@ use thiserror::Error;
 mod ata;
 mod atapi;
 mod cdimage;
-mod video_params;
 mod dma;
+mod video_params;
 
 pub(crate) use video_params::{
     BDA_VIDEO_SAVE_POINTER, BIOS_FONT_8X8_HIGH_ROM_OFFSET, BIOS_FONT_8X8_ROM_OFFSET,
     BIOS_FONT_8X14_ROM_OFFSET, BIOS_FONT_8X16_ROM_OFFSET, INT10_STATE_BDA_LEN,
     INT10_STATE_CGA_LATCH_MARKER, INT10_STATE_CGA_LATCH_OFFSET, INT10_STATE_DAC_LEN,
     INT10_STATE_HARDWARE_LEN, INT10_STATIC_FUNCTIONALITY, INT10_VIDEO_PARAM_ENTRIES,
-    INT10_VIDEO_PARAM_ENTRY_LEN, INT10_VIDEO_PARAM_TABLE_ENTRIES,
-    INT10_VIDEO_PARAM_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
-    INT10_VIDEO_SAVE_POINTER_TABLE_PTRS,
+    INT10_VIDEO_PARAM_ENTRY_LEN, INT10_VIDEO_PARAM_TABLE_ENTRIES, INT10_VIDEO_PARAM_TABLE_OFFSET,
+    INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_PTRS,
 };
 mod fat32;
 mod fat32_volume;
@@ -115,7 +114,6 @@ const RAM_LOOKUP_PAGE_BITS: usize = 12;
 const RAM_LOOKUP_PAGE_SIZE: usize = 1 << RAM_LOOKUP_PAGE_BITS;
 const RAM_LOOKUP_PAGE_MASK: usize = RAM_LOOKUP_PAGE_SIZE - 1;
 const RAM_LOOKUP_SLOW: usize = usize::MAX;
-
 
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
 pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
@@ -1135,7 +1133,7 @@ pub struct Machine {
     active_mode: GswMode,
     pending_mode: Option<GswMode>,
     timing: TimingFactors,
-    cpu: Cpu386,
+    cpu: CpuGsw,
     // Per-mode cache model. A data access warms its tag state and the resolved tier
     // drives the charged wait-state (its per-mode tier costs are calibrated). Reset
     // on a mode switch (its contents are per-mode).
@@ -1459,7 +1457,7 @@ impl Machine {
     /// shares the rest (devices, audio chips, timing accumulators). The caller
     /// installs the BIOS stubs and any boot/program image afterwards, where the
     /// ordering relative to those memory writes matters.
-    fn base(profile: MachineProfile, cpu: Cpu386, mut rom: Vec<u8>) -> Result<Self, MachineError> {
+    fn base(profile: MachineProfile, cpu: CpuGsw, mut rom: Vec<u8>) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
         // Build the AD1848 codec from the WSS board config. The codec's IRQ/DMA
         // jumper readback comes from the same WssConfig the env/detection use, so
@@ -1618,7 +1616,7 @@ impl Machine {
         }
         let shadow = &rom[rom.len() - BIOS_ROM_SIZE..];
 
-        let mut machine = Self::base(profile, Cpu386::default(), shadow.to_vec())?;
+        let mut machine = Self::base(profile, CpuGsw::default(), shadow.to_vec())?;
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
     }
@@ -1984,7 +1982,7 @@ impl Machine {
         let mut rom = vec![0u8; BIOS_ROM_SIZE];
         let kb = izarravm_firmware::kbd_resident_bios();
         rom[..kb.len()].copy_from_slice(kb);
-        let mut machine = Self::base(profile, Cpu386::default(), rom)?;
+        let mut machine = Self::base(profile, CpuGsw::default(), rom)?;
         install_boot_bios_stubs(&mut machine.memory)?;
         machine.install_keyboard_bios()?;
         machine.program_runtime = true;
@@ -2103,7 +2101,7 @@ impl Machine {
         self.mixer.selected_irq()
     }
 
-    pub fn cpu(&self) -> &Cpu386 {
+    pub fn cpu(&self) -> &CpuGsw {
         &self.cpu
     }
 
@@ -10812,8 +10810,8 @@ fn days_since_1980(year: u16, month: u8, day: u8) -> u16 {
     days as u16
 }
 
-fn boot_sector_cpu() -> Cpu386 {
-    let mut cpu = Cpu386::default();
+fn boot_sector_cpu() -> CpuGsw {
+    let mut cpu = CpuGsw::default();
     for segment in [
         SegmentIndex::Cs,
         SegmentIndex::Ds,
@@ -27039,4 +27037,3 @@ mod tests {
         assert_eq!(boot_and_read_font_rows(0, 0xB5, 16), want437);
     }
 }
-

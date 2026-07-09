@@ -2,14 +2,14 @@
 //!
 //! This module holds the microarchitectural caches (TLB, DirectPageCache,
 //! CodePageCache, FetchPageCache, PrefetchWindow) and the page translation
-//! machinery. These are transparent to Cpu386 equality (always-equal impls)
+//! machinery. These are transparent to CpuGsw equality (always-equal impls)
 //! and are used by both the interpreter path and the JIT paged probes.
 
 use izarravm_bus::DirectPage;
 
 use crate::SegmentRegister;
 
-// The types below are pub(crate) so Cpu386 in lib.rs can name the fields.
+// The types below are pub(crate) so CpuGsw in lib.rs can name the fields.
 
 // --- Constants ---
 pub(crate) const TLB_ENTRIES: usize = 64;
@@ -49,7 +49,7 @@ impl TlbEntry {
 
 /// Direct-mapped linear->physical translation cache. `generation` bumps to flush
 /// in O(1); an entry is live only while its `generation` matches. Contents are
-/// microarchitectural, so the TLB is transparent to Cpu386 equality and prints
+/// microarchitectural, so the TLB is transparent to CpuGsw equality and prints
 /// terse. Non-snooping, which matches real x86: a guest must INVLPG or reload CR3
 /// after editing a page-table entry, and IzarraVM flushes on exactly those events.
 #[derive(Clone)]

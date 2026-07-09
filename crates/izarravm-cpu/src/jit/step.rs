@@ -6,7 +6,7 @@
 //! emitted native code contributes only the call sequencing and the loop back-edge; it never
 //! computes guest state itself.
 //!
-//! What the region defers to its exit (see `Cpu386::run_region`): `scale_clocks` (one batch call,
+//! What the region defers to its exit (see `CpuGsw::run_region`): `scale_clocks` (one batch call,
 //! sound by the remainder-carry identity the batch-identity test pins), `elapsed_clocks`,
 //! `perf.instructions`, and ring-0 residency. Nothing executed inside an admitted region reads
 //! any of those mid-run: the shape matcher admits no RDTSC/WRMSR (the `elapsed_clocks` readers)
@@ -19,7 +19,7 @@ use std::ffi::c_void;
 
 use izarravm_bus::CpuBus;
 
-use crate::{Cpu386, DecodedInsn, InternalFault};
+use crate::{CpuGsw, DecodedInsn, InternalFault};
 
 /// One guest instruction slot of a compiled region: the decoded instruction (refreshed wholesale
 /// on every re-stamp, which is how self-patched immediates stay current) and the linear address
@@ -87,23 +87,23 @@ pub(crate) enum RegionExitKind {
 /// wide with `None` as 0, so the emitted code's raw 8-byte load of `[ctx + 0]` reads the
 /// address directly.
 pub(crate) type RegionStepFn =
-    unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx, k: u32) -> u8;
+    unsafe extern "C" fn(cpu: *mut CpuGsw, bus: *mut c_void, ctx: *mut RegionCtx, k: u32) -> u8;
 
 /// Signature of the `jit_set_pending_add` flag helper, stored as a raw fn pointer the inline
 /// emitter loads and calls indirectly (the helper is a Rust method the emitter cannot address by
 /// offset). `Option` for the same null-pointer-optimization reason as `RegionStepFn`.
 #[cfg(feature = "jit")]
-pub(crate) type SetPendingAddFn = unsafe extern "C" fn(cpu: *mut Cpu386, a: u32, b: u32);
+pub(crate) type SetPendingAddFn = unsafe extern "C" fn(cpu: *mut CpuGsw, a: u32, b: u32);
 
 /// Signature of `jit_set_shift_flags_shr`, the SHR flag helper.
 #[cfg(feature = "jit")]
-pub(crate) type SetShiftFlagsFn = unsafe extern "C" fn(cpu: *mut Cpu386, value: u32, count: u8);
+pub(crate) type SetShiftFlagsFn = unsafe extern "C" fn(cpu: *mut CpuGsw, value: u32, count: u8);
 
 /// Signature of the charge-cached-fetch call-out. Advances eip by `len` and charges the bus for
 /// the instruction fetch. Returns 0 on success, 1 on fault (the fault is recorded in ctx).
 #[cfg(feature = "jit")]
 pub(crate) type ChargeFetchFn = unsafe extern "C" fn(
-    cpu: *mut Cpu386,
+    cpu: *mut CpuGsw,
     bus: *mut c_void,
     ctx: *mut RegionCtx,
     lin: u32,
@@ -116,19 +116,19 @@ pub(crate) type BusClocksFn = unsafe extern "C" fn(bus: *const c_void) -> u64;
 
 /// Signature of the decode-line liveness probe. Returns 1 if the slot's line is live, 0 otherwise.
 #[cfg(feature = "jit")]
-pub(crate) type LineLiveFn = unsafe extern "C" fn(cpu: *const Cpu386, lin: u32, d: bool) -> bool;
+pub(crate) type LineLiveFn = unsafe extern "C" fn(cpu: *const CpuGsw, lin: u32, d: bool) -> bool;
 
 /// Signature of the native-STORE write-tracking call-out: after the emitted probe writes the byte
 /// through the page-cache pointer, this does the part of `write_memory_u8` that is not the write —
 /// `record_write_page` (unpaged prefetch snapshot) + `note_code_write` (the SMC watch). `physical`
 /// is the store's physical address (== linear, since the store fold is unpaged-gated).
 #[cfg(feature = "jit")]
-pub(crate) type StoreFinishFn = unsafe extern "C" fn(cpu: *mut Cpu386, physical: u32);
+pub(crate) type StoreFinishFn = unsafe extern "C" fn(cpu: *mut CpuGsw, physical: u32);
 
-/// The mailbox between the dispatch (`Cpu386::run_region`), the emitted code, and the step fns.
+/// The mailbox between the dispatch (`CpuGsw::run_region`), the emitted code, and the step fns.
 /// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`;
 /// `inline_step_fn` is the second field, loaded from `[ctx + 8]`. Every other field is Rust-only.
-/// Boxed by the compile driver so its address is stable and disjoint from the `Cpu386` allocation
+/// Boxed by the compile driver so its address is stable and disjoint from the `CpuGsw` allocation
 /// (the step function holds `&mut` to both at once).
 #[repr(C)]
 pub(crate) struct RegionCtx {
@@ -140,11 +140,11 @@ pub(crate) struct RegionCtx {
     /// every entry alongside `step_fn`. Loaded by the prologue from `[ctx + 8]` (the second
     /// `Option<fn>` field; the null-pointer optimization keeps each one pointer-wide at 8 bytes).
     pub inline_step_fn: Option<RegionStepFn>,
-    /// Raw fn pointer to `Cpu386::jit_set_pending_add`, loaded by the inline add slot's helper
+    /// Raw fn pointer to `CpuGsw::jit_set_pending_add`, loaded by the inline add slot's helper
     /// call. At `[ctx + 16]` (third pointer field).
     #[cfg(feature = "jit")]
     pub set_pending_add_fn: Option<SetPendingAddFn>,
-    /// Raw fn pointer to `Cpu386::jit_set_shift_flags_shr`, loaded by the inline shr slot's helper
+    /// Raw fn pointer to `CpuGsw::jit_set_shift_flags_shr`, loaded by the inline shr slot's helper
     /// call. At `[ctx + 24]` (fourth pointer field).
     #[cfg(feature = "jit")]
     pub set_shift_flags_fn: Option<SetShiftFlagsFn>,
@@ -215,7 +215,7 @@ pub(crate) struct RegionCtx {
     /// no data access), = `bus.jit_fetch_cost_clocks()`. A native mov/add/shr slot adds this to
     /// `folded_raw_bus`. Zero under the trampoline. Past the disp8 range, so the emit reads it by disp32.
     pub fetch_cost: u64,
-    /// Raw fn pointer to `Cpu386::jit_store_u8_finish`, loaded (by disp32) + called by a native STORE
+    /// Raw fn pointer to `CpuGsw::jit_store_u8_finish`, loaded (by disp32) + called by a native STORE
     /// fold slot after it writes the byte, to do `record_write_page` + `note_code_write`. Written by the
     /// dispatch on every entry. `None` under the trampoline (no native store slot loads it).
     #[cfg(feature = "jit")]
@@ -234,7 +234,7 @@ impl RegionCtx {
 
 /// The signature the emitted region code is called through.
 pub(crate) type RegionEntryFn =
-    unsafe extern "C" fn(cpu: *mut Cpu386, bus: *mut c_void, ctx: *mut RegionCtx) -> i64;
+    unsafe extern "C" fn(cpu: *mut CpuGsw, bus: *mut c_void, ctx: *mut RegionCtx) -> i64;
 
 /// Status protocol with the emitted code: 0 = proceed (next slot, or the back-edge from the
 /// final slot); nonzero = return to the dispatch, which reads the details from the ctx.
@@ -250,13 +250,13 @@ const STOP: u8 = 1;
 /// cannot occur inside a region (the run loop still performs its own check across the whole
 /// region call).
 ///
-/// SAFETY: called only from region code invoked by `Cpu386::run_region`, which guarantees `cpu`
+/// SAFETY: called only from region code invoked by `CpuGsw::run_region`, which guarantees `cpu`
 /// and `bus` are live, non-aliased `&mut` for the whole region call, `ctx` is the boxed
-/// `RegionCtx` of the running region (a separate allocation from `Cpu386`, so the two `&mut`
+/// `RegionCtx` of the running region (a separate allocation from `CpuGsw`, so the two `&mut`
 /// reborrows are disjoint; nothing reachable from the execute dispatch touches `jit_regions`),
 /// and `B` is the concrete bus type behind `bus`.
 pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
-    cpu: *mut Cpu386,
+    cpu: *mut CpuGsw,
     bus: *mut c_void,
     ctx: *mut RegionCtx,
     k: u32,
@@ -369,10 +369,10 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
 /// path is unreachable for a warm cached fetch in an admitted region but is handled for soundness.
 ///
 /// SAFETY: same contract as `region_step`: called only from region code invoked by
-/// `Cpu386::run_region`; `cpu`/`bus` are live non-aliased `&mut`, `ctx` is the boxed RegionCtx, `B`
+/// `CpuGsw::run_region`; `cpu`/`bus` are live non-aliased `&mut`, `ctx` is the boxed RegionCtx, `B`
 /// is the concrete bus type.
 pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
-    cpu: *mut Cpu386,
+    cpu: *mut CpuGsw,
     bus: *mut c_void,
     ctx: *mut RegionCtx,
     k: u32,
@@ -439,7 +439,7 @@ pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
 /// RegionCtx.
 #[cfg(feature = "jit")]
 pub(crate) unsafe extern "C" fn jit_charge_fetch<B: CpuBus>(
-    cpu: *mut Cpu386,
+    cpu: *mut CpuGsw,
     bus: *mut c_void,
     ctx: *mut RegionCtx,
     lin: u32,
@@ -467,9 +467,9 @@ pub(crate) unsafe extern "C" fn jit_bus_clocks<B: CpuBus>(bus: *const c_void) ->
 }
 
 /// Probe whether a decode line is live (generation-current, matching tag and D bit).
-/// SAFETY: `cpu` must be the live Cpu386 pointer the region was entered with.
+/// SAFETY: `cpu` must be the live CpuGsw pointer the region was entered with.
 #[cfg(feature = "jit")]
-pub(crate) unsafe extern "C" fn jit_line_live(cpu: *const Cpu386, lin: u32, d: bool) -> bool {
+pub(crate) unsafe extern "C" fn jit_line_live(cpu: *const CpuGsw, lin: u32, d: bool) -> bool {
     let cpu = unsafe { &*cpu };
     cpu.decode_cache.line_live(lin, d)
 }

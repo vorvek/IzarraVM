@@ -1,5 +1,5 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
-use izarravm_cpu::{Cpu386, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{CpuGsw, SegmentIndex, SegmentRegister};
 use serde::Deserialize;
 
 // Flags the CPU core models. AF is now modeled but is undefined for logic ops
@@ -159,7 +159,7 @@ fn load_tests(text: &str) -> Vec<CpuTest> {
     serde_json::from_str(text).expect("test vectors should deserialize")
 }
 
-fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
+fn apply_state(cpu: &mut CpuGsw, bus: &mut FlatBus, state: &TestState) {
     let regs = &state.regs;
     if let Some(v) = regs.eax {
         cpu.registers.set_eax(v);
@@ -348,7 +348,7 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
     if is_logic { FLAG_AF } else { 0 }
 }
 
-fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> Vec<String> {
+fn diffs(cpu: &CpuGsw, bus: &FlatBus, expected: &TestState, undefined: u32) -> Vec<String> {
     let mut out = Vec::new();
     let regs = &expected.regs;
     {
@@ -474,7 +474,7 @@ fn install_vector_trap(bus: &mut FlatBus, vector: u8) {
 
 /// If the CPU is currently sitting on one of `install_vector_trap`'s trampolines, return the
 /// vector it corresponds to.
-fn delivered_vector(cpu: &Cpu386) -> Option<u8> {
+fn delivered_vector(cpu: &CpuGsw) -> Option<u8> {
     if cpu.registers.eip != u32::from(TRAP_IP) {
         return None;
     }
@@ -492,7 +492,7 @@ fn run_test(test: &CpuTest) -> Outcome {
         return Outcome::Skipped;
     }
 
-    let mut cpu = Cpu386::default();
+    let mut cpu = CpuGsw::default();
     let mut bus = FlatBus::new();
     apply_state(&mut cpu, &mut bus, &test.initial);
 
