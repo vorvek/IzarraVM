@@ -25,6 +25,19 @@ pub const INT10_VIDEO_PARAM_ENTRY_LEN: usize = 64;
 pub const INT10_VIDEO_PARAM_TABLE_ENTRIES: usize = 30;
 pub const BDA_VIDEO_SAVE_POINTER: usize = 0x4a8;
 
+// PCI / Distira chipset constants (static config tables)
+pub const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
+pub const PCI_CONFIG_DATA_PORT: u16 = 0x0cfc;
+pub const PCI_CONFIG_DATA_END: u16 = 0x0cff;
+pub const DISTIRA_PCI_SLOT: u8 = 0x10;
+pub const DISTIRA_PCI_BAR_SIZE: u32 = 0x0100_0000;
+pub const DISTIRA_PCI_CMDFIFO_OFFSET: u32 = 0x0020_0000;
+pub const DISTIRA_PCI_LFB_OFFSET: u32 = 0x0040_0000;
+pub const DISTIRA_PCI_TEX_OFFSET: u32 = 0x0080_0000;
+pub const DISTIRA_PCI_VENDOR_ID: u16 = 0x121a;
+pub const DISTIRA_PCI_DEVICE_ID: u16 = 0x0001;
+pub const DISTIRA_PCI_REVISION: u8 = 0x02;
+
 pub const INT10_VIDEO_PARAM_ENTRIES: &[(usize, [u8; INT10_VIDEO_PARAM_ENTRY_LEN])] = &[
     (
         0x04,
