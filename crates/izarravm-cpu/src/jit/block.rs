@@ -48,7 +48,10 @@ use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableBuffer;
 use super::region::{CompiledRegion, JIT_REGION_TABLE_CAP};
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
-use crate::{Cpu386, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, Prefixes};
+use crate::{
+    AddressSize, Cpu386, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, PerfCounters,
+    Prefixes, Registers, SegmentIndex,
+};
 
 /// Cap on a compiled block's slot count, to bound the emit and the compile pass. A block that
 /// reaches the cap ends linearly (its tail is interpreted); real hot loops are far smaller.
@@ -271,6 +274,39 @@ const STACK_RESERVE: u32 = 48;
 pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
+/// The cost-fold native-LOAD toggle (env `IZARRAVM_JIT_FOLD`), read at emit time. When ON AND a block
+/// is fold-eligible (Approximate class, unpaged, flat DS — checked by `try_admit_gated`), a `MemLoadU8`
+/// slot with a supported address form is emitted as a native page-cache probe + folded bookkeeping
+/// instead of a `region_step` call. OFF by default so production (`IZARRAVM_JIT=1` alone) and every
+/// bit-identical test are undisturbed. This makes JIT-block timing APPROXIMATE (bus cost is folded and
+/// flushed in bulk), validated by the anchor bands, not the differential timing asserts.
+pub(crate) static FOLD_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `MemLoadU8` slot's `mov r8, [EA]` has an address form the native fold probe supports,
+/// returning `(base, index, disp, dst_byte_reg)` if so. The probe computes `EA = base [+ index] [+ disp]`
+/// and treats it as linear == physical (unpaged, gated by the caller). Requirements: 32-bit address
+/// size (the probe does 32-bit EA math), a base register (the probe indexes off one), scale 1 when an
+/// index is present (the probe adds the index unscaled), and the DS segment (the per-entry flatness
+/// re-check in `run_region` guards DS only). Anything else falls to the `region_step` path unchanged.
+fn fold_load_eligible(insn: &DecodedInsn) -> Option<(u8, Option<u8>, i32, u8)> {
+    let Some(DecodedOperand::Mem(addr)) = insn.operand else {
+        return None;
+    };
+    let m = insn.modrm?;
+    if addr.address_size != AddressSize::Dword {
+        return None;
+    }
+    let base = addr.base?;
+    if addr.index.is_some() && addr.scale != 1 {
+        return None;
+    }
+    if addr.segment != SegmentIndex::Ds {
+        return None;
+    }
+    Some((base, addr.index, addr.disp, m.reg))
+}
+
 /// Emit the region chain for `slots`: pin cpu/bus/ctx in R12/R13/R15 and the two step functions
 /// in RBX (Memory/BackEdge) and R14 (inline register-only), then per slot either inline the guest
 /// op natively (mov r,r / add r,imm / shr r,imm against gpr[] + a flag-helper call, followed by the
@@ -293,7 +329,7 @@ pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
 ///   label. Today only Memory/BackEdge slots exit, via the step fn's nonzero return + `jnz exit`; a
 ///   faulting NATIVE template (the Round 3 memory fast path) will jump to `exit` after spilling, per
 ///   the re-plan's fault rule. A reg-only template never faults and never exits mid-body.
-fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32) -> Vec<u8> {
+fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32, fold_native: bool) -> Vec<u8> {
     let mode = NATIVE_BOOKKEEPING.load(std::sync::atomic::Ordering::Relaxed);
     let mut e = Encoder::new();
     e.push(Reg::RBX);
@@ -369,9 +405,38 @@ fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32) -> Vec<u8> {
             | SlotKind::MemStoreU8
             | SlotKind::MemLoadSized
             | SlotKind::MemStoreSized => {
-                emit_full_step_call(&mut e, k32);
-                e.test_al_al();
-                e.jnz(exit);
+                // A fold-eligible byte load runs as a native page-cache probe + folded bookkeeping;
+                // a MISS (and every other memory/terminal slot) takes the unchanged region_step call.
+                let native = if fold_native && slot.kind == SlotKind::MemLoadU8 {
+                    fold_load_eligible(&slot.insn)
+                } else {
+                    None
+                };
+                if let Some((base, index, disp, dst)) = native {
+                    let miss = e.label();
+                    let after = e.label();
+                    emit_native_load_fold(
+                        &mut e,
+                        base,
+                        index,
+                        disp,
+                        dst,
+                        slot.insn.len,
+                        next_lin,
+                        exit,
+                        miss,
+                    );
+                    e.jmp(after); // HIT path done → skip the miss fallback
+                    e.place(miss);
+                    emit_full_step_call(&mut e, k32);
+                    e.test_al_al();
+                    e.jnz(exit);
+                    e.place(after);
+                } else {
+                    emit_full_step_call(&mut e, k32);
+                    e.test_al_al();
+                    e.jnz(exit);
+                }
             }
         }
     }
@@ -461,6 +526,96 @@ pub(crate) fn emit_load_u8_probe(
     e.load_r64_disp8(Reg::RAX, Reg::RDX, 8);
     e.movzx_r32_byte_sib(Reg::RAX, Reg::RAX, Reg::RCX);
     e.store_r8_disp8(Reg::R14, gpr8_disp(dst), Reg::RAX);
+}
+
+/// Emit a native cost-fold LOAD slot for a `mov r8, [EA]` whose address is unpaged, flat-DS, and a
+/// supported form (the caller gates on `fold_load_eligible` and block eligibility). It replaces the
+/// per-slot `region_step` CALL: the emitted `emit_load_u8_probe` computes the native EA, probes the
+/// page cache, and on a HIT derefs and does the `write_gpr8`; then this appends the NATIVE bookkeeping
+/// `region_step` would otherwise do — advance eip, clear the interrupt shadow, accumulate the core
+/// clocks and retired count, FOLD the bus cost (into `ctx.folded_raw_bus`, flushed in bulk by the next
+/// `region_step` slot or the back-edge — which is what makes JIT-block timing approximate), bump the
+/// native-hit counter, and run the next slot's `line_live` probe. There is NO per-slot cap check
+/// (deferred to the next flush point) and NO per-slot bus charge. `begin_instruction` is intentionally
+/// skipped (fold spec gate #1: a native LOAD never writes `written_pages`, and the interspersed
+/// `region_step` slots and the back-edge reconcile it; the state comparator validates this). A
+/// page-cache MISS jumps to `miss`, where the CALLER emits the identical interpreter fallback
+/// (`emit_full_step_call`) — nothing above is committed on the miss branch (the probe only reads
+/// registers and the tag before jumping), so there is no double-charge.
+#[allow(clippy::too_many_arguments)]
+fn emit_native_load_fold(
+    e: &mut Encoder,
+    base: u8,
+    index: Option<u8>,
+    disp: i32,
+    dst: u8,
+    len: u8,
+    next_lin: u32,
+    exit: Label,
+    miss: Label,
+) {
+    // Native EA + page-cache probe + deref + write_gpr8 (HIT falls through; MISS jumps to `miss`).
+    emit_load_u8_probe(e, base, index, disp, dst, miss);
+
+    // ---- HIT-path native bookkeeping (scratch RAX/RCX/RDX; R14 = regs base, R12 = cpu, R15 = ctx) ----
+    // eip += len. `Registers.eip` is past the disp8 range through the regs base, so use disp32.
+    let eip_off = core::mem::offset_of!(Registers, eip) as i32;
+    e.load_r32_disp32(Reg::RAX, Reg::R14, eip_off);
+    e.add_r32_imm32(Reg::RAX, u32::from(len));
+    e.store_r32_disp32(Reg::R14, eip_off, Reg::RAX);
+    // interrupt_shadow = 0. `region_step` clears it per slot; it is provably already false inside a
+    // self-loop region (no admitted interior slot arms the shadow — the arming ops are terminal), but
+    // clear it anyway to match the interpreter's per-slot write exactly (the state comparator compares
+    // this field). Compute &interrupt_shadow = cpu + off and store a zero byte (DL) — off exceeds disp8.
+    let shadow_off = core::mem::offset_of!(Cpu386, interrupt_shadow) as u32;
+    e.mov_r64_r64(Reg::RAX, Reg::R12);
+    e.add_r64_imm32(Reg::RAX, shadow_off);
+    e.xor_r64_self(Reg::RDX);
+    e.store_r8_disp8(Reg::RAX, 0, Reg::RDX);
+    // ctx.raw_clocks += 2 (the byte load's core cost is clocks(2)=2, the same constant the inline slots
+    // and jit_execute_load_u8 use — no per-op cost table needed). u64 at disp8.
+    e.load_r64_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF);
+    e.add_r64_imm32(Reg::RAX, 2);
+    e.store_r64_disp8(Reg::R15, RAW_CLOCKS_OFF, Reg::RAX);
+    // ctx.insn_count += 1 (u32 at RAW_CLOCKS_OFF + 8).
+    e.load_r32_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF + 8);
+    e.add_r32_imm32(Reg::RAX, 1);
+    e.store_r32_disp8(Reg::R15, RAW_CLOCKS_OFF + 8, Reg::RAX);
+    // ctx.folded_raw_bus += ctx.fold_bus_cost (both u64, past disp8 → disp32). The bus is NOT charged
+    // here; region_step flushes the accumulator at its top (#460).
+    let folded_off = core::mem::offset_of!(RegionCtx, folded_raw_bus) as i32;
+    let cost_off = core::mem::offset_of!(RegionCtx, fold_bus_cost) as i32;
+    e.load_r64_disp32(Reg::RAX, Reg::R15, folded_off);
+    e.load_r64_disp32(Reg::RCX, Reg::R15, cost_off);
+    e.add_r64_r64(Reg::RAX, Reg::RCX);
+    e.store_r64_disp32(Reg::R15, folded_off, Reg::RAX);
+    // perf.jit_native_load_hits += 1 — instrumentation (the native path took this slot). Proves the
+    // test exercises the native path and reports how often it fired on the anchors (≈0 on paged Doom).
+    let hits_off = (core::mem::offset_of!(Cpu386, perf)
+        + core::mem::offset_of!(PerfCounters, jit_native_load_hits)) as i32;
+    e.load_r64_disp32(Reg::RAX, Reg::R12, hits_off);
+    e.add_r64_imm32(Reg::RAX, 1);
+    e.store_r64_disp32(Reg::R12, hits_off, Reg::RAX);
+    // line_live(cpu, next_lin, d): the next slot's decode-line liveness (narrow-SMC guard). Kept per
+    // native slot (fold spec REFINEMENT) so a self-patched step-immediate in the next slot is caught
+    // before the stale slot runs. jz exit if the line is no longer live.
+    #[cfg(windows)]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R12); // cpu
+        e.mov_r32_imm32(Reg::RDX, next_lin); // lin
+        e.load_r64_disp32(Reg::R8, Reg::R15, D_OFF); // d (bool, zero-extended)
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R12);
+        e.mov_r32_imm32(Reg::RSI, next_lin);
+        e.load_r64_disp32(Reg::RDX, Reg::R15, D_OFF);
+    }
+    e.load_r64_disp8(Reg::RAX, Reg::R15, LINE_LIVE_FN_OFF);
+    e.call_r64(Reg::RAX);
+    e.test_al_al();
+    e.jz(exit);
+    // HIT path falls through to the caller's `jmp after`; the caller places `miss` + the fallback next.
 }
 
 /// Reload cpu/bus/ctx and the slot index, then `call rbx` (the full region_step). Used by Memory
@@ -754,6 +909,17 @@ pub(crate) fn try_admit_gated(
     let mode_key = cpu.jit_mode_key();
     let regs_offset = core::mem::offset_of!(Cpu386, registers) as u32;
     let (_scale_num, scale_den) = crate::level_timing(cpu.level);
+    // Cost-fold native LOAD gate (read the toggle once here — the true emit site — so this admission's
+    // decision, the emit, and `has_native_fold` all agree): ON only if `IZARRAVM_JIT_FOLD` is set AND
+    // this CPU state is fold-eligible (Approximate class, unpaged, flat DS). `has_native_fold` also
+    // requires the block to actually contain a supported byte-load slot, so `run_region`'s per-entry
+    // DS-flat re-check only runs on regions that emitted a native probe.
+    let fold_native =
+        FOLD_TIMING.load(std::sync::atomic::Ordering::Relaxed) && cpu.jit_fold_block_eligible();
+    let has_native_fold = fold_native
+        && slots
+            .iter()
+            .any(|s| s.kind == SlotKind::MemLoadU8 && fold_load_eligible(&s.insn).is_some());
     if let Some(idx) = cpu.jit_regions.find(entry_lin, d) {
         let region = cpu
             .jit_regions
@@ -767,11 +933,12 @@ pub(crate) fn try_admit_gated(
         region.valid_epoch = epoch;
         region.is_loop = is_loop;
         region.mode_key = mode_key;
+        region.has_native_fold = has_native_fold;
         // v2 bakes the slot kinds and the add-imm immediates into the emitted bytes (unlike v1,
         // whose buffer encoded only the slot count). A self-patch changes an add slot's immediate,
         // and a rebuild can change the block shape, so the buffer is re-emitted from the fresh slot
         // table.
-        let code = emit_region(&region.ctx.slots, regs_offset, scale_den);
+        let code = emit_region(&region.ctx.slots, regs_offset, scale_den, fold_native);
         if let Some(buf) = ExecutableBuffer::new(&code) {
             // SAFETY: same transmute proof as the fresh-admission path below; `code` was produced
             // by emit_region to exactly the RegionEntryFn convention.
@@ -799,7 +966,7 @@ pub(crate) fn try_admit_gated(
         return None;
     }
     let terminal_slot = (slots.len() - 1) as u32;
-    let code = emit_region(&slots, regs_offset, scale_den);
+    let code = emit_region(&slots, regs_offset, scale_den, fold_native);
     let buf = ExecutableBuffer::new(&code)?;
     // SAFETY: `code` was produced by `emit_region` to exactly the `RegionEntryFn` calling
     // convention (alignment proof at STACK_RESERVE); `entry_ptr` stays valid for `buf`'s life,
@@ -831,6 +998,7 @@ pub(crate) fn try_admit_gated(
         fault: None,
         halted: false,
         folded_raw_bus: 0,
+        fold_bus_cost: 0,
     });
     let idx = cpu.jit_regions.install(CompiledRegion {
         buf,
@@ -843,6 +1011,7 @@ pub(crate) fn try_admit_gated(
         valid_epoch: epoch,
         is_loop,
         mode_key,
+        has_native_fold,
     });
     Some(idx)
 }

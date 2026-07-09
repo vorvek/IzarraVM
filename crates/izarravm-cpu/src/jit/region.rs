@@ -57,6 +57,11 @@ pub(crate) struct CompiledRegion {
     /// requires equality with the live mode key, so a block compiled for one mode is never reused
     /// in another at the same phys/d (spec §2.2). A mismatch is a miss: unstamp and re-admit.
     pub mode_key: u32,
+    /// Whether this region emitted any native cost-fold LOAD slot (`IZARRAVM_JIT_FOLD` on + fold-eligible
+    /// at admission). Those slots assume a FLAT DS (base 0, limit max) so EA == linear, but DS is a
+    /// runtime value NOT in `mode_key`; `run_region` re-checks DS flatness per entry when this is set and
+    /// bails to the interpreter if DS is no longer flat. Regions without native fold slots skip the check.
+    pub has_native_fold: bool,
 }
 
 /// Upper bound on live compiled regions. `find()` reuses a line's entry on re-admission, so the
@@ -204,6 +209,7 @@ mod tests {
                 fault: None,
                 halted: false,
                 folded_raw_bus: 0,
+                fold_bus_cost: 0,
             }),
             entry_lin,
             d,
@@ -212,6 +218,7 @@ mod tests {
             valid_epoch: 0,
             is_loop: true,
             mode_key: 0,
+            has_native_fold: false,
         }
     }
 

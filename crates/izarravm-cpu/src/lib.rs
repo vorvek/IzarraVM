@@ -1043,6 +1043,12 @@ pub struct PerfCounters {
     /// the JIT is re-warming - a signal to raise the cap or add per-entry eviction. Zero on the
     /// single-phase anchors. Always present (zero without the `jit` feature).
     pub jit_table_clears: u64,
+    /// Byte loads served by the native cost-fold LOAD probe (a page-cache HIT run entirely in emitted
+    /// code, skipping the `region_step` call). Bumped natively by the emitted probe. Zero unless
+    /// `IZARRAVM_JIT_FOLD` is on AND the block is fold-eligible (Approximate class, unpaged, flat DS);
+    /// on the paged Doom/Quake anchors this stays ~0 (the unpaged probe is gated off), which is the
+    /// A/B signal that this first cut is Doom-inert. Always present (zero without the `jit` feature).
+    pub jit_native_load_hits: u64,
     pub data_direct_reads: u64,
     pub data_slow_reads: u64,
     pub data_direct_writes: u64,
@@ -2829,7 +2835,37 @@ impl Cpu386 {
         if self.registers.segment(SegmentIndex::Ss).default_size_32 {
             key |= 1 << 3;
         }
+        // CR0.PG: the native cost-fold LOAD probe assumes linear == physical (unpaged), so an
+        // unpaged-compiled block must never be re-entered paged (it would probe the physical page
+        // cache with a linear address and read the wrong frame — re-plan trap #1). Keying on PG
+        // makes a paging transition a mode-key mismatch → unstamp + re-admit for the new mode.
+        if self.control.cr0 & CR0_PG != 0 {
+            key |= 1 << 4;
+        }
         key | ((self.level as u32) << 8)
+    }
+
+    /// Whether `seg` is FLAT: base 0 and limit `u32::MAX`. This is exactly the interpreter's
+    /// `segment_linear_byte` fast path (base 0 + limit max → return the offset as the linear address),
+    /// so under it EA == linear and no segment-limit fault is ever skipped (with limit max no offset can
+    /// exceed it, and the flat fast path returns before the expand-down logic). The native cost-fold LOAD
+    /// probe needs this for the access segment (DS) since it treats EA as linear (and, when unpaged, as
+    /// physical). DS is a runtime value not in `jit_mode_key`, so `run_region` re-checks it per entry.
+    #[cfg(feature = "jit")]
+    fn jit_segment_flat(&self, seg: SegmentIndex) -> bool {
+        let d = self.registers.segment(seg);
+        d.base == 0 && d.limit == u32::MAX
+    }
+
+    /// Whether a block admitted now may use the native cost-fold LOAD probe: the Approximate timing
+    /// class (486/586, where the folded bus cost constants apply), unpaged (the probe assumes linear ==
+    /// physical — re-plan trap #1), and a flat DS (see `jit_segment_flat`). The class and PG are in
+    /// `jit_mode_key` (so a class/paging change re-admits); DS flatness is re-checked per entry.
+    #[cfg(feature = "jit")]
+    fn jit_fold_block_eligible(&self) -> bool {
+        matches!(self.level, CpuLevel::I486 | CpuLevel::I586)
+            && self.control.cr0 & CR0_PG == 0
+            && self.jit_segment_flat(SegmentIndex::Ds)
     }
 
     /// The live instruction-set level the core presents to the guest.
@@ -3624,6 +3660,16 @@ impl Cpu386 {
         self.jit_regions.set_auto_admit(on);
     }
 
+    /// Enable/disable the cost-fold native-LOAD path (env `IZARRAVM_JIT_FOLD`), a process-global toggle
+    /// read at region emit time. Off by default so production (`IZARRAVM_JIT=1` alone) and every
+    /// bit-identical test are undisturbed. Associated (no `self`): it sets a global, like
+    /// `NATIVE_BOOKKEEPING`. Turning it on makes JIT-block timing approximate (bus cost is folded), so
+    /// it is validated by the anchor bands, not the differential timing asserts.
+    #[cfg(feature = "jit")]
+    pub fn set_jit_fold_timing(on: bool) {
+        jit::block::FOLD_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
     /// forced admission address, or once a line is hot enough) compile/re-stamp one first. `Ok(None)`
     /// means "no region ran"; the caller falls back to the interpreted continuation.
@@ -3698,6 +3744,11 @@ impl Cpu386 {
         let mode_key = self.jit_mode_key();
         let (num, den) = level_timing(self.level);
         let rem0 = self.timing_rem;
+        // For a region with native cost-fold LOAD slots: DS flatness is a runtime value NOT in the mode
+        // key, so re-check it here per entry (like the per-slot CS-limit check below). Computed before
+        // the region borrow so `self` is free to read the segment. Cheap; only consulted when the region
+        // actually emitted a native probe (has_native_fold).
+        let ds_flat = self.jit_segment_flat(SegmentIndex::Ds);
         let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
         let (entry, ctx_ptr) = {
             let Some(region) = self.jit_regions.get_mut(idx) else {
@@ -3719,6 +3770,13 @@ impl Cpu386 {
                 // built: the stamp may outlive the killed slot lines, so drop it and let the
                 // forced-admission path re-run the builder over the fresh decodes.
                 self.decode_cache.unstamp_region(lin, d);
+                return Ok(None);
+            }
+            if region.has_native_fold && !ds_flat {
+                // This region's native cost-fold LOAD slots assume DS is flat (EA == linear ==
+                // physical). DS is no longer flat, so the emitted probe would compute the wrong
+                // address. Bail to the interpreter (always correct); leave the stamp so a later entry
+                // re-uses the region if DS becomes flat again (self-healing, no re-admit churn).
                 return Ok(None);
             }
             let ctx = &mut *region.ctx;
@@ -3764,9 +3822,12 @@ impl Cpu386 {
             ctx.exit = jit::step::RegionExitKind::Boundary;
             ctx.fault = None;
             ctx.halted = false;
-            // Cost-fold: start the folded-bus accumulator empty; region_step flushes it. (The
-            // per-entry fetch/data cost constants the native slots fold from land with the emit.)
+            // Cost-fold: start the folded-bus accumulator empty; region_step flushes it. The native
+            // LOAD slots fold ONE instruction-fetch + ONE data-byte cost per slot; stash that constant
+            // from the concrete bus here (THE WRINKLE: the bus-agnostic emitted buffer cannot call a
+            // bus method). Zero on buses without bus timing, so a native slot folds nothing there.
             ctx.folded_raw_bus = 0;
+            ctx.fold_bus_cost = bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks();
             (region.entry, std::ptr::from_mut(ctx))
         };
         // SAFETY: the emitted code only forwards these pointers to `region_step::<B>`, whose
@@ -14263,6 +14324,17 @@ mod tests {
         eprintln!("cap offset = {cap_off}");
         let d_off = core::mem::offset_of!(RegionCtx, d);
         eprintln!("d offset = {d_off}");
+        // The native cost-fold reads these two by disp32 (both are past 127). The emit bakes
+        // offset_of! at emit time, so a reorder still produces correct code; assert they stay in the
+        // disp32 range so a future field placement that pulled them under 128 (silently switching the
+        // emit's addressing assumption) is caught.
+        let folded_off = core::mem::offset_of!(RegionCtx, folded_raw_bus);
+        let cost_off = core::mem::offset_of!(RegionCtx, fold_bus_cost);
+        eprintln!("folded_raw_bus offset = {folded_off}, fold_bus_cost offset = {cost_off}");
+        assert!(
+            folded_off > 127 && cost_off > 127,
+            "fold fields must be disp32"
+        );
     }
 
     /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
@@ -34502,6 +34574,53 @@ mod tests {
             );
         }
 
+        /// Cost-fold native-LOAD smoke A/B on the drawcolumn (flat DS, unpaged, direct pages — the only
+        /// mode where the fold fires; the anchors run PAGED so the fold is inert there and Doom is the
+        /// real gate, per dev_docs). Times the same drawcolumn with the fold OFF then ON. RUN FILTERED
+        /// (this sets the process-global FOLD_TIMING; a concurrent flat-DS #[ignore] bench would see it):
+        ///   cargo test -p izarravm-cpu --release --features jit drawcolumn_region_fold_ab -- --ignored --nocapture
+        #[test]
+        #[ignore]
+        fn drawcolumn_region_fold_ab() {
+            use std::sync::atomic::Ordering;
+            use std::time::Instant;
+            const ITERS: u32 = 200_000;
+            let time_variant = |fold: bool| -> (f64, u64) {
+                jit::block::FOLD_TIMING.store(fold, Ordering::Relaxed);
+                let mut m = vec![0u8; 64 << 20];
+                let p = program();
+                m[..p.len()].copy_from_slice(&p);
+                let mut cpu = fresh_cpu(0xffff_ffff);
+                let mut bus = TestBus::with_memory(m);
+                bus.direct_pages_enabled = true;
+                bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
+                arm_loop(&mut cpu, &mut bus, 2);
+                drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+                let idx = jit::block::try_admit(&mut cpu, ENTRY, true).expect("admit");
+                cpu.decode_cache.stamp_region(ENTRY, true, idx);
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    arm_loop(&mut cpu, &mut bus, ITERS);
+                    let t = Instant::now();
+                    drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+                    best = best.min(t.elapsed().as_secs_f64() / ITERS as f64 * 1e9);
+                }
+                (best, cpu.perf_counters().jit_native_load_hits)
+            };
+            let (off, off_hits) = time_variant(false);
+            let (on, on_hits) = time_variant(true);
+            jit::block::FOLD_TIMING.store(false, Ordering::Relaxed);
+            eprintln!("\n=== drawcolumn cost-fold native-LOAD A/B (ns/iter, best of 7) ===");
+            eprintln!("fold OFF: {off:.0} ns/iter  (native_hits={off_hits})");
+            eprintln!(
+                "fold ON : {on:.0} ns/iter  (native_hits={on_hits})  ({:.2}x)",
+                off / on
+            );
+            assert_eq!(off_hits, 0, "fold-off must run no native slots");
+            assert!(on_hits > 0, "fold-on must run the native LOAD slots");
+            eprintln!("=== end A/B (the anchors run PAGED, so this fold is Doom-inert) ===\n");
+        }
+
         /// Round 1 hotness admission: with `set_jit_auto_admit(true)` and NO manual `try_admit`, a
         /// hot loop compiles itself once its entry line crosses JIT_HOTNESS_THRESHOLD, and the
         /// auto-admitted region stays byte-identical to the interpreter. The interp CPU (auto-admit
@@ -36008,6 +36127,201 @@ mod tests {
             assert!(
                 lp.jit_regions.get_mut(region.unwrap()).unwrap().is_loop,
                 "the admitted region is a self-loop"
+            );
+        }
+
+        // ---- STAGE 2 FINALE: cost-fold native byte-LOAD, state-only differential ----
+        //
+        // With `IZARRAVM_JIT_FOLD` on, a fold-eligible `mov r8,[EA]` (unpaged, flat DS, 32-bit) runs as
+        // a native page-cache probe + folded bookkeeping instead of a `region_step` call, which makes
+        // JIT-block timing APPROXIMATE. So these assert STATE identity (the comparator, ignoring the four
+        // timing accumulators) rather than the four-accumulator identity the trampoline tests use. Each
+        // real-mode case PROVES it took the native path (`jit_native_load_hits > 0`); the paged case
+        // proves the CR0.PG gate keeps the unpaged probe OFF (native hits stay 0) while state stays
+        // identical through the trampoline.
+
+        /// `FOLD_TIMING` is a process-global read at region emit time; serialize the fold tests so one
+        /// dropping the toggle (below) cannot un-fold another mid-admission. No OTHER default-suite test
+        /// is fold-eligible (flat DS + unpaged + Approximate), so this only needs to cover fold tests.
+        static FOLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// RAII: hold the fold lock and turn the toggle ON for the test body; restore OFF on drop (even
+        /// on a panic), so the process global returns to its default and other tests are undisturbed.
+        struct FoldOn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+        impl FoldOn {
+            fn new() -> Self {
+                let g = FOLD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                jit::block::FOLD_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                FoldOn(g)
+            }
+        }
+        impl Drop for FoldOn {
+            fn drop(&mut self) {
+                jit::block::FOLD_TIMING.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        /// `h_arm` plus a FLAT DS (base already 0 in real mode; force limit to max) so the byte-load is
+        /// fold-eligible. This is the "flat real / unreal mode" a DOS extender sets up; without it a
+        /// real-mode DS (limit 0xffff) is not flat and the probe is correctly gated off.
+        fn flat_ds_arm(esi: u32, edi: u32) -> impl Fn(&mut Cpu386) {
+            move |cpu: &mut Cpu386| {
+                h_arm(esi, edi)(cpu);
+                let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+                ds.limit = u32::MAX;
+                cpu.registers.set_segment(SegmentIndex::Ds, ds);
+            }
+        }
+
+        /// Run `prog` to a halt on an interpreter CPU and a fold-on auto-admitting JIT CPU under `arm`,
+        /// asserting STATE + materialized eflags + memory identity at the halt boundary (timing is
+        /// approximate under the fold, so it is NOT asserted). `expect_native_hits`: `Some(true)` = the
+        /// native cost-fold LOAD path MUST have run (real-mode, flat DS); `Some(false)` = it MUST have
+        /// stayed off (paged, gated by CR0.PG); `None` = don't assert (SMC churn may keep the region
+        /// cold). Both buses hand out direct pages so the page cache is populated and the probe HITs.
+        /// Returns the interpreter CPU. Panics on any divergence.
+        fn assert_fold_state_identical(
+            prog: Vec<u8>,
+            arm: &dyn Fn(&mut Cpu386),
+            expect_native_hits: Option<bool>,
+            expect_region: bool,
+        ) -> Cpu386 {
+            let _fold = FoldOn::new();
+            let mut interp = fresh();
+            let mut jit_cpu = fresh();
+            jit_cpu.set_jit_auto_admit(true);
+            let mut bus_i = TestBus::with_memory(prog.clone());
+            let mut bus_j = TestBus::with_memory(prog);
+            bus_i.direct_pages_enabled = true; // populate the page cache so the native probe HITs
+            bus_j.direct_pages_enabled = true;
+            arm(&mut interp);
+            arm(&mut jit_cpu);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+            // The state-exact half of the S2 contract: architectural state byte-identical, timing not.
+            assert_state_identical(&interp, &jit_cpu);
+            assert_eq!(
+                interp.eflags(),
+                jit_cpu.eflags(),
+                "materialized eflags diverged (fold on)"
+            );
+            assert_eq!(
+                bus_i.memory, bus_j.memory,
+                "guest memory diverged (fold on)"
+            );
+            assert_eq!(
+                interp.perf_counters().jit_region_entries,
+                0,
+                "the interpreter CPU must never compile"
+            );
+            assert_eq!(
+                interp.perf_counters().jit_native_load_hits,
+                0,
+                "the interpreter must never run a native fold slot"
+            );
+            if expect_region {
+                assert!(
+                    jit_cpu.perf_counters().jit_region_entries > 0,
+                    "the JIT must have compiled and run a region"
+                );
+            }
+            match expect_native_hits {
+                Some(true) => assert!(
+                    jit_cpu.perf_counters().jit_native_load_hits > 0,
+                    "the native cost-fold LOAD path never ran (test did not exercise it)"
+                ),
+                Some(false) => assert_eq!(
+                    jit_cpu.perf_counters().jit_native_load_hits,
+                    0,
+                    "the native fold path must be gated off here"
+                ),
+                None => {}
+            }
+            interp
+        }
+
+        /// Real-mode, flat DS, unpaged: the byte-copy loop's `mov al,[esi]` runs as the native cost-fold
+        /// probe and stays STATE-identical to the interpreter across 200 iterations. Proves the native
+        /// path actually ran (`jit_native_load_hits > 0`) — the comparator would instantly catch the
+        /// begin_instruction / written_pages / EA / eip bugs the fold spec's five gates guard against.
+        #[test]
+        fn fold_real_mode_copy_loop_is_state_identical_and_native() {
+            let build = |count: u32| -> Vec<u8> {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&count.to_le_bytes());
+                m
+            };
+            assert_fold_state_identical(build(200), &flat_ds_arm(0x2000, 0x3000), Some(true), true);
+        }
+
+        /// Base+INDEX load (`mov al,[esi+ecx]`, scale 1) folded natively and STATE-identical. The copy
+        /// loop above has no index; the real R_DrawColumn loads are `[esi+ecx]`/`[esi+edx]`, so this
+        /// exercises the probe's index-EA path (`add_r32_r32`) in an integrated multi-iteration loop, not
+        /// just the isolation test. `ecx` is a fixed in-page offset; `esi` walks within the cached page.
+        #[test]
+        fn fold_index_load_is_state_identical_and_native() {
+            let prog = {
+                let mut m = vec![0u8; 0x1_0000];
+                m[0x100] = 0x90; // nop starter -> 0x101 reached as a continuation
+                let body: [u8; 14] = [
+                    0x8a, 0x04, 0x0e, // mov al,[esi+ecx]  (base esi, index ecx, scale 1)
+                    0x88, 0x07, // mov [edi],al
+                    0x46, // inc esi
+                    0x47, // inc edi
+                    0xff, 0x0d, 0x00, 0x04, 0x00, 0x00, // dec dword [H_COUNT]
+                    0x75, // jnz rel8
+                ];
+                m[0x101..0x101 + body.len()].copy_from_slice(&body);
+                let rel_at = 0x101 + body.len();
+                m[rel_at] = ((0x101i32) - (rel_at as i32 + 1)) as i8 as u8;
+                m[rel_at + 1] = 0xf4; // hlt at the fall-through
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&200u32.to_le_bytes());
+                m
+            };
+            let arm = move |cpu: &mut Cpu386| {
+                flat_ds_arm(0x2000, 0x3000)(cpu);
+                cpu.write_gpr32(1, 0x40); // ecx = a fixed in-page index offset; load reads [esi+0x40]
+            };
+            assert_fold_state_identical(prog, &arm, Some(true), true);
+        }
+
+        /// Paged (CR0.PG=1, the Doom/Quake anchor mode): the unpaged native probe is gated OFF by the PG
+        /// bit in `jit_mode_key`, so the byte load falls to the trampoline and stays identical — proving
+        /// the fold toggle does NOT break the paged path and native hits stay 0. This is the increment's
+        /// Doom-inertness in miniature (the anchors run paged, so this first cut cannot move them).
+        #[test]
+        fn fold_paged_copy_loop_is_state_identical_with_native_gated_off() {
+            let interp = assert_fold_state_identical(
+                paged_copy_program(200),
+                &pg_arm(PG_SRC_LIN, PG_DST_LIN),
+                Some(false),
+                true,
+            );
+            assert!(
+                interp.is_paging_enabled(),
+                "the paged fold test must run with paging enabled"
+            );
+        }
+
+        /// Self-modifying store under the fold, flat DS: `esi == edi == the loop's first opcode`, so the
+        /// byte read is written back into live code, firing the SMC watch. State must stay identical
+        /// across the write/refetch churn. The region may stay cold under the churn, so neither the
+        /// region nor a native hit is required — only STATE identity + that the SMC watch fired.
+        #[test]
+        fn fold_self_modifying_store_stays_state_identical() {
+            let prog = {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&40u32.to_le_bytes());
+                m
+            };
+            let interp =
+                assert_fold_state_identical(prog, &flat_ds_arm(H_ENTRY, H_ENTRY), None, false);
+            let pc = interp.perf_counters();
+            assert!(
+                pc.smc_narrow_kills > 0 || pc.decode_inval_smc > 0,
+                "the self-store must have triggered the SMC watch (narrow={}, global={})",
+                pc.smc_narrow_kills,
+                pc.decode_inval_smc
             );
         }
     }

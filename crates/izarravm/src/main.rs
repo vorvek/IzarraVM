@@ -135,6 +135,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
+    // The cost-fold native-LOAD JIT path is a process-global toggle read at region emit time; set it
+    // once here from `IZARRAVM_JIT_FOLD` so every entry path (bench/hdd-folder/katea/exe) sees it. Only
+    // meaningful alongside `IZARRAVM_JIT`; a no-op unless built `--features jit`.
+    #[cfg(feature = "jit")]
+    izarravm_cpu::Cpu386::set_jit_fold_timing(jit_fold_enabled());
     let mut config = load_config(&cli)?;
     // When the user gave no C: location (no --c_drive, no --dosroot, and the
     // config left at its "." default), use the per-user ~/.izarravm/c_drive (or,
@@ -355,6 +360,16 @@ fn run_bench_one(
 /// without a dedicated flag. A no-op unless the binary was built `--features jit`.
 fn jit_env_enabled() -> bool {
     std::env::var("IZARRAVM_JIT")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Whether the cost-fold native-LOAD JIT path should run this session, read from `IZARRAVM_JIT_FOLD`.
+/// Off by default; only meaningful alongside `IZARRAVM_JIT` (it needs the JIT active). Makes JIT-block
+/// timing approximate, so it is an opt-in A/B knob. A no-op unless the binary was built `--features jit`.
+#[cfg(feature = "jit")]
+fn jit_fold_enabled() -> bool {
+    std::env::var("IZARRAVM_JIT_FOLD")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false)
 }
@@ -831,7 +846,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns]={}/{}",
+         jit[entries/insns/nativeld]={}/{}/{}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -860,6 +875,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             perf.cache_tier_lookups,
             perf.jit_region_entries,
             perf.jit_region_insns,
+            perf.jit_native_load_hits,
         );
         // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
         // miss investigation.
@@ -1293,7 +1309,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns]={}/{}",
+         jit[entries/insns/nativeld]={}/{}/{}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -1326,6 +1342,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
         perf.cache_tier_lookups,
         perf.jit_region_entries,
         perf.jit_region_insns,
+        perf.jit_native_load_hits,
     );
     // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
     // miss investigation.

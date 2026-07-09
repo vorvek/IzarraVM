@@ -198,6 +198,12 @@ pub(crate) struct RegionCtx {
     /// trampoline (no native slots) it stays 0, so the flush is inert. Reset per entry. (The
     /// per-instruction cost constants the native slots fold from land here alongside the emit.)
     pub folded_raw_bus: u64,
+    /// The raw bus clocks ONE native fold slot charges (fetch + one byte of data), set per entry by
+    /// `run_region` from `bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks()`. The bus-agnostic
+    /// emitted buffer cannot read a bus method (THE WRINKLE in the fold spec), so the dispatch stashes
+    /// the constant here like `scale_den`; a native LOAD slot adds it to `folded_raw_bus`. Zero under the
+    /// trampoline (no native slots read it). Past the disp8 range, so the emit reads it by disp32.
+    pub fold_bus_cost: u64,
 }
 
 impl RegionCtx {
