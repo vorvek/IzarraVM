@@ -32,9 +32,13 @@ mod pci;
 
 pub(crate) use pci::PciConfig;
 mod ram_lookup;
+mod timing;
 mod video_params;
 
 pub(crate) use ram_lookup::RamPageLookup;
+pub(crate) use timing::{
+    DAC_HZ, OPL_NATIVE_HZ, PIT_INPUT_HZ, WSS_AUTOCAL_FALLBACK_HZ,
+};
 
 #[allow(unused_imports)]
 pub(crate) use video_params::{
@@ -233,18 +237,7 @@ pub enum StopReason {
     },
 }
 
-/// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
-const OPL_NATIVE_HZ: u32 = 49_716;
-const DAC_HZ: u32 = 44_100;
-/// Standard PC PIT input clock frequency.
-const PIT_INPUT_HZ: u32 = 1_193_182;
-/// Fallback cadence (Hz) for retiring the AD1848 autocal (ACI) window when the
-/// programmed sample rate is one of the two unsupported XTAL1 selects
-/// (`rate_hz()==0`). On real hardware the autocal converter clock retires the
-/// ~128-sample window regardless of the programmed rate; this is only used to
-/// clock the ACI countdown, never to produce audio. 8000 Hz is the lowest
-/// documented WSS rate (XTAL1, CFS=0).
-const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
