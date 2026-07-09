@@ -1021,6 +1021,7 @@ pub struct Machine {
     dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
     dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
     dsp_sample_phase: f64, // fractional DSP samples owed to the DMA playback clock
+    last_audio_clocks: u64, // for HLE guest-time driven sample counts in render (Phase 4)
     mixer: SbMixer,   // the CT1745 mixer: IRQ/DMA routing + volume attenuation
     // AD1848 / Windows Sound System codec. An always-on combo-card device that
     // decodes its own base/IRQ/DMA concurrently with the SB16 + OPL3 (no mode
@@ -1328,6 +1329,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
+            last_audio_clocks: 0,
             mixer,
             wss,
             // Placeholder; sync_wss_resampler rebuilds this for the live rate on
@@ -8106,11 +8108,21 @@ impl Machine {
             .collect();
         let opl_out = self.resampler.process(&opl_native);
 
+        // HLE: drive DSP/WSS sample counts from guest elapsed clocks * their
+        // programmed rate when possible (Phase 4). Falls back to OPL-scaled for
+        // wall-driven calls when no guest time advanced. This makes production
+        // tied to guest DMA/PIT time rather than host callback scaling.
+        let clock_hz = self.profile().clock_hz;
+        let delta = self.elapsed_clocks.saturating_sub(self.last_audio_clocks);
+        self.last_audio_clocks = self.elapsed_clocks;
         self.sync_dsp_resampler();
-        // DSP native samples spanning the same wall-clock window as the OPL.
-        let dsp_native_count = (native_samples as f64 * self.dsp.output_frame_rate() as f64
-            / OPL_NATIVE_HZ as f64)
-            .round() as usize;
+        let dsp_native_count = if delta > 0 {
+            let r = self.dsp.output_frame_rate() as u64;
+            ((delta as f64 * r as f64 / clock_hz as f64).round() as usize).max(1)
+        } else {
+            (native_samples as f64 * self.dsp.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
+                .round() as usize
+        };
         // The DSP already produces stereo frames; widen to i32 and resample.
         let dsp_stereo: Vec<(i32, i32)> = self
             .render_dsp_audio(dsp_native_count)
@@ -8125,9 +8137,13 @@ impl Machine {
         // is summed directly below WITHOUT the SB16 master/voice/outgain scaling.
         let wss_out = if self.wss_enabled {
             self.sync_wss_resampler();
-            let wss_native_count = (native_samples as f64 * self.wss.output_frame_rate() as f64
-                / OPL_NATIVE_HZ as f64)
-                .round() as usize;
+            let wss_native_count = if delta > 0 {
+                let r = self.wss.output_frame_rate() as u64;
+                ((delta as f64 * r as f64 / clock_hz as f64).round() as usize).max(1)
+            } else {
+                (native_samples as f64 * self.wss.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
+                    .round() as usize
+            };
             let wss_stereo: Vec<(i32, i32)> = self
                 .render_wss_audio(wss_native_count)
                 .iter()
