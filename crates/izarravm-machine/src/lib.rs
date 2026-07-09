@@ -8554,10 +8554,10 @@ impl Machine {
                 // speaker. At card_amp == 1.0 this is bit-identical to the pre-amp
                 // mix (`... as i32 + wl + s + cl`), since a whole f32 casts back
                 // unchanged and integer addition commutes.
-                let card_l =
-                    (((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + cl) as f32 * card_amp;
-                let card_r =
-                    (((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + cr) as f32 * card_amp;
+                let card_l = (((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + cl) as f32
+                    * card_amp;
+                let card_r = (((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + cr) as f32
+                    * card_amp;
                 let l = clamp_i16(card_l as i32 + s);
                 let r = clamp_i16(card_r as i32 + s);
                 (l, r)
@@ -10216,13 +10216,15 @@ impl CpuBus for MachineBus<'_> {
             // port is the single source of truth). Other bits read 0.
             return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
         }
-        if port == 0x0201 {
+        if (0x0200..=0x0207).contains(&port) {
             // Game port with no joystick attached: the four one-shot axis timers
             // (bits 0-3) have no pots to charge through so they read expired (0),
             // and the button inputs (bits 4-7) float high (open switches,
             // active-low) -- the same absent-joystick answer INT 15h AH=84h gives.
             // A routine joystick probe must see "no joystick", not an
-            // UnsupportedPort fault that halts the machine.
+            // UnsupportedPort fault that halts the machine. The ISA gameport
+            // decodes the whole 0x200-0x207 range as aliases of one register
+            // (TSUMERA probes 0x200, not 0x201).
             return Ok(0xf0);
         }
         if let Some(value) = self.unittester.read_port(port) {
@@ -10371,9 +10373,10 @@ impl CpuBus for MachineBus<'_> {
             self.keyboard.set_a20(value & 0x02 != 0);
             return Ok(());
         }
-        if port == 0x0201 {
-            // Game port: an OUT fires the four axis one-shots. With no joystick
-            // they expire immediately, so there is no state to keep.
+        if (0x0200..=0x0207).contains(&port) {
+            // Game port (0x200-0x207 aliases): an OUT fires the four axis
+            // one-shots. With no joystick they expire immediately, so there is
+            // no state to keep.
             return Ok(());
         }
         if port == 0x00e1 {
@@ -14503,6 +14506,12 @@ mod tests {
         assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xf0);
         bus.write_io(0x0201, BusWidth::Byte, 0xff, false).unwrap();
         assert_eq!(bus.read_io(0x0201, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+        // The ISA gameport decodes 0x200-0x207 as aliases of the one register;
+        // TSUMERA probes 0x200. Both ends of the range answer, IN and OUT.
+        for port in [0x0200, 0x0207] {
+            bus.write_io(port, BusWidth::Byte, 0xff, false).unwrap();
+            assert_eq!(bus.read_io(port, BusWidth::Byte, 0, false).unwrap(), 0xf0);
+        }
     }
 
     #[test]
