@@ -1,0 +1,784 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+use super::*;
+
+impl CpuGsw {
+    #[inline]
+    pub(super) fn record_data_read(&mut self, kind: BusAccessKind, direct: bool) {
+        if kind == BusAccessKind::DataRead {
+            if direct {
+                self.perf.data_direct_reads += 1;
+            } else {
+                self.perf.data_slow_reads += 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn record_data_write(&mut self, kind: BusAccessKind, direct: bool) {
+        if kind == BusAccessKind::DataWrite {
+            if direct {
+                self.perf.data_direct_writes += 1;
+            } else {
+                self.perf.data_slow_writes += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn read_direct_entry(entry: DirectPageCacheEntry, physical: u32, width: BusWidth) -> u32 {
+        let offset = (physical & 0x0fff) as usize;
+        let ptr = unsafe { entry.ptr.add(offset) };
+        match width {
+            BusWidth::Byte => unsafe { u32::from(*ptr) },
+            BusWidth::Word => unsafe {
+                u32::from(u16::from_le(std::ptr::read_unaligned(ptr.cast::<u16>())))
+            },
+            BusWidth::Dword => unsafe { u32::from_le(std::ptr::read_unaligned(ptr.cast::<u32>())) },
+        }
+    }
+
+    #[inline]
+    fn write_direct_entry(entry: DirectPageCacheEntry, physical: u32, width: BusWidth, value: u32) {
+        let offset = (physical & 0x0fff) as usize;
+        let ptr = unsafe { entry.ptr.add(offset) };
+        match width {
+            BusWidth::Byte => unsafe {
+                *ptr = value as u8;
+            },
+            BusWidth::Word => unsafe {
+                std::ptr::write_unaligned(ptr.cast::<u16>(), (value as u16).to_le());
+            },
+            BusWidth::Dword => unsafe {
+                std::ptr::write_unaligned(ptr.cast::<u32>(), value.to_le());
+            },
+        }
+    }
+
+    #[inline]
+    fn direct_access_page_local(physical: u32, width: BusWidth) -> bool {
+        let offset = (physical & 0x0fff) as usize;
+        if offset + width.bytes() as usize > 0x1000 {
+            return false;
+        }
+        match width {
+            BusWidth::Byte => true,
+            BusWidth::Word => physical & 1 == 0,
+            BusWidth::Dword => physical & 3 == 0,
+        }
+    }
+
+    #[inline]
+    pub(super) fn read_direct_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u32>> {
+        if !Self::direct_access_page_local(physical, width) {
+            return Ok(None);
+        }
+        if let Some(entry) = self.data_read_pages.get(physical) {
+            bus.charge_direct_memory(physical, width, kind)?;
+            self.record_data_read(kind, true);
+            self.perf.direct_data_pointer_reads += 1;
+            return Ok(Some(Self::read_direct_entry(entry, physical, width)));
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if offset + width.bytes() as usize > page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_read_pages.insert(page);
+        bus.charge_direct_memory(physical, width, kind)?;
+        self.record_data_read(kind, true);
+        self.perf.direct_data_pointer_reads += 1;
+        Ok(Some(Self::read_direct_entry(
+            DirectPageCacheEntry {
+                physical_page: page.physical_page,
+                ptr: page.ptr,
+            },
+            physical,
+            width,
+        )))
+    }
+
+    #[inline]
+    fn read_direct_byte_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u8>> {
+        if let Some(entry) = self.data_read_pages.get(physical) {
+            bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+            self.record_data_read(kind, true);
+            self.perf.direct_data_pointer_reads += 1;
+            let offset = (physical & 0x0fff) as usize;
+            return Ok(Some(unsafe { *entry.ptr.add(offset) }));
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if offset >= page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(None);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_read_pages.insert(page);
+        bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+        self.record_data_read(kind, true);
+        self.perf.direct_data_pointer_reads += 1;
+        Ok(Some(unsafe { *page.ptr.add(offset) }))
+    }
+
+    #[inline]
+    pub(super) fn write_direct_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<bool> {
+        if !Self::direct_access_page_local(physical, width) {
+            return Ok(false);
+        }
+        if let Some(entry) = self.data_write_pages.get(physical) {
+            bus.charge_direct_memory(physical, width, kind)?;
+            Self::write_direct_entry(entry, physical, width, value);
+            self.record_data_write(kind, true);
+            self.perf.direct_data_pointer_writes += 1;
+            return Ok(true);
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if !page.writable || offset + width.bytes() as usize > page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_write_pages.insert(page);
+        bus.charge_direct_memory(physical, width, kind)?;
+        Self::write_direct_entry(
+            DirectPageCacheEntry {
+                physical_page: page.physical_page,
+                ptr: page.ptr,
+            },
+            physical,
+            width,
+            value,
+        );
+        self.record_data_write(kind, true);
+        self.perf.direct_data_pointer_writes += 1;
+        Ok(true)
+    }
+
+    #[inline]
+    fn write_direct_byte_page_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<bool> {
+        if let Some(entry) = self.data_write_pages.get(physical) {
+            bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+            let offset = (physical & 0x0fff) as usize;
+            unsafe {
+                *entry.ptr.add(offset) = value;
+            }
+            self.record_data_write(kind, true);
+            self.perf.direct_data_pointer_writes += 1;
+            return Ok(true);
+        }
+        let Some(page) = bus.direct_page(physical, kind)? else {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        };
+        let offset = (physical & 0x0fff) as usize;
+        if !page.writable || offset >= page.len {
+            self.perf.direct_page_misses += 1;
+            return Ok(false);
+        }
+        self.perf.direct_page_hits += 1;
+        self.data_write_pages.insert(page);
+        bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+        unsafe {
+            *page.ptr.add(offset) = value;
+        }
+        self.record_data_write(kind, true);
+        self.perf.direct_data_pointer_writes += 1;
+        Ok(true)
+    }
+    // (`read_rm_u8` was removed with the legacy 0x84 TEST r/m8,reg8 handler — its only remaining
+    // caller. The converted flags-misc executor reads the byte r/m via `read_operand_u8` on the
+    // pre-decoded operand instead. `write_rm_u8` was removed earlier with the legacy 0x88 MOV
+    // r/m8,r8 handler. The sized/read siblings remain in use by the fallback handlers.)
+
+    pub(super) fn read_operand_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+    ) -> ExecResult<u8> {
+        match operand {
+            RmOperand::Register(index) => Ok(self.read_gpr8(index)),
+            RmOperand::Memory(memory) => {
+                self.read_memory_u8(bus, memory.segment, memory.offset, BusAccessKind::DataRead)
+            }
+        }
+    }
+
+    pub(super) fn write_operand_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+        value: u8,
+    ) -> ExecResult<()> {
+        match operand {
+            RmOperand::Register(index) => {
+                self.write_gpr8(index, value);
+                Ok(())
+            }
+            RmOperand::Memory(memory) => self.write_memory_u8(
+                bus,
+                memory.segment,
+                memory.offset,
+                value,
+                BusAccessKind::DataWrite,
+            ),
+        }
+    }
+
+    pub(super) fn read_operand_sized<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+        size: OperandSize,
+    ) -> ExecResult<u32> {
+        match operand {
+            RmOperand::Register(index) => Ok(self.read_gpr_sized(index, size)),
+            RmOperand::Memory(memory) => self.read_memory_sized(
+                bus,
+                memory.segment,
+                memory.offset,
+                size,
+                BusAccessKind::DataRead,
+            ),
+        }
+    }
+
+    pub(super) fn write_operand_sized<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+        size: OperandSize,
+        value: u32,
+    ) -> ExecResult<()> {
+        match operand {
+            RmOperand::Register(index) => {
+                self.write_gpr_sized(index, size, value);
+                Ok(())
+            }
+            RmOperand::Memory(memory) => self.write_memory_sized(
+                bus,
+                memory.segment,
+                memory.offset,
+                size,
+                value,
+                BusAccessKind::DataWrite,
+            ),
+        }
+    }
+
+    pub(super) fn read_memory_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<u8> {
+        let linear = self.segment_linear_byte(segment, offset, false)?;
+        let physical = if self.control.cr0 & CR0_PG == 0 {
+            linear
+        } else {
+            self.translate_linear(bus, linear, false)?
+        };
+        if let Some(value) = self.read_direct_byte_page_cached(bus, physical, kind)? {
+            return Ok(value);
+        }
+        let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
+        self.record_data_read(kind, read.direct);
+        Ok(read.value as u8)
+    }
+
+    pub(super) fn write_memory_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        let linear = self.segment_linear_byte(segment, offset, true)?;
+        let physical = if self.control.cr0 & CR0_PG == 0 {
+            self.record_write_page(linear);
+            linear
+        } else {
+            self.translate_linear(bus, linear, true)?
+        };
+        self.note_code_write(physical, 1);
+        if self.write_direct_byte_page_cached(bus, physical, value, kind)? {
+            return Ok(());
+        }
+        let write = bus.write_memory_direct(physical, BusWidth::Byte, u32::from(value), kind)?;
+        self.record_data_write(kind, write.direct);
+        Ok(())
+    }
+
+    /// Validate a data access's *kind* against the segment descriptor's type field: a
+    /// write through a read-only data segment, or any access through an execute-only
+    /// code segment loaded into a data-segment register, is #GP (386 PRM 5-12, "Data
+    /// segments can be read-only or read/write... Code segments can be execute-only or
+    /// execute/read"). Real mode and V86 mode always carry the fully-permissive
+    /// `access = 0x93` (`SegmentRegister::real`), so this only ever rejects something in
+    /// protected mode; the caller gates on that to skip the check entirely otherwise.
+    /// Instruction fetch never routes through here (it uses `code_linear_for_offset`),
+    /// so CS's own readability never needs checking on this path -- only the case of a
+    /// *data* segment register (DS/ES/FS/GS/SS) that happens to hold a code descriptor.
+    fn check_segment_access_kind(
+        &self,
+        segment: SegmentIndex,
+        access: u8,
+        write: bool,
+    ) -> ExecResult<()> {
+        if !self.is_protected_mode() || self.is_v86_mode() {
+            return Ok(());
+        }
+        let is_code = access & 0x08 != 0; // descriptor type bit 3
+        let ok = if is_code {
+            // A code descriptor addressed as data: legal only for a read, and only if
+            // the code segment's readable bit (type bit 1) is set.
+            !write && access & 0x02 != 0
+        } else {
+            // A data descriptor: legal for a read always; a write needs the writable
+            // bit (type bit 1) set.
+            !write || access & 0x02 != 0
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(segment_limit_fault(segment))
+        }
+    }
+
+    #[inline]
+    fn segment_linear_byte(
+        &self,
+        segment: SegmentIndex,
+        offset: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
+        let descriptor = self.registers.segment(segment);
+        self.check_segment_access_kind(segment, descriptor.access, write)?;
+        if descriptor.base == 0 && descriptor.limit == u32::MAX {
+            return Ok(offset);
+        }
+        let expand_down = self.is_protected_mode()
+            && !self.is_v86_mode()
+            && descriptor.access & 0x18 == 0x10
+            && descriptor.access & 0x04 != 0;
+        let in_limit = if expand_down {
+            // 386 PRM 5-12: an expand-down segment's valid offsets are those ABOVE the
+            // limit (up to 0xffff, or 0xffff_ffff for a 32-bit-default segment), the
+            // reverse of the normal sense.
+            let ceiling = if descriptor.default_size_32 {
+                u32::MAX
+            } else {
+                0xffff
+            };
+            offset > descriptor.limit && offset <= ceiling
+        } else {
+            offset <= descriptor.limit
+        };
+        if !in_limit {
+            return Err(segment_limit_fault(segment));
+        }
+        Ok(descriptor.base.wrapping_add(offset))
+    }
+
+    pub(super) fn read_memory_sized<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        size: OperandSize,
+        kind: BusAccessKind,
+    ) -> ExecResult<u32> {
+        self.check_alignment(offset, size.bytes())?;
+        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), false)?;
+        if let Some(value) = self.read_direct_page_cached(bus, physical, size.bus_width(), kind)? {
+            return Ok(value);
+        }
+        let read = bus.read_memory_direct(physical, size.bus_width(), kind)?;
+        self.record_data_read(kind, read.direct);
+        Ok(read.value)
+    }
+
+    pub(super) fn write_memory_sized<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        size: OperandSize,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        self.check_alignment(offset, size.bytes())?;
+        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), true)?;
+        if self.write_direct_page_cached(bus, physical, size.bus_width(), value, kind)? {
+            return Ok(());
+        }
+        let write = bus.write_memory_direct(physical, size.bus_width(), value, kind)?;
+        self.record_data_write(kind, write.direct);
+        Ok(())
+    }
+
+    // #AC alignment check (486). A data access faults vector 17 (no error code) when
+    // CR0.AM and EFLAGS.AC are both set and the access runs at CPL 3, and the effective
+    // address is not naturally aligned for its width (word on a 2-byte boundary, dword on
+    // a 4-byte boundary). Supervisor accesses (CPL < 3) and instruction fetches are exempt;
+    // fetches never route through this helper. Byte accesses (width 1) are always aligned.
+    fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
+        if width <= 1 || !self.alignment_armed {
+            return Ok(());
+        }
+        if self.current_privilege_level() == 3 && offset % width != 0 {
+            // Real 486 #AC pushes a zero error code; this core models it without one,
+            // matching the rest of the spec's fault contract. Flagged as a divergence.
+            return Err(InternalFault::Exception {
+                vector: 17,
+                error_code: None,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn translate_segmented<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        width: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
+        let descriptor = self.registers.segment(segment);
+        self.check_segment_access_kind(segment, descriptor.access, write)?;
+        let linear = if descriptor.base == 0 && descriptor.limit == u32::MAX {
+            offset
+        } else {
+            let last = offset.saturating_add(width.saturating_sub(1));
+            let expand_down = self.is_protected_mode()
+                && !self.is_v86_mode()
+                && descriptor.access & 0x18 == 0x10
+                && descriptor.access & 0x04 != 0;
+            let in_limit = if expand_down {
+                let ceiling = if descriptor.default_size_32 {
+                    u32::MAX
+                } else {
+                    0xffff
+                };
+                offset > descriptor.limit && last <= ceiling
+            } else {
+                offset <= descriptor.limit && last <= descriptor.limit
+            };
+            if !in_limit {
+                return Err(segment_limit_fault(segment));
+            }
+            descriptor.base.wrapping_add(offset)
+        };
+        let physical = if self.control.cr0 & CR0_PG == 0 {
+            if write {
+                self.record_write_page(linear);
+            }
+            linear
+        } else {
+            self.translate_linear(bus, linear, write)?
+        };
+        if write {
+            self.note_code_write(physical, width);
+        }
+        Ok(physical)
+    }
+
+    pub(super) fn translate_linear<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
+        self.translate_linear_checked(bus, linear, write, PagingAccessor::Current)
+    }
+
+    /// Like `translate_linear`, but for accesses to descriptor tables (GDT/LDT/IDT)
+    /// and TSS fields during exception delivery, segment loads, and task switches.
+    /// These are architecturally implicit supervisor accesses (386 PRM 6.2, 7.2):
+    /// the processor consults them to set up or validate a privilege transition, so
+    /// they must not be checked against the CPL of the code that triggered the
+    /// transition. A V86 task (always CPL 3) or a ring-3 CS delivering through an
+    /// interrupt gate must be able to read its own TSS/GDT even when those pages
+    /// are marked supervisor-only (U/S=0), exactly as real silicon does. Forcing
+    /// `user = false` here also means a WP-clear supervisor write (the 386 default)
+    /// is never blocked by a read-only system-structure page.
+    pub(super) fn translate_linear_system<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        write: bool,
+    ) -> ExecResult<u32> {
+        self.translate_linear_checked(bus, linear, write, PagingAccessor::Supervisor)
+    }
+
+    fn translate_linear_checked<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        write: bool,
+        accessor: PagingAccessor,
+    ) -> ExecResult<u32> {
+        if !self.is_paging_enabled() {
+            if write {
+                self.record_write_page(linear);
+            }
+            return Ok(linear);
+        }
+
+        // Paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor. A
+        // system-structure access is forced supervisor regardless of the current
+        // CPL (see `translate_linear_system`).
+        let user = match accessor {
+            // CPL is the cached quantity (`current_privilege_level`/`self.cpl`), not a live
+            // read of CS.selector -- see that method for why a live formula misclassifies
+            // the monitor's own ring-0 stack pushes as user during V86-source exception
+            // delivery (source CS's RPL bits are irrelevant once cpl has already been set
+            // to the entered level).
+            PagingAccessor::Current => self.current_privilege_level() == 3,
+            PagingAccessor::Supervisor => false,
+        };
+        // CR0.WP (a 486 addition) makes supervisor writes obey the page R/W bit too.
+        // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
+        let wp = self.control.cr0 & CR0_WP != 0;
+
+        // TLB fast path: a cached entry skips the two page-table reads (and the
+        // accessed-bit write the fill already did). The protection check is redone
+        // from the cached page bits against the *current* accessor (CPL can change
+        // without a flush); WP changes flush, so `wp` is consistent within a
+        // generation. A write to a page whose dirty bit is not yet set falls through
+        // to the walk so the PTE's D bit is updated.
+        let page = linear >> 12;
+        if let Some(e) = self.tlb.lookup(page) {
+            let protection_fault = if user {
+                !e.user || (write && !e.writable)
+            } else {
+                write && wp && !e.writable
+            };
+            if protection_fault {
+                self.control.cr2 = linear;
+                return Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(page_fault_code(true, write, user)),
+                });
+            }
+            // Serve the hit for a read, or a write to an already-dirty page.
+            if !write || e.dirty {
+                let physical = e.phys | (linear & 0x0000_0fff);
+                if write {
+                    self.record_write_page(physical);
+                }
+                return Ok(physical);
+            }
+        }
+
+        let directory = self.control.cr3 & 0xffff_f000;
+        let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
+        let mut pde = bus.read_memory(
+            directory_address,
+            BusWidth::Dword,
+            BusAccessKind::PageWalkRead,
+        )?;
+        if pde & 1 == 0 {
+            self.control.cr2 = linear;
+            return Err(InternalFault::Exception {
+                vector: 14,
+                error_code: Some(page_fault_code(false, write, user)),
+            });
+        }
+        if pde & 0x20 == 0 {
+            pde |= 0x20;
+            bus.write_memory(
+                directory_address,
+                BusWidth::Dword,
+                pde,
+                BusAccessKind::PageWalkWrite,
+            )?;
+        }
+
+        let table_address = (pde & 0xffff_f000) + (((linear >> 12) & 0x03ff) * 4);
+        let mut pte =
+            bus.read_memory(table_address, BusWidth::Dword, BusAccessKind::PageWalkRead)?;
+        if pte & 1 == 0 {
+            self.control.cr2 = linear;
+            return Err(InternalFault::Exception {
+                vector: 14,
+                error_code: Some(page_fault_code(false, write, user)),
+            });
+        }
+
+        // Protection check. The combined R/W and U/S come from ANDing the PDE and
+        // PTE bits (bit 1 and bit 2). A page is user-accessible only if both U/S
+        // bits are set, and writable only if both R/W bits are set.
+        //   - A user access faults if it touches a supervisor page, or writes a
+        //     read-only page.
+        //   - A supervisor write faults only when CR0.WP is set and the page is
+        //     read-only (combined R/W = 0). With WP clear, supervisor writes pass.
+        // Either way the fault is present=1 and the error-code U/S bit reflects the
+        // access (user), not the page. Checked before the dirty bit is set so a
+        // faulting write leaves it clear.
+        let writable = pde & pte & 0x2 != 0;
+        let user_accessible = pde & pte & 0x4 != 0;
+        let protection_fault = if user {
+            !user_accessible || (write && !writable)
+        } else {
+            write && wp && !writable
+        };
+        if protection_fault {
+            self.control.cr2 = linear;
+            return Err(InternalFault::Exception {
+                vector: 14,
+                error_code: Some(page_fault_code(true, write, user)),
+            });
+        }
+
+        let dirty = if write { 0x40 } else { 0 };
+        let accessed_dirty = 0x20 | dirty;
+        if pte & accessed_dirty != accessed_dirty {
+            pte |= accessed_dirty;
+            bus.write_memory(
+                table_address,
+                BusWidth::Dword,
+                pte,
+                BusAccessKind::PageWalkWrite,
+            )?;
+        }
+
+        // Cache the completed translation. Only reached on the success path, so a
+        // page that faulted (not present / protection) is never cached. `dirty`
+        // records whether the PTE's D bit is now set, so a later read hits but a
+        // first write to a still-clean page re-walks to set it.
+        self.tlb.insert(
+            page,
+            pte & 0xffff_f000,
+            writable,
+            user_accessible,
+            pte & 0x40 != 0,
+        );
+
+        let physical = (pte & 0xffff_f000) | (linear & 0x0000_0fff);
+        if write {
+            self.record_write_page(physical);
+        }
+        Ok(physical)
+    }
+
+    pub(super) fn push<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        value: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        let width = operand_size.bytes();
+        // The write PRECEDES the (E)SP commit: a push whose stack write faults
+        // (#PF on a not-yet-committed stack page under a lazy-commit DPMI host,
+        // or a #GP/#SS limit violation) must leave (E)SP at its pre-instruction
+        // value so the post-handler restart re-executes cleanly. Committing
+        // first left ESP decremented across the fault; CWSDPMI's commit-and-
+        // retry stack growth then double-decremented, shifting every later
+        // stack slot one down and handing DJGPP code shifted callee-saved
+        // registers on the next epilogue (found via Quake's crt1
+        // setup_environment crash).
+        if self.stack_is_32bit() {
+            // SS.B=1: implicit stack references use the full 32-bit ESP, for both
+            // 16-bit and 32-bit operand-size pushes (386 PRM 16.2: the B bit picks
+            // the stack-pointer width, independent of operand size).
+            let esp = self.registers.esp().wrapping_sub(width);
+            self.write_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                esp,
+                operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )?;
+            self.registers.set_esp(esp);
+        } else {
+            // SS.B=0 (real mode, V86, or a 16-bit protected-mode stack): the address
+            // comes from SP only, only SP advances, and ESP's high word is preserved
+            // (real silicon wraps SP, not ESP, on this stack).
+            let sp = self.read_gpr16(4).wrapping_sub(width as u16);
+            self.write_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                u32::from(sp),
+                operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )?;
+            self.write_gpr16(4, sp);
+        }
+        Ok(())
+    }
+
+    pub(super) fn pop<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand_size: OperandSize,
+    ) -> ExecResult<u32> {
+        let width = operand_size.bytes();
+        if self.stack_is_32bit() {
+            let esp = self.registers.esp();
+            let value = self.read_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                esp,
+                operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.registers.set_esp(esp.wrapping_add(width));
+            Ok(value)
+        } else {
+            // SS.B=0: read from SP and advance only SP, preserving ESP's high word.
+            let sp = self.read_gpr16(4);
+            let value = self.read_memory_sized(
+                bus,
+                SegmentIndex::Ss,
+                u32::from(sp),
+                operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.write_gpr16(4, sp.wrapping_add(width as u16));
+            Ok(value)
+        }
+    }
+}
