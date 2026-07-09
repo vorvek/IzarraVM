@@ -9941,6 +9941,83 @@ impl Cpu386 {
             self.is_v86_mode(),
             self.current_privilege_level(),
         );
+        // A selector-format error code names a descriptor; dump it (plus the
+        // vector-13 IDT gate, the CS descriptor, and the stack top) so a
+        // segment-load #GP shows WHY without a rebuild. This is what pinned
+        // the DPMI32VM ring-transition bug: the saved-DS slot on the ring-3
+        // stack held a ring-0 selector the IRET should have nulled.
+        if let Some(ec) = error_code {
+            let index = ec & 0xFFF8;
+            let (table, base) = if ec & 0x4 != 0 {
+                ("LDT", self.ldtr.base)
+            } else {
+                ("GDT", self.gdtr.base)
+            };
+            let mut desc = [0u8; 8];
+            for (i, b) in desc.iter_mut().enumerate() {
+                if let Ok(phys) = self.translate_linear(bus, base + index + i as u32, false) {
+                    if let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead) {
+                        *b = v as u8;
+                    }
+                }
+            }
+            eprintln!(
+                "fault trace: {table} base={base:#010x} desc[{index:#x}]={desc:02x?} gdtr={:#010x}/{:#06x}",
+                self.gdtr.base, self.gdtr.limit
+            );
+            let cs_sel = u32::from(self.registers.cs().selector);
+            let (tb, tag) = if cs_sel & 4 != 0 {
+                (self.ldtr.base, "LDT")
+            } else {
+                (self.gdtr.base, "GDT")
+            };
+            let targets = [
+                ("IDT gate 13", self.idtr.base + 13 * 8),
+                ("CS desc", tb + (cs_sel & 0xFFF8)),
+            ];
+            for (label, addr) in targets {
+                let mut d = [0u8; 8];
+                for (i, b) in d.iter_mut().enumerate() {
+                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false) {
+                        if let Ok(v) =
+                            bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
+                        {
+                            *b = v as u8;
+                        }
+                    }
+                }
+                eprintln!("fault trace: {label} ({tag}) @{addr:#010x} = {d:02x?}");
+            }
+            eprintln!(
+                "fault trace: ldtr sel={:#06x} base={:#010x} tr sel={:#06x} ss={:#06x} esp={:#010x}",
+                self.ldtr.selector,
+                self.ldtr.base,
+                self.tr.selector,
+                self.registers.segment(SegmentIndex::Ss).selector,
+                self.registers.esp(),
+            );
+            let ss_base = self.registers.segment(SegmentIndex::Ss).base;
+            let start = ss_base + (self.registers.esp() & !0xF).saturating_sub(16);
+            let mut stack = [0u8; 96];
+            for (i, b) in stack.iter_mut().enumerate() {
+                if let Ok(phys) = self.translate_linear(bus, start + i as u32, false) {
+                    if let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead) {
+                        *b = v as u8;
+                    }
+                }
+            }
+            for (row, chunk) in stack.chunks(16).enumerate() {
+                let words: Vec<String> = chunk
+                    .chunks(2)
+                    .map(|w| format!("{:02x}{:02x}", w[1], w[0]))
+                    .collect();
+                eprintln!(
+                    "fault trace: stack {:#010x}: {}",
+                    start + row as u32 * 16,
+                    words.join(" ")
+                );
+            }
+        }
     }
 
     fn deliver_exception<B: CpuBus>(
@@ -10273,6 +10350,7 @@ impl Cpu386 {
                     // PRM transition point: the target RPL (checked above, non-V86) is the
                     // new CPL.
                     self.cpl = (cs & 3) as u8;
+                    self.invalidate_data_segments_below_cpl();
                     return Ok(());
                 }
 
@@ -10283,6 +10361,39 @@ impl Cpu386 {
             }
         }
         Ok(())
+    }
+
+    /// 386 PRM (IRET / RET to an outer privilege level): after the CPL drops,
+    /// each of DS/ES/FS/GS holding a data segment or non-conforming code
+    /// segment whose DPL < the new CPL is loaded with the null selector, so
+    /// the outer ring cannot keep using an inner ring's segments. Conforming
+    /// code segments are exempt (accessible from any CPL). DPMI hosts rely on
+    /// this: their ring-0 handlers IRET to ring 3 with kernel selectors still
+    /// in DS, and the ring-3 code PUSH/POPs the (nulled) register afterwards.
+    fn invalidate_data_segments_below_cpl(&mut self) {
+        for segment in [
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Fs,
+            SegmentIndex::Gs,
+        ] {
+            let reg = self.registers.segment(segment);
+            if reg.selector & 0xfffc == 0 {
+                continue; // already null
+            }
+            let access = reg.access;
+            let conforming_code = access & 0x0c == 0x0c;
+            let dpl = (access >> 5) & 3;
+            if !conforming_code && dpl < self.cpl {
+                self.registers.set_segment(
+                    segment,
+                    SegmentRegister {
+                        selector: 0,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
     }
 
     fn far_call<B: CpuBus>(
@@ -33203,6 +33314,47 @@ mod tests {
         assert_eq!(cpu.registers.cs().selector, r3_cs);
         assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, r3_ss);
         assert_eq!(cpu.registers.esp(), 0x2000);
+    }
+
+    #[test]
+    fn iret_to_outer_ring_nulls_data_segments_inaccessible_at_the_new_cpl() {
+        // 386 PRM (IRET, return to outer privilege level): each of DS/ES/FS/GS
+        // holding a data or non-conforming code segment with DPL < new CPL is
+        // loaded with the null selector. Borland's DPMI32VM relies on this: its
+        // ring-0 trap handler IRETDs to ring 3 with DS still holding the ring-0
+        // data selector; ring-3 code then PUSH/POPs DS, which only works if the
+        // return nulled it (popping a DPL-0 selector at CPL 3 is #GP).
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        let r3_code = descriptor(0, 0xfffff, 0xfb, 0xc0);
+        let r3_data = descriptor(0, 0xfffff, 0xf3, 0xc0);
+        // Conforming ring-0 code (access 0x9f): readable at any CPL, must survive.
+        let r0_conforming = descriptor(0, 0xfffff, 0x9f, 0xc0);
+        bus.memory[(GDT + 0x20) as usize..(GDT + 0x20) as usize + 8].copy_from_slice(&r3_code);
+        bus.memory[(GDT + 0x28) as usize..(GDT + 0x28) as usize + 8].copy_from_slice(&r3_data);
+        bus.memory[(GDT + 0x30) as usize..(GDT + 0x30) as usize + 8]
+            .copy_from_slice(&r0_conforming);
+        cpu.registers.eflags = 0x2;
+        cpu.load_segment(&mut bus, SegmentIndex::Cs, R0_CS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ss, R0_SS).unwrap();
+        cpu.load_segment(&mut bus, SegmentIndex::Ds, R0_SS).unwrap(); // ring-0 data
+        cpu.load_segment(&mut bus, SegmentIndex::Es, 0x2B).unwrap(); // ring-3 data
+        cpu.load_segment(&mut bus, SegmentIndex::Fs, R0_SS).unwrap(); // ring-0 data
+        cpu.load_segment(&mut bus, SegmentIndex::Gs, 0x33).unwrap(); // conforming r0 code
+        cpu.registers.set_esp(0x6800);
+        for v in [0x2Bu32, 0x2000, 0x2, 0x23, 0x1234] {
+            cpu.push(&mut bus, v, OperandSize::Dword).unwrap();
+        }
+        cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+        assert_eq!(cpu.current_privilege_level(), 3);
+        let sel = |cpu: &Cpu386, s| cpu.registers.segment(s).selector;
+        assert_eq!(sel(&cpu, SegmentIndex::Ds), 0, "ring-0 DS nulled");
+        assert_eq!(sel(&cpu, SegmentIndex::Fs), 0, "ring-0 FS nulled");
+        assert_eq!(sel(&cpu, SegmentIndex::Es), 0x2B, "ring-3 ES survives");
+        assert_eq!(
+            sel(&cpu, SegmentIndex::Gs),
+            0x33,
+            "conforming code GS survives"
+        );
     }
 
     #[test]
