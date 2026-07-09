@@ -1,0 +1,1553 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+use super::*;
+
+fn bit_op(op: u8, value: u32, bit: u32) -> (bool, u32) {
+    // op: 0=BT, 1=BTS, 2=BTR, 3=BTC. `bit` is already reduced to 0..bits-1 (the caller
+    // masks to the operand width, so 0..15 for a word and 0..31 for a dword).
+    let mask = 1u32 << bit;
+    let cf = value & mask != 0;
+    let new = match op {
+        0 => value,         // BT: read-only
+        1 => value | mask,  // BTS
+        2 => value & !mask, // BTR
+        3 => value ^ mask,  // BTC
+        _ => unreachable!("bit op {op}"),
+    };
+    (cf, new)
+}
+
+impl CpuGsw {
+    /// The two-byte bit-manipulation block (BT/BTS/BTR/BTC reg+imm8, BSF/BSR, SHLD/SHRD, CMPXCHG,
+    /// XADD) through the decode/execute split. Each arm mirrors the former `execute_two_byte`
+    /// handler verbatim — same operand wiring, same read/write order, same clocks — but consumes the
+    /// ModRM/operand `decode` pre-parsed and the imm8 `decode` pre-fetched (for 0F BA/A4/AC). Memory
+    /// operands resolve from the pre-decoded descriptor, so the effective address is recomputed
+    /// against the live registers each call; for the BT-memory reg form the live reg bit index can
+    /// walk the address past the operand width, which `bit_string_op` handles unchanged. Dispatch is
+    /// off the FULL u16 `insn.opcode` because the `as u8` low byte of 0x0Fa4/a5/b0/b1/c0/c1 aliases
+    /// single-byte opcodes; the second 0F byte is never re-read and the ISA gate is never re-applied
+    /// (both already done once in `decode`).
+    pub(super) fn execute_bitmanip_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+
+        match insn.opcode {
+            0x0fbc => {
+                // BSF: index of the lowest set bit. Source 0 -> ZF=1, destination unchanged
+                // (386 silicon; Intel documents the destination as undefined).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src =
+                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
+                if src == 0 {
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_flag(FLAG_ZF, false);
+                    self.write_gpr_sized(modrm.reg, operand_size, src.trailing_zeros());
+                }
+                Ok(clocks(10))
+            }
+            0x0fbd => {
+                // BSR: index of the highest set bit. Source 0 -> ZF=1, destination unchanged
+                // (386 silicon; Intel documents the destination as undefined).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src =
+                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
+                if src == 0 {
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_flag(FLAG_ZF, false);
+                    self.write_gpr_sized(modrm.reg, operand_size, 31 - src.leading_zeros());
+                }
+                Ok(clocks(10))
+            }
+            0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb => {
+                // BT/BTS/BTR/BTC r/m, r. The opcodes are 8 apart: A3=BT, AB=BTS, B3=BTR, BB=BTC.
+                // The bit index in the reg operand is signed for a memory operand; the adjusted
+                // address is computed inside `bit_string_op` from the live reg index (register_index
+                // = true), never pre-resolved at decode.
+                let op = ((insn.opcode as u8) - 0xa3) / 8;
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let index = self.read_gpr_sized(modrm.reg, operand_size);
+                self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
+                Ok(clocks(6))
+            }
+            0x0fba => {
+                // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 was fetched by
+                // `decode` (after the ModRM+displacement) into `insn.imm`. /0../3 are not defined
+                // bit-test ops and #UD before the operation runs (matching the fused handler, which
+                // resolved the operand and read the imm8 first, then faulted on the bad /ext).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                if modrm.reg < 4 {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let op = modrm.reg - 4;
+                self.bit_string_op(
+                    bus,
+                    op,
+                    operand,
+                    insn.imm,
+                    operand_size,
+                    address_size,
+                    false,
+                )?;
+                Ok(clocks(6))
+            }
+            0x0fa4 | 0x0fac => {
+                // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 count was fetched by `decode` into
+                // `insn.imm`. Read order (src reg, then dest r/m) matches the fused handler.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_gpr_sized(modrm.reg, operand_size);
+                let count = insn.imm as u8;
+                let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                let result =
+                    self.double_shift(insn.opcode == 0x0fa4, dest, src, count, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, result)?;
+                Ok(clocks(3))
+            }
+            0x0fa5 | 0x0fad => {
+                // SHLD (A5) / SHRD (AD) r/m, r, CL. No immediate — the count is the low byte of CL.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_gpr_sized(modrm.reg, operand_size);
+                let count = (self.registers.ecx() & 0xff) as u8;
+                let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                let result =
+                    self.double_shift(insn.opcode == 0x0fa5, dest, src, count, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, result)?;
+                Ok(clocks(3))
+            }
+            0x0fb0 | 0x0fb1 => {
+                // CMPXCHG r/m, r. B0 is the byte form, B1 the word/dword form. Compare the
+                // accumulator (AL/AX/EAX) with the destination exactly like CMP (acc - dest),
+                // setting every ALU flag from that subtraction. If they are equal (ZF set after
+                // the compare) the source register is stored into the destination; otherwise the
+                // destination value is loaded into the accumulator. Either way the destination is
+                // written once, which is what makes the LOCK form meaningful.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let size = if insn.opcode == 0x0fb0 {
+                    None
+                } else {
+                    Some(operand_size)
+                };
+                match size {
+                    None => {
+                        let dest = self.read_operand_u8(bus, operand)?;
+                        let acc = self.read_gpr8(0);
+                        self.alu_sub(u32::from(acc), u32::from(dest), 0, BusWidth::Byte);
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr8(modrm.reg);
+                            self.write_operand_u8(bus, operand, src)?;
+                        } else {
+                            self.write_gpr8(0, dest);
+                            // Re-write the destination with its own value so the bus sees a write
+                            // even on the unequal branch, matching the architectural read-modify-
+                            // write of CMPXCHG.
+                            self.write_operand_u8(bus, operand, dest)?;
+                        }
+                    }
+                    Some(size) => {
+                        let dest = self.read_operand_sized(bus, operand, size)?;
+                        let acc = self.read_gpr_sized(0, size);
+                        self.alu_sub(acc, dest, 0, size.bus_width());
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr_sized(modrm.reg, size);
+                            self.write_operand_sized(bus, operand, size, src)?;
+                        } else {
+                            self.write_gpr_sized(0, size, dest);
+                            self.write_operand_sized(bus, operand, size, dest)?;
+                        }
+                    }
+                }
+                Ok(clocks(6))
+            }
+            0x0fc0 | 0x0fc1 => {
+                // XADD r/m, r. C0 is the byte form, C1 the word/dword form. The exchange-and-add
+                // first saves the destination, then writes dest + src back to the destination and
+                // copies the saved destination into the source register. The flags come out
+                // exactly like ADD of the two operands (reuse alu_add).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                if insn.opcode == 0x0fc0 {
+                    let dest = self.read_operand_u8(bus, operand)?;
+                    let src = self.read_gpr8(modrm.reg);
+                    let sum =
+                        self.alu_add(u32::from(dest), u32::from(src), 0, BusWidth::Byte) as u8;
+                    self.write_operand_u8(bus, operand, sum)?;
+                    self.write_gpr8(modrm.reg, dest);
+                } else {
+                    let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                    let src = self.read_gpr_sized(modrm.reg, operand_size);
+                    let sum = self.alu_add(dest, src, 0, operand_size.bus_width());
+                    self.write_operand_sized(bus, operand, operand_size, sum)?;
+                    self.write_gpr_sized(modrm.reg, operand_size, dest);
+                }
+                Ok(clocks(4))
+            }
+            opcode => unreachable!("bit-manipulation opcode {opcode:#x}"),
+        }
+    }
+
+    /// The conditional-move / SETcc / two-operand IMUL block (A11) through the decode/execute split
+    /// (task A11). Mirrors the former fused arms in `execute_two_byte` verbatim — same condition
+    /// helper, same CMOVcc read-before-conditional-write, same SETcc byte-write, same
+    /// `imul_truncated` — but consumes the ModRM/operand pre-decoded by `decode` (no re-fetch).
+    /// Dispatches off the FULL u16 `insn.opcode` (0x0F40-0x0F4F, 0x0F90-0x0F9F, 0x0FAF) so the
+    /// `as u8` narrowing can never alias these onto single-byte opcodes.
+    pub(super) fn execute_condmove_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+
+        match insn.opcode {
+            0x0f40..=0x0f4f => {
+                // CMOVcc reg, r/m: the source r/m is ALWAYS read (so a faulting memory operand
+                // still faults even when the condition is false), but the destination register is
+                // written only when the condition holds. A false condition leaves it untouched.
+                // The condition code is the low nibble of the second byte (insn.opcode & 0x0f).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                if self.condition((insn.opcode & 0x0f) as u8) {
+                    self.write_gpr_sized(modrm.reg, operand_size, value);
+                }
+                Ok(clocks(1))
+            }
+            0x0f90..=0x0f9f => {
+                // SETcc r/m8: set the byte operand to 1 when the condition holds, else 0. Always
+                // byte-wide regardless of the operand-size prefix. The condition code is the low
+                // nibble of the second byte (insn.opcode & 0x0f). Touches no flags.
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                let set = self.condition((insn.opcode & 0x0f) as u8);
+                self.write_operand_u8(bus, operand, u8::from(set))?;
+                Ok(clocks(4))
+            }
+            0x0faf => {
+                // IMUL reg, r/m: two-operand signed multiply into the reg destination. The full
+                // product's high half is discarded; CF/OF are set when the result does not fit in
+                // the operand size (the truncated result does not sign-extend back to the full
+                // product). Reuses `imul_truncated` verbatim.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let dst = self.read_gpr_sized(modrm.reg, operand_size);
+                let result = self.imul_truncated(dst, src, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(9))
+            }
+            opcode => unreachable!("condmove opcode {opcode:#x}"),
+        }
+    }
+
+    /// The system / descriptor-table / segment-load block (task A12) through the decode/execute
+    /// split. Each arm mirrors the former fused handler verbatim — the same /ext dispatch off
+    /// `modrm.reg`, the same privilege (`require_cpl0`) and protected-mode gates, the same descriptor
+    /// loads and TLB/code-cache flushes, the same #BR/#UD faults, and the same clocks — but consumes
+    /// the ModRM/operand pre-decoded by `decode` instead of re-fetching. Crucially the state-changing
+    /// leaf helpers (`load_segment`, `load_ldtr`, `load_tr`, `verify_segment`, `store_descriptor_table`,
+    /// `flush_tlb_and_code_caches`, `try_read_descriptor`/`descriptor_accessible`) are reused
+    /// UNCHANGED, so the invalidation hooks Stage B depends on still fire exactly as before. The
+    /// far pointer for LES/LDS is read FROM MEMORY here (against live registers), never at decode.
+    /// Dispatches off the FULL u16 `insn.opcode` (0x0F00/01/02/03/06/20/22 plus single-byte
+    /// 0x62/0xc4/0xc5) so the `as u8` narrowing can never alias a 0F opcode onto a single-byte one.
+    pub(super) fn execute_system_seg_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        match insn.opcode {
+            0x0f00 => {
+                // Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW). The whole group is invalid outside
+                // protected mode, exactly as the fused handler gated it.
+                if !self.is_protected_mode() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                match modrm.reg {
+                    0 => {
+                        // SLDT r/m16: store the LDTR selector.
+                        let selector = u32::from(self.ldtr.selector);
+                        self.write_operand_sized(bus, operand, OperandSize::Word, selector)?;
+                        Ok(clocks(2))
+                    }
+                    1 => {
+                        // STR r/m16: store the task-register selector.
+                        let selector = u32::from(self.tr.selector);
+                        self.write_operand_sized(bus, operand, OperandSize::Word, selector)?;
+                        Ok(clocks(2))
+                    }
+                    2 => {
+                        // LLDT r/m16: load the local descriptor table register. Privileged.
+                        self.require_cpl0()?;
+                        let selector =
+                            self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                        self.load_ldtr(bus, selector)?;
+                        Ok(clocks(11))
+                    }
+                    3 => {
+                        // LTR r/m16: load the task register. Privileged.
+                        self.require_cpl0()?;
+                        let selector =
+                            self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                        self.load_tr(bus, selector)?;
+                        Ok(clocks(11))
+                    }
+                    4 | 5 => {
+                        // VERR (/4) / VERW (/5): set ZF if the segment is readable / writable.
+                        let selector =
+                            self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                        let ok = self.verify_segment(bus, selector, modrm.reg == 5)?;
+                        self.set_flag(FLAG_ZF, ok);
+                        Ok(clocks(10))
+                    }
+                    _reg => Err(undefined_opcode()),
+                }
+            }
+            0x0f01 => {
+                // Group 7 (SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                match modrm.reg {
+                    4 => {
+                        // SMSW r/m16: store the machine status word (low 16 bits of CR0).
+                        let msw = self.control.cr0 as u16;
+                        self.write_operand_sized(bus, operand, OperandSize::Word, u32::from(msw))?;
+                        Ok(clocks(2))
+                    }
+                    6 => {
+                        // LMSW r/m16: load MP/EM/TS; PE can be set but not cleared. Privileged.
+                        self.require_cpl0()?;
+                        let msw = self.read_operand_sized(bus, operand, OperandSize::Word)?;
+                        let switchable = CR0_MP | CR0_EM | CR0_TS;
+                        let mut cr0 = (self.control.cr0 & !switchable) | (msw & switchable);
+                        if msw & CR0_PE != 0 {
+                            cr0 |= CR0_PE;
+                        }
+                        if self.control.cr0 != cr0 {
+                            self.control.cr0 = cr0;
+                            self.recompute_alignment_armed();
+                            self.flush_tlb_and_code_caches();
+                            // LMSW can only set PE (never clear it, masked out of
+                            // `switchable` above), and require_cpl0 above already forced
+                            // cpl == 0 -- entering protected mode this way starts at ring 0
+                            // per the PRM, and cpl was already 0, so no assignment needed.
+                        }
+                        Ok(clocks(3))
+                    }
+                    reg => {
+                        // SGDT/SIDT/LGDT/LIDT/INVLPG all require a memory operand.
+                        let memory = match operand {
+                            RmOperand::Memory(memory) => memory,
+                            RmOperand::Register(_) => {
+                                return Err(InternalFault::Exception {
+                                    vector: 6,
+                                    error_code: None,
+                                });
+                            }
+                        };
+                        match reg {
+                            0 => {
+                                // SGDT m: store the GDTR pseudo-descriptor.
+                                self.store_descriptor_table(bus, memory, self.gdtr)?;
+                                Ok(clocks(11))
+                            }
+                            1 => {
+                                // SIDT m: store the IDTR pseudo-descriptor.
+                                self.store_descriptor_table(bus, memory, self.idtr)?;
+                                Ok(clocks(11))
+                            }
+                            2 | 3 => {
+                                // LGDT (/2) / LIDT (/3): load the GDTR/IDTR from a 6-byte image.
+                                // 386 PRM 5.1 ("Privilege Levels"): LGDT/LIDT reload the
+                                // descriptor-table base/limit registers that the whole
+                                // protection model rests on, so like LLDT/LTR/LMSW/CLTS above
+                                // they are privileged instructions -- #GP(0) outside CPL 0.
+                                // Real mode has no protection, so CPL is always 0 there and
+                                // this gate is a no-op for real-mode boot code.
+                                self.require_cpl0()?;
+                                let limit = self.read_memory_sized(
+                                    bus,
+                                    memory.segment,
+                                    memory.offset,
+                                    OperandSize::Word,
+                                    BusAccessKind::DataRead,
+                                )? as u16;
+                                let base = self.read_memory_sized(
+                                    bus,
+                                    memory.segment,
+                                    memory.offset + 2,
+                                    OperandSize::Dword,
+                                    BusAccessKind::DataRead,
+                                )?;
+                                let table = DescriptorTable { base, limit };
+                                if reg == 2 {
+                                    self.gdtr = table;
+                                } else {
+                                    self.idtr = table;
+                                }
+                                Ok(clocks(11))
+                            }
+                            7 => {
+                                // INVLPG m: privileged on the 486. Flush the whole TLB (a
+                                // single-page invalidate is a permitted superset).
+                                if self.current_privilege_level() != 0 {
+                                    return Err(InternalFault::Exception {
+                                        vector: 6,
+                                        error_code: None,
+                                    });
+                                }
+                                self.flush_tlb_and_code_caches();
+                                Ok(clocks(12))
+                            }
+                            _ => Err(undefined_opcode()),
+                        }
+                    }
+                }
+            }
+            0x0f02 => {
+                // LAR reg, r/m16: read the descriptor access-rights byte(s). Protected mode only.
+                if !self.is_protected_mode() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let selector = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                match self.try_read_descriptor(bus, selector)? {
+                    Some((_, high)) if self.descriptor_accessible(selector, high) => {
+                        let mask = match operand_size {
+                            OperandSize::Word => 0x0000_ff00,
+                            OperandSize::Dword => 0x00f0_ff00,
+                        };
+                        self.write_gpr_sized(modrm.reg, operand_size, high & mask);
+                        self.set_flag(FLAG_ZF, true);
+                    }
+                    _ => self.set_flag(FLAG_ZF, false),
+                }
+                Ok(clocks(11))
+            }
+            0x0f03 => {
+                // LSL reg, r/m16: read the descriptor segment limit. Protected mode only.
+                if !self.is_protected_mode() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let selector = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                match self.try_read_descriptor(bus, selector)? {
+                    Some((low, high)) if self.descriptor_accessible(selector, high) => {
+                        let mut limit = (low & 0xffff) | (high & 0x000f_0000);
+                        if high & 0x0080_0000 != 0 {
+                            limit = (limit << 12) | 0x0fff;
+                        }
+                        self.write_gpr_sized(modrm.reg, operand_size, limit);
+                        self.set_flag(FLAG_ZF, true);
+                    }
+                    _ => self.set_flag(FLAG_ZF, false),
+                }
+                Ok(clocks(11))
+            }
+            0x0f06 => {
+                // CLTS: clear the task-switched flag. Privileged.
+                self.require_cpl0()?;
+                self.control.cr0 &= !CR0_TS;
+                Ok(clocks(2))
+            }
+            0x0f20 => {
+                // MOV reg, CR: whole-32-bit read of the selected control register. The ModRM is a
+                // register form (`mode == 3`); any other `mode` is an invalid encoding (#UD). The
+                // `reg` field is the CR number, `rm` the destination GPR.
+                //
+                // Privileged, like every other 0F 00/01 system-register op (LLDT/LTR/LMSW/CLTS
+                // all gate on require_cpl0 above). This was missing the gate: a CPL-3 guest
+                // (including a V86 task, which is architecturally always CPL 3) could read CR0
+                // straight through. #GP(0) outside CPL 0.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV reg,CR decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                // 386 PRM 12.2.4 / table 12-1: only CR0, CR2, CR3 (and, on this 586-class
+                // persona, CR4) are architecturally defined. CR1/CR5/CR6/CR7 have no backing
+                // register at all -- referencing one is an invalid encoding (#UD), not a
+                // silent read of 0.
+                let value = match modrm.reg {
+                    0 => self.control.cr0,
+                    2 => self.control.cr2,
+                    3 => self.control.cr3,
+                    4 => self.control.cr4,
+                    _ => return Err(undefined_opcode()),
+                };
+                self.write_gpr32(modrm.rm, value);
+                Ok(clocks(6))
+            }
+            0x0f22 => {
+                // MOV CR, reg: whole-32-bit write of the selected control register. CR0 (paging
+                // enable / WP) and CR3 (page-table base) change translations, so flush the TLB
+                // (and code caches) via the unchanged helper; CR2/CR4 do not.
+                //
+                // Privileged (same require_cpl0 gate as LLDT/LTR/LMSW/CLTS). This was the
+                // prerequisite gap the owner flagged for VCPI work: without it, a ring-3 V86
+                // guest could silently write CR0 (e.g. flip PE/PG) or CR3 (repoint the page
+                // tables), which is a guest-fidelity and monitor-security hole. #GP(0) outside
+                // CPL 0.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV CR,reg decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                // 386 PRM 12.2.4 / table 12-1: same undefined-register check as MOV reg,CR
+                // above -- CR1/CR5/CR6/CR7 have no backing store, so writing one is #UD, not
+                // a silent no-op.
+                if !matches!(modrm.reg, 0 | 2 | 3 | 4) {
+                    return Err(undefined_opcode());
+                }
+                let value = self.read_gpr32(modrm.rm);
+                match modrm.reg {
+                    0 => {
+                        // 386 PRM 5.2.1 / 12.3.1: PG (bit 31) requires PE (bit 0) -- paged
+                        // linear addressing only makes sense once protection (and with it
+                        // segment/privilege checking) is active. Setting PG while PE is (or
+                        // would remain) clear is an invalid combination -- #GP(0), the
+                        // register is left unmodified. This also rejects the "set both PE
+                        // and PG at once with PE=0 in the new value" case, since PE is taken
+                        // from the value being written, not the old CR0.
+                        if value & CR0_PG != 0 && value & CR0_PE == 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.control.cr0 = value;
+                        self.recompute_alignment_armed();
+                        self.flush_tlb_and_code_caches();
+                    }
+                    2 => self.control.cr2 = value,
+                    3 => {
+                        // CR3 (the Page Directory Base Register) holds the page-directory
+                        // physical base in bits 31:12 per 386 PRM 5.2.2. Bits 4:3 are PWT/PCD,
+                        // a 486-and-later addition absent from the 386 PRM -- defined here per
+                        // Pentium Vol. 3 S9 (register description) and S18.3 (PCD/PWT Bits),
+                        // which this 586-class persona implements as cache-control hints, and
+                        // bits 2:0 are reserved. The page-table base used by the walker keeps
+                        // masking to `cr3 & 0xFFFFF000` at the use site -- only the stored
+                        // value gains PWT/PCD so a guest that sets them can read them back.
+                        self.control.cr3 = value & 0xffff_f018;
+                        self.flush_tlb_and_code_caches();
+                    }
+                    4 => {
+                        // 386 PRM has no CR4 (a 486/586 addition); on this GSW-586 (K6-class)
+                        // persona only TSD (bit 2) has a modeled effect and only VME/PVI/TSD/
+                        // DE/PSE/MCE/GPE (bits 0-4, 6-7) are architecturally defined at all
+                        // per the AMD-K6 BIOS and Software Tools Developers Guide S: 3.7
+                        // (Control Register 4 (CR4) Extensions, Figure 13/Table 19). The same
+                        // guide's MOV-to/from-CR4 exception table, and the Pentium Vol. 3
+                        // instruction reference, both document a hard fault ("#GP(0)" in
+                        // protected mode, "Interrupt 13" in real mode) if a 1 is written to
+                        // any reserved bit -- so a write outside CR4_DEFINED_MASK faults
+                        // instead of silently dropping the bits, matching EFER/STAR above.
+                        if value & !CR4_DEFINED_MASK != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.control.cr4 = value;
+                    }
+                    _ => unreachable!("undefined CR numbers are rejected by the check above"),
+                }
+                Ok(clocks(6))
+            }
+            0x0f21 => {
+                // MOV reg, DR: whole-32-bit read of the selected debug register. Same shape as
+                // MOV reg,CR above -- ModRM register form only (`mode == 3`; any other mode is
+                // #UD), privileged (386 PRM ch12: debug-register access is CPL-0-only, #GP(0)
+                // otherwise), `reg` selects the DR number, `rm` the destination GPR.
+                //
+                // DR4/DR5 alias DR6/DR7 by default (CR4.DE clear, which this core never sets
+                // behaviorally -- see CR4_TSD/CR4_DEFINED_MASK above) per 386 PRM ch12 and the
+                // 486/586 successors; a guest that references DR4/DR5 expecting DR6/DR7 (as
+                // DOS/32A's exception reporter does) gets the alias instead of #UD.
+                //
+                // Storage only: no breakpoint matching or #DB generation is modeled (ledger
+                // row 26, deferred). This just stops MOV DR6/DR7 from raising #UD, which is
+                // what DOS/32A's VCPI init and exception reporter need.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV reg,DR decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                let value = match modrm.reg {
+                    0..=3 => self.control.dr0_3[modrm.reg as usize],
+                    4 => self.control.dr6,
+                    5 => self.control.dr7,
+                    6 => self.control.dr6,
+                    7 => self.control.dr7,
+                    _ => return Err(undefined_opcode()),
+                };
+                self.write_gpr32(modrm.rm, value);
+                Ok(clocks(6))
+            }
+            0x0f23 => {
+                // MOV DR, reg: whole-32-bit write of the selected debug register. Same shape as
+                // MOV CR,reg above; see 0x0f21 for the privilege/aliasing rationale.
+                //
+                // Reserved-bit handling per 386 PRM ch12: DR7 bit 10 is hardwired to 1 (it is
+                // not settable by the guest); this core does not model LE/GE cycle-exactness or
+                // the L/G breakpoint enables beyond plain storage, so every other bit is stored
+                // as written. DR6 has no core-enforced reserved bits either (this is storage
+                // only, not breakpoint matching), so it round-trips whatever is written.
+                self.require_cpl0()?;
+                let modrm = insn.modrm.expect("MOV DR,reg decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(undefined_opcode());
+                }
+                let value = self.read_gpr32(modrm.rm);
+                match modrm.reg {
+                    0..=3 => self.control.dr0_3[modrm.reg as usize] = value,
+                    4 | 6 => self.control.dr6 = value,
+                    5 | 7 => self.control.dr7 = (value & !DR7_FIXED_ONE) | DR7_FIXED_ONE,
+                    _ => return Err(undefined_opcode()),
+                }
+                Ok(clocks(6))
+            }
+            0x62 => {
+                // BOUND r, m: the memory operand holds the signed lower and upper array bounds;
+                // if the register is outside [lower, upper] raise #BR (vector 5). mod=3 -> #UD.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let memory = match operand {
+                    RmOperand::Memory(memory) => memory,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let size = operand_size.bytes();
+                let lower = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let upper = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset + size,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let index = self.read_gpr_sized(modrm.reg, operand_size);
+                let (index, lower, upper) = match operand_size {
+                    OperandSize::Word => (
+                        i32::from(index as u16 as i16),
+                        i32::from(lower as u16 as i16),
+                        i32::from(upper as u16 as i16),
+                    ),
+                    OperandSize::Dword => (index as i32, lower as i32, upper as i32),
+                };
+                if index < lower || index > upper {
+                    return Err(InternalFault::Exception {
+                        vector: 5,
+                        error_code: None,
+                    });
+                }
+                Ok(clocks(10))
+            }
+            0xc4 | 0xc5 => {
+                // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The low half (operand
+                // size) goes into the reg operand and the next word into ES (0xc4) or DS (0xc5).
+                // The far pointer is read here against the LIVE registers; the segment is loaded
+                // through the unchanged `load_segment`. mod=3 (a register r/m) is #UD.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = if insn.opcode == 0xc4 {
+                    SegmentIndex::Es
+                } else {
+                    SegmentIndex::Ds
+                };
+                self.load_segment(bus, segment, selector)?;
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
+            0x0fb2 | 0x0fb4 | 0x0fb5 => {
+                // LSS (0F B2) / LFS (0F B4) / LGS (0F B5): 386 PRM 17-56 -- same far-pointer
+                // shape as LES/LDS above (mod=3 is #UD, the offset is read first, then the
+                // selector word right after it, both against the LIVE registers), loading the
+                // offset into the reg operand and the selector into SS/FS/GS through the
+                // unchanged `load_segment` (so the existing null-selector/#GP/#NP rules and the
+                // SS.B cache refresh all apply exactly as they do for any other segment load).
+                // LSS additionally arms the one-instruction interrupt shadow via
+                // `load_segment_arming_ss_shadow`, exactly like MOV SS/POP SS: 386 PRM 11-16
+                // treats "load SS, then load (E)SP" as one atomic unit against interrupts, NMI,
+                // and single-step, and LSS is that idiom in a single instruction.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = match insn.opcode {
+                    0x0fb2 => SegmentIndex::Ss,
+                    0x0fb4 => SegmentIndex::Fs,
+                    _ => SegmentIndex::Gs,
+                };
+                if segment == SegmentIndex::Ss {
+                    self.load_segment_arming_ss_shadow(bus, segment, selector)?;
+                } else {
+                    self.load_segment(bus, segment, selector)?;
+                }
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
+            opcode => unreachable!("system/segment opcode {opcode:#x}"),
+        }
+    }
+
+    /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
+    /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
+    /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
+    /// but consumes what `decode` pre-parsed (the far-pointer offset/selector in `imm`/`imm2`, the
+    /// imm16 release in `imm`, the imm8 vector in `imm`, or the ModRM/descriptor) so the executor
+    /// re-fetches no instruction byte. The protected-mode descriptor loads, gates, faults, the
+    /// V86 IOPL check, the interrupt-shadow/IF semantics, and the FF indirect target read all stay in
+    /// the unchanged helpers, so behavior is byte-for-byte identical to the fused path.
+    pub(super) fn execute_control_flow_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+
+        match insn.opcode as u8 {
+            0x9a => {
+                // CALL far direct. `decode` fetched the far pointer (offset into `imm`, selector into
+                // `imm2`); reconstruct it and deliver through the unchanged far-call helper.
+                let offset = insn.imm;
+                let selector = insn.imm2 as u16;
+                self.far_call(bus, selector, offset, operand_size)?;
+                Ok(clocks(17))
+            }
+            0xea => {
+                // JMP far direct. Same far-pointer reconstruction, via the far-jump helper.
+                let offset = insn.imm;
+                let selector = insn.imm2 as u16;
+                self.far_jump(bus, selector, offset, operand_size)?;
+                Ok(clocks(17))
+            }
+            0xc2 => {
+                // RET near, release imm16 bytes of arguments. `decode` fetched the release count into
+                // `imm`; pop the return offset (operand-size wide) THEN release, the same order the
+                // fused handler used.
+                let release = insn.imm as u16;
+                let target = self.pop(bus, operand_size)?;
+                self.set_eip(target & operand_size.mask());
+                self.release_stack(release);
+                Ok(clocks(10))
+            }
+            0xc3 => {
+                let target = self.pop(bus, operand_size)?;
+                self.set_eip(target & operand_size.mask());
+                Ok(clocks(10))
+            }
+            0xca => {
+                // RETF, release imm16 bytes. `decode` fetched the count into `imm`; pop CS:IP via the
+                // far-return helper THEN release.
+                let release = insn.imm as u16;
+                self.return_far(bus, operand_size)?;
+                self.release_stack(release);
+                Ok(clocks(17))
+            }
+            0xcb => {
+                self.return_far(bus, operand_size)?;
+                Ok(clocks(17))
+            }
+            0xcc => {
+                // INT 3: one-byte breakpoint trap to vector 3, via the shared delivery path.
+                self.software_interrupt(bus, 3)?;
+                Ok(clocks(33))
+            }
+            0xcd => {
+                // INT n. IOPL-sensitive in V86 (checked here, exactly as the fused handler did,
+                // before the delivery). `decode` fetched the vector into `imm`.
+                let vector = insn.imm as u8;
+                // In V86 a below-IOPL `INT n` faults to the monitor, but the emulator's HLE
+                // BIOS/DOS services (INT 10h video, INT 13h disk, …) are driven from
+                // `interrupt_acknowledge`, which the fault path would otherwise skip — so the
+                // guest's console output would never render under a V86 monitor. Notify the bus
+                // first, exactly as real-mode `software_interrupt` does, then raise the #GP.
+                if self.is_v86_mode() && self.iopl() < 3 {
+                    bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
+                    self.check_v86_iopl()?;
+                }
+                self.software_interrupt(bus, vector)?;
+                Ok(clocks(37))
+            }
+            0xce => {
+                // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
+                if self.flag(FLAG_OF) {
+                    self.software_interrupt(bus, 4)?;
+                    Ok(clocks(35))
+                } else {
+                    Ok(clocks(3))
+                }
+            }
+            0xcf => {
+                // IRET is IOPL-sensitive in V86 (386 PRM): #GP(0) below IOPL 3, so the
+                // V86 monitor's .iret_op performs the virtualized pop (VIF from the
+                // image, real IF stays 1). Mirrors CLI/STI/PUSHF/POPF.
+                self.check_v86_iopl()?;
+                self.iret(bus, operand_size)?;
+                Ok(clocks(22))
+            }
+            0xff => {
+                // Group 5. The /ext is `modrm.reg`. `decode` pre-parsed the ModRM + descriptor; the
+                // r/m operand resolves against the live registers here. The indirect CALL/JMP read
+                // their target FROM MEMORY now, mirroring the fused handler's read order exactly.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                match modrm.reg {
+                    0 | 1 => {
+                        let value = self.read_operand_sized(bus, operand, operand_size)?;
+                        let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                        Ok(clocks(2))
+                    }
+                    2 => {
+                        let target = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.push(bus, self.registers.eip, operand_size)?;
+                        self.set_eip(target & operand_size.mask());
+                        Ok(clocks(7))
+                    }
+                    4 => {
+                        let target = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.set_eip(target & operand_size.mask());
+                        Ok(clocks(7))
+                    }
+                    6 => {
+                        let value = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.push(bus, value, operand_size)?;
+                        Ok(clocks(2))
+                    }
+                    3 | 5 => {
+                        // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;
+                        // mod=3 is an invalid encoding and faults as #UD.
+                        let memory = match operand {
+                            RmOperand::Memory(memory) => memory,
+                            RmOperand::Register(_) => {
+                                return Err(InternalFault::Exception {
+                                    vector: 6,
+                                    error_code: None,
+                                });
+                            }
+                        };
+                        let offset = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?;
+                        // The selector follows the offset in memory. Its address is computed in the
+                        // address-size space, so on a 16-bit real-mode segment it wraps at 0xffff
+                        // (offset 0xfffe puts the selector at 0x0000, not past the limit), matching
+                        // the 80386.
+                        let selector_offset = match address_size {
+                            AddressSize::Word => u32::from(
+                                (memory.offset as u16).wrapping_add(operand_size.bytes() as u16),
+                            ),
+                            AddressSize::Dword => memory.offset.wrapping_add(operand_size.bytes()),
+                        };
+                        let selector = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            selector_offset,
+                            OperandSize::Word,
+                            BusAccessKind::DataRead,
+                        )? as u16;
+                        if modrm.reg == 3 {
+                            self.far_call(bus, selector, offset, operand_size)?;
+                        } else {
+                            self.far_jump(bus, selector, offset, operand_size)?;
+                        }
+                        Ok(clocks(11))
+                    }
+                    _extension => Err(undefined_opcode()),
+                }
+            }
+            opcode => unreachable!("control-flow opcode {opcode:#x}"),
+        }
+    }
+
+    /// Execute a two-byte (0F) opcode that has no dedicated split group. `opcode` is the second
+    /// opcode byte that `decode` already read + charged and gated; this never re-reads it. Reached
+    /// two ways: the `TwoByteFallback` arm of `execute_decoded` (which #UDs the unimplemented bytes),
+    /// and as a leaf call from `execute_misc_decoded` for the no-operand 0F members. The converted 0F
+    /// groups (MOVZX/MOVSX and the rest) bypass this entirely via `route_group`/`execute_decoded`.
+    ///
+    /// Most opcodes handled here re-read no further instruction bytes, so the heterogeneous
+    /// `Misc` group (task A14) also leaf-calls this for its 0F members
+    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them.
+    /// PUSH/POP FS/GS (0F A0/A1/A8/A9) are Misc members too: like their one-byte ES/SS/DS
+    /// counterparts in `execute_stack_decoded`, they touch the stack, so `bus` is threaded
+    /// through. The genuinely unimplemented 0F bytes still fall through to the
+    /// `UnsupportedTwoByteOpcode` arm and #UD.
+    pub(super) fn execute_two_byte<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u8,
+        operand_size: OperandSize,
+    ) -> ExecResult<CycleOutcome> {
+        match opcode {
+            // The MMX block (`is_mmx_two_byte`) is converted to the decode/execute split (task A14):
+            // `route_group` classifies it as `DecodeGroup::Misc` and `execute_mmx_decoded` runs it
+            // (the ModRM + the 0F 71/72/73 imm8 are parsed in `decode`). Not handled here.
+            // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would wrongly accept it.
+            // 0F 00 (group 6: SLDT/STR/LLDT/LTR/VERR/VERW), 0F 01 (group 7: SGDT/SIDT/LGDT/LIDT/
+            // SMSW/LMSW/INVLPG), 0F 02 (LAR), 0F 03 (LSL), and 0F 06 (CLTS) are converted to the
+            // decode/execute split (task A12): `route_group` classifies them as
+            // `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs them (the ModRM + /ext
+            // dispatch and the descriptor/CR/TLB leaf helpers are reused unchanged). Not handled here.
+            0x30 => {
+                // WRMSR: write EDX:EAX into the model-specific register selected by ECX.
+                // Privileged (#GP(0) outside CPL 0). An undefined MSR selector also #GP(0)s.
+                self.require_cpl0()?;
+                let value = self.read_edx_eax();
+                match self.read_gpr32(1) {
+                    MSR_MCAR => self.msr.mcar = value,
+                    MSR_MCTR => self.msr.mctr = value,
+                    // Rebase the time-stamp counter: store the offset that makes the running
+                    // core-clock count read back as the written value.
+                    MSR_TSC => self.msr.tsc_offset = value.wrapping_sub(self.elapsed_clocks),
+                    MSR_EFER => {
+                        if value & !EFER_WRITABLE != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.msr.efer = value;
+                    }
+                    MSR_STAR => {
+                        if value & !STAR_WRITABLE != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.msr.star = value;
+                    }
+                    MSR_WHCR => self.msr.whcr = value,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
+                    }
+                }
+                Ok(clocks(30))
+            }
+            0x31 => {
+                // RDTSC: read the time-stamp counter into EDX:EAX. When CR4.TSD is set the
+                // instruction is privileged and #GP(0)s outside CPL 0; with TSD clear (the
+                // default) it runs at any level.
+                if self.control.cr4 & CR4_TSD != 0 && self.current_privilege_level() != 0 {
+                    return Err(InternalFault::Exception {
+                        vector: 13,
+                        error_code: Some(0),
+                    });
+                }
+                let tsc = self.time_stamp_counter();
+                self.set_edx_eax(tsc);
+                Ok(clocks(11))
+            }
+            0x32 => {
+                // RDMSR: read the model-specific register selected by ECX into EDX:EAX.
+                // Privileged; an undefined selector #GP(0)s.
+                self.require_cpl0()?;
+                let value = match self.read_gpr32(1) {
+                    MSR_MCAR => self.msr.mcar,
+                    MSR_MCTR => self.msr.mctr,
+                    MSR_TSC => self.time_stamp_counter(),
+                    MSR_EFER => self.msr.efer,
+                    MSR_STAR => self.msr.star,
+                    MSR_WHCR => self.msr.whcr,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
+                    }
+                };
+                self.set_edx_eax(value);
+                Ok(clocks(11))
+            }
+            0x05 => self.syscall(),
+            0x07 => self.sysret(),
+            0xaa => {
+                // RSM: return from System Management Mode. No SMI source is modeled, so the
+                // processor is never in SMM and RSM outside SMM is #UD, as on real hardware.
+                // Limit: SMM entry is not implemented; RSM is therefore always invalid.
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None,
+                })
+            }
+            // 0F 20 (MOV reg,CR) and 0F 22 (MOV CR,reg) are converted to the decode/execute split
+            // (task A12): `route_group` classifies them as `DecodeGroup::SystemSeg` and
+            // `execute_system_seg_decoded` runs them (the register-form ModRM is parsed in `decode`;
+            // the whole-32-bit CR read/write, the `mode != 3` #UD, and the CR0/CR3 TLB flush via the
+            // unchanged `flush_tlb_and_code_caches` stay in the executor). Not handled here. 0F 21/23
+            // (MOV reg,DR / MOV DR,reg) remain unimplemented and #UD as `UnsupportedTwoByteOpcode`.
+            // CMOVcc (0x40-0x4F), SETcc (0x90-0x9F), and IMUL reg,r/m (0xAF) are converted to
+            // the decode/execute split (task A11): `route_group` classifies them as
+            // `DecodeGroup::CondMove` and `execute_condmove_decoded` runs them. Not handled here.
+            // 0x80-0x8f (Jcc near, rel16/32) are converted to the decode/execute split: `decode`
+            // folds them into `insn.opcode` as 0x0F80-0x0F8F, `route_group` classifies them as
+            // `DecodeGroup::Branch`, and `execute_branch_decoded` runs them. Not handled here.
+            // MOVZX/MOVSX (0F B6/B7/BE/BF) are converted to the decode/execute split; they route
+            // through `DecodeGroup::DataMove` and `execute_datamove_decoded`, never reaching here.
+            // BSF/BSR (0xbc/0xbd), BT/BTS/BTR/BTC reg (0xa3/0xab/0xb3/0xbb) and imm8 (0xba), and
+            // SHLD/SHRD (0xa4/0xac imm8, 0xa5/0xad CL) are converted to the decode/execute split
+            // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
+            // `execute_bitmanip_decoded` runs them. Not handled here.
+            0x08 | 0x09 => {
+                // INVD (08) / WBINVD (09): flush the internal caches. Both are privileged and
+                // raise #UD outside CPL 0. We model no cache, so they are no-ops after the
+                // privilege check. WBINVD differs only by writing dirty lines back first, which
+                // has no observable effect here.
+                if self.current_privilege_level() != 0 {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                Ok(clocks(4))
+            }
+            // CMPXCHG (0xb0/0xb1) and XADD (0xc0/0xc1) are converted to the decode/execute split
+            // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
+            // `execute_bitmanip_decoded` runs them. Not handled here.
+            0xa2 => {
+                // CPUID (0F A2). Not privileged: it runs at any CPL. The leaf selector is in
+                // EAX. The result registers are EAX, EBX, ECX, EDX (full 32-bit writes). We
+                // model basic leaves 0 and 1 plus the extended leaves 0x80000000 and
+                // 0x80000002..0x80000004 (the brand string); any other leaf returns all zeros,
+                // the architectural reply for an unimplemented leaf at or below the maximum.
+                //
+                // CPUID arrived on the late 486 and is standard on the 586. At the 286 and
+                // 386 guest levels it does not exist, so raise #UD. (The 286-level gate above
+                // already blocks it; this also covers the 386 level, which keeps the rest of
+                // the 0F group but still has no CPUID.) Firmware in the BIOS ROM is exempt,
+                // and so is ring-0 protected mode -- the same chipset-side-monitor exemption
+                // (and the same ASSUMPTION/revisit trigger) as the two ISA gates in
+                // read_prefixes and check_two_byte_isa_gate; without it, future ring-0
+                // monitor code executing CPUID on a sub-486 persona would die by the same
+                // unpopulated-low-vector cascade the gate exemptions fixed.
+                if !self.level.has_cpuid()
+                    && !self.cs_in_firmware_rom()
+                    && !self.is_ring0_protected()
+                {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let leaf = self.registers.eax();
+                let (l1_kb, l2_kb) = self.level.cache_kb();
+                let (eax, ebx, ecx, edx) = match leaf {
+                    0 => (
+                        CPUID_MAX_BASIC_LEAF,
+                        CPUID_VENDOR_EBX,
+                        CPUID_VENDOR_ECX,
+                        CPUID_VENDOR_EDX,
+                    ),
+                    1 => (
+                        CPUID_VERSION_EAX,
+                        CPUID_LEAF1_EBX,
+                        CPUID_LEAF1_ECX,
+                        CPUID_FEATURES_EDX,
+                    ),
+                    0x8000_0000 => (CPUID_MAX_EXT_LEAF, 0, 0, 0),
+                    // Extended leaf 1: the AMD processor signature in EAX (same family/model/
+                    // stepping packing as leaf 1) and the extended feature flags in EDX. EBX
+                    // and ECX are reserved.
+                    0x8000_0001 => (CPUID_VERSION_EAX, 0, 0, CPUID_EXT_FEATURES_EDX),
+                    0x8000_0002 => (
+                        CPUID_BRAND_EAX_0,
+                        CPUID_BRAND_EBX_0,
+                        CPUID_BRAND_ECX_0,
+                        CPUID_BRAND_EDX_0,
+                    ),
+                    0x8000_0003 => (CPUID_BRAND_EAX_1, 0, 0, 0),
+                    0x8000_0004 => (0, 0, 0, 0),
+                    // L1 cache (AMD-style): ECX is the L1 data cache, with the size in KB in
+                    // bits 31-24. The whole L1 size is reported as the data cache for this
+                    // cosmetic readout; the associativity and line fields stay zero.
+                    0x8000_0005 => (0, 0, (u32::from(l1_kb) & 0xff) << 24, 0),
+                    // L2 cache (AMD-style): ECX carries the L2 size in KB in bits 31-16, with
+                    // associativity (bits 15-12) and line size (bits 7-0) left at zero.
+                    0x8000_0006 => (0, 0, (u32::from(l2_kb) & 0xffff) << 16, 0),
+                    _ => (0, 0, 0, 0),
+                };
+                self.write_gpr32(0, eax); // EAX
+                self.write_gpr32(3, ebx); // EBX
+                self.write_gpr32(1, ecx); // ECX
+                self.write_gpr32(2, edx); // EDX
+                Ok(clocks(14))
+            }
+            // CMPXCHG8B m64 (0F C7 /1) is converted to the decode/execute split (task A14):
+            // `route_group` classifies it as `DecodeGroup::Misc` and `execute_misc_decoded` runs it
+            // (the ModRM + addressing descriptor is parsed in `decode`; the register form / wrong
+            // /ext #UD and the read-modify-write stay in the executor). Not handled here.
+            0xc8..=0xcf => {
+                // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
+                // three bits of the opcode pick the register. The 16-bit-operand form is
+                // architecturally undefined; we follow the documented Intel note and the common
+                // emulator choice of leaving the register contents undefined-but-unchanged, so a
+                // 66h-prefixed BSWAP here is a no-op rather than corrupting the value.
+                let reg = opcode & 0x07;
+                if matches!(operand_size, OperandSize::Dword) {
+                    let value = self.read_gpr32(reg);
+                    self.write_gpr32(reg, value.swap_bytes());
+                }
+                Ok(clocks(1))
+            }
+            // PUSH FS / PUSH GS (0F A0 / 0F A8): 386+ additions, otherwise identical to the
+            // one-byte PUSH ES/CS/SS/DS handlers in `execute_stack_decoded` (0x06/0x0e/0x16/
+            // 0x1e). 386 PRM: PUSH sreg with a 32-bit operand size (66h prefix or D=1 code
+            // segment) decrements ESP by 4 and writes the 16-bit selector zero-extended to a
+            // dword; with a 16-bit operand size it is the classic 2-byte push. Honor
+            // `operand_size` here instead of hardcoding Word, matching the ES/SS/DS fix.
+            // Same clock cost (2) as those.
+            0xa0 => {
+                self.push(
+                    bus,
+                    u32::from(self.registers.segment(SegmentIndex::Fs).selector),
+                    operand_size,
+                )?;
+                Ok(clocks(2))
+            }
+            0xa8 => {
+                self.push(
+                    bus,
+                    u32::from(self.registers.segment(SegmentIndex::Gs).selector),
+                    operand_size,
+                )?;
+                Ok(clocks(2))
+            }
+            // POP FS / POP GS (0F A1 / 0F A9): mirrors POP ES/SS/DS (0x07/0x17/0x1f) -- pop a
+            // selector off the stack, then run it through the same `load_segment`
+            // descriptor-load path (which raises the identical #GP/#SS a bad or null selector
+            // would on POP DS). 386 PRM: a 32-bit operand size pops a full dword and loads the
+            // low 16 bits, discarding the upper half; a 16-bit operand size pops 2 bytes.
+            // Same clock cost (7) as those.
+            0xa1 => {
+                let value = self.pop(bus, operand_size)? as u16;
+                self.load_segment(bus, SegmentIndex::Fs, value)?;
+                Ok(clocks(7))
+            }
+            0xa9 => {
+                let value = self.pop(bus, operand_size)? as u16;
+                self.load_segment(bus, SegmentIndex::Gs, value)?;
+                Ok(clocks(7))
+            }
+            _ => Err(undefined_opcode()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bit_string_op<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        op: u8,
+        operand: RmOperand,
+        raw_index: u32,
+        operand_size: OperandSize,
+        address_size: AddressSize,
+        register_index: bool,
+    ) -> ExecResult<()> {
+        let bits = operand_size.bytes() * 8; // 16 or 32
+        match operand {
+            RmOperand::Register(index) => {
+                let bit = raw_index & (bits - 1);
+                let value = self.read_gpr_sized(index, operand_size);
+                let (cf, new) = bit_op(op, value, bit);
+                self.set_flag(FLAG_CF, cf);
+                if op != 0 {
+                    self.write_gpr_sized(index, operand_size, new);
+                }
+                Ok(())
+            }
+            RmOperand::Memory(mem) => {
+                let (offset, bit) = if register_index {
+                    // Signed bit-addressing: an index past the operand width walks to an
+                    // adjacent operand in the bit string. div_euclid/rem_euclid give the
+                    // floor block and the non-negative bit within it.
+                    let signed = match operand_size {
+                        OperandSize::Word => i32::from(raw_index as u16 as i16),
+                        OperandSize::Dword => raw_index as i32,
+                    };
+                    let block = signed.div_euclid(bits as i32);
+                    let bit = signed.rem_euclid(bits as i32) as u32;
+                    let bytes = operand_size.bytes() as i32;
+                    let offset = (mem.offset as i32).wrapping_add(block * bytes) as u32;
+                    let offset = match address_size {
+                        AddressSize::Word => offset & 0xffff,
+                        AddressSize::Dword => offset,
+                    };
+                    (offset, bit)
+                } else {
+                    (mem.offset, raw_index & (bits - 1))
+                };
+                let value = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let (cf, new) = bit_op(op, value, bit);
+                self.set_flag(FLAG_CF, cf);
+                if op != 0 {
+                    self.write_memory_sized(
+                        bus,
+                        mem.segment,
+                        offset,
+                        operand_size,
+                        new,
+                        BusAccessKind::DataWrite,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+    /// The heterogeneous one-off block (task A14) through the decode/execute split. Each arm mirrors
+    /// the former fused handler verbatim — same flag effects, same memory access, same clocks — but
+    /// consumes the ModRM/operand/immediate `decode` pre-parsed (so the executor never re-fetches an
+    /// instruction byte). The MMX block and CMPXCHG8B resolve their pre-decoded ModRM here; the
+    /// no-operand 0F system/serializing/CPU-id ops (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/
+    /// CPUID/BSWAP) read no instruction bytes, so they reuse the existing `execute_two_byte` leaf
+    /// logic verbatim (it re-reads nothing for them). Dispatch is off the FULL u16 `insn.opcode`
+    /// so a 0F low byte can never alias a single-byte opcode.
+    pub(super) fn execute_misc_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+        match insn.opcode {
+            0x27 => {
+                // DAA: decimal adjust AL after addition. OF is left undefined.
+                let old_al = self.read_gpr8(0);
+                let old_cf = self.flag(FLAG_CF);
+                let mut al = old_al;
+                self.set_flag(FLAG_CF, false);
+                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let (sum, carry) = al.overflowing_add(6);
+                    al = sum;
+                    self.set_flag(FLAG_CF, old_cf || carry);
+                    self.set_flag(FLAG_AF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_add(0x60);
+                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
+                }
+                self.write_gpr8(0, al);
+                self.set_szp(u32::from(al), BusWidth::Byte);
+                Ok(clocks(4))
+            }
+            0x2f => {
+                // DAS: decimal adjust AL after subtraction. OF is left undefined.
+                let old_al = self.read_gpr8(0);
+                let old_cf = self.flag(FLAG_CF);
+                let mut al = old_al;
+                self.set_flag(FLAG_CF, false);
+                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let (diff, borrow) = al.overflowing_sub(6);
+                    al = diff;
+                    self.set_flag(FLAG_CF, old_cf || borrow);
+                    self.set_flag(FLAG_AF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_sub(0x60);
+                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
+                }
+                self.write_gpr8(0, al);
+                self.set_szp(u32::from(al), BusWidth::Byte);
+                Ok(clocks(4))
+            }
+            0x37 => {
+                // AAA: ASCII adjust AL after addition. OF/SF/ZF/PF are left undefined.
+                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let ax = self.read_gpr16(0).wrapping_add(0x106);
+                    self.write_gpr16(0, ax);
+                    self.set_flag(FLAG_AF, true);
+                    self.set_flag(FLAG_CF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                    self.set_flag(FLAG_CF, false);
+                }
+                let al = self.read_gpr8(0) & 0x0f;
+                self.write_gpr8(0, al);
+                Ok(clocks(4))
+            }
+            0x3f => {
+                // AAS: ASCII adjust AL after subtraction. OF/SF/ZF/PF are left undefined.
+                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let ax = self.read_gpr16(0).wrapping_sub(6);
+                    self.write_gpr16(0, ax.wrapping_sub(0x100));
+                    self.set_flag(FLAG_AF, true);
+                    self.set_flag(FLAG_CF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                    self.set_flag(FLAG_CF, false);
+                }
+                let al = self.read_gpr8(0) & 0x0f;
+                self.write_gpr8(0, al);
+                Ok(clocks(4))
+            }
+            0x69 => {
+                // IMUL r, r/m, imm16/32: signed multiply of r/m by a full-width immediate.
+                // `decode` parsed the ModRM/operand and fetched the immediate into `insn.imm`.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.imul_truncated(src, insn.imm, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
+            0x6b => {
+                // IMUL r, r/m, imm8: signed multiply of r/m by a sign-extended byte immediate.
+                // `decode` parsed the ModRM/operand and sign-extended the imm8 into `insn.imm`.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.imul_truncated(src, insn.imm, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
+            0x6c => {
+                self.run_string(
+                    bus,
+                    StringOp::Ins,
+                    BusWidth::Byte,
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(15))
+            }
+            0x6d => {
+                self.run_string(
+                    bus,
+                    StringOp::Ins,
+                    operand_size.bus_width(),
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(15))
+            }
+            0x6e => {
+                self.run_string(
+                    bus,
+                    StringOp::Outs,
+                    BusWidth::Byte,
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(14))
+            }
+            0x6f => {
+                self.run_string(
+                    bus,
+                    StringOp::Outs,
+                    operand_size.bus_width(),
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(14))
+            }
+            0xa8 => {
+                // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8.
+                let al = self.read_gpr8(0);
+                self.alu(4, u32::from(al), insn.imm, BusWidth::Byte);
+                Ok(clocks(2))
+            }
+            0xa9 => {
+                // TEST AX/EAX, imm: AND-for-flags, no write-back. `decode` fetched the immediate.
+                let acc = self.read_gpr_sized(0, operand_size);
+                self.alu(4, acc, insn.imm, operand_size.bus_width());
+                Ok(clocks(2))
+            }
+            0xd4 => {
+                // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.
+                // `decode` fetched the imm8 base into `insn.imm`; a base of 0 raises #DE.
+                let divisor = insn.imm as u8;
+                if divisor == 0 {
+                    return Err(divide_error());
+                }
+                let al = self.read_gpr8(0);
+                self.write_gpr8(4, al / divisor);
+                let rem = al % divisor;
+                self.write_gpr8(0, rem);
+                self.set_szp(u32::from(rem), BusWidth::Byte);
+                Ok(clocks(17))
+            }
+            0xd5 => {
+                // AAD: AL = (AL + AH*imm8) & 0xff, AH = 0. OF/AF/CF undefined; SF/ZF/PF from AL.
+                let multiplier = insn.imm as u8;
+                let al = self.read_gpr8(0);
+                let ah = self.read_gpr8(4);
+                let result = al.wrapping_add(ah.wrapping_mul(multiplier));
+                self.write_gpr8(0, result);
+                self.write_gpr8(4, 0);
+                self.set_szp(u32::from(result), BusWidth::Byte);
+                Ok(clocks(19))
+            }
+            0xd6 => {
+                // SALC/SETALC (undocumented): AL = CF ? 0xFF : 0x00. Flags unaffected.
+                let value = if self.flag(FLAG_CF) { 0xff } else { 0x00 };
+                self.write_gpr8(0, value);
+                Ok(clocks(2))
+            }
+            0xd7 => {
+                // XLAT: AL = [segment:(B)X + AL]. DS is the default, overridable; the 16-bit base
+                // plus AL wraps inside the segment. Read from live registers at execute time.
+                let segment = insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+                let al = u32::from(self.read_gpr8(0));
+                let offset = match address_size {
+                    AddressSize::Word => u32::from(self.read_gpr16(3).wrapping_add(al as u16)),
+                    AddressSize::Dword => self.read_gpr32(3).wrapping_add(al),
+                };
+                let value = self.read_memory_u8(bus, segment, offset, BusAccessKind::DataRead)?;
+                self.write_gpr8(0, value);
+                Ok(clocks(5))
+            }
+            0xf4 => {
+                // HLT: privileged on real 386+ (#GP(0) at CPL != 0). A V86 task is
+                // always CPL 3, so a guest HLT under a V86 monitor faults here instead
+                // of halting the whole machine; the monitor (if any) is responsible for
+                // emulating the guest's halt semantics on the resulting #GP.
+                self.require_cpl0()?;
+                self.halted = true;
+                Ok(CycleOutcome {
+                    core_clocks: 5,
+                    halted: true,
+                })
+            }
+            // CMPXCHG8B (0F C7 /1): the ModRM was pre-parsed; resolve the m64 operand here and reuse
+            // the same compare/store/load-and-set-ZF logic as the former fused arm. The register
+            // form and any other group-7 /ext are #UD.
+            0x0fc7 => {
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) if modrm.reg == 1 => mem,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let current = self.read_qword(bus, mem)?;
+                if current == self.read_edx_eax() {
+                    let source =
+                        (u64::from(self.read_gpr32(1)) << 32) | u64::from(self.read_gpr32(3));
+                    self.write_qword(bus, mem, source)?;
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_edx_eax(current);
+                    // Re-write the destination with its own value so the bus still sees a write on
+                    // the unequal branch, matching the locked read-modify-write.
+                    self.write_qword(bus, mem, current)?;
+                    self.set_flag(FLAG_ZF, false);
+                }
+                Ok(clocks(10))
+            }
+            // The MMX block (EMMS, the shift-by-imm forms, MOVD/MOVQ, and the Pxxx forms) runs
+            // through its split executor, consuming the pre-decoded ModRM/operand and the pre-fetched
+            // imm8 (for the 0F 71/72/73 shifts).
+            op if op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
+                self.execute_mmx_decoded(insn, bus)
+            }
+            // The remaining 0F system/serializing/CPU-id/stack ops re-read no further instruction
+            // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL (05), SYSRET
+            // (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), PUSH FS/GS (A0/A8), CPUID
+            // (A2), POP FS/GS (A1/A9), BSWAP (C8-CF). `decode` already read + gated the second
+            // byte; this never re-reads it.
+            0x0f05
+            | 0x0f07
+            | 0x0f08
+            | 0x0f09
+            | 0x0f30
+            | 0x0f31
+            | 0x0f32
+            | 0x0fa0
+            | 0x0fa1
+            | 0x0fa2
+            | 0x0fa8
+            | 0x0fa9
+            | 0x0fc8..=0x0fcf => self.execute_two_byte(bus, insn.opcode as u8, insn.operand_size),
+            opcode => unreachable!("misc opcode {opcode:#x}"),
+        }
+    }
+}
