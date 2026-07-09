@@ -3415,25 +3415,29 @@ impl Vga {
             0x11 => self.crtc_regs.r11 = value,
             _ => {} // full timing programmed via set_mode_0dh in slice 1
         }
+        // Always capture the raw vertical-timing bytes, even in text mode: a
+        // register-banging 256-color guest (TSUMERA sets 320x240 mode X this way)
+        // programs the full CRTC BEFORE the ATC write that flips the personality,
+        // so these must survive to be decoded when the mode enters. (0x07/0x09/
+        // 0x11 are already stored by the main match above, with their line-compare
+        // side effects.)
+        match index {
+            0x06 => self.crtc_regs.r06 = value,
+            0x10 => self.crtc_regs.r10 = value,
+            0x12 => self.crtc_regs.r12 = value,
+            0x15 => self.crtc_regs.r15 = value,
+            0x16 => self.crtc_regs.r16 = value,
+            _ => {}
+        }
         // Graphics modes honor guest vertical CRTC timing. The absolute fields are
         // derived in recompute_vertical_timing; line-compare bits are handled above.
+        // Text keeps its own timing (the recompute is gated), so the raw stores
+        // above are inert there until a later mode flip decodes them.
         if matches!(
             self.mode,
             VideoMode::Planar | VideoMode::Mode13h | VideoMode::ModeX
         ) && matches!(index, 0x06 | 0x07 | 0x09 | 0x10 | 0x11 | 0x12 | 0x15 | 0x16)
         {
-            match index {
-                0x06 => self.crtc_regs.r06 = value,
-                0x10 => self.crtc_regs.r10 = value,
-                0x12 => self.crtc_regs.r12 = value,
-                0x15 => self.crtc_regs.r15 = value,
-                0x16 => self.crtc_regs.r16 = value,
-                // 0x07/0x09/0x11 are already stored (with their line-compare
-                // side effects) by the main match above; they only need the
-                // vertical-timing recompute here.
-                0x07 | 0x09 | 0x11 => {}
-                _ => unreachable!(),
-            }
             self.recompute_vertical_timing();
         }
     }
@@ -3451,7 +3455,7 @@ impl Vga {
                 0x00..=0x0F => self.attr.palette[self.attr.index as usize] = value & 0x3F,
                 0x10 => {
                     self.attr.mode_control = value;
-                    self.maybe_enter_mode13h_from_registers();
+                    self.maybe_enter_256color_from_registers();
                 }
                 0x11 => self.attr.overscan = value,
                 0x12 => self.attr.plane_enable = value,
@@ -4181,44 +4185,61 @@ impl Vga {
     }
 
     /// Register-banged 256-color entry. Real silicon has no mode numbers: writing
-    /// the standard 13h register set (ATC mode-control graphics bit 0 + 8-bit
-    /// color bit 6, SEQ memory-mode chain-4) IS the mode change, and DOS Quake
-    /// 1.06 sets 320x200x256 exactly this way (its vgamodes register tables, no
-    /// INT 10h). Act-on-write like the chain-4 mode-X toggle above: the ATC
-    /// mode-control write is the last register in the conventional modeset order,
-    /// so it is the decision point. Only the personality/scanout state flips -
-    /// the guest's own SEQ/GC/ATC/CRTC values stay untouched (no VGABIOS readback
-    /// seeding, no palette reset: a register-banging guest loads its own DAC).
-    /// ponytail: horizontal timing installs the canonical 13h values rather than
-    /// decoding the guest's CRTC horizontal registers (Quake writes the standard
-    /// ones); decode them if a title ever bangs a nonstandard-width 256-color
-    /// mode. The symmetric register-banged EXIT to text is also not derived -
-    /// every known title restores text via INT 10h.
-    fn maybe_enter_mode13h_from_registers(&mut self) {
+    /// the standard 256-color register set (ATC mode-control graphics bit 0 +
+    /// 8-bit color bit 6) IS the mode change. The ATC mode-control write is the
+    /// last register in the conventional modeset order, so it is the decision
+    /// point. Only the personality/scanout state flips — the guest's own
+    /// SEQ/GC/ATC/CRTC values stay untouched (no VGABIOS readback seeding, no
+    /// palette reset: a register-banging guest loads its own DAC).
+    ///
+    /// Two families ride this, discriminated by SEQ memory-mode chain-4:
+    /// - Chain-4 ON → chained mode 13h. DOS Quake 1.06 sets 320x200x256 this way
+    ///   (its vgamodes register tables, no INT 10h). Canonical 320x200 timing.
+    /// - Chain-4 OFF, with the GC actually set up for 256-color graphics →
+    ///   unchained mode X / mode Y. TSUMERA (Borland 32RTM) sets 320x240 this
+    ///   way. The guest's own vertical CRTC timing is honored so a 240-line mode
+    ///   renders full height. The GC-256/graphics requirement keeps a stray ATC
+    ///   write in a text-mode guest from spuriously flipping the personality.
+    ///
+    /// ponytail: horizontal timing installs the canonical 320-wide values rather
+    /// than decoding the guest's CRTC horizontal registers (both families write
+    /// the standard ones); decode them if a title ever bangs a nonstandard-width
+    /// 256-color mode. The symmetric register-banged EXIT to text is also not
+    /// derived — every known title restores text via INT 10h.
+    fn maybe_enter_256color_from_registers(&mut self) {
         let graphics = self.attr.mode_control & 0x01 != 0;
         let eight_bit = self.attr.mode_control & 0x40 != 0;
-        let chain4 = self.seq.memory_mode & 0x08 != 0;
-        if !graphics
-            || !eight_bit
-            || !chain4
-            || !matches!(self.mode, VideoMode::Text | VideoMode::Planar)
-        {
+        if !graphics || !eight_bit || !matches!(self.mode, VideoMode::Text | VideoMode::Planar) {
             return;
         }
-        self.bump_content_gen();
-        self.crtc = CrtcTiming::mode13h();
-        // Reseed the raw CRTC bytes from the canonical timing before the
-        // recompute: on a Text-origin bang the guest's vertical CRTC writes
-        // were DROPPED (the gated store block only accepts them in graphics
-        // personalities), so recomputing from the stale text bytes would be
-        // right only by the mode-3/13h timing coincidence. A Planar-origin
-        // bang did capture the guest's writes, but canonical 13h vertical
-        // timing is the correct 320x200x256 base either way.
-        self.crtc_regs = CrtcRegs::from_timing(self.crtc);
-        self.recompute_vertical_timing();
+        let chain4 = self.seq.memory_mode & 0x08 != 0;
+        if chain4 {
+            // Chained mode 13h: canonical 320x200. Reseed the raw CRTC bytes from
+            // the canonical timing before the recompute — a Text-origin bang's
+            // vertical CRTC writes are captured now but 320x200 is the correct
+            // chained base regardless, and this keeps Quake byte-identical.
+            self.bump_content_gen();
+            self.crtc = CrtcTiming::mode13h();
+            self.crtc_regs = CrtcRegs::from_timing(self.crtc);
+            self.recompute_vertical_timing();
+            self.mode = VideoMode::Mode13h;
+        } else {
+            // Unchained mode X / mode Y — only when the Graphics Controller is
+            // genuinely in 256-color graphics (256-shift + graphics/A0000 select),
+            // so chain-4-off alone (a stray text-mode ATC write) does not flip.
+            let gc_256_graphics = self.gc.mode_flags & 0x40 != 0 && self.gc.misc & 0x01 != 0;
+            if !gc_256_graphics {
+                return;
+            }
+            // Keep the guest's captured vertical CRTC timing (recompute decodes it)
+            // so a 320x240 mode Y keeps its 240 lines instead of snapping to 200.
+            self.bump_content_gen();
+            self.crtc = CrtcTiming::mode_x();
+            self.recompute_vertical_timing();
+            self.mode = VideoMode::ModeX;
+        }
         self.beam = 0;
         self.last_line = 0;
-        self.mode = VideoMode::Mode13h;
         self.presented = None;
         self.pending_start = None;
         self.resize_work();
@@ -5810,12 +5831,70 @@ mod tests {
     fn atc_graphics_bits_without_chain4_stay_text() {
         // A text-mode guest (or an INT 10h state restore) re-writing ATC 10h
         // with the graphics bits must NOT flip the personality unless the
-        // sequencer is actually in chained 256-color memory mode.
+        // Graphics Controller is actually set up for 256-color graphics. Chain-4
+        // off alone (with no GC 256-color/graphics bits) is not enough — a stray
+        // ATC write in text mode must stay text.
         let mut vga = Vga::default();
         vga.read_status1();
         vga.write_port(0x3C0, 0x10);
-        vga.write_port(0x3C0, 0x41); // graphics + 8-bit, but chain-4 off
+        vga.write_port(0x3C0, 0x41); // graphics + 8-bit, but GC not set up
         assert_eq!(vga.active_mode(), VideoMode::Text);
+    }
+
+    #[test]
+    fn register_banged_mode_x_320x240_entry_from_text() {
+        // TSUMERA (Borland 32RTM) sets 320x240 unchained mode X by banging the
+        // full VGA register set from text mode, no INT 10h: SEQ memory-mode with
+        // chain-4 OFF, the GC 256-color graphics bits, the guest's own 240-line
+        // vertical CRTC timing, then ATC 10h graphics+8bit (the decision write).
+        // The personality must flip to ModeX with the GUEST's geometry (480
+        // scanlines double-scanned to 240) — not stay text (blank screen), nor
+        // snap to canonical 320x200 (loses 40 lines).
+        let mut vga = Vga::default();
+        assert_eq!(vga.active_mode(), VideoMode::Text);
+
+        // SEQ memory mode 0x06: extended + odd/even disabled, chain-4 OFF.
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        // GC: 256-color shift (index 05h bit 6) + graphics mode / A0000 (index 06h).
+        vga.write_port(0x3CE, 0x05);
+        vga.write_port(0x3CF, 0x40);
+        vga.write_port(0x3CE, 0x06);
+        vga.write_port(0x3CF, 0x05);
+        // CRTC: the guest's own 320x240 mode-X timing (unlock 11h protect first).
+        for (idx, val) in [
+            (0x11u8, 0x2cu8),
+            (0x00, 0x5f),
+            (0x01, 0x4f),
+            (0x02, 0x50),
+            (0x03, 0x82),
+            (0x04, 0x54),
+            (0x05, 0x80),
+            (0x06, 0x0b),
+            (0x07, 0x3e),
+            (0x09, 0xc0),
+            (0x10, 0xea),
+            (0x11, 0xac),
+            (0x12, 0xdf),
+            (0x13, 0x28),
+            (0x15, 0xe7),
+            (0x16, 0x05),
+            (0x17, 0xe3),
+        ] {
+            vga.write_port(0x3D4, idx);
+            vga.write_port(0x3D5, val);
+        }
+        // ATC 10h = graphics (bit 0) + 8-bit color (bit 6): the decision write.
+        vga.read_status1();
+        vga.write_port(0x3C0, 0x10);
+        vga.write_port(0x3C0, 0x41);
+
+        assert_eq!(vga.active_mode(), VideoMode::ModeX);
+        assert_eq!(vga.raster_width(), 320);
+        // Guest vertical timing captured from text-mode CRTC writes (not canonical
+        // 320x200): VDE 0x1df + 1 = 480 scanlines, double-scanned (09h bit 7) to 240.
+        assert_eq!(vga.crtc.vdisp_end, 480);
+        assert!(vga.crtc.double_scan);
     }
 
     #[test]
