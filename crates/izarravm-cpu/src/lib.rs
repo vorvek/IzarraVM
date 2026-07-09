@@ -979,6 +979,101 @@ enum LazyFlagOp {
     Logic,
 }
 
+/// Packed pending flags for native code emission (v2 inlining).
+/// (tag & (1<<31)) == 0 means none.
+/// Layout is #[repr(C)] so emitted x86-64 can write it directly from scratch regs.
+/// Packing (little-endian tag):
+///   bits  0-7 : op (0=Add, 1=Sub, 2=Logic)
+///   bits  8-15: width (0=Byte, 1=Word, 2=Dword as BusWidth discriminant)
+///   bit  16   : has_cf_override
+///   bit  17   : cf value (if has)
+///   bit  31   : has-pending (set for any valid pending)
+/// a/b/result are the raw operands and result (masked by caller as before).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PendingFlags {
+    pub tag: u32,
+    pub a: u32,
+    pub b: u32,
+    pub result: u32,
+}
+
+impl PendingFlags {
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        (self.tag & (1u32 << 31)) == 0
+    }
+
+    #[inline]
+    pub(crate) fn op(&self) -> LazyFlagOp {
+        match self.tag & 0xff {
+            0 => LazyFlagOp::Add,
+            1 => LazyFlagOp::Sub,
+            _ => LazyFlagOp::Logic,
+        }
+    }
+
+    #[inline]
+    pub fn width(&self) -> BusWidth {
+        match (self.tag >> 8) & 0xff {
+            0 => BusWidth::Byte,
+            1 => BusWidth::Word,
+            _ => BusWidth::Dword,
+        }
+    }
+
+    #[inline]
+    pub fn cf_override(&self) -> Option<bool> {
+        if (self.tag & (1 << 16)) != 0 {
+            Some((self.tag & (1 << 17)) != 0)
+        } else {
+            None
+        }
+    }
+
+    /// Return a copy with the CF override set (for special-case set_flag on CF while pending).
+    pub fn with_cf_override(self, cf: bool) -> Self {
+        let mut tag = self.tag;
+        tag |= 1 << 16;
+        if cf {
+            tag |= 1 << 17;
+        } else {
+            tag &= !(1 << 17);
+        }
+        Self { tag, ..self }
+    }
+
+    /// Pack a legacy LazyFlags into the C form used by the emitter.
+    /// This is the bridge during v2 migration.
+    pub(crate) fn from_legacy(l: &LazyFlags) -> Self {
+        let op = match l.op {
+            LazyFlagOp::Add => 0u32,
+            LazyFlagOp::Sub => 1,
+            LazyFlagOp::Logic => 2,
+        };
+        let w = match l.width {
+            BusWidth::Byte => 0,
+            BusWidth::Word => 1,
+            BusWidth::Dword => 2,
+        };
+        let mut tag = op | (w << 8);
+        if let Some(cf) = l.cf_override {
+            tag |= 1 << 16;
+            if cf {
+                tag |= 1 << 17;
+            }
+        }
+        tag |= 1u32 << 31; // mark has-pending
+        Self {
+            tag,
+            a: l.a,
+            b: l.b,
+            result: l.result,
+        }
+    }
+}
+
+/// Legacy wrapper for the short term (will be removed once all sites use PendingFlags directly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LazyFlags {
     a: u32,
@@ -1053,6 +1148,11 @@ pub struct PerfCounters {
     /// emitted code + the `record_write_page`/`note_code_write` finish call, skipping the `region_step`
     /// call). Same gating + Doom-inertness as `jit_native_load_hits`.
     pub jit_native_store_hits: u64,
+    /// For paged fold investigation (low native hit rate on Doom): bumped in the emitted
+    /// paged probe right after successful TLB translate (before the physical page-cache probe).
+    /// Compare to jit_native_*_hits to see TLB hit rate within admitted paged fold slots.
+    /// Also helps separate TLB thrash from direct-page cache thrash.
+    pub jit_paged_tlb_successes: u64,
     pub data_direct_reads: u64,
     pub data_slow_reads: u64,
     pub data_direct_writes: u64,
@@ -1279,16 +1379,15 @@ pub struct Cpu386 {
     perf: PerfCounters,
     /// Optional host-side profiling. Off for normal execution and excluded from equality.
     profile: CpuProfileState,
-    /// Deferred arithmetic flags (lazy-flags optimization). While `Some`, the six arithmetic-flag
+    /// Deferred arithmetic flags (lazy-flags optimization). While not none, the six arithmetic-flag
     /// bits in `registers.eflags` are stale. Cpu386 equality is flag-representation-sensitive while a
     /// deferral is outstanding; real flag comparisons go through `flag()` / `eflags()`, which
     /// materialize. (Cpu386 `==` is currently unused.)
     ///
-    /// HANDLER INVARIANT: instruction handlers must NOT read `registers.eflags` directly for the
-    /// arithmetic bits (CF/PF/AF/ZF/SF/OF) — those may be deferred here. Read the live value via
-    /// `flag()` (single bit) or `eflags()`/`materialized_eflags()` (whole word), or call
-    /// `materialize_flags()` before a read-modify-write of the whole word.
-    pending_flags: Option<LazyFlags>,
+    /// Stored as the #[repr(C)] PendingFlags form so native emitted code can write it directly
+    /// (v2 inlining). Legacy LazyFlags is only for conversion during the final migration of
+    /// a few sites. Interpreter wall must not regress (A/B first).
+    pending_flags: PendingFlags,
     /// Cached `CR0.AM && EFLAGS.AC`, so the per-data-access #AC gate in `check_alignment`
     /// is a single bool test instead of two register loads. Pure derived state, recomputed
     /// by `recompute_alignment_armed` at every writer that can change either bit (see that
@@ -2549,12 +2648,14 @@ impl Cpu386 {
     /// Compute the six arithmetic flags `pending_flags` represents, returning the full eflags value with
     /// them applied (control flags untouched). Pure: does not mutate. Returns current eflags if no pending.
     fn materialized_eflags(&self) -> u32 {
-        let Some(p) = self.pending_flags else {
+        if self.pending_flags.is_none() {
             return self.registers.eflags;
-        };
-        let mask = width_mask(p.width);
-        let sign = width_sign(p.width);
-        let (cf, of, af, clear) = match p.op {
+        }
+        let p = &self.pending_flags;
+        let w = p.width();
+        let mask = width_mask(w);
+        let sign = width_sign(w);
+        let (cf, of, af, clear) = match p.op() {
             LazyFlagOp::Sub => (
                 u64::from(p.a) < u64::from(p.b),
                 ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
@@ -2574,7 +2675,7 @@ impl Cpu386 {
                 FLAG_CF | FLAG_OF | FLAG_ZF | FLAG_SF | FLAG_PF,
             ),
         };
-        let cf = p.cf_override.unwrap_or(cf);
+        let cf = p.cf_override().unwrap_or(cf);
         let zf = p.result & mask == 0;
         let sf = p.result & sign != 0;
         let pf = parity(p.result as u8);
@@ -2602,9 +2703,9 @@ impl Cpu386 {
 
     /// Settle any pending arithmetic flags into `registers.eflags` and clear `pending_flags`.
     fn materialize_flags(&mut self) {
-        if self.pending_flags.is_some() {
+        if !self.pending_flags.is_none() {
             self.registers.eflags = self.materialized_eflags();
-            self.pending_flags = None;
+            self.pending_flags = PendingFlags::default();
             self.perf.flag_materializations += 1;
         }
     }
@@ -2876,14 +2977,13 @@ impl Cpu386 {
         access & 0x08 == 0 && access & 0x02 != 0
     }
 
-    /// Whether a block admitted now may use the native cost-fold LOAD probe: the Approximate timing
-    /// class (486/586, where the folded bus cost constants apply), unpaged (the probe assumes linear ==
-    /// physical — re-plan trap #1), and a flat DS (see `jit_segment_flat`). The class and PG are in
-    /// `jit_mode_key` (so a class/paging change re-admits); DS flatness is re-checked per entry.
+    /// Whether a block admitted now may use the native cost-fold LOAD/STORE probe: Approximate class
+    /// (486/586) + flat DS. Both unpaged and paged are supported (the paged path inserts a TLB
+    /// linear->physical translate before the physical-keyed page-cache probe). The class and PG bit
+    /// are in `jit_mode_key` (paging transition re-admits); DS flatness/writability re-checked per entry.
     #[cfg(feature = "jit")]
     fn jit_fold_block_eligible(&self) -> bool {
         matches!(self.level, CpuLevel::I486 | CpuLevel::I586)
-            && self.control.cr0 & CR0_PG == 0
             && self.jit_segment_flat(SegmentIndex::Ds)
     }
 
@@ -10352,7 +10452,7 @@ impl Cpu386 {
         self.registers.eflags = merged;
         // The loaded image is the new truth for every flag bit; any deferred descriptor would
         // otherwise override the arithmetic bits we just wrote.
-        self.pending_flags = None;
+        self.pending_flags = PendingFlags::default();
         // The dword form can change EFLAGS.AC (the word form keeps the high half).
         self.recompute_alignment_armed();
     }
@@ -10986,7 +11086,7 @@ impl Cpu386 {
         }
         self.registers.eflags = eflags | 0x2;
         // The incoming task's eflags is the new truth; drop any stale arithmetic descriptor.
-        self.pending_flags = None;
+        self.pending_flags = PendingFlags::default();
         self.recompute_alignment_armed();
         self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
@@ -11413,7 +11513,7 @@ impl Cpu386 {
         const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
         // Route only a single, purely-arithmetic flag bit through the pending descriptor; a control
         // bit or multi-bit query falls through to the live eflags.
-        if self.pending_flags.is_some() && (flag & ARITH) != 0 && (flag & !ARITH) == 0 {
+        if !self.pending_flags.is_none() && (flag & ARITH) != 0 && (flag & !ARITH) == 0 {
             return self.arith_flag(flag);
         }
         self.registers.eflags & flag != 0
@@ -11423,30 +11523,31 @@ impl Cpu386 {
     /// so reads never force materialization. For any non-arithmetic (control) flag, or no pending, reads
     /// `registers.eflags` directly.
     fn arith_flag(&self, flag: u32) -> bool {
-        let Some(p) = self.pending_flags else {
+        if self.pending_flags.is_none() {
             return self.registers.eflags & flag != 0;
-        };
-        let mask = width_mask(p.width);
-        let sign = width_sign(p.width);
+        }
+        let p = &self.pending_flags;
+        let mask = width_mask(p.width());
+        let sign = width_sign(p.width());
         match flag {
             FLAG_ZF => p.result & mask == 0,
             FLAG_SF => p.result & sign != 0,
             FLAG_PF => parity(p.result as u8),
-            FLAG_AF if p.op == LazyFlagOp::Logic => self.registers.eflags & FLAG_AF != 0,
+            FLAG_AF if p.op() == LazyFlagOp::Logic => self.registers.eflags & FLAG_AF != 0,
             FLAG_AF => ((p.a ^ p.b ^ p.result) & 0x10) != 0,
             FLAG_CF => {
-                if let Some(cf) = p.cf_override {
+                if let Some(cf) = p.cf_override() {
                     cf
-                } else if p.op == LazyFlagOp::Logic {
+                } else if p.op() == LazyFlagOp::Logic {
                     false
-                } else if p.op == LazyFlagOp::Sub {
+                } else if p.op() == LazyFlagOp::Sub {
                     u64::from(p.a) < u64::from(p.b)
                 } else {
                     u64::from(p.a) + u64::from(p.b) > u64::from(mask)
                 }
             }
-            FLAG_OF if p.op == LazyFlagOp::Logic => false,
-            FLAG_OF if p.op == LazyFlagOp::Sub => ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
+            FLAG_OF if p.op() == LazyFlagOp::Logic => false,
+            FLAG_OF if p.op() == LazyFlagOp::Sub => ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
             FLAG_OF => ((p.a ^ p.result) & (p.b ^ p.result) & sign) != 0,
             _ => self.registers.eflags & flag != 0, // unreachable under flag()'s guard; defensive
         }
@@ -11470,11 +11571,12 @@ impl Cpu386 {
 
     fn set_flag(&mut self, flag: u32, enabled: bool) {
         const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
-        if self.pending_flags.is_some() {
+        if !self.pending_flags.is_none() {
             let arith = flag & ARITH;
             if flag == FLAG_CF {
-                if let Some(p) = &mut self.pending_flags {
-                    p.cf_override = Some(enabled);
+                if !self.pending_flags.is_none() {
+                    let p = self.pending_flags; // copy
+                    self.pending_flags = p.with_cf_override(enabled);
                 }
                 self.registers.eflags |= 0x2;
                 return;
@@ -11669,7 +11771,7 @@ impl Cpu386 {
         } else {
             value.wrapping_add(1) & mask
         };
-        self.pending_flags = Some(LazyFlags {
+        let lf = LazyFlags {
             a: value,
             b: 1,
             result,
@@ -11680,7 +11782,8 @@ impl Cpu386 {
                 LazyFlagOp::Add
             },
             cf_override: Some(carry),
-        });
+        };
+        self.pending_flags = PendingFlags::from_legacy(&lf);
         result
     }
 
@@ -11706,14 +11809,15 @@ impl Cpu386 {
         let a = a & mask;
         let b = b & mask;
         let result = ((u64::from(a) + u64::from(b)) as u32) & mask;
-        self.pending_flags = Some(LazyFlags {
+        let lf = LazyFlags {
             a,
             b,
             result,
             width,
             op: LazyFlagOp::Add,
             cf_override: None,
-        });
+        };
+        self.pending_flags = PendingFlags::from_legacy(&lf);
         result
     }
 
@@ -11739,14 +11843,15 @@ impl Cpu386 {
         let a = a & mask;
         let b = b & mask;
         let result = (u64::from(a).wrapping_sub(u64::from(b)) as u32) & mask;
-        self.pending_flags = Some(LazyFlags {
+        let lf = LazyFlags {
             a,
             b,
             result,
             width,
             op: LazyFlagOp::Sub,
             cf_override: None,
-        });
+        };
+        self.pending_flags = PendingFlags::from_legacy(&lf);
         result
     }
 
@@ -11759,14 +11864,15 @@ impl Cpu386 {
             self.registers.eflags &= !FLAG_AF;
         }
         self.registers.eflags |= 0x2;
-        self.pending_flags = Some(LazyFlags {
+        let lf = LazyFlags {
             a: 0,
             b: 0,
             result,
             width,
             op: LazyFlagOp::Logic,
             cf_override: None,
-        });
+        };
+        self.pending_flags = PendingFlags::from_legacy(&lf);
         result
     }
 
@@ -11923,7 +12029,7 @@ impl Cpu386 {
     }
 
     fn set_szp(&mut self, result: u32, width: BusWidth) {
-        if self.pending_flags.is_some() {
+        if !self.pending_flags.is_none() {
             self.materialize_flags();
         }
         self.set_szp_live(result, width);
@@ -11964,7 +12070,7 @@ impl Cpu386 {
             None => self.flag(FLAG_OF),
         };
         let af = self.flag(FLAG_AF);
-        self.pending_flags = None;
+        self.pending_flags = PendingFlags::default();
         self.set_flag_live(FLAG_CF, cf);
         self.set_flag_live(FLAG_OF, of);
         self.set_flag_live(FLAG_AF, af);
@@ -12020,22 +12126,40 @@ impl Cpu386 {
     /// linear address to record_write_page; here they are equal). Called via the `store_finish_fn`
     /// fn-pointer so the native store's `written_pages` + decode-cache SMC state stay interpreter-exact.
     #[cfg(feature = "jit")]
-    pub(crate) fn jit_store_u8_finish(&mut self, physical: u32) {
-        self.record_write_page(physical);
-        self.note_code_write(physical, 1);
+    pub(crate) fn jit_store_u8_finish(&mut self, addr: u32) {
+        // addr is the EA the probe recomputed (linear under flat DS).
+        // Under paging the native store path must pass PHYSICAL to record and note (decode cache
+        // and written_pages are physical-keyed; the interpreter's paged write path does so via
+        // translate). The TLB hit in the probe guarantees a fast lookup here.
+        if self.control.cr0 & CR0_PG != 0 {
+            let page = addr >> 12;
+            if let Some(e) = self.tlb.lookup(page) {
+                let phys = e.phys | (addr & 0x0fff);
+                self.record_write_page(phys);
+                self.note_code_write(phys, 1);
+                return;
+            }
+            // Fallback (should not happen inside a hot native region): use addr (will be reconciled).
+            self.record_write_page(addr);
+            self.note_code_write(addr, 1);
+        } else {
+            self.record_write_page(addr);
+            self.note_code_write(addr, 1);
+        }
     }
 
     #[cfg(feature = "jit")]
     pub(crate) fn jit_set_pending_add(&mut self, a: u32, b: u32) {
         let result = a.wrapping_add(b);
-        self.pending_flags = Some(LazyFlags {
+        let lf = LazyFlags {
             a,
             b,
             result,
             width: BusWidth::Dword,
             op: LazyFlagOp::Add,
             cf_override: None,
-        });
+        };
+        self.pending_flags = PendingFlags::from_legacy(&lf);
     }
 
     /// Update flags for a 32-bit SHR of `value` by `raw_count`, exactly as
@@ -14373,6 +14497,8 @@ mod tests {
         assert_eq!(core::mem::offset_of!(RegionCtx, charge_fetch_fn), 32);
         assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
         assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
+        // Pending flags offset for direct write in v2 inlining (slice 2+).
+        assert_eq!(core::mem::offset_of!(Cpu386, pending_flags), 3912);
         // Verify the timing-field offsets the native cap check uses.
         let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
         eprintln!("raw_clocks offset = {raw_off}");
@@ -14491,8 +14617,8 @@ mod tests {
                 );
                 // No descriptor should be outstanding after a shift (shifts materialize eagerly).
                 assert_eq!(
-                    jit_cpu.pending_flags.is_some(),
-                    ref_cpu.pending_flags.is_some(),
+                    jit_cpu.pending_flags.tag & (1u32 << 31) != 0,
+                    ref_cpu.pending_flags.tag & (1u32 << 31) != 0,
                     "jit_set_shift_flags_shr({value:#x}, {count}) pending-state diverges"
                 );
             }
@@ -23920,7 +24046,7 @@ mod tests {
             cpu.registers.eip = 0;
             cpu.registers.set_eax(0);
             cpu.registers.set_ebx(0);
-            cpu.pending_flags = None;
+            cpu.pending_flags = PendingFlags::default();
             cpu.halted = false;
             cpu.reset_perf_counters();
 
@@ -23929,7 +24055,7 @@ mod tests {
             assert_eq!(cpu.registers.eip, 0x0d, "run stopped at HLT");
             assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234, "branch was taken");
             assert!(
-                cpu.pending_flags.is_some(),
+                cpu.pending_flags.tag & (1u32 << 31) != 0,
                 "TEST flags should remain deferred after JZ/JNZ reads ZF"
             );
             assert_eq!(
@@ -24157,7 +24283,7 @@ mod tests {
         cpu.registers.set_edx(0);
         cpu.write_reg16(Reg16::Si, 0);
         cpu.registers.eflags = 0x02;
-        cpu.pending_flags = None;
+        cpu.pending_flags = PendingFlags::default();
         bus.memory[0x40..0x42].fill(0);
         cpu.halted = false;
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
@@ -32814,15 +32940,16 @@ mod tests {
         // pending-derived ZF intact, without forcing the rest of the lazy flags live.
         let mut cpu = Cpu386::default();
         let r = cpu.alu_add_eager(0xff, 0x01, 0, BusWidth::Byte); // CF=1, ZF=1 (result 0x00)
+        let lf = LazyFlags {
+            a: 0xff,
+            b: 0x01,
+            result: r,
+            width: BusWidth::Byte,
+            op: LazyFlagOp::Add,
+            cf_override: None,
+        };
         let mut lazy = Cpu386 {
-            pending_flags: Some(LazyFlags {
-                a: 0xff,
-                b: 0x01,
-                result: r,
-                width: BusWidth::Byte,
-                op: LazyFlagOp::Add,
-                cf_override: None,
-            }),
+            pending_flags: PendingFlags::from_legacy(&lf),
             ..Default::default()
         };
         lazy.reset_perf_counters();
@@ -32833,7 +32960,7 @@ mod tests {
             "ZF from the pending descriptor must survive"
         );
         assert!(
-            lazy.pending_flags.is_some(),
+            lazy.pending_flags.tag & (1u32 << 31) != 0,
             "single-CF writes should use the lazy CF override"
         );
         assert_eq!(
@@ -32853,7 +32980,7 @@ mod tests {
         assert!(lazy.flag(FLAG_DF), "DF write must be visible");
         assert!(lazy.flag(FLAG_ZF), "pending arithmetic flags must survive");
         assert!(
-            lazy.pending_flags.is_some(),
+            lazy.pending_flags.tag & (1u32 << 31) != 0,
             "non-arithmetic writes should not settle pending arithmetic flags"
         );
         assert_eq!(
@@ -32885,19 +33012,20 @@ mod tests {
                 } else {
                     eager.alu_add_eager(a, b, 0, w)
                 };
+                let lf = LazyFlags {
+                    a: a & width_mask(w),
+                    b: b & width_mask(w),
+                    result: r,
+                    width: w,
+                    op: if is_sub {
+                        LazyFlagOp::Sub
+                    } else {
+                        LazyFlagOp::Add
+                    },
+                    cf_override: None,
+                };
                 let lazy = Cpu386 {
-                    pending_flags: Some(LazyFlags {
-                        a: a & width_mask(w),
-                        b: b & width_mask(w),
-                        result: r,
-                        width: w,
-                        op: if is_sub {
-                            LazyFlagOp::Sub
-                        } else {
-                            LazyFlagOp::Add
-                        },
-                        cf_override: None,
-                    }),
+                    pending_flags: PendingFlags::from_legacy(&lf),
                     ..Default::default()
                 };
                 for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
@@ -32923,7 +33051,10 @@ mod tests {
             let mut lazy = Cpu386::default();
             let lr = lazy.alu_add(a, b, 0, w);
             assert_eq!(lr, er, "result");
-            assert!(lazy.pending_flags.is_some(), "carry-0 ADD must defer");
+            assert!(
+                lazy.pending_flags.tag & (1u32 << 31) != 0,
+                "carry-0 ADD must defer"
+            );
             for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
                 assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x}");
             }
@@ -32942,7 +33073,10 @@ mod tests {
             let mut lazy = Cpu386::default();
             let lr = lazy.alu_sub(a, b, 0, w);
             assert_eq!(lr, er, "result");
-            assert!(lazy.pending_flags.is_some(), "borrow-0 SUB must defer");
+            assert!(
+                lazy.pending_flags.tag & (1u32 << 31) != 0,
+                "borrow-0 SUB must defer"
+            );
             for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
                 assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x}");
             }
@@ -32954,15 +33088,16 @@ mod tests {
         // Reading the whole eflags word (e.g. via eflags()) after a pending op must equal the eager result.
         let mut eager = Cpu386::default();
         let r = eager.alu_add_eager(0x80, 0x80, 0, BusWidth::Byte); // CF=1, OF=1, ZF=1
+        let lf = LazyFlags {
+            a: 0x80,
+            b: 0x80,
+            result: r,
+            width: BusWidth::Byte,
+            op: LazyFlagOp::Add,
+            cf_override: None,
+        };
         let mut lazy = Cpu386 {
-            pending_flags: Some(LazyFlags {
-                a: 0x80,
-                b: 0x80,
-                result: r,
-                width: BusWidth::Byte,
-                op: LazyFlagOp::Add,
-                cf_override: None,
-            }),
+            pending_flags: PendingFlags::from_legacy(&lf),
             ..Default::default()
         };
         assert_eq!(
@@ -32981,7 +33116,10 @@ mod tests {
         cpu.set_flag(FLAG_AF | FLAG_CF | FLAG_OF, true);
         let result = cpu.alu(4, 0xf0, 0x0f, BusWidth::Byte);
         assert_eq!(result, 0);
-        assert!(cpu.pending_flags.is_some(), "logic flags stay lazy");
+        assert!(
+            cpu.pending_flags.tag & (1u32 << 31) != 0,
+            "logic flags stay lazy"
+        );
         assert!(!cpu.flag(FLAG_CF));
         assert!(!cpu.flag(FLAG_OF));
         assert!(cpu.flag(FLAG_ZF));
@@ -32998,7 +33136,7 @@ mod tests {
         let result = cpu.inc_dec(0xffff, false, BusWidth::Word);
         assert_eq!(result, 0);
         assert!(
-            cpu.pending_flags.is_some(),
+            cpu.pending_flags.tag & (1u32 << 31) != 0,
             "INC should not materialize just to keep CF"
         );
         assert!(cpu.flag(FLAG_CF), "INC preserves CF");
@@ -33007,7 +33145,10 @@ mod tests {
         cpu.set_flag(FLAG_CF, false);
         let result = cpu.inc_dec(0, true, BusWidth::Byte);
         assert_eq!(result, 0xff);
-        assert!(cpu.pending_flags.is_some(), "DEC should stay lazy");
+        assert!(
+            cpu.pending_flags.tag & (1u32 << 31) != 0,
+            "DEC should stay lazy"
+        );
         assert!(!cpu.flag(FLAG_CF), "DEC preserves CF");
         assert!(cpu.flag(FLAG_SF));
     }
@@ -35866,9 +36007,8 @@ mod tests {
         // ---- Round 3 native byte-LOAD probe (isolation test of the emitted assembly) ----
 
         /// Emit `emit_load_u8_probe` wrapped in a callable prologue/epilogue (pin cpu in R12, regs base
-        /// in R14, per the template ABI), run it against the live CPU, and return whether it hit (the
-        /// page-cache probe found the page) or missed. On a hit the emitted code has written the loaded
-        /// byte into `gpr[dst]`'s byte lane.
+        /// in RBP per current emit_region v3 ABI), run it against the live CPU, and return whether it hit.
+        /// On a hit the emitted code has written the loaded byte into `gpr[dst]`'s byte lane.
         fn run_load_probe(
             cpu: &mut Cpu386,
             base: u8,
@@ -35880,6 +36020,7 @@ mod tests {
             let regs_off = std::mem::offset_of!(Cpu386, registers) as u32;
             let mut e = Encoder::new();
             e.push(Reg::RBX);
+            e.push(Reg::RBP);
             e.push(Reg::R12);
             e.push(Reg::R13);
             e.push(Reg::R14);
@@ -35888,13 +36029,13 @@ mod tests {
             e.mov_r64_r64(Reg::R12, Reg::RCX); // win64 arg0 = cpu
             #[cfg(not(windows))]
             e.mov_r64_r64(Reg::R12, Reg::RDI); // sysv arg0 = cpu
-            e.mov_r64_r64(Reg::R14, Reg::R12);
+            e.mov_r64_r64(Reg::RBP, Reg::R12);
             if regs_off != 0 {
-                e.add_r64_imm32(Reg::R14, regs_off);
+                e.add_r64_imm32(Reg::RBP, regs_off);
             }
             let miss = e.label();
             let done = e.label();
-            jit::block::emit_load_u8_probe(&mut e, base, index, disp, dst, miss);
+            jit::block::emit_load_u8_probe(&mut e, base, index, disp, dst, miss, false);
             e.mov_r32_imm32(Reg::RAX, 1); // hit: fall through here (gpr already written)
             e.jmp(done);
             e.place(miss);
@@ -35904,6 +36045,7 @@ mod tests {
             e.pop(Reg::R14);
             e.pop(Reg::R13);
             e.pop(Reg::R12);
+            e.pop(Reg::RBP);
             e.pop(Reg::RBX);
             e.ret();
             let bytes = e.finish();
@@ -36422,17 +36564,17 @@ mod tests {
             assert_fold_state_identical(prog, &arm, Some(true), None, true);
         }
 
-        /// Paged (CR0.PG=1, the Doom/Quake anchor mode): the unpaged native probe is gated OFF by the PG
-        /// bit in `jit_mode_key`, so the byte load falls to the trampoline and stays identical — proving
-        /// the fold toggle does NOT break the paged path and native hits stay 0. This is the increment's
-        /// Doom-inertness in miniature (the anchors run paged, so this first cut cannot move them).
+        /// Paged (CR0.PG=1, the Doom/Quake anchor mode) with the paged native probe: linear->physical
+        /// via TLB before the physical page-cache probe. The #455 harness uses a NON-IDENTITY map
+        /// (lin 0x10000->phys 0x8000 etc) so a linear-as-physical bug would read wrong frames and fail
+        /// assert_state_identical instantly. Both LOAD and STORE must hit native and state must match.
         #[test]
-        fn fold_paged_copy_loop_is_state_identical_with_native_gated_off() {
+        fn fold_paged_copy_loop_is_state_identical_and_native() {
             let interp = assert_fold_state_identical(
                 paged_copy_program(200),
                 &pg_arm(PG_SRC_LIN, PG_DST_LIN),
-                Some(false),
-                Some(false),
+                Some(true),
+                Some(true),
                 true,
             );
             assert!(
