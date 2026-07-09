@@ -995,7 +995,16 @@ pub fn beam_hsync(t: &CrtcTiming, dots: u64) -> bool {
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
     // HLE fast linear buffer for mode 13h (Phase 5 fast path for common games).
-    #[allow(dead_code)]
+    // Wired for cpu chain4 writes/reads and render_256color_row (for Mode13h).
+    // Compatibility gaps identified for Phase 5 (to address in fast paths + coverage):
+    // - Pel pan + split screen + line compare edge cases (partly exercised in tests; A2/A3 in gap notes).
+    // - Unchained mode X/Y fast path (still planar; linear only for chained 13h).
+    // - LFB direct for margo/distira (separate paths, may need similar HLE buffers for scanout).
+    // - Retrace status (3DA) polling for vblank/palette updates (beam model exists but games may rely on exact).
+    // - DAC/palette mid-frame writes and snow avoidance.
+    // - 320x240+ mode13h variants via CRTC retune (linear sized to 64k; wrap?).
+    // - Text mode gaps (A1-A6) already handled in render paths.
+    // - Content gen / dirty region for host GUI with HLE bypass.
     pub(crate) mode13_linear: Vec<u8>,
     pub(crate) crtc: CrtcTiming,
     pub(crate) crtc_regs: CrtcRegs,
@@ -1928,6 +1937,18 @@ impl Vga {
         let row_scan = counter_line - first_line + self.preset_row_scan(below_split);
         let source_row = row_scan / self.scan_factor();
         let row_base = start + source_row * self.crtc.offset * 2 + self.byte_pan(below_split);
+        if self.mode == VideoMode::Mode13h {
+            // HLE fast path: direct linear buffer (Phase 5). Mode 13h is flat 256-color;
+            // byte pan applies directly. Keeps split/pan/scan math for compatibility.
+            let base = (start + source_row * self.crtc.offset * 2) as usize;
+            let pan = self.pel_pan(below_split) & 0x03;
+            let mut row = vec![0u8; width];
+            for (x, slot) in row.iter_mut().enumerate() {
+                let src = (base + pan + x) & 0xffff_usize;
+                *slot = self.mode13_linear.get(src).copied().unwrap_or(0) & self.pel_mask;
+            }
+            return row;
+        }
         // Mode-X pel-pan: one plane per pel, so the fine range is 0-3 (a pan of 4
         // equals a start-address bump). The below-split forcing is shared with the
         // 16-color path through pel_pan.
@@ -2711,6 +2732,9 @@ impl Vga {
     /// ch.47).
     pub fn cpu_write_chain4(&mut self, offset: usize, data: u8) {
         self.bump_content_gen();
+        if self.mode == VideoMode::Mode13h && offset < self.mode13_linear.len() {
+            self.mode13_linear[offset] = data;
+        }
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
         if plane_off < VGA_PLANE_SIZE {
@@ -2722,6 +2746,9 @@ impl Vga {
     /// `N >> 2` via the low two address bits, the symmetric counterpart to
     /// `cpu_write_chain4`.
     pub fn cpu_read_chain4(&self, offset: usize) -> u8 {
+        if self.mode == VideoMode::Mode13h && offset < self.mode13_linear.len() {
+            return self.mode13_linear[offset];
+        }
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
         if plane_off < VGA_PLANE_SIZE {
@@ -3522,6 +3549,7 @@ impl Vga {
         self.mode = VideoMode::Mode13h;
         if clear {
             self.vram.fill(0);
+            self.mode13_linear.fill(0);
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
