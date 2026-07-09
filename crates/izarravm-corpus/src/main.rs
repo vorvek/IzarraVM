@@ -137,19 +137,5 @@ fn launcher_kind(path: &Path) -> Option<LauncherKind> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_dos_launchers_case_insensitively() {
-        assert_eq!(
-            launcher_kind(Path::new("GAME.EXE")),
-            Some(LauncherKind::Exe)
-        );
-        assert_eq!(
-            launcher_kind(Path::new("START.bat")),
-            Some(LauncherKind::Bat)
-        );
-        assert_eq!(launcher_kind(Path::new("README.TXT")), None);
-    }
-}
+#[path = "corpus_test.rs"]
+mod tests;

@@ -1,0 +1,104 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+use super::*;
+
+#[test]
+fn round_trips_through_toml() {
+    let prefs = GuiPrefs {
+        master_volume: 0.65,
+        amp_gain: 55,
+        pc_speaker_volume: 40,
+        glide_render_threads: 4,
+        crt_style: CrtStyle::YeOlde,
+        input_release: KeyBinding::new(true, true, false, "F4"),
+        fullscreen: KeyBinding::new(false, false, true, "Enter"),
+        last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
+        last_cd_image: Some(PathBuf::from("/tmp/game.iso")),
+        last_cd_folder: None,
+        panel_open: false,
+    };
+    let text = toml::to_string_pretty(&prefs).expect("serialize");
+    let parsed: GuiPrefs = toml::from_str(&text).expect("deserialize");
+    assert_eq!(parsed, prefs);
+}
+
+#[test]
+fn missing_keys_fall_back_to_defaults() {
+    // An empty file should parse into the full default set, so a partial or
+    // older file never fails to load.
+    let parsed: GuiPrefs = toml::from_str("").expect("deserialize empty");
+    assert_eq!(parsed, GuiPrefs::default());
+    assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
+    assert_eq!(parsed.amp_gain, DEFAULT_AMP_GAIN);
+    assert_eq!(parsed.pc_speaker_volume, DEFAULT_PC_SPEAKER_VOLUME);
+    assert_eq!(parsed.glide_render_threads, 2);
+    assert_eq!(
+        parsed.crt_style,
+        CrtStyle::Subtle,
+        "CRT defaults to the subtle look for older files"
+    );
+    assert_eq!(
+        parsed.input_release,
+        KeyBinding::new(true, false, false, "F2")
+    );
+    assert_eq!(
+        parsed.fullscreen,
+        KeyBinding::new(true, false, false, "F11")
+    );
+    assert!(parsed.panel_open, "panel defaults to open for older files");
+}
+
+#[test]
+fn key_binding_display_strips_winit_prefixes() {
+    assert_eq!(
+        KeyBinding::new(true, false, false, "F2").display(),
+        "Ctrl+F2"
+    );
+    assert_eq!(
+        KeyBinding::new(true, true, true, "KeyA").display(),
+        "Ctrl+Shift+Alt+A"
+    );
+    assert_eq!(
+        KeyBinding::new(false, false, false, "Digit5").display(),
+        "5"
+    );
+}
+
+#[test]
+fn crt_style_serialises_lowercase() {
+    assert_eq!(
+        toml::Value::try_from(CrtStyle::YeOlde).unwrap().as_str(),
+        Some("yeolde")
+    );
+    assert_eq!(CrtStyle::default(), CrtStyle::Subtle);
+    assert_eq!(CrtStyle::Off.as_u32(), 0);
+    assert_eq!(CrtStyle::YeOlde.as_u32(), 2);
+}
+
+#[test]
+fn glide_render_threads_are_limited_to_86box_choices() {
+    let mut path = std::env::temp_dir();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    path.push(format!(
+        "izarravm-prefs-{}-{}.conf",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::write(&path, "glide_render_threads = 3\n").expect("write prefs");
+
+    let prefs = GuiPrefs::load(&path);
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(prefs.glide_render_threads, 2);
+}
+
+#[test]
+fn prefs_path_sits_beside_c_root() {
+    let c_root = PathBuf::from("/home/user/.izarravm/c_drive");
+    let path = prefs_path(&c_root);
+    assert_eq!(path, PathBuf::from("/home/user/.izarravm/izarravm.conf"));
+}

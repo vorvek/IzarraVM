@@ -13972,5 +13972,5 @@ impl CpuGsw {
 }
 
 #[cfg(test)]
-#[path = "cpu_tests.rs"]
+#[path = "cpu_test.rs"]
 mod tests;
