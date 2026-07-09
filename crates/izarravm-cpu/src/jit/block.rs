@@ -356,7 +356,13 @@ fn fold_store_eligible(insn: &DecodedInsn) -> Option<(u8, Option<u8>, i32, u8)> 
 ///   label. Today only Memory/BackEdge slots exit, via the step fn's nonzero return + `jnz exit`; a
 ///   faulting NATIVE template (the Round 3 memory fast path) will jump to `exit` after spilling, per
 ///   the re-plan's fault rule. A reg-only template never faults and never exits mid-body.
-fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32, fold_native: bool) -> Vec<u8> {
+fn emit_region(
+    slots: &[Slot],
+    regs_offset: u32,
+    scale_den: u32,
+    fold_native: bool,
+    store_fold: bool,
+) -> Vec<u8> {
     let mode = NATIVE_BOOKKEEPING.load(std::sync::atomic::Ordering::Relaxed);
     let mut e = Encoder::new();
     e.push(Reg::RBX);
@@ -443,18 +449,17 @@ fn emit_region(slots: &[Slot], regs_offset: u32, scale_den: u32, fold_native: bo
                 // bookkeeping; a MISS (and every other memory/terminal slot) takes the unchanged
                 // region_step call. `is_store` picks the store probe (which also emits the mandatory
                 // write-finish call-out); both share the miss→region_step fallback structure.
-                let native: Option<(bool, u8, Option<u8>, i32, u8)> =
-                    if fold_native {
-                        match slot.kind {
-                            SlotKind::MemLoadU8 => fold_load_eligible(&slot.insn)
-                                .map(|(b, i, d, r)| (false, b, i, d, r)),
-                            SlotKind::MemStoreU8 => fold_store_eligible(&slot.insn)
-                                .map(|(b, i, d, r)| (true, b, i, d, r)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                let native: Option<(bool, u8, Option<u8>, i32, u8)> = match slot.kind {
+                    SlotKind::MemLoadU8 if fold_native => {
+                        fold_load_eligible(&slot.insn).map(|(b, i, d, r)| (false, b, i, d, r))
+                    }
+                    // A native STORE additionally requires DS writable (store_fold): a read-only flat
+                    // DS passes the flat gate but must #GP on a store, so it falls to region_step here.
+                    SlotKind::MemStoreU8 if store_fold => {
+                        fold_store_eligible(&slot.insn).map(|(b, i, d, r)| (true, b, i, d, r))
+                    }
+                    _ => None,
+                };
                 if let Some((is_store, base, index, disp, reg)) = native {
                     let miss = e.label();
                     let after = e.label();
@@ -1095,11 +1100,21 @@ pub(crate) fn try_admit_gated(
     // DS-flat re-check only runs on regions that emitted a native probe.
     let fold_native =
         FOLD_TIMING.load(std::sync::atomic::Ordering::Relaxed) && cpu.jit_fold_block_eligible();
+    // A native STORE additionally requires DS WRITABLE (a write-cache HIT only proves the physical page
+    // was writable via some segment, not that the current DS permits writes — a read-only flat DS passes
+    // the flat gate but must #GP on a store). Gate the store emit + re-check on writability separately.
+    let store_fold = fold_native && cpu.jit_segment_writable(SegmentIndex::Ds);
     let has_native_fold = fold_native
         && slots.iter().any(|s| {
             (s.kind == SlotKind::MemLoadU8 && fold_load_eligible(&s.insn).is_some())
-                || (s.kind == SlotKind::MemStoreU8 && fold_store_eligible(&s.insn).is_some())
+                || (store_fold
+                    && s.kind == SlotKind::MemStoreU8
+                    && fold_store_eligible(&s.insn).is_some())
         });
+    let has_native_store = store_fold
+        && slots
+            .iter()
+            .any(|s| s.kind == SlotKind::MemStoreU8 && fold_store_eligible(&s.insn).is_some());
     if let Some(idx) = cpu.jit_regions.find(entry_lin, d) {
         let region = cpu
             .jit_regions
@@ -1114,11 +1129,18 @@ pub(crate) fn try_admit_gated(
         region.is_loop = is_loop;
         region.mode_key = mode_key;
         region.has_native_fold = has_native_fold;
+        region.has_native_store = has_native_store;
         // v2 bakes the slot kinds and the add-imm immediates into the emitted bytes (unlike v1,
         // whose buffer encoded only the slot count). A self-patch changes an add slot's immediate,
         // and a rebuild can change the block shape, so the buffer is re-emitted from the fresh slot
         // table.
-        let code = emit_region(&region.ctx.slots, regs_offset, scale_den, fold_native);
+        let code = emit_region(
+            &region.ctx.slots,
+            regs_offset,
+            scale_den,
+            fold_native,
+            store_fold,
+        );
         if let Some(buf) = ExecutableBuffer::new(&code) {
             // SAFETY: same transmute proof as the fresh-admission path below; `code` was produced
             // by emit_region to exactly the RegionEntryFn convention.
@@ -1146,7 +1168,7 @@ pub(crate) fn try_admit_gated(
         return None;
     }
     let terminal_slot = (slots.len() - 1) as u32;
-    let code = emit_region(&slots, regs_offset, scale_den, fold_native);
+    let code = emit_region(&slots, regs_offset, scale_den, fold_native, store_fold);
     let buf = ExecutableBuffer::new(&code)?;
     // SAFETY: `code` was produced by `emit_region` to exactly the `RegionEntryFn` calling
     // convention (alignment proof at STACK_RESERVE); `entry_ptr` stays valid for `buf`'s life,
@@ -1194,6 +1216,7 @@ pub(crate) fn try_admit_gated(
         is_loop,
         mode_key,
         has_native_fold,
+        has_native_store,
     });
     Some(idx)
 }

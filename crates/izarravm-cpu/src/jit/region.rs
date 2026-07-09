@@ -62,6 +62,12 @@ pub(crate) struct CompiledRegion {
     /// runtime value NOT in `mode_key`; `run_region` re-checks DS flatness per entry when this is set and
     /// bails to the interpreter if DS is no longer flat. Regions without native fold slots skip the check.
     pub has_native_fold: bool,
+    /// Whether this region emitted a native cost-fold STORE slot. Those additionally assume DS is
+    /// WRITABLE (a `data_write_pages` HIT only proves the physical page was writable via some segment,
+    /// not that the current DS permits writes), which is also a runtime value not in `mode_key`; when set
+    /// `run_region` re-checks DS writability per entry and bails if DS is now read-only (else the native
+    /// store would silently write where the interpreter #GPs).
+    pub has_native_store: bool,
 }
 
 /// Upper bound on live compiled regions. `find()` reuses a line's entry on re-admission, so the
@@ -221,6 +227,7 @@ mod tests {
             is_loop: true,
             mode_key: 0,
             has_native_fold: false,
+            has_native_store: false,
         }
     }
 

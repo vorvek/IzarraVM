@@ -2861,6 +2861,21 @@ impl Cpu386 {
         d.base == 0 && d.limit == u32::MAX
     }
 
+    /// Whether a data WRITE through `seg` is permitted — the write half of `check_segment_access_kind`.
+    /// The native STORE fold needs this: a `data_write_pages` HIT proves the PHYSICAL page was writable
+    /// via some segment, NOT that the current segment permits writes, so a read-only (but flat) DS would
+    /// pass `jit_segment_flat` yet must still #GP on a store. Real/V86 segments are always writable
+    /// (`0x93`); a protected-mode data descriptor needs the writable bit (type bit 1) and must not be a
+    /// code descriptor (type bit 3). Re-checked per entry for a region with native store slots.
+    #[cfg(feature = "jit")]
+    fn jit_segment_writable(&self, seg: SegmentIndex) -> bool {
+        if !self.is_protected_mode() || self.is_v86_mode() {
+            return true;
+        }
+        let access = self.registers.segment(seg).access;
+        access & 0x08 == 0 && access & 0x02 != 0
+    }
+
     /// Whether a block admitted now may use the native cost-fold LOAD probe: the Approximate timing
     /// class (486/586, where the folded bus cost constants apply), unpaged (the probe assumes linear ==
     /// physical — re-plan trap #1), and a flat DS (see `jit_segment_flat`). The class and PG are in
@@ -3748,11 +3763,12 @@ impl Cpu386 {
         let mode_key = self.jit_mode_key();
         let (num, den) = level_timing(self.level);
         let rem0 = self.timing_rem;
-        // For a region with native cost-fold LOAD slots: DS flatness is a runtime value NOT in the mode
-        // key, so re-check it here per entry (like the per-slot CS-limit check below). Computed before
-        // the region borrow so `self` is free to read the segment. Cheap; only consulted when the region
-        // actually emitted a native probe (has_native_fold).
+        // For a region with native cost-fold LOAD/STORE slots: DS flatness (and, for stores, DS
+        // writability) is a runtime value NOT in the mode key, so re-check it here per entry (like the
+        // per-slot CS-limit check below). Computed before the region borrow so `self` is free to read
+        // the segment. Cheap; only consulted for regions that emitted a native probe.
         let ds_flat = self.jit_segment_flat(SegmentIndex::Ds);
+        let ds_writable = self.jit_segment_writable(SegmentIndex::Ds);
         let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
         let (entry, ctx_ptr) = {
             let Some(region) = self.jit_regions.get_mut(idx) else {
@@ -3781,6 +3797,13 @@ impl Cpu386 {
                 // physical). DS is no longer flat, so the emitted probe would compute the wrong
                 // address. Bail to the interpreter (always correct); leave the stamp so a later entry
                 // re-uses the region if DS becomes flat again (self-healing, no re-admit churn).
+                return Ok(None);
+            }
+            if region.has_native_store && !ds_writable {
+                // A native STORE slot assumes DS permits writes (a write-cache HIT only proves the
+                // physical page was writable via some segment). DS is now read-only, so the native store
+                // would silently write where the interpreter #GPs — bail to the interpreter, which
+                // faults correctly. Self-healing like the flatness check.
                 return Ok(None);
             }
             let ctx = &mut *region.ctx;
@@ -36442,6 +36465,67 @@ mod tests {
                 "the self-store must have triggered the SMC watch (narrow={}, global={})",
                 pc.smc_narrow_kills,
                 pc.decode_inval_smc
+            );
+        }
+
+        /// The STORE fold's writability gate (adversarial-review Finding 1): a `data_write_pages` HIT
+        /// proves the physical page was writable via SOME segment, not that the current DS permits
+        /// writes. A READ-ONLY flat DS (base 0, limit max, no write bit) passes `jit_segment_flat` but a
+        /// store through it must #GP — so the store must NOT fold. Warm+admit with a writable DS (store
+        /// folds), then re-admit with DS read-only and confirm the store is gated off. Unpaged 32-bit
+        /// protected mode with segments set directly (hidden descriptors, no GDT — the pg_arm pattern).
+        #[test]
+        fn read_only_ds_gates_the_store_fold_off() {
+            let _fold = FoldOn::new();
+            let flat = |access: u8| SegmentRegister {
+                selector: 0x08,
+                base: 0,
+                limit: 0xffff_ffff,
+                access,
+                default_size_32: true,
+            };
+            let setup = |cpu: &mut Cpu386, ds_access: u8| {
+                cpu.registers.set_segment(SegmentIndex::Cs, flat(0x9b)); // exec/read
+                cpu.registers.set_segment(SegmentIndex::Ds, flat(ds_access));
+                cpu.registers.set_segment(SegmentIndex::Ss, flat(0x93)); // r/w stack
+                cpu.registers.set_segment(SegmentIndex::Es, flat(0x93));
+                cpu.cpl = 0;
+                cpu.control.cr0 |= CR0_PE; // protected, UNPAGED (PG stays clear)
+                h_arm(0x2000, 0x3000)(cpu); // eip/esp/esi/edi + flags
+            };
+            let prog = {
+                let mut m = h_copy_program();
+                m[H_COUNT..H_COUNT + 4].copy_from_slice(&8u32.to_le_bytes());
+                m
+            };
+            let mut cpu = fresh();
+            let mut bus = TestBus::with_memory(prog);
+            bus.direct_pages_enabled = true;
+
+            // Writable DS: warm the loop's stores + admit → the store folds (has_native_store).
+            setup(&mut cpu, 0x93);
+            assert!(cpu.jit_segment_flat(SegmentIndex::Ds));
+            assert!(cpu.jit_segment_writable(SegmentIndex::Ds));
+            assert!(
+                cpu.jit_fold_block_eligible(),
+                "unpaged flat pmode is fold-eligible"
+            );
+            drive_to_halt(&mut cpu, &mut bus);
+            let idx = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("admit the copy loop");
+            assert!(
+                cpu.jit_regions.get_mut(idx).unwrap().has_native_store,
+                "a writable DS must fold the store"
+            );
+
+            // Read-only flat DS: re-admit reads the current DS and must gate the store off (else it
+            // would silently write where the interpreter #GPs). Still flat, so the LOAD still folds.
+            setup(&mut cpu, 0x90); // present, dpl0, data, read-only (write bit clear)
+            assert!(cpu.jit_segment_flat(SegmentIndex::Ds));
+            assert!(!cpu.jit_segment_writable(SegmentIndex::Ds));
+            let idx2 = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("re-admit");
+            assert!(
+                !cpu.jit_regions.get_mut(idx2).unwrap().has_native_store,
+                "a read-only DS must gate the store fold off"
             );
         }
     }
