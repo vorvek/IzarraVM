@@ -118,6 +118,13 @@ pub(crate) type BusClocksFn = unsafe extern "C" fn(bus: *const c_void) -> u64;
 #[cfg(feature = "jit")]
 pub(crate) type LineLiveFn = unsafe extern "C" fn(cpu: *const Cpu386, lin: u32, d: bool) -> bool;
 
+/// Signature of the native-STORE write-tracking call-out: after the emitted probe writes the byte
+/// through the page-cache pointer, this does the part of `write_memory_u8` that is not the write —
+/// `record_write_page` (unpaged prefetch snapshot) + `note_code_write` (the SMC watch). `physical`
+/// is the store's physical address (== linear, since the store fold is unpaged-gated).
+#[cfg(feature = "jit")]
+pub(crate) type StoreFinishFn = unsafe extern "C" fn(cpu: *mut Cpu386, physical: u32);
+
 /// The mailbox between the dispatch (`Cpu386::run_region`), the emitted code, and the step fns.
 /// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`;
 /// `inline_step_fn` is the second field, loaded from `[ctx + 8]`. Every other field is Rust-only.
@@ -198,12 +205,21 @@ pub(crate) struct RegionCtx {
     /// trampoline (no native slots) it stays 0, so the flush is inert. Reset per entry. (The
     /// per-instruction cost constants the native slots fold from land here alongside the emit.)
     pub folded_raw_bus: u64,
-    /// The raw bus clocks ONE native fold slot charges (fetch + one byte of data), set per entry by
-    /// `run_region` from `bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks()`. The bus-agnostic
-    /// emitted buffer cannot read a bus method (THE WRINKLE in the fold spec), so the dispatch stashes
-    /// the constant here like `scale_den`; a native LOAD slot adds it to `folded_raw_bus`. Zero under the
-    /// trampoline (no native slots read it). Past the disp8 range, so the emit reads it by disp32.
+    /// The raw bus clocks ONE native MEMORY fold slot charges (fetch + one byte of data), set per entry
+    /// by `run_region` from `bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks()`. The
+    /// bus-agnostic emitted buffer cannot read a bus method (THE WRINKLE in the fold spec), so the
+    /// dispatch stashes the constant here like `scale_den`; a native LOAD/STORE slot adds it to
+    /// `folded_raw_bus`. Zero under the trampoline. Past the disp8 range, so the emit reads it by disp32.
     pub fold_bus_cost: u64,
+    /// The raw bus clocks ONE native ALU fold slot charges (instruction fetch only — a register op does
+    /// no data access), = `bus.jit_fetch_cost_clocks()`. A native mov/add/shr slot adds this to
+    /// `folded_raw_bus`. Zero under the trampoline. Past the disp8 range, so the emit reads it by disp32.
+    pub fetch_cost: u64,
+    /// Raw fn pointer to `Cpu386::jit_store_u8_finish`, loaded (by disp32) + called by a native STORE
+    /// fold slot after it writes the byte, to do `record_write_page` + `note_code_write`. Written by the
+    /// dispatch on every entry. `None` under the trampoline (no native store slot loads it).
+    #[cfg(feature = "jit")]
+    pub store_finish_fn: Option<StoreFinishFn>,
 }
 
 impl RegionCtx {

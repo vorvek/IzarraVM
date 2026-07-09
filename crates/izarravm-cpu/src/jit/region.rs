@@ -210,6 +210,8 @@ mod tests {
                 halted: false,
                 folded_raw_bus: 0,
                 fold_bus_cost: 0,
+                fetch_cost: 0,
+                store_finish_fn: None,
             }),
             entry_lin,
             d,
