@@ -994,20 +994,10 @@ pub fn beam_hsync(t: &CrtcTiming, dots: u64) -> bool {
 #[derive(Debug, Clone)]
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
-    // HLE fast linear buffer for mode 13h (Phase 5 fast path for common games).
-    // Wired for cpu chain4 writes/reads (guest A000 access uses linear for HLE).
-    // Render uses accurate reconstruction for unit test compatibility (tests poke vram directly).
-    // Compatibility gaps identified for Phase 5 (to address in fast paths + coverage):
-    // - Pel pan + split screen + line compare edge cases (partly exercised in tests; A2/A3 in gap notes).
-    // - Unchained mode X/Y fast path (still planar; linear only for chained 13h).
-    // - LFB direct for margo/distira (separate paths, may need similar HLE buffers for scanout).
-    // - Retrace status (3DA) polling for vblank/palette updates (beam model exists but games may rely on exact).
-    // - DAC/palette mid-frame writes and snow avoidance.
-    // - 320x240+ mode13h variants via CRTC retune (linear sized to 64k; wrap?).
-    // - Text mode gaps (A1-A6) already handled in render paths.
-    // - Content gen / dirty region for host GUI with HLE bypass.
-    // Reminder: Distira (Voodoo 1 with two TMUs) provides Obsidian + Amethyst 3D layer; VGA HLE fast paths must coexist with Distira LFB/scanout when Distira display is active for 3D titles.
+    // Derived cache for the canonical chained Mode 13h layout. Planar VRAM is
+    // authoritative; any write through a planar decode invalidates this cache.
     pub(crate) mode13_linear: Vec<u8>,
+    pub(crate) mode13_linear_valid: bool,
     pub(crate) crtc: CrtcTiming,
     pub(crate) crtc_regs: CrtcRegs,
     pub(crate) seq: Sequencer,
@@ -1078,6 +1068,7 @@ impl Default for Vga {
         let mut vga = Self {
             vram: vec![0; VGA_PLANAR_SIZE],
             mode13_linear: vec![0; 0x10000],
+            mode13_linear_valid: true,
             crtc: CrtcTiming::text_03h(),
             crtc_regs: CrtcRegs::default(),
             seq: Sequencer::default(),
@@ -1490,6 +1481,8 @@ impl Vga {
         self.planar_bios_mode = mode;
         if clear {
             self.vram.fill(0);
+            self.mode13_linear.fill(0);
+            self.mode13_linear_valid = true;
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
@@ -1907,6 +1900,16 @@ impl Vga {
         self.dac_index(self.attr_lookup(self.planar_scanout_attr_index(index)))
     }
 
+    /// The linear cache represents only the stock 320x200 Mode 13h address
+    /// layout. Register-banged layouts use the planar address generator below.
+    fn canonical_mode13_linear_scanout(&self) -> bool {
+        self.mode13_linear_valid
+            && self.mode == VideoMode::Mode13h
+            && self.seq.memory_mode & 0x08 != 0
+            && self.attr.pixel_pan == 0
+            && self.crtc == CrtcTiming::mode13h()
+    }
+
     /// Assemble one 256-color scanline, shared by chained mode 13h and unchained
     /// mode X. Chain-4 (Sequencer Memory Mode 04h bit 3) changes only the CPU
     /// write/read decode, so the CRTC display scanout is identical in both modes:
@@ -1943,23 +1946,34 @@ impl Vga {
         // equals a start-address bump). The below-split forcing is shared with the
         // 16-color path through pel_pan.
         let pan = (self.pel_pan(below_split) & 0x03) as u32;
+        let linear = self.canonical_mode13_linear_scanout();
         let mut row = vec![0u8; width];
         for (x, slot) in row.iter_mut().enumerate() {
             let x_eff = x as u32 + pan;
-            let plane = (x_eff & 3) as usize;
-            let ma = display_counter(
-                self.crtc.mode_control,
-                self.crtc.underline_loc,
-                row_base,
-                x_eff >> 2,
-            );
-            let off = display_offset_row(
-                self.crtc.mode_control,
-                self.crtc.underline_loc,
-                ma,
-                row_scan,
-            );
-            *slot = self.vram[plane * VGA_PLANE_SIZE + off] & self.pel_mask;
+            let val = if linear {
+                let l = ((row_base as usize) << 2) + (x_eff as usize);
+                if l < self.mode13_linear.len() {
+                    self.mode13_linear[l] & self.pel_mask
+                } else {
+                    0
+                }
+            } else {
+                let plane = (x_eff & 3) as usize;
+                let ma = display_counter(
+                    self.crtc.mode_control,
+                    self.crtc.underline_loc,
+                    row_base,
+                    x_eff >> 2,
+                );
+                let off = display_offset_row(
+                    self.crtc.mode_control,
+                    self.crtc.underline_loc,
+                    ma,
+                    row_scan,
+                );
+                self.vram[plane * VGA_PLANE_SIZE + off] & self.pel_mask
+            };
+            *slot = val;
         }
         row
     }
@@ -1972,6 +1986,14 @@ impl Vga {
     #[inline]
     fn color256_pixel(&self, row_base: u32, row_scan: u32, pan: u32, x: usize) -> u8 {
         let x_eff = x as u32 + pan;
+        if self.canonical_mode13_linear_scanout() {
+            let l = ((row_base as usize) << 2) + (x_eff as usize);
+            if l < self.mode13_linear.len() {
+                return self.mode13_linear[l] & self.pel_mask;
+            } else {
+                return 0;
+            }
+        }
         let plane = (x_eff & 3) as usize;
         let ma = display_counter(
             self.crtc.mode_control,
@@ -2621,6 +2643,7 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return;
         }
+        self.mode13_linear_valid = false;
         self.bump_content_gen();
         if self.seq.memory_mode & 0x04 == 0 {
             self.cpu_write_odd_even(offset, data);
@@ -2684,6 +2707,7 @@ impl Vga {
         let Some((offset, bit)) = self.planar_pixel_offset_at(start, x, y) else {
             return false;
         };
+        self.mode13_linear_valid = false;
         self.bump_content_gen();
         let old = self.planar_read_pixel_at(start, x, y);
         let color = self.planar_storage_bits(if xor { old ^ color } else { color });
@@ -2722,8 +2746,11 @@ impl Vga {
     /// ch.47).
     pub fn cpu_write_chain4(&mut self, offset: usize, data: u8) {
         self.bump_content_gen();
-        if self.mode == VideoMode::Mode13h && offset < self.mode13_linear.len() {
+        let cacheable = self.mode == VideoMode::Mode13h && offset < self.mode13_linear.len();
+        if cacheable {
             self.mode13_linear[offset] = data;
+        } else if offset >> 2 < VGA_PLANE_SIZE {
+            self.mode13_linear_valid = false;
         }
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
@@ -2736,9 +2763,6 @@ impl Vga {
     /// `N >> 2` via the low two address bits, the symmetric counterpart to
     /// `cpu_write_chain4`.
     pub fn cpu_read_chain4(&self, offset: usize) -> u8 {
-        if self.mode == VideoMode::Mode13h && offset < self.mode13_linear.len() {
-            return self.mode13_linear[offset];
-        }
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
         if plane_off < VGA_PLANE_SIZE {
@@ -3540,6 +3564,7 @@ impl Vga {
         if clear {
             self.vram.fill(0);
             self.mode13_linear.fill(0);
+            self.mode13_linear_valid = true;
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
@@ -6522,6 +6547,65 @@ mod tests {
     }
 
     #[test]
+    fn mode13h_linear_scanout_is_limited_to_the_stock_layout() {
+        let mut video = Vga::default();
+        video.set_mode13h_with_clear(true);
+        assert!(video.canonical_mode13_linear_scanout());
+
+        video.attr.pixel_pan = 1;
+        assert!(!video.canonical_mode13_linear_scanout());
+        video.attr.pixel_pan = 0;
+
+        video.crtc.preset_row_scan = 1;
+        assert!(!video.canonical_mode13_linear_scanout());
+        video.crtc.preset_row_scan = 0;
+
+        video.crtc.line_compare = 100;
+        assert!(!video.canonical_mode13_linear_scanout());
+        video.crtc.line_compare = CrtcTiming::mode13h().line_compare;
+
+        video.crtc.mode_control ^= 0x40;
+        assert!(!video.canonical_mode13_linear_scanout());
+    }
+
+    #[test]
+    fn mode13h_noncanonical_scanout_reads_authoritative_planar_vram() {
+        let mut video = Vga::default();
+        video.set_mode13h_with_clear(true);
+        video.cpu_write_chain4(1, 0x22);
+        video.mode13_linear[1] = 0xee;
+        video.attr.pixel_pan = 1;
+
+        assert_eq!(video.render_256color_row(0)[0], 0x22);
+    }
+
+    #[test]
+    fn planar_write_invalidates_mode13h_linear_scanout() {
+        let mut video = Vga::default();
+        video.set_mode13h_with_clear(true);
+        video.cpu_write(0, 0x5a);
+        video.mode13_linear[0] = 0xee;
+
+        assert!(!video.canonical_mode13_linear_scanout());
+        assert_eq!(video.render_256color_row(0)[0], video.vram[0]);
+    }
+
+    #[test]
+    fn mode13h_no_clear_transition_keeps_planar_vram_authoritative() {
+        let mut video = Vga::default();
+        video.set_mode13h_with_clear(true);
+        video.write_port(0x3C4, 0x04);
+        video.write_port(0x3C5, 0x06);
+        video.cpu_write(0, 0x5a);
+
+        video.set_mode13h_with_clear(false);
+        video.mode13_linear[0] = 0xee;
+
+        assert!(!video.canonical_mode13_linear_scanout());
+        assert_eq!(video.render_256color_row(0)[0], video.vram[0]);
+    }
+
+    #[test]
     fn crtc_cursor_ports_track_offset() {
         let mut text = Vga::default();
         assert!(text.write_port(0x03d4, 0x0e));
@@ -6706,13 +6790,13 @@ mod tests {
 
         let mut mode13h = Vga::default();
         mode13h.set_mode13h();
-        let pitch = (mode13h.crtc.offset * 2) as usize;
-        mode13h.vram[0] = 0x11;
-        mode13h.vram[pitch] = 0x22;
+        // Keep the derived linear cache in sync with planar VRAM.
+        mode13h.cpu_write_chain4(0, 0x11);
+        mode13h.cpu_write_chain4(320, 0x22);
         mode13h.crtc.preset_row_scan = 0x02;
         assert_eq!(mode13h.render_256color_row(0)[0], 0x22);
         mode13h.crtc.preset_row_scan = 0x20;
-        mode13h.vram[1] = 0x33;
+        mode13h.cpu_write_chain4(4, 0x33);
         assert_eq!(mode13h.render_256color_row(0)[0], 0x33);
     }
 
@@ -7370,8 +7454,8 @@ mod tests {
             vga.write_port(0x3C4, 0x04);
             vga.write_port(0x3C5, 0x06); // mode X
             let plane0_byte: [u8; VGA_PLANES] = [0x40, 0x50, 0x60, 0x70];
-            for (plane, &b) in plane0_byte.iter().enumerate() {
-                vga.vram[plane * VGA_PLANE_SIZE] = b;
+            for (i, &b) in plane0_byte.iter().enumerate() {
+                vga.cpu_write_chain4(i, b);
             }
             vga.crtc.line_compare = 100;
             vga.attr.pixel_pan = pan;
@@ -7589,9 +7673,12 @@ mod tests {
         }
         let mut vga = Vga::default();
         vga.set_mode13h();
-        for plane in 0..VGA_PLANES {
-            for off in 0..VGA_PLANE_SIZE {
-                vga.vram[plane * VGA_PLANE_SIZE + off] = byte(plane, off);
+        // Fill through chain-4 so the linear cache and planar VRAM agree.
+        for l in 0..0x10000usize {
+            let plane = l & 3;
+            let off = l >> 2;
+            if off < VGA_PLANE_SIZE {
+                vga.cpu_write_chain4(l, byte(plane, off));
             }
         }
         vga.crtc.start_address = 0;
@@ -7677,10 +7764,8 @@ mod tests {
         fn reference(start: u32, row: u32) -> Vec<u8> {
             let mut r = Vga::default();
             r.set_mode13h();
-            for plane in 0..VGA_PLANES {
-                for off in 0..VGA_PLANE_SIZE {
-                    r.vram[plane * VGA_PLANE_SIZE + off] = pattern(off);
-                }
+            for linear in 0..0x10000 {
+                r.cpu_write_chain4(linear, pattern(linear >> 2));
             }
             r.crtc.start_address = start;
             r.render_256color_row(row)
@@ -7688,10 +7773,8 @@ mod tests {
 
         let mut vga = Vga::default();
         vga.set_mode13h(); // 320x200, double-scanned: source_row = counter_line / 2
-        for plane in 0..VGA_PLANES {
-            for off in 0..VGA_PLANE_SIZE {
-                vga.vram[plane * VGA_PLANE_SIZE + off] = pattern(off);
-            }
+        for linear in 0..0x10000 {
+            vga.cpu_write_chain4(linear, pattern(linear >> 2));
         }
         let start = 0x1000u32;
         let split = 300u32;
