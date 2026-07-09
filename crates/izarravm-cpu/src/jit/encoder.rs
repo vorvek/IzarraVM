@@ -19,6 +19,7 @@ impl Reg {
     pub const RDX: Reg = Reg(2);
     pub const RBX: Reg = Reg(3);
     pub const RSP: Reg = Reg(4);
+    pub const RBP: Reg = Reg(5);
     // Not read by the strcpy block's emitter (it passes SI/DI as plain GPR indices to the
     // inc_gpr16 callback rather than addressing the host's own RSI/RDI), but kept and unit-tested
     // as part of the encoder's register-name completeness for whatever block a future slice adds.
@@ -402,6 +403,40 @@ impl Encoder {
         }
         self.bytes.push(0x81);
         self.modrm(0b11, 4, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `cmp r32, imm32` (81 /7 id, no REX.W). Byte-exact tested; used by the paged TLB probe
+    /// for cpl==3 and similar small-imm checks without needing a 64-bit form.
+    #[allow(dead_code)]
+    pub(crate) fn cmp_r32_imm32(&mut self, r: Reg, imm: u32) {
+        if r.ext() {
+            self.rex(false, false, false, r.ext());
+        }
+        self.bytes.push(0x81);
+        self.modrm(0b11, 7, r.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `or r32, r32` (09 /r, no REX.W) -- dst |= src. Byte-exact tested for the paged probe's
+    /// physical = (entry.phys | (linear & 0xfff)).
+    #[allow(dead_code)]
+    pub(crate) fn or_r32_r32(&mut self, dst: Reg, src: Reg) {
+        if dst.ext() || src.ext() {
+            self.rex(false, src.ext(), false, dst.ext());
+        }
+        self.bytes.push(0x09);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `or r32, imm32` (81 /1 id) for completeness with the TLB phys combine path.
+    #[allow(dead_code)]
+    pub(crate) fn or_r32_imm32(&mut self, dst: Reg, imm: u32) {
+        if dst.ext() {
+            self.rex(false, false, false, dst.ext());
+        }
+        self.bytes.push(0x81);
+        self.modrm(0b11, 1, dst.low3());
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
@@ -877,6 +912,38 @@ mod tests {
         let mut e = Encoder::new();
         e.and_r32_imm32(Reg::R12, 0xff);
         assert_eq!(e.finish(), vec![0x41, 0x81, 0xE4, 0xFF, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn cmp_r32_imm32_known_bytes() {
+        // cmp eax, 3 -- no REX, 81 /7 id. ModRM 11_111_000 = 0xF8.
+        let mut e = Encoder::new();
+        e.cmp_r32_imm32(Reg::RAX, 3);
+        assert_eq!(e.finish(), vec![0x81, 0xF8, 0x03, 0x00, 0x00, 0x00]);
+        // cmp r12d, 0xff -- REX.B.
+        let mut e = Encoder::new();
+        e.cmp_r32_imm32(Reg::R12, 0xff);
+        assert_eq!(e.finish(), vec![0x41, 0x81, 0xFC, 0xFF, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn or_r32_r32_known_bytes() {
+        // or eax, ecx -- no REX, 09 /r. ModRM mod=11,reg=ecx(1),rm=eax(0) = 0xC8.
+        let mut e = Encoder::new();
+        e.or_r32_r32(Reg::RAX, Reg::RCX);
+        assert_eq!(e.finish(), vec![0x09, 0xC8]);
+        // or r12d, eax -- REX.B on dst (r12), reg=eax(0) so ModRM rm=4 (r12), reg=0 -> 0xC4 ; REX 0x41.
+        let mut e = Encoder::new();
+        e.or_r32_r32(Reg::R12, Reg::RAX);
+        assert_eq!(e.finish(), vec![0x41, 0x09, 0xC4]);
+    }
+
+    #[test]
+    fn or_r32_imm32_known_bytes() {
+        // or eax, 0x00000fff -- no REX, 81 /1 . ModRM 11_001_000 = 0xC8.
+        let mut e = Encoder::new();
+        e.or_r32_imm32(Reg::RAX, 0x0000_0fff);
+        assert_eq!(e.finish(), vec![0x81, 0xC8, 0xFF, 0x0F, 0x00, 0x00]);
     }
 
     #[test]

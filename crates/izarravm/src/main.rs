@@ -846,7 +846,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns/nativeld]={}/{}/{}",
+         jit[entries/insns/nativeld]={}/{}/{}  paged_tlb_success={}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -876,6 +876,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             perf.jit_region_entries,
             perf.jit_region_insns,
             perf.jit_native_load_hits,
+            perf.jit_paged_tlb_successes,
         );
         // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
         // miss investigation.
@@ -1309,7 +1310,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns/nativeld]={}/{}/{}",
+         jit[entries/insns/nativeld]={}/{}/{}  paged_tlb={}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -1343,6 +1344,7 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
         perf.jit_region_entries,
         perf.jit_region_insns,
         perf.jit_native_load_hits,
+        perf.jit_paged_tlb_successes,
     );
     // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
     // miss investigation.
@@ -1753,6 +1755,7 @@ fn run_boot_hdd_folder(
         machine.enable_host_profiling(stride);
     }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
+    let start_wall = std::time::Instant::now();
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     if cpu_profile_stride.is_some() {
         let snapshot = machine.cpu().profile_snapshot();
@@ -1860,7 +1863,34 @@ fn run_boot_hdd_folder(
     // silently discarded at exit, which defeats the mounted-folder contract
     // and the guest-side debug channel it enables.
     machine.flush_hdd_folder();
+
+    // Wall time + realtics extraction (for 2+3). Makes A/B runs self-contained.
+    let wall = start_wall.elapsed();
+    println!("wall: {:.3}s", wall.as_secs_f64());
+    let screen = machine.screen_text().as_text();
+    if let Some((gametics, realtics)) = extract_timedemo_realtics(&screen) {
+        println!("timed {} gametics in {} realtics", gametics, realtics);
+    }
+
     Ok(())
+}
+
+/// Parse Doom-style timedemo output from the guest text screen.
+/// Looks for lines like "timed 2134 gametics in 907 realtics".
+fn extract_timedemo_realtics(text: &str) -> Option<(u32, u32)> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(after_timed) = line.strip_prefix("timed ") {
+            if let Some((g_str, rest)) = after_timed.split_once(" gametics in ") {
+                if let Some(r_str) = rest.strip_suffix(" realtics") {
+                    if let (Ok(g), Ok(r)) = (g_str.parse::<u32>(), r_str.parse::<u32>()) {
+                        return Some((g, r));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Print a machine-readable result block for a headless benchmark/timedemo run:
