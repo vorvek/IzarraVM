@@ -951,12 +951,13 @@ pub struct Machine {
     wss_resampler: Resampler,
     wss_rate_hz: u32, // input rate the wss_resampler is currently configured for
     wss_sample_phase: f64, // fractional WSS frames owed to the DMA playback clock
-    wss_base: u16,    // I/O base of the 4-port config region (codec sits at base+4)
-    wss_irq: u8,      // PIC line the codec's terminal-count interrupt forwards to
-    wss_dma: usize,   // byte-wide DMA channel the codec pulls playback bytes from
-    wss_enabled: bool, // false drops all WSS work (port decode, tick, IRQ, render)
-    margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
-    vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
+    cd_sample_phase: f64, // fractional CD Red Book samples (44.1 kHz) owed to guest time for HLE timing (Phase 4)
+    wss_base: u16,        // I/O base of the 4-port config region (codec sits at base+4)
+    wss_irq: u8,          // PIC line the codec's terminal-count interrupt forwards to
+    wss_dma: usize,       // byte-wide DMA channel the codec pulls playback bytes from
+    wss_enabled: bool,    // false drops all WSS work (port decode, tick, IRQ, render)
+    margo_ns: f64,        // fractional nanoseconds owed to the Margo busy countdown
+    vga_dots: f64,        // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
     // Of elapsed_clocks, the clocks consumed by device I/O stalls (floppy seek/
@@ -1254,6 +1255,7 @@ impl Machine {
             wss_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             wss_rate_hz: 0,
             wss_sample_phase: 0.0,
+            cd_sample_phase: 0.0,
             wss_base,
             wss_irq,
             wss_dma,
@@ -7739,6 +7741,24 @@ impl Machine {
             }
         }
 
+        // CD audio (Red Book 44.1 kHz) HLE time-driven advance (Phase 4).
+        // Drive the playback LBA from guest elapsed time so position is accurate
+        // independent of when the mixer drains samples. Pull in render_audio
+        // consumes from the advanced position (frac for sub-frame continuity).
+        // Fixed rate, no "programmed" variation.
+        if self.ide.device().playback().playing {
+            let cd_rate: u64 = DAC_HZ as u64; // 44100
+            self.cd_sample_phase += clocks as f64 * cd_rate as f64 * self.timing.inv_clock;
+            let n = self.cd_sample_phase as usize;
+            self.cd_sample_phase -= n as f64;
+            if n > 0 {
+                let frames = n / 588;
+                if frames > 0 {
+                    self.ide.device_mut().advance_play(frames as u32);
+                }
+            }
+        }
+
         let ch2_before = self.pit.channel_out(2);
         let pit_fraction_before = self.pit_clocks;
         // The one shared fractional-advance formula (`advance_fractional`): the
@@ -8125,10 +8145,12 @@ impl Machine {
             .collect();
         let opl_out = self.resampler.process(&opl_native);
 
-        // HLE: drive DSP/WSS sample counts from guest elapsed clocks * their
-        // programmed rate when possible (Phase 4). Falls back to OPL-scaled for
-        // wall-driven calls when no guest time advanced. This makes production
-        // tied to guest DMA/PIT time rather than host callback scaling.
+        // HLE: drive DSP/WSS/CD sample counts from guest elapsed clocks * their
+        // programmed (or fixed) rate when possible (Phase 4). The production in
+        // advance_devices uses per-device phase accum (dsp/wss/cd_sample_phase)
+        // so rings are filled by guest time. render drains by delta on elapsed_clocks
+        // for rate matching. Falls back to OPL-scaled when no guest delta. This
+        // decouples audio production from host render cadence and reduces drift.
         let clock_hz = self.profile().clock_hz;
         let delta = self.elapsed_clocks.saturating_sub(self.last_audio_clocks);
         self.last_audio_clocks = self.elapsed_clocks;
