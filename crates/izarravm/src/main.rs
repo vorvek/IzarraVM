@@ -435,7 +435,7 @@ const BENCHES: &[Bench] = &[
     Bench {
         name: "sieve",
         source: BenchSource::BootSelector(1),
-        min_mode: GswMode::Gsw286,
+        min_mode: GswMode::Gsw386Slow,
         flops_per_iter: None,
     },
     Bench {
@@ -447,7 +447,7 @@ const BENCHES: &[Bench] = &[
     Bench {
         name: "dhrystone",
         source: BenchSource::DosExe(izarravm_firmware::DHRYSTONE_EXE),
-        min_mode: GswMode::Gsw286,
+        min_mode: GswMode::Gsw386Slow,
         flops_per_iter: None,
     },
     // Whetstone: the FP oracle (486+). `flops_per_iter` is the per-sweep FLOP weight,
@@ -660,7 +660,7 @@ fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         "pattern", "mode", "guest_ms", "wall_ms", "rt_factor"
     );
     let modes = [
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,
@@ -708,7 +708,7 @@ fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
 /// modes it runs in.
 fn mode_rank(mode: GswMode) -> u8 {
     match mode {
-        GswMode::Gsw286 => 0,
+        GswMode::Gsw386Slow => 0,
         GswMode::Gsw386 => 1,
         GswMode::Gsw486 => 2,
         GswMode::Gsw586 => 3,
@@ -724,7 +724,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     const BENCH_BUDGET: u64 = 50_000_000_000;
 
     let modes = [
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,
@@ -1409,7 +1409,7 @@ fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     const TOTAL: u64 = 16 * 1024 * 1024;
 
     let modes = [
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,
@@ -4248,8 +4248,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         // isolates the CPU gate from the still-open TOKAEMM EMS/XMS gap).
         // `set_mode` drives `cpu.set_level` internally (see
         // `set_mode_drives_cpu_level_and_cache_table` in izarravm-machine).
-        machine.set_mode(GswMode::Gsw286);
-        assert_eq!(machine.active_mode(), GswMode::Gsw286);
+        machine.set_mode(GswMode::Gsw386Slow);
+        assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
 
         // A keypress raises IRQ1, routing through the monitor's reflect path.
         machine.inject_key_scancodes(&[0x1e, 0x9e]); // 'a' make + break
@@ -4443,8 +4443,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             .to_vec();
         let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVER\r\n".to_vec();
         let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        profile.cpu = GswMode::Gsw286;
-        profile.clock_hz = GswMode::Gsw286.clock_hz();
+        profile.cpu = GswMode::Gsw386Slow;
+        profile.clock_hz = GswMode::Gsw386Slow.clock_hz();
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine
@@ -4469,7 +4469,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 
         assert_eq!(
             machine.active_mode(),
-            GswMode::Gsw286,
+            GswMode::Gsw386Slow,
             "the machine should still be in the saved 286 mode (stop={stop:?}).\n{text}"
         );
         let lower = text.to_ascii_lowercase();
@@ -4514,8 +4514,8 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVER\r\n".to_vec();
 
         let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        profile.cpu = GswMode::Gsw286;
-        profile.clock_hz = GswMode::Gsw286.clock_hz();
+        profile.cpu = GswMode::Gsw386Slow;
+        profile.clock_hz = GswMode::Gsw386Slow.clock_hz();
         let mut machine =
             Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
         machine

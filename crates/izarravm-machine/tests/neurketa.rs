@@ -25,7 +25,7 @@ fn run(mode: GswMode, selector: u8) -> Machine {
 #[test]
 fn sieve_reports_1899_primes_in_every_mode() {
     for mode in [
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,

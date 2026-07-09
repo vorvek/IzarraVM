@@ -44,11 +44,11 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GswMode {
-    #[serde(rename = "286")]
-    Gsw286,
     #[serde(rename = "386")]
     #[default]
     Gsw386,
+    #[serde(rename = "386-slow")]
+    Gsw386Slow,
     #[serde(rename = "486")]
     Gsw486,
     #[serde(rename = "586")]
@@ -56,13 +56,12 @@ pub enum GswMode {
 }
 
 impl GswMode {
-    /// The throttled core clock per compatibility mode: 8.33 MHz (286 mode, the Super
-    /// Slow setting), 22 MHz (386 mode, picked for the early-386 game range), 66 MHz
-    /// (486 mode), and 200 MHz native (the Pentium MMX-200 / P55C on the 66 MHz bus).
+    /// The throttled core clock per compatibility mode: 22 MHz (386), ~7.33 MHz
+    /// (386-slow, one-third speed), 66 MHz (486), and 200 MHz native (586).
     pub const fn clock_hz(self) -> u64 {
         match self {
-            Self::Gsw286 => 8_333_333,
             Self::Gsw386 => 22_000_000,
+            Self::Gsw386Slow => 7_333_333,
             Self::Gsw486 => 66_000_000,
             Self::Gsw586 => 200_000_000,
         }
@@ -72,10 +71,10 @@ impl GswMode {
     /// motherboard cache module. Mirrors `CpuLevel::cache_kb` and the machine
     /// CacheModel geometry, which drive data-access timing (no longer cosmetic).
     /// The 586 L1 is 32 KB: the Pentium MMX (P55C) has 16 KB instruction + 16 KB data.
+    /// 386-slow uses the same geometry as 386 for now.
     pub const fn cache_kb(self) -> (u16, u16) {
         match self {
-            Self::Gsw286 => (0, 0),
-            Self::Gsw386 => (0, 64),
+            Self::Gsw386 | Self::Gsw386Slow => (0, 64),
             Self::Gsw486 => (16, 128),
             Self::Gsw586 => (32, 512),
         }
@@ -83,8 +82,8 @@ impl GswMode {
 
     pub const fn canonical_name(self) -> &'static str {
         match self {
-            Self::Gsw286 => "286",
             Self::Gsw386 => "386",
+            Self::Gsw386Slow => "386-slow",
             Self::Gsw486 => "486",
             Self::Gsw586 => "586",
         }
@@ -92,13 +91,13 @@ impl GswMode {
 }
 
 /// How faithfully a GSW mode models time. A hard property of the mode, not a
-/// runtime toggle: the two slow modes are cycle-faithful; the two fast modes are
-/// close approximations that trade cycle accuracy for host headroom (real DOS
-/// audio/timers hold realtime). Instruction RESULTS are bit-exact in both classes;
-/// only TIME differs.
+/// runtime toggle: the slow modes (386 and 386-slow) are cycle-faithful; the
+/// fast modes are close approximations that trade cycle accuracy for host
+/// headroom (real DOS audio/timers hold realtime). Instruction RESULTS are
+/// bit-exact in both classes; only TIME differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimingClass {
-    /// 286/386: era-calibrated, cycle-faithful, exactly as today.
+    /// 386 and 386-slow: era-calibrated, cycle-faithful.
     Accurate,
     /// 486/586: fast by default, close approximations, not cycle-accurate.
     Approximate,
@@ -106,10 +105,10 @@ pub enum TimingClass {
 
 impl GswMode {
     /// The timing class this mode runs in. `const fn` so every timing decision can
-    /// branch on it cheaply. 286/386 are Accurate; 486/586 are Approximate.
+    /// branch on it cheaply. 386/386-slow are Accurate; 486/586 are Approximate.
     pub const fn timing_class(self) -> TimingClass {
         match self {
-            Self::Gsw286 | Self::Gsw386 => TimingClass::Accurate,
+            Self::Gsw386 | Self::Gsw386Slow => TimingClass::Accurate,
             Self::Gsw486 | Self::Gsw586 => TimingClass::Approximate,
         }
     }
@@ -127,8 +126,9 @@ impl FromStr for GswMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
             // Primary GSW names plus legacy Intel aliases so old configs parse.
-            "286" | "gsw286" | "286_8" | "i286" | "286super" | "superslow" => Ok(Self::Gsw286),
+            // 286 aliases removed (mode dropped); 386-slow is the new slow tier.
             "386" | "gsw386" | "386dx25" | "i386dx25" | "i386dx_25" | "386_25" => Ok(Self::Gsw386),
+            "386-slow" | "slow" | "386slow" | "gsw386slow" => Ok(Self::Gsw386Slow),
             "486" | "gsw486" | "486dx266" | "i486dx266" | "i486dx2_66" | "486dx2_66" => {
                 Ok(Self::Gsw486)
             }
@@ -933,40 +933,42 @@ mod tests {
 
     #[test]
     fn gsw_mode_clocks_and_names() {
-        assert_eq!(GswMode::Gsw286.clock_hz(), 8_333_333);
         assert_eq!(GswMode::Gsw386.clock_hz(), 22_000_000);
+        assert_eq!(GswMode::Gsw386Slow.clock_hz(), 7_333_333);
         assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
         assert_eq!(GswMode::Gsw586.clock_hz(), 200_000_000);
-        assert_eq!(GswMode::Gsw286.canonical_name(), "286");
+        assert_eq!(GswMode::Gsw386Slow.canonical_name(), "386-slow");
         assert_eq!(GswMode::Gsw586.canonical_name(), "586");
         assert_eq!(GswMode::default(), GswMode::Gsw386);
     }
 
     #[test]
     fn gsw_mode_cache_table_per_mode() {
-        assert_eq!(GswMode::Gsw286.cache_kb(), (0, 0));
         assert_eq!(GswMode::Gsw386.cache_kb(), (0, 64));
+        assert_eq!(GswMode::Gsw386Slow.cache_kb(), (0, 64));
         assert_eq!(GswMode::Gsw486.cache_kb(), (16, 128));
         assert_eq!(GswMode::Gsw586.cache_kb(), (32, 512));
     }
 
     #[test]
-    fn timing_class_is_accurate_for_286_386_and_approximate_for_486_586() {
+    fn timing_class_is_accurate_for_386_and_386_slow_and_approximate_for_fast() {
         use crate::{GswMode, TimingClass};
-        assert_eq!(GswMode::Gsw286.timing_class(), TimingClass::Accurate);
         assert_eq!(GswMode::Gsw386.timing_class(), TimingClass::Accurate);
+        assert_eq!(GswMode::Gsw386Slow.timing_class(), TimingClass::Accurate);
         assert_eq!(GswMode::Gsw486.timing_class(), TimingClass::Approximate);
         assert_eq!(GswMode::Gsw586.timing_class(), TimingClass::Approximate);
     }
 
     #[test]
     fn gsw_mode_parses_primary_and_legacy_names() {
-        assert_eq!("286".parse::<GswMode>().unwrap(), GswMode::Gsw286);
         assert_eq!("386".parse::<GswMode>().unwrap(), GswMode::Gsw386);
+        assert_eq!("386-slow".parse::<GswMode>().unwrap(), GswMode::Gsw386Slow);
+        assert_eq!("slow".parse::<GswMode>().unwrap(), GswMode::Gsw386Slow);
         assert_eq!("486".parse::<GswMode>().unwrap(), GswMode::Gsw486);
         assert_eq!("586".parse::<GswMode>().unwrap(), GswMode::Gsw586);
         assert_eq!("i386dx_25".parse::<GswMode>().unwrap(), GswMode::Gsw386);
         assert!("pentium_133".parse::<GswMode>().is_err());
+        assert!("286".parse::<GswMode>().is_err());
     }
 
     #[test]

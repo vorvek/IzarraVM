@@ -162,7 +162,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     // band-width-ordering invariant, both still centered on the owner target.
     BenchBand {
         payload: "dhrystone",
-        mode: GswMode::Gsw286,
+        mode: GswMode::Gsw386Slow,
         target: 3500.0,
         lo: 3325.0, // +/-5% (covers the 8.33 MHz part's ~3644 too).
         hi: 3680.0,
@@ -208,7 +208,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     // mostly the bus scalar. Sieve never blocks the gate (observability tag only).
     BenchBand {
         payload: "sieve",
-        mode: GswMode::Gsw286,
+        mode: GswMode::Gsw386Slow,
         target: 18.0,
         lo: 16.2, // +/-10%, best-effort (no authoritative Sieve absolute).
         hi: 19.8,
@@ -308,7 +308,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     // descends L1 > L2 > RAM in every mode.
     BenchBand {
         payload: "bandwidth-ram",
-        mode: GswMode::Gsw286,
+        mode: GswMode::Gsw386Slow,
         target: 30.6,
         lo: 27.5, // +/-10%, best-effort.
         hi: 33.7,
@@ -395,7 +395,7 @@ mod tests {
 
     /// All four modes, slowest to fastest, for relative-width checks.
     const MODES: [GswMode; 4] = [
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(w586.unit, "MFLOPS");
         assert!(w486.cite.contains("OWNER AUTHORITATIVE"));
         assert!(w586.cite.contains("OWNER AUTHORITATIVE"));
-        assert!(band_for("whetstone", GswMode::Gsw286).is_none());
+        assert!(band_for("whetstone", GswMode::Gsw386Slow).is_none());
         assert!(band_for("whetstone", GswMode::Gsw386).is_none());
     }
 
@@ -519,7 +519,7 @@ mod tests {
         assert!(band_for("fp-mandel", GswMode::Gsw486).is_some());
         assert!(band_for("fp-mandel", GswMode::Gsw586).is_some());
         assert!(
-            band_for("fp-mandel", GswMode::Gsw286).is_none(),
+            band_for("fp-mandel", GswMode::Gsw386Slow).is_none(),
             "fp-mandel must not be encoded for the FPU-less 286"
         );
         assert!(
@@ -528,9 +528,9 @@ mod tests {
         );
         // Bandwidth tiers per the cache geometry: 286 RAM only; 386 L2 + RAM;
         // 486 and 586 L1 + L2 + RAM.
-        assert!(band_for("bandwidth-ram", GswMode::Gsw286).is_some());
-        assert!(band_for("bandwidth-l1", GswMode::Gsw286).is_none());
-        assert!(band_for("bandwidth-l2", GswMode::Gsw286).is_none());
+        assert!(band_for("bandwidth-ram", GswMode::Gsw386Slow).is_some());
+        assert!(band_for("bandwidth-l1", GswMode::Gsw386Slow).is_none());
+        assert!(band_for("bandwidth-l2", GswMode::Gsw386Slow).is_none());
 
         assert!(band_for("bandwidth-l2", GswMode::Gsw386).is_some());
         assert!(band_for("bandwidth-ram", GswMode::Gsw386).is_some());
@@ -588,7 +588,7 @@ mod tests {
                 continue;
             };
             let wide = relative_width(superscalar);
-            for mode in [GswMode::Gsw286, GswMode::Gsw386, GswMode::Gsw486] {
+            for mode in [GswMode::Gsw386Slow, GswMode::Gsw386, GswMode::Gsw486] {
                 if let Some(band) = band_for(payload, mode) {
                     assert!(
                         relative_width(band) <= wide + f64::EPSILON,

@@ -21,7 +21,7 @@ fn run(mode: GswMode) -> Machine {
 #[test]
 fn dhrystone_self_check_is_correct_in_every_mode() {
     for mode in [
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,

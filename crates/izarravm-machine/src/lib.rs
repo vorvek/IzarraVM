@@ -10845,7 +10845,7 @@ fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
         0 => Some(GswMode::Gsw386),
         1 => Some(GswMode::Gsw486),
         2 => Some(GswMode::Gsw586),
-        3 => Some(GswMode::Gsw286),
+        3 => Some(GswMode::Gsw386Slow),
         _ => None,
     }
 }
@@ -10853,11 +10853,9 @@ fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
 fn gsw_mode_code(mode: GswMode) -> u8 {
     match mode {
         GswMode::Gsw386 => 0,
+        GswMode::Gsw386Slow => 3,
         GswMode::Gsw486 => 1,
         GswMode::Gsw586 => 2,
-        // 286 (Super Slow) takes code 3 so the original 386/486/586 codes keep their
-        // values and old guests that write 0/1/2 are unaffected.
-        GswMode::Gsw286 => 3,
     }
 }
 
@@ -10866,8 +10864,7 @@ fn gsw_mode_code(mode: GswMode) -> u8 {
 /// so the core raises #UD for instructions that part lacked.
 fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
     match mode {
-        GswMode::Gsw286 => CpuLevel::I286,
-        GswMode::Gsw386 => CpuLevel::I386,
+        GswMode::Gsw386 | GswMode::Gsw386Slow => CpuLevel::I386,
         GswMode::Gsw486 => CpuLevel::I486,
         GswMode::Gsw586 => CpuLevel::I586,
     }
@@ -12422,7 +12419,7 @@ mod tests {
         // descending L1/L2/RAM curve.
         const TOTAL: u64 = 4 * 1024 * 1024;
         let modes = [
-            GswMode::Gsw286,
+            GswMode::Gsw386Slow,
             GswMode::Gsw386,
             GswMode::Gsw486,
             GswMode::Gsw586,
@@ -12521,8 +12518,8 @@ mod tests {
 
         // 286: no cache. Two sizes must be roughly flat (no tier step), within 20%.
         {
-            let small = measure(GswMode::Gsw286, 8 * 1024);
-            let large = measure(GswMode::Gsw286, 1024 * 1024);
+            let small = measure(GswMode::Gsw386Slow, 8 * 1024);
+            let large = measure(GswMode::Gsw386Slow, 1024 * 1024);
             let ratio = small / large;
             assert!(
                 (0.8..=1.25).contains(&ratio),
@@ -15135,10 +15132,10 @@ mod tests {
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
         assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 200_000_000.0).abs() < 1e-9);
-        // Super Slow (286) @ 8.33 MHz.
-        machine.set_mode(GswMode::Gsw286);
-        assert_eq!(machine.active_mode(), GswMode::Gsw286);
-        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 8_333_333.0).abs() < 1e-9);
+        // 386-slow @ ~7.33 MHz.
+        machine.set_mode(GswMode::Gsw386Slow);
+        assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 7_333_333.0).abs() < 1e-9);
     }
 
     #[test]
@@ -15152,9 +15149,9 @@ mod tests {
         // 386 boot mode, until the guest writes a Lotura mode.
         assert_eq!(machine.cpu.level(), CpuLevel::I586);
 
-        machine.set_mode(GswMode::Gsw286);
-        assert_eq!(machine.cpu.level(), CpuLevel::I286);
-        assert_eq!(machine.cache_config(), (0, 0));
+        machine.set_mode(GswMode::Gsw386Slow);
+        assert_eq!(machine.cpu.level(), CpuLevel::I386);
+        assert_eq!(machine.cache_config(), (0, 64));
 
         machine.set_mode(GswMode::Gsw386);
         assert_eq!(machine.cpu.level(), CpuLevel::I386);
@@ -15170,10 +15167,10 @@ mod tests {
     }
 
     #[test]
-    fn lotura_code_3_selects_286_mode() {
-        assert_eq!(gsw_mode_from_code(3), Some(GswMode::Gsw286));
-        assert_eq!(gsw_mode_code(GswMode::Gsw286), 3);
-        assert_eq!(cpu_level_for_mode(GswMode::Gsw286), CpuLevel::I286);
+    fn lotura_code_3_selects_386_slow_mode() {
+        assert_eq!(gsw_mode_from_code(3), Some(GswMode::Gsw386Slow));
+        assert_eq!(gsw_mode_code(GswMode::Gsw386Slow), 3);
+        assert_eq!(cpu_level_for_mode(GswMode::Gsw386Slow), CpuLevel::I386);
     }
 
     fn rom_with_code(code: &[u8]) -> Vec<u8> {

@@ -119,7 +119,7 @@ fn accept_super_slow_commits_the_286_tier() {
     // mark it with Enter, then Accept with F10. The Accept maps the marked row to GSW
     // code 3 and writes it to the live Lotura register (port 0xE1) and to CMOS 0x12.
     // The 0xE1 write is a live switch (no cold reset), so the firmware keeps running
-    // at the new speed; active_mode() reads back Gsw286 and CMOS 0x12 holds 3,
+    // at the new speed; active_mode() reads back 386-slow and CMOS 0x12 holds 3,
     // mirroring the other speed tiers.
     let mut machine = boot_machine();
     assert_eq!(machine.active_mode(), GswMode::Gsw386, "boot mode is 386");
@@ -153,7 +153,7 @@ fn accept_super_slow_commits_the_286_tier() {
 
     assert_eq!(
         machine.active_mode(),
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         "Accept wrote GSW code 3 to the live Lotura register"
     );
     assert_eq!(
@@ -179,7 +179,7 @@ fn saved_cmos_gsw_mode_is_applied_at_post() {
     machine.run_until_halt_or_cycles(25_000_000).unwrap();
     assert_eq!(
         machine.active_mode(),
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         "POST applied the saved GSW code to the live Lotura register"
     );
 }
@@ -195,7 +195,7 @@ fn loaded_cmos_gsw_mode_is_active_before_post() {
     assert!(machine.load_cmos(&cmos));
     assert_eq!(
         machine.active_mode(),
-        GswMode::Gsw286,
+        GswMode::Gsw386Slow,
         "loading persisted CMOS should set the CPU mode before the BIOS runs"
     );
 }
