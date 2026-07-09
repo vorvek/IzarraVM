@@ -38,6 +38,11 @@ pub const DISTIRA_PCI_VENDOR_ID: u16 = 0x121a;
 pub const DISTIRA_PCI_DEVICE_ID: u16 = 0x0001;
 pub const DISTIRA_PCI_REVISION: u8 = 0x02;
 
+pub const RAM_LOOKUP_PAGE_BITS: usize = 12;
+pub const RAM_LOOKUP_PAGE_SIZE: usize = 1 << RAM_LOOKUP_PAGE_BITS;
+pub const RAM_LOOKUP_PAGE_MASK: usize = RAM_LOOKUP_PAGE_SIZE - 1;
+pub const RAM_LOOKUP_SLOW: usize = usize::MAX;
+
 pub const INT10_VIDEO_PARAM_ENTRIES: &[(usize, [u8; INT10_VIDEO_PARAM_ENTRY_LEN])] = &[
     (
         0x04,

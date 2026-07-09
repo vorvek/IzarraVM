@@ -31,7 +31,10 @@ mod dma;
 mod pci;
 
 pub(crate) use pci::PciConfig;
+mod ram_lookup;
 mod video_params;
+
+pub(crate) use ram_lookup::RamPageLookup;
 
 #[allow(unused_imports)]
 pub(crate) use video_params::{
@@ -44,7 +47,8 @@ pub(crate) use video_params::{
     INT10_VIDEO_PARAM_ENTRIES, INT10_VIDEO_PARAM_ENTRY_LEN, INT10_VIDEO_PARAM_TABLE_ENTRIES,
     INT10_VIDEO_PARAM_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
     INT10_VIDEO_SAVE_POINTER_TABLE_PTRS, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_END,
-    PCI_CONFIG_DATA_PORT,
+    PCI_CONFIG_DATA_PORT, RAM_LOOKUP_PAGE_BITS, RAM_LOOKUP_PAGE_MASK, RAM_LOOKUP_PAGE_SIZE,
+    RAM_LOOKUP_SLOW,
 };
 mod fat32;
 mod fat32_volume;
@@ -108,10 +112,6 @@ pub const DISTIRA_LFB_BASE: u32 = 0xE140_0000;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 const BIOS_ROM_SEGMENT: u16 = (LOW_BIOS_BASE >> 4) as u16;
-const RAM_LOOKUP_PAGE_BITS: usize = 12;
-const RAM_LOOKUP_PAGE_SIZE: usize = 1 << RAM_LOOKUP_PAGE_BITS;
-const RAM_LOOKUP_PAGE_MASK: usize = RAM_LOOKUP_PAGE_SIZE - 1;
-const RAM_LOOKUP_SLOW: usize = usize::MAX;
 
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
 pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
@@ -231,78 +231,6 @@ pub enum StopReason {
     TestExit {
         code: u8,
     },
-}
-
-#[derive(Debug)]
-struct RamPageLookup {
-    page_bases: Box<[usize]>,
-    memory_len: usize,
-}
-
-impl RamPageLookup {
-    fn new(memory_len: usize, pci: &PciConfig) -> Self {
-        let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
-        let mut lookup = Self {
-            page_bases: vec![RAM_LOOKUP_SLOW; page_count].into_boxed_slice(),
-            memory_len,
-        };
-        lookup.rebuild(memory_len, pci);
-        lookup
-    }
-
-    fn rebuild(&mut self, memory_len: usize, pci: &PciConfig) {
-        self.memory_len = memory_len;
-        let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
-        if self.page_bases.len() != page_count {
-            self.page_bases = vec![RAM_LOOKUP_SLOW; page_count].into_boxed_slice();
-        } else {
-            self.page_bases.fill(RAM_LOOKUP_SLOW);
-        }
-
-        for (page, base) in self.page_bases.iter_mut().enumerate() {
-            let start = page * RAM_LOOKUP_PAGE_SIZE;
-            let end = (start + RAM_LOOKUP_PAGE_SIZE).min(memory_len);
-            if ram_lookup_page_is_direct(start, end, pci) {
-                *base = start;
-            }
-        }
-    }
-
-    #[inline]
-    fn direct_bytes(&self, address: u32, bytes: usize) -> Option<(usize, usize)> {
-        let start = address as usize;
-        let end = start.checked_add(bytes)?;
-        if bytes == 0 || end > self.memory_len {
-            return None;
-        }
-        let first_page = start >> RAM_LOOKUP_PAGE_BITS;
-        let last_page = (end - 1) >> RAM_LOOKUP_PAGE_BITS;
-        let first_base = self.page_bases.get(first_page).copied()?;
-        if first_base == RAM_LOOKUP_SLOW {
-            return None;
-        }
-        if first_page == last_page {
-            let mapped_start = first_base + (start & RAM_LOOKUP_PAGE_MASK);
-            return Some((mapped_start, mapped_start + bytes));
-        }
-        for page in first_page..=last_page {
-            if self.page_bases.get(page).copied()? == RAM_LOOKUP_SLOW {
-                return None;
-            }
-        }
-        let mapped_start = first_base + (start & RAM_LOOKUP_PAGE_MASK);
-        Some((mapped_start, mapped_start + bytes))
-    }
-}
-
-fn ram_lookup_page_is_direct(start: usize, end: usize, pci: &PciConfig) -> bool {
-    if end <= 0x000A_0000 {
-        return true;
-    }
-    if start < 0x0010_0000 {
-        return false;
-    }
-    !pci.distira_bar_overlaps(start, end)
 }
 
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
