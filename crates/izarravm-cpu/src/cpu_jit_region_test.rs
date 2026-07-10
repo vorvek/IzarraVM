@@ -840,8 +840,8 @@ fn hotness_admission_compiles_a_hot_loop_and_stays_identical() {
     );
 }
 
-/// Auto-admit stays OFF by default: the same hot loop, without `set_jit_auto_admit`, never
-/// compiles (so existing manual-admission tests and default runs are undisturbed).
+/// Direct `CpuGsw` use keeps auto-admit off until requested. `Machine` applies the production
+/// environment policy separately, while this default keeps manual-admission tests deterministic.
 #[test]
 fn no_auto_admit_by_default() {
     let mut cpu = fresh_cpu(0xffff);

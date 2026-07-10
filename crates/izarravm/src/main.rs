@@ -138,7 +138,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     // The cost-fold native-LOAD JIT path is a process-global toggle read at region emit time; set it
     // once here from `IZARRAVM_JIT_FOLD` so every entry path (bench/hdd-folder/katea/exe) sees it. Only
-    // meaningful alongside `IZARRAVM_JIT`; a no-op unless built `--features jit`.
+    // meaningful while JIT admission is active; a no-op in an interpreter-only build.
     #[cfg(feature = "jit")]
     izarravm_cpu::CpuGsw::set_jit_fold_timing(bench::jit_fold_enabled());
     let mut config = load_config(&cli)?;
@@ -464,7 +464,6 @@ fn run_boot_hdd(
         izarravm_firmware::izarra_bios(),
     )?;
     machine.mount_hdd(image);
-    machine.set_jit_auto_admit(bench::jit_env_enabled());
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
 
@@ -551,7 +550,6 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
 
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios())?;
     machine.mount_hdd_folder_with(dir.path(), overrides)?;
-    machine.set_jit_auto_admit(bench::jit_env_enabled());
     let stop = machine.run_until_halt_or_cycles(500_000_000)?;
     print!("{}", machine.screen_text().as_text());
 
@@ -581,7 +579,6 @@ fn run_boot_hdd_folder(
         izarravm_firmware::izarra_bios(),
     )?;
     machine.mount_hdd_folder(dir)?;
-    machine.set_jit_auto_admit(bench::jit_env_enabled());
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
     // run. Reads the guest-clock attribution of e.g. the x87 opcode rows

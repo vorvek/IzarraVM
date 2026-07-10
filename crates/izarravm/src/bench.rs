@@ -39,18 +39,9 @@ fn run_bench_one(
     run_bench_one_profiled(hardware, mode, source, budget, stride)
 }
 
-/// Whether the JIT should auto-admit hot loops this run, read from `IZARRAVM_JIT` (any value other
-/// than empty or "0" turns it on). Lets the headless game anchors be measured with the JIT active
-/// without a dedicated flag. A no-op unless the binary was built `--features jit`.
-pub(super) fn jit_env_enabled() -> bool {
-    std::env::var("IZARRAVM_JIT")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-}
-
 /// Whether the cost-fold native-LOAD JIT path should run this session, read from `IZARRAVM_JIT_FOLD`.
-/// Off by default; only meaningful alongside `IZARRAVM_JIT` (it needs the JIT active). Makes JIT-block
-/// timing approximate, so it is an opt-in A/B knob. A no-op unless the binary was built `--features jit`.
+/// Off by default and only meaningful while JIT admission is active. Makes JIT-block timing
+/// approximate, so it is an opt-in A/B knob. A no-op in an interpreter-only build.
 #[cfg(feature = "jit")]
 pub(super) fn jit_fold_enabled() -> bool {
     std::env::var("IZARRAVM_JIT_FOLD")
@@ -75,7 +66,6 @@ fn run_bench_one_profiled(
         BenchSource::DosExe(exe) => Machine::new_raw_program(profile, exe)?,
     };
     machine.set_mode(mode);
-    machine.set_jit_auto_admit(jit_env_enabled());
     if let Some(sample_stride) = sample_stride {
         machine.enable_host_profiling(sample_stride);
     }

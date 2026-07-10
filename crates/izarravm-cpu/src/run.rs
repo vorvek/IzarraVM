@@ -15,10 +15,9 @@ fn diff_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
 }
 
-/// The one linear address the spike's forced JIT admission compiles
-/// (IZARRAVM_JIT_REGION=<hex>, with or without 0x). `None` (the default) keeps the region
-/// compiler fully inert: the production admission policy comes after the win exists. Cached on
-/// first read, same pattern as `diff_trace_enabled`.
+/// The optional linear address forced JIT admission compiles
+/// (`IZARRAVM_JIT_REGION=<hex>`, with or without `0x`). `None` leaves normal hotness admission in
+/// control. Cached on first read, like `diff_trace_enabled`.
 #[cfg(feature = "jit")]
 fn jit_forced_region_lin() -> Option<u32> {
     static FORCED: OnceLock<Option<u32>> = OnceLock::new();
@@ -404,18 +403,18 @@ impl CpuGsw {
         })
     }
 
-    /// Enable or disable hotness-driven JIT admission (feature `jit`). Off by default; the CLI/GUI
-    /// turns it on to run the JIT on real workloads. Independent of the forced-address override.
+    /// Enable or disable hotness-driven JIT admission (feature `jit`). Unsupported hosts always
+    /// keep it disabled. Independent of the forced-address override.
     /// Lives on the region table (a transparent accelerator excluded from CPU equality), so setting
     /// it never makes an otherwise-identical CPU compare unequal.
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
-        self.jit_regions.set_auto_admit(on);
+        self.jit_regions.set_auto_admit(on && jit::HOST_SUPPORTED);
     }
 
     /// Enable/disable the cost-fold native-LOAD path (env `IZARRAVM_JIT_FOLD`), a process-global toggle
-    /// read at region emit time. Off by default so production (`IZARRAVM_JIT=1` alone) and every
-    /// bit-identical test are undisturbed. Associated (no `self`): it sets a global, like
+    /// read at region emit time. Off by default so ordinary JIT admission and every bit-identical
+    /// test are undisturbed. Associated (no `self`): it sets a global, like
     /// `NATIVE_BOOKKEEPING`. Turning it on makes JIT-block timing approximate (bus cost is folded), so
     /// it is validated by the anchor bands, not the differential timing asserts.
     #[cfg(feature = "jit")]

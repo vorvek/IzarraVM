@@ -8,8 +8,9 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# P3 template JIT. Off by default: the shipped binary runs the pure interpreter until the
-# JIT passes its zero-regression and bit-identity gates.
+# The existing template JIT is the default. `--no-default-features` keeps the interpreter-only
+# build for unsupported hosts and differential checks.
+default = ["jit"]
 jit = []
 
 [dependencies]

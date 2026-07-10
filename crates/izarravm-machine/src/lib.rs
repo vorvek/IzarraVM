@@ -983,6 +983,20 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
+fn jit_auto_admit_policy(value: Option<&str>, jit_available: bool) -> bool {
+    jit_available && !matches!(value, Some("" | "0"))
+}
+
+fn jit_auto_admit_default() -> bool {
+    let value = std::env::var("IZARRAVM_JIT").ok();
+    let jit_available = cfg!(feature = "jit")
+        && cfg!(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ));
+    jit_auto_admit_policy(value.as_deref(), jit_available)
+}
+
 impl Machine {
     /// Shared field initialization for the public constructors. They differ only
     /// in the CPU entry state and the ROM image, so each hands those in and
@@ -1134,6 +1148,7 @@ impl Machine {
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
+        machine.set_jit_auto_admit(jit_auto_admit_default());
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.
@@ -1285,9 +1300,8 @@ impl Machine {
         &self.cpu
     }
 
-    /// Turn on the JIT's hotness auto-admission (feature `jit`; a no-op unless the CPU was built
-    /// with it). Lets a headless run compile hot loops so the game anchors can be measured with the
-    /// JIT active. Off by default; the CLI flips it from the `IZARRAVM_JIT` env.
+    /// Set the JIT hotness auto-admission policy. This is a no-op without feature `jit`, and the CPU
+    /// keeps it disabled on unsupported hosts.
     pub fn set_jit_auto_admit(&mut self, on: bool) {
         #[cfg(feature = "jit")]
         self.cpu.set_jit_auto_admit(on);

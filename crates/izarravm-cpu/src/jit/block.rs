@@ -277,9 +277,9 @@ pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
 /// The cost-fold native-LOAD toggle (env `IZARRAVM_JIT_FOLD`), read at emit time. When ON AND a block
 /// is fold-eligible (Approximate class, unpaged, flat DS — checked by `try_admit_gated`), a `MemLoadU8`
 /// slot with a supported address form is emitted as a native page-cache probe + folded bookkeeping
-/// instead of a `region_step` call. OFF by default so production (`IZARRAVM_JIT=1` alone) and every
-/// bit-identical test are undisturbed. This makes JIT-block timing APPROXIMATE (bus cost is folded and
-/// flushed in bulk), validated by the anchor bands, not the differential timing asserts.
+/// instead of a `region_step` call. OFF by default so ordinary JIT admission and every bit-identical
+/// test are undisturbed. This makes JIT-block timing APPROXIMATE (bus cost is folded and flushed in
+/// bulk), validated by the anchor bands, not the differential timing asserts.
 pub(crate) static FOLD_TIMING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1389,6 +1389,12 @@ pub(crate) fn try_admit_gated(
     d: bool,
     reject_linear: bool,
 ) -> Option<NonZeroU32> {
+    // Unpaged ring-0 protected mode is the V86 monitor in production today. Hotness admission
+    // stays out of that transition path; forced and test admission remain available for
+    // differential coverage.
+    if reject_linear && cpu.is_ring0_protected() && !cpu.is_paging_enabled() {
+        return None;
+    }
     // The BIOS HLE stub window is a no-compile zone (the fetch seam must see those fetches;
     // defensive here, since forced admission should never point at it).
     if (0xff000..0xff400).contains(&entry_lin) {
