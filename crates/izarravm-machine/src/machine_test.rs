@@ -123,6 +123,10 @@ fn int16_peek_guest_exit(scancodes: &[u8], prog: &[u8]) -> StopReason {
     let mut machine =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     machine.inject_key_scancodes(scancodes);
+    if !scancodes.is_empty() {
+        let deadline = machine.keyboard.ticks_until_event().unwrap();
+        machine.advance_devices_ticks(deadline);
+    }
     machine.run_until_halt_or_cycles(1_000_000).unwrap()
 }
 

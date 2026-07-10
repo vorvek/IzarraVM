@@ -1306,12 +1306,9 @@ impl Machine {
     }
 
     /// Feed Set 1 scancodes to the keyboard controller (make on press, break on
-    /// release). Requests IRQ1 immediately so a halted or idle CPU wakes to it.
+    /// release). The controller schedules the wire transfer and IRQ1 deadline.
     pub fn inject_key_scancodes(&mut self, codes: &[u8]) {
         self.keyboard.push_scancodes(codes);
-        if self.keyboard.take_irq() {
-            self.pic.request(1);
-        }
     }
 
     /// Feed a host mouse delta and button mask to the PS/2 aux device. `dx`/`dy`
@@ -1319,16 +1316,12 @@ impl Machine {
     /// bit2 middle. The aux device queues a movement packet and, when data
     /// reporting is enabled, this requests IRQ12 so a guest ISR runs.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) {
-        if self.keyboard.inject_mouse(dx, dy, buttons) {
-            self.pic.request(12);
-        }
+        let _ = self.keyboard.inject_mouse(dx, dy, buttons);
     }
 
     /// Inject a scroll-wheel detent as a PS/2 packet (IntelliMouse 4-byte mode).
     pub fn inject_mouse_wheel(&mut self, dz: i32) {
-        if self.keyboard.inject_mouse_wheel(dz) {
-            self.pic.request(12);
-        }
+        let _ = self.keyboard.inject_mouse_wheel(dz);
     }
 
     /// Map the GUI's absolute captured pointer onto relative aux-device motion.
@@ -1380,8 +1373,8 @@ impl Machine {
         self.write_physical_u16(base + 2, seg);
         // Ensure the 8042 command byte has IRQ12 (bit1) enabled, then turn on aux
         // reporting. Without bit1, a latched aux byte never arms IRQ12.
-        self.keyboard.write_port(0x64, 0x60); // write-command-byte
-        self.keyboard.write_port(0x60, 0x03); // IRQ1 + IRQ12 enabled
+        self.keyboard.set_mouse_irq(true);
+        self.pic.set_irq_level(12, self.keyboard.irq12_level());
         self.keyboard.set_mouse_reporting(true);
     }
 
@@ -1407,12 +1400,8 @@ impl Machine {
     /// first.
     #[cfg(test)]
     fn enable_8042_irq12(&mut self) {
-        let mut bus = self.make_bus();
-        bus.write_io(0x64, BusWidth::Byte, 0x20, false).unwrap();
-        let ccb = bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap() as u8;
-        bus.write_io(0x64, BusWidth::Byte, 0x60, false).unwrap();
-        bus.write_io(0x60, BusWidth::Byte, u32::from(ccb | 0x01 | 0x02), false)
-            .unwrap();
+        self.keyboard.set_mouse_irq(true);
+        self.pic.set_irq_level(12, self.keyboard.irq12_level());
     }
 
     #[cfg(test)]

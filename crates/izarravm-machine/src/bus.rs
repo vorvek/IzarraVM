@@ -986,6 +986,13 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.keyboard.read_port(port) {
+            // Reading the data register drops the 8042's keyboard or auxiliary
+            // output line in the same I/O cycle. Keep the PIC's electrical input
+            // in step here so LTIM cannot reassert a byte the guest consumed.
+            if port == 0x60 {
+                self.pic.set_irq_level(1, self.keyboard.irq1_level());
+                self.pic.set_irq_level(12, self.keyboard.irq12_level());
+            }
             return Ok(u32::from(value));
         }
         self.device_ports

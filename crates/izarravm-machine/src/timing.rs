@@ -417,10 +417,7 @@ impl Machine {
         self.speaker
             .accumulate(advance.master_ticks, ch2_before, transitions);
 
-        // Decay the keyboard-to-aux settle window (see AUX_BYTE_SETTLE_TICKS in
-        // keyboard.rs) so a mouse byte held back by a just-read keyboard
-        // scancode releases once real PS/2 wire time has actually elapsed.
-        self.keyboard.advance_mouse_pacing(advance.master_ticks);
+        self.keyboard.advance_master_ticks(advance.master_ticks);
 
         self.serial.advance_master_ticks(advance.master_ticks);
         self.serial2.advance_master_ticks(advance.master_ticks);
@@ -453,22 +450,18 @@ impl Machine {
         }
         self.ide.advance_master_ticks(advance.master_ticks);
 
-        // These edge latches coalesce like the PIC input pins. Timed UART and
-        // LPT deadlines cap normal CPU batches, while a larger host-driven
-        // advance may cross several transitions before the single pending edge
-        // is forwarded here.
-        if self.keyboard.take_irq() {
-            self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
-        }
+        // Timed keyboard and auxiliary lines hold while OBF is set. UART and
+        // LPT edge latches coalesce at their PIC inputs. Their deadlines cap
+        // normal CPU batches, while a larger host-driven advance may cross
+        // several transitions before the pending state is forwarded here.
+        self.pic.set_irq_level(1, self.keyboard.irq1_level());
         if self.serial.take_irq() {
             self.pic.request(4); // IRQ4: COM1 (0x3F8) has a pending UART interrupt
         }
         if self.serial2.take_irq() {
             self.pic.request(3); // IRQ3: COM2 (0x2F8) has a pending UART interrupt
         }
-        if self.keyboard.take_irq12() {
-            self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
-        }
+        self.pic.set_irq_level(12, self.keyboard.irq12_level());
         if self.lpt.take_irq() {
             // IRQ7: LPT1 -ACK after a strobed byte. The Sound Blaster DSP can also
             // route to IRQ7, so this line is shared; the LPT only requests it on a
@@ -761,7 +754,8 @@ impl Machine {
 
     /// CPU clocks to advance while halted so the next wake-capable IRQ lands, or
     /// None if nothing can wake the CPU (so HLT is a genuine halt). A halted guest
-    /// is woken by timer, audio, storage, RTC, serial, or printer completion.
+    /// is woken by timer, audio, storage, RTC, keyboard, serial, or printer
+    /// completion.
     /// Each is considered only when unmasked and deliverable. The result is the
     /// soonest applicable wake, clamped to the deadline and to at least one clock
     /// so the run loop always makes progress.
@@ -833,6 +827,15 @@ impl Machine {
         } else {
             None
         };
+        let keyboard_wake = if (self.pic.deliverable(1) && self.keyboard.irq1_enabled())
+            || (self.pic.deliverable(12) && self.keyboard.irq12_enabled())
+        {
+            self.keyboard
+                .ticks_until_irq()
+                .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
+        } else {
+            None
+        };
         let rtc_wake = self
             .pic
             .deliverable(8)
@@ -876,6 +879,7 @@ impl Machine {
             wss_wake,
             ata_wake,
             atapi_wake,
+            keyboard_wake,
             rtc_wake,
             serial_wake,
             serial2_wake,
@@ -925,16 +929,17 @@ impl Machine {
             .chain(self.lpt.ticks_until_event())
             .chain(self.lpt2.ticks_until_event())
             .chain(self.fdc.ticks_until_event(self.timeline.now_ticks()))
+            .chain(self.keyboard.ticks_until_event())
             .min()
     }
 
     /// CPU clocks until the next due device event.
     ///
     /// Interrupts are serviced at batch entry and devices advance at batch end,
-    /// so known timer, audio, storage, RTC, serial, and printer edges shorten the
-    /// batch to the first causal CPU clock in every CPU mode. Fast modes have a
-    /// 1 ms fallback; the 386 modes keep a finer DAC-period fallback. A known
-    /// edge may be earlier than either fallback.
+    /// so known timer, audio, storage, RTC, keyboard, serial, and printer edges
+    /// shorten the batch to the first causal CPU clock in every CPU mode. Fast
+    /// modes have a 1 ms fallback; the 386 modes keep a finer DAC-period fallback.
+    /// A known edge may be earlier than either fallback.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would

@@ -3,6 +3,24 @@
 
 use super::*;
 
+fn keyboard_out(machine: &mut Machine, port: u16, value: u8) {
+    with_bus(machine, |bus| {
+        bus.write_io(port, BusWidth::Byte, u32::from(value), false)
+            .unwrap();
+    });
+    while machine.read_io_port_u8(0x64) & 0x02 != 0 {
+        let deadline = machine.keyboard.ticks_until_event().unwrap();
+        machine.advance_devices_ticks(deadline);
+    }
+}
+
+fn advance_8042_output(machine: &mut Machine) {
+    while machine.read_io_port_u8(0x64) & 0x01 == 0 {
+        let deadline = machine.keyboard.ticks_until_event().unwrap();
+        machine.advance_devices_ticks(deadline);
+    }
+}
+
 #[test]
 fn mouse_movement_requests_irq12_after_enable() {
     // Bring up the PS/2 mouse the way a driver does (command byte bit 1 set
@@ -11,22 +29,18 @@ fn mouse_movement_requests_irq12_after_enable() {
     // three-byte packet is readable on port 0x60 with the AUX status bit set.
     let profile = MachineProfile::gsw_386(1, VideoCard::Vega);
     let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
-    // Drive the controller through the bus the way the CPU would.
-    {
-        let mut bus = machine.make_bus();
-        bus.write_io(0x64, BusWidth::Byte, 0x60, false).unwrap(); // write command byte
-        bus.write_io(0x60, BusWidth::Byte, 0x03, false).unwrap(); // IRQ1 + IRQ12 enabled
-        bus.write_io(0x64, BusWidth::Byte, 0xD4, false).unwrap(); // next byte to aux
-        bus.write_io(0x60, BusWidth::Byte, 0xF4, false).unwrap(); // enable data reporting
-        assert_eq!(bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap(), 0xFA); // mouse ACK
-    }
-    // The ACK read armed the keyboard controller's aux settle window (see
-    // AUX_BYTE_SETTLE_US in keyboard.rs); advance past it -- comfortably
-    // more than 1ms regardless of the active GSW clock rate -- so the
-    // movement packet below latches without an unrelated pacing delay.
-    machine.advance_devices_clocks(1_000_000);
+    // Drive the controller through the bus the way the CPU would, respecting
+    // IBF and the auxiliary serial-byte deadline.
+    keyboard_out(&mut machine, 0x64, 0x60); // write command byte
+    keyboard_out(&mut machine, 0x60, 0x03); // IRQ1 + IRQ12 enabled
+    keyboard_out(&mut machine, 0x64, 0xd4); // next byte to aux
+    keyboard_out(&mut machine, 0x60, 0xf4); // enable data reporting
+    advance_8042_output(&mut machine);
+    assert_eq!(machine.read_io_port_u8(0x60), 0xfa); // mouse ACK
     // Move right 4, down 2, left button down.
     machine.inject_mouse(4, 2, 0x01);
+    let deadline = machine.keyboard.ticks_until_event().unwrap();
+    machine.advance_devices_ticks(deadline);
     assert!(machine.irq12_pending(), "movement requests IRQ12");
     // The packet is on port 0x60 and the status reports an AUX byte.
     assert_eq!(machine.read_io_port_u8(0x64) & 0x20, 0x20, "AUX status bit");
@@ -35,9 +49,9 @@ fn mouse_movement_requests_irq12_after_enable() {
     assert_eq!(b0 & 0x01, 0x01, "left button");
     assert_eq!(b0 & 0x10, 0x00, "X positive");
     assert_eq!(b0 & 0x20, 0x20, "Y sign set (screen-down move)");
-    machine.advance_devices_clocks(1_000_000); // pace the next aux byte
+    advance_8042_output(&mut machine);
     assert_eq!(machine.read_io_port_u8(0x60), 4, "dx byte");
-    machine.advance_devices_clocks(1_000_000); // pace the next aux byte
+    advance_8042_output(&mut machine);
     assert_eq!(machine.read_io_port_u8(0x60) as i8 as i32, -2, "dy byte");
 }
 
@@ -52,46 +66,30 @@ fn bios_aux_enable_then_packet_reads_back_with_no_stray_keyboard_byte() {
     // keyboard scancode ring (which the keyboard ISR reads unconditionally).
     let profile = MachineProfile::gsw_386(1, VideoCard::Vega);
     let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
-    {
-        let mut bus = machine.make_bus();
-        // Read CCB (0x20) -> 0x60, OR in IRQ1 (bit0) + IRQ12 (bit1), write back.
-        bus.write_io(0x64, BusWidth::Byte, 0x20, false).unwrap();
-        let ccb = bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap() as u8;
-        let new_ccb = ccb | 0x01 | 0x02;
-        bus.write_io(0x64, BusWidth::Byte, 0x60, false).unwrap();
-        bus.write_io(0x60, BusWidth::Byte, new_ccb as u32, false)
-            .unwrap();
-    }
-    // Drain the IRQ1 edge the CCB read above itself arms in
-    // respond_immediately (a pre-existing quirk unrelated to AUX enable:
+    // Read CCB (0x20) -> 0x60, OR in IRQ1 (bit0) + IRQ12 (bit1), write back.
+    keyboard_out(&mut machine, 0x64, 0x20);
+    let ccb = machine.read_io_port_u8(0x60);
+    let new_ccb = ccb | 0x01 | 0x02;
+    keyboard_out(&mut machine, 0x64, 0x60);
+    keyboard_out(&mut machine, 0x60, new_ccb);
+    // Drain the IRQ1 edge the CCB read above itself arms in the controller
+    // response path (a pre-existing quirk unrelated to AUX enable:
     // it fires for any controller-command response while command-byte
     // bit0 is set, which it is by default), then acknowledge it the way
     // the CPU eventually would so it doesn't linger as a pending PIC
     // request. This keeps the assertion below honestly testing whether
     // the AUX-enable sequence, not this earlier CCB read, arms IRQ1.
-    machine.advance_devices_clocks(1_000_000);
     machine.pic.acknowledge();
-    {
-        let mut bus = machine.make_bus();
-        // Enable AUX data reporting: 0xD4 routes 0xF4 to the mouse.
-        bus.write_io(0x64, BusWidth::Byte, 0xD4, false).unwrap();
-        bus.write_io(0x60, BusWidth::Byte, 0xF4, false).unwrap();
-        // Drain the AUX ACK (0xFA): it must arrive flagged as an AUX byte.
-        let status = bus.read_io(0x64, BusWidth::Byte, 0, false).unwrap() as u8;
-        assert_eq!(status & 0x01, 0x01, "ACK waiting (OBF)");
-        assert_eq!(status & 0x20, 0x20, "ACK is an AUX byte, not a key");
-        assert_eq!(
-            bus.read_io(0x60, BusWidth::Byte, 0, false).unwrap(),
-            0xFA,
-            "mouse ACK"
-        );
-    }
-    // The AUX-enable sequence itself must not arm IRQ1. The ACK read also
-    // armed the keyboard controller's aux settle window (see
-    // AUX_BYTE_SETTLE_US in keyboard.rs); advance past it too, 1,000,000
-    // clocks being far more than 1ms regardless of the active GSW clock
-    // rate.
-    machine.advance_devices_clocks(1_000_000);
+    // Enable AUX data reporting: 0xD4 routes 0xF4 to the mouse.
+    keyboard_out(&mut machine, 0x64, 0xd4);
+    keyboard_out(&mut machine, 0x60, 0xf4);
+    advance_8042_output(&mut machine);
+    // Drain the AUX ACK (0xFA): it must arrive flagged as an AUX byte.
+    let status = machine.read_io_port_u8(0x64);
+    assert_eq!(status & 0x01, 0x01, "ACK waiting (OBF)");
+    assert_eq!(status & 0x20, 0x20, "ACK is an AUX byte, not a key");
+    assert_eq!(machine.read_io_port_u8(0x60), 0xfa, "mouse ACK");
+    // The AUX-enable sequence itself must not arm IRQ1.
     assert!(
         !machine.irq1_pending(),
         "AUX enable must not arm the keyboard interrupt"
@@ -104,6 +102,8 @@ fn bios_aux_enable_then_packet_reads_back_with_no_stray_keyboard_byte() {
 
     // Now a host move queues a three-byte packet, flagged AUX, with IRQ12.
     machine.inject_mouse(6, -3, 0x01); // right 6, up 3, left button down
+    let deadline = machine.keyboard.ticks_until_event().unwrap();
+    machine.advance_devices_ticks(deadline);
     assert!(machine.irq12_pending(), "movement requests IRQ12");
     assert_eq!(
         machine.read_io_port_u8(0x64) & 0x20,
@@ -113,9 +113,9 @@ fn bios_aux_enable_then_packet_reads_back_with_no_stray_keyboard_byte() {
     let b0 = machine.read_io_port_u8(0x60);
     assert_eq!(b0 & 0x08, 0x08, "sync bit");
     assert_eq!(b0 & 0x01, 0x01, "left button");
-    machine.advance_devices_clocks(1_000_000); // pace the next aux byte
+    advance_8042_output(&mut machine);
     assert_eq!(machine.read_io_port_u8(0x60), 6, "dx byte");
-    machine.advance_devices_clocks(1_000_000); // pace the next aux byte
+    advance_8042_output(&mut machine);
     assert_eq!(
         machine.read_io_port_u8(0x60),
         3,
@@ -144,6 +144,8 @@ fn c200_enable_arms_irq12_in_the_command_byte_itself() {
     m.cpu.registers.set_ebx(0x0100); // BH=1 enable
     m.handle_int15();
     m.inject_mouse(4, -2, 0x01);
+    let deadline = m.keyboard.ticks_until_event().unwrap();
+    m.advance_devices_ticks(deadline);
     assert!(
         m.irq12_pending(),
         "C200 enable alone arms IRQ12 (no separate command-byte write needed)"
@@ -159,6 +161,8 @@ fn c205_initialize_arms_irq12_in_the_command_byte() {
     m.cpu.registers.set_eax(0xC205);
     m.handle_int15();
     m.inject_mouse(4, -2, 0x01);
+    let deadline = m.keyboard.ticks_until_event().unwrap();
+    m.advance_devices_ticks(deadline);
     assert!(
         m.irq12_pending(),
         "C205 initialize alone arms IRQ12 (no separate command-byte write needed)"
@@ -254,6 +258,8 @@ fn set_mouse_absolute_synthesizes_relative_deltas() {
     m.handle_int15(); // initialize enables reporting
     m.seed_mouse_origin(100, 100);
     m.set_mouse_absolute(110, 97, 0x00); // +10 / -3 screen delta
+    let deadline = m.keyboard.ticks_until_event().unwrap();
+    m.advance_devices_ticks(deadline);
     assert!(
         m.irq12_pending(),
         "synthesized motion reaches the aux device"

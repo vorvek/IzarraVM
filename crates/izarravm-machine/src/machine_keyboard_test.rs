@@ -10,6 +10,8 @@ fn injected_key_is_readable_on_port_0x60_and_requests_irq1() {
     let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega);
     let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
     machine.inject_key_scancodes(&[0x1e]); // 'A' make
+    let deadline = machine.keyboard.ticks_until_event().unwrap();
+    machine.advance_devices_ticks(deadline);
     assert_eq!(machine.read_io_port_u8(0x60), 0x1e);
     assert!(machine.irq1_pending(), "injecting a key requests IRQ1");
 }

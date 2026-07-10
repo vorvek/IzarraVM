@@ -12,9 +12,9 @@
 //   4. The setup page draws on the Margo LFB (mode 0x150), like the graphical POST
 //      screen and the Tab boot menu: the red title bar renders inside the box.
 //
-// Keys are fed as Set 1 scancodes via inject_key_scancodes. The menu blocks on a
-// keyboard read between keystrokes, so a whole burst injected up front is consumed
-// in order as IRQ1 delivers each scancode.
+// Keys are fed as Set 1 scancodes via inject_key_scancodes. Device bytes cross
+// the PS/2 wire on timed deadlines, so navigation sends one make/break pair and
+// runs the guest before sending the next pair.
 
 use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
@@ -39,6 +39,15 @@ const A_BREAK: u8 = 0x9e;
 fn boot_machine() -> Machine {
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     Machine::new(profile, izarra_bios()).unwrap()
+}
+
+fn press(machine: &mut Machine, make_code: u8, break_code: u8, clocks: u64) -> StopReason {
+    machine.inject_key_scancodes(&[make_code, break_code]);
+    machine.run_until_halt_or_cycles(clocks).unwrap()
+}
+
+fn enter_setup(machine: &mut Machine) {
+    let _ = press(machine, DEL_MAKE, DEL_BREAK, 20_000_000);
 }
 
 #[test]
@@ -68,24 +77,12 @@ fn setup_save_applies_chosen_gsw_mode() {
     // Hotkey to enter setup, move down to the CPU-mode row, advance the mode from
     // 386 to 586 with two Right presses, then Save with F10. The save writes the
     // chosen code to the live Lotura register; the switch lands at once.
-    machine.inject_key_scancodes(&[
-        DEL_MAKE,
-        DEL_BREAK, // enter setup
-        DOWN_MAKE,
-        DOWN_BREAK, // Time -> Keyboard
-        DOWN_MAKE,
-        DOWN_BREAK, // Keyboard -> CPU mode
-        RIGHT_MAKE,
-        RIGHT_BREAK, // 386 -> 486
-        RIGHT_MAKE,
-        RIGHT_BREAK, // 486 -> 586
-        F10_MAKE,
-        F10_BREAK, // Save
-    ]);
-    // This test queues all six keys up front and processes them in one run, so the
-    // budget must cover the full POST (~15M with the RLE art) plus the setup menu
-    // walking and saving each queued key after it.
-    let reason = machine.run_until_halt_or_cycles(30_000_000).unwrap();
+    enter_setup(&mut machine);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, RIGHT_MAKE, RIGHT_BREAK, 3_000_000);
+    let _ = press(&mut machine, RIGHT_MAKE, RIGHT_BREAK, 3_000_000);
+    let reason = press(&mut machine, F10_MAKE, F10_BREAK, 30_000_000);
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "setup saves then boots and idles"
@@ -102,19 +99,11 @@ fn setup_discard_keeps_boot_mode() {
     let mut machine = boot_machine();
     // Enter setup, move to the CPU-mode row, edit it, then Discard (Esc). The working
     // copy changes but active_mode must stay at the boot default.
-    machine.inject_key_scancodes(&[
-        DEL_MAKE,
-        DEL_BREAK,
-        DOWN_MAKE,
-        DOWN_BREAK, // Time -> Keyboard
-        DOWN_MAKE,
-        DOWN_BREAK, // Keyboard -> CPU mode
-        RIGHT_MAKE,
-        RIGHT_BREAK, // edit to 486 in the working copy
-        ESC_MAKE,
-        ESC_BREAK, // Discard
-    ]);
-    let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    enter_setup(&mut machine);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, RIGHT_MAKE, RIGHT_BREAK, 3_000_000);
+    let reason = press(&mut machine, ESC_MAKE, ESC_BREAK, 20_000_000);
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "discard still boots and idles"
@@ -137,19 +126,11 @@ fn setup_save_then_setup_draws_the_lfb() {
     // leaving some stale mode-13h/text state behind, the way the old mode-13h
     // page could).
     let mut machine = boot_machine();
-    machine.inject_key_scancodes(&[
-        DEL_MAKE,
-        DEL_BREAK,
-        DOWN_MAKE,
-        DOWN_BREAK, // Time -> Keyboard
-        DOWN_MAKE,
-        DOWN_BREAK, // Keyboard -> CPU mode
-        RIGHT_MAKE,
-        RIGHT_BREAK, // 386 -> 486
-        F10_MAKE,
-        F10_BREAK, // Save
-    ]);
-    machine.run_until_halt_or_cycles(30_000_000).unwrap();
+    enter_setup(&mut machine);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, RIGHT_MAKE, RIGHT_BREAK, 3_000_000);
+    let _ = press(&mut machine, F10_MAKE, F10_BREAK, 30_000_000);
 
     assert_eq!(
         machine.active_display(),
@@ -201,33 +182,18 @@ fn setup_sub_pages_open_and_return() {
     // The run completing at the cycle limit (no fault) plus the boot mode staying at
     // the default proves the page returned cleanly each time.
     let mut machine = boot_machine();
-    machine.inject_key_scancodes(&[
-        DEL_MAKE,
-        DEL_BREAK, // enter setup (highlight on Time, row 0)
-        ENTER_MAKE,
-        ENTER_BREAK, // open Time
-        ESC_MAKE,
-        ESC_BREAK, // back to the menu
-        DOWN_MAKE,
-        DOWN_BREAK, // Time -> Keyboard
-        DOWN_MAKE,
-        DOWN_BREAK, // Keyboard -> CPU mode
-        DOWN_MAKE,
-        DOWN_BREAK, // CPU mode -> Peripherals
-        ENTER_MAKE,
-        ENTER_BREAK, // open Peripherals (runs the probes)
-        ESC_MAKE,
-        ESC_BREAK, // back to the menu
-        DOWN_MAKE,
-        DOWN_BREAK, // Peripherals -> Health
-        ENTER_MAKE,
-        ENTER_BREAK, // open Health (jittered readings)
-        ESC_MAKE,
-        ESC_BREAK, // back to the menu
-        ESC_MAKE,
-        ESC_BREAK, // Esc on the menu discards and exits
-    ]);
-    let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    enter_setup(&mut machine);
+    let _ = press(&mut machine, ENTER_MAKE, ENTER_BREAK, 4_000_000);
+    let _ = press(&mut machine, ESC_MAKE, ESC_BREAK, 4_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, ENTER_MAKE, ENTER_BREAK, 5_000_000);
+    let _ = press(&mut machine, ESC_MAKE, ESC_BREAK, 4_000_000);
+    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    let _ = press(&mut machine, ENTER_MAKE, ENTER_BREAK, 4_000_000);
+    let _ = press(&mut machine, ESC_MAKE, ESC_BREAK, 4_000_000);
+    let reason = press(&mut machine, ESC_MAKE, ESC_BREAK, 20_000_000);
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "the sub-pages open and return without fault"

@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! AT keyboard controller (8042-class) as software sees it: status/data ports,
 //! a host-fed scancode FIFO, and the command subset the BIOS uses at boot. The
 //! controller also multiplexes a PS/2 auxiliary (mouse) device, reachable
@@ -8,35 +11,25 @@ use crate::mouse::Ps2Mouse;
 use std::collections::VecDeque;
 
 const STATUS_OBF: u8 = 0x01; // output buffer full (data waiting on 0x60)
+const STATUS_IBF: u8 = 0x02; // input buffer full (controller is processing a write)
 const STATUS_SYS: u8 = 0x04; // system flag, set after a passed self-test
+const STATUS_CMD: u8 = 0x08; // last accepted input was written to command port 0x64
 const STATUS_AUX: u8 = 0x20; // the byte in the output buffer came from the mouse
 
-// How long, in emulated microseconds, reading ANY real device byte (a
-// keyboard scancode or an aux/mouse byte) off 0x60 holds back the next aux
-// byte from latching. Real PS/2 hardware serializes each device byte onto
-// its own wire at roughly 1ms/byte (~10kHz device clock), so a byte that
-// finished arriving microseconds ago genuinely could not be followed by
-// another one that fast. Two distinct races this guards:
-//   - A guest that reads 0x60 twice in a row (Prince of Persia's INT 09h
-//     handler reads 0x60 itself, then chains to the BIOS's INT 09h handler,
-//     which reads 0x60 again expecting the same stale scancode -- see
-//     `reread_returns_stale_byte_until_next_arrives`) must not have a
-//     freshly queued mouse byte race into that second read, corrupting BIOS
-//     shift-state handling.
-//   - A host mouse "flick" can queue many PS/2 packets at once (no real
-//     mouse could ever transmit that fast); without pacing, the mouse
-//     driver's IRQ12 handler gets slammed with a burst of back-to-back
-//     interrupts far outside anything real hardware produces.
-// Excludes controller-command echoes (self-test, CCB read, etc.): those are
-// an immediate digital handshake, not a serialized device transmission.
-const AUX_BYTE_SETTLE_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 1000;
+const CONTROLLER_INPUT_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 50_000; // 20 us
+const DEVICE_BYTE_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 1000; // 1 ms
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingInput {
+    Command(u8),
+    Data(u8),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keyboard8042 {
-    queue: VecDeque<u8>,         // host-injected scancodes waiting to be latched
-    output: Option<u8>,          // the byte currently readable on 0x60
-    output_is_aux: bool,         // the latched byte came from the mouse (status bit 5)
-    output_is_device_byte: bool, // the latched byte is a real scancode or aux byte
+    queue: VecDeque<u8>, // host-injected scancodes waiting to be latched
+    output: Option<u8>,  // the byte currently readable on 0x60
+    output_is_aux: bool, // the latched byte came from the mouse (status bit 5)
     status: u8,
     command_byte: u8,                   // 8042 command byte (bit 0 = IRQ1 enable)
     expecting_command_data: Option<u8>, // a 0x64 command awaiting its 0x60 data
@@ -47,7 +40,10 @@ pub struct Keyboard8042 {
     scan_set: u8,                       // active scancode set (0xF0 select; default 2)
     last_byte: u8,                      // last scancode latched, for 0xFE resend
     mouse: Ps2Mouse,
-    aux_settle_ticks: u64,
+    pending_input: Option<PendingInput>,
+    input_ticks: u64,
+    device_byte_ticks: Option<u64>,
+    device_byte_ready: bool,
 }
 
 impl Default for Keyboard8042 {
@@ -56,9 +52,8 @@ impl Default for Keyboard8042 {
             queue: VecDeque::new(),
             output: None,
             output_is_aux: false,
-            output_is_device_byte: false,
             status: STATUS_SYS,
-            command_byte: 0x01, // IRQ1 enabled, translation on (as a PC BIOS leaves it)
+            command_byte: 0x01, // IRQ1 enabled; host input is already translated Set 1
             expecting_command_data: None,
             irq_armed: false,
             irq12_armed: false,
@@ -67,7 +62,10 @@ impl Default for Keyboard8042 {
             scan_set: 2, // PS/2 keyboards power up in set 2
             last_byte: 0,
             mouse: Ps2Mouse::default(),
-            aux_settle_ticks: 0,
+            pending_input: None,
+            input_ticks: 0,
+            device_byte_ticks: None,
+            device_byte_ready: false,
         }
     }
 }
@@ -76,24 +74,24 @@ impl Keyboard8042 {
     /// Queue host scancodes (Set 1, make on press / break = 0x80|make on release).
     pub fn push_scancodes(&mut self, codes: &[u8]) {
         self.queue.extend(codes.iter().copied());
-        self.latch_next();
+        self.schedule_device_byte();
     }
 
     /// Feed host mouse movement to the aux device: a relative delta plus the
-    /// button mask. Queues a PS/2 packet and latches the first byte when data
-    /// reporting is enabled. Returns true if that should pulse IRQ12.
+    /// button mask. Queues a PS/2 packet for the serial-byte deadline when data
+    /// reporting is enabled. Returns true only if IRQ12 was already armed.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) -> bool {
         let reporting = self.mouse.queue_movement(dx, dy, buttons, 0);
-        self.latch_next();
+        self.schedule_device_byte();
         reporting && self.irq12_armed
     }
 
     /// Inject a wheel detent: a Z-only PS/2 packet (no motion, buttons unchanged).
-    /// Returns true if reporting is on so the caller can raise IRQ12.
+    /// Returns true only if IRQ12 was already armed.
     pub fn inject_mouse_wheel(&mut self, dz: i32) -> bool {
         let buttons = self.mouse.current_buttons();
         let reporting = self.mouse.queue_movement(0, 0, buttons, dz);
-        self.latch_next();
+        self.schedule_device_byte();
         reporting && self.irq12_armed
     }
 
@@ -135,7 +133,11 @@ impl Keyboard8042 {
     pub fn set_mouse_irq(&mut self, on: bool) {
         if on {
             self.command_byte |= 0x02;
-            self.latch_next();
+            self.arm_current_output();
+            if self.device_byte_ready {
+                self.latch_ready_device_byte();
+            }
+            self.schedule_device_byte();
         } else {
             self.command_byte &= !0x02;
             // A byte latched while the interrupt was enabled may have left the
@@ -166,7 +168,7 @@ impl Keyboard8042 {
                 0xF3 => self.queue.push_back(0xFA),
                 _ => self.queue.push_back(0xFA),
             }
-            self.latch_next();
+            self.schedule_device_byte();
             return;
         }
         match value {
@@ -188,12 +190,9 @@ impl Keyboard8042 {
         }
     }
 
-    /// Put a controller command response (self-test 0x55, interface test 0x00)
-    /// into the output buffer ahead of keyboard scancodes. A real 8042 holds the
-    /// keyboard while it processes a command and returns the answer immediately, so
-    /// any scancode already latched is pushed back to the front of the queue rather
-    /// than dropped. This keeps a self-test from eating host keystrokes.
-    fn respond_immediately(&mut self, response: u8) {
+    /// Put a processed controller response ahead of keyboard scancodes. Any
+    /// unread byte is pushed back instead of being discarded.
+    fn respond_controller(&mut self, response: u8) {
         // Only a fresh (OBF-set) byte gets pushed back; a stale byte left in the
         // output register after a read (OBF clear) was already consumed and must
         // not be re-queued.
@@ -204,11 +203,11 @@ impl Keyboard8042 {
                 } else {
                     self.queue.push_front(latched);
                 }
+                self.device_byte_ready = true;
             }
         }
         self.output = Some(response);
         self.output_is_aux = false;
-        self.output_is_device_byte = false; // a controller echo, not a real device byte
         self.status |= STATUS_OBF;
         self.status &= !STATUS_AUX;
         if self.command_byte & 0x01 != 0 {
@@ -216,11 +215,25 @@ impl Keyboard8042 {
         }
     }
 
-    /// Move the next queued byte into the output buffer if it is free. A waiting
-    /// keyboard byte is preferred; a mouse byte is drained only when no scancode
-    /// is pending. A mouse byte sets the AUX status bit and arms IRQ12 instead of
-    /// IRQ1.
-    fn latch_next(&mut self) {
+    fn queued_device_byte(&self) -> bool {
+        let keyboard = self.command_byte & 0x10 == 0 && !self.queue.is_empty();
+        let auxiliary = self.command_byte & 0x20 == 0 && !self.mouse.queue.is_empty();
+        keyboard || auxiliary
+    }
+
+    fn schedule_device_byte(&mut self) {
+        if self.status & STATUS_OBF == 0
+            && !self.device_byte_ready
+            && self.device_byte_ticks.is_none()
+            && self.queued_device_byte()
+        {
+            self.device_byte_ticks = Some(DEVICE_BYTE_TICKS);
+        }
+    }
+
+    /// Latch one byte whose serial transfer has completed. Keyboard data keeps
+    /// priority over auxiliary data, matching the existing controller behavior.
+    fn latch_ready_device_byte(&mut self) {
         // A fresh byte (OBF set) is still waiting to be read; do not overwrite it.
         // A stale byte left after a read (OBF clear) may be overwritten by the
         // next queued byte.
@@ -235,37 +248,153 @@ impl Keyboard8042 {
             let code = self.queue.pop_front().unwrap();
             self.output = Some(code);
             self.output_is_aux = false;
-            self.output_is_device_byte = true;
             self.last_byte = code; // remember for a 0xFE resend
             self.status |= STATUS_OBF;
             self.status &= !STATUS_AUX;
             if self.command_byte & 0x01 != 0 {
                 self.irq_armed = true;
             }
-        } else if !aux_disabled && self.aux_settle_ticks == 0 {
+            self.device_byte_ready = false;
+        } else if !aux_disabled {
             if let Some(code) = self.mouse.queue.pop_front() {
                 self.output = Some(code);
                 self.output_is_aux = true;
-                self.output_is_device_byte = true;
                 self.status |= STATUS_OBF | STATUS_AUX;
                 // Command byte bit 1 enables the mouse interrupt (IRQ12).
                 if self.command_byte & 0x02 != 0 {
                     self.irq12_armed = true;
                 }
+                self.device_byte_ready = false;
             }
         }
     }
 
-    /// Decay the aux settle window by fixed master ticks, releasing a held byte
-    /// at the same guest-time deadline in every CPU mode.
-    pub(crate) fn advance_mouse_pacing(&mut self, master_ticks: u64) {
-        if self.aux_settle_ticks > 0 {
-            self.aux_settle_ticks = self.aux_settle_ticks.saturating_sub(master_ticks);
-            self.latch_next(); // a byte held back by the settle window may now latch
+    fn arm_current_output(&mut self) {
+        if self.status & STATUS_OBF == 0 {
+            return;
+        }
+        if self.output_is_aux {
+            if self.command_byte & 0x02 != 0 {
+                self.irq12_armed = true;
+            }
+        } else if self.command_byte & 0x01 != 0 {
+            self.irq_armed = true;
+        }
+    }
+
+    fn process_input(&mut self, input: PendingInput) {
+        self.status &= !STATUS_IBF;
+        match input {
+            PendingInput::Command(command) => self.process_command(command),
+            PendingInput::Data(data) => self.process_data(data),
+        }
+        if self.device_byte_ready {
+            self.latch_ready_device_byte();
+        }
+        self.schedule_device_byte();
+    }
+
+    fn process_data(&mut self, value: u8) {
+        if let Some(command) = self.expecting_command_data.take() {
+            match command {
+                0x60 => {
+                    self.command_byte = value;
+                    self.arm_current_output();
+                }
+                0xD4 => self.mouse.write_byte(value),
+                0xD1 => self.output_port = value,
+                _ => {}
+            }
+        } else {
+            self.write_keyboard_byte(value);
+        }
+    }
+
+    fn process_command(&mut self, value: u8) {
+        match value {
+            0xAA => self.respond_controller(0x55),
+            0xAB | 0xA9 => self.respond_controller(0x00),
+            0x20 => self.respond_controller(self.command_byte),
+            0x60 | 0xD4 | 0xD1 => self.expecting_command_data = Some(value),
+            0xA7 => self.command_byte |= 0x20,
+            0xA8 => self.command_byte &= !0x20,
+            0xAD => self.command_byte |= 0x10,
+            0xAE => self.command_byte &= !0x10,
+            0xD0 => self.respond_controller(self.output_port),
+            0xC0 => self.respond_controller(0xA0),
+            0xE0 => self.respond_controller(0x03),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn ticks_until_event(&self) -> Option<u64> {
+        self.pending_input
+            .map(|_| self.input_ticks)
+            .into_iter()
+            .chain(self.device_byte_ticks)
+            .min()
+    }
+
+    pub(crate) fn ticks_until_irq(&self) -> Option<u64> {
+        self.ticks_until_event()
+    }
+
+    pub(crate) fn irq1_enabled(&self) -> bool {
+        self.command_byte & 0x01 != 0
+    }
+
+    pub(crate) fn irq12_enabled(&self) -> bool {
+        self.command_byte & 0x02 != 0
+    }
+
+    pub(crate) fn irq1_level(&self) -> bool {
+        self.status & STATUS_OBF != 0 && !self.output_is_aux && self.irq1_enabled()
+    }
+
+    pub(crate) fn irq12_level(&self) -> bool {
+        self.status & STATUS_OBF != 0 && self.output_is_aux && self.irq12_enabled()
+    }
+
+    pub(crate) fn advance_master_ticks(&mut self, ticks: u64) {
+        let mut remaining = ticks;
+        while remaining > 0 {
+            let Some(next) = self.ticks_until_event() else {
+                break;
+            };
+            if remaining < next {
+                if self.pending_input.is_some() {
+                    self.input_ticks -= remaining;
+                }
+                if let Some(serial) = self.device_byte_ticks.as_mut() {
+                    *serial -= remaining;
+                }
+                break;
+            }
+
+            if self.pending_input.is_some() {
+                self.input_ticks -= next;
+            }
+            if let Some(serial) = self.device_byte_ticks.as_mut() {
+                *serial -= next;
+            }
+            remaining -= next;
+
+            if self.input_ticks == 0
+                && let Some(input) = self.pending_input.take()
+            {
+                self.process_input(input);
+            }
+            if self.device_byte_ticks == Some(0) {
+                self.device_byte_ticks = None;
+                self.device_byte_ready = true;
+                self.latch_ready_device_byte();
+            }
+            self.schedule_device_byte();
         }
     }
 
     /// Take the pending "announce a keyboard byte" edge; the caller pulses IRQ1.
+    #[cfg(test)]
     pub fn take_irq(&mut self) -> bool {
         let armed = self.irq_armed;
         self.irq_armed = false;
@@ -273,6 +402,7 @@ impl Keyboard8042 {
     }
 
     /// Take the pending "announce a mouse byte" edge; the caller pulses IRQ12.
+    #[cfg(test)]
     pub fn take_irq12(&mut self) -> bool {
         let armed = self.irq12_armed;
         self.irq12_armed = false;
@@ -308,21 +438,12 @@ impl Keyboard8042 {
                 // of Persia does exactly that and reads its shift state from the
                 // BDA flag the BIOS sets from that second read.
                 let value = self.output.unwrap_or(0x00);
-                if self.status & STATUS_OBF != 0 && self.output_is_device_byte {
-                    // A real device byte (keyboard or aux) was just consumed:
-                    // hold off latching the next aux byte for a short settle
-                    // window. This guards two races: a chained re-read (see
-                    // the comment above) seeing this same stale value rather
-                    // than a freshly arrived aux byte, and a flooded aux
-                    // queue (a host mouse "flick" can queue many packets at
-                    // once) delivering its bytes to the guest faster than any
-                    // real PS/2 mouse could transmit them.
-                    self.aux_settle_ticks = AUX_BYTE_SETTLE_TICKS;
-                }
                 self.status &= !(STATUS_OBF | STATUS_AUX);
                 self.output_is_aux = false;
-                self.output_is_device_byte = false;
-                self.latch_next(); // latch the next queued byte now that OBF is clear
+                if self.device_byte_ready {
+                    self.latch_ready_device_byte();
+                }
+                self.schedule_device_byte();
                 Some(value)
             }
             0x64 => Some(self.status),
@@ -331,62 +452,22 @@ impl Keyboard8042 {
     }
 
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
-        match port {
-            0x60 => {
-                if let Some(cmd) = self.expecting_command_data.take() {
-                    match cmd {
-                        0x60 => self.command_byte = value,
-                        0xD4 => {
-                            // Byte destined for the mouse: hand it to the aux
-                            // device, then latch whatever it queued in reply.
-                            self.mouse.write_byte(value);
-                            self.latch_next();
-                        }
-                        0xD1 => self.output_port = value, // drive the output port (A20)
-                        _ => {} // other command-data writes ignored until needed
-                    }
-                } else {
-                    self.write_keyboard_byte(value);
-                }
-                true
+        let input = match port {
+            0x60 => PendingInput::Data(value),
+            0x64 => PendingInput::Command(value),
+            _ => return false,
+        };
+        if self.pending_input.is_none() {
+            self.pending_input = Some(input);
+            self.input_ticks = CONTROLLER_INPUT_TICKS;
+            self.status |= STATUS_IBF;
+            if port == 0x64 {
+                self.status |= STATUS_CMD;
+            } else {
+                self.status &= !STATUS_CMD;
             }
-            0x64 => {
-                match value {
-                    0xAA => self.respond_immediately(0x55), // controller self-test OK
-                    0xAB => self.respond_immediately(0x00), // keyboard interface test OK
-                    0xA9 => self.respond_immediately(0x00), // aux (mouse) interface test OK
-                    0x20 => {
-                        // Read command byte. This is a controller-generated response, so it
-                        // goes straight to the output buffer and is not held back by the
-                        // keyboard-disable bit the way a queued scancode would be.
-                        let cb = self.command_byte;
-                        self.respond_immediately(cb);
-                    }
-                    0x60 => self.expecting_command_data = Some(0x60), // write command byte
-                    0xA7 => self.command_byte |= 0x20, // disable aux (mouse): set bit5
-                    0xA8 => {
-                        // enable aux (mouse): clear bit5, then drain any byte
-                        // that queued up while it was masked.
-                        self.command_byte &= !0x20;
-                        self.latch_next();
-                    }
-                    0xD4 => self.expecting_command_data = Some(0xD4), // write next byte to aux
-                    0xAD => self.command_byte |= 0x10,                // disable keyboard: set bit4
-                    0xAE => {
-                        // enable keyboard: clear bit4, then drain a held scancode.
-                        self.command_byte &= !0x10;
-                        self.latch_next();
-                    }
-                    0xD0 => self.respond_immediately(self.output_port), // read output port (A20 state)
-                    0xC0 => self.respond_immediately(0xA0), // read input port: kbd unlocked (bit7), normal (bit5)
-                    0xE0 => self.respond_immediately(0x03), // read test inputs: kbd clock+data idle high
-                    0xD1 => self.expecting_command_data = Some(0xD1), // write output port (A20)
-                    _ => {}                                 // Rest accepted and ignored
-                }
-                true
-            }
-            _ => false,
         }
+        true
     }
 }
 
