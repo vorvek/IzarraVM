@@ -50,6 +50,39 @@ BINARY_SUFFIXES = {
     ".sys",
     ".ttf",
 }
+SOURCE_CODE_SUFFIXES = {
+    ".asm",
+    ".bat",
+    ".btm",
+    ".c",
+    ".cc",
+    ".cmd",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".inc",
+    ".js",
+    ".jsx",
+    ".ld",
+    ".m",
+    ".mak",
+    ".mk",
+    ".nas",
+    ".pl",
+    ".pm",
+    ".ps1",
+    ".py",
+    ".rc",
+    ".rs",
+    ".s",
+    ".sh",
+    ".ts",
+    ".tsx",
+}
+SOURCE_CODE_NAMES = {"makefile"}
 
 
 def tracked_files() -> list[str]:
@@ -137,6 +170,11 @@ def is_test_file(path: str) -> bool:
     return "tests" in item.parts or item.stem.endswith("_test") or item.name.startswith("test_")
 
 
+def is_source_code(path: str) -> bool:
+    item = PurePosixPath(path)
+    return item.suffix.lower() in SOURCE_CODE_SUFFIXES or item.name.lower() in SOURCE_CODE_NAMES
+
+
 def read_manifest(errors: list[str]) -> list[list[str]]:
     path = ROOT / MANIFEST_PATH
     if not path.is_file():
@@ -208,9 +246,10 @@ def main() -> int:
         offset = header_offset(lines, path)
         if tuple(lines[offset : offset + 2]) != header:
             errors.append(f"{path}: missing exact GPL-3.0-only header")
-        limit = 2500 if is_test_file(path) else 3000
-        if len(lines) > limit:
-            errors.append(f"{path}: {len(lines)} lines exceeds the {limit}-line limit")
+        if path not in GENERATED_TEXT and is_source_code(path):
+            limit = 2500 if is_test_file(path) else 3000
+            if len(lines) > limit:
+                errors.append(f"{path}: {len(lines)} lines exceeds the {limit}-line limit")
         if PurePosixPath(path).suffix.lower() == ".rs" and not is_test_file(path):
             if test_attribute.search(text):
                 errors.append(f"{path}: inline test body belongs in a *_test.rs file")

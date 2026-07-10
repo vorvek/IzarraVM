@@ -21,3 +21,4 @@
 *.ttf -text -diff
 third_party/fluidr3mono/FluidR3Mono_License.md -text -diff
 crates/izarravm-native-synth/vendor/licenses/* -text -diff
+tools/msdos-keyboard/LICENSE -text -diff

@@ -1,7 +1,7 @@
 path	class	origin	license	sha256
 Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	7a3a6ddbcd9dfa50d818a75180e07924c41fd239bf6bde26f324624d8e54a1ce
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	59782af2a610bfcff675de28eafbbbd138af51f21377e73efcd969d7144c218b
+NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	75d1f2dd908a9d475b07ea88866460200b890242cd5830d0f3ea1f421b9a89ee
 crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
 crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	48745aa5cdc2aefda93e57529fcfd5ffb40258a9a43381b9f61ff822fd63aa1e
 crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
@@ -51,28 +51,33 @@ crates/izarravm-machine/tests/fixtures/lotura_crc.com	generated-test-fixture	Iza
 crates/izarravm-machine/tests/fixtures/pmirq5.com	generated-test-fixture	IzarraVM project source	GPL-3.0-only	dfd1f2a85f7b1cd619d7065c8b910f2da1f86db8f5a3b824dad0811d1b104fd4
 crates/izarravm-machine/tests/fixtures/vcpipic.com	generated-test-fixture	IzarraVM project source	GPL-3.0-only	456d0bc7fd3040aa11924916535b76bf90b12af4f4754d58d4dc1763d1a0eab7
 crates/izarravm-native-synth/vendor/flac-1.4.3.tar.gz	vendored-source-archive	FLAC 1.4.3 from Xiph.Org	LicenseRef-FLAC-1.4.3-Source-Archive	0a4bb82a30609b606650d538a804a7b40205366ce8fc98871b0ecf3fbb0611ee
-crates/izarravm-native-synth/vendor/fluidsynth-2.5.6.tar.gz	vendored-source-archive	FluidSynth 2.5.6	LGPL-2.1-or-later	0825f024c9cf7a18073739b83612d46542ecbfb349ae9147a1e9f08e2d524407
+crates/izarravm-native-synth/vendor/fluidsynth-2.5.6.tar.gz	vendored-source-archive	FluidSynth 2.5.6	LicenseRef-FluidSynth-2.5.6-Source-Archive	0825f024c9cf7a18073739b83612d46542ecbfb349ae9147a1e9f08e2d524407
 crates/izarravm-native-synth/vendor/gcem-012ae73c6d0a2cb09ffe86475f5c6fba3926e200.tar.gz	vendored-source-archive	GCEM commit 012ae73c	Apache-2.0	34ab0ee87a9eb26d3087fa9b49c2572ea8ee03db0c9705b83648301a3a3fc172
-crates/izarravm-native-synth/vendor/libogg-1.3.6.tar.gz	vendored-source-archive	libogg 1.3.6 from Xiph.Org	BSD-3-Clause	95b643da661155d79db9de2fca55daed3a8d491039829def246aacb3d9201c81
-crates/izarravm-native-synth/vendor/libsndfile-1.2.2.tar.gz	vendored-source-archive	libsndfile 1.2.2	LGPL-2.1-or-later AND Apache-2.0	ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121
-crates/izarravm-native-synth/vendor/libvorbis-1.3.7.tar.gz	vendored-source-archive	libvorbis 1.3.7 from Xiph.Org	BSD-3-Clause	270c76933d0934e42c5ee0a54a36280e2d87af1de3cc3e584806357e237afd13
+crates/izarravm-native-synth/vendor/libogg-1.3.6.tar.gz	vendored-source-archive	libogg 1.3.6 from Xiph.Org	LicenseRef-libogg-1.3.6-Source-Archive	95b643da661155d79db9de2fca55daed3a8d491039829def246aacb3d9201c81
+crates/izarravm-native-synth/vendor/libsndfile-1.2.2.tar.gz	vendored-source-archive	libsndfile 1.2.2	LicenseRef-libsndfile-1.2.2-Source-Archive	ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121
+crates/izarravm-native-synth/vendor/libvorbis-1.3.7.tar.gz	vendored-source-archive	libvorbis 1.3.7 from Xiph.Org	LicenseRef-libvorbis-1.3.7-Source-Archive	270c76933d0934e42c5ee0a54a36280e2d87af1de3cc3e584806357e237afd13
 crates/izarravm-native-synth/vendor/licenses/FLAC-BSD-3-Clause.txt	third-party-license-text	FLAC from Xiph.Org	BSD-3-Clause	12600ea1a7affcbf469bd0d8b2cd725e4167114a2ee834b88f5d2857bfd7ddbf
 crates/izarravm-native-synth/vendor/licenses/FLAC-GFDL-1.2.txt	third-party-license-text	GNU Free Documentation License text from FLAC	GFDL-1.2-only	f45cc81b400a048b56c9edbd4c3317f7a8958463dfd55aa96f268ecfd6baa12c
 crates/izarravm-native-synth/vendor/licenses/FLAC-GPL-2.0.txt	third-party-license-text	GNU GPL notice from FLAC	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643
 crates/izarravm-native-synth/vendor/licenses/FLAC-LGPL-2.1.txt	third-party-license-text	GNU LGPL notice from FLAC	LGPL-2.1-or-later	5df07007198989c622f5d41de8d703e7bef3d0e79d62e24332ee739a452af62a
 crates/izarravm-native-synth/vendor/licenses/FluidSynth-LGPL-2.1.txt	third-party-license-text	FluidSynth	LGPL-2.1-or-later	20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95
+crates/izarravm-native-synth/vendor/licenses/FluidSynth-Vintage-Dreams-Waves-COPYRIGHT.txt	third-party-license-text	Vintage Dreams Waves by Ian Wilson, retained in FluidSynth	LicenseRef-Vintage-Dreams-Waves-Freeware	766f8b6f5716dae672ab3cab74c3d6e3ad452beb49cfef81c82b79970c2601d6
 crates/izarravm-native-synth/vendor/licenses/Munt-GPL-2.0.txt	third-party-license-text	Munt	GPL-2.0-only	ab15fd526bd8dd18a9e77ebc139656bf4d33e97fc7238cd11bf60e2b9b8666c6
 crates/izarravm-native-synth/vendor/licenses/Munt-LGPL-2.1.txt	third-party-license-text	libmt32emu from Munt	LGPL-2.1-or-later	36b6d3fa47916943fd5fec313c584784946047ec1337a78b440e5992cb595f89
+crates/izarravm-native-synth/vendor/licenses/Munt-SHA1-BSD-3-Clause.txt	third-party-license-text	Munt bundled SHA-1 implementation by Micael Hildenborg	BSD-3-Clause	1d773c3b9731d2914567f7345174b149b4cd14fdc798e78cc48148240a2deab4
 crates/izarravm-native-synth/vendor/licenses/Opus-BSD-3-Clause.txt	third-party-license-text	Opus from Xiph.Org	BSD-3-Clause	01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551
 crates/izarravm-native-synth/vendor/licenses/Opus-LICENSE_PLEASE_READ.txt	third-party-license-text	Opus from Xiph.Org	BSD-3-Clause	7efb4989e0cd1b256229bdf2f09300c5d14e35db0e7476bfb87fac243498273d
 crates/izarravm-native-synth/vendor/licenses/gcem-Apache-2.0.txt	third-party-license-text	GCEM	Apache-2.0	58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
 crates/izarravm-native-synth/vendor/licenses/gcem-NOTICE.txt	third-party-license-text	GCEM	Apache-2.0	b9184798c812dd98d754be0101d600cac3d83ee703e994d3320fcfc9662090ec
 crates/izarravm-native-synth/vendor/licenses/libogg-BSD-3-Clause.txt	third-party-license-text	libogg from Xiph.Org	BSD-3-Clause	d2ab5758336489da61c12cc5bb757da5339c4ae9001f9bb0562b4370249af814
 crates/izarravm-native-synth/vendor/licenses/libsndfile-ALAC-Apache-2.0.txt	third-party-license-text	libsndfile bundled ALAC codec	Apache-2.0	232efbd83786e157286b0b96c68ebb673541b69b33036287bf1e5ec5067a49d9
+crates/izarravm-native-synth/vendor/licenses/libsndfile-G72x-Sun.txt	third-party-license-text	libsndfile bundled G72x codec from Sun Microsystems	LicenseRef-Sun-G72x-Unrestricted	4647b6cc906edc577e16b8984357f94adb1439b7abe72afe8d353422cfab7085
+crates/izarravm-native-synth/vendor/licenses/libsndfile-GSM610-COPYRIGHT.txt	third-party-license-text	libsndfile bundled GSM 6.10 codec by Jutta Degener and Carsten Bormann	TU-Berlin-1.0	1bbe7119b1bcd1489e0f36cb95b8902f7f0ceec9a2f3a67394bc9f4709a4e0a7
 crates/izarravm-native-synth/vendor/licenses/libsndfile-LGPL-2.1.txt	third-party-license-text	libsndfile	LGPL-2.1-or-later	ad01ea5cd2755f6048383c8d54c88459cd6fcb17757c5c8892f8c5ea060f6140
+crates/izarravm-native-synth/vendor/licenses/libsndfile-OpusFile-BSD-3-Clause.txt	third-party-license-text	libsndfile code based on OpusFile and Opus-Tools	BSD-3-Clause	d00bc5e9b910d10d5aa2eeb7f8a61b737ebbee2a6366c2441e2f3056a6c079b5
 crates/izarravm-native-synth/vendor/licenses/libvorbis-BSD-3-Clause.txt	third-party-license-text	libvorbis from Xiph.Org	BSD-3-Clause	ec1815db59fcd302846df949d7424876cb2e2dc5ed1606c5fb0b36787b1cf43a
 crates/izarravm-native-synth/vendor/munt-2.8.2.tar.gz	vendored-source-archive	Munt 2.8.2	LicenseRef-Munt-2.8.2-Source-Archive	ca0a2b881207a88d10c511c441bcf4f7a9fd591bea630032662f02bcb51b1b5d
-crates/izarravm-native-synth/vendor/opus-1.5.2.tar.gz	vendored-source-archive	Opus 1.5.2 from Xiph.Org	BSD-3-Clause	9480e329e989f70d69886ded470c7f8cfe6c0667cc4196d4837ac9e668fb7404
+crates/izarravm-native-synth/vendor/opus-1.5.2.tar.gz	vendored-source-archive	Opus 1.5.2 from Xiph.Org	LicenseRef-Opus-1.5.2-Source-Archive	9480e329e989f70d69886ded470c7f8cfe6c0667cc4196d4837ac9e668fb7404
 crates/izarravm/assets/izarra3000_logo.rgba	project-artwork	IzarraVM project	GPL-3.0-only	a0cd6a47d46ab16fd9b252d21929e306e8b2ed7782b76900238e8516d9a5e8d7
 docs/izarra-3000-chassis.jpg	project-artwork	IzarraVM project	GPL-3.0-only	2c1ee8644a0002171234ecf798805a544b6106017bbbe2416a8c7a3774c82720
 docs/izarra3000-logo.png	project-artwork	IzarraVM project	GPL-3.0-only	2533847bd1b9db59b06e6af6f70c83e94ebadec04195a5df9eff74507f78fb91
@@ -109,3 +114,4 @@ tools/cp437-fonts.bin	generated-font	Modern DOS by Jayvee Enaguas	CC0-1.0	fa9d82
 tools/fonts/ModernDOS8x14.ttf	vendored-font	Modern DOS by Jayvee Enaguas	CC0-1.0	a0101fce103ce916ec95d80536215b6c974e66d2756615fc68dac1dba97e3af5
 tools/fonts/ModernDOS8x16.ttf	vendored-font	Modern DOS by Jayvee Enaguas	CC0-1.0	f79ebf2f0bf038dcfcb4648be794603fac902af132d8730484650f7f88431a4f
 tools/fonts/ModernDOS8x8.ttf	vendored-font	Modern DOS by Jayvee Enaguas	CC0-1.0	6f20adfa9cf7323daabcc80dae3768b2e7fcf3b37c5468d981af3ebcb42a5d95
+tools/msdos-keyboard/LICENSE	third-party-license-text	Microsoft MS-DOS repository	MIT	b5179f780ec212a434efcc989a2295a140deb0bdb17182d2bf9c5f6f1f1a01c4
