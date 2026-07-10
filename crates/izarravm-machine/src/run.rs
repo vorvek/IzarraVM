@@ -493,7 +493,7 @@ impl Machine {
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     let advance_start = self.host_profile.start();
-                    self.advance_cpu_work(step);
+                    self.advance_cpu_work(step, u64::from(outcome.core_clocks));
                     self.host_profile
                         .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
                     let service_start = self.host_profile.start();
@@ -576,7 +576,7 @@ impl Machine {
                         let halt_start = self.host_profile.start();
                         match self.next_timer_wake(deadline_ticks) {
                             Some(wake_step) => {
-                                self.advance_cpu_work(wake_step);
+                                self.advance_cpu_work(wake_step, 0);
                             }
                             None => {
                                 let remaining = deadline_ticks - self.timeline.now_ticks();

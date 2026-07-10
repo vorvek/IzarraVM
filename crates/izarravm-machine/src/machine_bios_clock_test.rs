@@ -251,7 +251,10 @@ fn live_mode_switches_keep_one_master_deadline_and_device_phase() {
     let mut baseline = test_machine();
     baseline.set_mode(GswMode::Gsw386Slow);
     baseline.advance_devices_ticks(actual_ticks);
-    assert_eq!(machine.timeline, baseline.timeline);
+    assert_eq!(
+        machine.timeline.excluding_tsc(),
+        baseline.timeline.excluding_tsc()
+    );
     assert_eq!(machine.video().beam_dots(), baseline.video().beam_dots());
     assert_eq!(machine.pit.channel_out(0), baseline.pit.channel_out(0));
     assert_eq!(machine.pit.channel_out(2), baseline.pit.channel_out(2));
@@ -295,6 +298,69 @@ fn storage_stall_advances_pit_audio_video_and_the_timeline() {
         machine.speaker.drain(441).iter().any(|&sample| sample != 0),
         "speaker samples must continue through a storage stall"
     );
+}
+
+#[test]
+fn tsc_counts_halted_and_storage_time_across_live_mode_changes() {
+    let make_machine = || {
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.cpu = GswMode::Gsw586;
+        Machine::new(profile, rom_with_code(&[0x0f, 0x31, 0xfa, 0xf4])).unwrap()
+    };
+    let read_tsc = |machine: &Machine| {
+        u64::from(machine.cpu().registers.eax()) | (u64::from(machine.cpu().registers.edx()) << 32)
+    };
+
+    let mut baseline = make_machine();
+    assert_eq!(
+        baseline.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    let baseline_tsc = read_tsc(&baseline);
+
+    let mut advanced = make_machine();
+    advanced.stall_for_master_ticks(33 * 1_000);
+    advanced.set_mode(GswMode::Gsw486);
+    advanced.advance_halted_ticks(100 * 2_000);
+    advanced.set_mode(GswMode::Gsw386);
+    advanced.stall_for_master_ticks(300 * 3_000);
+    advanced.set_mode(GswMode::Gsw386Slow);
+    advanced.advance_halted_ticks(900 * 4_000);
+    advanced.set_mode(GswMode::Gsw586);
+    assert_eq!(
+        advanced.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+
+    assert_eq!(read_tsc(&advanced).wrapping_sub(baseline_tsc), 10_000);
+}
+
+#[test]
+fn tsc_counts_retired_and_bus_overshoot_clocks_once() {
+    let make_machine = || {
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.cpu = GswMode::Gsw586;
+        Machine::new(profile, rom_with_code(&[0x0f, 0x31, 0xfa, 0xf4])).unwrap()
+    };
+    let read_tsc = |machine: &Machine| {
+        u64::from(machine.cpu().registers.eax()) | (u64::from(machine.cpu().registers.edx()) << 32)
+    };
+
+    let mut baseline = make_machine();
+    assert_eq!(
+        baseline.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+
+    let mut advanced = make_machine();
+    advanced.cpu.elapsed_clocks = 400;
+    advanced.advance_cpu_work(1_000, 400);
+    assert_eq!(
+        advanced.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+
+    assert_eq!(read_tsc(&advanced).wrapping_sub(read_tsc(&baseline)), 1_000);
 }
 
 #[test]
