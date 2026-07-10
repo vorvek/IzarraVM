@@ -176,6 +176,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let saved_prefs = prefs::GuiPrefs::load(&prefs::prefs_path(&config.dos.c_drive));
     merge_saved_midi(&mut config.audio.midi, &saved_prefs.midi, midi_presence);
+    if !cli.portable {
+        discover_munt_roms(&mut config.audio.midi, &state_dir_path());
+    }
     let hardware = HardwareProfile::from_config(&config)?;
     let audio = AudioSubsystem::from_config(&config.audio);
     let input = InputState {
@@ -307,10 +310,14 @@ fn c_root_path(portable: bool) -> PathBuf {
             .unwrap_or_else(|| PathBuf::from("."));
         exe_dir.join("c_drive")
     } else {
-        #[allow(deprecated)]
-        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".izarravm").join("c_drive")
+        state_dir_path().join("c_drive")
     }
+}
+
+fn state_dir_path() -> PathBuf {
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".izarravm")
 }
 
 /// Run the clean-room boot suite and print its result block.
@@ -1043,6 +1050,36 @@ fn merge_saved_midi(config: &mut MidiConfig, saved: &MidiConfig, presence: MidiC
     }
     if !presence.mt32_pcm_rom {
         config.mt32_pcm_rom.clone_from(&saved.mt32_pcm_rom);
+    }
+}
+
+fn discover_munt_roms(config: &mut MidiConfig, state_dir: &Path) {
+    if config.mt32_control_rom.is_some() || config.mt32_pcm_rom.is_some() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return;
+    };
+    let files: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    let named = |name: &str| {
+        files.iter().find(|path| {
+            path.file_name()
+                .is_some_and(|file| file.to_string_lossy().eq_ignore_ascii_case(name))
+        })
+    };
+    for (control_name, pcm_name) in [
+        ("MT32_CONTROL.ROM", "MT32_PCM.ROM"),
+        ("CM32L_CONTROL.ROM", "CM32L_PCM.ROM"),
+    ] {
+        if let (Some(control), Some(pcm)) = (named(control_name), named(pcm_name)) {
+            config.mt32_control_rom = Some(control.clone());
+            config.mt32_pcm_rom = Some(pcm.clone());
+            return;
+        }
     }
 }
 

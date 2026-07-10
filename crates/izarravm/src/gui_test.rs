@@ -16,6 +16,15 @@ fn cpu_mode_label_preserves_fractional_clock_rates() {
 }
 
 #[test]
+fn munt_selection_requires_both_rom_paths() {
+    assert!(!munt_roms_configured("", ""));
+    assert!(!munt_roms_configured("control.rom", ""));
+    assert!(!munt_roms_configured("", "pcm.rom"));
+    assert!(!munt_roms_configured("control.rom", "   "));
+    assert!(munt_roms_configured("control.rom", "pcm.rom"));
+}
+
+#[test]
 fn volume_gain_is_cubic_and_clamped() {
     // Endpoints are exact: silence at 0, unity at full.
     assert_eq!(volume_gain(0.0), 0.0);

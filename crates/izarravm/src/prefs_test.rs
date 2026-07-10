@@ -23,7 +23,7 @@ fn round_trips_through_toml() {
                 name: "LoopMIDI".into(),
                 ordinal: 1,
             }),
-            soundfont: None,
+            soundfont: Some(PathBuf::from("/tmp/external.sf3")),
             mt32_control_rom: None,
             mt32_pcm_rom: None,
         },
