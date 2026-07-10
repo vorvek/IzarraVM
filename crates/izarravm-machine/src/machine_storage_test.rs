@@ -399,6 +399,151 @@ fn int13_ah42_extended_read_via_disk_address_packet() {
     assert_eq!(m.read_physical_u8(dap + 2), 1);
 }
 
+fn assert_chs_fixed_disk_deadline(mode: GswMode, ah: u8, count: u8) {
+    let mut machine = machine_with_hdd(64);
+    machine.set_mode(mode);
+    machine
+        .cpu
+        .registers
+        .set_eax((u32::from(ah) << 8) | u32::from(count));
+    machine.cpu.registers.set_ecx(0x0001);
+    machine.cpu.registers.set_edx(0x0080);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2000));
+    machine.cpu.registers.set_ebx(0);
+    let ticks_before = machine.master_ticks();
+    let stalls_before = machine.io_stall_ticks();
+
+    machine.handle_int13();
+
+    let expected = ata::pio_transfer_ticks(u32::from(count));
+    assert_eq!(
+        machine.master_ticks() - ticks_before,
+        expected,
+        "{mode} CHS AH={ah:02X} master deadline"
+    );
+    assert_eq!(
+        machine.io_stall_ticks() - stalls_before,
+        expected,
+        "{mode} CHS AH={ah:02X} I/O stall"
+    );
+    assert_eq!(
+        (machine.cpu.registers.eax() >> 8) as u8,
+        0,
+        "{mode} CHS AH={ah:02X} succeeds"
+    );
+}
+
+fn assert_edd_fixed_disk_deadline(mode: GswMode, ah: u8, count: u16) {
+    let mut machine = machine_with_hdd(64);
+    machine.set_mode(mode);
+    let dap = 0x5_0000u32;
+    machine.write_physical_u8(dap, 16);
+    for (offset, byte) in count.to_le_bytes().into_iter().enumerate() {
+        machine.write_physical_u8(dap + 2 + offset as u32, byte);
+    }
+    machine.write_physical_u8(dap + 7, 0x60);
+    machine.write_physical_u8(dap + 8, 7);
+    machine.cpu.registers.set_eax(u32::from(ah) << 8);
+    machine.cpu.registers.set_edx(0x0080);
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x5000));
+    machine.cpu.registers.set_esi(0);
+    let ticks_before = machine.master_ticks();
+    let stalls_before = machine.io_stall_ticks();
+
+    machine.handle_int13();
+
+    let expected = ata::pio_transfer_ticks(u32::from(count));
+    assert_eq!(
+        machine.master_ticks() - ticks_before,
+        expected,
+        "{mode} EDD AH={ah:02X} master deadline"
+    );
+    assert_eq!(
+        machine.io_stall_ticks() - stalls_before,
+        expected,
+        "{mode} EDD AH={ah:02X} I/O stall"
+    );
+    assert_eq!(
+        (machine.cpu.registers.eax() >> 8) as u8,
+        0,
+        "{mode} EDD AH={ah:02X} succeeds"
+    );
+    assert_eq!(read_u16(&mut machine, dap + 2), count, "DAP block count");
+}
+
+#[test]
+fn fixed_disk_bios_deadlines_are_cpu_mode_invariant() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for ah in [0x02, 0x03, 0x04, 0x0A, 0x0B] {
+            assert_chs_fixed_disk_deadline(mode, ah, 2);
+        }
+        for ah in [0x42, 0x43, 0x44] {
+            assert_edd_fixed_disk_deadline(mode, ah, 2);
+        }
+    }
+}
+
+#[test]
+fn fixed_disk_bios_stall_advances_devices_and_is_batch_invariant() {
+    let mut bios = machine_with_hdd(300);
+    let mut split = machine_with_hdd(300);
+    for machine in [&mut bios, &mut split] {
+        with_bus(machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x40, false).unwrap();
+            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
+        });
+    }
+    let beam_before = bios.video().beam_dots();
+    let pit_before = bios.pit.channel_out(2);
+    bios.cpu.registers.set_eax(0x02ff);
+    bios.cpu.registers.set_ecx(0x0001);
+    bios.cpu.registers.set_edx(0x0080);
+    bios.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2000));
+    bios.cpu.registers.set_ebx(0);
+
+    bios.handle_int13();
+    let expected = ata::pio_transfer_ticks(255);
+    split.stall_for_master_ticks(expected / 3);
+    split.stall_for_master_ticks(expected - expected / 3);
+
+    assert_eq!(bios.master_ticks(), expected);
+    assert_eq!(bios.io_stall_ticks(), expected);
+    assert_ne!(bios.video().beam_dots(), beam_before, "video beam advanced");
+    assert_ne!(
+        bios.pit.channel_out(2),
+        pit_before,
+        "PIT channel 2 advanced"
+    );
+    assert_eq!(
+        bios.timeline.excluding_tsc(),
+        split.timeline.excluding_tsc()
+    );
+    assert_eq!(bios.video().beam_dots(), split.video().beam_dots());
+    assert_eq!(bios.pit.channel_out(2), split.pit.channel_out(2));
+    let bios_audio = bios.speaker.drain(512);
+    let split_audio = split.speaker.drain(512);
+    assert!(
+        bios_audio.iter().any(|&sample| sample != 0),
+        "speaker audio advanced"
+    );
+    assert_eq!(bios_audio, split_audio, "audio advance is batch invariant");
+}
+
 #[test]
 fn int13_ah48_extended_drive_params() {
     let mut m = machine_with_hdd(4032);

@@ -28,6 +28,20 @@ fn advance_to_deadline(disk: &mut AtaDisk) {
 }
 
 #[test]
+fn bios_and_pio_share_the_media_transfer_deadline() {
+    assert_eq!(pio_transfer_ticks(0), 0);
+    assert_eq!(
+        pio_transfer_ticks(3),
+        COMMAND_LATENCY_TICKS + 3 * pio_sector_ticks()
+    );
+
+    let mut disk = marked_disk(8);
+    program_lba(&mut disk, 1, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x20);
+    assert_eq!(disk.ticks_until_completion(), Some(pio_transfer_ticks(1)));
+}
+
+#[test]
 fn geometry_is_16_heads_63_spt() {
     // 16 * 63 = 1008 sectors per cylinder; 4032 sectors is 4 cylinders.
     let disk = marked_disk(4032);
