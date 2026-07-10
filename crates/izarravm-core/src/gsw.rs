@@ -23,6 +23,13 @@ pub enum CpuPersona {
     I586,
 }
 
+impl CpuPersona {
+    /// Whether this fixed Izarra 3000 CPU persona includes an x87 unit.
+    pub const fn has_fpu(self) -> bool {
+        matches!(self, Self::I486 | Self::I586)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum L1Cache {
     None,

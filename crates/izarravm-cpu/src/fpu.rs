@@ -1,4 +1,4 @@
-//! x87 FPU state for the 387-class core: the register stack, the control and
+//! x87 state for the CPU personas with an integrated FPU: the register stack, the control and
 //! status words, and the tag word.
 //!
 //! Limit: registers hold f64, not the hardware's 80-bit extended format. The

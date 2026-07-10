@@ -1117,7 +1117,7 @@ impl Machine {
         let shadow = &rom[rom.len() - BIOS_ROM_SIZE..];
 
         let mut machine = Self::base(profile, CpuGsw::default(), shadow.to_vec())?;
-        install_boot_bios_stubs(&mut machine.memory)?;
+        install_boot_bios_stubs(&mut machine.memory, machine.active_mode)?;
         Ok(machine)
     }
 
@@ -1225,7 +1225,7 @@ impl Machine {
                 .write_u8(BOOT_STAGE2_ADDRESS + offset, byte)?;
         }
 
-        install_boot_bios_stubs(&mut machine.memory)?;
+        install_boot_bios_stubs(&mut machine.memory, machine.active_mode)?;
         Ok(machine)
     }
 
@@ -1512,6 +1512,14 @@ impl Machine {
         self.active_mode = mode;
         self.timeline.set_mode(mode);
         self.cpu.set_mode(mode);
+        if let Ok(mut equipment) = self.memory.read_u16(0x410) {
+            if mode.persona().has_fpu() {
+                equipment |= BIOS_EQUIPMENT_FPU;
+            } else {
+                equipment &= !BIOS_EQUIPMENT_FPU;
+            }
+            let _ = self.memory.write_u16(0x410, equipment);
+        }
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
@@ -2108,10 +2116,11 @@ fn boot_sector_cpu() -> CpuGsw {
 /// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
 /// initial video mode; bits 11-9 = 010b advertises two serial ports (COM1 and
 /// COM2 are emulated); bits 15-14 = 10b advertises two parallel printer ports
-/// (LPT1 and LPT2 are emulated). Bit 1 (80x87 coprocessor) stays clear: the
-/// Izarra 3000 ships no 387, so software that probes the equipment word skips
-/// its FPU path. The bit layout follows RBIL's INT 11h equipment word.
+/// (LPT1 and LPT2 are emulated). Bit 1 is added for the 486 and 586 modes,
+/// whose CPU personas include an x87 unit, and stays clear for both 386 modes.
+/// The bit layout follows RBIL's INT 11h equipment word.
 const BIOS_EQUIPMENT_WORD: u16 = 0x8421;
+const BIOS_EQUIPMENT_FPU: u16 = 0x0002;
 
 /// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
 /// caps usable low memory at 640 KiB no matter how much RAM is installed; the
@@ -2410,7 +2419,7 @@ fn seed_video_bios_tables(memory: &mut Memory) -> Result<(), BusError> {
     Ok(())
 }
 
-fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
+fn install_boot_bios_stubs(memory: &mut Memory, mode: GswMode) -> Result<(), BusError> {
     // Low CPU exception vectors and INT 05h Print Screen start as safe BIOS
     // defaults. Guests and DOS can replace them through the IVT.
     for vector in 0x00usize..=0x07 {
@@ -2489,7 +2498,12 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
-    memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
+    let equipment = if mode.persona().has_fpu() {
+        BIOS_EQUIPMENT_WORD | BIOS_EQUIPMENT_FPU
+    } else {
+        BIOS_EQUIPMENT_WORD
+    };
+    memory.write_u16(0x410, equipment)?;
     memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB - 1)?;
     // Reserve the 1 KB EBDA at 0x9FC00 and write its size byte (1 = 1 KB) at offset
     // 0, the way a real BIOS POST does. INT 15h AH=C1h returns its segment.

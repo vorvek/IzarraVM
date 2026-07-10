@@ -95,8 +95,8 @@ const CR0_PG: u32 = 0x8000_0000;
 // 486 control bits added to the 386's PE/PG. WP gates supervisor writes to read-only
 // pages, AM enables #AC, and NE selects native x87 exception delivery. NW and CD are
 // inert storage because cache disabling has no modeled effect.
-// CR0 bit 4 is ET (extension type). The existing reset image leaves it clear; x87
-// execution is available independently because the core models an attached 387 on the 386.
+// CR0 bit 4 is ET (extension type). The existing reset image leaves it clear. The
+// active CPU persona decides whether an x87 unit is present.
 const CR0_WP: u32 = 0x0001_0000; // bit 16
 const CR0_AM: u32 = 0x0004_0000; // bit 18
 #[allow(dead_code)]
@@ -422,8 +422,8 @@ impl Registers {
 
 // Reset state is all zero: PE/PG clear (real mode, no paging) and AM clear. AM is
 // correctly CR0 bit 18, so it powers up masked at zero. Bit 4 is ET, which an old
-// 386 reset forced on; here it stays 0 since no x87 FPU is emulated, so the default
-// is a plain zero (derived).
+// 386 reset forced on; it stays 0 because x87 presence comes from the active CPU
+// persona rather than this stored reset image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlRegisters {
     pub cr0: u32,

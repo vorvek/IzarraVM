@@ -28,7 +28,7 @@ impl Machine {
         let kb = izarravm_firmware::kbd_resident_bios();
         rom[..kb.len()].copy_from_slice(kb);
         let mut machine = Self::base(profile, CpuGsw::default(), rom)?;
-        install_boot_bios_stubs(&mut machine.memory)?;
+        install_boot_bios_stubs(&mut machine.memory, machine.active_mode)?;
         machine.install_keyboard_bios()?;
         machine.program_runtime = true;
 
