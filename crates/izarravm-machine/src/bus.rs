@@ -832,16 +832,30 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         if port == WAVETABLE_MPU_BASE {
-            return Ok(u32::from(self.wavetable_mpu.read_data()));
+            let guest_tick = self.guest_tick_now();
+            self.pic.set_irq_level(9, self.midi_mpu.irq_level());
+            let value = self.wavetable_mpu.read_data_at(guest_tick);
+            self.sync_mpu_irq();
+            return Ok(u32::from(value));
         }
         if port == WAVETABLE_MPU_BASE + 1 {
-            return Ok(u32::from(self.wavetable_mpu.status()));
+            let guest_tick = self.guest_tick_now();
+            let value = self.wavetable_mpu.status_at(guest_tick);
+            self.sync_mpu_irq();
+            return Ok(u32::from(value));
         }
         if port == MIDI_MPU_BASE {
-            return Ok(u32::from(self.midi_mpu.read_data()));
+            let guest_tick = self.guest_tick_now();
+            self.pic.set_irq_level(9, self.wavetable_mpu.irq_level());
+            let value = self.midi_mpu.read_data_at(guest_tick);
+            self.sync_mpu_irq();
+            return Ok(u32::from(value));
         }
         if port == MIDI_MPU_BASE + 1 {
-            return Ok(u32::from(self.midi_mpu.status()));
+            let guest_tick = self.guest_tick_now();
+            let value = self.midi_mpu.status_at(guest_tick);
+            self.sync_mpu_irq();
+            return Ok(u32::from(value));
         }
         // AD1848 / Windows Sound System: 4 config-region ports at wss_base plus
         // the 4 codec ports at wss_base+4. read_port takes the in-region offset
@@ -1037,19 +1051,25 @@ impl CpuBus for MachineBus<'_> {
         if port == WAVETABLE_MPU_BASE {
             let guest_tick = self.guest_tick_now();
             self.wavetable_mpu.write_data(value as u8, guest_tick);
+            self.sync_mpu_irq();
             return Ok(());
         }
         if port == WAVETABLE_MPU_BASE + 1 {
-            self.wavetable_mpu.write_command(value as u8);
+            let guest_tick = self.guest_tick_now();
+            self.wavetable_mpu.write_command_at(value as u8, guest_tick);
+            self.sync_mpu_irq();
             return Ok(());
         }
         if port == MIDI_MPU_BASE {
             let guest_tick = self.guest_tick_now();
             self.midi_mpu.write_data(value as u8, guest_tick);
+            self.sync_mpu_irq();
             return Ok(());
         }
         if port == MIDI_MPU_BASE + 1 {
-            self.midi_mpu.write_command(value as u8);
+            let guest_tick = self.guest_tick_now();
+            self.midi_mpu.write_command_at(value as u8, guest_tick);
+            self.sync_mpu_irq();
             return Ok(());
         }
         // AD1848 / Windows Sound System write path. write_port takes the in-region
@@ -1394,6 +1414,13 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
 }
 
 impl MachineBus<'_> {
+    fn sync_mpu_irq(&mut self) {
+        self.pic.set_irq_level(
+            9,
+            self.wavetable_mpu.irq_level() || self.midi_mpu.irq_level(),
+        );
+    }
+
     /// In-region offset (0..=7) of `port` within the AD1848 / WSS port window
     /// `[wss_base, wss_base + 8)`, or `None` when the codec is disabled or the
     /// port lies outside the window. The codec's read_port/write_port take this
