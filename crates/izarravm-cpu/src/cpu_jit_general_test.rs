@@ -518,6 +518,59 @@ fn sixteen_bit_register_ops_are_not_inlined_as_wrong_width() {
     assert!(jit_cpu.perf_counters().jit_region_entries > 0);
 }
 
+#[test]
+fn region_callbacks_keep_host_stack_aligned_in_a_string_loop() {
+    // DOS/4GW uses this strlen/copy shape while starting a protected-mode
+    // program. It was the first real workload whose callback needed the host
+    // ABI's stack-alignment guarantee, exposing a region prologue that counted
+    // five saved registers while actually pushing six.
+    let program = || {
+        let mut memory = vec![0u8; 0x1000];
+        memory[0x100] = 0x90; // starter NOP warms the loop as a continuation
+        memory[0x101..0x108].copy_from_slice(&[
+            0xac, // lodsb
+            0xaa, // stosb
+            0x84, 0xc0, // test al,al
+            0x75, 0xfa, // jnz 0x101
+            0xf4, // hlt
+        ]);
+        memory[0x300..0x307].copy_from_slice(b"DOS4GW\0");
+        memory
+    };
+    let arm = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.registers.eip = 0x100;
+        cpu.registers.set_esp(0x700);
+        cpu.registers.set_esi(0x300);
+        cpu.registers.set_edi(0x400);
+        bus.memory[0x400..0x407].fill(0);
+    };
+
+    let mut interp = fresh16();
+    let mut jit_cpu = fresh16();
+    let mut bus_i = TestBus::with_memory(program());
+    let mut bus_j = TestBus::with_memory(program());
+
+    arm(&mut interp, &mut bus_i);
+    arm(&mut jit_cpu, &mut bus_j);
+    drive_to_halt(&mut interp, &mut bus_i);
+    drive_to_halt(&mut jit_cpu, &mut bus_j);
+    assert_eq!(interp, jit_cpu, "warm phases must match before admission");
+
+    let idx = jit::block::try_admit(&mut jit_cpu, 0x101, false)
+        .expect("the DOS/4GW string loop must build");
+    jit_cpu.decode_cache.stamp_region(0x101, false, idx);
+
+    arm(&mut interp, &mut bus_i);
+    arm(&mut jit_cpu, &mut bus_j);
+    drive_to_halt(&mut interp, &mut bus_i);
+    drive_to_halt(&mut jit_cpu, &mut bus_j);
+
+    assert_eq!(interp, jit_cpu, "string-loop CPU state diverged");
+    assert_eq!(bus_i.memory, bus_j.memory, "string-loop memory diverged");
+    assert_eq!(&bus_j.memory[0x400..0x407], b"DOS4GW\0");
+    assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+}
+
 // ---- S2.1: the per-op differential gate (template_diff) ----
 //
 // For each templated op, admit it as a single INTERIOR inline slot and run the region vs

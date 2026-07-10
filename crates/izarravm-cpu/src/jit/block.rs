@@ -257,14 +257,14 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
     Some((slots, is_loop))
 }
 
-/// Total bytes the prologue reserves below the five pushed callee-saved registers, sized so every
+/// Total bytes the prologue reserves below the six pushed callee-saved registers, sized so every
 /// `call` site sees RSP % 16 == 0 AND leaves room for a 5th stack-passed argument. At entry
-/// RSP % 16 == 8 (after the return-address push); 5 pushes subtract 40 (8 mod 16), landing RSP at
-/// 0 mod 16; 48 keeps it there (48 is a multiple of 16). 32 is the Win64 shadow space (a callee's
+/// RSP % 16 == 8 (after the return-address push); 6 pushes subtract 48, leaving RSP at 8 mod 16;
+/// 56 moves it to 0 mod 16. 32 is the Win64 shadow space (a callee's
 /// [RSP+0..32]); the native-bookkeeping path calls `jit_charge_fetch` (5 args on win64), whose 5th
-/// argument lands at [RSP+32], so the reserve must cover [0..40] at least - 48 gives that with
+/// argument lands at [RSP+32], so the reserve must cover [0..40] at least. 56 gives that with
 /// alignment. Harmless on SysV64 (no shadow space, but the alignment holds).
-const STACK_RESERVE: u32 = 48;
+const STACK_RESERVE: u32 = 56;
 
 /// Throwaway A/B mode for the S2.2 end-to-end prototype (owner: "prototype first"): controls how
 /// `emit_region` compiles the inline slots' bookkeeping. 0 = the `region_inline_slot` trampoline
