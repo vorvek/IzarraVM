@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_native_synth::NATIVE_SYNTH_AVAILABLE;
+use std::fs;
 
 fn config(backend: MidiBackend) -> MidiConfig {
     MidiConfig {
@@ -10,6 +12,18 @@ fn config(backend: MidiBackend) -> MidiConfig {
         soundfont: None,
         mt32_control_rom: None,
         mt32_pcm_rom: None,
+    }
+}
+
+fn tick_for_frame(frame: u64) -> u64 {
+    u64::try_from(u128::from(frame) * u128::from(MASTER_CLOCK_HZ) / u128::from(SAMPLE_RATE_HZ))
+        .unwrap()
+}
+
+fn message(frame: u64, bytes: &[u8]) -> TimedMidiMessage {
+    TimedMidiMessage {
+        guest_tick: tick_for_frame(frame),
+        bytes: bytes.to_vec(),
     }
 }
 
@@ -28,15 +42,28 @@ fn exact_port_name_and_ordinal_select_only_the_requested_duplicate() {
     };
     assert_eq!(matching_port_index(names, &absent), None);
 
-    let failed_name = MidiPortId {
-        name: String::new(),
-        ordinal: 0,
-    };
-    assert_eq!(matching_port_index([None], &failed_name), None);
+    let ids = port_ids(names);
+    assert_eq!(
+        ids,
+        [
+            MidiPortId {
+                name: "LoopMIDI".into(),
+                ordinal: 0,
+            },
+            MidiPortId {
+                name: "Other".into(),
+                ordinal: 0,
+            },
+            MidiPortId {
+                name: "LoopMIDI".into(),
+                ordinal: 1,
+            },
+        ]
+    );
 }
 
 #[test]
-fn silent_and_deferred_backends_report_actionable_status() {
+fn off_external_without_a_port_and_munt_without_roms_stay_actionable() {
     assert_eq!(
         MidiEngine::open(&config(MidiBackend::Off)).status(),
         MidiStatus::Ready
@@ -45,22 +72,98 @@ fn silent_and_deferred_backends_report_actionable_status() {
         MidiEngine::open(&config(MidiBackend::External)).status(),
         MidiStatus::MissingPort
     );
-    assert_eq!(
-        MidiEngine::open(&config(MidiBackend::FluidSynth)).status(),
-        MidiStatus::InitializationFailed
-    );
-    assert_eq!(
-        MidiEngine::open(&config(MidiBackend::Munt)).status(),
-        MidiStatus::MissingRoms
-    );
+
+    let mut munt = MidiEngine::open(&config(MidiBackend::Munt));
+    assert_eq!(munt.status(), MidiStatus::MissingRoms);
+    let mut output = vec![(0, 0); 64];
+    munt.send(&message(0, &[0x90, 60, 100]));
+    munt.render(&mut output);
+    assert!(output.iter().all(|frame| *frame == (0, 0)));
+}
+
+#[test]
+fn master_ticks_map_to_the_first_mixer_frame_at_or_after_the_deadline() {
+    assert_eq!(sample_frame_for_tick(0), 0);
+    for frame in [1, 2, 127, 128, 44_100] {
+        assert_eq!(sample_frame_for_tick(tick_for_frame(frame)), frame);
+    }
+    assert_eq!(sample_frame_for_tick(MASTER_CLOCK_HZ), 44_100);
+}
+
+#[test]
+fn pending_messages_are_ordered_by_guest_timestamp() {
+    let mut midi = MidiEngine::open(&config(MidiBackend::Off));
+    midi.queue(message(30, &[0x90, 62, 100]));
+    midi.queue(message(10, &[0x90, 60, 100]));
+    midi.queue(message(20, &[0x90, 61, 100]));
+
+    let frames: Vec<_> = midi
+        .pending
+        .iter()
+        .map(|message| sample_frame_for_tick(message.guest_tick))
+        .collect();
+    assert_eq!(frames, [10, 20, 30]);
+}
+
+#[test]
+fn backend_switch_keeps_the_absolute_render_cursor() {
+    let mut midi = MidiEngine::open(&config(MidiBackend::Off));
+    midi.render(&mut [(0, 0); 37]);
+    midi.reconfigure(&config(MidiBackend::Off));
+    midi.render(&mut [(0, 0); 5]);
+    assert_eq!(midi.rendered_frames, 42);
+}
+
+#[test]
+fn embedded_fluidsynth_starts_a_note_at_its_guest_timed_offset() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+
+    let mut midi = MidiEngine::open(&config(MidiBackend::FluidSynth));
+    assert_eq!(midi.status(), MidiStatus::Ready);
+    midi.send(&message(0, &[0xc0, 0]));
+    midi.send(&message(128, &[0x90, 60, 110]));
+
+    let mut output = vec![(0, 0); 2_048];
+    midi.render(&mut output);
+    let early_peak = output[..128]
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(i16::unsigned_abs)
+        .max()
+        .unwrap();
+    let note_peak = output[128..]
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(i16::unsigned_abs)
+        .max()
+        .unwrap();
+    assert!(early_peak <= 2, "pre-note dither was {early_peak}");
+    assert!(note_peak > 16, "note peak was only {note_peak}");
+}
+
+#[test]
+fn missing_and_bad_custom_soundfonts_warn_status_and_use_the_embedded_bank() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
 
     let temp = tempfile::tempdir().unwrap();
-    let mut missing_soundfont = config(MidiBackend::FluidSynth);
-    missing_soundfont.soundfont = Some(temp.path().join("missing.sf3"));
-    assert_eq!(
-        MidiEngine::open(&missing_soundfont).status(),
-        MidiStatus::MissingSoundFont
-    );
+    for path in [temp.path().join("missing.sf3"), temp.path().join("bad.sf3")] {
+        if path.file_name().unwrap() == "bad.sf3" {
+            fs::write(&path, b"not a SoundFont").unwrap();
+        }
+        let mut custom = config(MidiBackend::FluidSynth);
+        custom.soundfont = Some(path);
+        let mut midi = MidiEngine::open(&custom);
+        assert_eq!(midi.status(), MidiStatus::MissingSoundFont);
+
+        midi.send(&message(0, &[0x90, 60, 110]));
+        let mut output = vec![(0, 0); 2_048];
+        midi.render(&mut output);
+        assert!(output.iter().any(|frame| *frame != (0, 0)));
+    }
 }
 
 #[test]

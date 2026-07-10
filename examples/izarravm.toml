@@ -17,8 +17,11 @@ dma = "1"
 high_dma = "5"
 
 [audio.midi]
-backend = "external"
-soundfont = ""
+backend = "fluidsynth"
+# soundfont = "C:\\SoundFonts\\custom.sf3"
+# For an external backend, add an exact saved identity:
+# external_port = { name = "USB MIDI", ordinal = 0 }
+# Munt also needs mt32_control_rom and mt32_pcm_rom paths.
 
 [input]
 keyboard = true

@@ -5,7 +5,7 @@ pub use runtime::run;
 
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink, MidiEngine};
-use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
+use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use std::cell::Cell;
@@ -267,14 +267,16 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
     }
 }
 
-/// Render OPL audio for the emulated time elapsed since the last pump. `gain` is
+/// Render machine and built-in MIDI audio since the last pump. `gain` is
 /// the host-side master gain (already curved), applied to each sample before it
 /// is queued, independent of the guest's own CT1745 mixer. `amp` is the ReSonique
 /// 2 analog output-stage gain; the machine applies it to the card's own sources
 /// (not the PC speaker) inside `render_audio`, so it is set on the machine here
 /// rather than multiplied into every sample.
+#[allow(clippy::too_many_arguments)]
 fn pump_audio(
     machine: &mut Machine,
+    midi: &mut MidiEngine,
     sink: &AudioSink,
     wall_dt: f64,
     debt: &mut f64,
@@ -308,8 +310,9 @@ fn pump_audio(
         return;
     }
     // The card amp was applied inside render_audio (card sources only); `gain` here
-    // is just the host master volume, applied to the whole mix (card + speaker).
+    // is the host master volume, applied to the whole mix (card, speaker, and MIDI).
     let mut pcm = machine.render_audio(samples);
+    midi.render(&mut pcm);
     for (l, r) in &mut pcm {
         *l = (*l as f32 * gain)
             .round()
@@ -343,6 +346,7 @@ struct Frame {
     floppy_accesses: u64,  // monotonic A: access count, drives the LED
     c_accesses: u64,       // monotonic C: access count, drives the LED
     cd_accesses: u64,      // monotonic CD access count, drives the LED
+    midi_status: MidiStatus,
 }
 
 /// UI-to-emulation-thread messages.
@@ -368,6 +372,8 @@ enum Command {
     MountCd(izarravm_machine::CdImage),
     /// Eject the CD.
     EjectCd,
+    /// Switch host MIDI output without resetting either guest MPU.
+    MidiConfig(MidiConfig),
     Shutdown,
 }
 
@@ -860,6 +866,10 @@ impl Emulator {
         let _ = self.commands.send(Command::EjectCd);
     }
 
+    fn configure_midi(&self, config: MidiConfig) {
+        let _ = self.commands.send(Command::MidiConfig(config));
+    }
+
     fn shutdown(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
         if let Some(join) = self.join.take() {
@@ -941,7 +951,10 @@ fn emulate(
     }
 
     let mut midi = MidiEngine::open(&midi_config);
-    if midi.status() != MidiStatus::Ready {
+    if !matches!(
+        midi.status(),
+        MidiStatus::Ready | MidiStatus::MissingSoundFont
+    ) {
         warn!(
             backend = %midi_config.backend,
             status = ?midi.status(),
@@ -990,6 +1003,19 @@ fn emulate(
                 }
                 Ok(Command::MountCd(image)) => machine.mount_cd(image),
                 Ok(Command::EjectCd) => machine.eject_cd(),
+                Ok(Command::MidiConfig(config)) => {
+                    midi.reconfigure(&config);
+                    if !matches!(
+                        midi.status(),
+                        MidiStatus::Ready | MidiStatus::MissingSoundFont
+                    ) {
+                        warn!(
+                            backend = %config.backend,
+                            status = ?midi.status(),
+                            "MIDI output unavailable; the guest MPU remains active"
+                        );
+                    }
+                }
                 Ok(Command::Shutdown) => {
                     // Flush the Katea host folder, the floppy, and the final CMOS
                     // state before exiting (this arm also runs on Reset, which
@@ -1084,17 +1110,6 @@ fn emulate(
                 stalled = machine.io_stall_ticks().saturating_sub(stall_before);
             }
             credit -= i64::try_from(ran.saturating_add(topped_up)).unwrap_or(i64::MAX);
-            if let Some(sink) = &sink {
-                pump_audio(
-                    &mut machine,
-                    sink,
-                    dt_secs,
-                    &mut audio_debt,
-                    gain.get(),
-                    amp.get(),
-                    speaker_vol.get(),
-                );
-            }
             if dt_secs > 0.0 {
                 // Speed reflects instructions executed vs wall time; a drive stall
                 // is intentional wait, not the emulator running fast.
@@ -1104,6 +1119,18 @@ fn emulate(
             }
         }
         pump_midi(&mut machine, &mut midi);
+        if let Some(sink) = &sink {
+            pump_audio(
+                &mut machine,
+                &mut midi,
+                sink,
+                dt_secs,
+                &mut audio_debt,
+                gain.get(),
+                amp.get(),
+                speaker_vol.get(),
+            );
+        }
 
         // Publish: clone the framebuffer only when the guest presents a new
         // frame; refresh the light fields every pass so the readout stays live.
@@ -1141,6 +1168,7 @@ fn emulate(
             f.floppy_accesses = floppy_accesses;
             f.c_accesses = c_accesses;
             f.cd_accesses = cd_accesses;
+            f.midi_status = midi.status();
         }
         published_seq = seq;
 
@@ -1300,8 +1328,72 @@ struct ConfigDialog {
     amp_gain: u32,
     // PC speaker volume percent (100 = full, 0 = muted); see GuiApp::pc_speaker_volume.
     pc_speaker_volume: u32,
+    midi_backend: MidiBackend,
+    external_midi_port: Option<MidiPortId>,
+    soundfont: String,
+    mt32_control_rom: String,
+    mt32_pcm_rom: String,
+    midi_ports: Vec<MidiPortId>,
     // The binding awaiting a key press, set when the user clicks a rebind button.
     capturing: Option<BindTarget>,
+}
+
+fn path_text(path: Option<&PathBuf>) -> String {
+    path.map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn optional_path(text: &str) -> Option<PathBuf> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
+fn midi_backend_label(backend: MidiBackend) -> &'static str {
+    match backend {
+        MidiBackend::Off => "Off",
+        MidiBackend::External => "External MIDI",
+        MidiBackend::FluidSynth => "FluidSynth",
+        MidiBackend::Munt => "Munt (MT-32)",
+    }
+}
+
+fn midi_port_label(port: &MidiPortId) -> String {
+    format!("{} #{}", port.name, u32::from(port.ordinal) + 1)
+}
+
+fn midi_status_text(status: MidiStatus) -> &'static str {
+    match status {
+        MidiStatus::Ready => "Ready",
+        MidiStatus::MissingPort => "The selected MIDI port is not available.",
+        MidiStatus::MissingSoundFont => "The custom SoundFont failed. The embedded bank is active.",
+        MidiStatus::MissingRoms => "Select both MT-32 ROMs. MIDI output is silent.",
+        MidiStatus::InitializationFailed => "The MIDI backend could not be initialized.",
+    }
+}
+
+fn midi_path_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    text: &mut String,
+    filter: &str,
+    extensions: &[&str],
+    hint: &str,
+) {
+    ui.label(label);
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 72.0).max(120.0);
+        ui.add_sized(
+            [width, 22.0],
+            egui::TextEdit::singleline(text).hint_text(hint),
+        );
+        if ui.button("Browse").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter(filter, extensions)
+                .pick_file()
+        {
+            *text = path.to_string_lossy().into_owned();
+        }
+    });
 }
 
 impl GuiApp {
@@ -1941,6 +2033,12 @@ impl GuiApp {
             crt_style: self.crt_style,
             amp_gain: self.amp_gain,
             pc_speaker_volume: self.pc_speaker_volume,
+            midi_backend: self.midi_config.backend,
+            external_midi_port: self.midi_config.external_port.clone(),
+            soundfont: path_text(self.midi_config.soundfont.as_ref()),
+            mt32_control_rom: path_text(self.midi_config.mt32_control_rom.as_ref()),
+            mt32_pcm_rom: path_text(self.midi_config.mt32_pcm_rom.as_ref()),
+            midi_ports: MidiEngine::external_ports(),
             capturing: None,
         });
     }
@@ -1970,6 +2068,16 @@ impl GuiApp {
     /// Render the configuration modal. Accept applies the staged settings and
     /// closes; Cancel, the backdrop, or Esc discards and closes.
     fn config_ui(&mut self, ctx: &egui::Context) {
+        let midi_status = self
+            .emu
+            .as_ref()
+            .map(|emu| {
+                emu.frame
+                    .lock()
+                    .expect("frame snapshot poisoned")
+                    .midi_status
+            })
+            .unwrap_or(MidiStatus::InitializationFailed);
         let Some(mut dialog) = self.config_dialog.take() else {
             return;
         };
@@ -2066,6 +2174,86 @@ impl GuiApp {
                                  from the sound card. Set to 0 to mute it.",
                             );
                         });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("P300 wavetable output");
+                            egui::ComboBox::from_id_salt("midi-backend")
+                                .selected_text(midi_backend_label(dialog.midi_backend))
+                                .show_ui(ui, |ui| {
+                                    for backend in [
+                                        MidiBackend::Off,
+                                        MidiBackend::External,
+                                        MidiBackend::FluidSynth,
+                                        MidiBackend::Munt,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut dialog.midi_backend,
+                                            backend,
+                                            midi_backend_label(backend),
+                                        );
+                                    }
+                                });
+                        });
+                        match dialog.midi_backend {
+                            MidiBackend::Off => {}
+                            MidiBackend::External => {
+                                let selected = dialog
+                                    .external_midi_port
+                                    .as_ref()
+                                    .map(midi_port_label)
+                                    .unwrap_or_else(|| "Select a port".to_owned());
+                                ui.horizontal(|ui| {
+                                    ui.label("Output port");
+                                    egui::ComboBox::from_id_salt("midi-port")
+                                        .selected_text(selected)
+                                        .show_ui(ui, |ui| {
+                                            for port in &dialog.midi_ports {
+                                                ui.selectable_value(
+                                                    &mut dialog.external_midi_port,
+                                                    Some(port.clone()),
+                                                    midi_port_label(port),
+                                                );
+                                            }
+                                        });
+                                });
+                                if dialog.midi_ports.is_empty() {
+                                    ui.small("No external MIDI output ports were found.");
+                                }
+                            }
+                            MidiBackend::FluidSynth => midi_path_picker(
+                                ui,
+                                "Custom SoundFont",
+                                &mut dialog.soundfont,
+                                "SoundFont",
+                                &["sf2", "sf3"],
+                                "Embedded FluidR3Mono",
+                            ),
+                            MidiBackend::Munt => {
+                                midi_path_picker(
+                                    ui,
+                                    "MT-32 control ROM",
+                                    &mut dialog.mt32_control_rom,
+                                    "ROM image",
+                                    &["rom", "bin"],
+                                    "Required",
+                                );
+                                midi_path_picker(
+                                    ui,
+                                    "MT-32 PCM ROM",
+                                    &mut dialog.mt32_pcm_rom,
+                                    "ROM image",
+                                    &["rom", "bin"],
+                                    "Required",
+                                );
+                            }
+                        }
+                        ui.small("P330 remains available for guest MIDI input.");
+                        let status_color = if midi_status == MidiStatus::Ready {
+                            INK
+                        } else {
+                            egui::Color32::from_rgb(170, 62, 48)
+                        };
+                        ui.colored_label(status_color, midi_status_text(midi_status));
                     });
 
                     ui.add_space(14.0);
@@ -2114,6 +2302,20 @@ impl GuiApp {
             self.speaker_vol
                 .set(speaker_multiplier(self.pc_speaker_volume));
         }
+        let midi_config = MidiConfig {
+            backend: dialog.midi_backend,
+            external_port: dialog.external_midi_port.clone(),
+            soundfont: optional_path(&dialog.soundfont),
+            mt32_control_rom: optional_path(&dialog.mt32_control_rom),
+            mt32_pcm_rom: optional_path(&dialog.mt32_pcm_rom),
+        };
+        if midi_config != self.midi_config {
+            self.midi_config = midi_config.clone();
+            if let Some(emu) = &self.emu {
+                emu.configure_midi(midi_config.clone());
+            }
+        }
+        self.prefs.midi = midi_config;
         self.save_prefs();
     }
 

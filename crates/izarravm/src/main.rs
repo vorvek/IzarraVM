@@ -8,8 +8,8 @@ mod prefs;
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;
 use izarravm_core::{
-    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, MidiPortId, SbDma8, SbDma16,
-    SbIrq, VideoCard,
+    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, MidiConfig, MidiPortId,
+    SbDma8, SbDma16, SbIrq, VideoCard,
 };
 use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
@@ -137,6 +137,15 @@ struct Cli {
     dosroot: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MidiConfigPresence {
+    backend: bool,
+    external_port: bool,
+    soundfont: bool,
+    mt32_control_rom: bool,
+    mt32_pcm_rom: bool,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -151,6 +160,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // meaningful while JIT admission is active; a no-op in an interpreter-only build.
     #[cfg(feature = "jit")]
     izarravm_cpu::CpuGsw::set_jit_fold_timing(bench::jit_fold_enabled());
+    let midi_presence = midi_config_presence(&cli)?;
     let mut config = load_config(&cli)?;
     // When the user gave no C: location (no --c_drive, no --dosroot, and the
     // config left at its "." default), use the per-user ~/.izarravm/c_drive (or,
@@ -160,6 +170,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
         config.dos.c_drive = resolve_c_root(cli.portable);
     }
+    let saved_prefs = prefs::GuiPrefs::load(&prefs::prefs_path(&config.dos.c_drive));
+    merge_saved_midi(&mut config.audio.midi, &saved_prefs.midi, midi_presence);
     let hardware = HardwareProfile::from_config(&config)?;
     let audio = AudioSubsystem::from_config(&config.audio);
     let input = InputState {
@@ -981,6 +993,49 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
     });
 
     Ok(config)
+}
+
+fn midi_config_presence(cli: &Cli) -> Result<MidiConfigPresence, Box<dyn Error>> {
+    let mut presence = MidiConfigPresence::default();
+    if let Some(path) = &cli.config {
+        let text = std::fs::read_to_string(path)?;
+        let value: toml::Value = toml::from_str(&text)?;
+        if let Some(midi) = value
+            .get("audio")
+            .and_then(|audio| audio.get("midi"))
+            .and_then(toml::Value::as_table)
+        {
+            presence.backend = midi.contains_key("backend");
+            presence.external_port = midi.contains_key("external_port");
+            presence.soundfont = midi.contains_key("soundfont");
+            presence.mt32_control_rom = midi.contains_key("mt32_control_rom");
+            presence.mt32_pcm_rom = midi.contains_key("mt32_pcm_rom");
+        }
+    }
+    presence.backend |= cli.midi_backend.is_some();
+    presence.external_port |= cli.midi_port.is_some();
+    presence.soundfont |= cli.soundfont.is_some();
+    presence.mt32_control_rom |= cli.mt32_control_rom.is_some();
+    presence.mt32_pcm_rom |= cli.mt32_pcm_rom.is_some();
+    Ok(presence)
+}
+
+fn merge_saved_midi(config: &mut MidiConfig, saved: &MidiConfig, presence: MidiConfigPresence) {
+    if !presence.backend {
+        config.backend = saved.backend;
+    }
+    if !presence.external_port {
+        config.external_port.clone_from(&saved.external_port);
+    }
+    if !presence.soundfont {
+        config.soundfont.clone_from(&saved.soundfont);
+    }
+    if !presence.mt32_control_rom {
+        config.mt32_control_rom.clone_from(&saved.mt32_control_rom);
+    }
+    if !presence.mt32_pcm_rom {
+        config.mt32_pcm_rom.clone_from(&saved.mt32_pcm_rom);
+    }
 }
 
 /// Print whatever the guest wrote to COM1 (the serial port), under a header so

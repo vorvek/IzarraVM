@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::{MidiBackend, MidiPortId};
 
 #[test]
 fn round_trips_through_toml() {
@@ -16,6 +17,16 @@ fn round_trips_through_toml() {
         last_cd_image: Some(PathBuf::from("/tmp/game.iso")),
         last_cd_folder: None,
         panel_open: false,
+        midi: MidiConfig {
+            backend: MidiBackend::External,
+            external_port: Some(MidiPortId {
+                name: "LoopMIDI".into(),
+                ordinal: 1,
+            }),
+            soundfont: None,
+            mt32_control_rom: None,
+            mt32_pcm_rom: None,
+        },
     };
     let text = toml::to_string_pretty(&prefs).expect("serialize");
     let parsed: GuiPrefs = toml::from_str(&text).expect("deserialize");
@@ -45,6 +56,7 @@ fn missing_keys_fall_back_to_defaults() {
         KeyBinding::new(true, false, false, "F11")
     );
     assert!(parsed.panel_open, "panel defaults to open for older files");
+    assert_eq!(parsed.midi, MidiConfig::default());
 }
 
 #[test]

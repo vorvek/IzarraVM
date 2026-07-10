@@ -52,13 +52,14 @@ separate from the machine-hardware config you pass with `--config`:
 - Your rebound hotkeys for input release and full screen
 - The last floppy image, last CD image, and last CD folder you mounted
 - Whether the control panel is expanded or collapsed
+- The MIDI backend, external output port, SoundFont, and MT-32 ROM paths
 
 Every field has a default, so an old or partial `izarravm.conf` still loads
 cleanly after an upgrade.
 
 ## The config modal
 
-Opened from the control panel, the config modal has two sections:
+Opened from the control panel, the config modal has three sections:
 
 **Input**: rebind the "Input release" hotkey (the key combination that
 gives keyboard and mouse focus back to the host) and the "Full screen"
@@ -71,6 +72,24 @@ toggle hotkey.
 | **No** | No CRT effect; a plain scaled image. |
 | **Subtle** | A light shadow-mask CRT effect. This is the default. |
 | **Ye Olde Screene** | A heavier CRT effect for the full period look. |
+
+**Audio**: set the card amp and PC speaker volume, then choose the P300
+wavetable output:
+
+| Backend | What it uses |
+| --- | --- |
+| **Off** | Keeps the guest MPU active without producing host output. |
+| **External MIDI** | The exact host output port selected by name and same-name ordinal. If that port disappears, IzarraVM does not switch to another one. |
+| **FluidSynth** | The embedded FluidR3Mono bank, or an optional SF2/SF3 file. If a custom bank fails, the embedded bank remains active and the dialog reports the problem. |
+| **Munt (MT-32)** | User-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
+
+P330 remains the guest MIDI input port. The status line reports a missing
+external port, failed custom SoundFont, missing ROMs, or initialization
+failure without hiding the guest hardware.
+
+Startup settings are resolved one field at a time. An explicit command-line
+option wins, followed by an explicitly present `--config` TOML key, the saved
+GUI preference, and finally the built-in default.
 
 Accept applies your changes and closes the modal; Cancel discards them.
 

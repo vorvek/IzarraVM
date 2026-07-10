@@ -12,6 +12,8 @@ cpal.workspace = true
 crossbeam-queue.workspace = true
 midir.workspace = true
 izarravm-core = { path = "../izarravm-core" }
+izarravm-native-synth = { path = "../izarravm-native-synth" }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
