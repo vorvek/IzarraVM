@@ -9,9 +9,8 @@ impl Machine {
         // mutably borrowed by other fields in that same literal.
         let beam_at_batch_start = self.video.beam_dots();
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
-        // Read from self.cpu.level(), the same source scale_bus reads from, not
-        // cpu_level_for_mode(self.active_mode) -- see run_until_clock's matching
-        // capture for why the two can diverge.
+        // Read from the CPU, the same authoritative mode owner that scale_bus
+        // uses. Machine's active_mode copy is kept for bus register readback.
         let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
         MachineBus {
             memory: &mut self.memory,
@@ -352,7 +351,7 @@ impl CpuBus for MachineBus<'_> {
     /// See the trait doc: the straight-line run loop adds this figure's growth
     /// to its core total against the (guest-clock) run cap. Approximate class
     /// only; the Accurate class returns 0 so its lockstep batches keep the
-    /// historical core-only check bit-for-bit (frozen 286/386 byte-identity).
+    /// historical core-only check bit-for-bit (frozen 386 byte-identity).
     /// Same arithmetic as `in_batch_clocks` minus the core terms the CPU
     /// already tracks itself.
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
@@ -650,7 +649,7 @@ impl CpuBus for MachineBus<'_> {
         // (see pic.rs -- `read_isr` is a mode bit, not time-derived), so deferring
         // exactly when it is consumed relative to batch-end timing is safe. Gated
         // on `lazy_port_reads` (Approximate class only, i.e. 486/586): the
-        // Accurate class (286/386) keeps byte-identical batch semantics, matching
+        // Accurate 386 class keeps byte-identical batch semantics, matching
         // every other P4a lazy gate in this function.
         let skip_io_touched = cpu_is_ring0_pm && self.lazy_port_reads;
         // Bus-clock trace recording stays unconditional for every port, both timing
@@ -899,7 +898,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(LOTURA_ID_VALUE));
         }
         if port == 0x00e1 {
-            return Ok(u32::from(gsw_mode_code(self.active_mode)));
+            return Ok(u32::from(self.active_mode.register_code()));
         }
         if port == 0x00e2 {
             // Lotura POST-pacing flag: 1 = fast (skip cosmetic delays), 0 = full.
@@ -1078,7 +1077,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if port == 0x00e1 {
-            if let Some(mode) = gsw_mode_from_code(value as u8) {
+            if let Some(mode) = GswMode::from_register_code(value as u8) {
                 *self.pending_mode = Some(mode);
             }
             return Ok(());
@@ -1935,9 +1934,7 @@ impl MachineBus<'_> {
             // frozen profile value bit-for-bit.
             match self.active_mode.timing_class() {
                 TimingClass::Accurate => self.wait_states.video,
-                TimingClass::Approximate => {
-                    video_wait_states_approx(cpu_level_for_mode(self.active_mode))
-                }
+                TimingClass::Approximate => video_wait_states_approx(self.active_mode.persona()),
             }
         } else {
             self.wait_states.ram

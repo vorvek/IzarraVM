@@ -2210,36 +2210,45 @@ fn timing_factors_track_the_active_mode() {
 }
 
 #[test]
-fn set_mode_drives_cpu_level_and_cache_table() {
+fn profile_construction_and_set_mode_drive_cpu_and_cache_table() {
     let mut machine = Machine::new(
         MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
-    // The CPU boots at the full ISA so POST is never restricted, regardless of the
-    // 386 boot mode, until the guest writes a Lotura mode.
-    assert_eq!(machine.cpu.level(), CpuLevel::I586);
-
-    machine.set_mode(GswMode::Gsw386Slow);
-    assert_eq!(machine.cpu.level(), CpuLevel::I386);
+    assert_eq!(machine.cpu.mode(), GswMode::Gsw386);
+    assert_eq!(machine.cpu.persona(), CpuPersona::I386);
     assert_eq!(machine.cache_config(), (0, 64));
 
+    let generation = machine.cpu.decode_cache_generation();
+    machine.set_mode(GswMode::Gsw386Slow);
+    assert_eq!(machine.cpu.mode(), GswMode::Gsw386Slow);
+    assert_eq!(machine.cpu.persona(), CpuPersona::I386);
+    assert_eq!(machine.cache_config(), (0, 64));
+    assert_eq!(
+        machine.cpu.decode_cache_generation(),
+        generation.wrapping_add(1)
+    );
+
     machine.set_mode(GswMode::Gsw386);
-    assert_eq!(machine.cpu.level(), CpuLevel::I386);
+    assert_eq!(machine.cpu.mode(), GswMode::Gsw386);
+    assert_eq!(machine.cpu.persona(), CpuPersona::I386);
     assert_eq!(machine.cache_config(), (0, 64));
 
     machine.set_mode(GswMode::Gsw486);
-    assert_eq!(machine.cpu.level(), CpuLevel::I486);
-    assert_eq!(machine.cache_config(), (16, 128));
+    assert_eq!(machine.cpu.mode(), GswMode::Gsw486);
+    assert_eq!(machine.cpu.persona(), CpuPersona::I486);
+    assert_eq!(machine.cache_config(), (8, 256));
 
     machine.set_mode(GswMode::Gsw586);
-    assert_eq!(machine.cpu.level(), CpuLevel::I586);
+    assert_eq!(machine.cpu.mode(), GswMode::Gsw586);
+    assert_eq!(machine.cpu.persona(), CpuPersona::I586);
     assert_eq!(machine.cache_config(), (32, 512));
 }
 
 #[test]
 fn lotura_code_3_selects_386_slow_mode() {
-    assert_eq!(gsw_mode_from_code(3), Some(GswMode::Gsw386Slow));
-    assert_eq!(gsw_mode_code(GswMode::Gsw386Slow), 3);
-    assert_eq!(cpu_level_for_mode(GswMode::Gsw386Slow), CpuLevel::I386);
+    assert_eq!(GswMode::from_register_code(3), Some(GswMode::Gsw386Slow));
+    assert_eq!(GswMode::Gsw386Slow.register_code(), 3);
+    assert_eq!(GswMode::Gsw386Slow.persona(), CpuPersona::I386);
 }

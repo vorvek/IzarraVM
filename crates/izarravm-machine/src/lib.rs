@@ -9,12 +9,10 @@ use izarravm_bus::{
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard, WssConfig,
+    CpuPersona, GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard, WssConfig,
 };
 pub use izarravm_cpu::PerfCounters;
-use izarravm_cpu::{
-    CpuError, CpuGsw, CpuLevel, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing,
-};
+use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     CGA_FB_SIZE, DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, HGC_FB_SIZE,
@@ -333,13 +331,13 @@ impl TimingFactors {
 /// The shipped 486 value stays at the flat 1 (see the arm comment: with honest
 /// tick delivery the DX2-66 persona hits its target with no surcharge, so no
 /// VLB-class value ships). If `bus_timing` is ever retuned, recalibrate these with
-/// it. The Accurate class (286/386) keeps the frozen `WaitStateProfile.video`
+/// it. The Accurate 386 class keeps the frozen `WaitStateProfile.video`
 /// path bit-for-bit (byte-identity gate).
-const fn video_wait_states_approx(level: CpuLevel) -> u8 {
-    match level {
+const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
+    match persona {
         // Unreachable in practice (Accurate class takes the profile path), but
         // keep the frozen classes on the profile default should routing change.
-        CpuLevel::I286 | CpuLevel::I386 => 1,
+        CpuPersona::I386 => 1,
         // The 486 keeps the flat profile value: once the batch cap counts bus
         // clocks (no more coalesced IRQ0 ticks), the DX2-66 persona lands the
         // owner's 29-30 fps demo3 target with NO video surcharge - its
@@ -349,10 +347,10 @@ const fn video_wait_states_approx(level: CpuLevel) -> u8 {
         // accepted and recorded: the 486's Doom time leans more on ordinary bus
         // than a real DX2-66's (which leans on the video bus); the NET frame
         // rate is what is calibrated. Revisit alongside any bus_timing retune.
-        CpuLevel::I486 => 1,
+        CpuPersona::I486 => 1,
         // Retuned 2026-07-06: ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
         // See the function-level doc for the sweep data and the isolation proof.
-        CpuLevel::I586 => 88,
+        CpuPersona::I586 => 88,
     }
 }
 
@@ -392,31 +390,31 @@ struct CacheModel {
 const CACHE_EMPTY_TAG: u32 = u32::MAX;
 
 impl CacheModel {
-    fn new(level: CpuLevel) -> Self {
+    fn new(mode: GswMode) -> Self {
         Self {
             l1_tags: vec![CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES].into_boxed_slice(),
             l2_tags: vec![CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES].into_boxed_slice(),
-            config: cache_level_config(level),
-            cost: tier_cost(level),
-            code_fetch_ws: code_fetch_ws(level),
+            config: cache_level_config(mode),
+            cost: tier_cost(mode),
+            code_fetch_ws: code_fetch_ws(mode),
             lookups: 0,
         }
     }
 
-    fn set_level(&mut self, level: CpuLevel) {
-        self.config = cache_level_config(level);
-        self.cost = tier_cost(level);
-        self.code_fetch_ws = code_fetch_ws(level);
+    fn set_mode(&mut self, mode: GswMode) {
+        self.config = cache_level_config(mode);
+        self.cost = tier_cost(mode);
+        self.code_fetch_ws = code_fetch_ws(mode);
         self.reset();
     }
 
     /// Resolve a DATA access at `phys` to a tier for the live `level`, installing the
     /// line into the cheaper tiers on a miss (modeling an inclusive fill). A 0-size
-    /// tier is skipped: the 286 has neither tier (always RAM); the 386 has no L1.
+    /// tier is skipped: the 386 has no L1.
     ///
     #[cfg(test)]
-    fn data_tier(&mut self, level: CpuLevel, phys: u32) -> Tier {
-        self.data_tier_with_config(cache_level_config(level), phys)
+    fn data_tier(&mut self, mode: GswMode, phys: u32) -> Tier {
+        self.data_tier_with_config(cache_level_config(mode), phys)
     }
 
     #[inline(always)]
@@ -1003,7 +1001,11 @@ impl Machine {
     /// shares the rest (devices, audio chips, timing accumulators). The caller
     /// installs the BIOS stubs and any boot/program image afterwards, where the
     /// ordering relative to those memory writes matters.
-    fn base(profile: MachineProfile, cpu: CpuGsw, mut rom: Vec<u8>) -> Result<Self, MachineError> {
+    fn base(
+        profile: MachineProfile,
+        mut cpu: CpuGsw,
+        mut rom: Vec<u8>,
+    ) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
         // Build the AD1848 codec from the WSS board config. The codec's IRQ/DMA
         // jumper readback comes from the same WssConfig the env/detection use, so
@@ -1019,6 +1021,7 @@ impl Machine {
             dma: wss_dma as u8,
         });
         let active_mode = profile.cpu;
+        cpu.set_mode(active_mode);
         let distira = Distira::new();
         let pci = PciConfig::new(profile.video == VideoCard::Distira);
         let memory = Memory::from_mib(profile.memory_mib)?;
@@ -1043,7 +1046,7 @@ impl Machine {
             pending_mode: None,
             timing,
             cpu,
-            cache_model: CacheModel::new(cpu_level_for_mode(active_mode)),
+            cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
             video: Box::new(Vga::default()),
             paradise_non_vga: false,
@@ -1152,7 +1155,7 @@ impl Machine {
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.
-        machine.set_cmos_byte(0x12, gsw_mode_code(machine.active_mode));
+        machine.set_cmos_byte(0x12, machine.active_mode.register_code());
         Ok(machine)
     }
 
@@ -1226,7 +1229,7 @@ impl Machine {
     /// bytes are kept and the checksum is repaired), so the host can log it.
     pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
         let valid = self.rtc.load_nvram(bytes);
-        if let Some(mode) = gsw_mode_from_code(self.rtc.nvram_byte(0x12)) {
+        if let Some(mode) = GswMode::from_register_code(self.rtc.nvram_byte(0x12)) {
             self.set_mode(mode);
         }
         valid
@@ -1575,18 +1578,14 @@ impl Machine {
             .collect()
     }
 
-    /// Switch the active compatibility mode live, recomputing the timing factors
-    /// for the new clock and lowering the CPU's guest-facing instruction-set level
-    /// to match. Called from the Lotura mode write (port 0xE1). The CPU level gate
-    /// is guest-facing only: firmware POST never reaches this path, so it always
-    /// runs at the full ISA the core resets to.
+    /// Switch the active compatibility mode live. The CPU installs the core-table
+    /// row once, while Machine refreshes its retained timing and cache state.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.active_mode = mode;
         self.timing = TimingFactors::for_clock(mode.clock_hz());
-        self.cpu.set_level(cpu_level_for_mode(mode));
-        // The modeled cache contents are per-mode (geometry changes with the CPU
-        // level); a mode switch starts cold.
-        self.cache_model.set_level(cpu_level_for_mode(mode));
+        self.cpu.set_mode(mode);
+        // The modeled cache contents are per-mode, so a mode switch starts cold.
+        self.cache_model.set_mode(mode);
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
@@ -1596,8 +1595,7 @@ impl Machine {
     /// The reported (L1 KB, L2 KB) cache for the live mode (the L2 models a
     /// motherboard cache module). Feeds the BIOS setup and GUI readout, and the same
     /// per-mode geometry (`cache_geometry`) also drives the `CacheModel` tiering, so
-    /// this readout tracks the live data-access timing. Driven from the live CPU
-    /// level so it tracks a Lotura mode switch.
+    /// this readout tracks the live data-access timing.
     pub fn cache_config(&self) -> (u16, u16) {
         self.cpu.cache_kb()
     }
@@ -2043,7 +2041,7 @@ struct MachineBus<'a> {
     cache: &'a mut CacheModel,
     /// True in the Approximate timing class (486/586): data accesses charge a flat
     /// cost and skip the per-access cache-tier tag arrays. False in the Accurate
-    /// class (286/386) and forced false by the bandwidth diagnostic so its tier
+    /// 386 class and forced false by the bandwidth diagnostic so its tier
     /// curve stays on the accurate model.
     flat_data_cost: bool,
     /// True in the Approximate timing class (486/586), computed identically to
@@ -2051,7 +2049,7 @@ struct MachineBus<'a> {
     /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`
     /// (P4a Task 1.3): when true, a status-port read does not set `io_touched`
     /// and computes its returned bits from `predicted_beam()` instead of the
-    /// live device beam; when false (Accurate class, 286/386) the port keeps
+    /// live device beam; when false (Accurate 386 class) the port keeps
     /// the byte-identical pre-Task-1.3 behavior. A single bool test at the top
     /// of the one arm that branches on it, not a per-access classification.
     lazy_port_reads: bool,
@@ -2114,12 +2112,9 @@ struct MachineBus<'a> {
     // `active_mode` above it.
     inv_clock_at_batch_start: f64,
     // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from
-    // the SAME source `scale_bus` reads (`self.cpu.level()`), NOT derived from
-    // `active_mode` here: the CPU's live level only tracks `active_mode` from a
-    // `set_mode` call onward, so at construction (before any Lotura 0xE1 write)
-    // the two can disagree. `predicted_beam` must scale in-batch bus clocks with
-    // exactly this ratio to match what the real end-of-batch `scale_bus` call
-    // will use.
+    // the same authoritative CPU mode `scale_bus` reads. `predicted_beam` must
+    // scale in-batch bus clocks with exactly this ratio to match the real
+    // end-of-batch `scale_bus` call.
     bus_num_at_batch_start: u32,
     bus_den_at_batch_start: u32,
     // The fractional PIT-input-clock accumulator (Machine::pit_clocks), copied at
@@ -2197,36 +2192,6 @@ fn icdex_iso_name_and_version(record: &[u8]) -> (Vec<u8>, u16) {
         (base.as_bytes().to_vec(), version)
     } else {
         (raw.into_bytes(), 1)
-    }
-}
-
-fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
-    match code {
-        0 => Some(GswMode::Gsw386),
-        1 => Some(GswMode::Gsw486),
-        2 => Some(GswMode::Gsw586),
-        3 => Some(GswMode::Gsw386Slow),
-        _ => None,
-    }
-}
-
-fn gsw_mode_code(mode: GswMode) -> u8 {
-    match mode {
-        GswMode::Gsw386 => 0,
-        GswMode::Gsw386Slow => 3,
-        GswMode::Gsw486 => 1,
-        GswMode::Gsw586 => 2,
-    }
-}
-
-/// Map a GSW compatibility mode to the CPU instruction-set level it presents to the
-/// guest. The 586 native default keeps the full ISA; a lower mode lowers the level
-/// so the core raises #UD for instructions that part lacked.
-fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
-    match mode {
-        GswMode::Gsw386 | GswMode::Gsw386Slow => CpuLevel::I386,
-        GswMode::Gsw486 => CpuLevel::I486,
-        GswMode::Gsw586 => CpuLevel::I586,
     }
 }
 

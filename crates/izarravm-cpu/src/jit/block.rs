@@ -1421,7 +1421,7 @@ pub(crate) fn try_admit_gated(
     let epoch = cpu.decode_cache.jit_smc_epoch;
     let mode_key = cpu.jit_mode_key();
     let regs_offset = core::mem::offset_of!(CpuGsw, registers) as u32;
-    let (_scale_num, scale_den) = crate::level_timing(cpu.level);
+    let (_scale_num, scale_den) = crate::level_timing(cpu.persona());
     // Cost-fold native LOAD gate (read the toggle once here — the true emit site — so this admission's
     // decision, the emit, and `has_native_fold` all agree): ON only if `IZARRAVM_JIT_FOLD` is set AND
     // this CPU state is fold-eligible (Approximate class, unpaged, flat DS). `has_native_fold` also

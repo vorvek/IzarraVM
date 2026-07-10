@@ -110,17 +110,89 @@ fn cpuid_is_not_privileged_at_cpl3() {
 }
 
 #[test]
-fn default_level_is_full_isa() {
+fn default_mode_is_full_586() {
     // The core resets to the full ISA so firmware POST is never restricted.
-    assert_eq!(CpuGsw::default().level(), CpuLevel::I586);
+    let cpu = CpuGsw::default();
+    assert_eq!(cpu.mode(), GswMode::Gsw586);
+    assert_eq!(cpu.persona(), CpuPersona::I586);
+    assert_eq!(cpu.level(), CpuPersona::I586);
 }
 
 #[test]
-fn cpu_level_cache_table() {
-    assert_eq!(CpuLevel::I286.cache_kb(), (0, 0));
-    assert_eq!(CpuLevel::I386.cache_kb(), (0, 64));
-    assert_eq!(CpuLevel::I486.cache_kb(), (16, 128));
-    assert_eq!(CpuLevel::I586.cache_kb(), (32, 512));
+fn cpu_cache_readout_comes_from_the_mode_table() {
+    for (mode, cache) in [
+        (GswMode::Gsw386Slow, (0, 64)),
+        (GswMode::Gsw386, (0, 64)),
+        (GswMode::Gsw486, (8, 256)),
+        (GswMode::Gsw586, (32, 512)),
+    ] {
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(mode);
+        assert_eq!(cpu.cache_kb(), cache);
+    }
+}
+
+#[test]
+fn switching_between_386_modes_resets_remainders_and_fetch_state() {
+    let (mut cpu, memory) = real_mode_cpu(&[0x40], 0x20);
+    cpu.set_mode(GswMode::Gsw386);
+    let mut bus = TestBus::with_memory(memory);
+    let linear = cpu.linear_eip();
+    cpu.cycle(&mut bus).unwrap();
+    assert!(cpu.decode_cache.get(linear, false).is_some());
+
+    cpu.timing_rem = 4;
+    cpu.fp_rem = 7;
+    cpu.code_page.valid = true;
+    cpu.prefetch.len = 1;
+    cpu.fetch_page.entries[0].valid = true;
+    let generation = cpu.decode_cache_generation();
+
+    cpu.set_mode(GswMode::Gsw386Slow);
+
+    assert_eq!(cpu.mode(), GswMode::Gsw386Slow);
+    assert_eq!(cpu.persona(), CpuPersona::I386);
+    assert_eq!(cpu.timing_rem, 0);
+    assert_eq!(cpu.fp_rem, 0);
+    assert!(!cpu.code_page.valid);
+    assert_eq!(cpu.prefetch.len, 0);
+    assert!(cpu.fetch_page.entries.iter().all(|entry| !entry.valid));
+    assert_ne!(cpu.decode_cache_generation(), generation);
+    assert!(cpu.decode_cache.get(linear, false).is_none());
+}
+
+#[test]
+fn slow_and_normal_386_execute_identical_architectural_state() {
+    fn run(mode: GswMode) -> (CpuGsw, TestBus) {
+        let code = [
+            0xb8, 0x01, 0x00, // mov ax,1
+            0xbb, 0x02, 0x00, // mov bx,2
+            0x01, 0xd8, // add ax,bx
+            0xd1, 0xe0, // shl ax,1
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 0x20);
+        cpu.set_mode(mode);
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..4 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        (cpu, bus)
+    }
+
+    let (slow, slow_bus) = run(GswMode::Gsw386Slow);
+    let (normal, normal_bus) = run(GswMode::Gsw386);
+    assert_eq!(slow.persona(), normal.persona());
+    assert_eq!(slow.registers, normal.registers);
+    assert_eq!(slow.fpu, normal.fpu);
+    assert_eq!(slow.control, normal.control);
+    assert_eq!(slow.msr, normal.msr);
+    assert_eq!(slow.gdtr, normal.gdtr);
+    assert_eq!(slow.idtr, normal.idtr);
+    assert_eq!(slow.ldtr, normal.ldtr);
+    assert_eq!(slow.tr, normal.tr);
+    assert_eq!(slow.elapsed_clocks, normal.elapsed_clocks);
+    assert_eq!(slow.eflags(), normal.eflags());
+    assert_eq!(slow_bus.memory, normal_bus.memory);
 }
 
 // --- Phase 5 Slice A: RDTSC, RDMSR/WRMSR, the K6 MSR set, CR4 ---
@@ -136,14 +208,11 @@ fn level_timing_scales_instruction_clocks_per_mode() {
     // `scale_bus`) now carries the modes' absolute benchmark magnitude, so a fast
     // mode pulls ahead via the bus, NOT by charging fewer instruction clocks. The
     // compute dial just trims each mode's compute share to seat Dhrystone: it is
-    // largest on the 286 (most compute-heavy in-order ratio), smaller on the 386,
-    // and smallest-and-EQUAL on the 486 and 586 (their pull-ahead is all in the
-    // bus dial). The contract this test guards: the scalar is applied per level,
-    // descends 286 > 386 >= 486, and the 586 charges no more than the 486 (the bus
-    // dial, not this one, carries the 586's speed). A mode change re-scales.
-    fn elapsed_for(level: CpuLevel) -> u64 {
+    // identical for the two 386 modes and smallest-and-equal on the 486 and 586
+    // (their pull-ahead is in the bus and machine clock dials). A mode change re-scales.
+    fn elapsed_for(mode: GswMode) -> u64 {
         let (mut cpu, memory) = real_mode_cpu(&[0x01, 0xd8], 0x20);
-        cpu.set_level(level);
+        cpu.set_mode(mode);
         let mut bus = TestBus::with_memory(memory);
         for _ in 0..1000 {
             cpu.registers.eip = 0;
@@ -151,15 +220,11 @@ fn level_timing_scales_instruction_clocks_per_mode() {
         }
         cpu.elapsed_clocks
     }
-    let i286 = elapsed_for(CpuLevel::I286);
-    let i386 = elapsed_for(CpuLevel::I386);
-    let i486 = elapsed_for(CpuLevel::I486);
-    let i586 = elapsed_for(CpuLevel::I586);
-    // 286 (3/5) charges more instruction clocks than the 386 (2/5).
-    assert!(
-        i286 > i386,
-        "286 ({i286}) should charge more instruction clocks than 386 ({i386})"
-    );
+    let slow = elapsed_for(GswMode::Gsw386Slow);
+    let i386 = elapsed_for(GswMode::Gsw386);
+    let i486 = elapsed_for(GswMode::Gsw486);
+    let i586 = elapsed_for(GswMode::Gsw586);
+    assert_eq!(slow, i386, "both 386 modes have identical per-op cycles");
     // 386 (2/5) charges more than the small-and-equal 486/586 (1/12).
     assert!(
         i386 > i486,
@@ -402,9 +467,7 @@ fn lidt_faults_at_cpl3() {
 #[test]
 fn lgdt_lidt_run_at_cpl0_in_real_mode() {
     // Real mode has no protection, so CPL is always 0 there; the new require_cpl0 gate
-    // on LGDT/LIDT must not regress the existing 286-boot-code path (mirrors
-    // lgdt_still_runs_at_286 above, but exercised here as the CPL0-unaffected half of
-    // the row-22 contract).
+    // on LGDT/LIDT must not regress real-mode boot code.
     let mut memory = vec![0; 1024];
     // LGDT [0x0020] (5 bytes: opcode+modrm+disp16); LIDT [0x0026] starts right after.
     memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x16, 0x20, 0x00]);
@@ -665,10 +728,10 @@ fn rdtsc_is_undefined_opcode_below_586() {
     // RDTSC is a 586 addition: #UD at the throttled 486 level, fine at 586.
     let code = [0x0f, 0x31];
     assert!(matches!(
-        run_at_level(&code, CpuLevel::I486).unwrap_err(),
+        run_at_mode(&code, GswMode::Gsw486).unwrap_err(),
         InternalFault::Exception { vector: 6, .. }
     ));
-    assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
 // --- Phase 5 Slice B: CMOVcc, FCMOVcc, FCOMI/FUCOMI ---
@@ -713,10 +776,10 @@ fn cmovne_dword_moves_when_zf_clear() {
 fn cmovcc_is_undefined_opcode_below_586() {
     let code = [0x0f, 0x44, 0xc3];
     assert!(matches!(
-        run_at_level(&code, CpuLevel::I486).unwrap_err(),
+        run_at_mode(&code, GswMode::Gsw486).unwrap_err(),
         InternalFault::Exception { vector: 6, .. }
     ));
-    assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
 #[test]
@@ -874,10 +937,10 @@ fn cpuid_leaf1_reports_cx8() {
 fn cmpxchg8b_is_undefined_opcode_below_586() {
     let code = [0x0f, 0xc7, 0x0e, 0x40, 0x00];
     assert!(matches!(
-        run_at_level(&code, CpuLevel::I486).unwrap_err(),
+        run_at_mode(&code, GswMode::Gsw486).unwrap_err(),
         InternalFault::Exception { vector: 6, .. }
     ));
-    assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
 // --- Phase 5 Slice D: SYSCALL/SYSRET and RSM ---
@@ -965,7 +1028,7 @@ fn syscall_is_undefined_opcode_below_586() {
     let mut memory = vec![0u8; 64];
     memory[..2].copy_from_slice(&[0x0f, 0x05]);
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I486);
+    cpu.set_mode(GswMode::Gsw486);
     cpu.msr.efer = EFER_SCE;
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;
@@ -1212,17 +1275,12 @@ fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
 
 #[test]
 fn isa_gate_exempt_decodes_are_never_cached() {
-    // The firmware-ROM/ring-0 ISA-gate exemptions are context, not bytes. With CS loads no
-    // longer flushing the decode cache, an exempt decode entering the cache could replay at
-    // CPL 3 where the same bytes must #UD -- so both exemption channels must mark the
-    // decode no-cache. Ring-0 protected mode at level I286, both channels:
-    //   - 0F A2 CPUID: gated by is_386plus_two_byte at I286, passes via is_ring0_protected.
-    //   - 66 40 (INC EAX): the 66 prefix #UDs at pre-386 outside the exemption.
+    // The ring-0 ISA-gate exemption is context, not bytes. An exempt RDTSC decode
+    // must not be cached and later replayed in guest code under the 386 persona.
     let mut memory = vec![0u8; 256];
-    memory[..2].copy_from_slice(&[0x0f, 0xa2]); // CPUID at linear 0
-    memory[0x10..0x12].copy_from_slice(&[0x66, 0x40]); // INC EAX at linear 0x10
+    memory[..2].copy_from_slice(&[0x0f, 0x31]);
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I286);
+    cpu.set_mode(GswMode::Gsw386);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -1231,7 +1289,7 @@ fn isa_gate_exempt_decodes_are_never_cached() {
             base: 0,
             limit: 0xffff_ffff,
             access: 0x9b,
-            default_size_32: false, // 16-bit segment: the 66 prefix is a real override
+            default_size_32: false,
         },
     );
     let mut bus = TestBus::with_memory(memory);
@@ -1240,14 +1298,7 @@ fn isa_gate_exempt_decodes_are_never_cached() {
     cpu.cycle(&mut bus).unwrap();
     assert!(
         cpu.decode_cache.get(0, false).is_none(),
-        "an exempt two-byte decode (CPUID at I286, ring 0) must not be cached"
-    );
-
-    cpu.set_eip(0x10);
-    cpu.cycle(&mut bus).unwrap();
-    assert!(
-        cpu.decode_cache.get(0x10, false).is_none(),
-        "an exempt 66-prefixed decode (pre-386, ring 0) must not be cached"
+        "an exempt RDTSC decode at ring 0 must not be cached"
     );
 }
 
@@ -1416,72 +1467,47 @@ fn note_a20_changed_invalidates_the_decode_cache() {
     );
 }
 
-fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
+fn run_at_mode(code: &[u8], mode: GswMode) -> Result<CycleOutcome, InternalFault> {
     let mut memory = vec![0; 1024];
     memory[..code.len()].copy_from_slice(code);
     let mut cpu = CpuGsw::default();
-    cpu.set_level(level);
+    cpu.set_mode(mode);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
     let mut bus = TestBus::with_memory(memory);
-    // Route through the production split. Prefix-gating (66/67 at I286, the 0F two-byte ISA gate)
-    // lives in `decode`, so the #UD-at-286 assertions hold on the same path the guest runs.
+    // Route through the production split so persona gates use the guest path.
     exec_one_split(&mut cpu, &mut bus)
 }
 
 #[test]
-fn movzx_is_undefined_opcode_at_286_but_runs_at_386() {
-    // 0F B6 C3: MOVZX AX, BL. A 386 addition, so #UD at the 286 level and fine above it.
-    let code = [0x0f, 0xb6, 0xc3];
-    let fault = run_at_level(&code, CpuLevel::I286).unwrap_err();
-    assert!(
-        matches!(fault, InternalFault::Exception { vector: 6, .. }),
-        "MOVZX must raise #UD at I286"
-    );
-    assert!(
-        run_at_level(&code, CpuLevel::I386).is_ok(),
-        "MOVZX must execute at I386"
-    );
-    assert!(run_at_level(&code, CpuLevel::I586).is_ok());
-}
-
-#[test]
-fn firmware_rom_cs_is_exempt_from_the_286_gate() {
-    // MOVZX AX, BL is a 386 op: guest code at the 286 level #UDs on it, but the
+fn firmware_rom_cs_is_exempt_from_the_586_gate() {
+    // RDTSC is a 586 op: guest code under the 386 persona #UDs on it, but the
     // BIOS ROM must keep running the full ISA so a lowered GSW mode never faults
     // firmware (Accept, interrupt service, boot). CS in the F-segment ROM
     // aperture (base 0xF0000) is the exemption.
-    let code = [0x0f, 0xb6, 0xc3];
+    let code = [0x0f, 0x31];
     assert!(
         matches!(
-            run_at_level(&code, CpuLevel::I286).unwrap_err(),
+            run_at_mode(&code, GswMode::Gsw386).unwrap_err(),
             InternalFault::Exception { vector: 6, .. }
         ),
-        "guest MOVZX must still #UD at I286"
+        "guest RDTSC must #UD under the 386 persona"
     );
     let mut memory = vec![0u8; 0x10_0000];
     let base = 0x000F_0000usize;
     memory[base..base + code.len()].copy_from_slice(&code);
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I286);
+    cpu.set_mode(GswMode::Gsw386);
     cpu.load_segment_real(SegmentIndex::Cs, 0xF000);
-    cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
-    cpu.write_reg16(Reg16::Bx, 0x0042);
+    cpu.elapsed_clocks = 42;
     let mut bus = TestBus::with_memory(memory);
-    // Drive through the split (MOVZX is a converted group now); the firmware-ROM exemption to
-    // the 286 ISA gate lives in `decode`, which `exec_one_split` exercises. Confirm the op truly
-    // ran (AX = zero-extended BL) rather than merely not faulting.
     assert!(
         exec_one_split(&mut cpu, &mut bus).is_ok(),
-        "MOVZX fetched from BIOS ROM must run even at I286"
+        "RDTSC fetched from BIOS ROM must run under the 386 persona"
     );
-    assert_eq!(
-        cpu.read_reg16(Reg16::Ax),
-        0x0042,
-        "MOVZX must have zero-extended BL into AX"
-    );
+    assert_eq!(cpu.registers.eax(), 42);
 }
 
 #[test]
@@ -1516,26 +1542,6 @@ fn two_byte_convention_charges_the_second_byte_exactly_once() {
         seam_fetch_count(&sbus),
         3,
         "the convention must charge the second 0F byte exactly once (no re-read)"
-    );
-}
-
-#[test]
-fn throttled_286_raises_ud_for_an_unconverted_two_byte_opcode_via_the_new_gate() {
-    // BSWAP EAX (0F C8) is a 486 addition and stays on Fallback. The ISA gate that #UDs it at
-    // the 286 level now lives in `decode` (the shared convention point), not in execute_two_byte.
-    // Proving an *un-converted* 0F op still #UDs confirms the gate did not get tied to the one
-    // converted group.
-    let code = [0x0f, 0xc8];
-    assert!(
-        matches!(
-            run_at_level(&code, CpuLevel::I286).unwrap_err(),
-            InternalFault::Exception { vector: 6, .. }
-        ),
-        "BSWAP must #UD at I286 through the new gate location"
-    );
-    assert!(
-        run_at_level(&code, CpuLevel::I486).is_ok(),
-        "BSWAP must run at I486"
     );
 }
 
@@ -1652,8 +1658,8 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
     // instructions: nothing implemented can reach them, and the unimplemented ones still #UD.
     for &op in UNIMPLEMENTED_SINGLE_BYTE {
         // The eight prefix bytes are valid as prefixes; they only #UD when they are the whole
-        // instruction (no following opcode), which `read_prefixes` reaches end-of-stream on at
-        // I286 but treats as a real prefix at I586. To exercise the Fallback opcode arm we need a
+        // instruction (no following opcode), which `read_prefixes` consumes as a prefix. To
+        // exercise the Fallback opcode arm we need a
         // byte that is an *opcode*, never a prefix: ARPL (0x63) and ICEBP (0xf1). The prefix
         // bytes are covered by the routing-partition test above and the dedicated #UD guards.
         if matches!(op, 0x63 | 0xf1) {
@@ -1728,77 +1734,15 @@ fn single_byte_f1_is_an_undefined_opcode() {
 }
 
 #[test]
-fn operand_size_prefix_is_undefined_opcode_at_286() {
-    // 66 B8 ... a 32-bit MOV EAX, imm32 reached through the operand-size prefix. The 286
-    // has no 66h prefix, so the decoder #UDs on the prefix byte; 386 and up run it.
-    let code = [0x66, 0xb8, 0x78, 0x56, 0x34, 0x12];
-    let fault = run_at_level(&code, CpuLevel::I286).unwrap_err();
-    assert!(
-        matches!(fault, InternalFault::Exception { vector: 6, .. }),
-        "the 66h operand-size prefix must raise #UD at I286"
-    );
-    assert!(run_at_level(&code, CpuLevel::I386).is_ok());
-}
-
-#[test]
-fn address_size_prefix_is_undefined_opcode_at_286() {
-    // 67 prefix: a 32-bit address form. Absent on the 286, present from the 386.
-    // 67 8B 00 would be MOV with a 32-bit address; the prefix alone must #UD at I286.
-    let code = [0x67, 0x90];
-    let fault = run_at_level(&code, CpuLevel::I286).unwrap_err();
-    assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
-    // At I386 the prefix decodes and the NOP after it runs.
-    assert!(run_at_level(&code, CpuLevel::I386).is_ok());
-}
-
-#[test]
-fn shld_and_setcc_are_undefined_opcodes_at_286() {
-    // 0F A4 SHLD and 0F 90 SETO are both 386 additions.
-    let shld = [0x0f, 0xa4, 0xc3, 0x04]; // SHLD BX, AX, 4
-    let setcc = [0x0f, 0x90, 0xc0]; // SETO AL
-    for code in [&shld[..], &setcc[..]] {
-        let fault = run_at_level(code, CpuLevel::I286).unwrap_err();
-        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
-        assert!(run_at_level(code, CpuLevel::I386).is_ok());
-    }
-}
-
-#[test]
-fn lgdt_still_runs_at_286() {
-    // 0F 01 /2 LGDT is a 286 instruction, so it must NOT be gated at the 286 level.
-    // ModRM 16 = mode 0, reg 2 (LGDT), rm 6 (direct disp16) pointing at a 6-byte pseudo-
-    // descriptor in memory.
-    let mut memory = vec![0; 1024];
-    memory[0..4].copy_from_slice(&[0x0f, 0x01, 0x16, 0x20]); // disp16 = 0x0020
-    // 6-byte GDTR image at 0x0020: limit then 32-bit base.
-    memory[0x20..0x26].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
-    let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I286);
-    cpu.load_segment_real(SegmentIndex::Cs, 0);
-    cpu.load_segment_real(SegmentIndex::Ds, 0);
-    cpu.registers.eip = 0;
-    let mut bus = TestBus::with_memory(memory);
-    // LGDT (0F 01 /2) is converted to the decode/execute split (task A12); run it through the
-    // split, not the legacy fused entry (whose 0F 01 arm is gone).
-    assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
-    assert_eq!(cpu.gdtr.limit, 0x00ff);
-    assert_eq!(cpu.gdtr.base, 0x0000_1000);
-}
-
-#[test]
 fn cpuid_is_undefined_opcode_below_486() {
-    // CPUID is absent on the 286 and 386; it appears on the 486 and 586.
+    // CPUID is absent on the 386; it appears on the 486 and 586.
     let code = [0x0f, 0xa2];
     assert!(matches!(
-        run_at_level(&code, CpuLevel::I286).unwrap_err(),
+        run_at_mode(&code, GswMode::Gsw386).unwrap_err(),
         InternalFault::Exception { vector: 6, .. }
     ));
-    assert!(matches!(
-        run_at_level(&code, CpuLevel::I386).unwrap_err(),
-        InternalFault::Exception { vector: 6, .. }
-    ));
-    assert!(run_at_level(&code, CpuLevel::I486).is_ok());
-    assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    assert!(run_at_mode(&code, GswMode::Gsw486).is_ok());
+    assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
 #[test]
@@ -1806,15 +1750,14 @@ fn cpuid_runs_in_ring0_protected_mode_below_486() {
     // The exec-time CPUID gate carries the same ring-0 protected-mode
     // exemption as the prefix and 0F-extended gates: chipset-side ring-0
     // monitor code gets the full core ISA even when the guest persona has
-    // no CPUID (I286/I386). Same flat CPL-0 code segment shape as
+    // no CPUID (I386). Same flat CPL-0 code segment shape as
     // `cpl3_code`, but with an RPL-0 selector. I386 is the interesting
-    // level: the I286 two-byte gate does not apply, so only the CPUID
-    // gate decides. (At I486/I586 `has_cpuid()` is true and the gate is
+    // level, so only the CPUID gate decides. (At I486/I586 the gate is
     // moot for everyone.)
     let mut memory = vec![0u8; 256];
     memory[..2].copy_from_slice(&[0x0f, 0xa2]);
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I386);
+    cpu.set_mode(GswMode::Gsw386);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
         SegmentIndex::Cs,
@@ -1835,13 +1778,13 @@ fn cpuid_runs_in_ring0_protected_mode_below_486() {
 
     // Guest-facing code is still gated: CPL-3 protected mode at I386 #UDs.
     let (mut cpu3, mut bus3) = cpl3_code(&[0x0f, 0xa2]);
-    cpu3.set_level(CpuLevel::I386);
+    cpu3.set_mode(GswMode::Gsw386);
     let fault = exec_one_split(&mut cpu3, &mut bus3).unwrap_err();
     assert!(
         matches!(fault, InternalFault::Exception { vector: 6, .. }),
         "CPUID must still #UD for CPL-3 guest code at the I386 level"
     );
-    // (Real-mode #UD at I286/I386 is pinned by cpuid_is_undefined_opcode_below_486.)
+    // Real-mode #UD at I386 is pinned by cpuid_is_undefined_opcode_below_486.
 }
 
 #[test]

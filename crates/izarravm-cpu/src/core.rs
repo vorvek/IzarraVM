@@ -285,8 +285,8 @@ impl CpuGsw {
 
     /// The CPU mode/size bitmask a compiled JIT block is keyed by (spec §2.2): a block compiled
     /// for one mode must never be reused in another at the same phys/d. Packs the CS operand-size
-    /// default (D bit), protected mode (CR0.PE), V86, the SS stack big bit (B), and the ISA level.
-    /// A level change already invalidates the decode cache (`set_level`), but it is folded in here
+    /// default (D bit), protected mode (CR0.PE), V86, the SS stack big bit (B), and the GSW mode.
+    /// A mode change already invalidates the decode cache (`set_mode`), but it is folded in here
     /// too so the key is self-contained. Validated at every region entry (`run_region`).
     #[cfg(feature = "jit")]
     pub(super) fn jit_mode_key(&self) -> u32 {
@@ -310,7 +310,7 @@ impl CpuGsw {
         if self.control.cr0 & CR0_PG != 0 {
             key |= 1 << 4;
         }
-        key | ((self.level as u32) << 8)
+        key | (u32::from(self.mode.rank()) << 8)
     }
 
     /// Whether `seg` is FLAT: base 0 and limit `u32::MAX`. This is exactly the interpreter's
@@ -346,26 +346,35 @@ impl CpuGsw {
     /// are in `jit_mode_key` (paging transition re-admits); DS flatness/writability re-checked per entry.
     #[cfg(feature = "jit")]
     pub(super) fn jit_fold_block_eligible(&self) -> bool {
-        matches!(self.level, CpuLevel::I486 | CpuLevel::I586)
+        matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
             && self.jit_segment_flat(SegmentIndex::Ds)
     }
 
-    /// The live instruction-set level the core presents to the guest.
-    pub fn level(&self) -> CpuLevel {
-        self.level
+    /// The active GSW compatibility mode.
+    pub fn mode(&self) -> GswMode {
+        self.mode
     }
 
-    /// Set the guest-facing instruction-set level. The Machine calls this from the
-    /// live Lotura GSW mode write so a guest that selects Super Slow (286) gets a
-    /// true 286 instruction boundary. Firmware POST never calls this, so it always
-    /// runs at the default full ISA.
-    pub fn set_level(&mut self, level: CpuLevel) {
-        self.level = level;
+    /// The guest-facing ISA persona selected by the active mode.
+    pub fn persona(&self) -> CpuPersona {
+        self.mode.persona()
+    }
+
+    /// Compatibility readout for callers that still use the old name.
+    pub fn level(&self) -> CpuPersona {
+        self.persona()
+    }
+
+    /// Install one core-table mode atomically. Every call resets fractional timing
+    /// state and execution accelerators, including switches between the two modes
+    /// that share the 386 persona.
+    pub fn set_mode(&mut self, mode: GswMode) {
+        self.mode = mode;
         self.timing_rem = 0;
         self.fp_rem = 0;
-        // The ISA level gates the two-byte #UD checks in decode, so the same bytes can decode
-        // differently after a level change. Invalidate the decode cache so it re-decodes.
-        self.decode_cache.invalidate();
+        #[cfg(feature = "jit")]
+        self.jit_regions.clear();
+        self.invalidate_code_caches();
     }
 
     /// Scale a retired instruction's clocks by the active level's timing factor,
@@ -386,18 +395,19 @@ impl CpuGsw {
         // The remainder carry (`timing_rem`) is shared across all levels (reset on level
         // change), so switching levels mid-run is safe (the carry is < the old den and
         // the new den is always >= 5, so the first scaled result is exact).
-        let (num, den) = level_timing(self.level);
+        let persona = self.persona();
+        let (num, den) = level_timing(persona);
         let scaled = u64::from(clocks) * u64::from(num) + self.timing_rem;
-        // The `match` on `self.level` gives the compiler a compile-time constant for `den`
+        // The `match` on the persona gives the compiler a compile-time constant for `den`
         // in each arm, enabling magic-multiplier strength reduction. The generic
         // `scaled % den` + `scaled / den` would be two divs; computing the quotient first
         // then the remainder as `scaled - quot * den` is one div + one mul + one sub.
-        let (quot, rem) = match self.level {
-            CpuLevel::I286 | CpuLevel::I386 => {
+        let (quot, rem) = match persona {
+            CpuPersona::I386 => {
                 let q = scaled / 5u64;
                 (q, scaled - q * 5)
             }
-            CpuLevel::I486 | CpuLevel::I586 => {
+            CpuPersona::I486 | CpuPersona::I586 => {
                 let q = scaled / 12u64;
                 (q, scaled - q * 12)
             }
@@ -413,7 +423,7 @@ impl CpuGsw {
     /// `scale_clocks_batches_exactly`).
     #[cfg(feature = "jit")]
     pub(super) fn scale_clocks_batch(&mut self, clocks: u64) -> u64 {
-        let (num, den) = level_timing(self.level);
+        let (num, den) = level_timing(self.persona());
         let scaled = clocks * u64::from(num) + self.timing_rem;
         self.timing_rem = scaled % u64::from(den);
         scaled / u64::from(den)
@@ -426,17 +436,17 @@ impl CpuGsw {
     /// remainder stays exact across ops of different classes. With an identity factor
     /// this returns `clocks` unchanged.
     pub(super) fn scale_fp_clocks(&mut self, clocks: u32, class: FpOpClass) -> u32 {
-        let num = fp_timing_class(self.level, class);
+        let num = fp_timing_class(self.persona(), class);
         let scaled = u64::from(clocks) * u64::from(num) + self.fp_rem;
         self.fp_rem = scaled % u64::from(FP_TIMING_DEN);
         (scaled / u64::from(FP_TIMING_DEN)).min(u64::from(u32::MAX)) as u32
     }
 
-    /// Reported (L1 KB, L2 KB) cache for the live level. The same geometry drives
+    /// Reported (L1 KB, L2 KB) cache for the live mode. The same geometry drives
     /// per-mode data-access timing through the machine's `CacheModel`, so this is no
-    /// longer a no-timing readout (see `CpuLevel::cache_kb`).
+    /// longer a no-timing readout.
     pub fn cache_kb(&self) -> (u16, u16) {
-        self.level.cache_kb()
+        self.mode.cache_kb()
     }
 
     /// Host-side performance counters accumulated since construction or the last

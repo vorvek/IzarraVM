@@ -992,50 +992,6 @@ fn pop_fs_gs_fault_on_a_bad_selector_in_protected_mode() {
     }
 }
 
-/// Like `run_at_level`, but seeds SP at 0x1f0 (mirroring `fs_gs_stack_cpu`/`stack_seed`) so
-/// the PUSH FS/GS arms have room on the stack instead of wrapping SP into unmapped memory.
-/// POP FS/GS only ever read what PUSH just wrote (or zero), so no separate POP variant needed.
-fn run_at_level_with_stack(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
-    let mut memory = vec![0; 1024];
-    memory[..code.len()].copy_from_slice(code);
-    let mut cpu = CpuGsw::default();
-    cpu.set_level(level);
-    cpu.load_segment_real(SegmentIndex::Cs, 0);
-    cpu.load_segment_real(SegmentIndex::Ds, 0);
-    cpu.load_segment_real(SegmentIndex::Ss, 0);
-    cpu.registers.eip = 0;
-    cpu.write_reg16(Reg16::Sp, 0x01f0);
-    let mut bus = TestBus::with_memory(memory);
-    exec_one_split(&mut cpu, &mut bus)
-}
-
-#[test]
-fn push_pop_fs_gs_raise_ud_at_i286() {
-    // FS/GS are 386+ only. At the I286 level the check_two_byte_isa_gate must #UD all four
-    // opcodes (via is_386plus_two_byte), the same gate MOVZX/BSF/etc go through, and they
-    // must run cleanly from I386 up.
-    for code in [
-        [0x0fu8, 0xa0], // PUSH FS
-        [0x0f, 0xa1],   // POP FS
-        [0x0f, 0xa8],   // PUSH GS
-        [0x0f, 0xa9],   // POP GS
-    ] {
-        assert!(
-            matches!(
-                run_at_level_with_stack(&code, CpuLevel::I286).unwrap_err(),
-                InternalFault::Exception { vector: 6, .. }
-            ),
-            "{code:02x?} must #UD at I286"
-        );
-        assert!(
-            run_at_level_with_stack(&code, CpuLevel::I386).is_ok(),
-            "{code:02x?} must run at I386"
-        );
-        assert!(run_at_level_with_stack(&code, CpuLevel::I486).is_ok());
-        assert!(run_at_level_with_stack(&code, CpuLevel::I586).is_ok());
-    }
-}
-
 #[test]
 fn lldt_loads_the_descriptor() {
     // LDT descriptor at selector 0x08: base 0x0004_0000, limit 0x0fff, access 0x82.

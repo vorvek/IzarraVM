@@ -494,7 +494,7 @@ impl CpuGsw {
         let epoch = self.decode_cache.jit_smc_epoch;
         let ring0 = self.is_ring0_protected();
         let mode_key = self.jit_mode_key();
-        let (num, den) = level_timing(self.level);
+        let (num, den) = level_timing(self.persona());
         let rem0 = self.timing_rem;
         // For a region with native cost-fold LOAD/STORE slots: DS flatness (and, for stores, DS
         // writability) is a runtime value NOT in the mode key, so re-check it here per entry (like the

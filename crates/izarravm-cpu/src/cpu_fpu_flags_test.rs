@@ -1663,9 +1663,9 @@ fn fp_timing_identity_does_not_change_fpu_clocks() {
         0xd8, 0xc1, // FADD ST(0), ST(1)
     ];
 
-    let fadd_elapsed = |level: CpuLevel| -> u64 {
+    let fadd_elapsed = |mode: GswMode| -> u64 {
         let (mut cpu, memory) = real_mode_cpu(code, 0x20);
-        cpu.set_level(level);
+        cpu.set_mode(mode);
         let mut bus = TestBus::with_memory(memory);
         // Execute FLD1; FLD1 to load the stack.
         cpu.cycle(&mut bus).unwrap();
@@ -1676,8 +1676,8 @@ fn fp_timing_identity_does_not_change_fpu_clocks() {
         cpu.elapsed_clocks - before
     };
 
-    let fadd_i486 = fadd_elapsed(CpuLevel::I486);
-    let fadd_i586 = fadd_elapsed(CpuLevel::I586);
+    let fadd_i486 = fadd_elapsed(GswMode::Gsw486);
+    let fadd_i586 = fadd_elapsed(GswMode::Gsw586);
 
     // Both modes share level_timing (1,12); the per-class FP dial is identity at
     // I486 and Register-class x0.25 at I586 (P5 pairing/issue-rate honesty), so

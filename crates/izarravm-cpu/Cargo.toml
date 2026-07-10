@@ -16,6 +16,7 @@ jit = []
 [dependencies]
 thiserror.workspace = true
 izarravm-bus = { path = "../izarravm-bus" }
+izarravm-core = { path = "../izarravm-core" }
 
 [dev-dependencies]
 serde = { workspace = true }
