@@ -23,7 +23,7 @@ fn a_new_queue_has_thirty_milliseconds_of_silent_prefill() {
 }
 
 #[test]
-fn low_watermark_refills_to_target_before_new_audio() {
+fn low_watermark_appends_new_audio_without_padding() {
     let ring = Arc::new(ArrayQueue::new(CAPACITY_FRAMES));
     let sink = AudioSink {
         ring: Arc::clone(&ring),
@@ -32,10 +32,24 @@ fn low_watermark_refills_to_target_before_new_audio() {
 
     sink.queue(&[(123, -123)]);
 
-    assert_eq!(ring.len(), TARGET_FRAMES + 1);
-    for _ in 0..TARGET_FRAMES {
-        assert!(matches!(ring.pop(), Some(QueuedFrame::Padding)));
-    }
+    assert_eq!(ring.len(), 1);
+    assert!(matches!(ring.pop(), Some(QueuedFrame::Audio((123, -123)))));
+}
+
+#[test]
+fn a_batch_within_the_high_watermark_is_not_truncated() {
+    let ring = Arc::new(ArrayQueue::new(CAPACITY_FRAMES));
+    let debug = Arc::new(AudioDebugCounters::new(ring.len()));
+    let sink = AudioSink {
+        ring: Arc::clone(&ring),
+        debug: Some(Arc::clone(&debug)),
+    };
+    let frames = vec![(123, -123); HIGH_FRAMES];
+
+    sink.queue(&frames);
+
+    assert_eq!(ring.len(), HIGH_FRAMES);
+    assert_eq!(debug.snapshot().overruns, 0);
     assert!(matches!(ring.pop(), Some(QueuedFrame::Audio((123, -123)))));
 }
 
@@ -186,9 +200,10 @@ fn debug_snapshot_records_producer_consumer_and_callback_pressure() {
 
     let snapshot = debug.snapshot();
     assert_eq!(snapshot.frames_produced, 2 + oversized.len() as u64);
-    assert_eq!(snapshot.frames_consumed, TARGET_FRAMES as u64 + 3);
+    assert_eq!(snapshot.frames_consumed, 3);
     assert_eq!(snapshot.queue_min_depth, 0);
-    assert_eq!(snapshot.queue_max_depth, TARGET_FRAMES + 2);
+    assert_eq!(snapshot.queue_max_depth, TARGET_FRAMES);
+    assert_eq!(snapshot.low_water_writes, 2);
     assert_eq!(snapshot.underruns_after_prefill, 1);
     assert_eq!(snapshot.overruns, 1);
     assert_eq!(snapshot.late_callbacks, 1);

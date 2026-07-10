@@ -31,6 +31,7 @@ struct AudioDebugSnapshot {
     frames_consumed: u64,
     queue_min_depth: usize,
     queue_max_depth: usize,
+    low_water_writes: u64,
     underruns_after_prefill: u64,
     overruns: u64,
     late_callbacks: u64,
@@ -44,6 +45,7 @@ struct AudioDebugCounters {
     frames_consumed: AtomicU64,
     queue_min_depth: AtomicUsize,
     queue_max_depth: AtomicUsize,
+    low_water_writes: AtomicU64,
     underruns_after_prefill: AtomicU64,
     overruns: AtomicU64,
     late_callbacks: AtomicU64,
@@ -58,6 +60,7 @@ impl AudioDebugCounters {
             frames_consumed: AtomicU64::new(0),
             queue_min_depth: AtomicUsize::new(queue_depth),
             queue_max_depth: AtomicUsize::new(queue_depth),
+            low_water_writes: AtomicU64::new(0),
             underruns_after_prefill: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
             late_callbacks: AtomicU64::new(0),
@@ -89,6 +92,7 @@ impl AudioDebugCounters {
             frames_consumed: self.frames_consumed.load(Ordering::Relaxed),
             queue_min_depth: self.queue_min_depth.load(Ordering::Relaxed),
             queue_max_depth: self.queue_max_depth.load(Ordering::Relaxed),
+            low_water_writes: self.low_water_writes.load(Ordering::Relaxed),
             underruns_after_prefill: self.underruns_after_prefill.load(Ordering::Relaxed),
             overruns: self.overruns.load(Ordering::Relaxed),
             late_callbacks: self.late_callbacks.load(Ordering::Relaxed),
@@ -140,10 +144,10 @@ pub struct AudioSink {
 impl AudioSink {
     /// Queue mixer frames while holding the buffer near its 30 ms target.
     ///
-    /// Falling below 15 ms schedules silence before the new audio. Rising above
-    /// 60 ms discards old latency and inserts a short fade boundary. The queue
-    /// itself is capped at 100 ms, so a stalled callback cannot grow memory or
-    /// leave sound far behind the guest.
+    /// Falling below 15 ms records producer starvation and appends new audio
+    /// immediately. Rising above 60 ms discards old latency and inserts a short
+    /// fade boundary. The queue itself is capped at 100 ms, so a stalled callback
+    /// cannot grow memory or leave sound far behind the guest.
     pub fn queue(&self, frames: &[StereoFrame]) {
         if frames.is_empty() {
             return;
@@ -155,14 +159,12 @@ impl AudioSink {
         }
 
         let queued = self.ring.len();
-        let planned_padding = if queued < LOW_FRAMES {
-            TARGET_FRAMES.saturating_sub(queued)
-        } else {
-            0
-        };
-        let projected = queued
-            .saturating_add(planned_padding)
-            .saturating_add(frames.len());
+        if queued < LOW_FRAMES
+            && let Some(debug) = &self.debug
+        {
+            debug.low_water_writes.fetch_add(1, Ordering::Relaxed);
+        }
+        let projected = queued.saturating_add(frames.len());
         if projected > HIGH_FRAMES {
             if let Some(debug) = &self.debug {
                 debug.overruns.fetch_add(1, Ordering::Relaxed);
@@ -174,7 +176,6 @@ impl AudioSink {
             return;
         }
 
-        push_padding(&self.ring, planned_padding);
         for &frame in frames {
             if self.ring.push(QueuedFrame::Audio(frame)).is_err() {
                 if let Some(debug) = &self.debug {
@@ -367,12 +368,15 @@ where
                 if out_frames >= out_hz as u64 {
                     let snapshot = debug.snapshot();
                     eprintln!(
-                        "[AUDIO] produced/s={} consumed/s={} ring_now={} ring_min={} ring_max={} underruns_after_prefill/s={} overruns/s={} late_callbacks/s={} callback_lateness_us/s={} max_callback_lateness_us={}",
+                        "[AUDIO] produced/s={} consumed/s={} ring_now={} ring_min={} ring_max={} low_water_writes/s={} underruns_after_prefill/s={} overruns/s={} late_callbacks/s={} callback_lateness_us/s={} max_callback_lateness_us={}",
                         snapshot.frames_produced.saturating_sub(reported.frames_produced),
                         snapshot.frames_consumed.saturating_sub(reported.frames_consumed),
                         source.ring.len(),
                         snapshot.queue_min_depth,
                         snapshot.queue_max_depth,
+                        snapshot
+                            .low_water_writes
+                            .saturating_sub(reported.low_water_writes),
                         snapshot
                             .underruns_after_prefill
                             .saturating_sub(reported.underruns_after_prefill),
