@@ -409,6 +409,16 @@ impl CpuBus for MachineBus<'_> {
             });
         }
 
+        if self.distira_texture_offset(address, bytes).is_some() {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            return Ok(match width {
+                BusWidth::Byte => 0xff,
+                BusWidth::Word => 0xffff,
+                BusWidth::Dword => 0xffff_ffff,
+            });
+        }
+
         if should_split(address, width) {
             let mut value = 0u32;
             for offset in 0..width.bytes() {
@@ -465,6 +475,15 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
 
+        if let Some(offset) = self.distira_texture_offset(address, width.bytes() as usize) {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            if width == BusWidth::Dword {
+                self.distira.write_texture_u32(offset, value);
+            }
+            return Ok(());
+        }
+
         if should_split(address, width) {
             for offset in 0..width.bytes() {
                 self.write_memory(
@@ -493,13 +512,6 @@ impl CpuBus for MachineBus<'_> {
         if let Some(offset) = self.distira_cmdfifo_offset(address, width.bytes() as usize) {
             if width == BusWidth::Dword {
                 self.distira.write_command_fifo_u32(offset, value);
-            }
-            return Ok(());
-        }
-
-        if let Some(offset) = self.distira_texture_offset(address, width.bytes() as usize) {
-            if width == BusWidth::Dword {
-                self.distira.write_texture_u32(offset, value);
             }
             return Ok(());
         }
@@ -1669,6 +1681,11 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        if self.distira_texture_offset(address, width).is_some() {
+            out.fill(0xff);
+            return Ok(());
+        }
+
         if let Some(offset) = self.distira_mmio_offset(address, width) {
             for (index, byte) in out.iter_mut().enumerate() {
                 *byte = self.distira.read_mmio_u8(offset + index);
@@ -1774,6 +1791,10 @@ impl MachineBus<'_> {
         }
 
         if self.distira_lfb_offset(address, 1).is_some() {
+            return Ok(());
+        }
+
+        if self.distira_texture_offset(address, 1).is_some() {
             return Ok(());
         }
 
@@ -1946,6 +1967,7 @@ impl MachineBus<'_> {
             || margo_mmio_offset(address, bytes).is_some()
             || self.distira_lfb_offset(address, bytes).is_some()
             || self.distira_cmdfifo_offset(address, bytes).is_some()
+            || self.distira_texture_offset(address, bytes).is_some()
             || self.distira_mmio_offset(address, bytes).is_some()
     }
 
@@ -1974,6 +1996,7 @@ impl MachineBus<'_> {
             || margo_mmio_offset(address, 1).is_some()
             || self.distira_lfb_offset(address, 1).is_some()
             || self.distira_cmdfifo_offset(address, 1).is_some()
+            || self.distira_texture_offset(address, 1).is_some()
             || self.distira_mmio_offset(address, 1).is_some()
         {
             // The Approximate class charges the era bus latency of a real video

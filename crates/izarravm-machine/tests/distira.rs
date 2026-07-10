@@ -15,9 +15,16 @@ use izarravm_video::{
     SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_FASTFILL_CMD,
     SST_FBI_INIT2, SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE, SST_START_A,
     SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR,
-    SST_TEXTURE_MODE, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY,
-    SST_VERTEX_CX, SST_VERTEX_CY, TEX_R5G6B5,
+    SST_TEXTURE_MODE, SST_TLOD, SST_TREX_INIT0, SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX,
+    SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY, TEX_R5G6B5,
 };
+
+const TREX0: usize = 0x2 << 10;
+const TREX1: usize = 0x4 << 10;
+const DISTIRA_TEXTURE_OFFSET: u32 = 0x0080_0000;
+const DISTIRA_TEXTURE_APERTURE_SIZE: u32 = 0x0080_0000;
+const TMU1_APERTURE: u32 = 1 << 21;
+const TC_ADD_CLOCAL: u32 = 1 << 18;
 
 fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
     for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
@@ -39,6 +46,40 @@ fn read_guest_u32(machine: &mut Machine, address: u32) -> u32 {
     (0..4)
         .map(|i| u32::from(machine.read_physical_u8(address + i)) << (i * 8))
         .fold(0, |a, b| a | b)
+}
+
+fn draw_texture_sample(machine: &mut Machine, tmu: usize) -> u32 {
+    write_reg(machine, DISTIRA_REG_FB_WIDTH, 4);
+    write_reg(machine, DISTIRA_REG_FB_HEIGHT, 4);
+    write_reg(machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(machine, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(
+        machine,
+        TREX0 | SST_TEXTURE_MODE,
+        (TEX_R5G6B5 << 8) | if tmu == 1 { TC_ADD_CLOCAL } else { 0 },
+    );
+    write_reg(machine, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(machine, SST_VERTEX_AX, 0);
+    write_reg(machine, SST_VERTEX_AY, 0);
+    write_reg(machine, SST_VERTEX_BX, 3 << 4);
+    write_reg(machine, SST_VERTEX_BY, 0);
+    write_reg(machine, SST_VERTEX_CX, 0);
+    write_reg(machine, SST_VERTEX_CY, 3 << 4);
+    write_reg(machine, SST_START_R, 0xff << 12);
+    write_reg(machine, SST_START_G, 0xff << 12);
+    write_reg(machine, SST_START_B, 0xff << 12);
+    write_reg(machine, SST_START_A, 0xff << 12);
+    write_reg(machine, SST_TRIANGLE_CMD, 1);
+    write_reg(machine, SST_SWAPBUFFER_CMD, 1);
+    machine.frame_argb().0[0]
+}
+
+fn write_texture_texel(machine: &mut Machine, tmu: usize, byte_address: u32, texel: u16) {
+    let chip = if tmu == 0 { TREX0 } else { TREX1 };
+    let aperture =
+        DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET + if tmu == 0 { 0 } else { TMU1_APERTURE };
+    write_reg(machine, chip | SST_TEX_BASE_ADDR, byte_address >> 3);
+    machine.write_physical_u32(aperture, u32::from(texel) | (u32::from(texel) << 16));
 }
 
 fn cmdfifo_type1_header(reg: usize, count: u32) -> u32 {
@@ -510,16 +551,24 @@ fn distira_guest_cmdfifo_type5_texture_packets_use_assigned_bar_aperture() {
 }
 
 #[test]
-fn distira_guest_direct_texture_bar_writes_feed_texture_sampling() {
+fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
     const ASSIGNED_BAR: u32 = 0xe600_0000;
     const ASSIGNED_TEX: u32 = ASSIGNED_BAR + 0x0080_0000;
+    const LOD2: u32 = 2;
 
     let mut code = Vec::new();
     push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
     push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
     push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
     push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_TEX, 0x07e0_07e0);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_TEXTURE_MODE as u32,
+        TEX_R5G6B5 << 8,
+    );
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_TLOD as u32, LOD2 << 2);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_TEX_BASE_ADDR as u32, 0);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_TEX + (LOD2 << 17), 0x07e0_07e0);
 
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Distira),
@@ -530,28 +579,138 @@ fn distira_guest_direct_texture_bar_writes_feed_texture_sampling() {
     let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
 
     assert_eq!(reason, StopReason::Halted);
-    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 4);
-    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 4);
-    write_reg(&mut machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    write_reg(&mut machine, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
-    write_reg(&mut machine, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(&mut machine, SST_TEX_BASE_ADDR, 0);
-    write_reg(&mut machine, SST_VERTEX_AX, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_BX, 3 << 4);
-    write_reg(&mut machine, SST_VERTEX_BY, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_CY, 3 << 4);
-    write_reg(&mut machine, SST_START_R, 0xff << 12);
-    write_reg(&mut machine, SST_START_G, 0xff << 12);
-    write_reg(&mut machine, SST_START_B, 0xff << 12);
-    write_reg(&mut machine, SST_START_A, 0xff << 12);
-    write_reg(&mut machine, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    assert_eq!(draw_texture_sample(&mut machine, 0), 0x0000_ff00);
+}
 
-    let (frame, width, height) = machine.frame_argb();
-    assert_eq!((width, height), (4, 4));
-    assert_eq!(frame[0], 0x0000_ff00);
+#[test]
+fn distira_texture_aperture_keeps_tmu_stores_independent() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(&mut machine, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_texture_texel(&mut machine, 0, 0, 0xf800);
+    write_texture_texel(&mut machine, 1, 0, 0x001f);
+
+    assert_eq!(draw_texture_sample(&mut machine, 0), 0x00ff_0000);
+    assert_eq!(draw_texture_sample(&mut machine, 1), 0x00ff_00ff);
+}
+
+#[test]
+fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    for tmu in 0..2 {
+        let chip = if tmu == 0 { TREX0 } else { TREX1 };
+        write_reg(&mut machine, chip | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+        write_reg(&mut machine, chip | SST_TLOD, 0);
+        write_reg(&mut machine, chip | SST_TREX_INIT0, 0x5000);
+        assert_eq!(read_reg(&mut machine, chip | SST_TREX_INIT0), 0x5000);
+
+        write_texture_texel(&mut machine, tmu, 0x0020_0000, 0xf800);
+        write_texture_texel(&mut machine, tmu, 0x0010_0000, 0x07e0);
+        write_texture_texel(&mut machine, tmu, 0, 0x001f);
+        write_reg(&mut machine, chip | SST_TEX_BASE_ADDR, 0x0020_0000 >> 3);
+        if tmu == 1 {
+            write_texture_texel(&mut machine, 0, 0, 0);
+        }
+        assert_eq!(draw_texture_sample(&mut machine, tmu), 0x0000_00ff);
+
+        write_reg(&mut machine, chip | SST_TREX_INIT0, 0x2000);
+        assert_eq!(read_reg(&mut machine, chip | SST_TREX_INIT0), 0x2000);
+        write_texture_texel(&mut machine, tmu, 0x0020_0000, 0xf800);
+        write_texture_texel(&mut machine, tmu, 0x0010_0000, 0x07e0);
+        write_texture_texel(&mut machine, tmu, 0, 0x001f);
+        write_reg(&mut machine, chip | SST_TEX_BASE_ADDR, 0x0010_0000 >> 3);
+        if tmu == 1 {
+            write_texture_texel(&mut machine, 0, 0, 0);
+        }
+        assert_eq!(draw_texture_sample(&mut machine, tmu), 0x0000_ff00);
+    }
+}
+
+#[test]
+fn distira_trex_config_send_reports_two_tmus() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    const SEND_CONFIG: u32 = 1 << 18;
+
+    write_reg(&mut machine, TREX0 | SST_TREX_INIT1, SEND_CONFIG);
+    assert_eq!(read_reg(&mut machine, TREX0 | SST_TREX_INIT1), SEND_CONFIG);
+    let pixel = draw_texture_sample(&mut machine, 0);
+    assert_eq!(pixel & 0x00ff_ff00, 0);
+    assert!(
+        (pixel as u8).abs_diff(0xc1) <= 8,
+        "configuration pixel was {pixel:#010x}"
+    );
+}
+
+#[test]
+fn distira_texture_aperture_aligns_dwords_and_ignores_narrow_writes() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    let aperture = DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET;
+
+    write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_texture_texel(&mut machine, 0, 0, 0x07e0);
+    machine.write_physical_u32(aperture + 1, 0x001f_001f);
+    machine.write_physical_u16(aperture, 0xf800);
+    machine.write_physical_u8(aperture, 0);
+
+    assert_eq!(draw_texture_sample(&mut machine, 0), 0x0000_00ff);
+}
+
+#[test]
+fn distira_texture_aperture_ignores_unsupported_tmu_space_at_the_boundary() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    let aperture = DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET;
+
+    write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(&mut machine, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_texture_texel(&mut machine, 0, 0, 0xf800);
+    write_texture_texel(&mut machine, 1, 0, 0x001f);
+    machine.write_physical_u32(aperture + (1 << 22), 0x07e0_07e0);
+    machine.write_physical_u32(aperture + DISTIRA_TEXTURE_APERTURE_SIZE - 4, 0x07e0_07e0);
+
+    assert_eq!(draw_texture_sample(&mut machine, 0), 0x00ff_0000);
+    assert_eq!(draw_texture_sample(&mut machine, 1), 0x00ff_00ff);
+    assert_eq!(
+        machine.read_physical_u32(aperture + DISTIRA_TEXTURE_APERTURE_SIZE - 4),
+        0xffff_ffff
+    );
+}
+
+#[test]
+fn distira_texture_aperture_reads_open_bus() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    let aperture = DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET;
+
+    write_reg(&mut machine, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_texture_texel(&mut machine, 0, 0, 0x07e0);
+    assert_eq!(machine.read_physical_u8(aperture), 0xff);
+    assert_eq!(machine.read_physical_u16(aperture), 0xffff);
+    assert_eq!(machine.read_physical_u32(aperture), 0xffff_ffff);
+    assert_eq!(machine.read_physical_u32(aperture + 1), 0xffff_ffff);
 }
 
 #[test]
