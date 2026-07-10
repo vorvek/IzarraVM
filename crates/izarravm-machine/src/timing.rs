@@ -22,9 +22,9 @@ impl Machine {
         if secs <= 0.0 {
             return;
         }
-        // Floppy and optical mechanics still expose seconds as f64. Convert once
-        // at this seam, rounding up to the first causal master tick. Their seek
-        // models can move to integer durations without changing device advance.
+        // Floppy mechanics still expose seconds as f64. Convert once at this
+        // seam, rounding up to the first causal master tick. The floppy model can
+        // move to integer durations without changing device advance.
         let master_ticks = (secs * izarravm_core::MASTER_CLOCK_HZ as f64).ceil() as u64;
         self.stall_for_master_ticks(master_ticks);
     }
