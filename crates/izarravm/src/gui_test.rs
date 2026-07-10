@@ -16,12 +16,29 @@ fn cpu_mode_label_preserves_fractional_clock_rates() {
 }
 
 #[test]
-fn munt_selection_requires_both_rom_paths() {
-    assert!(!munt_roms_configured("", ""));
-    assert!(!munt_roms_configured("control.rom", ""));
-    assert!(!munt_roms_configured("", "pcm.rom"));
-    assert!(!munt_roms_configured("control.rom", "   "));
-    assert!(munt_roms_configured("control.rom", "pcm.rom"));
+fn munt_selection_requires_two_existing_rom_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "izarravm-munt-ui-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let control = dir.join("control.rom");
+    let pcm = dir.join("pcm.rom");
+    let control_text = control.to_string_lossy();
+    let pcm_text = pcm.to_string_lossy();
+
+    assert!(!munt_roms_available("", ""));
+    assert!(!munt_roms_available(&control_text, &pcm_text));
+    std::fs::write(&control, b"control").unwrap();
+    assert!(!munt_roms_available(&control_text, &pcm_text));
+    std::fs::write(&pcm, b"pcm").unwrap();
+    assert!(munt_roms_available(&control_text, &pcm_text));
+
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

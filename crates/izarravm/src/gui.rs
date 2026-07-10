@@ -1389,8 +1389,10 @@ fn midi_backend_label(backend: MidiBackend) -> &'static str {
     }
 }
 
-fn munt_roms_configured(control: &str, pcm: &str) -> bool {
-    !control.trim().is_empty() && !pcm.trim().is_empty()
+fn munt_roms_available(control: &str, pcm: &str) -> bool {
+    [control, pcm]
+        .into_iter()
+        .all(|path| Path::new(path.trim()).is_file())
 }
 
 fn midi_port_label(port: &MidiPortId) -> String {
@@ -2242,7 +2244,7 @@ impl GuiApp {
                         ui.colored_label(wavetable_color, midi_status_text(wavetable_status));
                         ui.add_space(6.0);
                         let munt_ready =
-                            munt_roms_configured(&dialog.mt32_control_rom, &dialog.mt32_pcm_rom);
+                            munt_roms_available(&dialog.mt32_control_rom, &dialog.mt32_pcm_rom);
                         let munt_label = if munt_ready {
                             "Munt (MT-32)"
                         } else {
