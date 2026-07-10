@@ -96,6 +96,8 @@ fn identify_packet_device_returns_512_bytes() {
     // Word 0 low/high bytes: 0x85C0 little-endian.
     assert_eq!(block[0], 0xC0);
     assert_eq!(block[1], 0x85);
+    let capabilities = u16::from_le_bytes([block[98], block[99]]);
+    assert_eq!(capabilities & (1 << 8), 0, "ATAPI DMA is not advertised");
 }
 
 #[test]

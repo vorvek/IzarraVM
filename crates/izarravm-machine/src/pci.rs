@@ -1,5 +1,7 @@
-//! PCI config space handling (Distira specific).
-//! Extracted from lib.rs for compartmentalization (Phase 3).
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! PCI configuration for the PIIX4-compatible southbridge and Distira.
 
 use izarravm_bus::BusWidth;
 
@@ -9,12 +11,23 @@ use crate::video_params::{
     DISTIRA_PCI_VENDOR_ID, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_END, PCI_CONFIG_DATA_PORT,
 };
 
+const PIIX_SLOT: u8 = 7;
+const INTEL_VENDOR_ID: u16 = 0x8086;
+const PIIX4_ISA_DEVICE_ID: u16 = 0x7110;
+const PIIX4_IDE_DEVICE_ID: u16 = 0x7111;
+const PIIX4_REVISION: u8 = 0x01;
+const PIIX4_BMIDE_POWER_ON_BASE: u32 = 0x0000_f000;
+const PCI_COMMAND_IO: u16 = 0x0001;
+const PCI_COMMAND_BUS_MASTER: u16 = 0x0004;
+
 #[derive(Debug, Clone)]
 pub(crate) struct PciConfig {
     address: u32,
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
+    piix_ide_command: u16,
+    piix_ide_bm_base: u32,
 }
 
 impl PciConfig {
@@ -26,6 +39,10 @@ impl PciConfig {
             distira_command: 0x0002,
             distira_mem_base: crate::DISTIRA_MMIO_BASE & !(DISTIRA_PCI_BAR_SIZE - 1),
             distira_init_enable: 0,
+            // There is no PCI BIOS yet, so the legacy IDE controller powers on
+            // decoded and bus-master capable at its fixed 0xF000 BAR4.
+            piix_ide_command: PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER,
+            piix_ide_bm_base: PIIX4_BMIDE_POWER_ON_BASE,
         }
     }
 
@@ -64,6 +81,20 @@ impl PciConfig {
             return true;
         }
         false
+    }
+
+    pub(crate) fn ide_io_enabled(&self) -> bool {
+        self.piix_ide_command & PCI_COMMAND_IO != 0
+    }
+
+    pub(crate) fn ide_bus_master_enabled(&self) -> bool {
+        self.piix_ide_command & PCI_COMMAND_BUS_MASTER != 0
+    }
+
+    /// Current BAR4 I/O base when it fits the x86 16-bit I/O space. An all-ones
+    /// size probe therefore decodes nowhere until the driver restores the BAR.
+    pub(crate) fn ide_bus_master_io_base(&self) -> Option<u16> {
+        (self.piix_ide_bm_base <= u32::from(u16::MAX) - 15).then_some(self.piix_ide_bm_base as u16)
     }
 
     pub(crate) fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
@@ -151,9 +182,19 @@ impl PciConfig {
     }
 
     fn read_config_byte(&self, offset: u32) -> u8 {
-        if !self.distira_selected() {
-            return 0xff;
+        if self.piix_selected(0) {
+            return read_piix4_isa_byte(offset);
         }
+        if self.piix_selected(1) {
+            return self.read_piix4_ide_byte(offset);
+        }
+        if self.distira_selected() {
+            return self.read_distira_byte(offset);
+        }
+        0xff
+    }
+
+    fn read_distira_byte(&self, offset: u32) -> u8 {
         match offset {
             0x00 => (DISTIRA_PCI_VENDOR_ID & 0xff) as u8,
             0x01 => (DISTIRA_PCI_VENDOR_ID >> 8) as u8,
@@ -172,7 +213,35 @@ impl PciConfig {
         }
     }
 
+    fn read_piix4_ide_byte(&self, offset: u32) -> u8 {
+        match offset {
+            0x00 => (INTEL_VENDOR_ID & 0xff) as u8,
+            0x01 => (INTEL_VENDOR_ID >> 8) as u8,
+            0x02 => (PIIX4_IDE_DEVICE_ID & 0xff) as u8,
+            0x03 => (PIIX4_IDE_DEVICE_ID >> 8) as u8,
+            0x04 => self.piix_ide_command as u8,
+            0x05 => (self.piix_ide_command >> 8) as u8,
+            0x08 => PIIX4_REVISION,
+            0x09 => 0x80, // legacy primary/secondary channels, bus mastering
+            0x0a => 0x01, // IDE subclass
+            0x0b => 0x01, // mass-storage class
+            0x0e => 0x00,
+            0x20..=0x23 => {
+                let bar = self.piix_ide_bm_base | 1;
+                ((bar >> ((offset - 0x20) * 8)) & 0xff) as u8
+            }
+            // Compatibility channels use legacy IRQ14/15, not one PCI INTA pin.
+            0x3c => 0xff,
+            0x3d => 0,
+            _ => 0,
+        }
+    }
+
     fn write_config_byte(&mut self, offset: u32, value: u8) {
+        if self.piix_selected(1) {
+            self.write_piix4_ide_byte(offset, value);
+            return;
+        }
         if !self.distira_selected() {
             return;
         }
@@ -191,6 +260,23 @@ impl PciConfig {
         }
     }
 
+    fn write_piix4_ide_byte(&mut self, offset: u32, value: u8) {
+        match offset {
+            0x04 => {
+                self.piix_ide_command =
+                    u16::from(value) & (PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER);
+            }
+            0x05 => {}
+            0x20..=0x23 => {
+                let shift = (offset - 0x20) * 8;
+                self.piix_ide_bm_base =
+                    (self.piix_ide_bm_base & !(0xff << shift)) | (u32::from(value) << shift);
+                self.piix_ide_bm_base &= !0x0f;
+            }
+            _ => {}
+        }
+    }
+
     fn distira_selected(&self) -> bool {
         self.address & 0x8000_0000 != 0
             && ((self.address >> 16) & 0xff) == 0
@@ -198,8 +284,30 @@ impl PciConfig {
             && ((self.address >> 8) & 0x07) == 0
     }
 
+    fn piix_selected(&self, function: u8) -> bool {
+        self.address & 0x8000_0000 != 0
+            && ((self.address >> 16) & 0xff) == 0
+            && ((self.address >> 11) & 0x1f) as u8 == PIIX_SLOT
+            && ((self.address >> 8) & 0x07) as u8 == function
+    }
+
     pub(crate) fn distira_init_enable(&self) -> u32 {
         self.distira_init_enable
+    }
+}
+
+fn read_piix4_isa_byte(offset: u32) -> u8 {
+    match offset {
+        0x00 => (INTEL_VENDOR_ID & 0xff) as u8,
+        0x01 => (INTEL_VENDOR_ID >> 8) as u8,
+        0x02 => (PIIX4_ISA_DEVICE_ID & 0xff) as u8,
+        0x03 => (PIIX4_ISA_DEVICE_ID >> 8) as u8,
+        0x08 => PIIX4_REVISION,
+        0x09 => 0x00,
+        0x0a => 0x01, // ISA bridge subclass
+        0x0b => 0x06, // bridge class
+        0x0e => 0x80, // multifunction, so enumerators probe function 1
+        _ => 0,
     }
 }
 
@@ -218,3 +326,7 @@ fn write_register_bytes(register: u32, byte_offset: u16, width: BusWidth, value:
     let shift = byte_offset * 8;
     (register & !(mask << shift)) | ((value & mask) << shift)
 }
+
+#[cfg(test)]
+#[path = "pci_test.rs"]
+mod tests;

@@ -21,6 +21,12 @@ fn program_lba(disk: &mut AtaDisk, lba: u32, count: u8) {
     disk.write_port(PRIMARY_CMD_BASE + 6, 0x40 | ((lba >> 24) as u8 & 0x0F)); // LBA mode + 24-27
 }
 
+fn advance_to_deadline(disk: &mut AtaDisk) {
+    let ticks = disk.ticks_until_completion().expect("timed ATA command");
+    assert!(ticks > 0);
+    disk.advance_master_ticks(ticks);
+}
+
 #[test]
 fn geometry_is_16_heads_63_spt() {
     // 16 * 63 = 1008 sectors per cylinder; 4032 sectors is 4 cylinders.
@@ -50,6 +56,8 @@ fn identify_round_trips_geometry() {
     let disk_sectors = 4032usize;
     let mut disk = marked_disk(disk_sectors);
     disk.write_port(PRIMARY_CMD_BASE + 7, 0xEC); // IDENTIFY DEVICE
+    assert_eq!(disk.status, status::BSY);
+    advance_to_deadline(&mut disk);
     assert_eq!(disk.status & status::DRQ, status::DRQ);
     let mut block = Vec::with_capacity(512);
     for _ in 0..512 {
@@ -61,7 +69,10 @@ fn identify_round_trips_geometry() {
     assert_eq!(word(3), 16); // heads
     assert_eq!(word(6), 63); // sectors per track
     assert_ne!(word(49) & (1 << 9), 0, "LBA is advertised");
-    assert_eq!(word(49) & (1 << 8), 0, "DMA is not advertised");
+    assert_ne!(word(49) & (1 << 8), 0, "DMA is advertised");
+    assert_eq!(word(53), 0x0005, "CHS and UDMA words are valid");
+    assert_eq!(word(63) & 0x0707, 0x0007, "MWDMA 0-2 supported");
+    assert_eq!(word(88) & 0x0707, 0x0407, "UDMA2 supported and selected");
     let lba = u32::from(word(60)) | (u32::from(word(61)) << 16);
     assert_eq!(lba, disk_sectors as u32);
     // The drain dropped DRQ and returned to ready.
@@ -72,11 +83,38 @@ fn identify_round_trips_geometry() {
 }
 
 #[test]
+fn set_features_selects_only_supported_transfer_modes() {
+    let mut disk = marked_disk(8);
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x21);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xef);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.dma_mode, DmaMode::Multiword(1));
+    assert_eq!(disk.status & status::ERR, 0);
+
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x43);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xef);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.status & status::ERR, status::ERR);
+    assert_eq!(disk.error, error::ABRT);
+
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x01);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xef);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.dma_mode, DmaMode::None);
+    assert_eq!(disk.status & status::ERR, 0);
+}
+
+#[test]
 fn pio_write_then_read_round_trips_a_sector() {
     let mut disk = marked_disk(64);
     // WRITE one sector at LBA 5 with a recognizable pattern.
     program_lba(&mut disk, 5, 1);
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x30); // WRITE SECTORS
+    assert_eq!(disk.status, status::BSY);
+    advance_to_deadline(&mut disk);
     assert_eq!(disk.status & status::DRQ, status::DRQ);
     let mut pattern = [0u8; SECTOR];
     for (i, b) in pattern.iter_mut().enumerate() {
@@ -85,6 +123,8 @@ fn pio_write_then_read_round_trips_a_sector() {
     for b in pattern {
         disk.write_port(PRIMARY_CMD_BASE, b);
     }
+    assert_eq!(disk.status, status::BSY);
+    advance_to_deadline(&mut disk);
     // The write completed: DRQ dropped, IRQ raised.
     assert_eq!(disk.status & status::DRQ, 0);
     assert!(disk.take_irq());
@@ -93,6 +133,8 @@ fn pio_write_then_read_round_trips_a_sector() {
     // READ it back through the data port.
     program_lba(&mut disk, 5, 1);
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x20); // READ SECTORS
+    assert_eq!(disk.status, status::BSY);
+    advance_to_deadline(&mut disk);
     assert_eq!(disk.status & status::DRQ, status::DRQ);
     let mut out = [0u8; SECTOR];
     for slot in out.iter_mut() {
@@ -103,13 +145,98 @@ fn pio_write_then_read_round_trips_a_sector() {
 }
 
 #[test]
+fn multi_sector_write_reports_each_committed_sector() {
+    let mut disk = marked_disk(8);
+    program_lba(&mut disk, 2, 2);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x30);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.status & status::DRQ, status::DRQ);
+    assert!(!disk.take_irq(), "the initial write DRQ is polled");
+
+    for byte in [0x5a; SECTOR] {
+        disk.write_port(PRIMARY_CMD_BASE, byte);
+    }
+    assert_eq!(disk.status, status::BSY);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.status & status::DRQ, status::DRQ);
+    assert!(disk.take_irq(), "sector one committed");
+
+    for byte in [0xa5; SECTOR] {
+        disk.write_port(PRIMARY_CMD_BASE, byte);
+    }
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.status & status::DRQ, 0);
+    assert!(disk.take_irq(), "sector two committed");
+    assert_eq!(disk.read_lba(2).unwrap(), [0x5a; SECTOR]);
+    assert_eq!(disk.read_lba(3).unwrap(), [0xa5; SECTOR]);
+}
+
+#[test]
+fn pio_deadlines_are_batch_invariant() {
+    let mut whole = marked_disk(8);
+    let mut split = marked_disk(8);
+    program_lba(&mut whole, 3, 1);
+    program_lba(&mut split, 3, 1);
+    whole.write_port(PRIMARY_CMD_BASE + 7, 0x20);
+    split.write_port(PRIMARY_CMD_BASE + 7, 0x20);
+    let deadline = whole.ticks_until_completion().unwrap();
+
+    whole.advance_master_ticks(deadline);
+    split.advance_master_ticks(deadline / 3);
+    split.advance_master_ticks(deadline / 5);
+    split.advance_master_ticks(deadline - deadline / 3 - deadline / 5);
+
+    assert_eq!(whole.status, split.status);
+    assert_eq!(whole.phase, split.phase);
+    assert_eq!(whole.buffer, split.buffer);
+    assert_eq!(whole.irq_pending, split.irq_pending);
+}
+
+#[test]
 fn read_past_end_aborts() {
     let mut disk = marked_disk(8);
     program_lba(&mut disk, 8, 1); // LBA 8 on an 8-sector disk
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x20);
+    assert_eq!(disk.status, status::BSY);
+    advance_to_deadline(&mut disk);
     assert_eq!(disk.status & status::ERR, status::ERR);
     assert_eq!(disk.error, error::ABRT);
     assert_eq!(disk.status & status::DRQ, 0);
+}
+
+#[test]
+fn dma_command_rejects_an_off_media_range_or_pio_only_mode() {
+    let mut disk = marked_disk(8);
+    program_lba(&mut disk, 8, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xc8);
+    assert_eq!(disk.status & status::ERR, status::ERR);
+    assert_eq!(disk.pending_dma(), None);
+
+    disk.write_port(PRIMARY_CMD_BASE + 1, 0x03);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 0x01);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xef);
+    advance_to_deadline(&mut disk);
+    program_lba(&mut disk, 0, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0xc8);
+    assert_eq!(disk.status & status::ERR, status::ERR);
+    assert_eq!(disk.pending_dma(), None);
+}
+
+#[test]
+fn read_and_write_dma_retry_opcodes_arm_the_same_requests() {
+    for (command, direction) in [
+        (0xc8, AtaDmaDirection::DeviceToMemory),
+        (0xc9, AtaDmaDirection::DeviceToMemory),
+        (0xca, AtaDmaDirection::MemoryToDevice),
+        (0xcb, AtaDmaDirection::MemoryToDevice),
+    ] {
+        let mut disk = marked_disk(8);
+        program_lba(&mut disk, 2, 1);
+        disk.write_port(PRIMARY_CMD_BASE + 7, command);
+        assert_eq!(disk.pending_dma().unwrap().direction, direction);
+        assert_eq!(disk.status & status::BSY, status::BSY);
+        assert_eq!(disk.status & status::DRQ, 0);
+    }
 }
 
 #[test]
@@ -117,6 +244,7 @@ fn slave_select_aborts_commands() {
     let mut disk = marked_disk(8);
     disk.write_port(PRIMARY_CMD_BASE + 6, 0x10); // select slave (drive bit 4)
     disk.write_port(PRIMARY_CMD_BASE + 7, 0xEC); // IDENTIFY to the absent slave
+    advance_to_deadline(&mut disk);
     assert_eq!(disk.status & status::ERR, status::ERR);
     assert_eq!(disk.error, error::ABRT);
 }
@@ -126,7 +254,23 @@ fn nien_suppresses_the_irq() {
     let mut disk = marked_disk(8);
     disk.write_port(PRIMARY_CTRL, 0x02); // nIEN
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x90); // EXECUTE DEVICE DIAGNOSTIC
+    advance_to_deadline(&mut disk);
     assert!(!disk.take_irq());
+}
+
+#[test]
+fn non_data_command_becomes_ready_on_its_master_tick() {
+    let mut disk = marked_disk(8);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x90);
+    assert_eq!(disk.status, status::BSY);
+    let deadline = disk.ticks_until_completion().unwrap();
+    disk.advance_master_ticks(deadline - 1);
+    assert_eq!(disk.status, status::BSY);
+    assert!(!disk.take_irq());
+    disk.advance_master_ticks(1);
+    assert_eq!(disk.status, status::DRDY | status::DSC);
+    assert_eq!(disk.error, 0x01);
+    assert!(disk.take_irq());
 }
 
 #[test]
@@ -134,10 +278,12 @@ fn sector_count_zero_means_256() {
     let mut disk = marked_disk(300);
     program_lba(&mut disk, 0, 0); // count 0 -> 256 sectors
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x20); // READ SECTORS
-    // 256 sectors are buffered; draining them all returns to ready.
-    assert_eq!(disk.status & status::DRQ, status::DRQ);
-    for _ in 0..(256 * SECTOR) {
-        disk.read_port(PRIMARY_CMD_BASE);
+    for _ in 0..256 {
+        advance_to_deadline(&mut disk);
+        assert_eq!(disk.status & status::DRQ, status::DRQ);
+        for _ in 0..SECTOR {
+            disk.read_port(PRIMARY_CMD_BASE);
+        }
     }
     assert_eq!(disk.status & status::DRQ, 0);
 }
@@ -152,6 +298,7 @@ fn chs_addressing_reads_the_right_sector() {
     disk.write_port(PRIMARY_CMD_BASE + 5, 0); // cylinder high
     disk.write_port(PRIMARY_CMD_BASE + 6, 0x01); // CHS mode (bit 6 clear), head 1
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x20); // READ SECTORS
+    advance_to_deadline(&mut disk);
     let first = disk.read_port(PRIMARY_CMD_BASE).unwrap();
     assert_eq!(first, 63u8.wrapping_add(0x10));
 }
@@ -162,6 +309,7 @@ fn initialize_device_parameters_acks() {
     disk.write_port(PRIMARY_CMD_BASE + 2, 63); // sectors per track
     disk.write_port(PRIMARY_CMD_BASE + 6, 0x0F); // 15+1 = 16 heads
     disk.write_port(PRIMARY_CMD_BASE + 7, 0x91); // INITIALIZE DEVICE PARAMETERS
+    advance_to_deadline(&mut disk);
     assert_eq!(disk.status & status::ERR, 0);
     assert_eq!(disk.status & status::DRDY, status::DRDY);
     assert!(disk.take_irq());

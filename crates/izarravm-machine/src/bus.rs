@@ -43,6 +43,7 @@ impl Machine {
             wss_enabled: self.wss_enabled,
             ide: &mut self.ide,
             ata: &mut self.ata,
+            bmide: &mut self.bmide,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
             last_int_vector: &mut self.last_int_vector,
@@ -695,6 +696,22 @@ impl CpuBus for MachineBus<'_> {
             return Ok(value);
         }
 
+        if let Some(base) = self.pci.ide_bus_master_io_base()
+            && bmide::BusMasterIde::owns_io(port, width, base)
+        {
+            if !skip_io_touched {
+                *self.io_touched = true;
+            }
+            if self.pci.ide_io_enabled() {
+                return Ok(self.bmide.read_io(port, width, base));
+            }
+            return Ok(match width {
+                BusWidth::Byte => 0xff,
+                BusWidth::Word => 0xffff,
+                BusWidth::Dword => u32::MAX,
+            });
+        }
+
         if width != BusWidth::Byte {
             // A wider-than-byte port access decomposes into byte cycles, the way the
             // ISA bus does for a port that is not 16-bit: the low byte comes from the
@@ -1022,6 +1039,24 @@ impl CpuBus for MachineBus<'_> {
             // the device on every config-space write so it never drifts from
             // the PciConfig copy of record.
             self.distira.set_init_enable(self.pci.distira_init_enable());
+            if let Some(disk) = self.ata.as_mut() {
+                self.bmide
+                    .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
+            }
+            return Ok(());
+        }
+
+        if let Some(base) = self.pci.ide_bus_master_io_base()
+            && bmide::BusMasterIde::owns_io(port, width, base)
+        {
+            if self.pci.ide_io_enabled() {
+                self.bmide
+                    .write_io(port, width, value, self.ata.as_mut(), base);
+                if let Some(disk) = self.ata.as_mut() {
+                    self.bmide
+                        .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
+                }
+            }
             return Ok(());
         }
 
@@ -1089,6 +1124,8 @@ impl CpuBus for MachineBus<'_> {
             // channel must not fault. A mounted disk takes the task-file write.
             if let Some(disk) = self.ata.as_mut() {
                 disk.write_port(port, value as u8);
+                self.bmide
+                    .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
             }
             return Ok(());
         }

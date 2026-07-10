@@ -437,8 +437,16 @@ fn primary_channel_identify_runs_through_the_bus() {
     let mut machine = int15_machine(16);
     machine.mount_hdd(vec![0u8; 4032 * 512]);
     with_bus(&mut machine, |bus| {
-        // IDENTIFY DEVICE on the command port, then drain word 0 of the block.
         bus.write_io(0x1F7, BusWidth::Byte, 0xEC, false).unwrap();
+    });
+    let deadline = machine
+        .ata
+        .as_ref()
+        .and_then(ata::AtaDisk::ticks_until_completion)
+        .unwrap();
+    machine.advance_devices_ticks(deadline);
+    with_bus(&mut machine, |bus| {
+        // Drain word 0 after IDENTIFY reaches its scheduled DRQ boundary.
         let lo = bus.read_io(0x1F0, BusWidth::Byte, 0, false).unwrap();
         let hi = bus.read_io(0x1F0, BusWidth::Byte, 0, false).unwrap();
         let word0 = u16::from(lo as u8) | (u16::from(hi as u8) << 8);
