@@ -318,7 +318,7 @@ impl CpuGsw {
         // peeks the lock target over the bus (charging fetch clocks that are NOT part of `len`, so a
         // cached replay would under-charge them) and raises #UD for a non-lockable target. Replaying
         // it from the cache would skip both. LOCK is rare, so re-decoding it every time is free.
-        if !insn.prefixes.lock && !insn.no_cache {
+        if !insn.prefixes.lock {
             // Mark the physical block(s) this instruction occupies so a later write into them
             // invalidates the cache (cross-page SMC). decode just warmed the code-page translation,
             // so resolving the physical start is a cache hit (and the identity map without paging). A
@@ -397,14 +397,13 @@ impl CpuGsw {
         // here — charging its instruction-fetch exactly once — and fold it into `insn.opcode` as
         // `0x0F00 | second`. Every later 0F group routes on this combined value, and the fused
         // fallback (`execute_two_byte`) consumes the second byte from `insn.opcode as u8` rather
-        // than re-reading it. The persona #UD gate applies once, right after the read, with the
-        // firmware-ROM exemption preserved for instructions that exist on the full P55C core.
-        let (opcode, isa_gate_exempt) = if opcode == 0x0f {
+        // than re-reading it. The persona #UD gate applies once, right after the read.
+        let opcode = if opcode == 0x0f {
             let second = self.fetch_u8(bus)?;
-            let exempt_used = self.check_two_byte_isa_gate(second)?;
-            (0x0f00u16 | u16::from(second), exempt_used)
+            self.check_two_byte_isa_gate(second)?;
+            0x0f00u16 | u16::from(second)
         } else {
-            (u16::from(opcode), false)
+            u16::from(opcode)
         };
 
         // The single `route_group` authority runs ONCE here; the result is stored in the insn so
@@ -427,8 +426,6 @@ impl CpuGsw {
             // Placeholder; the finalize below resolves it once the ModRM (the 0xFF /ext
             // discriminator) has been pre-parsed.
             continuable: false,
-            // ISA-gate exemptions are context, not bytes, so an exempt decode may not be cached.
-            no_cache: isa_gate_exempt,
         };
 
         // Pre-parse the operands of converted groups, dispatching on the group resolved above.
@@ -868,20 +865,12 @@ impl CpuGsw {
     /// additions, the 486 rejects P55C additions, and instructions outside the P55C contract
     /// always #UD.
     ///
-    /// Firmware ROM remains exempt while POST still uses CPUID on every persona. Instructions
-    /// outside the P55C contract are never exempt. Firmware work will remove this narrow exception.
-    ///
     /// `decode` applies this once, right after reading the second 0F byte — the same logical point
     /// (and eip) the fused path faulted at — so both the converted split path and the un-converted
     /// fused fallback share a single gate.
-    /// Returns whether the firmware-ROM exemption was decisive. Such a decode must not enter the
-    /// decode cache because the exemption belongs to the executing CS, not the instruction bytes.
-    pub(super) fn require_isa_generation(&self, required: IsaGeneration) -> ExecResult<bool> {
+    pub(super) fn require_isa_generation(&self, required: IsaGeneration) -> ExecResult<()> {
         if persona_supports(self.persona(), required) {
-            return Ok(false);
-        }
-        if required != IsaGeneration::Never && self.cs_in_firmware_rom() {
-            return Ok(true);
+            return Ok(());
         }
         Err(InternalFault::Exception {
             vector: 6,
@@ -889,7 +878,7 @@ impl CpuGsw {
         })
     }
 
-    fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<bool> {
+    fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<()> {
         self.require_isa_generation(two_byte_isa_generation(second))
     }
 

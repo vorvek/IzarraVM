@@ -3,13 +3,14 @@
 ; This is a *runtime-only* override: it never touches CMOS, so the BIOS boot
 ; default (set by the BIOS setup speed menu) is unaffected.
 ;
-; Usage: GSWMODE 286 | 386 | 486 | 586   (case-insensitive)
+; Usage: GSWMODE 386-slow | 386 | 486 | 586   (case-insensitive)
 ;   No argument or an unrecognized argument prints usage plus the CURRENT mode
 ;   (read back from port 0xE1) and writes nothing.
+;   The removed 286 name prints its replacement.
 ;
 ; Port 0xE1 codes (see crates/izarravm-firmware/roms/izbios-defs.inc
 ; PORT_LOTURA_MODE and izbios-bootbox.inc bx_spd_row_to_code):
-;   0 = 386, 1 = 486, 2 = 586, 3 = 286
+;   0 = 386, 1 = 486, 2 = 586, 3 = 386-slow
 ;
 ; Build: nasm -f bin gswmode.asm -o gswmode.com
     cpu 386
@@ -36,65 +37,77 @@ start:
 .to_no_arg:
     jmp .no_arg
 .have_start:
-    ; Uppercase the first 3 chars into `tok` (stop early on CR/space -> too short).
+    ; Copy and uppercase one token. The longest accepted name is 386-SLOW.
     mov di, tok
-    mov bx, 3
+    xor bx, bx
 .copy:
-    jcxz .check_tok
-    cmp bx, 0
-    je .check_tok
+    jcxz .token_done
     mov al, [si]
+    inc si
+    dec cx
     cmp al, 13                     ; CR
-    je .check_tok
+    je .token_done
     cmp al, ' '
-    je .check_tok
+    je .token_separator
+    cmp al, 9
+    je .token_separator
+    cmp bx, 8
+    jae .to_no_arg2
     cmp al, 'a'
     jb .upper_ok
     cmp al, 'z'
     ja .upper_ok
     sub al, 0x20                   ; lowercase -> uppercase
 .upper_ok:
-    mov [di], al
-    inc di
-    inc si
-    dec cx
-    dec bx
+    stosb
+    inc bx
     jmp .copy
-.check_tok:
-    cmp bx, 0                      ; must have consumed exactly 3 chars
-    jne .to_no_arg2
-    ; The 4th char (if any before CR/space) must not continue the token, else
-    ; e.g. "2860" would falsely match "286".
+.token_separator:
+    mov al, '$'
+    stosb
+.skip_trailing:
     jcxz .tok_ready
-    mov al, [si]
+    lodsb
+    dec cx
     cmp al, 13
     je .tok_ready
     cmp al, ' '
-    je .tok_ready
+    je .skip_trailing
+    cmp al, 9
+    je .skip_trailing
 .to_no_arg2:
     jmp .no_arg
+.token_done:
+    mov al, '$'
+    stosb
+    test bx, bx
+    jz .to_no_arg2
 .tok_ready:
     mov si, tok
-    mov di, s286
-    call streq3
-    jc .match286
+    mov di, c386slow
+    call streq
+    jc .match386slow
     mov si, tok
     mov di, s386
-    call streq3
+    call streq
     jc .match386
     mov si, tok
     mov di, s486
-    call streq3
+    call streq
     jc .match486
     mov si, tok
     mov di, s586
-    call streq3
+    call streq
     jc .match586
+    mov si, tok
+    mov di, c286
+    call streq
+    jc .removed286
     jmp .no_arg
 
-.match286:
+.match386slow:
     mov al, 3
-    mov dx, s286
+    mov dx, s386slow
     jmp .apply
 .match386:
     mov al, 0
@@ -123,6 +136,13 @@ start:
     mov ax, 0x4c00
     int 0x21
 
+.removed286:
+    mov ah, 0x09
+    mov dx, msg_removed286
+    int 0x21
+    mov ax, 0x4c01
+    int 0x21
+
 .no_arg:
     mov ah, 0x09
     mov dx, msg_usage
@@ -137,7 +157,7 @@ start:
     mov si, s586
     cmp al, 2
     je .cur
-    mov si, s286
+    mov si, s386slow
 .cur:
     mov dx, msg_cur1
     mov ah, 0x09
@@ -152,38 +172,40 @@ start:
     mov ax, 0x4c01
     int 0x21
 
-; streq3: compare 3 bytes at DS:SI (already uppercase) to DS:DI. CF=1 on match.
-streq3:
+; streq: compare two '$'-terminated strings. CF=1 on match.
+streq:
     push si
     push di
-    push cx
-    mov cx, 3
 .loop:
     mov al, [si]
     cmp al, [di]
     jne .no
+    cmp al, '$'
+    je .yes
     inc si
     inc di
-    loop .loop
-    pop cx
+    jmp .loop
+.yes:
     pop di
     pop si
     stc
     ret
 .no:
-    pop cx
     pop di
     pop si
     clc
     ret
 
-tok:    times 3 db 0
-s286:   db '286', '$'
+tok:    times 9 db '$'
+c286:   db '286', '$'
+c386slow: db '386-SLOW', '$'
+s386slow: db '386-slow', '$'
 s386:   db '386', '$'
 s486:   db '486', '$'
 s586:   db '586', '$'
 msg_switch1: db 'GSWMODE: switched to ', '$'
 msg_switch2: db '.', 13, 10, '$'
-msg_usage:   db 'Usage: GSWMODE 286|386|486|586', 13, 10, '$'
+msg_usage:   db 'Usage: GSWMODE 386-slow|386|486|586', 13, 10, '$'
+msg_removed286: db "CPU mode '286' was removed; use '386-slow'.", 13, 10, '$'
 msg_cur1:    db 'Current mode: ', '$'
 msg_cur2:    db 13, 10, '$'

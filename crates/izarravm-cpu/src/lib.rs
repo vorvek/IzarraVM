@@ -1385,11 +1385,6 @@ struct DecodedInsn {
     /// recover it); resolve admission at decode, never in the run loop — this
     /// measurement is the reason.
     continuable: bool,
-    /// Never enter this decode in the decode cache. Set when the two-byte ISA gate passed only
-    /// via the firmware-ROM exemption: that exemption is context, not bytes, so a
-    /// cached replay after a privilege change would skip the #UD. (LOCK-prefixed instructions
-    /// are the other no-cache class, detected from `prefixes.lock` directly.)
-    no_cache: bool,
 }
 
 /// Direct-mapped decode-cache lines (power of two so the index is a mask). A break-attribution

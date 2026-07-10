@@ -40,8 +40,8 @@ depending on which lab note you believe. The record is thin, because the
 company didn't outlive the hardware it was written for. What is clear from
 the product itself: the "GSW" in GSW-586 is their initials, not a
 coincidence, and the throttle-without-rebooting trick that lets one CPU
-answer as a 586, 486, 386, or 286 is the kind of pragmatic, slightly cheeky
-engineering their boot banner promises.
+act as a 586, a 486, or a 386 at two speeds fits the pragmatic, slightly
+cheeky engineering their boot banner promises.
 
 ## Reading the fiction
 

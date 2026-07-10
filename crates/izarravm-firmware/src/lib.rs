@@ -306,10 +306,9 @@ pub fn gpemul_com() -> &'static [u8] {
 
 /// GSWMODE.COM: a guest tool that retargets the GSW-586's live CPU speed at
 /// runtime by writing the Lotura mode register (port 0xE1). `GSWMODE
-/// 286|386|486|586` (case-insensitive) switches; no argument or a bad argument
-/// prints usage plus the current mode (read back from 0xE1) and writes
-/// nothing. Runtime-only: never touches CMOS, so the BIOS boot default is
-/// unaffected. Ships on the Toka-DOS image (see build-freedos-hdd-image.py).
+/// 386-slow|386|486|586` switches without changing the BIOS default. The
+/// removed `286` name reports how to migrate. Ships on the Toka-DOS image
+/// (see build-freedos-hdd-image.py).
 pub fn gswmode_com() -> &'static [u8] {
     GSWMODE_COM
 }

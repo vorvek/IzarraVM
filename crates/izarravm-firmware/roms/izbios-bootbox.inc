@@ -575,7 +575,7 @@ bx_spd_label_ptr:
     ret
 
 ; bx_spd_row_to_code: AL = speed row -> AL = 0xE1/CMOS GSW code (Fast/586=2,
-; Slow/486=1, VSlow/386=0, SSlow/286=3). Out-of-range falls back to VSlow (0).
+; Slow/486=1, VSlow/386=0, SSlow/386-slow=3). Invalid rows use VSlow (0).
 bx_spd_row_to_code:
     cmp al, BMX_SPD_FAST
     je .fast
@@ -627,6 +627,6 @@ bx_str_dev_cd:    db 'CD-ROM', 0
 bx_str_spd_fast:  db 'Fast   586', 0
 bx_str_spd_slow:  db 'Slow   486', 0
 bx_str_spd_vslow: db 'VSlow  386', 0
-bx_str_spd_sslow: db 'SSlow  286', 0
+bx_str_spd_sslow: db 'SSlow  386', 0
 bx_str_accept:    db 'Accept', 0
 bx_str_hint:      db 'Up/Dn  Enter  Esc', 0

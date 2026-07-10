@@ -25,7 +25,7 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "kbd-layouts.inc"      ; foundation: scancode -> ASCII layout tables (17 layouts)
 %include "kbd-layout-meta.inc"  ; generated: kbd_layout_codepage table (cp index per layout)
 %include "izbios-result.inc"    ; foundation: POST_STEP macro + result_append
-%include "probes/probe-cpu.inc"      ; STREAM C: GSW-586 P55C identity
+%include "probes/probe-cpu.inc"      ; STREAM C: GSW CPU mode detection
 %include "probes/probe-margo.inc"    ; STREAM C: VEGA/Margo video (screen path)
 %include "ramtest-core.inc"          ; STREAM B
 %include "probe-table.inc"           ; STREAM C (shared, reserved)

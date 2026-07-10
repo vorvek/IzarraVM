@@ -88,11 +88,8 @@ impl CpuGsw {
     /// The CS-load hook: a CS load never flushes the decode cache. The cache is keyed by LINEAR
     /// address, and every other decode input a CS load could change is re-checked on each hit
     /// instead of being flushed away here: the D bit is part of the line (`DecodeLine::d`,
-    /// compared in `get`), the fetch limit is re-checked at both hit sites (a violation misses
-    /// to `decode`, which raises the exact fault), and the firmware-ROM ISA-gate exemption marks
-    /// its
-    /// instructions no-cache at decode so a cached line never carries an exemption across a
-    /// privilege change. This matters because pmode workloads
+    /// compared in `get`), and the fetch limit is re-checked at both hit sites (a violation misses
+    /// to `decode`, which raises the exact fault). This matters because pmode workloads
     /// load CS at every interrupt edge and V86 monitor round-trip: the Doom 586 census measured
     /// 326M whole-cache CS-load flushes in a 12.4G-instruction timedemo (one per ~38
     /// instructions), pinning decode_hit at 21% regardless of cache size.
@@ -522,17 +519,6 @@ impl CpuGsw {
             debug_assert_eq!(self.cpl, 3, "a V86 task is always CPL 3");
         }
         self.cpl
-    }
-
-    /// True when CS points into the BIOS ROM: the real-mode F-segment aperture
-    /// (0xF0000..0xFFFFF, which also covers the FF00:0000 IRET stub) or its high
-    /// reset alias. The instruction-set gate skips ROM code so firmware always runs
-    /// the full ISA. After the guest picks a lower GSW mode through the boot menu,
-    /// the BIOS still finishes Accept, services interrupts, and boots unrestricted;
-    /// only guest code, which never executes from the ROM, is held to the level.
-    pub(super) fn cs_in_firmware_rom(&self) -> bool {
-        let base = self.registers.cs().base;
-        (0x000F_0000..=0x000F_FFFF).contains(&base) || base >= 0xFFFF_0000
     }
 
     pub fn linear_eip(&self) -> u32 {

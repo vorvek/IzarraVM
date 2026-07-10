@@ -10,7 +10,7 @@ machine, and this manual reproduces its manual.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
-| CPU | GSW-586, a Pentium MMX-class part at 200 MHz on a 66 MHz bus. Toka-DOS can throttle it to 486DX2 66 MHz, 386DX 25 MHz, or a slower 286-class mode, without rebooting. |
+| CPU | GSW-586, a Pentium MMX-class part at 200 MHz on a 66 MHz bus. Toka-DOS can throttle it to a 486DX2 at 66 MHz, a 386DX at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
 | Memory | 24 MB SDRAM, with Toka-DOS mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), and OPL3 FM. |
@@ -73,7 +73,7 @@ menu finds media to boot from; an unavailable row is drawn in grey.
 | Fast 586 | GSW-586 at full speed | 2 |
 | Slow 486 | 486DX2-equivalent | 1 |
 | VSlow 386 | 386DX-equivalent | 0 |
-| SSlow 286 | 286-equivalent, the slowest tier | 3 |
+| SSlow 386 | 386DX-equivalent at 7.33 MHz, the slowest tier | 3 |
 
 Accepting the menu writes the chosen speed to the Lotura chipset's mode port
 immediately (the CPU actually changes speed class right there) and saves
@@ -97,7 +97,7 @@ box changes to describe whatever row is highlighted.
 | --- | --- |
 | **Time** | Opens a sub-page to set the clock: hour, minute, second, day, month, year. Left/Right picks the field, Up/Down (or Enter) changes it, Esc returns. |
 | **Keyboard** | Cycles the active keyboard layout with Left/Right (or Enter). Seventeen layouts are available (US, UK, Spanish, French, German, Italian, and others). |
-| **CPU Mode** | Cycles the boot-time CPU speed with Left/Right (or Enter): 386, 486, 586, then 286, wrapping, the same four classes as the Tab boot menu, in the same order the hardware answers them. |
+| **CPU Mode** | Cycles the boot-time CPU speed with Left/Right (or Enter): 386, 486, 586, then 386-slow, wrapping, in the same order as the Tab boot menu. |
 | **Peripherals** | Opens a sub-page that re-runs the POST hardware checks live (they are non-destructive) and lists each as PASS or FAIL: Lotura, 8042 KBD, PIT Timer, COM1 UART, SB DSP, OPL FM, and Margo VGA. |
 | **Repair Toka-DOS** | Reinstalls Toka-DOS onto the hard disk from the ROM's built-in image, for when the installed copy is damaged or missing. Reports "Toka-DOS repaired" on success. See [Repair Toka-DOS](../toka-dos/using-toka-dos.md#repair-toka-dos) for exactly what this touches. |
 | **Save and Exit** | Commits the working copy (keyboard layout and CPU mode to CMOS, the clock to the real-time clock if you changed it) and reboots. |
