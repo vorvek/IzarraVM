@@ -60,6 +60,8 @@ fn identify_round_trips_geometry() {
     assert_eq!(word(1), 4); // cylinders
     assert_eq!(word(3), 16); // heads
     assert_eq!(word(6), 63); // sectors per track
+    assert_ne!(word(49) & (1 << 9), 0, "LBA is advertised");
+    assert_eq!(word(49) & (1 << 8), 0, "DMA is not advertised");
     let lba = u32::from(word(60)) | (u32::from(word(61)) << 16);
     assert_eq!(lba, disk_sectors as u32);
     // The drain dropped DRQ and returned to ready.
