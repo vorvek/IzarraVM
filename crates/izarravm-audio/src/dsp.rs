@@ -717,30 +717,26 @@ impl SbDsp {
         B: FnMut() -> Option<u8>,
     {
         loop {
-            match self.adpcm.as_mut() {
-                Some(state) => {
-                    if let Some(sample) = state.buf.pop_front() {
-                        return Some(sample);
-                    }
+            {
+                let state = self.adpcm.as_mut()?;
+                if let Some(sample) = state.buf.pop_front() {
+                    return Some(sample);
                 }
-                None => return None,
             }
             if !self.playing {
                 return None;
             }
             let byte = byte_fetch()?;
             self.advance_block(1);
-            match self.adpcm.as_mut() {
-                Some(state) => {
-                    if state.haveref {
-                        state.haveref = false;
-                        state.reference = byte;
-                        state.step = 0;
-                    } else {
-                        state.decode_byte(byte);
-                    }
+            {
+                let state = self.adpcm.as_mut()?;
+                if state.haveref {
+                    state.haveref = false;
+                    state.reference = byte;
+                    state.step = 0;
+                } else {
+                    state.decode_byte(byte);
                 }
-                None => return None,
             }
         }
     }

@@ -372,8 +372,8 @@ fn beige_visuals(ui: &mut egui::Ui) {
         &mut v.widgets.hovered,
         &mut v.widgets.active,
     ] {
-        w.bg_stroke = egui::Stroke::new(1.0, BEVEL_LO);
-        w.fg_stroke = egui::Stroke::new(1.0, INK);
+        w.bg_stroke = egui::Stroke::new(1.0_f32, BEVEL_LO);
+        w.fg_stroke = egui::Stroke::new(1.0_f32, INK);
     }
     v.widgets.inactive.bg_fill = FACEPLATE;
     v.widgets.inactive.weak_bg_fill = FACEPLATE;
@@ -383,7 +383,7 @@ fn beige_visuals(ui: &mut egui::Ui) {
     v.widgets.active.weak_bg_fill = BEVEL_LO;
     // A pressed segmented control reads as recessed.
     v.selection.bg_fill = BEVEL_LO;
-    v.selection.stroke = egui::Stroke::new(1.0, INK);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, INK);
 }
 
 /// Draw the four bevel edges over `rect`: highlight on the top and left, shadow
@@ -395,8 +395,8 @@ fn bevel_edges(painter: &egui::Painter, rect: egui::Rect, raised: bool) {
     } else {
         (BEVEL_LO, BEVEL_HI)
     };
-    let top = egui::Stroke::new(1.0, hi);
-    let bot = egui::Stroke::new(1.0, lo);
+    let top = egui::Stroke::new(1.0_f32, hi);
+    let bot = egui::Stroke::new(1.0_f32, lo);
     painter.line_segment([rect.left_top(), rect.right_top()], top);
     painter.line_segment([rect.left_top(), rect.left_bottom()], top);
     painter.line_segment([rect.left_bottom(), rect.right_bottom()], bot);
@@ -465,7 +465,7 @@ fn beige_window(
         .frame(
             egui::Frame::new()
                 .fill(PANEL_FACE)
-                .stroke(egui::Stroke::new(1.5, BEVEL_LO))
+                .stroke(egui::Stroke::new(1.5_f32, BEVEL_LO))
                 .inner_margin(egui::Margin {
                     left: 14,
                     right: 14,
@@ -492,7 +492,7 @@ fn info_button(ui: &mut egui::Ui) -> egui::Response {
     let rect = resp.rect;
     let c = rect.center();
     let r = (h * 0.32).round();
-    let stroke = egui::Stroke::new(1.5, INK);
+    let stroke = egui::Stroke::new(1.5_f32, INK);
     let p = ui.painter();
     p.circle_stroke(c, r, stroke);
     // The dot and stem of the lowercase "i".
@@ -562,7 +562,7 @@ fn activity_led(ui: &mut egui::Ui, lit: bool) {
     ui.painter().rect_stroke(
         rect,
         1.0,
-        egui::Stroke::new(0.5, BEVEL_LO),
+        egui::Stroke::new(0.5_f32, BEVEL_LO),
         egui::StrokeKind::Inside,
     );
 }
@@ -584,7 +584,7 @@ fn eject_button(ui: &mut egui::Ui, enabled: bool) -> bool {
         .add(egui::Shape::convex_polygon(tri, col, egui::Stroke::NONE));
     ui.painter().line_segment(
         [c + egui::vec2(-4.0, 4.0), c + egui::vec2(4.0, 4.0)],
-        egui::Stroke::new(1.5, col),
+        egui::Stroke::new(1.5_f32, col),
     );
     enabled && resp.clicked()
 }
@@ -614,7 +614,7 @@ fn volume_icon(ui: &mut egui::Ui) {
     ui.painter()
         .add(egui::Shape::convex_polygon(cone, LABEL, egui::Stroke::NONE));
     // Two sound-wave chevrons to the right.
-    let stroke = egui::Stroke::new(1.2, LABEL);
+    let stroke = egui::Stroke::new(1.2_f32, LABEL);
     ui.painter().line_segment(
         [
             egui::pos2(left + 14.0, cy - 2.5),
@@ -1918,7 +1918,7 @@ impl GuiApp {
                         );
                     }
                     ui.painter()
-                        .circle_stroke(c, 6.0, egui::Stroke::new(1.0, BEVEL_LO));
+                        .circle_stroke(c, 6.0, egui::Stroke::new(1.0_f32, BEVEL_LO));
                 });
             },
         );
@@ -2539,7 +2539,7 @@ impl GuiApp {
                         egui::pos2(slot.left() + 5.0, seam),
                         egui::pos2(slot.right() - 5.0, seam),
                     ],
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3D, 0x38, 0x2D)),
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x3D, 0x38, 0x2D)),
                 );
                 let mounted = self.cd_label.is_some();
                 if eject_button(ui, running && mounted) {
