@@ -640,14 +640,13 @@ impl Machine {
                 self.set_int_frame_carry(false);
             }
             // C202 set sample rate (BH=rate code 0-6).
+            0x02 if self.keyboard.set_mouse_sample_rate_code(bh) => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
             0x02 => {
-                if self.keyboard.set_mouse_sample_rate_code(bh) {
-                    self.set_eax_ah(0x00);
-                    self.set_int_frame_carry(false);
-                } else {
-                    self.set_eax_ah(0x86);
-                    self.set_int_frame_carry(true);
-                }
+                self.set_eax_ah(0x86);
+                self.set_int_frame_carry(true);
             }
             // C203 set resolution (BH=0-3): no hardware resolution is modeled, so
             // accept and ignore.

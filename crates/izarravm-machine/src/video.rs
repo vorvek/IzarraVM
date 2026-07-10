@@ -590,11 +590,10 @@ impl Machine {
             // body is not modeled; accepting the call matches VGA BIOS probes.
             0x20 => {}
             // BL=30h: select text-mode scanline count for the next mode set.
-            0x30 if al <= 0x02 => {
-                if self.set_selected_text_scanlines(al) {
-                    self.set_eax_al(0x12);
-                }
+            0x30 if al <= 0x02 && self.set_selected_text_scanlines(al) => {
+                self.set_eax_al(0x12);
             }
+            0x30 => {}
             // BL=31h: default palette loading on mode set.
             0x31 if al <= 0x01 => {
                 self.vega

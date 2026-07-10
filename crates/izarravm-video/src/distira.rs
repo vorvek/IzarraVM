@@ -1299,20 +1299,18 @@ impl Distira {
                 self.clip_high_y = clip & 0xffff;
                 self.clip_low_y = (clip >> 16) & 0xffff;
             }
-            SST_NOP_CMD => {
-                if byte == 0 && value & 1 != 0 {
-                    self.fbi_pixels_in = 0;
-                    self.fbi_chroma_fail = 0;
-                    self.fbi_zfunc_fail = 0;
-                    self.fbi_afunc_fail = 0;
-                    self.fbi_pixels_out = 0;
-                }
+            SST_NOP_CMD if byte == 0 && value & 1 != 0 => {
+                self.fbi_pixels_in = 0;
+                self.fbi_chroma_fail = 0;
+                self.fbi_zfunc_fail = 0;
+                self.fbi_afunc_fail = 0;
+                self.fbi_pixels_out = 0;
             }
-            SST_FASTFILL_CMD => {
-                if byte == 0 {
-                    self.run_fastfill();
-                }
+            SST_NOP_CMD => {}
+            SST_FASTFILL_CMD if byte == 0 => {
+                self.run_fastfill();
             }
+            SST_FASTFILL_CMD => {}
             SST_SWAPBUFFER_CMD => {
                 merge_byte(&mut self.swapbuffer_command, byte, value);
                 if byte == 3 {
@@ -1335,11 +1333,10 @@ impl Distira {
             SST_CMD_FIFO_RD_PTR => merge_byte(&mut self.cmd_fifo_read_ptr, byte, value),
             SST_CMD_FIFO_AMIN => merge_byte(&mut self.cmd_fifo_amin, byte, value),
             SST_CMD_FIFO_AMAX => merge_byte(&mut self.cmd_fifo_amax, byte, value),
-            SST_CMD_FIFO_DEPTH => {
-                if byte == 0 && value == 0 {
-                    self.command_fifo.clear();
-                }
+            SST_CMD_FIFO_DEPTH if byte == 0 && value == 0 => {
+                self.command_fifo.clear();
             }
+            SST_CMD_FIFO_DEPTH => {}
             SST_CMD_FIFO_HOLES => merge_byte(&mut self.cmd_fifo_holes, byte, value),
             SST_FBI_INIT4 => self.write_fbi_init(4, byte, value),
             SST_BACK_PORCH => merge_byte(&mut self.back_porch, byte, value),

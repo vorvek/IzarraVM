@@ -1071,6 +1071,7 @@ fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
 /// Map a Windows LANGID to one of the 17 guest layout indices. Regions that
 /// share a language but use different keyboards are matched on the full LANGID
 /// first; everything else falls back to the primary-language default, then US.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn layout_index_from_langid(langid: u16) -> u8 {
     match langid {
         0x0809 => return 1,          // en-GB -> UK
