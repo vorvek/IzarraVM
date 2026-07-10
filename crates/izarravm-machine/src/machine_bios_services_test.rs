@@ -675,7 +675,7 @@ fn int14_fossil_screen_and_info_calls_are_minimal_but_stable() {
     m.cpu.registers.set_eax(0x1541);
     m.handle_int14();
     let cell = (4 * 80 + 7) * 2;
-    assert_eq!(m.video.read_u8(cell).unwrap(), b'A');
+    assert_eq!(m.video().read_u8(cell).unwrap(), b'A');
 
     m.cpu
         .registers

@@ -206,7 +206,7 @@ fn live_mode_switches_keep_one_master_deadline_and_device_phase() {
     baseline.set_mode(GswMode::Gsw386Slow);
     baseline.advance_devices_ticks(actual_ticks);
     assert_eq!(machine.timeline, baseline.timeline);
-    assert_eq!(machine.video.beam_dots(), baseline.video.beam_dots());
+    assert_eq!(machine.video().beam_dots(), baseline.video().beam_dots());
     assert_eq!(machine.pit.channel_out(0), baseline.pit.channel_out(0));
     assert_eq!(machine.pit.channel_out(2), baseline.pit.channel_out(2));
 }
@@ -234,7 +234,7 @@ fn storage_stall_advances_pit_audio_video_and_the_timeline() {
         bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
     });
     let ticks_before = machine.master_ticks();
-    let beam_before = machine.video.beam_dots();
+    let beam_before = machine.video().beam_dots();
     let pit_before = machine.pit.channel_out(2);
 
     machine.stall_for(0.010);
@@ -243,7 +243,7 @@ fn storage_stall_advances_pit_audio_video_and_the_timeline() {
         machine.master_ticks() - ticks_before,
         izarravm_core::MASTER_CLOCK_HZ / 100
     );
-    assert_ne!(machine.video.beam_dots(), beam_before);
+    assert_ne!(machine.video().beam_dots(), beam_before);
     assert_ne!(machine.pit.channel_out(2), pit_before);
     assert!(
         machine.speaker.drain(441).iter().any(|&sample| sample != 0),
@@ -277,7 +277,7 @@ fn splitting_a_time_advance_preserves_device_state_and_irq_order() {
     assert_eq!(split.timeline, whole.timeline);
     assert_eq!(split.pit, whole.pit);
     assert_eq!(split.pic, whole.pic);
-    assert_eq!(split.video.beam_dots(), whole.video.beam_dots());
+    assert_eq!(split.video().beam_dots(), whole.video().beam_dots());
     assert_eq!(split.speaker.drain(100), whole.speaker.drain(100));
 }
 

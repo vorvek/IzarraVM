@@ -248,20 +248,15 @@ fn load_asymmetric_stereo(machine: &mut Machine, frames: u32) {
 
 // Run one closure against a freshly-borrowed bus over the whole machine.
 fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
-    // Captured before the struct literal below since video/trace are also
+    // Captured before the struct literal below since VEGA and trace are also
     // mutably borrowed by other fields in that same literal.
-    let beam_at_batch_start = machine.video.beam_dots();
+    let beam_at_batch_start = machine.vega.beam_dots();
     let trace_elapsed_at_batch_start = machine.trace.elapsed_clocks();
     let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(machine.cpu.level());
     let mut bus = MachineBus {
         memory: &mut machine.memory,
         ram_lookup: &mut machine.ram_lookup,
-        video: &mut machine.video,
-        margo: &mut machine.margo,
-        margo_active: machine.margo_active,
-        margo_linear: machine.margo_linear,
-        margo_bank: machine.margo_bank,
-        distira: &mut machine.distira,
+        vega: &mut machine.vega,
         pci: &mut machine.pci,
         rom: &machine.rom,
         serial: &mut machine.serial,
@@ -401,7 +396,7 @@ fn read_mmio_reg(machine: &mut Machine, offset: u32) -> u32 {
     value
 }
 
-// Regression: the HLE BIOS INT 10h graphics services mutate `self.video` directly
+// Regression: the HLE BIOS INT 10h graphics services mutate the legacy video Adapter
 // (bypassing the CPU bus), so the content generation must live inside the Vga
 // mutators, not on the bus, or a BIOS-drawing program would be frozen by the cache.
 // Each sub-case stays in an ALREADY-established graphics mode (same dims before and

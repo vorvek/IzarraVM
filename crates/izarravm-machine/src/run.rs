@@ -189,7 +189,7 @@ impl Machine {
             // batch's MachineBus is built (the one that matters for Slice 1).
             let timeline_at_batch_start = self.timeline;
             let master_ticks_at_batch_start = self.timeline.now_ticks();
-            let beam_at_batch_start = self.video.beam_dots();
+            let beam_at_batch_start = self.vega.beam_dots();
             let trace_elapsed_at_batch_start = trace_before;
             let bus_rem_at_batch_start = self.bus_rem;
             // bus_timing's (num, den), read from the same authoritative CPU mode
@@ -232,12 +232,7 @@ impl Machine {
                     cache_model,
                     memory,
                     ram_lookup,
-                    video,
-                    margo,
-                    margo_active,
-                    margo_linear,
-                    margo_bank,
-                    distira,
+                    vega,
                     rom,
                     serial,
                     serial2,
@@ -283,12 +278,7 @@ impl Machine {
                 let mut bus = MachineBus {
                     memory,
                     ram_lookup,
-                    video,
-                    margo,
-                    margo_active: *margo_active,
-                    margo_linear: *margo_linear,
-                    margo_bank: *margo_bank,
-                    distira,
+                    vega,
                     pci,
                     rom,
                     serial,
