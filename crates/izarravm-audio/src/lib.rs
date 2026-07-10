@@ -4,6 +4,7 @@ use izarravm_core::{AudioConfig, MidiBackend};
 
 mod dsp;
 mod mixer;
+mod mpu401;
 mod opl;
 mod output;
 mod pcm;
@@ -13,6 +14,7 @@ mod wss;
 
 pub use dsp::SbDsp;
 pub use mixer::SbMixer;
+pub use mpu401::{Mpu401, TimedMidiMessage};
 pub use opl::OplChip;
 pub use output::{AudioPlayer, AudioSink};
 pub use resample::Resampler;

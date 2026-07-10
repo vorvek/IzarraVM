@@ -3,14 +3,16 @@ pub use fat32::{
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
 };
 pub use fat32_volume::{Fat32Volume, build_fat32};
-use izarravm_audio::{Ad1848, Ad1848Config, OplChip, Resampler, SbDsp, SbMixer};
+use izarravm_audio::{
+    Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, SbDsp, SbMixer, TimedMidiMessage,
+};
 use izarravm_bus::{
     BusAccessKind, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead, DirectMemoryWrite,
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    CpuPersona, GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard,
-    WAVETABLE_MPU_BASE, WssConfig,
+    CpuPersona, GswMode, HardwareProfile, MIDI_INPUT_MPU_BASE, SoundBlasterConfig, TimingClass,
+    VideoCard, WAVETABLE_MPU_BASE, WssConfig,
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
@@ -106,6 +108,7 @@ const VGA_BIOS_INT1D_VIDEO_TABLE_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1D_VIDE
 const VGA_BIOS_FONT_TABLE_OFF: u16 = 0x2000;
 const VGA_BIOS_INT43_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_FONT_TABLE_OFF as u32;
 const VGA_BIOS_INT44_FONT_OFF: u16 = 0x3000;
+const MIDI_INPUT_IRQ: u8 = 9;
 const VGA_BIOS_INT44_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT44_FONT_OFF as u32;
 const VGA_BIOS_INT1F_FONT_OFF: u16 = 0x3800;
 const VGA_BIOS_INT1F_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1F_FONT_OFF as u32;
@@ -770,6 +773,8 @@ pub struct Machine {
     dsp_sample_phase: f64, // fractional DSP samples owed to the DMA playback clock
     last_audio_clocks: u64, // for HLE guest-time driven sample counts in render (Phase 4)
     mixer: SbMixer,   // the CT1745 mixer: IRQ/DMA routing + volume attenuation
+    wavetable_mpu: Mpu401,
+    midi_input_mpu: Mpu401,
     // AD1848 / Windows Sound System codec. An always-on combo-card device that
     // decodes its own base/IRQ/DMA concurrently with the SB16 + OPL3 (no mode
     // switch). The codec is independent of the CT1745 mixer; its I6/I7 DAC
@@ -1099,6 +1104,8 @@ impl Machine {
             dsp_sample_phase: 0.0,
             last_audio_clocks: 0,
             mixer,
+            wavetable_mpu: Mpu401::default(),
+            midi_input_mpu: Mpu401::default(),
             wss,
             // Placeholder; sync_wss_resampler rebuilds this for the live rate on
             // first use, so the value here never reaches the DAC as-is.
@@ -1978,6 +1985,21 @@ impl Machine {
     pub fn dma_read_word(&mut self, channel: usize) -> Option<u16> {
         self.dma.read_word(channel, &mut self.memory)
     }
+
+    /// Queue host MIDI input at the MPU mapped to 0x330/0x331.
+    pub fn inject_midi_input(&mut self, bytes: &[u8]) -> usize {
+        let accepted = self.midi_input_mpu.inject_input(bytes);
+        if accepted != 0 {
+            self.pic.request(MIDI_INPUT_IRQ);
+        }
+        accepted
+    }
+
+    /// Take the next complete message written to the wavetable MPU at
+    /// 0x300/0x301. The MIDI engine drains this after each emulation pass.
+    pub fn take_wavetable_midi_message(&mut self) -> Option<TimedMidiMessage> {
+        self.wavetable_mpu.take_message()
+    }
 }
 
 struct MachineBus<'a> {
@@ -2007,6 +2029,8 @@ struct MachineBus<'a> {
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
     mixer: &'a mut SbMixer,
+    wavetable_mpu: &'a mut Mpu401,
+    midi_input_mpu: &'a mut Mpu401,
     // The AD1848 codec and its config-region base. The port decode routes the 8
     // ports in [wss_base, wss_base+8) to read_port/write_port when enabled; the
     // DMA/IRQ feed lives on the owning Machine in advance_devices, not here.
