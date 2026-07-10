@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; vcpipic.com -- TOKAEMM VCPI DE0B remapped-PIC IRQ5 smoke test.
 ; Assemble: nasm -f bin vcpipic.asm -o vcpipic.com
 cpu 386
@@ -32,6 +35,9 @@ start:
     mov [es:0x25 * 4 + 2], cs
     mov word [ticks], 0
 
+    mov al, 0xDF                  ; DE0B preserves this IRQ5-only mask
+    out 0x21, al
+
     mov ax, 0xDE0B
     mov bx, 0x20
     mov cx, 0x28
@@ -50,10 +56,6 @@ start:
 
     call reset_dsp
     jc fail_dsp
-
-    in al, 0x21
-    and al, 0xDF
-    out 0x21, al
 
     sti
     mov al, 0xF2                  ; immediate 8-bit DSP IRQ

@@ -51,6 +51,16 @@ fn pio_sector_ticks() -> u64 {
     (SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(PIO_BYTES_PER_SECOND as u128) as u64
 }
 
+/// Time from command acceptance through the final sector boundary for a PIO
+/// media transfer. The BIOS fixed-disk path uses the same disk and deadline as
+/// the ATA task-file path, without charging for guest data-port instructions.
+pub(crate) fn pio_transfer_ticks(sectors: u32) -> u64 {
+    if sectors == 0 {
+        return 0;
+    }
+    COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks().saturating_mul(u64::from(sectors)))
+}
+
 /// ATA status register bits.
 mod status {
     pub const ERR: u8 = 0x01; // error: consult the error register
@@ -690,10 +700,7 @@ impl AtaDisk {
         self.pio_lba = lba;
         self.pio_sectors_remaining = count;
         self.last_access_bytes = 0;
-        self.schedule(
-            PendingAction::PrepareRead,
-            COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks()),
-        );
+        self.schedule(PendingAction::PrepareRead, pio_transfer_ticks(1));
     }
 
     fn prepare_read_sector(&mut self) {

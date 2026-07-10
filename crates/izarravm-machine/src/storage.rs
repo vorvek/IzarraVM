@@ -907,8 +907,9 @@ impl Machine {
             0x15 => self.int13_hdd_dasd(),
             // EDD install check.
             0x41 => self.int13_edd_install_check(),
-            // EDD extended read/write via a Disk Address Packet at DS:SI.
-            0x42 | 0x43 => self.int13_edd_transfer(ah),
+            // EDD extended read, write, and verify via a Disk Address Packet at
+            // DS:SI.
+            0x42..=0x44 => self.int13_edd_transfer(ah),
             // EDD get extended drive parameters into a result buffer at DS:SI.
             0x48 => self.int13_edd_drive_params(),
             // Genuinely unknown subfunctions report invalid-function.
@@ -954,6 +955,13 @@ impl Machine {
         let cyl = u32::from(ch) | (u32::from(cl & 0xc0) << 2);
         let head = u32::from((self.cpu.registers.edx() as u16 >> 8) as u8);
         (cyl, head, sector)
+    }
+
+    /// Advance the shared machine clock for sectors moved directly by an INT
+    /// 13h fixed-disk service. Port-driven ATA commands schedule this deadline
+    /// themselves, so only the BIOS path calls this helper.
+    fn stall_for_hdd_sectors(&mut self, sectors: u32) {
+        self.stall_for_master_ticks(ata::pio_transfer_ticks(sectors));
     }
 
     /// AH=02/03 CHS read/write against the mounted hard disk. ES:BX is the buffer;
@@ -1014,6 +1022,7 @@ impl Machine {
                 self.booter_inert = true;
             }
         }
+        self.stall_for_hdd_sectors(u32::from(done));
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -1077,6 +1086,7 @@ impl Machine {
             done += 1;
         }
 
+        self.stall_for_hdd_sectors(u32::from(done));
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -1103,14 +1113,20 @@ impl Machine {
             self.set_int_frame_carry(true);
             return;
         };
-        let total = self.ata.as_ref().map_or(0, |d| d.total_sectors());
+        self.c_accesses += 1;
         let mut done: u8 = 0;
         for i in 0..count {
-            if start_lba + u32::from(i) >= total {
+            let readable = self
+                .ata
+                .as_ref()
+                .and_then(|d| d.read_lba(start_lba + u32::from(i)))
+                .is_some();
+            if !readable {
                 break;
             }
             done += 1;
         }
+        self.stall_for_hdd_sectors(u32::from(done));
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
@@ -1178,11 +1194,12 @@ impl Machine {
         self.set_int_frame_carry(false);
     }
 
-    /// EDD AH=42h/43h extended read/write. The Disk Address Packet at DS:SI holds
-    /// the block count and the 64-bit starting LBA; the transfer buffer is a
-    /// seg:off far pointer inside the packet. Only the low 32 bits of the LBA are
-    /// honored. Limit: the 64-bit-flat-buffer form (DAP bytes 16-23 when the
-    /// seg:off is 0xFFFF:0xFFFF) is not decoded; lift by reading the wide pointer.
+    /// EDD AH=42h/43h/44h extended read, write, and verify. The Disk Address
+    /// Packet at DS:SI holds the block count and the 64-bit starting LBA; reads
+    /// and writes use the seg:off transfer buffer inside the packet. Only the low
+    /// 32 bits of the LBA are honored. Limit: the 64-bit-flat-buffer form (DAP
+    /// bytes 16-23 when the seg:off is 0xFFFF:0xFFFF) is not decoded; lift by
+    /// reading the wide pointer.
     fn int13_edd_transfer(&mut self, ah: u8) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let si = self.cpu.registers.esi() as u16;
@@ -1212,25 +1229,35 @@ impl Machine {
         for i in 0..count {
             let l = lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * 512);
-            if ah == 0x42 {
-                let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
-                match data {
-                    Some(bytes) => self.write_guest_block(addr, &bytes),
-                    None => break,
+            match ah {
+                0x42 => {
+                    let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
+                    match data {
+                        Some(bytes) => self.write_guest_block(addr, &bytes),
+                        None => break,
+                    }
                 }
-            } else {
-                let bytes = self.read_guest_block(addr, 512);
-                let wrote = self
-                    .ata
-                    .as_mut()
-                    .map(|d| d.write_lba(l, &bytes))
-                    .unwrap_or(false);
-                if !wrote {
-                    break;
+                0x43 => {
+                    let bytes = self.read_guest_block(addr, 512);
+                    let wrote = self
+                        .ata
+                        .as_mut()
+                        .map(|d| d.write_lba(l, &bytes))
+                        .unwrap_or(false);
+                    if !wrote {
+                        break;
+                    }
                 }
+                0x44 => {
+                    if self.ata.as_ref().and_then(|d| d.read_lba(l)).is_none() {
+                        break;
+                    }
+                }
+                _ => unreachable!("EDD transfer dispatch validates AH"),
             }
             done += 1;
         }
+        self.stall_for_hdd_sectors(u32::from(done));
         // EDD writes the count actually moved back into the DAP block-count field.
         self.set_dap_blocks(dap, done);
         if done == count {
