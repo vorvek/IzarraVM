@@ -238,7 +238,7 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
                     // Present only the active visible region. `height` is the full
                     // beam frame (vtotal) including the vertical retrace/border the
                     // monitor never shows; cropping to the top `display_height`
-                    // (vdisp_end) rows is what makes the aspect-fill correct — it
+                    // (vdisp_end) rows is what makes the aspect-fill correct; it
                     // drops the black bottom bar a 320x200 mode would otherwise bake
                     // into the stretched image.
                     let w = raster.width as usize;
@@ -1048,7 +1048,7 @@ fn emulate(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // Channel closed (the GUI dropped the sender on exit) — same
+                    // Channel closed (the GUI dropped the sender on exit); same
                     // flush sequence as Shutdown before the thread ends.
                     machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
