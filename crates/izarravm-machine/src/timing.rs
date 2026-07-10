@@ -11,23 +11,6 @@ pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 
 impl Machine {
-    /// Consume `secs` of emulated time for a device operation that blocks the
-    /// guest (a floppy seek/read). Advancing both the timeline and the devices
-    /// by the same amount keeps timekeeping coupled, the way an instruction's own
-    /// clocks do. Guest time jumps forward; the GUI's realtime pacing then
-    /// turns that jump into a visible wall-clock wait. Mechanical duration is
-    /// independent of the active GSW speed.
-    pub(super) fn stall_for(&mut self, secs: f64) {
-        if secs <= 0.0 {
-            return;
-        }
-        // Floppy mechanics still expose seconds as f64. Convert once at this
-        // seam, rounding up to the first causal master tick. The floppy model can
-        // move to integer durations without changing device advance.
-        let master_ticks = (secs * izarravm_core::MASTER_CLOCK_HZ as f64).ceil() as u64;
-        self.stall_for_master_ticks(master_ticks);
-    }
-
     pub(super) fn stall_for_micros(&mut self, micros: u64) {
         let master_ticks = (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
             / 1_000_000)

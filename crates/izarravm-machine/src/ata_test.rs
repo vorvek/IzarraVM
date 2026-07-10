@@ -315,6 +315,26 @@ fn initialize_device_parameters_acks() {
     assert!(disk.take_irq());
 }
 
+#[test]
+fn initialized_geometry_translates_task_file_chs() {
+    let mut disk = marked_disk(64);
+    disk.write_port(PRIMARY_CMD_BASE + 2, 4); // four sectors per track
+    disk.write_port(PRIMARY_CMD_BASE + 6, 0x01); // head 1 means two heads
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x91);
+    advance_to_deadline(&mut disk);
+    assert!(disk.take_irq());
+
+    // CHS(1,1,1) maps through the programmed 2-head, 4-sector geometry to LBA 12.
+    disk.write_port(PRIMARY_CMD_BASE + 2, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 3, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 4, 1);
+    disk.write_port(PRIMARY_CMD_BASE + 5, 0);
+    disk.write_port(PRIMARY_CMD_BASE + 6, 0x01);
+    disk.write_port(PRIMARY_CMD_BASE + 7, 0x20);
+    advance_to_deadline(&mut disk);
+    assert_eq!(disk.read_port(PRIMARY_CMD_BASE), Some(12 + 0x10));
+}
+
 /// A tiny host-folder-backed disk: a real KateaTreeVolume over a temp folder.
 fn host_folder_disk(tag: &str) -> (AtaDisk, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("katea_ata_{}_{}", std::process::id(), tag));

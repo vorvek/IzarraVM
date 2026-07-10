@@ -55,19 +55,19 @@ fn access_duration_models_seek_latency_and_transfer() {
     let mut f = Floppy::from_image(vec![0u8; 1_474_560]).unwrap(); // 1.44M, HD
     // First read at track 0 (head starts there): no seek, no latency, just
     // the transfer of one sector at 62.5 KB/s.
-    let one_sector = f.access_duration_secs(0, 512);
-    assert!((one_sector - 512.0 / 62_500.0).abs() < 1e-9);
+    let one_sector = f.access_duration_ticks(0, 512);
+    assert_eq!(one_sector, 512 * MASTER_CLOCK_HZ / 62_500);
     // A read on the same track is transfer-only again (no fresh latency).
-    assert!((f.access_duration_secs(0, 512) - 512.0 / 62_500.0).abs() < 1e-9);
+    assert_eq!(f.access_duration_ticks(0, 512), one_sector);
     // Seeking to track 10 costs 10 steps of seek plus half a revolution of
     // rotational latency, on top of the transfer.
-    let seek_read = f.access_duration_secs(10, 512);
-    let expect = 0.003 * 10.0 + 0.2 / 2.0 + 512.0 / 62_500.0;
-    assert!((seek_read - expect).abs() < 1e-9, "{seek_read} vs {expect}");
+    let seek_read = f.access_duration_ticks(10, 512);
+    let expect = MASTER_CLOCK_HZ * 3 * 10 / 1_000 + MASTER_CLOCK_HZ / 10 + one_sector;
+    assert_eq!(seek_read, expect);
     // A full-stroke seek is clamped to 100 ms.
-    f.access_duration_secs(0, 0);
-    let full = f.access_duration_secs(79, 0);
-    assert!((full - (0.100 + 0.2 / 2.0)).abs() < 1e-9);
+    f.access_duration_ticks(0, 0);
+    let full = f.access_duration_ticks(79, 0);
+    assert_eq!(full, MASTER_CLOCK_HZ / 5);
 }
 
 #[test]
@@ -75,9 +75,9 @@ fn double_density_transfers_at_half_the_rate() {
     let mut hd = Floppy::from_image(vec![0u8; 1_474_560]).unwrap();
     let mut dd = Floppy::from_image(vec![0u8; 737_280]).unwrap();
     // Same bytes, same track: DD takes twice as long to transfer as HD.
-    let hd_t = hd.access_duration_secs(0, 4096);
-    let dd_t = dd.access_duration_secs(0, 4096);
-    assert!((dd_t - 2.0 * hd_t).abs() < 1e-9);
+    let hd_t = hd.access_duration_ticks(0, 4096);
+    let dd_t = dd.access_duration_ticks(0, 4096);
+    assert_eq!(dd_t, 2 * hd_t);
 }
 
 #[test]
