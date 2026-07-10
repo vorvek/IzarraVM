@@ -1606,7 +1606,7 @@ fn cms_probe_range_reads_open_bus_not_a_fault() {
 }
 
 #[test]
-fn unused_at_diagnostic_port_is_passive() {
+fn upper_dma_page_register_is_passive() {
     let mut m = int15_machine(16);
     let mut bus = m.make_bus();
     assert_eq!(bus.read_io(0x0099, BusWidth::Byte, 0, false).unwrap(), 0xff);
