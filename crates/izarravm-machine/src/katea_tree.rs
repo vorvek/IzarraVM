@@ -113,9 +113,9 @@ pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> Hos
     // `system_names`, so reconcile classifies them Skip and never materializes them:
     // this folder never touches the host filesystem unless the guest itself writes a
     // non-system file into C:\DOS.
-    // ponytail: a guest write into C:\DOS would try to materialize under
-    // root/DOS/<file>; atomic_write holds it if that host dir is absent. Fine for the
-    // read-only system folder; revisit only if guests routinely write there.
+    // A guest write into C:\DOS would try to materialize under root/DOS/<file>;
+    // atomic_write holds it if that host directory is absent. That is sufficient
+    // while this system folder remains read-only.
     let mut dos = TreeDir {
         host_path: root.join("DOS"),
         ..TreeDir::default()

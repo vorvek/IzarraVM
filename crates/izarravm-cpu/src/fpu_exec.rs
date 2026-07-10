@@ -1101,8 +1101,8 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         let rounded = fpu_round_rc(self.fpu.control, value);
         let negative = rounded.is_sign_negative();
-        // ponytail: BCD overflow past 18 digits is not detected (Quake never FBSTPs);
-        // add the packed-BCD indefinite if a title ever trips it.
+        // BCD overflow past 18 digits is not detected because the current game
+        // corpus never exercises FBSTP. Add the packed-BCD indefinite if needed.
         let mut magnitude = rounded.abs() as u64;
         let mut raw = [0u8; 9];
         for slot in raw.iter_mut() {
