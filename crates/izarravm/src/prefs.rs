@@ -10,8 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
-use izarravm_video::{DISTIRA_DEFAULT_RENDER_THREADS, normalize_distira_render_threads};
-
 /// File name for the GUI prefs, written next to the C: root.
 const PREFS_FILE: &str = "izarravm.conf";
 
@@ -125,8 +123,6 @@ pub struct GuiPrefs {
     /// attenuation applied host-side to the speaker only, independent of the card
     /// amp, so the beeps can be turned down or off.
     pub pc_speaker_volume: u32,
-    /// Distira Glide renderer worker count. Matches 86Box's choices: 1, 2, or 4.
-    pub glide_render_threads: u8,
     /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
     pub crt_style: CrtStyle,
     /// Hotkey that releases captured input. Default Ctrl+F2.
@@ -153,7 +149,6 @@ impl Default for GuiPrefs {
             master_volume: DEFAULT_VOLUME,
             amp_gain: DEFAULT_AMP_GAIN,
             pc_speaker_volume: DEFAULT_PC_SPEAKER_VOLUME,
-            glide_render_threads: DISTIRA_DEFAULT_RENDER_THREADS,
             crt_style: CrtStyle::Subtle,
             input_release: KeyBinding::new(true, false, false, "F2"),
             fullscreen: KeyBinding::new(true, false, false, "F11"),
@@ -191,8 +186,6 @@ impl GuiPrefs {
                 prefs.master_volume = prefs.master_volume.clamp(0.0, 1.0);
                 prefs.amp_gain = prefs.amp_gain.min(AMP_GAIN_MAX);
                 prefs.pc_speaker_volume = prefs.pc_speaker_volume.min(100);
-                prefs.glide_render_threads =
-                    normalize_distira_render_threads(prefs.glide_render_threads);
                 prefs
             }
             Err(err) => {

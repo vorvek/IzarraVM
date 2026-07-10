@@ -10,8 +10,6 @@ pub const DISTIRA_MODEL_VALUE: u32 = 1;
 pub const DISTIRA_TMU_COUNT: u32 = 2;
 pub const BIG_DISTIRA_CHIP_NAME: &str = "BigDistira";
 pub const SMALL_DISTIRA_CHIP_NAME: &str = "SmallDistira";
-pub const DISTIRA_DEFAULT_RENDER_THREADS: u8 = 2;
-pub const DISTIRA_RENDER_THREAD_CHOICES: [u8; 3] = [1, 2, 4];
 pub const DISTIRA_MAX_WIDTH: u32 = 640;
 pub const DISTIRA_MAX_HEIGHT: u32 = 480;
 

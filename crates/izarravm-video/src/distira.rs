@@ -11,14 +11,6 @@ mod registers;
 use raster_math::*;
 pub use registers::*;
 
-pub fn normalize_distira_render_threads(threads: u8) -> u8 {
-    if DISTIRA_RENDER_THREAD_CHOICES.contains(&threads) {
-        threads
-    } else {
-        DISTIRA_DEFAULT_RENDER_THREADS
-    }
-}
-
 const CONTROL_DITHER: u32 = 1 << 1;
 const STATUS_DISPLAY_ENABLED: u32 = 1 << 1;
 const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
@@ -104,7 +96,6 @@ pub struct Distira {
     dither_enabled: bool,
     clear_color: u32,
     command: u32,
-    render_threads: u8,
     intr_ctrl: u32,
     fbz_color_path: u32,
     fog_mode: u32,
@@ -235,7 +226,6 @@ impl Distira {
             dither_enabled: false,
             clear_color: 0,
             command: 0,
-            render_threads: DISTIRA_DEFAULT_RENDER_THREADS,
             intr_ctrl: 0,
             fbz_color_path: 0,
             fog_mode: 0,
@@ -358,14 +348,6 @@ impl Distira {
 
     pub const fn chip_names(&self) -> [&'static str; 2] {
         [BIG_DISTIRA_CHIP_NAME, SMALL_DISTIRA_CHIP_NAME]
-    }
-
-    pub const fn render_threads(&self) -> u8 {
-        self.render_threads
-    }
-
-    pub fn set_render_threads(&mut self, threads: u8) {
-        self.render_threads = normalize_distira_render_threads(threads);
     }
 
     pub fn display(&self) -> DistiraDisplay {

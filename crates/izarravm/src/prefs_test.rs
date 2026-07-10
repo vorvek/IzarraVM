@@ -9,7 +9,6 @@ fn round_trips_through_toml() {
         master_volume: 0.65,
         amp_gain: 55,
         pc_speaker_volume: 40,
-        glide_render_threads: 4,
         crt_style: CrtStyle::YeOlde,
         input_release: KeyBinding::new(true, true, false, "F4"),
         fullscreen: KeyBinding::new(false, false, true, "Enter"),
@@ -32,7 +31,6 @@ fn missing_keys_fall_back_to_defaults() {
     assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
     assert_eq!(parsed.amp_gain, DEFAULT_AMP_GAIN);
     assert_eq!(parsed.pc_speaker_volume, DEFAULT_PC_SPEAKER_VOLUME);
-    assert_eq!(parsed.glide_render_threads, 2);
     assert_eq!(
         parsed.crt_style,
         CrtStyle::Subtle,
@@ -77,23 +75,14 @@ fn crt_style_serialises_lowercase() {
 }
 
 #[test]
-fn glide_render_threads_are_limited_to_86box_choices() {
-    let mut path = std::env::temp_dir();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock")
-        .as_nanos();
-    path.push(format!(
-        "izarravm-prefs-{}-{}.conf",
-        std::process::id(),
-        nonce
-    ));
-    std::fs::write(&path, "glide_render_threads = 3\n").expect("write prefs");
-
-    let prefs = GuiPrefs::load(&path);
-    let _ = std::fs::remove_file(path);
-
-    assert_eq!(prefs.glide_render_threads, 2);
+fn retired_glide_render_threads_key_is_ignored_and_not_written() {
+    let prefs: GuiPrefs = toml::from_str("glide_render_threads = 4\n").unwrap();
+    assert_eq!(prefs, GuiPrefs::default());
+    assert!(
+        !toml::to_string(&prefs)
+            .unwrap()
+            .contains("glide_render_threads")
+    );
 }
 
 #[test]

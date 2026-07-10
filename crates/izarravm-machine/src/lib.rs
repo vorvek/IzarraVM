@@ -1025,7 +1025,7 @@ impl Machine {
         let active_mode = profile.cpu;
         cpu.set_mode(active_mode);
         let distira = Distira::new();
-        let pci = PciConfig::new(profile.video == VideoCard::Distira);
+        let pci = PciConfig::new();
         let memory = Memory::from_mib(profile.memory_mib)?;
         let ram_lookup = RamPageLookup::new(memory.len(), &pci);
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
@@ -1181,14 +1181,6 @@ impl Machine {
     /// the GUI to keep the full power-on screen and timing.
     pub fn set_fast_post(&mut self, fast: bool) {
         self.fast_post = fast;
-    }
-
-    pub fn distira_render_threads(&self) -> u8 {
-        self.distira.render_threads()
-    }
-
-    pub fn set_distira_render_threads(&mut self, threads: u8) {
-        self.distira.set_render_threads(threads);
     }
 
     pub fn drain_distira_fifo(&mut self) {
