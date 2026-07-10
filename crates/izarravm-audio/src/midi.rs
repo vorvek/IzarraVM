@@ -10,6 +10,7 @@ use tracing::warn;
 
 const ALL_NOTES_OFF: u8 = 123;
 const MAX_PENDING_MESSAGES: usize = 4_096;
+const MAX_STAGED_FRAMES: usize = SAMPLE_RATE_HZ as usize / 10;
 
 enum MidiAdapter {
     Off,
@@ -43,7 +44,8 @@ pub struct MidiEngine {
     adapter: MidiAdapter,
     status: MidiStatus,
     pending: VecDeque<TimedMidiMessage>,
-    rendered_frames: u64,
+    staged: VecDeque<(i16, i16)>,
+    guest_frame_cursor: u64,
     scratch: Vec<i16>,
     role: MidiRole,
     config: MidiConfig,
@@ -63,7 +65,8 @@ impl MidiEngine {
             adapter: MidiAdapter::Off,
             status: MidiStatus::Ready,
             pending: VecDeque::new(),
-            rendered_frames: 0,
+            staged: VecDeque::with_capacity(MAX_STAGED_FRAMES),
+            guest_frame_cursor: 0,
             scratch: Vec::new(),
             role,
             config: config.clone(),
@@ -105,50 +108,69 @@ impl MidiEngine {
         }
     }
 
-    /// Render native synthesis into an existing 44.1 kHz stereo mix.
+    /// Render guest-timed native synthesis into an existing 44.1 kHz stereo mix.
     ///
-    /// Guest timestamps map to absolute mixer frames. Splitting the same render
-    /// span into smaller calls therefore leaves event offsets unchanged.
-    pub fn render(&mut self, output: &mut [(i16, i16)]) {
+    /// Native PCM advances only as far as `guest_tick`, then waits in a bounded
+    /// 100 ms staging queue for the wall-time mixer. A full queue keeps its oldest
+    /// audio and resumes synthesis after the mixer drains space.
+    pub fn render(&mut self, output: &mut [(i16, i16)], guest_tick: u64) {
         if output.is_empty() {
             return;
         }
 
-        let sample_count = output.len().saturating_mul(2);
-        self.scratch.resize(sample_count, 0);
+        let target = sample_frame_for_tick(guest_tick).max(self.guest_frame_cursor);
+        if matches!(self.adapter, MidiAdapter::Fluid(_) | MidiAdapter::Munt(_)) {
+            self.stage_until(target);
+        } else {
+            self.guest_frame_cursor = target;
+        }
+
+        for frame in output {
+            let Some(samples) = self.staged.pop_front() else {
+                break;
+            };
+            frame.0 = frame.0.saturating_add(samples.0);
+            frame.1 = frame.1.saturating_add(samples.1);
+        }
+    }
+
+    fn stage_until(&mut self, target: u64) {
+        let available = MAX_STAGED_FRAMES.saturating_sub(self.staged.len());
+        let start = self.guest_frame_cursor;
+        let end = start.saturating_add(available as u64).min(target);
+        let frame_count = end.saturating_sub(start) as usize;
+        self.scratch.resize(frame_count.saturating_mul(2), 0);
         self.scratch.fill(0);
 
-        let start = self.rendered_frames;
-        let end = start.saturating_add(output.len() as u64);
         let mut cursor = 0usize;
         while let Some(message) = self.pending.front() {
             let event_frame = sample_frame_for_tick(message.guest_tick);
             if event_frame > end {
                 break;
             }
-            let offset = event_frame.saturating_sub(start).min(output.len() as u64) as usize;
+            let offset = event_frame.saturating_sub(start).min(frame_count as u64) as usize;
             if !render_adapter(&mut self.adapter, &mut self.scratch[cursor * 2..offset * 2]) {
                 self.fail_native();
-                break;
+                return;
             }
             cursor = offset;
             let message = self.pending.pop_front().expect("front message exists");
             if !send_native(&mut self.adapter, &message.bytes) {
                 self.fail_native();
-                break;
+                return;
             }
         }
         if !matches!(self.adapter, MidiAdapter::Silent)
             && !render_adapter(&mut self.adapter, &mut self.scratch[cursor * 2..])
         {
             self.fail_native();
+            return;
         }
 
-        for (frame, samples) in output.iter_mut().zip(self.scratch.chunks_exact(2)) {
-            frame.0 = frame.0.saturating_add(samples[0]);
-            frame.1 = frame.1.saturating_add(samples[1]);
+        for samples in self.scratch.chunks_exact(2) {
+            self.staged.push_back((samples[0], samples[1]));
         }
-        self.rendered_frames = end;
+        self.guest_frame_cursor = end;
     }
 
     pub fn reconfigure(&mut self, config: &MidiConfig) {
@@ -213,6 +235,7 @@ impl MidiEngine {
     fn fail_native(&mut self) {
         self.adapter = MidiAdapter::Silent;
         self.pending.clear();
+        self.staged.clear();
         self.status = MidiStatus::InitializationFailed;
     }
 
@@ -228,6 +251,7 @@ impl MidiEngine {
         silence(&mut self.adapter);
         self.adapter = MidiAdapter::Off;
         self.pending.clear();
+        self.staged.clear();
     }
 }
 
