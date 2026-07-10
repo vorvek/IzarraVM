@@ -77,7 +77,7 @@ fn off_external_without_a_port_and_munt_without_roms_stay_actionable() {
     assert_eq!(munt.status(), MidiStatus::MissingRoms);
     let mut output = vec![(0, 0); 64];
     munt.send(&message(0, &[0x90, 60, 100]));
-    munt.render(&mut output);
+    munt.render(&mut output, tick_for_frame(64));
     assert!(output.iter().all(|frame| *frame == (0, 0)));
 }
 
@@ -106,12 +106,14 @@ fn pending_messages_are_ordered_by_guest_timestamp() {
 }
 
 #[test]
-fn backend_switch_keeps_the_absolute_render_cursor() {
+fn backend_switch_keeps_the_guest_cursor_and_discards_old_pcm() {
     let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
-    midi.render(&mut [(0, 0); 37]);
+    midi.render(&mut [(0, 0); 37], tick_for_frame(37));
+    midi.staged.push_back((1, 1));
     midi.reconfigure(&config(MidiBackend::Munt));
-    midi.render(&mut [(0, 0); 5]);
-    assert_eq!(midi.rendered_frames, 42);
+    assert!(midi.staged.is_empty());
+    midi.render(&mut [(0, 0); 5], tick_for_frame(42));
+    assert_eq!(midi.guest_frame_cursor, 42);
 }
 
 #[test]
@@ -126,7 +128,7 @@ fn embedded_fluidsynth_starts_a_note_at_its_guest_timed_offset() {
     midi.send(&message(128, &[0x90, 60, 110]));
 
     let mut output = vec![(0, 0); 2_048];
-    midi.render(&mut output);
+    midi.render(&mut output, tick_for_frame(2_048));
     let early_peak = output[..128]
         .iter()
         .flat_map(|frame| [frame.0, frame.1])
@@ -141,6 +143,88 @@ fn embedded_fluidsynth_starts_a_note_at_its_guest_timed_offset() {
         .unwrap();
     assert!(early_peak <= 2, "pre-note dither was {early_peak}");
     assert!(note_peak > 16, "note peak was only {note_peak}");
+}
+
+#[test]
+fn frozen_guest_time_does_not_advance_synthesis_past_later_events() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+
+    let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+    midi.send(&message(0, &[0xc0, 0]));
+    midi.render(&mut [(0, 0); 512], 0);
+    midi.render(&mut [(0, 0); 512], 0);
+    assert_eq!(midi.guest_frame_cursor, 0);
+
+    midi.send(&message(128, &[0x90, 60, 110]));
+    let mut output = vec![(0, 0); 2_048];
+    midi.render(&mut output, tick_for_frame(2_048));
+    let early_peak = output[..128]
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(i16::unsigned_abs)
+        .max()
+        .unwrap();
+    let note_peak = output[128..]
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(i16::unsigned_abs)
+        .max()
+        .unwrap();
+    assert!(early_peak <= 2, "pre-note dither was {early_peak}");
+    assert!(note_peak > 16, "note peak was only {note_peak}");
+}
+
+#[test]
+fn half_speed_guest_progress_keeps_the_event_offset_in_guest_pcm() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+
+    let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+    midi.send(&message(0, &[0xc0, 0]));
+    midi.render(&mut [(0, 0); 512], tick_for_frame(256));
+    assert_eq!(midi.guest_frame_cursor, 256);
+
+    midi.send(&message(320, &[0x90, 60, 110]));
+    let mut output = vec![(0, 0); 512];
+    midi.render(&mut output, tick_for_frame(512));
+    let early_peak = output[..64]
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(i16::unsigned_abs)
+        .max()
+        .unwrap();
+    let note_peak = output[64..256]
+        .iter()
+        .flat_map(|frame| [frame.0, frame.1])
+        .map(i16::unsigned_abs)
+        .max()
+        .unwrap();
+    assert!(early_peak <= 2, "pre-note dither was {early_peak}");
+    assert!(note_peak > 16, "note peak was only {note_peak}");
+    assert!(output[256..].iter().all(|frame| *frame == (0, 0)));
+}
+
+#[test]
+fn full_staging_keeps_old_audio_and_resumes_without_dropping_events() {
+    let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
+    let target = (MAX_STAGED_FRAMES + 256) as u64;
+    midi.queue(message((MAX_STAGED_FRAMES + 64) as u64, &[0x90, 60, 100]));
+
+    midi.stage_until(target);
+    assert_eq!(midi.staged.len(), MAX_STAGED_FRAMES);
+    assert_eq!(midi.guest_frame_cursor, MAX_STAGED_FRAMES as u64);
+    assert_eq!(midi.pending.len(), 1);
+
+    for _ in 0..128 {
+        midi.staged.pop_front();
+    }
+    midi.stage_until(target);
+    assert_eq!(midi.staged.len(), MAX_STAGED_FRAMES);
+    assert_eq!(midi.guest_frame_cursor, (MAX_STAGED_FRAMES + 128) as u64);
+    assert!(midi.pending.is_empty());
 }
 
 #[test]
@@ -161,7 +245,7 @@ fn missing_and_bad_custom_soundfonts_warn_status_and_use_the_embedded_bank() {
 
         midi.send(&message(0, &[0x90, 60, 110]));
         let mut output = vec![(0, 0); 2_048];
-        midi.render(&mut output);
+        midi.render(&mut output, tick_for_frame(2_048));
         assert!(output.iter().any(|frame| *frame != (0, 0)));
     }
 }

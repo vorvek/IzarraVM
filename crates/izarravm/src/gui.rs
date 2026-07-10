@@ -312,9 +312,10 @@ fn pump_audio(
     }
     // The card amp was applied inside render_audio (card sources only); `gain` here
     // is the host master volume, applied to the whole mix (card, speaker, and MIDI).
+    let guest_tick = machine.master_ticks();
     let mut pcm = machine.render_audio(samples);
-    wavetable.render(&mut pcm);
-    midi_receiver.render(&mut pcm);
+    wavetable.render(&mut pcm, guest_tick);
+    midi_receiver.render(&mut pcm, guest_tick);
     for (l, r) in &mut pcm {
         *l = (*l as f32 * gain)
             .round()
