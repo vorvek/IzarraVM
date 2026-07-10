@@ -13,8 +13,8 @@ pub struct VbeMode {
     pub bpp: u32,
 }
 
-/// The modes Margo lists, reports, and sets. Includes 8-bit indexed modes
-/// (slice 2b) and hi-color/true-color modes (slice 8): 15bpp, 16bpp, and 32bpp.
+/// The modes Margo lists, reports, and sets. Includes 8-bit indexed modes and
+/// 15bpp, 16bpp, and 32bpp direct-color modes.
 pub const MARGO_VBE_MODES: &[VbeMode] = &[
     VbeMode {
         number: 0x100,

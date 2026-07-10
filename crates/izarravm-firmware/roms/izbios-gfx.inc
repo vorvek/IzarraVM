@@ -261,8 +261,7 @@ console_step_line:
 
 ; icon_map: each wired component, mapped step-name -> colour sprite + cell. A row
 ; is  dw step_name_ptr, dw sprite_rle_ptr, dw cell_x, cell_y, cell_w, cell_h
-; (6 words = 12 bytes). All 7 icons are wired: VEGA/RAM/sound (Phase 2) and
-; CPU/floppy/HDD/optical (Phase 3). An absent device's probe FAILs, so its icon
+; (6 words = 12 bytes). All seven icons are wired. An absent device's probe fails, so its icon
 ; stays grey (e.g. HDD when C: is HLE-backed rather than a real ATA disk).
 icon_map:
     dw icon_name_video,   art_icon_0_rle, ICON_0_X, ICON_0_Y, ICON_0_W, ICON_0_H

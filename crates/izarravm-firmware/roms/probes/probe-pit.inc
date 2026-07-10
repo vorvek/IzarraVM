@@ -1,4 +1,4 @@
-; probes/probe-pit.inc - STREAM C: 8254 timer (PIT) probe.
+; 8254 timer (PIT) probe.
 ; Presence is proven through the control port (PORT_PIT_CTRL) and counter 0's
 ; data port (PORT_PIT_CH0) alone, so the check does not depend on the PIC or on
 ; IRQ0 being unmasked. We program counter 0 with a known control word, then issue
@@ -6,11 +6,11 @@
 ; live 8254 echoes the mode and access bits we just wrote; a missing or stuck
 ; port does not.
 ;
-; Note: the task suggested a counter-latch count readback (latch, read 0x40
-; twice). Under the live machine clock the counter is decrementing while the
+; A counter-latch count readback (latch, read 0x40 twice) is unsuitable here.
+; Under the live machine clock the counter is decrementing while the
 ; handler runs, so the latched count is timing dependent and a fixed comparison
 ; would be fragile. The status read-back proves the same device with a value the
-; model fixes deterministically, so we use it instead. See the stream risks.
+; model fixes deterministically, so we use it instead.
 
 POST_STEP "component.timer_pit", probe_pit
 

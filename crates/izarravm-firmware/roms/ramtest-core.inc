@@ -1,4 +1,4 @@
-; ramtest-core.inc - STREAM B (RAM test). Owns this file. Registers two POST
+; RAM test. Registers two POST
 ; steps in source order:
 ;   POST_STEP "memory.ramtest", ramtest_run        ; PASS/FAIL
 ;   POST_STEP "memory.detected_kib", ramtest_size   ; MEASURE, value in segment 0

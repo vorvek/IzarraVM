@@ -1,4 +1,4 @@
-; izbios-chime.inc - STREAM E: the power-on PC-speaker chime. play_chime plays a
+; Power-on PC-speaker chime. play_chime plays a
 ; four-note rising major arpeggio (about C5, E5, G5, C6) through PIT channel 2 and
 ; port 0x61 at the very start of POST, then silences the speaker. The note delay
 ; is cosmetic, so it runs through the same fast-POST gate the RAM count-up uses

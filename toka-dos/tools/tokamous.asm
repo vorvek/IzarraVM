@@ -68,7 +68,7 @@ cb_live_tmp     db 0                 ; scratch result byte for callback validati
 
 ; ---- INT 33h dispatcher ----
 ; A flat compare ladder over the core function set 0x00..0x10. AX > 0x10 falls
-; through to x33_high, which Task 3.4 fills in (today it just returns).
+; through to x33_high, which currently just returns.
 ; State is accessed CS-relative throughout (the TSR runs on the caller's DS).
 int33:
     sti
@@ -386,7 +386,7 @@ m_def_gfx_cursor:
     iret
 
 ; 0x0A define text cursor. BX==0 selects the software cursor: store the screen
-; and cursor masks. Rendering is Task 3.5. Returns nothing; preserve ALL (no
+; and cursor masks. Rendering is not implemented. Returns nothing; preserve ALL (no
 ; register is written).
 m_def_txt_cursor:
     cmp bx, 0
@@ -450,7 +450,7 @@ m_set_ratio:
     iret
 
 ; 0x10 conditional-off region. order(CX,SI) -> cond_left,cond_right and
-; order(DX,DI) -> cond_top,cond_bottom. Cursor hide-on-overlap is Task 3.5.
+; order(DX,DI) -> cond_top,cond_bottom. Cursor hide-on-overlap is not implemented.
 ; Returns nothing; preserve ALL (AX,BX are scratch).
 m_cond_off:
     push ax

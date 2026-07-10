@@ -1,8 +1,8 @@
 //! Sound Blaster 16-class DSP (CT1747) clean-room core: reset handshake,
 //! command/data protocol, 8-bit plus 16-bit single/auto-init DMA playback, and
 //! Creative ADPCM (4-bit, 2.6-bit, 2-bit) decode on the 8-bit DMA path. The
-//! CT1745 mixer lives next to this in the machine crate. Input/ADC and
-//! MIDI/MPU-401 are not modeled yet.
+//! CT1745 mixer lives next to this in the machine crate. Input/ADC is not
+//! modeled. MIDI and MPU-401 support lives in the sibling modules.
 
 use crate::pcm::{push_frame_capped, sample_i8, sample_i16, sample_u8, sample_u16};
 use std::collections::VecDeque;
@@ -168,7 +168,7 @@ pub struct SbDsp {
     direct_dac_byte: Option<u8>,
     test_reg: u8,
     speaker_on: bool,
-    // 8-bit DMA playback state (Tasks 5-6).
+    // 8-bit DMA playback state.
     rate_hz: u32,
     // Whether rate_hz was programmed as an interleaved BYTE rate (the 0x40 time
     // constant pre-multiplies by the channel count for stereo) rather than a
@@ -177,7 +177,7 @@ pub struct SbDsp {
     rate_is_byte_rate: bool,
     block_size: u32,
     block_remaining: u32,
-    // HLE pre-fetched block data for command + buffer level production (Phase 4).
+    // HLE block data prefetched for batched production.
     block_buffer: Option<Vec<u8>>,
     block_buffer_pos: usize,
     auto_init: bool,
@@ -656,8 +656,7 @@ impl SbDsp {
         }
     }
 
-    /// Batch render for HLE: produce up to n frames at once. Used to drive
-    /// production from guest elapsed time * rate in batch (Phase 4).
+    /// Produce up to `n` HLE frames from one elapsed-time batch.
     pub fn render_n_frames<B, W>(
         &mut self,
         n: usize,
@@ -679,7 +678,7 @@ impl SbDsp {
         out
     }
 
-    // HLE buffer accessors for command + buffer level (Phase 4).
+    // HLE block-buffer accessors.
     pub fn take_block_buffer(&mut self) -> Option<Vec<u8>> {
         self.block_buffer.take()
     }

@@ -1,6 +1,5 @@
-//! Cache geometry, tier costs and level config (Phase 3 carve).
-//! Pure const data and const fns extracted from machine/lib.rs monolith.
-//! No state, no hot-path logic; used by CacheModel.
+//! Cache geometry, tier costs, and level configuration.
+//! This module contains the constant data and functions used by `CacheModel`.
 
 use izarravm_core::{CpuPersona, GswMode};
 

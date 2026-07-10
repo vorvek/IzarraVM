@@ -1,4 +1,4 @@
-; probes/probe-sbdsp.inc - STREAM C: Sound Blaster DSP probes.
+; Sound Blaster DSP probes.
 ; Two POST steps: a PASS/FAIL reset handshake and a MEASURE of the DSP version.
 ; The reset routine writes 0x226 (1 then 0), lets the ~100us settle accrue
 ; through a busy-delay loop (advance_devices ticks the DSP per CPU clock), polls
@@ -8,7 +8,7 @@
 ; boot-suite/stage2.asm test_sb_dsp_reset.
 
 ; Sub-offsets inside the shared 256-byte PROBE_SCRATCH (0x0700). The upper half
-; keeps these clear of the lower-numbered Stream C probes' working bytes.
+; keeps these clear of the lower-numbered probes' working bytes.
 %define SBDSP_VER_HI   PROBE_SCRATCH + 0x40   ; stashed major byte (from 0xE1)
 %define SBDSP_VER_LO   PROBE_SCRATCH + 0x41   ; stashed minor byte
 %define SBDSP_VER_STR  PROBE_SCRATCH + 0x42   ; formatted "major.minor", ASCIIZ

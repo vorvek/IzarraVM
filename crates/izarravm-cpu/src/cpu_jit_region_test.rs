@@ -648,11 +648,9 @@ fn cold_decode_lines_defer_admission() {
     assert!(jit::block::try_admit(&mut cpu, ENTRY, true).is_some());
 }
 
-/// S2.2 end-to-end prototype (owner chose "prototype first"): wire the native-bookkeeping
-/// path (`emit_native_bookkeeping`, native arithmetic replacing the `region_inline_slot`
-/// CALL for inline slots), VERIFY it is bit-identical on the real drawcolumn, then time it
-/// A/B vs the CALL path through the real `run_straight_line`. The micro-benchmarks were
-/// confounded; this is the honest measurement.
+/// Compare native inline-slot bookkeeping with the `region_inline_slot` call
+/// path. The test first checks bit identity on the drawcolumn, then times both
+/// paths through `run_straight_line`.
 ///   cargo test -j8 -p izarravm-cpu --release --features jit s2_native_bookkeeping -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -660,7 +658,7 @@ fn s2_native_bookkeeping_prototype() {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    // Part 1: BIT-IDENTITY on the drawcolumn (native-bookkeeping region vs interpreter).
+    // Verify bit identity against the interpreter.
     jit::block::NATIVE_BOOKKEEPING.store(1, Ordering::Relaxed);
     {
         let mut interp = fresh_cpu(0xffff);
@@ -679,7 +677,7 @@ fn s2_native_bookkeeping_prototype() {
     jit::block::NATIVE_BOOKKEEPING.store(0, Ordering::Relaxed);
     eprintln!("native bookkeeping BIT-IDENTICAL on the drawcolumn (region vs interpreter)");
 
-    // Part 2: timed A/B through run_straight_line. Big memory so edi can advance across many
+    // Time both paths through run_straight_line. Big memory lets EDI advance across many
     // iterations; tracing off (representative of production, not the traced test bus).
     const ITERS: u32 = 200_000;
     let time_variant = |mode: u8| -> f64 {
@@ -707,7 +705,7 @@ fn s2_native_bookkeeping_prototype() {
     let call = time_variant(0);
     let native = time_variant(1);
     jit::block::NATIVE_BOOKKEEPING.store(0, Ordering::Relaxed);
-    eprintln!("\n=== S2.2 native-bookkeeping A/B (drawcolumn, ns/insn, best of 7) ===");
+    eprintln!("\n=== Native-bookkeeping A/B (drawcolumn, ns/insn, best of 7) ===");
     eprintln!("0. call bookkeeping (today's region) : {call:.3} ns/insn");
     eprintln!(
         "1. native bookkeeping (emit_native)  : {native:.3} ns/insn  ({:.2}x)",
@@ -718,9 +716,7 @@ fn s2_native_bookkeeping_prototype() {
         "      ~{:.0} ns iteration (~1%); even a fully-native version cannot move the",
         call * 15.0
     );
-    eprintln!(
-        "      drawcolumn. Its cost is the 7 memory slots' execute dispatch (the S2.4 lever)."
-    );
+    eprintln!("      drawcolumn. Most cost remains in the 7 memory-slot dispatches.");
     eprintln!("=== end A/B ===\n");
 }
 
@@ -753,11 +749,8 @@ fn region_is_byte_identical_on_the_direct_page_path() {
 
 /// Baseline drawcolumn region throughput on a production-representative harness (the one-op
 /// instruction-fetch charge and host-pointer direct pages, both matching MachineBus). The
-/// reference the eventual native-template build's A/B measures against. The full cost
-/// decomposition, and why the incremental fast paths (S2.2 bookkeeping, S2.4 memory) are not
-/// the lever, are in dev_docs/2026-07-08-s2.4-memory-fast-path-results.md: on this harness
-/// the drawcolumn is ~165 ns/iter with a flat cost distribution (no single 50% lever), so
-/// only a full native-template dynarec reaches the 6.7x target.
+/// reference for native-template A/B measurements. On this harness the
+/// drawcolumn is about 165 ns per iteration with no single dominant cost.
 ///   cargo test -j8 -p izarravm-cpu --release --features jit drawcolumn_region_baseline -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -785,9 +778,9 @@ fn drawcolumn_region_baseline() {
     eprintln!("drawcolumn region baseline: {best:.0} ns/iter (15 insns), representative harness");
 }
 
-/// Cost-fold native-LOAD smoke A/B on the drawcolumn (flat DS, unpaged, direct pages — the only
-/// mode where the fold fires; the anchors run PAGED so the fold is inert there and Doom is the
-/// real gate, per dev_docs). Times the same drawcolumn with the fold OFF then ON. RUN FILTERED
+/// Cost-fold native-LOAD smoke A/B on the drawcolumn. The fold fires only with
+/// flat DS, no paging, and direct pages. The anchors use paging, so the fold is
+/// inert there. Times the same drawcolumn with the fold off and on. Run filtered
 /// (this sets the process-global FOLD_TIMING; a concurrent flat-DS #[ignore] bench would see it):
 ///   cargo test -p izarravm-cpu --release --features jit drawcolumn_region_fold_ab -- --ignored --nocapture
 #[test]

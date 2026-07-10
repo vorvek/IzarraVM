@@ -338,9 +338,8 @@ impl CpuGsw {
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset);
-        // V86 trap tax measurement (dev_docs/2026-07-02-v86-trap-tax): a successful
-        // vector-13 delivery out of V86 is exactly one TOKAEMM round-trip (a V86
-        // sensitive-instruction #GP or a real IRQ5, both share this vector).
+        // Count each vector-13 delivery from V86 as one TOKAEMM monitor trip.
+        // Sensitive-instruction #GP faults and real IRQ5 both use this vector.
         if source_v86 && vector == 13 {
             self.perf.monitor_trips_vec13 += 1;
         }

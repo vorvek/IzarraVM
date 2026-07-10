@@ -1,11 +1,10 @@
-//! Generic forward-decode basic-block builder (DYN-S1). Starting at any hot linear PC,
+//! Generic forward-decode basic-block builder. Starting at any hot linear PC,
 //! `build_block` walks the decode cache forward, collecting continuable slots until the first
 //! block terminator, and `try_admit` compiles the result as a loop-region: emitted native code
 //! that chains one `region_step` call per slot, with a native back-edge for a self-loop and a
 //! return-to-interpreter for a linear block. Execution stays the proven v1/v2 trampoline (each
 //! slot runs through the interpreter's own dispatch, so per-slot SEMANTICS need no validation
-//! here); this stage delivers general block coverage plus the timing and terminator contracts,
-//! not the native-template speedup (that is S2).
+//! here). This delivers general block coverage plus the timing and terminator contracts.
 //!
 //! ## What the builder vouches for (the region's admission invariants)
 //!
@@ -13,7 +12,7 @@
 //!   `block_continuable`) covers MOST of the spec §2.9 terminator predicate, inverted: it excludes
 //!   control-flow mutators, CR/DR/segment/paging changers, HLT, far transfers, INT/IRET, MOV-CR/DR,
 //!   LGDT.., OUT, INS/OUTS, and the clock readers RDTSC/WRMSR (all non-continuable). IN and
-//!   TEST-acc-imm ARE admitted as interior continuations in the Approximate class (the P4a
+//!   TEST-acc-imm ARE admitted as interior continuations in the Approximate class (the
 //!   poll-loop win); they are runtime step-breaks, NOT compile-time terminators, and
 //!   `region_step`'s per-slot `requires_step_break()` check ends the block when a real device is
 //!   actually touched.
@@ -266,11 +265,10 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
 /// alignment. Harmless on SysV64 (no shadow space, but the alignment holds).
 const STACK_RESERVE: u32 = 56;
 
-/// Throwaway A/B mode for the S2.2 end-to-end prototype (owner: "prototype first"): controls how
-/// `emit_region` compiles the inline slots' bookkeeping. 0 = the `region_inline_slot` trampoline
-/// CALL (today); 1 = native arithmetic (`emit_native_bookkeeping`, still 3 call-outs); 2 = SKIP the
-/// bookkeeping entirely (INCORRECT clocks - a timing-ceiling probe bounding how much inline
-/// bookkeeping can ever cost). Read only at emit time. Not wired to production admission.
+/// Experimental A/B mode for inline-slot bookkeeping. Mode 0 calls the
+/// `region_inline_slot` trampoline, mode 1 emits native arithmetic with three
+/// callouts, and mode 2 skips bookkeeping to measure its upper cost bound.
+/// Mode 2 has incorrect clocks and is never used for production admission.
 pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
@@ -407,7 +405,7 @@ fn emit_region(
         );
         let do_group = is_inline && (fold_native || mode == 1);
         if do_group {
-            // Collect and emit a run of consecutive register-only inline slots (slice 3 folding).
+            // Collect and emit consecutive register-only inline slots.
             let group_start = i;
             let mut group_total_len: u8 = 0;
             while i < slots.len() {
@@ -1082,7 +1080,7 @@ fn emit_native_hit_counter(e: &mut Encoder, perf_field_off: usize) {
 /// overshoot ok, validated by anchor bands), and run the next slot's `line_live` probe (`jz exit` if
 /// the line died). `cost_off` is the `RegionCtx` offset of the per-entry cost constant to fold.
 /// NO `begin_instruction` (fold spec gate). ABI: scratch RAX/RCX/RDX; RBP=regs base, R12=cpu, R15=ctx.
-/// `len`/`count` support batched groups (slice 3/4). Cap uses cross-mult form (no div) and accounts
+/// `len` and `count` support batched groups. The cap uses cross-multiplication and accounts for
 /// pending folded_raw_bus for the effective bus delta.
 fn emit_fold_bookkeeping(
     e: &mut Encoder,
@@ -1106,7 +1104,7 @@ fn emit_fold_bookkeeping(
     e.add_r64_imm32(Reg::RAX, shadow_off);
     e.xor_r64_self(Reg::RDX);
     e.store_r8_disp8(Reg::RAX, 0, Reg::RDX);
-    // ctx.raw_clocks += 2 * count (for batched adjacent inlines in slice 3)
+    // ctx.raw_clocks += 2 * count for batched adjacent inlines.
     e.load_r64_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF);
     e.add_r64_imm32(Reg::RAX, 2 * u32::from(count)); // safe, count small
     e.store_r64_disp8(Reg::R15, RAW_CLOCKS_OFF, Reg::RAX);
@@ -1122,12 +1120,9 @@ fn emit_fold_bookkeeping(
     e.add_r64_r64(Reg::RAX, Reg::RCX);
     e.store_r64_disp32(Reg::R15, folded_off, Reg::RAX);
 
-    // NOTE (slice 4): batched cross-mult cap logic was prepared here but is disabled for now to
-    // keep exact cap boundary tests passing (coarsening can skip side-effect mem ops like dec
-    // or fault points in harness). Clock/insn/folded batching + line_live are active; cap
-    // checked via full step slots or back-edge. The cross-mult emit code is in the file for
-    // the final composition / pure-native loops. Sentinel + formula ready for re-enable.
-    // (When re-enabled, place after reg groups only or accept approx for fold tests.)
+    // Batched cap checks stay disabled because coarsening can skip side-effecting
+    // memory operations or fault points. Full step slots and the back edge still
+    // check the cap while clock, instruction, folded-cost, and liveness updates batch.
 
     // line_live(cpu, next_lin, d): the next slot's decode-line liveness (narrow-SMC guard). Kept per
     // native slot (fold spec REFINEMENT) so a self-patched step-immediate in the next slot is caught

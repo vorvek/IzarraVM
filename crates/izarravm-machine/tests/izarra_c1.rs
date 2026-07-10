@@ -1,8 +1,8 @@
-//! Integration coverage for Stream C1: the four simple port probes (Lotura
+//! Integration coverage for the four simple port probes (Lotura
 //! identity and mode, the 8042 keyboard controller, the PIT, and COM1). The test
 //! boots the real Izarra BIOS image, runs POST to completion, parses the VDTS
 //! result block out of guest memory, and asserts each probe's record by name.
-//! Records are order independent and other streams add their own, so every check
+//! Records are order independent and other probes add their own, so every check
 //! matches by name rather than by position.
 
 use izarravm_core::{GswMode, VideoCard};

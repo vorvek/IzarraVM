@@ -1,4 +1,4 @@
-//! Stream B integration tests: the RAM test sizes memory through INT 15h AH=88h
+//! Integration tests for RAM sizing through INT 15h AH=88h
 //! and pattern-checks it, publishing memory.ramtest (PASS/FAIL) and
 //! memory.detected_kib (MEASURE, total KiB) plus the INT 12h word.
 

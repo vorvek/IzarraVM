@@ -2,9 +2,8 @@
 ; component/peripheral probes, mode-13h status + setup page).
 ; Assemble with: nasm -f bin izarra-bios.asm -o izarra-bios.bin
 ;
-; This skeleton is the ONLY file that lists %includes. The order below is frozen;
-; each work-stream owns exactly one .inc file so parallel agents never edit a
-; shared file. izbios-tables.inc MUST stay last: it emits the POST step table that
+; This is the only file that lists includes. The order is fixed.
+; izbios-tables.inc must stay last because it emits the POST step table that
 ; POST_STEP accumulated across every prior include. izbios-art.inc (generated)
 ; sits right after the reset jump and before core/gfx/lfb because its geometry
 ; %defines are textual and must precede every routine that references them.
@@ -25,24 +24,24 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "kbd-layouts.inc"      ; foundation: scancode -> ASCII layout tables (17 layouts)
 %include "kbd-layout-meta.inc"  ; generated: kbd_layout_codepage table (cp index per layout)
 %include "izbios-result.inc"    ; foundation: POST_STEP macro + result_append
-%include "probes/probe-cpu.inc"      ; STREAM C: GSW CPU mode detection
-%include "probes/probe-margo.inc"    ; STREAM C: VEGA/Margo video (screen path)
-%include "ramtest-core.inc"          ; STREAM B
-%include "probe-table.inc"           ; STREAM C (shared, reserved)
-%include "probes/probe-lotura.inc"   ; STREAM C
-%include "probes/probe-kbd8042.inc"  ; STREAM C
-%include "probes/probe-pit.inc"      ; STREAM C
-%include "probes/probe-serial.inc"   ; STREAM C
-%include "probes/probe-sbdsp.inc"    ; STREAM C
-%include "probes/probe-opl.inc"      ; STREAM C
-%include "probes/probe-floppy.inc"   ; STREAM C: floppy disk controller (FDC MSR)
-%include "probes/probe-hdd.inc"      ; STREAM C: ATA hard disk (primary status)
-%include "probes/probe-optical.inc"  ; STREAM C: ATAPI optical (secondary signature)
-%include "setup-ui.inc"              ; STREAM D
-%include "izbios-boot.inc"           ; STREAM E: INT 19h bootstrap (boot_entry)
-%include "izbios-bootbox.inc"        ; STREAM E: boxed two-pane boot+speed menu
-%include "izbios-chime.inc"          ; STREAM E: power-on PC-speaker chime (play_chime)
-%include "izbios-logo.inc"           ; STREAM E: red "Izarra 3000" wordmark bitmap
+%include "probes/probe-cpu.inc"      ; GSW CPU mode detection
+%include "probes/probe-margo.inc"    ; VEGA/Margo video screen path
+%include "ramtest-core.inc"          ; RAM test
+%include "probe-table.inc"           ; shared probe table
+%include "probes/probe-lotura.inc"   ; Lotura controller
+%include "probes/probe-kbd8042.inc"  ; keyboard controller
+%include "probes/probe-pit.inc"      ; PIT
+%include "probes/probe-serial.inc"   ; serial port
+%include "probes/probe-sbdsp.inc"    ; Sound Blaster DSP
+%include "probes/probe-opl.inc"      ; OPL
+%include "probes/probe-floppy.inc"   ; floppy disk controller
+%include "probes/probe-hdd.inc"      ; ATA hard disk
+%include "probes/probe-optical.inc"  ; ATAPI optical drive
+%include "setup-ui.inc"              ; setup UI
+%include "izbios-boot.inc"           ; INT 19h bootstrap
+%include "izbios-bootbox.inc"        ; boot and speed menu
+%include "izbios-chime.inc"          ; power-on speaker chime
+%include "izbios-logo.inc"           ; Izarra 3000 wordmark
 %include "izbios-tables.inc"    ; foundation: MUST be last (emits the step table)
 
 ; INT 13h ROM entry at ROM offset 0xF000 (linear 0xFF000, i.e. FF00:0000).

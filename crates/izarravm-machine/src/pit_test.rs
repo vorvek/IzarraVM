@@ -207,7 +207,7 @@ fn simulated_out_after(counter: &Counter, clocks: u64) -> bool {
 
 #[test]
 fn analytic_out_after_matches_the_step_simulation_across_modes_and_phases() {
-    // Task 2.1 spike: every mode x a spread of reloads (even, odd, minimum
+    // Cover every mode across a spread of reloads (even, odd, minimum
     // legal, illegal, full-range) x every phase across two-plus periods x a
     // sweep of queried distances (0, 1, boundary-adjacent, a large
     // multi-period jump), matching out_after against clone-and-step.
@@ -354,7 +354,7 @@ fn analytic_out_after_declines_bcd_counters() {
 
 #[test]
 fn analytic_out_after_matches_on_channel1_and_channel2_defaults() {
-    // The actual Slice-2 call sites: channel 1 (DRAM refresh, mode 2) and
+    // Cover the production call sites: channel 1 (DRAM refresh, mode 2) and
     // channel 2 (speaker, mode 3), the two channels port 0x61 bits 4/5 read.
     let mut pit = Pit::default(); // channel 1 pre-seeded mode 2 count 18
     for clocks in [0u64, 1, 5, 17, 18, 19, 36, 37, 90, 91] {
@@ -417,7 +417,7 @@ fn lsb_then_msb_write_and_read() {
     assert_eq!(u16::from_le_bytes([lo, hi]), 0x1234);
 }
 
-// Slice 1: BCD counting. Control words set bit 0 (BCD).
+// BCD counting. Control words set bit 0 (BCD).
 const CW_MODE0_BCD: u8 = CW_MODE0 | 1;
 const CW_MODE2_BCD: u8 = CW_MODE2 | 1;
 
@@ -483,7 +483,7 @@ fn bcd_mode0_one_shot_decimal() {
 
 #[test]
 fn mode1_new_count_mid_pulse_waits_for_next_gate() {
-    // Slice 2: a longer count written during a live mode-1 pulse must not abort
+    // A longer count written during a live mode-1 pulse must not abort
     // the pulse. The original count completes; the new count loads on the next
     // GATE rising edge.
     let mut pit = Pit::default();
@@ -509,7 +509,7 @@ fn mode1_new_count_mid_pulse_waits_for_next_gate() {
 
 #[test]
 fn mode3_gate_falling_forces_out_high_immediately() {
-    // Slice 3: dropping GATE in mode 2/3 forces OUT high at once, no tick.
+    // Dropping GATE in mode 2/3 forces OUT high at once, with no tick.
     let mut pit = Pit::default();
     // Use channel 2 so the wiring is exercised on a non-IRQ counter.
     pit.write_port(0x43, 0xb6); // counter 2, LSB/MSB, mode 3, binary
@@ -524,7 +524,7 @@ fn mode3_gate_falling_forces_out_high_immediately() {
 
 #[test]
 fn read_back_latch_nothing_is_a_no_op() {
-    // Slice 4: a read-back with D5=D4=1 latches nothing. A following read must
+    // A read-back with D5=D4=1 latches nothing. A following read must
     // still return the live count, not a stale latch.
     let mut pit = Pit::default();
     program_ch0(&mut pit, CW_MODE3, 100);

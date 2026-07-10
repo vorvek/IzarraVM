@@ -593,8 +593,7 @@ impl Vga {
         // units as the CRTC cursor location (0E/0Fh): a displayed cell at
         // (char_row, col) has the absolute cell index `start + char_row*offset +
         // col` and reads the char/attr byte pair at that cell index * 2. The byte
-        // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior). See
-        // A1 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior).
         let below_split = self.below_split(counter_line);
         let (start, first_line) = self.split_origin(counter_line);
         // split_origin returns first_line <= counter_line in both branches, so the
@@ -604,8 +603,7 @@ impl Vga {
         // first displayed font scanline (vertical sub-row smooth scroll), bits 6-5
         // are the byte pan added to the start address. Below the line-compare split
         // the preset always resets to 0; the byte pan resets to 0 below the split
-        // only when AC 10h bit 5 is set (FreeVGA 18h). See A3 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // only when AC 10h bit 5 is set (FreeVGA 18h).
         let preset_row = self.preset_row_scan(below_split);
         let byte_pan = self.byte_pan(below_split) as usize;
         // Effective scanline = rel + preset_row scrolls the display up; char_row
@@ -627,8 +625,7 @@ impl Vga {
         // visible column; the leftmost `pan` pels of cell 0 scroll off the left
         // edge. Range 0..char_width (0-8 for 9-dot, 0-7 for 8-dot); routed through
         // the shared pel_pan so AC 10h bit 5 forces it to 0 below the line-compare
-        // split (FreeVGA crtcreg.htm 18h). See A2 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // split (FreeVGA crtcreg.htm 18h).
         let pan = if cga_text {
             0
         } else {
@@ -641,8 +638,7 @@ impl Vga {
         };
         // The shared blink hide phase: 16 frames on, 16 off, driven by the frame
         // (vertical-retrace) counter. Attribute blink and the cursor blink both
-        // read this single source. See A6 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // read this single source.
         let blink_hide_phase = self.blink_hide_phase();
         let start_cells = start as usize;
         // VGA text uses Sequencer font maps; CGA text uses the fixed 8x8
@@ -689,7 +685,7 @@ impl Vga {
             // 512-glyph mode: when the Sequencer selects two distinct font tables
             // (map A != map B), attribute bit 3 becomes the per-cell font selector
             // and is no longer foreground intensity, so the foreground is masked to
-            // 8 colors. See A4 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+            // 8 colors.
             let font_select = (attr >> 3) & 1 != 0;
             let font_table = if dual_font && font_select {
                 table_b
@@ -727,8 +723,7 @@ impl Vga {
             // matches, scrolling with the start address. The Cursor Skew (0Bh
             // bits 6-5) delays the onset by that many character clocks, so the
             // effective cursor cell is cursor_offset + skew (FreeVGA crtcreg.htm
-            // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). See A5 in
-            // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md. The skew,
+            // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). The skew,
             // cursor byte, disable bit, and scanline range are decoded once per
             // scanline above the loop.
             let cursor_here = base == cursor_byte;
@@ -814,8 +809,7 @@ impl Vga {
         // units as the CRTC cursor location (0E/0Fh): a displayed cell at
         // (char_row, col) has the absolute cell index `start + char_row*offset +
         // col` and reads the char/attr byte pair at that cell index * 2. The byte
-        // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior). See
-        // A1 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior).
         let below_split = self.below_split(counter_line);
         let (start, first_line) = self.split_origin(counter_line);
         // split_origin returns first_line <= counter_line in both branches, so the
@@ -825,8 +819,7 @@ impl Vga {
         // first displayed font scanline (vertical sub-row smooth scroll), bits 6-5
         // are the byte pan added to the start address. Below the line-compare split
         // the preset always resets to 0; the byte pan resets to 0 below the split
-        // only when AC 10h bit 5 is set (FreeVGA 18h). See A3 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // only when AC 10h bit 5 is set (FreeVGA 18h).
         let preset_row = self.preset_row_scan(below_split);
         let byte_pan = self.byte_pan(below_split) as usize;
         // Effective scanline = rel + preset_row scrolls the display up; char_row
@@ -848,8 +841,7 @@ impl Vga {
         // visible column; the leftmost `pan` pels of cell 0 scroll off the left
         // edge. Range 0..char_width (0-8 for 9-dot, 0-7 for 8-dot); routed through
         // the shared pel_pan so AC 10h bit 5 forces it to 0 below the line-compare
-        // split (FreeVGA crtcreg.htm 18h). See A2 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // split (FreeVGA crtcreg.htm 18h).
         let pan = if cga_text {
             0
         } else {
@@ -862,8 +854,7 @@ impl Vga {
         };
         // The shared blink hide phase: 16 frames on, 16 off, driven by the frame
         // (vertical-retrace) counter. Attribute blink and the cursor blink both
-        // read this single source. See A6 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // read this single source.
         let blink_hide_phase = self.blink_hide_phase();
         let start_cells = start as usize;
         // VGA text uses Sequencer font maps; CGA text uses the fixed 8x8
@@ -934,7 +925,7 @@ impl Vga {
         // 512-glyph mode: when the Sequencer selects two distinct font tables
         // (map A != map B), attribute bit 3 becomes the per-cell font selector
         // and is no longer foreground intensity, so the foreground is masked to
-        // 8 colors. See A4 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        // 8 colors.
         let font_select = (attr >> 3) & 1 != 0;
         let font_table = if p.dual_font && font_select {
             p.table_b
@@ -972,8 +963,7 @@ impl Vga {
         // matches, scrolling with the start address. The Cursor Skew (0Bh
         // bits 6-5) delays the onset by that many character clocks, so the
         // effective cursor cell is cursor_offset + skew (FreeVGA crtcreg.htm
-        // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). See A5 in
-        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md. The skew,
+        // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). The skew,
         // cursor byte, disable bit, and scanline range are decoded once per
         // scanline in text_row_scan.
         let cursor_here = base == p.cursor_byte;

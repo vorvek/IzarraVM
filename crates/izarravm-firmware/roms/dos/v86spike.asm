@@ -1,12 +1,11 @@
-; v86spike.asm — SP-4b M0 Task 2 standalone V86 spike.
+; Standalone V86 monitor fixture.
 ;
-; Increment 3b: a real hardware timer IRQ, delivered to the V86 task by the CPU
-; (SP-4a hardware_interrupt -> deliver_exception V86 path), is reflected by the
+; A real hardware timer IRQ delivered to the V86 task by the CPU is reflected by the
 ; monitor to the guest's V86 INT 08h handler. The stub programs the PIC (master
 ; base 0x20, to dodge the error-code exception vectors) + PIT, installs a V86
 ; timer handler at IVT[8], STIs, and spins until a tick lands. Signals 0xA5.
 ;
-; Also still proves increments 2-3: CLI/STI/PUSHF virtual-IF + INT n reflection.
+; It also checks CLI/STI/PUSHF virtual IF and INT n reflection.
 ;
 ; The V86 task runs with REAL IF=1 (so IRQs reach the monitor); VIF is the guest's
 ; view of IF. The monitor reflects vector 0x20 -> V86 INT 08h.

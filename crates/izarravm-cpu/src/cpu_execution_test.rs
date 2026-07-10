@@ -16,8 +16,7 @@ fn reset_state_starts_at_386_reset_vector() {
 #[test]
 fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_accurate_class() {
     // In the Accurate 386 class `block_continuable` never admits
-    // `DecodeGroup::PortIo` (see that function's doc comment: the P4a Task 1.3
-    // IN admission is gated on the Approximate class only), so an IN can ONLY
+    // `DecodeGroup::PortIo`, so an IN can only
     // ever be `run_straight_line`'s FIRST instruction there, never a
     // continuation -- every port access still sets `io_touched` unconditionally
     // in the Accurate class's read_io dispatch, ending the run right after it
@@ -68,7 +67,7 @@ fn out_and_outs_forward_the_live_run_offset_to_the_bus() {
 #[test]
 fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approximate_class_continuation()
  {
-    // P4a Task 1.3: in the Approximate class (I486/I586) `block_continuable`
+    // In the Approximate class (I486/I586), `block_continuable`
     // admits the IN forms (0xe4/0xe5/0xec/0xed), so an IN reached as a
     // continuation (not the run's first instruction) must see
     // core_clocks_so_far equal to the running total of every prior
@@ -306,7 +305,7 @@ fn in_stays_a_run_terminator_not_a_continuation_in_the_accurate_class() {
 
 #[test]
 fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation() {
-    // Directly pins the mechanism Task 0.2 adds (a CpuGsw field set to
+    // Directly checks the CpuGsw field set to
     // run_straight_line's running `total` before every continuation dispatch,
     // read by read_io) using a continuable instruction group (INC, DataMove/
     // Alu-adjacent -- specifically Group) as the observation point, since

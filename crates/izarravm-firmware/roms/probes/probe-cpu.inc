@@ -1,4 +1,4 @@
-; probes/probe-cpu.inc - STREAM C: GSW CPU probe (the CPU icon).
+; GSW CPU probe (the CPU icon).
 ; Toggle EFLAGS.AC first. If it is fixed, this is either 386 clock mode. If AC
 ; changes, toggle EFLAGS.ID. A fixed ID marks the 486. Only the 586 executes
 ; CPUID, where leaf 0 must report GenuineIntel for the modeled P55C.

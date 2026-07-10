@@ -1,4 +1,4 @@
-; xmstest.com — SP-4b M1 XMS round-trip e2e fixture. Runs in V86 under TOKAEMM.
+; XMS round-trip fixture. Runs in V86 under TOKAEMM.
 ;
 ; Install-check (INT 2Fh 4300) -> get entry (4310) -> version -> alloc 64 KB ->
 ; lock -> move a pattern conventional->EMB -> move EMB->conventional -> verify ->

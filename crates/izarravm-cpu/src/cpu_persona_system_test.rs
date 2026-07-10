@@ -167,7 +167,7 @@ fn slow_and_normal_386_execute_identical_architectural_state() {
     assert_eq!(slow_bus.memory, normal_bus.memory);
 }
 
-// --- Phase 5 Slice A: RDTSC, the P55C MSR subset, and CR4 ---
+// --- RDTSC, the P55C MSR subset, and CR4 ---
 
 #[test]
 fn level_timing_scales_instruction_clocks_per_mode() {
@@ -662,7 +662,7 @@ fn p6_conditional_move_families_are_undefined_on_every_mode() {
     }
 }
 
-// --- Phase 5 Slice C: CMPXCHG8B ---
+// --- CMPXCHG8B ---
 
 fn read_dword(memory: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([memory[at], memory[at + 1], memory[at + 2], memory[at + 3]])

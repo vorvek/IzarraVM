@@ -564,9 +564,7 @@ pub trait CpuBus {
     /// current straight-line run, NOT including the in-flight instruction issuing
     /// this read (the batch-break boundary today always falls after an IN's own
     /// charge, so this matches "now" as any batch break has always meant). Lets a
-    /// future lazy port read compute time-derived device state without ending the
-    /// batch; unused by every implementor until a port switches to the lazy path
-    /// (see dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Slice 0/1).
+    /// lazy port read compute time-derived device state without ending the batch.
     ///
     /// `cpu_is_ring0_pm`: true when the CPU issuing this access is executing
     /// ring-0 protected-mode code that is not a V86 task (`Cpu::is_ring0_protected`)

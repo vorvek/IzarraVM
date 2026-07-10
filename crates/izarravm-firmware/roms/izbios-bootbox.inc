@@ -1,4 +1,4 @@
-; izbios-bootbox.inc - STREAM E (Phase 4 section 8): the boot-device + CPU-speed
+; Boot-device and CPU-speed
 ; menu, rendered on the proprietary Margo LFB (mode 0x150) inside the boot-box
 ; sprite from izbios-art.inc. boot_menu (izbios-boot.inc) is a one-line shim that
 ; jumps to bootbox_menu here.

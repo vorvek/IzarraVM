@@ -15,7 +15,7 @@ fn folds_files_and_dirs_and_resolves_collisions_and_reverse_lookup() {
     assert_eq!(&a, b"README  TXT");
     assert_eq!(&b, b"README~1TXT");
     assert_eq!(&d, b"MYGAMES    ");
-    // Reverse: the folded name maps back to the host path (for M2 writes).
+    // Reverse: the folded name maps back to the host path for writes.
     assert_eq!(t.host_path(&a), Some(&PathBuf::from("/h/Readme.txt")));
     assert_eq!(t.host_path(b"KERNEL  SYS"), None); // a reserved name has no host path
 }

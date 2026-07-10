@@ -22,7 +22,6 @@ impl Machine {
     /// no DOS kernel behind it — only `handle_raw_program_int`'s minimal
     /// terminate/console-I/O surface services interrupts. For tests and
     /// benchmarks that need a quick runnable machine, not C: drive access.
-    /// See `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md`.
     pub fn new_raw_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
         let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
         let mut rom = vec![0u8; BIOS_ROM_SIZE];
@@ -629,8 +628,8 @@ impl Machine {
     /// The minimal interrupt surface for a `new_raw_program` machine: INT 20h
     /// and AH=4Ch terminate; AH=01h/02h/06h/09h console I/O; anything else
     /// returns DOS's "invalid function" convention (CF=1, AX=0007h) instead
-    /// of doing nothing silently. No file I/O, no critical error, no EXEC —
-    /// see `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3.
+    /// of doing nothing silently. It provides no file I/O, critical error, or
+    /// EXEC support.
     pub(super) fn handle_raw_program_int(&mut self, vector: u8) -> Result<Option<u8>, BusError> {
         let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
         let sp = self.cpu.registers.esp() as u16;
@@ -734,8 +733,8 @@ impl Machine {
 
     /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the
     /// status the BIOS reads back. Cmd 0x01 (Repair Toka-DOS) resets the Katea host
-    /// folder's CONFIG.SYS/AUTOEXEC.BAT. (The legacy 0x10 HLE C: boot shim was
-    /// removed with the Rust DOS kernel in SP-3.)
+    /// folder's CONFIG.SYS/AUTOEXEC.BAT. The retired Rust DOS kernel's legacy
+    /// 0x10 HLE C: boot shim is no longer present.
     pub(super) fn perform_toka_service(&mut self, command: u8) {
         self.toka_service_status = match command {
             0x01 => self.katea_repair(),

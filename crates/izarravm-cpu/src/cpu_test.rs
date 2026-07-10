@@ -57,7 +57,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, charge_fetch_fn), 32);
     assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
     assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
-    // Pending flags offset for direct write in v2 inlining (slice 2+).
+    // Pending flags offset used by direct native writes.
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3888);
     // Verify the timing-field offsets the native cap check uses.
     let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
@@ -185,8 +185,8 @@ fn jit_set_shift_flags_shr_matches_shift_rotate() {
     }
 }
 
-/// G0' CPU-ceiling probe (2026-07-07 JIT/perf plan): how much faster is fully register-allocated
-/// native codegen of a hot loop than our interpreter? Runs a 32-bit flat drawcolumn-shaped loop
+/// Measure fully register-allocated native code against the interpreter. Runs a
+/// 32-bit flat drawcolumn-shaped loop
 /// (15 instructions, 7 memory ops) through the REAL interpreter (`run_straight_line`) and through
 /// a hand-emitted native version that keeps every guest register in a host register and folds the
 /// texture base into a host pointer so each guest base+index memory operand lowers to one host SIB
@@ -404,17 +404,17 @@ fn g0_prime_cpu_ceiling_probe() {
     }
     let mi = median(interp_ns);
     let mn = median(native_ns);
-    eprintln!("\n=== G0' CPU-ceiling probe ({ITERS} iters x 15 insns, median of {TRIALS}) ===");
+    eprintln!("\n=== CPU ceiling probe ({ITERS} iters x 15 insns, median of {TRIALS}) ===");
     eprintln!("interpreter : {mi:.3} ns/guest-insn");
     eprintln!("native (best-case, reg-allocated + raw-ptr mem) : {mn:.3} ns/guest-insn");
     eprintln!(
         "SPEEDUP CEILING : {:.2}x   [4x = 'already very good' bar]",
         mi / mn
     );
-    eprintln!("=== end G0' (memory-mixed) ===\n");
+    eprintln!("=== end memory-mixed probe ===\n");
 }
 
-/// G0' companion: an ARTIFACT-FREE dispatch-only ceiling. A 15-instruction register-only loop
+/// Dispatch-only companion to the CPU ceiling probe. A 15-instruction register-only loop
 /// (no memory operands at all, so ZERO bus involvement — the TestBus memory-path caveat cannot
 /// apply) isolating the interpreter's pure per-instruction dispatch/decode/flag/clock-accounting
 /// overhead vs native register ops. This anchors that the memory-mixed interpreter figure is real
@@ -580,19 +580,19 @@ fn g0_prime_dispatch_ceiling_probe() {
     }
     let mi = median(interp_ns);
     let mn = median(native_ns);
-    eprintln!("\n=== G0' dispatch-only ceiling (register-only loop, NO memory/bus artifact) ===");
+    eprintln!("\n=== Dispatch-only ceiling (register-only loop) ===");
     eprintln!("interpreter : {mi:.3} ns/guest-insn");
     eprintln!("native      : {mn:.3} ns/guest-insn");
     eprintln!("DISPATCH SPEEDUP CEILING : {:.2}x", mi / mn);
-    eprintln!("=== end G0' (dispatch-only) ===\n");
+    eprintln!("=== end dispatch-only probe ===\n");
 }
 
-/// S2.2 spike (owner chose "spike first"): the reg-cache alone is not the lever; the per-slot
+/// Measure the per-slot bookkeeping cost. The register cache alone is not the limiting factor; the per-slot
 /// fetch/cap CALLs back into Rust are the floor (the region is wall-neutral with the interpreter
 /// precisely because native emitted code cannot inline the bus/cpu work the Rust trampoline
 /// inlines). This measures the per-slot BOOKKEEPING cost (fetch charge + clock accumulate +
 /// cross-multiplied cap check) under the three candidate models, the variable that decides the
-/// S2 build. Combined with the G0' compute (~0.38 ns/insn dirty native) and interpreter
+/// emitted path. Combined with the native compute and interpreter
 /// (~96 ns/insn) numbers, it gives the drawcolumn per-insn estimate for each model. Throwaway.
 ///   cargo test -j8 -p izarravm-cpu --release --features jit s2_bookkeeping -- --ignored --nocapture
 #[cfg(feature = "jit")]
@@ -753,12 +753,12 @@ fn s2_bookkeeping_model_spike() {
         }
     }
     let (mc, mn, mb) = (median(c), median(n), median(b));
-    eprintln!("\n=== S2.2 bookkeeping-model spike (ns per slot, median of {TRIALS}) ===");
+    eprintln!("\n=== Bookkeeping models (ns per slot, median of {TRIALS}) ===");
     eprintln!("1. call-per-slot  (today's region model)     : {mc:.3} ns/slot");
     eprintln!("2. native-per-slot (Option A, cached accum)  : {mn:.3} ns/slot");
     eprintln!("3. batched CALL/iter (Option B, 15 slots)    : {mb:.3} ns/slot");
     eprintln!("--- drawcolumn per-insn estimate = ~0.38 ns native compute + bookkeeping/slot ---");
-    eprintln!("current region (wall-neutral w/ interp)      : ~96 ns/insn (G0')");
+    eprintln!("current region (wall-neutral w/ interp)      : ~96 ns/insn");
     eprintln!(
         "Option A (native per-slot)  : {:.2} ns/insn  => {:.0}x over current",
         0.38 + mn,
@@ -769,7 +769,7 @@ fn s2_bookkeeping_model_spike() {
         0.38 + mb,
         96.0 / (0.38 + mb)
     );
-    eprintln!("=== end S2.2 spike ===\n");
+    eprintln!("=== end bookkeeping models ===\n");
 }
 
 #[test]
@@ -816,15 +816,14 @@ fn scale_clocks_batches_exactly() {
     }
 }
 
-/// S0 (JIT/perf plan, council #1 finding): a compiled block that contains x87 ops carries a
-/// SECOND remainder (`fp_rem`) besides the integer `timing_rem`, and it must batch into one
+/// A compiled block containing x87 operations carries `fp_rem` alongside the
+/// integer `timing_rem`, and must batch both into one
 /// block-exit flush with the SAME carry as per-op scaling, or the block's guest cycle count
 /// diverges from the interpreter. Unlike integer clocks (one per-level numerator), FP ops have
 /// PER-CLASS numerators, so the batched form weights each op by its class before summing; the
 /// shared `FP_TIMING_DEN` is what keeps the single `fp_rem` carry exact across mixed classes.
 /// This pins `Σ scale_fp_clocks == floor((Σ clocks·num_class + rem0) / DEN)` with the final
-/// remainder `(Σ clocks·num_class + rem0) % DEN` — the identity a future `scale_fp_clocks_batch`
-/// (added with S2's x87 templates) must satisfy, and a guard that scale_fp_clocks never drops
+/// remainder `(Σ clocks·num_class + rem0) % DEN`. This guards against `scale_fp_clocks` dropping
 /// the shared-denominator property the batch relies on.
 #[test]
 fn scale_fp_clocks_batches_exactly() {

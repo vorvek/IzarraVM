@@ -8,7 +8,7 @@
 //! companding decoders and linear converters live in `pcm.rs` (shared with the
 //! Sound Blaster DSP); everything else here is independent of `SbDsp`.
 //!
-//! Built from the AD1848K datasheet (`dev_docs/reference/wss/ad1848.txt`):
+//! Built from the AD1848K datasheet:
 //! - R0 Index Address (INIT/MCE/TRD/IXA3:0) -- datasheet "Index Register".
 //! - R2 Status (INT sticky bit, cleared by any write) -- "Status Register".
 //! - I8 Clock and Data Format (FMT/L/C/S/M/CFS2:0/CSS) -- IXA3:0 = 8.
@@ -165,7 +165,7 @@ pub struct Ad1848 {
     /// Rendered stereo frames, drained by the host audio path; capped by
     /// `pcm::push_frame_capped` (drop-oldest rate-match buffer).
     rendered: VecDeque<(i16, i16)>,
-    // HLE pre-fetched block data for WSS DMA (Phase 4 command/buffer level).
+    // HLE block data prefetched for batched WSS DMA.
     block_buffer: Option<Vec<u8>>,
     block_buffer_pos: usize,
 }
@@ -412,8 +412,7 @@ impl Ad1848 {
         self.format() == Format::Pcm16
     }
 
-    /// Bytes the byte-fetcher will be called for per output frame, for HLE
-    /// block buffer sizing (Phase 4).
+    /// Number of DMA bytes consumed per output frame, used to size HLE blocks.
     pub fn bytes_per_frame(&self) -> usize {
         let per_sample = if self.is_16bit() { 2 } else { 1 };
         if self.is_stereo() {
@@ -463,7 +462,7 @@ impl Ad1848 {
         self.playing
     }
 
-    /// Current DMA count for HLE block-buffer pre-fetch decision (Phase 4).
+    /// Current DMA count used to size the next HLE block.
     pub fn current_dma_count(&self) -> u32 {
         self.current_count
     }
@@ -598,7 +597,7 @@ impl Ad1848 {
         self.rendered.pop_front()
     }
 
-    // HLE buffer accessors for WSS command + buffer level DMA pre-fetch (Phase 4).
+    // HLE block-buffer accessors.
     pub fn take_block_buffer(&mut self) -> Option<Vec<u8>> {
         self.block_buffer.take()
     }

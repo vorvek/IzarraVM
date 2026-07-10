@@ -1,8 +1,7 @@
 //! A native .COM/.EXE loader with no DOS-kernel backing — builds a
 //! DOS-compatible PSP/memory image so a guest program can run, without any
-//! service-dispatch state attached. Ported from `izarravm-dos`'s loader
-//! (which is identical in spirit but carries a full kernel struct this
-//! crate doesn't want). See `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md`.
+//! service-dispatch state attached. Ported from `izarravm-dos`'s loader, which
+//! carries the full kernel state that this crate does not need.
 
 use izarravm_bus::Memory;
 

@@ -1,4 +1,4 @@
-; izbios-lfb.inc - STREAM F: linear-framebuffer draw primitives for the
+; Linear-framebuffer draw primitives for the
 ; proprietary Margo mode 0x150 (320x240x8). All routines preserve caller
 ; registers. Fills, clears, and text go through the Margo blit engine (the
 ; MMIO register block at MARGO_MMIO, reached via the same unreal-mode flat FS
@@ -380,7 +380,7 @@ lfb_load_palette:
 ; row boundaries. Geometry + run state live in segment-0 scratch (BLIT_*) so the
 ; inner loop keeps registers free, mirroring lfb_blit_1bpp.
 ;
-; Register discipline (Phase-1 gotcha): EBX holds the running LFB address that
+; EBX holds the running LFB address that
 ; lfb_pixel_addr returns, so the pixel value is written from AL and BL/BH are
 ; never touched. lfb_pixel_addr preserves SI (the RLE pointer) and CX.
 lfb_blit_rle:

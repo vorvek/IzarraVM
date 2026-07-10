@@ -2,13 +2,10 @@
 
 pub const I386DX25_TEST_ROM: &[u8] = include_bytes!("../roms/i386dx25-test.bin");
 pub const I386DX25_TEST_ROM_SOURCE: &str = include_str!("../roms/i386dx25-test.asm");
-/// Distira driver-plan slice 1: a standalone flat-ROM guest program that finds
+/// A standalone flat-ROM guest program that finds
 /// the Distira 3D card via real PCI configuration space, maps BAR0, and draws
 /// one flat-shaded triangle through direct SST-1 register pokes (the same
-/// wire format real DOS Glide uses), no Glide involved. See
-/// dev_docs/2026-07-02-distira-driver-plan.md slice 1 and
-/// crates/izarravm-machine/tests/distira.rs's distira_guest_* tests, whose
-/// hand-assembled-bytes pattern this promotes to a buildable source file.
+/// wire format real DOS Glide uses), with no Glide dependency.
 pub const DISTTRI_BIN: &[u8] = include_bytes!("../roms/disttri.bin");
 pub const DISTTRI_SOURCE: &str = include_str!("../roms/disttri.asm");
 pub const X86_BOOT_TEST_IMAGE: &[u8] = include_bytes!("../roms/boot-suite/izarravm-test.img");
@@ -78,7 +75,7 @@ pub const DHRYSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/dhrystone.ex
 /// (load with `Machine::new_raw_program`, read `bench_iterations` = the sweep count
 /// and `bench_aux` = the FP self-check fold). See roms/neurketa-c/whetstone.c.
 pub const WHETSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/whetstone.exe");
-/// The standalone V86 monitor spike (SP-4b M0 Task 2): a 512-byte boot sector that
+/// A 512-byte boot sector that
 /// enters Virtual-8086 mode under a hand-built monitor and signals success through
 /// the unit-tester exit port. Run via `Machine::new_boot_image`.
 pub const V86SPIKE_BIN: &[u8] = include_bytes!("../roms/dos/v86spike.bin");
@@ -195,7 +192,7 @@ pub fn multihlt_com() -> &'static [u8] {
     MULTIHLT_COM
 }
 
-/// The SP-4b M1 XMS round-trip e2e fixture: install-check, get entry, version,
+/// The XMS round-trip fixture: install-check, get entry, version,
 /// alloc a 64 KB EMB, lock, move a pattern conventional->EMB->conventional, verify,
 /// unlock, free — then signal 0xA5 (success) via the unit-tester exit port. Runs in
 /// V86 under TOKAEMM; a non-0xA5 exit code names the step that broke.
@@ -203,7 +200,7 @@ pub fn xmstest_com() -> &'static [u8] {
     XMSTEST_COM
 }
 
-/// The SP-4b M3 UMB e2e fixture: with DOS=UMB, set the high-first allocation
+/// The UMB fixture: with DOS=UMB, set the high-first allocation
 /// strategy, AH=48h-allocate a block, assert it landed in upper memory (segment
 /// 0xC800 or above) with real RAM behind it (write/read a pattern) — proving
 /// TOKAEMM page-mapped extended RAM into the upper holes and DOS=UMB consumed it.
@@ -212,7 +209,7 @@ pub fn umbtest_com() -> &'static [u8] {
     UMBTEST_COM
 }
 
-/// The SP-4b M2 EMS e2e fixture (needs TOKAEMM loaded with the RAM argument):
+/// The EMS fixture, which needs TOKAEMM loaded with the RAM argument:
 /// version, frame segment, page counts, allocate, then map logical pages
 /// through the frame slots writing distinct patterns and reading them back
 /// through other slots — proving the runtime page remap through the paged
@@ -221,14 +218,14 @@ pub fn emstest_com() -> &'static [u8] {
     EMSTEST_COM
 }
 
-/// The SP-4b M4 mouse-under-V86 fixture: after LH TOKAMOUS, polls the INT 33h
+/// The mouse-under-V86 fixture: after LH TOKAMOUS, polls the INT 33h
 /// wheel counter for a host-injected detent — proving slave IRQ12 -> vector
 /// 0x74 -> INT 74h reflection under the monitor. Signals 0xA5 / 0xEn.
 pub fn mousetst_com() -> &'static [u8] {
     MOUSETST_COM
 }
 
-/// The SP-4b M4 SB16-IRQ5-under-V86 fixture: hooks INT 0Dh, resets the DSP,
+/// The SB16-IRQ5-under-V86 fixture: hooks INT 0Dh, resets the DSP,
 /// and requests immediate 8-bit IRQs (DSP 0xF2) inside a CLI/STI-dense loop —
 /// IRQ5 deliveries interleave with #GPs on the shared vector 13, exercising
 /// the monitor's discriminator. Signals 0xA5 / 0xEn.
@@ -245,14 +242,14 @@ pub fn irq5ip0_com() -> &'static [u8] {
     IRQ5IP0_COM
 }
 
-/// The SP-4b M2 default-off contract fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): the
+/// The default-off EMS fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): the
 /// manager must answer INT 67h frameless — present, version 4.0, zero pages,
 /// 41h returns 80h, allocation refused with 87h. Signals 0xA5 / 0xEn.
 pub fn emsnone_com() -> &'static [u8] {
     EMSNONE_COM
 }
 
-/// The VCPI M0 presence fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): INT 67h
+/// The VCPI presence fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): INT 67h
 /// AX=DE00h must answer AH=0/BX=0100h (VCPI 1.0 present, even frameless), a
 /// not-yet-implemented subfunction must answer 8Fh, untouched registers must
 /// survive, and plain EMS must keep answering on the shared vector. Signals
@@ -261,7 +258,7 @@ pub fn vcpidet_com() -> &'static [u8] {
     VCPIDET_COM
 }
 
-/// The VCPI M1 query/page-pool fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS):
+/// The VCPI query/page-pool fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS):
 /// exercises DE02-DE0B — pool count/alloc/free round-trip with 12-LSB
 /// masking, bad-free and double-free rejection, the V86 page-table query,
 /// CR0, the debug-register array, and the 8259 report/record round-trip.
@@ -270,7 +267,7 @@ pub fn vcpimem_com() -> &'static [u8] {
     VCPIMEM_COM
 }
 
-/// The VCPI M2 DE01 fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): validates the
+/// The VCPI DE01 fixture (bare DEVICE=C:\DOS\TOKAEMM.SYS): validates the
 /// Get Protected Mode Interface call's V86-observable outputs — the 0x110-
 /// entry page-table copy (identity mappings, software bits 9-11 cleared,
 /// exact write extent, DI advance), the three furnished GDT descriptors,
@@ -279,7 +276,7 @@ pub fn vcpiif_com() -> &'static [u8] {
     VCPIIF_COM
 }
 
-/// The VCPI M3 mode-switch fixture: a minimal REAL VCPI client. DE01
+/// The VCPI mode-switch fixture: a minimal real VCPI client. DE01
 /// interface setup, DE0C into 16-bit protected mode under its own
 /// CR3/GDT/TSS, PM far-calls to the server entry (DE03 vs the V86 baseline,
 /// DE04/DE05 round-trip), DE0C back to V86, marker-register and
@@ -288,7 +285,7 @@ pub fn vcpisw_com() -> &'static [u8] {
     VCPISW_COM
 }
 
-/// The V86 #GP-reflection fixture (VCPI M4): hooks INT 0Dh, executes an o32
+/// The V86 #GP-reflection fixture hooks INT 0Dh, executes an o32
 /// LGDT (the literal DOS16M startup shape), and verifies the monitor
 /// reflects the fault to the guest handler with fault-IP semantics and that
 /// skip-and-resume works. Signals 0xA5 / 0xEn.
@@ -313,7 +310,7 @@ pub fn gswmode_com() -> &'static [u8] {
     GSWMODE_COM
 }
 
-/// The SP-4b M3 UMB *mechanism* fixture: drives XMS 10h/11h/12h directly (no
+/// The direct UMB mechanism fixture: drives XMS 10h/11h/12h without
 /// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach — the
 /// too-big probe (B0h + largest), alloc, grow, release, and reuse-after-free —
 /// plus a write/read of the paged RAM. Signals 0xA5 (or a 0xEn step code).
@@ -321,7 +318,7 @@ pub fn umbmech_com() -> &'static [u8] {
     UMBMECH_COM
 }
 
-/// TOKAEMM.SYS (SP-4b M0): a bespoke memory-manager char device. Its INIT runs
+/// TOKAEMM.SYS is a bespoke memory-manager character device. Its INIT runs
 /// at SYSINIT, builds a load-relative protected-mode + paging + ring-0 monitor
 /// environment in its own resident memory, then IRETDs the running kernel into
 /// virtual-8086 mode — so the rest of DOS boots and runs virtualized under the

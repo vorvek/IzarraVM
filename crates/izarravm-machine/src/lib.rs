@@ -279,15 +279,9 @@ pub enum ActiveDisplay {
 /// wall second, so a guest that never polls pays ~140k clocks/s (~0.2 percent).
 pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 
-/// Bytes per modeled cache line: 64 bytes on every tier. (A real Pentium MMX uses
-/// 32-byte lines; the line size is kept as-is -- out of scope for the P55C timing
-/// retarget, which changed clock / L1 size / dials, not the line geometry.)
-/// Per-mode VIDEO-window wait-states for the Approximate class (486/586), the
-/// FOURTH timing lever, calibrated (2026-07-05, retuned 2026-07-06) against the
-/// owner's real-hardware Doom `-timedemo demo3` fps targets (486 DX2-66 max
-/// detail 29-30 fps, P55C-200 ~82 fps; cross-checked vs the Ertl doombench
-/// archive). Why it exists: a real VGA card sits across an expansion bus whose
-/// per-access latency does NOT scale with CPU speed, but the flat
+/// Per-mode VIDEO-window wait states for the Approximate class (486/586).
+/// A real VGA card sits across an expansion bus whose per-access latency does
+/// not scale with CPU speed, but the flat
 /// `WaitStateProfile.video = 1` rode `scale_bus` (486 x1/3, 586 x7/30), pricing a
 /// VRAM byte write at ~15 ns / ~3.5 ns where real VLB / PCI writes cost
 /// ~100-450 ns. Doom is framebuffer-bound (measured: ~61,500 VRAM data accesses
@@ -296,19 +290,12 @@ pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 /// are calibrated POST-`scale_bus`: the charged clocks are `(2 + ws) *
 /// bus_num/bus_den`.
 ///
-/// 586 retune (2026-07-06): the narrow-SMC fix (PR #431) lifted Doom demo3 from
-/// 907 to 773 realtics (96.6 fps), faster than the ~82 fps P55C target. The owner
-/// kept the SMC win and retuned this dial to restore era-apparent speed. ws=88 ->
-/// 913 realtics -> 81.8 fps (was ws=62 -> 773 realtics -> 96.6 fps). This is the
-/// Doom-isolated lever: a sweep confirmed the synthetic bench cyc/iter columns
+/// The 586 value of 88 produces 913 realtics, or 81.8 fps, near the ~82 fps
+/// P55C target. A sweep confirmed the synthetic bench cycles-per-iteration columns
 /// (sieve 120503.05, dhrystone 663.62, all four modes) are byte-identical across
-/// the sweep, because the benches do no VRAM traffic. The dial is not perfectly
-/// Quake-decoupled (Quake's software renderer does enough VRAM traffic to feel
-/// it): measured nosound demo1 went 42.4 fps (ws=62) -> 41.5 fps (ws=88), a -2.1%
-/// shift vs Doom's -15.3%, so Doom is ~16x more sensitive. The two era targets
-/// (Doom ~82, Quake ~43) are not simultaneously reachable with this single dial;
-/// Doom is the priority (it was 18% too fast; Quake shifted 2%). x87 timing work,
-/// which shifts Quake more than Doom, is deferred to a later round.
+/// the sweep because the benches do no VRAM traffic. Quake's software renderer
+/// is less isolated: nosound demo1 changes from 42.4 fps at ws=62 to 41.5 fps at
+/// ws=88, a 2.1 percent shift compared with Doom's 15.3 percent shift.
 ///
 /// The shipped 486 value stays at the flat 1 (see the arm comment: with honest
 /// tick delivery the DX2-66 persona hits its target with no surcharge, so no
@@ -322,7 +309,7 @@ const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
         CpuPersona::I386 => 1,
         // The 486 keeps the flat profile value: once the batch cap counts bus
         // clocks (no more coalesced IRQ0 ticks), the DX2-66 persona lands the
-        // owner's 29-30 fps demo3 target with NO video surcharge - its
+        // 29-30 fps demo3 target with no video surcharge. Its
         // Dhrystone-pinned bus dial already prices every access fat enough that
         // the real VLB video cost is absorbed. Charging the physical ~130 ns on
         // top would undershoot the target (~27 fps). Composition infidelity
@@ -330,7 +317,7 @@ const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
         // than a real DX2-66's (which leans on the video bus); the NET frame
         // rate is what is calibrated. Revisit alongside any bus_timing retune.
         CpuPersona::I486 => 1,
-        // Retuned 2026-07-06: ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
+        // ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
         // See the function-level doc for the sweep data and the isolation proof.
         CpuPersona::I586 => 88,
     }
@@ -693,8 +680,7 @@ pub struct Machine {
     // machine mirrors the new bytes onto the framebuffer so the screen shows them.
     dos_screen_shown: usize,
     /// True only for a `new_raw_program` machine: routes INT 20h/21h/27h to
-    /// `handle_raw_program_int`. See
-    /// `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3a.
+    /// `handle_raw_program_int`.
     program_runtime: bool,
     /// Accumulated console output for a `new_raw_program` machine, read back
     /// through `program_output()` / seeded through `set_program_stdin()`.
@@ -795,7 +781,7 @@ pub struct Machine {
     // interface (INT 25h read; INT 26h write is write-protected). Optional and
     // consulted only by INT 25h/26h for AL=2, so it does not touch the ATA / INT
     // 13h path. None until one is mounted. The eventual single C: backing (ATA
-    // vs this) is the install-layout decision (P2).
+    // vs this) remains an install-layout decision.
     fat32_c: Option<Fat32Volume>,
     cd_accesses: u64,
     // Fractional Red Book frames owed to the CD-audio mixer from the DAC clock.
@@ -827,7 +813,7 @@ pub struct Machine {
     // host. None disables snapshots (the command becomes a no-op).
     test_snapshot_path: Option<std::path::PathBuf>,
     // Test-only observation seam for the batch loop's prior_runs_core_clocks
-    // updates (P4a Slice 1 Task 1.2 review finding 1). One inner Vec per batch
+    // updates. One inner Vec per batch
     // (pushed at batch entry); each element is the value the loop pushed into
     // `MachineBus::prior_runs_core_clocks` before one `run_straight_line` call.
     // Compiled out of release builds entirely, so the hot loop pays nothing.
@@ -1413,9 +1399,8 @@ impl Machine {
         self.memory.as_slice()[RESULT_BLOCK_ADDRESS..end].to_vec()
     }
 
-    /// Whether the guest is executing in virtual-8086 mode (under the TOKAEMM
-    /// ring-0 monitor). Exposed so the SP-4b M4 default-boot e2e can assert the
-    /// default CONFIG.SYS really put the system in V86.
+    /// Whether the guest is executing in virtual-8086 mode under the TOKAEMM
+    /// ring-0 monitor. The default-boot test uses this to verify CONFIG.SYS.
     pub fn in_v86(&self) -> bool {
         self.cpu.is_v86_mode()
     }
@@ -1836,15 +1821,14 @@ impl Machine {
         out
     }
 
-    /// Raise a hardware interrupt request line into the PIC. The PIT and other
-    /// devices call this; slice 2b wires the PIT's IRQ0 tick through here.
+    /// Raise a hardware interrupt request line into the PIC.
     pub fn request_irq(&mut self, line: u8) {
         self.pic.request(line);
     }
 
     /// Pull one byte from a DMA channel's memory transfer (memory->device read).
     /// Returns None when the channel is masked or has reached terminal count. The
-    /// sound slice feeds this to the SB16 DSP for 8-bit playback.
+    /// The SB16 DSP uses this for 8-bit playback.
     pub fn dma_read_byte(&mut self, channel: usize) -> Option<u8> {
         self.dma.read_byte(channel, &mut self.memory)
     }
@@ -1931,10 +1915,10 @@ struct MachineBus<'a> {
     /// True for the approximate-timing 486/586 modes, computed identically to
     /// `flat_data_cost` (same `active_mode.uses_approximate_timing()` check, same
     /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`
-    /// (P4a Task 1.3): when true, a status-port read does not set `io_touched`
+    /// When true, a status-port read does not set `io_touched`
     /// and computes its returned bits from `predicted_beam()` instead of the
     /// live device beam; when false (Accurate 386 class) the port keeps
-    /// the byte-identical pre-Task-1.3 behavior. A single bool test at the top
+    /// byte-identical behavior. A single bool test at the top
     /// of the one arm that branches on it, not a per-access classification.
     lazy_port_reads: bool,
     // Set true by any port I/O this batch. The run loop batches straight-line
@@ -1952,9 +1936,7 @@ struct MachineBus<'a> {
     // A copy of the current read_io call's core_clocks_so_far argument (CPU core
     // clocks charged by prior instructions in this straight-line run, not
     // including the in-flight IN). Written at the top of every read_io call so a
-    // future lazy-port arm can read it without its own plumbing. Not read by any
-    // arm yet; Slice 0 is pure seam-threading (dev_docs/2026-07-02-p4a-lazy-port-
-    // device-time-plan.md Task 0.2). Initialized to 0 at bus construction; the
+    // lazy-port arm can read it without extra plumbing. Initialized to 0 at bus construction; the
     // first read_io call overwrites it before any arm can observe it.
     core_clocks_so_far: u64,
     // CPU core clocks accumulated by everything BEFORE the current straight-line
@@ -2128,8 +2110,7 @@ fn boot_sector_cpu() -> CpuGsw {
 /// COM2 are emulated); bits 15-14 = 10b advertises two parallel printer ports
 /// (LPT1 and LPT2 are emulated). Bit 1 (80x87 coprocessor) stays clear: the
 /// Izarra 3000 ships no 387, so software that probes the equipment word skips
-/// its FPU path. See RBIL INT 11h equipment bitfield
-/// (dev_docs/reference/rbil/INTERRUP.B).
+/// its FPU path. The bit layout follows RBIL's INT 11h equipment word.
 const BIOS_EQUIPMENT_WORD: u16 = 0x8421;
 
 /// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC

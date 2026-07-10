@@ -1,4 +1,4 @@
-; gpreflct.com — TOKAEMM V86 #GP-reflection fixture (VCPI M4). A real-monitor
+; gpreflct.com: TOKAEMM V86 #GP-reflection fixture. A real-monitor
 ; contract check: a V86 program that hooks INT 0Dh and executes a privileged
 ; instruction the monitor does not emulate must receive its own fault
 ; reflection, with fault semantics (the stacked return IP points AT the

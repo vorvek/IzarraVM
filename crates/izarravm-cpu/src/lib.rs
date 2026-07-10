@@ -557,13 +557,10 @@ pub struct PerfCounters {
     pub rep_string_fast_iterations: u64,
     pub flag_materializations: u64,
     pub cache_tier_lookups: u64,
-    /// V86 trap tax measurement (dev_docs/2026-07-02-v86-trap-tax): every entry into
-    /// the ring-0 monitor via vector 13 (a V86 sensitive-instruction #GP or a real
-    /// IRQ5), counted at `deliver_exception`. One "trip" per TOKAEMM round-trip.
-    /// Combine with `brk_step` (already tracked above) for the batch-breaking
-    /// share the trap tax measures: `brk_step / monitor_trips_vec13` is the mean
-    /// number of port accesses that ended a batch per trip (was ~2, the vec13
-    /// PIC OCW3 select write and its readback; near 0 after the Part 1 fix).
+    /// Entries from V86 into the ring-0 monitor through vector 13. Sensitive-
+    /// instruction #GP faults and real IRQ5 share this vector. Dividing
+    /// `brk_step` by this count gives the mean batch-ending port accesses per
+    /// monitor trip.
     pub monitor_trips_vec13: u64,
     /// Guest CORE clocks charged to instructions that retired while
     /// `is_ring0_protected()` was true: the V86-#GP-entry-to-IRETD-back residency
@@ -718,9 +715,8 @@ pub struct CpuGsw {
     // execute_decoded, execute_port_io_decoded, ...). Set once per instruction at
     // the top of run_straight_line's loop body / cycle_no_interrupt_check; read by
     // CpuBus::read_io call sites. Zero-initialized by the struct's derive(Default);
-    // a hand-written Default impl must keep it 0 (cycle_no_interrupt_check's
-    // reset-to-0 assumes a fresh CPU starts there). See dev_docs/
-    // 2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.2.
+    // a hand-written Default impl must keep it 0 because
+    // cycle_no_interrupt_check assumes a fresh CPU starts there.
     core_clocks_so_far: u64,
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
@@ -1540,7 +1536,7 @@ struct DecodeCache {
 }
 
 /// A tiny multiplicative hasher for the decode cache's `u32`-keyed `code_page_lin` map, replacing
-/// std's SipHash (N2, 2026-07-07 perf plan). `put` runs it on every decode-cache miss-fill; SipHash's
+/// std's SipHash. `put` runs it on every decode-cache miss-fill; SipHash's
 /// per-lookup cost is wasted on a small integer key. No new dependency: one Fibonacci-multiply on the
 /// `write_u32` path (the only path a `u32` key ever takes), with a byte fallback for completeness.
 #[derive(Default)]
@@ -2039,8 +2035,8 @@ const FP_TIMING_DEN: u32 = 8;
 /// 386/486: their FP rides `level_timing` alone, keeping the frozen-class
 /// bench bytes and the 486 Whetstone anchor (6.5 MFLOPS) untouched.
 ///
-/// The I586 values replace the old flat (31/34) scalar with the class shape the
-/// workload census demanded (dev_docs quake-fps-cal notes): Quake demo1's FP
+/// The I586 values replace the old flat (31/34) scalar with separate classes.
+/// Quake demo1's FP
 /// clocks are conversion/traffic-shaped (FILD/FIST + f32/f64 memory ops) while
 /// Whetstone's are register-arithmetic/transcendental-shaped, and the era
 /// anchors pull those classes in OPPOSITE directions (real P55C-200: Quake

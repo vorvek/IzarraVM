@@ -327,7 +327,7 @@ fn wall_shortfall_advances_devices_and_master_clock_together() {
 
 #[test]
 fn wall_shortfall_stops_at_a_vretrace_start_edge_and_then_makes_progress() {
-    // The P4d clamp: a top-up spanning a vretrace start edge must stop AT the
+    // A top-up spanning a vretrace start edge must stop AT the
     // edge (vretrace bit 3 already readable) and report the shorter consume,
     // so the GUI can grant a polling guest an execution quantum there instead
     // of sweeping the whole window past it unobserved.
@@ -375,7 +375,7 @@ fn wall_shortfall_stops_at_a_vretrace_start_edge_and_then_makes_progress() {
 
 #[test]
 fn paced_wall_topup_lets_a_polling_guest_catch_vretrace_windows() {
-    // Permanent port of the P4d investigation repro. A mode-13h guest
+    // A mode-13h guest
     // double-polling port 0x3DA (wait for vretrace to clear, then wait for
     // it to set) is driven with the GUI's Approximate-class pacing pattern
     // at a 1/8 execution share: run 1/8 of each ~1ms quantum, then top the

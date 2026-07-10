@@ -1,8 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! RAM page lookup for direct memory access (bypass for conventional + UMA etc).
-//! Extracted as part of Phase 3 memory map / RAM lookup construction carve.
+//! RAM page lookup for direct memory access, including conventional and UMA
+//! bypasses.
 
 use crate::vega::Vega;
 use crate::video_params::RAM_LOOKUP_PAGE_BITS;

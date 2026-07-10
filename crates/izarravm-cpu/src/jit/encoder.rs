@@ -1,10 +1,6 @@
-//! A minimal direct-byte x86-64 encoder, forked from the seed JIT (tag jit-seed-slice1a). Not a
-//! general assembler: only the instruction forms the emitted region chains need, each unit-tested
-//! against a hand-derived byte sequence. Comments referencing "the strcpy block" describe the
-//! seed emitter these primitives were proven on; the loop-region emitter reuses them unchanged.
-//!
-//! The v1 region chain uses only a subset (the call/test/branch scaffolding); the rest are kept
-//! dead for the planned inlining slices, each already unit-tested below.
+//! Minimal direct-byte x86-64 encoder for emitted region chains. It is not a
+//! general assembler. Each supported instruction form has a byte-level test.
+//! The region compiler uses only the subset it needs for a given host path.
 #![allow(dead_code)]
 
 /// A host x86-64 general-purpose register, numbered 0-15 in the standard encoding order
@@ -101,8 +97,8 @@ impl Encoder {
     }
 
     fn rex(&mut self, w: bool, r: bool, x: bool, b: bool) {
-        // REX prefix is only required when 64-bit-operand-size or an extended (8-15) register is
-        // used; Slice 1a always sets W=true for pointer/qword ops, so this is unconditional here.
+        // REX is required for 64-bit operands or extended registers. Pointer
+        // and qword operations always set W, so this prefix is unconditional.
         let byte =
             0x40 | (u8::from(w) << 3) | (u8::from(r) << 2) | (u8::from(x) << 1) | u8::from(b);
         self.bytes.push(byte);

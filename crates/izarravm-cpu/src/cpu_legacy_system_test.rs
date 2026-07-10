@@ -311,7 +311,7 @@ fn wait_is_a_nop_without_a_pending_x87_exception() {
     assert_eq!(cpu.registers.eflags, flags_before);
 }
 
-// ---- Phase 2 slice A: x87 FPU foundation (see dev_docs/coverage-roadmap.md) ----
+// ---- x87 FPU foundation ----
 
 #[test]
 fn fninit_then_fld1_pushes_one() {
@@ -395,7 +395,7 @@ fn fsub_reverse_forms_differ() {
     assert_eq!(cpu.fpu.get(0), 8.0);
 }
 
-// ---- Phase 2 slice B: x87 transcendentals ----
+// ---- x87 transcendentals ----
 
 #[test]
 fn f2xm1_of_one_is_one() {
@@ -445,7 +445,7 @@ fn fptan_replaces_st0_and_pushes_one() {
     assert_eq!(cpu.fpu.get(1), 0.0);
 }
 
-// ---- Phase 2 slice C: integer-operand arithmetic + 80-bit extended ----
+// ---- Integer-operand arithmetic and 80-bit extended precision ----
 
 #[test]
 fn fidiv_divides_by_an_integer_operand() {
@@ -475,7 +475,7 @@ fn extended80_round_trips_through_memory() {
     assert_eq!(cpu.fpu.get(0), 3.5);
 }
 
-// ---- Phase 2 slice D: BCD, environment, state save/restore, FUCOMPP ----
+// ---- BCD, environment, state save/restore, and FUCOMPP ----
 
 #[test]
 fn fbld_fbstp_round_trips_packed_bcd() {
@@ -534,7 +534,7 @@ fn fucompp_sets_equal_condition() {
     assert_eq!(cpu.fpu.top(), 0, "both operands popped");
 }
 
-// ---- Phase 3: MMX execute path (lane math is unit-tested in mmx.rs) ----
+// ---- MMX execute path; lane math is unit-tested in mmx.rs ----
 
 #[test]
 fn movd_then_movq_copies_registers() {
@@ -587,7 +587,7 @@ fn psllw_immediate_shifts_each_word() {
     assert_eq!(cpu.fpu.mm(0) & 0xffff_ffff, 0x0010_0020);
 }
 
-// ---- Phase 4 slice A: protected-mode system instructions ----
+// ---- Protected-mode system instructions ----
 
 #[test]
 fn smsw_stores_machine_status_word() {
@@ -1250,7 +1250,7 @@ fn lar_and_lsl_read_descriptor_fields() {
     assert_eq!(cpu.read_reg16(Reg16::Ax), 0xffff);
 }
 
-// ---- Phase 4 slice B: exception error codes and FPU #MF ----
+// ---- Exception error codes and FPU #MF ----
 
 #[test]
 fn error_code_vectors_are_classified() {
@@ -1308,7 +1308,7 @@ fn mf_is_suppressed_when_ne_is_clear() {
     }
 }
 
-// ---- Phase 4 slice C: call gates and privilege-level stack switching ----
+// ---- Call gates and privilege-level stack switching ----
 
 /// Protected-mode CPU with a GDT at 0x100 holding the given (selector, low, high)
 /// descriptors. CS/SS default to ring 0 (real-mode shells, base 0); SP at 0x80.
@@ -1631,7 +1631,7 @@ fn cpl_transition_pe_clear_resets_cpl_to_zero() {
     );
 }
 
-// ---- Phase 4 slice D: hardware task switch ----
+// ---- Hardware task switch ----
 
 #[test]
 fn jmp_to_tss_performs_a_task_switch() {
@@ -1681,7 +1681,7 @@ fn jmp_to_tss_performs_a_task_switch() {
     assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x89);
 }
 
-// ---- Phase 1 slice 2 cleanup: BOUND and INS/OUTS ----
+// ---- BOUND and INS/OUTS ----
 
 #[test]
 fn bound_passes_when_in_range() {
@@ -1749,7 +1749,7 @@ fn rep_outsw_writes_words_from_ds_si() {
     assert_eq!(cpu.read_reg16(Reg16::Si), 0x0104);
 }
 
-// ---- Phase 4 slice E: virtual-8086 mode ----
+// ---- Virtual-8086 mode ----
 
 #[test]
 fn v86_segment_load_uses_real_mode_base() {
@@ -1768,7 +1768,7 @@ fn v86_segment_load_uses_real_mode_base() {
 fn v86_far_call_uses_real_mode_segments() {
     // CALL FAR 0x8FA9:0x1234 (9A off16 seg16) in a V86 task must be an 8086-style
     // far call (CS = 0x8FA9, base 0x8FA90), never a GDT descriptor lookup — 0x8FA9
-    // is not a valid selector and would #GP. Regression for the SP-4b V86 boot:
+    // is not a valid selector and would #GP. Regression for the V86 boot:
     // real FreeDOS makes far calls to high segments while virtualized.
     let (mut cpu, memory) = real_mode_cpu(&[0x9a, 0x34, 0x12, 0xa9, 0x8f], 0x200);
     cpu.control.cr0 |= CR0_PE;

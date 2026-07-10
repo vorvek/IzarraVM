@@ -136,7 +136,7 @@ bios_start:
     ja .gsw_keep
     out PORT_LOTURA_MODE, al
 .gsw_keep:
-    call setup_maybe_enter     ; STREAM D setup-page hook (foundation stub: ret)
+    call setup_maybe_enter     ; setup-page hook
     ; Load the boot code-page font (CMOS 0x13) into the VGA character generator.
     ; This runs after POST so the BDA character height (0040:0085) is settled and
     ; the host has seeded the font tables for the default 8x16 text mode.

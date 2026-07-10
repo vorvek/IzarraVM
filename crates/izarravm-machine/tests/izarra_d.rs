@@ -1,4 +1,4 @@
-// STREAM D integration test: the Margo-LFB setup page.
+// Integration test for the Margo-LFB setup page.
 //
 // Drives the public Machine API only. The setup page is a multi-row menu; the GSW
 // compatibility mode is the third selectable row (Time, Keyboard, CPU mode, ...),

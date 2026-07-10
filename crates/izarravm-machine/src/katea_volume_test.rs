@@ -45,7 +45,7 @@ fn extracts_the_embedded_image_payload() {
     );
 
     // TOKAMOUS.COM ships as a synthesized binary; the default AUTOEXEC loads it
-    // HIGH into a TOKAEMM UMB (SP-4b M4).
+    // HIGH into a TOKAEMM UMB.
     assert!(by_name.contains_key("TOKAMOUS.COM"), "TOKAMOUS.COM present");
     let autoexec = by_name.get("AUTOEXEC.BAT").expect("AUTOEXEC.BAT present");
     assert!(
@@ -57,7 +57,7 @@ fn extracts_the_embedded_image_payload() {
         "default AUTOEXEC loads the mouse driver high"
     );
 
-    // SP-4b M4: TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
+    // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
     // loads it (frameless NOEMS) with DOS=HIGH,UMB — every default boot runs
     // FreeDOS in V86 under the guest memory manager. BYTE compare, not a
     // length compare: the driver's resident envelope is padded to a fixed

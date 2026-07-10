@@ -164,7 +164,7 @@ fn slave_channel_5_auto_init_reloads_and_keeps_feeding() {
     assert_eq!(dma.read_word(5, &mut mem), Some(0x5678), "buffer restarts");
 }
 
-// --- Slice 1: page register read-back ---
+// Page register read-back.
 
 #[test]
 fn channel_page_ports_read_back_what_was_written() {
@@ -228,7 +228,7 @@ fn refresh_page_0x8f_is_its_own_latch_not_slave_channel_zero() {
     assert_eq!(dma.slave.channels[0].page, 0x00);
 }
 
-// --- Slice 2: status request-active bits ---
+// Status request-active bits.
 
 #[test]
 fn status_reflects_software_request_bits_without_clearing_them() {
@@ -267,7 +267,7 @@ fn status_tc_bits_clear_but_request_bits_persist() {
     assert_eq!(s2 & (1 << 5), 1 << 5, "request bit remains");
 }
 
-// --- Slice 3: mode register transfer-mode field ---
+// Mode register transfer-mode field.
 
 #[test]
 fn set_mode_decodes_the_transfer_mode_field() {
@@ -279,7 +279,7 @@ fn set_mode_decodes_the_transfer_mode_field() {
     }
 }
 
-// --- Slice 4: device->memory write and verify datapaths ---
+// Device-to-memory write and verify datapaths.
 
 #[test]
 fn write_transfer_stores_to_memory_steps_and_signals_tc() {
@@ -460,7 +460,7 @@ fn chip_write_word_latches_terminal_count_into_status() {
     );
 }
 
-// --- Slice 5: command register and memory-to-memory transfer ---
+// Command register and memory-to-memory transfer.
 
 #[test]
 fn command_register_round_trips_through_port_0x08() {

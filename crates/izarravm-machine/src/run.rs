@@ -183,10 +183,7 @@ impl Machine {
             self.io_touched = false;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
-            // Batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
-            // Task 1.1). Captured here, before the fields below are moved into the
-            // destructure, so they reflect live machine state at the moment this
-            // batch's MachineBus is built (the one that matters for Slice 1).
+            // Capture live timing state before the fields move into MachineBus.
             let timeline_at_batch_start = self.timeline;
             let master_ticks_at_batch_start = self.timeline.now_ticks();
             let beam_at_batch_start = self.vega.beam_dots();

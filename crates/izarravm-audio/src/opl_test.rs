@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Differential test for `Timer::expired_after` (P4a Slice 3 Task 3.1): for
+/// For
 /// every `Timer` state in the sweep and every `micros_elapsed`, peeking must
 /// report the exact same `expired` a real `.advance(micros_elapsed, preset)`
 /// on a clone would produce, without mutating the original. Sweeps running/
@@ -55,7 +55,7 @@ fn expired_after_matches_a_real_advance_on_a_clone() {
     }
 }
 
-/// Differential test for `OplChip::status_after` (P4a Slice 3 Task 3.2): the
+/// The
 /// predicted status byte at T microseconds from now must equal what a real
 /// `advance_micros(T)` followed by `status()` would produce, across both
 /// timers running, various presets/masks, and T values straddling the

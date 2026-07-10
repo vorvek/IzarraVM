@@ -69,7 +69,7 @@ mod error {
 /// (the today path: a mounted .img); a host-folder facade serves sectors lazily
 /// from a `KateaTreeVolume` over a host directory tree, so a huge/deep folder
 /// never lands in memory. Writes to the facade route into the volume's in-memory
-/// overlay (M2) and are reconciled to host files on command completion.
+/// overlay and are reconciled to host files on command completion.
 #[derive(Debug)]
 enum Backing {
     /// A flat sector array, addressed by `lba * SECTOR`.
@@ -297,7 +297,7 @@ impl AtaDisk {
         matches!(self.backing, Backing::Image(_))
     }
 
-    /// Run the host-folder reconcile pass (M2). A no-op for an image-backed disk.
+    /// Run the host-folder reconcile pass. A no-op for an image-backed disk.
     /// The machine calls this at eject/flush so anything held in the overlay is a
     /// final-pass materialized to the host folder.
     pub fn reconcile_host_folder(&mut self) {
@@ -327,7 +327,7 @@ impl AtaDisk {
 
     /// Overwrite one whole 512-byte sector at `lba`. Returns false if past the end
     /// or `data` is short. An image writes in place; a host-folder facade routes the
-    /// write into its overlay (M2) and reconciles on command completion.
+    /// write into its overlay and reconciles on command completion.
     pub fn write_lba(&mut self, lba: u32, data: &[u8]) -> bool {
         if data.len() < SECTOR {
             return false;
