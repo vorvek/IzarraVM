@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; disttri.asm — Distira slice 1 guest proof: hand-written x86 that finds the
 ; Distira 3D card via PCI configuration space, maps its BAR0 aperture,
 ; initializes the minimal SST-1 register state, and draws one flat-shaded
@@ -198,7 +201,7 @@ protected_entry:
     mov dword [ASSIGNED_BAR + SST_TRIANGLE_CMD], 1
 
     ; ---- Present: swap back to front ----
-    mov dword [ASSIGNED_BAR + SST_SWAPBUFFER_CMD], 1
+    mov dword [ASSIGNED_BAR + SST_SWAPBUFFER_CMD], 0
 
     mov al, EXIT_OK
 

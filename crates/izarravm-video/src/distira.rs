@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Distira, VEGA's Glide-capable 3D unit. This first slice models the Voodoo
 //! Graphics style scanout path: a 16-bit RGB565 front/back frame store, buffer
 //! swaps, ordered dither, simple triangle setup, and exact host-color decode.
@@ -13,6 +16,8 @@ pub use registers::*;
 
 const CONTROL_DITHER: u32 = 1 << 1;
 const STATUS_DISPLAY_ENABLED: u32 = 1 << 1;
+const SWAPBUFFER_SYNC_TO_RETRACE: u32 = 1;
+const SWAPBUFFER_INTERVAL_MASK: u32 = 0xff;
 const DISTIRA_TMU_CONFIG: u8 = 1 | (1 << 6) | (1 << 7);
 const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
@@ -86,6 +91,12 @@ enum DistiraFifoEntry {
     TextureU32 { offset: usize, value: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSwap {
+    target_base: u32,
+    interval: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distira {
     fb: Vec<u8>,
@@ -93,6 +104,7 @@ pub struct Distira {
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
     display: DistiraDisplay,
+    scanout_base: u32,
     aux_base: u32,
     buffer_stride: u32,
     display_enabled: bool,
@@ -180,16 +192,12 @@ pub struct Distira {
     /// write's side effect (address decode, PLL register update, or ICS
     /// probe response) runs once the whole dword has been assembled.
     dac_data_write: u32,
-    /// A monotonically increasing beam-position counter, in scanline units,
-    /// advanced by `advance_frame_phase`. This is a lightweight frame-phase
-    /// clock rather than true dot-clock beam coupling (the plan's
-    /// "acceptable" fallback): real hardware ties `SST_vRetrace`/
-    /// `SST_hvRetrace`/`SST_STATUS`'s vsync bit to the actual CRTC beam
-    /// position, but Distira's own scanout does not model a dot clock, so
-    /// this just needs to make forward progress and periodically enter/exit
-    /// a "retrace" window so a `grSstVRetrace()`-shaped poll loop (wait for
-    /// either edge) always terminates.
+    /// Current line in the fixed 525-line SST-1 scanout phase.
     frame_phase_line: u32,
+    retrace_count: u64,
+    swapbuffer_command: u32,
+    pending_swap: Option<PendingSwap>,
+    swap_commands: VecDeque<u32>,
     texture_mode: u32,
     texture_mode_tmu1: u32,
     texture_lod: u32,
@@ -227,6 +235,7 @@ impl Distira {
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
             display,
+            scanout_base: display.front_base,
             aux_base: buffer_stride * 2,
             buffer_stride,
             display_enabled: false,
@@ -299,6 +308,10 @@ impl Distira {
             dac_reg_ff: false,
             dac_data_write: 0,
             frame_phase_line: 0,
+            retrace_count: 0,
+            swapbuffer_command: 0,
+            pending_swap: None,
+            swap_commands: VecDeque::new(),
             texture_mode: 0,
             texture_mode_tmu1: 0,
             texture_lod: 0,
@@ -356,6 +369,8 @@ impl Distira {
         if self.fbi_init[0] & FBIINIT0_GRAPHICS_RESET != 0 {
             self.display.front_base = 0;
             self.display.back_base = self.buffer_stride;
+            self.scanout_base = 0;
+            self.reset_swap_state();
         }
     }
 
@@ -369,9 +384,11 @@ impl Distira {
         self.fbi_init[1] = (new & !5) | (old & 5);
         if old & FBIINIT1_VIDEO_RESET != 0 && self.fbi_init[1] & FBIINIT1_VIDEO_RESET == 0 {
             self.frame_phase_line = 0;
+            self.reset_swap_state();
             self.display_enabled = self.fbi_init[0] & FBIINIT0_VGA_PASS == 0;
         } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET != 0 {
             self.display_enabled = false;
+            self.reset_swap_state();
         }
         self.recalculate_fbi_layout();
     }
@@ -393,6 +410,10 @@ impl Distira {
         let old_stride = self.buffer_stride;
         let front_buffer = self.display.front_base.checked_div(old_stride).unwrap_or(0);
         let back_buffer = self.display.back_base.checked_div(old_stride).unwrap_or(1);
+        let scanout_buffer = self.scanout_base.checked_div(old_stride).unwrap_or(0);
+        let pending_buffer = self
+            .pending_swap
+            .map(|swap| swap.target_base.checked_div(old_stride).unwrap_or(0));
         let stride = ((self.fbi_init[2] & FBIINIT2_BUFFER_OFFSET_MASK)
             >> FBIINIT2_BUFFER_OFFSET_SHIFT)
             * 4096;
@@ -401,6 +422,10 @@ impl Distira {
         self.display.pitch = tiles * 128;
         self.display.front_base = front_buffer.min(2).saturating_mul(stride);
         self.display.back_base = back_buffer.min(2).saturating_mul(stride);
+        self.scanout_base = scanout_buffer.min(2).saturating_mul(stride);
+        if let (Some(buffer), Some(pending)) = (pending_buffer, self.pending_swap.as_mut()) {
+            pending.target_base = buffer.min(2).saturating_mul(stride);
+        }
         self.aux_base = stride.saturating_mul(if self.fbi_init[2] & FBIINIT2_TRIPLE_BUFFER != 0 {
             3
         } else {
@@ -421,13 +446,94 @@ impl Distira {
     /// Advance a 525-line, 60 Hz scanout by whole lines. The machine timeline
     /// generates these independently of CPU mode.
     pub fn advance_frame_phase(&mut self, lines: u64) {
-        let total = u64::from(FRAME_PHASE_TOTAL_LINES);
-        let line = (u64::from(self.frame_phase_line) + lines) % total;
-        self.frame_phase_line = line as u32;
+        let total = u128::from(FRAME_PHASE_TOTAL_LINES);
+        let retrace_start = u128::from(FRAME_PHASE_TOTAL_LINES - FRAME_PHASE_VRETRACE_LINES);
+        let old = u128::from(self.frame_phase_line);
+        let advanced = old + u128::from(lines);
+        let edges_through = |position: u128| {
+            if position < retrace_start {
+                0
+            } else {
+                (position - retrace_start) / total + 1
+            }
+        };
+        let retrace_edges = edges_through(advanced) - edges_through(old);
+        self.frame_phase_line = (advanced % total) as u32;
+        self.advance_retrace_edges(retrace_edges as u64);
     }
 
     fn in_vretrace(&self) -> bool {
         self.frame_phase_line >= FRAME_PHASE_TOTAL_LINES - FRAME_PHASE_VRETRACE_LINES
+    }
+
+    fn advance_retrace_edges(&mut self, mut edges: u64) {
+        while edges > 0 {
+            let Some(pending) = self.pending_swap else {
+                self.retrace_count = self.retrace_count.saturating_add(edges);
+                return;
+            };
+            let interval = u64::from(pending.interval);
+            let until_swap = if self.retrace_count > interval {
+                1
+            } else {
+                interval + 1 - self.retrace_count
+            };
+            if edges < until_swap {
+                self.retrace_count = self.retrace_count.saturating_add(edges);
+                return;
+            }
+
+            edges -= until_swap;
+            self.pending_swap = None;
+            self.retrace_count = 0;
+            self.present_swap(pending.target_base);
+            self.start_next_swap();
+        }
+    }
+
+    fn reset_swap_state(&mut self) {
+        self.retrace_count = 0;
+        self.swapbuffer_command = 0;
+        self.pending_swap = None;
+        self.swap_commands.clear();
+    }
+
+    fn rotate_buffers(&mut self) {
+        if self.fbi_init[2] & FBIINIT2_TRIPLE_BUFFER != 0 && self.buffer_stride != 0 {
+            let stride = self.buffer_stride;
+            self.display.front_base = ((self.display.front_base / stride + 1) % 3) * stride;
+            self.display.back_base = ((self.display.back_base / stride + 1) % 3) * stride;
+        } else {
+            std::mem::swap(&mut self.display.front_base, &mut self.display.back_base);
+        }
+    }
+
+    fn present_swap(&mut self, target_base: u32) {
+        self.scanout_base = target_base;
+        self.display_enabled = true;
+    }
+
+    fn issue_swapbuffer_command(&mut self, value: u32) {
+        self.swap_commands.push_back(value);
+        self.start_next_swap();
+    }
+
+    fn start_next_swap(&mut self) {
+        while self.pending_swap.is_none() {
+            let Some(value) = self.swap_commands.pop_front() else {
+                return;
+            };
+            self.rotate_buffers();
+            let target_base = self.display.front_base;
+            if value & SWAPBUFFER_SYNC_TO_RETRACE == 0 {
+                self.present_swap(target_base);
+            } else {
+                self.pending_swap = Some(PendingSwap {
+                    target_base,
+                    interval: ((value >> 1) & SWAPBUFFER_INTERVAL_MASK) as u8,
+                });
+            }
+        }
     }
 
     pub const fn chip_names(&self) -> [&'static str; 2] {
@@ -462,6 +568,8 @@ impl Distira {
             front_base: 0,
             back_base: frame,
         };
+        self.scanout_base = self.display.front_base;
+        self.reset_swap_state();
         self.buffer_stride = frame;
         self.aux_base = frame.saturating_mul(2);
         self.clip_right = self.clip_right.min(width);
@@ -480,8 +588,8 @@ impl Distira {
     }
 
     pub fn swap_buffers(&mut self) {
-        std::mem::swap(&mut self.display.front_base, &mut self.display.back_base);
-        self.display_enabled = true;
+        self.rotate_buffers();
+        self.present_swap(self.display.front_base);
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
@@ -589,7 +697,7 @@ impl Distira {
         let width = self.display.width as usize;
         let height = self.display.height as usize;
         let pitch = self.display.pitch as u64;
-        let start = self.display.front_base as u64;
+        let start = self.scanout_base as u64;
         let len = self.fb.len() as u64;
         let mut out = Vec::with_capacity(width * height);
         for y in 0..height as u64 {
@@ -1124,8 +1232,9 @@ impl Distira {
                 }
             }
             SST_SWAPBUFFER_CMD => {
-                if byte == 0 && value != 0 {
-                    self.swap_buffers();
+                merge_byte(&mut self.swapbuffer_command, byte, value);
+                if byte == 3 {
+                    self.issue_swapbuffer_command(self.swapbuffer_command);
                 }
             }
             SST_FOG_COLOR => merge_byte(&mut self.fog_color, byte, value),
@@ -1310,7 +1419,10 @@ impl Distira {
                 merge_byte(&mut height, byte, value);
                 self.set_frame_size(self.display.width, height);
             }
-            DISTIRA_REG_FRONT_BASE => merge_byte(&mut self.display.front_base, byte, value),
+            DISTIRA_REG_FRONT_BASE => {
+                merge_byte(&mut self.display.front_base, byte, value);
+                merge_byte(&mut self.scanout_base, byte, value);
+            }
             DISTIRA_REG_BACK_BASE => merge_byte(&mut self.display.back_base, byte, value),
             DISTIRA_REG_CLEAR_COLOR => merge_byte(&mut self.clear_color, byte, value),
             DISTIRA_REG_COMMAND => {
@@ -1643,13 +1755,9 @@ impl Distira {
             SST_FBI_INIT3 => self.fbi_init[3] | (1 << 10) | (2 << 8),
             SST_H_SYNC => self.h_sync,
             SST_V_SYNC => self.v_sync,
-            // Real hardware packs a horizontal line-time fraction into the
-            // low bits and the current scanline into the high bits
-            // (SST_hvRetrace, gsst.c); this frame-phase counter has no
-            // sub-line horizontal position to report, so it exposes the
-            // scanline alone shifted into the same field. Any real vsync
-            // poll only needs this nonzero and moving, not sub-line exact.
-            SST_HV_RETRACE => self.frame_phase_line << 16,
+            // The low field is the scanline. Distira has no horizontal dot
+            // phase yet, so the high horizontal-position field remains zero.
+            SST_HV_RETRACE => self.frame_phase_line & 0x1fff,
             SST_FBI_INIT5 => self.fbi_init[5] & !0x1ff,
             SST_FBI_INIT6 => self.fbi_init[6],
             SST_FBI_INIT7 => self.fbi_init[7] & !0xff,
@@ -1679,17 +1787,15 @@ impl Distira {
 
     fn status_value(&self) -> u32 {
         // 86Box reports a large free FIFO count plus low empty bits when idle.
-        // This synchronous first slice keeps work in a host-drained queue, so
-        // expose the same busy bit shape while any FIFO entry is pending.
-        // Bit 6 (0x40) is the vsync status bit: 86Box's SST_status handler
-        // sets it when NOT in vertical retrace ("if (!voodoo->v_retrace)
-        // temp |= 0x40"), so it is part of the base mask here and cleared
-        // while advance_frame_phase has the beam inside the retrace window.
+        // Bit 6 is set outside vertical retrace. Bits 28 through 30 hold the
+        // number of submitted swaps, capped at seven.
         let mut status = 0x0fff_f07f;
         if self.in_vretrace() {
             status &= !0x40;
         }
-        if !self.fifo_is_empty() {
+        let swap_count = usize::from(self.pending_swap.is_some()) + self.swap_commands.len();
+        status |= (swap_count.min(7) as u32) << 28;
+        if !self.fifo_is_empty() || swap_count != 0 {
             status |= 0x380;
         }
         status

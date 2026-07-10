@@ -121,10 +121,101 @@ fn voodoo_fastfill_and_swap_present_the_back_buffer() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_COLOR1, 0x0034_5678);
     write_reg(&mut distira, SST_FASTFILL_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame, vec![0x0031_557b; 4]);
+}
+
+#[test]
+fn swapbuffer_command_distinguishes_immediate_and_retrace_swaps() {
+    const STATUS_BUSY: u32 = 0x380;
+    const STATUS_SWAP_COUNT: u32 = 0x7000_0000;
+
+    let mut immediate = Distira::new();
+    immediate.set_frame_size(1, 1);
+    immediate.clear_back_rgb(0xff, 0, 0);
+    write_reg(&mut immediate, SST_SWAPBUFFER_CMD, 0);
+    assert_eq!(immediate.scanout_argb(), vec![0x00ff_0000]);
+    assert_eq!(read_reg(&immediate, SST_STATUS) & STATUS_BUSY, 0);
+    assert_eq!(read_reg(&immediate, SST_STATUS) & STATUS_SWAP_COUNT, 0);
+
+    let mut queued = Distira::new();
+    queued.set_frame_size(1, 1);
+    queued.clear_back_rgb(0xff, 0, 0);
+    write_reg(&mut queued, SST_SWAPBUFFER_CMD, 1);
+    assert_eq!(queued.scanout_argb(), vec![0]);
+    assert_eq!(read_reg(&queued, SST_STATUS) & STATUS_BUSY, STATUS_BUSY);
+    assert_eq!(
+        read_reg(&queued, SST_STATUS) & STATUS_SWAP_COUNT,
+        0x1000_0000
+    );
+
+    queued.advance_frame_phase(479);
+    assert_eq!(queued.scanout_argb(), vec![0]);
+    queued.advance_frame_phase(1);
+    assert_eq!(queued.scanout_argb(), vec![0x00ff_0000]);
+    assert_eq!(read_reg(&queued, SST_STATUS) & STATUS_BUSY, 0);
+    assert_eq!(read_reg(&queued, SST_STATUS) & STATUS_SWAP_COUNT, 0);
+    assert_eq!(read_reg(&queued, SST_STATUS) & 0x40, 0);
+}
+
+#[test]
+fn retrace_swap_honors_the_requested_interval() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+    distira.clear_back_rgb(0, 0xff, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1 | (1 << 1));
+
+    distira.advance_frame_phase(480);
+    assert_eq!(distira.scanout_argb(), vec![0]);
+    assert_ne!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+
+    distira.advance_frame_phase(524);
+    assert_eq!(distira.scanout_argb(), vec![0]);
+    distira.advance_frame_phase(1);
+    assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
+    assert_eq!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+}
+
+#[test]
+fn queued_retrace_swaps_commit_in_submission_order() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    distira.clear_back_rgb(0xff, 0, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    distira.clear_back_rgb(0, 0, 0xff);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(read_reg(&distira, SST_STATUS) & 0x7000_0000, 0x2000_0000);
+    distira.advance_frame_phase(480);
+    assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
+    assert_eq!(read_reg(&distira, SST_STATUS) & 0x7000_0000, 0x1000_0000);
+    assert_ne!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+
+    distira.advance_frame_phase(525);
+    assert_eq!(distira.scanout_argb(), vec![0x0000_00ff]);
+    assert_eq!(read_reg(&distira, SST_STATUS) & 0x7000_0000, 0);
+    assert_eq!(read_reg(&distira, SST_STATUS) & 0x380, 0);
+}
+
+#[test]
+fn retrace_swap_is_invariant_to_split_frame_advances() {
+    let mut whole = Distira::new();
+    whole.set_frame_size(1, 1);
+    whole.clear_back_rgb(0, 0, 0xff);
+    write_reg(&mut whole, SST_SWAPBUFFER_CMD, 1 | (2 << 1));
+    let mut split = whole.clone();
+
+    whole.advance_frame_phase(1_530);
+    for lines in [479, 1, 200, 325, 524, 1] {
+        split.advance_frame_phase(lines);
+    }
+
+    assert_eq!(split, whole);
+    assert_eq!(whole.scanout_argb(), vec![0x0000_00ff]);
+    assert_eq!(read_reg(&whole, SST_STATUS) & 0x380, 0);
 }
 
 #[test]
@@ -159,7 +250,7 @@ fn voodoo_fifo_drains_queued_register_and_lfb_writes_in_order() {
         LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
     );
     direct.write_lfb_u32(0, 0x0034_5678);
-    write_reg(&mut direct, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut direct, SST_SWAPBUFFER_CMD, 0);
 
     let mut queued = Distira::new();
     queued.set_frame_size(2, 1);
@@ -170,7 +261,7 @@ fn voodoo_fifo_drains_queued_register_and_lfb_writes_in_order() {
     queued.queue_register_write(SST_FASTFILL_CMD, 1);
     queued.queue_register_write(SST_LFB_MODE, LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK);
     queued.queue_lfb_write_u32(0, 0x0034_5678);
-    queued.queue_register_write(SST_SWAPBUFFER_CMD, 1);
+    queued.queue_register_write(SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(queued.fifo_depth(), 8);
     assert!(!queued.fifo_is_empty());
@@ -395,7 +486,7 @@ fn w_buffer_mode_orders_depth_by_nearer_reciprocal_w() {
     write_reg(&mut distira, SST_DW_DX, 0);
     write_reg(&mut distira, SST_DW_DY, 0);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(
@@ -449,7 +540,7 @@ fn z_buffer_mode_is_unaffected_by_the_w_buffer_wiring() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
     write_reg(&mut distira, SST_START_Z, 0x0200 << 12);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x00ff_0000);
@@ -483,10 +574,14 @@ fn v_retrace_and_status_bit_toggle_so_a_poll_loop_terminates() {
         } else {
             saw_retracing = true;
         }
-        if read_reg(&distira, SST_V_RETRACE) != initial_v_retrace {
+        let v_retrace = read_reg(&distira, SST_V_RETRACE);
+        let hv_retrace = read_reg(&distira, SST_HV_RETRACE);
+        assert_eq!(hv_retrace & 0x1fff, v_retrace);
+        assert_eq!(hv_retrace >> 16, 0);
+        if v_retrace != initial_v_retrace {
             v_retrace_changed = true;
         }
-        if read_reg(&distira, SST_HV_RETRACE) != 0 {
+        if hv_retrace != 0 {
             hv_retrace_nonzero = true;
         }
     }

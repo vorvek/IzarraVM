@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 use izarravm_video::*;
 
 fn read_reg(distira: &Distira, reg: usize) -> u32 {
@@ -45,7 +48,7 @@ fn draw_textured_alpha_probe(
     write_reg(&mut distira, SST_START_A, start_a << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     (
         distira.scanout_argb(),
@@ -81,7 +84,7 @@ fn draw_textured_color_probe(
     write_reg(&mut distira, SST_START_A, start_a << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
     distira.scanout_argb()
 }
 
@@ -360,7 +363,7 @@ fn triangle_cmd_alpha_mask_rejects_even_selected_alpha() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
     write_reg(&mut distira, SST_START_A, 0xff << 12);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x0000_00ff);
 }
@@ -391,7 +394,7 @@ fn triangle_cmd_alpha_mask_allows_odd_selected_alpha() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
     write_reg(&mut distira, SST_START_A, 0xff << 12);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x0000_ff00);
 }
@@ -418,7 +421,7 @@ fn triangle_cmd_without_depth_write_mask_does_not_update_depth() {
         0x00ff00,
         0x8000,
     );
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x0000_ff00);
 }
@@ -449,7 +452,7 @@ fn triangle_cmd_with_depth_write_mask_updates_depth() {
         0x00ff00,
         0x8000,
     );
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x00ff_0000);
 }
@@ -476,7 +479,7 @@ fn triangle_cmd_depth_only_draw_updates_depth_without_rgb_writes() {
         0x00ff00,
         0x8000,
     );
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb()[0], 0x0000_00ff);
 }
@@ -499,7 +502,7 @@ fn triangle_cmd_draw_back_waits_for_swap_before_scanout() {
     draw_solid_depth_triangle(&mut distira, FBZ_RGB_WMASK | FBZ_DRAW_BACK, 0xff0000, 0);
     assert_eq!(distira.scanout_argb()[0], 0x0000_0000);
 
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
     assert_eq!(distira.scanout_argb()[0], 0x00ff_0000);
 }
 
@@ -529,7 +532,7 @@ fn voodoo_lfb_writes_rgb555_dwords_to_back_buffer() {
         LFB_FORMAT_RGB555 | LFB_WRITE_BACK,
     );
     distira.write_lfb_u32(0, 0x03e0_7c00);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000, 0x0000_ff00]);
 }
@@ -545,7 +548,7 @@ fn voodoo_lfb_writes_argb1555_dwords_to_back_buffer() {
         LFB_FORMAT_ARGB1555 | LFB_WRITE_BACK,
     );
     distira.write_lfb_u32(0, 0x83e0_fc00);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000, 0x0000_ff00]);
 }
@@ -561,7 +564,7 @@ fn voodoo_lfb_writes_rgb565_dword_as_two_pixels() {
         LFB_FORMAT_RGB565 | LFB_WRITE_BACK,
     );
     distira.write_lfb_u32(0, 0x07e0_f800);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000, 0x0000_ff00]);
 }
@@ -577,7 +580,7 @@ fn voodoo_lfb_depth_dword_writes_two_aux_pixels() {
         LFB_FORMAT_DEPTH | LFB_WRITE_BACK | LFB_READ_AUX,
     );
     distira.write_lfb_u32(0, 0x2222_1111);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_0000]);
     assert_eq!(
@@ -599,7 +602,7 @@ fn voodoo_lfb_depth_rgb565_dword_writes_one_color_and_depth_pixel() {
         LFB_FORMAT_DEPTH_RGB565 | LFB_WRITE_BACK | LFB_READ_AUX,
     );
     distira.write_lfb_u32(4, 0x3333_f800);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x00ff_0000]);
     assert_eq!(distira.read_lfb_u8(2), 0x33);
@@ -617,7 +620,7 @@ fn voodoo_lfb_depth_rgb555_dword_converts_color_and_depth() {
         LFB_FORMAT_DEPTH_RGB555 | LFB_WRITE_BACK | LFB_READ_AUX,
     );
     distira.write_lfb_u32(0, 0x4444_03e0);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
     assert_eq!(distira.read_lfb_u8(0), 0x44);
@@ -635,7 +638,7 @@ fn voodoo_lfb_depth_argb1555_dword_converts_color_and_depth() {
         LFB_FORMAT_DEPTH_ARGB1555 | LFB_WRITE_BACK | LFB_READ_AUX,
     );
     distira.write_lfb_u32(0, 0x5555_fc00);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
     assert_eq!(distira.read_lfb_u8(0), 0x55);
@@ -654,7 +657,7 @@ fn voodoo_lfb_pipeline_respects_rgb_write_mask() {
     );
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_DRAW_BACK);
     distira.write_lfb_u32(0, 0x07e0_f800);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_0000]);
 }
@@ -805,7 +808,7 @@ fn voodoo_lfb_pipeline_alpha_blends_argb8888_over_destination() {
     );
 
     distira.write_lfb_u32(0, 0x80ff_0000);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0084_007b]);
 }
@@ -831,7 +834,7 @@ fn voodoo_lfb_pipeline_alpha_blends_rgb565_with_opaque_source_alpha() {
     );
 
     distira.write_lfb_u32(0, 0x0000_f800);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_00ff]);
 }
@@ -937,7 +940,7 @@ fn voodoo_lfb_word_rgb565_runs_pixel_pipeline_alpha_blend() {
     );
 
     distira.write_lfb_u16(0, 0xf800);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_00ff]);
 }

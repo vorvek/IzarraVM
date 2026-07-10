@@ -37,7 +37,7 @@ fn triangle_cmd_selects_color1_over_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x00ff_0000);
@@ -76,7 +76,7 @@ fn triangle_cmd_selects_lfb_over_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
@@ -118,7 +118,7 @@ fn triangle_cmd_adds_color0_local_to_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x00ff_ff00);
@@ -160,7 +160,7 @@ fn triangle_cmd_subtracts_color0_local_from_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
@@ -203,7 +203,7 @@ fn triangle_cmd_reverse_blends_color0_local_with_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_8200);
@@ -245,7 +245,7 @@ fn triangle_cmd_nonreverse_blends_color0_local_with_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_7d00);
@@ -284,7 +284,7 @@ fn triangle_cmd_inverts_texture_color_path_output() {
     write_reg(&mut distira, SST_START_B, 0);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x00ff_00ff);
@@ -325,7 +325,7 @@ fn triangle_cmd_adds_alocal_to_texture_color_path() {
     write_reg(&mut distira, SST_START_A, 0x40 << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0042_ff42);
@@ -367,7 +367,7 @@ fn triangle_cmd_modulates_texture_color_path_by_aother() {
     write_reg(&mut distira, SST_START_A, 0x40 << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_4100);
@@ -409,7 +409,7 @@ fn triangle_cmd_modulates_texture_color_path_by_alocal() {
     write_reg(&mut distira, SST_START_A, 0x40 << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_4100);
@@ -451,7 +451,7 @@ fn triangle_cmd_modulates_texture_color_path_by_texture_alpha() {
     write_reg(&mut distira, SST_START_A, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_4500);
@@ -494,7 +494,7 @@ fn triangle_cmd_modulates_color1_path_by_texture_rgb() {
     write_reg(&mut distira, SST_START_B, 0);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_ff00);
@@ -533,7 +533,7 @@ fn triangle_cmd_zero_other_zeros_texture_color_path() {
     write_reg(&mut distira, SST_START_B, 0xff << 12);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_0000);

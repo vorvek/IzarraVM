@@ -1,7 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-use izarravm_core::VideoCard;
+use izarravm_core::{GswMode, MASTER_CLOCK_HZ, VideoCard};
 use izarravm_firmware::{DISTTRI_BIN, I386DX25_TEST_ROM};
 use izarravm_machine::{
     ActiveDisplay, BIOS_ROM_SIZE, DISTIRA_LFB_BASE, DISTIRA_MMIO_BASE, Machine, MachineProfile,
@@ -158,7 +158,7 @@ fn draw_texture_sample_at(machine: &mut Machine, base: u32, tmu: usize) -> u32 {
     write_reg_at(machine, base, SST_START_B, 0xff << 12);
     write_reg_at(machine, base, SST_START_A, 0xff << 12);
     write_reg_at(machine, base, SST_TRIANGLE_CMD, 1);
-    write_reg_at(machine, base, SST_SWAPBUFFER_CMD, 1);
+    write_reg_at(machine, base, SST_SWAPBUFFER_CMD, 0);
     machine.frame_argb().0[0]
 }
 
@@ -323,7 +323,7 @@ fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
     write_reg(&mut machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut machine, SST_COLOR1, 0x0034_5678);
     write_reg(&mut machine, SST_FASTFILL_CMD, 1);
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(machine.active_display(), ActiveDisplay::Distira);
     let (frame, width, height) = machine.frame_argb();
@@ -347,7 +347,7 @@ fn distira_lfb_dword_writes_follow_voodoo_lfb_format() {
         LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
     );
     machine.write_physical_u32(DISTIRA_LFB_BASE, 0x0034_5678);
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 0);
 
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
@@ -381,7 +381,7 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
     );
 
     machine.write_physical_u16(DISTIRA_LFB_BASE, 0xf800);
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 0);
 
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (1, 1));
@@ -426,7 +426,7 @@ fn distira_odd_aligned_lfb_word_dword_accesses_use_voodoo_callbacks() {
 
     machine.write_physical_u32(DISTIRA_LFB_BASE + 2, 0x07e0_001f);
     assert_eq!(machine.read_physical_u32(DISTIRA_LFB_BASE + 3), 0x07e0_001f);
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 0);
 
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (4, 1));
@@ -459,7 +459,7 @@ fn distira_guest_lfb_bar_odd_reads_and_writes_use_voodoo_callbacks() {
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_LFB + 2, 0x07e0_001f);
     push_load_eax_moffs(&mut code, ASSIGNED_LFB + 3);
     push_store_eax_moffs(&mut code, SCRATCH + 4);
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_SWAPBUFFER_CMD as u32, 1);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_SWAPBUFFER_CMD as u32, 0);
 
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
@@ -532,7 +532,7 @@ fn distira_guest_cmdfifo_type1_packets_use_assigned_bar_aperture() {
         CMD_FIFO_BASE + 40,
         cmdfifo_type1_header(SST_SWAPBUFFER_CMD, 1),
     );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 44, 1);
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 44, 0);
 
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
@@ -614,7 +614,7 @@ fn distira_guest_cmdfifo_type5_framebuffer_packets_use_assigned_bar_aperture() {
     );
 
     machine.drain_distira_fifo();
-    write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 1);
+    write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(
         read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
@@ -898,7 +898,7 @@ fn distira_pci_bar_maps_voodoo_mmio_and_lfb_windows() {
         u32::MAX
     );
     machine.write_physical_u32(ASSIGNED_LFB, 0x0034_5678);
-    write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 1);
+    write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 0);
 
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
@@ -989,7 +989,7 @@ fn distira_cmdfifo_aperture_drains_type1_register_packets() {
         CMD_FIFO_BASE + 40,
         cmdfifo_type1_header(SST_SWAPBUFFER_CMD, 1),
     );
-    machine.write_physical_u32(CMD_FIFO_BASE + 44, 1);
+    machine.write_physical_u32(CMD_FIFO_BASE + 44, 0);
 
     assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 12);
     assert_ne!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
@@ -1031,7 +1031,7 @@ fn distira_cmdfifo_type5_framebuffer_packet_writes_lfb() {
     assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 3);
 
     machine.drain_distira_fifo();
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 0);
 
     assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
     let (frame, width, height) = machine.frame_argb();
@@ -1115,6 +1115,95 @@ fn distira_v_retrace_poll_loop_terminates_as_device_clocks_advance() {
 
     assert!(saw_set, "the vsync status bit must be observed set");
     assert!(saw_clear, "the vsync status bit must be observed clear");
+}
+
+fn machine_with_pending_retrace_swap(mode: GswMode) -> Machine {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+    machine.set_mode(mode);
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 1);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
+    write_reg(
+        &mut machine,
+        SST_LFB_MODE,
+        LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
+    );
+    machine.write_physical_u32(DISTIRA_LFB_BASE, 0x0000_ff00);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    machine
+}
+
+fn distira_retrace_start_ticks() -> u64 {
+    (MASTER_CLOCK_HZ * 480).div_ceil(525 * 60)
+}
+
+#[test]
+fn distira_retrace_swap_deadline_is_identical_in_every_cpu_mode() {
+    let deadline = distira_retrace_start_ticks();
+    let mut expected = None;
+
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = machine_with_pending_retrace_swap(mode);
+        machine.advance_devices_ticks(deadline - 1);
+        let before = read_reg(&mut machine, SST_STATUS);
+        assert_eq!(before & 0x7000_0000, 0x1000_0000, "{mode:?}");
+        assert_eq!(before & 0x380, 0x380, "{mode:?}");
+        assert_ne!(before & 0x40, 0, "{mode:?}");
+
+        machine.advance_devices_ticks(1);
+        let after = read_reg(&mut machine, SST_STATUS);
+        assert_eq!(after & 0x7000_0000, 0, "{mode:?}");
+        assert_eq!(after & 0x380, 0, "{mode:?}");
+        assert_eq!(after & 0x40, 0, "{mode:?}");
+        assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+        let frame = machine.frame_argb();
+        assert_eq!(frame, (vec![0x0000_ff00], 1, 1), "{mode:?}");
+
+        let observation = (before, after, frame);
+        if let Some(expected) = &expected {
+            assert_eq!(&observation, expected, "{mode:?}");
+        } else {
+            expected = Some(observation);
+        }
+    }
+}
+
+#[test]
+fn distira_retrace_swap_survives_split_batches_and_live_mode_switches() {
+    let deadline = distira_retrace_start_ticks();
+    let mut whole = machine_with_pending_retrace_swap(GswMode::Gsw586);
+    let mut split = machine_with_pending_retrace_swap(GswMode::Gsw586);
+
+    whole.advance_devices_ticks(deadline - 1);
+    let first = (deadline - 1) / 3;
+    let second = (deadline - 1) / 3;
+    split.advance_devices_ticks(first);
+    split.set_mode(GswMode::Gsw486);
+    split.advance_devices_ticks(second);
+    split.set_mode(GswMode::Gsw386Slow);
+    split.advance_devices_ticks(deadline - 1 - first - second);
+    assert_eq!(
+        read_reg(&mut split, SST_STATUS),
+        read_reg(&mut whole, SST_STATUS)
+    );
+
+    whole.advance_devices_ticks(1);
+    split.set_mode(GswMode::Gsw386);
+    split.advance_devices_ticks(1);
+    assert_eq!(
+        read_reg(&mut split, SST_STATUS),
+        read_reg(&mut whole, SST_STATUS)
+    );
+    assert_eq!(split.frame_argb(), whole.frame_argb());
+    assert_eq!(split.active_display(), ActiveDisplay::Distira);
 }
 
 #[test]
