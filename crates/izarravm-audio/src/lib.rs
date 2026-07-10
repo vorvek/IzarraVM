@@ -8,6 +8,7 @@ mod opl;
 mod output;
 mod pcm;
 mod resample;
+mod soundfont;
 mod wss;
 
 pub use dsp::SbDsp;
@@ -15,6 +16,7 @@ pub use mixer::SbMixer;
 pub use opl::OplChip;
 pub use output::{AudioPlayer, AudioSink};
 pub use resample::Resampler;
+pub use soundfont::{EMBEDDED_SOUNDFONT_SHA256, embedded_soundfont_path};
 pub use wss::{Ad1848, Ad1848Config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
