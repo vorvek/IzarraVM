@@ -456,6 +456,56 @@ fn output_frame_rate_does_not_halve_a_0x41_rate_for_8bit_stereo() {
 }
 
 #[test]
+fn pcm_bytes_per_output_frame_tracks_width_and_channels() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x14, 0x03, 0x00]);
+    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(1));
+
+    dsp.set_sbpro_stereo(true);
+    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(2));
+
+    write_cmd(&mut dsp, &[0xB0, 0x00, 0x03, 0x00]);
+    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(2));
+
+    write_cmd(&mut dsp, &[0xB0, 0x20, 0x03, 0x00]);
+    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(4));
+
+    write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
+    assert_eq!(dsp.pcm_bytes_per_output_frame(), None);
+}
+
+#[test]
+fn tick_n_samples_reports_frames_and_stops_when_dma_is_dry() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0x14, 0x03, 0x00]);
+    let mut bytes = [0x80].into_iter();
+
+    let produced = dsp.tick_n_samples(4, || bytes.next(), || None);
+
+    assert_eq!(produced, 1);
+    assert_eq!(dsp.block_remaining(), 3);
+    assert_eq!(dsp.drain_frame(), Some((0, 0)));
+    assert_eq!(dsp.drain_frame(), None);
+}
+
+#[test]
+fn odd_stereo_auto_init_block_carries_a_unit_into_the_reloaded_block() {
+    let mut dsp = SbDsp::default();
+    // Three DMA bytes per auto-init block, two bytes per stereo frame.
+    write_cmd(&mut dsp, &[0xC6, 0x20, 0x02, 0x00]);
+    let mut bytes = [0x00, 0x40, 0x80, 0xC0].into_iter();
+
+    assert_eq!(dsp.tick_n_samples(2, || bytes.next(), || None), 2);
+    assert_eq!(
+        dsp.block_remaining(),
+        2,
+        "the fourth byte is the first unit consumed from the reloaded block"
+    );
+    assert!(dsp.is_playing());
+    assert!(dsp.take_irq(), "the crossed block boundary raised an IRQ");
+}
+
+#[test]
 fn reading_0x22f_acks_the_16bit_irq() {
     let mut dsp = SbDsp::default();
     write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0xB6, 0x30, 0x00, 0x00]); // count 1
@@ -529,6 +579,36 @@ fn adpcm4_reference_command_seeds_predictor_and_counts_encoded_bytes() {
         dsp.block_remaining(),
         1,
         "reference seed + one encoded byte both drained the counter"
+    );
+}
+
+#[test]
+fn adpcm_tick_count_tracks_decoded_frames_and_drains_the_final_fifo() {
+    let mut dsp = SbDsp::default();
+    dsp.set_block_buffer(vec![0xFF, 0xFF]);
+    dsp.advance_block_buffer(1);
+    // Reference plus two encoded bytes. Each encoded 4-bit byte yields two
+    // frames, so the three DMA bytes produce four frames in total.
+    write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
+    assert!(
+        dsp.block_buffer().is_none(),
+        "ADPCM arm drops stale PCM data"
+    );
+    assert_eq!(dsp.block_buffer_pos(), 0);
+    assert_eq!(dsp.pcm_bytes_per_output_frame(), None);
+
+    let mut bytes = [0x80, 0x00, 0x00].into_iter();
+    let produced = dsp.tick_n_samples(10, || bytes.next(), || None);
+
+    assert_eq!(produced, 4, "two encoded bytes expand to four frames");
+    assert!(
+        !dsp.is_playing(),
+        "single-cycle transfer stopped at its byte count"
+    );
+    assert_eq!(
+        std::iter::from_fn(|| dsp.drain_frame()).count(),
+        4,
+        "decoded samples buffered at terminal count are still rendered"
     );
 }
 
