@@ -19,22 +19,54 @@ enum MidiAdapter {
     Silent,
 }
 
+#[derive(Clone, Copy)]
+enum MidiRole {
+    Wavetable,
+    Receiver,
+}
+
+impl MidiRole {
+    fn settings_changed(self, old: &MidiConfig, new: &MidiConfig) -> bool {
+        match self {
+            Self::Wavetable => old.soundfont != new.soundfont,
+            Self::Receiver => {
+                old.backend != new.backend
+                    || old.external_port != new.external_port
+                    || old.mt32_control_rom != new.mt32_control_rom
+                    || old.mt32_pcm_rom != new.mt32_pcm_rom
+            }
+        }
+    }
+}
+
 pub struct MidiEngine {
     adapter: MidiAdapter,
     status: MidiStatus,
     pending: VecDeque<TimedMidiMessage>,
     rendered_frames: u64,
     scratch: Vec<i16>,
+    role: MidiRole,
+    config: MidiConfig,
 }
 
 impl MidiEngine {
-    pub fn open(config: &MidiConfig) -> Self {
+    pub fn open_wavetable(config: &MidiConfig) -> Self {
+        Self::open(config, MidiRole::Wavetable)
+    }
+
+    pub fn open_receiver(config: &MidiConfig) -> Self {
+        Self::open(config, MidiRole::Receiver)
+    }
+
+    fn open(config: &MidiConfig, role: MidiRole) -> Self {
         let mut engine = Self {
             adapter: MidiAdapter::Off,
             status: MidiStatus::Ready,
             pending: VecDeque::new(),
             rendered_frames: 0,
             scratch: Vec::new(),
+            role,
+            config: config.clone(),
         };
         engine.configure(config);
         engine
@@ -63,10 +95,9 @@ impl MidiEngine {
     pub fn send(&mut self, message: &TimedMidiMessage) {
         match &mut self.adapter {
             MidiAdapter::External(connection) => {
-                if let Err(error) = connection.send(&message.bytes) {
+                let result = connection.send(&message.bytes);
+                if let Err(error) = self.record_external_send_result(result) {
                     warn!(%error, "external MIDI port was disconnected");
-                    self.adapter = MidiAdapter::Silent;
-                    self.status = MidiStatus::MissingPort;
                 }
             }
             MidiAdapter::Fluid(_) | MidiAdapter::Munt(_) => self.queue(message.clone()),
@@ -121,16 +152,22 @@ impl MidiEngine {
     }
 
     pub fn reconfigure(&mut self, config: &MidiConfig) {
+        if !self.role.settings_changed(&self.config, config) {
+            return;
+        }
         self.close();
+        self.config = config.clone();
         self.configure(config);
     }
 
     fn configure(&mut self, config: &MidiConfig) {
-        let (adapter, status) = match config.backend {
-            MidiBackend::Off => (MidiAdapter::Off, MidiStatus::Ready),
-            MidiBackend::External => self.open_external(config.external_port.as_ref()),
-            MidiBackend::FluidSynth => open_fluidsynth(config),
-            MidiBackend::Munt => open_munt(config),
+        let (adapter, status) = match self.role {
+            MidiRole::Wavetable => open_fluidsynth(config),
+            MidiRole::Receiver => match config.backend {
+                MidiBackend::Off => (MidiAdapter::Off, MidiStatus::Ready),
+                MidiBackend::External => self.open_external(config.external_port.as_ref()),
+                MidiBackend::Munt => open_munt(config),
+            },
         };
         self.adapter = adapter;
         self.status = status;
@@ -152,7 +189,7 @@ impl MidiEngine {
         else {
             return (MidiAdapter::Silent, MidiStatus::MissingPort);
         };
-        match output.connect(&ports[index], "IzarraVM wavetable") {
+        match output.connect(&ports[index], "IzarraVM P330 MIDI") {
             Ok(connection) => (MidiAdapter::External(connection), MidiStatus::Ready),
             Err(error) => {
                 warn!(%error, "could not open the selected external MIDI port");
@@ -177,6 +214,14 @@ impl MidiEngine {
         self.adapter = MidiAdapter::Silent;
         self.pending.clear();
         self.status = MidiStatus::InitializationFailed;
+    }
+
+    fn record_external_send_result<E>(&mut self, result: Result<(), E>) -> Result<(), E> {
+        if result.is_err() {
+            self.adapter = MidiAdapter::Silent;
+            self.status = MidiStatus::MissingPort;
+        }
+        result
     }
 
     fn close(&mut self) {

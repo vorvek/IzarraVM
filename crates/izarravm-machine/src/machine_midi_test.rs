@@ -20,7 +20,7 @@ fn read_byte(machine: &mut Machine, port: u16) -> u8 {
 fn both_mpu_port_pairs_reset_and_acknowledge() {
     let mut machine = test_machine();
 
-    for base in [WAVETABLE_MPU_BASE, MIDI_INPUT_MPU_BASE] {
+    for base in [WAVETABLE_MPU_BASE, MIDI_MPU_BASE] {
         assert_eq!(read_byte(&mut machine, base + 1), 0x80);
         write_byte(&mut machine, base + 1, 0xff);
         assert_eq!(read_byte(&mut machine, base + 1), 0x00);
@@ -30,7 +30,7 @@ fn both_mpu_port_pairs_reset_and_acknowledge() {
 }
 
 #[test]
-fn wavetable_output_is_mapped_to_p300() {
+fn p300_wavetable_and_p330_midi_outputs_are_independent() {
     let mut machine = test_machine();
     for byte in [0x90, 60, 100] {
         write_byte(&mut machine, WAVETABLE_MPU_BASE, byte);
@@ -42,9 +42,17 @@ fn wavetable_output_is_mapped_to_p300() {
     assert_eq!(message.bytes, [0x90, 60, 100]);
 
     for byte in [0x80, 60, 0] {
-        write_byte(&mut machine, MIDI_INPUT_MPU_BASE, byte);
+        write_byte(&mut machine, MIDI_MPU_BASE, byte);
     }
     assert!(machine.take_wavetable_midi_message().is_none());
+    assert_eq!(
+        machine
+            .take_midi_message()
+            .expect("P330 produced a MIDI message")
+            .bytes,
+        [0x80, 60, 0]
+    );
+    assert!(machine.take_midi_message().is_none());
 }
 
 #[test]
@@ -95,18 +103,4 @@ fn wavetable_timestamps_remain_monotonic_across_cpu_mode_switches() {
 
     assert!(second.guest_tick > first.guest_tick);
     assert!(second.guest_tick - first.guest_tick >= 100 * 33 + 900);
-}
-
-#[test]
-fn host_midi_input_is_mapped_only_to_p330() {
-    let mut machine = test_machine();
-    assert_eq!(machine.inject_midi_input(&[0x90, 64, 127]), 3);
-    assert!(machine.pic.irr_bit(MIDI_INPUT_IRQ));
-
-    assert_eq!(read_byte(&mut machine, WAVETABLE_MPU_BASE + 1), 0x80);
-    assert_eq!(read_byte(&mut machine, MIDI_INPUT_MPU_BASE + 1), 0x00);
-    assert_eq!(read_byte(&mut machine, MIDI_INPUT_MPU_BASE), 0x90);
-    assert_eq!(read_byte(&mut machine, MIDI_INPUT_MPU_BASE), 64);
-    assert_eq!(read_byte(&mut machine, MIDI_INPUT_MPU_BASE), 127);
-    assert_eq!(read_byte(&mut machine, MIDI_INPUT_MPU_BASE + 1), 0x80);
 }

@@ -145,7 +145,7 @@ pub struct GuiPrefs {
     /// Whether the beige control panel is expanded. Persisted so the collapse
     /// state survives a restart. Defaults to open.
     pub panel_open: bool,
-    /// Host MIDI output selected in the configuration dialog.
+    /// P330 receiver and P300 SoundFont selected in the configuration dialog.
     pub midi: MidiConfig,
 }
 

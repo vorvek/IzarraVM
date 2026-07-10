@@ -17,9 +17,10 @@ dma = "1"
 high_dma = "5"
 
 [audio.midi]
-backend = "fluidsynth"
+backend = "off" # P330 receiver: off, external, or munt
+# P300 always uses FluidSynth. This optional path replaces the embedded bank.
 # soundfont = "C:\\SoundFonts\\custom.sf3"
-# For an external backend, add an exact saved identity:
+# For an external P330 receiver, add an exact host destination:
 # external_port = { name = "USB MIDI", ordinal = 0 }
 # Munt also needs mt32_control_rom and mt32_pcm_rom paths.
 

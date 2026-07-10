@@ -12,11 +12,12 @@ card.
 | Digital audio | Sound Blaster 16 / CT1745 mixer | `0x220` | 5 | 8-bit: 1, 16-bit: 5 |
 | FM synthesis | OPL3 (Yamaha YMF262) | `0x388` | n/a | n/a |
 | Wavetable MIDI output | MPU-401 | `0x300` | n/a | n/a |
-| MIDI input | MPU-401 | `0x330` | 9 | n/a |
+| External MIDI output | MPU-401 | `0x330` | n/a | n/a |
 
 The digital and FM sections use their standard, fixed Sound Blaster and
-AdLib addresses. ReSonique 2 assigns separate fixed ports to wavetable output
-and MIDI input so software can select each direction explicitly.
+AdLib addresses. ReSonique 2 assigns separate fixed ports to its wavetable
+daughter card and its external MIDI connection, so software can select either
+path explicitly.
 
 ## The BLASTER variable
 
@@ -60,21 +61,26 @@ program that issues the ADPCM DSP commands just works.
 
 ## MIDI and wavetable
 
-The card exposes separate MPU-401 port pairs. Games send wavetable music to
-`0x300`; Toka-DOS publishes this as `P300` in `BLASTER`. Port `0x330` is the
-MIDI input side and raises IRQ 9 when host input is injected. Both MPUs remain
-visible even when host output is disabled or unavailable.
+The card exposes separate MPU-401 port pairs. Games configured for the
+wavetable daughter card send music to `0x300`; Toka-DOS publishes this as
+`P300` in `BLASTER`. Games configured for an external MPU-401 send music to
+`0x330`. Both MPUs remain visible when a host receiver is unavailable.
 
-IzarraVM can route P300 output to one exact operating-system MIDI port, to
-FluidSynth for General MIDI, or to Munt for MT-32 music. FluidSynth uses the
-embedded FluidR3Mono bank unless a custom SF2/SF3 is selected. A missing or
-invalid custom bank falls back to the embedded copy. Munt requires control
-and PCM ROM paths supplied by the user; IzarraVM does not include Roland
-ROMs.
+P300 always renders through FluidSynth. It uses the embedded FluidR3Mono bank
+unless a custom SF2 or SF3 is selected. A missing or invalid custom bank falls
+back to the embedded copy.
 
-Changing the backend sends all-notes-off to the old destination without
-resetting either guest MPU. See the [GUI guide](../izarravm-gui/guide.md#the-config-modal)
-for settings and status messages.
+P330 can be Off, use Munt for MT-32 music, or send to one exact operating-system
+MIDI destination selected by name and same-name ordinal. A listed host
+destination represents the MIDI IN side of the receiving device. IzarraVM does
+not fall back to a different destination if it disappears. Munt requires
+control and PCM ROM paths supplied by the user; IzarraVM does not include
+Roland ROMs.
+
+Changing the P330 receiver sends all-notes-off to the old destination without
+resetting either guest MPU or interrupting P300 FluidSynth. See the
+[GUI guide](../izarravm-gui/guide.md#the-config-modal) for settings and status
+messages.
 
 ## Next
 

@@ -56,7 +56,7 @@ fn saved_midi_preferences_fill_only_keys_absent_from_cli_and_toml() {
         },
     );
 
-    assert_eq!(config.backend, MidiBackend::FluidSynth);
+    assert_eq!(config.backend, MidiBackend::Off);
     assert_eq!(config.soundfont, None);
     assert_eq!(config.external_port, saved.external_port);
     assert_eq!(config.mt32_control_rom, saved.mt32_control_rom);
@@ -82,6 +82,7 @@ fn midi_presence_tracks_each_explicit_toml_and_cli_key() {
             [audio.midi.external_port]
             name = "USB MIDI"
             ordinal = 1
+
         "#,
     )
     .unwrap();

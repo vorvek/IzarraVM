@@ -276,7 +276,8 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
 #[allow(clippy::too_many_arguments)]
 fn pump_audio(
     machine: &mut Machine,
-    midi: &mut MidiEngine,
+    wavetable: &mut MidiEngine,
+    midi_receiver: &mut MidiEngine,
     sink: &AudioSink,
     wall_dt: f64,
     debt: &mut f64,
@@ -312,7 +313,8 @@ fn pump_audio(
     // The card amp was applied inside render_audio (card sources only); `gain` here
     // is the host master volume, applied to the whole mix (card, speaker, and MIDI).
     let mut pcm = machine.render_audio(samples);
-    midi.render(&mut pcm);
+    wavetable.render(&mut pcm);
+    midi_receiver.render(&mut pcm);
     for (l, r) in &mut pcm {
         *l = (*l as f32 * gain)
             .round()
@@ -324,9 +326,12 @@ fn pump_audio(
     sink.queue(&pcm);
 }
 
-fn pump_midi(machine: &mut Machine, midi: &mut MidiEngine) {
+fn pump_midi(machine: &mut Machine, wavetable: &mut MidiEngine, midi_receiver: &mut MidiEngine) {
     while let Some(message) = machine.take_wavetable_midi_message() {
-        midi.send(&message);
+        wavetable.send(&message);
+    }
+    while let Some(message) = machine.take_midi_message() {
+        midi_receiver.send(&message);
     }
 }
 
@@ -346,6 +351,7 @@ struct Frame {
     floppy_accesses: u64,  // monotonic A: access count, drives the LED
     c_accesses: u64,       // monotonic C: access count, drives the LED
     cd_accesses: u64,      // monotonic CD access count, drives the LED
+    wavetable_status: MidiStatus,
     midi_status: MidiStatus,
 }
 
@@ -372,7 +378,7 @@ enum Command {
     MountCd(izarravm_machine::CdImage),
     /// Eject the CD.
     EjectCd,
-    /// Switch host MIDI output without resetting either guest MPU.
+    /// Reconfigure host MIDI without resetting either guest MPU.
     MidiConfig(MidiConfig),
     Shutdown,
 }
@@ -950,15 +956,22 @@ fn emulate(
         load_margo_test_pattern(&mut machine);
     }
 
-    let mut midi = MidiEngine::open(&midi_config);
+    let mut wavetable = MidiEngine::open_wavetable(&midi_config);
+    let mut midi_receiver = MidiEngine::open_receiver(&midi_config);
     if !matches!(
-        midi.status(),
+        wavetable.status(),
         MidiStatus::Ready | MidiStatus::MissingSoundFont
     ) {
         warn!(
+            status = ?wavetable.status(),
+            "P300 FluidSynth unavailable; the guest MPU remains active"
+        );
+    }
+    if midi_receiver.status() != MidiStatus::Ready {
+        warn!(
             backend = %midi_config.backend,
-            status = ?midi.status(),
-            "MIDI output unavailable; the guest MPU remains active"
+            status = ?midi_receiver.status(),
+            "P330 receiver unavailable; the guest MPU remains active"
         );
     }
 
@@ -1004,15 +1017,22 @@ fn emulate(
                 Ok(Command::MountCd(image)) => machine.mount_cd(image),
                 Ok(Command::EjectCd) => machine.eject_cd(),
                 Ok(Command::MidiConfig(config)) => {
-                    midi.reconfigure(&config);
+                    wavetable.reconfigure(&config);
+                    midi_receiver.reconfigure(&config);
                     if !matches!(
-                        midi.status(),
+                        wavetable.status(),
                         MidiStatus::Ready | MidiStatus::MissingSoundFont
                     ) {
                         warn!(
+                            status = ?wavetable.status(),
+                            "P300 FluidSynth unavailable; the guest MPU remains active"
+                        );
+                    }
+                    if midi_receiver.status() != MidiStatus::Ready {
+                        warn!(
                             backend = %config.backend,
-                            status = ?midi.status(),
-                            "MIDI output unavailable; the guest MPU remains active"
+                            status = ?midi_receiver.status(),
+                            "P330 receiver unavailable; the guest MPU remains active"
                         );
                     }
                 }
@@ -1118,11 +1138,12 @@ fn emulate(
                 speed_ratio = speed_ratio * 0.9 + ratio * 0.1;
             }
         }
-        pump_midi(&mut machine, &mut midi);
+        pump_midi(&mut machine, &mut wavetable, &mut midi_receiver);
         if let Some(sink) = &sink {
             pump_audio(
                 &mut machine,
-                &mut midi,
+                &mut wavetable,
+                &mut midi_receiver,
                 sink,
                 dt_secs,
                 &mut audio_debt,
@@ -1168,7 +1189,8 @@ fn emulate(
             f.floppy_accesses = floppy_accesses;
             f.c_accesses = c_accesses;
             f.cd_accesses = cd_accesses;
-            f.midi_status = midi.status();
+            f.wavetable_status = wavetable.status();
+            f.midi_status = midi_receiver.status();
         }
         published_seq = seq;
 
@@ -1362,7 +1384,6 @@ fn midi_backend_label(backend: MidiBackend) -> &'static str {
     match backend {
         MidiBackend::Off => "Off",
         MidiBackend::External => "External MIDI",
-        MidiBackend::FluidSynth => "FluidSynth",
         MidiBackend::Munt => "Munt (MT-32)",
     }
 }
@@ -1374,10 +1395,10 @@ fn midi_port_label(port: &MidiPortId) -> String {
 fn midi_status_text(status: MidiStatus) -> &'static str {
     match status {
         MidiStatus::Ready => "Ready",
-        MidiStatus::MissingPort => "The selected MIDI port is not available.",
+        MidiStatus::MissingPort => "The selected host MIDI destination is not available.",
         MidiStatus::MissingSoundFont => "The custom SoundFont failed. The embedded bank is active.",
-        MidiStatus::MissingRoms => "Select both MT-32 ROMs. MIDI output is silent.",
-        MidiStatus::InitializationFailed => "The MIDI backend could not be initialized.",
+        MidiStatus::MissingRoms => "Select both MT-32 ROMs. P330 output is silent.",
+        MidiStatus::InitializationFailed => "The MIDI output could not be initialized.",
     }
 }
 
@@ -2071,16 +2092,17 @@ impl GuiApp {
     /// Render the configuration modal. Accept applies the staged settings and
     /// closes; Cancel, the backdrop, or Esc discards and closes.
     fn config_ui(&mut self, ctx: &egui::Context) {
-        let midi_status = self
+        let (wavetable_status, midi_status) = self
             .emu
             .as_ref()
             .map(|emu| {
-                emu.frame
-                    .lock()
-                    .expect("frame snapshot poisoned")
-                    .midi_status
+                let frame = emu.frame.lock().expect("frame snapshot poisoned");
+                (frame.wavetable_status, frame.midi_status)
             })
-            .unwrap_or(MidiStatus::InitializationFailed);
+            .unwrap_or((
+                MidiStatus::InitializationFailed,
+                MidiStatus::InitializationFailed,
+            ));
         let Some(mut dialog) = self.config_dialog.take() else {
             return;
         };
@@ -2180,77 +2202,81 @@ impl GuiApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("P300 wavetable output");
+                            ui.label("FluidSynth");
+                        });
+                        midi_path_picker(
+                            ui,
+                            "Custom SoundFont",
+                            &mut dialog.soundfont,
+                            "SoundFont",
+                            &["sf2", "sf3"],
+                            "Embedded FluidR3Mono",
+                        );
+                        let wavetable_color = if wavetable_status == MidiStatus::Ready {
+                            INK
+                        } else {
+                            egui::Color32::from_rgb(170, 62, 48)
+                        };
+                        ui.colored_label(wavetable_color, midi_status_text(wavetable_status));
+                        ui.add_space(6.0);
+                        let receiver_label = match dialog.midi_backend {
+                            MidiBackend::Off => midi_backend_label(MidiBackend::Off).to_owned(),
+                            MidiBackend::Munt => midi_backend_label(MidiBackend::Munt).to_owned(),
+                            MidiBackend::External => dialog
+                                .external_midi_port
+                                .as_ref()
+                                .map(midi_port_label)
+                                .unwrap_or_else(|| "Select a host MIDI device".to_owned()),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label("P330 MIDI receiver");
                             egui::ComboBox::from_id_salt("midi-backend")
-                                .selected_text(midi_backend_label(dialog.midi_backend))
+                                .selected_text(receiver_label)
                                 .show_ui(ui, |ui| {
-                                    for backend in [
+                                    ui.selectable_value(
+                                        &mut dialog.midi_backend,
                                         MidiBackend::Off,
-                                        MidiBackend::External,
-                                        MidiBackend::FluidSynth,
+                                        midi_backend_label(MidiBackend::Off),
+                                    );
+                                    ui.selectable_value(
+                                        &mut dialog.midi_backend,
                                         MidiBackend::Munt,
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut dialog.midi_backend,
-                                            backend,
-                                            midi_backend_label(backend),
-                                        );
+                                        midi_backend_label(MidiBackend::Munt),
+                                    );
+                                    for port in &dialog.midi_ports {
+                                        let selected = dialog.midi_backend == MidiBackend::External
+                                            && dialog.external_midi_port.as_ref() == Some(port);
+                                        if ui
+                                            .selectable_label(selected, midi_port_label(port))
+                                            .clicked()
+                                        {
+                                            dialog.midi_backend = MidiBackend::External;
+                                            dialog.external_midi_port = Some(port.clone());
+                                        }
                                     }
                                 });
                         });
-                        match dialog.midi_backend {
-                            MidiBackend::Off => {}
-                            MidiBackend::External => {
-                                let selected = dialog
-                                    .external_midi_port
-                                    .as_ref()
-                                    .map(midi_port_label)
-                                    .unwrap_or_else(|| "Select a port".to_owned());
-                                ui.horizontal(|ui| {
-                                    ui.label("Output port");
-                                    egui::ComboBox::from_id_salt("midi-port")
-                                        .selected_text(selected)
-                                        .show_ui(ui, |ui| {
-                                            for port in &dialog.midi_ports {
-                                                ui.selectable_value(
-                                                    &mut dialog.external_midi_port,
-                                                    Some(port.clone()),
-                                                    midi_port_label(port),
-                                                );
-                                            }
-                                        });
-                                });
-                                if dialog.midi_ports.is_empty() {
-                                    ui.small("No external MIDI output ports were found.");
-                                }
-                            }
-                            MidiBackend::FluidSynth => midi_path_picker(
-                                ui,
-                                "Custom SoundFont",
-                                &mut dialog.soundfont,
-                                "SoundFont",
-                                &["sf2", "sf3"],
-                                "Embedded FluidR3Mono",
-                            ),
-                            MidiBackend::Munt => {
-                                midi_path_picker(
-                                    ui,
-                                    "MT-32 control ROM",
-                                    &mut dialog.mt32_control_rom,
-                                    "ROM image",
-                                    &["rom", "bin"],
-                                    "Required",
-                                );
-                                midi_path_picker(
-                                    ui,
-                                    "MT-32 PCM ROM",
-                                    &mut dialog.mt32_pcm_rom,
-                                    "ROM image",
-                                    &["rom", "bin"],
-                                    "Required",
-                                );
-                            }
+                        if dialog.midi_ports.is_empty() {
+                            ui.small("No host MIDI destination ports were found.");
                         }
-                        ui.small("P330 remains available for guest MIDI input.");
+                        if dialog.midi_backend == MidiBackend::Munt {
+                            midi_path_picker(
+                                ui,
+                                "MT-32 control ROM",
+                                &mut dialog.mt32_control_rom,
+                                "ROM image",
+                                &["rom", "bin"],
+                                "Required",
+                            );
+                            midi_path_picker(
+                                ui,
+                                "MT-32 PCM ROM",
+                                &mut dialog.mt32_pcm_rom,
+                                "ROM image",
+                                &["rom", "bin"],
+                                "Required",
+                            );
+                        }
                         let status_color = if midi_status == MidiStatus::Ready {
                             INK
                         } else {

@@ -121,16 +121,6 @@ impl Mpu401 {
         }
     }
 
-    /// Queue host MIDI bytes for the guest. Returns the number accepted; excess
-    /// bytes are left with the caller so a full FIFO never replaces an ACK or an
-    /// earlier MIDI event.
-    pub fn inject_input(&mut self, bytes: &[u8]) -> usize {
-        let available = INPUT_CAPACITY.saturating_sub(self.input.len());
-        let accepted = available.min(bytes.len());
-        self.input.extend(bytes[..accepted].iter().copied());
-        accepted
-    }
-
     pub fn take_message(&mut self) -> Option<TimedMidiMessage> {
         self.output.pop_front()
     }

@@ -84,18 +84,3 @@ fn real_time_bytes_do_not_interrupt_sysex() {
     assert_eq!(take_bytes(&mut mpu), [0xf8]);
     assert_eq!(take_bytes(&mut mpu), [0xf0, 0x41, 0x10, 0xf7]);
 }
-
-#[test]
-fn host_input_is_bounded_and_read_in_order() {
-    let mut mpu = Mpu401::default();
-    assert_eq!(mpu.inject_input(&[0x90, 60, 100]), 3);
-    assert_eq!(mpu.status(), 0);
-    assert_eq!(mpu.read_data(), 0x90);
-    assert_eq!(mpu.read_data(), 60);
-    assert_eq!(mpu.read_data(), 100);
-    assert_eq!(mpu.read_data(), 0xff);
-
-    let oversized = vec![0; INPUT_CAPACITY + 1];
-    assert_eq!(mpu.inject_input(&oversized), INPUT_CAPACITY);
-    assert_eq!(mpu.inject_input(&[1]), 0);
-}
