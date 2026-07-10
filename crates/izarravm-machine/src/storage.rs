@@ -8,11 +8,11 @@ impl Machine {
     /// image length; an unrecognized size returns an error and leaves any
     /// previously mounted image in place.
     pub fn mount_floppy(&mut self, bytes: Vec<u8>) -> Result<(), String> {
-        self.floppy = Some(floppy::Floppy::from_image(bytes)?);
+        let floppy = floppy::Floppy::from_image(bytes)?;
+        let geometry = floppy.geometry();
+        self.floppy = Some(floppy);
         self.set_equipment_floppy(true);
-        // Tell the FDC media is present so SENSE DRIVE STATUS reports the drive
-        // ready and a DIR read latches the disk-change line.
-        self.fdc.set_media_present(true);
+        self.fdc.set_media_geometry(Some(geometry));
         Ok(())
     }
 
@@ -35,7 +35,7 @@ impl Machine {
     pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
         let bytes = self.floppy.take().map(|f| f.bytes().to_vec());
         self.set_equipment_floppy(false);
-        self.fdc.set_media_present(false);
+        self.fdc.set_media_geometry(None);
         bytes
     }
 

@@ -269,7 +269,6 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         rtc: &mut machine.rtc,
         dma: &mut machine.dma,
         fdc: &mut machine.fdc,
-        floppy: &mut machine.floppy,
         opl: &mut machine.opl,
         dsp: &mut machine.dsp,
         mixer: &mut machine.mixer,
@@ -482,6 +481,9 @@ mod core;
 #[cfg(test)]
 #[path = "machine_device_integration_test.rs"]
 mod device_integration;
+#[cfg(test)]
+#[path = "machine_fdc_dma_test.rs"]
+mod fdc_dma;
 #[cfg(test)]
 #[path = "machine_firmware_video_test.rs"]
 mod firmware_video;

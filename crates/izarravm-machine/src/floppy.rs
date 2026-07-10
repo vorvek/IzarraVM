@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! In-memory floppy image with geometry derived from its size.
 //!
 //! The drive is a 1.44 MB high-density unit, but the media geometry is read off
@@ -161,6 +164,26 @@ impl Floppy {
             return false;
         }
         self.bytes[off..off + SECTOR].copy_from_slice(&data[..SECTOR]);
+        self.dirty = true;
+        true
+    }
+
+    /// Write one byte during a timed FDC DMA transfer.
+    pub fn write_sector_byte(
+        &mut self,
+        cyl: u16,
+        head: u8,
+        sector: u8,
+        byte_offset: usize,
+        value: u8,
+    ) -> bool {
+        if byte_offset >= SECTOR {
+            return false;
+        }
+        let Some(offset) = self.chs_offset(cyl, head, sector) else {
+            return false;
+        };
+        self.bytes[offset + byte_offset] = value;
         self.dirty = true;
         true
     }

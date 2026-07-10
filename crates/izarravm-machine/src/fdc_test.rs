@@ -3,160 +3,248 @@
 
 use super::*;
 
-/// Drive the chip's data register the way a guest does: write the opcode then
-/// the parameter bytes.
 fn issue(fdc: &mut Fdc, bytes: &[u8]) {
-    for &b in bytes {
-        fdc.write_port(0x3F5, b);
+    for &byte in bytes {
+        fdc.write_port_at(0x3F5, byte, fdc.now_ticks);
     }
 }
 
-/// Read the whole pending result phase as a vector.
 fn drain_result(fdc: &mut Fdc) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut bytes = Vec::new();
     while fdc.main_status() & msr::DIO != 0 {
-        out.push(fdc.read_port(0x3F5).unwrap());
+        bytes.push(fdc.read_port(0x3F5).unwrap());
     }
-    out
+    bytes
+}
+
+fn advance_next(fdc: &mut Fdc) -> Option<DmaByteRequest> {
+    let ticks = fdc
+        .ticks_until_event(fdc.now_ticks)
+        .expect("a pending FDC deadline");
+    fdc.advance_to(fdc.now_ticks + ticks)
 }
 
 fn ready_chip() -> Fdc {
     let mut fdc = Fdc::default();
-    // Leave reset and select drive 0 with the DMA/IRQ gate on.
-    fdc.write_port(0x3F2, 0x0C);
-    // Drop the power-on reset interrupt so tests start from a clean line.
-    issue(&mut fdc, &[0x08]); // SENSE INTERRUPT STATUS
+    fdc.write_port_at(0x3F2, 0x0C, fdc.now_ticks);
+    issue(&mut fdc, &[0x08]);
     let _ = drain_result(&mut fdc);
+    fdc
+}
+
+fn ready_disk() -> Fdc {
+    let mut fdc = ready_chip();
+    fdc.set_media_geometry(Some(Geometry {
+        cylinders: 80,
+        heads: 2,
+        sectors: 18,
+        drive_type: 0x04,
+    }));
+    fdc.write_port_at(0x3F2, 0x1C, fdc.now_ticks);
+    assert_eq!(advance_next(&mut fdc), None, "motor spin-up deadline");
+    assert!(fdc.drive_ready(0));
     fdc
 }
 
 #[test]
 fn version_returns_enhanced_controller() {
     let mut fdc = ready_chip();
-    issue(&mut fdc, &[0x10]); // VERSION
-    assert_eq!(drain_result(&mut fdc), vec![0x90]);
-}
-
-#[test]
-fn specify_consumes_two_params_with_no_result() {
-    let mut fdc = ready_chip();
-    issue(&mut fdc, &[0x03, 0xDF, 0x02]); // SPECIFY: SRT/HUT, HLT/ND
-    // No result phase: DIO is clear and the chip is back to the command phase.
-    assert_eq!(fdc.main_status() & msr::DIO, 0, "no result bytes to read");
-    assert_eq!(fdc.main_status() & msr::CB, 0, "command no longer busy");
-    // The next opcode is accepted straight away.
     issue(&mut fdc, &[0x10]);
     assert_eq!(drain_result(&mut fdc), vec![0x90]);
 }
 
 #[test]
-fn recalibrate_then_sense_interrupt_reports_seek_end_at_cyl_zero() {
+fn specify_programs_seek_and_head_load_timing_without_a_result() {
     let mut fdc = ready_chip();
-    // Move the head off track 0 first so RECALIBRATE has somewhere to come from.
-    issue(&mut fdc, &[0x0F, 0x00, 10]); // SEEK drive 0 to cyl 10
-    issue(&mut fdc, &[0x08]); // clear that seek interrupt
+    issue(&mut fdc, &[0x03, 0xF0, 0x04]);
+    assert_eq!(fdc.step_rate_ticks, MILLIS_TICKS);
+    assert_eq!(fdc.head_load_ticks, 4 * MILLIS_TICKS);
+    assert_eq!(fdc.main_status() & (msr::DIO | msr::CB), 0);
+
+    issue(&mut fdc, &[0x0F, 0x00, 4]);
+    assert_eq!(fdc.seek_busy & 1, 1);
+    assert_eq!(fdc.ticks_until_event(fdc.now_ticks), Some(4 * MILLIS_TICKS));
+}
+
+#[test]
+fn seek_is_busy_until_its_exact_deadline_then_sense_reports_the_cylinder() {
+    let mut fdc = ready_chip();
+    issue(&mut fdc, &[0x0F, 0x00, 10]);
+    let delay = 30 * MILLIS_TICKS;
+    assert_eq!(fdc.main_status() & 1, 1, "drive 0 busy");
+    assert_eq!(fdc.main_status() & msr::CB, 0, "command phase reopened");
+    assert_eq!(fdc.advance_to(delay - 1), None);
+    assert!(!fdc.take_irq());
+    assert_eq!(fdc.present_cyl[0], 0);
+
+    assert_eq!(fdc.advance_to(delay), None);
+    assert!(fdc.take_irq());
+    assert_eq!(fdc.main_status() & 1, 0);
+    issue(&mut fdc, &[0x08]);
+    let result = drain_result(&mut fdc);
+    assert_eq!(result[0] & st0::SE, st0::SE);
+    assert_eq!(result[1], 10);
+}
+
+#[test]
+fn recalibrate_uses_the_same_step_clock_and_finishes_at_track_zero() {
+    let mut fdc = ready_chip();
+    issue(&mut fdc, &[0x0F, 0x00, 10]);
+    advance_next(&mut fdc);
+    issue(&mut fdc, &[0x08]);
     let _ = drain_result(&mut fdc);
 
-    issue(&mut fdc, &[0x07, 0x00]); // RECALIBRATE drive 0
-    let res = {
-        issue(&mut fdc, &[0x08]); // SENSE INTERRUPT STATUS
-        drain_result(&mut fdc)
-    };
-    assert_eq!(res.len(), 2, "ST0 + present cylinder");
-    assert_eq!(res[0] & st0::SE, st0::SE, "seek-end set in ST0");
-    assert_eq!(res[0] & 0xC0, st0::IC_NORMAL, "normal termination");
-    assert_eq!(res[1], 0, "present cylinder is 0 after recalibrate");
-}
-
-#[test]
-fn sense_interrupt_with_none_pending_is_invalid() {
-    let mut fdc = ready_chip();
-    // ready_chip already cleared the power-on interrupt, so none is pending.
+    issue(&mut fdc, &[0x07, 0x00]);
+    assert_eq!(
+        fdc.ticks_until_event(fdc.now_ticks),
+        Some(30 * MILLIS_TICKS)
+    );
+    advance_next(&mut fdc);
     issue(&mut fdc, &[0x08]);
-    assert_eq!(drain_result(&mut fdc), vec![0x80], "invalid, no PCN");
+    let result = drain_result(&mut fdc);
+    assert_eq!(result[0] & st0::SE, st0::SE);
+    assert_eq!(result[1], 0);
 }
 
 #[test]
-fn sense_drive_status_reports_track0_and_ready() {
+fn sense_interrupt_without_a_completed_seek_is_invalid() {
     let mut fdc = ready_chip();
-    fdc.set_media_present(true);
-    issue(&mut fdc, &[0x04, 0x00]); // SENSE DRIVE STATUS, drive 0 head 0
-    let st3v = drain_result(&mut fdc);
-    assert_eq!(st3v.len(), 1);
-    assert_eq!(st3v[0] & st3::TRACK0, st3::TRACK0, "head at cyl 0");
-    assert_eq!(st3v[0] & st3::READY, st3::READY, "media present");
-    assert_eq!(st3v[0] & st3::TWO_SIDED, st3::TWO_SIDED, "double-sided");
+    issue(&mut fdc, &[0x08]);
+    assert_eq!(drain_result(&mut fdc), vec![st0::IC_INVALID]);
 }
 
 #[test]
-fn read_data_stages_a_transfer_request() {
+fn motor_spin_up_controls_ready_and_spin_down_reaches_stopped() {
     let mut fdc = ready_chip();
-    // READ DATA: HDS+DS=0, C=2, H=0, R=3, N=2(512), EOT=9, GPL, DTL.
+    fdc.set_media_geometry(Some(Geometry {
+        cylinders: 80,
+        heads: 2,
+        sectors: 18,
+        drive_type: 0x04,
+    }));
+    fdc.write_port_at(0x3F2, 0x1C, fdc.now_ticks);
+    issue(&mut fdc, &[0x04, 0x00]);
+    assert_eq!(drain_result(&mut fdc)[0] & st3::READY, 0);
+    assert_eq!(fdc.advance_to(MOTOR_SPIN_UP_TICKS - 1), None);
+    assert_eq!(fdc.motors[0].phase, MotorPhase::Starting);
+    assert_eq!(fdc.advance_to(MOTOR_SPIN_UP_TICKS), None);
+    assert!(fdc.drive_ready(0));
+
+    fdc.write_port_at(0x3F2, 0x0C, fdc.now_ticks);
+    assert_eq!(fdc.motors[0].phase, MotorPhase::Stopping);
+    let stopped_at = MOTOR_SPIN_UP_TICKS + MOTOR_SPIN_DOWN_TICKS;
+    assert_eq!(fdc.advance_to(stopped_at - 1), None);
+    assert_eq!(fdc.motors[0].phase, MotorPhase::Stopping);
+    assert_eq!(fdc.advance_to(stopped_at), None);
+    assert_eq!(fdc.motors[0].phase, MotorPhase::Stopped);
+}
+
+#[test]
+fn read_id_waits_for_rotation_then_enters_the_result_phase() {
+    let mut fdc = ready_disk();
+    issue(&mut fdc, &[0x0A, 0x00]);
+    assert_eq!(fdc.main_status() & msr::RQM, 0);
+    let deadline = fdc.next_deadline().unwrap();
+    assert_eq!(fdc.advance_to(deadline - 1), None);
+    assert_eq!(fdc.main_status() & msr::DIO, 0);
+    assert_eq!(fdc.advance_to(deadline), None);
+    assert!(fdc.take_irq());
+    let result = drain_result(&mut fdc);
+    assert_eq!(result.len(), 7);
+    assert_eq!(result[0] & 0xC0, st0::IC_NORMAL);
+    assert!((1..=18).contains(&result[5]));
+}
+
+#[test]
+fn read_data_requests_one_timed_dma_cycle_per_byte() {
+    let mut fdc = ready_disk();
     issue(
         &mut fdc,
-        &[0xE6, 0x00, 0x02, 0x00, 0x03, 0x02, 0x09, 0x1B, 0xFF],
+        &[0xE6, 0x00, 0x02, 0x00, 0x03, 0x02, 0x03, 0x1B, 0xFF],
     );
-    // While the transfer is staged the chip is busy with RQM low: it is not
-    // asking the CPU for a byte, it is waiting for the execution phase to run.
     assert_eq!(fdc.main_status() & msr::CB, msr::CB);
     assert_eq!(fdc.main_status() & msr::RQM, 0);
-    let req = fdc.take_transfer().expect("a staged transfer");
-    assert!(req.read);
-    assert_eq!(req.cylinder, 2);
-    assert_eq!(req.sector, 3);
-    assert_eq!(req.bytes_per_sec, 512);
-    assert_eq!(req.end_sector, 9);
+
+    for offset in 0..512u16 {
+        let request = advance_next(&mut fdc).expect("one byte reaches channel 2");
+        assert_eq!(request.sector, 3);
+        assert_eq!(request.offset, offset);
+        fdc.complete_dma_byte(DmaByteOutcome {
+            transferred: true,
+            terminal_count: offset == 511,
+        });
+    }
+
+    assert!(fdc.take_irq());
+    let result = drain_result(&mut fdc);
+    assert_eq!(result.len(), 7);
+    assert_eq!(result[0] & 0xC0, st0::IC_NORMAL);
+    assert_eq!(result[3], 2);
+    assert_eq!(result[5], 3);
+    assert_eq!(result[6], 2);
 }
 
 #[test]
-fn completed_read_produces_a_seven_byte_result_and_irq() {
-    let mut fdc = ready_chip();
+fn a_masked_dma_cycle_ends_read_data_abnormally_at_its_deadline() {
+    let mut fdc = ready_disk();
     issue(
         &mut fdc,
-        &[0xE6, 0x00, 0x02, 0x00, 0x03, 0x02, 0x09, 0x1B, 0xFF],
+        &[0xE6, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF],
     );
-    let req = fdc.take_transfer().unwrap();
-    fdc.complete_transfer(req, 2, 0, 9, true);
-    // The completion edge fires (DMA/IRQ gate is on).
-    assert!(fdc.take_irq(), "IRQ6 raised on completion");
-    let res = drain_result(&mut fdc);
-    assert_eq!(res.len(), 7, "ST0,ST1,ST2,C,H,R,N");
-    assert_eq!(res[0] & 0xC0, st0::IC_NORMAL, "normal termination");
-    assert_eq!(res[3], 2, "ending cylinder");
-    assert_eq!(res[5], 9, "ending sector");
-    assert_eq!(res[6], 2, "N=2 (512-byte sectors)");
+    let _ = advance_next(&mut fdc).expect("first byte request");
+    fdc.complete_dma_byte(DmaByteOutcome {
+        transferred: false,
+        terminal_count: false,
+    });
+    assert!(fdc.take_irq());
+    let result = drain_result(&mut fdc);
+    assert_eq!(result[0] & 0xC0, st0::IC_ABNORMAL);
+    assert_eq!(result[1] & 0x04, 0x04, "no-data status");
 }
 
 #[test]
-fn invalid_opcode_returns_single_invalid_status() {
-    let mut fdc = ready_chip();
-    issue(&mut fdc, &[0x1E]); // not a modeled command
-    assert_eq!(drain_result(&mut fdc), vec![0x80]);
+fn dor_dma_gate_prevents_a_channel_request() {
+    let mut fdc = ready_disk();
+    fdc.write_port_at(0x3F2, 0x14, fdc.now_ticks); // motor and reset on, DMA/IRQ gate off
+    issue(
+        &mut fdc,
+        &[0xE6, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF],
+    );
+    assert_eq!(advance_next(&mut fdc), None);
+    assert!(!fdc.take_irq());
+    assert_eq!(drain_result(&mut fdc)[0] & 0xC0, st0::IC_ABNORMAL);
 }
 
 #[test]
-fn reset_clears_an_in_flight_command_and_raises_an_interrupt() {
-    let mut fdc = ready_chip();
-    issue(&mut fdc, &[0x03, 0xDF]); // SPECIFY, one parameter still owed
-    assert_eq!(fdc.main_status() & msr::CB, msr::CB, "mid-command");
-    // Pulse reset (clear bit2) then release it.
-    fdc.write_port(0x3F2, 0x00);
-    assert_eq!(fdc.main_status() & msr::CB, 0, "command dropped by reset");
-    fdc.write_port(0x3F2, 0x0C);
-    // Leaving reset raises the power-up interrupt with ST0 = 0xC0.
+fn reset_drops_an_in_flight_data_command() {
+    let mut fdc = ready_disk();
+    issue(
+        &mut fdc,
+        &[0xE6, 0x00, 0x00, 0x00, 0x01, 0x02, 0x01, 0x1B, 0xFF],
+    );
+    assert_eq!(fdc.main_status() & msr::CB, msr::CB);
+    fdc.write_port_at(0x3F2, 0x00, fdc.now_ticks);
+    assert_eq!(fdc.main_status() & msr::CB, 0);
+    assert!(fdc.operation.is_none());
+    fdc.write_port_at(0x3F2, 0x0C, fdc.now_ticks);
     issue(&mut fdc, &[0x08]);
-    let res = drain_result(&mut fdc);
-    assert_eq!(res[0], 0xC0, "ready-changed / abnormal after reset");
+    assert_eq!(drain_result(&mut fdc)[0], 0xC0);
 }
 
 #[test]
-fn irq_is_masked_when_the_dor_gate_is_off() {
+fn dor_gate_masks_the_seek_edge_but_not_sense_interrupt_state() {
     let mut fdc = Fdc::default();
-    fdc.write_port(0x3F2, 0x04); // out of reset, drive 0, but DMA/IRQ gate off
-    issue(&mut fdc, &[0x07, 0x00]); // RECALIBRATE raises a seek interrupt
-    assert!(!fdc.take_irq(), "gate off masks the IRQ line");
-    // The interrupt is still latched internally and clears via SENSE INTERRUPT.
+    fdc.write_port_at(0x3F2, 0x04, fdc.now_ticks);
+    issue(&mut fdc, &[0x07, 0x00]);
+    advance_next(&mut fdc);
+    assert!(!fdc.take_irq());
     issue(&mut fdc, &[0x08]);
-    let res = drain_result(&mut fdc);
-    assert_eq!(res[0] & st0::SE, st0::SE);
+    assert_eq!(drain_result(&mut fdc)[0] & st0::SE, st0::SE);
+}
+
+#[test]
+fn invalid_opcode_returns_one_invalid_status_byte() {
+    let mut fdc = ready_chip();
+    issue(&mut fdc, &[0x1E]);
+    assert_eq!(drain_result(&mut fdc), vec![st0::IC_INVALID]);
 }

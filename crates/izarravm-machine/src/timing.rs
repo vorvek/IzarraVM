@@ -256,7 +256,7 @@ impl Machine {
         }
         // Forward a pending DSP interrupt with playback idle too: the 0xF2
         // IRQ-request command raises it without a transfer running (drivers
-        // probe their IRQ wiring that way) — the real chip asserts the line
+        // probe their IRQ wiring that way). The real chip asserts the line
         // regardless. take_irq is a test-and-clear latch, so this never
         // double-delivers an edge the per-tick forward above already took.
         if self.dsp.take_irq() {
@@ -433,6 +433,11 @@ impl Machine {
             self.pic.request(8);
         }
 
+        // The FDC owns mechanical and byte deadlines in the fixed timeline.
+        // Each due byte performs exactly one channel-2 cycle before the command
+        // engine schedules the following byte or enters its result phase.
+        self.advance_fdc_to(self.timeline.now_ticks());
+
         // ATA PIO and PIIX4 bus-master transfers share the authoritative master
         // timeline. A device-to-memory completion bypasses the CPU bus, so drop
         // cached code immediately. This also covers host-driven timeline advances
@@ -515,6 +520,61 @@ impl Machine {
         self.pump_pusher();
     }
 
+    fn advance_fdc_to(&mut self, target_ticks: u64) {
+        const FDC_DMA_CHANNEL: usize = 2;
+        let mut wrote_memory = false;
+        while let Some(request) = self.fdc.advance_to(target_ticks) {
+            if request.offset == 0 && request.sector == request.transfer.sector {
+                self.floppy_accesses = self.floppy_accesses.saturating_add(1);
+            }
+
+            let transferred = if request.transfer.read {
+                let byte = self
+                    .floppy
+                    .as_ref()
+                    .and_then(|floppy| {
+                        floppy.read_sector(
+                            u16::from(request.transfer.cylinder),
+                            request.transfer.head,
+                            request.sector,
+                        )
+                    })
+                    .and_then(|sector| sector.get(usize::from(request.offset)))
+                    .copied();
+                byte.is_some_and(|byte| {
+                    let wrote = self
+                        .dma
+                        .write_byte(FDC_DMA_CHANNEL, &mut self.memory, byte)
+                        .is_some();
+                    wrote_memory |= wrote;
+                    wrote
+                })
+            } else {
+                self.dma
+                    .pull_byte(FDC_DMA_CHANNEL, &mut self.memory)
+                    .is_some_and(|byte| {
+                        self.floppy.as_mut().is_some_and(|floppy| {
+                            floppy.write_sector_byte(
+                                u16::from(request.transfer.cylinder),
+                                request.transfer.head,
+                                request.sector,
+                                usize::from(request.offset),
+                                byte,
+                            )
+                        })
+                    })
+            };
+            let terminal_count = transferred && self.dma.at_terminal_count(FDC_DMA_CHANNEL);
+            self.fdc.complete_dma_byte(fdc::DmaByteOutcome {
+                transferred,
+                terminal_count,
+            });
+        }
+        if wrote_memory {
+            self.cpu.note_device_memory_write();
+        }
+    }
+
     fn device_rates(&mut self) -> DeviceRates {
         self.dsp.set_sbpro_stereo(self.mixer.sbpro_stereo());
         let programmed_wss = self.wss.output_frame_rate();
@@ -539,19 +599,46 @@ impl Machine {
     }
 
     fn advance_master_time(&mut self, master_ticks: u64, io_stall: bool) {
-        let rates = self.device_rates();
-        let advance = if io_stall {
-            self.timeline.advance_io_stall_ticks(master_ticks, rates)
-        } else {
-            self.timeline.advance_master_ticks(master_ticks, rates)
-        };
-        self.apply_device_advance(advance);
+        let mut remaining = master_ticks;
+        if remaining == 0 {
+            let rates = self.device_rates();
+            let advance = if io_stall {
+                self.timeline.advance_io_stall_ticks(0, rates)
+            } else {
+                self.timeline.advance_master_ticks(0, rates)
+            };
+            self.apply_device_advance(advance);
+            return;
+        }
+        while remaining != 0 {
+            let step = self
+                .fdc
+                .ticks_until_event(self.timeline.now_ticks())
+                .map_or(remaining, |deadline| remaining.min(deadline));
+            let rates = self.device_rates();
+            let advance = if io_stall {
+                self.timeline.advance_io_stall_ticks(step, rates)
+            } else {
+                self.timeline.advance_master_ticks(step, rates)
+            };
+            self.apply_device_advance(advance);
+            remaining -= step;
+        }
     }
 
     pub(super) fn advance_cpu_work(&mut self, clocks: u64) {
-        let rates = self.device_rates();
-        let advance = self.timeline.advance_cpu_clocks(clocks, rates);
-        self.apply_device_advance(advance);
+        let master_ticks = self.timeline.master_ticks_for_cpu_clocks(clocks);
+        let crosses_fdc_deadline = self
+            .fdc
+            .ticks_until_event(self.timeline.now_ticks())
+            .is_some_and(|deadline| deadline <= master_ticks);
+        if crosses_fdc_deadline {
+            self.advance_master_time(master_ticks, false);
+        } else {
+            let rates = self.device_rates();
+            let advance = self.timeline.advance_cpu_clocks(clocks, rates);
+            self.apply_device_advance(advance);
+        }
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(clocks);
     }
 
@@ -776,6 +863,12 @@ impl Machine {
             .then(|| self.lpt2.ticks_until_irq())
             .flatten()
             .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        let fdc_wake = self
+            .pic
+            .deliverable(6)
+            .then(|| self.fdc.ticks_until_event(self.timeline.now_ticks()))
+            .flatten()
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
         // The sooner of whichever wakes apply; None only when none can fire.
         let wake = [
             pit_wake,
@@ -788,6 +881,7 @@ impl Machine {
             serial2_wake,
             lpt_wake,
             lpt2_wake,
+            fdc_wake,
         ]
         .into_iter()
         .flatten()
@@ -830,6 +924,7 @@ impl Machine {
             .chain(self.serial2.ticks_until_event())
             .chain(self.lpt.ticks_until_event())
             .chain(self.lpt2.ticks_until_event())
+            .chain(self.fdc.ticks_until_event(self.timeline.now_ticks()))
             .min()
     }
 

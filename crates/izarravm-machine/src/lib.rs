@@ -677,9 +677,8 @@ pub struct Machine {
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     isa_io_batch_clocks: u64,
-    // Set by MachineBus when a device (DMA disk/floppy transfer, DMA block copy) writes guest RAM,
-    // which bypasses the CPU's self-modifying-code tracking. The run loop tells the CPU to drop its
-    // prefetch + decode cache at end of step so staged code is never replayed stale.
+    // Set when a bus-side DMA block copy or HLE service writes guest RAM. The
+    // run loop drops CPU prefetch and decoded code before the next instruction.
     device_wrote_memory: bool,
     // Set when the RAM direct-map table changes, so cached host pointers in the CPU are dropped
     // before any later guest access can use a stale RAM page classification.
@@ -1981,10 +1980,6 @@ struct MachineBus<'a> {
     rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,
     fdc: &'a mut fdc::Fdc,
-    // The mounted A: image the FDC transfers against. The borrowed bus needs it
-    // alongside `dma` and `memory` so a READ/WRITE DATA port write can run the
-    // floppy + DMA datapath in one place.
-    floppy: &'a mut Option<floppy::Floppy>,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
     mixer: &'a mut SbMixer,
