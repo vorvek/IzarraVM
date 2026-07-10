@@ -39,9 +39,8 @@ fn run_bench_one(
     run_bench_one_profiled(hardware, mode, source, budget, stride)
 }
 
-/// Whether the cost-fold native-LOAD JIT path should run this session, read from `IZARRAVM_JIT_FOLD`.
-/// Off by default and only meaningful while JIT admission is active. Makes JIT-block timing
-/// approximate, so it is an opt-in A/B knob. A no-op in an interpreter-only build.
+/// Whether the cost-fold native-load JIT experiment is enabled for this run.
+/// It is an opt-in measurement switch and a no-op without the JIT.
 #[cfg(feature = "jit")]
 pub(super) fn jit_fold_enabled() -> bool {
     std::env::var("IZARRAVM_JIT_FOLD")
@@ -141,24 +140,9 @@ const BENCHES: &[Bench] = &[
 /// units constant; the physical 586/486 ratio lives in fp_timing(I586).
 const WHETSTONE_FLOPS_PER_SWEEP: f64 = 26000.0;
 
-/// Permanent poll-loop microbench fixture (P4a Task 0.4). Reproduces the three
-/// diagnosis patterns behind the P4a lazy-port-device-time initiative (see
-/// dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md): a tight 0x3DA
-/// vsync-wait poll (the named worst case, ~131 ns/access at 586 on the
-/// original diagnosis), a VRAM write loop (memory-bound, no port I/O, isolates
-/// the poll's cost from a plain hot loop), and a register-only loop (the
-/// compute-only floor, no memory or port access at all). Each payload is a
-/// small hand-assembled real-mode code array injected directly as the boot ROM
-/// (mirrors `paced_wall_topup_lets_a_polling_guest_catch_vretrace_windows`'s
-/// `rom_with_code` pattern), run for a fixed guest-clock budget via
-/// `Machine::new` + `run_until_halt_or_cycles` -- NOT `Machine::new_raw_program`
-/// (the DOS-loader path) and NOT a new `neurketa` selector (that payload is a
-/// NASM-built, pre-baked binary blob; adding a selector there would need an
-/// assembly-toolchain rebuild step this fixture should not depend on). None of
-/// the three payloads ever halts or exits, so there is no iteration count to
-/// self-report the way the unit-tester-backed `BENCHES` table's payloads do;
-/// this fixture reports guest_ms/wall_ms/rt_factor only, the same shape the
-/// original diagnosis numbers used (58M batches/guest-s, ~131 ns/access).
+/// Small real-mode polling and memory loops used for host-performance diagnosis.
+/// They run from a bare boot ROM for a fixed guest-time budget and never affect
+/// the reference-band result.
 struct Microbench {
     name: &'static str,
     code: &'static [u8],
@@ -178,8 +162,7 @@ const MICROBENCHES: &[Microbench] = &[
         //       test al, 0x08
         //       jz wait          (spin while the vretrace bit is clear)
         //       jmp wait         (re-poll once seen set, an unconditional spin)
-        // The worst case named in the plan: 58M batches/guest-s at the original
-        // diagnosis baseline.
+        // Tight polling makes the per-port-read host cost visible.
         code: &[
             0xBA, 0xDA, 0x03, // mov dx, 0x03DA
             0xEC, // wait: in al, dx
@@ -194,9 +177,7 @@ const MICROBENCHES: &[Microbench] = &[
         //       test al, 0x10
         //       jz wait          (spin while the DRAM-refresh heartbeat bit is clear)
         //       jmp wait         (re-poll once seen set, an unconditional spin)
-        // Mirrors poll-3da's shape but against port 0x61 bits 4/5 (PIT channel
-        // 1/2 OUT), the P4a Task 2.3 lazy-read target: a real boot-time DRAM-
-        // refresh detection loop polls exactly this bit.
+        // Mirrors poll-3da's shape against the PIT channel 1 refresh heartbeat.
         code: &[
             0xE4, 0x61, // wait: in al, 0x61
             0xA8, 0x10, // test al, 0x10
@@ -209,14 +190,8 @@ const MICROBENCHES: &[Microbench] = &[
         // The canonical AdLib detection idiom (Ralf Brown's probe, mirrored
         // from OplChip's own `adlib_detection_sequence_reports_present` unit
         // test): reset both timers, arm timer 1 to overflow in one 80us step,
-        // start it, then poll the status port for the timer-1 flag. Before
-        // P4a Slice 3 every one of the loop's status reads ended a CPU batch;
-        // after Slice 3 only the one setup write per OUT (address port,
-        // 0x388) does, so this is the lazy-status-read counterpart of
-        // poll-3da/poll-61 -- 1 address write + up to 6 status reads/session
-        // per the plan's idiom shape, though this fixture polls forever (no
-        // halt) so the same handful of address-port writes repeats only in
-        // the one-time setup, and the hot loop is pure status reads.
+        // start it, then poll the status port for the timer-1 flag. The setup
+        // writes once and the hot loop contains only status reads.
         //
         // Byte layout (hand-checked, see the poll-61 lesson: a IN AL,imm8's
         // 2-byte encoding vs IN AL,DX's 1-byte moved the branch target and
@@ -313,22 +288,11 @@ fn microbench_rom(code: &[u8]) -> Vec<u8> {
     rom
 }
 
-/// Run the poll-loop microbench fixture (Task 0.4): all three patterns, in
-/// every GSW mode, for a fixed clock budget each (none of the payloads halts
-/// or exits, so there is nothing to run "to completion"). Prints rt_factor per
-/// mode per pattern in the same columns `run_bench` uses for its guest_ms/
-/// wall_ms/rt_factor fields. Every row carries an ` [info]` marker (the
-/// ` [approx]` suffix precedent): these rows never gate the process exit,
-/// even when read without the section header in view. Banding runs through
-/// `band_tag`, which no-ops for a payload name with no reference band, so no
-/// microbench row can ever fail the run -- same policy as the
-/// Approximate-class rows in the main table, per Phase 3 of
-/// dev_docs/2026-07-01-cpu-timing-classes-plan.md. A row whose run ended on
-/// anything other than the clock budget is tagged ` [early-stop: <reason>]`,
-/// since its rt_factor measured a truncated run.
+/// Run every diagnostic loop in every GSW mode. These host-speed rows remain
+/// informational because they have no period-hardware reference target.
 fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!();
-    println!("=== poll-loop microbench (informational; P4a Task 0.4) ===");
+    println!("=== poll-loop microbench (host diagnostics) ===");
     println!(
         "{:<14} {:<5} {:>10} {:>9} {:>10}",
         "pattern", "mode", "guest_ms", "wall_ms", "rt_factor"
@@ -427,10 +391,9 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
     );
     // Collected for the host-side perf summary printed after the table.
     let mut perf_rows: Vec<(&'static str, GswMode, PerfCounters)> = Vec::new();
-    // Only an accurate 386-mode out-of-band row fails the process. The 486/586
-    // modes are informational, so their verdicts print but never flip this flag.
-    let mut accurate_out_of_band = false;
+    let mut out_of_band = false;
     for bench in BENCHES {
+        let mut slow_row: Option<(u64, f64)> = None;
         for mode in modes {
             if mode_rank(mode) < mode_rank(bench.min_mode) {
                 continue;
@@ -473,6 +436,29 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 }
                 None => (iters_per_sec, String::new()),
             };
+            match mode {
+                GswMode::Gsw386Slow => slow_row = Some((work, band_value)),
+                GswMode::Gsw386 => {
+                    if let Some((slow_work, slow_value)) = slow_row {
+                        if slow_work != work {
+                            return Err(format!(
+                                "{} retired different architectural work in 386-slow ({slow_work}) and 386 ({work})",
+                                bench.name
+                            )
+                            .into());
+                        }
+                        let ratio = slow_value * 3.0 / band_value;
+                        if (ratio - 1.0).abs() > 0.005 {
+                            return Err(format!(
+                                "{} 386-slow throughput is {:.4} of the exact one-third target",
+                                bench.name, ratio
+                            )
+                            .into());
+                        }
+                    }
+                }
+                GswMode::Gsw486 | GswMode::Gsw586 => {}
+            }
             print!(
                 "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
                 bench.name,
@@ -485,17 +471,10 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 wall_secs * 1000.0,
                 rt,
             );
-            // Soft reporter: tag each row against the era reference band. Accurate
-            // 386 modes gate the process exit on an out-of-band verdict; the
-            // approximate 486/586 modes are informational only (their bands
-            // were widened for this in bench_reference.rs), so they always print
-            // their tag but never fail the run.
-            if !mode.uses_approximate_timing()
-                && bench_reference::band_for(bench.name, mode).is_some_and(|band| {
-                    band.verdict(band_value) != bench_reference::BandVerdict::InBand
-                })
-            {
-                accurate_out_of_band = true;
+            if bench_reference::band_for(bench.name, mode).is_some_and(|band| {
+                band.verdict(band_value) != bench_reference::BandVerdict::InBand
+            }) {
+                out_of_band = true;
             }
             println!(
                 "{}{}",
@@ -553,15 +532,9 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.jit_native_load_hits,
             perf.jit_paged_tlb_successes,
         );
-        // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
-        // miss investigation.
-        println!(
-            "  brk_attrib[decode_miss/not_continuable/page_cross]={}/{}/{}",
-            perf.brk_cont_decode_miss, perf.brk_cont_not_continuable, perf.brk_cont_page_cross,
-        );
     }
-    if accurate_out_of_band {
-        return Err("a 386 bench row is out of its era reference band"
+    if out_of_band {
+        return Err("a CPU benchmark row is outside its hard reference band"
             .to_string()
             .into());
     }
@@ -1019,8 +992,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.jit_native_load_hits,
         perf.jit_paged_tlb_successes,
     );
-    // TEMPORARY: split the brk_decode_or_branch attribution for the decode-cache
-    // miss investigation.
+    // Attribute combined decode-or-branch exits for profiling runs.
     println!(
         "  brk_attrib[decode_miss/not_continuable/page_cross]={}/{}/{}",
         perf.brk_cont_decode_miss, perf.brk_cont_not_continuable, perf.brk_cont_page_cross,
@@ -1029,23 +1001,16 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
 
 /// Compare a measured `iters/sec` to the matching era reference band and return
 /// a tag to append to the row: ` [in band]`, ` [LOW <ratio>]`, ` [HIGH <ratio>]`,
-/// or empty when no band is encoded for this payload/mode. The approximate-timing
-/// 486/586 modes carry an extra trailing ` [approx]` marker,
-/// since their band is informational rather than a gate.
+/// or empty when no band is encoded for this payload/mode.
 fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
     use bench_reference::BandVerdict;
     let Some(band) = bench_reference::band_for(payload, mode) else {
         return String::new();
     };
-    let verdict = match band.verdict(iters_per_sec) {
+    match band.verdict(iters_per_sec) {
         BandVerdict::InBand => " [in band]".to_string(),
         BandVerdict::Low => format!(" [LOW {:.2}]", iters_per_sec / band.target),
         BandVerdict::High => format!(" [HIGH {:.2}]", iters_per_sec / band.target),
-    };
-    if mode.uses_approximate_timing() {
-        format!("{verdict} [approx]")
-    } else {
-        verdict
     }
 }
 
@@ -1072,10 +1037,8 @@ const BANDWIDTH_BLOCKS: &[u32] = &[
 /// physical address) over a range of block sizes and prints MB/s per block, so a
 /// human can see the L1/L2/RAM cache tiers as steps in the curve.
 ///
-/// This is observability only: it never fails the process (the hard tier-ordering
-/// assertions are a later task). The tier costs are CALIBRATED (B-T9): the curve
-/// steps DOWN at each cache boundary (586/486: L1 > L2 > RAM; 386: L2 > RAM; 286:
-/// flat RAM), and each tier sits in its (best-effort) era band.
+/// Every row is checked against the same hard reference window as the CPU
+/// payloads. The curve must step down at each cache boundary.
 pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // A fixed total budget per block: small blocks do many passes, large blocks a
     // few. 16 MB amortizes the cold first pass so the steady state dominates.
@@ -1095,6 +1058,7 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
     );
     println!("(tier costs calibrated: the curve steps down at each cache boundary)");
 
+    let mut out_of_band = false;
     for mode in modes {
         println!();
         println!(
@@ -1118,32 +1082,38 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
             } else {
                 0.0
             };
-            println!(
-                "{:>7}K {:>12.1} {:>16}",
-                block / 1024,
-                mb_per_sec,
-                bandwidth_band_tag(mode, block, mb_per_sec),
-            );
+            let tag = bandwidth_band_tag(mode, block, mb_per_sec);
+            if bench_reference::band_for(bandwidth_tier(mode, block), mode).is_some_and(|band| {
+                band.verdict(mb_per_sec) != bench_reference::BandVerdict::InBand
+            }) {
+                out_of_band = true;
+            }
+            println!("{:>7}K {:>12.1} {:>16}", block / 1024, mb_per_sec, tag,);
         }
     }
-    Ok(())
+    if out_of_band {
+        Err("a memory-bandwidth row is outside its hard reference band".into())
+    } else {
+        Ok(())
+    }
 }
 
-/// Soft band tag for a bandwidth row: pick the tier a block falls into for the
-/// mode's cache geometry (<= L1 -> L1, <= L2 -> L2, else RAM), look up the
-/// matching `bandwidth-*` era band, and tag the measured MB/s against it. Returns
-/// empty when no band is encoded for that mode/tier. Observability only.
-fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64) -> String {
-    use bench_reference::BandVerdict;
+fn bandwidth_tier(mode: GswMode, block: u32) -> &'static str {
     let (l1_kb, l2_kb) = mode.cache_kb();
     let block_kb = block / 1024;
-    let tier = if l1_kb != 0 && block_kb <= u32::from(l1_kb) {
+    if l1_kb != 0 && block_kb <= u32::from(l1_kb) {
         "bandwidth-l1"
     } else if l2_kb != 0 && block_kb <= u32::from(l2_kb) {
         "bandwidth-l2"
     } else {
         "bandwidth-ram"
-    };
+    }
+}
+
+/// Tag a bandwidth row against the band for its active cache tier.
+fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64) -> String {
+    use bench_reference::BandVerdict;
+    let tier = bandwidth_tier(mode, block);
     let Some(band) = bench_reference::band_for(tier, mode) else {
         return String::new();
     };
