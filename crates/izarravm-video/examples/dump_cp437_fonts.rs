@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 // Authoring-only: write the built-in CP437 glyphs (8x8, 8x14, 8x16, in that
 // order, concatenated) to tools/cp437-fonts.bin so the font-blob generator can
 // reuse them verbatim and keep CP437 byte-identical to what ships.

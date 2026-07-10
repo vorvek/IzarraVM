@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The monitor presentation pass: a wgpu shader that stretches the guest
 //! framebuffer to fill the 4:3 rect (correct pixel aspect for every mode) and,
 //! when enabled, adds a faithful high-resolution-CRT look — sharp upscale, a

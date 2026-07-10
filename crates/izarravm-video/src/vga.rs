@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The legacy VGA core: 256 KB planar VRAM, the VGA register blocks, a
 //! cycle-coupled beam clock, and a catch-up rasterizer. This is Margo's
 //! VGA-compatibility personality (one chip, one frame store, one RAMDAC).

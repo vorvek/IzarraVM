@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Izarra keyboard BIOS: real INT 09h / INT 16h, echo to B8000.
 ; Assemble with: nasm -f bin kbd-bios.asm -o kbd-bios.bin
 bits 16

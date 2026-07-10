@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-result.inc - foundation: POST step registration + the live VDTS
 ; result-block builder. The macro accumulates (name, handler) pairs across every
 ; %include; izbios-tables.inc (last) emits the contiguous table. result_append

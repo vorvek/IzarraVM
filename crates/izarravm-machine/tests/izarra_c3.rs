@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Integration coverage for the four component probes that
 //! complete the graphical POST's icon sweep (GSW CPU, floppy controller, ATA
 //! hard disk, ATAPI optical). They do real port reads, so an absent device is

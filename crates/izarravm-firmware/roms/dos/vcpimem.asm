@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; vcpimem.com: TOKAEMM VCPI query/page-pool fixture. Runs in V86 under a
 ; bare DEVICE=C:\DOS\TOKAEMM.SYS and exercises the DE02-DE0B set: the page
 ; pool (count/alloc/free round-trip, 12-LSB masking, bad-free and double-free

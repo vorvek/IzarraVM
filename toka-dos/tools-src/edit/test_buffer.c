@@ -1,3 +1,6 @@
+/* This file is part of IzarraVM and is licensed under GNU GPL version 3 only. */
+/* SPDX-License-Identifier: GPL-3.0-only */
+
 /* TokaEdit buffer core host test harness. Part of the Toka-DOS project, GPL-3.0-only. Copyright (c) 2026 the IzarraVM project. */
 #include <assert.h>
 #include <stdio.h>

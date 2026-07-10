@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; MTEST.COM - guest self-test for the Toka-DOS MOUSE.COM driver (INT 33h).
 ;
 ; Runs from AUTOEXEC.BAT after MOUSE.COM is resident. It drives the INT 33h

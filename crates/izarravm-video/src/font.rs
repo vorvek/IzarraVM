@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The built-in CP437 character generator: the three ROM glyph fonts the VGA
 //! BIOS carries, byte-for-byte from the LGPL VGABios used by QEMU/Bochs
 //! (`vgafonts.h`, originally Joseph Gil's fntcol16.zip, public-domain glyphs).

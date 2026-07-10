@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izarra-bios.asm - Izarra 3000 clean-room real-mode BIOS (POST, RAM test,
 ; component/peripheral probes, mode-13h status + setup page).
 ; Assemble with: nasm -f bin izarra-bios.asm -o izarra-bios.bin

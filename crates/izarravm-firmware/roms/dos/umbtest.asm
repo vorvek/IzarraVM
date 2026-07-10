@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; UMB fixture. Runs in V86 under TOKAEMM and DOS=UMB.
 ;
 ; Proves the full integration: with DOS=UMB, FreeDOS calls TOKAEMM's XMS 10h at

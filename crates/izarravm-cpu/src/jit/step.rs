@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The per-instruction step function a compiled loop-region calls, and the `RegionCtx` it
 //! communicates through. One call per guest instruction slot: the step does exactly what one
 //! `run_straight_line` continuation does (the `run_one_cached` prologue, the cached-fetch charge,

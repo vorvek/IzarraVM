@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! x87 state for the CPU personas with an integrated FPU: the register stack, the control and
 //! status words, and the tag word.
 //!

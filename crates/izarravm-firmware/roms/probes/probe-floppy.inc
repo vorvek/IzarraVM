@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Floppy disk controller probe (the floppy
 ; icon). The NEC-765/82077-class FDC lives at ports 0x3F2-0x3F7; its main status
 ; register (MSR, 0x3F4) is the presence handle. A live controller drives RQM

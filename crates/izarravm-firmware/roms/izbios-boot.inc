@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Tab boot menu and INT 19h bootstrap. After
 ; POST the core calls setup_maybe_enter (which opens this menu on Tab) and then
 ; boot_entry. boot_entry reads the chosen device from BOOT_CHOICE and dispatches:

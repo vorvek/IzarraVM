@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; gpreflct.com: TOKAEMM V86 #GP-reflection fixture. A real-monitor
 ; contract check: a V86 program that hooks INT 0Dh and executes a privileged
 ; instruction the monitor does not emulate must receive its own fault

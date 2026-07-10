@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; EMS fixture. Runs in V86 under TOKAEMM loaded with
 ; DEVICE=C:\DOS\TOKAEMM.SYS RAM (the page frame provisioned).
 ;

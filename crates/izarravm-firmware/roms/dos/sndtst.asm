@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; SB16 IRQ5 under V86 fixture. Runs under the
 ; TOKAEMM monitor (default-payload config).
 ;

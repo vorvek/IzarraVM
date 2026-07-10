@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # Izarra 3000 User Manual
 
 The Izarra 3000 is a fixed machine. This manual describes it as built: what

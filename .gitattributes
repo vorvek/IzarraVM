@@ -1,5 +1,23 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 * text=auto eol=lf
+*.bin -text -diff
+*.com -text -diff
+*.COM -text -diff
+*.exe -text -diff
+*.EXE -text -diff
+*.gz -text -diff
+*.ico -text -diff
+*.img -text -diff
+*.jpg -text -diff
+*.ovl -text -diff
+*.OVL -text -diff
+*.png -text -diff
+*.rgba -text -diff
 *.sf3 -text -diff
+*.sys -text -diff
+*.SYS -text -diff
+*.ttf -text -diff
 third_party/fluidr3mono/FluidR3Mono_License.md -text -diff
-crates/izarravm-native-synth/vendor/*.tar.gz -text -diff
 crates/izarravm-native-synth/vendor/licenses/* -text -diff

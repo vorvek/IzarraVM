@@ -1,6 +1,12 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 name: CI
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -20,6 +26,9 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: File policy
+        run: python scripts/check_file_policy.py
+
       - name: Format
         run: cargo fmt --check
 
@@ -31,3 +40,12 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+      - name: Check configuration
+        run: cargo run -p izarravm -- --headless-config-check
+
+      - name: Run test ROM
+        run: cargo run -p izarravm -- --headless-test-rom
+
+      - name: Run boot suite
+        run: cargo run -p izarravm -- --headless-boot-suite

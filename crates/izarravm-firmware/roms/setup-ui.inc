@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Margo-LFB setup page. Uses the
 ; SETUP_SCRATCH region (segment 0, 256 bytes). Core calls setup_maybe_enter after
 ; run_post and before enter_setup_or_boot.

@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Generic forward-decode basic-block builder. Starting at any hot linear PC,
 //! `build_block` walks the decode cache forward, collecting continuable slots until the first
 //! block terminator, and `try_admit` compiles the result as a loop-region: emitted native code

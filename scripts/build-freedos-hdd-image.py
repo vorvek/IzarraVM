@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Build a bootable, partitioned FAT32 Toka-DOS hard-disk image from the built
 components. Authoring-only; emits crates/izarravm-firmware/roms/tokados-hdd.img.
 

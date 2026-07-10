@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; GSW CPU probe (the CPU icon).
 ; Toggle EFLAGS.AC first. If it is fixed, this is either 386 clock mode. If AC
 ; changes, toggle EFLAGS.ID. A fixed ID marks the 486. Only the 586 executes

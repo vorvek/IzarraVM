@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; A DOS .EXE: load DS from a relocated segment reference, print via INT 21h
 ; AH=09h, exit via AH=4Ch. The "mov ax, DATA / mov ds, ax" emits an MZ
 ; relocation; if the loader fails to apply it, DS is wrong and the printed

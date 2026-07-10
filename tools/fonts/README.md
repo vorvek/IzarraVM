@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # Vendored fonts
 
 `ModernDOS8x8.ttf`, `ModernDOS8x14.ttf`, `ModernDOS8x16.ttf` are the native

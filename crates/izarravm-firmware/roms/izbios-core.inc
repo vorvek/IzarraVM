@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-core.inc - foundation: reset bring-up, PIC init, the POST sequencer,
 ; the >1 MiB / MMIO access helpers, and the boot/halt tail. Reset enters at
 ; bios_start (the skeleton's reset: at offset 0 jumps here).

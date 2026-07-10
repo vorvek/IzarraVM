@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Assemble a read-only FAT32 volume from a host folder.
 //!
 //! Unlike the FAT12 floppy (fat12.rs), which materializes the whole 1.44 MB

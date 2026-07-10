@@ -1,3 +1,6 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 # Authoring-only: build Toka-DOS (FreeDOS) from vendored source. Not run in CI.
 # Builds the kernel (kernel.sys + fat12com.bin) and the FreeCOM shell
 # (command.com), in that order.

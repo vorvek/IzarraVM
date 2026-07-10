@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! A small write-then-execute (W^X) memory buffer for emitted machine code. Windows and Linux
 //! x86-64 get a real allocator; every other target compiles to a buffer that can never be
 //! created, so the JIT compiles nothing and the interpreter runs unchanged.

@@ -35,6 +35,13 @@ notices, hashes, and relinking instructions are in
 crates/izarravm-native-synth/vendor. Roland ROMs are not distributed.
 The embedded FluidR3Mono_GM.sf3 SoundFont is distributed under the MIT
 license. Its upstream notice and provenance are in third_party/fluidr3mono.
+The imported MS-DOS 4.0 keyboard tables are distributed by Microsoft under
+the MIT license. Their provenance is in tools/msdos-keyboard/VENDOR.md.
+The Modern DOS fonts by Jayvee Enaguas are released under CC0-1.0. The
+generated CP437 and code-page font blobs retain that license. Provenance is
+in tools/fonts/README.md.
+The Izarra 3000 logo, chassis photograph, emulator screenshot, and firmware
+artwork are project assets distributed under GPL-3.0-only.
 Host audio output uses cpal 0.15.3 under Apache-2.0. External MIDI output uses
 midir 0.10.4, Copyright (c) 2015 Patrick Reisert and the RtMidi contributors,
 under MIT. Exact license texts are in third_party/licenses.
@@ -48,3 +55,13 @@ adapted to the Izarra 3000's virtual hardware and reimplemented in NASM for
 IzarraVM. The VCPI 1.0 interface follows the Virtual Control Program
 Interface specification (© 1987-89 Phar Lap Software, Inc. and Quarterdeck
 Office Systems).
+
+LICENSE_MANIFEST.tsv records the origin, license, and SHA-256 of tracked
+binary, generated, and non-commentable files. LicenseRef-IzarraVM-TokaDOS-Aggregate
+identifies the Toka-DOS disk image as an aggregation of GPL-3.0-only project
+files, GPL-2.0-or-later FreeDOS files, and LGPL-2.1 kitten files. Each component
+retains its own license and notice.
+LicenseRef-FLAC-1.4.3-Source-Archive and
+LicenseRef-Munt-2.8.2-Source-Archive identify the unmodified, mixed-license
+upstream source archives. Their component licenses and notices remain in the
+archives and are listed in crates/izarravm-native-synth/vendor/SOURCES.md.

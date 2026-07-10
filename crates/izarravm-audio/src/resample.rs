@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Band-limited resampler taking the OPL3's native 49716 Hz stereo output down
 //! to the Resonique 2 DAC rate (44100 Hz). A Blackman-windowed sinc low-pass is
 //! baked into a polyphase table, so each output frame is a 64-tap weighted sum

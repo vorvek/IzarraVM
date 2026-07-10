@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! PS/2 auxiliary (mouse) device, as the 8042 controller multiplexes it.
 //! Models a Microsoft IntelliMouse: it powers up as a standard three-byte mouse
 //! (id 0x00) and switches to four-byte wheel mode (id 0x03) once the driver

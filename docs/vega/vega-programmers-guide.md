@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # VEGA for Programmers
 
 A working guide to drawing on the Izarra 3000 through the VEGA chipset. The

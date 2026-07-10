@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Margo (VEGA 2D) probe.
 ; Two POST steps: component.video_margo (PASS/FAIL on the identity register) and
 ; video.margo_caps (MEASURE of the capability bits). Both read Margo's 32-bit

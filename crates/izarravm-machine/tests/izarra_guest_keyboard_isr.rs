@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 // Reproduces how an action game (Prince of Persia) reads the keyboard: it
 // installs its OWN INT 09h handler, reads raw scancodes from port 0x60, and
 // tracks key state from the make/break codes (a key release is scancode | 0x80).

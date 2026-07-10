@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Sound Blaster 16 CT1745 mixer chip: the index/data register file at I/O
 //! `0x224`/`0x225` that selects the card's IRQ line and DMA channels and sets
 //! the output volume. Clean-room derived from the Creative "Sound Blaster 16

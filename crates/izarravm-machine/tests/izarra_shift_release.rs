@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 // Shift make/break round-trips through the real run loop: 8042 -> IRQ1 ->
 // INT 09h -> BDA KB_FLAGS. This pins where a "sticky shift" can and cannot come
 // from. If these pass, a stuck shift is NOT the interrupt/8042/BIOS path; the

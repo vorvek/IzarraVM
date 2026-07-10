@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; HLTTEST.COM - enable interrupts, execute a real HLT, then terminate with DOS
 ; exit code 1. The katea-run e2e fixture for guest HLT under TOKAEMM (V86):
 ; proves the CPU's HLT-is-privileged #GP(0) and TOKAEMM's .hlt emulation

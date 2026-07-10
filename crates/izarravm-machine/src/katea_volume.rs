@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Shared FAT32 primitives for the "Katea" storage controller, plus the read-only
 //! extractor that pulls the Toka-DOS system files back out of the committed
 //! `crates/izarravm-firmware/roms/tokados-hdd.img`.

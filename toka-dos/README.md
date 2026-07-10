@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # Toka-DOS
 
 The Izarra 3000's bundled operating system: a rebranded, real **FreeDOS**. The
