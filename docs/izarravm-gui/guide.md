@@ -73,16 +73,18 @@ toggle hotkey.
 | **Subtle** | A light shadow-mask CRT effect. This is the default. |
 | **Ye Olde Screene** | A heavier CRT effect for the full period look. |
 
-**Audio**: set the card amp and PC speaker volume. The P300 wavetable
-daughter card always uses FluidSynth with the embedded FluidR3Mono bank. You
+**Audio**: set the card amp and PC speaker volume. P300 represents a wavetable
+daughterboard fitted to the ReSonique 2's internal pin headers. IzarraVM
+emulates that board through FluidSynth with the embedded FluidR3Mono bank. You
 can select a custom SF2 or SF3 bank without changing the P330 MIDI route.
 
-The P330 receiver selector contains these choices:
+P330 represents the Izarra 3000's rear MPU-401/gameport. Its receiver selector
+contains these choices:
 
 | Receiver | What it uses |
 | --- | --- |
 | **Off** | Keeps the P330 MPU active without sending its messages anywhere. |
-| **Munt (MT-32)** | User-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
+| **Munt (MT-32)** | An emulator convenience using user-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
 | **Host device name and ordinal** | The exact operating-system MIDI destination. These entries represent the MIDI IN side of an external receiver. If the destination disappears, IzarraVM does not choose another one. |
 
 P300 and P330 are independent. A P330 receiver change sends all-notes-off to
