@@ -23,46 +23,6 @@ fn device_lines_are_returned_in_order_with_high_flag() {
 }
 
 #[test]
-fn gsw_mode_clocks_and_names() {
-    assert_eq!(GswMode::Gsw386.clock_hz(), 22_000_000);
-    assert_eq!(GswMode::Gsw386Slow.clock_hz(), 7_333_333);
-    assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
-    assert_eq!(GswMode::Gsw586.clock_hz(), 200_000_000);
-    assert_eq!(GswMode::Gsw386Slow.canonical_name(), "386-slow");
-    assert_eq!(GswMode::Gsw586.canonical_name(), "586");
-    assert_eq!(GswMode::default(), GswMode::Gsw386);
-}
-
-#[test]
-fn gsw_mode_cache_table_per_mode() {
-    assert_eq!(GswMode::Gsw386.cache_kb(), (0, 64));
-    assert_eq!(GswMode::Gsw386Slow.cache_kb(), (0, 64));
-    assert_eq!(GswMode::Gsw486.cache_kb(), (16, 128));
-    assert_eq!(GswMode::Gsw586.cache_kb(), (32, 512));
-}
-
-#[test]
-fn timing_class_is_accurate_for_386_and_386_slow_and_approximate_for_fast() {
-    use crate::{GswMode, TimingClass};
-    assert_eq!(GswMode::Gsw386.timing_class(), TimingClass::Accurate);
-    assert_eq!(GswMode::Gsw386Slow.timing_class(), TimingClass::Accurate);
-    assert_eq!(GswMode::Gsw486.timing_class(), TimingClass::Approximate);
-    assert_eq!(GswMode::Gsw586.timing_class(), TimingClass::Approximate);
-}
-
-#[test]
-fn gsw_mode_parses_primary_and_legacy_names() {
-    assert_eq!("386".parse::<GswMode>().unwrap(), GswMode::Gsw386);
-    assert_eq!("386-slow".parse::<GswMode>().unwrap(), GswMode::Gsw386Slow);
-    assert_eq!("slow".parse::<GswMode>().unwrap(), GswMode::Gsw386Slow);
-    assert_eq!("486".parse::<GswMode>().unwrap(), GswMode::Gsw486);
-    assert_eq!("586".parse::<GswMode>().unwrap(), GswMode::Gsw586);
-    assert_eq!("i386dx_25".parse::<GswMode>().unwrap(), GswMode::Gsw386);
-    assert!("pentium_133".parse::<GswMode>().is_err());
-    assert!("286".parse::<GswMode>().is_err());
-}
-
-#[test]
 fn emm386_conf_key_parses_and_is_ignored() {
     // Pre-M4 izarravm.conf files carried `emm386 = "..."`; the key is
     // accepted and ignored so those conf files still parse under M4's

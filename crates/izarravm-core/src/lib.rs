@@ -1,4 +1,15 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 #![forbid(unsafe_code)]
+
+mod clock;
+mod gsw;
+
+pub use clock::ClockRate;
+pub use gsw::{
+    CacheGeometry, CpuPersona, GSW_MODE_SPECS, GswMode, GswModeSpec, L1Cache, TimingClass,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -28,6 +39,8 @@ pub enum ConfigError {
     InvalidMemory(u16),
     #[error("unknown {kind} preset '{value}'")]
     UnknownPreset { kind: &'static str, value: String },
+    #[error("CPU preset '286' was removed; use '386-slow'")]
+    RemovedCpu286,
     #[error(
         "audio.wss.base {0:#06x} places the 8-port WSS window [{0:#06x}, {1:#06x}) over a fixed chipset/device port range; use a documented WSS base (0x530, 0x604, 0xE80, or 0xF40)"
     )]
@@ -40,105 +53,6 @@ pub enum ConfigError {
         "audio.wss.irq {0} collides with audio.sound_blaster.irq {0}; the AD1848 and SB16 must use distinct PIC lines (real combo cards jumper them apart, e.g. WSS IRQ7 vs SB16 IRQ5)"
     )]
     WssSbIrqCollision(u8),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GswMode {
-    #[serde(rename = "386")]
-    #[default]
-    Gsw386,
-    #[serde(rename = "386-slow")]
-    Gsw386Slow,
-    #[serde(rename = "486")]
-    Gsw486,
-    #[serde(rename = "586")]
-    Gsw586,
-}
-
-impl GswMode {
-    /// The throttled core clock per compatibility mode: 22 MHz (386), ~7.33 MHz
-    /// (386-slow, one-third speed), 66 MHz (486), and 200 MHz native (586).
-    pub const fn clock_hz(self) -> u64 {
-        match self {
-            Self::Gsw386 => 22_000_000,
-            Self::Gsw386Slow => 7_333_333,
-            Self::Gsw486 => 66_000_000,
-            Self::Gsw586 => 200_000_000,
-        }
-    }
-
-    /// Reported cache sizes per compatibility mode as (L1 KB, L2 KB). The L2 is a
-    /// motherboard cache module. Mirrors `CpuLevel::cache_kb` and the machine
-    /// CacheModel geometry, which drive data-access timing (no longer cosmetic).
-    /// The 586 L1 is 32 KB: the Pentium MMX (P55C) has 16 KB instruction + 16 KB data.
-    /// 386-slow uses the same geometry as 386 for now.
-    pub const fn cache_kb(self) -> (u16, u16) {
-        match self {
-            Self::Gsw386 | Self::Gsw386Slow => (0, 64),
-            Self::Gsw486 => (16, 128),
-            Self::Gsw586 => (32, 512),
-        }
-    }
-
-    pub const fn canonical_name(self) -> &'static str {
-        match self {
-            Self::Gsw386 => "386",
-            Self::Gsw386Slow => "386-slow",
-            Self::Gsw486 => "486",
-            Self::Gsw586 => "586",
-        }
-    }
-}
-
-/// How faithfully a GSW mode models time. A hard property of the mode, not a
-/// runtime toggle: the slow modes (386 and 386-slow) are cycle-faithful; the
-/// fast modes are close approximations that trade cycle accuracy for host
-/// headroom (real DOS audio/timers hold realtime). Instruction RESULTS are
-/// bit-exact in both classes; only TIME differs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimingClass {
-    /// 386 and 386-slow: era-calibrated, cycle-faithful.
-    Accurate,
-    /// 486/586: fast by default, close approximations, not cycle-accurate.
-    Approximate,
-}
-
-impl GswMode {
-    /// The timing class this mode runs in. `const fn` so every timing decision can
-    /// branch on it cheaply. 386/386-slow are Accurate; 486/586 are Approximate.
-    pub const fn timing_class(self) -> TimingClass {
-        match self {
-            Self::Gsw386 | Self::Gsw386Slow => TimingClass::Accurate,
-            Self::Gsw486 | Self::Gsw586 => TimingClass::Approximate,
-        }
-    }
-}
-
-impl fmt::Display for GswMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.canonical_name())
-    }
-}
-
-impl FromStr for GswMode {
-    type Err = ConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match normalize(value).as_str() {
-            // Primary GSW names plus legacy Intel aliases so old configs parse.
-            // 286 aliases removed (mode dropped); 386-slow is the new slow tier.
-            "386" | "gsw386" | "386dx25" | "i386dx25" | "i386dx_25" | "386_25" => Ok(Self::Gsw386),
-            "386-slow" | "slow" | "386slow" | "gsw386slow" => Ok(Self::Gsw386Slow),
-            "486" | "gsw486" | "486dx266" | "i486dx266" | "i486dx2_66" | "486dx2_66" => {
-                Ok(Self::Gsw486)
-            }
-            "586" | "gsw586" => Ok(Self::Gsw586),
-            _ => Err(ConfigError::UnknownPreset {
-                kind: "CPU",
-                value: value.to_owned(),
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
