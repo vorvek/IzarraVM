@@ -412,6 +412,16 @@ impl CpuBus for MachineBus<'_> {
             });
         }
 
+        if self.distira_cmdfifo_offset(address, bytes).is_some() {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            return Ok(match width {
+                BusWidth::Byte => 0xff,
+                BusWidth::Word => 0xffff,
+                BusWidth::Dword => u32::MAX,
+            });
+        }
+
         if should_split(address, width) {
             let mut value = 0u32;
             for offset in 0..width.bytes() {
@@ -1007,8 +1017,14 @@ impl CpuBus for MachineBus<'_> {
         // today (the real gate never drops), so this is belt-and-braces for a
         // future monitor that pokes the real gate, at zero hot-path cost (the
         // monitor's hot pokes are the PIC/EOI ports, not these three).
-        let skip_io_touched =
-            cpu_is_ring0_pm && self.lazy_port_reads && !matches!(port, 0x60 | 0x64 | 0x92);
+        //
+        // PCI configuration writes are also batch-ending. A BAR or command
+        // update rebuilds the direct-RAM map below, so the CPU must discard its
+        // cached direct pages before it executes another guest instruction.
+        let skip_io_touched = cpu_is_ring0_pm
+            && self.lazy_port_reads
+            && !matches!(port, 0x60 | 0x64 | 0x92)
+            && !(PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_DATA_END).contains(&port);
         if !skip_io_touched {
             *self.io_touched = true;
         }
@@ -1468,15 +1484,11 @@ impl MachineBus<'_> {
     }
 
     fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
-        self.pci
-            .distira_mmio_offset(address, width)
-            .or_else(|| distira_mmio_offset(address, width))
+        self.pci.distira_mmio_offset(address, width)
     }
 
     fn distira_lfb_offset(&self, address: u32, width: usize) -> Option<usize> {
-        self.pci
-            .distira_lfb_offset(address, width)
-            .or_else(|| distira_lfb_offset(address, width))
+        self.pci.distira_lfb_offset(address, width)
     }
 
     fn distira_texture_offset(&self, address: u32, width: usize) -> Option<usize> {
@@ -1718,6 +1730,11 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        if self.distira_cmdfifo_offset(address, width).is_some() {
+            out.fill(0xff);
+            return Ok(());
+        }
+
         if let Some(offset) = self.distira_mmio_offset(address, width) {
             for (index, byte) in out.iter_mut().enumerate() {
                 *byte = self.distira.read_mmio_u8(offset + index);
@@ -1738,7 +1755,10 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        Err(BusError::UnmappedMemory { address })
+        // No device or memory answers this physical address. The data lines
+        // float high instead of raising a CPU-visible memory fault.
+        out.fill(0xff);
+        Ok(())
     }
 
     fn write_memory_byte(&mut self, address: u32, value: u8) -> Result<(), BusError> {
@@ -1830,6 +1850,10 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        if self.distira_cmdfifo_offset(address, 1).is_some() {
+            return Ok(());
+        }
+
         if let Some(offset) = self.distira_mmio_offset(address, 1) {
             self.distira.write_mmio_u8(offset, value);
             return Ok(());
@@ -1839,7 +1863,8 @@ impl MachineBus<'_> {
             return self.memory.write_u8(address as usize, value);
         }
 
-        Err(BusError::UnmappedMemory { address })
+        // Writes to an unclaimed physical address have no receiver.
+        Ok(())
     }
 
     /// Run a floppy READ/WRITE DATA execution phase the FDC staged: move sector
@@ -2134,24 +2159,6 @@ fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
     let end = MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32;
     if (MARGO_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - MARGO_MMIO_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-fn distira_lfb_offset(address: u32, width: usize) -> Option<usize> {
-    let end = DISTIRA_LFB_BASE + DISTIRA_FB_SIZE as u32;
-    if (DISTIRA_LFB_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - DISTIRA_LFB_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-fn distira_mmio_offset(address: u32, width: usize) -> Option<usize> {
-    let end = DISTIRA_MMIO_BASE + DISTIRA_MMIO_SIZE as u32;
-    if (DISTIRA_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - DISTIRA_MMIO_BASE) as usize)
     } else {
         None
     }

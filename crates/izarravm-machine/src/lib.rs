@@ -21,10 +21,10 @@ pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, HGC_FB_SIZE,
-    MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE,
-    VGA_MONO_TEXT_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga,
-    VgaRaster, VideoMode, bytes_per_pixel, font, pixel_format, vbe_mode,
+    CGA_FB_SIZE, DAC_ENTRIES, Distira, HGC_FB_SIZE, MARGO_MMIO_SIZE, MARGO_VBE_MODES,
+    MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
+    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode,
+    bytes_per_pixel, font, pixel_format, vbe_mode,
 };
 use thiserror::Error;
 

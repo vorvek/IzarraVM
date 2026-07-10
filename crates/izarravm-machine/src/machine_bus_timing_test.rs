@@ -1021,14 +1021,27 @@ fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
 }
 
 #[test]
-fn ram_lookup_rebuilds_when_distira_bar_moves_over_ram() {
+fn ram_lookup_rebuilds_on_each_effective_distira_decode_change() {
+    fn write_config(bus: &mut MachineBus<'_>, register: u32, value: u32) {
+        let address = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | register;
+        bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, address, false)
+            .unwrap();
+        bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, value, false)
+            .unwrap();
+    }
+
     let mut machine = Machine::new(
         MachineProfile::gsw_386(24, VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
     const RAM_ADDR: u32 = 0x0100_0000;
+    const FIFO_RAM_ADDR: u32 = RAM_ADDR + DISTIRA_PCI_CMDFIFO_OFFSET;
     machine.memory.write_u8(RAM_ADDR as usize, 0x5a).unwrap();
+    machine
+        .memory
+        .write_u8(FIFO_RAM_ADDR as usize, 0x6b)
+        .unwrap();
 
     with_bus(&mut machine, |bus| {
         assert!(
@@ -1037,11 +1050,7 @@ fn ram_lookup_rebuilds_when_distira_bar_moves_over_ram() {
                 .is_some(),
             "extended RAM starts direct"
         );
-        let config_addr = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x10;
-        bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, config_addr, false)
-            .unwrap();
-        bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_ADDR, false)
-            .unwrap();
+        write_config(bus, 0x10, RAM_ADDR);
         assert!(
             bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
                 .unwrap()
@@ -1054,13 +1063,124 @@ fn ram_lookup_rebuilds_when_distira_bar_moves_over_ram() {
         );
         bus.write_memory(RAM_ADDR, BusWidth::Byte, 0xa5, BusAccessKind::DataWrite)
             .unwrap();
+
+        *bus.direct_map_changed = false;
+        write_config(bus, 0x04, 0);
+        assert!(
+            bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
+                .unwrap()
+                .is_some(),
+            "command disable restores the direct RAM page"
+        );
+        assert!(*bus.direct_map_changed);
+
+        *bus.direct_map_changed = false;
+        write_config(bus, 0x10, DISTIRA_MMIO_BASE);
+        assert!(
+            !*bus.direct_map_changed,
+            "moving a disabled BAR does not change the effective decode"
+        );
+
+        write_config(bus, 0x04, 0x0000_0002);
+        assert!(*bus.direct_map_changed);
+        assert!(
+            bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
+                .unwrap()
+                .is_some(),
+            "enabling a BAR outside RAM leaves the direct page available"
+        );
+
+        *bus.direct_map_changed = false;
+        write_config(bus, 0x10, RAM_ADDR);
+        assert!(*bus.direct_map_changed);
+        assert!(
+            bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
+                .unwrap()
+                .is_none(),
+            "relocating the enabled BAR over RAM removes the direct page again"
+        );
     });
+    machine.write_physical_u8(FIFO_RAM_ADDR, 0xb6);
 
     assert_eq!(
         machine.memory.read_u8(RAM_ADDR as usize).unwrap(),
         0x5a,
         "Distira BAR relocation must invalidate direct-RAM lookup entries"
     );
+    assert_eq!(
+        machine.memory.read_u8(FIFO_RAM_ADDR as usize).unwrap(),
+        0x6b,
+        "the command FIFO aperture must not leak writes into backing RAM"
+    );
+}
+
+#[test]
+fn distira_decode_writes_end_ring0_approximate_batches() {
+    let mut profile = MachineProfile::gsw_386(24, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw486;
+    let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+    const RAM_ADDR: u32 = 0x0100_0000;
+
+    with_bus(&mut machine, |bus| {
+        assert!(bus.lazy_port_reads);
+        *bus.io_touched = false;
+        let address = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x10;
+        bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, address, true)
+            .unwrap();
+        *bus.io_touched = false;
+
+        bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_ADDR, true)
+            .unwrap();
+
+        assert!(*bus.io_touched, "a decode change must end the CPU batch");
+        assert!(*bus.direct_map_changed);
+        assert!(
+            bus.direct_page(RAM_ADDR, BusAccessKind::DataRead)
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn guest_distira_decode_transitions_invalidate_cpu_direct_maps_once_each() {
+    fn push_out_dx_eax(code: &mut Vec<u8>, port: u16, value: u32) {
+        code.push(0xba);
+        code.extend_from_slice(&port.to_le_bytes());
+        code.extend_from_slice(&[0x66, 0xb8]);
+        code.extend_from_slice(&value.to_le_bytes());
+        code.extend_from_slice(&[0x66, 0xef]);
+    }
+
+    const BAR_CONFIG: u32 = 0x8000_0000 | ((DISTIRA_PCI_SLOT as u32) << 11) | 0x10;
+    const COMMAND_CONFIG: u32 = 0x8000_0000 | ((DISTIRA_PCI_SLOT as u32) << 11) | 0x04;
+    const RAM_ADDR: u32 = 0x0100_0000;
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, PCI_CONFIG_ADDRESS_PORT, BAR_CONFIG);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, RAM_ADDR);
+    push_out_dx_eax(&mut code, PCI_CONFIG_ADDRESS_PORT, COMMAND_CONFIG);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, 0);
+    push_out_dx_eax(&mut code, PCI_CONFIG_ADDRESS_PORT, BAR_CONFIG);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, DISTIRA_MMIO_BASE);
+    push_out_dx_eax(&mut code, PCI_CONFIG_ADDRESS_PORT, COMMAND_CONFIG);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, 2);
+    push_out_dx_eax(&mut code, PCI_CONFIG_ADDRESS_PORT, BAR_CONFIG);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, RAM_ADDR);
+    push_out_dx_eax(&mut code, PCI_CONFIG_ADDRESS_PORT, COMMAND_CONFIG);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, 0);
+    push_out_dx_eax(&mut code, PCI_CONFIG_DATA_PORT, 2);
+    code.extend_from_slice(&[0xcd, 0x20]);
+
+    let mut profile = MachineProfile::gsw_386(24, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw486;
+    let mut machine = Machine::new_raw_program(profile, &code).unwrap();
+    machine.cpu.reset_perf_counters();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(500_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    assert_eq!(machine.cpu.perf_counters().direct_map_invalidations, 6);
 }
 
 #[test]

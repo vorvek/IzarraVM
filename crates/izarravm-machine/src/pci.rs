@@ -99,7 +99,9 @@ impl PciConfig {
 
     pub(crate) fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
         let offset = self.distira_bar_offset(address, width)?;
-        if offset < DISTIRA_PCI_LFB_OFFSET && offset + width as u32 <= DISTIRA_PCI_LFB_OFFSET {
+        if offset < DISTIRA_PCI_CMDFIFO_OFFSET
+            && offset + width as u32 <= DISTIRA_PCI_CMDFIFO_OFFSET
+        {
             Some(offset as usize)
         } else {
             None
@@ -151,11 +153,12 @@ impl PciConfig {
     }
 
     fn distira_memory_enabled(&self) -> bool {
-        self.distira_command & 0x0002 != 0
+        self.distira_command & 0x0002 != 0 && self.distira_mem_base != 0
     }
 
-    pub(crate) fn distira_memory_decode_key(&self) -> (bool, u32) {
-        (self.distira_memory_enabled(), self.distira_mem_base)
+    pub(crate) fn distira_memory_decode_key(&self) -> Option<u32> {
+        self.distira_memory_enabled()
+            .then_some(self.distira_mem_base)
     }
 
     pub(crate) fn distira_bar_overlaps(&self, start: usize, end: usize) -> bool {
