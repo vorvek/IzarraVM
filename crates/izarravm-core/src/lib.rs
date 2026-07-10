@@ -377,13 +377,17 @@ impl FromStr for SbDma16 {
     }
 }
 
+pub const WAVETABLE_MPU_BASE: u16 = 0x300;
+pub const MIDI_INPUT_MPU_BASE: u16 = 0x330;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MidiBackend {
     Off,
-    #[default]
     External,
+    #[default]
     FluidSynth,
+    Munt,
 }
 
 impl MidiBackend {
@@ -392,6 +396,7 @@ impl MidiBackend {
             Self::Off => "off",
             Self::External => "external",
             Self::FluidSynth => "fluidsynth",
+            Self::Munt => "munt",
         }
     }
 }
@@ -410,6 +415,7 @@ impl FromStr for MidiBackend {
             "off" | "none" => Ok(Self::Off),
             "external" | "midir" | "midiout" => Ok(Self::External),
             "fluidsynth" | "fluid" | "sf2" => Ok(Self::FluidSynth),
+            "munt" | "mt32" => Ok(Self::Munt),
             _ => Err(ConfigError::UnknownPreset {
                 kind: "MIDI backend",
                 value: value.to_owned(),
@@ -498,6 +504,15 @@ impl AppConfig {
         }
         if let Some(midi_backend) = overrides.midi_backend {
             self.audio.midi.backend = midi_backend;
+        }
+        if let Some(external_port) = overrides.external_midi_port {
+            self.audio.midi.external_port = Some(external_port);
+        }
+        if let Some(control_rom) = overrides.mt32_control_rom {
+            self.audio.midi.mt32_control_rom = Some(control_rom);
+        }
+        if let Some(pcm_rom) = overrides.mt32_pcm_rom {
+            self.audio.midi.mt32_pcm_rom = Some(pcm_rom);
         }
         if let Some(sb_irq) = overrides.sb_irq {
             self.audio.sound_blaster.irq = sb_irq;
@@ -726,16 +741,39 @@ pub struct RetiredAudioSection {}
 #[serde(default, deny_unknown_fields)]
 pub struct MidiConfig {
     pub backend: MidiBackend,
+    pub external_port: Option<MidiPortId>,
     pub soundfont: Option<PathBuf>,
+    pub mt32_control_rom: Option<PathBuf>,
+    pub mt32_pcm_rom: Option<PathBuf>,
 }
 
 impl Default for MidiConfig {
     fn default() -> Self {
         Self {
-            backend: MidiBackend::External,
+            backend: MidiBackend::FluidSynth,
+            external_port: None,
             soundfont: None,
+            mt32_control_rom: None,
+            mt32_pcm_rom: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MidiPortId {
+    pub name: String,
+    pub ordinal: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MidiStatus {
+    #[default]
+    Ready,
+    MissingPort,
+    MissingSoundFont,
+    MissingRoms,
+    InitializationFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +810,9 @@ pub struct ConfigOverrides {
     pub c_drive: Option<PathBuf>,
     pub soundfont: Option<PathBuf>,
     pub midi_backend: Option<MidiBackend>,
+    pub external_midi_port: Option<MidiPortId>,
+    pub mt32_control_rom: Option<PathBuf>,
+    pub mt32_pcm_rom: Option<PathBuf>,
     pub sb_irq: Option<SbIrq>,
     pub sb_dma: Option<SbDma8>,
     pub sb_high_dma: Option<SbDma16>,

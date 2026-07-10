@@ -9,8 +9,8 @@ fn sound_blaster_env_entries_default_config() {
     assert_eq!(
         entries,
         vec![
-            ("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string()),
-            ("SETSOUND".to_string(), "A220 I5 D1 H5 T6".to_string()),
+            ("BLASTER".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
+            ("SETSOUND".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
         ]
     );
 }
@@ -26,8 +26,8 @@ fn sound_blaster_env_entries_non_default_routing() {
     assert_eq!(
         sound_blaster_env_entries(&config),
         vec![
-            ("BLASTER".to_string(), "A220 I7 D3 H5 T6".to_string()),
-            ("SETSOUND".to_string(), "A220 I7 D3 H5 T6".to_string()),
+            ("BLASTER".to_string(), "A220 I7 D3 H5 P300 T6".to_string()),
+            ("SETSOUND".to_string(), "A220 I7 D3 H5 P300 T6".to_string()),
         ]
     );
 }
@@ -59,8 +59,8 @@ fn new_raw_program_seeds_psp_env_pointer_with_blaster() {
     assert_eq!(
         parse_env_block(&machine, env_seg),
         vec![
-            ("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string()),
-            ("SETSOUND".to_string(), "A220 I5 D1 H5 T6".to_string()),
+            ("BLASTER".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
+            ("SETSOUND".to_string(), "A220 I5 D1 H5 P300 T6".to_string()),
         ]
     );
 }
@@ -82,8 +82,8 @@ fn dos_env_block_carries_the_configured_routing() {
     assert_eq!(
         parse_env_block(&machine, env_seg),
         vec![
-            ("BLASTER".to_string(), "A220 I7 D3 H5 T6".to_string()),
-            ("SETSOUND".to_string(), "A220 I7 D3 H5 T6".to_string()),
+            ("BLASTER".to_string(), "A220 I7 D3 H5 P300 T6".to_string()),
+            ("SETSOUND".to_string(), "A220 I7 D3 H5 P300 T6".to_string()),
         ]
     );
 }

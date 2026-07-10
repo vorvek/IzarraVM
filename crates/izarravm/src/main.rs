@@ -8,8 +8,8 @@ mod prefs;
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;
 use izarravm_core::{
-    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, SbDma8, SbDma16, SbIrq,
-    VideoCard,
+    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, MidiPortId, SbDma8, SbDma16,
+    SbIrq, VideoCard,
 };
 use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
@@ -61,6 +61,16 @@ struct Cli {
     soundfont: Option<PathBuf>,
     #[arg(long)]
     midi_backend: Option<MidiBackend>,
+    /// External MIDI port name. Duplicate names are selected with
+    /// --midi-port-ordinal, starting at zero.
+    #[arg(long)]
+    midi_port: Option<String>,
+    #[arg(long, requires = "midi_port")]
+    midi_port_ordinal: Option<u16>,
+    #[arg(long)]
+    mt32_control_rom: Option<PathBuf>,
+    #[arg(long)]
+    mt32_pcm_rom: Option<PathBuf>,
     #[arg(long)]
     sb_irq: Option<SbIrq>,
     #[arg(long)]
@@ -952,6 +962,10 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
     };
 
     let c_drive = cli.c_drive.clone().or_else(|| cli.dosroot.clone());
+    let external_midi_port = cli.midi_port.as_ref().map(|name| MidiPortId {
+        name: name.clone(),
+        ordinal: cli.midi_port_ordinal.unwrap_or(0),
+    });
     config.apply_overrides(ConfigOverrides {
         cpu: cli.cpu,
         memory_mib: cli.memory_mib,
@@ -959,6 +973,9 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
         c_drive,
         soundfont: cli.soundfont.clone(),
         midi_backend: cli.midi_backend,
+        external_midi_port,
+        mt32_control_rom: cli.mt32_control_rom.clone(),
+        mt32_pcm_rom: cli.mt32_pcm_rom.clone(),
         sb_irq: cli.sb_irq,
         sb_dma: cli.sb_dma,
         sb_high_dma: cli.sb_high_dma,

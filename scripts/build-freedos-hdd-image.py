@@ -298,10 +298,10 @@ def main():
     # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS
     # lets the command-line tools (MOVE/SORT/MEM/...) and TOKAMOUS resolve from any
     # current directory. SET BLASTER advertises the emulated SB16 (base 0x220, IRQ5,
-    # DMA1, high DMA5, type 6 SB16); no P (MPU-401) param -- no MPU is emulated. LH
+    # DMA1, high DMA5, wavetable MPU at 0x300, type 6 SB16). LH
     # loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load).
     autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n"
-                b"SET BLASTER=A220 I5 D1 H5 T6\r\nLH TOKAMOUS\r\n")
+                b"SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
     # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
     license_txt = build_license_txt(repo)

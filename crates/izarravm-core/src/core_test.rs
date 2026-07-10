@@ -65,7 +65,13 @@ fn applies_cli_style_overrides() {
         video: Some(VideoCard::S3VirgeDx),
         c_drive: Some(PathBuf::from("games")),
         soundfont: Some(PathBuf::from("gm.sf2")),
-        midi_backend: Some(MidiBackend::FluidSynth),
+        midi_backend: Some(MidiBackend::Munt),
+        external_midi_port: Some(MidiPortId {
+            name: "USB MIDI".to_string(),
+            ordinal: 1,
+        }),
+        mt32_control_rom: Some(PathBuf::from("MT32_CONTROL.ROM")),
+        mt32_pcm_rom: Some(PathBuf::from("MT32_PCM.ROM")),
         sb_irq: Some(SbIrq::I7),
         sb_dma: Some(SbDma8::D3),
         sb_high_dma: Some(SbDma16::D6),
@@ -76,10 +82,61 @@ fn applies_cli_style_overrides() {
     assert_eq!(config.machine.video, VideoCard::S3VirgeDx);
     assert_eq!(config.dos.c_drive, PathBuf::from("games"));
     assert_eq!(config.audio.midi.soundfont, Some(PathBuf::from("gm.sf2")));
-    assert_eq!(config.audio.midi.backend, MidiBackend::FluidSynth);
+    assert_eq!(config.audio.midi.backend, MidiBackend::Munt);
+    assert_eq!(
+        config.audio.midi.external_port,
+        Some(MidiPortId {
+            name: "USB MIDI".to_string(),
+            ordinal: 1,
+        })
+    );
+    assert_eq!(
+        config.audio.midi.mt32_control_rom,
+        Some(PathBuf::from("MT32_CONTROL.ROM"))
+    );
+    assert_eq!(
+        config.audio.midi.mt32_pcm_rom,
+        Some(PathBuf::from("MT32_PCM.ROM"))
+    );
     assert_eq!(config.audio.sound_blaster.irq, SbIrq::I7);
     assert_eq!(config.audio.sound_blaster.dma, SbDma8::D3);
     assert_eq!(config.audio.sound_blaster.high_dma, SbDma16::D6);
+}
+
+#[test]
+fn midi_config_defaults_to_embedded_fluidsynth_and_round_trips_port_identity() {
+    let default = MidiConfig::default();
+    assert_eq!(default.backend, MidiBackend::FluidSynth);
+    assert_eq!(default.external_port, None);
+    assert_eq!(default.soundfont, None);
+    assert_eq!(default.mt32_control_rom, None);
+    assert_eq!(default.mt32_pcm_rom, None);
+
+    let parsed: AppConfig = toml::from_str(
+        r#"
+        [audio.midi]
+        backend = "munt"
+        soundfont = "custom.sf3"
+        mt32_control_rom = "control.rom"
+        mt32_pcm_rom = "pcm.rom"
+
+        [audio.midi.external_port]
+        name = "USB MIDI"
+        ordinal = 2
+        "#,
+    )
+    .unwrap();
+    assert_eq!(parsed.audio.midi.backend, MidiBackend::Munt);
+    assert_eq!(
+        parsed.audio.midi.external_port,
+        Some(MidiPortId {
+            name: "USB MIDI".to_string(),
+            ordinal: 2,
+        })
+    );
+    let encoded = toml::to_string(&parsed).unwrap();
+    let round_trip: AppConfig = toml::from_str(&encoded).unwrap();
+    assert_eq!(round_trip.audio.midi, parsed.audio.midi);
 }
 
 #[test]
@@ -91,6 +148,22 @@ fn sound_blaster_overrides_and_aliases_parse() {
     assert_eq!(SbIrq::I10.line(), 10);
     assert_eq!(SbDma8::D3.channel(), 3);
     assert_eq!(SbDma16::D7.channel(), 7);
+}
+
+#[test]
+fn midi_backends_and_fixed_guest_ports_are_unambiguous() {
+    assert_eq!("off".parse::<MidiBackend>().unwrap(), MidiBackend::Off);
+    assert_eq!(
+        "external".parse::<MidiBackend>().unwrap(),
+        MidiBackend::External
+    );
+    assert_eq!(
+        "fluidsynth".parse::<MidiBackend>().unwrap(),
+        MidiBackend::FluidSynth
+    );
+    assert_eq!("mt-32".parse::<MidiBackend>().unwrap(), MidiBackend::Munt);
+    assert_eq!(WAVETABLE_MPU_BASE, 0x300);
+    assert_eq!(MIDI_INPUT_MPU_BASE, 0x330);
 }
 
 #[test]
