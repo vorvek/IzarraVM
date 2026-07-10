@@ -64,7 +64,6 @@ const BLIT_TICKS_COM: &[u8] = &[
 fn vram_blit_delivers_every_pit_edge_at_586() {
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
     profile.cpu = GswMode::Gsw586;
-    profile.clock_hz = GswMode::Gsw586.clock_hz();
     let mut machine = Machine::new_raw_program(profile, BLIT_TICKS_COM).unwrap();
     let before = machine.elapsed_clocks();
     let reason = machine.run_until_halt_or_cycles(2_000_000_000).unwrap();

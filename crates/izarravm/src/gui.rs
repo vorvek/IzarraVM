@@ -5,7 +5,7 @@ pub use runtime::run;
 
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink, MidiEngine};
-use izarravm_core::{GswMode, MidiConfig, MidiStatus, TimingClass};
+use izarravm_core::{GswMode, MidiConfig, MidiStatus};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use std::cell::Cell;
@@ -1009,7 +1009,7 @@ fn emulate(
         if budget > 0 {
             let before = machine.elapsed_clocks();
             let stall_before = machine.io_stall_clocks();
-            let approximate = machine.active_mode().timing_class() == TimingClass::Approximate;
+            let approximate = machine.active_mode().uses_approximate_timing();
             let stop = if approximate {
                 // Approximate class (486/586): time is already an approximation, so
                 // sub-slice the budget in ~1ms quanta and stop issuing quanta once

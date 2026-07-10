@@ -206,7 +206,6 @@ fn fresh_cmos_seeds_the_profile_speed_code() {
     // same-mode no-op until the user saves a different choice from the BIOS.
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
     profile.cpu = GswMode::Gsw586;
-    profile.clock_hz = GswMode::Gsw586.clock_hz();
     let machine = Machine::new(profile, izarra_bios()).unwrap();
     assert_eq!(machine.cmos_byte(0x12), 2, "586 seeds code 2");
 }

@@ -361,11 +361,11 @@ fn audio_sample_cap_is_one_dac_sample_and_never_zero() {
     // default and a pathologically slow clock where the floor division would
     // otherwise be 0.
     assert_eq!(
-        TimingFactors::for_clock(200_000_000).clocks_per_audio_sample,
+        TimingFactors::for_clock(ClockRate::from_hz(200_000_000)).clocks_per_audio_sample,
         200_000_000 / u64::from(DAC_HZ)
     );
     assert_eq!(
-        TimingFactors::for_clock(40_000).clocks_per_audio_sample,
+        TimingFactors::for_clock(ClockRate::from_hz(40_000)).clocks_per_audio_sample,
         1,
         "a clock below the DAC rate must floor to 1, not 0"
     );
@@ -1102,7 +1102,12 @@ fn opl_timers_advance_with_machine_clocks() {
     });
 
     // 100 us of CPU time (clock_hz/10000 clocks) covers the 80 us timer step.
-    machine.advance_devices(machine.profile().clock_hz / 10_000);
+    machine.advance_devices(
+        machine
+            .active_mode()
+            .clock_rate()
+            .clocks_for_fraction_floor(1, 10_000),
+    );
 
     let status = with_bus(&mut machine, |bus| {
         bus.read_io(0x0388, BusWidth::Byte, 0, false).unwrap()

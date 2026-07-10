@@ -210,11 +210,11 @@ impl Machine {
             //   f64 device accumulators through different partial sums, so
             //   device event instants may microshift against the Accurate
             //   splitting; that is licensed in this class (results stay
-            //   bit-exact, time is approximate; see TimingClass). Computed once
+            //   bit-exact, time is approximate). Computed once
             //   per batch entry: the run loop sits on a measured code-layout
             //   cliff, so nothing here may run per instruction.
             let remaining = deadline - self.elapsed_clocks;
-            let cap = if matches!(self.active_mode.timing_class(), TimingClass::Approximate) {
+            let cap = if self.active_mode.uses_approximate_timing() {
                 self.approx_batch_cap(remaining)
             } else {
                 self.timing.clocks_per_audio_sample.min(remaining)
@@ -318,8 +318,8 @@ impl Machine {
                     unittester,
                     wait_states: profile.wait_states,
                     cache: cache_model,
-                    flat_data_cost: matches!(active_mode.timing_class(), TimingClass::Approximate),
-                    lazy_port_reads: matches!(active_mode.timing_class(), TimingClass::Approximate),
+                    flat_data_cost: active_mode.uses_approximate_timing(),
+                    lazy_port_reads: active_mode.uses_approximate_timing(),
                     io_touched,
                     isa_io_clocks: isa_io_batch_clocks,
                     device_wrote_memory,
@@ -402,9 +402,7 @@ impl Machine {
                         // frozen-class delta). So Accurate skips this break and
                         // relies solely on the restored post-run check below.
                         let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();
-                        if spent >= cap
-                            && matches!(bus.active_mode.timing_class(), TimingClass::Approximate)
-                        {
+                        if spent >= cap && bus.active_mode.uses_approximate_timing() {
                             break;
                         }
                         // Run a straight-line run of instructions inside the CPU in one call (the

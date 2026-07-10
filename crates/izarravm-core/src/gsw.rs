@@ -193,20 +193,11 @@ impl GswMode {
     }
 }
 
-/// Compatibility classification retained for the current machine timing code.
-/// The next timing migration should consume the mode specification directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimingClass {
-    Accurate,
-    Approximate,
-}
-
 impl GswMode {
-    pub const fn timing_class(self) -> TimingClass {
-        match self.persona() {
-            CpuPersona::I386 => TimingClass::Accurate,
-            CpuPersona::I486 | CpuPersona::I586 => TimingClass::Approximate,
-        }
+    /// Whether the current batching policy uses the higher-throughput timing
+    /// path retained for the 486 and 586 personas.
+    pub const fn uses_approximate_timing(self) -> bool {
+        matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
     }
 }
 

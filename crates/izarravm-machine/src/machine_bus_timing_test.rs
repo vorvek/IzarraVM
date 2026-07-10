@@ -1381,7 +1381,7 @@ fn rtc_advances_seconds_on_the_machine_clock() {
     machine.seed_rtc(2026, 6, 20, 6, 12, 0, 0);
     // Step roughly three seconds of emulated time, in ~10 ms chunks so the
     // sub-second accumulator carries the way it does during a real run.
-    let clock_hz = machine.profile.clock_hz;
+    let clock_hz = machine.active_mode.clock_rate().floor_hz();
     let chunk = clock_hz / 100; // ~10 ms
     for _ in 0..300 {
         machine.advance_devices_clocks(chunk);
@@ -1428,7 +1428,7 @@ fn pc_speaker_renders_a_square_wave() {
         bus.write_io(0x42, BusWidth::Byte, 0x04, false).unwrap(); // divisor high (0x0400)
         bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap(); // GATE2 + data enable
     });
-    let clock_hz = machine.profile.clock_hz;
+    let clock_hz = machine.active_mode.clock_rate().floor_hz();
     let chunk = clock_hz / 100_000; // ~10 us, mimicking per-instruction advance
     for _ in 0..2_000 {
         machine.advance_devices_clocks(chunk); // ~20 ms total
@@ -1449,7 +1449,7 @@ fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
         bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap(); // divisor high
         bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap(); // GATE2 + data enable
     });
-    let clock_hz = machine.profile.clock_hz;
+    let clock_hz = machine.active_mode.clock_rate().floor_hz();
     let chunk = clock_hz / 100_000; // ~10 us, mimicking per-instruction advance
     for _ in 0..2_000 {
         machine.advance_devices_clocks(chunk); // ~20 ms total
@@ -1475,7 +1475,7 @@ fn port_61_reports_out_gate_enable_and_refresh() {
         bus.write_io(0x42, BusWidth::Byte, 0x04, false).unwrap();
         bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
     });
-    let clock_hz = machine.profile.clock_hz;
+    let clock_hz = machine.active_mode.clock_rate().floor_hz();
     machine.advance_devices_clocks(clock_hz / 100_000); // ~10 us
     let b = with_bus(&mut machine, |bus| {
         bus.read_io(0x61, BusWidth::Byte, 0, false).unwrap() as u8

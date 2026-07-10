@@ -220,22 +220,22 @@ fn bench_band_verdict_classifies() {
 
 #[test]
 fn approximate_mode_bands_are_loose_accurate_mode_bands_are_tight() {
-    use izarravm_core::TimingClass;
     for payload in ["dhrystone", "sieve", "fp-mandel", "whetstone"] {
         for mode in MODES {
             let Some(band) = band_for(payload, mode) else {
                 continue;
             };
             let width = relative_width(band);
-            match mode.timing_class() {
-                TimingClass::Accurate => assert!(
-                    width <= 0.22,
-                    "{payload} {mode:?} (Accurate) band width {width} must stay tight (<=0.22)"
-                ),
-                TimingClass::Approximate => assert!(
+            if mode.uses_approximate_timing() {
+                assert!(
                     width >= 0.30,
-                    "{payload} {mode:?} (Approximate) band width {width} must be loose (>=0.30)"
-                ),
+                    "{payload} {mode:?} approximate band width {width} must be loose (>=0.30)"
+                );
+            } else {
+                assert!(
+                    width <= 0.22,
+                    "{payload} {mode:?} accurate band width {width} must stay tight (<=0.22)"
+                );
             }
         }
     }

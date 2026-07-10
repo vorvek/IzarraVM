@@ -6,10 +6,8 @@
 mod clock;
 mod gsw;
 
-pub use clock::ClockRate;
-pub use gsw::{
-    CacheGeometry, CpuPersona, GSW_MODE_SPECS, GswMode, GswModeSpec, L1Cache, TimingClass,
-};
+pub use clock::{ClockRate, MASTER_CLOCK_HZ};
+pub use gsw::{CacheGeometry, CpuPersona, GSW_MODE_SPECS, GswMode, GswModeSpec, L1Cache};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -836,7 +834,6 @@ pub struct ConfigOverrides {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfile {
     pub cpu: GswMode,
-    pub clock_hz: u64,
     pub memory_mib: u16,
     pub video: VideoCard,
     pub sound_blaster: SoundBlasterConfig,
@@ -849,7 +846,6 @@ impl HardwareProfile {
 
         Ok(Self {
             cpu: config.machine.cpu,
-            clock_hz: config.machine.cpu.clock_hz(),
             memory_mib: config.machine.memory_mib,
             video: config.machine.video,
             sound_blaster: config.audio.sound_blaster,

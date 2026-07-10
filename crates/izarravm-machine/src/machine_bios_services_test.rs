@@ -2203,10 +2203,12 @@ fn timing_factors_track_the_active_mode() {
     machine.set_mode(GswMode::Gsw586);
     assert_eq!(machine.active_mode(), GswMode::Gsw586);
     assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 200_000_000.0).abs() < 1e-9);
-    // 386-slow @ ~7.33 MHz.
+    // 386-slow is exactly one third of 22 MHz.
     machine.set_mode(GswMode::Gsw386Slow);
     assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
-    assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 7_333_333.0).abs() < 1e-9);
+    assert!(
+        (machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / (22_000_000.0 / 3.0)).abs() < 1e-9
+    );
 }
 
 #[test]
