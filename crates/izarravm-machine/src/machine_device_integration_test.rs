@@ -358,8 +358,14 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
                 .unwrap();
         }
     });
-    // Drain the whole 16-byte block at 11025 Hz (~2.9 ms); 400k clocks spans it.
-    machine.advance_devices_clocks(400_000);
+    let rate = u64::from(machine.dsp.output_frame_rate());
+    for _ in 0..30 {
+        let clocks = machine
+            .timeline
+            .cpu_clocks_until(timeline::DeviceClock::Dsp, 1, rate)
+            .unwrap();
+        machine.advance_devices_clocks(clocks);
+    }
     // The programmed-block IRQ latched on the SB16's default line (IRQ5).
     assert!(
         machine.pic.irr_bit(5),
@@ -369,13 +375,12 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
     assert!(!machine.dsp.is_playing(), "single-cycle ADPCM halted at TC");
     // The decoder produced audible (non-silent) frames on the DSP ring: the
     // reference byte seeded 0x80 and the 0x50 code bytes moved it off center.
-    let mut audible = false;
-    while let Some((l, _)) = machine.dsp.drain_frame() {
-        if l != 0 {
-            audible = true;
-        }
-    }
-    assert!(audible, "decoded ADPCM is audible, not flat silence");
+    let decoded: Vec<_> = std::iter::from_fn(|| machine.dsp.drain_frame()).collect();
+    assert_eq!(decoded.len(), 30, "15 packed bytes produce 30 frames");
+    assert!(
+        decoded.iter().any(|&(left, _)| left != 0),
+        "decoded ADPCM is audible, not flat silence"
+    );
 }
 
 #[test]

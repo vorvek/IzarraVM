@@ -451,25 +451,6 @@ fn output_frame_rate_does_not_halve_a_0x41_rate_for_8bit_stereo() {
 }
 
 #[test]
-fn pcm_bytes_per_output_frame_tracks_width_and_channels() {
-    let mut dsp = SbDsp::default();
-    write_cmd(&mut dsp, &[0x14, 0x03, 0x00]);
-    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(1));
-
-    dsp.set_sbpro_stereo(true);
-    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(2));
-
-    write_cmd(&mut dsp, &[0xB0, 0x00, 0x03, 0x00]);
-    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(2));
-
-    write_cmd(&mut dsp, &[0xB0, 0x20, 0x03, 0x00]);
-    assert_eq!(dsp.pcm_bytes_per_output_frame(), Some(4));
-
-    write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
-    assert_eq!(dsp.pcm_bytes_per_output_frame(), None);
-}
-
-#[test]
 fn frames_until_next_irq_counts_stereo_dma_units() {
     let mut dsp = SbDsp::default();
     write_cmd(&mut dsp, &[0xC6, 0x20, 0x0F, 0x00]);
@@ -517,6 +498,77 @@ fn odd_stereo_auto_init_block_carries_a_unit_into_the_reloaded_block() {
     );
     assert!(dsp.is_playing());
     assert!(dsp.take_irq(), "the crossed block boundary raised an IRQ");
+}
+
+#[test]
+fn dry_8bit_stereo_dma_preserves_the_left_sample_for_refill() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xC6, 0x20, 0x02, 0x00]);
+    let mut left_only = [0x00].into_iter();
+
+    assert_eq!(dsp.tick_n_samples(1, || left_only.next(), || None), 0);
+    assert_eq!(dsp.block_remaining(), 2);
+    assert_eq!(dsp.frames_until_next_irq(), Some(2));
+
+    let mut right_only = [0xFF].into_iter();
+    assert_eq!(dsp.tick_n_samples(1, || right_only.next(), || None), 1);
+    assert_eq!(dsp.drain_frame(), Some((-32_768, 32_512)));
+    assert_eq!(dsp.block_remaining(), 1);
+}
+
+#[test]
+fn dry_16bit_stereo_dma_preserves_the_left_sample_for_refill() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xB6, 0x30, 0x02, 0x00]);
+    let mut left_only = [0xFFFF].into_iter();
+
+    assert_eq!(dsp.tick_n_samples(1, || None, || left_only.next()), 0);
+    assert_eq!(dsp.block_remaining(), 2);
+
+    let mut right_only = [0x0001].into_iter();
+    assert_eq!(dsp.tick_n_samples(1, || None, || right_only.next()), 1);
+    assert_eq!(dsp.drain_frame(), Some((-1, 1)));
+    assert_eq!(dsp.block_remaining(), 1);
+}
+
+#[test]
+fn odd_single_8bit_stereo_block_does_not_read_past_completion() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xC0, 0x20, 0x00, 0x00]);
+    let mut reads = 0;
+
+    let frame = dsp.render_frame(
+        || {
+            reads += 1;
+            Some(0x80)
+        },
+        || None,
+    );
+
+    assert_eq!(frame, None);
+    assert_eq!(reads, 1, "the one-unit block consumes one DMA byte");
+    assert!(!dsp.is_playing());
+    assert!(dsp.take_irq());
+}
+
+#[test]
+fn odd_single_16bit_stereo_block_does_not_read_past_completion() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xB0, 0x20, 0x00, 0x00]);
+    let mut reads = 0;
+
+    let frame = dsp.render_frame(
+        || None,
+        || {
+            reads += 1;
+            Some(0x8000)
+        },
+    );
+
+    assert_eq!(frame, None);
+    assert_eq!(reads, 1, "the one-unit block consumes one DMA word");
+    assert!(!dsp.is_playing());
+    assert!(dsp.take_irq());
 }
 
 #[test]
@@ -599,18 +651,9 @@ fn adpcm4_reference_command_seeds_predictor_and_counts_encoded_bytes() {
 #[test]
 fn adpcm_tick_count_tracks_decoded_frames_and_drains_the_final_fifo() {
     let mut dsp = SbDsp::default();
-    dsp.set_block_buffer(vec![0xFF, 0xFF]);
-    dsp.advance_block_buffer(1);
     // Reference plus two encoded bytes. Each encoded 4-bit byte yields two
     // frames, so the three DMA bytes produce four frames in total.
     write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
-    assert!(
-        dsp.block_buffer().is_none(),
-        "ADPCM arm drops stale PCM data"
-    );
-    assert_eq!(dsp.block_buffer_pos(), 0);
-    assert_eq!(dsp.pcm_bytes_per_output_frame(), None);
-
     let mut bytes = [0x80, 0x00, 0x00].into_iter();
     let produced = dsp.tick_n_samples(10, || bytes.next(), || None);
 

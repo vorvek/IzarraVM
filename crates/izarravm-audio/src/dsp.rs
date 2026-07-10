@@ -180,9 +180,6 @@ pub struct SbDsp {
     rate_is_byte_rate: bool,
     block_size: u32,
     block_remaining: u32,
-    // HLE block data prefetched for batched production.
-    block_buffer: Option<Vec<u8>>,
-    block_buffer_pos: usize,
     auto_init: bool,
     playing: bool,
     irq_pending: bool,
@@ -192,6 +189,8 @@ pub struct SbDsp {
     dma_16bit: bool,
     stereo: bool,
     sample_signed: bool,
+    // A stereo left sample whose matching right DMA unit was not available yet.
+    pending_stereo_left: Option<i16>,
     // SB Pro 8-bit stereo (mixer register 0x0E bit1): interleaves two bytes per
     // output frame (left then right). Set from the mixer each producer tick.
     sbpro_stereo: bool,
@@ -227,14 +226,13 @@ impl Default for SbDsp {
             rate_is_byte_rate: true,
             block_size: 0,
             block_remaining: 0,
-            block_buffer: None,
-            block_buffer_pos: 0,
             auto_init: false,
             playing: false,
             irq_pending: false,
             dma_16bit: false,
             stereo: false,
             sample_signed: false,
+            pending_stereo_left: None,
             sbpro_stereo: false,
             adpcm: None,
             rendered: VecDeque::new(),
@@ -408,12 +406,11 @@ impl SbDsp {
         self.dma_16bit = false;
         self.stereo = stereo;
         self.sample_signed = signed;
+        self.pending_stereo_left = None;
         self.adpcm = None;
         self.auto_init = auto_init;
         self.playing = true;
         self.block_remaining = self.block_size;
-        self.block_buffer = None;
-        self.block_buffer_pos = 0;
     }
 
     /// Arm the 8-bit DMA path as a Creative ADPCM transfer. Mono unsigned like
@@ -424,12 +421,11 @@ impl SbDsp {
         self.dma_16bit = false;
         self.stereo = false;
         self.sample_signed = false;
+        self.pending_stereo_left = None;
         self.adpcm = Some(AdpcmState::new(mode, haveref));
         self.auto_init = auto_init;
         self.playing = true;
         self.block_remaining = self.block_size;
-        self.block_buffer = None;
-        self.block_buffer_pos = 0;
     }
 
     /// Arm the SB16 16-bit DMA path from a 0xBx command (mode byte + 2-byte
@@ -454,12 +450,11 @@ impl SbDsp {
         self.dma_16bit = true;
         self.stereo = stereo;
         self.sample_signed = signed;
+        self.pending_stereo_left = None;
         self.auto_init = auto_init;
         self.block_size = count;
         self.block_remaining = count;
         self.playing = true;
-        self.block_buffer = None;
-        self.block_buffer_pos = 0;
     }
 
     /// Arm the SB16 8-bit DMA path from a 0xCx command (mode byte + 2-byte
@@ -487,6 +482,16 @@ impl SbDsp {
         self.playing
     }
 
+    /// Whether the output clock still has PCM to produce. Creative ADPCM can
+    /// retain decoded samples after its final encoded DMA byte stops playback.
+    pub fn needs_output_tick(&self) -> bool {
+        self.playing
+            || self
+                .adpcm
+                .as_ref()
+                .is_some_and(|state| !state.buf.is_empty())
+    }
+
     pub fn is_auto_init(&self) -> bool {
         self.auto_init
     }
@@ -503,6 +508,9 @@ impl SbDsp {
 
     /// Set the SB Pro 8-bit stereo flag from the mixer (register 0x0E bit1).
     pub fn set_sbpro_stereo(&mut self, on: bool) {
+        if !on && !self.dma_16bit && !self.stereo {
+            self.pending_stereo_left = None;
+        }
         self.sbpro_stereo = on;
     }
 
@@ -521,16 +529,6 @@ impl SbDsp {
 
     pub fn block_size(&self) -> u32 {
         self.block_size
-    }
-
-    /// Bytes consumed from DMA for one PCM output frame. ADPCM returns `None`
-    /// because its encoded bytes expand to a variable number of output frames.
-    pub fn pcm_bytes_per_output_frame(&self) -> Option<usize> {
-        self.adpcm.is_none().then(|| {
-            let bytes_per_sample = if self.dma_16bit { 2 } else { 1 };
-            let stereo = self.stereo || (!self.dma_16bit && self.sbpro_stereo);
-            bytes_per_sample * if stereo { 2 } else { 1 }
-        })
     }
 
     /// Advance the DMA playback by exactly one stereo frame and push the result
@@ -585,21 +583,20 @@ impl SbDsp {
             return Some(1);
         }
         let units = u64::from(self.block_remaining.max(1));
-        let units_per_frame = if self.stereo || (!self.dma_16bit && self.sbpro_stereo) {
-            2
+        if self.stereo || (!self.dma_16bit && self.sbpro_stereo) {
+            let pending = u64::from(self.pending_stereo_left.is_some());
+            Some((units + pending).div_ceil(2))
         } else {
-            1
-        };
-        Some(units.div_ceil(units_per_frame))
+            Some(units)
+        }
     }
 
     /// Produce one stereo output frame for the current DMA mode, or None if the
     /// channel is idle. `byte_fetch` feeds the 8-bit DMA path and `word_fetch`
     /// the 16-bit path; only the one matching the armed mode is pulled. Mono
     /// modes duplicate their single sample to both channels. `block_remaining`
-    /// is decremented by the words consumed (1 for 8-bit and 16-bit mono, 2 for
-    /// 16-bit stereo), and the programmed-block IRQ is edged exactly as on the 8-bit
-    /// path does.
+    /// advances after each successful DMA unit: a byte on the 8-bit path or a
+    /// word on the 16-bit path. The programmed-block IRQ follows those units.
     pub fn render_frame<B, W>(&mut self, mut byte_fetch: B, mut word_fetch: W) -> Option<(i16, i16)>
     where
         B: FnMut() -> Option<u8>,
@@ -622,23 +619,53 @@ impl SbDsp {
             });
         }
         if self.dma_16bit {
-            let left = self.sample_word(word_fetch()?);
-            let right = if self.stereo {
-                self.sample_word(word_fetch()?)
+            if !self.stereo {
+                let sample = self.sample_word(word_fetch()?);
+                self.advance_block(1);
+                return Some((sample, sample));
+            }
+            let left = if let Some(left) = self.pending_stereo_left.take() {
+                left
             } else {
+                let left = self.sample_word(word_fetch()?);
+                self.advance_block(1);
+                if !self.playing {
+                    return None;
+                }
                 left
             };
-            let words = if self.stereo { 2 } else { 1 };
-            self.advance_block(words);
+            let Some(word) = word_fetch() else {
+                if self.playing {
+                    self.pending_stereo_left = Some(left);
+                }
+                return None;
+            };
+            let right = self.sample_word(word);
+            self.advance_block(1);
             Some((left, right))
         } else if self.stereo || self.sbpro_stereo {
             // SB Pro 8-bit stereo: two interleaved bytes per frame, left then
             // right, advancing the block counter by both bytes consumed.
             // The SB Pro silent-byte priming / L<->R channel-swap alignment quirk
             // is not modeled, so the first byte of each frame is always Left.
-            let left = self.sample_byte(byte_fetch()?);
-            let right = self.sample_byte(byte_fetch()?);
-            self.advance_block(2);
+            let left = if let Some(left) = self.pending_stereo_left.take() {
+                left
+            } else {
+                let left = self.sample_byte(byte_fetch()?);
+                self.advance_block(1);
+                if !self.playing {
+                    return None;
+                }
+                left
+            };
+            let Some(byte) = byte_fetch() else {
+                if self.playing {
+                    self.pending_stereo_left = Some(left);
+                }
+                return None;
+            };
+            let right = self.sample_byte(byte);
+            self.advance_block(1);
             Some((left, right))
         } else {
             let s = self.sample_byte(byte_fetch()?);
@@ -667,32 +694,6 @@ impl SbDsp {
             }
         }
         out
-    }
-
-    // HLE block-buffer accessors.
-    pub fn take_block_buffer(&mut self) -> Option<Vec<u8>> {
-        self.block_buffer.take()
-    }
-
-    pub fn set_block_buffer(&mut self, buf: Vec<u8>) {
-        self.block_buffer = Some(buf);
-        self.block_buffer_pos = 0;
-    }
-
-    pub fn block_buffer_pos(&self) -> usize {
-        self.block_buffer_pos
-    }
-
-    pub fn advance_block_buffer(&mut self, bytes: usize) {
-        self.block_buffer_pos += bytes;
-    }
-
-    pub fn block_buffer_len(&self) -> usize {
-        self.block_buffer.as_ref().map_or(0, |b| b.len())
-    }
-
-    pub fn block_buffer(&self) -> Option<&Vec<u8>> {
-        self.block_buffer.as_ref()
     }
 
     /// Pop the next decoded Creative ADPCM sample, fetching and decoding encoded
@@ -877,6 +878,7 @@ impl SbDsp {
                     self.dma_16bit = false;
                     self.stereo = false;
                     self.sample_signed = false;
+                    self.pending_stereo_left = None;
                     // Drop any in-flight ADPCM decode so a post-reset PCM or
                     // direct-DAC path is not stuck decoding.
                     self.adpcm = None;
