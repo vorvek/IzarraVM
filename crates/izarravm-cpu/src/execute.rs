@@ -55,10 +55,9 @@ impl CpuGsw {
             // the pre-fetched imm8 for 0F BA/A4/AC) and reusing `bit_string_op`/`double_shift`/
             // `alu_sub`/`alu_add` verbatim so the bit-addressing and flag logic stays in one place.
             DecodeGroup::BitManip => self.execute_bitmanip_decoded(insn, bus),
-            // The two-byte conditional-move / SETcc / two-operand IMUL block (CMOVcc, SETcc,
-            // IMUL reg,r/m) runs through its split executor, consuming the pre-decoded
-            // ModRM/operand and reusing `self.condition` (the same helper Jcc and the fused
-            // CMOVcc/SETcc arms used) and `self.imul_truncated` verbatim.
+            // SETcc and two-operand IMUL run through their split executor, consuming the
+            // pre-decoded ModRM/operand and reusing `self.condition` and
+            // `self.imul_truncated`.
             DecodeGroup::CondMove => self.execute_condmove_decoded(insn, bus),
             // The system / descriptor-table / segment block (0F 00/01/02/03/06/20/22, BOUND,
             // LES/LDS) runs through its split executor, consuming the pre-decoded ModRM/operand and
@@ -75,7 +74,7 @@ impl CpuGsw {
             // operand IMUL, INS/OUTS, HLT, and the no-operand 0F system/serializing/CPU-id ops,
             // CMPXCHG8B, and MMX) runs through its split executor, consuming the pre-decoded
             // ModRM/operand/immediate and reusing the existing BCD/`imul_truncated`/`run_string`/
-            // CPUID/RDTSC/`syscall`/halt/MMX leaf logic verbatim.
+            // CPUID/RDTSC/halt/MMX leaf logic verbatim.
             DecodeGroup::Misc => self.execute_misc_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
@@ -670,15 +669,21 @@ impl CpuGsw {
             }
             0x9c => {
                 // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
-                // dword form additionally carries the 486 AC and ID bits (RF and VM are
-                // masked to 0 in the pushed image). operand_size drives whether push writes
-                // 2 or 4 bytes.
+                // dword form additionally carries the persona's writable high flags. RF and
+                // VM are masked to 0. operand_size drives whether push writes 2 or 4 bytes.
                 self.check_v86_iopl()?;
                 // Settle any deferred arithmetic flags so the pushed image has live CF/PF/AF/ZF/SF/OF.
                 self.materialize_flags();
                 let value = match operand_size {
                     OperandSize::Word => self.registers.eflags & 0xffff,
-                    OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
+                    OperandSize::Dword => {
+                        let high = match self.persona() {
+                            CpuPersona::I386 => 0,
+                            CpuPersona::I486 => FLAG_AC,
+                            CpuPersona::I586 => FLAG_AC | FLAG_ID,
+                        };
+                        self.registers.eflags & (0xffff | high)
+                    }
                 };
                 self.push(bus, value, operand_size)?;
                 Ok(clocks(3))

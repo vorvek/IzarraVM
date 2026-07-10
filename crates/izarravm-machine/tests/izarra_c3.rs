@@ -1,5 +1,5 @@
 //! Integration coverage for Stream C3: the four Phase-3 component probes that
-//! complete the graphical POST's icon sweep (GSW-586 CPU, floppy controller, ATA
+//! complete the graphical POST's icon sweep (GSW-586 P55C, floppy controller, ATA
 //! hard disk, ATAPI optical). They do real port reads, so an absent device is
 //! reported as FAIL (its icon stays grey) -- this guards the faithful behaviour:
 //! the HDD probe FAILs on a bare machine because C: is HLE-backed rather than a
@@ -35,8 +35,7 @@ fn status(results: &izarravm_firmware::SuiteResults, name: &str) -> SuiteRecordS
 
 #[test]
 fn cpu_gsw_probe_passes_via_cpuid() {
-    // The GSW-586 always answers CPUID with its vendor identity, regardless of the
-    // live throttle mode, so the CPU icon lights on every machine.
+    // POST checks the P55C CPUID identity before applying the saved GSW mode.
     assert_eq!(
         status(&run_post_bare(), "component.cpu_gsw"),
         SuiteRecordStatus::Pass

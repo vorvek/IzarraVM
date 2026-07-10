@@ -126,33 +126,6 @@ fn straight_line_cached_zf_branches_keep_test_flags_lazy() {
 }
 
 #[test]
-fn hot_cached_forms_do_not_alias_two_byte_opcodes() {
-    // 0F 44 C3 is CMOVE AX,BX. Its low byte is 0x44, which is INC SP in the single-byte map; the
-    // hot cached single-byte table must not see it. With ZF clear, CMOVE leaves AX and SP alone.
-    let code = [
-        0xb8, 0x05, 0x00, // MOV AX, 5
-        0xbb, 0x03, 0x00, // MOV BX, 3
-        0x0f, 0x44, 0xc3, // CMOVE AX, BX
-        0xf4, // HLT
-    ];
-    let (mut cpu, memory) = real_mode_cpu(&code, 1024);
-    cpu.write_reg16(Reg16::Sp, 0x0100);
-    let mut bus = TestBus::with_memory(memory);
-    drive_straight_line_runs(&mut cpu, &mut bus);
-
-    cpu.registers.eip = 0;
-    cpu.write_reg16(Reg16::Ax, 0);
-    cpu.write_reg16(Reg16::Bx, 0);
-    cpu.write_reg16(Reg16::Sp, 0x0100);
-    cpu.set_flag(FLAG_ZF, false);
-    cpu.halted = false;
-    let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
-    assert!(!outcome.halted);
-    assert_eq!(cpu.read_reg16(Reg16::Ax), 5, "CMOVE false leaves AX");
-    assert_eq!(cpu.read_reg16(Reg16::Sp), 0x0100, "CMOVE is not INC SP");
-}
-
-#[test]
 fn straight_line_run_executes_hot_alu_group_cached_forms() {
     // MOV AX,10 ; MOV BX,3 ; ADD AX,BX ; SUB AX,1 ; CMP AX,12 ; JNZ dead ;
     // OR AL,1 ; XOR AL,1 ; AND AX,0x00ff ; SHL AX,1 ; SHR AX,1 ; HLT. The warm second run

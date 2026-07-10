@@ -302,7 +302,7 @@ fn opcode_82_aliases_80_add() {
 }
 
 #[test]
-fn wait_is_a_nop_without_fpu() {
+fn wait_is_a_nop_without_a_pending_x87_exception() {
     let (mut cpu, memory) = real_mode_cpu(&[0x9b], 0x10);
     let flags_before = cpu.registers.eflags;
     let mut bus = TestBus::with_memory(memory);

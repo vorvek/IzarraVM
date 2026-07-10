@@ -821,6 +821,26 @@ fn state_comparator_ignores_timing_but_catches_state() {
     );
 }
 
+#[test]
+fn p55c_mode_admitted_xadd_loop_matches_the_interpreter() {
+    let mut program = vec![0u8; 0x1_0000];
+    program[0x100..0x108].copy_from_slice(&[
+        0x90, // NOP starter
+        0x0f, 0xc1, 0xd8, // XADD EAX,EBX
+        0x49, // DEC ECX
+        0x75, 0xfa, // JNZ 0x101
+        0xf4, // HLT
+    ]);
+    let arm = |cpu: &mut CpuGsw| {
+        cpu.registers.eip = 0x100;
+        cpu.registers.set_esp(0x700);
+        cpu.registers.set_eax(1);
+        cpu.registers.set_ebx(1);
+        cpu.registers.set_ecx(200);
+    };
+    assert_shape_identical(program, &arm, true);
+}
+
 /// Sets eip/esp/esi/edi and a non-trivial incoming flag pattern. The loop count lives in the
 /// program image (at `H_COUNT`), not here.
 fn h_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {

@@ -58,7 +58,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
     assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
     // Pending flags offset for direct write in v2 inlining (slice 2+).
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3912);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3888);
     // Verify the timing-field offsets the native cap check uses.
     let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
     eprintln!("raw_clocks offset = {raw_off}");

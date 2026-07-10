@@ -7,8 +7,8 @@ impl CpuGsw {
     // ============================ x87 FPU (387-class) ============================
     // Escape opcodes 0xD8-0xDF. Registers are f64 (see fpu.rs for the precision
     // ceiling). Coverage now spans arithmetic (all D8/DC/DA/DE forms), the
-    // transcendentals, 80-bit-extended and BCD memory operands, FCMOVcc/FCOMI
-    // (Pentium-era), and the environment/state save-restore set. Known limits are
+    // transcendentals, 80-bit-extended and BCD memory operands, and the
+    // environment/state save-restore set. Known limits are
     // documented at each site: precision control is ignored (everything computes in
     // f64), stores ignore RC (FIST/FRNDINT/FBSTP honor it), stack over/underflow
     // does not fault, and the env image's instruction/data pointers store as zero.
@@ -314,18 +314,6 @@ impl CpuGsw {
                     self.fpu.pop();
                     Ok(clocks(5))
                 }
-                0xc0..=0xdf => {
-                    // FCMOVcc ST(0), ST(i): move ST(i) into ST(0) when the integer-flag
-                    // condition holds. The row picks B(CF), E(ZF), BE(CF|ZF) or U(PF).
-                    let cc = match (byte >> 3) & 3 {
-                        0 => 0x2, // FCMOVB
-                        1 => 0x4, // FCMOVE
-                        2 => 0x6, // FCMOVBE
-                        _ => 0xa, // FCMOVU
-                    };
-                    let take = self.condition(cc);
-                    self.fpu_cmov(take, byte & 7)
-                }
                 _ => self.fpu_unsupported(opcode),
             },
             0xd9 => self.fpu_d9_register(byte, i),
@@ -337,22 +325,6 @@ impl CpuGsw {
                     let sw = self.fpu.status;
                     self.write_gpr16(0, sw);
                     Ok(clocks(3))
-                }
-                0xe8..=0xef => {
-                    // FUCOMIP ST(0), ST(i): compare, set the integer flags, then pop ST(0).
-                    let a = self.fpu.get(0);
-                    let b = self.fpu.get(byte & 7);
-                    self.fpu_compare_set_eflags(a, b);
-                    self.fpu.pop();
-                    Ok(clocks(4))
-                }
-                0xf0..=0xf7 => {
-                    // FCOMIP ST(0), ST(i): same as FUCOMIP in this model, then pop.
-                    let a = self.fpu.get(0);
-                    let b = self.fpu.get(byte & 7);
-                    self.fpu_compare_set_eflags(a, b);
-                    self.fpu.pop();
-                    Ok(clocks(4))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -392,38 +364,6 @@ impl CpuGsw {
             }
         }
         Ok(clocks(20))
-    }
-
-    /// FCMOVcc: copy ST(i) into ST(0) when the integer-flag condition holds, leaving the
-    /// stack untouched otherwise. The condition was already evaluated by the caller.
-    fn fpu_cmov(&mut self, take: bool, i: u8) -> ExecResult<CycleOutcome> {
-        if take {
-            let v = self.fpu.get(i);
-            self.fpu.set(0, v);
-        }
-        Ok(clocks(4))
-    }
-
-    /// FCOMI/FUCOMI: set the integer EFLAGS ZF/PF/CF from comparing ST(0) with ST(i), the
-    /// way SAHF would after FNSTSW. Unordered (a NaN operand) sets all three. OF/SF/AF are
-    /// cleared. Limit: FCOMI's SNaN-vs-QNaN #IA distinction is not modeled, so FCOMI and
-    /// FUCOMI behave identically here.
-    fn fpu_compare_set_eflags(&mut self, a: f64, b: f64) {
-        let (zf, pf, cf) = if a.is_nan() || b.is_nan() {
-            (true, true, true)
-        } else if a > b {
-            (false, false, false)
-        } else if a < b {
-            (false, false, true)
-        } else {
-            (true, false, false)
-        };
-        self.set_flag(FLAG_ZF, zf);
-        self.set_flag(FLAG_PF, pf);
-        self.set_flag(FLAG_CF, cf);
-        self.set_flag(FLAG_OF, false);
-        self.set_flag(FLAG_SF, false);
-        self.set_flag(FLAG_AF, false);
     }
 
     /// Set the IE (invalid) and ZE (divide-by-zero) status flags after an arithmetic
@@ -680,32 +620,6 @@ impl CpuGsw {
             0xe3 => {
                 self.fpu.finit();
                 Ok(clocks(3))
-            }
-            0xc0..=0xdf => {
-                // FCMOVNcc ST(0), ST(i): the negated conditions of the DA forms.
-                let cc = match (byte >> 3) & 3 {
-                    0 => 0x3, // FCMOVNB
-                    1 => 0x5, // FCMOVNE
-                    2 => 0x7, // FCMOVNBE
-                    _ => 0xb, // FCMOVNU
-                };
-                let take = self.condition(cc);
-                self.fpu_cmov(take, byte & 7)
-            }
-            0xe8..=0xef => {
-                // FUCOMI ST(0), ST(i): compare and set the integer flags ZF/PF/CF directly.
-                let a = self.fpu.get(0);
-                let b = self.fpu.get(byte & 7);
-                self.fpu_compare_set_eflags(a, b);
-                Ok(clocks(4))
-            }
-            0xf0..=0xf7 => {
-                // FCOMI ST(0), ST(i): identical here to FUCOMI (the SNaN/QNaN #IA split is
-                // not modeled, see fpu_compare_set_eflags).
-                let a = self.fpu.get(0);
-                let b = self.fpu.get(byte & 7);
-                self.fpu_compare_set_eflags(a, b);
-                Ok(clocks(4))
             }
             _ => self.fpu_unsupported(0xdb),
         }

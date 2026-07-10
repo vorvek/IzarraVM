@@ -385,8 +385,8 @@ fn regen_bitmanip_goldens() {
 
 // ── Task A11: condmove golden battery ────────────────────────────────────────────────────────
 
-/// One golden end-state for a condmove case (task A11). CMOVcc, SETcc, and IMUL reg,r/m all
-/// touch the register file and/or memory and leave eflags unchanged (CMOVcc/SETcc) or set
+/// One golden end-state for a condmove case (task A11). SETcc and IMUL reg,r/m
+/// touch the register file and/or memory and leave eflags unchanged (SETcc) or set
 /// CF/OF (IMUL), so this captures the full register file, eflags, eip, memory-write deltas,
 /// and the InstructionPrefetch fetch count. `eip` proves decode consumed the right number of
 /// bytes (incl. the 0F second byte and the ModRM+displacement); `fetch` proves each byte
@@ -403,7 +403,7 @@ struct CondMoveGolden {
 
 /// Seed for the condmove golden battery. Real-mode, DS=0, 16-bit addressing. AX=5, BX=3,
 /// CX=0x0100, DX=0x4000; eflags has ZF=0 (only the reserved bit-1). Scratch memory at
-/// 0x40 holds the word 0x0003 (CMOVcc memory source); byte at 0x50 is zero (SETcc mem dest).
+/// Byte at 0x50 is zero for the SETcc memory destination.
 fn condmove_seed(cpu: &mut CpuGsw) {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
@@ -422,12 +422,11 @@ fn condmove_seed(cpu: &mut CpuGsw) {
 
 fn condmove_seed_mem(mem: &mut [u8], code: &[u8]) {
     mem[..code.len()].copy_from_slice(code);
-    mem[0x40..0x42].copy_from_slice(&3u16.to_le_bytes()); // word 3 for CMOVcc memory source
 }
 
 /// The condmove differential battery (task A11). Captured from the PRIOR fused reference
 /// (`execute_instruction_legacy`) via `regen_condmove_goldens` (parent commit 93bdff3f) WHILE
-/// the fused arms (CMOVcc 0x40-0x4F, SETcc 0x90-0x9F, IMUL 0xAF) still existed in
+/// the fused arms (SETcc 0x90-0x9F and IMUL 0xAF) still existed in
 /// `execute_two_byte`. Never edit by hand — re-run the regen from the pre-split commit.
 fn condmove_golden_cases() -> &'static [CondMoveGolden] {
     &[
@@ -472,47 +471,6 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
             deltas: &[(80, 1)],
             fetch: 6,
         },
-        // CMOVcc false: CMOVZ AX, BX (0F 44 C3): ZF=0 → condition false → AX unchanged (=5).
-        CondMoveGolden {
-            name: "cmovz ax,bx false (0f 44 c3)",
-            code: &[15, 68, 195],
-            gpr: [5, 256, 16384, 3, 240, 16, 8, 24],
-            eflags: 0x2,
-            eip: 0x3,
-            deltas: &[],
-            fetch: 4,
-        },
-        // CMOVcc true: CMOVNZ AX, BX (0F 45 C3): ZF=0 → condition true → AX = BX = 3.
-        CondMoveGolden {
-            name: "cmovnz ax,bx true (0f 45 c3)",
-            code: &[15, 69, 195],
-            gpr: [3, 256, 16384, 3, 240, 16, 8, 24],
-            eflags: 0x2,
-            eip: 0x3,
-            deltas: &[],
-            fetch: 4,
-        },
-        // CMOVcc mem false: CMOVZ AX, [0x40] (0F 44 06 40 00): ZF=0 → AX unchanged; the
-        // memory source is still read (architectural: memory operand is always fetched).
-        CondMoveGolden {
-            name: "cmovz ax,[0x40] false (0f 44 06 40 00)",
-            code: &[15, 68, 6, 64, 0],
-            gpr: [5, 256, 16384, 3, 240, 16, 8, 24],
-            eflags: 0x2,
-            eip: 0x5,
-            deltas: &[],
-            fetch: 6,
-        },
-        // CMOVcc mem true: CMOVNZ AX, [0x40] (0F 45 06 40 00): ZF=0 → AX = [0x40] = 3.
-        CondMoveGolden {
-            name: "cmovnz ax,[0x40] true (0f 45 06 40 00)",
-            code: &[15, 69, 6, 64, 0],
-            gpr: [3, 256, 16384, 3, 240, 16, 8, 24],
-            eflags: 0x2,
-            eip: 0x5,
-            deltas: &[],
-            fetch: 6,
-        },
         // IMUL no overflow: IMUL AX, BX (0F AF C3): 5*3=15, fits in 16 bits → CF=OF=0.
         CondMoveGolden {
             name: "imul ax,bx no-overflow (0f af c3)",
@@ -539,13 +497,13 @@ fn condmove_golden_cases() -> &'static [CondMoveGolden] {
 
 #[test]
 fn condmove_split_matches_golden_across_ops() {
-    // The condmove opcodes (CMOVcc, SETcc, IMUL reg,r/m) are converted to the decode/execute
+    // SETcc and IMUL reg,r/m are converted to the decode/execute
     // split, so their fused arms are deleted and they can no longer be diffed against a fused
     // executor in-tree. Run each case through cycle() (the split) and assert the architectural
     // end-state against goldens captured from the pre-split fused path (parent 93bdff3f) via
     // `regen_condmove_goldens`. The register file proves SETcc byte writes (true/false both
-    // register and memory), CMOVcc destination changed-or-unchanged, and IMUL product;
-    // eflags proves SETcc/CMOVcc leave flags unchanged and IMUL sets CF/OF on overflow;
+    // register and memory) and the IMUL product;
+    // eflags proves SETcc leaves flags unchanged and IMUL sets CF/OF on overflow;
     // the memory deltas prove SETcc writes a 0 or 1 correctly; eip + fetch prove decode
     // consumed and charged every byte (0F prefix + ModRM + displacement) exactly once.
     for g in condmove_golden_cases() {
