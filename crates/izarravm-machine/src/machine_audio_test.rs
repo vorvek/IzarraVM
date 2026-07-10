@@ -534,6 +534,82 @@ fn wss_16bit_stereo_dma_plays_and_irqs_through_the_machine() {
 }
 
 #[test]
+fn wss_16bit_stereo_auto_init_refills_across_live_clock_changes() {
+    let mut machine = test_machine();
+    let pattern = [(1i16, -2i16), (3, -4), (5, -6), (7, -8)];
+    for (index, &(left, right)) in pattern.iter().enumerate() {
+        let address = 0x1_0000 + index as u32 * 4;
+        for (offset, byte) in left
+            .to_le_bytes()
+            .into_iter()
+            .chain(right.to_le_bytes())
+            .enumerate()
+        {
+            machine.write_physical_u8(address + offset as u32, byte);
+        }
+    }
+
+    with_bus(&mut machine, |bus| {
+        // Four 16-bit stereo frames in an auto-init DMA channel. A 1 ms
+        // advance at 48 kHz crosses this buffer twelve times.
+        bus.write_io(0x0B, BusWidth::Byte, 0x58, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x0F, false).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00, false).unwrap();
+
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x48, false)
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C, false).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08, false)
+            .unwrap();
+        wss_write_indirect(bus, 10, 0x02);
+        wss_write_indirect(bus, 15, 3);
+        wss_write_indirect(bus, 14, 0);
+        wss_write_indirect(bus, 9, 0x09);
+        wss_write_indirect(bus, 6, 0);
+        wss_write_indirect(bus, 7, 0);
+    });
+
+    let mut elapsed_ticks = 0u64;
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        machine.set_mode(mode);
+        let clocks = mode.clock_rate().clocks_for_fraction_floor(1, 1_000);
+        let expected_ticks = mode.clock_rate().master_ticks_for_clocks_floor(clocks);
+        let before = machine.master_ticks();
+        machine.advance_devices_clocks(clocks);
+        assert_eq!(machine.master_ticks() - before, expected_ticks, "{mode}");
+        elapsed_ticks += expected_ticks;
+    }
+
+    let expected_frames =
+        (u128::from(elapsed_ticks) * 48_000 / u128::from(izarravm_core::MASTER_CLOCK_HZ)) as usize;
+    let mut frames = Vec::new();
+    while let Some(frame) = machine.wss.drain_frame() {
+        frames.push(frame);
+    }
+    assert_eq!(frames.len(), expected_frames);
+    for (index, frame) in frames.into_iter().enumerate() {
+        assert_eq!(frame, pattern[index % pattern.len()], "frame {index}");
+    }
+    assert!(
+        machine.pic.irr_bit(7),
+        "auto-init terminal count raised IRQ7"
+    );
+    assert!(
+        !machine.wss.take_irq(),
+        "the machine forwarded the IRQ edge"
+    );
+}
+
+#[test]
 fn wss_coexists_with_sb16_and_opl_without_cross_talk() {
     // With WSS enabled, the SB16 DSP + OPL must still function and there must
     // be no port/IRQ/DMA cross-talk: WSS uses base 0x530 / IRQ7 / DMA0, the
