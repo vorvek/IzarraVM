@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Image-backed ATA hard disk on the primary IDE channel.
 //!
 //! The disk is the primary master at command block 0x1F0-0x1F7, control block
@@ -12,9 +15,9 @@
 //! 13h legacy calls, LBA28 for the ATA task file, and LBA48-style packets for
 //! EDD, though only the low 28 bits are honored here.
 //!
-//! Transfers are PIO, the path every DOS driver and the BIOS use. A command runs
-//! synchronously inside the port write, so BSY is never observed; the host sees
-//! DRDY|DRQ when a data buffer is ready and DRDY alone when idle. Completion
+//! PIO commands keep their immediate data-port path. Bus-master DMA commands arm
+//! a request which the PIIX4-compatible BMIDE engine completes. PIO command and
+//! sector boundaries are scheduled on the machine master clock. Completion
 //! raises IRQ14 unless nIEN masks it.
 //!
 //! Limit: one master, no slave. The channel models a single drive 0; a slave
@@ -23,6 +26,8 @@
 //! Limit: LBA28 only, no LBA48. The capacity caps at 2^28-1 sectors (128 GB),
 //! plenty for the era. Lift by decoding the READ/WRITE SECTORS EXT (0x24/0x34)
 //! commands and the high-order LBA bytes.
+
+use izarravm_core::MASTER_CLOCK_HZ;
 
 /// Primary-channel command-block base (0x1F0-0x1F7).
 pub const PRIMARY_CMD_BASE: u16 = 0x1F0;
@@ -39,6 +44,12 @@ pub const SECTOR: usize = 512;
 /// the only image-dependent value.
 const HEADS: u32 = 16;
 const SECTORS_PER_TRACK: u32 = 63;
+const COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000; // 100 us
+const PIO_BYTES_PER_SECOND: u64 = 16_700_000;
+
+fn pio_sector_ticks() -> u64 {
+    (SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(PIO_BYTES_PER_SECOND as u128) as u64
+}
 
 /// ATA status register bits.
 mod status {
@@ -46,8 +57,7 @@ mod status {
     pub const DRQ: u8 = 0x08; // data request: a PIO word is ready on the data port
     pub const DSC: u8 = 0x10; // device seek complete
     pub const DRDY: u8 = 0x40; // device ready
-    // BSY (0x80) is never set: each command runs synchronously inside the port
-    // write, so the host never observes a busy window.
+    pub const BSY: u8 = 0x80; // command in progress
 }
 
 /// ATA error register bits used by the abort path.
@@ -76,9 +86,70 @@ enum Phase {
     Idle,
     /// Draining a read buffer to the host (device-to-host).
     DataIn,
-    /// Filling a write buffer from the host (host-to-device); flushed to the
-    /// image when the programmed sector count is satisfied.
+    /// Filling one write sector from the host (host-to-device).
     DataOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    PrepareIdentify,
+    PrepareRead,
+    PrepareWrite,
+    CommitWrite,
+    CompleteOk,
+    Abort,
+    Initialize { sectors: u8, heads: u8 },
+    SetFeatures { feature: u8, mode: u8 },
+    Diagnostic,
+    CheckPower,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingCommand {
+    ticks_remaining: u64,
+    action: PendingAction,
+}
+
+/// Transfer direction from the ATA device's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtaDmaDirection {
+    DeviceToMemory,
+    MemoryToDevice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmaMode {
+    None,
+    Multiword(u8),
+    Ultra(u8),
+}
+
+impl DmaMode {
+    fn bytes_per_second(self) -> Option<u64> {
+        match self {
+            Self::None => None,
+            Self::Multiword(0) => Some(4_200_000),
+            Self::Multiword(1) => Some(13_300_000),
+            Self::Multiword(2) | Self::Ultra(0) => Some(16_700_000),
+            Self::Ultra(1) => Some(25_000_000),
+            Self::Ultra(2) => Some(33_300_000),
+            Self::Multiword(_) | Self::Ultra(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtaDmaRequest {
+    pub(crate) direction: AtaDmaDirection,
+    pub(crate) lba: u32,
+    pub(crate) sectors: u32,
+    pub(crate) bytes_per_second: u64,
+}
+
+impl AtaDmaRequest {
+    pub(crate) fn byte_len(self) -> usize {
+        self.sectors as usize * SECTOR
+    }
 }
 
 /// An ATA hard disk and its task-file register set. The sectors come from either
@@ -113,10 +184,18 @@ pub struct AtaDisk {
     phase: Phase,
     buffer: Vec<u8>,
     buffer_pos: usize,
-    /// For a multi-sector write, the first LBA of the in-flight buffer.
-    write_lba: u32,
-    /// Set on command completion so the machine forwards IRQ14 to the PIC.
+    /// Current PIO sector and sectors remaining in the command.
+    pio_lba: u32,
+    pio_sectors_remaining: u32,
+    /// Command or sector boundary waiting on the machine master clock.
+    pending_command: Option<PendingCommand>,
+    /// Set when a command completes or a PIO sector becomes ready.
     irq_pending: bool,
+    /// DMA command waiting for the PIIX4 bus-master engine.
+    dma_request: Option<AtaDmaRequest>,
+    /// Transfer mode selected through SET FEATURES. Izarra 3000 powers on in
+    /// UDMA2, matching its 1997 storage profile.
+    dma_mode: DmaMode,
     /// Bytes moved by the last data command, for the GUI access LED.
     last_access_bytes: usize,
 }
@@ -166,8 +245,12 @@ impl AtaDisk {
             phase: Phase::Idle,
             buffer: Vec::new(),
             buffer_pos: 0,
-            write_lba: 0,
+            pio_lba: 0,
+            pio_sectors_remaining: 0,
+            pending_command: None,
             irq_pending: false,
+            dma_request: None,
+            dma_mode: DmaMode::Ultra(2),
             last_access_bytes: 0,
         }
     }
@@ -288,6 +371,10 @@ impl AtaDisk {
         pending
     }
 
+    pub(crate) fn irq_enabled(&self) -> bool {
+        !self.interrupts_disabled
+    }
+
     /// Take and clear the access-byte count for the GUI LED.
     pub fn take_access_bytes(&mut self) -> usize {
         let bytes = self.last_access_bytes;
@@ -355,6 +442,9 @@ impl AtaDisk {
             return false;
         }
         let reg = port - PRIMARY_CMD_BASE;
+        if self.status & status::BSY != 0 && reg != 0 {
+            return true;
+        }
         match reg {
             0 => self.write_data_byte(value),
             1 => self.features = value,
@@ -371,8 +461,11 @@ impl AtaDisk {
 
     fn soft_reset(&mut self) {
         self.phase = Phase::Idle;
+        self.dma_request = None;
+        self.pending_command = None;
         self.buffer.clear();
         self.buffer_pos = 0;
+        self.pio_sectors_remaining = 0;
         self.status = status::DRDY | status::DSC;
         // Diagnostic code 0x01: device 0 passed (ATA 9.1). An ATA disk leaves the
         // signature registers at 0x00 sector-count/LBA-low and 0x0000 cylinder,
@@ -382,6 +475,7 @@ impl AtaDisk {
         self.lba_low = 0x01;
         self.lba_mid = 0x00;
         self.lba_high = 0x00;
+        self.irq_pending = false;
     }
 
     /// Decode the command's starting LBA from the task file (LBA28 or CHS) and the
@@ -407,15 +501,23 @@ impl AtaDisk {
     }
 
     fn write_command(&mut self, command: u8) {
+        // The command register is not accepted while a command or PIO buffer is
+        // in flight. SRST remains available through the control port.
+        if self.dma_request.is_some() || self.pending_command.is_some() || self.phase != Phase::Idle
+        {
+            return;
+        }
         if !self.master_selected() {
-            // No slave device: any command to it aborts.
-            self.abort();
+            // No slave device: any command to it aborts after command latency.
+            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
             return;
         }
         match command {
-            0xEC => self.identify_device(),
+            0xEC => self.schedule(PendingAction::PrepareIdentify, COMMAND_LATENCY_TICKS),
             0x20 | 0x21 => self.read_sectors(),
             0x30 | 0x31 => self.write_sectors(),
+            0xC8 | 0xC9 => self.begin_dma(AtaDmaDirection::DeviceToMemory),
+            0xCA | 0xCB => self.begin_dma(AtaDmaDirection::MemoryToDevice),
             // READ/WRITE MULTIPLE behave like the single-sector PIO forms here:
             // the model has no per-block interrupt, so each sector still drains
             // through the data port. Limit: no multi-count block size, lift by
@@ -423,35 +525,109 @@ impl AtaDisk {
             0xC4 => self.read_sectors(),
             0xC5 => self.write_sectors(),
             // RECALIBRATE (0x10-0x1F): seek to cylinder 0, complete with DSC.
-            0x10..=0x1F => self.complete_ok(),
+            0x10..=0x1F => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
+            // SEEK (0x70-0x7F): the HLE medium has no mechanical head state.
+            0x70..=0x7F => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
             // INITIALIZE DEVICE PARAMETERS (0x91): set the logical CHS the host
             // wants. sector_count = sectors per track, drive_head low nibble + 1
             // = heads. Accept and ack.
-            0x91 => {
-                self.logical_sectors = self.sector_count;
-                self.logical_heads = (self.drive_head & 0x0F) + 1;
-                self.complete_ok();
-            }
-            // SET FEATURES (0xEF): transfer-mode and cache knobs. Acknowledge.
-            0xEF => self.complete_ok(),
+            0x91 => self.schedule(
+                PendingAction::Initialize {
+                    sectors: self.sector_count,
+                    heads: (self.drive_head & 0x0F) + 1,
+                },
+                COMMAND_LATENCY_TICKS,
+            ),
+            // SET FEATURES (0xEF): transfer-mode selection is guest-visible in
+            // IDENTIFY. Other established feature toggles remain acknowledged.
+            0xEF => self.schedule(
+                PendingAction::SetFeatures {
+                    feature: self.features,
+                    mode: self.sector_count,
+                },
+                COMMAND_LATENCY_TICKS,
+            ),
             // EXECUTE DEVICE DIAGNOSTIC (0x90): report device 0 passed (0x01).
-            0x90 => {
-                self.error = 0x01;
-                self.complete_ok();
-            }
-            // CHECK POWER MODE (0xE5) / IDLE (0xE3) / standby ack: report active.
-            0xE5 => {
-                self.sector_count = 0xFF; // 0xFF = active/idle
-                self.complete_ok();
-            }
+            0x90 => self.schedule(PendingAction::Diagnostic, COMMAND_LATENCY_TICKS),
+            // CHECK POWER MODE reports active. IDLE, STANDBY, and FLUSH CACHE
+            // complete successfully because the HLE backing has no volatile
+            // drive cache or mechanical power state.
+            0xE5 => self.schedule(PendingAction::CheckPower, COMMAND_LATENCY_TICKS),
+            0xE2 | 0xE3 | 0xE7 => self.schedule(PendingAction::CompleteOk, COMMAND_LATENCY_TICKS),
             // NOP (0x00) always aborts on hardware, never a silent success.
-            _ => self.abort(),
+            _ => self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS),
+        }
+    }
+
+    fn schedule(&mut self, action: PendingAction, ticks: u64) {
+        self.phase = Phase::Idle;
+        self.status = status::BSY;
+        self.error = 0;
+        self.irq_pending = false;
+        self.pending_command = Some(PendingCommand {
+            ticks_remaining: ticks.max(1),
+            action,
+        });
+    }
+
+    /// Master ticks until the next guest-visible PIO command or sector boundary.
+    pub(crate) fn ticks_until_completion(&self) -> Option<u64> {
+        self.pending_command
+            .as_ref()
+            .map(|pending| pending.ticks_remaining)
+    }
+
+    pub(crate) fn ticks_until_irq(&self) -> Option<u64> {
+        self.pending_command
+            .as_ref()
+            .filter(|pending| pending.action != PendingAction::PrepareWrite)
+            .map(|pending| pending.ticks_remaining)
+    }
+
+    /// Advance a pending PIO operation on the fixed machine timeline.
+    pub(crate) fn advance_master_ticks(&mut self, ticks: u64) {
+        let Some(pending) = self.pending_command.as_mut() else {
+            return;
+        };
+        if ticks < pending.ticks_remaining {
+            pending.ticks_remaining -= ticks;
+            return;
+        }
+        let action = self.pending_command.take().unwrap().action;
+        self.finish_pending(action);
+    }
+
+    fn finish_pending(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::PrepareIdentify => self.prepare_identify(),
+            PendingAction::PrepareRead => self.prepare_read_sector(),
+            PendingAction::PrepareWrite => self.prepare_write_sector(false),
+            PendingAction::CommitWrite => self.commit_write_sector(),
+            PendingAction::CompleteOk => self.complete_ok(),
+            PendingAction::Abort => self.abort(),
+            PendingAction::Initialize { sectors, heads } => {
+                self.logical_sectors = sectors;
+                self.logical_heads = heads;
+                self.complete_ok();
+            }
+            PendingAction::SetFeatures { feature, mode } => self.apply_set_features(feature, mode),
+            PendingAction::Diagnostic => {
+                self.error = 0x01;
+                self.status = status::DRDY | status::DSC;
+                self.raise_irq();
+            }
+            PendingAction::CheckPower => {
+                self.sector_count = 0xFF;
+                self.complete_ok();
+            }
         }
     }
 
     /// Complete a non-data command: DRDY|DSC, clear ERR, raise the IRQ.
     fn complete_ok(&mut self) {
         self.phase = Phase::Idle;
+        self.dma_request = None;
+        self.pending_command = None;
         self.status = status::DRDY | status::DSC;
         self.error = 0;
         self.raise_irq();
@@ -460,21 +636,25 @@ impl AtaDisk {
     /// Abort a command: DRDY|ERR with ABRT in the error register.
     fn abort(&mut self) {
         self.phase = Phase::Idle;
+        self.dma_request = None;
+        self.pending_command = None;
         self.buffer.clear();
         self.buffer_pos = 0;
+        self.pio_sectors_remaining = 0;
         self.status = status::DRDY | status::ERR;
         self.error = error::ABRT;
         self.raise_irq();
     }
 
     /// IDENTIFY DEVICE (0xEC): present the 256-word identify block as a read PIO
-    /// buffer, DRQ raised, IRQ on completion.
-    fn identify_device(&mut self) {
+    /// buffer, then raise DRQ and IRQ when it is ready.
+    fn prepare_identify(&mut self) {
         self.buffer = identify_block(
             self.cylinders,
             HEADS,
             SECTORS_PER_TRACK,
             self.total_sectors(),
+            self.dma_mode,
         );
         self.buffer_pos = 0;
         self.phase = Phase::DataIn;
@@ -483,60 +663,169 @@ impl AtaDisk {
         self.raise_irq();
     }
 
-    /// READ SECTORS (0x20/0x21): gather the requested run into the read buffer and
-    /// arm the data-in drain. An out-of-range run aborts.
+    /// READ SECTORS validates the task file, then schedules the first sector.
     fn read_sectors(&mut self) {
         let Some((lba, count)) = self.command_lba() else {
-            self.abort();
+            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
             return;
         };
         let end = lba.saturating_add(count);
         if end > self.total_sectors() {
-            self.abort();
+            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
             return;
         }
-        let mut buf = Vec::with_capacity(count as usize * SECTOR);
-        for l in lba..end {
-            match self.read_lba(l) {
-                Some(s) => buf.extend_from_slice(&s),
-                None => {
-                    self.abort();
-                    return;
-                }
-            }
-        }
-        self.last_access_bytes = buf.len();
-        self.buffer = buf;
+        self.pio_lba = lba;
+        self.pio_sectors_remaining = count;
+        self.last_access_bytes = 0;
+        self.schedule(
+            PendingAction::PrepareRead,
+            COMMAND_LATENCY_TICKS.saturating_add(pio_sector_ticks()),
+        );
+    }
+
+    fn prepare_read_sector(&mut self) {
+        let Some(sector) = self.read_lba(self.pio_lba) else {
+            self.abort();
+            return;
+        };
+        self.buffer = sector.to_vec();
         self.buffer_pos = 0;
         self.phase = Phase::DataIn;
         self.status = status::DRDY | status::DRQ | status::DSC;
         self.error = 0;
-        // The host drains the first sector immediately; the IRQ signals the buffer
-        // is ready, matching a real drive that interrupts when data is available.
+        self.last_access_bytes = self.last_access_bytes.saturating_add(SECTOR);
         self.raise_irq();
     }
 
-    /// WRITE SECTORS (0x30/0x31): arm the data-out phase. The host writes the
-    /// sector bytes through the data port; the buffer flushes to the image once
-    /// the programmed count is filled.
+    /// WRITE SECTORS validates the task file, then schedules the first DRQ.
     fn write_sectors(&mut self) {
         let Some((lba, count)) = self.command_lba() else {
-            self.abort();
+            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
             return;
         };
         let end = lba.saturating_add(count);
         if end > self.total_sectors() {
+            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
+            return;
+        }
+        self.pio_lba = lba;
+        self.pio_sectors_remaining = count;
+        self.last_access_bytes = 0;
+        self.schedule(PendingAction::PrepareWrite, COMMAND_LATENCY_TICKS);
+    }
+
+    fn prepare_write_sector(&mut self, raise_irq: bool) {
+        self.buffer = vec![0u8; SECTOR];
+        self.buffer_pos = 0;
+        self.phase = Phase::DataOut;
+        self.status = status::DRDY | status::DRQ | status::DSC;
+        self.error = 0;
+        if raise_irq {
+            self.raise_irq();
+        }
+    }
+
+    fn begin_dma(&mut self, direction: AtaDmaDirection) {
+        let Some(bytes_per_second) = self.dma_mode.bytes_per_second() else {
+            self.abort();
+            return;
+        };
+        let Some((lba, sectors)) = self.command_lba() else {
+            self.abort();
+            return;
+        };
+        if lba.saturating_add(sectors) > self.total_sectors() {
             self.abort();
             return;
         }
-        self.write_lba = lba;
-        self.buffer = vec![0u8; count as usize * SECTOR];
+        self.phase = Phase::Idle;
+        self.buffer.clear();
         self.buffer_pos = 0;
-        self.phase = Phase::DataOut;
-        // DRQ up, awaiting the host's data. No IRQ yet: WRITE SECTORS interrupts
-        // on completion, after the host has fed the data, not before.
-        self.status = status::DRDY | status::DRQ | status::DSC;
         self.error = 0;
+        self.status = status::BSY;
+        self.irq_pending = false;
+        self.dma_request = Some(AtaDmaRequest {
+            direction,
+            lba,
+            sectors,
+            bytes_per_second,
+        });
+    }
+
+    fn apply_set_features(&mut self, feature: u8, mode: u8) {
+        if feature != 0x03 {
+            self.complete_ok();
+            return;
+        }
+        self.dma_mode = match mode {
+            0x00 | 0x01 | 0x08..=0x0C => DmaMode::None,
+            0x20..=0x22 => DmaMode::Multiword(mode - 0x20),
+            0x40..=0x42 => DmaMode::Ultra(mode - 0x40),
+            _ => {
+                self.abort();
+                return;
+            }
+        };
+        self.complete_ok();
+    }
+
+    pub(crate) fn pending_dma(&self) -> Option<AtaDmaRequest> {
+        self.dma_request
+    }
+
+    pub(crate) fn read_dma_payload(&self) -> Option<Vec<u8>> {
+        let request = self.dma_request?;
+        if request.direction != AtaDmaDirection::DeviceToMemory {
+            return None;
+        }
+        let mut payload = Vec::with_capacity(request.byte_len());
+        for lba in request.lba..request.lba + request.sectors {
+            payload.extend_from_slice(&self.read_lba(lba)?);
+        }
+        Some(payload)
+    }
+
+    pub(crate) fn complete_dma_read(&mut self, bytes: usize) {
+        let Some(request) = self.dma_request else {
+            return;
+        };
+        if request.direction != AtaDmaDirection::DeviceToMemory || bytes != request.byte_len() {
+            self.abort();
+            return;
+        }
+        self.last_access_bytes = bytes;
+        self.advance_dma_task_file(request);
+        self.complete_ok();
+    }
+
+    pub(crate) fn complete_dma_write(&mut self, data: &[u8]) -> bool {
+        let Some(request) = self.dma_request else {
+            return false;
+        };
+        if request.direction != AtaDmaDirection::MemoryToDevice || data.len() != request.byte_len()
+        {
+            self.abort();
+            return false;
+        }
+        for (index, sector) in data.chunks_exact(SECTOR).enumerate() {
+            if !self.write_lba(request.lba + index as u32, sector) {
+                self.abort();
+                return false;
+            }
+        }
+        if let Backing::HostFolder(volume) = &mut self.backing {
+            volume.reconcile();
+        }
+        self.last_access_bytes = data.len();
+        self.advance_dma_task_file(request);
+        self.complete_ok();
+        true
+    }
+
+    pub(crate) fn abort_dma(&mut self) {
+        if self.dma_request.is_some() {
+            self.abort();
+        }
     }
 
     fn read_data_byte(&mut self) -> u8 {
@@ -546,11 +835,18 @@ impl AtaDisk {
         let byte = self.buffer.get(self.buffer_pos).copied().unwrap_or(0);
         self.buffer_pos += 1;
         if self.buffer_pos >= self.buffer.len() {
-            // Whole transfer complete: drop DRQ, go idle.
             self.phase = Phase::Idle;
             self.buffer.clear();
             self.buffer_pos = 0;
-            self.status = status::DRDY | status::DSC;
+            if self.pio_sectors_remaining > 0 {
+                self.pio_sectors_remaining -= 1;
+                self.advance_pio_task_file();
+            }
+            if self.pio_sectors_remaining > 0 {
+                self.schedule(PendingAction::PrepareRead, pio_sector_ticks());
+            } else {
+                self.status = status::DRDY | status::DSC;
+            }
         }
         byte
     }
@@ -564,25 +860,63 @@ impl AtaDisk {
             self.buffer_pos += 1;
         }
         if self.buffer_pos >= self.buffer.len() {
-            // The host has fed the whole run: flush each sector to the image.
-            let sectors = self.buffer.len() / SECTOR;
-            let buffer = std::mem::take(&mut self.buffer);
-            for i in 0..sectors {
-                let slice = &buffer[i * SECTOR..(i + 1) * SECTOR];
-                self.write_lba(self.write_lba + i as u32, slice);
-            }
-            self.last_access_bytes = buffer.len();
-            self.buffer_pos = 0;
+            self.phase = Phase::Idle;
+            self.schedule(PendingAction::CommitWrite, pio_sector_ticks());
+        }
+    }
+
+    fn commit_write_sector(&mut self) {
+        let buffer = std::mem::take(&mut self.buffer);
+        self.buffer_pos = 0;
+        if !self.write_lba(self.pio_lba, &buffer) {
+            self.abort();
+            return;
+        }
+        self.last_access_bytes = self.last_access_bytes.saturating_add(SECTOR);
+        if self.pio_sectors_remaining > 0 {
+            self.pio_sectors_remaining -= 1;
+            self.advance_pio_task_file();
+        }
+        if self.pio_sectors_remaining > 0 {
+            self.prepare_write_sector(true);
+        } else {
             self.phase = Phase::Idle;
             self.status = status::DRDY | status::DSC;
             self.error = 0;
-            // M2: mirror any finished files to the host folder. Runs a full
-            // reconcile pass per write command.
             if let Backing::HostFolder(volume) = &mut self.backing {
                 volume.reconcile();
             }
-            // Completion raises the IRQ, the way a drive signals the write done.
             self.raise_irq();
+        }
+    }
+
+    fn advance_pio_task_file(&mut self) {
+        self.sector_count = self.sector_count.wrapping_sub(1);
+        self.pio_lba = self.pio_lba.saturating_add(1);
+        self.set_task_file_address(self.pio_lba);
+    }
+
+    fn advance_dma_task_file(&mut self, request: AtaDmaRequest) {
+        self.sector_count = self.sector_count.wrapping_sub(request.sectors as u8);
+        self.set_task_file_address(request.lba.saturating_add(request.sectors));
+    }
+
+    fn set_task_file_address(&mut self, lba: u32) {
+        if self.lba_mode() {
+            self.lba_low = lba as u8;
+            self.lba_mid = (lba >> 8) as u8;
+            self.lba_high = (lba >> 16) as u8;
+            self.drive_head = (self.drive_head & 0xf0) | ((lba >> 24) as u8 & 0x0f);
+        } else {
+            let cylinder_size = HEADS * SECTORS_PER_TRACK;
+            let cylinder = lba / cylinder_size;
+            let in_cylinder = lba % cylinder_size;
+            let head = in_cylinder / SECTORS_PER_TRACK;
+            let sector = in_cylinder % SECTORS_PER_TRACK + 1;
+            self.lba_low = sector as u8;
+            self.lba_mid = cylinder as u8;
+            self.lba_high = (cylinder >> 8) as u8;
+            self.drive_head = (self.drive_head & 0xf0) | head as u8;
         }
     }
 
@@ -594,9 +928,14 @@ impl AtaDisk {
 /// Build the 256-word (512-byte) IDENTIFY DEVICE block for the derived geometry.
 /// The fields a BIOS and DOS driver read: word 0 general config, words 1/3/6 the
 /// default CHS, words 60-61 the LBA28 capacity, the model string byte-swapped per
-/// ATA. Limit: only the words a real probe reads are filled; SMART, UDMA, and
-/// the 48-bit capacity words stay zero.
-fn identify_block(cylinders: u32, heads: u32, sectors: u32, total_lba: u32) -> Vec<u8> {
+/// ATA. Limit: SMART and the 48-bit capacity words stay zero.
+fn identify_block(
+    cylinders: u32,
+    heads: u32,
+    sectors: u32,
+    total_lba: u32,
+    dma_mode: DmaMode,
+) -> Vec<u8> {
     let mut words = [0u16; 256];
     // Word 0 general configuration: bit 6 = fixed (non-removable) device, bit 15
     // clear marks an ATA (not ATAPI) device. 0x0040 is the value a fixed ATA disk
@@ -605,12 +944,11 @@ fn identify_block(cylinders: u32, heads: u32, sectors: u32, total_lba: u32) -> V
     words[1] = cylinders.min(0xFFFF) as u16; // default cylinders
     words[3] = heads as u16; // default heads
     words[6] = sectors as u16; // default sectors per track
-    // Word 49 capabilities: bit 9 advertises LBA. Bit 8 stays clear because this
-    // controller implements PIO transfers only.
-    words[49] = 0x0200;
-    // Words 53/54-58: the current CHS translation is valid (bit 0 of word 53),
-    // echoing the default geometry.
-    words[53] = 0x0001;
+    // Word 49 capabilities: LBA and DMA are implemented.
+    words[49] = 0x0300;
+    // The current CHS translation and Ultra DMA word are valid. Advanced PIO
+    // timing words stay invalid rather than advertising cycle data we do not use.
+    words[53] = 0x0005;
     words[54] = cylinders.min(0xFFFF) as u16;
     words[55] = heads as u16;
     words[56] = sectors as u16;
@@ -621,6 +959,16 @@ fn identify_block(cylinders: u32, heads: u32, sectors: u32, total_lba: u32) -> V
     // low word first).
     words[60] = (total_lba & 0xFFFF) as u16;
     words[61] = (total_lba >> 16) as u16;
+    // Multiword DMA modes 0-2 and Ultra DMA modes 0-2 are supported. The high
+    // byte reports the one mode selected through SET FEATURES.
+    words[63] = 0x0007;
+    words[80] = 0x0010; // ATA/ATAPI-4
+    words[88] = 0x0007;
+    match dma_mode {
+        DmaMode::Multiword(mode) => words[63] |= 1 << (8 + mode),
+        DmaMode::Ultra(mode) => words[88] |= 1 << (8 + mode),
+        DmaMode::None => {}
+    }
     put_string(&mut words[10..20], "IZARRA-HD-0001"); // serial number
     put_string(&mut words[23..27], "1.0 "); // firmware revision
     put_string(&mut words[27..47], "Izarra Hard Disk"); // model number

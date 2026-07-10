@@ -28,6 +28,7 @@ use thiserror::Error;
 mod ata;
 mod atapi;
 mod bios;
+mod bmide;
 mod bus;
 mod cdimage;
 mod dma;
@@ -792,6 +793,10 @@ pub struct Machine {
     // boot drive C:; None when no image is mounted. INT 13h DL>=0x80 and the
     // primary-channel ports drive it.
     ata: Option<ata::AtaDisk>,
+    // PIIX4-compatible two-channel bus-master IDE register block. The primary
+    // channel transfers the ATA disk; the secondary bank records legacy IDE
+    // interrupts but does not advertise ATAPI DMA.
+    bmide: bmide::BusMasterIde,
     // Synthesized read-only FAT32 volume serving drive C: to the DOS absolute-disk
     // interface (INT 25h read; INT 26h write is write-protected). Optional and
     // consulted only by INT 25h/26h for AL=2, so it does not touch the ATA / INT
@@ -1096,6 +1101,7 @@ impl Machine {
             ide: ide::IdeChannel::new(),
             icdex_vd_preference: 0x0100,
             ata: None,
+            bmide: bmide::BusMasterIde::default(),
             fat32_c: None,
             cd_accesses: 0,
             cd_audio_sample: 0,
@@ -1993,6 +1999,7 @@ struct MachineBus<'a> {
     wss_enabled: bool,
     ide: &'a mut ide::IdeChannel,
     ata: &'a mut Option<ata::AtaDisk>,
+    bmide: &'a mut bmide::BusMasterIde,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
     last_int_vector: &'a mut Option<u8>,

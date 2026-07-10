@@ -14,7 +14,7 @@ machine, and this manual reproduces its manual.
 | Memory | 24 MB SDRAM, with Toka-DOS mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), and OPL3 FM. |
-| Storage | IDE hard disk, ATAPI CD-ROM with CD audio, and a 1.44 MB floppy drive. |
+| Storage | UDMA2 IDE hard disk on a PIIX4-compatible controller, PIO ATAPI CD-ROM with CD audio, and a 1.44 MB floppy drive. |
 | Display | 15-inch CRT, up to 1024x768@75Hz. |
 | Firmware | 2 MB ROM with the Izarra BIOS, Toka-DOS (FreeDOS-based), and bundled tools. |
 | I/O | PS/2 keyboard and mouse, serial, parallel, VGA, line out, line in. |

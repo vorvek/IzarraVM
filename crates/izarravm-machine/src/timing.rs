@@ -412,6 +412,20 @@ impl Machine {
         // scancode releases once real PS/2 wire time has actually elapsed.
         self.keyboard.advance_mouse_pacing(advance.master_ticks);
 
+        // ATA PIO and PIIX4 bus-master transfers share the authoritative master
+        // timeline. A device-to-memory completion bypasses the CPU bus, so drop
+        // cached code immediately. This also covers host-driven timeline advances
+        // that occur outside the instruction run loop.
+        if let Some(disk) = self.ata.as_mut() {
+            disk.advance_master_ticks(advance.master_ticks);
+            if self
+                .bmide
+                .advance_master_ticks(advance.master_ticks, &mut self.memory, disk)
+            {
+                self.cpu.note_device_memory_write();
+            }
+        }
+
         // The take_irq latches below are single-edge bools, which is safe for
         // these devices even across a multi-sample step: each is a completion
         // edge that can fire at most once per guest-initiated operation (a
@@ -451,12 +465,14 @@ impl Machine {
         // ATAPI command completion forwards IRQ15 (the secondary channel) to the
         // PIC, the way a real drive interrupts the host when a packet finishes.
         if self.ide.take_irq() {
+            self.bmide.note_ide_irq(true);
             self.pic.request(ide::SECONDARY_IRQ);
         }
         // ATA hard-disk completion forwards IRQ14 (the primary channel) the same
         // way. The access-byte count flashes the C: LED through c_accesses.
         if let Some(disk) = self.ata.as_mut() {
             if disk.take_irq() {
+                self.bmide.note_ide_irq(false);
                 self.pic.request(ata::PRIMARY_IRQ);
             }
             if disk.take_access_bytes() > 0 {
@@ -646,10 +662,7 @@ impl Machine {
 
     /// CPU clocks to advance while halted so the next wake-capable IRQ lands, or
     /// None if nothing can wake the CPU (so HLT is a genuine halt). A halted guest
-    /// is woken by any of four sources: IRQ0 (PIT channel 0 OUT edge), IRQ5 (the
-    /// SB16 DSP half/end-buffer edge, clock-driven), the AD1848/WSS codec's
-    /// terminal-count edge, or the Yamaha ADPCM-B block edge, the latter two on
-    /// their own (config) IRQ lines. Each is considered only when
+    /// is woken by timer, audio, or primary IDE completion. Each is considered only when
     /// unmasked/deliverable; the result is the soonest of the applicable wakes,
     /// clamped to the deadline and to at least one clock so the run loop always
     /// makes progress.
@@ -706,9 +719,38 @@ impl Machine {
         } else {
             None
         };
+        let ata_wake = if self.pic.deliverable(ata::PRIMARY_IRQ)
+            && self.ata.as_ref().is_some_and(ata::AtaDisk::irq_enabled)
+        {
+            self.next_ata_irq_deadline()
+                .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
+        } else {
+            None
+        };
         // The sooner of whichever wakes apply; None only when none can fire.
-        let wake = [pit_wake, dsp_wake, wss_wake].into_iter().flatten().min()?;
+        let wake = [pit_wake, dsp_wake, wss_wake, ata_wake]
+            .into_iter()
+            .flatten()
+            .min()?;
         Some(wake.max(1).min(remaining))
+    }
+
+    fn next_ata_deadline(&self) -> Option<u64> {
+        self.ata
+            .as_ref()
+            .and_then(ata::AtaDisk::ticks_until_completion)
+            .into_iter()
+            .chain(self.bmide.ticks_until_completion())
+            .min()
+    }
+
+    fn next_ata_irq_deadline(&self) -> Option<u64> {
+        self.ata
+            .as_ref()
+            .and_then(ata::AtaDisk::ticks_until_irq)
+            .into_iter()
+            .chain(self.bmide.ticks_until_completion())
+            .min()
     }
 
     /// CPU clocks until the next due device event.
@@ -770,6 +812,9 @@ impl Machine {
             )
         {
             cap = cap.min(clocks);
+        }
+        if let Some(ticks) = self.next_ata_deadline() {
+            cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
         }
         cap.max(1).min(remaining)
     }

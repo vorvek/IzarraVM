@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! IDE/ATA register file for the secondary channel, hosting the ATAPI CD-ROM as
 //! the secondary master.
 //!
@@ -448,8 +451,9 @@ fn identify_block() -> Vec<u8> {
     // General config: bits 15-14 = 10b (ATAPI device), bits 12-8 = 0x05 (CD-ROM
     // command set), bits 6-5 = removable, bits 1-0 = 0 (12-byte packet).
     words[0] = 0x85C0;
-    // Capabilities: DMA + LBA supported bits (cosmetic for PIO use).
-    words[49] = 0x0300;
+    // LBA is supported. DMA stays clear until the secondary ATAPI DMA path is
+    // implemented; the BMIDE register bank alone is not a transfer engine.
+    words[49] = 0x0200;
     // ATAPI signature fields per ATA-4 word 0 already cover the type.
     put_string(&mut words[10..20], "IZARRA-CD-0001"); // serial number
     put_string(&mut words[23..27], "1.0 "); // firmware revision

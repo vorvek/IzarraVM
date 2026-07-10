@@ -76,6 +76,7 @@ impl Machine {
     /// DL>=0x80 and the primary-channel ports then serve it. Seeds the BDA fixed-
     /// disk count to 1 so a guest reading 0040:0075 sees the drive.
     pub fn mount_hdd(&mut self, bytes: Vec<u8>) {
+        self.bmide.reset_primary();
         self.ata = Some(ata::AtaDisk::new(bytes));
         let _ = self.publish_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
@@ -107,6 +108,7 @@ impl Machine {
         // the folder.
         let volume =
             katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
+        self.bmide.reset_primary();
         self.ata = Some(ata::AtaDisk::from_host_folder(volume));
         let _ = self.publish_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
@@ -130,6 +132,7 @@ impl Machine {
         let system_files = user_folder_overlay(payload.files);
         let volume =
             katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
+        self.bmide.reset_primary();
         self.ata = Some(ata::AtaDisk::from_host_folder(volume));
         self.katea_root = Some(dir.to_path_buf());
         let _ = self.publish_fixed_disk_parameter_table();
@@ -150,6 +153,7 @@ impl Machine {
     /// flushable image — returning its empty `bytes()` would persist a 0-byte file).
     /// Clears the BDA fixed-disk count.
     pub fn eject_hdd(&mut self) -> Option<Vec<u8>> {
+        self.bmide.reset_primary();
         if let Some(disk) = self.ata.as_mut() {
             disk.reconcile_host_folder(); // final pass for a host folder; no-op for images
         }

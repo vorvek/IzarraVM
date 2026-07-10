@@ -280,6 +280,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         wss_enabled: machine.wss_enabled,
         ide: &mut machine.ide,
         ata: &mut machine.ata,
+        bmide: &mut machine.bmide,
         trace: &mut machine.trace,
         pending_soft_int: &mut machine.pending_soft_int,
         last_int_vector: &mut machine.last_int_vector,
@@ -457,6 +458,9 @@ fn boot_and_read_font_rows(cmos_codepage: u8, glyph: u8, rows: usize) -> Vec<u8>
         .collect()
 }
 
+#[cfg(test)]
+#[path = "machine_ata_dma_test.rs"]
+mod ata_dma;
 #[cfg(test)]
 #[path = "machine_audio_test.rs"]
 mod audio;
