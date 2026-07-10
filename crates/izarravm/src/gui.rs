@@ -238,7 +238,7 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
                     // Present only the active visible region. `height` is the full
                     // beam frame (vtotal) including the vertical retrace/border the
                     // monitor never shows; cropping to the top `display_height`
-                    // (vdisp_end) rows is what makes the aspect-fill correct — it
+                    // (vdisp_end) rows is what makes the aspect-fill correct; it
                     // drops the black bottom bar a 320x200 mode would otherwise bake
                     // into the stretched image.
                     let w = raster.width as usize;
@@ -1048,7 +1048,7 @@ fn emulate(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // Channel closed (the GUI dropped the sender on exit) — same
+                    // Channel closed (the GUI dropped the sender on exit); same
                     // flush sequence as Shutdown before the thread ends.
                     machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
@@ -1291,7 +1291,7 @@ pub struct GuiApp {
     // Whether the floating About window is open. The footer info button and the
     // window's own close control both flip this.
     show_about: bool,
-    // Whether the floating License (GPL-3.0) window is open. The About window's
+    // Whether the floating License (GPL-3.0-only) window is open. The About window's
     // "View license" button and the window's own close control flip this.
     show_license: bool,
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
@@ -2385,13 +2385,13 @@ impl GuiApp {
         self.show_com1 = open;
     }
 
-    /// The floating License window: the full GPL-3.0 text, black monospace on
+    /// The floating License window: the full GPL-3.0-only text, black monospace on
     /// white inside the shared beige chrome. Opened from the About window.
     fn license_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_license;
         beige_window(
             ctx,
-            "License (GPL-3.0)",
+            "License (GPL-3.0-only)",
             &mut open,
             true,
             [640.0, 520.0],
@@ -2445,7 +2445,7 @@ impl GuiApp {
                     ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
                     ui.label(
                         egui::RichText::new(
-                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0",
+                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0-only",
                         )
                         .color(MUTED)
                         .size(12.0),

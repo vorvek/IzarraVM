@@ -39,11 +39,17 @@ manual](resonique2/manual.md):
 
 ## A 3D-accelerated game doesn't detect Distira
 
-This is expected for now. The Distira 3D chip itself is emulated to a real
-Voodoo Graphics-class register and memory contract (see [VEGA technical
-reference, section 10](vega/vega-technical-reference.md#10-distira-3d)), but
-no guest-side Glide driver exists yet for a game to load. Fall back to
-software rendering or a VESA/VGA mode if the game offers one.
+Distira supports both DOS Glide linking models. A static build contains Glide
+inside the executable and needs no OVL; the original Voodoo Graphics Tomb
+Raider executable is verified this way. A dynamic build needs a compatible
+`GLIDE2X.OVL` beside the game; Carmageddon is verified with a local Glide 2.48
+OVL.
+
+Make sure you are running the game's Voodoo Graphics build. For a dynamic
+build, check that its expected OVL is present and matches the game. IzarraVM
+does not ship proprietary Glide binaries or game data. See [VEGA technical
+reference, section 10](vega/vega-technical-reference.md#10-distira-3d) for the
+emulated hardware contract.
 
 ## Where do my files actually live?
 

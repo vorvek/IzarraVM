@@ -4,16 +4,18 @@ Visual Engine for Graphics Acceleration. This is the hardware reference for the
 VEGA chipset fitted to the Izarra 3000. It documents the programming interface:
 the memory map, the display modes, and the register set.
 
-VEGA is two chips that share one pool of memory:
+VEGA combines two graphics engines with separate memory:
 
 - **Margo**, the 2D engine. Drives the desktop and all 2D display modes, and
-  carries a blit engine for accelerated fills, copies, text, and lines.
-- **Distira**, the 3D engine. Documented in a later revision of this manual.
+  owns a 4 MB frame store and a blit engine for accelerated fills, copies,
+  text, and lines.
+- **Distira**, the 3D engine. Owns a 2 MB framebuffer and two independent 2 MB
+  texture stores.
 
-Both chips read and write a single 4 MB frame store. Memory is allocated by
-mode, so a high resolution 32-bit 2D surface and a 3D scene do not coexist.
+VEGA presents the scanout from whichever engine is active. Margo and Distira
+do not alias each other's memory.
 
-This revision covers Margo. The Distira sections are reserved.
+This revision covers both engines. Margo starts below; Distira is in section 10.
 
 ---
 
@@ -24,7 +26,7 @@ through the VESA BIOS interface, and a memory mapped register block that drives
 the blit engine. A driver sets a mode through the VBE software interface, then
 talks to the engine through the register block to move pixels without the CPU.
 
-- 4 MB frame store, shared with Distira, addressed as a flat byte space from
+- 4 MB frame store, private to Margo, addressed as a flat byte space from
   offset `0x000000` to `0x3FFFFF`.
 - Display modes up to 1024x768 at 32 bits per pixel.
 - 256-entry palette for 8-bit modes, through the standard VGA DAC ports.
@@ -45,7 +47,7 @@ are documented with the rest of the VGA core, not here.
 | Host interface | 66 MHz, 32-bit, bus-mastering port to the custom chipset (PCI derived) |
 | Host bandwidth | about 266 MB/s peak |
 | Margo core clock | 100 MHz |
-| Frame store | 4 MB SGRAM, 128-bit, 100 MHz, shared with Distira |
+| Frame store | 4 MB SGRAM, 128-bit, 100 MHz, dedicated to Margo |
 | Memory bandwidth | about 1.6 GB/s |
 | RAMDAC | 206 MHz, integrated |
 | 2D solid fill | up to about 200 Mpixels/s |
@@ -434,9 +436,9 @@ same memory. That coupling is approximated, not modeled exactly.
 
 ## 10. Distira (3D)
 
-Distira is the second half of VEGA: a fixed-function 3D rasterizer sharing the
-frame store and RAMDAC with Margo. Where Margo speaks a chipset-specific
-register interface, Distira speaks a compatible dialect of a real one: it
+Distira is the second half of VEGA: a fixed-function 3D rasterizer with its own
+framebuffer, texture stores, and 60 Hz scanout. Where Margo speaks a
+chipset-specific register interface, Distira follows a real one. It
 targets the same PCI, MMIO, framebuffer, and register contract as the 3dfx
 Voodoo Graphics generation (the SST-1 chipset), so period Glide-based
 software can find and drive it the way it drives real Voodoo hardware. This
@@ -503,17 +505,18 @@ formats DOS Glide 2.x software uses, and dithering.
 
 ### 10.4 Software status
 
-The device side is implemented in depth: the register, PCI, MMIO, LFB, and
-FIFO contracts are in place, and the rasterizer draws real triangles with
-depth, alpha, fog, chroma key, and textures. A hardware proof program
-(built from the same register sequence real Glide 2.x uses, but written
-directly against the SST-1 registers rather than through the Glide library)
-exercises the device end to end as a regression check.
+The register, PCI, MMIO, LFB, and texture-aperture contracts are in place, and
+the rasterizer draws triangles with depth, alpha, fog, chroma key, and textures.
+A direct SST-1 proof program exercises the device end to end as a regression
+check.
 
-What does not exist yet is a guest driver: no DOS Glide 2.x driver ships or
-has been written for Distira. A game that expects to load `GLIDE2X.OVL` and
-call into it has nothing to load. Driver work is in the planning stage,
-scoped against the real DOS Glide 2.x source to make sure the eventual
-driver's initialization sequence and register use match what Distira already
-answers. Until that lands, Distira is a card the hardware can see and probe,
-not yet one a Glide game can render through.
+Both DOS Glide linking models are verified in-game:
+
+- **Static:** the original Voodoo Graphics Tomb Raider executable detects
+  Distira and renders in-game. Its Glide implementation is built into the
+  executable, so no emulator-provided `GLIDE2X.OVL` is involved.
+- **Dynamic:** Carmageddon detects Distira and renders in-game with a locally
+  supplied Glide 2.48 `GLIDE2X.OVL`.
+
+IzarraVM ships neither proprietary Glide binaries nor game data. Local OVLs
+and games remain untracked test fixtures.
