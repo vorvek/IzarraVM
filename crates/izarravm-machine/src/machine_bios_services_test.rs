@@ -1606,6 +1606,18 @@ fn cms_probe_range_reads_open_bus_not_a_fault() {
 }
 
 #[test]
+fn upper_dma_page_register_aliases_the_canonical_register() {
+    let mut m = int15_machine(16);
+    let mut bus = m.make_bus();
+    assert_eq!(bus.read_io(0x0099, BusWidth::Byte, 0, false).unwrap(), 0);
+    bus.write_io(0x0099, BusWidth::Byte, 0x88, false).unwrap();
+    assert_eq!(bus.read_io(0x0099, BusWidth::Byte, 0, false).unwrap(), 0x88);
+    assert_eq!(bus.read_io(0x0089, BusWidth::Byte, 0, false).unwrap(), 0x88);
+    bus.write_io(0x0089, BusWidth::Byte, 0x42, false).unwrap();
+    assert_eq!(bus.read_io(0x0099, BusWidth::Byte, 0, false).unwrap(), 0x42);
+}
+
+#[test]
 fn vmware_backdoor_probe_reads_open_bus_not_a_fault() {
     // Port 0x5658 is the VMware backdoor detection port: real VMware sets
     // EAX/EBX/ECX/EDX on `IN EAX, DX` (DX=0x5658, EAX='VMXh'); real,
