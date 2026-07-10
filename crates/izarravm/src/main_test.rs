@@ -3,6 +3,19 @@
 
 use super::*;
 
+fn munt_test_dir(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-munt-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
 #[test]
 fn cli_parses_munt_roms_and_stable_external_port_identity() {
     let cli = Cli::try_parse_from([
@@ -61,6 +74,68 @@ fn saved_midi_preferences_fill_only_keys_absent_from_cli_and_toml() {
     assert_eq!(config.external_port, saved.external_port);
     assert_eq!(config.mt32_control_rom, saved.mt32_control_rom);
     assert_eq!(config.mt32_pcm_rom, saved.mt32_pcm_rom);
+}
+
+#[test]
+fn munt_discovery_is_case_insensitive_and_prefers_mt32() {
+    let dir = munt_test_dir("prefer-mt32");
+    let mt_control = dir.join("mt32_control.rom");
+    let mt_pcm = dir.join("Mt32_Pcm.Rom");
+    for name in [
+        &mt_control,
+        &mt_pcm,
+        &dir.join("CM32L_CONTROL.ROM"),
+        &dir.join("CM32L_PCM.ROM"),
+    ] {
+        std::fs::write(name, b"rom").unwrap();
+    }
+
+    let mut config = MidiConfig::default();
+    discover_munt_roms(&mut config, &dir);
+
+    assert_eq!(config.mt32_control_rom, Some(mt_control));
+    assert_eq!(config.mt32_pcm_rom, Some(mt_pcm));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn munt_discovery_uses_only_complete_pairs() {
+    let dir = munt_test_dir("complete-pairs");
+    std::fs::write(dir.join("MT32_CONTROL.ROM"), b"rom").unwrap();
+    let cm_control = dir.join("cm32l_control.rom");
+    let cm_pcm = dir.join("cm32l_pcm.rom");
+    std::fs::write(&cm_control, b"rom").unwrap();
+    std::fs::write(&cm_pcm, b"rom").unwrap();
+
+    let mut config = MidiConfig::default();
+    discover_munt_roms(&mut config, &dir);
+    assert_eq!(config.mt32_control_rom, Some(cm_control));
+    assert_eq!(config.mt32_pcm_rom, Some(cm_pcm.clone()));
+
+    std::fs::remove_file(cm_pcm).unwrap();
+    let mut incomplete = MidiConfig::default();
+    discover_munt_roms(&mut incomplete, &dir);
+    assert_eq!(incomplete.mt32_control_rom, None);
+    assert_eq!(incomplete.mt32_pcm_rom, None);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn munt_discovery_does_not_mix_with_configured_paths() {
+    let dir = munt_test_dir("configured-paths");
+    std::fs::write(dir.join("MT32_CONTROL.ROM"), b"rom").unwrap();
+    std::fs::write(dir.join("MT32_PCM.ROM"), b"rom").unwrap();
+    let explicit = PathBuf::from("custom-control.rom");
+    let mut config = MidiConfig {
+        mt32_control_rom: Some(explicit.clone()),
+        ..MidiConfig::default()
+    };
+
+    discover_munt_roms(&mut config, &dir);
+
+    assert_eq!(config.mt32_control_rom, Some(explicit));
+    assert_eq!(config.mt32_pcm_rom, None);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -220,6 +295,7 @@ fn c_root_path_lives_under_dot_izarravm_when_not_portable() {
         p.ends_with(std::path::Path::new(".izarravm").join("c_drive")),
         "default C: root should end with .izarravm/c_drive, got {p:?}"
     );
+    assert_eq!(p, state_dir_path().join("c_drive"));
 }
 
 #[test]

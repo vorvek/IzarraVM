@@ -1353,7 +1353,7 @@ struct ConfigDialog {
     pc_speaker_volume: u32,
     midi_backend: MidiBackend,
     external_midi_port: Option<MidiPortId>,
-    soundfont: String,
+    soundfont: Option<PathBuf>,
     mt32_control_rom: String,
     mt32_pcm_rom: String,
     midi_ports: Vec<MidiPortId>,
@@ -1387,6 +1387,12 @@ fn midi_backend_label(backend: MidiBackend) -> &'static str {
         MidiBackend::External => "External MIDI",
         MidiBackend::Munt => "Munt (MT-32)",
     }
+}
+
+fn munt_roms_available(control: &str, pcm: &str) -> bool {
+    [control, pcm]
+        .into_iter()
+        .all(|path| Path::new(path.trim()).is_file())
 }
 
 fn midi_port_label(port: &MidiPortId) -> String {
@@ -1426,6 +1432,30 @@ fn midi_path_picker(
             *text = path.to_string_lossy().into_owned();
         }
     });
+}
+
+fn soundfont_picker(ui: &mut egui::Ui, soundfont: &mut Option<PathBuf>) {
+    ui.label("P300 SoundFont");
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(soundfont.is_none(), "FluidR3Mono GM (Internal)")
+            .clicked()
+        {
+            *soundfont = None;
+        }
+        if ui
+            .selectable_label(soundfont.is_some(), "External...")
+            .clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("SoundFont", &["sf2", "sf3"])
+                .pick_file()
+        {
+            *soundfont = Some(path);
+        }
+    });
+    if let Some(path) = soundfont {
+        ui.small(format!("External: {}", path.display()));
+    }
 }
 
 impl GuiApp {
@@ -2060,7 +2090,7 @@ impl GuiApp {
             pc_speaker_volume: self.pc_speaker_volume,
             midi_backend: self.midi_config.backend,
             external_midi_port: self.midi_config.external_port.clone(),
-            soundfont: path_text(self.midi_config.soundfont.as_ref()),
+            soundfont: self.midi_config.soundfont.clone(),
             mt32_control_rom: path_text(self.midi_config.mt32_control_rom.as_ref()),
             mt32_pcm_rom: path_text(self.midi_config.mt32_pcm_rom.as_ref()),
             midi_ports: MidiEngine::external_ports(),
@@ -2205,14 +2235,7 @@ impl GuiApp {
                             ui.label("P300 wavetable output");
                             ui.label("FluidSynth");
                         });
-                        midi_path_picker(
-                            ui,
-                            "Custom SoundFont",
-                            &mut dialog.soundfont,
-                            "SoundFont",
-                            &["sf2", "sf3"],
-                            "Embedded FluidR3Mono",
-                        );
+                        soundfont_picker(ui, &mut dialog.soundfont);
                         let wavetable_color = if wavetable_status == MidiStatus::Ready {
                             INK
                         } else {
@@ -2220,9 +2243,16 @@ impl GuiApp {
                         };
                         ui.colored_label(wavetable_color, midi_status_text(wavetable_status));
                         ui.add_space(6.0);
+                        let munt_ready =
+                            munt_roms_available(&dialog.mt32_control_rom, &dialog.mt32_pcm_rom);
+                        let munt_label = if munt_ready {
+                            "Munt (MT-32)"
+                        } else {
+                            "Munt (MT-32) (missing ROMs)"
+                        };
                         let receiver_label = match dialog.midi_backend {
                             MidiBackend::Off => midi_backend_label(MidiBackend::Off).to_owned(),
-                            MidiBackend::Munt => midi_backend_label(MidiBackend::Munt).to_owned(),
+                            MidiBackend::Munt => munt_label.to_owned(),
                             MidiBackend::External => dialog
                                 .external_midi_port
                                 .as_ref()
@@ -2239,11 +2269,13 @@ impl GuiApp {
                                         MidiBackend::Off,
                                         midi_backend_label(MidiBackend::Off),
                                     );
-                                    ui.selectable_value(
-                                        &mut dialog.midi_backend,
-                                        MidiBackend::Munt,
-                                        midi_backend_label(MidiBackend::Munt),
-                                    );
+                                    ui.add_enabled_ui(munt_ready, |ui| {
+                                        ui.selectable_value(
+                                            &mut dialog.midi_backend,
+                                            MidiBackend::Munt,
+                                            munt_label,
+                                        );
+                                    });
                                     for port in &dialog.midi_ports {
                                         let selected = dialog.midi_backend == MidiBackend::External
                                             && dialog.external_midi_port.as_ref() == Some(port);
@@ -2260,7 +2292,7 @@ impl GuiApp {
                         if dialog.midi_ports.is_empty() {
                             ui.small("No host MIDI destination ports were found.");
                         }
-                        if dialog.midi_backend == MidiBackend::Munt {
+                        if dialog.midi_backend == MidiBackend::Munt || !munt_ready {
                             midi_path_picker(
                                 ui,
                                 "MT-32 control ROM",
@@ -2335,7 +2367,7 @@ impl GuiApp {
         let midi_config = MidiConfig {
             backend: dialog.midi_backend,
             external_port: dialog.external_midi_port.clone(),
-            soundfont: optional_path(&dialog.soundfont),
+            soundfont: dialog.soundfont.clone(),
             mt32_control_rom: optional_path(&dialog.mt32_control_rom),
             mt32_pcm_rom: optional_path(&dialog.mt32_pcm_rom),
         };
