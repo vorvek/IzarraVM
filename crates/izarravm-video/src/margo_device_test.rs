@@ -19,6 +19,7 @@ fn reports_identity_caps_and_display() {
 #[test]
 fn disp_start_is_writable_byte_by_byte() {
     let mut margo = Margo::default();
+    margo.set_mode_640x480x8();
     // Distinct values in every lane prove the byte recombination, not just
     // a single shift.
     margo.write_mmio_u8(REG_DISP_START, 0x01);
@@ -26,6 +27,25 @@ fn disp_start_is_writable_byte_by_byte() {
     margo.write_mmio_u8(REG_DISP_START + 2, 0x03);
     margo.write_mmio_u8(REG_DISP_START + 3, 0x04);
     assert_eq!(read_reg_u32(&margo, REG_DISP_START), 0x0403_0201);
+    assert_eq!(margo.display().start, 0, "scanout keeps the active latch");
+    assert!(margo.display_start_pending());
+    margo.advance_frames(1);
+    assert_eq!(margo.display().start, 0x0403_0201);
+    assert!(!margo.display_start_pending());
+}
+
+#[test]
+fn checked_display_start_requires_a_complete_visible_page() {
+    let mut margo = Margo::default();
+    margo.set_mode_640x480x8();
+    let page = 640usize * 480;
+
+    assert!(margo.program_display_start(page as u32));
+    assert!(margo.display_start_pending());
+    assert!(!margo.program_display_start((MARGO_VRAM_SIZE - page + 1) as u32));
+
+    margo.advance_frames(1);
+    assert_eq!(margo.display().start, page as u32);
 }
 
 #[test]

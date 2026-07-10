@@ -7,6 +7,7 @@ use crate::timing::PIT_INPUT_HZ;
 
 const MICROSECOND_HZ: u64 = 1_000_000;
 const NANOSECOND_HZ: u64 = 1_000_000_000;
+pub(crate) const MARGO_FRAME_HZ: u64 = 60;
 const DISTIRA_LINE_HZ: u64 = 525 * 60;
 
 const fn saturating_u64(value: u128) -> u64 {
@@ -79,6 +80,7 @@ pub(crate) struct DeviceAdvance {
     pub cd_frames: u64,
     pub rtc_seconds: u64,
     pub margo_nanoseconds: u64,
+    pub margo_frames: u64,
     pub distira_lines: u64,
     pub vga_dots: u64,
 }
@@ -88,6 +90,7 @@ pub(crate) enum DeviceClock {
     Pit,
     Dsp,
     Wss,
+    MargoFrame,
     Vga,
 }
 
@@ -106,6 +109,7 @@ pub(crate) struct Timeline {
     cd: RatePhase,
     rtc: RatePhase,
     margo: RatePhase,
+    margo_frame: RatePhase,
     distira: RatePhase,
     vga: RatePhase,
 }
@@ -123,6 +127,7 @@ impl Timeline {
             cd: RatePhase::default(),
             rtc: RatePhase::default(),
             margo: RatePhase::default(),
+            margo_frame: RatePhase::default(),
             distira: RatePhase::default(),
             vga: RatePhase::default(),
         }
@@ -186,6 +191,7 @@ impl Timeline {
                 .advance(master_ticks, if rates.cd_playing { 75 } else { 0 }),
             rtc_seconds: self.rtc.advance(master_ticks, 1),
             margo_nanoseconds: self.margo.advance(master_ticks, NANOSECOND_HZ),
+            margo_frames: self.margo_frame.advance(master_ticks, MARGO_FRAME_HZ),
             distira_lines: self.distira.advance(master_ticks, DISTIRA_LINE_HZ),
             vga_dots: self.vga.advance(master_ticks, rates.vga_dot_hz),
         }
@@ -232,6 +238,7 @@ impl Timeline {
             DeviceClock::Pit => self.pit,
             DeviceClock::Dsp => self.dsp,
             DeviceClock::Wss => self.wss,
+            DeviceClock::MargoFrame => self.margo_frame,
             DeviceClock::Vga => self.vga,
         };
         phase.ticks_until(events, rate_hz)

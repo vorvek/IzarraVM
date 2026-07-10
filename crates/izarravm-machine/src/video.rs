@@ -2003,6 +2003,7 @@ impl Machine {
             0x01 => self.vbe_mode_info(),
             0x02 => self.vbe_set_mode(),
             0x03 => self.vbe_current_mode(),
+            0x07 => self.vbe_display_start(),
             _ => {}
         }
     }
@@ -2061,6 +2062,55 @@ impl Machine {
         let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
         self.cpu.registers.set_ebx(ebx);
         self.set_vbe_status(0x004f);
+    }
+
+    fn vbe_display_start(&mut self) {
+        if !self.margo_active {
+            self.set_vbe_status(0x014f);
+            return;
+        }
+
+        match self.cpu.registers.ebx() as u8 {
+            0x00 | 0x80 => {
+                let display = self.margo.display();
+                let x = self.cpu.registers.ecx() as u16;
+                let y = self.cpu.registers.edx() as u16;
+                let depth = bytes_per_pixel(display.bpp);
+                let start = u64::from(y)
+                    .saturating_mul(u64::from(display.pitch))
+                    .saturating_add(u64::from(x).saturating_mul(u64::from(depth)));
+                if u32::from(x) >= display.width
+                    || start > u64::from(u32::MAX)
+                    || !self.margo.program_display_start(start as u32)
+                {
+                    self.set_vbe_status(0x014f);
+                    return;
+                }
+                if self.cpu.registers.ebx() as u8 == 0x80 {
+                    self.stall_until_margo_frame();
+                }
+                self.set_vbe_status(0x004f);
+            }
+            0x01 => {
+                let display = self.margo.display();
+                let depth = bytes_per_pixel(display.bpp).max(1);
+                let (x, y) = if display.pitch == 0 {
+                    (0, 0)
+                } else {
+                    (
+                        (display.start % display.pitch) / depth,
+                        display.start / display.pitch,
+                    )
+                };
+                self.cpu
+                    .registers
+                    .set_ebx(self.cpu.registers.ebx() & !0xff00);
+                self.cpu.registers.set_ecx(x);
+                self.cpu.registers.set_edx(y);
+                self.set_vbe_status(0x004f);
+            }
+            _ => self.set_vbe_status(0x014f),
+        }
     }
 
     /// Real-mode `ES:DI` of the caller's info block, as a physical address.

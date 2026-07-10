@@ -525,7 +525,7 @@ fn int10_10h_selects_and_reports_dac_color_pages() {
 }
 
 #[test]
-fn overlay_color_key_gates_on_the_primary_pixel() {
+pub(super) fn overlay_color_key_gates_on_the_primary_pixel() {
     let mut machine = test_machine();
     machine.margo_mut().set_mode(0x14a); // 640x480x32, pitch 2560
     // Primary at (10, 20) holds the key; (11, 20) holds an occluding window pixel.
@@ -564,7 +564,7 @@ fn overlay_color_key_gates_on_the_primary_pixel() {
 }
 
 #[test]
-fn overlay_yuy2_composites_through_the_apertures() {
+pub(super) fn overlay_yuy2_composites_through_the_apertures() {
     let mut machine = test_machine();
     machine.margo_mut().set_mode(0x14a); // 640x480x32
     // One YUY2 group offscreen (2 MiB in, past the 32bpp visible surface):
@@ -697,7 +697,7 @@ fn overlay_yv12_chroma_traversal_addresses_each_cell() {
 }
 
 #[test]
-fn pusher_runs_a_fill_packet_from_the_ring() {
+pub(super) fn pusher_runs_a_fill_packet_from_the_ring() {
     let mut machine = test_machine();
     // A command ring in system RAM that issues one FILL: a 2x2 rect of 0xAB at
     // (x=1, y=1) on a depth-1 surface, pitch 8, base 0. Mirrors the guide's
@@ -1291,7 +1291,7 @@ fn overlay_quantizes_to_16bpp_display_without_dither() {
 }
 
 #[test]
-fn overlay_orders_dither_on_a_16bpp_display() {
+pub(super) fn overlay_orders_dither_on_a_16bpp_display() {
     let mut machine = test_machine();
     machine.margo_mut().set_mode(0x111); // 640x480x16
     let src = 0x0010_0000u32;

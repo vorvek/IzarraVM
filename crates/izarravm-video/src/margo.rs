@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
 //! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
 //! LINE, and PATTERN_FILL, all with full ROP3 and rectangle clipping, plus a
@@ -490,6 +493,8 @@ fn pattern(vram: &mut [u8], p: &PatternParams) -> u64 {
 pub struct Margo {
     vram: Vec<u8>,
     display: MargoDisplay,
+    display_start_latch: u32,
+    display_start_pending: bool,
     control: u32,
     blit: [u32; BLIT_REGS],
     command: u32,
@@ -506,6 +511,8 @@ impl Default for Margo {
         Self {
             vram: vec![0; MARGO_VRAM_SIZE],
             display: MargoDisplay::default(),
+            display_start_latch: 0,
+            display_start_pending: false,
             control: 0,
             blit: [0; BLIT_REGS],
             command: 0,
@@ -537,7 +544,39 @@ impl Margo {
             pitch: mode.width * bytes_per_pixel(mode.bpp),
             start: 0,
         };
+        self.display_start_latch = 0;
+        self.display_start_pending = false;
         true
+    }
+
+    /// Queue a display origin for the next 60 Hz frame boundary. VBE callers use
+    /// this checked path; direct MMIO writes retain the hardware's raw register
+    /// behavior and may program an off-store address.
+    pub fn program_display_start(&mut self, start: u32) -> bool {
+        if !self.display_start_available(start) {
+            return false;
+        }
+        self.display_start_latch = start;
+        self.display_start_pending = true;
+        true
+    }
+
+    pub fn display_start_available(&self, start: u32) -> bool {
+        let visible_bytes = u64::from(self.display.pitch) * u64::from(self.display.height);
+        visible_bytes > 0
+            && u64::from(start).saturating_add(visible_bytes) <= self.vram.len() as u64
+    }
+
+    pub fn display_start_pending(&self) -> bool {
+        self.display_start_pending
+    }
+
+    /// Apply a queued display origin when one or more frame boundaries elapsed.
+    pub fn advance_frames(&mut self, frames: u64) {
+        if frames > 0 && self.display_start_pending {
+            self.display.start = self.display_start_latch;
+            self.display_start_pending = false;
+        }
     }
 
     pub fn set_mode_640x480x8(&mut self) {
@@ -833,7 +872,7 @@ impl Margo {
             REG_DISP_HEIGHT => self.display.height,
             REG_DISP_BPP => self.display.bpp,
             REG_DISP_PITCH => self.display.pitch,
-            REG_DISP_START => self.display.start,
+            REG_DISP_START => self.display_start_latch,
             reg if (CURSOR_BASE..CURSOR_BASE + CURSOR_REGS * 4).contains(&reg) => {
                 self.cursor[(reg - CURSOR_BASE) / 4]
             }
@@ -910,8 +949,9 @@ impl Margo {
             return;
         }
         if reg == REG_DISP_START {
-            let slot = &mut self.display.start;
+            let slot = &mut self.display_start_latch;
             *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            self.display_start_pending = true;
         }
     }
 
