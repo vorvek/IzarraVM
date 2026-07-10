@@ -462,9 +462,8 @@ fn w_buffer_mode_orders_depth_by_nearer_reciprocal_w() {
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
-    // A small 1/w (0.01, register units are 14.18-scale like the S/T
-    // texture coordinates the W wire format shares): far away.
-    write_reg(&mut distira, SST_START_W, 164);
+    // A small 1/w (0.01 in signed 2.30 fixed point): far away.
+    write_reg(&mut distira, SST_START_W, 10_737_418);
     write_reg(&mut distira, SST_DW_DX, 0);
     write_reg(&mut distira, SST_DW_DY, 0);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
@@ -482,7 +481,7 @@ fn w_buffer_mode_orders_depth_by_nearer_reciprocal_w() {
     write_reg(&mut distira, SST_START_R, 0);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
     // A larger 1/w (0.5): nearer. Must win and overwrite the far red triangle.
-    write_reg(&mut distira, SST_START_W, 8192);
+    write_reg(&mut distira, SST_START_W, 536_870_912);
     write_reg(&mut distira, SST_DW_DX, 0);
     write_reg(&mut distira, SST_DW_DY, 0);
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);

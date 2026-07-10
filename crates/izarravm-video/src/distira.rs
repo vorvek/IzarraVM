@@ -11,10 +11,15 @@ use std::collections::VecDeque;
 mod ncc;
 mod raster_math;
 mod registers;
+mod texture_raster;
 
 use ncc::NccState;
 use raster_math::*;
 pub use registers::*;
+use texture_raster::{
+    TextureIteratorState, TextureRaster, TextureSample, texture_base_slot, texture_dimensions,
+    texture_mip_offset,
+};
 
 const CONTROL_DITHER: u32 = 1 << 1;
 const STATUS_DISPLAY_ENABLED: u32 = 1 << 1;
@@ -139,9 +144,7 @@ pub struct Distira {
     triangle_alpha: u32,
     triangle_alpha_dx: u32,
     triangle_alpha_dy: u32,
-    triangle_tex_coord: [u32; 3],
-    triangle_tex_coord_dx: [u32; 3],
-    triangle_tex_coord_dy: [u32; 3],
+    texture_iterators: TextureIteratorState,
     ftriangle_vertices: [(u32, u32); 3],
     ftriangle_color: [u32; 3],
     ftriangle_color_dx: [u32; 3],
@@ -152,9 +155,6 @@ pub struct Distira {
     ftriangle_alpha: u32,
     ftriangle_alpha_dx: u32,
     ftriangle_alpha_dy: u32,
-    ftriangle_tex_coord: [u32; 3],
-    ftriangle_tex_coord_dx: [u32; 3],
-    ftriangle_tex_coord_dy: [u32; 3],
     fbi_pixels_in: u32,
     fbi_chroma_fail: u32,
     fbi_zfunc_fail: u32,
@@ -265,9 +265,7 @@ impl Distira {
             triangle_alpha: 0x00ff_0000,
             triangle_alpha_dx: 0,
             triangle_alpha_dy: 0,
-            triangle_tex_coord: [0; 3],
-            triangle_tex_coord_dx: [0; 3],
-            triangle_tex_coord_dy: [0; 3],
+            texture_iterators: TextureIteratorState::default(),
             ftriangle_vertices: [(0, 0); 3],
             ftriangle_color: [0; 3],
             ftriangle_color_dx: [0; 3],
@@ -278,9 +276,6 @@ impl Distira {
             ftriangle_alpha: f32::to_bits(255.0),
             ftriangle_alpha_dx: 0,
             ftriangle_alpha_dy: 0,
-            ftriangle_tex_coord: [0; 3],
-            ftriangle_tex_coord_dx: [0; 3],
-            ftriangle_tex_coord_dy: [0; 3],
             fbi_pixels_in: 0,
             fbi_chroma_fail: 0,
             fbi_zfunc_fail: 0,
@@ -585,17 +580,23 @@ impl Distira {
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
-        self.draw_triangle_inner(vertices, None)
+        self.draw_triangle_inner(vertices, None, None)
     }
 
-    fn draw_triangle_with_depth(&mut self, vertices: [DistiraVertex; 3], depths: [f32; 3]) -> u64 {
-        self.draw_triangle_inner(vertices, Some(depths))
+    fn draw_triangle_with_depth(
+        &mut self,
+        vertices: [DistiraVertex; 3],
+        depths: [f32; 3],
+        texture: TextureRaster,
+    ) -> u64 {
+        self.draw_triangle_inner(vertices, Some(depths), Some(texture))
     }
 
     fn draw_triangle_inner(
         &mut self,
         vertices: [DistiraVertex; 3],
         depths: Option<[f32; 3]>,
+        texture: Option<TextureRaster>,
     ) -> u64 {
         let [a, b, c] = vertices;
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
@@ -614,6 +615,7 @@ impl Distira {
             max_y = max_y.min(self.clip_high_y);
         }
 
+        let affine_lods = [self.texture_lod, self.texture_lod_tmu1];
         let mut written = 0;
         for y in min_y..max_y {
             for x in min_x..max_x {
@@ -647,18 +649,28 @@ impl Distira {
                 let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
                 let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
-                let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
-                let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
+                let texture_samples = if let Some(texture) = texture {
+                    texture.samples(px, py)
+                } else {
+                    let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
+                    let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
+                    std::array::from_fn(|tmu| TextureSample::affine(s, t, affine_lods[tmu]))
+                };
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
                 let alocal = self.alpha_local_source(alpha, depth_raw);
-                let texture_alpha = self.texture_alpha_factor(s, t);
-                let aother = self.texture_alpha_or_source(alpha, s, t);
+                let texture_alpha = self.texture_alpha_factor(texture_samples[0]);
+                let aother = self.texture_alpha_or_source(alpha, texture_samples[0]);
                 if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
                     continue;
                 }
 
-                let (r, g, blue) =
-                    self.texture_color_or_source((x, y), (r, g, blue), alocal, aother, (s, t));
+                let (r, g, blue) = self.texture_color_or_source(
+                    (x, y),
+                    (r, g, blue),
+                    alocal,
+                    aother,
+                    texture_samples,
+                );
                 let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
@@ -1029,6 +1041,13 @@ impl Distira {
         if self.ncc.write_register(chip, voodoo_reg, byte, value) {
             return;
         }
+        if reg < DISTIRA_REG_ID
+            && self
+                .texture_iterators
+                .write_register(chip, voodoo_reg, byte, value)
+        {
+            return;
+        }
         match reg {
             SST_INTR_CTRL => merge_byte(&mut self.intr_ctrl, byte, value),
             SST_VERTEX_AX => merge_vertex_component(&mut self.triangle_vertices[0].0, byte, value),
@@ -1042,25 +1061,16 @@ impl Distira {
             SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
             SST_START_Z => merge_byte(&mut self.triangle_depth, byte, value),
             SST_START_A => merge_color_component(&mut self.triangle_alpha, byte, value),
-            SST_START_S => merge_byte(&mut self.triangle_tex_coord[0], byte, value),
-            SST_START_T => merge_byte(&mut self.triangle_tex_coord[1], byte, value),
-            SST_START_W => merge_byte(&mut self.triangle_tex_coord[2], byte, value),
             SST_DR_DX => merge_color_component(&mut self.triangle_color_dx[0], byte, value),
             SST_DG_DX => merge_color_component(&mut self.triangle_color_dx[1], byte, value),
             SST_DB_DX => merge_color_component(&mut self.triangle_color_dx[2], byte, value),
             SST_DZ_DX => merge_byte(&mut self.triangle_depth_dx, byte, value),
             SST_DA_DX => merge_color_component(&mut self.triangle_alpha_dx, byte, value),
-            SST_DS_DX => merge_byte(&mut self.triangle_tex_coord_dx[0], byte, value),
-            SST_DT_DX => merge_byte(&mut self.triangle_tex_coord_dx[1], byte, value),
-            SST_DW_DX => merge_byte(&mut self.triangle_tex_coord_dx[2], byte, value),
             SST_DR_DY => merge_color_component(&mut self.triangle_color_dy[0], byte, value),
             SST_DG_DY => merge_color_component(&mut self.triangle_color_dy[1], byte, value),
             SST_DB_DY => merge_color_component(&mut self.triangle_color_dy[2], byte, value),
             SST_DZ_DY => merge_byte(&mut self.triangle_depth_dy, byte, value),
             SST_DA_DY => merge_color_component(&mut self.triangle_alpha_dy, byte, value),
-            SST_DS_DY => merge_byte(&mut self.triangle_tex_coord_dy[0], byte, value),
-            SST_DT_DY => merge_byte(&mut self.triangle_tex_coord_dy[1], byte, value),
-            SST_DW_DY => merge_byte(&mut self.triangle_tex_coord_dy[2], byte, value),
             SST_TRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
                     self.run_triangle_command();
@@ -1110,21 +1120,6 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_alpha, byte, value);
                 self.triangle_alpha = float_color_to_fixed(self.ftriangle_alpha);
             }
-            SST_FSTART_S => {
-                merge_byte(&mut self.ftriangle_tex_coord[0], byte, value);
-                self.triangle_tex_coord[0] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord[0]);
-            }
-            SST_FSTART_T => {
-                merge_byte(&mut self.ftriangle_tex_coord[1], byte, value);
-                self.triangle_tex_coord[1] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord[1]);
-            }
-            SST_FSTART_W => {
-                merge_byte(&mut self.ftriangle_tex_coord[2], byte, value);
-                self.triangle_tex_coord[2] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord[2]);
-            }
             SST_FDR_DX => {
                 merge_byte(&mut self.ftriangle_color_dx[0], byte, value);
                 self.triangle_color_dx[0] = float_color_to_fixed(self.ftriangle_color_dx[0]);
@@ -1145,21 +1140,6 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_alpha_dx, byte, value);
                 self.triangle_alpha_dx = float_color_to_fixed(self.ftriangle_alpha_dx);
             }
-            SST_FDS_DX => {
-                merge_byte(&mut self.ftriangle_tex_coord_dx[0], byte, value);
-                self.triangle_tex_coord_dx[0] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dx[0]);
-            }
-            SST_FDT_DX => {
-                merge_byte(&mut self.ftriangle_tex_coord_dx[1], byte, value);
-                self.triangle_tex_coord_dx[1] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dx[1]);
-            }
-            SST_FDW_DX => {
-                merge_byte(&mut self.ftriangle_tex_coord_dx[2], byte, value);
-                self.triangle_tex_coord_dx[2] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dx[2]);
-            }
             SST_FDR_DY => {
                 merge_byte(&mut self.ftriangle_color_dy[0], byte, value);
                 self.triangle_color_dy[0] = float_color_to_fixed(self.ftriangle_color_dy[0]);
@@ -1179,21 +1159,6 @@ impl Distira {
             SST_FDA_DY => {
                 merge_byte(&mut self.ftriangle_alpha_dy, byte, value);
                 self.triangle_alpha_dy = float_color_to_fixed(self.ftriangle_alpha_dy);
-            }
-            SST_FDS_DY => {
-                merge_byte(&mut self.ftriangle_tex_coord_dy[0], byte, value);
-                self.triangle_tex_coord_dy[0] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dy[0]);
-            }
-            SST_FDT_DY => {
-                merge_byte(&mut self.ftriangle_tex_coord_dy[1], byte, value);
-                self.triangle_tex_coord_dy[1] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dy[1]);
-            }
-            SST_FDW_DY => {
-                merge_byte(&mut self.ftriangle_tex_coord_dy[2], byte, value);
-                self.triangle_tex_coord_dy[2] =
-                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dy[2]);
             }
             SST_FTRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
@@ -1435,13 +1400,14 @@ impl Distira {
             (aperture_offset >> 1) & 0xfc
         };
         let t = (aperture_offset >> 9) & 0xff;
-        let (width, _) = self.texture_dimensions_for_lod(tmu, lod);
+        let lod_reg = self.texture_lod_for_tmu(tmu);
+        let (width, _) = texture_dimensions(lod_reg, lod);
         let row_offset = t
             .saturating_mul(width)
             .saturating_add(s)
             .saturating_mul(bytes_per_texel);
         let offset = (self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, bytes_per_texel))
+            .saturating_add(texture_mip_offset(lod_reg, lod, bytes_per_texel))
             .saturating_add(row_offset);
         Some((tmu, offset & (DISTIRA_TEX_SIZE - 1)))
     }
@@ -1963,17 +1929,14 @@ impl Distira {
             .triangle_vertices
             .map(|(x, y)| (fixed_vertex_to_f32(x), fixed_vertex_to_f32(y)));
         let (origin_x, origin_y) = coords[0];
+        let texture = self.texture_iterators.raster(
+            [self.texture_mode, self.texture_mode_tmu1],
+            [self.texture_lod, self.texture_lod_tmu1],
+            (origin_x, origin_y),
+        );
         let depths = if self.fbz_mode & FBZ_W_BUFFER != 0 {
             coords.map(|(x, y)| {
-                let w = fixed_texture_coord_at(
-                    self.triangle_tex_coord[2],
-                    self.triangle_tex_coord_dx[2],
-                    self.triangle_tex_coord_dy[2],
-                    x,
-                    y,
-                    origin_x,
-                    origin_y,
-                );
+                let w = self.texture_iterators.fbi_w_at(x, y, origin_x, origin_y);
                 // wfloat_depth already returns the same "raw, pre depth_to_u16
                 // divide-by-4096" units fixed_depth_at produces for Z, so both
                 // paths feed the shared depth_to_u16 conversion unchanged.
@@ -2031,26 +1994,10 @@ impl Distira {
                 origin_x,
                 origin_y,
             ),
-            s: fixed_texture_coord_at(
-                self.triangle_tex_coord[0],
-                self.triangle_tex_coord_dx[0],
-                self.triangle_tex_coord_dy[0],
-                x,
-                y,
-                origin_x,
-                origin_y,
-            ),
-            t: fixed_texture_coord_at(
-                self.triangle_tex_coord[1],
-                self.triangle_tex_coord_dx[1],
-                self.triangle_tex_coord_dy[1],
-                x,
-                y,
-                origin_x,
-                origin_y,
-            ),
+            s: 0.0,
+            t: 0.0,
         });
-        let written = self.draw_triangle_with_depth(vertices, depths) as u32;
+        let written = self.draw_triangle_with_depth(vertices, depths, texture) as u32;
         self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
         self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(written);
     }
@@ -2126,10 +2073,9 @@ impl Distira {
         source: (u8, u8, u8),
         alocal: u8,
         aother: u8,
-        texture_coords: (f32, f32),
+        samples: [TextureSample; 2],
     ) -> (u8, u8, u8) {
         let (r, g, b) = source;
-        let (s, t) = texture_coords;
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
             return source;
         }
@@ -2165,11 +2111,19 @@ impl Distira {
                 ) {
                     return (r, g, b);
                 }
-                let tmu0 = self.apply_texture_detail_blend(0, self.sample_tmu_texture(0, s, t));
+                let tmu0 = self.apply_texture_detail_blend(
+                    0,
+                    self.sample_tmu_texture(0, samples[0]),
+                    samples[0].lod,
+                );
                 if self.texture_mode & (1 << 18) != 0
                     && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
                 {
-                    let tmu1 = self.apply_texture_detail_blend(1, self.sample_tmu_texture(1, s, t));
+                    let tmu1 = self.apply_texture_detail_blend(
+                        1,
+                        self.sample_tmu_texture(1, samples[1]),
+                        samples[1].lod,
+                    );
                     (
                         tmu0.0.saturating_add(tmu1.0),
                         tmu0.1.saturating_add(tmu1.1),
@@ -2180,8 +2134,8 @@ impl Distira {
                 }
             }
         };
-        let texture_alpha = self.sample_tmu_alpha(0, s, t);
-        let texture_rgb = self.sample_tmu_texture(0, s, t);
+        let texture_alpha = self.sample_tmu_alpha(0, samples[0]);
+        let texture_rgb = self.sample_tmu_texture(0, samples[0]);
         let color = self.apply_color_path_local_combine(
             selected,
             source,
@@ -2316,14 +2270,18 @@ impl Distira {
         )
     }
 
-    fn apply_texture_detail_blend(&self, tmu: usize, color: (u8, u8, u8)) -> (u8, u8, u8) {
+    fn apply_texture_detail_blend(
+        &self,
+        tmu: usize,
+        color: (u8, u8, u8),
+        lod: u32,
+    ) -> (u8, u8, u8) {
         let mode = self.texture_mode_for_tmu(tmu);
         let mselect = (mode >> TC_MSELECT_SHIFT) & TC_MSELECT_MASK;
         if mode & TC_ADD_CLOCAL == 0 || mselect != TC_MSELECT_DETAIL {
             return color;
         }
 
-        let lod = self.texture_lod_level(tmu);
         let factor = self.texture_detail_factor(tmu, lod);
         (
             detail_blend_channel(color.0, factor),
@@ -2340,12 +2298,12 @@ impl Distira {
         ((bias - lod as i32) << scale).clamp(0, max).min(255) as u8
     }
 
-    fn texture_alpha_or_source(&self, alpha: u8, s: f32, t: f32) -> u8 {
+    fn texture_alpha_or_source(&self, alpha: u8, sample: TextureSample) -> u8 {
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
             return alpha;
         }
         match (self.fbz_color_path >> FBZCP_A_SELECT_SHIFT) & FBZCP_A_SELECT_MASK {
-            A_SELECT_TEX => self.sample_tmu_alpha(0, s, t),
+            A_SELECT_TEX => self.sample_tmu_alpha(0, sample),
             A_SELECT_COLOR1 => (self.color1 >> 24) as u8,
             _ => alpha,
         }
@@ -2362,11 +2320,11 @@ impl Distira {
         }
     }
 
-    fn texture_alpha_factor(&self, s: f32, t: f32) -> u8 {
+    fn texture_alpha_factor(&self, sample: TextureSample) -> u8 {
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
             0xff
         } else {
-            self.sample_tmu_alpha(0, s, t)
+            self.sample_tmu_alpha(0, sample)
         }
     }
 
@@ -2404,51 +2362,51 @@ impl Distira {
         alpha
     }
 
-    fn sample_tmu_alpha(&self, tmu: usize, s: f32, t: f32) -> u8 {
+    fn sample_tmu_alpha(&self, tmu: usize, sample: TextureSample) -> u8 {
         match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
-            TEX_A8 => self.sample_tmu_u8(tmu, s, t),
-            TEX_AI8 => expand4(self.sample_tmu_u8(tmu, s, t) >> 4),
+            TEX_A8 => self.sample_tmu_u8(tmu, sample),
+            TEX_AI8 => expand4(self.sample_tmu_u8(tmu, sample) >> 4),
             TEX_ARGB8332 | TEX_A8Y4I2Q2 | TEX_A8I8 | TEX_APAL88 => {
-                (self.sample_tmu_u16(tmu, s, t) >> 8) as u8
+                (self.sample_tmu_u16(tmu, sample) >> 8) as u8
             }
             TEX_ARGB1555 => {
-                if self.sample_tmu_u16(tmu, s, t) & 0x8000 != 0 {
+                if self.sample_tmu_u16(tmu, sample) & 0x8000 != 0 {
                     0xff
                 } else {
                     0
                 }
             }
-            TEX_ARGB4444 => expand4((self.sample_tmu_u16(tmu, s, t) >> 12) as u8),
+            TEX_ARGB4444 => expand4((self.sample_tmu_u16(tmu, sample) >> 12) as u8),
             _ => 0xff,
         }
     }
 
-    fn sample_tmu_texture(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+    fn sample_tmu_texture(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
         match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
-            TEX_RGB332 => self.sample_tmu_rgb332(tmu, s, t),
-            TEX_Y4I2Q2 => self.sample_tmu_yiq_ncc(tmu, s, t),
-            TEX_A8 => self.sample_tmu_a8(tmu, s, t),
-            TEX_I8 => self.sample_tmu_i8(tmu, s, t),
-            TEX_AI8 => self.sample_tmu_ai44(tmu, s, t),
-            TEX_PAL8 => self.sample_tmu_pal8(tmu, s, t),
-            TEX_APAL8 => self.sample_tmu_apal8(tmu, s, t),
-            TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, s, t),
-            TEX_A8Y4I2Q2 => self.sample_tmu_a8_yiq_ncc(tmu, s, t),
-            TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
-            TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
-            TEX_ARGB4444 => self.sample_tmu_argb4444(tmu, s, t),
-            TEX_A8I8 => self.sample_tmu_ai88(tmu, s, t),
-            TEX_APAL88 => self.sample_tmu_apal88(tmu, s, t),
+            TEX_RGB332 => self.sample_tmu_rgb332(tmu, sample),
+            TEX_Y4I2Q2 => self.sample_tmu_yiq_ncc(tmu, sample),
+            TEX_A8 => self.sample_tmu_a8(tmu, sample),
+            TEX_I8 => self.sample_tmu_i8(tmu, sample),
+            TEX_AI8 => self.sample_tmu_ai44(tmu, sample),
+            TEX_PAL8 => self.sample_tmu_pal8(tmu, sample),
+            TEX_APAL8 => self.sample_tmu_apal8(tmu, sample),
+            TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, sample),
+            TEX_A8Y4I2Q2 => self.sample_tmu_a8_yiq_ncc(tmu, sample),
+            TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, sample),
+            TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, sample),
+            TEX_ARGB4444 => self.sample_tmu_argb4444(tmu, sample),
+            TEX_A8I8 => self.sample_tmu_ai88(tmu, sample),
+            TEX_APAL88 => self.sample_tmu_apal88(tmu, sample),
             _ => (0, 0, 0),
         }
     }
 
-    fn sample_tmu_rgb332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let lod = self.texture_lod_level(tmu);
+    fn sample_tmu_rgb332(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let TextureSample { s, t, lod } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
-        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
+        let (width, height) = texture_dimensions(lod_reg, lod);
         let s = texture_coord_index(
             s / scale,
             width,
@@ -2463,7 +2421,7 @@ impl Distira {
         );
         let texel = t * width + s;
         let offset = ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, 1))
+            .saturating_add(texture_mip_offset(lod_reg, lod, 1))
             .saturating_add(texel))
             & (DISTIRA_TEX_SIZE - 1);
         let Some(&raw) = self.texture[tmu].get(offset) else {
@@ -2472,13 +2430,13 @@ impl Distira {
         expand_rgb332(raw)
     }
 
-    fn sample_tmu_yiq_ncc(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u8(tmu, s, t);
+    fn sample_tmu_yiq_ncc(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u8(tmu, sample);
         self.ncc_color(tmu, raw)
     }
 
-    fn sample_tmu_a8_yiq_ncc(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u16(tmu, s, t) as u8;
+    fn sample_tmu_a8_yiq_ncc(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u16(tmu, sample) as u8;
         self.ncc_color(tmu, raw)
     }
 
@@ -2487,64 +2445,64 @@ impl Distira {
         self.ncc.color(tmu, table, raw)
     }
 
-    fn sample_tmu_a8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u8(tmu, s, t);
+    fn sample_tmu_a8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u8(tmu, sample);
         (raw, raw, raw)
     }
 
-    fn sample_tmu_ai44(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let intensity = expand4(self.sample_tmu_u8(tmu, s, t));
+    fn sample_tmu_ai44(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let intensity = expand4(self.sample_tmu_u8(tmu, sample));
         (intensity, intensity, intensity)
     }
 
-    fn sample_tmu_ai88(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let intensity = self.sample_tmu_u16(tmu, s, t) as u8;
+    fn sample_tmu_ai88(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let intensity = self.sample_tmu_u16(tmu, sample) as u8;
         (intensity, intensity, intensity)
     }
 
-    fn sample_tmu_pal8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+    fn sample_tmu_pal8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
         let raw = self
             .ncc
-            .palette(tmu, usize::from(self.sample_tmu_u8(tmu, s, t)));
+            .palette(tmu, usize::from(self.sample_tmu_u8(tmu, sample)));
         ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
     }
 
-    fn sample_tmu_apal8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+    fn sample_tmu_apal8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
         expand_apal8(
             self.ncc
-                .palette(tmu, usize::from(self.sample_tmu_u8(tmu, s, t))),
+                .palette(tmu, usize::from(self.sample_tmu_u8(tmu, sample))),
         )
     }
 
-    fn sample_tmu_apal88(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let index = (self.sample_tmu_u16(tmu, s, t) & 0xff) as usize;
+    fn sample_tmu_apal88(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let index = (self.sample_tmu_u16(tmu, sample) & 0xff) as usize;
         let raw = self.ncc.palette(tmu, index);
         ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
     }
 
-    fn sample_tmu_argb8332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        expand_rgb332(self.sample_tmu_u16(tmu, s, t) as u8)
+    fn sample_tmu_argb8332(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        expand_rgb332(self.sample_tmu_u16(tmu, sample) as u8)
     }
 
-    fn sample_tmu_argb1555(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        expand_rgb555(self.sample_tmu_u16(tmu, s, t))
+    fn sample_tmu_argb1555(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        expand_rgb555(self.sample_tmu_u16(tmu, sample))
     }
 
-    fn sample_tmu_argb4444(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        expand_rgb444(self.sample_tmu_u16(tmu, s, t))
+    fn sample_tmu_argb4444(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        expand_rgb444(self.sample_tmu_u16(tmu, sample))
     }
 
-    fn sample_tmu_i8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let raw = self.sample_tmu_u8(tmu, s, t);
+    fn sample_tmu_i8(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u8(tmu, sample);
         (raw, raw, raw)
     }
 
-    fn sample_tmu_u8(&self, tmu: usize, s: f32, t: f32) -> u8 {
-        let lod = self.texture_lod_level(tmu);
+    fn sample_tmu_u8(&self, tmu: usize, sample: TextureSample) -> u8 {
+        let TextureSample { s, t, lod } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
-        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
+        let (width, height) = texture_dimensions(lod_reg, lod);
         let s = texture_coord_index(
             s / scale,
             width,
@@ -2559,18 +2517,18 @@ impl Distira {
         );
         let texel = t * width + s;
         let offset = ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, 1))
+            .saturating_add(texture_mip_offset(lod_reg, lod, 1))
             .saturating_add(texel))
             & (DISTIRA_TEX_SIZE - 1);
         self.texture[tmu].get(offset).copied().unwrap_or(0)
     }
 
-    fn sample_tmu_u16(&self, tmu: usize, s: f32, t: f32) -> u16 {
-        let lod = self.texture_lod_level(tmu);
+    fn sample_tmu_u16(&self, tmu: usize, sample: TextureSample) -> u16 {
+        let TextureSample { s, t, lod } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
-        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
+        let (width, height) = texture_dimensions(lod_reg, lod);
         let s = texture_coord_index(
             s / scale,
             width,
@@ -2585,7 +2543,7 @@ impl Distira {
         );
         let texel = (t * width + s).saturating_mul(2);
         let offset = ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
-            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, 2))
+            .saturating_add(texture_mip_offset(lod_reg, lod, 2))
             .saturating_add(texel))
             & (DISTIRA_TEX_SIZE - 1);
         u16::from_le_bytes([
@@ -2594,17 +2552,17 @@ impl Distira {
         ])
     }
 
-    fn sample_tmu_rgb565(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
-        let lod = self.texture_lod_level(tmu);
+    fn sample_tmu_rgb565(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
+        let TextureSample { s, t, lod } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
         let s = s / scale;
         let t = t / scale;
         let base_addr = self.tex_base_addr_for_tmu_lod(tmu, lod);
-        let mip_offset = self.texture_mip_offset_for_lod(tmu, lod, 2);
-        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
-        let sample = TmuTextureSample {
+        let mip_offset = texture_mip_offset(lod_reg, lod, 2);
+        let (width, height) = texture_dimensions(lod_reg, lod);
+        let texture_sample = TmuTextureSample {
             tmu,
             width,
             height,
@@ -2614,7 +2572,7 @@ impl Distira {
             lod_reg,
         };
         if mode & 0x6 != 0 {
-            return self.bilinear_rgb565(s, t, sample);
+            return self.bilinear_rgb565(s, t, texture_sample);
         }
         let s = texture_coord_index(
             s,
@@ -2628,7 +2586,7 @@ impl Distira {
             mode & TEXTUREMODE_TCLAMPT != 0,
             lod_reg & LOD_TMIRROR_T != 0,
         ) as i32;
-        self.sample_rgb565_texel(s, t, sample)
+        self.sample_rgb565_texel(s, t, texture_sample)
     }
 
     fn bilinear_rgb565(&self, s: f32, t: f32, sample: TmuTextureSample) -> (u8, u8, u8) {
@@ -2691,30 +2649,6 @@ impl Distira {
         }
     }
 
-    fn texture_lod_level(&self, tmu: usize) -> u32 {
-        let lod = self.texture_lod_for_tmu(tmu);
-        let min_lod = ((lod >> 2) & 0xf).min(8);
-        let max_lod = ((lod >> 8) & 0xf).min(8);
-        if max_lod == 0 {
-            min_lod
-        } else {
-            min_lod.min(max_lod)
-        }
-    }
-
-    fn texture_dimensions_for_lod(&self, tmu: usize, lod: u32) -> (usize, usize) {
-        let lod_reg = self.texture_lod_for_tmu(tmu);
-        let aspect = ((lod_reg >> 21) & 0x3) as usize;
-        let mut width = (256_usize >> lod).max(1);
-        let mut height = (256_usize >> lod).max(1);
-        if lod_reg & LOD_S_IS_WIDER != 0 {
-            height = (height >> aspect).max(1);
-        } else {
-            width = (width >> aspect).max(1);
-        }
-        (width, height)
-    }
-
     fn tex_base_addr_for_tmu(&self, tmu: usize) -> u32 {
         let value = if tmu == 0 {
             self.tex_base_addr
@@ -2726,32 +2660,11 @@ impl Distira {
 
     fn tex_base_addr_for_tmu_lod(&self, tmu: usize, lod: u32) -> u32 {
         let lod_reg = self.texture_lod_for_tmu(tmu);
-        if lod_reg & LOD_TMULTIBASEADDR == 0 {
-            return self.tex_base_addr_for_tmu(tmu);
-        }
-        let base_lod = if lod_reg & (LOD_SPLIT | LOD_ODD) == (LOD_SPLIT | LOD_ODD) && lod == 0 {
-            1
-        } else {
-            lod
-        };
-        match base_lod {
+        match texture_base_slot(lod_reg, lod) {
             0 => self.tex_base_addr_for_tmu(tmu),
             1 => (self.tex_base_addr1[tmu] & 0x0007_ffff) << 3,
             2 => (self.tex_base_addr2[tmu] & 0x0007_ffff) << 3,
             _ => (self.tex_base_addr38[tmu] & 0x0007_ffff) << 3,
-        }
-    }
-
-    fn texture_mip_offset_for_lod(&self, tmu: usize, lod: u32, bytes_per_texel: usize) -> usize {
-        if self.texture_lod_for_tmu(tmu) & LOD_TMULTIBASEADDR != 0 {
-            0
-        } else {
-            (0..lod)
-                .map(|level| {
-                    let (width, height) = self.texture_dimensions_for_lod(tmu, level);
-                    width * height * bytes_per_texel
-                })
-                .sum()
         }
     }
 

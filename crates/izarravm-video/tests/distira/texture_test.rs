@@ -46,7 +46,7 @@ fn triangle_cmd_uses_s_texture_gradient_for_nearest_rgb565_sampling() {
     const SST_TEX_BASE_ADDR: usize = 0x30c;
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
     const TEX_R5G6B5: u32 = 0x0a;
-    const TEX_COORD_ONE: u32 = 1 << 14;
+    const TEX_COORD_ONE: u32 = 1 << 18;
 
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
@@ -129,7 +129,7 @@ fn triangle_cmd_bilinear_filters_rgb565_texels() {
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
     const TEX_R5G6B5: u32 = 0x0a;
     const TEXTUREMODE_BILINEAR_FILTER: u32 = 0x2;
-    const TEX_COORD_HALF: u32 = 1 << 13;
+    const TEX_COORD_HALF: u32 = 1 << 17;
 
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
@@ -172,13 +172,14 @@ fn triangle_cmd_selects_rgb565_mip_level_from_tlod_min() {
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
     const TEX_R5G6B5: u32 = 0x0a;
     const LOD1_MIN: u32 = 1 << 2;
+    const LOD1_MAX: u32 = 1 << 8;
     const RGB565_LOD1_APERTURE: usize = 1 << 17;
 
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
     distira.clear_back_rgb(0, 0, 0);
     write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(&mut distira, SST_TLOD, LOD1_MIN);
+    write_reg(&mut distira, SST_TLOD, LOD1_MIN | LOD1_MAX);
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     assert!(distira.queue_texture_write_u32(0, 0xf800_f800));
     assert!(distira.queue_texture_write_u32(RGB565_LOD1_APERTURE, 0x07e0_07e0));
@@ -187,7 +188,7 @@ fn triangle_cmd_selects_rgb565_mip_level_from_tlod_min() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
     write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(&mut distira, SST_TLOD, LOD1_MIN);
+    write_reg(&mut distira, SST_TLOD, LOD1_MIN | LOD1_MAX);
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
@@ -259,6 +260,7 @@ fn triangle_cmd_selects_rgb565_multibase_lod_address() {
     const SST_TEX_BASE_ADDR1: usize = 0x310;
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
     const LOD1_MIN: u32 = 1 << 2;
+    const LOD1_MAX: u32 = 1 << 8;
     const LOD_TMULTIBASEADDR: u32 = 1 << 24;
     const TEX_R5G6B5: u32 = 0x0a;
     const RGB565_LOD1_APERTURE: usize = 1 << 17;
@@ -267,7 +269,11 @@ fn triangle_cmd_selects_rgb565_multibase_lod_address() {
     distira.set_frame_size(4, 4);
     distira.clear_back_rgb(0, 0, 0);
     write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(&mut distira, SST_TLOD, LOD1_MIN | LOD_TMULTIBASEADDR);
+    write_reg(
+        &mut distira,
+        SST_TLOD,
+        LOD1_MIN | LOD1_MAX | LOD_TMULTIBASEADDR,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_TEX_BASE_ADDR1, 1);
     assert!(distira.queue_texture_write_u32(0, 0x001f_001f));
@@ -277,7 +283,11 @@ fn triangle_cmd_selects_rgb565_multibase_lod_address() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
     write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(&mut distira, SST_TLOD, LOD1_MIN | LOD_TMULTIBASEADDR);
+    write_reg(
+        &mut distira,
+        SST_TLOD,
+        LOD1_MIN | LOD1_MAX | LOD_TMULTIBASEADDR,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_TEX_BASE_ADDR1, 1);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
@@ -304,6 +314,7 @@ fn triangle_cmd_selects_split_odd_multibase_lod_address() {
     const SST_TEX_BASE_ADDR: usize = 0x30c;
     const SST_TEX_BASE_ADDR1: usize = 0x310;
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const LOD1_MAX: u32 = 1 << 8;
     const LOD_ODD: u32 = 1 << 18;
     const LOD_SPLIT: u32 = 1 << 19;
     const LOD_TMULTIBASEADDR: u32 = 1 << 24;
@@ -316,11 +327,11 @@ fn triangle_cmd_selects_split_odd_multibase_lod_address() {
     write_reg(
         &mut distira,
         SST_TLOD,
-        LOD_SPLIT | LOD_ODD | LOD_TMULTIBASEADDR,
+        LOD1_MAX | LOD_SPLIT | LOD_ODD | LOD_TMULTIBASEADDR,
     );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_TEX_BASE_ADDR1, 1);
-    assert!(distira.queue_texture_write_u32(0, 0x07e0_07e0));
+    assert!(distira.queue_texture_write_u32(1 << 17, 0x07e0_07e0));
     distira.drain_fifo();
 
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
@@ -329,7 +340,7 @@ fn triangle_cmd_selects_split_odd_multibase_lod_address() {
     write_reg(
         &mut distira,
         SST_TLOD,
-        LOD_SPLIT | LOD_ODD | LOD_TMULTIBASEADDR,
+        LOD1_MAX | LOD_SPLIT | LOD_ODD | LOD_TMULTIBASEADDR,
     );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_TEX_BASE_ADDR1, 1);
@@ -361,7 +372,7 @@ fn triangle_cmd_applies_rgb565_s_wider_aspect_ratio() {
     const LOD_S_IS_WIDER: u32 = 1 << 20;
     const ASPECT_2_TO_1: u32 = 1 << 21;
     const TEX_R5G6B5: u32 = 0x0a;
-    const TEX_COORD_130: u32 = 130 << 14;
+    const TEX_COORD_130: u32 = 130 << 18;
 
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
@@ -466,7 +477,7 @@ fn triangle_cmd_clamps_rgb565_s_texture_coordinate() {
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
     const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
     const TEX_R5G6B5: u32 = 0x0a;
-    const TEX_COORD_300: u32 = 300 << 14;
+    const TEX_COORD_300: u32 = 300 << 18;
 
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
@@ -518,7 +529,7 @@ fn triangle_cmd_mirrors_rgb565_s_texture_coordinate() {
     const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
     const LOD_TMIRROR_S: u32 = 1 << 28;
     const TEX_R5G6B5: u32 = 0x0a;
-    const TEX_COORD_300: u32 = 300 << 14;
+    const TEX_COORD_300: u32 = 300 << 18;
 
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
