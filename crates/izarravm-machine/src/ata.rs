@@ -172,9 +172,8 @@ pub struct AtaDisk {
     error: u8,
     /// INITIALIZE DEVICE PARAMETERS programs the logical sectors-per-track and
     /// heads the host wants to use for CHS translation. Defaults to the derived
-    /// geometry. Limit: stored but CHS reads use the derived geometry, so a
-    /// host that reprograms a nonstandard translation is not honored; lift by
-    /// routing chs_to_lba through these.
+    /// geometry. These values apply only to task-file CHS commands; INT 13h uses
+    /// the public derived geometry so the BIOS and shared medium stay stable.
     logical_sectors: u8,
     logical_heads: u8,
 
@@ -363,6 +362,20 @@ impl AtaDisk {
         Some((cyl * HEADS + head) * SECTORS_PER_TRACK + (sector - 1))
     }
 
+    fn task_file_chs_to_lba(&self, cyl: u32, head: u32, sector: u32) -> Option<u32> {
+        let heads = u32::from(self.logical_heads);
+        let sectors = u32::from(self.logical_sectors);
+        if heads == 0 || sectors == 0 || head >= heads || sector == 0 || sector > sectors {
+            return None;
+        }
+        let lba = cyl
+            .checked_mul(heads)?
+            .checked_add(head)?
+            .checked_mul(sectors)?
+            .checked_add(sector - 1)?;
+        (lba < self.total_sectors()).then_some(lba)
+    }
+
     /// Take the pending IRQ (the machine forwards it to the PIC). nIEN suppresses
     /// the forward, matching a channel with interrupts masked.
     pub fn take_irq(&mut self) -> bool {
@@ -495,7 +508,7 @@ impl AtaDisk {
             let cyl = u32::from(self.lba_mid) | (u32::from(self.lba_high) << 8);
             let head = u32::from(self.drive_head & 0x0F);
             let sector = u32::from(self.lba_low);
-            self.chs_to_lba(cyl, head, sector)?
+            self.task_file_chs_to_lba(cyl, head, sector)?
         };
         Some((lba, count))
     }

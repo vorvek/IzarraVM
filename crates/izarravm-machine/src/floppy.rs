@@ -8,6 +8,8 @@
 //! sectors-per-track. Wizardry III's booter is a 720 KB image, so hardcoding 18
 //! sectors per track would misread it.
 
+use izarravm_core::MASTER_CLOCK_HZ;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Geometry {
     pub cylinders: u16,
@@ -31,15 +33,15 @@ const SECTOR: usize = 512;
 
 /// One revolution at 300 RPM. Half of it is the average rotational latency: the
 /// wait for the target sector to come under the head after a seek.
-const REVOLUTION_SECS: f64 = 0.2;
+const REVOLUTION_TICKS: u64 = MASTER_CLOCK_HZ / 5;
 /// Head step time per cylinder, clamped so a full stroke lands in the period
 /// 3-100 ms seek envelope.
-const SEEK_PER_TRACK_SECS: f64 = 0.003;
-const SEEK_MAX_SECS: f64 = 0.100;
+const SEEK_PER_TRACK_TICKS: u64 = MASTER_CLOCK_HZ * 3 / 1_000;
+const SEEK_MAX_TICKS: u64 = MASTER_CLOCK_HZ / 10;
 /// Sustained transfer rate. High-density media (1.2/1.44 MB, 500 kbit/s) moves
 /// ~62.5 KB/s; double-density (360/720 KB, 250 kbit/s) is half that.
-const HD_BYTES_PER_SEC: f64 = 62_500.0;
-const DD_BYTES_PER_SEC: f64 = 31_250.0;
+const HD_BYTES_PER_SEC: u64 = 62_500;
+const DD_BYTES_PER_SEC: u64 = 31_250;
 
 /// Map a raw image length to a CHS geometry, or None for an unrecognized size.
 pub fn geometry_for(size: usize) -> Option<Geometry> {
@@ -109,27 +111,32 @@ impl Floppy {
         self.geom
     }
 
-    /// Emulated seconds an access at `target_cyl` moving `bytes` of data takes on
-    /// the real drive: seek from the tracked head position, plus the average
-    /// rotational latency when the head moved, plus the transfer time. Updates the
-    /// tracked position to `target_cyl`. `bytes` = 0 models a bare seek/recalibrate.
-    pub fn access_duration_secs(&mut self, target_cyl: u16, bytes: usize) -> f64 {
+    /// Master-clock ticks an access at `target_cyl` moving `bytes` of data takes:
+    /// seek from the tracked head position, average rotational latency when the
+    /// head moved, and transfer time. Updates the tracked position to
+    /// `target_cyl`. `bytes` = 0 models a bare seek or recalibrate.
+    pub fn access_duration_ticks(&mut self, target_cyl: u16, bytes: usize) -> u64 {
         let delta = (i32::from(target_cyl) - i32::from(self.current_cylinder)).unsigned_abs();
         self.current_cylinder = target_cyl;
         let (seek, latency) = if delta == 0 {
             // Same track: no step, and sequential sectors arrive without a fresh
             // rotational wait.
-            (0.0, 0.0)
+            (0, 0)
         } else {
-            let seek = (SEEK_PER_TRACK_SECS * f64::from(delta)).min(SEEK_MAX_SECS);
-            (seek, REVOLUTION_SECS / 2.0)
+            let seek = SEEK_PER_TRACK_TICKS
+                .saturating_mul(u64::from(delta))
+                .min(SEEK_MAX_TICKS);
+            (seek, REVOLUTION_TICKS / 2)
         };
         let rate = if self.geom.drive_type == 0x04 {
             HD_BYTES_PER_SEC
         } else {
             DD_BYTES_PER_SEC
         };
-        seek + latency + bytes as f64 / rate
+        let transfer = (bytes as u128 * u128::from(MASTER_CLOCK_HZ))
+            .div_ceil(u128::from(rate))
+            .min(u128::from(u64::MAX)) as u64;
+        seek.saturating_add(latency).saturating_add(transfer)
     }
 
     pub fn bytes(&self) -> &[u8] {

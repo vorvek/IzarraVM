@@ -286,7 +286,7 @@ fn storage_stall_advances_pit_audio_video_and_the_timeline() {
     let beam_before = machine.video().beam_dots();
     let pit_before = machine.pit.channel_out(2);
 
-    machine.stall_for(0.010);
+    machine.stall_for_master_ticks(izarravm_core::MASTER_CLOCK_HZ / 100);
 
     assert_eq!(
         machine.master_ticks() - ticks_before,

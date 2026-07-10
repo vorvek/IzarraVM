@@ -462,11 +462,11 @@ impl Machine {
             // AH=00 reset disk system: the heads recalibrate back to track 0,
             // which steps the drive and takes time.
             0x00 => {
-                let secs = self
+                let ticks = self
                     .floppy
                     .as_mut()
-                    .map_or(0.0, |f| f.access_duration_secs(0, 0));
-                self.stall_for(secs);
+                    .map_or(0, |f| f.access_duration_ticks(0, 0));
+                self.stall_for_master_ticks(ticks);
                 self.set_eax_ah(0x00);
                 self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
@@ -607,11 +607,11 @@ impl Machine {
             .unwrap_or(false);
         // Charge the seek to the formatted track plus a full-track write.
         let bytes = usize::from(geom.sectors) * 512;
-        let secs = self
+        let ticks = self
             .floppy
             .as_mut()
-            .map_or(0.0, |f| f.access_duration_secs(cyl, bytes));
-        self.stall_for(secs);
+            .map_or(0, |f| f.access_duration_ticks(cyl, bytes));
+        self.stall_for_master_ticks(ticks);
         if ok {
             self.set_eax_ah(0x00);
             self.set_disk_status(0x00);
@@ -694,11 +694,11 @@ impl Machine {
         // instead of completing instantly.
         if done > 0 {
             let bytes = usize::from(done) * 512;
-            let secs = self
+            let ticks = self
                 .floppy
                 .as_mut()
-                .map_or(0.0, |f| f.access_duration_secs(cyl, bytes));
-            self.stall_for(secs);
+                .map_or(0, |f| f.access_duration_ticks(cyl, bytes));
+            self.stall_for_master_ticks(ticks);
         }
 
         // The ROM BIOS boot path reads A: CHS 0/0/1 to 0000:7C00 with INT 13h,
