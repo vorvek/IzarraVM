@@ -21,6 +21,19 @@ fn slave_initialized(pic: &mut Pic8259Pair) {
     pic.write_port(0xa1, 0x01);
 }
 
+fn level_pair() -> Pic8259Pair {
+    let mut pic = Pic8259Pair::default();
+    pic.write_port(0x20, 0x19);
+    pic.write_port(0x21, 0x08);
+    pic.write_port(0x21, 0x04);
+    pic.write_port(0x21, 0x01);
+    pic.write_port(0xa0, 0x19);
+    pic.write_port(0xa1, 0x70);
+    pic.write_port(0xa1, 0x02);
+    pic.write_port(0xa1, 0x01);
+    pic
+}
+
 #[test]
 fn icw1_clears_mask_and_sets_ready() {
     let pic = master_initialized();
@@ -58,6 +71,83 @@ fn request_sets_irr_acknowledge_sets_isr() {
     assert_eq!(pic.master.isr, 0x01);
     pic.write_port(0x20, 0x0b); // OCW3: read ISR (D3=1, RR=1, RIS=1)
     assert_eq!(pic.read_port(0x20), Some(0x01));
+}
+
+#[test]
+fn held_master_level_reasserts_only_after_eoi() {
+    let mut pic = level_pair();
+    pic.set_irq_level(3, true);
+    assert_eq!(pic.acknowledge(), Some(0x0b));
+    assert_eq!(pic.master.irr & 0x08, 0);
+    assert_eq!(pic.master.isr & 0x08, 0x08);
+    assert!(!pic.interrupt_pending());
+
+    pic.write_port(0x20, 0x20);
+    assert_eq!(pic.master.isr & 0x08, 0);
+    assert_eq!(pic.master.irr & 0x08, 0x08);
+    assert!(pic.interrupt_pending());
+
+    pic.set_irq_level(3, false);
+    assert_eq!(pic.master.irr & 0x08, 0);
+}
+
+#[test]
+fn deasserted_master_level_does_not_return_after_eoi() {
+    let mut pic = level_pair();
+    pic.set_irq_level(4, true);
+    assert_eq!(pic.acknowledge(), Some(0x0c));
+    pic.set_irq_level(4, false);
+    pic.write_port(0x20, 0x20);
+    assert!(!pic.interrupt_pending());
+}
+
+#[test]
+fn edge_mode_still_requires_a_new_rising_edge() {
+    let mut pic = master_initialized();
+    pic.set_irq_level(3, true);
+    assert_eq!(pic.acknowledge(), Some(0x0b));
+    pic.write_port(0x20, 0x20);
+    assert!(!pic.interrupt_pending());
+    pic.set_irq_level(3, true);
+    assert!(!pic.interrupt_pending());
+    pic.set_irq_level(3, false);
+    pic.set_irq_level(3, true);
+    assert!(pic.interrupt_pending());
+}
+
+#[test]
+fn automatic_eoi_reasserts_a_held_level_after_acknowledge() {
+    let mut pic = Pic8259Pair::default();
+    pic.write_port(0x20, 0x19);
+    pic.write_port(0x21, 0x08);
+    pic.write_port(0x21, 0x04);
+    pic.write_port(0x21, 0x03);
+    pic.set_irq_level(5, true);
+    assert_eq!(pic.acknowledge(), Some(0x0d));
+    assert_eq!(pic.master.isr & 0x20, 0);
+    assert_eq!(pic.master.irr & 0x20, 0x20);
+    assert!(pic.interrupt_pending());
+}
+
+#[test]
+fn held_slave_level_reasserts_through_the_cascade() {
+    let mut pic = level_pair();
+    pic.set_irq_level(12, true);
+    assert_eq!(pic.acknowledge(), Some(0x74));
+    assert_eq!(pic.master.isr & 0x04, 0x04);
+    assert_eq!(pic.slave.isr & 0x10, 0x10);
+
+    pic.write_port(0xa0, 0x20);
+    assert_eq!(pic.slave.irr & 0x10, 0x10);
+    assert!(!pic.interrupt_pending());
+    pic.write_port(0x20, 0x20);
+    assert!(pic.interrupt_pending());
+    assert_eq!(pic.acknowledge(), Some(0x74));
+
+    pic.set_irq_level(12, false);
+    pic.write_port(0xa0, 0x20);
+    pic.write_port(0x20, 0x20);
+    assert!(!pic.interrupt_pending());
 }
 
 #[test]

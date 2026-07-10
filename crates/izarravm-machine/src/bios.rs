@@ -625,6 +625,7 @@ impl Machine {
                     // does this today.
                     self.keyboard.set_mouse_reporting(false);
                     self.keyboard.set_mouse_irq(false);
+                    self.pic.set_irq_level(12, false);
                 }
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
@@ -723,6 +724,7 @@ impl Machine {
     fn enable_pointing_device(&mut self) {
         self.keyboard.set_mouse_reporting(true);
         self.keyboard.set_mouse_irq(true);
+        self.pic.set_irq_level(12, self.keyboard.irq12_level());
         self.keyboard.enable_mouse_wheel();
         // Tell the BIOS ISR to assemble 4-byte packets. Same EBDA-base computation
         // the C207 handler uses for the handler pointer, at the packet-size offset.

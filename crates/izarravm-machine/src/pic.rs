@@ -1,14 +1,19 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Intel 8259A programmable interrupt controller, a master/slave cascade pair.
 //!
 //! Built clean-room from the Intel 8259A datasheet cached at
-//! dev_docs/reference/8259a/. Edge latched, 8086 vector mode. Priority order is
-//! rotatable through OCW2 (a per-controller lowest-priority pointer), and ICW4
-//! special fully nested mode is decoded and honored in the cascade decision.
+//! dev_docs/reference/8259a/. Edge and level triggering are supported in 8086
+//! vector mode. Priority order is rotatable through OCW2 (a per-controller
+//! lowest-priority pointer), and ICW4 special fully nested mode is decoded and
+//! honored in the cascade decision.
 
 /// One 8259A. The pair owns two of these plus the cascade routing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pic {
     irr: u8,               // interrupt request register (latched requests)
+    asserted: u8,          // current electrical level on each IR input
     isr: u8,               // in-service register
     imr: u8,               // interrupt mask register (1 = masked)
     icw2: u8,              // vector base; vector(irq) = (icw2 & 0xF8) | irq
@@ -16,7 +21,7 @@ pub(crate) struct Pic {
     init: InitStage,       // odd-port initialization sequence position
     expect_icw4: bool,     // ICW1 bit0 (IC4)
     single: bool,          // ICW1 bit1 (SNGL): skip ICW3
-    level_triggered: bool, // ICW1 bit3 (LTIM): level mode, stored only
+    level_triggered: bool, // ICW1 bit3 (LTIM)
     auto_eoi: bool,        // ICW4 bit1 (AEOI)
     buffered: bool,        // ICW4 bit3 (BUF), stored only
     is_master: bool,       // ICW4 bit2 (M/S) when buffered, stored only
@@ -43,7 +48,6 @@ impl Pic {
             // Command port (A0=0).
             if value & 0x10 != 0 {
                 // ICW1: master clear, then start the init sequence.
-                self.irr = 0;
                 self.isr = 0;
                 self.imr = 0;
                 self.read_isr = false;
@@ -53,9 +57,12 @@ impl Pic {
                 self.auto_rotate = false;
                 self.expect_icw4 = value & 0x01 != 0;
                 self.single = value & 0x02 != 0;
-                // Limit: LTIM is decoded and stored, but the request path stays
-                // edge-pulsed; level-triggered re-assertion is not modeled.
                 self.level_triggered = value & 0x08 != 0;
+                self.irr = if self.level_triggered {
+                    self.asserted
+                } else {
+                    0
+                };
                 self.init = InitStage::ExpectIcw2;
             } else if value & 0x08 != 0 {
                 // OCW3: read-register select, poll command, and special mask mode.
@@ -157,6 +164,34 @@ impl Pic {
         order
     }
 
+    fn request(&mut self, irq: u8) {
+        self.irr |= 1 << irq;
+    }
+
+    fn set_input_level(&mut self, irq: u8, asserted: bool) {
+        let bit = 1 << irq;
+        let was_asserted = self.asserted & bit != 0;
+        if asserted {
+            self.asserted |= bit;
+            if self.level_triggered || !was_asserted {
+                self.irr |= bit;
+            }
+        } else {
+            self.asserted &= !bit;
+            if self.level_triggered {
+                self.irr &= !bit;
+            }
+        }
+    }
+
+    fn clear_in_service(&mut self, irq: u8) {
+        let bit = 1 << irq;
+        self.isr &= !bit;
+        if self.level_triggered && self.asserted & bit != 0 {
+            self.irr |= bit;
+        }
+    }
+
     /// OCW2: end of interrupt and priority rotation. Bits 7-5 select the command,
     /// bits 2-0 name a level for the specific variants.
     fn end_of_interrupt(&mut self, ocw2: u8) {
@@ -167,16 +202,16 @@ impl Pic {
             // 001: non-specific EOI, clear the highest-priority in-service level.
             0b001 => {
                 if let Some(level) = self.highest_in_service() {
-                    self.isr &= !(1 << level);
+                    self.clear_in_service(level);
                 }
             }
             // 011: specific EOI, clear the named level.
-            0b011 => self.isr &= !(1 << level),
+            0b011 => self.clear_in_service(level),
             // 101: rotate on non-specific EOI. Clear the highest in-service level
             // and move it to lowest priority.
             0b101 => {
                 if let Some(level) = self.highest_in_service() {
-                    self.isr &= !(1 << level);
+                    self.clear_in_service(level);
                     self.lowest = level;
                 }
             }
@@ -185,7 +220,7 @@ impl Pic {
             // 111: rotate on specific EOI. Clear the named level and move it to
             // lowest priority.
             0b111 => {
-                self.isr &= !(1 << level);
+                self.clear_in_service(level);
                 self.lowest = level;
             }
             // 010: no-op.
@@ -237,7 +272,7 @@ impl Pic {
         self.isr |= bit;
         self.irr &= !bit;
         if self.auto_eoi {
-            self.isr &= !bit;
+            self.clear_in_service(irq);
             if self.auto_rotate {
                 // Rotate-in-automatic-EOI: the acknowledged level drops to lowest.
                 self.lowest = irq;
@@ -248,11 +283,9 @@ impl Pic {
 
 /// The master/slave 8259A pair. The slave's INT output drives one master IR pin,
 /// the one selected by the slave's ICW3 id, modeled by mirroring any slave request
-/// onto that master pin so the single-chip resolver handles both levels. The mirror
-/// is edge latched: a second slave request latched while another slave level is in
-/// service must be re-raised through `request`, because the master cascade bit is
-/// not held across its EOI. The PIT (IRQ0, master) does not exercise this; add a
-/// held slave INT line if a cascaded device needs it.
+/// onto that master pin so the single-chip resolver handles both levels. Pulsed
+/// requests retain the edge-latched path. Held inputs also drive the slave INT
+/// level through the cascade pin.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pic8259Pair {
     master: Pic,
@@ -263,7 +296,15 @@ impl Pic8259Pair {
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
         match port {
             0x20 | 0x21 => self.master.write_port(port, value),
-            0xa0 | 0xa1 => self.slave.write_port(port, value),
+            0xa0 | 0xa1 => {
+                let old_pin = self.slave.icw3 & 0x07;
+                self.slave.write_port(port, value);
+                let new_pin = self.slave.icw3 & 0x07;
+                if old_pin != new_pin {
+                    self.master.set_input_level(old_pin, false);
+                }
+                self.sync_cascade();
+            }
             _ => return false,
         }
         true
@@ -280,7 +321,11 @@ impl Pic8259Pair {
             }
             // The slave never owns a cascade pin of its own, so the plain fully
             // nested poll resolution applies.
-            0xa0 | 0xa1 => Some(self.slave.read_port(port, None)),
+            0xa0 | 0xa1 => {
+                let value = self.slave.read_port(port, None);
+                self.sync_cascade();
+                Some(value)
+            }
             _ => None,
         }
     }
@@ -333,15 +378,31 @@ impl Pic8259Pair {
     pub(crate) fn request(&mut self, irq: u8) {
         debug_assert!(irq < 16, "the PIC pair has 16 IRQ lines, got {irq}");
         if irq < 8 {
-            self.master.irr |= 1 << irq;
+            self.master.request(irq);
         } else if irq < 16 {
-            self.slave.irr |= 1 << (irq - 8);
+            self.slave.request(irq - 8);
             // The slave INT line is wired to the master IR pin named by the
             // slave's ICW3 id (bits 2-0); the AT default is master IR2.
             let cascade_pin = self.slave.icw3 & 0x07;
-            self.master.irr |= 1 << cascade_pin;
+            self.master.request(cascade_pin);
         }
         // irq >= 16 is not a PC interrupt line; ignore it in release builds.
+    }
+
+    pub(crate) fn set_irq_level(&mut self, irq: u8, asserted: bool) {
+        debug_assert!(irq < 16, "the PIC pair has 16 IRQ lines, got {irq}");
+        if irq < 8 {
+            self.master.set_input_level(irq, asserted);
+        } else if irq < 16 {
+            self.slave.set_input_level(irq - 8, asserted);
+            self.sync_cascade();
+        }
+    }
+
+    fn sync_cascade(&mut self) {
+        let cascade_pin = self.slave.icw3 & 0x07;
+        let asserted = self.slave.highest_pending(None).is_some();
+        self.master.set_input_level(cascade_pin, asserted);
     }
 
     /// The master cascade pin exempt from the fully nested block, or `None`. When
@@ -387,10 +448,14 @@ impl Pic8259Pair {
         match self.slave.highest_pending(None) {
             Some(slave_irq) => {
                 self.slave.set_in_service(slave_irq);
+                self.sync_cascade();
                 Some(self.slave.vector(slave_irq))
             }
             // The slave line dropped before INTA: spurious IR7, no slave ISR set.
-            None => Some(self.slave.vector(7)),
+            None => {
+                self.sync_cascade();
+                Some(self.slave.vector(7))
+            }
         }
     }
 }

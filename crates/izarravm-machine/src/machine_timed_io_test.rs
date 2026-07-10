@@ -42,6 +42,23 @@ fn initialize_pic(machine: &mut Machine, master_mask: u8, slave_mask: u8) {
     }
 }
 
+fn initialize_level_pic(machine: &mut Machine, master_mask: u8, slave_mask: u8) {
+    for (port, value) in [
+        (0x20, 0x19),
+        (0x21, 0x08),
+        (0x21, 0x04),
+        (0x21, 0x01),
+        (0xa0, 0x19),
+        (0xa1, 0x70),
+        (0xa1, 0x02),
+        (0xa1, 0x01),
+        (0x21, master_mask),
+        (0xa1, slave_mask),
+    ] {
+        out(machine, port, value);
+    }
+}
+
 fn enable_halt_wake(machine: &mut Machine, master_mask: u8, slave_mask: u8) {
     machine.cpu.registers.eflags |= 0x0200;
     initialize_pic(machine, master_mask, slave_mask);
@@ -225,4 +242,113 @@ fn halted_cpu_finishes_non_interrupting_uart_and_lpt_transfers() {
     assert_eq!(machine.lpt_output(), b"P");
     assert_eq!(machine.serial.ticks_until_event(), None);
     assert_eq!(machine.lpt.ticks_until_event(), None);
+}
+
+#[test]
+fn keyboard_deadline_is_exact_and_wakes_hlt_in_every_mode() {
+    for mode in ALL_MODES {
+        let mut machine = int15_machine(4);
+        machine.set_mode(mode);
+        enable_halt_wake(&mut machine, 0xfd, 0xff); // master IRQ1 only
+        machine.inject_key_scancodes(&[0x1e]);
+        let deadline = machine.keyboard.ticks_until_event().unwrap();
+        let expected = machine
+            .timeline
+            .cpu_clocks_for_master_ticks_ceil(deadline)
+            .max(1);
+        assert_eq!(
+            machine.next_timer_wake(machine.master_ticks() + deadline),
+            Some(expected),
+            "{mode:?}"
+        );
+
+        machine.advance_devices_ticks(deadline - 1);
+        assert!(!machine.pic.irr_bit(1), "early IRQ1 in {mode:?}");
+        assert_eq!(machine.read_io_port_u8(0x64) & 0x01, 0, "{mode:?}");
+        assert_eq!(
+            machine.event_batch_cap(u64::MAX),
+            machine.timeline.cpu_clocks_for_master_ticks_ceil(1).max(1),
+            "{mode:?}"
+        );
+        machine.advance_devices_ticks(1);
+        assert!(machine.pic.irr_bit(1), "missing IRQ1 in {mode:?}");
+        assert_eq!(machine.read_io_port_u8(0x60), 0x1e, "{mode:?}");
+    }
+}
+
+#[test]
+fn keyboard_deadline_keeps_master_time_across_a_live_mode_switch() {
+    let mut machine = int15_machine(4);
+    machine.set_mode(GswMode::Gsw586);
+    enable_halt_wake(&mut machine, 0xfd, 0xff);
+    machine.inject_key_scancodes(&[0x30]);
+    let deadline = machine.keyboard.ticks_until_event().unwrap();
+    machine.advance_devices_ticks(deadline / 3);
+    let remaining = machine.keyboard.ticks_until_event().unwrap();
+
+    machine.set_mode(GswMode::Gsw386Slow);
+    assert_eq!(machine.keyboard.ticks_until_event(), Some(remaining));
+    let expected = machine
+        .timeline
+        .cpu_clocks_for_master_ticks_ceil(remaining)
+        .max(1);
+    assert_eq!(
+        machine.next_timer_wake(machine.master_ticks() + remaining),
+        Some(expected)
+    );
+    machine.advance_devices_ticks(remaining - 1);
+    assert!(!machine.pic.irr_bit(1));
+    machine.advance_devices_ticks(1);
+    assert!(machine.pic.irr_bit(1));
+    assert_eq!(machine.read_io_port_u8(0x60), 0x30);
+}
+
+#[test]
+fn keyboard_precedes_aux_and_each_byte_keeps_its_wire_deadline() {
+    for mode in ALL_MODES {
+        let mut machine = int15_machine(4);
+        machine.set_mode(mode);
+        initialize_pic(&mut machine, 0xf9, 0xef); // IRQ1, cascade, and IRQ12
+        machine.keyboard.set_mouse_irq(true);
+        machine.keyboard.set_mouse_reporting(true);
+        machine.inject_mouse(4, -2, 0x01);
+        machine.inject_key_scancodes(&[0x2e]);
+
+        let keyboard_deadline = machine.keyboard.ticks_until_event().unwrap();
+        machine.advance_devices_ticks(keyboard_deadline);
+        assert!(machine.pic.irr_bit(1), "keyboard did not win in {mode:?}");
+        assert!(!machine.pic.irr_bit(12), "early AUX byte in {mode:?}");
+        assert_eq!(machine.read_io_port_u8(0x64) & 0x20, 0, "{mode:?}");
+        assert_eq!(machine.read_io_port_u8(0x60), 0x2e, "{mode:?}");
+        assert_eq!(machine.pic.acknowledge(), Some(0x09), "{mode:?}");
+        out(&mut machine, 0x20, 0x20);
+
+        let aux_deadline = machine.keyboard.ticks_until_event().unwrap();
+        machine.advance_devices_ticks(aux_deadline - 1);
+        assert!(!machine.pic.irr_bit(12), "early IRQ12 in {mode:?}");
+        machine.advance_devices_ticks(1);
+        assert!(machine.pic.irr_bit(12), "missing IRQ12 in {mode:?}");
+        assert_eq!(machine.read_io_port_u8(0x64) & 0x20, 0x20, "{mode:?}");
+    }
+}
+
+#[test]
+fn ltim_keyboard_request_stays_asserted_until_the_guest_reads_obf() {
+    let mut machine = int15_machine(4);
+    initialize_level_pic(&mut machine, 0xfd, 0xff);
+    machine.inject_key_scancodes(&[0x20]);
+    let deadline = machine.keyboard.ticks_until_event().unwrap();
+    machine.advance_devices_ticks(deadline);
+
+    assert_eq!(machine.pic.acknowledge(), Some(0x09));
+    out(&mut machine, 0x20, 0x20);
+    assert!(
+        machine.pic.irr_bit(1),
+        "EOI reasserts while the 8042 output line remains high"
+    );
+    assert_eq!(machine.read_io_port_u8(0x60), 0x20);
+    assert!(
+        !machine.pic.irr_bit(1),
+        "the port read deasserts the LTIM input in the same I/O cycle"
+    );
 }

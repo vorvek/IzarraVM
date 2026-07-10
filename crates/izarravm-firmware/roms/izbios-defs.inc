@@ -75,13 +75,12 @@
 %define SU_NVRAM_GSW 0x12
 
 ; Boot-device choice (segment 0 byte), written by the boot menu and read by
-; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives in the
-; free tail of the foundation BIOS_SCRATCH region (BLIT_* ends at 0x052D), so it
-; does not collide with the Stream D/C scratch areas. Defaults to floppy.
-%define BOOT_CHOICE    (BIOS_SCRATCH + 0x0e)   ; 0x052E
+; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives after
+; the BOX_* fields in the free tail of BIOS_SCRATCH. Defaults to floppy.
+%define BOOT_CHOICE    (BIOS_SCRATCH + 0x17)   ; 0x0537
 ; First POST hotkey latched from anywhere in diagnostics: 0 none, 1 Del/setup,
 ; 2 Tab/boot menu. First one wins.
-%define POST_HOTKEY    (BIOS_SCRATCH + 0x0f)   ; 0x052F
+%define POST_HOTKEY    (BIOS_SCRATCH + 0x18)   ; 0x0538
 %define POST_HOTKEY_SETUP 1
 %define POST_HOTKEY_BOOT  2
 
@@ -195,10 +194,8 @@
 ; keyboard-only menu.
 %define BMX_MOUSE 1
 
-; 8042 controller command-byte bits, as the machine model honors them
-; (keyboard.rs latch_next): bit 0 enables IRQ1 (keyboard), bit 1 enables IRQ12
-; (the mouse). There is no "disable mouse clock" bit in this model, so enabling
-; the mouse is just "set bit 1" on top of the keyboard's bit 0.
+; 8042 controller command-byte bits used by the BIOS: bit 0 enables IRQ1
+; (keyboard), and bit 1 enables IRQ12 (the mouse).
 %define KBC_CMD_IRQ1     0x01
 %define KBC_CMD_IRQ12    0x02
 ; 8042 commands the AUX path uses.
@@ -208,8 +205,9 @@
 ; PS/2 mouse device commands (sent through the 0xD4 prefix).
 %define PS2_ENABLE_REPORT 0xf4
 %define PS2_DISABLE_REPORT 0xf5
-; Status bits on port 0x64 (keyboard.rs STATUS_OBF / STATUS_AUX).
+; Status bits on port 0x64.
 %define KBC_STATUS_OBF   0x01      ; output buffer full (byte waiting on 0x60)
+%define KBC_STATUS_IBF   0x02      ; input buffer full (controller handling a write)
 %define KBC_STATUS_AUX   0x20      ; the latched byte came from the mouse
 
 ; Boxed-menu state block (segment 0, free 0x0800+ region, clear of BIOS_SCRATCH,
