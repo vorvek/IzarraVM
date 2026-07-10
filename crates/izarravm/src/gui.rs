@@ -1291,7 +1291,7 @@ pub struct GuiApp {
     // Whether the floating About window is open. The footer info button and the
     // window's own close control both flip this.
     show_about: bool,
-    // Whether the floating License (GPL-3.0) window is open. The About window's
+    // Whether the floating License (GPL-3.0-only) window is open. The About window's
     // "View license" button and the window's own close control flip this.
     show_license: bool,
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
@@ -2385,13 +2385,13 @@ impl GuiApp {
         self.show_com1 = open;
     }
 
-    /// The floating License window: the full GPL-3.0 text, black monospace on
+    /// The floating License window: the full GPL-3.0-only text, black monospace on
     /// white inside the shared beige chrome. Opened from the About window.
     fn license_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_license;
         beige_window(
             ctx,
-            "License (GPL-3.0)",
+            "License (GPL-3.0-only)",
             &mut open,
             true,
             [640.0, 520.0],
@@ -2445,7 +2445,7 @@ impl GuiApp {
                     ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
                     ui.label(
                         egui::RichText::new(
-                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0",
+                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0-only",
                         )
                         .color(MUTED)
                         .size(12.0),

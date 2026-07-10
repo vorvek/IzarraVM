@@ -45,7 +45,7 @@ reproduces the Izarra 3000 exactly as it was built.
 | --- | --- |
 | CPU | GSW-586, a Pentium MMX at 200 MHz on a 66 MHz bus. The BIOS or the bundled GSWMODE tool can throttle it to a 486DX2 at 66 MHz, a 386DX at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
 | Memory | 24 MB SDRAM, with Toka mapping itself out of conventional memory when DOS games need the first 640 KB. |
-| Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
+| Graphics | VEGA chipset: Margo 2D with a 4 MB frame store; Distira 3D with a 2 MB framebuffer and 2 MB per TMU; VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), OPL3 FM, MPU-401 MIDI, and wavetable daughterboard. |
 | Storage | 3.6 GB UDMA2 IDE hard disk on a PIIX4-compatible controller, 12x PIO ATAPI CD-ROM with CD audio, and a 1.44 MB floppy drive. |
 | Display | 15-inch CRT, up to 1024x768@75hz. |
@@ -99,4 +99,4 @@ cargo build --workspace
 
 ## License
 
-GNU GPL v3.0 (see [LICENSE](LICENSE)).
+GNU GPL version 3 only (`GPL-3.0-only`; see [LICENSE](LICENSE)).

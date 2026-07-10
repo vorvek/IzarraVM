@@ -2,7 +2,7 @@ IzarraVM bundles Toka-DOS, built from FreeDOS source (https://www.freedos.org/).
 FreeDOS kernel: © 1995-2012 Pasquale J. Villani and The FreeDOS Project, GPLv2-or-later.
 FreeCOM: © 1994-2005 Tim Norman and others, GPLv2-or-later.
 Modified by the Toka-DOS project (2026). Corresponding source: toka-dos/freedos/.
-Full license: GPL-3.0 (see LICENSE).
+Full license: GPL-3.0-only (see LICENSE).
 FreeDOS MOVE: © 1997-2002 Joe Cosentino, © 2003-2004 Imre Leber, GPLv2-or-later.
 FreeDOS SORT: © 1995 Jim Lynch, updated 2003-2004 Eric Auer, GPLv2-or-later.
 FreeDOS MEM: © 1997 Express Software / Joseph Cosentino, © 2001 Bart Oldeman,
@@ -33,6 +33,11 @@ libogg 1.3.6, libvorbis 1.3.7, FLAC 1.4.3, and Opus 1.5.2 use their BSD
 licenses. FluidSynth also uses GCEM under Apache-2.0. Exact sources, license
 notices, hashes, and relinking instructions are in
 crates/izarravm-native-synth/vendor. Roland ROMs are not distributed.
+The embedded FluidR3Mono_GM.sf3 SoundFont is distributed under the MIT
+license. Its upstream notice and provenance are in third_party/fluidr3mono.
+Host audio output uses cpal 0.15.3 under Apache-2.0. External MIDI output uses
+midir 0.10.4, Copyright (c) 2015 Patrick Reisert and the RtMidi contributors,
+under MIT. Exact license texts are in third_party/licenses.
 TOKAEMM.SYS (the XMS/UMB/EMS memory manager and V86 monitor) is a 386MAX
 adaptation: its VCPI 1.0 server and its V86 privileged-instruction emulation
 (the INT 67h AH=DEh handlers, the DE0C mode switch, and the MOV CRn/DRn /
