@@ -331,23 +331,21 @@ impl SbDsp {
                     }
                 }
             }
-            0x41 => {
+            0x41 if args.len() >= 2 => {
                 // Set sample rate in Hz, high byte then low byte (SB16). Unlike
                 // the time constant, this is already the per-channel rate for
                 // stereo (no channel-count pre-multiply), so it is not a byte
                 // rate and must not be halved for SB Pro stereo.
-                if args.len() >= 2 {
-                    self.rate_hz = (u32::from(args[0]) << 8) | u32::from(args[1]);
-                    self.rate_is_byte_rate = false;
-                }
+                self.rate_hz = (u32::from(args[0]) << 8) | u32::from(args[1]);
+                self.rate_is_byte_rate = false;
             }
-            0x48 => {
+            0x41 => {}
+            0x48 if args.len() >= 2 => {
                 // Set DSP block transfer size, low byte then high byte (n+1 bytes).
-                if args.len() >= 2 {
-                    let count = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
-                    self.block_size = count;
-                }
+                let count = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
+                self.block_size = count;
             }
+            0x48 => {}
             0x14 => {
                 if args.len() >= 2 {
                     self.block_size = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
