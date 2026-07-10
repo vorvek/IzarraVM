@@ -895,7 +895,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.dma.read_port(port) {
+        if let Some(value) = self.dma.read_port(dma_page_register_port(port)) {
             return Ok(u32::from(value));
         }
         if port == 0x00e0 {
@@ -945,7 +945,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         self.device_ports
-            .read_port(port)
+            .read_port(dma_page_register_port(port))
             .map(u32::from)
             .ok_or(BusError::UnsupportedPort { port })
     }
@@ -1100,7 +1100,10 @@ impl CpuBus for MachineBus<'_> {
         if self.dsp.write_port(port, value as u8) {
             return Ok(());
         }
-        if self.dma.write_port(port, value as u8) {
+        if self
+            .dma
+            .write_port(dma_page_register_port(port), value as u8)
+        {
             // The 8237A runs a memory-to-memory block transfer when the guest
             // arms a software DREQ on channel 0 (a write to the request register,
             // port 0x09) with mem-to-mem enabled in the command register. The
@@ -1178,7 +1181,9 @@ impl CpuBus for MachineBus<'_> {
             || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
             || self.keyboard.write_port(port, value as u8)
-            || self.device_ports.write_port(port, value as u8)
+            || self
+                .device_ports
+                .write_port(dma_page_register_port(port), value as u8)
         {
             Ok(())
         } else {
@@ -1392,7 +1397,7 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
     let ranges = [
         0x0000..=0x000f, // DMA controller 1
         0x0062..=0x0063, // system control port B (speaker now owns 0x61)
-        0x0080..=0x009f, // DMA page registers
+        0x0080..=0x008f, // DMA page registers
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
         0x0280..=0x028f, // C/MS Game Blaster alternate-base probe range (Prince of
@@ -1411,6 +1416,15 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
                          // CpuError("unsupported I/O port 0x5658") before this stub existed.
     ];
     ranges.into_iter().flatten()
+}
+
+/// PIIX4 DMAAC aliases the upper page-register window onto the IBM AT window.
+/// Port 92h remains the separate fast-A20 and reset control register.
+fn dma_page_register_port(port: u16) -> u16 {
+    match port {
+        0x0090..=0x009f if port != 0x0092 => port - 0x10,
+        _ => port,
+    }
 }
 
 impl MachineBus<'_> {
