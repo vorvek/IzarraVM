@@ -678,6 +678,7 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
     const ASSIGNED_BAR: u32 = 0xe600_0000;
     const ASSIGNED_TEX: u32 = ASSIGNED_BAR + 0x0080_0000;
     const LOD2: u32 = 2;
+    const LOD2_RANGE: u32 = (LOD2 << 2) | ((LOD2 << 2) << 6);
 
     let mut code = Vec::new();
     push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
@@ -689,7 +690,7 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
         ASSIGNED_BAR + SST_TEXTURE_MODE as u32,
         TEX_R5G6B5 << 8,
     );
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_TLOD as u32, LOD2 << 2);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_TLOD as u32, LOD2_RANGE);
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_TEX_BASE_ADDR as u32, 0);
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_TEX + (LOD2 << 17), 0x07e0_07e0);
 

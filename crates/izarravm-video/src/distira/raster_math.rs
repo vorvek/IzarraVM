@@ -63,20 +63,6 @@ fn fixed_color_value(raw: u32) -> f32 {
     sign_extend_24(raw) as f32 / 4096.0
 }
 
-pub(super) fn fixed_texture_coord_at(
-    start: u32,
-    dx: u32,
-    dy: u32,
-    x: f32,
-    y: f32,
-    origin_x: f32,
-    origin_y: f32,
-) -> f32 {
-    start as i32 as f32 / 16384.0
-        + dx as i32 as f32 / 16384.0 * (x - origin_x)
-        + dy as i32 as f32 / 16384.0 * (y - origin_y)
-}
-
 /// Convert an iterated 1/w value to the SST-1 W-buffer's 16-bit floating
 /// point depth code. This ports the *behavior* of 86Box's `vid_voodoo_render.c`
 /// wfloat encode (itself the real SST-1 hardware algorithm: a
@@ -154,10 +140,6 @@ pub(super) fn float_color_to_fixed(raw: u32) -> u32 {
 
 pub(super) fn float_depth_to_fixed(raw: u32) -> u32 {
     (f32::from_bits(raw) * 4096.0) as i32 as u32
-}
-
-pub(super) fn float_texture_coord_to_fixed(raw: u32) -> u32 {
-    (f32::from_bits(raw) * 16384.0) as i32 as u32
 }
 
 pub(super) fn signed_ncc_component(raw: u32, shift: u32) -> i32 {
