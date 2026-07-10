@@ -62,19 +62,6 @@ pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
 pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
-/// The freestanding Dhrystone 2.1 benchmark, built as a small-model DOS .EXE.
-/// It carries no C runtime: the records are static, the run count is fixed at
-/// 10000, and the result is a 16-bit self-check fold reported to the Lotura
-/// unit-tester device. Load it with `Machine::new_raw_program` and read the
-/// result back with `Machine::bench_iterations` (10000) and `bench_aux` (the
-/// fold). It is a .EXE rather than a .COM so the MZ relocations place its global
-/// variables in the data segment instead of overwriting the code.
-pub const DHRYSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/dhrystone.exe");
-/// The freestanding Whetstone double-precision FP benchmark .EXE: the floating-point
-/// oracle for the per-mode `fp_timing` factor. Same harness contract as Dhrystone
-/// (load with `Machine::new_raw_program`, read `bench_iterations` = the sweep count
-/// and `bench_aux` = the FP self-check fold). See roms/neurketa-c/whetstone.c.
-pub const WHETSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/whetstone.exe");
 /// A 512-byte boot sector that
 /// enters Virtual-8086 mode under a hand-built monitor and signals success through
 /// the unit-tester exit port. Run via `Machine::new_boot_image`.
@@ -330,14 +317,6 @@ pub fn tokaemm_sys() -> &'static [u8] {
 
 pub fn exehello_exe() -> &'static [u8] {
     EXEHELLO_EXE
-}
-
-pub fn dhrystone_exe() -> &'static [u8] {
-    DHRYSTONE_EXE
-}
-
-pub fn whetstone_exe() -> &'static [u8] {
-    WHETSTONE_EXE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
