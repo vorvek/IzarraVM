@@ -4,6 +4,11 @@
 use super::*;
 
 #[test]
+fn izarra_3000_defaults_to_its_586_persona() {
+    assert_eq!(MachineConfig::default().cpu, GswMode::Gsw586);
+}
+
+#[test]
 fn device_lines_are_returned_in_order_with_high_flag() {
     let lines = parse_device_lines(
         "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
