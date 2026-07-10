@@ -1028,25 +1028,6 @@ fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
 }
 
 #[test]
-fn isa_gate_exempt_decodes_are_never_cached() {
-    // The firmware exemption is context, not bytes. An exempt RDTSC decode must
-    // not be cached and later replayed in guest code under the 386 persona.
-    let mut memory = vec![0u8; 0x10_0000];
-    memory[0x000f_0000..0x000f_0002].copy_from_slice(&[0x0f, 0x31]);
-    let mut cpu = CpuGsw::default();
-    cpu.set_mode(GswMode::Gsw386);
-    cpu.load_segment_real(SegmentIndex::Cs, 0xf000);
-    let mut bus = TestBus::with_memory(memory);
-
-    cpu.registers.eip = 0;
-    cpu.cycle(&mut bus).unwrap();
-    assert!(
-        cpu.decode_cache.get(0x000f_0000, false).is_none(),
-        "an exempt firmware RDTSC decode must not be cached"
-    );
-}
-
-#[test]
 fn smc_above_the_byte_bitmap_coverage_invalidates_via_page_marks() {
     // Stage-2 review finding 12: extended-memory code (where DOS-extender workloads live,
     // e.g. Quake's self-patching renderer) sits above SMC_BYTE_COVERAGE. The byte bitmap
@@ -1333,11 +1314,9 @@ fn amd_specific_msr_selectors_are_unimplemented() {
 }
 
 #[test]
-fn firmware_rom_cs_is_exempt_from_the_586_gate() {
-    // RDTSC is a 586 op: guest code under the 386 persona #UDs on it, but the
-    // BIOS ROM must keep running the full ISA so a lowered GSW mode never faults
-    // firmware (Accept, interrupt service, boot). CS in the F-segment ROM
-    // aperture (base 0xF0000) is the exemption.
+fn firmware_rom_obeys_the_386_isa_gate() {
+    // ROM placement does not change the active persona. RDTSC must #UD under
+    // the 386 persona whether its bytes come from RAM or the F-segment BIOS.
     let code = [0x0f, 0x31];
     assert!(
         matches!(
@@ -1353,13 +1332,14 @@ fn firmware_rom_cs_is_exempt_from_the_586_gate() {
     cpu.set_mode(GswMode::Gsw386);
     cpu.load_segment_real(SegmentIndex::Cs, 0xF000);
     cpu.registers.eip = 0;
-    cpu.elapsed_clocks = 42;
     let mut bus = TestBus::with_memory(memory);
     assert!(
-        exec_one_split(&mut cpu, &mut bus).is_ok(),
-        "RDTSC fetched from BIOS ROM must run under the 386 persona"
+        matches!(
+            exec_one_split(&mut cpu, &mut bus).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ),
+        "RDTSC fetched from BIOS ROM must #UD under the 386 persona"
     );
-    assert_eq!(cpu.registers.eax(), 42);
 }
 
 #[test]

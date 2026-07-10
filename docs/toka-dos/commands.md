@@ -276,16 +276,22 @@ General Simulation Works's own tool: switches the GSW-586's live CPU speed
 class from inside DOS, without rebooting.
 
 ```
-GSWMODE 286 | 386 | 486 | 586
+GSWMODE 386-slow | 386 | 486 | 586
 ```
 
-Case-insensitive. Run with no argument, or an argument it doesn't
-recognize, GSWMODE prints usage and the *current* mode (read back live) and
-changes nothing:
+Mode names are case-insensitive. With no argument or an unrecognized one,
+GSWMODE prints usage and the *current* mode (read back live) and changes
+nothing:
 
 ```
-Usage: GSWMODE 286|386|486|586
+Usage: GSWMODE 386-slow|386|486|586
 Current mode: <mode>
+```
+
+The retired `286` name is rejected with a migration hint:
+
+```
+CPU mode '286' was removed; use '386-slow'.
 ```
 
 Given a valid mode, it writes the matching code straight to the Lotura

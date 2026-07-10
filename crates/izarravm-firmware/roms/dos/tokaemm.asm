@@ -18,15 +18,10 @@
 ; On a V86 fault the CPU nulls DS/ES/FS/GS; the monitor reads guest memory + the
 ; real-mode IVT through the null DS (base 0 == flat) and its own data through FS.
 ;
-; ISA split (GSWMODE 286): the guest can throttle the live CPU to a true 286
-; instruction boundary at runtime, and V86/real-mode code is held to it (only
-; the ring-0 monitor is exempt). So the guest-facing section — everything the
-; XMS/EMS/UMB entry points reach — assembles under `cpu 286` (NASM enforces the
-; boundary), works in 16-bit KB units internally (the 16 MB map keeps every KB
-; count under 0x4000), and passes 32-bit arguments to the INT 0xC0 monitor
-; services through driver-resident scratch dwords the monitor reads via FS
-; instead of 32-bit registers. INIT (which builds the 386 PM/paging monitor —
-; there is no 286 equivalent of that job) and the monitor itself stay `cpu 386`.
+; All four GSW modes expose at least the 386 ISA. The guest-facing XMS/EMS/UMB
+; entry points keep a 16-bit ABI and use KB units internally. The 16 MB map
+; keeps each KB count under 0x4000. They pass 32-bit arguments to INT 0xC0
+; monitor services through driver-resident scratch dwords read through FS.
 cpu 386
 org 0
 
@@ -79,7 +74,7 @@ a20_count: dw 0                   ; XMS local-A20 enable nesting (fns 05h/06h)
 xms_disp:  dw 0                   ; dispatch scratch (register-safe table jump)
 xms_mv_len: dd 0                  ; 0Bh move: byte count / src linear / dst linear
 xms_mv_src: dd 0                  ; (the INT 0xC0 'TM' memcpy reads these three
-xms_mv_dst: dd 0                  ;  via FS — the 286-clean V86 side has no
+xms_mv_dst: dd 0                  ;  via FS; the 16-bit V86 ABI has no
                                   ;  32-bit registers to pass them in)
 xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
 xms_rv_off: dd 0                  ; resolve input: the endpoint's 32-bit offset
@@ -190,30 +185,6 @@ interrupt:
     retf
 
 init:
-    ; Pre-386 guard FIRST, in 8086-safe code: INIT's whole job is building the
-    ; 386 PM/paging monitor, so on a pre-386 level decline like real EMM386 on
-    ; a 286 — message, failed status, nothing resident (its first MOVZX would
-    ; otherwise #UD into the IVT's bare-IRET default and hang the boot). The
-    ; live ISA level is the Lotura GSW mode register (port 0xE1; 3 = GSW-286
-    ; Super Slow): the classic FLAGS-bits-12..15 probe is not modeled by the
-    ; emulator's level gate, the port is the machine's own truth.
-    in al, 0xE1
-    cmp al, 3                     ; GSW-286?
-    jne .cpu_ok
-    mov si, msg386
-.gl:
-    lodsb                         ; DS = CS (set by `interrupt` above)
-    test al, al
-    jz .gdone
-    int 0x29
-    jmp .gl
-.gdone:
-    mov word [es:bx+14], 0        ; r_endaddr = CS:0000 — keep nothing resident
-    mov word [es:bx+16], cs
-    mov word [es:bx+3], 0x810C    ; r_status = S_ERROR | S_DONE | general failure
-    sti
-    retf
-.cpu_ok:
     ; Report resident size FIRST, while ES:BX still points at the request header
     ; (the setup below clobbers BX). r_endaddr = drv_seg:resident_end covers the
     ; driver's code + tables, which stay resident under the monitor permanently.
@@ -446,13 +417,10 @@ init:
 ; by fall-through (INIT above ends in a far jump). Own data via cs: overrides
 ; because the far-callable entry runs with the caller's DS.
 ;
-; Everything from here to the monitor (`bits 32`) is guest-facing V86 code and
-; must stay 286-clean: GSWMODE 286 throttles the live CPU to a true 286 ISA
-; boundary and V86/real mode are held to it (66h/67h prefixes and 386-only 0F
-; opcodes #UD there — and TOKAEMM's IDT has no low exception gates, so that
-; #UD is fatal). `cpu 286` makes NASM the enforcer.
+; Everything from here to the monitor (`bits 32`) is guest-facing V86 code.
+; It shares the 386 ISA exposed by both 386 clock modes.
 ; ============================================================================
-cpu 286
+cpu 386
 
 ; INT 2Fh multiplex hook: XMS install-check (4300) / get-entry (4310); chain else.
 xms_2f_handler:
@@ -477,7 +445,7 @@ xms_entry:
     cmp ah, 0x12
     ja .unimpl                   ; 13h+ : not implemented
     push bx
-    mov bl, ah                   ; zero-extend AH 286-style
+    mov bl, ah                   ; zero-extend AH through the 16-bit ABI
     xor bh, bh
     add bx, bx
     mov bx, [cs:xms_jt + bx]
@@ -935,7 +903,7 @@ find_gap:
 ; Resolve a move endpoint. in: BX=handle, [cs:xms_rv_off]=32-bit offset,
 ; [cs:xms_mv_len]=length. out: DX:AX = linear, CF clear; or CF set +
 ; AL=1 (bad handle) / AL=2 (bad offset). Handle 0 => the offset dword is a
-; real-mode seg:off (high=seg, low=off). 32-bit values as word pairs (286-clean).
+; real-mode seg:off (high=seg, low=off). 32-bit values use word pairs.
 ; Clobbers ax, bx, dx.
 resolve:
     test bx, bx
@@ -1227,7 +1195,7 @@ ems_int67:
     cmp ah, 0x4C
     ja ef_undef
     push bx
-    mov bl, ah                    ; zero-extend AH 286-style
+    mov bl, ah                    ; zero-extend AH through the 16-bit ABI
     xor bh, bh
     sub bx, 0x40
     add bx, bx
@@ -1618,7 +1586,7 @@ ems_find_run:
 ; Monitor remap of one frame slot. AL = slot 0-3, CX = backing page index or
 ; 0xFFFF to restore the INIT (UMB-backing) mapping. Preserves all registers.
 ; The two 32-bit args (slot linear base, backing physical base) are staged in
-; [cs:ems_rm_*] as word pairs; the monitor reads them via FS (286-clean side).
+; [cs:ems_rm_*] as word pairs; the monitor reads them via FS.
 ems_remap_slot:
     push dx
     mov dx, ax
@@ -1718,8 +1686,6 @@ idt:
     IDTGATE deflt_4               ; 4    #OF (INTO overflow trap)
     IDTGATE deflt_5               ; 5    #BR (BOUND range exceeded)
     IDTGATE exc_ud                ; 6    #UD invalid opcode -> reflect to IVT[6]
-                                  ;      (a guest program using 386-only ops at
-                                  ;      GSWMODE 286 dies alone, not the system)
     IDTGATE exc_nm                ; 7    #NM no-FPU trap -> reflect to IVT[7]
     IDTGATE irq_m0                ; 8    IRQ0 timer
     IDTGATE irq_m1                ; 9    IRQ1 keyboard
@@ -3294,7 +3260,7 @@ maybe_deliver:
 
 ; Ring-0 flat memcpy for the XMS block MOVE (INT 0xC0 monitor service). The guest
 ; driver staged src/dst linear + byte count in its resident [xms_mv_*] dwords
-; (the V86 side is 286-clean and cannot pass 32-bit registers) and enabled A20
+; through its 16-bit ABI and enabled A20
 ; first; read them via FS = driver data (0x20). deliver_exception NULLED
 ; ES/DS/FS/GS on the V86->ring0 entry, and a null selector faults a PM memory
 ; access, so reload ES to the flat selector (DS is already 0x10 from monitor
@@ -3312,8 +3278,8 @@ flat_memcpy:
 ; Ring-0 EMS frame remap (INT 0xC0 'PM'). [ems_rm_lin] = frame-slot linear
 ; base, [ems_rm_phys] = backing physical base, or 0 to restore the INIT
 ; mapping (the UMB-backing bytes the INIT .umb_map loop pointed this window
-; at) — staged by ems_remap_slot in driver data, read via FS (cf. flat_memcpy;
-; the 286-clean V86 side cannot pass 32-bit registers). Rewrites the slot's 4
+; at), staged by ems_remap_slot in driver data and read via FS (cf. flat_memcpy).
+; Rewrites the slot's 4
 ; PTEs in PT0 and reloads CR3 — the 386 full-TLB-flush idiom. Private,
 ; cookie-gated, single caller (ems_remap_slot) validates -> no arg checks.
 ; DS is already flat 0x10 from monitor entry; FS = 0x20 (driver data) for
@@ -3371,7 +3337,6 @@ a20_apply:
     ret
 
 banner: db 'TOKAEMM: XMS/UMB/EMS memory manager; system running in V86.', 0x0D, 0x0A, 0
-msg386: db 'TOKAEMM requires a 386 or better; not installed.', 0x0D, 0x0A, 0
 
 ; Debug failure signal via the unit-tester exit port (AL = code).
 signal32:

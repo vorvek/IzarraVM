@@ -52,7 +52,7 @@ layout's characters.
 ## CPU MODE
 
 Cycles the boot-time CPU speed directly on the main menu, in the order
-`386` → `486` → `586` → `286`, wrapping back to `386`. This sets the speed
+`386` → `486` → `586` → `386-slow`, wrapping back to `386`. This sets the speed
 class the machine will boot at next time, saved to CMOS on Save. It's the
 same four classes and the same underlying value as the [Tab boot
 menu](../izarra-3000/user-manual.md#the-tab-boot-menu), just reachable from

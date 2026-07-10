@@ -864,18 +864,15 @@ fn tokaemm_m4_default_boot_runs_v86() {
     );
 }
 
-/// GSWMODE (coverage audit item 18): a runtime CPU-speed switch guest tool.
-/// Default V86 boot (TOKAEMM resident, DOS=HIGH,UMB), then AUTOEXEC drives
-/// `GSWMODE 486`, a downgrade from the default 586. Then `VER` to
-/// prove DOS still works post-switch, then `GSWMODE 586` to prove switching
-/// back also works. Driven entirely through AUTOEXEC.BAT bytes (not injected
-/// keystrokes): the default keyboard layout is European, so scancode
-/// injection can garble punctuation, and this test needs none of that.
+/// Code 3 boots as 386-slow with TOKAEMM resident and DOS=HIGH,UMB. AUTOEXEC
+/// checks the removed 286 name, selects 386-slow by its canonical name, runs
+/// VER, then switches to 586. The commands come from AUTOEXEC.BAT because the
+/// default keyboard layout can garble injected punctuation.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-fn tokaemm_gswmode_486_switch_survives_v86_monitor() {
+fn tokaemm_and_gswmode_support_code_3_as_386_slow() {
     let dir = std::env::temp_dir().join(format!(
-        "tokaemm_gsw486_{}_{}",
+        "tokaemm_gsw386slow_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -888,9 +885,12 @@ fn tokaemm_gswmode_486_switch_survives_v86_monitor() {
 DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\nDOS=HIGH,UMB\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
-    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGSWMODE 486\r\nVER\r\nGSWMODE 586\r\n".to_vec();
+    let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGSWMODE 286\r\n\
+GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
+        .to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    profile.cpu = GswMode::Gsw386Slow;
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -918,7 +918,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
         panic!(
-            "CPU fault after the GSWMODE 486 switch while TOKAEMM's ring-0 \
+            "CPU fault after the GSWMODE 386-slow switch while TOKAEMM's ring-0 \
                  monitor was resident: {msg}\nstop={stop:?}\n{text}"
         );
     }
@@ -928,17 +928,25 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     assert_eq!(
         machine.active_mode(),
         GswMode::Gsw586,
-        "GSWMODE 486 then GSWMODE 586 should leave the machine back at 586 \
+        "GSWMODE 386-slow then GSWMODE 586 should leave the machine at 586 \
              (stop={stop:?}).\n{text}"
     );
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("switched to 486") && lower.contains("switched to 586"),
+        lower.contains("tokaemm: xms/umb/ems memory manager; system running in v86"),
+        "TOKAEMM did not install while code 3 was active (stop={stop:?}).\n{text}"
+    );
+    assert!(
+        lower.contains("switched to 386-slow") && lower.contains("switched to 586"),
         "GSWMODE confirmation output missing for one of the two switches.\n{text}"
     );
     assert!(
+        lower.contains("cpu mode '286' was removed; use '386-slow'"),
+        "GSWMODE did not explain how to migrate the removed 286 name.\n{text}"
+    );
+    assert!(
         lower.contains("c:\\>"),
-        "no C:\\> prompt after the GSWMODE 486/VER/GSWMODE 586 sequence \
+        "no C:\\> prompt after the GSWMODE 386-slow/VER/GSWMODE 586 sequence \
              (stop={stop:?}).\n{text}"
     );
 }

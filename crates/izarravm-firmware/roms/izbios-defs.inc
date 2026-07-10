@@ -70,7 +70,7 @@
 %define BOOT_CMOS_ORDER 0x11
 
 ; CMOS NVRAM byte 0x12 holds the saved GSW speed code (0 386, 1 486, 2 586,
-; 3 286). Written by the setup panel and the boot menu on Save/Accept; applied
+; 3 386-slow). Written by the setup panel and boot menu on Save/Accept; applied
 ; to the live Lotura register at POST bring-up so the choice survives reboot.
 %define SU_NVRAM_GSW 0x12
 
@@ -275,11 +275,11 @@
 %define BMX_BTN_COUNT    2
 
 ; Speed rows (right pane). The 0xE1/CMOS 0x12 code per row is the real hardware
-; encoding (gsw_mode_from_code: 0=386, 1=486, 2=586, 3=286), NOT a row index.
+; encoding (gsw_mode_from_code: 0=386, 1=486, 2=586, 3=386-slow), not a row index.
 %define BMX_SPD_FAST     0         ; 586, code 2
 %define BMX_SPD_SLOW     1         ; 486, code 1
 %define BMX_SPD_VSLOW    2         ; 386, code 0
-%define BMX_SPD_SSLOW    3         ; 286, code 3
+%define BMX_SPD_SSLOW    3         ; 386-slow, code 3
 
 ; Cursor sprite geometry (16x16, 2-byte stride, set-bit-only blit).
 %define BMX_CUR_W        16

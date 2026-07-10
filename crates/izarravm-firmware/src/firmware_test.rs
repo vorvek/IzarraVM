@@ -53,6 +53,23 @@ fn izarra_bios_carries_v301_version_string() {
 }
 
 #[test]
+fn code_3_is_named_386_slow_in_guest_firmware() {
+    for (name, image, needle) in [
+        ("GSWMODE.COM", GSWMODE_COM, b"386-slow".as_slice()),
+        ("GSWMODE.COM", GSWMODE_COM, b"use '386-slow'".as_slice()),
+        ("izarra-bios.bin", IZARRA_BIOS, b"SSlow  386".as_slice()),
+    ] {
+        assert!(
+            image.windows(needle.len()).any(|window| window == needle),
+            "{name} does not contain {}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+    assert!(!GSWMODE_COM_SOURCE.contains("GSWMODE 286|"));
+    assert!(!TOKAEMM_SYS_SOURCE.contains("cpu 286"));
+}
+
+#[test]
 fn izarra_bios_reset_far_jump() {
     // The reset vector at 0xFFF0 far-jumps to ROM_SEG:0000 (reset at offset 0).
     assert_eq!(

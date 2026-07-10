@@ -43,7 +43,7 @@ reproduces the Izarra 3000 exactly as it was built.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
-| CPU | GSW-586, a Pentium MMX @200MHz part on a 66 MHz bus. The BIOS or the bundled GSWMODE tool can throttle it to 486DX2 66 MHz, 386DX 25 MHz, or a 286 @8 MHz without rebooting. |
+| CPU | GSW-586, a Pentium MMX at 200 MHz on a 66 MHz bus. The BIOS or the bundled GSWMODE tool can throttle it to a 486DX2 at 66 MHz, a 386DX at 22 MHz, or the same 386 ISA at 7.33 MHz without rebooting. |
 | Memory | 24 MB SDRAM, with Toka mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio (PCM and Creative ADPCM), OPL3 FM, MPU-401 MIDI, and wavetable daughterboard. |

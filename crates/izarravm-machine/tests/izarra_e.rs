@@ -15,7 +15,7 @@
 //      the box, which the plain POST screen does not paint there.
 //   2. Tab then F10 (Accept) on the default Floppy boots the mounted image: the
 //      Wizardry III booter takes over and switches the card to CGA.
-//   3. Walking down to the 286 row and accepting switches the CPU tier live.
+//   3. Walking down to the 386-slow row and accepting switches the CPU tier live.
 //   4. HDD/CD device rows become markable only when their firmware probes pass.
 //
 // Keys are fed as Set 1 scancodes via inject_key_scancodes.
@@ -114,8 +114,8 @@ fn tab_then_accept_boots_the_floppy() {
 }
 
 #[test]
-fn accept_super_slow_commits_the_286_tier() {
-    // Open the menu, cross to the speed pane, walk down to the Super Slow (286) row,
+fn accept_super_slow_commits_the_386_slow_tier() {
+    // Open the menu, cross to the speed pane, walk down to the 386-slow row,
     // mark it with Enter, then Accept with F10. The Accept maps the marked row to GSW
     // code 3 and writes it to the live Lotura register (port 0xE1) and to CMOS 0x12.
     // The 0xE1 write is a live switch (no cold reset), so the firmware keeps running
@@ -126,7 +126,7 @@ fn accept_super_slow_commits_the_286_tier() {
 
     // Tab opens the menu with focus on the marked device (flat index 1 = Floppy).
     // The flat list is dev0..dev2 (0..2), spd0..spd3 (3..6), Accept (7), so five
-    // Downs walk from Floppy (1) to the Super Slow / 286 row (focus 6 = speed row 3).
+    // Downs walk from Floppy (1) to the 386-slow row (focus 6 = speed row 3).
     // Enter marks it, F10 accepts.
     machine.inject_key_scancodes(&[
         TAB_MAKE,
@@ -140,7 +140,7 @@ fn accept_super_slow_commits_the_286_tier() {
         DOWN_MAKE,
         DOWN_BREAK, // -> VSlow 386
         DOWN_MAKE,
-        DOWN_BREAK, // -> SSlow 286
+        DOWN_BREAK, // -> SSlow 386
         ENTER_MAKE,
         ENTER_BREAK, // mark the Super Slow row
         F10_MAKE,
@@ -166,7 +166,7 @@ fn accept_super_slow_commits_the_286_tier() {
 #[test]
 fn saved_cmos_gsw_mode_is_applied_at_post() {
     // The persisted half of a setup-panel Save: a CMOS image carrying GSW code
-    // 3 (286) retunes the machine during POST bring-up, even though the host
+    // 3 (386-slow) retunes the machine during POST bring-up, even though the host
     // profile boots 386. This mirrors a cmos.bin load at startup, which lands
     // before the first run.
     let mut machine = boot_machine();

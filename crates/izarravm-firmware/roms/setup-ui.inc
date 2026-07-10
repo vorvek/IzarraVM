@@ -519,8 +519,8 @@ su_cursor_inc:
     ret
 
 ; su_edit_left / su_edit_right: Left/Right on the main menu edit the inline rows.
-; LAYOUT cycles the keyboard layout 0..16; GSW cycles the mode 0..3 (386/486/586/286,
-; wrapping; 286 is the slowest, cycling after 586, mirroring the bootbox SSlow row).
+; LAYOUT cycles the keyboard layout 0..16. GSW cycles the four modes
+; (386/486/586/386-slow), wrapping after the bootbox SSlow row.
 ; Other rows are not inline-editable, so the keys are ignored there. DS = 0. Clobbers
 ; AX, BX.
 su_edit_left:
@@ -937,7 +937,7 @@ su_cs_row_text_colors:
     pop ax
     ret
 
-; su_draw_mode_value: draw the working GSW mode's name (386/486/586/286) at the
+; su_draw_mode_value: draw the working GSW mode name at the
 ; value column on the GSW row. Reads SU_WORKING_MODE; uses DS = CS for the string.
 ; Re-derives the row text colors without repainting the highlight band.
 su_draw_mode_value:
@@ -954,7 +954,7 @@ su_draw_mode_value:
     je .m486
     cmp al, 2
     je .m586
-    mov si, su_str_mode286
+    mov si, su_str_mode386slow
     jmp .put
 .m386:
     mov si, su_str_mode386
@@ -1550,7 +1550,7 @@ su_str_slash:        db '/', 0
 su_str_mode386:      db '386', 0
 su_str_mode486:      db '486', 0
 su_str_mode586:      db '586', 0
-su_str_mode286:      db '286', 0
+su_str_mode386slow:  db '386-slow', 0
 
 ; Keyboard layout names, indexed by CMOS 0x10 (0 US .. 16 LA).
 ; Codes match the MS-DOS KEYB tool identifiers.
