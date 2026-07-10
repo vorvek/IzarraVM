@@ -1645,6 +1645,8 @@ impl Distira {
             SST_TLOD => self.texture_lod,
             SST_TDETAIL => self.texture_detail,
             SST_TEX_BASE_ADDR => self.tex_base_addr,
+            DISTIRA_REG_ID => DISTIRA_ID_VALUE,
+            DISTIRA_REG_CAPS => DISTIRA_CAPS_VALUE,
             DISTIRA_REG_STATUS => {
                 if self.display_enabled {
                     STATUS_DISPLAY_ENABLED
