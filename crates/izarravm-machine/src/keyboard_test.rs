@@ -82,7 +82,7 @@ fn enable_mouse(kbd: &mut Keyboard8042) {
     // clear it so callers can inject and immediately read a movement
     // packet, matching a real driver that doesn't move the mouse in the
     // same instant the enable handshake completes.
-    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
+    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_TICKS);
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn keyboard_reread_is_not_hijacked_by_a_pending_mouse_byte() {
 
     // Once the settle window elapses, the untouched mouse byte latches
     // normally and the mouse driver's packet framing is never disturbed.
-    kbd.advance_mouse_pacing(2000.0); // comfortably past the settle window
+    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_TICKS * 2);
     let status = kbd.read_port(0x64).unwrap();
     assert_eq!(
         status & STATUS_OBF,
@@ -178,10 +178,10 @@ fn movement_queues_three_byte_packet_and_arms_irq12() {
     assert_eq!(b0 & 0x20, 0x00, "Y positive (up), no sign");
     // Each byte is paced ~1ms apart (AUX_BYTE_SETTLE_US), matching real
     // PS/2 serial transmission; advance past it between reads.
-    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
+    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_TICKS);
     let bx = kbd.read_port(0x60).unwrap();
     assert_eq!(bx, 5, "dx byte");
-    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
+    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_TICKS);
     let by = kbd.read_port(0x60).unwrap();
     assert_eq!(by, 3, "dy byte (negated screen delta)");
 }
@@ -247,10 +247,10 @@ fn negative_delta_sets_sign_bits() {
     let b0 = kbd.read_port(0x60).unwrap();
     assert_eq!(b0 & 0x10, 0x10, "X sign set for leftward move");
     assert_eq!(b0 & 0x20, 0x20, "Y sign set for downward move");
-    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
+    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_TICKS);
     let bx = kbd.read_port(0x60).unwrap();
     assert_eq!(bx as i8 as i32, -4, "dx is -4 two's complement");
-    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
+    kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_TICKS);
     let by = kbd.read_port(0x60).unwrap();
     assert_eq!(by as i8 as i32, -7, "dy is -7 (down)");
 }

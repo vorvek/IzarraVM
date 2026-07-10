@@ -905,6 +905,7 @@ struct TestBus {
     // `read_io` call, so tests can assert on it directly (see
     // `core_clocks_so_far_reflects_prior_instructions_not_the_in_flight_one`).
     last_read_io_core_clocks_so_far: Option<u64>,
+    last_write_io_core_clocks_so_far: Option<u64>,
     // When true, `direct_page` hands out host-pointer pages into `memory` (mirroring the
     // production MachineBus), so data accesses take the CPU's cached host-pointer deref path
     // instead of the slow `read_memory_direct` fallback. Default false: the historical
@@ -923,6 +924,7 @@ impl TestBus {
             io_touched: false,
             lazy_io_reads: false,
             last_read_io_core_clocks_so_far: None,
+            last_write_io_core_clocks_so_far: None,
             direct_pages_enabled: false,
         }
     }
@@ -1166,9 +1168,11 @@ impl CpuBus for TestBus {
         port: u16,
         width: BusWidth,
         _value: u32,
+        core_clocks_so_far: u64,
         _cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError> {
         self.io_touched = true;
+        self.last_write_io_core_clocks_so_far = Some(core_clocks_so_far);
         self.trace.push(BusCycle::new(
             BusAccessKind::IoWrite,
             u32::from(port),

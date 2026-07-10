@@ -15,7 +15,8 @@ const SYSEX_CAPACITY: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimedMidiMessage {
-    pub guest_clock: u64,
+    /// Fixed machine-timeline tick at which the message completed.
+    pub guest_tick: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -101,7 +102,7 @@ impl Mpu401 {
         }
     }
 
-    pub fn write_data(&mut self, value: u8, guest_clock: u64) {
+    pub fn write_data(&mut self, value: u8, guest_tick: u64) {
         if let Some(parameter) = self.pending_parameter.take() {
             match parameter {
                 PendingParameter::Tempo => self.tempo = value.clamp(8, 250),
@@ -116,7 +117,7 @@ impl Mpu401 {
                 self.output.pop_front();
             }
             self.output
-                .push_back(TimedMidiMessage { guest_clock, bytes });
+                .push_back(TimedMidiMessage { guest_tick, bytes });
         }
     }
 

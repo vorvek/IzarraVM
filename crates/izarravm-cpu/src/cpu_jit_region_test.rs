@@ -443,9 +443,11 @@ impl CpuBus for InstrumentedBus {
         port: u16,
         width: BusWidth,
         value: u32,
+        core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError> {
-        self.inner.write_io(port, width, value, cpu_is_ring0_pm)
+        self.inner
+            .write_io(port, width, value, core_clocks_so_far, cpu_is_ring0_pm)
     }
     fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError> {
         self.inner.interrupt_acknowledge(vector, ax)

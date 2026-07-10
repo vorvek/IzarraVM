@@ -301,16 +301,13 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         direct_map_changed: &mut machine.direct_map_changed,
         core_clocks_so_far: 0,
         prior_runs_core_clocks: 0,
-        elapsed_clocks_at_batch_start: machine.elapsed_clocks,
-        vga_dots_at_batch_start: machine.vga_dots,
+        timeline_at_batch_start: machine.timeline,
+        master_ticks_at_batch_start: machine.timeline.now_ticks(),
         beam_at_batch_start,
         trace_elapsed_at_batch_start,
         bus_rem_at_batch_start: machine.bus_rem,
-        inv_clock_at_batch_start: machine.timing.inv_clock,
         bus_num_at_batch_start,
         bus_den_at_batch_start,
-        pit_clocks_at_batch_start: machine.pit_clocks,
-        pit_per_clock_at_batch_start: machine.timing.pit_per_clock,
     };
     f(&mut bus)
 }

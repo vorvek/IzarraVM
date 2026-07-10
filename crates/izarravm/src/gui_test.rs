@@ -19,30 +19,31 @@ fn volume_gain_is_cubic_and_clamped() {
 
 #[test]
 fn refill_credit_clamps_a_stall() {
-    let clock = 266_000_000u64;
-    let cap = clock / 20; // 50 ms of guest time
+    let cap = MASTER_CLOCK_HZ / 20;
     // From empty, a normal ~15 ms slice yields its full wall-time worth.
     assert_eq!(
-        refill_credit(0, 0.015, clock, cap),
-        (0.015 * clock as f64) as i64
+        refill_credit(0, Duration::from_millis(15), cap),
+        (MASTER_CLOCK_HZ * 15 / 1000) as i64
     );
     // A long stall is clamped to the cap, so the backlog is forgiven, not banked.
-    assert_eq!(refill_credit(0, 0.5, clock, cap), cap as i64);
+    assert_eq!(
+        refill_credit(0, Duration::from_millis(500), cap),
+        cap as i64
+    );
 }
 
 #[test]
 fn disk_overshoot_holds_the_guest() {
-    let clock = 266_000_000u64;
-    let cap = clock / 20;
+    let cap = MASTER_CLOCK_HZ / 20;
     // A read that ran ~190 ms past its budget leaves credit deep in debt.
-    let mut credit: i64 = -(clock as i64) / 5;
+    let mut credit: i64 = -(MASTER_CLOCK_HZ as i64) / 5;
     // One short slice cannot lift it out of debt, so the guest's budget stays
     // zero: it waits in wall-clock time.
-    credit = refill_credit(credit, 0.001, clock, cap);
+    credit = refill_credit(credit, Duration::from_millis(1), cap);
     assert!(credit < 0);
     assert_eq!(credit.max(0) as u64, 0, "no budget while in disk debt");
     // After enough wall time the debt clears and the guest runs again.
-    credit = refill_credit(credit, 0.5, clock, cap);
+    credit = refill_credit(credit, Duration::from_millis(500), cap);
     assert!(credit > 0, "debt repaid once wall-clock catches up");
 }
 
@@ -78,27 +79,39 @@ fn top_up_escape_hatch_caps_edge_stops_for_a_pathological_crtc() {
         vga.write_port(0x3D4, index);
         vga.write_port(0x3D5, value);
     }
-    let clock_hz = machine.active_mode().clock_hz();
-    let asked = clock_hz / 10; // 100ms of shortfall: ~157 edges, cap is 12
-    let before = machine.elapsed_clocks();
+    let asked = MASTER_CLOCK_HZ / 10; // 100ms of shortfall: ~157 edges, cap is 12
+    let work_before = machine.elapsed_clocks();
+    let ticks_before = machine.master_ticks();
     let top_up = top_up_shortfall(&mut machine, asked);
     assert_eq!(
-        top_up.topped_up, asked,
+        top_up.topped_up_ticks, asked,
         "the escape hatch must still consume the full shortfall"
     );
     assert_eq!(
-        machine.elapsed_clocks() - before,
-        asked + top_up.peeked,
-        "master clock advances by the shortfall plus the executed peeks"
+        machine.elapsed_clocks() - work_before,
+        machine
+            .active_mode()
+            .clock_rate()
+            .clocks_for_master_ticks_floor(top_up.peeked_ticks),
+        "only executed peeks count as CPU work"
+    );
+    assert_eq!(
+        machine.master_ticks() - ticks_before,
+        asked + top_up.peeked_ticks,
+        "the timeline advances by the shortfall plus executed peeks"
     );
     // The cap allows asked/10ms + 2 = 12 stops; each peek runs about
     // VRETRACE_PEEK_CLOCKS (allow 2x for run-loop batch overshoot). An
     // uncapped loop would have peeked ~157 times.
-    let max_stops = asked / (clock_hz / 100) + 2;
+    let max_stops = asked / (MASTER_CLOCK_HZ / 100) + 2;
+    let max_peek_ticks = machine
+        .active_mode()
+        .clock_rate()
+        .master_ticks_for_clocks_ceil(max_stops * VRETRACE_PEEK_CLOCKS * 2);
     assert!(
-        top_up.peeked <= max_stops * VRETRACE_PEEK_CLOCKS * 2,
+        top_up.peeked_ticks <= max_peek_ticks,
         "peek work must be bounded by the stop cap (peeked {} over {} stops max)",
-        top_up.peeked,
+        top_up.peeked_ticks,
         max_stops
     );
 }
@@ -118,21 +131,52 @@ fn top_up_aborts_when_the_peek_halts() {
         rom,
     )
     .unwrap();
-    let clock_hz = machine.active_mode().clock_hz();
-    let asked = clock_hz; // one guest second: dozens of frames
+    let asked = MASTER_CLOCK_HZ; // one guest second: dozens of frames
     let top_up = top_up_shortfall(&mut machine, asked);
     assert!(
-        top_up.topped_up < asked / 2,
+        top_up.topped_up_ticks < asked / 2,
         "a halted peek must abort the top-up (topped up {} of {asked})",
-        top_up.topped_up
+        top_up.topped_up_ticks
     );
     assert!(
-        top_up.peeked > 0,
+        top_up.peeked_ticks > 0,
         "the aborting peek itself executed guest time"
     );
     assert!(
         matches!(tick_machine(&mut machine, 1_000), Some(StopReason::Halted)),
         "the machine is halted after the aborted top-up"
+    );
+}
+
+#[test]
+fn live_mode_switch_debits_credit_in_master_ticks() {
+    let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
+    rom[..15].copy_from_slice(&[
+        0xB0, 0x01, 0xE6, 0xE1, // 486
+        0xB0, 0x00, 0xE6, 0xE1, // 386
+        0xB0, 0x03, 0xE6, 0xE1, // 386-slow
+        0xFA, 0xEB, 0xFE, // cli; jmp $
+    ]);
+    rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+        rom,
+    )
+    .unwrap();
+    machine.set_mode(GswMode::Gsw586);
+    let budget = MASTER_CLOCK_HZ / 1000;
+    let mut credit = budget as i64;
+    let before = machine.master_ticks();
+
+    assert_eq!(tick_machine_ticks(&mut machine, budget), None);
+    let ran = machine.master_ticks() - before;
+    credit -= i64::try_from(ran).unwrap();
+
+    assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
+    assert!(credit <= 0, "the full fixed-time budget was debited");
+    assert!(
+        credit > -(100 * 900),
+        "credit debt is only final-instruction overshoot, not mixed clock units"
     );
 }
 

@@ -442,45 +442,6 @@ fn izarra_bios_lfb_carries_rle_background() {
 }
 
 #[test]
-fn predict_vga_dots_matches_the_real_advance_devices_accumulator_step() {
-    // predict_dots must be textually identical arithmetic to the vga_dots
-    // block it was extracted from (Task 0.3), so its output, fed through the
-    // same Vga::advance + vga_dots-subtract sequence advance_devices already
-    // uses, reproduces the real post-advance_devices state exactly: not just
-    // numerically close, bit-for-bit (same operation order, same rounding).
-    let mut expected = test_machine();
-    let mut actual = test_machine();
-    let clocks = 12_345u64;
-    let vga_dots_before = actual.vga_dots;
-
-    // The real, mutating step (what advance_devices does today).
-    expected.advance_devices(clocks);
-
-    // The shared pure function, applied by hand the same way advance_devices
-    // applies it internally.
-    let (whole, remainder) = actual.predict_dots(clocks, vga_dots_before);
-    actual.video.advance(whole);
-    actual.vga_dots = remainder;
-
-    assert_eq!(
-        actual.video.beam_dots(),
-        expected.video.beam_dots(),
-        "predict_dots's whole-dots output must move the beam identically \
-             to advance_devices's real step"
-    );
-    assert_eq!(
-        actual.vga_dots, expected.vga_dots,
-        "predict_dots's fractional remainder must match the real accumulator"
-    );
-    assert_eq!(
-        actual.video.frames_completed(),
-        expected.video.frames_completed(),
-        "frame-boundary bookkeeping (finalize_frame/frames) must also agree \
-             when applied by hand through the same Vga::advance call"
-    );
-}
-
-#[test]
 fn word_out_to_a_vga_register_pair_splits_into_two_byte_cycles() {
     // `OUT DX, AX` (16-bit) to a VGA index/data port pair is the canonical
     // mode-set idiom: the low byte (AL) selects the index at the port, the high

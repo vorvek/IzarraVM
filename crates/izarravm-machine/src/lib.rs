@@ -11,8 +11,8 @@ use izarravm_bus::{
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    ClockRate, CpuPersona, GswMode, HardwareProfile, MIDI_INPUT_MPU_BASE, SoundBlasterConfig,
-    VideoCard, WAVETABLE_MPU_BASE, WssConfig,
+    CpuPersona, GswMode, HardwareProfile, MIDI_INPUT_MPU_BASE, SoundBlasterConfig, VideoCard,
+    WAVETABLE_MPU_BASE, WssConfig,
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
@@ -38,15 +38,17 @@ use bus::DevicePorts;
 pub(crate) use pci::PciConfig;
 mod cache_config;
 mod ram_lookup;
-pub mod timeline;
+mod timeline;
 mod timing;
-#[cfg(test)]
-use timing::advance_fractional;
 mod video;
 mod video_params;
 
+use timeline::{DeviceAdvance, DeviceRates, RatePhase, Timeline};
+
 pub(crate) use ram_lookup::RamPageLookup;
-pub(crate) use timing::{DAC_HZ, OPL_NATIVE_HZ, PIT_INPUT_HZ};
+#[cfg(test)]
+pub(crate) use timing::PIT_INPUT_HZ;
+pub(crate) use timing::{DAC_HZ, OPL_NATIVE_HZ};
 
 pub(crate) use cache_config::{
     CACHE_L1_MAX_LINES, CACHE_L2_MAX_LINES, CACHE_TIER_DISABLED_MASK, CacheLevelConfig, TierCost,
@@ -269,35 +271,6 @@ pub enum ActiveDisplay {
 /// is still inside the window for the whole peek. At most ~70 edge-stops per
 /// wall second, so a guest that never polls pays ~140k clocks/s (~0.2 percent).
 pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
-
-/// Per-clock conversion factors, recomputed once whenever the active mode (clock)
-/// changes, so the per-instruction device pacing multiplies instead of dividing.
-#[derive(Debug, Clone, Copy)]
-struct TimingFactors {
-    micros_per_clock: f64,   // 1e6 / clock_hz (OPL and DSP settle)
-    pit_per_clock: f64,      // PIT_INPUT_HZ / clock_hz
-    margo_ns_per_clock: f64, // 1e9 / clock_hz
-    inv_clock: f64,          // 1 / clock_hz (DSP sample phase)
-    // CPU clocks in one 44.1 kHz DAC sample. The run loop batches instructions
-    // up to this many clocks before servicing devices once, so the per-clock
-    // fine-samplers (the DSP/CD producers step at the DAC rate) still see at
-    // most one sample of time per call and never alias. >=1 in every mode
-    // (clock_hz >> 44100).
-    clocks_per_audio_sample: u64,
-}
-
-impl TimingFactors {
-    fn for_clock(clock: ClockRate) -> Self {
-        let c = clock.as_hz_f64();
-        Self {
-            micros_per_clock: 1_000_000.0 / c,
-            pit_per_clock: PIT_INPUT_HZ as f64 / c,
-            margo_ns_per_clock: 1_000_000_000.0 / c,
-            inv_clock: 1.0 / c,
-            clocks_per_audio_sample: clock.clocks_for_fraction_floor(1, u64::from(DAC_HZ)).max(1),
-        }
-    }
-}
 
 /// Bytes per modeled cache line: 64 bytes on every tier. (A real Pentium MMX uses
 /// 32-byte lines; the line size is kept as-is -- out of scope for the P55C timing
@@ -662,7 +635,7 @@ pub struct Machine {
     profile: MachineProfile,
     active_mode: GswMode,
     pending_mode: Option<GswMode>,
-    timing: TimingFactors,
+    timeline: Timeline,
     cpu: CpuGsw,
     // Per-mode cache model. A data access warms its tag state and the resolved tier
     // drives the charged wait-state (its per-mode tier costs are calibrated). Reset
@@ -695,13 +668,13 @@ pub struct Machine {
     // way it keys the per-vector stub table). Consumed by `note_stub_fetch`.
     last_int_vector: Option<u8>,
     // Set by MachineBus on any port I/O; the run loop's instruction batch reads
-    // it to know when to stop and service devices (see run_until_clock). A field
+    // it to know when to stop and service devices (see run_until_tick). A field
     // rather than a loop local so make_bus's one-off host accesses share it.
     io_touched: bool,
     // Fixed ISA-bus time (in CPU clocks) accrued this batch by the OPL status poll,
-    // added to the batch's device advance in the Approximate class so a fast-CPU
+    // added to the batch's device advance in the fast modes so a fast CPU
     // poll cannot outrun the 80 us OPL timer. See the batch-end use in
-    // run_until_clock and the accrual in read_io. Consumed (zeroed) each batch via
+    // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     isa_io_batch_clocks: u64,
     // Set by MachineBus when a device (DMA disk/floppy transfer, DMA block copy) writes guest RAM,
@@ -743,7 +716,6 @@ pub struct Machine {
     pit: pit::Pit,
     keyboard: keyboard::Keyboard8042,
     speaker: speaker::Speaker,
-    pit_clocks: f64, // fractional PIT input clocks owed to the counters
     speaker_transitions: Vec<pit::OutTransition>,
     dma: dma::DmaController,
     // 8272A floppy disk controller (ports 0x3F0-0x3F7). A guest that programs the
@@ -761,16 +733,14 @@ pub struct Machine {
     /// render_audio to the speaker only. 1.0 = full (default), 0.0 = muted. Like
     /// card_amp it is host-side loudness only, never guest-visible.
     speaker_volume: f32,
-    opl_micros: f64, // fractional microseconds owed to the OPL timers
     dsp: SbDsp,
     /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
     /// changes. Summed with the OPL stream in render_audio.
     dsp_resampler: Resampler,
     dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
-    dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
-    dsp_sample_phase: f64, // fractional DSP samples owed to the DMA playback clock
-    last_audio_clocks: u64, // for HLE guest-time driven sample counts in render (Phase 4)
-    mixer: SbMixer,   // the CT1745 mixer: IRQ/DMA routing + volume attenuation
+    last_audio_ticks: u64,
+    dsp_render_phase: RatePhase,
+    mixer: SbMixer, // the CT1745 mixer: IRQ/DMA routing + volume attenuation
     wavetable_mpu: Mpu401,
     midi_input_mpu: Mpu401,
     // AD1848 / Windows Sound System codec. An always-on combo-card device that
@@ -783,15 +753,14 @@ pub struct Machine {
     /// programmed rate changes. Summed with the OPL + DSP streams in render_audio.
     wss_resampler: Resampler,
     wss_rate_hz: u32, // input rate the wss_resampler is currently configured for
-    wss_sample_phase: f64, // fractional WSS frames owed to the DMA playback clock
-    cd_sample_phase: f64, // fractional CD Red Book samples (44.1 kHz) owed to guest time for HLE timing (Phase 4)
-    wss_base: u16,        // I/O base of the 4-port config region (codec sits at base+4)
-    wss_irq: u8,          // PIC line the codec's terminal-count interrupt forwards to
-    wss_dma: usize,       // byte-wide DMA channel the codec pulls playback bytes from
-    wss_enabled: bool,    // false drops all WSS work (port decode, tick, IRQ, render)
-    margo_ns: f64,        // fractional nanoseconds owed to the Margo busy countdown
-    vga_dots: f64,        // fractional VGA dot clocks owed to the beam advance
+    wss_render_phase: RatePhase,
+    wss_base: u16,     // I/O base of the 4-port config region (codec sits at base+4)
+    wss_irq: u8,       // PIC line the codec's terminal-count interrupt forwards to
+    wss_dma: usize,    // byte-wide DMA channel the codec pulls playback bytes from
+    wss_enabled: bool, // false drops all WSS work (port decode, tick, IRQ, render)
     trace: BusTrace,
+    // CPU-domain work accounting kept for compatibility counters and benchmarks.
+    // Global device time lives in `timeline` and remains meaningful across mode changes.
     elapsed_clocks: u64,
     // Of elapsed_clocks, the clocks consumed by device I/O stalls (floppy seek/
     // read, later ATA) rather than executed instructions. A realtime host can
@@ -831,12 +800,9 @@ pub struct Machine {
     fat32_c: Option<Fat32Volume>,
     cd_accesses: u64,
     // Fractional Red Book frames owed to the CD-audio mixer from the DAC clock.
-    cd_audio_frac: f64,
+    cd_audio_sample: usize,
     // MC146818 RTC and CMOS NVRAM at ports 0x70/0x71.
     rtc: rtc::Rtc,
-    // Fractional seconds owed to the RTC from the machine clock; whole seconds
-    // are folded into the clock in advance_devices.
-    rtc_seconds: f64,
     // Cosmetic POST pacing flag, read by the BIOS at port 0xE2. True (the
     // default) tells the ROM to skip the ~8 s RAM count-up and chime delays so
     // headless runs and unit tests finish inside their cycle budgets. The GUI
@@ -1031,7 +997,6 @@ impl Machine {
         let pci = PciConfig::new();
         let memory = Memory::from_mib(profile.memory_mib)?;
         let ram_lookup = RamPageLookup::new(memory.len(), &pci);
-        let timing = TimingFactors::for_clock(active_mode.clock_rate());
         // Lay the HLE entry stubs into ROM. PSP:0005 reaches the CALL 5 adapter
         // through the low-memory DOS entry at 0000:00C0.
         install_bios_font_mirror(&mut rom);
@@ -1049,7 +1014,7 @@ impl Machine {
             profile,
             active_mode,
             pending_mode: None,
-            timing,
+            timeline: Timeline::new(active_mode),
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
@@ -1084,7 +1049,6 @@ impl Machine {
             pit: pit::Pit::default(),
             keyboard: keyboard::Keyboard8042::default(),
             speaker: speaker::Speaker::default(),
-            pit_clocks: 0.0,
             speaker_transitions: Vec::new(),
             dma: dma::DmaController::default(),
             fdc: fdc::Fdc::default(),
@@ -1092,15 +1056,13 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             card_amp: 1.0,
             speaker_volume: 1.0,
-            opl_micros: 0.0,
             dsp: SbDsp::default(),
             // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
             // first use, so the value here never reaches the DAC as-is.
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             dsp_rate_hz: 0,
-            dsp_micros: 0.0,
-            dsp_sample_phase: 0.0,
-            last_audio_clocks: 0,
+            last_audio_ticks: 0,
+            dsp_render_phase: RatePhase::default(),
             mixer,
             wavetable_mpu: Mpu401::default(),
             midi_input_mpu: Mpu401::default(),
@@ -1109,14 +1071,11 @@ impl Machine {
             // first use, so the value here never reaches the DAC as-is.
             wss_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             wss_rate_hz: 0,
-            wss_sample_phase: 0.0,
-            cd_sample_phase: 0.0,
+            wss_render_phase: RatePhase::default(),
             wss_base,
             wss_irq,
             wss_dma,
             wss_enabled,
-            margo_ns: 0.0,
-            vga_dots: 0.0,
             trace: {
                 let mut trace = BusTrace::default();
                 trace.set_tracing_mode(TracingMode::Off);
@@ -1139,9 +1098,8 @@ impl Machine {
             ata: None,
             fat32_c: None,
             cd_accesses: 0,
-            cd_audio_frac: 0.0,
+            cd_audio_sample: 0,
             rtc: rtc::Rtc::new(),
-            rtc_seconds: 0.0,
             fast_post: true,
             booter_inert: false,
             last_abs: (MOUSE_GUEST_CENTER_X, MOUSE_GUEST_CENTER_Y),
@@ -1581,7 +1539,7 @@ impl Machine {
     /// row once, while Machine refreshes its retained timing and cache state.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.active_mode = mode;
-        self.timing = TimingFactors::for_clock(mode.clock_rate());
+        self.timeline.set_mode(mode);
         self.cpu.set_mode(mode);
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
@@ -1827,19 +1785,16 @@ impl Machine {
             .collect();
         let opl_out = self.resampler.process(&opl_native);
 
-        // HLE: drive DSP/WSS/CD sample counts from guest elapsed clocks * their
-        // programmed (or fixed) rate when possible (Phase 4). The production in
-        // advance_devices uses per-device phase accum (dsp/wss/cd_sample_phase)
-        // so rings are filled by guest time. render drains by delta on elapsed_clocks
-        // for rate matching. Falls back to OPL-scaled when no guest delta. This
-        // decouples audio production from host render cadence and reduces drift.
-        let clock_hz = self.active_mode.clock_rate().as_hz_f64();
-        let delta = self.elapsed_clocks.saturating_sub(self.last_audio_clocks);
-        self.last_audio_clocks = self.elapsed_clocks;
+        // DSP and WSS rings are produced by global guest time. Keep the drain
+        // phases in the same fixed tick domain so a live CPU switch cannot
+        // reinterpret time accumulated under the previous mode.
+        let now_ticks = self.timeline.now_ticks();
+        let delta_ticks = now_ticks.saturating_sub(self.last_audio_ticks);
+        self.last_audio_ticks = now_ticks;
         self.sync_dsp_resampler();
-        let dsp_native_count = if delta > 0 {
-            let r = self.dsp.output_frame_rate() as u64;
-            ((delta as f64 * r as f64 / clock_hz).round() as usize).max(1)
+        let dsp_native_count = if delta_ticks > 0 {
+            self.dsp_render_phase
+                .advance(delta_ticks, u64::from(self.dsp.output_frame_rate())) as usize
         } else {
             (native_samples as f64 * self.dsp.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
                 .round() as usize
@@ -1858,9 +1813,10 @@ impl Machine {
         // is summed directly below WITHOUT the SB16 master/voice/outgain scaling.
         let wss_out = if self.wss_enabled {
             self.sync_wss_resampler();
-            let wss_native_count = if delta > 0 {
-                let r = self.wss.output_frame_rate() as u64;
-                ((delta as f64 * r as f64 / clock_hz).round() as usize).max(1)
+            let wss_native_count = if delta_ticks > 0 {
+                self.wss_render_phase
+                    .advance(delta_ticks, u64::from(self.wss.output_frame_rate()))
+                    as usize
             } else {
                 (native_samples as f64 * self.wss.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
                     .round() as usize
@@ -1934,16 +1890,16 @@ impl Machine {
     fn pull_cd_audio_samples(&mut self, count: usize) -> Vec<(i32, i32)> {
         const SAMPLES_PER_FRAME: usize = crate::cdimage::RAW_SECTOR / 4; // 588
         let mut out = Vec::with_capacity(count);
-        if !self.ide.device().playback().playing {
-            self.cd_audio_frac = 0.0;
+        if !self.ide.device().mixer_audio_active() {
+            self.cd_audio_sample = 0;
             return out;
         }
-        // cd_audio_frac is the next sample index within the current frame, carried
+        // cd_audio_sample is the next sample index within the current frame, carried
         // across render calls so the stream stays continuous. Peek the current
         // frame, drain its remaining samples, then step to the next frame.
-        let mut sample_in_frame = self.cd_audio_frac as usize;
+        let mut sample_in_frame = self.cd_audio_sample;
         while out.len() < count {
-            let Some(buf) = self.ide.device().peek_audio_frame() else {
+            let Some(buf) = self.ide.device().peek_mixer_audio_frame() else {
                 break; // playback reached its end mid-window
             };
             while sample_in_frame < SAMPLES_PER_FRAME && out.len() < count {
@@ -1955,11 +1911,11 @@ impl Machine {
             }
             if sample_in_frame >= SAMPLES_PER_FRAME {
                 // Consumed the whole frame: step the play position forward.
-                self.ide.device_mut().advance_play(1);
+                self.ide.device_mut().advance_mixer_audio(1);
                 sample_in_frame = 0;
             }
         }
-        self.cd_audio_frac = sample_in_frame as f64;
+        self.cd_audio_sample = sample_in_frame;
         out
     }
 
@@ -2102,56 +2058,19 @@ struct MachineBus<'a> {
     // core total as of the in-flight instruction, mirroring exactly the core
     // component of the batch-end step (nothing more, nothing less).
     prior_runs_core_clocks: u64,
-    // Five batch-entry snapshots for the Slice 1 lazy port-read prediction (P4a
-    // Task 1.1: dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Each is a
-    // copy of the corresponding live Machine/BusTrace value at the moment this
-    // bus is constructed (once per batch), never mutated afterward.
-    // `vga_dots_at_batch_start`/`beam_at_batch_start`/`trace_elapsed_at_batch_start`/
-    // `bus_rem_at_batch_start` are consumed by `predicted_beam`, which the lazy
-    // 3DA/3BA/3C2 arm in `read_io` calls (Task 1.3). `elapsed_clocks_at_batch_start`
-    // is not needed by that formula (predicted_beam derives its clock total from
-    // core_clocks + trace bus clocks directly, not from elapsed_clocks); it stays
-    // for construction-site symmetry and is pinned directly by
-    // `predicted_beam_at_batch_start_equals_the_unmutated_beam`.
-    #[allow(dead_code)] // pinned by its own test, not read by predicted_beam's formula
-    elapsed_clocks_at_batch_start: u64,
-    vga_dots_at_batch_start: f64,
+    // Fixed-time snapshot used by lazy PIT and beam reads. Predictions clone the
+    // same integer phases that the batch-end advance consumes.
+    timeline_at_batch_start: Timeline,
+    master_ticks_at_batch_start: u64,
     beam_at_batch_start: u64,
     trace_elapsed_at_batch_start: u64,
     bus_rem_at_batch_start: u64,
-    // The active mode's `1 / clock_hz` factor (Machine::timing.inv_clock), copied
-    // at bus construction like the five batch-entry snapshots above. Needed by
-    // `predicted_beam` to call the shared `predict_dots_core` formula; MachineBus
-    // has no `&Machine` to read `self.timing` from directly. A copy field rather
-    // than a per-call recompute: `TimingFactors::for_clock` only changes on a
-    // Lotura mode write (`set_mode`), so it is batch-entry-stable exactly like
-    // `active_mode` above it.
-    inv_clock_at_batch_start: f64,
     // bus_timing(cpu.level())'s (num, den) ratio, copied at bus construction from
     // the same authoritative CPU mode `scale_bus` reads. `predicted_beam` must
     // scale in-batch bus clocks with exactly this ratio to match the real
     // end-of-batch `scale_bus` call.
     bus_num_at_batch_start: u32,
     bus_den_at_batch_start: u32,
-    // The fractional PIT-input-clock accumulator (Machine::pit_clocks), copied at
-    // bus construction like the snapshots above (P4a Task 2.3: the lazy port 0x61
-    // bits 4/5 read). `advance_devices` is the only place that mutates
-    // `pit_clocks` or steps `self.pit`, and it only runs at batch end / wake step
-    // (never mid-batch), so this snapshot plus the in-batch clock total
-    // (identical construction to `predicted_beam`'s) is enough to reproduce
-    // exactly the elapsed-PIT-clocks `whole` value the real `advance_devices`
-    // would compute for the same total, via the shared `advance_fractional`
-    // formula.
-    pit_clocks_at_batch_start: f64,
-    // The active mode's PIT_INPUT_HZ / clock_hz factor (Machine::timing.
-    // pit_per_clock), copied at bus construction like `inv_clock_at_batch_start`
-    // above and for the same reason (batch-entry-stable, only a Lotura mode
-    // write recomputes TimingFactors). Snapshotted RATHER than recomputed from
-    // PIT_INPUT_HZ and inv_clock: the real `advance_devices` multiplies by this
-    // exact pre-divided f64, and re-deriving it as `PIT_INPUT_HZ as f64 *
-    // inv_clock` is a DIFFERENT factoring whose product floor-diverges from the
-    // real one at the IEEE-f64 level (see `advance_fractional`'s doc comment).
-    pit_per_clock_at_batch_start: f64,
 }
 
 fn icdex_iso_child_record(image: &CdImage, dir_record: &[u8], component: &str) -> Option<Vec<u8>> {

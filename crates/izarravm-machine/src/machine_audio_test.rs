@@ -753,73 +753,106 @@ fn pit_channel0_multi_edge_advance_latches_irq0() {
 }
 
 #[test]
-fn approx_batch_cap_tracks_the_next_device_event() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    let clock_hz = machine.active_mode().clock_hz();
-    let ceiling = clock_hz / 1000;
-    let floor = machine.timing.clocks_per_audio_sample;
+fn event_batch_cap_reaches_a_near_due_pit_edge_in_every_mode() {
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        let ceiling = if mode.uses_approximate_timing() {
+            mode.clock_hz() / 1000
+        } else {
+            mode.clock_hz() / u64::from(DAC_HZ)
+        };
 
-    // Nothing scheduled: the ~1 ms latency ceiling binds. The always-running
-    // channel-1 refresh heartbeat (mode 2, reload 18, ~15 us) must NOT
-    // bind, or this cap could never exceed the Accurate DAC-sample cap.
-    assert_eq!(machine.approx_batch_cap(u64::MAX), ceiling);
+        // With channels 0 and 2 stopped, the mode-scaled fallback binds.
+        assert_eq!(machine.event_batch_cap(u64::MAX), ceiling, "{mode:?}");
+        assert_eq!(machine.event_batch_cap(123), 123, "{mode:?}");
 
-    // The remaining-deadline clamp wins when nearer.
-    assert_eq!(machine.approx_batch_cap(123), 123);
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x08, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
+        });
+        let pit_ticks = machine.pit.clocks_until_out_rise(0).unwrap();
+        let due_ticks = timeline::RatePhase::default()
+            .ticks_until(pit_ticks, u64::from(PIT_INPUT_HZ))
+            .unwrap();
+        machine.advance_devices_ticks(due_ticks - 1);
 
-    // A running channel-0 (IRQ0) counter binds the cap to its next OUT rise.
-    with_bus(&mut machine, |bus| {
-        bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap(); // ch0 mode 2
-        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap();
-        bus.write_io(0x40, BusWidth::Byte, 0x04, false).unwrap(); // reload 0x0400
-    });
-    let ticks = machine.pit.clocks_until_out_rise(0).unwrap();
-    let expected =
-        ((u128::from(ticks) * u128::from(clock_hz)).div_ceil(u128::from(PIT_INPUT_HZ))) as u64;
-    assert!(expected < ceiling && expected > floor);
-    assert_eq!(machine.approx_batch_cap(u64::MAX), expected);
-
-    // A sub-sample edge floors at the DAC-sample cap: an Approximate batch
-    // is never SHORTER than an Accurate one.
-    with_bus(&mut machine, |bus| {
-        bus.write_io(0x40, BusWidth::Byte, 0x08, false).unwrap();
-        bus.write_io(0x40, BusWidth::Byte, 0x00, false).unwrap(); // reload 8 (~7 us)
-    });
-    assert_eq!(machine.approx_batch_cap(u64::MAX), floor);
+        let pit_ticks = machine.pit.clocks_until_out_rise(0).unwrap();
+        let expected = machine
+            .timeline
+            .cpu_clocks_until(
+                timeline::DeviceClock::Pit,
+                pit_ticks,
+                u64::from(PIT_INPUT_HZ),
+            )
+            .unwrap();
+        assert_eq!(expected, 1, "{mode:?}: edge is one master tick away");
+        assert_eq!(machine.event_batch_cap(u64::MAX), expected, "{mode:?}");
+    }
 }
 
 #[test]
-fn approx_batch_cap_ends_at_the_next_dsp_block_edge() {
-    let mut machine = test_machine();
-    machine.set_mode(GswMode::Gsw586);
-    let clock_hz = machine.active_mode().clock_hz();
-    for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
-        machine.write_physical_u8(0x1_0000 + i as u32, b);
+fn event_batch_cap_reaches_a_near_due_stereo_dsp_edge_in_every_mode() {
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            // One 8-bit stereo frame reaches both the half and end edge.
+            for &byte in &[0x41u8, 0x2B, 0x11, 0xC0, 0x20, 0x01, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
+                    .unwrap();
+            }
+        });
+        assert_eq!(machine.dsp.frames_until_next_irq(), Some(1));
+        let rate = u64::from(machine.dsp.output_frame_rate());
+        let due_ticks = timeline::RatePhase::default().ticks_until(1, rate).unwrap();
+        machine.advance_devices_ticks(due_ticks - 1);
+
+        let expected = machine
+            .timeline
+            .cpu_clocks_until(timeline::DeviceClock::Dsp, 1, rate)
+            .unwrap();
+        assert_eq!(expected, 1, "{mode:?}: edge is one master tick away");
+        assert_eq!(machine.event_batch_cap(u64::MAX), expected, "{mode:?}");
     }
-    with_bus(&mut machine, |bus| {
-        // The 16-frame 8-bit single-cycle golden: at 11025 Hz the half edge
-        // (8 frames, ~726 us) is the next due event, under the ~1 ms
-        // ceiling and above the DAC-sample floor.
-        bus.write_io(0x0B, BusWidth::Byte, 0x49, false).unwrap();
-        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
-        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
-        bus.write_io(0x03, BusWidth::Byte, 0x0F, false).unwrap();
-        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
-        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
-        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
-        for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
-            bus.write_io(0x22C, BusWidth::Byte, u32::from(b), false)
-                .unwrap();
-        }
-    });
-    let expected = machine
-        .dsp
-        .clocks_until_next_irq(machine.dsp.rate_hz(), clock_hz)
-        .unwrap();
-    assert!(expected < clock_hz / 1000, "half edge under the ceiling");
-    assert!(expected > machine.timing.clocks_per_audio_sample);
-    assert_eq!(machine.approx_batch_cap(u64::MAX), expected);
+}
+
+#[test]
+fn event_batch_cap_reaches_a_near_due_wss_edge_in_every_mode() {
+    const WSS_FRAME_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 48_000;
+
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        machine.write_physical_u8(0x1_0000, 0x80);
+        with_bus(&mut machine, |bus| wss_arm_8bit_mono(bus, 1));
+
+        // Retire the first frame and stop one master tick before the underflow.
+        machine.advance_devices_ticks(2 * WSS_FRAME_TICKS - 1);
+        assert_eq!(machine.wss.frames_until_next_irq(), Some(1));
+        let expected = machine
+            .timeline
+            .cpu_clocks_until(timeline::DeviceClock::Wss, 1, 48_000)
+            .unwrap();
+        assert_eq!(expected, 1, "{mode:?}: edge is one master tick away");
+        assert_eq!(machine.event_batch_cap(u64::MAX), expected, "{mode:?}");
+    }
 }
 
 #[test]

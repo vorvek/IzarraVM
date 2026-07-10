@@ -481,18 +481,15 @@ impl Ad1848 {
         self.current_count
     }
 
-    /// CPU clocks until the next terminal-count IRQ, or `None` when nothing can
-    /// raise one (idle, IEN clear, or an invalid `rate_hz`). Mirrors
-    /// `SbDsp::clocks_until_next_irq`: it lets a halted CPU fast-forward to the
-    /// codec's next interrupt instead of single-stepping the HLT.
+    /// Output frames until the next terminal-count IRQ, or `None` when nothing
+    /// can raise one (idle or IEN clear). The machine timeline converts this
+    /// device-domain count to the first causal master-tick deadline.
     ///
     /// The AD1848 Current Count drains one sample period per output frame, and
     /// the underflow that latches the IRQ happens the period *after* the count
     /// reaches zero -- so a count of `current_count` reaches the interrupt in
     /// `current_count + 1` output frames (the same N+1 cadence `advance_count`
-    /// enforces). At `rate_hz` frames per second over a `clock_hz` CPU, that is
-    /// `(current_count + 1) * clock_hz / rate_hz` clocks, rounded up and clamped
-    /// to at least one so the run loop always advances.
+    /// enforces).
     ///
     /// The external INT pin is gated by I10 IEN, so a codec armed with IEN clear
     /// sets only the sticky Status bit on underflow and never forwards the line;
@@ -505,8 +502,8 @@ impl Ad1848 {
     /// -- hence no new IRQ -- is generated until the host acks. The estimator must
     /// mirror that gate and return `None`, or the run loop would fast-forward a
     /// halted CPU to a wake the producer never actually generates.
-    pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u64) -> Option<u64> {
-        if !self.playing || rate_hz == 0 {
+    pub fn frames_until_next_irq(&self) -> Option<u64> {
+        if !self.playing {
             return None;
         }
         if self.regs[IDX_PIN_CONTROL] & I10_IEN == 0 {
@@ -515,8 +512,7 @@ impl Ad1848 {
         if self.trd && (self.status & R2_INT) != 0 {
             return None;
         }
-        let frames = u64::from(self.current_count) + 1;
-        Some((frames * clock_hz).div_ceil(u64::from(rate_hz)).max(1))
+        Some(u64::from(self.current_count) + 1)
     }
 
     /// Decode one mono sample of the current format from the byte-wide DMA. 8-bit

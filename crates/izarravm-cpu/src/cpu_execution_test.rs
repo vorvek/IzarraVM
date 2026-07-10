@@ -45,6 +45,27 @@ fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_acc
 }
 
 #[test]
+fn out_and_outs_forward_the_live_run_offset_to_the_bus() {
+    let (mut out_cpu, out_memory) = real_mode_cpu(&[0xee], 32);
+    out_cpu.write_gpr16(2, 0x300);
+    let mut out_bus = TestBus::with_memory(out_memory);
+    let out = out_cpu.decode(&mut out_bus).unwrap();
+    out_cpu.core_clocks_so_far = 123;
+    out_cpu.execute_decoded(&out, &mut out_bus).unwrap();
+    assert_eq!(out_bus.last_write_io_core_clocks_so_far, Some(123));
+
+    let (mut outs_cpu, mut outs_memory) = real_mode_cpu(&[0x6e], 32);
+    outs_memory[0x10] = 0x5a;
+    outs_cpu.write_gpr16(2, 0x300);
+    outs_cpu.write_gpr16(6, 0x10);
+    let mut outs_bus = TestBus::with_memory(outs_memory);
+    let outs = outs_cpu.decode(&mut outs_bus).unwrap();
+    outs_cpu.core_clocks_so_far = 456;
+    outs_cpu.execute_decoded(&outs, &mut outs_bus).unwrap();
+    assert_eq!(outs_bus.last_write_io_core_clocks_so_far, Some(456));
+}
+
+#[test]
 fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approximate_class_continuation()
  {
     // P4a Task 1.3: in the Approximate class (I486/I586) `block_continuable`

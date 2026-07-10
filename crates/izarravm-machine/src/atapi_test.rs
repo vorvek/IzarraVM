@@ -162,11 +162,14 @@ fn pause_then_resume_toggles_playing() {
     // Pause (byte 8 bit0 = 0).
     let _ = dev.execute(&cdb(0x4B));
     assert!(!dev.playback().playing && dev.playback().paused);
+    assert!(!dev.mixer_audio_active());
+    assert!(dev.peek_mixer_audio_frame().is_none());
     // Resume (byte 8 bit0 = 1).
     let mut resume = cdb(0x4B);
     resume[8] = 0x01;
     let _ = dev.execute(&resume);
     assert!(dev.playback().playing);
+    assert!(dev.mixer_audio_active());
     // Stop.
     let _ = dev.execute(&cdb(0x4E));
     assert!(!dev.playback().playing);

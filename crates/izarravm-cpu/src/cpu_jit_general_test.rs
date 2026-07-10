@@ -365,6 +365,65 @@ fn terminator_predicate_covers_clock_device_and_interrupt_ops() {
     }
 }
 
+#[test]
+fn jit_prefix_and_interpreter_out_terminators_agree_on_the_bus_offset() {
+    fn run(opcode: u8) {
+        let mut program = vec![0u8; 0x1000];
+        program[0x100..0x106].copy_from_slice(&[
+            0x90, // starter
+            0x40, // inc eax, JIT loop body
+            0xe2, 0xfd,   // loop 0x101
+            opcode, // out dx,al or outsb
+            0xf4,   // hlt
+        ]);
+        program[0x300] = 0x5a;
+
+        let mut interp = fresh();
+        let mut jit_cpu = fresh();
+        let mut bus_i = TestBus::with_memory(program.clone());
+        let mut bus_j = TestBus::with_memory(program);
+        let arm = |cpu: &mut CpuGsw| {
+            cpu.registers.eip = 0x100;
+            cpu.registers.set_ecx(3);
+            cpu.registers.set_edx(0x300);
+            cpu.registers.set_esi(0x300);
+        };
+        let drive = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+            for _ in 0..32 {
+                bus.io_touched = false;
+                if cpu.run_straight_line(bus, u64::MAX).unwrap().halted {
+                    return;
+                }
+            }
+            panic!("guest never halted");
+        };
+
+        arm(&mut interp);
+        arm(&mut jit_cpu);
+        drive(&mut interp, &mut bus_i);
+        drive(&mut jit_cpu, &mut bus_j);
+        let idx = jit::block::try_admit(&mut jit_cpu, 0x101, true).unwrap();
+        jit_cpu.decode_cache.stamp_region(0x101, true, idx);
+
+        arm(&mut interp);
+        arm(&mut jit_cpu);
+        drive(&mut interp, &mut bus_i);
+        drive(&mut jit_cpu, &mut bus_j);
+
+        assert_eq!(interp, jit_cpu);
+        assert_eq!(bus_i.memory, bus_j.memory);
+        assert_eq!(
+            bus_i.last_write_io_core_clocks_so_far,
+            bus_j.last_write_io_core_clocks_so_far
+        );
+        assert_eq!(bus_i.last_write_io_core_clocks_so_far, Some(0));
+        assert!(jit_cpu.perf_counters().jit_region_entries > 0);
+    }
+
+    run(0xee);
+    run(0x6e);
+}
+
 // ---- 5. 16-bit register ops must not be inlined as 32-bit templates ----
 
 /// Real mode with a 16-bit code segment (the default DOS-game target): CS.D is clear, so

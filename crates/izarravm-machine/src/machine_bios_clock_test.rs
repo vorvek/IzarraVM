@@ -148,47 +148,144 @@ fn int15_ah86_wait_advances_guest_clock() {
         0xCD, 0x15, 0xF4,
     ]);
     let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
-    let before = machine.elapsed_clocks();
+    let before = machine.master_ticks();
     let reason = machine.run_until_halt_or_cycles(10_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
-    // CX:DX = 0x00004240 = 16960 microseconds. stall_for converts that to guest
-    // clocks at the active mode's rate, so the elapsed-clock jump must dwarf the
-    // handful of setup-instruction clocks. Require at least half the expected
-    // stall to leave margin for the rounding in stall_for.
-    let wait_secs = 16_960.0 / 1_000_000.0;
-    let expected_stall = (wait_secs * machine.active_mode().clock_hz() as f64) as u64;
-    let advanced = machine.elapsed_clocks() - before;
+    let expected_stall = 16_960 * (izarravm_core::MASTER_CLOCK_HZ / 1_000_000);
+    let advanced = machine.master_ticks() - before;
     assert!(
         advanced >= expected_stall / 2,
-        "AH=86h stall too small: advanced {advanced} clocks, expected ~{expected_stall}"
+        "AH=86h stall too small: advanced {advanced} ticks, expected ~{expected_stall}"
     );
     let flags = machine.cpu().registers.eflags;
     assert_eq!(flags & 0x0001, 0, "CF clear after WAIT");
 }
 
 #[test]
-fn device_fill_never_moves_the_master_clock() {
-    // The GUI's Approximate-class stall fill relies on this: stall_for already
-    // advanced elapsed_clocks by the stall, so the device catch-up must not
-    // advance it again or the audio pump gains a cumulative lead over wall time.
+fn microsecond_stalls_map_exactly_to_master_ticks() {
     let mut machine = test_machine();
-    let before = machine.elapsed_clocks();
-    machine.advance_devices_clocks(1000);
+    let before = machine.master_ticks();
+    machine.stall_for_micros(16_960);
     assert_eq!(
-        machine.elapsed_clocks(),
-        before,
-        "advance_devices_clocks must advance device time only, never the master clock"
+        machine.master_ticks() - before,
+        16_960 * (izarravm_core::MASTER_CLOCK_HZ / 1_000_000)
     );
+}
+
+#[test]
+fn live_mode_switches_keep_one_master_deadline_and_device_phase() {
+    let rom = rom_with_code(&[
+        0xB0, 0x01, 0xE6, 0xE1, // 486
+        0xB0, 0x00, 0xE6, 0xE1, // 386
+        0xB0, 0x03, 0xE6, 0xE1, // 386-slow
+        0xFA, // cli
+        0xEB, 0xFE, // jmp $
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    machine.set_mode(GswMode::Gsw586);
+    let requested = 200_000;
+    let expected_ticks = machine.timeline.master_ticks_for_cpu_clocks(requested);
+    let before = machine.master_ticks();
+
+    let reason = machine.run_cycles(requested).unwrap();
+
+    assert_eq!(reason, StopReason::CycleLimit { requested });
+    assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
+    let actual_ticks = machine.master_ticks() - before;
+    assert!(actual_ticks >= expected_ticks);
+    assert!(
+        actual_ticks - expected_ticks < 100 * machine.timeline.ticks_per_cpu_clock(),
+        "run deadline overshot by {} ticks (expected {expected_ticks}, actual {actual_ticks})",
+        actual_ticks - expected_ticks
+    );
+
+    // Advancing a fresh slow-mode machine by the same fixed duration must land
+    // every rational device phase at the same point. The three set_mode calls
+    // above therefore changed only future CPU quanta.
+    let mut baseline = test_machine();
+    baseline.set_mode(GswMode::Gsw386Slow);
+    baseline.advance_devices_ticks(actual_ticks);
+    assert_eq!(machine.timeline, baseline.timeline);
+    assert_eq!(machine.video.beam_dots(), baseline.video.beam_dots());
+    assert_eq!(machine.pit.channel_out(0), baseline.pit.channel_out(0));
+    assert_eq!(machine.pit.channel_out(2), baseline.pit.channel_out(2));
+}
+
+#[test]
+fn device_only_advance_moves_global_time_not_cpu_work() {
+    let mut machine = test_machine();
+    let work_before = machine.elapsed_clocks();
+    let ticks_before = machine.master_ticks();
+    machine.advance_devices_clocks(1000);
+    assert_eq!(machine.elapsed_clocks(), work_before);
+    assert_eq!(
+        machine.master_ticks(),
+        ticks_before + machine.timeline.master_ticks_for_cpu_clocks(1000)
+    );
+}
+
+#[test]
+fn storage_stall_advances_pit_audio_video_and_the_timeline() {
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+        bus.write_io(0x42, BusWidth::Byte, 0x20, false).unwrap();
+        bus.write_io(0x42, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
+    });
+    let ticks_before = machine.master_ticks();
+    let beam_before = machine.video.beam_dots();
+    let pit_before = machine.pit.channel_out(2);
+
+    machine.stall_for(0.010);
+
+    assert_eq!(
+        machine.master_ticks() - ticks_before,
+        izarravm_core::MASTER_CLOCK_HZ / 100
+    );
+    assert_ne!(machine.video.beam_dots(), beam_before);
+    assert_ne!(machine.pit.channel_out(2), pit_before);
+    assert!(
+        machine.speaker.drain(441).iter().any(|&sample| sample != 0),
+        "speaker samples must continue through a storage stall"
+    );
+}
+
+#[test]
+fn splitting_a_time_advance_preserves_device_state_and_irq_order() {
+    fn configured() -> Machine {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x34, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 100, false).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0, false).unwrap();
+            bus.write_io(0x43, BusWidth::Byte, 0xb6, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 32, false).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0, false).unwrap();
+            bus.write_io(0x61, BusWidth::Byte, 0x03, false).unwrap();
+        });
+        machine
+    }
+
+    let mut whole = configured();
+    let mut split = configured();
+    whole.advance_devices_clocks(12_345);
+    for clocks in [1, 17, 337, 5_000, 6_990] {
+        split.advance_devices_clocks(clocks);
+    }
+
+    assert_eq!(split.timeline, whole.timeline);
+    assert_eq!(split.pit, whole.pit);
+    assert_eq!(split.pic, whole.pic);
+    assert_eq!(split.video.beam_dots(), whole.video.beam_dots());
+    assert_eq!(split.speaker.drain(100), whole.speaker.drain(100));
 }
 
 #[test]
 fn wall_shortfall_advances_devices_and_master_clock_together() {
     // The GUI's Approximate-class wall-clock top-up relies on this: when the
     // host could not execute the full budget, the unrun remainder must move
-    // BOTH device time and the master clock, so the audio pump (which paces
-    // off elapsed_clocks deltas) keeps tracking wall time. Contrast with
-    // device_fill_never_moves_the_master_clock above: that path fills a gap
-    // the master clock already jumped over; this one creates the time.
+    // both device time and the fixed timeline, without claiming CPU work.
     let mut machine = test_machine();
     fn latched_count(m: &mut Machine) -> u16 {
         let mut bus = m.make_bus();
@@ -217,9 +314,9 @@ fn wall_shortfall_advances_devices_and_master_clock_together() {
         "a span with no intervening vretrace edge is consumed in full"
     );
     assert_eq!(
-        machine.elapsed_clocks(),
-        before + 100_000,
-        "advance_wall_shortfall must advance the master clock by exactly the consumed clocks"
+        machine.master_ticks(),
+        before + machine.timeline.master_ticks_for_cpu_clocks(consumed),
+        "advance_wall_shortfall must advance global guest time"
     );
     assert_ne!(
         latched_count(&mut machine),
@@ -236,7 +333,7 @@ fn wall_shortfall_stops_at_a_vretrace_start_edge_and_then_makes_progress() {
     // of sweeping the whole window past it unobserved.
     let mut machine = test_machine();
     let clock_hz = machine.active_mode().clock_hz();
-    let before = machine.elapsed_clocks();
+    let before = machine.master_ticks();
     // A full guest second: dozens of frames, so an edge is guaranteed inside.
     let consumed = machine.advance_wall_shortfall(clock_hz);
     assert!(
@@ -245,9 +342,9 @@ fn wall_shortfall_stops_at_a_vretrace_start_edge_and_then_makes_progress() {
     );
     assert!(consumed > 0, "the stop must still make progress");
     assert_eq!(
-        machine.elapsed_clocks(),
-        before + consumed,
-        "the master clock advances by exactly the consumed clocks"
+        machine.master_ticks(),
+        before + machine.timeline.master_ticks_for_cpu_clocks(consumed),
+        "the timeline advances by the consumed active-mode clocks"
     );
     assert_ne!(
         machine.video_mut().read_status1() & 0x08,

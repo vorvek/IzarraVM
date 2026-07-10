@@ -64,16 +64,13 @@ impl Machine {
             direct_map_changed: &mut self.direct_map_changed,
             core_clocks_so_far: 0,
             prior_runs_core_clocks: 0,
-            elapsed_clocks_at_batch_start: self.elapsed_clocks,
-            vga_dots_at_batch_start: self.vga_dots,
+            timeline_at_batch_start: self.timeline,
+            master_ticks_at_batch_start: self.timeline.now_ticks(),
             beam_at_batch_start,
             trace_elapsed_at_batch_start,
             bus_rem_at_batch_start: self.bus_rem,
-            inv_clock_at_batch_start: self.timing.inv_clock,
             bus_num_at_batch_start,
             bus_den_at_batch_start,
-            pit_clocks_at_batch_start: self.pit_clocks,
-            pit_per_clock_at_batch_start: self.timing.pit_per_clock,
         }
     }
 
@@ -132,6 +129,26 @@ impl Machine {
         } else {
             TracingMode::Off
         });
+    }
+}
+
+impl MachineBus<'_> {
+    pub(crate) fn write_io(
+        &mut self,
+        port: u16,
+        width: BusWidth,
+        value: u32,
+        cpu_is_ring0_pm: bool,
+    ) -> Result<(), BusError> {
+        let core_clocks_so_far = self.core_clocks_so_far;
+        <Self as CpuBus>::write_io(
+            self,
+            port,
+            width,
+            value,
+            core_clocks_so_far,
+            cpu_is_ring0_pm,
+        )
     }
 }
 
@@ -351,15 +368,10 @@ impl CpuBus for MachineBus<'_> {
     }
 
     /// See the trait doc: the straight-line run loop adds this figure's growth
-    /// to its core total against the (guest-clock) run cap. Approximate class
-    /// only; the Accurate class returns 0 so its lockstep batches keep the
-    /// historical core-only check bit-for-bit (frozen 386 byte-identity).
-    /// Same arithmetic as `in_batch_clocks` minus the core terms the CPU
-    /// already tracks itself.
+    /// to its core total against the guest-clock run cap. The same scaled-bus
+    /// accounting applies in every CPU mode so a bus-heavy run cannot cross an
+    /// earlier master-timeline deadline unnoticed.
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
-        if !self.active_mode.uses_approximate_timing() {
-            return 0;
-        }
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         (raw * u64::from(self.bus_num_at_batch_start) + self.bus_rem_at_batch_start)
             / u64::from(self.bus_den_at_batch_start)
@@ -646,7 +658,7 @@ impl CpuBus for MachineBus<'_> {
         // guest-visible device activity in their own right. Ending the CPU batch
         // around them (the normal io_touched contract) triples the guest-visible
         // cost of every V86 trap for no fidelity gain: device time is still exact
-        // because the batch still ends at the next approx_batch_cap edge or the
+        // because the batch still ends at the next event_batch_cap edge or the
         // next GUEST port access, and OCW3's read-select is pure register state
         // (see pic.rs -- `read_isr` is a mode bit, not time-derived), so deferring
         // exactly when it is consumed relative to batch-end timing is safe. Gated
@@ -829,11 +841,10 @@ impl CpuBus for MachineBus<'_> {
             // detection loop runs inside one batch, the timer only advances at batch
             // end (after every poll already read a stale 0x00), and detection fails.
             *self.io_touched = true;
-            // Charge the poll its real ISA bus time in the Approximate class so it
+            // Charge the poll its real ISA bus time in the fast modes so it
             // cannot outrun the 80 us OPL timer on a fast CPU (folded into the batch
-            // device advance in run_until_clock). The Accurate class never accrues
-            // this, keeping its byte-identical batch cadence; it also does not need
-            // it (its slower clock already spans the window).
+            // device advance in run_until_tick). The 386 modes do not need this
+            // charge because their slower clocks already span the window.
             if self.lazy_port_reads {
                 *self.isa_io_clocks += isa_io_clocks(self.active_mode);
             }
@@ -958,8 +969,10 @@ impl CpuBus for MachineBus<'_> {
         port: u16,
         width: BusWidth,
         value: u32,
+        core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError> {
+        self.core_clocks_so_far = core_clocks_so_far;
         // See read_io's matching comment (V86 trap tax, Part 1): the ring-0
         // monitor's own device pokes (e.g. the vec13 discriminator's PIC OCW3
         // select write) are chipset bookkeeping, not guest-visible activity, so
@@ -1008,10 +1021,12 @@ impl CpuBus for MachineBus<'_> {
             // `0x3CE`/`0x3D4`) depends on this; it used to halt the VM with
             // WidthMismatch.
             for i in 0..width.bytes() {
-                self.write_io(
+                <Self as CpuBus>::write_io(
+                    self,
                     io_word_sub_port(port, i),
                     BusWidth::Byte,
                     value >> (8 * i),
+                    core_clocks_so_far,
                     cpu_is_ring0_pm,
                 )?;
             }
@@ -1030,8 +1045,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if port == WAVETABLE_MPU_BASE {
-            self.wavetable_mpu
-                .write_data(value as u8, self.elapsed_clocks_at_batch_start);
+            let guest_tick = self.guest_tick_now();
+            self.wavetable_mpu.write_data(value as u8, guest_tick);
             return Ok(());
         }
         if port == WAVETABLE_MPU_BASE + 1 {
@@ -1039,8 +1054,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if port == MIDI_INPUT_MPU_BASE {
-            self.midi_input_mpu
-                .write_data(value as u8, self.elapsed_clocks_at_batch_start);
+            let guest_tick = self.guest_tick_now();
+            self.midi_input_mpu.write_data(value as u8, guest_tick);
             return Ok(());
         }
         if port == MIDI_INPUT_MPU_BASE + 1 {

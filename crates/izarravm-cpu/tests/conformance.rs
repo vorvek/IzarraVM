@@ -87,6 +87,7 @@ impl CpuBus for FlatBus {
         _port: u16,
         _width: BusWidth,
         _value: u32,
+        _core_clocks_so_far: u64,
         _cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError> {
         Ok(())

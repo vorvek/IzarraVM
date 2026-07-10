@@ -8,7 +8,7 @@ fn reset_handshake_yields_0xaa() {
     let mut dsp = SbDsp::default();
     dsp.write_port(0x226, 0x01);
     dsp.write_port(0x226, 0x00);
-    dsp.advance_micros(120.0); // > the ~100us the DSP needs to respond
+    dsp.advance_micros(120); // > the ~100us the DSP needs to respond
     // 0x22E bit7 = data available.
     assert_eq!(dsp.read_port(0x22E), Some(0x80));
     assert_eq!(dsp.read_port(0x22A), Some(0xAA));
@@ -472,6 +472,25 @@ fn pcm_bytes_per_output_frame_tracks_width_and_channels() {
 
     write_cmd(&mut dsp, &[0x75, 0x02, 0x00]);
     assert_eq!(dsp.pcm_bytes_per_output_frame(), None);
+}
+
+#[test]
+fn frames_until_next_irq_counts_stereo_dma_units() {
+    let mut dsp = SbDsp::default();
+    write_cmd(&mut dsp, &[0xC6, 0x20, 0x0F, 0x00]);
+    assert_eq!(dsp.frames_until_next_irq(), Some(4));
+
+    let mut bytes = [0x80; 8].into_iter();
+    assert_eq!(dsp.tick_n_samples(3, || bytes.next(), || None), 3);
+    assert_eq!(dsp.frames_until_next_irq(), Some(1));
+}
+
+#[test]
+fn sbpro_stereo_does_not_change_16bit_mono_irq_units() {
+    let mut dsp = SbDsp::default();
+    dsp.set_sbpro_stereo(true);
+    write_cmd(&mut dsp, &[0xB0, 0x00, 0x07, 0x00]);
+    assert_eq!(dsp.frames_until_next_irq(), Some(4));
 }
 
 #[test]

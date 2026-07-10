@@ -488,9 +488,7 @@ pub trait CpuBus {
     /// blit) cannot exhaust a guest-clock budget expressed in core clocks and
     /// overshoot the next timer edge - the batch cap's PIT terms are guest
     /// clocks, and a real PIT interrupts at every edge. Buses without batch
-    /// bus accounting (or ones whose cap really is core clocks, like the
-    /// Accurate-class lockstep) return 0, which reproduces the historical
-    /// core-only check bit-for-bit.
+    /// bus accounting return 0 and use the core-only check.
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         0
     }
@@ -588,12 +586,15 @@ pub trait CpuBus {
         cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError>;
 
-    /// `cpu_is_ring0_pm`: see `read_io`'s doc comment. Same live-per-call contract.
+    /// `core_clocks_so_far` and `cpu_is_ring0_pm` have the same live-per-call
+    /// contract as `read_io` so output events can use their exact guest-time
+    /// offset inside a batch.
     fn write_io(
         &mut self,
         port: u16,
         width: BusWidth,
         value: u32,
+        core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<(), BusError>;
 

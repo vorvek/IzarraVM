@@ -156,7 +156,7 @@ impl AdpcmState {
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SbDsp {
-    reset_micros: Option<f64>,
+    reset_micros: Option<u64>,
     read_data: VecDeque<u8>,
     data_available: bool,
     // Last byte handed back on the read-data port. The bus holds its last value,
@@ -244,10 +244,10 @@ impl Default for SbDsp {
 impl SbDsp {
     /// Advance the DSP's reset-settle countdown by `micros` microseconds. When
     /// the countdown elapses the DSP queues 0xAA on read-data.
-    pub fn advance_micros(&mut self, micros: f64) {
+    pub fn advance_micros(&mut self, micros: u64) {
         if let Some(remaining) = self.reset_micros.as_mut() {
-            *remaining -= micros;
-            if *remaining <= 0.0 {
+            *remaining = remaining.saturating_sub(micros);
+            if *remaining == 0 {
                 self.queue_read(0xAA);
                 self.reset_micros = None;
             }
@@ -577,31 +577,29 @@ impl SbDsp {
         self.rendered.pop_front()
     }
 
-    /// CPU clocks until the next half/end-buffer IRQ edges, or None when the DSP
-    /// is not playing. The next edge is the sooner of the half-buffer point
-    /// (`block_remaining - block_size/2`, unless already reached) and the
-    /// end-of-buffer point (`block_remaining`). Converted to CPU clocks via
-    /// `ceil(samples * clock_hz / rate_hz)`, clamped to at least one. `rate_hz`
-    /// must be the rate at which the block counter actually drains (the raw
-    /// byte/word rate from [`rate_hz`](Self::rate_hz), not the per-channel
-    /// output frame rate): the counter ticks in bytes for 8-bit and words for
-    /// 16-bit. With the byte/word rate this is exact for every 8-bit mode
-    /// (including SB Pro stereo, which drains two bytes per frame at the full
-    /// byte rate). For 16-bit stereo the counter advances two words per frame
-    /// while `rate_hz` is per-frame, so this stays a conservative (never under-)
-    /// estimate, which is what the HLT fast-forward needs.
-    pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u64) -> Option<u64> {
-        if !self.playing || rate_hz == 0 {
+    /// Output frames until the next half/end-buffer IRQ edge. PCM stereo drains
+    /// two block units per frame; mono drains one. Creative ADPCM fetch cadence
+    /// depends on its decoded-sample FIFO, so it returns the earliest causal
+    /// deadline of one frame rather than risking a late interrupt.
+    pub fn frames_until_next_irq(&self) -> Option<u64> {
+        if !self.playing {
             return None;
+        }
+        if self.adpcm.is_some() {
+            return Some(1);
         }
         let half_left = if self.half_reached {
             u32::MAX
         } else {
             self.block_remaining.saturating_sub(self.block_size / 2)
         };
-        let end_left = self.block_remaining;
-        let samples = half_left.min(end_left).max(1) as u64;
-        Some(((samples * clock_hz).div_ceil(rate_hz as u64)).max(1))
+        let units = u64::from(half_left.min(self.block_remaining).max(1));
+        let units_per_frame = if self.stereo || (!self.dma_16bit && self.sbpro_stereo) {
+            2
+        } else {
+            1
+        };
+        Some(units.div_ceil(units_per_frame))
     }
 
     /// Produce one stereo output frame for the current DMA mode, or None if the
@@ -875,9 +873,9 @@ impl SbDsp {
             0x226 => {
                 // Write 1 arms the reset; write 0 starts the ~100us settle.
                 if value == 0x01 {
-                    self.reset_micros = Some(0.0);
+                    self.reset_micros = Some(0);
                 } else {
-                    self.reset_micros = Some(100.0);
+                    self.reset_micros = Some(100);
                     self.read_data.clear();
                     self.data_available = false;
                     // Real hardware halts playback and clears the interrupt
