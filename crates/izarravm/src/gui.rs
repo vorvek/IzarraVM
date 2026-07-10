@@ -57,6 +57,7 @@ fn volume_gain(volume: f32) -> f32 {
 /// holds regardless of the exact wake interval as long as it stays well under
 /// the 50 ms master-tick budget cap.
 const EMU_SLICE: Duration = Duration::from_millis(1);
+const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Ceiling on how often accumulated mouse motion is flushed into the guest,
 /// independent of (and generally faster than) the video refresh rate that
@@ -147,6 +148,23 @@ fn duration_for_master_ticks(master_ticks: u64) -> Duration {
         seconds.saturating_add((nanos / 1_000_000_000) as u64),
         (nanos % 1_000_000_000) as u32,
     )
+}
+
+fn speed_sample(
+    executed_ticks: u64,
+    halted_ticks: u64,
+    advanced_ticks: u64,
+    wall: Duration,
+) -> (f64, bool) {
+    let idle =
+        advanced_ticks != 0 && u128::from(halted_ticks) * 10 >= u128::from(advanced_ticks) * 9;
+    let wall_ticks = wall.as_secs_f64() * MASTER_CLOCK_HZ as f64;
+    let ratio = if wall_ticks > 0.0 {
+        (executed_ticks as f64 / wall_ticks).min(1.0)
+    } else {
+        0.0
+    };
+    (ratio, idle)
 }
 
 fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
@@ -305,7 +323,8 @@ struct Frame {
     height: usize,
     seq: u64,              // guest frame counter
     serial: String,        // COM1 log
-    speed_ratio: f64,      // EMA, fraction of real time
+    speed_ratio: f64,      // active CPU throughput, fraction of real time
+    idle: bool,            // at least 90% of the sample advanced through HLT
     mode: Option<GswMode>, // live CPU mode for the label
     refresh_hz: f64,       // guest vertical refresh, paces the UI repaint
     floppy_accesses: u64,  // monotonic A: access count, drives the LED
@@ -944,6 +963,11 @@ fn emulate(
 
     let mut audio_debt = 0.0;
     let mut speed_ratio = 0.0;
+    let mut speed_idle = false;
+    let mut speed_wall = Duration::ZERO;
+    let mut speed_executed = 0u64;
+    let mut speed_halted = 0u64;
+    let mut speed_advanced = 0u64;
     // Pacing credit (master ticks the guest is owed). Wall time refills it; guest
     // time drains it. A disk read that consumes more than its slice drives
     // it negative, pausing the guest for the disk's duration.
@@ -1032,6 +1056,7 @@ fn emulate(
         let now = Instant::now();
         let dt = now.duration_since(last);
         let dt_secs = dt.as_secs_f64();
+        speed_wall = speed_wall.saturating_add(dt);
         last = now;
         // Credit stays in fixed master ticks across guest-driven CPU-mode changes.
         let cap = MASTER_CLOCK_HZ / 20;
@@ -1040,6 +1065,7 @@ fn emulate(
         if budget > 0 {
             let before = machine.master_ticks();
             let stall_before = machine.io_stall_ticks();
+            let halted_before = machine.halted_ticks();
             let approximate = machine.active_mode().uses_approximate_timing();
             let stop = if approximate {
                 // The fast modes are sub-sliced in 1 ms master-time quanta so a
@@ -1069,12 +1095,13 @@ fn emulate(
             // exclude it from the speed measurement below.
             let mut stalled = machine.io_stall_ticks().saturating_sub(stall_before);
             let mut topped_up = 0u64;
+            let mut halt_top_up = 0u64;
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
             // framebuffer is presented instead.
             if matches!(stop, Some(StopReason::Halted)) {
-                let halt_top_up = budget.saturating_sub(ran);
+                halt_top_up = budget.saturating_sub(ran);
                 machine.advance_devices_ticks(halt_top_up);
                 topped_up = halt_top_up;
             } else if approximate && stop.is_none() {
@@ -1097,13 +1124,21 @@ fn emulate(
                 stalled = machine.io_stall_ticks().saturating_sub(stall_before);
             }
             credit -= i64::try_from(ran.saturating_add(topped_up)).unwrap_or(i64::MAX);
-            if dt_secs > 0.0 {
-                // Speed reflects instructions executed vs wall time; a drive stall
-                // is intentional wait, not the emulator running fast.
-                let executed = ran.saturating_sub(stalled);
-                let ratio = (executed as f64 / (dt_secs * MASTER_CLOCK_HZ as f64)).min(1.5);
-                speed_ratio = speed_ratio * 0.9 + ratio * 0.1;
-            }
+            let halted = machine.halted_ticks().saturating_sub(halted_before);
+            // Speed reflects active CPU work. Device-I/O stalls and HLT
+            // fast-forward are intentional waits, not CPU throughput.
+            speed_executed =
+                speed_executed.saturating_add(ran.saturating_sub(stalled).saturating_sub(halted));
+            speed_halted = speed_halted.saturating_add(halted.saturating_add(halt_top_up));
+            speed_advanced = speed_advanced.saturating_add(ran.saturating_add(topped_up));
+        }
+        if speed_wall >= SPEED_SAMPLE_INTERVAL {
+            (speed_ratio, speed_idle) =
+                speed_sample(speed_executed, speed_halted, speed_advanced, speed_wall);
+            speed_wall = Duration::ZERO;
+            speed_executed = 0;
+            speed_halted = 0;
+            speed_advanced = 0;
         }
         pump_midi(&mut machine, &mut wavetable, &mut midi_receiver);
         if let Some(sink) = &sink {
@@ -1153,6 +1188,7 @@ fn emulate(
             f.mode = Some(mode);
             f.refresh_hz = refresh_hz;
             f.speed_ratio = speed_ratio;
+            f.idle = speed_idle;
             f.floppy_accesses = floppy_accesses;
             f.c_accesses = c_accesses;
             f.cd_accesses = cd_accesses;
@@ -1926,12 +1962,13 @@ impl GuiApp {
 
     fn panel_body(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_some();
-        let (mode, speed, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
+        let (mode, speed, idle, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
             Some(emu) => {
                 let f = emu.frame.lock().expect("frame snapshot poisoned");
                 (
                     f.mode,
                     f.speed_ratio,
+                    f.idle,
                     f.floppy_accesses,
                     f.c_accesses,
                     f.cd_accesses,
@@ -1940,6 +1977,7 @@ impl GuiApp {
             None => (
                 None,
                 0.0,
+                false,
                 self.floppy_access_seen,
                 self.c_access_seen,
                 self.cd_access_seen,
@@ -1989,14 +2027,16 @@ impl GuiApp {
                     });
                 });
                 ui.horizontal(|ui| {
-                    line(
-                        ui,
+                    let text = if idle {
+                        format!("Idle - {} MB", self.profile.memory_mib)
+                    } else {
                         format!(
                             "Speed {:.0}% - {} MB",
                             speed * 100.0,
                             self.profile.memory_mib
-                        ),
-                    );
+                        )
+                    };
+                    line(ui, text);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
                         if ui.button(com1_label).clicked() {

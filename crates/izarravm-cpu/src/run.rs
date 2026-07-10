@@ -576,6 +576,8 @@ impl CpuGsw {
             ctx.entry_eip = eip;
             ctx.raw_clocks = 0;
             ctx.insn_count = 0;
+            ctx.native_insn_count = 0;
+            ctx.helper_exit_count = 0;
             ctx.run_total_at_entry = total;
             ctx.bus_at_run_start = bus_at_entry;
             ctx.cap = cap;
@@ -596,6 +598,7 @@ impl CpuGsw {
             ctx.fold_bus_cost = ctx.fetch_cost + bus.jit_data_byte_cost_clocks();
             (region.entry, std::ptr::from_mut(ctx))
         };
+        let block_start = (self.perf.jit_region_entries & 0x3ff == 0).then(std::time::Instant::now);
         // SAFETY: the emitted code only forwards these pointers to `region_step::<B>`, whose
         // contract this call establishes: `self` and `bus` stay live `&mut` for the whole call
         // (no other reference to either exists here), `ctx` is the running region's boxed
@@ -609,7 +612,11 @@ impl CpuGsw {
                 ctx_ptr,
             );
         }
-        let (raw, count, halted, fault, folded_bus) = {
+        if let Some(start) = block_start {
+            self.perf.jit_native_block_ns += duration_ns_u64(start.elapsed());
+            self.perf.jit_native_block_samples += 1;
+        }
+        let (raw, count, native_count, helper_exits, halted, fault, folded_bus) = {
             let region = self
                 .jit_regions
                 .get_mut(idx)
@@ -618,6 +625,8 @@ impl CpuGsw {
             (
                 ctx.raw_clocks,
                 ctx.insn_count,
+                ctx.native_insn_count,
+                ctx.helper_exit_count,
                 ctx.halted,
                 ctx.fault.take(),
                 std::mem::take(&mut ctx.folded_raw_bus),
@@ -635,6 +644,8 @@ impl CpuGsw {
         self.perf.instructions += u64::from(count);
         self.perf.jit_region_entries += 1;
         self.perf.jit_region_insns += u64::from(count);
+        self.perf.jit_native_insns += u64::from(native_count);
+        self.perf.jit_helper_exits += u64::from(helper_exits);
         if ring0 {
             self.perf.monitor_resident_core_clocks += charged;
         }

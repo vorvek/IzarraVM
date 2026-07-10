@@ -58,6 +58,11 @@ impl Machine {
         self.timeline.io_stall_ticks()
     }
 
+    /// Monotonic master ticks advanced while the CPU was parked by HLT.
+    pub fn halted_ticks(&self) -> u64 {
+        self.halted_ticks
+    }
+
     /// Scale a step's raw bus clocks by the active level's `bus_timing` factor,
     /// carrying the fractional remainder so a cheap access in a fast mode is not
     /// rounded to zero. This is the THIRD timing lever (B-T10): it scales the whole
@@ -639,6 +644,14 @@ impl Machine {
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(clocks);
     }
 
+    pub(super) fn advance_halted_cpu_clocks(&mut self, clocks: u64) {
+        let before = self.timeline.now_ticks();
+        self.advance_cpu_work(clocks, 0);
+        self.halted_ticks = self
+            .halted_ticks
+            .saturating_add(self.timeline.now_ticks().saturating_sub(before));
+    }
+
     /// Advance global guest time by active-mode CPU clocks without executing CPU
     /// work. Used for wall shortfall, halted scanout, and focused device tests.
     pub fn advance_devices_clocks(&mut self, clocks: u64) {
@@ -653,9 +666,13 @@ impl Machine {
     }
 
     pub(super) fn advance_halted_ticks(&mut self, master_ticks: u64) {
+        let before = self.timeline.now_ticks();
         let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
         self.advance_master_time(master_ticks, false, 0);
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(cpu_clocks);
+        self.halted_ticks = self
+            .halted_ticks
+            .saturating_add(self.timeline.now_ticks().saturating_sub(before));
     }
 
     #[cfg(test)]

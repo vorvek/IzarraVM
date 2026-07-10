@@ -206,6 +206,16 @@ fn region_run_is_byte_identical_to_the_interpreter() {
         "the region should have retired the loop's instructions, got {}",
         perf.jit_region_insns
     );
+    assert!(perf.jit_native_insns > 0, "no native instruction retired");
+    assert!(perf.jit_helper_exits > 0, "no region helper ran");
+    assert!(
+        perf.jit_native_insns < perf.jit_region_insns,
+        "the mixed native/helper block reported no interpreted instructions"
+    );
+    assert_eq!(
+        perf.jit_native_block_samples, 1,
+        "the first compiled block entry must be timed"
+    );
     assert_eq!(interp.perf_counters().jit_region_entries, 0);
 }
 

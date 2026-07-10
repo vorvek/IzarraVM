@@ -625,6 +625,9 @@ pub struct Machine {
     active_mode: GswMode,
     pending_mode: Option<GswMode>,
     timeline: Timeline,
+    // Monotonic fixed-time duration advanced while HLT had parked the CPU. The
+    // GUI uses this to distinguish an idle guest from a slow active CPU.
+    halted_ticks: u64,
     cpu: CpuGsw,
     // Per-mode cache model. A data access warms its tag state and the resolved tier
     // drives the charged wait-state (its per-mode tier costs are calibrated). Reset
@@ -999,6 +1002,7 @@ impl Machine {
             active_mode,
             pending_mode: None,
             timeline: Timeline::new(active_mode),
+            halted_ticks: 0,
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,

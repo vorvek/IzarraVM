@@ -44,6 +44,8 @@ fn stub_region(entry_lin: u32, d: bool) -> CompiledRegion {
             fold_bus_cost: 0,
             fetch_cost: 0,
             store_finish_fn: None,
+            native_insn_count: 0,
+            helper_exit_count: 0,
         }),
         entry_lin,
         d,

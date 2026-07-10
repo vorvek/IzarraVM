@@ -27,6 +27,7 @@ fn low_watermark_refills_to_target_before_new_audio() {
     let ring = Arc::new(ArrayQueue::new(CAPACITY_FRAMES));
     let sink = AudioSink {
         ring: Arc::clone(&ring),
+        debug: None,
     };
 
     sink.queue(&[(123, -123)]);
@@ -46,6 +47,7 @@ fn high_watermark_drops_latency_and_marks_a_fade_boundary() {
     }
     let sink = AudioSink {
         ring: Arc::clone(&ring),
+        debug: None,
     };
 
     sink.queue(&[(6_400, -6_400)]);
@@ -53,9 +55,11 @@ fn high_watermark_drops_latency_and_marks_a_fade_boundary() {
     assert_eq!(ring.len(), TARGET_FRAMES);
     let mut source = CallbackSource {
         ring: Arc::clone(&ring),
+        debug: None,
         last: (6_400, -6_400),
         gain: RAMP_FRAMES,
         underruns: 0,
+        prefill_remaining: TARGET_FRAMES,
     };
     for step in (0..RAMP_FRAMES).rev() {
         assert_eq!(
@@ -81,6 +85,7 @@ fn incoming_write_is_part_of_the_high_watermark_decision() {
     }
     let sink = AudioSink {
         ring: Arc::clone(&ring),
+        debug: None,
     };
 
     sink.queue(&[(20, 20), (30, 30)]);
@@ -100,7 +105,7 @@ fn callback_fades_out_and_back_in_over_sixty_four_source_frames() {
     for _ in 0..RAMP_FRAMES {
         ring.push(QueuedFrame::Audio((6_400, -6_400))).unwrap();
     }
-    let mut source = CallbackSource::new(Arc::clone(&ring));
+    let mut source = CallbackSource::with_debug(Arc::clone(&ring), None);
 
     for step in 1..=RAMP_FRAMES {
         assert_eq!(
@@ -131,6 +136,7 @@ fn oversized_writes_recover_to_target_with_the_newest_audio() {
     let ring = new_ring();
     let sink = AudioSink {
         ring: Arc::clone(&ring),
+        debug: None,
     };
     let frames: Vec<_> = (0..CAPACITY_FRAMES * 2)
         .map(|index| (index as i16, -(index as i16)))
@@ -155,4 +161,37 @@ fn oversized_writes_recover_to_target_with_the_newest_audio() {
         last,
         Some(QueuedFrame::Audio(frame)) if frame == *frames.last().unwrap()
     ));
+}
+
+#[test]
+fn debug_snapshot_records_producer_consumer_and_callback_pressure() {
+    let ring = Arc::new(ArrayQueue::new(CAPACITY_FRAMES));
+    let debug = Arc::new(AudioDebugCounters::new(ring.len()));
+    let sink = AudioSink {
+        ring: Arc::clone(&ring),
+        debug: Some(Arc::clone(&debug)),
+    };
+
+    sink.queue(&[(1, -1), (2, -2)]);
+    let mut source = CallbackSource::with_debug(Arc::clone(&ring), Some(Arc::clone(&debug)));
+    source.prefill_remaining = 0;
+    while !ring.is_empty() {
+        source.next();
+    }
+    source.next();
+
+    let oversized = vec![(3, -3); CAPACITY_FRAMES * 2];
+    sink.queue(&oversized);
+    debug.record_callback_lateness(2_500_000);
+
+    let snapshot = debug.snapshot();
+    assert_eq!(snapshot.frames_produced, 2 + oversized.len() as u64);
+    assert_eq!(snapshot.frames_consumed, TARGET_FRAMES as u64 + 3);
+    assert_eq!(snapshot.queue_min_depth, 0);
+    assert_eq!(snapshot.queue_max_depth, TARGET_FRAMES + 2);
+    assert_eq!(snapshot.underruns_after_prefill, 1);
+    assert_eq!(snapshot.overruns, 1);
+    assert_eq!(snapshot.late_callbacks, 1);
+    assert_eq!(snapshot.callback_lateness_us, 2_500);
+    assert_eq!(snapshot.max_callback_lateness_us, 2_500);
 }

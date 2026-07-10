@@ -1115,6 +1115,11 @@ fn emit_fold_bookkeeping(
     e.load_r32_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF + 8);
     e.add_r32_imm32(Reg::RAX, u32::from(count));
     e.store_r32_disp8(Reg::R15, RAW_CLOCKS_OFF + 8, Reg::RAX);
+    // ctx.native_insn_count += count
+    let native_count_off = core::mem::offset_of!(RegionCtx, native_insn_count) as i32;
+    e.load_r32_disp32(Reg::RAX, Reg::R15, native_count_off);
+    e.add_r32_imm32(Reg::RAX, u32::from(count));
+    e.store_r32_disp32(Reg::R15, native_count_off, Reg::RAX);
     // ctx.folded_raw_bus += cost * count
     let folded_off = core::mem::offset_of!(RegionCtx, folded_raw_bus) as i32;
     e.load_r64_disp32(Reg::RAX, Reg::R15, folded_off);
@@ -1243,6 +1248,10 @@ fn emit_native_bookkeeping(
     e.load_r32_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF + 8);
     e.add_r32_imm32(Reg::RAX, 1);
     e.store_r32_disp8(Reg::R15, RAW_CLOCKS_OFF + 8, Reg::RAX);
+    let native_count_off = core::mem::offset_of!(RegionCtx, native_insn_count) as i32;
+    e.load_r32_disp32(Reg::RAX, Reg::R15, native_count_off);
+    e.add_r32_imm32(Reg::RAX, 1);
+    e.store_r32_disp32(Reg::R15, native_count_off, Reg::RAX);
 
     // 3. Cap check: total + bus_delta >= cap
     //    where total = run_total + (rem0 + raw) / den (floor division, u64)
@@ -1483,6 +1492,7 @@ pub(crate) fn try_admit_gated(
             // admitted" and interprets instead.
             cpu.jit_regions.clear();
             cpu.decode_cache.invalidate();
+            cpu.perf.code_invalidations += 1;
             return None;
         }
         return Some(idx);
@@ -1493,6 +1503,7 @@ pub(crate) fn try_admit_gated(
     if cpu.jit_regions.len() >= JIT_REGION_TABLE_CAP {
         cpu.jit_regions.clear();
         cpu.decode_cache.invalidate();
+        cpu.perf.code_invalidations += 1;
         cpu.perf.jit_table_clears += 1;
         return None;
     }
@@ -1539,6 +1550,8 @@ pub(crate) fn try_admit_gated(
         fold_bus_cost: 0,
         fetch_cost: 0,
         store_finish_fn: None,
+        native_insn_count: 0,
+        helper_exit_count: 0,
     });
     let idx = cpu.jit_regions.install(CompiledRegion {
         buf,

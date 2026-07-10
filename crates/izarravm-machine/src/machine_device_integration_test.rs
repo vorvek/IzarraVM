@@ -68,6 +68,7 @@ fn hlt_wakes_on_pit_timer_tick() {
     )
     .unwrap();
 
+    let halted_before = machine.halted_ticks();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
     assert_eq!(reason, StopReason::Halted);
@@ -81,6 +82,10 @@ fn hlt_wakes_on_pit_timer_tick() {
     assert!(
         machine.elapsed_clocks() > 10_000,
         "the fast-forward should have advanced emulated time across the tick interval"
+    );
+    assert!(
+        machine.halted_ticks() > halted_before,
+        "the HLT wait must be visible to host speed reporting"
     );
 }
 
@@ -371,6 +376,11 @@ fn cli_hlt_is_a_genuine_halt() {
     .unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
+    assert_eq!(
+        machine.halted_ticks(),
+        0,
+        "a terminal HLT has no hidden fast-forward"
+    );
 }
 
 #[test]

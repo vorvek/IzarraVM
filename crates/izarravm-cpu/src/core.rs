@@ -82,6 +82,7 @@ impl CpuGsw {
 
     fn invalidate_code_caches(&mut self) {
         self.perf.decode_inval_other += 1;
+        self.perf.code_invalidations += 1;
         self.invalidate_code_caches_uncounted();
     }
 
@@ -205,6 +206,9 @@ impl CpuGsw {
             match narrow {
                 Some(kills) => {
                     self.perf.smc_narrow_kills += u64::from(kills);
+                    if kills > 0 {
+                        self.perf.code_invalidations += 1;
+                    }
                     // A kill inside an installed region's physical span stales its slot table
                     // even though the entry line's stamp may survive; bump the epoch so entry
                     // re-validates through the matcher.
@@ -216,6 +220,7 @@ impl CpuGsw {
                 }
                 None => {
                     self.perf.decode_inval_smc += 1;
+                    self.perf.code_invalidations += 1;
                     self.decode_cache.invalidate_and_clear_code_marks();
                 }
             }

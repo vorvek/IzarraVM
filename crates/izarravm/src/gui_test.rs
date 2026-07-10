@@ -71,6 +71,29 @@ fn refill_credit_clamps_a_stall() {
 }
 
 #[test]
+fn speed_sample_marks_exactly_ninety_percent_hlt_as_idle() {
+    let wall = Duration::from_secs(1);
+    assert!(!speed_sample(100, 899, 1_000, wall).1);
+    assert!(speed_sample(100, 900, 1_000, wall).1);
+    assert!(
+        !speed_sample(0, 0, 1_000, wall).1,
+        "I/O wait is not HLT idle"
+    );
+}
+
+#[test]
+fn speed_sample_caps_active_throughput_at_realtime() {
+    let (ratio, idle) = speed_sample(
+        MASTER_CLOCK_HZ.saturating_mul(2),
+        0,
+        MASTER_CLOCK_HZ.saturating_mul(2),
+        Duration::from_secs(1),
+    );
+    assert_eq!(ratio, 1.0);
+    assert!(!idle);
+}
+
+#[test]
 fn disk_overshoot_holds_the_guest() {
     let cap = MASTER_CLOCK_HZ / 20;
     // A read that ran ~190 ms past its budget leaves credit deep in debt.
