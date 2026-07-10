@@ -273,6 +273,8 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         opl: &mut machine.opl,
         dsp: &mut machine.dsp,
         mixer: &mut machine.mixer,
+        wavetable_mpu: &mut machine.wavetable_mpu,
+        midi_input_mpu: &mut machine.midi_input_mpu,
         wss: &mut machine.wss,
         wss_base: machine.wss_base,
         wss_enabled: machine.wss_enabled,
@@ -491,6 +493,9 @@ mod legacy_video;
 #[cfg(test)]
 #[path = "machine_margo_test.rs"]
 mod margo;
+#[cfg(test)]
+#[path = "machine_midi_test.rs"]
+mod midi;
 #[cfg(test)]
 #[path = "machine_mouse_test.rs"]
 mod mouse;
