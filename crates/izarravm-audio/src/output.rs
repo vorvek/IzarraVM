@@ -1,67 +1,119 @@
-//! Host audio output: plays queued 44100 Hz stereo PCM through the default
-//! device. The emulator pushes resampled OPL frames with [`AudioSink::queue`]
-//! and the cpal callback drains them, resampling to the device's own rate. This
-//! is device glue, it can only be exercised by actually running on a machine
-//! with an output device, so it is kept small and free of synthesis logic.
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! Host audio output at 44.1 kHz stereo.
+//!
+//! The emulation thread writes PCM into a bounded lock-free queue. The cpal
+//! callback drains it without taking a mutex and resamples to the host rate.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 
-/// The rate the emulator renders PCM at. The output stream resamples from this
-/// to whatever the host device asks for.
+type StereoFrame = (i16, i16);
+
+/// The rate used by the emulator mixer.
 const SOURCE_HZ: u32 = 44_100;
+const TARGET_FRAMES: usize = SOURCE_HZ as usize * 30 / 1_000;
+const LOW_FRAMES: usize = (SOURCE_HZ as usize * 15).div_ceil(1_000);
+const HIGH_FRAMES: usize = SOURCE_HZ as usize * 60 / 1_000;
+const CAPACITY_FRAMES: usize = SOURCE_HZ as usize * 100 / 1_000;
+const RAMP_FRAMES: u16 = 64;
 
-/// A `Send` handle to the queue feeding the output stream. Clone it onto the
-/// emulation thread to push PCM while the stream itself stays put.
-#[derive(Clone)]
-pub struct AudioSink {
-    ring: Arc<Mutex<VecDeque<(i16, i16)>>>,
-    capacity: usize,
+#[derive(Debug, Clone, Copy)]
+enum QueuedFrame {
+    Audio(StereoFrame),
+    Padding,
 }
 
-impl AudioSink {
-    /// Queue resampled frames for playback, dropping the oldest if the backlog
-    /// exceeds ~0.5 s so a faster-than-real-time emulator cannot grow the buffer
-    /// without bound. Mutex ring for now; move to lock-free if it ever glitches.
-    pub fn queue(&self, frames: &[(i16, i16)]) {
-        let mut ring = self.ring.lock().expect("audio ring poisoned");
-        ring.extend(frames.iter().copied());
-        while ring.len() > self.capacity {
-            ring.pop_front();
+fn new_ring() -> Arc<ArrayQueue<QueuedFrame>> {
+    let ring = Arc::new(ArrayQueue::new(CAPACITY_FRAMES));
+    push_padding(&ring, TARGET_FRAMES);
+    ring
+}
+
+fn push_padding(ring: &ArrayQueue<QueuedFrame>, count: usize) {
+    for _ in 0..count {
+        if ring.push(QueuedFrame::Padding).is_err() {
+            break;
         }
     }
 }
 
-/// A handle to the running output stream and the queue feeding it. Dropping it
-/// stops playback. The `cpal::Stream` is `!Send`, so keep this on the thread
-/// that created it and hand the emulation thread a [`AudioSink`] via [`sink`].
+fn recover_to_target(ring: &ArrayQueue<QueuedFrame>, frames: &[StereoFrame]) {
+    while ring.pop().is_some() {}
+
+    let audio_count = frames.len().min(TARGET_FRAMES - usize::from(RAMP_FRAMES));
+    push_padding(ring, TARGET_FRAMES - audio_count);
+    for &frame in &frames[frames.len() - audio_count..] {
+        if ring.push(QueuedFrame::Audio(frame)).is_err() {
+            break;
+        }
+    }
+}
+
+/// A sendable handle to the queue feeding the output stream.
+#[derive(Clone)]
+pub struct AudioSink {
+    ring: Arc<ArrayQueue<QueuedFrame>>,
+}
+
+impl AudioSink {
+    /// Queue mixer frames while holding the buffer near its 30 ms target.
+    ///
+    /// Falling below 15 ms schedules silence before the new audio. Rising above
+    /// 60 ms discards old latency and inserts a short fade boundary. The queue
+    /// itself is capped at 100 ms, so a stalled callback cannot grow memory or
+    /// leave sound far behind the guest.
+    pub fn queue(&self, frames: &[StereoFrame]) {
+        if frames.is_empty() {
+            return;
+        }
+
+        let queued = self.ring.len();
+        let planned_padding = if queued < LOW_FRAMES {
+            TARGET_FRAMES.saturating_sub(queued)
+        } else {
+            0
+        };
+        let projected = queued
+            .saturating_add(planned_padding)
+            .saturating_add(frames.len());
+        if projected > HIGH_FRAMES {
+            recover_to_target(&self.ring, frames);
+            return;
+        }
+
+        push_padding(&self.ring, planned_padding);
+        for &frame in frames {
+            if self.ring.push(QueuedFrame::Audio(frame)).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// A running output stream and the queue that feeds it.
 ///
-/// [`sink`]: AudioPlayer::sink
+/// The cpal stream is not sendable, so callers keep this value on its creation
+/// thread and pass an AudioSink to the emulation thread.
 pub struct AudioPlayer {
     _stream: cpal::Stream,
     sink: AudioSink,
 }
 
 impl AudioPlayer {
-    /// Open the default output device at its own preferred config. Returns an
-    /// error if there is no device or the format is unsupported, so the caller
-    /// can keep running silently.
+    /// Open the default output device at its preferred format.
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or("no default audio output device")?;
-        // Use the device's own default config rather than a fixed 44.1 kHz/f32
-        // request: in WASAPI shared mode only the device mix format is accepted,
-        // so the fixed request failed (silently, no sound) on the many Windows
-        // devices that mix at 48 kHz. The callback resamples our 44.1 kHz frames
-        // to whatever rate and channel count the device reports.
         let supported = device.default_output_config()?;
         let sample_format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
+        let ring = new_ring();
 
-        let ring: Arc<Mutex<VecDeque<(i16, i16)>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stream = match sample_format {
             cpal::SampleFormat::F32 => build_stream::<f32>(&device, &config, Arc::clone(&ring)),
             cpal::SampleFormat::I16 => build_stream::<i16>(&device, &config, Arc::clone(&ring)),
@@ -72,90 +124,112 @@ impl AudioPlayer {
 
         Ok(Self {
             _stream: stream,
-            sink: AudioSink {
-                ring,
-                capacity: SOURCE_HZ as usize, // ~1 s of backlog (larger ring for HLE drift tolerance)
-            },
+            sink: AudioSink { ring },
         })
     }
 
-    /// A `Send` handle to the playback queue for the emulation thread.
+    /// Return a handle that can feed this stream from another thread.
     pub fn sink(&self) -> AudioSink {
         self.sink.clone()
     }
 }
 
-/// Build an output stream that pulls 44.1 kHz stereo i16 frames from `ring`,
-/// sample-and-hold resamples them to the device rate, and writes them as `T`
-/// across the device's channels. Sample-and-hold is crude but ample for a
-/// beeper and an OPL chime, and keeps the conversion to a few lines.
+struct CallbackSource {
+    ring: Arc<ArrayQueue<QueuedFrame>>,
+    last: StereoFrame,
+    gain: u16,
+    underruns: u64,
+}
+
+impl CallbackSource {
+    fn new(ring: Arc<ArrayQueue<QueuedFrame>>) -> Self {
+        Self {
+            ring,
+            last: (0, 0),
+            gain: 0,
+            underruns: 0,
+        }
+    }
+
+    fn next(&mut self) -> StereoFrame {
+        match self.ring.pop() {
+            Some(QueuedFrame::Audio(frame)) => {
+                self.last = frame;
+                self.gain = self.gain.saturating_add(1).min(RAMP_FRAMES);
+            }
+            Some(QueuedFrame::Padding) => {
+                self.gain = self.gain.saturating_sub(1);
+            }
+            None => {
+                self.gain = self.gain.saturating_sub(1);
+                self.underruns = self.underruns.saturating_add(1);
+            }
+        }
+        scale_frame(self.last, self.gain)
+    }
+}
+
+fn scale_frame(frame: StereoFrame, gain: u16) -> StereoFrame {
+    let scale = |sample: i16| {
+        (i32::from(sample) * i32::from(gain) / i32::from(RAMP_FRAMES))
+            .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+    };
+    (scale(frame.0), scale(frame.1))
+}
+
+/// Build a stream that linearly resamples the mixer output to the host rate.
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    ring: Arc<Mutex<VecDeque<(i16, i16)>>>,
+    ring: Arc<ArrayQueue<QueuedFrame>>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = config.channels as usize;
     let out_hz = config.sample_rate.0 as i64;
-    // Two straddling source frames (`cur`..`nxt`) plus a fractional read position
-    // between them. Interpolating linearly between the two is far smoother than
-    // the old zero-order hold, whose stair-stepping injected audible high-
-    // frequency imaging noise ("scratch") when up-sampling 44.1 kHz to a 48 kHz
-    // device. On underrun `nxt` holds its last value, so a starved ring fades to
-    // a held level rather than clicking.
-    let mut cur = (0i16, 0i16);
-    let mut nxt = (0i16, 0i16);
-    let mut phase: i64 = 0; // read position between cur and nxt, scaled by out_hz
-    // Opt-in underrun diagnostic (IZARRAVM_AUDIO_DEBUG): counts source frames the
-    // ring could not supply (the emulation produced audio slower than the device
-    // consumed it) and logs a rate once per output second. A high rate is the
-    // signature of the crackle when a guest runs below real time. Off = one bool.
     let debug = std::env::var_os("IZARRAVM_AUDIO_DEBUG").is_some();
-    let mut underruns: u64 = 0;
-    let mut out_frames: u64 = 0;
+    let mut source = CallbackSource::new(ring);
+    let mut cur = (0i16, 0i16);
+    let mut next = (0i16, 0i16);
+    let mut phase = 0i64;
+    let mut out_frames = 0u64;
+    let mut reported_underruns = 0u64;
+
     device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let mut ring = ring.lock().expect("audio ring poisoned");
             for frame in data.chunks_mut(channels) {
-                // Linear interpolation: `phase/out_hz` is how far the output time
-                // sits between `cur` and `nxt`.
-                let frac = phase as f32 / out_hz as f32;
-                let li = f32::from(cur.0) + (f32::from(nxt.0) - f32::from(cur.0)) * frac;
-                let ri = f32::from(cur.1) + (f32::from(nxt.1) - f32::from(cur.1)) * frac;
-                let l = T::from_sample(li / 32768.0);
-                let r = T::from_sample(ri / 32768.0);
-                if let Some(s) = frame.get_mut(0) {
-                    *s = l;
+                let fraction = phase as f32 / out_hz as f32;
+                let left = f32::from(cur.0) + (f32::from(next.0) - f32::from(cur.0)) * fraction;
+                let right = f32::from(cur.1) + (f32::from(next.1) - f32::from(cur.1)) * fraction;
+                if let Some(sample) = frame.get_mut(0) {
+                    *sample = T::from_sample(left / 32768.0);
                 }
-                if let Some(s) = frame.get_mut(1) {
-                    *s = r;
+                if let Some(sample) = frame.get_mut(1) {
+                    *sample = T::from_sample(right / 32768.0);
                 }
-                for s in frame.iter_mut().skip(2) {
-                    *s = T::from_sample(0.0);
+                for sample in frame.iter_mut().skip(2) {
+                    *sample = T::from_sample(0.0);
                 }
-                // Advance the read position by SOURCE_HZ/out_hz per output frame,
-                // stepping cur<-nxt<-ring each time it crosses a source frame.
-                phase += SOURCE_HZ as i64;
+
+                phase += i64::from(SOURCE_HZ);
                 while phase >= out_hz {
                     phase -= out_hz;
-                    cur = nxt;
-                    match ring.pop_front() {
-                        Some(f) => nxt = f,
-                        None => underruns += 1, // hold last (nxt) on underrun
-                    }
+                    cur = next;
+                    next = source.next();
                 }
             }
+
             if debug {
                 out_frames += (data.len() / channels.max(1)) as u64;
                 if out_frames >= out_hz as u64 {
+                    let underruns = source.underruns.saturating_sub(reported_underruns);
                     eprintln!(
                         "[AUDIO] underruns/s={underruns} ring_now={} (0 = keeping up)",
-                        ring.len()
+                        source.ring.len()
                     );
-                    underruns = 0;
+                    reported_underruns = source.underruns;
                     out_frames = 0;
                 }
             }
@@ -164,3 +238,7 @@ where
         None,
     )
 }
+
+#[cfg(test)]
+#[path = "output_test.rs"]
+mod tests;
