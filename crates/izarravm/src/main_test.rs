@@ -124,12 +124,26 @@ fn ascii_to_set1_maps_a_letter_to_make_and_break() {
 }
 
 #[test]
-fn write_framebuffer_ppm_writes_a_valid_p6_header() {
+fn write_framebuffer_ppm_uses_the_active_distira_scanout() {
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_CLEAR_COLOR as u32,
+        0x0010_2030,
+    );
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_COMMAND as u32,
+        izarravm_video::DISTIRA_CMD_CLEAR,
+    );
+    machine.write_physical_u32(
+        izarravm_machine::DISTIRA_MMIO_BASE + izarravm_video::DISTIRA_REG_COMMAND as u32,
+        izarravm_video::DISTIRA_CMD_SWAP,
+    );
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+
     let dir = std::env::temp_dir().join(format!(
         "izarravm_ppm_test_{}_{}",
         std::process::id(),
@@ -151,8 +165,7 @@ fn write_framebuffer_ppm_writes_a_valid_p6_header() {
     assert_eq!(parts.next(), Some("P6"));
     let width: usize = parts.next().unwrap().parse().unwrap();
     let height: usize = parts.next().unwrap().parse().unwrap();
-    assert!(width > 0);
-    assert!(height > 0);
+    assert_eq!((width, height), (640, 480));
 }
 
 #[test]

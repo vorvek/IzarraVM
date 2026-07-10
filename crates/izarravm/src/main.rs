@@ -17,7 +17,7 @@ use izarravm_firmware::{
 };
 use izarravm_input::InputState;
 use izarravm_machine::{
-    Machine, MachineHostProfileSnapshot, MachineProfile, PerfCounters, StopReason,
+    ActiveDisplay, Machine, MachineHostProfileSnapshot, MachineProfile, PerfCounters, StopReason,
 };
 use serde_json::json;
 use std::cmp::Reverse;
@@ -795,63 +795,72 @@ fn print_dump_result(machine: &mut Machine, stop_reason: &StopReason) {
 fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<dyn Error>> {
     use std::io::Write;
 
-    let raster = machine.video_mut().render_full_frame();
-    let height = raster.display_height.min(raster.height);
-    let width = raster.width;
-    let palette = machine.palette_argb();
+    let (pixels, width, height) = active_frame_words(machine);
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     write!(out, "P6\n{width} {height}\n255\n")?;
-    for row in 0..height as usize {
-        let start = row * width as usize;
-        let end = start + width as usize;
-        for &index in &raster.pixels[start..end] {
-            let color = palette[usize::from(index)];
-            out.write_all(&[(color >> 16) as u8, (color >> 8) as u8, color as u8])?;
-        }
+    for color in pixels {
+        out.write_all(&[(color >> 16) as u8, (color >> 8) as u8, color as u8])?;
     }
     Ok(())
 }
 
-/// After a headless run, report the active video mode and whether the screen
-/// holds meaningful content. It renders a full frame and counts non-background
-/// pixels with a small histogram of the busiest DAC indices; in text mode it
-/// also prints the 80x25 page. A human reads this to confirm a booter drew its
-/// title or menu rather than sitting on a blank screen.
+fn active_frame_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
+    match machine.active_display() {
+        ActiveDisplay::VgaRaster => {
+            let raster = machine.video_mut().render_full_frame();
+            let width = raster.width as usize;
+            let height = raster.display_height.min(raster.height) as usize;
+            let palette = machine.palette_argb();
+            let pixels = raster.pixels[..width * height]
+                .iter()
+                .map(|&index| palette[usize::from(index)])
+                .collect();
+            (pixels, width, height)
+        }
+        ActiveDisplay::MargoLfb | ActiveDisplay::Distira => machine.frame_argb(),
+    }
+}
+
+/// After a headless run, report the active scanout and whether it holds meaningful
+/// content. Legacy text mode also includes the 80x25 page.
 fn print_video_summary(machine: &mut Machine) {
     use izarravm_video::VideoMode;
 
-    let mode = machine.video().active_mode();
-    let mode_name = match mode {
-        VideoMode::Text => "text (03h)",
-        VideoMode::Mode13h => "mode 13h (320x200x256)",
-        VideoMode::Planar => "planar (EGA/VGA 16-color)",
-        VideoMode::ModeX => "mode X (unchained 256-color)",
-        VideoMode::Cga => "CGA graphics (320x200x4 / 640x200x2)",
-        VideoMode::Hercules => "Hercules graphics (720x348 monochrome)",
+    let active_display = machine.active_display();
+    let display_name = match active_display {
+        ActiveDisplay::VgaRaster => "VGA raster",
+        ActiveDisplay::MargoLfb => "Margo linear framebuffer",
+        ActiveDisplay::Distira => "Distira",
     };
-    println!("video mode: {mode_name}");
+    println!("active display: {display_name}");
 
-    if matches!(mode, VideoMode::Text) {
-        let frame = machine.screen_text();
-        let text = frame.as_text();
-        let printable = text.chars().filter(|c| !c.is_whitespace()).count();
-        println!("text non-blank glyphs: {printable}");
-        println!("--- 80x25 text ---");
-        println!("{text}");
-        println!("--- end text ---");
+    if active_display == ActiveDisplay::VgaRaster {
+        let mode = machine.video().active_mode();
+        let mode_name = match mode {
+            VideoMode::Text => "text (03h)",
+            VideoMode::Mode13h => "mode 13h (320x200x256)",
+            VideoMode::Planar => "planar (EGA/VGA 16-color)",
+            VideoMode::ModeX => "mode X (unchained 256-color)",
+            VideoMode::Cga => "CGA graphics (320x200x4 / 640x200x2)",
+            VideoMode::Hercules => "Hercules graphics (720x348 monochrome)",
+        };
+        println!("video mode: {mode_name}");
+
+        if matches!(mode, VideoMode::Text) {
+            let frame = machine.screen_text();
+            let text = frame.as_text();
+            let printable = text.chars().filter(|c| !c.is_whitespace()).count();
+            println!("text non-blank glyphs: {printable}");
+            println!("--- 80x25 text ---");
+            println!("{text}");
+            println!("--- end text ---");
+        }
     }
 
-    // Render one full frame and summarize the pixel indices (works for text and
-    // graphics modes alike: render_full_frame walks the CRTC scanlines). The
-    // background is DAC index 0 (black on the stock palette), so non-zero pixels
-    // mean the guest drew something.
-    let raster = machine.video_mut().render_full_frame();
-    let total = raster.pixels.len();
-    let nonzero = raster.pixels.iter().filter(|&&p| p != 0).count();
-    println!(
-        "framebuffer: {}x{} ({total} px)",
-        raster.width, raster.height
-    );
+    let (pixels, width, height) = active_frame_words(machine);
+    let total = pixels.len();
+    let nonzero = pixels.iter().filter(|&&pixel| pixel != 0).count();
+    println!("framebuffer: {width}x{height} ({total} px)");
     println!(
         "non-zero pixels: {nonzero} ({:.1}%)",
         if total == 0 {
@@ -860,24 +869,19 @@ fn print_video_summary(machine: &mut Machine) {
             100.0 * nonzero as f64 / total as f64
         }
     );
-    let mut histogram = [0u32; 256];
-    for &index in &raster.pixels {
-        histogram[index as usize] += 1;
+    let mut histogram = std::collections::HashMap::new();
+    for &color in &pixels {
+        *histogram.entry(color).or_insert(0u32) += 1;
     }
-    let mut entries: Vec<(usize, u32)> = histogram
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|&(_, count)| count > 0)
-        .collect();
-    entries.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+    let mut entries: Vec<(u32, u32)> = histogram.into_iter().collect();
+    entries.sort_by_key(|&(color, count)| (Reverse(count), color));
     let top: Vec<String> = entries
         .iter()
         .take(8)
-        .map(|(index, count)| format!("idx {index}: {count}"))
+        .map(|(color, count)| format!("#{color:06X}: {count}"))
         .collect();
     println!("distinct colors: {}", entries.len());
-    println!("top indices: {}", top.join(", "));
+    println!("top colors: {}", top.join(", "));
 }
 
 /// Minimal ASCII to Set 1 make+break for the demo (lowercase letters, digits,
