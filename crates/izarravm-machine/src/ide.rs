@@ -56,12 +56,15 @@ enum Phase {
     AwaitPacket,
     /// Presenting data-in bytes to the host (the buffer is being drained).
     DataIn,
+    /// Receiving a packet command's parameter list from the host.
+    DataOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingAction {
     AcceptPacket,
     ExecutePacket([u8; 12]),
+    CompleteDataOut,
     PresentReadSector,
     CompleteSeek { lba: u32 },
     PrepareIdentify,
@@ -106,6 +109,10 @@ pub struct IdeChannel {
     /// commands grow this one sector at a time; short control replies expose the
     /// whole buffer at their command deadline.
     data_in_ready_end: usize,
+    /// The active packet command's host-to-device parameter list.
+    data_out: Vec<u8>,
+    data_out_expected: usize,
+    data_out_block_end: usize,
     /// Per-command host byte-count limit (cylinder low/high at PACKET time). Zero
     /// means no limit was programmed, so the whole buffer goes out in one block.
     byte_count_limit: usize,
@@ -139,6 +146,9 @@ impl Default for IdeChannel {
             data_in_pos: 0,
             data_in_block_end: 0,
             data_in_ready_end: 0,
+            data_out: Vec::new(),
+            data_out_expected: 0,
+            data_out_block_end: 0,
             byte_count_limit: 0,
             irq_pending: false,
             pending_command: None,
@@ -305,6 +315,9 @@ impl IdeChannel {
         self.data_in_pos = 0;
         self.data_in_block_end = 0;
         self.data_in_ready_end = 0;
+        self.data_out.clear();
+        self.data_out_expected = 0;
+        self.data_out_block_end = 0;
         self.byte_count_limit = 0;
         self.pending_command = None;
         self.irq_pending = false;
@@ -354,6 +367,7 @@ impl IdeChannel {
         match action {
             PendingAction::AcceptPacket => self.begin_packet(),
             PendingAction::ExecutePacket(cdb) => self.execute_packet(cdb),
+            PendingAction::CompleteDataOut => self.complete_data_out(),
             PendingAction::PresentReadSector => self.present_read_sector(),
             PendingAction::CompleteSeek { lba } => {
                 self.head_lba = lba;
@@ -433,6 +447,9 @@ impl IdeChannel {
         self.data_in_pos = 0;
         self.data_in_block_end = 0;
         self.data_in_ready_end = 0;
+        self.data_out.clear();
+        self.data_out_expected = 0;
+        self.data_out_block_end = 0;
         self.status = status::DRDY | status::ERR;
         self.error = 0x04;
         self.raise_irq();
@@ -468,22 +485,37 @@ impl IdeChannel {
     }
 
     fn write_data_byte(&mut self, value: u8) {
-        if self.phase != Phase::AwaitPacket {
-            return;
-        }
-        if self.packet_filled < self.packet.len() {
-            self.packet[self.packet_filled] = value;
-            self.packet_filled += 1;
-        }
-        if self.packet_filled == self.packet.len() {
-            let cdb = self.packet;
-            self.schedule(PendingAction::ExecutePacket(cdb), COMMAND_LATENCY_TICKS);
+        match self.phase {
+            Phase::AwaitPacket => {
+                if self.packet_filled < self.packet.len() {
+                    self.packet[self.packet_filled] = value;
+                    self.packet_filled += 1;
+                }
+                if self.packet_filled == self.packet.len() {
+                    let cdb = self.packet;
+                    self.schedule(PendingAction::ExecutePacket(cdb), COMMAND_LATENCY_TICKS);
+                }
+            }
+            Phase::DataOut => {
+                self.data_out.push(value);
+                if self.data_out.len() >= self.data_out_expected {
+                    self.schedule(PendingAction::CompleteDataOut, COMMAND_LATENCY_TICKS);
+                } else if self.data_out.len() >= self.data_out_block_end {
+                    self.present_data_out_block();
+                    self.raise_irq();
+                }
+            }
+            _ => {}
         }
     }
 
     /// Execute an assembled CDB after command latency. Short replies become
     /// visible now; reads and seeks schedule their mechanical boundary.
     fn execute_packet(&mut self, cdb: [u8; 12]) {
+        if let Some(length) = data_out_length(&cdb).filter(|&length| length > 0) {
+            self.begin_data_out(length);
+            return;
+        }
         match self.device.execute(&cdb) {
             CmdResult::Data(buf) => {
                 if buf.is_empty() {
@@ -527,6 +559,37 @@ impl IdeChannel {
                 self.status = status::DRDY | status::ERR;
                 self.error = 0x04; // ABRT / CHECK CONDITION (sense already latched)
                 self.publish_interrupt_reason();
+                self.raise_irq();
+            }
+        }
+    }
+
+    fn begin_data_out(&mut self, length: usize) {
+        self.phase = Phase::DataOut;
+        self.data_out.clear();
+        self.data_out.reserve(length);
+        self.data_out_expected = length;
+        self.last_access_bytes = 0;
+        self.device.arm_data_out();
+        self.publish_interrupt_reason();
+        self.error = 0;
+        self.present_data_out_block();
+        self.raise_irq();
+    }
+
+    fn complete_data_out(&mut self) {
+        let result = self.device.mode_select_data(&self.data_out);
+        self.last_access_bytes = self.last_access_bytes.saturating_add(self.data_out.len());
+        self.data_out.clear();
+        self.data_out_expected = 0;
+        self.data_out_block_end = 0;
+        match result {
+            CmdResult::Data(_) => self.complete_packet(),
+            CmdResult::Error => {
+                self.phase = Phase::Idle;
+                self.publish_interrupt_reason();
+                self.status = status::DRDY | status::ERR;
+                self.error = 0x04;
                 self.raise_irq();
             }
         }
@@ -592,6 +655,19 @@ impl IdeChannel {
         self.status = status::DRDY | status::DRQ | status::DSC;
     }
 
+    fn present_data_out_block(&mut self) {
+        let remaining = self.data_out_expected - self.data_out.len();
+        let block = if self.byte_count_limit > 0 && self.byte_count_limit < remaining {
+            self.byte_count_limit
+        } else {
+            remaining
+        };
+        self.data_out_block_end = self.data_out.len() + block;
+        self.lba_mid = (block & 0xFF) as u8;
+        self.lba_high = ((block >> 8) & 0xFF) as u8;
+        self.status = status::DRDY | status::DRQ | status::DSC;
+    }
+
     /// Copy the device's current interrupt reason (C/D, I/O) onto the sector-count
     /// register, which is the ATAPI Interrupt Reason register the host polls.
     fn publish_interrupt_reason(&mut self) {
@@ -605,6 +681,10 @@ impl IdeChannel {
 
 fn is_read_opcode(opcode: u8) -> bool {
     matches!(opcode, 0x28 | 0xA8 | 0xBE)
+}
+
+fn data_out_length(cdb: &[u8; 12]) -> Option<usize> {
+    (cdb[0] == 0x55).then(|| u16::from_be_bytes([cdb[7], cdb[8]]) as usize)
 }
 
 fn packet_lba(cdb: &[u8; 12]) -> u32 {

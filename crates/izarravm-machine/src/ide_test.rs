@@ -41,6 +41,17 @@ fn clear_unit_attention(ch: &mut IdeChannel) {
     let _ = ch.take_irq();
 }
 
+fn audio_mode_select_params(left: u8, right: u8) -> Vec<u8> {
+    let mut params = vec![0u8; 24];
+    params[8] = 0x0E;
+    params[9] = 14;
+    params[16] = 0x01;
+    params[17] = left;
+    params[18] = 0x02;
+    params[19] = right;
+    params
+}
+
 /// Drive the full PACKET handshake for a READ(10) of one sector at `lba` and
 /// return the drained data-in buffer.
 fn packet_read10(ch: &mut IdeChannel, lba: u32) -> Vec<u8> {
@@ -340,4 +351,58 @@ fn interrupt_reason_walks_the_packet_phases() {
     assert_eq!(ch.status & status::DRQ, 0);
     assert_eq!(ch.read_port(SECTOR_COUNT).unwrap(), ir::COMMAND_COMPLETE);
     assert_eq!(ir::COMMAND_COMPLETE, 0x03);
+}
+
+#[test]
+fn mode_select_receives_its_parameter_list_on_the_ide_timeline() {
+    use crate::atapi::interrupt_reason as ir;
+
+    let mut ch = IdeChannel::new();
+    let params = audio_mode_select_params(0x80, 0x40);
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x55;
+    cdb[1] = 0x10; // page format
+    cdb[7..9].copy_from_slice(&(params.len() as u16).to_be_bytes());
+
+    begin_packet(&mut ch);
+    for byte in cdb {
+        ch.write_port(SECONDARY_CMD_BASE, byte);
+    }
+    let command_ticks = ch.ticks_until_completion().unwrap();
+    ch.advance_master_ticks(command_ticks - 1);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    assert!(!ch.take_irq());
+    ch.advance_master_ticks(1);
+
+    assert_eq!(ch.phase, Phase::DataOut);
+    assert_eq!(ch.status & status::DRQ, status::DRQ);
+    assert_eq!(ch.sector_count, ir::DATA_OUT);
+    assert_eq!(
+        u16::from_le_bytes([ch.lba_mid, ch.lba_high]) as usize,
+        params.len()
+    );
+    assert!(ch.take_irq());
+
+    for &byte in &params[..params.len() - 1] {
+        ch.write_port(SECONDARY_CMD_BASE, byte);
+    }
+    assert_eq!(ch.status & status::DRQ, status::DRQ);
+    assert_eq!(ch.device().audio_volume(), [0xFF, 0xFF]);
+    ch.write_port(SECONDARY_CMD_BASE, params[params.len() - 1]);
+
+    assert_eq!(ch.status & status::DRQ, 0);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    assert!(!ch.take_irq());
+    let completion_ticks = ch.ticks_until_completion().unwrap();
+    ch.advance_master_ticks(completion_ticks - 1);
+    assert_eq!(ch.device().audio_volume(), [0xFF, 0xFF]);
+    assert!(!ch.take_irq());
+    ch.advance_master_ticks(1);
+
+    assert_eq!(ch.device().audio_volume(), [0x80, 0x40]);
+    assert_eq!(ch.sector_count, ir::COMMAND_COMPLETE);
+    assert_eq!(ch.status & (status::BSY | status::DRQ | status::ERR), 0);
+    assert_eq!(ch.status & status::DRDY, status::DRDY);
+    assert!(ch.take_irq());
+    assert_eq!(ch.take_access_bytes(), params.len());
 }
