@@ -2435,9 +2435,9 @@ impl Vga {
     ///   renders full height. The GC-256/graphics requirement keeps a stray ATC
     ///   write in a text-mode guest from spuriously flipping the personality.
     ///
-    /// ponytail: horizontal timing installs the canonical 320-wide values rather
-    /// than decoding the guest's CRTC horizontal registers (both families write
-    /// the standard ones); decode them if a title ever bangs a nonstandard-width
+    /// Horizontal timing installs the canonical 320-wide values rather than
+    /// decoding the guest's CRTC horizontal registers because both families write
+    /// the standard ones. Decode them if a title uses a nonstandard-width
     /// 256-color mode. The symmetric register-banged EXIT to text is also not
     /// derived — every known title restores text via INT 10h.
     fn maybe_enter_256color_from_registers(&mut self) {

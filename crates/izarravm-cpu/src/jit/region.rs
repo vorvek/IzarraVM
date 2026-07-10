@@ -76,8 +76,8 @@ pub(crate) struct CompiledRegion {
 /// survives) - a coarse GC that also adapts to workload phase shifts (the post-clear table refills
 /// with whatever is hot now). The single-phase anchors have far fewer hot loops than this, so it
 /// never fires there.
-// ponytail: whole-table clear-on-full, not per-entry LRU. Upgrade to LRU eviction only if a
-// phase-shifting workload is measured re-warming often (jit_table_clears climbing).
+// This clears the whole table when full instead of maintaining per-entry LRU state. Upgrade
+// only if a phase-shifting workload repeatedly warms the table after a clear.
 pub(crate) const JIT_REGION_TABLE_CAP: usize = 1024;
 
 /// The region table. Index 0 is reserved (DecodeLine stores 1-based `NonZeroU32` indices so the
