@@ -152,8 +152,8 @@ success).
 | `4F02h` | Set mode | Mode number in `BX`. Bit 14 (`0x4000`) requests the linear frame buffer. Bit 15 (`0x8000`) preserves memory. |
 | `4F03h` | Return current mode | Current mode number in `BX`. |
 | `4F07h` | Set/get display start | `BL=00h` queues an `(x,y)` origin, `BL=01h` returns the active origin, and `BL=80h` queues the origin and waits for the next 60 Hz frame boundary. Used for panning and page flips. |
-| `4F08h` | Set/get DAC palette width | Selects 6-bit or 8-bit DAC entries. |
-| `4F09h` | Set/get palette data | Bulk palette load, an alternative to the DAC ports. |
+| `4F08h` | Set/get DAC palette width | `BL=00h` selects the width requested in `BH` and `BL=01h` returns the active width in `BH`. Six-bit and eight-bit entries are supported. |
+| `4F09h` | Set/get palette data | `BL=00h` loads, `BL=01h` reads, and `BL=80h` loads at the next frame boundary. Entries at `ES:DI` are four-byte B,G,R,alignment records. `CX` is the count and `DX` the first index. |
 
 Functions `4F00h` through `4F03h` are the mode-setting core. The rest extend it.
 

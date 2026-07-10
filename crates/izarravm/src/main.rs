@@ -791,22 +791,22 @@ fn print_dump_result(machine: &mut Machine, stop_reason: &StopReason) {
 
 /// Write the current framebuffer to a binary PPM (P6) file: the full raw
 /// pixel dump a graphics-mode benchmark result (e.g. 3DBench2's fps readout)
-/// lands in. Resolves DAC indices through the 6-bit VGA palette to 8-bit RGB.
+/// lands in. Resolves DAC indices through the active 6-bit or 8-bit palette.
 fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<dyn Error>> {
     use std::io::Write;
 
     let raster = machine.video_mut().render_full_frame();
     let height = raster.display_height.min(raster.height);
     let width = raster.width;
+    let palette = machine.palette_argb();
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     write!(out, "P6\n{width} {height}\n255\n")?;
     for row in 0..height as usize {
         let start = row * width as usize;
         let end = start + width as usize;
         for &index in &raster.pixels[start..end] {
-            let [r, g, b] = machine.video().dac_entry(index);
-            // 6-bit VGA DAC component (0..=63) to 8-bit (0..=255).
-            out.write_all(&[r << 2 | r >> 4, g << 2 | g >> 4, b << 2 | b >> 4])?;
+            let color = palette[usize::from(index)];
+            out.write_all(&[(color >> 16) as u8, (color >> 8) as u8, color as u8])?;
         }
     }
     Ok(())

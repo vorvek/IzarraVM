@@ -2004,6 +2004,8 @@ impl Machine {
             0x02 => self.vbe_set_mode(),
             0x03 => self.vbe_current_mode(),
             0x07 => self.vbe_display_start(),
+            0x08 => self.vbe_dac_format(),
+            0x09 => self.vbe_palette_data(),
             _ => {}
         }
     }
@@ -2014,6 +2016,7 @@ impl Machine {
         let mut block = [0u8; 256];
         block[0x00..0x04].copy_from_slice(b"VESA");
         block[0x04..0x06].copy_from_slice(&0x0200u16.to_le_bytes()); // VbeVersion
+        block[0x0a..0x0e].copy_from_slice(&1u32.to_le_bytes()); // 6/8-bit DAC switching
         block[0x12..0x14].copy_from_slice(&64u16.to_le_bytes()); // TotalMemory: 64 * 64 KB = 4 MB
 
         // The mode list lives inside the block at offset 0x14. VideoModePtr is a
@@ -2047,6 +2050,7 @@ impl Machine {
         let mode = self.cpu.registers.ebx() as u16 & 0x01ff;
         if self.margo.set_mode(mode) {
             self.margo_active = true;
+            self.video.set_dac_component_bits(6);
             self.set_vbe_status(0x004f);
         } else {
             self.set_vbe_status(0x014f);
@@ -2107,6 +2111,78 @@ impl Machine {
                     .set_ebx(self.cpu.registers.ebx() & !0xff00);
                 self.cpu.registers.set_ecx(x);
                 self.cpu.registers.set_edx(y);
+                self.set_vbe_status(0x004f);
+            }
+            _ => self.set_vbe_status(0x014f),
+        }
+    }
+
+    fn vbe_dac_format(&mut self) {
+        if !self.margo_active || self.margo.display().bpp != 8 {
+            self.set_vbe_status(0x034f);
+            return;
+        }
+
+        let bits = match self.cpu.registers.ebx() as u8 {
+            0x00 => {
+                let requested = ((self.cpu.registers.ebx() >> 8) & 0xff) as u8;
+                if requested >= 8 {
+                    8
+                } else if requested >= 6 {
+                    6
+                } else {
+                    self.set_vbe_status(0x014f);
+                    return;
+                }
+            }
+            0x01 => self.video.dac_component_bits(),
+            _ => {
+                self.set_vbe_status(0x014f);
+                return;
+            }
+        };
+        self.video.set_dac_component_bits(bits);
+        let ebx = (self.cpu.registers.ebx() & !0xff00) | (u32::from(bits) << 8);
+        self.cpu.registers.set_ebx(ebx);
+        self.set_vbe_status(0x004f);
+    }
+
+    fn vbe_palette_data(&mut self) {
+        if !self.margo_active || self.margo.display().bpp != 8 {
+            self.set_vbe_status(0x034f);
+            return;
+        }
+
+        let start = self.cpu.registers.edx() as u16;
+        let count = self.cpu.registers.ecx() as u16;
+        if usize::from(start) + usize::from(count) > DAC_ENTRIES {
+            self.set_vbe_status(0x014f);
+            return;
+        }
+        let address = self.vbe_block_ptr();
+        match self.cpu.registers.ebx() as u8 {
+            0x00 | 0x80 => {
+                let entries = self.read_guest_block(address, usize::from(count) * 4);
+                if self.cpu.registers.ebx() as u8 == 0x80 {
+                    self.stall_until_margo_frame();
+                }
+                for (offset, entry) in entries.chunks_exact(4).enumerate() {
+                    self.video.set_dac_entry(
+                        (usize::from(start) + offset) as u8,
+                        entry[2],
+                        entry[1],
+                        entry[0],
+                    );
+                }
+                self.set_vbe_status(0x004f);
+            }
+            0x01 => {
+                let mut entries = Vec::with_capacity(usize::from(count) * 4);
+                for offset in 0..count {
+                    let [r, g, b] = self.video.dac_entry((start + offset) as u8);
+                    entries.extend_from_slice(&[b, g, r, 0]);
+                }
+                self.write_guest_block(address, &entries);
                 self.set_vbe_status(0x004f);
             }
             _ => self.set_vbe_status(0x014f),

@@ -23,3 +23,21 @@ fn default_dac_matches_stock_vga() {
     assert_eq!(dac.rgb888(15), (0xFF, 0xFF, 0xFF));
     assert_eq!(dac.rgb888(255), (0, 0, 0));
 }
+
+#[test]
+fn dac_switches_between_six_and_eight_bit_components() {
+    let mut dac = Dac::default();
+    dac.set_entry(1, 0x3f, 0x20, 0x00);
+    assert_eq!(dac.rgb888(1), (0xff, 0x82, 0x00));
+
+    assert!(dac.set_component_bits(8));
+    assert_eq!(dac.component_bits(), 8);
+    assert_eq!(dac.entry(1), [0xff, 0x82, 0x00]);
+    dac.set_entry(2, 0x81, 0x42, 0x23);
+    assert_eq!(dac.rgb888(2), (0x81, 0x42, 0x23));
+
+    assert!(dac.set_component_bits(6));
+    assert_eq!(dac.component_bits(), 6);
+    assert_eq!(dac.entry(2), [0x20, 0x10, 0x08]);
+    assert!(!dac.set_component_bits(7));
+}

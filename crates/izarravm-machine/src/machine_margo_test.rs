@@ -136,6 +136,74 @@ fn vbe_display_start_retrace_wait_returns_the_active_coordinates() {
 }
 
 #[test]
+fn vbe_eight_bit_palette_round_trips_at_vertical_retrace() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h (8bpp LFB)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x00, 0x40, // mov ax, 4000h
+        0x8e, 0xc0, // mov es, ax
+        0xbf, 0x00, 0x00, // mov di, 0
+        0xb8, 0x08, 0x4f, // mov ax, 4F08h
+        0xbb, 0x00, 0x08, // mov bx, 0800h (set 8-bit DAC)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x09, 0x4f, // mov ax, 4F09h
+        0xbb, 0x80, 0x00, // mov bx, 0080h (set during vertical retrace)
+        0xb9, 0x02, 0x00, // mov cx, 2 entries
+        0xba, 0x0a, 0x00, // mov dx, first index 10
+        0xcd, 0x10, // int 10h
+        0xbf, 0x20, 0x00, // mov di, 0020h
+        0xb8, 0x09, 0x4f, // mov ax, 4F09h
+        0xbb, 0x01, 0x00, // mov bx, 0001h (get palette)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x08, 0x4f, // mov ax, 4F08h
+        0xbb, 0x01, 0x00, // mov bx, 0001h (get DAC width)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+    let input = [0x56, 0x34, 0x12, 0, 0xef, 0xcd, 0xab, 0]; // B,G,R,alignment
+    for (offset, value) in input.into_iter().enumerate() {
+        machine.write_physical_u8(0x40000 + offset as u32, value);
+    }
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    assert_eq!(machine.cpu().registers.ebx() as u16, 0x0801);
+    assert_eq!(machine.video().dac_component_bits(), 8);
+    assert_eq!(machine.video().dac_entry(10), [0x12, 0x34, 0x56]);
+    assert_eq!(machine.video().dac_entry(11), [0xab, 0xcd, 0xef]);
+    assert!(machine.io_stall_ticks() > 0);
+    for (offset, expected) in input.into_iter().enumerate() {
+        assert_eq!(machine.read_physical_u8(0x40020 + offset as u32), expected);
+    }
+}
+
+#[test]
+fn vbe_dac_format_rejects_direct_color_modes() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x11, 0x41, // mov bx, 0111h | 4000h (16bpp LFB)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x08, 0x4f, // mov ax, 4F08h
+        0xbb, 0x00, 0x08, // mov bx, 0800h
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x034f);
+    assert_eq!(machine.video().dac_component_bits(), 6);
+}
+
+#[test]
 fn vbe_mode_info_fills_the_block() {
     // ES = 0x4000 -> physical 0x40000, DI = 0.
     let rom = rom_with_code(&[
@@ -184,9 +252,9 @@ fn vbe_controller_info_fills_the_block() {
     assert_eq!(machine.read_physical_u8(base + 3), b'A');
     assert_eq!(read_u16(&mut machine, base + 0x04), 0x0200); // VbeVersion
     assert_eq!(read_u16(&mut machine, base + 0x12), 64); // TotalMemory (64 KB units)
-    // OemStringPtr and Capabilities are intentionally left zero.
+    // OemStringPtr is absent. Capabilities bit 0 advertises 6/8-bit DAC switching.
     assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
-    assert_eq!(read_u32(&mut machine, base + 0x0a), 0); // Capabilities
+    assert_eq!(read_u32(&mut machine, base + 0x0a), 1); // Capabilities
 
     // VideoModePtr (seg:off) must point at the mode list, which lists every
     // entry in MARGO_VBE_MODES (8bpp then hi-color then true-color) and ends

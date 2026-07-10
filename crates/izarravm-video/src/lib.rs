@@ -94,7 +94,8 @@ pub const DAC_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dac {
-    palette: [[u8; 3]; DAC_ENTRIES], // 6-bit components, 0..=63
+    palette: [[u8; 3]; DAC_ENTRIES],
+    component_bits: u8,
     write_index: u8,
     read_index: u8,
     write_component: u8, // 0,1,2 -> R,G,B
@@ -492,6 +493,7 @@ impl Default for Dac {
     fn default() -> Self {
         Self {
             palette: STOCK_VGA_DAC_PALETTE,
+            component_bits: 6,
             write_index: 0,
             read_index: 0,
             write_component: 0,
@@ -517,6 +519,7 @@ impl Dac {
         palette[..64].copy_from_slice(table);
         Self {
             palette,
+            component_bits: 6,
             write_index: 0,
             read_index: 0,
             write_component: 0,
@@ -536,7 +539,8 @@ impl Dac {
 
     pub fn write_data(&mut self, value: u8) -> Option<u8> {
         let index = self.write_index;
-        self.palette[self.write_index as usize][self.write_component as usize] = value & 0x3f;
+        self.palette[self.write_index as usize][self.write_component as usize] =
+            value & self.component_mask();
         self.write_component += 1;
         if self.write_component == 3 {
             self.write_component = 0;
@@ -563,13 +567,18 @@ impl Dac {
 
     pub fn rgb888(&self, index: u8) -> (u8, u8, u8) {
         let [r, g, b] = self.palette[index as usize];
-        (expand6(r), expand6(g), expand6(b))
+        if self.component_bits == 8 {
+            (r, g, b)
+        } else {
+            (expand6(r), expand6(g), expand6(b))
+        }
     }
 
     /// Set one DAC entry directly, bypassing the 3C9 write flip-flop. Used by the
-    /// host-locked INT 10h AH=10h services. Components are masked to 6 bits.
+    /// host-locked INT 10h and VBE palette services.
     pub fn set_entry(&mut self, index: u8, r: u8, g: u8, b: u8) {
-        self.palette[index as usize] = [r & 0x3F, g & 0x3F, b & 0x3F];
+        let mask = self.component_mask();
+        self.palette[index as usize] = [r & mask, g & mask, b & mask];
     }
 
     pub fn entry(&self, index: u8) -> [u8; 3] {
@@ -581,22 +590,50 @@ impl Dac {
     pub fn set_block(&mut self, start: u8, entries: &[[u8; 3]]) {
         for (offset, &[r, g, b]) in entries.iter().enumerate() {
             let index = start.wrapping_add(offset as u8);
-            self.palette[index as usize] = [r & 0x3F, g & 0x3F, b & 0x3F];
+            self.set_entry(index, r, g, b);
         }
     }
 
     /// Serialize `count` consecutive DAC entries starting at `start` as R,G,B
-    /// bytes (6-bit, masked), wrapping modulo 256.
+    /// bytes in the active component width, wrapping modulo 256.
     pub fn block_bytes(&self, start: u8, count: u16) -> Vec<u8> {
         let mut out = Vec::with_capacity(count as usize * 3);
         for offset in 0..count {
             let index = start.wrapping_add(offset as u8);
             let [r, g, b] = self.palette[index as usize];
-            out.push(r & 0x3F);
-            out.push(g & 0x3F);
-            out.push(b & 0x3F);
+            out.push(r);
+            out.push(g);
+            out.push(b);
         }
         out
+    }
+
+    pub fn component_bits(&self) -> u8 {
+        self.component_bits
+    }
+
+    pub fn set_component_bits(&mut self, bits: u8) -> bool {
+        if !matches!(bits, 6 | 8) {
+            return false;
+        }
+        if bits == self.component_bits {
+            return true;
+        }
+        for entry in &mut self.palette {
+            for component in entry {
+                *component = if bits == 8 {
+                    expand6(*component)
+                } else {
+                    *component >> 2
+                };
+            }
+        }
+        self.component_bits = bits;
+        true
+    }
+
+    fn component_mask(&self) -> u8 {
+        if self.component_bits == 8 { 0xff } else { 0x3f }
     }
 }
 
