@@ -77,6 +77,65 @@ fn vbe_current_mode_returns_the_set_mode() {
 }
 
 #[test]
+fn vbe_display_start_latches_on_the_next_margo_frame() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h
+        0xcd, 0x10, // int 10h
+        0xb8, 0x07, 0x4f, // mov ax, 4F07h
+        0xbb, 0x00, 0x00, // mov bx, 0000h (set without waiting)
+        0xb9, 0x00, 0x00, // mov cx, 0
+        0xba, 0xe0, 0x01, // mov dx, 480 (second page)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    assert_eq!(read_mmio_reg(&mut machine, 0x24), 640 * 480);
+    assert_eq!(machine.margo().display().start, 0);
+    assert!(machine.margo().display_start_pending());
+
+    machine.advance_devices_ticks(izarravm_core::MASTER_CLOCK_HZ / 60);
+    assert_eq!(machine.margo().display().start, 640 * 480);
+    assert!(!machine.margo().display_start_pending());
+}
+
+#[test]
+fn vbe_display_start_retrace_wait_returns_the_active_coordinates() {
+    let rom = rom_with_code(&[
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h
+        0xcd, 0x10, // int 10h
+        0xb8, 0x07, 0x4f, // mov ax, 4F07h
+        0xbb, 0x80, 0x00, // mov bx, 0080h (set during vertical retrace)
+        0xb9, 0x00, 0x00, // mov cx, 0
+        0xba, 0xe0, 0x01, // mov dx, 480
+        0xcd, 0x10, // int 10h
+        0xb8, 0x07, 0x4f, // mov ax, 4F07h
+        0xbb, 0x01, 0x00, // mov bx, 0001h (get active start)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    assert_eq!(machine.cpu().registers.ebx() as u16, 0x0001);
+    assert_eq!(machine.cpu().registers.ecx() as u16, 0);
+    assert_eq!(machine.cpu().registers.edx() as u16, 480);
+    assert_eq!(machine.margo().display().start, 640 * 480);
+    assert!(machine.io_stall_ticks() > 0);
+}
+
+#[test]
 fn vbe_mode_info_fills_the_block() {
     // ES = 0x4000 -> physical 0x40000, DI = 0.
     let rom = rom_with_code(&[
@@ -162,7 +221,7 @@ fn vbe_mode_info_rejects_unknown_modes() {
 }
 
 #[test]
-fn copy_through_the_mmio_aperture_moves_vram_and_times_busy() {
+pub(super) fn copy_through_the_mmio_aperture_moves_vram_and_times_busy() {
     let mut machine = test_machine();
     // Seed a 2x2 source rectangle at (0, 0), pitch 640, depth 1, through the LFB.
     machine.write_physical_u8(MARGO_LFB_BASE, 0xa1); // (0,0)
@@ -228,7 +287,7 @@ fn dos_com_exit_code_is_carried_through() {
 }
 
 #[test]
-fn fill_through_the_mmio_aperture_writes_vram_and_times_busy() {
+pub(super) fn fill_through_the_mmio_aperture_writes_vram_and_times_busy() {
     let mut machine = test_machine();
     // Latch a 5x4 fill at (3, 2), pitch 640, depth 1, color 0xAB, solid.
     write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
@@ -330,7 +389,7 @@ fn dos_com_echoes_input() {
 }
 
 #[test]
-fn color_expand_data_through_the_mmio_aperture_draws_a_glyph_and_times_busy() {
+pub(super) fn color_expand_data_through_the_mmio_aperture_draws_a_glyph_and_times_busy() {
     let mut machine = test_machine();
     // draw_glyph_8x8: an 8x8 glyph expanded at (10, 5), pitch 640, depth 1,
     // FG 0xAB, EXPAND_TRANSPARENT so clear bits leave the zeroed background.
@@ -392,7 +451,7 @@ fn color_expand_data_through_the_mmio_aperture_draws_a_glyph_and_times_busy() {
 }
 
 #[test]
-fn line_through_the_mmio_aperture_draws_and_times_busy() {
+pub(super) fn line_through_the_mmio_aperture_draws_and_times_busy() {
     let mut machine = test_machine();
     // draw_line: a horizontal 5-pixel line at y=5 from x=10 to x=14, pitch 640,
     // depth 1, FG 0xAB. ROP 0xF0 (PATCOPY) draws solid; LINE has no source, so
@@ -423,7 +482,7 @@ fn line_through_the_mmio_aperture_draws_and_times_busy() {
 }
 
 #[test]
-fn pattern_fill_through_the_mmio_aperture_tiles_and_times_busy() {
+pub(super) fn pattern_fill_through_the_mmio_aperture_tiles_and_times_busy() {
     let mut machine = test_machine();
     // Seed an 8x8 tile in offscreen VRAM (offset 0x10000, clear of the
     // destination) through the LFB: cell (r, c) = r*8 + c + 1, depth 1.
@@ -458,7 +517,7 @@ fn pattern_fill_through_the_mmio_aperture_tiles_and_times_busy() {
 }
 
 #[test]
-fn clipped_xor_fill_through_the_mmio_aperture() {
+pub(super) fn clipped_xor_fill_through_the_mmio_aperture() {
     let mut machine = test_machine();
     // Seed x=0..3 at y=0 with 0xFF through the LFB.
     for x in 0u32..4 {
@@ -568,7 +627,7 @@ fn hicolor_scanout_decodes_through_the_lfb_aperture() {
 }
 
 #[test]
-fn hardware_cursor_composites_through_the_apertures() {
+pub(super) fn hardware_cursor_composites_through_the_apertures() {
     let mut machine = test_machine();
     machine.margo_mut().set_mode(0x111); // 640x480x16 (R5G6B5)
     // Seed the cursor planes offscreen (1 MiB in, past the 16bpp visible surface)

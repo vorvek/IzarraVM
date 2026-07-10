@@ -36,6 +36,16 @@ impl Machine {
         self.stall_for_master_ticks(master_ticks);
     }
 
+    pub(super) fn stall_until_margo_frame(&mut self) {
+        if let Some(master_ticks) = self.timeline.master_ticks_until(
+            timeline::DeviceClock::MargoFrame,
+            1,
+            timeline::MARGO_FRAME_HZ,
+        ) {
+            self.stall_for_master_ticks(master_ticks);
+        }
+    }
+
     fn stall_for_master_ticks(&mut self, master_ticks: u64) {
         let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
         self.advance_master_time(master_ticks, true);
@@ -499,6 +509,7 @@ impl Machine {
         }
 
         self.margo.advance_busy(advance.margo_nanoseconds);
+        self.margo.advance_frames(advance.margo_frames);
 
         // Distira's 525-line scanout runs at 60 Hz in fixed guest time,
         // independent of the active CPU mode.
@@ -815,6 +826,15 @@ impl Machine {
         }
         if let Some(ticks) = self.next_ata_deadline() {
             cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        }
+        if self.margo.display_start_pending()
+            && let Some(clocks) = self.timeline.cpu_clocks_until(
+                timeline::DeviceClock::MargoFrame,
+                1,
+                timeline::MARGO_FRAME_HZ,
+            )
+        {
+            cap = cap.min(clocks);
         }
         cap.max(1).min(remaining)
     }

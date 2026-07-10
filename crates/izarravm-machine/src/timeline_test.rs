@@ -120,6 +120,7 @@ fn device_events_and_phases_are_batch_invariant() {
         actual.cd_frames += step.cd_frames;
         actual.rtc_seconds += step.rtc_seconds;
         actual.margo_nanoseconds += step.margo_nanoseconds;
+        actual.margo_frames += step.margo_frames;
         actual.distira_lines += step.distira_lines;
         actual.vga_dots += step.vga_dots;
     }
@@ -132,6 +133,7 @@ fn device_events_and_phases_are_batch_invariant() {
     assert_eq!(actual.cd_frames, expected.cd_frames);
     assert_eq!(actual.rtc_seconds, expected.rtc_seconds);
     assert_eq!(actual.margo_nanoseconds, expected.margo_nanoseconds);
+    assert_eq!(actual.margo_frames, expected.margo_frames);
     assert_eq!(actual.distira_lines, expected.distira_lines);
     assert_eq!(actual.vga_dots, expected.vga_dots);
     assert_eq!(split, whole);
@@ -168,7 +170,7 @@ fn pit_and_video_deadlines_choose_the_first_causal_cpu_clock() {
             let (before_events, at_events) = match clock {
                 DeviceClock::Pit => (pit_before, pit_at),
                 DeviceClock::Vga => (vga_before, vga_at),
-                DeviceClock::Dsp | DeviceClock::Wss => unreachable!(),
+                DeviceClock::Dsp | DeviceClock::Wss | DeviceClock::MargoFrame => unreachable!(),
             };
             assert_eq!(before_events, 0, "{mode:?} {clock:?}");
             assert!(at_events >= 1, "{mode:?} {clock:?}");
@@ -177,7 +179,7 @@ fn pit_and_video_deadlines_choose_the_first_causal_cpu_clock() {
 }
 
 #[test]
-fn distira_scanout_is_sixty_hz_in_every_cpu_mode() {
+fn margo_and_distira_scanout_are_sixty_hz_in_every_cpu_mode() {
     for mode in [
         GswMode::Gsw586,
         GswMode::Gsw486,
@@ -187,6 +189,7 @@ fn distira_scanout_is_sixty_hz_in_every_cpu_mode() {
         let mut timeline = Timeline::new(mode);
         let clocks = timeline.cpu_clocks_for_master_ticks_ceil(MASTER_CLOCK_HZ);
         let advance = timeline.advance_cpu_clocks(clocks, DeviceRates::default());
+        assert_eq!(advance.margo_frames, 60, "{mode:?}");
         assert_eq!(advance.distira_lines, 525 * 60, "{mode:?}");
         assert!(advance.master_ticks - MASTER_CLOCK_HZ < timeline.ticks_per_cpu_clock());
     }

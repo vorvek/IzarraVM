@@ -506,3 +506,57 @@ mod storage;
 #[cfg(test)]
 #[path = "machine_video_services_test.rs"]
 mod video_services;
+
+#[test]
+fn margo_caps_match_the_end_to_end_coverage_matrix() {
+    let coverage: [(u32, fn()); 12] = [
+        (
+            1 << 0,
+            margo::fill_through_the_mmio_aperture_writes_vram_and_times_busy,
+        ),
+        (
+            1 << 1,
+            margo::copy_through_the_mmio_aperture_moves_vram_and_times_busy,
+        ),
+        (
+            1 << 2,
+            margo::color_expand_data_through_the_mmio_aperture_draws_a_glyph_and_times_busy,
+        ),
+        (
+            1 << 3,
+            margo::line_through_the_mmio_aperture_draws_and_times_busy,
+        ),
+        (1 << 4, margo::clipped_xor_fill_through_the_mmio_aperture),
+        (1 << 5, margo::clipped_xor_fill_through_the_mmio_aperture),
+        (
+            1 << 6,
+            video_services::overlay_color_key_gates_on_the_primary_pixel,
+        ),
+        (
+            1 << 7,
+            margo::pattern_fill_through_the_mmio_aperture_tiles_and_times_busy,
+        ),
+        (
+            1 << 8,
+            margo::hardware_cursor_composites_through_the_apertures,
+        ),
+        (
+            1 << 9,
+            video_services::overlay_yuy2_composites_through_the_apertures,
+        ),
+        (
+            1 << 10,
+            video_services::pusher_runs_a_fill_packet_from_the_ring,
+        ),
+        (
+            1 << 11,
+            video_services::overlay_orders_dither_on_a_16bpp_display,
+        ),
+    ];
+    let covered = coverage
+        .iter()
+        .fold(0, |mask, (capability, _test)| mask | capability);
+
+    let mut machine = test_machine();
+    assert_eq!(read_mmio_reg(&mut machine, 0x0004), covered);
+}

@@ -151,7 +151,7 @@ success).
 | `4F01h` | Return mode information | Fills a ModeInfoBlock at `ES:DI` for the mode in `CX`: resolution, depth, pitch, color masks, and `PhysBasePtr = 0xE0000000`. |
 | `4F02h` | Set mode | Mode number in `BX`. Bit 14 (`0x4000`) requests the linear frame buffer. Bit 15 (`0x8000`) preserves memory. |
 | `4F03h` | Return current mode | Current mode number in `BX`. |
-| `4F07h` | Set/get display start | Maps to `DISP_START`. Used for panning and page flips. |
+| `4F07h` | Set/get display start | `BL=00h` queues an `(x,y)` origin, `BL=01h` returns the active origin, and `BL=80h` queues the origin and waits for the next 60 Hz frame boundary. Used for panning and page flips. |
 | `4F08h` | Set/get DAC palette width | Selects 6-bit or 8-bit DAC entries. |
 | `4F09h` | Set/get palette data | Bulk palette load, an alternative to the DAC ports. |
 
