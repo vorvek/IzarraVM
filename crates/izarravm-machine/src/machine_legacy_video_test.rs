@@ -45,6 +45,43 @@ fn display_refresh_uses_misc_output_clock_select() {
 }
 
 #[test]
+fn video_facade_preserves_presented_and_headless_scanout_behavior() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    machine.video_mut().set_dac_entry(1, 63, 0, 0);
+    machine.write_physical_u8(VGA_MODE13H_BASE, 1);
+
+    assert_eq!(machine.active_video_mode(), VideoMode::Mode13h);
+    let initial_sequence = machine.frame_sequence();
+    let (captured, captured_width, captured_height) = machine.capture_frame_argb();
+    assert_eq!((captured_width, captured_height), (320, 400));
+    assert_eq!(captured[0], 0x00ff_0000);
+
+    machine.advance_devices(600_000);
+    assert!(machine.frame_sequence() > initial_sequence);
+    let (presented, presented_width, presented_height) = machine.presented_frame_argb();
+    assert_eq!((presented_width, presented_height), (320, 400));
+    assert_eq!(presented[0], 0x00ff_0000);
+
+    let (_, full_width, full_height) = machine.frame_argb();
+    assert_eq!(full_width, 320);
+    assert!(full_height > presented_height);
+}
+
+#[test]
+fn margo_test_pattern_is_owned_by_the_video_facade() {
+    let mut machine = test_machine();
+    machine.load_margo_test_pattern();
+
+    assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+    let display = machine.margo().display();
+    assert_eq!((display.width, display.height), (640, 480));
+    assert_eq!(machine.margo().read_vram_u8(0), 0);
+    assert_eq!(machine.margo().read_vram_u8(1), 1);
+    assert_eq!(machine.margo().read_vram_u8(display.pitch as usize), 1);
+}
+
+#[test]
 fn graphics_mode_reporting_follows_the_active_vega_engine() {
     let mut machine = test_machine();
     assert!(!machine.is_graphics_mode());

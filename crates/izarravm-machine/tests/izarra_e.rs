@@ -24,8 +24,7 @@
 
 use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
-use izarravm_machine::{ActiveDisplay, MARGO_LFB_BASE, Machine, MachineProfile};
-use izarravm_video::VideoMode;
+use izarravm_machine::{ActiveDisplay, MARGO_LFB_BASE, Machine, MachineProfile, VideoMode};
 
 // Set 1 make/break codes used by the boot menu.
 const TAB_MAKE: u8 = 0x0f;
@@ -117,7 +116,7 @@ fn tab_then_accept_boots_the_floppy() {
     let mut reached_cga = false;
     for _ in 0..60 {
         machine.run_until_halt_or_cycles(10_000_000).unwrap();
-        if machine.video().active_mode() == VideoMode::Cga {
+        if machine.active_video_mode() == VideoMode::Cga {
             reached_cga = true;
             break;
         }
