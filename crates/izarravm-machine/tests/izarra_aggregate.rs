@@ -10,11 +10,8 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 #[test]
 fn full_post_block_is_consistent_and_every_component_passes() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-        izarra_bios(),
-    )
-    .unwrap();
+    let mut machine =
+        Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios()).unwrap();
     // Mount a real ATA disk so the HDD probe (component.disk_hdd) finds a device:
     // this is the fully-equipped machine where every component is present and must
     // PASS. (On a bare machine C: is HLE-backed, so the HDD probe FAILs by design.)

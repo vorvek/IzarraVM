@@ -47,7 +47,7 @@ const BOOT_CHOICE_ADDR: u32 = 0x052e;
 const WIZ3_IMAGE: &str = "R:/La Colección by Neville/dosroot/Wizardry III - The Legacy of Llylgamyn (PC Booter)/WIZ3MAST.IMG";
 
 fn boot_machine() -> Machine {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     Machine::new(profile, izarra_bios()).unwrap()
 }
 
@@ -204,7 +204,7 @@ fn loaded_cmos_gsw_mode_is_active_before_post() {
 fn fresh_cmos_seeds_the_profile_speed_code() {
     // The host seeds NVRAM 0x12 from the boot profile, so POST's apply is a
     // same-mode no-op until the user saves a different choice from the BIOS.
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
     let machine = Machine::new(profile, izarra_bios()).unwrap();
     assert_eq!(machine.cmos_byte(0x12), 2, "586 seeds code 2");

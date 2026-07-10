@@ -12,7 +12,7 @@ fn int11_returns_equipment_word() {
         0xCD, 0x11, // int 11h
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     let ax = machine.cpu().registers.eax() as u16;
@@ -33,7 +33,7 @@ fn int12_returns_conventional_memory_kib() {
         0xCD, 0x12, // int 12h
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     let ax = machine.cpu().registers.eax() as u16;
@@ -49,7 +49,7 @@ fn int1a_ah00_reads_bda_tick() {
         0xCD, 0x1A, // int 1Ah
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.write_physical_u8(0x46c, 0x45);
     machine.write_physical_u8(0x46d, 0x23);
     machine.write_physical_u8(0x46e, 0x01);
@@ -83,7 +83,7 @@ fn int1a_ah02_ah04_return_bcd_clock() {
         0xB4, 0x04, 0xCD, 0x1A, // int 1Ah AH=04h (date)
         0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.seed_rtc(2026, 6, 21, 1, 13, 45, 30); // helper forwards to rtc.seed
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -110,7 +110,7 @@ fn int15_ah87_block_move_across_1mb() {
         0xBE, 0x00, 0x10, // mov si,1000h (GDT offset)
         0xCD, 0x15, 0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     // ES = 0 so the GDT sits at linear 0x1000. Descriptors at +0x10 (src), +0x18 (dst).
     let gdt = 0x1000u32;
     let write_desc = |m: &mut Machine, at: u32, base: u32| {
@@ -147,7 +147,7 @@ fn int15_ah86_wait_advances_guest_clock() {
         0xBA, 0x40, 0x42, // DX=0x4240 -> with CX=0 that is 16960 us
         0xCD, 0x15, 0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let before = machine.master_ticks();
     let reason = machine.run_until_halt_or_cycles(10_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -181,7 +181,7 @@ fn live_mode_switches_keep_one_master_deadline_and_device_phase() {
         0xFA, // cli
         0xEB, 0xFE, // jmp $
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.set_mode(GswMode::Gsw586);
     let requested = 200_000;
     let expected_ticks = machine.timeline.master_ticks_for_cpu_clocks(requested);
@@ -405,7 +405,7 @@ fn paced_wall_topup_lets_a_polling_guest_catch_vretrace_windows() {
         0xEB, 0xF0, // jmp wait_clear
     ];
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(4, VideoCard::Vega),
         rom_with_code(&code),
     )
     .unwrap();

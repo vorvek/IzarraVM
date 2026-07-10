@@ -135,7 +135,7 @@ fn misc_output_ram_enable_gates_legacy_apertures_through_the_machine() {
 fn mode7_routes_b000_text_window_through_the_machine() {
     // mov ax,0007h; int 10h; hlt
     let rom = rom_with_code(&[0xb8, 0x07, 0x00, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     assert_eq!(
         machine.run_until_halt_or_cycles(1_000_000).unwrap(),
@@ -372,7 +372,7 @@ fn int10_11h_loads_user_font() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.write_guest_block(0x40000, &[0xFF; 32]); // two solid glyphs
     // Display cell 0 = 'A', white on black.
     machine.write_physical_u8(VGA_TEXT_BASE, 0x41);
@@ -499,7 +499,7 @@ fn int10_11h_loads_rom_8x16() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.write_guest_block(0x40000, &[0x00; 16]); // a blank glyph for 0xDB
     machine.write_physical_u8(VGA_TEXT_BASE, 0xDB);
     machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
@@ -529,7 +529,7 @@ fn int10_11h_caps_a_pathological_glyph_count() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     // A solid glyph for 'A' at the first 16 bytes; the rest of the 64 KB
     // page stays zero, so capping the read also proves only the real glyph
     // data is consulted.
@@ -551,7 +551,7 @@ fn int10_teletype_and_cursor() {
         0xB4, 0x03, 0xB7, 0x00, 0xCD, 0x10, // AH=03h get cursor (page 0)
         0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     // 'H' then 'i' landed at row 0 cols 0,1; cursor now at row 0 col 2.
@@ -653,7 +653,7 @@ fn int10_scroll_window_up_blanks_bottom() {
         0xBA, 0x4F, 0x18, // mov dx,184Fh (bottom-right row 24 col 79)
         0xCD, 0x10, 0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     // Put a non-space at row 1 col 0; after scroll-up by 1 it lands at row 0.
     machine.write_physical_u8(VGA_TEXT_BASE + 80 * 2, b'X');
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -681,7 +681,7 @@ fn int10_scroll_window_down_blanks_top() {
         0xBA, 0x4F, 0x18, // mov dx,184Fh (bottom-right row 24 col 79)
         0xCD, 0x10, 0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     // Put a non-space at row 0 col 0; after scroll-down by 1 it lands at row 1.
     machine.write_physical_u8(VGA_TEXT_BASE, b'Y');
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -711,7 +711,7 @@ fn int10_scroll_subwindow_up() {
         0xBA, 0x0A, 0x03, // mov dx,030Ah (bottom-right row 3 col 10)
         0xCD, 0x10, 0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     // Marker inside the window at row 2 col 5; after scroll-up by 1 it lands
     // at row 1 col 5.
     machine.write_physical_u8(VGA_TEXT_BASE + ((2 * 80) + 5) * 2, b'W');
@@ -1218,7 +1218,7 @@ fn int10_ega_modes_publish_bda_geometry() {
 fn int10_sets_mode_12h_then_draws_and_presents_640x480() {
     // mov ax, 0012h; int 10h; hlt
     let rom = rom_with_code(&[0xb8, 0x12, 0x00, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -1252,7 +1252,7 @@ fn int10_sets_mode_12h_then_draws_and_presents_640x480() {
 fn int10_sets_ega_mode_0fh_through_planar_dispatch() {
     // mov ax,000Fh; int 10h; hlt
     let rom = rom_with_code(&[0xb8, 0x0f, 0x00, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -1306,7 +1306,7 @@ fn int10_returns_to_text_mode() {
     let rom = rom_with_code(&[
         0xb8, 0x13, 0x00, 0xcd, 0x10, 0xb8, 0x03, 0x00, 0xcd, 0x10, 0xf4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     // Stamp a recognizable pattern into the text buffer before the toggles.
     machine.video_mut().write_u8(0, b'X').unwrap();

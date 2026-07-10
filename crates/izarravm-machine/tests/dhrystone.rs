@@ -4,7 +4,7 @@ use izarravm_core::{GswMode, VideoCard};
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 fn run(mode: GswMode) -> Machine {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new_raw_program(profile, izarravm_firmware::dhrystone_exe())
         .expect("load dhrystone");
     machine.set_mode(mode);

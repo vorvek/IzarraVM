@@ -9,7 +9,7 @@ fn mouse_movement_requests_irq12_after_enable() {
     // for the mouse interrupt, then 0xF4 enable reporting via the 0xD4 path),
     // then inject a host move and confirm IRQ12 is pending on the PIC and the
     // three-byte packet is readable on port 0x60 with the AUX status bit set.
-    let profile = MachineProfile::gsw_386(1, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(1, VideoCard::Vega);
     let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
     // Drive the controller through the bus the way the CPU would.
     {
@@ -50,7 +50,7 @@ fn bios_aux_enable_then_packet_reads_back_with_no_stray_keyboard_byte() {
     // coverage for: the injected packet reads back on 0x60 with the AUX status
     // bit set, AND the enable handshake never drops a stray byte into the
     // keyboard scancode ring (which the keyboard ISR reads unconditionally).
-    let profile = MachineProfile::gsw_386(1, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(1, VideoCard::Vega);
     let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
     {
         let mut bus = machine.make_bus();
@@ -206,7 +206,7 @@ fn bios_irq12_preserves_interrupted_cx_dx() {
     ];
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -273,7 +273,7 @@ fn bios_service_vectors_survive_low_memory_wipe() {
         0xCD, 0x11, // int 11h
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     assert_eq!(machine.cpu().registers.eax() as u16, BIOS_EQUIPMENT_WORD);

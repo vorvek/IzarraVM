@@ -75,7 +75,7 @@ fn measure_read_bandwidth_returns_a_finite_sample_in_every_mode() {
     ];
     for mode in modes {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(24, VideoCard::Vega),
             izarravm_firmware::neurketa_image(),
         )
         .expect("boot image");
@@ -115,7 +115,7 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
     // nothing carries over, exactly like the bandwidth tool does.
     fn measure(mode: GswMode, block: u32) -> f64 {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(24, VideoCard::Vega),
             izarravm_firmware::neurketa_image(),
         )
         .expect("boot image");
@@ -222,7 +222,7 @@ fn slow_post_paces_without_null_vector_runaway() {
     // the count-up, then confirm the CPU never left the BIOS region and the INT
     // 08h handler advanced the BDA tick count.
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -286,7 +286,7 @@ fn default_int08_ticks_and_returns_from_irq0() {
         0xfa, 0xf4, // cli; hlt
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -317,7 +317,7 @@ fn sti_hlt_idle_loop_still_takes_irq0_per_batch() {
         0xeb, 0xfc, // jmp $-2 (back to the sti)
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -351,7 +351,7 @@ fn sti_busy_loop_takes_irq0_despite_intervening_instructions() {
         0xeb, 0xf9, // jmp $-7 (back to the sti)
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -373,8 +373,7 @@ fn machine_accepts_256k_flash_and_shadows_top_64k() {
     let mut flash = vec![0u8; 256 * 1024];
     let top = flash.len() - BIOS_ROM_SIZE;
     flash[top + 0xfff0..top + 0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
-    let mut machine =
-        Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), flash).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), flash).unwrap();
     assert_eq!(machine.read_physical_u8(0xffff0), 0xea);
     assert_eq!(machine.read_physical_u8(0xffff4), 0xf0);
 }
@@ -385,7 +384,7 @@ fn izarra_bios_boots_into_margo_lfb_screen() {
     // there. Fast POST (default) skips delays so the screen is up within the
     // cycle budget.
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -414,7 +413,7 @@ fn izarra_bios_boots_into_margo_lfb_screen() {
 #[test]
 fn izarra_bios_lfb_carries_rle_background() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();

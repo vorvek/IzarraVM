@@ -62,7 +62,7 @@ const BLIT_TICKS_COM: &[u8] = &[
 
 #[test]
 fn vram_blit_delivers_every_pit_edge_at_586() {
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
     let mut machine = Machine::new_raw_program(profile, BLIT_TICKS_COM).unwrap();
     let before = machine.elapsed_clocks();

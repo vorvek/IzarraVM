@@ -17,7 +17,7 @@ const SHIFT_MAKE: u8 = 0x2a;
 const SHIFT_BREAK: u8 = 0xaa;
 
 fn booted_to_idle() -> Machine {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
     // Past POST and the setup-hotkey window, to the idle loop with IRQ1 unmasked.
     machine.run_until_halt_or_cycles(20_000_000).unwrap();

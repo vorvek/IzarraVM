@@ -37,7 +37,7 @@ fn jit_auto_admission_policy_defaults_on_only_when_available() {
 // cycle_no_interrupt_check before the next batch entry, where IRQ0 is taken.
 fn test_machine() -> Machine {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -47,7 +47,7 @@ fn test_machine() -> Machine {
 
 fn int15_machine(mem_mib: u16) -> Machine {
     Machine::new(
-        MachineProfile::gsw_386(mem_mib, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(mem_mib, VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap()
@@ -108,7 +108,7 @@ fn int16_read_after_with_layout(layout: u8, scancodes: &[u8]) -> u16 {
     // mov ah,0; int 16h; mov [0x200],ax; int 20h
     const PROG: [u8; 9] = [0xB4, 0x00, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
     machine.write_physical_u8(0x0496, layout);
     machine.inject_key_scancodes(scancodes);
     machine.run_until_halt_or_cycles(3_000_000).unwrap();
@@ -121,7 +121,7 @@ fn int16_read_after(scancodes: &[u8]) -> u16 {
 
 fn int16_peek_guest_exit(scancodes: &[u8], prog: &[u8]) -> StopReason {
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     machine.inject_key_scancodes(scancodes);
     machine.run_until_halt_or_cycles(1_000_000).unwrap()
 }
@@ -133,7 +133,7 @@ fn int16_enhanced_read_after(scancodes: &[u8]) -> u16 {
     // mov ah,0x10; int 16h; mov [0x200],ax; int 20h
     const PROG: [u8; 9] = [0xB4, 0x10, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
     machine.inject_key_scancodes(scancodes);
     machine.run_until_halt_or_cycles(3_000_000).unwrap();
     read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
@@ -449,7 +449,7 @@ fn psp_env_segment(machine: &Machine) -> u16 {
 // return `rows` font bytes for `glyph` from the VGA character generator (table 0).
 // Mirrors the boot-to-idle pattern from izarra_kbd_layouts.rs.
 fn boot_and_read_font_rows(cmos_codepage: u8, glyph: u8, rows: usize) -> Vec<u8> {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.set_cmos_byte(0x13, cmos_codepage);
     machine.run_until_halt_or_cycles(20_000_000).unwrap();

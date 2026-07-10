@@ -89,7 +89,7 @@ fn katea_host_folder_boots_and_lists_a_host_file() {
         .expect("write host file");
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
@@ -176,7 +176,7 @@ fn katea_full_post_boot_hands_display_back_to_vga() {
     std::fs::write(dir.join("GREETING.TXT"), b"hi\r\n").expect("write host file");
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
@@ -229,7 +229,7 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
     std::fs::write(depth.join("READAT.TXT"), b"read at depth ok\r\n").expect("write depth file");
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
@@ -327,7 +327,7 @@ echo deep>SUB\\DEEP.TXT\r\n";
     std::fs::write(saves.join("MAKE.BAT"), make_bat).expect("seed MAKE.BAT");
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
@@ -433,7 +433,7 @@ del PREEXIST.TXT\r\n";
     std::fs::write(ops.join("OPS.BAT"), ops_bat).expect("seed OPS.BAT");
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
@@ -518,8 +518,7 @@ fn katea_run_captures_a_program_exit_code() {
     let prog = dir.path().join("EXIT42.COM");
     std::fs::write(&prog, izarravm_firmware::exit42_com()).unwrap();
 
-    let code =
-        katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+    let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
     assert_eq!(
         code, 42,
         "the program's DOS exit code must reach the host process"
@@ -549,8 +548,7 @@ fn katea_run_guest_hlt_resumes_and_exits_under_tokaemm() {
     let prog = dir.path().join("HLTTEST.COM");
     std::fs::write(&prog, izarravm_firmware::hlttest_com()).unwrap();
 
-    let code =
-        katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+    let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
     assert_eq!(
         code, 1,
         "a guest sti;hlt must resume past the F4 byte and reach its own exit, \
@@ -576,8 +574,7 @@ fn katea_run_repeated_guest_hlt_resumes_and_exits_under_tokaemm() {
     let prog = dir.path().join("MULTIHLT.COM");
     std::fs::write(&prog, izarravm_firmware::multihlt_com()).unwrap();
 
-    let code =
-        katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+    let code = katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Vega)).expect("katea_run");
     assert_eq!(
         code, 7,
         "five sequential guest HLTs must all resume cleanly under TOKAEMM"
@@ -634,7 +631,7 @@ fn tokaedit_edits_and_saves_a_file() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");

@@ -11,7 +11,7 @@ fn vbe_set_mode_selects_a_margo_mode() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -31,7 +31,7 @@ fn vbe_set_mode_then_vga_mode_follows_the_display() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -49,7 +49,7 @@ fn vbe_set_mode_accepts_hi_color_modes() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -68,7 +68,7 @@ fn vbe_current_mode_returns_the_set_mode() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -88,7 +88,7 @@ fn vbe_mode_info_fills_the_block() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -112,7 +112,7 @@ fn vbe_controller_info_fills_the_block() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -154,7 +154,7 @@ fn vbe_mode_info_rejects_unknown_modes() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -210,7 +210,7 @@ fn dos_com_prints_string_and_exits() {
         0xb4, 0x09, 0xba, 0x0c, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'H', b'i', b'$',
     ];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
     assert_eq!(machine.program_output(), b"Hi");
@@ -221,7 +221,7 @@ fn dos_com_exit_code_is_carried_through() {
     // org 0x100: mov ax,4c07; int 21
     let com: &[u8] = &[0xb8, 0x07, 0x4c, 0xcd, 0x21];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 7 });
     assert!(machine.program_output().is_empty());
@@ -257,7 +257,7 @@ fn fill_through_the_mmio_aperture_writes_vram_and_times_busy() {
 #[test]
 fn dos_com_runs_the_committed_hello_fixture() {
     let mut machine = Machine::new_raw_program(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::HELLO_COM,
     )
     .unwrap();
@@ -273,7 +273,7 @@ fn dos_exe_runs_with_relocation_applied() {
     // the relocation (otherwise DS is the link-time base and the bytes
     // diverge), so this doubles as the end-to-end relocation check.
     let mut machine = Machine::new_raw_program(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::EXEHELLO_EXE,
     )
     .unwrap();
@@ -296,7 +296,7 @@ fn dos_com_ah06_zf_reaches_the_guest() {
     ];
 
     let mut available =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     available.set_program_stdin(b"X");
     assert_eq!(
         available.run_until_halt_or_cycles(100_000).unwrap(),
@@ -305,7 +305,7 @@ fn dos_com_ah06_zf_reaches_the_guest() {
     assert_eq!(available.program_output(), b"X"); // char path taken, AL echoed
 
     let mut empty =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     assert_eq!(
         empty.run_until_halt_or_cycles(100_000).unwrap(),
         StopReason::DosExit { code: 0 }
@@ -320,7 +320,7 @@ fn dos_com_echoes_input() {
         0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
     ];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     machine.set_program_stdin(b"hi");
     assert_eq!(
         machine.run_until_halt_or_cycles(100_000).unwrap(),
@@ -503,7 +503,7 @@ fn vbe_mode_info_reports_hicolor_masks() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     assert_eq!(
         machine.run_until_halt_or_cycles(1_000_000).unwrap(),
         StopReason::Halted
@@ -534,7 +534,7 @@ fn vbe_mode_info_reports_15bpp_masks() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     assert_eq!(
         machine.run_until_halt_or_cycles(1_000_000).unwrap(),
         StopReason::Halted

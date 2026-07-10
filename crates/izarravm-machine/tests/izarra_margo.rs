@@ -15,11 +15,8 @@ use izarravm_machine::{Machine, MachineProfile};
 
 /// Boot the BIOS, run POST for the standard budget, and return its records.
 fn post_records() -> Vec<SuiteRecord> {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-        izarra_bios(),
-    )
-    .expect("the izarra-bios image builds a gsw_386 machine");
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios())
+        .expect("the izarra-bios image builds a gsw_386 machine");
 
     machine
         .run_until_halt_or_cycles(20_000_000)

@@ -101,7 +101,7 @@ fn flush_hdd_folder_runs_a_final_reconcile() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut m = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -575,7 +575,7 @@ fn program_runtime_reintercepts_dos_vectors_for_the_raw_program_loader() {
     // exact branch the SP-3 seam deletion added to interrupt_acknowledge.
     let prog: &[u8] = &[0xcd, 0x20]; // int 20h
     let mut raw =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     for vector in [0x20u8, 0x21, 0x27] {
         raw.pending_soft_int = None;
         ack_and_dispatch(&mut raw, vector);

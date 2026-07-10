@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn v86spike_enters_v86_and_signals() {
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(izarravm_firmware::V86SPIKE_BIN),
     )
     .unwrap();
@@ -32,7 +32,7 @@ fn hlt_wakes_on_pit_timer_tick() {
         0xf4, 0xfa, 0xf4, 0xff, 0x06, 0x00, 0x05, 0xb0, 0x20, 0xe6, 0x20, 0xcf,
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -56,7 +56,7 @@ fn hlt_wakes_on_pit_timer_tick() {
 #[test]
 fn boot_suite_reports_timer_irq0_pass() {
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
@@ -80,7 +80,7 @@ fn boot_suite_reports_timer_irq0_pass() {
 fn boot_suite_reports_sb_dsp_reset_pass() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Vega),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -104,7 +104,7 @@ fn boot_suite_reports_sb_dsp_reset_pass() {
 fn boot_suite_reports_opl3_pass() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Vega),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -128,7 +128,7 @@ fn boot_suite_reports_opl3_pass() {
 fn boot_suite_reports_opl2_pass() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Vega),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -151,7 +151,7 @@ fn boot_suite_reports_opl2_pass() {
 #[test]
 fn boot_suite_reports_sb_8bit_dma_pass() {
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
@@ -170,7 +170,7 @@ fn boot_suite_reports_sb_8bit_dma_pass() {
 #[test]
 fn boot_suite_reports_sb_16bit_dma_pass() {
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
@@ -193,7 +193,7 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
     // deliver the half-buffer IRQ5, so the handler runs and real emulated time
     // advances -- not a genuine no-wake halt. Setup mirrors the 8-bit probe.
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
         rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
     )
@@ -304,7 +304,7 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
 fn cli_hlt_is_a_genuine_halt() {
     // With interrupts off, HLT must still halt immediately, not spin.
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         rom_with_code(&[0xfa, 0xf4]), // cli; hlt
     )
     .unwrap();
@@ -317,7 +317,7 @@ fn pit_channel0_raises_irq0_while_running() {
     // cli; jmp $ keeps the CPU spinning with interrupts off, so advance_devices
     // ticks the PIT but the raised IRQ0 stays pending (never acknowledged).
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         rom_with_code(&[0xfa, 0xeb, 0xfe]),
     )
     .unwrap();
@@ -341,7 +341,7 @@ fn batch_throughput() {
     // batch fully amortizes (one bus build + device fan-out per ~thousands of
     // instructions instead of per instruction).
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         rom_with_code(&[0xfa, 0xeb, 0xfe]),
     )
     .unwrap();

@@ -206,7 +206,7 @@ fn protected_flat_rom(body: &[u8]) -> Vec<u8> {
 #[test]
 fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -234,7 +234,7 @@ fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
 #[test]
 fn distira_lfb_dword_writes_follow_voodoo_lfb_format() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -257,7 +257,7 @@ fn distira_lfb_dword_writes_follow_voodoo_lfb_format() {
 #[test]
 fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -291,7 +291,7 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
 #[test]
 fn distira_odd_aligned_lfb_word_dword_accesses_use_voodoo_callbacks() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -346,7 +346,7 @@ fn distira_guest_lfb_bar_odd_reads_and_writes_use_voodoo_callbacks() {
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_SWAPBUFFER_CMD as u32, 1);
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         protected_flat_rom(&code),
     )
     .unwrap();
@@ -419,7 +419,7 @@ fn distira_guest_cmdfifo_type1_packets_use_assigned_bar_aperture() {
     push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 44, 1);
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         protected_flat_rom(&code),
     )
     .unwrap();
@@ -472,7 +472,7 @@ fn distira_guest_cmdfifo_type5_framebuffer_packets_use_assigned_bar_aperture() {
     push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 8, 0x0034_5678);
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         protected_flat_rom(&code),
     )
     .unwrap();
@@ -513,7 +513,7 @@ fn distira_guest_cmdfifo_type5_texture_packets_use_assigned_bar_aperture() {
     push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 8, 0x07e0_07e0);
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         protected_flat_rom(&code),
     )
     .unwrap();
@@ -571,7 +571,7 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
     push_mov_moffs_u32_imm32(&mut code, ASSIGNED_TEX + (LOD2 << 17), 0x07e0_07e0);
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         protected_flat_rom(&code),
     )
     .unwrap();
@@ -585,7 +585,7 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
 #[test]
 fn distira_texture_aperture_keeps_tmu_stores_independent() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -601,7 +601,7 @@ fn distira_texture_aperture_keeps_tmu_stores_independent() {
 #[test]
 fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -638,7 +638,7 @@ fn distira_glide_probe_detects_two_megabytes_on_each_tmu() {
 #[test]
 fn distira_trex_config_send_reports_two_tmus() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -657,7 +657,7 @@ fn distira_trex_config_send_reports_two_tmus() {
 #[test]
 fn distira_texture_aperture_aligns_dwords_and_ignores_narrow_writes() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -675,7 +675,7 @@ fn distira_texture_aperture_aligns_dwords_and_ignores_narrow_writes() {
 #[test]
 fn distira_texture_aperture_ignores_unsupported_tmu_space_at_the_boundary() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -699,7 +699,7 @@ fn distira_texture_aperture_ignores_unsupported_tmu_space_at_the_boundary() {
 #[test]
 fn distira_texture_aperture_reads_open_bus() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -743,7 +743,7 @@ fn distira_pci_bar_maps_voodoo_mmio_and_lfb_windows() {
         0x20,
     ];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Distira), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -771,7 +771,7 @@ fn distira_cmdfifo_aperture_drains_type1_register_packets() {
     const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -821,7 +821,7 @@ fn distira_cmdfifo_type5_framebuffer_packet_writes_lfb() {
     const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -884,7 +884,7 @@ fn distira_guest_dac_detect_ics_probe_reaches_fbi_init2_through_pci_init_enable(
     push_store_eax_moffs(&mut code, 0x2200);
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         protected_flat_rom(&code),
     )
     .unwrap();
@@ -906,7 +906,7 @@ fn distira_v_retrace_poll_loop_terminates_as_device_clocks_advance() {
     // advance_devices uses every batch) and confirm the bit is observed in
     // both states, i.e. a real wait-for-either-edge loop cannot hang.
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         I386DX25_TEST_ROM,
     )
     .unwrap();
@@ -940,7 +940,7 @@ fn disttri_guest_program_finds_distira_via_pci_and_draws_a_triangle() {
     // evidence the plan calls for, as opposed to a Rust test poking the
     // device directly.
     let mut machine =
-        Machine::new(MachineProfile::gsw_386(16, VideoCard::Distira), DISTTRI_BIN).unwrap();
+        Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), DISTTRI_BIN).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
 

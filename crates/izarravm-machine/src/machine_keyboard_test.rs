@@ -7,7 +7,7 @@ use super::*;
 fn injected_key_is_readable_on_port_0x60_and_requests_irq1() {
     // A bare machine: inject a scancode, then read it back through the bus the
     // way the CPU would, and confirm IRQ1 became pending on the PIC.
-    let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega);
     let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
     machine.inject_key_scancodes(&[0x1e]); // 'A' make
     assert_eq!(machine.read_io_port_u8(0x60), 0x1e);
@@ -180,7 +180,7 @@ fn int16_keyclick_call_returns_to_caller() {
         0xb8, 0x01, 0x04, 0xcd, 0x16, 0xc7, 0x06, 0x00, 0x02, 0x34, 0x12, 0xcd, 0x20,
     ];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
     machine.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(
         read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200),
@@ -193,7 +193,7 @@ fn int16_keyclick_call_returns_to_caller() {
 fn io_port_reports_last_post_write() {
     // mov al,0x42; out 0x80,al; hlt
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         rom_with_code(&[0xb0, 0x42, 0xe6, 0x80, 0xf4]),
     )
     .unwrap();

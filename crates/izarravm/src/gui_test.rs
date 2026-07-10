@@ -60,7 +60,7 @@ fn top_up_escape_hatch_caps_edge_stops_for_a_pathological_crtc() {
     rom[1] = 0xFE;
     rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
         rom,
     )
     .unwrap();
@@ -127,7 +127,7 @@ fn top_up_aborts_when_the_peek_halts() {
     rom[1] = 0xF4; // hlt
     rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
         rom,
     )
     .unwrap();
@@ -159,7 +159,7 @@ fn live_mode_switch_debits_credit_in_master_ticks() {
     ]);
     rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
         rom,
     )
     .unwrap();

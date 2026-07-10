@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn rejects_non_64k_roms() {
-    let err = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
+    let err = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), [0u8; 8]).unwrap_err();
 
     assert!(matches!(err, MachineError::InvalidRomSize(8)));
 }
@@ -81,7 +81,7 @@ fn int10_mode13h_routes_a000_through_chain4() {
         0xaa, // stosb
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.set_bus_trace_detailed(true);
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -106,7 +106,7 @@ fn unittester_exit_command_stops_with_the_guest_code() {
         0xB0, 0x03, 0xE6, 0xE6, // mov al,3;  out 0E6h,al  (CMD_EXIT)
         0xF4, // hlt (not reached)
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::TestExit { code: 42 });
 }
@@ -128,7 +128,7 @@ fn unittester_crc_command_matches_the_rust_helper() {
         0xB0, 0x01, 0xE6, 0xE6, // CMD_CRC
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
     let reported = with_bus(&mut machine, |bus| {
@@ -150,7 +150,7 @@ fn int10_ah0f_reports_mode_after_set() {
         0xB4, 0x0F, 0xCD, 0x10, // mov ah,0Fh; int 10h (get mode)
         0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     let ax = machine.cpu().registers.eax() as u16;
@@ -201,7 +201,7 @@ fn int10_00_tracks_no_clear_in_bda_video_control() {
 #[test]
 fn boot_image_starts_at_bios_loaded_boot_sector() {
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
@@ -219,7 +219,7 @@ fn boot_image_starts_at_bios_loaded_boot_sector() {
 #[test]
 fn boot_image_emits_serial_records_and_result_block() {
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
@@ -273,7 +273,7 @@ fn boot_suite_timer_passes_at_native_200mhz() {
     let profile = MachineProfile {
         cpu: GswMode::Gsw586,
         memory_mib: 16,
-        video: VideoCard::Et4000Ax,
+        video: VideoCard::Vega,
         sound_blaster: SoundBlasterConfig::default(),
         wss: WssConfig::default(),
         wait_states: WaitStateProfile::default(),
@@ -324,7 +324,7 @@ fn vga_mode_set_clears_a_latched_margo_display() {
         0xcd, 0x10, // int 10h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     // Host path latches Margo as the active display.
     machine.set_margo_mode_640x480x8();
@@ -343,7 +343,7 @@ fn int42_relocated_video_handler_uses_int10_service() {
         0xcd, 0x42, // int 42h
         0xf4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -383,7 +383,7 @@ fn int13_read_places_sector_in_memory() {
         0xCD, 0x13, // int 13h
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.mount_floppy(img).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -414,7 +414,7 @@ fn int40_relocated_floppy_handler_uses_disk_service() {
         0xCD, 0x40, // int 40h
         0xF4, // hlt
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.mount_floppy(img).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -593,7 +593,7 @@ fn ega_graphics_brown_and_bright_colors_render_through_the_dac() {
         code.push(0xF4); // hlt
 
         let mut machine = Machine::new(
-            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Vega),
             rom_with_code(&code),
         )
         .unwrap();

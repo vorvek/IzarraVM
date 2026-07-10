@@ -45,7 +45,7 @@ fn translate(layout: u8, scancode: u8) -> u8 {
 }
 
 fn translate_sequence(layout: u8, scancodes: &[u8]) -> u8 {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
     // The bring-up caches CMOS 0x10 into the BDA, so set the layout before any run.
     machine.set_cmos_byte(CMOS_LAYOUT, layout);

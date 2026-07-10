@@ -7,7 +7,7 @@ use super::*;
 fn int10_0bh_sets_border_overscan() {
     // mov ax,0b00h; mov bx,0005h; int 10h; hlt  (AH=0Bh, BH=0 border, BL=5)
     let rom = rom_with_code(&[0xb8, 0x00, 0x0b, 0xbb, 0x05, 0x00, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -21,7 +21,7 @@ fn int10_0bh_sets_cga_background_and_palette() {
         0xb8, 0x04, 0x00, 0xcd, 0x10, 0xb8, 0x00, 0x0b, 0xbb, 0x11, 0x00, 0xcd, 0x10, 0xb8, 0x00,
         0x0b, 0xbb, 0x01, 0x01, 0xcd, 0x10, 0xf4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -101,7 +101,7 @@ fn int10_non_cga_mode_set_clears_cga_bda_latches() {
 fn int10_ah05_sets_the_text_page_via_start_address() {
     // mov ax,0501h; int 10h; hlt  (AH=05h, AL=1 -> display page 1)
     let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -242,7 +242,7 @@ fn int10_ah05_page_flip_scrolls_through_the_machine() {
     //   int 10h
     //   hlt
     let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     // Page 0 cell 0 = 'A'; page 1 cell 0 (cell 2048, byte 4096) = 'Z'.
     let video = machine.video_mut();
@@ -274,7 +274,7 @@ fn int10_ah05_page_flip_scrolls_through_the_machine() {
 fn int10_10h_sets_palette_register() {
     // mov ax,1000h; mov bx,0901h; int 10h; hlt  (AH=10h AL=00, BL=1, BH=9)
     let rom = rom_with_code(&[0xb8, 0x00, 0x10, 0xbb, 0x01, 0x09, 0xcd, 0x10, 0xf4]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -288,7 +288,7 @@ fn int10_10h_sets_individual_dac() {
     let rom = rom_with_code(&[
         0xb8, 0x10, 0x10, 0xbb, 0x28, 0x00, 0xba, 0x00, 0x3f, 0xb9, 0x00, 0x00, 0xcd, 0x10, 0xf4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -303,7 +303,7 @@ fn int10_10h_sets_dac_block() {
         0xb8, 0x00, 0x10, 0x8e, 0xc0, 0xba, 0x00, 0x00, 0xb8, 0x12, 0x10, 0xbb, 0x0a, 0x00, 0xb9,
         0x03, 0x00, 0xcd, 0x10, 0xf4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     // The three triples at 0x10000: red, green, blue.
     for (i, &b) in [63u8, 0, 0, 0, 63, 0, 0, 0, 63].iter().enumerate() {
@@ -325,7 +325,7 @@ fn int10_10h_gets_dac_block() {
         0xb8, 0x00, 0x10, 0x8e, 0xc0, 0xba, 0x00, 0x00, 0xb8, 0x17, 0x10, 0xbb, 0x0a, 0x00, 0xb9,
         0x03, 0x00, 0xcd, 0x10, 0xf4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
 
     // Seed DAC entries 10/11/12 with known values, then let the readback run.
     machine.video_mut().set_dac_entry(10, 12, 34, 56);
