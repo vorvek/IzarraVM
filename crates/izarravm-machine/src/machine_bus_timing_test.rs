@@ -133,6 +133,51 @@ fn jit_fetch_preview_matches_the_live_bus_charge() {
 }
 
 #[test]
+fn jit_direct_memory_preview_bounds_the_live_bus_charge() {
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut machine = test_machine();
+        machine.set_mode(mode);
+        with_bus(&mut machine, |bus| {
+            let data_bound = bus
+                .jit_direct_memory_max_clocks(BusWidth::Byte, BusAccessKind::DataRead)
+                .expect("the machine bus has a direct-memory bound");
+            let fetch = bus
+                .jit_cached_fetch_run_clocks(0x3000, 2)
+                .expect("ordinary RAM has a stable fetch cost");
+            let additional = data_bound + fetch;
+            let now = bus.in_batch_scaled_bus_clocks();
+            let scaled_bound = bus
+                .jit_projected_batch_scaled_bus_clocks(additional)
+                .unwrap()
+                - now
+                + 1;
+            for i in 0..32 {
+                let now = bus.in_batch_scaled_bus_clocks();
+                let projected = bus
+                    .jit_projected_batch_scaled_bus_clocks(additional)
+                    .unwrap();
+                assert!(projected - now <= scaled_bound, "{mode:?}, phase {i}");
+                bus.charge_instruction_fetch(0x4000 + i).unwrap();
+            }
+
+            let before = bus.trace.elapsed_clocks();
+            bus.charge_direct_memory(0x3000, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap();
+            let charged = bus.trace.elapsed_clocks() - before;
+            assert!(
+                charged <= data_bound,
+                "{mode:?}: charged {charged}, bound {data_bound}"
+            );
+        });
+    }
+}
+
+#[test]
 fn predicted_beam_at_batch_start_equals_the_unmutated_beam() {
     // At core_clocks_so_far = 0 with zero in-batch bus clocks (the very first
     // instruction of a batch, before any fetch/data access has been recorded

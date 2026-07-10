@@ -17,10 +17,9 @@
 //!   exits land at exactly the boundaries the interpreter run would have broken at: halted,
 //!   `requires_step_break` (port I/O / pending soft-int), an interrupt-enable transition, the
 //!   scaled-clock cap, or any fault (rewound + delivered through the normal path).
-//! - Register/ALU work is inlined against `gpr[]` and the pending-flags state; memory operands
-//!   go through the `extern "C"` trampolines (`callbacks.rs` pattern: fault-rewind-then-negative
-//!   convention). The BIOS stub window 0xFF000..0xFF400 is a no-compile zone (the HLE fetch
-//!   seam must keep seeing those fetches).
+//! - Register/ALU work is inlined against `gpr[]` and the pending-flags state. Supported byte
+//!   memory forms use exact helpers; other memory forms use `region_step`.
+//!   The BIOS stub window 0xFF000..0xFF400 is a no-compile zone so the HLE fetch seam still sees it.
 //! - Guest-visible identity is the gate: cyc/aux byte-identical in all four modes, conformance
 //!   exact, the Doom/Quake anchors unmoved. The region's only legal observable is wall time.
 
@@ -60,16 +59,11 @@ pub(crate) struct CompiledRegion {
     /// requires equality with the live mode key, so a block compiled for one mode is never reused
     /// in another at the same phys/d (spec §2.2). A mismatch is a miss: unstamp and re-admit.
     pub mode_key: u32,
-    /// Whether this region emitted any native cost-fold LOAD slot (`IZARRAVM_JIT_FOLD` on + fold-eligible
-    /// at admission). Those slots assume a FLAT DS (base 0, limit max) so EA == linear, but DS is a
-    /// runtime value NOT in `mode_key`; `run_region` re-checks DS flatness per entry when this is set and
-    /// bails to the interpreter if DS is no longer flat. Regions without native fold slots skip the check.
-    pub has_native_fold: bool,
-    /// Whether this region emitted a native cost-fold STORE slot. Those additionally assume DS is
-    /// WRITABLE (a `data_write_pages` HIT only proves the physical page was writable via some segment,
-    /// not that the current DS permits writes), which is also a runtime value not in `mode_key`; when set
-    /// `run_region` re-checks DS writability per entry and bails if DS is now read-only (else the native
-    /// store would silently write where the interpreter #GPs).
+    /// Whether this region contains a native byte load. Its runtime guard requires flat, readable
+    /// DS and otherwise uses `region_step`.
+    pub has_native_load: bool,
+    /// Whether this region contains a native byte store. Its runtime guard requires flat, writable
+    /// DS and otherwise uses `region_step`.
     pub has_native_store: bool,
 }
 

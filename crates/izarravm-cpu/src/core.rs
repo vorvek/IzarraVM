@@ -305,10 +305,8 @@ impl CpuGsw {
         if self.registers.segment(SegmentIndex::Ss).default_size_32 {
             key |= 1 << 3;
         }
-        // CR0.PG: the native cost-fold LOAD probe assumes linear == physical (unpaged), so an
-        // unpaged-compiled block must never be re-entered paged (it would probe the physical page
-        // cache with a linear address and read the wrong frame — re-plan trap #1). Keying on PG
-        // makes a paging transition a mode-key mismatch → unstamp + re-admit for the new mode.
+        // The native memory probe emits a TLB translation only for a paged block. A paging change
+        // therefore needs a mode-key miss and a fresh emission.
         if self.control.cr0 & CR0_PG != 0 {
             key |= 1 << 4;
         }
@@ -318,38 +316,29 @@ impl CpuGsw {
     /// Whether `seg` is FLAT: base 0 and limit `u32::MAX`. This is exactly the interpreter's
     /// `segment_linear_byte` fast path (base 0 + limit max → return the offset as the linear address),
     /// so under it EA == linear and no segment-limit fault is ever skipped (with limit max no offset can
-    /// exceed it, and the flat fast path returns before the expand-down logic). The native cost-fold LOAD
-    /// probe needs this for the access segment (DS) since it treats EA as linear (and, when unpaged, as
-    /// physical). DS is a runtime value not in `jit_mode_key`, so `run_region` re-checks it per entry.
+    /// exceed it, and the flat fast path returns before the expand-down logic). The native memory
+    /// probe needs this for DS because it computes the linear offset directly. DS is not part of the
+    /// mode key, so every region entry rechecks it.
     #[cfg(feature = "jit")]
     pub(super) fn jit_segment_flat(&self, seg: SegmentIndex) -> bool {
         let d = self.registers.segment(seg);
         d.base == 0 && d.limit == u32::MAX
     }
 
-    /// Whether a data WRITE through `seg` is permitted — the write half of `check_segment_access_kind`.
-    /// The native STORE fold needs this: a `data_write_pages` HIT proves the PHYSICAL page was writable
-    /// via some segment, NOT that the current segment permits writes, so a read-only (but flat) DS would
-    /// pass `jit_segment_flat` yet must still #GP on a store. Real/V86 segments are always writable
-    /// (`0x93`); a protected-mode data descriptor needs the writable bit (type bit 1) and must not be a
-    /// code descriptor (type bit 3). Re-checked per entry for a region with native store slots.
+    /// Whether a data read through `seg` is permitted. This deliberately uses the interpreter's
+    /// descriptor check so execute-only code loaded into DS cannot enter a native memory region.
     #[cfg(feature = "jit")]
-    pub(super) fn jit_segment_writable(&self, seg: SegmentIndex) -> bool {
-        if !self.is_protected_mode() || self.is_v86_mode() {
-            return true;
-        }
+    pub(super) fn jit_segment_readable(&self, seg: SegmentIndex) -> bool {
         let access = self.registers.segment(seg).access;
-        access & 0x08 == 0 && access & 0x02 != 0
+        self.check_segment_access_kind(seg, access, false).is_ok()
     }
 
-    /// Whether a block admitted now may use the native cost-fold LOAD/STORE probe: Approximate class
-    /// (486/586) + flat DS. Both unpaged and paged are supported (the paged path inserts a TLB
-    /// linear->physical translate before the physical-keyed page-cache probe). The class and PG bit
-    /// are in `jit_mode_key` (paging transition re-admits); DS flatness/writability re-checked per entry.
+    /// Whether a data write through `seg` is permitted. A direct-page cache hit proves that the
+    /// physical page is writable, but it says nothing about the current segment descriptor.
     #[cfg(feature = "jit")]
-    pub(super) fn jit_fold_block_eligible(&self) -> bool {
-        matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
-            && self.jit_segment_flat(SegmentIndex::Ds)
+    pub(super) fn jit_segment_writable(&self, seg: SegmentIndex) -> bool {
+        let access = self.registers.segment(seg).access;
+        self.check_segment_access_kind(seg, access, true).is_ok()
     }
 
     /// The active GSW compatibility mode.
@@ -1270,35 +1259,6 @@ impl CpuGsw {
     /// result to gpr; this only records the flag descriptor. `a` and `b` are the width-masked (here
     /// full 32-bit) operands, matching the lazy-flags contract: `b` is the raw second operand, not
     /// b+carry (plain ADD, carry 0, so the lazy Add form applies).
-    /// The write-tracking `write_memory_u8` does AFTER writing the byte, for the native STORE fold: the
-    /// emitted probe already wrote the byte through the `data_write_pages` host pointer, so this only
-    /// records the written page (the unpaged prefetch snapshot) and runs the SMC code-write watch. The
-    /// store fold is unpaged-gated, so `physical == linear` (write_memory_u8's unpaged branch passes the
-    /// linear address to record_write_page; here they are equal). Called via the `store_finish_fn`
-    /// fn-pointer so the native store's `written_pages` + decode-cache SMC state stay interpreter-exact.
-    #[cfg(feature = "jit")]
-    pub(crate) fn jit_store_u8_finish(&mut self, addr: u32) {
-        // addr is the EA the probe recomputed (linear under flat DS).
-        // Under paging the native store path must pass PHYSICAL to record and note (decode cache
-        // and written_pages are physical-keyed; the interpreter's paged write path does so via
-        // translate). The TLB hit in the probe guarantees a fast lookup here.
-        if self.control.cr0 & CR0_PG != 0 {
-            let page = addr >> 12;
-            if let Some(e) = self.tlb.lookup(page) {
-                let phys = e.phys | (addr & 0x0fff);
-                self.record_write_page(phys);
-                self.note_code_write(phys, 1);
-                return;
-            }
-            // Fallback (should not happen inside a hot native region): use addr (will be reconciled).
-            self.record_write_page(addr);
-            self.note_code_write(addr, 1);
-        } else {
-            self.record_write_page(addr);
-            self.note_code_write(addr, 1);
-        }
-    }
-
     #[cfg(feature = "jit")]
     pub(crate) fn jit_set_pending_add(&mut self, a: u32, b: u32) {
         let result = a.wrapping_add(b);

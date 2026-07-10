@@ -111,7 +111,7 @@ impl CpuGsw {
     }
 
     #[inline]
-    fn read_direct_byte_page_cached<B: CpuBus>(
+    pub(super) fn read_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
         physical: u32,
@@ -186,42 +186,45 @@ impl CpuGsw {
         Ok(true)
     }
 
+    /// `Some(changed)` means the direct write completed; `None` asks the caller to use the bus path.
     #[inline]
-    fn write_direct_byte_page_cached<B: CpuBus>(
+    pub(super) fn write_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
         physical: u32,
         value: u8,
         kind: BusAccessKind,
-    ) -> ExecResult<bool> {
+    ) -> ExecResult<Option<bool>> {
         if let Some(entry) = self.data_write_pages.get(physical) {
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             let offset = (physical & 0x0fff) as usize;
+            let changed = unsafe { *entry.ptr.add(offset) != value };
             unsafe {
                 *entry.ptr.add(offset) = value;
             }
             self.record_data_write(kind, true);
             self.perf.direct_data_pointer_writes += 1;
-            return Ok(true);
+            return Ok(Some(changed));
         }
         let Some(page) = bus.direct_page(physical, kind)? else {
             self.perf.direct_page_misses += 1;
-            return Ok(false);
+            return Ok(None);
         };
         let offset = (physical & 0x0fff) as usize;
         if !page.writable || offset >= page.len {
             self.perf.direct_page_misses += 1;
-            return Ok(false);
+            return Ok(None);
         }
         self.perf.direct_page_hits += 1;
         self.data_write_pages.insert(page);
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
+        let changed = unsafe { *page.ptr.add(offset) != value };
         unsafe {
             *page.ptr.add(offset) = value;
         }
         self.record_data_write(kind, true);
         self.perf.direct_data_pointer_writes += 1;
-        Ok(true)
+        Ok(Some(changed))
     }
     // (`read_rm_u8` was removed with the legacy 0x84 TEST r/m8,reg8 handler — its only remaining
     // caller. The converted flags-misc executor reads the byte r/m via `read_operand_u8` on the
@@ -339,10 +342,13 @@ impl CpuGsw {
         } else {
             self.translate_linear(bus, linear, true)?
         };
-        self.note_code_write(physical, 1);
-        if self.write_direct_byte_page_cached(bus, physical, value, kind)? {
+        if let Some(changed) = self.write_direct_byte_page_cached(bus, physical, value, kind)? {
+            if changed {
+                self.note_code_write(physical, 1);
+            }
             return Ok(());
         }
+        self.note_code_write(physical, 1);
         let write = bus.write_memory_direct(physical, BusWidth::Byte, u32::from(value), kind)?;
         self.record_data_write(kind, write.direct);
         Ok(())
@@ -358,7 +364,7 @@ impl CpuGsw {
     /// Instruction fetch never routes through here (it uses `code_linear_for_offset`),
     /// so CS's own readability never needs checking on this path -- only the case of a
     /// *data* segment register (DS/ES/FS/GS/SS) that happens to hold a code descriptor.
-    fn check_segment_access_kind(
+    pub(super) fn check_segment_access_kind(
         &self,
         segment: SegmentIndex,
         access: u8,

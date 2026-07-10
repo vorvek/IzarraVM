@@ -442,9 +442,6 @@ impl CpuBus for InstrumentedBus {
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         self.bus_clocks
     }
-    fn jit_fetch_cost_clocks(&self) -> u64 {
-        2
-    }
     fn jit_cached_fetch_run_clocks(&self, _start: u32, _count: u32) -> Option<u64> {
         Some(2)
     }
@@ -700,8 +697,8 @@ fn region_is_byte_identical_on_the_direct_page_path() {
 
 /// Baseline drawcolumn region throughput on a production-representative harness (the one-op
 /// instruction-fetch charge and host-pointer direct pages, both matching MachineBus). The
-/// reference for native-template A/B measurements. On this harness the
-/// drawcolumn is about 165 ns per iteration with no single dominant cost.
+/// reference for native-template A/B measurements. The current owner-machine result is about
+/// 103 ns per iteration.
 ///   cargo test -j8 -p izarravm-cpu --release --features jit drawcolumn_region_baseline -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -727,59 +724,6 @@ fn drawcolumn_region_baseline() {
         best = best.min(t.elapsed().as_secs_f64() / ITERS as f64 * 1e9);
     }
     eprintln!("drawcolumn region baseline: {best:.0} ns/iter (15 insns), representative harness");
-}
-
-/// Cost-fold native-LOAD smoke A/B on the drawcolumn. The fold fires only with
-/// flat DS, no paging, and direct pages. The anchors use paging, so the fold is
-/// inert there. Times the same drawcolumn with the fold off and on. Run filtered
-/// (this sets the process-global FOLD_TIMING; a concurrent flat-DS #[ignore] bench would see it):
-///   cargo test -p izarravm-cpu --release --features jit drawcolumn_region_fold_ab -- --ignored --nocapture
-#[test]
-#[ignore]
-fn drawcolumn_region_fold_ab() {
-    use std::sync::atomic::Ordering;
-    use std::time::Instant;
-    const ITERS: u32 = 200_000;
-    let time_variant = |fold: bool| -> (f64, u64, u64) {
-        jit::block::FOLD_TIMING.store(fold, Ordering::Relaxed);
-        let mut m = vec![0u8; 64 << 20];
-        let p = program();
-        m[..p.len()].copy_from_slice(&p);
-        let mut cpu = fresh_cpu(0xffff_ffff);
-        let mut bus = TestBus::with_memory(m);
-        bus.direct_pages_enabled = true;
-        bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
-        arm_loop(&mut cpu, &mut bus, 2);
-        drive_to_halt(&mut cpu, &mut bus, u64::MAX);
-        let idx = jit::block::try_admit(&mut cpu, ENTRY, true).expect("admit");
-        cpu.decode_cache.stamp_region(ENTRY, true, idx);
-        let mut best = f64::MAX;
-        for _ in 0..7 {
-            arm_loop(&mut cpu, &mut bus, ITERS);
-            let t = Instant::now();
-            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
-            best = best.min(t.elapsed().as_secs_f64() / ITERS as f64 * 1e9);
-        }
-        let pc = cpu.perf_counters();
-        (best, pc.jit_native_load_hits, pc.jit_native_store_hits)
-    };
-    let (off, off_ld, off_st) = time_variant(false);
-    let (on, on_ld, on_st) = time_variant(true);
-    jit::block::FOLD_TIMING.store(false, Ordering::Relaxed);
-    eprintln!("\n=== drawcolumn cost-fold native LOAD+STORE+ALU A/B (ns/iter, best of 7) ===");
-    eprintln!("fold OFF: {off:.0} ns/iter  (load_hits={off_ld}, store_hits={off_st})");
-    eprintln!(
-        "fold ON : {on:.0} ns/iter  (load_hits={on_ld}, store_hits={on_st})  ({:.2}x)",
-        off / on
-    );
-    assert_eq!(
-        (off_ld, off_st),
-        (0, 0),
-        "fold-off must run no native slots"
-    );
-    assert!(on_ld > 0, "fold-on must run the native LOAD slots");
-    assert!(on_st > 0, "fold-on must run the native STORE slots");
-    eprintln!("=== end A/B (the anchors run PAGED, so this fold is Doom-inert) ===\n");
 }
 
 /// Round 1 hotness admission: with `set_jit_auto_admit(true)` and NO manual `try_admit`, a

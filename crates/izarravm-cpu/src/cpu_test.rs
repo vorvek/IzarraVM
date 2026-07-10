@@ -22,6 +22,19 @@ fn registers_repr_c_offsets_are_stable() {
     assert_eq!(core::mem::offset_of!(Registers, eflags), eip_off + 4);
 }
 
+/// The paged JIT probe bakes this entry stride and these field offsets into native code.
+#[test]
+#[cfg(feature = "jit")]
+fn tlb_entry_repr_c_offsets_are_stable() {
+    assert_eq!(core::mem::size_of::<TlbEntry>(), 16);
+    assert_eq!(core::mem::offset_of!(TlbEntry, tag), 0);
+    assert_eq!(core::mem::offset_of!(TlbEntry, phys), 4);
+    assert_eq!(core::mem::offset_of!(TlbEntry, generation), 8);
+    assert_eq!(core::mem::offset_of!(TlbEntry, writable), 12);
+    assert_eq!(core::mem::offset_of!(TlbEntry, user), 13);
+    assert_eq!(core::mem::offset_of!(TlbEntry, dirty), 14);
+}
+
 /// The v2 region emitter bakes `offset_of!(CpuGsw, registers)` into its emitted bytes (the
 /// prologue computes `regs_ptr = cpu_ptr + regs_offset`, and inline slots address gpr as
 /// `[regs_ptr + 4*i]`). CpuGsw is NOT repr(C), so rustc is free to reorder its fields; this
@@ -64,44 +77,9 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, inline_step_fn), 8);
     assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
-    assert_eq!(core::mem::offset_of!(RegionCtx, charge_fetch_fn), 32);
-    assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
-    assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
+    assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
     // Pending flags offset used by direct native writes.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3928);
-    // Verify the timing-field offsets the native cap check uses.
-    let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
-    eprintln!("raw_clocks offset = {raw_off}");
-    assert_eq!(raw_off, 88);
-    let rt_off = core::mem::offset_of!(RegionCtx, run_total_at_entry);
-    eprintln!("run_total_at_entry offset = {rt_off}");
-    let cap_off = core::mem::offset_of!(RegionCtx, cap);
-    eprintln!("cap offset = {cap_off}");
-    // `d` is read by LIVE emitted code now (the native fold's line_live arg loads it via D_OFF=144),
-    // so pin it — a reorder that moved it while leaving the fold fields > 127 would slip past the
-    // other asserts and feed jit_line_live the wrong decode-line D bit.
-    let d_off = core::mem::offset_of!(RegionCtx, d);
-    eprintln!("d offset = {d_off}");
-    assert_eq!(
-        d_off, 144,
-        "RegionCtx.d moved; update D_OFF in jit/block.rs"
-    );
-    // The native cost-fold reads these two by disp32 (both are past 127). The emit bakes
-    // offset_of! at emit time, so a reorder still produces correct code; assert they stay in the
-    // disp32 range so a future field placement that pulled them under 128 (silently switching the
-    // emit's addressing assumption) is caught.
-    let folded_off = core::mem::offset_of!(RegionCtx, folded_raw_bus);
-    let cost_off = core::mem::offset_of!(RegionCtx, fold_bus_cost);
-    // `store_finish_fn` is a fn-pointer the native STORE fold loads by disp32 and calls; keep it in
-    // the disp32 range alongside the other fold fields.
-    let finish_off = core::mem::offset_of!(RegionCtx, store_finish_fn);
-    eprintln!(
-        "folded_raw_bus offset = {folded_off}, fold_bus_cost offset = {cost_off}, store_finish_fn offset = {finish_off}"
-    );
-    assert!(
-        folded_off > 127 && cost_off > 127 && finish_off > 127,
-        "fold fields must be disp32"
-    );
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3936);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
@@ -1124,6 +1102,10 @@ impl CpuBus for TestBus {
     fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
         self.trace.record_instruction_fetch_run(start, count, 0);
         Ok(())
+    }
+
+    fn jit_direct_memory_max_clocks(&self, _width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
+        Some(0)
     }
 
     fn jit_cached_fetch_run_clocks(&self, _start: u32, count: u32) -> Option<u64> {

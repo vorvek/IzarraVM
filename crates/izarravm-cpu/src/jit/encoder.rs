@@ -321,9 +321,7 @@ impl Encoder {
     }
 
     /// `mov dst32, [base + disp32]` (8B /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12) -- the
-    /// 32-bit-operand, 32-bit-displacement load. Reads a 32-bit field past the disp8 range (the native
-    /// fold path reads `Registers.eip` at offset ~128 through the regs-base register). Zero-extends to
-    /// 64 bits like `load_r32_disp8`.
+    /// 32-bit-operand, 32-bit-displacement load. Zero-extends like `load_r32_disp8`.
     pub(crate) fn load_r32_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
         if dst.ext() || base.ext() {
             self.rex(false, dst.ext(), false, base.ext());
@@ -336,9 +334,21 @@ impl Encoder {
         self.bytes.extend_from_slice(&disp32.to_le_bytes());
     }
 
+    /// `movzx dst32, byte [base + disp32]` (0F B6 /r, mod=10 disp32, no REX.W).
+    pub(crate) fn movzx_r32_byte_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
+        if dst.ext() || base.ext() {
+            self.rex(false, dst.ext(), false, base.ext());
+        }
+        self.bytes.extend_from_slice(&[0x0F, 0xB6]);
+        self.modrm(0b10, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
     /// `mov [base + disp32], src32` (89 /r, mod=10 disp32, no REX.W, SIB if `base` is RSP/R12) -- the
-    /// 32-bit store mirror of `load_r32_disp32`, for writing back a 32-bit field past the disp8 range
-    /// (the native fold path writes the advanced `Registers.eip`).
+    /// 32-bit store mirror of `load_r32_disp32` for fields past the disp8 range.
     pub(crate) fn store_r32_disp32(&mut self, base: Reg, disp32: i32, src: Reg) {
         if src.ext() || base.ext() {
             self.rex(false, src.ext(), false, base.ext());
