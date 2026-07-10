@@ -2616,6 +2616,21 @@ impl Vga {
         self.dac.set_entry(index, r, g, b);
     }
 
+    pub fn dac_component_bits(&self) -> u8 {
+        self.dac.component_bits()
+    }
+
+    pub fn set_dac_component_bits(&mut self, bits: u8) -> bool {
+        if self.dac.component_bits() == bits {
+            return true;
+        }
+        if !self.dac.set_component_bits(bits) {
+            return false;
+        }
+        self.bump_content_gen();
+        true
+    }
+
     pub fn dac_entry(&self, index: u8) -> [u8; 3] {
         self.dac.entry(index)
     }
@@ -2650,22 +2665,23 @@ impl Vga {
         if self.grayscale_summing_enabled {
             self.bump_content_gen();
             let [r, g, b] = self.dac.entry(index);
-            let gray = Self::gray6(r, g, b);
+            let gray = Self::gray_component(self.dac.component_bits(), r, g, b);
             self.dac.set_entry(index, gray, gray, gray);
         }
     }
 
     fn dac_entry_for_write(&self, r: u8, g: u8, b: u8) -> [u8; 3] {
         if self.grayscale_summing_enabled {
-            let gray = Self::gray6(r, g, b);
+            let gray = Self::gray_component(self.dac.component_bits(), r, g, b);
             [gray, gray, gray]
         } else {
-            [r & 0x3F, g & 0x3F, b & 0x3F]
+            [r, g, b]
         }
     }
 
-    fn gray6(r: u8, g: u8, b: u8) -> u8 {
-        ((u16::from(r & 0x3F) * 77 + u16::from(g & 0x3F) * 151 + u16::from(b & 0x3F) * 28) >> 8)
+    fn gray_component(bits: u8, r: u8, g: u8, b: u8) -> u8 {
+        let mask = if bits == 8 { 0xff } else { 0x3f };
+        ((u16::from(r & mask) * 77 + u16::from(g & mask) * 151 + u16::from(b & mask) * 28) >> 8)
             as u8
     }
 
