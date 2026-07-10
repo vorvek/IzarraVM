@@ -4,6 +4,14 @@
 use super::*;
 
 #[test]
+fn custom_identity_and_capabilities_are_readable() {
+    let distira = Distira::new();
+
+    assert_eq!(read_reg(&distira, DISTIRA_REG_ID), DISTIRA_ID_VALUE);
+    assert_eq!(read_reg(&distira, DISTIRA_REG_CAPS), DISTIRA_CAPS_VALUE);
+}
+
+#[test]
 fn voodoo_registers_store_init_and_render_state() {
     let mut distira = Distira::new();
     distira.set_init_enable(INIT_ENABLE_WRITE);

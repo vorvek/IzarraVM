@@ -25,6 +25,11 @@ pub const DISTIRA_CAPS_DITHER: u32 = 1 << 1;
 pub const DISTIRA_CAPS_TMU1: u32 = 1 << 2;
 pub const DISTIRA_CAPS_TMU2: u32 = 1 << 3;
 pub const DISTIRA_CAPS_LFB: u32 = 1 << 4;
+pub const DISTIRA_CAPS_VALUE: u32 = DISTIRA_CAPS_TRIANGLE
+    | DISTIRA_CAPS_DITHER
+    | DISTIRA_CAPS_TMU1
+    | DISTIRA_CAPS_TMU2
+    | DISTIRA_CAPS_LFB;
 
 pub const DISTIRA_REG_ID: usize = 0xf000;
 pub const DISTIRA_REG_CAPS: usize = 0xf004;
