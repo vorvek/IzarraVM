@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Cache geometry, tier costs, and level configuration.
 //! This module contains the constant data and functions used by `CacheModel`.
 

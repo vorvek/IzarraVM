@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # DOS Command Reference
 
 Toka-DOS commands come in two kinds. The **built-in commands** (`DIR`, `COPY`,

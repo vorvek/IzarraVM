@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-tables.inc - foundation: MUST be the last %include. Emits the POST step
 ; table that POST_STEP accumulated across every prior include, as immutable ROM
 ; data. run_post (in izbios-core.inc) walks this table. Each entry is

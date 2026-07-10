@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Pure write-interpretation helpers for the Katea write engine. These parse
 //! the guest's own directory + FAT bytes (no INT 21h, no DOS internals) so the
 //! reconcile pass in `katea_tree.rs` can decide what finished files to mirror to

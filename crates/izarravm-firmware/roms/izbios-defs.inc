@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-defs.inc - foundation: shared constants for the Izarra 3000 BIOS.
 ; This file emits NO bytes (only %define / equ), so reset: stays at ROM offset 0.
 ; Read-only contract: streams use these names and never redefine them.

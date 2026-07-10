@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 # Authoring-only. Build crates/izarravm-firmware/roms/codepage-fonts.bin:
 # five code pages (437,850,860,863,865) x three sizes (8x16,8x14,8x8).
 # CP437 and every character also present in CP437 are copied from the shipped

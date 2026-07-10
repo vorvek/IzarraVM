@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; ATA hard disk probe (the HDD icon). The boot
 ; disk is the primary-channel master at command block 0x1F0-0x1F7. Its status
 ; register (0x1F7) is the presence handle: a mounted drive reads back DRDY

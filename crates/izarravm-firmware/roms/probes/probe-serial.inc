@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; COM1 (16550-class UART) probe.
 ; Wait for the timed transmitter to drain and check its idle pattern. Then
 ; round-trip the scratch register, which has no side effects.

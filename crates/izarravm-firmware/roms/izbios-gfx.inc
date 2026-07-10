@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-gfx.inc - foundation: VGA mode 13h drawing primitives + the 8x8 CP437
 ; font (a byte-for-byte copy of izarravm-video VGAFONT_8X8; a Rust spot-check
 ; guards against drift). Pixels go to A000:offset, offset = y*320 + x; the

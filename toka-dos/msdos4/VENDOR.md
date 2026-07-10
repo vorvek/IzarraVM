@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # MS-DOS 4.0 XCOPY: investigated, rejected as a port target
 
 Toka-DOS needed an XCOPY. FreeDOS's own XCOPY is GPL-2-only, which cannot be

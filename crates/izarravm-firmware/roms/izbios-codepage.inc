@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-codepage.inc - load a code-page font into the VGA character generator.
 ; The host banks the requested page into a 4 KB window at C400:0000 when we write
 ; a selector to Lotura port 0xE7. sel = cp*3 + size_index (size 0=8x16, 1=8x14,

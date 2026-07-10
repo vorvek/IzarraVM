@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Boot-device and CPU-speed
 ; menu, rendered on the proprietary Margo LFB (mode 0x150) inside the boot-box
 ; sprite from izbios-art.inc. boot_menu (izbios-boot.inc) is a one-line shim that

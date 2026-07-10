@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The full POST result block must
 //! stay self-consistent (the live-append header keeps the declared count in sync)
 //! and every present component must PASS (a capability-revealing POST never FAILs

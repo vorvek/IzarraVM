@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Shared 8.3 short-name folding for the synthesized FAT volumes. The FAT12
 //! floppy (fat12.rs) and the FAT32 hard disk (fat32.rs) both turn host file
 //! names into the canonical 11-byte 8.3 directory-entry name through this

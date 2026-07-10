@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Host side of the RTC/CMOS: seed the clock from host local time at startup
 //! and persist the 64-byte NVRAM image to `cmos.bin` next to `izarravm.conf`.
 //!

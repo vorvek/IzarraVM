@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Linear-framebuffer draw primitives for the
 ; proprietary Margo mode 0x150 (320x240x8). All routines preserve caller
 ; registers. Fills, clears, and text go through the Margo blit engine (the

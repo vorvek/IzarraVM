@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Sound Blaster DSP probes.
 ; Two POST steps: a PASS/FAIL reset handshake and a MEASURE of the DSP version.
 ; The reset routine writes 0x226 (1 then 0), lets the ~100us settle accrue

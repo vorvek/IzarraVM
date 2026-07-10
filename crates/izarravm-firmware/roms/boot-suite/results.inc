@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 %define RESULT_RECORD_COUNT 21
 %define RESULT_PAYLOAD_LEN 453
 %define RESULT_PAYLOAD_CHECKSUM 0x9c70

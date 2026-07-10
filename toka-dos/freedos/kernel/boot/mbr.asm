@@ -14,7 +14,7 @@
 ;
 ; Assemble: nasm mbr.asm -o mbr.bin   (exactly 512 bytes, 0x55AA at 510/511).
 
-        cpu     8086            ; must run at the GSW-286 ISA gate (and below);
+        cpu     8086            ; kept 8086-clean in 386-slow and every faster mode;
                                 ; NASM enforces the boundary
         org     0x600           ; we relocate to here before running
 
@@ -65,10 +65,8 @@ reloc_entry:
 
 .found:
         ; SI -> active partition entry. Its RelSect (start LBA) is at offset 8.
-        ; Copied as two word moves: this MBR must stay 8086-clean, because a
-        ; GSW-286 cold boot runs it at the true-286 ISA level where a
-        ; 66h-prefixed 32-bit move raises #UD (and the IVT default handler is
-        ; a bare IRET, turning that into an infinite fault loop).
+        ; Copied as two word moves so the MBR stays 8086-clean even though a
+        ; GSW-386-slow cold boot exposes the full 386 instruction set.
         push    si                  ; preserve entry pointer for the chain jump
         mov     ax, [si + 8]        ; partition start LBA (dword), low word
         mov     [dap_lba], ax

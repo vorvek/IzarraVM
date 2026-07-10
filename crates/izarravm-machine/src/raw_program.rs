@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! A native .COM/.EXE loader with no DOS-kernel backing — builds a
 //! DOS-compatible PSP/memory image so a guest program can run, without any
 //! service-dispatch state attached. Ported from `izarravm-dos`'s loader, which

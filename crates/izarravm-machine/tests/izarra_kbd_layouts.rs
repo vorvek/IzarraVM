@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 // Keyboard-layout integration test: the six Set-1 scancode -> ASCII tables the
 // Izarra BIOS selects from CMOS byte 0x10.
 //

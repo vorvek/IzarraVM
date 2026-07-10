@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! FAT32 volume geometry. Given a volume size, compute the BPB fields a
 //! synthesized FAT32 volume needs: sectors per cluster, reserved sectors, the
 //! size of one FAT, the usable cluster count, and the fixed FAT32 layout

@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; 8042 keyboard-controller probe.
 ; The controller self-test: wait for IBF to clear, write 0xAA to the command
 ; port, then wait for OBF and read 0x55 from the data port. Interrupts stay

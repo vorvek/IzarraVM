@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; A DOS .COM filter: read bytes with INT 21h AH=08h (no echo) and write each back
 ; with AH=02h until end of input (^Z, 0x1A), then exit via AH=4Ch.
 ; Assemble with: nasm -f bin echo.asm -o echo.com

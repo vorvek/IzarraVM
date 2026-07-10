@@ -1,4 +1,7 @@
 #!/usr/bin/env pwsh
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 # Profile-guided-optimization (PGO) release build for izarravm.
 #
 # Two-stage build: instrument -> run a representative workload to gather a

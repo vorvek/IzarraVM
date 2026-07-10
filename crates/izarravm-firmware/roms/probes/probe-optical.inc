@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; ATAPI optical drive probe (the optical
 ; icon). The CD-ROM is the secondary-channel device at command block 0x170-0x177.
 ; ATAPI devices are identified by the signature they place in the cylinder

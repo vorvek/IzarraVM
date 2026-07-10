@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Standalone V86 monitor fixture.
 ;
 ; A real hardware timer IRQ delivered to the V86 task by the CPU is reflected by the

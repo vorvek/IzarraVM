@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 // Integration test for the Tab boot menu and the INT 19h floppy bootstrap.
 //
 // Drives the public Machine API only. During the POST hotkey window the BIOS

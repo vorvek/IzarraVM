@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; The single source for the INT 09h/INT 16h keyboard path. Included by
 ; kbd-bios.asm and kbd-resident.asm directly, and by the full Izarra BIOS via
 ; izbios-kbd.inc (which supplies these BDA defines from izbios-defs.inc and

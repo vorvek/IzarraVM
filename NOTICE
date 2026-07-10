@@ -17,7 +17,8 @@ FreeDOS FIND: © 1994-2002 Jim Hall, © 2003 Eric Auer, GPLv2-or-later.
 Modified by the Toka-DOS project (2026): product-name banner rebrand.
 FreeDOS LABEL: © Joe Cosentino, Brian E. Reifsnyder, Eric Auer, GPLv2-or-later.
 FreeDOS DELTREE: © 1998-2003 Charles Dye, GPLv2-or-later.
-kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: © 1995 Pasquale J. Villani, GPLv2+.
+kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1-or-later. tnyprntf:
+© 1995 Pasquale J. Villani, GPLv2-or-later.
 The SB16 DSP's Creative ADPCM decoder (4-bit, 2.6-bit, and 2-bit) ports the
 step/adjust tables and predictor arithmetic of DOSBox-X's decode_ADPCM_*
 functions (https://github.com/joncampbell123/dosbox-x, src/hardware/sblaster.cpp,
@@ -28,13 +29,26 @@ behavior of 86Box's Voodoo emulation (https://86box.net, © 2008-2020 Sarah
 Walker and contributors, GPLv2-or-later), reimplemented in Rust for IzarraVM.
 Native MIDI synthesis links FluidSynth 2.5.6 and Munt/libmt32emu 2.8.2
 statically under LGPL-2.1-or-later. FluidSynth's SF3 reader uses libsndfile
-1.2.2 under LGPL-2.1-or-later, whose bundled ALAC codec is Apache-2.0.
-libogg 1.3.6, libvorbis 1.3.7, FLAC 1.4.3, and Opus 1.5.2 use their BSD
-licenses. FluidSynth also uses GCEM under Apache-2.0. Exact sources, license
-notices, hashes, and relinking instructions are in
-crates/izarravm-native-synth/vendor. Roland ROMs are not distributed.
+1.2.2 under LGPL-2.1-or-later. That build also contains an Apache-2.0 ALAC
+codec, GSM 6.10 code under TU-Berlin-1.0, G72x code under the Sun source-code
+terms, and OpusFile-based code under BSD-3-Clause. Munt's linked libmt32emu
+contains Micael Hildenborg's SHA-1 implementation under BSD-3-Clause.
+The linked libogg 1.3.6, libvorbis 1.3.7, FLAC 1.4.3, and Opus 1.5.2 libraries
+use their BSD licenses. FluidSynth also uses GCEM under Apache-2.0. The full
+source archives contain additional test, documentation, build, and training
+files under their own terms. Exact sources, notices, hashes, and relinking
+instructions are in crates/izarravm-native-synth/vendor. Roland ROMs are not
+distributed.
 The embedded FluidR3Mono_GM.sf3 SoundFont is distributed under the MIT
 license. Its upstream notice and provenance are in third_party/fluidr3mono.
+The imported MS-DOS 4.0 keyboard tables are distributed by Microsoft under
+the MIT license. The exact permission text is in tools/msdos-keyboard/LICENSE,
+and their provenance is in tools/msdos-keyboard/VENDOR.md.
+The Modern DOS fonts by Jayvee Enaguas are released under CC0-1.0. The
+generated CP437 and code-page font blobs retain that license. Provenance is
+in tools/fonts/README.md.
+The Izarra 3000 logo, chassis photograph, emulator screenshot, and firmware
+artwork are project assets distributed under GPL-3.0-only.
 Host audio output uses cpal 0.15.3 under Apache-2.0. External MIDI output uses
 midir 0.10.4, Copyright (c) 2015 Patrick Reisert and the RtMidi contributors,
 under MIT. Exact license texts are in third_party/licenses.
@@ -48,3 +62,25 @@ adapted to the Izarra 3000's virtual hardware and reimplemented in NASM for
 IzarraVM. The VCPI 1.0 interface follows the Virtual Control Program
 Interface specification (© 1987-89 Phar Lap Software, Inc. and Quarterdeck
 Office Systems).
+
+LICENSE_MANIFEST.tsv records the origin, license, and SHA-256 of tracked
+binary, generated, and non-commentable files. LicenseRef-IzarraVM-TokaDOS-Aggregate
+identifies the Toka-DOS disk image as an aggregation of GPL-3.0-only project
+files, GPL-2.0-or-later FreeDOS and tnyprntf files, LGPL-2.0-or-later FreeCOM
+supplement-library files, and LGPL-2.1-or-later kitten files. Each component
+retains its own license and notice.
+LicenseRef-FluidSynth-2.5.6-Source-Archive,
+LicenseRef-libsndfile-1.2.2-Source-Archive,
+LicenseRef-libogg-1.3.6-Source-Archive,
+LicenseRef-libvorbis-1.3.7-Source-Archive,
+LicenseRef-FLAC-1.4.3-Source-Archive,
+LicenseRef-Opus-1.5.2-Source-Archive, and
+LicenseRef-Munt-2.8.2-Source-Archive identify unmodified upstream archives
+that contain material under more than one license. The linked library license
+for each archive is listed in crates/izarravm-native-synth/vendor/SOURCES.md.
+LicenseRef-Vintage-Dreams-Waves-Freeware identifies Ian Wilson's redistribution
+terms and SF3 conversion permission for the FluidSynth test SoundFonts.
+LicenseRef-Sun-G72x-Unrestricted identifies the Sun Microsystems notice on the
+G72x codec sources compiled by libsndfile. Exact component notices are retained
+in the archives and copied into the vendor license directory when their code is
+compiled.

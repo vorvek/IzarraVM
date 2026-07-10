@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Lotura system-controller probe.
 ; Two POST steps share this file. The first reads the Lotura identity port and
 ; reports PASS/FAIL; the second reads the live GSW-586 mode register and reports

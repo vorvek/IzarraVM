@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Pins the Approximate-class batch cap's guest-clock contract: a bus-heavy
 //! stretch (a framebuffer blit) must still deliver every PIT channel-0 edge as
 //! its own IRQ0. Before the cap counted in-batch scaled bus clocks, a blit's

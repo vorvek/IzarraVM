@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Mouse-under-V86 fixture. Runs from AUTOEXEC after
 ; LH TOKAMOUS (the default AUTOEXEC loads the INT 33h driver into a TOKAEMM UMB)
 ; with the whole system in V86 under the monitor.

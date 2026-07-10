@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Integration tests for RAM sizing through INT 15h AH=88h
 //! and pattern-checks it, publishing memory.ramtest (PASS/FAIL) and
 //! memory.detected_kib (MEASURE, total KiB) plus the INT 12h word.

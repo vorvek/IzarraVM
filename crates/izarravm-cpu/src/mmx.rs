@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Pure MMX lane operations on 64-bit registers. The CPU dispatch in lib.rs
 //! reads the operands and the x87-aliased register file; everything numeric
 //! lives here so it is testable on its own.

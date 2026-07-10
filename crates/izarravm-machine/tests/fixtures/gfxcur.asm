@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; GFXCUR.COM - verify IZMOUSE does not draw its text cursor in graphics modes.
 ;
 ; Runs after MOUSE.COM is resident. It switches to VGA mode 12h, resets the mouse

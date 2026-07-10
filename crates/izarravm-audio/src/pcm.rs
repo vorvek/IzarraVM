@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Shared PCM format converters for the audio crate: the linear 8/16-bit DMA
 //! sample mappings used by the Sound Blaster DSP, plus the ITU-T G.711 mu-law
 //! and A-law companding decoders the AD1848 (WSS) codec expands internally.

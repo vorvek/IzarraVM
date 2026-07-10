@@ -1,3 +1,6 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 # Intermediate build artifacts from build-freedos.ps1. The committed sources of
 # truth are the FreeDOS-built binaries under crates/izarravm-firmware/roms
 # (tokados-hdd.img, gswmode.com, tokaemm.sys) plus the vendored FreeDOS trees'

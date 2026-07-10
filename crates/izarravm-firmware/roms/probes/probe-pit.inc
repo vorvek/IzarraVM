@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; 8254 timer (PIT) probe.
 ; Presence is proven through the control port (PORT_PIT_CTRL) and counter 0's
 ; data port (PORT_PIT_CH0) alone, so the check does not depend on the PIC or on

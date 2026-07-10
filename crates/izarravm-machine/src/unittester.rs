@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Guest-visible regression-test device, modelled on 86Box's Unit Tester
 //! (`src/device/unittester.c`) but done the Izarra-native way: a dedicated
 //! Lotura register file instead of 86Box's magic-sequence-on-port-0x80, since a

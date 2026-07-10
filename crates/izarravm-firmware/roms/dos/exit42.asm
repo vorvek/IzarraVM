@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; EXIT42.COM - terminate immediately with DOS exit code 42 (0x2A). The katea-run
 ; e2e fixture: proves RUNNER captures and reports a child's exit code.
         cpu 8086

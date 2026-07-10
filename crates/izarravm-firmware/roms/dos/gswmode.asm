@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; GSWMODE.COM - runtime CPU speed switch. Writes the Lotura mode register
 ; (port 0xE1) to retarget the GSW-586's live CPU speed without rebooting.
 ; This is a *runtime-only* override: it never touches CMOS, so the BIOS boot

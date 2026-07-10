@@ -1,0 +1,117 @@
+path	class	origin	license	sha256
+Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	7a3a6ddbcd9dfa50d818a75180e07924c41fd239bf6bde26f324624d8e54a1ce
+LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
+NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	75d1f2dd908a9d475b07ea88866460200b890242cd5830d0f3ea1f421b9a89ee
+crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
+crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	48745aa5cdc2aefda93e57529fcfd5ffb40258a9a43381b9f61ff822fd63aa1e
+crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
+crates/izarravm-firmware/roms/codepage-fonts.bin	generated-font	Modern DOS by Jayvee Enaguas	CC0-1.0	39c4644a8b3569e5181c12a4804ce47e4ce8014996c6286962179336bff64116
+crates/izarravm-firmware/roms/disttri.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	5eef10d3488a4c1f20f89d6744617300377a34dfa5ae4f69607d012758eff03a
+crates/izarravm-firmware/roms/dos/echo.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4afb3163a32df36aaa90b742ef9f08a40a6ab9feec1d117fb6bfe9dd04626a7a
+crates/izarravm-firmware/roms/dos/emsnone.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f3425782f72e2c89589596f3718b1d3adefa09e4c4257a0bad3ca718da0f70c4
+crates/izarravm-firmware/roms/dos/emstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	a3752f9faabdd1ce9b6dc9df12e54ffb3c7633c50b794dc61699f97499d949ed
+crates/izarravm-firmware/roms/dos/exehello.exe	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f8fc112288d6479572709bfee1c7aa3fbc54f3514d4c8d6abf5976e9922b926e
+crates/izarravm-firmware/roms/dos/exit42.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	ef892afebf7fabb6142f6f024536a9c51bc48f3b2158a060c7ba1eae0dcaa956
+crates/izarravm-firmware/roms/dos/gpemul.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	76e6976a71aa730dd9e908e6b1c986c479daeb4fbbbed7466a020ed606a24f12
+crates/izarravm-firmware/roms/dos/gpreflct.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	187626b002ed83025623f287ba1c0f18096f3caadd958e0f7b6348ab4442cda2
+crates/izarravm-firmware/roms/dos/gswmode.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	024d1d970e329e0c79b872b49b367ef4ce14f4fc38db8ac411ab6fd8334fda29
+crates/izarravm-firmware/roms/dos/hello.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	519f2343101ef8972e3c97d461ebda5921202cd85db4a769ec6b3832e543b622
+crates/izarravm-firmware/roms/dos/hlttest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	e9d9f69815edaf65d8efac93b67526576b51e10c814dbf154d7d4b7073618b0c
+crates/izarravm-firmware/roms/dos/irq5ip0.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	8a351c4531147120f6651b646781993e2cd8d6b2490476d7fc8e2aae7ed3a238
+crates/izarravm-firmware/roms/dos/mousetst.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	84602006d02f20711d55c33ca57a1a3e3c058d2bf33376d0a220c177e7c4a7dd
+crates/izarravm-firmware/roms/dos/multihlt.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c22b14d7ad173ad2067a4b97c5a7192201a299cc10a9d852fba38abe71e3756
+crates/izarravm-firmware/roms/dos/runner.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	7904c3a69a009d641d9531b8fd0d17b84991b05a6969e2591756aa84f354bf2b
+crates/izarravm-firmware/roms/dos/sndtst.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c47c99382715572e6f1335b28556c23afde8f1f4feb699d58f7d6aa8f7c00a0b
+crates/izarravm-firmware/roms/dos/tokaemm.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	518d1bc5173ed3a5788fd36c5d59785e77fcd4fb0aee066ca0e74f817d037b8e
+crates/izarravm-firmware/roms/dos/type.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	0899410e755306edd63bafa1e44afe4dafe446f1d5d533d19c7b95c8a508b899
+crates/izarravm-firmware/roms/dos/umbmech.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	06e04e3855157df3215fd14bb84df0467e56fc230ecea3e22e2d6a40d0a545cc
+crates/izarravm-firmware/roms/dos/umbtest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	6d6511b1040256e62f7e9f9231a01077b89623de1285655a4e1ea20d408ac42a
+crates/izarravm-firmware/roms/dos/v86spike.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	cb9a380c1367c038c3d6b9101dd80abcefa1375515be4857d0d274572245c865
+crates/izarravm-firmware/roms/dos/vcpidet.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	701e71522453b1e6b8887ce302f4e8fe555fd9153dabedf781a86aa8d7e7c2a9
+crates/izarravm-firmware/roms/dos/vcpiif.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	61c18058cca4a4936775fe13918d14641e8eceffc7495c878fef4b7331cfefdd
+crates/izarravm-firmware/roms/dos/vcpimem.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	e06a4ccde070604834d3a749a148cfcbe7f3b16cd140a1c2de7a903a7fc1caa3
+crates/izarravm-firmware/roms/dos/vcpisw.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c6664e02c679def02a51188d2bff37f2cec073e42a84b7f66366511bf6bc893
+crates/izarravm-firmware/roms/dos/xmstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	abe3525797632eb696d3f925622e1c20042dbec3d2ee383d3bbe29bb5d42b752
+crates/izarravm-firmware/roms/i386dx25-test.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	ba3a1717b073d4c41b0c2f9f83aec51d082431251de1d3cb239d64c9d41c4932
+crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	396bcf9990c3e95be49f664d1a34f5bf61d02c89f8306f1bf5fcff91d42c83f4
+crates/izarravm-firmware/roms/izbios-art.inc	generated-source	IzarraVM gen_art.py	GPL-3.0-only	9e9e9b94a787498051ccc3a89cf512bbf3e5ebc2c31d3a88b6bf194d5a09c853
+crates/izarravm-firmware/roms/izbios-logo.inc	generated-source	IzarraVM project artwork	GPL-3.0-only	55e62c1bb449c8c659e4f447d95885d2baa73c6363fb3d5a4767f9afdba227e1
+crates/izarravm-firmware/roms/kbd-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	43b71ebdd508b4c237bbad71aa2debfbcd3e07a829ca05fe7bbc9fb4f8f78973
+crates/izarravm-firmware/roms/kbd-layout-meta.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	dd14ec56ab17e55cb242a88154d9abb10b1ec7a88366f742147693702828d484
+crates/izarravm-firmware/roms/kbd-layouts.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	51a5d737fd5cfac4c7d7d5c2376401536a7e427f098b84128b851130e03348b2
+crates/izarravm-firmware/roms/kbd-resident.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	2c7fee2d50c8f65157f9db4f7792eb6ab4cefc7f24f212fd1d96cf6b02e19d8e
+crates/izarravm-firmware/roms/neurketa/neurketa.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	760cdddd2c5e3bcaaa378961fd08df89a8f8d68f01f522a512f4d27d8d7e7ca9
+crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	9be435a3f93681b50293142e43cac1642e50eec82682d4670e92c77ff575a167
+crates/izarravm-machine/tests/fixtures/CBLEAK.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	9c0d52099a205491ceea7a17d850cb9a459d7d7c1580b8c8dd8f05099ca2b008
+crates/izarravm-machine/tests/fixtures/GFXCUR.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	611acec5ccda2c22c9add0e8a1d6809793068ebd8d6428df5fbb97f946176493
+crates/izarravm-machine/tests/fixtures/MTEST.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	4fc9fb2d6e67aa8fea1f789da7c97bf8a7d3dcc75595ef93843617deb4793fa9
+crates/izarravm-machine/tests/fixtures/SEGKEEP.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	a975aa7b9f4ea13215cd5f45fe55c8b9916e85bb1b6241e5702f19a78f6342d0
+crates/izarravm-machine/tests/fixtures/WHEELTEST.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	8417eb8721eee1bcc346a649d2d3339875493b058f6382c814022e5ac654682d
+crates/izarravm-machine/tests/fixtures/lotura_crc.com	generated-test-fixture	IzarraVM project source	GPL-3.0-only	8d3ad95601eef5f0765f5ac0c397e4f57845daeb08874acd5bde654d65c9b8e3
+crates/izarravm-machine/tests/fixtures/pmirq5.com	generated-test-fixture	IzarraVM project source	GPL-3.0-only	dfd1f2a85f7b1cd619d7065c8b910f2da1f86db8f5a3b824dad0811d1b104fd4
+crates/izarravm-machine/tests/fixtures/vcpipic.com	generated-test-fixture	IzarraVM project source	GPL-3.0-only	456d0bc7fd3040aa11924916535b76bf90b12af4f4754d58d4dc1763d1a0eab7
+crates/izarravm-native-synth/vendor/flac-1.4.3.tar.gz	vendored-source-archive	FLAC 1.4.3 from Xiph.Org	LicenseRef-FLAC-1.4.3-Source-Archive	0a4bb82a30609b606650d538a804a7b40205366ce8fc98871b0ecf3fbb0611ee
+crates/izarravm-native-synth/vendor/fluidsynth-2.5.6.tar.gz	vendored-source-archive	FluidSynth 2.5.6	LicenseRef-FluidSynth-2.5.6-Source-Archive	0825f024c9cf7a18073739b83612d46542ecbfb349ae9147a1e9f08e2d524407
+crates/izarravm-native-synth/vendor/gcem-012ae73c6d0a2cb09ffe86475f5c6fba3926e200.tar.gz	vendored-source-archive	GCEM commit 012ae73c	Apache-2.0	34ab0ee87a9eb26d3087fa9b49c2572ea8ee03db0c9705b83648301a3a3fc172
+crates/izarravm-native-synth/vendor/libogg-1.3.6.tar.gz	vendored-source-archive	libogg 1.3.6 from Xiph.Org	LicenseRef-libogg-1.3.6-Source-Archive	95b643da661155d79db9de2fca55daed3a8d491039829def246aacb3d9201c81
+crates/izarravm-native-synth/vendor/libsndfile-1.2.2.tar.gz	vendored-source-archive	libsndfile 1.2.2	LicenseRef-libsndfile-1.2.2-Source-Archive	ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121
+crates/izarravm-native-synth/vendor/libvorbis-1.3.7.tar.gz	vendored-source-archive	libvorbis 1.3.7 from Xiph.Org	LicenseRef-libvorbis-1.3.7-Source-Archive	270c76933d0934e42c5ee0a54a36280e2d87af1de3cc3e584806357e237afd13
+crates/izarravm-native-synth/vendor/licenses/FLAC-BSD-3-Clause.txt	third-party-license-text	FLAC from Xiph.Org	BSD-3-Clause	12600ea1a7affcbf469bd0d8b2cd725e4167114a2ee834b88f5d2857bfd7ddbf
+crates/izarravm-native-synth/vendor/licenses/FLAC-GFDL-1.2.txt	third-party-license-text	GNU Free Documentation License text from FLAC	GFDL-1.2-only	f45cc81b400a048b56c9edbd4c3317f7a8958463dfd55aa96f268ecfd6baa12c
+crates/izarravm-native-synth/vendor/licenses/FLAC-GPL-2.0.txt	third-party-license-text	GNU GPL notice from FLAC	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643
+crates/izarravm-native-synth/vendor/licenses/FLAC-LGPL-2.1.txt	third-party-license-text	GNU LGPL notice from FLAC	LGPL-2.1-or-later	5df07007198989c622f5d41de8d703e7bef3d0e79d62e24332ee739a452af62a
+crates/izarravm-native-synth/vendor/licenses/FluidSynth-LGPL-2.1.txt	third-party-license-text	FluidSynth	LGPL-2.1-or-later	20e50fe7aae3e56378ebf0417d9de904f55a0e61e4df315333e632a4d3555d95
+crates/izarravm-native-synth/vendor/licenses/FluidSynth-Vintage-Dreams-Waves-COPYRIGHT.txt	third-party-license-text	Vintage Dreams Waves by Ian Wilson, retained in FluidSynth	LicenseRef-Vintage-Dreams-Waves-Freeware	766f8b6f5716dae672ab3cab74c3d6e3ad452beb49cfef81c82b79970c2601d6
+crates/izarravm-native-synth/vendor/licenses/Munt-GPL-2.0.txt	third-party-license-text	Munt	GPL-2.0-only	ab15fd526bd8dd18a9e77ebc139656bf4d33e97fc7238cd11bf60e2b9b8666c6
+crates/izarravm-native-synth/vendor/licenses/Munt-LGPL-2.1.txt	third-party-license-text	libmt32emu from Munt	LGPL-2.1-or-later	36b6d3fa47916943fd5fec313c584784946047ec1337a78b440e5992cb595f89
+crates/izarravm-native-synth/vendor/licenses/Munt-SHA1-BSD-3-Clause.txt	third-party-license-text	Munt bundled SHA-1 implementation by Micael Hildenborg	BSD-3-Clause	1d773c3b9731d2914567f7345174b149b4cd14fdc798e78cc48148240a2deab4
+crates/izarravm-native-synth/vendor/licenses/Opus-BSD-3-Clause.txt	third-party-license-text	Opus from Xiph.Org	BSD-3-Clause	01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551
+crates/izarravm-native-synth/vendor/licenses/Opus-LICENSE_PLEASE_READ.txt	third-party-license-text	Opus from Xiph.Org	BSD-3-Clause	7efb4989e0cd1b256229bdf2f09300c5d14e35db0e7476bfb87fac243498273d
+crates/izarravm-native-synth/vendor/licenses/gcem-Apache-2.0.txt	third-party-license-text	GCEM	Apache-2.0	58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
+crates/izarravm-native-synth/vendor/licenses/gcem-NOTICE.txt	third-party-license-text	GCEM	Apache-2.0	b9184798c812dd98d754be0101d600cac3d83ee703e994d3320fcfc9662090ec
+crates/izarravm-native-synth/vendor/licenses/libogg-BSD-3-Clause.txt	third-party-license-text	libogg from Xiph.Org	BSD-3-Clause	d2ab5758336489da61c12cc5bb757da5339c4ae9001f9bb0562b4370249af814
+crates/izarravm-native-synth/vendor/licenses/libsndfile-ALAC-Apache-2.0.txt	third-party-license-text	libsndfile bundled ALAC codec	Apache-2.0	232efbd83786e157286b0b96c68ebb673541b69b33036287bf1e5ec5067a49d9
+crates/izarravm-native-synth/vendor/licenses/libsndfile-G72x-Sun.txt	third-party-license-text	libsndfile bundled G72x codec from Sun Microsystems	LicenseRef-Sun-G72x-Unrestricted	4647b6cc906edc577e16b8984357f94adb1439b7abe72afe8d353422cfab7085
+crates/izarravm-native-synth/vendor/licenses/libsndfile-GSM610-COPYRIGHT.txt	third-party-license-text	libsndfile bundled GSM 6.10 codec by Jutta Degener and Carsten Bormann	TU-Berlin-1.0	1bbe7119b1bcd1489e0f36cb95b8902f7f0ceec9a2f3a67394bc9f4709a4e0a7
+crates/izarravm-native-synth/vendor/licenses/libsndfile-LGPL-2.1.txt	third-party-license-text	libsndfile	LGPL-2.1-or-later	ad01ea5cd2755f6048383c8d54c88459cd6fcb17757c5c8892f8c5ea060f6140
+crates/izarravm-native-synth/vendor/licenses/libsndfile-OpusFile-BSD-3-Clause.txt	third-party-license-text	libsndfile code based on OpusFile and Opus-Tools	BSD-3-Clause	d00bc5e9b910d10d5aa2eeb7f8a61b737ebbee2a6366c2441e2f3056a6c079b5
+crates/izarravm-native-synth/vendor/licenses/libvorbis-BSD-3-Clause.txt	third-party-license-text	libvorbis from Xiph.Org	BSD-3-Clause	ec1815db59fcd302846df949d7424876cb2e2dc5ed1606c5fb0b36787b1cf43a
+crates/izarravm-native-synth/vendor/munt-2.8.2.tar.gz	vendored-source-archive	Munt 2.8.2	LicenseRef-Munt-2.8.2-Source-Archive	ca0a2b881207a88d10c511c441bcf4f7a9fd591bea630032662f02bcb51b1b5d
+crates/izarravm-native-synth/vendor/opus-1.5.2.tar.gz	vendored-source-archive	Opus 1.5.2 from Xiph.Org	LicenseRef-Opus-1.5.2-Source-Archive	9480e329e989f70d69886ded470c7f8cfe6c0667cc4196d4837ac9e668fb7404
+crates/izarravm/assets/izarra3000_logo.rgba	project-artwork	IzarraVM project	GPL-3.0-only	a0cd6a47d46ab16fd9b252d21929e306e8b2ed7782b76900238e8516d9a5e8d7
+docs/izarra-3000-chassis.jpg	project-artwork	IzarraVM project	GPL-3.0-only	2c1ee8644a0002171234ecf798805a544b6106017bbbe2416a8c7a3774c82720
+docs/izarra3000-logo.png	project-artwork	IzarraVM project	GPL-3.0-only	2533847bd1b9db59b06e6af6f70c83e94ebadec04195a5df9eff74507f78fb91
+docs/izarravm-screenshot.png	project-screenshot	IzarraVM project	GPL-3.0-only	cc5204840f4185cd4bfa50ef7a5650c9d7d51031ce8abdcb9502c21d16e10357
+third_party/fluidr3mono/FluidR3Mono_GM.sf3	vendored-soundfont	FluidR3Mono from MuseScore	MIT	cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2
+third_party/fluidr3mono/FluidR3Mono_License.md	third-party-license-text	FluidR3Mono by Frank Wen and Michael Cowgill	MIT	09926f9451f751408abd65162c99343f840234d2a708584808fd46427633063f
+third_party/licenses/cpal-0.15.3-Apache-2.0.txt	third-party-license-text	cpal 0.15.3	Apache-2.0	c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4
+third_party/licenses/midir-0.10.4-MIT.txt	third-party-license-text	midir 0.10.4 and RtMidi contributors	MIT	6fe6f623b1fa80e90679aee2f917d8978a184988ebb995ebc254cc9633903cac
+toka-dos/freedos/choice/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331
+toka-dos/freedos/choice/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643
+toka-dos/freedos/deltree/copying	third-party-license-text	FreeDOS deltree	GPL-2.0-or-later	3d2352c2bef1877b2c973f2286eb75bb7b1c3e579fff7dcc8117384d379e7394
+toka-dos/freedos/find/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331
+toka-dos/freedos/find/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643
+toka-dos/freedos/freecom/bin/fdcom.ico	vendored-artwork	FreeCOM 0.86	GPL-2.0-or-later	6ae03b1f37bc18713709020201000208fa12a4aeb7be885527e389aed5bbc963
+toka-dos/freedos/freecom/license	third-party-license-text	FreeDOS freecom	GPL-2.0-or-later	45ece956c40ccac10202a455c0841da8bf42b28412f8c992357da826bb107eae
+toka-dos/freedos/freecom/suppl/src/copying	third-party-license-text	FreeDOS freecom	GPL-2.0-or-later	45ece956c40ccac10202a455c0841da8bf42b28412f8c992357da826bb107eae
+toka-dos/freedos/freecom/suppl/src/copying.lb	third-party-license-text	FreeCOM supplement library	LGPL-2.0-only	a30edd18dd7444fb631c00951e4571fc2c2832f3859b438f3f7e15ba4ef63176
+toka-dos/freedos/kernel/COPYING	third-party-license-text	FreeDOS kernel 2043	GPL-2.0-or-later	2ec21c4f10e9fc6bafbc619cf905424162a0b6443e482d599a6d0d7718e9ae58
+toka-dos/freedos/kernel/bin/config.sys	vendored-configuration	FreeDOS kernel 2043	GPL-2.0-or-later	0a4f684a0fbd49e6e9961cb158da4457c469b9987da5c568593cb1184e0ae890
+toka-dos/freedos/kernel/kernel/nls/001-437.up	vendored-data	FreeDOS kernel 2043	GPL-2.0-or-later	b246758976e51bff0b067f4287f2bf3a93986e1cdd4387d1fa717a627192759a
+toka-dos/freedos/kernel/kernel/nls/049-850.up	vendored-data	FreeDOS kernel 2043	GPL-2.0-or-later	b746501111275a94f5dfa367f3c6f017b1cd18eda7ff4fbc080ac937c348d606
+toka-dos/freedos/label/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331
+toka-dos/freedos/label/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643
+toka-dos/freedos/mem/doc/license.txt	third-party-license-text	FreeDOS mem	GPL-2.0-or-later	32b1062f7da84967e7019d01ab805935caa7ab7321a7ced0e30ebe75e5df1670
+toka-dos/freedos/more/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331
+toka-dos/freedos/more/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643
+toka-dos/freedos/move/LICENSE	third-party-license-text	FreeDOS move	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
+toka-dos/freedos/move/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	7ffe1954587c77dfba1cf8eb9b2ea743671fa6e63f9e7a2f258119d42e14eefe
+toka-dos/freedos/move/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
+toka-dos/freedos/sort/LICENSE	third-party-license-text	FreeDOS sort	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
+toka-dos/freedos/sort/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	7ffe1954587c77dfba1cf8eb9b2ea743671fa6e63f9e7a2f258119d42e14eefe
+toka-dos/freedos/sort/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
+tools/cp437-fonts.bin	generated-font	Modern DOS by Jayvee Enaguas	CC0-1.0	fa9d82276af87f803bfb8d8d8bd42ac9ad66ddbf05f77e91659934cac06923aa
+tools/fonts/ModernDOS8x14.ttf	vendored-font	Modern DOS by Jayvee Enaguas	CC0-1.0	a0101fce103ce916ec95d80536215b6c974e66d2756615fc68dac1dba97e3af5
+tools/fonts/ModernDOS8x16.ttf	vendored-font	Modern DOS by Jayvee Enaguas	CC0-1.0	f79ebf2f0bf038dcfcb4648be794603fac902af132d8730484650f7f88431a4f
+tools/fonts/ModernDOS8x8.ttf	vendored-font	Modern DOS by Jayvee Enaguas	CC0-1.0	6f20adfa9cf7323daabcc80dae3768b2e7fcf3b37c5468d981af3ebcb42a5d95
+tools/msdos-keyboard/LICENSE	third-party-license-text	Microsoft MS-DOS repository	MIT	b5179f780ec212a434efcc989a2295a140deb0bdb17182d2bf9c5f6f1f1a01c4

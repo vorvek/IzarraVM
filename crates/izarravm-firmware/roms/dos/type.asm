@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; A DOS .COM that prints a file: open C:\HELLO.TXT for read (INT 21h AH=3Dh),
 ; read it (AH=3Fh), close it (AH=3Eh), then write the bytes to stdout one at a
 ; time (AH=02h) and exit (AH=4Ch). Exit code 1 on any file error.

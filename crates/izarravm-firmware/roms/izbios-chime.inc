@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Power-on PC-speaker chime. play_chime plays a
 ; four-note rising major arpeggio (about C5, E5, G5, C6) through PIT channel 2 and
 ; port 0x61 at the very start of POST, then silences the speaker. The note delay

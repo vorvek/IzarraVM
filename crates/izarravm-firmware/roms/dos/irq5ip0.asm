@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; irq5ip0.com — V86-trap-tax regression fixture: IRQ5 delivered while the
 ; interrupted code's IP is EXACTLY 0. Runs in V86 under the TOKAEMM monitor
 ; (default-payload config).

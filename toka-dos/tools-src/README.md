@@ -1,10 +1,13 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # tools-src
 
 Original Toka-DOS project source, licensed GPL-3 like the rest of this repo.
-Unlike `toka-dos/freedos/` (vendored upstream FreeDOS/MS-DOS-4.0 userland,
-GPL-2-only, see each subdir's `VENDOR.md`), nothing under here is a port or
-derivative of another project's source. Each tool is written from documented
-command-line behavior only.
+Unlike the vendored upstream trees under `toka-dos/freedos/` and
+`toka-dos/msdos4/` (see their `VENDOR.md` files), nothing under here is a port
+or derivative of another project's source. Each tool is written from
+documented command-line behavior only.
 
 - `xcopy/` `XCOPY.EXE`, a small-model Open Watcom C reimplementation of the
   classic DOS XCOPY command (see `xcopy/xcopy.c` for the switch list and the

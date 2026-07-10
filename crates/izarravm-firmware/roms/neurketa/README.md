@@ -1,3 +1,6 @@
+<!-- This file is part of IzarraVM and is licensed under GNU GPL version 3 only. -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
 # Neurketa benchmark harness image
 
 - `boot.asm` is a 512-byte real-mode boot sector. It loads stage 2 with INT 13h.

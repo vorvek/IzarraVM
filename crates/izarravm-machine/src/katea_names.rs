@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Per-directory 8.3 name table for the Katea host-folder facade. One instance
 //! per directory (FAT 8.3 uniqueness is per-directory). It owns the folding (via
 //! `fat_name`) and a bidirectional record so a folded name maps back to its host

@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Template JIT (default feature `jit`). The interpreter remains the source of
 //! truth and the fallback everywhere; a compiled loop-region's only legal observable is wall
 //! time. Non-(Windows|Linux)-x86-64 hosts compile nothing and run the interpreter unchanged.

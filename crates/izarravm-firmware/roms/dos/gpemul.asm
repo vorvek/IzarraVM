@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; gpemul.com — TOKAEMM V86 privileged-0F emulation fixture (386MAX-surface
 ; port). A V86 task is CPL 3, so MOV r32,CRn / MOV CRn,r32 / CLTS / LMSW all
 ; #GP into the monitor, which must EMULATE them transparently (the way DOS16M

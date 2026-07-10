@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Sound Blaster 16-class DSP (CT1747) clean-room core: reset handshake,
 //! command/data protocol, 8-bit plus 16-bit single/auto-init DMA playback, and
 //! Creative ADPCM (4-bit, 2.6-bit, 2-bit) decode on the 8-bit DMA path. The
@@ -714,30 +717,26 @@ impl SbDsp {
         B: FnMut() -> Option<u8>,
     {
         loop {
-            match self.adpcm.as_mut() {
-                Some(state) => {
-                    if let Some(sample) = state.buf.pop_front() {
-                        return Some(sample);
-                    }
+            {
+                let state = self.adpcm.as_mut()?;
+                if let Some(sample) = state.buf.pop_front() {
+                    return Some(sample);
                 }
-                None => return None,
             }
             if !self.playing {
                 return None;
             }
             let byte = byte_fetch()?;
             self.advance_block(1);
-            match self.adpcm.as_mut() {
-                Some(state) => {
-                    if state.haveref {
-                        state.haveref = false;
-                        state.reference = byte;
-                        state.step = 0;
-                    } else {
-                        state.decode_byte(byte);
-                    }
+            {
+                let state = self.adpcm.as_mut()?;
+                if state.haveref {
+                    state.haveref = false;
+                    state.reference = byte;
+                    state.step = 0;
+                } else {
+                    state.decode_byte(byte);
                 }
-                None => return None,
             }
         }
     }

@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; A minimal DOS .COM: print a message with INT 21h AH=09h, then exit via AH=4Ch.
 ; Assemble with: nasm -f bin hello.asm -o hello.com
     org 0x100

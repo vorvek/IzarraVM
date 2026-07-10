@@ -16,9 +16,8 @@
 ;
 ; Requirements: LBA BIOS and 186 or better CPU. (Toka-DOS: the upstream
 ; sector required a 386; this copy does all its 32-bit LBA/cluster math as
-; 16-bit word pairs so a GSW-286 cold boot — where the Lotura gate holds
-; guest code to a true-286 ISA and a 66h prefix raises #UD — can still get
-; through the boot chain. `cpu 286` below makes NASM enforce the boundary;
+; 16-bit word pairs so a GSW-386-slow cold boot uses the same compact path as
+; every faster GSW mode. `cpu 286` below preserves the assembler boundary;
 ; the only 186+ features used are push-immediate and shift-by-imm8.)
 ;
 ; FAT12 / FAT16 hints: Use the older CHS-only boot sector unless you

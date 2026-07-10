@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Recursive, read-only, lazy host-folder directory tree for the Katea
 //! controller. Generalizes the flat `KateaVolume` into a full FAT32
 //! directory tree whose FAT and directory sectors are computed on demand, so

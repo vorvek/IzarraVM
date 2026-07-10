@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Minimal direct-byte x86-64 encoder for emitted region chains. It is not a
 //! general assembler. Each supported instruction form has a byte-level test.
 //! The region compiler uses only the subset it needs for a given host path.

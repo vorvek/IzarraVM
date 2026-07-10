@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; OPL (YMF262 / AdLib) presence probe.
 ; One POST step, PASS/FAIL. Reset the timer overflow flags by writing 0x80 to
 ; timer-control register 0x04 (PORT_OPL_ADDR selects, PORT_OPL_DATA writes), then

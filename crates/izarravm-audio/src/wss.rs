@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! AD1848K (Windows Sound System) SoundPort stereo codec clean-room core:
 //! the indirect register file, the direct-register (Index/Data/Status/PIO)
 //! interface, the MCE / autocalibrate (ACI) handshake, the fixed sample-rate

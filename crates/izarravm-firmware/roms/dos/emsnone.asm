@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Default-off EMS fixture. Runs in V86 under
 ; TOKAEMM loaded with a bare DEVICE=C:\DOS\TOKAEMM.SYS (no RAM argument): the
 ; manager must answer INT 67h as a FRAMELESS EMM386-NOEMS-style manager —

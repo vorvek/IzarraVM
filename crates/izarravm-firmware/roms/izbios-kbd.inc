@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; izbios-kbd.inc - keyboard foundation for the full Izarra BIOS: the shared
 ; INT 09h / INT 16h core (kbd-bios-core.inc, the single source also used by
 ; kbd-bios.asm and kbd-resident.asm) plus kb_getkey / kb_flush for the setup

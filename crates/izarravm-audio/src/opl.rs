@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Clean-room OPL3 (YMF262 / AdLib) sound chip.
 //!
 //! The register/timer model drives AdLib detection; the synthesis path

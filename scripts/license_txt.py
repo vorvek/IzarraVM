@@ -1,3 +1,6 @@
+# This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+# SPDX-License-Identifier: GPL-3.0-only
+
 """Assemble C:\\LICENSE.TXT for the Toka-DOS disk images.
 
 The boot banner points at "See C:\\LICENSE.TXT for more.", so the full FreeDOS /

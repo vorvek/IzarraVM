@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The named physical-memory regions of the first megabyte plus the HMA, as the
 //! DOS world sees them: conventional RAM, the upper-memory area (video aperture,
 //! option and system ROM, and the UMB-able holes between them), and extended

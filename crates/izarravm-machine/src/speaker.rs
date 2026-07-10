@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The motherboard PC speaker: a 1-bit beeper driven by PIT channel-2 OUT ANDed
 //! with port 0x61 bit 1 (data enable). This converts that 1-bit membrane over
 //! emulated time into samples at the DAC rate for the audio mixer to sum.

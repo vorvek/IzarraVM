@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; RUNNER.COM - launched by AUTOEXEC as "RUNNER PROG.EXT". Frees memory, EXECs the
 ; named program, reads its DOS exit code, reports it to the Izarra unit-tester exit
 ; port, and halts. Built: nasm -f bin runner.asm -o runner.com

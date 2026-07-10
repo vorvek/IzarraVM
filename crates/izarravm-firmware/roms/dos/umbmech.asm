@@ -1,3 +1,6 @@
+; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+; SPDX-License-Identifier: GPL-3.0-only
+
 ; Direct UMB mechanism fixture. Drives TOKAEMM's XMS 10h/11h/12h
 ; directly (no DOS=UMB, so the whole upper region is free for us), exercising the
 ; allocator paths the DOS=UMB e2e doesn't reach: the too-big probe (B0h+largest),
