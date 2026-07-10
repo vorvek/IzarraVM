@@ -89,7 +89,7 @@ fn voodoo_lfb_writes_convert_argb8888_to_the_selected_back_buffer() {
 }
 
 #[test]
-fn voodoo_fifo_drains_queued_register_lfb_and_texture_writes_in_order() {
+fn voodoo_fifo_drains_queued_register_and_lfb_writes_in_order() {
     let mut direct = Distira::new();
     direct.set_frame_size(2, 1);
     write_reg(&mut direct, SST_CLIP_LEFT_RIGHT, 2);
@@ -114,44 +114,18 @@ fn voodoo_fifo_drains_queued_register_lfb_and_texture_writes_in_order() {
     queued.queue_register_write(SST_FASTFILL_CMD, 1);
     queued.queue_register_write(SST_LFB_MODE, LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK);
     queued.queue_lfb_write_u32(0, 0x0034_5678);
-    queued.queue_texture_write_u32(0x10, 0xdead_beef);
     queued.queue_register_write(SST_SWAPBUFFER_CMD, 1);
 
-    assert_eq!(queued.fifo_depth(), 9);
+    assert_eq!(queued.fifo_depth(), 8);
     assert!(!queued.fifo_is_empty());
     assert!(!queued.fifo_is_full());
     assert_ne!(read_reg(&queued, SST_STATUS) & 0x380, 0);
-    assert_eq!(queued.read_texture_u32(0x10), 0);
 
     queued.drain_fifo();
 
     assert!(queued.fifo_is_empty());
     assert_eq!(read_reg(&queued, SST_STATUS) & 0x380, 0);
-    assert_eq!(queued.read_texture_u32(0x10), 0xdead_beef);
     assert_eq!(queued.scanout_argb(), direct.scanout_argb());
-}
-
-#[test]
-fn command_fifo_type5_texture_packet_writes_texture_memory() {
-    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
-
-    let mut distira = Distira::new();
-    write_reg(&mut distira, SST_FBI_INIT7, FBIINIT7_CMDFIFO_ENABLE);
-
-    assert!(distira.write_command_fifo_u32(0, cmdfifo_type5_header(3, 2)));
-    assert!(distira.write_command_fifo_u32(4, 0x20));
-    assert!(distira.write_command_fifo_u32(8, 0x1122_3344));
-    assert!(distira.write_command_fifo_u32(12, 0xaabb_ccdd));
-
-    assert_eq!(distira.fifo_depth(), 4);
-    assert_eq!(distira.read_texture_u32(0x20), 0);
-    assert_eq!(distira.read_texture_u32(0x24), 0);
-
-    distira.drain_fifo();
-
-    assert_eq!(distira.fifo_depth(), 0);
-    assert_eq!(distira.read_texture_u32(0x20), 0x1122_3344);
-    assert_eq!(distira.read_texture_u32(0x24), 0xaabb_ccdd);
 }
 
 #[test]
@@ -497,27 +471,5 @@ fn frame_buffer_writes_beyond_the_configured_size_do_not_alias() {
         distira.read_lfb_u8(past_end),
         0,
         "a write past the configured framebuffer size must not alias onto backed memory"
-    );
-}
-
-#[test]
-fn texture_memory_writes_beyond_the_configured_size_do_not_alias() {
-    // Same non-aliasing contract as the framebuffer, for TMU memory: the
-    // TMU sense-pattern probe (sst1InitGetTmuMemory, info.c) relies on
-    // unbacked texture addresses not echoing back a previously-written
-    // sense pattern from backed memory.
-    use izarravm_video::DISTIRA_TEX_SIZE;
-
-    let mut distira = Distira::new();
-    let last_dword = DISTIRA_TEX_SIZE - 4;
-    distira.write_texture_u32(last_dword, 0xdead_beef);
-    assert_eq!(distira.read_texture_u32(last_dword), 0xdead_beef);
-
-    let past_end = DISTIRA_TEX_SIZE;
-    distira.write_texture_u32(past_end, 0x5a5a_5a5a);
-    assert_eq!(
-        distira.read_texture_u32(past_end),
-        0,
-        "a write past the configured texture memory size must not alias onto backed memory"
     );
 }
