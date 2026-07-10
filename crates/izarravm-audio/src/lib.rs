@@ -3,6 +3,7 @@
 use izarravm_core::{AudioConfig, MidiBackend};
 
 mod dsp;
+mod midi;
 mod mixer;
 mod mpu401;
 mod opl;
@@ -13,6 +14,7 @@ mod soundfont;
 mod wss;
 
 pub use dsp::SbDsp;
+pub use midi::MidiEngine;
 pub use mixer::SbMixer;
 pub use mpu401::{Mpu401, TimedMidiMessage};
 pub use opl::OplChip;

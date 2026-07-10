@@ -256,7 +256,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The PC speaker is always-present motherboard hardware, so the host audio
     // output is opened regardless of which sound cards are enabled. AudioPlayer
     // falls back to silent if the host has no usable device.
-    let audio_enabled = true;
     // Read host local time and resolve host-side cmos.bin now, on the main thread,
     // before the emulation thread spawns. now_local() is sound only single-threaded.
     let rtc_setup = cmos::RtcSetup::from_c_root(&config.dos.c_drive);
@@ -265,7 +264,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         rom,
         config.dos.c_drive.clone(),
         config.dos.cd_image.clone(),
-        audio_enabled,
+        config.audio.midi.clone(),
         cli.margo_test_pattern,
         rtc_setup,
     )?;

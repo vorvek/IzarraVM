@@ -4,8 +4,8 @@ mod runtime;
 pub use runtime::run;
 
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
-use izarravm_audio::{AudioPlayer, AudioSink};
-use izarravm_core::{GswMode, TimingClass};
+use izarravm_audio::{AudioPlayer, AudioSink, MidiEngine};
+use izarravm_core::{GswMode, MidiConfig, MidiStatus, TimingClass};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use std::cell::Cell;
@@ -298,6 +298,12 @@ fn pump_audio(
             .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
     sink.queue(&pcm);
+}
+
+fn pump_midi(machine: &mut Machine, midi: &mut MidiEngine) {
+    while let Some(message) = machine.take_wavetable_midi_message() {
+        midi.send(&message);
+    }
 }
 
 /// What the emulation thread publishes for the UI to render and label. The UI
@@ -766,6 +772,7 @@ impl Emulator {
         profile: MachineProfile,
         rom: Vec<u8>,
         c_drive: PathBuf,
+        midi_config: MidiConfig,
         test_pattern: bool,
         sink: Option<AudioSink>,
         rtc_setup: crate::cmos::RtcSetup,
@@ -783,6 +790,7 @@ impl Emulator {
                     profile,
                     rom,
                     c_drive,
+                    midi_config,
                     test_pattern,
                     sink,
                     rtc_setup,
@@ -866,6 +874,7 @@ fn emulate(
     profile: MachineProfile,
     rom: Vec<u8>,
     c_drive: PathBuf,
+    midi_config: MidiConfig,
     test_pattern: bool,
     sink: Option<AudioSink>,
     rtc_setup: crate::cmos::RtcSetup,
@@ -908,6 +917,15 @@ fn emulate(
     }
     if test_pattern {
         load_margo_test_pattern(&mut machine);
+    }
+
+    let mut midi = MidiEngine::open(&midi_config);
+    if midi.status() != MidiStatus::Ready {
+        warn!(
+            backend = %midi_config.backend,
+            status = ?midi.status(),
+            "MIDI output unavailable; the guest MPU remains active"
+        );
     }
 
     let mut audio_debt = 0.0;
@@ -1092,6 +1110,7 @@ fn emulate(
                 speed_ratio = speed_ratio * 0.9 + ratio * 0.1;
             }
         }
+        pump_midi(&mut machine, &mut midi);
 
         // Publish: clone the framebuffer only when the guest presents a new
         // frame; refresh the light fields every pass so the readout stays live.
@@ -1159,6 +1178,7 @@ pub struct GuiApp {
     profile: MachineProfile,
     rom: Vec<u8>,
     c_drive: PathBuf,
+    midi_config: MidiConfig,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
     title: String,
@@ -1298,20 +1318,16 @@ impl GuiApp {
         rom: Vec<u8>,
         c_drive: PathBuf,
         cd_image: Option<PathBuf>,
-        audio_enabled: bool,
+        midi_config: MidiConfig,
         test_pattern: bool,
         rtc_setup: crate::cmos::RtcSetup,
     ) -> Self {
-        let audio = if audio_enabled {
-            match AudioPlayer::new() {
-                Ok(player) => Some(player),
-                Err(err) => {
-                    warn!(%err, "audio output unavailable; running silently");
-                    None
-                }
+        let audio = match AudioPlayer::new() {
+            Ok(player) => Some(player),
+            Err(err) => {
+                warn!(%err, "audio output unavailable; running silently");
+                None
             }
-        } else {
-            None
         };
         // The machine details (CPU, memory) live in the controls panel; the window
         // title stays the product name.
@@ -1336,6 +1352,7 @@ impl GuiApp {
             profile,
             rom,
             c_drive,
+            midi_config,
             test_pattern,
             rtc_setup,
             title,
@@ -1413,6 +1430,7 @@ impl GuiApp {
             self.profile.clone(),
             self.rom.clone(),
             self.c_drive.clone(),
+            self.midi_config.clone(),
             self.test_pattern,
             sink,
             self.rtc_setup.clone(),
