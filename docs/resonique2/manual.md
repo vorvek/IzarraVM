@@ -11,8 +11,8 @@ card.
 | --- | --- | --- | --- | --- |
 | Digital audio | Sound Blaster 16 / CT1745 mixer | `0x220` | 5 | 8-bit: 1, 16-bit: 5 |
 | FM synthesis | OPL3 (Yamaha YMF262) | `0x388` | n/a | n/a |
-| Wavetable MIDI output | MPU-401 | `0x300` | n/a | n/a |
-| External MIDI output | MPU-401 | `0x330` | n/a | n/a |
+| Wavetable MIDI output | MPU-401 | `0x300` | 9 | n/a |
+| External MIDI output | MPU-401 | `0x330` | 9 | n/a |
 
 The digital and FM sections use their standard, fixed Sound Blaster and
 AdLib addresses. ReSonique 2 assigns separate fixed ports to its wavetable
@@ -65,6 +65,12 @@ The card exposes separate MPU-401 port pairs. Games configured for the
 wavetable daughter card send music to `0x300`; Toka-DOS publishes this as
 `P300` in `BLASTER`. Games configured for an external MPU-401 send music to
 `0x330`. Both MPUs remain visible when a host receiver is unavailable.
+
+Both ports support UART output and the playback side of MPU-401 intelligent
+mode. Intelligent-mode software can use eight timed tracks, the conductor,
+tempo and timebase changes, and start or stop playback. The two ports share
+IRQ 9 for acknowledgements and data requests. Recording, external clock sync,
+metronome input, and the MPU reference filters are not implemented.
 
 P300 always renders through FluidSynth. It uses the embedded FluidR3Mono bank
 unless a custom SF2 or SF3 is selected. A missing or invalid custom bank falls

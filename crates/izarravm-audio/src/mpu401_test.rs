@@ -7,6 +7,28 @@ fn take_bytes(mpu: &mut Mpu401) -> Vec<u8> {
     mpu.take_message().expect("complete MIDI message").bytes
 }
 
+fn acknowledged(mpu: &mut Mpu401, command: u8) {
+    mpu.write_command(command);
+    assert_eq!(mpu.read_data(), ACK, "command {command:#04x}");
+}
+
+fn arm_tracks(mpu: &mut Mpu401, mask: u8) -> u64 {
+    acknowledged(mpu, 0xec);
+    mpu.write_data(mask, 0);
+    acknowledged(mpu, 0xb8);
+    acknowledged(mpu, 0x08);
+    let pulse = mpu.ticks_until_event().expect("first sequencer pulse");
+    mpu.advance_to(pulse);
+    pulse
+}
+
+fn submit_note(mpu: &mut Mpu401, timing: u8, note: u8, velocity: u8) {
+    assert_eq!(mpu.read_data(), 0xf0);
+    for value in [timing, 0x90, note, velocity] {
+        mpu.write_data(value, mpu.now_tick);
+    }
+}
+
 #[test]
 fn reset_and_uart_commands_acknowledge() {
     let mut mpu = Mpu401::default();
@@ -14,8 +36,10 @@ fn reset_and_uart_commands_acknowledge() {
 
     mpu.write_command(RESET);
     assert_eq!(mpu.status(), 0);
+    assert!(mpu.irq_level());
     assert_eq!(mpu.read_data(), ACK);
     assert_eq!(mpu.status(), RX_EMPTY);
+    assert!(!mpu.irq_level());
 
     mpu.write_command(ENTER_UART);
     assert!(mpu.is_uart());
@@ -45,6 +69,120 @@ fn intelligent_timebase_and_tempo_commands_store_their_parameters() {
     mpu.write_data(90, 12);
     assert_eq!(mpu.tempo(), 90);
     assert!(mpu.take_message().is_none());
+}
+
+#[test]
+fn intelligent_track_requests_count_timing_bytes_on_the_master_clock() {
+    let mut mpu = Mpu401::default();
+    let pulse = arm_tracks(&mut mpu, 1);
+    assert!(mpu.irq_level());
+    submit_note(&mut mpu, 2, 60, 100);
+    assert!(!mpu.irq_level());
+
+    mpu.advance_to(pulse * 2);
+    assert!(mpu.take_message().is_none());
+    mpu.advance_to(pulse * 3 - 1);
+    assert!(mpu.take_message().is_none());
+    mpu.advance_to(pulse * 3);
+
+    let note = mpu.take_message().expect("timed track note");
+    assert_eq!(note.bytes, [0x90, 60, 100]);
+    assert_eq!(note.guest_tick, pulse * 3);
+    assert_eq!(mpu.read_data(), 0xf0, "the track asks for its next event");
+}
+
+#[test]
+fn intelligent_track_request_accepts_running_status() {
+    let mut mpu = Mpu401::default();
+    let pulse = arm_tracks(&mut mpu, 1);
+    submit_note(&mut mpu, 1, 60, 100);
+    mpu.advance_to(pulse * 2);
+    assert_eq!(take_bytes(&mut mpu), [0x90, 60, 100]);
+
+    assert_eq!(mpu.read_data(), 0xf0);
+    for value in [1, 61, 0] {
+        mpu.write_data(value, mpu.now_tick);
+    }
+    mpu.advance_to(pulse * 3);
+    assert_eq!(take_bytes(&mut mpu), [0x90, 61, 0]);
+}
+
+#[test]
+fn zero_timing_uses_the_short_end_of_input_deadline() {
+    let mut mpu = Mpu401::default();
+    let pulse = arm_tracks(&mut mpu, 1);
+    submit_note(&mut mpu, 0, 64, 127);
+    let due = pulse + IMMEDIATE_DELAY_TICKS;
+
+    mpu.advance_to(due - 1);
+    assert!(mpu.take_message().is_none());
+    assert_eq!(mpu.status(), RX_EMPTY);
+    mpu.advance_to(due);
+
+    let note = mpu.take_message().expect("zero-timing note");
+    assert_eq!(note.bytes, [0x90, 64, 127]);
+    assert_eq!(note.guest_tick, due);
+    assert_eq!(mpu.read_data(), 0xf0);
+}
+
+#[test]
+fn conductor_requests_apply_tempo_on_the_requested_pulse() {
+    let mut mpu = Mpu401::default();
+    acknowledged(&mut mpu, 0x8f);
+    acknowledged(&mut mpu, 0xb8);
+    acknowledged(&mut mpu, 0x08);
+    let first_pulse = mpu.ticks_until_event().unwrap();
+    mpu.advance_to(first_pulse);
+    assert_eq!(mpu.read_data(), 0xf9);
+
+    for value in [1, 0xe0, 200] {
+        mpu.write_data(value, mpu.now_tick);
+    }
+    mpu.advance_to(first_pulse * 2);
+
+    assert_eq!(mpu.tempo(), 200);
+    assert_eq!(
+        mpu.read_data(),
+        0xf9,
+        "the conductor asks for its next command"
+    );
+    assert_eq!(
+        mpu.ticks_until_event(),
+        Some(CLOCK_NUMERATOR.div_ceil(120 * 200) as u64),
+        "the tempo change restarts the rational clock"
+    );
+}
+
+#[test]
+fn sequencer_advance_is_batch_invariant() {
+    let mut whole = Mpu401::default();
+    let mut split = Mpu401::default();
+    let pulse = arm_tracks(&mut whole, 1);
+    assert_eq!(arm_tracks(&mut split, 1), pulse);
+    submit_note(&mut whole, 3, 67, 90);
+    submit_note(&mut split, 3, 67, 90);
+    let end = pulse * 4;
+
+    whole.advance_to(end);
+    for point in [pulse + 7, pulse * 2 - 3, pulse * 3 + 11, end] {
+        split.advance_to(point);
+    }
+
+    assert_eq!(whole.take_message(), split.take_message());
+    assert_eq!(whole.read_data(), split.read_data());
+    assert_eq!(whole.ticks_until_event(), split.ticks_until_event());
+}
+
+#[test]
+fn stop_playback_acknowledges_and_silences_every_channel() {
+    let mut mpu = Mpu401::default();
+    let _ = arm_tracks(&mut mpu, 1);
+    assert_eq!(mpu.read_data(), 0xf0);
+    acknowledged(&mut mpu, 0x04);
+    assert!(!mpu.is_playing());
+    for channel in 0..16 {
+        assert_eq!(take_bytes(&mut mpu), [0xb0 | channel, 123, 0]);
+    }
 }
 
 #[test]

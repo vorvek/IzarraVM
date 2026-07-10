@@ -396,6 +396,17 @@ impl Machine {
 
         self.keyboard.advance_master_ticks(advance.master_ticks);
 
+        // Both MPU ports share the period-correct IRQ9 line. Their intelligent
+        // sequencers keep absolute master time, so an in-batch command write and
+        // the batch-end advance agree on the first clock pulse after that write.
+        let now_tick = self.timeline.now_ticks();
+        self.wavetable_mpu.advance_to(now_tick);
+        self.midi_mpu.advance_to(now_tick);
+        self.pic.set_irq_level(
+            9,
+            self.wavetable_mpu.irq_level() || self.midi_mpu.irq_level(),
+        );
+
         self.serial.advance_master_ticks(advance.master_ticks);
         self.serial2.advance_master_ticks(advance.master_ticks);
         self.lpt.advance_master_ticks(advance.master_ticks);
@@ -828,6 +839,18 @@ impl Machine {
         } else {
             None
         };
+        let mpu_wake = self
+            .pic
+            .deliverable(9)
+            .then(|| {
+                self.wavetable_mpu
+                    .ticks_until_event()
+                    .into_iter()
+                    .chain(self.midi_mpu.ticks_until_event())
+                    .min()
+            })
+            .flatten()
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
         let rtc_wake = self
             .pic
             .deliverable(8)
@@ -872,6 +895,7 @@ impl Machine {
             ata_wake,
             atapi_wake,
             keyboard_wake,
+            mpu_wake,
             rtc_wake,
             serial_wake,
             serial2_wake,
@@ -922,13 +946,15 @@ impl Machine {
             .chain(self.lpt2.ticks_until_event())
             .chain(self.fdc.ticks_until_event(self.timeline.now_ticks()))
             .chain(self.keyboard.ticks_until_event())
+            .chain(self.wavetable_mpu.ticks_until_event())
+            .chain(self.midi_mpu.ticks_until_event())
             .min()
     }
 
     /// CPU clocks until the next due device event.
     ///
     /// Interrupts are serviced at batch entry and devices advance at batch end,
-    /// so known timer, audio, storage, RTC, keyboard, serial, and printer edges
+    /// so known timer, audio, MIDI, storage, RTC, keyboard, serial, and printer edges
     /// shorten the batch to the first causal CPU clock in every CPU mode. Fast
     /// modes have a 1 ms fallback; the 386 modes keep a finer DAC-period fallback.
     /// A known edge may be earlier than either fallback.
