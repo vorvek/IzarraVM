@@ -1,4 +1,5 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
+pub use izarravm_core::{CpuPersona, GswMode};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
@@ -541,62 +542,6 @@ pub struct Msrs {
     pub tsc_offset: u64,
 }
 
-/// The instruction-set level the core presents to the running guest. It is a
-/// throttle the Lotura GSW register selects live (286 mode -> I286, and so on), not
-/// the physical part: the silicon is always a 586, so the core can execute the full
-/// ISA. At a level below the part the core faithfully raises #UD for the features
-/// that processor generation lacked, so a guest that opts into Super Slow (286) sees
-/// a true 286 instruction boundary.
-///
-/// This gating is guest-facing only. The default is `I586`, the full ISA, so the
-/// BIOS POST and every firmware path run with no restriction; the level drops below
-/// I586 only when the guest writes a lower GSW mode to Lotura port 0xE1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub enum CpuLevel {
-    I286,
-    I386,
-    I486,
-    #[default]
-    I586,
-}
-
-impl CpuLevel {
-    /// True when the level predates the 386, which introduced the 32-bit operand
-    /// and address forms (the 66h/67h prefixes) and the bulk of the 0F-extended
-    /// opcode group the core also supports.
-    const fn is_pre_386(self) -> bool {
-        matches!(self, Self::I286)
-    }
-
-    /// True when CPUID is present. CPUID arrived on the late 486 and is standard on
-    /// the 586; the 286 and 386 have no CPUID and report #UD for it.
-    const fn has_cpuid(self) -> bool {
-        matches!(self, Self::I486 | Self::I586)
-    }
-
-    /// True when the 586-class instruction additions are present (RDTSC, RDMSR/WRMSR,
-    /// CMOVcc, CMPXCHG8B, SYSCALL/SYSRET, RSM). The physical part is always a 586, so
-    /// only a guest that throttled to a lower GSW mode sees these as #UD.
-    const fn has_pentium_isa(self) -> bool {
-        matches!(self, Self::I586)
-    }
-
-    /// Reported (L1 KB, L2 KB) cache for the level. Mirrors the machine's
-    /// `CacheModel` geometry (`cache_geometry`) and now drives per-mode data-access
-    /// timing through the cosmetic multi-tier cache, so it is no longer a no-timing
-    /// readout. Still mirrors `GswMode::cache_kb` in the core so the CPU can answer
-    /// the cache readout without a core dependency; the L2 is a motherboard cache
-    /// module.
-    pub const fn cache_kb(self) -> (u16, u16) {
-        match self {
-            Self::I286 => (0, 0),
-            Self::I386 => (0, 64),
-            Self::I486 => (16, 128),
-            Self::I586 => (32, 512),
-        }
-    }
-}
-
 /// Direct-mapped TLB size (entries). Covers TLB_ENTRIES * 4 KiB before two pages
 /// collide on a slot; a 386/486 had 32, this keeps a few more so a fetch/execute
 /// loop's interleaved code and data pages do not evict each other every step.
@@ -827,7 +772,7 @@ impl std::fmt::Debug for CpuProfileState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuGsw {
     pub registers: Registers,
     pub fpu: X87,
@@ -863,10 +808,9 @@ pub struct CpuGsw {
     // the 386 holds off interrupts until the instruction after STI, which makes
     // the STI; HLT idle idiom safe (the HLT runs before any interrupt is taken).
     interrupt_shadow: bool,
-    // The guest-facing instruction-set level. Defaults to the full ISA (I586) so
-    // firmware POST is never restricted; the Machine lowers it from the live Lotura
-    // GSW mode write. See CpuLevel.
-    level: CpuLevel,
+    // The active GSW mode. Its core-table row owns the guest-facing persona,
+    // cache geometry, ordering, and clock identity.
+    mode: GswMode,
     // Caches linear->physical page translations so paged protected mode (DOS
     // extenders, Win9x) does not re-walk the two-level page table on every access.
     // Flushed on CR0/CR3 writes, task switch, and INVLPG.
@@ -924,6 +868,45 @@ pub struct CpuGsw {
     /// the frame's own CS is loaded, which must not be mistaken for the CPL the pushes
     /// execute under).
     cpl: u8,
+}
+
+impl Default for CpuGsw {
+    fn default() -> Self {
+        Self {
+            registers: Registers::default(),
+            fpu: X87::default(),
+            control: ControlRegisters::default(),
+            msr: Msrs::default(),
+            gdtr: DescriptorTable::default(),
+            idtr: DescriptorTable::default(),
+            ldtr: SegmentRegister::default(),
+            tr: SegmentRegister::default(),
+            elapsed_clocks: 0,
+            core_clocks_so_far: 0,
+            timing_rem: 0,
+            fp_rem: 0,
+            halted: false,
+            interrupt_shadow: false,
+            mode: GswMode::Gsw586,
+            tlb: Tlb::default(),
+            code_page: CodePageCache::default(),
+            prefetch: PrefetchWindow::default(),
+            data_read_pages: DirectPageCache::default(),
+            data_write_pages: DirectPageCache::default(),
+            fetch_page: FetchPageCache::default(),
+            written_pages: [None; TRACKED_WRITE_PAGES],
+            written_count: 0,
+            written_pages_overflow: false,
+            decode_cache: DecodeCache::default(),
+            #[cfg(feature = "jit")]
+            jit_regions: jit::RegionTable::default(),
+            perf: PerfCounters::default(),
+            profile: CpuProfileState::default(),
+            pending_flags: PendingFlags::default(),
+            alignment_armed: false,
+            cpl: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1599,7 +1582,7 @@ struct PageCodeInfo {
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
 /// (`cs.base + eip`). It lets a hot loop skip re-decoding the same bytes every iteration. The `gen`
 /// counter is advanced whenever a decode could change meaning: CS base / paging / mode changes (via
-/// `invalidate_code_caches`) and an ISA-level change (via `set_level`). A bump makes every stamped
+/// `invalidate_code_caches`) and a mode change (via `set_mode`). A bump makes every stamped
 /// line miss, so the next execution at each address re-decodes and re-stamps. It is NOT advanced on
 /// a near branch (`set_eip` only moves eip, which already changes the linear key) nor on a plain
 /// data write to a non-code page, both of which would flush the cache every loop iteration.
@@ -2080,7 +2063,7 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 /// floor), so this dial only trims the compute share. Dhrystone (the PRIMARY
 /// oracle) is a fetch+data mix split roughly compute/bus; these values plus
 /// `bus_timing` seat all four modes' Dhrystones/sec on the owner's authoritative
-/// era targets (286 ~3500, 386 ~9200, 486 ~61000, 586 ~475000) to within ~0.3%.
+/// era targets (386 ~9200, 486 ~61000, 586 ~475000) to within ~0.3%.
 ///
 /// fp-mandel TRADE-OFF: fp-mandel is x87-compute-bound (~7280 instruction clocks
 /// vs ~6247 bus per pixel), so it rides this dial. Dhrystone pinned to its owner
@@ -2090,12 +2073,11 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 /// fp-mandel ratio AND the Dhrystone target needs a separate x87 latency dial (a
 /// deferred Whetstone-payload follow-up); Dhrystone is PRIMARY, so fp-mandel's band
 /// is recentered on the achieved value and the ratio gap recorded.
-const fn level_timing(level: CpuLevel) -> (u32, u32) {
-    match level {
-        CpuLevel::I286 => (3, 5),
-        CpuLevel::I386 => (2, 5),
-        CpuLevel::I486 => (1, 12),
-        CpuLevel::I586 => (1, 12),
+const fn level_timing(persona: CpuPersona) -> (u32, u32) {
+    match persona {
+        CpuPersona::I386 => (2, 5),
+        CpuPersona::I486 => (1, 12),
+        CpuPersona::I586 => (1, 12),
     }
 }
 
@@ -2139,7 +2121,7 @@ const FP_TIMING_DEN: u32 = 8;
 /// Per-mode, per-class FP-op-clock numerator over `FP_TIMING_DEN` — a SEPARATE
 /// dial from `level_timing` so the P55C's x87 pipeline can be modeled at I586
 /// without touching the integer-instruction compute ratio. Identity (8/8) for
-/// 286/386/486: their FP rides `level_timing` alone, keeping the frozen-class
+/// 386/486: their FP rides `level_timing` alone, keeping the frozen-class
 /// bench bytes and the 486 Whetstone anchor (6.5 MFLOPS) untouched.
 ///
 /// The I586 values replace the old flat (31/34) scalar with the class shape the
@@ -2151,11 +2133,11 @@ const FP_TIMING_DEN: u32 = 8;
 /// clocks (U/V pairing, 1-clock FADD/FMUL issue); the int<->fp boundary pays an
 /// effective stall surcharge (see FpOpClass::IntConvert). CALIBRATION
 /// CONSTRAINTS: Whetstone 586 = 34.5 MFLOPS and 486 = 6.5 stay era-exact;
-/// Dhrystone/Sieve run no x87 and stay bit-identical; 286/386 frozen.
-const fn fp_timing_class(level: CpuLevel, class: FpOpClass) -> u32 {
-    match level {
-        CpuLevel::I286 | CpuLevel::I386 | CpuLevel::I486 => FP_TIMING_DEN,
-        CpuLevel::I586 => match class {
+/// Dhrystone/Sieve run no x87 and stay bit-identical; 386 frozen.
+const fn fp_timing_class(persona: CpuPersona, class: FpOpClass) -> u32 {
+    match persona {
+        CpuPersona::I386 | CpuPersona::I486 => FP_TIMING_DEN,
+        CpuPersona::I586 => match class {
             // Census-guided, empirically walked against the two era anchors
             // (Whetstone 586 = 34.5 MFLOPS, Quake demo1 ~42 fps).
             FpOpClass::IntConvert32 => 272, // x34: conversion drains the FP pipe
@@ -2195,40 +2177,16 @@ const fn fp_timing_class(level: CpuLevel, class: FpOpClass) -> u32 {
 /// pull those tiers down to SpeedSys on the 486; on the 586 the u8 wait-state cap
 /// (255) over a 16-dword line floors L2/RAM above SpeedSys. Era anchors and the gap
 /// are recorded in each bandwidth `cite`.
-pub const fn bus_timing(level: CpuLevel) -> (u32, u32) {
-    match level {
-        CpuLevel::I286 => (6, 11),
-        CpuLevel::I386 => (23, 31),
-        CpuLevel::I486 => (1, 3),
-        CpuLevel::I586 => (7, 30),
+pub const fn bus_timing(persona: CpuPersona) -> (u32, u32) {
+    match persona {
+        CpuPersona::I386 => (23, 31),
+        CpuPersona::I486 => (1, 3),
+        CpuPersona::I586 => (7, 30),
     }
 }
 
-/// True when a second-byte 0F opcode is one the 386 or a later part introduced and
-/// the core executes. Used to raise #UD at the 286 guest level. The 286-era 0F
-/// opcodes the core supports (0F 01 LGDT/LIDT) return false and stay allowed.
-const fn is_386plus_two_byte(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        // 486 cache/atomic group: INVD, WBINVD, CMPXCHG, XADD, BSWAP.
-        0x08 | 0x09 | 0xb0 | 0xb1 | 0xc0 | 0xc1 | 0xc8..=0xcf
-        // MOV to/from CR (386).
-        | 0x20 | 0x22
-        // PUSH/POP FS/GS (386): FS and GS do not exist before the 386.
-        | 0xa0 | 0xa1 | 0xa8 | 0xa9
-        // Jcc rel16/32 and SETcc (386).
-        | 0x80..=0x8f | 0x90..=0x9f
-        // CPUID (gated again by level below; 286 has no CPUID either way).
-        | 0xa2
-        // SHLD/SHRD, BT group r/m+reg, IMUL r,r/m (386).
-        | 0xa3 | 0xa4 | 0xa5 | 0xab | 0xac | 0xad | 0xaf
-        // BT/BTS/BTR/BTC r/m+imm8 and r/m+reg, MOVZX/MOVSX, BSF/BSR (386).
-        | 0xb3 | 0xba | 0xbb | 0xb6 | 0xb7 | 0xbc | 0xbd | 0xbe | 0xbf
-    )
-}
-
 /// True when a second-byte 0F opcode is a 586-class addition the core executes only at
-/// the full GSW level. Used to raise #UD when the guest throttled to 286/386/486.
+/// the full GSW level. Used to raise #UD when the guest selects a 386 or 486 mode.
 const fn is_586plus_two_byte(opcode: u8) -> bool {
     matches!(
         opcode,

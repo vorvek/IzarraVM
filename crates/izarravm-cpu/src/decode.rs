@@ -63,17 +63,16 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// NO other Misc opcode is admitted: the BCD adjusts, AAM/AAD (#DE path), SALC/XLAT
 /// (memory read), INS/OUTS (port + string), and HLT all stay terminators.
 ///
-/// Gated on `level` (not a runtime bus flag) so the Accurate class (I286/I386) keeps
+/// Gated on `persona` (not a runtime bus flag) so the Accurate 386 class keeps
 /// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
-/// per decode, and `CpuGsw::set_level` unconditionally invalidates the decode cache
+/// per decode, and `CpuGsw::set_mode` unconditionally invalidates the decode cache
 /// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
-/// admission re-resolved -- after any level change. There is no stale-entry window where an
-/// I286-level IN or TEST could carry an I586-level admission decision forward.
+/// admission re-resolved -- after any mode change.
 fn block_continuable(
     group: DecodeGroup,
     opcode: u16,
     modrm: Option<ModRm>,
-    level: CpuLevel,
+    persona: CpuPersona,
 ) -> bool {
     if block_straight_line(group) {
         return true;
@@ -90,12 +89,14 @@ fn block_continuable(
     }
     if group == DecodeGroup::PortIo {
         // Only the IN forms, only in the Approximate class; see the doc comment above.
-        return level >= CpuLevel::I486 && matches!(opcode, 0xe4 | 0xe5 | 0xec | 0xed);
+        return matches!(persona, CpuPersona::I486 | CpuPersona::I586)
+            && matches!(opcode, 0xe4 | 0xe5 | 0xec | 0xed);
     }
     if group == DecodeGroup::Misc {
         // Only TEST AL/AX/EAX,imm, only in the Approximate class; see the doc
         // comment above. Everything else in the Misc bucket stays a terminator.
-        return level >= CpuLevel::I486 && matches!(opcode, 0xa8 | 0xa9);
+        return matches!(persona, CpuPersona::I486 | CpuPersona::I586)
+            && matches!(opcode, 0xa8 | 0xa9);
     }
     if group != DecodeGroup::ControlFlow {
         return false;
@@ -399,7 +400,7 @@ impl CpuGsw {
         // here — charging its instruction-fetch exactly once — and fold it into `insn.opcode` as
         // `0x0F00 | second`. Every later 0F group routes on this combined value, and the fused
         // fallback (`execute_two_byte`) consumes the second byte from `insn.opcode as u8` rather
-        // than re-reading it. The 286/586 ISA #UD gates apply once, right after the read (matching
+        // than re-reading it. The 586 ISA #UD gate applies once, right after the read (matching
         // the point the fused path faulted), with the firmware-ROM exemption preserved.
         let (opcode, isa_gate_exempt) = if opcode == 0x0f {
             let second = self.fetch_u8(bus)?;
@@ -429,13 +430,8 @@ impl CpuGsw {
             // Placeholder; the finalize below resolves it once the ModRM (the 0xFF /ext
             // discriminator) has been pre-parsed.
             continuable: false,
-            // Both ISA-gate exemptions are context, not bytes, so neither may be cached: the
-            // two-byte gate reports its exemption directly; a 66/67 prefix at a pre-386 level
-            // can only have survived read_prefixes via the same firmware-ROM/ring-0 exemption
-            // (any other context #UDs there), so the prefix flags themselves are the signal.
-            no_cache: isa_gate_exempt
-                || (self.level.is_pre_386()
-                    && (prefixes.operand_size_override || prefixes.address_size_override)),
+            // ISA-gate exemptions are context, not bytes, so an exempt decode may not be cached.
+            no_cache: isa_gate_exempt,
         };
 
         // Pre-parse the operands of converted groups, dispatching on the group resolved above.
@@ -844,7 +840,7 @@ impl CpuGsw {
         insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
         // Resolve the continuation gate once per decode (the ModRM is in by now), so the
         // per-continuation check in `run_straight_line` reads a single cached flag.
-        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm, self.level);
+        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm, self.persona());
 
         Ok(insn)
     }
@@ -871,25 +867,18 @@ impl CpuGsw {
         (modrm, operand)
     }
 
-    /// The guest-level ISA #UD gate for the whole 0F-extended group. At the 286 level the core
-    /// raises #UD for every 0F opcode the 386 (and later) introduced that it otherwise executes:
-    /// MOVZX/MOVSX, BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD, SETcc, the 0F-form IMUL and Jcc, MOV
-    /// to/from CR, and the 486 additions (INVD/WBINVD, CMPXCHG, XADD, BSWAP). The 286-era 0F
-    /// opcodes the core supports (0F 01 LGDT/LIDT) stay allowed. CPUID is gated separately because
-    /// it is absent on both the 286 and the 386. The 586-class additions (RDTSC, RDMSR/WRMSR,
-    /// CMOVcc, CMPXCHG8B, SYSCALL/SYSRET, RSM) #UD when the guest has throttled below the 586
-    /// level. Code fetched from the BIOS ROM is exempt (see `cs_in_firmware_rom`), so the gate only
-    /// ever holds guest code that selected a lower GSW mode.
+    /// The guest-level ISA #UD gate for 586-class additions. RDTSC, RDMSR/WRMSR,
+    /// CMOVcc, CMPXCHG8B, SYSCALL/SYSRET, and RSM fault under the 386 and 486
+    /// personas. CPUID retains its separate execution-time gate.
     ///
     /// Ring-0 protected-mode code (`is_ring0_protected()`) is exempt too, for the same reason as
-    /// the `read_prefixes` 66h/67h gate below: TOKAEMM's monitor is chipset-side, not guest
-    /// software, and it is 32-bit-default code that uses MOVZX/MOVSX/BSF/etc freely. V86 tasks are
+    /// the firmware exception: TOKAEMM's monitor is chipset-side, not guest software. V86 tasks are
     /// always CPL 3 architecturally, so this can never leak into guest-facing V86 code, and it
     /// reads false in real mode (not protected). V86 and real-mode fidelity are unchanged.
     ///
     /// ASSUMPTION (same as `is_ring0_protected()`'s own doc): today ring-0 PM is ONLY the
     /// chipset-side TOKAEMM monitor. A guest OS running its own ring-0 protected mode on a
-    /// throttled persona (OS/2 1.x or Windows standard mode on the 286 persona), or a future
+    /// throttled persona, or a future
     /// VCPI client (which runs ring-0 PM by design), would get the full core ISA here -- including
     /// the 586-only additions this same short-circuit skips on the 386/486 personas -- where real
     /// hardware would #UD. Correct-by-design for the monitor (same precedent as the blanket
@@ -904,8 +893,7 @@ impl CpuGsw {
     /// exemption is a property of the executing context (CS region, privilege), not of the
     /// bytes, and a cached replay after a privilege change would skip the #UD.
     fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<bool> {
-        let gated = (self.level.is_pre_386() && is_386plus_two_byte(second))
-            || (!self.level.has_pentium_isa() && is_586plus_two_byte(second));
+        let gated = !matches!(self.persona(), CpuPersona::I586) && is_586plus_two_byte(second);
         if !gated {
             return Ok(false);
         }
@@ -932,49 +920,6 @@ impl CpuGsw {
                 0x65 => prefixes.segment_override = Some(SegmentIndex::Gs),
                 // A prefix is idempotent: repeating 66h/67h keeps the override on,
                 // it does not toggle it back off (so 66 66 op stays operand-size).
-                //
-                // The 66h operand-size and 67h address-size prefixes are 386
-                // additions: the 286 has no 32-bit operand or address form and
-                // decodes neither byte as a prefix. At the 286 guest level the core
-                // raises #UD for them, which faithfully blocks every 32-bit
-                // operation reached through a prefix. Code fetched from the BIOS ROM
-                // is exempt (see cs_in_firmware_rom), so firmware is never blocked.
-                //
-                // Ring-0 protected-mode code (`is_ring0_protected()`: PE set, CPL 0,
-                // not V86) is exempt too, parallel to the firmware exemption. That
-                // state is TOKAEMM's own monitor -- chipset-side code that runs
-                // underneath the guest, not guest software -- so it is never subject
-                // to the guest-facing ISA level the player selected. The level gate
-                // exists to make the emulated machine LOOK like a 286 to the guest;
-                // it must bind guest-facing execution only. V86 tasks are
-                // architecturally always CPL 3, so `is_ring0_protected()` (which
-                // requires !is_v86_mode()) can never accidentally exempt them: V86
-                // guest code stays gated exactly as before. Real mode is likewise
-                // unaffected (`is_protected_mode()` is false there, so
-                // `is_ring0_protected()` is false too). Without this, a 286-mode
-                // session with TOKAEMM resident dies the instant the monitor's
-                // 32-bit-default entry code (e.g. `vec13_entry`'s `66 B8 .. / mov
-                // ds, ax`) runs, and the resulting #UD cascades into a worse fault
-                // because TOKAEMM's IDT does not populate the low exception vectors.
-                //
-                // ASSUMPTION (same as `is_ring0_protected()`'s own doc): today
-                // ring-0 PM is ONLY the chipset-side TOKAEMM monitor. A guest OS
-                // running its own ring-0 protected mode on the 286 persona (OS/2
-                // 1.x, Windows standard mode), or a future VCPI client (ring-0 PM
-                // by design), would get 386+ ISA here where a real 286 #UDs.
-                // Correct-by-design for the monitor; revisit when VCPI/DPMI lands,
-                // likely by scoping this to monitor identity instead of privilege.
-                // See check_two_byte_isa_gate's doc for the full statement.
-                0x66 | 0x67
-                    if self.level.is_pre_386()
-                        && !self.cs_in_firmware_rom()
-                        && !self.is_ring0_protected() =>
-                {
-                    return Err(InternalFault::Exception {
-                        vector: 6,
-                        error_code: None,
-                    });
-                }
                 0x66 => prefixes.operand_size_override = true,
                 0x67 => prefixes.address_size_override = true,
                 0xf0 => prefixes.lock = true,

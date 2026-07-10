@@ -15,7 +15,7 @@ fn reset_state_starts_at_386_reset_vector() {
 
 #[test]
 fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_accurate_class() {
-    // In the Accurate class (I286/I386) `block_continuable` never admits
+    // In the Accurate 386 class `block_continuable` never admits
     // `DecodeGroup::PortIo` (see that function's doc comment: the P4a Task 1.3
     // IN admission is gated on the Approximate class only), so an IN can ONLY
     // ever be `run_straight_line`'s FIRST instruction there, never a
@@ -27,7 +27,7 @@ fn core_clocks_so_far_is_zero_for_an_in_as_the_runs_first_instruction_in_the_acc
     // changes. See the sibling test for the Approximate-class continuation case.
     let code = [0xec]; // in al,dx
     let (mut cpu, memory) = real_mode_cpu(&code, 32);
-    cpu.set_level(CpuLevel::I386);
+    cpu.set_mode(GswMode::Gsw386);
     let mut bus = TestBus::with_memory(memory);
 
     let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
@@ -66,7 +66,7 @@ fn core_clocks_so_far_tracks_the_running_total_for_an_in_reached_as_an_approxima
     // real_mode_cpu's default level (CpuGsw::default()) is already I586
     // (Approximate); set it explicitly so this test does not silently change
     // meaning if the default ever moves.
-    cpu.set_level(CpuLevel::I586);
+    cpu.set_mode(GswMode::Gsw586);
     let mut bus = TestBus::with_memory(memory);
     // Warm the decode cache one instruction at a time via single-step `cycle`
     // (not `run_straight_line`): once the IN is continuable, a warm-up call
@@ -143,7 +143,7 @@ fn poll_loop_with_test_imm_chains_end_to_end_in_the_approximate_class() {
         0xEB, 0xF9, // 5: jmp -7 -> back to 0 (unreachable, decode fodder only)
     ];
     let (mut cpu, memory) = real_mode_cpu(&code, 32);
-    cpu.set_level(CpuLevel::I586);
+    cpu.set_mode(GswMode::Gsw586);
     let mut bus = TestBus::with_memory(memory);
     bus.lazy_io_reads = true;
     // Warm the decode cache: one single-step per loop instruction (IN, TEST,
@@ -201,7 +201,7 @@ fn poll_loop_test_imm_still_terminates_the_run_in_the_accurate_class() {
         0xEB, 0xF9, // 5: jmp -7 -> back to 0
     ];
     let (mut cpu, memory) = real_mode_cpu(&code, 32);
-    cpu.set_level(CpuLevel::I386);
+    cpu.set_mode(GswMode::Gsw386);
     let mut bus = TestBus::with_memory(memory);
     bus.lazy_io_reads = true;
     for _ in 0..3 {
@@ -248,7 +248,7 @@ fn in_stays_a_run_terminator_not_a_continuation_in_the_accurate_class() {
     // the None assertion; with the gate intact it passes.
     let code = [0x40, 0x40, 0xec]; // inc ax; inc ax; in al,dx
     let (mut cpu, memory) = real_mode_cpu(&code, 32);
-    cpu.set_level(CpuLevel::I386);
+    cpu.set_mode(GswMode::Gsw386);
     let mut bus = TestBus::with_memory(memory);
     bus.lazy_io_reads = true;
     // Warm all three decode-cache lines via single-steps (the IN included,
@@ -297,7 +297,7 @@ fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation()
     // accident of PortIo's continuability gate.
     let code = [0x40, 0x40, 0x40]; // inc ax; inc ax; inc ax
     let (mut cpu, memory) = real_mode_cpu(&code, 32);
-    cpu.set_level(CpuLevel::I286);
+    cpu.set_mode(GswMode::Gsw386);
     let mut bus = TestBus::with_memory(memory);
     // Warm the decode cache one instruction at a time (INC is continuable, so
     // once warm all three chain in a single run_straight_line call).
@@ -312,12 +312,13 @@ fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation()
     // the CPU right here (so its warmed-up `timing_rem` fractional-clock
     // carry, accumulated over the 3 warm-up runs, matches exactly) and
     // driving the clone through two `cycle()` single-steps.
-    let two_incs_total = {
+    let (two_incs_total, three_incs_total) = {
         let mut solo = cpu.clone();
-        let mut solo_bus = TestBus::with_memory(vec![0x40, 0x40]);
+        let mut solo_bus = TestBus::with_memory(vec![0x40, 0x40, 0x40]);
         let a = solo.cycle(&mut solo_bus).unwrap().core_clocks;
         let b = solo.cycle(&mut solo_bus).unwrap().core_clocks;
-        a + b
+        let c = solo.cycle(&mut solo_bus).unwrap().core_clocks;
+        (a + b, a + b + c)
     };
 
     let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
@@ -332,10 +333,7 @@ fn core_clocks_so_far_tracks_run_straight_lines_total_before_each_continuation()
     // continuation (the third INC) dispatched, so it must equal exactly the
     // first two INCs' combined charge, independently measured above.
     assert_eq!(cpu.core_clocks_so_far, u64::from(two_incs_total));
-    assert!(
-        u64::from(outcome.core_clocks) > u64::from(two_incs_total),
-        "the third INC's own charge must be included in the run total"
-    );
+    assert_eq!(outcome.core_clocks, three_incs_total);
 }
 
 #[test]

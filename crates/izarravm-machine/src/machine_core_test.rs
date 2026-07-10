@@ -5,14 +5,14 @@ use super::*;
 
 #[test]
 fn cache_level_config_matches_geometry() {
-    for level in [
-        CpuLevel::I286,
-        CpuLevel::I386,
-        CpuLevel::I486,
-        CpuLevel::I586,
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
     ] {
-        let g = cache_geometry(level);
-        let config = cache_level_config(level);
+        let g = cache_geometry(mode);
+        let config = cache_level_config(mode);
         let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
         let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
 
@@ -37,28 +37,27 @@ fn cache_level_config_matches_geometry() {
 
 #[test]
 fn cache_model_resolves_tiers_by_working_set() {
-    let mut c = CacheModel::new(CpuLevel::I486);
+    let mut c = CacheModel::new(GswMode::Gsw486);
     let warm = |c: &mut CacheModel, base: u32, len: u32| {
         for off in (0..len).step_by(64) {
-            c.data_tier(CpuLevel::I486, base + off);
+            c.data_tier(GswMode::Gsw486, base + off);
         }
     };
-    warm(&mut c, 0x10_0000, 8 * 1024); // 8K fits 486 L1 (16K)
-    assert_eq!(c.data_tier(CpuLevel::I486, 0x10_0000), Tier::L1);
-    warm(&mut c, 0x20_0000, 64 * 1024); // 64K exceeds L1, fits L2 (128K)
-    assert_eq!(c.data_tier(CpuLevel::I486, 0x20_0000), Tier::L2);
-    warm(&mut c, 0x40_0000, 256 * 1024); // 256K exceeds 486 L2 -> RAM
-    assert_eq!(c.data_tier(CpuLevel::I486, 0x40_0000), Tier::Ram);
-    assert_eq!(c.data_tier(CpuLevel::I286, 0x10_0000), Tier::Ram); // 286: no cache
+    warm(&mut c, 0x10_0000, 4 * 1024); // 4K fits 486 L1 (8K)
+    assert_eq!(c.data_tier(GswMode::Gsw486, 0x10_0000), Tier::L1);
+    warm(&mut c, 0x20_0000, 64 * 1024); // 64K exceeds L1, fits L2 (256K)
+    assert_eq!(c.data_tier(GswMode::Gsw486, 0x20_0000), Tier::L2);
+    warm(&mut c, 0x40_0000, 512 * 1024); // 512K exceeds 486 L2 -> RAM
+    assert_eq!(c.data_tier(GswMode::Gsw486, 0x40_0000), Tier::Ram);
 }
 
 #[test]
 fn cache_model_reset_goes_cold() {
-    let mut c = CacheModel::new(CpuLevel::I586);
-    c.data_tier(CpuLevel::I586, 0x30_0000); // installs the line
-    assert_eq!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // hot
+    let mut c = CacheModel::new(GswMode::Gsw586);
+    c.data_tier(GswMode::Gsw586, 0x30_0000); // installs the line
+    assert_eq!(c.data_tier(GswMode::Gsw586, 0x30_0000), Tier::L1); // hot
     c.reset();
-    assert_ne!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // cold again
+    assert_ne!(c.data_tier(GswMode::Gsw586, 0x30_0000), Tier::L1); // cold again
 }
 
 #[test]
@@ -124,9 +123,9 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
         mbps(&mut machine, mode, block)
     }
 
-    // 586: L1 64K, L2 512K. 32K is deep in L1, 256K deep in L2, 2M is RAM.
+    // 586: L1 32K, L2 512K. 16K is deep in L1, 256K deep in L2, 2M is RAM.
     {
-        let l1 = measure(GswMode::Gsw586, 32 * 1024);
+        let l1 = measure(GswMode::Gsw586, 16 * 1024);
         let l2 = measure(GswMode::Gsw586, 256 * 1024);
         let ram = measure(GswMode::Gsw586, 2 * 1024 * 1024);
         assert!(
@@ -139,11 +138,11 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
         );
     }
 
-    // 486: L1 16K, L2 128K. 8K is deep in L1, 64K deep in L2, 256K is RAM.
+    // 486: L1 8K, L2 256K. 4K is deep in L1, 64K deep in L2, 512K is RAM.
     {
-        let l1 = measure(GswMode::Gsw486, 8 * 1024);
+        let l1 = measure(GswMode::Gsw486, 4 * 1024);
         let l2 = measure(GswMode::Gsw486, 64 * 1024);
-        let ram = measure(GswMode::Gsw486, 256 * 1024);
+        let ram = measure(GswMode::Gsw486, 512 * 1024);
         assert!(
             l1 > l2 * 1.05,
             "486: L1 {l1:.1} must exceed L2 {l2:.1} MB/s"
@@ -157,23 +156,12 @@ fn measure_read_bandwidth_curve_descends_per_tier() {
     // 386: L2 64K, no L1. 32K is deep in L2, 1M is well into RAM. The 386 L2-vs-RAM
     // step is the narrowest, so pick a small L2 block and a large RAM block to
     // separate them cleanly and assert a >5% margin.
-    {
-        let l2 = measure(GswMode::Gsw386, 32 * 1024);
-        let ram = measure(GswMode::Gsw386, 1024 * 1024);
+    for mode in [GswMode::Gsw386, GswMode::Gsw386Slow] {
+        let l2 = measure(mode, 32 * 1024);
+        let ram = measure(mode, 1024 * 1024);
         assert!(
             l2 > ram * 1.05,
-            "386: L2 {l2:.1} must exceed RAM {ram:.1} MB/s"
-        );
-    }
-
-    // 286: no cache. Two sizes must be roughly flat (no tier step), within 20%.
-    {
-        let small = measure(GswMode::Gsw386Slow, 8 * 1024);
-        let large = measure(GswMode::Gsw386Slow, 1024 * 1024);
-        let ratio = small / large;
-        assert!(
-            (0.8..=1.25).contains(&ratio),
-            "286 is cacheless: {small:.1} vs {large:.1} MB/s should be flat (ratio {ratio:.3})"
+            "{mode:?}: L2 {l2:.1} must exceed RAM {ram:.1} MB/s"
         );
     }
 }
@@ -208,16 +196,20 @@ fn approximate_class_bypasses_cache_tiering_accurate_class_does_not() {
 #[test]
 fn cache_geometry_matches_cache_kb() {
     // The machine geometry must agree with the CPU's cache_kb readout (KB).
-    for (level, (l1_kb, l2_kb)) in [
-        (CpuLevel::I286, (0u16, 0u16)),
-        (CpuLevel::I386, (0, 64)),
-        (CpuLevel::I486, (16, 128)),
-        (CpuLevel::I586, (32, 512)),
+    for (mode, (l1_kib, external_kib)) in [
+        (GswMode::Gsw386Slow, (0u16, 64u16)),
+        (GswMode::Gsw386, (0, 64)),
+        (GswMode::Gsw486, (8, 256)),
+        (GswMode::Gsw586, (32, 512)),
     ] {
-        let g = cache_geometry(level);
-        assert_eq!(g.l1_bytes / 1024, u32::from(l1_kb), "{level:?} L1");
-        assert_eq!(g.l2_bytes / 1024, u32::from(l2_kb), "{level:?} L2");
-        assert_eq!(level.cache_kb(), (l1_kb, l2_kb)); // mirrors cpu cache_kb
+        let g = cache_geometry(mode);
+        assert_eq!(g.l1_bytes / 1024, u32::from(l1_kib), "{mode:?} L1");
+        assert_eq!(
+            g.l2_bytes / 1024,
+            u32::from(external_kib),
+            "{mode:?} external cache"
+        );
+        assert_eq!(mode.cache_kb(), (l1_kib, external_kib));
     }
 }
 

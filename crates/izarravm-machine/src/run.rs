@@ -180,12 +180,9 @@ impl Machine {
             let inv_clock_at_batch_start = self.timing.inv_clock;
             let pit_clocks_at_batch_start = self.pit_clocks;
             let pit_per_clock_at_batch_start = self.timing.pit_per_clock;
-            // bus_timing's (num, den), read from the SAME source scale_bus reads
-            // from (self.cpu.level()) -- not cpu_level_for_mode(self.active_mode).
-            // The two can diverge: the CPU's live level only tracks active_mode
-            // from a set_mode (Lotura 0xE1) call onward; at construction the CPU
-            // starts at its own default level until the first mode switch. Reading
-            // active_mode here would silently mispredict during that window.
+            // bus_timing's (num, den), read from the same authoritative CPU mode
+            // that scale_bus uses. Machine's active_mode copy exists for Lotura
+            // register readback and is updated in the same set_mode call.
             let (bus_num_at_batch_start, bus_den_at_batch_start) = bus_timing(self.cpu.level());
             // Test seam: open this batch's per-run prior_runs_core_clocks push log.
             #[cfg(test)]
@@ -203,7 +200,7 @@ impl Machine {
             // + 14-device fan-out that dominated the old loop.
             //
             // The batch cap is per timing class:
-            // - Accurate (286/386): exactly one DAC sample of CPU time, so the
+            // - Accurate (386): exactly one DAC sample of CPU time, so the
             //   per-clock fine-samplers stay in lockstep. BYTE-IDENTICAL
             //   contract (bench cyc/iter + aux, boot suite, device cadence):
             //   do not touch.
@@ -392,7 +389,7 @@ impl Machine {
                         // toward the cap in the Approximate class, checked at
                         // loop top so an over-budget batch does not enter one
                         // more run. APPROXIMATE ONLY: the Accurate class (frozen
-                        // 286/386) must keep not just the core-only comparison
+                        // 386) must keep not just the core-only comparison
                         // but the historical batch GEOMETRY - the old post-run
                         // check meant every batch executed at least one
                         // instruction even when the interrupt-service charge
@@ -503,7 +500,7 @@ impl Machine {
                     // in the V86 monitor (ring-0 PM), where the monitor's own device
                     // pokes are deliberately exempted from io_touched, so gating on it
                     // would miss exactly the case that fails. The Accurate class
-                    // (286/386) never accumulates this (see read_io), so it stays
+                    // (386) never accumulates this (see read_io), so it stays
                     // byte-identical; its slower clock already spans the 80 us window.
                     let step = u64::from(outcome.core_clocks)
                         + self.scale_bus(bus_clocks)

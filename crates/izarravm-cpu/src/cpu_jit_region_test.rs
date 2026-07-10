@@ -66,7 +66,7 @@ fn program_in(size: usize) -> Vec<u8> {
 
 fn fresh_cpu(ds_limit: u32) -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I586);
+    cpu.set_mode(GswMode::Gsw586);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -155,6 +155,33 @@ fn assert_identical(interp: &CpuGsw, bus_i: &TestBus, jit_cpu: &CpuGsw, bus_j: &
         (pj.brk_cap, pj.brk_step, pj.brk_halt, pj.brk_interrupt),
         "run break attribution diverged"
     );
+}
+
+#[test]
+fn switching_between_386_modes_clears_regions_stamps_and_remainders() {
+    let mut interp = fresh_cpu(u32::MAX);
+    let mut jit_cpu = fresh_cpu(u32::MAX);
+    interp.set_mode(GswMode::Gsw386);
+    jit_cpu.set_mode(GswMode::Gsw386);
+    let mut bus_i = TestBus::with_memory(program());
+    let mut bus_j = TestBus::with_memory(program());
+    let region = warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
+
+    assert_eq!(jit_cpu.jit_regions.len(), 1);
+    assert_eq!(jit_cpu.decode_cache.region_at(ENTRY, true), Some(region));
+    let mode_key = jit_cpu.jit_mode_key();
+    jit_cpu.timing_rem = 4;
+    jit_cpu.fp_rem = 7;
+    jit_cpu.jit_regions.set_auto_admit(true);
+
+    jit_cpu.set_mode(GswMode::Gsw386Slow);
+
+    assert_ne!(jit_cpu.jit_mode_key(), mode_key);
+    assert_eq!(jit_cpu.jit_regions.len(), 0);
+    assert!(jit_cpu.jit_regions.auto_admit());
+    assert_eq!(jit_cpu.decode_cache.region_at(ENTRY, true), None);
+    assert_eq!(jit_cpu.timing_rem, 0);
+    assert_eq!(jit_cpu.fp_rem, 0);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! Pure const data and const fns extracted from machine/lib.rs monolith.
 //! No state, no hot-path logic; used by CacheModel.
 
-use izarravm_cpu::CpuLevel;
+use izarravm_core::{CpuPersona, GswMode};
 
 pub(crate) const CACHE_LINE_BYTES: u32 = 64;
 pub(crate) const CACHE_L1_MAX_LINES: usize = (32 * 1024) / CACHE_LINE_BYTES as usize;
@@ -14,24 +14,11 @@ pub(crate) struct CacheGeometry {
     pub(crate) l2_bytes: u32,
 }
 
-pub(crate) const fn cache_geometry(level: CpuLevel) -> CacheGeometry {
-    match level {
-        CpuLevel::I286 => CacheGeometry {
-            l1_bytes: 0,
-            l2_bytes: 0,
-        },
-        CpuLevel::I386 => CacheGeometry {
-            l1_bytes: 0,
-            l2_bytes: 64 * 1024,
-        },
-        CpuLevel::I486 => CacheGeometry {
-            l1_bytes: 16 * 1024,
-            l2_bytes: 128 * 1024,
-        },
-        CpuLevel::I586 => CacheGeometry {
-            l1_bytes: 32 * 1024,
-            l2_bytes: 512 * 1024,
-        },
+pub(crate) const fn cache_geometry(mode: GswMode) -> CacheGeometry {
+    let geometry = mode.cache_geometry();
+    CacheGeometry {
+        l1_bytes: geometry.l1.total_kib() as u32 * 1024,
+        l2_bytes: geometry.external_kib as u32 * 1024,
     }
 }
 
@@ -42,24 +29,19 @@ pub(crate) struct TierCost {
     pub(crate) ram: u8,
 }
 
-pub(crate) const fn tier_cost(level: CpuLevel) -> TierCost {
-    match level {
-        CpuLevel::I286 => TierCost {
-            l1: 0,
-            l2: 0,
-            ram: 0,
-        },
-        CpuLevel::I386 => TierCost {
+pub(crate) const fn tier_cost(mode: GswMode) -> TierCost {
+    match mode.persona() {
+        CpuPersona::I386 => TierCost {
             l1: 0,
             l2: 0,
             ram: 3,
         },
-        CpuLevel::I486 => TierCost {
+        CpuPersona::I486 => TierCost {
             l1: 2,
             l2: 191,
             ram: 250,
         },
-        CpuLevel::I586 => TierCost {
+        CpuPersona::I586 => TierCost {
             l1: 0,
             l2: 200,
             ram: 255,
@@ -75,8 +57,8 @@ pub(crate) struct CacheLevelConfig {
 
 pub(crate) const CACHE_TIER_DISABLED_MASK: u32 = u32::MAX;
 
-pub(crate) const fn build_cache_level_config(level: CpuLevel) -> CacheLevelConfig {
-    let g = cache_geometry(level);
+pub(crate) const fn build_cache_level_config(mode: GswMode) -> CacheLevelConfig {
+    let g = cache_geometry(mode);
     let l1_lines = if g.l1_bytes == 0 {
         0
     } else {
@@ -101,26 +83,11 @@ pub(crate) const fn build_cache_level_config(level: CpuLevel) -> CacheLevelConfi
     }
 }
 
-pub(crate) const CACHE_CONFIG_286: CacheLevelConfig = build_cache_level_config(CpuLevel::I286);
-pub(crate) const CACHE_CONFIG_386: CacheLevelConfig = build_cache_level_config(CpuLevel::I386);
-pub(crate) const CACHE_CONFIG_486: CacheLevelConfig = build_cache_level_config(CpuLevel::I486);
-pub(crate) const CACHE_CONFIG_586: CacheLevelConfig = build_cache_level_config(CpuLevel::I586);
-
 #[inline(always)]
-pub(crate) const fn cache_level_config(level: CpuLevel) -> CacheLevelConfig {
-    match level {
-        CpuLevel::I286 => CACHE_CONFIG_286,
-        CpuLevel::I386 => CACHE_CONFIG_386,
-        CpuLevel::I486 => CACHE_CONFIG_486,
-        CpuLevel::I586 => CACHE_CONFIG_586,
-    }
+pub(crate) const fn cache_level_config(mode: GswMode) -> CacheLevelConfig {
+    build_cache_level_config(mode)
 }
 
-pub(crate) const fn code_fetch_ws(level: CpuLevel) -> u8 {
-    match level {
-        CpuLevel::I286 => 0,
-        CpuLevel::I386 => 0,
-        CpuLevel::I486 => 0,
-        CpuLevel::I586 => 0,
-    }
+pub(crate) const fn code_fetch_ws(_mode: GswMode) -> u8 {
+    0
 }

@@ -1090,16 +1090,14 @@ impl CpuGsw {
                 // 0x80000002..0x80000004 (the brand string); any other leaf returns all zeros,
                 // the architectural reply for an unimplemented leaf at or below the maximum.
                 //
-                // CPUID arrived on the late 486 and is standard on the 586. At the 286 and
-                // 386 guest levels it does not exist, so raise #UD. (The 286-level gate above
-                // already blocks it; this also covers the 386 level, which keeps the rest of
-                // the 0F group but still has no CPUID.) Firmware in the BIOS ROM is exempt,
+                // CPUID arrived on the late 486 and is standard on the 586. At the 386
+                // guest level it does not exist, so raise #UD. Firmware in the BIOS ROM is exempt,
                 // and so is ring-0 protected mode -- the same chipset-side-monitor exemption
                 // (and the same ASSUMPTION/revisit trigger) as the two ISA gates in
                 // read_prefixes and check_two_byte_isa_gate; without it, future ring-0
                 // monitor code executing CPUID on a sub-486 persona would die by the same
                 // unpopulated-low-vector cascade the gate exemptions fixed.
-                if !self.level.has_cpuid()
+                if matches!(self.persona(), CpuPersona::I386)
                     && !self.cs_in_firmware_rom()
                     && !self.is_ring0_protected()
                 {
@@ -1109,7 +1107,7 @@ impl CpuGsw {
                     });
                 }
                 let leaf = self.registers.eax();
-                let (l1_kb, l2_kb) = self.level.cache_kb();
+                let (l1_kb, l2_kb) = self.mode().cache_kb();
                 let (eax, ebx, ecx, edx) = match leaf {
                     0 => (
                         CPUID_MAX_BASIC_LEAF,

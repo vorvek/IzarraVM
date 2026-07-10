@@ -7,7 +7,7 @@ use super::*;
 /// timing classes are non-identity and `fp_rem` actually carries.
 fn fresh() -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I586);
+    cpu.set_mode(GswMode::Gsw586);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -371,7 +371,7 @@ fn terminator_predicate_covers_clock_device_and_interrupt_ops() {
 /// the unprefixed mov/add/shr register forms are 16-bit ops.
 fn fresh16() -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.set_level(CpuLevel::I586);
+    cpu.set_mode(GswMode::Gsw586);
     cpu.load_segment_real(SegmentIndex::Cs, 0); // default_size_32 = false
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
