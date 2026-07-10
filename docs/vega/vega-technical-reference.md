@@ -516,9 +516,12 @@ The direct DOS Glide path is verified in-game:
   Distira and renders in-game. Its Glide implementation is built into the
   executable, so no emulator-provided `GLIDE2X.OVL` is involved.
 
-Dynamic OVL validation still needs a title that demonstrably fails when
-`GLIDE2X.OVL` is absent. The current Carmageddon fixture renders without an OVL
-and has no LE import modules, so it is not evidence for the dynamic path.
+The dynamic DOS Glide path is verified with `test00.exe` from the 3dfx Glide
+2.43 SDK. The program fails at DLL loading when the OVL is absent. With a local
+Voodoo Graphics `GLIDE2X.OVL`, it opens Distira at 640x480, renders its expected
+frame, and returns exit code 0. The current Carmageddon fixture renders without
+an OVL and has no LE import modules, so it is not evidence for this path. A
+dynamic in-game corpus run is still pending.
 
 IzarraVM ships neither proprietary Glide binaries nor game data. Local OVLs
 and games remain untracked test fixtures.
