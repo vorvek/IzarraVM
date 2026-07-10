@@ -56,10 +56,12 @@ impl Vega {
         &mut self.vga
     }
 
+    #[cfg(test)]
     pub(crate) fn margo(&self) -> &Margo {
         &self.margo
     }
 
+    #[cfg(test)]
     pub(crate) fn margo_mut(&mut self) -> &mut Margo {
         &mut self.margo
     }
@@ -113,6 +115,20 @@ impl Vega {
         self.distira.disable_display();
     }
 
+    pub(crate) fn load_margo_test_pattern(&mut self) {
+        self.set_margo_mode_640x480x8();
+        let display = self.margo.display();
+        let width = display.width as usize;
+        let height = display.height as usize;
+        let pitch = display.pitch as usize;
+        let vram = self.margo.vram_mut();
+        for y in 0..height {
+            for x in 0..width {
+                vram[y * pitch + x] = ((x + y) & 0xff) as u8;
+            }
+        }
+    }
+
     pub(crate) fn active_display(&self) -> ActiveDisplay {
         if self.distira.display_enabled() {
             ActiveDisplay::Distira
@@ -129,6 +145,14 @@ impl Vega {
 
     pub(crate) fn margo_active(&self) -> bool {
         self.margo_active
+    }
+
+    pub(crate) fn active_video_mode(&self) -> VideoMode {
+        self.vga.active_mode()
+    }
+
+    pub(crate) fn frame_sequence(&self) -> u64 {
+        self.vga.frames_completed()
     }
 
     pub(crate) fn program_display_start(&mut self, start: u32) -> bool {
@@ -217,7 +241,7 @@ impl Vega {
         hz.clamp(50.0, 120.0)
     }
 
-    pub(crate) fn vga_raster(&mut self) -> Option<VgaRaster> {
+    pub(crate) fn vga_raster(&self) -> Option<VgaRaster> {
         self.vga.last_presented().cloned()
     }
 
@@ -225,7 +249,7 @@ impl Vega {
         self.vga.palette_argb()
     }
 
-    pub(crate) fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
+    pub(crate) fn frame_argb(&self) -> (Vec<u32>, usize, usize) {
         let palette = self.palette_argb();
         match self.active_display() {
             ActiveDisplay::VgaRaster => match self.vga_raster() {
@@ -250,6 +274,45 @@ impl Vega {
                 (self.distira.scanout_argb(), width, height)
             }
         }
+    }
+
+    pub(crate) fn presented_frame_argb(&self) -> (Vec<u32>, usize, usize) {
+        if self.active_display() != ActiveDisplay::VgaRaster {
+            return self.frame_argb();
+        }
+
+        let palette = self.palette_argb();
+        let Some(raster) = self.vga.last_presented() else {
+            return (vec![0], 1, 1);
+        };
+        let width = raster.width as usize;
+        let height = if raster.display_height == 0 {
+            raster.height as usize
+        } else {
+            raster.display_height as usize
+        };
+        let visible = &raster.pixels[..width.saturating_mul(height).min(raster.pixels.len())];
+        let words = visible
+            .iter()
+            .map(|&index| palette[usize::from(index)])
+            .collect();
+        (words, width, height)
+    }
+
+    pub(crate) fn capture_frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
+        if self.active_display() != ActiveDisplay::VgaRaster {
+            return self.frame_argb();
+        }
+
+        let raster = self.vga.render_full_frame();
+        let width = raster.width as usize;
+        let height = raster.display_height.min(raster.height) as usize;
+        let palette = self.palette_argb();
+        let words = raster.pixels[..width * height]
+            .iter()
+            .map(|&index| palette[usize::from(index)])
+            .collect();
+        (words, width, height)
     }
 
     pub(crate) fn frame_generation(&self) -> Option<u64> {

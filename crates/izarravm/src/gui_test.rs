@@ -91,11 +91,28 @@ fn top_up_escape_hatch_caps_edge_stops_for_a_pathological_crtc() {
     // vretrace edges inside one slice's shortfall; the defensive cap must
     // bound the peek work and consume the remainder unclamped instead of
     // livelocking the emulate thread.
-    // ROM: reset far-jumps to F000:0000 which spins forever (jmp $), so the
-    // peeks execute real instructions and never stop early.
+    // ROM: reset far-jumps to F000:0000, programs the small CRTC frame through
+    // guest I/O, then spins forever so peeks never stop early.
     let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
-    rom[0] = 0xEB; // jmp $
-    rom[1] = 0xFE;
+    let mut code = vec![0xBA, 0xD4, 0x03]; // mov dx, 03D4h
+    for (index, value) in [
+        (0x11u8, 0x0Eu8),
+        (0x07, 0x00),
+        (0x06, 18),
+        (0x12, 9),
+        (0x10, 12),
+    ] {
+        code.extend_from_slice(&[
+            0xB0, index, // mov al, index
+            0xEE,  // out dx, al
+            0x42,  // inc dx
+            0xB0, value, // mov al, value
+            0xEE,  // out dx, al
+            0x4A,  // dec dx
+        ]);
+    }
+    code.extend_from_slice(&[0xEB, 0xFE]); // jmp $
+    rom[..code.len()].copy_from_slice(&code);
     rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
     let mut machine = Machine::new(
         MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
@@ -105,18 +122,8 @@ fn top_up_escape_hatch_caps_edge_stops_for_a_pathological_crtc() {
     // Mode 13h, then shrink the frame to 20 scanlines (~0.64ms, ~1570
     // edges/s): unprotect + vretrace end 14, overflow 0, vtotal 18+2,
     // vdisp end 9+1, vretrace start 12.
-    let vga = machine.video_mut();
-    assert!(vga.set_mode(0x13));
-    for (index, value) in [
-        (0x11u8, 0x0Eu8),
-        (0x07, 0x00),
-        (0x06, 18),
-        (0x12, 9),
-        (0x10, 12),
-    ] {
-        vga.write_port(0x3D4, index);
-        vga.write_port(0x3D5, value);
-    }
+    assert!(machine.set_vga_mode(0x13));
+    let _ = machine.run_until_halt_or_cycles(1_000).unwrap();
     let asked = MASTER_CLOCK_HZ / 10; // 100ms of shortfall: ~157 edges, cap is 12
     let work_before = machine.elapsed_clocks();
     let ticks_before = machine.master_ticks();
@@ -230,13 +237,8 @@ fn logo_recolor_maps_background_to_beige_and_keeps_ink() {
 }
 
 #[test]
-fn palette_maps_indices_to_words() {
-    let pixels = [0u8, 1, 0, 1];
-    let mut palette = [0u32; 256];
-    palette[1] = 0x00AB_CDEF;
-    let words = palette_words(&pixels, &palette);
-    assert_eq!(words.len(), 4);
-    assert_eq!(words[1], 0x00AB_CDEF);
+fn framebuffer_words_pack_into_rgba() {
+    let words = [0, 0x00AB_CDEF, 0, 0x00AB_CDEF];
     let rgba = words_to_rgba(&words, 2, 2);
     assert_eq!(rgba.len(), 16);
     // Pixel 1 is 0x00ABCDEF -> R=AB, G=CD, B=EF, A=FF.

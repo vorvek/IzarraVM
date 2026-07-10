@@ -7,7 +7,7 @@ use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
 use izarravm_input::HostKeyboard;
-use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
+use izarravm_machine::{Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use std::cell::Cell;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -124,11 +124,6 @@ fn words_to_rgba(words: &[u32], width: usize, height: usize) -> Vec<u8> {
     rgba
 }
 
-/// Map palette-indexed pixels (mode 13h, the VGA raster core) to 0x00RRGGBB words.
-fn palette_words(pixels: &[u8], palette: &[u32; 256]) -> Vec<u32> {
-    pixels.iter().map(|&i| palette[i as usize]).collect()
-}
-
 /// Refill the pacing credit by the wall time elapsed this slice, capping the
 /// backlog at `cap`. The cap forgives a long host stall (the OS starving the
 /// thread) instead of banking it, so the guest never sprints above realtime to
@@ -225,45 +220,6 @@ fn top_up_shortfall(machine: &mut Machine, mut remaining: u64) -> TopUp {
     TopUp {
         topped_up_ticks,
         peeked_ticks,
-    }
-}
-
-/// The active display as native-resolution 0x00RRGGBB words plus its size.
-fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
-    match machine.active_display() {
-        ActiveDisplay::VgaRaster => {
-            let palette = machine.palette_argb();
-            match machine.vga_raster() {
-                Some(raster) => {
-                    // Present only the active visible region. `height` is the full
-                    // beam frame (vtotal) including the vertical retrace/border the
-                    // monitor never shows; cropping to the top `display_height`
-                    // (vdisp_end) rows is what makes the aspect-fill correct; it
-                    // drops the black bottom bar a 320x200 mode would otherwise bake
-                    // into the stretched image.
-                    let w = raster.width as usize;
-                    let h = if raster.display_height == 0 {
-                        raster.height as usize
-                    } else {
-                        raster.display_height as usize
-                    };
-                    let visible = &raster.pixels[..(w * h).min(raster.pixels.len())];
-                    (palette_words(visible, &palette), w, h)
-                }
-                None => (vec![0x0000_0000], 1, 1),
-            }
-        }
-        ActiveDisplay::MargoLfb => {
-            let palette = machine.palette_argb();
-            let margo = machine.margo();
-            let display = margo.display();
-            (
-                margo.scanout_argb(&palette),
-                display.width as usize,
-                display.height as usize,
-            )
-        }
-        ActiveDisplay::Distira => machine.frame_argb(),
     }
 }
 
@@ -961,7 +917,7 @@ fn emulate(
         machine.load_cmos(&cmos);
     }
     if test_pattern {
-        load_margo_test_pattern(&mut machine);
+        machine.load_margo_test_pattern();
     }
 
     let mut wavetable = MidiEngine::open_wavetable(&midi_config);
@@ -994,7 +950,7 @@ fn emulate(
     // Dirty-framebuffer cache (graphics modes only, v1): the content-generation key
     // of the last frame we palette-mapped + published. The guest's vsync counter
     // (`seq`) advances every retrace even on a totally static mode-13h screen, which
-    // would re-run the 64 KB palette map (`render_words`) ~70x/s for nothing. When
+    // would re-run the 64 KB palette conversion ~70x/s for nothing. When
     // `frame_generation()` returns `Some(k)` and k is unchanged, the graphics output
     // cannot have changed, so we skip the render + publish: `f.seq` stays put, so the
     // UI's existing per-seq texture-upload guard skips the upload too. `None` (text
@@ -1163,7 +1119,7 @@ fn emulate(
 
         // Publish: clone the framebuffer only when the guest presents a new
         // frame; refresh the light fields every pass so the readout stays live.
-        let seq = machine.video().frames_completed();
+        let seq = machine.frame_sequence();
         // Dirty-framebuffer guard: in a graphics mode whose content key is unchanged
         // since the last published frame, the output is bit-identical, so skip the
         // palette map + publish even though `seq` advanced. `None` (text/Margo/
@@ -1171,7 +1127,7 @@ fn emulate(
         let frame_gen = machine.frame_generation();
         let content_unchanged = matches!((frame_gen, last_frame_gen), (Some(k), Some(p)) if k == p);
         let new_frame = seq != published_seq && !content_unchanged;
-        let rendered = new_frame.then(|| render_words(&mut machine));
+        let rendered = new_frame.then(|| machine.presented_frame_argb());
         let serial = new_frame.then(|| machine.serial_text());
         let mode = machine.active_mode();
         let refresh_hz = machine.display_refresh_hz();
@@ -2966,22 +2922,6 @@ fn host_lock_on(vk: i32) -> Option<bool> {
 #[cfg(not(target_os = "windows"))]
 fn host_lock_on(_vk: i32) -> Option<bool> {
     None
-}
-
-/// Fill the Margo LFB with a diagonal gradient. Debug aid behind
-/// --margo-test-pattern; not reapplied automatically other than on Start/Reset.
-fn load_margo_test_pattern(machine: &mut Machine) {
-    machine.set_margo_mode_640x480x8();
-    let display = machine.margo().display();
-    let width = display.width as usize;
-    let height = display.height as usize;
-    let pitch = display.pitch as usize;
-    let vram = machine.margo_mut().vram_mut();
-    for y in 0..height {
-        for x in 0..width {
-            vram[y * pitch + x] = ((x + y) & 0xff) as u8;
-        }
-    }
 }
 
 #[cfg(test)]

@@ -21,12 +21,13 @@ pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
 #[cfg(test)]
 use izarravm_video::HGC_FB_SIZE;
-pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, MARGO_VBE_MODES, Margo, TextFrame, VGA_PLANAR_WINDOW_SIZE,
-    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, font,
-    pixel_format, vbe_mode,
+    CGA_FB_SIZE, DAC_ENTRIES, MARGO_VBE_MODES, TextFrame, VGA_PLANAR_WINDOW_SIZE,
+    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, bytes_per_pixel, font, pixel_format, vbe_mode,
 };
+pub use izarravm_video::{MARGO_ID_VALUE, VideoMode};
+#[cfg(test)]
+use izarravm_video::{Margo, Vga, VgaRaster};
 use thiserror::Error;
 
 mod ata;

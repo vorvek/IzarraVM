@@ -12,19 +12,23 @@ impl Machine {
         self.vega.is_graphics_mode()
     }
 
-    pub fn margo(&self) -> &Margo {
+    #[cfg(test)]
+    pub(crate) fn margo(&self) -> &Margo {
         self.vega.margo()
     }
 
-    pub fn margo_mut(&mut self) -> &mut Margo {
+    #[cfg(test)]
+    pub(crate) fn margo_mut(&mut self) -> &mut Margo {
         self.vega.margo_mut()
     }
 
-    pub fn video(&self) -> &Vga {
+    #[cfg(test)]
+    pub(crate) fn video(&self) -> &Vga {
         self.vega.legacy()
     }
 
-    pub fn video_mut(&mut self) -> &mut Vga {
+    #[cfg(test)]
+    pub(crate) fn video_mut(&mut self) -> &mut Vga {
         self.vega.legacy_mut()
     }
 
@@ -2298,8 +2302,15 @@ impl Machine {
         self.set_vbe_status(0x004f);
     }
 
-    pub fn set_margo_mode_640x480x8(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn set_margo_mode_640x480x8(&mut self) {
         self.vega.set_margo_mode_640x480x8();
+    }
+
+    /// Select Margo's 640x480x8 output and fill it with the built-in diagonal
+    /// gradient used by the command-line debug option.
+    pub fn load_margo_test_pattern(&mut self) {
+        self.vega.load_margo_test_pattern();
     }
 
     pub fn active_display(&self) -> ActiveDisplay {
@@ -2307,6 +2318,17 @@ impl Machine {
         // through the core. VEGA also exposes Margo's linear framebuffer and
         // Distira's Voodoo-style front buffer as alternate scanout paths.
         self.vega.active_display()
+    }
+
+    /// The active mode of the legacy VGA-compatible scanout path.
+    pub fn active_video_mode(&self) -> VideoMode {
+        self.vega.active_video_mode()
+    }
+
+    /// Monotonic legacy timing sequence used by the host renderer to pace frame
+    /// publication without borrowing the VGA implementation.
+    pub fn frame_sequence(&self) -> u64 {
+        self.vega.frame_sequence()
     }
 
     /// Emulated vertical refresh of the active display, in Hz. The host uses
@@ -2319,19 +2341,34 @@ impl Machine {
         self.vega.display_refresh_hz()
     }
 
-    pub fn vga_raster(&mut self) -> Option<VgaRaster> {
+    #[cfg(test)]
+    pub(crate) fn vga_raster(&self) -> Option<VgaRaster> {
         self.vega.vga_raster()
     }
 
-    pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
+    #[cfg(test)]
+    pub(crate) fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
         self.vega.palette_argb()
     }
 
     /// The active display as native-resolution `0x00RRGGBB` words plus
-    /// `(width, height)`. Mirrors the GUI's scanout so the unit tester's CRC and
-    /// snapshot see exactly what is presented on screen.
-    pub fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
+    /// `(width, height)`. Legacy VGA keeps the complete beam raster here for
+    /// unit-tester CRC compatibility, including rows outside the visible image.
+    pub fn frame_argb(&self) -> (Vec<u32>, usize, usize) {
         self.vega.frame_argb()
+    }
+
+    /// The most recently completed display frame, cropped exactly as the GUI
+    /// presents it and converted to native `0x00RRGGBB` words.
+    pub fn presented_frame_argb(&self) -> (Vec<u32>, usize, usize) {
+        self.vega.presented_frame_argb()
+    }
+
+    /// Render the current display state immediately for a headless capture.
+    /// Legacy VGA output is cropped to its visible rows; accelerated scanouts
+    /// use their current front buffers.
+    pub fn capture_frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
+        self.vega.capture_frame_argb()
     }
 
     /// An O(1) content-generation key for the host-side dirty-framebuffer cache.

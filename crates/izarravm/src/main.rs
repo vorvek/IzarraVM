@@ -860,7 +860,7 @@ fn print_dump_result(machine: &mut Machine, stop_reason: &StopReason) {
 fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<dyn Error>> {
     use std::io::Write;
 
-    let (pixels, width, height) = active_frame_words(machine);
+    let (pixels, width, height) = machine.capture_frame_argb();
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     write!(out, "P6\n{width} {height}\n255\n")?;
     for color in pixels {
@@ -869,27 +869,10 @@ fn write_framebuffer_ppm(machine: &mut Machine, path: &Path) -> Result<(), Box<d
     Ok(())
 }
 
-fn active_frame_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
-    match machine.active_display() {
-        ActiveDisplay::VgaRaster => {
-            let raster = machine.video_mut().render_full_frame();
-            let width = raster.width as usize;
-            let height = raster.display_height.min(raster.height) as usize;
-            let palette = machine.palette_argb();
-            let pixels = raster.pixels[..width * height]
-                .iter()
-                .map(|&index| palette[usize::from(index)])
-                .collect();
-            (pixels, width, height)
-        }
-        ActiveDisplay::MargoLfb | ActiveDisplay::Distira => machine.frame_argb(),
-    }
-}
-
 /// After a headless run, report the active scanout and whether it holds meaningful
 /// content. Legacy text mode also includes the 80x25 page.
 fn print_video_summary(machine: &mut Machine) {
-    use izarravm_video::VideoMode;
+    use izarravm_machine::VideoMode;
 
     let active_display = machine.active_display();
     let display_name = match active_display {
@@ -900,7 +883,7 @@ fn print_video_summary(machine: &mut Machine) {
     println!("active display: {display_name}");
 
     if active_display == ActiveDisplay::VgaRaster {
-        let mode = machine.video().active_mode();
+        let mode = machine.active_video_mode();
         let mode_name = match mode {
             VideoMode::Text => "text (03h)",
             VideoMode::Mode13h => "mode 13h (320x200x256)",
@@ -922,7 +905,7 @@ fn print_video_summary(machine: &mut Machine) {
         }
     }
 
-    let (pixels, width, height) = active_frame_words(machine);
+    let (pixels, width, height) = machine.capture_frame_argb();
     let total = pixels.len();
     let nonzero = pixels.iter().filter(|&&pixel| pixel != 0).count();
     println!("framebuffer: {width}x{height} ({total} px)");
