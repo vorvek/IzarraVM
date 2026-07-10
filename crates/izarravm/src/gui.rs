@@ -1348,6 +1348,16 @@ fn optional_path(text: &str) -> Option<PathBuf> {
     (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
+fn cpu_mode_label(mode: GswMode) -> String {
+    let clock = mode.clock_rate();
+    let mhz = clock.as_hz_f64() / 1_000_000.0;
+    let precision = if clock.denominator() == 1 { 0 } else { 2 };
+    format!(
+        "GSW-586 - {} mode - {mhz:.precision$} MHz",
+        mode.canonical_name()
+    )
+}
+
 fn midi_backend_label(backend: MidiBackend) -> &'static str {
     match backend {
         MidiBackend::Off => "Off",
@@ -1942,14 +1952,7 @@ impl GuiApp {
                 };
                 // CPU and mode line, with the COM1 toggle aligned to its right.
                 ui.horizontal(|ui| {
-                    line(
-                        ui,
-                        format!(
-                            "GSW-586 - {} mode - {} MHz",
-                            mode.canonical_name(),
-                            mode.clock_hz() / 1_000_000
-                        ),
-                    );
+                    line(ui, cpu_mode_label(mode));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if info_button(ui).on_hover_text("About").clicked() {
                             self.show_about = true;

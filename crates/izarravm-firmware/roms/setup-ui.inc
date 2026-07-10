@@ -520,7 +520,7 @@ su_cursor_inc:
 
 ; su_edit_left / su_edit_right: Left/Right on the main menu edit the inline rows.
 ; LAYOUT cycles the keyboard layout 0..16. GSW cycles the four modes
-; (386/486/586/386-slow), wrapping after the bootbox SSlow row.
+; (386/486/586/386-slow), wrapping after the bootbox 386-slow row.
 ; Other rows are not inline-editable, so the keys are ignored there. DS = 0. Clobbers
 ; AX, BX.
 su_edit_left:

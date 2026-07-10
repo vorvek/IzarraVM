@@ -4,6 +4,18 @@
 use super::*;
 
 #[test]
+fn cpu_mode_label_preserves_fractional_clock_rates() {
+    assert_eq!(
+        cpu_mode_label(GswMode::Gsw386Slow),
+        "GSW-586 - 386-slow mode - 7.33 MHz"
+    );
+    assert_eq!(
+        cpu_mode_label(GswMode::Gsw586),
+        "GSW-586 - 586 mode - 200 MHz"
+    );
+}
+
+#[test]
 fn volume_gain_is_cubic_and_clamped() {
     // Endpoints are exact: silence at 0, unity at full.
     assert_eq!(volume_gain(0.0), 0.0);
