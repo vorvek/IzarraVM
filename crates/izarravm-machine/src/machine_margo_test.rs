@@ -73,7 +73,120 @@ fn vbe_current_mode_returns_the_set_mode() {
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    assert_eq!(machine.cpu().registers.ebx() as u16, 0x4101);
+}
+
+#[test]
+fn vbe_banked_window_set_get_and_boundary_round_trip_in_guest() {
+    let rom = rom_with_code(&[
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xd8, // mov ds, ax
+        0xb8, 0x13, 0x00, // mov ax, 0013h
+        0xcd, 0x10, // int 10h
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h (banked)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x00, 0xa0, // mov ax, A000h
+        0x8e, 0xc0, // mov es, ax
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0x31, 0xdb, // xor bx, bx (set window A)
+        0x31, 0xd2, // xor dx, dx (bank 0)
+        0xcd, 0x10, // int 10h
+        0x26, 0xc6, 0x06, 0xff, 0xff, 0x11, // mov byte [es:FFFFh], 11h
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0x31, 0xdb, // xor bx, bx
+        0xba, 0x01, 0x00, // mov dx, 1
+        0xcd, 0x10, // int 10h
+        0x26, 0xc6, 0x06, 0x00, 0x00, 0x22, // mov byte [es:0000h], 22h
+        0x26, 0xa0, 0x00, 0x00, // mov al, [es:0000h]
+        0xa2, 0x00, 0x05, // mov [0500h], al
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0xbb, 0x00, 0x01, // mov bx, 0100h (get window A)
+        0xcd, 0x10, // int 10h
+        0x89, 0x16, 0x02, 0x05, // mov [0502h], dx
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0x31, 0xdb, // xor bx, bx
+        0x31, 0xd2, // xor dx, dx
+        0xcd, 0x10, // int 10h
+        0x26, 0xa0, 0xff, 0xff, // mov al, [es:FFFFh]
+        0xa2, 0x01, 0x05, // mov [0501h], al
+        0xb8, 0x03, 0x4f, // mov ax, 4F03h
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.read_physical_u8(0x0500), 0x22);
+    assert_eq!(machine.read_physical_u8(0x0501), 0x11);
+    assert_eq!(read_u16(&mut machine, 0x0502), 1);
+    assert_eq!(machine.margo().read_vram_u8(0xffff), 0x11);
+    assert_eq!(machine.margo().read_vram_u8(0x1_0000), 0x22);
+    assert_eq!(machine.video().cpu_read_chain4(0), 0);
+    assert_eq!(machine.video().cpu_read_chain4(0xffff), 0);
     assert_eq!(machine.cpu().registers.ebx() as u16, 0x0101);
+}
+
+#[test]
+fn vbe_banked_window_outside_vram_reads_open_bus() {
+    let rom = rom_with_code(&[
+        0x31, 0xc0, // xor ax, ax
+        0x8e, 0xd8, // mov ds, ax
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x01, // mov bx, 0101h (banked)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x00, 0xa0, // mov ax, A000h
+        0x8e, 0xc0, // mov es, ax
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0x31, 0xdb, // xor bx, bx
+        0xba, 0x40, 0x00, // mov dx, 64 (one bank past 4 MiB)
+        0xcd, 0x10, // int 10h
+        0x26, 0xc6, 0x06, 0x00, 0x00, 0x66, // mov byte [es:0000h], 66h
+        0x26, 0xa0, 0x00, 0x00, // mov al, [es:0000h]
+        0xa2, 0x00, 0x05, // mov [0500h], al
+        0xb8, 0x05, 0x4f, // mov ax, 4F05h
+        0xbb, 0x00, 0x01, // mov bx, 0100h (get window A)
+        0xcd, 0x10, // int 10h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+    assert_eq!(machine.cpu().registers.edx() as u16, 64);
+    assert_eq!(machine.read_physical_u8(0x0500), 0xff);
+    assert_eq!(machine.margo().read_vram_u8(0), 0);
+}
+
+#[test]
+fn vbe_linear_mode_keeps_a000_on_vga_and_the_lfb_on_margo() {
+    let rom = rom_with_code(&[
+        0xb8, 0x13, 0x00, // mov ax, 0013h
+        0xcd, 0x10, // int 10h
+        0xb8, 0x02, 0x4f, // mov ax, 4F02h
+        0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h (linear)
+        0xcd, 0x10, // int 10h
+        0xb8, 0x00, 0xa0, // mov ax, A000h
+        0x8e, 0xc0, // mov es, ax
+        0x26, 0xc6, 0x06, 0x00, 0x00, 0x77, // mov byte [es:0000h], 77h
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.video().cpu_read_chain4(0), 0x77);
+    assert_eq!(machine.margo().read_vram_u8(0), 0);
+    machine.write_physical_u8(MARGO_LFB_BASE, 0x88);
+    assert_eq!(machine.margo().read_vram_u8(0), 0x88);
 }
 
 #[test]
@@ -222,11 +335,44 @@ fn vbe_mode_info_fills_the_block() {
     assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
 
     let base = 0x40000;
+    assert_eq!(machine.read_physical_u8(base + 0x02), 0x07); // WinA: present, read/write
+    assert_eq!(machine.read_physical_u8(base + 0x03), 0); // WinB absent
+    assert_eq!(read_u16(&mut machine, base + 0x04), 64); // WinGranularity, KiB
+    assert_eq!(read_u16(&mut machine, base + 0x06), 64); // WinSize, KiB
+    assert_eq!(read_u16(&mut machine, base + 0x08), 0xa000); // WinASegment
+    assert_eq!(read_u16(&mut machine, base + 0x0a), 0); // WinBSegment
+    assert_eq!(read_u32(&mut machine, base + 0x0c), 0); // no direct ROM bank thunk
     assert_eq!(read_u16(&mut machine, base + 0x10), 640); // BytesPerScanLine
     assert_eq!(read_u16(&mut machine, base + 0x12), 640); // XResolution
     assert_eq!(read_u16(&mut machine, base + 0x14), 480); // YResolution
     assert_eq!(machine.read_physical_u8(base + 0x19), 8); // BitsPerPixel
     assert_eq!(read_u32(&mut machine, base + 0x28), MARGO_LFB_BASE); // PhysBasePtr
+}
+
+#[test]
+fn tomb_shaped_vbe_granularity_divisor_is_nonzero() {
+    let rom = rom_with_code(&[
+        0xb8, 0x00, 0x40, // mov ax, 4000h
+        0x8e, 0xc0, // mov es, ax
+        0xbf, 0x00, 0x00, // mov di, 0
+        0xb8, 0x01, 0x4f, // mov ax, 4F01h
+        0xb9, 0x01, 0x01, // mov cx, 0101h
+        0xcd, 0x10, // int 10h
+        0x26, 0x8b, 0x5d, 0x04, // mov bx, [es:di+WinGranularity]
+        0xb8, 0x00, 0x01, // mov ax, 256
+        0x31, 0xd2, // xor dx, dx
+        0xf7, 0xf3, // div bx
+        0xf4, // hlt
+    ]);
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+        StopReason::Halted
+    );
+    assert_eq!(machine.cpu().registers.ebx() as u16, 64);
+    assert_eq!(machine.cpu().registers.eax() as u16, 4);
+    assert_eq!(machine.cpu().registers.edx() as u16, 0);
 }
 
 #[test]

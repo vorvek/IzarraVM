@@ -2003,6 +2003,7 @@ impl Machine {
             0x01 => self.vbe_mode_info(),
             0x02 => self.vbe_set_mode(),
             0x03 => self.vbe_current_mode(),
+            0x05 => self.vbe_window_control(),
             0x07 => self.vbe_display_start(),
             0x08 => self.vbe_dac_format(),
             0x09 => self.vbe_palette_data(),
@@ -2047,9 +2048,12 @@ impl Machine {
     }
 
     fn vbe_set_mode(&mut self) {
-        let mode = self.cpu.registers.ebx() as u16 & 0x01ff;
+        let request = self.cpu.registers.ebx() as u16;
+        let mode = request & 0x01ff;
         if self.margo.set_mode(mode) {
             self.margo_active = true;
+            self.margo_linear = request & 0x4000 != 0;
+            self.margo_bank = 0;
             self.video.set_dac_component_bits(6);
             self.set_vbe_status(0x004f);
         } else {
@@ -2059,13 +2063,42 @@ impl Machine {
 
     fn vbe_current_mode(&mut self) {
         let mode = if self.margo_active {
-            self.margo.display().mode
+            self.margo.display().mode | if self.margo_linear { 0x4000 } else { 0 }
         } else {
             0x0003 // VBE mode 0003h: standard 80x25 text fallback
         };
         let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
         self.cpu.registers.set_ebx(ebx);
         self.set_vbe_status(0x004f);
+    }
+
+    fn vbe_window_control(&mut self) {
+        if !self.margo_active {
+            self.set_vbe_status(0x014f);
+            return;
+        }
+        if self.margo_linear {
+            self.set_vbe_status(0x034f);
+            return;
+        }
+
+        let bx = self.cpu.registers.ebx() as u16;
+        if bx as u8 != 0 {
+            self.set_vbe_status(0x014f);
+            return;
+        }
+        match (bx >> 8) as u8 {
+            0x00 => {
+                self.margo_bank = self.cpu.registers.edx() as u16;
+                self.set_vbe_status(0x004f);
+            }
+            0x01 => {
+                let edx = (self.cpu.registers.edx() & 0xffff_0000) | u32::from(self.margo_bank);
+                self.cpu.registers.set_edx(edx);
+                self.set_vbe_status(0x004f);
+            }
+            _ => self.set_vbe_status(0x014f),
+        }
     }
 
     fn vbe_display_start(&mut self) {
@@ -2205,11 +2238,18 @@ impl Machine {
         let pitch = (info.width * bytes_per_pixel(info.bpp)) as u16;
         let mut block = [0u8; 256];
         block[0x00..0x02].copy_from_slice(&0x009bu16.to_le_bytes()); // ModeAttributes: supported, color, graphics, linear-fb
+        block[0x02] = 0x07; // WinAAttributes: present, readable, writable
+        block[0x04..0x06].copy_from_slice(&64u16.to_le_bytes()); // WinGranularity in KiB
+        block[0x06..0x08].copy_from_slice(&64u16.to_le_bytes()); // WinSize in KiB
+        block[0x08..0x0a].copy_from_slice(&0xa000u16.to_le_bytes()); // WinASegment
+        // WinB is absent. WinFuncPtr remains null because this HLE exposes bank
+        // switching through INT 10h 4F05h, not a directly callable ROM thunk.
         block[0x10..0x12].copy_from_slice(&pitch.to_le_bytes()); // BytesPerScanLine
         block[0x12..0x14].copy_from_slice(&(info.width as u16).to_le_bytes()); // XResolution
         block[0x14..0x16].copy_from_slice(&(info.height as u16).to_le_bytes()); // YResolution
         block[0x18] = 1; // NumberOfPlanes
         block[0x19] = info.bpp as u8; // BitsPerPixel
+        block[0x1a] = 1; // NumberOfBanks for packed-pixel modes
         block[0x1b] = 4; // MemoryModel: packed pixel
         if let Some(fmt) = pixel_format(info.bpp) {
             block[0x1f] = fmt.r.size as u8; // RedMaskSize
@@ -2230,6 +2270,8 @@ impl Machine {
     pub fn set_margo_mode_640x480x8(&mut self) {
         self.margo.set_mode_640x480x8();
         self.margo_active = true;
+        self.margo_linear = true;
+        self.margo_bank = 0;
         self.distira.disable_display();
     }
 
