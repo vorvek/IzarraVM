@@ -146,6 +146,9 @@ fn conductor_requests_apply_tempo_on_the_requested_pulse() {
         0xf9,
         "the conductor asks for its next command"
     );
+    for value in [1, 0x8f] {
+        mpu.write_data(value, mpu.now_tick);
+    }
     assert_eq!(
         mpu.ticks_until_event(),
         Some(CLOCK_NUMERATOR.div_ceil(120 * 200) as u64),
@@ -183,6 +186,97 @@ fn stop_playback_acknowledges_and_silences_every_channel() {
     for channel in 0..16 {
         assert_eq!(take_bytes(&mut mpu), [0xb0 | channel, 123, 0]);
     }
+}
+
+#[test]
+fn uart_mode_gates_pending_intelligent_playback() {
+    let mut mpu = Mpu401::default();
+    let pulse = arm_tracks(&mut mpu, 1);
+    submit_note(&mut mpu, 1, 60, 100);
+
+    acknowledged(&mut mpu, ENTER_UART);
+    assert!(mpu.is_uart());
+    assert!(!mpu.is_playing());
+    assert_eq!(mpu.ticks_until_event(), None);
+    mpu.advance_to(pulse * 8);
+    assert!(mpu.take_message().is_none());
+    assert_eq!(mpu.status(), RX_EMPTY);
+
+    for byte in [0x90, 61, 90] {
+        mpu.write_data(byte, pulse * 8);
+    }
+    let message = mpu.take_message().expect("UART message");
+    assert_eq!(message.bytes, [0x90, 61, 90]);
+    assert_eq!(message.guest_tick, pulse * 8);
+}
+
+#[test]
+fn clear_play_map_does_not_apply_configured_tracks_or_conductor() {
+    let mut mpu = Mpu401::default();
+    acknowledged(&mut mpu, 0xec);
+    mpu.write_data(1, 0);
+    acknowledged(&mut mpu, 0x8f);
+    acknowledged(&mut mpu, 0xb9);
+    acknowledged(&mut mpu, 0x08);
+
+    assert_eq!(mpu.ticks_until_event(), None);
+    let dormant_pulse = CLOCK_NUMERATOR.div_ceil(120 * 100) as u64;
+    mpu.advance_to(dormant_pulse * 4);
+    assert_eq!(mpu.status(), RX_EMPTY);
+
+    acknowledged(&mut mpu, 0xb8);
+    let pulse = mpu.ticks_until_event().expect("B8 applies the play map");
+    mpu.advance_to(mpu.now_tick + pulse);
+    assert_eq!(mpu.read_data(), 0xf0);
+    mpu.write_data(0xf0, mpu.now_tick);
+    assert_eq!(mpu.read_data(), 0xf9);
+}
+
+#[test]
+fn reset_preserves_completed_output_and_appends_a_timed_silence() {
+    let mut mpu = Mpu401::default();
+    for byte in [0x90, 60, 100] {
+        mpu.write_data(byte, 7);
+    }
+
+    mpu.write_command_at(RESET, 11);
+    assert_eq!(mpu.read_data_at(11), ACK);
+    let note = mpu.take_message().expect("pre-reset note");
+    assert_eq!(note.bytes, [0x90, 60, 100]);
+    assert_eq!(note.guest_tick, 7);
+    let reset = mpu.take_message().expect("MIDI reset");
+    assert_eq!(reset.bytes, [RESET]);
+    assert_eq!(reset.guest_tick, 11);
+    for channel in 0..16 {
+        let silence = mpu.take_message().expect("all-notes-off");
+        assert_eq!(silence.bytes, [0xb0 | channel, 123, 0]);
+        assert_eq!(silence.guest_tick, 11);
+    }
+    assert!(mpu.take_message().is_none());
+}
+
+#[test]
+fn track_counters_pause_until_the_active_request_is_complete() {
+    let mut mpu = Mpu401::default();
+    let pulse = arm_tracks(&mut mpu, 0b11);
+    submit_note(&mut mpu, 2, 60, 100);
+
+    assert_eq!(mpu.read_data(), 0xf1);
+    for value in [10, 0x90, 65] {
+        mpu.write_data(value, mpu.now_tick);
+    }
+    let held_at = mpu.now_tick;
+    mpu.advance_to(held_at + pulse * 5);
+    assert!(mpu.take_message().is_none());
+
+    mpu.write_data(100, mpu.now_tick);
+    let released_at = mpu.now_tick;
+    mpu.advance_to(released_at + pulse * 2 - 1);
+    assert!(mpu.take_message().is_none());
+    mpu.advance_to(released_at + pulse * 2);
+    let note = mpu.take_message().expect("track 0 note after request EOI");
+    assert_eq!(note.bytes, [0x90, 60, 100]);
+    assert_eq!(note.guest_tick, released_at + pulse * 2);
 }
 
 #[test]

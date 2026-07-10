@@ -249,7 +249,7 @@ impl Mpu401 {
                 self.pending_parameter = Some(PendingParameter::Discard);
             }
             RESET => {
-                self.reset_protocol();
+                self.reset_protocol(guest_tick);
                 if acknowledge {
                     self.queue_response(&[ACK]);
                 }
@@ -264,13 +264,15 @@ impl Mpu401 {
 
     pub fn write_data(&mut self, value: u8, guest_tick: u64) {
         self.advance_to(guest_tick);
-        if let Some(parameter) = self.pending_parameter.take() {
-            self.apply_parameter(parameter, value);
-            return;
-        }
-        if self.request.is_some() {
-            self.feed_request(value, guest_tick);
-            return;
+        if self.mode == MpuMode::Intelligent {
+            if let Some(parameter) = self.pending_parameter.take() {
+                self.apply_parameter(parameter, value);
+                return;
+            }
+            if self.request.is_some() {
+                self.feed_request(value, guest_tick);
+                return;
+            }
         }
 
         let mut completed = Vec::new();
@@ -282,22 +284,26 @@ impl Mpu401 {
 
     pub fn advance_to(&mut self, target_tick: u64) {
         while self.now_tick < target_tick {
-            let pulse_ticks = self.playing.then(|| self.ticks_until_clock_pulse());
-            let immediate_ticks = self
-                .immediate
-                .as_ref()
-                .map(|event| event.due_tick.saturating_sub(self.now_tick).max(1));
+            let intelligent = self.mode == MpuMode::Intelligent;
+            let pulse_ticks = (intelligent && self.playing).then(|| self.ticks_until_clock_pulse());
+            let immediate_ticks = if intelligent {
+                self.immediate
+                    .as_ref()
+                    .map(|event| event.due_tick.saturating_sub(self.now_tick).max(1))
+            } else {
+                None
+            };
             let Some(step) = pulse_ticks.into_iter().chain(immediate_ticks).min() else {
                 self.now_tick = target_tick;
                 return;
             };
             let step = step.min(target_tick - self.now_tick);
-            if self.playing {
+            if intelligent && self.playing {
                 self.clock_phase += u128::from(step) * self.clock_rate();
             }
             self.now_tick += step;
 
-            let pulse_due = self.playing && self.clock_phase >= CLOCK_NUMERATOR;
+            let pulse_due = intelligent && self.playing && self.clock_phase >= CLOCK_NUMERATOR;
             if pulse_due {
                 self.clock_phase -= CLOCK_NUMERATOR;
                 self.clock_tick();
@@ -314,12 +320,15 @@ impl Mpu401 {
     }
 
     pub fn ticks_until_event(&self) -> Option<u64> {
+        if self.mode == MpuMode::Uart {
+            return None;
+        }
         let immediate = self
             .immediate
             .as_ref()
             .map(|event| event.due_tick.saturating_sub(self.now_tick).max(1));
         let clock = (self.playing
-            && self.input.is_empty()
+            && !self.sequencer_blocked()
             && (self.active_tracks != 0 || self.conductor_active))
             .then(|| self.ticks_until_clock_pulse());
         immediate.into_iter().chain(clock).min()
@@ -338,7 +347,7 @@ impl Mpu401 {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.playing
+        self.mode == MpuMode::Intelligent && self.playing
     }
 
     pub fn timebase(&self) -> u16 {
@@ -394,19 +403,23 @@ impl Mpu401 {
     }
 
     fn clear_play_map(&mut self, guest_tick: u64) {
-        self.clear_play_counters();
+        self.pending_requests = 0;
+        self.request = None;
+        self.immediate = None;
         for track in &mut self.tracks {
-            track.running_status = None;
+            track.counter = 0;
+            track.event = None;
         }
+        self.conductor.counter = 0;
+        self.conductor.event = None;
         for channel in 0..16 {
             self.queue_output(guest_tick, vec![0xb0 | channel, 123, 0]);
         }
     }
 
-    fn reset_protocol(&mut self) {
+    fn reset_protocol(&mut self, guest_tick: u64) {
         self.mode = MpuMode::Intelligent;
         self.input.clear();
-        self.output.clear();
         self.parser.reset();
         self.timebase = 120;
         self.tempo = 100;
@@ -422,6 +435,10 @@ impl Mpu401 {
         self.request = None;
         self.immediate = None;
         self.clock_phase = 0;
+        self.queue_output(guest_tick, vec![RESET]);
+        for channel in 0..16 {
+            self.queue_output(guest_tick, vec![0xb0 | channel, 123, 0]);
+        }
     }
 
     fn restart_clock(&mut self) {
@@ -551,7 +568,7 @@ impl Mpu401 {
     }
 
     fn clock_tick(&mut self) {
-        if !self.input.is_empty() {
+        if self.sequencer_blocked() {
             return;
         }
         for track in 0..8u8 {
@@ -626,7 +643,8 @@ impl Mpu401 {
     }
 
     fn issue_next_request(&mut self) {
-        if !self.playing
+        if self.mode != MpuMode::Intelligent
+            || !self.playing
             || !self.input.is_empty()
             || self.request.is_some()
             || self.immediate.is_some()
@@ -665,6 +683,10 @@ impl Mpu401 {
 
     fn clock_rate(&self) -> u128 {
         u128::from(self.timebase) * u128::from(self.tempo)
+    }
+
+    fn sequencer_blocked(&self) -> bool {
+        !self.input.is_empty() || self.request.is_some() || self.immediate.is_some()
     }
 
     fn ticks_until_clock_pulse(&self) -> u64 {
