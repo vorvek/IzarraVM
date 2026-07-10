@@ -9,14 +9,17 @@ use izarravm_machine::{
 };
 use izarravm_video::{
     ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
-    DACDATA_ADDR_SHIFT, DACDATA_RD, DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK,
-    FBZ_RGB_WMASK, FBZCP_TEXTURE_ENABLED, INIT_ENABLE_REMAP, LFB_ENABLE_PIXEL_PIPELINE,
-    LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565, LFB_READ_BACK, LFB_WRITE_BACK, SST_ALPHA_MODE,
+    DACDATA_ADDR_SHIFT, DACDATA_RD, DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH,
+    FBIINIT1_TILES_IN_X_SHIFT, FBIINIT2_BUFFER_OFFSET_SHIFT, FBZ_DEPTH_WMASK, FBZ_DRAW_BACK,
+    FBZ_RGB_WMASK, FBZCP_TEXTURE_ENABLED, INIT_ENABLE_REMAP, INIT_ENABLE_WRITE,
+    LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_DEPTH, LFB_FORMAT_RGB565,
+    LFB_READ_AUX, LFB_READ_BACK, LFB_WRITE_BACK, LFB_WRITE_FRONT, SST_ALPHA_MODE,
     SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_FASTFILL_CMD,
-    SST_FBI_INIT2, SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE, SST_START_A,
-    SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR,
-    SST_TEXTURE_MODE, SST_TLOD, SST_TREX_INIT0, SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX,
-    SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY, TEX_R5G6B5,
+    SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE,
+    SST_LFB_MODE, SST_START_A, SST_START_B, SST_START_G, SST_START_R, SST_STATUS,
+    SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR, SST_TEXTURE_MODE, SST_TLOD, SST_TREX_INIT0,
+    SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY,
+    SST_VERTEX_CX, SST_VERTEX_CY, SST_VIDEO_DIMENSIONS, TEX_R5G6B5,
 };
 
 const TREX0: usize = 0x2 << 10;
@@ -46,6 +49,86 @@ fn read_guest_u32(machine: &mut Machine, address: u32) -> u32 {
     (0..4)
         .map(|i| u32::from(machine.read_physical_u8(address + i)) << (i * 8))
         .fold(0, |a, b| a | b)
+}
+
+fn glide_lfb_address(x: u32, y: u32) -> u32 {
+    DISTIRA_LFB_BASE + (x << 1) + (y << 11)
+}
+
+fn configure_glide_resolution(
+    machine: &mut Machine,
+    width: u32,
+    height: u32,
+    tiles: u32,
+    offset: u32,
+) {
+    write_reg(machine, SST_FBI_INIT1, tiles << FBIINIT1_TILES_IN_X_SHIFT);
+    write_reg(
+        machine,
+        SST_FBI_INIT2,
+        offset << FBIINIT2_BUFFER_OFFSET_SHIFT,
+    );
+    write_reg(machine, SST_VIDEO_DIMENSIONS, (height << 16) | (width - 1));
+}
+
+fn run_glide_fbi_memory_probe(machine: &mut Machine) -> u32 {
+    write_reg(machine, SST_FBI_INIT0, 0);
+    write_reg(machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DEPTH_WMASK);
+
+    configure_glide_resolution(machine, 800, 600, 13, 247);
+    write_reg(
+        machine,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH | LFB_WRITE_FRONT | LFB_READ_AUX,
+    );
+    for (x, y, value) in [
+        (128, 100, 0xdead),
+        (0, 0, 0),
+        (798, 599, 0xffff),
+        (200, 200, 0x55aa),
+        (20, 20, 0xffff),
+        (400, 400, 0),
+    ] {
+        machine.write_physical_u16(glide_lfb_address(x, y), value);
+    }
+    if machine.read_physical_u16(glide_lfb_address(128, 100)) == 0xdead
+        && machine.read_physical_u16(glide_lfb_address(200, 200)) == 0x55aa
+    {
+        return 4;
+    }
+
+    configure_glide_resolution(machine, 640, 480, 10, 150);
+    write_reg(machine, SST_LFB_MODE, LFB_FORMAT_RGB565 | LFB_WRITE_FRONT);
+    for (x, y, value) in [(50, 100, 0xdead), (0, 0, 0), (638, 479, 0xffff)] {
+        machine.write_physical_u16(glide_lfb_address(x, y), value);
+    }
+    write_reg(machine, SST_LFB_MODE, LFB_FORMAT_RGB565 | LFB_WRITE_BACK);
+    for (x, y, value) in [(178, 436, 0xaa55), (20, 20, 0), (400, 400, 0xffff)] {
+        machine.write_physical_u16(glide_lfb_address(x, y), value);
+    }
+    write_reg(machine, SST_LFB_MODE, LFB_FORMAT_RGB565);
+    if machine.read_physical_u16(glide_lfb_address(50, 100)) == 0xdead {
+        write_reg(machine, SST_LFB_MODE, LFB_FORMAT_RGB565 | LFB_READ_BACK);
+        if machine.read_physical_u16(glide_lfb_address(178, 436)) == 0xaa55 {
+            return 2;
+        }
+    }
+
+    write_reg(machine, SST_LFB_MODE, LFB_FORMAT_RGB565 | LFB_WRITE_FRONT);
+    for (x, y, value) in [
+        (10, 10, 0xdead),
+        (8, 8, 0),
+        (340, 340, 0xffff),
+        (100, 200, 0x5a5a),
+        (66, 0, 0),
+        (360, 360, 0xffff),
+    ] {
+        machine.write_physical_u16(glide_lfb_address(x, y), value);
+    }
+    u32::from(
+        machine.read_physical_u16(glide_lfb_address(10, 10)) == 0xdead
+            && machine.read_physical_u16(glide_lfb_address(100, 200)) == 0x5a5a,
+    )
 }
 
 fn draw_texture_sample(machine: &mut Machine, tmu: usize) -> u32 {
@@ -116,6 +199,14 @@ fn push_out_dx_eax(out: &mut Vec<u8>, port: u16, value: u32) {
     push_mov_dx_imm16(out, port);
     push_mov_eax_imm32(out, value);
     out.push(0xef);
+}
+
+fn push_real_out_dx_eax(out: &mut Vec<u8>, port: u16, value: u32) {
+    out.push(0xba);
+    push_u16(out, port);
+    out.extend_from_slice(&[0x66, 0xb8]);
+    push_u32(out, value);
+    out.extend_from_slice(&[0x66, 0xef]);
 }
 
 fn push_mov_moffs_u32_imm32(out: &mut Vec<u8>, address: u32, value: u32) {
@@ -286,6 +377,22 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (1, 1));
     assert_eq!(frame, vec![0x0000_00ff]);
+}
+
+#[test]
+fn glide_destructive_framebuffer_probe_reports_two_megabytes() {
+    let mut code = Vec::new();
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8040);
+    push_real_out_dx_eax(&mut code, 0x0cfc, INIT_ENABLE_WRITE);
+    code.extend_from_slice(&[0xcd, 0x20]);
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &code).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    assert_eq!(run_glide_fbi_memory_probe(&mut machine), 2);
 }
 
 #[test]

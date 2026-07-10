@@ -325,14 +325,21 @@ pub const FOG_CONSTANT: u32 = 0x20;
 
 pub const FBIINIT0_VGA_PASS: u32 = 1;
 pub const FBIINIT0_GRAPHICS_RESET: u32 = 1 << 1;
+pub const FBIINIT1_TILES_IN_X_SHIFT: u32 = 4;
+pub const FBIINIT1_TILES_IN_X_MASK: u32 = 0xf << FBIINIT1_TILES_IN_X_SHIFT;
 pub const FBIINIT1_MULTI_SST: u32 = 1 << 2;
 pub const FBIINIT1_VIDEO_RESET: u32 = 1 << 8;
 pub const FBIINIT1_SLI_ENABLE: u32 = 1 << 23;
 pub const FBIINIT2_SWAP_ALGORITHM_MASK: u32 = 3 << 9;
+pub const FBIINIT2_BUFFER_OFFSET_SHIFT: u32 = 11;
+pub const FBIINIT2_BUFFER_OFFSET_MASK: u32 = 0x1ff << FBIINIT2_BUFFER_OFFSET_SHIFT;
+pub const FBIINIT2_TRIPLE_BUFFER: u32 = 1 << 4;
 pub const FBIINIT3_REMAP: u32 = 1;
 pub const FBIINIT5_MULTI_CVG: u32 = 1 << 14;
 pub const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
 
+/// `initEnable` bit 0 allows writes to the SST-1 framebuffer init registers.
+pub const INIT_ENABLE_WRITE: u32 = 1;
 /// `initEnable` bit that remaps `fbiInit2` readback onto the DAC readback
 /// latch instead of the stored `fbiInit2` value. This is `initEnable` bit 2
 /// (`SST_FBIINIT23_REMAP` in the Glide init source), written through PCI

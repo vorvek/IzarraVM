@@ -89,11 +89,12 @@ enum DistiraFifoEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distira {
     fb: Vec<u8>,
-    depth: Vec<u16>,
     texture: [Vec<u8>; 2],
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
     display: DistiraDisplay,
+    aux_base: u32,
+    buffer_stride: u32,
     display_enabled: bool,
     dither_enabled: bool,
     clear_color: u32,
@@ -219,13 +220,15 @@ impl Default for Distira {
 impl Distira {
     pub fn new() -> Self {
         let display = DistiraDisplay::default();
-        Self {
+        let buffer_stride = display.pitch * display.height;
+        let mut distira = Self {
             fb: vec![0; DISTIRA_FB_SIZE],
-            depth: vec![0xffff; (DISTIRA_MAX_WIDTH * DISTIRA_MAX_HEIGHT) as usize],
             texture: std::array::from_fn(|_| vec![0; DISTIRA_TEX_SIZE]),
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
             display,
+            aux_base: buffer_stride * 2,
+            buffer_stride,
             display_enabled: false,
             dither_enabled: false,
             clear_color: 0,
@@ -315,7 +318,9 @@ impl Distira {
             ncc_table0_i: [[0; 4]; 2],
             ncc_table0_q: [[0; 4]; 2],
             texture_palette: [[0; 256]; 2],
-        }
+        };
+        distira.clear_aux_depth();
+        distira
     }
 
     pub const fn tmu_count(&self) -> u32 {
@@ -325,11 +330,92 @@ impl Distira {
     /// Set the SST `initEnable` value. On real hardware and in this
     /// codebase's PCI function, `initEnable` lives in PCI config space
     /// (offset 0x40) rather than the MMIO register window; the machine
-    /// crate calls this whenever the guest writes that config dword so
-    /// `SST_FBI_INIT2`'s readback can honor the remap bit
-    /// (`INIT_ENABLE_REMAP`) the same way `sst1InitDacDetect()` expects.
+    /// crate calls this whenever the guest writes that config dword so the
+    /// init-register write gate and `SST_FBI_INIT2` DAC remap match SST-1.
     pub fn set_init_enable(&mut self, value: u32) {
         self.init_enable = value;
+    }
+
+    fn init_writes_enabled(&self) -> bool {
+        self.init_enable & INIT_ENABLE_WRITE != 0
+    }
+
+    fn write_fbi_init0(&mut self, byte: usize, value: u8) {
+        if !self.init_writes_enabled() {
+            return;
+        }
+        merge_byte(&mut self.fbi_init[0], byte, value);
+        if byte != 0 {
+            return;
+        }
+        if self.fbi_init[0] & FBIINIT0_VGA_PASS != 0 {
+            self.display_enabled = false;
+        } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET == 0 {
+            self.display_enabled = true;
+        }
+        if self.fbi_init[0] & FBIINIT0_GRAPHICS_RESET != 0 {
+            self.display.front_base = 0;
+            self.display.back_base = self.buffer_stride;
+        }
+    }
+
+    fn write_fbi_init1(&mut self, byte: usize, value: u8) {
+        if !self.init_writes_enabled() {
+            return;
+        }
+        let old = self.fbi_init[1];
+        let mut new = old;
+        merge_byte(&mut new, byte, value);
+        self.fbi_init[1] = (new & !5) | (old & 5);
+        if old & FBIINIT1_VIDEO_RESET != 0 && self.fbi_init[1] & FBIINIT1_VIDEO_RESET == 0 {
+            self.frame_phase_line = 0;
+            self.display_enabled = self.fbi_init[0] & FBIINIT0_VGA_PASS == 0;
+        } else if self.fbi_init[1] & FBIINIT1_VIDEO_RESET != 0 {
+            self.display_enabled = false;
+        }
+        self.recalculate_fbi_layout();
+    }
+
+    fn write_fbi_init2(&mut self, byte: usize, value: u8) {
+        if self.init_writes_enabled() {
+            merge_byte(&mut self.fbi_init[2], byte, value);
+            self.recalculate_fbi_layout();
+        }
+    }
+
+    fn write_fbi_init(&mut self, index: usize, byte: usize, value: u8) {
+        if self.init_writes_enabled() {
+            merge_byte(&mut self.fbi_init[index], byte, value);
+        }
+    }
+
+    fn recalculate_fbi_layout(&mut self) {
+        let old_stride = self.buffer_stride;
+        let front_buffer = self.display.front_base.checked_div(old_stride).unwrap_or(0);
+        let back_buffer = self.display.back_base.checked_div(old_stride).unwrap_or(1);
+        let stride = ((self.fbi_init[2] & FBIINIT2_BUFFER_OFFSET_MASK)
+            >> FBIINIT2_BUFFER_OFFSET_SHIFT)
+            * 4096;
+        let tiles = (self.fbi_init[1] & FBIINIT1_TILES_IN_X_MASK) >> FBIINIT1_TILES_IN_X_SHIFT;
+        self.buffer_stride = stride;
+        self.display.pitch = tiles * 128;
+        self.display.front_base = front_buffer.min(2).saturating_mul(stride);
+        self.display.back_base = back_buffer.min(2).saturating_mul(stride);
+        self.aux_base = stride.saturating_mul(if self.fbi_init[2] & FBIINIT2_TRIPLE_BUFFER != 0 {
+            3
+        } else {
+            2
+        });
+    }
+
+    fn update_video_dimensions(&mut self) {
+        let width = (self.video_dimensions & 0xfff) + 1;
+        let mut height = (self.video_dimensions >> 16) & 0xfff;
+        if matches!(height, 386 | 402 | 482 | 602) {
+            height -= 2;
+        }
+        self.display.width = width.clamp(1, 800);
+        self.display.height = height.clamp(1, 600);
     }
 
     /// Advance a 525-line, 60 Hz scanout by whole lines. The machine timeline
@@ -376,9 +462,11 @@ impl Distira {
             front_base: 0,
             back_base: frame,
         };
+        self.buffer_stride = frame;
+        self.aux_base = frame.saturating_mul(2);
         self.clip_right = self.clip_right.min(width);
         self.clip_high_y = self.clip_high_y.min(height);
-        self.depth.fill(0xffff);
+        self.clear_aux_depth();
     }
 
     pub fn clear_back_rgb(&mut self, r: u8, g: u8, b: u8) {
@@ -521,22 +609,29 @@ impl Distira {
     }
 
     pub fn read_lfb_u8(&self, offset: usize) -> u8 {
-        match self.lfb_mode & LFB_READ_MASK {
-            LFB_READ_BACK => self.read_color_lfb_byte(self.display.back_base, offset),
-            LFB_READ_AUX => self.read_depth_lfb_byte(offset),
-            _ => self.read_color_lfb_byte(self.display.front_base, offset),
-        }
+        self.lfb_byte_offset(self.lfb_read_base(), offset)
+            .and_then(|offset| self.fb.get(offset).copied())
+            .unwrap_or(0xff)
+    }
+
+    pub fn read_lfb_u16(&self, offset: usize) -> u16 {
+        u16::from_le_bytes(self.read_lfb_bytes::<2>(offset & !1))
+    }
+
+    pub fn read_lfb_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes(self.read_lfb_bytes::<4>(offset & !1))
     }
 
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
-        if (self.lfb_mode & LFB_FORMAT_MASK) == LFB_FORMAT_DEPTH {
-            self.write_depth_lfb_byte(offset, value);
-            return;
-        }
-        let Some(off) = (self.lfb_write_base() as usize).checked_add(offset) else {
-            return;
+        let base = if self.lfb_mode & LFB_FORMAT_MASK == LFB_FORMAT_DEPTH {
+            self.aux_base
+        } else {
+            self.lfb_write_base()
         };
-        if let Some(slot) = self.fb.get_mut(off) {
+        if let Some(slot) = self
+            .lfb_byte_offset(base, offset)
+            .and_then(|offset| self.fb.get_mut(offset))
+        {
             *slot = value;
         }
     }
@@ -546,41 +641,44 @@ impl Distira {
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
         let pipeline = self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE != 0;
+        let position = lfb_position(offset, false);
         match self.lfb_mode & LFB_FORMAT_MASK {
             LFB_FORMAT_RGB565 => {
-                let pixel = offset / 2;
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel,
+                    position,
                     value,
                     rgb565_components(value),
                     0xff,
                 );
             }
             LFB_FORMAT_RGB555 => {
-                let pixel = offset / 2;
-                let raw = rgb555_to_rgb565(value);
-                self.write_lfb_color_pipeline_pixel(base, pixel, raw, rgb565_components(raw), 0xff);
-            }
-            LFB_FORMAT_ARGB1555 => {
-                let pixel = offset / 2;
                 let raw = rgb555_to_rgb565(value);
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel,
+                    position,
+                    raw,
+                    rgb565_components(raw),
+                    0xff,
+                );
+            }
+            LFB_FORMAT_ARGB1555 => {
+                let raw = rgb555_to_rgb565(value);
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    position,
                     raw,
                     rgb565_components(raw),
                     argb1555_alpha(value),
                 );
             }
             LFB_FORMAT_DEPTH if write_depth || write_color || pipeline => {
-                let pixel = offset / 2;
-                if let Some(color) = self.lfb_pipeline_depth_only_color(base, pixel, value) {
+                if let Some(color) = self.lfb_pipeline_depth_only_color(base, position, value) {
                     if let Some(color) = color {
-                        self.write_color_pixel(base, pixel, color);
+                        self.write_color_pixel(base, position, color);
                     }
                     if write_depth {
-                        self.write_depth_pixel_by_index(pixel, value);
+                        self.write_depth_pixel_at(position, value);
                     }
                 }
             }
@@ -592,63 +690,73 @@ impl Distira {
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
-        match self.lfb_mode & LFB_FORMAT_MASK {
+        let format = self.lfb_mode & LFB_FORMAT_MASK;
+        let position = lfb_position(
+            offset,
+            matches!(
+                format,
+                LFB_FORMAT_XRGB8888
+                    | LFB_FORMAT_ARGB8888
+                    | LFB_FORMAT_DEPTH_RGB565
+                    | LFB_FORMAT_DEPTH_RGB555
+                    | LFB_FORMAT_DEPTH_ARGB1555
+            ),
+        );
+        let next = (position.0 + 1, position.1);
+        match format {
             LFB_FORMAT_RGB565 => {
-                let pixel = offset / 2;
                 let raw0 = value as u16;
                 let raw1 = (value >> 16) as u16;
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel,
+                    position,
                     raw0,
                     rgb565_components(raw0),
                     0xff,
                 );
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel + 1,
+                    next,
                     raw1,
                     rgb565_components(raw1),
                     0xff,
                 );
             }
             LFB_FORMAT_RGB555 => {
-                let pixel = offset / 2;
                 let raw0 = value as u16;
                 let raw1 = (value >> 16) as u16;
                 let raw0_rgb565 = rgb555_to_rgb565(raw0);
                 let raw1_rgb565 = rgb555_to_rgb565(raw1);
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel,
+                    position,
                     raw0_rgb565,
                     rgb565_components(raw0_rgb565),
                     0xff,
                 );
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel + 1,
+                    next,
                     raw1_rgb565,
                     rgb565_components(raw1_rgb565),
                     0xff,
                 );
             }
             LFB_FORMAT_ARGB1555 => {
-                let pixel = offset / 2;
                 let raw0 = value as u16;
                 let raw1 = (value >> 16) as u16;
                 let raw0_rgb565 = rgb555_to_rgb565(raw0);
                 let raw1_rgb565 = rgb555_to_rgb565(raw1);
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel,
+                    position,
                     raw0_rgb565,
                     rgb565_components(raw0_rgb565),
                     argb1555_alpha(raw0),
                 );
                 self.write_lfb_color_pipeline_pixel(
                     base,
-                    pixel + 1,
+                    next,
                     raw1_rgb565,
                     rgb565_components(raw1_rgb565),
                     argb1555_alpha(raw1),
@@ -664,15 +772,14 @@ impl Distira {
                     0xff
                 };
                 let raw = pack_rgb565(r, g, b);
-                self.write_lfb_color_pipeline_pixel(base, offset / 4, raw, (r, g, b), alpha);
+                self.write_lfb_color_pipeline_pixel(base, position, raw, (r, g, b), alpha);
             }
             LFB_FORMAT_DEPTH_RGB565 => {
-                let pixel = offset / 4;
                 let raw = value as u16;
                 let depth = (value >> 16) as u16;
                 let color = self.lfb_pipeline_depth_color_pixel(
                     base,
-                    pixel,
+                    position,
                     raw,
                     rgb565_components(raw),
                     0xff,
@@ -680,21 +787,20 @@ impl Distira {
                 );
                 if let Some(color) = color {
                     if write_color {
-                        self.write_color_pixel(base, pixel, color);
+                        self.write_color_pixel(base, position, color);
                     }
                     if write_depth {
-                        self.write_depth_pixel_by_index(pixel, depth);
+                        self.write_depth_pixel_at(position, depth);
                     }
                 }
             }
             LFB_FORMAT_DEPTH_RGB555 => {
-                let pixel = offset / 4;
                 let raw = value as u16;
                 let raw_rgb565 = rgb555_to_rgb565(raw);
                 let depth = (value >> 16) as u16;
                 let color = self.lfb_pipeline_depth_color_pixel(
                     base,
-                    pixel,
+                    position,
                     raw_rgb565,
                     rgb565_components(raw_rgb565),
                     0xff,
@@ -702,21 +808,20 @@ impl Distira {
                 );
                 if let Some(color) = color {
                     if write_color {
-                        self.write_color_pixel(base, pixel, color);
+                        self.write_color_pixel(base, position, color);
                     }
                     if write_depth {
-                        self.write_depth_pixel_by_index(pixel, depth);
+                        self.write_depth_pixel_at(position, depth);
                     }
                 }
             }
             LFB_FORMAT_DEPTH_ARGB1555 => {
-                let pixel = offset / 4;
                 let raw = value as u16;
                 let raw_rgb565 = rgb555_to_rgb565(raw);
                 let depth = (value >> 16) as u16;
                 let color = self.lfb_pipeline_depth_color_pixel(
                     base,
-                    pixel,
+                    position,
                     raw_rgb565,
                     rgb565_components(raw_rgb565),
                     argb1555_alpha(raw),
@@ -724,31 +829,30 @@ impl Distira {
                 );
                 if let Some(color) = color {
                     if write_color {
-                        self.write_color_pixel(base, pixel, color);
+                        self.write_color_pixel(base, position, color);
                     }
                     if write_depth {
-                        self.write_depth_pixel_by_index(pixel, depth);
+                        self.write_depth_pixel_at(position, depth);
                     }
                 }
             }
             LFB_FORMAT_DEPTH if write_depth || write_color => {
-                let pixel = offset / 2;
                 let depth0 = value as u16;
                 let depth1 = (value >> 16) as u16;
-                if let Some(color) = self.lfb_pipeline_depth_only_color(base, pixel, depth0) {
+                if let Some(color) = self.lfb_pipeline_depth_only_color(base, position, depth0) {
                     if let Some(color) = color {
-                        self.write_color_pixel(base, pixel, color);
+                        self.write_color_pixel(base, position, color);
                     }
                     if write_depth {
-                        self.write_depth_pixel_by_index(pixel, depth0);
+                        self.write_depth_pixel_at(position, depth0);
                     }
                 }
-                if let Some(color) = self.lfb_pipeline_depth_only_color(base, pixel + 1, depth1) {
+                if let Some(color) = self.lfb_pipeline_depth_only_color(base, next, depth1) {
                     if let Some(color) = color {
-                        self.write_color_pixel(base, pixel + 1, color);
+                        self.write_color_pixel(base, next, color);
                     }
                     if write_depth {
-                        self.write_depth_pixel_by_index(pixel + 1, depth1);
+                        self.write_depth_pixel_at(next, depth1);
                     }
                 }
             }
@@ -1046,13 +1150,16 @@ impl Distira {
                 }
             }
             SST_CMD_FIFO_HOLES => merge_byte(&mut self.cmd_fifo_holes, byte, value),
-            SST_FBI_INIT4 => merge_byte(&mut self.fbi_init[4], byte, value),
+            SST_FBI_INIT4 => self.write_fbi_init(4, byte, value),
             SST_BACK_PORCH => merge_byte(&mut self.back_porch, byte, value),
-            SST_VIDEO_DIMENSIONS => merge_byte(&mut self.video_dimensions, byte, value),
-            SST_FBI_INIT0 => merge_byte(&mut self.fbi_init[0], byte, value),
-            SST_FBI_INIT1 => merge_byte(&mut self.fbi_init[1], byte, value),
-            SST_FBI_INIT2 => merge_byte(&mut self.fbi_init[2], byte, value),
-            SST_FBI_INIT3 => merge_byte(&mut self.fbi_init[3], byte, value),
+            SST_VIDEO_DIMENSIONS => {
+                merge_byte(&mut self.video_dimensions, byte, value);
+                self.update_video_dimensions();
+            }
+            SST_FBI_INIT0 => self.write_fbi_init0(byte, value),
+            SST_FBI_INIT1 => self.write_fbi_init1(byte, value),
+            SST_FBI_INIT2 => self.write_fbi_init2(byte, value),
+            SST_FBI_INIT3 => self.write_fbi_init(3, byte, value),
             SST_H_SYNC => merge_byte(&mut self.h_sync, byte, value),
             SST_V_SYNC => merge_byte(&mut self.v_sync, byte, value),
             SST_DAC_DATA => {
@@ -1592,8 +1699,41 @@ impl Distira {
         match self.lfb_mode & LFB_WRITE_MASK {
             LFB_WRITE_FRONT => self.display.front_base,
             LFB_WRITE_BACK => self.display.back_base,
-            _ => self.display.back_base,
+            _ => self.display.front_base,
         }
+    }
+
+    fn lfb_read_base(&self) -> u32 {
+        match self.lfb_mode & LFB_READ_MASK {
+            LFB_READ_BACK => self.display.back_base,
+            LFB_READ_AUX => self.aux_base,
+            _ => self.display.front_base,
+        }
+    }
+
+    fn lfb_byte_offset(&self, base: u32, aperture_offset: usize) -> Option<usize> {
+        let x = (aperture_offset & 0x7fe) | (aperture_offset & 1);
+        let y = (aperture_offset >> 11) & 0x3ff;
+        usize::try_from(
+            u64::from(base)
+                .checked_add((y as u64).checked_mul(u64::from(self.display.pitch))?)?
+                .checked_add(x as u64)?,
+        )
+        .ok()
+    }
+
+    fn read_lfb_bytes<const N: usize>(&self, aperture_offset: usize) -> [u8; N] {
+        let mut bytes = [0xff; N];
+        let Some(start) = self.lfb_byte_offset(self.lfb_read_base(), aperture_offset) else {
+            return bytes;
+        };
+        let Some(end) = start.checked_add(N) else {
+            return bytes;
+        };
+        if let Some(source) = self.fb.get(start..end) {
+            bytes.copy_from_slice(source);
+        }
+        bytes
     }
 
     fn lfb_pipeline_writes_color(&self) -> bool {
@@ -1607,7 +1747,7 @@ impl Distira {
     fn write_lfb_color_pipeline_pixel(
         &mut self,
         base: u32,
-        pixel: usize,
+        position: (u32, u32),
         raw: u16,
         color: (u8, u8, u8),
         alpha: u8,
@@ -1617,25 +1757,25 @@ impl Distira {
         let write_depth = pipeline && self.fbz_mode & FBZ_DEPTH_WMASK != 0;
         let depth = self.za_color as u16;
         let color = if pipeline {
-            self.lfb_pipeline_depth_color_pixel(base, pixel, raw, color, alpha, depth)
+            self.lfb_pipeline_depth_color_pixel(base, position, raw, color, alpha, depth)
         } else {
-            self.lfb_pipeline_color_pixel(base, pixel, raw, color, alpha)
+            self.lfb_pipeline_color_pixel(base, position, raw, color, alpha)
         };
         if let Some(color) = color {
             if write_color {
-                self.write_color_pixel(base, pixel, color);
+                self.write_color_pixel(base, position, color);
             }
             if write_depth {
-                self.write_depth_pixel_by_index(pixel, depth);
+                self.write_depth_pixel_at(position, depth);
             }
         }
     }
 
-    fn lfb_pipeline_depth_test_passes(&self, pixel: usize, depth: u16) -> bool {
+    fn lfb_pipeline_depth_test_passes(&self, position: (u32, u32), depth: u16) -> bool {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
             return true;
         }
-        let Some(&old_depth) = self.depth.get(pixel) else {
+        let Some(old_depth) = self.read_depth_pixel(position.0, position.1) else {
             return false;
         };
         depth_compare_passes(self.fbz_mode, old_depth, depth)
@@ -1662,7 +1802,7 @@ impl Distira {
     fn lfb_pipeline_color_pixel(
         &mut self,
         base: u32,
-        pixel: usize,
+        position: (u32, u32),
         raw: u16,
         color: (u8, u8, u8),
         alpha: u8,
@@ -1670,14 +1810,14 @@ impl Distira {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
             return Some(raw);
         }
-        let position = self.lfb_pipeline_stipple_position(pixel)?;
+        let position = self.lfb_pipeline_stipple_position(position)?;
         self.lfb_pipeline_shade_color_at(base, position, raw, color, alpha)
     }
 
     fn lfb_pipeline_depth_color_pixel(
         &mut self,
         base: u32,
-        pixel: usize,
+        position: (u32, u32),
         raw: u16,
         color: (u8, u8, u8),
         alpha: u8,
@@ -1686,8 +1826,8 @@ impl Distira {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
             return Some(raw);
         }
-        let position = self.lfb_pipeline_stipple_position(pixel)?;
-        if !self.lfb_pipeline_depth_test_passes(pixel, depth) {
+        let position = self.lfb_pipeline_stipple_position(position)?;
+        if !self.lfb_pipeline_depth_test_passes(position, depth) {
             return None;
         }
         self.lfb_pipeline_shade_color_at(base, position, raw, color, alpha)
@@ -1696,14 +1836,14 @@ impl Distira {
     fn lfb_pipeline_depth_only_color(
         &mut self,
         base: u32,
-        pixel: usize,
+        position: (u32, u32),
         depth: u16,
     ) -> Option<Option<u16>> {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
             return Some(None);
         }
-        let position = self.lfb_pipeline_stipple_position(pixel)?;
-        if !self.lfb_pipeline_depth_test_passes(pixel, depth) {
+        let position = self.lfb_pipeline_stipple_position(position)?;
+        if !self.lfb_pipeline_depth_test_passes(position, depth) {
             return None;
         }
         let alpha = (self.za_color >> 24) as u8;
@@ -1711,8 +1851,9 @@ impl Distira {
             .map(Some)
     }
 
-    fn lfb_pipeline_stipple_position(&mut self, pixel: usize) -> Option<(u32, u32)> {
-        let (x, y) = self.pixel_index_coords(pixel)?;
+    fn lfb_pipeline_stipple_position(&mut self, position: (u32, u32)) -> Option<(u32, u32)> {
+        let (x, y) = position;
+        self.framebuffer_pixel_offset(self.lfb_write_base(), x, y)?;
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_STIPPLE == 0 {
             return Some((x, y));
         }
@@ -1743,61 +1884,19 @@ impl Distira {
         Some(pack_rgb565_for_pixel(r, g, b, x, y, self.dither_enabled))
     }
 
-    fn read_color_lfb_byte(&self, base: u32, offset: usize) -> u8 {
-        let Some(off) = (base as usize).checked_add(offset) else {
-            return 0;
-        };
-        self.fb.get(off).copied().unwrap_or(0)
-    }
-
-    fn read_depth_lfb_byte(&self, offset: usize) -> u8 {
-        let Some(value) = self.depth.get(offset / 2).copied() else {
-            return 0;
-        };
-        value.to_le_bytes()[offset & 1]
-    }
-
-    fn write_depth_lfb_byte(&mut self, offset: usize, value: u8) {
-        let Some(slot) = self.depth.get_mut(offset / 2) else {
+    fn write_depth_pixel_at(&mut self, position: (u32, u32), value: u16) {
+        let Some(offset) = self.framebuffer_pixel_offset(self.aux_base, position.0, position.1)
+        else {
             return;
         };
-        let mut bytes = slot.to_le_bytes();
-        bytes[offset & 1] = value;
-        *slot = u16::from_le_bytes(bytes);
+        self.fb[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn write_depth_pixel_by_index(&mut self, pixel: usize, value: u16) {
-        if let Some(slot) = self.depth.get_mut(pixel) {
-            *slot = value;
-        }
-    }
-
-    fn pixel_index_coords(&self, pixel: usize) -> Option<(u32, u32)> {
-        let width = self.display.width as usize;
-        if width == 0 {
-            return None;
-        }
-        let x = pixel % width;
-        let y = pixel / width;
-        if y >= self.display.height as usize {
-            return None;
-        }
-        Some((x as u32, y as u32))
-    }
-
-    fn write_color_pixel(&mut self, base: u32, pixel: usize, value: u16) {
-        let Some((x, y)) = self.pixel_index_coords(pixel) else {
+    fn write_color_pixel(&mut self, base: u32, position: (u32, u32), value: u16) {
+        let Some(offset) = self.framebuffer_pixel_offset(base, position.0, position.1) else {
             return;
         };
-        let off = u64::from(base)
-            .saturating_add((y as u64).saturating_mul(u64::from(self.display.pitch)))
-            .saturating_add((x as u64).saturating_mul(2));
-        if off + 1 >= self.fb.len() as u64 {
-            return;
-        }
-        let bytes = value.to_le_bytes();
-        self.fb[off as usize] = bytes[0];
-        self.fb[off as usize + 1] = bytes[1];
+        self.fb[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
 
     fn run_fastfill(&mut self) {
@@ -1951,15 +2050,10 @@ impl Distira {
     }
 
     fn write_pixel_at_base(&mut self, base: u32, x: u32, y: u32, pixel: u16) -> bool {
-        let off = u64::from(base)
-            .saturating_add(u64::from(y).saturating_mul(u64::from(self.display.pitch)))
-            .saturating_add(u64::from(x).saturating_mul(2));
-        if off + 1 >= self.fb.len() as u64 {
+        let Some(offset) = self.framebuffer_pixel_offset(base, x, y) else {
             return false;
-        }
-        let bytes = pixel.to_le_bytes();
-        self.fb[off as usize] = bytes[0];
-        self.fb[off as usize + 1] = bytes[1];
+        };
+        self.fb[offset..offset + 2].copy_from_slice(&pixel.to_le_bytes());
         true
     }
 
@@ -2716,14 +2810,10 @@ impl Distira {
     }
 
     fn read_pixel_rgb_at_base(&self, base: u32, x: u32, y: u32) -> (u8, u8, u8) {
-        let off = u64::from(base)
-            .saturating_add(u64::from(y).saturating_mul(u64::from(self.display.pitch)))
-            .saturating_add(u64::from(x).saturating_mul(2));
-        let raw = if off + 1 < self.fb.len() as u64 {
-            u16::from_le_bytes([self.fb[off as usize], self.fb[off as usize + 1]])
-        } else {
-            0
-        };
+        let raw = self
+            .framebuffer_pixel_offset(base, x, y)
+            .map(|offset| u16::from_le_bytes([self.fb[offset], self.fb[offset + 1]]))
+            .unwrap_or(0);
         (
             expand5(raw >> 11) as u8,
             expand6(raw >> 5) as u8,
@@ -2732,8 +2822,8 @@ impl Distira {
     }
 
     fn read_depth_pixel(&self, x: u32, y: u32) -> Option<u16> {
-        self.depth_pixel_index(x, y)
-            .and_then(|index| self.depth.get(index).copied())
+        self.framebuffer_pixel_offset(self.aux_base, x, y)
+            .map(|offset| u16::from_le_bytes([self.fb[offset], self.fb[offset + 1]]))
     }
 
     fn write_depth_pixel(&mut self, x: u32, y: u32, depth: u16) -> bool {
@@ -2742,23 +2832,43 @@ impl Distira {
         {
             return false;
         }
-        let Some(index) = self.depth_pixel_index(x, y) else {
+        let Some(offset) = self.framebuffer_pixel_offset(self.aux_base, x, y) else {
             return false;
         };
-        if let Some(slot) = self.depth.get_mut(index) {
-            *slot = depth;
-            true
-        } else {
-            false
-        }
+        self.fb[offset..offset + 2].copy_from_slice(&depth.to_le_bytes());
+        true
     }
 
-    fn depth_pixel_index(&self, x: u32, y: u32) -> Option<usize> {
-        if x >= self.display.width || y >= self.display.height {
-            return None;
-        }
-        Some((y as usize * self.display.width as usize) + x as usize)
+    fn framebuffer_pixel_offset(&self, base: u32, x: u32, y: u32) -> Option<usize> {
+        let offset = u64::from(base)
+            .checked_add(u64::from(y).checked_mul(u64::from(self.display.pitch))?)?
+            .checked_add(u64::from(x).checked_mul(2)?)?;
+        let offset = usize::try_from(offset).ok()?;
+        (offset.checked_add(2)? <= self.fb.len()).then_some(offset)
     }
+
+    fn clear_aux_depth(&mut self) {
+        let Some(start) = usize::try_from(self.aux_base).ok() else {
+            return;
+        };
+        let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
+        let end = start.saturating_add(len).min(self.fb.len());
+        if let Some(bytes) = self.fb.get_mut(start..end) {
+            bytes.fill(0xff);
+        }
+    }
+}
+
+fn lfb_position(aperture_offset: usize, packed_32_bit: bool) -> (u32, u32) {
+    let address = if packed_32_bit {
+        aperture_offset >> 1
+    } else {
+        aperture_offset
+    };
+    (
+        ((address & 0x7fe) >> 1) as u32,
+        ((address >> 11) & 0x3ff) as u32,
+    )
 }
 
 #[cfg(test)]

@@ -397,16 +397,8 @@ impl CpuBus for MachineBus<'_> {
             };
             return Ok(match width {
                 BusWidth::Byte => 0xff,
-                BusWidth::Word => u32::from(u16::from_le_bytes([
-                    self.distira.read_lfb_u8(offset),
-                    self.distira.read_lfb_u8(offset + 1),
-                ])),
-                BusWidth::Dword => u32::from_le_bytes([
-                    self.distira.read_lfb_u8(offset),
-                    self.distira.read_lfb_u8(offset + 1),
-                    self.distira.read_lfb_u8(offset + 2),
-                    self.distira.read_lfb_u8(offset + 3),
-                ]),
+                BusWidth::Word => u32::from(self.distira.read_lfb_u16(offset)),
+                BusWidth::Dword => self.distira.read_lfb_u32(offset),
             });
         }
 
@@ -1708,12 +1700,15 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = self.distira_lfb_offset(address, width) {
-            if width == 1 {
-                out[0] = 0xff;
-                return Ok(());
-            }
-            for (index, byte) in out.iter_mut().enumerate() {
-                *byte = self.distira.read_lfb_u8(offset + index);
+            match width {
+                1 => out[0] = 0xff,
+                2 => out.copy_from_slice(&self.distira.read_lfb_u16(offset & !1).to_le_bytes()),
+                4 => out.copy_from_slice(&self.distira.read_lfb_u32(offset & !1).to_le_bytes()),
+                _ => {
+                    for (index, byte) in out.iter_mut().enumerate() {
+                        *byte = self.distira.read_lfb_u8(offset + index);
+                    }
+                }
             }
             return Ok(());
         }

@@ -6,6 +6,7 @@ use super::*;
 #[test]
 fn voodoo_registers_store_init_and_render_state() {
     let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_WRITE);
 
     write_reg(&mut distira, SST_FBI_INIT0, 0x0000_0003);
     write_reg(&mut distira, SST_FBI_INIT1, 0x0000_0100);
@@ -27,6 +28,61 @@ fn voodoo_registers_store_init_and_render_state() {
     assert_eq!(read_reg(&distira, SST_ALPHA_MODE), 0x0001_0001);
     assert_eq!(read_reg(&distira, SST_CLIP_LEFT_RIGHT), (2 << 16) | 7);
     assert_eq!(read_reg(&distira, SST_CLIP_LOW_Y_HIGH_Y), (3 << 16) | 9);
+}
+
+#[test]
+fn fbi_init_register_writes_require_pci_init_enable() {
+    let mut distira = Distira::new();
+    let initial_init2 = read_reg(&distira, SST_FBI_INIT2);
+
+    write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_GRAPHICS_RESET);
+    write_reg(
+        &mut distira,
+        SST_FBI_INIT2,
+        247 << FBIINIT2_BUFFER_OFFSET_SHIFT,
+    );
+    write_reg(&mut distira, SST_FBI_INIT4, 0x1234_5678);
+
+    assert_eq!(read_reg(&distira, SST_FBI_INIT0), 0);
+    assert_eq!(read_reg(&distira, SST_FBI_INIT2), initial_init2);
+    assert_eq!(read_reg(&distira, SST_FBI_INIT4), 0);
+
+    distira.set_init_enable(INIT_ENABLE_WRITE);
+    write_reg(&mut distira, SST_FBI_INIT4, 0x1234_5678);
+    assert_eq!(read_reg(&distira, SST_FBI_INIT4), 0x1234_5678);
+}
+
+#[test]
+fn fbi_init_layout_and_reset_select_physical_buffers() {
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_WRITE);
+    write_reg(
+        &mut distira,
+        SST_FBI_INIT1,
+        FBIINIT1_VIDEO_RESET | (10 << FBIINIT1_TILES_IN_X_SHIFT),
+    );
+    write_reg(
+        &mut distira,
+        SST_FBI_INIT2,
+        150 << FBIINIT2_BUFFER_OFFSET_SHIFT,
+    );
+    write_reg(&mut distira, SST_VIDEO_DIMENSIONS, (480 << 16) | 639);
+
+    assert!(!distira.display_enabled());
+    assert_eq!(distira.display().width, 640);
+    assert_eq!(distira.display().height, 480);
+    assert_eq!(distira.display().pitch, 1280);
+    assert_eq!(distira.display().front_base, 0);
+    assert_eq!(distira.display().back_base, 150 * 4096);
+
+    write_reg(&mut distira, SST_FBI_INIT1, 10 << FBIINIT1_TILES_IN_X_SHIFT);
+    assert!(distira.display_enabled());
+    distira.swap_buffers();
+    assert_eq!(distira.display().front_base, 150 * 4096);
+
+    write_reg(&mut distira, SST_FBI_INIT0, FBIINIT0_GRAPHICS_RESET);
+    assert_eq!(distira.display().front_base, 0);
+    assert_eq!(distira.display().back_base, 150 * 4096);
 }
 
 #[test]
@@ -271,6 +327,7 @@ fn fbi_init2_reads_raw_storage_when_remap_bit_is_clear() {
     // fbiInit register: plain byte-mergeable storage, and a DAC read cycle
     // does not leak into it.
     let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_WRITE);
     write_reg(&mut distira, SST_FBI_INIT2, 0x0000_0200);
 
     write_reg(&mut distira, SST_DAC_DATA, (7 << DACDATA_ADDR_SHIFT) | 0x0b);
@@ -450,26 +507,41 @@ fn v_retrace_and_status_bit_toggle_so_a_poll_loop_terminates() {
 }
 
 #[test]
-fn frame_buffer_writes_beyond_the_configured_size_do_not_alias() {
-    // The 86Box-modeled memory-sizing probe (fbiMemSize, info.c) writes
-    // marker values at LFB offsets chosen to land only in an installed
-    // upper memory bank, then reads them back to confirm survival. That
-    // only works if unbacked addresses genuinely don't respond (open bus)
-    // rather than wrapping/aliasing onto backing that IS present. Assert
-    // the actual boundary behavior: the last valid framebuffer offset
-    // round-trips, one byte past it is silently dropped.
-    use izarravm_video::DISTIRA_FB_SIZE;
-
+fn lfb_aperture_wraps_its_unused_high_address_bit() {
     let mut distira = Distira::new();
-    let last_offset = DISTIRA_FB_SIZE - 1;
-    distira.write_lfb_u8(last_offset, 0xaa);
-    assert_eq!(distira.read_lfb_u8(last_offset), 0xaa);
+    distira.set_frame_size(1, 1);
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_WRITE_FRONT | LFB_FORMAT_RGB565,
+    );
+    distira.write_lfb_u16(1 << 21, 0xf800);
+    assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
+}
 
-    let past_end = DISTIRA_FB_SIZE;
-    distira.write_lfb_u8(past_end, 0x55);
+#[test]
+fn lfb_physical_addresses_past_two_megabytes_are_open_bus() {
+    let mut distira = Distira::new();
+    distira.set_init_enable(INIT_ENABLE_WRITE);
+    write_reg(&mut distira, SST_FBI_INIT1, 13 << FBIINIT1_TILES_IN_X_SHIFT);
+    write_reg(
+        &mut distira,
+        SST_FBI_INIT2,
+        247 << FBIINIT2_BUFFER_OFFSET_SHIFT,
+    );
+    write_reg(&mut distira, SST_VIDEO_DIMENSIONS, (600 << 16) | 799);
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH | LFB_WRITE_FRONT | LFB_READ_AUX,
+    );
+
+    let aperture_offset = (100 << 11) | (128 << 1);
+    distira.write_lfb_u16(aperture_offset, 0xdead);
+
     assert_eq!(
-        distira.read_lfb_u8(past_end),
-        0,
-        "a write past the configured framebuffer size must not alias onto backed memory"
+        distira.read_lfb_u16(aperture_offset),
+        0xffff,
+        "the 800x600 auxiliary buffer starts near the end of installed memory"
     );
 }
