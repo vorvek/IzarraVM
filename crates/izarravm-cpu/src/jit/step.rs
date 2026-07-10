@@ -223,6 +223,10 @@ pub(crate) struct RegionCtx {
     /// dispatch on every entry. `None` under the trampoline (no native store slot loads it).
     #[cfg(feature = "jit")]
     pub store_finish_fn: Option<StoreFinishFn>,
+    /// Instructions completed by emitted native operations during this entry.
+    pub native_insn_count: u32,
+    /// Calls from emitted code into `region_step` during this entry.
+    pub helper_exit_count: u32,
 }
 
 impl RegionCtx {
@@ -268,6 +272,7 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
     let cpu = unsafe { &mut *cpu };
     let bus = unsafe { &mut *(bus as *mut B) };
     let ctx = unsafe { &mut *ctx };
+    ctx.helper_exit_count += 1;
     // Cost-fold flush: reconcile any bus clocks the native slots folded into the running trace before
     // this slot's own bookkeeping reads it (core_clocks_so_far below, the cap check, and - at the
     // back-edge - the mandatory yield). region_step holds the bus, so no fn-pointer is needed. Under
@@ -405,6 +410,7 @@ pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
     // execute_hot_cached_decoded returns for them); accumulate it and the retired-instruction count.
     ctx.raw_clocks += 2;
     ctx.insn_count += 1;
+    ctx.native_insn_count += 1;
 
     // The run loop's break checks. Halted is always false for these opcodes (mov/add/shr do not
     // halt). The step-break check (requires_step_break) is elided: register-only slots do no port

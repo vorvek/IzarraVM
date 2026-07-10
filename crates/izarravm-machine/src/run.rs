@@ -576,7 +576,7 @@ impl Machine {
                         let halt_start = self.host_profile.start();
                         match self.next_timer_wake(deadline_ticks) {
                             Some(wake_step) => {
-                                self.advance_cpu_work(wake_step, 0);
+                                self.advance_halted_cpu_clocks(wake_step);
                             }
                             None => {
                                 let remaining = deadline_ticks - self.timeline.now_ticks();

@@ -507,7 +507,8 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
              data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns/nativeld]={}/{}/{}  paged_tlb_success={}",
+             jit[entries/insns/native/helper]={}/{}/{}/{}  \
+             jit_mem[load/store/tlb]={}/{}/{}  jit_time[ns/samples]={}/{}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -536,8 +537,13 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.cache_tier_lookups,
             perf.jit_region_entries,
             perf.jit_region_insns,
+            perf.jit_native_insns,
+            perf.jit_helper_exits,
             perf.jit_native_load_hits,
+            perf.jit_native_store_hits,
             perf.jit_paged_tlb_successes,
+            perf.jit_native_block_ns,
+            perf.jit_native_block_samples,
         );
     }
     if out_of_band {
@@ -930,6 +936,7 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "brk_interrupt": perf.brk_interrupt,
         "brk_cap": perf.brk_cap,
         "brk_halt": perf.brk_halt,
+        "code_invalidations": perf.code_invalidations,
         "data_direct_reads": perf.data_direct_reads,
         "data_slow_reads": perf.data_slow_reads,
         "data_direct_writes": perf.data_direct_writes,
@@ -949,6 +956,13 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "smc_narrow_kills": perf.smc_narrow_kills,
         "jit_region_entries": perf.jit_region_entries,
         "jit_region_insns": perf.jit_region_insns,
+        "jit_native_insns": perf.jit_native_insns,
+        "jit_helper_exits": perf.jit_helper_exits,
+        "jit_native_block_ns": perf.jit_native_block_ns,
+        "jit_native_block_samples": perf.jit_native_block_samples,
+        "jit_native_load_hits": perf.jit_native_load_hits,
+        "jit_native_store_hits": perf.jit_native_store_hits,
+        "jit_paged_tlb_successes": perf.jit_paged_tlb_successes,
     })
 }
 
@@ -959,11 +973,12 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
     println!(
         "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
          brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
-         inval[cs/smc/other]={}/{}/{} narrow={}  \
+         inval[cs/smc/other/all]={}/{}/{}/{} narrow={}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns/nativeld]={}/{}/{}  paged_tlb={}",
+         jit[entries/insns/native/helper]={}/{}/{}/{}  \
+         jit_mem[load/store/tlb]={}/{}/{}  jit_time[ns/samples]={}/{}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -977,6 +992,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.decode_inval_cs_load,
         perf.decode_inval_smc,
         perf.decode_inval_other,
+        perf.code_invalidations,
         perf.smc_narrow_kills,
         perf.data_direct_reads,
         perf.data_slow_reads,
@@ -996,8 +1012,13 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.cache_tier_lookups,
         perf.jit_region_entries,
         perf.jit_region_insns,
+        perf.jit_native_insns,
+        perf.jit_helper_exits,
         perf.jit_native_load_hits,
+        perf.jit_native_store_hits,
         perf.jit_paged_tlb_successes,
+        perf.jit_native_block_ns,
+        perf.jit_native_block_samples,
     );
     // Attribute combined decode-or-branch exits for profiling runs.
     println!(

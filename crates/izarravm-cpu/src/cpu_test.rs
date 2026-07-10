@@ -46,6 +46,16 @@ fn cpu_registers_field_offset_is_stable() {
 }
 
 #[test]
+fn perf_counter_tracks_code_invalidation_events() {
+    let mut cpu = CpuGsw::default();
+    let before = cpu.perf_counters().code_invalidations;
+
+    cpu.note_a20_changed();
+
+    assert_eq!(cpu.perf_counters().code_invalidations, before + 1);
+}
+
+#[test]
 #[cfg(feature = "jit")]
 fn region_ctx_fn_pointer_offsets() {
     // Pin ALL offsets the emitted native code reads/writes so a field reorder is caught.
@@ -58,7 +68,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, bus_clocks_fn), 40);
     assert_eq!(core::mem::offset_of!(RegionCtx, line_live_fn), 48);
     // Pending flags offset used by direct native writes.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3888);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3928);
     // Verify the timing-field offsets the native cap check uses.
     let raw_off = core::mem::offset_of!(RegionCtx, raw_clocks);
     eprintln!("raw_clocks offset = {raw_off}");

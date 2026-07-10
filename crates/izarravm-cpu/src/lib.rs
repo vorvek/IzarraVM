@@ -513,6 +513,10 @@ pub struct PerfCounters {
     pub decode_inval_cs_load: u64,
     pub decode_inval_smc: u64,
     pub decode_inval_other: u64,
+    /// Code-cache invalidation events, including narrow self-modifying-code kills. This is the
+    /// aggregate rate; the `decode_inval_*` and `smc_narrow_kills` counters retain the cause and
+    /// affected-line detail.
+    pub code_invalidations: u64,
     /// Lines killed by the NARROW SMC path (a self-patch whose covering lines were
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
     /// global-flush fallbacks only, so the two together split the SMC write traffic.
@@ -524,6 +528,16 @@ pub struct PerfCounters {
     /// without the `jit` feature) so perf-row consumers need no feature gymnastics.
     pub jit_region_entries: u64,
     pub jit_region_insns: u64,
+    /// Guest instructions completed by emitted native operations, excluding instructions run by
+    /// `region_step`. Compare with `jit_region_insns` to measure native opcode coverage.
+    pub jit_native_insns: u64,
+    /// Transitions from emitted code into `region_step`, including a transition that reports a
+    /// fault. Inline bookkeeping and flag helpers are not counted.
+    pub jit_helper_exits: u64,
+    /// Wall time for sampled compiled-region calls and the number of samples. The first entry and
+    /// every 1,024th entry are sampled to keep timing overhead out of the hot path.
+    pub jit_native_block_ns: u64,
+    pub jit_native_block_samples: u64,
     /// Times the compiled-region table hit its capacity and was dropped wholesale (a coarse GC;
     /// see `JIT_REGION_TABLE_CAP`). Nonzero means the working set of hot loops exceeded the cap and
     /// the JIT is re-warming - a signal to raise the cap or add per-entry eviction. Zero on the
