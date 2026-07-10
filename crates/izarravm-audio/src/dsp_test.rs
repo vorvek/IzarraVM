@@ -121,23 +121,22 @@ fn auto_init_command_marks_the_mode() {
 }
 
 #[test]
-fn render_sample_consumes_dma_bytes_and_edges_half_and_end_irqs() {
+fn render_sample_raises_one_irq_per_completed_auto_init_block() {
     let mut dsp = SbDsp::default();
     write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 11025 Hz
     write_cmd(&mut dsp, &[0x48, 0x07, 0x00]); // block size 8
     write_cmd(&mut dsp, &[0x1C]); // 8-bit auto-init
     let pattern = [0x00u8, 0x40, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0];
     let mut irq_at: Vec<usize> = Vec::new();
-    for i in 1..=8 {
+    for i in 1..=16 {
         let byte = pattern[(i - 1) % pattern.len()];
         let _ = dsp.render_sample(move || Some(byte));
         if dsp.take_irq() {
             irq_at.push(i);
         }
     }
-    // Half-buffer IRQ at the midpoint (4 consumed), end IRQ at TC (8 consumed).
-    assert_eq!(irq_at, vec![4, 8], "half at 4, end at 8");
-    // Auto-init reloads and keeps playing across terminal count.
+    assert_eq!(irq_at, vec![8, 16], "one IRQ at each block completion");
+    // Auto-init reloads and keeps playing across programmed block completion.
     assert!(dsp.is_playing(), "auto-init keeps playing past TC");
 }
 
@@ -317,13 +316,11 @@ fn reset_during_active_playback_clears_playing_and_auto_init() {
     let mut dsp = SbDsp::default();
     write_cmd(&mut dsp, &[0x48, 0x07, 0x00, 0x90]); // block 8, high-speed auto-init
     assert!(dsp.is_playing() && dsp.is_auto_init());
-    // Render past the block midpoint so half_reached latches, and leave a
-    // half-byte command partially assembled so `pending` is non-empty.
+    // Render part of the block and leave a command partially assembled so
+    // `pending` is non-empty.
     for _ in 0..5 {
         let _ = dsp.render_sample(|| Some(0x80));
     }
-    assert!(dsp.half_reached, "midpoint crossed before reset");
-    let _ = dsp.take_irq(); // drop any IRQ raised by the half-buffer edge
     // Re-establish a pending IRQ and a partial command to prove reset clears them.
     dsp.irq_pending = true;
     dsp.write_command_byte(0x48); // arity-2 command, no args yet -> pending set
@@ -334,7 +331,6 @@ fn reset_during_active_playback_clears_playing_and_auto_init() {
     assert!(!dsp.is_playing(), "reset halts playback");
     assert!(!dsp.is_auto_init(), "reset clears the auto-init latch");
     assert_eq!(dsp.block_remaining(), 0);
-    assert!(!dsp.half_reached, "reset clears the half-buffer latch");
     assert!(dsp.pending.is_none(), "reset drops the partial command");
     // Real hardware clears the interrupt latch on reset, so a pre-reset
     // pending IRQ does not fire on the next re-armed playback.
@@ -374,22 +370,21 @@ fn sbpro_8bit_stereo_consumes_two_bytes_and_yields_distinct_l_r() {
 }
 
 #[test]
-fn sbpro_8bit_stereo_edges_half_and_end_irqs_consuming_two_bytes_per_frame() {
+fn sbpro_8bit_stereo_raises_irq_only_at_block_completion() {
     let mut dsp = SbDsp::default();
     // Block 4 bytes, 8-bit single, SB Pro stereo: advance_block(2) per frame,
-    // so the block drains in 2 frames. Half fires when remaining <= 2 (after
-    // frame 1), end fires when remaining == 0 (after frame 2), then single
-    // mode stops.
+    // so the block drains in 2 frames. Only block completion after frame 2 raises
+    // the IRQ, then single mode stops.
     write_cmd(&mut dsp, &[0x14, 0x03, 0x00]); // block 4
     dsp.set_sbpro_stereo(true);
     let mut feed = || Some(0x80u8);
-    // Frame 1: remaining 4 -> 2, half IRQ.
+    // Frame 1: remaining 4 -> 2, no IRQ.
     assert!(dsp.render_frame(&mut feed, || panic!("no words")).is_some());
     assert_eq!(dsp.block_remaining(), 2);
-    assert!(dsp.take_irq(), "half-buffer IRQ after frame 1");
+    assert!(!dsp.take_irq(), "no IRQ before block completion");
     // Frame 2: remaining 2 -> 0, end IRQ, single mode stops.
     assert!(dsp.render_frame(&mut feed, || panic!("no words")).is_some());
-    assert!(dsp.take_irq(), "end-buffer IRQ after frame 2");
+    assert!(dsp.take_irq(), "block-completion IRQ after frame 2");
     assert!(!dsp.is_playing(), "single mode stops at end of block");
 }
 
@@ -478,11 +473,11 @@ fn pcm_bytes_per_output_frame_tracks_width_and_channels() {
 fn frames_until_next_irq_counts_stereo_dma_units() {
     let mut dsp = SbDsp::default();
     write_cmd(&mut dsp, &[0xC6, 0x20, 0x0F, 0x00]);
-    assert_eq!(dsp.frames_until_next_irq(), Some(4));
+    assert_eq!(dsp.frames_until_next_irq(), Some(8));
 
     let mut bytes = [0x80; 8].into_iter();
     assert_eq!(dsp.tick_n_samples(3, || bytes.next(), || None), 3);
-    assert_eq!(dsp.frames_until_next_irq(), Some(1));
+    assert_eq!(dsp.frames_until_next_irq(), Some(5));
 }
 
 #[test]
@@ -490,7 +485,7 @@ fn sbpro_stereo_does_not_change_16bit_mono_irq_units() {
     let mut dsp = SbDsp::default();
     dsp.set_sbpro_stereo(true);
     write_cmd(&mut dsp, &[0xB0, 0x00, 0x07, 0x00]);
-    assert_eq!(dsp.frames_until_next_irq(), Some(4));
+    assert_eq!(dsp.frames_until_next_irq(), Some(8));
 }
 
 #[test]
@@ -627,7 +622,7 @@ fn adpcm_tick_count_tracks_decoded_frames_and_drains_the_final_fifo() {
     assert_eq!(
         std::iter::from_fn(|| dsp.drain_frame()).count(),
         4,
-        "decoded samples buffered at terminal count are still rendered"
+        "decoded samples buffered at block completion are still rendered"
     );
 }
 

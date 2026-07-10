@@ -730,7 +730,7 @@ fn sb_dsp_auto_init_edges_forward_within_their_advance_and_rearm_after_ack() {
     let mut machine = test_machine();
     // 16-byte auto-init DMA loop on ch1 feeding an 8-sample auto-init DSP
     // block: one 200k-clock advance at 22 MHz (~9 ms, ~99 frames at
-    // 11025 Hz) spans MANY half/end block edges.
+    // 11025 Hz) spans many completed DSP blocks.
     for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
         machine.write_physical_u8(0x1_0000 + i as u32, b);
     }
@@ -884,7 +884,7 @@ fn event_batch_cap_reaches_a_near_due_stereo_dsp_edge_in_every_mode() {
         let mut machine = test_machine();
         machine.set_mode(mode);
         with_bus(&mut machine, |bus| {
-            // One 8-bit stereo frame reaches both the half and end edge.
+            // One 8-bit stereo frame reaches the block-completion edge.
             for &byte in &[0x41u8, 0x2B, 0x11, 0xC0, 0x20, 0x01, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
                     .unwrap();

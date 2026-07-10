@@ -58,8 +58,8 @@ The DSP decodes Creative ADPCM the way a real SB16 does, as part of the
 digital audio path rather than a separate device. The 4-bit, 2.6-bit, and
 2-bit playback commands (`0x74`-`0x77`, `0x16`/`0x17`, and their auto-init
 variants) expand the compressed DMA stream to 8-bit samples through the
-DSP's adaptive predictor, with the same half-buffer and end-of-buffer
-interrupts as raw PCM playback. Nothing extra to detect or configure: a
+DSP's adaptive predictor, with one interrupt at each programmed block boundary,
+as in raw PCM playback. Nothing extra to detect or configure: a
 program that issues the ADPCM DSP commands just works.
 
 ## MIDI and wavetable
