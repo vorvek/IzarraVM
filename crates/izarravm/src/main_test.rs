@@ -313,3 +313,39 @@ fn c_root_path_is_a_bare_c_drive_when_portable() {
         "portable C: root must not use the ~/.izarravm prefix, got {p:?}"
     );
 }
+
+#[test]
+fn boot_suite_failure_summary_lists_every_failed_record() {
+    let mut results = SuiteResults {
+        version: 1,
+        declared_record_count: 3,
+        payload_len: 0,
+        checksum: 0,
+        records: vec![
+            izarravm_firmware::SuiteRecord {
+                status: SuiteRecordStatus::Begin,
+                name: "suite.boot".to_string(),
+                value: None,
+            },
+            izarravm_firmware::SuiteRecord {
+                status: SuiteRecordStatus::Fail,
+                name: "sound.opl3".to_string(),
+                value: None,
+            },
+            izarravm_firmware::SuiteRecord {
+                status: SuiteRecordStatus::Fail,
+                name: "timer.irq0".to_string(),
+                value: None,
+            },
+        ],
+    };
+
+    assert_eq!(
+        boot_suite_failure_summary(&results).as_deref(),
+        Some("boot suite reported FAIL: sound.opl3, timer.irq0")
+    );
+    results
+        .records
+        .retain(|record| record.status != SuiteRecordStatus::Fail);
+    assert_eq!(boot_suite_failure_summary(&results), None);
+}

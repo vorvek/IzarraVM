@@ -13,7 +13,7 @@ use izarravm_core::{
 };
 use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
-    SuiteRecordStatus, boot_test_image, neurketa_image, parse_result_block, test_rom,
+    SuiteRecordStatus, SuiteResults, boot_test_image, neurketa_image, parse_result_block, test_rom,
 };
 use izarravm_input::InputState;
 use izarravm_machine::{
@@ -349,7 +349,24 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("stop: {stop_reason:?}");
     print_com1(&machine.serial_text());
+    if let Some(message) = boot_suite_failure_summary(&results) {
+        return Err(message.into());
+    }
     Ok(())
+}
+
+fn boot_suite_failure_summary(results: &SuiteResults) -> Option<String> {
+    let failures: Vec<&str> = results
+        .records
+        .iter()
+        .filter(|record| record.status == SuiteRecordStatus::Fail)
+        .map(|record| record.name.as_str())
+        .collect();
+    if failures.is_empty() {
+        None
+    } else {
+        Some(format!("boot suite reported FAIL: {}", failures.join(", ")))
+    }
 }
 
 /// Boot a BIOS/test ROM headless and print the screen text plus POST code.
