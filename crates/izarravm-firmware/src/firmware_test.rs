@@ -53,11 +53,10 @@ fn izarra_bios_carries_v301_version_string() {
 }
 
 #[test]
-fn code_3_is_named_386_slow_in_guest_firmware() {
+fn guest_tools_name_code_3_386_slow() {
     for (name, image, needle) in [
         ("GSWMODE.COM", GSWMODE_COM, b"386-slow".as_slice()),
         ("GSWMODE.COM", GSWMODE_COM, b"use '386-slow'".as_slice()),
-        ("izarra-bios.bin", IZARRA_BIOS, b"SSlow  386".as_slice()),
     ] {
         assert!(
             image.windows(needle.len()).any(|window| window == needle),
@@ -67,6 +66,23 @@ fn code_3_is_named_386_slow_in_guest_firmware() {
     }
     assert!(!GSWMODE_COM_SOURCE.contains("GSWMODE 286|"));
     assert!(!TOKAEMM_SYS_SOURCE.contains("cpu 286"));
+}
+
+#[test]
+fn izarra_bios_boot_menu_uses_canonical_cpu_mode_names() {
+    let names = [
+        b"586\0".as_slice(),
+        b"486\0".as_slice(),
+        b"386\0".as_slice(),
+        b"386-slow\0".as_slice(),
+    ]
+    .concat();
+    assert!(
+        IZARRA_BIOS
+            .windows(names.len())
+            .any(|window| window == names),
+        "canonical CPU mode rows not found in the Izarra BIOS ROM"
+    );
 }
 
 #[test]

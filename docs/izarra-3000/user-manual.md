@@ -68,12 +68,12 @@ menu finds media to boot from; an unavailable row is drawn in grey.
 
 **CPU speed** has four rows, from fastest to slowest:
 
-| Row | Speed class | Port/CMOS code |
+| Row | CPU class | Port/CMOS code |
 | --- | --- | --- |
-| Fast 586 | GSW-586 at full speed | 2 |
-| Slow 486 | 486DX2-equivalent | 1 |
-| VSlow 386 | 386DX-equivalent | 0 |
-| SSlow 386 | 386DX-equivalent at 7.33 MHz, the slowest tier | 3 |
+| 586 | Pentium MMX-class at 200 MHz | 2 |
+| 486 | 486DX2 at 66 MHz | 1 |
+| 386 | 386DX at 22 MHz | 0 |
+| 386-slow | The same 386DX ISA at 7.33 MHz | 3 |
 
 Accepting the menu writes the chosen speed to the Lotura chipset's mode port
 immediately (the CPU actually changes speed class right there) and saves

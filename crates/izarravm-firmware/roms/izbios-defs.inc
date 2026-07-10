@@ -274,10 +274,10 @@
 
 ; Speed rows (right pane). The 0xE1/CMOS 0x12 code per row is the real hardware
 ; encoding (gsw_mode_from_code: 0=386, 1=486, 2=586, 3=386-slow), not a row index.
-%define BMX_SPD_FAST     0         ; 586, code 2
-%define BMX_SPD_SLOW     1         ; 486, code 1
-%define BMX_SPD_VSLOW    2         ; 386, code 0
-%define BMX_SPD_SSLOW    3         ; 386-slow, code 3
+%define BMX_SPD_586      0         ; code 2
+%define BMX_SPD_486      1         ; code 1
+%define BMX_SPD_386      2         ; code 0
+%define BMX_SPD_386_SLOW 3         ; code 3
 
 ; Cursor sprite geometry (16x16, 2-byte stride, set-bit-only blit).
 %define BMX_CUR_W        16

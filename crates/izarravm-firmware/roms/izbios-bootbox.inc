@@ -556,63 +556,63 @@ bx_dev_label_ptr:
 bx_spd_label_ptr:
     push cs
     pop ds
-    cmp al, BMX_SPD_FAST
-    je .fast
-    cmp al, BMX_SPD_SLOW
-    je .slow
-    cmp al, BMX_SPD_VSLOW
-    je .vslow
-    mov si, bx_str_spd_sslow
+    cmp al, BMX_SPD_586
+    je .mode586
+    cmp al, BMX_SPD_486
+    je .mode486
+    cmp al, BMX_SPD_386
+    je .mode386
+    mov si, bx_str_spd_386_slow
     ret
-.fast:
-    mov si, bx_str_spd_fast
+.mode586:
+    mov si, bx_str_spd_586
     ret
-.slow:
-    mov si, bx_str_spd_slow
+.mode486:
+    mov si, bx_str_spd_486
     ret
-.vslow:
-    mov si, bx_str_spd_vslow
+.mode386:
+    mov si, bx_str_spd_386
     ret
 
-; bx_spd_row_to_code: AL = speed row -> AL = 0xE1/CMOS GSW code (Fast/586=2,
-; Slow/486=1, VSlow/386=0, SSlow/386-slow=3). Invalid rows use VSlow (0).
+; bx_spd_row_to_code: AL = speed row -> AL = 0xE1/CMOS GSW code
+; (586=2, 486=1, 386=0, 386-slow=3). Invalid rows use 386 (0).
 bx_spd_row_to_code:
-    cmp al, BMX_SPD_FAST
-    je .fast
-    cmp al, BMX_SPD_SLOW
-    je .slow
-    cmp al, BMX_SPD_SSLOW
-    je .sslow
-    xor al, al                      ; VSlow / default
+    cmp al, BMX_SPD_586
+    je .mode586
+    cmp al, BMX_SPD_486
+    je .mode486
+    cmp al, BMX_SPD_386_SLOW
+    je .mode386_slow
+    xor al, al                      ; 386 / default
     ret
-.fast:
+.mode586:
     mov al, 2
     ret
-.slow:
+.mode486:
     mov al, 1
     ret
-.sslow:
+.mode386_slow:
     mov al, 3
     ret
 
 ; bx_code_to_row: AL = GSW code -> AL = speed row. Inverse of bx_spd_row_to_code.
 bx_code_to_row:
     cmp al, 2
-    je .fast
+    je .mode586
     cmp al, 1
-    je .slow
+    je .mode486
     cmp al, 3
-    je .sslow
-    mov al, BMX_SPD_VSLOW           ; code 0 or other -> 386
+    je .mode386_slow
+    mov al, BMX_SPD_386              ; code 0 or other -> 386
     ret
-.fast:
-    mov al, BMX_SPD_FAST
+.mode586:
+    mov al, BMX_SPD_586
     ret
-.slow:
-    mov al, BMX_SPD_SLOW
+.mode486:
+    mov al, BMX_SPD_486
     ret
-.sslow:
-    mov al, BMX_SPD_SSLOW
+.mode386_slow:
+    mov al, BMX_SPD_386_SLOW
     ret
 
 ; ===========================================================================
@@ -624,9 +624,9 @@ bx_str_spd_title: db 'CPU speed:', 0
 bx_str_dev_hdd:   db 'Hard Disk', 0
 bx_str_dev_flpy:  db 'Floppy A:', 0
 bx_str_dev_cd:    db 'CD-ROM', 0
-bx_str_spd_fast:  db 'Fast   586', 0
-bx_str_spd_slow:  db 'Slow   486', 0
-bx_str_spd_vslow: db 'VSlow  386', 0
-bx_str_spd_sslow: db 'SSlow  386', 0
+bx_str_spd_586:      db '586', 0
+bx_str_spd_486:      db '486', 0
+bx_str_spd_386:      db '386', 0
+bx_str_spd_386_slow: db '386-slow', 0
 bx_str_accept:    db 'Accept', 0
 bx_str_hint:      db 'Up/Dn  Enter  Esc', 0
