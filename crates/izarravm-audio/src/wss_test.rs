@@ -460,6 +460,38 @@ fn drain_frame_pops_pushed_frames() {
 }
 
 #[test]
+fn tick_n_samples_counts_complete_multibyte_frames_and_stops_dry() {
+    let mut dev = Ad1848::default();
+    arm_format(&mut dev, I8_FMT | I8_SM, 4); // 16-bit stereo, 4 bytes per frame
+    assert_eq!(dev.bytes_per_frame(), 4);
+    let before = dev.current_count();
+    let mut bytes = [
+        0x01, 0x00, 0xFE, 0xFF, // L=1, R=-2
+        0x02, 0x00, 0xFD, 0xFF, // L=2, R=-3
+    ]
+    .into_iter();
+
+    let produced = dev.tick_n_samples(5, || bytes.next());
+
+    assert_eq!(produced, 2);
+    assert_eq!(dev.current_count(), before - 2);
+    assert_eq!(dev.drain_frame(), Some((1, -2)));
+    assert_eq!(dev.drain_frame(), Some((2, -3)));
+    assert_eq!(dev.drain_frame(), None);
+}
+
+#[test]
+fn tick_sample_returns_false_without_a_complete_frame() {
+    let mut dev = Ad1848::default();
+    arm_format(&mut dev, I8_FMT | I8_SM, 4);
+    let before = dev.current_count();
+
+    assert!(!dev.tick_sample(|| None));
+    assert_eq!(dev.current_count(), before);
+    assert_eq!(dev.drain_frame(), None);
+}
+
+#[test]
 fn ien_clear_sets_status_int_but_does_not_forward_irq_pin() {
     // Datasheet: the internal INT status bit becomes one on underflow even
     // when IEN is zero, but the external INT pin (the PIC forward) stays

@@ -431,6 +431,8 @@ impl SbDsp {
         self.playing = true;
         self.block_remaining = self.block_size;
         self.half_reached = false;
+        self.block_buffer = None;
+        self.block_buffer_pos = 0;
     }
 
     /// Arm the SB16 16-bit DMA path from a 0xBx command (mode byte + 2-byte
@@ -525,33 +527,48 @@ impl SbDsp {
         self.block_size
     }
 
+    /// Bytes consumed from DMA for one PCM output frame. ADPCM returns `None`
+    /// because its encoded bytes expand to a variable number of output frames.
+    pub fn pcm_bytes_per_output_frame(&self) -> Option<usize> {
+        self.adpcm.is_none().then(|| {
+            let bytes_per_sample = if self.dma_16bit { 2 } else { 1 };
+            let stereo = self.stereo || (!self.dma_16bit && self.sbpro_stereo);
+            bytes_per_sample * if stereo { 2 } else { 1 }
+        })
+    }
+
     /// Advance the DMA playback by exactly one stereo frame and push the result
     /// onto the rendered-frame ring. This is the per-CPU-clock producer entry
     /// point: it wraps the existing [`render_frame`] (which advances the block
     /// counter and edges the half/end IRQs) and buffers the frame for the host
     /// drainer. A `None` frame (channel idle or DMA exhausted) is not pushed.
     /// The IRQ raised inside `render_frame` is left pending for the caller to
-    /// forward to the PIC via [`take_irq`].
-    pub fn tick_sample<B, W>(&mut self, byte_fetch: B, word_fetch: W)
+    /// forward to the PIC via [`take_irq`]. Returns whether a frame was produced.
+    pub fn tick_sample<B, W>(&mut self, byte_fetch: B, word_fetch: W) -> bool
     where
         B: FnMut() -> Option<u8>,
         W: FnMut() -> Option<u16>,
     {
         if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
             push_frame_capped(&mut self.rendered, frame);
+            true
+        } else {
+            false
         }
     }
 
-    /// Batch tick for HLE: tick n samples at once (each may push to rendered and
-    /// advance block/IRQ). Used to batch the phase accumulation in advance_devices.
-    pub fn tick_n_samples<B, W>(&mut self, n: usize, mut byte_fetch: B, mut word_fetch: W)
+    /// Batch tick for HLE: produce up to `n` frames, stopping on a dry source and
+    /// returning the number produced. Used by the machine's phase accounting.
+    pub fn tick_n_samples<B, W>(&mut self, n: usize, mut byte_fetch: B, mut word_fetch: W) -> usize
     where
         B: FnMut() -> Option<u8>,
         W: FnMut() -> Option<u16>,
     {
-        for _ in 0..n {
-            self.tick_sample(&mut byte_fetch, &mut word_fetch);
+        let mut produced = 0;
+        while produced < n && self.tick_sample(&mut byte_fetch, &mut word_fetch) {
+            produced += 1;
         }
+        produced
     }
 
     /// Pop the oldest rendered stereo frame for the host audio path, or None
@@ -762,23 +779,38 @@ impl SbDsp {
         }
     }
 
-    /// Decrement the block counter by `consumed` words and edge the half and
-    /// end-of-buffer IRQs. Shared by the 8-bit and 16-bit render paths.
-    fn advance_block(&mut self, consumed: u32) {
-        self.block_remaining = self.block_remaining.saturating_sub(consumed);
-        // Half-buffer IRQ fires once, at the block midpoint.
-        if !self.half_reached && self.block_remaining <= self.block_size / 2 {
-            self.half_reached = true;
-            self.irq_pending = true;
-        }
-        if self.block_remaining == 0 {
-            // End-of-buffer IRQ. Auto-init reloads and keeps going; single mode stops.
-            self.irq_pending = true;
-            if self.auto_init {
-                self.block_remaining = self.block_size;
-                self.half_reached = false;
-            } else {
-                self.playing = false;
+    /// Consume DMA units and edge half/end IRQs. A stereo frame may cross an
+    /// odd-sized auto-init block, so units left after the reload belong to the
+    /// next block instead of being lost at the first terminal count.
+    fn advance_block(&mut self, mut consumed: u32) {
+        while consumed > 0 && self.playing {
+            if self.block_remaining == 0 {
+                self.irq_pending = true;
+                if self.auto_init && self.block_size > 0 {
+                    self.block_remaining = self.block_size;
+                    self.half_reached = false;
+                } else {
+                    self.playing = false;
+                    break;
+                }
+            }
+
+            let step = consumed.min(self.block_remaining);
+            self.block_remaining -= step;
+            consumed -= step;
+
+            if !self.half_reached && self.block_remaining <= self.block_size / 2 {
+                self.half_reached = true;
+                self.irq_pending = true;
+            }
+            if self.block_remaining == 0 {
+                self.irq_pending = true;
+                if self.auto_init && self.block_size > 0 {
+                    self.block_remaining = self.block_size;
+                    self.half_reached = false;
+                } else {
+                    self.playing = false;
+                }
             }
         }
     }

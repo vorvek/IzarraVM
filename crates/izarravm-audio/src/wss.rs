@@ -575,18 +575,25 @@ impl Ad1848 {
     /// Per-output-frame producer entry point: render one frame and push it onto
     /// the rendered ring (drop-oldest on overflow). A `None` frame (idle or DMA
     /// dry) is not pushed. The IRQ raised inside `render_frame` is left pending
-    /// for the caller to forward via `take_irq`.
-    pub fn tick_sample<B: FnMut() -> Option<u8>>(&mut self, fetch: B) {
+    /// for the caller to forward via `take_irq`. Returns whether a frame was
+    /// produced.
+    pub fn tick_sample<B: FnMut() -> Option<u8>>(&mut self, fetch: B) -> bool {
         if let Some(frame) = self.render_frame(fetch) {
             push_frame_capped(&mut self.rendered, frame);
+            true
+        } else {
+            false
         }
     }
 
-    /// Batch tick for HLE (Phase 4).
-    pub fn tick_n_samples<B: FnMut() -> Option<u8>>(&mut self, n: usize, mut fetch: B) {
-        for _ in 0..n {
-            self.tick_sample(&mut fetch);
+    /// Produce up to `n` frames, stopping on a dry source and returning the
+    /// number produced.
+    pub fn tick_n_samples<B: FnMut() -> Option<u8>>(&mut self, n: usize, mut fetch: B) -> usize {
+        let mut produced = 0;
+        while produced < n && self.tick_sample(&mut fetch) {
+            produced += 1;
         }
+        produced
     }
 
     /// Pop the oldest rendered stereo frame for the host audio path, or `None`
