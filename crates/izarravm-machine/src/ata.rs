@@ -605,8 +605,9 @@ fn identify_block(cylinders: u32, heads: u32, sectors: u32, total_lba: u32) -> V
     words[1] = cylinders.min(0xFFFF) as u16; // default cylinders
     words[3] = heads as u16; // default heads
     words[6] = sectors as u16; // default sectors per track
-    // Word 49 capabilities: bit 9 LBA supported, bit 8 DMA supported (cosmetic).
-    words[49] = 0x0300;
+    // Word 49 capabilities: bit 9 advertises LBA. Bit 8 stays clear because this
+    // controller implements PIO transfers only.
+    words[49] = 0x0200;
     // Words 53/54-58: the current CHS translation is valid (bit 0 of word 53),
     // echoing the default geometry.
     words[53] = 0x0001;
