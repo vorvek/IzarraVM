@@ -39,10 +39,14 @@ fn write_reg(machine: &mut Machine, reg: usize, value: u32) {
     write_reg_at(machine, DISTIRA_MMIO_BASE, reg, value);
 }
 
-fn read_reg(machine: &mut Machine, reg: usize) -> u32 {
+fn read_reg_at(machine: &mut Machine, base: u32, reg: usize) -> u32 {
     (0..4)
-        .map(|i| u32::from(machine.read_physical_u8(DISTIRA_MMIO_BASE + reg as u32 + i)) << (i * 8))
+        .map(|i| u32::from(machine.read_physical_u8(base + reg as u32 + i)) << (i * 8))
         .fold(0, |a, b| a | b)
+}
+
+fn read_reg(machine: &mut Machine, reg: usize) -> u32 {
+    read_reg_at(machine, DISTIRA_MMIO_BASE, reg)
 }
 
 fn read_guest_u32(machine: &mut Machine, address: u32) -> u32 {
@@ -131,30 +135,35 @@ fn run_glide_fbi_memory_probe(machine: &mut Machine) -> u32 {
     )
 }
 
-fn draw_texture_sample(machine: &mut Machine, tmu: usize) -> u32 {
-    write_reg(machine, DISTIRA_REG_FB_WIDTH, 4);
-    write_reg(machine, DISTIRA_REG_FB_HEIGHT, 4);
-    write_reg(machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    write_reg(machine, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
-    write_reg(
+fn draw_texture_sample_at(machine: &mut Machine, base: u32, tmu: usize) -> u32 {
+    write_reg_at(machine, base, DISTIRA_REG_FB_WIDTH, 4);
+    write_reg_at(machine, base, DISTIRA_REG_FB_HEIGHT, 4);
+    write_reg_at(machine, base, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg_at(machine, base, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg_at(
         machine,
+        base,
         TREX0 | SST_TEXTURE_MODE,
         (TEX_R5G6B5 << 8) | if tmu == 1 { TC_ADD_CLOCAL } else { 0 },
     );
-    write_reg(machine, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(machine, SST_VERTEX_AX, 0);
-    write_reg(machine, SST_VERTEX_AY, 0);
-    write_reg(machine, SST_VERTEX_BX, 3 << 4);
-    write_reg(machine, SST_VERTEX_BY, 0);
-    write_reg(machine, SST_VERTEX_CX, 0);
-    write_reg(machine, SST_VERTEX_CY, 3 << 4);
-    write_reg(machine, SST_START_R, 0xff << 12);
-    write_reg(machine, SST_START_G, 0xff << 12);
-    write_reg(machine, SST_START_B, 0xff << 12);
-    write_reg(machine, SST_START_A, 0xff << 12);
-    write_reg(machine, SST_TRIANGLE_CMD, 1);
-    write_reg(machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg_at(machine, base, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg_at(machine, base, SST_VERTEX_AX, 0);
+    write_reg_at(machine, base, SST_VERTEX_AY, 0);
+    write_reg_at(machine, base, SST_VERTEX_BX, 3 << 4);
+    write_reg_at(machine, base, SST_VERTEX_BY, 0);
+    write_reg_at(machine, base, SST_VERTEX_CX, 0);
+    write_reg_at(machine, base, SST_VERTEX_CY, 3 << 4);
+    write_reg_at(machine, base, SST_START_R, 0xff << 12);
+    write_reg_at(machine, base, SST_START_G, 0xff << 12);
+    write_reg_at(machine, base, SST_START_B, 0xff << 12);
+    write_reg_at(machine, base, SST_START_A, 0xff << 12);
+    write_reg_at(machine, base, SST_TRIANGLE_CMD, 1);
+    write_reg_at(machine, base, SST_SWAPBUFFER_CMD, 1);
     machine.frame_argb().0[0]
+}
+
+fn draw_texture_sample(machine: &mut Machine, tmu: usize) -> u32 {
+    draw_texture_sample_at(machine, DISTIRA_MMIO_BASE, tmu)
 }
 
 fn write_texture_texel(machine: &mut Machine, tmu: usize, byte_address: u32, texel: u16) {
@@ -534,13 +543,25 @@ fn distira_guest_cmdfifo_type1_packets_use_assigned_bar_aperture() {
     let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
 
     assert_eq!(reason, StopReason::Halted);
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 12);
-    assert_ne!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
+        12
+    );
+    assert_ne!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_STATUS) & 0x380,
+        0
+    );
 
     machine.drain_distira_fifo();
 
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
-    assert_eq!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
+        0
+    );
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_STATUS) & 0x380,
+        0
+    );
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b; 2]);
@@ -587,12 +608,18 @@ fn distira_guest_cmdfifo_type5_framebuffer_packets_use_assigned_bar_aperture() {
     let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
 
     assert_eq!(reason, StopReason::Halted);
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 3);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
+        3
+    );
 
     machine.drain_distira_fifo();
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+    write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 1);
 
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
+        0
+    );
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
@@ -628,33 +655,22 @@ fn distira_guest_cmdfifo_type5_texture_packets_use_assigned_bar_aperture() {
     let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
 
     assert_eq!(reason, StopReason::Halted);
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 3);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
+        3
+    );
 
     machine.drain_distira_fifo();
 
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
-    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 4);
-    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 4);
-    write_reg(&mut machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    write_reg(&mut machine, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
-    write_reg(&mut machine, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
-    write_reg(&mut machine, SST_TEX_BASE_ADDR, 0);
-    write_reg(&mut machine, SST_VERTEX_AX, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_BX, 3 << 4);
-    write_reg(&mut machine, SST_VERTEX_BY, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut machine, SST_VERTEX_CY, 3 << 4);
-    write_reg(&mut machine, SST_START_R, 0xff << 12);
-    write_reg(&mut machine, SST_START_G, 0xff << 12);
-    write_reg(&mut machine, SST_START_B, 0xff << 12);
-    write_reg(&mut machine, SST_START_A, 0xff << 12);
-    write_reg(&mut machine, SST_TRIANGLE_CMD, 1);
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
-
-    let (frame, width, height) = machine.frame_argb();
-    assert_eq!((width, height), (4, 4));
-    assert_eq!(frame[0], 0x0000_ff00);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
+        0
+    );
+    write_reg_at(&mut machine, ASSIGNED_BAR, SST_TEX_BASE_ADDR, 0);
+    assert_eq!(
+        draw_texture_sample_at(&mut machine, ASSIGNED_BAR, 0),
+        0x0000_ff00
+    );
 }
 
 #[test]
@@ -686,7 +702,10 @@ fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
     let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
 
     assert_eq!(reason, StopReason::Halted);
-    assert_eq!(draw_texture_sample(&mut machine, 0), 0x0000_ff00);
+    assert_eq!(
+        draw_texture_sample_at(&mut machine, ASSIGNED_BAR, 0),
+        0x0000_ff00
+    );
 }
 
 #[test]
@@ -863,12 +882,75 @@ fn distira_pci_bar_maps_voodoo_mmio_and_lfb_windows() {
         SST_LFB_MODE,
         LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
     );
+    write_reg_at(&mut machine, DISTIRA_MMIO_BASE, DISTIRA_REG_FB_WIDTH, 9);
+    machine.write_physical_u32(DISTIRA_LFB_BASE, 0x00ff_0000);
+    assert_eq!(
+        read_reg_at(&mut machine, ASSIGNED_BAR, DISTIRA_REG_FB_WIDTH),
+        2
+    );
+    assert_eq!(
+        read_reg_at(&mut machine, DISTIRA_MMIO_BASE, DISTIRA_REG_FB_WIDTH),
+        u32::MAX
+    );
+    assert_eq!(machine.read_physical_u32(DISTIRA_LFB_BASE), u32::MAX);
+    assert_eq!(
+        machine.read_physical_u32(DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET),
+        u32::MAX
+    );
     machine.write_physical_u32(ASSIGNED_LFB, 0x0034_5678);
     write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 1);
 
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
+}
+
+#[test]
+fn distira_pci_memory_command_disables_every_bar_window() {
+    const ASSIGNED_BAR: u32 = 0xe300_0000;
+    let mut code = Vec::new();
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_real_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_real_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_real_out_dx_eax(&mut code, 0x0cfc, 0);
+    code.extend_from_slice(&[0xcd, 0x20]);
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &code).unwrap();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+
+    write_reg_at(&mut machine, ASSIGNED_BAR, DISTIRA_REG_FB_WIDTH, 9);
+    machine.write_physical_u32(ASSIGNED_BAR + 0x0040_0000, 0x0034_5678);
+    assert_eq!(machine.read_physical_u32(ASSIGNED_BAR), u32::MAX);
+    assert_eq!(
+        machine.read_physical_u32(ASSIGNED_BAR + 0x0020_0000),
+        u32::MAX
+    );
+    assert_eq!(
+        machine.read_physical_u32(ASSIGNED_BAR + 0x0040_0000),
+        u32::MAX
+    );
+    assert_eq!(
+        machine.read_physical_u32(ASSIGNED_BAR + DISTIRA_TEXTURE_OFFSET),
+        u32::MAX
+    );
+}
+
+#[test]
+fn distira_command_fifo_reads_open_bus() {
+    const CMD_FIFO_BASE: u32 = DISTIRA_MMIO_BASE + 0x0020_0000;
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    assert_eq!(machine.read_physical_u8(CMD_FIFO_BASE), 0xff);
+    assert_eq!(machine.read_physical_u16(CMD_FIFO_BASE), 0xffff);
+    assert_eq!(machine.read_physical_u32(CMD_FIFO_BASE), u32::MAX);
 }
 
 #[test]

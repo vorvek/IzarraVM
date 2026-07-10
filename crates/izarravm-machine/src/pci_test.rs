@@ -67,3 +67,89 @@ fn ide_bar4_sizes_relocates_and_command_bits_gate_decode() {
     assert!(config.ide_io_enabled());
     assert!(config.ide_bus_master_enabled());
 }
+
+#[test]
+fn distira_bar0_probe_reports_a_16_mib_aligned_aperture() {
+    let mut config = PciConfig::new();
+    let power_on_base = crate::DISTIRA_MMIO_BASE;
+
+    assert_eq!(
+        read_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10),
+        power_on_base
+    );
+    assert_eq!(config.distira_memory_decode_key(), Some(power_on_base));
+
+    assert_eq!(
+        config.distira_mmio_offset(power_on_base + DISTIRA_PCI_CMDFIFO_OFFSET - 1, 1),
+        Some((DISTIRA_PCI_CMDFIFO_OFFSET - 1) as usize)
+    );
+    assert_eq!(
+        config.distira_mmio_offset(power_on_base + DISTIRA_PCI_CMDFIFO_OFFSET - 1, 2),
+        None
+    );
+    assert_eq!(
+        config.distira_cmdfifo_offset(power_on_base + DISTIRA_PCI_CMDFIFO_OFFSET, 4),
+        Some(0)
+    );
+    assert_eq!(
+        config.distira_cmdfifo_offset(power_on_base + DISTIRA_PCI_LFB_OFFSET - 1, 1),
+        Some((DISTIRA_PCI_LFB_OFFSET - DISTIRA_PCI_CMDFIFO_OFFSET - 1) as usize)
+    );
+    assert_eq!(
+        config.distira_lfb_offset(power_on_base + DISTIRA_PCI_LFB_OFFSET, 4),
+        Some(0)
+    );
+    assert_eq!(
+        config.distira_texture_offset(power_on_base + DISTIRA_PCI_TEX_OFFSET, 4),
+        Some(0)
+    );
+    assert_eq!(
+        config.distira_texture_offset(power_on_base + DISTIRA_PCI_BAR_SIZE - 1, 1),
+        Some((DISTIRA_PCI_BAR_SIZE - DISTIRA_PCI_TEX_OFFSET - 1) as usize)
+    );
+    assert_eq!(
+        config.distira_texture_offset(power_on_base + DISTIRA_PCI_BAR_SIZE - 1, 2),
+        None
+    );
+    assert_eq!(
+        config.distira_texture_offset(power_on_base + DISTIRA_PCI_BAR_SIZE, 1),
+        None
+    );
+
+    write_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10, u32::MAX);
+    assert_eq!(
+        read_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10),
+        0xff00_0000
+    );
+    assert_eq!(config.distira_memory_decode_key(), Some(0xff00_0000));
+    assert_eq!(config.distira_texture_offset(u32::MAX, 1), Some(0x7f_ffff));
+
+    write_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10, 0xe2ab_cdef);
+    assert_eq!(
+        read_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10),
+        0xe200_0000
+    );
+}
+
+#[test]
+fn distira_memory_command_and_zero_bar_disable_decode() {
+    let mut config = PciConfig::new();
+
+    write_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x04, 0);
+    assert_eq!(config.distira_memory_decode_key(), None);
+    assert_eq!(
+        config.distira_mmio_offset(crate::DISTIRA_MMIO_BASE, 4),
+        None
+    );
+
+    write_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10, 0xe300_0000);
+    assert_eq!(config.distira_memory_decode_key(), None);
+
+    write_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x04, 0x0000_0002);
+    assert_eq!(config.distira_memory_decode_key(), Some(0xe300_0000));
+    assert_eq!(config.distira_mmio_offset(0xe300_0000, 4), Some(0));
+
+    write_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10, 0);
+    assert_eq!(read_dword(&mut config, DISTIRA_PCI_SLOT, 0, 0x10), 0);
+    assert_eq!(config.distira_memory_decode_key(), None);
+}
