@@ -46,3 +46,6 @@ mod color_combine;
 
 #[path = "distira/texture_test.rs"]
 mod texture;
+
+#[path = "distira/ncc_test.rs"]
+mod ncc;
