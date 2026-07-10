@@ -111,6 +111,28 @@ fn machine_bus_snapshots_batch_entry_state() {
 }
 
 #[test]
+fn jit_fetch_preview_matches_the_live_bus_charge() {
+    for (start, count) in [(0x1000, 5), (0x000f_8000, 5)] {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            let raw = bus
+                .jit_cached_fetch_run_clocks(start, count)
+                .expect("uniform RAM and ROM fetches have an exact preview");
+            let projected = bus
+                .jit_projected_batch_scaled_bus_clocks(raw)
+                .expect("the machine bus can scale an exact raw preview");
+            bus.charge_instruction_fetch_run(start, count).unwrap();
+            assert_eq!(projected, bus.in_batch_scaled_bus_clocks());
+        });
+    }
+
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        assert_eq!(bus.jit_cached_fetch_run_clocks(0x000f_ffff, 2), None);
+    });
+}
+
+#[test]
 fn predicted_beam_at_batch_start_equals_the_unmutated_beam() {
     // At core_clocks_so_far = 0 with zero in-batch bus clocks (the very first
     // instruction of a batch, before any fetch/data access has been recorded

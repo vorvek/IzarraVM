@@ -435,8 +435,21 @@ impl CpuBus for InstrumentedBus {
         self.bus_clocks += 2;
         self.inner.charge_instruction_fetch(address)
     }
+    fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
+        self.bus_clocks += 2;
+        self.inner.charge_instruction_fetch_run(start, count)
+    }
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
         self.bus_clocks
+    }
+    fn jit_fetch_cost_clocks(&self) -> u64 {
+        2
+    }
+    fn jit_cached_fetch_run_clocks(&self, _start: u32, _count: u32) -> Option<u64> {
+        Some(2)
+    }
+    fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        Some(self.bus_clocks + additional_raw)
     }
     fn read_io(
         &mut self,
@@ -656,78 +669,6 @@ fn cold_decode_lines_defer_admission() {
     assert!(jit::block::try_admit(&mut cpu, ENTRY, true).is_none());
     drive_to_halt(&mut cpu, &mut bus, u64::MAX);
     assert!(jit::block::try_admit(&mut cpu, ENTRY, true).is_some());
-}
-
-/// Compare native inline-slot bookkeeping with the `region_inline_slot` call
-/// path. The test first checks bit identity on the drawcolumn, then times both
-/// paths through `run_straight_line`.
-///   cargo test -j8 -p izarravm-cpu --release --features jit s2_native_bookkeeping -- --ignored --nocapture
-#[test]
-#[ignore]
-fn s2_native_bookkeeping_prototype() {
-    use std::sync::atomic::Ordering;
-    use std::time::Instant;
-
-    // Verify bit identity against the interpreter.
-    jit::block::NATIVE_BOOKKEEPING.store(1, Ordering::Relaxed);
-    {
-        let mut interp = fresh_cpu(0xffff);
-        let mut jit_cpu = fresh_cpu(0xffff);
-        let mut bus_i = TestBus::with_memory(program());
-        let mut bus_j = TestBus::with_memory(program());
-        warm_and_admit(&mut interp, &mut bus_i, &mut jit_cpu, &mut bus_j);
-        arm_loop(&mut interp, &mut bus_i, 8);
-        arm_loop(&mut jit_cpu, &mut bus_j, 8);
-        let ci = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
-        let cj = drive_to_halt(&mut jit_cpu, &mut bus_j, u64::MAX);
-        assert_eq!(ci, cj, "native bookkeeping: per-run outcomes diverged");
-        assert_identical(&interp, &bus_i, &jit_cpu, &bus_j);
-        assert!(jit_cpu.perf_counters().jit_region_entries > 0);
-    }
-    jit::block::NATIVE_BOOKKEEPING.store(0, Ordering::Relaxed);
-    eprintln!("native bookkeeping BIT-IDENTICAL on the drawcolumn (region vs interpreter)");
-
-    // Time both paths through run_straight_line. Big memory lets EDI advance across many
-    // iterations; tracing off (representative of production, not the traced test bus).
-    const ITERS: u32 = 200_000;
-    let time_variant = |mode: u8| -> f64 {
-        jit::block::NATIVE_BOOKKEEPING.store(mode, Ordering::Relaxed);
-        let mut m = vec![0u8; 64 << 20];
-        let p = program();
-        m[..p.len()].copy_from_slice(&p);
-        let mut cpu = fresh_cpu(0xffff_ffff);
-        let mut bus = TestBus::with_memory(m);
-        bus.direct_pages_enabled = true; // host-pointer cache path, like production
-        bus.trace.set_tracing_mode(izarravm_bus::TracingMode::Off);
-        arm_loop(&mut cpu, &mut bus, 2);
-        drive_to_halt(&mut cpu, &mut bus, u64::MAX);
-        let idx = jit::block::try_admit(&mut cpu, ENTRY, true).expect("admit");
-        cpu.decode_cache.stamp_region(ENTRY, true, idx);
-        let mut best = f64::MAX;
-        for _ in 0..7 {
-            arm_loop(&mut cpu, &mut bus, ITERS);
-            let t = Instant::now();
-            drive_to_halt(&mut cpu, &mut bus, u64::MAX);
-            best = best.min(t.elapsed().as_secs_f64() / (ITERS as f64 * 15.0) * 1e9);
-        }
-        best
-    };
-    let call = time_variant(0);
-    let native = time_variant(1);
-    jit::block::NATIVE_BOOKKEEPING.store(0, Ordering::Relaxed);
-    eprintln!("\n=== Native-bookkeeping A/B (drawcolumn, ns/insn, best of 7) ===");
-    eprintln!("0. call bookkeeping (today's region) : {call:.3} ns/insn");
-    eprintln!(
-        "1. native bookkeeping (emit_native)  : {native:.3} ns/insn  ({:.2}x)",
-        call / native
-    );
-    eprintln!("   -> the inline bookkeeping CALL is ~2 ns/slot x 8 inline slots ~= 16 ns of a");
-    eprintln!(
-        "      ~{:.0} ns iteration (~1%); even a fully-native version cannot move the",
-        call * 15.0
-    );
-    eprintln!("      drawcolumn. Most cost remains in the 7 memory-slot dispatches.");
-    eprintln!("=== end A/B ===\n");
 }
 
 /// The region trampoline must stay byte-identical to the interpreter on the host-pointer

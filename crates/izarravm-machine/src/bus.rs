@@ -354,6 +354,37 @@ impl CpuBus for MachineBus<'_> {
         2 + u64::from(self.cache.code_fetch_wait_states())
     }
 
+    fn jit_cached_fetch_run_clocks(&self, start: u32, count: u32) -> Option<u64> {
+        if count == 0 {
+            return Some(0);
+        }
+        let end = start.checked_add(count - 1)?;
+        if end < 0x000A_0000 {
+            return Some(self.jit_fetch_cost_clocks());
+        }
+        let first = self.apply_a20(start);
+        let last = self.apply_a20(end);
+        let wait_states = self.code_fetch_wait_states(first);
+        if last != first.wrapping_add(count - 1) || wait_states != self.code_fetch_wait_states(last)
+        {
+            return None;
+        }
+        let accesses = if first >= 0x000A_0000 && self.is_device_window(first, BusWidth::Byte) {
+            count
+        } else {
+            1
+        };
+        Some((2 + u64::from(wait_states)) * u64::from(accesses))
+    }
+
+    fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
+        raw.checked_add(additional_raw)?
+            .checked_mul(u64::from(self.bus_num_at_batch_start))?
+            .checked_add(self.bus_rem_at_batch_start)
+            .map(|scaled| scaled / u64::from(self.bus_den_at_batch_start))
+    }
+
     /// One byte-wide direct data access: `clocks_for(Byte, cost.l1)` = 2 + the flat L1 wait-state,
     /// exactly what `charge_direct_memory` records for a direct-page hit in the Approximate class.
     fn jit_data_byte_cost_clocks(&self) -> u64 {

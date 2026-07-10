@@ -1468,15 +1468,32 @@ fn sized_mem_moves_run_identically() {
     assert_shape_identical(sized_copy_program(200), &sized_copy_arm, true);
 }
 
+#[test]
+fn block_builder_stops_at_the_entry_code_page() {
+    let mut cpu = fresh();
+    let mut memory = vec![0u8; 0x2000];
+    for offset in (0..16).step_by(2) {
+        memory[0x0ff8 + offset] = 0x8b;
+        memory[0x0ff9 + offset] = 0xc3; // mov eax,ebx
+    }
+    memory[0x1008] = 0xf4;
+    let mut bus = TestBus::with_memory(memory);
+    cpu.registers.eip = 0x0ff8;
+    drive_to_halt(&mut cpu, &mut bus);
+
+    let (slots, is_loop) = jit::block::build_block(&cpu, 0x0ff8, true).expect("warm block");
+    assert!(!is_loop);
+    assert_eq!(slots.len(), 4);
+    assert!(slots.iter().all(|slot| slot.lin < 0x1000));
+}
+
 // ---- Linear-block auto-admission gate ----
 
-/// Auto-admission (hotness) must REFUSE a linear (non-self-loop) block: it runs once per entry
-/// then returns, so the region prologue/epilogue is pure overhead over the same interpreted
-/// instructions (measured: admitting the hot linear basic blocks was a ~2.9x Doom wall
-/// regression). The forced/test path (`reject_linear = false`) still admits it, and a real
-/// self-loop still admits under the gate. Refusal is always state-correct.
+/// Auto-admission refuses short or mixed linear blocks, admits a linear block with four native
+/// interior slots, and keeps the existing self-loop path. This avoids the measured broad-linear
+/// Doom regression while permitting blocks that can amortize one entry and terminal helper.
 #[test]
-fn auto_admit_gate_refuses_linear_but_keeps_loops() {
+fn auto_admit_gate_requires_a_native_linear_body_and_keeps_loops() {
     // A linear block: nop; mov eax,ebx; hlt -> build_block yields a 2-slot non-loop.
     let mut lin = fresh();
     let mut m = vec![0u8; 0x1000];
@@ -1495,6 +1512,53 @@ fn auto_admit_gate_refuses_linear_but_keeps_loops() {
         jit::block::try_admit_gated(&mut lin, 0x200, true, false).is_some(),
         "the forced/test path still admits the same linear block"
     );
+
+    // Five register moves followed by HLT produce four native interior slots and one precise
+    // terminal slot. This is the minimum linear shape that repays one region entry.
+    let mut native_interp = fresh();
+    let mut native_lin = fresh();
+    let mut m = vec![0u8; 0x1000];
+    m[0x1ff] = 0x90; // starter so the region entry is a continuation
+    for offset in (0..10).step_by(2) {
+        m[0x200 + offset] = 0x8b;
+        m[0x201 + offset] = 0xc3; // mov eax,ebx
+    }
+    m[0x20a] = 0xf4;
+    let mut native_interp_bus = TestBus::with_memory(m.clone());
+    let mut native_bus = TestBus::with_memory(m);
+    for cpu in [&mut native_interp, &mut native_lin] {
+        cpu.registers.eip = 0x1ff;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ebx(0x1234_5678);
+    }
+    drive_to_halt(&mut native_interp, &mut native_interp_bus);
+    drive_to_halt(&mut native_lin, &mut native_bus);
+    assert_eq!(native_interp, native_lin, "warm phases must match");
+    let native_region = jit::block::try_admit_gated(&mut native_lin, 0x200, true, true)
+        .expect("four native interior slots should admit a hot linear block");
+    {
+        let region = native_lin.jit_regions.get_mut(native_region).unwrap();
+        assert!(!region.is_loop);
+        assert_eq!(region.ctx.slots.len(), 5);
+    }
+    native_lin
+        .decode_cache
+        .stamp_region(0x200, true, native_region);
+    for cpu in [&mut native_interp, &mut native_lin] {
+        cpu.registers.eip = 0x1ff;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ebx(0x89ab_cdef);
+    }
+    let entries_before = native_lin.perf_counters().jit_region_entries;
+    drive_to_halt(&mut native_interp, &mut native_interp_bus);
+    drive_to_halt(&mut native_lin, &mut native_bus);
+    assert_eq!(
+        native_interp, native_lin,
+        "native linear execution diverged"
+    );
+    assert_eq!(native_interp_bus.memory, native_bus.memory);
+    assert!(native_lin.perf_counters().jit_region_entries > entries_before);
+    assert!(native_lin.perf_counters().jit_native_insns >= 4);
 
     // A self-loop (the byte-copy loop) still admits with the gate on.
     let mut lp = fresh();
