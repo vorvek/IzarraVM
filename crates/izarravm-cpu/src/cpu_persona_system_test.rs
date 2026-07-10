@@ -1499,7 +1499,7 @@ fn two_byte_convention_charges_the_second_byte_exactly_once() {
 /// size prefixes, LOCK 0xF0, and REP/REPNE 0xF3/0xF2) and 0x0F (the two-byte escape), none of
 /// which is an instruction on its own — `read_prefixes`/`decode` consume them before
 /// `route_group` ever classifies the following opcode, so reaching them AS an opcode is a decode
-/// bug — plus 0x63 (ARPL) and 0xF1 (ICEBP/INT1), which are genuinely unimplemented. Everything
+/// bug, plus 0xF1 (ICEBP/INT1), which is genuinely unimplemented. Everything
 /// else in the single-byte space is implemented and MUST route to a real group. This list is the
 /// sole authority for "not routed as a single-byte opcode"; the coverage test below derives the
 /// implemented set as its complement.
@@ -1508,7 +1508,6 @@ const UNIMPLEMENTED_SINGLE_BYTE: &[u8] = &[
     0x66, 0x67, // operand-size / address-size prefix bytes
     0xf0, 0xf2, 0xf3, // LOCK / REPNE / REP prefix bytes
     0x0f, // two-byte (0F) escape: folded into 0x0F00 | second by `decode`, never routed bare
-    0x63, // ARPL (unimplemented)
     0xf1, // ICEBP / INT1 (unimplemented)
 ];
 
@@ -1609,9 +1608,9 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
         // The eight prefix bytes are valid as prefixes; they only #UD when they are the whole
         // instruction (no following opcode), which `read_prefixes` consumes as a prefix. To
         // exercise the Fallback opcode arm we need a
-        // byte that is an *opcode*, never a prefix: ARPL (0x63) and ICEBP (0xf1). The prefix
+        // byte that is an *opcode*, never a prefix: ICEBP (0xf1). The prefix
         // bytes are covered by the routing-partition test above and the dedicated #UD guards.
-        if matches!(op, 0x63 | 0xf1) {
+        if op == 0xf1 {
             let mut cpu = CpuGsw::default();
             cpu.load_segment_real(SegmentIndex::Cs, 0);
             cpu.registers.eip = 0;
@@ -1659,9 +1658,8 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
 #[test]
 fn single_byte_f1_is_an_undefined_opcode() {
     // 0xF1 (ICEBP / INT1) is not implemented as a single-byte opcode. It must #UD through the
-    // production split exactly like ARPL (0x63): `route_group` leaves it on Fallback and the
-    // Fallback arm raises UnsupportedOpcode. Dedicated guard alongside the ARPL/prefix-byte
-    // #UD tests so a future edit that mis-routes 0xF1 is caught here.
+    // production split: `route_group` leaves it on Fallback and the Fallback arm raises
+    // UnsupportedOpcode. This guard catches any future edit that mis-routes 0xF1.
     let mut cpu = CpuGsw::default();
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.registers.eip = 0;

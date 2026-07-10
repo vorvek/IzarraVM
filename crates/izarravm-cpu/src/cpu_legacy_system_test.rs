@@ -660,27 +660,83 @@ fn sldt_is_invalid_in_real_mode() {
 }
 
 #[test]
-fn a12_unimplemented_neighbours_stay_undefined() {
-    // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
-    // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
-    // the routing so a future edit can't silently capture them. 0x63 (ARPL) #UDs (vector 6, no
-    // error code) through the split, never a panic. (0F B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV
-    // reg,DR / MOV DR,reg moved OFF this list once implemented -- see the `lss`/`lfs`/`lgs` tests
-    // below and the ledger-row-25 `mov_dr*` tests above.)
-    let code = &[0x63, 0xc0][..]; // ARPL AX, AX
-    let (mut cpu, memory) = real_mode_cpu(code, 0x40);
+fn arpl_register_form_raises_only_a_less_restrictive_rpl() {
+    let (mut cpu, memory) = protected_cpu(&[0x63, 0xc8], 0, 0); // ARPL AX,CX
+    cpu.write_reg16(Reg16::Ax, 0x0029);
+    cpu.write_reg16(Reg16::Cx, 0x0003);
+    cpu.registers.eflags = FLAG_CF | FLAG_SF | FLAG_OF | 0x2;
     let mut bus = TestBus::with_memory(memory);
-    let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            InternalFault::Exception {
-                vector: 6,
-                error_code: None
-            }
-        ),
-        "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
+
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+
+    assert_eq!(cpu.read_reg16(Reg16::Ax), 0x002b);
+    assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0003);
+    assert_eq!(
+        cpu.eflags() & (FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF),
+        FLAG_CF | FLAG_ZF | FLAG_SF | FLAG_OF
     );
+
+    cpu.registers.eip = 0;
+    cpu.write_reg16(Reg16::Ax, 0x002b);
+    cpu.write_reg16(Reg16::Cx, 0x0001);
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.read_reg16(Reg16::Ax), 0x002b);
+    assert!(!cpu.flag(FLAG_ZF));
+}
+
+#[test]
+fn arpl_memory_form_updates_the_selector_word() {
+    let (mut cpu, mut memory) = protected_cpu(&[0x63, 0x0f], 0, 0); // ARPL [BX],CX
+    cpu.write_reg16(Reg16::Bx, 0x0040);
+    cpu.write_reg16(Reg16::Cx, 0x0002);
+    memory[0x40..0x42].copy_from_slice(&0x0030_u16.to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+
+    assert_eq!(
+        u16::from_le_bytes(bus.memory[0x40..0x42].try_into().unwrap()),
+        0x0032
+    );
+    assert!(cpu.flag(FLAG_ZF));
+}
+
+#[test]
+fn arpl_is_undefined_in_real_and_v86_modes() {
+    let (mut real, memory) = real_mode_cpu(&[0x63, 0xc0], 0x40);
+    let mut real_bus = TestBus::with_memory(memory);
+    assert!(matches!(
+        exec_one_split(&mut real, &mut real_bus),
+        Err(InternalFault::Exception { vector: 6, .. })
+    ));
+
+    let (mut v86, memory) = protected_cpu(&[0x63, 0xc0], 0, 0);
+    v86.registers.eflags |= FLAG_VM;
+    v86.cpl = 3;
+    let mut v86_bus = TestBus::with_memory(memory);
+    assert!(matches!(
+        exec_one_split(&mut v86, &mut v86_bus),
+        Err(InternalFault::Exception { vector: 6, .. })
+    ));
+}
+
+#[test]
+fn arpl_uses_the_386_and_486_class_cycle_counts() {
+    for (mode, expected) in [
+        (GswMode::Gsw386Slow, 20),
+        (GswMode::Gsw386, 20),
+        (GswMode::Gsw486, 9),
+        (GswMode::Gsw586, 7),
+    ] {
+        let (mut cpu, memory) = protected_cpu(&[0x63, 0xc8], 0, 0);
+        cpu.set_mode(mode);
+        let mut bus = TestBus::with_memory(memory);
+        assert_eq!(
+            exec_one_split(&mut cpu, &mut bus).unwrap().core_clocks,
+            expected,
+            "{mode:?}"
+        );
+    }
 }
 
 // ---- PUSH/POP FS/GS (0F A0/A1/A8/A9) ----

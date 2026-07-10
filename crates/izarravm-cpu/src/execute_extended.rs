@@ -239,7 +239,8 @@ impl CpuGsw {
     /// UNCHANGED, so the invalidation hooks Stage B depends on still fire exactly as before. The
     /// far pointer for LES/LDS is read FROM MEMORY here (against live registers), never at decode.
     /// Dispatches off the FULL u16 `insn.opcode` (0x0F00/01/02/03/06/20/22 plus single-byte
-    /// 0x62/0xc4/0xc5) so the `as u8` narrowing can never alias a 0F opcode onto a single-byte one.
+    /// 0x62/0x63/0xc4/0xc5) so the `as u8` narrowing can never alias a 0F opcode onto a single-byte
+    /// one.
     pub(super) fn execute_system_seg_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
@@ -604,6 +605,29 @@ impl CpuGsw {
                     _ => return Err(undefined_opcode()),
                 }
                 Ok(clocks(6))
+            }
+            0x63 => {
+                // ARPL r/m16,r16 raises a selector's requested privilege level when the source
+                // RPL is more restrictive. It exists only in protected mode and always operates
+                // on 16-bit selectors, regardless of the operand-size attribute.
+                if !self.is_protected_mode() || self.is_v86_mode() {
+                    return Err(undefined_opcode());
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let destination = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                let source_rpl = self.read_gpr16(modrm.reg) & 3;
+                let adjusted = destination & 3 < source_rpl;
+                if adjusted {
+                    let selector = (destination & !3) | source_rpl;
+                    self.write_operand_sized(bus, operand, OperandSize::Word, u32::from(selector))?;
+                }
+                self.set_flag(FLAG_ZF, adjusted);
+                let clocks_used = match self.persona() {
+                    CpuPersona::I386 => 20,
+                    CpuPersona::I486 => 9,
+                    CpuPersona::I586 => 7,
+                };
+                Ok(clocks(clocks_used))
             }
             0x62 => {
                 // BOUND r, m: the memory operand holds the signed lower and upper array bounds;

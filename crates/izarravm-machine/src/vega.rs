@@ -193,10 +193,17 @@ impl Vega {
     }
 
     pub(crate) fn is_graphics_mode(&self) -> bool {
-        matches!(
-            self.vga.active_mode(),
-            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX | VideoMode::Cga
-        )
+        match self.active_display() {
+            ActiveDisplay::MargoLfb | ActiveDisplay::Distira => true,
+            ActiveDisplay::VgaRaster => matches!(
+                self.vga.active_mode(),
+                VideoMode::Mode13h
+                    | VideoMode::Planar
+                    | VideoMode::ModeX
+                    | VideoMode::Cga
+                    | VideoMode::Hercules
+            ),
+        }
     }
 
     pub(crate) fn display_refresh_hz(&self) -> f64 {

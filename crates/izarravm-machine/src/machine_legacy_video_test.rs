@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_video::{DISTIRA_REG_FB_WIDTH, SST_SWAPBUFFER_CMD};
 
 #[test]
 fn machine_advances_the_vga_beam_with_cpu_clocks() {
@@ -41,6 +42,38 @@ fn display_refresh_uses_misc_output_clock_select() {
         (clock28 / clock25 - 28_322_000.0 / 25_175_000.0).abs() < 0.01,
         "expected refresh ratio to follow Misc Output clock select"
     );
+}
+
+#[test]
+fn graphics_mode_reporting_follows_the_active_vega_engine() {
+    let mut machine = test_machine();
+    assert!(!machine.is_graphics_mode());
+
+    assert!(machine.set_vga_mode(0x13));
+    assert!(machine.is_graphics_mode());
+
+    machine.video_mut().set_text_mode();
+    assert!(!machine.is_graphics_mode());
+
+    machine.set_margo_mode_640x480x8();
+    assert!(machine.is_graphics_mode());
+
+    let width = 2_u32.to_le_bytes();
+    for (byte, value) in width.into_iter().enumerate() {
+        machine.write_physical_u8(
+            DISTIRA_MMIO_BASE + DISTIRA_REG_FB_WIDTH as u32 + byte as u32,
+            value,
+        );
+    }
+    for byte in 0..4 {
+        machine.write_physical_u8(DISTIRA_MMIO_BASE + SST_SWAPBUFFER_CMD as u32 + byte, 0);
+    }
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+    assert!(machine.is_graphics_mode());
+
+    assert!(machine.set_vga_mode(0x13));
+    machine.video_mut().set_text_mode();
+    assert!(!machine.is_graphics_mode());
 }
 
 #[test]
@@ -289,6 +322,7 @@ fn hercules_graphics_routes_b0000_and_b8000_through_the_machine() {
         bus.write_io(0x3B8, BusWidth::Byte, 0x0A, false).unwrap(); // GRPH + video enable
     }
     assert_eq!(machine.video().active_mode(), VideoMode::Hercules);
+    assert!(machine.is_graphics_mode());
     assert_eq!(machine.video().raster_width(), 720);
     assert_eq!(machine.video().raster_height(), 370);
 
