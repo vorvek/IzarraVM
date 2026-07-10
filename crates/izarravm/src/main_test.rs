@@ -349,3 +349,20 @@ fn boot_suite_failure_summary_lists_every_failed_record() {
         .retain(|record| record.status != SuiteRecordStatus::Fail);
     assert_eq!(boot_suite_failure_summary(&results), None);
 }
+
+#[test]
+fn state_glide_ovl_discovery_is_case_insensitive() {
+    let dir = std::env::temp_dir().join(format!(
+        "izarravm-glide-ovl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(load_state_glide_ovl(&dir), None);
+    std::fs::write(dir.join("gLiDe2x.oVl"), b"state fallback").unwrap();
+    assert_eq!(load_state_glide_ovl(&dir), Some(b"state fallback".to_vec()));
+    std::fs::remove_dir_all(dir).ok();
+}

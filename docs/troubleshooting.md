@@ -37,19 +37,47 @@ manual](resonique2/manual.md):
   choose Munt or the exact host destination connected to the receiver's MIDI
   IN side. See the [ReSonique 2 manual](resonique2/manual.md#midi-and-wavetable).
 
+### Which ROM files does Munt need?
+
+Choose one control ROM and the PCM ROM from the same row:
+
+| Module | Control ROM | PCM ROM |
+| --- | --- | --- |
+| MT-32, old generation | `ctrl_mt32_1_04.rom`, `ctrl_mt32_1_05.rom`, `ctrl_mt32_1_06.rom`, or `ctrl_mt32_1_07.rom` | `pcm_mt32.rom` |
+| MT-32, new generation | `ctrl_mt32_2_04.rom`, `ctrl_mt32_2_06.rom`, or `ctrl_mt32_2_07.rom` | `pcm_mt32.rom` |
+| CM-32L | `ctrl_cm32l_1_00.rom` or `ctrl_cm32l_1_02.rom` | `pcm_cm32l.rom` |
+| CM-32LN | `ctrl_cm32ln_1_00.rom` | `pcm_cm32l.rom` |
+
+Settings accepts arbitrary control and PCM paths, so the archive filenames can
+be selected directly. For automatic discovery, copy and rename an MT-32 pair
+to `~/.izarravm/MT32_CONTROL.ROM` and `~/.izarravm/MT32_PCM.ROM`. Copy and
+rename a CM-32L or CM-32LN pair to `~/.izarravm/CM32L_CONTROL.ROM` and
+`~/.izarravm/CM32L_PCM.ROM`. Discovery is ASCII case-insensitive and is disabled
+under `--portable`; paths selected in Settings still work. The source names in
+the table match the `mt32pi` directory in the [Roland MT-32 ROMs
+archive](https://archive.org/details/Roland-MT-32-ROMs).
+
 ## A 3D-accelerated game doesn't detect Distira
 
 Distira supports both DOS Glide linking models. A static build contains Glide
 inside the executable and needs no OVL; the original Voodoo Graphics Tomb
-Raider executable is verified this way. A dynamic build needs a compatible
-`GLIDE2X.OVL` beside the game; Carmageddon is verified with a local Glide 2.48
-OVL.
+Raider executable is verified this way. Many dynamic builds already include a
+compatible `GLIDE2X.OVL` beside the game. That game-local copy takes priority.
 
 Make sure you are running the game's Voodoo Graphics build. For a dynamic
-build, check that its expected OVL is present and matches the game. IzarraVM
-does not ship proprietary Glide binaries or game data. See [VEGA technical
-reference, section 10](vega/vega-technical-reference.md#10-distira-3d) for the
-emulated hardware contract.
+build without its own OVL, place a compatible Voodoo Graphics file at
+`~/.izarravm/GLIDE2X.OVL`. The file-name check is ASCII case-insensitive.
+IzarraVM exposes it through `C:\DOS`, after the game's current directory in the
+normal DOS search order. When neither copy exists, IzarraVM does not inject a
+replacement or diagnostic OVL. A
+[3DBVoodoo2 driver-disc image](https://archive.org/details/3-dbvoodoo-2_202302)
+is archived for reference.
+
+IzarraVM neither downloads nor redistributes ROMs, Glide drivers, or game data.
+Archive item metadata is not a license. Use these files only when you have the
+lawful right to do so. See [VEGA technical reference, section
+10](vega/vega-technical-reference.md#10-distira-3d) for the emulated hardware
+contract.
 
 ## Where do my files actually live?
 

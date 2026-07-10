@@ -115,12 +115,15 @@ impl Machine {
         Ok(())
     }
 
-    /// Mount a host folder as C: through Katea in "user-folder mode": seed the
-    /// default CONFIG.SYS/AUTOEXEC.BAT into `dir` if missing, then overlay only the
-    /// OS binaries so the host folder's config files are authoritative (the user
-    /// owns them). The GUI and `--hdd-folder` use this. For the override mode (a
-    /// throwaway runner disk) see [`mount_hdd_folder_with`](Self::mount_hdd_folder_with).
-    pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+    /// Mount a host folder in user-folder mode and add in-memory system
+    /// overrides. System binaries such as `GLIDE2X.OVL` land in `C:\DOS`. Host
+    /// files remain visible in their own directories, so DOS's normal
+    /// current-directory-before-PATH lookup keeps a game-local file first.
+    pub fn mount_hdd_folder_with_user_overrides(
+        &mut self,
+        dir: &std::path::Path,
+        overrides: Vec<(String, Vec<u8>)>,
+    ) -> std::io::Result<()> {
         let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
         // Seed the user-owned config from the payload we already hold (parse the
         // image once), before `user_folder_overlay` below consumes `payload.files`.
@@ -129,7 +132,8 @@ impl Machine {
             &payload_file(&payload, "CONFIG.SYS"),
             &payload_file(&payload, "AUTOEXEC.BAT"),
         )?;
-        let system_files = user_folder_overlay(payload.files);
+        let mut system_files = user_folder_overlay(payload.files);
+        apply_overrides(&mut system_files, overrides);
         let volume =
             katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
         self.bmide.reset_primary();
@@ -138,6 +142,12 @@ impl Machine {
         let _ = self.publish_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
         Ok(())
+    }
+
+    /// Mount a host folder as C: through Katea in user-folder mode. The GUI and
+    /// `--hdd-folder` use this when there are no extra global fallback files.
+    pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.mount_hdd_folder_with_user_overrides(dir, Vec::new())
     }
 
     /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk

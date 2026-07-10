@@ -807,6 +807,7 @@ impl Emulator {
         rom: Vec<u8>,
         c_drive: PathBuf,
         midi_config: MidiConfig,
+        glide_ovl: Option<Vec<u8>>,
         test_pattern: bool,
         sink: Option<AudioSink>,
         rtc_setup: crate::cmos::RtcSetup,
@@ -825,6 +826,7 @@ impl Emulator {
                     rom,
                     c_drive,
                     midi_config,
+                    glide_ovl,
                     test_pattern,
                     sink,
                     rtc_setup,
@@ -913,6 +915,7 @@ fn emulate(
     rom: Vec<u8>,
     c_drive: PathBuf,
     midi_config: MidiConfig,
+    glide_ovl: Option<Vec<u8>>,
     test_pattern: bool,
     sink: Option<AudioSink>,
     rtc_setup: crate::cmos::RtcSetup,
@@ -939,7 +942,11 @@ fn emulate(
     // TOKAMOUS and SET BLASTER) and overlays the OS binaries (TOKAMOUS.COM ships
     // on the payload), so the mouse and Sound Blaster work and the user owns the
     // config. "Repair Toka-DOS" in the BIOS setup menu resets it.
-    if let Err(err) = machine.mount_hdd_folder(&c_drive) {
+    let overlays = glide_ovl
+        .into_iter()
+        .map(|bytes| ("GLIDE2X.OVL".to_string(), bytes))
+        .collect();
+    if let Err(err) = machine.mount_hdd_folder_with_user_overrides(&c_drive, overlays) {
         error!(%err, "failed to mount C: host folder");
     }
     // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
@@ -1223,6 +1230,7 @@ pub struct GuiApp {
     rom: Vec<u8>,
     c_drive: PathBuf,
     midi_config: MidiConfig,
+    glide_ovl: Option<Vec<u8>>,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
     title: String,
@@ -1466,6 +1474,7 @@ impl GuiApp {
         c_drive: PathBuf,
         cd_image: Option<PathBuf>,
         midi_config: MidiConfig,
+        glide_ovl: Option<Vec<u8>>,
         test_pattern: bool,
         rtc_setup: crate::cmos::RtcSetup,
     ) -> Self {
@@ -1500,6 +1509,7 @@ impl GuiApp {
             rom,
             c_drive,
             midi_config,
+            glide_ovl,
             test_pattern,
             rtc_setup,
             title,
@@ -1578,6 +1588,7 @@ impl GuiApp {
             self.rom.clone(),
             self.c_drive.clone(),
             self.midi_config.clone(),
+            self.glide_ovl.clone(),
             self.test_pattern,
             sink,
             self.rtc_setup.clone(),

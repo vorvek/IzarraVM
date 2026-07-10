@@ -23,7 +23,7 @@ use serde_json::json;
 use std::cmp::Reverse;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default cycle budget for --headless-test-rom. Large enough that test386.bin
 /// reaches its POST-0x03 fault out of the box; halting ROMs return at their HLT
@@ -254,8 +254,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(dir) = &cli.hdd_folder {
+        let glide_ovl = load_state_glide_ovl(&state_dir_path());
         return run_boot_hdd_folder(
             dir,
+            glide_ovl,
             cli.cycles,
             &hardware,
             cli.dump_result,
@@ -278,12 +280,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Read host local time and resolve host-side cmos.bin now, on the main thread,
     // before the emulation thread spawns. now_local() is sound only single-threaded.
     let rtc_setup = cmos::RtcSetup::from_c_root(&config.dos.c_drive);
+    let glide_ovl = load_state_glide_ovl(&state_dir_path());
     gui::run(
         MachineProfile::from_hardware_profile(&hardware),
         rom,
         config.dos.c_drive.clone(),
         config.dos.cd_image.clone(),
         config.audio.midi.clone(),
+        glide_ovl,
         cli.margo_test_pattern,
         rtc_setup,
     )?;
@@ -311,6 +315,34 @@ fn c_root_path(portable: bool) -> PathBuf {
         exe_dir.join("c_drive")
     } else {
         state_dir_path().join("c_drive")
+    }
+}
+
+fn load_state_glide_ovl(state_dir: &Path) -> Option<Vec<u8>> {
+    let canonical = state_dir.join("GLIDE2X.OVL");
+    let path = canonical.is_file().then_some(canonical).or_else(|| {
+        std::fs::read_dir(state_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("GLIDE2X.OVL"))
+            })
+            .min()
+    })?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            info!(path = %path.display(), "using global GLIDE2X.OVL fallback");
+            Some(bytes)
+        }
+        Err(error) => {
+            warn!(%error, path = %path.display(), "could not read global GLIDE2X.OVL fallback");
+            None
+        }
     }
 }
 
@@ -618,6 +650,7 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
 /// of the flat-image boot loop.
 fn run_boot_hdd_folder(
     dir: &Path,
+    glide_ovl: Option<Vec<u8>>,
     cycles: Option<u64>,
     hardware: &HardwareProfile,
     dump_result: bool,
@@ -627,7 +660,11 @@ fn run_boot_hdd_folder(
         MachineProfile::from_hardware_profile(hardware),
         izarravm_firmware::izarra_bios(),
     )?;
-    machine.mount_hdd_folder(dir)?;
+    let overlays = glide_ovl
+        .into_iter()
+        .map(|bytes| ("GLIDE2X.OVL".to_string(), bytes))
+        .collect();
+    machine.mount_hdd_folder_with_user_overrides(dir, overlays)?;
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
     // run. Reads the guest-clock attribution of e.g. the x87 opcode rows
