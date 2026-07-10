@@ -637,15 +637,26 @@ fn rdtsc_is_undefined_opcode_below_586() {
 }
 
 #[test]
-fn p6_conditional_move_families_are_undefined_on_every_mode() {
-    let instructions: &[&[u8]] = &[
-        &[0x0f, 0x44, 0xc3], // CMOVE AX,BX
-        &[0xda, 0xc9],       // FCMOVE ST(0),ST(1)
-        &[0xdb, 0xc1],       // FCMOVNB ST(0),ST(1)
-        &[0xdb, 0xe9],       // FUCOMI ST(0),ST(1)
-        &[0xdb, 0xf1],       // FCOMI ST(0),ST(1)
-        &[0xdf, 0xe9],       // FUCOMIP ST(0),ST(1)
-        &[0xdf, 0xf1],       // FCOMIP ST(0),ST(1)
+fn p6_conditional_moves_follow_x87_fault_priority() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        assert!(matches!(
+            run_at_mode(&[0x0f, 0x44, 0xc3], mode).unwrap_err(), // CMOVE AX,BX
+            InternalFault::Exception { vector: 6, .. }
+        ));
+    }
+
+    let x87_instructions: &[&[u8]] = &[
+        &[0xda, 0xc9], // FCMOVE ST(0),ST(1)
+        &[0xdb, 0xc1], // FCMOVNB ST(0),ST(1)
+        &[0xdb, 0xe9], // FUCOMI ST(0),ST(1)
+        &[0xdb, 0xf1], // FCOMI ST(0),ST(1)
+        &[0xdf, 0xe9], // FUCOMIP ST(0),ST(1)
+        &[0xdf, 0xf1], // FCOMIP ST(0),ST(1)
     ];
     for mode in [
         GswMode::Gsw386Slow,
@@ -653,10 +664,11 @@ fn p6_conditional_move_families_are_undefined_on_every_mode() {
         GswMode::Gsw486,
         GswMode::Gsw586,
     ] {
-        for code in instructions {
+        let vector = if mode.persona().has_fpu() { 6 } else { 7 };
+        for code in x87_instructions {
             assert!(matches!(
                 run_at_mode(code, mode).unwrap_err(),
-                InternalFault::Exception { vector: 6, .. }
+                InternalFault::Exception { vector: fault, .. } if fault == vector
             ));
         }
     }
@@ -1193,10 +1205,19 @@ fn note_a20_changed_invalidates_the_decode_cache() {
 }
 
 fn run_at_mode(code: &[u8], mode: GswMode) -> Result<CycleOutcome, InternalFault> {
+    run_at_mode_with_cr0(code, mode, 0)
+}
+
+fn run_at_mode_with_cr0(
+    code: &[u8],
+    mode: GswMode,
+    cr0: u32,
+) -> Result<CycleOutcome, InternalFault> {
     let mut memory = vec![0; 1024];
     memory[..code.len()].copy_from_slice(code);
     let mut cpu = CpuGsw::default();
     cpu.set_mode(mode);
+    cpu.control.cr0 = cr0;
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
@@ -1263,14 +1284,89 @@ fn every_mmx_opcode_is_gated_to_the_586_persona() {
 }
 
 #[test]
-fn external_x87_behavior_remains_available_on_every_mode() {
+fn x87_availability_follows_the_fixed_cpu_persona() {
+    for (mode, available) in [
+        (GswMode::Gsw386Slow, false),
+        (GswMode::Gsw386, false),
+        (GswMode::Gsw486, true),
+        (GswMode::Gsw586, true),
+    ] {
+        let result = run_at_mode(&[0xd9, 0xe8], mode); // FLD1
+        if available {
+            assert!(result.is_ok(), "{mode} has an x87 unit");
+        } else {
+            assert!(matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 7,
+                    error_code: None
+                })
+            ));
+        }
+    }
+}
+
+#[test]
+fn x87_escapes_honor_emulation_and_task_switched_state() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for cr0 in [CR0_EM, CR0_TS, CR0_EM | CR0_TS] {
+            assert!(matches!(
+                run_at_mode_with_cr0(&[0xd9, 0xe8], mode, cr0),
+                Err(InternalFault::Exception {
+                    vector: 7,
+                    error_code: None
+                })
+            ));
+        }
+    }
+}
+
+#[test]
+fn fwait_uses_the_mp_ts_pair_in_every_mode() {
     for mode in [
         GswMode::Gsw386Slow,
         GswMode::Gsw386,
         GswMode::Gsw486,
         GswMode::Gsw586,
     ] {
-        assert!(run_at_mode(&[0xd9, 0xe8], mode).is_ok()); // FLD1
+        for cr0 in [0, CR0_EM, CR0_MP, CR0_TS, CR0_EM | CR0_TS] {
+            assert!(
+                run_at_mode_with_cr0(&[0x9b], mode, cr0).is_ok(),
+                "{mode} CR0={cr0:#x}"
+            );
+        }
+        assert!(matches!(
+            run_at_mode_with_cr0(&[0x9b], mode, CR0_MP | CR0_TS),
+            Err(InternalFault::Exception {
+                vector: 7,
+                error_code: None
+            })
+        ));
+    }
+}
+
+#[test]
+fn live_mode_switch_changes_x87_availability() {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    let mut bus = TestBus::with_memory(vec![0xd9, 0xe8]); // FLD1
+
+    for (mode, available) in [
+        (GswMode::Gsw486, true),
+        (GswMode::Gsw386Slow, false),
+        (GswMode::Gsw586, true),
+        (GswMode::Gsw386, false),
+    ] {
+        cpu.set_mode(mode);
+        cpu.set_eip(0);
+        let result = exec_one_split(&mut cpu, &mut bus);
+        assert_eq!(result.is_ok(), available, "{mode}");
+        if !available {
+            assert!(matches!(
+                result,
+                Err(InternalFault::Exception { vector: 7, .. })
+            ));
+        }
     }
 }
 

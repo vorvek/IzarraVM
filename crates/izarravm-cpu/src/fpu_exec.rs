@@ -4,7 +4,7 @@
 use super::*;
 
 impl CpuGsw {
-    // ============================ x87 FPU (387-class) ============================
+    // ============================ x87 FPU ============================
     // Escape opcodes 0xD8-0xDF. Registers are f64 (see fpu.rs for the precision
     // ceiling). Coverage now spans arithmetic (all D8/DC/DA/DE forms), the
     // transcendentals, 80-bit-extended and BCD memory operands, and the
@@ -13,12 +13,8 @@ impl CpuGsw {
     // f64), stores ignore RC (FIST/FRNDINT/FBSTP honor it), stack over/underflow
     // does not fault, and the env image's instruction/data pointers store as zero.
 
-    /// The x87 FPU block (0xD8-0xDF) + WAIT/FWAIT (0x9B) through the decode/execute split (task
-    /// A13). A THIN wrapper: `decode` already fetched the ModRM once (and the addressing descriptor
-    /// for the `mod != 3` memory forms), so this reproduces the fused handler's pending-#MF gate,
-    /// resolves the pre-decoded operand against the live registers, and calls the existing
-    /// `execute_fpu_register` / `execute_fpu_memory` — the entire x87 stack/control/status logic
-    /// stays in those leaf helpers verbatim. Nothing is re-fetched from the instruction stream.
+    /// Execute an x87 escape or FWAIT from the decoded instruction. The shared
+    /// entry applies #NM and pending-#MF gates before the leaf operation runs.
     pub(super) fn execute_fpu_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
@@ -26,6 +22,14 @@ impl CpuGsw {
     ) -> ExecResult<CycleOutcome> {
         let opcode = insn.opcode as u8;
         if opcode == 0x9b {
+            // WAIT checks task switching only when CR0.MP requests that behavior.
+            // CR0.EM and physical FPU presence do not make WAIT an x87 escape.
+            if self.control.cr0 & (CR0_MP | CR0_TS) == (CR0_MP | CR0_TS) {
+                return Err(InternalFault::Exception {
+                    vector: 7,
+                    error_code: None,
+                });
+            }
             // WAIT/FWAIT: trap with #MF if the x87 has a pending unmasked exception (gated on
             // CR0.NE; otherwise the FERR#/IRQ13 path the PC uses applies and is not modeled). With
             // nothing pending it retires as a no-op. Identical to the former fused 0x9b arm.
@@ -40,6 +44,16 @@ impl CpuGsw {
             return Ok(CycleOutcome {
                 core_clocks: self.scale_fp_clocks(raw.core_clocks, FpOpClass::Wait),
                 halted: raw.halted,
+            });
+        }
+
+        // Every x87 escape raises #NM before touching FPU or memory state when
+        // this fixed persona has no unit, emulation is requested, or a task switch
+        // has left the FPU unavailable.
+        if !self.persona().has_fpu() || self.control.cr0 & (CR0_EM | CR0_TS) != 0 {
+            return Err(InternalFault::Exception {
+                vector: 7,
+                error_code: None,
             });
         }
 

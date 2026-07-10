@@ -21,8 +21,54 @@ fn int11_returns_equipment_word() {
     assert_eq!((ax >> 9) & 0x07, 2, "two serial ports advertised");
     // Bits 15-14 = 10b: two parallel printer ports advertised (LPT1 + LPT2).
     assert_eq!((ax >> 14) & 0x03, 2, "two parallel ports advertised");
-    // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
+    // The 386 mode has no external 387.
     assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
+}
+
+#[test]
+fn int11_coprocessor_bit_follows_the_boot_mode() {
+    for (mode, expected) in [
+        (GswMode::Gsw386Slow, 0),
+        (GswMode::Gsw386, 0),
+        (GswMode::Gsw486, BIOS_EQUIPMENT_FPU),
+        (GswMode::Gsw586, BIOS_EQUIPMENT_FPU),
+    ] {
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        profile.cpu = mode;
+        let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+        machine.cpu.registers.set_eax(0);
+        machine.handle_int11();
+        assert_eq!(
+            machine.cpu.registers.eax() as u16 & BIOS_EQUIPMENT_FPU,
+            expected,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn int11_coprocessor_bit_tracks_live_mode_switches() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+
+    for (mode, expected) in [
+        (GswMode::Gsw486, BIOS_EQUIPMENT_FPU),
+        (GswMode::Gsw386Slow, 0),
+        (GswMode::Gsw586, BIOS_EQUIPMENT_FPU),
+        (GswMode::Gsw386, 0),
+    ] {
+        machine.set_mode(mode);
+        machine.cpu.registers.set_eax(0);
+        machine.handle_int11();
+        assert_eq!(
+            machine.cpu.registers.eax() as u16 & BIOS_EQUIPMENT_FPU,
+            expected,
+            "{mode}"
+        );
+    }
 }
 
 #[test]
