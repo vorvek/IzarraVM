@@ -462,6 +462,9 @@ fn boot_and_read_font_rows(cmos_codepage: u8, glyph: u8, rows: usize) -> Vec<u8>
 #[path = "machine_ata_dma_test.rs"]
 mod ata_dma;
 #[cfg(test)]
+#[path = "machine_atapi_timing_test.rs"]
+mod atapi_timing;
+#[cfg(test)]
 #[path = "machine_audio_test.rs"]
 mod audio;
 #[cfg(test)]

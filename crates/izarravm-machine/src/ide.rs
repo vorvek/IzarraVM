@@ -6,21 +6,20 @@
 //!
 //! Channel choice: the CD-ROM lives on the **secondary** IDE channel, the
 //! conventional home for an optical drive, at command block 0x170-0x177, control
-//! block 0x376, IRQ15. The primary channel (0x1F0/0x3F6, IRQ14) is left free for
-//! a future hard disk. Only the master device (drive 0) is populated; selecting
-//! the slave reads back a not-present status.
+//! block 0x376, IRQ15. The primary channel (0x1F0/0x3F6, IRQ14) hosts the hard
+//! disk. Only the secondary master is populated; selecting its slave reports a
+//! command error.
 //!
 //! ATAPI handshake modeled (SFF-8020i): the host issues the ATA PACKET command
 //! (0xA0) to the command register, then writes the 12-byte command descriptor
-//! block to the data register. The device runs the packet and, for a data-in
-//! command, presents the result through the data register with the byte-count
-//! limit (cylinder low/high) set and DRQ raised, asserting IRQ15 if interrupts
-//! are enabled. IDENTIFY PACKET DEVICE (0xA1) and the ATA soft-reset path are
-//! handled directly. DMA is not modeled: transfers are PIO, which every ATAPI
-//! driver and IZCDEX supports.
+//! block to the data register. Command acceptance, seeks, spin-up, and each PIO
+//! sector become visible on the machine master timeline. IDENTIFY PACKET DEVICE
+//! (0xA1) and the ATA soft-reset path are handled directly. DMA is not modeled:
+//! transfers are PIO, which every ATAPI driver and IZCDEX supports.
 
 use crate::atapi::{self, AtapiDevice, CmdResult};
 use crate::cdimage::DATA_SECTOR;
+use izarravm_core::MASTER_CLOCK_HZ;
 
 /// Secondary-channel command-block base (0x170-0x177).
 pub const SECONDARY_CMD_BASE: u16 = 0x170;
@@ -29,14 +28,23 @@ pub const SECONDARY_CTRL: u16 = 0x376;
 /// The IRQ the secondary channel raises on command completion.
 pub const SECONDARY_IRQ: u8 = 15;
 
+const COMMAND_LATENCY_TICKS: u64 = MASTER_CLOCK_HZ / 10_000; // 100 us
+const PACKET_ACCEPT_TICKS: u64 = MASTER_CLOCK_HZ / 20_000; // 50 us accelerated DRQ
+const SPIN_UP_TICKS: u64 = MASTER_CLOCK_HZ / 5; // 200 ms
+const MAX_SEEK_TICKS: u64 = MASTER_CLOCK_HZ / 10; // 100 ms
+const CD_BYTES_PER_SECOND: u64 = 1_800 * 1024; // 12x CD-ROM
+
+fn sector_transfer_ticks() -> u64 {
+    (DATA_SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(CD_BYTES_PER_SECOND as u128) as u64
+}
+
 /// ATA status register bits.
 mod status {
     pub const ERR: u8 = 0x01; // error
     pub const DRQ: u8 = 0x08; // data request: a PIO transfer is ready
     pub const DSC: u8 = 0x10; // device seek complete / service
     pub const DRDY: u8 = 0x40; // device ready
-    // BSY (0x80) is never set: the model runs each command synchronously inside
-    // the port write, so the host never observes a busy window.
+    pub const BSY: u8 = 0x80; // command or media operation in progress
 }
 
 /// What the register file is waiting for on the data port.
@@ -48,6 +56,25 @@ enum Phase {
     AwaitPacket,
     /// Presenting data-in bytes to the host (the buffer is being drained).
     DataIn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    AcceptPacket,
+    ExecutePacket([u8; 12]),
+    PresentReadSector,
+    CompleteSeek { lba: u32 },
+    PrepareIdentify,
+    DeviceReset,
+    IdentifyNak,
+    Diagnostic,
+    Abort,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingCommand {
+    ticks_remaining: u64,
+    action: PendingAction,
 }
 
 /// One IDE channel hosting a single ATAPI device as the master.
@@ -75,14 +102,19 @@ pub struct IdeChannel {
     /// End offset (exclusive) of the DRQ block currently presented to the host.
     /// When the cursor reaches it the next block is armed, or the phase ends.
     data_in_block_end: usize,
+    /// End offset of the media bytes whose transfer deadline has elapsed. Read
+    /// commands grow this one sector at a time; short control replies expose the
+    /// whole buffer at their command deadline.
+    data_in_ready_end: usize,
     /// Per-command host byte-count limit (cylinder low/high at PACKET time). Zero
     /// means no limit was programmed, so the whole buffer goes out in one block.
     byte_count_limit: usize,
     /// Set when a command completes so the machine forwards IRQ15 to the PIC.
     irq_pending: bool,
-    /// Pending mechanical time (seconds) for the last data command, drained by
-    /// the machine so a read costs wall-clock time like the floppy.
-    pending_stall: f64,
+    pending_command: Option<PendingCommand>,
+    /// Current optical head location and the first LBA of the active read.
+    head_lba: u32,
+    read_lba: u32,
     /// Bytes moved by the last data command, for the access LED.
     last_access_bytes: usize,
 }
@@ -106,9 +138,12 @@ impl Default for IdeChannel {
             data_in: Vec::new(),
             data_in_pos: 0,
             data_in_block_end: 0,
+            data_in_ready_end: 0,
             byte_count_limit: 0,
             irq_pending: false,
-            pending_stall: 0.0,
+            pending_command: None,
+            head_lba: 0,
+            read_lba: 0,
             last_access_bytes: 0,
         }
     }
@@ -146,12 +181,47 @@ impl IdeChannel {
         pending
     }
 
-    /// Take and clear the pending mechanical-time charge (seconds) for the last
-    /// data command, so the machine can stall the guest the way the floppy does.
-    pub fn take_stall_secs(&mut self) -> f64 {
-        let secs = self.pending_stall;
-        self.pending_stall = 0.0;
-        secs
+    pub(crate) fn irq_enabled(&self) -> bool {
+        !self.interrupts_disabled
+    }
+
+    /// Master ticks until the next command or media boundary.
+    pub(crate) fn ticks_until_completion(&self) -> Option<u64> {
+        self.pending_command
+            .as_ref()
+            .map(|pending| pending.ticks_remaining)
+    }
+
+    /// Master ticks until progress can produce an interrupt. An execute boundary
+    /// may schedule mechanical work instead, in which case a halted machine
+    /// immediately asks again for the new deadline.
+    pub(crate) fn ticks_until_irq(&self) -> Option<u64> {
+        self.pending_command
+            .as_ref()
+            .filter(|pending| pending.action != PendingAction::AcceptPacket)
+            .map(|pending| pending.ticks_remaining)
+    }
+
+    /// Advance pending work on the authoritative machine timeline. Consume
+    /// surplus ticks when one internal boundary schedules another so a split or
+    /// unsplit advance reaches the same state.
+    pub(crate) fn advance_master_ticks(&mut self, ticks: u64) {
+        let mut remaining = ticks;
+        loop {
+            let Some(pending) = self.pending_command.as_mut() else {
+                return;
+            };
+            if remaining < pending.ticks_remaining {
+                pending.ticks_remaining -= remaining;
+                return;
+            }
+            remaining -= pending.ticks_remaining;
+            let action = self.pending_command.take().unwrap().action;
+            self.finish_pending(action);
+            if remaining == 0 {
+                return;
+            }
+        }
     }
 
     /// Take and clear the access-byte count for the GUI LED.
@@ -211,6 +281,9 @@ impl IdeChannel {
             return false;
         }
         let reg = port - SECONDARY_CMD_BASE;
+        if self.status & status::BSY != 0 && reg != 0 {
+            return true;
+        }
         match reg {
             0 => self.write_data_byte(value),
             1 => self.features = value,
@@ -231,7 +304,10 @@ impl IdeChannel {
         self.data_in.clear();
         self.data_in_pos = 0;
         self.data_in_block_end = 0;
+        self.data_in_ready_end = 0;
         self.byte_count_limit = 0;
+        self.pending_command = None;
+        self.irq_pending = false;
         self.status = status::DRDY | status::DSC;
         // Diagnostic code: device 0 passed (ATA 5.2.9). `new` runs this on
         // construction so power-up presents the same code, as real hardware does.
@@ -245,27 +321,52 @@ impl IdeChannel {
     }
 
     fn write_command(&mut self, command: u8) {
+        if self.pending_command.is_some() || self.phase != Phase::Idle {
+            return;
+        }
         if !self.master_selected() {
-            // No slave device: a command to it sets ERR.
-            self.status = status::ERR;
+            self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS);
             return;
         }
         match command {
-            0xA0 => self.begin_packet(),
-            0xA1 => self.identify_packet_device(),
-            0x08 => self.soft_reset(),   // DEVICE RESET
-            0xEC => self.identify_nak(), // IDENTIFY DEVICE: ATAPI aborts it
-            0x90 => self.execute_diagnostic(),
-            0x00 => {
-                // NOP (ATA-3 7.13): always aborts, never a silent success.
-                self.status = status::DRDY | status::ERR;
-                self.error = 0x04; // ABRT
+            0xA0 => self.schedule(PendingAction::AcceptPacket, PACKET_ACCEPT_TICKS),
+            0xA1 => self.schedule(PendingAction::PrepareIdentify, COMMAND_LATENCY_TICKS),
+            0x08 => self.schedule(PendingAction::DeviceReset, COMMAND_LATENCY_TICKS),
+            0xEC => self.schedule(PendingAction::IdentifyNak, COMMAND_LATENCY_TICKS),
+            0x90 => self.schedule(PendingAction::Diagnostic, COMMAND_LATENCY_TICKS),
+            // NOP and unsupported commands abort after command latency.
+            _ => self.schedule(PendingAction::Abort, COMMAND_LATENCY_TICKS),
+        }
+    }
+
+    fn schedule(&mut self, action: PendingAction, ticks: u64) {
+        self.phase = Phase::Idle;
+        self.status = status::BSY;
+        self.error = 0;
+        self.irq_pending = false;
+        self.pending_command = Some(PendingCommand {
+            ticks_remaining: ticks.max(1),
+            action,
+        });
+    }
+
+    fn finish_pending(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::AcceptPacket => self.begin_packet(),
+            PendingAction::ExecutePacket(cdb) => self.execute_packet(cdb),
+            PendingAction::PresentReadSector => self.present_read_sector(),
+            PendingAction::CompleteSeek { lba } => {
+                self.head_lba = lba;
+                self.complete_packet();
             }
-            _ => {
-                // Unsupported command: abort.
-                self.status = status::DRDY | status::ERR;
-                self.error = 0x04; // ABRT
+            PendingAction::PrepareIdentify => self.identify_packet_device(),
+            PendingAction::DeviceReset => {
+                self.soft_reset();
+                self.raise_irq();
             }
+            PendingAction::IdentifyNak => self.identify_nak(),
+            PendingAction::Diagnostic => self.execute_diagnostic(),
+            PendingAction::Abort => self.abort(),
         }
     }
 
@@ -289,7 +390,7 @@ impl IdeChannel {
         self.packet_filled = 0;
         self.packet = [0u8; 12];
         // The host has already written the byte-count limit (cylinder low/high)
-        // before issuing PACKET. Capture it now so run_packet can chunk a large
+        // before issuing PACKET. Capture it now so the data path can chunk a large
         // data-in transfer into DRQ blocks no bigger than the limit.
         self.byte_count_limit = u16::from_le_bytes([self.lba_mid, self.lba_high]) as usize;
         // Arm the CDB phase: the device sets C/D=1, I/O=0 (command, from host).
@@ -306,6 +407,7 @@ impl IdeChannel {
         let block = identify_block();
         self.data_in = block;
         self.data_in_pos = 0;
+        self.data_in_ready_end = self.data_in.len();
         self.phase = Phase::DataIn;
         // IDENTIFY ignores the host byte-count limit: the whole block is one DRQ.
         self.byte_count_limit = 0;
@@ -322,6 +424,18 @@ impl IdeChannel {
         self.lba_low = 0x01;
         self.lba_mid = 0x14;
         self.lba_high = 0xEB;
+        self.raise_irq();
+    }
+
+    fn abort(&mut self) {
+        self.phase = Phase::Idle;
+        self.data_in.clear();
+        self.data_in_pos = 0;
+        self.data_in_block_end = 0;
+        self.data_in_ready_end = 0;
+        self.status = status::DRDY | status::ERR;
+        self.error = 0x04;
+        self.raise_irq();
     }
 
     fn read_data_byte(&mut self) -> u8 {
@@ -337,11 +451,16 @@ impl IdeChannel {
             self.data_in.clear();
             self.data_in_pos = 0;
             self.data_in_block_end = 0;
+            self.data_in_ready_end = 0;
             self.sector_count = atapi::interrupt_reason::COMMAND_COMPLETE;
             self.status = status::DRDY | status::DSC;
+            self.raise_irq();
+        } else if self.data_in_pos >= self.data_in_ready_end {
+            // The ready sector drained. Keep later sectors busy until their own
+            // transfer deadlines instead of exposing the whole HLE buffer.
+            self.schedule(PendingAction::PresentReadSector, sector_transfer_ticks());
         } else if self.data_in_pos >= self.data_in_block_end {
-            // Block done but more data remains: arm the next DRQ block and pulse
-            // the IRQ, the way ATAPI signals the host to drain the next block.
+            // The host byte-count block drained inside the ready sector.
             self.present_data_block();
             self.raise_irq();
         }
@@ -357,32 +476,48 @@ impl IdeChannel {
             self.packet_filled += 1;
         }
         if self.packet_filled == self.packet.len() {
-            self.run_packet();
+            let cdb = self.packet;
+            self.schedule(PendingAction::ExecutePacket(cdb), COMMAND_LATENCY_TICKS);
         }
     }
 
-    /// Execute the assembled 12-byte CDB through the ATAPI device and set up the
-    /// data-in phase (or completion) accordingly.
-    fn run_packet(&mut self) {
-        let cdb = self.packet;
+    /// Execute an assembled CDB after command latency. Short replies become
+    /// visible now; reads and seeks schedule their mechanical boundary.
+    fn execute_packet(&mut self, cdb: [u8; 12]) {
         match self.device.execute(&cdb) {
             CmdResult::Data(buf) => {
-                self.charge_time(cdb[0], &buf);
                 if buf.is_empty() {
-                    // Non-data command: complete with DRDY, raise the IRQ. The
-                    // device left the reason on command-complete (C/D=1, I/O=1).
-                    self.phase = Phase::Idle;
-                    self.status = status::DRDY | status::DSC;
-                    self.error = 0;
+                    if cdb[0] == 0x2B {
+                        let lba = packet_lba(&cdb);
+                        let delay = self.media_delay(lba);
+                        if delay > 0 {
+                            self.schedule(PendingAction::CompleteSeek { lba }, delay);
+                        } else {
+                            self.head_lba = lba;
+                            self.complete_packet();
+                        }
+                    } else {
+                        self.complete_packet();
+                    }
                 } else {
-                    // Data-in: present the first DRQ block. The host byte-count
-                    // limit caps each block; the rest go out as the host drains.
-                    // The device left the reason on data-in (C/D=0, I/O=1).
                     self.data_in = buf;
                     self.data_in_pos = 0;
-                    self.phase = Phase::DataIn;
+                    self.data_in_ready_end = 0;
                     self.error = 0;
-                    self.present_data_block();
+                    self.publish_interrupt_reason();
+                    if is_read_opcode(cdb[0]) {
+                        self.read_lba = packet_lba(&cdb);
+                        self.last_access_bytes = 0;
+                        let delay = self
+                            .media_delay(self.read_lba)
+                            .saturating_add(sector_transfer_ticks());
+                        self.schedule(PendingAction::PresentReadSector, delay);
+                    } else {
+                        self.data_in_ready_end = self.data_in.len();
+                        self.phase = Phase::DataIn;
+                        self.present_data_block();
+                        self.raise_irq();
+                    }
                 }
             }
             CmdResult::Error => {
@@ -391,12 +526,53 @@ impl IdeChannel {
                 self.phase = Phase::Idle;
                 self.status = status::DRDY | status::ERR;
                 self.error = 0x04; // ABRT / CHECK CONDITION (sense already latched)
+                self.publish_interrupt_reason();
+                self.raise_irq();
             }
         }
-        // Publish the phase the command landed in onto the sector-count
-        // (interrupt-reason) port the host polls.
-        self.publish_interrupt_reason();
+    }
+
+    fn present_read_sector(&mut self) {
+        let sector_start = self.data_in_ready_end;
+        self.data_in_ready_end = self
+            .data_in_ready_end
+            .saturating_add(DATA_SECTOR)
+            .min(self.data_in.len());
+        self.head_lba = self
+            .read_lba
+            .saturating_add((sector_start / DATA_SECTOR) as u32);
+        self.last_access_bytes = self
+            .last_access_bytes
+            .saturating_add(self.data_in_ready_end - sector_start);
+        self.phase = Phase::DataIn;
+        self.sector_count = atapi::interrupt_reason::DATA_IN;
+        self.error = 0;
+        self.present_data_block();
         self.raise_irq();
+    }
+
+    fn complete_packet(&mut self) {
+        self.phase = Phase::Idle;
+        self.sector_count = atapi::interrupt_reason::COMMAND_COMPLETE;
+        self.status = status::DRDY | status::DSC;
+        self.error = 0;
+        self.raise_irq();
+    }
+
+    fn media_delay(&mut self, lba: u32) -> u64 {
+        let spin = if self.device.ensure_started() {
+            SPIN_UP_TICKS
+        } else {
+            0
+        };
+        let sectors = self
+            .device
+            .image()
+            .map_or(1, crate::cdimage::CdImage::total_sectors)
+            .max(1);
+        let distance = self.head_lba.abs_diff(lba).min(sectors);
+        let seek = (u128::from(distance) * u128::from(MAX_SEEK_TICKS) / u128::from(sectors)) as u64;
+        spin.saturating_add(seek)
     }
 
     /// Arm the next data-in DRQ block at the current cursor: set the byte count
@@ -404,7 +580,7 @@ impl IdeChannel {
     /// remaining bytes capped by the host byte-count limit, or the whole
     /// remainder when no limit (or a limit at least as large) was programmed.
     fn present_data_block(&mut self) {
-        let remaining = self.data_in.len() - self.data_in_pos;
+        let remaining = self.data_in_ready_end - self.data_in_pos;
         let block = if self.byte_count_limit > 0 && self.byte_count_limit < remaining {
             self.byte_count_limit
         } else {
@@ -414,23 +590,6 @@ impl IdeChannel {
         self.lba_mid = (block & 0xFF) as u8;
         self.lba_high = ((block >> 8) & 0xFF) as u8;
         self.status = status::DRDY | status::DRQ | status::DSC;
-    }
-
-    /// Charge the mechanical time and access-byte count for a read command, the
-    /// way the floppy charges seek + transfer. Only the data-returning READ
-    /// commands cost time; control commands are instant.
-    fn charge_time(&mut self, opcode: u8, buf: &[u8]) {
-        if matches!(opcode, 0x28 | 0xA8 | 0xBE) && !buf.is_empty() {
-            let bytes = buf.len();
-            self.last_access_bytes = bytes;
-            // A fixed seek component plus the 12x transfer time. Pragmatic: a
-            // fraction of the full-stroke seek, independent of head position
-            // (the model does not track CD head geometry).
-            let transfer = bytes as f64 / crate::atapi::CD_BYTES_PER_SEC;
-            let seek = crate::atapi::CD_SEEK_MAX_SECS * 0.2;
-            self.pending_stall += seek + transfer;
-        }
-        let _ = DATA_SECTOR;
     }
 
     /// Copy the device's current interrupt reason (C/D, I/O) onto the sector-count
@@ -444,12 +603,21 @@ impl IdeChannel {
     }
 }
 
+fn is_read_opcode(opcode: u8) -> bool {
+    matches!(opcode, 0x28 | 0xA8 | 0xBE)
+}
+
+fn packet_lba(cdb: &[u8; 12]) -> u32 {
+    u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]])
+}
+
 /// The 512-byte IDENTIFY PACKET DEVICE response. Word 0 marks an ATAPI removable
 /// CD-ROM; the model number and firmware strings are byte-swapped ASCII per ATA.
 fn identify_block() -> Vec<u8> {
     let mut words = [0u16; 256];
     // General config: bits 15-14 = 10b (ATAPI device), bits 12-8 = 0x05 (CD-ROM
-    // command set), bits 6-5 = removable, bits 1-0 = 0 (12-byte packet).
+    // command set), bit 7 = removable, bits 6-5 = 10b accelerated command DRQ,
+    // and bits 1-0 = 0 (12-byte packet).
     words[0] = 0x85C0;
     // LBA is supported. DMA stays clear until the secondary ATAPI DMA path is
     // implemented; the BMIDE register bank alone is not a transfer engine.

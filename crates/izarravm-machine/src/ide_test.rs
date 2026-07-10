@@ -12,29 +12,58 @@ fn data_disc(sectors: u32) -> CdImage {
     CdImage::from_iso(bytes).unwrap()
 }
 
+fn advance_next(ch: &mut IdeChannel) -> u64 {
+    let ticks = ch.ticks_until_completion().expect("pending IDE deadline");
+    ch.advance_master_ticks(ticks);
+    ticks
+}
+
+fn begin_packet(ch: &mut IdeChannel) {
+    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    advance_next(ch);
+    assert_eq!(ch.status & status::DRQ, status::DRQ);
+    assert!(!ch.take_irq());
+}
+
+fn execute_cdb(ch: &mut IdeChannel, cdb: [u8; 12]) {
+    begin_packet(ch);
+    for byte in cdb {
+        ch.write_port(SECONDARY_CMD_BASE, byte);
+    }
+    while ch.status & status::BSY != 0 {
+        advance_next(ch);
+    }
+}
+
+fn clear_unit_attention(ch: &mut IdeChannel) {
+    execute_cdb(ch, [0u8; 12]);
+    let _ = ch.take_irq();
+}
+
 /// Drive the full PACKET handshake for a READ(10) of one sector at `lba` and
 /// return the drained data-in buffer.
 fn packet_read10(ch: &mut IdeChannel, lba: u32) -> Vec<u8> {
-    // PACKET command.
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    assert_eq!(ch.status & status::DRQ, status::DRQ);
-    // Feed the 12-byte CDB through the data register.
     let mut cdb = [0u8; 12];
     cdb[0] = 0x28;
     cdb[2..6].copy_from_slice(&lba.to_be_bytes());
     cdb[7] = 0;
     cdb[8] = 1; // one sector
-    for b in cdb {
-        ch.write_port(SECONDARY_CMD_BASE, b);
-    }
+    execute_cdb(ch, cdb);
     // After the packet, data-in is armed and the byte count is set.
     let count = u16::from_le_bytes([ch.lba_mid, ch.lba_high]) as usize;
     assert_eq!(count, DATA_SECTOR);
     assert_eq!(ch.status & status::DRQ, status::DRQ);
     // Drain the data register.
     let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        out.push(ch.read_port(SECONDARY_CMD_BASE).unwrap());
+    while out.len() < DATA_SECTOR {
+        let block = u16::from_le_bytes([ch.lba_mid, ch.lba_high]) as usize;
+        for _ in 0..block {
+            out.push(ch.read_port(SECONDARY_CMD_BASE).unwrap());
+        }
+        if ch.status & status::BSY != 0 {
+            advance_next(ch);
+        }
     }
     out
 }
@@ -43,11 +72,7 @@ fn packet_read10(ch: &mut IdeChannel, lba: u32) -> Vec<u8> {
 fn packet_read10_round_trips_a_sector() {
     let mut ch = IdeChannel::new();
     ch.device_mut().insert(data_disc(8));
-    // Clear the post-insert unit attention with a TEST UNIT READY.
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    for b in [0u8; 12] {
-        ch.write_port(SECONDARY_CMD_BASE, b);
-    }
+    clear_unit_attention(&mut ch);
     let buf = packet_read10(&mut ch, 2);
     assert_eq!(buf.len(), DATA_SECTOR);
     assert_eq!(buf[0], 0x52); // 0x50 + 2
@@ -60,11 +85,7 @@ fn packet_read10_round_trips_a_sector() {
 fn packet_command_raises_irq_when_enabled() {
     let mut ch = IdeChannel::new();
     ch.device_mut().insert(data_disc(4));
-    // Run a TEST UNIT READY packet.
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    for b in [0u8; 12] {
-        ch.write_port(SECONDARY_CMD_BASE, b);
-    }
+    execute_cdb(&mut ch, [0u8; 12]);
     assert!(ch.take_irq());
     // A second take clears it.
     assert!(!ch.take_irq());
@@ -76,10 +97,7 @@ fn nien_suppresses_the_irq() {
     ch.device_mut().insert(data_disc(4));
     // Set nIEN via the control register.
     ch.write_port(SECONDARY_CTRL, 0x02);
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    for b in [0u8; 12] {
-        ch.write_port(SECONDARY_CMD_BASE, b);
-    }
+    execute_cdb(&mut ch, [0u8; 12]);
     assert!(!ch.take_irq());
 }
 
@@ -87,6 +105,8 @@ fn nien_suppresses_the_irq() {
 fn identify_packet_device_returns_512_bytes() {
     let mut ch = IdeChannel::new();
     ch.write_port(SECONDARY_CMD_BASE + 7, 0xA1);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    advance_next(&mut ch);
     let count = u16::from_le_bytes([ch.lba_mid, ch.lba_high]) as usize;
     assert_eq!(count, 512);
     let mut block = Vec::new();
@@ -113,29 +133,86 @@ fn slave_select_makes_commands_error() {
     let mut ch = IdeChannel::new();
     ch.write_port(SECONDARY_CMD_BASE + 6, 0x10); // select slave
     ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    advance_next(&mut ch);
     assert_eq!(ch.status & status::ERR, status::ERR);
 }
 
 #[test]
-fn read10_charges_seek_and_transfer_time() {
+fn read10_reaches_each_boundary_on_its_exact_tick() {
     let mut ch = IdeChannel::new();
     ch.device_mut().insert(data_disc(8));
-    // clear unit attention
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    for b in [0u8; 12] {
-        ch.write_port(SECONDARY_CMD_BASE, b);
+    clear_unit_attention(&mut ch);
+
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x28;
+    cdb[8] = 1;
+    begin_packet(&mut ch);
+    for byte in cdb {
+        ch.write_port(SECONDARY_CMD_BASE, byte);
     }
-    let _ = ch.take_stall_secs();
-    let _ = packet_read10(&mut ch, 0);
-    let secs = ch.take_stall_secs();
-    assert!(secs > 0.0);
+    let command_ticks = ch.ticks_until_completion().unwrap();
+    ch.advance_master_ticks(command_ticks - 1);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    assert!(!ch.take_irq());
+    ch.advance_master_ticks(1);
+    let media_ticks = ch.ticks_until_completion().unwrap();
+    ch.advance_master_ticks(media_ticks - 1);
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    assert_eq!(ch.take_access_bytes(), 0);
+    ch.advance_master_ticks(1);
+    assert_eq!(ch.status & status::DRQ, status::DRQ);
+    assert!(ch.take_irq());
     assert_eq!(ch.take_access_bytes(), DATA_SECTOR);
+}
+
+#[test]
+fn splitting_master_time_does_not_move_a_read_boundary() {
+    fn armed_read() -> IdeChannel {
+        let mut ch = IdeChannel::new();
+        ch.device_mut().insert(data_disc(8));
+        clear_unit_attention(&mut ch);
+        let mut cdb = [0u8; 12];
+        cdb[0] = 0x28;
+        cdb[8] = 1;
+        begin_packet(&mut ch);
+        for byte in cdb {
+            ch.write_port(SECONDARY_CMD_BASE, byte);
+        }
+        ch
+    }
+
+    let mut whole = armed_read();
+    let mut split = armed_read();
+    let elapsed = COMMAND_LATENCY_TICKS + SPIN_UP_TICKS + sector_transfer_ticks();
+    whole.advance_master_ticks(elapsed);
+    for part in [
+        17,
+        elapsed / 3,
+        elapsed / 5,
+        elapsed - 17 - elapsed / 3 - elapsed / 5,
+    ] {
+        split.advance_master_ticks(part);
+    }
+
+    assert_eq!(whole.status, split.status);
+    assert_eq!(whole.phase, split.phase);
+    assert_eq!(whole.data_in_pos, split.data_in_pos);
+    assert_eq!(whole.data_in_ready_end, split.data_in_ready_end);
+    assert_eq!(
+        whole.ticks_until_completion(),
+        split.ticks_until_completion()
+    );
+    assert_eq!(whole.take_access_bytes(), split.take_access_bytes());
+    assert_eq!(whole.take_irq(), split.take_irq());
 }
 
 #[test]
 fn nop_command_always_aborts() {
     let mut ch = IdeChannel::new();
     ch.write_port(SECONDARY_CMD_BASE + 7, 0x00); // NOP
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    advance_next(&mut ch);
     assert_eq!(ch.status & status::DRDY, status::DRDY);
     assert_eq!(ch.status & status::ERR, status::ERR);
     assert_eq!(ch.error, 0x04);
@@ -145,6 +222,8 @@ fn nop_command_always_aborts() {
 fn execute_diagnostic_passes_with_atapi_signature() {
     let mut ch = IdeChannel::new();
     ch.write_port(SECONDARY_CMD_BASE + 7, 0x90); // EXECUTE DEVICE DIAGNOSTIC
+    assert_eq!(ch.status & status::BSY, status::BSY);
+    advance_next(&mut ch);
     // Device 0 passed and no error bit, so BIOS detection still sees it.
     assert_eq!(ch.error, 0x01);
     assert_eq!(ch.status & status::ERR, 0);
@@ -160,20 +239,14 @@ fn execute_diagnostic_passes_with_atapi_signature() {
 fn packet_read_chunks_to_the_byte_count_limit() {
     let mut ch = IdeChannel::new();
     ch.device_mut().insert(data_disc(8));
-    // Clear the post-insert unit attention with a TEST UNIT READY.
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    for b in [0u8; 12] {
-        ch.write_port(SECONDARY_CMD_BASE, b);
-    }
+    clear_unit_attention(&mut ch);
 
     // Discard the TUR completion interrupt so the block IRQs below are the
     // only ones the assertions see.
     ch.take_irq();
 
-    // Read two sectors so the data-in buffer is larger than one limit block.
-    // The limit is deliberately NOT a divisor of the total, so the final block
-    // is a short remainder (1500, 1500, 1096 over 4096) exercising the partial
-    // block path, not just full-limit blocks.
+    // Read two sectors with a limit that splits each ready sector into 1500 and
+    // 548 byte blocks.
     let sectors = 2usize;
     let total = sectors * DATA_SECTOR; // 4096
     let limit = 1500usize;
@@ -181,7 +254,7 @@ fn packet_read_chunks_to_the_byte_count_limit() {
     // Program a byte-count limit smaller than the data before PACKET.
     ch.write_port(SECONDARY_CMD_BASE + 4, (limit & 0xFF) as u8); // cyl low
     ch.write_port(SECONDARY_CMD_BASE + 5, (limit >> 8) as u8); // cyl high
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0); // PACKET
+    begin_packet(&mut ch);
     let mut cdb = [0u8; 12];
     cdb[0] = 0x28; // READ(10)
     cdb[2..6].copy_from_slice(&0u32.to_be_bytes()); // lba 0
@@ -190,24 +263,32 @@ fn packet_read_chunks_to_the_byte_count_limit() {
     for b in cdb {
         ch.write_port(SECONDARY_CMD_BASE, b);
     }
+    while ch.status & status::BSY != 0 {
+        advance_next(&mut ch);
+    }
 
     // The first DRQ block arms an interrupt.
     assert!(ch.take_irq(), "the first data block raises IRQ15");
 
-    // Drain block by block. Each block's byte count is the limit, except the
-    // last, which is the remainder. Each new block re-raises the interrupt.
+    // Drain block by block. The next sector remains BSY until its transfer
+    // boundary, while byte-count subblocks within one sector re-arm immediately.
     let mut out = Vec::with_capacity(total);
     let mut drained = 0usize;
     while drained < total {
         assert_eq!(ch.status & status::DRQ, status::DRQ);
         let count = u16::from_le_bytes([ch.lba_mid, ch.lba_high]) as usize;
-        let expected = (total - drained).min(limit);
+        let ready_remaining = DATA_SECTOR - (drained % DATA_SECTOR);
+        let expected = (total - drained).min(limit).min(ready_remaining);
         assert_eq!(count, expected);
         for _ in 0..count {
             out.push(ch.read_port(SECONDARY_CMD_BASE).unwrap());
         }
         drained += count;
         if drained < total {
+            if ch.status & status::BSY != 0 {
+                assert!(!ch.take_irq());
+                advance_next(&mut ch);
+            }
             assert!(ch.take_irq(), "each new data block re-raises IRQ15");
         }
     }
@@ -228,14 +309,10 @@ fn interrupt_reason_walks_the_packet_phases() {
 
     let mut ch = IdeChannel::new();
     ch.device_mut().insert(data_disc(8));
-    // Clear the post-insert unit attention with a TEST UNIT READY.
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
-    for b in [0u8; 12] {
-        ch.write_port(SECONDARY_CMD_BASE, b);
-    }
+    clear_unit_attention(&mut ch);
 
     // PACKET (0xA0): awaiting the CDB. C/D=1, I/O=0 (command, from host).
-    ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
+    begin_packet(&mut ch);
     assert_eq!(ch.read_port(SECTOR_COUNT).unwrap(), ir::AWAIT_PACKET);
     assert_eq!(ir::AWAIT_PACKET, 0x01);
 
@@ -246,6 +323,9 @@ fn interrupt_reason_walks_the_packet_phases() {
     cdb[8] = 1; // one sector
     for b in cdb {
         ch.write_port(SECONDARY_CMD_BASE, b);
+    }
+    while ch.status & status::BSY != 0 {
+        advance_next(&mut ch);
     }
     assert_eq!(ch.status & status::DRQ, status::DRQ);
     assert_eq!(ch.read_port(SECTOR_COUNT).unwrap(), ir::DATA_IN);
