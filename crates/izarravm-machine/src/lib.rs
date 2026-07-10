@@ -1804,6 +1804,7 @@ impl Machine {
             self.cd_audio_sample = 0;
             return out;
         }
+        let [left_volume, right_volume] = self.ide.device().audio_volume();
         // cd_audio_sample is the next sample index within the current frame, carried
         // across render calls so the stream stays continuous. Peek the current
         // frame, drain its remaining samples, then step to the next frame.
@@ -1816,7 +1817,10 @@ impl Machine {
                 let base = sample_in_frame * 4;
                 let l = i16::from_le_bytes([buf[base], buf[base + 1]]);
                 let r = i16::from_le_bytes([buf[base + 2], buf[base + 3]]);
-                out.push((i32::from(l), i32::from(r)));
+                out.push((
+                    i32::from(l) * i32::from(left_volume) / 255,
+                    i32::from(r) * i32::from(right_volume) / 255,
+                ));
                 sample_in_frame += 1;
             }
             if sample_in_frame >= SAMPLES_PER_FRAME {

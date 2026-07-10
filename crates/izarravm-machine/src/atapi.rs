@@ -54,9 +54,11 @@ pub const BSY: u8 = 0x80;
 
 /// The ATAPI Interrupt Reason register is the sector-count register, reinterpreted
 /// during a packet transfer: bit0 = C/D (1 = command/CDB phase, 0 = data phase),
-/// bit1 = I/O (1 = transfer to host, 0 = transfer from host). The three states a
-/// packet command moves through map to three byte values.
+/// bit1 = I/O (1 = transfer to host, 0 = transfer from host). The four packet
+/// phases map to four byte values.
 pub mod interrupt_reason {
+    /// Data-out armed (host-to-device): C/D=0, I/O=0.
+    pub const DATA_OUT: u8 = 0x00;
     /// Awaiting the command packet (CDB): C/D=1, I/O=0.
     pub const AWAIT_PACKET: u8 = 0x01;
     /// Data-in armed (device-to-host): C/D=0, I/O=1.
@@ -136,10 +138,6 @@ impl AtapiDevice {
     }
 
     /// Current CD-audio output volume (mode page 0x0E ports 0 and 1), 0xFF full.
-    /// The mixer can scale the CD-audio stream by these once it consults them.
-    // Limit: stored and reported but not yet applied to the mixer; the audio
-    // path can read these to attenuate the streamed frames.
-    #[allow(dead_code)]
     pub fn audio_volume(&self) -> [u8; 2] {
         self.audio_volume
     }
@@ -214,6 +212,11 @@ impl AtapiDevice {
     /// issues the ATA PACKET command, before the CDB arrives.
     pub fn arm_packet(&mut self) {
         self.interrupt_reason = interrupt_reason::AWAIT_PACKET;
+    }
+
+    /// Mark the device as ready to receive a packet command's parameter list.
+    pub fn arm_data_out(&mut self) {
+        self.interrupt_reason = interrupt_reason::DATA_OUT;
     }
 
     fn set_sense(&mut self, key: u8, asc: u8, ascq: u8) {
@@ -697,9 +700,6 @@ impl AtapiDevice {
     /// the parameter list itself (header plus mode pages) arrives in a data-out
     /// phase. This call acknowledges the command; the page list is applied through
     /// [`Self::mode_select_data`].
-    // Limit: the IDE register file (ide.rs) has no data-out phase yet, so the
-    // parameter list is never delivered and the command only acks. Wire a write
-    // buffer through run_packet that calls mode_select_data to apply the pages.
     fn mode_select10(&mut self, _cdb: &[u8; 12]) -> CmdResult {
         CmdResult::Data(Vec::new())
     }
@@ -709,10 +709,8 @@ impl AtapiDevice {
     /// tracks (page 0x0E CD audio control: the two output-port volumes). Unknown
     /// pages are skipped, the way a forgiving drive treats vendor pages. Returns
     /// Error with latched sense on a malformed list.
-    // Limit: ready for the IDE data-out phase but not yet reachable from it
-    // (only the tests call it). A mode_select10 data-out path will use this.
-    #[allow(dead_code)]
     pub fn mode_select_data(&mut self, params: &[u8]) -> CmdResult {
+        self.interrupt_reason = interrupt_reason::COMMAND_COMPLETE;
         // 8-byte MODE SELECT(10) parameter header, then a block-descriptor area
         // whose length is bytes 6-7, then the mode pages.
         if params.len() < 8 {

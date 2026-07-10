@@ -21,6 +21,19 @@ fn timed_packet(machine: &mut Machine, cdb: [u8; 12]) {
     }
 }
 
+fn timed_packet_data_out(machine: &mut Machine, cdb: [u8; 12], data: &[u8]) {
+    timed_packet(machine, cdb);
+    with_bus(machine, |bus| {
+        for &byte in data {
+            bus.write_io(0x170, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    while let Some(ticks) = machine.ide.ticks_until_completion() {
+        machine.advance_devices_ticks(ticks);
+    }
+}
+
 #[test]
 fn v86spike_enters_v86_and_signals() {
     let mut machine = Machine::new_boot_image(
@@ -582,6 +595,45 @@ fn play_audio_mixes_cd_audio_into_render_audio() {
     assert!(
         pcm.iter().any(|&(l, r)| l != 0 || r != 0),
         "PLAY AUDIO should mix nonzero CD audio into the DAC output"
+    );
+}
+
+#[test]
+fn mode_select_volume_scales_signed_cd_audio_channels() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(20));
+    with_bus(&mut machine, |bus| {
+        for (index, value) in [(0x36u32, 31u32), (0x37, 31)] {
+            bus.write_io(0x224, BusWidth::Byte, index, false).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, value, false).unwrap();
+        }
+    });
+
+    let mut params = vec![0u8; 24];
+    params[8] = 0x0E;
+    params[9] = 14;
+    params[16] = 0x01;
+    params[17] = 0xFF;
+    params[18] = 0x02;
+    params[19] = 0x80;
+    let mut select = [0u8; 12];
+    select[0] = 0x55;
+    select[1] = 0x10;
+    select[7..9].copy_from_slice(&(params.len() as u16).to_be_bytes());
+    timed_packet_data_out(&mut machine, select, &params);
+
+    let mut play = [0u8; 12];
+    play[0] = 0x45;
+    play[5] = 1;
+    play[8] = 16;
+    timed_packet(&mut machine, play);
+    let pcm = machine.render_audio(2000);
+
+    assert!(!pcm.is_empty());
+    assert!(
+        pcm.iter()
+            .all(|&(left, right)| (left, right) == (8000, -4015)),
+        "drive volumes must scale positive and negative Red Book samples per channel"
     );
 }
 
