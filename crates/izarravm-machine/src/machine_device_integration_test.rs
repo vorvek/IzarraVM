@@ -421,6 +421,17 @@ fn fdc_read_data_streams_a_sector_into_memory_over_dma_channel_2() {
         }
     });
 
+    // The port write only scheduled the command. Advance from one fixed-timeline
+    // deadline to the next so spin-up, rotation, and all 512 DMA cycles happen at
+    // their own guest times.
+    while machine.fdc.read_port(0x3F4).unwrap() & 0x40 == 0 {
+        let ticks = machine
+            .fdc
+            .ticks_until_event(machine.master_ticks())
+            .expect("the active FDC command has another deadline");
+        machine.advance_devices_ticks(ticks);
+    }
+
     // The sector landed in the guest buffer over channel 2.
     for i in 0..512usize {
         let got = machine.read_physical_u8(u32::from(BUF) + i as u32);
@@ -428,18 +439,12 @@ fn fdc_read_data_streams_a_sector_into_memory_over_dma_channel_2() {
         assert_eq!(got, want, "byte {i} of the sector in memory");
     }
 
-    // The disk->memory DMA transfer flagged a device memory write, so the run loop will tell
-    // the CPU to drop its prefetch + decode cache (the staged bytes could be re-entered by a
-    // near branch that would not otherwise invalidate). The flag->invalidation step itself is
-    // covered end-to-end by a20_toggle_through_the_run_loop, which shares the seam.
-    assert!(
-        machine.device_wrote_memory,
-        "an FDC disk->memory DMA transfer must flag a device memory write"
+    assert_eq!(
+        machine.dma.master.channels[2].transfer_cycles, 512,
+        "one channel cycle per sector byte"
     );
 
-    // The completion interrupt is IRQ6 (the controller raised it; advance the
-    // device pump so the bus collects it into the PIC).
-    machine.advance_devices(1);
+    // The final DMA deadline has already forwarded IRQ6 to the PIC.
     let pending = with_bus(&mut machine, |bus| bus.interrupt_pending());
     assert!(pending, "FDC completion raised IRQ6");
 

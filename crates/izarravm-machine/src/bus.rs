@@ -32,7 +32,6 @@ impl Machine {
             rtc: &mut self.rtc,
             dma: &mut self.dma,
             fdc: &mut self.fdc,
-            floppy: &mut self.floppy,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
             mixer: &mut self.mixer,
@@ -1138,13 +1137,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if fdc::Fdc::owns_port(port) {
-            self.fdc.write_port(port, value as u8);
-            // A READ/WRITE DATA command stages an execution-phase transfer the
-            // chip cannot run on its own; the bus owns the floppy image and the
-            // DMA channel, so run it here and feed the result phase back.
-            if let Some(req) = self.fdc.take_transfer() {
-                self.run_fdc_transfer(req);
-            }
+            let now_ticks = self.guest_tick_now();
+            self.fdc.write_port_at(port, value as u8, now_ticks);
             return Ok(());
         }
         if self.dsp.write_port(port, value as u8) {
@@ -1157,8 +1151,8 @@ impl CpuBus for MachineBus<'_> {
             // write above recorded the request; fire the block copy here.
             if port == 0x09 && self.dma.mem_to_mem_request_armed() {
                 self.dma.mem_to_mem(self.memory);
-                // A DMA block copy wrote guest RAM directly; if it staged code, drop the caches
-                // (see the FDC transfer path). The run loop honors the flag at end of step.
+                // A DMA block copy wrote guest RAM directly. The run loop honors
+                // the flag at the end of the step and drops cached code.
                 *self.device_wrote_memory = true;
             }
             return Ok(());
@@ -1865,114 +1859,6 @@ impl MachineBus<'_> {
 
         // Writes to an unclaimed physical address have no receiver.
         Ok(())
-    }
-
-    /// Run a floppy READ/WRITE DATA execution phase the FDC staged: move sector
-    /// bytes between the mounted image and guest memory over DMA channel 2, then
-    /// hand the result phase back to the chip.
-    ///
-    /// The transfer walks sectors from the start id up to EOT on the addressed
-    /// track, but the DMA terminal count is the real limit: the channel's
-    /// programmed byte count decides how much actually moves, exactly as on
-    /// hardware where the FDC streams until the DMAC asserts /TC. A read with no
-    /// disk, an off-media address, or a masked/misprogrammed channel terminates
-    /// abnormally.
-    fn run_fdc_transfer(&mut self, req: fdc::TransferRequest) {
-        const FDC_DMA_CHANNEL: usize = 2;
-        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
-            // No media: abnormal termination at the requested address.
-            self.fdc
-                .complete_transfer(req, req.cylinder, req.head, req.sector, false);
-            return;
-        };
-
-        let cyl = u16::from(req.cylinder);
-        let mut sector = req.sector;
-        let mut last_sector = req.sector;
-        let mut moved_any = false;
-        let mut ok = true;
-
-        // Walk sectors up to EOT, stopping early at DMA terminal count. EOT bounds
-        // the track; the spec's sector ids are 1-based.
-        while sector <= req.end_sector && sector <= geom.sectors {
-            if self.dma.at_terminal_count(FDC_DMA_CHANNEL) {
-                break;
-            }
-            if req.read {
-                // Disk -> memory: copy the sector out of the image first (an
-                // immutable borrow), then push the bytes through DMA channel 2.
-                let Some(data) = self
-                    .floppy
-                    .as_ref()
-                    .and_then(|f| f.read_sector(cyl, req.head, sector))
-                    .map(|s| s.to_vec())
-                else {
-                    ok = false;
-                    break;
-                };
-                let mut pushed = 0usize;
-                for &byte in &data {
-                    if self
-                        .dma
-                        .write_byte(FDC_DMA_CHANNEL, self.memory, byte)
-                        .is_none()
-                    {
-                        // DMA reached terminal count (or the channel is not
-                        // programmed for a write transfer): stop streaming.
-                        break;
-                    }
-                    pushed += 1;
-                }
-                if pushed == 0 {
-                    // A masked or unprogrammed channel moved no bytes: abnormal
-                    // termination, not a clean completion (matches the write path).
-                    break;
-                }
-            } else {
-                // Memory -> disk: pull a sector's worth out of the DMA channel,
-                // then commit it to the image.
-                let mut data = vec![0u8; usize::from(req.bytes_per_sec)];
-                let mut filled = 0usize;
-                for slot in data.iter_mut() {
-                    match self.dma.pull_byte(FDC_DMA_CHANNEL, self.memory) {
-                        Some(byte) => {
-                            *slot = byte;
-                            filled += 1;
-                        }
-                        None => break,
-                    }
-                }
-                if filled == 0 {
-                    break; // nothing left to write
-                }
-                let wrote = self
-                    .floppy
-                    .as_mut()
-                    .map(|f| f.write_sector(cyl, req.head, sector, &data))
-                    .unwrap_or(false);
-                if !wrote {
-                    ok = false;
-                    break;
-                }
-            }
-            moved_any = true;
-            last_sector = sector;
-            sector += 1;
-        }
-
-        // Success means at least one sector moved without an off-media fault.
-        let success = ok && moved_any;
-        self.fdc
-            .complete_transfer(req, req.cylinder, req.head, last_sector, success);
-
-        // A disk -> memory transfer wrote guest RAM directly via the DMA controller, bypassing the
-        // CPU's self-modifying-code tracking. If that RAM held cached code (a loaded overlay or boot
-        // stage later re-entered by a near branch, which would not otherwise invalidate), the decode
-        // cache and prefetch must drop it. This runs in the bus, so flag it; the run loop calls the
-        // CPU's note_device_memory_write at the end of the step (where the A20 seam also lives).
-        if req.read && moved_any {
-            *self.device_wrote_memory = true;
-        }
     }
 
     /// Wait-states to charge for a DATA access at the post-A20 physical `address`,

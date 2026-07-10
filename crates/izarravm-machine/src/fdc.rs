@@ -1,103 +1,190 @@
-//! NEC uPD765A / Intel 8272A floppy disk controller, the chip a guest programs
-//! directly through ports 0x3F2-0x3F7.
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! NEC uPD765A / Intel 8272A floppy disk controller.
 //!
-//! Built clean-room from the uPD765A datasheet and the IBM PC/AT technical
-//! reference. The floppy is INT 13h HLE for most guests, but a few program the
-//! FDC straight: this models the register file, the three-phase command protocol
-//! (command, execution, result), and the ST0-ST3 status registers, and drives
-//! sector data over DMA channel 2.
-//!
-//! The chip here is pure state: it decodes commands and parameters, tracks the
-//! per-drive head position and the seek/recalibrate interrupt, and produces a
-//! transfer request the machine fulfils against the mounted image and the 8237A.
-//! It does not own the floppy or the DMA controller; the machine bridges them so
-//! READ/WRITE DATA push bytes through the real channel-2 datapath.
+//! The controller owns its command, execution, and result phases. Mechanical
+//! work is scheduled in fixed master-clock ticks. The machine supplies one DMA
+//! byte when the controller reaches a data deadline, so channel 2 progresses one
+//! 8237 cycle at a time instead of copying a whole sector in an I/O-port write.
+
+use izarravm_core::MASTER_CLOCK_HZ;
+
+use crate::floppy::Geometry;
 
 /// Main status register (0x3F4) bit positions.
 mod msr {
-    /// RQM: the data register is ready for a byte transfer with the CPU.
     pub const RQM: u8 = 0x80;
-    /// DIO: data direction. Set means FDC->CPU (a result byte is waiting);
-    /// clear means CPU->FDC (the chip wants a command or parameter byte).
     pub const DIO: u8 = 0x40;
-    /// NDM: a non-DMA execution phase is in progress. Always clear here: every
-    /// modeled transfer runs over DMA.
-    #[allow(dead_code)]
     pub const NDM: u8 = 0x20;
-    /// CB: a command is in progress (set from the first command byte through the
-    /// last result byte).
     pub const CB: u8 = 0x10;
-    // Bits 3-0 are the per-drive seek-busy flags (DnB); not modeled as busy
-    // because seeks complete inside the command.
 }
 
 /// Status register 0 (ST0) bit fields.
 mod st0 {
-    /// Interrupt code, bits 7-6: 00 normal termination, 01 abnormal, 10 invalid
-    /// command, 11 ready-line changed during polling.
     pub const IC_NORMAL: u8 = 0x00;
     pub const IC_ABNORMAL: u8 = 0x40;
     pub const IC_INVALID: u8 = 0x80;
-    /// SE: seek end. Set when a RECALIBRATE or SEEK finishes.
     pub const SE: u8 = 0x20;
-    // bit2 head address, bits1-0 drive select are OR'd in from the unit.
 }
 
-/// Status register 3 (ST3) bit fields, returned by SENSE DRIVE STATUS.
+/// Status register 3 (ST3) bit fields.
 mod st3 {
-    /// TS: two-sided media. The modeled drives are all double-sided.
     pub const TWO_SIDED: u8 = 0x08;
-    /// T0: track 0. Set while the head is over cylinder 0.
     pub const TRACK0: u8 = 0x10;
-    /// RY: drive ready. Set when media is present.
     pub const READY: u8 = 0x20;
-    /// WP: write protected. Modeled media is writable, so this stays clear.
-    #[allow(dead_code)]
-    pub const WRITE_PROTECT: u8 = 0x40;
-    // bit2 head address, bits1-0 drive select are OR'd in from the unit.
 }
 
-/// What the chip is doing with the data register right now.
+const MILLIS_TICKS: u64 = MASTER_CLOCK_HZ / 1_000;
+const MOTOR_SPIN_UP_TICKS: u64 = MASTER_CLOCK_HZ / 2;
+const MOTOR_SPIN_DOWN_TICKS: u64 = MASTER_CLOCK_HZ * 2;
+const REVOLUTION_TICKS: u64 = MASTER_CLOCK_HZ / 5;
+const NO_READY_TIMEOUT_TICKS: u64 = MASTER_CLOCK_HZ;
+const FLOPPY_SECTOR_BYTES: u16 = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Idle: the next data-register write is a command opcode.
     Command,
-    /// Collecting the parameter bytes a command needs before it executes.
     Parameters,
-    /// Handing result bytes back to the CPU, one read at a time.
+    Execution,
     Result,
 }
 
-/// A data transfer the machine must run for a READ DATA or WRITE DATA command.
-/// The chip produces this after the parameter phase; the machine reads or writes
-/// the addressed sector against the mounted image and moves the bytes over DMA
-/// channel 2, then calls `complete_transfer` to enter the result phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotorPhase {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Motor {
+    phase: MotorPhase,
+    deadline: Option<u64>,
+    rotation_epoch: u64,
+}
+
+impl Default for Motor {
+    fn default() -> Self {
+        Self {
+            phase: MotorPhase::Stopped,
+            deadline: None,
+            rotation_epoch: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaTiming {
+    cylinders: u16,
+    heads: u8,
+    sectors: u8,
+    bytes_per_second: u64,
+}
+
+impl From<Geometry> for MediaTiming {
+    fn from(value: Geometry) -> Self {
+        Self {
+            cylinders: value.cylinders,
+            heads: value.heads,
+            sectors: value.sectors,
+            bytes_per_second: if value.drive_type == 0x04 {
+                62_500
+            } else {
+                31_250
+            },
+        }
+    }
+}
+
+/// A READ DATA or WRITE DATA command decoded into its guest-visible address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransferRequest {
-    pub read: bool, // true READ DATA (disk->memory), false WRITE DATA (memory->disk)
+    pub read: bool,
     pub drive: u8,
     pub cylinder: u8,
     pub head: u8,
-    pub sector: u8,         // first sector id (1-based)
-    pub end_sector: u8,     // last sector id on the track to transfer (EOT parameter)
-    pub bytes_per_sec: u16, // 128 << N from the N parameter (commonly 512)
+    pub sector: u8,
+    pub end_sector: u8,
+    pub bytes_per_sec: u16,
 }
 
-/// The 8272A register file and command engine.
+/// One byte that has reached the FDC data separator and now needs channel 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DmaByteRequest {
+    pub transfer: TransferRequest,
+    pub sector: u8,
+    pub offset: u16,
+}
+
+/// Result of servicing one FDC DMA request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DmaByteOutcome {
+    pub transferred: bool,
+    pub terminal_count: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferState {
+    request: TransferRequest,
+    media: Option<MediaTiming>,
+    sector: u8,
+    offset: u16,
+    last_sector: u8,
+    moved_any: bool,
+    deadline: Option<u64>,
+    awaiting_dma: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimedOperation {
+    Seek {
+        deadline: u64,
+        drive: u8,
+        head: u8,
+        cylinder: u8,
+    },
+    ReadId {
+        deadline: u64,
+        drive: u8,
+        head: u8,
+        sector: u8,
+        valid: bool,
+    },
+    Transfer(TransferState),
+}
+
+impl TimedOperation {
+    fn deadline(self) -> Option<u64> {
+        match self {
+            Self::Seek { deadline, .. } | Self::ReadId { deadline, .. } => Some(deadline),
+            Self::Transfer(state) => state.deadline,
+        }
+    }
+}
+
+/// The 8272A register file, motors, and timed command engine.
 #[derive(Debug, Clone)]
 pub(crate) struct Fdc {
-    dor: u8,                                   // digital output register (0x3F2)
-    phase: Phase,                              // current data-register phase
-    command: Vec<u8>,                          // command opcode + parameter bytes collected so far
-    needed_params: usize,                      // parameter bytes the current command still expects
-    result: Vec<u8>,                           // result bytes the CPU reads back, last byte first
-    present_cyl: [u8; 4],                      // tracked head cylinder per drive
-    irq_pending: bool,    // a completion/seek interrupt is waiting for the host
-    seek_interrupt: bool, // the pending interrupt came from RECALIBRATE/SEEK
-    st0: u8,              // latched ST0 for SENSE INTERRUPT STATUS
-    media_present: bool,  // whether a disk is mounted (drives the RY/disk-change bits)
-    disk_changed: bool,   // DIR bit7: latched media-change line
-    pending_transfer: Option<TransferRequest>, // a READ/WRITE the machine must run
+    dor: u8,
+    phase: Phase,
+    command: Vec<u8>,
+    needed_params: usize,
+    result: Vec<u8>,
+    present_cyl: [u8; 4],
+    seek_busy: u8,
+    irq_edge_pending: bool,
+    seek_interrupt: bool,
+    st0: u8,
+    media: Option<MediaTiming>,
+    disk_changed: bool,
+    motors: [Motor; 4],
+    operation: Option<TimedOperation>,
+    now_ticks: u64,
+    step_rate_ticks: u64,
+    head_load_ticks: u64,
+    non_dma: bool,
 }
 
 impl Default for Fdc {
@@ -109,64 +196,61 @@ impl Default for Fdc {
             needed_params: 0,
             result: Vec::new(),
             present_cyl: [0; 4],
-            irq_pending: false,
+            seek_busy: 0,
+            irq_edge_pending: false,
             seek_interrupt: false,
             st0: 0,
-            media_present: false,
+            media: None,
             disk_changed: false,
-            pending_transfer: None,
+            motors: [Motor::default(); 4],
+            operation: None,
+            now_ticks: 0,
+            step_rate_ticks: 3 * MILLIS_TICKS,
+            head_load_ticks: 4 * MILLIS_TICKS,
+            non_dma: false,
         }
     }
 }
 
 impl Fdc {
-    /// Whether `port` is one of the controller's register ports. 0x3F6 is left
-    /// out: on the AT that address is the hard-disk controller's, not the FDC's,
-    /// and 0x3F7 is shared (the FDC owns its read for the DIR and its write for
-    /// the CCR data rate). 0x3F0/0x3F1 are the PS/2 status registers A/B, accepted
-    /// but not modeled.
-    // Limit: 0x3F0/0x3F1 read back 0; a guest probing the PS/2 status-register
-    // A/B bits sees nothing. The upgrade path is to model those two bytes if a
-    // guest is found that reads the drive-select / write-protect mirror from them.
     pub(crate) fn owns_port(port: u16) -> bool {
         matches!(port, 0x3F0 | 0x3F1 | 0x3F2 | 0x3F4 | 0x3F5 | 0x3F7)
     }
 
-    /// Tell the chip whether a disk is mounted. Drives the ST3 ready bit and the
-    /// DIR disk-change line; the machine calls this when media is mounted or
-    /// ejected so SENSE DRIVE STATUS and a DIR read report the truth.
-    pub(crate) fn set_media_present(&mut self, present: bool) {
-        if present != self.media_present {
-            // Any change of the ready line latches the disk-change signal, which a
-            // guest clears by stepping the head (a seek) to fresh media.
+    pub(crate) fn set_media_geometry(&mut self, geometry: Option<Geometry>) {
+        let present = geometry.is_some();
+        if present != self.media.is_some() {
             self.disk_changed = true;
         }
-        self.media_present = present;
+        self.media = geometry.map(MediaTiming::from);
     }
 
-    /// DMA + interrupt enable (/NDMAGATE, DOR bit3). When clear the controller
-    /// holds /DACK and /IRQ off the bus; a guest that drives the FDC by polling
-    /// rather than DMA clears it. The transfer datapath still runs in the model;
-    /// only the IRQ gate honors this bit.
     fn dma_irq_enabled(&self) -> bool {
         self.dor & 0x08 != 0
     }
 
-    /// Port read. Returns None for ports this chip does not source on a read
-    /// (0x3F2 DOR is write-mostly but reads back the last value; 0x3F7 reads the
-    /// DIR, while a write to 0x3F7 is the CCR data-rate register).
+    fn motor_enabled(&self, drive: u8) -> bool {
+        self.dor & (0x10 << (drive & 0x03)) != 0
+    }
+
+    fn drive_ready(&self, drive: u8) -> bool {
+        self.media.is_some()
+            && self.motor_enabled(drive)
+            && matches!(self.motors[drive as usize].phase, MotorPhase::Running)
+    }
+
     pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x3F2 => Some(self.dor),
             0x3F4 => Some(self.main_status()),
             0x3F5 => Some(self.read_data()),
-            0x3F7 => Some(self.read_dir()),
+            0x3F7 => Some(if self.disk_changed { 0x80 } else { 0x00 }),
             _ => None,
         }
     }
 
-    /// Port write. Returns true if the chip claims the port.
-    pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
+    pub(crate) fn write_port_at(&mut self, port: u16, value: u8, now_ticks: u64) -> bool {
+        self.now_ticks = self.now_ticks.max(now_ticks);
         match port {
             0x3F2 => {
                 self.write_dor(value);
@@ -176,73 +260,93 @@ impl Fdc {
                 self.write_data(value);
                 true
             }
-            0x3F7 => true, // CCR data-rate select: accepted, no observable state
+            0x3F7 => true,
             _ => false,
         }
     }
 
-    /// Compose the main status register (0x3F4). RQM and DIO follow the phase; CB
-    /// is set whenever a command is mid-flight (command, execution-pending, or
-    /// result phase).
     fn main_status(&self) -> u8 {
-        let mut s = msr::RQM; // the data register is always ready in this model
+        let mut status = self.seek_busy & 0x0F;
         match self.phase {
-            Phase::Result => s |= msr::DIO | msr::CB, // FDC->CPU, command still busy
-            Phase::Parameters => s |= msr::CB,        // CPU->FDC, command busy
-            Phase::Command => {}                      // CPU->FDC, idle
+            Phase::Command => status |= msr::RQM,
+            Phase::Parameters => status |= msr::RQM | msr::CB,
+            Phase::Execution => {
+                status |= msr::CB;
+                if self.non_dma {
+                    status |= msr::NDM;
+                }
+            }
+            Phase::Result => status |= msr::RQM | msr::DIO | msr::CB,
         }
-        if self.pending_transfer.is_some() {
-            // An execution phase the machine has not yet run: still command-busy,
-            // and the chip is not asking the CPU for a byte.
-            s = (s | msr::CB) & !msr::RQM;
-        }
-        s
+        status
     }
 
-    /// DIR read (0x3F7). Bit7 is the disk-change line; the rest read 0 here.
-    fn read_dir(&mut self) -> u8 {
-        if self.disk_changed { 0x80 } else { 0x00 }
-    }
-
-    /// DOR write (0x3F2). bit7-4 motor on for drives 3-0, bit3 DMA+IRQ enable,
-    /// bit2 /reset (0 holds the chip in reset), bits1-0 drive select.
     fn write_dor(&mut self, value: u8) {
-        let leaving_reset = self.dor & 0x04 == 0 && value & 0x04 != 0;
-        let entering_reset = self.dor & 0x04 != 0 && value & 0x04 == 0;
+        let old = self.dor;
+        let leaving_reset = old & 0x04 == 0 && value & 0x04 != 0;
+        let entering_reset = old & 0x04 != 0 && value & 0x04 == 0;
         self.dor = value;
+
+        for drive in 0..4u8 {
+            let bit = 0x10 << drive;
+            match (old & bit != 0, value & bit != 0) {
+                (false, true) => self.start_motor(drive),
+                (true, false) => self.stop_motor(drive),
+                _ => {}
+            }
+        }
+
         if entering_reset {
             self.enter_reset();
         }
         if leaving_reset {
-            // Coming out of reset the controller raises an interrupt and presents
-            // an ST0 of 0xC0 (abnormal-termination / ready-changed) on the first
-            // SENSE INTERRUPT STATUS, the documented power-up handshake.
-            self.irq_pending = true;
+            self.irq_edge_pending = true;
             self.seek_interrupt = true;
             self.st0 = 0xC0;
         }
     }
 
-    /// Hold the chip in reset: clear the phase, drop any in-flight command, and
-    /// reset the data-register FIFOs. The DOR value itself is preserved.
+    fn start_motor(&mut self, drive: u8) {
+        let motor = &mut self.motors[drive as usize];
+        match motor.phase {
+            MotorPhase::Stopped => {
+                motor.phase = MotorPhase::Starting;
+                motor.deadline = Some(self.now_ticks.saturating_add(MOTOR_SPIN_UP_TICKS));
+            }
+            MotorPhase::Stopping => {
+                motor.phase = MotorPhase::Running;
+                motor.deadline = None;
+            }
+            MotorPhase::Starting | MotorPhase::Running => {}
+        }
+    }
+
+    fn stop_motor(&mut self, drive: u8) {
+        let motor = &mut self.motors[drive as usize];
+        if motor.phase != MotorPhase::Stopped {
+            motor.phase = MotorPhase::Stopping;
+            motor.deadline = Some(self.now_ticks.saturating_add(MOTOR_SPIN_DOWN_TICKS));
+        }
+    }
+
     fn enter_reset(&mut self) {
         self.phase = Phase::Command;
         self.command.clear();
         self.result.clear();
         self.needed_params = 0;
-        self.pending_transfer = None;
-        self.irq_pending = false;
+        self.operation = None;
+        self.seek_busy = 0;
+        self.irq_edge_pending = false;
         self.seek_interrupt = false;
     }
 
-    /// Data register read (0x3F5): hand back the next result byte. Returns 0 when
-    /// no result is pending, the way the chip drives the bus with nothing to say.
     fn read_data(&mut self) -> u8 {
         if self.phase != Phase::Result {
             return 0;
         }
-        // Result bytes were pushed in reverse so the first byte the CPU reads is
-        // the last pushed; pop from the end.
+        if !self.seek_interrupt {
+            self.irq_edge_pending = false;
+        }
         let byte = self.result.pop().unwrap_or(0);
         if self.result.is_empty() {
             self.phase = Phase::Command;
@@ -250,51 +354,34 @@ impl Fdc {
         byte
     }
 
-    /// Data register write (0x3F5): a command opcode or a parameter byte.
     fn write_data(&mut self, value: u8) {
         match self.phase {
             Phase::Command => self.begin_command(value),
             Phase::Parameters => {
                 self.command.push(value);
-                // command holds the opcode plus the parameters collected so far,
-                // so its length is one more than the parameter count; execute once
-                // every expected parameter is in.
                 if self.command.len() > self.needed_params {
                     self.execute_command();
                 }
             }
-            Phase::Result => {
-                // The CPU should not write during the result phase; ignore it, as
-                // the chip does (the byte is not a command).
-            }
+            Phase::Execution | Phase::Result => {}
         }
     }
 
-    /// Start a new command: latch the opcode and decide how many parameter bytes
-    /// follow. The low five bits select the command; bits 7-5 (MT/MFM/SK) are
-    /// modifiers the model accepts but does not vary behavior on.
     fn begin_command(&mut self, opcode: u8) {
         self.command.clear();
         self.result.clear();
         self.command.push(opcode);
         let params = match opcode & 0x1F {
-            0x03 => 2, // SPECIFY: SRT/HUT, HLT/ND
-            0x04 => 1, // SENSE DRIVE STATUS: HDS+DS
-            0x07 => 1, // RECALIBRATE: DS
-            0x08 => 0, // SENSE INTERRUPT STATUS: no parameters
-            0x06 => 8, // READ DATA: HDS+DS, C, H, R, N, EOT, GPL, DTL
-            0x05 => 8, // WRITE DATA: same parameter shape as READ DATA
-            0x0A => 1, // READ ID: HDS+DS
-            0x0F => 2, // SEEK: HDS+DS, NCN
-            0x13 => 3, // CONFIGURE: 0, config, precomp
-            0x10 => 0, // VERSION: no parameters
+            0x03 => 2,
+            0x04 => 1,
+            0x05 | 0x06 => 8,
+            0x07 => 1,
+            0x08 | 0x10 => 0,
+            0x0A => 1,
+            0x0F => 2,
+            0x13 => 3,
             _ => {
-                // Unknown opcode: the chip enters an invalid-command result of a
-                // single ST0 = 0x80 byte and waits for it to be read.
-                self.command.clear();
-                self.result.clear();
-                self.result.push(st0::IC_INVALID);
-                self.phase = Phase::Result;
+                self.finish_with_result(vec![st0::IC_INVALID]);
                 return;
             }
         };
@@ -306,235 +393,478 @@ impl Fdc {
         }
     }
 
-    /// Drive + head from a command's first parameter byte (HDS in bit2, DS in
-    /// bits1-0), the shared layout of most commands' first byte.
     fn drive_head(&self) -> (u8, u8) {
-        let p = self.command.get(1).copied().unwrap_or(0);
-        (p & 0x03, (p >> 2) & 0x01)
+        let parameter = self.command.get(1).copied().unwrap_or(0);
+        (parameter & 0x03, (parameter >> 2) & 0x01)
     }
 
-    /// Build an ST0 with the interrupt code, optional seek-end, and the drive and
-    /// head OR'd in from the addressed unit.
-    fn make_st0(&self, ic: u8, seek_end: bool, drive: u8, head: u8) -> u8 {
-        let mut v = ic | (drive & 0x03) | ((head & 0x01) << 2);
+    fn make_st0(&self, interrupt_code: u8, seek_end: bool, drive: u8, head: u8) -> u8 {
+        let mut value = interrupt_code | (drive & 0x03) | ((head & 0x01) << 2);
         if seek_end {
-            v |= st0::SE;
+            value |= st0::SE;
         }
-        v
+        value
     }
 
-    /// Run the command once its parameters are in. Commands with a data transfer
-    /// stage a TransferRequest; the rest finish here.
     fn execute_command(&mut self) {
-        let opcode = self.command[0] & 0x1F;
-        match opcode {
+        match self.command[0] & 0x1F {
             0x03 => self.cmd_specify(),
             0x04 => self.cmd_sense_drive_status(),
+            0x05 => self.cmd_read_write(false),
+            0x06 => self.cmd_read_write(true),
             0x07 => self.cmd_recalibrate(),
             0x08 => self.cmd_sense_interrupt(),
-            0x0F => self.cmd_seek(),
-            0x10 => self.cmd_version(),
-            0x13 => self.cmd_configure(),
             0x0A => self.cmd_read_id(),
-            0x06 => self.cmd_read_write(true),
-            0x05 => self.cmd_read_write(false),
-            _ => {
-                self.finish_with_result(vec![st0::IC_INVALID]);
-            }
+            0x0F => self.cmd_seek(),
+            0x10 => self.finish_with_result(vec![0x90]),
+            0x13 => self.finish_with_result(vec![]),
+            _ => self.finish_with_result(vec![st0::IC_INVALID]),
         }
     }
 
-    /// Push a result vector and enter the result phase. The vector is given in CPU
-    /// read order (first byte the CPU reads first); it is reversed internally so a
-    /// pop hands bytes back in order. An empty result returns to the idle command
-    /// phase with no result handshake (SPECIFY, CONFIGURE).
     fn finish_with_result(&mut self, mut bytes: Vec<u8>) {
         self.command.clear();
         self.needed_params = 0;
         if bytes.is_empty() {
-            self.phase = Phase::Command;
             self.result.clear();
-            return;
+            self.phase = Phase::Command;
+        } else {
+            bytes.reverse();
+            self.result = bytes;
+            self.phase = Phase::Result;
         }
-        bytes.reverse();
-        self.result = bytes;
-        self.phase = Phase::Result;
     }
 
-    /// SPECIFY (0x03): load the step-rate / head-load timing. No result phase and
-    /// no interrupt, exactly as the chip behaves.
     fn cmd_specify(&mut self) {
-        // Limit: timing parameters (SRT/HUT/HLT) are accepted and dropped; we
-        // do not model head-load or step-rate delays. The upgrade path is to feed
-        // these into Floppy::access_duration_secs so a guest-programmed step rate
-        // changes the modeled seek time.
+        let timing = self.command.get(1).copied().unwrap_or(0);
+        let options = self.command.get(2).copied().unwrap_or(0);
+        let step_ms = u64::from(16 - (timing >> 4)).max(1);
+        let head_load_ms = u64::from(options >> 1) * 2;
+        self.step_rate_ticks = step_ms * MILLIS_TICKS;
+        self.head_load_ticks = head_load_ms * MILLIS_TICKS;
+        self.non_dma = options & 1 != 0;
         self.finish_with_result(vec![]);
     }
 
-    /// SENSE DRIVE STATUS (0x04): return ST3 for the addressed drive.
     fn cmd_sense_drive_status(&mut self) {
         let (drive, head) = self.drive_head();
-        let mut st3v = TWO_SIDED_BASE | (drive & 0x03) | ((head & 0x01) << 2);
+        let mut value = st3::TWO_SIDED | drive | (head << 2);
         if self.present_cyl[drive as usize] == 0 {
-            st3v |= st3::TRACK0;
+            value |= st3::TRACK0;
         }
-        if self.media_present {
-            st3v |= st3::READY;
+        if self.drive_ready(drive) {
+            value |= st3::READY;
         }
-        self.finish_with_result(vec![st3v]);
+        self.finish_with_result(vec![value]);
     }
 
-    /// RECALIBRATE (0x07): step the head to cylinder 0 and raise a seek interrupt.
-    /// No result phase; the host clears the interrupt with SENSE INTERRUPT STATUS.
     fn cmd_recalibrate(&mut self) {
         let drive = self.command.get(1).copied().unwrap_or(0) & 0x03;
-        self.present_cyl[drive as usize] = 0;
-        self.disk_changed = false; // stepping the head clears the change latch
-        self.st0 = self.make_st0(st0::IC_NORMAL, true, drive, 0);
-        self.irq_pending = true;
-        self.seek_interrupt = true;
-        self.finish_with_result(vec![]);
+        self.schedule_seek(drive, 0, 0);
     }
 
-    /// SEEK (0x0F): move the head to the new cylinder number and raise a seek
-    /// interrupt. No result phase.
     fn cmd_seek(&mut self) {
         let (drive, head) = self.drive_head();
-        let ncn = self.command.get(2).copied().unwrap_or(0);
-        self.present_cyl[drive as usize] = ncn;
-        self.disk_changed = false;
-        self.st0 = self.make_st0(st0::IC_NORMAL, true, drive, head);
-        self.irq_pending = true;
-        self.seek_interrupt = true;
+        let cylinder = self.command.get(2).copied().unwrap_or(0);
+        self.schedule_seek(drive, head, cylinder);
+    }
+
+    fn schedule_seek(&mut self, drive: u8, head: u8, cylinder: u8) {
+        let current = self.present_cyl[drive as usize];
+        let tracks = current.abs_diff(cylinder).max(1);
+        let delay = u64::from(tracks).saturating_mul(self.step_rate_ticks);
+        self.seek_busy |= 1 << drive;
+        self.operation = Some(TimedOperation::Seek {
+            deadline: self.deadline_after(delay),
+            drive,
+            head,
+            cylinder,
+        });
         self.finish_with_result(vec![]);
     }
 
-    /// SENSE INTERRUPT STATUS (0x08): the only way to clear a seek/recal
-    /// interrupt. Returns ST0 and the present cylinder number when an interrupt is
-    /// pending; otherwise ST0 = 0x80 (invalid) and no PCN, the documented "no
-    /// interrupt pending" reply.
     fn cmd_sense_interrupt(&mut self) {
         if self.seek_interrupt {
             let drive = (self.st0 & 0x03) as usize;
-            let pcn = self.present_cyl[drive];
+            let cylinder = self.present_cyl[drive];
             self.seek_interrupt = false;
-            self.irq_pending = false;
-            self.finish_with_result(vec![self.st0, pcn]);
+            self.irq_edge_pending = false;
+            self.finish_with_result(vec![self.st0, cylinder]);
         } else {
-            // No pending interrupt: invalid-command status, single byte, no PCN.
             self.finish_with_result(vec![st0::IC_INVALID]);
         }
     }
 
-    /// VERSION (0x10): identify the controller. 0x90 marks an enhanced
-    /// (uPD765B / 82077-class) part, the value PC/AT-era code checks for.
-    fn cmd_version(&mut self) {
-        self.finish_with_result(vec![0x90]);
-    }
-
-    /// CONFIGURE (0x13): set FIFO/polling options. Accepted, no result phase.
-    fn cmd_configure(&mut self) {
-        // Limit: the FIFO threshold, EIS (implied seek) and polling-disable
-        // bits are accepted and ignored. The upgrade path is to honor EIS so a
-        // READ/WRITE seeks to the target cylinder first, and to expose the FIFO
-        // threshold if a non-DMA transfer path is ever added.
-        self.finish_with_result(vec![]);
-    }
-
-    /// READ ID (0x0A): return the id of the next sector under the head. With no
-    /// rotational model the chip reports sector 1 of the current cylinder.
     fn cmd_read_id(&mut self) {
         let (drive, head) = self.drive_head();
-        let cyl = self.present_cyl[drive as usize];
-        let st0v = self.make_st0(st0::IC_NORMAL, false, drive, head);
-        // Result is ST0, ST1, ST2, then the C/H/R/N address mark of the sector.
-        // Limit: with no MFM/rotation model READ ID always names sector 1, N=2
-        // (512-byte sectors). The upgrade path is a real index/rotation counter so
-        // the reported sector advances with disk angle.
-        self.finish_with_result(vec![st0v, 0, 0, cyl, head, 1, 2]);
-    }
-
-    /// READ DATA (0x06) / WRITE DATA (0x05): set up the execution-phase transfer
-    /// the machine runs over DMA channel 2. The result phase is produced later by
-    /// `complete_transfer` once the bytes have moved.
-    fn cmd_read_write(&mut self, read: bool) {
-        // Parameter bytes (after the opcode): HDS+DS, C, H, R, N, EOT, GPL, DTL.
-        let p = &self.command[1..];
-        let drive = p[0] & 0x03;
-        let head = (p[0] >> 2) & 0x01;
-        let cyl = p[1];
-        let sector = p[3];
-        let n = p[4];
-        let eot = p[5];
-        let bytes_per_sec = 128u16 << (n.min(7)); // N encodes 128<<N bytes/sector
-        self.present_cyl[drive as usize] = cyl; // an access implies the head is here
-        self.pending_transfer = Some(TransferRequest {
-            read,
+        let Some((deadline, sector)) = self.next_sector_deadline(drive, 1) else {
+            self.operation = Some(TimedOperation::ReadId {
+                deadline: self.deadline_after(NO_READY_TIMEOUT_TICKS),
+                drive,
+                head,
+                sector: 1,
+                valid: false,
+            });
+            self.phase = Phase::Execution;
+            self.command.clear();
+            return;
+        };
+        self.operation = Some(TimedOperation::ReadId {
+            deadline,
             drive,
-            cylinder: cyl,
             head,
             sector,
-            end_sector: eot,
-            bytes_per_sec,
+            valid: true,
         });
-        // The machine sees pending_transfer set and runs it; until then the chip
-        // is command-busy with RQM low. command/needed_params are cleared so a
-        // stray data write does not corrupt the staged transfer.
+        self.phase = Phase::Execution;
+        self.command.clear();
+    }
+
+    fn cmd_read_write(&mut self, read: bool) {
+        let parameters = &self.command[1..];
+        let drive = parameters[0] & 0x03;
+        let head = (parameters[0] >> 2) & 0x01;
+        let cylinder = parameters[1];
+        let sector = parameters[3];
+        let n = parameters[4].min(7);
+        let request = TransferRequest {
+            read,
+            drive,
+            cylinder,
+            head,
+            sector,
+            end_sector: parameters[5],
+            bytes_per_sec: 128u16 << n,
+        };
+
+        let media = self.media;
+        let deadline = self
+            .first_data_deadline(request, media)
+            .unwrap_or_else(|| self.deadline_after(NO_READY_TIMEOUT_TICKS));
+        self.operation = Some(TimedOperation::Transfer(TransferState {
+            request,
+            media,
+            sector,
+            offset: 0,
+            last_sector: sector,
+            moved_any: false,
+            deadline: Some(deadline),
+            awaiting_dma: false,
+        }));
+        self.phase = Phase::Execution;
         self.command.clear();
         self.needed_params = 0;
     }
 
-    /// The machine takes the staged transfer (if any) to run the floppy + DMA
-    /// datapath. Returns None when nothing is pending.
-    pub(crate) fn take_transfer(&mut self) -> Option<TransferRequest> {
-        self.pending_transfer.take()
+    fn first_data_deadline(
+        &self,
+        request: TransferRequest,
+        media: Option<MediaTiming>,
+    ) -> Option<u64> {
+        let media = media?;
+        if request.bytes_per_sec != FLOPPY_SECTOR_BYTES
+            || request.cylinder as u16 >= media.cylinders
+            || request.head >= media.heads
+            || request.sector == 0
+            || request.sector > media.sectors
+            || !self.motor_enabled(request.drive)
+        {
+            return None;
+        }
+
+        let motor_ready = self.motor_ready_tick(request.drive)?;
+        let tracks = self.present_cyl[request.drive as usize].abs_diff(request.cylinder);
+        let head_ready = self.now_ticks.saturating_add(
+            u64::from(tracks)
+                .saturating_mul(self.step_rate_ticks)
+                .saturating_add(self.head_load_ticks),
+        );
+        let ready = motor_ready.max(head_ready);
+        self.rotation_wait(request.drive, request.sector, media.sectors, ready)
+            .map(|wait| ready.saturating_add(wait.max(1)))
     }
 
-    /// Finish a READ/WRITE DATA command after the machine moved the data. `last`
-    /// is the address of the last sector actually transferred; `success` false
-    /// means the access ran off the media. Produces the seven-byte result phase
-    /// (ST0, ST1, ST2, C, H, R, N) and raises the completion interrupt.
-    pub(crate) fn complete_transfer(
-        &mut self,
-        req: TransferRequest,
-        last_cyl: u8,
-        last_head: u8,
-        last_sector: u8,
-        success: bool,
-    ) {
-        let ic = if success {
+    fn motor_ready_tick(&self, drive: u8) -> Option<u64> {
+        let motor = self.motors[drive as usize];
+        match motor.phase {
+            MotorPhase::Running => Some(self.now_ticks),
+            MotorPhase::Starting => motor.deadline,
+            MotorPhase::Stopped | MotorPhase::Stopping => None,
+        }
+    }
+
+    fn next_sector_deadline(&self, drive: u8, minimum_sector: u8) -> Option<(u64, u8)> {
+        let media = self.media?;
+        if !self.motor_enabled(drive) {
+            return None;
+        }
+        let ready = self
+            .motor_ready_tick(drive)?
+            .max(self.now_ticks.saturating_add(self.head_load_ticks));
+        let phase = self.rotation_phase_at(drive, ready)?;
+        for sector in minimum_sector.max(1)..=media.sectors {
+            let target = sector_phase(sector, media.sectors);
+            if target >= phase {
+                return Some((ready.saturating_add((target - phase).max(1)), sector));
+            }
+        }
+        let target = sector_phase(1, media.sectors);
+        Some((
+            ready.saturating_add((REVOLUTION_TICKS - phase + target).max(1)),
+            1,
+        ))
+    }
+
+    fn rotation_wait(&self, drive: u8, sector: u8, sectors_per_track: u8, at: u64) -> Option<u64> {
+        let phase = self.rotation_phase_at(drive, at)?;
+        let target = sector_phase(sector, sectors_per_track);
+        Some(if target >= phase {
+            target - phase
+        } else {
+            REVOLUTION_TICKS - phase + target
+        })
+    }
+
+    fn rotation_phase_at(&self, drive: u8, at: u64) -> Option<u64> {
+        let motor = self.motors[drive as usize];
+        let epoch = match motor.phase {
+            MotorPhase::Running | MotorPhase::Stopping => motor.rotation_epoch,
+            MotorPhase::Starting => motor.deadline?,
+            MotorPhase::Stopped => return None,
+        };
+        Some(at.saturating_sub(epoch) % REVOLUTION_TICKS)
+    }
+
+    fn deadline_after(&self, delta: u64) -> u64 {
+        self.now_ticks.saturating_add(delta.max(1))
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        self.operation
+            .and_then(TimedOperation::deadline)
+            .into_iter()
+            .chain(self.motors.iter().filter_map(|motor| motor.deadline))
+            .min()
+    }
+
+    pub(crate) fn ticks_until_event(&self, machine_now: u64) -> Option<u64> {
+        self.next_deadline()
+            .map(|deadline| deadline.saturating_sub(machine_now).max(1))
+    }
+
+    /// Advance to an absolute master tick. Internal motor and command events are
+    /// consumed in deadline order. A DMA byte is returned to the machine and the
+    /// controller pauses at that exact tick until `complete_dma_byte` is called.
+    pub(crate) fn advance_to(&mut self, target_ticks: u64) -> Option<DmaByteRequest> {
+        if target_ticks < self.now_ticks {
+            return None;
+        }
+        loop {
+            let Some(deadline) = self.next_deadline() else {
+                self.now_ticks = target_ticks;
+                return None;
+            };
+            if deadline > target_ticks {
+                self.now_ticks = target_ticks;
+                return None;
+            }
+            self.now_ticks = deadline;
+            self.advance_motors_at_deadline(deadline);
+
+            let due = self
+                .operation
+                .is_some_and(|operation| operation.deadline() == Some(deadline));
+            if !due {
+                continue;
+            }
+            let operation = self.operation.take().expect("due FDC operation");
+            match operation {
+                TimedOperation::Seek {
+                    drive,
+                    head,
+                    cylinder,
+                    ..
+                } => self.complete_seek(drive, head, cylinder),
+                TimedOperation::ReadId {
+                    drive,
+                    head,
+                    sector,
+                    valid,
+                    ..
+                } => self.complete_read_id(drive, head, sector, valid),
+                TimedOperation::Transfer(mut state) => {
+                    let valid = state.media.is_some_and(|media| {
+                        self.media.is_some()
+                            && self.drive_ready(state.request.drive)
+                            && self.dma_irq_enabled()
+                            && state.request.bytes_per_sec == FLOPPY_SECTOR_BYTES
+                            && (state.request.cylinder as u16) < media.cylinders
+                            && state.request.head < media.heads
+                            && state.sector != 0
+                            && state.sector <= media.sectors
+                    });
+                    if !valid {
+                        self.finish_transfer(state, false);
+                        continue;
+                    }
+                    self.present_cyl[state.request.drive as usize] = state.request.cylinder;
+                    self.disk_changed = false;
+                    state.deadline = None;
+                    state.awaiting_dma = true;
+                    let request = DmaByteRequest {
+                        transfer: state.request,
+                        sector: state.sector,
+                        offset: state.offset,
+                    };
+                    self.operation = Some(TimedOperation::Transfer(state));
+                    return Some(request);
+                }
+            }
+        }
+    }
+
+    fn advance_motors_at_deadline(&mut self, deadline: u64) {
+        for motor in &mut self.motors {
+            if motor.deadline != Some(deadline) {
+                continue;
+            }
+            match motor.phase {
+                MotorPhase::Starting => {
+                    motor.phase = MotorPhase::Running;
+                    motor.deadline = None;
+                    motor.rotation_epoch = deadline;
+                }
+                MotorPhase::Stopping => {
+                    motor.phase = MotorPhase::Stopped;
+                    motor.deadline = None;
+                    motor.rotation_epoch = deadline;
+                }
+                MotorPhase::Stopped | MotorPhase::Running => motor.deadline = None,
+            }
+        }
+    }
+
+    fn complete_seek(&mut self, drive: u8, head: u8, cylinder: u8) {
+        self.present_cyl[drive as usize] = cylinder;
+        self.disk_changed = false;
+        self.seek_busy &= !(1 << drive);
+        self.st0 = self.make_st0(st0::IC_NORMAL, true, drive, head);
+        self.seek_interrupt = true;
+        self.irq_edge_pending = true;
+    }
+
+    fn complete_read_id(&mut self, drive: u8, head: u8, sector: u8, valid: bool) {
+        let cylinder = self.present_cyl[drive as usize];
+        let interrupt_code = if valid && self.drive_ready(drive) {
             st0::IC_NORMAL
         } else {
             st0::IC_ABNORMAL
         };
-        let st0v = self.make_st0(ic, false, req.drive, req.head);
-        // ST1 is clean on a normal completion; on failure bit2 ND (no data /
-        // sector not found) marks the missing or off-media sector.
-        // Limit: ST1 bit7 EN (end of cylinder) is never set, so a guest that
-        // reads to the very last sector without a TC will not see EN. The upgrade
-        // path is to flag EN when the walk reaches geom.sectors before TC.
-        let st1 = if success { 0x00 } else { 0x04 };
-        let n = match req.bytes_per_sec {
+        let st1 = if interrupt_code == st0::IC_NORMAL {
+            0
+        } else {
+            0x04
+        };
+        let status = self.make_st0(interrupt_code, false, drive, head);
+        self.st0 = status;
+        self.seek_interrupt = false;
+        self.irq_edge_pending = true;
+        self.finish_with_result(vec![status, st1, 0, cylinder, head, sector, 2]);
+    }
+
+    pub(crate) fn complete_dma_byte(&mut self, outcome: DmaByteOutcome) {
+        let Some(TimedOperation::Transfer(mut state)) = self.operation.take() else {
+            return;
+        };
+        if !state.awaiting_dma {
+            self.operation = Some(TimedOperation::Transfer(state));
+            return;
+        }
+        state.awaiting_dma = false;
+        if !outcome.transferred {
+            self.finish_transfer(state, false);
+            return;
+        }
+
+        state.moved_any = true;
+        state.last_sector = state.sector;
+        if outcome.terminal_count {
+            self.finish_transfer(state, true);
+            return;
+        }
+
+        state.offset += 1;
+        if state.offset < state.request.bytes_per_sec {
+            let byte_ticks = MASTER_CLOCK_HZ / state.media.unwrap().bytes_per_second;
+            state.deadline = Some(self.deadline_after(byte_ticks));
+            self.operation = Some(TimedOperation::Transfer(state));
+            return;
+        }
+
+        if state.sector >= state.request.end_sector {
+            self.finish_transfer(state, true);
+            return;
+        }
+        state.sector = state.sector.saturating_add(1);
+        state.offset = 0;
+        let Some(media) = state.media else {
+            self.finish_transfer(state, false);
+            return;
+        };
+        if state.sector > media.sectors {
+            self.finish_transfer(state, false);
+            return;
+        }
+        let wait = self
+            .rotation_wait(
+                state.request.drive,
+                state.sector,
+                media.sectors,
+                self.now_ticks,
+            )
+            .unwrap_or(NO_READY_TIMEOUT_TICKS);
+        state.deadline = Some(self.deadline_after(wait));
+        self.operation = Some(TimedOperation::Transfer(state));
+    }
+
+    fn finish_transfer(&mut self, state: TransferState, success: bool) {
+        let success = success && state.moved_any;
+        let interrupt_code = if success {
+            st0::IC_NORMAL
+        } else {
+            st0::IC_ABNORMAL
+        };
+        let status = self.make_st0(
+            interrupt_code,
+            false,
+            state.request.drive,
+            state.request.head,
+        );
+        let st1 = if success { 0 } else { 0x04 };
+        let n = match state.request.bytes_per_sec {
             128 => 0,
             256 => 1,
             512 => 2,
             1024 => 3,
             _ => 2,
         };
-        self.st0 = st0v;
-        self.irq_pending = true;
-        self.seek_interrupt = false; // a data interrupt is cleared by reading results
-        self.finish_with_result(vec![st0v, st1, 0, last_cyl, last_head, last_sector, n]);
+        self.st0 = status;
+        self.seek_interrupt = false;
+        self.irq_edge_pending = true;
+        self.finish_with_result(vec![
+            status,
+            st1,
+            0,
+            state.request.cylinder,
+            state.request.head,
+            state.last_sector,
+            n,
+        ]);
     }
 
-    /// Take the pending IRQ6 edge, if any, for the host's IRQ-collection step.
-    /// Honors the DOR DMA/IRQ gate: a disabled gate masks the line.
     pub(crate) fn take_irq(&mut self) -> bool {
-        if self.irq_pending && self.dma_irq_enabled() {
-            // For a data-transfer interrupt the edge is one-shot; a seek interrupt
-            // stays pending until SENSE INTERRUPT STATUS clears it, but the host
-            // only needs one edge to vector its ISR, so clear the edge either way.
-            self.irq_pending = false;
+        if self.irq_edge_pending && self.dma_irq_enabled() {
+            self.irq_edge_pending = false;
             true
         } else {
             false
@@ -542,8 +872,9 @@ impl Fdc {
     }
 }
 
-/// ST3 always reports two-sided media for the modeled drives.
-const TWO_SIDED_BASE: u8 = st3::TWO_SIDED;
+fn sector_phase(sector: u8, sectors_per_track: u8) -> u64 {
+    u64::from(sector.saturating_sub(1)) * REVOLUTION_TICKS / u64::from(sectors_per_track.max(1))
+}
 
 #[cfg(test)]
 #[path = "fdc_test.rs"]

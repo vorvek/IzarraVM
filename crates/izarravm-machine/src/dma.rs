@@ -1,12 +1,17 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Intel 8237A DMA controller, a master/slave cascade pair.
 //!
 //! Built clean-room from the Intel 8237A datasheet cached at
-//! dev_docs/reference/8237a/. Single-transfer and auto-init modes are modeled
-//! (the two the Sound Blaster uses for 8-bit playback), plus the command
-//! register's controller-disable gate and the memory-to-memory block transfer.
+//! dev_docs/reference/8237a/. Demand, single, block, and auto-init channel state
+//! is modeled, along with the command register's controller-disable gate and
+//! the memory-to-memory block transfer.
 //! Both transfer directions run: memory->device (Sound Blaster playback) and
 //! device->memory (the floppy controller's READ DATA on channel 2).
-//! Demand, block and cascade modes are out of scope.
+//! A device call is one request/grant/transfer cycle. Demand, single, and block
+//! programming share that cycle path; cascade channels do not use its memory
+//! datapath.
 
 use izarravm_bus::Memory;
 
@@ -23,6 +28,9 @@ pub(crate) struct DmaChannel {
     pub transfer_mode: u8,    // mode bits6-7: 0 demand, 1 single, 2 block, 3 cascade
     pub mask: bool,           // mask register bit
     pub reached_tc: bool,
+    pub dreq: bool,           // hardware request input level
+    pub active: bool,         // a granted transfer cycle is in progress
+    pub transfer_cycles: u64, // completed byte or word cycles
 }
 
 impl Default for DmaChannel {
@@ -39,14 +47,17 @@ impl Default for DmaChannel {
             transfer_mode: 0,
             mask: true,
             reached_tc: false,
+            dreq: false,
+            active: false,
+            transfer_cycles: 0,
         }
     }
 }
 
 impl DmaChannel {
     /// Mode register write (bits 2-3 transfer kind, bit4 auto-init, bit5 addr dec,
-    /// bits 6-7 transfer mode). Only single transfer has a datapath; the other
-    /// mode encodings are stored but otherwise stepped one transfer at a time.
+    /// bits 6-7 transfer mode). Device calls grant one cycle at a time. Block
+    /// mode keeps its grant until terminal count, while cascade has no datapath.
     pub(crate) fn set_mode(&mut self, value: u8) {
         self.transfer_kind = (value >> 2) & 0x3;
         self.auto_init = value & 0x10 != 0;
@@ -69,6 +80,7 @@ impl DmaChannel {
     /// Shared per-transfer step: advance the address counter, decrement the count
     /// through zero to terminal count, then reload (auto-init) or mask (single).
     fn step_transfer(&mut self) {
+        self.transfer_cycles = self.transfer_cycles.saturating_add(1);
         self.cur_addr = if self.addr_decrement {
             self.cur_addr.wrapping_sub(1)
         } else {
@@ -208,6 +220,9 @@ impl DmaChip {
                     // Single mask register: bits 0-1 channel, bit2 set(1)/clear(0).
                     let ci = (value & 0x03) as usize;
                     self.channels[ci].mask = value & 0x04 != 0;
+                    if self.channels[ci].mask {
+                        self.channels[ci].active = false;
+                    }
                 }
                 11 => {
                     // Mode register: bits 0-1 select the channel.
@@ -221,6 +236,9 @@ impl DmaChip {
                     // Write-all-mask: bits 0-3 set each channel's mask.
                     for ci in 0..4 {
                         self.channels[ci].mask = value & (1 << ci) != 0;
+                        if self.channels[ci].mask {
+                            self.channels[ci].active = false;
+                        }
                     }
                 }
                 _ => {}
@@ -237,9 +255,15 @@ impl DmaChip {
             match local {
                 8 => {
                     // Status read: bits 0-3 are terminal-count (read-clear), bits
-                    // 4-7 are the per-channel DREQ-active level taken from the low
-                    // nibble of the request register (level, not read-cleared).
-                    let s = (self.status & 0x0F) | ((self.request_reg & 0x0F) << 4);
+                    // 4-7 are the combined hardware and software DREQ levels.
+                    // Request levels are not cleared by a status read.
+                    let mut requests = self.request_reg & 0x0F;
+                    for (ci, channel) in self.channels.iter().enumerate() {
+                        if channel.dreq {
+                            requests |= 1 << ci;
+                        }
+                    }
+                    let s = (self.status & 0x0F) | (requests << 4);
                     self.status = 0;
                     Some(s)
                 }
@@ -300,7 +324,11 @@ impl DmaChip {
         self.status = 0;
         self.request_reg = 0;
         self.hi_lo = false;
-        self.channels.iter_mut().for_each(|c| c.mask = true);
+        self.channels.iter_mut().for_each(|channel| {
+            channel.mask = true;
+            channel.dreq = false;
+            channel.active = false;
+        });
     }
 
     /// Command-register bit0: memory-to-memory transfers enabled.
@@ -321,6 +349,45 @@ impl DmaChip {
         self.command & 0x04 != 0
     }
 
+    fn set_hardware_request(&mut self, ci: usize, asserted: bool) {
+        self.channels[ci].dreq = asserted;
+        if !asserted && self.channels[ci].transfer_mode != 2 {
+            self.channels[ci].active = false;
+        }
+    }
+
+    fn request_active(&self, ci: usize) -> bool {
+        self.channels[ci].dreq || self.request_reg & (1 << ci) != 0
+    }
+
+    fn begin_cycle(&mut self, ci: usize) -> bool {
+        let block_active = self.channels[ci].transfer_mode == 2 && self.channels[ci].active;
+        if self.controller_disabled()
+            || self.channels[ci].mask
+            || self.channels[ci].transfer_mode == 3
+            || (!self.request_active(ci) && !block_active)
+        {
+            return false;
+        }
+        self.channels[ci].reached_tc = false;
+        self.channels[ci].active = true;
+        true
+    }
+
+    fn finish_cycle(&mut self, ci: usize, completed: bool) {
+        if !completed {
+            self.channels[ci].active = false;
+            return;
+        }
+        if self.channels[ci].reached_tc {
+            self.status |= 1 << ci;
+            self.request_reg &= !(1 << ci);
+            self.channels[ci].active = false;
+        } else if self.channels[ci].transfer_mode != 2 {
+            self.channels[ci].active = false;
+        }
+    }
+
     /// Whether a software DREQ on channel 0 is currently armed to launch a
     /// memory-to-memory transfer: mem-to-mem enabled (command bit0), the
     /// controller live, channel 0 unmasked, and its request-register bit set. The
@@ -336,13 +403,12 @@ impl DmaChip {
     /// latching terminal-count into the status register. Returns None when the
     /// controller is disabled by command bit2.
     fn read_byte(&mut self, ci: usize, memory: &mut Memory) -> Option<u8> {
-        if self.controller_disabled() {
+        if !self.begin_cycle(ci) {
             return None;
         }
-        let byte = self.channels[ci].read_byte(memory)?;
-        if self.channels[ci].reached_tc {
-            self.status |= 1 << ci;
-        }
+        let byte = self.channels[ci].read_byte(memory);
+        self.finish_cycle(ci, byte.is_some());
+        let byte = byte?;
         Some(byte)
     }
 
@@ -350,13 +416,12 @@ impl DmaChip {
     /// `ci`, latching terminal-count into the status register. Returns None when
     /// the controller is disabled by command bit2.
     fn read_word(&mut self, ci: usize, memory: &mut Memory) -> Option<u16> {
-        if self.controller_disabled() {
+        if !self.begin_cycle(ci) {
             return None;
         }
-        let word = self.channels[ci].read_word(memory)?;
-        if self.channels[ci].reached_tc {
-            self.status |= 1 << ci;
-        }
+        let word = self.channels[ci].read_word(memory);
+        self.finish_cycle(ci, word.is_some());
+        let word = word?;
         Some(word)
     }
 
@@ -385,11 +450,21 @@ impl DmaChip {
         }
         let hold = self.channel0_hold();
         let mut copied = 0usize;
+        self.channels[0].active = true;
+        self.channels[1].active = true;
         loop {
             let src = self.channels[0].byte_address() as usize;
             let dst = self.channels[1].byte_address() as usize;
-            let byte = memory.read_u8(src).ok()?;
-            memory.write_u8(dst, byte).ok()?;
+            let Ok(byte) = memory.read_u8(src) else {
+                self.channels[0].active = false;
+                self.channels[1].active = false;
+                return None;
+            };
+            if memory.write_u8(dst, byte).is_err() {
+                self.channels[0].active = false;
+                self.channels[1].active = false;
+                return None;
+            }
             copied += 1;
 
             // Channel 1 (the destination) owns the word count and terminal count.
@@ -398,6 +473,7 @@ impl DmaChip {
             // address hold freezes it for a memory fill.
             if hold {
                 let c0 = &mut self.channels[0];
+                c0.transfer_cycles = c0.transfer_cycles.saturating_add(1);
                 let next = c0.cur_count.wrapping_sub(1);
                 c0.cur_count = next;
             } else {
@@ -413,6 +489,8 @@ impl DmaChip {
         // count. Clear the source/dest request bits so a later unrelated write to
         // the request register cannot re-trigger this copy.
         self.request_reg &= !0x03;
+        self.channels[0].active = false;
+        self.channels[1].active = false;
         Some(copied)
     }
 
@@ -420,42 +498,36 @@ impl DmaChip {
     /// latching terminal-count into the status register. The FDC READ DATA
     /// datapath reaches memory through here.
     fn write_byte(&mut self, ci: usize, memory: &mut Memory, byte: u8) -> Option<()> {
-        if self.controller_disabled() {
+        if !self.begin_cycle(ci) {
             return None;
         }
-        self.channels[ci].write_byte(memory, byte)?;
-        if self.channels[ci].reached_tc {
-            self.status |= 1 << ci;
-        }
-        Some(())
+        let wrote = self.channels[ci].write_byte(memory, byte);
+        self.finish_cycle(ci, wrote.is_some());
+        wrote
     }
 
     /// Write one 16-bit word from the device (device->memory) on local channel
     /// `ci`, latching terminal-count into the status register.
     #[allow(dead_code)] // Limit: no Machine-level write wiring yet (see DmaChannel::write_byte).
     fn write_word(&mut self, ci: usize, memory: &mut Memory, word: u16) -> Option<()> {
-        if self.controller_disabled() {
+        if !self.begin_cycle(ci) {
             return None;
         }
-        self.channels[ci].write_word(memory, word)?;
-        if self.channels[ci].reached_tc {
-            self.status |= 1 << ci;
-        }
-        Some(())
+        let wrote = self.channels[ci].write_word(memory, word);
+        self.finish_cycle(ci, wrote.is_some());
+        wrote
     }
 
     /// Run one verify transfer on local channel `ci`, latching terminal-count
     /// into the status register. No memory is touched.
     #[allow(dead_code)] // Limit: no Machine-level verify wiring yet (see DmaChannel::write_byte).
     fn verify(&mut self, ci: usize) -> Option<()> {
-        if self.controller_disabled() {
+        if !self.begin_cycle(ci) {
             return None;
         }
-        self.channels[ci].verify()?;
-        if self.channels[ci].reached_tc {
-            self.status |= 1 << ci;
-        }
-        Some(())
+        let verified = self.channels[ci].verify();
+        self.finish_cycle(ci, verified.is_some());
+        verified
     }
 }
 
@@ -575,10 +647,16 @@ impl DmaController {
     /// Read one byte for DMA channel `channel` (0-3 master, 4-7 slave).
     pub(crate) fn read_byte(&mut self, channel: usize, memory: &mut Memory) -> Option<u8> {
         if channel < 4 {
-            self.master.read_byte(channel, memory)
+            self.master.set_hardware_request(channel, true);
+            let value = self.master.read_byte(channel, memory);
+            self.master.set_hardware_request(channel, false);
+            value
         } else {
-            // Slave channels are 16-bit on real hardware; modeled byte-wise here.
-            self.slave.read_byte(channel - 4, memory)
+            let local = channel - 4;
+            self.slave.set_hardware_request(local, true);
+            let value = self.slave.read_byte(local, memory);
+            self.slave.set_hardware_request(local, false);
+            value
         }
     }
 
@@ -589,7 +667,11 @@ impl DmaController {
         if channel < 4 {
             None
         } else {
-            self.slave.read_word(channel - 4, memory)
+            let local = channel - 4;
+            self.slave.set_hardware_request(local, true);
+            let value = self.slave.read_word(local, memory);
+            self.slave.set_hardware_request(local, false);
+            value
         }
     }
 
@@ -606,9 +688,16 @@ impl DmaController {
         byte: u8,
     ) -> Option<()> {
         if channel < 4 {
-            self.master.write_byte(channel, memory, byte)
+            self.master.set_hardware_request(channel, true);
+            let wrote = self.master.write_byte(channel, memory, byte);
+            self.master.set_hardware_request(channel, false);
+            wrote
         } else {
-            self.slave.write_byte(channel - 4, memory, byte)
+            let local = channel - 4;
+            self.slave.set_hardware_request(local, true);
+            let wrote = self.slave.write_byte(local, memory, byte);
+            self.slave.set_hardware_request(local, false);
+            wrote
         }
     }
 

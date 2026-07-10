@@ -248,7 +248,6 @@ impl Machine {
                     rtc,
                     dma,
                     fdc,
-                    floppy,
                     opl,
                     dsp,
                     mixer,
@@ -298,7 +297,6 @@ impl Machine {
                     rtc,
                     dma,
                     fdc,
-                    floppy,
                     opl,
                     dsp,
                     mixer,
@@ -609,9 +607,8 @@ impl Machine {
                     if self.keyboard.a20_enabled() != a20_before {
                         self.cpu.note_a20_changed();
                     }
-                    // A device wrote guest RAM this step (a DMA disk/floppy transfer or block copy),
-                    // bypassing the CPU's SMC tracking; drop the prefetch + decode cache so staged
-                    // code is re-decoded rather than replayed stale on a later near branch into it.
+                    // A bus-side DMA copy or HLE service wrote guest RAM this step,
+                    // bypassing CPU SMC tracking. Drop prefetch and decoded code.
                     if self.device_wrote_memory {
                         self.cpu.note_device_memory_write();
                     }

@@ -416,8 +416,10 @@ fn chip_write_latches_terminal_count_into_status() {
     chip.channels[2].base_addr = 0x0040;
     chip.channels[2].cur_count = 0; // one transfer -> immediate TC
     chip.channels[2].set_mode(0x44); // kind 1 (write), ch2 bits ignored here
+    chip.set_hardware_request(2, true);
     let mut mem = Memory::new(0x0040 + 2).unwrap();
     chip.write_byte(2, &mut mem, 0x5A).unwrap();
+    chip.set_hardware_request(2, false);
     assert_eq!(mem.read_u8(0x0040).unwrap(), 0x5A);
     // Status read returns the latched TC for channel 2 and clears it.
     assert_eq!(chip.read_local(8), Some(0x04));
@@ -430,7 +432,9 @@ fn chip_verify_latches_terminal_count_into_status() {
     chip.channels[3].mask = false;
     chip.channels[3].cur_count = 0; // one transfer -> immediate TC
     chip.channels[3].set_mode(0x40); // kind 0 (verify)
+    chip.set_hardware_request(3, true);
     chip.verify(3).unwrap();
+    chip.set_hardware_request(3, false);
     assert_eq!(chip.read_local(8), Some(0x08), "ch3 TC latched by verify");
 }
 
@@ -442,9 +446,11 @@ fn chip_write_word_latches_terminal_count_into_status() {
     chip.channels[1].page = 0x00;
     chip.channels[1].cur_count = 0; // one transfer -> immediate TC
     chip.channels[1].set_mode(0x44); // kind 1 (write)
+    chip.set_hardware_request(1, true);
     let byte_addr = (0x0004u32 << 1) as usize;
     let mut mem = Memory::new(byte_addr + 4).unwrap();
     chip.write_word(1, &mut mem, 0x1234).unwrap();
+    chip.set_hardware_request(1, false);
     assert_eq!(mem.read_u8(byte_addr).unwrap(), 0x34);
     assert_eq!(mem.read_u8(byte_addr + 1).unwrap(), 0x12);
     assert_eq!(
@@ -615,4 +621,79 @@ fn mem_to_mem_is_gated_by_enable_and_disable_bits() {
     dma.write_port(0x08, 0x01);
     dma.write_port(0x0A, 0x04); // mask ch0
     assert_eq!(dma.mem_to_mem(&mut mem), None, "masked channel 0");
+}
+
+#[test]
+fn hardware_request_level_is_visible_until_the_device_drops_it() {
+    let mut dma = DmaController::default();
+    dma.master.set_hardware_request(2, true);
+    assert_eq!(dma.read_port(0x08).unwrap() & 0x40, 0x40);
+    assert_eq!(dma.read_port(0x08).unwrap() & 0x40, 0x40);
+    dma.master.set_hardware_request(2, false);
+    assert_eq!(dma.read_port(0x08).unwrap() & 0x40, 0);
+}
+
+#[test]
+fn one_device_request_consumes_one_channel_cycle() {
+    let mut dma = DmaController::default();
+    dma.write_port(0x0B, 0x46); // channel 2, single, device->memory
+    dma.write_port(0x04, 0x20);
+    dma.write_port(0x04, 0x00);
+    dma.write_port(0x05, 0x01); // two transfers
+    dma.write_port(0x05, 0x00);
+    dma.write_port(0x0A, 0x02);
+    let mut memory = Memory::new(0x40).unwrap();
+
+    assert_eq!(dma.master.channels[2].transfer_cycles, 0);
+    dma.write_byte(2, &mut memory, 0xA5).unwrap();
+    let channel = &dma.master.channels[2];
+    assert_eq!(channel.transfer_cycles, 1);
+    assert_eq!(channel.cur_addr, 0x0021);
+    assert_eq!(channel.cur_count, 0);
+    assert!(!channel.dreq, "the one-cycle request pulse has ended");
+    assert!(!channel.active, "the bus grant has ended");
+}
+
+#[test]
+fn mask_and_cascade_mode_refuse_a_device_cycle_without_stepping() {
+    let mut dma = DmaController::default();
+    let mut memory = Memory::new(4).unwrap();
+    dma.write_port(0x0B, 0x46);
+    assert_eq!(dma.write_byte(2, &mut memory, 1), None, "masked");
+    assert_eq!(dma.master.channels[2].transfer_cycles, 0);
+
+    dma.write_port(0x0A, 0x02);
+    dma.write_port(0x0B, 0xC6); // channel 2 cascade
+    assert_eq!(dma.write_byte(2, &mut memory, 1), None, "cascade");
+    assert_eq!(dma.master.channels[2].transfer_cycles, 0);
+}
+
+#[test]
+fn block_mode_keeps_the_channel_active_until_terminal_count() {
+    let mut dma = DmaController::default();
+    dma.write_port(0x0B, 0x86); // channel 2, block, device->memory
+    dma.write_port(0x04, 0x00);
+    dma.write_port(0x04, 0x00);
+    dma.write_port(0x05, 0x01); // two cycles
+    dma.write_port(0x05, 0x00);
+    dma.write_port(0x0A, 0x02);
+    let mut memory = Memory::new(4).unwrap();
+
+    dma.write_byte(2, &mut memory, 0x11).unwrap();
+    assert!(dma.master.channels[2].active);
+    dma.write_byte(2, &mut memory, 0x22).unwrap();
+    assert!(dma.master.channels[2].reached_tc);
+    assert!(!dma.master.channels[2].active);
+    assert_eq!(dma.master.channels[2].transfer_cycles, 2);
+}
+
+#[test]
+fn a_rejected_block_cycle_does_not_latch_the_channel_active() {
+    let mut dma = DmaController::default();
+    dma.write_port(0x0B, 0x8A); // channel 2, block, memory->device
+    dma.write_port(0x0A, 0x02);
+    let mut memory = Memory::new(4).unwrap();
+    assert_eq!(dma.write_byte(2, &mut memory, 0x55), None);
+    assert!(!dma.master.channels[2].active);
+    assert_eq!(dma.master.channels[2].transfer_cycles, 0);
 }
