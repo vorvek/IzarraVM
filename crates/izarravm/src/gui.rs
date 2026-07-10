@@ -8,7 +8,6 @@ use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::{GswMode, TimingClass};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
-use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
 use std::cell::Cell;
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -342,8 +341,6 @@ enum Command {
     MountCd(izarravm_machine::CdImage),
     /// Eject the CD.
     EjectCd,
-    /// Set the host-side Distira/Glide render worker count.
-    SetGlideRenderThreads(u8),
     Shutdown,
 }
 
@@ -775,7 +772,6 @@ impl Emulator {
         gain: SharedGain,
         amp: SharedGain,
         speaker_vol: SharedGain,
-        glide_render_threads: u8,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
         let (commands, rx) = mpsc::channel();
@@ -793,7 +789,6 @@ impl Emulator {
                     gain,
                     amp,
                     speaker_vol,
-                    glide_render_threads,
                     rx,
                     frame_thread,
                 )
@@ -834,10 +829,6 @@ impl Emulator {
 
     fn eject_cd(&self) {
         let _ = self.commands.send(Command::EjectCd);
-    }
-
-    fn set_glide_render_threads(&self, threads: u8) {
-        let _ = self.commands.send(Command::SetGlideRenderThreads(threads));
     }
 
     fn shutdown(&mut self) {
@@ -881,7 +872,6 @@ fn emulate(
     gain: SharedGain,
     amp: SharedGain,
     speaker_vol: SharedGain,
-    glide_render_threads: u8,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
@@ -896,7 +886,6 @@ fn emulate(
     // the ~8 s RAM count-up and the startup chime. Headless runs and tests leave
     // the default (fast) so they finish inside their cycle budgets.
     machine.set_fast_post(false);
-    machine.set_distira_render_threads(glide_render_threads);
     // Boot real FreeDOS from this host folder via Katea: the controller presents
     // the folder as a real ATA disk and the kernel does its own FAT / INT 21h.
     // mount_hdd_folder seeds the user-owned CONFIG.SYS/AUTOEXEC.BAT (which loads
@@ -962,9 +951,6 @@ fn emulate(
                 }
                 Ok(Command::MountCd(image)) => machine.mount_cd(image),
                 Ok(Command::EjectCd) => machine.eject_cd(),
-                Ok(Command::SetGlideRenderThreads(threads)) => {
-                    machine.set_distira_render_threads(threads)
-                }
                 Ok(Command::Shutdown) => {
                     // Flush the Katea host folder, the floppy, and the final CMOS
                     // state before exiting (this arm also runs on Reset, which
@@ -1262,9 +1248,6 @@ pub struct GuiApp {
     // The shared PC speaker gain (pc_speaker_volume / 100), read each audio pump
     // and applied to the speaker only.
     speaker_vol: SharedGain,
-    // Distira/Glide render worker count. Persisted in the GUI prefs and applied
-    // live to the emulation thread.
-    glide_render_threads: u8,
     // CRT presentation style (off / subtle / Ye Olde). Persisted; read by
     // monitor_ui each frame and mapped to the shader's style uniform.
     crt_style: CrtStyle,
@@ -1299,7 +1282,6 @@ enum BindTarget {
 struct ConfigDialog {
     input_release: KeyBinding,
     fullscreen: KeyBinding,
-    glide_threads: u8,
     crt_style: CrtStyle,
     // ReSonique 2 amp gain in tenths (120 = 12.0x); see GuiApp::amp_gain.
     amp_gain: u32,
@@ -1340,7 +1322,6 @@ impl GuiApp {
         let prefs = GuiPrefs::load(&prefs_path);
         let volume = prefs.master_volume.clamp(0.0, 1.0);
         let amp_gain = prefs.amp_gain;
-        let glide_render_threads = prefs.glide_render_threads;
         let crt_style = prefs.crt_style;
         let input_release = prefs.input_release.clone();
         let fullscreen_key = prefs.fullscreen.clone();
@@ -1391,7 +1372,6 @@ impl GuiApp {
             gain,
             amp,
             speaker_vol,
-            glide_render_threads,
             crt_style,
             input_release,
             fullscreen_key,
@@ -1439,7 +1419,6 @@ impl GuiApp {
             self.gain.clone(),
             self.amp.clone(),
             self.speaker_vol.clone(),
-            self.glide_render_threads,
         ));
         self.frame_seq = u64::MAX;
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
@@ -1948,7 +1927,6 @@ impl GuiApp {
         self.config_dialog = Some(ConfigDialog {
             input_release: self.input_release.clone(),
             fullscreen: self.fullscreen_key.clone(),
-            glide_threads: self.glide_render_threads,
             crt_style: self.crt_style,
             amp_gain: self.amp_gain,
             pc_speaker_volume: self.pc_speaker_volume,
@@ -2024,22 +2002,6 @@ impl GuiApp {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("DISPLAY").color(LABEL).size(11.0));
                     beige_group(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Voodoo render threads");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for threads in DISTIRA_RENDER_THREAD_CHOICES.iter().rev() {
-                                        ui.selectable_value(
-                                            &mut dialog.glide_threads,
-                                            *threads,
-                                            threads.to_string(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("CRT emulation");
                             ui.with_layout(
@@ -2141,12 +2103,7 @@ impl GuiApp {
             self.speaker_vol
                 .set(speaker_multiplier(self.pc_speaker_volume));
         }
-        if dialog.glide_threads != self.glide_render_threads {
-            // Updates the field, prefs, and emulation thread, and persists.
-            self.set_glide_render_threads(dialog.glide_threads);
-        } else {
-            self.save_prefs();
-        }
+        self.save_prefs();
     }
 
     /// The floating COM1 window: black monospace serial log on white, auto-scrolled
@@ -2273,16 +2230,6 @@ impl GuiApp {
     /// swallows any IO error, so this never interrupts the UI.
     fn save_prefs(&self) {
         self.prefs.save(&self.prefs_path);
-    }
-
-    fn set_glide_render_threads(&mut self, threads: u8) {
-        let threads = normalize_distira_render_threads(threads);
-        self.glide_render_threads = threads;
-        self.prefs.glide_render_threads = threads;
-        self.save_prefs();
-        if let Some(emu) = &self.emu {
-            emu.set_glide_render_threads(threads);
-        }
     }
 
     /// The three drive bays. `running` gates the media actions on a live

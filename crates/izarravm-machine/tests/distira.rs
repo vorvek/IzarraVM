@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 use izarravm_core::VideoCard;
 use izarravm_firmware::{DISTTRI_BIN, I386DX25_TEST_ROM};
 use izarravm_machine::{
@@ -185,21 +188,6 @@ fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 2));
     assert_eq!(frame, vec![0x0031_557b; 4]);
-}
-
-#[test]
-fn distira_render_threads_are_applied_to_the_machine() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Distira),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
-
-    assert_eq!(machine.distira_render_threads(), 2);
-    machine.set_distira_render_threads(4);
-    assert_eq!(machine.distira_render_threads(), 4);
-    machine.set_distira_render_threads(3);
-    assert_eq!(machine.distira_render_threads(), 2);
 }
 
 #[test]
@@ -567,7 +555,7 @@ fn distira_guest_direct_texture_bar_writes_feed_texture_sampling() {
 }
 
 #[test]
-fn distira_pci_config_ports_report_voodoo_graphics_identity() {
+fn vega_always_exposes_the_distira_pci_function() {
     // mov dx,0x0cf8; mov eax,0x80008000; out dx,eax
     // mov dx,0x0cfc; in eax,dx; mov [0x0200],eax; int 20h
     const PROG: [u8; 22] = [
@@ -575,7 +563,7 @@ fn distira_pci_config_ports_report_voodoo_graphics_identity() {
         0xED, 0x66, 0xA3, 0x00, 0x02, 0xCD, 0x20,
     ];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Distira), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
 

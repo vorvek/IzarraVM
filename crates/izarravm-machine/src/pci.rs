@@ -12,20 +12,18 @@ use crate::video_params::{
 #[derive(Debug, Clone)]
 pub(crate) struct PciConfig {
     address: u32,
-    distira_present: bool,
     distira_command: u16,
     distira_mem_base: u32,
     distira_init_enable: u32,
 }
 
 impl PciConfig {
-    pub(crate) fn new(distira_present: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             address: 0,
-            distira_present,
             // Izarra has no PCI BIOS yet, so Distira powers on with its fixed BAR
             // decoded. Guest drivers can still rewrite command/BAR0 through CF8/CFC.
-            distira_command: if distira_present { 0x0002 } else { 0 },
+            distira_command: 0x0002,
             distira_mem_base: crate::DISTIRA_MMIO_BASE & !(DISTIRA_PCI_BAR_SIZE - 1),
             distira_init_enable: 0,
         }
@@ -122,7 +120,7 @@ impl PciConfig {
     }
 
     fn distira_memory_enabled(&self) -> bool {
-        self.distira_present && self.distira_command & 0x0002 != 0
+        self.distira_command & 0x0002 != 0
     }
 
     pub(crate) fn distira_memory_decode_key(&self) -> (bool, u32) {
@@ -194,8 +192,7 @@ impl PciConfig {
     }
 
     fn distira_selected(&self) -> bool {
-        self.distira_present
-            && self.address & 0x8000_0000 != 0
+        self.address & 0x8000_0000 != 0
             && ((self.address >> 16) & 0xff) == 0
             && ((self.address >> 11) & 0x1f) as u8 == DISTIRA_PCI_SLOT
             && ((self.address >> 8) & 0x07) == 0

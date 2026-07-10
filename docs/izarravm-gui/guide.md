@@ -48,7 +48,6 @@ A TOML file holding GUI preferences that are meant to survive between runs,
 separate from the machine-hardware config you pass with `--config`:
 
 - Master volume
-- The number of Distira/Glide render threads (1, 2, or 4)
 - The CRT emulation style (below)
 - Your rebound hotkeys for input release and full screen
 - The last floppy image, last CD image, and last CD folder you mounted
@@ -65,8 +64,7 @@ Opened from the control panel, the config modal has two sections:
 gives keyboard and mouse focus back to the host) and the "Full screen"
 toggle hotkey.
 
-**Display**: the number of Voodoo/Distira render threads, and **CRT
-emulation**, a three-way choice:
+**Display**: **CRT emulation**, a three-way choice:
 
 | On-screen label | What it does |
 | --- | --- |

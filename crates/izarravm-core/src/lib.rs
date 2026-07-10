@@ -57,24 +57,40 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCard {
-    #[serde(rename = "et4000_ax")]
+    #[serde(
+        rename = "vega",
+        alias = "et4000ax",
+        alias = "et4000_ax",
+        alias = "s3virgedx",
+        alias = "s3_virge_dx",
+        alias = "distira",
+        alias = "voodoo1",
+        alias = "voodoo_graphics",
+        alias = "voodoo2"
+    )]
     #[default]
-    Et4000Ax,
-    #[serde(rename = "s3_virge_dx")]
-    S3VirgeDx,
-    #[serde(rename = "distira", alias = "voodoo1", alias = "voodoo_graphics")]
-    Distira,
-    #[serde(rename = "voodoo2")]
-    Voodoo2,
+    Vega,
 }
 
 impl VideoCard {
+    /// Source-compatible names for old call sites. They are aliases of VEGA,
+    /// not selectable hardware variants.
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals)]
+    pub const Et4000Ax: Self = Self::Vega;
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals)]
+    pub const S3VirgeDx: Self = Self::Vega;
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals)]
+    pub const Distira: Self = Self::Vega;
+    #[doc(hidden)]
+    #[allow(non_upper_case_globals)]
+    pub const Voodoo2: Self = Self::Vega;
+
     pub const fn canonical_name(self) -> &'static str {
         match self {
-            Self::Et4000Ax => "et4000_ax",
-            Self::S3VirgeDx => "s3_virge_dx",
-            Self::Distira => "distira",
-            Self::Voodoo2 => "voodoo2",
+            Self::Vega => "vega",
         }
     }
 }
@@ -90,10 +106,9 @@ impl FromStr for VideoCard {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
-            "et4000ax" | "et4000_ax" | "tsenget4000ax" => Ok(Self::Et4000Ax),
-            "s3virgedx" | "s3_virge_dx" | "virgedx" => Ok(Self::S3VirgeDx),
-            "distira" | "voodoo1" | "voodoographics" | "3dfxvoodoo" => Ok(Self::Distira),
-            "voodoo2" | "3dfxvoodoo2" => Ok(Self::Voodoo2),
+            "vega" | "et4000ax" | "et4000_ax" | "tsenget4000ax" | "s3virgedx" | "s3_virge_dx"
+            | "virgedx" | "distira" | "voodoo1" | "voodoographics" | "3dfxvoodoo" | "voodoo2"
+            | "3dfxvoodoo2" => Ok(Self::Vega),
             _ => Err(ConfigError::UnknownPreset {
                 kind: "video",
                 value: value.to_owned(),
@@ -544,7 +559,7 @@ impl Default for MachineConfig {
         Self {
             cpu: GswMode::Gsw386,
             memory_mib: 24, // Izarra 3000: 24 MB, 3 x 8 MB DIMMs
-            video: VideoCard::Et4000Ax,
+            video: VideoCard::Vega,
             emm386: None,
         }
     }

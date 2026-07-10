@@ -1267,7 +1267,7 @@ fn direct_memory_helpers_accept_only_page_local_ram() {
 
 #[test]
 fn ram_lookup_does_not_expose_partial_final_pages_as_full_pages() {
-    let pci = PciConfig::new(false);
+    let pci = PciConfig::new();
     let lookup = RamPageLookup::new(RAM_LOOKUP_PAGE_SIZE + 17, &pci);
     assert!(lookup.direct_bytes(0, RAM_LOOKUP_PAGE_SIZE).is_some());
     assert!(
