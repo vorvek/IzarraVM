@@ -660,6 +660,8 @@ pub struct Machine {
     distira: Distira,
     pci: PciConfig,
     margo_active: bool,
+    margo_linear: bool,
+    margo_bank: u16,
     text_scanline_override: Option<u16>,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
     // The vector of the last host-intercepted `INT n` opcode, stashed so the
@@ -1028,6 +1030,8 @@ impl Machine {
             distira,
             pci,
             margo_active: false,
+            margo_linear: false,
+            margo_bank: 0,
             text_scanline_override: None,
             pending_soft_int: None,
             last_int_vector: None,
@@ -1954,6 +1958,9 @@ struct MachineBus<'a> {
     ram_lookup: &'a mut RamPageLookup,
     video: &'a mut Vga,
     margo: &'a mut Margo,
+    margo_active: bool,
+    margo_linear: bool,
+    margo_bank: u16,
     distira: &'a mut Distira,
     pci: &'a mut PciConfig,
     rom: &'a [u8],

@@ -17,6 +17,9 @@ impl Machine {
             ram_lookup: &mut self.ram_lookup,
             video: &mut self.video,
             margo: &mut self.margo,
+            margo_active: self.margo_active,
+            margo_linear: self.margo_linear,
+            margo_bank: self.margo_bank,
             distira: &mut self.distira,
             pci: &mut self.pci,
             rom: &self.rom,
@@ -1605,6 +1608,21 @@ impl MachineBus<'_> {
         }
     }
 
+    fn margo_banked_window_at(&self, address: u32) -> bool {
+        self.margo_active
+            && !self.margo_linear
+            && (VGA_MODE13H_BASE..VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE).contains(&address)
+    }
+
+    fn margo_banked_window_offset(&self, address: u32) -> Option<usize> {
+        if !self.margo_banked_window_at(address) {
+            return None;
+        }
+        let bank = usize::from(self.margo_bank) * VGA_PLANAR_WINDOW_SIZE as usize;
+        let offset = bank + (address - VGA_MODE13H_BASE) as usize;
+        (offset < MARGO_VRAM_SIZE).then_some(offset)
+    }
+
     fn read_phys_u8(&mut self, address: u32) -> Result<u8, BusError> {
         let mut byte = [0];
         self.read_phys(address, &mut byte)?;
@@ -1624,6 +1642,17 @@ impl MachineBus<'_> {
 
         if let Some(offset) = rom_offset(address, width) {
             out.copy_from_slice(&self.rom[offset..offset + width]);
+            return Ok(());
+        }
+
+        if self.margo_banked_window_at(address) {
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = address
+                    .checked_add(index as u32)
+                    .and_then(|address| self.margo_banked_window_offset(address))
+                    .map(|offset| self.margo.read_vram_u8(offset))
+                    .unwrap_or(0xff);
+            }
             return Ok(());
         }
 
@@ -1777,6 +1806,13 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        if self.margo_banked_window_at(address) {
+            if let Some(offset) = self.margo_banked_window_offset(address) {
+                self.margo.write_vram_u8(offset, value);
+            }
+            return Ok(());
+        }
+
         // A guest that moves the graphics aperture through GC06 redirects the
         // framebuffer window; route through the planar / chain-4 write datapath
         // before the fixed text/CGA window decode below.
@@ -1910,6 +1946,7 @@ impl MachineBus<'_> {
     fn is_device_window(&self, address: u32, width: BusWidth) -> bool {
         let bytes = width.bytes() as usize;
         rom_offset(address, bytes).is_some()
+            || self.margo_banked_window_at(address)
             || self.vga_gfx_offset(address, bytes).is_some()
             || self.video_text_offset(address, bytes).is_some()
             || (self.video.video_memory_enabled() && vga_planar_offset(address, bytes).is_some())
@@ -1939,7 +1976,8 @@ impl MachineBus<'_> {
     fn memory_wait_states_device(&self, address: u32) -> u8 {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
-        } else if self.vga_gfx_offset(address, 1).is_some()
+        } else if self.margo_banked_window_at(address)
+            || self.vga_gfx_offset(address, 1).is_some()
             || self.video_text_offset(address, 1).is_some()
             || (self.video.video_memory_enabled() && vga_planar_offset(address, 1).is_some())
             || margo_lfb_offset(address, 1).is_some()
