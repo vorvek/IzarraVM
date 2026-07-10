@@ -275,7 +275,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         dsp: &mut machine.dsp,
         mixer: &mut machine.mixer,
         wavetable_mpu: &mut machine.wavetable_mpu,
-        midi_input_mpu: &mut machine.midi_input_mpu,
+        midi_mpu: &mut machine.midi_mpu,
         wss: &mut machine.wss,
         wss_base: machine.wss_base,
         wss_enabled: machine.wss_enabled,

@@ -376,15 +376,21 @@ impl FromStr for SbDma16 {
 }
 
 pub const WAVETABLE_MPU_BASE: u16 = 0x300;
-pub const MIDI_INPUT_MPU_BASE: u16 = 0x330;
+pub const MIDI_MPU_BASE: u16 = 0x330;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MidiBackend {
+    #[serde(
+        alias = "none",
+        alias = "fluid_synth",
+        alias = "fluidsynth",
+        alias = "fluid",
+        alias = "sf2"
+    )]
+    #[default]
     Off,
     External,
-    #[default]
-    FluidSynth,
     Munt,
 }
 
@@ -393,7 +399,6 @@ impl MidiBackend {
         match self {
             Self::Off => "off",
             Self::External => "external",
-            Self::FluidSynth => "fluidsynth",
             Self::Munt => "munt",
         }
     }
@@ -410,12 +415,11 @@ impl FromStr for MidiBackend {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
-            "off" | "none" => Ok(Self::Off),
+            "off" | "none" | "fluid_synth" | "fluidsynth" | "fluid" | "sf2" => Ok(Self::Off),
             "external" | "midir" | "midiout" => Ok(Self::External),
-            "fluidsynth" | "fluid" | "sf2" => Ok(Self::FluidSynth),
             "munt" | "mt32" => Ok(Self::Munt),
             _ => Err(ConfigError::UnknownPreset {
-                kind: "MIDI backend",
+                kind: "P330 MIDI receiver (off, external, or munt)",
                 value: value.to_owned(),
             }),
         }
@@ -738,8 +742,11 @@ pub struct RetiredAudioSection {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MidiConfig {
+    /// Receiver for guest MIDI written to the MPU at 0x330.
     pub backend: MidiBackend,
+    /// Exact host destination used when `backend` is External.
     pub external_port: Option<MidiPortId>,
+    /// Optional bank for the FluidSynth wavetable fixed at 0x300.
     pub soundfont: Option<PathBuf>,
     pub mt32_control_rom: Option<PathBuf>,
     pub mt32_pcm_rom: Option<PathBuf>,
@@ -748,7 +755,7 @@ pub struct MidiConfig {
 impl Default for MidiConfig {
     fn default() -> Self {
         Self {
-            backend: MidiBackend::FluidSynth,
+            backend: MidiBackend::Off,
             external_port: None,
             soundfont: None,
             mt32_control_rom: None,

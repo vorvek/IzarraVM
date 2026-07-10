@@ -65,15 +65,15 @@ fn exact_port_name_and_ordinal_select_only_the_requested_duplicate() {
 #[test]
 fn off_external_without_a_port_and_munt_without_roms_stay_actionable() {
     assert_eq!(
-        MidiEngine::open(&config(MidiBackend::Off)).status(),
+        MidiEngine::open_receiver(&config(MidiBackend::Off)).status(),
         MidiStatus::Ready
     );
     assert_eq!(
-        MidiEngine::open(&config(MidiBackend::External)).status(),
+        MidiEngine::open_receiver(&config(MidiBackend::External)).status(),
         MidiStatus::MissingPort
     );
 
-    let mut munt = MidiEngine::open(&config(MidiBackend::Munt));
+    let mut munt = MidiEngine::open_receiver(&config(MidiBackend::Munt));
     assert_eq!(munt.status(), MidiStatus::MissingRoms);
     let mut output = vec![(0, 0); 64];
     munt.send(&message(0, &[0x90, 60, 100]));
@@ -92,7 +92,7 @@ fn master_ticks_map_to_the_first_mixer_frame_at_or_after_the_deadline() {
 
 #[test]
 fn pending_messages_are_ordered_by_guest_timestamp() {
-    let mut midi = MidiEngine::open(&config(MidiBackend::Off));
+    let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
     midi.queue(message(30, &[0x90, 62, 100]));
     midi.queue(message(10, &[0x90, 60, 100]));
     midi.queue(message(20, &[0x90, 61, 100]));
@@ -107,9 +107,9 @@ fn pending_messages_are_ordered_by_guest_timestamp() {
 
 #[test]
 fn backend_switch_keeps_the_absolute_render_cursor() {
-    let mut midi = MidiEngine::open(&config(MidiBackend::Off));
+    let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
     midi.render(&mut [(0, 0); 37]);
-    midi.reconfigure(&config(MidiBackend::Off));
+    midi.reconfigure(&config(MidiBackend::Munt));
     midi.render(&mut [(0, 0); 5]);
     assert_eq!(midi.rendered_frames, 42);
 }
@@ -120,7 +120,7 @@ fn embedded_fluidsynth_starts_a_note_at_its_guest_timed_offset() {
         return;
     }
 
-    let mut midi = MidiEngine::open(&config(MidiBackend::FluidSynth));
+    let mut midi = MidiEngine::open_wavetable(&config(MidiBackend::Off));
     assert_eq!(midi.status(), MidiStatus::Ready);
     midi.send(&message(0, &[0xc0, 0]));
     midi.send(&message(128, &[0x90, 60, 110]));
@@ -154,9 +154,9 @@ fn missing_and_bad_custom_soundfonts_warn_status_and_use_the_embedded_bank() {
         if path.file_name().unwrap() == "bad.sf3" {
             fs::write(&path, b"not a SoundFont").unwrap();
         }
-        let mut custom = config(MidiBackend::FluidSynth);
+        let mut custom = config(MidiBackend::Off);
         custom.soundfont = Some(path);
-        let mut midi = MidiEngine::open(&custom);
+        let mut midi = MidiEngine::open_wavetable(&custom);
         assert_eq!(midi.status(), MidiStatus::MissingSoundFont);
 
         midi.send(&message(0, &[0x90, 60, 110]));
@@ -172,4 +172,51 @@ fn external_close_covers_every_channel() {
     assert_eq!(messages.len(), 16);
     assert_eq!(messages[0], [0xb0, 123, 0]);
     assert_eq!(messages[15], [0xbf, 123, 0]);
+}
+
+#[test]
+fn failed_external_send_enters_missing_port_state_without_hardware() {
+    let mut midi = MidiEngine::open_receiver(&config(MidiBackend::Off));
+    assert_eq!(midi.record_external_send_result(Ok::<(), &str>(())), Ok(()));
+    assert_eq!(midi.status(), MidiStatus::Ready);
+
+    assert_eq!(
+        midi.record_external_send_result(Err("disconnected")),
+        Err("disconnected")
+    );
+    assert!(matches!(midi.adapter, MidiAdapter::Silent));
+    assert_eq!(midi.status(), MidiStatus::MissingPort);
+}
+
+#[test]
+fn missing_p330_receiver_does_not_disable_p300_fluidsynth() {
+    if !NATIVE_SYNTH_AVAILABLE {
+        return;
+    }
+    let wavetable = MidiEngine::open_wavetable(&config(MidiBackend::External));
+    let receiver = MidiEngine::open_receiver(&config(MidiBackend::External));
+
+    assert!(matches!(wavetable.adapter, MidiAdapter::Fluid(_)));
+    assert_eq!(wavetable.status(), MidiStatus::Ready);
+    assert_eq!(receiver.status(), MidiStatus::MissingPort);
+}
+
+#[test]
+fn p330_receiver_changes_do_not_reset_p300_messages() {
+    let mut wavetable = MidiEngine::open_wavetable(&config(MidiBackend::Off));
+    wavetable.queue(message(30, &[0x90, 60, 100]));
+
+    wavetable.reconfigure(&config(MidiBackend::Munt));
+    assert_eq!(wavetable.pending.len(), 1);
+}
+
+#[test]
+fn p300_soundfont_changes_do_not_reset_p330_messages() {
+    let mut receiver = MidiEngine::open_receiver(&config(MidiBackend::Off));
+    receiver.queue(message(30, &[0x90, 60, 100]));
+    let mut changed = config(MidiBackend::Off);
+    changed.soundfont = Some("custom.sf3".into());
+
+    receiver.reconfigure(&changed);
+    assert_eq!(receiver.pending.len(), 1);
 }

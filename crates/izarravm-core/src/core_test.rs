@@ -104,9 +104,9 @@ fn applies_cli_style_overrides() {
 }
 
 #[test]
-fn midi_config_defaults_to_embedded_fluidsynth_and_round_trips_port_identity() {
+fn midi_config_defaults_p330_off_and_round_trips_receiver_identity() {
     let default = MidiConfig::default();
-    assert_eq!(default.backend, MidiBackend::FluidSynth);
+    assert_eq!(default.backend, MidiBackend::Off);
     assert_eq!(default.external_port, None);
     assert_eq!(default.soundfont, None);
     assert_eq!(default.mt32_control_rom, None);
@@ -137,6 +137,14 @@ fn midi_config_defaults_to_embedded_fluidsynth_and_round_trips_port_identity() {
     let encoded = toml::to_string(&parsed).unwrap();
     let round_trip: AppConfig = toml::from_str(&encoded).unwrap();
     assert_eq!(round_trip.audio.midi, parsed.audio.midi);
+
+    let legacy: AppConfig = toml::from_str("[audio.midi]\nbackend = \"fluid_synth\"\n").unwrap();
+    assert_eq!(legacy.audio.midi.backend, MidiBackend::Off);
+    assert!(
+        toml::to_string(&legacy)
+            .unwrap()
+            .contains("backend = \"off\"")
+    );
 }
 
 #[test]
@@ -151,7 +159,7 @@ fn sound_blaster_overrides_and_aliases_parse() {
 }
 
 #[test]
-fn midi_backends_and_fixed_guest_ports_are_unambiguous() {
+fn midi_receivers_and_fixed_guest_ports_are_unambiguous() {
     assert_eq!("off".parse::<MidiBackend>().unwrap(), MidiBackend::Off);
     assert_eq!(
         "external".parse::<MidiBackend>().unwrap(),
@@ -159,11 +167,11 @@ fn midi_backends_and_fixed_guest_ports_are_unambiguous() {
     );
     assert_eq!(
         "fluidsynth".parse::<MidiBackend>().unwrap(),
-        MidiBackend::FluidSynth
+        MidiBackend::Off
     );
     assert_eq!("mt-32".parse::<MidiBackend>().unwrap(), MidiBackend::Munt);
     assert_eq!(WAVETABLE_MPU_BASE, 0x300);
-    assert_eq!(MIDI_INPUT_MPU_BASE, 0x330);
+    assert_eq!(MIDI_MPU_BASE, 0x330);
 }
 
 #[test]

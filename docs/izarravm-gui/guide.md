@@ -52,7 +52,7 @@ separate from the machine-hardware config you pass with `--config`:
 - Your rebound hotkeys for input release and full screen
 - The last floppy image, last CD image, and last CD folder you mounted
 - Whether the control panel is expanded or collapsed
-- The MIDI backend, external output port, SoundFont, and MT-32 ROM paths
+- The P330 receiver, exact host destination, P300 SoundFont, and MT-32 ROM paths
 
 Every field has a default, so an old or partial `izarravm.conf` still loads
 cleanly after an upgrade.
@@ -73,19 +73,22 @@ toggle hotkey.
 | **Subtle** | A light shadow-mask CRT effect. This is the default. |
 | **Ye Olde Screene** | A heavier CRT effect for the full period look. |
 
-**Audio**: set the card amp and PC speaker volume, then choose the P300
-wavetable output:
+**Audio**: set the card amp and PC speaker volume. The P300 wavetable
+daughter card always uses FluidSynth with the embedded FluidR3Mono bank. You
+can select a custom SF2 or SF3 bank without changing the P330 MIDI route.
 
-| Backend | What it uses |
+The P330 receiver selector contains these choices:
+
+| Receiver | What it uses |
 | --- | --- |
-| **Off** | Keeps the guest MPU active without producing host output. |
-| **External MIDI** | The exact host output port selected by name and same-name ordinal. If that port disappears, IzarraVM does not switch to another one. |
-| **FluidSynth** | The embedded FluidR3Mono bank, or an optional SF2/SF3 file. If a custom bank fails, the embedded bank remains active and the dialog reports the problem. |
+| **Off** | Keeps the P330 MPU active without sending its messages anywhere. |
 | **Munt (MT-32)** | User-selected MT-32 control and PCM ROMs. IzarraVM does not include Roland ROMs. |
+| **Host device name and ordinal** | The exact operating-system MIDI destination. These entries represent the MIDI IN side of an external receiver. If the destination disappears, IzarraVM does not choose another one. |
 
-P330 remains the guest MIDI input port. The status line reports a missing
-external port, failed custom SoundFont, missing ROMs, or initialization
-failure without hiding the guest hardware.
+P300 and P330 are independent. A P330 receiver change sends all-notes-off to
+the old receiver without interrupting FluidSynth. Each section has its own
+status line, so a missing host destination or missing ROMs cannot hide a failed
+custom SoundFont. Neither failure hides the corresponding guest MPU.
 
 Startup settings are resolved one field at a time. An explicit command-line
 option wins, followed by an explicitly present `--config` TOML key, the saved

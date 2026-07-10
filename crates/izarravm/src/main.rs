@@ -57,11 +57,13 @@ struct Cli {
     /// instead of in the per-user <home>/.izarravm. For self-contained installs.
     #[arg(long)]
     portable: bool,
+    /// Custom SF2 or SF3 bank for the FluidSynth wavetable at P300.
     #[arg(long)]
     soundfont: Option<PathBuf>,
+    /// P330 receiver: off, external, or Munt.
     #[arg(long)]
     midi_backend: Option<MidiBackend>,
-    /// External MIDI port name. Duplicate names are selected with
+    /// P330 host MIDI destination. Duplicate names are selected with
     /// --midi-port-ordinal, starting at zero.
     #[arg(long)]
     midi_port: Option<String>,
