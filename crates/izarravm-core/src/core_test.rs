@@ -62,7 +62,7 @@ fn applies_cli_style_overrides() {
     config.apply_overrides(ConfigOverrides {
         cpu: Some(GswMode::Gsw386),
         memory_mib: Some(32),
-        video: Some(VideoCard::S3VirgeDx),
+        video: Some(VideoCard::Vega),
         c_drive: Some(PathBuf::from("games")),
         soundfont: Some(PathBuf::from("gm.sf2")),
         midi_backend: Some(MidiBackend::Munt),
@@ -79,7 +79,7 @@ fn applies_cli_style_overrides() {
 
     assert_eq!(config.machine.cpu, GswMode::Gsw386);
     assert_eq!(config.machine.memory_mib, 32);
-    assert_eq!(config.machine.video, VideoCard::S3VirgeDx);
+    assert_eq!(config.machine.video, VideoCard::Vega);
     assert_eq!(config.dos.c_drive, PathBuf::from("games"));
     assert_eq!(config.audio.midi.soundfont, Some(PathBuf::from("gm.sf2")));
     assert_eq!(config.audio.midi.backend, MidiBackend::Munt);
@@ -439,6 +439,6 @@ fn loads_toml_config() {
 
     let config = AppConfig::from_toml_path(path).unwrap();
     assert_eq!(config.machine.cpu, GswMode::Gsw386);
-    assert_eq!(config.machine.video, VideoCard::Et4000Ax);
+    assert_eq!(config.machine.video, VideoCard::Vega);
     assert_eq!(config.dos.c_drive, PathBuf::from("."));
 }

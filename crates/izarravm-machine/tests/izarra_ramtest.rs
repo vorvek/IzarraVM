@@ -10,7 +10,7 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 /// memory.ramtest status and the parsed memory.detected_kib value.
 fn ramtest_result(memory_mib: u16) -> (SuiteRecordStatus, u32) {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(memory_mib, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(memory_mib, VideoCard::Vega),
         izarra_bios(),
     )
     .unwrap();
@@ -61,11 +61,8 @@ fn ramtest_caps_the_int12h_word_at_640_kib() {
     // (16384 KiB here) lives in the memory.detected_kib record instead. A
     // self-booting game sizes its heap off this word, so reporting the total
     // sent QuickDOS booters into ROM/unmapped space and a "Bad free parm" halt.
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-        izarra_bios(),
-    )
-    .unwrap();
+    let mut machine =
+        Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios()).unwrap();
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let memory = machine.memory().as_slice();
     let word = u16::from_le_bytes([memory[0x413], memory[0x414]]);

@@ -31,7 +31,7 @@ const HANDLER: [u8; 22] = [
 ];
 
 fn booted_to_idle() -> Machine {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     machine

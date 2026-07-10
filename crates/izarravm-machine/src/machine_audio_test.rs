@@ -280,7 +280,7 @@ fn sb_mixer_reset_restores_irq5_default() {
 
 #[test]
 fn machine_applies_host_sound_blaster_config_at_boot() {
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.sound_blaster = SoundBlasterConfig {
         enabled: true,
         irq: SbIrq::I7,
@@ -878,7 +878,7 @@ fn approximate_class_delivers_pit_irq0_during_long_compute_stretches() {
         0xEB, 0xFE, // jmp $ (pure compute, no port I/O)
     ];
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(4, VideoCard::Vega),
         rom_with_code(&code),
     )
     .unwrap();
@@ -911,7 +911,7 @@ fn wss_irq7_wakes_a_halted_cpu_via_fast_forward() {
     // codec's terminal-count window and deliver IRQ7 -- proving the wss_wake
     // estimator drives the machine, not just the wss.rs unit test.
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
         rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
     )
@@ -964,7 +964,7 @@ fn wss_honors_a_configured_slave_irq11_end_to_end() {
     // transposed or hardcoded line would route the terminal-count IRQ to the
     // wrong pin. Arm the codec and advance device time across its window; the
     // configured line must latch in the PIC's IRR and IRQ7 must stay clear.
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wss = WssConfig {
         irq: izarravm_core::WssIrq::I11,
         ..WssConfig::default()
@@ -997,7 +997,7 @@ fn wss_masked_irq7_does_not_wake_the_cpu() {
     // interrupts enabled. (The sticky Status INT bit is proven separately in
     // wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge.)
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
         rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
     )
@@ -1103,7 +1103,7 @@ fn wss_disabled_leaves_its_ports_undecoded() {
     // and not a stale latched value. Contrast with the enabled machine, which
     // answers the I12 revision read with 0x0A, so the test proves the gate
     // toggles real decode rather than relying on an error either way.
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wss = WssConfig {
         enabled: false,
         ..WssConfig::default()
@@ -1161,7 +1161,7 @@ fn wss_disabled_advance_and_render_run_cleanly_and_stay_silent() {
     // arm DMA/codec ports first to confirm a disabled codec ignores them entirely
     // -- but the ports do not decode, so the writes that would land on the codec
     // are skipped; only the DMA programming (separate decoder) is set up.
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.wss = WssConfig {
         enabled: false,
         ..WssConfig::default()
@@ -1221,7 +1221,7 @@ fn wss_stream_reaches_the_mixed_render_output_through_render_audio() {
 
     // The identical buffer with WSS disabled produces silence: nothing else is
     // sounding, so the signal above was the WSS mix path, not a stray stream.
-    let mut silent_profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut silent_profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     silent_profile.wss = WssConfig {
         enabled: false,
         ..WssConfig::default()

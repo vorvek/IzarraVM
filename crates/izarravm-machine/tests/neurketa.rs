@@ -7,7 +7,7 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 fn run(mode: GswMode, selector: u8) -> Machine {
     // Base profile mirrors the other machine tests; set_mode switches the mode.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new_boot_image(profile, neurketa_image()).expect("neurketa image boots");
     machine.set_mode(mode);

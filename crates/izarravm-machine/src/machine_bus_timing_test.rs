@@ -553,7 +553,7 @@ fn lazy_reads_chain_into_far_fewer_batches_than_poll_iterations_with_monotone_ob
         0xEB, 0xEA, // 49: jmp poll (displacement -22: poll=29, jmp ends at 51)
     ];
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(4, VideoCard::Vega),
         rom_with_code(&code),
     )
     .unwrap();
@@ -647,7 +647,7 @@ fn lazy_read_after_an_interrupt_service_charge_sees_the_batch_scoped_total() {
         0xEB, 0xFE, // jmp $ (pure compute, no port I/O)
     ];
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(4, VideoCard::Vega),
         rom_with_code(&code),
     )
     .unwrap();
@@ -1023,7 +1023,7 @@ fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
 #[test]
 fn ram_lookup_rebuilds_when_distira_bar_moves_over_ram() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(24, VideoCard::Distira),
+        MachineProfile::gsw_386(24, VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
@@ -1066,7 +1066,7 @@ fn ram_lookup_rebuilds_when_distira_bar_moves_over_ram() {
 #[test]
 fn direct_memory_helpers_accept_only_page_local_ram() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(24, VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
@@ -1200,7 +1200,7 @@ fn ram_lookup_profile() {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(5_000_000);
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(24, VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();

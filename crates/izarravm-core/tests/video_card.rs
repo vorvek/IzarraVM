@@ -14,6 +14,7 @@ fn canonical_name_and_migration_aliases_all_select_vega() {
         "s3_virge_dx",
         "distira",
         "voodoo1",
+        "voodoo_graphics",
         "voodoo2",
     ] {
         assert_eq!(VideoCard::from_str(name).unwrap(), VideoCard::Vega);
@@ -29,20 +30,6 @@ fn canonical_name_and_migration_aliases_all_select_vega() {
     }
 
     assert_eq!(VideoCard::Vega.to_string(), "vega");
-}
-
-#[test]
-fn compatibility_constants_are_values_not_fake_choices() {
-    for card in [
-        VideoCard::Et4000Ax,
-        VideoCard::S3VirgeDx,
-        VideoCard::Distira,
-        VideoCard::Voodoo2,
-    ] {
-        assert_eq!(card, VideoCard::Vega);
-        assert_eq!(card.to_string(), "vega");
-        assert_eq!(toml::Value::try_from(card).unwrap().as_str(), Some("vega"));
-    }
 }
 
 #[test]

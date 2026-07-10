@@ -11,11 +11,8 @@ use izarravm_machine::{Machine, MachineProfile};
 
 /// Boot the BIOS, run POST, and return the parsed result block.
 fn run_post() -> izarravm_firmware::SuiteResults {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-        izarra_bios(),
-    )
-    .expect("the Izarra BIOS image builds a machine");
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios())
+        .expect("the Izarra BIOS image builds a machine");
 
     // POST runs at reset and writes every record well within this budget. The
     // run may end on the cycle limit or a halt depending on what the later
@@ -83,10 +80,7 @@ fn machine_boots_in_gsw386_mode() {
     // The mode probe formats whatever the Lotura register reports for the active
     // mode. Pin the boot default here so a future change to it surfaces alongside
     // the MEASURE value above rather than silently.
-    let machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-        izarra_bios(),
-    )
-    .expect("machine builds");
+    let machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios())
+        .expect("machine builds");
     assert_eq!(machine.active_mode(), GswMode::Gsw386);
 }

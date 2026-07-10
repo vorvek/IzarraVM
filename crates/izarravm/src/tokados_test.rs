@@ -9,7 +9,7 @@ use izarravm_machine::StopReason;
 /// then mounts the FAT32 partition as C: and launches the shell.
 fn boot_hdd(cycles: u64) -> (Machine, StopReason) {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");

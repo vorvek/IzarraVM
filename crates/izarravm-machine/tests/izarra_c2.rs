@@ -13,7 +13,7 @@ use izarravm_firmware::{SuiteRecord, SuiteRecordStatus, izarra_bios, parse_resul
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 fn run_post() -> Vec<SuiteRecord> {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarra_bios()).expect("build machine with izarra BIOS");
     let stop = machine
         .run_until_halt_or_cycles(20_000_000)

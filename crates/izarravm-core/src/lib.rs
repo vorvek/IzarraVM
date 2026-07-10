@@ -71,21 +71,6 @@ pub enum VideoCard {
 }
 
 impl VideoCard {
-    /// Source-compatible names for old call sites. They are aliases of VEGA,
-    /// not selectable hardware variants.
-    #[doc(hidden)]
-    #[allow(non_upper_case_globals)]
-    pub const Et4000Ax: Self = Self::Vega;
-    #[doc(hidden)]
-    #[allow(non_upper_case_globals)]
-    pub const S3VirgeDx: Self = Self::Vega;
-    #[doc(hidden)]
-    #[allow(non_upper_case_globals)]
-    pub const Distira: Self = Self::Vega;
-    #[doc(hidden)]
-    #[allow(non_upper_case_globals)]
-    pub const Voodoo2: Self = Self::Vega;
-
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::Vega => "vega",
@@ -105,8 +90,8 @@ impl FromStr for VideoCard {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
             "vega" | "et4000ax" | "et4000_ax" | "tsenget4000ax" | "s3virgedx" | "s3_virge_dx"
-            | "virgedx" | "distira" | "voodoo1" | "voodoographics" | "3dfxvoodoo" | "voodoo2"
-            | "3dfxvoodoo2" => Ok(Self::Vega),
+            | "virgedx" | "distira" | "voodoo1" | "voodoo_graphics" | "voodoographics"
+            | "3dfxvoodoo" | "voodoo2" | "3dfxvoodoo2" => Ok(Self::Vega),
             _ => Err(ConfigError::UnknownPreset {
                 kind: "video",
                 value: value.to_owned(),

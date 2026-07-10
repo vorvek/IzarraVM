@@ -32,7 +32,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");
@@ -104,7 +104,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nXMSTEST\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -162,7 +162,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -218,7 +218,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBMECH\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -276,7 +276,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSTEST\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -333,7 +333,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -389,7 +389,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSNONE\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -447,7 +447,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIDET\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -505,7 +505,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIMEM\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -565,7 +565,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIIF\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -625,7 +625,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -682,7 +682,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGPREFLCT\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -740,7 +740,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nGPEMUL\r\n".to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -791,7 +791,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine.mount_hdd_folder(&dir).expect("mount host folder");
@@ -889,7 +889,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
         .to_vec();
 
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw386Slow;
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
@@ -974,7 +974,7 @@ fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (String, StopReason) {
 
     let autoexec =
         format!("@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM {mem_args}\r\n").into_bytes();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -1073,7 +1073,7 @@ fn tokaemm_real_if_never_zero_in_v86_across_a_boot() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM\r\n".to_vec();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -1143,7 +1143,7 @@ ECHO Y | CHOICE /C:YN Continue\r\n\
 FIND \"IZARRA\" HELLO.TXT\r\n"
         .to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -1225,7 +1225,7 @@ TYPE DEST\\SUB\\B.TXT\r\n\
 DIR DEST\r\n"
         .to_vec();
 
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -1292,7 +1292,7 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMOUSETST\r\n".to_vec();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -1351,7 +1351,7 @@ fn tokaemm_m4_sb16_irq5_under_v86() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nSNDTST\r\n".to_vec();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -1409,7 +1409,7 @@ fn tokaemm_irq5_at_ip0_discriminated_under_v86() {
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nIRQ5IP0\r\n".to_vec();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine

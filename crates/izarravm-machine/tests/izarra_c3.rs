@@ -11,7 +11,7 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 /// Boot a bare machine (no ATA disk mounted), run POST, return the result block.
 fn run_post_bare(mode: GswMode) -> izarravm_firmware::SuiteResults {
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = mode;
     let mut machine =
         Machine::new(profile, izarra_bios()).expect("the Izarra BIOS image builds a machine");
@@ -95,11 +95,8 @@ fn hdd_probe_fails_when_no_real_ata_disk_is_present() {
 
 #[test]
 fn hdd_probe_passes_with_a_mounted_ata_disk() {
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
-        izarra_bios(),
-    )
-    .unwrap();
+    let mut machine =
+        Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), izarra_bios()).unwrap();
     machine.mount_hdd(vec![0u8; 64 * 512]);
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let results = parse_result_block(machine.memory().as_slice()).expect("valid VDTS result block");

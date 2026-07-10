@@ -46,7 +46,7 @@ fn new_raw_program_seeds_psp_env_pointer_with_blaster() {
     // A trivial exit-only program is enough: the env is seeded at load.
     let com: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
     let machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     let env_seg = psp_env_segment(&machine);
     assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
     // The env data sits one paragraph above the 64 KiB .COM program block
@@ -69,7 +69,7 @@ fn new_raw_program_seeds_psp_env_pointer_with_blaster() {
 fn dos_env_block_carries_the_configured_routing() {
     // A non-default routing (IRQ7 / DMA3) flows from the host config through
     // the loader into the env block a guest scans via PSP:0x2C.
-    let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.sound_blaster = SoundBlasterConfig {
         enabled: true,
         irq: SbIrq::I7,
@@ -90,7 +90,7 @@ fn dos_env_block_carries_the_configured_routing() {
 
 #[test]
 fn keyboard_rom_echoes_injected_keys_to_the_screen() {
-    let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::kbd_bios()).unwrap();
     // Let the ROM run its init (install vectors, unmask IRQ1, STI, enter loop).
     machine.run_until_halt_or_cycles(200_000).unwrap();
@@ -111,7 +111,7 @@ fn dos_machine_routes_irq1_to_the_keyboard_isr() {
     // org 0x100: jmp $  (EB FE)
     let com: &[u8] = &[0xeb, 0xfe];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     machine.inject_key_scancodes(&[0x1e, 0x9e]); // 'a' make + break
     machine.run_until_halt_or_cycles(200_000).unwrap();
     // The real INT 09h ISR should have moved 'a' into the BDA ring.
@@ -128,7 +128,7 @@ fn dos_program_reads_typed_keys_through_int21() {
         0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
     ];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), com).unwrap();
     // Type 'h' then 'i' as Set 1 make+break (H=0x23, I=0x17).
     machine.inject_key_scancodes(&[0x23, 0xa3, 0x17, 0x97]);
     let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
@@ -143,7 +143,7 @@ fn tokados_sndtst_delivers_sb_irq5_under_v86() {
     std::fs::create_dir(&dir).unwrap();
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -184,7 +184,7 @@ fn tokados_vcpi_de0b_remaps_sb_irq5_vector() {
     std::fs::create_dir(&dir).unwrap();
 
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -219,7 +219,7 @@ fn tokados_vcpi_de0b_remaps_sb_irq5_vector() {
 fn protected_mode_sb_dma_irq5_reaches_client_idt() {
     for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
         let mut machine =
-            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PMIRQ5_COM)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PMIRQ5_COM)
                 .unwrap();
         machine.set_mode(mode);
         let reason = machine
@@ -237,7 +237,7 @@ fn lotura_reports_id_and_switches_mode_live() {
     // org 0x100: mov al,2; out 0xe1,al; mov ax,4c00h; int 21h
     let com: &[u8] = &[0xb0, 0x02, 0xe6, 0xe1, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
     let mut machine = Machine::new_raw_program(
-        MachineProfile::gsw_386(16, izarravm_core::VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, izarravm_core::VideoCard::Vega),
         com,
     )
     .unwrap();
@@ -267,7 +267,7 @@ fn lotura_reports_id_and_switches_mode_live() {
 
 #[test]
 fn izarra_bios_post_publishes_result_block() {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     // The full-screen RLE background blit delays the POST step loop to ~10M
     // cycles, so the result block fills out later than the old mode-13h screen.
@@ -321,7 +321,7 @@ fn izarra_bios_post_publishes_result_block() {
 
 #[test]
 fn izarra_bios_slow_post_continues_after_ramtest() {
-    let profile = MachineProfile::gsw_386(2, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(2, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.set_fast_post(false);
     let mut results = None;
@@ -350,7 +350,7 @@ fn izarra_bios_slow_post_continues_after_ramtest() {
 
 #[test]
 fn izarra_bios_ramtest_esc_skips_and_continues_post() {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.set_fast_post(false);
     for _ in 0..40 {
@@ -380,7 +380,7 @@ fn izarra_bios_ramtest_esc_skips_and_continues_post() {
 
 #[test]
 fn izarra_bios_tab_before_ramtest_wins_over_later_del() {
-    let profile = MachineProfile::gsw_386(2, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(2, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.set_fast_post(false);
     for _ in 0..40 {
@@ -423,7 +423,7 @@ fn izarra_bios_draws_art_post_screen() {
     // the top-left header text drawn over it by lfb_text. Pixels are read as raw
     // palette indices from the LFB VRAM at MARGO_LFB_BASE + y*320 + x. The
     // full-screen RLE blit is heavy, so POST needs a large cycle budget.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
@@ -481,7 +481,7 @@ fn izarra_bios_post_lights_component_icons() {
     // y 166..192) carries saturated colour bars once lit, whereas the grey icon
     // is near-monochrome. A saturated pixel in the cell after a full POST sweep
     // proves component.video_margo passed and the grey->colour reveal fired.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
@@ -503,7 +503,7 @@ fn serial_tx_is_captured_and_lsr_reports_empty() {
     // A write to the COM1 transmit register (0x3F8) with DLAB clear appends to
     // the text serial_text() surfaces, and the line status register (0x3FD)
     // always reports transmitter empty (THRE|TEMT) so a poll loop never stalls.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     with_bus(&mut machine, |bus| {
         bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'H'), false)
@@ -522,7 +522,7 @@ fn izarra_bios_mirrors_post_log_to_com1() {
     // POST initializes COM1 and writes each step's status and name to 0x3F8.
     // After a full POST run the serial log carries the header and the
     // foundation reference step, proving the mirror is live.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     // The RLE background blit delays com1_init/the step loop to ~10M cycles.
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
@@ -548,7 +548,7 @@ fn fast_post_port_reflects_the_flag() {
     // Port 0xE2 is the Lotura POST-pacing flag the BIOS reads before the
     // cosmetic RAM count-up. It defaults to fast (1) so headless runs and
     // tests skip the ~8 s pacing; the GUI clears it for the full experience.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     let fast = with_bus(&mut machine, |bus| {
         bus.read_io(0x00e2, BusWidth::Byte, 0, false).unwrap() as u8
@@ -566,7 +566,7 @@ fn izarra_bios_int19_boots_floppy_sector_zero() {
     // INT 19h must load sector 0 of the mounted floppy to 0000:7C00 and far
     // jump there with no signature check. The boot sector writes a sentinel
     // and halts; if the sentinel lands, the bootstrap loaded and jumped.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
 
     let mut img = vec![0u8; 737_280];
@@ -592,7 +592,7 @@ fn floppy_booter_owns_int21_through_its_ivt_handler() {
     // 0000:7C1E, calls AH=4Ch, then writes a post-return marker and halts. If
     // HLE owns the call, AH=4Ch reports StopReason::DosExit before either
     // marker lands.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
 
     let mut img = vec![0u8; 737_280];
@@ -666,7 +666,7 @@ fn int13_through_ff00_0000_returns_to_caller() {
     // a clean return point.
     let mut rom = rom;
     rom[0xF000] = 0xCF; // iret
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.mount_floppy(img).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -694,7 +694,7 @@ fn int13_ah01_returns_last_status() {
         0xCD, 0x13, 0xB4, 0x01, 0xCD, 0x13, // AH=01h get last status
         0xF4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     // Mount media in A: so handle_int13 runs; the read targets B:, which is unbacked.
     machine.mount_floppy(vec![0u8; 737_280]).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -721,7 +721,7 @@ fn simulated_int_dispatch_through_the_ivt_services_the_hle() {
         0xfa, 0xf4, // cli; hlt
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -746,7 +746,7 @@ fn int_opcode_dispatch_services_exactly_once() {
         0xfa, 0xf4, // cli; hlt
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -786,7 +786,7 @@ fn hook_chaining_to_the_saved_default_services_exactly_once() {
     // saved default with a far jump through the saved pointer.
     image_code.extend_from_slice(&[0xff, 0x2e, 0x80, 0x7d]); // jmp far [0x7D80]
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(&image_code),
     )
     .unwrap();
@@ -818,7 +818,7 @@ fn copied_vector_services_once_as_the_landed_vector() {
         0xfa, 0xf4, // cli; hlt
     ];
     let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         boot_image_with(code),
     )
     .unwrap();
@@ -856,7 +856,7 @@ fn hook_chain_to_legacy_iret_survives_an_uninterceded_stub_landing() {
         0xcd, 0x1c, // int 0x1c   (lands stub 0x1C, not intercepted)
         0xea, 0x00, 0x00, 0x00, 0xff, // jmp far FF00:0000
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.mount_floppy(vec![0u8; 737_280]).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -889,7 +889,7 @@ fn booter_hardcoded_legacy_iret_keeps_int13_serviced() {
         0xb4, 0x01, 0xcd, 0x13, // ...and AH=01h reads it back.
         0xf4,
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.mount_floppy(vec![0u8; 737_280]).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
@@ -903,7 +903,7 @@ fn booter_hardcoded_legacy_iret_keeps_int13_serviced() {
 
 #[test]
 fn izarra_bios_isr_enqueues_injected_key() {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     // Run POST so the BIOS reaches its idle loop (past the setup hotkey window,
     // which would otherwise drain the key). Then inject a key: IRQ1 reaches the
@@ -925,7 +925,7 @@ fn izarra_setup_saves_a_changed_value_to_cmos() {
     // keyboard layout (CMOS 0x10, default 0 = en-US) to the next entry, save,
     // and confirm the persisted CMOS byte changed. The setup menu blocks on a
     // keyboard read between keystrokes, so each key is injected then run.
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     assert_eq!(
         machine.cmos_byte(0x10),
@@ -964,7 +964,7 @@ fn izarra_setup_saves_a_changed_value_to_cmos() {
     // The save also refreshes the NVRAM checksum, so a reload validates.
     let saved = machine.cmos_bytes();
     let mut reloaded = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .unwrap();
@@ -983,7 +983,7 @@ fn boot_menu_marks_one_speed_row_on_the_lfb() {
     // paints an ink diamond (index ART_INK_INDEX = 0) on the cream field, so ink
     // pixels in that column flag the mark. This guards the full-repaint render
     // (a stale or missing marker would change the count).
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     machine.inject_key_scancodes(&[0x0f, 0x8f]); // Tab opens the menu.
     machine.run_until_halt_or_cycles(25_000_000).unwrap();
@@ -1006,7 +1006,7 @@ fn int1b_and_int1c_vectors_point_at_valid_iret_handlers() {
     // Use a ROM that carries the IRET byte at FF00:0000, the way the real BIOS
     // does, so the seeded vector lands on a genuine IRET.
     let mut m = Machine::new(
-        MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(4, VideoCard::Vega),
         rom_with_code(&[]),
     )
     .unwrap();
@@ -1034,7 +1034,7 @@ fn int1b_and_int1c_vectors_point_at_valid_iret_handlers() {
 #[test]
 fn dos_reserved_vectors_point_at_a_valid_iret_handler() {
     let mut m = Machine::new(
-        MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(4, VideoCard::Vega),
         rom_with_code(&[]),
     )
     .unwrap();
@@ -1245,7 +1245,7 @@ fn lotura_e7_banks_a_codepage_font_page_into_the_window() {
     // sel=3: cp=3/3=1, size_index=3%3=0 => CP850, 8x16 block.
     const PROG: [u8; 6] = [0xB0, 0x03, 0xE6, 0xE7, 0xCD, 0x20];
     let mut machine =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &PROG).unwrap();
     machine.run_until_halt_or_cycles(1_000_000).unwrap();
     // CP850 8x16 block is CODEPAGE_FONTS[9728 .. 9728+4096]; it must now be at 0xC4000.
     for k in [0u32, 1, 0x41 * 16 + 2, 4095] {

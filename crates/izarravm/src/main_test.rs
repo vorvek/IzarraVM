@@ -49,7 +49,7 @@ fn ascii_to_set1_maps_a_letter_to_make_and_break() {
 #[test]
 fn write_framebuffer_ppm_writes_a_valid_p6_header() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(16, VideoCard::Vega),
         izarravm_firmware::izarra_bios(),
     )
     .expect("build machine");

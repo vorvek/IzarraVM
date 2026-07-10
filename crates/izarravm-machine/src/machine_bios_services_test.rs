@@ -10,7 +10,7 @@ fn new_raw_program_leaves_pit_counter0_running() {
     // a speed calibration spins forever (TSUMERA's setup does exactly that).
     static PROG: &[u8] = &[0xeb, 0xfe]; // JMP $ - we only need a machine to run.
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROG).unwrap();
     fn latched_count(m: &mut Machine) -> u16 {
         let mut bus = m.make_bus();
         bus.write_io(0x43, BusWidth::Byte, 0x00, false).unwrap(); // latch counter 0
@@ -31,7 +31,7 @@ fn new_raw_program_leaves_pit_counter0_running() {
 fn new_raw_program_runs_and_exits_via_int20() {
     let prog: &[u8] = &[0xcd, 0x20]; // int 20h
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     let reason = m.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
 }
@@ -40,7 +40,7 @@ fn new_raw_program_runs_and_exits_via_int20() {
 fn new_raw_program_exits_with_ah4c_code() {
     let prog: &[u8] = &[0xb8, 0x2a, 0x4c, 0xcd, 0x21]; // mov ax,4c2a; int 21h
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     let reason = m.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0x2a });
 }
@@ -49,7 +49,7 @@ fn new_raw_program_exits_with_ah4c_code() {
 fn raw_program_profile_records_cpu_batch_phase() {
     let prog: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21]; // mov ax,4c00; int 21h
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     m.enable_host_profiling(1);
 
     let reason = m.run_until_halt_or_cycles(100_000).unwrap();
@@ -87,7 +87,7 @@ fn raw_program_uses_direct_page_data_and_fetch_caches() {
     prog.extend_from_slice(&0u16.to_le_bytes());
 
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
     m.cpu.reset_perf_counters();
     let reason = m.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -125,7 +125,7 @@ fn new_raw_program_prints_a_dollar_terminated_string() {
         0xb4, 0x09, 0xba, 0x0c, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'H', b'i', b'$',
     ];
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     let reason = m.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
     assert_eq!(m.program_output(), b"Hi");
@@ -141,7 +141,7 @@ fn new_raw_program_output_reaches_the_vga_screen() {
         0xb4, 0x09, 0xba, 0x0c, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'H', b'i', b'$',
     ];
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     let reason = m.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
     let screen = m.screen_text();
@@ -159,7 +159,7 @@ fn new_raw_program_reads_typed_keys_via_ah01() {
         0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
     ];
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     m.set_program_stdin(b"hi");
     let reason = m.run_until_halt_or_cycles(2_000_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -173,7 +173,7 @@ fn new_raw_program_unknown_int21_function_sets_carry() {
     // without the program continuing past it.
     let prog: &[u8] = &[0xb4, 0xff, 0xcd, 0x21, 0xeb, 0xfe];
     let mut m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     m.run_until_halt_or_cycles(1_000).unwrap();
     assert_eq!(m.cpu.registers.eax() as u16, 0x0007);
     assert_eq!(m.cpu.registers.eflags & 0x0001, 0x0001, "CF set");
@@ -182,8 +182,7 @@ fn new_raw_program_unknown_int21_function_sets_carry() {
 #[test]
 fn new_raw_program_seeds_env_one_paragraph_above_prog_top() {
     let prog: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
-    let m =
-        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog).unwrap();
+    let m = Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
     let prog_top = m
         .memory()
         .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)
@@ -824,9 +823,8 @@ fn a20_toggle_through_the_run_loop_invalidates_the_decode_cache() {
     // not advance it, proving the bump comes from the A20 toggle and not incidental run-loop
     // activity. Both spin on JMP $ so the short run never reaches a HLT or a timer interrupt.
     fn gen_after_running(program: &[u8]) -> (bool, u32, u32) {
-        let mut m =
-            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), program)
-                .unwrap();
+        let mut m = Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), program)
+            .unwrap();
         let before = m.cpu.decode_cache_generation();
         m.run_until_halt_or_cycles(1000).unwrap();
         (
@@ -1468,7 +1466,7 @@ fn int13_read_over_executed_buffer_invalidates_decoded_bytes() {
         0xCD, 0x13, // int 13h
         0xEA, 0x00, 0x7C, 0x00, 0x00, // jmp far 0000:7C00
     ]);
-    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+    let mut machine = Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), rom).unwrap();
     machine.write_guest_block(0x7C00, &[0xB8, 0xAA, 0xAA, 0xCB]); // mov ax,AAAAh; retf
 
     let mut image = vec![0u8; 1_474_560];
@@ -2192,7 +2190,7 @@ fn int10_1b_reports_ega_graphics_page_count() {
 #[test]
 fn timeline_tracks_the_active_mode_without_reinterpreting_elapsed_time() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
@@ -2213,7 +2211,7 @@ fn timeline_tracks_the_active_mode_without_reinterpreting_elapsed_time() {
 #[test]
 fn profile_construction_and_set_mode_drive_cpu_and_cache_table() {
     let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();

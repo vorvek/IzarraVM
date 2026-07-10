@@ -37,7 +37,7 @@ const A_MAKE: u8 = 0x1e;
 const A_BREAK: u8 = 0x9e;
 
 fn boot_machine() -> Machine {
-    let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     Machine::new(profile, izarra_bios()).unwrap()
 }
 
