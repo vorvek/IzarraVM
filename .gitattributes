@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.sf3 -text -diff
 third_party/fluidr3mono/FluidR3Mono_License.md -text -diff
+crates/izarravm-native-synth/vendor/*.tar.gz -text -diff
+crates/izarravm-native-synth/vendor/licenses/* -text -diff
