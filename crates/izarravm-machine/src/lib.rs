@@ -9,7 +9,8 @@ use izarravm_bus::{
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    CpuPersona, GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard, WssConfig,
+    CpuPersona, GswMode, HardwareProfile, SoundBlasterConfig, TimingClass, VideoCard,
+    WAVETABLE_MPU_BASE, WssConfig,
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
@@ -891,8 +892,8 @@ fn power_on_mixer(profile: &MachineProfile) -> SbMixer {
 /// Derive the DOS environment entries that advertise the Sound Blaster to
 /// auto-detecting games. `BLASTER` and `SETSOUND` carry the same value:
 /// `A220` (the fixed Resonique 2 base), `I`/`D`/`H` from the host config, and
-/// `T6` (the SB16 card type). The MPU-401 base (`P`) is omitted until MIDI is
-/// modeled. Returns an empty list when the card is disabled, so no `BLASTER`
+/// `T6` (the SB16 card type), and `P300` for the built-in wavetable MPU. Returns
+/// an empty list when the card is disabled, so no `BLASTER`
 /// leaks into a machine that has no SB16; the value always matches the routing
 /// the CT1745 mixer answers, since both are derived from the same config.
 fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String)> {
@@ -900,10 +901,11 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
         return Vec::new();
     }
     let value = format!(
-        "A220 I{} D{} H{} T6",
+        "A220 I{} D{} H{} P{:03X} T6",
         config.irq.line(),
         config.dma.channel(),
-        config.high_dma.channel()
+        config.high_dma.channel(),
+        WAVETABLE_MPU_BASE
     );
     vec![
         ("BLASTER".to_string(), value.clone()),

@@ -229,8 +229,13 @@ fn load_program_routes_com_when_no_mz() {
 fn place_environment_sits_one_paragraph_above_prog_top() {
     let mut mem = Memory::new(1024 * 1024).unwrap();
     build_psp(&mut mem, 0x0100, 0x1100).unwrap();
-    let env_seg =
-        place_environment(&mut mem, 0x0100, 0x1100, &[("BLASTER", "A220 I5 D1 H5 T6")]).unwrap();
+    let env_seg = place_environment(
+        &mut mem,
+        0x0100,
+        0x1100,
+        &[("BLASTER", "A220 I5 D1 H5 P300 T6")],
+    )
+    .unwrap();
     assert_eq!(env_seg, 0x1101);
     assert_eq!(mem.read_u16(0x0100 * 16 + 0x2c).unwrap(), env_seg);
     let base = usize::from(env_seg) * 16;
@@ -244,5 +249,5 @@ fn place_environment_sits_one_paragraph_above_prog_top() {
         s.push(b);
         i += 1;
     }
-    assert_eq!(s, b"BLASTER=A220 I5 D1 H5 T6");
+    assert_eq!(s, b"BLASTER=A220 I5 D1 H5 P300 T6");
 }

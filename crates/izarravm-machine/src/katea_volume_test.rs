@@ -49,7 +49,7 @@ fn extracts_the_embedded_image_payload() {
     assert!(by_name.contains_key("TOKAMOUS.COM"), "TOKAMOUS.COM present");
     let autoexec = by_name.get("AUTOEXEC.BAT").expect("AUTOEXEC.BAT present");
     assert!(
-        String::from_utf8_lossy(autoexec).contains("SET BLASTER=A220 I5 D1 H5 T6"),
+        String::from_utf8_lossy(autoexec).contains("SET BLASTER=A220 I5 D1 H5 P300 T6"),
         "default AUTOEXEC advertises the Sound Blaster"
     );
     assert!(

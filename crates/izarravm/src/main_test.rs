@@ -4,6 +4,36 @@
 use super::*;
 
 #[test]
+fn cli_parses_munt_roms_and_stable_external_port_identity() {
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--midi-backend",
+        "munt",
+        "--midi-port",
+        "USB MIDI",
+        "--midi-port-ordinal",
+        "2",
+        "--mt32-control-rom",
+        "control.rom",
+        "--mt32-pcm-rom",
+        "pcm.rom",
+    ])
+    .unwrap();
+
+    assert_eq!(cli.midi_backend, Some(MidiBackend::Munt));
+    assert_eq!(cli.midi_port.as_deref(), Some("USB MIDI"));
+    assert_eq!(cli.midi_port_ordinal, Some(2));
+    assert_eq!(
+        cli.mt32_control_rom.as_deref(),
+        Some(std::path::Path::new("control.rom"))
+    );
+    assert_eq!(
+        cli.mt32_pcm_rom.as_deref(),
+        Some(std::path::Path::new("pcm.rom"))
+    );
+}
+
+#[test]
 fn ascii_to_set1_maps_a_letter_to_make_and_break() {
     assert_eq!(ascii_to_set1('h'), vec![0x23, 0xa3]);
     // Uppercase wraps the key in left-Shift make/break.

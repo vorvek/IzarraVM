@@ -22,7 +22,7 @@ Toka-DOS sets it in `AUTOEXEC.BAT` so any Sound Blaster-aware program finds
 the card without probing:
 
 ```
-SET BLASTER=A220 I5 D1 H5 T6
+SET BLASTER=A220 I5 D1 H5 P300 T6
 ```
 
 That's base address `0x220`, IRQ 5, 8-bit DMA channel 1, 16-bit DMA channel
