@@ -1672,8 +1672,10 @@ dependencies = [
  "cpal",
  "crossbeam-queue",
  "izarravm-core",
+ "izarravm-native-synth",
  "midir",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

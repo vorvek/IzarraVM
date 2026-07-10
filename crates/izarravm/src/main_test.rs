@@ -34,6 +34,83 @@ fn cli_parses_munt_roms_and_stable_external_port_identity() {
 }
 
 #[test]
+fn saved_midi_preferences_fill_only_keys_absent_from_cli_and_toml() {
+    let mut config = MidiConfig::default();
+    let saved = MidiConfig {
+        backend: MidiBackend::Munt,
+        external_port: Some(MidiPortId {
+            name: "USB MIDI".into(),
+            ordinal: 2,
+        }),
+        soundfont: Some(PathBuf::from("saved.sf3")),
+        mt32_control_rom: Some(PathBuf::from("saved-control.rom")),
+        mt32_pcm_rom: Some(PathBuf::from("saved-pcm.rom")),
+    };
+    merge_saved_midi(
+        &mut config,
+        &saved,
+        MidiConfigPresence {
+            backend: true,
+            soundfont: true,
+            ..MidiConfigPresence::default()
+        },
+    );
+
+    assert_eq!(config.backend, MidiBackend::FluidSynth);
+    assert_eq!(config.soundfont, None);
+    assert_eq!(config.external_port, saved.external_port);
+    assert_eq!(config.mt32_control_rom, saved.mt32_control_rom);
+    assert_eq!(config.mt32_pcm_rom, saved.mt32_pcm_rom);
+}
+
+#[test]
+fn midi_presence_tracks_each_explicit_toml_and_cli_key() {
+    let path = std::env::temp_dir().join(format!(
+        "izarravm-midi-presence-{}-{}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        r#"
+            [audio.midi]
+            mt32_control_rom = "control.rom"
+
+            [audio.midi.external_port]
+            name = "USB MIDI"
+            ordinal = 1
+        "#,
+    )
+    .unwrap();
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--config",
+        path.to_str().unwrap(),
+        "--midi-backend",
+        "external",
+        "--soundfont",
+        "cli.sf3",
+    ])
+    .unwrap();
+    let presence = midi_config_presence(&cli).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        presence,
+        MidiConfigPresence {
+            backend: true,
+            external_port: true,
+            soundfont: true,
+            mt32_control_rom: true,
+            mt32_pcm_rom: false,
+        }
+    );
+}
+
+#[test]
 fn ascii_to_set1_maps_a_letter_to_make_and_break() {
     assert_eq!(ascii_to_set1('h'), vec![0x23, 0xa3]);
     // Uppercase wraps the key in left-Shift make/break.

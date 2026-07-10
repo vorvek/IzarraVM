@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! GUI preferences, persisted as a small `izarravm.conf` TOML file next to the
 //! C: root (in the directory that contains the c_drive folder). This is separate
 //! from `AppConfig`: it holds host-side GUI state (master volume, last mounts)
@@ -6,6 +9,7 @@
 //! Every load and save is best-effort: an IO or parse error logs a warning and
 //! falls back to defaults rather than aborting the run.
 
+use izarravm_core::MidiConfig;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -141,6 +145,8 @@ pub struct GuiPrefs {
     /// Whether the beige control panel is expanded. Persisted so the collapse
     /// state survives a restart. Defaults to open.
     pub panel_open: bool,
+    /// Host MIDI output selected in the configuration dialog.
+    pub midi: MidiConfig,
 }
 
 impl Default for GuiPrefs {
@@ -156,6 +162,7 @@ impl Default for GuiPrefs {
             last_cd_image: None,
             last_cd_folder: None,
             panel_open: true,
+            midi: MidiConfig::default(),
         }
     }
 }

@@ -30,10 +30,11 @@ manual](resonique2/manual.md):
   `5`.
 - **FM music**: use the AdLib or OPL2/OPL3 option at port `388` if the game
   offers a choice. This is fully modeled.
-- **MIDI / General MIDI / wavetable**: not emulated as a port-level device
-  today. A game's MPU-401 or wavetable option will not find hardware to
-  talk to. Pick FM/AdLib music instead, or route MIDI through the host as
-  described in the [ReSonique 2 manual](resonique2/manual.md#what-resonique-2-does-not-have-yet).
+- **MIDI / General MIDI / wavetable**: select MPU-401 output at port `300`.
+  Toka-DOS advertises it as `P300` in `BLASTER`. The configuration dialog can
+  route that output to FluidSynth, Munt, or one exact host MIDI port. Port
+  `330` is reserved for MIDI input. See the [ReSonique 2
+  manual](resonique2/manual.md#midi-and-wavetable).
 
 ## A 3D-accelerated game doesn't detect Distira
 

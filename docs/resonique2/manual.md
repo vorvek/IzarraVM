@@ -11,10 +11,12 @@ card.
 | --- | --- | --- | --- | --- |
 | Digital audio | Sound Blaster 16 / CT1745 mixer | `0x220` | 5 | 8-bit: 1, 16-bit: 5 |
 | FM synthesis | OPL3 (Yamaha YMF262) | `0x388` | n/a | n/a |
+| Wavetable MIDI output | MPU-401 | `0x300` | n/a | n/a |
+| MIDI input | MPU-401 | `0x330` | 9 | n/a |
 
-Both sections sit at their standard, fixed Sound Blaster addresses, the way
-real SB16 hardware does. Software doesn't need to detect them beyond the
-usual Sound Blaster and AdLib probes.
+The digital and FM sections use their standard, fixed Sound Blaster and
+AdLib addresses. ReSonique 2 assigns separate fixed ports to wavetable output
+and MIDI input so software can select each direction explicitly.
 
 ## The BLASTER variable
 
@@ -26,8 +28,8 @@ SET BLASTER=A220 I5 D1 H5 P300 T6
 ```
 
 That's base address `0x220`, IRQ 5, 8-bit DMA channel 1, 16-bit DMA channel
-5, and card type 6 (Sound Blaster 16): exactly the digital audio section's
-defaults above.
+5, wavetable MPU port `0x300`, and card type 6 (Sound Blaster 16). These
+match the defaults above.
 
 ## Digital audio (Sound Blaster 16 compatible)
 
@@ -56,26 +58,23 @@ DSP's adaptive predictor, with the same half-buffer and end-of-buffer
 interrupts as raw PCM playback. Nothing extra to detect or configure: a
 program that issues the ADPCM DSP commands just works.
 
-## What ReSonique 2 does not have, yet
+## MIDI and wavetable
 
-The Izarra 3000's original spec sheet also lists MPU-401 MIDI and a
-wavetable daughterboard. Neither is implemented as hardware a guest program
-can program directly:
+The card exposes separate MPU-401 port pairs. Games send wavetable music to
+`0x300`; Toka-DOS publishes this as `P300` in `BLASTER`. Port `0x330` is the
+MIDI input side and raises IRQ 9 when host input is injected. Both MPUs remain
+visible even when host output is disabled or unavailable.
 
-- **MIDI** is handled on the host side instead: IzarraVM can route MIDI
-  output either to an external MIDI device through your operating system,
-  or to an in-process FluidSynth soundfont renderer. There is no emulated
-  MPU-401 UART at the usual `0x330` port for a DOS program to talk to
-  directly. A game that insists on probing for one at that address won't
-  find it.
-- **Wavetable daughterboard** is flavor text describing where the card's
-  design was headed, not a modeled device. There's no wavetable synthesis
-  chip on the emulated card today.
+IzarraVM can route P300 output to one exact operating-system MIDI port, to
+FluidSynth for General MIDI, or to Munt for MT-32 music. FluidSynth uses the
+embedded FluidR3Mono bank unless a custom SF2/SF3 is selected. A missing or
+invalid custom bank falls back to the embedded copy. Munt requires control
+and PCM ROM paths supplied by the user; IzarraVM does not include Roland
+ROMs.
 
-If you're chasing down why a game's MIDI or wavetable option doesn't light
-up, this is why. Check the [troubleshooting page](../troubleshooting.md)
-for what to try instead (OPL3 FM is always a safe fallback for MIDI-style
-music in period DOS games).
+Changing the backend sends all-notes-off to the old destination without
+resetting either guest MPU. See the [GUI guide](../izarravm-gui/guide.md#the-config-modal)
+for settings and status messages.
 
 ## Next
 
