@@ -510,13 +510,15 @@ the rasterizer draws triangles with depth, alpha, fog, chroma key, and textures.
 A direct SST-1 proof program exercises the device end to end as a regression
 check.
 
-Both DOS Glide linking models are verified in-game:
+The direct DOS Glide path is verified in-game:
 
-- **Static:** the original Voodoo Graphics Tomb Raider executable detects
+- The original Voodoo Graphics Tomb Raider executable detects
   Distira and renders in-game. Its Glide implementation is built into the
   executable, so no emulator-provided `GLIDE2X.OVL` is involved.
-- **Dynamic:** Carmageddon detects Distira and renders in-game with a locally
-  supplied Glide 2.48 `GLIDE2X.OVL`.
+
+Dynamic OVL validation still needs a title that demonstrably fails when
+`GLIDE2X.OVL` is absent. The current Carmageddon fixture renders without an OVL
+and has no LE import modules, so it is not evidence for the dynamic path.
 
 IzarraVM ships neither proprietary Glide binaries nor game data. Local OVLs
 and games remain untracked test fixtures.

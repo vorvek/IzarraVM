@@ -529,12 +529,14 @@ fn build_event_loop(
 }
 
 /// Open the window and run the emulator. Returns when the user closes it.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     profile: MachineProfile,
     rom: Vec<u8>,
     c_drive: PathBuf,
     cd_image: Option<PathBuf>,
     midi_config: MidiConfig,
+    glide_ovl: Option<Vec<u8>>,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
 ) -> Result<(), Box<dyn Error>> {
@@ -546,6 +548,7 @@ pub fn run(
         c_drive,
         cd_image,
         midi_config,
+        glide_ovl,
         test_pattern,
         rtc_setup,
     );

@@ -88,6 +88,38 @@ By default the C: drive, `cmos.bin`, and `izarravm.conf` live under the per-user
 behind in the working directory. Pass `--portable` to keep them in a `c_drive`
 beside the executable instead, for a self-contained install.
 
+## Optional MT-32 and Glide files
+
+Munt needs one control ROM and its matching PCM ROM:
+
+| Module | Control ROM | PCM ROM |
+| --- | --- | --- |
+| MT-32, old generation | `ctrl_mt32_1_04.rom`, `ctrl_mt32_1_05.rom`, `ctrl_mt32_1_06.rom`, or `ctrl_mt32_1_07.rom` | `pcm_mt32.rom` |
+| MT-32, new generation | `ctrl_mt32_2_04.rom`, `ctrl_mt32_2_06.rom`, or `ctrl_mt32_2_07.rom` | `pcm_mt32.rom` |
+| CM-32L | `ctrl_cm32l_1_00.rom` or `ctrl_cm32l_1_02.rom` | `pcm_cm32l.rom` |
+| CM-32LN | `ctrl_cm32ln_1_00.rom` | `pcm_cm32l.rom` |
+
+Settings accepts arbitrary control and PCM paths, so the archive filenames can
+be selected directly. For automatic discovery, copy and rename an MT-32 pair
+to `~/.izarravm/MT32_CONTROL.ROM` and `~/.izarravm/MT32_PCM.ROM`. Copy and
+rename a CM-32L or CM-32LN pair to `~/.izarravm/CM32L_CONTROL.ROM` and
+`~/.izarravm/CM32L_PCM.ROM`. Discovery is ASCII case-insensitive and is disabled
+under `--portable`; paths selected in Settings still work. The source names in
+the table match the `mt32pi` directory in the [Roland MT-32 ROMs
+archive](https://archive.org/details/Roland-MT-32-ROMs).
+
+Many DOS Glide games already include `GLIDE2X.OVL`; that game-local copy takes
+priority. Otherwise, place a compatible Voodoo Graphics OVL at
+`~/.izarravm/GLIDE2X.OVL`. IzarraVM finds the name without regard to ASCII case
+and exposes it through `C:\DOS` as the global `PATH` fallback. A
+[3DBVoodoo2 driver-disc image](https://archive.org/details/3-dbvoodoo-2_202302)
+is archived for reference. IzarraVM does not bundle a replacement or
+diagnostic OVL when neither copy is present.
+
+IzarraVM neither downloads nor redistributes ROMs, Glide drivers, or game data.
+Archive item metadata is not a license. Use these files only when you have the
+lawful right to do so.
+
 ## Validation
 
 ```powershell

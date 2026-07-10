@@ -90,6 +90,42 @@ fn fresh_vol(tag: &str) -> (KateaTreeVolume, std::path::PathBuf) {
 }
 
 #[test]
+fn glide_fallback_stays_on_path_behind_a_game_local_ovl() {
+    let root = scratch("glide_precedence");
+    std::fs::write(root.join("GLIDE2X.OVL"), b"game local").unwrap();
+    let tree = build_tree(
+        &root,
+        &[("GLIDE2X.OVL".to_string(), b"global fallback".to_vec())],
+    );
+
+    let local = tree
+        .root
+        .files
+        .iter()
+        .find(|file| &file.name == b"GLIDE2X OVL")
+        .expect("game-local OVL remains in the current directory");
+    assert!(matches!(local.source, FileSource::HostFile { .. }));
+
+    let dos = tree
+        .root
+        .subdirs
+        .iter()
+        .find(|dir| &dir.name == b"DOS        ")
+        .expect("synthetic C:\\DOS exists");
+    let fallback = dos
+        .dir
+        .files
+        .iter()
+        .find(|file| &file.name == b"GLIDE2X OVL")
+        .expect("global OVL is available through PATH");
+    assert!(matches!(
+        &fallback.source,
+        FileSource::InMemory(bytes) if bytes == b"global fallback"
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn reconcile_creates_a_new_file_in_the_root() {
     let (mut vol, root) = fresh_vol("rec_create");
     let free = vol.next_free;

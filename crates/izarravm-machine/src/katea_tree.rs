@@ -93,6 +93,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
     "LABEL.EXE",
     "DELTREE.COM",
     "XCOPY.EXE",
+    "GLIDE2X.OVL",
 ];
 
 /// Build the tree from a host folder, overlaying the in-memory system files (so the
