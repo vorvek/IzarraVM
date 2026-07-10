@@ -170,7 +170,10 @@ fn pit_and_video_deadlines_choose_the_first_causal_cpu_clock() {
             let (before_events, at_events) = match clock {
                 DeviceClock::Pit => (pit_before, pit_at),
                 DeviceClock::Vga => (vga_before, vga_at),
-                DeviceClock::Dsp | DeviceClock::Wss | DeviceClock::MargoFrame => unreachable!(),
+                DeviceClock::Dsp
+                | DeviceClock::Wss
+                | DeviceClock::MargoFrame
+                | DeviceClock::Rtc => unreachable!(),
             };
             assert_eq!(before_events, 0, "{mode:?} {clock:?}");
             assert!(at_events >= 1, "{mode:?} {clock:?}");

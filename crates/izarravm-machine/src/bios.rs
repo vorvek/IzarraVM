@@ -25,7 +25,7 @@ impl Machine {
 
     /// Service INT 14h over the COM1 UART. DX selects the serial port; only COM1
     /// (DX=0) is wired. The BIOS functions cover AH=00h-05h, and the FOSSIL calls
-    /// use the same instant-drain UART plus the BIOS text cursor and keyboard ring.
+    /// use the same timed UART plus the BIOS text cursor and keyboard ring.
     pub(super) fn handle_int14(&mut self) {
         const COM1: u16 = 0x03f8;
         let ax = self.cpu.registers.eax() as u16;
@@ -82,8 +82,8 @@ impl Machine {
                 self.set_eax_al(msr);
             }
             0x01 => {
-                // THRE is always set (instant transmit), so the send never times out.
                 self.serial.write_port(COM1, al);
+                self.finish_uart_transmit();
                 let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
                 self.set_eax_ah(lsr & 0x7f); // bit7 clear = sent
             }
@@ -147,6 +147,7 @@ impl Machine {
             }
             0x0B => {
                 self.serial.write_port(COM1, al);
+                self.finish_uart_transmit();
                 self.set_ax(0x0001);
             }
             0x18 => self.int14_fossil_read_block(),
@@ -205,6 +206,7 @@ impl Machine {
         for index in 0..count {
             let byte = self.read_physical_u8(es + u32::from(di.wrapping_add(index)));
             self.serial.write_port(COM1, byte);
+            self.finish_uart_transmit();
         }
         self.set_ax(count);
     }
@@ -226,7 +228,7 @@ impl Machine {
 
     /// Program the COM1 UART from an INT 14h AH=00h parameter byte: bits 7-5 baud
     /// rate, 4-3 parity, 2 stop bits, 1-0 word length. The divisor is stored for
-    /// fidelity but does not gate transmit timing.
+    /// fidelity and drives transmit timing.
     fn uart_init(&mut self, params: u8) {
         const COM1: u16 = 0x03f8;
         let divisor: u16 = match params >> 5 {
@@ -251,6 +253,11 @@ impl Machine {
         self.serial.write_port(COM1, (divisor & 0xff) as u8); // DLL
         self.serial.write_port(COM1 + 1, (divisor >> 8) as u8); // DLM
         self.serial.write_port(COM1 + 3, lcr); // LCR, clears DLAB
+    }
+
+    fn finish_uart_transmit(&mut self) {
+        let ticks = self.serial.ticks_until_idle();
+        self.stall_for_master_ticks(ticks);
     }
 
     fn int14_extended_params_valid(&self) -> bool {
@@ -324,9 +331,10 @@ impl Machine {
             let base = self.lpt.read_port(LPT1 + 2).unwrap_or(0) & 0x1e; // keep bits 1-4
             self.lpt.write_port(LPT1 + 2, base | 0x01); // assert -Strobe (edge captures)
             self.lpt.write_port(LPT1 + 2, base); // de-assert
+            self.stall_for_master_ticks(self.lpt.ticks_until_idle());
         }
-        // AH=01h initialize and AH=02h status are status-only on this always-ready
-        // model, so every subfunction returns the current printer status.
+        // AH=01h initialize and AH=02h are status-only. A completed print has
+        // already passed through BUSY and -ACK, so the returned status is idle.
         let status = self.int17_printer_status();
         self.set_eax_ah(status);
     }

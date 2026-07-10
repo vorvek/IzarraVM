@@ -597,15 +597,22 @@ impl Machine {
                         match self.next_timer_wake(deadline_ticks) {
                             Some(wake_step) => {
                                 self.advance_cpu_work(wake_step);
-                                self.host_profile
-                                    .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
                             }
                             None => {
-                                self.host_profile
-                                    .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
-                                return Ok(StopReason::Halted);
+                                let remaining = deadline_ticks - self.timeline.now_ticks();
+                                if let Some(ticks) = self.next_timed_io_deadline() {
+                                    self.advance_halted_ticks(ticks.min(remaining));
+                                } else {
+                                    self.host_profile.record(
+                                        MachineProfilePhaseKind::HaltFastForward,
+                                        halt_start,
+                                    );
+                                    return Ok(StopReason::Halted);
+                                }
                             }
                         }
+                        self.host_profile
+                            .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
                     }
                     // The A20 gate toggled during this step (port 0x92, the 8042, INT 15h, or XMS):
                     // tell the CPU so it drops any prefetch/decoded bytes that A20 now remaps near

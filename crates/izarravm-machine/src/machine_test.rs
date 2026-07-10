@@ -504,6 +504,9 @@ mod mouse;
 #[path = "machine_storage_test.rs"]
 mod storage;
 #[cfg(test)]
+#[path = "machine_timed_io_test.rs"]
+mod timed_io;
+#[cfg(test)]
 #[path = "machine_video_services_test.rs"]
 mod video_services;
 

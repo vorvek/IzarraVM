@@ -91,6 +91,7 @@ pub(crate) enum DeviceClock {
     Dsp,
     Wss,
     MargoFrame,
+    Rtc,
     Vga,
 }
 
@@ -239,6 +240,7 @@ impl Timeline {
             DeviceClock::Dsp => self.dsp,
             DeviceClock::Wss => self.wss,
             DeviceClock::MargoFrame => self.margo_frame,
+            DeviceClock::Rtc => self.rtc,
             DeviceClock::Vga => self.vga,
         };
         phase.ticks_until(events, rate_hz)

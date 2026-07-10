@@ -112,8 +112,14 @@ fn loopback_byte_returns_through_rbr() {
     let mut uart = Uart16450::default();
     uart.write_port(MCR, MCR_LOOP | MCR_OUT2);
     uart.write_port(THR, b'Z');
+    let deadline = uart.ticks_until_event().unwrap();
     let lsr = uart.read_port(LSR).unwrap();
-    assert_ne!(lsr & LSR_DR, 0, "data ready after looped write");
+    assert_eq!(lsr & LSR_DR, 0, "shift register has not completed");
+    uart.advance_master_ticks(deadline - 1);
+    assert_eq!(uart.read_port(LSR).unwrap() & LSR_DR, 0);
+    uart.advance_master_ticks(1);
+    let lsr = uart.read_port(LSR).unwrap();
+    assert_ne!(lsr & LSR_DR, 0, "data ready at the baud deadline");
     assert_eq!(uart.read_port(RBR), Some(b'Z'), "looped byte readable");
     // SOUT is disconnected in loopback, so nothing reaches the capture sink.
     assert!(uart.output().is_empty(), "loopback does not capture");
@@ -123,14 +129,22 @@ fn loopback_byte_returns_through_rbr() {
 }
 
 #[test]
-fn non_loopback_tx_captures_and_lsr_stays_empty() {
+fn non_loopback_tx_captures_only_after_baud_deadlines() {
     let mut uart = Uart16450::default();
     uart.write_port(THR, b'H');
     uart.write_port(THR, b'i');
+    assert!(uart.output().is_empty());
+    let lsr = uart.read_port(LSR).unwrap();
+    assert_eq!(lsr & LSR_THRE, 0, "one byte remains in THR");
+    assert_eq!(lsr & LSR_TEMT, 0, "shift register is active");
+    let deadline = uart.ticks_until_idle();
+    uart.advance_master_ticks(deadline - 1);
+    assert_eq!(uart.output(), b"H");
+    uart.advance_master_ticks(1);
     assert_eq!(uart.output(), b"Hi");
     let lsr = uart.read_port(LSR).unwrap();
-    assert_ne!(lsr & LSR_THRE, 0, "THRE set");
-    assert_ne!(lsr & LSR_TEMT, 0, "TEMT set");
+    assert_ne!(lsr & LSR_THRE, 0, "THRE set after drain");
+    assert_ne!(lsr & LSR_TEMT, 0, "TEMT set after drain");
 }
 
 #[test]
@@ -164,7 +178,9 @@ fn loopback_rx_data_raises_rda_interrupt() {
     // Enable received-data interrupt, gate with OUT2, enter loopback.
     uart.write_port(IER, IER_RDA);
     uart.write_port(MCR, MCR_LOOP | MCR_OUT2);
-    uart.write_port(THR, b'A'); // loops into RBR, sets DR
+    uart.write_port(THR, b'A');
+    assert!(!uart.take_irq(), "no receive edge before baud deadline");
+    uart.advance_master_ticks(uart.ticks_until_event().unwrap());
     assert!(uart.take_irq(), "RDA edge armed");
     let iir = uart.read_port(IIR).unwrap();
     assert_eq!(iir & 0x0f, IIR_RDA, "IIR reports received data available");
@@ -188,7 +204,108 @@ fn com2_transmit_captures_like_com1() {
     // THR at the COM2 base (DLAB clear) drains into the capture sink.
     uart.write_port(COM2_BASE, b'O');
     uart.write_port(COM2_BASE, b'k');
+    assert!(uart.output().is_empty());
+    uart.advance_master_ticks(uart.ticks_until_idle());
     assert_eq!(uart.output(), b"Ok");
     let lsr = uart.read_port(COM2_BASE + 5).unwrap();
     assert_ne!(lsr & LSR_THRE, 0, "THRE set");
+}
+
+#[test]
+fn divisor_controls_the_exact_character_deadline() {
+    let mut fast = Uart16450::default();
+    fast.write_port(LCR, 0x80);
+    fast.write_port(THR, 1);
+    fast.write_port(IER, 0);
+    fast.write_port(LCR, 0x03); // 8 data bits, no parity, 1 stop bit
+    fast.write_port(THR, b'F');
+
+    let mut slow = Uart16450::default();
+    slow.write_port(LCR, 0x80);
+    slow.write_port(THR, 2);
+    slow.write_port(IER, 0);
+    slow.write_port(LCR, 0x03);
+    slow.write_port(THR, b'S');
+
+    let fast_deadline = fast.ticks_until_idle();
+    let slow_deadline = slow.ticks_until_idle();
+    assert_eq!(slow_deadline, fast_deadline * 2);
+    slow.advance_master_ticks(slow_deadline - 1);
+    assert!(slow.output().is_empty());
+    slow.advance_master_ticks(1);
+    assert_eq!(slow.output(), b"S");
+}
+
+#[test]
+fn fifo_character_timeout_raises_receive_irq() {
+    let mut uart = Uart16450::default();
+    uart.write_port(FCR, FCR_FIFO_ENABLE | 0x40); // four-byte RX trigger
+    uart.write_port(IER, IER_RDA);
+    uart.write_port(MCR, MCR_LOOP | MCR_OUT2);
+    uart.write_port(THR, b'T');
+
+    uart.advance_master_ticks(uart.ticks_until_event().unwrap());
+    assert_eq!(uart.read_port(IIR).unwrap() & 0x0f, IIR_NONE);
+    let timeout = uart.ticks_until_event().unwrap();
+    uart.advance_master_ticks(timeout - 1);
+    assert!(!uart.take_irq());
+    uart.advance_master_ticks(1);
+    assert!(uart.take_irq());
+    assert_eq!(uart.read_port(IIR).unwrap() & 0x0f, IIR_TIMEOUT);
+    assert_eq!(uart.read_port(RBR), Some(b'T'));
+    assert_eq!(uart.read_port(IIR).unwrap() & 0x0f, IIR_NONE);
+}
+
+#[test]
+fn fifo_receive_threshold_raises_irq_without_waiting_for_timeout() {
+    let mut uart = Uart16450::default();
+    uart.write_port(FCR, FCR_FIFO_ENABLE | 0x40); // four-byte RX trigger
+    uart.write_port(IER, IER_RDA);
+    uart.write_port(MCR, MCR_LOOP | MCR_OUT2);
+    for byte in b"ABCD" {
+        uart.write_port(THR, *byte);
+    }
+    let character = uart.character_ticks();
+    assert_eq!(uart.ticks_until_irq(), Some(character * 4));
+    uart.advance_master_ticks(character * 4 - 1);
+    assert!(!uart.take_irq());
+    uart.advance_master_ticks(1);
+    assert!(uart.take_irq());
+    assert_eq!(uart.read_port(IIR).unwrap() & 0x0f, IIR_RDA);
+}
+
+#[test]
+fn queued_transmit_empty_irq_deadline_includes_each_holding_byte() {
+    let mut uart = Uart16450::default();
+    uart.write_port(FCR, FCR_FIFO_ENABLE);
+    uart.write_port(MCR, MCR_OUT2);
+    uart.write_port(THR, b'A');
+    let _ = uart.read_port(IIR); // acknowledge the first immediate THRE source
+    uart.write_port(THR, b'B');
+    uart.write_port(THR, b'C');
+    uart.write_port(IER, IER_THRE);
+    let character = uart.character_ticks();
+    assert_eq!(uart.ticks_until_irq(), Some(character * 2));
+    uart.advance_master_ticks(character * 2 - 1);
+    assert!(!uart.take_irq());
+    uart.advance_master_ticks(1);
+    assert!(uart.take_irq());
+    assert_eq!(uart.read_port(IIR).unwrap() & 0x0f, IIR_THRE);
+}
+
+#[test]
+fn transmit_and_timeout_state_are_batch_invariant() {
+    let mut whole = Uart16450::default();
+    whole.write_port(FCR, FCR_FIFO_ENABLE | 0x40);
+    whole.write_port(MCR, MCR_LOOP | MCR_OUT2);
+    whole.write_port(IER, IER_RDA);
+    whole.write_port(THR, b'B');
+    let mut split = whole.clone();
+
+    let span = whole.ticks_until_idle() + whole.character_ticks() * 4;
+    whole.advance_master_ticks(span);
+    split.advance_master_ticks(span / 3);
+    split.advance_master_ticks(span - span / 3);
+    assert_eq!(whole, split);
+    assert_eq!(whole.pending_code(), IIR_TIMEOUT);
 }

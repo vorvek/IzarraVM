@@ -317,8 +317,8 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     )?;
     // The suite is wall-time-bound (PIT ticks and device-settle delays), so the
     // cycle budget scales with the clock to cover the same span at any GSW mode.
-    // 200 ms (clock_hz / 5) matches the original 5,000,000 cycles at 25 MHz.
-    let budget = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 5);
+    // Half a second covers the timer probe and the 453-byte report at 38400 baud.
+    let budget = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 2);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     // Report the result block, which holds the runtime outcome (the timer test
     // patches its record here). The serial dump is an earlier static snapshot.

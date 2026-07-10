@@ -46,7 +46,7 @@ impl Machine {
         }
     }
 
-    fn stall_for_master_ticks(&mut self, master_ticks: u64) {
+    pub(super) fn stall_for_master_ticks(&mut self, master_ticks: u64) {
         let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
         self.advance_master_time(master_ticks, true);
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(cpu_clocks);
@@ -422,6 +422,17 @@ impl Machine {
         // scancode releases once real PS/2 wire time has actually elapsed.
         self.keyboard.advance_mouse_pacing(advance.master_ticks);
 
+        self.serial.advance_master_ticks(advance.master_ticks);
+        self.serial2.advance_master_ticks(advance.master_ticks);
+        self.lpt.advance_master_ticks(advance.master_ticks);
+        self.lpt2.advance_master_ticks(advance.master_ticks);
+        if self
+            .rtc
+            .advance_master_ticks(advance.master_ticks, advance.rtc_seconds)
+        {
+            self.pic.request(8);
+        }
+
         // ATA PIO and PIIX4 bus-master transfers share the authoritative master
         // timeline. A device-to-memory completion bypasses the CPU bus, so drop
         // cached code immediately. This also covers host-driven timeline advances
@@ -436,13 +447,10 @@ impl Machine {
             }
         }
 
-        // The take_irq latches below are single-edge bools, which is safe for
-        // these devices even across a multi-sample step: each is a completion
-        // edge that can fire at most once per guest-initiated operation (a
-        // scancode/aux byte entering the 8042 output buffer, a UART event, an
-        // LPT -ACK strobe, an FDC/IDE/ATA command completion), and the next
-        // operation requires guest port I/O, which ends the CPU batch. No
-        // periodic producer feeds them, so one advance can never span two edges.
+        // These edge latches coalesce like the PIC input pins. Timed UART and
+        // LPT deadlines cap normal CPU batches, while a larger host-driven
+        // advance may cross several transitions before the single pending edge
+        // is forwarded here.
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
@@ -492,20 +500,6 @@ impl Machine {
         // Flash the GUI CD LED for any data the drive just served.
         if self.ide.take_access_bytes() > 0 {
             self.cd_accesses += 1;
-        }
-
-        if advance.rtc_seconds > 0 {
-            self.rtc.tick_seconds(advance.rtc_seconds);
-            // Advance the clock first, then evaluate the RTC interrupt sources so
-            // an enabled alarm compares against the new time. tick_interrupts
-            // returns true only on the rising edge of IRQF (a guest that has not
-            // read Register C to ack keeps the line asserted without a new edge).
-            // A single-edge bool is safe here: IRQF sources are seconds-scale
-            // (far coarser than any batch) and the line stays asserted until the
-            // Register C ack, so one advance cannot span two IRQ8 edges.
-            if self.rtc.tick_interrupts(advance.rtc_seconds) {
-                self.pic.request(8); // IRQ8: RTC periodic/alarm/update interrupt
-            }
         }
 
         self.margo.advance_busy(advance.margo_nanoseconds);
@@ -571,6 +565,12 @@ impl Machine {
     /// without executing CPU work.
     pub fn advance_devices_ticks(&mut self, master_ticks: u64) {
         self.advance_master_time(master_ticks, false);
+    }
+
+    pub(super) fn advance_halted_ticks(&mut self, master_ticks: u64) {
+        let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
+        self.advance_master_time(master_ticks, false);
+        self.elapsed_clocks = self.elapsed_clocks.saturating_add(cpu_clocks);
     }
 
     #[cfg(test)]
@@ -673,10 +673,10 @@ impl Machine {
 
     /// CPU clocks to advance while halted so the next wake-capable IRQ lands, or
     /// None if nothing can wake the CPU (so HLT is a genuine halt). A halted guest
-    /// is woken by timer, audio, or primary IDE completion. Each is considered only when
-    /// unmasked/deliverable; the result is the soonest of the applicable wakes,
-    /// clamped to the deadline and to at least one clock so the run loop always
-    /// makes progress.
+    /// is woken by timer, audio, storage, RTC, serial, or printer completion.
+    /// Each is considered only when unmasked and deliverable. The result is the
+    /// soonest applicable wake, clamped to the deadline and to at least one clock
+    /// so the run loop always makes progress.
     pub(super) fn next_timer_wake(&self, deadline_ticks: u64) -> Option<u64> {
         if !self.cpu.interrupts_enabled() {
             return None;
@@ -738,11 +738,51 @@ impl Machine {
         } else {
             None
         };
-        // The sooner of whichever wakes apply; None only when none can fire.
-        let wake = [pit_wake, dsp_wake, wss_wake, ata_wake]
-            .into_iter()
+        let rtc_wake = self
+            .pic
+            .deliverable(8)
+            .then(|| self.next_rtc_irq_deadline())
             .flatten()
-            .min()?;
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        let serial_wake = self
+            .pic
+            .deliverable(4)
+            .then(|| self.serial.ticks_until_irq())
+            .flatten()
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        let serial2_wake = self
+            .pic
+            .deliverable(3)
+            .then(|| self.serial2.ticks_until_irq())
+            .flatten()
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        let lpt_wake = self
+            .pic
+            .deliverable(7)
+            .then(|| self.lpt.ticks_until_irq())
+            .flatten()
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        let lpt2_wake = self
+            .pic
+            .deliverable(5)
+            .then(|| self.lpt2.ticks_until_irq())
+            .flatten()
+            .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        // The sooner of whichever wakes apply; None only when none can fire.
+        let wake = [
+            pit_wake,
+            dsp_wake,
+            wss_wake,
+            ata_wake,
+            rtc_wake,
+            serial_wake,
+            serial2_wake,
+            lpt_wake,
+            lpt2_wake,
+        ]
+        .into_iter()
+        .flatten()
+        .min()?;
         Some(wake.max(1).min(remaining))
     }
 
@@ -764,13 +804,32 @@ impl Machine {
             .min()
     }
 
+    fn next_rtc_irq_deadline(&self) -> Option<u64> {
+        let periodic = self.rtc.ticks_until_periodic_irq();
+        let update_or_alarm = self.rtc.seconds_until_irq().and_then(|seconds| {
+            self.timeline
+                .master_ticks_until(timeline::DeviceClock::Rtc, seconds, 1)
+        });
+        periodic.into_iter().chain(update_or_alarm).min()
+    }
+
+    pub(super) fn next_timed_io_deadline(&self) -> Option<u64> {
+        self.serial
+            .ticks_until_event()
+            .into_iter()
+            .chain(self.serial2.ticks_until_event())
+            .chain(self.lpt.ticks_until_event())
+            .chain(self.lpt2.ticks_until_event())
+            .min()
+    }
+
     /// CPU clocks until the next due device event.
     ///
     /// Interrupts are serviced at batch entry and devices advance at batch end,
-    /// so PIT channel 0/2 edges and DSP/WSS block edges shorten the batch to the
-    /// first causal CPU clock in every CPU mode. Fast modes have a 1 ms fallback;
-    /// the 386 modes keep a finer DAC-period fallback. A known edge may be
-    /// earlier than either fallback.
+    /// so known timer, audio, storage, RTC, serial, and printer edges shorten the
+    /// batch to the first causal CPU clock in every CPU mode. Fast modes have a
+    /// 1 ms fallback; the 386 modes keep a finer DAC-period fallback. A known
+    /// edge may be earlier than either fallback.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
@@ -835,6 +894,12 @@ impl Machine {
             )
         {
             cap = cap.min(clocks);
+        }
+        if let Some(ticks) = self.next_rtc_irq_deadline() {
+            cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
+        }
+        if let Some(ticks) = self.next_timed_io_deadline() {
+            cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
         }
         cap.max(1).min(remaining)
     }

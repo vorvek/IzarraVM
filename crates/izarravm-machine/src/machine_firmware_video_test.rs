@@ -224,9 +224,9 @@ fn boot_image_emits_serial_records_and_result_block() {
     )
     .unwrap();
 
-    // The budget covers the timer test's idle (ten ticks of about 11932 PIT
-    // clocks, near 2.5M CPU clocks) plus the setup, matching the headless runner.
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    // The budget covers the timer idle and the 453-byte report at the guest's
+    // programmed 38400 baud, matching the headless runner.
+    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
     let serial = machine.serial_text();
     let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
 
@@ -235,6 +235,7 @@ fn boot_image_emits_serial_records_and_result_block() {
     assert!(serial.contains("PASS video.cga_graphics"));
     assert!(serial.contains("PASS video.ega_planar"));
     assert!(serial.contains("PASS video.vga_mode13h"));
+    assert!(serial.contains("PASS timer.irq0"));
     assert_eq!(
         usize::from(results.declared_record_count),
         results.records.len()
@@ -268,8 +269,8 @@ fn boot_image_emits_serial_records_and_result_block() {
 fn boot_suite_timer_passes_at_native_200mhz() {
     // The boot suite is wall-time-bound: the timer test waits for ten IRQ0
     // edges and the PIT runs at a fixed rate regardless of the CPU clock. At
-    // the 200 MHz native default the cycle budget must scale (clock_hz / 5,
-    // about 200 ms) or the timer test never reaches its tick target.
+    // the 200 MHz native default the cycle budget must scale to cover both the
+    // timer and the report's programmed serial baud.
     let profile = MachineProfile {
         cpu: GswMode::Gsw586,
         memory_mib: 16,
@@ -280,7 +281,7 @@ fn boot_suite_timer_passes_at_native_200mhz() {
         address_pipelining: false,
         cache_enabled: false,
     };
-    let budget = profile.cpu.clock_rate().clocks_for_fraction_floor(1, 5);
+    let budget = profile.cpu.clock_rate().clocks_for_fraction_floor(1, 2);
     let mut machine =
         Machine::new_boot_image(profile, izarravm_firmware::X86_BOOT_TEST_IMAGE).unwrap();
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_core::MASTER_CLOCK_HZ;
 
 #[test]
 fn rtc_register_round_trip() {
@@ -193,10 +194,15 @@ fn set_century_rolls_the_year_and_mirrors_alt_slot() {
 #[test]
 fn disabled_periodic_interrupt_latches_nothing() {
     let mut r = Rtc::new();
-    // Power-on Register B has every enable clear.
-    assert!(!r.tick_interrupts(1));
+    let deadline = r
+        .periodic_phase
+        .ticks_until(1, r.periodic_rate_hz())
+        .unwrap();
+    assert!(!r.advance_master_ticks(deadline, 0));
     r.write_port(0x70, REG_C);
-    assert_eq!(r.read_port(0x71), Some(0));
+    let c = r.read_port(0x71).unwrap();
+    assert_ne!(c & REG_C_PF, 0, "raw PF still latches");
+    assert_eq!(c & REG_C_IRQF, 0, "PIE gates IRQF");
 }
 
 #[test]
@@ -205,7 +211,10 @@ fn enabled_periodic_interrupt_sets_pf_and_irqf_then_clears_on_read() {
     // Enable the periodic interrupt (PIE, bit 6).
     r.write_port(0x70, REG_B);
     r.write_port(0x71, REG_B_PIE);
-    assert!(r.tick_interrupts(1)); // rising edge of IRQF
+    assert_eq!(r.periodic_rate_hz(), 1024);
+    let deadline = r.ticks_until_periodic_irq().unwrap();
+    assert!(!r.advance_master_ticks(deadline - 1, 0));
+    assert!(r.advance_master_ticks(1, 0));
     r.write_port(0x70, REG_C);
     let c = r.read_port(0x71).unwrap();
     assert_ne!(c & REG_C_PF, 0, "PF set");
@@ -220,18 +229,18 @@ fn pending_flag_reports_no_new_edge_until_acked() {
     let mut r = Rtc::new();
     r.write_port(0x70, REG_B);
     r.write_port(0x71, REG_B_UIE);
-    assert!(r.tick_interrupts(1)); // first edge
-    assert!(!r.tick_interrupts(1)); // still pending, no new edge
+    assert!(r.advance_master_ticks(MASTER_CLOCK_HZ, 1));
+    assert!(!r.advance_master_ticks(MASTER_CLOCK_HZ, 1));
     // Ack by reading Register C, then a tick edges again.
     r.write_port(0x70, REG_C);
     let _ = r.read_port(0x71);
-    assert!(r.tick_interrupts(1));
+    assert!(r.advance_master_ticks(MASTER_CLOCK_HZ, 1));
 }
 
 #[test]
 fn alarm_fires_only_on_a_time_match() {
     let mut r = Rtc::new();
-    r.seed(2026, 6, 22, 1, 10, 30, 45);
+    r.seed(2026, 6, 22, 1, 10, 30, 44);
     // Enable the alarm and set it for 10:30:45.
     r.write_port(0x70, REG_B);
     r.write_port(0x71, REG_B_AIE);
@@ -241,13 +250,13 @@ fn alarm_fires_only_on_a_time_match() {
     r.write_port(0x71, 30);
     r.write_port(0x70, REG_HOURS_ALARM);
     r.write_port(0x71, 10);
-    assert!(r.tick_interrupts(1));
+    assert!(r.advance_master_ticks(MASTER_CLOCK_HZ, 1));
     r.write_port(0x70, REG_C);
     assert_ne!(r.read_port(0x71).unwrap() & REG_C_AF, 0);
 
     // Move the clock off the alarm time: no match, no flag.
     r.seed(2026, 6, 22, 1, 10, 30, 46);
-    assert!(!r.tick_interrupts(1));
+    assert!(!r.advance_master_ticks(MASTER_CLOCK_HZ, 1));
 }
 
 #[test]
@@ -264,7 +273,36 @@ fn alarm_wildcard_byte_matches_any_value() {
     r.write_port(0x71, 0xff);
     r.write_port(0x70, REG_HOURS_ALARM);
     r.write_port(0x71, 0xff);
-    assert!(r.tick_interrupts(1));
+    assert!(r.advance_master_ticks(MASTER_CLOCK_HZ, 1));
+}
+
+#[test]
+fn rate_select_and_periodic_phase_are_batch_invariant() {
+    let mut whole = Rtc::new();
+    let mut split = Rtc::new();
+    for rtc in [&mut whole, &mut split] {
+        rtc.write_port(0x70, REG_A);
+        rtc.write_port(0x71, 0x2f); // 2 Hz
+        rtc.write_port(0x70, REG_B);
+        rtc.write_port(0x71, REG_B_PIE);
+    }
+    assert_eq!(whole.periodic_rate_hz(), 2);
+    let deadline = whole.ticks_until_periodic_irq().unwrap();
+    whole.advance_master_ticks(deadline, 0);
+    split.advance_master_ticks(deadline / 3, 0);
+    split.advance_master_ticks(deadline - deadline / 3, 0);
+    assert_eq!(whole.ram[usize::from(REG_C)], split.ram[usize::from(REG_C)]);
+    assert_eq!(whole.periodic_phase, split.periodic_phase);
+}
+
+#[test]
+fn legacy_periodic_rate_aliases_match_the_rtc_table() {
+    let mut rtc = Rtc::new();
+    for (selector, expected) in [(1, 256), (2, 128), (3, 8192), (6, 1024), (15, 2)] {
+        rtc.write_port(0x70, REG_A);
+        rtc.write_port(0x71, 0x20 | selector);
+        assert_eq!(rtc.periodic_rate_hz(), expected, "selector {selector}");
+    }
 }
 
 #[test]

@@ -500,9 +500,8 @@ fn izarra_bios_post_lights_component_icons() {
 
 #[test]
 fn serial_tx_is_captured_and_lsr_reports_empty() {
-    // A write to the COM1 transmit register (0x3F8) with DLAB clear appends to
-    // the text serial_text() surfaces, and the line status register (0x3FD)
-    // always reports transmitter empty (THRE|TEMT) so a poll loop never stalls.
+    // COM1 bytes reach the capture sink only after their programmed baud time.
+    // THRE/TEMT then report that both the holding and shift registers are empty.
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
     with_bus(&mut machine, |bus| {
@@ -511,6 +510,8 @@ fn serial_tx_is_captured_and_lsr_reports_empty() {
         bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'i'), false)
             .unwrap();
     });
+    assert!(machine.serial_output().is_empty());
+    machine.advance_devices_ticks(machine.serial.ticks_until_idle());
     assert!(machine.serial_text().ends_with("Hi"));
     let lsr = machine.read_io_port_u8(0x03fd);
     assert_ne!(lsr & 0x20, 0, "THRE set");
@@ -1100,9 +1101,8 @@ fn enabled_rtc_periodic_interrupt_requests_irq8() {
     // Enable the periodic interrupt (select Reg B, set PIE bit 6).
     m.rtc.write_port(0x70, 0x0b);
     m.rtc.write_port(0x71, 0x40);
-    // Advance enough clocks for at least one whole RTC second to elapse.
-    let one_second = m.active_mode.clock_hz();
-    m.advance_devices(one_second + 1);
+    let deadline = m.rtc.ticks_until_periodic_irq().unwrap();
+    m.advance_devices_ticks(deadline);
     assert!(m.pic.irr_bit(8), "IRQ8 became pending");
 }
 

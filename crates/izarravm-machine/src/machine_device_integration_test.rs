@@ -60,7 +60,7 @@ fn boot_suite_reports_timer_irq0_pass() {
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
 
     let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
@@ -86,7 +86,7 @@ fn boot_suite_reports_sb_dsp_reset_pass() {
         .unwrap();
         machine.set_mode(mode);
         let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 4)
+            .run_until_halt_or_cycles(mode.clock_hz() / 2)
             .unwrap();
         assert_eq!(reason, StopReason::Halted);
         let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
@@ -110,7 +110,7 @@ fn boot_suite_reports_opl3_pass() {
         .unwrap();
         machine.set_mode(mode);
         let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 4)
+            .run_until_halt_or_cycles(mode.clock_hz() / 2)
             .unwrap();
         assert_eq!(reason, StopReason::Halted);
         let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
@@ -134,7 +134,7 @@ fn boot_suite_reports_opl2_pass() {
         .unwrap();
         machine.set_mode(mode);
         let reason = machine
-            .run_until_halt_or_cycles(mode.clock_hz() / 4)
+            .run_until_halt_or_cycles(mode.clock_hz() / 2)
             .unwrap();
         assert_eq!(reason, StopReason::Halted);
         let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
@@ -155,7 +155,7 @@ fn boot_suite_reports_sb_8bit_dma_pass() {
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
     assert!(
@@ -174,7 +174,7 @@ fn boot_suite_reports_sb_16bit_dma_pass() {
         izarravm_firmware::X86_BOOT_TEST_IMAGE,
     )
     .unwrap();
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
     let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
     assert!(

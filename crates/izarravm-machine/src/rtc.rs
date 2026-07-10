@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! MC146818 real-time clock and CMOS NVRAM.
 //!
 //! The chip exposes two I/O ports: 0x70 selects a register (low 7 bits) and
@@ -9,6 +12,8 @@
 //! DM=1 and 24/12=1) so the BIOS ASM does not have to unpack BCD. The host
 //! seeds the time once at startup and the device self-advances on the machine
 //! clock; there is no live host resync.
+
+use crate::timeline::RatePhase;
 
 /// Register index of the seconds byte; the rest follow the standard offsets.
 const REG_SECONDS: u8 = 0x00;
@@ -116,6 +121,8 @@ pub struct Rtc {
     /// Set when the guest writes an NVRAM byte (index 0x0E or above), so the
     /// host can flush cmos.bin. Cleared by `take_nvram_dirty`.
     nvram_dirty: bool,
+    /// Phase of the programmable periodic divider against the master timeline.
+    periodic_phase: RatePhase,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -162,6 +169,7 @@ impl Rtc {
             },
             seeded: false,
             nvram_dirty: false,
+            periodic_phase: RatePhase::default(),
         };
         rtc.write_time_registers();
         rtc.refresh_checksum();
@@ -245,64 +253,104 @@ impl Rtc {
         self.write_time_registers();
     }
 
-    /// Decide which RTC interrupt sources fired over `elapsed_seconds` of clock
-    /// advance and, for each enabled source, latch its Register C flag plus the
-    /// shared IRQF bit. Returns true when IRQF newly latched, so the machine
-    /// raises IRQ8. The caller advances the clock with `tick_seconds` first, then
-    /// calls this so the alarm compares against the new time.
-    ///
-    /// Sources (MC146818): the update-ended interrupt (UF) fires once per second;
-    /// the alarm (AF) fires when the time matches the alarm registers; the
-    /// periodic interrupt (PF) fires at the Register A rate. A flag latches only
-    /// when its Register B enable is set, matching real hardware where a disabled
-    /// source still sets nothing the guest can see through Register C.
-    ///
-    /// Limit: the periodic granularity is one tick (a whole second), not the
-    /// programmed Register A rate. Every standard rate is at least once per second,
-    /// so a guest that polls Register C for PF still sees it set each second, but a
-    /// guest counting periodic interrupts to measure sub-second time gets one per
-    /// second instead of up to 1024. To lift this, drive a fractional periodic
-    /// accumulator from advance_devices at the Register A frequency and raise IRQ8
-    /// per period instead of per second.
-    pub fn tick_interrupts(&mut self, elapsed_seconds: u64) -> bool {
-        if elapsed_seconds == 0 {
-            return false;
+    /// Advance the clock and programmable divider on the master timeline.
+    /// Returns true only when IRQF changes from clear to set.
+    pub fn advance_master_ticks(&mut self, master_ticks: u64, elapsed_seconds: u64) -> bool {
+        let alarm_due = elapsed_seconds > 0
+            && self
+                .seconds_until_alarm()
+                .is_some_and(|seconds| seconds <= elapsed_seconds);
+        self.tick_seconds(elapsed_seconds);
+
+        let mut flags = 0;
+        if self
+            .periodic_phase
+            .advance(master_ticks, self.periodic_rate_hz())
+            > 0
+        {
+            flags |= REG_C_PF;
         }
-        let enables = self.ram[usize::from(REG_B)];
-        let mut new_flags = 0u8;
-        // UF: the update cycle ends once per second, so any whole second elapsed
-        // raises it when UIE is set.
-        if enables & REG_B_UIE != 0 {
-            new_flags |= REG_C_UF;
+        if elapsed_seconds > 0 {
+            flags |= REG_C_UF;
         }
-        // PF: latched at second granularity (see the limit above).
-        if enables & REG_B_PIE != 0 {
-            new_flags |= REG_C_PF;
+        if alarm_due {
+            flags |= REG_C_AF;
         }
-        // AF: fires when the current time matches the alarm registers. A "don't
-        // care" alarm byte (top two bits set, value >= 0xC0) matches any value,
-        // the MC146818 wildcard convention.
-        if enables & REG_B_AIE != 0 && self.alarm_matches() {
-            new_flags |= REG_C_AF;
-        }
-        if new_flags == 0 {
+        self.latch_interrupt_flags(flags)
+    }
+
+    fn latch_interrupt_flags(&mut self, flags: u8) -> bool {
+        if flags == 0 {
             return false;
         }
         let was_pending = self.ram[usize::from(REG_C)] & REG_C_IRQF != 0;
-        self.ram[usize::from(REG_C)] |= new_flags | REG_C_IRQF;
-        // Signal the machine to raise IRQ8 only on the rising edge of IRQF; while a
-        // flag is already pending (the guest has not read Register C to ack), the
-        // line stays asserted and no new edge is reported.
-        !was_pending
+        self.ram[usize::from(REG_C)] |= flags;
+        let enables = self.ram[usize::from(REG_B)];
+        let enabled = (flags & REG_C_PF != 0 && enables & REG_B_PIE != 0)
+            || (flags & REG_C_AF != 0 && enables & REG_B_AIE != 0)
+            || (flags & REG_C_UF != 0 && enables & REG_B_UIE != 0);
+        if enabled {
+            self.ram[usize::from(REG_C)] |= REG_C_IRQF;
+        }
+        enabled && !was_pending
     }
 
-    /// Whether the current time matches the seconds/minutes/hours alarm registers.
-    /// A byte of 0xC0 or higher is a "don't care" wildcard that matches any value.
-    fn alarm_matches(&self) -> bool {
+    /// Programmed periodic rate. Divider value 010 selects the normal 32.768 kHz
+    /// time base; the two legacy aliases and standard rates match MC146818.
+    pub(crate) fn periodic_rate_hz(&self) -> u64 {
+        if self.ram[usize::from(REG_A)] & 0x70 != 0x20 {
+            return 0;
+        }
+        match self.ram[usize::from(REG_A)] & 0x0f {
+            0 => 0,
+            1 | 8 => 256,
+            2 | 9 => 128,
+            rate => 32_768 >> (rate - 1),
+        }
+    }
+
+    pub(crate) fn ticks_until_periodic_irq(&self) -> Option<u64> {
+        if self.ram[usize::from(REG_C)] & REG_C_IRQF != 0
+            || self.ram[usize::from(REG_B)] & REG_B_PIE == 0
+        {
+            return None;
+        }
+        self.periodic_phase.ticks_until(1, self.periodic_rate_hz())
+    }
+
+    /// Whole one-second update events until an enabled update or alarm source
+    /// can assert IRQ8. Periodic timing is returned separately in master ticks.
+    pub(crate) fn seconds_until_irq(&self) -> Option<u64> {
+        if self.ram[usize::from(REG_C)] & REG_C_IRQF != 0 {
+            return None;
+        }
+        let enables = self.ram[usize::from(REG_B)];
+        let update = (enables & REG_B_UIE != 0).then_some(1);
+        let alarm = (enables & REG_B_AIE != 0)
+            .then(|| self.seconds_until_alarm())
+            .flatten();
+        update.into_iter().chain(alarm).min()
+    }
+
+    fn seconds_until_alarm(&self) -> Option<u64> {
+        let now = u64::from(self.time.hour) * 3600
+            + u64::from(self.time.minute) * 60
+            + u64::from(self.time.second);
+        (1..=86_400).find(|delta| {
+            let then = (now + delta) % 86_400;
+            self.alarm_matches_time(
+                (then / 3600) as u8,
+                ((then / 60) % 60) as u8,
+                (then % 60) as u8,
+            )
+        })
+    }
+
+    fn alarm_matches_time(&self, hour: u8, minute: u8, second: u8) -> bool {
         let matches = |alarm: u8, now: u8| alarm >= 0xc0 || alarm == now;
-        matches(self.ram[usize::from(REG_SECONDS_ALARM)], self.time.second)
-            && matches(self.ram[usize::from(REG_MINUTES_ALARM)], self.time.minute)
-            && matches(self.ram[usize::from(REG_HOURS_ALARM)], self.time.hour)
+        matches(self.ram[usize::from(REG_SECONDS_ALARM)], second)
+            && matches(self.ram[usize::from(REG_MINUTES_ALARM)], minute)
+            && matches(self.ram[usize::from(REG_HOURS_ALARM)], hour)
     }
 
     /// Read the byte the index port currently selects. Status and clock reads
@@ -342,10 +390,16 @@ impl Rtc {
             // Register A: the OS programs the rate-select and time-base bits here.
             // UIP (bit 7) is read-only and always reads 0 on this device (no
             // update cycle is modeled), so mask it off on write.
-            REG_A => self.ram[usize::from(REG_A)] = value & 0x7f,
+            REG_A => {
+                let value = value & 0x7f;
+                if self.ram[usize::from(REG_A)] != value {
+                    self.periodic_phase = RatePhase::default();
+                }
+                self.ram[usize::from(REG_A)] = value;
+            }
             // Register B: interrupt enables and format bits. The format bits stay
             // forced (binary, 24-hour) so the BIOS format never changes underfoot,
-            // but the enable bits the guest sets drive `tick_interrupts`.
+            // but the enable bits the guest sets drive interrupt generation.
             REG_B => self.ram[usize::from(REG_B)] = value | REG_B_DEFAULT,
             REG_C | REG_D => { /* status C and D are read-only */ }
             _ => {
@@ -421,6 +475,7 @@ impl Rtc {
     /// returned, so the caller can log that the file was inconsistent.
     pub fn load_nvram(&mut self, bytes: &[u8; 64]) -> bool {
         self.ram = *bytes;
+        self.periodic_phase = RatePhase::default();
         // A century byte of 0 means an older image without one; fall back to the
         // default so the year does not resolve to year 0.
         if self.ram[REG_CENTURY] == 0 {
