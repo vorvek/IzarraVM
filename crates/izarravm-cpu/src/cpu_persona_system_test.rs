@@ -20,34 +20,29 @@ fn run_cpuid(leaf: u32) -> CpuGsw {
 #[test]
 fn cpuid_leaf0_reports_vendor_string_and_max_leaf() {
     let cpu = run_cpuid(0);
-    // Max basic leaf is 1.
     assert_eq!(cpu.registers.eax(), 1);
-    // Vendor string "Genuine GSW " in the standard EBX, EDX, ECX order, four bytes
-    // little-endian per register.
     assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
-    assert_eq!(cpu.registers.edx().to_le_bytes(), *b"ine ");
-    assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"GSW ");
-    // Concatenating EBX:EDX:ECX yields the full 12-byte vendor string.
+    assert_eq!(cpu.registers.edx().to_le_bytes(), *b"ineI");
+    assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"ntel");
     let mut vendor = [0u8; 12];
     vendor[0..4].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
     vendor[4..8].copy_from_slice(&cpu.registers.edx().to_le_bytes());
     vendor[8..12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
-    assert_eq!(&vendor, b"Genuine GSW ");
+    assert_eq!(&vendor, b"GenuineIntel");
 }
 
 #[test]
-fn cpuid_leaf1_reports_family5_and_mmx_without_fpu() {
+fn cpuid_leaf1_reports_the_modeled_p55c_contract() {
     let cpu = run_cpuid(1);
-    let eax = cpu.registers.eax();
-    // Family is bits 11-8 and must be 5 (586 / K6 class).
-    assert_eq!((eax >> 8) & 0xf, 5);
-    // Type is bits 13-12 (OEM = 0).
-    assert_eq!((eax >> 12) & 0x3, 0);
-    // MMX is bit 23 of EDX; FPU is bit 0 and must be off.
-    let edx = cpu.registers.edx();
-    assert_ne!(edx & (1 << 23), 0, "MMX bit should be set");
-    assert_eq!(edx & 1, 0, "FPU bit should be clear");
-    // Brand index 0 and no extended feature claimed.
+    assert_eq!(cpu.registers.eax(), 0x0000_0543);
+    assert_eq!(
+        cpu.registers.edx(),
+        CPUID_FEATURE_FPU
+            | CPUID_FEATURE_TSC
+            | CPUID_FEATURE_MSR
+            | CPUID_FEATURE_CX8
+            | CPUID_FEATURE_MMX
+    );
     assert_eq!(cpu.registers.ebx(), 0);
     assert_eq!(cpu.registers.ecx(), 0);
 }
@@ -62,32 +57,9 @@ fn cpuid_unknown_leaf_returns_zeros() {
 }
 
 #[test]
-fn cpuid_brand_string_reports_genuine_gsw_80586() {
-    // Leaf 0x80000000 reports the maximum extended leaf, and 0x80000002..0x80000004
-    // return the 48-byte null-padded brand string, 16 bytes per leaf in EAX, EBX, ECX,
-    // EDX order. Concatenated, they spell the full processor name "Genuine GSW-80586".
-    assert_eq!(run_cpuid(0x8000_0000).registers.eax(), 0x8000_0006);
-    let mut brand = [0u8; 48];
-    for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004]
-        .iter()
-        .enumerate()
-    {
-        let cpu = run_cpuid(*leaf);
-        let base = i * 16;
-        brand[base..base + 4].copy_from_slice(&cpu.registers.eax().to_le_bytes());
-        brand[base + 4..base + 8].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
-        brand[base + 8..base + 12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
-        brand[base + 12..base + 16].copy_from_slice(&cpu.registers.edx().to_le_bytes());
-    }
-    let mut expected = [0u8; 48];
-    expected[..17].copy_from_slice(b"Genuine GSW-80586");
-    assert_eq!(brand, expected);
-}
-
-#[test]
 fn cpuid_is_not_privileged_at_cpl3() {
     // CPUID runs at any privilege level. In protected mode at CPL 3 it must execute,
-    // not fault, and still report the GSW-586 identity.
+    // not fault, and still report the P55C identity.
     let mut cpu = CpuGsw::default();
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.set_segment(
@@ -195,7 +167,7 @@ fn slow_and_normal_386_execute_identical_architectural_state() {
     assert_eq!(slow_bus.memory, normal_bus.memory);
 }
 
-// --- Phase 5 Slice A: RDTSC, RDMSR/WRMSR, the K6 MSR set, CR4 ---
+// --- Phase 5 Slice A: RDTSC, the P55C MSR subset, and CR4 ---
 
 #[test]
 fn level_timing_scales_instruction_clocks_per_mode() {
@@ -250,76 +222,6 @@ fn rdtsc_reads_elapsed_core_clocks_into_edx_eax() {
 }
 
 #[test]
-fn wrmsr_rdmsr_round_trip_whcr() {
-    // 0F 30 WRMSR then 0F 32 RDMSR with ECX selecting WHCR. EDX:EAX is the 64-bit value.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30, 0x0f, 0x32], 0x20);
-    cpu.registers.set_ecx(MSR_WHCR);
-    cpu.registers.set_edx(0xdead_beef);
-    cpu.registers.set_eax(0x0bad_f00d);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap(); // wrmsr
-    assert_eq!(cpu.msr.whcr, 0xdead_beef_0bad_f00d);
-    cpu.registers.set_eax(0);
-    cpu.registers.set_edx(0);
-    cpu.cycle(&mut bus).unwrap(); // rdmsr
-    assert_eq!(cpu.registers.edx(), 0xdead_beef);
-    assert_eq!(cpu.registers.eax(), 0x0bad_f00d);
-}
-
-#[test]
-fn wrmsr_efer_rejects_reserved_bits() {
-    // Only EFER.SCE (bit 0) is writable; any reserved bit set raises #GP(0).
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30], 0x20);
-    cpu.registers.set_ecx(MSR_EFER);
-    cpu.registers.set_edx(0);
-    cpu.registers.set_eax(0x2); // bit 1 is reserved
-    let mut bus = TestBus::with_memory(memory);
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(
-        fault,
-        InternalFault::Exception {
-            vector: 13,
-            error_code: Some(0)
-        }
-    ));
-}
-
-#[test]
-fn wrmsr_star_rejects_reserved_bits() {
-    // STAR bits 63-48 are reserved; setting one raises #GP(0).
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30], 0x20);
-    cpu.registers.set_ecx(MSR_STAR);
-    cpu.registers.set_edx(0x0001_0000); // bit 48 set
-    cpu.registers.set_eax(0);
-    let mut bus = TestBus::with_memory(memory);
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(
-        fault,
-        InternalFault::Exception {
-            vector: 13,
-            error_code: Some(0)
-        }
-    ));
-}
-
-#[test]
-fn wrmsr_efer_and_star_accept_their_defined_bits() {
-    // SCE in EFER and the selector base / target EIP in STAR write without faulting.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30, 0x0f, 0x30], 0x20);
-    cpu.registers.set_ecx(MSR_EFER);
-    cpu.registers.set_edx(0);
-    cpu.registers.set_eax(EFER_SCE as u32);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.msr.efer, EFER_SCE);
-    cpu.registers.set_ecx(MSR_STAR);
-    cpu.registers.set_edx(0x0000_ffff); // selector base in 47-32
-    cpu.registers.set_eax(0x0001_0000); // target EIP in 31-0
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.msr.star, 0x0000_ffff_0001_0000);
-}
-
-#[test]
 fn wrmsr_tsc_rebases_so_the_counter_reads_the_written_value() {
     // Writing the TSC stores an offset such that the running core-clock count reads
     // back as the written value. execute_instruction does not advance elapsed_clocks,
@@ -337,7 +239,7 @@ fn wrmsr_tsc_rebases_so_the_counter_reads_the_written_value() {
 #[test]
 fn wrmsr_is_general_protection_at_cpl3() {
     let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x30]);
-    cpu.registers.set_ecx(MSR_WHCR);
+    cpu.registers.set_ecx(MSR_TSC);
     let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
     assert!(matches!(
         fault,
@@ -539,8 +441,8 @@ fn mov_to_undefined_cr_is_undefined_opcode() {
 
 #[test]
 fn mov_cr4_accepts_defined_bits() {
-    // 0F 22 E0 = MOV CR4, EAX; 0F 20 E3 = MOV EBX, CR4. Only the bits this GSW-586
-    // persona defines (VME/PVI/TSD/DE/PSE/MCE/GPE, CR4_DEFINED_MASK) exist; writing
+    // 0F 22 E0 = MOV CR4, EAX; 0F 20 E3 = MOV EBX, CR4. Only the bits P55C
+    // defines (VME/PVI/TSD/DE/PSE/MCE, CR4_DEFINED_MASK) exist; writing
     // exactly that set round-trips.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0, 0x0f, 0x20, 0xe3], 0x20);
     cpu.registers.set_eax(CR4_DEFINED_MASK);
@@ -553,11 +455,8 @@ fn mov_cr4_accepts_defined_bits() {
 
 #[test]
 fn mov_cr4_rejects_reserved_bits() {
-    // 0F 22 E0 = MOV CR4, EAX. The AMD-K6 guide's MOV-to/from-CR4 exception table and
-    // the Pentium Vol. 3 instruction reference both fault ("#GP(0)"/"Interrupt 13")
-    // if a 1 is written to any reserved bit -- including one way outside the defined
-    // byte, like bit 31 -- in every mode, not just protected mode. CR4 is left
-    // unmodified (the same convention as CR0's PG/PE gate above).
+    // 0F 22 E0 = MOV CR4, EAX. A P55C faults if a reserved bit is set. CR4 is left
+    // unmodified, matching the CR0 PG/PE rejection behavior above.
     let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0], 0x20);
     cpu.registers.set_eax(0xffff_ffff);
     let mut bus = TestBus::with_memory(memory);
@@ -698,22 +597,25 @@ fn mov_dr_memory_operand_is_undefined_opcode() {
 }
 
 #[test]
-fn mov_cr3_round_trips_pwt_and_pcd() {
+fn mov_cr3_retains_pwt_and_pcd_only_on_486_and_586() {
     // 0F 22 D8 = MOV CR3, EAX (reg=3, rm=EAX); 0F 20 DB = MOV EBX, CR3 (reg=3, rm=EBX).
     // 386 PRM 5.2.2 defines the page-directory base in bits 31:12; PWT/PCD (bits 4:3)
-    // are a 486+ addition (Pentium Vol. 3 S9/S18.3) this persona implements as
-    // cache-control hints. A guest that sets PWT/PCD must read them back; only bits
-    // 2:0 (always reserved/0) and the base-alignment bits outside 31:12 are not
-    // preserved by the base itself.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xd8, 0x0f, 0x20, 0xdb], 0x20);
-    // Base 0x00123000 with PWT (bit 3) and PCD (bit 4) both set, plus reserved bits
-    // 2:0 set to confirm those stay masked off.
-    cpu.registers.set_eax(0x0012_3007 | 0x18);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.control.cr3, 0x0012_3018);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.registers.ebx(), 0x0012_3018);
+    // are a 486+ addition. Bits 2:0 are reserved on every persona.
+    for (mode, expected) in [
+        (GswMode::Gsw386Slow, 0x0012_3000),
+        (GswMode::Gsw386, 0x0012_3000),
+        (GswMode::Gsw486, 0x0012_3018),
+        (GswMode::Gsw586, 0x0012_3018),
+    ] {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xd8, 0x0f, 0x20, 0xdb], 0x20);
+        cpu.set_mode(mode);
+        cpu.registers.set_eax(0x0012_301f);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr3, expected, "{mode:?}");
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), expected, "{mode:?}");
+    }
 }
 
 #[test]
@@ -734,117 +636,30 @@ fn rdtsc_is_undefined_opcode_below_586() {
     assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
-// --- Phase 5 Slice B: CMOVcc, FCMOVcc, FCOMI/FUCOMI ---
-
 #[test]
-fn cmove_word_moves_low_half_when_zf_set() {
-    // 0F 44 C3: CMOVE AX, BX (16-bit operand in real mode).
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x44, 0xc3], 0x20);
-    cpu.registers.set_eax(0x1111_1111);
-    cpu.registers.set_ebx(0xaaaa_bbbb);
-    cpu.set_flag(FLAG_ZF, true);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    // A 16-bit move writes only the low word; the upper half of EAX is preserved.
-    assert_eq!(cpu.registers.eax(), 0x1111_bbbb);
-}
-
-#[test]
-fn cmove_does_not_move_when_zf_clear() {
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x44, 0xc3], 0x20);
-    cpu.registers.set_eax(0x1111_1111);
-    cpu.registers.set_ebx(0xaaaa_bbbb);
-    cpu.set_flag(FLAG_ZF, false);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.registers.eax(), 0x1111_1111);
-}
-
-#[test]
-fn cmovne_dword_moves_when_zf_clear() {
-    // 66 0F 45 C3: CMOVNE EAX, EBX (32-bit operand).
-    let (mut cpu, memory) = real_mode_cpu(&[0x66, 0x0f, 0x45, 0xc3], 0x20);
-    cpu.registers.set_eax(0x1111_1111);
-    cpu.registers.set_ebx(0xaaaa_bbbb);
-    cpu.set_flag(FLAG_ZF, false);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.registers.eax(), 0xaaaa_bbbb);
-}
-
-#[test]
-fn cmovcc_is_undefined_opcode_below_586() {
-    let code = [0x0f, 0x44, 0xc3];
-    assert!(matches!(
-        run_at_mode(&code, GswMode::Gsw486).unwrap_err(),
-        InternalFault::Exception { vector: 6, .. }
-    ));
-    assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
-}
-
-#[test]
-fn fcmove_moves_st1_into_st0_when_zf_set() {
-    // DA C9: FCMOVE ST(0), ST(1).
-    let (mut cpu, memory) = real_mode_cpu(&[0xda, 0xc9], 0x20);
-    cpu.fpu.push(2.0); // ST(1)
-    cpu.fpu.push(1.0); // ST(0)
-    cpu.set_flag(FLAG_ZF, true);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.fpu.get(0), 2.0);
-}
-
-#[test]
-fn fcmove_leaves_st0_when_zf_clear() {
-    let (mut cpu, memory) = real_mode_cpu(&[0xda, 0xc9], 0x20);
-    cpu.fpu.push(2.0);
-    cpu.fpu.push(1.0);
-    cpu.set_flag(FLAG_ZF, false);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.fpu.get(0), 1.0);
-}
-
-#[test]
-fn fcmovnb_moves_st1_into_st0_when_cf_clear() {
-    // DB C1: FCMOVNB ST(0), ST(1).
-    let (mut cpu, memory) = real_mode_cpu(&[0xdb, 0xc1], 0x20);
-    cpu.fpu.push(7.0); // ST(1)
-    cpu.fpu.push(3.0); // ST(0)
-    cpu.set_flag(FLAG_CF, false);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.fpu.get(0), 7.0);
-}
-
-#[test]
-fn fcomi_sets_integer_flags_from_the_comparison() {
-    // DB F1: FCOMI ST(0), ST(1). The result lands in ZF/PF/CF.
-    fn run(st0: f64, st1: f64) -> (bool, bool, bool) {
-        let (mut cpu, memory) = real_mode_cpu(&[0xdb, 0xf1], 0x40);
-        cpu.fpu.push(st1);
-        cpu.fpu.push(st0);
-        let mut bus = TestBus::with_memory(memory);
-        cpu.cycle(&mut bus).unwrap();
-        (cpu.flag(FLAG_ZF), cpu.flag(FLAG_PF), cpu.flag(FLAG_CF))
+fn p6_conditional_move_families_are_undefined_on_every_mode() {
+    let instructions: &[&[u8]] = &[
+        &[0x0f, 0x44, 0xc3], // CMOVE AX,BX
+        &[0xda, 0xc9],       // FCMOVE ST(0),ST(1)
+        &[0xdb, 0xc1],       // FCMOVNB ST(0),ST(1)
+        &[0xdb, 0xe9],       // FUCOMI ST(0),ST(1)
+        &[0xdb, 0xf1],       // FCOMI ST(0),ST(1)
+        &[0xdf, 0xe9],       // FUCOMIP ST(0),ST(1)
+        &[0xdf, 0xf1],       // FCOMIP ST(0),ST(1)
+    ];
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for code in instructions {
+            assert!(matches!(
+                run_at_mode(code, mode).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ));
+        }
     }
-    assert_eq!(run(2.0, 1.0), (false, false, false)); // ST0 > ST1
-    assert_eq!(run(1.0, 2.0), (false, false, true)); // ST0 < ST1
-    assert_eq!(run(1.0, 1.0), (true, false, false)); // equal
-    assert_eq!(run(f64::NAN, 1.0), (true, true, true)); // unordered
-}
-
-#[test]
-fn fcomip_compares_then_pops() {
-    // DF F1: FCOMIP ST(0), ST(1). Equal operands set ZF, then ST(0) is popped.
-    let (mut cpu, memory) = real_mode_cpu(&[0xdf, 0xf1], 0x40);
-    cpu.fpu.push(2.0);
-    cpu.fpu.push(2.0);
-    let top_before = cpu.fpu.top();
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert!(cpu.flag(FLAG_ZF));
-    assert_eq!(cpu.fpu.top(), (top_before + 1) & 7);
 }
 
 // --- Phase 5 Slice C: CMPXCHG8B ---
@@ -943,98 +758,37 @@ fn cmpxchg8b_is_undefined_opcode_below_586() {
     assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
-// --- Phase 5 Slice D: SYSCALL/SYSRET and RSM ---
-
 #[test]
-fn syscall_jumps_to_star_target_and_loads_flat_segments() {
-    // 0F 05 SYSCALL. STAR: target EIP = 0x0001_0000, CS/SS selector base = 0x08.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x05], 0x40);
-    cpu.msr.efer = EFER_SCE;
-    cpu.msr.star = (0x0008u64 << 32) | 0x0001_0000;
-    cpu.set_flag(FLAG_IF, true);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.registers.ecx(), 2); // return address (EIP past the 2-byte SYSCALL)
-    assert_eq!(cpu.registers.eip, 0x0001_0000);
-    let cs = cpu.registers.cs();
-    assert_eq!(cs.selector, 0x08);
-    assert_eq!(cs.base, 0);
-    assert_eq!(cs.limit, 0xffff_ffff);
-    assert!(cs.default_size_32);
-    assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x10); // base + 8
-    assert!(!cpu.flag(FLAG_IF)); // SYSCALL clears IF
-}
-
-#[test]
-fn syscall_is_undefined_opcode_without_sce() {
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x05], 0x20);
-    cpu.msr.efer = 0;
-    let mut bus = TestBus::with_memory(memory);
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
-}
-
-#[test]
-fn sysret_returns_to_ecx_with_cpl3_and_sets_if() {
-    // 0F 07 SYSRET. STAR CS/SS base = 0x08; SYSRET forces RPL 3 and SS = base + 16.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x07], 0x20);
-    cpu.msr.efer = EFER_SCE;
-    cpu.msr.star = 0x0008u64 << 32;
-    cpu.registers.set_ecx(0x0002_0000);
-    cpu.set_flag(FLAG_IF, false);
-    let mut bus = TestBus::with_memory(memory);
-    cpu.cycle(&mut bus).unwrap();
-    assert_eq!(cpu.registers.eip, 0x0002_0000);
-    assert_eq!(cpu.registers.cs().selector, 0x0b); // 0x08 | 3
-    assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x1b); // (0x08 + 16) | 3
-    assert!(cpu.flag(FLAG_IF)); // SYSRET sets IF
-}
-
-#[test]
-fn sysret_is_general_protection_at_cpl3() {
-    let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x07]);
-    cpu.msr.efer = EFER_SCE;
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(
-        fault,
-        InternalFault::Exception {
-            vector: 13,
-            error_code: Some(0)
+fn amd_fast_system_calls_are_undefined_on_every_mode() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        for code in [[0x0f, 0x05], [0x0f, 0x07]] {
+            assert!(matches!(
+                run_at_mode(&code, mode).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ));
         }
-    ));
-}
-
-#[test]
-fn sysret_is_undefined_opcode_without_sce() {
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x07], 0x20);
-    cpu.msr.efer = 0;
-    let mut bus = TestBus::with_memory(memory);
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
 }
 
 #[test]
 fn rsm_is_undefined_opcode_outside_smm() {
     // No SMM is modeled, so RSM always faults #UD.
-    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xaa], 0x20);
-    let mut bus = TestBus::with_memory(memory);
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
-}
-
-#[test]
-fn syscall_is_undefined_opcode_below_586() {
-    // Even with SCE enabled, a throttled 486-level guest sees #UD from the 586 gate.
-    let mut memory = vec![0u8; 64];
-    memory[..2].copy_from_slice(&[0x0f, 0x05]);
-    let mut cpu = CpuGsw::default();
-    cpu.set_mode(GswMode::Gsw486);
-    cpu.msr.efer = EFER_SCE;
-    cpu.load_segment_real(SegmentIndex::Cs, 0);
-    cpu.registers.eip = 0;
-    let mut bus = TestBus::with_memory(memory);
-    let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
-    assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        assert!(matches!(
+            run_at_mode(&[0x0f, 0xaa], mode).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+    }
 }
 
 #[test]
@@ -1275,30 +1029,20 @@ fn a_cached_line_is_not_served_past_a_shrunken_cs_limit() {
 
 #[test]
 fn isa_gate_exempt_decodes_are_never_cached() {
-    // The ring-0 ISA-gate exemption is context, not bytes. An exempt RDTSC decode
-    // must not be cached and later replayed in guest code under the 386 persona.
-    let mut memory = vec![0u8; 256];
-    memory[..2].copy_from_slice(&[0x0f, 0x31]);
+    // The firmware exemption is context, not bytes. An exempt RDTSC decode must
+    // not be cached and later replayed in guest code under the 386 persona.
+    let mut memory = vec![0u8; 0x10_0000];
+    memory[0x000f_0000..0x000f_0002].copy_from_slice(&[0x0f, 0x31]);
     let mut cpu = CpuGsw::default();
     cpu.set_mode(GswMode::Gsw386);
-    cpu.control.cr0 |= CR0_PE;
-    cpu.registers.set_segment(
-        SegmentIndex::Cs,
-        SegmentRegister {
-            selector: 0x0008,
-            base: 0,
-            limit: 0xffff_ffff,
-            access: 0x9b,
-            default_size_32: false,
-        },
-    );
+    cpu.load_segment_real(SegmentIndex::Cs, 0xf000);
     let mut bus = TestBus::with_memory(memory);
 
     cpu.registers.eip = 0;
     cpu.cycle(&mut bus).unwrap();
     assert!(
-        cpu.decode_cache.get(0, false).is_none(),
-        "an exempt RDTSC decode at ring 0 must not be cached"
+        cpu.decode_cache.get(0x000f_0000, false).is_none(),
+        "an exempt firmware RDTSC decode must not be cached"
     );
 }
 
@@ -1481,6 +1225,114 @@ fn run_at_mode(code: &[u8], mode: GswMode) -> Result<CycleOutcome, InternalFault
 }
 
 #[test]
+fn generation_matrix_accepts_only_the_target_isa() {
+    let i486_ops: &[&[u8]] = &[
+        &[0x0f, 0x08],                   // INVD
+        &[0x0f, 0x09],                   // WBINVD
+        &[0x0f, 0xb1, 0xd8],             // CMPXCHG AX,BX
+        &[0x0f, 0xc1, 0xd8],             // XADD AX,BX
+        &[0x66, 0x0f, 0xc8],             // BSWAP EAX
+        &[0x0f, 0x01, 0x3e, 0x00, 0x00], // INVLPG [0]
+    ];
+    for code in i486_ops {
+        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386] {
+            assert!(matches!(
+                run_at_mode(code, mode).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ));
+        }
+        assert!(run_at_mode(code, GswMode::Gsw486).is_ok());
+        assert!(run_at_mode(code, GswMode::Gsw586).is_ok());
+    }
+
+    let p55c_ops: &[&[u8]] = &[
+        &[0x0f, 0x30],                   // WRMSR, ECX selects MCAR
+        &[0x0f, 0x31],                   // RDTSC
+        &[0x0f, 0x32],                   // RDMSR, ECX selects MCAR
+        &[0x0f, 0xa2],                   // CPUID
+        &[0x0f, 0xc7, 0x0e, 0x40, 0x00], // CMPXCHG8B [0x40]
+        &[0x0f, 0x6f, 0xc0],             // MOVQ MM0,MM0
+        &[0x0f, 0x20, 0xe0],             // MOV EAX,CR4
+    ];
+    for code in p55c_ops {
+        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386, GswMode::Gsw486] {
+            assert!(matches!(
+                run_at_mode(code, mode).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ));
+        }
+        assert!(run_at_mode(code, GswMode::Gsw586).is_ok());
+    }
+}
+
+#[test]
+fn every_mmx_opcode_is_gated_to_the_586_persona() {
+    for second in 0u8..=u8::MAX {
+        if !is_mmx_two_byte(second) {
+            continue;
+        }
+        let code = [0x0f, second, 0xc0, 0x00];
+        for mode in [GswMode::Gsw386Slow, GswMode::Gsw386, GswMode::Gsw486] {
+            assert!(matches!(
+                run_at_mode(&code, mode).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn external_x87_behavior_remains_available_on_every_mode() {
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        assert!(run_at_mode(&[0xd9, 0xe8], mode).is_ok()); // FLD1
+    }
+}
+
+#[test]
+fn popfd_exposes_only_persona_control_flags() {
+    for (mode, expected) in [
+        (GswMode::Gsw386Slow, 0),
+        (GswMode::Gsw386, 0),
+        (GswMode::Gsw486, FLAG_AC),
+        (GswMode::Gsw586, FLAG_AC | FLAG_ID),
+    ] {
+        let mut memory = vec![0u8; 0x200];
+        memory[..2].copy_from_slice(&[0x66, 0x9d]); // POPFD
+        memory[0x100..0x104].copy_from_slice(&(0x2 | FLAG_AC | FLAG_ID).to_le_bytes());
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(mode);
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x100);
+        let mut bus = TestBus::with_memory(memory);
+        exec_one_split(&mut cpu, &mut bus).unwrap();
+        assert_eq!(cpu.eflags() & (FLAG_AC | FLAG_ID), expected);
+    }
+}
+
+#[test]
+fn amd_specific_msr_selectors_are_unimplemented() {
+    for selector in [0xc000_0080, 0xc000_0081, 0xc000_0082] {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x32], 0x20);
+        cpu.registers.set_ecx(selector);
+        let mut bus = TestBus::with_memory(memory);
+        assert!(matches!(
+            exec_one_split(&mut cpu, &mut bus).unwrap_err(),
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+}
+
+#[test]
 fn firmware_rom_cs_is_exempt_from_the_586_gate() {
     // RDTSC is a 586 op: guest code under the 386 persona #UDs on it, but the
     // BIOS ROM must keep running the full ISA so a lowered GSW mode never faults
@@ -1579,12 +1431,12 @@ fn implemented_two_byte(second: u8) -> bool {
         // BitManip
         | 0xa3 | 0xab | 0xb3 | 0xbb | 0xba | 0xbc | 0xbd | 0xa4 | 0xa5 | 0xac | 0xad
         | 0xb0 | 0xb1 | 0xc0 | 0xc1
-        // CMOVcc / SETcc / IMUL (CondMove)
-        | 0x40..=0x4f | 0x90..=0x9f | 0xaf
+        // SETcc / IMUL (CondMove)
+        | 0x90..=0x9f | 0xaf
         // SystemSeg
         | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x21 | 0x22 | 0x23 | 0xb2 | 0xb4 | 0xb5
         // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP + PUSH/POP FS/GS (Misc)
-        | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
+        | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa0 | 0xa1 | 0xa2 | 0xa8 | 0xa9
         | 0xc7 | 0xc8..=0xcf
     );
     routed || is_mmx_two_byte(second)
@@ -1683,11 +1535,8 @@ fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
 
     // A representative un-implemented 0F byte that falls through to the generic catch-all:
     // 0x0a (unmapped). It routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode. (0F
-    // B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV reg,DR / MOV DR,reg are now implemented -- see the
-    // SystemSeg coverage test below and the ledger-row-25 `mov_dr*` tests. 0F AA RSM also routes
-    // to TwoByteFallback but is an EXPLICITLY handled arm in `execute_two_byte` that #UDs with
-    // vector 6 because no SMM is modeled -- it is "implemented", just always invalid -- so it is
-    // not part of this generic-catch-all sweep.)
+    // B2/B4/B5 LSS/LFS/LGS and 0F 21/23 MOV reg,DR / MOV DR,reg are now implemented. RSM
+    // is rejected by the persona gate because no SMM is modeled.)
     let second = 0x0au8;
     assert!(
         !implemented_two_byte(second),
@@ -1734,86 +1583,31 @@ fn single_byte_f1_is_an_undefined_opcode() {
 }
 
 #[test]
-fn cpuid_is_undefined_opcode_below_486() {
-    // CPUID is absent on the 386; it appears on the 486 and 586.
+fn cpuid_is_available_only_on_the_586_persona() {
     let code = [0x0f, 0xa2];
-    assert!(matches!(
-        run_at_mode(&code, GswMode::Gsw386).unwrap_err(),
-        InternalFault::Exception { vector: 6, .. }
-    ));
-    assert!(run_at_mode(&code, GswMode::Gsw486).is_ok());
+    for mode in [GswMode::Gsw386Slow, GswMode::Gsw386, GswMode::Gsw486] {
+        assert!(matches!(
+            run_at_mode(&code, mode).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+    }
     assert!(run_at_mode(&code, GswMode::Gsw586).is_ok());
 }
 
 #[test]
-fn cpuid_runs_in_ring0_protected_mode_below_486() {
-    // The exec-time CPUID gate carries the same ring-0 protected-mode
-    // exemption as the prefix and 0F-extended gates: chipset-side ring-0
-    // monitor code gets the full core ISA even when the guest persona has
-    // no CPUID (I386). Same flat CPL-0 code segment shape as
-    // `cpl3_code`, but with an RPL-0 selector. I386 is the interesting
-    // level, so only the CPUID gate decides. (At I486/I586 the gate is
-    // moot for everyone.)
-    let mut memory = vec![0u8; 256];
-    memory[..2].copy_from_slice(&[0x0f, 0xa2]);
-    let mut cpu = CpuGsw::default();
-    cpu.set_mode(GswMode::Gsw386);
-    cpu.control.cr0 |= CR0_PE;
-    cpu.registers.set_segment(
-        SegmentIndex::Cs,
-        SegmentRegister {
-            selector: 0x0008,
-            base: 0,
-            limit: 0xffff_ffff,
-            access: 0x9b,
-            default_size_32: true,
-        },
-    );
-    cpu.registers.eip = 0;
-    let mut bus = TestBus::with_memory(memory);
-    assert!(
-        exec_one_split(&mut cpu, &mut bus).is_ok(),
-        "CPUID must execute in ring-0 protected mode at the I386 level"
-    );
-
-    // Guest-facing code is still gated: CPL-3 protected mode at I386 #UDs.
-    let (mut cpu3, mut bus3) = cpl3_code(&[0x0f, 0xa2]);
-    cpu3.set_mode(GswMode::Gsw386);
-    let fault = exec_one_split(&mut cpu3, &mut bus3).unwrap_err();
-    assert!(
-        matches!(fault, InternalFault::Exception { vector: 6, .. }),
-        "CPUID must still #UD for CPL-3 guest code at the I386 level"
-    );
-    // Real-mode #UD at I386 is pinned by cpuid_is_undefined_opcode_below_486.
-}
-
-#[test]
-fn cpuid_extended_leaf1_reports_amd_feature_flags() {
-    let cpu = run_cpuid(0x8000_0001);
-    // EAX carries the processor signature: family 5.
-    assert_eq!((cpu.registers.eax() >> 8) & 0xf, 5);
-    let edx = cpu.registers.edx();
-    // The implemented instructions sit at their AMD extended-leaf bit positions.
-    assert_ne!(edx & (1 << 10), 0, "SYSCALL/SYSRET (bit 10)");
-    assert_ne!(edx & (1 << 15), 0, "integer CMOVcc (bit 15)");
-    assert_ne!(edx & (1 << 16), 0, "FP FCMOVcc (bit 16)");
-    assert_ne!(edx & (1 << 4), 0, "TSC");
-    assert_ne!(edx & (1 << 5), 0, "MSR");
-    assert_ne!(edx & (1 << 8), 0, "CX8");
-    assert_ne!(edx & (1 << 23), 0, "MMX");
-    // Features the GSW-586 does not emulate stay clear.
-    assert_eq!(edx & 1, 0, "FPU off");
-    assert_eq!(edx & (1 << 7), 0, "no machine-check exception");
-}
-
-#[test]
-fn cpuid_cache_leaves_report_level_sizes() {
-    // The AMD-style L1 (0x80000005) and L2 (0x80000006) leaves carry the live level's
-    // cache sizes in ECX: L1 KB in bits 31-24, L2 KB in bits 31-16.
-    let mut cpu = run_cpuid(0x8000_0005);
-    assert_eq!(cpu.registers.ecx() >> 24, 32); // I586 L1 = 32 KB (P55C: 16K I + 16K D)
-    cpu = run_cpuid(0x8000_0006);
-    assert_eq!(cpu.registers.ecx() >> 16, 512); // I586 L2 = 512 KB
+fn cpuid_has_no_amd_extended_leaf_space() {
+    for leaf in [0x8000_0000, 0x8000_0001, 0x8000_0005, 0x8000_0006] {
+        let cpu = run_cpuid(leaf);
+        assert_eq!(
+            (
+                cpu.registers.eax(),
+                cpu.registers.ebx(),
+                cpu.registers.ecx(),
+                cpu.registers.edx()
+            ),
+            (0, 0, 0, 0)
+        );
+    }
 }
 
 #[test]
@@ -1846,7 +1640,7 @@ fn id_flag_toggle_detection_sequence_finds_cpuid() {
     let toggled = cpu.flag(FLAG_ID);
     assert_eq!(toggled, !before, "ID flag must be toggleable");
 
-    // Detection concluded CPUID is present; execute it and confirm the GSW-586 vendor.
+    // Detection concluded CPUID is present; execute it and confirm the Intel vendor.
     cpu.cycle(&mut bus).unwrap(); // cpuid
     assert_eq!(cpu.registers.eax(), 1);
     assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");

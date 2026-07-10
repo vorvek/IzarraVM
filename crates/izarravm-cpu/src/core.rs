@@ -89,8 +89,8 @@ impl CpuGsw {
     /// address, and every other decode input a CS load could change is re-checked on each hit
     /// instead of being flushed away here: the D bit is part of the line (`DecodeLine::d`,
     /// compared in `get`), the fetch limit is re-checked at both hit sites (a violation misses
-    /// to `decode`, which raises the exact fault), and the ISA-gate exemptions (firmware ROM /
-    /// ring-0, BOTH the two-byte gate and the pre-386 66/67 prefix gate) mark their
+    /// to `decode`, which raises the exact fault), and the firmware-ROM ISA-gate exemption marks
+    /// its
     /// instructions no-cache at decode so a cached line never carries an exemption across a
     /// privilege change. This matters because pmode workloads
     /// load CS at every interrupt edge and V86 monitor round-trip: the Doom 586 census measured

@@ -128,10 +128,9 @@ impl CpuGsw {
                 // CMPXCHG (B0/B1), XADD (C0/C1). Every one is a ModRM r/m form.
                 0xa3 | 0xab | 0xb3 | 0xbb | 0xba | 0xbc | 0xbd | 0xa4 | 0xa5 | 0xac | 0xad
                 | 0xb0 | 0xb1 | 0xc0 | 0xc1 => DecodeGroup::BitManip,
-                // Two-byte conditional-move / SETcc / two-operand IMUL block (task A11):
-                // CMOVcc reg,r/m (40-4F, 586-class), SETcc r/m8 (90-9F, 386-class), and
-                // IMUL reg,r/m (AF, 386-class). All are ModRM r/m forms with no immediate.
-                0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
+                // SETcc and two-operand IMUL. Integer CMOVcc is a P6 instruction and stays
+                // outside the P55C contract.
+                0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
                 // System / descriptor-table / segment block (task A12), 0F forms: the descriptor
                 // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06),
                 // MOV reg,CR / MOV CR,reg (0F 20/22), MOV reg,DR / MOV DR,reg (0F 21/23, ledger
@@ -140,14 +139,12 @@ impl CpuGsw {
                 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x21 | 0x22 | 0x23 | 0xb2 | 0xb4
                 | 0xb5 => DecodeGroup::SystemSeg,
                 // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
-                // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
+                // ops INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
                 // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); PUSH/POP FS/GS
                 // (A0/A1/A8/A9, 386+, mirroring the one-byte ES/SS/DS segment push/pop arms in
                 // `execute_stack_decoded`); and the whole MMX block (`is_mmx_two_byte`). 0F AA
                 // (RSM) is unimplemented and stays TwoByteFallback.
-                0x05
-                | 0x07
-                | 0x08
+                0x08
                 | 0x09
                 | 0x30
                 | 0x31
@@ -400,8 +397,8 @@ impl CpuGsw {
         // here — charging its instruction-fetch exactly once — and fold it into `insn.opcode` as
         // `0x0F00 | second`. Every later 0F group routes on this combined value, and the fused
         // fallback (`execute_two_byte`) consumes the second byte from `insn.opcode as u8` rather
-        // than re-reading it. The 586 ISA #UD gate applies once, right after the read (matching
-        // the point the fused path faulted), with the firmware-ROM exemption preserved.
+        // than re-reading it. The persona #UD gate applies once, right after the read, with the
+        // firmware-ROM exemption preserved for instructions that exist on the full P55C core.
         let (opcode, isa_gate_exempt) = if opcode == 0x0f {
             let second = self.fetch_u8(bus)?;
             let exempt_used = self.check_two_byte_isa_gate(second)?;
@@ -701,10 +698,10 @@ impl CpuGsw {
                 }
             }
             DecodeGroup::CondMove => {
-                // Conditional-move / SETcc / two-operand IMUL block (task A11). Every opcode in
+                // SETcc / two-operand IMUL block. Every opcode in
                 // this group is a ModRM r/m form with no immediate after the ModRM+displacement.
                 // Parse the ModRM + addressing descriptor (instruction bytes only, so it stays
-                // cacheable); the executor reads `modrm.reg` (CMOVcc/IMUL destination) and the
+                // cacheable); the executor reads `modrm.reg` (the IMUL destination) and the
                 // r/m operand at execute time. No imm8 is ever present, so no `insn.imm` fetch.
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
@@ -822,7 +819,7 @@ impl CpuGsw {
                     // Every other one-off carries no encoded operand after the opcode byte(s):
                     // the BCD adjusts (0x27/0x2f/0x37/0x3f), SALC/XLAT (0xd6/0xd7), INS/OUTS
                     // (0x6c-0x6f), HLT (0xf4), EMMS (0F 77), and the no-operand 0F system/serializing/
-                    // CPU-id ops (05/07/08/09/30/31/32/a2/c8-cf). XLAT reads memory at execute from
+                    // CPU-id ops (08/09/30/31/32/a2/c8-cf). XLAT reads memory at execute from
                     // live registers; the rest take implicit/register/no operands.
                     _ => {}
                 }
@@ -867,43 +864,33 @@ impl CpuGsw {
         (modrm, operand)
     }
 
-    /// The guest-level ISA #UD gate for 586-class additions. RDTSC, RDMSR/WRMSR,
-    /// CMOVcc, CMPXCHG8B, SYSCALL/SYSRET, and RSM fault under the 386 and 486
-    /// personas. CPUID retains its separate execution-time gate.
+    /// Apply a guest-visible ISA generation requirement. The 386 rejects 486 and P55C
+    /// additions, the 486 rejects P55C additions, and instructions outside the P55C contract
+    /// always #UD.
     ///
-    /// Ring-0 protected-mode code (`is_ring0_protected()`) is exempt too, for the same reason as
-    /// the firmware exception: TOKAEMM's monitor is chipset-side, not guest software. V86 tasks are
-    /// always CPL 3 architecturally, so this can never leak into guest-facing V86 code, and it
-    /// reads false in real mode (not protected). V86 and real-mode fidelity are unchanged.
-    ///
-    /// ASSUMPTION (same as `is_ring0_protected()`'s own doc): today ring-0 PM is ONLY the
-    /// chipset-side TOKAEMM monitor. A guest OS running its own ring-0 protected mode on a
-    /// throttled persona, or a future
-    /// VCPI client (which runs ring-0 PM by design), would get the full core ISA here -- including
-    /// the 586-only additions this same short-circuit skips on the 386/486 personas -- where real
-    /// hardware would #UD. Correct-by-design for the monitor (same precedent as the blanket
-    /// firmware-ROM exemption); revisit when VCPI/DPMI lands, likely by scoping the exemption to
-    /// monitor identity (e.g. a CS-range check like `cs_in_firmware_rom`) instead of privilege.
+    /// Firmware ROM remains exempt while POST still uses CPUID on every persona. Instructions
+    /// outside the P55C contract are never exempt. Firmware work will remove this narrow exception.
     ///
     /// `decode` applies this once, right after reading the second 0F byte — the same logical point
     /// (and eip) the fused path faulted at — so both the converted split path and the un-converted
     /// fused fallback share a single gate.
-    /// Returns whether the firmware-ROM / ring-0 exemption was DECISIVE (the opcode would have
-    /// #UD'd at this level without it). Such a decode must not enter the decode cache: the
-    /// exemption is a property of the executing context (CS region, privilege), not of the
-    /// bytes, and a cached replay after a privilege change would skip the #UD.
-    fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<bool> {
-        let gated = !matches!(self.persona(), CpuPersona::I586) && is_586plus_two_byte(second);
-        if !gated {
+    /// Returns whether the firmware-ROM exemption was decisive. Such a decode must not enter the
+    /// decode cache because the exemption belongs to the executing CS, not the instruction bytes.
+    pub(super) fn require_isa_generation(&self, required: IsaGeneration) -> ExecResult<bool> {
+        if persona_supports(self.persona(), required) {
             return Ok(false);
         }
-        if self.cs_in_firmware_rom() || self.is_ring0_protected() {
+        if required != IsaGeneration::Never && self.cs_in_firmware_rom() {
             return Ok(true);
         }
         Err(InternalFault::Exception {
             vector: 6,
             error_code: None,
         })
+    }
+
+    fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<bool> {
+        self.require_isa_generation(two_byte_isa_generation(second))
     }
 
     fn read_prefixes<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<Prefixes> {

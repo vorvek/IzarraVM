@@ -194,12 +194,8 @@ impl CpuGsw {
         }
     }
 
-    /// The conditional-move / SETcc / two-operand IMUL block (A11) through the decode/execute split
-    /// (task A11). Mirrors the former fused arms in `execute_two_byte` verbatim — same condition
-    /// helper, same CMOVcc read-before-conditional-write, same SETcc byte-write, same
-    /// `imul_truncated` — but consumes the ModRM/operand pre-decoded by `decode` (no re-fetch).
-    /// Dispatches off the FULL u16 `insn.opcode` (0x0F40-0x0F4F, 0x0F90-0x0F9F, 0x0FAF) so the
-    /// `as u8` narrowing can never alias these onto single-byte opcodes.
+    /// The SETcc / two-operand IMUL block through the decode/execute split. Integer CMOVcc is a
+    /// P6 instruction and is rejected by the generation gate before routing reaches this block.
     pub(super) fn execute_condmove_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
@@ -208,18 +204,6 @@ impl CpuGsw {
         let operand_size = insn.operand_size;
 
         match insn.opcode {
-            0x0f40..=0x0f4f => {
-                // CMOVcc reg, r/m: the source r/m is ALWAYS read (so a faulting memory operand
-                // still faults even when the condition is false), but the destination register is
-                // written only when the condition holds. A false condition leaves it untouched.
-                // The condition code is the low nibble of the second byte (insn.opcode & 0x0f).
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
-                let value = self.read_operand_sized(bus, operand, operand_size)?;
-                if self.condition((insn.opcode & 0x0f) as u8) {
-                    self.write_gpr_sized(modrm.reg, operand_size, value);
-                }
-                Ok(clocks(1))
-            }
             0x0f90..=0x0f9f => {
                 // SETcc r/m8: set the byte operand to 1 when the condition holds, else 0. Always
                 // byte-wide regardless of the operand-size prefix. The condition code is the low
@@ -399,6 +383,7 @@ impl CpuGsw {
                             7 => {
                                 // INVLPG m: privileged on the 486. Flush the whole TLB (a
                                 // single-page invalidate is a permitted superset).
+                                self.require_isa_generation(IsaGeneration::I486)?;
                                 if self.current_privilege_level() != 0 {
                                     return Err(InternalFault::Exception {
                                         vector: 6,
@@ -474,12 +459,15 @@ impl CpuGsw {
                 // all gate on require_cpl0 above). This was missing the gate: a CPL-3 guest
                 // (including a V86 task, which is architecturally always CPL 3) could read CR0
                 // straight through. #GP(0) outside CPL 0.
-                self.require_cpl0()?;
                 let modrm = insn.modrm.expect("MOV reg,CR decoded with a ModRM");
                 if modrm.mode != 3 {
                     return Err(undefined_opcode());
                 }
-                // 386 PRM 12.2.4 / table 12-1: only CR0, CR2, CR3 (and, on this 586-class
+                if modrm.reg == 4 {
+                    self.require_isa_generation(IsaGeneration::P55c)?;
+                }
+                self.require_cpl0()?;
+                // 386 PRM 12.2.4 / table 12-1: only CR0, CR2, CR3 (and, on the P55C
                 // persona, CR4) are architecturally defined. CR1/CR5/CR6/CR7 have no backing
                 // register at all -- referencing one is an invalid encoding (#UD), not a
                 // silent read of 0.
@@ -503,7 +491,6 @@ impl CpuGsw {
                 // guest could silently write CR0 (e.g. flip PE/PG) or CR3 (repoint the page
                 // tables), which is a guest-fidelity and monitor-security hole. #GP(0) outside
                 // CPL 0.
-                self.require_cpl0()?;
                 let modrm = insn.modrm.expect("MOV CR,reg decoded with a ModRM");
                 if modrm.mode != 3 {
                     return Err(undefined_opcode());
@@ -514,6 +501,10 @@ impl CpuGsw {
                 if !matches!(modrm.reg, 0 | 2 | 3 | 4) {
                     return Err(undefined_opcode());
                 }
+                if modrm.reg == 4 {
+                    self.require_isa_generation(IsaGeneration::P55c)?;
+                }
+                self.require_cpl0()?;
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
                     0 => {
@@ -536,28 +527,19 @@ impl CpuGsw {
                     }
                     2 => self.control.cr2 = value,
                     3 => {
-                        // CR3 (the Page Directory Base Register) holds the page-directory
-                        // physical base in bits 31:12 per 386 PRM 5.2.2. Bits 4:3 are PWT/PCD,
-                        // a 486-and-later addition absent from the 386 PRM -- defined here per
-                        // Pentium Vol. 3 S9 (register description) and S18.3 (PCD/PWT Bits),
-                        // which this 586-class persona implements as cache-control hints, and
-                        // bits 2:0 are reserved. The page-table base used by the walker keeps
-                        // masking to `cr3 & 0xFFFFF000` at the use site -- only the stored
-                        // value gains PWT/PCD so a guest that sets them can read them back.
-                        self.control.cr3 = value & 0xffff_f018;
+                        // CR3 holds the page-directory base in bits 31:12. The 486 and P55C
+                        // also retain PWT/PCD in bits 3:4; those bits remain reserved on the 386.
+                        let mask = match self.persona() {
+                            CpuPersona::I386 => 0xffff_f000,
+                            CpuPersona::I486 | CpuPersona::I586 => 0xffff_f018,
+                        };
+                        self.control.cr3 = value & mask;
                         self.flush_tlb_and_code_caches();
                     }
                     4 => {
-                        // 386 PRM has no CR4 (a 486/586 addition); on this GSW-586 (K6-class)
-                        // persona only TSD (bit 2) has a modeled effect and only VME/PVI/TSD/
-                        // DE/PSE/MCE/GPE (bits 0-4, 6-7) are architecturally defined at all
-                        // per the AMD-K6 BIOS and Software Tools Developers Guide S: 3.7
-                        // (Control Register 4 (CR4) Extensions, Figure 13/Table 19). The same
-                        // guide's MOV-to/from-CR4 exception table, and the Pentium Vol. 3
-                        // instruction reference, both document a hard fault ("#GP(0)" in
-                        // protected mode, "Interrupt 13" in real mode) if a 1 is written to
-                        // any reserved bit -- so a write outside CR4_DEFINED_MASK faults
-                        // instead of silently dropping the bits, matching EFER/STAR above.
+                        // CR4 is present only on the P55C persona. TSD has a modeled effect;
+                        // the other P55C-defined bits are inert storage. A set reserved bit
+                        // faults instead of being silently dropped.
                         if value & !CR4_DEFINED_MASK != 0 {
                             return Err(InternalFault::Exception {
                                 vector: 13,
@@ -943,7 +925,7 @@ impl CpuGsw {
     ///
     /// Most opcodes handled here re-read no further instruction bytes, so the heterogeneous
     /// `Misc` group (task A14) also leaf-calls this for its 0F members
-    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them.
+    /// (INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them.
     /// PUSH/POP FS/GS (0F A0/A1/A8/A9) are Misc members too: like their one-byte ES/SS/DS
     /// counterparts in `execute_stack_decoded`, they touch the stack, so `bus` is threaded
     /// through. The genuinely unimplemented 0F bytes still fall through to the
@@ -958,7 +940,7 @@ impl CpuGsw {
             // The MMX block (`is_mmx_two_byte`) is converted to the decode/execute split (task A14):
             // `route_group` classifies it as `DecodeGroup::Misc` and `execute_mmx_decoded` runs it
             // (the ModRM + the 0F 71/72/73 imm8 are parsed in `decode`). Not handled here.
-            // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would wrongly accept it.
+            // The shared decode gate limits every MMX opcode to the P55C persona.
             // 0F 00 (group 6: SLDT/STR/LLDT/LTR/VERR/VERW), 0F 01 (group 7: SGDT/SIDT/LGDT/LIDT/
             // SMSW/LMSW/INVLPG), 0F 02 (LAR), 0F 03 (LSL), and 0F 06 (CLTS) are converted to the
             // decode/execute split (task A12): `route_group` classifies them as
@@ -975,25 +957,6 @@ impl CpuGsw {
                     // Rebase the time-stamp counter: store the offset that makes the running
                     // core-clock count read back as the written value.
                     MSR_TSC => self.msr.tsc_offset = value.wrapping_sub(self.elapsed_clocks),
-                    MSR_EFER => {
-                        if value & !EFER_WRITABLE != 0 {
-                            return Err(InternalFault::Exception {
-                                vector: 13,
-                                error_code: Some(0),
-                            });
-                        }
-                        self.msr.efer = value;
-                    }
-                    MSR_STAR => {
-                        if value & !STAR_WRITABLE != 0 {
-                            return Err(InternalFault::Exception {
-                                vector: 13,
-                                error_code: Some(0),
-                            });
-                        }
-                        self.msr.star = value;
-                    }
-                    MSR_WHCR => self.msr.whcr = value,
                     _ => {
                         return Err(InternalFault::Exception {
                             vector: 13,
@@ -1025,9 +988,6 @@ impl CpuGsw {
                     MSR_MCAR => self.msr.mcar,
                     MSR_MCTR => self.msr.mctr,
                     MSR_TSC => self.time_stamp_counter(),
-                    MSR_EFER => self.msr.efer,
-                    MSR_STAR => self.msr.star,
-                    MSR_WHCR => self.msr.whcr,
                     _ => {
                         return Err(InternalFault::Exception {
                             vector: 13,
@@ -1038,26 +998,14 @@ impl CpuGsw {
                 self.set_edx_eax(value);
                 Ok(clocks(11))
             }
-            0x05 => self.syscall(),
-            0x07 => self.sysret(),
-            0xaa => {
-                // RSM: return from System Management Mode. No SMI source is modeled, so the
-                // processor is never in SMM and RSM outside SMM is #UD, as on real hardware.
-                // Limit: SMM entry is not implemented; RSM is therefore always invalid.
-                Err(InternalFault::Exception {
-                    vector: 6,
-                    error_code: None,
-                })
-            }
             // 0F 20 (MOV reg,CR) and 0F 22 (MOV CR,reg) are converted to the decode/execute split
             // (task A12): `route_group` classifies them as `DecodeGroup::SystemSeg` and
             // `execute_system_seg_decoded` runs them (the register-form ModRM is parsed in `decode`;
             // the whole-32-bit CR read/write, the `mode != 3` #UD, and the CR0/CR3 TLB flush via the
             // unchanged `flush_tlb_and_code_caches` stay in the executor). Not handled here. 0F 21/23
             // (MOV reg,DR / MOV DR,reg) remain unimplemented and #UD as `UnsupportedTwoByteOpcode`.
-            // CMOVcc (0x40-0x4F), SETcc (0x90-0x9F), and IMUL reg,r/m (0xAF) are converted to
-            // the decode/execute split (task A11): `route_group` classifies them as
-            // `DecodeGroup::CondMove` and `execute_condmove_decoded` runs them. Not handled here.
+            // SETcc (0x90-0x9F) and IMUL reg,r/m (0xAF) use the CondMove split group.
+            // P6 CMOVcc remains undefined on P55C.
             // 0x80-0x8f (Jcc near, rel16/32) are converted to the decode/execute split: `decode`
             // folds them into `insn.opcode` as 0x0F80-0x0F8F, `route_group` classifies them as
             // `DecodeGroup::Branch`, and `execute_branch_decoded` runs them. Not handled here.
@@ -1086,28 +1034,9 @@ impl CpuGsw {
             0xa2 => {
                 // CPUID (0F A2). Not privileged: it runs at any CPL. The leaf selector is in
                 // EAX. The result registers are EAX, EBX, ECX, EDX (full 32-bit writes). We
-                // model basic leaves 0 and 1 plus the extended leaves 0x80000000 and
-                // 0x80000002..0x80000004 (the brand string); any other leaf returns all zeros,
-                // the architectural reply for an unimplemented leaf at or below the maximum.
-                //
-                // CPUID arrived on the late 486 and is standard on the 586. At the 386
-                // guest level it does not exist, so raise #UD. Firmware in the BIOS ROM is exempt,
-                // and so is ring-0 protected mode -- the same chipset-side-monitor exemption
-                // (and the same ASSUMPTION/revisit trigger) as the two ISA gates in
-                // read_prefixes and check_two_byte_isa_gate; without it, future ring-0
-                // monitor code executing CPUID on a sub-486 persona would die by the same
-                // unpopulated-low-vector cascade the gate exemptions fixed.
-                if matches!(self.persona(), CpuPersona::I386)
-                    && !self.cs_in_firmware_rom()
-                    && !self.is_ring0_protected()
-                {
-                    return Err(InternalFault::Exception {
-                        vector: 6,
-                        error_code: None,
-                    });
-                }
+                // model the two basic P55C leaves. The shared decode gate has already rejected
+                // CPUID on the 386 and 486 personas. Any other leaf returns all zeros.
                 let leaf = self.registers.eax();
-                let (l1_kb, l2_kb) = self.mode().cache_kb();
                 let (eax, ebx, ecx, edx) = match leaf {
                     0 => (
                         CPUID_MAX_BASIC_LEAF,
@@ -1121,26 +1050,6 @@ impl CpuGsw {
                         CPUID_LEAF1_ECX,
                         CPUID_FEATURES_EDX,
                     ),
-                    0x8000_0000 => (CPUID_MAX_EXT_LEAF, 0, 0, 0),
-                    // Extended leaf 1: the AMD processor signature in EAX (same family/model/
-                    // stepping packing as leaf 1) and the extended feature flags in EDX. EBX
-                    // and ECX are reserved.
-                    0x8000_0001 => (CPUID_VERSION_EAX, 0, 0, CPUID_EXT_FEATURES_EDX),
-                    0x8000_0002 => (
-                        CPUID_BRAND_EAX_0,
-                        CPUID_BRAND_EBX_0,
-                        CPUID_BRAND_ECX_0,
-                        CPUID_BRAND_EDX_0,
-                    ),
-                    0x8000_0003 => (CPUID_BRAND_EAX_1, 0, 0, 0),
-                    0x8000_0004 => (0, 0, 0, 0),
-                    // L1 cache (AMD-style): ECX is the L1 data cache, with the size in KB in
-                    // bits 31-24. The whole L1 size is reported as the data cache for this
-                    // cosmetic readout; the associativity and line fields stay zero.
-                    0x8000_0005 => (0, 0, (u32::from(l1_kb) & 0xff) << 24, 0),
-                    // L2 cache (AMD-style): ECX carries the L2 size in KB in bits 31-16, with
-                    // associativity (bits 15-12) and line size (bits 7-0) left at zero.
-                    0x8000_0006 => (0, 0, (u32::from(l2_kb) & 0xffff) << 16, 0),
                     _ => (0, 0, 0, 0),
                 };
                 self.write_gpr32(0, eax); // EAX
@@ -1280,7 +1189,7 @@ impl CpuGsw {
     /// the former fused handler verbatim — same flag effects, same memory access, same clocks — but
     /// consumes the ModRM/operand/immediate `decode` pre-parsed (so the executor never re-fetches an
     /// instruction byte). The MMX block and CMPXCHG8B resolve their pre-decoded ModRM here; the
-    /// no-operand 0F system/serializing/CPU-id ops (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/
+    /// no-operand 0F system/serializing/CPU-id ops (INVD/WBINVD/WRMSR/RDTSC/RDMSR/
     /// CPUID/BSWAP) read no instruction bytes, so they reuse the existing `execute_two_byte` leaf
     /// logic verbatim (it re-reads nothing for them). Dispatch is off the FULL u16 `insn.opcode`
     /// so a 0F low byte can never alias a single-byte opcode.
@@ -1528,13 +1437,11 @@ impl CpuGsw {
                 self.execute_mmx_decoded(insn, bus)
             }
             // The remaining 0F system/serializing/CPU-id/stack ops re-read no further instruction
-            // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL (05), SYSRET
-            // (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), PUSH FS/GS (A0/A8), CPUID
+            // bytes in `execute_two_byte`, so reuse that leaf logic verbatim: INVD/WBINVD (08/09),
+            // WRMSR/RDTSC/RDMSR (30/31/32), PUSH FS/GS (A0/A8), CPUID
             // (A2), POP FS/GS (A1/A9), BSWAP (C8-CF). `decode` already read + gated the second
             // byte; this never re-reads it.
-            0x0f05
-            | 0x0f07
-            | 0x0f08
+            0x0f08
             | 0x0f09
             | 0x0f30
             | 0x0f31

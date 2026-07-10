@@ -2008,7 +2008,7 @@ fn hlt_at_cpl0_protected_mode_halts() {
 #[test]
 fn hlt_at_cpl3_protected_mode_is_general_protection() {
     // Outside V86, a ring-3 HLT is the ordinary CPL check: #GP(0), same shape
-    // as WBINVD/SYSRET's existing CPL3 tests.
+    // as the existing CPL3 system-instruction tests.
     let (mut cpu, mut bus) = cpl3_code(&[0xf4]);
     let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
     assert!(matches!(

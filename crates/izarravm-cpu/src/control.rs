@@ -432,6 +432,14 @@ impl CpuGsw {
         if !allow_vm_load {
             merged = (merged & !FLAG_VM) | (old & FLAG_VM);
         }
+        // AC is a 486 addition. ID is writable only on the CPUID-capable P55C persona.
+        // Unsupported flag bits retain their live value, which is zero in the reset image.
+        let fixed = match self.persona() {
+            CpuPersona::I386 => FLAG_AC | FLAG_ID,
+            CpuPersona::I486 => FLAG_ID,
+            CpuPersona::I586 => 0,
+        };
+        merged = (merged & !fixed) | (old & fixed);
         self.registers.eflags = merged;
         // The loaded image is the new truth for every flag bit; any deferred descriptor would
         // otherwise override the arithmetic bits we just wrote.
@@ -1350,78 +1358,6 @@ impl CpuGsw {
             });
         }
         Ok(())
-    }
-
-    /// SYSCALL (0F 05): the K6 fast system-call entry. Saves the return EIP in ECX, jumps
-    /// to the STAR target, and loads fixed flat CS/SS from STAR[47:32] with CPL forced to
-    /// 0. IF and VM are cleared. #UD when EFER.SCE is clear. No privilege or mode checks.
-    pub(super) fn syscall(&mut self) -> ExecResult<CycleOutcome> {
-        if self.msr.efer & EFER_SCE == 0 {
-            return Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None,
-            });
-        }
-        let star = self.msr.star;
-        // EIP already points past SYSCALL, so it is the return address.
-        let return_eip = self.registers.eip;
-        self.write_gpr32(1, return_eip); // ECX
-        self.set_eip(star as u32); // STAR[31:0]
-        self.set_flag(FLAG_IF, false);
-        self.set_flag(FLAG_VM, false);
-        // STAR[47:32] is the CS/SS selector base; force the CS RPL to 0 so CPL reads 0.
-        let cs_sel = ((star >> 32) as u16) & 0xfffc;
-        self.registers
-            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(cs_sel, 0x9b));
-        self.invalidate_code_caches_for_cs_load();
-        self.registers.set_segment(
-            SegmentIndex::Ss,
-            SegmentRegister::flat(cs_sel.wrapping_add(8), 0x93),
-        );
-        // PRM transition point: SYSCALL always enters at CPL 0.
-        self.cpl = 0;
-        Ok(clocks(10))
-    }
-
-    /// SYSRET (0F 07): the matching return. Restores EIP from ECX and loads flat CS/SS
-    /// from STAR[47:32] with the RPL forced to 3 (SS selector is the base + 16). IF is set.
-    /// #UD when EFER.SCE is clear, #GP(0) outside CPL 0.
-    pub(super) fn sysret(&mut self) -> ExecResult<CycleOutcome> {
-        if self.msr.efer & EFER_SCE == 0 {
-            return Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None,
-            });
-        }
-        if self.current_privilege_level() != 0 {
-            return Err(InternalFault::Exception {
-                vector: 13,
-                error_code: Some(0),
-            });
-        }
-        let star = self.msr.star;
-        self.set_eip(self.read_gpr32(1)); // ECX -> EIP
-        self.set_flag(FLAG_IF, true);
-        let base = (star >> 32) as u16; // STAR[47:32]
-        let cs_sel = (base & 0xfffc) | 3; // CPL 3
-        let ss_sel = (base.wrapping_add(16) & 0xfffc) | 3; // SS = base + 16, RPL 3
-        self.registers
-            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(cs_sel, 0xfb));
-        self.invalidate_code_caches_for_cs_load();
-        self.registers
-            .set_segment(SegmentIndex::Ss, SegmentRegister::flat(ss_sel, 0xf3));
-        // PRM transition point: SYSRET returns to CPL 3 -- but only in protected mode.
-        // SYSRET has "no privilege or mode checks" (see `syscall`'s doc comment) and can
-        // fire from real mode, where it loads a flat CS whose low bits happen to read 3
-        // without CR0.PE ever being touched; real mode has no ring concept, and the
-        // historical live formula (`current_privilege_level`'s old body) always answered
-        // 0 there regardless of CS's selector bits. Setting the cache to 3 unconditionally
-        // here would leak a false CPL-3 reading into whatever comes next while still in
-        // real mode; gate on `is_protected_mode()` so the cache matches that formula.
-        if self.is_protected_mode() {
-            self.cpl = 3;
-        }
-        Ok(clocks(10))
     }
 
     /// Decode an 8-byte descriptor into a cached segment register. Shared by the

@@ -461,13 +461,13 @@ fn emit_region(
                             e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
                         }
                         // Direct write of PendingFlags (Add, Dword) to avoid helper call.
-                        const PENDING_OFF: i32 = 3912;
+                        let pending_off = core::mem::offset_of!(CpuGsw, pending_flags) as i32;
                         e.mov_r32_imm32(Reg::RDX, 0x8000_0200);
-                        e.store_r32_disp32(Reg::R12, PENDING_OFF, Reg::RDX); // tag
-                        e.store_r32_disp32(Reg::R12, PENDING_OFF + 4, Reg::RCX); // a = old
+                        e.store_r32_disp32(Reg::R12, pending_off, Reg::RDX); // tag
+                        e.store_r32_disp32(Reg::R12, pending_off + 4, Reg::RCX); // a = old
                         e.mov_r32_imm32(Reg::RDX, imm);
-                        e.store_r32_disp32(Reg::R12, PENDING_OFF + 8, Reg::RDX); // b = imm
-                        e.store_r32_disp32(Reg::R12, PENDING_OFF + 12, Reg::RAX); // result
+                        e.store_r32_disp32(Reg::R12, pending_off + 8, Reg::RDX); // b = imm
+                        e.store_r32_disp32(Reg::R12, pending_off + 12, Reg::RAX); // result
                     }
                     SlotKind::RegShrImm { dst, count } => {
                         if dst == 5 {
@@ -578,13 +578,13 @@ fn emit_region(
                     } else {
                         e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
                     }
-                    const PENDING_OFF: i32 = 3912;
+                    let pending_off = core::mem::offset_of!(CpuGsw, pending_flags) as i32;
                     e.mov_r32_imm32(Reg::RDX, 0x8000_0200);
-                    e.store_r32_disp32(Reg::R12, PENDING_OFF, Reg::RDX);
-                    e.store_r32_disp32(Reg::R12, PENDING_OFF + 4, Reg::RCX);
+                    e.store_r32_disp32(Reg::R12, pending_off, Reg::RDX);
+                    e.store_r32_disp32(Reg::R12, pending_off + 4, Reg::RCX);
                     e.mov_r32_imm32(Reg::RDX, imm);
-                    e.store_r32_disp32(Reg::R12, PENDING_OFF + 8, Reg::RDX);
-                    e.store_r32_disp32(Reg::R12, PENDING_OFF + 12, Reg::RAX);
+                    e.store_r32_disp32(Reg::R12, pending_off + 8, Reg::RDX);
+                    e.store_r32_disp32(Reg::R12, pending_off + 12, Reg::RAX);
                     if fold_native {
                         let fetch_off = core::mem::offset_of!(RegionCtx, fetch_cost) as i32;
                         emit_fold_bookkeeping(&mut e, slot.insn.len, 1, fetch_off, next_lin, exit);

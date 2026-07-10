@@ -93,15 +93,10 @@ const CR0_EM: u32 = 0x0000_0004;
 const CR0_TS: u32 = 0x0000_0008;
 const CR0_PG: u32 = 0x8000_0000;
 // 486 control bits added to the 386's PE/PG. WP gates supervisor writes to read-only
-// pages in translate_linear, and AM enables the #AC alignment-check path. The rest are
-// read/write storage with no modeled effect, kept so MOV CR0 round-trips them:
-//   NE (bit 5)  numeric-error reporting; no FPU is emulated, so it is cosmetic.
-//   NW (bit 29) / CD (bit 30) cache control; no cache is modeled, so both are
-//               cosmetic.
-// The cosmetic constants document the bit layout in one place; they are not yet
-// read by the core, hence the allow on the trio that has no consumer.
-// AM is CR0 bit 18. CR0 bit 4 is ET (extension type), which we leave as 0 because no
-// x87 FPU is emulated, consistent with CPUID reporting the FPU feature off.
+// pages, AM enables #AC, and NE selects native x87 exception delivery. NW and CD are
+// inert storage because cache disabling has no modeled effect.
+// CR0 bit 4 is ET (extension type). The existing reset image leaves it clear; x87
+// execution is available independently because the core models an attached 387 on the 386.
 const CR0_WP: u32 = 0x0001_0000; // bit 16
 const CR0_AM: u32 = 0x0004_0000; // bit 18
 #[allow(dead_code)]
@@ -111,75 +106,42 @@ const CR0_NW: u32 = 0x2000_0000; // bit 29
 #[allow(dead_code)]
 const CR0_CD: u32 = 0x4000_0000; // bit 30
 
-// GSW-586 CPUID identity. The GSW-586 is the fantasy chip's physical part (a K6-class
-// 586). CPUID always reports this identity regardless of the GswMode throttle, which is
-// a clock control rather than an ISA switch. Keep every tunable value here so the
-// identity is changed in one place.
-//
-// Leaf 0 returns the maximum basic leaf in EAX and the 12-byte vendor string
-// "Genuine GSW " split across EBX, EDX, ECX in that standard order (each register holds
-// four string bytes little-endian, so EBX's low byte is 'G', and so on). The full
-// processor name "Genuine GSW-80586" does not fit the 12-byte vendor field, so it lives
-// in the brand string returned by the extended leaves below.
+// Pentium MMX P55C CPUID identity. Leaf 0 returns the maximum basic leaf in EAX and the
+// 12-byte Intel vendor string split across EBX, EDX, ECX in the architectural order.
 const CPUID_MAX_BASIC_LEAF: u32 = 1;
 const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Genu");
-const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"ine ");
-const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"GSW ");
+const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"ineI");
+const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"ntel");
 
 // Leaf 1 EAX packs type (bits 13-12), family (bits 11-8), model (bits 7-4) and stepping
-// (bits 3-0). Family 5 marks the 586/K6 class; the model and stepping are chosen values.
+// (bits 3-0). Family 5, model 4 is the Pentium MMX P55C identity. Stepping 3 is one of
+// the production P55C revisions.
 const CPUID_TYPE: u32 = 0; // original OEM part
-const CPUID_FAMILY: u32 = 5; // 586 / K6 class
-const CPUID_MODEL: u32 = 6; // chosen GSW-586 model
-const CPUID_STEPPING: u32 = 1; // chosen stepping
+const CPUID_FAMILY: u32 = 5;
+const CPUID_MODEL: u32 = 4;
+const CPUID_STEPPING: u32 = 3;
 const CPUID_VERSION_EAX: u32 =
     (CPUID_TYPE << 12) | (CPUID_FAMILY << 8) | (CPUID_MODEL << 4) | CPUID_STEPPING;
 
-// Leaf 1 feature flags. Only bits for features the core actually emulates are set. FPU
-// (bit 0) is off (no FPU is modeled). TSC (bit 4) and MSR (bit 5) are on: RDTSC and
-// RDMSR/WRMSR with the K6 model-specific register set are implemented. MMX (bit 23) is
-// on to match the GSW-586 lore. The rest stay off until the matching behavior exists.
+// Leaf 1 reports only behavior modeled by this core.
+const CPUID_FEATURE_FPU: u32 = 1 << 0;
 const CPUID_FEATURE_TSC: u32 = 1 << 4;
 const CPUID_FEATURE_MSR: u32 = 1 << 5;
 const CPUID_FEATURE_CX8: u32 = 1 << 8; // CMPXCHG8B
 const CPUID_FEATURE_MMX: u32 = 1 << 23;
-const CPUID_FEATURES_EDX: u32 =
-    CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_CX8 | CPUID_FEATURE_MMX;
-
-// Extended-leaf (0x80000001) feature flags. The AMD Processor Recognition app note (Table
-// 6) places three K6 additions at their own bit positions: SYSCALL/SYSRET (bit 10), integer
-// CMOVcc (bit 15) and FP FCMOVcc (bit 16). TSC/MSR/CX8/MMX share the standard positions. As
-// with leaf 1, only emulated features are set, so FPU/VME/DE/PSE/MCE/PGE stay clear (the
-// GSW-586 emulates none of them, and the real K6 generates no machine-check exception).
-const CPUID_EXT_FEATURE_SYSCALL: u32 = 1 << 10;
-const CPUID_EXT_FEATURE_CMOV: u32 = 1 << 15;
-const CPUID_EXT_FEATURE_FCMOV: u32 = 1 << 16;
-const CPUID_EXT_FEATURES_EDX: u32 = CPUID_FEATURE_TSC
+const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_FPU
+    | CPUID_FEATURE_TSC
     | CPUID_FEATURE_MSR
     | CPUID_FEATURE_CX8
-    | CPUID_FEATURE_MMX
-    | CPUID_EXT_FEATURE_SYSCALL
-    | CPUID_EXT_FEATURE_CMOV
-    | CPUID_EXT_FEATURE_FCMOV;
+    | CPUID_FEATURE_MMX;
 
 // CR4 bits with a modeled effect. TSD (bit 2) makes RDTSC privileged: when set, RDTSC
 // outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
 const CR4_TSD: u32 = 0x0000_0004;
 
-// The full set of CR4 bits this GSW-586 (K6-class) persona defines at all, per the AMD-K6
-// BIOS and Software Tools Developers Guide S: 3.7 (Control Register 4 (CR4) Extensions,
-// Figure 13 / Table 19): VME(0), PVI(1), TSD(2), DE(3), PSE(4), MCE(6), GPE(7, the K6's
-// name for what later became PGE). Bit 5 and bits 31:8 are reserved on real K6 hardware.
-// Only TSD is behaviorally wired up (see CR4_TSD above); VME/PVI/DE/PSE/MCE/GPE are not
-// emulated (the matching CPUID feature bits stay clear, matching the leaf-1 comment
-// above), but a guest is still allowed to set/clear/read them back as inert storage --
-// real firmware and memory managers probe CR4 this way. Bits outside this mask are
-// rejected on write: the same K6 guide's MOV-to/from-CR4 exception table (S: MOV to and
-// from CR4) lists a fault "If 1 is written to any reserved bits" in Real, Virtual-8086,
-// and Protected mode alike, and the Pentium Vol. 3 instruction reference repeats it
-// verbatim ("#GP(0)"/"Interrupt 13 if an attempt is made to write a 1 to any reserved
-// bits of CR4"). So a reserved-bit write faults with #GP(0), the same as EFER/STAR.
-const CR4_DEFINED_MASK: u32 = 0x0000_009f; // bits 0-4, 6-7
+// P55C defines VME, PVI, TSD, DE, PSE and MCE. Only TSD has modeled behavior; the
+// remaining defined bits are inert storage. PGE is a P6 addition and stays reserved.
+const CR4_DEFINED_MASK: u32 = 0x0000_005f; // bits 0-4, 6
 
 // DR6 (debug status): bits 0-3 are B0-B3 (which breakpoint condition matched), bit 13
 // is BD (an attempt to access a debug register while GD was set), bit 14 is BS (the
@@ -200,46 +162,15 @@ const DR6_RESET: u32 = 0xffff_0ff0;
 const DR7_RESET: u32 = 0x0000_0400;
 const DR7_FIXED_ONE: u32 = 0x0000_0400; // bit 10, always reads back as 1
 
-// K6 model-specific register addresses (the value the RDMSR/WRMSR ECX selector carries).
-// This is the full software-visible set from the AMD-K6 BIOS and Software Tools guide:
-// the two machine-check registers, the time-stamp counter, the AMD extended-feature and
-// SYSCALL-target registers, and the write-handling control register.
+// Pentium model-specific register addresses used by the modeled P55C subset.
 const MSR_MCAR: u32 = 0x0000_0000; // machine-check address
 const MSR_MCTR: u32 = 0x0000_0001; // machine-check type
 const MSR_TSC: u32 = 0x0000_0010; // time-stamp counter
-const MSR_EFER: u32 = 0xc000_0080; // extended feature enable (bit 0 = SCE)
-const MSR_STAR: u32 = 0xc000_0081; // SYSCALL/SYSRET target address
-const MSR_WHCR: u32 = 0xc000_0082; // write handling control
-
-// EFER bit 0: System Call Extension. SYSCALL and SYSRET raise #UD when it is clear.
-const EFER_SCE: u64 = 0x1;
-
-// Writable masks for the two MSRs with reserved bits. Per the AMD-K6 guide (EFER Table 40,
-// STAR Table 41) writing a 1 to any reserved bit raises #GP(0). EFER defines only SCE (bits
-// 63-1 reserved); STAR holds the target EIP (31-0) and the CS/SS selector base (47-32), with
-// bits 63-48 reserved.
-const EFER_WRITABLE: u64 = EFER_SCE;
-const STAR_WRITABLE: u64 = 0x0000_ffff_ffff_ffff;
 
 // Leaf 1 EBX: brand index 0 (no brand string), CLFLUSH line size and other fields stay 0.
 const CPUID_LEAF1_EBX: u32 = 0;
 // Leaf 1 ECX: no extended feature is claimed.
 const CPUID_LEAF1_ECX: u32 = 0;
-
-// Extended leaves expose the brand string "Genuine GSW-80586", the full human-readable
-// processor name. Leaf 0x80000000 reports the maximum extended leaf; leaves 0x80000002
-// through 0x80000004 return the 48-byte null-padded brand string, 16 bytes per leaf in
-// EAX, EBX, ECX, EDX order. The original K6 lacked the brand-string leaves, so exposing
-// them is a fantasy extension that lets the GSW-586 name itself in full.
-// The maximum extended leaf reaches 0x80000006 so the AMD-style cache leaves
-// 0x80000005 (L1) and 0x80000006 (L2) sit inside the reported range. The K6 did
-// expose these cache leaves, so they fit the GSW-586 identity.
-const CPUID_MAX_EXT_LEAF: u32 = 0x8000_0006;
-const CPUID_BRAND_EAX_0: u32 = u32::from_le_bytes(*b"Genu");
-const CPUID_BRAND_EBX_0: u32 = u32::from_le_bytes(*b"ine ");
-const CPUID_BRAND_ECX_0: u32 = u32::from_le_bytes(*b"GSW-");
-const CPUID_BRAND_EDX_0: u32 = u32::from_le_bytes(*b"8058");
-const CPUID_BRAND_EAX_1: u32 = u32::from_le_bytes([b'6', 0, 0, 0]);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CpuError {
@@ -358,8 +289,7 @@ impl SegmentRegister {
         }
     }
 
-    /// A 4-GByte flat 32-bit segment (base 0, full limit). Used by SYSCALL/SYSRET, which
-    /// load fixed flat descriptors from the selector in STAR without touching the GDT.
+    /// A 4-GByte flat 32-bit segment (base 0, full limit).
     pub const fn flat(selector: u16, access: u8) -> Self {
         Self {
             selector,
@@ -528,17 +458,12 @@ impl Default for ControlRegisters {
     }
 }
 
-/// The K6 model-specific register file behind RDMSR/WRMSR. MCAR/MCTR/WHCR are plain
-/// 64-bit storage with no modeled effect (no machine-check or write-allocate logic is
-/// emulated). EFER bit 0 (SCE) and STAR feed SYSCALL/SYSRET. `tsc_offset` is added to
-/// the running core-clock count so a WRMSR to the TSC can rebase it.
+/// The modeled Pentium MSR subset. MCAR and MCTR are plain storage because machine-check
+/// delivery is not modeled. `tsc_offset` lets a WRMSR to TSC rebase the running counter.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Msrs {
     pub mcar: u64,
     pub mctr: u64,
-    pub whcr: u64,
-    pub efer: u64,
-    pub star: u64,
     pub tsc_offset: u64,
 }
 
@@ -862,7 +787,7 @@ pub struct CpuGsw {
     /// far JMP/CALL/RETF/IRET same- and inter-privilege transfers; call/task gates and
     /// `task_switch` (to the target DPL); IRET-into-V86 (3); `deliver_exception` (to the
     /// gate's target level, before the frame-push sequence begins -- see that function);
-    /// SYSCALL/SYSRET; reset (0). `current_privilege_level` returns this field directly;
+    /// reset (0). `current_privilege_level` returns this field directly;
     /// see that method for why a live `CS.selector & 3` read is wrong during exception
     /// delivery out of a V86 source (the source CS can carry arbitrary low bits before
     /// the frame's own CS is loaded, which must not be mistaken for the CPL the pushes
@@ -1123,17 +1048,12 @@ enum DecodeGroup {
     /// off the full u16 (the `as u8` low byte of 0x0Fa4/a5/b0/b1/c0/c1 would alias single-byte
     /// opcodes).
     BitManip,
-    /// The two-byte conditional-move / set-on-condition / two-operand IMUL block (task A11):
-    /// CMOVcc reg, r/m (0F 40-0F 4F — 586-class), SETcc r/m8 (0F 90-0F 9F — 386-class), and
-    /// IMUL reg, r/m (0F AF — 386-class). Every one is a ModRM r/m form with no immediate after
+    /// The two-byte set-on-condition / two-operand IMUL block:
+    /// SETcc r/m8 (0F 90-0F 9F) and IMUL reg, r/m (0F AF). Both are ModRM r/m forms with no immediate after
     /// the ModRM, so `decode` parses the ModRM + addressing descriptor and stores it (no `imm`
     /// fetch). The executor dispatches off the FULL u16 (`insn.opcode`, never narrowed to u8 first)
-    /// and reuses `self.condition(insn.opcode as u8 & 0x0f)` for the condition codes and
-    /// `self.imul_truncated` for the two-operand IMUL. CMOVcc reads the source r/m even when the
-    /// condition is false (memory faults still fire), but writes the destination register only
-    /// when the condition holds. SETcc is always byte-wide and uses `write_operand_u8`. The ISA
-    /// gates (386+ for SETcc/IMUL, 586+ for CMOVcc) are applied once in `decode`'s
-    /// `check_two_byte_isa_gate`; the executor does NOT re-gate.
+    /// and reuses `self.condition(insn.opcode as u8 & 0x0f)` for SETcc and
+    /// `self.imul_truncated` for IMUL. SETcc is always byte-wide and uses `write_operand_u8`.
     CondMove,
     /// The system / descriptor-table / segment-load block (task A12), a MIX of two-byte (0F) and
     /// single-byte opcodes that read/write control, descriptor-table, and segment state. The members
@@ -1187,8 +1107,8 @@ enum DecodeGroup {
     ///   - string port I/O: INSB/INSW (0x6C/0x6D), OUTSB/OUTSW (0x6E/0x6F) — implicit operands; the
     ///     executor is a thin call to the existing `run_string` (REP/DF/segment-override stay there).
     ///   - HLT (0xF4) — sets the halted state.
-    ///   - the two-byte system/serializing/CPU-id ops with no encoded operand: SYSCALL (0F 05),
-    ///     SYSRET (0F 07), INVD/WBINVD (0F 08/09), WRMSR (0F 30), RDTSC (0F 31), RDMSR (0F 32),
+    ///   - the two-byte system/serializing/CPU-id ops with no encoded operand: INVD/WBINVD
+    ///     (0F 08/09), WRMSR (0F 30), RDTSC (0F 31), RDMSR (0F 32),
     ///     CPUID (0F A2), BSWAP r32 (0F C8-CF).
     ///   - CMPXCHG8B m64 (0F C7 /1) — a ModRM r/m form (`decode` parses the ModRM + descriptor).
     ///   - the MMX integer-SIMD block (the `is_mmx_two_byte` opcodes): EMMS (0F 77, no ModRM); the
@@ -1199,7 +1119,7 @@ enum DecodeGroup {
     /// `decode` parses each form's ModRM + addressing descriptor (instruction bytes only, so it stays
     /// cacheable) and its immediate exactly as the fused handler did, so the byte budget — and thus the
     /// fetch clocks — is byte-identical. The executor reuses the existing BCD/`imul_truncated`/
-    /// `run_string`/`execute_mmx_decoded`/CPUID/RDTSC/`syscall`/halt leaf logic verbatim; the only
+    /// `run_string`/`execute_mmx_decoded`/CPUID/RDTSC/halt leaf logic verbatim; the only
     /// change is WHERE the ModRM/immediate is fetched (once, in `decode`). The 0F forms are folded
     /// into `insn.opcode` as 0x0F00 | second and dispatched off the full u16. The genuinely
     /// unimplemented neighbours (single-byte 0x63 ARPL / 0xF1; 0F 21/23 MOV DR; 0F AA RSM; the
@@ -1466,7 +1386,7 @@ struct DecodedInsn {
     /// measurement is the reason.
     continuable: bool,
     /// Never enter this decode in the decode cache. Set when the two-byte ISA gate passed only
-    /// via the firmware-ROM / ring-0 exemption: that exemption is context, not bytes, so a
+    /// via the firmware-ROM exemption: that exemption is context, not bytes, so a
     /// cached replay after a privilege change would skip the #UD. (LOCK-prefixed instructions
     /// are the other no-cache class, detected from `prefixes.lock` directly.)
     no_cache: bool,
@@ -2185,14 +2105,37 @@ pub const fn bus_timing(persona: CpuPersona) -> (u32, u32) {
     }
 }
 
-/// True when a second-byte 0F opcode is a 586-class addition the core executes only at
-/// the full GSW level. Used to raise #UD when the guest selects a 386 or 486 mode.
-const fn is_586plus_two_byte(opcode: u8) -> bool {
-    matches!(
-        opcode,
-        // SYSCALL/SYSRET; WRMSR, RDTSC, RDMSR; CMOVcc; RSM; CMPXCHG8B.
-        0x05 | 0x07 | 0x30..=0x32 | 0x40..=0x4f | 0xaa | 0xc7
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IsaGeneration {
+    I386,
+    I486,
+    P55c,
+    Never,
+}
+
+const fn persona_supports(persona: CpuPersona, required: IsaGeneration) -> bool {
+    match required {
+        IsaGeneration::I386 => true,
+        IsaGeneration::I486 => matches!(persona, CpuPersona::I486 | CpuPersona::I586),
+        IsaGeneration::P55c => matches!(persona, CpuPersona::I586),
+        IsaGeneration::Never => false,
+    }
+}
+
+/// Generation requirement for each implemented two-byte opcode family. Operand-sensitive
+/// additions such as INVLPG and CR4 are checked by their executors after the ModRM is decoded.
+const fn two_byte_isa_generation(opcode: u8) -> IsaGeneration {
+    match opcode {
+        // AMD fast system calls and the P6 conditional-move family are outside P55C.
+        // RSM stays invalid because this core never enters SMM.
+        0x05 | 0x07 | 0x40..=0x4f | 0xaa => IsaGeneration::Never,
+        // 486 additions.
+        0x08 | 0x09 | 0xb0 | 0xb1 | 0xc0 | 0xc1 | 0xc8..=0xcf => IsaGeneration::I486,
+        // Pentium and Pentium MMX additions.
+        0x30..=0x32 | 0xa2 | 0xc7 => IsaGeneration::P55c,
+        op if is_mmx_two_byte(op) => IsaGeneration::P55c,
+        _ => IsaGeneration::I386,
+    }
 }
 
 fn sign_extend_u8(value: u8) -> u32 {
