@@ -534,7 +534,7 @@ pub fn run(
     rom: Vec<u8>,
     c_drive: PathBuf,
     cd_image: Option<PathBuf>,
-    audio_enabled: bool,
+    midi_config: MidiConfig,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
 ) -> Result<(), Box<dyn Error>> {
@@ -545,7 +545,7 @@ pub fn run(
         rom,
         c_drive,
         cd_image,
-        audio_enabled,
+        midi_config,
         test_pattern,
         rtc_setup,
     );
