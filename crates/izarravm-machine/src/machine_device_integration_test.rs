@@ -72,6 +72,36 @@ fn hlt_wakes_on_pit_timer_tick() {
 }
 
 #[test]
+fn tsc_keeps_running_while_hlt_waits_for_irq0() {
+    let mut code = vec![
+        0xb0, 0x11, 0xe6, 0x20, 0xb0, 0x08, 0xe6, 0x21, 0xb0, 0x04, 0xe6, 0x21, 0xb0, 0x01, 0xe6,
+        0x21, 0xb0, 0xfe, 0xe6, 0x21, 0xb0, 0x36, 0xe6, 0x43, 0xb0, 0xe8, 0xe6, 0x40, 0xb0, 0x03,
+        0xe6, 0x40, 0xc7, 0x06, 0x20, 0x00, 0x00, 0x00, 0xc7, 0x06, 0x22, 0x00, 0x00, 0x00, 0x0f,
+        0x31, 0x66, 0xa3, 0x00, 0x05, 0xfb, 0xf4, 0x0f, 0x31, 0x66, 0x2b, 0x06, 0x00, 0x05, 0x66,
+        0xa3, 0x04, 0x05, 0xfa, 0xf4,
+    ];
+    let handler = (0x7c00 + code.len()) as u16;
+    code[36..38].copy_from_slice(&handler.to_le_bytes());
+    code.extend_from_slice(&[0xb0, 0x20, 0xe6, 0x20, 0xcf]);
+
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_boot_image(profile, boot_image_with(&code)).unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    let bytes: [u8; 4] = machine.memory().as_slice()[0x0504..0x0508]
+        .try_into()
+        .unwrap();
+    let halted_tsc_clocks = u32::from_le_bytes(bytes);
+    assert!(
+        u64::from(halted_tsc_clocks) > GswMode::Gsw586.clock_hz() / 2_000,
+        "TSC advanced only {halted_tsc_clocks} clocks across the PIT wait"
+    );
+}
+
+#[test]
 fn boot_suite_reports_timer_irq0_pass() {
     let mut machine = Machine::new_boot_image(
         MachineProfile::gsw_386(16, VideoCard::Vega),

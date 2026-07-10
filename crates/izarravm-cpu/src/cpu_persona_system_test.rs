@@ -237,6 +237,27 @@ fn wrmsr_tsc_rebases_so_the_counter_reads_the_written_value() {
 }
 
 #[test]
+fn machine_tsc_advance_preserves_instruction_clocks_and_guest_rebase() {
+    let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30], 0x20);
+    cpu.elapsed_clocks = 500;
+    cpu.advance_tsc(1_500);
+    assert_eq!(cpu.elapsed_clocks, 500);
+    assert_eq!(cpu.time_stamp_counter(), 2_000);
+
+    cpu.registers.set_ecx(MSR_TSC);
+    cpu.registers.set_edx(0);
+    cpu.registers.set_eax(1_000_000);
+    let mut bus = TestBus::with_memory(memory);
+    exec_one_split(&mut cpu, &mut bus).unwrap();
+    assert_eq!(cpu.time_stamp_counter(), 1_000_000);
+
+    cpu.set_mode(GswMode::Gsw486);
+    cpu.advance_tsc(500);
+    assert_eq!(cpu.elapsed_clocks, 500);
+    assert_eq!(cpu.time_stamp_counter(), 1_000_500);
+}
+
+#[test]
 fn wrmsr_is_general_protection_at_cpl3() {
     let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x30]);
     cpu.registers.set_ecx(MSR_TSC);

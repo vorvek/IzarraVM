@@ -374,6 +374,13 @@ impl CpuGsw {
         self.invalidate_code_caches();
     }
 
+    /// Advance the architectural TSC for machine time not represented by
+    /// retired-instruction clocks. This leaves instruction timing unchanged
+    /// and preserves a guest WRMSR rebase.
+    pub fn advance_tsc(&mut self, clocks: u64) {
+        self.msr.tsc_offset = self.msr.tsc_offset.wrapping_add(clocks);
+    }
+
     /// Scale a retired instruction's clocks by the active level's timing factor,
     /// carrying the fractional remainder so a run of cheap ops is not rounded to
     /// zero. This is the single per-mode timing dial; it feeds both the CPU's
@@ -580,8 +587,8 @@ impl CpuGsw {
         self.write_gpr32(2, (value >> 32) as u32);
     }
 
-    /// The time-stamp counter: the running core-clock count plus whatever offset a WRMSR
-    /// to the TSC last rebased it by.
+    /// The time-stamp counter: retired-instruction clocks plus machine-time and
+    /// guest WRMSR adjustments.
     pub(super) fn time_stamp_counter(&self) -> u64 {
         self.elapsed_clocks.wrapping_add(self.msr.tsc_offset)
     }

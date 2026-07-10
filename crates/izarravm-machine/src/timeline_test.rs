@@ -27,9 +27,30 @@ fn mode_switch_preserves_elapsed_and_stall_time() {
 
     assert_eq!(timeline.now_ticks(), 400);
     assert_eq!(timeline.io_stall_ticks(), 70);
+    assert_eq!(timeline.tsc_clocks(), 12);
     assert_eq!(timeline.ticks_per_cpu_clock(), 900);
     timeline.advance_cpu_clocks(1, DeviceRates::default());
     assert_eq!(timeline.now_ticks(), 1_300);
+    assert_eq!(timeline.tsc_clocks(), 13);
+}
+
+#[test]
+fn tsc_clock_is_batch_invariant_and_resets_fraction_on_mode_change() {
+    let mut whole = Timeline::new(GswMode::Gsw486);
+    whole.advance_master_ticks(10_099, DeviceRates::default());
+
+    let mut split = Timeline::new(GswMode::Gsw486);
+    for ticks in [1, 17, 81, 4_000, 6_000] {
+        split.advance_master_ticks(ticks, DeviceRates::default());
+    }
+    assert_eq!(split, whole);
+    assert_eq!(whole.tsc_clocks(), 100);
+
+    whole.set_mode(GswMode::Gsw386);
+    whole.advance_master_ticks(201, DeviceRates::default());
+    assert_eq!(whole.tsc_clocks(), 100);
+    whole.advance_master_ticks(99, DeviceRates::default());
+    assert_eq!(whole.tsc_clocks(), 101);
 }
 
 #[test]
@@ -84,8 +105,10 @@ fn timeline_and_rate_phase_saturate_after_wide_arithmetic() {
     let mut timeline = Timeline::new(GswMode::Gsw386Slow);
     assert_eq!(timeline.master_ticks_for_cpu_clocks(u64::MAX), u64::MAX);
     timeline.advance_cpu_clocks(u64::MAX, DeviceRates::default());
+    let saturated_tsc = timeline.tsc_clocks();
     timeline.advance_master_ticks(1, DeviceRates::default());
     assert_eq!(timeline.now_ticks(), u64::MAX);
+    assert_eq!(timeline.tsc_clocks(), saturated_tsc);
 
     timeline.advance_io_stall_ticks(u64::MAX, DeviceRates::default());
     assert_eq!(timeline.io_stall_ticks(), 0);

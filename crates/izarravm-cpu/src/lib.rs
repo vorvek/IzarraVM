@@ -459,7 +459,7 @@ impl Default for ControlRegisters {
 }
 
 /// The modeled Pentium MSR subset. MCAR and MCTR are plain storage because machine-check
-/// delivery is not modeled. `tsc_offset` lets a WRMSR to TSC rebase the running counter.
+/// delivery is not modeled. `tsc_offset` lets a WRMSR rebase the timeline-driven TSC.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Msrs {
     pub mcar: u64,

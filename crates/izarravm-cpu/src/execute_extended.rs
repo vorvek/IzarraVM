@@ -954,8 +954,8 @@ impl CpuGsw {
                 match self.read_gpr32(1) {
                     MSR_MCAR => self.msr.mcar = value,
                     MSR_MCTR => self.msr.mctr = value,
-                    // Rebase the time-stamp counter: store the offset that makes the running
-                    // core-clock count read back as the written value.
+                    // Rebase the counter against elapsed instruction clocks.
+                    // Future machine-time advances are added to the new offset.
                     MSR_TSC => self.msr.tsc_offset = value.wrapping_sub(self.elapsed_clocks),
                     _ => {
                         return Err(InternalFault::Exception {

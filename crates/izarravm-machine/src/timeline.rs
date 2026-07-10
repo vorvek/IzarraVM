@@ -103,6 +103,8 @@ pub(crate) struct Timeline {
     now_ticks: u64,
     io_stall_ticks: u64,
     ticks_per_cpu_clock: u64,
+    tsc_clocks: u64,
+    tsc_phase_ticks: u64,
     microseconds: RatePhase,
     pit: RatePhase,
     dsp: RatePhase,
@@ -121,6 +123,8 @@ impl Timeline {
             now_ticks: 0,
             io_stall_ticks: 0,
             ticks_per_cpu_clock: exact_cpu_quantum(mode),
+            tsc_clocks: 0,
+            tsc_phase_ticks: 0,
             microseconds: RatePhase::default(),
             pit: RatePhase::default(),
             dsp: RatePhase::default(),
@@ -142,6 +146,17 @@ impl Timeline {
         self.io_stall_ticks
     }
 
+    pub(crate) const fn tsc_clocks(self) -> u64 {
+        self.tsc_clocks
+    }
+
+    #[cfg(test)]
+    pub(crate) fn excluding_tsc(mut self) -> Self {
+        self.tsc_clocks = 0;
+        self.tsc_phase_ticks = 0;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) const fn ticks_per_cpu_clock(self) -> u64 {
         self.ticks_per_cpu_clock
@@ -149,6 +164,7 @@ impl Timeline {
 
     pub(crate) fn set_mode(&mut self, mode: GswMode) {
         self.ticks_per_cpu_clock = exact_cpu_quantum(mode);
+        self.tsc_phase_ticks = 0;
     }
 
     pub(crate) fn master_ticks_for_cpu_clocks(self, cpu_clocks: u64) -> u64 {
@@ -179,6 +195,10 @@ impl Timeline {
     ) -> DeviceAdvance {
         let master_ticks = requested_ticks.min(u64::MAX - self.now_ticks);
         self.now_ticks += master_ticks;
+        let tsc_ticks = self.tsc_phase_ticks as u128 + master_ticks as u128;
+        let tsc_clocks = (tsc_ticks / self.ticks_per_cpu_clock as u128) as u64;
+        self.tsc_phase_ticks = (tsc_ticks % self.ticks_per_cpu_clock as u128) as u64;
+        self.tsc_clocks = self.tsc_clocks.wrapping_add(tsc_clocks);
         let pit_remainder_before = self.pit.remainder();
         DeviceAdvance {
             master_ticks,

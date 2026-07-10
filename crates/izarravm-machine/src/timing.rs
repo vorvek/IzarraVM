@@ -47,7 +47,7 @@ impl Machine {
 
     pub(super) fn stall_for_master_ticks(&mut self, master_ticks: u64) {
         let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
-        self.advance_master_time(master_ticks, true);
+        self.advance_master_time(master_ticks, true, 0);
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(cpu_clocks);
         self.io_stall_clocks = self.io_stall_clocks.saturating_add(cpu_clocks);
     }
@@ -583,7 +583,21 @@ impl Machine {
         }
     }
 
-    fn advance_master_time(&mut self, master_ticks: u64, io_stall: bool) {
+    fn finish_tsc_advance(&mut self, before: u64, executed_clocks: u64) {
+        let timeline_clocks = self.timeline.tsc_clocks().wrapping_sub(before);
+        debug_assert!(
+            timeline_clocks >= executed_clocks || self.timeline.now_ticks() == u64::MAX,
+            "timeline TSC clocks must cover retired clocks before saturation"
+        );
+        // Retired clocks already reached CpuGsw::elapsed_clocks. Add only bus,
+        // ISA, stall, and halted clocks. At master-time saturation the wrapping
+        // difference cancels retired clocks beyond the last representable tick.
+        self.cpu
+            .advance_tsc(timeline_clocks.wrapping_sub(executed_clocks));
+    }
+
+    fn advance_master_time(&mut self, master_ticks: u64, io_stall: bool, executed_clocks: u64) {
+        let tsc_before = self.timeline.tsc_clocks();
         let mut remaining = master_ticks;
         if remaining == 0 {
             let rates = self.device_rates();
@@ -593,6 +607,7 @@ impl Machine {
                 self.timeline.advance_master_ticks(0, rates)
             };
             self.apply_device_advance(advance);
+            self.finish_tsc_advance(tsc_before, executed_clocks);
             return;
         }
         while remaining != 0 {
@@ -609,20 +624,23 @@ impl Machine {
             self.apply_device_advance(advance);
             remaining -= step;
         }
+        self.finish_tsc_advance(tsc_before, executed_clocks);
     }
 
-    pub(super) fn advance_cpu_work(&mut self, clocks: u64) {
+    pub(super) fn advance_cpu_work(&mut self, clocks: u64, executed_clocks: u64) {
         let master_ticks = self.timeline.master_ticks_for_cpu_clocks(clocks);
         let crosses_fdc_deadline = self
             .fdc
             .ticks_until_event(self.timeline.now_ticks())
             .is_some_and(|deadline| deadline <= master_ticks);
         if crosses_fdc_deadline {
-            self.advance_master_time(master_ticks, false);
+            self.advance_master_time(master_ticks, false, executed_clocks);
         } else {
+            let tsc_before = self.timeline.tsc_clocks();
             let rates = self.device_rates();
             let advance = self.timeline.advance_cpu_clocks(clocks, rates);
             self.apply_device_advance(advance);
+            self.finish_tsc_advance(tsc_before, executed_clocks);
         }
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(clocks);
     }
@@ -637,12 +655,12 @@ impl Machine {
     /// Advance devices and global guest time by a fixed master-tick duration
     /// without executing CPU work.
     pub fn advance_devices_ticks(&mut self, master_ticks: u64) {
-        self.advance_master_time(master_ticks, false);
+        self.advance_master_time(master_ticks, false, 0);
     }
 
     pub(super) fn advance_halted_ticks(&mut self, master_ticks: u64) {
         let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
-        self.advance_master_time(master_ticks, false);
+        self.advance_master_time(master_ticks, false, 0);
         self.elapsed_clocks = self.elapsed_clocks.saturating_add(cpu_clocks);
     }
 
