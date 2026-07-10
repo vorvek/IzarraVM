@@ -29,7 +29,7 @@ const STATUS_AUX: u8 = 0x20; // the byte in the output buffer came from the mous
 //     interrupts far outside anything real hardware produces.
 // Excludes controller-command echoes (self-test, CCB read, etc.): those are
 // an immediate digital handshake, not a serialized device transmission.
-const AUX_BYTE_SETTLE_US: f64 = 1000.0;
+const AUX_BYTE_SETTLE_TICKS: u64 = izarravm_core::MASTER_CLOCK_HZ / 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keyboard8042 {
@@ -47,7 +47,7 @@ pub struct Keyboard8042 {
     scan_set: u8,                       // active scancode set (0xF0 select; default 2)
     last_byte: u8,                      // last scancode latched, for 0xFE resend
     mouse: Ps2Mouse,
-    aux_settle_us: f64, // microseconds left before the next aux byte may latch
+    aux_settle_ticks: u64,
 }
 
 impl Default for Keyboard8042 {
@@ -67,7 +67,7 @@ impl Default for Keyboard8042 {
             scan_set: 2, // PS/2 keyboards power up in set 2
             last_byte: 0,
             mouse: Ps2Mouse::default(),
-            aux_settle_us: 0.0,
+            aux_settle_ticks: 0,
         }
     }
 }
@@ -242,7 +242,7 @@ impl Keyboard8042 {
             if self.command_byte & 0x01 != 0 {
                 self.irq_armed = true;
             }
-        } else if !aux_disabled && self.aux_settle_us <= 0.0 {
+        } else if !aux_disabled && self.aux_settle_ticks == 0 {
             if let Some(code) = self.mouse.queue.pop_front() {
                 self.output = Some(code);
                 self.output_is_aux = true;
@@ -256,13 +256,11 @@ impl Keyboard8042 {
         }
     }
 
-    /// Decay the aux settle window (see `AUX_BYTE_SETTLE_US`) by `micros` of
-    /// emulated time, releasing a held-back aux byte once it elapses. Called
-    /// once per device-clocking tick from `Machine::advance_devices`, which
-    /// has the real elapsed time.
-    pub(crate) fn advance_mouse_pacing(&mut self, micros: f64) {
-        if self.aux_settle_us > 0.0 {
-            self.aux_settle_us = (self.aux_settle_us - micros).max(0.0);
+    /// Decay the aux settle window by fixed master ticks, releasing a held byte
+    /// at the same guest-time deadline in every CPU mode.
+    pub(crate) fn advance_mouse_pacing(&mut self, master_ticks: u64) {
+        if self.aux_settle_ticks > 0 {
+            self.aux_settle_ticks = self.aux_settle_ticks.saturating_sub(master_ticks);
             self.latch_next(); // a byte held back by the settle window may now latch
         }
     }
@@ -319,7 +317,7 @@ impl Keyboard8042 {
                     // queue (a host mouse "flick" can queue many packets at
                     // once) delivering its bytes to the guest faster than any
                     // real PS/2 mouse could transmit them.
-                    self.aux_settle_us = AUX_BYTE_SETTLE_US;
+                    self.aux_settle_ticks = AUX_BYTE_SETTLE_TICKS;
                 }
                 self.status &= !(STATUS_OBF | STATUS_AUX);
                 self.output_is_aux = false;

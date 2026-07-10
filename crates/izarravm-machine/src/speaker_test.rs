@@ -3,12 +3,16 @@
 
 use super::*;
 
+fn millis(value: u64) -> u64 {
+    izarravm_core::MASTER_CLOCK_HZ / 1000 * value
+}
+
 #[test]
 fn enabled_membrane_toggles_with_ch2_out() {
     let mut spk = Speaker::default();
     spk.write_control(0x03); // gate + data enable
-    spk.accumulate(0.001, true, std::iter::empty::<(f64, bool)>()); // ~44 samples high
-    spk.accumulate(0.001, false, std::iter::empty::<(f64, bool)>()); // ~44 samples low
+    spk.accumulate(millis(1), true, std::iter::empty::<(u64, bool)>());
+    spk.accumulate(millis(1), false, std::iter::empty::<(u64, bool)>());
     let s = spk.drain(88);
     assert!(s.iter().any(|&v| v > 0), "high half produced +AMP");
     assert!(s.iter().any(|&v| v < 0), "low half produced -AMP");
@@ -17,7 +21,7 @@ fn enabled_membrane_toggles_with_ch2_out() {
 #[test]
 fn disabled_speaker_is_silent() {
     let mut spk = Speaker::default(); // data_enable false
-    spk.accumulate(0.01, true, std::iter::empty::<(f64, bool)>()); // OUT high but disabled
+    spk.accumulate(millis(10), true, std::iter::empty::<(u64, bool)>());
     assert!(spk.drain(100).iter().all(|&v| v == 0));
 }
 
@@ -25,7 +29,7 @@ fn disabled_speaker_is_silent() {
 fn drain_pads_with_zero_on_underrun() {
     let mut spk = Speaker::default();
     spk.write_control(0x03);
-    spk.accumulate(0.0001, true, std::iter::empty::<(f64, bool)>()); // ~4 samples
+    spk.accumulate(millis(1) / 10, true, std::iter::empty::<(u64, bool)>());
     let s = spk.drain(50);
     assert_eq!(s.len(), 50);
     assert!(s[40..].iter().all(|&v| v == 0));
@@ -35,18 +39,16 @@ fn drain_pads_with_zero_on_underrun() {
 fn sub_sample_pulse_width_changes_the_sample() {
     let mut short = Speaker::default();
     short.write_control(0x03);
+    let sample_ticks = izarravm_core::MASTER_CLOCK_HZ.div_ceil(u64::from(DAC_HZ));
     short.accumulate(
-        SAMPLE_SECONDS,
+        sample_ticks,
         false,
-        [
-            (SAMPLE_SECONDS * 0.25, true),
-            (SAMPLE_SECONDS * 0.50, false),
-        ],
+        [(sample_ticks / 4, true), (sample_ticks / 2, false)],
     );
 
     let mut long = Speaker::default();
     long.write_control(0x03);
-    long.accumulate(SAMPLE_SECONDS, false, [(SAMPLE_SECONDS * 0.25, true)]);
+    long.accumulate(sample_ticks, false, [(sample_ticks / 4, true)]);
 
     let short = short.drain(1)[0];
     let long = long.drain(1)[0];

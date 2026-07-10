@@ -326,19 +326,11 @@ impl Distira {
         self.init_enable = value;
     }
 
-    /// Advance the beam-position counter `clocks` device clocks. This is
-    /// the "simple frame-phase counter advanced by device clocks" the
-    /// compatibility plan calls acceptable in place of true dot-clock beam
-    /// coupling: it exists only so `SST_V_RETRACE`/`SST_HV_RETRACE`/
-    /// `SST_STATUS`'s vsync bit make forward progress and periodically
-    /// enter/exit retrace, so a real `grSstVRetrace()`-shaped poll loop
-    /// (wait for either edge) always terminates instead of hanging on a
-    /// permanently hardcoded bit. One clock advances one scanline; the
-    /// scale is arbitrary since no guest-visible contract ties Distira's
-    /// scanout to a specific dot clock yet.
-    pub fn advance_frame_phase(&mut self, clocks: u64) {
+    /// Advance a 525-line, 60 Hz scanout by whole lines. The machine timeline
+    /// generates these independently of CPU mode.
+    pub fn advance_frame_phase(&mut self, lines: u64) {
         let total = u64::from(FRAME_PHASE_TOTAL_LINES);
-        let line = (u64::from(self.frame_phase_line) + clocks) % total;
+        let line = (u64::from(self.frame_phase_line) + lines) % total;
         self.frame_phase_line = line as u32;
     }
 

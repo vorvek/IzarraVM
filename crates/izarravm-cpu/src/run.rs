@@ -298,9 +298,8 @@ impl CpuGsw {
         // only. Track the batch's scaled-bus growth across this run so a
         // bus-heavy run (a framebuffer blit is several bus clocks per core
         // clock) ends at the budget instead of overshooting the next timer
-        // edge by the bus:core ratio. Zero-cost where the bus reports 0 (the
-        // Accurate class and non-batching buses): the check degrades to the
-        // historical core-only comparison bit-for-bit.
+        // edge by the bus:core ratio. Buses without this accounting return 0,
+        // which degrades to the core-only comparison.
         let bus_at_entry = bus.in_batch_scaled_bus_clocks();
         self.perf.straight_line_runs += 1;
         loop {

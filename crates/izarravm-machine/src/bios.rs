@@ -375,11 +375,11 @@ impl Machine {
                 self.cpu.registers.set_eax(eax);
                 self.set_int_frame_carry(false);
             }
-            // AH=86h WAIT: CX:DX microseconds. Convert to seconds and stall.
+            // AH=86h WAIT: CX:DX microseconds.
             0x86 => {
                 let micros = (u64::from(self.cpu.registers.ecx() as u16) << 16)
                     | u64::from(self.cpu.registers.edx() as u16);
-                self.stall_for(micros as f64 / 1_000_000.0);
+                self.stall_for_micros(micros);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -548,7 +548,7 @@ impl Machine {
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let bx = self.cpu.registers.ebx() as u16;
                 let addr = es.wrapping_add(u32::from(bx));
-                self.stall_for(micros as f64 / 1_000_000.0);
+                self.stall_for_micros(micros);
                 let byte = self.read_physical_u8(addr);
                 let _ = self.memory.write_u8(addr as usize, byte | 0x80);
                 self.set_eax_ah(0x00);

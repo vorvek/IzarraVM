@@ -11,82 +11,59 @@ pub const DAC_HZ: u32 = 44_100;
 pub const PIT_INPUT_HZ: u32 = 1_193_182;
 pub const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 
-/// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
-/// fractional-dot accumulator `dots_owed`, the VGA's live dot-clock rate, and the
-/// active mode's `1 / clock_hz` factor. Pure free function: the one shared
-/// arithmetic core `Machine::predict_dots` (the real `advance_devices` step) and
-/// `MachineBus::predicted_beam` (the Slice 1 lazy port-read peek) both call, so a
-/// mid-batch prediction and the later real advance can never structurally diverge
-/// in rounding. Kept textually identical to the arithmetic it was extracted from
-/// (same operation order, same floor/subtract sequence) -- do not "simplify" this
-/// without re-checking both callers' bit-for-bit tests.
-fn predict_dots_core(clocks: u64, dots_owed: f64, dot_clock_hz: u64, inv_clock: f64) -> (u64, f64) {
-    let raw = dots_owed + clocks as f64 * dot_clock_hz as f64 * inv_clock;
-    let whole = raw.floor();
-    (whole as u64, raw - whole)
-}
-
-/// Whole device clocks elapsed for `clocks` CPU clocks at a PRE-COMBINED
-/// per-CPU-clock rate, given the live fractional carry. Pure free function: the
-/// one shared arithmetic core every real `advance_devices` fractional block
-/// (PIT, OPL, DSP) and the mid-batch lazy PIT peek (`MachineBus::
-/// elapsed_pit_clocks`, the P4a Task 2.3 lazy port 0x61 read), so a mid-batch
-/// prediction and the later real advance can never diverge in rounding.
-/// NOT interchangeable with `predict_dots_core` above
-/// even where the rates are mathematically equal: that formula multiplies
-/// `clocks * rate_hz as f64 * inv_clock` (two roundings, left-associated),
-/// while the PIT path has always multiplied by the pre-divided
-/// `pit_per_clock = PIT_INPUT_HZ / clock_hz` factor (one rounding) -- the two
-/// factorings floor-diverge at the IEEE-f64 level for reachable (carry, clocks)
-/// pairs, which is exactly the seam this extraction closes. Kept textually
-/// identical to the `advance_devices` arithmetic it was extracted from (carry
-/// plus product, floor, subtract) -- do not "simplify" this without re-checking
-/// all callers' bit-for-bit tests.
-pub(super) fn advance_fractional(carry: f64, clocks: u64, rate_per_clock: f64) -> (u64, f64) {
-    let raw = carry + clocks as f64 * rate_per_clock;
-    let whole = raw.floor();
-    (whole as u64, raw - whole)
-}
-
 impl Machine {
     /// Consume `secs` of emulated time for a device operation that blocks the
-    /// guest (a floppy seek/read). Advancing both the master clock and the devices
+    /// guest (a floppy seek/read). Advancing both the timeline and the devices
     /// by the same amount keeps timekeeping coupled, the way an instruction's own
-    /// clocks do. The guest clock jumps forward; the GUI's realtime pacing then
-    /// turns that jump into a visible wall-clock wait. `clock_hz` is the live mode
-    /// rate so the cost scales with the active GSW speed.
+    /// clocks do. Guest time jumps forward; the GUI's realtime pacing then
+    /// turns that jump into a visible wall-clock wait. Mechanical duration is
+    /// independent of the active GSW speed.
     pub(super) fn stall_for(&mut self, secs: f64) {
         if secs <= 0.0 {
             return;
         }
-        // Jump the master clock so the GUI's realtime pacing turns the access into
-        // a wall-clock wait. Keep the time-of-day RTC advancing (O(1)), but do NOT
-        // step the PIT/speaker/sound devices per clock: pushing a multi-million-
-        // clock jump through advance_devices is the O(n) spin the HLT wake path is
-        // careful to clamp, and the guest runs no instructions during the stall, so
-        // it cannot observe their intermediate state. They resume cleanly from the
-        // next instruction's own advance.
-        let extra = (secs * self.active_mode.clock_hz() as f64) as u64;
-        self.elapsed_clocks += extra;
-        self.io_stall_clocks += extra;
-        self.rtc_seconds += secs;
-        let whole = self.rtc_seconds.floor();
-        if whole >= 1.0 {
-            self.rtc.tick_seconds(whole as u64);
-            self.rtc_seconds -= whole;
-        }
+        // Floppy and optical mechanics still expose seconds as f64. Convert once
+        // at this seam, rounding up to the first causal master tick. Their seek
+        // models can move to integer durations without changing device advance.
+        let master_ticks = (secs * izarravm_core::MASTER_CLOCK_HZ as f64).ceil() as u64;
+        self.stall_for_master_ticks(master_ticks);
     }
 
+    pub(super) fn stall_for_micros(&mut self, micros: u64) {
+        let master_ticks = (u128::from(micros) * u128::from(izarravm_core::MASTER_CLOCK_HZ)
+            / 1_000_000)
+            .min(u128::from(u64::MAX)) as u64;
+        self.stall_for_master_ticks(master_ticks);
+    }
+
+    fn stall_for_master_ticks(&mut self, master_ticks: u64) {
+        let cpu_clocks = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
+        self.advance_master_time(master_ticks, true);
+        self.elapsed_clocks = self.elapsed_clocks.saturating_add(cpu_clocks);
+        self.io_stall_clocks = self.io_stall_clocks.saturating_add(cpu_clocks);
+    }
+
+    /// CPU-domain work and budget clocks. This compatibility metric changes unit
+    /// with the active mode and is not global guest time. Use `master_ticks` for
+    /// device deadlines and cross-mode timestamps.
     pub fn elapsed_clocks(&self) -> u64 {
         self.elapsed_clocks
     }
 
-    /// Cumulative guest clocks spent blocked on device I/O (floppy, later ATA)
-    /// rather than executing instructions. A realtime host subtracts these from
-    /// the clocks run when it gauges emulation speed, so a drive grind does not
-    /// read as the emulator running fast.
+    /// CPU-domain budget clocks spent blocked on device I/O. The fixed-time
+    /// equivalent is available from `io_stall_ticks`.
     pub fn io_stall_clocks(&self) -> u64 {
         self.io_stall_clocks
+    }
+
+    /// Monotonic global guest time in fixed 6.6 GHz master ticks. Unlike
+    /// `elapsed_clocks`, this value keeps one unit across live CPU-mode changes.
+    pub fn master_ticks(&self) -> u64 {
+        self.timeline.now_ticks()
+    }
+
+    pub fn io_stall_ticks(&self) -> u64 {
+        self.timeline.io_stall_ticks()
     }
 
     /// Scale a step's raw bus clocks by the active level's `bus_timing` factor,
@@ -105,29 +82,14 @@ impl Machine {
         scaled / u64::from(den)
     }
 
-    /// Advance time-based devices by `clocks` of CPU time, carrying fractional
-    /// remainders forward for the OPL timers (microseconds), the PIT counters,
-    /// and the Margo blit engine (nanoseconds).
-    pub(super) fn advance_devices(&mut self, clocks: u64) {
-        // The one shared fractional-advance formula (`advance_fractional`),
-        // same discipline as the PIT block below.
-        let (whole, remainder) =
-            advance_fractional(self.opl_micros, clocks, self.timing.micros_per_clock);
-        self.opl.advance_micros(whole);
-        self.opl_micros = remainder;
+    fn apply_device_advance(&mut self, advance: DeviceAdvance) {
+        self.opl.advance_micros(advance.microseconds);
 
         // The DSP reset-settle countdown advances with emulated time so a
         // detection routine's delay loop sees 0xAA become available. No lazy
         // twin yet; routed through the shared formula anyway so the last
-        // hand-synchronized copy of its arithmetic is gone. `Dsp::
-        // advance_micros` takes f64, and `whole as f64` reproduces the old
-        // directly-passed `.floor()` value exactly: the u64 round-trip is
-        // lossless for any integral value below 2^53 (~104 days of guest
-        // microseconds in a single advance, unreachable under the batch caps).
-        let (whole, remainder) =
-            advance_fractional(self.dsp_micros, clocks, self.timing.micros_per_clock);
-        self.dsp.advance_micros(whole as f64);
-        self.dsp_micros = remainder;
+        // hand-synchronized copy of its arithmetic is gone.
+        self.dsp.advance_micros(advance.microseconds);
 
         // DMA playback is clock-driven: accrue DSP sample phases per CPU clock
         // and, for each whole sample, advance the block and buffer the rendered
@@ -163,9 +125,7 @@ impl Machine {
         let dma8 = self.mixer.selected_dma_8();
         let dma16 = self.mixer.selected_dma_16();
         if self.dsp.is_playing() && rate > 0 {
-            self.dsp_sample_phase += clocks as f64 * rate as f64 * self.timing.inv_clock;
-            let n = self.dsp_sample_phase as usize;
-            self.dsp_sample_phase -= n as f64;
+            let n = advance.dsp_frames as usize;
             let Machine {
                 dsp, dma, memory, ..
             } = self;
@@ -332,9 +292,7 @@ impl Machine {
             // accumulation entirely instead of spinning ~8000 times/sec.
             let playing_at_valid_rate = programmed_rate > 0 && self.wss.is_playing();
             if wss_rate > 0 && (playing_at_valid_rate || autocal_active) {
-                self.wss_sample_phase += clocks as f64 * wss_rate as f64 * self.timing.inv_clock;
-                let n = self.wss_sample_phase as usize;
-                self.wss_sample_phase -= n as f64;
+                let n = advance.wss_frames as usize;
                 if n > 0 {
                     // HLE block buffer pre-fetch + feeding for WSS (Phase 4), with
                     // support for spanning multiple blocks within large n (refill
@@ -415,32 +373,19 @@ impl Machine {
         // independent of when the mixer drains samples. Pull in render_audio
         // consumes from the advanced position (frac for sub-frame continuity).
         // Fixed rate, no "programmed" variation.
-        if self.ide.device().playback().playing {
-            let cd_rate: u64 = DAC_HZ as u64; // 44100
-            self.cd_sample_phase += clocks as f64 * cd_rate as f64 * self.timing.inv_clock;
-            let n = self.cd_sample_phase as usize;
-            self.cd_sample_phase -= n as f64;
-            if n > 0 {
-                let frames = n / 588;
-                if frames > 0 {
-                    self.ide.device_mut().advance_play(frames as u32);
-                }
-            }
+        if self.ide.device().playback().playing && advance.cd_frames > 0 {
+            self.ide
+                .device_mut()
+                .advance_play(advance.cd_frames.min(u64::from(u32::MAX)) as u32);
         }
 
         let ch2_before = self.pit.channel_out(2);
-        let pit_fraction_before = self.pit_clocks;
-        // The one shared fractional-advance formula (`advance_fractional`): the
-        // lazy port 0x61 peek (`MachineBus::elapsed_pit_clocks`) calls the same
-        // function with the same batch-entry carry and pit_per_clock, so its
-        // mid-batch answer floors exactly where this real advance will.
-        let (whole, remainder) =
-            advance_fractional(self.pit_clocks, clocks, self.timing.pit_per_clock);
-        self.pit_clocks = remainder;
         self.speaker_transitions.clear();
-        let edges =
-            self.pit
-                .tick_recording_out_transitions(whole, 2, &mut self.speaker_transitions);
+        let edges = self.pit.tick_recording_out_transitions(
+            advance.pit_clocks,
+            2,
+            &mut self.speaker_transitions,
+        );
         // Per-edge forwarding, same multi-edge contract as the DSP loop above:
         // N channel-0 edges in one step issue N requests and the PIC's IRR
         // coalesces them into the one interrupt the guest can actually take.
@@ -450,20 +395,22 @@ impl Machine {
 
         // PC speaker: integrate channel-2 OUT transitions at PIT-clock precision,
         // then let the speaker model produce DAC-rate samples.
-        let seconds = clocks as f64 * self.timing.inv_clock;
+        let pit_phase = RatePhase::with_remainder(advance.pit_remainder_before);
         let transitions = self.speaker_transitions.iter().map(|event| {
             (
-                (event.tick as f64 - pit_fraction_before) / PIT_INPUT_HZ as f64,
+                pit_phase
+                    .ticks_until(event.tick, u64::from(PIT_INPUT_HZ))
+                    .unwrap_or(0),
                 event.level,
             )
         });
-        self.speaker.accumulate(seconds, ch2_before, transitions);
+        self.speaker
+            .accumulate(advance.master_ticks, ch2_before, transitions);
 
-        // Decay the keyboard-to-aux settle window (see KEYBOARD_TO_AUX_SETTLE_US
-        // in keyboard.rs) so a mouse byte held back by a just-read keyboard
+        // Decay the keyboard-to-aux settle window (see AUX_BYTE_SETTLE_TICKS in
+        // keyboard.rs) so a mouse byte held back by a just-read keyboard
         // scancode releases once real PS/2 wire time has actually elapsed.
-        self.keyboard
-            .advance_mouse_pacing(clocks as f64 * self.timing.micros_per_clock);
+        self.keyboard.advance_mouse_pacing(advance.master_ticks);
 
         // The take_irq latches below are single-edge bools, which is safe for
         // these devices even across a multi-sample step: each is a completion
@@ -521,13 +468,8 @@ impl Machine {
             self.cd_accesses += 1;
         }
 
-        // Advance the RTC: inv_clock is 1/clock_hz, so clocks * inv_clock is
-        // elapsed seconds. Fold whole seconds into the clock and carry the rest.
-        self.rtc_seconds += clocks as f64 * self.timing.inv_clock;
-        let whole_secs = self.rtc_seconds.floor();
-        if whole_secs >= 1.0 {
-            let secs = whole_secs as u64;
-            self.rtc.tick_seconds(secs);
+        if advance.rtc_seconds > 0 {
+            self.rtc.tick_seconds(advance.rtc_seconds);
             // Advance the clock first, then evaluate the RTC interrupt sources so
             // an enabled alarm compares against the new time. tick_interrupts
             // returns true only on the rising edge of IRQF (a guest that has not
@@ -535,72 +477,81 @@ impl Machine {
             // A single-edge bool is safe here: IRQF sources are seconds-scale
             // (far coarser than any batch) and the line stays asserted until the
             // Register C ack, so one advance cannot span two IRQ8 edges.
-            if self.rtc.tick_interrupts(secs) {
+            if self.rtc.tick_interrupts(advance.rtc_seconds) {
                 self.pic.request(8); // IRQ8: RTC periodic/alarm/update interrupt
             }
-            self.rtc_seconds -= whole_secs;
         }
 
-        self.margo_ns += clocks as f64 * self.timing.margo_ns_per_clock;
-        let whole_ns = self.margo_ns.floor();
-        self.margo.advance_busy(whole_ns as u64);
-        self.margo_ns -= whole_ns;
+        self.margo.advance_busy(advance.margo_nanoseconds);
 
-        // Distira has no dot-clock beam model of its own (see
-        // Distira::advance_frame_phase); feed it CPU clocks directly so
-        // SST_V_RETRACE/SST_HV_RETRACE/SST_STATUS's vsync bit make forward
-        // progress and a real vsync poll loop cannot hang.
-        self.distira.advance_frame_phase(clocks);
+        // Distira's 525-line scanout runs at 60 Hz in fixed guest time,
+        // independent of the active CPU mode.
+        self.distira.advance_frame_phase(advance.distira_lines);
 
-        let (whole, remainder) = self.predict_dots(clocks, self.vga_dots);
-        self.video.advance(whole);
-        self.vga_dots = remainder;
+        self.video.advance(advance.vga_dots);
 
         self.pump_pusher();
     }
 
-    /// Whole VGA dot-clocks elapsed for `clocks` CPU clocks, given the live
-    /// fractional-dot accumulator `dots_owed`. Pure: does not mutate `self`. The
-    /// SAME arithmetic (via `predict_dots_core`) both `advance_devices` (the real,
-    /// mutating step above) and the Slice 1 lazy port-read peek
-    /// (`MachineBus::predicted_beam`) apply, so the two paths cannot structurally
-    /// diverge: "no time travel" (a lazy read predicting state the later real
-    /// advance would contradict) becomes a property of sharing one implementation,
-    /// not an invariant maintained by hand across two call sites.
-    /// See dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 0.3/1.2.
-    pub(super) fn predict_dots(&self, clocks: u64, dots_owed: f64) -> (u64, f64) {
-        predict_dots_core(
-            clocks,
-            dots_owed,
-            self.video.dot_clock_hz(),
-            self.timing.inv_clock,
-        )
+    fn device_rates(&mut self) -> DeviceRates {
+        self.dsp.set_sbpro_stereo(self.mixer.sbpro_stereo());
+        let programmed_wss = self.wss.output_frame_rate();
+        DeviceRates {
+            dsp_hz: if self.dsp.is_playing() {
+                u64::from(self.dsp.output_frame_rate())
+            } else {
+                0
+            },
+            wss_hz: if self.wss_enabled && (self.wss.is_playing() || self.wss.autocal_active()) {
+                u64::from(if programmed_wss > 0 {
+                    programmed_wss
+                } else {
+                    WSS_AUTOCAL_FALLBACK_HZ
+                })
+            } else {
+                0
+            },
+            cd_playing: self.ide.device().playback().playing,
+            vga_dot_hz: self.video.dot_clock_hz(),
+        }
     }
 
-    /// Drive the internal per-clock device advance (PIT, OPL, DSP reset-settle,
-    /// and the clock-driven DMA playback producer). Exposed so a host test or a
-    /// frontend can flush device time without running the CPU, and so the DMA
-    /// host goldens can advance the clock that now paces playback. Does NOT
-    /// advance the master clock; see `advance_wall_clocks` for the variant that
-    /// moves both.
+    fn advance_master_time(&mut self, master_ticks: u64, io_stall: bool) {
+        let rates = self.device_rates();
+        let advance = if io_stall {
+            self.timeline.advance_io_stall_ticks(master_ticks, rates)
+        } else {
+            self.timeline.advance_master_ticks(master_ticks, rates)
+        };
+        self.apply_device_advance(advance);
+    }
+
+    pub(super) fn advance_cpu_work(&mut self, clocks: u64) {
+        let rates = self.device_rates();
+        let advance = self.timeline.advance_cpu_clocks(clocks, rates);
+        self.apply_device_advance(advance);
+        self.elapsed_clocks = self.elapsed_clocks.saturating_add(clocks);
+    }
+
+    /// Advance global guest time by active-mode CPU clocks without executing CPU
+    /// work. Used for wall shortfall, halted scanout, and focused device tests.
     pub fn advance_devices_clocks(&mut self, clocks: u64) {
-        self.advance_devices(clocks);
+        let master_ticks = self.timeline.master_ticks_for_cpu_clocks(clocks);
+        self.advance_devices_ticks(master_ticks);
     }
 
-    /// Advance device time AND the master clock by `clocks` without running the
-    /// CPU. Used by the GUI in the Approximate class when the host could not
-    /// execute the full wall-clock budget: guest time keeps tracking wall time so
-    /// audio/PIT hold realtime; the CPU simply retires fewer instructions per
-    /// guest second (the DOSBox-style degradation). Never called in the Accurate
-    /// class. Unconditional: prefer `advance_wall_shortfall`, which stops at VGA
-    /// vertical-retrace start edges so a polling guest can observe them; this
-    /// variant is the escape hatch behind the caller's defensive edge-stop cap.
-    pub fn advance_wall_clocks(&mut self, clocks: u64) {
-        self.advance_devices(clocks);
-        self.elapsed_clocks += clocks;
+    /// Advance devices and global guest time by a fixed master-tick duration
+    /// without executing CPU work.
+    pub fn advance_devices_ticks(&mut self, master_ticks: u64) {
+        self.advance_master_time(master_ticks, false);
     }
 
-    /// Advance device time AND the master clock by AT MOST `clocks` without
+    #[cfg(test)]
+    pub(super) fn advance_devices(&mut self, clocks: u64) {
+        self.advance_devices_clocks(clocks);
+    }
+
+    /// Advance device time and the timeline by at most `clocks` without
     /// running the CPU, and return the clocks actually consumed.
     ///
     /// Contract: if the next VGA vertical-retrace START edge falls strictly
@@ -634,30 +585,49 @@ impl Machine {
             Some(edge_clocks) => edge_clocks.min(clocks),
             None => clocks,
         };
-        self.advance_wall_clocks(consume);
+        self.advance_devices_clocks(consume);
+        consume
+    }
+
+    /// Master-tick form of `advance_wall_shortfall`. This is the pacing seam:
+    /// a live CPU-mode switch cannot change the unit of its budget or result.
+    pub fn advance_wall_shortfall_ticks(&mut self, master_ticks: u64) -> u64 {
+        let consume = match self.master_ticks_to_vretrace_start() {
+            Some(edge_ticks) => edge_ticks.max(1).min(master_ticks),
+            None => master_ticks,
+        };
+        self.advance_devices_ticks(consume);
         consume
     }
 
     /// Clocks of device time until the VGA beam reaches the next vertical-
-    /// retrace start edge, converted from beam dots at the live TimingFactors
-    /// and accounting for the fractional `vga_dots` accumulator: delivering the
-    /// returned count to `advance_devices` moves the beam onto (or a dot or two
-    /// past) the edge. `None` when the CRTC has no usable frame geometry.
+    /// retrace start edge, converted from beam dots through the timeline phase.
+    /// Delivering the returned count to `advance_devices_clocks` moves the beam
+    /// onto (or a dot or two past) the edge. `None` means the CRTC has no usable
+    /// frame geometry.
     fn clocks_to_vretrace_start(&self) -> Option<u64> {
         let edge_dots = self.video.dots_until_vretrace_start()?;
-        let dots_per_clock = self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
-        if dots_per_clock <= 0.0 {
-            return None;
-        }
-        let needed = ((edge_dots as f64 - self.vga_dots) / dots_per_clock).ceil();
-        Some((needed as u64).max(1))
+        self.timeline.cpu_clocks_until(
+            timeline::DeviceClock::Vga,
+            edge_dots,
+            self.video.dot_clock_hz(),
+        )
+    }
+
+    fn master_ticks_to_vretrace_start(&self) -> Option<u64> {
+        let edge_dots = self.video.dots_until_vretrace_start()?;
+        self.timeline.master_ticks_until(
+            timeline::DeviceClock::Vga,
+            edge_dots,
+            self.video.dot_clock_hz(),
+        )
     }
 
     /// Advance the DSP reset-settle clock by `micros` microseconds. The run loop
     /// drives this from CPU clocks in advance_devices; this exposes it directly
     /// so a reset-detection golden can settle the DSP without running the CPU.
     pub fn advance_dsp_micros(&mut self, micros: u64) {
-        self.dsp.advance_micros(micros as f64);
+        self.dsp.advance_micros(micros);
     }
 
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
@@ -683,34 +653,37 @@ impl Machine {
     /// unmasked/deliverable; the result is the soonest of the applicable wakes,
     /// clamped to the deadline and to at least one clock so the run loop always
     /// makes progress.
-    pub(super) fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
+    pub(super) fn next_timer_wake(&self, deadline_ticks: u64) -> Option<u64> {
         if !self.cpu.interrupts_enabled() {
             return None;
         }
-        let remaining = deadline.saturating_sub(self.elapsed_clocks);
-        if remaining == 0 {
+        let remaining_ticks = deadline_ticks.saturating_sub(self.timeline.now_ticks());
+        if remaining_ticks == 0 {
             return None;
         }
+        let remaining = self
+            .timeline
+            .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
+            .max(1);
         let pit_wake = if self.pic.irq0_unmasked() {
-            self.clocks_until_timer0_irq().map(|pit_delta| {
-                ((u128::from(pit_delta) * u128::from(self.active_mode.clock_hz()))
-                    .div_ceil(u128::from(PIT_INPUT_HZ))) as u64
+            self.clocks_until_timer0_irq().and_then(|pit_delta| {
+                self.timeline.cpu_clocks_until(
+                    timeline::DeviceClock::Pit,
+                    pit_delta,
+                    u64::from(PIT_INPUT_HZ),
+                )
             })
         } else {
             None
         };
         let dsp_wake = if self.pic.deliverable(self.mixer.selected_irq()) {
-            // clocks_until_next_irq reasons in block-counter units (bytes for
-            // 8-bit, words for 16-bit), so it must be fed the rate at which that
-            // counter drains -- the raw byte/word rate -- not the per-channel
-            // output frame rate. In SB Pro 8-bit stereo the counter ticks two
-            // bytes per frame at the full byte rate (rate_hz), so passing
-            // output_frame_rate() (= rate_hz/2) would over-estimate the wake by
-            // 2x. rate_hz() is exact for every 8-bit path and keeps the
-            // documented conservative estimate for 16-bit stereo (counter in
-            // words, drained at 2x the per-channel frame rate).
-            self.dsp
-                .clocks_until_next_irq(self.dsp.rate_hz(), self.active_mode.clock_hz())
+            self.dsp.frames_until_next_irq().and_then(|frames| {
+                self.timeline.cpu_clocks_until(
+                    timeline::DeviceClock::Dsp,
+                    frames,
+                    u64::from(self.dsp.output_frame_rate()),
+                )
+            })
         } else {
             None
         };
@@ -719,12 +692,17 @@ impl Machine {
         // estimator is fed the frame rate directly (no byte/word-counter scaling
         // like the SB16's). Considered only when that line can actually deliver
         // (`deliverable` also requires the master IR2 cascade pin for a slave line
-        // 9/10/11) and the codec is enabled; clocks_until_next_irq also returns
+        // 9/10/11) and the codec is enabled; frames_until_next_irq also returns
         // None when IEN is clear (the underflow then sets only the sticky Status
         // bit, no pin edge).
         let wss_wake = if self.wss_enabled && self.pic.deliverable(self.wss_irq) {
-            self.wss
-                .clocks_until_next_irq(self.wss.rate_hz(), self.active_mode.clock_hz())
+            self.wss.frames_until_next_irq().and_then(|frames| {
+                self.timeline.cpu_clocks_until(
+                    timeline::DeviceClock::Wss,
+                    frames,
+                    u64::from(self.wss.output_frame_rate()),
+                )
+            })
         } else {
             None
         };
@@ -733,79 +711,87 @@ impl Machine {
         Some(wake.max(1).min(remaining))
     }
 
-    /// The Approximate-class (486/586) batch cap: CPU clocks until the next due
-    /// device event, instead of the Accurate class's one-DAC-sample lockstep.
+    /// CPU clocks until the next due device event.
     ///
-    /// Contract. Interrupts are serviced at batch entry and devices advance at
-    /// batch end, so this cap is what bounds Approximate-class IRQ latency:
-    /// - the next PIT channel 0 (IRQ0) or channel 2 (speaker/game timing) OUT
-    ///   rising edge ends the batch at (within a PIT tick of) its instant, so
-    ///   timer-driven cadences hold;
-    /// - the next DSP/WSS/ADPCM block-IRQ edge does the same for audio blocks,
-    ///   which also keeps one guest interrupt per block edge (see the
-    ///   multi-edge contract in advance_devices);
-    /// - a ~1 ms ceiling (clock_hz / 1000) bounds the latency of everything
-    ///   else (a line masked now and unmasked later, a declined estimator);
-    /// - the DAC-sample floor means no batch is ever SHORTER than the Accurate
-    ///   cap: a sub-sample edge estimate degrades to exactly the Accurate
-    ///   class's up-to-one-sample delivery latency instead of shrinking
-    ///   batches, and a degenerate estimator can never stall progress.
+    /// Interrupts are serviced at batch entry and devices advance at batch end,
+    /// so PIT channel 0/2 edges and DSP/WSS block edges shorten the batch to the
+    /// first causal CPU clock in every CPU mode. Fast modes have a 1 ms fallback;
+    /// the 386 modes keep a finer DAC-period fallback. A known edge may be
+    /// earlier than either fallback.
     ///
     /// PIT channel 1 is EXCLUDED deliberately: the power-on DRAM-refresh
     /// heartbeat (mode 2, reload 18, ~15 us) runs forever, so its term would
-    /// bind every batch below even the Accurate cap and cancel this fast path
+    /// bind every batch below the 386 fallback and cancel this path
     /// outright. Its OUT is only guest-visible through a port 0x61 read, which
     /// ends the batch anyway. PIC masking is likewise ignored on purpose: an
     /// edge on a masked line latches IRR at the same advance either way, so the
     /// per-batch mask query buys no alignment.
     ///
-    /// The PIT tick -> CPU clock conversion ignores the pit_clocks fractional
-    /// accumulator (up to one PIT tick of skew; the same div_ceil idiom
-    /// next_timer_wake already uses for the HLT wake) and the audio estimators
-    /// are conservative for 16-bit stereo; both sit inside this class's license
-    /// (results bit-exact, time approximate). Device-time exactness within a
-    /// batch is unchanged: devices see the exact batch clock total, the speaker
-    /// integrates PIT transitions sub-step, and the sample-phase producers emit
-    /// exactly the frames the elapsed clocks call for, whatever the split.
-    pub(super) fn approx_batch_cap(&self, remaining: u64) -> u64 {
+    /// Timeline phase is included in every conversion, so splitting execution
+    /// into different batches does not move an event deadline.
+    pub(super) fn event_batch_cap(&self, remaining: u64) -> u64 {
         let clock_hz = self.active_mode.clock_hz();
-        // The ~1 ms latency ceiling.
-        let mut cap = (clock_hz / 1000).max(1);
+        let mut cap = if self.active_mode.uses_approximate_timing() {
+            clock_hz / 1000
+        } else {
+            clock_hz / u64::from(DAC_HZ)
+        }
+        .max(1);
         // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
         // speaker/GATE timing games poll. (Channel 1: see above.)
         for channel in [0usize, 2] {
             if let Some(ticks) = self.pit.clocks_until_out_rise(channel) {
-                let clocks = ((u128::from(ticks) * u128::from(clock_hz))
-                    .div_ceil(u128::from(PIT_INPUT_HZ))) as u64;
-                cap = cap.min(clocks);
+                if let Some(clocks) = self.timeline.cpu_clocks_until(
+                    timeline::DeviceClock::Pit,
+                    ticks,
+                    u64::from(PIT_INPUT_HZ),
+                ) {
+                    cap = cap.min(clocks);
+                }
             }
         }
-        // Next audio block-IRQ edge. The DSP/WSS/ADPCM rates mirror the wake
-        // estimators in next_timer_wake (the DSP block counter drains at the
-        // raw byte/word rate, rate_hz; the WSS counter at its frame rate).
-        if let Some(clocks) = self.dsp.clocks_until_next_irq(self.dsp.rate_hz(), clock_hz) {
-            cap = cap.min(clocks);
-        }
-        if self.wss_enabled
-            && let Some(clocks) = self.wss.clocks_until_next_irq(self.wss.rate_hz(), clock_hz)
+        // Next audio block-IRQ edge. Both counters are expressed in output
+        // frames, including stereo DMA-unit accounting inside the DSP.
+        if let Some(frames) = self.dsp.frames_until_next_irq()
+            && let Some(clocks) = self.timeline.cpu_clocks_until(
+                timeline::DeviceClock::Dsp,
+                frames,
+                u64::from(self.dsp.output_frame_rate()),
+            )
         {
             cap = cap.min(clocks);
         }
-        cap.max(self.timing.clocks_per_audio_sample).min(remaining)
+        if self.wss_enabled
+            && let Some(frames) = self.wss.frames_until_next_irq()
+            && let Some(clocks) = self.timeline.cpu_clocks_until(
+                timeline::DeviceClock::Wss,
+                frames,
+                u64::from(self.wss.output_frame_rate()),
+            )
+        {
+            cap = cap.min(clocks);
+        }
+        cap.max(1).min(remaining)
     }
 }
 
 impl MachineBus<'_> {
+    pub(super) fn guest_tick_now(&self) -> u64 {
+        self.master_ticks_at_batch_start.saturating_add(
+            self.timeline_at_batch_start
+                .master_ticks_for_cpu_clocks(self.in_batch_clocks()),
+        )
+    }
+
     /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
     /// batch's accumulated core clocks plus the bus clocks recorded into `trace`
     /// since batch entry add up to -- WITHOUT mutating any device state (`video`,
     /// `vga_dots`, `bus_rem` on the owning `Machine` are all untouched; `&self`
     /// makes that compiler-enforced). This is the P4a Slice 1 lazy port-read peek
-    /// (dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md Task 1.2); wiring
-    /// it into `read_io` is Task 1.3.
+    /// used by time-dependent port reads.
     ///
     /// Units combined, matching exactly what the real batch-end step in
-    /// `run_until_clock`/`advance_devices` will later consume:
+    /// `run_until_tick`/`advance_cpu_work` will later consume:
     /// - the core portion, BATCH-scoped: `prior_runs_core_clocks` (the
     ///   interrupt-service charge plus every completed straight-line run of this
     ///   batch, republished by the batch loop before each run) plus
@@ -842,12 +828,9 @@ impl MachineBus<'_> {
     /// diverge from what the later real advance will show for the same clocks.
     pub(super) fn predicted_beam(&self) -> u64 {
         let in_batch_clocks = self.in_batch_clocks();
-        let (whole_dots, _remainder) = predict_dots_core(
-            in_batch_clocks,
-            self.vga_dots_at_batch_start,
-            self.video.dot_clock_hz(),
-            self.inv_clock_at_batch_start,
-        );
+        let (_, whole_dots) = self
+            .timeline_at_batch_start
+            .preview_cpu_clocks(in_batch_clocks, self.video.dot_clock_hz());
         let frame = self.video.frame_dots();
         if frame == 0 {
             return self.beam_at_batch_start; // guard: un-programmed CRTC, mirrors Vga::advance
@@ -897,12 +880,9 @@ impl MachineBus<'_> {
     /// time travel, this predicts exactly what a real `advance_devices` at T
     /// followed by a read would produce.
     pub(super) fn elapsed_pit_clocks(&self) -> u64 {
-        let (elapsed_pit_clocks, _remainder) = advance_fractional(
-            self.pit_clocks_at_batch_start,
-            self.in_batch_clocks(),
-            self.pit_per_clock_at_batch_start,
-        );
-        elapsed_pit_clocks
+        self.timeline_at_batch_start
+            .preview_cpu_clocks(self.in_batch_clocks(), self.video.dot_clock_hz())
+            .0
     }
 
     /// Peek `channel`'s live PIT OUT level "now" -- mid-batch, WITHOUT stepping

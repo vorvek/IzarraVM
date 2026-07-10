@@ -692,19 +692,15 @@ fn format_dispatch_is_format_sensitive_with_sign_bearing_codes() {
 }
 
 #[test]
-fn clocks_until_next_irq_tracks_count_and_gates() {
+fn frames_until_next_irq_tracks_count_and_gates() {
     // Idle codec: nothing can wake the CPU.
     let mut dev = Ad1848::default();
-    assert_eq!(dev.clocks_until_next_irq(48_000, 1_000_000), None);
+    assert_eq!(dev.frames_until_next_irq(), None);
 
     // Armed 8-bit mono with IEN set, base count 4 -> N+1 = 5 frames to the
-    // first underflow. At rate == clock_hz that is exactly 5 clocks.
+    // first underflow.
     arm_8bit_mono(&mut dev, 4);
-    assert_eq!(dev.clocks_until_next_irq(1_000, 1_000), Some(5));
-    // div_ceil: 5 frames at 1000 Hz over a 10_000 Hz clock -> 50 clocks.
-    assert_eq!(dev.clocks_until_next_irq(1_000, 10_000), Some(50));
-    // Invalid rate (the unsupported XTAL1 cells decode to 0) -> None.
-    assert_eq!(dev.clocks_until_next_irq(0, 1_000), None);
+    assert_eq!(dev.frames_until_next_irq(), Some(5));
 
     // Same arming but with IEN clear: the external pin never forwards, so no
     // wake. arm_format leaves IEN set, so write I10 back to 0 explicitly.
@@ -712,7 +708,7 @@ fn clocks_until_next_irq_tracks_count_and_gates() {
     arm_8bit_mono(&mut dev, 4);
     write_indirect(&mut dev, IDX_PIN_CONTROL as u8, 0);
     assert_eq!(
-        dev.clocks_until_next_irq(1_000, 1_000),
+        dev.frames_until_next_irq(),
         None,
         "IEN clear cannot wake the CPU"
     );
@@ -728,14 +724,14 @@ fn clocks_until_next_irq_tracks_count_and_gates() {
     let _ = dev.render_frame(|| Some(0x80)); // underflow: INT set, count held
     assert!(dev.take_irq(), "the underflow forwarded the first edge");
     assert_eq!(
-        dev.clocks_until_next_irq(1_000, 1_000),
+        dev.frames_until_next_irq(),
         None,
         "TRD + sticky INT freezes the count, so no further wake is generated"
     );
     // Acking INT (R2 write) clears the gate; the estimator returns finite again.
     dev.write_port(R2_STATUS, 0x00);
     assert!(
-        dev.clocks_until_next_irq(1_000, 1_000).is_some(),
+        dev.frames_until_next_irq().is_some(),
         "acking INT releases the TRD gate so the codec can wake again"
     );
 }

@@ -56,10 +56,10 @@ fn channel_messages_keep_running_status_and_timestamp_completion() {
 
     let first = mpu.take_message().expect("first note");
     assert_eq!(first.bytes, [0x90, 60, 100]);
-    assert_eq!(first.guest_clock, 3);
+    assert_eq!(first.guest_tick, 3);
     let second = mpu.take_message().expect("running-status note");
     assert_eq!(second.bytes, [0x90, 61, 0]);
-    assert_eq!(second.guest_clock, 5);
+    assert_eq!(second.guest_tick, 5);
 }
 
 #[test]

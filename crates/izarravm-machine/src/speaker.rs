@@ -6,11 +6,10 @@ use std::collections::VecDeque;
 
 /// Output level for an enabled membrane. Audible, with headroom against the OPL
 /// and DSP sums. Bipolar so a toggling square wave carries no DC bias.
-const SPEAKER_AMPLITUDE: f64 = 8000.0;
+const SPEAKER_AMPLITUDE: i64 = 8000;
 
 /// The host DAC rate the ring is produced at.
 const DAC_HZ: u32 = 44_100;
-const SAMPLE_SECONDS: f64 = 1.0 / DAC_HZ as f64;
 
 // Voicing of the physical cone. A real case-mounted PC speaker is not flat: it
 // has a low-mid body resonance that gives it warmth and presence, and a soft top
@@ -190,11 +189,12 @@ const RING_CAP: usize = 2 * DAC_HZ as usize;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Speaker {
-    data_enable: bool,   // port 0x61 bit 1
-    control_bits: u8,    // low bits last written to 0x61, for readback (bits 0,1)
-    ch2_out: bool,       // current PIT channel-2 OUT level
-    sample_elapsed: f64, // seconds accumulated into the current DAC sample
-    sample_area: f64,    // target-level integral for the current DAC sample
+    data_enable: bool, // port 0x61 bit 1
+    control_bits: u8,  // low bits last written to 0x61, for readback (bits 0,1)
+    ch2_out: bool,     // current PIT channel-2 OUT level
+    sample_phase: u64,
+    sample_ticks: u64,
+    sample_area: i128,
     body: Biquad,        // cone body resonance (low-mid warmth)
     top: Biquad,         // top rolloff (tames the tinny buzz)
     case: BoxReverb,     // "inside the case" early-reflection ambience
@@ -209,8 +209,9 @@ impl Default for Speaker {
             data_enable: false,
             control_bits: 0,
             ch2_out: false,
-            sample_elapsed: 0.0,
-            sample_area: 0.0,
+            sample_phase: 0,
+            sample_ticks: 0,
+            sample_area: 0,
             body: Biquad::peaking(fs, BODY_HZ, BODY_Q, BODY_GAIN_DB),
             top: Biquad::low_pass(fs, TOP_HZ, TOP_Q),
             case: BoxReverb::new(fs),
@@ -245,18 +246,18 @@ impl Speaker {
 
     /// Advance emulated time, integrating PIT channel-2 transitions at their
     /// sub-sample times before shaping the result through the cone voicing.
-    pub(crate) fn accumulate<I>(&mut self, seconds: f64, initial_ch2_out: bool, transitions: I)
+    pub(crate) fn accumulate<I>(&mut self, master_ticks: u64, initial_ch2_out: bool, transitions: I)
     where
-        I: IntoIterator<Item = (f64, bool)>,
+        I: IntoIterator<Item = (u64, bool)>,
     {
-        if seconds <= 0.0 {
+        if master_ticks == 0 {
             return;
         }
 
         self.ch2_out = initial_ch2_out;
-        let mut cursor = 0.0;
+        let mut cursor = 0;
         for (at, level) in transitions {
-            let at = at.clamp(0.0, seconds);
+            let at = at.min(master_ticks);
             if at > cursor {
                 self.advance_segment(at - cursor);
                 cursor = at;
@@ -264,14 +265,14 @@ impl Speaker {
             self.ch2_out = level;
         }
 
-        if seconds > cursor {
-            self.advance_segment(seconds - cursor);
+        if master_ticks > cursor {
+            self.advance_segment(master_ticks - cursor);
         }
     }
 
-    fn target_level(&self) -> f64 {
+    fn target_level(&self) -> i64 {
         if !self.data_enable {
-            0.0
+            0
         } else if self.ch2_out {
             SPEAKER_AMPLITUDE
         } else {
@@ -279,24 +280,28 @@ impl Speaker {
         }
     }
 
-    fn advance_segment(&mut self, mut seconds: f64) {
-        while seconds > f64::EPSILON {
-            let remaining = SAMPLE_SECONDS - self.sample_elapsed;
-            let step = seconds.min(remaining);
-            self.sample_area += self.target_level() * step;
-            self.sample_elapsed += step;
-            seconds -= step;
+    fn advance_segment(&mut self, mut master_ticks: u64) {
+        while master_ticks > 0 {
+            let until_sample = (u128::from(izarravm_core::MASTER_CLOCK_HZ)
+                - u128::from(self.sample_phase))
+            .div_ceil(u128::from(DAC_HZ)) as u64;
+            let step = master_ticks.min(until_sample.max(1));
+            self.sample_area += i128::from(self.target_level()) * i128::from(step);
+            self.sample_ticks += step;
+            let phase = u128::from(self.sample_phase) + u128::from(step) * u128::from(DAC_HZ);
+            self.sample_phase = (phase % u128::from(izarravm_core::MASTER_CLOCK_HZ)) as u64;
+            master_ticks -= step;
 
-            if self.sample_elapsed + f64::EPSILON >= SAMPLE_SECONDS {
+            if phase >= u128::from(izarravm_core::MASTER_CLOCK_HZ) {
                 self.emit_sample();
-                self.sample_elapsed = 0.0;
-                self.sample_area = 0.0;
+                self.sample_ticks = 0;
+                self.sample_area = 0;
             }
         }
     }
 
     fn emit_sample(&mut self) {
-        let avg_target = self.sample_area / SAMPLE_SECONDS;
+        let avg_target = self.sample_area as f64 / self.sample_ticks.max(1) as f64;
         // Shape the box-averaged square through the cone voicing (low-mid body
         // resonance, then top rolloff), then place it inside the case.
         let shaped = self.top.process(self.body.process(avg_target));

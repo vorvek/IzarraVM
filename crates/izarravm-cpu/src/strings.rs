@@ -222,7 +222,13 @@ impl CpuGsw {
             StringOp::Outs => {
                 // OUTS: port[DX] <- [DS:SI] (segment overridable).
                 let value = self.read_string_src(bus, prefixes, address_size, width)?;
-                bus.write_io(self.read_gpr16(2), width, value, self.is_ring0_protected())?;
+                bus.write_io(
+                    self.read_gpr16(2),
+                    width,
+                    value,
+                    self.core_clocks_so_far,
+                    self.is_ring0_protected(),
+                )?;
                 self.adjust_index_register(6, address_size, bytes);
             }
         }

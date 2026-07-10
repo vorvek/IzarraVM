@@ -2190,25 +2190,24 @@ fn int10_1b_reports_ega_graphics_page_count() {
 }
 
 #[test]
-fn timing_factors_track_the_active_mode() {
+fn timeline_tracks_the_active_mode_without_reinterpreting_elapsed_time() {
     let mut machine = Machine::new(
         MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
         vec![0u8; BIOS_ROM_SIZE],
     )
     .unwrap();
-    // Boot mode is 386 @ 22 MHz: the PIT factor is PIT_INPUT_HZ / 22 MHz.
     assert_eq!(machine.active_mode(), GswMode::Gsw386);
-    assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 22_000_000.0).abs() < 1e-9);
-    // Switching to 586 @ 200 MHz recomputes the factor.
+    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 300);
+    machine.advance_devices_clocks(1);
+    let before = machine.master_ticks();
     machine.set_mode(GswMode::Gsw586);
     assert_eq!(machine.active_mode(), GswMode::Gsw586);
-    assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 200_000_000.0).abs() < 1e-9);
-    // 386-slow is exactly one third of 22 MHz.
+    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 33);
+    assert_eq!(machine.master_ticks(), before);
     machine.set_mode(GswMode::Gsw386Slow);
     assert_eq!(machine.active_mode(), GswMode::Gsw386Slow);
-    assert!(
-        (machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / (22_000_000.0 / 3.0)).abs() < 1e-9
-    );
+    assert_eq!(machine.timeline.ticks_per_cpu_clock(), 900);
+    assert_eq!(machine.master_ticks(), before);
 }
 
 #[test]

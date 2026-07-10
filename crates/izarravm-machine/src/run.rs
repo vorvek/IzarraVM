@@ -134,24 +134,39 @@ impl Machine {
     }
 
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
-        let deadline = self.elapsed_clocks.saturating_add(cycles);
-        self.run_until_clock(deadline, cycles)
+        let deadline_ticks = self
+            .timeline
+            .now_ticks()
+            .saturating_add(self.timeline.master_ticks_for_cpu_clocks(cycles));
+        self.run_until_tick(deadline_ticks, cycles)
+    }
+
+    /// Run against a fixed master-tick deadline. The CPU-clock count reported
+    /// in `CycleLimit` is the causal quantum selected at this call boundary;
+    /// live mode changes do not reinterpret the deadline.
+    pub fn run_master_ticks(&mut self, master_ticks: u64) -> Result<StopReason, MachineError> {
+        let requested = self.timeline.cpu_clocks_for_master_ticks_ceil(master_ticks);
+        let deadline_ticks = self.timeline.now_ticks().saturating_add(master_ticks);
+        self.run_until_tick(deadline_ticks, requested)
     }
 
     pub fn run_until_halt_or_cycles(
         &mut self,
         max_cycles: u64,
     ) -> Result<StopReason, MachineError> {
-        let deadline = self.elapsed_clocks.saturating_add(max_cycles);
-        self.run_until_clock(deadline, max_cycles)
+        let deadline_ticks = self
+            .timeline
+            .now_ticks()
+            .saturating_add(self.timeline.master_ticks_for_cpu_clocks(max_cycles));
+        self.run_until_tick(deadline_ticks, max_cycles)
     }
 
-    fn run_until_clock(
+    fn run_until_tick(
         &mut self,
-        deadline: u64,
+        deadline_ticks: u64,
         requested: u64,
     ) -> Result<StopReason, MachineError> {
-        while self.elapsed_clocks < deadline {
+        while self.timeline.now_ticks() < deadline_ticks {
             if self.direct_map_changed {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
@@ -172,14 +187,11 @@ impl Machine {
             // Task 1.1). Captured here, before the fields below are moved into the
             // destructure, so they reflect live machine state at the moment this
             // batch's MachineBus is built (the one that matters for Slice 1).
-            let elapsed_clocks_at_batch_start = self.elapsed_clocks;
-            let vga_dots_at_batch_start = self.vga_dots;
+            let timeline_at_batch_start = self.timeline;
+            let master_ticks_at_batch_start = self.timeline.now_ticks();
             let beam_at_batch_start = self.video.beam_dots();
             let trace_elapsed_at_batch_start = trace_before;
             let bus_rem_at_batch_start = self.bus_rem;
-            let inv_clock_at_batch_start = self.timing.inv_clock;
-            let pit_clocks_at_batch_start = self.pit_clocks;
-            let pit_per_clock_at_batch_start = self.timing.pit_per_clock;
             // bus_timing's (num, den), read from the same authoritative CPU mode
             // that scale_bus uses. Machine's active_mode copy exists for Lotura
             // register readback and is updated in the same set_mode call.
@@ -199,26 +211,17 @@ impl Machine {
             // model (research item 2.3): it drops the per-instruction bus rebuild
             // + 14-device fan-out that dominated the old loop.
             //
-            // The batch cap is per timing class:
-            // - Accurate (386): exactly one DAC sample of CPU time, so the
-            //   per-clock fine-samplers stay in lockstep. BYTE-IDENTICAL
-            //   contract (bench cyc/iter + aux, boot suite, device cadence):
-            //   do not touch.
-            // - Approximate (486/586): up to the next due device event, bounded
-            //   by a ~1 ms latency ceiling and floored at the DAC-sample cap;
-            //   approx_batch_cap holds the full contract. Batch splits move the
-            //   f64 device accumulators through different partial sums, so
-            //   device event instants may microshift against the Accurate
-            //   splitting; that is licensed in this class (results stay
-            //   bit-exact, time is approximate). Computed once
-            //   per batch entry: the run loop sits on a measured code-layout
-            //   cliff, so nothing here may run per instruction.
-            let remaining = deadline - self.elapsed_clocks;
-            let cap = if self.active_mode.uses_approximate_timing() {
-                self.approx_batch_cap(remaining)
-            } else {
-                self.timing.clocks_per_audio_sample.min(remaining)
-            };
+            // End every batch at the next known PIT, DSP, or WSS deadline. A
+            // 1 ms fallback bounds the fast modes; a DAC-period fallback keeps
+            // the 386 paths fine-grained. Either may be shortened by an earlier
+            // event. Compute this once at batch entry because the run loop is
+            // layout-sensitive.
+            let remaining_ticks = deadline_ticks - self.timeline.now_ticks();
+            let remaining = self
+                .timeline
+                .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
+                .max(1);
+            let cap = self.event_batch_cap(remaining);
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -326,16 +329,13 @@ impl Machine {
                     direct_map_changed,
                     core_clocks_so_far: 0,
                     prior_runs_core_clocks: 0,
-                    elapsed_clocks_at_batch_start,
-                    vga_dots_at_batch_start,
+                    timeline_at_batch_start,
+                    master_ticks_at_batch_start,
                     beam_at_batch_start,
                     trace_elapsed_at_batch_start,
                     bus_rem_at_batch_start,
-                    inv_clock_at_batch_start,
                     bus_num_at_batch_start,
                     bus_den_at_batch_start,
-                    pit_clocks_at_batch_start,
-                    pit_per_clock_at_batch_start,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -390,19 +390,10 @@ impl Machine {
                         // timer ISR then loses ticks that a real PIT delivers
                         // (each edge interrupts long before the next at any
                         // realistic rate). Count the in-batch SCALED bus clocks
-                        // toward the cap in the Approximate class, checked at
-                        // loop top so an over-budget batch does not enter one
-                        // more run. APPROXIMATE ONLY: the Accurate class (frozen
-                        // 386) must keep not just the core-only comparison
-                        // but the historical batch GEOMETRY - the old post-run
-                        // check meant every batch executed at least one
-                        // instruction even when the interrupt-service charge
-                        // alone met the cap, and review showed the loop-top
-                        // relocation changes that (a gate-invisible but real
-                        // frozen-class delta). So Accurate skips this break and
-                        // relies solely on the restored post-run check below.
+                        // toward the cap in every mode. Check at loop top so an
+                        // over-budget batch does not enter one more run.
                         let spent = u64::from(batch_core) + bus.in_batch_scaled_bus_clocks();
-                        if spent >= cap && bus.active_mode.uses_approximate_timing() {
+                        if spent >= cap {
                             break;
                         }
                         // Run a straight-line run of instructions inside the CPU in one call (the
@@ -447,11 +438,9 @@ impl Machine {
                                 if !can_take_before && cpu.can_take_interrupt() {
                                     break;
                                 }
-                                // Historical post-run core-clock check: the sole
-                                // cap break for the Accurate class (preserving
-                                // its at-least-one-run batch geometry exactly);
-                                // for Approximate the loop-top guest-clock check
-                                // above fires first or at the same boundary.
+                                // A core-only fast exit avoids another loop when
+                                // this run consumed the full budget. Bus-heavy
+                                // runs are caught by the combined check above.
                                 if u64::from(batch_core) >= cap {
                                     break;
                                 }
@@ -507,17 +496,16 @@ impl Machine {
                     let step = u64::from(outcome.core_clocks)
                         + self.scale_bus(bus_clocks)
                         + std::mem::take(&mut self.isa_io_batch_clocks);
-                    self.elapsed_clocks += step;
                     // Advance the OPL timers so AdLib detection's delay loops see
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     let advance_start = self.host_profile.start();
-                    self.advance_devices(step);
+                    self.advance_cpu_work(step);
                     self.host_profile
                         .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
                     // Charge the CD-ROM's seek + transfer time for a read the
                     // instruction just issued, the way the floppy stalls. The
-                    // guest clock jumps; the GUI's realtime pacing turns that into
+                    // guest time jumps; the GUI's realtime pacing turns that into
                     // a visible wait.
                     let cd_secs = self.ide.take_stall_secs();
                     if cd_secs > 0.0 {
@@ -604,10 +592,9 @@ impl Machine {
                         .record(MachineProfilePhaseKind::ConsoleFlush, console_start);
                     if outcome.halted {
                         let halt_start = self.host_profile.start();
-                        match self.next_timer_wake(deadline) {
+                        match self.next_timer_wake(deadline_ticks) {
                             Some(wake_step) => {
-                                self.elapsed_clocks += wake_step;
-                                self.advance_devices(wake_step);
+                                self.advance_cpu_work(wake_step);
                                 self.host_profile
                                     .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
                             }

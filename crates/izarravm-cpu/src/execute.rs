@@ -1299,6 +1299,7 @@ impl CpuGsw {
                     port,
                     BusWidth::Byte,
                     u32::from(self.read_gpr8(0)),
+                    self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
@@ -1311,6 +1312,7 @@ impl CpuGsw {
                     port,
                     operand_size.bus_width(),
                     self.read_gpr_sized(0, operand_size),
+                    self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
@@ -1349,6 +1351,7 @@ impl CpuGsw {
                     port,
                     BusWidth::Byte,
                     u32::from(self.read_gpr8(0)),
+                    self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))
@@ -1361,6 +1364,7 @@ impl CpuGsw {
                     port,
                     operand_size.bus_width(),
                     self.read_gpr_sized(0, operand_size),
+                    self.core_clocks_so_far,
                     self.is_ring0_protected(),
                 )?;
                 Ok(clocks(10))

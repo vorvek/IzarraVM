@@ -5,7 +5,7 @@ pub use runtime::run;
 
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink, MidiEngine};
-use izarravm_core::{GswMode, MidiConfig, MidiStatus};
+use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiConfig, MidiStatus};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
 use std::cell::Cell;
@@ -52,7 +52,7 @@ fn volume_gain(volume: f32) -> f32 {
 /// How long the emulation thread sleeps between work slices. The wall-clock
 /// catch-up pacing absorbs the coarse Windows timer granularity, so realtime
 /// holds regardless of the exact wake interval as long as it stays well under
-/// the clock_hz/20 budget cap (50 ms of guest time).
+/// the 50 ms master-tick budget cap.
 const EMU_SLICE: Duration = Duration::from_millis(1);
 
 /// Ceiling on how often accumulated mouse motion is flushed into the guest,
@@ -132,11 +132,23 @@ fn palette_words(pixels: &[u8], palette: &[u32; 256]) -> Vec<u32> {
 /// Refill the pacing credit by the wall time elapsed this slice, capping the
 /// backlog at `cap`. The cap forgives a long host stall (the OS starving the
 /// thread) instead of banking it, so the guest never sprints above realtime to
-/// repay it. The caller runs `credit.max(0)` clocks then subtracts what actually
-/// ran, so a floppy read that overshoots its budget drives credit negative and
-/// holds the guest until wall-clock catches up: the drive "grinds" in real time.
-fn refill_credit(credit: i64, dt: f64, clock_hz: u64, cap: u64) -> i64 {
-    (credit + (dt * clock_hz as f64) as i64).min(cap as i64)
+/// repay it. The caller runs `credit.max(0)` master ticks, then subtracts what
+/// actually ran. A floppy read that overshoots its budget drives credit negative
+/// and holds the guest until wall-clock catches up.
+fn refill_credit(credit: i64, dt: Duration, cap: u64) -> i64 {
+    let wall_ticks =
+        (dt.as_nanos() * u128::from(MASTER_CLOCK_HZ) / 1_000_000_000).min(i64::MAX as u128) as i64;
+    credit.saturating_add(wall_ticks).min(cap as i64)
+}
+
+fn duration_for_master_ticks(master_ticks: u64) -> Duration {
+    let seconds = master_ticks / MASTER_CLOCK_HZ;
+    let remainder = master_ticks % MASTER_CLOCK_HZ;
+    let nanos = (u128::from(remainder) * 1_000_000_000).div_ceil(u128::from(MASTER_CLOCK_HZ));
+    Duration::new(
+        seconds.saturating_add((nanos / 1_000_000_000) as u64),
+        (nanos % 1_000_000_000) as u32,
+    )
 }
 
 fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
@@ -147,19 +159,26 @@ fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
     }
 }
 
-/// Result of `top_up_shortfall`: `topped_up` is device+master-clock time created
-/// without executing instructions (wall-backed by construction); `peeked` is
-/// REAL executed guest time the vretrace peeks ran. The caller drains credit for
-/// both, folding `peeked` into its executed-clock accounting.
-struct TopUp {
-    topped_up: u64,
-    peeked: u64,
+fn tick_machine_ticks(machine: &mut Machine, master_ticks: u64) -> Option<StopReason> {
+    match machine.run_master_ticks(master_ticks) {
+        Ok(StopReason::CycleLimit { .. }) => None,
+        Ok(reason) => Some(reason),
+        Err(err) => Some(StopReason::CpuError(err.to_string())),
+    }
 }
 
-/// Consume an Approximate-class wall-pacing shortfall, edge-aware.
+/// Result of `top_up_shortfall`, in master ticks. `topped_up_ticks` is device
+/// time created without executing instructions. `peeked_ticks` is elapsed guest
+/// time created by the retrace peeks. The caller drains credit for both.
+struct TopUp {
+    topped_up_ticks: u64,
+    peeked_ticks: u64,
+}
+
+/// Consume a fast-mode wall-pacing shortfall, stopping at scanout edges.
 ///
-/// advance_wall_shortfall stops at each VGA vertical-retrace start edge inside
-/// the span (a bare top-up sweeps the beam across a whole mode-13h frame with
+/// `advance_wall_shortfall_ticks` stops at each VGA vertical-retrace start edge
+/// inside the span (a bare top-up sweeps the beam across a whole mode-13h frame with
 /// zero instructions executing, so a guest polling 0x3DA caught only 12.8
 /// percent of the windows), and the CPU gets a small peek quantum at every stop
 /// so the window is observable. The slice may thus consume slightly more than
@@ -168,43 +187,45 @@ struct TopUp {
 /// pays only ~70 edge-stops + peeks per wall second (~0.2 percent of a 486
 /// slice).
 ///
-/// Termination: advance_wall_shortfall consumes >= 1 clock per call, and a
-/// defensive stop cap bounds the peek work. Normal VGA frames are 60-70 Hz, so
-/// a slice's shortfall (<= 50ms of clocks) sees a handful of edges; the cap
-/// budgets one stop per 10ms of shortfall plus slack, and a pathological
+/// Termination: `advance_wall_shortfall_ticks` consumes at least one tick per
+/// call, and a defensive stop cap bounds the peek work. Normal VGA frames are
+/// 60-70 Hz, so a slice's shortfall (at most 50 ms) sees a handful of edges.
+/// The cap budgets one stop per 10 ms of shortfall plus slack, and a pathological
 /// guest-programmed CRTC (kHz-rate frames) then degrades to an unclamped
 /// top-up instead of livelocking the emulate thread in peeks. A peek that
 /// halts or faults aborts the top-up; the unrun remainder stays as credit for
 /// the next slice, which sees the new machine state per its own stop handling.
 fn top_up_shortfall(machine: &mut Machine, mut remaining: u64) -> TopUp {
-    let clock_hz = machine.active_mode().clock_hz();
-    let mut stops_left = remaining / (clock_hz / 100).max(1) + 2;
-    let mut topped_up = 0u64;
-    let mut peeked = 0u64;
+    let mut stops_left = remaining / (MASTER_CLOCK_HZ / 100) + 2;
+    let mut topped_up_ticks = 0u64;
+    let mut peeked_ticks = 0u64;
     while remaining > 0 {
-        let consumed = machine.advance_wall_shortfall(remaining);
-        topped_up += consumed;
+        let consumed = machine.advance_wall_shortfall_ticks(remaining);
+        topped_up_ticks += consumed;
         remaining = remaining.saturating_sub(consumed.max(1));
         if remaining == 0 {
             break;
         }
         if stops_left == 0 {
-            machine.advance_wall_clocks(remaining);
-            topped_up += remaining;
+            machine.advance_devices_ticks(remaining);
+            topped_up_ticks += remaining;
             break;
         }
         stops_left -= 1;
         // Stopped at a vretrace start edge (bit 3 of 0x3DA already reads set):
         // let the guest run a peek so a polling loop observes the window before
         // the top-up sweeps past it.
-        let peek_before = machine.elapsed_clocks();
+        let peek_before = machine.master_ticks();
         let peek_stop = tick_machine(machine, VRETRACE_PEEK_CLOCKS);
-        peeked += machine.elapsed_clocks().saturating_sub(peek_before);
+        peeked_ticks += machine.master_ticks().saturating_sub(peek_before);
         if peek_stop.is_some() {
             break;
         }
     }
-    TopUp { topped_up, peeked }
+    TopUp {
+        topped_up_ticks,
+        peeked_ticks,
+    }
 }
 
 /// The active display as native-resolution 0x00RRGGBB words plus its size.
@@ -930,8 +951,8 @@ fn emulate(
 
     let mut audio_debt = 0.0;
     let mut speed_ratio = 0.0;
-    // Pacing credit (guest clocks the guest is owed). Wall time refills it; the
-    // cycles run drain it. A disk read that consumes more than its slice drives
+    // Pacing credit (master ticks the guest is owed). Wall time refills it; guest
+    // time drains it. A disk read that consumes more than its slice drives
     // it negative, pausing the guest for the disk's duration.
     let mut credit: i64 = 0;
     let mut last = Instant::now();
@@ -992,121 +1013,93 @@ fn emulate(
 
         // Pace by the wall time since the last slice. The credit bucket forgives a
         // host stall (capped backlog, no catch-up sprint) and, in the other
-        // direction, makes a disk read that jumps the guest clock cost real
+        // direction, makes a disk read that advances guest time cost real
         // wall-clock time: the overshoot drives credit negative and the next
         // slices run nothing until wall time refills it.
         let now = Instant::now();
-        let dt = now.duration_since(last).as_secs_f64();
+        let dt = now.duration_since(last);
+        let dt_secs = dt.as_secs_f64();
         last = now;
-        // Pace against the live mode clock, which the guest can change at runtime
-        // (Lotura port 0xE1). Reading it each slice keeps the credit refill in the
-        // same clock domain as the cycles run and as the disk-stall jumps, so a
-        // floppy read pauses for its true wall-clock duration in any GSW mode.
-        let clock_hz = machine.active_mode().clock_hz();
-        let cap = clock_hz / 20;
-        credit = refill_credit(credit, dt, clock_hz, cap);
+        // Credit stays in fixed master ticks across guest-driven CPU-mode changes.
+        let cap = MASTER_CLOCK_HZ / 20;
+        credit = refill_credit(credit, dt, cap);
         let budget = credit.max(0) as u64;
         if budget > 0 {
-            let before = machine.elapsed_clocks();
-            let stall_before = machine.io_stall_clocks();
+            let before = machine.master_ticks();
+            let stall_before = machine.io_stall_ticks();
             let approximate = machine.active_mode().uses_approximate_timing();
             let stop = if approximate {
-                // Approximate class (486/586): time is already an approximation, so
-                // sub-slice the budget in ~1ms quanta and stop issuing quanta once
-                // the slice's wall deadline passes. On a host too slow to emulate
-                // the mode at full speed, the CPU retires what it can and the unrun
-                // remainder is topped up below, so audio/PIT hold realtime instead
-                // of starving behind an ever-longer slice. The Accurate class
-                // (286/386) keeps the single full-budget call: sub-slicing changes
-                // device-advance boundaries and its cadence is frozen.
-                let quantum = (clock_hz / 1000).max(1);
-                let deadline = now + Duration::from_secs_f64(budget as f64 / clock_hz as f64);
+                // The fast modes are sub-sliced in 1 ms master-time quanta so a
+                // slow host can stop issuing work at the wall deadline. Any
+                // unrun duration is topped up below to keep devices realtime.
+                let quantum = MASTER_CLOCK_HZ / 1000;
+                let deadline = now + duration_for_master_ticks(budget);
                 let mut stop = None;
                 loop {
-                    let ran_so_far = machine.elapsed_clocks().saturating_sub(before);
+                    let ran_so_far = machine.master_ticks().saturating_sub(before);
                     let remaining = budget.saturating_sub(ran_so_far);
                     if remaining == 0 {
                         break;
                     }
-                    stop = tick_machine(&mut machine, quantum.min(remaining));
+                    stop = tick_machine_ticks(&mut machine, quantum.min(remaining));
                     if stop.is_some() || Instant::now() >= deadline {
                         break;
                     }
                 }
                 stop
             } else {
-                tick_machine(&mut machine, budget)
+                tick_machine_ticks(&mut machine, budget)
             };
-            let mut ran = machine.elapsed_clocks().saturating_sub(before);
-            // Of those clocks, some may be a device-I/O stall (a floppy seek/read)
-            // that jumped the clock without executing instructions. Drain the full
+            let mut ran = machine.master_ticks().saturating_sub(before);
+            // Some elapsed ticks may be a device-I/O stall. Drain the full
             // ran from the credit so the stall still costs wall-clock time, but
             // exclude it from the speed measurement below.
-            let mut stalled = machine.io_stall_clocks().saturating_sub(stall_before);
+            let mut stalled = machine.io_stall_ticks().saturating_sub(stall_before);
             let mut topped_up = 0u64;
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
             // framebuffer is presented instead.
             if matches!(stop, Some(StopReason::Halted)) {
-                machine.advance_devices_clocks(budget);
-            } else if approximate {
-                if stalled > 0 {
-                    // A device I/O stall (floppy/CD seek) jumped the master clock
-                    // without advancing the devices, so fill the device gap to match
-                    // and audio keeps playing through a disk grind instead of the
-                    // sink starving. The master clock is NOT bumped here: stall_for
-                    // already advanced it by the stall, and re-adding it gave the
-                    // audio pump a cumulative lead over wall time. The Accurate
-                    // class (286/386) keeps exact main behavior (devices resume from
-                    // the next instruction's own advance).
-                    machine.advance_devices_clocks(stalled);
-                }
-                if stop.is_none() {
-                    // The host ran out of wall time before the budget was consumed
-                    // (the deadline bail-out above). Top up devices AND the master
-                    // clock by the genuinely unrun remainder so guest time keeps
-                    // tracking wall time; the shortfall is wall-backed by
-                    // construction, so draining credit for it below is correct.
-                    // Stall jumps already count as progress in `ran`, so they are
-                    // not double-counted here. Fatal stops (CpuError/DosExit/
-                    // TestExit) skip the top-up and keep devices frozen.
-                    //
-                    // The top-up stops at VGA vretrace start edges and peeks the
-                    // CPU there (see top_up_shortfall). The peek is REAL executed
-                    // guest time backed by the wall time spent running it, so it
-                    // folds into `ran` and drains credit like any other execution.
-                    let top_up = top_up_shortfall(&mut machine, budget.saturating_sub(ran));
-                    topped_up += top_up.topped_up;
-                    ran += top_up.peeked;
-                    // A peek can itself hit a device-I/O stall (a guest kicking
-                    // off a disk read at the edge): fill the device gap the same
-                    // way the slice fill above did, and fold it into `stalled` so
-                    // the speed metric keeps excluding intentional waits.
-                    let stalled_total = machine.io_stall_clocks().saturating_sub(stall_before);
-                    if stalled_total > stalled {
-                        machine.advance_devices_clocks(stalled_total - stalled);
-                        stalled = stalled_total;
-                    }
-                }
+                let halt_top_up = budget.saturating_sub(ran);
+                machine.advance_devices_ticks(halt_top_up);
+                topped_up = halt_top_up;
+            } else if approximate && stop.is_none() {
+                // The host ran out of wall time before the budget was consumed
+                // (the deadline bail-out above). Top up devices and the master
+                // timeline by the genuinely unrun remainder so guest time keeps
+                // tracking wall time; the shortfall is wall-backed by
+                // construction, so draining credit for it below is correct.
+                // Stall jumps already count as progress in `ran`, so they are
+                // not double-counted here. Fatal stops (CpuError/DosExit/
+                // TestExit) skip the top-up and keep devices frozen.
+                //
+                // The top-up stops at VGA vretrace start edges and peeks the
+                // CPU there (see top_up_shortfall). The peek executes guest time
+                // backed by the wall time spent running it, so it
+                // folds into `ran` and drains credit like any other execution.
+                let top_up = top_up_shortfall(&mut machine, budget.saturating_sub(ran));
+                topped_up += top_up.topped_up_ticks;
+                ran += top_up.peeked_ticks;
+                stalled = machine.io_stall_ticks().saturating_sub(stall_before);
             }
             credit -= i64::try_from(ran.saturating_add(topped_up)).unwrap_or(i64::MAX);
             if let Some(sink) = &sink {
                 pump_audio(
                     &mut machine,
                     sink,
-                    dt,
+                    dt_secs,
                     &mut audio_debt,
                     gain.get(),
                     amp.get(),
                     speaker_vol.get(),
                 );
             }
-            if dt > 0.0 {
+            if dt_secs > 0.0 {
                 // Speed reflects instructions executed vs wall time; a drive stall
                 // is intentional wait, not the emulator running fast.
                 let executed = ran.saturating_sub(stalled);
-                let ratio = (executed as f64 / (dt * clock_hz as f64)).min(1.5);
+                let ratio = (executed as f64 / (dt_secs * MASTER_CLOCK_HZ as f64)).min(1.5);
                 speed_ratio = speed_ratio * 0.9 + ratio * 0.1;
             }
         }

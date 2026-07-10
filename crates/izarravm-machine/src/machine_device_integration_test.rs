@@ -234,6 +234,7 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
                 .unwrap();
         }
     });
+    let master_before = machine.master_ticks();
     let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
     // The handler ran (after the cli the second hlt is genuine).
     assert_eq!(reason, StopReason::Halted);
@@ -246,6 +247,7 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
         machine.elapsed_clocks() > 15_000,
         "the fast-forward should advance emulated time across the DSP sample window"
     );
+    assert!(machine.master_ticks() > master_before);
 }
 
 #[test]
@@ -350,24 +352,6 @@ fn batch_throughput() {
     println!(
         "batch_throughput: {budget} guest clocks in {secs:.3}s = {:.1} M guest-clocks/s",
         budget as f64 / secs / 1.0e6
-    );
-}
-
-#[test]
-fn audio_sample_cap_is_one_dac_sample_and_never_zero() {
-    // The run-loop batch services devices once per cap clocks; the cap must be
-    // exactly one 44.1 kHz DAC sample so the DSP/CD producers never alias, and
-    // never 0 (which would stall the batch). Checked at the live 200 MHz
-    // default and a pathologically slow clock where the floor division would
-    // otherwise be 0.
-    assert_eq!(
-        TimingFactors::for_clock(ClockRate::from_hz(200_000_000)).clocks_per_audio_sample,
-        200_000_000 / u64::from(DAC_HZ)
-    );
-    assert_eq!(
-        TimingFactors::for_clock(ClockRate::from_hz(40_000)).clocks_per_audio_sample,
-        1,
-        "a clock below the DAC rate must floor to 1, not 0"
     );
 }
 

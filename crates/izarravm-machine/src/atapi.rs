@@ -100,6 +100,7 @@ impl Playback {
 pub struct AtapiDevice {
     image: Option<CdImage>,
     play: Playback,
+    mixer_lba: Option<u32>,
     /// Latched sense: (key, asc, ascq). REQUEST SENSE returns and clears it.
     sense_key: u8,
     asc: u8,
@@ -150,6 +151,7 @@ impl AtapiDevice {
         self.image = Some(image);
         self.media_changed = true;
         self.play = Playback::default();
+        self.mixer_lba = None;
         self.set_sense(
             sense_key::UNIT_ATTENTION,
             asc::MEDIUM_MAY_HAVE_CHANGED.0,
@@ -162,6 +164,7 @@ impl AtapiDevice {
         self.image = None;
         self.media_changed = true;
         self.play = Playback::default();
+        self.mixer_lba = None;
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -240,6 +243,7 @@ impl AtapiDevice {
     /// inside the range yields silence (a zeroed frame) rather than data. The
     /// mixer reads this, consumes its samples, then calls `advance_play` to step
     /// to the next frame.
+    #[cfg(test)]
     pub fn peek_audio_frame(&self) -> Option<[u8; crate::cdimage::RAW_SECTOR]> {
         if !self.play.playing || self.play.current_lba >= self.play.end_lba {
             return None;
@@ -247,6 +251,34 @@ impl AtapiDevice {
         let lba = self.play.current_lba;
         let frame = self.image.as_ref()?.read_audio_frame(lba);
         Some(frame.unwrap_or([0u8; crate::cdimage::RAW_SECTOR]))
+    }
+
+    pub(crate) fn peek_mixer_audio_frame(&self) -> Option<[u8; crate::cdimage::RAW_SECTOR]> {
+        if !self.play.playing {
+            return None;
+        }
+        let lba = self.mixer_lba?;
+        if lba >= self.play.end_lba {
+            return None;
+        }
+        Some(
+            self.image
+                .as_ref()?
+                .read_audio_frame(lba)
+                .unwrap_or([0u8; crate::cdimage::RAW_SECTOR]),
+        )
+    }
+
+    pub(crate) fn mixer_audio_active(&self) -> bool {
+        self.play.playing && self.mixer_lba.is_some()
+    }
+
+    pub(crate) fn advance_mixer_audio(&mut self, frames: u32) {
+        let Some(lba) = self.mixer_lba else {
+            return;
+        };
+        let next = lba.saturating_add(frames);
+        self.mixer_lba = (next < self.play.end_lba).then_some(next);
     }
 
     /// Pull the next audio frame to render, advancing the play position by one
@@ -730,6 +762,7 @@ impl AtapiDevice {
             current_lba: start,
             end_lba: end,
         };
+        self.mixer_lba = (start < end).then_some(start);
         CmdResult::Data(Vec::new())
     }
 
@@ -750,6 +783,7 @@ impl AtapiDevice {
 
     fn stop_audio(&mut self) -> CmdResult {
         self.play.stop();
+        self.mixer_lba = None;
         CmdResult::Data(Vec::new())
     }
 
