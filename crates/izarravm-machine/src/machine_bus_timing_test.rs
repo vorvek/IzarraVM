@@ -82,7 +82,7 @@ fn machine_bus_snapshots_batch_entry_state() {
     machine.run_cycles(5_000).unwrap();
     let expected_timeline = machine.timeline;
     let expected_ticks = machine.timeline.now_ticks();
-    let expected_beam = machine.video.beam_dots();
+    let expected_beam = machine.video().beam_dots();
     let expected_trace_elapsed = machine.trace.elapsed_clocks();
     let expected_bus_rem = machine.bus_rem;
     with_bus(&mut machine, |bus| {
@@ -118,7 +118,7 @@ fn predicted_beam_at_batch_start_equals_the_unmutated_beam() {
     // P4a Slice 1 peek's first-instruction safety argument as a test.
     let mut machine = test_machine();
     machine.run_cycles(5_000).unwrap();
-    let expected_beam = machine.video.beam_dots();
+    let expected_beam = machine.video().beam_dots();
     with_bus(&mut machine, |bus| {
         // core_clocks_so_far and prior_runs_core_clocks default to 0 (no
         // read_io call has run yet on this bus, no prior run this batch) and
@@ -165,8 +165,8 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
                 assert_eq!(predicted_machine.timeline, real_machine.timeline);
                 assert_eq!(predicted_machine.bus_rem, real_machine.bus_rem);
                 assert_eq!(
-                    predicted_machine.video.beam_dots(),
-                    real_machine.video.beam_dots()
+                    predicted_machine.video().beam_dots(),
+                    real_machine.video().beam_dots()
                 );
 
                 let (predicted, raw_bus_clocks) = with_bus(&mut predicted_machine, |bus| {
@@ -202,13 +202,13 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
                 // only claims position, but the wrap cases must be shown to
                 // really wrap (frames_completed bumps) or the coverage claim
                 // above is hollow.
-                let frames_before = real_machine.video.frames_completed();
+                let frames_before = real_machine.video().frames_completed();
                 real_machine.advance_devices(step);
-                let wraps = real_machine.video.frames_completed() > frames_before;
+                let wraps = real_machine.video().frames_completed() > frames_before;
 
                 assert_eq!(
                     predicted,
-                    real_machine.video.beam_dots(),
+                    real_machine.video().beam_dots(),
                     "predicted_beam(prior={prior_runs_core_clocks}, \
                          core={core_clocks_so_far}, fetch_count={fetch_count}) must match a \
                          real advance_devices of the same core+scaled-bus clock total"
@@ -216,7 +216,7 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
                 if wraps {
                     any_wrap = true;
                     assert!(
-                        real_machine.video.frames_completed() > frames_before,
+                        real_machine.video().frames_completed() > frames_before,
                         "a wrapping step must bump the real machine's frame counter \
                              (prior={prior_runs_core_clocks}, core={core_clocks_so_far}, \
                              fetch_count={fetch_count})"
@@ -494,7 +494,7 @@ fn lazy_3da_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
     machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
     machine.run_cycles(5_000).unwrap();
 
-    let mut accurate_clone = machine.video.clone();
+    let mut accurate_clone = machine.video().clone();
     let expected = accurate_clone.read_status1();
 
     let (lazy_value, io_touched) = with_bus(&mut machine, |bus| {
@@ -989,7 +989,7 @@ fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
     // window, and its wait-states differ from the code-fetch constant (otherwise
     // the uniform arm legitimately collapses the run and the paths are
     // charge-identical by design).
-    assert!(machine.video.video_memory_enabled());
+    assert!(machine.video().video_memory_enabled());
     let code_ws = machine.cache_model.code_fetch_wait_states();
     let video_ws = machine.profile.wait_states.video;
     assert_ne!(
@@ -1301,8 +1301,8 @@ fn direct_memory_helpers_accept_only_page_local_ram() {
 
 #[test]
 fn ram_lookup_does_not_expose_partial_final_pages_as_full_pages() {
-    let pci = PciConfig::new();
-    let lookup = RamPageLookup::new(RAM_LOOKUP_PAGE_SIZE + 17, &pci);
+    let vega = Vega::default();
+    let lookup = RamPageLookup::new(RAM_LOOKUP_PAGE_SIZE + 17, &vega);
     assert!(lookup.direct_bytes(0, RAM_LOOKUP_PAGE_SIZE).is_some());
     assert!(
         lookup

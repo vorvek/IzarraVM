@@ -1,7 +1,10 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! RAM page lookup for direct memory access (bypass for conventional + UMA etc).
 //! Extracted as part of Phase 3 memory map / RAM lookup construction carve.
 
-use crate::pci::PciConfig;
+use crate::vega::Vega;
 use crate::video_params::RAM_LOOKUP_PAGE_BITS;
 use crate::video_params::RAM_LOOKUP_PAGE_MASK;
 use crate::video_params::RAM_LOOKUP_PAGE_SIZE;
@@ -14,17 +17,17 @@ pub(crate) struct RamPageLookup {
 }
 
 impl RamPageLookup {
-    pub(crate) fn new(memory_len: usize, pci: &PciConfig) -> Self {
+    pub(crate) fn new(memory_len: usize, vega: &Vega) -> Self {
         let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
         let mut lookup = Self {
             page_bases: vec![RAM_LOOKUP_SLOW; page_count].into_boxed_slice(),
             memory_len,
         };
-        lookup.rebuild(memory_len, pci);
+        lookup.rebuild(memory_len, vega);
         lookup
     }
 
-    pub(crate) fn rebuild(&mut self, memory_len: usize, pci: &PciConfig) {
+    pub(crate) fn rebuild(&mut self, memory_len: usize, vega: &Vega) {
         self.memory_len = memory_len;
         let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
         if self.page_bases.len() != page_count {
@@ -36,7 +39,7 @@ impl RamPageLookup {
         for (page, base) in self.page_bases.iter_mut().enumerate() {
             let start = page * RAM_LOOKUP_PAGE_SIZE;
             let end = (start + RAM_LOOKUP_PAGE_SIZE).min(memory_len);
-            if ram_lookup_page_is_direct(start, end, pci) {
+            if ram_lookup_page_is_direct(start, end, vega) {
                 *base = start;
             }
         }
@@ -69,12 +72,12 @@ impl RamPageLookup {
     }
 }
 
-fn ram_lookup_page_is_direct(start: usize, end: usize, pci: &PciConfig) -> bool {
+fn ram_lookup_page_is_direct(start: usize, end: usize, vega: &Vega) -> bool {
     if end <= 0x000A_0000 {
         return true;
     }
     if start < 0x0010_0000 {
         return false;
     }
-    !pci.distira_bar_overlaps(start, end)
+    !vega.memory_bar_overlaps(start, end)
 }

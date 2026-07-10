@@ -19,12 +19,13 @@ use izarravm_core::{
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{CpuError, CpuGsw, CycleOutcome, SegmentIndex, SegmentRegister, bus_timing};
+#[cfg(test)]
+use izarravm_video::HGC_FB_SIZE;
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    CGA_FB_SIZE, DAC_ENTRIES, Distira, HGC_FB_SIZE, MARGO_MMIO_SIZE, MARGO_VBE_MODES,
-    MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
-    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode,
-    bytes_per_pixel, font, pixel_format, vbe_mode,
+    CGA_FB_SIZE, DAC_ENTRIES, MARGO_VBE_MODES, Margo, TextFrame, VGA_PLANAR_WINDOW_SIZE,
+    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, font,
+    pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -44,10 +45,12 @@ mod cache_config;
 mod ram_lookup;
 mod timeline;
 mod timing;
+mod vega;
 mod video;
 mod video_params;
 
 use timeline::{DeviceAdvance, DeviceRates, RatePhase, Timeline};
+use vega::Vega;
 
 pub(crate) use ram_lookup::RamPageLookup;
 #[cfg(test)]
@@ -649,19 +652,10 @@ pub struct Machine {
     bus_rem: u64,
     memory: Memory,
     ram_lookup: RamPageLookup,
-    // Boxed: Vga is ~99 KB. Inline, the Machine value (and its Result wrapper)
-    // got copied through the constructors enough times in debug builds to
-    // overflow the main-thread stack before the binary did any work. On the heap
-    // it costs one pointer and the copies stay cheap.
-    video: Box<Vga>,
+    vega: Vega,
     paradise_non_vga: bool,
     paradise_regs: [u8; 6],
-    margo: Margo,
-    distira: Distira,
     pci: PciConfig,
-    margo_active: bool,
-    margo_linear: bool,
-    margo_bank: u16,
     text_scanline_override: Option<u16>,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
     // The vector of the last host-intercepted `INT n` opcode, stashed so the
@@ -998,10 +992,10 @@ impl Machine {
         });
         let active_mode = profile.cpu;
         cpu.set_mode(active_mode);
-        let distira = Distira::new();
+        let vega = Vega::default();
         let pci = PciConfig::new();
         let memory = Memory::from_mib(profile.memory_mib)?;
-        let ram_lookup = RamPageLookup::new(memory.len(), &pci);
+        let ram_lookup = RamPageLookup::new(memory.len(), &vega);
         // Lay the HLE entry stubs into ROM. PSP:0005 reaches the CALL 5 adapter
         // through the low-memory DOS entry at 0000:00C0.
         install_bios_font_mirror(&mut rom);
@@ -1023,15 +1017,10 @@ impl Machine {
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
-            video: Box::new(Vga::default()),
+            vega,
             paradise_non_vga: false,
             paradise_regs: [0; 6],
-            margo: Margo::default(),
-            distira,
             pci,
-            margo_active: false,
-            margo_linear: false,
-            margo_bank: 0,
             text_scanline_override: None,
             pending_soft_int: None,
             last_int_vector: None,
@@ -1155,7 +1144,7 @@ impl Machine {
     }
 
     pub fn drain_distira_fifo(&mut self) {
-        self.distira.drain_fifo();
+        self.vega.drain_distira_fifo();
     }
 
     /// Whether the PC speaker was ever enabled (port 0x61 bit 1 driven high). The
@@ -1621,75 +1610,6 @@ impl Machine {
         }
     }
 
-    /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
-    /// is idle (`busy_ns == 0`), and the ring is not drained (`get != put`), read
-    /// one command from the ring in system RAM and replay its data words as
-    /// register writes through `margo.write_mmio_u8`, advancing PUSH_GET. A data
-    /// word that writes COMMAND sets `busy_ns`, so the loop stalls there until the
-    /// operation completes on a later `advance_devices`, which is why PUSH_GET
-    /// trails PUSH_PUT. Latch-only packets consume instantly.
-    ///
-    /// A full ring holds at most `size / 4` words, so the engine consumes at most
-    /// that many words per call: this backstops a malformed ring (a non-power-of-two
-    /// `size`, or a `put` that the `(get + 4) % size` orbit never reaches) where the
-    /// `get != put` guard alone would spin forever over latch-only or zeroed words.
-    /// A well-formed ring always drains in fewer than `size / 4` words, so the budget
-    /// never truncates legitimate work.
-    fn pump_pusher(&mut self) {
-        let p = self.margo.pusher();
-        if !p.enabled || p.size == 0 {
-            return;
-        }
-        let mut get = p.get;
-        let mut budget = (p.size / 4) as u64;
-        while self.margo.busy_ns() == 0 && get != p.put && budget > 0 {
-            let header = self.read_ring_word(p.base, p.size, get);
-            let method = (header & 0xffff) as usize;
-            let count = header >> 16;
-            get = (get + 4) % p.size;
-            budget -= 1;
-            let mut i = 0u32;
-            while i < count && get != p.put && budget > 0 {
-                let data = self.read_ring_word(p.base, p.size, get);
-                for b in 0..4 {
-                    self.margo
-                        .write_mmio_u8(method + (i as usize) * 4 + b, (data >> (8 * b)) as u8);
-                }
-                get = (get + 4) % p.size;
-                budget -= 1;
-                i += 1;
-            }
-            self.margo.set_pusher_get(get);
-        }
-    }
-
-    /// Read one 32-bit little-endian word from the command ring at byte offset
-    /// `off`, wrapping within `size` (a power of two in practice; `% size` is used
-    /// so any nonzero size is safe). Each byte is bounds-checked against system RAM;
-    /// an out-of-range byte reads as 0 (no panic, no wrap into other state).
-    fn read_ring_word(&self, base: u32, size: u32, off: u32) -> u32 {
-        // Fast path (N2/N4 perf plan): when the 4 bytes neither wrap the ring boundary nor run
-        // off system RAM, read them as one slice instead of four bounds-checked byte fetches.
-        let start = off as usize % size as usize;
-        if start + 4 <= size as usize {
-            if let Some(slice) = self
-                .memory
-                .as_slice()
-                .get(base as usize + start..base as usize + start + 4)
-            {
-                return u32::from_le_bytes(slice.try_into().unwrap());
-            }
-        }
-        // Slow path: the word straddles the ring wrap or the RAM edge — per-byte with wrap, an
-        // out-of-range byte reading as 0 (unchanged semantics).
-        let mut bytes = [0u8; 4];
-        for (b, slot) in bytes.iter_mut().enumerate() {
-            let ring_off = (off as usize + b) % size as usize;
-            *slot = self.memory.read_u8(base as usize + ring_off).unwrap_or(0);
-        }
-        u32::from_le_bytes(bytes)
-    }
-
     /// Render `native_samples` of DSP DMA output as stereo frames by draining
     /// the rendered-frame ring the per-CPU-clock producer (in `advance_devices`)
     /// fills. The block counter and the half/end-buffer IRQ now advance with CPU
@@ -1956,12 +1876,7 @@ impl Machine {
 struct MachineBus<'a> {
     memory: &'a mut Memory,
     ram_lookup: &'a mut RamPageLookup,
-    video: &'a mut Vga,
-    margo: &'a mut Margo,
-    margo_active: bool,
-    margo_linear: bool,
-    margo_bank: u16,
-    distira: &'a mut Distira,
+    vega: &'a mut Vega,
     pci: &'a mut PciConfig,
     rom: &'a [u8],
     serial: &'a mut uart::Uart16450,

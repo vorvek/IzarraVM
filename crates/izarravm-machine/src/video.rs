@@ -5,34 +5,31 @@ use super::*;
 
 impl Machine {
     pub fn screen_text(&self) -> TextFrame {
-        self.video.frame()
+        self.vega.screen_text()
     }
 
     pub fn is_graphics_mode(&self) -> bool {
-        matches!(
-            self.video.active_mode(),
-            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX | VideoMode::Cga
-        )
+        self.vega.is_graphics_mode()
     }
 
     pub fn margo(&self) -> &Margo {
-        &self.margo
+        self.vega.margo()
     }
 
     pub fn margo_mut(&mut self) -> &mut Margo {
-        &mut self.margo
+        self.vega.margo_mut()
     }
 
     pub fn video(&self) -> &Vga {
-        &self.video
+        self.vega.legacy()
     }
 
     pub fn video_mut(&mut self) -> &mut Vga {
-        &mut self.video
+        self.vega.legacy_mut()
     }
 
     pub fn set_vga_mode_0dh(&mut self) {
-        self.video.set_mode_0dh();
+        self.vega.legacy_mut().set_mode_0dh();
     }
 
     /// Select a VGA graphics mode by its INT 10h number from the host side. Returns
@@ -43,10 +40,9 @@ impl Machine {
     }
 
     fn set_vga_mode_with_clear(&mut self, mode: u8, clear: bool) -> bool {
-        let ok = self.video.set_mode_with_clear(mode, clear);
+        let ok = self.vega.legacy_mut().set_mode_with_clear(mode, clear);
         if ok {
-            self.margo_active = false;
-            self.distira.disable_display();
+            self.vega.select_legacy();
         }
         ok
     }
@@ -56,7 +52,7 @@ impl Machine {
     /// 10h clears this latch. Exposed so a test can assert the BIOS hands the
     /// display back to VGA text before booting an OS.
     pub fn margo_active(&self) -> bool {
-        self.margo_active
+        self.vega.margo_active()
     }
 
     fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
@@ -71,26 +67,30 @@ impl Machine {
                 self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
             }
             0x04..=0x06 => {
-                self.video.set_cga_mode_with_clear(mode, clear);
-                self.margo_active = false;
-                self.distira.disable_display();
+                self.vega.legacy_mut().set_cga_mode_with_clear(mode, clear);
+                self.vega.select_legacy();
                 let cols = if mode == 0x06 { 80 } else { 40 };
                 self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
             }
             0x00..=0x03 | 0x07 => {
-                self.margo_active = false;
-                self.distira.disable_display();
+                self.vega.select_legacy();
                 let cols: u16 = if mode <= 0x01 { 40 } else { 80 };
                 if mode == 0x07 {
-                    self.video.set_mono_text_mode();
+                    self.vega.legacy_mut().set_mono_text_mode();
                 } else if let Some(scanlines) = self.text_scanline_override {
                     let _ = self
-                        .video
+                        .vega
+                        .legacy_mut()
                         .set_color_text_mode_scanlines(mode, scanlines, clear);
                 } else if mode <= 0x02 {
-                    let _ = self.video.set_cga_text_mode_with_clear(mode, clear);
+                    let _ = self
+                        .vega
+                        .legacy_mut()
+                        .set_cga_text_mode_with_clear(mode, clear);
                 } else {
-                    self.video.set_text_mode_columns(usize::from(cols));
+                    self.vega
+                        .legacy_mut()
+                        .set_text_mode_columns(usize::from(cols));
                 }
                 self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
             }
@@ -142,7 +142,7 @@ impl Machine {
                 return;
             }
             if let Some((page, page_start)) = self.ega_graphics_page_start(mode, al) {
-                self.video.set_start_address(page_start);
+                self.vega.legacy_mut().set_start_address(page_start);
                 let _ = self.memory.write_u8(0x462, page);
                 let _ = self.memory.write_u16(0x44e, page_start as u16);
                 return;
@@ -150,7 +150,9 @@ impl Machine {
             let page = self.normalize_text_page(al);
             let stride = self.text_page_stride();
             let page_start = usize::from(page) * stride;
-            self.video.set_start_address((page_start / 2) as u32);
+            self.vega
+                .legacy_mut()
+                .set_start_address((page_start / 2) as u32);
             let _ = self.memory.write_u8(0x462, page);
             let _ = self.memory.write_u16(0x44e, page_start as u16);
             let pos = self.cursor_pos(page);
@@ -162,24 +164,26 @@ impl Machine {
                 // BH=0: BL is the border/overscan color. In CGA graphics it also
                 // sets the 3D9h background/foreground nibble plus intensity.
                 0x00 => {
-                    self.video.set_overscan(bl);
-                    if self.video.active_mode() == VideoMode::Cga {
-                        let current = self.video.cga_color_select();
+                    self.vega.legacy_mut().set_overscan(bl);
+                    if self.vega.legacy_mut().active_mode() == VideoMode::Cga {
+                        let current = self.vega.legacy_mut().cga_color_select();
                         let _ = self
-                            .video
+                            .vega
+                            .legacy_mut()
                             .write_port(0x3D9, (current & !0x1F) | (bl & 0x1F));
                     }
                 }
                 // BH=1: BL bit0 selects CGA palette 0 vs 1 for 320x200x4.
                 0x01 => {
-                    let current = self.video.cga_color_select();
+                    let current = self.vega.legacy_mut().cga_color_select();
                     let _ = self
-                        .video
+                        .vega
+                        .legacy_mut()
                         .write_port(0x3D9, (current & !0x20) | ((bl & 1) << 5));
                 }
                 _ => {}
             }
-            if self.video.is_cga_personality() {
+            if self.vega.legacy_mut().is_cga_personality() {
                 self.sync_bda_cga_latches();
             }
             return;
@@ -593,7 +597,9 @@ impl Machine {
             }
             // BL=31h: default palette loading on mode set.
             0x31 if al <= 0x01 => {
-                self.video.set_default_palette_loading_enabled(al == 0x00);
+                self.vega
+                    .legacy_mut()
+                    .set_default_palette_loading_enabled(al == 0x00);
                 let mut flags = self.read_physical_u8(0x489);
                 if al == 0x01 {
                     flags |= 0x08; // no palette load
@@ -605,18 +611,20 @@ impl Machine {
             }
             // BL=32h: video memory/register addressing.
             0x32 if al <= 0x01 => {
-                let misc = self.video.read_port(0x3CC).unwrap_or(0x67);
+                let misc = self.vega.legacy_mut().read_port(0x3CC).unwrap_or(0x67);
                 let misc = if al == 0x00 {
                     misc | 0x02
                 } else {
                     misc & !0x02
                 };
-                let _ = self.video.write_port(0x3C2, misc);
+                let _ = self.vega.legacy_mut().write_port(0x3C2, misc);
                 self.set_eax_al(0x12);
             }
             // BL=33h: gray-scale summing policy.
             0x33 if al <= 0x01 => {
-                self.video.set_grayscale_summing_enabled(al == 0x00);
+                self.vega
+                    .legacy_mut()
+                    .set_grayscale_summing_enabled(al == 0x00);
                 let mut flags = self.read_physical_u8(0x489);
                 if al == 0x00 {
                     flags |= 0x02; // gray scaling enabled
@@ -648,7 +656,9 @@ impl Machine {
             0x35 if al <= 0x03 => self.set_eax_al(0x12),
             // BL=36h refresh control.
             0x36 if al <= 0x01 => {
-                self.video.set_display_refresh_enabled(al == 0x00);
+                self.vega
+                    .legacy_mut()
+                    .set_display_refresh_enabled(al == 0x00);
                 self.set_eax_al(0x12);
             }
             _ => {}
@@ -688,8 +698,12 @@ impl Machine {
     }
 
     fn sync_bda_cga_latches(&mut self) {
-        let _ = self.memory.write_u8(0x465, self.video.cga_mode_control());
-        let _ = self.memory.write_u8(0x466, self.video.cga_color_select());
+        let _ = self
+            .memory
+            .write_u8(0x465, self.vega.legacy_mut().cga_mode_control());
+        let _ = self
+            .memory
+            .write_u8(0x466, self.vega.legacy_mut().cga_color_select());
     }
 
     fn video_page_size(&self, mode: u8) -> u16 {
@@ -748,7 +762,7 @@ impl Machine {
     }
 
     fn text_aperture_size(&self) -> usize {
-        if self.video.is_cga_personality() {
+        if self.vega.legacy().is_cga_personality() {
             CGA_FB_SIZE
         } else {
             VGA_TEXT_MEMORY_SIZE
@@ -789,7 +803,7 @@ impl Machine {
     }
 
     fn normalize_bios_page(&mut self, page: u8) -> u8 {
-        match self.video.active_mode() {
+        match self.vega.legacy_mut().active_mode() {
             VideoMode::Cga => 0,
             VideoMode::Planar => {
                 let mode = self.read_physical_u8(0x449);
@@ -838,7 +852,8 @@ impl Machine {
         let row = usize::from(pos >> 8);
         let col = usize::from(pos & 0x00ff);
         let base_cells = self.text_page_base(page) / 2;
-        self.video
+        self.vega
+            .legacy_mut()
             .set_cursor_offset((base_cells + row * columns + col) as u16);
     }
 
@@ -877,18 +892,19 @@ impl Machine {
         let col = self.cpu.registers.ecx() as u16;
         let row = self.cpu.registers.edx() as u16;
         let page = ((self.cpu.registers.ebx() as u16) >> 8) as u8;
-        match self.video.active_mode() {
+        match self.vega.legacy_mut().active_mode() {
             VideoMode::Mode13h => {
                 let offset = usize::from(row) * 320 + usize::from(col);
                 if offset < 320 * 200 {
                     // Mode 13h is a 256-color mode: AL is the full 8-bit pixel
                     // value, bit 7 included, with no XOR.
-                    self.video.cpu_write_chain4(offset, al);
+                    self.vega.legacy_mut().cpu_write_chain4(offset, al);
                 }
             }
             VideoMode::Cga => {
                 let _ = self
-                    .video
+                    .vega
+                    .legacy_mut()
                     .cga_write_pixel(col, row, al & 0x7F, al & 0x80 != 0);
             }
             VideoMode::Planar => {
@@ -897,9 +913,13 @@ impl Machine {
                     .ega_graphics_page_start(mode, page)
                     .map(|(_, start)| start)
                     .unwrap_or(0);
-                let _ =
-                    self.video
-                        .planar_write_pixel_at(start, col, row, al & 0x0F, al & 0x80 != 0);
+                let _ = self.vega.legacy_mut().planar_write_pixel_at(
+                    start,
+                    col,
+                    row,
+                    al & 0x0F,
+                    al & 0x80 != 0,
+                );
             }
             _ => {}
         }
@@ -913,23 +933,23 @@ impl Machine {
         let col = self.cpu.registers.ecx() as u16;
         let row = self.cpu.registers.edx() as u16;
         let page = ((self.cpu.registers.ebx() as u16) >> 8) as u8;
-        let color = match self.video.active_mode() {
+        let color = match self.vega.legacy_mut().active_mode() {
             VideoMode::Mode13h => {
                 let offset = usize::from(row) * 320 + usize::from(col);
                 if offset < 320 * 200 {
-                    self.video.cpu_read_chain4(offset)
+                    self.vega.legacy_mut().cpu_read_chain4(offset)
                 } else {
                     0
                 }
             }
-            VideoMode::Cga => self.video.cga_read_pixel(col, row),
+            VideoMode::Cga => self.vega.legacy_mut().cga_read_pixel(col, row),
             VideoMode::Planar => {
                 let mode = self.read_physical_u8(0x449);
                 let start = self
                     .ega_graphics_page_start(mode, page)
                     .map(|(_, start)| start)
                     .unwrap_or(0);
-                self.video.planar_read_pixel_at(start, col, row)
+                self.vega.legacy_mut().planar_read_pixel_at(start, col, row)
             }
             _ => 0,
         };
@@ -939,7 +959,8 @@ impl Machine {
     /// INT 10h AH=04h READ LIGHT PEN POSITION. CGA-compatible only; VGA BIOSes
     /// report this as unsupported by leaving the trigger flag clear.
     fn int10_read_light_pen(&mut self) {
-        let Some((pixel_col, pixel_row, char_row, char_col)) = self.video.cga_light_pen_report()
+        let Some((pixel_col, pixel_row, char_row, char_col)) =
+            self.vega.legacy_mut().cga_light_pen_report()
         else {
             self.set_eax_ah(0);
             return;
@@ -1037,42 +1058,45 @@ impl Machine {
         let crtc_addr: u16 = if crtc_addr == 0x03B4 { 0x03B4 } else { 0x03D4 };
         let mut block = Vec::with_capacity(INT10_STATE_HARDWARE_LEN);
 
-        block.push(self.video.read_port(0x3C4).unwrap_or(0));
-        block.push(self.video.crtc_index_latch());
-        block.push(self.video.read_port(0x3CE).unwrap_or(0));
-        self.video.read_status1();
-        block.push(self.video.read_port(0x3C0).unwrap_or(0x20));
-        block.push(self.video.read_port(0x3CA).unwrap_or(0));
+        block.push(self.vega.legacy_mut().read_port(0x3C4).unwrap_or(0));
+        block.push(self.vega.legacy_mut().crtc_index_latch());
+        block.push(self.vega.legacy_mut().read_port(0x3CE).unwrap_or(0));
+        self.vega.legacy_mut().read_status1();
+        block.push(self.vega.legacy_mut().read_port(0x3C0).unwrap_or(0x20));
+        block.push(self.vega.legacy_mut().read_port(0x3CA).unwrap_or(0));
 
         for index in 1..=4 {
-            let _ = self.video.write_port(0x3C4, index);
-            block.push(self.video.read_port(0x3C5).unwrap_or(0));
+            let _ = self.vega.legacy_mut().write_port(0x3C4, index);
+            block.push(self.vega.legacy_mut().read_port(0x3C5).unwrap_or(0));
         }
-        let _ = self.video.write_port(0x3C4, 0);
-        block.push(self.video.read_port(0x3C5).unwrap_or(0));
+        let _ = self.vega.legacy_mut().write_port(0x3C4, 0);
+        block.push(self.vega.legacy_mut().read_port(0x3C5).unwrap_or(0));
 
         for index in 0..=0x18 {
-            block.push(self.video.crtc_register_latch(index));
+            block.push(self.vega.legacy_mut().crtc_register_latch(index));
         }
 
         let ar_index = block[3];
         for index in 0..=0x13 {
-            self.video.read_status1();
-            let _ = self.video.write_port(0x3C0, index | (ar_index & 0x20));
-            block.push(self.video.read_port(0x3C1).unwrap_or(0));
+            self.vega.legacy_mut().read_status1();
+            let _ = self
+                .vega
+                .legacy_mut()
+                .write_port(0x3C0, index | (ar_index & 0x20));
+            block.push(self.vega.legacy_mut().read_port(0x3C1).unwrap_or(0));
         }
-        self.video.read_status1();
+        self.vega.legacy_mut().read_status1();
 
         for index in 0..=0x08 {
-            let _ = self.video.write_port(0x3CE, index);
-            block.push(self.video.read_port(0x3CF).unwrap_or(0));
+            let _ = self.vega.legacy_mut().write_port(0x3CE, index);
+            block.push(self.vega.legacy_mut().read_port(0x3CF).unwrap_or(0));
         }
 
         block.extend_from_slice(&crtc_addr.to_le_bytes());
-        if self.video.is_cga_personality() {
+        if self.vega.legacy_mut().is_cga_personality() {
             block.extend_from_slice(&INT10_STATE_CGA_LATCH_MARKER);
-            block.push(self.video.cga_mode_control());
-            block.push(self.video.cga_color_select());
+            block.push(self.vega.legacy_mut().cga_mode_control());
+            block.push(self.vega.legacy_mut().cga_color_select());
         } else {
             block.extend_from_slice(&[0; 4]); // VGA latches are not CPU-readable.
         }
@@ -1087,76 +1111,85 @@ impl Machine {
         }
         let crtc_addr = u16::from_le_bytes([block[0x40], block[0x41]]);
         let crtc_addr = if crtc_addr == 0x03B4 { 0x03B4 } else { 0x03D4 };
-        let misc = self.video.read_port(0x3CC).unwrap_or(0x67);
+        let misc = self.vega.legacy_mut().read_port(0x3CC).unwrap_or(0x67);
         let misc = (misc & !0x01) | u8::from(crtc_addr == 0x03D4);
-        let _ = self.video.write_port(0x3C2, misc);
+        let _ = self.vega.legacy_mut().write_port(0x3C2, misc);
         if block[INT10_STATE_CGA_LATCH_OFFSET..INT10_STATE_CGA_LATCH_OFFSET + 2]
             == INT10_STATE_CGA_LATCH_MARKER
         {
             let _ = self
-                .video
+                .vega
+                .legacy_mut()
                 .write_port(0x3D8, block[INT10_STATE_CGA_LATCH_OFFSET + 2]);
             let _ = self
-                .video
+                .vega
+                .legacy_mut()
                 .write_port(0x3D9, block[INT10_STATE_CGA_LATCH_OFFSET + 3]);
         }
 
         let mut offset = 5;
         for index in 1..=4 {
-            let _ = self.video.write_port(0x3C4, index);
-            let _ = self.video.write_port(0x3C5, block[offset]);
+            let _ = self.vega.legacy_mut().write_port(0x3C4, index);
+            let _ = self.vega.legacy_mut().write_port(0x3C5, block[offset]);
             offset += 1;
         }
-        let _ = self.video.write_port(0x3C4, 0);
-        let _ = self.video.write_port(0x3C5, block[offset]);
+        let _ = self.vega.legacy_mut().write_port(0x3C4, 0);
+        let _ = self.vega.legacy_mut().write_port(0x3C5, block[offset]);
         offset += 1;
 
-        let _ = self.video.write_port(crtc_addr, 0x11);
-        let _ = self.video.write_port(crtc_addr + 1, 0x00);
+        let _ = self.vega.legacy_mut().write_port(crtc_addr, 0x11);
+        let _ = self.vega.legacy_mut().write_port(crtc_addr + 1, 0x00);
         for index in 0..=0x18 {
             let value = block[offset + index as usize];
             if index != 0x11 {
-                let _ = self.video.write_port(crtc_addr, index);
-                let _ = self.video.write_port(crtc_addr + 1, value);
+                let _ = self.vega.legacy_mut().write_port(crtc_addr, index);
+                let _ = self.vega.legacy_mut().write_port(crtc_addr + 1, value);
             }
         }
         let crtc_offset = offset;
         offset += 0x19;
-        let _ = self.video.write_port(crtc_addr, 0x11);
+        let _ = self.vega.legacy_mut().write_port(crtc_addr, 0x11);
         let _ = self
-            .video
+            .vega
+            .legacy_mut()
             .write_port(crtc_addr + 1, block[crtc_offset + 0x11]);
 
         let ar_index = block[3];
         for index in 0..=0x13 {
-            self.video.read_status1();
-            let _ = self.video.write_port(0x3C0, index | (ar_index & 0x20));
-            let _ = self.video.write_port(0x3C0, block[offset]);
+            self.vega.legacy_mut().read_status1();
+            let _ = self
+                .vega
+                .legacy_mut()
+                .write_port(0x3C0, index | (ar_index & 0x20));
+            let _ = self.vega.legacy_mut().write_port(0x3C0, block[offset]);
             offset += 1;
         }
-        self.video.read_status1();
-        let _ = self.video.write_port(0x3C0, ar_index);
-        self.video.read_status1();
+        self.vega.legacy_mut().read_status1();
+        let _ = self.vega.legacy_mut().write_port(0x3C0, ar_index);
+        self.vega.legacy_mut().read_status1();
 
         for index in 0..=0x08 {
-            let _ = self.video.write_port(0x3CE, index);
-            let _ = self.video.write_port(0x3CF, block[offset]);
+            let _ = self.vega.legacy_mut().write_port(0x3CE, index);
+            let _ = self.vega.legacy_mut().write_port(0x3CF, block[offset]);
             offset += 1;
         }
 
-        let _ = self.video.write_port(0x3C4, block[0]);
-        let _ = self.video.write_port(crtc_addr, block[1]);
-        let _ = self.video.write_port(0x3CE, block[2]);
-        let _ = self.video.write_port(crtc_addr - 4 + 0x0A, block[4]);
+        let _ = self.vega.legacy_mut().write_port(0x3C4, block[0]);
+        let _ = self.vega.legacy_mut().write_port(crtc_addr, block[1]);
+        let _ = self.vega.legacy_mut().write_port(0x3CE, block[2]);
+        let _ = self
+            .vega
+            .legacy_mut()
+            .write_port(crtc_addr - 4 + 0x0A, block[4]);
     }
 
     fn save_video_dac_state(&mut self, dst: u32) {
         let mut block = Vec::with_capacity(INT10_STATE_DAC_LEN);
-        block.push(self.video.read_port(0x3C7).unwrap_or(0));
-        block.push(self.video.read_port(0x3C8).unwrap_or(0));
-        block.push(self.video.read_port(0x3C6).unwrap_or(0xFF));
-        block.extend(self.video.dac_block_bytes(0, 256));
-        block.push(self.video.attr_register(0x14));
+        block.push(self.vega.legacy_mut().read_port(0x3C7).unwrap_or(0));
+        block.push(self.vega.legacy_mut().read_port(0x3C8).unwrap_or(0));
+        block.push(self.vega.legacy_mut().read_port(0x3C6).unwrap_or(0xFF));
+        block.extend(self.vega.legacy_mut().dac_block_bytes(0, 256));
+        block.push(self.vega.legacy_mut().attr_register(0x14));
         debug_assert_eq!(block.len(), INT10_STATE_DAC_LEN);
         self.write_guest_block(dst, &block);
     }
@@ -1166,18 +1199,25 @@ impl Machine {
         if block.len() != INT10_STATE_DAC_LEN {
             return;
         }
-        let _ = self.video.write_port(0x3C6, block[2]);
-        let grayscale = self.video.grayscale_summing_enabled();
-        self.video.set_grayscale_summing_enabled(false);
+        let _ = self.vega.legacy_mut().write_port(0x3C6, block[2]);
+        let grayscale = self.vega.legacy_mut().grayscale_summing_enabled();
+        self.vega.legacy_mut().set_grayscale_summing_enabled(false);
         for index in 0..=255usize {
             let base = 3 + index * 3;
-            self.video
-                .set_dac_entry(index as u8, block[base], block[base + 1], block[base + 2]);
+            self.vega.legacy_mut().set_dac_entry(
+                index as u8,
+                block[base],
+                block[base + 1],
+                block[base + 2],
+            );
         }
-        self.video.set_grayscale_summing_enabled(grayscale);
-        self.video
+        self.vega
+            .legacy_mut()
+            .set_grayscale_summing_enabled(grayscale);
+        self.vega
+            .legacy_mut()
             .set_attr_register(0x14, block[INT10_STATE_DAC_LEN - 1]);
-        let _ = self.video.write_port(0x3C8, block[1]);
+        let _ = self.vega.legacy_mut().write_port(0x3C8, block[1]);
     }
 
     /// INT 10h AH=1Ch SAVE/RESTORE VIDEO STATE. AL=00 returns the buffer size in
@@ -1258,7 +1298,7 @@ impl Machine {
             0x01 => {
                 let (bda_shape, start, end) = self.bios_cursor_shape(cx);
                 let _ = self.memory.write_u16(0x460, bda_shape);
-                self.video.set_cursor_shape(start, end);
+                self.vega.legacy_mut().set_cursor_shape(start, end);
             }
             // AH=02h set cursor position: DH=row, DL=col.
             0x02 => {
@@ -1286,8 +1326,8 @@ impl Machine {
                 } else {
                     let off = self.text_offset(page, row, col);
                     (
-                        self.video.read_u8(off).unwrap_or(b' '),
-                        self.video.read_u8(off + 1).unwrap_or(0x07),
+                        self.vega.legacy_mut().read_u8(off).unwrap_or(b' '),
+                        self.vega.legacy_mut().read_u8(off + 1).unwrap_or(0x07),
                     )
                 };
                 let eax =
@@ -1308,9 +1348,9 @@ impl Machine {
                         self.draw_graphics_char(page, row, target_col, al, bl);
                     } else {
                         let off = self.text_offset(page, row, target_col);
-                        let _ = self.video.write_u8(off, al);
+                        let _ = self.vega.legacy_mut().write_u8(off, al);
                         if ah == 0x09 {
-                            let _ = self.video.write_u8(off + 1, bl);
+                            let _ = self.vega.legacy_mut().write_u8(off + 1, bl);
                         }
                     }
                 }
@@ -1326,17 +1366,20 @@ impl Machine {
             self.draw_graphics_char(page, row, col, ch, attr);
         } else {
             let off = self.text_offset(page, row, col);
-            let _ = self.video.write_u8(off, ch);
-            let _ = self.video.write_u8(off + 1, attr);
+            let _ = self.vega.legacy_mut().write_u8(off, ch);
+            let _ = self.vega.legacy_mut().write_u8(off + 1, attr);
         }
     }
 
     fn is_bios_graphics_text_mode(&self) -> bool {
-        matches!(self.video.active_mode(), VideoMode::Cga | VideoMode::Planar)
+        matches!(
+            self.vega.legacy().active_mode(),
+            VideoMode::Cga | VideoMode::Planar
+        )
     }
 
     fn graphics_text_cell_height(&mut self) -> usize {
-        match self.video.active_mode() {
+        match self.vega.legacy_mut().active_mode() {
             VideoMode::Cga => 8,
             VideoMode::Planar => usize::from(self.read_physical_u8(0x485)).clamp(1, 32),
             _ => 16,
@@ -1344,7 +1387,7 @@ impl Machine {
     }
 
     fn graphics_page_start(&mut self, page: u8) -> u32 {
-        if self.video.active_mode() != VideoMode::Planar {
+        if self.vega.legacy_mut().active_mode() != VideoMode::Planar {
             return 0;
         }
         let mode = self.read_physical_u8(0x449);
@@ -1354,22 +1397,24 @@ impl Machine {
     }
 
     fn graphics_write_pixel(&mut self, page: u8, x: u16, y: u16, color: u8, xor: bool) -> bool {
-        match self.video.active_mode() {
-            VideoMode::Cga => self.video.cga_write_pixel(x, y, color, xor),
+        match self.vega.legacy_mut().active_mode() {
+            VideoMode::Cga => self.vega.legacy_mut().cga_write_pixel(x, y, color, xor),
             VideoMode::Planar => {
                 let start = self.graphics_page_start(page);
-                self.video.planar_write_pixel_at(start, x, y, color, xor)
+                self.vega
+                    .legacy_mut()
+                    .planar_write_pixel_at(start, x, y, color, xor)
             }
             _ => false,
         }
     }
 
     fn graphics_read_pixel(&mut self, page: u8, x: u16, y: u16) -> u8 {
-        match self.video.active_mode() {
-            VideoMode::Cga => self.video.cga_read_pixel(x, y),
+        match self.vega.legacy_mut().active_mode() {
+            VideoMode::Cga => self.vega.legacy_mut().cga_read_pixel(x, y),
             VideoMode::Planar => {
                 let start = self.graphics_page_start(page);
-                self.video.planar_read_pixel_at(start, x, y)
+                self.vega.legacy_mut().planar_read_pixel_at(start, x, y)
             }
             _ => 0,
         }
@@ -1380,7 +1425,7 @@ impl Machine {
         let cell_height = self.graphics_text_cell_height();
         let y0 = row * cell_height;
         let xor = color & 0x80 != 0;
-        let fg = match self.video.active_mode() {
+        let fg = match self.vega.legacy_mut().active_mode() {
             VideoMode::Cga => color & 0x7F,
             VideoMode::Planar => color & 0x0F,
             _ => color,
@@ -1413,13 +1458,13 @@ impl Machine {
     }
 
     fn graphics_glyph_row(&mut self, ch: u8, row: usize) -> u8 {
-        if self.video.active_mode() != VideoMode::Cga || ch < 0x80 {
-            return self.video.active_font_glyph_row(ch, row);
+        if self.vega.legacy_mut().active_mode() != VideoMode::Cga || ch < 0x80 {
+            return self.vega.legacy_mut().active_font_glyph_row(ch, row);
         }
         let offset = self.read_guest_word(0x1F * 4);
         let segment = self.read_guest_word(0x1F * 4 + 2);
         if offset == 0 && segment == 0 {
-            return self.video.active_font_glyph_row(ch, row);
+            return self.vega.legacy_mut().active_font_glyph_row(ch, row);
         }
         let base = u32::from(segment) * 16 + u32::from(offset);
         self.read_physical_u8(base + u32::from(ch - 0x80) * 8 + row.min(7) as u32)
@@ -1429,11 +1474,11 @@ impl Machine {
         let x0 = col * 8;
         let cell_height = self.graphics_text_cell_height();
         let y0 = row * cell_height;
-        if row >= self.text_rows() || x0 + 8 > self.video.raster_width() as usize {
+        if row >= self.text_rows() || x0 + 8 > self.vega.legacy_mut().raster_width() as usize {
             return (0, 0);
         }
-        let max_fg = match self.video.active_mode() {
-            VideoMode::Cga if self.video.raster_width() >= 640 => 1,
+        let max_fg = match self.vega.legacy_mut().active_mode() {
+            VideoMode::Cga if self.vega.legacy_mut().raster_width() >= 640 => 1,
             VideoMode::Cga => 3,
             VideoMode::Planar => 15,
             _ => 0,
@@ -1528,10 +1573,10 @@ impl Machine {
         for col in left..=right {
             let src = self.text_offset(page, src_row, col);
             let dst = self.text_offset(page, dst_row, col);
-            let b0 = self.video.read_u8(src).unwrap_or(b' ');
-            let b1 = self.video.read_u8(src + 1).unwrap_or(attr);
-            let _ = self.video.write_u8(dst, b0);
-            let _ = self.video.write_u8(dst + 1, b1);
+            let b0 = self.vega.legacy_mut().read_u8(src).unwrap_or(b' ');
+            let b1 = self.vega.legacy_mut().read_u8(src + 1).unwrap_or(attr);
+            let _ = self.vega.legacy_mut().write_u8(dst, b0);
+            let _ = self.vega.legacy_mut().write_u8(dst + 1, b1);
         }
     }
 
@@ -1539,8 +1584,8 @@ impl Machine {
     fn blank_text_row(&mut self, page: u8, row: usize, left: usize, right: usize, attr: u8) {
         for col in left..=right {
             let off = self.text_offset(page, row, col);
-            let _ = self.video.write_u8(off, b' ');
-            let _ = self.video.write_u8(off + 1, attr);
+            let _ = self.vega.legacy_mut().write_u8(off, b' ');
+            let _ = self.vega.legacy_mut().write_u8(off + 1, attr);
         }
     }
 
@@ -1561,15 +1606,15 @@ impl Machine {
         match al {
             // AL=00: set individual Attribute register. BL=index, BH=value.
             0x00 => {
-                self.video.set_attr_register(bl, bh);
-                if self.video.is_cga_personality() {
+                self.vega.legacy_mut().set_attr_register(bl, bh);
+                if self.vega.legacy_mut().is_cga_personality() {
                     self.sync_bda_cga_latches();
                 }
             }
             // AL=01: set overscan/border color. BH=value (overlap with AH=0Bh).
             0x01 => {
-                self.video.set_overscan(bh);
-                if self.video.is_cga_personality() {
+                self.vega.legacy_mut().set_overscan(bh);
+                if self.vega.legacy_mut().is_cga_personality() {
                     self.sync_bda_cga_latches();
                 }
             }
@@ -1577,29 +1622,33 @@ impl Machine {
             0x02 => {
                 let block = self.read_guest_block(es_dx, 17);
                 for i in 0..16u8 {
-                    self.video.set_attr_palette_reg(i, block[i as usize]);
+                    self.vega
+                        .legacy_mut()
+                        .set_attr_palette_reg(i, block[i as usize]);
                 }
-                self.video.set_overscan(block[16]);
-                if self.video.is_cga_personality() {
+                self.vega.legacy_mut().set_overscan(block[16]);
+                if self.vega.legacy_mut().is_cga_personality() {
                     self.sync_bda_cga_latches();
                 }
             }
             // AL=03: BL=0 enables bright backgrounds, BL=1 enables blink.
             0x03 => {
-                self.video.set_text_blink_enabled(bl & 0x01 != 0);
-                if self.video.is_cga_personality() {
+                self.vega
+                    .legacy_mut()
+                    .set_text_blink_enabled(bl & 0x01 != 0);
+                if self.vega.legacy_mut().is_cga_personality() {
                     self.sync_bda_cga_latches();
                 }
             }
             // AL=07: get individual Attribute register. BL=index -> BH.
             0x07 => {
-                let value = self.video.attr_register(bl);
+                let value = self.vega.legacy_mut().attr_register(bl);
                 let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(value) << 8);
                 self.cpu.registers.set_ebx(ebx);
             }
             // AL=08: read overscan/border color -> BH.
             0x08 => {
-                let value = self.video.overscan();
+                let value = self.vega.legacy_mut().overscan();
                 let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(value) << 8);
                 self.cpu.registers.set_ebx(ebx);
             }
@@ -1607,46 +1656,46 @@ impl Machine {
             0x09 => {
                 let mut block = [0u8; 17];
                 for (i, slot) in block.iter_mut().take(16).enumerate() {
-                    *slot = self.video.attr_palette_reg(i as u8);
+                    *slot = self.vega.legacy_mut().attr_palette_reg(i as u8);
                 }
-                block[16] = self.video.overscan();
+                block[16] = self.vega.legacy_mut().overscan();
                 self.write_guest_block(es_dx, &block);
             }
             // AL=10: set individual DAC register. BX=index, DH=R, CH=G, CL=B.
-            0x10 => self.video.set_dac_entry(bx as u8, dh, ch, cl),
+            0x10 => self.vega.legacy_mut().set_dac_entry(bx as u8, dh, ch, cl),
             // AL=12: set a block of DAC registers. BX=start, CX=count, ES:DX -> RGB triples.
             0x12 => {
                 let bytes = self.read_guest_block(es_dx, cx as usize * 3);
                 let entries: Vec<[u8; 3]> =
                     bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
-                self.video.set_dac_block(bx as u8, &entries);
+                self.vega.legacy_mut().set_dac_block(bx as u8, &entries);
             }
             // AL=13: select DAC colour-page mode/page. BL=0 picks four 64-colour
             // pages (BH=0) vs sixteen 16-colour pages (BH=1); BL=1 selects page.
             0x13 => match bl {
                 0x00 => {
-                    let mut mode_control = self.video.attr_register(0x10);
+                    let mut mode_control = self.vega.legacy_mut().attr_register(0x10);
                     if bh & 0x01 != 0 {
                         mode_control |= 0x80;
                     } else {
                         mode_control &= !0x80;
                     }
-                    self.video.set_attr_register(0x10, mode_control);
+                    self.vega.legacy_mut().set_attr_register(0x10, mode_control);
                 }
                 0x01 => {
-                    let color_select = self.video.attr_register(0x14);
-                    let page = if self.video.attr_register(0x10) & 0x80 != 0 {
+                    let color_select = self.vega.legacy_mut().attr_register(0x14);
+                    let page = if self.vega.legacy_mut().attr_register(0x10) & 0x80 != 0 {
                         bh & 0x0F
                     } else {
                         (color_select & 0x03) | ((bh & 0x03) << 2)
                     };
-                    self.video.set_attr_register(0x14, page);
+                    self.vega.legacy_mut().set_attr_register(0x14, page);
                 }
                 _ => {}
             },
             // AL=15: get individual DAC register. BX=index -> DH=R, CH=G, CL=B.
             0x15 => {
-                let [r, g, b] = self.video.dac_entry(bx as u8);
+                let [r, g, b] = self.vega.legacy_mut().dac_entry(bx as u8);
                 let edx = (self.cpu.registers.edx() & !0xFF00) | (u32::from(r) << 8);
                 self.cpu.registers.set_edx(edx);
                 let ecx_new =
@@ -1655,23 +1704,23 @@ impl Machine {
             }
             // AL=17: get a block of DAC registers. BX=start, CX=count -> ES:DX.
             0x17 => {
-                let bytes = self.video.dac_block_bytes(bx as u8, cx);
+                let bytes = self.vega.legacy_mut().dac_block_bytes(bx as u8, cx);
                 self.write_guest_block(es_dx, &bytes);
             }
             // AL=18: set PEL mask. BL=value.
             0x18 => {
-                let _ = self.video.write_port(0x3C6, bl);
+                let _ = self.vega.legacy_mut().write_port(0x3C6, bl);
             }
             // AL=19: read PEL mask -> BL.
             0x19 => {
-                let value = self.video.read_port(0x3C6).unwrap_or(0xFF);
+                let value = self.vega.legacy_mut().read_port(0x3C6).unwrap_or(0xFF);
                 let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(value);
                 self.cpu.registers.set_ebx(ebx);
             }
             // AL=1A: read DAC page state -> BL=paging mode, BH=current page.
             0x1A => {
-                let mode = u8::from(self.video.attr_register(0x10) & 0x80 != 0);
-                let color_select = self.video.attr_register(0x14);
+                let mode = u8::from(self.vega.legacy_mut().attr_register(0x10) & 0x80 != 0);
+                let color_select = self.vega.legacy_mut().attr_register(0x14);
                 let page = if mode == 0 {
                     (color_select >> 2) & 0x03
                 } else {
@@ -1688,10 +1737,12 @@ impl Machine {
                 let start = bx as u8;
                 for offset in 0..cx {
                     let index = start.wrapping_add(offset as u8);
-                    let [r, g, b] = self.video.dac_entry(index);
+                    let [r, g, b] = self.vega.legacy_mut().dac_entry(index);
                     let gray =
                         ((u16::from(r) * 77 + u16::from(g) * 151 + u16::from(b) * 28) >> 8) as u8;
-                    self.video.set_dac_entry(index, gray, gray, gray);
+                    self.vega
+                        .legacy_mut()
+                        .set_dac_entry(index, gray, gray, gray);
                 }
             }
             _ => {}
@@ -1714,7 +1765,7 @@ impl Machine {
         let bh = (bx >> 8) as u8;
         let cx = self.cpu.registers.ecx() as u16;
         let dx = self.cpu.registers.edx() as u16;
-        let table = self.video.char_map_table(bl);
+        let table = self.vega.legacy_mut().char_map_table(bl);
         match al {
             0x00 | 0x10 => {
                 let bp = self.cpu.registers.ebp() as u16;
@@ -1726,39 +1777,41 @@ impl Machine {
                 // byte-at-a-time bus reads plus a multi-megabyte allocation.
                 let count = (cx as usize).min(256);
                 let bytes = self.read_guest_block(es_base + u32::from(bp), count * bh as usize);
-                self.video.load_font_table(table, dx, bh, &bytes);
+                self.vega
+                    .legacy_mut()
+                    .load_font_table(table, dx, bh, &bytes);
                 self.set_int43_pointer(self.cpu.registers.segment(SegmentIndex::Es).selector, bp);
                 if al >= 0x10 {
-                    self.video.set_char_height(bh);
+                    self.vega.legacy_mut().set_char_height(bh);
                 }
                 self.publish_int43_font_table();
             }
             0x01 | 0x11 => {
-                self.video.load_rom_font(table, 14);
+                self.vega.legacy_mut().load_rom_font(table, 14);
                 self.set_int43_pointer(BIOS_ROM_SEGMENT, BIOS_FONT_8X14_ROM_OFFSET);
                 if al >= 0x10 {
-                    self.video.set_char_height(14);
+                    self.vega.legacy_mut().set_char_height(14);
                 }
                 self.publish_int43_font_table();
             }
             0x02 | 0x12 => {
-                self.video.load_rom_font(table, 8);
+                self.vega.legacy_mut().load_rom_font(table, 8);
                 self.set_int43_pointer(BIOS_ROM_SEGMENT, BIOS_FONT_8X8_ROM_OFFSET);
                 if al >= 0x10 {
-                    self.video.set_char_height(8);
+                    self.vega.legacy_mut().set_char_height(8);
                 }
                 self.publish_int43_font_table();
             }
             0x04 | 0x14 => {
-                self.video.load_rom_font(table, 16);
+                self.vega.legacy_mut().load_rom_font(table, 16);
                 self.set_int43_pointer(BIOS_ROM_SEGMENT, BIOS_FONT_8X16_ROM_OFFSET);
                 if al >= 0x10 {
-                    self.video.set_char_height(16);
+                    self.vega.legacy_mut().set_char_height(16);
                 }
                 self.publish_int43_font_table();
             }
             0x03 => {
-                self.video.set_char_map_select(bl);
+                self.vega.legacy_mut().set_char_map_select(bl);
                 self.publish_int43_font_table();
             }
             0x20 => {
@@ -1773,8 +1826,10 @@ impl Machine {
                 let bytes_per_char = cx.clamp(1, 32) as u8;
                 let bytes = self
                     .read_guest_block(es_base + u32::from(bp), 256 * usize::from(bytes_per_char));
-                self.video.set_char_map_select(0);
-                self.video.load_font_table(0, 0, bytes_per_char, &bytes);
+                self.vega.legacy_mut().set_char_map_select(0);
+                self.vega
+                    .legacy_mut()
+                    .load_font_table(0, 0, bytes_per_char, &bytes);
                 self.set_graphics_font_grid(bytes_per_char, bl, dx as u8);
             }
             0x22 => self.load_rom_graphics_font(14, bl, dx as u8),
@@ -1796,9 +1851,9 @@ impl Machine {
     }
 
     fn publish_int43_font_table(&mut self) {
-        let height = self.video.char_height();
-        let table = self.video.active_font_table();
-        let bytes = self.video.font_table_image(table, height);
+        let height = self.vega.legacy_mut().char_height();
+        let table = self.vega.legacy_mut().active_font_table();
+        let bytes = self.vega.legacy_mut().font_table_image(table, height);
         self.write_guest_block(VGA_BIOS_INT43_FONT_ADDR, &bytes);
         self.set_int43_pointer(VGA_BIOS_SEGMENT, VGA_BIOS_FONT_TABLE_OFF);
         let _ = self.memory.write_u8(0x485, height);
@@ -1840,13 +1895,13 @@ impl Machine {
     }
 
     fn load_rom_graphics_font(&mut self, height: u8, row_specifier: u8, user_rows: u8) {
-        self.video.set_char_map_select(0);
-        self.video.load_rom_font(0, height);
+        self.vega.legacy_mut().set_char_map_select(0);
+        self.vega.legacy_mut().load_rom_font(0, height);
         self.set_graphics_font_grid(height, row_specifier, user_rows);
     }
 
     fn set_graphics_font_grid(&mut self, bytes_per_char: u8, row_specifier: u8, user_rows: u8) {
-        if self.video.active_mode() != VideoMode::Planar {
+        if self.vega.legacy_mut().active_mode() != VideoMode::Planar {
             return;
         }
         let rows = match row_specifier {
@@ -1916,15 +1971,16 @@ impl Machine {
         let row_bytes = columns * 2;
         for offset in 0..((rows - 1) * row_bytes) {
             let byte = self
-                .video
+                .vega
+                .legacy_mut()
                 .read_u8(base + offset + row_bytes)
                 .unwrap_or(b' ');
-            let _ = self.video.write_u8(base + offset, byte);
+            let _ = self.vega.legacy_mut().write_u8(base + offset, byte);
         }
         let last = base + (rows - 1) * row_bytes;
         for col in 0..columns {
-            let _ = self.video.write_u8(last + col * 2, b' ');
-            let _ = self.video.write_u8(last + col * 2 + 1, 0x07);
+            let _ = self.vega.legacy_mut().write_u8(last + col * 2, b' ');
+            let _ = self.vega.legacy_mut().write_u8(last + col * 2 + 1, 0x07);
         }
     }
 
@@ -1948,11 +2004,11 @@ impl Machine {
     ) {
         let cell_height = self.graphics_text_cell_height();
         let x0 = (left * 8) as u16;
-        let x1 = ((right + 1) * 8).min(self.video.raster_width() as usize) as u16;
+        let x1 = ((right + 1) * 8).min(self.vega.legacy_mut().raster_width() as usize) as u16;
         let y0 = (top * cell_height) as u16;
         let y1 = ((bottom + 1) * cell_height) as u16;
         let height = bottom - top + 1;
-        let fill = match self.video.active_mode() {
+        let fill = match self.vega.legacy_mut().active_mode() {
             VideoMode::Cga => color & 0x7F,
             VideoMode::Planar => color & 0x0F,
             _ => color,
@@ -2049,12 +2105,8 @@ impl Machine {
 
     fn vbe_set_mode(&mut self) {
         let request = self.cpu.registers.ebx() as u16;
-        let mode = request & 0x01ff;
-        if self.margo.set_mode(mode) {
-            self.margo_active = true;
-            self.margo_linear = request & 0x4000 != 0;
-            self.margo_bank = 0;
-            self.video.set_dac_component_bits(6);
+        if self.vega.set_vbe_mode(request) {
+            self.vega.legacy_mut().set_dac_component_bits(6);
             self.set_vbe_status(0x004f);
         } else {
             self.set_vbe_status(0x014f);
@@ -2062,54 +2114,34 @@ impl Machine {
     }
 
     fn vbe_current_mode(&mut self) {
-        let mode = if self.margo_active {
-            self.margo.display().mode | if self.margo_linear { 0x4000 } else { 0 }
-        } else {
-            0x0003 // VBE mode 0003h: standard 80x25 text fallback
-        };
+        let mode = self.vega.current_vbe_mode().unwrap_or(0x0003);
         let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
         self.cpu.registers.set_ebx(ebx);
         self.set_vbe_status(0x004f);
     }
 
     fn vbe_window_control(&mut self) {
-        if !self.margo_active {
-            self.set_vbe_status(0x014f);
-            return;
-        }
-        if self.margo_linear {
-            self.set_vbe_status(0x034f);
-            return;
-        }
-
         let bx = self.cpu.registers.ebx() as u16;
-        if bx as u8 != 0 {
-            self.set_vbe_status(0x014f);
-            return;
-        }
-        match (bx >> 8) as u8 {
-            0x00 => {
-                self.margo_bank = self.cpu.registers.edx() as u16;
-                self.set_vbe_status(0x004f);
-            }
-            0x01 => {
-                let edx = (self.cpu.registers.edx() & 0xffff_0000) | u32::from(self.margo_bank);
+        let bank = self.cpu.registers.edx() as u16;
+        match self.vega.vbe_window_control(bx, bank) {
+            Ok(selected) => {
+                let edx = (self.cpu.registers.edx() & 0xffff_0000) | u32::from(selected);
                 self.cpu.registers.set_edx(edx);
                 self.set_vbe_status(0x004f);
             }
-            _ => self.set_vbe_status(0x014f),
+            Err(status) => self.set_vbe_status(status),
         }
     }
 
     fn vbe_display_start(&mut self) {
-        if !self.margo_active {
+        if !self.vega.margo_active() {
             self.set_vbe_status(0x014f);
             return;
         }
 
         match self.cpu.registers.ebx() as u8 {
             0x00 | 0x80 => {
-                let display = self.margo.display();
+                let display = self.vega.margo_display();
                 let x = self.cpu.registers.ecx() as u16;
                 let y = self.cpu.registers.edx() as u16;
                 let depth = bytes_per_pixel(display.bpp);
@@ -2118,7 +2150,7 @@ impl Machine {
                     .saturating_add(u64::from(x).saturating_mul(u64::from(depth)));
                 if u32::from(x) >= display.width
                     || start > u64::from(u32::MAX)
-                    || !self.margo.program_display_start(start as u32)
+                    || !self.vega.program_display_start(start as u32)
                 {
                     self.set_vbe_status(0x014f);
                     return;
@@ -2129,7 +2161,7 @@ impl Machine {
                 self.set_vbe_status(0x004f);
             }
             0x01 => {
-                let display = self.margo.display();
+                let display = self.vega.margo_display();
                 let depth = bytes_per_pixel(display.bpp).max(1);
                 let (x, y) = if display.pitch == 0 {
                     (0, 0)
@@ -2151,7 +2183,7 @@ impl Machine {
     }
 
     fn vbe_dac_format(&mut self) {
-        if !self.margo_active || self.margo.display().bpp != 8 {
+        if !self.vega.margo_active() || self.vega.margo_display().bpp != 8 {
             self.set_vbe_status(0x034f);
             return;
         }
@@ -2168,20 +2200,20 @@ impl Machine {
                     return;
                 }
             }
-            0x01 => self.video.dac_component_bits(),
+            0x01 => self.vega.legacy_mut().dac_component_bits(),
             _ => {
                 self.set_vbe_status(0x014f);
                 return;
             }
         };
-        self.video.set_dac_component_bits(bits);
+        self.vega.legacy_mut().set_dac_component_bits(bits);
         let ebx = (self.cpu.registers.ebx() & !0xff00) | (u32::from(bits) << 8);
         self.cpu.registers.set_ebx(ebx);
         self.set_vbe_status(0x004f);
     }
 
     fn vbe_palette_data(&mut self) {
-        if !self.margo_active || self.margo.display().bpp != 8 {
+        if !self.vega.margo_active() || self.vega.margo_display().bpp != 8 {
             self.set_vbe_status(0x034f);
             return;
         }
@@ -2200,7 +2232,7 @@ impl Machine {
                     self.stall_until_margo_frame();
                 }
                 for (offset, entry) in entries.chunks_exact(4).enumerate() {
-                    self.video.set_dac_entry(
+                    self.vega.legacy_mut().set_dac_entry(
                         (usize::from(start) + offset) as u8,
                         entry[2],
                         entry[1],
@@ -2212,7 +2244,7 @@ impl Machine {
             0x01 => {
                 let mut entries = Vec::with_capacity(usize::from(count) * 4);
                 for offset in 0..count {
-                    let [r, g, b] = self.video.dac_entry((start + offset) as u8);
+                    let [r, g, b] = self.vega.legacy_mut().dac_entry((start + offset) as u8);
                     entries.extend_from_slice(&[b, g, r, 0]);
                 }
                 self.write_guest_block(address, &entries);
@@ -2268,24 +2300,14 @@ impl Machine {
     }
 
     pub fn set_margo_mode_640x480x8(&mut self) {
-        self.margo.set_mode_640x480x8();
-        self.margo_active = true;
-        self.margo_linear = true;
-        self.margo_bank = 0;
-        self.distira.disable_display();
+        self.vega.set_margo_mode_640x480x8();
     }
 
     pub fn active_display(&self) -> ActiveDisplay {
         // Every VGA mode (text, planar, mode X, mode 13h) now presents a raster
         // through the core. VEGA also exposes Margo's linear framebuffer and
         // Distira's Voodoo-style front buffer as alternate scanout paths.
-        if self.distira.display_enabled() {
-            ActiveDisplay::Distira
-        } else if self.margo_active {
-            ActiveDisplay::MargoLfb
-        } else {
-            ActiveDisplay::VgaRaster
-        }
+        self.vega.active_display()
     }
 
     /// Emulated vertical refresh of the active display, in Hz. The host uses
@@ -2295,52 +2317,22 @@ impl Machine {
     /// repaint interval. Margo's linear framebuffer has no beam model, so it
     /// reports a plain 60 Hz.
     pub fn display_refresh_hz(&self) -> f64 {
-        let hz = match self.active_display() {
-            ActiveDisplay::VgaRaster => match self.video.frame_dots() {
-                0 => 60.0,
-                dots => self.video.dot_clock_hz() as f64 / dots as f64,
-            },
-            ActiveDisplay::MargoLfb | ActiveDisplay::Distira => 60.0,
-        };
-        hz.clamp(50.0, 120.0)
+        self.vega.display_refresh_hz()
     }
 
     pub fn vga_raster(&mut self) -> Option<VgaRaster> {
-        self.video.last_presented().cloned()
+        self.vega.vga_raster()
     }
 
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
-        self.video.palette_argb()
+        self.vega.palette_argb()
     }
 
     /// The active display as native-resolution `0x00RRGGBB` words plus
     /// `(width, height)`. Mirrors the GUI's scanout so the unit tester's CRC and
     /// snapshot see exactly what is presented on screen.
     pub fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
-        let palette = self.palette_argb();
-        match self.active_display() {
-            ActiveDisplay::VgaRaster => match self.vga_raster() {
-                Some(raster) => {
-                    let words = raster
-                        .pixels
-                        .iter()
-                        .map(|&index| palette[usize::from(index)])
-                        .collect();
-                    (words, raster.width as usize, raster.height as usize)
-                }
-                None => (vec![0], 1, 1),
-            },
-            ActiveDisplay::MargoLfb => {
-                let display = self.margo.display();
-                let (width, height) = (display.width as usize, display.height as usize);
-                (self.margo.scanout_argb(&palette), width, height)
-            }
-            ActiveDisplay::Distira => {
-                let display = self.distira.display();
-                let (width, height) = (display.width as usize, display.height as usize);
-                (self.distira.scanout_argb(), width, height)
-            }
-        }
+        self.vega.frame_argb()
     }
 
     /// An O(1) content-generation key for the host-side dirty-framebuffer cache.
@@ -2353,7 +2345,7 @@ impl Machine {
     /// can change the output: the Vga `content_gen` (bumped inside every Vga display
     /// mutator — VRAM writers, register/DAC writes, and the start-address latch — so
     /// it catches writes from BOTH the CPU bus AND the HLE BIOS INT 10h services that
-    /// mutate `self.video` directly, regardless of caller), plus the raster dimensions
+    /// mutate the legacy Adapter directly, regardless of caller), plus the raster dimensions
     /// (so a mode or resolution change always moves the key).
     ///
     /// Returns `None` for text mode (time-based cursor/attribute blink toggles with no
@@ -2361,21 +2353,7 @@ impl Machine {
     /// in v1 — for Margo LFB / Distira (their own scanout; a generation for them is
     /// deferred to v2). Pure `&self`: no rendering, no timing side effects.
     pub fn frame_generation(&self) -> Option<u64> {
-        if self.active_display() != ActiveDisplay::VgaRaster || self.video.is_text_mode() {
-            return None;
-        }
-        // A cheap reversible mix: each input is multiplied by a distinct large odd
-        // constant, so the key changes whenever any input changes.
-        const K: u64 = 0x9E37_79B9_7F4A_7C15; // golden-ratio odd multiplier
-        let width = u64::from(self.video.raster_width());
-        let height = u64::from(self.video.raster_height());
-        let key = self
-            .video
-            .content_gen()
-            .wrapping_mul(K)
-            .wrapping_add(width.wrapping_mul(0x0001_0000_0001))
-            .wrapping_add(height.wrapping_mul(0x1_0000_0001_0000));
-        Some(key)
+        self.vega.frame_generation()
     }
 
     /// zlib/IEEE CRC-32 of a framebuffer rectangle, each pixel hashed as its four
@@ -2384,18 +2362,7 @@ impl Machine {
     /// value the unit tester returns at `REG_CRC`, and a handy Rust-side check
     /// for the boot suite.
     pub fn screen_crc32(&mut self, x: u16, y: u16, w: u16, h: u16) -> u32 {
-        let (words, frame_w, frame_h) = self.frame_argb();
-        let x = usize::from(x);
-        let y = usize::from(y);
-        let x_end = x.saturating_add(usize::from(w)).min(frame_w);
-        let y_end = y.saturating_add(usize::from(h)).min(frame_h);
-        let mut bytes = Vec::new();
-        for row in y..y_end {
-            for col in x..x_end {
-                bytes.extend_from_slice(&words[row * frame_w + col].to_le_bytes());
-            }
-        }
-        unittester::crc32(&bytes)
+        self.vega.screen_crc32(x, y, w, h)
     }
 
     /// Set where the unit tester's Snapshot command writes PPM frames. `None`

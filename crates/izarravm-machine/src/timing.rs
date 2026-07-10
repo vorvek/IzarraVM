@@ -501,16 +501,14 @@ impl Machine {
             self.cd_accesses += 1;
         }
 
-        self.margo.advance_busy(advance.margo_nanoseconds);
-        self.margo.advance_frames(advance.margo_frames);
+        self.vega.advance(
+            advance.margo_nanoseconds,
+            advance.margo_frames,
+            advance.distira_lines,
+            advance.vga_dots,
+        );
 
-        // Distira's 525-line scanout runs at 60 Hz in fixed guest time,
-        // independent of the active CPU mode.
-        self.distira.advance_frame_phase(advance.distira_lines);
-
-        self.video.advance(advance.vga_dots);
-
-        self.pump_pusher();
+        self.vega.pump_pusher(&self.memory);
     }
 
     fn advance_fdc_to(&mut self, target_ticks: u64) {
@@ -587,7 +585,7 @@ impl Machine {
                 0
             },
             cd_playing: self.ide.device().playback().playing,
-            vga_dot_hz: self.video.dot_clock_hz(),
+            vga_dot_hz: self.vega.dot_clock_hz(),
         }
     }
 
@@ -714,20 +712,20 @@ impl Machine {
     /// onto (or a dot or two past) the edge. `None` means the CRTC has no usable
     /// frame geometry.
     fn clocks_to_vretrace_start(&self) -> Option<u64> {
-        let edge_dots = self.video.dots_until_vretrace_start()?;
+        let edge_dots = self.vega.dots_until_vretrace_start()?;
         self.timeline.cpu_clocks_until(
             timeline::DeviceClock::Vga,
             edge_dots,
-            self.video.dot_clock_hz(),
+            self.vega.dot_clock_hz(),
         )
     }
 
     fn master_ticks_to_vretrace_start(&self) -> Option<u64> {
-        let edge_dots = self.video.dots_until_vretrace_start()?;
+        let edge_dots = self.vega.dots_until_vretrace_start()?;
         self.timeline.master_ticks_until(
             timeline::DeviceClock::Vga,
             edge_dots,
-            self.video.dot_clock_hz(),
+            self.vega.dot_clock_hz(),
         )
     }
 
@@ -996,7 +994,7 @@ impl Machine {
         if let Some(ticks) = self.next_ata_deadline() {
             cap = cap.min(self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1));
         }
-        if self.margo.display_start_pending()
+        if self.vega.display_start_pending()
             && let Some(clocks) = self.timeline.cpu_clocks_until(
                 timeline::DeviceClock::MargoFrame,
                 1,
@@ -1070,8 +1068,8 @@ impl MachineBus<'_> {
         let in_batch_clocks = self.in_batch_clocks();
         let (_, whole_dots) = self
             .timeline_at_batch_start
-            .preview_cpu_clocks(in_batch_clocks, self.video.dot_clock_hz());
-        let frame = self.video.frame_dots();
+            .preview_cpu_clocks(in_batch_clocks, self.vega.dot_clock_hz());
+        let frame = self.vega.frame_dots();
         if frame == 0 {
             return self.beam_at_batch_start; // guard: un-programmed CRTC, mirrors Vga::advance
         }
@@ -1121,7 +1119,7 @@ impl MachineBus<'_> {
     /// followed by a read would produce.
     pub(super) fn elapsed_pit_clocks(&self) -> u64 {
         self.timeline_at_batch_start
-            .preview_cpu_clocks(self.in_batch_clocks(), self.video.dot_clock_hz())
+            .preview_cpu_clocks(self.in_batch_clocks(), self.vega.dot_clock_hz())
             .0
     }
 

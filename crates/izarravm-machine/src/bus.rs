@@ -5,9 +5,9 @@ use super::*;
 
 impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
-        // Captured before the struct literal below since video/trace are also
+        // Captured before the struct literal below since VEGA and trace are also
         // mutably borrowed by other fields in that same literal.
-        let beam_at_batch_start = self.video.beam_dots();
+        let beam_at_batch_start = self.vega.beam_dots();
         let trace_elapsed_at_batch_start = self.trace.elapsed_clocks();
         // Read from the CPU, the same authoritative mode owner that scale_bus
         // uses. Machine's active_mode copy is kept for bus register readback.
@@ -15,12 +15,7 @@ impl Machine {
         MachineBus {
             memory: &mut self.memory,
             ram_lookup: &mut self.ram_lookup,
-            video: &mut self.video,
-            margo: &mut self.margo,
-            margo_active: self.margo_active,
-            margo_linear: self.margo_linear,
-            margo_bank: self.margo_bank,
-            distira: &mut self.distira,
+            vega: &mut self.vega,
             pci: &mut self.pci,
             rom: &self.rom,
             serial: &mut self.serial,
@@ -389,39 +384,10 @@ impl CpuBus for MachineBus<'_> {
         let address = self.apply_a20(address);
         let bytes = width.bytes() as usize;
 
-        if let Some(offset) = self.distira_lfb_offset(address, bytes) {
+        if let Some(value) = self.vega.read_wide_memory(address, width) {
             let ws = self.data_access_wait_states(address, width);
             self.trace.record(kind, address, width, ws);
-            let offset = if width == BusWidth::Byte {
-                offset
-            } else {
-                offset & !1
-            };
-            return Ok(match width {
-                BusWidth::Byte => 0xff,
-                BusWidth::Word => u32::from(self.distira.read_lfb_u16(offset)),
-                BusWidth::Dword => self.distira.read_lfb_u32(offset),
-            });
-        }
-
-        if self.distira_texture_offset(address, bytes).is_some() {
-            let ws = self.data_access_wait_states(address, width);
-            self.trace.record(kind, address, width, ws);
-            return Ok(match width {
-                BusWidth::Byte => 0xff,
-                BusWidth::Word => 0xffff,
-                BusWidth::Dword => 0xffff_ffff,
-            });
-        }
-
-        if self.distira_cmdfifo_offset(address, bytes).is_some() {
-            let ws = self.data_access_wait_states(address, width);
-            self.trace.record(kind, address, width, ws);
-            return Ok(match width {
-                BusWidth::Byte => 0xff,
-                BusWidth::Word => 0xffff,
-                BusWidth::Dword => u32::MAX,
-            });
+            return Ok(value);
         }
 
         if should_split(address, width) {
@@ -464,28 +430,9 @@ impl CpuBus for MachineBus<'_> {
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
         let address = self.apply_a20(address);
-        if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
+        if self.vega.write_wide_memory(address, width, value) {
             let ws = self.data_access_wait_states(address, width);
             self.trace.record(kind, address, width, ws);
-            let offset = if width == BusWidth::Byte {
-                offset
-            } else {
-                offset & !1
-            };
-            match width {
-                BusWidth::Byte => {}
-                BusWidth::Word => self.distira.write_lfb_u16(offset, value as u16),
-                BusWidth::Dword => self.distira.write_lfb_u32(offset, value),
-            }
-            return Ok(());
-        }
-
-        if let Some(offset) = self.distira_texture_offset(address, width.bytes() as usize) {
-            let ws = self.data_access_wait_states(address, width);
-            self.trace.record(kind, address, width, ws);
-            if width == BusWidth::Dword {
-                self.distira.write_texture_u32(offset, value);
-            }
             return Ok(());
         }
 
@@ -514,10 +461,7 @@ impl CpuBus for MachineBus<'_> {
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
 
-        if let Some(offset) = self.distira_cmdfifo_offset(address, width.bytes() as usize) {
-            if width == BusWidth::Dword {
-                self.distira.write_command_fifo_u32(offset, value);
-            }
+        if self.vega.write_command_memory(address, width, value) {
             return Ok(());
         }
 
@@ -693,7 +637,7 @@ impl CpuBus for MachineBus<'_> {
             self.wait_states.io,
         );
 
-        if let Some(value) = self.pci.read_io(port, width) {
+        if let Some(value) = self.pci.read_io(port, width, self.vega) {
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -738,7 +682,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(value);
         }
 
-        if self.video_io_disabled_for_port(port) {
+        if self.vega.port_disabled(port) {
             if !skip_io_touched {
                 *self.io_touched = true;
             }
@@ -785,10 +729,10 @@ impl CpuBus for MachineBus<'_> {
         // a dot-clock switch is not beam-continuous on real hardware either, and the
         // write itself sets io_touched and ends the batch, so no further lazy read
         // can observe the stale prediction within the same batch.
-        if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.video_io_enabled_for_port(port) {
+        if matches!(port, 0x3DA | 0x3BA | 0x3C2) && self.vega.port_enabled(port) {
             if self.lazy_port_reads {
                 let beam = self.predicted_beam();
-                if let Some(value) = self.video.read_status_port_lazy(port, beam) {
+                if let Some(value) = self.vega.read_status_port_lazy(port, beam) {
                     return Ok(u32::from(value));
                 }
                 // Inactive alias (e.g. 3BA polled in a color setup): no side
@@ -805,12 +749,12 @@ impl CpuBus for MachineBus<'_> {
                 if !skip_io_touched {
                     *self.io_touched = true;
                 }
-                if let Some(value) = self.video.read_port(port) {
+                if let Some(value) = self.vega.read_port(port) {
                     return Ok(u32::from(value));
                 }
             }
-        } else if self.video_io_enabled_for_port(port) {
-            if let Some(value) = self.video.read_port(port) {
+        } else if self.vega.port_enabled(port) {
+            if let Some(value) = self.vega.read_port(port) {
                 if !skip_io_touched {
                     *self.io_touched = true;
                 }
@@ -1044,18 +988,12 @@ impl CpuBus for MachineBus<'_> {
             self.wait_states.io,
         );
 
-        let pci_decode = self.pci.distira_memory_decode_key();
-        if self.pci.write_io(port, width, value) {
-            if self.pci.distira_memory_decode_key() != pci_decode {
-                self.ram_lookup.rebuild(self.memory.len(), self.pci);
+        let pci_decode = self.vega.memory_decode_key();
+        if self.pci.write_io(port, width, value, self.vega) {
+            if self.vega.memory_decode_key() != pci_decode {
+                self.ram_lookup.rebuild(self.memory.len(), self.vega);
                 *self.direct_map_changed = true;
             }
-            // initEnable lives in PCI config space (offset 0x40) on real SST-1
-            // hardware, not the MMIO window, but Distira's own fbiInit2/dacData
-            // DAC-detect handshake needs to see its remap bit. Mirror it into
-            // the device on every config-space write so it never drifts from
-            // the PciConfig copy of record.
-            self.distira.set_init_enable(self.pci.distira_init_enable());
             if let Some(disk) = self.ata.as_mut() {
                 self.bmide
                     .synchronize(self.pci.ide_bus_master_enabled(), self.memory, disk);
@@ -1097,7 +1035,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
 
-        if self.video_io_disabled_for_port(port) {
+        if self.vega.port_disabled(port) {
             return Ok(());
         }
 
@@ -1228,7 +1166,7 @@ impl CpuBus for MachineBus<'_> {
             || self.serial2.write_port(port, value as u8)
             || self.lpt.write_port(port, value as u8)
             || self.lpt2.write_port(port, value as u8)
-            || (self.video_io_enabled_for_port(port) && self.video.write_port(port, value as u8))
+            || (self.vega.port_enabled(port) && self.vega.write_port(port, value as u8))
             || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
             || self.keyboard.write_port(port, value as u8)
@@ -1468,14 +1406,6 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
 }
 
 impl MachineBus<'_> {
-    fn video_io_disabled_for_port(&self, port: u16) -> bool {
-        !self.video.video_subsystem_enabled() && port != 0x3C3 && (0x3B0..=0x3DF).contains(&port)
-    }
-
-    fn video_io_enabled_for_port(&self, port: u16) -> bool {
-        self.video.video_subsystem_enabled() || port == 0x3C3
-    }
-
     /// In-region offset (0..=7) of `port` within the AD1848 / WSS port window
     /// `[wss_base, wss_base + 8)`, or `None` when the codec is disabled or the
     /// port lies outside the window. The codec's read_port/write_port take this
@@ -1485,62 +1415,6 @@ impl MachineBus<'_> {
             return None;
         }
         port.checked_sub(self.wss_base).filter(|&off| off < 8)
-    }
-
-    fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
-        self.pci.distira_mmio_offset(address, width)
-    }
-
-    fn distira_lfb_offset(&self, address: u32, width: usize) -> Option<usize> {
-        self.pci.distira_lfb_offset(address, width)
-    }
-
-    fn distira_texture_offset(&self, address: u32, width: usize) -> Option<usize> {
-        self.pci.distira_texture_offset(address, width)
-    }
-
-    fn distira_cmdfifo_offset(&self, address: u32, width: usize) -> Option<usize> {
-        self.pci.distira_cmdfifo_offset(address, width)
-    }
-
-    fn video_text_offset(&self, address: u32, width: usize) -> Option<usize> {
-        // The Hercules personality has its own dedicated B0000-BFFFF decode
-        // (`hgc_offset`, checked first by both callers below): it must not
-        // also fall through to this single-sliding-window text/CGA decode,
-        // which would let an unpaged-in B8000 access reach `text_memory` as
-        // an MDA/CGA text write instead of correctly missing.
-        if self.video.is_hercules_personality() {
-            return None;
-        }
-        self.video
-            .video_memory_enabled()
-            .then(|| video_text_offset(self.video.text_memory_base(), address, width))
-            .flatten()
-    }
-
-    /// The Hercules graphics window, B0000-BFFFF: unlike the single sliding
-    /// 32K window `video_text_offset` decodes for text/CGA, both Hercules pages
-    /// are simultaneously addressable at their real hardware addresses (page 0
-    /// always at B0000, page 1 at B8000 once 3BFh pages it in), independent of
-    /// which page the CRTC is currently scanning out. Only live while the
-    /// Hercules personality is active; text mode 07h (also mono, also
-    /// B0000-based) keeps using `video_text_offset` as before.
-    fn hgc_offset(&self, address: u32, width: usize) -> Option<usize> {
-        if !self.video.video_memory_enabled() || !self.video.is_hercules_personality() {
-            return None;
-        }
-        let end = VGA_MONO_TEXT_BASE + (HGC_FB_SIZE as u32 * 2);
-        if !(VGA_MONO_TEXT_BASE..end).contains(&address) || address + width as u32 > end {
-            return None;
-        }
-        let offset = (address - VGA_MONO_TEXT_BASE) as usize;
-        // Page 1 (B8000-BFFFF, offset 0x8000..0x10000) only decodes once 3BFh
-        // has paged it in; otherwise that half is open bus (unmapped), matching
-        // real hardware where the second bank simply is not there.
-        if offset >= HGC_FB_SIZE && !self.video.hgc_page1_addressable() {
-            return None;
-        }
-        Some(offset)
     }
 
     /// Apply the A20 gate to a physical address before it reaches memory. The gate
@@ -1592,37 +1466,6 @@ impl MachineBus<'_> {
             .map(|(start, end)| (gated, start, end))
     }
 
-    /// The plane-window offset for an access that the guest-selected GC06 graphics
-    /// aperture redirects. Only graphics modes consult the aperture; text and CGA
-    /// keep the fixed B8000 decode.
-    fn vga_gfx_offset(&self, address: u32, width: usize) -> Option<usize> {
-        if !self.video.video_memory_enabled() {
-            return None;
-        }
-        match self.video.active_mode() {
-            VideoMode::Planar | VideoMode::ModeX | VideoMode::Mode13h => {
-                let ap = self.video.gfx_aperture();
-                vga_gfx_aperture_offset(ap.base, ap.length, address, width)
-            }
-            VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => None,
-        }
-    }
-
-    fn margo_banked_window_at(&self, address: u32) -> bool {
-        self.margo_active
-            && !self.margo_linear
-            && (VGA_MODE13H_BASE..VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE).contains(&address)
-    }
-
-    fn margo_banked_window_offset(&self, address: u32) -> Option<usize> {
-        if !self.margo_banked_window_at(address) {
-            return None;
-        }
-        let bank = usize::from(self.margo_bank) * VGA_PLANAR_WINDOW_SIZE as usize;
-        let offset = bank + (address - VGA_MODE13H_BASE) as usize;
-        (offset < MARGO_VRAM_SIZE).then_some(offset)
-    }
-
     fn read_phys_u8(&mut self, address: u32) -> Result<u8, BusError> {
         let mut byte = [0];
         self.read_phys(address, &mut byte)?;
@@ -1645,130 +1488,7 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        if self.margo_banked_window_at(address) {
-            for (index, byte) in out.iter_mut().enumerate() {
-                *byte = address
-                    .checked_add(index as u32)
-                    .and_then(|address| self.margo_banked_window_offset(address))
-                    .map(|offset| self.margo.read_vram_u8(offset))
-                    .unwrap_or(0xff);
-            }
-            return Ok(());
-        }
-
-        // A guest that moves the graphics aperture through GC06 (memory map select)
-        // redirects the framebuffer window. When the active mode is a graphics mode
-        // and GC06 points at a moved window, route the access through the planar /
-        // chain-4 datapath before the fixed text/CGA window decode below.
-        if let Some(offset) = self.vga_gfx_offset(address, width) {
-            for (i, byte) in out.iter_mut().enumerate() {
-                *byte = match self.video.active_mode() {
-                    VideoMode::Mode13h => self.video.cpu_read_chain4(offset + i),
-                    _ => self.video.cpu_read(offset + i),
-                };
-            }
-            return Ok(());
-        }
-
-        // Hercules graphics: both B0000 (page 0) and B8000 (page 1, once paged
-        // in) are live simultaneously, unlike the single sliding text/CGA
-        // window below, so this is checked first and independently.
-        if let Some(offset) = self.hgc_offset(address, width) {
-            for (index, byte) in out.iter_mut().enumerate() {
-                *byte = self.video.hgc_read(offset + index);
-            }
-            return Ok(());
-        }
-
-        if let Some(offset) = self.video_text_offset(address, width) {
-            // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
-            // framebuffer; in text mode it is the character/attribute buffer.
-            let cga_window = self.video.is_cga_personality();
-            let cga_graphics = self.video.active_mode() == VideoMode::Cga;
-            for (index, byte) in out.iter_mut().enumerate() {
-                let byte_offset = if cga_window {
-                    (offset + index) & (CGA_FB_SIZE - 1)
-                } else {
-                    offset + index
-                };
-                *byte = if cga_graphics {
-                    self.video.cga_read(byte_offset)
-                } else {
-                    self.video
-                        .read_u8(byte_offset)
-                        .map_err(|_| BusError::UnmappedMemory { address })?
-                };
-            }
-            return Ok(());
-        }
-
-        // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
-        // X) and 16-color planar route through the planar datapath (cpu_read loads
-        // the VGA latches as a side effect, so it needs &mut self); chained mode
-        // 13h routes through the chain-4 decode.
-        if self.video.video_memory_enabled() {
-            if let Some(offset) = vga_planar_offset(address, width) {
-                match self.video.active_mode() {
-                    VideoMode::Planar | VideoMode::ModeX => {
-                        for (i, byte) in out.iter_mut().enumerate() {
-                            *byte = self.video.cpu_read(offset + i);
-                        }
-                        return Ok(());
-                    }
-                    VideoMode::Mode13h => {
-                        for (i, byte) in out.iter_mut().enumerate() {
-                            *byte = self.video.cpu_read_chain4(offset + i);
-                        }
-                        return Ok(());
-                    }
-                    // Text, CGA, and Hercules do not decode the A0000 window; fall through.
-                    VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => {}
-                }
-            }
-        }
-
-        if let Some(offset) = margo_lfb_offset(address, width) {
-            for (index, byte) in out.iter_mut().enumerate() {
-                *byte = self.margo.read_vram_u8(offset + index);
-            }
-            return Ok(());
-        }
-
-        if let Some(offset) = margo_mmio_offset(address, width) {
-            for (index, byte) in out.iter_mut().enumerate() {
-                *byte = self.margo.read_mmio_u8(offset + index);
-            }
-            return Ok(());
-        }
-
-        if let Some(offset) = self.distira_lfb_offset(address, width) {
-            match width {
-                1 => out[0] = 0xff,
-                2 => out.copy_from_slice(&self.distira.read_lfb_u16(offset & !1).to_le_bytes()),
-                4 => out.copy_from_slice(&self.distira.read_lfb_u32(offset & !1).to_le_bytes()),
-                _ => {
-                    for (index, byte) in out.iter_mut().enumerate() {
-                        *byte = self.distira.read_lfb_u8(offset + index);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        if self.distira_texture_offset(address, width).is_some() {
-            out.fill(0xff);
-            return Ok(());
-        }
-
-        if self.distira_cmdfifo_offset(address, width).is_some() {
-            out.fill(0xff);
-            return Ok(());
-        }
-
-        if let Some(offset) = self.distira_mmio_offset(address, width) {
-            for (index, byte) in out.iter_mut().enumerate() {
-                *byte = self.distira.read_mmio_u8(offset + index);
-            }
+        if self.vega.read_memory(address, out) {
             return Ok(());
         }
 
@@ -1806,93 +1526,7 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        if self.margo_banked_window_at(address) {
-            if let Some(offset) = self.margo_banked_window_offset(address) {
-                self.margo.write_vram_u8(offset, value);
-            }
-            return Ok(());
-        }
-
-        // A guest that moves the graphics aperture through GC06 redirects the
-        // framebuffer window; route through the planar / chain-4 write datapath
-        // before the fixed text/CGA window decode below.
-        if let Some(offset) = self.vga_gfx_offset(address, 1) {
-            match self.video.active_mode() {
-                VideoMode::Mode13h => self.video.cpu_write_chain4(offset, value),
-                _ => self.video.cpu_write(offset, value),
-            }
-            return Ok(());
-        }
-
-        // Hercules graphics: see the matching check in `read_phys`.
-        if let Some(offset) = self.hgc_offset(address, 1) {
-            self.video.hgc_write(offset, value);
-            return Ok(());
-        }
-
-        if let Some(offset) = self.video_text_offset(address, 1) {
-            // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
-            // framebuffer; in text mode it is the character/attribute buffer.
-            let offset = if self.video.is_cga_personality() {
-                offset & (CGA_FB_SIZE - 1)
-            } else {
-                offset
-            };
-            if self.video.active_mode() == VideoMode::Cga {
-                self.video.cga_write(offset, value);
-                return Ok(());
-            }
-            return self
-                .video
-                .write_u8(offset, value)
-                .map_err(|_| BusError::UnmappedMemory { address });
-        }
-
-        // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
-        // X) and 16-color planar route A0000 through the planar datapath (map mask,
-        // write mode, bit mask, latches); chained mode 13h routes through the
-        // chain-4 decode.
-        if self.video.video_memory_enabled() {
-            if let Some(offset) = vga_planar_offset(address, 1) {
-                match self.video.active_mode() {
-                    VideoMode::Planar | VideoMode::ModeX => {
-                        self.video.cpu_write(offset, value);
-                        return Ok(());
-                    }
-                    VideoMode::Mode13h => {
-                        self.video.cpu_write_chain4(offset, value);
-                        return Ok(());
-                    }
-                    // Text, CGA, and Hercules do not decode the A0000 window; fall through.
-                    VideoMode::Text | VideoMode::Cga | VideoMode::Hercules => {}
-                }
-            }
-        }
-
-        if let Some(offset) = margo_lfb_offset(address, 1) {
-            self.margo.write_vram_u8(offset, value);
-            return Ok(());
-        }
-
-        if let Some(offset) = margo_mmio_offset(address, 1) {
-            self.margo.write_mmio_u8(offset, value);
-            return Ok(());
-        }
-
-        if self.distira_lfb_offset(address, 1).is_some() {
-            return Ok(());
-        }
-
-        if self.distira_texture_offset(address, 1).is_some() {
-            return Ok(());
-        }
-
-        if self.distira_cmdfifo_offset(address, 1).is_some() {
-            return Ok(());
-        }
-
-        if let Some(offset) = self.distira_mmio_offset(address, 1) {
-            self.distira.write_mmio_u8(offset, value);
+        if self.vega.write_memory_u8(address, value) {
             return Ok(());
         }
 
@@ -1945,17 +1579,7 @@ impl MachineBus<'_> {
     /// `address >= 0xA0000`, so conventional RAM never reaches here.
     fn is_device_window(&self, address: u32, width: BusWidth) -> bool {
         let bytes = width.bytes() as usize;
-        rom_offset(address, bytes).is_some()
-            || self.margo_banked_window_at(address)
-            || self.vga_gfx_offset(address, bytes).is_some()
-            || self.video_text_offset(address, bytes).is_some()
-            || (self.video.video_memory_enabled() && vga_planar_offset(address, bytes).is_some())
-            || margo_lfb_offset(address, bytes).is_some()
-            || margo_mmio_offset(address, bytes).is_some()
-            || self.distira_lfb_offset(address, bytes).is_some()
-            || self.distira_cmdfifo_offset(address, bytes).is_some()
-            || self.distira_texture_offset(address, bytes).is_some()
-            || self.distira_mmio_offset(address, bytes).is_some()
+        rom_offset(address, bytes).is_some() || self.vega.owns_memory(address, bytes)
     }
 
     #[inline]
@@ -1976,17 +1600,7 @@ impl MachineBus<'_> {
     fn memory_wait_states_device(&self, address: u32) -> u8 {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
-        } else if self.margo_banked_window_at(address)
-            || self.vga_gfx_offset(address, 1).is_some()
-            || self.video_text_offset(address, 1).is_some()
-            || (self.video.video_memory_enabled() && vga_planar_offset(address, 1).is_some())
-            || margo_lfb_offset(address, 1).is_some()
-            || margo_mmio_offset(address, 1).is_some()
-            || self.distira_lfb_offset(address, 1).is_some()
-            || self.distira_cmdfifo_offset(address, 1).is_some()
-            || self.distira_texture_offset(address, 1).is_some()
-            || self.distira_mmio_offset(address, 1).is_some()
-        {
+        } else if self.vega.owns_memory(address, 1) {
             // The Approximate class charges the era bus latency of a real video
             // card (see `video_wait_states_approx`); the Accurate class keeps the
             // frozen profile value bit-for-bit.
@@ -2041,56 +1655,4 @@ fn is_open_bus_uma(address: u32, width: usize) -> bool {
         return false;
     };
     address >= uma_occupied_end && end <= SYSTEM_ROM_BASE
-}
-
-fn video_text_offset(base: u32, address: u32, width: usize) -> Option<usize> {
-    let end = base + VGA_TEXT_MEMORY_SIZE as u32;
-    if (base..end).contains(&address) && address + width as u32 <= end {
-        Some((address - base) as usize)
-    } else {
-        None
-    }
-}
-
-/// The A0000 window for chained mode 13h and unchained / 16-color planar access:
-/// the full 64 KB the hardware decodes.
-fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
-    let end = VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
-    if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - VGA_MODE13H_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-/// The graphics-mode CPU window the guest selected through Graphics Controller
-/// register 06h (memory map select), as a plane-window offset for the VGA
-/// datapath. The VGA datapath addresses a 64 KB plane window; map-select 00's
-/// 128 KB host window mirrors that 64 KB plane window twice.
-fn vga_gfx_aperture_offset(base: u32, length: u32, address: u32, width: usize) -> Option<usize> {
-    let end = base + length;
-    if (base..end).contains(&address) && address + width as u32 <= end {
-        let offset = ((address - base) % VGA_PLANAR_WINDOW_SIZE) as usize;
-        (offset + width <= VGA_PLANAR_WINDOW_SIZE as usize).then_some(offset)
-    } else {
-        None
-    }
-}
-
-fn margo_lfb_offset(address: u32, width: usize) -> Option<usize> {
-    let end = MARGO_LFB_BASE + MARGO_VRAM_SIZE as u32;
-    if (MARGO_LFB_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - MARGO_LFB_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
-    let end = MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32;
-    if (MARGO_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - MARGO_MMIO_BASE) as usize)
-    } else {
-        None
-    }
 }
