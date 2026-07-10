@@ -14,12 +14,13 @@ use izarravm_video::{
     FBIINIT2_BUFFER_OFFSET_SHIFT, FBZ_DEPTH_WMASK, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
     FBZCP_TEXTURE_ENABLED, INIT_ENABLE_REMAP, INIT_ENABLE_WRITE, LFB_ENABLE_PIXEL_PIPELINE,
     LFB_FORMAT_ARGB8888, LFB_FORMAT_DEPTH, LFB_FORMAT_RGB565, LFB_READ_AUX, LFB_READ_BACK,
-    LFB_WRITE_BACK, LFB_WRITE_FRONT, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y,
-    SST_COLOR1, SST_DAC_DATA, SST_FASTFILL_CMD, SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2,
-    SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE, SST_START_A, SST_START_B,
-    SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR, SST_TEXTURE_MODE,
-    SST_TLOD, SST_TREX_INIT0, SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY,
-    SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY, SST_VIDEO_DIMENSIONS, TEX_R5G6B5,
+    LFB_WRITE_BACK, LFB_WRITE_FRONT, RGB_SELECT_TEXTURE, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT,
+    SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DAC_DATA, SST_FASTFILL_CMD, SST_FBI_INIT0,
+    SST_FBI_INIT1, SST_FBI_INIT2, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE, SST_START_A,
+    SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TEX_BASE_ADDR,
+    SST_TEXTURE_MODE, SST_TLOD, SST_TREX_INIT0, SST_TREX_INIT1, SST_TRIANGLE_CMD, SST_VERTEX_AX,
+    SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
+    SST_VIDEO_DIMENSIONS, TEX_R5G6B5, TEXTUREMODE_LOCAL,
 };
 
 const TREX0: usize = 0x2 << 10;
@@ -28,6 +29,7 @@ const DISTIRA_TEXTURE_OFFSET: u32 = 0x0080_0000;
 const DISTIRA_TEXTURE_APERTURE_SIZE: u32 = 0x0080_0000;
 const TMU1_APERTURE: u32 = 1 << 21;
 const TC_ADD_CLOCAL: u32 = 1 << 18;
+const TC_REPLACE: u32 = (1 << 12) | TC_ADD_CLOCAL;
 
 fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
     for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
@@ -139,14 +141,29 @@ fn draw_texture_sample_at(machine: &mut Machine, base: u32, tmu: usize) -> u32 {
     write_reg_at(machine, base, DISTIRA_REG_FB_WIDTH, 4);
     write_reg_at(machine, base, DISTIRA_REG_FB_HEIGHT, 4);
     write_reg_at(machine, base, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    write_reg_at(machine, base, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg_at(
+        machine,
+        base,
+        SST_FBZ_COLOR_PATH,
+        FBZCP_TEXTURE_ENABLED | RGB_SELECT_TEXTURE,
+    );
     write_reg_at(
         machine,
         base,
         TREX0 | SST_TEXTURE_MODE,
-        (TEX_R5G6B5 << 8) | if tmu == 1 { TC_ADD_CLOCAL } else { 0 },
+        (TEX_R5G6B5 << 8)
+            | if tmu == 1 {
+                TC_ADD_CLOCAL
+            } else {
+                TEXTUREMODE_LOCAL
+            },
     );
-    write_reg_at(machine, base, TREX1 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg_at(
+        machine,
+        base,
+        TREX1 | SST_TEXTURE_MODE,
+        (TEX_R5G6B5 << 8) | if tmu == 1 { TC_REPLACE } else { 0 },
+    );
     write_reg_at(machine, base, SST_VERTEX_AX, 0);
     write_reg_at(machine, base, SST_VERTEX_AY, 0);
     write_reg_at(machine, base, SST_VERTEX_BX, 3 << 4);
@@ -172,18 +189,6 @@ fn write_texture_texel(machine: &mut Machine, tmu: usize, byte_address: u32, tex
         DISTIRA_MMIO_BASE + DISTIRA_TEXTURE_OFFSET + if tmu == 0 { 0 } else { TMU1_APERTURE };
     write_reg(machine, chip | SST_TEX_BASE_ADDR, byte_address >> 3);
     machine.write_physical_u32(aperture, u32::from(texel) | (u32::from(texel) << 16));
-}
-
-fn cmdfifo_type1_header(reg: usize, count: u32) -> u32 {
-    1 | (((reg as u32) << 1) & 0x7ff8) | (count << 16)
-}
-
-fn cmdfifo_type5_framebuffer_header(count: u32) -> u32 {
-    (2 << 30) | (count << 3) | 5
-}
-
-fn cmdfifo_type5_texture_header(count: u32) -> u32 {
-    (3 << 30) | (count << 3) | 5
 }
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {
@@ -479,201 +484,6 @@ fn distira_guest_lfb_bar_odd_reads_and_writes_use_voodoo_callbacks() {
 }
 
 #[test]
-fn distira_guest_cmdfifo_type1_packets_use_assigned_bar_aperture() {
-    const ASSIGNED_BAR: u32 = 0xe300_0000;
-    const CMD_FIFO_BASE: u32 = ASSIGNED_BAR + 0x0020_0000;
-    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
-    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
-
-    let mut code = Vec::new();
-    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
-    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
-    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
-    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_WIDTH as u32, 2);
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_HEIGHT as u32, 1);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        ASSIGNED_BAR + SST_FBI_INIT7 as u32,
-        FBIINIT7_CMDFIFO_ENABLE,
-    );
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE,
-        cmdfifo_type1_header(SST_CLIP_LEFT_RIGHT, 1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 4, 2);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE + 8,
-        cmdfifo_type1_header(SST_CLIP_LOW_Y_HIGH_Y, 1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 12, 1);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE + 16,
-        cmdfifo_type1_header(SST_FBZ_MODE, 1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 20, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE + 24,
-        cmdfifo_type1_header(SST_COLOR1, 1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 28, 0x0034_5678);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE + 32,
-        cmdfifo_type1_header(SST_FASTFILL_CMD, 1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 36, 1);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE + 40,
-        cmdfifo_type1_header(SST_SWAPBUFFER_CMD, 1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 44, 0);
-
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        protected_flat_rom(&code),
-    )
-    .unwrap();
-
-    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
-
-    assert_eq!(reason, StopReason::Halted);
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
-        12
-    );
-    assert_ne!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_STATUS) & 0x380,
-        0
-    );
-
-    machine.drain_distira_fifo();
-
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
-        0
-    );
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_STATUS) & 0x380,
-        0
-    );
-    let (frame, width, height) = machine.frame_argb();
-    assert_eq!((width, height), (2, 1));
-    assert_eq!(frame, vec![0x0031_557b; 2]);
-}
-
-#[test]
-fn distira_guest_cmdfifo_type5_framebuffer_packets_use_assigned_bar_aperture() {
-    const ASSIGNED_BAR: u32 = 0xe400_0000;
-    const CMD_FIFO_BASE: u32 = ASSIGNED_BAR + 0x0020_0000;
-    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
-    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
-
-    let mut code = Vec::new();
-    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
-    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
-    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
-    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_WIDTH as u32, 2);
-    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_HEIGHT as u32, 1);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        ASSIGNED_BAR + SST_LFB_MODE as u32,
-        LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
-    );
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        ASSIGNED_BAR + SST_FBI_INIT7 as u32,
-        FBIINIT7_CMDFIFO_ENABLE,
-    );
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        CMD_FIFO_BASE,
-        cmdfifo_type5_framebuffer_header(1),
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 4, 0);
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 8, 0x0034_5678);
-
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        protected_flat_rom(&code),
-    )
-    .unwrap();
-
-    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
-
-    assert_eq!(reason, StopReason::Halted);
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
-        3
-    );
-
-    machine.drain_distira_fifo();
-    write_reg_at(&mut machine, ASSIGNED_BAR, SST_SWAPBUFFER_CMD, 0);
-
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
-        0
-    );
-    let (frame, width, height) = machine.frame_argb();
-    assert_eq!((width, height), (2, 1));
-    assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
-}
-
-#[test]
-fn distira_guest_cmdfifo_type5_texture_packets_use_assigned_bar_aperture() {
-    const ASSIGNED_BAR: u32 = 0xe500_0000;
-    const CMD_FIFO_BASE: u32 = ASSIGNED_BAR + 0x0020_0000;
-    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
-    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
-
-    let mut code = Vec::new();
-    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
-    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
-    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
-    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
-    push_mov_moffs_u32_imm32(
-        &mut code,
-        ASSIGNED_BAR + SST_FBI_INIT7 as u32,
-        FBIINIT7_CMDFIFO_ENABLE,
-    );
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE, cmdfifo_type5_texture_header(1));
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 4, 0);
-    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 8, 0x07e0_07e0);
-
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        protected_flat_rom(&code),
-    )
-    .unwrap();
-
-    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
-
-    assert_eq!(reason, StopReason::Halted);
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
-        3
-    );
-
-    machine.drain_distira_fifo();
-
-    assert_eq!(
-        read_reg_at(&mut machine, ASSIGNED_BAR, SST_CMD_FIFO_DEPTH),
-        0
-    );
-    write_reg_at(&mut machine, ASSIGNED_BAR, SST_TEX_BASE_ADDR, 0);
-    assert_eq!(
-        draw_texture_sample_at(&mut machine, ASSIGNED_BAR, 0),
-        0x0000_ff00
-    );
-}
-
-#[test]
 fn distira_guest_texture_bar_writes_decode_lod_before_sampling() {
     const ASSIGNED_BAR: u32 = 0xe600_0000;
     const ASSIGNED_TEX: u32 = ASSIGNED_BAR + 0x0080_0000;
@@ -949,106 +759,6 @@ fn distira_pci_memory_command_disables_every_bar_window() {
 }
 
 #[test]
-fn distira_command_fifo_reads_open_bus() {
-    const CMD_FIFO_BASE: u32 = DISTIRA_MMIO_BASE + 0x0020_0000;
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
-
-    assert_eq!(machine.read_physical_u8(CMD_FIFO_BASE), 0xff);
-    assert_eq!(machine.read_physical_u16(CMD_FIFO_BASE), 0xffff);
-    assert_eq!(machine.read_physical_u32(CMD_FIFO_BASE), u32::MAX);
-}
-
-#[test]
-fn distira_cmdfifo_aperture_drains_type1_register_packets() {
-    const CMD_FIFO_BASE: u32 = DISTIRA_MMIO_BASE + 0x0020_0000;
-    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
-    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
-
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
-
-    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 2);
-    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
-    write_reg(&mut machine, SST_FBI_INIT7, FBIINIT7_CMDFIFO_ENABLE);
-
-    machine.write_physical_u32(CMD_FIFO_BASE, cmdfifo_type1_header(SST_CLIP_LEFT_RIGHT, 1));
-    machine.write_physical_u32(CMD_FIFO_BASE + 4, 2);
-    machine.write_physical_u32(
-        CMD_FIFO_BASE + 8,
-        cmdfifo_type1_header(SST_CLIP_LOW_Y_HIGH_Y, 1),
-    );
-    machine.write_physical_u32(CMD_FIFO_BASE + 12, 1);
-    machine.write_physical_u32(CMD_FIFO_BASE + 16, cmdfifo_type1_header(SST_FBZ_MODE, 1));
-    machine.write_physical_u32(CMD_FIFO_BASE + 20, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    machine.write_physical_u32(CMD_FIFO_BASE + 24, cmdfifo_type1_header(SST_COLOR1, 1));
-    machine.write_physical_u32(CMD_FIFO_BASE + 28, 0x0034_5678);
-    machine.write_physical_u32(
-        CMD_FIFO_BASE + 32,
-        cmdfifo_type1_header(SST_FASTFILL_CMD, 1),
-    );
-    machine.write_physical_u32(CMD_FIFO_BASE + 36, 1);
-    machine.write_physical_u32(
-        CMD_FIFO_BASE + 40,
-        cmdfifo_type1_header(SST_SWAPBUFFER_CMD, 1),
-    );
-    machine.write_physical_u32(CMD_FIFO_BASE + 44, 0);
-
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 12);
-    assert_ne!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
-
-    machine.drain_distira_fifo();
-
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
-    assert_eq!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
-    let (frame, width, height) = machine.frame_argb();
-    assert_eq!((width, height), (2, 1));
-    assert_eq!(frame, vec![0x0031_557b; 2]);
-}
-
-#[test]
-fn distira_cmdfifo_type5_framebuffer_packet_writes_lfb() {
-    const CMD_FIFO_BASE: u32 = DISTIRA_MMIO_BASE + 0x0020_0000;
-    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
-    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
-
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        I386DX25_TEST_ROM,
-    )
-    .unwrap();
-
-    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 2);
-    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
-    write_reg(
-        &mut machine,
-        SST_LFB_MODE,
-        LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
-    );
-    write_reg(&mut machine, SST_FBI_INIT7, FBIINIT7_CMDFIFO_ENABLE);
-
-    machine.write_physical_u32(CMD_FIFO_BASE, cmdfifo_type5_framebuffer_header(1));
-    machine.write_physical_u32(CMD_FIFO_BASE + 4, 0);
-    machine.write_physical_u32(CMD_FIFO_BASE + 8, 0x0034_5678);
-
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 3);
-
-    machine.drain_distira_fifo();
-    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 0);
-
-    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
-    let (frame, width, height) = machine.frame_argb();
-    assert_eq!((width, height), (2, 1));
-    assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
-}
-
-#[test]
 fn distira_guest_dac_detect_ics_probe_reaches_fbi_init2_through_pci_init_enable() {
     // A real DAC-detect handshake needs two PCI-config-space writes
     // (command/BAR0, already exercised elsewhere) plus a third: initEnable
@@ -1234,19 +944,17 @@ fn disttri_guest_program_finds_distira_via_pci_and_draws_a_triangle() {
 
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (4, 4));
-    // The right triangle (0,0)-(4,0)-(0,4) covers the standard half-frame
-    // staircase under this codebase's pixel-center rasterization rule (see
-    // the analogous triangle_rasterizes_to_the_back_buffer_with_rgb565_scanout
-    // video-crate test): opaque green (0x0000ff00) inside the triangle,
-    // untouched black (clear color) outside it.
+    // The right triangle (0,0)-(4,0)-(0,4) excludes its lower-right edge under
+    // the SST top-left rasterization rule. Pixels inside are opaque green and
+    // pixels outside remain at the black clear color.
     let green = 0x0000_ff00u32;
     let black = 0x0000_0000u32;
     #[rustfmt::skip]
     let expected = [
-        green, green, green, green,
         green, green, green, black,
         green, green, black, black,
         green, black, black, black,
+        black, black, black, black,
     ];
     assert_eq!(
         frame, expected,

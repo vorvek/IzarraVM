@@ -12,10 +12,10 @@ fn triangle_cmd_rasterizes_flat_untextured_triangle_from_integer_registers() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -81,10 +81,10 @@ fn triangle_cmd_applies_integer_gouraud_color_gradients() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -110,10 +110,10 @@ fn ftriangle_cmd_rasterizes_flat_untextured_triangle_from_float_registers() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
@@ -149,10 +149,10 @@ fn triangle_cmd_depth_test_rejects_farther_pixels_and_counts_failures() {
     );
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -181,6 +181,118 @@ fn triangle_cmd_depth_test_rejects_farther_pixels_and_counts_failures() {
 }
 
 #[test]
+fn triangle_depth_bias_is_signed_clamped_and_used_for_test_and_write() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_Z, 100 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_DEPTH_BIAS
+            | (DEPTHOP_GREATERTHAN << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_ZA_COLOR, 20);
+    write_reg(&mut distira, SST_START_R, 0);
+    write_reg(&mut distira, SST_START_G, 0xff << 12);
+    write_reg(&mut distira, SST_START_Z, 90 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+
+    write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+    assert_eq!(distira.read_lfb_u16(0), 110);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_DEPTH_BIAS
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_ZA_COLOR, u32::from((-20_i16) as u16));
+    write_reg(&mut distira, SST_START_Z, 10 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    assert_eq!(distira.read_lfb_u16(0), 0);
+
+    write_reg(&mut distira, SST_ZA_COLOR, 20);
+    write_reg(&mut distira, SST_START_Z, 65_530 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    assert_eq!(distira.read_lfb_u16(0), u16::MAX);
+
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+    assert_eq!(distira.scanout_argb()[0], 0x0000_ff00);
+}
+
+#[test]
+fn depth_source_compares_za_but_writes_biased_interpolated_depth() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | (DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_B, 0);
+    write_reg(&mut distira, SST_START_Z, 100 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DRAW_BACK
+            | FBZ_DEPTH_ENABLE
+            | FBZ_DEPTH_WMASK
+            | FBZ_DEPTH_BIAS
+            | FBZ_DEPTH_SOURCE
+            | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT),
+    );
+    write_reg(&mut distira, SST_ZA_COLOR, 20);
+    write_reg(&mut distira, SST_START_R, 0);
+    write_reg(&mut distira, SST_START_B, 0xff << 12);
+    write_reg(&mut distira, SST_START_Z, 90 << 12);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+
+    write_reg(&mut distira, SST_LFB_MODE, LFB_READ_AUX);
+    assert_eq!(distira.read_lfb_u16(0), 110);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+    assert_eq!(distira.scanout_argb()[0], 0x0000_00ff);
+}
+
+#[test]
 fn ftriangle_cmd_applies_float_gouraud_color_gradients() {
     let mut distira = Distira::new();
     distira.set_frame_size(4, 4);
@@ -189,10 +301,10 @@ fn ftriangle_cmd_applies_float_gouraud_color_gradients() {
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
     write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_R, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
@@ -225,10 +337,10 @@ fn ftriangle_cmd_depth_test_accepts_closer_float_z() {
     );
     write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
@@ -268,14 +380,14 @@ fn triangle_cmd_alpha_test_rejects_pixels_below_reference() {
     write_reg(
         &mut distira,
         SST_ALPHA_MODE,
-        (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
+        (90 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -301,7 +413,7 @@ fn triangle_cmd_alpha_test_uses_texture_alpha_when_selected() {
     const AFUNC_GREATER_THAN: u32 = 4;
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_A8: u32 = 0x02;
 
     let mut distira = Distira::new();
@@ -321,14 +433,18 @@ fn triangle_cmd_alpha_test_uses_texture_alpha_when_selected() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_A8 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_A8 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -352,7 +468,7 @@ fn triangle_cmd_alpha_zero_other_rejects_texture_alpha() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_ZERO_OTHER: u32 = 1 << 17;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -372,14 +488,18 @@ fn triangle_cmd_alpha_zero_other_rejects_texture_alpha() {
         SST_ALPHA_MODE,
         (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -403,7 +523,7 @@ fn triangle_cmd_alpha_subtracts_local_from_texture_alpha() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_SUB_CLOCAL: u32 = 1 << 18;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -423,14 +543,18 @@ fn triangle_cmd_alpha_subtracts_local_from_texture_alpha() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -455,7 +579,7 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_local_alpha() {
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_MSELECT_ALOCAL: u32 = 1 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -478,14 +602,18 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_local_alpha() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -510,7 +638,7 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_local_alpha_2() {
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_MSELECT_ALOCAL2: u32 = 3 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -533,14 +661,18 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_local_alpha_2() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -565,7 +697,7 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_other_alpha() {
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_MSELECT_AOTHER: u32 = 2 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -588,14 +720,18 @@ fn triangle_cmd_alpha_modulates_texture_alpha_by_other_alpha() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -619,7 +755,7 @@ fn triangle_cmd_alpha_modulates_iterated_alpha_by_texture_alpha() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_CCA_MSELECT_TEX: u32 = 4 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -639,14 +775,18 @@ fn triangle_cmd_alpha_modulates_iterated_alpha_by_texture_alpha() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -670,7 +810,7 @@ fn triangle_cmd_alpha_adds_local_alpha_to_texture_alpha() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_ADD_ALOCAL: u32 = 2 << 23;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -690,14 +830,18 @@ fn triangle_cmd_alpha_adds_local_alpha_to_texture_alpha() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -721,7 +865,7 @@ fn triangle_cmd_alpha_adds_local_alpha_with_saturation() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_ADD_ALOCAL: u32 = 2 << 23;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -741,14 +885,18 @@ fn triangle_cmd_alpha_adds_local_alpha_with_saturation() {
         SST_ALPHA_MODE,
         (0xf0 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -773,7 +921,7 @@ fn triangle_cmd_alpha_subtracts_before_adding_local_alpha() {
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_SUB_CLOCAL: u32 = 1 << 18;
     const FBZCP_CCA_ADD_ALOCAL: u32 = 2 << 23;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -793,14 +941,18 @@ fn triangle_cmd_alpha_subtracts_before_adding_local_alpha() {
         SST_ALPHA_MODE,
         (0x30 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -810,7 +962,46 @@ fn triangle_cmd_alpha_subtracts_before_adding_local_alpha() {
     write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
 
     let frame = distira.scanout_argb();
-    assert_eq!(frame[0], 0x0000_ff00);
+    assert_eq!(frame[0], 0x0000_00ff);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 6);
+}
+
+#[test]
+fn untextured_alpha_path_selects_color_registers_and_combines_them() {
+    const AFUNC_GREATER_THAN: u32 = 4;
+    const ALPHA_TEST_ENABLE: u32 = 1;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 255);
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        (A_SELECT_COLOR1 << FBZCP_A_SELECT_SHIFT)
+            | (CCA_LOCALSELECT_COLOR0 << FBZCP_CCA_LOCALSELECT_SHIFT)
+            | (2 << FBZCP_CCA_ADD_SHIFT),
+    );
+    write_reg(&mut distira, SST_COLOR0, 0x4000_0000);
+    write_reg(&mut distira, SST_COLOR1, 0x2000_0000);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        (0x50 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
+    );
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(&mut distira, SST_START_G, 0xff << 12);
+    write_reg(&mut distira, SST_START_A, 0);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+    assert_eq!(distira.scanout_argb()[0], 0x0000_ff00);
     assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
 }
 
@@ -827,7 +1018,7 @@ fn triangle_cmd_alpha_subtracts_then_modulates_then_adds_local_alpha() {
     const FBZCP_CCA_MSELECT_ALOCAL: u32 = 1 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
     const FBZCP_CCA_ADD_ALOCAL: u32 = 2 << 23;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -852,14 +1043,18 @@ fn triangle_cmd_alpha_subtracts_then_modulates_then_adds_local_alpha() {
         SST_ALPHA_MODE,
         (0x48 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -883,7 +1078,7 @@ fn triangle_cmd_alpha_adds_local_alpha_for_clocal_add_mode() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_ADD_CLOCAL: u32 = 1 << 23;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -903,14 +1098,18 @@ fn triangle_cmd_alpha_adds_local_alpha_for_clocal_add_mode() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -934,7 +1133,7 @@ fn triangle_cmd_alpha_inverts_texture_alpha_output() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_INVERT_OUTPUT: u32 = 1 << 25;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -954,14 +1153,18 @@ fn triangle_cmd_alpha_inverts_texture_alpha_output() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -985,7 +1188,7 @@ fn triangle_cmd_alpha_nonreverse_modulates_by_inverted_local_alpha() {
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
     const FBZCP_CCA_MSELECT_ALOCAL: u32 = 1 << 19;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -1005,14 +1208,18 @@ fn triangle_cmd_alpha_nonreverse_modulates_by_inverted_local_alpha() {
         SST_ALPHA_MODE,
         (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -1035,7 +1242,7 @@ fn triangle_cmd_alpha_selects_color1_alpha() {
     const AFUNC_GREATER_THAN: u32 = 4;
     const ALPHA_TEST_ENABLE: u32 = 1;
     const FBZCP_A_SELECT_COLOR1: u32 = 2 << 2;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -1056,14 +1263,18 @@ fn triangle_cmd_alpha_selects_color1_alpha() {
         (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
     write_reg(&mut distira, SST_COLOR1, 0x0012_3456);
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -1090,7 +1301,7 @@ fn triangle_cmd_alpha_selects_color0_as_local_alpha() {
     const FBZCP_CCA_LOCALSELECT_COLOR0: u32 = 1 << 5;
     const FBZCP_CCA_MSELECT_ALOCAL: u32 = 1 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -1115,14 +1326,18 @@ fn triangle_cmd_alpha_selects_color0_as_local_alpha() {
         (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
     write_reg(&mut distira, SST_COLOR0, 0x0012_3456);
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -1148,7 +1363,7 @@ fn triangle_cmd_alpha_selects_iter_z_as_local_alpha() {
     const FBZCP_CCA_LOCALSELECT_ITER_Z: u32 = 2 << 5;
     const FBZCP_CCA_MSELECT_ALOCAL: u32 = 1 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -1172,14 +1387,18 @@ fn triangle_cmd_alpha_selects_iter_z_as_local_alpha() {
         SST_ALPHA_MODE,
         (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -1206,7 +1425,7 @@ fn ftriangle_cmd_alpha_selects_float_iter_z_as_local_alpha() {
     const FBZCP_CCA_LOCALSELECT_ITER_Z: u32 = 2 << 5;
     const FBZCP_CCA_MSELECT_ALOCAL: u32 = 1 << 19;
     const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -1230,14 +1449,18 @@ fn ftriangle_cmd_alpha_selects_float_iter_z_as_local_alpha() {
         SST_ALPHA_MODE,
         (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_G, 255.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_B, 255.0f32.to_bits());
@@ -1268,14 +1491,14 @@ fn ftriangle_cmd_alpha_test_uses_float_alpha_derivatives() {
     write_reg(
         &mut distira,
         SST_ALPHA_MODE,
-        (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
+        (90 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
     );
     write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
-    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 4.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
     write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
@@ -1311,10 +1534,10 @@ fn triangle_cmd_alpha_blends_source_over_destination() {
     );
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -1337,7 +1560,7 @@ fn triangle_cmd_alpha_blends_texture_alpha_over_destination() {
     const AFUNC_AOMSRC_ALPHA: u32 = 5;
     const ALPHA_BLEND_ENABLE: u32 = 1 << 4;
     const FBZCP_A_SELECT_TEX: u32 = 1 << 2;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_ARGB8332: u32 = 0x08;
 
     let mut distira = Distira::new();
@@ -1357,14 +1580,18 @@ fn triangle_cmd_alpha_blends_texture_alpha_over_destination() {
         SST_ALPHA_MODE,
         ALPHA_BLEND_ENABLE | (AFUNC_ASRC_ALPHA << 8) | (AFUNC_AOMSRC_ALPHA << 12),
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_ARGB8332 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -1393,10 +1620,10 @@ fn triangle_cmd_chroma_key_rejects_matching_source_color() {
     write_reg(&mut distira, SST_CHROMA_KEY, 0x00ff_0000);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -1414,7 +1641,7 @@ fn triangle_cmd_chroma_key_rejects_matching_texture_color() {
     const SST_FBI_CHROMA_FAIL: usize = 0x150;
     const SST_TEXTURE_MODE: usize = 0x300;
     const SST_TEX_BASE_ADDR: usize = 0x30c;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const TEX_R5G6B5: u32 = 0x0a;
 
     let mut distira = Distira::new();
@@ -1430,14 +1657,18 @@ fn triangle_cmd_chroma_key_rejects_matching_texture_color() {
     );
     write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
     write_reg(&mut distira, SST_CHROMA_KEY, 0x00ff_0000);
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0);
@@ -1447,6 +1678,52 @@ fn triangle_cmd_chroma_key_rejects_matching_texture_color() {
 
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0000_00ff);
+    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
+}
+
+#[test]
+fn triangle_cmd_chroma_key_checks_cother_before_color_combining() {
+    const SST_TEXTURE_MODE: usize = 0x300;
+    const SST_TEX_BASE_ADDR: usize = 0x30c;
+    const TEX_R5G6B5: u32 = 0x0a;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 255);
+    assert!(distira.queue_texture_write_u32(0, 0xf800_f800));
+    distira.drain_fifo();
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_CHROMAKEY,
+    );
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        FBZCP_TEXTURE_ENABLED
+            | RGB_SELECT_TEXTURE
+            | FBZCP_CC_LOCALSELECT_COLOR0
+            | FBZCP_CC_ADD_CLOCAL,
+    );
+    write_reg(&mut distira, SST_CHROMA_KEY, 0x00ff_0000);
+    write_reg(&mut distira, SST_COLOR0, 0x0000_00ff);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL,
+    );
+    write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut distira, SST_VERTEX_AX, 0);
+    write_reg(&mut distira, SST_VERTEX_AY, 0);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0);
+    write_reg(&mut distira, SST_VERTEX_CX, 0);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 0);
+
+    assert_eq!(distira.scanout_argb()[0], 0x0000_00ff);
     assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
 }
 
@@ -1464,10 +1741,10 @@ fn triangle_cmd_applies_constant_fog_color() {
     write_reg(&mut distira, SST_FOG_COLOR, 0x0000_0033);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);
@@ -1483,7 +1760,7 @@ fn triangle_cmd_applies_constant_fog_color() {
 fn triangle_cmd_applies_fog_after_texture_color() {
     const SST_TEXTURE_MODE: usize = 0x300;
     const SST_TEX_BASE_ADDR: usize = 0x30c;
-    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
     const FOG_ENABLE: u32 = 0x01;
     const FOG_CONSTANT: u32 = 0x20;
     const TEX_R5G6B5: u32 = 0x0a;
@@ -1498,14 +1775,18 @@ fn triangle_cmd_applies_fog_after_texture_color() {
     write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
     write_reg(&mut distira, SST_FOG_MODE, FOG_ENABLE | FOG_CONSTANT);
     write_reg(&mut distira, SST_FOG_COLOR, 0x0000_0033);
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
     write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0);
     write_reg(&mut distira, SST_START_B, 0);

@@ -37,9 +37,17 @@ fn draw_textured_alpha_probe(
     distira.drain_fifo();
 
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    write_reg(&mut distira, SST_FBZ_COLOR_PATH, color_path);
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        color_path | RGB_SELECT_TEXTURE,
+    );
     write_reg(&mut distira, SST_ALPHA_MODE, alpha_mode);
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        (TEX_ARGB8332 << 8) | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_triangle_vertices(&mut distira);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
@@ -72,10 +80,18 @@ fn draw_textured_color_probe(
     distira.drain_fifo();
 
     write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
-    write_reg(&mut distira, SST_FBZ_COLOR_PATH, color_path);
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        color_path | RGB_SELECT_TEXTURE,
+    );
     write_reg(&mut distira, SST_COLOR0, color0);
     write_reg(&mut distira, SST_COLOR1, color1);
-    write_reg(&mut distira, SST_TEXTURE_MODE, texture_mode << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        (texture_mode << 8) | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_triangle_vertices(&mut distira);
     write_reg(&mut distira, SST_START_R, start_rgb.0 << 12);
@@ -110,7 +126,7 @@ fn triangle_cmd_alpha_inverts_after_adding_local_alpha() {
     let (frame, afunc_fail) = draw_textured_alpha_probe(color_path, alpha_mode, 0x101c_101c, 0x40);
 
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(afunc_fail, 6);
+    assert_eq!(afunc_fail, 3);
 }
 
 #[test]
@@ -125,7 +141,7 @@ fn triangle_cmd_alpha_zero_other_happens_before_add_local() {
     let (frame, afunc_fail) = draw_textured_alpha_probe(color_path, alpha_mode, 0xff1c_ff1c, 0x40);
 
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(afunc_fail, 6);
+    assert_eq!(afunc_fail, 3);
 }
 
 #[test]
@@ -155,7 +171,7 @@ fn triangle_cmd_alpha_clocal_add_mode_inverts_after_add() {
     let (frame, afunc_fail) = draw_textured_alpha_probe(color_path, alpha_mode, 0x201c_201c, 0x40);
 
     assert_eq!(frame[0], 0x0000_00ff);
-    assert_eq!(afunc_fail, 6);
+    assert_eq!(afunc_fail, 3);
 }
 
 #[test]
@@ -353,9 +369,13 @@ fn triangle_cmd_alpha_mask_rejects_even_selected_alpha() {
     write_reg(
         &mut distira,
         SST_FBZ_COLOR_PATH,
-        FBZCP_TEXTURE_ENABLED | (A_SELECT_TEX << FBZCP_A_SELECT_SHIFT),
+        FBZCP_TEXTURE_ENABLED | RGB_SELECT_TEXTURE | (A_SELECT_TEX << FBZCP_A_SELECT_SHIFT),
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        (TEX_ARGB8332 << 8) | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_triangle_vertices(&mut distira);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
@@ -384,9 +404,13 @@ fn triangle_cmd_alpha_mask_allows_odd_selected_alpha() {
     write_reg(
         &mut distira,
         SST_FBZ_COLOR_PATH,
-        FBZCP_TEXTURE_ENABLED | (A_SELECT_TEX << FBZCP_A_SELECT_SHIFT),
+        FBZCP_TEXTURE_ENABLED | RGB_SELECT_TEXTURE | (A_SELECT_TEX << FBZCP_A_SELECT_SHIFT),
     );
-    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_ARGB8332 << 8);
+    write_reg(
+        &mut distira,
+        SST_TEXTURE_MODE,
+        (TEX_ARGB8332 << 8) | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
     write_triangle_vertices(&mut distira);
     write_reg(&mut distira, SST_START_R, 0xff << 12);

@@ -53,7 +53,7 @@ impl NccTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NccState {
     tables: [[NccTable; 2]; 2],
-    palette_write: [[u32; 2]; 2],
+    table0_iq_write: [[u32; 8]; 2],
     palette: [[u32; 256]; 2],
 }
 
@@ -61,7 +61,7 @@ impl Default for NccState {
     fn default() -> Self {
         Self {
             tables: [[NccTable::default(); 2]; 2],
-            palette_write: [[0; 2]; 2],
+            table0_iq_write: [[0; 8]; 2],
             palette: [[0; 256]; 2],
         }
     }
@@ -103,16 +103,15 @@ impl NccState {
         byte: usize,
         value: u8,
     ) {
-        if table == 0 && register >= 10 {
-            self.write_table0_q2_or_q3(tmu, register, byte, value);
+        if table == 0 && register >= 4 {
+            self.write_table0_iq_or_palette(tmu, register, byte, value);
         } else {
             self.tables[tmu][table].write_byte(register, byte, value);
         }
     }
 
-    fn write_table0_q2_or_q3(&mut self, tmu: usize, register: usize, byte: usize, value: u8) {
-        let odd = register - 10;
-        let slot = &mut self.palette_write[tmu][odd];
+    fn write_table0_iq_or_palette(&mut self, tmu: usize, register: usize, byte: usize, value: u8) {
+        let slot = &mut self.table0_iq_write[tmu][register - 4];
         merge_byte(slot, byte, value);
         if byte != 3 {
             return;
@@ -120,7 +119,7 @@ impl NccState {
 
         let raw = *slot;
         if raw & PALETTE_WRITE != 0 {
-            let index = ((raw >> 23) & 0xfe) as usize | odd;
+            let index = ((raw >> 23) & 0xfe) as usize | (register & 1);
             self.palette[tmu][index] = raw | 0xff00_0000;
         } else {
             self.tables[tmu][0].write(register, raw);

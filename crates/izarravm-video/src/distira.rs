@@ -3,14 +3,14 @@
 
 //! Distira, VEGA's Glide-capable 3D unit. This first slice models the Voodoo
 //! Graphics style scanout path: a 16-bit RGB565 front/back frame store, buffer
-//! swaps, ordered dither, simple triangle setup, and exact host-color decode.
-//! Texture sampling and the PCI/Glide command FIFO will hang off the same state.
+//! swaps, ordered dither, triangle setup, texture sampling, and host-color decode.
 
 use std::collections::VecDeque;
 
 mod ncc;
 mod raster_math;
 mod registers;
+mod texture_combine;
 mod texture_raster;
 
 use ncc::NccState;
@@ -92,6 +92,27 @@ struct TmuTextureSample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextureRgba {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+}
+
+impl TextureRgba {
+    const TRANSPARENT_BLACK: Self = Self {
+        red: 0,
+        green: 0,
+        blue: 0,
+        alpha: 0,
+    };
+
+    fn rgb(self) -> (u8, u8, u8) {
+        (self.red, self.green, self.blue)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DistiraFifoEntry {
     Register { offset: usize, value: u32 },
     LfbU32 { offset: usize, value: u32 },
@@ -134,6 +155,7 @@ pub struct Distira {
     stipple: u32,
     color0: u32,
     color1: u32,
+    triangle_command: u32,
     triangle_vertices: [(u32, u32); 3],
     triangle_color: [u32; 3],
     triangle_color_dx: [u32; 3],
@@ -194,6 +216,10 @@ pub struct Distira {
     /// write's side effect (address decode, PLL register update, or ICS
     /// probe response) runs once the whole dword has been assembled.
     dac_data_write: u32,
+    clut_data_write: u32,
+    clut_anchors: [[u8; 3]; 64],
+    clut: [[u8; 3]; 256],
+    clut_programmed: bool,
     /// Current line in the fixed 525-line SST-1 scanout phase.
     frame_phase_line: u32,
     retrace_count: u64,
@@ -255,6 +281,7 @@ impl Distira {
             stipple: 0,
             color0: 0,
             color1: 0,
+            triangle_command: 0,
             triangle_vertices: [(0, 0); 3],
             triangle_color: [0; 3],
             triangle_color_dx: [0; 3],
@@ -299,6 +326,13 @@ impl Distira {
             dac_pll_regs: [0; 16],
             dac_reg_ff: false,
             dac_data_write: 0,
+            clut_data_write: 0,
+            clut_anchors: std::array::from_fn(|index| {
+                let value = (index.saturating_mul(8)).min(255) as u8;
+                [value; 3]
+            }),
+            clut: std::array::from_fn(|value| [value as u8; 3]),
+            clut_programmed: false,
             frame_phase_line: 0,
             retrace_count: 0,
             swapbuffer_command: 0,
@@ -580,7 +614,7 @@ impl Distira {
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
-        self.draw_triangle_inner(vertices, None, None)
+        self.draw_triangle_inner(vertices, None, None, None)
     }
 
     fn draw_triangle_with_depth(
@@ -588,8 +622,9 @@ impl Distira {
         vertices: [DistiraVertex; 3],
         depths: [f32; 3],
         texture: TextureRaster,
+        coverage: SstTriangleCoverage,
     ) -> u64 {
-        self.draw_triangle_inner(vertices, Some(depths), Some(texture))
+        self.draw_triangle_inner(vertices, Some(depths), Some(texture), Some(coverage))
     }
 
     fn draw_triangle_inner(
@@ -597,7 +632,9 @@ impl Distira {
         vertices: [DistiraVertex; 3],
         depths: Option<[f32; 3]>,
         texture: Option<TextureRaster>,
+        coverage: Option<SstTriangleCoverage>,
     ) -> u64 {
+        let count_fbi_pixels = coverage.is_some();
         let [a, b, c] = vertices;
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
         if area == 0.0 {
@@ -608,6 +645,10 @@ impl Distira {
         let mut min_y = a.y.min(b.y).min(c.y).floor().max(0.0) as u32;
         let mut max_x = a.x.max(b.x).max(c.x).ceil().min(self.display.width as f32) as u32;
         let mut max_y = a.y.max(b.y).max(c.y).ceil().min(self.display.height as f32) as u32;
+        if coverage.is_some() {
+            min_x = min_x.saturating_sub(1);
+            max_x = max_x.saturating_add(1).min(self.display.width);
+        }
         if self.fbz_mode & FBZ_CLIP_ENABLE != 0 {
             min_x = min_x.max(self.clip_left);
             max_x = max_x.min(self.clip_right);
@@ -618,18 +659,37 @@ impl Distira {
         let affine_lods = [self.texture_lod, self.texture_lod_tmu1];
         let mut written = 0;
         for y in min_y..max_y {
-            for x in min_x..max_x {
+            let (row_min_x, row_max_x) = if let Some(coverage) = coverage {
+                let Some((span_min, span_max)) = coverage.scanline_span(y) else {
+                    continue;
+                };
+                let span_min = span_min.max(0) as u32;
+                let span_max = span_max.max(-1).saturating_add(1) as u32;
+                (min_x.max(span_min), max_x.min(span_max))
+            } else {
+                (min_x, max_x)
+            };
+            for x in row_min_x..row_max_x {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
                 let w0 = edge(b.x, b.y, c.x, c.y, px, py);
                 let w1 = edge(c.x, c.y, a.x, a.y, px, py);
                 let w2 = edge(a.x, a.y, b.x, b.y, px, py);
-                let inside = if area < 0.0 {
+                let inside = if coverage.is_some() {
+                    true
+                } else if area < 0.0 {
                     w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
                 } else {
                     w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
                 };
                 if !inside {
+                    continue;
+                }
+                if count_fbi_pixels {
+                    self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(1);
+                }
+                let draw_y = self.draw_y(y);
+                if !self.stipple_test_passes(x, draw_y) {
                     continue;
                 }
 
@@ -638,9 +698,9 @@ impl Distira {
                 let l1 = w1 * inv_area;
                 let l2 = w2 * inv_area;
                 let depth_raw = depths.map(|[za, zb, zc]| lerp_f32(za, zb, zc, l0, l1, l2));
-                let depth = depth_raw.map(depth_to_u16);
+                let depth = depth_raw.map(|raw| self.biased_triangle_depth(raw));
                 if let Some(depth) = depth {
-                    if !self.depth_test_passes(x, y, depth) {
+                    if !self.depth_test_passes(x, draw_y, depth) {
                         self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
                         continue;
                     }
@@ -658,37 +718,42 @@ impl Distira {
                 };
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
                 let alocal = self.alpha_local_source(alpha, depth_raw);
-                let texture_alpha = self.texture_alpha_factor(texture_samples[0]);
-                let aother = self.texture_alpha_or_source(alpha, texture_samples[0]);
+                let texture = if self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0 {
+                    self.combined_texture(texture_samples)
+                } else {
+                    TextureRgba::TRANSPARENT_BLACK
+                };
+                let texture_alpha = self.texture_alpha_factor(texture.alpha);
+                let aother = self.texture_alpha_or_source(alpha, texture.alpha);
                 if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
                     continue;
                 }
 
-                let (r, g, blue) = self.texture_color_or_source(
-                    (x, y),
-                    (r, g, blue),
-                    alocal,
-                    aother,
-                    texture_samples,
-                );
+                let selected = self.selected_color_or_source((x, draw_y), (r, g, blue), texture);
+                if !self.chroma_key_passes(selected.0, selected.1, selected.2) {
+                    self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
+                    continue;
+                }
+                let (r, g, blue) =
+                    self.texture_color_or_source(selected, (r, g, blue), alocal, aother, texture);
                 let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
                     continue;
                 }
-                if !self.chroma_key_passes(r, g, blue) {
-                    self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
-                    continue;
+                if count_fbi_pixels {
+                    self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(1);
                 }
                 let (r, g, blue) = self.apply_fog_color(r, g, blue);
-                let (r, g, blue) = self.alpha_blend_color(x, y, r, g, blue, alpha);
-                let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
+                let (r, g, blue) = self.alpha_blend_color(x, draw_y, r, g, blue, alpha);
+                let pixel = pack_rgb565_for_pixel(r, g, blue, x, draw_y, self.dither_enabled);
                 let wrote_color = if depths.is_none() {
-                    self.write_pixel_at_base(self.display.back_base, x, y, pixel)
+                    self.write_pixel_at_base(self.display.back_base, x, draw_y, pixel)
                 } else {
-                    self.fbz_mode & FBZ_RGB_WMASK != 0 && self.write_draw_pixel(x, y, pixel)
+                    self.fbz_mode & FBZ_RGB_WMASK != 0 && self.write_draw_pixel(x, draw_y, pixel)
                 };
-                let wrote_depth = depth.is_some_and(|depth| self.write_depth_pixel(x, y, depth));
+                let wrote_depth =
+                    depth.is_some_and(|depth| self.write_depth_pixel(x, draw_y, depth));
                 if wrote_color || wrote_depth {
                     written += 1;
                 }
@@ -714,10 +779,51 @@ impl Distira {
                 } else {
                     0
                 };
-                out.push(rgb565_to_argb(raw));
+                out.push(self.scanout_rgb565(raw));
             }
         }
         out
+    }
+
+    fn scanout_rgb565(&self, raw: u16) -> u32 {
+        if !self.clut_programmed {
+            return rgb565_to_argb(raw);
+        }
+        let red = usize::from((raw >> 8) & 0xf8);
+        let green = usize::from((raw >> 3) & 0xfc);
+        let blue = usize::from((raw << 3) & 0xf8);
+        (u32::from(self.clut[red][0]) << 16)
+            | (u32::from(self.clut[green][1]) << 8)
+            | u32::from(self.clut[blue][2])
+    }
+
+    fn write_clut_data(&mut self, byte: usize, value: u8) {
+        merge_byte(&mut self.clut_data_write, byte, value);
+        if byte != 3 {
+            return;
+        }
+
+        let index = ((self.clut_data_write >> 24) & 0x3f) as usize;
+        self.clut_anchors[index] = if self.clut_data_write & (1 << 29) != 0 {
+            [255; 3]
+        } else {
+            [
+                (self.clut_data_write >> 16) as u8,
+                (self.clut_data_write >> 8) as u8,
+                self.clut_data_write as u8,
+            ]
+        };
+        self.clut_programmed = true;
+        for value in 0..256 {
+            let base = value >> 3;
+            let fraction = value & 7;
+            for channel in 0..3 {
+                self.clut[value][channel] = ((usize::from(self.clut_anchors[base][channel])
+                    * (8 - fraction)
+                    + usize::from(self.clut_anchors[base + 1][channel]) * fraction)
+                    >> 3) as u8;
+            }
+        }
     }
 
     pub fn read_lfb_u8(&self, offset: usize) -> u8 {
@@ -1028,27 +1134,31 @@ impl Distira {
         let value = match voodoo_reg {
             SST_TREX_INIT0 => self.tmu_register(chip, &self.trex_init0),
             SST_TREX_INIT1 => self.tmu_register(chip, &self.trex_init1),
-            _ => self.register_u32(reg),
+            _ => self.register_u32(if reg < DISTIRA_REG_ID {
+                voodoo_reg
+            } else {
+                reg
+            }),
         };
         (value >> (byte * 8)) as u8
     }
 
     pub fn write_mmio_u8(&mut self, offset: usize, value: u8) {
-        let reg = offset & !0x3;
         let voodoo_reg = offset & 0x3fc;
+        let register = canonical_write_register(offset, self.fbi_init[3]);
         let byte = offset & 0x3;
         let chip = tmu_chip_mask(offset);
-        if self.ncc.write_register(chip, voodoo_reg, byte, value) {
+        if self.ncc.write_register(chip, register, byte, value) {
             return;
         }
-        if reg < DISTIRA_REG_ID
+        if register < DISTIRA_REG_ID
             && self
                 .texture_iterators
-                .write_register(chip, voodoo_reg, byte, value)
+                .write_register(chip, register, byte, value)
         {
             return;
         }
-        match reg {
+        match register {
             SST_INTR_CTRL => merge_byte(&mut self.intr_ctrl, byte, value),
             SST_VERTEX_AX => merge_vertex_component(&mut self.triangle_vertices[0].0, byte, value),
             SST_VERTEX_AY => merge_vertex_component(&mut self.triangle_vertices[0].1, byte, value),
@@ -1072,7 +1182,8 @@ impl Distira {
             SST_DZ_DY => merge_byte(&mut self.triangle_depth_dy, byte, value),
             SST_DA_DY => merge_color_component(&mut self.triangle_alpha_dy, byte, value),
             SST_TRIANGLE_CMD => {
-                if byte == 0 && value != 0 {
+                merge_byte(&mut self.triangle_command, byte, value);
+                if byte == 3 {
                     self.run_triangle_command();
                 }
             }
@@ -1161,7 +1272,8 @@ impl Distira {
                 self.triangle_alpha_dy = float_color_to_fixed(self.ftriangle_alpha_dy);
             }
             SST_FTRIANGLE_CMD => {
-                if byte == 0 && value != 0 {
+                merge_byte(&mut self.triangle_command, byte, value);
+                if byte == 3 {
                     self.run_triangle_command();
                 }
             }
@@ -1172,7 +1284,9 @@ impl Distira {
                 merge_byte(&mut self.fbz_mode, byte, value);
                 self.dither_enabled = self.fbz_mode & FBZ_DITHER != 0;
             }
-            SST_LFB_MODE => merge_byte(&mut self.lfb_mode, byte, value),
+            SST_LFB_MODE => {
+                merge_byte(&mut self.lfb_mode, byte, value);
+            }
             SST_CLIP_LEFT_RIGHT => {
                 let mut clip = self.clip_right | (self.clip_left << 16);
                 merge_byte(&mut clip, byte, value);
@@ -1185,9 +1299,17 @@ impl Distira {
                 self.clip_high_y = clip & 0xffff;
                 self.clip_low_y = (clip >> 16) & 0xffff;
             }
-            SST_NOP_CMD => {}
+            SST_NOP_CMD => {
+                if byte == 0 && value & 1 != 0 {
+                    self.fbi_pixels_in = 0;
+                    self.fbi_chroma_fail = 0;
+                    self.fbi_zfunc_fail = 0;
+                    self.fbi_afunc_fail = 0;
+                    self.fbi_pixels_out = 0;
+                }
+            }
             SST_FASTFILL_CMD => {
-                if byte == 0 && value != 0 {
+                if byte == 0 {
                     self.run_fastfill();
                 }
             }
@@ -1231,6 +1353,7 @@ impl Distira {
             SST_FBI_INIT3 => self.write_fbi_init(3, byte, value),
             SST_H_SYNC => merge_byte(&mut self.h_sync, byte, value),
             SST_V_SYNC => merge_byte(&mut self.v_sync, byte, value),
+            SST_CLUT_DATA => self.write_clut_data(byte, value),
             SST_DAC_DATA => {
                 merge_byte(&mut self.dac_data_write, byte, value);
                 if byte == 3 {
@@ -1635,6 +1758,7 @@ impl Distira {
             SST_FBI_INIT3 => self.fbi_init[3] | (1 << 10) | (2 << 8),
             SST_H_SYNC => self.h_sync,
             SST_V_SYNC => self.v_sync,
+            SST_CLUT_DATA => self.clut_data_write,
             // The low field is the scanline. Distira has no horizontal dot
             // phase yet, so the high horizontal-position field remains zero.
             SST_HV_RETRACE => self.frame_phase_line & 0x1fff,
@@ -1663,7 +1787,7 @@ impl Distira {
             DISTIRA_REG_BACK_BASE => self.display.back_base,
             DISTIRA_REG_CLEAR_COLOR => self.clear_color,
             DISTIRA_REG_COMMAND => self.command,
-            _ => 0,
+            _ => u32::MAX,
         }
     }
 
@@ -1842,17 +1966,23 @@ impl Distira {
     fn lfb_pipeline_stipple_position(&mut self, position: (u32, u32)) -> Option<(u32, u32)> {
         let (x, y) = position;
         self.framebuffer_pixel_offset(self.lfb_write_base(), x, y)?;
-        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_STIPPLE == 0 {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.stipple_test_passes(x, y) {
             return Some((x, y));
         }
-        let passes = if self.fbz_mode & FBZ_STIPPLE_PATT != 0 {
+        None
+    }
+
+    fn stipple_test_passes(&mut self, x: u32, y: u32) -> bool {
+        if self.fbz_mode & FBZ_STIPPLE == 0 {
+            return true;
+        }
+        if self.fbz_mode & FBZ_STIPPLE_PATT != 0 {
             let index = ((y & 3) << 3) | ((!x) & 7);
             self.stipple & (1 << index) != 0
         } else {
             self.stipple = self.stipple.rotate_left(1);
             self.stipple & 0x8000_0000 != 0
-        };
-        passes.then_some((x, y))
+        }
     }
 
     fn lfb_pipeline_shade_color_at(
@@ -1888,17 +2018,20 @@ impl Distira {
     }
 
     fn run_fastfill(&mut self) {
-        if self.fbz_mode & FBZ_RGB_WMASK == 0 {
+        let write_color = self.fbz_mode & FBZ_RGB_WMASK != 0;
+        let write_depth = self.fbz_mode & FBZ_DEPTH_WMASK != 0;
+        if !write_color && !write_depth {
             return;
         }
 
-        let pixel = pack_rgb565(
+        let color = pack_rgb565(
             (self.color1 >> 16) as u8,
             (self.color1 >> 8) as u8,
             self.color1 as u8,
         )
         .to_le_bytes();
-        let start = match self.fbz_mode & FBZ_DRAW_MASK {
+        let depth = (self.za_color as u16).to_le_bytes();
+        let color_start = match self.fbz_mode & FBZ_DRAW_MASK {
             FBZ_DRAW_FRONT => self.display.front_base,
             _ => self.display.back_base,
         };
@@ -1910,23 +2043,26 @@ impl Distira {
         let len = self.fb.len() as u64;
 
         for y in low_y..high_y {
+            let draw_y = u64::from(self.draw_y(y as u32));
             for x in left..right {
-                let off = u64::from(start)
-                    .saturating_add(y.saturating_mul(pitch))
+                let pixel_offset = draw_y
+                    .saturating_mul(pitch)
                     .saturating_add(x.saturating_mul(2));
-                if off + 1 < len {
-                    self.fb[off as usize] = pixel[0];
-                    self.fb[off as usize + 1] = pixel[1];
+                let color_offset = u64::from(color_start).saturating_add(pixel_offset);
+                if write_color && color_offset + 1 < len {
+                    self.fb[color_offset as usize] = color[0];
+                    self.fb[color_offset as usize + 1] = color[1];
+                }
+                let depth_offset = u64::from(self.aux_base).saturating_add(pixel_offset);
+                if write_depth && depth_offset + 1 < len {
+                    self.fb[depth_offset as usize] = depth[0];
+                    self.fb[depth_offset as usize + 1] = depth[1];
                 }
             }
         }
     }
 
     fn run_triangle_command(&mut self) {
-        if self.fbz_mode & (FBZ_RGB_WMASK | FBZ_DEPTH_WMASK) == 0 {
-            return;
-        }
-
         let coords = self
             .triangle_vertices
             .map(|(x, y)| (fixed_vertex_to_f32(x), fixed_vertex_to_f32(y)));
@@ -1999,9 +2135,11 @@ impl Distira {
             s: 0.0,
             t: 0.0,
         });
-        let written = self.draw_triangle_with_depth(vertices, depths, texture) as u32;
-        self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
-        self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(written);
+        let coverage = SstTriangleCoverage::new(
+            self.triangle_vertices,
+            self.triangle_command & (1 << 31) != 0,
+        );
+        self.draw_triangle_with_depth(vertices, depths, texture, coverage);
     }
 
     fn run_command(&mut self) {
@@ -2041,7 +2179,32 @@ impl Distira {
         let Some(old_depth) = self.read_depth_pixel(x, y) else {
             return false;
         };
-        depth_compare_passes(self.fbz_mode, old_depth, depth)
+        let test_depth = if self.fbz_mode & FBZ_DEPTH_SOURCE != 0 {
+            self.za_color as u16
+        } else {
+            depth
+        };
+        depth_compare_passes(self.fbz_mode, old_depth, test_depth)
+    }
+
+    fn biased_triangle_depth(&self, raw: f32) -> u16 {
+        let depth = i32::from(depth_to_u16(raw));
+        if self.fbz_mode & FBZ_DEPTH_BIAS == 0 {
+            return depth as u16;
+        }
+        let bias = i32::from(self.za_color as u16 as i16);
+        (depth + bias).clamp(0, i32::from(u16::MAX)) as u16
+    }
+
+    fn draw_y(&self, logical_y: u32) -> u32 {
+        if self.fbz_mode & FBZ_Y_ORIGIN == 0 {
+            logical_y
+        } else {
+            self.display
+                .height
+                .saturating_sub(1)
+                .saturating_sub(logical_y)
+        }
     }
 
     fn alpha_test_passes(&self, alpha: u8) -> bool {
@@ -2067,93 +2230,6 @@ impl Distira {
             || r != (self.chroma_key >> 16) as u8
             || g != (self.chroma_key >> 8) as u8
             || b != self.chroma_key as u8
-    }
-
-    fn texture_color_or_source(
-        &self,
-        position: (u32, u32),
-        source: (u8, u8, u8),
-        alocal: u8,
-        aother: u8,
-        samples: [TextureSample; 2],
-    ) -> (u8, u8, u8) {
-        let (r, g, b) = source;
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
-            return source;
-        }
-        if self.trex_init1[0] & TREXINIT1_SEND_CONFIG != 0 {
-            return (0, 0, DISTIRA_TMU_CONFIG);
-        }
-
-        let selected = match self.fbz_color_path & FBZCP_RGB_SELECT_MASK {
-            RGB_SELECT_COLOR1 => (
-                (self.color1 >> 16) as u8,
-                (self.color1 >> 8) as u8,
-                self.color1 as u8,
-            ),
-            RGB_SELECT_LFB => self.read_back_pixel_rgb(position.0, position.1),
-            _ => {
-                let format = (self.texture_mode >> 8) & 0xf;
-                if !matches!(
-                    format,
-                    TEX_RGB332
-                        | TEX_Y4I2Q2
-                        | TEX_A8
-                        | TEX_I8
-                        | TEX_AI8
-                        | TEX_PAL8
-                        | TEX_APAL8
-                        | TEX_ARGB8332
-                        | TEX_A8Y4I2Q2
-                        | TEX_R5G6B5
-                        | TEX_ARGB1555
-                        | TEX_ARGB4444
-                        | TEX_A8I8
-                        | TEX_APAL88
-                ) {
-                    return (r, g, b);
-                }
-                let tmu0 = self.apply_texture_detail_blend(
-                    0,
-                    self.sample_tmu_texture(0, samples[0]),
-                    samples[0].lod,
-                );
-                if self.texture_mode & (1 << 18) != 0
-                    && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
-                {
-                    let tmu1 = self.apply_texture_detail_blend(
-                        1,
-                        self.sample_tmu_texture(1, samples[1]),
-                        samples[1].lod,
-                    );
-                    (
-                        tmu0.0.saturating_add(tmu1.0),
-                        tmu0.1.saturating_add(tmu1.1),
-                        tmu0.2.saturating_add(tmu1.2),
-                    )
-                } else {
-                    tmu0
-                }
-            }
-        };
-        let texture_alpha = self.sample_tmu_alpha(0, samples[0]);
-        let texture_rgb = self.sample_tmu_texture(0, samples[0]);
-        let color = self.apply_color_path_local_combine(
-            selected,
-            source,
-            alocal,
-            aother,
-            texture_alpha,
-            texture_rgb,
-        );
-        self.apply_color_path_output_invert(color)
-    }
-
-    fn apply_color_path_output_invert(&self, color: (u8, u8, u8)) -> (u8, u8, u8) {
-        if self.fbz_color_path & FBZCP_CC_INVERT_OUTPUT == 0 {
-            return color;
-        }
-        (color.0 ^ 0xff, color.1 ^ 0xff, color.2 ^ 0xff)
     }
 
     fn apply_color_path_local_combine(
@@ -2272,26 +2348,6 @@ impl Distira {
         )
     }
 
-    fn apply_texture_detail_blend(
-        &self,
-        tmu: usize,
-        color: (u8, u8, u8),
-        lod: u32,
-    ) -> (u8, u8, u8) {
-        let mode = self.texture_mode_for_tmu(tmu);
-        let mselect = (mode >> TC_MSELECT_SHIFT) & TC_MSELECT_MASK;
-        if mode & TC_ADD_CLOCAL == 0 || mselect != TC_MSELECT_DETAIL {
-            return color;
-        }
-
-        let factor = self.texture_detail_factor(tmu, lod);
-        (
-            detail_blend_channel(color.0, factor),
-            detail_blend_channel(color.1, factor),
-            detail_blend_channel(color.2, factor),
-        )
-    }
-
     fn texture_detail_factor(&self, tmu: usize, lod: u32) -> u8 {
         let detail = self.texture_detail_for_tmu(tmu);
         let max = (detail & 0xff).min(0xff) as i32;
@@ -2300,21 +2356,15 @@ impl Distira {
         ((bias - lod as i32) << scale).clamp(0, max).min(255) as u8
     }
 
-    fn texture_alpha_or_source(&self, alpha: u8, sample: TextureSample) -> u8 {
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
-            return alpha;
-        }
+    fn texture_alpha_or_source(&self, alpha: u8, texture_alpha: u8) -> u8 {
         match (self.fbz_color_path >> FBZCP_A_SELECT_SHIFT) & FBZCP_A_SELECT_MASK {
-            A_SELECT_TEX => self.sample_tmu_alpha(0, sample),
+            A_SELECT_TEX => texture_alpha,
             A_SELECT_COLOR1 => (self.color1 >> 24) as u8,
             _ => alpha,
         }
     }
 
     fn alpha_local_source(&self, alpha: u8, depth_raw: Option<f32>) -> u8 {
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
-            return alpha;
-        }
         match (self.fbz_color_path >> FBZCP_CCA_LOCALSELECT_SHIFT) & FBZCP_CCA_LOCALSELECT_MASK {
             CCA_LOCALSELECT_COLOR0 => (self.color0 >> 24) as u8,
             CCA_LOCALSELECT_ITER_Z => depth_raw.map_or(0, fixed_depth_to_local_alpha),
@@ -2322,22 +2372,18 @@ impl Distira {
         }
     }
 
-    fn texture_alpha_factor(&self, sample: TextureSample) -> u8 {
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
-            0xff
-        } else {
-            self.sample_tmu_alpha(0, sample)
-        }
+    fn texture_alpha_factor(&self, texture_alpha: u8) -> u8 {
+        texture_alpha
     }
 
     fn apply_alpha_path(&self, alocal: u8, aother: u8, texture_alpha: u8) -> u8 {
         let mut alpha = if self.fbz_color_path & FBZCP_CCA_ZERO_OTHER != 0 {
             0
         } else {
-            aother
+            i32::from(aother)
         };
         if self.fbz_color_path & FBZCP_CCA_SUB_CLOCAL != 0 {
-            alpha = alpha.saturating_sub(alocal);
+            alpha -= i32::from(alocal);
         }
         let mselect = (self.fbz_color_path >> FBZCP_CCA_MSELECT_SHIFT) & FBZCP_CCA_MSELECT_MASK;
         if mselect == CCA_MSELECT_ALOCAL
@@ -2353,11 +2399,12 @@ impl Distira {
                 alocal
             };
             let reverse = self.fbz_color_path & FBZCP_CCA_REVERSE_BLEND != 0;
-            alpha = color_path_blend_channel(alpha, factor, reverse);
+            alpha = color_path_blend_component(alpha, factor, reverse);
         }
         if ((self.fbz_color_path >> FBZCP_CCA_ADD_SHIFT) & FBZCP_CCA_ADD_MASK) != 0 {
-            alpha = alpha.saturating_add(alocal);
+            alpha += i32::from(alocal);
         }
+        let mut alpha = alpha.clamp(0, 255) as u8;
         if self.fbz_color_path & FBZCP_CCA_INVERT_OUTPUT != 0 {
             alpha ^= 0xff;
         }
@@ -2368,6 +2415,11 @@ impl Distira {
         match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
             TEX_A8 => self.sample_tmu_u8(tmu, sample),
             TEX_AI8 => expand4(self.sample_tmu_u8(tmu, sample) >> 4),
+            TEX_APAL8 => {
+                let index = usize::from(self.sample_tmu_u8(tmu, sample));
+                let red = (self.ncc.palette(tmu, index) >> 16) as u8;
+                (red & 0xfc) | ((red & 0xc0) >> 6)
+            }
             TEX_ARGB8332 | TEX_A8Y4I2Q2 | TEX_A8I8 | TEX_APAL88 => {
                 (self.sample_tmu_u16(tmu, sample) >> 8) as u8
             }
@@ -2404,7 +2456,7 @@ impl Distira {
     }
 
     fn sample_tmu_rgb332(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let TextureSample { s, t, lod } = sample;
+        let TextureSample { s, t, lod, .. } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
@@ -2500,7 +2552,11 @@ impl Distira {
     }
 
     fn sample_tmu_u8(&self, tmu: usize, sample: TextureSample) -> u8 {
-        let TextureSample { s, t, lod } = sample;
+        self.texture[tmu][self.tmu_u8_offset(tmu, sample)]
+    }
+
+    fn tmu_u8_offset(&self, tmu: usize, sample: TextureSample) -> usize {
+        let TextureSample { s, t, lod, .. } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
@@ -2518,15 +2574,14 @@ impl Distira {
             lod_reg & LOD_TMIRROR_T != 0,
         );
         let texel = t * width + s;
-        let offset = ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
+        ((self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
             .saturating_add(texture_mip_offset(lod_reg, lod, 1))
             .saturating_add(texel))
-            & (DISTIRA_TEX_SIZE - 1);
-        self.texture[tmu].get(offset).copied().unwrap_or(0)
+            & (DISTIRA_TEX_SIZE - 1)
     }
 
     fn sample_tmu_u16(&self, tmu: usize, sample: TextureSample) -> u16 {
-        let TextureSample { s, t, lod } = sample;
+        let TextureSample { s, t, lod, .. } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
@@ -2555,7 +2610,7 @@ impl Distira {
     }
 
     fn sample_tmu_rgb565(&self, tmu: usize, sample: TextureSample) -> (u8, u8, u8) {
-        let TextureSample { s, t, lod } = sample;
+        let TextureSample { s, t, lod, .. } = sample;
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
@@ -2573,9 +2628,6 @@ impl Distira {
             mode,
             lod_reg,
         };
-        if mode & 0x6 != 0 {
-            return self.bilinear_rgb565(s, t, texture_sample);
-        }
         let s = texture_coord_index(
             s,
             width,
@@ -2589,42 +2641,6 @@ impl Distira {
             lod_reg & LOD_TMIRROR_T != 0,
         ) as i32;
         self.sample_rgb565_texel(s, t, texture_sample)
-    }
-
-    fn bilinear_rgb565(&self, s: f32, t: f32, sample: TmuTextureSample) -> (u8, u8, u8) {
-        let base_s = s.floor();
-        let base_t = t.floor();
-        let frac_s = ((s - base_s) * 16.0).floor().clamp(0.0, 15.0) as u32;
-        let frac_t = ((t - base_t) * 16.0).floor().clamp(0.0, 15.0) as u32;
-        let s0 = base_s as i32;
-        let t0 = base_t as i32;
-        let samples = [
-            self.sample_rgb565_texel(s0, t0, sample),
-            self.sample_rgb565_texel(s0 + 1, t0, sample),
-            self.sample_rgb565_texel(s0, t0 + 1, sample),
-            self.sample_rgb565_texel(s0 + 1, t0 + 1, sample),
-        ];
-        let weights = [
-            (16 - frac_s) * (16 - frac_t),
-            frac_s * (16 - frac_t),
-            (16 - frac_s) * frac_t,
-            frac_s * frac_t,
-        ];
-        let blend = |component: fn((u8, u8, u8)) -> u8| -> u8 {
-            samples
-                .iter()
-                .zip(weights)
-                .map(|(&sample, weight)| u32::from(component(sample)) * weight)
-                .sum::<u32>()
-                .checked_shr(8)
-                .unwrap_or(0)
-                .min(255) as u8
-        };
-        (
-            blend(|(r, _, _)| r),
-            blend(|(_, g, _)| g),
-            blend(|(_, _, b)| b),
-        )
     }
 
     fn texture_mode_for_tmu(&self, tmu: usize) -> u32 {

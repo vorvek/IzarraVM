@@ -168,16 +168,28 @@ pub(super) struct TextureSample {
     pub(super) s: f32,
     pub(super) t: f32,
     pub(super) lod: u32,
+    pub(super) lod_floor: u32,
+    pub(super) lod_fraction: u8,
 }
 
 impl TextureSample {
     pub(super) fn affine(s: f32, t: f32, texture_lod: u32) -> Self {
+        let lod = select_lod(f64::NEG_INFINITY, 1.0, 0, texture_lod);
         Self {
             s,
             t,
-            lod: select_lod(f64::NEG_INFINITY, 1.0, 0, texture_lod),
+            lod: lod.physical,
+            lod_floor: lod.floor,
+            lod_fraction: lod.fraction,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextureLod {
+    physical: u32,
+    floor: u32,
+    fraction: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -247,15 +259,18 @@ impl TmuRaster {
         } else {
             (s_over_w, t_over_w)
         };
+        let lod = select_lod(
+            self.base_lod,
+            reciprocal_w,
+            self.texture_mode,
+            self.texture_lod,
+        );
         TextureSample {
             s: s as f32,
             t: t as f32,
-            lod: select_lod(
-                self.base_lod,
-                reciprocal_w,
-                self.texture_mode,
-                self.texture_lod,
-            ),
+            lod: lod.physical,
+            lod_floor: lod.floor,
+            lod_fraction: lod.fraction,
         }
     }
 }
@@ -294,12 +309,7 @@ pub(super) fn texture_base_slot(texture_lod: u32, lod: u32) -> usize {
 }
 
 pub(super) fn texture_mip_offset(texture_lod: u32, lod: u32, bytes_per_texel: usize) -> usize {
-    let first = if texture_lod & LOD_TMULTIBASEADDR != 0 {
-        lod.min(3)
-    } else {
-        0
-    };
-    (first..lod)
+    (0..lod)
         .filter(|&level| owns_lod(texture_lod, level))
         .map(|level| {
             let (width, height) = texture_dimensions(texture_lod, level);
@@ -311,7 +321,7 @@ pub(super) fn texture_mip_offset(texture_lod: u32, lod: u32, bytes_per_texel: us
         .sum()
 }
 
-fn select_lod(base_lod: f64, reciprocal_w: f64, texture_mode: u32, texture_lod: u32) -> u32 {
+fn select_lod(base_lod: f64, reciprocal_w: f64, texture_mode: u32, texture_lod: u32) -> TextureLod {
     let min = f64::from(texture_lod & 0x3f) / 4.0;
     let max = (f64::from((texture_lod >> 6) & 0x3f) / 4.0).min(8.0);
     let min = min.min(8.0);
@@ -326,14 +336,18 @@ fn select_lod(base_lod: f64, reciprocal_w: f64, texture_mode: u32, texture_lod: 
     } else {
         0.0
     };
-    let lod = (base_lod - perspective_adjust + bias)
-        .max(min)
-        .min(max)
-        .floor() as u32;
-    if owns_lod(texture_lod, lod) {
-        lod
+    let lod = (base_lod - perspective_adjust + bias).max(min).min(max);
+    let fixed = ((lod * 256.0).floor() as u32).min(8 << 8);
+    let floor = fixed >> 8;
+    let physical = if owns_lod(texture_lod, floor) {
+        floor
     } else {
-        lod.saturating_add(1).min(8)
+        floor.saturating_add(1).min(8)
+    };
+    TextureLod {
+        physical,
+        floor,
+        fraction: fixed as u8,
     }
 }
 
@@ -373,3 +387,7 @@ fn decode_register(register: usize) -> Option<(bool, usize, usize)> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+#[path = "texture_raster_test.rs"]
+mod tests;
