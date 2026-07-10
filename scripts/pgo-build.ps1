@@ -3,7 +3,7 @@
 #
 # Two-stage build: instrument -> run a representative workload to gather a
 # profile -> rebuild with the profile. This is a RELEASE recipe, not the default
-# `cargo build` (which is untouched). See dev_docs/2026-06-28-perf-pgo-design.md.
+# `cargo build` (which is untouched).
 #
 # Why --config instead of $env:RUSTFLAGS: the project pins
 # `target.x86_64-pc-windows-msvc.rustflags = ["-C","target-cpu=x86-64-v3"]` in

@@ -1,18 +1,13 @@
 //! Sound Blaster 16 CT1745 mixer chip: the index/data register file at I/O
 //! `0x224`/`0x225` that selects the card's IRQ line and DMA channels and sets
 //! the output volume. Clean-room derived from the Creative "Sound Blaster 16
-//! Hardware Programming Guide" cached at `dev_docs/reference/sb16/` (the
-//! greppable MIT-mirrored txt). See `docs/clean-room-audio.md` for the
-//! derivation pointers.
+//! Hardware Programming Guide`. See `docs/clean-room-audio.md` for the
+//! derivation sources.
 //!
-//! Scope this slice implements: the IRQ/DMA routing registers (`0x80`/`0x81`),
-//! the read-only Interrupt Status register (`0x82`) with its producer-set /
-//! guest-ack lifecycle, and the volume registers that actually attenuate the
-//! host audio output (master `0x30`/`0x31`, voice `0x32`/`0x33`, output gain
-//! `0x41`/`0x42`, plus the CT1345-compatible `0x22`/`0x04` aliases). The other
-//! source/tone/AGC registers are stored and returned at their datasheet
-//! defaults so a setup utility's read-modify-write round-trips preserve guest
-//! writes, but have no audio effect this slice (their sources are not modeled).
+//! The mixer models IRQ/DMA routing (`0x80`/`0x81`), the read-only Interrupt
+//! Status register (`0x82`), and the volume registers that attenuate host
+//! audio. Other source, tone, and AGC registers retain guest writes but have
+//! no audio effect because their signal sources are not modeled.
 
 use std::sync::LazyLock;
 
@@ -131,8 +126,8 @@ impl SbMixer {
 
     /// Set the Interrupt Status register (`0x82`) source bit for the armed DMA
     /// mode right when the producer forwards the IRQ to the PIC. D0 (0x01) is
-    /// the 8-bit DMA / SB-MIDI bit; D1 (0x02) is the 16-bit DMA bit. MPU-401
-    /// (D2) is never set this slice (MIDI is out of scope).
+    /// the 8-bit DMA / SB-MIDI bit and D1 (0x02) is the 16-bit DMA bit. The HLE
+    /// MPU-401 uses its own port state and does not drive this mixer register.
     pub fn set_irq_status(&mut self, is_16bit: bool) {
         self.irq_status = if is_16bit { 0x02 } else { 0x01 };
     }

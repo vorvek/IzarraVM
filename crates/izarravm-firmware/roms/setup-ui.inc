@@ -1,4 +1,4 @@
-; setup-ui.inc - STREAM D: the Margo-LFB setup page. Owns this file and the
+; Margo-LFB setup page. Uses the
 ; SETUP_SCRATCH region (segment 0, 256 bytes). Core calls setup_maybe_enter after
 ; run_post and before enter_setup_or_boot.
 ;
@@ -131,7 +131,7 @@ setup_maybe_enter:
     call su_run_menu                ; AL=0 -> Del opened the setup page
     ret
 .boot_menu:
-    call boot_menu                  ; Stream E: the Tab boot-device menu
+    call boot_menu                  ; Tab boot-device menu
 .done:
     ret
 

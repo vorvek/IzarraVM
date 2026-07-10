@@ -1,4 +1,4 @@
-; probes/probe-opl.inc - STREAM C: OPL (YMF262 / AdLib) presence probe.
+; OPL (YMF262 / AdLib) presence probe.
 ; One POST step, PASS/FAIL. Reset the timer overflow flags by writing 0x80 to
 ; timer-control register 0x04 (PORT_OPL_ADDR selects, PORT_OPL_DATA writes), then
 ; read the status byte back on PORT_OPL_ADDR. With both timers idle and their

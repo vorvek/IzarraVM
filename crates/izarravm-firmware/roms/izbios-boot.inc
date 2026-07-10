@@ -1,4 +1,4 @@
-; izbios-boot.inc - STREAM E: the Tab boot menu and the INT 19h bootstrap. After
+; Tab boot menu and INT 19h bootstrap. After
 ; POST the core calls setup_maybe_enter (which opens this menu on Tab) and then
 ; boot_entry. boot_entry reads the chosen device from BOOT_CHOICE and dispatches:
 ;   0 floppy  -> the floppy path below
@@ -38,7 +38,7 @@
 %define BOOT_DEV_CDROM   2
 
 ; The highlighted boot-menu entry. One byte in the free tail of BIOS_SCRATCH,
-; right after BOOT_CHOICE (0x052E), so it stays clear of the Stream C/D scratch.
+; right after BOOT_CHOICE (0x052E), so it stays clear of other scratch regions.
 %define BOOT_MENU_CURSOR (BIOS_SCRATCH + 0x0f)   ; 0x052F
 
 ; Navigation make codes (Set 1).
@@ -110,7 +110,7 @@ boot_entry:
     ; probes do not run again), losing the reveal. The boot_status_line messages on
     ; the no-media paths are legacy mode-13h text (invisible in the LFB mode), so
     ; the clean-console reset is cosmetic; CONSOLE_ROW_Y is still seeded for it.
-    ; (Phase 4 owns restoring the LFB screen after the mode-13h Tab/Del menus.)
+    ; The menu return paths restore the LFB screen after mode-13h Tab/Del menus.
     xor ax, ax
     mov ds, ax
     mov word [CONSOLE_ROW_Y], POST_HINT_Y

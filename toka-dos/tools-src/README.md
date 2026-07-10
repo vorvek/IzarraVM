@@ -14,4 +14,4 @@ command-line behavior only.
 - `edit/` `EDIT.COM` ("TokaEdit"), a full-screen MS-DOS-EDIT-style editor:
   menus, dialogs, mouse, clipboard. Open Watcom large-model C; the ANSI-clean
   buffer core (`buffer.c`) is self-checked at build time by a native
-  `test_buffer.c` harness. Design: `dev_docs/2026-07-03-tokados-edit-design.md`.
+  `test_buffer.c` harness.

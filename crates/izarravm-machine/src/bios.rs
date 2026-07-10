@@ -961,8 +961,8 @@ impl Machine {
     ///
     /// Limit: the floppy boot copies sector 0 and jumps; it does not retry on a
     /// read error. The fixed-disk boot loads the real MBR at LBA 0 (signature-gated)
-    /// and lets it chain to the active partition — the Rust Toka-DOS HLE boot record
-    /// that used to back a non-bootable C: was retired in SP-3.
+    /// and lets it chain to the active partition. The retired Rust Toka-DOS HLE
+    /// boot record no longer backs a non-bootable C: drive.
     pub(super) fn handle_int19(&mut self) {
         // A: floppy first. Copy its boot sector (CHS 0,0,1) to 0000:7C00 and jump
         // there. A mounted floppy is bootable (matching the ROM path); only an
@@ -999,8 +999,8 @@ impl Machine {
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
             return;
         }
-        // Nothing bootable (no signed floppy or ATA MBR): the Rust Toka-DOS HLE
-        // boot fallback was retired in SP-3, so hand off to the diskless/no-boot
+        // Nothing bootable (no signed floppy or ATA MBR): the retired Rust
+        // Toka-DOS HLE boot fallback is absent, so hand off to the diskless/no-boot
         // path exactly like the firmware's .disk_absent branch.
         self.handle_int18();
     }

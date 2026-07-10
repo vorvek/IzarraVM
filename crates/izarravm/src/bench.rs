@@ -149,7 +149,7 @@ struct Microbench {
 }
 
 // Small enough that the slowest pattern (poll-3da, which pays a full batch
-// epilogue per iteration pre-Slice-1) still finishes in a couple of seconds at
+// epilogue per iteration) still finishes in a couple of seconds at
 // 486/586, large enough for a stable rt_factor (thousands of guest batches
 // even in the worst case).
 const MICROBENCH_BUDGET: u64 = 20_000_000;

@@ -284,7 +284,7 @@ def main():
     gswmode = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
 
-    # CONFIG.SYS / AUTOEXEC point at C: (the HDD). SP-4b M4 defaults: TOKAEMM
+    # CONFIG.SYS / AUTOEXEC point at C: (the HDD). TOKAEMM
     # loads as the memory manager (frameless NOEMS; the system runs in V86 under
     # its monitor), DOS=HIGH,UMB uses the HMA + TOKAEMM's UMBs, LASTDRIVE=D
     # covers A: floppy / C: HDD / D: CD-ROM without wasting CDS entries. The system

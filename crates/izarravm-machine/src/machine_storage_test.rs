@@ -459,7 +459,7 @@ fn booter_inert_stands_down_dos_vectors_but_keeps_the_bios() {
     let mut m = int15_machine(16);
 
     // The Rust DOS kernel that used to service INT 21h/25h/26h/27h/29h/2Ah/2Eh
-    // was retired in SP-3, so those pure-DOS vectors are no longer intercepted
+    // is retired, so those pure-DOS vectors are no longer intercepted
     // in EITHER mode; they always pass straight through to the guest's IVT.
     ack_and_dispatch(&mut m, 0x21);
     assert_eq!(
@@ -469,7 +469,7 @@ fn booter_inert_stands_down_dos_vectors_but_keeps_the_bios() {
 
     // The DOS multiplex vector (INT 2Fh) IS intercepted by default. INT 67h is
     // not intercepted at all any more: the TOKAEMM guest driver owns the EMS
-    // API (SP-4b M2).
+    // API.
     ack_and_dispatch(&mut m, 0x2f);
     assert_eq!(
         m.pending_soft_int,
@@ -572,7 +572,7 @@ fn program_runtime_reintercepts_dos_vectors_for_the_raw_program_loader() {
     // itself (terminate + minimal console I/O), so interrupt_acknowledge must
     // record those vectors when program_runtime is set — even though the
     // retired HLE no longer intercepts them for a normal boot. This pins the
-    // exact branch the SP-3 seam deletion added to interrupt_acknowledge.
+    // corresponding branch in interrupt_acknowledge.
     let prog: &[u8] = &[0xcd, 0x20]; // int 20h
     let mut raw =
         Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();

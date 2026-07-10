@@ -200,7 +200,7 @@ fn unknown_command_is_illegal_request() {
     assert_eq!(dev.asc, asc::INVALID_COMMAND.0);
 }
 
-// Slice A: interrupt reason (C/D, I/O) + BSY const.
+// Interrupt reason (C/D, I/O) and BSY behavior.
 
 #[test]
 fn arm_packet_sets_await_packet_reason() {
@@ -246,7 +246,7 @@ fn bsy_const_is_the_high_bit() {
     assert_eq!(BSY, 0x80);
 }
 
-// Slice B: START STOP UNIT (0x1B) + PREVENT/ALLOW (0x1E).
+// START STOP UNIT (0x1B) and PREVENT/ALLOW (0x1E).
 
 #[test]
 fn prevent_allow_latches_the_flag() {
@@ -308,7 +308,7 @@ fn start_stop_flips_started_flag() {
     assert!(dev.is_loaded()); // a plain stop does not eject
 }
 
-// Slice C: SEEK (0x2B).
+// SEEK (0x2B).
 
 #[test]
 fn seek_in_range_succeeds_with_no_data() {
@@ -338,7 +338,7 @@ fn seek_not_ready_when_empty() {
     assert_eq!(dev.sense_key, sense_key::NOT_READY);
 }
 
-// Slice D: REQUEST SENSE info field, INQUIRY EVPD, READ HEADER.
+// REQUEST SENSE information, INQUIRY EVPD, and READ HEADER.
 
 #[test]
 fn request_sense_carries_failing_lba_with_valid_bit() {
@@ -458,7 +458,7 @@ fn read_header_past_end_is_out_of_range() {
     assert_eq!(dev.asc, asc::LBA_OUT_OF_RANGE.0);
 }
 
-// Slice 9a-3: READ CD (0xBE), MODE SENSE(10) pages, MODE SELECT(10).
+// READ CD (0xBE), MODE SENSE(10) pages, and MODE SELECT(10).
 
 #[test]
 fn read_cd_returns_user_data_like_read10() {

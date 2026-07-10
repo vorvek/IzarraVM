@@ -579,8 +579,7 @@ impl Vga {
     /// The second font table index, decoded from the map-B field of the Sequencer
     /// Character Map Select (bits 2, 3, 5). In 512-glyph mode each cell's attribute
     /// bit 3 picks map A (clear) or map B (set); when both maps select the same
-    /// table the cell is 256-glyph and bit 3 stays foreground intensity. See A4 in
-    /// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+    /// table the cell is 256-glyph and bit 3 stays foreground intensity.
     pub fn active_font_table_b(&self) -> usize {
         char_map_b_decode(self.seq.char_map_select)
     }
@@ -596,8 +595,7 @@ impl Vga {
     /// counter: 16 frames on, 16 frames off (period 32). At mode 03h's 70 Hz that
     /// is the documented ~2.19 Hz cursor/attribute blink rate. Both the attribute
     /// blink (foreground collapse) and the hardware-cursor blink read this single
-    /// source so they stay in lockstep. See A6 in
-    /// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+    /// source so they stay in lockstep.
     pub fn blink_hide_phase(&self) -> bool {
         (self.frames / 16) % 2 == 1
     }
@@ -1041,7 +1039,7 @@ impl Vga {
     ///
     /// Composed of `status1_side_effects` (the two guest-visible mutations: the
     /// raster catch-up and the attribute flip-flop reset) plus `status1_bits`
-    /// (the pure bit computation off `self.beam`). The P4a lazy port-read path
+    /// (the pure bit computation off `self.beam`). The lazy port-read path
     /// (`MachineBus::read_io`, Approximate timing class) calls the same two
     /// pieces but passes a predicted beam position to `status1_bits` instead of
     /// `self.beam`, so both callers share exactly one bit-computation
@@ -1126,7 +1124,7 @@ impl Vga {
         status
     }
 
-    /// Lazy-path status-port read (P4a Task 1.3, Approximate timing class only):
+    /// Lazy-path status-port read for the Approximate timing class:
     /// handles exactly 3DA/3BA/3C2, the same three ports `read_port` routes to
     /// `read_status1`/`read_status0`, but computes the returned bits from a
     /// caller-supplied predicted beam (`MachineBus::predicted_beam()`) instead
@@ -1645,7 +1643,7 @@ impl Vga {
                     (self.crtc.line_compare & !0x200) | (u32::from((value >> 6) & 1) << 9);
             }
             0x11 => self.crtc_regs.r11 = value,
-            _ => {} // full timing programmed via set_mode_0dh in slice 1
+            _ => {} // full timing is programmed via set_mode_0dh
         }
         // Always capture the raw vertical-timing bytes, even in text mode: a
         // register-banging 256-color guest (TSUMERA sets 320x240 mode X this way)
@@ -2740,8 +2738,7 @@ fn char_map_a_decode(spec: u8) -> usize {
 
 /// Map-B font table (Sequencer Character Map Select bits 2, 3, 5), the mirror of
 /// `char_map_a_decode` for the second character set. Per cell, attribute bit 3
-/// selects map B (set) or map A (clear) in 512-glyph mode. See A4 in
-/// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+/// selects map B (set) or map A (clear) in 512-glyph mode.
 fn char_map_b_decode(spec: u8) -> usize {
     char_map_decode(spec, 2, 3, 5)
 }
@@ -2904,7 +2901,6 @@ pub fn write_planes(
 /// Map a display-address counter value `ma` to a per-plane byte offset, applying
 /// the CRTC byte/word/doubleword addressing transform and the 16-bit (64 KB)
 /// counter wrap. `mode_control` is CRTC index 17h, `underline_loc` is index 14h.
-/// See `docs/vga-core/README.md` slice 3.
 pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
     display_offset_row(mode_control, underline_loc, ma, 0)
 }

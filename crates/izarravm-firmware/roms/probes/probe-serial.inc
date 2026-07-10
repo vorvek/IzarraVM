@@ -1,4 +1,4 @@
-; probes/probe-serial.inc - STREAM C: COM1 (16550-class UART) probe.
+; COM1 (16550-class UART) probe.
 ; Wait for the timed transmitter to drain and check its idle pattern. Then
 ; round-trip the scratch register, which has no side effects.
 

@@ -1,4 +1,4 @@
-; mousetst.com — SP-4b M4 mouse-under-V86 e2e fixture. Runs from AUTOEXEC after
+; Mouse-under-V86 fixture. Runs from AUTOEXEC after
 ; LH TOKAMOUS (the default AUTOEXEC loads the INT 33h driver into a TOKAEMM UMB)
 ; with the whole system in V86 under the monitor.
 ;

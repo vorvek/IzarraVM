@@ -1,4 +1,4 @@
-; probes/probe-optical.inc - STREAM C: ATAPI optical drive probe (the optical
+; ATAPI optical drive probe (the optical
 ; icon). The CD-ROM is the secondary-channel device at command block 0x170-0x177.
 ; ATAPI devices are identified by the signature they place in the cylinder
 ; (LBA mid/high) registers: 0x14 in LBA mid (0x174) and 0xEB in LBA high (0x175).

@@ -228,7 +228,7 @@ fn apply_state(cpu: &mut CpuGsw, bus: &mut FlatBus, state: &TestState) {
 /// both); OF is defined only for a 1-bit count (guaranteed only by 0xD0/0xD1); and
 /// CF is undefined for SHL/SHR (and the /6 SHL alias) when the masked count reaches
 /// the operand size in bits, per the Intel SDM. SAR and the rotates keep CF defined
-/// at any count. See dev_docs/reference/80386-shift-flags.md. SF/ZF/PF and the
+/// at any count. SF/ZF/PF and the
 /// result stay compared for every count. For the 0xF6/0xF7 group the mask depends
 /// on /reg: TEST (/0, /1) leaves AF undefined; MUL/IMUL (/4, /5) define CF/OF and
 /// leave SF/ZF/AF/PF undefined; DIV/IDIV (/6, /7) leave all arithmetic flags

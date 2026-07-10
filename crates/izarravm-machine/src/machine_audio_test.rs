@@ -857,7 +857,7 @@ fn event_batch_cap_reaches_a_near_due_wss_edge_in_every_mode() {
 
 #[test]
 fn approximate_class_delivers_pit_irq0_during_long_compute_stretches() {
-    // P4c end to end: in the Approximate class a guest that computes for
+    // In the Approximate class, a guest that computes for
     // many milliseconds without any port I/O still sees IRQ0 at the
     // programmed cadence. Each edge is requested by advance_devices in the
     // batch that spans it, the cap ends that batch at (about) the edge

@@ -1,7 +1,7 @@
 //! Intel 8254 programmable interval timer: three independent counters.
 //!
-//! Built clean-room from the Intel 8254 datasheet cached at
-//! dev_docs/reference/8254/. Channel 0's OUT drives IRQ0; channel 1 is the AT
+//! Built clean-room from the Intel 8254 datasheet. Channel 0's OUT drives IRQ0;
+//! channel 1 is the AT
 //! DRAM-refresh timer (mode 2) and channel 2 the PC speaker. All six counter modes
 //! are modeled at input-CLK granularity, including the mode-3 odd-count asymmetry.
 //! BCD counting decrements in decimal (reload 0 means 10000). Channel 1 and 2 OUT
@@ -240,8 +240,8 @@ impl Counter {
     /// `clocks` span, matching the batch-boundary contract `predicted_beam` and
     /// `clocks_until_out_rise` already rely on.
     ///
-    /// Wired to production via `Pit::out_after` (P4a Task 2.3): the lazy port
-    /// 0x61 bits 4/5 read peeks channel 1 and channel 2 through it.
+    /// The lazy port 0x61 bits 4/5 read peeks channel 1 and channel 2 through
+    /// `Pit::out_after`.
     fn out_after(&self, clocks: u64) -> Option<bool> {
         if self.bcd {
             return None;
@@ -809,7 +809,7 @@ impl Pit {
     }
 
     /// The analytic live OUT level of `channel` `clocks` input CLKs from now,
-    /// without stepping (P4a Task 2.3: the lazy port 0x61 bits 4/5 read).
+    /// without stepping. The lazy port 0x61 bits 4/5 read uses this path.
     /// `None` when the channel is out of range or the counter is BCD (see
     /// `Counter::out_after`); the caller falls back to a real `tick` in either
     /// case.

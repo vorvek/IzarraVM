@@ -1,4 +1,4 @@
-// STREAM E integration test: the Tab boot menu and the INT 19h floppy bootstrap.
+// Integration test for the Tab boot menu and the INT 19h floppy bootstrap.
 //
 // Drives the public Machine API only. During the POST hotkey window the BIOS
 // watches for Del (setup) and Tab (boot menu). Tab opens the boot menu on the

@@ -1,4 +1,4 @@
-// Stream C2 integration test: the Izarra 3000 BIOS audio probes.
+// Integration test for the Izarra 3000 BIOS audio probes.
 //
 // Boots the real izarra-bios ROM on a 386-class machine, runs POST to the idle
 // halt, and parses the VDTS result block the BIOS built in low memory. The audio

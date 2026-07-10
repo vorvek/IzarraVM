@@ -3,10 +3,9 @@
 
 //! Intel 8237A DMA controller, a master/slave cascade pair.
 //!
-//! Built clean-room from the Intel 8237A datasheet cached at
-//! dev_docs/reference/8237a/. Demand, single, block, and auto-init channel state
-//! is modeled, along with the command register's controller-disable gate and
-//! the memory-to-memory block transfer.
+//! Built clean-room from the Intel 8237A datasheet. Demand, single, block, and
+//! auto-init channel state is modeled, along with the command register's
+//! controller-disable gate and the memory-to-memory block transfer.
 //! Both transfer directions run: memory->device (Sound Blaster playback) and
 //! device->memory (the floppy controller's READ DATA on channel 2).
 //! A device call is one request/grant/transfer cycle. Demand, single, and block

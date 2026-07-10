@@ -75,9 +75,7 @@ fn machine_bus_snapshots_batch_entry_state() {
     // Run the machine forward a bit first so timeline/beam/
     // bus_rem are not all trivially zero, then check that a freshly-built
     // MachineBus's five batch-entry snapshot fields equal the live machine
-    // state at the moment the bus is constructed (P4a Slice 1 Task 1.1:
-    // dev_docs/2026-07-02-p4a-lazy-port-device-time-plan.md). Nothing
-    // consumes these fields yet; this only pins the wiring.
+    // state at the moment the bus is constructed.
     let mut machine = test_machine();
     machine.run_cycles(5_000).unwrap();
     let expected_timeline = machine.timeline;
@@ -114,8 +112,7 @@ fn predicted_beam_at_batch_start_equals_the_unmutated_beam() {
     // At core_clocks_so_far = 0 with zero in-batch bus clocks (the very first
     // instruction of a batch, before any fetch/data access has been recorded
     // into the trace this batch), the lazy formula must degenerate to exactly
-    // the batch-entry beam: no in-batch advance has happened yet. This pins the
-    // P4a Slice 1 peek's first-instruction safety argument as a test.
+    // the batch-entry beam because no in-batch advance has happened yet.
     let mut machine = test_machine();
     machine.run_cycles(5_000).unwrap();
     let expected_beam = machine.video().beam_dots();
@@ -139,7 +136,7 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
     // (the established pattern, see
     // predict_vga_dots_matches_the_real_advance_devices_accumulator_step). Run
     // both forward an odd cycle count first so the dot phase and
-    // bus_rem is nonzero at batch entry (the Task 1.1 shape: vga_dots
+    // bus_rem is nonzero at batch entry (vga_dots
     // ~0.4397, bus_rem 24 after 5000 cycles). Snapshot one into a MachineBus
     // and compute predicted_beam for a given in-batch clock total; call
     // advance_devices for real on the other with the same total (expressed in
@@ -150,8 +147,8 @@ fn predicted_beam_after_n_clocks_matches_a_real_advance_devices_of_the_same_n() 
     // modulo wrap REALLY happens (asserted below via frames_completed), and
     // nonzero prior_runs_core_clocks values so the batch-scoped core term
     // (prior runs of the same batch) is exercised, not just the run-scoped
-    // one. Task 1.3's lazy-read tests will drive the prior-runs seam
-    // end-to-end through read_io; here the field is set directly, paired with
+    // one. Other lazy-read tests drive the prior-runs seam end to end through
+    // read_io; here the field is set directly, paired with
     // the batch-loop pin test below
     // (batch_loop_publishes_prior_runs_core_clocks_before_every_run).
     let mut any_wrap = false;
@@ -239,9 +236,8 @@ fn batch_loop_publishes_prior_runs_core_clocks_before_every_run() {
     // loop must republish the batch-scoped core accumulator (interrupt-service
     // charge + prior runs) into the bus, so a mid-run lazy prediction sees a
     // clock total that is monotone across run boundaries and bounded by the
-    // core total the batch-end step later consumes. Nothing reads the field
-    // from read_io yet (Task 1.3 wires that end-to-end); this pins the
-    // loop-update mechanics directly: per batch, pushes are non-decreasing
+    // core total the batch-end step later consumes. This pins the loop-update
+    // mechanics directly: per batch, pushes are non-decreasing
     // prefix sums of the final batch core total, they reset at batch entry,
     // and real ROM execution produces multi-run batches where a later run
     // observes a NONZERO prior-runs value (the case the run-scoped
@@ -292,7 +288,7 @@ fn batch_loop_publishes_prior_runs_core_clocks_before_every_run() {
 
 #[test]
 fn lazy_3da_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
-    // The P4a Task 1.3 behavior change: in the Approximate class (486/586) a
+    // In the Approximate class (486/586), a
     // 0x3DA/0x3BA/0x3C2 read must NOT end the batch (io_touched stays false),
     // while the 386 modes keep the exact prior behavior
     // (io_touched set on every status-port read). Covers all three ports.
@@ -354,7 +350,7 @@ fn ring0_monitor_port_access_does_not_set_io_touched_in_approximate_class() {
 fn ring0_monitor_port_access_still_sets_io_touched_in_accurate_class() {
     // The 386 modes keep byte-identical batch semantics:
     // the ring-0-monitor exemption is Approximate-only, matching every
-    // other P4a lazy gate in read_io/write_io.
+    // other lazy gate in read_io/write_io.
     let mut accurate = test_machine(); // Gsw386 by construction
     with_bus(&mut accurate, |bus| {
         bus.write_io(0x20, BusWidth::Byte, 0x0B, true).unwrap();
@@ -482,8 +478,8 @@ fn lazy_3da_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
     // At batch start (zero in-batch clocks, predicted_beam degenerates to the
     // batch-entry beam exactly, per
     // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy
-    // status1 bits must be byte-identical to what the pre-Task-1.3
-    // read_status1 would have returned for the same live beam. Compared
+    // status1 bits must be byte-identical to what a non-lazy read_status1
+    // would return for the same live beam. Compared
     // within a SINGLE Approximate-class machine (not across two differently
     // clocked machines, whose beams would drift apart independently of this
     // task's change): clone the live Vga state before either read touches
@@ -517,7 +513,7 @@ fn lazy_3da_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
 #[test]
 fn lazy_reads_chain_into_far_fewer_batches_than_poll_iterations_with_monotone_observations() {
     // End-to-end no-time-travel test: a real mode-13h guest tightly polls
-    // 0x3DA in a loop (the same port the P4d cadence test polls) and
+    // 0x3DA in a loop and
     // maintains, in guest memory, a running sample count and a toggle count
     // of the vretrace bit (0x08) across every sample it has ever taken --
     // not just a bounded ring, so the toggle observation cannot be an
@@ -687,7 +683,7 @@ fn lazy_read_after_an_interrupt_service_charge_sees_the_batch_scoped_total() {
 
 #[test]
 fn lazy_61_read_does_not_set_io_touched_in_approximate_class_but_does_in_accurate() {
-    // The P4a Task 2.3 behavior change, mirroring the 3DA/3BA/3C2 case: in
+    // Mirroring the 3DA/3BA/3C2 case, in
     // the Approximate class (486/586) a port 0x61 read must NOT end the
     // batch (io_touched stays false), while the 386 modes
     // keeps the exact prior behavior (io_touched set).
@@ -717,8 +713,8 @@ fn lazy_61_read_returns_the_same_bits_a_non_lazy_read_would_at_batch_start() {
     // At batch start (zero in-batch clocks, predicted_pit_out degenerates to
     // the batch-entry live channel_out exactly, the PIT counterpart of
     // predicted_beam_at_batch_start_equals_the_unmutated_beam), the lazy 0x61
-    // byte must be byte-identical to what the pre-Task-2.3 read would have
-    // returned for the same live PIT/speaker state.
+    // byte must be byte-identical to what a non-lazy read would return for the
+    // same live PIT/speaker state.
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw486); // Approximate class: the lazy path
     machine.run_cycles(5_000).unwrap();
@@ -823,7 +819,7 @@ fn predicted_pit_out_after_n_clocks_matches_a_real_advance_devices_of_the_same_n
 
 #[test]
 fn lazy_61_read_falls_back_to_the_non_lazy_path_for_a_bcd_counter() {
-    // BCD fallback (P4a Task 2.3): out_after conservatively declines for a
+    // `out_after` conservatively declines for a
     // BCD-programmed counter, so the lazy 0x61 arm must fall all the way
     // back to the exact non-lazy path -- io_touched set, today's live read
     // -- rather than a second implementation of the bit composition.

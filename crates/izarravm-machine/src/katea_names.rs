@@ -2,7 +2,7 @@
 //! per directory (FAT 8.3 uniqueness is per-directory). It owns the folding (via
 //! `fat_name`) and a bidirectional record so a folded name maps back to its host
 //! path — the read side uses the folded name for the directory entry, the write
-//! side (M2) uses the reverse map.
+//! side uses the reverse map.
 
 use crate::fat_name;
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ impl NameTable {
     }
 
     /// Reverse lookup: the host path a folded name came from, if any.
-    // Limit: superseded for M2's write path by `KateaTreeVolume::dir_paths` +
+    // Limit: superseded for writes by `KateaTreeVolume::dir_paths` +
     // `existing_files` (seeded once at mount, no O(n) scan). Retained for a future
     // delete/rename milestone, which needs name->host-path resolution.
     #[allow(dead_code)]

@@ -3,7 +3,7 @@
 
 use super::*;
 
-// ---- Slice 1: real-mode integer opcode completion (see dev_docs/COVERAGE.md) ----
+// ---- Real-mode integer opcode coverage ----
 
 /// Drive `run_straight_line` repeatedly the way the machine batch loop does (without devices or
 /// interrupts): keep starting a fresh run from the current eip until one halts or a generous step
@@ -712,7 +712,7 @@ fn straight_line_run_executes_cached_near_call_continuation() {
 
 #[test]
 fn straight_line_run_chains_a_near_ret_procedure_in_one_run() {
-    // The P1b chaining property: a warm CALL rel16 -> body -> near RET procedure executes as
+    // A warm CALL rel16 -> body -> near RET procedure executes as
     // ONE run (no brk[branch] break at the RET), proven via the run/break perf counters.
     //
     //   0x00: B9 02 00     MOV CX, 2

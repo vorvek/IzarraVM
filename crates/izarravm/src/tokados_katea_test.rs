@@ -66,9 +66,8 @@ fn katea_static_hdd_boots() {
 /// The Katea host-folder facade end-to-end: mount a real host directory as C:
 /// through `mount_hdd_folder` (the lazy facade, not a flat image), boot the
 /// real FreeDOS kernel, and confirm it reaches C:\> and lists a file that lives
-/// only in the host folder. This proves the mount path — system files from the
-/// committed image + host files folded to 8.3 — boots and reads host files,
-/// the M0 deliverable.
+/// only in the host folder. This proves that system files from the committed
+/// image and host files folded to 8.3 can share a bootable mount.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
 fn katea_host_folder_boots_and_lists_a_host_file() {
@@ -203,13 +202,13 @@ fn katea_full_post_boot_hands_display_back_to_vga() {
     );
 }
 
-/// The Katea-1 M1 boot-coherence gate: a host folder with a file *in a
+/// A host folder with a file *in a
 /// subfolder* boots the real FreeDOS kernel, the subfolder is navigable, and a
 /// file at depth reads lazily through the recursive tree facade. This is the
-/// milestone's success gate — it proves the tree volume (`KateaTreeVolume`)
+/// test proves the tree volume (`KateaTreeVolume`)
 /// produces a self-consistent, bootable disk and that `CD` into a synthesized
 /// subdirectory plus a `TYPE` of a file two levels down (`C:\GAMES\HELLO\`)
-/// returns the host file's bytes, which M0's flat facade could never expose.
+/// returns the host file's bytes, which the flat facade could never expose.
 #[test]
 #[ignore = "boots a full DOS image from a host-folder tree (slow in debug); run with --ignored"]
 fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
@@ -297,7 +296,7 @@ fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
     );
 }
 
-/// Katea-1 M2 success gate: real FreeDOS, booted from a host folder, creates a
+/// Real FreeDOS, booted from a host folder, creates a
 /// new file, overwrites an existing one, and grows one — all in a subfolder,
 /// plus MKDIR a host subdir with a file at depth — and the changes appear
 /// correctly in the host folder (verified by host-side read-back), with the
@@ -338,7 +337,7 @@ echo deep>SUB\\DEEP.TXT\r\n";
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
-        panic!("CPU fault during Katea M2 boot: {msg}\nstop={stop:?}\n{text}");
+        panic!("CPU fault during Katea write boot: {msg}\nstop={stop:?}\n{text}");
     }
     let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
     assert!(
@@ -395,7 +394,7 @@ echo deep>SUB\\DEEP.TXT\r\n";
     );
 }
 
-/// Katea-1 M3 gate: real FreeDOS deletes a file, renames a file in place, moves
+/// Real FreeDOS deletes a file, renames a file in place, moves
 /// a file into a subdir, RMDIRs an emptied dir, renames a subdir, and deletes a
 /// PRE-EXISTING host file — all reflected in the host folder, read back.
 #[test]
@@ -444,7 +443,7 @@ del PREEXIST.TXT\r\n";
     if let StopReason::CpuError(msg) = &stop {
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
-        panic!("CPU fault during Katea M3 boot: {msg}\nstop={stop:?}\n{text}");
+        panic!("CPU fault during Katea mutation boot: {msg}\nstop={stop:?}\n{text}");
     }
     let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
     assert!(
@@ -452,8 +451,8 @@ del PREEXIST.TXT\r\n";
         "no C:\\> prompt (stop={stop:?}).\n{boot_text}"
     );
 
-    // `ops` runs six commands incl. a COPY (heavier than M2's echoes) + an inline
-    // reconcile each, hence a larger settle budget than the M2 e2e's 120M.
+    // `ops` runs six commands including a COPY and an inline reconcile for each,
+    // so it needs a larger settle budget than the create-and-overwrite test.
     for (cmd, settle) in [("cd ops\r", 40_000_000u64), ("ops\r", 150_000_000u64)] {
         for ch in cmd.chars() {
             for code in ascii_to_set1(ch) {

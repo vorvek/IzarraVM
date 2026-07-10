@@ -210,7 +210,7 @@ impl FromStr for SbIrq {
 }
 
 /// IRQ line for the Windows Sound System (AD1848) codec. The WSS standard
-/// documents IRQ 7/9/10/11 (see `dev_docs/reference/wss/README.md`), a set that
+/// documents IRQ 7/9/10/11, a set that
 /// only partially overlaps `SbIrq` (which carries 2/5/7/10): WSS cannot use 2 or
 /// 5, and `SbIrq` cannot express 9 or 11. A dedicated enum keeps the codec's
 /// configurable lines faithful to the documented set.
@@ -530,8 +530,8 @@ pub struct MachineConfig {
     pub cpu: GswMode,
     pub memory_mib: u16,
     pub video: VideoCard,
-    /// Retired (SP-4b M4): the TOKAEMM guest driver provides XMS/UMB/EMS from
-    /// the default CONFIG.SYS now. Accepted and ignored so pre-M4 conf files
+    /// Retired: the TOKAEMM guest driver provides XMS/UMB/EMS from the default
+    /// CONFIG.SYS. Accepted and ignored so older configuration files
     /// still parse; never written back.
     #[serde(default, skip_serializing)]
     pub emm386: Option<String>,

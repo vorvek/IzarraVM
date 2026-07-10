@@ -1,4 +1,4 @@
-; umbtest.com — SP-4b M3 UMB e2e fixture. Runs in V86 under TOKAEMM + DOS=UMB.
+; UMB fixture. Runs in V86 under TOKAEMM and DOS=UMB.
 ;
 ; Proves the full integration: with DOS=UMB, FreeDOS calls TOKAEMM's XMS 10h at
 ; SYSINIT and links our paged upper region into its MCB chain. This program sets

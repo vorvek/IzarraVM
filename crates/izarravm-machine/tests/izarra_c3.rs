@@ -1,7 +1,7 @@
-//! Integration coverage for Stream C3: the four Phase-3 component probes that
+//! Integration coverage for the four component probes that
 //! complete the graphical POST's icon sweep (GSW CPU, floppy controller, ATA
 //! hard disk, ATAPI optical). They do real port reads, so an absent device is
-//! reported as FAIL (its icon stays grey) -- this guards the faithful behaviour:
+//! reported as FAIL (its icon stays grey). This guards the faithful behaviour:
 //! the HDD probe FAILs on a bare machine because C: is HLE-backed rather than a
 //! real ATA disk, while CPU/floppy/optical PASS (those controllers are present).
 

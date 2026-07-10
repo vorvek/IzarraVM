@@ -24,9 +24,9 @@ fn device_lines_are_returned_in_order_with_high_flag() {
 
 #[test]
 fn emm386_conf_key_parses_and_is_ignored() {
-    // Pre-M4 izarravm.conf files carried `emm386 = "..."`; the key is
-    // accepted and ignored so those conf files still parse under M4's
-    // deny_unknown_fields MachineConfig.
+    // Older izarravm.conf files carried `emm386 = "..."`; the key is
+    // accepted and ignored so those files still parse while `MachineConfig`
+    // uses `deny_unknown_fields`.
     let cfg: AppConfig = toml::from_str("[machine]\nemm386 = \"noems\"\n").unwrap();
     assert_eq!(cfg.machine.emm386, Some("noems".to_string()));
 

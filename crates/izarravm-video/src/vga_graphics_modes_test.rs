@@ -1003,8 +1003,8 @@ fn mode_x_pel_pan_below_split_is_forced_to_zero_only_when_enabled() {
 
 #[test]
 fn mode_x_page_flip_reads_the_selected_page() {
-    // Checks render_256color_row's row_base arithmetic directly; the start-address
-    // vretrace latch is exercised end to end in the machine test (slice-5 task 5).
+    // Checks render_256color_row's row_base arithmetic directly. The machine test
+    // exercises the start-address vretrace latch end to end.
     let mut vga = Vga::default();
     vga.set_mode13h();
     vga.write_port(0x3C4, 0x04);

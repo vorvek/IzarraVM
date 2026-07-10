@@ -1,6 +1,6 @@
-; TOKAEMM.SYS — SP-4b M0 memory manager (bespoke, runs the system in V86).
+; TOKAEMM.SYS memory manager. Runs the system in V86.
 ;
-; Task 3 increment B: the driver's INIT builds a load-relative PM/paging +
+; The driver's INIT builds a load-relative PM/paging and
 ; ring-0 monitor environment in its OWN resident memory, then instead of a
 ; signal stub it IRETDs the *running kernel* into V86 at the SYSINIT return
 ; point (the EXECRH post-INIT code), so real FreeDOS keeps booting virtualized
@@ -63,9 +63,9 @@ va20: db 1                        ; virtual A20 (guest's view). The REAL gate is
                                   ; FreeDOS and period software use.)
 align 2
 vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
-                                  ; line N, master 0-7 + slave 8-15; SP-4b M4)
+                                  ; line N, master 0-7 + slave 8-15)
 
-; ---- SP-4b M1 XMS state (resident; reached via cs: overrides from V86) ----
+; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
 xms_pool_base: dd 0               ; first linear byte the EMB allocator hands out
 xms_pool_end:  dd 0               ; one past the last (capped to the 16 MB map)
@@ -87,21 +87,21 @@ XMS_HANDLES equ 32
 XMS_SLOT    equ 8
 xms_table: times XMS_HANDLES*XMS_SLOT db 0
 
-; SP-4b M3 UMB: the free upper window 0xC8000-0xEFFFF (above the VGA BIOS, below
+; The free UMB window is 0xC8000-0xEFFFF, above the VGA BIOS and below
 ; system ROM), 160 KB, page-mapped at INIT to extended RAM just above the HMA. The
 ; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, umb_win_end)
-; — the window ends at 0xF000, or 0xE000 when the EMS page frame is on (SP-4b M2).
+; The window ends at 0xF000, or 0xE000 when the EMS page frame is enabled.
 UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
 UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
 UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment); the window
-                                  ; ends at the runtime umb_win_end (SP-4b M2)
+                                  ; ends at the runtime umb_win_end
 ; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
 UMB_SLOTS equ 8
 UMB_SLOT  equ 6
 umb_table: times UMB_SLOTS*UMB_SLOT db 0
 
-; ---- SP-4b M2 EMS state (resident; reached via cs: overrides from V86) ----
+; ---- EMS state (resident; reached via cs: overrides from V86) ----
 ; Default-off: DEVICE=C:\DOS\TOKAEMM.SYS presents a frameless manager (INT 67h
 ; answers present/version/0 pages, like EMM386 NOEMS); the RAM argument
 ; provisions the page frame [0xE000,0xF000) + a backing pool carved from
@@ -131,7 +131,7 @@ ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ems_rm_lin:  dd 0
 ems_rm_phys: dd 0
 
-; ---- VCPI server state (M1; monitor-side only, reached via FS). The page
+; ---- VCPI server state (monitor-side only, reached via FS). The page
 ; pool is a STATIC carve of the XMS arena made at INIT: XMS keeps a fixed low
 ; reserve for EMBs (stock DOS barely allocates any -- DOS=HIGH uses the HMA,
 ; not EMBs), the VCPI bitmap owns everything above it. Disjoint from the EMS
@@ -192,7 +192,7 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
-    ; --- SP-4b M2: parse the DEVICE= tail for a whole-token "RAM" argument.
+    ; Parse the DEVICE= tail for a whole-token "RAM" argument.
     ; r_bpbptr (+18) points at the raw command line, driver path first
     ; (FreeDOS init_device). Case-insensitive; NOEMS/anything else = default off.
     push ds
@@ -248,8 +248,7 @@ init:
 .p_done:
     pop ds
 
-    ; --- SP-4b M4: signon banner (real mode, INT 29h per char — the proven M0
-    ; marker method; INT 21h AH=09h is unreliable at device-INIT time). ---
+    ; Signon banner. INT 29h works during device INIT, when INT 21h AH=09h is unreliable.
     mov si, banner
 .bl:
     lodsb                         ; DS = CS here
@@ -259,7 +258,7 @@ init:
     jmp .bl
 .bdone:
 
-    ; --- SP-4b M1/M3: size the XMS pool + hook INT 2Fh (real mode, pre-V86) ---
+    ; Size the XMS pool and hook INT 2Fh in real mode before entering V86.
     ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
     ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
     mov ah, 0x88
@@ -271,12 +270,12 @@ init:
 .pool_ok:
     sub eax, 64                   ; drop the HMA (first 64 KB of extended memory)
     shl eax, 10                   ; KB -> bytes
-    add eax, 0x00110000           ; eax = top of extended (pool_end, unchanged from M1)
+    add eax, 0x00110000           ; eax = top of extended (pool_end)
     mov [cs:xms_pool_end], eax
-    ; The 160 KB UMB backing sits just above the HMA (SP-4b M3); XMS starts past it.
+    ; The 160 KB UMB backing sits just above the HMA; XMS starts past it.
     mov dword [cs:xms_pool_base], UMB_PHYS_BASE + UMB_BYTES
 
-    ; --- SP-4b M2: with RAM, carve the EMS pool [EMS_PHYS_BASE, +pages*16K),
+    ; With RAM enabled, carve the EMS pool [EMS_PHYS_BASE, +pages*16K),
     ; shift the XMS pool past it, and end the UMB window below the page frame.
     cmp byte [cs:ems_on], 0
     je .ems_done
@@ -300,7 +299,7 @@ init:
     mov byte [cs:ems_on], 0
 .ems_done:
 
-    ; --- VCPI M1: carve the page pool from the top of the (post-EMS) XMS
+    ; Carve the VCPI page pool from the top of the post-EMS XMS region.
     ; arena. XMS keeps VCPI_XMS_KEEP; the bitmap owns the rest. Shrinking
     ; xms_pool_end here is what makes the two allocators disjoint. On a
     ; degenerate small-RAM box the pool is simply empty (DE04 answers 88h).
@@ -336,7 +335,6 @@ init:
     mov word [ds:0x67*4], ems_int67
     mov [ds:0x67*4+2], cs
     pop ds
-    ; --- end M1 INIT additions ---
 
     mov [drv_seg], cs
     xor eax, eax
@@ -393,7 +391,7 @@ init:
     mov ebx, eax                  ; carry monitor ESP into PM (survives PT build)
     mov word  [tss + 8], 0x0010   ; SS0 = flat data selector
     mov word  [tss + 0x66], 0x0068 ; I/O-map base (all-zero bitmap = permissive)
-    ; SP-4b M4: trap port 0x92 so the monitor virtualizes the guest's A20 (the
+    ; Trap port 0x92 so the monitor virtualizes the guest's A20 (the
     ; only bit set in the otherwise-permissive map), and force the REAL gate on
     ; for good — the monitor + the paged UMB/EMS backing sit above 1 MB.
     or byte [tss + 0x68 + (0x92/8)], 1 << (0x92 % 8)
@@ -412,7 +410,7 @@ init:
     jmp dword 0x08:pm_init        ; code sel base = base -> linear base+pm_init
 
 ; ============================================================================
-; SP-4b M1 — guest XMS driver (16-bit real mode / V86). Reached only via the INT
+; Guest XMS driver (16-bit real mode / V86). Reached only via the INT
 ; 2Fh hook (install-check / get-entry) and the far-callable control entry, never
 ; by fall-through (INIT above ends in a far jump). Own data via cs: overrides
 ; because the far-callable entry runs with the caller's DS.
@@ -479,7 +477,7 @@ xf_version:
     mov dx, 1
     retf
 
-; 01h request HMA / 02h release HMA (a flag; no /HMAMIN gate in M1).
+; 01h request HMA / 02h release HMA (a flag; no /HMAMIN gate).
 xf_req_hma:
     cmp byte [cs:hma_owned], 0
     jne .inuse
@@ -705,7 +703,7 @@ xf_info:
 ; 0Fh resize EMB: BX=new KB, DX=handle. Free + re-place; restore on failure.
 ; Re-places without copying the old contents to the new base — data is
 ; preserved only when find_gap returns the same base (no fragmentation). This
-; mirrors the retired FlatEmbAllocator::resize (the M1 goal was HLE parity); a
+; mirrors the retired FlatEmbAllocator::resize; a
 ; copy-on-relocate (via the INT 0xC0 memcpy) is a future-milestone fidelity item.
 xf_resize:
     push cx
@@ -970,7 +968,7 @@ resolve:
     stc
     ret
 
-; --- SP-4b M3 UMB (XMS 10h/11h/12h) over the paged window [UMB_SEG_BASE, +PARAS) --
+; --- UMB (XMS 10h/11h/12h) over the paged window [UMB_SEG_BASE, +PARAS) ---
 
 ; 10h Request UMB: DX = paragraphs. First-fit a free run; on success mark a slot.
 ;   success: AX=1, BX=segment, DX=paras. smaller-only: AX=0, BL=0xB0, DX=largest.
@@ -1060,7 +1058,7 @@ umb_free_run:
     push cx
     push si
     mov ax, [cs:umb_win_end]      ; window end (drops to 0xE000 when the EMS
-    sub ax, UMB_SEG_BASE          ; page frame carves the top; SP-4b M2)
+    sub ax, UMB_SEG_BASE          ; the EMS page frame carves the top
     cmp dx, ax                    ; bigger than the whole window? can't fit (dodges
     ja .none                      ; the 16-bit wrap on cursor+need for huge probes).
     mov bx, UMB_SEG_BASE
@@ -1183,7 +1181,7 @@ umb_max_grow:
     ret
 
 ; ============================================================================
-; SP-4b M2 — guest EMS (INT 67h, LIM 4.0 subset; V86 code, cs: overrides).
+; Guest EMS (INT 67h, LIM 4.0 subset; V86 code, cs: overrides).
 ; Hooked at INIT; apps find the manager by comparing "EMMXXXX0" at
 ; [IVT67-seg:000A] = our device-header name. Status in AH (0 = OK); registers
 ; other than documented outputs are preserved. Functions outside the
@@ -1297,7 +1295,7 @@ ef_alloc:
 
 ; 44h map: AL = physical slot 0-3, BX = logical page (0xFFFF unmaps),
 ; DX = handle. The bookkeeping is here; the PTE rewrite + TLB flush is the
-; monitor's INT 0xC0 'PM' service (ring-0 work, like the M1 XMS-move memcpy).
+; monitor's INT 0xC0 'PM' service (ring-0 work, like the XMS-move memcpy).
 ef_map:
     cmp al, 3
     ja .badphys
@@ -1652,7 +1650,7 @@ gdtr:
     dd 0
 
 ; IDT (static gates; offsets are driver-relative, selector = PM code 0x08;
-; base patched at runtime). SP-4b M4: the default boot runs the WHOLE system in
+; base patched at runtime). The default boot runs the whole system in
 ; V86, so every device IRQ the machine can raise needs a gate — master IRQ0-7 on
 ; vectors 8-15 (the DOS PIC base) and slave IRQ8-15 on 0x70-0x77. Vector 13 is
 ; BOTH #GP and IRQ5 (SB16): vec13_entry disambiguates. The exception overlaps on
@@ -1664,7 +1662,7 @@ gdtr:
     dw 0                          ; offset-high
 %endmacro
 align 8
-; SP-4b/vcpi-substrate: after the PRM-correct load_flags IOPL gate, a V86 guest
+; After the PRM-correct load_flags IOPL gate, a V86 guest
 ; that legitimately raises its live IOPL to 3 (Watcom-compiled Toka-DOS kernel/
 ; EMM glue does this during MEM runs) stops trapping CLI/STI/PUSHF/POPF/INT/
 ; IRET as sensitive ops (check_v86_iopl correctly waves them through, matching
@@ -1772,7 +1770,7 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     add eax, 0x1000
     add edi, 4
     loop .pt
-    ; SP-4b M3: page the free upper window 0xC8000-0xEFFFF to extended RAM (the
+    ; Page the free upper window 0xC8000-0xEFFFF to extended RAM (the
     ; EMM386 trick). On real hardware these holes have no RAM; a UMB there must be
     ; extended RAM mapped in. (This emulator's flat array also backs phys 0xC8000 via
     ; read_phys's fallback, so identity would work too -- but mapping proper extended
@@ -2646,7 +2644,7 @@ int67_entry:
     mov ebx, 0x67
     jmp deflt_common              ; re-loads DS/FS: harmless
 
-; ---- VCPI 1.0 server dispatch (INT 67h AH=DEh, AL = subfunction). M1:
+; ---- VCPI 1.0 server dispatch (INT 67h AH=DEh, AL = subfunction).
 ; presence + the query/page-pool/system-register/PIC set (DE00, DE02-DE0B).
 ; DE01/DE0C (the PM interface + mode switch) are later rungs; they and every
 ; undefined subfunction answer 8Fh, the spec's recommended "undefined
@@ -2980,7 +2978,7 @@ vcpi_page_free:
 ; server memory itself is reachable because the client's 0th page table was
 ; copied from ours (everything driver-resident is below 1MB). All segment
 ; registers are preserved (spec p.7); USE32 far return. Serves the PM set
-; that exists at this rung: DE00, DE03, DE04, DE05 (DE0C lands in M3);
+; available here: DE00, DE03, DE04, DE05, and DE0C;
 ; everything else answers 8Fh. The pool ops run IF-masked: clients may call
 ; with interrupts enabled and an ISR of theirs could reenter the interface
 ; mid-bitmap-update. FS is borrowed for driver data so vcpi_page_alloc/free

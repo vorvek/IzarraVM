@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// SP-4b M0 GO/NO-GO: `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
+/// `DEVICE=C:\DOS\TOKAEMM.SYS` puts the running kernel into V86
 /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
 /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
 /// onward runs virtualized. The gate: the DOS prompt reaches the screen.
@@ -76,14 +76,14 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M1 GO/NO-GO: a guest program install-checks XMS, allocates a 64 KB EMB,
+/// A guest program install-checks XMS, allocates a 64 KB EMB,
 /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
 /// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
 /// the monitor's flat memcpy). XMSTEST.COM signals 0xA5 (success) via the
 /// unit-tester exit port; any other code names the step that broke.
 ///
 /// The config is NOEMS so host EMS reserves no extended RAM and the guest XMS
-/// driver owns all of it (the M2 EMS-coexistence reconciliation is separate).
+/// driver owns all of it. EMS coexistence is covered separately.
 /// XMSTEST runs from AUTOEXEC, so the machine stops as soon as it signals — no
 /// interactive settling needed.
 #[test]
@@ -138,7 +138,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M3 GO/NO-GO: with DEVICE=TOKAEMM.SYS + DOS=UMB, a guest program sets
+/// With DEVICE=TOKAEMM.SYS + DOS=UMB, a guest program sets
 /// the high-first allocation strategy and AH=48h-allocates a block that lands in
 /// upper memory (segment >= 0xC800) with real RAM behind it (write/read a
 /// pattern) — proving TOKAEMM page-mapped extended RAM into the upper holes and
@@ -196,7 +196,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M3 mechanism test: drives TOKAEMM's XMS 10h/11h/12h directly (no
+/// Drives TOKAEMM's XMS 10h/11h/12h directly (no
 /// DOS=UMB) to exercise the allocator paths the DOS=UMB e2e doesn't reach — the
 /// too-big probe, alloc, grow, release, reuse-after-free — plus a write/read of
 /// the paged RAM. UMBMECH signals 0xA5; a 0xEn code names the failed step.
@@ -252,7 +252,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M2 GO/NO-GO: with DEVICE=TOKAEMM.SYS RAM, a guest program drives the
+/// With DEVICE=TOKAEMM.SYS RAM, a guest program drives the
 /// LIM EMS 4.0 API — version, frame segment, page counts, allocate — then maps
 /// logical pages through the frame slots, writing distinct patterns and reading
 /// them back through OTHER slots: the runtime page remap through the paged
@@ -310,11 +310,11 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M2 coexistence: with DEVICE=TOKAEMM.SYS RAM *and* DOS=UMB, the UMB
+/// With DEVICE=TOKAEMM.SYS RAM and DOS=UMB, the UMB
 /// window ends below the EMS page frame (umb_win_end = 0xE000) and DOS=UMB
 /// still links and allocates upper memory from the carved window — the frame
 /// and the UMBs share the upper area under the guest driver's own bookkeeping.
-/// Reuses the M3 UMBTEST fixture (seg >= 0xC800 + write/read pattern).
+/// Reuses the UMBTEST fixture (seg >= 0xC800 + write/read pattern).
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_m2_umb_coexists_with_ems_frame_in_v86() {
@@ -367,7 +367,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M2 default-off contract: a bare DEVICE=TOKAEMM.SYS (no RAM argument)
+/// A bare DEVICE=TOKAEMM.SYS (no RAM argument)
 /// presents a FRAMELESS manager — INT 67h answers present/version 4.0, the
 /// frame query returns 80h, page counts are zero, and allocation is refused
 /// with 87h (the EMM386 NOEMS contract). EMSNONE signals 0xA5 / 0xEn.
@@ -423,7 +423,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// VCPI M0 presence: under a bare DEVICE=TOKAEMM.SYS (frameless default,
+/// VCPI presence under a bare DEVICE=TOKAEMM.SYS (frameless default,
 /// no EMS pool — the stock-boot shape), INT 67h AX=DE00h answers VCPI 1.0
 /// present (AH=0, BX=0100h), a not-yet-implemented DExx subfunction
 /// answers 8Fh, untouched registers survive the call, and the plain EMS
@@ -481,7 +481,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// VCPI M1 queries + page pool: under a bare DEVICE=TOKAEMM.SYS, the
+/// VCPI queries and page-pool behavior under a bare DEVICE=TOKAEMM.SYS. The
 /// DE02-DE0B set answers — free-page count over a real pool, max-page
 /// query, alloc/free round-trip with 12-LSB masking, bad-free and
 /// double-free rejection, V86 page-table lookups (identity + out-of-range
@@ -534,19 +534,19 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
-        "VCPI M1 query/page-pool contract did not report success (stop={stop:?}); \
+        "VCPI query/page-pool contract did not report success (stop={stop:?}); \
              a 0xEn code names the failed step.\n{text}"
     );
 }
 
-/// VCPI M2 DE01: under a bare DEVICE=TOKAEMM.SYS, Get Protected Mode
+/// Under a bare DEVICE=TOKAEMM.SYS, VCPI DE01 Get Protected Mode
 /// Interface fills the client page-table buffer (identity first-MB
 /// entries, software bits 9-11 cleared, exactly 0x110 entries, DI
 /// advanced), furnishes the three server GDT descriptors (32-bit CPL0
 /// code / flat-4GB data / driver data sharing the code base), and
 /// returns a nonzero in-segment PM entry offset. VCPIIF signals
-/// 0xA5 / 0xEn. (The PM entry itself is exercised by the M3 switch
-/// fixture — it can only be far-called from protected mode.)
+/// 0xA5 / 0xEn. The protected-mode entry is exercised by the switch
+/// fixture because it can only be far-called from protected mode.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_vcpi_m2_de01_pm_interface() {
@@ -594,12 +594,12 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
-        "VCPI M2 DE01 interface contract did not report success (stop={stop:?}); \
+        "VCPI DE01 interface contract did not report success (stop={stop:?}); \
              a 0xEn code names the failed step.\n{text}"
     );
 }
 
-/// VCPI M3 DE0C: a minimal REAL VCPI client walks the full extender
+/// A minimal real VCPI client uses DE0C to walk the full extender
 /// lifecycle under a bare DEVICE=TOKAEMM.SYS — DE01 interface setup,
 /// DE0C into 16-bit protected mode under its own CR3/GDT/TSS (the
 /// JEMM-traced switch flow), far-calls to the server PM entry (DE03
@@ -654,12 +654,12 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     assert_eq!(
         stop,
         StopReason::TestExit { code: 0xA5 },
-        "VCPI M3 switch round-trip did not report success (stop={stop:?}); \
+        "VCPI switch round-trip did not report success (stop={stop:?}); \
              a 0xEn code names the failed step (0xEF = DE0C returned).\n{text}"
     );
 }
 
-/// VCPI M4 real-monitor contract: a V86 program that hooks INT 0Dh and
+/// A V86 program hooks INT 0Dh and
 /// executes a privileged instruction the monitor does not emulate (the
 /// literal DOS16M o32 LGDT startup shape) receives its own reflected
 /// fault with fault-IP semantics and can skip-and-resume — instead of
@@ -716,7 +716,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// VCPI M6 privileged-0F emulation (386MAX GP_ESCOD surface port): a V86
+/// VCPI privileged-0F emulation for the 386MAX GP_ESCOD surface: a V86
 /// task executes MOV r32,CR0/CR3/CR2, MOV CR0,r32 (with PE|PG cleared in
 /// the source — the monitor must force them back on), CLTS, and LMSW —
 /// all #GP at CPL 3 — and the monitor must EMULATE them transparently
@@ -774,7 +774,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// SP-4b M4 GO/NO-GO: a fresh (empty) user folder gets the NEW defaults seeded
+/// A fresh empty user folder gets the current defaults seeded
 /// (`ensure_user_config`) — DEVICE=TOKAEMM.SYS NOEMS + DOS=HIGH,UMB + LH
 /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
 /// TOKAEMM monitor, with the driver's signon banner on screen.
@@ -800,7 +800,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
     let seeded = std::fs::read_to_string(dir.join("CONFIG.SYS")).expect("seeded CONFIG.SYS");
     assert!(
         seeded.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS") && seeded.contains("DOS=HIGH,UMB"),
-        "seeded CONFIG.SYS lacks the M4 defaults:\n{seeded}"
+        "seeded CONFIG.SYS lacks the expected defaults:\n{seeded}"
     );
 
     let stop = machine
@@ -1274,7 +1274,7 @@ DIR DEST\r\n"
     );
 }
 
-/// SP-4b M4: the PS/2 mouse works under the default V86 boot — a host-injected
+/// The PS/2 mouse works under the default V86 boot. A host-injected
 /// wheel detent travels 8042 -> slave IRQ12 -> vector 0x74 -> the monitor's
 /// slave reflect stub -> guest INT 74h -> TOKAMOUS (loaded HIGH) -> INT 33h
 /// fn 03h, where MOUSETST polls it. Signals 0xA5; a 0xEn names the step.
@@ -1333,7 +1333,7 @@ fn tokaemm_m4_mouse_wheel_under_v86() {
     );
 }
 
-/// SP-4b M4: SB16 IRQ5 under V86 — IRQ5 lands on vector 13, shared with #GP,
+/// Under V86, SB16 IRQ5 lands on vector 13, shared with #GP,
 /// and the monitor's discriminator must route each correctly. SNDTST hooks
 /// INT 0Dh, resets the DSP, then requests immediate 8-bit IRQs (DSP 0xF2)
 /// inside a CLI/STI-dense loop. Signals 0xA5; a 0xEn names the step.

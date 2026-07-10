@@ -909,7 +909,7 @@ static void dispatch(const Event *e) {
 
     /* alt combos: Alt+F/E/S/H open the matching pulldown directly (ascii
      * can be 0 with Alt held, so dispatch on scancode); any other Alt+key
-     * is the mouse/menu layer's concern (Task 9) or unbound */
+     * is the mouse/menu layer's concern or unbound */
     if (alt) {
         switch (e->scan) {
         case 0x21: /* Alt+F */

@@ -1,11 +1,11 @@
-; vcpiif.com — TOKAEMM VCPI M2 DE01 (Get Protected Mode Interface) fixture.
+; vcpiif.com: TOKAEMM VCPI DE01 (Get Protected Mode Interface) fixture.
 ; Runs in V86 under a bare DEVICE=C:\DOS\TOKAEMM.SYS and validates every
 ; V86-observable effect of DE01: the page-table copy (identity first-MB
 ; entries, software bits 9-11 cleared, exactly 0x110 entries written, DI
 ; advanced to match), and the three furnished GDT descriptors (32-bit CPL0
 ; code with a sane limit, the exact flat-4GB data mirror, the driver-data
 ; mirror), plus a nonzero in-segment PM entry offset in EBX. The PM entry
-; itself is exercised by the M3 switch fixture -- it can only be far-called
+; itself is exercised by the switch fixture because it can only be far-called
 ; from protected mode.
 ;
 ; Signals 0xA5 (success) via the unit-tester exit port; 0xEn names the step.

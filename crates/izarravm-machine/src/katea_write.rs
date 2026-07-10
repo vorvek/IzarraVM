@@ -1,4 +1,4 @@
-//! Pure write-interpretation helpers for the Katea M2 write engine. These parse
+//! Pure write-interpretation helpers for the Katea write engine. These parse
 //! the guest's own directory + FAT bytes (no INT 21h, no DOS internals) so the
 //! reconcile pass in `katea_tree.rs` can decide what finished files to mirror to
 //! the host folder. Everything here is pure except `atomic_write`.
@@ -22,7 +22,7 @@ pub(crate) struct DirEntry {
 }
 
 /// What to do with one entry. `Skip` covers dot/dotdot, LFN, volume label, free,
-/// deleted, and system files. Delete/rename are out of M2 scope, so a vanished or
+/// deleted, and system files. Delete and rename are handled elsewhere, so a vanished or
 /// re-pointed entry is never destructive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EntryAction {

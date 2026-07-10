@@ -1,4 +1,4 @@
-; Izarra keyboard BIOS (phase 1): real INT 09h / INT 16h, echo to B8000.
+; Izarra keyboard BIOS: real INT 09h / INT 16h, echo to B8000.
 ; Assemble with: nasm -f bin kbd-bios.asm -o kbd-bios.bin
 bits 16
 org 0

@@ -144,7 +144,7 @@ post_self_framework:
     ret
 
 ; --- Foundation self-test: round-trip a dword above 1 MiB through the unreal
-; helpers, proving >1 MiB access works in the live BIOS (Stream B/C depend on it).
+; helpers, proving that live BIOS code can access memory above 1 MiB.
 POST_STEP "self.extaccess", post_self_extaccess
 post_self_extaccess:
     mov ebx, 0x00100000

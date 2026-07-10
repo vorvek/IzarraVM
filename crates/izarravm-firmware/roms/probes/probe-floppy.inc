@@ -1,4 +1,4 @@
-; probes/probe-floppy.inc - STREAM C: floppy disk controller probe (the floppy
+; Floppy disk controller probe (the floppy
 ; icon). The NEC-765/82077-class FDC lives at ports 0x3F2-0x3F7; its main status
 ; register (MSR, 0x3F4) is the presence handle. A live controller drives RQM
 ; (bit 7, "data register ready") and never reads back the all-ones floating bus a

@@ -5,7 +5,7 @@ use super::*;
 use izarravm_core::{SbDma8, SbDma16, SbIrq};
 use izarravm_firmware::I386DX25_TEST_ROM;
 use izarravm_video::{VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE};
-// Re-exported from cache carve (Phase 3).
+// Re-exported cache test helpers.
 use super::cache_config::{CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK, cache_geometry};
 
 const BIOS_TEXT_WHITE: u8 = 0x3F;
@@ -346,10 +346,10 @@ fn boot_image_with(code: &[u8]) -> Vec<u8> {
     image
 }
 
-// SP-4b M0 Task 2 (increment 1): the standalone V86 spike boots, enters V86 via
+// The standalone V86 spike boots, enters V86 via
 // the real-mode -> PM+paging -> IRETD-into-V86 transition, and the V86 stub signals
 // exit code 0xA5 through the unit-tester port. Proves the transition in isolation.
-// Throughput probe for the run-loop batching (item 2.3). Not a correctness
+// Throughput probe for run-loop batching. Not a correctness
 // test; run with: cargo test --release -- --ignored --nocapture batch_throughput
 /// Build a CD image with one data sector and a stretch of loud audio frames,
 /// for the CD-audio mixing test.

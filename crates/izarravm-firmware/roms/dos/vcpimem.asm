@@ -1,4 +1,4 @@
-; vcpimem.com — TOKAEMM VCPI M1 query/page-pool fixture. Runs in V86 under a
+; vcpimem.com: TOKAEMM VCPI query/page-pool fixture. Runs in V86 under a
 ; bare DEVICE=C:\DOS\TOKAEMM.SYS and exercises the DE02-DE0B set: the page
 ; pool (count/alloc/free round-trip, 12-LSB masking, bad-free and double-free
 ; rejection), the V86 page-table query, CR0, the debug-register array, and

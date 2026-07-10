@@ -513,7 +513,7 @@ fn geometry_bounds_a_huge_folder_and_reproduces_m0_for_a_small_one() {
     // bytes; the geometry loop re-queries it as `spc` climbs, because bigger
     // clusters hold the same bytes in fewer of them (see `fat32_geometry_for`).
 
-    // C1: a folder whose demand stays enormous at EVERY cluster size (here a
+    // A folder whose demand stays enormous at every cluster size (here a
     // flat ~80 billion clusters, i.e. roughly > 8 TB of data) doesn't fit even
     // at the largest cluster size (spc=64) -> must fail loudly, not overflow.
     let huge = fat32_geometry_for(|_cb| 80_000_000_000);
@@ -550,21 +550,21 @@ fn geometry_bounds_a_huge_folder_and_reproduces_m0_for_a_small_one() {
     );
     assert_eq!(sectors_per_cluster(geo1g.part_sectors), geo1g.spc);
 
-    // A tiny demand floors at MIN_DATA_CLUSTERS and reproduces M0's exact,
+    // A tiny demand floors at MIN_DATA_CLUSTERS and reproduces the exact,
     // boot-tested geometry: spc=1, fatsz=741, count_of_clusters=94742.
     let small = fat32_geometry_for(|_cb| 10).expect("a tiny demand fits a FAT32 volume");
     assert_eq!(
         small.spc, 1,
         "small folder stays on the 1-sector cluster band"
     );
-    assert_eq!(small.fatsz, 741, "M0's kernel-formula FAT size");
-    assert_eq!(small.count_of_clusters, 94_742, "M0's data-cluster count");
+    assert_eq!(small.fatsz, 741, "kernel-formula FAT size");
+    assert_eq!(small.count_of_clusters, 94_742, "data-cluster count");
     assert_eq!(sectors_per_cluster(small.part_sectors), small.spc);
 }
 
 #[test]
 fn root_child_dotdot_points_at_cluster_zero() {
-    // M2: per fatgen103 6.5, a directory whose parent is the root must encode
+    // Per fatgen103 6.5, a directory whose parent is the root must encode
     // its `..` FstClus as 0, not the root's actual cluster (2).
     let root = scratch("dotdot");
     std::fs::create_dir_all(root.join("SUB")).unwrap();
@@ -574,7 +574,7 @@ fn root_child_dotdot_points_at_cluster_zero() {
     allocate(&mut tree).expect("small folder fits a FAT32 volume");
 
     let sub = &tree.root.subdirs[0].dir;
-    // `parent_first_cluster` still records the real parent (root = 2) for M2's
+    // `parent_first_cluster` still records the real parent (root = 2) for the
     // write engine; only the emitted `..` entry collapses it to 0.
     assert_eq!(sub.parent_first_cluster, ROOT_CLUSTER);
 
@@ -620,8 +620,8 @@ fn new_seeds_dir_paths_mirrored_and_system_names() {
     let saves_fc = vol.tree().root.subdirs[0].dir.first_cluster;
     assert_eq!(vol.dir_paths.get(&saves_fc), Some(&root.join("SAVES")));
 
-    // The SAVES subdir is recorded in mirrored under the root, as a directory
-    // (new in M3: subdirs are seeded so disappearance/rename detection sees them).
+    // The SAVES subdir is recorded in mirrored under the root as a directory, so
+    // disappearance and rename detection can see it.
     let mut saves = [b' '; 11];
     saves[..5].copy_from_slice(b"SAVES");
     let sub_entry = vol

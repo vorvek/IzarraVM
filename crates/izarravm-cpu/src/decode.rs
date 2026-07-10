@@ -39,7 +39,7 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// faulting stack read or segment-limit hit still routes through `finish_instruction`'s
 /// rewind-and-deliver exactly as on the one-instruction path.
 ///
-/// P4a Task 1.3 additionally admits the IN forms (0xe4 IN AL,imm8; 0xe5 IN AX/EAX,imm8;
+/// The IN forms (0xe4 IN AL,imm8; 0xe5 IN AX/EAX,imm8;
 /// 0xec IN AL,DX; 0xed IN AX/EAX,DX) within `DecodeGroup::PortIo`, but ONLY when `level`
 /// is in the Approximate timing class (I486/I586): a lazy port read (`MachineBus::read_io`)
 /// no longer sets `io_touched` for the VGA status ports, so an IN reaching those ports no
@@ -59,12 +59,12 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// They matter because the canonical vretrace poll idiom is `IN; TEST AL,imm8; Jcc; JMP`:
 /// with IN admitted but TEST still a terminator, every poll iteration ends its run at the
 /// TEST and pays a full run restart, which measured at about the cost of the batch
-/// epilogue the lazy port read had just eliminated (P4a A/B, poll-3da flat at 0.204/0.051).
+/// epilogue the lazy port read had just eliminated (poll-3da measured 0.204/0.051).
 /// NO other Misc opcode is admitted: the BCD adjusts, AAM/AAD (#DE path), SALC/XLAT
 /// (memory read), INS/OUTS (port + string), and HLT all stay terminators.
 ///
 /// Gated on `persona` (not a runtime bus flag) so the Accurate 386 class keeps
-/// BYTE-IDENTICAL batch structure to before this task: `block_continuable` is called once
+/// byte-identical batch structure: `block_continuable` is called once
 /// per decode, and `CpuGsw::set_mode` unconditionally invalidates the decode cache
 /// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
 /// admission re-resolved -- after any mode change.

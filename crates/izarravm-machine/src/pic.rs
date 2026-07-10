@@ -3,9 +3,8 @@
 
 //! Intel 8259A programmable interrupt controller, a master/slave cascade pair.
 //!
-//! Built clean-room from the Intel 8259A datasheet cached at
-//! dev_docs/reference/8259a/. Edge and level triggering are supported in 8086
-//! vector mode. Priority order is rotatable through OCW2 (a per-controller
+//! Built clean-room from the Intel 8259A datasheet. Edge and level triggering
+//! are supported in 8086 vector mode. Priority order is rotatable through OCW2 (a per-controller
 //! lowest-priority pointer), and ICW4 special fully nested mode is decoded and
 //! honored in the cascade decision.
 

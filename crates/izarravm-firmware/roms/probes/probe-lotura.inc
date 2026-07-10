@@ -1,4 +1,4 @@
-; probes/probe-lotura.inc - STREAM C: Lotura system-controller probe.
+; Lotura system-controller probe.
 ; Two POST steps share this file. The first reads the Lotura identity port and
 ; reports PASS/FAIL; the second reads the live GSW-586 mode register and reports
 ; it as a one-character MEASURE value. The emulator answers PORT_LOTURA_ID with

@@ -1,18 +1,15 @@
 //! Recursive, read-only, lazy host-folder directory tree for the Katea
-//! controller. Generalizes the flat `KateaVolume` (M0) into a full FAT32
+//! controller. Generalizes the flat `KateaVolume` into a full FAT32
 //! directory tree whose FAT and directory sectors are computed on demand, so
 //! RAM scales with the entry count rather than the disk or file sizes.
 
-// `KateaTreeVolume` is now consumed by the ATA `HostFolder` backing (`ata.rs`)
-// and `mount_hdd_folder` (`lib.rs`), so the read path (`new`/`read_sector`/
-// `total_sectors`) is live and the module-level dead-code allow is gone. The M2
-// write path (`write_sector`/`fat_entry`/`cluster_to_lba`/`reconcile` and the
-// `overlay`/`dir_paths`/`mirrored`/`system_names` state) is now live too. A few
+// `KateaTreeVolume` is consumed by the ATA `HostFolder` backing (`ata.rs`) and
+// `mount_hdd_folder` (`lib.rs`). A few
 // items remain reachable only from this module's `#[cfg(test)]` tests; each
 // carries a narrow `#[allow(dead_code)]` at its definition: `tree()` and the
 // `tree` field it reads, and the free `dir_sector` (the per-volume read path
 // inlines the same logic in `data_sector`). The `tree` field is also the seam
-// the M2 write engine reads at construction.
+// the write engine reads at construction.
 
 use crate::fat32::{FAT32_EOC, fat32_dir_entry, fat32_fsinfo_sector};
 use crate::katea_names::NameTable;
@@ -31,10 +28,10 @@ use std::path::{Path, PathBuf};
 const MAX_DEPTH: usize = 32;
 
 /// Floor on the data-cluster count so the synthesized partition is always a
-/// valid, boot-tested FAT32. This is exactly the M0 static disk's data-cluster
+/// valid, boot-tested FAT32. This is exactly the flat static disk's data-cluster
 /// count: `(PART_SECTORS - used) / spc` for the proven-bootable 96256-sector
 /// partition (`used = 32 + 2*741`). Flooring here means a small host folder
-/// reproduces M0's known-good geometry (`part_sectors = 96256`, `fatsz = 741`)
+/// reproduces the known-good geometry (`part_sectors = 96256`, `fatsz = 741`)
 /// instead of landing just under `sectors_per_cluster`'s FAT32 floor (66601
 /// sectors), where it would panic. A larger folder grows past this floor.
 const MIN_DATA_CLUSTERS: u32 = 94_742;
@@ -43,7 +40,7 @@ const MIN_DATA_CLUSTERS: u32 = 94_742;
 pub(crate) struct TreeFile {
     pub name: [u8; 11],
     pub source: FileSource, // InMemory (system files) or HostFile (lazy)
-    pub first_cluster: u32, // assigned in Task 4
+    pub first_cluster: u32, // assigned after the tree is built
     pub cluster_count: u32,
 }
 
@@ -61,7 +58,7 @@ pub(crate) struct TreeDir {
     pub cluster_count: u32,
     pub parent_first_cluster: u32, // for `..`; 0 when the parent is the root
     /// This directory's host-filesystem path (root = the mounted folder). Used by
-    /// the M2 write engine to know where to materialize files created here.
+    /// the write engine to know where to materialize files created here.
     pub host_path: std::path::PathBuf,
 }
 
@@ -102,7 +99,7 @@ const DOS_FOLDER_BINARIES: &[&str] = &[
 /// disk still boots). The Toka-DOS binaries land in a synthetic `C:\DOS` subdir;
 /// KERNEL.SYS / CONFIG.SYS / AUTOEXEC.BAT / LICENSE.TXT and any user/runner file
 /// stay at the root. Metadata only — never reads host file contents. Cluster fields
-/// are zero here; Task 4 assigns them.
+/// are zero here; cluster assignment happens after construction.
 pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> HostTree {
     let mut names = NameTable::new();
     let mut dir = TreeDir {
@@ -163,7 +160,7 @@ pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> Hos
 fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize) {
     if depth > MAX_DEPTH {
         // A too-deep folder is truncated rather than recursed forever; warn once
-        // at the cap so the loss isn't silent (L2).
+        // at the cap so the loss is not silent.
         eprintln!("katea: directory tree deeper than {MAX_DEPTH}; truncating");
         return;
     }
@@ -176,7 +173,7 @@ fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize
         // metadata (not symlink_metadata): we already skip symlinks below.
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_symlink() {
-            continue; // No symlink following in M1 (loop-safe)
+            continue; // No symlink following, which also avoids loops.
         }
         let path = e.path();
         if ft.is_dir() {
@@ -191,11 +188,11 @@ fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize
         } else if ft.is_file() {
             let Ok(md) = e.metadata() else { continue };
             // Skip any file too large for a FAT32 32-bit size/cluster span, exactly
-            // as M0's `KateaVolume::new` does (`katea_volume.rs`): a `>= 4 GiB` file
+            // as `KateaVolume::new` does (`katea_volume.rs`): a `>= 4 GiB` file
             // can't be represented (the directory `size` field is u32), and letting
-            // it through would also clamp `size` wrong and feed the C1 cluster
-            // overflow. No unit test — a 4 GiB fixture is infeasible — so this
-            // mirrors M0's untested-but-correct pattern (M1).
+            // it through would also clamp `size` and overflow cluster sizing. A
+            // 4 GiB unit-test fixture is impractical, so this mirrors the flat
+            // volume's checked behavior.
             if md.len() >= u32::MAX as u64 {
                 eprintln!(
                     "katea: skipping {} (>= 4 GiB, not FAT32-representable)",
@@ -309,7 +306,7 @@ fn next_spc(spc: u8) -> u8 {
 /// (`MAX_SPC` = 64, i.e. roughly > 8 TB of data) — `count_of_clusters` past
 /// `FAT32_MAX_CLUSTERS` or a sector count past `u32::MAX` at a *smaller* `spc` just
 /// means "climb to a bigger cluster", not "fail". All sizing is done in `u64`; the
-/// final values are range-checked once before being narrowed into `u32`. (C1)
+/// final values are range-checked once before being narrowed into `u32`.
 ///
 /// The cluster size (`spc`) the FAT and partition are sized with must match the
 /// one `sectors_per_cluster` derives from the final partition size, or the BPB is
@@ -326,8 +323,8 @@ fn fat32_geometry_for(demand_at: impl Fn(u32) -> u64) -> Result<Geometry, std::i
         // The demand for THIS cluster size: the only honest figure to size from.
         let used_data = demand_at(u32::from(spc) * SECTOR as u32);
         // Need a valid FAT32; pad with headroom (25%) so DIR shows free space and
-        // M2 has room, and floor at the boot-tested M0 cluster count so the small-
-        // folder partition reproduces M0's known-good geometry (see
+        // writes have room, and floor at the boot-tested cluster count so the small-
+        // folder partition reproduces the known-good geometry (see
         // MIN_DATA_CLUSTERS) rather than landing just under the FAT32 floor. All in
         // u64 so the +25% can't overflow before the checks below.
         let needed = used_data.max(1);
@@ -344,7 +341,7 @@ fn fat32_geometry_for(demand_at: impl Fn(u32) -> u64) -> Result<Geometry, std::i
             return Err(too_large());
         }
         let data_sectors = data_sectors as u32;
-        // Size the FAT from the whole partition it lives in, exactly as M0 does
+        // Size the FAT from the whole partition it lives in, exactly as the flat volume does
         // (`fat_size_sectors(PART_SECTORS, spc)`): the formula's divisor accounts
         // for the FAT sectors, so passing the full partition is self-correcting.
         // We do not know `fatsz` until we size the partition, and the partition
@@ -432,7 +429,7 @@ fn assign_dir(dir: &mut TreeDir, is_root: bool, parent: u32, next: &mut u32, clu
     }
 }
 
-/// The computed-on-demand FAT. Task 4 assigns every chain as one *contiguous
+/// The computed-on-demand FAT. Every chain is assigned as one *contiguous
 /// run* of clusters, so a used cluster's FAT entry is simply `c + 1` unless `c`
 /// is the last cluster of its run (then EOC), and any cluster the tree never
 /// touched is free (0). We therefore store only the set of run-end clusters and
@@ -528,7 +525,7 @@ fn dir_entries(dir: &TreeDir, is_root: bool) -> Vec<[u8; 32]> {
         // Canonical FAT (fatgen103 6.5; cf. `fat32::fat32_dot_entries`): `..` points
         // at the parent's first cluster, EXCEPT when the parent is the root, where
         // it must be 0 (the root has no real cluster number to name). The root is
-        // always cluster 2 (ROOT_CLUSTER), so a parent of 2 means "root". (M2)
+        // always cluster 2 (ROOT_CLUSTER), so a parent of 2 means "root".
         let dotdot = *b"..         ";
         let dotdot_cluster = if dir.parent_first_cluster == ROOT_CLUSTER {
             0
@@ -615,17 +612,17 @@ enum Role {
 }
 
 /// A lazy, read-only, whole-disk FAT32 volume over a recursive host-folder tree.
-/// The sibling of M0's flat `KateaVolume`, generalized to a full directory tree:
+/// The sibling of the flat `KateaVolume`, generalized to a full directory tree:
 /// FAT and directory sectors are computed on demand and file data is read lazily,
 /// so RAM scales with the entry count rather than the disk or file sizes.
 ///
 /// The struct is **pointer-free**: it owns only `Vec`s (the flattened dirs/files
 /// and the sorted cluster-run table), the two stamped boot sectors, the geometry,
-/// and the cluster index. `tree` is kept whole for the test and M2 (writes); it is
+/// and the cluster index. `tree` is kept whole for tests and writes; it is
 /// not consulted by `read_sector` — that path resolves a cluster through `runs`.
 #[derive(Debug)]
 pub(crate) struct KateaTreeVolume {
-    /// The owned tree; kept for tests / M2 (writes), not read by `read_sector`.
+    /// The owned tree; kept for tests and writes, not read by `read_sector`.
     #[allow(dead_code)]
     tree: HostTree,
     geo: Geometry,
@@ -646,7 +643,7 @@ pub(crate) struct KateaTreeVolume {
     /// `(first_cluster, last_cluster, role)` runs, sorted by `first_cluster`.
     runs: Vec<(u32, u32, Role)>,
     /// Sparse write overlay: guest writes land here, reads consult it first. Held
-    /// until eject (no eviction in M2). RAM is bounded by bytes written this session.
+    /// until eject with no eviction. RAM is bounded by bytes written this session.
     overlay: HashMap<u32, [u8; SECTOR]>,
     /// Directory first-cluster -> its host-filesystem path. Seeded from the tree;
     /// extended on guest MKDIR. Reconcile materializes a file in this directory to
@@ -654,7 +651,7 @@ pub(crate) struct KateaTreeVolume {
     dir_paths: HashMap<u32, PathBuf>,
     /// What Katea believes currently exists on the host, keyed by
     /// `(parent dir first-cluster, folded 8.3 name)`. Seeded from the tree at
-    /// mount (every host file + subdir) and maintained by reconcile. Subsumes M2's
+    /// mount (every host file + subdir) and maintained by reconcile. Subsumes the
     /// `existing_files` (host_path for case-correct overwrite) and `materialized`
     /// (content-fingerprint dedupe). The root dir has no entry (it has no parent).
     mirrored: HashMap<(u32, [u8; 11]), MirrorEntry>,
@@ -845,7 +842,7 @@ impl KateaTreeVolume {
         self.geo.total_sectors
     }
 
-    /// The owned tree (for tests / M2 writes; `read_sector` does not use it).
+    /// The owned tree for tests and writes; `read_sector` does not use it.
     #[allow(dead_code)]
     pub(crate) fn tree(&self) -> &HostTree {
         &self.tree
@@ -1379,7 +1376,7 @@ fn clone_source(s: &FileSource) -> FileSource {
 }
 
 /// Read one 512-byte span at `byte_off` from a source, zero-padding past `size`.
-/// Same contract as M0's `katea_volume::read_source_span`: a `HostFile` opens,
+/// Same contract as `katea_volume::read_source_span`: a `HostFile` opens,
 /// seeks, and reads exactly the in-file portion on demand; an I/O error logs and
 /// reads back as zeros so a vanished/shrunk host file can't panic the guest.
 fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTOR] {
@@ -1393,7 +1390,7 @@ fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTO
             let start = byte_off as usize;
             // `valid` derives from the declared `size`; clamp it to what the backing
             // Vec actually holds so a size that disagrees with `v.len()` can never
-            // panic the slice (L1). The padded tail stays zero.
+            // panic the read. The padded tail stays zero.
             let avail = valid.min(v.len().saturating_sub(start));
             out[..avail].copy_from_slice(&v[start..start + avail]);
         }

@@ -1,4 +1,4 @@
-; sndtst.com — SP-4b M4 SB16-IRQ5-under-V86 e2e fixture. Runs in V86 under the
+; SB16 IRQ5 under V86 fixture. Runs under the
 ; TOKAEMM monitor (default-payload config).
 ;
 ; IRQ5 lands on vector 13 — the SAME vector as #GP, which the monitor uses for

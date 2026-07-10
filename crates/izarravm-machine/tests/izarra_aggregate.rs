@@ -1,7 +1,7 @@
-//! Phase 3 aggregate: with every stream landed, the full POST result block must
+//! The full POST result block must
 //! stay self-consistent (the live-append header keeps the declared count in sync)
 //! and every present component must PASS (a capability-revealing POST never FAILs
-//! a device that is there). Guards against one stream's records desynchronizing
+//! a device that is there). Guards against one probe's records desynchronizing
 //! the shared block.
 
 use izarravm_core::VideoCard;

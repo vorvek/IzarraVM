@@ -571,13 +571,13 @@ fn region_callbacks_keep_host_stack_aligned_in_a_string_loop() {
     assert!(jit_cpu.perf_counters().jit_region_entries > 0);
 }
 
-// ---- S2.1: the per-op differential gate (template_diff) ----
+// ---- Per-operation native-template differential checks ----
 //
 // For each templated op, admit it as a single INTERIOR inline slot and run the region vs
 // the interpreter across flag-corner operands, asserting byte-identical guest state,
 // materialized eflags, all four accumulators, and guest memory. This is the gate every
 // native template must pass (a divergence in a width/wrap/undefined-flag corner fails
-// here); S2.3's templates each add a row. The op's flags must survive to the comparison,
+// here). Each template adds a row. The op's flags must survive to the comparison,
 // so the loop back-edge is LOOP (0xE2), which decrements ECX and branches WITHOUT touching
 // the flags a `dec`/`jnz` counter would clobber.
 
@@ -881,7 +881,7 @@ fn assert_shape_identical(prog: Vec<u8>, arm: &dyn Fn(&mut CpuGsw), expect_regio
 /// Assert two CPUs are STATE-identical, ignoring the four timing accumulators
 /// (`elapsed_clocks`, `core_clocks_so_far`, `timing_rem`, `fp_rem`).
 ///
-/// Under the S2 contract a compiled JIT block leaves guest architectural state
+/// A compiled JIT block leaves guest architectural state
 /// (GPRs, materialized EFLAGS, segments + hidden descriptors, control/system
 /// regs, memory-mapped CPU state) BYTE-IDENTICAL to the interpreter, but its
 /// cycle accounting is only approximate. This is the state-exact half of that
@@ -1593,7 +1593,7 @@ fn assert_fold_state_identical(
     arm(&mut jit_cpu);
     drive_to_halt(&mut interp, &mut bus_i);
     drive_to_halt(&mut jit_cpu, &mut bus_j);
-    // The state-exact half of the S2 contract: architectural state byte-identical, timing not.
+    // Architectural state is byte-identical; timing is not.
     assert_state_identical(&interp, &jit_cpu);
     assert_eq!(
         interp.eflags(),

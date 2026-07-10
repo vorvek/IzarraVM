@@ -1,4 +1,4 @@
-; probes/probe-hdd.inc - STREAM C: ATA hard disk probe (the HDD icon). The boot
+; ATA hard disk probe (the HDD icon). The boot
 ; disk is the primary-channel master at command block 0x1F0-0x1F7. Its status
 ; register (0x1F7) is the presence handle: a mounted drive reads back DRDY
 ; (bit 6) at idle, while an empty channel reads the all-ones floating bus (the

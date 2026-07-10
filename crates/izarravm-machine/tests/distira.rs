@@ -1217,15 +1217,9 @@ fn distira_retrace_swap_survives_split_batches_and_live_mode_switches() {
 
 #[test]
 fn disttri_guest_program_finds_distira_via_pci_and_draws_a_triangle() {
-    // Slice 1 of dev_docs/2026-07-02-distira-driver-plan.md: a standalone
-    // buildable flat-ROM guest program (crates/izarravm-firmware/roms/
-    // disttri.asm), loaded exactly like a real BIOS image, that performs its
-    // own real PCI bus scan (not a machine-test shortcut with a hardcoded
-    // slot), programs BAR0, and rasterizes one flat green triangle through
-    // direct SST register writes before signaling success via the
-    // unit-tester exit port. This is the guest-visible compatibility
-    // evidence the plan calls for, as opposed to a Rust test poking the
-    // device directly.
+    // Load the standalone flat-ROM guest program like a real BIOS image. It
+    // scans the PCI bus, programs BAR0, and rasterizes a flat green triangle
+    // through direct SST register writes before signaling success.
     let mut machine =
         Machine::new(MachineProfile::gsw_386(16, VideoCard::Vega), DISTTRI_BIN).unwrap();
 

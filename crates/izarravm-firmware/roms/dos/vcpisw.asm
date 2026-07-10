@@ -1,4 +1,4 @@
-; vcpisw.com — TOKAEMM VCPI M3 mode-switch fixture: a MINIMAL REAL VCPI
+; vcpisw.com: TOKAEMM VCPI mode-switch fixture, a minimal real VCPI
 ; CLIENT. Runs in V86 under a bare DEVICE=C:\DOS\TOKAEMM.SYS and walks the
 ; whole client lifecycle the extenders use (the JEMM VCPI.ASM:359-402 flow):
 ;

@@ -1,4 +1,4 @@
-; vcpidet.com — TOKAEMM VCPI M0 presence fixture. Runs in V86 under a bare
+; vcpidet.com: TOKAEMM VCPI presence fixture. Runs in V86 under a bare
 ; DEVICE=C:\DOS\TOKAEMM.SYS (frameless default): the manager must answer the
 ; VCPI presence call even without an EMS pool (the EMM386-NOEMS precedent),
 ; refuse a not-yet-implemented subfunction with 8Fh, preserve untouched

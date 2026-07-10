@@ -1,8 +1,7 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Timing constants for audio, PIT, etc.
-//! Extracted as part of Phase 3.
+//! Shared machine and device timing.
 
 use super::*;
 
@@ -304,9 +303,8 @@ impl Machine {
             if wss_rate > 0 && (playing_at_valid_rate || autocal_active) {
                 let n = advance.wss_frames as usize;
                 if n > 0 {
-                    // HLE block buffer pre-fetch + feeding for WSS (Phase 4), with
-                    // support for spanning multiple blocks within large n (refill
-                    // when auto-reload happens inside tick).
+                    // Pre-fetch WSS data into the HLE block buffer. Large batches
+                    // can span multiple blocks, so refill after auto-reload.
                     let mut remaining = n;
                     while remaining > 0 {
                         if playing_at_valid_rate && self.wss.block_buffer().is_none() {
@@ -378,7 +376,7 @@ impl Machine {
             }
         }
 
-        // CD audio (Red Book 44.1 kHz) HLE time-driven advance (Phase 4).
+        // Advance Red Book CD audio at 44.1 kHz from guest elapsed time.
         // Drive the playback LBA from guest elapsed time so position is accurate
         // independent of when the mixer drains samples. Pull in render_audio
         // consumes from the advanced position (frac for sub-frame continuity).
@@ -737,15 +735,14 @@ impl Machine {
     }
 
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
-    /// slice wires GATE2 from port 0x61. Exposed now so the GATE-triggered modes
+    /// path wires GATE2 from port 0x61. Exposed so the GATE-triggered modes
     /// have a caller outside tests.
     pub fn set_timer_gate(&mut self, channel: usize, level: bool) {
         self.pit.set_gate(channel, level);
     }
 
     /// Input CLK pulses until channel 0 produces its next OUT rising edge, or None
-    /// if the counter cannot fire from its current state. Used by the HLT
-    /// fast-forward path added in Task 2b-2.
+    /// if the counter cannot fire from its current state. Used by HLT fast-forward.
     pub fn clocks_until_timer0_irq(&self) -> Option<u64> {
         self.pit.clocks_until_channel0_irq()
     }
@@ -1021,49 +1018,15 @@ impl MachineBus<'_> {
         )
     }
 
-    /// Peek the VGA beam's dot position "now" -- mid-batch, as of whatever this
-    /// batch's accumulated core clocks plus the bus clocks recorded into `trace`
-    /// since batch entry add up to -- WITHOUT mutating any device state (`video`,
-    /// `vga_dots`, `bus_rem` on the owning `Machine` are all untouched; `&self`
-    /// makes that compiler-enforced). This is the P4a Slice 1 lazy port-read peek
-    /// used by time-dependent port reads.
+    /// Predict the VGA beam position at the current point in a CPU batch without
+    /// mutating device state. The core-clock total includes completed runs and
+    /// prior instructions in the current run. Bus clocks use the batch-entry
+    /// timing ratio and fractional carry, matching the later batch-end advance.
     ///
-    /// Units combined, matching exactly what the real batch-end step in
-    /// `run_until_tick`/`advance_cpu_work` will later consume:
-    /// - the core portion, BATCH-scoped: `prior_runs_core_clocks` (the
-    ///   interrupt-service charge plus every completed straight-line run of this
-    ///   batch, republished by the batch loop before each run) plus
-    ///   `core_clocks_so_far` (the current run's prior instructions, excluding
-    ///   the in-flight instruction's own charge). One batch chains many runs and
-    ///   only the batch total feeds the batch-end step, so the run-scoped term
-    ///   alone would drop earlier runs' core clocks and jump backward at every
-    ///   run boundary; the monotonicity claim below rests on this batch-scoping,
-    ///   not on a port read ending the run.
-    /// - the bus portion: `trace.elapsed_clocks() - trace_elapsed_at_batch_start`
-    ///   raw bus clocks recorded so far this batch, scaled by the SAME (num, den)
-    ///   `bus_timing` ratio and the SAME fractional carry (`bus_rem_at_batch_start`)
-    ///   the real end-of-batch `scale_bus` call will start from -- no `scale_bus`
-    ///   call happens between batch entry and batch end, so the batch-entry carry
-    ///   IS the carry the real call uses. This mirrors `scale_bus`'s arithmetic
-    ///   shape exactly but reads `bus_rem_at_batch_start` instead of the live
-    ///   `bus_rem` and does not write the carry back anywhere (no mutation).
-    ///
-    /// The in-flight instruction's own fetch/data bus clocks may already be
-    /// partially recorded into `trace` by the time this runs; that is fine and
-    /// intentional -- the real batch-end total (computed once the whole
-    /// instruction has retired) is always a superset of what is recorded here, so
-    /// the clock total this predicts from is monotone within the batch and never
-    /// exceeds the batch's eventual final total. It never overshoots what the
-    /// real advance would show for the same clock total, because it uses the same
-    /// formula.
-    ///
-    /// Predicts POSITION ONLY: the dots-per-frame modulo wrap, never the
-    /// frame-boundary side effects (`finalize_frame`, the frame counter) that
-    /// `Vga::advance` performs -- those stay exclusively in the real
-    /// `advance_devices` at batch end. Shares the exact `predict_dots_core`
-    /// arithmetic `Machine::predict_dots` uses (same operation order, same
-    /// floor/subtract sequence), so a mid-batch peek can never structurally
-    /// diverge from what the later real advance will show for the same clocks.
+    /// Fetch and data clocks for the in-flight instruction may be only partly
+    /// recorded, so the prediction is monotonic and cannot exceed the final
+    /// batch total. Only beam position is predicted. Frame-boundary effects stay
+    /// in `advance_devices` at batch end.
     pub(super) fn predicted_beam(&self) -> u64 {
         let in_batch_clocks = self.in_batch_clocks();
         let (_, whole_dots) = self
@@ -1076,15 +1039,8 @@ impl MachineBus<'_> {
         (self.beam_at_batch_start + whole_dots) % frame
     }
 
-    /// The batch-scoped CPU clock total elapsed as of "now" (mid-batch), the
-    /// shared T both `predicted_beam` and `predicted_pit_clocks` build on: batch-
-    /// scoped core clocks (`prior_runs_core_clocks + core_clocks_so_far`) plus
-    /// in-batch bus clocks recorded into `trace` since batch entry, scaled by the
-    /// SAME (num, den) `bus_timing` ratio and fractional carry
-    /// (`bus_rem_at_batch_start`) the real end-of-batch `scale_bus` call will
-    /// start from. Extracted from `predicted_beam` (P4a Task 2.3) so the PIT lazy
-    /// read consumes byte-for-byte the same clock total the beam peek does,
-    /// rather than a second hand-rolled copy of this arithmetic.
+    /// Batch-scoped CPU clocks elapsed so far. Beam and PIT predictions share
+    /// this conversion so they use the same core total, bus scaling, and carry.
     fn in_batch_clocks(&self) -> u64 {
         let in_batch_bus_clocks = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
         let scaled = in_batch_bus_clocks * u64::from(self.bus_num_at_batch_start)
@@ -1093,14 +1049,8 @@ impl MachineBus<'_> {
         self.prior_runs_core_clocks + self.core_clocks_so_far + scaled_bus_clocks
     }
 
-    /// Elapsed PIT input CLKs "now" -- mid-batch, WITHOUT mutating `pit_clocks`
-    /// (P4a Task 2.3: the lazy port 0x61 bits 4/5 read). Shared by every channel
-    /// a caller peeks in the same read (0x61 needs both channel 1 and channel
-    /// 2), so a caller that needs more than one channel should compute this ONCE
-    /// and pass it to `Pit::out_after` per channel, not call `predicted_pit_out`
-    /// (below) once per channel -- the two calls would otherwise redo this exact
-    /// conversion redundantly (measured: that redundancy erased most of the
-    /// batch-chaining win in the P4a Task 2.3 A/B, see the microbench report).
+    /// Elapsed PIT input clocks at the current point in the batch without
+    /// mutating `pit_clocks`. Compute this once when reading several channels.
     ///
     /// Converts the shared in-batch clock total `T` (`in_batch_clocks`, the same
     /// T `predicted_beam` peeks with) into elapsed PIT input clocks by calling
@@ -1123,7 +1073,7 @@ impl MachineBus<'_> {
             .0
     }
 
-    /// Peek `channel`'s live PIT OUT level "now" -- mid-batch, WITHOUT stepping
+    /// Peek `channel`'s live PIT OUT level mid-batch without stepping
     /// `pit` or mutating `pit_clocks`. `None` when the channel's counter is BCD
     /// (see `Counter::out_after` via `Pit::out_after`); the caller falls back to
     /// a real read in that case. Convenience wrapper over `elapsed_pit_clocks`

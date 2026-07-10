@@ -1,4 +1,4 @@
-; umbmech.com — SP-4b M3 UMB *mechanism* e2e. Drives TOKAEMM's XMS 10h/11h/12h
+; Direct UMB mechanism fixture. Drives TOKAEMM's XMS 10h/11h/12h
 ; directly (no DOS=UMB, so the whole upper region is free for us), exercising the
 ; allocator paths the DOS=UMB e2e doesn't reach: the too-big probe (B0h+largest),
 ; alloc, grow (12h), release (11h), and reuse-after-free. Write/read a pattern to
@@ -85,7 +85,7 @@ start:
     or ax, ax
     jz f_rel
 
-    ; SP-4b M2 regression (the umb_free_run 16-bit wrap): fill the whole window,
+    ; Regression for the umb_free_run 16-bit wrap: fill the whole window,
     ; then probe with a large-but-not-over-window need. The scan cursor advances
     ; to the fill block's top (0xF000); without the carry guard, cursor+need
     ; wrapped past 0xFFFF, slipped the window-end check, and a bogus run at/above

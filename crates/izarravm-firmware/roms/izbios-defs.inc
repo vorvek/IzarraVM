@@ -59,7 +59,7 @@
 %define HRES_FAIL      1
 %define HRES_MEASURE   2
 
-; Setup hotkey: Del (AT scancode set 1 make code), per Phase 0 decision 5.
+; Setup hotkey: Del (AT scancode set 1 make code).
 %define SETUP_HOTKEY   0x53
 ; Boot-menu hotkey: Tab (Set 1 make code). Pressed during the POST hotkey window
 ; it opens the boot-device menu instead of the setup page.
@@ -156,10 +156,10 @@
 ; INT 10h/13h/15h/20h/21h vectors), so writing it would corrupt those services. ---
 %define BIOS_VALBUF      0x0500    ; foundation: ASCIIZ value/format buffer (32 B)
 %define BIOS_SCRATCH     0x0520    ; foundation: general scratch (32 B)
-%define RAMTEST_SCRATCH  0x0540    ; STREAM B: detected size + flags (160 B, ends 0x5DF)
+%define RAMTEST_SCRATCH  0x0540    ; detected size + flags (160 B, ends 0x5DF)
 ; 0x0600: emulator BIOS IRET stub. Reserved; never write here.
-%define SETUP_SCRATCH    0x0610    ; STREAM D: setup working copy (256 B, 0x610-0x70F)
-%define PROBE_SCRATCH    0x0710    ; STREAM C: per-probe value buffers (240 B, 0x710-0x7FF)
+%define SETUP_SCRATCH    0x0610    ; setup working copy (256 B, 0x610-0x70F)
+%define PROBE_SCRATCH    0x0710    ; per-probe value buffers (240 B, 0x710-0x7FF)
 ; 0x0800..STACK area free; stack top STACK_TOP; result block at RESULT_BLOCK.
 
 ; --- Device ports (read-only contract) ---

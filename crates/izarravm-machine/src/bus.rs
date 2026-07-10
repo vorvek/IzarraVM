@@ -609,9 +609,7 @@ impl CpuBus for MachineBus<'_> {
         core_clocks_so_far: u64,
         cpu_is_ring0_pm: bool,
     ) -> Result<u32, BusError> {
-        // A copy, mirroring `active_mode`: available to any lazy-read arm without
-        // re-threading the parameter, per dev_docs/2026-07-02-p4a-lazy-port-device-
-        // time-plan.md Task 0.2. Read by the lazy 3DA/3BA/3C2 arm below (Task 1.3).
+        // Publish the current run offset for lazy time-dependent reads.
         self.core_clocks_so_far = core_clocks_so_far;
         // Ring-0-monitor port-time exemption (V86 trap tax, Part 1): the TOKAEMM
         // monitor's own device pokes (the vec13 discriminator's PIC OCW3 probe,
@@ -625,7 +623,7 @@ impl CpuBus for MachineBus<'_> {
         // exactly when it is consumed relative to batch-end timing is safe. Gated
         // on `lazy_port_reads` (Approximate class only, i.e. 486/586): the
         // Accurate 386 class keeps byte-identical batch semantics, matching
-        // every other P4a lazy gate in this function.
+        // every other lazy-read gate in this function.
         let skip_io_touched = cpu_is_ring0_pm && self.lazy_port_reads;
         // Bus-clock trace recording stays unconditional for every port, both timing
         // classes: `predicted_beam`'s bus term scales exactly the clocks recorded
@@ -714,7 +712,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         // The VGA status ports (3DA/3BA/3C2) are the ONLY arm in this function that
-        // does not unconditionally set io_touched -- the P4a lazy-read case: in the
+        // does not unconditionally set io_touched. In the lazy-read case for the
         // Approximate timing class they must NOT end the batch (io_touched stays
         // false) so a poll loop chains as `run_straight_line` continuations. Static
         // per-port dispatch: these three port numbers always land here, whether or
@@ -761,7 +759,7 @@ impl CpuBus for MachineBus<'_> {
                 return Ok(u32::from(value));
             }
         }
-        // Port 0x61 bits 4/5 (P4a Task 2.3): the second lazy read arm, same static
+        // Port 0x61 bits 4/5 use the same lazy
         // per-port dispatch discipline as 3DA/3BA/3C2 above -- 0x61 always lands
         // here whether or not lazy_port_reads is set. Bits 0/1 (speaker gate/data)
         // are plain register state that cannot change mid-batch: the only writer
@@ -777,9 +775,7 @@ impl CpuBus for MachineBus<'_> {
                 // Both channels share the SAME elapsed-PIT-clocks conversion
                 // (same rate, same batch-entry carry): computed once here rather
                 // than twice inside two separate predicted_pit_out calls, since
-                // that redundant second predict_dots_core call was pure waste on
-                // this hot path (measured: it erased most of the batch-chaining
-                // win in the P4a Task 2.3 A/B, see the microbench report).
+                // a redundant conversion on this hot path.
                 let elapsed_pit_clocks = self.elapsed_pit_clocks();
                 let ch1 = self.pit.out_after(1, elapsed_pit_clocks);
                 let ch2 = self.pit.out_after(2, elapsed_pit_clocks);
@@ -831,12 +827,8 @@ impl CpuBus for MachineBus<'_> {
         // DSP status reads are intentionally exact. SB reset/probe code polls
         // 0x22E for the reset ACK byte, so keeping that loop inside one
         // approximate CPU batch can starve the DSP settle timer.
-        // Every arm from here down is unchanged from before Task 1.3: a single
-        // unconditional set covers all of them, exactly like the old top-of-function
-        // set did, since none of them is a lazy arm (3DA/3BA/3C2, 0x61, OPL status)
-        // handled above. This is also where the ring-0-monitor PIC OCW3 probe (port
-        // 0x20/0xA0) lands (V86 trap tax, Part 1), so it takes the same
-        // skip_io_touched gate as everything else in this function.
+        // All remaining reads are exact and end the batch. The ring-0 monitor's
+        // PIC OCW3 probe still honors the same skip_io_touched gate.
         if !skip_io_touched {
             *self.io_touched = true;
         }
@@ -1129,8 +1121,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if port == 0x00e3 {
-            // Toka-DOS service command: 1 = Repair (the only one left after the HLE
-            // was retired in SP-3; Format and LoadBootRecord are gone).
+            // Toka-DOS service command: 1 = Repair. Format and LoadBootRecord were
+            // removed with the retired HLE DOS kernel.
             // The run loop performs it after this cycle (it needs &mut self).
             *self.pending_toka_service = Some(value as u8);
             return Ok(());
@@ -1254,7 +1246,7 @@ impl MachineBus<'_> {
     /// owns it, same for the absent-resident-API vectors. In booter-inert mode
     /// 2Fh also stands down so a self-booting disk owns it through the IVT.
     /// The pure DOS vectors 0x20-0x2E are not intercepted at all outside the
-    /// raw-program runtime (the Rust DOS kernel was retired in SP-3), and INT
+    /// raw-program runtime now that the Rust DOS kernel is retired, and INT
     /// 67h is never intercepted (the TOKAEMM guest driver owns the EMS API).
     fn soft_int_intercepted(&mut self, vector: u8) -> Result<bool, BusError> {
         let dos_multiplex = vector == 0x2F && self.vector_points_at_rom_iret(vector)?;
@@ -1552,7 +1544,7 @@ impl MachineBus<'_> {
         }
         if self.flat_data_cost {
             // Approximate class (486/586): charge the flat L1-resident cost and skip
-            // the per-access tag-array tiering (the Slice-0 measured floor). The
+            // the per-access tag-array tiering. The
             // benchmarks are L1-resident so cyc/iter stays near the accurate model;
             // the win is skipping ~3M tag lookups per run. Guest-invisible: only time.
             return self.cache.cost.l1;

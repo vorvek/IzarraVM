@@ -81,8 +81,8 @@ enum EgState {
 
 /// A single FM operator: a 20-bit phase accumulator, its waveform and level,
 /// and an ADSR envelope generator. The envelope datapath (rates, curve, timing)
-/// was derived from the YMF262's documented behaviour and cross-checked against
-/// a reference; see dev_docs/opl3-plan.md.
+/// was derived from the YMF262's documented behavior and cross-checked against
+/// a reference implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Operator {
     phase: u32,
@@ -573,7 +573,7 @@ impl Timer {
         }
     }
 
-    /// Pure peek (P4a Slice 3 Task 3.1): would `self.expired` be true after
+    /// Return whether `self.expired` would be true after
     /// `micros_elapsed` more microseconds of chip time, without mutating
     /// `self`? `expired` is sticky (only a register-0x04 bit7 write clears it,
     /// via `OplChip::write_bank`), so the answer is `self.expired` already, OR
@@ -1006,7 +1006,7 @@ impl OplChip {
     /// 0x04 (bit6 = timer 1, bit5 = timer 2) only gate the IRQ line.
     ///
     /// Composed of `status_bits` (the pure bit computation) off the live
-    /// timers' `expired` flags. The P4a lazy port-read path (`MachineBus::
+    /// timers' `expired` flags. The lazy port-read path (`MachineBus::
     /// read_io`, Approximate timing class) calls the same pure function with
     /// timer `expired_after` peeks instead of the live flags, so both callers
     /// share exactly one bit-composition implementation (the `Vga::
@@ -1015,10 +1015,10 @@ impl OplChip {
         self.status_bits(self.timer1.expired, self.timer2.expired)
     }
 
-    /// Lazy-path status byte (P4a Task 3.2, Approximate timing class only):
+    /// Lazy-path status byte for the Approximate timing class:
     /// the OPL status byte `micros_elapsed` microseconds of chip time from now,
     /// without stepping either timer. Peeks each timer's `expired_after`
-    /// (Task 3.1) instead of reading the live `expired` flag, then composes the
+    /// instead of reading the live `expired` flag, then composes the
     /// result through the same `status_bits` the live `status()` call uses, so
     /// the two paths can never structurally diverge in bit logic -- only in
     /// which `expired` inputs they feed it.
@@ -1028,7 +1028,7 @@ impl OplChip {
         self.status_bits(t1_expired, t2_expired)
     }
 
-    /// Peek at timer 1's `expired_after` (P4a Slice 3 Task 3.3). Exposed for
+    /// Peek at timer 1's `expired_after`. Exposed for
     /// the machine crate's carry-pinning differential test, which needs to
     /// locate an overflow step boundary without reimplementing `Timer`'s step
     /// arithmetic; NOT `#[cfg(test)]` because that test lives in a downstream

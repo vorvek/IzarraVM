@@ -820,7 +820,7 @@ impl Margo {
             1 => {
                 // YV12 planar 4:2:0: a full-resolution Y plane, then V and U planes
                 // at half width and half height. The register set carries no chroma
-                // pitch, so it is the Y pitch halved (slice-11 convention). Chroma is
+                // pitch, so it is the Y pitch halved. Chroma is
                 // upsampled by point sampling: (sx/2, sy/2) addresses both planes.
                 let y = self.vram_byte(
                     src_y

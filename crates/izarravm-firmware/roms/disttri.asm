@@ -1,15 +1,13 @@
 ; This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 ; SPDX-License-Identifier: GPL-3.0-only
 
-; disttri.asm — Distira slice 1 guest proof: hand-written x86 that finds the
+; Distira guest proof: hand-written x86 that finds the
 ; Distira 3D card via PCI configuration space, maps its BAR0 aperture,
 ; initializes the minimal SST-1 register state, and draws one flat-shaded
 ; triangle to the framebuffer, then signals completion and spins.
 ;
-; This is deliberately Glide-free: it pokes the same SST registers real DOS
-; Glide 2.x uses (direct triangleCMD register writes — see
-; dev_docs/2026-07-02-distira-driver-plan.md section 1: the DOS/Voodoo1 Glide
-; driver never uses the command FIFO, only direct register pokes), following
+; This is deliberately Glide-free. It pokes the same direct triangleCMD
+; registers used by DOS Glide 2.x, which does not require the command FIFO. It follows
 ; the exact wire sequence already proven in
 ; crates/izarravm-machine/tests/distira.rs's distira_guest_* tests (which
 ; drive the device end-to-end from hand-assembled protected-mode x86 through
