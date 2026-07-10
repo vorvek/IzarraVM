@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
-use crate::{
-    DISTIRA_PCI_BAR_SIZE, DISTIRA_PCI_CMDFIFO_OFFSET, DISTIRA_PCI_LFB_OFFSET,
-    DISTIRA_PCI_TEX_OFFSET,
-};
+use crate::{DISTIRA_PCI_BAR_SIZE, DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_TEX_OFFSET};
 
 struct PciRig {
     config: PciConfig,
@@ -102,24 +99,18 @@ fn distira_bar0_probe_reports_a_16_mib_aligned_aperture() {
     assert_eq!(rig.vega.memory_decode_key(), Some(power_on_base));
 
     assert_eq!(
-        rig.vega
-            .distira_mmio_offset(power_on_base + DISTIRA_PCI_CMDFIFO_OFFSET - 1, 1),
-        Some((DISTIRA_PCI_CMDFIFO_OFFSET - 1) as usize)
+        rig.vega.distira_mmio_offset(power_on_base + 0x0020_0000, 4),
+        Some(0x0020_0000)
     );
     assert_eq!(
         rig.vega
-            .distira_mmio_offset(power_on_base + DISTIRA_PCI_CMDFIFO_OFFSET - 1, 2),
+            .distira_mmio_offset(power_on_base + DISTIRA_PCI_LFB_OFFSET - 1, 1),
+        Some((DISTIRA_PCI_LFB_OFFSET - 1) as usize)
+    );
+    assert_eq!(
+        rig.vega
+            .distira_mmio_offset(power_on_base + DISTIRA_PCI_LFB_OFFSET - 1, 2),
         None
-    );
-    assert_eq!(
-        rig.vega
-            .distira_cmdfifo_offset(power_on_base + DISTIRA_PCI_CMDFIFO_OFFSET, 4),
-        Some(0)
-    );
-    assert_eq!(
-        rig.vega
-            .distira_cmdfifo_offset(power_on_base + DISTIRA_PCI_LFB_OFFSET - 1, 1),
-        Some((DISTIRA_PCI_LFB_OFFSET - DISTIRA_PCI_CMDFIFO_OFFSET - 1) as usize)
     );
     assert_eq!(
         rig.vega

@@ -226,12 +226,15 @@ pub const FBZ_ALPHA_MASK: u32 = 1 << 13;
 pub const FBZ_DRAW_FRONT: u32 = 0x0000;
 pub const FBZ_DRAW_BACK: u32 = 0x4000;
 pub const FBZ_DRAW_MASK: u32 = 0xc000;
+pub const FBZ_DEPTH_BIAS: u32 = 1 << 16;
+pub const FBZ_Y_ORIGIN: u32 = 1 << 17;
 pub const FBZ_ALPHA_ENABLE: u32 = 1 << 18;
 pub const FBZ_DITHER_SUB: u32 = 1 << 19;
 pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 pub const FBZCP_RGB_SELECT_MASK: u32 = 0x3;
+pub const RGB_SELECT_TEXTURE: u32 = 1;
 pub const RGB_SELECT_COLOR1: u32 = 2;
 pub const RGB_SELECT_LFB: u32 = 3;
 pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
@@ -275,13 +278,38 @@ pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
 pub const TC_MSELECT_MASK: u32 = 0x7;
+pub const TC_MSELECT_CLOCAL: u32 = 1;
+pub const TC_MSELECT_AOTHER: u32 = 2;
+pub const TC_MSELECT_ALOCAL: u32 = 3;
 pub const TC_MSELECT_DETAIL: u32 = 4;
+pub const TC_MSELECT_LOD_FRAC: u32 = 5;
+pub const TC_REVERSE_BLEND: u32 = 1 << 17;
 pub const TC_ADD_CLOCAL: u32 = 1 << 18;
+pub const TC_ADD_ALOCAL: u32 = 1 << 19;
+pub const TC_INVERT_OUTPUT: u32 = 1 << 20;
+pub const TCA_ZERO_OTHER: u32 = 1 << 21;
+pub const TCA_SUB_CLOCAL: u32 = 1 << 22;
+pub const TCA_MSELECT_SHIFT: u32 = 23;
+pub const TCA_MSELECT_MASK: u32 = 0x7;
+pub const TCA_MSELECT_CLOCAL: u32 = 1;
+pub const TCA_MSELECT_AOTHER: u32 = 2;
+pub const TCA_MSELECT_ALOCAL: u32 = 3;
+pub const TCA_MSELECT_DETAIL: u32 = 4;
+pub const TCA_MSELECT_LOD_FRAC: u32 = 5;
+pub const TCA_REVERSE_BLEND: u32 = 1 << 26;
+pub const TCA_ADD_CLOCAL: u32 = 1 << 27;
+pub const TCA_ADD_ALOCAL: u32 = 1 << 28;
+pub const TCA_INVERT_OUTPUT: u32 = 1 << 29;
+pub const TEXTUREMODE_COMBINE_MASK: u32 = 0x3ffff << 12;
+pub const TEXTUREMODE_PASSTHROUGH: u32 = 0;
+pub const TEXTUREMODE_LOCAL_MASK: u32 = 0x0064_3000;
+pub const TEXTUREMODE_LOCAL: u32 = 0x0024_1000;
 pub const TEXTUREMODE_TPERSP_ST: u32 = 1;
 pub const TEXTUREMODE_TCLAMPW: u32 = 1 << 3;
 pub const TEXTUREMODE_TNCCSELECT: u32 = 1 << 5;
 pub const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
 pub const TEXTUREMODE_TCLAMPT: u32 = 1 << 7;
+pub const TEXTUREMODE_TRILINEAR: u32 = 1 << 30;
 pub const TEXTUREMODE_SEQ_8_DOWNLD: u32 = 1 << 31;
 pub const LOD_ODD: u32 = 1 << 18;
 pub const LOD_SPLIT: u32 = 1 << 19;
@@ -360,6 +388,52 @@ pub const FBIINIT2_TRIPLE_BUFFER: u32 = 1 << 4;
 pub const FBIINIT3_REMAP: u32 = 1;
 pub const FBIINIT5_MULTI_CVG: u32 = 1 << 14;
 pub const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
+
+pub(super) fn canonical_write_register(offset: usize, fbi_init3: u32) -> usize {
+    let full_register = offset & !3;
+    if (DISTIRA_REG_ID..=DISTIRA_REG_COMMAND).contains(&full_register) {
+        return full_register;
+    }
+
+    let register = offset & 0x3fc;
+    if offset & (1 << 21) == 0 || fbi_init3 & FBIINIT3_REMAP == 0 || register >= 0x100 {
+        return register;
+    }
+
+    const FIXED_PARAMETERS: [[usize; 3]; 8] = [
+        [SST_START_R, SST_DR_DX, SST_DR_DY],
+        [SST_START_G, SST_DG_DX, SST_DG_DY],
+        [SST_START_B, SST_DB_DX, SST_DB_DY],
+        [SST_START_Z, SST_DZ_DX, SST_DZ_DY],
+        [SST_START_A, SST_DA_DX, SST_DA_DY],
+        [SST_START_S, SST_DS_DX, SST_DS_DY],
+        [SST_START_T, SST_DT_DX, SST_DT_DY],
+        [SST_START_W, SST_DW_DX, SST_DW_DY],
+    ];
+    const FLOAT_PARAMETERS: [[usize; 3]; 8] = [
+        [SST_FSTART_R, SST_FDR_DX, SST_FDR_DY],
+        [SST_FSTART_G, SST_FDG_DX, SST_FDG_DY],
+        [SST_FSTART_B, SST_FDB_DX, SST_FDB_DY],
+        [SST_FSTART_Z, SST_FDZ_DX, SST_FDZ_DY],
+        [SST_FSTART_A, SST_FDA_DX, SST_FDA_DY],
+        [SST_FSTART_S, SST_FDS_DX, SST_FDS_DY],
+        [SST_FSTART_T, SST_FDT_DX, SST_FDT_DY],
+        [SST_FSTART_W, SST_FDW_DX, SST_FDW_DY],
+    ];
+
+    match register {
+        0x020..=0x07c => {
+            let index = (register - 0x020) / 4;
+            FIXED_PARAMETERS[index / 3][index % 3]
+        }
+        0x080 => SST_TRIANGLE_CMD,
+        0x0a0..=0x0fc => {
+            let index = (register - 0x0a0) / 4;
+            FLOAT_PARAMETERS[index / 3][index % 3]
+        }
+        _ => register,
+    }
+}
 
 /// `initEnable` bit 0 allows writes to the SST-1 framebuffer init registers.
 pub const INIT_ENABLE_WRITE: u32 = 1;

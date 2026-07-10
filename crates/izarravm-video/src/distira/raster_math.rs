@@ -3,6 +3,65 @@
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SstTriangleCoverage {
+    vertices: [(i64, i64); 3],
+    edge_slopes: [i64; 3],
+    x_direction: i64,
+}
+
+impl SstTriangleCoverage {
+    pub(super) fn new(vertices: [(u32, u32); 3], negative_direction: bool) -> Self {
+        let vertices =
+            vertices.map(|(x, y)| (i64::from(x as u16 as i16), i64::from(y as u16 as i16)));
+        let edge_slope = |(x0, y0): (i64, i64), (x1, y1): (i64, i64)| {
+            if y1 == y0 {
+                0
+            } else {
+                (((x1 << 12) - (x0 << 12)) << 4) / (y1 - y0)
+            }
+        };
+        Self {
+            vertices,
+            edge_slopes: [
+                edge_slope(vertices[0], vertices[1]),
+                edge_slope(vertices[0], vertices[2]),
+                edge_slope(vertices[1], vertices[2]),
+            ],
+            x_direction: if negative_direction { -1 } else { 1 },
+        }
+    }
+
+    pub(super) fn scanline_span(self, pixel_y: u32) -> Option<(i64, i64)> {
+        let [(ax, ay), (bx, by), (_, cy)] = self.vertices;
+        let y = i64::from(pixel_y);
+        if y < (ay + 8) >> 4 || y >= (cy + 7) >> 4 {
+            return None;
+        }
+
+        let [ab, ac, bc] = self.edge_slopes;
+        let real_y = (y << 4) + 8;
+        let mut long_x = (ax << 12) + ((ac * (real_y - ay)) >> 4);
+        let mut other_x = if real_y < by {
+            (ax << 12) + ((ab * (real_y - ay)) >> 4)
+        } else {
+            (bx << 12) + ((bc * (real_y - by)) >> 4)
+        };
+        if self.x_direction > 0 {
+            other_x -= 1 << 16;
+        } else {
+            long_x -= 1 << 16;
+        }
+        let long_x = (long_x + 0x7000) >> 16;
+        let other_x = (other_x + 0x7000) >> 16;
+        if self.x_direction > 0 {
+            Some((long_x, other_x))
+        } else {
+            Some((other_x, long_x))
+        }
+    }
+}
+
 pub(super) fn merge_byte(slot: &mut u32, byte: usize, value: u8) {
     let shift = byte * 8;
     *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
@@ -155,21 +214,6 @@ pub(super) fn clamp_ncc(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
-pub(super) fn detail_blend_channel(channel: u8, factor: u8) -> u8 {
-    let inverse_factor = u32::from((factor ^ 0xff).wrapping_add(1));
-    let subtract = (u32::from(channel) * inverse_factor) >> 8;
-    channel.saturating_sub(subtract.min(u32::from(channel)) as u8)
-}
-
-pub(super) fn color_path_blend_channel(channel: u8, factor: u8, reverse: bool) -> u8 {
-    let factor = if reverse {
-        u32::from(factor) + 1
-    } else {
-        u32::from((factor ^ 0xff).wrapping_add(1))
-    };
-    ((u32::from(channel) * factor) >> 8).min(255) as u8
-}
-
 pub(super) fn color_path_blend_component(channel: i32, factor: u8, reverse: bool) -> i32 {
     let factor = if reverse {
         i32::from(factor) + 1
@@ -304,9 +348,16 @@ fn alpha_blend_dest_channel(func: u32, dest: u8, source: u8, source_alpha: u8) -
 }
 
 fn quantize_channel(v: u8, bits: u32, cell: u32, dither: bool) -> u16 {
-    let shift = 8 - bits;
-    let offset = if dither { (cell << shift) / 16 } else { 0 };
-    u16::try_from((u32::from(v) + offset).min(255) >> shift).unwrap()
+    let v = u32::from(v);
+    if !dither {
+        return u16::try_from(v >> (8 - bits)).unwrap();
+    }
+    let quantized = match bits {
+        5 => ((v << 1) - (v >> 4) + (v >> 7) + cell) >> 4,
+        6 => ((v << 2) - (v >> 4) + (v >> 6) + cell) >> 4,
+        _ => unreachable!("RGB565 channels have five or six bits"),
+    };
+    u16::try_from(quantized).unwrap()
 }
 
 pub(super) fn pack_rgb565_for_pixel(r: u8, g: u8, b: u8, x: u32, y: u32, dither: bool) -> u16 {

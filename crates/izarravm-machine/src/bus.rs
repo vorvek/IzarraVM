@@ -461,10 +461,6 @@ impl CpuBus for MachineBus<'_> {
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
 
-        if self.vega.write_command_memory(address, width, value) {
-            return Ok(());
-        }
-
         match width {
             BusWidth::Byte => self.write_memory_byte(address, value as u8),
             BusWidth::Word => {

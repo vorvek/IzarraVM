@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+use izarravm_video::{
+    FBIINIT3_REMAP, FBZ_DRAW_BACK, FBZ_RGB_WMASK, SST_FBI_INIT3, SST_FBZ_MODE, SST_SWAPBUFFER_CMD,
+};
 
 #[test]
 fn dma_software_request_drives_a_mem_to_mem_block_copy() {
@@ -1032,11 +1035,11 @@ fn ram_lookup_rebuilds_on_each_effective_distira_decode_change() {
     )
     .unwrap();
     const RAM_ADDR: u32 = 0x0100_0000;
-    const FIFO_RAM_ADDR: u32 = RAM_ADDR + DISTIRA_PCI_CMDFIFO_OFFSET;
+    const ALT_REG_RAM_ADDR: u32 = RAM_ADDR + 0x0020_0000;
     machine.memory.write_u8(RAM_ADDR as usize, 0x5a).unwrap();
     machine
         .memory
-        .write_u8(FIFO_RAM_ADDR as usize, 0x6b)
+        .write_u8(ALT_REG_RAM_ADDR as usize, 0x6b)
         .unwrap();
 
     with_bus(&mut machine, |bus| {
@@ -1096,7 +1099,7 @@ fn ram_lookup_rebuilds_on_each_effective_distira_decode_change() {
             "relocating the enabled BAR over RAM removes the direct page again"
         );
     });
-    machine.write_physical_u8(FIFO_RAM_ADDR, 0xb6);
+    machine.write_physical_u8(ALT_REG_RAM_ADDR, 0xb6);
 
     assert_eq!(
         machine.memory.read_u8(RAM_ADDR as usize).unwrap(),
@@ -1104,10 +1107,68 @@ fn ram_lookup_rebuilds_on_each_effective_distira_decode_change() {
         "Distira BAR relocation must invalidate direct-RAM lookup entries"
     );
     assert_eq!(
-        machine.memory.read_u8(FIFO_RAM_ADDR as usize).unwrap(),
+        machine.memory.read_u8(ALT_REG_RAM_ADDR as usize).unwrap(),
         0x6b,
-        "the command FIFO aperture must not leak writes into backing RAM"
+        "the alternate register aperture must not leak writes into backing RAM"
     );
+}
+
+#[test]
+fn distira_alt_register_aperture_reaches_glide_setup() {
+    const RAM_BAR: u32 = 0x0100_0000;
+    const ALT: u32 = 1 << 21;
+    const SST_VERTEX_AX: u32 = 0x008;
+    const SST_VERTEX_AY: u32 = 0x00c;
+    const SST_VERTEX_BX: u32 = 0x010;
+    const SST_VERTEX_BY: u32 = 0x014;
+    const SST_VERTEX_CX: u32 = 0x018;
+    const SST_VERTEX_CY: u32 = 0x01c;
+    const ALT_START_R: u32 = 0x020;
+    const ALT_START_G: u32 = 0x02c;
+    const ALT_START_B: u32 = 0x038;
+    const ALT_TRIANGLE_CMD: u32 = 0x080;
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(24, VideoCard::Vega),
+        vec![0u8; BIOS_ROM_SIZE],
+    )
+    .unwrap();
+    let backing_address = (RAM_BAR + ALT + ALT_START_R) as usize;
+    machine.memory.write_u8(backing_address, 0x5a).unwrap();
+
+    with_bus(&mut machine, |bus| {
+        for (register, value) in [(0x10, RAM_BAR), (0x40, 1)] {
+            let address = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | register;
+            bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, address, false)
+                .unwrap();
+            bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, value, false)
+                .unwrap();
+        }
+    });
+
+    machine.write_physical_u32(RAM_BAR + SST_FBI_INIT3 as u32, FBIINIT3_REMAP);
+    machine.write_physical_u32(RAM_BAR + SST_FBZ_MODE as u32, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    for (register, value) in [
+        (SST_VERTEX_AX, 0),
+        (SST_VERTEX_AY, 0),
+        (SST_VERTEX_BX, 3 << 4),
+        (SST_VERTEX_BY, 0),
+        (SST_VERTEX_CX, 0),
+        (SST_VERTEX_CY, 3 << 4),
+        (ALT_START_R, 0xff << 12),
+        (ALT_START_G, 0),
+        (ALT_START_B, 0),
+    ] {
+        machine.write_physical_u32(RAM_BAR + ALT + register, value);
+    }
+    machine.write_physical_u32(RAM_BAR + ALT + ALT_TRIANGLE_CMD, 0);
+    machine.write_physical_u32(RAM_BAR + SST_SWAPBUFFER_CMD as u32, 0);
+
+    assert_eq!(machine.active_display(), ActiveDisplay::Distira);
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (640, 480));
+    assert_eq!(frame[0], 0x00ff_0000);
+    assert_eq!(machine.memory.read_u8(backing_address).unwrap(), 0x5a);
 }
 
 #[test]

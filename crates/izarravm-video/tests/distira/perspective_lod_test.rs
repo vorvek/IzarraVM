@@ -20,9 +20,19 @@ const SST_TLOD: usize = 0x304;
 const SST_TEX_BASE_ADDR38: usize = 0x318;
 const TREX0: usize = 2 << 10;
 const TREX1: usize = 4 << 10;
-const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+const FBZCP_TEXTURE_ENABLED: u32 = (1 << 27) | RGB_SELECT_TEXTURE;
 const TEXTUREMODE_TPERSP_ST: u32 = 1;
 const TMU0_ADD_TMU1: u32 = 1 << 18;
+const TMU_REPLACE: u32 = (1 << 12) | (1 << 18);
+const TC_SUB_CLOCAL: u32 = 1 << 13;
+const TC_MSELECT_LOD_FRAC: u32 = 5 << 14;
+const TC_REVERSE_BLEND: u32 = 1 << 17;
+const TC_ADD_CLOCAL: u32 = 1 << 18;
+const TCA_SUB_CLOCAL: u32 = 1 << 22;
+const TCA_MSELECT_LOD_FRAC: u32 = 5 << 23;
+const TCA_REVERSE_BLEND: u32 = 1 << 26;
+const TCA_ADD_CLOCAL: u32 = 1 << 27;
+const TEXTUREMODE_TRILINEAR: u32 = 1 << 30;
 const TEX_R5G6B5: u32 = 0x0a;
 const LOD_ODD: u32 = 1 << 18;
 const LOD_SPLIT: u32 = 1 << 19;
@@ -39,10 +49,10 @@ fn textured_triangle() -> Distira {
     write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
     write_reg(&mut distira, SST_VERTEX_AX, 0);
     write_reg(&mut distira, SST_VERTEX_AY, 0);
-    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 4 << 4);
     write_reg(&mut distira, SST_VERTEX_BY, 0);
     write_reg(&mut distira, SST_VERTEX_CX, 0);
-    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 4 << 4);
     write_reg(&mut distira, SST_START_R, 0xff << 12);
     write_reg(&mut distira, SST_START_G, 0xff << 12);
     write_reg(&mut distira, SST_START_B, 0xff << 12);
@@ -69,7 +79,8 @@ fn draw_first_pixel(distira: &mut Distira) -> u32 {
 
 fn render_affine_contract(perspective: bool) -> u32 {
     let mut distira = textured_triangle();
-    let mode = (TEX_R5G6B5 << 8) | (u32::from(perspective) * TEXTUREMODE_TPERSP_ST);
+    let mode =
+        (TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL) | (u32::from(perspective) * TEXTUREMODE_TPERSP_ST);
     write_reg(&mut distira, TREX0 | SST_TEXTURE_MODE, mode);
     assert!(distira.queue_texture_write_u32(0, 0x07e0_f800));
     distira.drain_fifo();
@@ -89,7 +100,7 @@ fn float_iterators_keep_values_beyond_the_fixed_w_range() {
     write_reg(
         &mut distira,
         TREX0 | SST_TEXTURE_MODE,
-        (TEX_R5G6B5 << 8) | TEXTUREMODE_TPERSP_ST,
+        (TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL) | TEXTUREMODE_TPERSP_ST,
     );
     assert!(distira.queue_texture_write_u32(0, 0x07e0_f800));
     assert!(distira.queue_texture_write_u32(4, 0x001f_001f));
@@ -106,7 +117,7 @@ fn render_mip_for_reciprocal_w(reciprocal_w: u32) -> u32 {
     write_reg(
         &mut distira,
         TREX0 | SST_TEXTURE_MODE,
-        (TEX_R5G6B5 << 8) | TEXTUREMODE_TPERSP_ST,
+        (TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL) | TEXTUREMODE_TPERSP_ST,
     );
     write_reg(&mut distira, TREX0 | SST_TLOD, LOD8_MAX);
     assert!(distira.queue_texture_write_u32(0, 0xf800_f800));
@@ -124,7 +135,11 @@ fn reciprocal_w_selects_near_and_far_mip_levels_from_the_gradient() {
 
 fn render_mip_with_bias(bias: u32) -> u32 {
     let mut distira = textured_triangle();
-    write_reg(&mut distira, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TEXTURE_MODE,
+        TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(&mut distira, TREX0 | SST_TLOD, LOD8_MAX | bias);
     assert!(distira.queue_texture_write_u32(0, 0xf800_f800));
     assert!(distira.queue_texture_write_u32(1 << 17, 0x07e0_07e0));
@@ -145,7 +160,11 @@ fn split_odd_multibase_packs_later_mips_after_owned_levels_only() {
     const LOD5_MAX: u32 = (5 * 4) << 6;
 
     let mut distira = textured_triangle();
-    write_reg(&mut distira, TREX0 | SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TEXTURE_MODE,
+        TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL,
+    );
     write_reg(
         &mut distira,
         TREX0 | SST_TLOD,
@@ -171,7 +190,7 @@ fn two_tmus_use_independent_perspective_and_lod_iterators() {
     write_reg(
         &mut distira,
         TREX1 | SST_TEXTURE_MODE,
-        (TEX_R5G6B5 << 8) | TEXTUREMODE_TPERSP_ST,
+        (TEX_R5G6B5 << 8 | TEXTUREMODE_LOCAL) | TEXTUREMODE_TPERSP_ST | TMU_REPLACE,
     );
     write_reg(&mut distira, TREX0 | SST_TLOD, LOD8_MAX);
     write_reg(&mut distira, TREX1 | SST_TLOD, LOD8_MAX);
@@ -183,4 +202,97 @@ fn two_tmus_use_independent_perspective_and_lod_iterators() {
     set_iterator(&mut distira, TREX1, 0, ST_ONE, W_ONE / 2);
 
     assert_eq!(draw_first_pixel(&mut distira), 0x00ff_ff00);
+}
+
+fn render_split_trilinear_color(bias_quarters: u32) -> u32 {
+    const FORMAT: u32 = TEX_R5G6B5 << 8;
+
+    let mut distira = textured_triangle();
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TEXTURE_MODE,
+        FORMAT
+            | TC_SUB_CLOCAL
+            | TC_MSELECT_LOD_FRAC
+            | TC_REVERSE_BLEND
+            | TC_ADD_CLOCAL
+            | TEXTUREMODE_TRILINEAR,
+    );
+    write_reg(&mut distira, TREX1 | SST_TEXTURE_MODE, FORMAT);
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TLOD,
+        LOD8_MAX | LOD_SPLIT | (bias_quarters << 12),
+    );
+    write_reg(
+        &mut distira,
+        TREX1 | SST_TLOD,
+        LOD8_MAX | LOD_SPLIT | LOD_ODD | (bias_quarters << 12),
+    );
+    assert!(distira.queue_texture_write_u32(0, 0xf800_f800));
+    assert!(distira.queue_texture_write_u32(2 << 17, 0x07e0_07e0));
+    assert!(distira.queue_texture_write_u32((1 << 21) | (1 << 17), 0x001f_001f));
+    distira.drain_fifo();
+    set_iterator(&mut distira, TREX0, 0, ST_ONE, W_ONE);
+    set_iterator(&mut distira, TREX1, 0, ST_ONE, W_ONE);
+    draw_first_pixel(&mut distira)
+}
+
+#[test]
+fn split_trilinear_blends_adjacent_mips_and_flips_on_odd_lod() {
+    assert_eq!(render_split_trilinear_color(1), 0x00bd_0042);
+    assert_eq!(render_split_trilinear_color(5), 0x0000_3cbd);
+}
+
+#[test]
+fn split_trilinear_lod_fraction_drives_texture_alpha() {
+    const TEX_ARGB8332: u32 = 0x08;
+    const FORMAT: u32 = TEX_ARGB8332 << 8;
+    const TC_ZERO_OTHER: u32 = 1 << 12;
+    const ALPHA_BLEND_ENABLE: u32 = 1 << 4;
+    const ALPHA_SRC_FUNC_SHIFT: u32 = 8;
+    const BLEND_ASRC_ALPHA: u32 = 1;
+    const A_SELECT_TEX: u32 = 1 << 2;
+
+    let mut distira = textured_triangle();
+    write_reg(
+        &mut distira,
+        SST_FBZ_COLOR_PATH,
+        FBZCP_TEXTURE_ENABLED | A_SELECT_TEX,
+    );
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_BLEND_ENABLE | (BLEND_ASRC_ALPHA << ALPHA_SRC_FUNC_SHIFT),
+    );
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TEXTURE_MODE,
+        FORMAT
+            | TC_ZERO_OTHER
+            | TC_ADD_CLOCAL
+            | TCA_SUB_CLOCAL
+            | TCA_MSELECT_LOD_FRAC
+            | TCA_REVERSE_BLEND
+            | TCA_ADD_CLOCAL
+            | TEXTUREMODE_TRILINEAR,
+    );
+    write_reg(&mut distira, TREX1 | SST_TEXTURE_MODE, FORMAT);
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TLOD,
+        LOD8_MAX | LOD_SPLIT | (5 << 12),
+    );
+    write_reg(
+        &mut distira,
+        TREX1 | SST_TLOD,
+        LOD8_MAX | LOD_SPLIT | LOD_ODD | (5 << 12),
+    );
+    assert!(distira.queue_texture_write_u32(2 << 17, 0x001c_001c));
+    assert!(distira.queue_texture_write_u32((1 << 21) | (1 << 17), 0xff1c_ff1c));
+    distira.drain_fifo();
+    set_iterator(&mut distira, TREX0, 0, ST_ONE, W_ONE);
+    set_iterator(&mut distira, TREX1, 0, ST_ONE, W_ONE);
+
+    assert_eq!(draw_first_pixel(&mut distira), 0x0000_be00);
 }

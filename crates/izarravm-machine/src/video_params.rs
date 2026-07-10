@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Extracted video/BIOS parameter tables and related constants.
 //! Goal: shrink the monolithic lib.rs .
 
@@ -31,7 +34,6 @@ pub const PCI_CONFIG_DATA_PORT: u16 = 0x0cfc;
 pub const PCI_CONFIG_DATA_END: u16 = 0x0cff;
 pub const DISTIRA_PCI_SLOT: u8 = 0x10;
 pub const DISTIRA_PCI_BAR_SIZE: u32 = 0x0100_0000;
-pub const DISTIRA_PCI_CMDFIFO_OFFSET: u32 = 0x0020_0000;
 pub const DISTIRA_PCI_LFB_OFFSET: u32 = 0x0040_0000;
 pub const DISTIRA_PCI_TEX_OFFSET: u32 = 0x0080_0000;
 pub const DISTIRA_PCI_VENDOR_ID: u16 = 0x121a;

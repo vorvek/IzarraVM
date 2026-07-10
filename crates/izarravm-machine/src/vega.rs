@@ -11,8 +11,8 @@ use izarravm_video::{
 };
 
 use crate::video_params::{
-    DISTIRA_PCI_BAR_SIZE, DISTIRA_PCI_CMDFIFO_OFFSET, DISTIRA_PCI_DEVICE_ID,
-    DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_REVISION, DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID,
+    DISTIRA_PCI_BAR_SIZE, DISTIRA_PCI_DEVICE_ID, DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_REVISION,
+    DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID,
 };
 use crate::{ActiveDisplay, DISTIRA_MMIO_BASE, MARGO_LFB_BASE, MARGO_MMIO_BASE};
 
@@ -331,9 +331,7 @@ impl Vega {
                 BusWidth::Dword => self.distira.read_lfb_u32(offset),
             });
         }
-        if self.distira_texture_offset(address, bytes).is_some()
-            || self.distira_cmdfifo_offset(address, bytes).is_some()
-        {
+        if self.distira_texture_offset(address, bytes).is_some() {
             return Some(match width {
                 BusWidth::Byte => 0xff,
                 BusWidth::Word => 0xffff,
@@ -365,21 +363,6 @@ impl Vega {
             return true;
         }
         false
-    }
-
-    pub(crate) fn write_command_memory(
-        &mut self,
-        address: u32,
-        width: BusWidth,
-        value: u32,
-    ) -> bool {
-        let Some(offset) = self.distira_cmdfifo_offset(address, width.bytes() as usize) else {
-            return false;
-        };
-        if width == BusWidth::Dword {
-            self.distira.write_command_fifo_u32(offset, value);
-        }
-        true
     }
 
     pub(crate) fn read_memory(&mut self, address: u32, out: &mut [u8]) -> bool {
@@ -479,9 +462,7 @@ impl Vega {
             }
             return true;
         }
-        if self.distira_texture_offset(address, width).is_some()
-            || self.distira_cmdfifo_offset(address, width).is_some()
-        {
+        if self.distira_texture_offset(address, width).is_some() {
             out.fill(0xff);
             return true;
         }
@@ -550,7 +531,6 @@ impl Vega {
         }
         if self.distira_lfb_offset(address, 1).is_some()
             || self.distira_texture_offset(address, 1).is_some()
-            || self.distira_cmdfifo_offset(address, 1).is_some()
         {
             return true;
         }
@@ -570,7 +550,6 @@ impl Vega {
             || margo_lfb_offset(address, width).is_some()
             || margo_mmio_offset(address, width).is_some()
             || self.distira_lfb_offset(address, width).is_some()
-            || self.distira_cmdfifo_offset(address, width).is_some()
             || self.distira_texture_offset(address, width).is_some()
             || self.distira_mmio_offset(address, width).is_some()
     }
@@ -640,19 +619,8 @@ impl Vega {
 
     pub(crate) fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
         let offset = self.distira_bar_offset(address, width)?;
-        (offset < DISTIRA_PCI_CMDFIFO_OFFSET && offset + width as u32 <= DISTIRA_PCI_CMDFIFO_OFFSET)
+        (offset < DISTIRA_PCI_LFB_OFFSET && offset + width as u32 <= DISTIRA_PCI_LFB_OFFSET)
             .then_some(offset as usize)
-    }
-
-    pub(crate) fn distira_cmdfifo_offset(&self, address: u32, width: usize) -> Option<usize> {
-        let offset = self.distira_bar_offset(address, width)?;
-        if (DISTIRA_PCI_CMDFIFO_OFFSET..DISTIRA_PCI_LFB_OFFSET).contains(&offset)
-            && offset + width as u32 <= DISTIRA_PCI_LFB_OFFSET
-        {
-            Some((offset - DISTIRA_PCI_CMDFIFO_OFFSET) as usize)
-        } else {
-            None
-        }
     }
 
     pub(crate) fn distira_lfb_offset(&self, address: u32, width: usize) -> Option<usize> {
