@@ -8,7 +8,8 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# Forward the CPU's P3 template JIT so a headless run can compile hot loops. Off by default.
+# Forward the CPU template JIT by default. Disabling defaults keeps the interpreter-only path.
+default = ["jit"]
 jit = ["izarravm-cpu/jit"]
 
 [dependencies]
@@ -16,7 +17,7 @@ thiserror.workspace = true
 izarravm-audio = { path = "../izarravm-audio" }
 izarravm-bus = { path = "../izarravm-bus" }
 izarravm-core = { path = "../izarravm-core" }
-izarravm-cpu = { path = "../izarravm-cpu" }
+izarravm-cpu = { path = "../izarravm-cpu", default-features = false }
 izarravm-firmware = { path = "../izarravm-firmware" }
 izarravm-video = { path = "../izarravm-video" }
 

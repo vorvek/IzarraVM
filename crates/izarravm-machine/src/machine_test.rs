@@ -10,6 +10,17 @@ use super::cache_config::{CACHE_LINE_BYTES, CACHE_TIER_DISABLED_MASK, cache_geom
 
 const BIOS_TEXT_WHITE: u8 = 0x3F;
 
+#[test]
+fn jit_auto_admission_policy_defaults_on_only_when_available() {
+    assert!(jit_auto_admit_policy(None, true));
+    assert!(jit_auto_admit_policy(Some("1"), true));
+    assert!(jit_auto_admit_policy(Some("yes"), true));
+    assert!(!jit_auto_admit_policy(Some("0"), true));
+    assert!(!jit_auto_admit_policy(Some(""), true));
+    assert!(!jit_auto_admit_policy(None, false));
+    assert!(!jit_auto_admit_policy(Some("1"), false));
+}
+
 // The CacheModel tests below exercise tier IDENTITY, not the wait-state numbers:
 // tier_cost is calibrated (non-zero) now, but these tests assert only that the
 // model resolves L1/L2/RAM correctly per the per-mode geometry, not the specific

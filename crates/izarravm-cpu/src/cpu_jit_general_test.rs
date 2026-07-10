@@ -1382,6 +1382,14 @@ fn auto_admit_gate_refuses_linear_but_keeps_loops() {
         lp.jit_regions.get_mut(region.unwrap()).unwrap().is_loop,
         "the admitted region is a self-loop"
     );
+
+    // Production unpaged ring-0 protected mode is the V86 monitor. Auto-admission stays out,
+    // while the forced/test path remains available for the protected-mode differential suites.
+    lp.control.cr0 |= CR0_PE;
+    lp.cpl = 0;
+    assert!(lp.is_ring0_protected());
+    assert!(jit::block::try_admit_gated(&mut lp, H_ENTRY, true, true).is_none());
+    assert!(jit::block::try_admit_gated(&mut lp, H_ENTRY, true, false).is_some());
 }
 
 // ---- STAGE 2 FINALE: cost-fold native byte-LOAD, state-only differential ----

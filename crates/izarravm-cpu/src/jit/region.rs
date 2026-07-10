@@ -85,11 +85,11 @@ pub(crate) const JIT_REGION_TABLE_CAP: usize = 1024;
 #[derive(Default)]
 pub(crate) struct RegionTable {
     regions: Vec<CompiledRegion>,
-    /// Whether the continuation seam admits hot loops automatically. Off by default so
-    /// manual-admission tests and the forced-address path are undisturbed; the CLI/GUI turns it on
-    /// to run the JIT on real workloads. Lives here (not on `CpuGsw`) so it is excluded from CPU
-    /// equality via this table's always-equal `PartialEq` - setting it never makes two otherwise
-    /// identical CPUs compare unequal, which the differential suite relies on.
+    /// Whether the continuation seam admits hot loops automatically. Direct CPU users start with
+    /// it off; `Machine` applies the production environment policy. Lives here (not on `CpuGsw`)
+    /// so it is excluded from CPU equality via this table's always-equal `PartialEq`. Setting it
+    /// never makes two otherwise identical CPUs compare unequal, which the differential suite
+    /// relies on.
     auto_admit: bool,
 }
 
