@@ -169,7 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     info!(
         cpu = %config.machine.cpu,
-        hz = hardware.clock_hz,
+        hz = hardware.cpu.clock_rate().as_hz_f64(),
         memory_mib = config.machine.memory_mib,
         video = %config.machine.video,
         c_drive = %config.dos.c_drive.display(),
@@ -306,7 +306,7 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // The suite is wall-time-bound (PIT ticks and device-settle delays), so the
     // cycle budget scales with the clock to cover the same span at any GSW mode.
     // 200 ms (clock_hz / 5) matches the original 5,000,000 cycles at 25 MHz.
-    let budget = hardware.clock_hz / 5;
+    let budget = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 5);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     // Report the result block, which holds the runtime outcome (the timer test
     // patches its record here). The serial dump is an earlier static snapshot.
@@ -382,7 +382,7 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         izarravm_firmware::izarra_bios(),
     )?;
     // The graphical POST blit and RAM sweep need more than the old 200 ms budget.
-    let budget = hardware.clock_hz;
+    let budget = hardware.cpu.clock_rate().clocks_for_fraction_floor(1, 1);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let results = parse_result_block(machine.memory().as_slice())?;
     for record in &results.records {

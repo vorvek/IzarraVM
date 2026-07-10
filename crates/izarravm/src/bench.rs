@@ -347,7 +347,9 @@ fn run_microbench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             let started = std::time::Instant::now();
             let stop = machine.run_until_halt_or_cycles(MICROBENCH_BUDGET)?;
             let wall = started.elapsed();
-            let guest_secs = machine.elapsed_clocks() as f64 / mode.clock_hz() as f64;
+            let guest_secs = mode
+                .clock_rate()
+                .seconds_for_clocks(machine.elapsed_clocks());
             let wall_secs = wall.as_secs_f64();
             let rt = if wall_secs > 0.0 {
                 guest_secs / wall_secs
@@ -425,9 +427,8 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
     );
     // Collected for the host-side perf summary printed after the table.
     let mut perf_rows: Vec<(&'static str, GswMode, PerfCounters)> = Vec::new();
-    // Only an Accurate-class (286/386) out-of-band row fails the process; the
-    // Approximate fast modes (486/586) are informational (see TimingClass and
-    // bench_reference.rs), so their verdicts print but never flip this flag.
+    // Only an accurate 386-mode out-of-band row fails the process. The 486/586
+    // modes are informational, so their verdicts print but never flip this flag.
     let mut accurate_out_of_band = false;
     for bench in BENCHES {
         for mode in modes {
@@ -451,7 +452,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             let work = run.clocks.saturating_sub(baseline_clocks);
             let iters = u64::from(run.iterations.max(1));
             let cyc_per_iter = work as f64 / iters as f64;
-            let guest_secs = work as f64 / mode.clock_hz() as f64;
+            let guest_secs = mode.clock_rate().seconds_for_clocks(work);
             let iters_per_sec = if guest_secs > 0.0 {
                 iters as f64 / guest_secs
             } else {
@@ -485,11 +486,11 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 rt,
             );
             // Soft reporter: tag each row against the era reference band. Accurate
-            // modes (286/386) gate the process exit on an out-of-band verdict; the
-            // Approximate fast modes (486/586) are informational only (their bands
+            // 386 modes gate the process exit on an out-of-band verdict; the
+            // approximate 486/586 modes are informational only (their bands
             // were widened for this in bench_reference.rs), so they always print
-            // their tag but never fail the run. See TimingClass.
-            if mode.timing_class() == izarravm_core::TimingClass::Accurate
+            // their tag but never fail the run.
+            if !mode.uses_approximate_timing()
                 && bench_reference::band_for(bench.name, mode).is_some_and(|band| {
                     band.verdict(band_value) != bench_reference::BandVerdict::InBand
                 })
@@ -560,11 +561,9 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
         );
     }
     if accurate_out_of_band {
-        return Err(
-            "an Accurate-class (286/386) bench row is out of its era reference band"
-                .to_string()
-                .into(),
-        );
+        return Err("a 386 bench row is out of its era reference band"
+            .to_string()
+            .into());
     }
     Ok(())
 }
@@ -576,7 +575,7 @@ pub(super) fn run_bench_exe(path: &Path, hardware: &HardwareProfile) -> Result<(
     let run = run_bench_one(hardware, mode, &BenchSource::DosExe(&exe), BENCH_BUDGET)?;
     let iters = u64::from(run.iterations.max(1));
     let cyc_per_iter = run.clocks as f64 / iters as f64;
-    let guest_secs = run.clocks as f64 / mode.clock_hz() as f64;
+    let guest_secs = mode.clock_rate().seconds_for_clocks(run.clocks);
     let iters_per_sec = if guest_secs > 0.0 {
         iters as f64 / guest_secs
     } else {
@@ -628,7 +627,7 @@ struct BenchMetrics {
 fn bench_metrics(run: &BenchRun, mode: GswMode) -> BenchMetrics {
     let iters = u64::from(run.iterations.max(1));
     let cycles_per_iter = run.clocks as f64 / iters as f64;
-    let guest_secs = run.clocks as f64 / mode.clock_hz() as f64;
+    let guest_secs = mode.clock_rate().seconds_for_clocks(run.clocks);
     let iters_per_sec = if guest_secs > 0.0 {
         iters as f64 / guest_secs
     } else {
@@ -1030,8 +1029,8 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
 
 /// Compare a measured `iters/sec` to the matching era reference band and return
 /// a tag to append to the row: ` [in band]`, ` [LOW <ratio>]`, ` [HIGH <ratio>]`,
-/// or empty when no band is encoded for this payload/mode. Approximate-class
-/// modes (486/586; see TimingClass) carry an extra trailing ` [approx]` marker,
+/// or empty when no band is encoded for this payload/mode. The approximate-timing
+/// 486/586 modes carry an extra trailing ` [approx]` marker,
 /// since their band is informational rather than a gate.
 fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
     use bench_reference::BandVerdict;
@@ -1043,7 +1042,7 @@ fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
         BandVerdict::Low => format!(" [LOW {:.2}]", iters_per_sec / band.target),
         BandVerdict::High => format!(" [HIGH {:.2}]", iters_per_sec / band.target),
     };
-    if mode.timing_class() == izarravm_core::TimingClass::Approximate {
+    if mode.uses_approximate_timing() {
         format!("{verdict} [approx]")
     } else {
         verdict
@@ -1101,7 +1100,7 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
         println!(
             "mode {} @ {:.2} MHz  L1/L2 = {:?} KB",
             mode.canonical_name(),
-            mode.clock_hz() as f64 / 1.0e6,
+            mode.clock_rate().as_hz_f64() / 1.0e6,
             mode.cache_kb(),
         );
         println!("{:>8} {:>12} {:>16}", "block", "MB/s", "band");
@@ -1115,7 +1114,7 @@ pub(super) fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Er
             machine.set_mode(mode);
             let sample = machine.measure_read_bandwidth(0x10_0000, block, TOTAL);
             let mb_per_sec = if sample.clocks > 0 {
-                sample.bytes as f64 / (sample.clocks as f64 / mode.clock_hz() as f64) / 1.0e6
+                sample.bytes as f64 / mode.clock_rate().seconds_for_clocks(sample.clocks) / 1.0e6
             } else {
                 0.0
             };

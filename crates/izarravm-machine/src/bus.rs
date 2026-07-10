@@ -56,8 +56,8 @@ impl Machine {
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
-            flat_data_cost: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
-            lazy_port_reads: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
+            flat_data_cost: self.active_mode.uses_approximate_timing(),
+            lazy_port_reads: self.active_mode.uses_approximate_timing(),
             io_touched: &mut self.io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             device_wrote_memory: &mut self.device_wrote_memory,
@@ -357,7 +357,7 @@ impl CpuBus for MachineBus<'_> {
     /// Same arithmetic as `in_batch_clocks` minus the core terms the CPU
     /// already tracks itself.
     fn in_batch_scaled_bus_clocks(&self) -> u64 {
-        if matches!(self.active_mode.timing_class(), TimingClass::Accurate) {
+        if !self.active_mode.uses_approximate_timing() {
             return 0;
         }
         let raw = self.trace.elapsed_clocks() - self.trace_elapsed_at_batch_start;
@@ -1964,9 +1964,10 @@ impl MachineBus<'_> {
             // The Approximate class charges the era bus latency of a real video
             // card (see `video_wait_states_approx`); the Accurate class keeps the
             // frozen profile value bit-for-bit.
-            match self.active_mode.timing_class() {
-                TimingClass::Accurate => self.wait_states.video,
-                TimingClass::Approximate => video_wait_states_approx(self.active_mode.persona()),
+            if self.active_mode.uses_approximate_timing() {
+                video_wait_states_approx(self.active_mode.persona())
+            } else {
+                self.wait_states.video
             }
         } else {
             self.wait_states.ram

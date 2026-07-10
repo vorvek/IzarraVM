@@ -22,6 +22,61 @@ fn rational_budget_overflow_saturates() {
 }
 
 #[test]
+fn master_clock_exactly_represents_every_gsw_rate() {
+    for (rate, expected) in [
+        (ClockRate::from_hz(200_000_000), 33),
+        (ClockRate::from_hz(66_000_000), 100),
+        (ClockRate::from_hz(22_000_000), 300),
+        (ClockRate::new(22_000_000, 3), 900),
+    ] {
+        assert_eq!(rate.master_ticks_per_clock(), Some(expected));
+        assert_eq!(rate.master_ticks_for_clocks_floor(1), expected);
+        assert_eq!(rate.master_ticks_for_clocks_ceil(1), expected);
+    }
+
+    assert_eq!(ClockRate::from_hz(44_100).master_ticks_per_clock(), None);
+}
+
+#[test]
+fn master_clock_inverse_uses_the_earliest_causal_clock() {
+    let rate = ClockRate::from_hz(200_000_000);
+
+    assert_eq!(rate.clocks_for_master_ticks_floor(32), 0);
+    assert_eq!(rate.clocks_for_master_ticks_ceil(32), 1);
+    assert_eq!(rate.clocks_for_master_ticks_floor(33), 1);
+    assert_eq!(rate.clocks_for_master_ticks_ceil(33), 1);
+    assert_eq!(rate.clocks_for_master_ticks_floor(34), 1);
+    assert_eq!(rate.clocks_for_master_ticks_ceil(34), 2);
+}
+
+#[test]
+fn master_clock_conversions_saturate_after_u128_arithmetic() {
+    let slow = ClockRate::new(22_000_000, 3);
+    assert_eq!(slow.master_ticks_for_clocks_floor(u64::MAX), u64::MAX);
+    assert_eq!(slow.master_ticks_for_clocks_ceil(u64::MAX), u64::MAX);
+
+    let largest_denominator = ClockRate::new(1, u64::MAX);
+    assert_eq!(
+        largest_denominator.master_ticks_for_clocks_floor(u64::MAX),
+        u64::MAX
+    );
+    assert_eq!(
+        largest_denominator.master_ticks_for_clocks_ceil(u64::MAX),
+        u64::MAX
+    );
+
+    let fastest_ratio = ClockRate::from_hz(u64::MAX);
+    assert_eq!(
+        fastest_ratio.clocks_for_master_ticks_floor(u64::MAX),
+        u64::MAX
+    );
+    assert_eq!(
+        fastest_ratio.clocks_for_master_ticks_ceil(u64::MAX),
+        u64::MAX
+    );
+}
+
+#[test]
 #[should_panic(expected = "clock-rate numerator must not be zero")]
 fn zero_clock_is_rejected() {
     let _ = ClockRate::from_hz(0);

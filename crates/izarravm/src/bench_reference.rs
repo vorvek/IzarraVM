@@ -9,12 +9,9 @@
 //! per-mode bus scalar `bus_timing`) every `--headless-bench` and
 //! `--headless-bandwidth` row tags [in band].
 //!
-//! GswMode splits into two timing classes (`izarravm_core::TimingClass`): 286/386
-//! are Accurate and stay on the tight bands below; 486/586 are Approximate (the
-//! fast modes trade cycle fidelity for speed), so their runnable bands (dhrystone,
-//! sieve, fp-mandel, whetstone) are widened to informational width and never fail
-//! the `--headless-bench` process (see `main.rs`'s exit-gating, which only counts
-//! an Accurate-mode out-of-band verdict as a failure).
+//! The 386 modes stay on the tight bands below. The 486/586 modes trade some
+//! cycle fidelity for speed, so their runnable bands are informational and never
+//! fail `--headless-bench`.
 //!
 //! Every band is encoded in the bench's NATIVE comparison unit (`iters/sec`) so
 //! the reporter compares directly:
@@ -157,7 +154,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     // The B-T10 per-mode bus scalar lifts the fast modes off the old flat per-access
     // bus floor, so all four modes hit the owner's targets within ~0.3%. The Accurate
     // 286/386 bands stay tight (+/-5%; the 286 a touch wider for sparse period data).
-    // The Approximate 486/586 (not cycle-accurate; see TimingClass) carry loosened,
+    // The approximate-timing 486/586 modes carry loosened,
     // informational bands (+/-20%/+/-22%), the 586 widest per the
     // band-width-ordering invariant, both still centered on the owner target.
     BenchBand {
@@ -182,7 +179,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "dhrystone",
         mode: GswMode::Gsw486,
         target: 61000.0,
-        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        // Approximate timing: loosened to informational (+/-20%).
         lo: 48800.0,
         hi: 73200.0,
         unit: "iters/sec",
@@ -228,7 +225,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "sieve",
         mode: GswMode::Gsw486,
         target: 372.0,
-        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        // Approximate timing: loosened to informational (+/-20%).
         lo: 297.6,
         hi: 446.4,
         unit: "iters/sec",
@@ -256,7 +253,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "fp-mandel",
         mode: GswMode::Gsw486,
         target: 24600.0,
-        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        // Approximate timing: loosened to informational (+/-20%).
         lo: 19680.0,
         hi: 29520.0,
         unit: "iters/sec",
@@ -281,7 +278,7 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         payload: "whetstone",
         mode: GswMode::Gsw486,
         target: 6.5,
-        // APPROXIMATE class: loosened to informational (+/-20%; see TimingClass).
+        // Approximate timing: loosened to informational (+/-20%).
         // 486 still anchors the FP weight, lands 6.50.
         lo: 5.2,
         hi: 7.8,

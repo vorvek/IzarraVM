@@ -272,7 +272,6 @@ fn boot_suite_timer_passes_at_native_200mhz() {
     // about 200 ms) or the timer test never reaches its tick target.
     let profile = MachineProfile {
         cpu: GswMode::Gsw586,
-        clock_hz: GswMode::Gsw586.clock_hz(),
         memory_mib: 16,
         video: VideoCard::Et4000Ax,
         sound_blaster: SoundBlasterConfig::default(),
@@ -281,7 +280,7 @@ fn boot_suite_timer_passes_at_native_200mhz() {
         address_pipelining: false,
         cache_enabled: false,
     };
-    let budget = profile.clock_hz / 5;
+    let budget = profile.cpu.clock_rate().clocks_for_fraction_floor(1, 5);
     let mut machine =
         Machine::new_boot_image(profile, izarravm_firmware::X86_BOOT_TEST_IMAGE).unwrap();
 

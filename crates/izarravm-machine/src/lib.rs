@@ -11,7 +11,7 @@ use izarravm_bus::{
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    CpuPersona, GswMode, HardwareProfile, MIDI_INPUT_MPU_BASE, SoundBlasterConfig, TimingClass,
+    ClockRate, CpuPersona, GswMode, HardwareProfile, MIDI_INPUT_MPU_BASE, SoundBlasterConfig,
     VideoCard, WAVETABLE_MPU_BASE, WssConfig,
 };
 pub use izarravm_cpu::PerfCounters;
@@ -38,6 +38,7 @@ use bus::DevicePorts;
 pub(crate) use pci::PciConfig;
 mod cache_config;
 mod ram_lookup;
+pub mod timeline;
 mod timing;
 #[cfg(test)]
 use timing::advance_fractional;
@@ -189,7 +190,6 @@ impl Default for WaitStateProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineProfile {
     pub cpu: GswMode,
-    pub clock_hz: u64,
     pub memory_mib: u16,
     pub video: VideoCard,
     /// Power-on CT1745 mixer routing (IRQ/DMA) + host enable flag, applied to
@@ -209,7 +209,6 @@ impl MachineProfile {
     pub fn gsw_386(memory_mib: u16, video: VideoCard) -> Self {
         Self {
             cpu: GswMode::Gsw386,
-            clock_hz: GswMode::Gsw386.clock_hz(),
             memory_mib,
             video,
             sound_blaster: SoundBlasterConfig::default(),
@@ -223,7 +222,6 @@ impl MachineProfile {
     pub fn from_hardware_profile(profile: &HardwareProfile) -> Self {
         Self {
             cpu: profile.cpu,
-            clock_hz: profile.clock_hz,
             memory_mib: profile.memory_mib,
             video: profile.video,
             sound_blaster: profile.sound_blaster,
@@ -289,14 +287,14 @@ struct TimingFactors {
 }
 
 impl TimingFactors {
-    fn for_clock(clock_hz: u64) -> Self {
-        let c = clock_hz as f64;
+    fn for_clock(clock: ClockRate) -> Self {
+        let c = clock.as_hz_f64();
         Self {
             micros_per_clock: 1_000_000.0 / c,
             pit_per_clock: PIT_INPUT_HZ as f64 / c,
             margo_ns_per_clock: 1_000_000_000.0 / c,
             inv_clock: 1.0 / c,
-            clocks_per_audio_sample: (clock_hz / u64::from(DAC_HZ)).max(1),
+            clocks_per_audio_sample: clock.clocks_for_fraction_floor(1, u64::from(DAC_HZ)).max(1),
         }
     }
 }
@@ -1033,7 +1031,7 @@ impl Machine {
         let pci = PciConfig::new();
         let memory = Memory::from_mib(profile.memory_mib)?;
         let ram_lookup = RamPageLookup::new(memory.len(), &pci);
-        let timing = TimingFactors::for_clock(active_mode.clock_hz());
+        let timing = TimingFactors::for_clock(active_mode.clock_rate());
         // Lay the HLE entry stubs into ROM. PSP:0005 reaches the CALL 5 adapter
         // through the low-memory DOS entry at 0000:00C0.
         install_bios_font_mirror(&mut rom);
@@ -1583,7 +1581,7 @@ impl Machine {
     /// row once, while Machine refreshes its retained timing and cache state.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.active_mode = mode;
-        self.timing = TimingFactors::for_clock(mode.clock_hz());
+        self.timing = TimingFactors::for_clock(mode.clock_rate());
         self.cpu.set_mode(mode);
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
@@ -1835,13 +1833,13 @@ impl Machine {
         // so rings are filled by guest time. render drains by delta on elapsed_clocks
         // for rate matching. Falls back to OPL-scaled when no guest delta. This
         // decouples audio production from host render cadence and reduces drift.
-        let clock_hz = self.profile().clock_hz;
+        let clock_hz = self.active_mode.clock_rate().as_hz_f64();
         let delta = self.elapsed_clocks.saturating_sub(self.last_audio_clocks);
         self.last_audio_clocks = self.elapsed_clocks;
         self.sync_dsp_resampler();
         let dsp_native_count = if delta > 0 {
             let r = self.dsp.output_frame_rate() as u64;
-            ((delta as f64 * r as f64 / clock_hz as f64).round() as usize).max(1)
+            ((delta as f64 * r as f64 / clock_hz).round() as usize).max(1)
         } else {
             (native_samples as f64 * self.dsp.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
                 .round() as usize
@@ -1862,7 +1860,7 @@ impl Machine {
             self.sync_wss_resampler();
             let wss_native_count = if delta > 0 {
                 let r = self.wss.output_frame_rate() as u64;
-                ((delta as f64 * r as f64 / clock_hz as f64).round() as usize).max(1)
+                ((delta as f64 * r as f64 / clock_hz).round() as usize).max(1)
             } else {
                 (native_samples as f64 * self.wss.output_frame_rate() as f64 / OPL_NATIVE_HZ as f64)
                     .round() as usize
@@ -2062,8 +2060,8 @@ struct MachineBus<'a> {
     /// 386 class and forced false by the bandwidth diagnostic so its tier
     /// curve stays on the accurate model.
     flat_data_cost: bool,
-    /// True in the Approximate timing class (486/586), computed identically to
-    /// `flat_data_cost` (same `active_mode.timing_class()` match, same
+    /// True for the approximate-timing 486/586 modes, computed identically to
+    /// `flat_data_cost` (same `active_mode.uses_approximate_timing()` check, same
     /// construction sites). Gates the lazy 3DA/3BA/3C2 dispatch in `read_io`
     /// (P4a Task 1.3): when true, a status-port read does not set `io_touched`
     /// and computes its returned bits from `predicted_beam()` instead of the
