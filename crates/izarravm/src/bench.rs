@@ -17,17 +17,18 @@ struct BenchRun {
 }
 
 /// How a benchmark payload is loaded: baked into the Neurketa boot image and
-/// chosen by a selector byte, or a freestanding DOS .EXE.
+/// chosen by a selector byte, or a local DOS executable under `.bench`.
 #[derive(Debug)]
-enum BenchSource<'a> {
+enum BenchSource {
     BootSelector(u8),
-    DosExe(&'a [u8]),
+    LocalDosExe(&'static str),
+    DosExe(Vec<u8>),
 }
 
 fn run_bench_one(
     hardware: &HardwareProfile,
     mode: GswMode,
-    source: &BenchSource<'_>,
+    source: &BenchSource,
     budget: u64,
 ) -> Result<BenchRun, Box<dyn Error>> {
     // Calibration census tool (mirrors run_boot_hdd_folder):
@@ -51,7 +52,7 @@ pub(super) fn jit_fold_enabled() -> bool {
 fn run_bench_one_profiled(
     hardware: &HardwareProfile,
     mode: GswMode,
-    source: &BenchSource<'_>,
+    source: &BenchSource,
     budget: u64,
     sample_stride: Option<u64>,
 ) -> Result<BenchRun, Box<dyn Error>> {
@@ -61,6 +62,12 @@ fn run_bench_one_profiled(
             let mut m = Machine::new_boot_image(profile, neurketa_image())?;
             m.set_bench_selector(*selector);
             m
+        }
+        BenchSource::LocalDosExe(path) => {
+            let exe = std::fs::read(path).map_err(|error| {
+                format!("cannot load local benchmark {path}: {error}; place the licensed DOS executable in .bench")
+            })?;
+            Machine::new_raw_program(profile, &exe)?
         }
         BenchSource::DosExe(exe) => Machine::new_raw_program(profile, exe)?,
     };
@@ -96,7 +103,7 @@ fn run_bench_one_profiled(
 /// they start at 486.
 struct Bench {
     name: &'static str,
-    source: BenchSource<'static>,
+    source: BenchSource,
     min_mode: GswMode,
     /// Floating-point operations per reported iteration. When set, the harness
     /// reports `MFLOPS = iters_per_sec * flops_per_iter / 1e6` and bands against it
@@ -119,16 +126,16 @@ const BENCHES: &[Bench] = &[
     },
     Bench {
         name: "dhrystone",
-        source: BenchSource::DosExe(izarravm_firmware::DHRYSTONE_EXE),
+        source: BenchSource::LocalDosExe(".bench/dhrystone.exe"),
         min_mode: GswMode::Gsw386Slow,
         flops_per_iter: None,
     },
     // Whetstone: the FP oracle (486+). `flops_per_iter` is the per-sweep FLOP weight,
     // anchored so the era-calibrated 486 lands at ~6.5 MFLOPS (Roy Longbottom); the
-    // 586 is then tuned to ~34.5 MFLOPS via fp_timing(I586). See whetstone.c.
+    // 586 is then tuned to ~34.5 MFLOPS via fp_timing(I586).
     Bench {
         name: "whetstone",
-        source: BenchSource::DosExe(izarravm_firmware::WHETSTONE_EXE),
+        source: BenchSource::LocalDosExe(".bench/whetstone.exe"),
         min_mode: GswMode::Gsw486,
         flops_per_iter: Some(WHETSTONE_FLOPS_PER_SWEEP),
     },
@@ -408,9 +415,9 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
                 print_cpu_profile(&run.cpu_profile);
             }
             perf_rows.push((bench.name, mode, run.perf.clone()));
-            let baseline_clocks = match bench.source {
+            let baseline_clocks = match &bench.source {
                 BenchSource::BootSelector(_) => baseline[mode_rank(mode) as usize],
-                BenchSource::DosExe(_) => 0,
+                BenchSource::LocalDosExe(_) | BenchSource::DosExe(_) => 0,
             };
             let work = run.clocks.saturating_sub(baseline_clocks);
             let iters = u64::from(run.iterations.max(1));
@@ -545,7 +552,7 @@ pub(super) fn run_bench_exe(path: &Path, hardware: &HardwareProfile) -> Result<(
     const BENCH_BUDGET: u64 = 50_000_000_000;
     let exe = std::fs::read(path)?;
     let mode = GswMode::Gsw586;
-    let run = run_bench_one(hardware, mode, &BenchSource::DosExe(&exe), BENCH_BUDGET)?;
+    let run = run_bench_one(hardware, mode, &BenchSource::DosExe(exe), BENCH_BUDGET)?;
     let iters = u64::from(run.iterations.max(1));
     let cyc_per_iter = run.clocks as f64 / iters as f64;
     let guest_secs = mode.clock_rate().seconds_for_clocks(run.clocks);
@@ -646,7 +653,7 @@ pub(super) fn run_profile_exe(
     const BENCH_BUDGET: u64 = 50_000_000_000;
     let exe = std::fs::read(path)?;
     let mode = GswMode::Gsw586;
-    let source = BenchSource::DosExe(&exe);
+    let source = BenchSource::DosExe(exe);
     let baseline = run_bench_one(hardware, mode, &source, BENCH_BUDGET)?;
     let profiled =
         run_bench_one_profiled(hardware, mode, &source, BENCH_BUDGET, Some(sample_stride))?;

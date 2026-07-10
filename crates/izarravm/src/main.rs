@@ -85,6 +85,8 @@ struct Cli {
     headless_test_rom: bool,
     #[arg(long)]
     headless_boot_suite: bool,
+    /// Run the built-in calibration probes and the local Dhrystone and
+    /// Whetstone executables at .bench/dhrystone.exe and .bench/whetstone.exe.
     #[arg(long)]
     headless_bench: bool,
     /// Run one supplied DOS EXE through the raw-program bench harness in GSW-586.

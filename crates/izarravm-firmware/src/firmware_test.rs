@@ -280,13 +280,3 @@ fn exehello_exe_fixture_is_a_valid_mz() {
     let e_crlc = u16::from_le_bytes([EXEHELLO_EXE[6], EXEHELLO_EXE[7]]);
     assert!(e_crlc >= 1, "fixture must carry a relocation, got {e_crlc}");
 }
-
-#[test]
-fn dhrystone_exe_starts_with_mz() {
-    assert_eq!(&dhrystone_exe()[0..2], &[0x4D, 0x5A]);
-}
-
-#[test]
-fn whetstone_exe_starts_with_mz() {
-    assert_eq!(&whetstone_exe()[0..2], &[0x4D, 0x5A]);
-}
