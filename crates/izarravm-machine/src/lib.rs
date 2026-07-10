@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 pub use fat32::{
     FAT_ATTR_DIRECTORY, FAT32_EOC, Fat32Geometry, Fat32Table, fat32_boot_sector, fat32_dir_entry,
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
@@ -481,7 +484,7 @@ pub struct BandwidthSample {
     pub clocks: u64,
 }
 
-const MACHINE_PROFILE_PHASES: usize = 6;
+const MACHINE_PROFILE_PHASES: usize = 5;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MachineProfilePhase {
@@ -502,7 +505,6 @@ enum MachineProfilePhaseKind {
     SoftInt,
     ConsoleFlush,
     HaltFastForward,
-    CdStall,
 }
 
 impl MachineProfilePhaseKind {
@@ -512,7 +514,6 @@ impl MachineProfilePhaseKind {
         Self::SoftInt,
         Self::ConsoleFlush,
         Self::HaltFastForward,
-        Self::CdStall,
     ];
 
     const fn index(self) -> usize {
@@ -522,7 +523,6 @@ impl MachineProfilePhaseKind {
             Self::SoftInt => 2,
             Self::ConsoleFlush => 3,
             Self::HaltFastForward => 4,
-            Self::CdStall => 5,
         }
     }
 
@@ -533,7 +533,6 @@ impl MachineProfilePhaseKind {
             Self::SoftInt => "soft_int",
             Self::ConsoleFlush => "console_flush",
             Self::HaltFastForward => "halt_fast_forward",
-            Self::CdStall => "cd_stall",
         }
     }
 }

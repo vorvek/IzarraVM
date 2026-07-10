@@ -3,6 +3,24 @@
 
 use super::*;
 
+fn timed_packet(machine: &mut Machine, cdb: [u8; 12]) {
+    with_bus(machine, |bus| {
+        bus.write_io(0x177, BusWidth::Byte, 0xa0, false).unwrap();
+    });
+    let accept = machine.ide.ticks_until_completion().unwrap();
+    machine.advance_devices_ticks(accept);
+    with_bus(machine, |bus| {
+        let _ = bus.read_io(0x177, BusWidth::Byte, 0, false).unwrap();
+        for byte in cdb {
+            bus.write_io(0x170, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    while let Some(ticks) = machine.ide.ticks_until_completion() {
+        machine.advance_devices_ticks(ticks);
+    }
+}
+
 #[test]
 fn v86spike_enters_v86_and_signals() {
     let mut machine = Machine::new_boot_image(
@@ -519,17 +537,11 @@ fn play_audio_mixes_cd_audio_into_render_audio() {
     // Issue PLAY AUDIO(10) over the secondary-channel ATAPI ports: PACKET
     // command, then the 12-byte CDB. Play from LBA 1 (audio start) for 16
     // frames.
-    with_bus(&mut machine, |bus| {
-        bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap(); // PACKET command
-        let mut cdb = [0u8; 12];
-        cdb[0] = 0x45; // PLAY AUDIO(10)
-        cdb[5] = 1; // starting LBA 1
-        cdb[8] = 16; // 16 frames
-        for b in cdb {
-            bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
-                .unwrap();
-        }
-    });
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x45; // PLAY AUDIO(10)
+    cdb[5] = 1; // starting LBA 1
+    cdb[8] = 16; // 16 frames
+    timed_packet(&mut machine, cdb);
     assert!(machine.cd_loaded());
     let pcm = machine.render_audio(2000);
     assert!(
@@ -543,17 +555,11 @@ fn cd_audio_is_silent_with_the_volume_muted() {
     let mut machine = test_machine();
     machine.mount_cd(audio_cd(20));
     // Leave CD volume at its muted default (0). Start playback.
-    with_bus(&mut machine, |bus| {
-        bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap();
-        let mut cdb = [0u8; 12];
-        cdb[0] = 0x45;
-        cdb[5] = 1;
-        cdb[8] = 16;
-        for b in cdb {
-            bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
-                .unwrap();
-        }
-    });
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x45;
+    cdb[5] = 1;
+    cdb[8] = 16;
+    timed_packet(&mut machine, cdb);
     let pcm = machine.render_audio(2000);
     assert!(
         pcm.iter().all(|&(l, r)| l == 0 && r == 0),
@@ -865,26 +871,16 @@ fn atapi_read10_on_a_folder_mount_returns_a_known_files_bytes() {
     let file_lba = file_lba.expect("HELLO.TXT;1 must be in the root directory");
 
     // Clear the post-mount unit attention with a TEST UNIT READY packet.
-    with_bus(&mut machine, |bus| {
-        bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap();
-        for b in [0u8; 12] {
-            bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
-                .unwrap();
-        }
-    });
+    timed_packet(&mut machine, [0u8; 12]);
 
     // READ(10) one sector at the file's LBA over the real ATAPI packet
     // ports, then drain the data-in phase.
+    let mut cdb = [0u8; 12];
+    cdb[0] = 0x28; // READ(10)
+    cdb[2..6].copy_from_slice(&file_lba.to_be_bytes());
+    cdb[8] = 1; // one sector
+    timed_packet(&mut machine, cdb);
     let sector = with_bus(&mut machine, |bus| {
-        bus.write_io(0x177, BusWidth::Byte, 0xA0, false).unwrap(); // PACKET
-        let mut cdb = [0u8; 12];
-        cdb[0] = 0x28; // READ(10)
-        cdb[2..6].copy_from_slice(&file_lba.to_be_bytes());
-        cdb[8] = 1; // one sector
-        for b in cdb {
-            bus.write_io(0x170, BusWidth::Byte, u32::from(b), false)
-                .unwrap();
-        }
         let mut out = Vec::with_capacity(cdimage::DATA_SECTOR);
         for _ in 0..cdimage::DATA_SECTOR {
             out.push(bus.read_io(0x170, BusWidth::Byte, 0, false).unwrap() as u8);

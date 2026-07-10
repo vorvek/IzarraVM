@@ -446,6 +446,7 @@ impl Machine {
                 self.cpu.note_device_memory_write();
             }
         }
+        self.ide.advance_master_ticks(advance.master_ticks);
 
         // These edge latches coalesce like the PIC input pins. Timed UART and
         // LPT deadlines cap normal CPU batches, while a larger host-driven
@@ -733,7 +734,14 @@ impl Machine {
         let ata_wake = if self.pic.deliverable(ata::PRIMARY_IRQ)
             && self.ata.as_ref().is_some_and(ata::AtaDisk::irq_enabled)
         {
-            self.next_ata_irq_deadline()
+            self.next_primary_ata_irq_deadline()
+                .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
+        } else {
+            None
+        };
+        let atapi_wake = if self.pic.deliverable(ide::SECONDARY_IRQ) && self.ide.irq_enabled() {
+            self.ide
+                .ticks_until_irq()
                 .map(|ticks| self.timeline.cpu_clocks_for_master_ticks_ceil(ticks).max(1))
         } else {
             None
@@ -774,6 +782,7 @@ impl Machine {
             dsp_wake,
             wss_wake,
             ata_wake,
+            atapi_wake,
             rtc_wake,
             serial_wake,
             serial2_wake,
@@ -792,10 +801,11 @@ impl Machine {
             .and_then(ata::AtaDisk::ticks_until_completion)
             .into_iter()
             .chain(self.bmide.ticks_until_completion())
+            .chain(self.ide.ticks_until_completion())
             .min()
     }
 
-    fn next_ata_irq_deadline(&self) -> Option<u64> {
+    fn next_primary_ata_irq_deadline(&self) -> Option<u64> {
         self.ata
             .as_ref()
             .and_then(ata::AtaDisk::ticks_until_irq)

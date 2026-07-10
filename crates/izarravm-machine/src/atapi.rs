@@ -1,3 +1,6 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! ATAPI command interpreter for the CD-ROM drive.
 //!
 //! This holds the mounted [`CdImage`], the audio-playback state, and the most
@@ -18,12 +21,8 @@
 
 use crate::cdimage::{CdImage, DATA_SECTOR, lba_to_msf, msf_to_lba};
 
-/// 12x CD-ROM transfer ceiling: ~1800 KB/s sustained. Used by the timing model
-/// in the machine to charge a read its mechanical cost, mirroring the floppy.
+/// 12x CD-ROM transfer ceiling reported by MODE SENSE: about 1800 KB/s.
 pub const CD_BYTES_PER_SEC: f64 = 1_800.0 * 1024.0;
-/// Worst-case full-stroke seek for a 12x drive, ~100 ms. A read pays a fraction
-/// of this proportional to how far the head moved.
-pub const CD_SEEK_MAX_SECS: f64 = 0.100;
 
 /// SCSI sense keys this device reports.
 pub mod sense_key {
@@ -114,8 +113,8 @@ pub struct AtapiDevice {
     /// Latched by PREVENT/ALLOW MEDIUM REMOVAL (0x1E). While true, START STOP UNIT
     /// refuses to eject the tray.
     prevent_removal: bool,
-    /// START STOP UNIT spin state. Cosmetic: the model serves data regardless, but
-    /// drivers that stop then start the unit see the flag flip.
+    /// START STOP UNIT spin state. The IDE transport uses it to schedule spin-up
+    /// before the next seek or read.
     started: bool,
     /// The interrupt-reason byte (C/D, I/O) for the current packet phase. The IDE
     /// register file reads this through [`Self::interrupt_reason`] and publishes it
@@ -150,6 +149,7 @@ impl AtapiDevice {
     pub fn insert(&mut self, image: CdImage) {
         self.image = Some(image);
         self.media_changed = true;
+        self.started = false;
         self.play = Playback::default();
         self.mixer_lba = None;
         self.set_sense(
@@ -163,6 +163,7 @@ impl AtapiDevice {
     pub fn eject(&mut self) {
         self.image = None;
         self.media_changed = true;
+        self.started = false;
         self.play = Playback::default();
         self.mixer_lba = None;
     }
@@ -191,6 +192,14 @@ impl AtapiDevice {
     #[allow(dead_code)]
     pub fn started(&self) -> bool {
         self.started
+    }
+
+    /// Spin up on demand for a media operation. Returns true only when the IDE
+    /// transport must schedule the spin-up delay.
+    pub(crate) fn ensure_started(&mut self) -> bool {
+        let was_stopped = !self.started;
+        self.started = true;
+        was_stopped
     }
 
     /// The interrupt-reason (C/D, I/O) byte for the phase the last command left

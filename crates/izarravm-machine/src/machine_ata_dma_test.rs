@@ -113,6 +113,12 @@ fn secondary_pio_interrupt_latches_in_the_bmide_status_bank() {
         BusWidth::Byte,
         0xa1,
     );
+    let deadline = machine.ide.ticks_until_completion().unwrap();
+    machine.advance_devices_ticks(deadline - 1);
+    assert_eq!(
+        input(&mut machine, BMIDE_BASE + 10, BusWidth::Byte) & 0x04,
+        0
+    );
     machine.advance_devices_ticks(1);
     assert_ne!(
         input(&mut machine, BMIDE_BASE + 10, BusWidth::Byte) & 0x04,

@@ -505,17 +505,6 @@ impl Machine {
                     self.advance_cpu_work(step);
                     self.host_profile
                         .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
-                    // Charge the CD-ROM's seek + transfer time for a read the
-                    // instruction just issued, the way the floppy stalls. The
-                    // guest time jumps; the GUI's realtime pacing turns that into
-                    // a visible wait.
-                    let cd_secs = self.ide.take_stall_secs();
-                    if cd_secs > 0.0 {
-                        let cd_start = self.host_profile.start();
-                        self.stall_for(cd_secs);
-                        self.host_profile
-                            .record(MachineProfilePhaseKind::CdStall, cd_start);
-                    }
                     let service_start = self.host_profile.start();
                     let mut serviced = false;
                     let mut service_stop = None;
