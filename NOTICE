@@ -26,6 +26,13 @@ reimplemented in Rust for IzarraVM.
 Distira's SST-1 DAC-backdoor handshake and W-buffer depth encoding follow the
 behavior of 86Box's Voodoo emulation (https://86box.net, © 2008-2020 Sarah
 Walker and contributors, GPLv2-or-later), reimplemented in Rust for IzarraVM.
+Native MIDI synthesis links FluidSynth 2.5.6 and Munt/libmt32emu 2.8.2
+statically under LGPL-2.1-or-later. FluidSynth's SF3 reader uses libsndfile
+1.2.2 under LGPL-2.1-or-later, whose bundled ALAC codec is Apache-2.0.
+libogg 1.3.6, libvorbis 1.3.7, FLAC 1.4.3, and Opus 1.5.2 use their BSD
+licenses. FluidSynth also uses GCEM under Apache-2.0. Exact sources, license
+notices, hashes, and relinking instructions are in
+crates/izarravm-native-synth/vendor. Roland ROMs are not distributed.
 TOKAEMM.SYS (the XMS/UMB/EMS memory manager and V86 monitor) is a 386MAX
 adaptation: its VCPI 1.0 server and its V86 privileged-instruction emulation
 (the INT 67h AH=DEh handlers, the DE0C mode switch, and the MOV CRn/DRn /

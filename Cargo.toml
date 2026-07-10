@@ -10,6 +10,7 @@ members = [
     "crates/izarravm-firmware",
     "crates/izarravm-input",
     "crates/izarravm-machine",
+    "crates/izarravm-native-synth",
     "crates/izarravm-video",
 ]
 

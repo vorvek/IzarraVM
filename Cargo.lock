@@ -1745,6 +1745,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "izarravm-native-synth"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tempfile",
+]
+
+[[package]]
 name = "izarravm-video"
 version = "0.1.0"
 dependencies = [
