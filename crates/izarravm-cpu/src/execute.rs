@@ -87,7 +87,7 @@ impl CpuGsw {
             DecodeGroup::Fallback => {
                 // Fallback is now a pure dead-end: after Stage A every IMPLEMENTED single-byte opcode
                 // is routed to a dedicated split group, so the only opcodes that land here are the
-                // genuinely-unimplemented ones (0x63 ARPL, 0xF1 ICEBP) and — as a decode-bug guard —
+                // genuinely-unimplemented ones (currently 0xF1 ICEBP) and, as a decode-bug guard,
                 // any prefix byte `read_prefixes` failed to consume. Raise the architectural #UD
                 // (vector 6); `deliver_exception` traces CS:IP/bytes/CR0/EFLAGS for it when #UD
                 // tracing is enabled, so the diagnostic detail the old `UnsupportedOpcode` error
@@ -102,7 +102,7 @@ impl CpuGsw {
     /// Raise the #UD for a single-byte opcode that the decode/execute split does not implement.
     /// After Stage A every IMPLEMENTED opcode is routed by `route_group` to a dedicated split group,
     /// so the only opcodes that reach here (via the `DecodeGroup::Fallback` arm of `execute_decoded`)
-    /// are the genuinely-unimplemented ones — 0x63 (ARPL) and 0xF1 (ICEBP), plus any prefix byte that
+    /// are the genuinely-unimplemented ones, currently 0xF1 (ICEBP), plus any prefix byte that
     /// `read_prefixes` did not consume (which would be a decode bug). All produce the same
     /// `UnsupportedOpcode` the fused path produced: `opcode` is the byte, `cs` the current selector,
     /// and `eip` the instruction's start (the byte before any ModRM/immediate would sit), matching

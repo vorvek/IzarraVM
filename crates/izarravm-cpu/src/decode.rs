@@ -262,10 +262,10 @@ impl CpuGsw {
             return DecodeGroup::PortIo;
         }
         // System / descriptor-table / segment block (task A12), single-byte forms: BOUND r,m
-        // (0x62) and LES/LDS (0xc4/0xc5). Each is a ModRM r/m form whose memory operand decode
-        // pre-parses; the far pointer for LES/LDS is read FROM MEMORY at execute. 0x63 (ARPL) is
-        // unimplemented in the fused path (`UnsupportedOpcode`) and stays on Fallback.
-        if matches!(opcode, 0x62 | 0xc4 | 0xc5) {
+        // (0x62), ARPL r/m16,r16 (0x63), and LES/LDS (0xc4/0xc5). Each is a ModRM r/m form whose
+        // memory operand decode pre-parses; the far pointer for LES/LDS is read from memory at
+        // execute time.
+        if matches!(opcode, 0x62 | 0x63 | 0xc4 | 0xc5) {
             return DecodeGroup::SystemSeg;
         }
         // x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF (each a ModRM r/m or
@@ -278,8 +278,7 @@ impl CpuGsw {
         // Heterogeneous one-off single-byte block (task A14): BCD adjust DAA/DAS/AAA/AAS
         // (0x27/0x2f/0x37/0x3f), three-operand IMUL (0x69/0x6b), string port I/O INS/OUTS
         // (0x6c-0x6f), TEST AL/AX,imm (0xa8/0xa9), AAM/AAD (0xd4/0xd5), SALC/XLAT (0xd6/0xd7),
-        // and HLT (0xf4). 0x63 (ARPL) and 0xf1 are unimplemented in the fused path and stay
-        // on Fallback (they #UD as `UnsupportedOpcode`).
+        // and HLT (0xf4). 0xf1 remains unimplemented and stays on Fallback.
         if matches!(
             opcode,
             0x27 | 0x2f | 0x37 | 0x3f | 0x69 | 0x6b | 0x6c

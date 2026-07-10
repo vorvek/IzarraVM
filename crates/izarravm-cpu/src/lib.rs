@@ -1118,13 +1118,13 @@ enum DecodeGroup {
     /// `run_string`/`execute_mmx_decoded`/CPUID/RDTSC/halt leaf logic verbatim; the only
     /// change is WHERE the ModRM/immediate is fetched (once, in `decode`). The 0F forms are folded
     /// into `insn.opcode` as 0x0F00 | second and dispatched off the full u16. The genuinely
-    /// unimplemented neighbours (single-byte 0x63 ARPL / 0xF1; 0F 21/23 MOV DR; 0F AA RSM; the
-    /// other unmapped 0F bytes) are NOT routed here — they stay on Fallback / TwoByteFallback and
+    /// unimplemented neighbours (single-byte 0xF1; 0F AA RSM; the other unmapped 0F bytes) are NOT
+    /// routed here. They stay on Fallback / TwoByteFallback and
     /// still #UD as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`.
     Misc,
     /// A single-byte opcode with no split implementation. After Stage A this is a pure dead-end: the
-    /// only members are the genuinely-unimplemented 0x63 (ARPL) and 0xF1 (ICEBP), plus — as a
-    /// decode-bug guard — any prefix byte `read_prefixes` did not consume. `execute_decoded` raises
+    /// only member is the genuinely-unimplemented 0xF1 (ICEBP), plus, as a decode-bug guard, any
+    /// prefix byte `read_prefixes` did not consume. `execute_decoded` raises
     /// `UnsupportedOpcode` for them (via `unsupported_single_byte_opcode`); `decode` parses nothing
     /// extra. No IMPLEMENTED opcode routes here — `every_implemented_opcode_routes_off_the_legacy_fallback`
     /// locks that invariant.
