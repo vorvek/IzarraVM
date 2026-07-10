@@ -1,9 +1,12 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Parallel printer port as software sees it (LPT1 at base 0x378 on IRQ7, LPT2
-//! at 0x278 on IRQ5): the data latch, a status register that reports a printer
-//! that is always ready, and a control register with the strobe/init/IRQ-enable
-//! bits. Printed bytes are captured into an output sink on the strobe pulse, so a
-//! polled or interrupt INT 17h driver runs without ever blocking on a real
-//! printer.
+//! at 0x278 on IRQ5): the data latch, BUSY and -ACK phases, and a control
+//! register with the strobe/init/IRQ-enable bits. A strobe starts a short timed
+//! transfer. The byte and optional interrupt become visible on the -ACK edge.
+
+use izarravm_core::MASTER_CLOCK_HZ;
 
 const LPT1_BASE: u16 = 0x0378;
 const LPT2_BASE: u16 = 0x0278;
@@ -30,6 +33,16 @@ const CONTROL_STROBE: u8 = 0x01; // bit0 -Strobe
 const CONTROL_IRQ_ENABLE: u8 = 0x10; // bit4 ACK interrupt enable
 const CONTROL_RESERVED: u8 = 0xC0; // bits6-7 read as 1
 
+const BUSY_TICKS: u64 = MASTER_CLOCK_HZ / 100_000; // 10 us
+const ACK_TICKS: u64 = MASTER_CLOCK_HZ / 200_000; // 5 us
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrinterPhase {
+    Idle,
+    Busy { ticks: u64, byte: u8 },
+    Ack { ticks: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lpt {
     base: u16,             // first I/O port (0x378 for LPT1, 0x278 for LPT2)
@@ -38,6 +51,7 @@ pub struct Lpt {
     strobe_asserted: bool, // last seen strobe state, to capture once per pulse
     output: Vec<u8>,       // captured printed bytes
     irq_armed: bool,       // a strobed byte armed the -ACK IRQ edge
+    phase: PrinterPhase,
 }
 
 impl Default for Lpt {
@@ -49,6 +63,7 @@ impl Default for Lpt {
             strobe_asserted: false,
             output: Vec::new(),
             irq_armed: false,
+            phase: PrinterPhase::Idle,
         }
     }
 }
@@ -80,7 +95,7 @@ impl Lpt {
     pub fn read_port(&self, port: u16) -> Option<u8> {
         match port.checked_sub(self.base) {
             Some(0) => Some(self.data),
-            Some(1) => Some(STATUS_IDLE),
+            Some(1) => Some(self.status()),
             Some(2) => Some(self.control | CONTROL_RESERVED),
             _ => None,
         }
@@ -95,21 +110,79 @@ impl Lpt {
             Some(2) => {
                 self.control = value;
                 let strobe_now = value & CONTROL_STROBE != 0;
-                // Capture once on the de-asserted -> asserted edge of -Strobe.
-                if strobe_now && !self.strobe_asserted {
-                    self.output.push(self.data);
-                    // The -ACK pulse after the latched byte raises the port's IRQ
-                    // when the control register has IRQ-enable set.
-                    // Limit: instant printer, no real busy/ack timing window.
-                    if value & CONTROL_IRQ_ENABLE != 0 {
-                        self.irq_armed = true;
-                    }
+                // Latch once on the de-asserted -> asserted edge of -Strobe.
+                if strobe_now && !self.strobe_asserted && self.phase == PrinterPhase::Idle {
+                    self.phase = PrinterPhase::Busy {
+                        ticks: BUSY_TICKS,
+                        byte: self.data,
+                    };
                 }
                 self.strobe_asserted = strobe_now;
                 true
             }
             Some(1) => true, // status register is read-only; swallow writes
             _ => false,
+        }
+    }
+
+    fn status(&self) -> u8 {
+        match self.phase {
+            PrinterPhase::Idle => STATUS_IDLE,
+            PrinterPhase::Busy { .. } => STATUS_IDLE & !STATUS_NOT_BUSY,
+            PrinterPhase::Ack { .. } => STATUS_IDLE & !STATUS_NOT_ACK,
+        }
+    }
+
+    pub fn advance_master_ticks(&mut self, mut ticks: u64) {
+        while ticks > 0 {
+            let Some(deadline) = self.ticks_until_event() else {
+                break;
+            };
+            let step = ticks.min(deadline);
+            ticks -= step;
+            match &mut self.phase {
+                PrinterPhase::Busy { ticks, byte } => {
+                    *ticks -= step;
+                    if *ticks == 0 {
+                        self.output.push(*byte);
+                        if self.control & CONTROL_IRQ_ENABLE != 0 {
+                            self.irq_armed = true;
+                        }
+                        self.phase = PrinterPhase::Ack { ticks: ACK_TICKS };
+                    }
+                }
+                PrinterPhase::Ack { ticks } => {
+                    *ticks -= step;
+                    if *ticks == 0 {
+                        self.phase = PrinterPhase::Idle;
+                    }
+                }
+                PrinterPhase::Idle => break,
+            }
+        }
+    }
+
+    pub fn ticks_until_event(&self) -> Option<u64> {
+        match self.phase {
+            PrinterPhase::Idle => None,
+            PrinterPhase::Busy { ticks, .. } | PrinterPhase::Ack { ticks } => Some(ticks),
+        }
+    }
+
+    pub fn ticks_until_idle(&self) -> u64 {
+        match self.phase {
+            PrinterPhase::Idle => 0,
+            PrinterPhase::Busy { ticks, .. } => ticks.saturating_add(ACK_TICKS),
+            PrinterPhase::Ack { ticks } => ticks,
+        }
+    }
+
+    pub fn ticks_until_irq(&self) -> Option<u64> {
+        match self.phase {
+            PrinterPhase::Busy { ticks, .. } if self.control & CONTROL_IRQ_ENABLE != 0 => {
+                Some(ticks)
+            }
+            PrinterPhase::Idle | PrinterPhase::Busy { .. } | PrinterPhase::Ack { .. } => None,
         }
     }
 }

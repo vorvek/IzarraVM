@@ -640,6 +640,7 @@ fn int14_fossil_services_use_uart_and_bios_state() {
 
     m.serial.write_port(0x03fc, 0x10);
     m.serial.write_port(0x03f8, b'R');
+    m.advance_devices_ticks(m.serial.ticks_until_idle());
     m.cpu
         .registers
         .set_segment(SegmentIndex::Es, SegmentRegister::real(0x500));
