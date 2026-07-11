@@ -4117,6 +4117,13 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
             );
         }
     }
+    if case
+        .opcode
+        .first()
+        .is_some_and(|opcode| (0xd8..=0xdf).contains(opcode))
+    {
+        direct.fpu.push(1.25);
+    }
     let block = install_fixture_block(&mut direct, ENTRY);
     assert_eq!(
         block.raw_clocks(),

@@ -990,6 +990,7 @@ pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "jit_direct_reject_interrupt_shadow": perf.jit_direct_reject_interrupt_shadow,
         "jit_direct_reject_aggregate_accounting": perf.jit_direct_reject_aggregate_accounting,
         "jit_direct_reject_mode_key": perf.jit_direct_reject_mode_key,
+        "jit_direct_reject_x87_top": perf.jit_direct_reject_x87_top,
         "jit_direct_reject_cs_layout": perf.jit_direct_reject_cs_layout,
         "jit_direct_reject_cpl": perf.jit_direct_reject_cpl,
         "jit_direct_reject_data_segment": perf.jit_direct_reject_data_segment,
@@ -1025,7 +1026,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
          jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
          compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
          arena[compact/live/bytes/fail]={}/{}/{}/{}  \
-         gate[obs/shadow/agg/mode/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
+         gate[obs/shadow/agg/mode/top/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
          jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
         name,
         mode.canonical_name(),
@@ -1089,6 +1090,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.jit_direct_reject_interrupt_shadow,
         perf.jit_direct_reject_aggregate_accounting,
         perf.jit_direct_reject_mode_key,
+        perf.jit_direct_reject_x87_top,
         perf.jit_direct_reject_cs_layout,
         perf.jit_direct_reject_cpl,
         perf.jit_direct_reject_data_segment,

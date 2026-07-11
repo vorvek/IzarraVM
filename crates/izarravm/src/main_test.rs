@@ -47,6 +47,33 @@ fn cli_parses_munt_roms_and_stable_external_port_identity() {
 }
 
 #[test]
+fn cli_accepts_explicit_interpreter_backend() {
+    let cli = Cli::try_parse_from(["izarravm", "--interpreter"]).unwrap();
+    assert!(cli.interpreter);
+}
+
+#[test]
+fn execution_backend_requires_avx2_only_for_native_builds() {
+    assert_eq!(
+        requested_execution_backend(false, true, true),
+        Ok(ExecutionBackend::Automatic)
+    );
+    assert!(
+        requested_execution_backend(false, true, false)
+            .unwrap_err()
+            .contains("AVX2")
+    );
+    assert_eq!(
+        requested_execution_backend(true, true, false),
+        Ok(ExecutionBackend::Interpreter)
+    );
+    assert_eq!(
+        requested_execution_backend(false, false, false),
+        Ok(ExecutionBackend::Interpreter)
+    );
+}
+
+#[test]
 fn cli_accepts_hdd_folder_profile_json_output() {
     let cli = Cli::try_parse_from([
         "izarravm",
@@ -139,6 +166,7 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
         "jit_direct_reject_interrupt_shadow",
         "jit_direct_reject_aggregate_accounting",
         "jit_direct_reject_mode_key",
+        "jit_direct_reject_x87_top",
         "jit_direct_reject_cs_layout",
         "jit_direct_reject_cpl",
         "jit_direct_reject_data_segment",

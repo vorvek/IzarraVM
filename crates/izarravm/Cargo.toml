@@ -11,8 +11,8 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-# Build the binary with the CPU template JIT. `--no-default-features` keeps the interpreter-only
-# binary; `IZARRAVM_JIT=0` disables admission in a default build.
+# Build the binary with native CPU translation. `--no-default-features` keeps an
+# interpreter-only build, while the release binary accepts `--interpreter` at launch.
 default = ["jit"]
 jit = ["izarravm-cpu/jit", "izarravm-machine/jit"]
 

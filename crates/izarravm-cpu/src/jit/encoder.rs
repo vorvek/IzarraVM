@@ -74,6 +74,37 @@ impl Xmm {
     }
 }
 
+/// A host x86-64 AVX register in the standard YMM0-YMM15 encoding order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ymm(pub u8);
+
+impl Ymm {
+    pub const YMM0: Ymm = Ymm(0);
+    pub const YMM1: Ymm = Ymm(1);
+    pub const YMM2: Ymm = Ymm(2);
+    pub const YMM3: Ymm = Ymm(3);
+    pub const YMM4: Ymm = Ymm(4);
+    pub const YMM5: Ymm = Ymm(5);
+    pub const YMM6: Ymm = Ymm(6);
+    pub const YMM7: Ymm = Ymm(7);
+    pub const YMM8: Ymm = Ymm(8);
+    pub const YMM9: Ymm = Ymm(9);
+    pub const YMM10: Ymm = Ymm(10);
+    pub const YMM11: Ymm = Ymm(11);
+    pub const YMM12: Ymm = Ymm(12);
+    pub const YMM13: Ymm = Ymm(13);
+    pub const YMM14: Ymm = Ymm(14);
+    pub const YMM15: Ymm = Ymm(15);
+
+    fn low3(self) -> u8 {
+        self.0 & 0x7
+    }
+
+    fn ext(self) -> bool {
+        self.0 >= 8
+    }
+}
+
 /// A forward- or backward-reference point in the emitted byte stream. `Encoder::label()`
 /// creates one (its position is filled in once it is actually placed by `Encoder::place`);
 /// `Encoder::jcc`/`Encoder::jmp` reference one before it may be placed (a forward jump), and the
@@ -97,6 +128,27 @@ struct Patch {
     instr_start: usize,
     kind: PatchKind,
     target: Label,
+}
+
+#[derive(Clone, Copy)]
+struct VexOp {
+    map: u8,
+    pp: u8,
+    w: bool,
+    vector_256: bool,
+    opcode: u8,
+}
+
+impl VexOp {
+    const fn new(map: u8, pp: u8, w: bool, vector_256: bool, opcode: u8) -> Self {
+        Self {
+            map,
+            pp,
+            w,
+            vector_256,
+            opcode,
+        }
+    }
 }
 
 pub(crate) struct Encoder {
@@ -186,6 +238,64 @@ impl Encoder {
         self.modrm(0b10, xmm.low3(), 0b100);
         self.bytes
             .push((0b11 << 6) | (index.low3() << 3) | base.low3());
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// Emit the shortest valid VEX prefix for the requested fields. `src1` is the logical
+    /// register encoded through the inverted vvvv field. `None` emits raw vvvv=1111, as required
+    /// by instructions where that field is reserved.
+    fn vex_prefix(
+        &mut self,
+        op: VexOp,
+        reg_ext: bool,
+        index_ext: bool,
+        rm_ext: bool,
+        src1: Option<u8>,
+    ) {
+        assert!(
+            (1..=3).contains(&op.map),
+            "VEX map must be 0F, 0F38, or 0F3A"
+        );
+        assert!(op.pp < 4, "VEX mandatory-prefix field must fit two bits");
+        if let Some(src1) = src1 {
+            assert!(src1 < 16, "VEX vvvv source must be XMM0-XMM15");
+        }
+        let encoded_vvvv = src1.map_or(0x0f, |register| (!register) & 0x0f);
+        let third =
+            (u8::from(op.w) << 7) | (encoded_vvvv << 3) | (u8::from(op.vector_256) << 2) | op.pp;
+
+        // VEX2 fixes X, B, and W to zero and selects the 0F opcode map. High ModRM.reg values
+        // remain available through its inverted R bit.
+        if op.map == 1 && !op.w && !index_ext && !rm_ext {
+            self.bytes.push(0xc5);
+            self.bytes.push((u8::from(!reg_ext) << 7) | (third & 0x7f));
+        } else {
+            self.bytes.push(0xc4);
+            self.bytes.push(
+                (u8::from(!reg_ext) << 7)
+                    | (u8::from(!index_ext) << 6)
+                    | (u8::from(!rm_ext) << 5)
+                    | op.map,
+            );
+            self.bytes.push(third);
+        }
+    }
+
+    fn vex_reg_rm(&mut self, op: VexOp, reg: u8, src1: Option<u8>, rm: u8) {
+        assert!(reg < 16 && rm < 16, "VEX register must be below 16");
+        self.vex_prefix(op, reg >= 8, false, rm >= 8, src1);
+        self.bytes.push(op.opcode);
+        self.modrm(0b11, reg & 7, rm & 7);
+    }
+
+    fn vex_mem_disp32(&mut self, op: VexOp, reg: u8, src1: Option<u8>, base: Reg, disp32: i32) {
+        assert!(reg < 16, "VEX ModRM.reg must be below 16");
+        self.vex_prefix(op, reg >= 8, false, base.ext(), src1);
+        self.bytes.push(op.opcode);
+        self.modrm(0b10, reg & 7, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
         self.bytes.extend_from_slice(&disp32.to_le_bytes());
     }
 
@@ -943,6 +1053,299 @@ impl Encoder {
     /// `bts word [base], index16` (66 + 0F AB /r).
     pub(crate) fn bts_r16_mem(&mut self, base: Reg, index: Reg) {
         self.bit_r16_mem(0xAB, base, index);
+    }
+
+    /// `vmovupd dst, ymmword [base + disp32]`.
+    pub(crate) fn vmovupd_ymm_disp32(&mut self, dst: Ymm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 1, false, true, 0x10),
+            dst.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vmovupd ymmword [base + disp32], src`.
+    pub(crate) fn vmovupd_disp32_ymm(&mut self, base: Reg, disp32: i32, src: Ymm) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 1, false, true, 0x11),
+            src.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vmovupd dst, xmmword [base + disp32]`.
+    pub(crate) fn vmovupd_xmm_disp32(&mut self, dst: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 1, false, false, 0x10),
+            dst.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vmovupd xmmword [base + disp32], src`.
+    pub(crate) fn vmovupd_disp32_xmm(&mut self, base: Reg, disp32: i32, src: Xmm) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 1, false, false, 0x11),
+            src.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vpermpd dst, src, imm8`.
+    pub(crate) fn vpermpd(&mut self, dst: Ymm, src: Ymm, imm: u8) {
+        self.vex_reg_rm(VexOp::new(3, 1, true, true, 0x01), dst.0, None, src.0);
+        self.bytes.push(imm);
+    }
+
+    /// `vblendpd dst, src1, src2, imm8`.
+    pub(crate) fn vblendpd(&mut self, dst: Ymm, src1: Ymm, src2: Ymm, imm: u8) {
+        self.vex_reg_rm(
+            VexOp::new(3, 1, false, true, 0x0d),
+            dst.0,
+            Some(src1.0),
+            src2.0,
+        );
+        self.bytes.push(imm);
+    }
+
+    /// `vbroadcastsd dst, src`. The register-source form requires AVX2.
+    pub(crate) fn vbroadcastsd(&mut self, dst: Ymm, src: Xmm) {
+        self.vex_reg_rm(VexOp::new(2, 1, false, true, 0x19), dst.0, None, src.0);
+    }
+
+    fn vex_scalar_binary(&mut self, opcode: u8, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_reg_rm(
+            VexOp::new(1, 3, false, false, opcode),
+            dst.0,
+            Some(src1.0),
+            src2.0,
+        );
+    }
+
+    /// `vaddsd dst, src1, src2`.
+    pub(crate) fn vaddsd(&mut self, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_scalar_binary(0x58, dst, src1, src2);
+    }
+
+    /// `vmulsd dst, src1, src2`.
+    pub(crate) fn vmulsd(&mut self, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_scalar_binary(0x59, dst, src1, src2);
+    }
+
+    /// `vsubsd dst, src1, src2`.
+    pub(crate) fn vsubsd(&mut self, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_scalar_binary(0x5c, dst, src1, src2);
+    }
+
+    /// `vdivsd dst, src1, src2`.
+    pub(crate) fn vdivsd(&mut self, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_scalar_binary(0x5e, dst, src1, src2);
+    }
+
+    /// `vucomisd lhs, rhs`.
+    pub(crate) fn vucomisd(&mut self, lhs: Xmm, rhs: Xmm) {
+        self.vex_reg_rm(VexOp::new(1, 1, false, false, 0x2e), lhs.0, None, rhs.0);
+    }
+
+    /// `vmovsd dst, merge, src`.
+    pub(crate) fn vmovsd_xmm_xmm(&mut self, dst: Xmm, merge: Xmm, src: Xmm) {
+        self.vex_reg_rm(
+            VexOp::new(1, 3, false, false, 0x10),
+            dst.0,
+            Some(merge.0),
+            src.0,
+        );
+    }
+
+    /// `vmovsd dst, qword [base + disp32]`.
+    pub(crate) fn vmovsd_xmm_disp32(&mut self, dst: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 3, false, false, 0x10),
+            dst.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vmovsd qword [base + disp32], src`.
+    pub(crate) fn vmovsd_disp32_xmm(&mut self, base: Reg, disp32: i32, src: Xmm) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 3, false, false, 0x11),
+            src.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vmovss dst, merge, src`.
+    pub(crate) fn vmovss_xmm_xmm(&mut self, dst: Xmm, merge: Xmm, src: Xmm) {
+        self.vex_reg_rm(
+            VexOp::new(1, 2, false, false, 0x10),
+            dst.0,
+            Some(merge.0),
+            src.0,
+        );
+    }
+
+    /// `vmovss dst, dword [base + disp32]`.
+    pub(crate) fn vmovss_xmm_disp32(&mut self, dst: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 2, false, false, 0x10),
+            dst.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vmovss dword [base + disp32], src`.
+    pub(crate) fn vmovss_disp32_xmm(&mut self, base: Reg, disp32: i32, src: Xmm) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 2, false, false, 0x11),
+            src.0,
+            None,
+            base,
+            disp32,
+        );
+    }
+
+    /// `vroundsd dst, merge, src, imm8`.
+    pub(crate) fn vroundsd(&mut self, dst: Xmm, merge: Xmm, src: Xmm, imm: u8) {
+        self.vex_reg_rm(
+            VexOp::new(3, 1, false, false, 0x0b),
+            dst.0,
+            Some(merge.0),
+            src.0,
+        );
+        self.bytes.push(imm);
+    }
+
+    /// `vcvtss2sd dst, merge, src`.
+    pub(crate) fn vcvtss2sd(&mut self, dst: Xmm, merge: Xmm, src: Xmm) {
+        self.vex_reg_rm(
+            VexOp::new(1, 2, false, false, 0x5a),
+            dst.0,
+            Some(merge.0),
+            src.0,
+        );
+    }
+
+    /// `vcvtss2sd dst, merge, dword [base + disp32]`.
+    pub(crate) fn vcvtss2sd_disp32(&mut self, dst: Xmm, merge: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 2, false, false, 0x5a),
+            dst.0,
+            Some(merge.0),
+            base,
+            disp32,
+        );
+    }
+
+    /// `vcvtsd2ss dst, merge, src`.
+    pub(crate) fn vcvtsd2ss(&mut self, dst: Xmm, merge: Xmm, src: Xmm) {
+        self.vex_reg_rm(
+            VexOp::new(1, 3, false, false, 0x5a),
+            dst.0,
+            Some(merge.0),
+            src.0,
+        );
+    }
+
+    /// `vcvtsd2ss dst, merge, qword [base + disp32]`.
+    pub(crate) fn vcvtsd2ss_disp32(&mut self, dst: Xmm, merge: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 3, false, false, 0x5a),
+            dst.0,
+            Some(merge.0),
+            base,
+            disp32,
+        );
+    }
+
+    fn vcvtsi2sd_reg(&mut self, dst: Xmm, merge: Xmm, src: Reg, wide: bool) {
+        self.vex_reg_rm(
+            VexOp::new(1, 3, wide, false, 0x2a),
+            dst.0,
+            Some(merge.0),
+            src.0,
+        );
+    }
+
+    /// `vcvtsi2sd dst, merge, src32`.
+    pub(crate) fn vcvtsi2sd_r32(&mut self, dst: Xmm, merge: Xmm, src: Reg) {
+        self.vcvtsi2sd_reg(dst, merge, src, false);
+    }
+
+    /// `vcvtsi2sd dst, merge, src64`.
+    pub(crate) fn vcvtsi2sd_r64(&mut self, dst: Xmm, merge: Xmm, src: Reg) {
+        self.vcvtsi2sd_reg(dst, merge, src, true);
+    }
+
+    /// `vcvtsi2sd dst, merge, dword [base + disp32]`.
+    pub(crate) fn vcvtsi2sd_i32_disp32(&mut self, dst: Xmm, merge: Xmm, base: Reg, disp32: i32) {
+        self.vex_mem_disp32(
+            VexOp::new(1, 3, false, false, 0x2a),
+            dst.0,
+            Some(merge.0),
+            base,
+            disp32,
+        );
+    }
+
+    fn vcvttsd2si(&mut self, dst: Reg, src: Xmm, wide: bool) {
+        self.vex_reg_rm(VexOp::new(1, 3, wide, false, 0x2c), dst.0, None, src.0);
+    }
+
+    /// `vcvttsd2si dst32, src`.
+    pub(crate) fn vcvttsd2si_r32(&mut self, dst: Reg, src: Xmm) {
+        self.vcvttsd2si(dst, src, false);
+    }
+
+    /// `vcvttsd2si dst64, src`.
+    pub(crate) fn vcvttsd2si_r64(&mut self, dst: Reg, src: Xmm) {
+        self.vcvttsd2si(dst, src, true);
+    }
+
+    /// `vmovq dst, src64`.
+    pub(crate) fn vmovq_xmm_r64(&mut self, dst: Xmm, src: Reg) {
+        self.vex_reg_rm(VexOp::new(1, 1, true, false, 0x6e), dst.0, None, src.0);
+    }
+
+    /// `vmovq dst64, src`.
+    pub(crate) fn vmovq_r64_xmm(&mut self, dst: Reg, src: Xmm) {
+        self.vex_reg_rm(VexOp::new(1, 1, true, false, 0x7e), src.0, None, dst.0);
+    }
+
+    /// `vxorpd dst, src1, src2`.
+    pub(crate) fn vxorpd(&mut self, dst: Xmm, src1: Xmm, src2: Xmm) {
+        self.vex_reg_rm(
+            VexOp::new(1, 1, false, false, 0x57),
+            dst.0,
+            Some(src1.0),
+            src2.0,
+        );
+    }
+
+    /// End an AVX block before returning to code that may use legacy SSE.
+    pub(crate) fn vzeroupper(&mut self) {
+        self.vex_prefix(
+            VexOp::new(1, 0, false, false, 0x77),
+            false,
+            false,
+            false,
+            None,
+        );
+        self.bytes.push(0x77);
     }
 
     /// `movsd dst, qword [base + disp32]` (F2 + 0F 10 /r).

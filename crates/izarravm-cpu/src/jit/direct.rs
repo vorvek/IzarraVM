@@ -14,6 +14,8 @@ use std::{
 use izarravm_core::CpuPersona;
 
 use super::code_watch::NativeCodeWatch;
+#[cfg(target_os = "windows")]
+use super::encoder::Xmm;
 use super::encoder::{Encoder, Label, Reg};
 use super::exec_mem::ExecutableArena;
 use super::native_x87::{NativeX87Insn, NativeX87MemoryDirection};
@@ -21,7 +23,9 @@ use super::native_x87::{NativeX87Insn, NativeX87MemoryDirection};
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-use super::x87_emit::{NativeX87EmitContext, emit_native_x87};
+use super::x87_avx2_emit::{
+    Avx2X87EmitContext, emit_enter as emit_x87_enter, emit_native_x87, emit_spill as emit_x87_spill,
+};
 use crate::{
     AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, Prefixes,
     Registers, SegmentIndex, SegmentRegister, U32BuildHasher,
@@ -278,6 +282,8 @@ pub(crate) struct CompiledBlock {
     has_wide_accesses: bool,
     self_loop: bool,
     has_x87: bool,
+    x87_entry_top: u8,
+    x87_exit_top: u8,
     successors: [Option<LinkTarget>; 2],
 }
 
@@ -366,10 +372,15 @@ impl CompiledBlock {
         self.has_x87
     }
 
+    pub(crate) fn x87_entry_top(&self) -> Option<u8> {
+        self.has_x87.then_some(self.x87_entry_top)
+    }
+
     fn link_compatible(self, target: Self) -> bool {
         self.span.key.mode_key == target.span.key.mode_key
             && self.memory_cpl3 == target.memory_cpl3
             && self.has_x87 == target.has_x87
+            && (!self.has_x87 || self.x87_exit_top == target.x87_entry_top)
             && self.segment_layout.link_compatible(target.segment_layout)
     }
 }
@@ -602,6 +613,8 @@ impl BlockCache {
             has_wide_accesses: compilation.has_wide_accesses,
             self_loop: compilation.self_loop,
             has_x87: compilation.has_x87,
+            x87_entry_top: compilation.x87_entry_top,
+            x87_exit_top: compilation.x87_exit_top,
             successors: compilation.successors,
         };
         if index == self.blocks.len() {
@@ -1267,6 +1280,8 @@ pub(crate) struct Compilation {
     pub has_wide_accesses: bool,
     pub self_loop: bool,
     pub has_x87: bool,
+    pub x87_entry_top: u8,
+    pub x87_exit_top: u8,
     successors: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
     body_offset: usize,
@@ -1915,6 +1930,10 @@ const EXIT_ARG: Reg = Reg::R9;
 const EXIT_ARG: Reg = Reg::RCX;
 
 const NATIVE_STACK_LEN: u32 = 160;
+#[cfg(target_os = "windows")]
+const AVX2_X87_STACK_LEN: u32 = NATIVE_STACK_LEN + 8 + 6 * 16;
+#[cfg(not(target_os = "windows"))]
+const AVX2_X87_STACK_LEN: u32 = NATIVE_STACK_LEN;
 const STACK_QUOTA: i8 = 0;
 const STACK_ITERATIONS: i8 = 8;
 const STACK_RAM_BYTE_WRITES: i8 = 16;
@@ -1999,7 +2018,9 @@ fn dynamic_counter_fields() -> [(u16, i8, usize); 7] {
 }
 
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
-    if !super::HOST_SUPPORTED || !d || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586)
+    if !super::host_supported()
+        || !d
+        || !matches!(cpu.persona(), CpuPersona::I486 | CpuPersona::I586)
     {
         return None;
     }
@@ -2035,6 +2056,8 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
     let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
+    let x87_entry_top = cpu.fpu.top();
+    let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
 
     while slots.len() < MAX_BLOCK_INSTRUCTIONS {
@@ -2110,6 +2133,9 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         }
         stack_accesses += u8::from(kind.uses_stack());
         x87_slots += u8::from(kind.is_x87());
+        if let DirectKind::X87 { insn, .. } = kind {
+            x87_exit_top = insn.advance_top(x87_exit_top);
+        }
         memory_alu_slots += u8::from(kind.is_memory_alu());
         raw_clocks += kind.raw_clocks();
         let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
@@ -2157,6 +2183,9 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         slots.last().map(|slot| slot.kind),
         Some(DirectKind::Jcc { taken_delta: 0, .. })
     );
+    if self_loop && x87_slots != 0 && x87_entry_top != x87_exit_top {
+        return None;
+    }
     #[cfg(all(
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
@@ -2244,6 +2273,7 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         word_stores,
         dword_stores,
         self_loop,
+        x87_entry_top: (x87_slots != 0).then_some(x87_entry_top),
         memory: MemoryEmitContext {
             map: map_bases,
             code_watch_tables,
@@ -2272,6 +2302,8 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         has_wide_accesses,
         self_loop,
         has_x87: x87_slots != 0,
+        x87_entry_top,
+        x87_exit_top,
         successors,
         link_cells,
         body_offset: emitted.body_offset,
@@ -2773,6 +2805,7 @@ struct EmitInput<'a> {
     word_stores: u8,
     dword_stores: u8,
     self_loop: bool,
+    x87_entry_top: Option<u8>,
     memory: MemoryEmitContext,
     link_cell_ptrs: [usize; 2],
 }
@@ -2857,6 +2890,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         word_stores,
         dword_stores,
         self_loop,
+        x87_entry_top,
         memory,
         link_cell_ptrs,
     } = input;
@@ -2872,7 +2906,20 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     for reg in SAVED_HOST_REGS {
         e.push(reg);
     }
-    e.sub_r64_imm32(Reg::RSP, NATIVE_STACK_LEN);
+    #[cfg(target_os = "windows")]
+    if x87_entry_top.is_some() {
+        e.push(Reg::RSI);
+    }
+    let native_stack_len = if x87_entry_top.is_some() {
+        AVX2_X87_STACK_LEN
+    } else {
+        NATIVE_STACK_LEN
+    };
+    e.sub_r64_imm32(Reg::RSP, native_stack_len);
+    #[cfg(target_os = "windows")]
+    if x87_entry_top.is_some() {
+        emit_save_x87_host_xmms(&mut e);
+    }
     e.mov_r64_r64(Reg::R15, CPU_ARG);
     e.mov_r32_r32(Reg::RBP, FLAGS_ARG);
     e.mov_r64_r64(Reg::RAX, EXIT_ARG);
@@ -2896,6 +2943,18 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     for (index, home) in GUEST_HOMES.into_iter().enumerate() {
         e.load_r32_disp32(home, Reg::R15, gpr_offset(index));
     }
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    if x87_entry_top.is_some() {
+        emit_x87_enter(&mut e, Reg::R15);
+    }
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )))]
+    debug_assert!(x87_entry_top.is_none());
     let loop_entry = e.label();
     let body_offset = e.position();
     e.place(loop_entry);
@@ -2912,6 +2971,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     let self_loop_return = self_loop.then(|| e.label());
     let mut terminal = false;
     let mut x87_gate_emitted = false;
+    let mut current_x87_top = x87_entry_top;
     for slot in slots {
         match slot.kind {
             DirectKind::MovReg { dst, src, width } => match width {
@@ -3200,6 +3260,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 let side = e.label();
                 let eligibility = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, addr);
+                let top = current_x87_top.expect("x87 block must carry an entry TOP");
                 // Every exceptional fast-path result exits before changing x87 state, so a
                 // successful x87 instruction cannot make #MF pending for the next slot.
                 emit_x87_slot(
@@ -3208,9 +3269,13 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                     addr,
                     memory,
                     reasons,
-                    eligibility,
-                    !x87_gate_emitted,
+                    X87SlotEmitState {
+                        eligibility_side: eligibility,
+                        check_gate: !x87_gate_emitted,
+                        top,
+                    },
                 );
+                current_x87_top = Some(insn.advance_top(top));
                 x87_gate_emitted = true;
                 if let Some(access) = insn.metadata().memory {
                     reasons.append_stubs(
@@ -3479,8 +3544,19 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         e.jmp(shared_return);
     }
     e.place(shared_return);
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    if x87_entry_top.is_some() {
+        emit_x87_spill(&mut e, Reg::R15);
+    }
+    #[cfg(target_os = "windows")]
+    if x87_entry_top.is_some() {
+        emit_restore_x87_host_xmms(&mut e);
+    }
     emit_store_homes(&mut e);
-    emit_return(&mut e, COUNTER_ALL);
+    emit_return(&mut e, COUNTER_ALL, x87_entry_top.is_some());
     debug_assert_eq!(usize::from(completed), slots.len());
     debug_assert_eq!(u32::from(completed_raw), raw_clocks);
     debug_assert_eq!(completed_weighted_fp_clocks, weighted_fp_clocks);
@@ -3777,6 +3853,13 @@ fn emit_load(
     }
 }
 
+#[derive(Clone, Copy)]
+struct X87SlotEmitState {
+    eligibility_side: Label,
+    check_gate: bool,
+    top: u8,
+}
+
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
@@ -3787,8 +3870,7 @@ fn emit_x87_slot(
     addr: Option<DirectAddr>,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
-    eligibility_side: Label,
-    check_gate: bool,
+    state: X87SlotEmitState,
 ) {
     let access = insn.metadata().memory;
     if let Some(access) = access {
@@ -3803,11 +3885,12 @@ fn emit_x87_slot(
     emit_native_x87(
         e,
         insn,
-        NativeX87EmitContext {
+        Avx2X87EmitContext {
             cpu: Reg::R15,
             memory: access.map(|_| Reg::RDI),
-            side_exit: eligibility_side,
-            check_gate,
+            side_exit: state.eligibility_side,
+            check_gate: state.check_gate,
+            top: state.top,
         },
     );
     if let Some(access) = access {
@@ -3829,8 +3912,7 @@ fn emit_x87_slot(
     _: Option<DirectAddr>,
     _: MemoryEmitContext,
     _: MemorySideExits,
-    _: Label,
-    _: bool,
+    _: X87SlotEmitState,
 ) {
     unreachable!("direct x87 lowering is x86-64-only")
 }
@@ -5354,7 +5436,31 @@ fn emit_store_homes(e: &mut Encoder) {
     }
 }
 
-fn emit_return(e: &mut Encoder, counter_mask: u16) {
+#[cfg(target_os = "windows")]
+const X87_NONVOLATILE_XMMS: [Xmm; 6] = [
+    Xmm::XMM6,
+    Xmm::XMM7,
+    Xmm::XMM8,
+    Xmm::XMM9,
+    Xmm::XMM10,
+    Xmm::XMM11,
+];
+
+#[cfg(target_os = "windows")]
+fn emit_save_x87_host_xmms(e: &mut Encoder) {
+    for (index, xmm) in X87_NONVOLATILE_XMMS.into_iter().enumerate() {
+        e.vmovupd_disp32_xmm(Reg::RSP, NATIVE_STACK_LEN as i32 + (index as i32) * 16, xmm);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn emit_restore_x87_host_xmms(e: &mut Encoder) {
+    for (index, xmm) in X87_NONVOLATILE_XMMS.into_iter().enumerate() {
+        e.vmovupd_xmm_disp32(xmm, Reg::RSP, NATIVE_STACK_LEN as i32 + (index as i32) * 16);
+    }
+}
+
+fn emit_return(e: &mut Encoder, counter_mask: u16, cached_x87: bool) {
     e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_EXIT);
     for (bit, stack_offset, output_offset) in dynamic_counter_fields() {
         if counter_mask & bit != 0 {
@@ -5387,7 +5493,16 @@ fn emit_return(e: &mut Encoder, counter_mask: u16) {
         e.load_r64_disp8(Reg::RAX, Reg::RSP, stack_offset);
         e.store_r64_disp32(Reg::RDI, output_offset as i32, Reg::RAX);
     }
-    e.add_r64_imm32(Reg::RSP, NATIVE_STACK_LEN);
+    let native_stack_len = if cached_x87 {
+        AVX2_X87_STACK_LEN
+    } else {
+        NATIVE_STACK_LEN
+    };
+    e.add_r64_imm32(Reg::RSP, native_stack_len);
+    #[cfg(target_os = "windows")]
+    if cached_x87 {
+        e.pop(Reg::RSI);
+    }
     for reg in SAVED_HOST_REGS.into_iter().rev() {
         e.pop(reg);
     }
@@ -5423,6 +5538,8 @@ mod tests {
             has_wide_accesses: false,
             self_loop: false,
             has_x87: false,
+            x87_entry_top: 0,
+            x87_exit_top: 0,
             successors: [None, None],
             link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
             body_offset: 0,

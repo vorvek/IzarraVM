@@ -26,6 +26,38 @@ mod run;
 mod strings;
 pub use fpu::X87;
 
+/// Whether this build contains the native x64 execution backend.
+///
+/// Windows and Linux x86-64 are the release targets for native execution.
+/// Other targets and interpreter-only builds keep using the portable core.
+pub const NATIVE_BACKEND_COMPILED: bool = cfg!(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+));
+
+/// Whether the host can execute the native backend in this build.
+///
+/// The x64 translator is allowed to emit AVX2 unconditionally. Callers which
+/// admit native blocks must check this once before enabling the backend.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub fn native_backend_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+pub fn native_backend_available() -> bool {
+    false
+}
+
 pub use flags::PendingFlags;
 pub(crate) use flags::{
     FLAG_AC, FLAG_AF, FLAG_CF, FLAG_DF, FLAG_ID, FLAG_IF, FLAG_IOPL, FLAG_NT, FLAG_OF, FLAG_PF,
@@ -559,6 +591,7 @@ pub struct PerfCounters {
     pub jit_direct_reject_interrupt_shadow: u64,
     pub jit_direct_reject_aggregate_accounting: u64,
     pub jit_direct_reject_mode_key: u64,
+    pub jit_direct_reject_x87_top: u64,
     pub jit_direct_reject_cs_layout: u64,
     pub jit_direct_reject_cpl: u64,
     pub jit_direct_reject_data_segment: u64,
