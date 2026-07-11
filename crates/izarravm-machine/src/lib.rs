@@ -28,6 +28,7 @@ use izarravm_video::{
 pub use izarravm_video::{MARGO_ID_VALUE, VideoMode};
 #[cfg(test)]
 use izarravm_video::{Margo, Vga, VgaRaster};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 mod ata;
@@ -174,6 +175,37 @@ pub enum MachineError {
     InvalidRomSize(usize),
     #[error("boot image must be exactly 1.44 MiB, got {0} bytes")]
     InvalidBootImageSize(usize),
+}
+
+/// Process default for CPU execution in machines constructed afterwards.
+///
+/// The application selects this once before it creates worker threads. Library
+/// users keep automatic native admission unless they explicitly opt into the
+/// interpreter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionBackend {
+    #[default]
+    Automatic,
+    Interpreter,
+}
+
+static PROCESS_INTERPRETER_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Set the execution backend inherited by subsequently constructed machines.
+pub fn set_process_execution_backend(backend: ExecutionBackend) {
+    PROCESS_INTERPRETER_ONLY.store(
+        matches!(backend, ExecutionBackend::Interpreter),
+        Ordering::Release,
+    );
+}
+
+/// Return the execution backend currently inherited by new machines.
+pub fn process_execution_backend() -> ExecutionBackend {
+    if PROCESS_INTERPRETER_ONLY.load(Ordering::Acquire) {
+        ExecutionBackend::Interpreter
+    } else {
+        ExecutionBackend::Automatic
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -953,18 +985,21 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
-fn jit_auto_admit_policy(value: Option<&str>, jit_available: bool) -> bool {
-    jit_available && !matches!(value, Some("" | "0"))
+fn jit_auto_admit_policy(
+    value: Option<&str>,
+    jit_available: bool,
+    backend: ExecutionBackend,
+) -> bool {
+    backend == ExecutionBackend::Automatic && jit_available && !matches!(value, Some("" | "0"))
 }
 
 fn jit_auto_admit_default() -> bool {
     let value = std::env::var("IZARRAVM_JIT").ok();
-    let jit_available = cfg!(feature = "jit")
-        && cfg!(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ));
-    jit_auto_admit_policy(value.as_deref(), jit_available)
+    jit_auto_admit_policy(
+        value.as_deref(),
+        izarravm_cpu::native_backend_available(),
+        process_execution_backend(),
+    )
 }
 
 impl Machine {

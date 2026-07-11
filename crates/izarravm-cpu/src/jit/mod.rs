@@ -1,14 +1,12 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Template JIT (default feature `jit`). The interpreter remains the source of
-//! truth and the fallback everywhere; a compiled loop-region's only legal observable is wall
-//! time. Non-(Windows|Linux)-x86-64 hosts compile nothing and run the interpreter unchanged.
+//! Direct native execution for AVX2-capable Windows and Linux x86-64 hosts. The interpreter
+//! remains the architectural reference and can be selected explicitly for diagnostics.
 
-pub(crate) const HOST_SUPPORTED: bool = cfg!(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-));
+pub(crate) fn host_supported() -> bool {
+    crate::native_backend_available()
+}
 
 pub(crate) mod block;
 #[cfg(all(
@@ -32,6 +30,6 @@ pub(crate) mod step;
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-pub(crate) mod x87_emit;
+pub(crate) mod x87_avx2_emit;
 
 pub(crate) use region::RegionTable;

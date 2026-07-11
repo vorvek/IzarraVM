@@ -631,13 +631,13 @@ impl CpuGsw {
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
         self.jit_regions.set_auto_admit(false);
-        self.jit_direct.set_auto_admit(on && jit::HOST_SUPPORTED);
+        self.jit_direct.set_auto_admit(on && jit::host_supported());
     }
 
     #[cfg(all(feature = "jit", test))]
     pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
         self.jit_direct.set_auto_admit(false);
-        self.jit_regions.set_auto_admit(on && jit::HOST_SUPPORTED);
+        self.jit_regions.set_auto_admit(on && jit::host_supported());
         #[cfg(all(
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
@@ -788,6 +788,14 @@ impl CpuGsw {
         let span = block.span();
         if span.key.mode_key != self.jit_mode_key() {
             self.perf.jit_direct_reject_mode_key += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        if block
+            .x87_entry_top()
+            .is_some_and(|expected| self.fpu.top() != expected)
+        {
+            self.perf.jit_direct_reject_x87_top += 1;
+            self.jit_direct.retire_key_for_recompile(span.key);
             return Ok(DirectBlockOutcome::NotRun);
         }
         if !block.cs_descriptor_matches(self) {

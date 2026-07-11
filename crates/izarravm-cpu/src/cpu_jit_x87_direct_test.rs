@@ -154,6 +154,154 @@ fn quake_hot_x87_sequence_matches_interpreter_in_486_and_586_modes() {
     }
 }
 
+#[test]
+fn linked_x87_blocks_keep_stack_state_resident_and_validate_root_top() {
+    const SECOND: u32 = ENTRY + 24;
+    const END: u32 = SECOND + 28;
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let first = [
+        0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89,
+        0xc0, 0x89, 0xc0, 0x89, 0xc0, 0x89, 0xc0, // eleven mov eax,eax
+        0xd9, 0xe8, // fld1
+    ];
+    let second = [
+        0xd9, 0x1d, 0x00, 0x02, 0x00, 0x00, // fstp dword [0x200]
+        0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, 0x89,
+        0xdb, 0x89, 0xdb, 0x89, 0xdb, 0x89, 0xdb, // eleven mov ebx,ebx
+    ];
+    memory[ENTRY as usize..SECOND as usize].copy_from_slice(&first);
+    memory[SECOND as usize..END as usize].copy_from_slice(&second);
+    memory[END as usize] = 0xf4;
+
+    let mut native = x87_cpu(GswMode::Gsw586);
+    let mut interpreter = x87_cpu(GswMode::Gsw586);
+    let mut native_bus = direct_memory(memory.clone());
+    let mut interpreter_bus = direct_memory(memory.clone());
+    arm(&mut native, 0x0f7f);
+    run_to_halt(&mut native, &mut native_bus);
+    arm(&mut interpreter, 0x0f7f);
+    run_to_halt(&mut interpreter, &mut interpreter_bus);
+
+    arm(&mut native, 0x0f7f);
+    let first_key = jit::direct::key_for(&native, ENTRY, true).expect("first x87 block key");
+    assert!(matches!(
+        native.jit_direct.probe(first_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let first_compilation =
+        jit::direct::compile(&mut native, ENTRY, true).expect("first x87 block");
+    assert_eq!(first_compilation.span.instructions, 12);
+    assert_eq!(first_compilation.x87_entry_top, 0);
+    assert_eq!(first_compilation.x87_exit_top, 7);
+    let first_id = native
+        .jit_direct
+        .install(&first_compilation)
+        .expect("first x87 block install");
+    let first_block = native
+        .jit_direct
+        .block(first_id)
+        .expect("first x87 block remains live");
+
+    native.fpu.dec_top();
+    let second_key = jit::direct::key_for(&native, SECOND, true).expect("second x87 block key");
+    assert!(matches!(
+        native.jit_direct.probe(second_key),
+        jit::direct::BlockProbe::Interpret
+    ));
+    let second_compilation =
+        jit::direct::compile(&mut native, SECOND, true).expect("second x87 block");
+    assert_eq!(second_compilation.span.instructions, 12);
+    assert_eq!(second_compilation.x87_entry_top, 7);
+    assert_eq!(second_compilation.x87_exit_top, 0);
+    native
+        .jit_direct
+        .install(&second_compilation)
+        .expect("second x87 block install");
+
+    arm(&mut native, 0x0f7f);
+    arm(&mut interpreter, 0x0f7f);
+    native.registers.eip = ENTRY;
+    interpreter.registers.eip = ENTRY;
+    native_bus.memory.copy_from_slice(&memory);
+    interpreter_bus.memory.copy_from_slice(&memory);
+    native_bus.trace = BusTrace::default();
+    interpreter_bus.trace = BusTrace::default();
+    let entries = native.perf_counters().jit_direct_entries;
+    let transfers = native.perf_counters().jit_direct_linked_transfers;
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, first_block)
+            .unwrap()
+    );
+    for _ in 0..24 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert_eq!(native.registers, interpreter.registers);
+    assert_eq!(native.fpu, interpreter.fpu);
+    assert_eq!(native.pending_flags, interpreter.pending_flags);
+    assert_eq!(native.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(native.fp_rem, interpreter.fp_rem);
+    assert_eq!(native_bus.memory, interpreter_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, END);
+    assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - transfers,
+        1
+    );
+    assert_eq!(
+        f32::from_bits(u32::from_le_bytes(
+            native_bus.memory[DATA..DATA + 4].try_into().unwrap()
+        )),
+        1.0
+    );
+
+    arm(&mut native, 0x0f7f);
+    native.registers.eip = ENTRY;
+    native.fpu.dec_top();
+    let registers = native.registers.clone();
+    let fpu = native.fpu.clone();
+    let rejects = native.perf_counters().jit_direct_reject_x87_top;
+    assert!(
+        !native
+            .try_run_direct_block_for_test(&mut native_bus, first_block)
+            .unwrap()
+    );
+    assert_eq!(native.registers, registers);
+    assert_eq!(native.fpu, fpu);
+    assert_eq!(
+        native.perf_counters().jit_direct_reject_x87_top - rejects,
+        1
+    );
+}
+
+#[test]
+fn x87_self_loop_with_a_net_top_change_stays_interpreted() {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    memory[ENTRY as usize..ENTRY as usize + 7].copy_from_slice(&[
+        0xd9, 0xe8, // fld1
+        0x89, 0xc0, // mov eax,eax
+        0x75, 0xfa, // jnz ENTRY
+        0xf4, // hlt
+    ]);
+    let mut cpu = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory);
+    arm(&mut cpu, 0x0f7f);
+    cpu.registers.eflags |= FLAG_ZF;
+    run_to_halt(&mut cpu, &mut bus);
+
+    arm(&mut cpu, 0x0f7f);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("x87 loop key");
+    assert_eq!(cpu.fpu.top(), 0);
+    assert!(jit::direct::compile(&mut cpu, key.linear, true).is_none());
+}
+
 fn d8_program(extension: u8, memory_source: bool) -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[ENTRY as usize - 1] = 0x90;

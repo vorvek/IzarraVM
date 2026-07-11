@@ -12,13 +12,46 @@ const BIOS_TEXT_WHITE: u8 = 0x3F;
 
 #[test]
 fn jit_auto_admission_policy_defaults_on_only_when_available() {
-    assert!(jit_auto_admit_policy(None, true));
-    assert!(jit_auto_admit_policy(Some("1"), true));
-    assert!(jit_auto_admit_policy(Some("yes"), true));
-    assert!(!jit_auto_admit_policy(Some("0"), true));
-    assert!(!jit_auto_admit_policy(Some(""), true));
-    assert!(!jit_auto_admit_policy(None, false));
-    assert!(!jit_auto_admit_policy(Some("1"), false));
+    assert!(jit_auto_admit_policy(
+        None,
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(jit_auto_admit_policy(
+        Some("1"),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(jit_auto_admit_policy(
+        Some("yes"),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some("0"),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some(""),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        None,
+        false,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some("1"),
+        false,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some("1"),
+        true,
+        ExecutionBackend::Interpreter
+    ));
 }
 
 // The CacheModel tests below exercise tier IDENTITY, not the wait-state numbers:

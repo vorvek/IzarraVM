@@ -151,6 +151,38 @@ impl NativeX87Metadata {
 }
 
 impl NativeX87Insn {
+    /// Net architectural TOP movement after a successful instruction. Positive values pop,
+    /// negative values push, and zero leaves the stack position unchanged.
+    pub(crate) const fn top_delta(self) -> i8 {
+        match self {
+            Self::LoadF32 { .. }
+            | Self::LoadRegister { .. }
+            | Self::LoadOne
+            | Self::LoadZero
+            | Self::LoadI32 { .. } => -1,
+            Self::BinaryMemory { op, .. } | Self::BinaryRegister { op, .. } => {
+                if op.pops() {
+                    1
+                } else {
+                    0
+                }
+            }
+            Self::StoreF32 { pop: true, .. }
+            | Self::StoreRegister { pop: true, .. }
+            | Self::StoreI32 { .. }
+            | Self::PopBinary { .. } => 1,
+            Self::ComparePopPop => 2,
+            Self::StoreF32 { pop: false, .. }
+            | Self::StoreRegister { pop: false, .. }
+            | Self::Exchange { .. }
+            | Self::StoreStatusAx => 0,
+        }
+    }
+
+    pub(crate) const fn advance_top(self, top: u8) -> u8 {
+        top.wrapping_add_signed(self.top_delta()) & 7
+    }
+
     pub(crate) fn classify(insn: &DecodedInsn) -> Option<Self> {
         if insn.group != DecodeGroup::Fpu
             || insn.prefixes.lock
@@ -694,6 +726,22 @@ mod tests {
         let classified = NativeX87Insn::classify(&candidate).unwrap();
         assert_eq!(classified, NativeX87Insn::LoadF32 { addr: word_addr });
         assert_eq!(classified.metadata().memory.unwrap().width, 4);
+    }
+
+    #[test]
+    fn stack_effects_advance_every_top_with_wraparound() {
+        let push = NativeX87Insn::LoadOne;
+        let pop = NativeX87Insn::PopBinary {
+            op: NativeX87PopOp::Add,
+            index: 1,
+        };
+        let pop_twice = NativeX87Insn::ComparePopPop;
+
+        for top in 0..8 {
+            assert_eq!(push.advance_top(top), top.wrapping_add(7) & 7);
+            assert_eq!(pop.advance_top(top), top.wrapping_add(1) & 7);
+            assert_eq!(pop_twice.advance_top(top), top.wrapping_add(2) & 7);
+        }
     }
 
     #[test]

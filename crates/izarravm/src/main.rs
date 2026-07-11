@@ -22,7 +22,8 @@ use izarravm_firmware::{
 };
 use izarravm_input::InputState;
 use izarravm_machine::{
-    ActiveDisplay, Machine, MachineHostProfileSnapshot, MachineProfile, PerfCounters, StopReason,
+    ActiveDisplay, ExecutionBackend, Machine, MachineHostProfileSnapshot, MachineProfile,
+    PerfCounters, StopReason, set_process_execution_backend,
 };
 use serde_json::json;
 use std::cmp::Reverse;
@@ -52,6 +53,9 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     cpu: Option<GswMode>,
+    /// Run the portable CPU interpreter and disable native block admission.
+    #[arg(long)]
+    interpreter: bool,
     #[arg(long)]
     memory_mib: Option<u16>,
     #[arg(long)]
@@ -159,6 +163,23 @@ struct MidiConfigPresence {
     mt32_pcm_rom: bool,
 }
 
+fn requested_execution_backend(
+    interpreter: bool,
+    native_backend_compiled: bool,
+    native_backend_available: bool,
+) -> Result<ExecutionBackend, &'static str> {
+    if interpreter || !native_backend_compiled {
+        return Ok(ExecutionBackend::Interpreter);
+    }
+    if native_backend_available {
+        Ok(ExecutionBackend::Automatic)
+    } else {
+        Err(
+            "this IzarraVM build requires an AVX2-capable x86-64 CPU; use --interpreter to run the portable CPU core",
+        )
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -168,6 +189,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
+    let execution_backend = requested_execution_backend(
+        cli.interpreter,
+        izarravm_cpu::NATIVE_BACKEND_COMPILED,
+        izarravm_cpu::native_backend_available(),
+    )?;
+    set_process_execution_backend(execution_backend);
     if cli.profile_json.is_some() && cli.headless_profile_exe.is_none() && cli.hdd_folder.is_none()
     {
         return Err("--profile-json requires --headless-profile-exe or --hdd-folder".into());
