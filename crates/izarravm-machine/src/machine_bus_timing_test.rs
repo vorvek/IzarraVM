@@ -1778,6 +1778,12 @@ fn native_mode13_page_batches_charge_video_timing_and_move_generation_once() {
 }
 
 #[test]
+fn approximate_video_wait_states_keep_the_doom_calibration() {
+    assert_eq!(video_wait_states_approx(CpuPersona::I486), 45);
+    assert_eq!(video_wait_states_approx(CpuPersona::I586), 75);
+}
+
+#[test]
 fn native_cached_fetch_batch_charges_the_exact_warm_ram_cost() {
     const FETCHES: u64 = 25_000;
     const FETCH_LENS: &[u8] = &[1, 3, 2, 4];

@@ -310,47 +310,31 @@ pub enum ActiveDisplay {
 /// wall second, so a guest that never polls pays ~140k clocks/s (~0.2 percent).
 pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 
-/// Per-mode VIDEO-window wait states for the Approximate class (486/586).
-/// A real VGA card sits across an expansion bus whose per-access latency does
-/// not scale with CPU speed, but the flat
-/// `WaitStateProfile.video = 1` rode `scale_bus` (486 x1/3, 586 x7/30), pricing a
-/// VRAM byte write at ~15 ns / ~3.5 ns where real VLB / PCI writes cost
-/// ~100-450 ns. Doom is framebuffer-bound (measured: ~61,500 VRAM data accesses
-/// per frame at max detail), so the 486/586 personas ran demo3 1.27x / 1.56x too
-/// fast while every synthetic bench (no VRAM traffic) sat era-exact. These values
-/// are calibrated POST-`scale_bus`: the charged clocks are `(2 + ws) *
-/// bus_num/bus_den`.
+/// Per-mode video-window wait states for the Approximate class (486/586).
+/// A real VGA card sits across an expansion bus whose access latency does not
+/// scale with CPU speed. The flat `WaitStateProfile.video = 1` rode `scale_bus`
+/// (486 x1/3, 586 x7/30), which priced VRAM far below VLB and PCI latency. Doom
+/// issues about 131 million VGA accesses in the max-detail demo3 timedemo, so it
+/// exposes this error while the synthetic CPU benchmarks do not.
 ///
-/// The 586 value of 88 produces 913 realtics, or 81.8 fps, near the ~82 fps
-/// P55C target. A sweep confirmed the synthetic bench cycles-per-iteration columns
-/// (sieve 120503.05, dhrystone 663.62, all four modes) are byte-identical across
-/// the sweep because the benches do no VRAM traffic. Quake's software renderer
-/// is less isolated: nosound demo1 changes from 42.4 fps at ws=62 to 41.5 fps at
-/// ws=88, a 2.1 percent shift compared with Doom's 15.3 percent shift.
+/// Narrow SMC invalidation removed an accidental cold-decode timing tax. The 586
+/// value was recalibrated at that point, but the 486 value was left stale. The
+/// current values are measured after that change and after `scale_bus`:
 ///
-/// The shipped 486 value stays at the flat 1 (see the arm comment: with honest
-/// tick delivery the DX2-66 persona hits its target with no surcharge, so no
-/// VLB-class value ships). If `bus_timing` is ever retuned, recalibrate these with
-/// it. The Accurate 386 class keeps the frozen `WaitStateProfile.video`
-/// path bit-for-bit (byte-identity gate).
+/// - 486 ws=45: 2980 realtics, 25.1 fps (target about 3000 realtics)
+/// - 586 ws=75: 833 realtics, 89.7 fps (target 820 to 850 realtics)
+///
+/// Interpreter, direct-page, REP, and native VGA paths all use this table. The
+/// Accurate 386 class keeps the frozen `WaitStateProfile.video` path. Recalibrate
+/// these values if `bus_timing` changes.
 const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
     match persona {
-        // Unreachable in practice (Accurate class takes the profile path), but
-        // keep the frozen classes on the profile default should routing change.
+        // Unreachable in practice because the Accurate class takes the profile path.
         CpuPersona::I386 => 1,
-        // The 486 keeps the flat profile value: once the batch cap counts bus
-        // clocks (no more coalesced IRQ0 ticks), the DX2-66 persona lands the
-        // 29-30 fps demo3 target with no video surcharge. Its
-        // Dhrystone-pinned bus dial already prices every access fat enough that
-        // the real VLB video cost is absorbed. Charging the physical ~130 ns on
-        // top would undershoot the target (~27 fps). Composition infidelity
-        // accepted and recorded: the 486's Doom time leans more on ordinary bus
-        // than a real DX2-66's (which leans on the video bus); the NET frame
-        // rate is what is calibrated. Revisit alongside any bus_timing retune.
-        CpuPersona::I486 => 1,
-        // ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
-        // See the function-level doc for the sweep data and the isolation proof.
-        CpuPersona::I586 => 88,
+        // (2 + 45) * 1/3 clocks at 66 MHz is about 237 ns per access.
+        CpuPersona::I486 => 45,
+        // (2 + 75) * 7/30 clocks at 200 MHz is about 90 ns per access.
+        CpuPersona::I586 => 75,
     }
 }
 

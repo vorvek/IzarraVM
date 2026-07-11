@@ -5,7 +5,7 @@ param(
     [string]$ResultsDirectory = "",
     [int]$Runs = 3,
     [int]$HostTimeoutSeconds = 900,
-    [ValidateSet("Both", "Doom", "Quake")]
+    [ValidateSet("Both", "Doom", "Doom586", "Quake")]
     [string]$Workload = "Both",
     [ValidateSet("0", "1")]
     [string]$Jit = "1",
@@ -55,8 +55,9 @@ function Read-QuakeTimedemoIdentity([string]$Path) {
         throw "Quake must produce exactly one timedemo identity line; found $($identities.Count)."
     }
     $identity = $identities[0]
-    if ($identity.frames -ne 969 -or $identity.seconds -le 0 -or $identity.fps -le 0) {
-        throw "Quake did not complete the 969-frame fixed demo."
+    if ($identity.frames -ne 969 -or $identity.seconds -le 0 -or
+        $identity.fps -lt 41.0 -or $identity.fps -gt 44.0) {
+        throw "Quake did not complete the 969-frame demo near its 42 fps target."
     }
     $derivedFps = $identity.frames / $identity.seconds
     if ([Math]::Abs($derivedFps - $identity.fps) -gt 0.2) {
@@ -115,7 +116,7 @@ if (-not $ReportOnly -and $SkipBuild) {
 if ($HostTimeoutSeconds -lt 1) {
     throw "HostTimeoutSeconds must be positive."
 }
-if ($Workload -in @("Both", "Doom")) {
+if ($Workload -in @("Both", "Doom", "Doom586")) {
     if (-not (Test-Path -LiteralPath "$DoomFolder/AUTOEXEC.BAT" -PathType Leaf) -or
         -not (Select-String -LiteralPath "$DoomFolder/AUTOEXEC.BAT" -SimpleMatch "C:\EXITVM.COM" -Quiet)) {
         throw "The Doom fixture must run C:\EXITVM.COM after the timedemo."
@@ -139,7 +140,7 @@ if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
     throw "Release executable not found at $Executable."
 }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
-if ($Workload -in @("Both", "Doom")) {
+if ($Workload -in @("Both", "Doom", "Doom586")) {
     $DoomFolder = (Resolve-Path -LiteralPath $DoomFolder).Path
 }
 if ($Workload -in @("Both", "Quake")) {
@@ -287,8 +288,8 @@ $exitVmBytes = [byte[]](
 $gateScriptHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $exitVmHash = Get-BytesSha256 $exitVmBytes
 $workloadInputHashes = [ordered]@{}
-if ($Workload -in @("Both", "Doom")) {
-    $workloadInputHashes.doom_486 = Get-WorkloadInputHashes $DoomFolder @(
+if ($Workload -in @("Both", "Doom", "Doom586")) {
+    $doomInputHashes = Get-WorkloadInputHashes $DoomFolder @(
         "AUTOEXEC.BAT",
         "CONFIG.SYS",
         "JEMMEX.EXE",
@@ -296,6 +297,11 @@ if ($Workload -in @("Both", "Doom")) {
         "DOOM/DOOM1.WAD",
         "DOOM/MAX.CFG"
     )
+    if ($Workload -eq "Doom586") {
+        $workloadInputHashes.doom_586 = $doomInputHashes
+    } else {
+        $workloadInputHashes.doom_486 = $doomInputHashes
+    }
 }
 if ($Workload -in @("Both", "Quake")) {
     $workloadInputHashes.quake_586 = Get-WorkloadInputHashes $QuakeFolder @(
@@ -339,7 +345,7 @@ function Invoke-Workload(
             "--dump-result",
             "--profile-json", $jsonPath
         )
-        if ($Name -eq "doom-486") {
+        if ($Name.StartsWith("doom-", [StringComparison]::Ordinal)) {
             $processArguments += "--expect-test-exit"
         }
         $exitCode = Invoke-IzarraProcess $processArguments $stdoutPath $stderrPath
@@ -353,7 +359,7 @@ function Invoke-Workload(
         if ($sample.schema -ne "izarravm-hdd-profile-v1" -or $sample.mode -ne $Mode) {
             throw "$Name run $run produced an unexpected schema or CPU mode."
         }
-        if ($Name -eq "doom-486") {
+        if ($Name.StartsWith("doom-", [StringComparison]::Ordinal)) {
             if ($sample.stop.kind -ne "test_exit" -or $sample.stop.code -ne 0) {
                 throw "$Name run $run did not reach TestExit code 0."
             }
@@ -390,10 +396,16 @@ function Invoke-Workload(
         Assert-NearlyEqual $instructionsPerSecond ($instructions / $wallSeconds) "instructions_per_host_second"
         Assert-NearlyEqual $directCoverage ($directInstructions / $instructions) "direct_native_coverage"
         Assert-NearlyEqual $directExitsPer100 (100.0 * $directSideExits / $instructions) "direct_slow_exits_per_100_instructions"
-        if ($Name -eq "doom-486") {
+        if ($Name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+            $minimumRealtics, $maximumRealtics = switch ($Name) {
+                "doom-486" { 2900, 3050; break }
+                "doom-586" { 820, 850; break }
+                default { throw "Unknown Doom timing workload '$Name'." }
+            }
             if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
-                $sample.timedemo.realtics -lt 1950 -or $sample.timedemo.realtics -gt 2000) {
-                throw "Doom run $run failed its 2134-gametic timing identity check."
+                $sample.timedemo.realtics -lt $minimumRealtics -or
+                $sample.timedemo.realtics -gt $maximumRealtics) {
+                throw "$Name run $run failed its 2134-gametic timing identity check."
             }
         } else {
             $preservedQconsole = Join-Path $ResultsDirectory "$Name-run$run-qconsole.log"
@@ -454,6 +466,9 @@ try {
     $workloads = @()
     if ($Workload -in @("Both", "Doom")) {
         $workloads += Invoke-Workload "doom-486" "486" $DoomFolder 8000000000
+    }
+    if ($Workload -eq "Doom586") {
+        $workloads += Invoke-Workload "doom-586" "586" $DoomFolder 8000000000
     }
     if ($Workload -in @("Both", "Quake")) {
         $workloads += Invoke-Workload "quake-586" "586" $QuakeFolder 6200000000
