@@ -400,6 +400,40 @@ fn sb_pro_8bit_stereo_deinterleaves_two_bytes_per_frame_at_the_halved_rate() {
 }
 
 #[test]
+fn sb_pro_stereo_auto_init_keeps_every_frame_in_a_large_batch() {
+    let mut machine = test_machine();
+    for (i, byte) in [0x00u8, 0x40, 0x80, 0xC0].into_iter().enumerate() {
+        machine.write_physical_u8(0x1_0000 + i as u32, byte);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x0B, BusWidth::Byte, 0x59, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x02, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x03, false).unwrap();
+        bus.write_io(0x03, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x83, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0x224, BusWidth::Byte, 0x0E, false).unwrap();
+        bus.write_io(0x225, BusWidth::Byte, 0x02, false).unwrap();
+        for &byte in &[0x41u8, 0x2B, 0x11, 0x48, 0x03, 0x00, 0x1C] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    let rate = u64::from(machine.dsp.output_frame_rate());
+    let clocks = machine
+        .timeline
+        .cpu_clocks_until(timeline::DeviceClock::Dsp, 8, rate)
+        .unwrap();
+
+    machine.advance_devices_clocks(clocks);
+    let out = machine.render_dsp_audio(8);
+
+    assert_eq!(out.len(), 8, "four auto-init blocks produce eight frames");
+    assert!(out.iter().all(|(left, right)| left != right));
+}
+
+#[test]
 fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
     let mut machine = test_machine();
     // 8 signed-LE stereo frames (32 bytes). The slave 8237A (channel 5)
@@ -434,13 +468,14 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
                 .unwrap();
         }
     });
-    let out = {
-        // Playback is now clock-driven: advance CPU time for well over the
-        // 8-frame stereo buffer (auto-init keeps feeding), then drain the ring.
-        machine.advance_devices_clocks(200_000);
-        machine.render_dsp_audio(8)
-    };
-    assert_eq!(out.len(), 8);
+    let rate = u64::from(machine.dsp.output_frame_rate());
+    let clocks = machine
+        .timeline
+        .cpu_clocks_until(timeline::DeviceClock::Dsp, 32, rate)
+        .unwrap();
+    machine.advance_devices_clocks(clocks);
+    let out = machine.render_dsp_audio(32);
+    assert_eq!(out.len(), 32, "a large batch keeps every stereo frame");
     assert_eq!(out[0].0, -1, "left channel is signed -1");
     assert_eq!(out[0].1, 1, "right channel is signed +1");
     assert!(
@@ -451,6 +486,81 @@ fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
     assert!(
         machine.dma_read_word(5).is_some(),
         "auto-init keeps feeding"
+    );
+}
+
+#[test]
+fn sb_16bit_dma_waits_for_the_first_sample_deadline_before_reading() {
+    let mut machine = test_machine();
+    for i in 0..16u32 {
+        let word = (0x1000u16 + i as u16).to_le_bytes();
+        machine.write_physical_u8(0x2_0000 + i * 2, word[0]);
+        machine.write_physical_u8(0x2_0001 + i * 2, word[1]);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0xD6, BusWidth::Byte, 0x59, false).unwrap();
+        bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xC6, BusWidth::Byte, 0x0F, false).unwrap();
+        bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x8B, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap();
+        for &byte in &[0x41u8, 0x56, 0x22, 0xB6, 0x00, 0x03, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    let rate = u64::from(machine.dsp.output_frame_rate());
+    let first_frame = machine
+        .timeline
+        .cpu_clocks_until(timeline::DeviceClock::Dsp, 1, rate)
+        .unwrap();
+
+    machine.advance_devices_clocks(first_frame - 1);
+
+    assert_eq!(machine.dsp.drain_frame(), None);
+    assert_eq!(
+        machine.dma_read_word(5),
+        Some(0x1000),
+        "DMA remains at the first word until its sample deadline"
+    );
+}
+
+#[test]
+fn short_16bit_dma_does_not_fabricate_silent_words() {
+    let mut machine = test_machine();
+    for (i, word) in [0x1000u16, 0x2000, 0x3000].into_iter().enumerate() {
+        let bytes = word.to_le_bytes();
+        machine.write_physical_u8(0x2_0000 + i as u32 * 2, bytes[0]);
+        machine.write_physical_u8(0x2_0001 + i as u32 * 2, bytes[1]);
+    }
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0xD6, BusWidth::Byte, 0x49, false).unwrap();
+        bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xC4, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0xC6, BusWidth::Byte, 0x02, false).unwrap();
+        bus.write_io(0xC6, BusWidth::Byte, 0x00, false).unwrap();
+        bus.write_io(0x8B, BusWidth::Byte, 0x01, false).unwrap();
+        bus.write_io(0xD4, BusWidth::Byte, 0x01, false).unwrap();
+        for &byte in &[0x41u8, 0x56, 0x22, 0xB0, 0x00, 0x07, 0x00] {
+            bus.write_io(0x22C, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    let rate = u64::from(machine.dsp.output_frame_rate());
+    let clocks = machine
+        .timeline
+        .cpu_clocks_until(timeline::DeviceClock::Dsp, 8, rate)
+        .unwrap();
+
+    machine.advance_devices_clocks(clocks);
+    let out = machine.render_dsp_audio(8);
+
+    assert_eq!(out.len(), 3, "only the three DMA words become samples");
+    assert_eq!(machine.dsp.block_remaining(), 5);
+    assert!(
+        !machine.pic.irr_bit(5),
+        "an incomplete DSP block has no IRQ"
     );
 }
 

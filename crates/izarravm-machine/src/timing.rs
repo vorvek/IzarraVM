@@ -95,21 +95,10 @@ impl Machine {
         // IRQ5 no longer depend on the host frontend pulling audio. The host path
         // (render_dsp_audio) only drains what the clock already produced.
         //
-        // MULTI-EDGE CONTRACT (holds for this DSP loop and the WSS/ADPCM loops
-        // below, which mirror it): take_irq is drained INSIDE the producer loop,
-        // at the sample tick that edged it, so every block edge reaches the PIC
-        // within the advance in which it occurred and none is ever parked in the
-        // device-side latch across a step (where a later gate, e.g. is_playing
-        // going false at a single-cycle block end, could strand it). When one
-        // advance spans N edges the PIC receives N requests, but the CPU does not
-        // execute during advance_devices, so the guest cannot acknowledge between
-        // them: the 8259 latches each request into IRR and a request on a
-        // still-set IRR bit is absorbed, exactly as real hardware absorbs a new
-        // pulse on a line whose interrupt is still pending. N intra-step edges
-        // therefore deliver ONE guest interrupt by construction; that is the
-        // architecturally correct coalescing, not a loss. What the run loop must
-        // (and does, see the Approximate batch cap) arrange is that batches end
-        // at block-edge instants when the guest needs one interrupt PER edge.
+        // The run loop caps normal CPU batches at the next programmed block edge,
+        // then forwards the DSP latch below so the guest can acknowledge each IRQ.
+        // An explicit device-only advance can span several edges while the CPU is
+        // unable to acknowledge; those requests coalesce in the device latch.
         // The mixer's SB Pro stereo bit (0x0E bit1) selects 8-bit byte
         // interleaving, which halves the per-channel frame rate; sample it before
         // computing the rate the DSP frames at.
@@ -121,119 +110,20 @@ impl Machine {
         let irq_line = self.mixer.selected_irq();
         let dma8 = self.mixer.selected_dma_8();
         let dma16 = self.mixer.selected_dma_16();
-        if self.dsp.is_playing() && rate > 0 {
+        if self.dsp.needs_output_tick() && rate > 0 {
             let n = advance.dsp_frames as usize;
             let Machine {
                 dsp, dma, memory, ..
             } = self;
             let is16 = dsp.is_16bit();
             let ch = if is16 { dma16 } else { dma8 };
-            // HLE: on new block (command level), pre-fetch the entire block data
-            // in bulk (advances DMA in one operation), store in buffer, then
-            // render from buffer (no per-sample fetch micro steps).
-            if dsp.block_remaining() == dsp.block_size() && dsp.block_buffer().is_none() {
-                let bpp = if is16 { 2 } else { 1 };
-                let nbytes = dsp.block_size() as usize * bpp;
-                let mut buf = Vec::with_capacity(nbytes);
-                for _ in 0..nbytes {
-                    if is16 {
-                        let w = dma.read_word(ch, memory).unwrap_or(0);
-                        buf.extend_from_slice(&w.to_le_bytes());
-                    } else {
-                        buf.push(dma.read_byte(ch, memory).unwrap_or(0));
-                    }
-                }
-                dsp.set_block_buffer(buf);
-            }
-            // HLE buffer feeding with refill support for auto-init blocks that may
-            // be crossed inside a single large-n advance (e.g. tests and long steps).
-            // We chunk the requested n at buffer/block boundaries so we can
-            // re-prefetch the next DMA block when auto-init reloads remaining.
-            let mut remaining = n;
-            while remaining > 0 {
-                if dsp.block_remaining() == dsp.block_size() && dsp.block_buffer().is_none() {
-                    let bpp = if is16 { 2 } else { 1 };
-                    let nbytes = dsp.block_size() as usize * bpp;
-                    let mut buf = Vec::with_capacity(nbytes);
-                    for _ in 0..nbytes {
-                        if is16 {
-                            let w = dma.read_word(ch, memory).unwrap_or(0);
-                            buf.extend_from_slice(&w.to_le_bytes());
-                        } else {
-                            buf.push(dma.read_byte(ch, memory).unwrap_or(0));
-                        }
-                    }
-                    dsp.set_block_buffer(buf);
-                }
-                let start_pos = dsp.block_buffer_pos();
-                let mut consumed_from_buf: usize = 0;
-                if let Some(buf) = dsp.block_buffer().cloned() {
-                    let bytes_per_frame = if is16 { 2 } else { 1 };
-                    let bytes_avail = buf.len().saturating_sub(start_pos);
-                    if bytes_avail >= bytes_per_frame {
-                        let frames_this = (bytes_avail / bytes_per_frame).min(remaining);
-                        if is16 {
-                            dsp.tick_n_samples(
-                                frames_this,
-                                || None,
-                                || {
-                                    let p = start_pos + consumed_from_buf;
-                                    if p + 1 < buf.len() {
-                                        let w = u16::from_le_bytes([buf[p], buf[p + 1]]);
-                                        consumed_from_buf += 2;
-                                        Some(w)
-                                    } else {
-                                        None
-                                    }
-                                },
-                            );
-                        } else {
-                            dsp.tick_n_samples(
-                                frames_this,
-                                || {
-                                    let p = start_pos + consumed_from_buf;
-                                    if p < buf.len() {
-                                        let b = buf[p];
-                                        consumed_from_buf += 1;
-                                        Some(b)
-                                    } else {
-                                        None
-                                    }
-                                },
-                                || None,
-                            );
-                        }
-                    }
-                } else {
-                    // Fallback direct per-frame (old path) for this chunk.
-                    let frames_this = remaining; // will be limited by dry inside
-                    if is16 {
-                        dsp.tick_n_samples(frames_this, || None, || dma.read_word(ch, memory));
-                    } else {
-                        dsp.tick_n_samples(frames_this, || dma.read_byte(ch, memory), || None);
-                    }
-                }
-                if consumed_from_buf > 0 {
-                    dsp.advance_block_buffer(consumed_from_buf);
-                }
-                // If we hit end of this buf during the chunk, clear so next while
-                // iteration (or future) can pre-fetch if auto-init reset the block.
-                if dsp.block_buffer_pos() >= dsp.block_buffer_len() {
-                    dsp.take_block_buffer();
-                }
-                // Reduce by how many we asked this chunk (actual produced may be
-                // slightly less if dry, but advance will have stopped feeding).
-                // Conservative: always reduce by the chunk size we targeted; if
-                // underfed the phase carry will handle tail next advance.
-                let did = if consumed_from_buf > 0 {
-                    consumed_from_buf / (if is16 { 2 } else { 1 })
-                } else {
-                    remaining
-                };
-                if did == 0 {
-                    break;
-                }
-                remaining = remaining.saturating_sub(did);
+            // HLE batches the elapsed output frames but keeps DMA reads at the
+            // frame that consumes them. This avoids copying stale data ahead of
+            // the guest's block IRQ and lets a dry DMA source stop the batch.
+            if is16 {
+                dsp.tick_n_samples(n, || None, || dma.read_word(ch, memory));
+            } else {
+                dsp.tick_n_samples(n, || dma.read_byte(ch, memory), || None);
             }
             if dsp.take_irq() {
                 let is_16bit = dsp.is_16bit();
@@ -563,7 +453,7 @@ impl Machine {
         self.dsp.set_sbpro_stereo(self.mixer.sbpro_stereo());
         let programmed_wss = self.wss.output_frame_rate();
         DeviceRates {
-            dsp_hz: if self.dsp.is_playing() {
+            dsp_hz: if self.dsp.needs_output_tick() {
                 u64::from(self.dsp.output_frame_rate())
             } else {
                 0
