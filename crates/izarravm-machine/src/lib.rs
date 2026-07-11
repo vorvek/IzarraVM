@@ -10,8 +10,8 @@ use izarravm_audio::{
     Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, SbDsp, SbMixer, TimedMidiMessage,
 };
 use izarravm_bus::{
-    BusAccessKind, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead, DirectMemoryWrite,
-    DirectPage, Memory, TracingMode,
+    BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead,
+    DirectMemoryWrite, DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
     CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,

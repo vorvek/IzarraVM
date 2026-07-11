@@ -132,7 +132,7 @@ fn store_r32_disp8_known_bytes() {
 #[test]
 fn load_store_r32_disp32_known_bytes() {
     // mov eax, [r14+128] -- REX.B (r14 extended), no REX.W. 8B; ModRM mod=10,reg=eax(0),
-    // rm=r14&7=6 = 10_000_110 = 0x86; disp32 128 LE. The native fold path's eip read.
+    // rm=r14&7=6 = 10_000_110 = 0x86; disp32 128 LE.
     let mut e = Encoder::new();
     e.load_r32_disp32(Reg::RAX, Reg::R14, 128);
     assert_eq!(e.finish(), vec![0x41, 0x8B, 0x86, 0x80, 0x00, 0x00, 0x00]);
@@ -146,6 +146,16 @@ fn load_store_r32_disp32_known_bytes() {
     assert_eq!(
         e.finish(),
         vec![0x41, 0x8B, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00]
+    );
+}
+
+#[test]
+fn movzx_r32_byte_disp32_known_bytes() {
+    let mut e = Encoder::new();
+    e.movzx_r32_byte_disp32(Reg::RAX, Reg::R12, 0x1234);
+    assert_eq!(
+        e.finish(),
+        vec![0x41, 0x0f, 0xb6, 0x84, 0x24, 0x34, 0x12, 0x00, 0x00]
     );
 }
 

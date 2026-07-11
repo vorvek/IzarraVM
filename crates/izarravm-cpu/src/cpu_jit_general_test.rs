@@ -6,8 +6,12 @@ use super::*;
 /// Real mode with a 32-bit code segment (flat, 64 KB limit), at the 586 level so the FP
 /// timing classes are non-identity and `fp_rem` actually carries.
 fn fresh() -> CpuGsw {
+    fresh_for(GswMode::Gsw586)
+}
+
+fn fresh_for(mode: GswMode) -> CpuGsw {
     let mut cpu = CpuGsw::default();
-    cpu.set_mode(GswMode::Gsw586);
+    cpu.set_mode(mode);
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.load_segment_real(SegmentIndex::Ss, 0);
@@ -282,7 +286,7 @@ fn terminator_predicate_covers_clock_device_and_interrupt_ops() {
     for (bytes, name) in [
         (&[0x83, 0xc1, 0x01][..], "add ecx,1"),
         (&[0x89, 0xd8][..], "mov eax,ebx"),
-        (&[0x8e, 0xd8][..], "mov ds,ax (not SS)"),
+        (&[0x8e, 0xc0][..], "mov es,ax"),
         (
             &[0xec][..],
             "in al,dx (Approximate: runtime step-break, interior)",
@@ -293,6 +297,16 @@ fn terminator_predicate_covers_clock_device_and_interrupt_ops() {
         assert!(
             jit::block::is_interior_eligible(&insn),
             "{name} must be an interior slot"
+        );
+    }
+
+    for (bytes, name) in [(&[0x1f][..], "pop ds"), (&[0x8e, 0xd8][..], "mov ds,ax")] {
+        let insn = decode_one(bytes);
+        assert!(insn.continuable, "{name} is continuable");
+        assert!(jit::block::changes_native_memory_context(&insn));
+        assert!(
+            !jit::block::is_interior_eligible(&insn),
+            "{name} must end a native-memory block"
         );
     }
 
@@ -795,9 +809,7 @@ fn template_diff_mov_r32_r32_preserves_state() {
 // harness runs a block SHAPE to completion on the interpreter and the JIT (hotness auto-admit)
 // and asserts full state + memory identity at the halt boundary, with variants that inject a
 // mid-loop fault and a self-store. Every memory template that lands must pass it per shape.
-// Today it validates the TRAMPOLINE (bit-identical), which proves the harness itself is sound.
-// (When native templates make timing approximate, the elapsed_clocks/timing_rem asserts here
-// relax to state-only; the state + memory asserts stay exact - that is the invariant.)
+// It began as a trampoline oracle and now also pins the exact native-memory path.
 
 const H_ENTRY: u32 = 0x101;
 const H_COUNT: usize = 0x400;
@@ -849,10 +861,7 @@ fn assert_shape_identical(prog: Vec<u8>, arm: &dyn Fn(&mut CpuGsw), expect_regio
         jit_cpu.eflags(),
         "materialized eflags diverged"
     );
-    // Timing is still exact under the trampoline, so assert every accumulator
-    // (a divergence names the field). Round 3's cost-fold makes JIT-block timing
-    // approximate and relaxes these to drift-tolerant; the state assertion above
-    // (which ignores exactly these four fields) stays bit-exact.
+    // Assert every timing accumulator separately so a divergence names the field.
     assert_eq!(
         interp.elapsed_clocks, jit_cpu.elapsed_clocks,
         "elapsed_clocks diverged"
@@ -881,14 +890,9 @@ fn assert_shape_identical(prog: Vec<u8>, arm: &dyn Fn(&mut CpuGsw), expect_regio
 /// Assert two CPUs are STATE-identical, ignoring the four timing accumulators
 /// (`elapsed_clocks`, `core_clocks_so_far`, `timing_rem`, `fp_rem`).
 ///
-/// A compiled JIT block leaves guest architectural state
-/// (GPRs, materialized EFLAGS, segments + hidden descriptors, control/system
-/// regs, memory-mapped CPU state) BYTE-IDENTICAL to the interpreter, but its
-/// cycle accounting is only approximate. This is the state-exact half of that
-/// contract: it reuses the derived `PartialEq` by zeroing just the timing
-/// fields on throwaway clones, so it covers every present and future state field
-/// automatically without a hand-maintained list. Timing is asserted separately
-/// by the caller (bit-exact today; drift-tolerant once the cost-fold lands).
+/// A compiled JIT block leaves guest architectural state byte-identical to the interpreter. This
+/// helper zeros the four timing fields so callers can report architecture and timing failures
+/// separately without maintaining a manual field list.
 fn assert_state_identical(interp: &CpuGsw, jit: &CpuGsw) {
     assert!(
         state_eq(interp, jit),
@@ -1056,10 +1060,8 @@ fn harness_self_modifying_store_stays_identical() {
 // cache with the linear address reads the WRONG physical frame. A harness with an IDENTITY map
 // cannot catch that. This one runs the same byte-copy self-loop in 32-bit protected mode with
 // paging ON and a deliberately NON-IDENTITY linear->physical map, so a linear-indexed probe
-// would diverge. Today (trampoline, memory routed through the interpreter leaf) it is
-// bit-identical incl. timing; it gates the paged probe when that lands. The Doom/Quake anchors
-// run paged (137M page-table walks per Doom timedemo), so this is the mode the probe must win
-// in - the unpaged fast path never runs on them.
+// would diverge. The native path must remain bit-identical, including timing. The Doom/Quake
+// anchors run paged, so this is the mode the helper must handle.
 //
 // Physical image (256 KiB): page directory at 0x1000, page table at 0x2000 (PDE[0], covers
 // linear 0..4 MiB), the code frame at 0x8000, the data frame at 0x9000. Linear 0x10000 maps to
@@ -1175,12 +1177,9 @@ fn harness_paged_self_modifying_store_stays_identical() {
     );
 }
 
-// ---- Round 3 native byte-LOAD probe (isolation test of the emitted assembly) ----
+// ---- Native byte-memory address probe (isolation test of the emitted assembly) ----
 
-/// Emit `emit_load_u8_probe` wrapped in a callable prologue/epilogue (pin cpu in R12, regs base
-/// in RBP per current emit_region v3 ABI), run it against the live CPU, and return whether it hit.
-/// On a hit the emitted code has written the loaded byte into `gpr[dst]`'s byte lane.
-fn run_load_probe(cpu: &mut CpuGsw, base: u8, index: Option<u8>, disp: i32, dst: u8) -> bool {
+fn run_address_probe(cpu: &mut CpuGsw, base: u8, index: Option<u8>, disp: i32) -> Option<u32> {
     use jit::encoder::{Encoder, Reg};
     let regs_off = std::mem::offset_of!(CpuGsw, registers) as u32;
     let mut e = Encoder::new();
@@ -1198,13 +1197,14 @@ fn run_load_probe(cpu: &mut CpuGsw, base: u8, index: Option<u8>, disp: i32, dst:
     if regs_off != 0 {
         e.add_r64_imm32(Reg::RBP, regs_off);
     }
+    e.load_r32_disp8(Reg::RBX, Reg::RBP, 20);
+    e.load_r32_disp8(Reg::R14, Reg::RBP, 28);
     let miss = e.label();
     let done = e.label();
-    jit::block::emit_load_u8_probe(&mut e, base, index, disp, dst, miss, false);
-    e.mov_r32_imm32(Reg::RAX, 1); // hit: fall through here (gpr already written)
+    jit::block::emit_u8_address(&mut e, base, index, disp, false, miss, false);
     e.jmp(done);
     e.place(miss);
-    e.mov_r32_imm32(Reg::RAX, 0); // miss: nothing written
+    e.mov_r32_imm32(Reg::RAX, u32::MAX);
     e.place(done);
     e.pop(Reg::R15);
     e.pop(Reg::R14);
@@ -1215,101 +1215,26 @@ fn run_load_probe(cpu: &mut CpuGsw, base: u8, index: Option<u8>, disp: i32, dst:
     e.ret();
     let bytes = e.finish();
     let buf = jit::exec_mem::ExecutableBuffer::new(&bytes).expect("W^X alloc must succeed");
-    let f: extern "C" fn(*mut CpuGsw) -> i64 = unsafe { std::mem::transmute(buf.entry_ptr()) };
-    f(cpu as *mut CpuGsw) != 0
+    let f: extern "C" fn(*mut CpuGsw) -> u32 = unsafe { std::mem::transmute(buf.entry_ptr()) };
+    match f(cpu as *mut CpuGsw) {
+        u32::MAX => None,
+        physical => Some(physical),
+    }
 }
 
-/// The probe assembly, run in isolation against a real `data_read_pages` entry: it must compute
-/// the effective address for `[reg]` and `[base+index]`, probe the physical-keyed page cache,
-/// deref the host pointer at the in-page offset, and write ONLY the destination byte lane
-/// (write_gpr8 semantics) on a hit - and take the miss path when the page is not cached.
+/// The emitter computes all currently admitted effective-address shapes and leaves guest state alone.
 #[test]
-fn native_load_probe_reads_the_right_byte() {
-    let mut page = vec![0u8; 0x1000];
-    page[3] = 0xAB;
-    page[0x10] = 0xCD;
+fn native_address_probe_returns_the_physical_address() {
     let mut cpu = fresh();
-    cpu.data_read_pages.insert(izarravm_bus::DirectPage {
-        physical_page: 0x5000,
-        ptr: page.as_mut_ptr(),
-        len: 0x1000,
-        writable: false,
-    });
-
-    // `mov bl, [eax]` with eax = 0x5003 -> the byte at page offset 3 (0xAB) into BL, EBX's
-    // upper three bytes preserved.
-    cpu.write_gpr32(0, 0x5003); // eax
-    cpu.write_gpr32(3, 0xdead_be00); // ebx (dst BL)
-    assert!(
-        run_load_probe(&mut cpu, 0, None, 0, 3),
-        "must hit the cached page"
-    );
-    assert_eq!(
-        cpu.read_gpr32(3),
-        0xdead_beab,
-        "BL written from page[3]=0xAB, upper bytes preserved"
-    );
-
-    // `mov bl, [eax+ecx]` (SIB scale 1): eax=0x5000, ecx=0x10 -> page offset 0x10 (0xCD).
     cpu.write_gpr32(0, 0x5000);
-    cpu.write_gpr32(1, 0x10); // ecx (index)
-    cpu.write_gpr32(3, 0x0000_0000);
-    assert!(
-        run_load_probe(&mut cpu, 0, Some(1), 0, 3),
-        "SIB form must hit"
-    );
-    assert_eq!(cpu.read_gpr32(3), 0x0000_00cd, "BL = page[0x10] = 0xCD");
-
-    // `mov bl, [eax+3]` (displacement, no index): eax=0x5000, disp=3 -> page offset 3 (0xAB).
-    // Pins that the `disp != 0` branch adds into the EA register (RAX), not a scratch.
+    cpu.write_gpr32(1, 0x0d);
+    let before = cpu.registers.clone();
+    assert_eq!(run_address_probe(&mut cpu, 0, None, 3), Some(0x5003));
+    assert_eq!(run_address_probe(&mut cpu, 0, Some(1), 3), Some(0x5010));
+    cpu.write_gpr32(0, 0x9003);
+    assert_eq!(run_address_probe(&mut cpu, 0, None, 0), Some(0x9003));
     cpu.write_gpr32(0, 0x5000);
-    cpu.write_gpr32(3, 0x0000_0000);
-    assert!(
-        run_load_probe(&mut cpu, 0, None, 3, 3),
-        "disp form must hit"
-    );
-    assert_eq!(
-        cpu.read_gpr32(3),
-        0x0000_00ab,
-        "BL = page[0x5000+3] = 0xAB via disp"
-    );
-
-    // `mov bl, [eax+ecx+3]` (index + displacement): eax=0x5000, ecx=0x0d, disp=3 -> offset 0x10.
-    cpu.write_gpr32(0, 0x5000);
-    cpu.write_gpr32(1, 0x0d); // ecx
-    cpu.write_gpr32(3, 0x0000_0000);
-    assert!(
-        run_load_probe(&mut cpu, 0, Some(1), 3, 3),
-        "index+disp must hit"
-    );
-    assert_eq!(
-        cpu.read_gpr32(3),
-        0x0000_00cd,
-        "BL = page[0x5000+0x0d+3] = 0xCD"
-    );
-
-    // A high byte destination (AH = gpr8 index 4 = byte 1 of EAX): write into bits 8-15.
-    cpu.write_gpr32(0, 0x5003); // eax base (also the AH target register)
-    assert!(run_load_probe(&mut cpu, 0, None, 0, 4), "must hit");
-    // EAX was 0x5003; AH (bits 8-15) becomes 0xAB -> 0x0000_ABxx with the low byte 0x03 kept.
-    assert_eq!(
-        cpu.read_gpr32(0) & 0xffff,
-        0xab03,
-        "AH set to 0xAB, AL (0x03) preserved"
-    );
-
-    // Miss: an address whose physical page is not cached -> the miss path, gpr untouched.
-    cpu.write_gpr32(0, 0x9003); // page 0x9000 not inserted
-    cpu.write_gpr32(3, 0x1234_5678);
-    assert!(
-        !run_load_probe(&mut cpu, 0, None, 0, 3),
-        "uncached page must miss"
-    );
-    assert_eq!(
-        cpu.read_gpr32(3),
-        0x1234_5678,
-        "miss leaves the gpr unchanged"
-    );
+    assert_eq!(cpu.registers, before);
 }
 
 // ---- Round 3 byte-LOAD template (stage 1: dispatch removal) ----
@@ -1378,10 +1303,7 @@ fn byte_load_mid_loop_fault_delivers_identically() {
 /// pins the routing itself is live. The store's FAULT path is exercised in-region by
 /// `harness_mid_loop_fault_delivers_identically` (edi runs off the DS limit, so the faulting
 /// access is the store, past the admission threshold). The SMC (note_code_write) behavior is
-/// inherited STRUCTURALLY, not by a dynamic in-region test: `jit_execute_store_u8`'s only store
-/// is `write_memory_u8`, which runs `note_code_write` unconditionally, so the template cannot
-/// diverge on a code-write regardless of which path executes it;
-/// `harness_self_modifying_store_stays_identical` covers the churn (the region may stay cold).
+/// covered dynamically by the same-value and changed-value native SMC tests below.
 #[test]
 fn byte_store_slot_is_classified_memstoreu8() {
     let mut cpu = fresh();
@@ -1588,40 +1510,9 @@ fn auto_admit_gate_requires_a_native_linear_body_and_keeps_loops() {
     assert!(jit::block::try_admit_gated(&mut lp, H_ENTRY, true, false).is_some());
 }
 
-// ---- STAGE 2 FINALE: cost-fold native byte-LOAD, state-only differential ----
-//
-// With `IZARRAVM_JIT_FOLD` on, a fold-eligible `mov r8,[EA]` (unpaged, flat DS, 32-bit) runs as
-// a native page-cache probe + folded bookkeeping instead of a `region_step` call, which makes
-// JIT-block timing APPROXIMATE. So these assert STATE identity (the comparator, ignoring the four
-// timing accumulators) rather than the four-accumulator identity the trampoline tests use. Each
-// real-mode case PROVES it took the native path (`jit_native_load_hits > 0`); the paged case
-// proves the CR0.PG gate keeps the unpaged probe OFF (native hits stay 0) while state stays
-// identical through the trampoline.
+// ---- Exact native byte-memory differential ----
 
-/// `FOLD_TIMING` is a process-global read at region emit time; serialize the fold tests so one
-/// dropping the toggle (below) cannot un-fold another mid-admission. No OTHER default-suite test
-/// is fold-eligible (flat DS + unpaged + Approximate), so this only needs to cover fold tests.
-static FOLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// RAII: hold the fold lock and turn the toggle ON for the test body; restore OFF on drop (even
-/// on a panic), so the process global returns to its default and other tests are undisturbed.
-struct FoldOn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-impl FoldOn {
-    fn new() -> Self {
-        let g = FOLD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        jit::block::FOLD_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
-        FoldOn(g)
-    }
-}
-impl Drop for FoldOn {
-    fn drop(&mut self) {
-        jit::block::FOLD_TIMING.store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// `h_arm` plus a FLAT DS (base already 0 in real mode; force limit to max) so the byte-load is
-/// fold-eligible. This is the "flat real / unreal mode" a DOS extender sets up; without it a
-/// real-mode DS (limit 0xffff) is not flat and the probe is correctly gated off.
+/// `h_arm` plus a flat DS, matching the unreal-mode setup used by DOS extenders.
 fn flat_ds_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {
     move |cpu: &mut CpuGsw| {
         h_arm(esi, edi)(cpu);
@@ -1631,43 +1522,92 @@ fn flat_ds_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {
     }
 }
 
-/// Run `prog` to a halt on an interpreter CPU and a fold-on auto-admitting JIT CPU under `arm`,
-/// asserting STATE + materialized eflags + memory identity at the halt boundary (timing is
-/// approximate under the fold, so it is NOT asserted). `expect_native_hits`: `Some(true)` = the
-/// native cost-fold LOAD path MUST have run (real-mode, flat DS); `Some(false)` = it MUST have
-/// stayed off (paged, gated by CR0.PG); `None` = don't assert (SMC churn may keep the region
-/// cold). Both buses hand out direct pages so the page cache is populated and the probe HITs.
-/// Returns the interpreter CPU. Panics on any divergence.
-fn assert_fold_state_identical(
-    prog: Vec<u8>,
-    arm: &dyn Fn(&mut CpuGsw),
-    expect_native_hits: Option<bool>,
-    expect_store_hits: Option<bool>,
-    expect_region: bool,
-) -> CpuGsw {
-    let _fold = FoldOn::new();
+#[test]
+fn native_memory_linear_block_passes_the_admission_gate() {
+    let mut program = vec![0u8; 0x1000];
+    program[0x1ff] = 0x90;
+    program[0x200..0x20d].copy_from_slice(&[
+        0x8a, 0x06, // mov al,[esi]
+        0x88, 0x07, // mov [edi],al
+        0x8a, 0x4e, 0x01, // mov cl,[esi+1]
+        0x88, 0x4f, 0x01, // mov [edi+1],cl
+        0x8a, 0x56, 0x02, // mov dl,[esi+2]
+    ]);
+    program[0x20d] = 0xf4;
+    program[0x300..0x303].copy_from_slice(&[0x12, 0x34, 0x56]);
+
+    let mut nonflat = fresh();
+    let mut nonflat_bus = TestBus::with_memory(program.clone());
+    nonflat.registers.eip = 0x1ff;
+    nonflat.write_gpr32(6, 0x300);
+    nonflat.write_gpr32(7, 0x400);
+    drive_to_halt(&mut nonflat, &mut nonflat_bus);
+    assert!(
+        jit::block::try_admit_gated(&mut nonflat, 0x200, true, true).is_none(),
+        "a linear memory block must not admit when DS disables its native slots"
+    );
+
+    let arm = |cpu: &mut CpuGsw| {
+        flat_ds_arm(0x300, 0x400)(cpu);
+        cpu.registers.eip = 0x1ff;
+        cpu.halted = false;
+    };
     let mut interp = fresh();
     let mut jit_cpu = fresh();
-    jit_cpu.set_jit_auto_admit(true);
-    let mut bus_i = TestBus::with_memory(prog.clone());
-    let mut bus_j = TestBus::with_memory(prog);
-    bus_i.direct_pages_enabled = true; // populate the page cache so the native probe HITs
+    let mut bus_i = TestBus::with_memory(program.clone());
+    let mut bus_j = TestBus::with_memory(program);
+    bus_i.direct_pages_enabled = true;
     bus_j.direct_pages_enabled = true;
     arm(&mut interp);
     arm(&mut jit_cpu);
     drive_to_halt(&mut interp, &mut bus_i);
     drive_to_halt(&mut jit_cpu, &mut bus_j);
-    // Architectural state is byte-identical; timing is not.
+    let idx = jit::block::try_admit_gated(&mut jit_cpu, 0x200, true, true)
+        .expect("four native memory interiors must admit");
+    jit_cpu.decode_cache.stamp_region(0x200, true, idx);
+    arm(&mut interp);
+    arm(&mut jit_cpu);
+    drive_to_halt(&mut interp, &mut bus_i);
+    drive_to_halt(&mut jit_cpu, &mut bus_j);
+    assert_state_identical(&interp, &jit_cpu);
+    assert_eq!(interp.elapsed_clocks, jit_cpu.elapsed_clocks);
+    assert_eq!(bus_i.memory, bus_j.memory);
+    assert!(jit_cpu.perf_counters().jit_native_load_hits > 0);
+    assert!(jit_cpu.perf_counters().jit_native_store_hits > 0);
+}
+
+/// Run one direct-page workload through the interpreter and JIT and compare architecture, timing,
+/// and memory exactly. Both final CPUs are returned for counter and invalidation assertions.
+fn assert_native_memory_identical(
+    mode: GswMode,
+    prog: Vec<u8>,
+    arm: &dyn Fn(&mut CpuGsw),
+    expect_native_hits: Option<bool>,
+    expect_store_hits: Option<bool>,
+    expect_region: bool,
+) -> (CpuGsw, CpuGsw) {
+    let mut interp = fresh_for(mode);
+    let mut jit_cpu = fresh_for(mode);
+    jit_cpu.set_jit_auto_admit(true);
+    let mut bus_i = TestBus::with_memory(prog.clone());
+    let mut bus_j = TestBus::with_memory(prog);
+    bus_i.direct_pages_enabled = true;
+    bus_j.direct_pages_enabled = true;
+    arm(&mut interp);
+    arm(&mut jit_cpu);
+    drive_to_halt(&mut interp, &mut bus_i);
+    drive_to_halt(&mut jit_cpu, &mut bus_j);
     assert_state_identical(&interp, &jit_cpu);
     assert_eq!(
         interp.eflags(),
         jit_cpu.eflags(),
-        "materialized eflags diverged (fold on)"
+        "materialized eflags diverged"
     );
-    assert_eq!(
-        bus_i.memory, bus_j.memory,
-        "guest memory diverged (fold on)"
-    );
+    assert_eq!(interp.elapsed_clocks, jit_cpu.elapsed_clocks);
+    assert_eq!(interp.core_clocks_so_far, jit_cpu.core_clocks_so_far);
+    assert_eq!(interp.timing_rem, jit_cpu.timing_rem);
+    assert_eq!(interp.fp_rem, jit_cpu.fp_rem);
+    assert_eq!(bus_i.memory, bus_j.memory, "guest memory diverged");
     assert_eq!(
         interp.perf_counters().jit_region_entries,
         0,
@@ -1676,12 +1616,12 @@ fn assert_fold_state_identical(
     assert_eq!(
         interp.perf_counters().jit_native_load_hits,
         0,
-        "the interpreter must never run a native fold LOAD slot"
+        "the interpreter must never run a native load slot"
     );
     assert_eq!(
         interp.perf_counters().jit_native_store_hits,
         0,
-        "the interpreter must never run a native fold STORE slot"
+        "the interpreter must never run a native store slot"
     );
     if expect_region {
         assert!(
@@ -1690,12 +1630,9 @@ fn assert_fold_state_identical(
         );
     }
     let check = |actual: u64, expect: Option<bool>, what: &str| match expect {
-        Some(true) => assert!(actual > 0, "the native cost-fold {what} path never ran"),
+        Some(true) => assert!(actual > 0, "the native {what} path never ran"),
         Some(false) => {
-            assert_eq!(
-                actual, 0,
-                "the native fold {what} path must be gated off here"
-            )
+            assert_eq!(actual, 0, "the native {what} path must be gated off here")
         }
         None => {}
     };
@@ -1709,22 +1646,25 @@ fn assert_fold_state_identical(
         expect_store_hits,
         "STORE",
     );
-    interp
+    assert_eq!(
+        jit_cpu.perf_counters().jit_native_memory_helpers,
+        jit_cpu.perf_counters().jit_native_load_hits
+            + jit_cpu.perf_counters().jit_native_store_hits,
+        "the direct-page fixture must account for every byte-memory helper call"
+    );
+    (interp, jit_cpu)
 }
 
-/// Real-mode, flat DS, unpaged: the byte-copy loop's `mov al,[esi]` runs as the native cost-fold
-/// probe and stays STATE-identical to the interpreter across 200 iterations. Proves the native
-/// path actually ran (`jit_native_load_hits > 0`) — the comparator would instantly catch the
-/// begin_instruction / written_pages / EA / eip bugs the fold spec's five gates guard against.
+/// Real-mode, flat DS, unpaged byte-copy loop through the native direct-page path.
 #[test]
-fn fold_real_mode_copy_loop_is_state_identical_and_native() {
+fn native_real_mode_copy_loop_is_exact() {
     let build = |count: u32| -> Vec<u8> {
         let mut m = h_copy_program();
         m[H_COUNT..H_COUNT + 4].copy_from_slice(&count.to_le_bytes());
         m
     };
-    // The copy loop folds BOTH the load (`mov al,[esi]`) and the store (`mov [edi],al`).
-    assert_fold_state_identical(
+    assert_native_memory_identical(
+        GswMode::Gsw586,
         build(200),
         &flat_ds_arm(0x2000, 0x3000),
         Some(true),
@@ -1733,12 +1673,12 @@ fn fold_real_mode_copy_loop_is_state_identical_and_native() {
     );
 }
 
-/// Base+INDEX load (`mov al,[esi+ecx]`, scale 1) folded natively and STATE-identical. The copy
+/// Base+INDEX load (`mov al,[esi+ecx]`, scale 1) lowered natively and kept exact. The copy
 /// loop above has no index; the real R_DrawColumn loads are `[esi+ecx]`/`[esi+edx]`, so this
 /// exercises the probe's index-EA path (`add_r32_r32`) in an integrated multi-iteration loop, not
 /// just the isolation test. `ecx` is a fixed in-page offset; `esi` walks within the cached page.
 #[test]
-fn fold_index_load_is_state_identical_and_native() {
+fn native_index_load_is_exact() {
     let prog = {
         let mut m = vec![0u8; 0x1_0000];
         m[0x100] = 0x90; // nop starter -> 0x101 reached as a continuation
@@ -1761,17 +1701,12 @@ fn fold_index_load_is_state_identical_and_native() {
         flat_ds_arm(0x2000, 0x3000)(cpu);
         cpu.write_gpr32(1, 0x40); // ecx = a fixed in-page index offset; load reads [esi+0x40]
     };
-    // Index load + a plain `mov [edi],al` store both fold.
-    assert_fold_state_identical(prog, &arm, Some(true), Some(true), true);
+    assert_native_memory_identical(GswMode::Gsw586, prog, &arm, Some(true), Some(true), true);
 }
 
-/// The ALU inline slots (RegMov 0x8B mode3, RegAddImm 0x81/0, RegShrImm 0xC1/5) folded natively
-/// alongside a byte load, STATE-identical. The copy loops above use only single-byte inc/dec
-/// (region_step) — this is the only fold test that exercises the ALU-slot fold path (native op +
-/// flag helper + native fold bookkeeping replacing the region_inline_slot CALL). The drawcolumn's
-/// exact ALU shape; a wrong eip advance, flag helper, or raw_clocks in the fold would diverge.
+/// Native register groups and a direct byte load retain exact state and timing together.
 #[test]
-fn fold_alu_slots_are_state_identical() {
+fn native_alu_and_memory_slots_are_exact() {
     let prog = {
         let mut m = vec![0u8; 0x1_0000];
         m[0x100] = 0x90; // nop starter -> 0x101 reached as a continuation
@@ -1779,7 +1714,7 @@ fn fold_alu_slots_are_state_identical() {
             0x8b, 0xc8, // mov ecx,eax        (RegMov)
             0x81, 0xc1, 0x11, 0x22, 0x00, 0x00, // add ecx,0x2211  (RegAddImm)
             0xc1, 0xe9, 0x01, // shr ecx,1          (RegShrImm)
-            0x8a, 0x06, // mov al,[esi]       (MemLoadU8 fold)
+            0x8a, 0x06, // mov al,[esi]       (MemLoadU8)
             0xff, 0x0d, // dec dword [disp32] ...
         ];
         body.extend_from_slice(&(H_COUNT as u32).to_le_bytes()); // dec dword [H_COUNT]
@@ -1796,60 +1731,328 @@ fn fold_alu_slots_are_state_identical() {
         flat_ds_arm(0x2000, 0x3000)(cpu);
         cpu.write_gpr32(0, 0x1357); // eax feeds the mov/add/shr chain
     };
-    // ALU slots + a load fold; this program has no byte store (the dec is 0xFF, not 0x88).
-    assert_fold_state_identical(prog, &arm, Some(true), None, true);
+    assert_native_memory_identical(GswMode::Gsw586, prog, &arm, Some(true), None, true);
 }
 
-/// Paged (CR0.PG=1, the Doom/Quake anchor mode) with the paged native probe: linear->physical
-/// via TLB before the physical page-cache probe. The #455 harness uses a NON-IDENTITY map
-/// (lin 0x10000->phys 0x8000 etc) so a linear-as-physical bug would read wrong frames and fail
-/// assert_state_identical instantly. Both LOAD and STORE must hit native and state must match.
+/// A non-identity paged map exercises the same native implementation in every GSW mode.
 #[test]
-fn fold_paged_copy_loop_is_state_identical_and_native() {
-    let interp = assert_fold_state_identical(
-        paged_copy_program(200),
-        &pg_arm(PG_SRC_LIN, PG_DST_LIN),
-        Some(true),
-        Some(true),
-        true,
-    );
-    assert!(
-        interp.is_paging_enabled(),
-        "the paged fold test must run with paging enabled"
-    );
+fn native_paged_copy_loop_is_exact_in_all_modes() {
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let (interp, _) = assert_native_memory_identical(
+            mode,
+            paged_copy_program(200),
+            &pg_arm(PG_SRC_LIN, PG_DST_LIN),
+            Some(true),
+            Some(true),
+            true,
+        );
+        assert!(
+            interp.is_paging_enabled(),
+            "{mode:?} must keep paging enabled"
+        );
+    }
 }
 
-/// Self-modifying store under the fold, flat DS: `esi == edi == the loop's first opcode`, so the
-/// byte read is written back into live code, firing the SMC watch. State must stay identical
-/// across the write/refetch churn. The region may stay cold under the churn, so neither the
-/// region nor a native hit is required — only STATE identity + that the SMC watch fired.
 #[test]
-fn fold_self_modifying_store_stays_state_identical() {
+fn native_memory_preflights_finite_caps_in_all_modes() {
+    let drive = |cpu: &mut CpuGsw, bus: &mut TestBus, cap: u64| {
+        let mut calls = Vec::new();
+        for _ in 0..10_000 {
+            let outcome = cpu.run_straight_line(bus, cap).unwrap();
+            calls.push((outcome.core_clocks, cpu.registers.eip));
+            if outcome.halted {
+                return calls;
+            }
+        }
+        panic!("guest never halted");
+    };
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        for cap in [3, 7, 13] {
+            let mut program = h_copy_program();
+            program[H_COUNT..H_COUNT + 4].copy_from_slice(&2u32.to_le_bytes());
+            let mut interp = fresh_for(mode);
+            let mut jit_cpu = fresh_for(mode);
+            let mut bus_i = TestBus::with_memory(program.clone());
+            let mut bus_j = TestBus::with_memory(program);
+            bus_i.direct_pages_enabled = true;
+            bus_j.direct_pages_enabled = true;
+            flat_ds_arm(0x2000, 0x3000)(&mut interp);
+            flat_ds_arm(0x2000, 0x3000)(&mut jit_cpu);
+            drive_to_halt(&mut interp, &mut bus_i);
+            drive_to_halt(&mut jit_cpu, &mut bus_j);
+            let idx =
+                jit::block::try_admit(&mut jit_cpu, H_ENTRY, true).expect("admit byte-copy loop");
+            jit_cpu.decode_cache.stamp_region(H_ENTRY, true, idx);
+
+            for (cpu, bus) in [(&mut interp, &mut bus_i), (&mut jit_cpu, &mut bus_j)] {
+                flat_ds_arm(0x2000, 0x3000)(cpu);
+                cpu.halted = false;
+                bus.memory[H_COUNT..H_COUNT + 4].copy_from_slice(&12u32.to_le_bytes());
+            }
+            interp.reset_perf_counters();
+            jit_cpu.reset_perf_counters();
+            let calls_i = drive(&mut interp, &mut bus_i, cap);
+            let calls_j = drive(&mut jit_cpu, &mut bus_j, cap);
+            assert_eq!(calls_i, calls_j, "{mode:?}, cap {cap}");
+            assert_state_identical(&interp, &jit_cpu);
+            assert_eq!(interp.elapsed_clocks, jit_cpu.elapsed_clocks);
+            assert_eq!(bus_i.memory, bus_j.memory);
+            let perf = jit_cpu.perf_counters();
+            assert!(perf.jit_native_memory_helpers > 0, "{mode:?}, cap {cap}");
+            if cap == 3 {
+                assert!(
+                    perf.jit_native_memory_helpers
+                        > perf.jit_native_load_hits + perf.jit_native_store_hits,
+                    "{mode:?}: no native memory instruction used the cap fallback"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_paged_permissions_side_exit_in_all_modes() {
+    let modes = [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ];
+    for mode in modes {
+        for (writable, user, expected_cr2, load_hits) in
+            [(true, false, PG_SRC_LIN, 0), (false, true, PG_DST_LIN, 1)]
+        {
+            let mut cpu = fresh_for(mode);
+            let mut bus = TestBus::with_memory(paged_copy_program(2));
+            bus.direct_pages_enabled = true;
+            pg_arm(PG_SRC_LIN, PG_DST_LIN)(&mut cpu);
+            drive_to_halt(&mut cpu, &mut bus);
+            let idx =
+                jit::block::try_admit(&mut cpu, PG_ENTRY_LIN, true).expect("admit paged copy loop");
+            cpu.decode_cache.stamp_region(PG_ENTRY_LIN, true, idx);
+
+            pg_arm(PG_SRC_LIN, PG_DST_LIN)(&mut cpu);
+            cpu.halted = false;
+            cpu.cpl = 3;
+            cpu.idtr.limit = 0;
+            let count_phys = PG_DATA_PHYS + (PG_COUNT_LIN - PG_DATA_LIN) as usize;
+            bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());
+            cpu.tlb
+                .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, writable, user, true);
+            cpu.reset_perf_counters();
+            assert!(
+                cpu.run_straight_line(&mut bus, u64::MAX).is_err(),
+                "{mode:?} must deliver the page fault"
+            );
+            assert_eq!(cpu.control.cr2, expected_cr2, "{mode:?} CR2");
+            assert!(cpu.perf_counters().jit_region_entries > 0, "{mode:?}");
+            assert_eq!(
+                cpu.perf_counters().jit_native_load_hits,
+                load_hits,
+                "{mode:?} load fast-path count"
+            );
+            assert_eq!(cpu.perf_counters().jit_native_store_hits, 0, "{mode:?}");
+        }
+    }
+}
+
+#[test]
+fn native_paged_store_falls_back_to_set_the_dirty_bit_in_all_modes() {
+    let data_pte = 0x2000 + (PG_DATA_LIN as usize >> 12) * 4;
+    let count_phys = PG_DATA_PHYS + (PG_COUNT_LIN - PG_DATA_LIN) as usize;
+    let dst_phys = PG_DATA_PHYS + (PG_DST_LIN - PG_DATA_LIN) as usize;
+    for mode in [
+        GswMode::Gsw586,
+        GswMode::Gsw486,
+        GswMode::Gsw386,
+        GswMode::Gsw386Slow,
+    ] {
+        let mut program = paged_copy_program(2);
+        program[PG_DATA_PHYS] = 0x5a;
+        let mut interp = fresh_for(mode);
+        let mut jit_cpu = fresh_for(mode);
+        let mut bus_i = TestBus::with_memory(program.clone());
+        let mut bus_j = TestBus::with_memory(program);
+        bus_i.direct_pages_enabled = true;
+        bus_j.direct_pages_enabled = true;
+        pg_arm(PG_SRC_LIN, PG_DST_LIN)(&mut interp);
+        pg_arm(PG_SRC_LIN, PG_DST_LIN)(&mut jit_cpu);
+        drive_to_halt(&mut interp, &mut bus_i);
+        drive_to_halt(&mut jit_cpu, &mut bus_j);
+        let idx =
+            jit::block::try_admit(&mut jit_cpu, PG_ENTRY_LIN, true).expect("admit paged copy loop");
+        jit_cpu.decode_cache.stamp_region(PG_ENTRY_LIN, true, idx);
+
+        for (cpu, bus) in [(&mut interp, &mut bus_i), (&mut jit_cpu, &mut bus_j)] {
+            pg_arm(PG_SRC_LIN, PG_DST_LIN)(cpu);
+            cpu.halted = false;
+            cpu.tlb
+                .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, true, true, false);
+            bus.memory[data_pte..data_pte + 4]
+                .copy_from_slice(&((PG_DATA_PHYS as u32) | 0x007).to_le_bytes());
+            bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());
+            bus.memory[dst_phys] = 0;
+        }
+        interp.reset_perf_counters();
+        jit_cpu.reset_perf_counters();
+        drive_to_halt(&mut interp, &mut bus_i);
+        drive_to_halt(&mut jit_cpu, &mut bus_j);
+        assert_state_identical(&interp, &jit_cpu);
+        assert_eq!(interp.elapsed_clocks, jit_cpu.elapsed_clocks, "{mode:?}");
+        assert_eq!(bus_i.memory, bus_j.memory, "{mode:?}");
+        let pte = u32::from_le_bytes(bus_j.memory[data_pte..data_pte + 4].try_into().unwrap());
+        assert_ne!(pte & 0x40, 0, "{mode:?}: the store must set PTE.D");
+        assert_eq!(bus_j.memory[dst_phys], 0x5a, "{mode:?}");
+        assert!(jit_cpu.perf_counters().jit_native_load_hits > 0, "{mode:?}");
+        assert_eq!(jit_cpu.perf_counters().jit_native_store_hits, 0, "{mode:?}");
+    }
+}
+
+#[test]
+fn native_paged_supervisor_store_obeys_cr0_wp() {
+    let data_pte = 0x2000 + (PG_DATA_LIN as usize >> 12) * 4;
+    let count_phys = PG_DATA_PHYS + (PG_COUNT_LIN - PG_DATA_LIN) as usize;
+    let dst_phys = PG_DATA_PHYS + (PG_DST_LIN - PG_DATA_LIN) as usize;
+    for mode in [GswMode::Gsw586, GswMode::Gsw486] {
+        for wp in [false, true] {
+            let mut cpu = fresh_for(mode);
+            let mut bus = TestBus::with_memory(paged_copy_program(2));
+            bus.direct_pages_enabled = true;
+            pg_arm(PG_SRC_LIN, PG_DST_LIN)(&mut cpu);
+            drive_to_halt(&mut cpu, &mut bus);
+            let idx =
+                jit::block::try_admit(&mut cpu, PG_ENTRY_LIN, true).expect("admit paged copy loop");
+            cpu.decode_cache.stamp_region(PG_ENTRY_LIN, true, idx);
+
+            pg_arm(PG_SRC_LIN, PG_DST_LIN)(&mut cpu);
+            cpu.halted = false;
+            cpu.idtr.limit = 0;
+            cpu.control.cr0 = if wp {
+                cpu.control.cr0 | CR0_WP
+            } else {
+                cpu.control.cr0 & !CR0_WP
+            };
+            cpu.tlb
+                .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, false, true, true);
+            bus.memory[data_pte..data_pte + 4]
+                .copy_from_slice(&((PG_DATA_PHYS as u32) | 0x065).to_le_bytes());
+            bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());
+            bus.memory[PG_DATA_PHYS] = 0x5a;
+            bus.memory[dst_phys] = 0;
+            cpu.reset_perf_counters();
+
+            if wp {
+                assert!(
+                    cpu.run_straight_line(&mut bus, u64::MAX).is_err(),
+                    "{mode:?}"
+                );
+                assert_eq!(cpu.control.cr2, PG_DST_LIN, "{mode:?}");
+                assert_eq!(bus.memory[dst_phys], 0, "{mode:?}");
+                assert_eq!(cpu.perf_counters().jit_native_store_hits, 0, "{mode:?}");
+            } else {
+                drive_to_halt(&mut cpu, &mut bus);
+                assert_eq!(bus.memory[dst_phys], 0x5a, "{mode:?}");
+                assert!(cpu.perf_counters().jit_native_store_hits > 0, "{mode:?}");
+            }
+            assert!(cpu.perf_counters().jit_region_entries > 0, "{mode:?}");
+            assert!(cpu.perf_counters().jit_native_load_hits > 0, "{mode:?}");
+            let pte = u32::from_le_bytes(bus.memory[data_pte..data_pte + 4].try_into().unwrap());
+            assert_eq!(pte & 0x60, 0x60, "{mode:?}: PTE A/D state");
+        }
+    }
+}
+
+/// A same-value store into live code must not invalidate the compiled block.
+#[test]
+fn native_self_modifying_store_stays_exact() {
     let prog = {
         let mut m = h_copy_program();
         m[H_COUNT..H_COUNT + 4].copy_from_slice(&40u32.to_le_bytes());
         m
     };
-    let interp =
-        assert_fold_state_identical(prog, &flat_ds_arm(H_ENTRY, H_ENTRY), None, None, false);
-    let pc = interp.perf_counters();
-    assert!(
-        pc.smc_narrow_kills > 0 || pc.decode_inval_smc > 0,
-        "the self-store must have triggered the SMC watch (narrow={}, global={})",
-        pc.smc_narrow_kills,
-        pc.decode_inval_smc
+    let (interp, jit_cpu) = assert_native_memory_identical(
+        GswMode::Gsw586,
+        prog,
+        &flat_ds_arm(H_ENTRY, H_ENTRY),
+        Some(true),
+        Some(true),
+        true,
+    );
+    for (name, pc) in [
+        ("interpreter", interp.perf_counters()),
+        ("JIT", jit_cpu.perf_counters()),
+    ] {
+        assert_eq!(pc.smc_narrow_kills, 0, "{name} narrow invalidation");
+        assert_eq!(pc.decode_inval_smc, 0, "{name} global invalidation");
+    }
+    assert_eq!(
+        interp.perf_counters().code_invalidations,
+        jit_cpu.perf_counters().code_invalidations
     );
 }
 
-/// The STORE fold's writability gate (adversarial-review Finding 1): a `data_write_pages` HIT
-/// proves the physical page was writable via SOME segment, not that the current DS permits
-/// writes. A READ-ONLY flat DS (base 0, limit max, no write bit) passes `jit_segment_flat` but a
-/// store through it must #GP — so the store must NOT fold. Warm+admit with a writable DS (store
-/// folds), then re-admit with DS read-only and confirm the store is gated off. Unpaged 32-bit
-/// protected mode with segments set directly (hidden descriptors, no GDT — the pg_arm pattern).
 #[test]
-fn read_only_ds_gates_the_store_fold_off() {
-    let _fold = FoldOn::new();
+fn native_changed_store_exits_before_a_stale_register_group() {
+    const ENTRY: u32 = 0x101;
+    const PATCH: u32 = 0x107;
+    let mut program = vec![0u8; 0x1000];
+    program[0x100] = 0x90;
+    program[0x101..0x10f].copy_from_slice(&[
+        0x88, 0x07, // mov [edi],al
+        0x8b, 0xdb, // mov ebx,ebx
+        0x81, 0xc1, 0x01, 0x00, 0x00, 0x00, // add ecx,1
+        0x8b, 0xd2, // mov edx,edx
+        0x8b, 0xf6, // mov esi,esi (terminal helper)
+    ]);
+    program[0x10f] = 0xf4;
+
+    let arm = |cpu: &mut CpuGsw, patch: u8| {
+        flat_ds_arm(0, PATCH)(cpu);
+        cpu.registers.eip = 0x100;
+        cpu.registers.set_eax(u32::from(patch));
+        cpu.registers.set_ecx(0);
+        cpu.halted = false;
+    };
+    let mut interp = fresh();
+    let mut jit_cpu = fresh();
+    let mut bus_i = TestBus::with_memory(program.clone());
+    let mut bus_j = TestBus::with_memory(program);
+    bus_i.direct_pages_enabled = true;
+    bus_j.direct_pages_enabled = true;
+    arm(&mut interp, 1);
+    arm(&mut jit_cpu, 1);
+    drive_to_halt(&mut interp, &mut bus_i);
+    drive_to_halt(&mut jit_cpu, &mut bus_j);
+    let idx = jit::block::try_admit(&mut jit_cpu, ENTRY, true).expect("admit SMC block");
+    jit_cpu.decode_cache.stamp_region(ENTRY, true, idx);
+
+    arm(&mut interp, 2);
+    arm(&mut jit_cpu, 2);
+    drive_to_halt(&mut interp, &mut bus_i);
+    drive_to_halt(&mut jit_cpu, &mut bus_j);
+    assert_eq!(bus_i.memory[PATCH as usize], 2);
+    assert_eq!(interp.registers.ecx(), 2);
+    assert_state_identical(&interp, &jit_cpu);
+    assert_eq!(interp.elapsed_clocks, jit_cpu.elapsed_clocks);
+    assert_eq!(bus_i.memory, bus_j.memory);
+    assert!(jit_cpu.perf_counters().jit_native_store_hits > 0);
+    assert!(jit_cpu.perf_counters().smc_narrow_kills > 0);
+}
+
+/// Native entry gates use the same descriptor matrix as the interpreter and are rechecked after a
+/// region has already been compiled.
+#[test]
+fn native_ds_access_gates_match_protected_mode() {
     let flat = |access: u8| SegmentRegister {
         selector: 0x08,
         base: 0,
@@ -1866,38 +2069,43 @@ fn read_only_ds_gates_the_store_fold_off() {
         cpu.control.cr0 |= CR0_PE; // protected, UNPAGED (PG stays clear)
         h_arm(0x2000, 0x3000)(cpu); // eip/esp/esi/edi + flags
     };
-    let prog = {
-        let mut m = h_copy_program();
-        m[H_COUNT..H_COUNT + 4].copy_from_slice(&8u32.to_le_bytes());
-        m
-    };
-    let mut cpu = fresh();
-    let mut bus = TestBus::with_memory(prog);
-    bus.direct_pages_enabled = true;
+    for (access, readable, writable) in [
+        (0x90, true, false),
+        (0x92, true, true),
+        (0x98, false, false),
+        (0x9a, true, false),
+    ] {
+        let mut cpu = fresh();
+        setup(&mut cpu, access);
+        assert_eq!(cpu.jit_segment_readable(SegmentIndex::Ds), readable);
+        assert_eq!(cpu.jit_segment_writable(SegmentIndex::Ds), writable);
+    }
 
-    // Writable DS: warm the loop's stores + admit → the store folds (has_native_store).
-    setup(&mut cpu, 0x93);
-    assert!(cpu.jit_segment_flat(SegmentIndex::Ds));
-    assert!(cpu.jit_segment_writable(SegmentIndex::Ds));
-    assert!(
-        cpu.jit_fold_block_eligible(),
-        "unpaged flat pmode is fold-eligible"
-    );
-    drive_to_halt(&mut cpu, &mut bus);
-    let idx = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("admit the copy loop");
-    assert!(
-        cpu.jit_regions.get_mut(idx).unwrap().has_native_store,
-        "a writable DS must fold the store"
-    );
-
-    // Read-only flat DS: re-admit reads the current DS and must gate the store off (else it
-    // would silently write where the interpreter #GPs). Still flat, so the LOAD still folds.
-    setup(&mut cpu, 0x90); // present, dpl0, data, read-only (write bit clear)
-    assert!(cpu.jit_segment_flat(SegmentIndex::Ds));
-    assert!(!cpu.jit_segment_writable(SegmentIndex::Ds));
-    let idx2 = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("re-admit");
-    assert!(
-        !cpu.jit_regions.get_mut(idx2).unwrap().has_native_store,
-        "a read-only DS must gate the store fold off"
-    );
+    for (forbidden_access, load_hits) in [(0x90, 1), (0x98, 0)] {
+        let mut prog = h_copy_program();
+        prog[H_COUNT..H_COUNT + 4].copy_from_slice(&8u32.to_le_bytes());
+        let mut cpu = fresh();
+        let mut bus = TestBus::with_memory(prog);
+        bus.direct_pages_enabled = true;
+        setup(&mut cpu, 0x92);
+        drive_to_halt(&mut cpu, &mut bus);
+        let idx = jit::block::try_admit(&mut cpu, H_ENTRY, true).expect("admit copy loop");
+        {
+            let region = cpu.jit_regions.get_mut(idx).unwrap();
+            assert!(region.has_native_load);
+            assert!(region.has_native_store);
+        }
+        cpu.decode_cache.stamp_region(H_ENTRY, true, idx);
+        setup(&mut cpu, forbidden_access);
+        cpu.halted = false;
+        bus.memory[H_COUNT..H_COUNT + 4].copy_from_slice(&8u32.to_le_bytes());
+        cpu.reset_perf_counters();
+        assert!(
+            cpu.run_straight_line(&mut bus, u64::MAX).is_err(),
+            "the forbidden DS access must take the interpreter fault path"
+        );
+        assert!(cpu.perf_counters().jit_region_entries > 0);
+        assert_eq!(cpu.perf_counters().jit_native_load_hits, load_hits);
+        assert_eq!(cpu.perf_counters().jit_native_store_hits, 0);
+    }
 }

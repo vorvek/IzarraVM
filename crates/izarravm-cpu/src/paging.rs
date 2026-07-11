@@ -23,6 +23,8 @@ pub(crate) const FETCH_PAGE_CACHE_ENTRIES: usize = 4;
 
 // --- TLB ---
 
+// The JIT's paged memory probe emits the entry stride and field offsets directly.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct TlbEntry {
     /// Linear page number (linear >> 12). Meaningful only when `generation` is current.
@@ -118,12 +120,8 @@ impl std::fmt::Debug for Tlb {
     }
 }
 
-// --- Direct Page Cache (repr(C) for JIT probe compatibility) ---
+// --- Direct Page Cache ---
 
-// repr(C) pins the field layout (physical_page at +0, ptr at +8, size 16) that the native memory
-// probe's emitted deref hardcodes; default repr may reorder these, which in a release build (no
-// debug_assert) would silently read the wrong field. See jit::block::emit_load_u8_probe.
-#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct DirectPageCacheEntry {
     pub(crate) physical_page: u32,

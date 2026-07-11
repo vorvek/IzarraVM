@@ -40,15 +40,6 @@ fn run_bench_one(
     run_bench_one_profiled(hardware, mode, source, budget, stride)
 }
 
-/// Whether the cost-fold native-load JIT experiment is enabled for this run.
-/// It is an opt-in measurement switch and a no-op without the JIT.
-#[cfg(feature = "jit")]
-pub(super) fn jit_fold_enabled() -> bool {
-    std::env::var("IZARRAVM_JIT_FOLD")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-}
-
 fn run_bench_one_profiled(
     hardware: &HardwareProfile,
     mode: GswMode,
@@ -508,7 +499,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
              page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
              map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
              jit[entries/insns/native/helper]={}/{}/{}/{}  \
-             jit_mem[load/store/tlb]={}/{}/{}  jit_time[ns/samples]={}/{}",
+             jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
             name,
             mode.canonical_name(),
             perf.instructions,
@@ -542,6 +533,7 @@ pub(super) fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>
             perf.jit_native_load_hits,
             perf.jit_native_store_hits,
             perf.jit_paged_tlb_successes,
+            perf.jit_native_memory_helpers,
             perf.jit_native_block_ns,
             perf.jit_native_block_samples,
         );
@@ -958,6 +950,7 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "jit_region_insns": perf.jit_region_insns,
         "jit_native_insns": perf.jit_native_insns,
         "jit_helper_exits": perf.jit_helper_exits,
+        "jit_native_memory_helpers": perf.jit_native_memory_helpers,
         "jit_native_block_ns": perf.jit_native_block_ns,
         "jit_native_block_samples": perf.jit_native_block_samples,
         "jit_native_load_hits": perf.jit_native_load_hits,
@@ -978,7 +971,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
          jit[entries/insns/native/helper]={}/{}/{}/{}  \
-         jit_mem[load/store/tlb]={}/{}/{}  jit_time[ns/samples]={}/{}",
+         jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
         name,
         mode.canonical_name(),
         perf.instructions,
@@ -1017,6 +1010,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.jit_native_load_hits,
         perf.jit_native_store_hits,
         perf.jit_paged_tlb_successes,
+        perf.jit_native_memory_helpers,
         perf.jit_native_block_ns,
         perf.jit_native_block_samples,
     );

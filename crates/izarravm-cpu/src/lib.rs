@@ -534,6 +534,8 @@ pub struct PerfCounters {
     /// Transitions from emitted code into `region_step`, including a transition that reports a
     /// fault. Inline bookkeeping and flag helpers are not counted.
     pub jit_helper_exits: u64,
+    /// Calls from emitted byte-memory probes into the exact Rust memory helper.
+    pub jit_native_memory_helpers: u64,
     /// Wall time for sampled compiled-region calls and the number of samples. The first entry and
     /// every 1,024th entry are sampled to keep timing overhead out of the hot path.
     pub jit_native_block_ns: u64,
@@ -543,20 +545,11 @@ pub struct PerfCounters {
     /// the JIT is re-warming - a signal to raise the cap or add per-entry eviction. Zero on the
     /// single-phase anchors. Always present (zero without the `jit` feature).
     pub jit_table_clears: u64,
-    /// Byte loads served by the native cost-fold LOAD probe (a page-cache HIT run entirely in emitted
-    /// code, skipping the `region_step` call). Bumped natively by the emitted probe. Zero unless
-    /// `IZARRAVM_JIT_FOLD` is on AND the block is fold-eligible (Approximate class, unpaged, flat DS);
-    /// on the paged Doom/Quake anchors this stays ~0 (the unpaged probe is gated off), which is the
-    /// A/B signal that this first cut is Doom-inert. Always present (zero without the `jit` feature).
+    /// Byte loads completed through the native address probe and exact direct-page helper.
     pub jit_native_load_hits: u64,
-    /// Byte stores served by the native cost-fold STORE probe (a `data_write_pages` HIT written in
-    /// emitted code + the `record_write_page`/`note_code_write` finish call, skipping the `region_step`
-    /// call). Same gating + Doom-inertness as `jit_native_load_hits`.
+    /// Byte stores completed through the native address probe and exact direct-page helper.
     pub jit_native_store_hits: u64,
-    /// For paged fold investigation (low native hit rate on Doom): bumped in the emitted
-    /// paged probe right after successful TLB translate (before the physical page-cache probe).
-    /// Compare to jit_native_*_hits to see TLB hit rate within admitted paged fold slots.
-    /// Also helps separate TLB thrash from direct-page cache thrash.
+    /// Successful emitted TLB translations before the physical direct-page cache probe.
     pub jit_paged_tlb_successes: u64,
     pub data_direct_reads: u64,
     pub data_slow_reads: u64,

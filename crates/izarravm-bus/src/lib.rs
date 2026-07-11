@@ -397,15 +397,6 @@ impl BusTrace {
         self.elapsed_clocks
     }
 
-    /// Add `clocks` guest bus clocks to the running total in one shot, without a per-cycle record.
-    /// The JIT cost-fold uses this to flush a block's accumulated fetch/data bus cost (which it
-    /// computed from compile-time constants) at a flush point, instead of one `record` per access.
-    /// Only `elapsed_clocks` (what the device scheduler and batch-end step read) is affected; the
-    /// retained per-cycle detail is intentionally coarsened away for the folded run.
-    pub fn add_elapsed_clocks(&mut self, clocks: u64) {
-        self.elapsed_clocks += clocks;
-    }
-
     pub fn clear(&mut self) {
         self.cycles.clear();
         self.elapsed_clocks = 0;
@@ -505,47 +496,28 @@ pub trait CpuBus {
         Ok(())
     }
 
-    /// The clock cost this bus charges for ONE instruction-fetch access of cacheable RAM (the JIT
-    /// cost-fold's per-instruction fetch constant, read once per region entry and folded across the
-    /// block instead of charged per slot). Buses without bus timing return 0. See `charge_bus_clocks_bulk`.
-    ///
-    /// CALLER OBLIGATION: this is the CACHEABLE-RAM fast-path constant. ROM / device-window / A20-edge
-    /// fetches charge differently (per byte, or address-classified), so the cost-fold must only fold
-    /// blocks whose code is conventional cacheable RAM - the constant is wrong otherwise.
-    fn jit_fetch_cost_clocks(&self) -> u64 {
-        0
+    /// Return an upper bound on the raw clocks added by one cached direct-memory charge. `Some`
+    /// remains valid until the bus reports a step break. A JIT uses it only after its CPU-side
+    /// direct-page cache hit; `None` keeps the ordinary instruction path.
+    fn jit_direct_memory_max_clocks(&self, _width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
+        None
     }
 
-    /// Return the raw bus clocks that `charge_instruction_fetch_run(start, count)` will add with
-    /// the bus otherwise unchanged. `Some` also guarantees that call cannot fail. A JIT uses this
-    /// to preflight non-faulting fixed-cost native groups; `None` keeps the per-instruction path.
+    /// Return the raw bus clocks that `charge_instruction_fetch_run(start, count)` will add.
+    /// `Some` also guarantees that call cannot fail and that the cost remains valid until the bus
+    /// reports a step break. A JIT uses this to preflight non-faulting fixed-cost native groups;
+    /// `None` keeps the per-instruction path.
     fn jit_cached_fetch_run_clocks(&self, _start: u32, _count: u32) -> Option<u64> {
         None
     }
 
-    /// Project the exact in-batch scaled bus-clock total after `additional_raw` clocks. A JIT may
-    /// batch native instructions only when this returns `Some`; `None` keeps the ordinary
-    /// per-instruction charging path.
+    /// Project the exact in-batch scaled bus-clock total after `additional_raw` clocks. `Some`
+    /// guarantees a fixed integer-rational scaler for the batch, so the scaled delta for the same
+    /// raw increment can drift by at most one clock as its starting remainder changes. A JIT may
+    /// batch native instructions only when this returns `Some`; `None` keeps the ordinary path.
     fn jit_projected_batch_scaled_bus_clocks(&self, _additional_raw: u64) -> Option<u64> {
         None
     }
-
-    /// The clock cost this bus charges for ONE byte-wide direct data access (the JIT cost-fold's
-    /// per-byte-access data constant). Buses without bus timing return 0.
-    ///
-    /// CALLER OBLIGATION: this is the flat Approximate-class L1 constant. The Accurate class and
-    /// device-window accesses charge per-address, so the cost-fold must only fold Approximate-class
-    /// blocks whose data hits the direct-page cache (which the native probe already requires) - the
-    /// constant is wrong otherwise.
-    fn jit_data_byte_cost_clocks(&self) -> u64 {
-        0
-    }
-
-    /// Charge `clocks` bus clocks in one shot (the JIT cost-fold's bulk flush). The folded block
-    /// accumulates fetch + data cost from the two constants above and flushes it here at a flush
-    /// point, keeping the device-scheduler-visible clock total correct without a per-access record.
-    /// Buses without bus timing do nothing.
-    fn charge_bus_clocks_bulk(&mut self, _clocks: u64) {}
 
     /// Copy physical instruction bytes into `out` without charging bus clocks.
     /// The CPU charges each consumed fetch byte separately so prefetch snapshots

@@ -347,11 +347,17 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
-    /// One instruction-fetch access of cacheable RAM: `clocks_for(_, code_fetch_wait_states)` = 2 +
-    /// the per-mode I-cache constant. Matches what `charge_instruction_fetch_run`'s cacheable-RAM
-    /// fast path records for one access (machine.rs ~9806). The JIT cost-fold folds this per slot.
-    fn jit_fetch_cost_clocks(&self) -> u64 {
-        2 + u64::from(self.cache.code_fetch_wait_states())
+    fn jit_direct_memory_max_clocks(&self, width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
+        let wait_states = if self.flat_data_cost {
+            self.cache.cost.l1
+        } else {
+            self.cache
+                .cost
+                .l1
+                .max(self.cache.cost.l2)
+                .max(self.cache.cost.ram)
+        };
+        Some(u64::from(BusCycle::clocks_for(width, wait_states)))
     }
 
     fn jit_cached_fetch_run_clocks(&self, start: u32, count: u32) -> Option<u64> {
@@ -360,7 +366,7 @@ impl CpuBus for MachineBus<'_> {
         }
         let end = start.checked_add(count - 1)?;
         if end < 0x000A_0000 {
-            return Some(self.jit_fetch_cost_clocks());
+            return Some(2 + u64::from(self.cache.code_fetch_wait_states()));
         }
         let first = self.apply_a20(start);
         let last = self.apply_a20(end);
@@ -383,17 +389,6 @@ impl CpuBus for MachineBus<'_> {
             .checked_mul(u64::from(self.bus_num_at_batch_start))?
             .checked_add(self.bus_rem_at_batch_start)
             .map(|scaled| scaled / u64::from(self.bus_den_at_batch_start))
-    }
-
-    /// One byte-wide direct data access: `clocks_for(Byte, cost.l1)` = 2 + the flat L1 wait-state,
-    /// exactly what `charge_direct_memory` records for a direct-page hit in the Approximate class.
-    fn jit_data_byte_cost_clocks(&self) -> u64 {
-        2 + u64::from(self.cache.cost.l1)
-    }
-
-    /// Flush the JIT cost-fold's accumulated bus clocks into the trace's running total in one op.
-    fn charge_bus_clocks_bulk(&mut self, clocks: u64) {
-        self.trace.add_elapsed_clocks(clocks);
     }
 
     /// See the trait doc: the straight-line run loop adds this figure's growth

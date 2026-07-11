@@ -411,15 +411,6 @@ impl CpuGsw {
         self.jit_regions.set_auto_admit(on && jit::HOST_SUPPORTED);
     }
 
-    /// Enable/disable the cost-fold native-LOAD path (env `IZARRAVM_JIT_FOLD`), a process-global toggle
-    /// read at region emit time. Off by default so ordinary JIT admission and every bit-identical
-    /// test are undisturbed. Turning it on makes folded memory timing approximate, so it is
-    /// validated by the anchor bands, not the differential timing asserts.
-    #[cfg(feature = "jit")]
-    pub fn set_jit_fold_timing(on: bool) {
-        jit::block::FOLD_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
     /// forced admission address, or once a line is hot enough) compile/re-stamp one first. `Ok(None)`
     /// means "no region ran"; the caller falls back to the interpreted continuation.
@@ -492,11 +483,10 @@ impl CpuGsw {
         let mode_key = self.jit_mode_key();
         let (num, den) = level_timing(self.persona());
         let rem0 = self.timing_rem;
-        // For a region with native cost-fold LOAD/STORE slots: DS flatness (and, for stores, DS
-        // writability) is a runtime value NOT in the mode key, so re-check it here per entry (like the
-        // per-slot CS-limit check below). Computed before the region borrow so `self` is free to read
-        // the segment. Cheap; only consulted for regions that emitted a native probe.
+        // Native byte-memory helpers assume flat DS. Descriptor access rights are runtime values
+        // not present in the mode key, so set their per-entry guards before borrowing the table.
         let ds_flat = self.jit_segment_flat(SegmentIndex::Ds);
+        let ds_readable = self.jit_segment_readable(SegmentIndex::Ds);
         let ds_writable = self.jit_segment_writable(SegmentIndex::Ds);
         let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
         let (entry, ctx_ptr) = {
@@ -521,20 +511,6 @@ impl CpuGsw {
                 self.decode_cache.unstamp_region(lin, d);
                 return Ok(None);
             }
-            if region.has_native_fold && !ds_flat {
-                // This region's native cost-fold LOAD/STORE slots assume DS is flat (EA == linear ==
-                // physical). DS is no longer flat, so the emitted probe would compute the wrong
-                // address. Bail to the interpreter (always correct); leave the stamp so a later entry
-                // re-uses the region if DS becomes flat again (self-healing, no re-admit churn).
-                return Ok(None);
-            }
-            if region.has_native_store && !ds_writable {
-                // A native STORE slot assumes DS permits writes (a write-cache HIT only proves the
-                // physical page was writable via some segment). DS is now read-only, so the native store
-                // would silently write where the interpreter #GPs — bail to the interpreter, which
-                // faults correctly. Self-healing like the flatness check.
-                return Ok(None);
-            }
             let ctx = &mut *region.ctx;
             // Every slot must pass the same live CS-limit check its interpreted continuation
             // would have (limits cannot change inside: no CS writer is admitted).
@@ -544,6 +520,50 @@ impl CpuGsw {
                     return Ok(None);
                 }
             }
+            let can_native_load = region.has_native_load && ds_flat && ds_readable;
+            let can_native_store = region.has_native_store && ds_flat && ds_writable;
+            let native_u8_clock_bound =
+                if cap == u64::MAX || (!can_native_load && !can_native_store) {
+                    Some(0)
+                } else {
+                    (|| {
+                        let mut fetch_max = 0;
+                        for slot in &ctx.slots {
+                            if matches!(
+                                slot.kind,
+                                jit::step::SlotKind::MemLoadU8 | jit::step::SlotKind::MemStoreU8
+                            ) {
+                                fetch_max = fetch_max.max(bus.jit_cached_fetch_run_clocks(
+                                    slot.lin,
+                                    u32::from(slot.insn.len),
+                                )?);
+                            }
+                        }
+                        let mut data_max = 0;
+                        if can_native_load {
+                            data_max = data_max.max(bus.jit_direct_memory_max_clocks(
+                                BusWidth::Byte,
+                                BusAccessKind::DataRead,
+                            )?);
+                        }
+                        if can_native_store {
+                            data_max = data_max.max(bus.jit_direct_memory_max_clocks(
+                                BusWidth::Byte,
+                                BusAccessKind::DataWrite,
+                            )?);
+                        }
+                        let additional_bus = fetch_max.checked_add(data_max)?;
+                        let bus_now = bus.in_batch_scaled_bus_clocks();
+                        let bus_after =
+                            bus.jit_projected_batch_scaled_bus_clocks(additional_bus)?;
+                        let bus_bound = bus_after.checked_sub(bus_now)?.saturating_add(1);
+                        let num = u64::from(num);
+                        let den = u64::from(den);
+                        let core_bound = (2 * num).div_ceil(den);
+                        core_bound.checked_add(bus_bound)
+                    })()
+                };
+            let native_memory_timing = native_u8_clock_bound.is_some();
             ctx.step_fn = Some(step_fn);
             ctx.inline_step_fn =
                 Some(jit::step::region_inline_slot::<B> as jit::step::RegionStepFn);
@@ -561,15 +581,7 @@ impl CpuGsw {
                     Self::jit_set_shift_flags_shr as fn(&mut CpuGsw, u32, u8),
                 )
             });
-            ctx.charge_fetch_fn =
-                Some(jit::step::jit_charge_fetch::<B> as jit::step::ChargeFetchFn);
-            ctx.bus_clocks_fn = Some(jit::step::jit_bus_clocks::<B> as jit::step::BusClocksFn);
-            ctx.line_live_fn = Some(jit::step::jit_line_live as jit::step::LineLiveFn);
-            ctx.store_finish_fn = Some(unsafe {
-                std::mem::transmute::<fn(&mut CpuGsw, u32), jit::step::StoreFinishFn>(
-                    Self::jit_store_u8_finish as fn(&mut CpuGsw, u32),
-                )
-            });
+            ctx.native_u8_fn = Some(jit::step::region_native_u8::<B> as jit::step::NativeU8Fn);
             ctx.native_group_guard_fn =
                 Some(jit::step::region_native_group_guard::<B> as jit::step::NativeGroupGuardFn);
             ctx.native_group_finish_fn =
@@ -579,22 +591,21 @@ impl CpuGsw {
             ctx.insn_count = 0;
             ctx.native_insn_count = 0;
             ctx.helper_exit_count = 0;
+            ctx.native_memory_helper_count = 0;
+            ctx.native_load_enabled = u32::from(native_memory_timing && can_native_load);
+            ctx.native_store_enabled = u32::from(native_memory_timing && can_native_store);
+            ctx.native_u8_clock_bound = native_u8_clock_bound.unwrap_or(0);
             ctx.run_total_at_entry = total;
             ctx.bus_at_run_start = bus_at_entry;
             ctx.cap = cap;
             ctx.rem0 = rem0;
             ctx.scale_num = num;
             ctx.scale_den = den;
+            ctx.smc_epoch_at_entry = epoch;
             ctx.d = d;
             ctx.exit = jit::step::RegionExitKind::Boundary;
             ctx.fault = None;
             ctx.halted = false;
-            // Cost-fold: start the folded-bus accumulator empty; region_step flushes it. A native
-            // The optional native memory path folds one instruction fetch and one data byte. Stash
-            // that combined cost from the concrete bus because the emitted buffer cannot call a bus
-            // method. Buses without timing return zero.
-            ctx.folded_raw_bus = 0;
-            ctx.fold_bus_cost = bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks();
             (region.entry, std::ptr::from_mut(ctx))
         };
         let block_start = (self.perf.jit_region_entries & 0x3ff == 0).then(std::time::Instant::now);
@@ -611,7 +622,7 @@ impl CpuGsw {
                 ctx_ptr,
             );
         }
-        let (raw, count, native_count, helper_exits, halted, fault, folded_bus) = {
+        let (raw, count, native_count, helper_exits, memory_helpers, halted, fault) = {
             let region = self
                 .jit_regions
                 .get_mut(idx)
@@ -622,21 +633,14 @@ impl CpuGsw {
                 ctx.insn_count,
                 ctx.native_insn_count,
                 ctx.helper_exit_count,
+                ctx.native_memory_helper_count,
                 ctx.halted,
                 ctx.fault.take(),
-                std::mem::take(&mut ctx.folded_raw_bus),
             )
         };
         if let Some(start) = block_start {
             self.perf.jit_native_block_ns += duration_ns_u64(start.elapsed());
             self.perf.jit_native_block_samples += 1;
-        }
-        // Flush any bus cost the tail native fold slots accumulated but did not hand to a region_step
-        // slot: a region that exits directly from a native LOAD's line_live probe (or an inline slot's
-        // cap check immediately after one) leaves the last fold unflushed. Bus-timing only (the core
-        // term rides raw_clocks below), keeping the device-visible clock total current at region exit.
-        if folded_bus > 0 {
-            bus.charge_bus_clocks_bulk(folded_bus);
         }
         let charged = self.scale_clocks_batch(raw);
         self.elapsed_clocks += charged;
@@ -645,6 +649,7 @@ impl CpuGsw {
         self.perf.jit_region_insns += u64::from(count);
         self.perf.jit_native_insns += u64::from(native_count);
         self.perf.jit_helper_exits += u64::from(helper_exits);
+        self.perf.jit_native_memory_helpers += u64::from(memory_helpers);
         if ring0 {
             self.perf.monitor_resident_core_clocks += charged;
         }

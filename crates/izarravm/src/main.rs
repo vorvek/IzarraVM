@@ -162,11 +162,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
-    // The cost-fold native-LOAD JIT path is a process-global toggle read at region emit time; set it
-    // once here from `IZARRAVM_JIT_FOLD` so every entry path (bench/hdd-folder/katea/exe) sees it. Only
-    // meaningful while JIT admission is active; a no-op in an interpreter-only build.
-    #[cfg(feature = "jit")]
-    izarravm_cpu::CpuGsw::set_jit_fold_timing(bench::jit_fold_enabled());
     let midi_presence = midi_config_presence(&cli)?;
     let mut config = load_config(&cli)?;
     // When the user gave no C: location (no --c_drive, no --dosroot, and the

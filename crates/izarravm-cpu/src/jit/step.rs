@@ -5,9 +5,9 @@
 //! communicates through. One call per guest instruction slot: the step does exactly what one
 //! `run_straight_line` continuation does (the `run_one_cached` prologue, the cached-fetch charge,
 //! the execute dispatch, and the post-instruction break checks, in the same order), so guest
-//! semantics, bus traffic, and clock accounting are interpreter-identical by construction. The
-//! emitted native code contributes only the call sequencing and the loop back-edge; it never
-//! computes guest state itself.
+//! semantics, bus traffic, and clock accounting are interpreter-identical by construction. Native
+//! templates handle admitted register and address work. These helpers retain the bus, fault, and
+//! timing operations that depend on Rust state.
 //!
 //! What the region defers to its exit (see `CpuGsw::run_region`): `scale_clocks` (one batch call,
 //! sound by the remainder-carry identity the batch-identity test pins), `elapsed_clocks`,
@@ -20,7 +20,7 @@
 
 use std::ffi::c_void;
 
-use izarravm_bus::CpuBus;
+use izarravm_bus::{BusAccessKind, BusWidth, CpuBus};
 
 use crate::{CpuGsw, DecodedInsn, InternalFault};
 
@@ -49,17 +49,13 @@ pub(crate) enum SlotKind {
     RegAddImm { dst: u8, imm: u32 },
     /// `shr r32, imm8` (opcode 0xC1 /5, mode 3): native shr + `jit_set_shift_flags_shr` call.
     RegShrImm { dst: u8, count: u8 },
-    /// A memory-operand slot (load/store/r-m-w): the full v1 `region_step` (decode dispatch +
-    /// bus-bound memory resolution + fault handling).
+    /// A memory operand without a native lowering. Runs through `region_step`.
     Memory,
-    /// A `mov r8, [mem]` byte load (opcode 0x8A, memory operand). Runs through `region_step` like a
-    /// `Memory` slot, but `region_step` calls the specialized `jit_execute_load_u8` (which skips the
-    /// group/opcode dispatch chain) instead of the general `execute_hot_cached_or_decoded`. Stage 1
-    /// of the Round 3 byte-load template: dispatch removal only, bit-identical in every mode.
+    /// A `mov r8, [mem]` byte load (opcode 0x8A, memory operand). Unsupported address or runtime
+    /// shapes use `region_step`; eligible flat-DS forms use the exact byte helper.
     MemLoadU8,
-    /// A `mov [mem], r8` byte store (opcode 0x88, memory operand). Like `MemLoadU8` but `region_step`
-    /// calls the specialized `jit_execute_store_u8`. `write_memory_u8` runs `note_code_write`, so the
-    /// SMC code-write watch is inherited; dispatch removal only, bit-identical in every mode.
+    /// A `mov [mem], r8` byte store (opcode 0x88, memory operand). Uses the same native gate and
+    /// precise fallback as `MemLoadU8`.
     MemStoreU8,
     /// A `mov r16/r32, [mem]` sized load (opcode 0x8B, memory operand): `region_step` calls
     /// `jit_execute_load_sized`. Dispatch removal only; word and dword both go through
@@ -102,31 +98,15 @@ pub(crate) type SetPendingAddFn = unsafe extern "C" fn(cpu: *mut CpuGsw, a: u32,
 #[cfg(feature = "jit")]
 pub(crate) type SetShiftFlagsFn = unsafe extern "C" fn(cpu: *mut CpuGsw, value: u32, count: u8);
 
-/// Signature of the charge-cached-fetch call-out. Advances eip by `len` and charges the bus for
-/// the instruction fetch. Returns 0 on success, 1 on fault (the fault is recorded in ctx).
+/// Execute one byte memory instruction after emitted code has resolved its physical address.
 #[cfg(feature = "jit")]
-pub(crate) type ChargeFetchFn = unsafe extern "C" fn(
+pub(crate) type NativeU8Fn = unsafe extern "C" fn(
     cpu: *mut CpuGsw,
     bus: *mut c_void,
     ctx: *mut RegionCtx,
-    lin: u32,
-    len: u32,
+    k: u32,
+    physical: u32,
 ) -> u8;
-
-/// Signature of the scaled-bus-clocks call-out. Returns the live in-batch scaled bus clock count.
-#[cfg(feature = "jit")]
-pub(crate) type BusClocksFn = unsafe extern "C" fn(bus: *const c_void) -> u64;
-
-/// Signature of the decode-line liveness probe. Returns 1 if the slot's line is live, 0 otherwise.
-#[cfg(feature = "jit")]
-pub(crate) type LineLiveFn = unsafe extern "C" fn(cpu: *const CpuGsw, lin: u32, d: bool) -> bool;
-
-/// Signature of the native-STORE write-tracking call-out: after the emitted probe writes the byte
-/// through the page-cache pointer, this does the part of `write_memory_u8` that is not the write —
-/// `record_write_page` (unpaged prefetch snapshot) + `note_code_write` (the SMC watch). `physical`
-/// is the store's physical address (== linear, since the store fold is unpaged-gated).
-#[cfg(feature = "jit")]
-pub(crate) type StoreFinishFn = unsafe extern "C" fn(cpu: *mut CpuGsw, physical: u32);
 
 /// Check whether one native group fits before any guest register is changed.
 #[cfg(feature = "jit")]
@@ -166,15 +146,9 @@ pub(crate) struct RegionCtx {
     /// call. At `[ctx + 24]` (fourth pointer field).
     #[cfg(feature = "jit")]
     pub set_shift_flags_fn: Option<SetShiftFlagsFn>,
-    /// Fn pointer to the charge-cached-fetch call-out (advances eip + charges bus). At `[ctx+32]`.
+    /// Exact byte-memory helper specialized for the live bus type. At `[ctx + 32]`.
     #[cfg(feature = "jit")]
-    pub charge_fetch_fn: Option<ChargeFetchFn>,
-    /// Fn pointer to the scaled-bus-clocks call-out. At `[ctx+40]`.
-    #[cfg(feature = "jit")]
-    pub bus_clocks_fn: Option<BusClocksFn>,
-    /// Fn pointer to the decode-line liveness probe. At `[ctx+48]`.
-    #[cfg(feature = "jit")]
-    pub line_live_fn: Option<LineLiveFn>,
+    pub native_u8_fn: Option<NativeU8Fn>,
     pub slots: Vec<Slot>,
     /// Index of the block's terminal slot. For a self-loop (`is_loop`) it is the back-edge branch:
     /// taken = native back-edge, not taken = `LoopDone`. For a linear block it is the last slot:
@@ -199,6 +173,8 @@ pub(crate) struct RegionCtx {
     pub rem0: u64,
     pub scale_num: u32,
     pub scale_den: u32,
+    /// Decode-cache SMC epoch captured at region entry.
+    pub smc_epoch_at_entry: u32,
     /// The region's decode-line D bit, for the next-line liveness probe below.
     pub d: bool,
 
@@ -211,33 +187,19 @@ pub(crate) struct RegionCtx {
     pub halted: bool,
     /// Whether the block is a self-loop (terminal slot is a relative branch back to the entry) or
     /// a linear block. Read by `region_step` at the terminal slot to decide loop vs return. Placed
-    /// last so it does not shift any offset the emitted native code reads (fn pointers 0..48, the
-    /// timing fields 88..144); the emitter never reads this field.
+    /// last; the emitter never reads this field directly.
     pub is_loop: bool,
-
-    // ---- Cost-fold state (the native-fold path; zero/unused under the trampoline) ----
-    /// Raw (unscaled) bus clocks a native slot has folded but not yet flushed into the bus trace.
-    /// A native memory/ALU slot adds its fetch (+ data) cost here instead of charging the bus per
-    /// slot; `region_step` flushes it (via `bus.charge_bus_clocks_bulk`) at its top, so every
-    /// region_step slot and the back-edge reconcile the device-visible clock total. Under the
-    /// trampoline (no native slots) it stays 0, so the flush is inert. Reset per entry. (The
-    /// per-instruction cost constants the native slots fold from land here alongside the emit.)
-    pub folded_raw_bus: u64,
-    /// The raw bus clocks ONE native MEMORY fold slot charges (fetch + one byte of data), set per entry
-    /// by `run_region` from `bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks()`. The
-    /// bus-agnostic emitted buffer cannot read a bus method (THE WRINKLE in the fold spec), so the
-    /// dispatch stashes the constant here like `scale_den`; a native LOAD/STORE slot adds it to
-    /// `folded_raw_bus`. Zero under the trampoline. Past the disp8 range, so the emit reads it by disp32.
-    pub fold_bus_cost: u64,
-    /// Raw fn pointer to `CpuGsw::jit_store_u8_finish`, loaded (by disp32) + called by a native STORE
-    /// fold slot after it writes the byte, to do `record_write_page` + `note_code_write`. Written by the
-    /// dispatch on every entry. `None` under the trampoline (no native store slot loads it).
-    #[cfg(feature = "jit")]
-    pub store_finish_fn: Option<StoreFinishFn>,
     /// Instructions completed by emitted native operations during this entry.
     pub native_insn_count: u32,
     /// Calls from emitted code into `region_step` during this entry.
     pub helper_exit_count: u32,
+    /// Calls from emitted code into the exact native byte-memory helper.
+    pub native_memory_helper_count: u32,
+    /// Runtime segment gates for emitted byte loads and stores.
+    pub native_load_enabled: u32,
+    pub native_store_enabled: u32,
+    /// Conservative guest-clock cost of one native byte-memory instruction.
+    pub native_u8_clock_bound: u64,
     /// Group-level native bookkeeping functions, specialized for the live bus type at entry.
     #[cfg(feature = "jit")]
     pub native_group_guard_fn: Option<NativeGroupGuardFn>,
@@ -289,14 +251,6 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
     let bus = unsafe { &mut *(bus as *mut B) };
     let ctx = unsafe { &mut *ctx };
     ctx.helper_exit_count += 1;
-    // Cost-fold flush: reconcile any bus clocks the native slots folded into the running trace before
-    // this slot's own bookkeeping reads it (core_clocks_so_far below, the cap check, and - at the
-    // back-edge - the mandatory yield). region_step holds the bus, so no fn-pointer is needed. Under
-    // the trampoline (no native slots) folded_raw_bus is always 0, so this is inert.
-    if ctx.folded_raw_bus > 0 {
-        bus.charge_bus_clocks_bulk(ctx.folded_raw_bus);
-        ctx.folded_raw_bus = 0;
-    }
     let slot = &ctx.slots[k as usize];
     let insn = slot.insn;
     let lin = slot.lin;
@@ -321,6 +275,9 @@ pub(crate) unsafe extern "C" fn region_step<B: CpuBus>(
         Ok(outcome) => {
             ctx.raw_clocks += u64::from(outcome.core_clocks);
             ctx.insn_count += 1;
+            if cpu.decode_cache.jit_smc_epoch != ctx.smc_epoch_at_entry {
+                return STOP;
+            }
             // The run loop's break checks, in its exact order (halted, step, cap). All are
             // re-derivable from live state at exit, so the exit kind stays `Boundary` and the
             // loop re-attributes the break itself.
@@ -458,49 +415,142 @@ pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
 // emitted code does the native gpr op, then calls these for the bus-bound parts (fetch charge,
 // bus-clock read, line liveness), and does the cap-check arithmetic natively between calls.
 
-/// Charge the cached fetch for one slot: advance eip by `len` and charge the bus for the
-/// instruction-fetch clocks. Returns 0 on success, 1 on fault (records the fault in ctx).
-/// SAFETY: same contract as `region_step` — cpu/bus live non-aliased &mut, ctx is the boxed
-/// RegionCtx.
+/// Finish one emitted byte-memory instruction through the exact interpreter accounting seams.
+/// The emitter has already resolved `physical`. This helper owns the guest-visible access so a
+/// fault never follows a partially committed load/store.
+///
+/// SAFETY: called only by a live region. `cpu` and `bus` are non-aliased mutable pointers for the
+/// full call, `ctx` is that region's separate mailbox, and `B` is the erased bus's concrete type.
 #[cfg(feature = "jit")]
-pub(crate) unsafe extern "C" fn jit_charge_fetch<B: CpuBus>(
+pub(crate) unsafe extern "C" fn region_native_u8<B: CpuBus>(
     cpu: *mut CpuGsw,
     bus: *mut c_void,
     ctx: *mut RegionCtx,
-    lin: u32,
-    len: u32,
+    k: u32,
+    physical: u32,
 ) -> u8 {
+    let bus_ptr = bus.cast::<B>();
+    let (reg, kind, lin, len) = {
+        let ctx = unsafe { &mut *ctx };
+        let Some(slot) = ctx.slots.get(k as usize) else {
+            return STOP;
+        };
+        let Some(reg) = slot.insn.modrm.map(|modrm| modrm.reg) else {
+            return STOP;
+        };
+        let kind = slot.kind;
+        if !matches!(kind, SlotKind::MemLoadU8 | SlotKind::MemStoreU8) {
+            return STOP;
+        }
+        ctx.native_memory_helper_count += 1;
+        (reg, kind, slot.lin, slot.insn.len)
+    };
+
+    let page_cached = {
+        let cpu = unsafe { &mut *cpu };
+        if kind == SlotKind::MemLoadU8 {
+            cpu.data_read_pages.get(physical).is_some()
+        } else {
+            cpu.data_write_pages.get(physical).is_some()
+        }
+    };
+    if !page_cached {
+        return unsafe { region_step::<B>(cpu, bus, ctx, k) };
+    }
+
+    let (fits, core_at_slot) = {
+        let bus = unsafe { &mut *bus_ptr };
+        let ctx = unsafe { &mut *ctx };
+        let core = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+        let fits = ctx.cap == u64::MAX
+            || bus
+                .in_batch_scaled_bus_clocks()
+                .checked_sub(ctx.bus_at_run_start)
+                .and_then(|bus_delta| core.checked_add(bus_delta))
+                .and_then(|total| total.checked_add(ctx.native_u8_clock_bound))
+                .is_some_and(|projected| projected < ctx.cap);
+        (fits, core)
+    };
+    if !fits {
+        return unsafe { region_step::<B>(cpu, bus, ctx, k) };
+    }
+
     let cpu = unsafe { &mut *cpu };
-    let bus = unsafe { &mut *(bus as *mut B) };
+    let bus = unsafe { &mut *bus_ptr };
     let ctx = unsafe { &mut *ctx };
     cpu.interrupt_shadow = false;
     cpu.begin_instruction();
-    cpu.core_clocks_so_far = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
-    if let Err(fault) = cpu.charge_cached_fetch(bus, lin, len as u8) {
-        ctx.fault = Some((cpu.registers.eip, fault));
-        return 1;
+    let start_eip = cpu.registers.eip;
+    cpu.core_clocks_so_far = core_at_slot;
+
+    let result = cpu.charge_cached_fetch(bus, lin, len).and_then(|()| {
+        if kind == SlotKind::MemLoadU8 {
+            let value =
+                match cpu.read_direct_byte_page_cached(bus, physical, BusAccessKind::DataRead)? {
+                    Some(value) => {
+                        cpu.perf.jit_native_load_hits += 1;
+                        value
+                    }
+                    None => {
+                        let read = bus.read_memory_direct(
+                            physical,
+                            BusWidth::Byte,
+                            BusAccessKind::DataRead,
+                        )?;
+                        cpu.record_data_read(BusAccessKind::DataRead, read.direct);
+                        read.value as u8
+                    }
+                };
+            cpu.write_gpr8(reg, value);
+            Ok(())
+        } else {
+            let value = cpu.read_gpr8(reg);
+            cpu.record_write_page(physical);
+            if let Some(changed) =
+                cpu.write_direct_byte_page_cached(bus, physical, value, BusAccessKind::DataWrite)?
+            {
+                if changed {
+                    cpu.note_code_write(physical, 1);
+                }
+                cpu.perf.jit_native_store_hits += 1;
+            } else {
+                cpu.note_code_write(physical, 1);
+                let write = bus.write_memory_direct(
+                    physical,
+                    BusWidth::Byte,
+                    u32::from(value),
+                    BusAccessKind::DataWrite,
+                )?;
+                cpu.record_data_write(BusAccessKind::DataWrite, write.direct);
+            }
+            Ok(())
+        }
+    });
+    if let Err(fault) = result {
+        ctx.fault = Some((start_eip, fault));
+        return STOP;
     }
-    0
-}
 
-/// Read the live in-batch scaled bus clock count from the bus. A pure `&self` read.
-/// SAFETY: `bus` must be the live bus pointer the region was entered with.
-#[cfg(feature = "jit")]
-pub(crate) unsafe extern "C" fn jit_bus_clocks<B: CpuBus>(bus: *const c_void) -> u64 {
-    let bus = unsafe { &*(bus as *const B) };
-    bus.in_batch_scaled_bus_clocks()
-}
-
-/// Probe whether a decode line is live (generation-current, matching tag and D bit).
-/// SAFETY: `cpu` must be the live CpuGsw pointer the region was entered with.
-#[cfg(feature = "jit")]
-pub(crate) unsafe extern "C" fn jit_line_live(cpu: *const CpuGsw, lin: u32, d: bool) -> bool {
-    let cpu = unsafe { &*cpu };
-    cpu.decode_cache.line_live(lin, d)
+    ctx.raw_clocks += 2;
+    ctx.insn_count += 1;
+    ctx.native_insn_count += 1;
+    if cpu.decode_cache.jit_smc_epoch != ctx.smc_epoch_at_entry {
+        return STOP;
+    }
+    if bus.requires_step_break() {
+        return STOP;
+    }
+    if k == ctx.terminal_slot
+        || !cpu
+            .decode_cache
+            .line_live(ctx.slots[k as usize + 1].lin, ctx.d)
+    {
+        return STOP;
+    }
+    CONTINUE
 }
 
 /// Refuse a native group unless its complete core and cached-fetch cost fits in the current run.
-/// A pending optional fold is flushed first so the live bus delta includes all prior slots.
 #[cfg(feature = "jit")]
 pub(crate) unsafe extern "C" fn region_native_group_guard<B: CpuBus>(
     bus: *mut c_void,
@@ -508,11 +558,11 @@ pub(crate) unsafe extern "C" fn region_native_group_guard<B: CpuBus>(
     first: u32,
     count: u32,
 ) -> u8 {
-    let bus = unsafe { &mut *(bus as *mut B) };
     let ctx = unsafe { &mut *ctx };
-    if ctx.folded_raw_bus > 0 {
-        bus.charge_bus_clocks_bulk(std::mem::take(&mut ctx.folded_raw_bus));
+    if ctx.cap == u64::MAX {
+        return CONTINUE;
     }
+    let bus = unsafe { &mut *(bus as *mut B) };
     let first = first as usize;
     let Some(end) = first.checked_add(count as usize) else {
         return STOP;
