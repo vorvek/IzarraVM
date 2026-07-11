@@ -133,6 +133,69 @@ fn quake_hot_program() -> Vec<u8> {
     memory
 }
 
+fn oversized_x87_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let mut code = Vec::new();
+    for _ in 0..8 {
+        code.extend_from_slice(&[0xd9, 0x05, 0x00, 0x02, 0x00, 0x00]); // fld dword [0x200]
+    }
+    for _ in 0..4 {
+        code.extend_from_slice(&[0x89, 0xc0]); // mov eax,eax
+    }
+    code.push(0xf4);
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&1.5f32.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn oversized_x87_block_compiles_and_runs_as_fitting_prefixes() {
+    const FULL_BLOCK_INSTRUCTIONS: usize = 12;
+    let memory = oversized_x87_program();
+    let mut cpu = x87_cpu(GswMode::Gsw586);
+    let mut bus = direct_memory(memory.clone());
+    arm(&mut cpu, 0x0f7f);
+    run_to_halt(&mut cpu, &mut bus);
+
+    arm(&mut cpu, 0x0f7f);
+    let full = jit::direct::compile_with_instruction_limit_for_test(
+        &mut cpu,
+        ENTRY,
+        true,
+        FULL_BLOCK_INSTRUCTIONS,
+    )
+    .expect("unrestricted x87 block");
+    assert_eq!(usize::from(full.span.instructions), FULL_BLOCK_INSTRUCTIONS);
+    assert!(full.code.len() > jit::exec_mem::host_page_len());
+
+    let compilation = jit::direct::compile(&mut cpu, ENTRY, true).expect("fitting x87 prefix");
+    assert!((3..FULL_BLOCK_INSTRUCTIONS).contains(&usize::from(compilation.span.instructions)));
+    assert!(compilation.code.len() <= jit::exec_mem::host_page_len());
+    let retained = usize::from(compilation.span.instructions);
+    let instruction_lens = [6u8, 6, 6, 6, 6, 6, 6, 6, 2, 2, 2, 2];
+    assert_eq!(
+        usize::from(compilation.span.guest_len),
+        instruction_lens[..retained]
+            .iter()
+            .map(|&len| usize::from(len))
+            .sum::<usize>()
+    );
+    assert_eq!(
+        &compilation.fetch_lens[..retained],
+        &instruction_lens[..retained]
+    );
+    assert!(
+        compilation.fetch_lens[retained..]
+            .iter()
+            .all(|&len| len == 0)
+    );
+
+    let (direct, _) = assert_program_matches(GswMode::Gsw586, memory, 0x0f7f);
+    assert_eq!(direct.fpu.top(), 0);
+    assert_eq!(direct.fpu.tag, 0);
+}
+
 #[test]
 fn quake_hot_x87_sequence_matches_interpreter_in_486_and_586_modes() {
     for mode in [GswMode::Gsw486, GswMode::Gsw586] {
