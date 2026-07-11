@@ -1075,6 +1075,33 @@ fn frame_generation_tracks_graphics_writes() {
 }
 
 #[test]
+fn presented_frame_generation_waits_for_the_matching_completed_raster() {
+    let mut machine = test_machine();
+    machine.video_mut().set_mode13h_with_clear(true);
+    let frame_dots = machine.video().frame_dots();
+    machine.video_mut().advance(frame_dots);
+    let presented_before = machine
+        .presented_frame_generation()
+        .expect("the first graphics raster completed");
+    let live_before = machine.frame_generation().unwrap();
+
+    machine.write_physical_u8(0xA0000, 0x2A);
+    assert_ne!(machine.frame_generation(), Some(live_before));
+    assert_eq!(
+        machine.presented_frame_generation(),
+        Some(presented_before),
+        "an in-progress write does not relabel the prior raster"
+    );
+
+    machine.video_mut().advance(frame_dots);
+    assert_ne!(
+        machine.presented_frame_generation(),
+        Some(presented_before),
+        "the generation moves when the matching raster completes"
+    );
+}
+
+#[test]
 fn frame_generation_tracks_same_dims_mode_switch() {
     // Mode 13h and mode 0Dh are both 320x449 raster, so the dimension fold in
     // frame_generation cannot tell them apart. A program switching between them

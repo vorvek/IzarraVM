@@ -301,6 +301,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
         device_wrote_memory: &mut machine.device_wrote_memory,
         direct_map_changed: &mut machine.direct_map_changed,
+        direct_data_map_changed: &mut machine.direct_data_map_changed,
         core_clocks_so_far: 0,
         prior_runs_core_clocks: 0,
         timeline_at_batch_start: machine.timeline,

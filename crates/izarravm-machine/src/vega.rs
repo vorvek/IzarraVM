@@ -166,15 +166,38 @@ impl Vega {
         self.vga.mode13h_direct_page_ptr(offset)
     }
 
-    pub(crate) fn note_mode13_direct_write(&mut self, address: u32, bytes: usize) {
+    pub(crate) fn direct_write_token(&self) -> u8 {
+        if self.margo_banked_window_at(VGA_MODE13H_BASE) {
+            0
+        } else {
+            self.vga.direct_write_token()
+        }
+    }
+
+    pub(crate) fn direct_write_page(&mut self, physical_page: u32) -> Option<*mut u8> {
+        if self.direct_write_token() == 0 {
+            return None;
+        }
+        let offset = physical_page.checked_sub(VGA_MODE13H_BASE)? as usize;
+        if offset & 0x0fff != 0 {
+            return None;
+        }
+        self.vga.direct_write_page_ptr(offset)
+    }
+
+    pub(crate) fn note_direct_write(&mut self, address: u32, bytes: usize) {
         let Some(offset) = address.checked_sub(VGA_MODE13H_BASE) else {
             return;
         };
-        self.vga.note_mode13h_direct_write(offset as usize, bytes);
+        self.vga.note_direct_write(offset as usize, bytes);
     }
 
-    pub(crate) fn finish_mode13_direct_batch(&mut self) {
-        self.vga.finish_mode13h_direct_batch();
+    pub(crate) fn note_direct_write_pages(&mut self, dirty_pages: u16) {
+        self.vga.note_direct_write_pages(dirty_pages);
+    }
+
+    pub(crate) fn finish_direct_write_batch(&mut self) {
+        self.vga.finish_direct_write_batch();
     }
 
     pub(crate) fn frame_sequence(&self) -> u64 {
@@ -358,16 +381,31 @@ impl Vega {
         if self.active_display() != ActiveDisplay::VgaRaster || self.vga.is_text_mode() {
             return None;
         }
+        Some(Self::frame_generation_key(
+            self.vga.content_gen(),
+            self.vga.raster_width(),
+            self.vga.raster_height(),
+        ))
+    }
+
+    pub(crate) fn presented_frame_generation(&self) -> Option<u64> {
+        if self.active_display() != ActiveDisplay::VgaRaster || self.vga.is_text_mode() {
+            return None;
+        }
+        let raster = self.vga.last_presented()?;
+        Some(Self::frame_generation_key(
+            raster.generation,
+            raster.width,
+            raster.height,
+        ))
+    }
+
+    fn frame_generation_key(generation: u64, width: u32, height: u32) -> u64 {
         const K: u64 = 0x9e37_79b9_7f4a_7c15;
-        let width = u64::from(self.vga.raster_width());
-        let height = u64::from(self.vga.raster_height());
-        Some(
-            self.vga
-                .content_gen()
-                .wrapping_mul(K)
-                .wrapping_add(width.wrapping_mul(0x0001_0000_0001))
-                .wrapping_add(height.wrapping_mul(0x1_0000_0001_0000)),
-        )
+        generation
+            .wrapping_mul(K)
+            .wrapping_add(u64::from(width).wrapping_mul(0x0001_0000_0001))
+            .wrapping_add(u64::from(height).wrapping_mul(0x1_0000_0001_0000))
     }
 
     pub(crate) fn screen_crc32(&mut self, x: u16, y: u16, w: u16, h: u16) -> u32 {

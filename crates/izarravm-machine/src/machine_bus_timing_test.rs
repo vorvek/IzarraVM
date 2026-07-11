@@ -1044,7 +1044,7 @@ fn opl_status_poll_charges_isa_bus_time_only_in_approximate_class() {
 
 #[test]
 fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
-    // Pins the `end < 0xA0000` guard in charge_instruction_fetch_run: a run whose
+    // Pins the `end < 0xA0000` guard in charge_physical_instruction_fetch_run: a run whose
     // last byte is 0x9FFFF takes the conventional-RAM fast path (one collapsed
     // I-cache access at the per-mode code-fetch constant), while a run straddling
     // 0xA0000 must fall through to the full classification, which sees the VGA
@@ -1066,7 +1066,8 @@ fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
     with_bus(&mut machine, |bus| {
         // Fast path: 4 bytes ending exactly at 0x9FFFF -> one I-cache access.
         let before = bus.trace.elapsed_clocks();
-        bus.charge_instruction_fetch_run(0x0009_FFFC, 4).unwrap();
+        bus.charge_physical_instruction_fetch_run(0x0009_FFFC, 4)
+            .unwrap();
         assert_eq!(
             bus.trace.elapsed_clocks() - before,
             u64::from(BusCycle::clocks_for(BusWidth::Byte, code_ws)),
@@ -1076,7 +1077,8 @@ fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
         // window), charged per byte: two at the code-fetch constant, two at
         // the video cost.
         let before = bus.trace.elapsed_clocks();
-        bus.charge_instruction_fetch_run(0x0009_FFFE, 4).unwrap();
+        bus.charge_physical_instruction_fetch_run(0x0009_FFFE, 4)
+            .unwrap();
         assert_eq!(
             bus.trace.elapsed_clocks() - before,
             2 * u64::from(BusCycle::clocks_for(BusWidth::Byte, code_ws))
@@ -1463,10 +1465,36 @@ fn canonical_mode13_page_round_trips_through_the_cpu_cache() {
 }
 
 #[test]
-fn int10_invalidates_direct_pages_only_when_availability_changes() {
+fn canonical_mode13_bulk_read_uses_the_linear_page() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    for (offset, value) in [0x11, 0x22, 0x33, 0x44].into_iter().enumerate() {
+        machine.video_mut().cpu_write_chain4(0x1200 + offset, value);
+    }
+
+    with_bus(&mut machine, |bus| {
+        assert_eq!(bus.direct_memory_bytes(0xA_1200, 4, BusWidth::Dword), 4);
+        let mut bytes = [0; 4];
+        assert_eq!(
+            bus.read_memory_bytes_direct(
+                0xA_1200,
+                &mut bytes,
+                BusWidth::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(bytes, [0x11, 0x22, 0x33, 0x44]);
+    });
+}
+
+#[test]
+fn int10_invalidates_direct_data_pages_only_when_availability_changes() {
     let mut machine = test_machine();
     assert!(machine.set_vga_mode(0x13));
     machine.direct_map_changed = false;
+    machine.direct_data_map_changed = false;
 
     machine.cpu.registers.set_eax(0x0E41);
     machine.cpu.registers.set_ebx(0x000F);
@@ -1475,13 +1503,15 @@ fn int10_invalidates_direct_pages_only_when_availability_changes() {
         !machine.direct_map_changed,
         "teletype output keeps the canonical Mode 13h mapping"
     );
+    assert!(!machine.direct_data_map_changed);
 
     machine.cpu.registers.set_eax(0x0003);
     machine.handle_int10();
     assert!(
-        machine.direct_map_changed,
+        machine.direct_data_map_changed,
         "leaving Mode 13h invalidates the direct mapping"
     );
+    assert!(!machine.direct_map_changed);
 }
 
 #[test]
@@ -1526,6 +1556,115 @@ fn mode13_direct_write_materializes_before_mode_x() {
 }
 
 #[test]
+fn mode_x_direct_page_writes_one_plane_and_keeps_reads_on_the_handler() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    {
+        let vga = machine.video_mut();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        vga.write_port(0x3C4, 0x02);
+        vga.write_port(0x3C5, 0x04);
+    }
+    let content_before = machine.video().content_gen();
+    let frame_before = machine.frame_generation();
+
+    with_bus(&mut machine, |bus| {
+        assert!(
+            bus.direct_page(0xA_1234, BusAccessKind::DataRead)
+                .unwrap()
+                .is_none(),
+            "Mode X reads must retain latch and read-map handling"
+        );
+        let page = bus
+            .direct_page(0xA_1234, BusAccessKind::DataWrite)
+            .unwrap()
+            .expect("transparent single-plane Mode X write page");
+        assert_eq!(page.physical_page, 0xA_1000);
+        unsafe { page.ptr.add(0x234).write(0x5A) };
+        bus.charge_native_vga_writes(NativeVgaWrites {
+            dirty_pages: 1 << 1,
+            byte_writes: 1,
+            dword_writes: 0,
+        });
+        assert_eq!(bus.direct_memory_bytes(0xA_1240, 4, BusWidth::Dword), 4);
+        let mut readback = [0; 4];
+        assert_eq!(
+            bus.read_memory_bytes_direct(
+                0xA_1240,
+                &mut readback,
+                BusWidth::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+            0,
+            "Mode X bulk reads must retain VGA latch handling"
+        );
+        assert_eq!(
+            bus.write_memory_bytes_direct(
+                0xA_1240,
+                &[1, 2, 3, 4],
+                BusWidth::Dword,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap(),
+            4
+        );
+    });
+
+    assert_eq!(machine.video().plane_byte(2, 0x1234), 0x5A);
+    assert_eq!(
+        &[
+            machine.video().plane_byte(2, 0x1240),
+            machine.video().plane_byte(2, 0x1241),
+            machine.video().plane_byte(2, 0x1242),
+            machine.video().plane_byte(2, 0x1243),
+        ],
+        &[1, 2, 3, 4]
+    );
+    assert_eq!(machine.video().plane_byte(0, 0x1234), 0);
+    assert_eq!(machine.video().content_gen(), content_before + 1);
+    assert_ne!(machine.frame_generation(), frame_before);
+}
+
+#[test]
+fn mode_x_plane_switch_invalidates_only_vga_data_mappings() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    {
+        let vga = machine.video_mut();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        vga.write_port(0x3C4, 0x02);
+        vga.write_port(0x3C5, 0x01);
+    }
+    let decode_generation = machine.cpu.decode_cache_generation();
+
+    with_bus(&mut machine, |bus| {
+        *bus.direct_map_changed = false;
+        *bus.direct_data_map_changed = false;
+        bus.write_io(0x3C4, BusWidth::Byte, 0x02, false).unwrap();
+        bus.write_io(0x3C5, BusWidth::Byte, 0x08, false).unwrap();
+        assert!(!*bus.direct_map_changed);
+        assert!(*bus.direct_data_map_changed);
+        assert!(
+            bus.direct_page(0xA_0000, BusAccessKind::DataRead)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bus.direct_page(0xA_0000, BusAccessKind::DataWrite)
+                .unwrap()
+                .is_some()
+        );
+    });
+
+    machine.cpu.note_direct_data_map_changed();
+    machine.direct_data_map_changed = false;
+    assert_eq!(machine.cpu.decode_cache_generation(), decode_generation);
+}
+
+#[test]
 fn pending_crtc_start_ends_a_lazy_ring0_direct_page_run() {
     let mut machine = test_machine();
     machine.set_mode(GswMode::Gsw486);
@@ -1533,6 +1672,7 @@ fn pending_crtc_start_ends_a_lazy_ring0_direct_page_run() {
 
     with_bus(&mut machine, |bus| {
         *bus.direct_map_changed = false;
+        *bus.direct_data_map_changed = false;
         *bus.io_touched = false;
         assert!(
             bus.direct_page(0xA_0000, BusAccessKind::DataRead)
@@ -1547,7 +1687,8 @@ fn pending_crtc_start_ends_a_lazy_ring0_direct_page_run() {
             *bus.io_touched,
             "a VGA decode change ends even a lazy ring-0 batch"
         );
-        assert!(*bus.direct_map_changed);
+        assert!(!*bus.direct_map_changed);
+        assert!(*bus.direct_data_map_changed);
         assert!(bus.requires_step_break());
         assert!(
             bus.direct_page(0xA_0000, BusAccessKind::DataRead)
@@ -1585,6 +1726,417 @@ fn mode13_direct_write_moves_frame_generation_once() {
     assert_ne!(machine.frame_generation(), frame_before);
     assert_eq!(machine.video().cpu_read_chain4(0x1234), 0x7C);
     assert_eq!(machine.video().cpu_read_chain4(0x1235), 0x7D);
+}
+
+#[test]
+fn native_mode13_page_batches_charge_video_timing_and_move_generation_once() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+    assert!(machine.set_vga_mode(0x13));
+    let content_before = machine.video().content_gen();
+    let frame_before = machine.frame_generation();
+
+    with_bus(&mut machine, |bus| {
+        let page0 = bus
+            .direct_page(0xA_0000, BusAccessKind::DataWrite)
+            .unwrap()
+            .expect("canonical Mode 13h page 0 must be direct");
+        let page15 = bus
+            .direct_page(0xA_F000, BusAccessKind::DataWrite)
+            .unwrap()
+            .expect("canonical Mode 13h page 15 must be direct");
+        unsafe {
+            *page0.ptr = 0x2A;
+            *page15.ptr.add(0x123) = 0x6B;
+        }
+        let clocks_before = bus.trace.elapsed_clocks();
+        let byte_cost = bus.jit_mode13_data_cost_clocks(BusWidth::Byte);
+        let dword_cost = bus.jit_mode13_data_cost_clocks(BusWidth::Dword);
+        bus.charge_native_vga_writes(NativeVgaWrites {
+            dirty_pages: 1,
+            byte_writes: 1,
+            dword_writes: 0,
+        });
+        bus.charge_native_vga_writes(NativeVgaWrites {
+            dirty_pages: 1 << 15,
+            byte_writes: 0,
+            dword_writes: 1,
+        });
+        assert_eq!(
+            bus.trace.elapsed_clocks() - clocks_before,
+            byte_cost + dword_cost
+        );
+    });
+
+    assert_eq!(machine.video().content_gen(), content_before + 1);
+    assert_ne!(machine.frame_generation(), frame_before);
+    assert_eq!(machine.video().cpu_read_chain4(0), 0x2A);
+    assert_eq!(machine.video().cpu_read_chain4(0xF123), 0x6B);
+}
+
+#[test]
+fn native_cached_fetch_batch_charges_the_exact_warm_ram_cost() {
+    const FETCHES: u64 = 25_000;
+    const FETCH_LENS: &[u8] = &[1, 3, 2, 4];
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+
+    with_bus(&mut machine, |bus| {
+        let clocks_before = bus.trace.elapsed_clocks();
+        let fetch_cost = bus.jit_fetch_cost_clocks();
+        assert!(bus.charge_native_cached_fetches(0xF_4000, 0x100, FETCH_LENS, FETCHES));
+        assert_eq!(
+            bus.trace.elapsed_clocks() - clocks_before,
+            fetch_cost * FETCHES * FETCH_LENS.len() as u64
+        );
+    });
+}
+
+#[test]
+fn native_cached_fetch_batch_observes_the_linear_stub_address() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+    machine.last_int_vector = Some(0x10);
+
+    with_bus(&mut machine, |bus| {
+        assert!(bus.charge_native_cached_fetches(BIOS_LEGACY_IRET_LINEAR, 0x5000, &[1], 4,));
+    });
+
+    assert_eq!(machine.pending_soft_int, Some(0x10));
+    assert_eq!(machine.last_int_vector, None);
+}
+
+const NATIVE_FETCH_LINEAR: u32 = 0xF_4000;
+const NATIVE_FETCH_PHYSICAL: u32 = 0x5000;
+
+fn arm_native_fetch_loop(cpu: &mut CpuGsw) {
+    cpu.halted = false;
+    cpu.registers.eip = NATIVE_FETCH_LINEAR;
+    cpu.registers.set_eax(0);
+    cpu.registers.set_ecx(0);
+    cpu.registers.set_edx(0);
+    cpu.registers.set_ebx(0);
+    cpu.registers.set_esp(0);
+    cpu.registers.set_ebp(0);
+    cpu.registers.set_esi(0);
+    cpu.registers.set_edi(0);
+    cpu.registers.eflags = 0x203;
+    let mut cs = cpu.registers.cs();
+    cs.default_size_32 = true;
+    cs.limit = u32::MAX;
+    cs.access = 0x9b;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+}
+
+fn drive_native_fetch_loop(cpu: &mut CpuGsw, machine: &mut Machine) -> Vec<CycleOutcome> {
+    let mut outcomes = Vec::new();
+    for _ in 0..64 {
+        let outcome = with_bus(machine, |bus| cpu.run_straight_line(bus, u64::MAX).unwrap());
+        outcomes.push(outcome);
+        if outcome.halted {
+            return outcomes;
+        }
+    }
+    panic!("native fetch loop did not halt");
+}
+
+#[test]
+fn direct_large_self_loop_bulk_fetch_uses_physical_paging_alias_timing() {
+    const ITERATIONS: u32 = 1_000;
+    const PROGRAM: [u8; 16] = [
+        0xb9, 0xe8, 0x03, 0x00, 0x00, // mov ecx,1000
+        0x83, 0xc0, 0x03, // add eax,3
+        0x89, 0xc2, // mov edx,eax
+        0x83, 0xe9, 0x01, // sub ecx,1
+        0x75, 0xf6, // jnz to the loop body
+        0xf4,
+    ];
+    let mut interp_machine = test_machine();
+    let mut native_machine = test_machine();
+    interp_machine.set_mode(GswMode::Gsw586);
+    native_machine.set_mode(GswMode::Gsw586);
+    for machine in [&mut interp_machine, &mut native_machine] {
+        machine.write_physical_u32(0x1000, 0x2007);
+        machine.write_physical_u32(
+            0x2000 + ((NATIVE_FETCH_LINEAR >> 12) & 0x3FF) * 4,
+            NATIVE_FETCH_PHYSICAL | 7,
+        );
+    }
+    for (offset, byte) in PROGRAM.into_iter().enumerate() {
+        interp_machine.write_physical_u8(NATIVE_FETCH_PHYSICAL + offset as u32, byte);
+        native_machine.write_physical_u8(NATIVE_FETCH_PHYSICAL + offset as u32, byte);
+    }
+    let mut interp_cpu = interp_machine.cpu.clone();
+    let mut native_cpu = native_machine.cpu.clone();
+    for cpu in [&mut interp_cpu, &mut native_cpu] {
+        cpu.control.cr0 |= 0x8000_0001;
+        cpu.control.cr3 = 0x1000;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x08,
+                base: 0,
+                limit: u32::MAX,
+                access: 0x9b,
+                default_size_32: true,
+            },
+        );
+    }
+    interp_cpu.set_jit_auto_admit(false);
+    native_cpu.set_jit_auto_admit(true);
+
+    for _ in 0..4 {
+        arm_native_fetch_loop(&mut interp_cpu);
+        arm_native_fetch_loop(&mut native_cpu);
+        drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
+        drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
+    }
+    interp_machine.trace = BusTrace::default();
+    native_machine.trace = BusTrace::default();
+    arm_native_fetch_loop(&mut interp_cpu);
+    arm_native_fetch_loop(&mut native_cpu);
+    let traced_direct_insns = native_cpu.perf_counters().jit_direct_insns;
+    let traced_direct_entries = native_cpu.perf_counters().jit_direct_entries;
+
+    let interp_traced_outcomes = drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
+    let native_traced_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
+
+    assert_eq!(native_traced_outcomes, interp_traced_outcomes);
+    assert_eq!(native_machine.trace, interp_machine.trace);
+    assert_eq!(
+        native_cpu.perf_counters().jit_direct_insns,
+        traced_direct_insns
+    );
+    assert_eq!(
+        native_cpu.perf_counters().jit_direct_entries,
+        traced_direct_entries
+    );
+
+    interp_machine.trace = BusTrace::default();
+    interp_machine.trace.set_tracing_mode(TracingMode::Off);
+    native_machine.trace = BusTrace::default();
+    native_machine.trace.set_tracing_mode(TracingMode::Off);
+    arm_native_fetch_loop(&mut interp_cpu);
+    arm_native_fetch_loop(&mut native_cpu);
+    let direct_insns = native_cpu.perf_counters().jit_direct_insns;
+    let direct_entries = native_cpu.perf_counters().jit_direct_entries;
+
+    let interp_outcomes = drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
+    let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native_cpu, interp_cpu);
+    assert_eq!(
+        native_machine.trace.elapsed_clocks(),
+        interp_machine.trace.elapsed_clocks()
+    );
+    assert_eq!(native_cpu.registers.eax(), ITERATIONS * 3);
+    assert_eq!(
+        native_cpu.perf_counters().jit_direct_insns - direct_insns,
+        u64::from(ITERATIONS) * 4
+    );
+    assert_eq!(
+        native_cpu.perf_counters().jit_direct_entries - direct_entries,
+        1
+    );
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
+    const PAGE_DIRECTORY: u32 = 0x1000;
+    const PAGE_TABLE: u32 = 0x2000;
+    const WARM_CODE_LINEAR: u32 = 0x000f_4000;
+    const WARM_CODE_PHYSICAL: u32 = 0x5000;
+    const MEASURE_CODE_LINEAR: u32 = 0x000f_5000;
+    const MEASURE_CODE_PHYSICAL: u32 = 0x8000;
+    const LINEAR_A: u32 = 0x3000;
+    const LINEAR_B: u32 = LINEAR_A + 64 * 0x1000;
+    const FRAME_A: u32 = 0x6000;
+    const FRAME_B: u32 = 0x7000;
+    const VALUE_A: u32 = 0x1020_3040;
+    const VALUE_B: u32 = 0x5566_7788;
+    const PTE_A: u32 = PAGE_TABLE + ((LINEAR_A >> 12) & 0x3ff) * 4;
+    const PTE_B: u32 = PAGE_TABLE + ((LINEAR_B >> 12) & 0x3ff) * 4;
+
+    assert_eq!((LINEAR_A >> 12) & 63, (LINEAR_B >> 12) & 63);
+
+    let mut warm_program = vec![0xa1];
+    warm_program.extend_from_slice(&LINEAR_A.to_le_bytes());
+    warm_program.push(0xa1);
+    warm_program.extend_from_slice(&LINEAR_B.to_le_bytes());
+    warm_program.push(0xf4);
+
+    let mut program = vec![0x90, 0xa1];
+    program.extend_from_slice(&LINEAR_A.to_le_bytes());
+    program.extend_from_slice(&[
+        0x85, 0xc0, // test eax,eax
+        0x74, 0xf7, // jz back to the entry, not taken for VALUE_A
+        0xf4, // hlt
+    ]);
+
+    let make_fixture = || {
+        let mut machine = test_machine();
+        machine.set_mode(GswMode::Gsw486);
+        machine.write_physical_u32(PAGE_DIRECTORY, PAGE_TABLE | 7);
+        machine.write_physical_u32(
+            PAGE_TABLE + ((WARM_CODE_LINEAR >> 12) & 0x3ff) * 4,
+            WARM_CODE_PHYSICAL | 7,
+        );
+        machine.write_physical_u32(
+            PAGE_TABLE + ((MEASURE_CODE_LINEAR >> 12) & 0x3ff) * 4,
+            MEASURE_CODE_PHYSICAL | 7,
+        );
+        machine.write_physical_u32(PTE_A, FRAME_A | 7);
+        machine.write_physical_u32(PTE_B, FRAME_B | 7);
+        machine.write_physical_u32(FRAME_A, VALUE_A);
+        machine.write_physical_u32(FRAME_B, VALUE_B);
+        for (offset, byte) in warm_program.iter().copied().enumerate() {
+            machine.write_physical_u8(WARM_CODE_PHYSICAL + offset as u32, byte);
+        }
+        for (offset, byte) in program.iter().copied().enumerate() {
+            machine.write_physical_u8(MEASURE_CODE_PHYSICAL + offset as u32, byte);
+        }
+        machine.trace = BusTrace::default();
+        machine.trace.set_tracing_mode(TracingMode::Full);
+        machine
+    };
+    let mut interp_machine = make_fixture();
+    let mut native_machine = make_fixture();
+
+    let configure_cpu = |machine: &Machine| {
+        let mut cpu = machine.cpu.clone();
+        cpu.control.cr0 |= 0x8000_0001;
+        cpu.control.cr3 = PAGE_DIRECTORY;
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x08, 0x9b));
+        for segment in [
+            SegmentIndex::Ds,
+            SegmentIndex::Ss,
+            SegmentIndex::Es,
+            SegmentIndex::Fs,
+            SegmentIndex::Gs,
+        ] {
+            cpu.registers
+                .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+        }
+        cpu.set_jit_auto_admit(false);
+        cpu
+    };
+    let mut interp_cpu = configure_cpu(&interp_machine);
+    let mut native_cpu = configure_cpu(&native_machine);
+    let arm = |cpu: &mut CpuGsw, eip: u32| {
+        cpu.halted = false;
+        cpu.registers.eip = eip;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ecx(0);
+        cpu.registers.set_edx(0);
+        cpu.registers.set_ebx(0);
+        cpu.registers.set_esp(0);
+        cpu.registers.set_ebp(0);
+        cpu.registers.set_esi(0);
+        cpu.registers.set_edi(0);
+        cpu.registers.eflags = 0x202;
+    };
+
+    for (cpu, machine) in [
+        (&mut interp_cpu, &mut interp_machine),
+        (&mut native_cpu, &mut native_machine),
+    ] {
+        arm(cpu, WARM_CODE_LINEAR);
+        let outcomes = drive_native_fetch_loop(cpu, machine);
+        assert!(outcomes.last().is_some_and(|outcome| outcome.halted));
+        for pte in [PTE_A, PTE_B] {
+            assert!(
+                machine.trace.cycles().iter().any(|cycle| {
+                    cycle.kind == BusAccessKind::PageWalkRead && cycle.address == pte
+                }),
+                "the cold warmup must walk PTE {pte:#x}"
+            );
+        }
+    }
+
+    interp_machine.trace = BusTrace::default();
+    interp_machine.trace.set_tracing_mode(TracingMode::Off);
+    native_machine.trace = BusTrace::default();
+    native_machine.trace.set_tracing_mode(TracingMode::Off);
+    native_cpu.set_jit_auto_admit(true);
+    for _ in 0..3 {
+        interp_machine.write_physical_u32(FRAME_A, VALUE_A);
+        native_machine.write_physical_u32(FRAME_A, VALUE_A);
+        arm(&mut interp_cpu, MEASURE_CODE_LINEAR);
+        arm(&mut native_cpu, MEASURE_CODE_LINEAR);
+        let interp_outcomes = drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
+        let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
+        assert_eq!(native_outcomes, interp_outcomes);
+    }
+    assert!(
+        native_cpu.perf_counters().jit_direct_insns >= 3,
+        "{:?}",
+        native_cpu.perf_counters()
+    );
+
+    interp_machine.write_physical_u32(FRAME_A, VALUE_A);
+    native_machine.write_physical_u32(FRAME_A, VALUE_A);
+    interp_machine.trace = BusTrace::default();
+    interp_machine.trace.set_tracing_mode(TracingMode::Off);
+    native_machine.trace = BusTrace::default();
+    native_machine.trace.set_tracing_mode(TracingMode::Off);
+    arm(&mut interp_cpu, MEASURE_CODE_LINEAR);
+    arm(&mut native_cpu, MEASURE_CODE_LINEAR);
+    interp_cpu.elapsed_clocks = 0;
+    native_cpu.elapsed_clocks = 0;
+    let direct_insns = native_cpu.perf_counters().jit_direct_insns;
+    let direct_loads = native_cpu.perf_counters().jit_native_load_hits;
+
+    let interp_outcomes = drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
+    let native_outcomes = drive_native_fetch_loop(&mut native_cpu, &mut native_machine);
+
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(native_cpu, interp_cpu);
+    assert_eq!(
+        native_machine.trace.elapsed_clocks(),
+        interp_machine.trace.elapsed_clocks(),
+        "production aggregate accounting must preserve raw bus clocks"
+    );
+    assert_eq!(
+        native_cpu.perf_counters().jit_direct_insns - direct_insns,
+        3
+    );
+    assert_eq!(
+        native_cpu.perf_counters().jit_native_load_hits - direct_loads,
+        1,
+        "the evicted first alias must be read by native code"
+    );
+    assert_eq!(
+        native_machine.memory.as_slice(),
+        interp_machine.memory.as_slice()
+    );
+    assert_eq!(
+        interp_machine.memory.read_u32(FRAME_A as usize).unwrap(),
+        VALUE_A
+    );
+    assert_eq!(
+        interp_machine.memory.read_u32(FRAME_B as usize).unwrap(),
+        VALUE_B
+    );
+
+    interp_machine.write_physical_u32(FRAME_A, VALUE_A);
+    interp_machine.trace = BusTrace::default();
+    interp_machine.trace.set_tracing_mode(TracingMode::Full);
+    arm(&mut interp_cpu, MEASURE_CODE_LINEAR);
+    drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
+    assert!(
+        interp_machine.trace.cycles().iter().all(|cycle| !matches!(
+            cycle.kind,
+            BusAccessKind::PageWalkRead | BusAccessKind::PageWalkWrite
+        )),
+        "the shared FastMap must survive the old 64-entry TLB collision"
+    );
 }
 
 #[test]

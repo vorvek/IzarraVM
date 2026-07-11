@@ -25,6 +25,12 @@ struct PrdSpan {
     len: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DmaWriteSpan {
+    pub(crate) address: u32,
+    pub(crate) len: u32,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct PrdPlan {
     spans: Vec<PrdSpan>,
@@ -164,18 +170,29 @@ impl BusMasterIde {
 
     /// Advance the active transfer on the fixed machine timeline. Returns true
     /// when disk data was written into guest memory.
+    #[cfg(test)]
     pub(crate) fn advance_master_ticks(
         &mut self,
         master_ticks: u64,
         memory: &mut Memory,
         disk: &mut AtaDisk,
     ) -> bool {
-        let Some(transfer) = self.primary.transfer.as_mut() else {
-            return false;
-        };
+        self.advance_master_ticks_with_writes(master_ticks, memory, disk)
+            .is_some()
+    }
+
+    /// Advance the active transfer and return the exact guest-memory spans written by a completed
+    /// device-to-memory command. Memory-to-device transfers and incomplete commands return `None`.
+    pub(crate) fn advance_master_ticks_with_writes(
+        &mut self,
+        master_ticks: u64,
+        memory: &mut Memory,
+        disk: &mut AtaDisk,
+    ) -> Option<Vec<DmaWriteSpan>> {
+        let transfer = self.primary.transfer.as_mut()?;
         if master_ticks < transfer.ticks_remaining {
             transfer.ticks_remaining -= master_ticks;
-            return false;
+            return None;
         }
         self.complete_primary(memory, disk)
     }
@@ -202,10 +219,12 @@ impl BusMasterIde {
         self.primary = Channel::default();
     }
 
-    fn complete_primary(&mut self, memory: &mut Memory, disk: &mut AtaDisk) -> bool {
-        let Some(transfer) = self.primary.transfer.take() else {
-            return false;
-        };
+    fn complete_primary(
+        &mut self,
+        memory: &mut Memory,
+        disk: &mut AtaDisk,
+    ) -> Option<Vec<DmaWriteSpan>> {
+        let transfer = self.primary.transfer.take()?;
         let result = match transfer.direction {
             AtaDmaDirection::DeviceToMemory => disk.read_dma_payload().and_then(|payload| {
                 (payload.len() == transfer.byte_len).then(|| {
@@ -220,7 +239,7 @@ impl BusMasterIde {
         };
         if result.is_none() {
             self.fail_primary(disk);
-            return false;
+            return None;
         }
         if transfer.retires_eot {
             self.primary.status &= !STATUS_ACTIVE;
@@ -229,7 +248,16 @@ impl BusMasterIde {
             self.primary.status |= STATUS_ACTIVE;
             self.primary.completion_waits_for_stop = true;
         }
-        transfer.direction == AtaDmaDirection::DeviceToMemory
+        (transfer.direction == AtaDmaDirection::DeviceToMemory).then(|| {
+            transfer
+                .spans
+                .into_iter()
+                .map(|span| DmaWriteSpan {
+                    address: span.address as u32,
+                    len: span.len as u32,
+                })
+                .collect()
+        })
     }
 
     fn fail_primary(&mut self, disk: &mut AtaDisk) {

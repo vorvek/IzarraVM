@@ -43,6 +43,37 @@ impl Reg {
     }
 }
 
+/// A host x86-64 SIMD register in the standard XMM0-XMM15 encoding order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Xmm(pub u8);
+
+impl Xmm {
+    pub const XMM0: Xmm = Xmm(0);
+    pub const XMM1: Xmm = Xmm(1);
+    pub const XMM2: Xmm = Xmm(2);
+    pub const XMM3: Xmm = Xmm(3);
+    pub const XMM4: Xmm = Xmm(4);
+    pub const XMM5: Xmm = Xmm(5);
+    pub const XMM6: Xmm = Xmm(6);
+    pub const XMM7: Xmm = Xmm(7);
+    pub const XMM8: Xmm = Xmm(8);
+    pub const XMM9: Xmm = Xmm(9);
+    pub const XMM10: Xmm = Xmm(10);
+    pub const XMM11: Xmm = Xmm(11);
+    pub const XMM12: Xmm = Xmm(12);
+    pub const XMM13: Xmm = Xmm(13);
+    pub const XMM14: Xmm = Xmm(14);
+    pub const XMM15: Xmm = Xmm(15);
+
+    fn low3(self) -> u8 {
+        self.0 & 0x7
+    }
+
+    fn ext(self) -> bool {
+        self.0 >= 8
+    }
+}
+
 /// A forward- or backward-reference point in the emitted byte stream. `Encoder::label()`
 /// creates one (its position is filled in once it is actually placed by `Encoder::place`);
 /// `Encoder::jcc`/`Encoder::jmp` reference one before it may be placed (a forward jump), and the
@@ -88,6 +119,10 @@ impl Encoder {
         Label(self.label_positions.len() - 1)
     }
 
+    pub(crate) fn position(&self) -> usize {
+        self.bytes.len()
+    }
+
     /// Bind `label` to the CURRENT write position (the next byte emitted is the label's target).
     /// Panics if `label` has already been placed: silently rebinding a jump target to a second
     /// position would produce wrong-but-plausible code rather than a clear failure.
@@ -107,8 +142,51 @@ impl Encoder {
         self.bytes.push(byte);
     }
 
+    fn optional_rex(&mut self, w: bool, r: bool, x: bool, b: bool) {
+        if w || r || x || b {
+            self.rex(w, r, x, b);
+        }
+    }
+
     fn modrm(&mut self, md: u8, reg: u8, rm: u8) {
         self.bytes.push((md << 6) | ((reg & 7) << 3) | (rm & 7));
+    }
+
+    fn scalar_xmm_reg_reg(&mut self, prefix: u8, opcode: u8, dst: Xmm, src: Xmm) {
+        self.bytes.push(prefix);
+        self.optional_rex(false, dst.ext(), false, src.ext());
+        self.bytes.extend_from_slice(&[0x0F, opcode]);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    fn scalar_xmm_mem_disp32(&mut self, prefix: u8, opcode: u8, xmm: Xmm, base: Reg, disp32: i32) {
+        self.bytes.push(prefix);
+        self.optional_rex(false, xmm.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, opcode]);
+        self.modrm(0b10, xmm.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    fn scalar_xmm_mem_sib_scale8_disp32(
+        &mut self,
+        prefix: u8,
+        opcode: u8,
+        xmm: Xmm,
+        base: Reg,
+        index: Reg,
+        disp32: i32,
+    ) {
+        assert!(index != Reg::RSP, "RSP cannot be a SIB index");
+        self.bytes.push(prefix);
+        self.optional_rex(false, xmm.ext(), index.ext(), base.ext());
+        self.bytes.extend_from_slice(&[0x0F, opcode]);
+        self.modrm(0b10, xmm.low3(), 0b100);
+        self.bytes
+            .push((0b11 << 6) | (index.low3() << 3) | base.low3());
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
     }
 
     /// `push r64` (50+rd, REX.B set iff `r` is an extended register).
@@ -151,6 +229,13 @@ impl Encoder {
     pub(crate) fn add_r64_r64(&mut self, dst: Reg, src: Reg) {
         self.rex(true, src.ext(), false, dst.ext());
         self.bytes.push(0x01);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `or dst64, src64` (REX.W + 09 /r).
+    pub(crate) fn or_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x09);
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
@@ -255,6 +340,15 @@ impl Encoder {
         }
         self.bytes.push(0xB8 + dst.low3());
         self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `mov dst8, imm8` for AL/CL/DL/BL.
+    pub(crate) fn mov_r8_imm8(&mut self, dst: Reg, imm: u8) {
+        assert!(
+            dst.low3() < 4 && !dst.ext(),
+            "mov_r8_imm8 dst must be AL/CL/DL/BL"
+        );
+        self.bytes.extend_from_slice(&[0xB0 + dst.low3(), imm]);
     }
 
     /// `mov dst64, imm64` (REX.W + B8+rd io).
@@ -392,6 +486,31 @@ impl Encoder {
         self.bytes.push((index.low3() << 3) | base.low3()); // scale=00
     }
 
+    /// `mov dst64, [base + index*8]` (REX.W + 8B /r, SIB scale=8). The direct map uses
+    /// this to load one pointer bias from its `usize` array by linear-page index.
+    pub(crate) fn load_r64_sib_scale8(&mut self, dst: Reg, base: Reg, index: Reg) {
+        assert!(base.low3() != 0b101, "SIB base RBP/R13 needs a disp form");
+        assert!(index.low3() != 0b100, "SIB index RSP means no-index");
+        self.rex(true, dst.ext(), index.ext(), base.ext());
+        self.bytes.push(0x8B);
+        self.modrm(0b00, dst.low3(), 0b100);
+        self.bytes
+            .push((0b11 << 6) | (index.low3() << 3) | base.low3());
+    }
+
+    /// `mov dst32, [base + index*4]` (8B /r, SIB scale=4).
+    pub(crate) fn load_r32_sib_scale4(&mut self, dst: Reg, base: Reg, index: Reg) {
+        assert!(base.low3() != 0b101, "SIB base RBP/R13 needs a disp form");
+        assert!(index.low3() != 0b100, "SIB index RSP means no-index");
+        if dst.ext() || index.ext() || base.ext() {
+            self.rex(false, dst.ext(), index.ext(), base.ext());
+        }
+        self.bytes.push(0x8B);
+        self.modrm(0b00, dst.low3(), 0b100);
+        self.bytes
+            .push((0b10 << 6) | (index.low3() << 3) | base.low3());
+    }
+
     /// `add dst32, imm32` (81 /0 id, no REX.W) -- the 32-bit-operand ADD-immmediate form the v2
     /// inline `add r32, imm32` slot uses against a host scratch register holding the guest gpr
     /// value. Sets the host flags, but those are not the guest flags (the guest flag update is a
@@ -499,6 +618,18 @@ impl Encoder {
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// An 8-bit register-register ALU operation using AL, CL, DL, or BL.
+    pub(crate) fn alu_r8_r8(&mut self, op: u8, dst: Reg, src: Reg) {
+        const OPCODES: [u8; 8] = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];
+        assert!(op < 8, "ALU group must fit three bits");
+        assert!(
+            dst.0 < 4 && src.0 < 4,
+            "byte ALU scratch registers must be AL through BL"
+        );
+        self.bytes.push(OPCODES[usize::from(op)]);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// A 32-bit group-1 immediate ALU operation (`81 /op id`).
     pub(crate) fn alu_r32_imm32(&mut self, op: u8, dst: Reg, imm: u32) {
         assert!(op < 8, "ALU group must fit three bits");
@@ -530,6 +661,34 @@ impl Encoder {
         self.bytes.push(count);
     }
 
+    /// A 32-bit SHLD/SHRD register form. `count=None` selects CL; otherwise the supplied imm8 is
+    /// encoded verbatim and the host applies the architectural five-bit count mask.
+    pub(crate) fn double_shift_r32(&mut self, left: bool, dst: Reg, src: Reg, count: Option<u8>) {
+        self.optional_rex(false, src.ext(), false, dst.ext());
+        self.bytes.extend_from_slice(&[
+            0x0f,
+            match (left, count.is_some()) {
+                (true, true) => 0xa4,
+                (true, false) => 0xa5,
+                (false, true) => 0xac,
+                (false, false) => 0xad,
+            },
+        ]);
+        self.modrm(0b11, src.low3(), dst.low3());
+        if let Some(count) = count {
+            self.bytes.push(count);
+        }
+    }
+
+    /// `shr dst32, cl` (D3 /5).
+    pub(crate) fn shr_r32_cl(&mut self, dst: Reg) {
+        if dst.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.bytes.push(0xD3);
+        self.modrm(0b11, 5, dst.low3());
+    }
+
     /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W) -- load a
     /// byte from `[base + index]` and zero-extend it to 32 bits (clearing the host register's upper 64
     /// bits). The native byte-load probe uses this for the final deref off the host page pointer plus
@@ -546,6 +705,21 @@ impl Encoder {
         self.bytes.push(0xB6);
         self.modrm(0b00, dst.low3(), 0b100); // rm=100 -> a SIB byte follows
         self.bytes.push((index.low3() << 3) | base.low3()); // scale=00
+    }
+
+    /// `movzx dst32, byte [base + disp8]` (0F B6 /r). Used after the direct-map probe has
+    /// reduced a guest byte read to one checked host pointer.
+    pub(crate) fn movzx_r32_byte_disp8(&mut self, dst: Reg, base: Reg, disp8: i8) {
+        if dst.ext() || base.ext() {
+            self.rex(false, dst.ext(), false, base.ext());
+        }
+        self.bytes.push(0x0F);
+        self.bytes.push(0xB6);
+        self.modrm(0b01, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
     }
 
     /// `mov [base + disp8], src8` (88 /r, mod=01 disp8, SIB if `base` is RSP/R12) -- store the low
@@ -590,6 +764,276 @@ impl Encoder {
             self.bytes.push(0x24);
         }
         self.bytes.push(disp8 as u8);
+    }
+
+    /// `cmp reg8, [base + disp8]` (3A /r). The source must name AL/CL/DL/BL.
+    pub(crate) fn cmp_r8_disp8(&mut self, reg: Reg, base: Reg, disp8: i8) {
+        assert!(
+            reg.low3() < 4 && !reg.ext(),
+            "cmp_r8_disp8 register must be AL/CL/DL/BL"
+        );
+        if base.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.bytes.push(0x3A);
+        self.modrm(0b01, reg.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `add qword [base + disp8], src64` (REX.W + 01 /r).
+    pub(crate) fn add_r64_to_mem_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
+        self.rex(true, src.ext(), false, base.ext());
+        self.bytes.push(0x01);
+        self.modrm(0b01, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `bt qword [base], index64` (REX.W + 0F A3 /r). A memory bit index addresses a bit string,
+    /// so indices beyond 63 advance through consecutive bitmap words.
+    pub(crate) fn bt_r64_mem(&mut self, base: Reg, index: Reg) {
+        assert!(base.low3() != 0b101, "BT base RBP/R13 needs a disp form");
+        self.rex(true, index.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xA3]);
+        self.modrm(0b00, index.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+    }
+
+    /// `bts qword [base], index64` (REX.W + 0F AB /r).
+    pub(crate) fn bts_r64_mem(&mut self, base: Reg, index: Reg) {
+        assert!(base.low3() != 0b101, "BTS base RBP/R13 needs a disp form");
+        self.rex(true, index.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xAB]);
+        self.modrm(0b00, index.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+    }
+
+    /// `and dst64, src64` (REX.W + 21 /r).
+    pub(crate) fn and_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x21);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// `xor dst64, src64` (REX.W + 31 /r).
+    pub(crate) fn xor_r64_r64(&mut self, dst: Reg, src: Reg) {
+        self.rex(true, src.ext(), false, dst.ext());
+        self.bytes.push(0x31);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// A 64-bit group-2 immediate shift (`REX.W + C1 /op ib`).
+    pub(crate) fn shift_r64_imm8(&mut self, op: u8, dst: Reg, count: u8) {
+        assert!(op < 8, "shift group must fit three bits");
+        self.rex(true, false, false, dst.ext());
+        self.bytes.push(0xC1);
+        self.modrm(0b11, op, dst.low3());
+        self.bytes.push(count);
+    }
+
+    /// `movzx dst32, word [base + disp32]` (0F B7 /r).
+    pub(crate) fn movzx_r32_word_disp32(&mut self, dst: Reg, base: Reg, disp32: i32) {
+        self.optional_rex(false, dst.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xB7]);
+        self.modrm(0b10, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    /// `mov word [base + disp32], src16` (66 + 89 /r).
+    pub(crate) fn store_r16_disp32(&mut self, base: Reg, disp32: i32, src: Reg) {
+        self.bytes.push(0x66);
+        self.optional_rex(false, src.ext(), false, base.ext());
+        self.bytes.push(0x89);
+        self.modrm(0b10, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+    }
+
+    fn bit_r16_mem(&mut self, opcode: u8, base: Reg, index: Reg) {
+        assert!(
+            base.low3() != 0b101,
+            "word bit-operation base RBP/R13 needs a disp form"
+        );
+        self.bytes.push(0x66);
+        self.optional_rex(false, index.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, opcode]);
+        self.modrm(0b00, index.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+    }
+
+    /// `bt word [base], index16` (66 + 0F A3 /r).
+    pub(crate) fn bt_r16_mem(&mut self, base: Reg, index: Reg) {
+        self.bit_r16_mem(0xA3, base, index);
+    }
+
+    /// `btr word [base], index16` (66 + 0F B3 /r).
+    pub(crate) fn btr_r16_mem(&mut self, base: Reg, index: Reg) {
+        self.bit_r16_mem(0xB3, base, index);
+    }
+
+    /// `bts word [base], index16` (66 + 0F AB /r).
+    pub(crate) fn bts_r16_mem(&mut self, base: Reg, index: Reg) {
+        self.bit_r16_mem(0xAB, base, index);
+    }
+
+    /// `movsd dst, qword [base + disp32]` (F2 + 0F 10 /r).
+    pub(crate) fn movsd_xmm_disp32(&mut self, dst: Xmm, base: Reg, disp32: i32) {
+        self.scalar_xmm_mem_disp32(0xF2, 0x10, dst, base, disp32);
+    }
+
+    /// `movsd qword [base + disp32], src` (F2 + 0F 11 /r).
+    pub(crate) fn movsd_disp32_xmm(&mut self, base: Reg, disp32: i32, src: Xmm) {
+        self.scalar_xmm_mem_disp32(0xF2, 0x11, src, base, disp32);
+    }
+
+    /// `movsd dst, src` (F2 + 0F 10 /r).
+    pub(crate) fn movsd_xmm_xmm(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x10, dst, src);
+    }
+
+    /// `movss dst, dword [base + disp32]` (F3 + 0F 10 /r).
+    pub(crate) fn movss_xmm_disp32(&mut self, dst: Xmm, base: Reg, disp32: i32) {
+        self.scalar_xmm_mem_disp32(0xF3, 0x10, dst, base, disp32);
+    }
+
+    /// `movss dword [base + disp32], src` (F3 + 0F 11 /r).
+    pub(crate) fn movss_disp32_xmm(&mut self, base: Reg, disp32: i32, src: Xmm) {
+        self.scalar_xmm_mem_disp32(0xF3, 0x11, src, base, disp32);
+    }
+
+    /// `movsd dst, qword [base + index*8 + disp32]`.
+    pub(crate) fn movsd_xmm_sib_scale8_disp32(
+        &mut self,
+        dst: Xmm,
+        base: Reg,
+        index: Reg,
+        disp32: i32,
+    ) {
+        self.scalar_xmm_mem_sib_scale8_disp32(0xF2, 0x10, dst, base, index, disp32);
+    }
+
+    /// `movsd qword [base + index*8 + disp32], src`.
+    pub(crate) fn movsd_sib_scale8_disp32_xmm(
+        &mut self,
+        base: Reg,
+        index: Reg,
+        disp32: i32,
+        src: Xmm,
+    ) {
+        self.scalar_xmm_mem_sib_scale8_disp32(0xF2, 0x11, src, base, index, disp32);
+    }
+
+    /// `cvtss2sd dst, src` (F3 + 0F 5A /r).
+    pub(crate) fn cvtss2sd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF3, 0x5A, dst, src);
+    }
+
+    /// `cvtsd2ss dst, src` (F2 + 0F 5A /r).
+    pub(crate) fn cvtsd2ss(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x5A, dst, src);
+    }
+
+    /// `addsd dst, src` (F2 + 0F 58 /r).
+    pub(crate) fn addsd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x58, dst, src);
+    }
+
+    /// `mulsd dst, src` (F2 + 0F 59 /r).
+    pub(crate) fn mulsd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x59, dst, src);
+    }
+
+    /// `subsd dst, src` (F2 + 0F 5C /r).
+    pub(crate) fn subsd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x5C, dst, src);
+    }
+
+    /// `divsd dst, src` (F2 + 0F 5E /r).
+    pub(crate) fn divsd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x5E, dst, src);
+    }
+
+    /// `sqrtsd dst, src` (F2 + 0F 51 /r).
+    pub(crate) fn sqrtsd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0xF2, 0x51, dst, src);
+    }
+
+    /// `ucomisd lhs, rhs` (66 + 0F 2E /r).
+    pub(crate) fn ucomisd(&mut self, lhs: Xmm, rhs: Xmm) {
+        self.scalar_xmm_reg_reg(0x66, 0x2E, lhs, rhs);
+    }
+
+    /// `xorpd dst, src` (66 + 0F 57 /r).
+    pub(crate) fn xorpd(&mut self, dst: Xmm, src: Xmm) {
+        self.scalar_xmm_reg_reg(0x66, 0x57, dst, src);
+    }
+
+    /// `cvtsi2sd dst, src32` (F2 + 0F 2A /r).
+    pub(crate) fn cvtsi2sd_r32(&mut self, dst: Xmm, src: Reg) {
+        self.bytes.push(0xF2);
+        self.optional_rex(false, dst.ext(), false, src.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0x2A]);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    fn cvttsd2si(&mut self, dst: Reg, src: Xmm, wide: bool) {
+        self.bytes.push(0xF2);
+        self.optional_rex(wide, dst.ext(), false, src.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0x2C]);
+        self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// `cvttsd2si dst32, src` (F2 + 0F 2C /r).
+    pub(crate) fn cvttsd2si_r32(&mut self, dst: Reg, src: Xmm) {
+        self.cvttsd2si(dst, src, false);
+    }
+
+    /// `cvttsd2si dst64, src` (F2 + REX.W + 0F 2C /r).
+    pub(crate) fn cvttsd2si_r64(&mut self, dst: Reg, src: Xmm) {
+        self.cvttsd2si(dst, src, true);
+    }
+
+    fn mov_xmm_gpr(&mut self, opcode: u8, wide: bool, xmm: Xmm, gpr: Reg) {
+        self.bytes.push(0x66);
+        self.optional_rex(wide, xmm.ext(), false, gpr.ext());
+        self.bytes.extend_from_slice(&[0x0F, opcode]);
+        self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// `movq dst, src64` (66 + REX.W + 0F 6E /r).
+    pub(crate) fn movq_xmm_r64(&mut self, dst: Xmm, src: Reg) {
+        self.mov_xmm_gpr(0x6E, true, dst, src);
+    }
+
+    /// `movq dst64, src` (66 + REX.W + 0F 7E /r).
+    pub(crate) fn movq_r64_xmm(&mut self, dst: Reg, src: Xmm) {
+        self.mov_xmm_gpr(0x7E, true, src, dst);
+    }
+
+    /// `movd dst, src32` (66 + 0F 6E /r).
+    pub(crate) fn movd_xmm_r32(&mut self, dst: Xmm, src: Reg) {
+        self.mov_xmm_gpr(0x6E, false, dst, src);
+    }
+
+    /// `movd dst32, src` (66 + 0F 7E /r).
+    pub(crate) fn movd_r32_xmm(&mut self, dst: Reg, src: Xmm) {
+        self.mov_xmm_gpr(0x7E, false, src, dst);
     }
 
     /// `xor dst64, dst64` (REX.W + 31 /r), the standard zero-register idiom.
@@ -736,6 +1180,13 @@ impl Encoder {
         self.bytes.push(0xE9);
         self.bytes.extend_from_slice(&0i32.to_le_bytes());
         self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJmp, target);
+    }
+
+    /// `jmp r64` (FF /4).
+    pub(crate) fn jmp_r64(&mut self, target: Reg) {
+        self.optional_rex(false, false, false, target.ext());
+        self.bytes.push(0xFF);
+        self.modrm(0b11, 4, target.low3());
     }
 
     pub(crate) fn ret(&mut self) {

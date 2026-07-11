@@ -4,6 +4,21 @@
 use super::*;
 
 #[test]
+fn hle_guest_block_reports_an_exact_cpu_write_range() {
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &[0xf4]).unwrap();
+    machine.cpu.reset_perf_counters();
+
+    machine.write_guest_block(0x4000, &[1, 2, 3, 4]);
+
+    let perf = machine.cpu.perf_counters();
+    assert_eq!(perf.device_write_ranges, 1);
+    assert_eq!(perf.device_write_bytes, 4);
+    assert_eq!(perf.device_write_coarse_resets, 0);
+    assert!(!machine.device_wrote_memory);
+}
+
+#[test]
 fn new_raw_program_leaves_pit_counter0_running() {
     // A directly-loaded DOS program must see PIT counter 0 ticking, the way the
     // BIOS POST leaves it; otherwise a guest that polls the timer for a delay or
@@ -70,6 +85,83 @@ fn raw_program_profile_records_cpu_batch_phase() {
     assert!(
         cpu.groups.iter().any(|bucket| bucket.instructions > 0),
         "CPU group profile should record retired instructions"
+    );
+}
+
+#[test]
+fn machine_only_profile_keeps_the_cpu_sampler_disabled() {
+    let prog: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21]; // mov ax,4c00; int 21h
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw486;
+    let mut m = Machine::new_raw_program(profile, prog).unwrap();
+    m.enable_machine_profiling();
+
+    let reason = m.run_until_halt_or_cycles(100_000).unwrap();
+
+    assert_eq!(reason, StopReason::DosExit { code: 0 });
+    assert!(
+        m.host_profile_snapshot()
+            .phases
+            .iter()
+            .any(|phase| phase.name == "cpu_batch" && phase.count > 0),
+        "machine phase profiling should remain active"
+    );
+    assert!(
+        m.cpu()
+            .profile_snapshot()
+            .groups
+            .iter()
+            .all(|bucket| bucket.instructions == 0),
+        "machine-only profiling must not enable per-instruction sampling"
+    );
+}
+
+#[test]
+fn machine_profile_records_frame_conversion_and_audio_rendering() {
+    let prog: &[u8] = &[0xeb, 0xfe]; // jmp $
+    let mut m =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), prog).unwrap();
+    m.enable_machine_profiling();
+
+    let _ = m.frame_argb();
+    let _ = m.presented_frame_argb();
+    let _ = m.capture_frame_argb();
+    let _ = m.render_audio(32);
+
+    let snapshot = m.host_profile_snapshot();
+    assert_eq!(
+        snapshot
+            .phases
+            .iter()
+            .map(|phase| phase.name)
+            .collect::<Vec<_>>(),
+        [
+            "cpu_batch",
+            "advance_devices",
+            "video_conversion",
+            "audio_render",
+            "soft_int",
+            "console_flush",
+            "halt_fast_forward",
+        ]
+    );
+    assert_eq!(
+        snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "video_conversion")
+            .unwrap()
+            .count,
+        3
+    );
+    assert_eq!(
+        snapshot
+            .phases
+            .iter()
+            .find(|phase| phase.name == "audio_render")
+            .unwrap()
+            .count,
+        1
     );
 }
 

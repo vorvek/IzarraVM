@@ -30,8 +30,15 @@ fn jit_forced_region_lin() -> Option<u32> {
 #[cfg(feature = "jit")]
 enum DirectContinuation {
     Run(CycleOutcome),
+    Prefix(CycleOutcome),
     Interpret,
-    RegionFallback,
+}
+
+#[cfg(feature = "jit")]
+enum DirectBlockOutcome {
+    NotRun,
+    Complete(CycleOutcome),
+    Prefix(CycleOutcome),
 }
 
 #[cfg(feature = "jit")]
@@ -91,6 +98,10 @@ impl CpuGsw {
         // `cycle_no_interrupt_check` when that next instruction runs.
         if !self.interrupt_shadow && self.flag(FLAG_IF) && bus.interrupt_pending() {
             if let Some(vector) = bus.acknowledge_interrupt() {
+                // The interrupt frame sees the paused REP's start EIP. Once delivery begins, the
+                // saved host continuation is stale; IRET restarts from guest code and refetches.
+                self.rep_resume_active = false;
+                self.rep_execution.resume = None;
                 self.hardware_interrupt(bus, vector)
                     .map_err(|fault| match fault {
                         InternalFault::Cpu(error) => error,
@@ -128,6 +139,14 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
     ) -> Result<CycleOutcome, CpuError> {
+        self.cycle_no_interrupt_check_with_budget(bus, None)
+    }
+
+    fn cycle_no_interrupt_check_with_budget<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        rep_budget: Option<RepBudget>,
+    ) -> Result<CycleOutcome, CpuError> {
         self.interrupt_shadow = false;
         // This is always either a standalone single-step (no prior instructions in
         // "this run") or run_straight_line's FIRST instruction (total == 0 at that
@@ -137,9 +156,14 @@ impl CpuGsw {
         // before each continuation call.
         self.core_clocks_so_far = 0;
 
+        if self.rep_resume_active {
+            return self.resume_rep_instruction(bus, rep_budget);
+        }
+
         self.begin_instruction();
         let start_eip = self.registers.eip;
-        let start_cs = self.registers.cs().selector;
+        let start_cs_register = self.registers.cs();
+        let start_cs = start_cs_register.selector;
         let lin = self.linear_eip();
         let profiling = self.profile.enabled;
         let profile_start = if profiling {
@@ -148,8 +172,11 @@ impl CpuGsw {
             None
         };
         let mut profile_key = None;
+        let mut decoded = None;
+        self.rep_execution.yielded = false;
         let result = match self.fetch_decoded(bus, lin) {
             Ok(insn) => {
+                decoded = Some(insn);
                 if profiling {
                     profile_key = Some((
                         insn.group,
@@ -157,11 +184,128 @@ impl CpuGsw {
                         CpuProfileOperandForm::from_insn(&insn),
                     ));
                 }
-                self.execute_decoded(&insn, bus)
+                self.execute_decoded_with_rep_budget(&insn, bus, rep_budget)
             }
             Err(fault) => Err(fault),
         };
-        self.finish_instruction(bus, result, start_eip, start_cs, profile_key, profile_start)
+        if self.rep_execution.yielded {
+            let insn = decoded.expect("only a decoded REP instruction can yield");
+            let outcome = result.expect("a faulting REP chunk cannot also yield");
+            return Ok(self.pause_rep_instruction(insn, start_eip, start_cs_register, outcome));
+        }
+        self.finish_instruction(
+            bus,
+            result,
+            start_eip,
+            start_cs,
+            0,
+            profile_key,
+            profile_start,
+        )
+    }
+
+    fn pause_rep_instruction(
+        &mut self,
+        insn: DecodedInsn,
+        start_eip: u32,
+        cs: SegmentRegister,
+        outcome: CycleOutcome,
+    ) -> CycleOutcome {
+        debug_assert!(insn.prefixes.rep.is_some());
+        debug_assert!(!outcome.halted);
+        let post_eip = self.registers.eip;
+        let charged = self.scale_clocks(outcome.core_clocks);
+        self.elapsed_clocks += charged;
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        // Do not call set_eip here. A budget yield is not guest control flow and must retain the
+        // instruction's prefetch snapshot for the no-interrupt continuation.
+        self.registers.eip = start_eip;
+        self.rep_execution.resume = Some(RepResume {
+            insn,
+            start_eip,
+            post_eip,
+            cs,
+            precharged_core: charged,
+        });
+        self.rep_resume_active = true;
+        self.rep_execution.yielded = false;
+        CycleOutcome {
+            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+            halted: false,
+        }
+    }
+
+    fn resume_rep_instruction<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        rep_budget: Option<RepBudget>,
+    ) -> Result<CycleOutcome, CpuError> {
+        let resume = self
+            .rep_execution
+            .resume
+            .expect("resume path requires REP state");
+        if self.registers.eip != resume.start_eip || self.registers.cs() != resume.cs {
+            self.rep_resume_active = false;
+            self.rep_execution.resume = None;
+            return self.cycle_no_interrupt_check_with_budget(bus, rep_budget);
+        }
+
+        self.registers.eip = resume.post_eip;
+        self.rep_execution.yielded = false;
+        let profiling = self.profile.enabled;
+        let profile_start = if profiling {
+            self.profile.sample_start()
+        } else {
+            None
+        };
+        let result = self.execute_decoded_with_rep_budget(&resume.insn, bus, rep_budget);
+        if self.rep_execution.yielded {
+            let outcome = result.expect("a faulting REP chunk cannot also yield");
+            debug_assert!(!outcome.halted);
+            self.registers.eip = resume.start_eip;
+            self.rep_execution.yielded = false;
+            return Ok(CycleOutcome {
+                core_clocks: 0,
+                halted: false,
+            });
+        }
+
+        self.rep_resume_active = false;
+        self.rep_execution.resume = None;
+        let result = result.map(|outcome| CycleOutcome {
+            core_clocks: 0,
+            halted: outcome.halted,
+        });
+        self.finish_instruction(
+            bus,
+            result,
+            resume.start_eip,
+            resume.cs.selector,
+            resume.precharged_core,
+            profiling.then_some((
+                resume.insn.group,
+                resume.insn.opcode,
+                CpuProfileOperandForm::from_insn(&resume.insn),
+            )),
+            profile_start,
+        )
+    }
+
+    fn execute_decoded_with_rep_budget<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+        rep_budget: Option<RepBudget>,
+    ) -> ExecResult<CycleOutcome> {
+        if insn.prefixes.rep.is_none() || rep_budget.is_none() {
+            return self.execute_decoded(insn, bus);
+        }
+        self.rep_execution.budget = rep_budget;
+        let result = self.execute_decoded(insn, bus);
+        self.rep_execution.budget = None;
+        result
     }
 
     /// Emit one differential-oracle trace line for the instruction that just retired at
@@ -217,12 +361,14 @@ impl CpuGsw {
     /// `start_eip` / `start_cs` are captured before the fetch so the rewind lands on the instruction's
     /// first byte.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finish_instruction<B: CpuBus>(
         &mut self,
         bus: &mut B,
         result: ExecResult<CycleOutcome>,
         start_eip: u32,
         start_cs: u16,
+        precharged_core: u64,
         profile_key: Option<(DecodeGroup, u16, CpuProfileOperandForm)>,
         profile_start: Option<std::time::Instant>,
     ) -> Result<CycleOutcome, CpuError> {
@@ -268,8 +414,14 @@ impl CpuGsw {
             // sample; histogram noise, accepted (this is a host-side loop finder, not
             // architectural state).
             let lin = self.registers.cs().base.wrapping_add(start_eip);
-            self.profile
-                .record(group, opcode, form, charged, profile_start, lin);
+            self.profile.record(
+                group,
+                opcode,
+                form,
+                precharged_core.saturating_add(charged),
+                profile_start,
+                lin,
+            );
         }
         if diff_trace_enabled() {
             self.emit_diff_trace_line(start_cs, start_eip);
@@ -308,6 +460,8 @@ impl CpuGsw {
     ) -> Result<BudgetedRunOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
+        #[cfg(feature = "jit")]
+        let mut skip_direct_once = false;
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
         // derives it from PIT-edge instants), but `total` counts core clocks
         // only. Track the batch's scaled-bus growth across this run so a
@@ -316,12 +470,13 @@ impl CpuGsw {
         // edge by the bus:core ratio. Buses without this accounting return 0,
         // which degrades to the core-only comparison.
         let bus_at_entry = bus.in_batch_scaled_bus_clocks();
+        let rep_budget = RepBudget { bus_at_entry, cap };
         self.perf.straight_line_runs += 1;
         loop {
             let can_take_before = self.can_take_interrupt();
             let outcome = if first {
                 first = false;
-                self.cycle_no_interrupt_check(bus)?
+                self.cycle_no_interrupt_check_with_budget(bus, Some(rep_budget))?
             } else {
                 let lin = self.linear_eip();
                 let cs = self.registers.cs();
@@ -363,22 +518,35 @@ impl CpuGsw {
                     cap,
                 };
                 #[cfg(feature = "jit")]
-                let region_outcome = match self.try_direct_continuation(
-                    bus,
-                    lin,
-                    cs.default_size_32,
-                    stamped_region,
-                    continuation_budget,
-                )? {
-                    DirectContinuation::Run(outcome) => Some(outcome),
-                    DirectContinuation::Interpret => None,
-                    DirectContinuation::RegionFallback => self.try_region_continuation(
+                let region_outcome = if std::mem::take(&mut skip_direct_once) {
+                    None
+                } else if jit_forced_region_lin() == Some(lin)
+                    || !self.jit_direct.auto_admit()
+                        && (self.jit_regions.auto_admit() || stamped_region.is_some())
+                {
+                    self.try_region_continuation(
                         bus,
                         lin,
                         cs.default_size_32,
                         stamped_region,
                         continuation_budget,
-                    )?,
+                    )?
+                } else if self.mode().uses_approximate_timing() {
+                    match self.try_direct_continuation(
+                        bus,
+                        lin,
+                        cs.default_size_32,
+                        continuation_budget,
+                    )? {
+                        DirectContinuation::Run(outcome) => Some(outcome),
+                        DirectContinuation::Prefix(outcome) => {
+                            skip_direct_once = true;
+                            Some(outcome)
+                        }
+                        DirectContinuation::Interpret => None,
+                    }
+                } else {
+                    None
                 };
                 #[cfg(not(feature = "jit"))]
                 let region_outcome: Option<CycleOutcome> = None;
@@ -390,16 +558,23 @@ impl CpuGsw {
                         // total is exactly the prior instructions' charge in this run, not
                         // including the continuation about to execute.
                         self.core_clocks_so_far = total;
-                        self.run_one_cached(bus, &insn, lin)?
+                        self.run_one_cached(bus, &insn, lin, rep_budget)?
                     }
                 }
             };
             total += u64::from(outcome.core_clocks);
+            // A budgeted REP exposes its restart EIP and returns after every bounded chunk so the
+            // machine can service an event or interrupt before any further iteration.
+            if self.rep_resume_active {
+                break;
+            }
             // The post-instruction break checks run in the SAME ORDER the old per-instruction machine
             // loop used (halted -> step-break -> interrupt-transition -> cap), so the run ends at
             // exactly the boundary that loop would have stopped at.
             if outcome.halted {
                 self.perf.brk_halt += 1;
+                #[cfg(feature = "jit")]
+                self.flush_direct_cache_stats();
                 return Ok(BudgetedRunOutcome {
                     consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
@@ -428,6 +603,8 @@ impl CpuGsw {
                 break;
             }
         }
+        #[cfg(feature = "jit")]
+        self.flush_direct_cache_stats();
         Ok(BudgetedRunOutcome {
             consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,
@@ -449,11 +626,25 @@ impl CpuGsw {
 
     /// Enable or disable hotness-driven JIT admission (feature `jit`). Unsupported hosts always
     /// keep it disabled. Independent of the forced-address override.
-    /// Lives on the region table (a transparent accelerator excluded from CPU equality), so setting
-    /// it never makes an otherwise-identical CPU compare unequal.
+    /// Lives on the direct block cache, a transparent accelerator excluded from CPU equality, so
+    /// setting it never makes an otherwise-identical CPU compare unequal.
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
+        self.jit_regions.set_auto_admit(false);
+        self.jit_direct.set_auto_admit(on && jit::HOST_SUPPORTED);
+    }
+
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
+        self.jit_direct.set_auto_admit(false);
         self.jit_regions.set_auto_admit(on && jit::HOST_SUPPORTED);
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if on {
+            self.jit_fast_map.invalidate_all();
+        }
     }
 
     #[cfg(feature = "jit")]
@@ -462,51 +653,115 @@ impl CpuGsw {
         bus: &mut B,
         lin: u32,
         d: bool,
-        stamped_region: Option<std::num::NonZeroU32>,
         budget: ContinuationBudget,
     ) -> Result<DirectContinuation, CpuError> {
         if !self.mode().uses_approximate_timing() {
             return Ok(DirectContinuation::Interpret);
         }
-        if !self.jit_regions.auto_admit() {
-            return Ok(DirectContinuation::RegionFallback);
+        if !self.jit_direct.auto_admit() {
+            return Ok(DirectContinuation::Interpret);
         }
-        // The decode-line region stamp is the existing hot-block admission bit. Cold cached
-        // continuations stay on the old zero-hash path; the region engine warms and stamps a hot
-        // entry first, then the direct compiler gets its first/second observations here.
-        if stamped_region.is_none() {
-            return Ok(DirectContinuation::RegionFallback);
+        if !self.decode_cache.direct_hot(lin, d) {
+            return Ok(DirectContinuation::Interpret);
         }
         let Some(key) = jit::direct::key_for(self, lin, d) else {
-            return Ok(DirectContinuation::RegionFallback);
+            return Ok(DirectContinuation::Interpret);
         };
-        let block = match self.jit_direct.probe(key) {
+        let probe = self.jit_direct.probe(key);
+        let block = match probe {
             jit::direct::BlockProbe::Interpret => return Ok(DirectContinuation::Interpret),
             jit::direct::BlockProbe::Rejected => {
-                return Ok(DirectContinuation::RegionFallback);
+                return Ok(DirectContinuation::Interpret);
             }
-            jit::direct::BlockProbe::Ready(block) => block,
+            jit::direct::BlockProbe::Ready(id) => self
+                .jit_direct
+                .block(id)
+                .expect("ready direct block must remain live"),
             jit::direct::BlockProbe::Compile => {
+                let compile_start = std::time::Instant::now();
                 let Some(compilation) = jit::direct::compile(self, lin, d) else {
+                    self.perf.jit_direct_compile_attempts += 1;
+                    self.perf.jit_direct_compile_ns +=
+                        compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                     self.jit_direct.reject(key);
-                    return Ok(DirectContinuation::RegionFallback);
+                    return Ok(DirectContinuation::Interpret);
                 };
-                let Some(block) = self.jit_direct.install(
-                    compilation.span,
-                    compilation.fetch_lens,
-                    compilation.raw_clocks,
-                    &compilation.code,
-                ) else {
+                self.perf.jit_direct_compile_attempts += 1;
+                self.perf.jit_direct_compile_ns +=
+                    compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                let code_page =
+                    bus.direct_page(key.physical, BusAccessKind::InstructionPrefetch)?;
+                let code_page_covers_block = code_page.is_some_and(|page| {
+                    page.physical_page == key.physical & !0x0fff
+                        && (key.physical & 0x0fff)
+                            .checked_add(u32::from(compilation.span.guest_len))
+                            .is_some_and(|end| end as usize <= page.len)
+                });
+                if !code_page_covers_block {
                     self.jit_direct.reject(key);
-                    return Ok(DirectContinuation::RegionFallback);
+                    return Ok(DirectContinuation::Interpret);
+                }
+                let Some(id) = self.jit_direct.install(&compilation) else {
+                    self.jit_direct.reject(key);
+                    return Ok(DirectContinuation::Interpret);
                 };
-                block
+                self.perf.jit_direct_blocks_installed += 1;
+                self.jit_direct
+                    .block(id)
+                    .expect("installed direct block must be live")
             }
         };
-        match self.run_direct_block(bus, block, budget.total, budget.bus_at_entry, budget.cap)? {
-            Some(outcome) => Ok(DirectContinuation::Run(outcome)),
-            None => Ok(DirectContinuation::Interpret),
+        let residency_epoch = self.decode_cache.residency_epoch();
+        let block = if block.decode_residency_epoch() == residency_epoch {
+            block
+        } else {
+            let mut slot_lin = block.span().key.linear;
+            if block.fetch_lens().iter().any(|&len| {
+                let live = self.decode_cache.line_live(slot_lin, d);
+                slot_lin = slot_lin.wrapping_add(u32::from(len));
+                !live
+            }) {
+                return Ok(DirectContinuation::Interpret);
+            }
+            let Some(block) = self
+                .jit_direct
+                .refresh_decode_residency(block.span().key, residency_epoch)
+            else {
+                return Ok(DirectContinuation::Interpret);
+            };
+            block
+        };
+        // A stale short block must pass the residency scan above so it can become a link target in
+        // the new translation epoch. Once current, avoid the heavier native-entry validation until
+        // one of its own successor cells is live.
+        if self.jit_direct.defer_short_enabled()
+            && !block.is_self_loop()
+            && block.span().instructions < jit::direct::MIN_STANDALONE_INSTRUCTIONS
+            && !self.jit_direct.has_linked_successor(block)
+        {
+            self.perf.jit_direct_deferred_short += 1;
+            return Ok(DirectContinuation::Interpret);
         }
+        match self.run_direct_block(bus, block, budget.total, budget.bus_at_entry, budget.cap)? {
+            DirectBlockOutcome::Complete(outcome) => Ok(DirectContinuation::Run(outcome)),
+            DirectBlockOutcome::Prefix(outcome) => Ok(DirectContinuation::Prefix(outcome)),
+            DirectBlockOutcome::NotRun => Ok(DirectContinuation::Interpret),
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    fn flush_direct_cache_stats(&mut self) {
+        let stats = self.jit_direct.take_stats();
+        self.perf.jit_direct_hot_hits += stats.hot_hits;
+        self.perf.jit_direct_hash_hits += stats.hash_hits;
+        self.perf.jit_direct_lookup_misses += stats.lookup_misses;
+        self.perf.jit_direct_cache_resets += stats.cache_resets;
+        self.perf.jit_direct_arena_compactions += stats.arena_compactions;
+        self.perf.jit_direct_arena_compaction_live_blocks += stats.arena_compaction_live_blocks;
+        self.perf.jit_direct_arena_compaction_bytes += stats.arena_compaction_bytes;
+        self.perf.jit_direct_arena_compaction_failures += stats.arena_compaction_failures;
+        self.perf.jit_direct_links_created += stats.links;
+        self.perf.jit_direct_links_cleared += stats.unlinks;
     }
 
     #[cfg(feature = "jit")]
@@ -517,13 +772,49 @@ impl CpuGsw {
         total: u64,
         bus_at_entry: u64,
         cap: u64,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
-        if self.profile.enabled || diff_trace_enabled() || self.interrupt_shadow {
-            return Ok(None);
+    ) -> Result<DirectBlockOutcome, CpuError> {
+        if self.profile.enabled || diff_trace_enabled() {
+            self.perf.jit_direct_reject_observer += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        if self.interrupt_shadow {
+            self.perf.jit_direct_reject_interrupt_shadow += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        if !bus.native_aggregate_accounting_allowed() {
+            self.perf.jit_direct_reject_aggregate_accounting += 1;
+            return Ok(DirectBlockOutcome::NotRun);
         }
         let span = block.span();
         if span.key.mode_key != self.jit_mode_key() {
-            return Ok(None);
+            self.perf.jit_direct_reject_mode_key += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        if !block.cs_descriptor_matches(self) {
+            self.perf.jit_direct_reject_cs_layout += 1;
+            self.jit_direct.retire_key_for_recompile(span.key);
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        if block.memory_cpl3() != (self.current_privilege_level() == 3) {
+            self.perf.jit_direct_reject_cpl += 1;
+            self.jit_direct.retire_key_for_recompile(span.key);
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        let has_link = self.jit_direct.has_linked_successor(block);
+        let data_descriptors_match = if has_link {
+            block.chain_descriptors_match(self)
+        } else {
+            block.data_descriptors_match(self)
+        };
+        if !data_descriptors_match {
+            self.perf.jit_direct_reject_data_segment += 1;
+            self.jit_direct.retire_key_for_recompile(span.key);
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+        if block.has_dword_accesses() && self.alignment_armed && self.current_privilege_level() == 3
+        {
+            self.perf.jit_direct_reject_alignment += 1;
+            return Ok(DirectBlockOutcome::NotRun);
         }
         let eip = self.registers.eip;
         let fetch_last = u32::from(span.guest_len) - 1;
@@ -534,74 +825,332 @@ impl CpuGsw {
             .checked_sub(fetch_last)
             .is_none_or(|last_start| eip > last_start)
         {
-            return Ok(None);
+            self.perf.jit_direct_reject_fetch_limit += 1;
+            return Ok(DirectBlockOutcome::NotRun);
+        }
+
+        let chain_eligible =
+            has_link && !(self.alignment_armed && self.current_privilege_level() == 3);
+        if self.jit_direct.defer_short_enabled()
+            && !block.is_self_loop()
+            && span.instructions < jit::direct::MIN_STANDALONE_INSTRUCTIONS
+            && !chain_eligible
+        {
+            self.perf.jit_direct_deferred_short += 1;
+            return Ok(DirectBlockOutcome::NotRun);
         }
 
         let (num, den) = level_timing(self.persona());
-        let scaled_core =
-            (u64::from(block.raw_clocks()) * u64::from(num) + self.timing_rem) / u64::from(den);
+        let fp_core_upper = u64::from(block.weighted_fp_clocks())
+            .saturating_add(u64::from(FP_TIMING_DEN) - 1)
+            / u64::from(FP_TIMING_DEN);
+        let scaled_core_upper = u64::from(block.raw_clocks())
+            .saturating_add(fp_core_upper)
+            .saturating_mul(u64::from(num))
+            .saturating_add(u64::from(den) - 1)
+            / u64::from(den);
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(bus_at_entry);
-        let mut fetch_lin = span.key.linear;
-        let mut fetch_raw = 0u64;
-        for &len in block.fetch_lens() {
-            let Some(raw) = bus.jit_cached_fetch_run_clocks(fetch_lin, u32::from(len)) else {
-                return Ok(None);
-            };
-            fetch_raw = fetch_raw.saturating_add(raw);
-            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
-        }
-        let fetch_upper = if cap == u64::MAX {
+        let fetch_upper = bus
+            .jit_fetch_cost_clocks()
+            .saturating_mul(u64::from(span.instructions));
+        let data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Byte)
+            .saturating_mul(u64::from(block.byte_reads()))
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(u64::from(block.dword_reads())),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Byte)
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte))
+                    .saturating_mul(u64::from(block.byte_stores())),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
+                    .saturating_mul(u64::from(block.dword_stores())),
+            );
+        let iteration_upper = scaled_core_upper
+            .saturating_add(fetch_upper)
+            .saturating_add(data_upper);
+        let used = total.saturating_add(bus_growth);
+        let available = cap.saturating_sub(used).saturating_sub(1);
+        let budget_quota = available.checked_div(iteration_upper).unwrap_or(u64::MAX);
+        const MAX_NATIVE_SELF_LOOP_ITERATIONS: u64 = 4_096;
+        let quota = if block.is_self_loop() {
+            budget_quota.min(MAX_NATIVE_SELF_LOOP_ITERATIONS)
+        } else if budget_quota == 0 {
             0
         } else {
-            let bus_now = bus.in_batch_scaled_bus_clocks();
-            let Some(bus_after) = bus.jit_projected_batch_scaled_bus_clocks(fetch_raw) else {
-                return Ok(None);
-            };
-            bus_after.saturating_sub(bus_now).saturating_add(1)
+            // Devices advance only after native return. I/O, flag-control operations, segment
+            // changes, and interrupt-shadow boundaries are compiler barriers, so budget and the
+            // bounded block count are the only steady-state boundary checks needed here.
+            if !chain_eligible {
+                1
+            } else {
+                // x87-bearing blocks link only to other x87-bearing blocks. This keeps the common
+                // integer chain bound tight while covering the 586 FISTP conversion surcharge.
+                let unscaled_max_core = if block.has_x87() {
+                    jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
+                } else {
+                    // A block can contain 31 four-clock instructions followed by a ten-clock RET.
+                    4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6
+                };
+                let max_core = unscaled_max_core
+                    .saturating_mul(u64::from(num))
+                    .saturating_add(u64::from(den) - 1)
+                    / u64::from(den);
+                let max_read = bus
+                    .jit_data_cost_clocks(BusWidth::Dword)
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+                let max_store = max_read;
+                let global_block_upper = max_core.saturating_add(
+                    (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(
+                        bus.jit_fetch_cost_clocks()
+                            .saturating_add(max_read)
+                            .saturating_add(max_store),
+                    ),
+                );
+                let additional = available
+                    .saturating_sub(iteration_upper)
+                    .checked_div(global_block_upper)
+                    .unwrap_or(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1);
+                1 + additional.min(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1)
+            }
         };
-        if total
-            .saturating_add(bus_growth)
-            .saturating_add(scaled_core)
-            .saturating_add(fetch_upper)
-            > cap
-        {
-            return Ok(None);
+        if quota == 0 {
+            self.perf.jit_direct_reject_zero_budget += 1;
+            return Ok(DirectBlockOutcome::NotRun);
         }
 
+        let uniform_fetches = bus.native_fetches_are_uniform();
+        let trace_capacity = if uniform_fetches {
+            0
+        } else if block.is_self_loop() {
+            1
+        } else {
+            quota.min(jit::direct::MAX_CHAIN_BLOCKS as u64) as usize
+        };
+        let mut trace = Vec::<std::mem::MaybeUninit<jit::direct::NativeBlockTrace>>::with_capacity(
+            trace_capacity,
+        );
+        let mut exit = jit::direct::NativeExit {
+            trace_ptr: if uniform_fetches {
+                0
+            } else {
+                trace.as_mut_ptr() as usize
+            },
+            ..jit::direct::NativeExit::default()
+        };
+        // Arena compaction can relocate code while callers still hold a copied block descriptor.
+        // Resolve its generational ID at the last safe point before entering native code.
+        let Some(current_block) = self.jit_direct.block(block.id()) else {
+            return Ok(DirectBlockOutcome::NotRun);
+        };
         self.begin_instruction();
         self.core_clocks_so_far = total;
-        let mut fetch_lin = span.key.linear;
-        for &len in block.fetch_lens() {
-            if self.charge_cached_fetch(bus, fetch_lin, len).is_err() {
-                self.registers.eip = eip;
-                return Ok(None);
-            }
-            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
-        }
-        self.registers.eip = eip;
         let flags = self.materialized_eflags();
-        // SAFETY: direct::emit produced this page using the exact two-argument ABI, the arena
-        // sealed it executable, and `self.jit_direct` keeps that arena alive for this call.
-        let entry: jit::direct::DirectEntryFn = unsafe { std::mem::transmute(block.entry_ptr()) };
-        let raw = unsafe { entry(self as *mut CpuGsw, flags) };
-        debug_assert_eq!(raw, block.raw_clocks());
+        // SAFETY: direct::emit produced this page using the exact four-argument ABI, the arena
+        // sealed it executable, and the current generational lookup keeps that arena entry live.
+        let entry: jit::direct::DirectEntryFn =
+            unsafe { std::mem::transmute(current_block.entry_ptr()) };
+        unsafe {
+            entry(
+                self as *mut CpuGsw,
+                flags,
+                quota as u32,
+                &mut exit as *mut jit::direct::NativeExit,
+            );
+        }
+        debug_assert!((exit.trace_len as usize) <= trace_capacity);
+        debug_assert_eq!(exit.trace_len == 0, uniform_fetches);
+        debug_assert!(u64::from(exit.linked_transfers) < quota);
+        debug_assert!(exit.mode13_dirty_pages <= u64::from(u16::MAX));
+        debug_assert!(exit.side_exit <= 1);
+        debug_assert!(
+            exit.side_exit != 0
+                || exit.side_exit_reason == jit::direct::SideExitReason::None as u32
+        );
+        debug_assert!(exit.side_exit_reason <= jit::direct::SideExitReason::Other as u32);
+        let side_exit = exit.side_exit != 0;
 
-        let charged = self.scale_clocks_batch(u64::from(raw));
+        let final_eip = self.registers.eip;
+        let cs_base = self.registers.cs().base;
+        let instructions = exit.instructions;
+        let fp = jit::native_x87::scale_weighted_fp_clocks(exit.weighted_fp_clocks, self.fp_rem);
+        self.fp_rem = fp.remainder;
+        let raw_clocks = exit.raw_clocks.saturating_add(fp.clocks);
+        let byte_reads = exit.byte_reads;
+        let dword_reads = exit.dword_reads;
+        if uniform_fetches {
+            bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(instructions));
+        } else {
+            let trace = unsafe {
+                std::slice::from_raw_parts(
+                    trace.as_ptr().cast::<jit::direct::NativeBlockTrace>(),
+                    exit.trace_len as usize,
+                )
+            };
+            let mut traced_instructions = 0u64;
+            for trace in trace {
+                let traced = self
+                    .jit_direct
+                    .block_for_trace(trace.linear, trace.physical, span.key.mode_key)
+                    .expect("resident native trace must name a live block");
+                debug_assert!(trace.prefix_instructions <= u32::from(traced.span().instructions));
+                let repetitions = u64::from(trace.repetitions);
+                traced_instructions = traced_instructions
+                    .saturating_add(
+                        repetitions.saturating_mul(u64::from(traced.span().instructions)),
+                    )
+                    .saturating_add(u64::from(trace.prefix_instructions));
+                self.registers.eip = trace.linear.wrapping_sub(cs_base);
+                if !bus.charge_native_cached_fetches(
+                    trace.linear,
+                    trace.physical,
+                    traced.fetch_lens(),
+                    repetitions,
+                ) {
+                    for _ in 0..repetitions {
+                        let mut fetch_lin = trace.linear;
+                        for &len in traced.fetch_lens() {
+                            self.charge_cached_fetch(bus, fetch_lin, len)
+                                .expect("validated direct-block fetch charge cannot fault");
+                            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+                        }
+                    }
+                }
+                let mut fetch_lin = trace.linear;
+                for &len in traced
+                    .fetch_lens()
+                    .iter()
+                    .take(trace.prefix_instructions as usize)
+                {
+                    self.charge_cached_fetch(bus, fetch_lin, len)
+                        .expect("validated direct-block prefix fetch charge cannot fault");
+                    fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+                }
+            }
+            debug_assert_eq!(traced_instructions, instructions);
+        }
+        self.registers.eip = final_eip;
+
+        debug_assert!(exit.mode13_byte_reads <= byte_reads);
+        debug_assert!(exit.mode13_dword_reads <= dword_reads);
+        let ram_byte_reads = byte_reads - exit.mode13_byte_reads;
+        let ram_dword_reads = dword_reads - exit.mode13_dword_reads;
+
+        let data_clocks = bus
+            .jit_data_cost_clocks(BusWidth::Byte)
+            .saturating_mul(ram_byte_reads)
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(ram_dword_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(exit.mode13_byte_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(exit.mode13_dword_reads),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(exit.ram_byte_writes),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(exit.ram_dword_writes),
+            );
+        bus.charge_bus_clocks_bulk(data_clocks);
+        bus.charge_native_mode13_writes(izarravm_bus::NativeMode13Writes {
+            dirty_pages: exit.mode13_dirty_pages as u16,
+            byte_writes: exit.mode13_byte_writes,
+            dword_writes: exit.mode13_dword_writes,
+        });
+
+        let charged = self.scale_clocks_batch(raw_clocks);
         self.elapsed_clocks += charged;
-        let instructions = u64::from(span.instructions);
+        let reads = byte_reads + dword_reads;
+        let writes = exit.ram_byte_writes
+            + exit.ram_dword_writes
+            + exit.mode13_byte_writes
+            + exit.mode13_dword_writes;
+        if writes != 0
+            && let Some(page) = self.prefetch.physical_page()
+        {
+            // Native stores are reported in one batch, without an address per write. Mark the
+            // current prefetch page conservatively so the next instruction drops any stale bytes.
+            self.record_write_page(page << 12);
+        }
         self.perf.instructions += instructions;
-        self.perf.jit_region_entries += 1;
-        self.perf.jit_region_insns += instructions;
-        self.perf.jit_native_insns += instructions;
+        self.perf.jit_direct_entries += 1;
+        self.perf.jit_direct_insns += instructions;
+        self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
+        self.perf.jit_direct_unresolved_exits += u64::from(exit.unresolved_exits);
+        self.perf.jit_native_load_hits += reads;
+        self.perf.data_direct_reads += reads;
+        self.perf.direct_data_pointer_reads += reads;
+        self.perf.jit_native_store_hits += writes;
+        self.perf.data_direct_writes += writes;
+        self.perf.direct_data_pointer_writes += writes;
+        if side_exit {
+            self.perf.jit_direct_side_exits += 1;
+            match exit.side_exit_reason {
+                reason if reason == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
+                    self.perf.jit_direct_exit_cross_page_or_alignment += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
+                    self.perf.jit_direct_exit_unavailable_or_kind += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::Permission as u32 => {
+                    self.perf.jit_direct_exit_permission += 1;
+                }
+                reason if reason == jit::direct::SideExitReason::CodeWatch as u32 => {
+                    self.perf.jit_direct_exit_code_watch += 1;
+                }
+                _ => self.perf.jit_direct_exit_other += 1,
+            }
+        }
         if self.is_ring0_protected() {
             self.perf.monitor_resident_core_clocks += charged;
         }
-        Ok(Some(CycleOutcome {
+        self.flush_direct_cache_stats();
+        let outcome = CycleOutcome {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: false,
-        }))
+        };
+        if side_exit {
+            Ok(DirectBlockOutcome::Prefix(outcome))
+        } else {
+            Ok(DirectBlockOutcome::Complete(outcome))
+        }
+    }
+
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn try_run_direct_block_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        block: jit::direct::CompiledBlock,
+    ) -> Result<bool, CpuError> {
+        self.try_run_direct_block_with_cap_for_test(bus, block, u64::MAX)
+    }
+
+    #[cfg(all(feature = "jit", test))]
+    pub(crate) fn try_run_direct_block_with_cap_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        block: jit::direct::CompiledBlock,
+        cap: u64,
+    ) -> Result<bool, CpuError> {
+        let bus_at_entry = bus.in_batch_scaled_bus_clocks();
+        Ok(!matches!(
+            self.run_direct_block(bus, block, 0, bus_at_entry, cap)?,
+            DirectBlockOutcome::NotRun
+        ))
     }
 
     /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
@@ -900,17 +1449,23 @@ impl CpuGsw {
         bus: &mut B,
         insn: &DecodedInsn,
         lin: u32,
+        rep_budget: RepBudget,
     ) -> Result<CycleOutcome, CpuError> {
         self.interrupt_shadow = false;
         self.begin_instruction();
         let start_eip = self.registers.eip;
-        let start_cs = self.registers.cs().selector;
+        let start_cs_register = self.registers.cs();
+        let start_cs = start_cs_register.selector;
         let profiling = self.profile.enabled;
+        self.rep_execution.yielded = false;
         if !profiling {
             return match self
                 .charge_cached_fetch(bus, lin, insn.len)
-                .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus))
+                .and_then(|()| self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget))
             {
+                Ok(outcome) if self.rep_execution.yielded => {
+                    Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, outcome))
+                }
                 Ok(outcome) => {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
@@ -935,19 +1490,24 @@ impl CpuGsw {
                     })
                 }
                 Err(fault) => {
-                    self.finish_instruction(bus, Err(fault), start_eip, start_cs, None, None)
+                    self.finish_instruction(bus, Err(fault), start_eip, start_cs, 0, None, None)
                 }
             };
         }
         let profile_start = self.profile.sample_start();
         let result = self
             .charge_cached_fetch(bus, lin, insn.len)
-            .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus));
+            .and_then(|()| self.execute_hot_cached_or_decoded_budgeted(insn, bus, rep_budget));
+        if self.rep_execution.yielded {
+            let outcome = result.expect("a faulting REP chunk cannot also yield");
+            return Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, outcome));
+        }
         self.finish_instruction(
             bus,
             result,
             start_eip,
             start_cs,
+            0,
             profiling.then_some((
                 insn.group,
                 insn.opcode,
@@ -957,11 +1517,31 @@ impl CpuGsw {
         )
     }
 
+    fn execute_hot_cached_or_decoded_budgeted<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+        rep_budget: RepBudget,
+    ) -> ExecResult<CycleOutcome> {
+        self.execute_hot_cached_or_decoded_inner(insn, bus, Some(rep_budget))
+    }
+
     #[inline]
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     pub(super) fn execute_hot_cached_or_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        self.execute_hot_cached_or_decoded_inner(insn, bus, None)
+    }
+
+    #[inline]
+    fn execute_hot_cached_or_decoded_inner<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+        rep_budget: Option<RepBudget>,
     ) -> ExecResult<CycleOutcome> {
         if let Some(outcome) = self.execute_hot_cached_decoded(insn) {
             return Ok(outcome);
@@ -999,7 +1579,7 @@ impl CpuGsw {
             }
             _ => {}
         }
-        self.execute_decoded(insn, bus)
+        self.execute_decoded_with_rep_budget(insn, bus, rep_budget)
     }
 
     /// Hot cached-instruction subset that never touches the bus and cannot fault. EIP has already

@@ -10,20 +10,12 @@ pub(crate) const HOST_SUPPORTED: bool = cfg!(all(
     any(target_os = "windows", target_os = "linux")
 ));
 
-/// Whether the diagnostic single-address admission override is active. This is shared with the
-/// fast-map fill gate so `IZARRAVM_JIT=0` keeps the large map unallocated unless a forced compile
-/// was explicitly requested.
-pub(crate) fn forced_admission_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("IZARRAVM_JIT_REGION")
-            .ok()
-            .and_then(|value| u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok())
-            .is_some()
-    })
-}
-
 pub(crate) mod block;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(crate) mod code_watch;
 pub(crate) mod direct;
 pub(crate) mod encoder;
 pub(crate) mod exec_mem;
@@ -32,7 +24,14 @@ pub(crate) mod exec_mem;
     any(target_os = "windows", target_os = "linux")
 ))]
 pub(crate) mod fast_map;
+#[allow(dead_code)]
+pub(crate) mod native_x87;
 mod region;
 pub(crate) mod step;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(crate) mod x87_emit;
 
 pub(crate) use region::RegionTable;

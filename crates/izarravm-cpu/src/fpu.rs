@@ -35,6 +35,22 @@ pub struct X87 {
     mm: [u64; 8],
 }
 
+/// Byte offsets used by the native x64 backend to access the existing x87 state.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeX87Layout {
+    pub(crate) st: usize,
+    pub(crate) control: usize,
+    pub(crate) status: usize,
+    pub(crate) tag: usize,
+    pub(crate) st_stride: usize,
+}
+
 // Bit-wise equality so the containing CpuGsw can keep deriving Eq despite the
 // f64 register file (f64 is not Eq because of NaN; comparing raw bits is).
 impl PartialEq for X87 {
@@ -68,6 +84,23 @@ impl Default for X87 {
 }
 
 impl X87 {
+    /// Return offsets into this exact Rust layout without exposing its fields.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[allow(dead_code)]
+    pub(crate) const fn native_layout() -> NativeX87Layout {
+        NativeX87Layout {
+            st: core::mem::offset_of!(Self, st),
+            control: core::mem::offset_of!(Self, control),
+            status: core::mem::offset_of!(Self, status),
+            tag: core::mem::offset_of!(Self, tag),
+            st_stride: core::mem::size_of::<f64>(),
+        }
+    }
+
     /// FNINIT / FINIT: reset to the documented power-on state.
     pub fn finit(&mut self) {
         self.st = [0.0; 8];

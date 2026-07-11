@@ -1,6 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
+#![recursion_limit = "256"]
+
 mod bench;
 mod bench_reference;
 mod cmos;
@@ -11,8 +13,8 @@ mod prefs;
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;
 use izarravm_core::{
-    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, MidiConfig, MidiPortId,
-    SbDma8, SbDma16, SbIrq, VideoCard,
+    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MASTER_CLOCK_HZ, MidiBackend, MidiConfig,
+    MidiPortId, SbDma8, SbDma16, SbIrq, VideoCard,
 };
 use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
@@ -82,42 +84,43 @@ struct Cli {
     sb_dma: Option<SbDma8>,
     #[arg(long)]
     sb_high_dma: Option<SbDma16>,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_config_check: bool,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_test_rom: bool,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_boot_suite: bool,
     /// Run the built-in calibration probes and the local Dhrystone and
     /// Whetstone executables at .bench/dhrystone.exe and .bench/whetstone.exe.
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_bench: bool,
     /// Run one supplied DOS EXE through the raw-program bench harness in GSW-586.
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_bench_exe: Option<PathBuf>,
     /// Run one supplied DOS EXE twice in GSW-586: baseline, then profiling buckets.
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_profile_exe: Option<PathBuf>,
-    /// Write --headless-profile-exe output as pretty JSON. Parent directory must exist.
+    /// Write profiling output as pretty JSON. Supported by --headless-profile-exe and
+    /// --hdd-folder. The parent directory must exist.
     #[arg(long)]
     profile_json: Option<PathBuf>,
     /// Sample every Nth instruction in --headless-profile-exe.
     #[arg(long, default_value_t = 1024)]
     profile_sample_stride: u64,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_bandwidth: bool,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_keyboard: bool,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_izarra_bios: bool,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_boot_floppy: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     headless_boot_hdd: Option<PathBuf>,
     /// Boot the Katea host-folder facade: mount the given directory as C: through
     /// the real FreeDOS system files, run the BIOS, and print the boot diagnostics.
     /// The folder's top-level files are surfaced read-only beside the OS.
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     hdd_folder: Option<PathBuf>,
     /// With --hdd-folder, print a machine-readable result block after stop:
     /// stop reason, CS:IP, full register state, and the 80x25 text page. For
@@ -128,9 +131,12 @@ struct Cli {
     /// For headless benchmark/timedemo runs whose result lands in graphics mode.
     #[arg(long)]
     result_ppm: Option<PathBuf>,
+    /// With --hdd-folder, return an error unless the guest reaches Lotura TestExit code 0.
+    #[arg(long, requires = "hdd_folder")]
+    expect_test_exit: bool,
     /// Boot real FreeDOS from a temp Katea disk and run a single DOS program,
     /// exiting with its DOS exit code (the Katea replacement for --headless-run).
-    #[arg(long)]
+    #[arg(long, group = "run_mode")]
     katea_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
@@ -162,6 +168,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
+    if cli.profile_json.is_some() && cli.headless_profile_exe.is_none() && cli.hdd_folder.is_none()
+    {
+        return Err("--profile-json requires --headless-profile-exe or --hdd-folder".into());
+    }
     let midi_presence = midi_config_presence(&cli)?;
     let mut config = load_config(&cli)?;
     // When the user gave no C: location (no --c_drive, no --dosroot, and the
@@ -260,6 +270,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             &hardware,
             cli.dump_result,
             cli.result_ppm.as_deref(),
+            cli.profile_json.as_deref(),
+            cli.expect_test_exit,
         );
     }
 
@@ -646,6 +658,7 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
 /// plus the folder's top-level files, read-only), run the BIOS so INT 19h boots
 /// it, and print the same diagnostics as `run_boot_hdd`. The lazy-facade analogue
 /// of the flat-image boot loop.
+#[allow(clippy::too_many_arguments)]
 fn run_boot_hdd_folder(
     dir: &Path,
     glide_ovl: Option<Vec<u8>>,
@@ -653,7 +666,12 @@ fn run_boot_hdd_folder(
     hardware: &HardwareProfile,
     dump_result: bool,
     result_ppm: Option<&Path>,
+    profile_json: Option<&Path>,
+    expect_test_exit: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if let Some(path) = profile_json {
+        validate_profile_json_parent(path)?;
+    }
     let mut machine = Machine::new(
         MachineProfile::from_hardware_profile(hardware),
         izarravm_firmware::izarra_bios(),
@@ -667,15 +685,37 @@ fn run_boot_hdd_folder(
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
     // run. Reads the guest-clock attribution of e.g. the x87 opcode rows
     // (D8-DF) for a timedemo without touching guest-visible state.
+    // IZARRAVM_MACHINE_PROFILE=1 measures only the batch-level machine phases,
+    // leaving the direct compiler enabled for representative throughput runs.
     let cpu_profile_stride = std::env::var("IZARRAVM_CPU_PROFILE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
+    let machine_profile = profile_json.is_some()
+        || std::env::var("IZARRAVM_MACHINE_PROFILE")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0"));
     if let Some(stride) = cpu_profile_stride {
         machine.enable_host_profiling(stride);
+    } else if machine_profile {
+        machine.enable_machine_profiling();
     }
     let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
     let start_wall = std::time::Instant::now();
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    let wall = start_wall.elapsed();
+    let timedemo = extract_timedemo_realtics(&machine.screen_text().as_text());
+    if let Some(path) = profile_json {
+        write_hdd_profile_json(
+            path,
+            dir,
+            hardware.cpu,
+            budget,
+            wall,
+            &stop_reason,
+            timedemo,
+            &machine,
+        )?;
+    }
     if cpu_profile_stride.is_some() {
         let snapshot = machine.cpu().profile_snapshot();
         bench::print_cpu_profile(&snapshot);
@@ -743,6 +783,9 @@ fn run_boot_hdd_folder(
             }
         }
     }
+    if machine_profile {
+        bench::print_machine_profile(&machine.host_profile_snapshot(), wall);
+    }
     // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
     // always maintained, so unlike the sampled profile above this print costs nothing.
     bench::print_perf_counter_row("hdd-folder", hardware.cpu, machine.cpu().perf_counters());
@@ -784,14 +827,103 @@ fn run_boot_hdd_folder(
     machine.flush_hdd_folder();
 
     // Wall time + realtics extraction (for 2+3). Makes A/B runs self-contained.
-    let wall = start_wall.elapsed();
     println!("wall: {:.3}s", wall.as_secs_f64());
-    let screen = machine.screen_text().as_text();
-    if let Some((gametics, realtics)) = extract_timedemo_realtics(&screen) {
+    if let Some((gametics, realtics)) = timedemo {
         println!("timed {} gametics in {} realtics", gametics, realtics);
+    }
+    if expect_test_exit && !matches!(stop_reason, StopReason::TestExit { code: 0 }) {
+        return Err(format!("expected TestExit code 0, got {stop_reason:?}").into());
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_hdd_profile_json(
+    path: &Path,
+    workload: &Path,
+    mode: GswMode,
+    budget: u64,
+    wall: std::time::Duration,
+    stop_reason: &StopReason,
+    timedemo: Option<(u32, u32)>,
+    machine: &Machine,
+) -> Result<(), Box<dyn Error>> {
+    validate_profile_json_parent(path)?;
+
+    let wall_seconds = wall.as_secs_f64();
+    let master_ticks = machine.master_ticks();
+    let guest_seconds = master_ticks as f64 / MASTER_CLOCK_HZ as f64;
+    let perf = machine.cpu().perf_counters();
+    let instructions = perf.instructions.max(1);
+    let machine_phases = machine.host_profile_snapshot().phases;
+    let classified_wall_ns = machine_phases
+        .iter()
+        .map(|phase| phase.wall_ns)
+        .sum::<u64>();
+    let total_wall_ns = wall.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let report = json!({
+        "schema": "izarravm-hdd-profile-v1",
+        "workload": workload.display().to_string(),
+        "mode": mode.canonical_name(),
+        "cycle_budget": budget,
+        "stop": stop_reason_json(stop_reason),
+        "wall_seconds": wall_seconds,
+        "guest_seconds": guest_seconds,
+        "real_time_factor": guest_seconds / wall_seconds.max(f64::MIN_POSITIVE),
+        "master_ticks": master_ticks,
+        "elapsed_budget_clocks": machine.elapsed_clocks(),
+        "executed_cpu_core_clocks": machine.cpu().elapsed_clocks,
+        "raw_bus_clocks": machine.raw_bus_clocks(),
+        "instructions_per_host_second": perf.instructions as f64 / wall_seconds.max(f64::MIN_POSITIVE),
+        "budget_clocks_per_host_second": machine.elapsed_clocks() as f64 / wall_seconds.max(f64::MIN_POSITIVE),
+        "cpu_core_clocks_per_host_second": machine.cpu().elapsed_clocks as f64 / wall_seconds.max(f64::MIN_POSITIVE),
+        "combined_jit_native_coverage": perf.jit_native_insns.saturating_add(perf.jit_direct_insns) as f64 / instructions as f64,
+        "combined_jit_slow_exits_per_100_instructions": 100.0 * perf.jit_helper_exits.saturating_add(perf.jit_direct_side_exits) as f64 / instructions as f64,
+        "direct_native_coverage": perf.jit_direct_insns as f64 / instructions as f64,
+        "direct_slow_exits_per_100_instructions": 100.0 * perf.jit_direct_side_exits as f64 / instructions as f64,
+        "timedemo": timedemo.map(|(gametics, realtics)| json!({
+            "gametics": gametics,
+            "realtics": realtics,
+        })),
+        "machine_phases": machine_phases.iter().map(|phase| json!({
+            "name": phase.name,
+            "wall_ns": phase.wall_ns,
+            "count": phase.count,
+        })).collect::<Vec<_>>(),
+        "classified_wall_ns": classified_wall_ns,
+        "unattributed_wall_ns": total_wall_ns.saturating_sub(classified_wall_ns),
+        "perf": bench::perf_counters_json(perf),
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    Ok(())
+}
+
+fn validate_profile_json_parent(path: &Path) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.exists()
+    {
+        return Err(format!(
+            "profile JSON parent directory does not exist: {}",
+            parent.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn stop_reason_json(stop: &StopReason) -> serde_json::Value {
+    match stop {
+        StopReason::Halted => json!({ "kind": "halted" }),
+        StopReason::CycleLimit { requested } => {
+            json!({ "kind": "cycle_limit", "requested": requested })
+        }
+        StopReason::CpuError(message) => json!({ "kind": "cpu_error", "message": message }),
+        StopReason::DosExit { code } => json!({ "kind": "dos_exit", "code": code }),
+        StopReason::TestExit { code } => json!({ "kind": "test_exit", "code": code }),
+    }
 }
 
 /// Parse Doom-style timedemo output from the guest text screen.

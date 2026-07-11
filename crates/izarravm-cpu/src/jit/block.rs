@@ -227,6 +227,7 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
             Some(i) => i,
             None => break false, // cold ahead: the block is whatever we have so far (linear).
         };
+        let physical = cpu.decode_cache.line_phys_start(lin, d)?;
         // The run loop's own continuation gate: unprefixed + continuable + page-local. A slot that
         // fails it is a terminator; the block ends before it (linear).
         if insn.prefixes != Prefixes::default() || !insn.continuable {
@@ -246,6 +247,7 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
         slots.push(Slot {
             insn,
             lin: this_lin,
+            physical,
             kind: classify_slot(&insn),
         });
         if ends_block {
@@ -943,7 +945,8 @@ pub(crate) fn try_admit_gated(
             // into the now-empty table (the clear() contract). The caller treats None as "not
             // admitted" and interprets instead.
             cpu.jit_regions.clear();
-            cpu.decode_cache.invalidate();
+            cpu.jit_direct.clear();
+            cpu.decode_cache.invalidate_and_clear_code_marks();
             cpu.perf.code_invalidations += 1;
             return None;
         }
@@ -954,7 +957,8 @@ pub(crate) fn try_admit_gated(
     // re-admits on the next warm hit. Coarse but O(1) and correct (JIT_REGION_TABLE_CAP).
     if cpu.jit_regions.len() >= JIT_REGION_TABLE_CAP {
         cpu.jit_regions.clear();
-        cpu.decode_cache.invalidate();
+        cpu.jit_direct.clear();
+        cpu.decode_cache.invalidate_and_clear_code_marks();
         cpu.perf.code_invalidations += 1;
         cpu.perf.jit_table_clears += 1;
         return None;

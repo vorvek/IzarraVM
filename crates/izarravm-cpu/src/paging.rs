@@ -135,6 +135,8 @@ impl std::fmt::Debug for Tlb {
 #[derive(Clone, Copy)]
 pub(crate) struct DirectPageCacheEntry {
     pub(crate) physical_page: u32,
+    /// Last linear page whose FastMap slot was verified from this physical cache entry.
+    pub(crate) fast_map_linear_page: u32,
     pub(crate) ptr: *mut u8,
 }
 
@@ -142,6 +144,7 @@ impl Default for DirectPageCacheEntry {
     fn default() -> Self {
         Self {
             physical_page: u32::MAX,
+            fast_map_linear_page: u32::MAX,
             ptr: std::ptr::null_mut(),
         }
     }
@@ -176,13 +179,37 @@ impl DirectPageCache {
     pub(crate) fn insert(&mut self, page: DirectPage) {
         self.entries[Self::slot(page.physical_page)] = DirectPageCacheEntry {
             physical_page: page.physical_page,
+            fast_map_linear_page: u32::MAX,
             ptr: page.ptr,
         };
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    pub(crate) fn note_fast_map_linear(&mut self, physical: u32, linear: u32) {
+        let page = physical & !0x0fff;
+        let entry = &mut self.entries[Self::slot(page)];
+        if entry.physical_page == page {
+            entry.fast_map_linear_page = linear & !0x0fff;
+        }
     }
 
     #[inline]
     pub(crate) fn invalidate(&mut self) {
         self.entries.fill(DirectPageCacheEntry::default());
+    }
+
+    #[inline]
+    pub(crate) fn invalidate_physical_range(&mut self, start: u32, end: u32) {
+        for entry in &mut self.entries {
+            if (start..end).contains(&entry.physical_page) {
+                *entry = DirectPageCacheEntry::default();
+            }
+        }
     }
 }
 
@@ -241,6 +268,30 @@ mod page_map_tests {
 
         tlb.flush();
         assert!(tlb.lookup(collision).is_none());
+    }
+
+    #[test]
+    fn direct_page_cache_range_invalidation_preserves_other_pages() {
+        let mut low = [0u8; 0x1000];
+        let mut vga = [0u8; 0x1000];
+        let mut cache = DirectPageCache::default();
+        cache.insert(DirectPage {
+            physical_page: 0x2000,
+            ptr: low.as_mut_ptr(),
+            len: 0x1000,
+            writable: true,
+        });
+        cache.insert(DirectPage {
+            physical_page: 0xA_0000,
+            ptr: vga.as_mut_ptr(),
+            len: 0x1000,
+            writable: true,
+        });
+
+        cache.invalidate_physical_range(0xA_0000, 0xC_0000);
+
+        assert!(cache.get(0x2000).is_some());
+        assert!(cache.get(0xA_0000).is_none());
     }
 
     #[test]
@@ -346,6 +397,19 @@ impl PrefetchWindow {
 
     pub(crate) fn physical_page(&self) -> Option<u32> {
         (self.len != 0).then_some(self.physical_base >> 12)
+    }
+
+    /// Whether a wrapping physical write range touches bytes held in this snapshot. Device writes
+    /// use this to preserve an unrelated prefetch window while still observing DMA over code.
+    pub(crate) fn overlaps_physical_range(&self, physical: u32, width: u32) -> bool {
+        self.len != 0
+            && width != 0
+            && (0..u32::from(self.len)).any(|offset| {
+                self.physical_base
+                    .wrapping_add(offset)
+                    .wrapping_sub(physical)
+                    < width
+            })
     }
 }
 

@@ -130,13 +130,14 @@ impl DmaChannel {
     /// channel. Returns None when masked, not programmed for a write transfer, or
     /// already at terminal count. The floppy controller's READ DATA path lands
     /// sector bytes through here on channel 2.
-    pub(crate) fn write_byte(&mut self, memory: &mut Memory, byte: u8) -> Option<()> {
+    pub(crate) fn write_byte(&mut self, memory: &mut Memory, byte: u8) -> Option<u32> {
         if self.mask || self.transfer_kind != 1 {
             return None;
         }
-        memory.write_u8(self.byte_address() as usize, byte).ok()?;
+        let address = self.byte_address();
+        memory.write_u8(address as usize, byte).ok()?;
         self.step_transfer();
-        Some(())
+        Some(address)
     }
 
     /// Write one little-endian word to memory on the slave's word-addressed path
@@ -496,7 +497,7 @@ impl DmaChip {
     /// Write one byte from the device (device->memory) on local channel `ci`,
     /// latching terminal-count into the status register. The FDC READ DATA
     /// datapath reaches memory through here.
-    fn write_byte(&mut self, ci: usize, memory: &mut Memory, byte: u8) -> Option<()> {
+    fn write_byte(&mut self, ci: usize, memory: &mut Memory, byte: u8) -> Option<u32> {
         if !self.begin_cycle(ci) {
             return None;
         }
@@ -679,13 +680,14 @@ impl DmaController {
     /// to land read sector bytes in the guest's buffer; the channel's programmed
     /// address, page, count and terminal count all apply. Returns None when the
     /// channel is masked, not programmed for a write transfer, the controller is
-    /// disabled, or the channel has already reached terminal count.
+    /// disabled, or the channel has already reached terminal count. A successful transfer returns
+    /// the physical byte address written so CPU code-cache invalidation can stay range-aware.
     pub(crate) fn write_byte(
         &mut self,
         channel: usize,
         memory: &mut Memory,
         byte: u8,
-    ) -> Option<()> {
+    ) -> Option<u32> {
         if channel < 4 {
             self.master.set_hardware_request(channel, true);
             let wrote = self.master.write_byte(channel, memory, byte);
