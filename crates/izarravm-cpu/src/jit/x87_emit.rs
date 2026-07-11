@@ -66,6 +66,31 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Nat
             emit_store_st(e, context.cpu, 0, Xmm::XMM1);
             emit_store_st(e, context.cpu, index, Xmm::XMM0);
         }
+        NativeX87Insn::StoreRegister { index, pop } => {
+            if index == 0 {
+                if pop {
+                    emit_pop(e, context.cpu);
+                } else {
+                    emit_load_st(e, context.cpu, 0, Xmm::XMM0, context.side_exit);
+                    emit_store_st(e, context.cpu, 0, Xmm::XMM0);
+                }
+            } else {
+                emit_load_st(e, context.cpu, 0, Xmm::XMM0, context.side_exit);
+                emit_store_st(e, context.cpu, index, Xmm::XMM0);
+                if pop {
+                    emit_pop(e, context.cpu);
+                }
+            }
+        }
+        NativeX87Insn::LoadOne => {
+            e.mov_r64_imm64(Reg::RDX, 1.0f64.to_bits());
+            e.movq_xmm_r64(Xmm::XMM0, Reg::RDX);
+            emit_push(e, context.cpu, Xmm::XMM0);
+        }
+        NativeX87Insn::LoadZero => {
+            e.xorpd(Xmm::XMM0, Xmm::XMM0);
+            emit_push(e, context.cpu, Xmm::XMM0);
+        }
         NativeX87Insn::LoadI32 { .. } => {
             let memory = context.memory.expect("FILD needs a host pointer");
             e.load_r32_disp32(Reg::RDX, memory, 0);
@@ -86,9 +111,26 @@ pub(crate) fn emit_native_x87(e: &mut Encoder, insn: NativeX87Insn, context: Nat
             match op {
                 NativeX87PopOp::Add => e.addsd(Xmm::XMM0, Xmm::XMM1),
                 NativeX87PopOp::Multiply => e.mulsd(Xmm::XMM0, Xmm::XMM1),
+                NativeX87PopOp::Subtract => e.subsd(Xmm::XMM0, Xmm::XMM1),
+                NativeX87PopOp::Divide => e.divsd(Xmm::XMM0, Xmm::XMM1),
+                NativeX87PopOp::SubtractReverse => {
+                    e.subsd(Xmm::XMM1, Xmm::XMM0);
+                    e.movsd_xmm_xmm(Xmm::XMM0, Xmm::XMM1);
+                }
+                NativeX87PopOp::DivideReverse => {
+                    e.divsd(Xmm::XMM1, Xmm::XMM0);
+                    e.movsd_xmm_xmm(Xmm::XMM0, Xmm::XMM1);
+                }
             }
             emit_finite_guard(e, Xmm::XMM0, context.side_exit);
             emit_store_st(e, context.cpu, index, Xmm::XMM0);
+            emit_pop(e, context.cpu);
+        }
+        NativeX87Insn::ComparePopPop => {
+            emit_load_st(e, context.cpu, 0, Xmm::XMM0, context.side_exit);
+            emit_load_st(e, context.cpu, 1, Xmm::XMM1, context.side_exit);
+            emit_compare(e, context.cpu, Xmm::XMM0, Xmm::XMM1);
+            emit_pop(e, context.cpu);
             emit_pop(e, context.cpu);
         }
         NativeX87Insn::StoreStatusAx => {
@@ -314,7 +356,12 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     const MEMORY_ARG: Reg = Reg::RSI;
 
-    fn execute(cpu: &mut CpuGsw, memory: &mut u32, insn: NativeX87Insn) -> bool {
+    fn execute_with_gate(
+        cpu: &mut CpuGsw,
+        memory: &mut u32,
+        insn: NativeX87Insn,
+        check_gate: bool,
+    ) -> bool {
         let mut e = Encoder::new();
         e.push(Reg::R15);
         e.push(Reg::RDI);
@@ -329,7 +376,7 @@ mod tests {
                 cpu: Reg::R15,
                 memory: Some(Reg::RDI),
                 side_exit,
-                check_gate: true,
+                check_gate,
             },
         );
         e.mov_r32_imm32(Reg::RAX, 0);
@@ -350,6 +397,10 @@ mod tests {
         let function: unsafe extern "C" fn(*mut CpuGsw, *mut u32) -> u32 =
             unsafe { core::mem::transmute(buffer.entry_ptr()) };
         unsafe { function(cpu, memory) != 0 }
+    }
+
+    fn execute(cpu: &mut CpuGsw, memory: &mut u32, insn: NativeX87Insn) -> bool {
+        execute_with_gate(cpu, memory, insn, true)
     }
 
     fn cpu_with_stack(values: &[f64]) -> CpuGsw {
@@ -386,6 +437,19 @@ mod tests {
         assert_eq!(cpu.fpu.top(), 7);
         assert_eq!(cpu.fpu.get(0), 3.0);
         assert_eq!(cpu.fpu.status & X87_CONDITION_MASK, 0);
+
+        let mut cpu = cpu_with_stack(&[0.0]);
+        let physical = cpu.fpu.top();
+        cpu.fpu.tag &= !(3 << (physical * 2));
+        assert!(!execute(
+            &mut cpu,
+            &mut memory,
+            NativeX87Insn::StoreRegister {
+                index: 0,
+                pop: false,
+            }
+        ));
+        assert_eq!((cpu.fpu.tag >> (physical * 2)) & 3, 1);
     }
 
     #[test]
@@ -442,6 +506,49 @@ mod tests {
             &mut cpu,
             &mut memory,
             NativeX87Insn::StoreI32 { addr: dummy_addr() }
+        ));
+        assert_eq!(cpu.fpu, before);
+        assert_eq!(memory, 0x1234_5678);
+    }
+
+    #[test]
+    fn new_register_forms_exit_before_mutation_on_exceptional_values() {
+        let mut memory = 0x1234_5678;
+
+        let mut cpu = cpu_with_stack(&[0.0, 1.0]);
+        let before = cpu.fpu.clone();
+        assert!(execute_with_gate(
+            &mut cpu,
+            &mut memory,
+            NativeX87Insn::PopBinary {
+                op: NativeX87PopOp::Divide,
+                index: 1,
+            },
+            false,
+        ));
+        assert_eq!(cpu.fpu, before);
+
+        let mut cpu = cpu_with_stack(&[f64::NAN, 1.0]);
+        let before = cpu.fpu.clone();
+        assert!(execute_with_gate(
+            &mut cpu,
+            &mut memory,
+            NativeX87Insn::ComparePopPop,
+            false,
+        ));
+        assert_eq!(cpu.fpu, before);
+
+        let mut cpu = cpu_with_stack(&[2.0, 3.0]);
+        cpu.fpu.free(0);
+        let before = cpu.fpu.clone();
+        assert!(execute_with_gate(
+            &mut cpu,
+            &mut memory,
+            NativeX87Insn::StoreRegister {
+                index: 1,
+                pop: true,
+            },
+            false,
         ));
         assert_eq!(cpu.fpu, before);
         assert_eq!(memory, 0x1234_5678);

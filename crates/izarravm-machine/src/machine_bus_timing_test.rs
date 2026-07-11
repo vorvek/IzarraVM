@@ -1585,6 +1585,7 @@ fn mode_x_direct_page_writes_one_plane_and_keeps_reads_on_the_handler() {
         bus.charge_native_vga_writes(NativeVgaWrites {
             dirty_pages: 1 << 1,
             byte_writes: 1,
+            word_writes: 0,
             dword_writes: 0,
         });
         assert_eq!(bus.direct_memory_bytes(0xA_1240, 4, BusWidth::Dword), 4);
@@ -1755,11 +1756,13 @@ fn native_mode13_page_batches_charge_video_timing_and_move_generation_once() {
         bus.charge_native_vga_writes(NativeVgaWrites {
             dirty_pages: 1,
             byte_writes: 1,
+            word_writes: 0,
             dword_writes: 0,
         });
         bus.charge_native_vga_writes(NativeVgaWrites {
             dirty_pages: 1 << 15,
             byte_writes: 0,
+            word_writes: 0,
             dword_writes: 1,
         });
         assert_eq!(
@@ -1790,6 +1793,24 @@ fn native_cached_fetch_batch_charges_the_exact_warm_ram_cost() {
             fetch_cost * FETCHES * FETCH_LENS.len() as u64
         );
     });
+}
+
+#[test]
+fn native_deadline_bound_uses_the_same_bus_scale_as_batch_accounting() {
+    const RAW_CLOCKS: u64 = 301;
+    let mut machine = test_machine();
+
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        machine.set_mode(mode);
+        let (num, den) = bus_timing(mode.persona());
+        let expected = RAW_CLOCKS
+            .saturating_mul(u64::from(num))
+            .saturating_add(u64::from(den) - 1)
+            / u64::from(den);
+        with_bus(&mut machine, |bus| {
+            assert_eq!(bus.jit_scale_bus_cost_upper(RAW_CLOCKS), expected);
+        });
+    }
 }
 
 #[test]

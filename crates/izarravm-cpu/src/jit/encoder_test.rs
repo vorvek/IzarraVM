@@ -59,6 +59,26 @@ fn direct_store_bookkeeping_forms_have_known_bytes() {
 }
 
 #[test]
+fn word_register_and_memory_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.mov_r16_r16(Reg::R8, Reg::R9);
+    e.alu_r16_r16(7, Reg::R10, Reg::RBX);
+    e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+    e.store_r16_disp8(Reg::RSP, 4, Reg::R11);
+    e.cmp_r16_disp8(Reg::R9, Reg::R12, -2);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0x45, 0x89, 0xC8, // mov r8w,r9w
+            0x66, 0x41, 0x39, 0xDA, // cmp r10w,bx
+            0x0F, 0xB7, 0x57, 0x00, // movzx edx,word [rdi]
+            0x66, 0x44, 0x89, 0x5C, 0x24, 0x04, // mov word [rsp+4],r11w
+            0x66, 0x45, 0x3B, 0x4C, 0x24, 0xFE, // cmp r9w,word [r12-2]
+        ]
+    );
+}
+
+#[test]
 fn scalar_sse_memory_forms_have_known_bytes() {
     let mut e = Encoder::new();
     e.movsd_xmm_disp32(Xmm::XMM1, Reg::R12, 0x1122_3344);

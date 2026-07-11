@@ -478,6 +478,27 @@ fn profile_opcode(snapshot: &CpuProfileSnapshot, opcode: u16) -> &CpuOpcodeProfi
 }
 
 #[test]
+fn cpu_profile_splits_x87_escape_forms_by_modrm() {
+    let (mut cpu, mut bus) = profile_test_cpu(&[0xd9, 0xc0, 0xd9, 0xc8]);
+    cpu.enable_profiling(1);
+
+    cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+    cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+
+    let snapshot = cpu.profile_snapshot();
+    let fld = cpu.decode_cache.get(0, false).unwrap();
+    let fxch = cpu.decode_cache.get(2, false).unwrap();
+    assert_eq!(
+        profile_opcode(&snapshot, cpu_profile_opcode(&fld)).instructions,
+        1
+    );
+    assert_eq!(
+        profile_opcode(&snapshot, cpu_profile_opcode(&fxch)).instructions,
+        1
+    );
+}
+
+#[test]
 fn cpu_profile_disabled_records_no_groups() {
     let (mut cpu, mut bus) = profile_test_cpu(&[0x40]); // inc ax
 
@@ -517,11 +538,16 @@ fn cpu_profile_records_decode_groups() {
         assert_eq!(bucket.instructions, 1, "{name} instruction count");
         assert_eq!(bucket.samples, 1, "{name} sampled every instruction");
     }
-    for opcode in [0x05, 0x8b, 0xd9] {
+    for opcode in [0x05, 0x8b] {
         let bucket = profile_opcode(&snapshot, opcode);
         assert_eq!(bucket.instructions, 1, "opcode {opcode:#x} count");
         assert_eq!(bucket.samples, 1, "opcode {opcode:#x} samples");
     }
+    let fld1 = cpu.decode_cache.get(5, false).unwrap();
+    let opcode = cpu_profile_opcode(&fld1);
+    let bucket = profile_opcode(&snapshot, opcode);
+    assert_eq!(bucket.instructions, 1, "opcode {opcode:#x} count");
+    assert_eq!(bucket.samples, 1, "opcode {opcode:#x} samples");
 }
 
 #[test]

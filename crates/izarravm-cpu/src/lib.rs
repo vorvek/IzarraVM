@@ -695,6 +695,23 @@ impl CpuProfileOperandForm {
     }
 }
 
+/// Keep ordinary opcode buckets unchanged, but split x87 escapes by ModRM byte. The eight escape
+/// opcodes reuse that byte as their operation selector, so aggregating only D8 through DF hides the
+/// exact forms a direct backend still needs.
+fn cpu_profile_opcode(insn: &DecodedInsn) -> u16 {
+    if insn.group == DecodeGroup::Fpu
+        && matches!(insn.opcode, 0xd8..=0xdf)
+        && let Some(modrm) = insn.modrm
+    {
+        return 0x8000
+            | ((insn.opcode - 0xd8) << 8)
+            | (u16::from(modrm.mode) << 6)
+            | (u16::from(modrm.reg) << 3)
+            | u16::from(modrm.rm);
+    }
+    insn.opcode
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CpuOpcodeProfileBucketState {
     group: DecodeGroup,

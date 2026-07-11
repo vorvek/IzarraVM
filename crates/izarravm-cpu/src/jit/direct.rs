@@ -268,12 +268,14 @@ pub(crate) struct CompiledBlock {
     raw_clocks: u16,
     weighted_fp_clocks: u32,
     byte_reads: u8,
+    word_reads: u8,
     dword_reads: u8,
     byte_stores: u8,
+    word_stores: u8,
     dword_stores: u8,
     segment_layout: SegmentLayout,
     memory_cpl3: bool,
-    has_dword_accesses: bool,
+    has_wide_accesses: bool,
     self_loop: bool,
     has_x87: bool,
     successors: [Option<LinkTarget>; 2],
@@ -316,12 +318,20 @@ impl CompiledBlock {
         self.byte_reads
     }
 
+    pub(crate) fn word_reads(&self) -> u8 {
+        self.word_reads
+    }
+
     pub(crate) fn dword_reads(&self) -> u8 {
         self.dword_reads
     }
 
     pub(crate) fn byte_stores(&self) -> u8 {
         self.byte_stores
+    }
+
+    pub(crate) fn word_stores(&self) -> u8 {
+        self.word_stores
     }
 
     pub(crate) fn dword_stores(&self) -> u8 {
@@ -344,8 +354,8 @@ impl CompiledBlock {
         self.memory_cpl3
     }
 
-    pub(crate) fn has_dword_accesses(&self) -> bool {
-        self.has_dword_accesses
+    pub(crate) fn has_wide_accesses(&self) -> bool {
+        self.has_wide_accesses
     }
 
     pub(crate) fn is_self_loop(&self) -> bool {
@@ -582,12 +592,14 @@ impl BlockCache {
             raw_clocks,
             weighted_fp_clocks: compilation.weighted_fp_clocks,
             byte_reads: compilation.byte_reads,
+            word_reads: compilation.word_reads,
             dword_reads: compilation.dword_reads,
             byte_stores: compilation.byte_stores,
+            word_stores: compilation.word_stores,
             dword_stores: compilation.dword_stores,
             segment_layout: compilation.segment_layout,
             memory_cpl3: compilation.memory_cpl3,
-            has_dword_accesses: compilation.has_dword_accesses,
+            has_wide_accesses: compilation.has_wide_accesses,
             self_loop: compilation.self_loop,
             has_x87: compilation.has_x87,
             successors: compilation.successors,
@@ -1218,6 +1230,8 @@ pub(crate) struct NativeBlockTrace {
 pub(crate) struct NativeExit {
     pub(crate) instructions: u64,
     pub(crate) raw_clocks: u64,
+    // Byte counters use the low lane and word counters use the high lane. Native chain bounds
+    // keep both 32-bit lanes well below overflow while preserving the original exit layout.
     pub(crate) byte_reads: u64,
     pub(crate) dword_reads: u64,
     pub(crate) weighted_fp_clocks: u64,
@@ -1243,12 +1257,14 @@ pub(crate) struct Compilation {
     pub raw_clocks: u32,
     pub weighted_fp_clocks: u32,
     pub byte_reads: u8,
+    pub word_reads: u8,
     pub dword_reads: u8,
     pub byte_stores: u8,
+    pub word_stores: u8,
     pub dword_stores: u8,
     segment_layout: SegmentLayout,
     pub memory_cpl3: bool,
-    pub has_dword_accesses: bool,
+    pub has_wide_accesses: bool,
     pub self_loop: bool,
     pub has_x87: bool,
     successors: [Option<LinkTarget>; 2],
@@ -1270,6 +1286,7 @@ enum DirectKind {
     MovReg {
         dst: u8,
         src: u8,
+        width: MemoryWidth,
     },
     MovRegByte {
         dst: u8,
@@ -1290,11 +1307,13 @@ enum DirectKind {
     IncDecReg {
         dst: u8,
         is_dec: bool,
+        width: MemoryWidth,
     },
     AluReg {
         op: u8,
         dst: u8,
         src: u8,
+        width: MemoryWidth,
     },
     AluImm {
         op: u8,
@@ -1309,6 +1328,7 @@ enum DirectKind {
     AluMemSource {
         op: u8,
         dst: u8,
+        width: MemoryWidth,
         addr: DirectAddr,
     },
     AluMemDest {
@@ -1362,6 +1382,7 @@ enum DirectKind {
     },
     RmwIncDec {
         is_dec: bool,
+        width: MemoryWidth,
         addr: DirectAddr,
     },
     Push {
@@ -1393,6 +1414,7 @@ enum DirectKind {
 #[derive(Clone, Copy)]
 enum MemoryWidth {
     Byte,
+    Word,
     Dword,
 }
 
@@ -1400,8 +1422,13 @@ impl MemoryWidth {
     const fn bytes(self) -> u32 {
         match self {
             Self::Byte => 1,
+            Self::Word => 2,
             Self::Dword => 4,
         }
+    }
+
+    const fn needs_alignment_guard(self) -> bool {
+        !matches!(self, Self::Byte)
     }
 }
 
@@ -1465,6 +1492,28 @@ impl DirectKind {
         ))
     }
 
+    fn word_reads(self) -> u8 {
+        u8::from(matches!(
+            self,
+            Self::Load {
+                width: MemoryWidth::Word,
+                ..
+            } | Self::AluMemSource {
+                width: MemoryWidth::Word,
+                ..
+            } | Self::AluMemDest {
+                width: MemoryWidth::Word,
+                ..
+            } | Self::RmwIncDec {
+                width: MemoryWidth::Word,
+                ..
+            } | Self::TestImmMem {
+                width: MemoryWidth::Word,
+                ..
+            }
+        ))
+    }
+
     fn dword_reads(self) -> u8 {
         u8::from(
             matches!(
@@ -1472,13 +1521,16 @@ impl DirectKind {
                 Self::Load {
                     width: MemoryWidth::Dword,
                     ..
-                } | Self::AluMemSource { .. }
-                    | Self::AluMemDest {
-                        width: MemoryWidth::Dword,
-                        ..
-                    }
-                    | Self::RmwIncDec { .. }
-                    | Self::DoubleShiftMem { .. }
+                } | Self::AluMemSource {
+                    width: MemoryWidth::Dword,
+                    ..
+                } | Self::AluMemDest {
+                    width: MemoryWidth::Dword,
+                    ..
+                } | Self::RmwIncDec {
+                    width: MemoryWidth::Dword,
+                    ..
+                } | Self::DoubleShiftMem { .. }
                     | Self::TestImmMem {
                         width: MemoryWidth::Dword,
                         ..
@@ -1515,6 +1567,28 @@ impl DirectKind {
         )
     }
 
+    fn word_stores(self) -> u8 {
+        u8::from(
+            matches!(
+                self,
+                Self::Store {
+                    width: MemoryWidth::Word,
+                    ..
+                } | Self::RmwIncDec {
+                    width: MemoryWidth::Word,
+                    ..
+                }
+            ) || matches!(
+                self,
+                Self::AluMemDest {
+                    op: 0..=6,
+                    width: MemoryWidth::Word,
+                    ..
+                }
+            ),
+        )
+    }
+
     fn dword_stores(self) -> u8 {
         u8::from(
             matches!(
@@ -1522,8 +1596,10 @@ impl DirectKind {
                 Self::Store {
                     width: MemoryWidth::Dword,
                     ..
-                } | Self::RmwIncDec { .. }
-                    | Self::DoubleShiftMem { .. }
+                } | Self::RmwIncDec {
+                    width: MemoryWidth::Dword,
+                    ..
+                } | Self::DoubleShiftMem { .. }
                     | Self::Push { .. }
                     | Self::Call { .. }
             ) || matches!(
@@ -1552,6 +1628,10 @@ impl DirectKind {
                 ..
             } => COUNTER_MODE13_BYTE_READ,
             Self::Load {
+                width: MemoryWidth::Word,
+                ..
+            } => COUNTER_MODE13_BYTE_READ,
+            Self::Load {
                 width: MemoryWidth::Dword,
                 ..
             } => COUNTER_MODE13_DWORD_READ,
@@ -1560,13 +1640,22 @@ impl DirectKind {
                 ..
             } => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY,
             Self::Store {
+                width: MemoryWidth::Word,
+                ..
+            } => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE | COUNTER_MODE13_DIRTY,
+            Self::Store {
                 width: MemoryWidth::Dword,
                 ..
             } => COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY,
-            Self::AluMemSource { .. } => COUNTER_MODE13_DWORD_READ,
+            Self::AluMemSource { width, .. } => match width {
+                MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
+                MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
+                MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
+            },
             Self::AluMemDest { op, width, .. } => {
                 let read = match width {
                     MemoryWidth::Byte => COUNTER_MODE13_BYTE_READ,
+                    MemoryWidth::Word => COUNTER_MODE13_BYTE_READ,
                     MemoryWidth::Dword => COUNTER_MODE13_DWORD_READ,
                 };
                 if op == 7 {
@@ -1574,6 +1663,7 @@ impl DirectKind {
                 } else {
                     read | match width {
                         MemoryWidth::Byte => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
+                        MemoryWidth::Word => COUNTER_RAM_BYTE_WRITE | COUNTER_MODE13_BYTE_WRITE,
                         MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE,
                     } | COUNTER_MODE13_DIRTY
                 }
@@ -1589,6 +1679,10 @@ impl DirectKind {
                 ..
             } => COUNTER_MODE13_BYTE_READ,
             Self::TestImmMem {
+                width: MemoryWidth::Word,
+                ..
+            } => COUNTER_MODE13_BYTE_READ,
+            Self::TestImmMem {
                 width: MemoryWidth::Dword,
                 ..
             } => COUNTER_MODE13_DWORD_READ,
@@ -1599,7 +1693,16 @@ impl DirectKind {
                 }
                 None => 0,
             },
-            Self::RmwIncDec { .. } => COUNTER_RAM_DWORD_WRITE,
+            Self::RmwIncDec { width, .. } => match width {
+                MemoryWidth::Byte => COUNTER_RAM_BYTE_WRITE,
+                MemoryWidth::Word => {
+                    COUNTER_RAM_BYTE_WRITE
+                        | COUNTER_MODE13_BYTE_READ
+                        | COUNTER_MODE13_BYTE_WRITE
+                        | COUNTER_MODE13_DIRTY
+                }
+                MemoryWidth::Dword => COUNTER_RAM_DWORD_WRITE,
+            },
             Self::Pop { .. } | Self::Ret { .. } => COUNTER_MODE13_DWORD_READ,
             Self::Push { .. } | Self::Call { .. } => {
                 COUNTER_RAM_DWORD_WRITE | COUNTER_MODE13_DWORD_WRITE | COUNTER_MODE13_DIRTY
@@ -1660,13 +1763,16 @@ impl DirectKind {
             Self::Load {
                 width: MemoryWidth::Dword,
                 ..
-            } | Self::AluMemSource { .. }
-                | Self::AluMemDest {
-                    width: MemoryWidth::Dword,
-                    ..
-                }
-                | Self::RmwIncDec { .. }
-                | Self::DoubleShiftMem { .. }
+            } | Self::AluMemSource {
+                width: MemoryWidth::Dword,
+                ..
+            } | Self::AluMemDest {
+                width: MemoryWidth::Dword,
+                ..
+            } | Self::RmwIncDec {
+                width: MemoryWidth::Dword,
+                ..
+            } | Self::DoubleShiftMem { .. }
                 | Self::TestImmMem {
                     width: MemoryWidth::Dword,
                     ..
@@ -1689,8 +1795,10 @@ impl DirectKind {
             Self::Store {
                 width: MemoryWidth::Dword,
                 ..
-            } | Self::RmwIncDec { .. }
-                | Self::DoubleShiftMem { .. }
+            } | Self::RmwIncDec {
+                width: MemoryWidth::Dword,
+                ..
+            } | Self::DoubleShiftMem { .. }
                 | Self::Push { .. }
                 | Self::Call { .. }
         ) || matches!(
@@ -1708,6 +1816,10 @@ impl DirectKind {
                     Some(access) if access.direction == NativeX87MemoryDirection::Write
                 )
         )
+    }
+
+    fn has_word_access(self) -> bool {
+        self.word_reads() != 0 || self.word_stores() != 0
     }
 
     fn uses_stack(self) -> bool {
@@ -1913,16 +2025,17 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
     let mut raw_clocks = 0u32;
     let mut weighted_fp_clocks = 0u32;
     let mut byte_reads = 0u8;
+    let mut word_reads = 0u8;
     let mut dword_reads = 0u8;
     let mut byte_stores = 0u8;
+    let mut word_stores = 0u8;
     let mut dword_stores = 0u8;
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
-    let mut has_dword_accesses = false;
+    let mut has_wide_accesses = false;
     let mut stack_accesses = 0u8;
     let mut x87_slots = 0u8;
     let mut memory_alu_slots = 0u8;
-    let mut finite_cs_ret_barrier = false;
 
     while slots.len() < MAX_BLOCK_INSTRUCTIONS {
         if x87_slots != 0 && slots.len() == MAX_X87_BLOCK_INSTRUCTIONS {
@@ -1934,7 +2047,15 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         let Some(insn) = cpu.decode_cache.get(lin, d) else {
             break;
         };
-        if insn.prefixes != Prefixes::default() || !insn.continuable {
+        let word_prefixes = Prefixes {
+            operand_size_override: true,
+            ..Prefixes::default()
+        };
+        let prefixes_supported = match insn.operand_size {
+            OperandSize::Word => insn.prefixes == word_prefixes,
+            OperandSize::Dword => insn.prefixes == Prefixes::default(),
+        };
+        if !prefixes_supported || !insn.continuable {
             break;
         }
         let Some(next) = lin.checked_add(u32::from(insn.len)) else {
@@ -1956,13 +2077,15 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         if cpu.decode_cache.line_phys_start(lin, d) != Some(expected_phys) {
             break;
         }
+        // Quake's 586 renderer benefits from native word operations. Doom's 486 self-patching
+        // renderer recompiles the wider blocks often enough to lose throughput, so keep word
+        // instructions as precise interpreter barriers in that mode.
+        if insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586 {
+            break;
+        }
         let Some(kind) = classify(&insn, lin, entry_lin) else {
             break;
         };
-        if matches!(kind, DirectKind::Ret { .. }) && cs.limit != u32::MAX {
-            finite_cs_ret_barrier = true;
-            break;
-        }
         if !static_control_target_within_limit(kind, entry_eip, cs.limit)
             || !kind_segment_access_supported(cpu, kind)
         {
@@ -1992,8 +2115,10 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         let slot_weighted_fp_clocks = kind.weighted_fp_clocks(cpu.persona());
         weighted_fp_clocks = weighted_fp_clocks.checked_add(slot_weighted_fp_clocks)?;
         byte_reads = byte_reads.checked_add(kind.byte_reads())?;
+        word_reads = word_reads.checked_add(kind.word_reads())?;
         dword_reads = dword_reads.checked_add(kind.dword_reads())?;
         byte_stores = byte_stores.checked_add(kind.byte_stores())?;
+        word_stores = word_stores.checked_add(kind.word_stores())?;
         dword_stores = dword_stores.checked_add(kind.dword_stores())?;
         if let Some(segment) = kind.read_segment() {
             read_segments |= segment_bit(segment);
@@ -2001,7 +2126,8 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         if let Some(segment) = kind.write_segment() {
             write_segments |= segment_bit(segment);
         }
-        has_dword_accesses |= kind.has_dword_read() || kind.has_dword_store();
+        has_wide_accesses |=
+            kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
         fetch_lens[slots.len()] = insn.len;
         slots.push(DirectInsn {
             lin,
@@ -2016,9 +2142,7 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
     }
 
     if slots.is_empty()
-        || (slots.len() < 3
-            && !finite_cs_ret_barrier
-            && !slots.last().is_some_and(|slot| slot.kind.is_terminal()))
+        || (slots.len() < 3 && !slots.last().is_some_and(|slot| slot.kind.is_terminal()))
     {
         return None;
     }
@@ -2037,7 +2161,12 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    let map_bases = if byte_reads == 0 && dword_reads == 0 && byte_stores == 0 && dword_stores == 0
+    let map_bases = if byte_reads == 0
+        && word_reads == 0
+        && dword_reads == 0
+        && byte_stores == 0
+        && word_stores == 0
+        && dword_stores == 0
     {
         None
     } else {
@@ -2047,7 +2176,12 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     )))]
-    let map_bases = if byte_reads == 0 && dword_reads == 0 && byte_stores == 0 && dword_stores == 0
+    let map_bases = if byte_reads == 0
+        && word_reads == 0
+        && dword_reads == 0
+        && byte_stores == 0
+        && word_stores == 0
+        && dword_stores == 0
     {
         None
     } else {
@@ -2058,7 +2192,7 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    let code_watch_tables = if byte_stores == 0 && dword_stores == 0 {
+    let code_watch_tables = if byte_stores == 0 && word_stores == 0 && dword_stores == 0 {
         None
     } else {
         Some([
@@ -2070,7 +2204,7 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     )))]
-    let code_watch_tables = if byte_stores == 0 && dword_stores == 0 {
+    let code_watch_tables = if byte_stores == 0 && word_stores == 0 && dword_stores == 0 {
         None
     } else {
         return None;
@@ -2104,8 +2238,10 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         raw_clocks,
         weighted_fp_clocks,
         byte_reads,
+        word_reads,
         dword_reads,
         byte_stores,
+        word_stores,
         dword_stores,
         self_loop,
         memory: MemoryEmitContext {
@@ -2126,12 +2262,14 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         raw_clocks,
         weighted_fp_clocks,
         byte_reads,
+        word_reads,
         dword_reads,
         byte_stores,
+        word_stores,
         dword_stores,
         segment_layout,
         memory_cpl3,
-        has_dword_accesses,
+        has_wide_accesses,
         self_loop,
         has_x87: x87_slots != 0,
         successors,
@@ -2162,10 +2300,10 @@ fn kind_segment_access_supported(cpu: &CpuGsw, kind: DirectKind) -> bool {
 }
 
 fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> {
-    if insn.operand_size != OperandSize::Dword {
-        return None;
-    }
     if insn.group == DecodeGroup::Fpu {
+        if insn.operand_size != OperandSize::Dword {
+            return None;
+        }
         let native = NativeX87Insn::classify(insn)?;
         let addr = match native {
             NativeX87Insn::BinaryMemory { addr, .. }
@@ -2176,6 +2314,15 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             _ => None,
         };
         return Some(DirectKind::X87 { insn: native, addr });
+    }
+    let operand_width = match insn.operand_size {
+        OperandSize::Word => MemoryWidth::Word,
+        OperandSize::Dword => MemoryWidth::Dword,
+    };
+    if insn.operand_size == OperandSize::Word
+        && !matches!(insn.opcode, 0x39 | 0x3b | 0x40..=0x4f | 0x89 | 0x8b | 0xff)
+    {
+        return None;
     }
     if matches!(insn.opcode, 0x0fa4 | 0x0fa5 | 0x0fac | 0x0fad) {
         let m = insn.modrm?;
@@ -2213,11 +2360,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                             op,
                             dst,
                             src: m.reg,
+                            width: operand_width,
                         }),
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemDest {
                             op,
                             source: StoreSource::Reg(m.reg),
-                            width: MemoryWidth::Dword,
+                            width: operand_width,
                             addr: direct_addr(addr)?,
                         }),
                     };
@@ -2229,10 +2377,12 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                             op,
                             dst: m.reg,
                             src,
+                            width: operand_width,
                         }),
                         DecodedOperand::Mem(addr) => Some(DirectKind::AluMemSource {
                             op,
                             dst: m.reg,
+                            width: operand_width,
                             addr: direct_addr(addr)?,
                         }),
                     };
@@ -2252,6 +2402,7 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 return Some(DirectKind::IncDecReg {
                     dst: opcode & 7,
                     is_dec: opcode >= 0x48,
+                    width: operand_width,
                 });
             }
             0x50..=0x57 => {
@@ -2340,10 +2491,14 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             0x89 => {
                 let m = insn.modrm?;
                 return match insn.operand? {
-                    DecodedOperand::Reg(dst) => Some(DirectKind::MovReg { dst, src: m.reg }),
+                    DecodedOperand::Reg(dst) => Some(DirectKind::MovReg {
+                        dst,
+                        src: m.reg,
+                        width: operand_width,
+                    }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::Store {
                         source: StoreSource::Reg(m.reg),
-                        width: MemoryWidth::Dword,
+                        width: operand_width,
                         addr: direct_addr(addr)?,
                         raw_clocks: 2,
                     }),
@@ -2364,10 +2519,14 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
             0x8b => {
                 let m = insn.modrm?;
                 return match insn.operand? {
-                    DecodedOperand::Reg(src) => Some(DirectKind::MovReg { dst: m.reg, src }),
+                    DecodedOperand::Reg(src) => Some(DirectKind::MovReg {
+                        dst: m.reg,
+                        src,
+                        width: operand_width,
+                    }),
                     DecodedOperand::Mem(addr) => Some(DirectKind::Load {
                         dst: m.reg,
-                        width: MemoryWidth::Dword,
+                        width: operand_width,
                         addr: direct_addr(addr)?,
                         raw_clocks: 2,
                     }),
@@ -2513,6 +2672,9 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 };
             }
             0xc2 | 0xc3 => {
+                if !matches!(operand_width, MemoryWidth::Dword) {
+                    return None;
+                }
                 return Some(DirectKind::Ret {
                     release: if opcode == 0xc2 { insn.imm as u16 } else { 0 },
                 });
@@ -2522,13 +2684,18 @@ fn classify(insn: &DecodedInsn, lin: u32, entry_lin: u32) -> Option<DirectKind> 
                 if !matches!(m.reg, 0 | 1) {
                     return None;
                 }
-                let DecodedOperand::Mem(addr) = insn.operand? else {
-                    return None;
+                return match insn.operand? {
+                    DecodedOperand::Reg(dst) => Some(DirectKind::IncDecReg {
+                        dst,
+                        is_dec: m.reg == 1,
+                        width: operand_width,
+                    }),
+                    DecodedOperand::Mem(addr) => Some(DirectKind::RmwIncDec {
+                        is_dec: m.reg == 1,
+                        width: operand_width,
+                        addr: direct_addr(addr)?,
+                    }),
                 };
-                return Some(DirectKind::RmwIncDec {
-                    is_dec: m.reg == 1,
-                    addr: direct_addr(addr)?,
-                });
             }
             0x70..=0x7f if insn.group == DecodeGroup::Branch => {
                 let end_delta = lin
@@ -2600,8 +2767,10 @@ struct EmitInput<'a> {
     raw_clocks: u32,
     weighted_fp_clocks: u32,
     byte_reads: u8,
+    word_reads: u8,
     dword_reads: u8,
     byte_stores: u8,
+    word_stores: u8,
     dword_stores: u8,
     self_loop: bool,
     memory: MemoryEmitContext,
@@ -2682,8 +2851,10 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         raw_clocks,
         weighted_fp_clocks,
         byte_reads,
+        word_reads,
         dword_reads,
         byte_stores,
+        word_stores,
         dword_stores,
         self_loop,
         memory,
@@ -2693,6 +2864,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         instructions: span.instructions,
         raw_clocks: raw_clocks as u16,
         byte_reads,
+        word_reads,
         dword_reads,
         weighted_fp_clocks,
     };
@@ -2732,6 +2904,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     let mut completed_raw = 0u16;
     let mut completed_weighted_fp_clocks = 0u32;
     let mut completed_byte_reads = 0u8;
+    let mut completed_word_reads = 0u8;
     let mut completed_dword_reads = 0u8;
     let mut side_exits = Vec::new();
     let mut side_exit_reason_stubs = Vec::new();
@@ -2741,9 +2914,11 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     let mut x87_gate_emitted = false;
     for slot in slots {
         match slot.kind {
-            DirectKind::MovReg { dst, src } => {
-                e.mov_r32_r32(home(dst), home(src));
-            }
+            DirectKind::MovReg { dst, src, width } => match width {
+                MemoryWidth::Word => e.mov_r16_r16(home(dst), home(src)),
+                MemoryWidth::Dword => e.mov_r32_r32(home(dst), home(src)),
+                MemoryWidth::Byte => unreachable!("byte register moves use MovRegByte"),
+            },
             DirectKind::MovRegByte { dst, src } => {
                 emit_read_store_value(&mut e, StoreSource::Reg(src), MemoryWidth::Byte, Reg::RDX);
                 emit_write_gpr8(&mut e, dst, Reg::RDX);
@@ -2757,23 +2932,39 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 emit_effective_address(&mut e, addr);
                 e.mov_r32_r32(home(dst), Reg::RAX);
             }
-            DirectKind::IncDecReg { dst, is_dec } => {
-                emit_inc_dec_reg(&mut e, dst, is_dec);
+            DirectKind::IncDecReg { dst, is_dec, width } => {
+                emit_inc_dec_reg(&mut e, dst, is_dec, width);
             }
-            DirectKind::AluReg { op, dst, src } => {
-                emit_alu(&mut e, op, dst, Some(src), None);
+            DirectKind::AluReg {
+                op,
+                dst,
+                src,
+                width,
+            } => {
+                emit_alu(&mut e, op, dst, Some(src), None, width);
             }
             DirectKind::AluImm { op, dst, imm } => {
-                emit_alu(&mut e, op, dst, None, Some(imm));
+                emit_alu(&mut e, op, dst, None, Some(imm), MemoryWidth::Dword);
             }
             DirectKind::AluByteImm { op, dst, imm } => {
                 emit_alu_byte_imm(&mut e, op, dst, imm);
             }
-            DirectKind::AluMemSource { op, dst, addr } => {
+            DirectKind::AluMemSource {
+                op,
+                dst,
+                width,
+                addr,
+            } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
-                emit_alu_mem_source(&mut e, op, dst, addr, memory, reasons);
-                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
+                emit_alu_mem_source(&mut e, op, dst, width, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    width.needs_alignment_guard(),
+                    memory.cpl3,
+                    false,
+                );
                 side_exits.push((
                     side,
                     slot.lin.wrapping_sub(span.key.linear),
@@ -2781,6 +2972,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2798,7 +2990,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
-                    matches!(width, MemoryWidth::Dword),
+                    width.needs_alignment_guard(),
                     memory.cpl3,
                     op != 7,
                 );
@@ -2809,6 +3001,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2825,7 +3018,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
-                    matches!(width, MemoryWidth::Dword),
+                    width.needs_alignment_guard(),
                     memory.cpl3,
                     false,
                 );
@@ -2836,6 +3029,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2865,6 +3059,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2879,7 +3074,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
-                    matches!(width, MemoryWidth::Dword),
+                    width.needs_alignment_guard(),
                     memory.cpl3,
                     false,
                 );
@@ -2890,6 +3085,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2907,7 +3103,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 reasons.append_stubs(
                     &mut side_exit_reason_stubs,
                     side,
-                    matches!(width, MemoryWidth::Dword),
+                    width.needs_alignment_guard(),
                     memory.cpl3,
                     true,
                 );
@@ -2918,16 +3114,27 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
                 ));
             }
-            DirectKind::RmwIncDec { is_dec, addr } => {
+            DirectKind::RmwIncDec {
+                is_dec,
+                width,
+                addr,
+            } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(addr));
-                emit_rmw_inc_dec(&mut e, is_dec, addr, memory, reasons);
-                reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, true);
+                emit_rmw_inc_dec(&mut e, is_dec, width, addr, memory, reasons);
+                reasons.append_stubs(
+                    &mut side_exit_reason_stubs,
+                    side,
+                    width.needs_alignment_guard(),
+                    memory.cpl3,
+                    true,
+                );
                 side_exits.push((
                     side,
                     slot.lin.wrapping_sub(span.key.linear),
@@ -2935,6 +3142,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2960,6 +3168,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -2981,6 +3190,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -3019,6 +3229,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -3047,6 +3258,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -3056,6 +3268,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 completed_raw += slot.kind.raw_clocks() as u16;
                 completed_weighted_fp_clocks += slot.weighted_fp_clocks;
                 completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
                 completed_dword_reads += slot.kind.dword_reads();
                 emit_completed_path(
                     &mut e,
@@ -3074,6 +3287,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 completed_raw += slot.kind.raw_clocks() as u16;
                 completed_weighted_fp_clocks += slot.weighted_fp_clocks;
                 completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
                 completed_dword_reads += slot.kind.dword_reads();
                 emit_completed_path(
                     &mut e,
@@ -3090,8 +3304,22 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
             DirectKind::Ret { release } => {
                 let side = e.label();
                 let reasons = MemorySideExits::new(&mut e, memory, Some(stack_addr(0)));
-                emit_ram_read_pointer(&mut e, MemoryWidth::Dword, stack_addr(0), memory, reasons);
+                let limit = memory.segments.cs.limit;
+                let limit_exit = (limit != u32::MAX).then(|| e.label());
+                emit_ram_read_pointer_inner(
+                    &mut e,
+                    MemoryWidth::Dword,
+                    stack_addr(0),
+                    memory,
+                    reasons,
+                );
                 e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
+                if let Some(limit_exit) = limit_exit {
+                    e.cmp_r32_imm32(Reg::RDX, limit);
+                    e.jcc(7, limit_exit);
+                    side_exit_reason_stubs.push((limit_exit, side, SideExitReason::Other));
+                }
+                emit_mode13_read_completion(&mut e, MemoryWidth::Dword);
                 e.add_r32_imm32(home(4), 4 + u32::from(release));
                 reasons.append_stubs(&mut side_exit_reason_stubs, side, true, memory.cpl3, false);
                 side_exits.push((
@@ -3101,6 +3329,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                         completed,
                         completed_raw,
                         completed_byte_reads,
+                        completed_word_reads,
                         completed_dword_reads,
                         completed_weighted_fp_clocks,
                     ),
@@ -3109,6 +3338,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 completed_raw += slot.kind.raw_clocks() as u16;
                 completed_weighted_fp_clocks += slot.weighted_fp_clocks;
                 completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
                 completed_dword_reads += slot.kind.dword_reads();
                 emit_completed_dynamic_path(&mut e, span, Reg::RDX, shared_return, full_accounting);
                 terminal = true;
@@ -3122,6 +3352,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 completed_raw += slot.kind.raw_clocks() as u16;
                 completed_weighted_fp_clocks += slot.weighted_fp_clocks;
                 completed_byte_reads += slot.kind.byte_reads();
+                completed_word_reads += slot.kind.word_reads();
                 completed_dword_reads += slot.kind.dword_reads();
                 emit_load_host_flags(&mut e);
                 let taken = e.label();
@@ -3170,6 +3401,7 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         completed_raw += slot.kind.raw_clocks() as u16;
         completed_weighted_fp_clocks += slot.weighted_fp_clocks;
         completed_byte_reads += slot.kind.byte_reads();
+        completed_word_reads += slot.kind.word_reads();
         completed_dword_reads += slot.kind.dword_reads();
     }
     if !terminal {
@@ -3216,12 +3448,10 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
         debug_assert_ne!(stub_count, 0);
         e.place(common);
         e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
-        e.store_r8_disp8(
-            Reg::RAX,
-            i8::try_from(core::mem::offset_of!(NativeExit, side_exit_reason))
-                .expect("native side-exit reason offset must fit a disp8"),
-            Reg::RDX,
-        );
+        let reason_offset = u32::try_from(core::mem::offset_of!(NativeExit, side_exit_reason))
+            .expect("native side-exit reason offset must fit a u32");
+        e.add_r64_imm32(Reg::RAX, reason_offset);
+        e.store_r8_disp8(Reg::RAX, 0, Reg::RDX);
         emit_add_static_accounting(&mut e, exit);
         e.mov_r64_imm64(Reg::RAX, u64::from(exit.instructions));
         e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RAX);
@@ -3255,10 +3485,15 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
     debug_assert_eq!(u32::from(completed_raw), raw_clocks);
     debug_assert_eq!(completed_weighted_fp_clocks, weighted_fp_clocks);
     debug_assert_eq!(completed_byte_reads, byte_reads);
+    debug_assert_eq!(completed_word_reads, word_reads);
     debug_assert_eq!(completed_dword_reads, dword_reads);
     debug_assert_eq!(
         slots.iter().map(|slot| slot.kind.byte_stores()).sum::<u8>(),
         byte_stores
+    );
+    debug_assert_eq!(
+        slots.iter().map(|slot| slot.kind.word_stores()).sum::<u8>(),
+        word_stores
     );
     debug_assert_eq!(
         slots
@@ -3313,6 +3548,10 @@ fn emit_add_static_accounting(e: &mut Encoder, accounting: StaticAccounting) {
             e.add_r64_to_mem_disp8(Reg::RSP, stack_offset, Reg::RDX);
         }
     }
+    if accounting.word_reads != 0 {
+        e.mov_r64_imm64(Reg::RDX, u64::from(accounting.word_reads) << 32);
+        e.add_r64_to_mem_disp8(Reg::RSP, STACK_BYTE_READS, Reg::RDX);
+    }
 }
 
 fn emit_add_repeated_accounting(e: &mut Encoder, accounting: StaticAccounting) {
@@ -3325,6 +3564,14 @@ fn emit_add_repeated_accounting(e: &mut Encoder, accounting: StaticAccounting) {
             e.imul_r64_imm32(Reg::RDX, value);
         }
         e.add_r64_to_mem_disp8(Reg::RSP, stack_offset, Reg::RDX);
+    }
+    if accounting.word_reads != 0 {
+        e.load_r64_disp8(Reg::RDX, Reg::RSP, STACK_ITERATIONS);
+        if accounting.word_reads != 1 {
+            e.imul_r64_imm32(Reg::RDX, u32::from(accounting.word_reads));
+        }
+        e.shift_r64_imm8(4, Reg::RDX, 32);
+        e.add_r64_to_mem_disp8(Reg::RSP, STACK_BYTE_READS, Reg::RDX);
     }
 }
 
@@ -3478,6 +3725,7 @@ struct StaticAccounting {
     instructions: u8,
     raw_clocks: u16,
     byte_reads: u8,
+    word_reads: u8,
     dword_reads: u8,
     weighted_fp_clocks: u32,
 }
@@ -3486,6 +3734,7 @@ fn side_exit(
     instructions: u8,
     raw_clocks: u16,
     byte_reads: u8,
+    word_reads: u8,
     dword_reads: u8,
     weighted_fp_clocks: u32,
 ) -> StaticAccounting {
@@ -3493,6 +3742,7 @@ fn side_exit(
         instructions,
         raw_clocks,
         byte_reads,
+        word_reads,
         dword_reads,
         weighted_fp_clocks,
     }
@@ -3515,6 +3765,10 @@ fn emit_load(
         MemoryWidth::Byte => {
             e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
             emit_write_gpr8(e, dst, Reg::RDX);
+        }
+        MemoryWidth::Word => {
+            e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+            emit_write_gpr16(e, dst, Reg::RDX);
         }
         MemoryWidth::Dword => {
             e.load_r32_disp8(Reg::RDX, Reg::RDI, 0);
@@ -3594,7 +3848,7 @@ fn emit_x87_memory_pointer(
 ) {
     let map = memory.map.expect("x87 memory block has fast-map bases");
     emit_segmented_linear_address(e, addr, MemoryWidth::Dword, memory, sides);
-    emit_dword_page_guard(e, sides.cross_page_or_alignment);
+    emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -3686,10 +3940,25 @@ fn emit_ram_read_pointer(
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
+    emit_ram_read_pointer_inner(e, width, addr, memory, sides);
+    emit_mode13_read_completion(e, width);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_ram_read_pointer_inner(
+    e: &mut Encoder,
+    width: MemoryWidth,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
     let map = memory.map.expect("native read has fast-map bases");
     emit_segmented_linear_address(e, addr, width, memory, sides);
-    if matches!(width, MemoryWidth::Dword) {
-        emit_dword_page_guard(e, sides.cross_page_or_alignment);
+    if width.needs_alignment_guard() {
+        emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -3701,7 +3970,6 @@ fn emit_ram_read_pointer(
     e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
 
     let valid = e.label();
-    let done = e.label();
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
     e.jz(valid);
     e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
@@ -3710,16 +3978,22 @@ fn emit_ram_read_pointer(
     e.store_r64_disp8(Reg::RSP, STACK_READ_KIND, Reg::RDI);
     emit_read_permission_check(e, memory.cpl3, sides.permission);
     emit_read_pointer(e, map, sides.unavailable_or_kind);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_mode13_read_completion(e: &mut Encoder, width: MemoryWidth) {
+    let done = e.label();
     e.load_r64_disp8(Reg::RCX, Reg::RSP, STACK_READ_KIND);
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jnz(done);
-    emit_dynamic_increment(
-        e,
-        match width {
-            MemoryWidth::Byte => STACK_MODE13_BYTE_READS,
-            MemoryWidth::Dword => STACK_MODE13_DWORD_READS,
-        },
-    );
+    match width {
+        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_READS),
+        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS),
+        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
+    }
     e.place(done);
 }
 
@@ -3746,14 +4020,19 @@ fn emit_alu_mem_source(
     e: &mut Encoder,
     op: u8,
     dst: u8,
+    width: MemoryWidth,
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
 ) {
-    emit_ram_read_pointer(e, MemoryWidth::Dword, addr, memory, sides);
-    e.load_r32_disp8(Reg::RCX, Reg::RDI, 0);
+    emit_ram_read_pointer(e, width, addr, memory, sides);
+    match width {
+        MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RCX, Reg::RDI, 0),
+        MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
+        MemoryWidth::Dword => e.load_r32_disp8(Reg::RCX, Reg::RDI, 0),
+    }
     e.mov_r32_r32(Reg::RAX, home(dst));
-    emit_alu_preloaded(e, op, dst);
+    emit_alu_preloaded(e, op, dst, width);
 }
 
 #[cfg(all(
@@ -3771,6 +4050,7 @@ fn emit_test_imm_mem(
     emit_ram_read_pointer(e, width, addr, memory, sides);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
+        MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
         MemoryWidth::Dword => e.load_r32_disp8(Reg::RAX, Reg::RDI, 0),
     }
     e.mov_r32_imm32(Reg::RCX, imm);
@@ -3795,12 +4075,13 @@ fn emit_alu_mem_dest(
         emit_ram_read_pointer(e, width, addr, memory, sides);
         match width {
             MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RAX, Reg::RDI, 0),
+            MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RAX, Reg::RDI, 0),
             MemoryWidth::Dword => e.load_r32_disp8(Reg::RAX, Reg::RDI, 0),
         }
         emit_read_store_value(e, source, width, Reg::RCX);
         match width {
             MemoryWidth::Byte => emit_alu_byte_preloaded(e, op),
-            MemoryWidth::Dword => emit_alu_preloaded(e, op, 0),
+            MemoryWidth::Word | MemoryWidth::Dword => emit_alu_preloaded(e, op, 0, width),
         }
         return;
     }
@@ -3809,8 +4090,8 @@ fn emit_alu_mem_dest(
         .code_watch_tables
         .expect("writing memory ALU has code-watch tables");
     emit_segmented_linear_address(e, addr, width, memory, sides);
-    if matches!(width, MemoryWidth::Dword) {
-        emit_dword_page_guard(e, sides.cross_page_or_alignment);
+    if width.needs_alignment_guard() {
+        emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -3835,6 +4116,7 @@ fn emit_alu_mem_dest(
     emit_read_pointer(e, map, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0),
+        MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Dword => e.load_r32_disp8(Reg::RDX, Reg::RDI, 0),
     }
     emit_read_store_value(e, source, width, Reg::RCX);
@@ -3853,6 +4135,7 @@ fn emit_alu_mem_dest(
     emit_write_pointer(e, map, sides.unavailable_or_kind);
     match width {
         MemoryWidth::Byte => e.store_r8_disp8(Reg::RDI, 0, Reg::RDX),
+        MemoryWidth::Word => e.store_r16_disp8(Reg::RDI, 0, Reg::RDX),
         MemoryWidth::Dword => e.store_r32_disp8(Reg::RDI, 0, Reg::RDX),
     }
 
@@ -3862,29 +4145,27 @@ fn emit_alu_mem_dest(
     let done = e.label();
     e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
     e.jz(mode13);
-    emit_dynamic_increment(
-        e,
-        match width {
-            MemoryWidth::Byte => STACK_RAM_BYTE_WRITES,
-            MemoryWidth::Dword => STACK_RAM_DWORD_WRITES,
-        },
-    );
+    match width {
+        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
+        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
+        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+    }
     e.jmp(done);
     e.place(mode13);
-    emit_dynamic_increment(
-        e,
-        match width {
-            MemoryWidth::Byte => STACK_MODE13_BYTE_READS,
-            MemoryWidth::Dword => STACK_MODE13_DWORD_READS,
-        },
-    );
-    emit_dynamic_increment(
-        e,
-        match width {
-            MemoryWidth::Byte => STACK_MODE13_BYTE_WRITES,
-            MemoryWidth::Dword => STACK_MODE13_DWORD_WRITES,
-        },
-    );
+    match width {
+        MemoryWidth::Byte => {
+            emit_dynamic_increment(e, STACK_MODE13_BYTE_READS);
+            emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES);
+        }
+        MemoryWidth::Word => {
+            emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS);
+            emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
+        }
+        MemoryWidth::Dword => {
+            emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
+            emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
+        }
+    }
     emit_mode13_dirty_bit(e, map);
     e.place(done);
 }
@@ -3907,7 +4188,7 @@ fn emit_double_shift_mem(
         .code_watch_tables
         .expect("memory double shift has code-watch tables");
     emit_segmented_linear_address(e, addr, MemoryWidth::Dword, memory, sides);
-    emit_dword_page_guard(e, sides.cross_page_or_alignment);
+    emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -3977,6 +4258,7 @@ fn emit_alu_mem_source(
     _: &mut Encoder,
     _: u8,
     _: u8,
+    _: MemoryWidth,
     _: DirectAddr,
     _: MemoryEmitContext,
     _: MemorySideExits,
@@ -4095,8 +4377,8 @@ fn emit_store(
         .code_watch_tables
         .expect("native store has code-watch tables");
     emit_segmented_linear_address(e, addr, width, memory, sides);
-    if matches!(width, MemoryWidth::Dword) {
-        emit_dword_page_guard(e, sides.cross_page_or_alignment);
+    if width.needs_alignment_guard() {
+        emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
     }
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
@@ -4120,13 +4402,11 @@ fn emit_store(
     emit_write_pointer(e, map, sides.unavailable_or_kind);
     emit_watched_store_guard(e, source, width, map, code_watch_tables, sides.code_watch);
     emit_store_value(e, source, width);
-    emit_dynamic_increment(
-        e,
-        match width {
-            MemoryWidth::Byte => STACK_RAM_BYTE_WRITES,
-            MemoryWidth::Dword => STACK_RAM_DWORD_WRITES,
-        },
-    );
+    match width {
+        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
+        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
+        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+    }
     e.jmp(done);
 
     e.place(mode13);
@@ -4134,13 +4414,11 @@ fn emit_store(
     emit_write_pointer(e, map, sides.unavailable_or_kind);
     emit_watched_store_guard(e, source, width, map, code_watch_tables, sides.code_watch);
     emit_store_value(e, source, width);
-    emit_dynamic_increment(
-        e,
-        match width {
-            MemoryWidth::Byte => STACK_MODE13_BYTE_WRITES,
-            MemoryWidth::Dword => STACK_MODE13_DWORD_WRITES,
-        },
-    );
+    match width {
+        MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES),
+        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES),
+        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES),
+    }
     emit_mode13_dirty_bit(e, map);
     e.place(done);
 }
@@ -4152,6 +4430,125 @@ fn emit_store(
 fn emit_rmw_inc_dec(
     e: &mut Encoder,
     is_dec: bool,
+    width: MemoryWidth,
+    addr: DirectAddr,
+    memory: MemoryEmitContext,
+    sides: MemorySideExits,
+) {
+    if matches!(width, MemoryWidth::Dword) {
+        emit_rmw_inc_dec_dword(e, is_dec, addr, memory, sides);
+        return;
+    }
+    debug_assert!(matches!(width, MemoryWidth::Word));
+    let map = memory.map.expect("native RMW has fast-map bases");
+    let code_watch_tables = memory
+        .code_watch_tables
+        .expect("native RMW has code-watch tables");
+    emit_segmented_linear_address(e, addr, width, memory, sides);
+    emit_wide_page_guard(e, width, sides.cross_page_or_alignment);
+
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    e.mov_r64_imm64(Reg::RDX, map.flags() as u64);
+    e.movzx_r32_byte_sib(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.mov_r32_r32(Reg::RDI, Reg::RDX);
+    e.and_r32_imm32(Reg::RDI, u32::from(NATIVE_KIND_MASK));
+    let valid = e.label();
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_RAM_KIND));
+    e.jz(valid);
+    e.cmp_r32_imm32(Reg::RDI, u32::from(NATIVE_MODE13_KIND));
+    e.jnz(sides.unavailable_or_kind);
+    e.place(valid);
+    emit_write_permission_check(e, memory.cpl3, sides.permission);
+
+    // INC/DEC always changes its operand, so a watched chunk exits before any mutation.
+    let unwatched = e.label();
+    emit_code_watch_branch(
+        e,
+        width,
+        map,
+        code_watch_tables,
+        sides.code_watch,
+        unwatched,
+    );
+    e.place(unwatched);
+
+    e.shift_r64_imm8(4, Reg::RDI, 32);
+    e.or_r64_r64(Reg::RDI, Reg::RAX);
+    e.store_r64_disp32(Reg::RSP, STACK_ALU_ADDRESS_KIND, Reg::RDI);
+
+    e.mov_r32_r32(Reg::RCX, Reg::RAX);
+    e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
+    e.mov_r64_imm64(Reg::RDI, map.read_biases() as u64);
+    e.load_r64_sib_scale8(Reg::RDI, Reg::RDI, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDI, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(sides.unavailable_or_kind);
+    e.add_r64_r64(Reg::RDI, Reg::RAX);
+    e.mov_r64_imm64(Reg::RDX, map.write_biases() as u64);
+    e.load_r64_sib_scale8(Reg::RDX, Reg::RDX, Reg::RCX);
+    e.cmp_r64_imm32(Reg::RDX, NATIVE_UNAVAILABLE_BIAS as u32);
+    e.jz(sides.unavailable_or_kind);
+    e.add_r64_r64(Reg::RDX, Reg::RAX);
+
+    match width {
+        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Word => e.movzx_r32_word_disp8(Reg::RCX, Reg::RDI, 0),
+        MemoryWidth::Dword => e.load_r32_disp8(Reg::RCX, Reg::RDI, 0),
+    }
+    e.mov_r32_r32(Reg::RAX, Reg::RCX);
+    match width {
+        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Word => {
+            e.mov_r32_imm32(Reg::RDI, 1);
+            e.alu_r16_r16(if is_dec { 5 } else { 0 }, Reg::RAX, Reg::RDI);
+        }
+        MemoryWidth::Dword => e.alu_r32_imm32(if is_dec { 5 } else { 0 }, Reg::RAX, 1),
+    }
+    emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
+    emit_pending_inc_dec(e, is_dec, width, Reg::RCX, Reg::RAX);
+    match width {
+        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Word => e.store_r16_disp8(Reg::RDX, 0, Reg::RAX),
+        MemoryWidth::Dword => e.store_r32_disp8(Reg::RDX, 0, Reg::RAX),
+    }
+
+    e.load_r64_disp32(Reg::RAX, Reg::RSP, STACK_ALU_ADDRESS_KIND);
+    e.mov_r64_r64(Reg::RCX, Reg::RAX);
+    e.shift_r64_imm8(5, Reg::RCX, 32);
+    e.mov_r32_r32(Reg::RAX, Reg::RAX);
+    let mode13 = e.label();
+    let done = e.label();
+    e.cmp_r32_imm32(Reg::RCX, u32::from(NATIVE_MODE13_KIND));
+    e.jz(mode13);
+    match width {
+        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Word => emit_dynamic_word_increment(e, STACK_RAM_BYTE_WRITES),
+        MemoryWidth::Dword => emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES),
+    }
+    e.jmp(done);
+    e.place(mode13);
+    match width {
+        MemoryWidth::Byte => unreachable!("group 5 INC/DEC is word or dword"),
+        MemoryWidth::Word => {
+            emit_dynamic_word_increment(e, STACK_MODE13_BYTE_READS);
+            emit_dynamic_word_increment(e, STACK_MODE13_BYTE_WRITES);
+        }
+        MemoryWidth::Dword => {
+            emit_dynamic_increment(e, STACK_MODE13_DWORD_READS);
+            emit_dynamic_increment(e, STACK_MODE13_DWORD_WRITES);
+        }
+    }
+    emit_mode13_dirty_bit(e, map);
+    e.place(done);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn emit_rmw_inc_dec_dword(
+    e: &mut Encoder,
+    is_dec: bool,
     addr: DirectAddr,
     memory: MemoryEmitContext,
     sides: MemorySideExits,
@@ -4161,7 +4558,7 @@ fn emit_rmw_inc_dec(
         .code_watch_tables
         .expect("native RMW has code-watch tables");
     emit_segmented_linear_address(e, addr, MemoryWidth::Dword, memory, sides);
-    emit_dword_page_guard(e, sides.cross_page_or_alignment);
+    emit_wide_page_guard(e, MemoryWidth::Dword, sides.cross_page_or_alignment);
 
     e.mov_r32_r32(Reg::RCX, Reg::RAX);
     e.shift_r32_imm8(5, Reg::RCX, NATIVE_PAGE_SHIFT as u8);
@@ -4173,7 +4570,6 @@ fn emit_rmw_inc_dec(
     e.jnz(sides.unavailable_or_kind);
     emit_write_permission_check(e, memory.cpl3, sides.permission);
 
-    // INC/DEC always changes a dword, so a watched chunk exits before any mutation.
     let unwatched = e.label();
     emit_code_watch_branch(
         e,
@@ -4202,28 +4598,37 @@ fn emit_rmw_inc_dec(
     e.mov_r32_r32(Reg::RAX, Reg::RCX);
     e.alu_r32_imm32(if is_dec { 5 } else { 0 }, Reg::RAX, 1);
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
-    emit_pending_inc_dec(e, is_dec, Reg::RCX, Reg::RAX);
+    emit_pending_inc_dec(e, is_dec, MemoryWidth::Dword, Reg::RCX, Reg::RAX);
     e.store_r32_disp8(Reg::RDX, 0, Reg::RAX);
     emit_dynamic_increment(e, STACK_RAM_DWORD_WRITES);
 }
 
-fn emit_dword_page_guard(e: &mut Encoder, side: Label) {
+fn emit_wide_page_guard(e: &mut Encoder, width: MemoryWidth, side: Label) {
+    debug_assert!(width.needs_alignment_guard());
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
-    e.and_r32_imm32(Reg::RDX, 3);
+    e.and_r32_imm32(Reg::RDX, width.bytes() - 1);
     e.cmp_r32_imm32(Reg::RDX, 0);
     e.jnz(side);
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     e.and_r32_imm32(Reg::RDX, 0x0fff);
-    e.cmp_r32_imm32(Reg::RDX, 0x0ffc);
+    e.cmp_r32_imm32(Reg::RDX, 0x1000 - width.bytes());
     e.jcc(7, side);
 }
 
-fn emit_pending_inc_dec(e: &mut Encoder, is_dec: bool, old: Reg, result: Reg) {
+fn emit_pending_inc_dec(e: &mut Encoder, is_dec: bool, width: MemoryWidth, old: Reg, result: Reg) {
     let base = pending_offset();
     e.mov_r32_r32(Reg::RDI, Reg::RBP);
     e.and_r32_imm32(Reg::RDI, crate::FLAG_CF);
     e.shl_r32_imm8(Reg::RDI, 17);
-    e.or_r32_imm32(Reg::RDI, 0x8001_0200 | if is_dec { 1 } else { 0 });
+    let width_tag = match width {
+        MemoryWidth::Byte => 0,
+        MemoryWidth::Word => 0x100,
+        MemoryWidth::Dword => 0x200,
+    };
+    e.or_r32_imm32(
+        Reg::RDI,
+        0x8001_0000 | width_tag | if is_dec { 1 } else { 0 },
+    );
     e.store_r32_disp32(Reg::R15, base, Reg::RDI);
     e.store_r32_disp32(Reg::R15, base + 4, old);
     e.store_u32_imm_disp32(Reg::R15, base + 8, 1);
@@ -4300,6 +4705,7 @@ fn emit_watched_store_guard(
     emit_read_store_value(e, source, width, Reg::RDX);
     match width {
         MemoryWidth::Byte => e.cmp_r8_disp8(Reg::RDX, Reg::RDI, 0),
+        MemoryWidth::Word => e.cmp_r16_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Dword => e.cmp_r32_disp8(Reg::RDX, Reg::RDI, 0),
     }
     e.jnz(side);
@@ -4324,6 +4730,7 @@ fn emit_watched_alu_result_guard(
     e.load_r32_disp32(Reg::RDX, Reg::RSP, STACK_ALU_OLD_RESULT + 4);
     match width {
         MemoryWidth::Byte => e.cmp_r8_disp8(Reg::RDX, Reg::RDI, 0),
+        MemoryWidth::Word => e.cmp_r16_disp8(Reg::RDX, Reg::RDI, 0),
         MemoryWidth::Dword => e.cmp_r32_disp8(Reg::RDX, Reg::RDI, 0),
     }
     e.jnz(side);
@@ -4376,10 +4783,10 @@ fn emit_code_watch_table_branch(
     e.shift_r32_imm8(5, Reg::RCX, 4);
     e.bt_r64_mem(Reg::RDX, Reg::RCX);
     e.jcc(2, watched);
-    if matches!(width, MemoryWidth::Dword) {
+    if width.needs_alignment_guard() {
         e.mov_r32_r32(Reg::RCX, Reg::RAX);
         e.and_r32_imm32(Reg::RCX, 0x0fff);
-        e.add_r32_imm32(Reg::RCX, 3);
+        e.add_r32_imm32(Reg::RCX, width.bytes() - 1);
         e.shift_r32_imm8(5, Reg::RCX, 4);
         e.bt_r64_mem(Reg::RDX, Reg::RCX);
         e.jcc(2, watched);
@@ -4398,12 +4805,17 @@ fn emit_read_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidt
                 }
                 e.and_r32_imm32(value, 0xff);
             }
+            MemoryWidth::Word => {
+                e.mov_r32_r32(value, home(src));
+                e.and_r32_imm32(value, 0xffff);
+            }
             MemoryWidth::Dword => e.mov_r32_r32(value, home(src)),
         },
         StoreSource::Imm(imm) => e.mov_r32_imm32(
             value,
             match width {
                 MemoryWidth::Byte => imm & 0xff,
+                MemoryWidth::Word => imm & 0xffff,
                 MemoryWidth::Dword => imm,
             },
         ),
@@ -4421,6 +4833,10 @@ fn emit_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidth) {
             emit_read_store_value(e, source, width, Reg::RDX);
             e.store_r8_disp8(Reg::RDI, 0, Reg::RDX);
         }
+        MemoryWidth::Word => {
+            emit_read_store_value(e, source, width, Reg::RDX);
+            e.store_r16_disp8(Reg::RDI, 0, Reg::RDX);
+        }
         MemoryWidth::Dword => {
             emit_read_store_value(e, source, width, Reg::RDX);
             e.store_r32_disp8(Reg::RDI, 0, Reg::RDX);
@@ -4431,6 +4847,11 @@ fn emit_store_value(e: &mut Encoder, source: StoreSource, width: MemoryWidth) {
 fn emit_dynamic_increment(e: &mut Encoder, offset: i8) {
     e.mov_r64_imm64(Reg::RDX, 1);
     e.add_r64_to_mem_disp8(Reg::RSP, offset, Reg::RDX);
+}
+
+fn emit_dynamic_word_increment(e: &mut Encoder, byte_counter_offset: i8) {
+    e.mov_r64_imm64(Reg::RDX, 1u64 << 32);
+    e.add_r64_to_mem_disp8(Reg::RSP, byte_counter_offset, Reg::RDX);
 }
 
 #[cfg(all(
@@ -4471,6 +4892,7 @@ fn emit_store(
 fn emit_rmw_inc_dec(
     _: &mut Encoder,
     _: bool,
+    _: MemoryWidth,
     _: DirectAddr,
     _: MemoryEmitContext,
     _: MemorySideExits,
@@ -4489,6 +4911,10 @@ fn emit_write_gpr8(e: &mut Encoder, index: u8, value: Reg) {
     }
     e.and_r32_imm32(home, mask);
     e.or_r32_r32(home, value);
+}
+
+fn emit_write_gpr16(e: &mut Encoder, index: u8, value: Reg) {
+    e.mov_r16_r16(home(index), value);
 }
 
 fn home(index: u8) -> Reg {
@@ -4521,6 +4947,7 @@ fn emit_alu_candidate(e: &mut Encoder, op: u8, width: MemoryWidth) {
     }
     match width {
         MemoryWidth::Byte => e.alu_r8_r8(op, Reg::RDX, Reg::RCX),
+        MemoryWidth::Word => e.alu_r16_r16(op, Reg::RDX, Reg::RCX),
         MemoryWidth::Dword => e.alu_r32_r32(op, Reg::RDX, Reg::RCX),
     }
     e.pushfq();
@@ -4543,6 +4970,7 @@ fn emit_commit_alu_candidate(e: &mut Encoder, op: u8, source: StoreSource, width
     };
     let width_tag = match width {
         MemoryWidth::Byte => 0,
+        MemoryWidth::Word => 0x100,
         MemoryWidth::Dword => 0x200,
     };
 
@@ -4592,18 +5020,36 @@ fn emit_commit_alu_candidate(e: &mut Encoder, op: u8, source: StoreSource, width
     );
 }
 
-fn emit_alu(e: &mut Encoder, op: u8, dst: u8, src: Option<u8>, imm: Option<u32>) {
+fn emit_alu(
+    e: &mut Encoder,
+    op: u8,
+    dst: u8,
+    src: Option<u8>,
+    imm: Option<u32>,
+    width: MemoryWidth,
+) {
     e.mov_r32_r32(Reg::RAX, home(dst));
     if let Some(src) = src {
         e.mov_r32_r32(Reg::RCX, home(src));
     } else {
         e.mov_r32_imm32(Reg::RCX, imm.expect("register or immediate source"));
     }
-    emit_alu_preloaded(e, op, dst);
+    emit_alu_preloaded(e, op, dst, width);
 }
 
-/// Emit a dword ALU operation with the old destination in EAX and the source in ECX.
-fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8) {
+/// Emit an ALU operation with the old destination in EAX and the source in ECX.
+fn emit_alu_preloaded(e: &mut Encoder, op: u8, dst: u8, width: MemoryWidth) {
+    if matches!(width, MemoryWidth::Word) {
+        debug_assert_eq!(op, 7, "the current word ALU family only admits CMP");
+        e.and_r32_imm32(Reg::RAX, 0xffff);
+        e.and_r32_imm32(Reg::RCX, 0xffff);
+        e.mov_r32_r32(Reg::RDX, Reg::RAX);
+        e.alu_r16_r16(5, Reg::RDX, Reg::RCX);
+        emit_capture_flags(e, ARITH_FLAGS);
+        emit_pending(e, 0x8000_0101, Some(Reg::RAX), Some(Reg::RCX), Reg::RDX);
+        return;
+    }
+    debug_assert!(matches!(width, MemoryWidth::Dword));
     if matches!(op, 2 | 3) {
         emit_carry_alu_preloaded(e, op, home(dst));
         return;
@@ -4657,11 +5103,25 @@ fn emit_carry_alu_preloaded(e: &mut Encoder, op: u8, target: Reg) {
     e.place(done);
 }
 
-fn emit_inc_dec_reg(e: &mut Encoder, dst: u8, is_dec: bool) {
+fn emit_inc_dec_reg(e: &mut Encoder, dst: u8, is_dec: bool, width: MemoryWidth) {
     e.mov_r32_r32(Reg::RAX, home(dst));
-    e.alu_r32_imm32(if is_dec { 5 } else { 0 }, home(dst), 1);
+    match width {
+        MemoryWidth::Byte => unreachable!("register INC/DEC is word or dword"),
+        MemoryWidth::Word => {
+            e.mov_r32_imm32(Reg::RDX, 1);
+            e.alu_r16_r16(if is_dec { 5 } else { 0 }, home(dst), Reg::RDX);
+        }
+        MemoryWidth::Dword => e.alu_r32_imm32(if is_dec { 5 } else { 0 }, home(dst), 1),
+    }
     emit_capture_flags(e, ARITH_FLAGS & !crate::FLAG_CF);
-    emit_pending_inc_dec(e, is_dec, Reg::RAX, home(dst));
+    if matches!(width, MemoryWidth::Word) {
+        e.and_r32_imm32(Reg::RAX, 0xffff);
+        e.mov_r32_r32(Reg::RDX, home(dst));
+        e.and_r32_imm32(Reg::RDX, 0xffff);
+        emit_pending_inc_dec(e, is_dec, width, Reg::RAX, Reg::RDX);
+    } else {
+        emit_pending_inc_dec(e, is_dec, width, Reg::RAX, home(dst));
+    }
 }
 
 fn emit_alu_byte_imm(e: &mut Encoder, op: u8, dst: u8, imm: u8) {
@@ -4746,6 +5206,7 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
     match width {
         MemoryWidth::Byte => e.alu_r8_r8(4, Reg::RDX, Reg::RCX),
+        MemoryWidth::Word => e.alu_r16_r16(4, Reg::RDX, Reg::RCX),
         MemoryWidth::Dword => e.alu_r32_r32(4, Reg::RDX, Reg::RCX),
     }
     emit_capture_flags(e, LOGIC_FLAGS);
@@ -4753,6 +5214,7 @@ fn emit_test_preloaded(e: &mut Encoder, width: MemoryWidth) {
         e,
         match width {
             MemoryWidth::Byte => 0x8000_0002,
+            MemoryWidth::Word => 0x8000_0102,
             MemoryWidth::Dword => 0x8000_0202,
         },
         None,
@@ -4950,13 +5412,15 @@ mod tests {
             raw_clocks: 1,
             weighted_fp_clocks: 0,
             byte_reads: 0,
+            word_reads: 0,
             dword_reads: 0,
             byte_stores: 0,
+            word_stores: 0,
             dword_stores: 0,
             segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0)
                 .expect("default segment layout"),
             memory_cpl3: false,
-            has_dword_accesses: false,
+            has_wide_accesses: false,
             self_loop: false,
             has_x87: false,
             successors: [None, None],
@@ -5025,6 +5489,7 @@ mod tests {
         });
         let rmw = slot(DirectKind::RmwIncDec {
             is_dec: false,
+            width: MemoryWidth::Dword,
             addr,
         });
         let byte_alu = slot(DirectKind::AluMemDest {
