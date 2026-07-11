@@ -90,7 +90,7 @@ impl Machine {
 
         // DMA playback is clock-driven: accrue DSP sample phases per CPU clock
         // and, for each whole sample, advance the block and buffer the rendered
-        // stereo frame onto the DSP ring. The half/end-buffer IRQ that
+        // stereo frame onto the DSP ring. The block-completion IRQ that
         // render_frame edges is forwarded to the PIC here, so playback timing and
         // IRQ5 no longer depend on the host frontend pulling audio. The host path
         // (render_dsp_audio) only drains what the clock already produced.
@@ -1007,7 +1007,7 @@ impl Machine {
                 }
             }
         }
-        // Next audio block-IRQ edge. Both counters are expressed in output
+        // Next audio block IRQ edge. Both counters are expressed in output
         // frames, including stereo DMA-unit accounting inside the DSP.
         if let Some(frames) = self.dsp.frames_until_next_irq()
             && let Some(clocks) = self.timeline.cpu_clocks_until(

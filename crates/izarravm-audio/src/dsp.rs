@@ -186,7 +186,6 @@ pub struct SbDsp {
     auto_init: bool,
     playing: bool,
     irq_pending: bool,
-    half_reached: bool,
     // 16-bit DMA playback state (SB16 0xBx family). dma_16bit selects the word
     // fetch and sample-depth path; stereo selects one vs. two words per frame;
     // sample_signed selects signed vs. unsigned 16-bit conversion.
@@ -233,7 +232,6 @@ impl Default for SbDsp {
             auto_init: false,
             playing: false,
             irq_pending: false,
-            half_reached: false,
             dma_16bit: false,
             stereo: false,
             sample_signed: false,
@@ -414,7 +412,6 @@ impl SbDsp {
         self.auto_init = auto_init;
         self.playing = true;
         self.block_remaining = self.block_size;
-        self.half_reached = false;
         self.block_buffer = None;
         self.block_buffer_pos = 0;
     }
@@ -422,7 +419,7 @@ impl SbDsp {
     /// Arm the 8-bit DMA path as a Creative ADPCM transfer. Mono unsigned like
     /// `arm_dma`, but the fetched bytes are decoded through `AdpcmState`. The
     /// block counter still counts encoded DMA bytes (including the reference
-    /// seed byte), so the half/end IRQs land exactly as the raw 8-bit path.
+    /// seed byte), so the programmed-block IRQ lands exactly as on the raw 8-bit path.
     fn arm_adpcm(&mut self, mode: AdpcmMode, haveref: bool, auto_init: bool) {
         self.dma_16bit = false;
         self.stereo = false;
@@ -431,7 +428,6 @@ impl SbDsp {
         self.auto_init = auto_init;
         self.playing = true;
         self.block_remaining = self.block_size;
-        self.half_reached = false;
         self.block_buffer = None;
         self.block_buffer_pos = 0;
     }
@@ -461,7 +457,6 @@ impl SbDsp {
         self.auto_init = auto_init;
         self.block_size = count;
         self.block_remaining = count;
-        self.half_reached = false;
         self.playing = true;
         self.block_buffer = None;
         self.block_buffer_pos = 0;
@@ -541,7 +536,7 @@ impl SbDsp {
     /// Advance the DMA playback by exactly one stereo frame and push the result
     /// onto the rendered-frame ring. This is the per-CPU-clock producer entry
     /// point: it wraps the existing [`render_frame`] (which advances the block
-    /// counter and edges the half/end IRQs) and buffers the frame for the host
+    /// counter and edges the programmed-block IRQ) and buffers the frame for the host
     /// drainer. A `None` frame (channel idle or DMA exhausted) is not pushed.
     /// The IRQ raised inside `render_frame` is left pending for the caller to
     /// forward to the PIC via [`take_irq`]. Returns whether a frame was produced.
@@ -578,8 +573,8 @@ impl SbDsp {
         self.rendered.pop_front()
     }
 
-    /// Output frames until the next half/end-buffer IRQ edge. PCM stereo drains
-    /// two block units per frame; mono drains one. Creative ADPCM fetch cadence
+    /// Output frames until the next block-completion IRQ edge. PCM stereo drains two block units
+    /// per frame; mono drains one. Creative ADPCM fetch cadence
     /// depends on its decoded-sample FIFO, so it returns the earliest causal
     /// deadline of one frame rather than risking a late interrupt.
     pub fn frames_until_next_irq(&self) -> Option<u64> {
@@ -589,12 +584,7 @@ impl SbDsp {
         if self.adpcm.is_some() {
             return Some(1);
         }
-        let half_left = if self.half_reached {
-            u32::MAX
-        } else {
-            self.block_remaining.saturating_sub(self.block_size / 2)
-        };
-        let units = u64::from(half_left.min(self.block_remaining).max(1));
+        let units = u64::from(self.block_remaining.max(1));
         let units_per_frame = if self.stereo || (!self.dma_16bit && self.sbpro_stereo) {
             2
         } else {
@@ -608,7 +598,7 @@ impl SbDsp {
     /// the 16-bit path; only the one matching the armed mode is pulled. Mono
     /// modes duplicate their single sample to both channels. `block_remaining`
     /// is decremented by the words consumed (1 for 8-bit and 16-bit mono, 2 for
-    /// 16-bit stereo), and the half/end-buffer IRQ is edged exactly as the 8-bit
+    /// 16-bit stereo), and the programmed-block IRQ is edged exactly as on the 8-bit
     /// path does.
     pub fn render_frame<B, W>(&mut self, mut byte_fetch: B, mut word_fetch: W) -> Option<(i16, i16)>
     where
@@ -708,7 +698,7 @@ impl SbDsp {
     /// Pop the next decoded Creative ADPCM sample, fetching and decoding encoded
     /// DMA bytes as needed. Each fetched byte advances the block counter by one
     /// (bytes, not decoded samples, are what the DMA length counts) and edges the
-    /// half/end IRQ. The reference-init byte seeds the predictor and yields no
+    /// programmed-block IRQ. The reference-init byte seeds the predictor and yields no
     /// sample, so the loop fetches again. Returns None when the FIFO is empty and
     /// the channel is stopped or the DMA source is starved; buffered samples from
     /// the final byte still drain even after the block ends.
@@ -773,16 +763,15 @@ impl SbDsp {
         }
     }
 
-    /// Consume DMA units and edge half/end IRQs. A stereo frame may cross an
+    /// Consume DMA units and edge the block-completion IRQ. A stereo frame may cross an
     /// odd-sized auto-init block, so units left after the reload belong to the
-    /// next block instead of being lost at the first terminal count.
+    /// next block instead of being lost at the first programmed block boundary.
     fn advance_block(&mut self, mut consumed: u32) {
         while consumed > 0 && self.playing {
             if self.block_remaining == 0 {
                 self.irq_pending = true;
                 if self.auto_init && self.block_size > 0 {
                     self.block_remaining = self.block_size;
-                    self.half_reached = false;
                 } else {
                     self.playing = false;
                     break;
@@ -793,15 +782,10 @@ impl SbDsp {
             self.block_remaining -= step;
             consumed -= step;
 
-            if !self.half_reached && self.block_remaining <= self.block_size / 2 {
-                self.half_reached = true;
-                self.irq_pending = true;
-            }
             if self.block_remaining == 0 {
                 self.irq_pending = true;
                 if self.auto_init && self.block_size > 0 {
                     self.block_remaining = self.block_size;
-                    self.half_reached = false;
                 } else {
                     self.playing = false;
                 }
@@ -816,7 +800,7 @@ impl SbDsp {
         self.render_frame(&mut fetch, || None).map(|(l, _)| l)
     }
 
-    /// Take and clear a pending half/end IRQ (cleared when the host reads 0x22E).
+    /// Take and clear a pending block-completion IRQ (cleared when the host reads 0x22E).
     pub fn take_irq(&mut self) -> bool {
         let pending = self.irq_pending;
         self.irq_pending = false;
@@ -855,7 +839,7 @@ impl SbDsp {
             // 0x22E is the 8-bit read-buffer status port and the 8-bit DMA
             // interrupt-acknowledge port; 0x22F is its 16-bit counterpart. Only
             // one DMA mode runs at a time, so a read of either status port clears
-            // the single pending half/end IRQ.
+            // the pending block-completion IRQ.
             0x22E | 0x22F => {
                 self.irq_pending = false;
                 Some(if self.data_available { 0x80 } else { 0x00 })
@@ -878,14 +862,13 @@ impl SbDsp {
                     // latch on reset; clear the DMA state so a high-speed game's
                     // reset stops the channel cleanly. Clearing irq_pending here
                     // (and never re-arming it in arm_dma/arm_16bit) prevents a
-                    // half/end IRQ that went pending before the reset from firing
+                    // block IRQ that went pending before the reset from firing
                     // spuriously on the next re-armed playback. rate_hz and
                     // block_size are intentionally preserved: this is the
                     // halt-on-reset behavior, not a power-on parameter wipe.
                     self.playing = false;
                     self.auto_init = false;
                     self.block_remaining = 0;
-                    self.half_reached = false;
                     self.irq_pending = false;
                     self.pending = None;
                     // The mode latches must clear too, or the idle 16-bit

@@ -1608,7 +1608,7 @@ impl Machine {
 
     /// Render `native_samples` of DSP DMA output as stereo frames by draining
     /// the rendered-frame ring the per-CPU-clock producer (in `advance_devices`)
-    /// fills. The block counter and the half/end-buffer IRQ now advance with CPU
+    /// fills. The block counter and its completion IRQ now advance with CPU
     /// time, independent of this call; this path only reads back frames for the
     /// DAC. Each drained frame is attenuated by the CT1745 voice volume
     /// (`0x32`/`0x33`) so a mid-buffer guest volume change applies immediately. A

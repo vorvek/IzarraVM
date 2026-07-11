@@ -216,21 +216,33 @@ fn boot_suite_reports_opl2_pass() {
 
 #[test]
 fn boot_suite_reports_sb_8bit_dma_pass() {
-    let mut machine = Machine::new_boot_image(
-        MachineProfile::gsw_386(16, VideoCard::Vega),
-        izarravm_firmware::X86_BOOT_TEST_IMAGE,
-    )
-    .unwrap();
-    let reason = machine.run_until_halt_or_cycles(11_000_000).unwrap();
-    assert_eq!(reason, StopReason::Halted);
-    let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
-    assert!(
-        results.records.iter().any(|record| {
-            record.status == izarravm_firmware::SuiteRecordStatus::Pass
-                && record.name == "sound.sb_8bit_dma"
-        }),
-        "boot suite should report PASS sound.sb_8bit_dma (clock-driven single-cycle DMA + IRQ5)"
-    );
+    for mode in [
+        GswMode::Gsw386Slow,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ] {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Vega),
+            izarravm_firmware::X86_BOOT_TEST_IMAGE,
+        )
+        .unwrap();
+        machine.set_mode(mode);
+        let reason = machine
+            .run_until_halt_or_cycles(mode.clock_hz() / 2)
+            .unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        assert!(
+            results.records.iter().any(|record| {
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                    && record.name == "sound.sb_8bit_dma"
+            }),
+            "boot suite should report PASS sound.sb_8bit_dma in {mode:?}; remaining={}, playing={}",
+            machine.dsp.block_remaining(),
+            machine.dsp.is_playing()
+        );
+    }
 }
 
 #[test]
@@ -256,7 +268,7 @@ fn boot_suite_reports_sb_16bit_dma_pass() {
 fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
     // A guest arms 8-bit single-cycle DMA + IRQ5, then `sti;hlt`. The run loop
     // must fast-forward across the DSP sample window (the new IRQ5 wake) and
-    // deliver the half-buffer IRQ5, so the handler runs and real emulated time
+    // deliver the block-completion IRQ5, so the handler runs and real emulated time
     // advances -- not a genuine no-wake halt. Setup mirrors the 8-bit probe.
     let mut machine = Machine::new(
         MachineProfile::gsw_386(16, VideoCard::Vega),
@@ -307,10 +319,10 @@ fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
     let ticks = u16::from(machine.read_physical_u8(0x0610))
         | (u16::from(machine.read_physical_u8(0x0611)) << 8);
     assert!(ticks >= 1, "the IRQ5 handler should have run");
-    // The fast-forward crossed a real sample window (half-buffer at 8 samples
-    // ~= 16k CPU clocks at 22 MHz), not a no-op halt.
+    // The fast-forward crossed the full 16-sample block (about 32k CPU clocks
+    // at 22 MHz), not a no-op halt.
     assert!(
-        machine.elapsed_clocks() > 15_000,
+        machine.elapsed_clocks() > 30_000,
         "the fast-forward should advance emulated time across the DSP sample window"
     );
     assert!(machine.master_ticks() > master_before);
@@ -321,7 +333,7 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
     // End-to-end SB16 Creative ADPCM: a guest arms 4-bit ADPCM-with-reference
     // (DSP command 0x75) over 8-bit DMA channel 1, the clock-driven producer
     // pulls the encoded bytes, decodes them through the DSP, and raises the
-    // 8-bit IRQ (IRQ5, the mixer default) at terminal count. Exercises the
+    // 8-bit IRQ (IRQ5, the mixer default) at programmed block completion. Exercises the
     // real DMA -> DSP decode -> PIC path, not just the codec in isolation.
     let mut machine = test_machine();
     // 16 encoded DMA bytes at 0x01_0000 (page 0x01): a reference seed (0x80)
@@ -348,10 +360,10 @@ fn sb16_creative_adpcm_decodes_over_dma_and_raises_irq5() {
     });
     // Drain the whole 16-byte block at 11025 Hz (~2.9 ms); 400k clocks spans it.
     machine.advance_devices_clocks(400_000);
-    // The terminal-count IRQ latched on the SB16's default line (IRQ5).
+    // The programmed-block IRQ latched on the SB16's default line (IRQ5).
     assert!(
         machine.pic.irr_bit(5),
-        "Creative ADPCM block raised the 8-bit IRQ5 at terminal count"
+        "Creative ADPCM block raised the 8-bit IRQ5 at block completion"
     );
     // Single-cycle playback stopped at the end of the block.
     assert!(!machine.dsp.is_playing(), "single-cycle ADPCM halted at TC");
