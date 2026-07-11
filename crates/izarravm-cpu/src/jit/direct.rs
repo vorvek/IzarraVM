@@ -2128,6 +2128,40 @@ pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
 }
 
 pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compilation> {
+    let page_len = super::exec_mem::host_page_len();
+    let full = compile_with_instruction_limit(cpu, entry_lin, d, MAX_BLOCK_INSTRUCTIONS)?;
+    if full.code.len() <= page_len {
+        return Some(full);
+    }
+
+    // Shorter candidates use the same fallthrough exit, so emitted size increases with the
+    // instruction count. Find the longest prefix that fits one arena page. Two-instruction
+    // nonterminal prefixes remain interpreter-only.
+    let mut lower = 3usize;
+    let mut upper = usize::from(full.span.instructions).saturating_sub(1);
+    let mut best = None;
+    while lower <= upper {
+        let midpoint = lower + (upper - lower) / 2;
+        let Some(candidate) = compile_with_instruction_limit(cpu, entry_lin, d, midpoint) else {
+            upper = midpoint - 1;
+            continue;
+        };
+        if candidate.code.len() <= page_len {
+            best = Some(candidate);
+            lower = midpoint + 1;
+        } else {
+            upper = midpoint - 1;
+        }
+    }
+    best
+}
+
+fn compile_with_instruction_limit(
+    cpu: &mut CpuGsw,
+    entry_lin: u32,
+    d: bool,
+    instruction_limit: usize,
+) -> Option<Compilation> {
     let key = key_for(cpu, entry_lin, d)?;
     let cs = cpu.registers.cs();
     let entry_eip = entry_lin.wrapping_sub(cs.base);
@@ -2151,7 +2185,7 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
     let mut x87_exit_top = x87_entry_top;
     let mut memory_alu_slots = 0u8;
 
-    while slots.len() < MAX_BLOCK_INSTRUCTIONS {
+    while slots.len() < instruction_limit.min(MAX_BLOCK_INSTRUCTIONS) {
         if x87_slots != 0 && slots.len() == MAX_X87_BLOCK_INSTRUCTIONS {
             break;
         }
@@ -2377,9 +2411,6 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         },
         link_cell_ptrs: link_cells.each_ref().map(|cell| cell.address()),
     });
-    if emitted.code.len() > super::exec_mem::host_page_len() {
-        return None;
-    }
     Some(Compilation {
         span,
         decode_residency_epoch: cpu.decode_cache.residency_epoch(),
@@ -2405,6 +2436,16 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         body_offset: emitted.body_offset,
         code: emitted.code,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn compile_with_instruction_limit_for_test(
+    cpu: &mut CpuGsw,
+    entry_lin: u32,
+    d: bool,
+    instruction_limit: usize,
+) -> Option<Compilation> {
+    compile_with_instruction_limit(cpu, entry_lin, d, instruction_limit)
 }
 
 fn static_control_target_within_limit(kind: DirectKind, entry_eip: u32, limit: u32) -> bool {
