@@ -3,11 +3,10 @@
 
 //! Generic forward-decode basic-block builder. Starting at any hot linear PC,
 //! `build_block` walks the decode cache forward, collecting continuable slots until the first
-//! block terminator, and `try_admit` compiles the result as a loop-region: emitted native code
-//! that chains one `region_step` call per slot, with a native back-edge for a self-loop and a
-//! return-to-interpreter for a linear block. Execution stays the proven v1/v2 trampoline (each
-//! slot runs through the interpreter's own dispatch, so per-slot SEMANTICS need no validation
-//! here). This delivers general block coverage plus the timing and terminator contracts.
+//! block terminator, and `try_admit` compiles the result into one native region. Supported
+//! register-only runs execute after an exact budget preflight. Other slots and the terminal use
+//! the precise helper path. Self-loops use a native back-edge; linear blocks return to the
+//! interpreter at their boundary.
 //!
 //! ## What the builder vouches for (the region's admission invariants)
 //!
@@ -29,9 +28,9 @@
 //!   slot (`changes_interrupt_visibility`); the deferred post-region check then fires at exactly
 //!   the interpreter's boundary. This is the spec §2.9 behavioral predicate, enumerated from the
 //!   interpreter's own IF-writer and shadow-arming sites.
-//! - Every slot's decode is live in the cache (generation-current), unprefixed, and stays inside
-//!   its 4 KB page, mirroring the run loop's own continuation gate. The physical span is captured
-//!   at admission; a narrow-SMC kill inside it stales the slot table via the epoch.
+//! - Every slot's decode is live in the cache (generation-current), unprefixed, and contained in
+//!   the entry's 4 KB page. The physical span is captured at admission; a narrow-SMC kill inside
+//!   it stales the slot table via the epoch.
 //! - The block key includes the CPU mode/size bitmask (`CpuGsw::jit_mode_key`), validated at
 //!   entry, so a block compiled for one mode is never reused in another at the same phys/d
 //!   (spec §2.2).
@@ -201,7 +200,7 @@ fn loop_back_edge_target(insn: &DecodedInsn, lin: u32) -> Option<u32> {
 /// Forward-decode a basic block starting at `entry_lin`, returning its slot table and whether it
 /// is a self-loop. `None` when the entry is cold (the interpreter warms it; admission retries) or
 /// the entry itself is a terminator (nothing to compile). Mirrors `run_straight_line`'s own
-/// continuation gate per slot: warm, unprefixed, `continuable`, page-local.
+/// continuation gate: warm, unprefixed, `continuable`, and contained in the entry's code page.
 ///
 /// The block extends until the first control transfer (which becomes the terminal slot) or until
 /// the next instruction is a terminator / page-crosses / is cold (the last sequential slot is then
@@ -211,7 +210,11 @@ fn loop_back_edge_target(insn: &DecodedInsn, lin: u32) -> Option<u32> {
 pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<Slot>, bool)> {
     let mut slots: Vec<Slot> = Vec::new();
     let mut lin = entry_lin;
+    let entry_page = entry_lin & !0xfff;
     let is_loop = loop {
+        if lin & !0xfff != entry_page {
+            break false;
+        }
         let insn = match cpu.decode_cache.get(lin, d) {
             Some(i) => i,
             None => break false, // cold ahead: the block is whatever we have so far (linear).
@@ -259,21 +262,29 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
     Some((slots, is_loop))
 }
 
+/// A hot linear block repays its entry cost only when its interior is a useful native group. The
+/// terminal remains on the precise helper path and is excluded from this count.
+fn native_linear_candidate(slots: &[Slot]) -> bool {
+    let Some((_, interior)) = slots.split_last() else {
+        return false;
+    };
+    interior.len() >= 4
+        && interior.iter().all(|slot| {
+            matches!(
+                slot.kind,
+                SlotKind::RegMov { .. } | SlotKind::RegAddImm { .. } | SlotKind::RegShrImm { .. }
+            )
+        })
+}
+
 /// Total bytes the prologue reserves below the six pushed callee-saved registers, sized so every
 /// `call` site sees RSP % 16 == 0 AND leaves room for a 5th stack-passed argument. At entry
 /// RSP % 16 == 8 (after the return-address push); 6 pushes subtract 48, leaving RSP at 8 mod 16;
 /// 56 moves it to 0 mod 16. 32 is the Win64 shadow space (a callee's
-/// [RSP+0..32]); the native-bookkeeping path calls `jit_charge_fetch` (5 args on win64), whose 5th
+/// [RSP+0..32]); the native group finish call has five Win64 arguments, whose fifth
 /// argument lands at [RSP+32], so the reserve must cover [0..40] at least. 56 gives that with
 /// alignment. Harmless on SysV64 (no shadow space, but the alignment holds).
 const STACK_RESERVE: u32 = 56;
-
-/// Experimental A/B mode for inline-slot bookkeeping. Mode 0 calls the
-/// `region_inline_slot` trampoline, mode 1 emits native arithmetic with three
-/// callouts, and mode 2 skips bookkeeping to measure its upper cost bound.
-/// Mode 2 has incorrect clocks and is never used for production admission.
-pub(crate) static NATIVE_BOOKKEEPING: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
 
 /// The cost-fold native-LOAD toggle (env `IZARRAVM_JIT_FOLD`), read at emit time. When ON AND a block
 /// is fold-eligible (Approximate class, unpaged, flat DS — checked by `try_admit_gated`), a `MemLoadU8`
@@ -335,9 +346,56 @@ fn fold_store_eligible(insn: &DecodedInsn) -> Option<(u8, Option<u8>, i32, u8)> 
     Some((base, addr.index, addr.disp, m.reg))
 }
 
+/// Emit the guest-state update for one register-only native slot. Fetch, clock, cap, and liveness
+/// accounting is emitted separately, either once for a group or through the proven slot helper.
+fn emit_native_register_slot(e: &mut Encoder, slot: &Slot) {
+    match slot.kind {
+        SlotKind::RegMov { dst, src } => {
+            emit_load_guest32(e, Reg::RAX, src);
+            if dst == 5 {
+                e.mov_r32_r32(Reg::RBX, Reg::RAX);
+            } else if dst == 7 {
+                e.mov_r32_r32(Reg::R14, Reg::RAX);
+            }
+            e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
+        }
+        SlotKind::RegAddImm { dst, imm } => {
+            emit_load_guest32(e, Reg::RAX, dst);
+            e.mov_r32_r32(Reg::RCX, Reg::RAX);
+            e.add_r32_imm32(Reg::RAX, imm);
+            if dst == 5 {
+                e.mov_r32_r32(Reg::RBX, Reg::RAX);
+            } else if dst == 7 {
+                e.mov_r32_r32(Reg::R14, Reg::RAX);
+            }
+            e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
+            let pending_off = core::mem::offset_of!(CpuGsw, pending_flags) as i32;
+            e.mov_r32_imm32(Reg::RDX, 0x8000_0200);
+            e.store_r32_disp32(Reg::R12, pending_off, Reg::RDX);
+            e.store_r32_disp32(Reg::R12, pending_off + 4, Reg::RCX);
+            e.mov_r32_imm32(Reg::RDX, imm);
+            e.store_r32_disp32(Reg::R12, pending_off + 8, Reg::RDX);
+            e.store_r32_disp32(Reg::R12, pending_off + 12, Reg::RAX);
+        }
+        SlotKind::RegShrImm { dst, count } => {
+            emit_load_guest32(e, Reg::RAX, dst);
+            e.mov_r32_r32(Reg::RCX, Reg::RAX);
+            e.shr_r32_imm8(Reg::RAX, count);
+            if dst == 5 {
+                e.mov_r32_r32(Reg::RBX, Reg::RAX);
+            } else if dst == 7 {
+                e.mov_r32_r32(Reg::R14, Reg::RAX);
+            }
+            e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
+            emit_set_shift_flags_shr_call(e, count);
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Emit the region chain for `slots`: pin cpu/bus/ctx in R12/R13/R15, pin hot guest gprs (ebp->RBX,
 /// edi->R14) and regs-base in RBP, emit native ALU for Reg* slots and native fold probes for
-/// supported Mem* , with batched bookkeeping + cross-mult cap check. Memory/BackEdge fall to full
+/// supported Mem*, with exact batched bookkeeping. Memory/BackEdge fall to full
 /// step (or native fold probe for u8 when enabled). After final slot a jmp closes the loop.
 ///
 /// `regs_offset` is `offset_of!(CpuGsw, registers)`, baked in so the inline slots address `gpr[]`
@@ -354,16 +412,14 @@ fn fold_store_eligible(insn: &DecodedInsn) -> Option<(u8, Option<u8>, i32, u8)> 
 /// - EARLY EXIT: a slot that must leave the block (fault or run boundary) jumps to the shared `exit`
 ///   label. Today only Memory/BackEdge slots exit, via the step fn's nonzero return + `jnz exit`; a
 ///   faulting NATIVE template (the Round 3 memory fast path) will jump to `exit` after spilling, per
-///   the re-plan's fault rule. A reg-only template never faults and never exits mid-body.
+///   the re-plan's fault rule. A register-only guest operation itself cannot fault.
 fn emit_region(
     slots: &[Slot],
     regs_offset: u32,
-    scale_den: u32,
     fold_native: bool,
     store_fold: bool,
     fold_paged: bool,
 ) -> Vec<u8> {
-    let mode = NATIVE_BOOKKEEPING.load(std::sync::atomic::Ordering::Relaxed);
     let mut e = Encoder::new();
     e.push(Reg::RBX);
     e.push(Reg::RBP);
@@ -400,17 +456,28 @@ fn emit_region(
     let mut i = 0usize;
     while i < slots.len() {
         let slot = &slots[i];
-        let _k32 = i as u32;
-        let _next_lin = slots.get(i + 1).map(|s| s.lin).unwrap_or(0);
         let is_inline = matches!(
             slot.kind,
             SlotKind::RegMov { .. } | SlotKind::RegAddImm { .. } | SlotKind::RegShrImm { .. }
         );
-        let do_group = is_inline && (fold_native || mode == 1);
+        let group_len = slots[i..]
+            .iter()
+            .take_while(|slot| {
+                matches!(
+                    slot.kind,
+                    SlotKind::RegMov { .. }
+                        | SlotKind::RegAddImm { .. }
+                        | SlotKind::RegShrImm { .. }
+                )
+            })
+            .count();
+        let do_group = group_len >= 2;
         if do_group {
             // Collect and emit consecutive register-only inline slots.
             let group_start = i;
-            let mut group_total_len: u8 = 0;
+            let fallback = e.label();
+            let after = e.label();
+            emit_native_group_guard(&mut e, group_start as u32, group_len as u32, fallback);
             while i < slots.len() {
                 let s = &slots[i];
                 if !matches!(
@@ -421,225 +488,21 @@ fn emit_region(
                 ) {
                     break;
                 }
-                group_total_len = group_total_len.wrapping_add(s.insn.len);
-                match s.kind {
-                    SlotKind::RegMov { dst, src } => {
-                        // RA: use pinned host reg if hot (ebp=5->RBX, edi=7->R14), else [regs_base + off]
-                        if src == 5 {
-                            e.mov_r32_r32(Reg::RAX, Reg::RBX);
-                        } else if src == 7 {
-                            e.mov_r32_r32(Reg::RAX, Reg::R14);
-                        } else {
-                            e.load_r32_disp8(Reg::RAX, Reg::RBP, gpr_disp(src));
-                        }
-                        if dst == 5 {
-                            e.mov_r32_r32(Reg::RBX, Reg::RAX);
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(5), Reg::RAX); // write-through for pin
-                        } else if dst == 7 {
-                            e.mov_r32_r32(Reg::R14, Reg::RAX);
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(7), Reg::RAX);
-                        } else {
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
-                        }
-                    }
-                    SlotKind::RegAddImm { dst, imm } => {
-                        if dst == 5 {
-                            e.mov_r32_r32(Reg::RAX, Reg::RBX);
-                        } else if dst == 7 {
-                            e.mov_r32_r32(Reg::RAX, Reg::R14);
-                        } else {
-                            e.load_r32_disp8(Reg::RAX, Reg::RBP, gpr_disp(dst));
-                        }
-                        e.mov_r32_r32(Reg::RCX, Reg::RAX);
-                        e.add_r32_imm32(Reg::RAX, imm);
-                        if dst == 5 {
-                            e.mov_r32_r32(Reg::RBX, Reg::RAX);
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(5), Reg::RAX); // write-through for pin
-                        } else if dst == 7 {
-                            e.mov_r32_r32(Reg::R14, Reg::RAX);
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(7), Reg::RAX);
-                        } else {
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
-                        }
-                        // Direct write of PendingFlags (Add, Dword) to avoid helper call.
-                        let pending_off = core::mem::offset_of!(CpuGsw, pending_flags) as i32;
-                        e.mov_r32_imm32(Reg::RDX, 0x8000_0200);
-                        e.store_r32_disp32(Reg::R12, pending_off, Reg::RDX); // tag
-                        e.store_r32_disp32(Reg::R12, pending_off + 4, Reg::RCX); // a = old
-                        e.mov_r32_imm32(Reg::RDX, imm);
-                        e.store_r32_disp32(Reg::R12, pending_off + 8, Reg::RDX); // b = imm
-                        e.store_r32_disp32(Reg::R12, pending_off + 12, Reg::RAX); // result
-                    }
-                    SlotKind::RegShrImm { dst, count } => {
-                        if dst == 5 {
-                            e.mov_r32_r32(Reg::RAX, Reg::RBX);
-                        } else if dst == 7 {
-                            e.mov_r32_r32(Reg::RAX, Reg::R14);
-                        } else {
-                            e.load_r32_disp8(Reg::RAX, Reg::RBP, gpr_disp(dst));
-                        }
-                        e.mov_r32_r32(Reg::RCX, Reg::RAX);
-                        e.shr_r32_imm8(Reg::RAX, count);
-                        if dst == 5 {
-                            e.mov_r32_r32(Reg::RBX, Reg::RAX);
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(5), Reg::RAX); // write-through for pin
-                        } else if dst == 7 {
-                            e.mov_r32_r32(Reg::R14, Reg::RAX);
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(7), Reg::RAX);
-                        } else {
-                            e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
-                        }
-                        emit_set_shift_flags_shr_call(&mut e, count);
-                    }
-                    _ => unreachable!(),
-                }
+                emit_native_register_slot(&mut e, s);
                 i += 1;
             }
-            // After the group, one bookkeeping (folds post of last in group and pre of next).
-            let group_next_lin = slots.get(i).map(|s| s.lin).unwrap_or(0);
-            let group_count = (i - group_start) as u8;
-            if fold_native {
-                let fetch_off = core::mem::offset_of!(RegionCtx, fetch_cost) as i32;
-                emit_fold_bookkeeping(
-                    &mut e,
-                    group_total_len,
-                    group_count,
-                    fetch_off,
-                    group_next_lin,
-                    exit,
-                );
-            } else if mode == 1 {
-                let group_lin = slots[group_start].lin;
-                emit_native_bookkeeping(
-                    &mut e,
-                    group_lin,
-                    group_total_len,
-                    scale_den,
-                    group_next_lin,
-                    exit,
-                );
-            } else {
-                // For trampoline mode, call for the last k in group (approximates; main win is fold path).
-                emit_inline_bookkeeping_call(&mut e, (i - 1) as u32, exit);
+            let group_count = (i - group_start) as u32;
+            emit_native_group_finish(&mut e, group_start as u32, group_count, exit);
+            e.jmp(after);
+            e.place(fallback);
+            for (k, fallback_slot) in slots.iter().enumerate().take(i).skip(group_start) {
+                emit_native_register_slot(&mut e, fallback_slot);
+                emit_inline_bookkeeping_call(&mut e, k as u32, exit);
             }
+            e.place(after);
         } else if is_inline {
-            // Per-slot for non-folded modes (preserve exact behavior).
-            let k32 = i as u32;
-            let next_lin = slots.get(i + 1).map(|s| s.lin).unwrap_or(0);
-            match slot.kind {
-                SlotKind::RegMov { dst, src } => {
-                    if src == 5 {
-                        e.mov_r32_r32(Reg::RAX, Reg::RBX);
-                    } else if src == 7 {
-                        e.mov_r32_r32(Reg::RAX, Reg::R14);
-                    } else {
-                        e.load_r32_disp8(Reg::RAX, Reg::RBP, gpr_disp(src));
-                    }
-                    if dst == 5 {
-                        e.mov_r32_r32(Reg::RBX, Reg::RAX);
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(5), Reg::RAX); // write-through
-                    } else if dst == 7 {
-                        e.mov_r32_r32(Reg::R14, Reg::RAX);
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(7), Reg::RAX);
-                    } else {
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
-                    }
-                    if fold_native {
-                        let fetch_off = core::mem::offset_of!(RegionCtx, fetch_cost) as i32;
-                        emit_fold_bookkeeping(&mut e, slot.insn.len, 1, fetch_off, next_lin, exit);
-                    } else if mode == 1 {
-                        emit_native_bookkeeping(
-                            &mut e,
-                            slot.lin,
-                            slot.insn.len,
-                            scale_den,
-                            next_lin,
-                            exit,
-                        );
-                    } else {
-                        emit_inline_bookkeeping_call(&mut e, k32, exit);
-                    }
-                }
-                SlotKind::RegAddImm { dst, imm } => {
-                    if dst == 5 {
-                        e.mov_r32_r32(Reg::RAX, Reg::RBX);
-                    } else if dst == 7 {
-                        e.mov_r32_r32(Reg::RAX, Reg::R14);
-                    } else {
-                        e.load_r32_disp8(Reg::RAX, Reg::RBP, gpr_disp(dst));
-                    }
-                    e.mov_r32_r32(Reg::RCX, Reg::RAX);
-                    e.add_r32_imm32(Reg::RAX, imm);
-                    if dst == 5 {
-                        e.mov_r32_r32(Reg::RBX, Reg::RAX);
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(5), Reg::RAX); // write-through
-                    } else if dst == 7 {
-                        e.mov_r32_r32(Reg::R14, Reg::RAX);
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(7), Reg::RAX);
-                    } else {
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
-                    }
-                    let pending_off = core::mem::offset_of!(CpuGsw, pending_flags) as i32;
-                    e.mov_r32_imm32(Reg::RDX, 0x8000_0200);
-                    e.store_r32_disp32(Reg::R12, pending_off, Reg::RDX);
-                    e.store_r32_disp32(Reg::R12, pending_off + 4, Reg::RCX);
-                    e.mov_r32_imm32(Reg::RDX, imm);
-                    e.store_r32_disp32(Reg::R12, pending_off + 8, Reg::RDX);
-                    e.store_r32_disp32(Reg::R12, pending_off + 12, Reg::RAX);
-                    if fold_native {
-                        let fetch_off = core::mem::offset_of!(RegionCtx, fetch_cost) as i32;
-                        emit_fold_bookkeeping(&mut e, slot.insn.len, 1, fetch_off, next_lin, exit);
-                    } else if mode == 1 {
-                        emit_native_bookkeeping(
-                            &mut e,
-                            slot.lin,
-                            slot.insn.len,
-                            scale_den,
-                            next_lin,
-                            exit,
-                        );
-                    } else {
-                        emit_inline_bookkeeping_call(&mut e, k32, exit);
-                    }
-                }
-                SlotKind::RegShrImm { dst, count } => {
-                    if dst == 5 {
-                        e.mov_r32_r32(Reg::RAX, Reg::RBX);
-                    } else if dst == 7 {
-                        e.mov_r32_r32(Reg::RAX, Reg::R14);
-                    } else {
-                        e.load_r32_disp8(Reg::RAX, Reg::RBP, gpr_disp(dst));
-                    }
-                    e.mov_r32_r32(Reg::RCX, Reg::RAX);
-                    e.shr_r32_imm8(Reg::RAX, count);
-                    if dst == 5 {
-                        e.mov_r32_r32(Reg::RBX, Reg::RAX);
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(5), Reg::RAX); // write-through
-                    } else if dst == 7 {
-                        e.mov_r32_r32(Reg::R14, Reg::RAX);
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(7), Reg::RAX);
-                    } else {
-                        e.store_r32_disp8(Reg::RBP, gpr_disp(dst), Reg::RAX);
-                    }
-                    emit_set_shift_flags_shr_call(&mut e, count);
-                    if fold_native {
-                        let fetch_off = core::mem::offset_of!(RegionCtx, fetch_cost) as i32;
-                        emit_fold_bookkeeping(&mut e, slot.insn.len, 1, fetch_off, next_lin, exit);
-                    } else if mode == 1 {
-                        emit_native_bookkeeping(
-                            &mut e,
-                            slot.lin,
-                            slot.insn.len,
-                            scale_den,
-                            next_lin,
-                            exit,
-                        );
-                    } else {
-                        emit_inline_bookkeeping_call(&mut e, k32, exit);
-                    }
-                }
-                _ => unreachable!(),
-            }
+            emit_native_register_slot(&mut e, slot);
+            emit_inline_bookkeeping_call(&mut e, i as u32, exit);
             i += 1;
         } else {
             // Memory / terminal slot: original handling (no batching).
@@ -1174,14 +1037,6 @@ fn emit_full_step_call(e: &mut Encoder, k: u32) {
     e.call_r64(Reg::RAX);
 }
 
-/// The native bookkeeping for one inline slot, replacing the `region_inline_slot` trampoline call.
-/// Does in native code: the charge_cached_fetch call-out (bus-bound, irreducible), raw_clocks
-/// accumulation, the cap check (cross-multiplied to avoid division), and the line-live probe.
-/// Eliminates the per-slot call/ret overhead.
-///
-/// The cap check uses the cross-multiplied form to avoid a u64 divide:
-///   rem0 + raw + den * (run_total + bus_delta) >= den * cap
-/// where bus_delta = in_batch_scaled_bus_clocks() - bus_at_run_start, and den is the compile-time
 /// The trampoline-call form of inline-slot bookkeeping (used currently). Calls `region_inline_slot`
 /// via the ctx fn pointer — the Rust trampoline does begin_instruction + charge_cached_fetch +
 /// raw_clocks += 2 + insn_count += 1 + cap check + line_live probe.
@@ -1206,25 +1061,39 @@ fn emit_inline_bookkeeping_call(e: &mut Encoder, k: u32, exit: Label) {
     e.jnz(exit);
 }
 
-/// The native cap-check form of inline-slot bookkeeping. Now uses cross-mult form (no div) per v3.
-/// (Was slower than trampoline before RA; kept for the NATIVE_BOOKKEEPING=1 path and future.)
-#[allow(dead_code)]
-fn emit_native_bookkeeping(
-    e: &mut Encoder,
-    lin: u32,
-    len: u8,
-    scale_den: u32,
-    next_lin: u32,
-    exit: Label,
-) {
-    // 1. charge_cached_fetch(cpu, bus, ctx, lin, len) call-out.
+/// Call the exact budget preview before a native group changes guest state. A nonzero result takes
+/// the emitted per-slot fallback for this group.
+fn emit_native_group_guard(e: &mut Encoder, first: u32, count: u32, fallback: Label) {
+    #[cfg(windows)]
+    {
+        e.mov_r64_r64(Reg::RCX, Reg::R13);
+        e.mov_r64_r64(Reg::RDX, Reg::R15);
+        e.mov_r32_imm32(Reg::R8, first);
+        e.mov_r32_imm32(Reg::R9, count);
+    }
+    #[cfg(not(windows))]
+    {
+        e.mov_r64_r64(Reg::RDI, Reg::R13);
+        e.mov_r64_r64(Reg::RSI, Reg::R15);
+        e.mov_r32_imm32(Reg::RDX, first);
+        e.mov_r32_imm32(Reg::RCX, count);
+    }
+    let off = core::mem::offset_of!(RegionCtx, native_group_guard_fn) as i32;
+    e.load_r64_disp32(Reg::RAX, Reg::R15, off);
+    e.call_r64(Reg::RAX);
+    e.test_al_al();
+    e.jnz(fallback);
+}
+
+/// Commit exact fetch and clock bookkeeping for a completed native group.
+fn emit_native_group_finish(e: &mut Encoder, first: u32, count: u32, exit: Label) {
     #[cfg(windows)]
     {
         e.mov_r64_r64(Reg::RCX, Reg::R12);
         e.mov_r64_r64(Reg::RDX, Reg::R13);
         e.mov_r64_r64(Reg::R8, Reg::R15);
-        e.mov_r32_imm32(Reg::R9, lin);
-        e.mov_r32_imm32(Reg::RAX, u32::from(len));
+        e.mov_r32_imm32(Reg::R9, first);
+        e.mov_r32_imm32(Reg::RAX, count);
         e.store_r32_disp8(Reg::RSP, 32, Reg::RAX);
     }
     #[cfg(not(windows))]
@@ -1232,90 +1101,14 @@ fn emit_native_bookkeeping(
         e.mov_r64_r64(Reg::RDI, Reg::R12);
         e.mov_r64_r64(Reg::RSI, Reg::R13);
         e.mov_r64_r64(Reg::RDX, Reg::R15);
-        e.mov_r32_imm32(Reg::RCX, lin);
-        e.mov_r32_imm32(Reg::R8, u32::from(len));
+        e.mov_r32_imm32(Reg::RCX, first);
+        e.mov_r32_imm32(Reg::R8, count);
     }
-    e.load_r64_disp8(Reg::RAX, Reg::R15, CHARGE_FETCH_FN_OFF);
+    let off = core::mem::offset_of!(RegionCtx, native_group_finish_fn) as i32;
+    e.load_r64_disp32(Reg::RAX, Reg::R15, off);
     e.call_r64(Reg::RAX);
     e.test_al_al();
     e.jnz(exit);
-
-    // 2. raw_clocks += 2; insn_count += 1 (native load/add/store).
-    e.load_r64_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF);
-    e.add_r64_imm32(Reg::RAX, 2);
-    e.store_r64_disp8(Reg::R15, RAW_CLOCKS_OFF, Reg::RAX);
-    // insn_count is a u32 at RAW_CLOCKS_OFF + 8.
-    e.load_r32_disp8(Reg::RAX, Reg::R15, RAW_CLOCKS_OFF + 8);
-    e.add_r32_imm32(Reg::RAX, 1);
-    e.store_r32_disp8(Reg::R15, RAW_CLOCKS_OFF + 8, Reg::RAX);
-    let native_count_off = core::mem::offset_of!(RegionCtx, native_insn_count) as i32;
-    e.load_r32_disp32(Reg::RAX, Reg::R15, native_count_off);
-    e.add_r32_imm32(Reg::RAX, 1);
-    e.store_r32_disp32(Reg::R15, native_count_off, Reg::RAX);
-
-    // 3. Cap check: total + bus_delta >= cap
-    //    where total = run_total + (rem0 + raw) / den (floor division, u64)
-    // (kept div form here for mode=1 exact-match tests; fold uses cross-mult)
-
-    // RAX = bus_clocks(bus) — call-out (one arg: bus)
-    #[cfg(windows)]
-    {
-        e.mov_r64_r64(Reg::RCX, Reg::R13);
-    }
-    #[cfg(not(windows))]
-    {
-        e.mov_r64_r64(Reg::RDI, Reg::R13);
-    }
-    e.load_r64_disp8(Reg::RAX, Reg::R15, BUS_CLOCKS_FN_OFF);
-    e.call_r64(Reg::RAX);
-    // RAX = bus_delta = bus_clocks - bus_at_run_start
-    e.load_r64_disp8(Reg::RDX, Reg::R15, BUS_AT_RUN_START_OFF);
-    e.sub_r64_r64(Reg::RAX, Reg::RDX);
-    // Now compute total = run_total + (rem0 + raw) / den
-    // RDX = rem0 + raw (scale_num=1 for 486/586)
-    e.load_r64_disp32(Reg::RDX, Reg::R15, REM0_OFF);
-    e.load_r64_disp8(Reg::RCX, Reg::R15, RAW_CLOCKS_OFF);
-    e.add_r64_r64(Reg::RDX, Reg::RCX);
-    // RAX needs to be preserved (bus_delta) — move to a callee-saved-safe place.
-    // We have no spare callee-saved register, so save bus_delta on the stack.
-    e.store_r64_disp8(Reg::RSP, 0, Reg::RAX); // bus_delta -> [RSP+0] (shadow space)
-    // RAX = (rem0 + raw) / den: set RAX = dividend, RCX = divisor, div
-    e.mov_r64_r64(Reg::RAX, Reg::RDX); // dividend
-    e.mov_r32_imm32(Reg::RCX, scale_den); // divisor (zero-extends RCX)
-    e.div_r64(Reg::RCX); // RAX = quotient = (rem0 + raw) / den
-    // RAX = total = run_total + quotient
-    e.load_r64_disp8(Reg::RDX, Reg::R15, RUN_TOTAL_OFF);
-    e.add_r64_r64(Reg::RAX, Reg::RDX);
-    // RAX = total + bus_delta
-    e.load_r64_disp8(Reg::RDX, Reg::RSP, 0); // restore bus_delta
-    e.add_r64_r64(Reg::RAX, Reg::RDX);
-    // Compare: total + bus_delta >= cap?
-    e.load_r64_disp8(Reg::RDX, Reg::R15, CAP_OFF);
-    e.cmp_r64_r64(Reg::RAX, Reg::RDX);
-    e.jae(exit);
-
-    // 4. line_live probe for the next slot (if next_lin != 0).
-    //    jit_line_live(cpu, next_lin, d) — the d bit is in ctx at offset D_OFF.
-    if next_lin != 0 {
-        #[cfg(windows)]
-        {
-            e.mov_r64_r64(Reg::RCX, Reg::R12); // cpu
-            e.mov_r32_imm32(Reg::RDX, next_lin); // lin
-            // The d bit (bool) is the 3rd arg. Load it from ctx.
-            e.load_r64_disp32(Reg::R8, Reg::R15, D_OFF);
-            // R8 = d (0 or 1; bool is 1 byte, zero-extended by the 64-bit load).
-        }
-        #[cfg(not(windows))]
-        {
-            e.mov_r64_r64(Reg::RDI, Reg::R12); // cpu
-            e.mov_r32_imm32(Reg::RSI, next_lin); // lin
-            e.load_r64_disp32(Reg::RDX, Reg::R15, D_OFF);
-        }
-        e.load_r64_disp8(Reg::RAX, Reg::R15, LINE_LIVE_FN_OFF);
-        e.call_r64(Reg::RAX);
-        e.test_al_al();
-        e.jz(exit); // line not live -> exit
-    }
 }
 
 /// Call `CpuGsw::jit_set_shift_flags_shr(cpu, value, count)` with cpu in R12, the original value
@@ -1341,33 +1134,14 @@ fn emit_set_shift_flags_shr_call(e: &mut Encoder, count: u8) {
 /// emit). Each `Option<unsafe extern "C" fn>` is 8 bytes (null-pointer optimization).
 /// Field order: step_fn(0), inline_step_fn(8), set_pending_add_fn(16), set_shift_flags_fn(24),
 /// charge_fetch_fn(32), bus_clocks_fn(40), line_live_fn(48).
-#[allow(dead_code)] // wired by the native cap-check emit (in progress)
-const SET_PENDING_ADD_FN_OFF: i8 = 16;
 const SET_SHIFT_FLAGS_FN_OFF: i8 = 24;
-#[allow(dead_code)]
-const CHARGE_FETCH_FN_OFF: i8 = 32;
-#[allow(dead_code)]
-const BUS_CLOCKS_FN_OFF: i8 = 40;
-#[allow(dead_code)]
 const LINE_LIVE_FN_OFF: i8 = 48;
 
-/// Byte offsets of the timing fields within `RegionCtx` (read by the native cap check).
-/// Verified by the region_ctx_fn_pointer_offsets test (repr(C) alignment adds padding
-/// after the u32 insn_count before the u64 run_total_at_entry).
+/// Byte offsets within `RegionCtx` read by emitted native bookkeeping.
 const RAW_CLOCKS_OFF: i8 = 88;
 // insn_count is a u32 at 96 (RAW_CLOCKS_OFF + 8).
-const RUN_TOTAL_OFF: i8 = 104;
-const BUS_AT_RUN_START_OFF: i8 = 112;
-const CAP_OFF: i8 = 120;
-const REM0_OFF: i32 = 128;
 /// The `d` (decode-line D bit) field offset. Exceeds i8; use disp32.
 const D_OFF: i32 = 144;
-/// These offsets exceed i8 (127); the native cap check uses disp32 addressing (to be added).
-/// For now they're u32 constants used only in the (future) native cap-check emit.
-#[allow(dead_code)]
-const SCALE_NUM_OFF: u32 = 128;
-#[allow(dead_code)]
-const SCALE_DEN_OFF: u32 = 132;
 
 /// Try to admit a region at `entry_lin` (admits any block shape, linear or loop). Test-only helper;
 /// production auto-admission uses `try_admit_gated` with `reject_linear` set, and the forced-address
@@ -1383,13 +1157,9 @@ pub(crate) fn try_admit(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Non
 /// Returns the table index for the caller to stamp into the decode line, or `None` when the block
 /// is not (yet) buildable or the host has no W^X backend.
 ///
-/// `reject_linear`: when set, a NON-loop (linear) block is refused. A linear block runs once per
-/// entry then returns to the interpreter, so the region's per-entry prologue/epilogue is pure
-/// overhead on top of the same instructions the interpreter would run — it can never be faster than
-/// interpreting. Hotness auto-admission sets this so it only compiles self-loops (which amortize the
-/// entry over many iterations); on Doom, unconditionally admitting the hot linear basic blocks was a
-/// ~2.9x wall regression (751M region entries, ~5 insns each, all entry/exit overhead). Refusing
-/// admission is always state-correct (the interpreter runs the block).
+/// With `reject_linear`, hot linear blocks need four native interior slots and no interior helper
+/// slots. Short or mixed blocks retain the interpreter path that avoided the measured broad-linear
+/// admission regression. Self-loops and forced test admission keep their existing behavior.
 pub(crate) fn try_admit_gated(
     cpu: &mut CpuGsw,
     entry_lin: u32,
@@ -1408,7 +1178,7 @@ pub(crate) fn try_admit_gated(
         return None;
     }
     let (slots, is_loop) = build_block(cpu, entry_lin, d)?;
-    if reject_linear && !is_loop {
+    if reject_linear && !is_loop && !native_linear_candidate(&slots) {
         return None;
     }
     let last = &slots[slots.len() - 1];
@@ -1428,7 +1198,6 @@ pub(crate) fn try_admit_gated(
     let epoch = cpu.decode_cache.jit_smc_epoch;
     let mode_key = cpu.jit_mode_key();
     let regs_offset = core::mem::offset_of!(CpuGsw, registers) as u32;
-    let (_scale_num, scale_den) = crate::level_timing(cpu.persona());
     // Cost-fold native LOAD gate (read the toggle once here — the true emit site — so this admission's
     // decision, the emit, and `has_native_fold` all agree): ON only if `IZARRAVM_JIT_FOLD` is set AND
     // this CPU state is fold-eligible (Approximate class, unpaged, flat DS). `has_native_fold` also
@@ -1474,7 +1243,6 @@ pub(crate) fn try_admit_gated(
         let code = emit_region(
             &region.ctx.slots,
             regs_offset,
-            scale_den,
             fold_native,
             store_fold,
             fold_paged,
@@ -1508,14 +1276,7 @@ pub(crate) fn try_admit_gated(
         return None;
     }
     let terminal_slot = (slots.len() - 1) as u32;
-    let code = emit_region(
-        &slots,
-        regs_offset,
-        scale_den,
-        fold_native,
-        store_fold,
-        fold_paged,
-    );
+    let code = emit_region(&slots, regs_offset, fold_native, store_fold, fold_paged);
     let buf = ExecutableBuffer::new(&code)?;
     // SAFETY: `code` was produced by `emit_region` to exactly the `RegionEntryFn` calling
     // convention (alignment proof at STACK_RESERVE); `entry_ptr` stays valid for `buf`'s life,
@@ -1548,10 +1309,11 @@ pub(crate) fn try_admit_gated(
         halted: false,
         folded_raw_bus: 0,
         fold_bus_cost: 0,
-        fetch_cost: 0,
         store_finish_fn: None,
         native_insn_count: 0,
         helper_exit_count: 0,
+        native_group_guard_fn: None,
+        native_group_finish_fn: None,
     });
     let idx = cpu.jit_regions.install(CompiledRegion {
         buf,

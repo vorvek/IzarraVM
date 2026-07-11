@@ -92,15 +92,14 @@ fn region_ctx_fn_pointer_offsets() {
     // emit's addressing assumption) is caught.
     let folded_off = core::mem::offset_of!(RegionCtx, folded_raw_bus);
     let cost_off = core::mem::offset_of!(RegionCtx, fold_bus_cost);
-    let fetch_off = core::mem::offset_of!(RegionCtx, fetch_cost);
     // `store_finish_fn` is a fn-pointer the native STORE fold loads by disp32 and calls; keep it in
     // the disp32 range alongside the other fold fields.
     let finish_off = core::mem::offset_of!(RegionCtx, store_finish_fn);
     eprintln!(
-        "folded_raw_bus offset = {folded_off}, fold_bus_cost offset = {cost_off}, fetch_cost offset = {fetch_off}, store_finish_fn offset = {finish_off}"
+        "folded_raw_bus offset = {folded_off}, fold_bus_cost offset = {cost_off}, store_finish_fn offset = {finish_off}"
     );
     assert!(
-        folded_off > 127 && cost_off > 127 && fetch_off > 127 && finish_off > 127,
+        folded_off > 127 && cost_off > 127 && finish_off > 127,
         "fold fields must be disp32"
     );
 }
@@ -1125,6 +1124,14 @@ impl CpuBus for TestBus {
     fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
         self.trace.record_instruction_fetch_run(start, count, 0);
         Ok(())
+    }
+
+    fn jit_cached_fetch_run_clocks(&self, _start: u32, count: u32) -> Option<u64> {
+        Some(u64::from(count) * 2)
+    }
+
+    fn jit_projected_batch_scaled_bus_clocks(&self, _additional_raw: u64) -> Option<u64> {
+        Some(0)
     }
 
     // Hand out a host-pointer page into `memory`, mirroring MachineBus::direct_page, so the

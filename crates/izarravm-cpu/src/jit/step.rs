@@ -128,6 +128,21 @@ pub(crate) type LineLiveFn = unsafe extern "C" fn(cpu: *const CpuGsw, lin: u32, 
 #[cfg(feature = "jit")]
 pub(crate) type StoreFinishFn = unsafe extern "C" fn(cpu: *mut CpuGsw, physical: u32);
 
+/// Check whether one native group fits before any guest register is changed.
+#[cfg(feature = "jit")]
+pub(crate) type NativeGroupGuardFn =
+    unsafe extern "C" fn(bus: *mut c_void, ctx: *mut RegionCtx, first: u32, count: u32) -> u8;
+
+/// Apply the exact per-instruction fetch and clock accounting after a native group completes.
+#[cfg(feature = "jit")]
+pub(crate) type NativeGroupFinishFn = unsafe extern "C" fn(
+    cpu: *mut CpuGsw,
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    first: u32,
+    count: u32,
+) -> u8;
+
 /// The mailbox between the dispatch (`CpuGsw::run_region`), the emitted code, and the step fns.
 /// `step_fn` MUST stay the first field: the emitted prologue loads it from `[ctx + 0]`;
 /// `inline_step_fn` is the second field, loaded from `[ctx + 8]`. Every other field is Rust-only.
@@ -214,10 +229,6 @@ pub(crate) struct RegionCtx {
     /// dispatch stashes the constant here like `scale_den`; a native LOAD/STORE slot adds it to
     /// `folded_raw_bus`. Zero under the trampoline. Past the disp8 range, so the emit reads it by disp32.
     pub fold_bus_cost: u64,
-    /// The raw bus clocks ONE native ALU fold slot charges (instruction fetch only — a register op does
-    /// no data access), = `bus.jit_fetch_cost_clocks()`. A native mov/add/shr slot adds this to
-    /// `folded_raw_bus`. Zero under the trampoline. Past the disp8 range, so the emit reads it by disp32.
-    pub fetch_cost: u64,
     /// Raw fn pointer to `CpuGsw::jit_store_u8_finish`, loaded (by disp32) + called by a native STORE
     /// fold slot after it writes the byte, to do `record_write_page` + `note_code_write`. Written by the
     /// dispatch on every entry. `None` under the trampoline (no native store slot loads it).
@@ -227,6 +238,11 @@ pub(crate) struct RegionCtx {
     pub native_insn_count: u32,
     /// Calls from emitted code into `region_step` during this entry.
     pub helper_exit_count: u32,
+    /// Group-level native bookkeeping functions, specialized for the live bus type at entry.
+    #[cfg(feature = "jit")]
+    pub native_group_guard_fn: Option<NativeGroupGuardFn>,
+    #[cfg(feature = "jit")]
+    pub native_group_finish_fn: Option<NativeGroupFinishFn>,
 }
 
 impl RegionCtx {
@@ -481,4 +497,93 @@ pub(crate) unsafe extern "C" fn jit_bus_clocks<B: CpuBus>(bus: *const c_void) ->
 pub(crate) unsafe extern "C" fn jit_line_live(cpu: *const CpuGsw, lin: u32, d: bool) -> bool {
     let cpu = unsafe { &*cpu };
     cpu.decode_cache.line_live(lin, d)
+}
+
+/// Refuse a native group unless its complete core and cached-fetch cost fits in the current run.
+/// A pending optional fold is flushed first so the live bus delta includes all prior slots.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn region_native_group_guard<B: CpuBus>(
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    first: u32,
+    count: u32,
+) -> u8 {
+    let bus = unsafe { &mut *(bus as *mut B) };
+    let ctx = unsafe { &mut *ctx };
+    if ctx.folded_raw_bus > 0 {
+        bus.charge_bus_clocks_bulk(std::mem::take(&mut ctx.folded_raw_bus));
+    }
+    let first = first as usize;
+    let Some(end) = first.checked_add(count as usize) else {
+        return STOP;
+    };
+    let Some(slots) = ctx.slots.get(first..end) else {
+        return STOP;
+    };
+    let mut fetch_clocks = 0u64;
+    for slot in slots {
+        let Some(clocks) = bus.jit_cached_fetch_run_clocks(slot.lin, u32::from(slot.insn.len))
+        else {
+            return STOP;
+        };
+        let Some(total) = fetch_clocks.checked_add(clocks) else {
+            return STOP;
+        };
+        fetch_clocks = total;
+    }
+    let count = u64::from(count);
+    let projected_core = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks + 2 * count);
+    let Some(projected_bus) = bus.jit_projected_batch_scaled_bus_clocks(fetch_clocks) else {
+        return STOP;
+    };
+    let Some(projected_total) = projected_bus
+        .checked_sub(ctx.bus_at_run_start)
+        .and_then(|bus_delta| projected_core.checked_add(bus_delta))
+    else {
+        return STOP;
+    };
+    u8::from(projected_total >= ctx.cap)
+}
+
+/// Finish one already-executed native group through the same cached-fetch and clock seams used by
+/// individual interpreted instructions. Register-only groups cannot invalidate their own code, so
+/// one liveness probe at the group boundary is equivalent to probing after every slot.
+#[cfg(feature = "jit")]
+pub(crate) unsafe extern "C" fn region_native_group_finish<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    bus: *mut c_void,
+    ctx: *mut RegionCtx,
+    first: u32,
+    count: u32,
+) -> u8 {
+    let cpu = unsafe { &mut *cpu };
+    let bus = unsafe { &mut *(bus as *mut B) };
+    let ctx = unsafe { &mut *ctx };
+    let first = first as usize;
+    let end = first + count as usize;
+    for slot in &ctx.slots[first..end] {
+        cpu.interrupt_shadow = false;
+        cpu.begin_instruction();
+        cpu.core_clocks_so_far = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+        let start_eip = cpu.registers.eip;
+        if let Err(fault) = cpu.charge_cached_fetch(bus, slot.lin, slot.insn.len) {
+            ctx.fault = Some((start_eip, fault));
+            return STOP;
+        }
+        ctx.raw_clocks += 2;
+        ctx.insn_count += 1;
+        ctx.native_insn_count += 1;
+    }
+    let total = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
+    if total.saturating_add(
+        bus.in_batch_scaled_bus_clocks()
+            .saturating_sub(ctx.bus_at_run_start),
+    ) >= ctx.cap
+    {
+        return STOP;
+    }
+    if end < ctx.slots.len() && !cpu.decode_cache.line_live(ctx.slots[end].lin, ctx.d) {
+        return STOP;
+    }
+    CONTINUE
 }

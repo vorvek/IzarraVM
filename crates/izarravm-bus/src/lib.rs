@@ -516,6 +516,20 @@ pub trait CpuBus {
         0
     }
 
+    /// Return the raw bus clocks that `charge_instruction_fetch_run(start, count)` will add with
+    /// the bus otherwise unchanged. `Some` also guarantees that call cannot fail. A JIT uses this
+    /// to preflight non-faulting fixed-cost native groups; `None` keeps the per-instruction path.
+    fn jit_cached_fetch_run_clocks(&self, _start: u32, _count: u32) -> Option<u64> {
+        None
+    }
+
+    /// Project the exact in-batch scaled bus-clock total after `additional_raw` clocks. A JIT may
+    /// batch native instructions only when this returns `Some`; `None` keeps the ordinary
+    /// per-instruction charging path.
+    fn jit_projected_batch_scaled_bus_clocks(&self, _additional_raw: u64) -> Option<u64> {
+        None
+    }
+
     /// The clock cost this bus charges for ONE byte-wide direct data access (the JIT cost-fold's
     /// per-byte-access data constant). Buses without bus timing return 0.
     ///

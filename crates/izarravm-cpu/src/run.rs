@@ -413,9 +413,8 @@ impl CpuGsw {
 
     /// Enable/disable the cost-fold native-LOAD path (env `IZARRAVM_JIT_FOLD`), a process-global toggle
     /// read at region emit time. Off by default so ordinary JIT admission and every bit-identical
-    /// test are undisturbed. Associated (no `self`): it sets a global, like
-    /// `NATIVE_BOOKKEEPING`. Turning it on makes JIT-block timing approximate (bus cost is folded), so
-    /// it is validated by the anchor bands, not the differential timing asserts.
+    /// test are undisturbed. Turning it on makes folded memory timing approximate, so it is
+    /// validated by the anchor bands, not the differential timing asserts.
     #[cfg(feature = "jit")]
     pub fn set_jit_fold_timing(on: bool) {
         jit::block::FOLD_TIMING.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -446,11 +445,9 @@ impl CpuGsw {
                 if !forced && !hot {
                     return Ok(None);
                 }
-                // Auto-admission (hotness) compiles ONLY self-loops: a linear block runs once per
-                // entry then returns, so its region prologue/epilogue is pure overhead over the same
-                // interpreted instructions and can never win (measured: broad linear-block admission
-                // was a ~2.9x Doom wall regression). The forced-address override still admits any
-                // block, for the spike/tests. Refusing is always state-correct.
+                // Hot linear blocks are admitted only when the builder finds a useful all-native
+                // interior. Self-loops retain their existing gate, while forced admission remains
+                // available for differential tests of any block shape.
                 let Some(idx) = jit::block::try_admit_gated(self, lin, d, !forced) else {
                     return Ok(None);
                 };
@@ -573,6 +570,10 @@ impl CpuGsw {
                     Self::jit_store_u8_finish as fn(&mut CpuGsw, u32),
                 )
             });
+            ctx.native_group_guard_fn =
+                Some(jit::step::region_native_group_guard::<B> as jit::step::NativeGroupGuardFn);
+            ctx.native_group_finish_fn =
+                Some(jit::step::region_native_group_finish::<B> as jit::step::NativeGroupFinishFn);
             ctx.entry_eip = eip;
             ctx.raw_clocks = 0;
             ctx.insn_count = 0;
@@ -589,13 +590,11 @@ impl CpuGsw {
             ctx.fault = None;
             ctx.halted = false;
             // Cost-fold: start the folded-bus accumulator empty; region_step flushes it. A native
-            // MEMORY slot folds ONE instruction-fetch + ONE data-byte cost; a native ALU slot folds the
-            // fetch only. Stash both constants from the concrete bus here (THE WRINKLE: the bus-agnostic
-            // emitted buffer cannot call a bus method). Zero on buses without bus timing, so a native
-            // slot folds nothing there.
+            // The optional native memory path folds one instruction fetch and one data byte. Stash
+            // that combined cost from the concrete bus because the emitted buffer cannot call a bus
+            // method. Buses without timing return zero.
             ctx.folded_raw_bus = 0;
-            ctx.fetch_cost = bus.jit_fetch_cost_clocks();
-            ctx.fold_bus_cost = ctx.fetch_cost + bus.jit_data_byte_cost_clocks();
+            ctx.fold_bus_cost = bus.jit_fetch_cost_clocks() + bus.jit_data_byte_cost_clocks();
             (region.entry, std::ptr::from_mut(ctx))
         };
         let block_start = (self.perf.jit_region_entries & 0x3ff == 0).then(std::time::Instant::now);
@@ -611,10 +610,6 @@ impl CpuGsw {
                 (std::ptr::from_mut(bus)).cast(),
                 ctx_ptr,
             );
-        }
-        if let Some(start) = block_start {
-            self.perf.jit_native_block_ns += duration_ns_u64(start.elapsed());
-            self.perf.jit_native_block_samples += 1;
         }
         let (raw, count, native_count, helper_exits, halted, fault, folded_bus) = {
             let region = self
@@ -632,6 +627,10 @@ impl CpuGsw {
                 std::mem::take(&mut ctx.folded_raw_bus),
             )
         };
+        if let Some(start) = block_start {
+            self.perf.jit_native_block_ns += duration_ns_u64(start.elapsed());
+            self.perf.jit_native_block_samples += 1;
+        }
         // Flush any bus cost the tail native fold slots accumulated but did not hand to a region_step
         // slot: a region that exits directly from a native LOAD's line_live probe (or an inline slot's
         // cap check immediately after one) leaves the last fold unflushed. Bus-timing only (the core
