@@ -1807,10 +1807,10 @@ fn wbinvd_at_cpl3_delivers_ud() {
 }
 
 #[test]
-fn invlpg_memory_noop_at_cpl0() {
+fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
     // invlpg [0x40] (0x0f 0x01 0x3e 0x40 0x00, /7 with a memory operand) in real mode.
-    // No TLB is modeled, so it is a no-op that advances past its bytes and leaves the
-    // pointed-at memory untouched.
+    // It advances past its bytes, leaves the pointed-at memory untouched, and invalidates only
+    // the addressed linear page.
     let mut memory = vec![0; 128];
     memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x3e, 0x40, 0x00]);
     memory[0x40] = 0xaa;
@@ -1818,12 +1818,61 @@ fn invlpg_memory_noop_at_cpl0() {
     cpu.load_segment_real(SegmentIndex::Cs, 0);
     cpu.load_segment_real(SegmentIndex::Ds, 0);
     cpu.registers.eip = 0;
+    cpu.tlb.insert(0, 0x5000, true, false, true);
+    cpu.tlb.insert(1, 0x6000, true, false, true);
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    let (mut first_page, mut second_page) = (Box::new([0u8; 4096]), Box::new([0u8; 4096]));
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        let permissions = jit::fast_map::PagePermissions::UNPAGED;
+        assert!(cpu.jit_fast_map.populate_read(
+            0x40,
+            0x5040,
+            DirectPage {
+                physical_page: 0x5000,
+                ptr: first_page.as_mut_ptr(),
+                len: first_page.len(),
+                writable: false,
+            },
+            permissions,
+        ));
+        assert!(cpu.jit_fast_map.populate_read(
+            0x1000,
+            0x6000,
+            DirectPage {
+                physical_page: 0x6000,
+                ptr: second_page.as_mut_ptr(),
+                len: second_page.len(),
+                writable: false,
+            },
+            permissions,
+        ));
+    }
     let mut bus = TestBus::with_memory(memory);
 
     cpu.cycle(&mut bus).unwrap();
 
     assert_eq!(cpu.registers.eip, 5);
     assert_eq!(bus.memory[0x40], 0xaa);
+    assert!(cpu.tlb.lookup(0).is_none());
+    assert!(cpu.tlb.lookup(1).is_some());
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        assert!(!cpu.jit_fast_map.has_read_mapping(0x40));
+        assert!(cpu.jit_fast_map.has_read_mapping(0x1000));
+    }
 }
 
 #[test]

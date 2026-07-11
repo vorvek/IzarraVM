@@ -485,30 +485,35 @@ pub(crate) unsafe extern "C" fn region_native_u8<B: CpuBus>(
 
     let result = cpu.charge_cached_fetch(bus, lin, len).and_then(|()| {
         if kind == SlotKind::MemLoadU8 {
-            let value =
-                match cpu.read_direct_byte_page_cached(bus, physical, BusAccessKind::DataRead)? {
-                    Some(value) => {
-                        cpu.perf.jit_native_load_hits += 1;
-                        value
-                    }
-                    None => {
-                        let read = bus.read_memory_direct(
-                            physical,
-                            BusWidth::Byte,
-                            BusAccessKind::DataRead,
-                        )?;
-                        cpu.record_data_read(BusAccessKind::DataRead, read.direct);
-                        read.value as u8
-                    }
-                };
+            let value = match cpu.read_direct_byte_page_cached(
+                bus,
+                physical,
+                physical,
+                BusAccessKind::DataRead,
+            )? {
+                Some(value) => {
+                    cpu.perf.jit_native_load_hits += 1;
+                    value
+                }
+                None => {
+                    let read =
+                        bus.read_memory_direct(physical, BusWidth::Byte, BusAccessKind::DataRead)?;
+                    cpu.record_data_read(BusAccessKind::DataRead, read.direct);
+                    read.value as u8
+                }
+            };
             cpu.write_gpr8(reg, value);
             Ok(())
         } else {
             let value = cpu.read_gpr8(reg);
             cpu.record_write_page(physical);
-            if let Some(changed) =
-                cpu.write_direct_byte_page_cached(bus, physical, value, BusAccessKind::DataWrite)?
-            {
+            if let Some(changed) = cpu.write_direct_byte_page_cached(
+                bus,
+                physical,
+                physical,
+                value,
+                BusAccessKind::DataWrite,
+            )? {
                 if changed {
                     cpu.note_code_write(physical, 1);
                 }

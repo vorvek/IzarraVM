@@ -68,6 +68,57 @@ fn perf_counter_tracks_code_invalidation_events() {
     assert_eq!(cpu.perf_counters().code_invalidations, before + 1);
 }
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpreter_direct_page_misses_fill_fast_map_and_map_change_clears_it() {
+    let mut bus = TestBus::with_memory(vec![0; 0x6000]);
+    bus.direct_pages_enabled = true;
+    bus.memory[0x2456] = 0x3c;
+    bus.memory[0x3456] = 0x5a;
+    let mut cpu = CpuGsw::default();
+
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x2456, BusAccessKind::DataRead,)
+            .unwrap(),
+        0x3c
+    );
+    if !jit::forced_admission_enabled() {
+        assert!(
+            !cpu.jit_fast_map.is_allocated(),
+            "disabled auto-admission must leave the large map lazy"
+        );
+    }
+
+    cpu.set_jit_auto_admit(true);
+
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x3456, BusAccessKind::DataRead,)
+            .unwrap(),
+        0x5a
+    );
+    assert!(cpu.jit_fast_map.has_read_mapping(0x3456));
+    assert!(!cpu.jit_fast_map.has_write_mapping(0x3456));
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        0x3456,
+        0xa5,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.has_write_mapping(0x3456));
+    assert_eq!(bus.memory[0x3456], 0xa5);
+
+    cpu.note_direct_map_changed();
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x3456));
+    assert!(!cpu.jit_fast_map.has_write_mapping(0x3456));
+}
+
 #[test]
 #[cfg(feature = "jit")]
 fn region_ctx_fn_pointer_offsets() {
@@ -79,7 +130,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
     // Pending flags offset used by direct native writes.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3936);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3952);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
@@ -1474,3 +1525,7 @@ mod jit_region;
 #[cfg(feature = "jit")]
 #[path = "cpu_jit_general_test.rs"]
 mod jit_general;
+
+#[cfg(feature = "jit")]
+#[path = "cpu_jit_direct_test.rs"]
+mod jit_direct;

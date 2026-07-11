@@ -1,9 +1,8 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! A small write-then-execute (W^X) memory buffer for emitted machine code. Windows and Linux
-//! x86-64 get a real allocator; every other target compiles to a buffer that can never be
-//! created, so the JIT compiles nothing and the interpreter runs unchanged.
+//! Write-then-execute (W^X) storage for emitted machine code. Windows and Linux x86-64 get a real
+//! allocator; every other target compiles nothing and runs the interpreter unchanged.
 
 /// Owns a page of memory that starts Read+Write (so the encoder can write bytes into it) and is
 /// flipped to Read+Execute before any code in it runs, and never both writable and executable at
@@ -13,12 +12,29 @@ pub(crate) struct ExecutableBuffer {
     len: usize,
 }
 
+/// Maximum virtual memory reserved for direct blocks. Each block owns one host page so completed
+/// blocks can be sealed Read+Execute while unused slots remain Read+Write.
+pub(crate) const EXECUTABLE_ARENA_LEN: usize = 32 * 1024 * 1024;
+
+/// A bounded collection of one-page executable-code slots.
+pub(crate) struct ExecutableArena {
+    ptr: *mut u8,
+    len: usize,
+    page_len: usize,
+    used: usize,
+}
+
 // SAFETY: the buffer holds only plain code bytes; nothing here is interior-mutable shared state.
 // `CpuGsw` (which owns these via `JitBlockCache`) is not itself required to be Send/Sync today,
 // but marking this Send/Sync keeps it from accidentally blocking a future requirement; the
 // pointer is never aliased outside this type.
 unsafe impl Send for ExecutableBuffer {}
 unsafe impl Sync for ExecutableBuffer {}
+
+// SAFETY: installing code requires an exclusive borrow, and installed pages are never made
+// writable again. Exposed entry pointers refer only to sealed pages.
+unsafe impl Send for ExecutableArena {}
+unsafe impl Sync for ExecutableArena {}
 
 impl ExecutableBuffer {
     /// Allocate `len` bytes (rounded up to a page), write `code` into it, then flip the page to
@@ -32,7 +48,7 @@ impl ExecutableBuffer {
         unsafe {
             std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len());
         }
-        if !make_rx(ptr, len) {
+        if !flush_instruction_cache(ptr, len) || !make_rx(ptr, len) {
             // SAFETY: `ptr`/`len` came from `alloc_rw` above.
             unsafe { free(ptr, len) };
             return None;
@@ -48,10 +64,67 @@ impl ExecutableBuffer {
     }
 }
 
+impl ExecutableArena {
+    /// Reserve the fixed-size arena as Read+Write memory. Individual pages become Read+Execute as
+    /// blocks are installed. Unsupported hosts and allocation failure both return `None`.
+    pub(crate) fn new() -> Option<Self> {
+        let page_len = page_size();
+        let len = EXECUTABLE_ARENA_LEN / page_len * page_len;
+        if len == 0 {
+            return None;
+        }
+        let ptr = alloc_rw(len)?;
+        Some(Self {
+            ptr,
+            len,
+            page_len,
+            used: 0,
+        })
+    }
+
+    /// Copy one block into the next page and seal that page Read+Execute.
+    pub(crate) fn install(&mut self, code: &[u8]) -> Option<*const u8> {
+        if code.is_empty() || code.len() > self.page_len || self.is_full() {
+            return None;
+        }
+        // SAFETY: `used < len`, both values are page-aligned, and this page has not previously
+        // been exposed or sealed.
+        let slot = unsafe { self.ptr.add(self.used) };
+        // SAFETY: the slot has `page_len` writable bytes and `code` fits in it.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), slot, code.len()) };
+        if !flush_instruction_cache(slot, self.page_len) || !make_rx(slot, self.page_len) {
+            return None;
+        }
+        self.used += self.page_len;
+        Some(slot)
+    }
+
+    pub(crate) fn is_full(&self) -> bool {
+        self.used == self.len
+    }
+
+    pub(crate) fn slot_len(&self) -> usize {
+        self.page_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used_slots(&self) -> usize {
+        self.used / self.page_len
+    }
+}
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         // SAFETY: `self.ptr`/`self.len` were produced together by `alloc_rw` in `new` and never
         // mutated afterward.
+        unsafe { free(self.ptr, self.len) };
+    }
+}
+
+impl Drop for ExecutableArena {
+    fn drop(&mut self) {
+        // SAFETY: this is the original base and length returned by `alloc_rw`. Some pages have
+        // since become Read+Execute, which does not change how the allocation is released.
         unsafe { free(self.ptr, self.len) };
     }
 }
@@ -82,6 +155,12 @@ mod os {
         ) -> i32;
         fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> i32;
         fn GetSystemInfo(lpSystemInfo: *mut SystemInfo);
+        fn GetCurrentProcess() -> *mut c_void;
+        fn FlushInstructionCache(
+            hProcess: *mut c_void,
+            lpBaseAddress: *const c_void,
+            dwSize: usize,
+        ) -> i32;
     }
 
     // Layout matches the real Win32 SYSTEM_INFO on x86-64 (48 bytes): a 4-byte
@@ -123,6 +202,10 @@ mod os {
     pub(super) fn make_rx(ptr: *mut u8, len: usize) -> bool {
         let mut old = 0u32;
         unsafe { VirtualProtect(ptr as *mut c_void, len, PAGE_EXECUTE_READ, &mut old) != 0 }
+    }
+
+    pub(super) fn flush_instruction_cache(ptr: *mut u8, len: usize) -> bool {
+        unsafe { FlushInstructionCache(GetCurrentProcess(), ptr as *const c_void, len) != 0 }
     }
 
     pub(super) unsafe fn free(ptr: *mut u8, _len: usize) {
@@ -185,6 +268,9 @@ mod os {
     pub(super) fn make_rx(ptr: *mut u8, len: usize) -> bool {
         unsafe { mprotect(ptr as *mut c_void, len, PROT_READ | PROT_EXEC) == 0 }
     }
+    pub(super) fn flush_instruction_cache(_ptr: *mut u8, _len: usize) -> bool {
+        true
+    }
 
     pub(super) unsafe fn free(ptr: *mut u8, len: usize) {
         unsafe {
@@ -207,10 +293,17 @@ mod os {
     pub(super) fn make_rx(_ptr: *mut u8, _len: usize) -> bool {
         false
     }
+    pub(super) fn flush_instruction_cache(_ptr: *mut u8, _len: usize) -> bool {
+        false
+    }
     pub(super) unsafe fn free(_ptr: *mut u8, _len: usize) {}
 }
 
-use os::{alloc_rw, free, make_rx, page_size};
+use os::{alloc_rw, flush_instruction_cache, free, make_rx, page_size};
+
+pub(crate) fn host_page_len() -> usize {
+    page_size()
+}
 
 #[cfg(test)]
 #[path = "exec_mem_test.rs"]

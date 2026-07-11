@@ -382,8 +382,8 @@ impl CpuGsw {
                                 Ok(clocks(11))
                             }
                             7 => {
-                                // INVLPG m: privileged on the 486. Flush the whole TLB (a
-                                // single-page invalidate is a permitted superset).
+                                // INVLPG m: privileged on the 486. The operand supplies an address;
+                                // its memory contents are not read.
                                 self.require_isa_generation(IsaGeneration::I486)?;
                                 if self.current_privilege_level() != 0 {
                                     return Err(InternalFault::Exception {
@@ -391,7 +391,16 @@ impl CpuGsw {
                                         error_code: None,
                                     });
                                 }
-                                self.flush_tlb_and_code_caches();
+                                let linear =
+                                    self.segment_linear_byte(memory.segment, memory.offset, false)?;
+                                self.tlb.invalidate(linear >> 12);
+                                #[cfg(all(
+                                    feature = "jit",
+                                    target_arch = "x86_64",
+                                    any(target_os = "windows", target_os = "linux")
+                                ))]
+                                self.jit_fast_map.invalidate_page(linear);
+                                self.invalidate_code_caches();
                                 Ok(clocks(12))
                             }
                             _ => Err(undefined_opcode()),

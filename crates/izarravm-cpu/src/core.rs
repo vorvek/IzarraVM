@@ -80,7 +80,7 @@ impl CpuGsw {
         self.materialized_eflags()
     }
 
-    fn invalidate_code_caches(&mut self) {
+    pub(super) fn invalidate_code_caches(&mut self) {
         self.perf.decode_inval_other += 1;
         self.perf.code_invalidations += 1;
         self.invalidate_code_caches_uncounted();
@@ -112,16 +112,30 @@ impl CpuGsw {
         // through here, so this is the structural hook for the decode cache too: a remap can make
         // the same linear address decode differently (D-bit aliasing, page remap), so invalidate.
         self.decode_cache.invalidate();
+        #[cfg(feature = "jit")]
+        self.jit_direct.clear();
     }
 
     fn invalidate_direct_pages(&mut self) {
         self.data_read_pages.invalidate();
         self.data_write_pages.invalidate();
         self.fetch_page.invalidate();
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_fast_map.invalidate_all();
     }
 
     pub(super) fn flush_tlb_and_code_caches(&mut self) {
         self.tlb.flush();
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_fast_map.invalidate_all();
         self.invalidate_code_caches();
     }
 
@@ -182,6 +196,8 @@ impl CpuGsw {
     #[inline]
     pub(super) fn note_code_write(&mut self, physical: u32, width: u32) {
         if self.decode_cache.range_hits_code(physical, width) {
+            #[cfg(feature = "jit")]
+            self.jit_direct.clear();
             if self.profile.enabled {
                 // Flush-source census (64-byte physical blocks): locates the code/data byte
                 // sharing behind a residual SMC flush storm. Off the common path (flushes only).

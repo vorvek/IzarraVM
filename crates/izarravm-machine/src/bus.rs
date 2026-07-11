@@ -150,6 +150,12 @@ impl MachineBus<'_> {
     }
 }
 
+impl Drop for MachineBus<'_> {
+    fn drop(&mut self) {
+        self.vega.finish_mode13_direct_batch();
+    }
+}
+
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
 /// physical address with bit 20 set folds down by 0x100000, so a real-mode
 /// program reaching 0x100000-0x10FFEF (the most a seg:off pair can address) wraps
@@ -300,6 +306,19 @@ impl CpuBus for MachineBus<'_> {
             return Ok(None);
         }
         let physical_page = gated & !(RAM_LOOKUP_PAGE_MASK as u32);
+        if matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
+            && (izarravm_video::VGA_MODE13H_BASE
+                ..izarravm_video::VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE)
+                .contains(&physical_page)
+            && let Some(ptr) = self.vega.mode13_direct_page(physical_page)
+        {
+            return Ok(Some(DirectPage {
+                physical_page,
+                ptr,
+                len: RAM_LOOKUP_PAGE_SIZE,
+                writable: kind == BusAccessKind::DataWrite,
+            }));
+        }
         let Some((start, end)) = self.direct_ram_bytes(physical_page, RAM_LOOKUP_PAGE_SIZE) else {
             return Ok(None);
         };
@@ -321,6 +340,24 @@ impl CpuBus for MachineBus<'_> {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        let video_end = izarravm_video::VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
+        if address >= izarravm_video::VGA_MODE13H_BASE
+            && address
+                .checked_add(width.bytes())
+                .is_some_and(|end| end <= video_end)
+        {
+            if kind == BusAccessKind::DataWrite {
+                self.vega
+                    .note_mode13_direct_write(address, width.bytes() as usize);
+            }
+            let ws = if self.active_mode.uses_approximate_timing() {
+                video_wait_states_approx(self.active_mode.persona())
+            } else {
+                self.wait_states.video
+            };
+            self.trace.record(kind, address, width, ws);
+            return Ok(());
+        }
         // Only the CPU's DirectPageCache fast paths call this, and a live entry
         // guarantees cacheable RAM under the current A20 state: `direct_page`
         // installs a page only when `apply_a20` is the identity for it (an A20
@@ -1203,8 +1240,18 @@ impl CpuBus for MachineBus<'_> {
             || self.serial2.write_port(port, value as u8)
             || self.lpt.write_port(port, value as u8)
             || self.lpt2.write_port(port, value as u8)
-            || (self.vega.port_enabled(port) && self.vega.write_port(port, value as u8))
-            || self.pit.write_port(port, value as u8)
+        {
+            return Ok(());
+        }
+        let mode13_direct_before = self.vega.mode13_direct_page_available();
+        if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
+            if self.vega.mode13_direct_page_available() != mode13_direct_before {
+                *self.direct_map_changed = true;
+                *self.io_touched = true;
+            }
+            return Ok(());
+        }
+        if self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
             || self.keyboard.write_port(port, value as u8)
             || self
@@ -1227,11 +1274,9 @@ impl CpuBus for MachineBus<'_> {
 
     #[inline]
     fn requires_step_break(&self) -> bool {
-        // The exact condition the batch loop checks after each instruction: a port access touched
-        // time-dependent device state, or an HLE software interrupt is pending. The straight-line
-        // run executor ends its run on this so the machine services it at the old per-instruction
-        // boundary.
-        *self.io_touched || self.pending_soft_int.is_some()
+        // End at the instruction boundary for time-dependent I/O, an HLE
+        // interrupt, or a device-map change that makes a cached page stale.
+        *self.io_touched || *self.direct_map_changed || self.pending_soft_int.is_some()
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
