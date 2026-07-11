@@ -189,13 +189,14 @@ fn debug_snapshot_records_producer_consumer_and_callback_pressure() {
     };
 
     sink.queue(&[(1, -1), (2, -2)]);
+    let queue_depth_before = ring.len();
     let mut source = CallbackSource::with_debug(Arc::clone(&ring), Some(Arc::clone(&debug)));
     source.prefill_remaining = 0;
     while !ring.is_empty() {
         source.next();
     }
     source.next();
-    source.flush_debug_callback(Some(TARGET_FRAMES + 2));
+    source.flush_debug_callback(Some(queue_depth_before));
 
     let oversized = vec![(3, -3); CAPACITY_FRAMES * 2];
     sink.queue(&oversized);
