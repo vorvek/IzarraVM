@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
 };
 
@@ -69,12 +69,14 @@ struct LinkTarget {
 #[repr(C)]
 struct LinkCell {
     body: AtomicUsize,
+    target_eip: AtomicU32,
 }
 
 impl LinkCell {
     fn new() -> Self {
         Self {
             body: AtomicUsize::new(0),
+            target_eip: AtomicU32::new(0),
         }
     }
 
@@ -87,6 +89,11 @@ impl LinkCell {
     }
 
     fn set(&self, body: usize) {
+        self.body.store(body, Ordering::Release);
+    }
+
+    fn set_dynamic(&self, target_eip: u32, body: usize) {
+        self.target_eip.store(target_eip, Ordering::Relaxed);
         self.body.store(body, Ordering::Release);
     }
 
@@ -284,6 +291,7 @@ pub(crate) struct CompiledBlock {
     has_x87: bool,
     x87_entry_top: u8,
     x87_exit_top: u8,
+    dynamic_successor: bool,
     successors: [Option<LinkTarget>; 2],
 }
 
@@ -435,7 +443,9 @@ pub(crate) struct BlockCache {
     physical_keys: HashMap<u32, Vec<BlockKey>, U32BuildHasher>,
     blocks: Vec<CompiledBlock>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
+    link_sources: HashMap<usize, LinkSource>,
     outbound: Vec<[Option<BlockId>; 2]>,
+    dynamic_next_slots: Vec<u8>,
     inbound: HashMap<BlockId, Vec<LinkSource>>,
     waiting: HashMap<LinkTarget, Vec<LinkSource>>,
     linear_blocks: HashMap<LinkTarget, BlockId>,
@@ -473,7 +483,9 @@ impl BlockCache {
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
             link_cells: Vec::new(),
+            link_sources: HashMap::new(),
             outbound: Vec::new(),
+            dynamic_next_slots: Vec::new(),
             inbound: HashMap::new(),
             waiting: HashMap::new(),
             linear_blocks: HashMap::new(),
@@ -615,12 +627,14 @@ impl BlockCache {
             has_x87: compilation.has_x87,
             x87_entry_top: compilation.x87_entry_top,
             x87_exit_top: compilation.x87_exit_top,
+            dynamic_successor: compilation.dynamic_successor,
             successors: compilation.successors,
         };
         if index == self.blocks.len() {
             self.blocks.push(block);
             self.link_cells.push(compilation.link_cells.clone());
             self.outbound.push([None, None]);
+            self.dynamic_next_slots.push(0);
             self.block_link_epochs.push(0);
             self.block_active.push(true);
         } else {
@@ -628,8 +642,14 @@ impl BlockCache {
             self.blocks[index] = block;
             self.link_cells[index] = compilation.link_cells.clone();
             self.outbound[index] = [None, None];
+            self.dynamic_next_slots[index] = 0;
             self.block_link_epochs[index] = 0;
             self.block_active[index] = true;
+        }
+        if compilation.dynamic_successor {
+            let cell = &compilation.link_cells[0];
+            self.link_sources
+                .insert(cell.address(), LinkSource { block: id, slot: 0 });
         }
         self.code_watch
             .mark_refcounted_range(span.key.physical, u32::from(span.guest_len));
@@ -797,6 +817,49 @@ impl BlockCache {
         self.active_index(block.id)
             .and_then(|index| self.link_cells.get(index))
             .is_some_and(|cells| cells[0].linked() || cells[1].linked())
+    }
+
+    /// Bind one observed near-RET target to a target-checked successor cell. Dynamic targets are
+    /// deliberately not added to `waiting`: if the target is not link-visible yet, a later RET
+    /// observation retries after normal admission has had a chance to compile it.
+    pub(crate) fn bind_dynamic_successor(
+        &mut self,
+        site_cell: usize,
+        target_eip: u32,
+        target_linear: u32,
+        mode_key: u32,
+    ) -> bool {
+        let Some(source) = self.link_sources.get(&site_cell).copied() else {
+            return false;
+        };
+        if source.slot != 0 {
+            return false;
+        }
+        let Some(source_index) = self.active_index(source.block) else {
+            return false;
+        };
+        if !self.blocks[source_index].dynamic_successor {
+            return false;
+        }
+        let target_key = LinkTarget {
+            linear: target_linear,
+            mode_key,
+        };
+        let Some(target) = self.linear_blocks.get(&target_key).copied() else {
+            return false;
+        };
+        if let Some(slot) = self.outbound[source_index]
+            .iter()
+            .position(|outbound| *outbound == Some(target))
+        {
+            return self.try_link_inner(source.block, slot as u8, target, Some(target_eip));
+        }
+        let slot = self.outbound[source_index]
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| usize::from(self.dynamic_next_slots[source_index] & 1));
+        self.dynamic_next_slots[source_index] = ((slot + 1) & 1) as u8;
+        self.try_link_inner(source.block, slot as u8, target, Some(target_eip))
     }
 
     pub(crate) fn defer_short_enabled(&self) -> bool {
@@ -1002,7 +1065,9 @@ impl BlockCache {
         self.physical_keys.clear();
         self.blocks.clear();
         self.link_cells.clear();
+        self.link_sources.clear();
         self.outbound.clear();
+        self.dynamic_next_slots.clear();
         self.inbound.clear();
         self.waiting.clear();
         self.linear_blocks.clear();
@@ -1058,6 +1123,16 @@ impl BlockCache {
     }
 
     fn try_link(&mut self, source: BlockId, slot: u8, target: BlockId) -> bool {
+        self.try_link_inner(source, slot, target, None)
+    }
+
+    fn try_link_inner(
+        &mut self,
+        source: BlockId,
+        slot: u8,
+        target: BlockId,
+        target_eip: Option<u32>,
+    ) -> bool {
         let Some(source_index) = self.active_index(source) else {
             return false;
         };
@@ -1072,10 +1147,19 @@ impl BlockCache {
         }
         let slot_index = usize::from(slot);
         if self.outbound[source_index][slot_index] == Some(target) {
+            if let Some(target_eip) = target_eip {
+                self.link_cells[source_index][slot_index]
+                    .set_dynamic(target_eip, self.blocks[target_index].body_ptr());
+            }
             return true;
         }
         self.unlink_outbound(source, slot);
-        self.link_cells[source_index][slot_index].set(self.blocks[target_index].body_ptr());
+        if let Some(target_eip) = target_eip {
+            self.link_cells[source_index][slot_index]
+                .set_dynamic(target_eip, self.blocks[target_index].body_ptr());
+        } else {
+            self.link_cells[source_index][slot_index].set(self.blocks[target_index].body_ptr());
+        }
         self.outbound[source_index][slot_index] = Some(target);
         self.inbound.entry(target).or_default().push(LinkSource {
             block: source,
@@ -1149,6 +1233,10 @@ impl BlockCache {
             return;
         };
         let span = self.blocks[index].span;
+        if self.blocks[index].dynamic_successor {
+            self.link_sources
+                .remove(&self.link_cells[index][0].address());
+        }
         self.code_watch
             .unmark_refcounted_range(span.key.physical, u32::from(span.guest_len));
         self.unlink_block(id);
@@ -1261,6 +1349,8 @@ pub(crate) struct NativeExit {
     pub(crate) linked_transfers: u32,
     pub(crate) unresolved_exits: u32,
     pub(crate) trace_ptr: usize,
+    pub(crate) dynamic_link_cell: usize,
+    pub(crate) dynamic_target_eip: u32,
 }
 
 pub(crate) struct Compilation {
@@ -1282,6 +1372,7 @@ pub(crate) struct Compilation {
     pub has_x87: bool,
     pub x87_entry_top: u8,
     pub x87_exit_top: u8,
+    dynamic_successor: bool,
     successors: [Option<LinkTarget>; 2],
     link_cells: [Arc<LinkCell>; 2],
     body_offset: usize,
@@ -2242,6 +2333,10 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         linear: entry_lin.wrapping_add(u32::from(span.guest_len)),
         mode_key: key.mode_key,
     };
+    let dynamic_successor = matches!(
+        slots.last().map(|slot| slot.kind),
+        Some(DirectKind::Ret { .. })
+    );
     let successors = match slots.last().map(|slot| slot.kind) {
         Some(DirectKind::Jcc { taken_delta, .. }) => [
             Some(fallthrough),
@@ -2304,6 +2399,7 @@ pub(crate) fn compile(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<Compi
         has_x87: x87_slots != 0,
         x87_entry_top,
         x87_exit_top,
+        dynamic_successor,
         successors,
         link_cells,
         body_offset: emitted.body_offset,
@@ -3405,7 +3501,14 @@ fn emit(input: EmitInput<'_>) -> EmittedCode {
                 completed_byte_reads += slot.kind.byte_reads();
                 completed_word_reads += slot.kind.word_reads();
                 completed_dword_reads += slot.kind.dword_reads();
-                emit_completed_dynamic_path(&mut e, span, Reg::RDX, shared_return, full_accounting);
+                emit_completed_dynamic_path(
+                    &mut e,
+                    span,
+                    Reg::RDX,
+                    link_cell_ptrs,
+                    shared_return,
+                    full_accounting,
+                );
                 terminal = true;
                 break;
             }
@@ -3781,6 +3884,7 @@ fn emit_completed_dynamic_path(
     e: &mut Encoder,
     span: BlockSpan,
     target: Reg,
+    link_cells: [usize; 2],
     shared_return: Label,
     accounting: StaticAccounting,
 ) {
@@ -3792,6 +3896,51 @@ fn emit_completed_dynamic_path(
         StaticAccounting::default(),
         true,
         accounting,
+    );
+    e.load_r32_disp32(Reg::RDX, Reg::R15, eip_offset());
+    let bind = e.label();
+    e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_QUOTA);
+    e.sub_r64_imm32(Reg::RDI, 1);
+    e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RDI);
+    for link_cell in link_cells {
+        let next = e.label();
+        e.mov_r64_imm64(Reg::RAX, link_cell as u64);
+        e.load_r64_disp8(
+            Reg::RCX,
+            Reg::RAX,
+            core::mem::offset_of!(LinkCell, body) as i8,
+        );
+        e.cmp_r64_imm32(Reg::RCX, 0);
+        e.jz(next);
+        e.cmp_r32_disp8(
+            Reg::RDX,
+            Reg::RAX,
+            core::mem::offset_of!(LinkCell, target_eip) as i8,
+        );
+        e.jnz(next);
+        e.cmp_r64_imm32(Reg::RDI, 0);
+        e.jz(shared_return);
+        emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, linked_transfers));
+        e.xor_r64_self(Reg::RDI);
+        e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RDI);
+        e.jmp_r64(Reg::RCX);
+        e.place(next);
+    }
+    e.cmp_r64_imm32(Reg::RDI, 0);
+    e.jz(bind);
+    emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, unresolved_exits));
+    e.place(bind);
+    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
+    e.mov_r64_imm64(Reg::RCX, link_cells[0] as u64);
+    e.store_r64_disp32(
+        Reg::RAX,
+        core::mem::offset_of!(NativeExit, dynamic_link_cell) as i32,
+        Reg::RCX,
+    );
+    e.store_r32_disp32(
+        Reg::RAX,
+        core::mem::offset_of!(NativeExit, dynamic_target_eip) as i32,
+        Reg::RDX,
     );
     e.jmp(shared_return);
 }
@@ -5540,6 +5689,7 @@ mod tests {
             has_x87: false,
             x87_entry_top: 0,
             x87_exit_top: 0,
+            dynamic_successor: false,
             successors: [None, None],
             link_cells: [Arc::new(LinkCell::new()), Arc::new(LinkCell::new())],
             body_offset: 0,
@@ -5558,6 +5708,21 @@ mod tests {
         cache
             .install(&trivial_compilation(span))
             .expect("test block must install")
+    }
+
+    #[cfg(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    fn install_dynamic_trivial(cache: &mut BlockCache, key: BlockKey) -> BlockId {
+        assert!(matches!(cache.probe(key), BlockProbe::Interpret));
+        assert!(matches!(cache.probe(key), BlockProbe::Compile));
+        let span = BlockSpan::new(key, 1, 1).expect("test block must be page local");
+        let mut compilation = trivial_compilation(span);
+        compilation.dynamic_successor = true;
+        cache
+            .install(&compilation)
+            .expect("dynamic test block must install")
     }
 
     #[test]
@@ -5778,6 +5943,210 @@ mod tests {
         cache.clear();
         assert!(!cells[0].linked());
         assert!(!cells[1].linked());
+    }
+
+    #[cfg(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
+        let mut cache = BlockCache::default();
+        let source = key(0x1000);
+        let first = key(0x1100);
+        let second = key(0x1200);
+        let third = key(0x1300);
+        let source_id = install_dynamic_trivial(&mut cache, source);
+        install_trivial(&mut cache, first, 1);
+        install_trivial(&mut cache, second, 1);
+        install_trivial(&mut cache, third, 1);
+        let cells = cache.link_cells[source_id.index()].clone();
+        let site_cell = cells[0].address();
+
+        assert!(cache.bind_dynamic_successor(
+            site_cell,
+            first.linear,
+            first.linear,
+            first.mode_key
+        ));
+        assert!(cache.bind_dynamic_successor(
+            site_cell,
+            second.linear,
+            second.linear,
+            second.mode_key
+        ));
+        assert!(cells[0].linked());
+        assert!(cells[1].linked());
+        assert_eq!(cells[0].target_eip.load(Ordering::Acquire), first.linear);
+        assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
+        let cell_addresses = [cells[0].address(), cells[1].address()];
+        let old_bodies = [
+            cells[0].body.load(Ordering::Acquire),
+            cells[1].body.load(Ordering::Acquire),
+        ];
+        assert!(cache.compact_arena());
+        assert_eq!([cells[0].address(), cells[1].address()], cell_addresses);
+        assert_ne!(
+            [
+                cells[0].body.load(Ordering::Acquire),
+                cells[1].body.load(Ordering::Acquire),
+            ],
+            old_bodies
+        );
+        assert_eq!(cells[0].target_eip.load(Ordering::Acquire), first.linear);
+        assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
+
+        assert!(cache.bind_dynamic_successor(
+            site_cell,
+            third.linear,
+            third.linear,
+            third.mode_key
+        ));
+        assert_eq!(cells[0].target_eip.load(Ordering::Acquire), third.linear);
+        assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
+        assert!(cells[0].linked());
+        assert!(cells[1].linked());
+
+        assert_eq!(cache.invalidate_physical_range(first.physical, 1), 1);
+        assert!(cells[0].linked());
+        assert!(cells[1].linked());
+        assert_eq!(cache.invalidate_physical_range(second.physical, 1), 1);
+        assert!(cells[0].linked());
+        assert!(!cells[1].linked());
+        assert_eq!(cache.invalidate_physical_range(third.physical, 1), 1);
+        assert!(!cells[0].linked());
+
+        assert_eq!(cache.invalidate_physical_range(source.physical, 1), 1);
+        assert!(!cache.bind_dynamic_successor(
+            site_cell,
+            first.linear,
+            first.linear,
+            first.mode_key
+        ));
+        let stats = cache.take_stats();
+        assert_eq!(stats.links, 3);
+        assert_eq!(stats.unlinks, 3);
+    }
+
+    #[cfg(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn dynamic_ret_pic_requires_matching_x87_chain_top_and_kind() {
+        let mut cache = BlockCache::default();
+        let source = key(0x1000);
+        let wrong_top = key(0x1100);
+        let integer = key(0x1200);
+        let matching_top = key(0x1300);
+
+        assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+        assert!(matches!(cache.probe(source), BlockProbe::Compile));
+        let mut source_compilation =
+            trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+        source_compilation.has_x87 = true;
+        source_compilation.x87_entry_top = 1;
+        source_compilation.x87_exit_top = 3;
+        source_compilation.dynamic_successor = true;
+        let source_id = cache
+            .install(&source_compilation)
+            .expect("x87 source install");
+        let site_cell = cache.link_cells[source_id.index()][0].address();
+
+        assert!(matches!(cache.probe(wrong_top), BlockProbe::Interpret));
+        assert!(matches!(cache.probe(wrong_top), BlockProbe::Compile));
+        let mut wrong_top_compilation =
+            trivial_compilation(BlockSpan::new(wrong_top, 1, 1).expect("wrong-top span"));
+        wrong_top_compilation.has_x87 = true;
+        wrong_top_compilation.x87_entry_top = 2;
+        wrong_top_compilation.x87_exit_top = 2;
+        cache
+            .install(&wrong_top_compilation)
+            .expect("wrong-top install");
+        install_trivial(&mut cache, integer, 1);
+
+        assert!(!cache.bind_dynamic_successor(
+            site_cell,
+            wrong_top.linear,
+            wrong_top.linear,
+            wrong_top.mode_key
+        ));
+        assert!(!cache.bind_dynamic_successor(
+            site_cell,
+            integer.linear,
+            integer.linear,
+            integer.mode_key
+        ));
+
+        assert!(matches!(cache.probe(matching_top), BlockProbe::Interpret));
+        assert!(matches!(cache.probe(matching_top), BlockProbe::Compile));
+        let mut matching_compilation =
+            trivial_compilation(BlockSpan::new(matching_top, 1, 1).expect("matching span"));
+        matching_compilation.has_x87 = true;
+        matching_compilation.x87_entry_top = 3;
+        matching_compilation.x87_exit_top = 3;
+        cache
+            .install(&matching_compilation)
+            .expect("matching install");
+        assert!(cache.bind_dynamic_successor(
+            site_cell,
+            matching_top.linear,
+            matching_top.linear,
+            matching_top.mode_key
+        ));
+        assert!(cache.link_cells[source_id.index()][0].linked());
+    }
+
+    #[cfg(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn dynamic_ret_pic_stays_unlinked_until_both_translation_epochs_are_current() {
+        let mut cache = BlockCache::default();
+        let source = key(0x1000);
+        let target = key(0x1100);
+        let source_id = install_dynamic_trivial(&mut cache, source);
+        install_trivial(&mut cache, target, 1);
+        let cell = cache.link_cells[source_id.index()][0].clone();
+        let site_cell = cell.address();
+        assert!(cache.bind_dynamic_successor(
+            site_cell,
+            target.linear,
+            target.linear,
+            target.mode_key
+        ));
+        assert!(cell.linked());
+
+        cache.invalidate_translation();
+        assert!(!cell.linked());
+        assert_eq!(cell.target_eip.load(Ordering::Acquire), target.linear);
+        assert!(!cache.bind_dynamic_successor(
+            site_cell,
+            target.linear,
+            target.linear,
+            target.mode_key
+        ));
+
+        cache
+            .refresh_decode_residency(source, 1)
+            .expect("source revalidation");
+        assert!(!cache.bind_dynamic_successor(
+            site_cell,
+            target.linear,
+            target.linear,
+            target.mode_key
+        ));
+        cache
+            .refresh_decode_residency(target, 1)
+            .expect("target revalidation");
+        assert!(cache.bind_dynamic_successor(
+            site_cell,
+            target.linear,
+            target.linear,
+            target.mode_key
+        ));
+        assert!(cell.linked());
     }
 
     #[cfg(any(
