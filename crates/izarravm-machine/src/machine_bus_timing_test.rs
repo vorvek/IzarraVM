@@ -1424,6 +1424,170 @@ fn direct_memory_helpers_accept_only_page_local_ram() {
 }
 
 #[test]
+fn canonical_mode13_page_round_trips_through_the_cpu_cache() {
+    const RESULT_OFFSET: u32 = 0x0130;
+    const PROGRAM: &[u8] = &[
+        0xB8, 0x00, 0xA0, // mov ax,A000h
+        0x8E, 0xC0, // mov es,ax
+        0xBF, 0x34, 0x12, // mov di,1234h
+        0xB0, 0x5A, // mov al,5Ah
+        0x26, 0x88, 0x05, // mov es:[di],al
+        0x30, 0xC0, // xor al,al
+        0x26, 0x8A, 0x05, // mov al,es:[di]
+        0xA2, 0x30, 0x01, // mov [0130h],al
+        0xCD, 0x20, // int 20h
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    with_bus(&mut machine, |bus| {
+        let page = bus
+            .direct_page(0xA_1234, BusAccessKind::DataWrite)
+            .unwrap()
+            .expect("stock chained Mode 13h page is direct");
+        assert_eq!(page.physical_page, 0xA_1000);
+        assert!(page.writable);
+    });
+    machine.cpu.reset_perf_counters();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    let result = (u32::from(DOS_LOAD_SEGMENT) << 4) + RESULT_OFFSET;
+    assert_eq!(machine.read_physical_u8(result), 0x5A);
+    assert_eq!(machine.video().cpu_read_chain4(0x1234), 0x5A);
+    let perf = machine.cpu.perf_counters();
+    assert!(perf.direct_data_pointer_reads > 0);
+    assert!(perf.direct_data_pointer_writes > 0);
+}
+
+#[test]
+fn int10_invalidates_direct_pages_only_when_availability_changes() {
+    let mut machine = test_machine();
+    assert!(machine.set_vga_mode(0x13));
+    machine.direct_map_changed = false;
+
+    machine.cpu.registers.set_eax(0x0E41);
+    machine.cpu.registers.set_ebx(0x000F);
+    machine.handle_int10();
+    assert!(
+        !machine.direct_map_changed,
+        "teletype output keeps the canonical Mode 13h mapping"
+    );
+
+    machine.cpu.registers.set_eax(0x0003);
+    machine.handle_int10();
+    assert!(
+        machine.direct_map_changed,
+        "leaving Mode 13h invalidates the direct mapping"
+    );
+}
+
+#[test]
+fn mode13_direct_write_materializes_before_mode_x() {
+    const PROGRAM: &[u8] = &[
+        0xB8, 0x00, 0xA0, // mov ax,A000h
+        0x8E, 0xC0, // mov es,ax
+        0xBF, 0x34, 0x12, // mov di,1234h
+        0xB0, 0x6B, // mov al,6Bh
+        0x26, 0x88, 0x05, // mov es:[di],al
+        0xBA, 0xC4, 0x03, // mov dx,3C4h
+        0xB0, 0x04, // mov al,04h
+        0xEE, // out dx,al
+        0x42, // inc dx
+        0xB0, 0x06, // mov al,06h (chain-4 off)
+        0xEE, // out dx,al
+        0xCD, 0x20, // int 20h
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    machine.cpu.reset_perf_counters();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    assert_eq!(machine.video().active_mode(), VideoMode::ModeX);
+    assert_eq!(machine.video().plane_byte(0, 0x1234 >> 2), 0x6B);
+    with_bus(&mut machine, |bus| {
+        assert!(
+            bus.direct_page(0xA_1234, BusAccessKind::DataRead)
+                .unwrap()
+                .is_none(),
+            "unchained layout falls back to the planar handler"
+        );
+    });
+    assert!(
+        machine.cpu.perf_counters().direct_map_invalidations >= 2,
+        "mode set and chain-4 transition each invalidate cached pages"
+    );
+}
+
+#[test]
+fn pending_crtc_start_ends_a_lazy_ring0_direct_page_run() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+    assert!(machine.set_vga_mode(0x13));
+
+    with_bus(&mut machine, |bus| {
+        *bus.direct_map_changed = false;
+        *bus.io_touched = false;
+        assert!(
+            bus.direct_page(0xA_0000, BusAccessKind::DataRead)
+                .unwrap()
+                .is_some()
+        );
+
+        bus.write_io(0x3D4, BusWidth::Byte, 0x0C, true).unwrap();
+        bus.write_io(0x3D5, BusWidth::Byte, 0x01, true).unwrap();
+
+        assert!(
+            *bus.io_touched,
+            "a VGA decode change ends even a lazy ring-0 batch"
+        );
+        assert!(*bus.direct_map_changed);
+        assert!(bus.requires_step_break());
+        assert!(
+            bus.direct_page(0xA_0000, BusAccessKind::DataRead)
+                .unwrap()
+                .is_none(),
+            "a pending noncanonical start address removes the direct page"
+        );
+    });
+}
+
+#[test]
+fn mode13_direct_write_moves_frame_generation_once() {
+    const PROGRAM: &[u8] = &[
+        0xB8, 0x00, 0xA0, // mov ax,A000h
+        0x8E, 0xC0, // mov es,ax
+        0xBF, 0x34, 0x12, // mov di,1234h
+        0xB0, 0x7C, // mov al,7Ch
+        0x26, 0x88, 0x05, // mov es:[di],al
+        0x47, // inc di
+        0xB0, 0x7D, // mov al,7Dh
+        0x26, 0x88, 0x05, // mov es:[di],al
+        0xCD, 0x20, // int 20h
+    ];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    let content_before = machine.video().content_gen();
+    let frame_before = machine.frame_generation();
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    assert_eq!(machine.video().content_gen(), content_before + 1);
+    assert_ne!(machine.frame_generation(), frame_before);
+    assert_eq!(machine.video().cpu_read_chain4(0x1234), 0x7C);
+    assert_eq!(machine.video().cpu_read_chain4(0x1235), 0x7D);
+}
+
+#[test]
 fn ram_lookup_does_not_expose_partial_final_pages_as_full_pages() {
     let vega = Vega::default();
     let lookup = RamPageLookup::new(RAM_LOOKUP_PAGE_SIZE + 17, &vega);

@@ -71,6 +71,14 @@ fn refill_credit_clamps_a_stall() {
 }
 
 #[test]
+fn pacing_sleeps_only_when_the_guest_is_caught_up() {
+    assert!(emulation_should_sleep(-1, false));
+    assert!(emulation_should_sleep(0, false));
+    assert!(!emulation_should_sleep(1, false));
+    assert!(emulation_should_sleep(1, true));
+}
+
+#[test]
 fn speed_sample_marks_exactly_ninety_percent_hlt_as_idle() {
     let wall = Duration::from_secs(1);
     assert!(!speed_sample(100, 899, 1_000, wall).1);

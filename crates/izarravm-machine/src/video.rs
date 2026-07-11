@@ -29,11 +29,13 @@ impl Machine {
 
     #[cfg(test)]
     pub(crate) fn video_mut(&mut self) -> &mut Vga {
+        self.direct_map_changed = true;
         self.vega.legacy_mut()
     }
 
     pub fn set_vga_mode_0dh(&mut self) {
         self.vega.legacy_mut().set_mode_0dh();
+        self.direct_map_changed = true;
     }
 
     /// Select a VGA graphics mode by its INT 10h number from the host side. Returns
@@ -47,6 +49,7 @@ impl Machine {
         let ok = self.vega.legacy_mut().set_mode_with_clear(mode, clear);
         if ok {
             self.vega.select_legacy();
+            self.direct_map_changed = true;
         }
         ok
     }
@@ -108,6 +111,14 @@ impl Machine {
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
     pub(super) fn handle_int10(&mut self) {
+        let mode13_direct_before = self.vega.mode13_direct_page_available();
+        self.handle_int10_inner();
+        if self.vega.mode13_direct_page_available() != mode13_direct_before {
+            self.direct_map_changed = true;
+        }
+    }
+
+    fn handle_int10_inner(&mut self) {
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
         let al = ax as u8;

@@ -220,6 +220,20 @@ impl Encoder {
         self.bytes.extend_from_slice(&imm.to_le_bytes());
     }
 
+    /// `mov dword [base + disp32], imm32` (C7 /0 id, without REX.W).
+    pub(crate) fn store_u32_imm_disp32(&mut self, base: Reg, disp32: i32, imm: u32) {
+        if base.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.bytes.push(0xC7);
+        self.modrm(0b10, 0, base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.extend_from_slice(&disp32.to_le_bytes());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `mov dst32, src32` (32-bit move, no REX.W; used for passing a small u32 arg). REX byte is
     /// emitted only if an extended register is involved. Unit-tested but not yet called by the
     /// strcpy block's emitter (its u32 args are all compile-time constants, emitted via
@@ -473,6 +487,49 @@ impl Encoder {
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// A 32-bit register-register ALU operation. `op` is the x86 ALU group number used by both
+    /// the primary opcode families and group 1: ADD=0 through CMP=7.
+    pub(crate) fn alu_r32_r32(&mut self, op: u8, dst: Reg, src: Reg) {
+        const OPCODES: [u8; 8] = [0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39];
+        let opcode = OPCODES[usize::from(op)];
+        if src.ext() || dst.ext() {
+            self.rex(false, src.ext(), false, dst.ext());
+        }
+        self.bytes.push(opcode);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// A 32-bit group-1 immediate ALU operation (`81 /op id`).
+    pub(crate) fn alu_r32_imm32(&mut self, op: u8, dst: Reg, imm: u32) {
+        assert!(op < 8, "ALU group must fit three bits");
+        if dst.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.bytes.push(0x81);
+        self.modrm(0b11, op, dst.low3());
+        self.bytes.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `test dst32, src32` (85 /r).
+    pub(crate) fn test_r32_r32(&mut self, dst: Reg, src: Reg) {
+        if src.ext() || dst.ext() {
+            self.rex(false, src.ext(), false, dst.ext());
+        }
+        self.bytes.push(0x85);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// A 32-bit group-2 immediate shift (`C1 /op ib`).
+    pub(crate) fn shift_r32_imm8(&mut self, op: u8, dst: Reg, count: u8) {
+        assert!(op < 8, "shift group must fit three bits");
+        if dst.ext() {
+            self.rex(false, false, false, true);
+        }
+        self.bytes.push(0xC1);
+        self.modrm(0b11, op, dst.low3());
+        self.bytes.push(count);
+    }
+
     /// `movzx dst32, byte [base + index]` (0F B6 /r, mod=00, rm=100 SIB, scale=1, no REX.W) -- load a
     /// byte from `[base + index]` and zero-extend it to 32 bits (clearing the host register's upper 64
     /// bits). The native byte-load probe uses this for the final deref off the host page pointer plus
@@ -591,6 +648,24 @@ impl Encoder {
     pub(crate) fn test_al_al(&mut self) {
         self.bytes.push(0x84);
         self.bytes.push(0xC0);
+    }
+
+    pub(crate) fn pushfq(&mut self) {
+        self.bytes.push(0x9C);
+    }
+
+    pub(crate) fn popfq(&mut self) {
+        self.bytes.push(0x9D);
+    }
+
+    /// Emit a near conditional branch using the guest x86 condition-code nibble.
+    pub(crate) fn jcc(&mut self, condition: u8, target: Label) {
+        assert!(condition < 16, "condition code must fit four bits");
+        let instr_start = self.bytes.len();
+        self.bytes.push(0x0F);
+        self.bytes.push(0x80 | condition);
+        self.bytes.extend_from_slice(&0i32.to_le_bytes());
+        self.queue_or_resolve(instr_start, PatchKind::Rel32AfterJcc, target);
     }
 
     /// `jz label` (near, rel32; 0F 84 cd). Both forward and backward references are supported:

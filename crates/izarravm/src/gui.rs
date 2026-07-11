@@ -52,8 +52,8 @@ fn volume_gain(volume: f32) -> f32 {
     volume.clamp(0.0, 1.0).powi(3)
 }
 
-/// How long the emulation thread sleeps between work slices. The wall-clock
-/// catch-up pacing absorbs the coarse Windows timer granularity, so realtime
+/// How long the emulation thread sleeps when the guest is caught up. The
+/// wall-clock pacing absorbs the coarse Windows timer granularity, so realtime
 /// holds regardless of the exact wake interval as long as it stays well under
 /// the 50 ms master-tick budget cap.
 const EMU_SLICE: Duration = Duration::from_millis(1);
@@ -138,6 +138,10 @@ fn refill_credit(credit: i64, dt: Duration, cap: u64) -> i64 {
     let wall_ticks =
         (dt.as_nanos() * u128::from(MASTER_CLOCK_HZ) / 1_000_000_000).min(i64::MAX as u128) as i64;
     credit.saturating_add(wall_ticks).min(cap as i64)
+}
+
+fn emulation_should_sleep(credit: i64, terminal_stop: bool) -> bool {
+    terminal_stop || credit <= 0
 }
 
 fn duration_for_master_ticks(master_ticks: u64) -> Duration {
@@ -1062,6 +1066,7 @@ fn emulate(
         let cap = MASTER_CLOCK_HZ / 20;
         credit = refill_credit(credit, dt, cap);
         let budget = credit.max(0) as u64;
+        let mut terminal_stop = false;
         if budget > 0 {
             let before = machine.master_ticks();
             let stall_before = machine.io_stall_ticks();
@@ -1089,6 +1094,14 @@ fn emulate(
             } else {
                 tick_machine_ticks(&mut machine, budget)
             };
+            terminal_stop = matches!(
+                stop,
+                Some(
+                    StopReason::CpuError(_)
+                        | StopReason::DosExit { .. }
+                        | StopReason::TestExit { .. }
+                )
+            );
             let mut ran = machine.master_ticks().saturating_sub(before);
             // Some elapsed ticks may be a device-I/O stall. Drain the full
             // ran from the credit so the stall still costs wall-clock time, but
@@ -1203,7 +1216,9 @@ fn emulate(
             crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
         }
 
-        std::thread::sleep(EMU_SLICE);
+        if emulation_should_sleep(credit, terminal_stop) {
+            std::thread::sleep(EMU_SLICE);
+        }
     }
 }
 

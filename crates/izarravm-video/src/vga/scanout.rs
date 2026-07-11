@@ -455,11 +455,7 @@ impl Vga {
     /// The linear cache represents only the stock 320x200 Mode 13h address
     /// layout. Register-banged layouts use the planar address generator below.
     pub(super) fn canonical_mode13_linear_scanout(&self) -> bool {
-        self.mode13_linear_valid
-            && self.mode == VideoMode::Mode13h
-            && self.seq.memory_mode & 0x08 != 0
-            && self.attr.pixel_pan == 0
-            && self.crtc == CrtcTiming::mode13h()
+        self.mode13_linear_valid && self.canonical_mode13_layout()
     }
 
     /// Assemble one 256-color scanline, shared by chained mode 13h and unchained
@@ -1088,6 +1084,10 @@ impl Vga {
                 self.bump_content_gen();
             }
             self.crtc.start_address = addr; // latched for the next frame
+        }
+        if self.mode13_settle_frames != 0 {
+            self.content_gen = self.content_gen.wrapping_add(1);
+            self.mode13_settle_frames -= 1;
         }
         self.last_line = 0;
     }

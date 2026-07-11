@@ -10,9 +10,12 @@
 //! raster engine as the planar and mode-X paths; chain-4 only rewrites the CPU
 //! write/read decode.
 
+use std::cell::{Cell, RefCell};
+
 use crate::{
-    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS,
-    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS, VideoError, VideoMode,
+    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
+    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
+    VideoError, VideoMode,
 };
 mod scanout;
 mod timing;
@@ -37,6 +40,34 @@ const CGA_MODE_BW: u8 = 0x04;
 const CGA_MODE_VIDEO_ENABLE: u8 = 0x08;
 const CGA_MODE_HIGH_RES: u8 = 0x10;
 const CGA_MODE_BLINK: u8 = 0x20;
+const MODE13_DIRECT_PAGES: usize = VGA_PLANAR_WINDOW_SIZE as usize / 0x1000;
+
+#[derive(Debug, Clone)]
+struct Mode13ArgbCache {
+    words: Vec<u32>,
+    palette: [u32; DAC_ENTRIES],
+    width: usize,
+    height: usize,
+    display_height: usize,
+    frame: u64,
+    valid: bool,
+    converted_pixels: usize,
+}
+
+impl Default for Mode13ArgbCache {
+    fn default() -> Self {
+        Self {
+            words: Vec::new(),
+            palette: [0; DAC_ENTRIES],
+            width: 0,
+            height: 0,
+            display_height: 0,
+            frame: 0,
+            valid: false,
+            converted_pixels: 0,
+        }
+    }
+}
 
 /// CGA graphics framebuffer size: 16 KiB at B800:0000. Two 8000-byte banks
 /// (100 scanlines x 80 bytes each) hold the even and odd scanlines.
@@ -248,6 +279,15 @@ pub struct Vga {
     // authoritative; any write through a planar decode invalidates this cache.
     pub(crate) mode13_linear: Vec<u8>,
     pub(crate) mode13_linear_valid: bool,
+    // Direct CPU pages write the linear cache without passing through a byte
+    // mutator. Keep it authoritative until a planar or noncanonical path needs
+    // the four VGA planes, then materialize all 64 KiB once.
+    pub(crate) mode13_linear_authoritative: bool,
+    mode13_dirty_pages: Cell<u16>,
+    mode13_direct_batch_dirty: bool,
+    mode13_settle_frames: u8,
+    mode13_argb_full_dirty: Cell<bool>,
+    mode13_argb_cache: RefCell<Mode13ArgbCache>,
     pub(crate) crtc: CrtcTiming,
     pub(crate) crtc_regs: CrtcRegs,
     pub(crate) seq: Sequencer,
@@ -319,6 +359,12 @@ impl Default for Vga {
             vram: vec![0; VGA_PLANAR_SIZE],
             mode13_linear: vec![0; 0x10000],
             mode13_linear_valid: true,
+            mode13_linear_authoritative: false,
+            mode13_dirty_pages: Cell::new(0),
+            mode13_direct_batch_dirty: false,
+            mode13_settle_frames: 0,
+            mode13_argb_full_dirty: Cell::new(true),
+            mode13_argb_cache: RefCell::new(Mode13ArgbCache::default()),
             crtc: CrtcTiming::text_03h(),
             crtc_regs: CrtcRegs::default(),
             seq: Sequencer::default(),
@@ -703,8 +749,100 @@ impl Vga {
         }
     }
 
+    fn rebuild_mode13_linear(&mut self) {
+        if self.mode13_linear_valid {
+            return;
+        }
+        for linear in 0..self.mode13_linear.len() {
+            let plane = linear & 3;
+            let plane_offset = linear >> 2;
+            self.mode13_linear[linear] = self.vram[plane * VGA_PLANE_SIZE + plane_offset];
+        }
+        self.mode13_linear_valid = true;
+    }
+
+    fn sync_mode13_planar(&mut self) {
+        if !self.mode13_linear_authoritative {
+            return;
+        }
+        for (linear, &value) in self.mode13_linear.iter().enumerate() {
+            let plane = linear & 3;
+            let plane_offset = linear >> 2;
+            self.vram[plane * VGA_PLANE_SIZE + plane_offset] = value;
+        }
+        self.mode13_linear_authoritative = false;
+    }
+
+    fn canonical_mode13_layout(&self) -> bool {
+        self.mode == VideoMode::Mode13h
+            && self.seq.memory_mode & 0x08 != 0
+            && self.attr.pixel_pan == 0
+            && self.crtc == CrtcTiming::mode13h()
+    }
+
+    /// Whether the CPU can use the stock chained Mode 13h aperture as flat
+    /// memory. The machine uses this to invalidate cached direct pages only
+    /// when a VGA write actually changes their availability.
+    pub fn mode13h_direct_page_available(&self) -> bool {
+        let aperture = self.gc.aperture();
+        self.canonical_mode13_layout()
+            && self.pending_start.is_none()
+            && self.video_memory_enabled()
+            && aperture.base == VGA_MODE13H_BASE
+            && aperture.length == VGA_PLANAR_WINDOW_SIZE
+            && aperture.graphics
+    }
+
+    /// Return one page of the canonical chained Mode 13h aperture. The backing
+    /// buffer is stable for the lifetime of this VGA instance. Callers must use
+    /// `note_mode13h_direct_write` before mutating the returned page.
+    pub fn mode13h_direct_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
+        if !self.mode13h_direct_page_available()
+            || offset
+                .checked_add(0x1000)
+                .is_none_or(|end| end > self.mode13_linear.len())
+        {
+            return None;
+        }
+        self.rebuild_mode13_linear();
+        Some(self.mode13_linear[offset..].as_mut_ptr())
+    }
+
+    /// Mark a write made through a direct Mode 13h page. Content generation is
+    /// committed by `finish_mode13h_direct_batch`, once for the whole bus batch.
+    pub fn note_mode13h_direct_write(&mut self, offset: usize, bytes: usize) {
+        debug_assert!(self.mode13h_direct_page_available());
+        if bytes == 0 || offset >= self.mode13_linear.len() {
+            return;
+        }
+        let last = offset
+            .saturating_add(bytes - 1)
+            .min(self.mode13_linear.len() - 1);
+        let first_page = offset >> 12;
+        let last_page = last >> 12;
+        let mut dirty = self.mode13_dirty_pages.get();
+        for page in first_page..=last_page.min(MODE13_DIRECT_PAGES - 1) {
+            dirty |= 1 << page;
+        }
+        self.mode13_dirty_pages.set(dirty);
+        self.mode13_linear_valid = true;
+        self.mode13_linear_authoritative = true;
+        self.mode13_direct_batch_dirty = true;
+        if self.last_line != 0 {
+            self.mode13_settle_frames = 2;
+        }
+    }
+
+    pub fn finish_mode13h_direct_batch(&mut self) {
+        if self.mode13_direct_batch_dirty {
+            self.content_gen = self.content_gen.wrapping_add(1);
+            self.mode13_direct_batch_dirty = false;
+        }
+    }
+
     /// Install a planar mode's timing and reset the beam to the top of frame.
     fn set_planar_mode(&mut self, mode: u8, timing: CrtcTiming, clear: bool) {
+        self.sync_mode13_planar();
         // A mode change alters the scanout interpretation even between two graphics
         // modes of identical raster dims (e.g. 0Dh<->13h, both 320x449), which the
         // dimension fold in `Machine::frame_generation` cannot see. Bump so the host
@@ -731,6 +869,7 @@ impl Vga {
             self.vram.fill(0);
             self.mode13_linear.fill(0);
             self.mode13_linear_valid = true;
+            self.mode13_linear_authoritative = false;
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
@@ -772,6 +911,9 @@ impl Vga {
     }
 
     pub fn plane_byte(&self, plane: usize, offset: usize) -> u8 {
+        if self.mode13_linear_authoritative && plane < VGA_PLANES && offset < 0x4000 {
+            return self.mode13_linear[(offset << 2) | plane];
+        }
         self.vram[plane * VGA_PLANE_SIZE + offset]
     }
 
@@ -831,6 +973,7 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return;
         }
+        self.sync_mode13_planar();
         self.mode13_linear_valid = false;
         self.bump_content_gen();
         if self.seq.memory_mode & 0x04 == 0 {
@@ -848,6 +991,7 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return 0xFF;
         }
+        self.sync_mode13_planar();
         if self.gc.mode_odd_even() && self.gc.aperture().chain_odd_even {
             return self.cpu_read_odd_even(offset);
         }
@@ -895,6 +1039,7 @@ impl Vga {
         let Some((offset, bit)) = self.planar_pixel_offset_at(start, x, y) else {
             return false;
         };
+        self.sync_mode13_planar();
         self.mode13_linear_valid = false;
         self.bump_content_gen();
         let old = self.planar_read_pixel_at(start, x, y);
@@ -951,6 +1096,9 @@ impl Vga {
     /// `N >> 2` via the low two address bits, the symmetric counterpart to
     /// `cpu_write_chain4`.
     pub fn cpu_read_chain4(&self, offset: usize) -> u8 {
+        if self.mode13_linear_authoritative && offset < self.mode13_linear.len() {
+            return self.mode13_linear[offset];
+        }
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
         if plane_off < VGA_PLANE_SIZE {
@@ -964,6 +1112,7 @@ impl Vga {
     /// start address at the next frame boundary (finalize_frame), so mid-frame
     /// writes do not tear.
     pub fn set_start_address(&mut self, addr: u32) {
+        self.sync_mode13_planar();
         self.pending_start = Some(addr); // snapshot at next vretrace (finalize)
     }
 
@@ -1166,6 +1315,12 @@ impl Vga {
     /// new value takes effect. Returns `true` if the port is handled.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         self.catch_up();
+        let changes_mode13_layout = matches!(port, 0x3C2 | 0x3C3 | 0x3C5 | 0x3CF | 0x3D8 | 0x3B8)
+            || self.crtc_data_port_selected(port)
+            || (port == 0x3C0 && self.attr.flip_flop_data);
+        if changes_mode13_layout {
+            self.sync_mode13_planar();
+        }
         // Any VGA register / DAC write can change the scanout (palette, CRTC origin,
         // sequencer/GC/attribute state), so bump the content generation. This also
         // covers HLE BIOS palette writes (e.g. INT 10h AH=10h driving 0x3D9 directly).
@@ -1753,6 +1908,7 @@ impl Vga {
             self.vram.fill(0);
             self.mode13_linear.fill(0);
             self.mode13_linear_valid = true;
+            self.mode13_linear_authoritative = false;
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
@@ -1775,6 +1931,7 @@ impl Vga {
             0x06 => (CrtcTiming::cga_640x200(), CgaMode::Graphics640x200),
             _ => return false,
         };
+        self.sync_mode13_planar();
         // A mode change alters the scanout even at identical raster dims; bump the
         // content gen so the host frame cache re-renders the switch (after validation,
         // so an unsupported mode that returns false above does not bump).
@@ -1859,6 +2016,7 @@ impl Vga {
     }
 
     fn write_cga_mode_control(&mut self, value: u8) {
+        self.sync_mode13_planar();
         let value = value & 0x3F;
         let old_control = self.cga.mode_control;
         let was_cga = self.is_cga_personality();
@@ -2018,6 +2176,7 @@ impl Vga {
     /// and MDA-style mono text (identity attribute palette) instead need the
     /// standard 16 colors at entries 0..15, which the 256-color palette3 holds.
     fn reset_text_mode(&mut self, clear: bool, ega_attr_dac: bool) {
+        self.sync_mode13_planar();
         self.cursor_offset = 0;
         if clear {
             if self.crtc.char_width == 8 {
@@ -2483,6 +2642,7 @@ impl Vga {
     /// Enter unchained 256-color (mode X / mode Y) with the 320x200 base. The guest
     /// retunes the geometry by reprogramming the vertical CRTC timing while here.
     fn enter_mode_x(&mut self) {
+        self.sync_mode13_planar();
         // seq.memory_mode already holds the chain-4-off value from the write_seq
         // call that triggered this entry, so it is not reseeded here.
         self.crtc = CrtcTiming::mode_x();
@@ -2519,6 +2679,9 @@ impl Vga {
     /// caller (CPU bus or HLE BIOS) drove the write. Over-bumping is harmless.
     #[inline]
     fn bump_content_gen(&mut self) {
+        self.mode13_argb_full_dirty.set(true);
+        self.mode13_direct_batch_dirty = false;
+        self.mode13_settle_frames = 0;
         self.content_gen = self.content_gen.wrapping_add(1);
     }
 
@@ -2693,6 +2856,85 @@ impl Vga {
             *slot = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
         }
         out
+    }
+
+    /// Palette-map the latest completed canonical Mode 13h frame. The cache is
+    /// full-sized so callers can keep their existing crop behavior.
+    pub fn cached_mode13h_presented_argb(&self) -> Option<(Vec<u32>, usize, usize, usize)> {
+        if !self.canonical_mode13_layout() {
+            return None;
+        }
+        let raster = self.last_presented()?;
+        let width = raster.width as usize;
+        let height = raster.height as usize;
+        let display_height = raster.display_height.min(raster.height) as usize;
+        let palette = self.palette_argb();
+        let frame = self.frames_completed();
+        let dirty_pages = self.mode13_dirty_pages.get();
+        let full_dirty = self.mode13_argb_full_dirty.get();
+        let mut cache = self.mode13_argb_cache.borrow_mut();
+        let shape_changed = !cache.valid
+            || cache.width != width
+            || cache.height != height
+            || cache.words.len() != raster.pixels.len();
+        let frame_advanced = !cache.valid || cache.frame != frame;
+        let palette_changed = !cache.valid || cache.palette != palette;
+
+        if cache.valid && !frame_advanced && !palette_changed {
+            return Some((cache.words.clone(), width, height, display_height));
+        }
+
+        let full = shape_changed || palette_changed || full_dirty;
+        let converted = if full {
+            cache.words.resize(raster.pixels.len(), 0);
+            for (word, &index) in cache.words.iter_mut().zip(&raster.pixels) {
+                *word = palette[usize::from(index)];
+            }
+            raster.pixels.len()
+        } else {
+            let scan_factor = self.scan_factor() as usize;
+            let visible_bytes = crate::MODE13H_MEMORY_SIZE.min(self.mode13_linear.len());
+            let mut converted = 0;
+            for page in 0..MODE13_DIRECT_PAGES {
+                if dirty_pages & (1u16 << page) == 0 {
+                    continue;
+                }
+                let start = page * 0x1000;
+                let end = (start + 0x1000).min(visible_bytes);
+                for linear in start..end {
+                    let source_row = linear / width;
+                    let x = linear % width;
+                    for duplicate in 0..scan_factor {
+                        let row = source_row * scan_factor + duplicate;
+                        if row >= display_height {
+                            break;
+                        }
+                        let pixel = row * width + x;
+                        cache.words[pixel] = palette[usize::from(raster.pixels[pixel])];
+                        converted += 1;
+                    }
+                }
+            }
+            converted
+        };
+
+        cache.palette = palette;
+        cache.width = width;
+        cache.height = height;
+        cache.display_height = display_height;
+        cache.frame = frame;
+        cache.valid = true;
+        cache.converted_pixels = converted;
+        if frame_advanced && self.mode13_settle_frames == 0 {
+            self.mode13_dirty_pages.set(0);
+            self.mode13_argb_full_dirty.set(false);
+        }
+        Some((cache.words.clone(), width, height, display_height))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mode13h_last_converted_pixels(&self) -> usize {
+        self.mode13_argb_cache.borrow().converted_pixels
     }
 
     pub fn frame(&self) -> TextFrame {

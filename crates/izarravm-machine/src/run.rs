@@ -415,9 +415,9 @@ impl Machine {
                             .last_mut()
                             .expect("opened at batch entry")
                             .push(bus.prior_runs_core_clocks);
-                        match cpu.run_straight_line(&mut bus, remaining) {
+                        match cpu.run_budgeted(&mut bus, remaining) {
                             Ok(o) => {
-                                batch_core = batch_core.saturating_add(o.core_clocks);
+                                batch_core = batch_core.saturating_add(o.consumed_core_clocks);
                                 if o.halted {
                                     halted = true;
                                     break;

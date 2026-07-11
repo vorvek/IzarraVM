@@ -27,6 +27,21 @@ fn jit_forced_region_lin() -> Option<u32> {
     })
 }
 
+#[cfg(feature = "jit")]
+enum DirectContinuation {
+    Run(CycleOutcome),
+    Interpret,
+    RegionFallback,
+}
+
+#[cfg(feature = "jit")]
+#[derive(Clone, Copy)]
+struct ContinuationBudget {
+    total: u64,
+    bus_at_entry: u64,
+    cap: u64,
+}
+
 impl CpuGsw {
     pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
         // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
@@ -286,11 +301,11 @@ impl CpuGsw {
     /// uniformly, so the run ends at precisely the boundary the old per-instruction loop would have
     /// stopped at (the post-STI instruction consuming the shadow, or POPF/IRET enabling IF). The
     /// machine's own per-batch transition check then services the interrupt at the next batch entry.
-    pub fn run_straight_line<B: CpuBus>(
+    pub fn run_budgeted<B: CpuBus>(
         &mut self,
         bus: &mut B,
         cap: u64,
-    ) -> Result<CycleOutcome, CpuError> {
+    ) -> Result<BudgetedRunOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
@@ -340,14 +355,31 @@ impl CpuGsw {
                 // break checks below then fire at exactly the boundary the region stopped at.
                 // The probe read+branch is the whole per-continuation dispatch cost.
                 #[cfg(feature = "jit")]
-                let region_outcome = self.try_region_continuation(
-                    bus,
-                    lin,
-                    cs.default_size_32,
+                let stamped_region = self.decode_cache.region_at(lin, cs.default_size_32);
+                #[cfg(feature = "jit")]
+                let continuation_budget = ContinuationBudget {
                     total,
                     bus_at_entry,
                     cap,
-                )?;
+                };
+                #[cfg(feature = "jit")]
+                let region_outcome = match self.try_direct_continuation(
+                    bus,
+                    lin,
+                    cs.default_size_32,
+                    stamped_region,
+                    continuation_budget,
+                )? {
+                    DirectContinuation::Run(outcome) => Some(outcome),
+                    DirectContinuation::Interpret => None,
+                    DirectContinuation::RegionFallback => self.try_region_continuation(
+                        bus,
+                        lin,
+                        cs.default_size_32,
+                        stamped_region,
+                        continuation_budget,
+                    )?,
+                };
                 #[cfg(not(feature = "jit"))]
                 let region_outcome: Option<CycleOutcome> = None;
                 match region_outcome {
@@ -368,8 +400,8 @@ impl CpuGsw {
             // exactly the boundary that loop would have stopped at.
             if outcome.halted {
                 self.perf.brk_halt += 1;
-                return Ok(CycleOutcome {
-                    core_clocks: total.min(u64::from(u32::MAX)) as u32,
+                return Ok(BudgetedRunOutcome {
+                    consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
                 });
             }
@@ -396,9 +428,22 @@ impl CpuGsw {
                 break;
             }
         }
-        Ok(CycleOutcome {
-            core_clocks: total.min(u64::from(u32::MAX)) as u32,
+        Ok(BudgetedRunOutcome {
+            consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,
+        })
+    }
+
+    /// Compatibility wrapper for callers that still consume a single-cycle outcome.
+    pub fn run_straight_line<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        cap: u64,
+    ) -> Result<CycleOutcome, CpuError> {
+        let outcome = self.run_budgeted(bus, cap)?;
+        Ok(CycleOutcome {
+            core_clocks: outcome.consumed_core_clocks,
+            halted: outcome.halted,
         })
     }
 
@@ -411,6 +456,154 @@ impl CpuGsw {
         self.jit_regions.set_auto_admit(on && jit::HOST_SUPPORTED);
     }
 
+    #[cfg(feature = "jit")]
+    fn try_direct_continuation<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        d: bool,
+        stamped_region: Option<std::num::NonZeroU32>,
+        budget: ContinuationBudget,
+    ) -> Result<DirectContinuation, CpuError> {
+        if !self.mode().uses_approximate_timing() {
+            return Ok(DirectContinuation::Interpret);
+        }
+        if !self.jit_regions.auto_admit() {
+            return Ok(DirectContinuation::RegionFallback);
+        }
+        // The decode-line region stamp is the existing hot-block admission bit. Cold cached
+        // continuations stay on the old zero-hash path; the region engine warms and stamps a hot
+        // entry first, then the direct compiler gets its first/second observations here.
+        if stamped_region.is_none() {
+            return Ok(DirectContinuation::RegionFallback);
+        }
+        let Some(key) = jit::direct::key_for(self, lin, d) else {
+            return Ok(DirectContinuation::RegionFallback);
+        };
+        let block = match self.jit_direct.probe(key) {
+            jit::direct::BlockProbe::Interpret => return Ok(DirectContinuation::Interpret),
+            jit::direct::BlockProbe::Rejected => {
+                return Ok(DirectContinuation::RegionFallback);
+            }
+            jit::direct::BlockProbe::Ready(block) => block,
+            jit::direct::BlockProbe::Compile => {
+                let Some(compilation) = jit::direct::compile(self, lin, d) else {
+                    self.jit_direct.reject(key);
+                    return Ok(DirectContinuation::RegionFallback);
+                };
+                let Some(block) = self.jit_direct.install(
+                    compilation.span,
+                    compilation.fetch_lens,
+                    compilation.raw_clocks,
+                    &compilation.code,
+                ) else {
+                    self.jit_direct.reject(key);
+                    return Ok(DirectContinuation::RegionFallback);
+                };
+                block
+            }
+        };
+        match self.run_direct_block(bus, block, budget.total, budget.bus_at_entry, budget.cap)? {
+            Some(outcome) => Ok(DirectContinuation::Run(outcome)),
+            None => Ok(DirectContinuation::Interpret),
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    fn run_direct_block<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        block: jit::direct::CompiledBlock,
+        total: u64,
+        bus_at_entry: u64,
+        cap: u64,
+    ) -> Result<Option<CycleOutcome>, CpuError> {
+        if self.profile.enabled || diff_trace_enabled() || self.interrupt_shadow {
+            return Ok(None);
+        }
+        let span = block.span();
+        if span.key.mode_key != self.jit_mode_key() {
+            return Ok(None);
+        }
+        let eip = self.registers.eip;
+        let fetch_last = u32::from(span.guest_len) - 1;
+        if self
+            .registers
+            .cs()
+            .limit
+            .checked_sub(fetch_last)
+            .is_none_or(|last_start| eip > last_start)
+        {
+            return Ok(None);
+        }
+
+        let (num, den) = level_timing(self.persona());
+        let scaled_core =
+            (u64::from(block.raw_clocks()) * u64::from(num) + self.timing_rem) / u64::from(den);
+        let bus_growth = bus
+            .in_batch_scaled_bus_clocks()
+            .saturating_sub(bus_at_entry);
+        let mut fetch_lin = span.key.linear;
+        let mut fetch_raw = 0u64;
+        for &len in block.fetch_lens() {
+            let Some(raw) = bus.jit_cached_fetch_run_clocks(fetch_lin, u32::from(len)) else {
+                return Ok(None);
+            };
+            fetch_raw = fetch_raw.saturating_add(raw);
+            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+        }
+        let fetch_upper = if cap == u64::MAX {
+            0
+        } else {
+            let bus_now = bus.in_batch_scaled_bus_clocks();
+            let Some(bus_after) = bus.jit_projected_batch_scaled_bus_clocks(fetch_raw) else {
+                return Ok(None);
+            };
+            bus_after.saturating_sub(bus_now).saturating_add(1)
+        };
+        if total
+            .saturating_add(bus_growth)
+            .saturating_add(scaled_core)
+            .saturating_add(fetch_upper)
+            > cap
+        {
+            return Ok(None);
+        }
+
+        self.begin_instruction();
+        self.core_clocks_so_far = total;
+        let mut fetch_lin = span.key.linear;
+        for &len in block.fetch_lens() {
+            if self.charge_cached_fetch(bus, fetch_lin, len).is_err() {
+                self.registers.eip = eip;
+                return Ok(None);
+            }
+            fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+        }
+        self.registers.eip = eip;
+        let flags = self.materialized_eflags();
+        // SAFETY: direct::emit produced this page using the exact two-argument ABI, the arena
+        // sealed it executable, and `self.jit_direct` keeps that arena alive for this call.
+        let entry: jit::direct::DirectEntryFn = unsafe { std::mem::transmute(block.entry_ptr()) };
+        let raw = unsafe { entry(self as *mut CpuGsw, flags) };
+        debug_assert_eq!(raw, block.raw_clocks());
+
+        let charged = self.scale_clocks_batch(u64::from(raw));
+        self.elapsed_clocks += charged;
+        let instructions = u64::from(span.instructions);
+        self.perf.instructions += instructions;
+        self.perf.jit_region_entries += 1;
+        self.perf.jit_region_insns += instructions;
+        self.perf.jit_native_insns += instructions;
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
+        Ok(Some(CycleOutcome {
+            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+            halted: false,
+        }))
+    }
+
     /// The JIT dispatch at the continuation seam: run the region stamped on this line, or (on the
     /// forced admission address, or once a line is hot enough) compile/re-stamp one first. `Ok(None)`
     /// means "no region ran"; the caller falls back to the interpreted continuation.
@@ -420,11 +613,10 @@ impl CpuGsw {
         bus: &mut B,
         lin: u32,
         d: bool,
-        total: u64,
-        bus_at_entry: u64,
-        cap: u64,
+        stamped_region: Option<std::num::NonZeroU32>,
+        budget: ContinuationBudget,
     ) -> Result<Option<CycleOutcome>, CpuError> {
-        let idx = match self.decode_cache.region_at(lin, d) {
+        let idx = match stamped_region {
             Some(idx) => idx,
             None => {
                 // Admit when either the forced-address override names this line (the spike/test
@@ -446,7 +638,15 @@ impl CpuGsw {
                 idx
             }
         };
-        self.run_region(bus, idx, lin, d, total, bus_at_entry, cap)
+        self.run_region(
+            bus,
+            idx,
+            lin,
+            d,
+            budget.total,
+            budget.bus_at_entry,
+            budget.cap,
+        )
     }
 
     /// Execute a compiled region as one continuation of `run_straight_line`. On return the

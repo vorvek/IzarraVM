@@ -52,8 +52,8 @@ impl TlbEntry {
     };
 }
 
-/// Direct-mapped linear->physical translation cache. `generation` bumps to flush
-/// in O(1); an entry is live only while its `generation` matches. Contents are
+/// Direct-mapped linear-to-physical translation cache. `generation` bumps to flush
+/// in O(1); an entry is live only while its tag and `generation` match. Contents are
 /// microarchitectural, so the TLB is transparent to CpuGsw equality and prints
 /// terse. Non-snooping, which matches real x86: a guest must INVLPG or reload CR3
 /// after editing a page-table entry, and IzarraVM flushes on exactly those events.
@@ -96,6 +96,15 @@ impl Tlb {
         };
     }
 
+    #[inline]
+    pub(crate) fn invalidate(&mut self, page: u32) {
+        let slot = Self::slot(page);
+        let entry = self.entries[slot];
+        if entry.generation == self.generation && entry.tag == page {
+            self.entries[slot] = TlbEntry::EMPTY;
+        }
+    }
+
     /// Drop every cached translation (CR0/CR3 write, task switch, INVLPG). The rare
     /// generation wrap clears the table so stale gen-0 entries cannot alias.
     pub(crate) fn flush(&mut self) {
@@ -122,6 +131,7 @@ impl std::fmt::Debug for Tlb {
 
 // --- Direct Page Cache ---
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct DirectPageCacheEntry {
     pub(crate) physical_page: u32,
@@ -159,11 +169,7 @@ impl DirectPageCache {
     pub(crate) fn get(&self, physical: u32) -> Option<DirectPageCacheEntry> {
         let page = physical & !0x0fff;
         let entry = self.entries[Self::slot(page)];
-        if entry.physical_page == page {
-            Some(entry)
-        } else {
-            None
-        }
+        (entry.physical_page == page).then_some(entry)
     }
 
     #[inline]
@@ -196,6 +202,82 @@ impl Eq for DirectPageCache {}
 impl std::fmt::Debug for DirectPageCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "DirectPageCache")
+    }
+}
+
+#[cfg(test)]
+mod page_map_tests {
+    use super::*;
+
+    #[test]
+    fn direct_mapped_tlb_replaces_only_the_colliding_slot() {
+        let mut tlb = Tlb::default();
+        let first = 3;
+        let collision = first + TLB_ENTRIES as u32;
+
+        tlb.insert(first, 0x5000, true, false, true);
+        let first_entry = tlb.lookup(first).unwrap();
+        assert_eq!(first_entry.phys, 0x5000);
+        assert!(first_entry.writable);
+        assert!(!first_entry.user);
+        assert!(first_entry.dirty);
+
+        tlb.insert(collision, 0x9000, false, true, false);
+        assert!(tlb.lookup(first).is_none());
+        let collision_entry = tlb.lookup(collision).unwrap();
+        assert_eq!(collision_entry.phys, 0x9000);
+        assert!(!collision_entry.writable);
+        assert!(collision_entry.user);
+        assert!(!collision_entry.dirty);
+
+        tlb.invalidate(first);
+        assert!(tlb.lookup(first).is_none());
+        assert!(tlb.lookup(collision).is_some());
+
+        tlb.invalidate(collision);
+        assert!(tlb.lookup(collision).is_none());
+
+        tlb.insert(collision, 0x9000, false, true, false);
+
+        tlb.flush();
+        assert!(tlb.lookup(collision).is_none());
+    }
+
+    #[test]
+    fn physical_page_cache_tags_collisions_and_invalidates_all_entries() {
+        let mut first_bytes = Box::new([0u8; 4096]);
+        let mut collision_bytes = Box::new([0u8; 4096]);
+        let first = DirectPage {
+            physical_page: 0x1000,
+            ptr: first_bytes.as_mut_ptr(),
+            len: first_bytes.len(),
+            writable: true,
+        };
+        let collision = DirectPage {
+            physical_page: first.physical_page + (DIRECT_PAGE_CACHE_LINES as u32 * 0x1000),
+            ptr: collision_bytes.as_mut_ptr(),
+            len: collision_bytes.len(),
+            writable: true,
+        };
+        let mut pages = DirectPageCache::default();
+
+        pages.insert(first);
+        assert_eq!(pages.get(first.physical_page).unwrap().ptr, first.ptr);
+
+        pages.insert(collision);
+        assert!(pages.get(first.physical_page).is_none());
+        assert_eq!(
+            pages.get(collision.physical_page).unwrap().ptr,
+            collision.ptr
+        );
+
+        pages.insert(first);
+        assert!(pages.get(collision.physical_page).is_none());
+        assert_eq!(pages.get(first.physical_page).unwrap().ptr, first.ptr);
+
+        pages.invalidate();
+        assert!(pages.get(first.physical_page).is_none());
+        assert!(pages.get(collision.physical_page).is_none());
     }
 }
 

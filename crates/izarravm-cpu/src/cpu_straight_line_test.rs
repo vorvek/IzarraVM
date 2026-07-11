@@ -22,6 +22,23 @@ fn drive_straight_line_runs(cpu: &mut CpuGsw, bus: &mut TestBus) -> usize {
 }
 
 #[test]
+fn budgeted_run_matches_the_compatibility_wrapper() {
+    let (mut budgeted_cpu, memory) = real_mode_cpu(&[0x90, 0xf4], 32);
+    let mut legacy_cpu = budgeted_cpu.clone();
+    let mut budgeted_bus = TestBus::with_memory(memory.clone());
+    let mut legacy_bus = TestBus::with_memory(memory);
+
+    for cap in [1, u64::MAX] {
+        let budgeted = budgeted_cpu.run_budgeted(&mut budgeted_bus, cap).unwrap();
+        let legacy = legacy_cpu.run_straight_line(&mut legacy_bus, cap).unwrap();
+        assert_eq!(budgeted.consumed_core_clocks, legacy.core_clocks);
+        assert_eq!(budgeted.halted, legacy.halted);
+    }
+    assert_eq!(budgeted_cpu, legacy_cpu);
+    assert_eq!(budgeted_bus.memory, legacy_bus.memory);
+}
+
+#[test]
 fn straight_line_hot_loop_matches_per_instruction_result() {
     // MOV CX,5 ; loop: INC AX ; INC AX ; LOOP loop ; HLT. Once the loop body is cached, the
     // relative LOOP can run as a continuation too, so one hot run can chain several iterations.

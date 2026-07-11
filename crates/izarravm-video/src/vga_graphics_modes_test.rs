@@ -72,6 +72,78 @@ fn mode13h_chain4_write_routes_byte_n_to_plane_n_mod_4() {
 }
 
 #[test]
+fn mode13h_argb_cache_converts_only_the_dirty_direct_page() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    video.advance(video.frame_dots());
+    let (initial, width, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("canonical Mode 13h frame is cacheable");
+    assert_eq!(video.mode13h_last_converted_pixels(), initial.len());
+
+    let offset = 0x1000;
+    video.note_mode13h_direct_write(offset, 1);
+    video.mode13_linear[offset] = 0x2A;
+    video.finish_mode13h_direct_batch();
+    video.advance(video.frame_dots());
+    let (updated, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("updated canonical frame stays cacheable");
+
+    assert_eq!(
+        video.mode13h_last_converted_pixels(),
+        0x1000 * 2,
+        "one 4 KiB source page updates its two double-scanned rows"
+    );
+    assert_eq!(updated[0], initial[0], "untouched page remains cached");
+    let source_row = offset / width;
+    let x = offset % width;
+    assert_eq!(
+        updated[(source_row * 2) * width + x],
+        video.palette_argb()[0x2A]
+    );
+    assert_eq!(
+        updated[(source_row * 2 + 1) * width + x],
+        video.palette_argb()[0x2A]
+    );
+}
+
+#[test]
+fn mode13h_argb_cache_settles_a_direct_write_after_catch_up() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    video.advance(video.frame_dots());
+    let (initial, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("initial frame is cacheable");
+
+    let line_dots = video.frame_dots() / u64::from(video.crtc.vtotal);
+    video.advance(line_dots * 100);
+    video.read_status1();
+    assert_eq!(video.last_line, 100);
+    video.note_mode13h_direct_write(0, 1);
+    video.mode13_linear[0] = 0x2A;
+    video.finish_mode13h_direct_batch();
+
+    video.advance(video.frame_dots() - video.beam_dots());
+    let (split, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("split frame remains cacheable");
+    assert_eq!(split[0], initial[0], "past scanline keeps its old pixel");
+
+    video.advance(video.frame_dots());
+    let (settled, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("settled frame remains cacheable");
+    assert_eq!(settled[0], video.palette_argb()[0x2A]);
+    assert_eq!(
+        video.mode13h_last_converted_pixels(),
+        0x1000 * 2,
+        "the retained dirty page updates once more on the settled frame"
+    );
+}
+
+#[test]
 fn mode13h_linear_scanout_is_limited_to_the_stock_layout() {
     let mut video = Vga::default();
     video.set_mode13h_with_clear(true);

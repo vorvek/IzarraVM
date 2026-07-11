@@ -41,9 +41,10 @@ impl CpuGsw {
     ) -> ExecResult<u32> {
         let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
         let offset = self.index_offset(6, address_size); // SI / ESI
-        let physical = self.translate_segmented(bus, segment, offset, width.bytes(), false)?;
+        let (linear, physical) =
+            self.translate_segmented(bus, segment, offset, width.bytes(), false)?;
         if let Some(value) =
-            self.read_direct_page_cached(bus, physical, width, BusAccessKind::DataRead)?
+            self.read_direct_page_cached(bus, linear, physical, width, BusAccessKind::DataRead)?
         {
             return Ok(value);
         }
@@ -59,10 +60,10 @@ impl CpuGsw {
         width: BusWidth,
     ) -> ExecResult<u32> {
         let offset = self.index_offset(7, address_size); // DI / EDI
-        let physical =
+        let (linear, physical) =
             self.translate_segmented(bus, SegmentIndex::Es, offset, width.bytes(), false)?;
         if let Some(value) =
-            self.read_direct_page_cached(bus, physical, width, BusAccessKind::DataRead)?
+            self.read_direct_page_cached(bus, linear, physical, width, BusAccessKind::DataRead)?
         {
             return Ok(value);
         }
@@ -95,9 +96,16 @@ impl CpuGsw {
         value: u32,
     ) -> ExecResult<()> {
         let offset = self.index_offset(7, address_size); // DI / EDI
-        let physical =
+        let (linear, physical) =
             self.translate_segmented(bus, SegmentIndex::Es, offset, width.bytes(), true)?;
-        if self.write_direct_page_cached(bus, physical, width, value, BusAccessKind::DataWrite)? {
+        if self.write_direct_page_cached(
+            bus,
+            linear,
+            physical,
+            width,
+            value,
+            BusAccessKind::DataWrite,
+        )? {
             return Ok(());
         }
         let write = bus.write_memory_direct(physical, width, value, BusAccessKind::DataWrite)?;

@@ -470,9 +470,6 @@ pub struct Msrs {
     pub tsc_offset: u64,
 }
 
-/// Direct-mapped TLB size (entries). Covers TLB_ENTRIES * 4 KiB before two pages
-/// collide on a slot; a 386/486 had 32, this keeps a few more so a fetch/execute
-/// loop's interleaved code and data pages do not evict each other every step.
 const CPU_PROFILE_GROUPS: usize = 16;
 
 /// Host-side performance counters: pure diagnostics for `--headless-bench`, NOT
@@ -767,6 +764,18 @@ pub struct CpuGsw {
     /// the same equality/clone exclusions as the decode cache. See `jit::region`.
     #[cfg(feature = "jit")]
     jit_regions: jit::RegionTable,
+    /// Helper-free register block cache. Like the decode and region caches, this is host-only
+    /// accelerator state and clones empty.
+    #[cfg(feature = "jit")]
+    jit_direct: Box<jit::direct::BlockCache>,
+    /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
+    /// clones start empty like the other host-only accelerator caches.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    jit_fast_map: Box<jit::fast_map::FastMap>,
     /// Host-side performance counters (diagnostics for `--headless-bench`). Excluded from
     /// equality via `PerfCounters`'s always-equal `PartialEq`, like the decode cache.
     perf: PerfCounters,
@@ -831,6 +840,14 @@ impl Default for CpuGsw {
             decode_cache: DecodeCache::default(),
             #[cfg(feature = "jit")]
             jit_regions: jit::RegionTable::default(),
+            #[cfg(feature = "jit")]
+            jit_direct: Box::new(jit::direct::BlockCache::default()),
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_fast_map: Box::new(jit::fast_map::FastMap::default()),
             perf: PerfCounters::default(),
             profile: CpuProfileState::default(),
             pending_flags: PendingFlags::default(),
@@ -843,6 +860,13 @@ impl Default for CpuGsw {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleOutcome {
     pub core_clocks: u32,
+    pub halted: bool,
+}
+
+/// Result of an event-capped CPU run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetedRunOutcome {
+    pub consumed_core_clocks: u32,
     pub halted: bool,
 }
 
