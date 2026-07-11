@@ -850,7 +850,9 @@ pub(super) fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
 }
 
 fn format_profile_opcode(opcode: u16) -> String {
-    if opcode & 0xff00 == 0x0f00 {
+    if opcode & 0x8000 != 0 {
+        format!("{:02X}/{:02X}", 0xd8 + ((opcode >> 8) & 7), opcode as u8)
+    } else if opcode & 0xff00 == 0x0f00 {
         format!("0F {:02X}", opcode as u8)
     } else {
         format!("{:02X}", opcode as u8)

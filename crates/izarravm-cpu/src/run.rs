@@ -180,7 +180,7 @@ impl CpuGsw {
                 if profiling {
                     profile_key = Some((
                         insn.group,
-                        insn.opcode,
+                        cpu_profile_opcode(&insn),
                         CpuProfileOperandForm::from_insn(&insn),
                     ));
                 }
@@ -286,7 +286,7 @@ impl CpuGsw {
             resume.precharged_core,
             profiling.then_some((
                 resume.insn.group,
-                resume.insn.opcode,
+                cpu_profile_opcode(&resume.insn),
                 CpuProfileOperandForm::from_insn(&resume.insn),
             )),
             profile_start,
@@ -811,7 +811,7 @@ impl CpuGsw {
             self.jit_direct.retire_key_for_recompile(span.key);
             return Ok(DirectBlockOutcome::NotRun);
         }
-        if block.has_dword_accesses() && self.alignment_armed && self.current_privilege_level() == 3
+        if block.has_wide_accesses() && self.alignment_armed && self.current_privilege_level() == 3
         {
             self.perf.jit_direct_reject_alignment += 1;
             return Ok(DirectBlockOutcome::NotRun);
@@ -859,6 +859,10 @@ impl CpuGsw {
             .jit_data_cost_clocks(BusWidth::Byte)
             .saturating_mul(u64::from(block.byte_reads()))
             .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(u64::from(block.word_reads())),
+            )
+            .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Dword)
                     .saturating_mul(u64::from(block.dword_reads())),
             )
@@ -868,13 +872,20 @@ impl CpuGsw {
                     .saturating_mul(u64::from(block.byte_stores())),
             )
             .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word))
+                    .saturating_mul(u64::from(block.word_stores())),
+            )
+            .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Dword)
                     .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
                     .saturating_mul(u64::from(block.dword_stores())),
             );
-        let iteration_upper = scaled_core_upper
-            .saturating_add(fetch_upper)
-            .saturating_add(data_upper);
+        let raw_bus_upper = fetch_upper.saturating_add(data_upper);
+        // `cap` and `bus_growth` use the bus's scaled guest-clock domain. Fold the raw
+        // fetch/data bound through that same scale before deciding how much native work fits.
+        let iteration_upper =
+            scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(raw_bus_upper));
         let used = total.saturating_add(bus_growth);
         let available = cap.saturating_sub(used).saturating_sub(1);
         let budget_quota = available.checked_div(iteration_upper).unwrap_or(u64::MAX);
@@ -904,15 +915,20 @@ impl CpuGsw {
                     / u64::from(den);
                 let max_read = bus
                     .jit_data_cost_clocks(BusWidth::Dword)
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
+                    .max(bus.jit_data_cost_clocks(BusWidth::Word))
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word))
+                    .max(bus.jit_data_cost_clocks(BusWidth::Byte))
+                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
                 let max_store = max_read;
-                let global_block_upper = max_core.saturating_add(
-                    (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(
+                let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64)
+                    .saturating_mul(
                         bus.jit_fetch_cost_clocks()
                             .saturating_add(max_read)
                             .saturating_add(max_store),
-                    ),
-                );
+                    );
+                let global_block_upper =
+                    max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
                 let additional = available
                     .saturating_sub(iteration_upper)
                     .checked_div(global_block_upper)
@@ -982,8 +998,15 @@ impl CpuGsw {
         let fp = jit::native_x87::scale_weighted_fp_clocks(exit.weighted_fp_clocks, self.fp_rem);
         self.fp_rem = fp.remainder;
         let raw_clocks = exit.raw_clocks.saturating_add(fp.clocks);
-        let byte_reads = exit.byte_reads;
+        let byte_reads = exit.byte_reads & u64::from(u32::MAX);
+        let word_reads = exit.byte_reads >> 32;
         let dword_reads = exit.dword_reads;
+        let mode13_byte_reads = exit.mode13_byte_reads & u64::from(u32::MAX);
+        let mode13_word_reads = exit.mode13_byte_reads >> 32;
+        let ram_byte_writes = exit.ram_byte_writes & u64::from(u32::MAX);
+        let ram_word_writes = exit.ram_byte_writes >> 32;
+        let mode13_byte_writes = exit.mode13_byte_writes & u64::from(u32::MAX);
+        let mode13_word_writes = exit.mode13_byte_writes >> 32;
         if uniform_fetches {
             bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(instructions));
         } else {
@@ -1037,21 +1060,31 @@ impl CpuGsw {
         }
         self.registers.eip = final_eip;
 
-        debug_assert!(exit.mode13_byte_reads <= byte_reads);
+        debug_assert!(mode13_byte_reads <= byte_reads);
+        debug_assert!(mode13_word_reads <= word_reads);
         debug_assert!(exit.mode13_dword_reads <= dword_reads);
-        let ram_byte_reads = byte_reads - exit.mode13_byte_reads;
+        let ram_byte_reads = byte_reads - mode13_byte_reads;
+        let ram_word_reads = word_reads - mode13_word_reads;
         let ram_dword_reads = dword_reads - exit.mode13_dword_reads;
 
         let data_clocks = bus
             .jit_data_cost_clocks(BusWidth::Byte)
             .saturating_mul(ram_byte_reads)
             .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(ram_word_reads),
+            )
+            .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Dword)
                     .saturating_mul(ram_dword_reads),
             )
             .saturating_add(
                 bus.jit_mode13_data_cost_clocks(BusWidth::Byte)
-                    .saturating_mul(exit.mode13_byte_reads),
+                    .saturating_mul(mode13_byte_reads),
+            )
+            .saturating_add(
+                bus.jit_mode13_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(mode13_word_reads),
             )
             .saturating_add(
                 bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
@@ -1059,7 +1092,11 @@ impl CpuGsw {
             )
             .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Byte)
-                    .saturating_mul(exit.ram_byte_writes),
+                    .saturating_mul(ram_byte_writes),
+            )
+            .saturating_add(
+                bus.jit_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(ram_word_writes),
             )
             .saturating_add(
                 bus.jit_data_cost_clocks(BusWidth::Dword)
@@ -1068,16 +1105,19 @@ impl CpuGsw {
         bus.charge_bus_clocks_bulk(data_clocks);
         bus.charge_native_mode13_writes(izarravm_bus::NativeMode13Writes {
             dirty_pages: exit.mode13_dirty_pages as u16,
-            byte_writes: exit.mode13_byte_writes,
+            byte_writes: mode13_byte_writes,
+            word_writes: mode13_word_writes,
             dword_writes: exit.mode13_dword_writes,
         });
 
         let charged = self.scale_clocks_batch(raw_clocks);
         self.elapsed_clocks += charged;
-        let reads = byte_reads + dword_reads;
-        let writes = exit.ram_byte_writes
+        let reads = byte_reads + word_reads + dword_reads;
+        let writes = ram_byte_writes
+            + ram_word_writes
             + exit.ram_dword_writes
-            + exit.mode13_byte_writes
+            + mode13_byte_writes
+            + mode13_word_writes
             + exit.mode13_dword_writes;
         if writes != 0
             && let Some(page) = self.prefetch.physical_page()
@@ -1510,7 +1550,7 @@ impl CpuGsw {
             0,
             profiling.then_some((
                 insn.group,
-                insn.opcode,
+                cpu_profile_opcode(insn),
                 CpuProfileOperandForm::from_insn(insn),
             )),
             profile_start,

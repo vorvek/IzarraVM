@@ -231,6 +231,138 @@ fn fld_register_fxch_fstp_and_fmulp_match_the_interpreter() {
     );
 }
 
+fn de_pop_program(extension: u8) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9,
+        0x05,
+        0x00,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x200]
+        0xd9,
+        0x05,
+        0x04,
+        0x02,
+        0x00,
+        0x00, // fld dword [0x204]
+        0xde,
+        0xc1 | (extension << 3),
+        0xd9,
+        0x1d,
+        0x08,
+        0x02,
+        0x00,
+        0x00, // fstp dword [0x208]
+        0x89,
+        0xc0, // mov eax,eax
+        0x89,
+        0xdb, // mov ebx,ebx
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&6.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn every_de_pop_subtract_and_divide_matches_the_interpreter() {
+    let expected = [-4.0f32, 4.0, 1.0 / 3.0, 3.0];
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (extension, expected) in (4..=7).zip(expected) {
+            let (cpu, bus) = assert_program_matches(mode, de_pop_program(extension), 0x0f7f);
+            let actual = f32::from_bits(u32::from_le_bytes(
+                bus.memory[DATA + 8..DATA + 12].try_into().unwrap(),
+            ));
+            assert_eq!(actual, expected, "mode={mode:?} extension={extension}");
+            assert_eq!(
+                cpu.perf_counters().jit_direct_side_exits,
+                0,
+                "mode={mode:?} extension={extension}"
+            );
+        }
+    }
+}
+
+fn compare_pop_pop_program(opcode: u8) -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let modrm = if opcode == 0xda { 0xe9 } else { 0xd9 };
+    let code = [
+        0xd9, 0x05, 0x00, 0x02, 0x00, 0x00, // fld dword [0x200]
+        0xd9, 0x05, 0x04, 0x02, 0x00, 0x00, // fld dword [0x204]
+        opcode, modrm, 0xdf, 0xe0, // fnstsw ax
+        0x89, 0xc2, // mov edx,eax
+        0x89, 0xdb, // mov ebx,ebx
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA..DATA + 4].copy_from_slice(&3.0f32.to_bits().to_le_bytes());
+    memory[DATA + 4..DATA + 8].copy_from_slice(&2.0f32.to_bits().to_le_bytes());
+    memory
+}
+
+#[test]
+fn fcompp_and_fucompp_match_the_interpreter_and_pop_twice() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for opcode in [0xde, 0xda] {
+            let (cpu, _) = assert_program_matches(mode, compare_pop_pop_program(opcode), 0x0f7f);
+            assert_eq!(cpu.fpu.status & 0x4500, 1 << 8, "mode={mode:?}");
+            assert_eq!(cpu.fpu.top(), 0, "mode={mode:?}");
+            assert_eq!(cpu.fpu.tag, 0xffff, "mode={mode:?}");
+            assert_eq!(cpu.perf_counters().jit_direct_side_exits, 0);
+        }
+    }
+}
+
+fn constants_and_register_store_program() -> Vec<u8> {
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize - 1] = 0x90;
+    let code = [
+        0xd9, 0xe8, // fld1
+        0xd9, 0xee, // fldz
+        0xdd, 0xd1, // fst st(1)
+        0xd9, 0xe8, // fld1
+        0xdd, 0xd9, // fstp st(1)
+        0xd9, 0x1d, 0x00, 0x02, 0x00, 0x00, // fstp dword [0x200]
+        0xd9, 0x1d, 0x04, 0x02, 0x00, 0x00, // fstp dword [0x204]
+        0xd9, 0xe8, // fld1
+        0xdd, 0xd0, // fst st(0)
+        0xdd, 0xd8, // fstp st(0)
+        0x89, 0xc0, // mov eax,eax
+        0xf4,
+    ];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory
+}
+
+#[test]
+fn fld1_fldz_and_register_stores_match_the_interpreter() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let (cpu, bus) =
+            assert_program_matches(mode, constants_and_register_store_program(), 0x0f7f);
+        assert_eq!(
+            f32::from_bits(u32::from_le_bytes(
+                bus.memory[DATA..DATA + 4].try_into().unwrap()
+            )),
+            1.0,
+            "{mode:?}"
+        );
+        assert_eq!(
+            f32::from_bits(u32::from_le_bytes(
+                bus.memory[DATA + 4..DATA + 8].try_into().unwrap()
+            )),
+            0.0,
+            "{mode:?}"
+        );
+        assert_eq!(cpu.fpu.top(), 0, "{mode:?}");
+        assert_eq!(cpu.fpu.tag, 0xffff, "{mode:?}");
+        assert_eq!(cpu.perf_counters().jit_direct_side_exits, 0);
+    }
+}
+
 fn cross_page_load_program() -> Vec<u8> {
     let mut memory = vec![0; 0x2000];
     memory[ENTRY as usize - 1] = 0x90;

@@ -514,6 +514,13 @@ impl CpuBus for MachineBus<'_> {
         u64::from(izarravm_bus::BusCycle::clocks_for(width, wait_states))
     }
 
+    fn jit_scale_bus_cost_upper(&self, raw_clocks: u64) -> u64 {
+        raw_clocks
+            .saturating_mul(u64::from(self.bus_num_at_batch_start))
+            .saturating_add(u64::from(self.bus_den_at_batch_start) - 1)
+            / u64::from(self.bus_den_at_batch_start)
+    }
+
     fn rep_data_byte_cost_upper(&self) -> u64 {
         let ram = if self.flat_data_cost {
             self.cache.cost.l1
@@ -551,6 +558,10 @@ impl CpuBus for MachineBus<'_> {
         let clocks = self
             .jit_mode13_data_cost_clocks(BusWidth::Byte)
             .saturating_mul(writes.byte_writes)
+            .saturating_add(
+                self.jit_mode13_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(writes.word_writes),
+            )
             .saturating_add(
                 self.jit_mode13_data_cost_clocks(BusWidth::Dword)
                     .saturating_mul(writes.dword_writes),

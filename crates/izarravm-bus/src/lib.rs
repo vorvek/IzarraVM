@@ -188,12 +188,13 @@ pub struct DirectPage {
 pub struct NativeVgaWrites {
     pub dirty_pages: u16,
     pub byte_writes: u64,
+    pub word_writes: u64,
     pub dword_writes: u64,
 }
 
 impl NativeVgaWrites {
     pub const fn is_empty(self) -> bool {
-        self.byte_writes == 0 && self.dword_writes == 0
+        self.byte_writes == 0 && self.word_writes == 0 && self.dword_writes == 0
     }
 }
 
@@ -640,6 +641,13 @@ pub trait CpuBus {
     /// larger of this and the RAM cost for pre-entry deadline admission.
     fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
         self.jit_data_cost_clocks(width)
+    }
+
+    /// Convert a raw native bus-cost bound into the clock domain used by
+    /// `in_batch_scaled_bus_clocks`. The default is identity for buses whose
+    /// batch accounting is already raw or which do not scale bus time.
+    fn jit_scale_bus_cost_upper(&self, raw_clocks: u64) -> u64 {
+        raw_clocks
     }
 
     /// Conservative guest-clock cost for one byte of string data. Budgeted REP uses this before a

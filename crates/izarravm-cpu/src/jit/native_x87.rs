@@ -74,6 +74,10 @@ impl NativeX87BinaryOp {
 pub(crate) enum NativeX87PopOp {
     Add,
     Multiply,
+    Subtract,
+    SubtractReverse,
+    Divide,
+    DivideReverse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +103,12 @@ pub(crate) enum NativeX87Insn {
     Exchange {
         index: u8,
     },
+    StoreRegister {
+        index: u8,
+        pop: bool,
+    },
+    LoadOne,
+    LoadZero,
     LoadI32 {
         addr: AddrMode,
     },
@@ -109,6 +119,7 @@ pub(crate) enum NativeX87Insn {
         op: NativeX87PopOp,
         index: u8,
     },
+    ComparePopPop,
     StoreStatusAx,
 }
 
@@ -185,12 +196,33 @@ impl NativeX87Insn {
             }),
             (0xd9, 0, index) => Some(Self::LoadRegister { index }),
             (0xd9, 1, index) => Some(Self::Exchange { index }),
+            (0xd9, 5, 0) => Some(Self::LoadOne),
+            (0xd9, 5, 6) => Some(Self::LoadZero),
+            (0xda, 5, 1) | (0xde, 3, 1) => Some(Self::ComparePopPop),
+            (0xdd, 2, index) => Some(Self::StoreRegister { index, pop: false }),
+            (0xdd, 3, index) => Some(Self::StoreRegister { index, pop: true }),
             (0xde, 0, index) => Some(Self::PopBinary {
                 op: NativeX87PopOp::Add,
                 index,
             }),
             (0xde, 1, index) => Some(Self::PopBinary {
                 op: NativeX87PopOp::Multiply,
+                index,
+            }),
+            (0xde, 4, index) => Some(Self::PopBinary {
+                op: NativeX87PopOp::SubtractReverse,
+                index,
+            }),
+            (0xde, 5, index) => Some(Self::PopBinary {
+                op: NativeX87PopOp::Subtract,
+                index,
+            }),
+            (0xde, 6, index) => Some(Self::PopBinary {
+                op: NativeX87PopOp::DivideReverse,
+                index,
+            }),
+            (0xde, 7, index) => Some(Self::PopBinary {
+                op: NativeX87PopOp::Divide,
                 index,
             }),
             (0xdf, 4, 0) => Some(Self::StoreStatusAx),
@@ -238,11 +270,20 @@ impl NativeX87Insn {
                 pops: pop,
                 terminates_block: false,
             },
-            Self::LoadRegister { .. } | Self::Exchange { .. } => NativeX87Metadata {
-                raw_clocks: 4,
+            Self::LoadRegister { .. } | Self::Exchange { .. } | Self::LoadOne | Self::LoadZero => {
+                NativeX87Metadata {
+                    raw_clocks: 4,
+                    fp_class: FpOpClass::Register,
+                    memory: None,
+                    pops: false,
+                    terminates_block: false,
+                }
+            }
+            Self::StoreRegister { pop, .. } => NativeX87Metadata {
+                raw_clocks: 3,
                 fp_class: FpOpClass::Register,
                 memory: None,
-                pops: false,
+                pops: pop,
                 terminates_block: false,
             },
             Self::LoadI32 { .. } => NativeX87Metadata {
@@ -261,6 +302,13 @@ impl NativeX87Insn {
             },
             Self::PopBinary { .. } => NativeX87Metadata {
                 raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: true,
+                terminates_block: false,
+            },
+            Self::ComparePopPop => NativeX87Metadata {
+                raw_clocks: 5,
                 fp_class: FpOpClass::Register,
                 memory: None,
                 pops: true,
@@ -475,8 +523,12 @@ mod tests {
             (0xd8, 0..=3, 0..=7, 0..=7)
                 | (0xd9, 0..=2, 0 | 2 | 3, 0..=7)
                 | (0xd9, 3, 0 | 1, 0..=7)
+                | (0xd9, 3, 5, 0 | 6)
+                | (0xda, 3, 5, 1)
                 | (0xdb, 0..=2, 0 | 3, 0..=7)
-                | (0xde, 3, 0 | 1, 0..=7)
+                | (0xdd, 3, 2 | 3, 0..=7)
+                | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
+                | (0xde, 3, 3, 1)
                 | (0xdf, 3, 4, 0)
         )
     }
@@ -500,7 +552,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(accepted, 409);
+        assert_eq!(accepted, 461);
     }
 
     #[test]
@@ -534,6 +586,35 @@ mod tests {
             NativeX87Insn::classify(&insn(0xdf, 3, 4, 0)),
             Some(NativeX87Insn::StoreStatusAx)
         );
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xdd, 3, 3, 5)),
+            Some(NativeX87Insn::StoreRegister {
+                index: 5,
+                pop: true,
+            })
+        );
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xd9, 3, 5, 0)),
+            Some(NativeX87Insn::LoadOne)
+        );
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xd9, 3, 5, 6)),
+            Some(NativeX87Insn::LoadZero)
+        );
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xde, 3, 6, 2)),
+            Some(NativeX87Insn::PopBinary {
+                op: NativeX87PopOp::DivideReverse,
+                index: 2,
+            })
+        );
+        for opcode in [0xda, 0xde] {
+            let (reg, rm) = if opcode == 0xda { (5, 1) } else { (3, 1) };
+            assert_eq!(
+                NativeX87Insn::classify(&insn(opcode, 3, reg, rm)),
+                Some(NativeX87Insn::ComparePopPop)
+            );
+        }
     }
 
     #[test]
@@ -720,6 +801,36 @@ mod tests {
                 insn(0xde, 3, 0, 1),
                 NativeX87Metadata {
                     raw_clocks: 20,
+                    fp_class: FpOpClass::Register,
+                    memory: None,
+                    pops: true,
+                    terminates_block: false,
+                },
+            ),
+            (
+                insn(0xdd, 3, 3, 1),
+                NativeX87Metadata {
+                    raw_clocks: 3,
+                    fp_class: FpOpClass::Register,
+                    memory: None,
+                    pops: true,
+                    terminates_block: false,
+                },
+            ),
+            (
+                insn(0xd9, 3, 5, 0),
+                NativeX87Metadata {
+                    raw_clocks: 4,
+                    fp_class: FpOpClass::Register,
+                    memory: None,
+                    pops: false,
+                    terminates_block: false,
+                },
+            ),
+            (
+                insn(0xde, 3, 3, 1),
+                NativeX87Metadata {
+                    raw_clocks: 5,
                     fp_class: FpOpClass::Register,
                     memory: None,
                     pops: true,

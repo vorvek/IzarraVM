@@ -333,6 +333,14 @@ impl Encoder {
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// `mov dst16, src16` (66 + 89 /r). The upper 16 bits of the destination are preserved.
+    pub(crate) fn mov_r16_r16(&mut self, dst: Reg, src: Reg) {
+        self.bytes.push(0x66);
+        self.optional_rex(false, src.ext(), false, dst.ext());
+        self.bytes.push(0x89);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// `mov dst32, imm32` (B8+rd id; REX.B if dst is extended).
     pub(crate) fn mov_r32_imm32(&mut self, dst: Reg, imm: u32) {
         if dst.ext() {
@@ -618,6 +626,16 @@ impl Encoder {
         self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// A 16-bit register-register ALU operation. The operation numbers match `alu_r32_r32`.
+    pub(crate) fn alu_r16_r16(&mut self, op: u8, dst: Reg, src: Reg) {
+        const OPCODES: [u8; 8] = [0x01, 0x09, 0x11, 0x19, 0x21, 0x29, 0x31, 0x39];
+        assert!(op < 8, "ALU group must fit three bits");
+        self.bytes.push(0x66);
+        self.optional_rex(false, src.ext(), false, dst.ext());
+        self.bytes.push(OPCODES[usize::from(op)]);
+        self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// An 8-bit register-register ALU operation using AL, CL, DL, or BL.
     pub(crate) fn alu_r8_r8(&mut self, op: u8, dst: Reg, src: Reg) {
         const OPCODES: [u8; 8] = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38];
@@ -722,6 +740,17 @@ impl Encoder {
         self.bytes.push(disp8 as u8);
     }
 
+    /// `movzx dst32, word [base + disp8]` (0F B7 /r).
+    pub(crate) fn movzx_r32_word_disp8(&mut self, dst: Reg, base: Reg, disp8: i8) {
+        self.optional_rex(false, dst.ext(), false, base.ext());
+        self.bytes.extend_from_slice(&[0x0F, 0xB7]);
+        self.modrm(0b01, dst.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
     /// `mov [base + disp8], src8` (88 /r, mod=01 disp8, SIB if `base` is RSP/R12) -- store the low
     /// byte of `src` to `[base + disp8]`. The native byte-load probe uses this to write a loaded byte
     /// into a guest register's byte lane in the `Registers` array (low byte at `4*i`, high byte at
@@ -742,6 +771,18 @@ impl Encoder {
             self.rex(false, false, false, base.ext());
         }
         self.bytes.push(0x88);
+        self.modrm(0b01, src.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `mov word [base + disp8], src16` (66 + 89 /r).
+    pub(crate) fn store_r16_disp8(&mut self, base: Reg, disp8: i8, src: Reg) {
+        self.bytes.push(0x66);
+        self.optional_rex(false, src.ext(), false, base.ext());
+        self.bytes.push(0x89);
         self.modrm(0b01, src.low3(), base.low3());
         if Self::needs_sib(base) {
             self.bytes.push(0x24);
@@ -776,6 +817,18 @@ impl Encoder {
             self.rex(false, false, false, true);
         }
         self.bytes.push(0x3A);
+        self.modrm(0b01, reg.low3(), base.low3());
+        if Self::needs_sib(base) {
+            self.bytes.push(0x24);
+        }
+        self.bytes.push(disp8 as u8);
+    }
+
+    /// `cmp reg16, word [base + disp8]` (66 + 3B /r).
+    pub(crate) fn cmp_r16_disp8(&mut self, reg: Reg, base: Reg, disp8: i8) {
+        self.bytes.push(0x66);
+        self.optional_rex(false, reg.ext(), false, base.ext());
+        self.bytes.push(0x3B);
         self.modrm(0b01, reg.low3(), base.low3());
         if Self::needs_sib(base) {
             self.bytes.push(0x24);

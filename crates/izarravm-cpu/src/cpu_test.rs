@@ -1250,6 +1250,7 @@ struct TestBus {
     native_aggregate_accounting_disabled: bool,
     mode13_dirty_pages: u16,
     mode13_byte_writes: u64,
+    mode13_word_writes: u64,
     mode13_dword_writes: u64,
 }
 
@@ -1272,6 +1273,7 @@ impl TestBus {
             native_aggregate_accounting_disabled: false,
             mode13_dirty_pages: 0,
             mode13_byte_writes: 0,
+            mode13_word_writes: 0,
             mode13_dword_writes: 0,
         }
     }
@@ -1299,8 +1301,8 @@ impl TestBus {
         self.mode13_dirty_pages |= 1 << ((address - 0x000a_0000) >> 12);
         match width {
             BusWidth::Byte => self.mode13_byte_writes += 1,
+            BusWidth::Word => self.mode13_word_writes += 1,
             BusWidth::Dword => self.mode13_dword_writes += 1,
-            BusWidth::Word => {}
         }
     }
 }
@@ -1550,10 +1552,15 @@ impl CpuBus for TestBus {
     fn charge_native_mode13_writes(&mut self, writes: izarravm_bus::NativeMode13Writes) {
         self.mode13_dirty_pages |= writes.dirty_pages;
         self.mode13_byte_writes += writes.byte_writes;
+        self.mode13_word_writes += writes.word_writes;
         self.mode13_dword_writes += writes.dword_writes;
         let clocks = self
             .jit_mode13_data_cost_clocks(BusWidth::Byte)
             .saturating_mul(writes.byte_writes)
+            .saturating_add(
+                self.jit_mode13_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(writes.word_writes),
+            )
             .saturating_add(
                 self.jit_mode13_data_cost_clocks(BusWidth::Dword)
                     .saturating_mul(writes.dword_writes),

@@ -4082,7 +4082,7 @@ fn run_direct_timing_case(mode: GswMode, uniform_fetches: bool, case: &DirectTim
         code.extend_from_slice(&[0x89, 0xff]);
     }
     starts.push(ENTRY + code.len() as u32);
-    code.extend_from_slice(&[0x66, 0x89, 0xc0]);
+    code.extend_from_slice(&[0x66, 0x87, 0xc0]);
     let mut pristine = vec![0; 0x7000];
     pristine[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
     pristine[DATA..DATA + 4].copy_from_slice(&2.5f32.to_bits().to_le_bytes());
@@ -4435,6 +4435,177 @@ fn paged_quake_ds_ss_bases_match_load_store_and_call() {
 }
 
 #[test]
+fn finite_cs_near_returns_run_directly_and_match_interpreter() {
+    const ENTRY: u32 = 0x301;
+    const RET: u32 = ENTRY + 7;
+    const TARGET: u32 = 0x380;
+    const INITIAL_ESP: u32 = 0x2000;
+
+    for (return_bytes, release) in [(&[0xc3][..], 0u32), (&[0xc2, 0x08, 0x00][..], 8)] {
+        let mut memory = vec![0; 0xc000];
+        high_segment_page_tables(&mut memory);
+        memory[0x4008..0x400c].copy_from_slice(&0x0000_7067u32.to_le_bytes());
+        let mut code = vec![
+            0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+            0x89, 0xc1, // mov ecx,eax
+        ];
+        code.extend_from_slice(return_bytes);
+        memory[0x8301..0x8301 + code.len()].copy_from_slice(&code);
+        memory[0x7000..0x7004].copy_from_slice(&TARGET.to_le_bytes());
+
+        let mut native = quake_segment_cpu(ENTRY, true);
+        let mut interp = quake_segment_cpu(ENTRY, true);
+        let mut native_bus = TestBus::with_memory(memory.clone());
+        let mut interp_bus = TestBus::with_memory(memory);
+        for bus in [&mut native_bus, &mut interp_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        let starts = [ENTRY, ENTRY + 5, RET];
+        decode_segmented_fixture(&mut native, &mut native_bus, &starts);
+        decode_segmented_fixture(&mut interp, &mut interp_bus, &starts);
+        for (cpu, bus) in [
+            (&mut native, &mut native_bus),
+            (&mut interp, &mut interp_bus),
+        ] {
+            map_direct_page(
+                cpu,
+                bus,
+                QUAKE_SEGMENT_BASE + INITIAL_ESP,
+                0x7000,
+                jit::fast_map::PagePermissions {
+                    writable: true,
+                    user: true,
+                },
+                true,
+                false,
+            );
+        }
+        let block = install_fixture_block(&mut native, QUAKE_SEGMENT_BASE + ENTRY);
+        assert_eq!(block.span().instructions, 3);
+        arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+        arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, block)
+                .unwrap()
+        );
+        for _ in 0..3 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.registers, interp.registers);
+        assert_eq!(native.pending_flags, interp.pending_flags);
+        assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(native.registers.eip, TARGET);
+        assert_eq!(native.registers.esp(), INITIAL_ESP + 4 + release);
+    }
+}
+
+#[test]
+fn finite_cs_ret_limit_exit_preserves_restart_state_and_faults_precisely() {
+    for stack_physical in [0x7000, 0x000a_0000] {
+        finite_cs_ret_limit_exit_case(stack_physical);
+    }
+}
+
+fn finite_cs_ret_limit_exit_case(stack_physical: u32) {
+    const ENTRY: u32 = 0x301;
+    const RET: u32 = ENTRY + 7;
+    const INITIAL_ESP: u32 = 0x2000;
+    let mut memory = vec![0; 0x000b_0000];
+    high_segment_page_tables(&mut memory);
+    memory[0x4008..0x400c].copy_from_slice(&(stack_physical | 0x67).to_le_bytes());
+    memory[0x8301..0x8309].copy_from_slice(&[
+        0xb8, 0x44, 0x33, 0x22, 0x11, // mov eax,0x11223344
+        0x89, 0xc1, // mov ecx,eax
+        0xc3, // ret
+    ]);
+    let stack = stack_physical as usize;
+    memory[stack..stack + 4].copy_from_slice(&(QUAKE_CS_LIMIT + 1).to_le_bytes());
+
+    let mut native = quake_segment_cpu(ENTRY, true);
+    let mut interp = quake_segment_cpu(ENTRY, true);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [ENTRY, ENTRY + 5, RET];
+    decode_segmented_fixture(&mut native, &mut native_bus, &starts);
+    decode_segmented_fixture(&mut interp, &mut interp_bus, &starts);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        QUAKE_SEGMENT_BASE + INITIAL_ESP,
+        stack_physical,
+        jit::fast_map::PagePermissions {
+            writable: true,
+            user: true,
+        },
+        true,
+        false,
+    );
+    let block = install_fixture_block(&mut native, QUAKE_SEGMENT_BASE + ENTRY);
+    assert_eq!(block.span().instructions, 3);
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+    let side_exits = native.perf_counters().jit_direct_side_exits;
+    let other_exits = native.perf_counters().jit_direct_exit_other;
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, block)
+            .unwrap()
+    );
+    interp.cycle(&mut interp_bus).unwrap();
+    interp.cycle(&mut interp_bus).unwrap();
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.registers.eip, RET);
+    assert_eq!(native.registers.esp(), INITIAL_ESP);
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.perf_counters().jit_direct_side_exits - side_exits, 1);
+    assert_eq!(
+        native.perf_counters().jit_direct_exit_other - other_exits,
+        1
+    );
+
+    let native_ret = native
+        .decode_cache
+        .get(QUAKE_SEGMENT_BASE + RET, true)
+        .unwrap();
+    let interp_ret = interp
+        .decode_cache
+        .get(QUAKE_SEGMENT_BASE + RET, true)
+        .unwrap();
+    let native_fault = native.execute_decoded(&native_ret, &mut native_bus);
+    let interp_fault = interp.execute_decoded(&interp_ret, &mut interp_bus);
+    for fault in [native_fault, interp_fault] {
+        assert!(matches!(
+            fault,
+            Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            })
+        ));
+    }
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.registers.eip, RET);
+    assert_eq!(native.registers.esp(), INITIAL_ESP);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+}
+
+#[test]
 fn nonflat_segment_limit_and_permission_fallbacks_are_transactional() {
     const ENTRY: u32 = 0x201;
     const STORE: u32 = ENTRY + 9;
@@ -4629,5 +4800,151 @@ fn descriptor_change_selectively_recompiles_and_does_not_keep_a_stale_link() {
     assert_eq!(
         cpu.perf_counters().jit_direct_linked_transfers - transfers,
         1
+    );
+}
+
+#[test]
+fn word_renderer_slice_is_admitted_only_for_586() {
+    const ENTRY: u32 = 0x101;
+    let code = [
+        0x89, 0xc0, // mov eax,eax
+        0x89, 0xc9, // mov ecx,ecx
+        0x89, 0xd2, // mov edx,edx
+        0x66, 0x89, 0xc0, // mov ax,ax
+        0x89, 0xdb, // mov ebx,ebx
+        0x89, 0xf6, // mov esi,esi
+    ];
+    let starts = [
+        ENTRY,
+        ENTRY + 2,
+        ENTRY + 4,
+        ENTRY + 6,
+        ENTRY + 9,
+        ENTRY + 11,
+    ];
+
+    for (mode, expected_instructions) in [(GswMode::Gsw486, 3), (GswMode::Gsw586, 6)] {
+        let mut memory = vec![0; 0x1000];
+        memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+        let mut cpu = flat_stack_cpu(ENTRY);
+        cpu.set_mode(mode);
+        let mut bus = TestBus::with_memory(memory);
+        decode_fixture(&mut cpu, &mut bus, &starts);
+
+        let block = install_fixture_block(&mut cpu, ENTRY);
+        assert_eq!(block.span().instructions, expected_instructions, "{mode:?}");
+    }
+}
+
+#[test]
+fn quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing() {
+    const ENTRY: u32 = 0x101;
+    const DATA: u32 = 0x3000;
+    let code = [
+        0x66, 0x89, 0xd8, // mov ax,bx
+        0x66, 0x8b, 0xf8, // mov di,ax
+        0x66, 0x89, 0x0d, 0x00, 0x30, 0x00, 0x00, // mov word [DATA],cx
+        0x66, 0x8b, 0x15, 0x00, 0x30, 0x00, 0x00, // mov dx,word [DATA]
+        0x66, 0xff, 0x05, 0x02, 0x30, 0x00, 0x00, // inc word [DATA+2]
+        0x66, 0xff, 0x0d, 0x02, 0x30, 0x00, 0x00, // dec word [DATA+2]
+        0x66, 0x4b, // dec bx
+        0x66, 0xff, 0xc1, // inc cx through FF /0
+        0x66, 0x39, 0x1d, 0x00, 0x30, 0x00, 0x00, // cmp word [DATA],bx
+        0x72, 0x0b, // jb final HLT, not taken when the preceding CMP is correct
+        0x66, 0x3b, 0x1d, 0x00, 0x30, 0x00, 0x00, // cmp bx,word [DATA]
+        0x89, 0xf6, // mov esi,esi keeps the comparison flags live
+        0x89, 0xf6, // second filler keeps the comparison block independently compilable
+        0xf4,
+    ];
+    let starts = [
+        ENTRY,
+        ENTRY + 3,
+        ENTRY + 6,
+        ENTRY + 13,
+        ENTRY + 20,
+        ENTRY + 27,
+        ENTRY + 34,
+        ENTRY + 36,
+        ENTRY + 39,
+        ENTRY + 46,
+        ENTRY + 48,
+        ENTRY + 55,
+        ENTRY + 57,
+    ];
+    let mut memory = vec![0; 0x5000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[DATA as usize + 2..DATA as usize + 4].copy_from_slice(&0xffffu16.to_le_bytes());
+
+    let mut direct = flat_stack_cpu(ENTRY);
+    let mut interpreter = flat_stack_cpu(ENTRY);
+    let mut direct_bus = TestBus::with_memory(memory.clone());
+    let mut interpreter_bus = TestBus::with_memory(memory);
+    for bus in [&mut direct_bus, &mut interpreter_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    decode_fixture(&mut direct, &mut direct_bus, &starts);
+    decode_fixture(&mut interpreter, &mut interpreter_bus, &starts);
+    for (cpu, bus) in [
+        (&mut direct, &mut direct_bus),
+        (&mut interpreter, &mut interpreter_bus),
+    ] {
+        map_direct_page(
+            cpu,
+            bus,
+            DATA,
+            DATA,
+            jit::fast_map::PagePermissions::UNPAGED,
+            true,
+            true,
+        );
+        cpu.registers.set_ecx(0xaaaa_1234);
+        cpu.registers.set_edx(0xbbbb_0000);
+        cpu.registers.set_ebx(0xcccc_1200);
+        cpu.registers.set_eax(0xdddd_0000);
+        cpu.registers.set_edi(0xeeee_0000);
+        cpu.registers.eflags = 0x203;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.set_eip(ENTRY);
+    }
+    let first = install_fixture_block(&mut direct, ENTRY);
+    let first_compare = install_fixture_block(&mut direct, ENTRY + 39);
+    let second_compare = install_fixture_block(&mut direct, ENTRY + 48);
+    assert_eq!(first.span().instructions, 8);
+    assert_eq!(first.word_reads(), 3);
+    assert_eq!(first.word_stores(), 3);
+    assert_eq!(first_compare.span().instructions, 2);
+    assert_eq!(first_compare.word_reads(), 1);
+    assert_eq!(first_compare.word_stores(), 0);
+    assert_eq!(second_compare.span().instructions, 3);
+    assert_eq!(second_compare.word_reads(), 1);
+    assert_eq!(second_compare.word_stores(), 0);
+
+    assert!(
+        direct
+            .try_run_direct_block_for_test(&mut direct_bus, first)
+            .unwrap()
+    );
+    for _ in 0..13 {
+        interpreter.cycle(&mut interpreter_bus).unwrap();
+    }
+
+    assert_eq!(direct.registers, interpreter.registers);
+    assert_eq!(direct.pending_flags, interpreter.pending_flags);
+    assert_eq!(direct.eflags(), interpreter.eflags());
+    assert_eq!(direct_bus.memory, interpreter_bus.memory);
+    assert_eq!(direct.elapsed_clocks, interpreter.elapsed_clocks);
+    assert_eq!(
+        direct_bus.trace.elapsed_clocks(),
+        interpreter_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(direct.registers.edx(), 0xbbbb_1234);
+    assert_eq!(direct.registers.ebx(), 0xcccc_11ff);
+    assert_eq!(direct.registers.ecx(), 0xaaaa_1235);
+    assert_eq!(direct.registers.eax(), 0xdddd_1200);
+    assert_eq!(direct.registers.edi(), 0xeeee_1200);
+    assert_eq!(
+        &direct_bus.memory[DATA as usize..DATA as usize + 4],
+        &[0x34, 0x12, 0xff, 0xff]
     );
 }
