@@ -674,7 +674,7 @@ pub(super) fn run_profile_exe(
 
     let baseline_metrics = bench_metrics(&baseline, mode);
     println!();
-    print_machine_profile(&profiled.machine_profile);
+    print_machine_profile(&profiled.machine_profile, profiled.wall);
     println!();
     print_cpu_profile(&profiled.cpu_profile);
     println!();
@@ -694,10 +694,14 @@ pub(super) fn run_profile_exe(
     Ok(())
 }
 
-fn print_machine_profile(snapshot: &MachineHostProfileSnapshot) {
+pub(super) fn print_machine_profile(
+    snapshot: &MachineHostProfileSnapshot,
+    total_wall: std::time::Duration,
+) {
     let mut phases = snapshot.phases.clone();
     phases.sort_by_key(|phase| Reverse(phase.wall_ns));
-    let total_ns = phases.iter().map(|phase| phase.wall_ns).sum::<u64>().max(1);
+    let classified_ns = phases.iter().map(|phase| phase.wall_ns).sum::<u64>();
+    let total_ns = total_wall.as_nanos().min(u128::from(u64::MAX)).max(1) as u64;
     println!("=== machine phases ===");
     println!(
         "{:<20} {:>12} {:>10} {:>8}",
@@ -715,6 +719,14 @@ fn print_machine_profile(snapshot: &MachineHostProfileSnapshot) {
             100.0 * phase.wall_ns as f64 / total_ns as f64,
         );
     }
+    let unattributed_ns = total_ns.saturating_sub(classified_ns);
+    println!(
+        "{:<20} {:>12.3} {:>10} {:>7.2}%",
+        "unattributed",
+        unattributed_ns as f64 / 1_000_000.0,
+        1,
+        100.0 * unattributed_ns as f64 / total_ns as f64,
+    );
 }
 
 pub(super) fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
@@ -918,7 +930,7 @@ fn write_profile_json(
     Ok(())
 }
 
-fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
+pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
     json!({
         "instructions": perf.instructions,
         "decode_misses": perf.decode_misses,
@@ -946,11 +958,49 @@ fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "flag_materializations": perf.flag_materializations,
         "cache_tier_lookups": perf.cache_tier_lookups,
         "smc_narrow_kills": perf.smc_narrow_kills,
+        "device_write_ranges": perf.device_write_ranges,
+        "device_write_bytes": perf.device_write_bytes,
+        "device_write_code_hits": perf.device_write_code_hits,
+        "device_write_coarse_resets": perf.device_write_coarse_resets,
         "jit_region_entries": perf.jit_region_entries,
         "jit_region_insns": perf.jit_region_insns,
         "jit_native_insns": perf.jit_native_insns,
         "jit_helper_exits": perf.jit_helper_exits,
         "jit_native_memory_helpers": perf.jit_native_memory_helpers,
+        "jit_direct_entries": perf.jit_direct_entries,
+        "jit_direct_insns": perf.jit_direct_insns,
+        "jit_direct_side_exits": perf.jit_direct_side_exits,
+        "jit_direct_exit_cross_page_or_alignment": perf.jit_direct_exit_cross_page_or_alignment,
+        "jit_direct_exit_unavailable_or_kind": perf.jit_direct_exit_unavailable_or_kind,
+        "jit_direct_exit_permission": perf.jit_direct_exit_permission,
+        "jit_direct_exit_code_watch": perf.jit_direct_exit_code_watch,
+        "jit_direct_exit_other": perf.jit_direct_exit_other,
+        "jit_direct_compile_attempts": perf.jit_direct_compile_attempts,
+        "jit_direct_blocks_installed": perf.jit_direct_blocks_installed,
+        "jit_direct_compile_ns": perf.jit_direct_compile_ns,
+        "jit_direct_hot_hits": perf.jit_direct_hot_hits,
+        "jit_direct_hash_hits": perf.jit_direct_hash_hits,
+        "jit_direct_lookup_misses": perf.jit_direct_lookup_misses,
+        "jit_direct_linked_transfers": perf.jit_direct_linked_transfers,
+        "jit_direct_unresolved_exits": perf.jit_direct_unresolved_exits,
+        "jit_direct_deferred_short": perf.jit_direct_deferred_short,
+        "jit_direct_reject_observer": perf.jit_direct_reject_observer,
+        "jit_direct_reject_interrupt_shadow": perf.jit_direct_reject_interrupt_shadow,
+        "jit_direct_reject_aggregate_accounting": perf.jit_direct_reject_aggregate_accounting,
+        "jit_direct_reject_mode_key": perf.jit_direct_reject_mode_key,
+        "jit_direct_reject_cs_layout": perf.jit_direct_reject_cs_layout,
+        "jit_direct_reject_cpl": perf.jit_direct_reject_cpl,
+        "jit_direct_reject_data_segment": perf.jit_direct_reject_data_segment,
+        "jit_direct_reject_alignment": perf.jit_direct_reject_alignment,
+        "jit_direct_reject_fetch_limit": perf.jit_direct_reject_fetch_limit,
+        "jit_direct_reject_zero_budget": perf.jit_direct_reject_zero_budget,
+        "jit_direct_cache_resets": perf.jit_direct_cache_resets,
+        "jit_direct_arena_compactions": perf.jit_direct_arena_compactions,
+        "jit_direct_arena_compaction_live_blocks": perf.jit_direct_arena_compaction_live_blocks,
+        "jit_direct_arena_compaction_bytes": perf.jit_direct_arena_compaction_bytes,
+        "jit_direct_arena_compaction_failures": perf.jit_direct_arena_compaction_failures,
+        "jit_direct_links_created": perf.jit_direct_links_created,
+        "jit_direct_links_cleared": perf.jit_direct_links_cleared,
         "jit_native_block_ns": perf.jit_native_block_ns,
         "jit_native_block_samples": perf.jit_native_block_samples,
         "jit_native_load_hits": perf.jit_native_load_hits,
@@ -969,8 +1019,11 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
          inval[cs/smc/other/all]={}/{}/{}/{} narrow={}  \
          data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
-         map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
-         jit[entries/insns/native/helper]={}/{}/{}/{}  \
+         map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
+         jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
+         compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
+         arena[compact/live/bytes/fail]={}/{}/{}/{}  \
+         gate[obs/shadow/agg/mode/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
          jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
         name,
         mode.canonical_name(),
@@ -999,6 +1052,10 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.fetch_page_misses,
         perf.slow_prefetch_refills,
         perf.direct_map_invalidations,
+        perf.device_write_ranges,
+        perf.device_write_bytes,
+        perf.device_write_code_hits,
+        perf.device_write_coarse_resets,
         perf.rep_string_fast_iterations,
         perf.rep_string_iterations,
         perf.flag_materializations,
@@ -1007,6 +1064,36 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.jit_region_insns,
         perf.jit_native_insns,
         perf.jit_helper_exits,
+        perf.jit_direct_entries,
+        perf.jit_direct_insns,
+        perf.jit_direct_side_exits,
+        perf.jit_direct_linked_transfers,
+        perf.jit_direct_unresolved_exits,
+        perf.jit_direct_deferred_short,
+        perf.jit_direct_compile_attempts,
+        perf.jit_direct_blocks_installed,
+        perf.jit_direct_compile_ns,
+        perf.jit_direct_hot_hits,
+        perf.jit_direct_hash_hits,
+        perf.jit_direct_lookup_misses,
+        perf.jit_direct_links_created,
+        perf.jit_direct_links_cleared,
+        perf.jit_direct_cache_resets,
+        perf.jit_direct_arena_compactions,
+        perf.jit_direct_arena_compaction_live_blocks,
+        perf.jit_direct_arena_compaction_bytes,
+        perf.jit_direct_arena_compaction_failures,
+        perf.jit_direct_reject_observer,
+        perf.jit_direct_reject_interrupt_shadow,
+        perf.jit_direct_reject_aggregate_accounting,
+        perf.jit_direct_reject_mode_key,
+        perf.jit_direct_reject_cs_layout,
+        perf.jit_direct_reject_cpl,
+        perf.jit_direct_reject_data_segment,
+        perf.jit_direct_reject_alignment,
+        perf.jit_direct_reject_fetch_limit,
+        perf.jit_direct_deferred_short,
+        perf.jit_direct_reject_zero_budget,
         perf.jit_native_load_hits,
         perf.jit_native_store_hits,
         perf.jit_paged_tlb_successes,

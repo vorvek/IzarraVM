@@ -79,6 +79,223 @@ fn pacing_sleeps_only_when_the_guest_is_caught_up() {
 }
 
 #[test]
+fn fast_modes_run_one_bounded_quantum_while_accurate_modes_use_the_credit() {
+    let credit = (MASTER_CLOCK_HZ / 20) as i64;
+    assert_eq!(execution_budget(credit, true), FAST_EMU_QUANTUM_TICKS);
+    assert_eq!(execution_budget(credit, false), credit as u64);
+    assert_eq!(execution_budget(-1, true), 0);
+}
+
+#[test]
+fn only_halted_guests_receive_device_only_top_up() {
+    let budget = MASTER_CLOCK_HZ / 20;
+    let executed = FAST_EMU_QUANTUM_TICKS;
+    assert_eq!(halted_device_top_up(budget, executed, false), 0);
+    assert_eq!(
+        halted_device_top_up(budget, executed, true),
+        budget - executed
+    );
+}
+
+#[test]
+fn pacing_settlement_distinguishes_ahead_and_behind_execution() {
+    let cap = MASTER_CLOCK_HZ / 20;
+    let quantum = FAST_EMU_QUANTUM_TICKS;
+
+    let ahead = settle_credit(quantum as i64, quantum * 2, Duration::ZERO, cap);
+    assert!(ahead < 0);
+    assert!(emulation_should_sleep(ahead, false));
+
+    let behind = settle_credit(quantum as i64, quantum, Duration::from_millis(3), cap);
+    assert_eq!(behind, (MASTER_CLOCK_HZ * 3 / 1000) as i64);
+    assert!(!emulation_should_sleep(behind, false));
+}
+
+#[test]
+fn pacing_settlement_caps_catch_up_and_preserves_io_debt() {
+    let cap = MASTER_CLOCK_HZ / 20;
+    assert_eq!(
+        settle_credit(0, 0, Duration::from_millis(500), cap),
+        cap as i64
+    );
+
+    let credit = FAST_EMU_QUANTUM_TICKS as i64;
+    let disk_jump = MASTER_CLOCK_HZ / 5;
+    let after_disk = settle_credit(credit, disk_jump, Duration::from_millis(1), cap);
+    assert!(after_disk < 0);
+    assert_eq!(execution_budget(after_disk, true), 0);
+}
+
+#[test]
+fn runtime_profile_accumulates_host_phase_times() {
+    let mut metrics = RuntimeProfileMetrics::default();
+    metrics.record_work(
+        Duration::from_nanos(2),
+        Duration::from_nanos(3),
+        Duration::from_nanos(5),
+    );
+    metrics.record_work(
+        Duration::from_nanos(7),
+        Duration::from_nanos(11),
+        Duration::from_nanos(13),
+    );
+    metrics.record_sleep(Duration::from_nanos(17));
+
+    assert_eq!(metrics.emulation_work_wall_ns, 9);
+    assert_eq!(metrics.host_audio_mix_queue_wall_ns, 14);
+    assert_eq!(metrics.frame_conversion_publish_wall_ns, 18);
+    assert_eq!(metrics.throttle_sleep_wall_ns, 17);
+}
+
+#[test]
+fn runtime_profile_tracks_catchup_credit_and_throttle_ahead_independently() {
+    let mut metrics = RuntimeProfileMetrics::default();
+    metrics.observe_credit(120);
+    metrics.observe_credit(-75);
+    metrics.observe_credit(40);
+    metrics.observe_credit(-200);
+
+    assert_eq!(metrics.current_pacing_credit_ticks, -200);
+    assert_eq!(metrics.max_catchup_credit_ticks, 120);
+    assert_eq!(metrics.max_throttle_ahead_ticks, 200);
+}
+
+#[test]
+fn runtime_profile_counts_latest_frame_publication_and_backpressure() {
+    let mut metrics = RuntimeProfileMetrics::default();
+    metrics.record_frame(0, u64::MAX, true);
+    metrics.record_frame(12, 10, true);
+    metrics.record_frame(13, 12, false);
+    metrics.record_backpressure(Duration::from_millis(25));
+
+    assert_eq!(metrics.frames_produced, 2);
+    assert_eq!(metrics.frames_skipped, 1);
+    assert_eq!(
+        metrics.presentation_backpressure_wall_ns,
+        duration_ns(Duration::from_millis(25))
+    );
+}
+
+#[test]
+fn runtime_profile_json_has_stable_fields_and_derived_values() {
+    let metrics = RuntimeProfileMetrics {
+        emulation_work_wall_ns: 2,
+        host_audio_mix_queue_wall_ns: 3,
+        frame_conversion_publish_wall_ns: 5,
+        guest_master_ticks: MASTER_CLOCK_HZ / 2,
+        current_pacing_credit_ticks: -(MASTER_CLOCK_HZ as i64 / 4),
+        max_catchup_credit_ticks: MASTER_CLOCK_HZ / 2,
+        max_throttle_ahead_ticks: MASTER_CLOCK_HZ / 4,
+        frames_produced: 7,
+        frames_skipped: 2,
+        ..RuntimeProfileMetrics::default()
+    };
+    let audio = AudioDebugSnapshot {
+        underruns_after_prefill: 11,
+        overruns: 13,
+        late_callbacks: 17,
+        ..AudioDebugSnapshot::default()
+    };
+    let total_metrics = RuntimeProfileMetrics {
+        guest_master_ticks: MASTER_CLOCK_HZ * 3 / 2,
+        ..metrics
+    };
+    let value = serde_json::to_value(RuntimeProfileReport::new(
+        "interval",
+        4,
+        Duration::from_secs(1),
+        metrics,
+        Duration::from_secs(2),
+        total_metrics,
+        Some(audio),
+    ))
+    .unwrap();
+
+    assert_eq!(value["schema"], RUNTIME_PROFILE_SCHEMA);
+    assert_eq!(value["scope"], "interval");
+    assert_eq!(value["active_work_wall_ns"], 10);
+    assert_eq!(value["guest_realtime_factor"], 0.5);
+    assert_eq!(value["uncapped_wall_guest_lag_ticks"], MASTER_CLOCK_HZ / 2);
+    assert_eq!(value["uncapped_wall_guest_lag_seconds"], 0.5);
+    assert_eq!(value["total_guest_realtime_factor"], 0.75);
+    assert_eq!(
+        value["uncapped_total_wall_guest_lag_ticks"],
+        MASTER_CLOCK_HZ / 2
+    );
+    assert_eq!(value["current_catchup_credit_ticks"], 0);
+    assert_eq!(value["current_throttle_ahead_ticks"], MASTER_CLOCK_HZ / 4);
+    assert_eq!(value["current_throttle_ahead_seconds"], 0.25);
+    assert_eq!(value["max_catchup_credit_seconds"], 0.5);
+    assert_eq!(value["frames_produced"], 7);
+    assert_eq!(value["frames_skipped"], 2);
+    assert_eq!(value["audio_underruns_after_prefill"], 11);
+    assert_eq!(value["audio_overruns"], 13);
+    assert_eq!(value["audio_late_callbacks"], 17);
+    assert!(value.get("audio_queue_lifetime_min_depth").is_some());
+    assert!(
+        value
+            .get("audio_lifetime_max_callback_lateness_us")
+            .is_some()
+    );
+}
+
+#[test]
+fn runtime_profile_final_audio_counts_start_at_profile_enable() {
+    let baseline = AudioDebugSnapshot {
+        frames_produced: 100,
+        underruns_after_prefill: 7,
+        overruns: 3,
+        ..AudioDebugSnapshot::default()
+    };
+    let current = AudioDebugSnapshot {
+        frames_produced: 140,
+        underruns_after_prefill: 9,
+        overruns: 8,
+        ..AudioDebugSnapshot::default()
+    };
+
+    let delta = audio_snapshot_since(Some(current), Some(baseline)).unwrap();
+    assert_eq!(delta.frames_produced, 40);
+    assert_eq!(delta.underruns_after_prefill, 2);
+    assert_eq!(delta.overruns, 5);
+}
+
+#[test]
+fn frame_publish_waits_for_ack_then_selects_the_newest_frame() {
+    let published_seq = 10;
+    let published_generation = Some(100);
+
+    assert!(!should_publish_frame(
+        11,
+        published_seq,
+        9,
+        Some(101),
+        published_generation,
+    ));
+    assert!(!should_publish_frame(
+        12,
+        published_seq,
+        9,
+        Some(102),
+        published_generation,
+    ));
+    assert!(should_publish_frame(
+        12,
+        published_seq,
+        published_seq,
+        Some(102),
+        published_generation,
+    ));
+}
+
+#[test]
+fn frame_publish_skips_static_graphics_after_ack() {
+    assert!(should_publish_frame(0, u64::MAX, u64::MAX, Some(1), None));
+    assert!(!should_publish_frame(11, 10, 10, Some(7), Some(7)));
+    assert!(should_publish_frame(11, 10, 10, None, None));
+}
+
+#[test]
 fn speed_sample_marks_exactly_ninety_percent_hlt_as_idle() {
     let wall = Duration::from_secs(1);
     assert!(!speed_sample(100, 899, 1_000, wall).1);
@@ -114,114 +331,6 @@ fn disk_overshoot_holds_the_guest() {
     // After enough wall time the debt clears and the guest runs again.
     credit = refill_credit(credit, Duration::from_millis(500), cap);
     assert!(credit > 0, "debt repaid once wall-clock catches up");
-}
-
-#[test]
-fn top_up_escape_hatch_caps_edge_stops_for_a_pathological_crtc() {
-    // A guest-programmed CRTC with kHz-rate frames would put hundreds of
-    // vretrace edges inside one slice's shortfall; the defensive cap must
-    // bound the peek work and consume the remainder unclamped instead of
-    // livelocking the emulate thread.
-    // ROM: reset far-jumps to F000:0000, programs the small CRTC frame through
-    // guest I/O, then spins forever so peeks never stop early.
-    let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
-    let mut code = vec![0xBA, 0xD4, 0x03]; // mov dx, 03D4h
-    for (index, value) in [
-        (0x11u8, 0x0Eu8),
-        (0x07, 0x00),
-        (0x06, 18),
-        (0x12, 9),
-        (0x10, 12),
-    ] {
-        code.extend_from_slice(&[
-            0xB0, index, // mov al, index
-            0xEE,  // out dx, al
-            0x42,  // inc dx
-            0xB0, value, // mov al, value
-            0xEE,  // out dx, al
-            0x4A,  // dec dx
-        ]);
-    }
-    code.extend_from_slice(&[0xEB, 0xFE]); // jmp $
-    rom[..code.len()].copy_from_slice(&code);
-    rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
-        rom,
-    )
-    .unwrap();
-    // Mode 13h, then shrink the frame to 20 scanlines (~0.64ms, ~1570
-    // edges/s): unprotect + vretrace end 14, overflow 0, vtotal 18+2,
-    // vdisp end 9+1, vretrace start 12.
-    assert!(machine.set_vga_mode(0x13));
-    let _ = machine.run_until_halt_or_cycles(1_000).unwrap();
-    let asked = MASTER_CLOCK_HZ / 10; // 100ms of shortfall: ~157 edges, cap is 12
-    let work_before = machine.elapsed_clocks();
-    let ticks_before = machine.master_ticks();
-    let top_up = top_up_shortfall(&mut machine, asked);
-    assert_eq!(
-        top_up.topped_up_ticks, asked,
-        "the escape hatch must still consume the full shortfall"
-    );
-    assert_eq!(
-        machine.elapsed_clocks() - work_before,
-        machine
-            .active_mode()
-            .clock_rate()
-            .clocks_for_master_ticks_floor(top_up.peeked_ticks),
-        "only executed peeks count as CPU work"
-    );
-    assert_eq!(
-        machine.master_ticks() - ticks_before,
-        asked + top_up.peeked_ticks,
-        "the timeline advances by the shortfall plus executed peeks"
-    );
-    // The cap allows asked/10ms + 2 = 12 stops; each peek runs about
-    // VRETRACE_PEEK_CLOCKS (allow 2x for run-loop batch overshoot). An
-    // uncapped loop would have peeked ~157 times.
-    let max_stops = asked / (MASTER_CLOCK_HZ / 100) + 2;
-    let max_peek_ticks = machine
-        .active_mode()
-        .clock_rate()
-        .master_ticks_for_clocks_ceil(max_stops * VRETRACE_PEEK_CLOCKS * 2);
-    assert!(
-        top_up.peeked_ticks <= max_peek_ticks,
-        "peek work must be bounded by the stop cap (peeked {} over {} stops max)",
-        top_up.peeked_ticks,
-        max_stops
-    );
-}
-
-#[test]
-fn top_up_aborts_when_the_peek_halts() {
-    // ROM: reset far-jumps to F000:0000 which runs CLI; HLT, so the very
-    // first vretrace-edge peek halts the guest. The top-up must break
-    // instead of continuing to create time against a halted machine (the
-    // next slice's own Halted handling takes over).
-    let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
-    rom[0] = 0xFA; // cli
-    rom[1] = 0xF4; // hlt
-    rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
-    let mut machine = Machine::new(
-        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
-        rom,
-    )
-    .unwrap();
-    let asked = MASTER_CLOCK_HZ; // one guest second: dozens of frames
-    let top_up = top_up_shortfall(&mut machine, asked);
-    assert!(
-        top_up.topped_up_ticks < asked / 2,
-        "a halted peek must abort the top-up (topped up {} of {asked})",
-        top_up.topped_up_ticks
-    );
-    assert!(
-        top_up.peeked_ticks > 0,
-        "the aborting peek itself executed guest time"
-    );
-    assert!(
-        matches!(tick_machine(&mut machine, 1_000), Some(StopReason::Halted)),
-        "the machine is halted after the aborted top-up"
-    );
 }
 
 #[test]

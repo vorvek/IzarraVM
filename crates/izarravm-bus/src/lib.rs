@@ -182,6 +182,25 @@ pub struct DirectPage {
     pub writable: bool,
 }
 
+/// Writes completed through a native VGA aperture fast path during one CPU block chain.
+/// The bus applies dirty tracking and timing once at the chain boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeVgaWrites {
+    pub dirty_pages: u16,
+    pub byte_writes: u64,
+    pub dword_writes: u64,
+}
+
+impl NativeVgaWrites {
+    pub const fn is_empty(self) -> bool {
+        self.byte_writes == 0 && self.dword_writes == 0
+    }
+}
+
+/// Compatibility name retained while the direct CPU backend still labels the
+/// VGA aperture page kind as Mode 13h.
+pub type NativeMode13Writes = NativeVgaWrites;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusState {
     T1,
@@ -330,6 +349,50 @@ impl BusTrace {
         }
     }
 
+    /// Record a contiguous run of equal-width memory cycles. In the normal off mode this folds
+    /// the whole run into one clock update. Counts and full tracing retain the same access count
+    /// and addresses as individual `record` calls.
+    #[inline]
+    pub fn record_memory_run(
+        &mut self,
+        kind: BusAccessKind,
+        address: u32,
+        count: u32,
+        width: BusWidth,
+        wait_states: u8,
+    ) {
+        let clocks = BusCycle::clocks_for(width, wait_states);
+        self.elapsed_clocks += u64::from(clocks) * u64::from(count);
+        if self.mode != TracingMode::Off {
+            self.record_traced_memory_run(kind, address, count, width, wait_states);
+        }
+    }
+
+    #[cold]
+    fn record_traced_memory_run(
+        &mut self,
+        kind: BusAccessKind,
+        address: u32,
+        count: u32,
+        width: BusWidth,
+        wait_states: u8,
+    ) {
+        self.access_count += u64::from(count);
+        if self.mode == TracingMode::Full && self.capacity > 0 {
+            for i in 0..count {
+                if self.cycles.len() == self.capacity {
+                    self.cycles.pop_front();
+                }
+                self.cycles.push_back(BusCycle::new(
+                    kind,
+                    address.wrapping_add(i.wrapping_mul(width.bytes())),
+                    width,
+                    wait_states,
+                ));
+            }
+        }
+    }
+
     #[cold]
     fn record_traced_run(&mut self, address: u32, count: u32, wait_states: u8) {
         self.access_count += u64::from(count);
@@ -395,6 +458,11 @@ impl BusTrace {
 
     pub fn elapsed_clocks(&self) -> u64 {
         self.elapsed_clocks
+    }
+
+    /// Add aggregate bus clocks without recording individual accesses.
+    pub fn add_elapsed_clocks(&mut self, clocks: u64) {
+        self.elapsed_clocks += clocks;
     }
 
     pub fn clear(&mut self) {
@@ -519,6 +587,84 @@ pub trait CpuBus {
         None
     }
 
+    /// Return the raw cacheable-RAM cost for one warm instruction fetch.
+    fn jit_fetch_cost_clocks(&self) -> u64 {
+        0
+    }
+
+    /// Whether every direct-code block admitted by this bus can charge instruction fetches as
+    /// one uniform per-instruction total. The default keeps the address-observing fallback.
+    fn native_fetches_are_uniform(&self) -> bool {
+        false
+    }
+
+    /// Whether native blocks may fold fetch and data observations into aggregate clock charges.
+    /// Buses that retain per-access counts or addresses must return false so the interpreter keeps
+    /// their trace contract exact. The conservative default requires an explicit opt-in.
+    fn native_aggregate_accounting_allowed(&self) -> bool {
+        false
+    }
+
+    /// Observe and charge repeated warm instruction fetches from one page-local direct block.
+    /// `linear_start` is the guest-visible code address, while `physical_start` selects memory
+    /// timing. Returning `true` tells the CPU that all observations and charges were applied.
+    /// The default declines so generic buses retain the exact per-instruction fallback.
+    fn charge_native_cached_fetches(
+        &mut self,
+        _linear_start: u32,
+        _physical_start: u32,
+        _fetch_lens: &[u8],
+        _iterations: u64,
+    ) -> bool {
+        false
+    }
+
+    /// The clock cost this bus charges for ONE byte-wide direct data access (the JIT cost-fold's
+    /// per-byte-access data constant). Buses without bus timing return 0.
+    ///
+    /// CALLER OBLIGATION: this is the flat Approximate-class L1 constant. The Accurate class and
+    /// device-window accesses charge per-address, so the cost-fold must only fold Approximate-class
+    /// blocks whose data hits the direct-page cache (which the native probe already requires) - the
+    /// constant is wrong otherwise.
+    fn jit_data_byte_cost_clocks(&self) -> u64 {
+        0
+    }
+
+    /// Direct-RAM cost for one access of `width`. Backends with width-dependent bus cycles
+    /// override this; the default preserves the existing flat byte-cost contract.
+    fn jit_data_cost_clocks(&self, _width: BusWidth) -> u64 {
+        self.jit_data_byte_cost_clocks()
+    }
+
+    /// Canonical Mode 13h cost for one native access of `width`. The direct backend uses the
+    /// larger of this and the RAM cost for pre-entry deadline admission.
+    fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
+        self.jit_data_cost_clocks(width)
+    }
+
+    /// Conservative guest-clock cost for one byte of string data. Budgeted REP uses this before a
+    /// chunk; buses with tiered or scaled timing override it so a cold cache or device window cannot
+    /// cross an event.
+    fn rep_data_byte_cost_upper(&self) -> u64 {
+        self.jit_data_cost_clocks(BusWidth::Byte)
+            .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
+    }
+
+    /// Commit native VGA writes at a block-chain boundary. Implementations update
+    /// the dirty-page set and charge their existing video-memory timing here.
+    fn charge_native_vga_writes(&mut self, _writes: NativeVgaWrites) {}
+
+    /// Compatibility seam for the current direct CPU backend.
+    fn charge_native_mode13_writes(&mut self, writes: NativeMode13Writes) {
+        self.charge_native_vga_writes(writes);
+    }
+
+    /// Charge `clocks` bus clocks in one shot (the JIT cost-fold's bulk flush). The folded block
+    /// accumulates fetch + data cost from the two constants above and flushes it here at a flush
+    /// point, keeping the device-scheduler-visible clock total correct without a per-access record.
+    /// Buses without bus timing do nothing.
+    fn charge_bus_clocks_bulk(&mut self, _clocks: u64) {}
+
     /// Copy physical instruction bytes into `out` without charging bus clocks.
     /// The CPU charges each consumed fetch byte separately so prefetch snapshots
     /// do not advance guest-visible time for bytes that never execute.
@@ -538,15 +684,24 @@ pub trait CpuBus {
     #[inline]
     fn note_code_fetch_linear(&mut self, _linear: u32) {}
 
-    /// Charge the instruction-fetch clocks for a run of `count` bytes starting at
-    /// `start`. Equivalent to `count` calls to `charge_instruction_fetch(start + i)`,
-    /// but an impl backed by region-uniform memory may charge it in one op. Default:
-    /// the per-byte loop.
+    /// Charge a warm instruction-fetch run in one address domain.
     fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
         for i in 0..count {
             self.charge_instruction_fetch(start.wrapping_add(i))?;
         }
         Ok(())
+    }
+
+    /// Charge the instruction-fetch clocks for a run of `count` physically contiguous bytes.
+    /// Linear observation remains a separate `note_code_fetch_linear` call. Equivalent to
+    /// `count` calls to `charge_instruction_fetch(physical_start + i)`, but an implementation
+    /// backed by region-uniform memory may charge it in one operation.
+    fn charge_physical_instruction_fetch_run(
+        &mut self,
+        physical_start: u32,
+        count: u32,
+    ) -> Result<(), BusError> {
+        self.charge_instruction_fetch_run(physical_start, count)
     }
 
     /// `core_clocks_so_far`: CPU core clocks charged by prior instructions in the

@@ -101,19 +101,32 @@ impl CpuGsw {
     /// and stay live.
     pub(super) fn invalidate_code_caches_for_cs_load(&mut self) {
         self.perf.decode_inval_cs_load += 1;
+        self.rep_resume_active = false;
+        self.rep_execution.resume = None;
         self.prefetch.invalidate();
     }
 
     fn invalidate_code_caches_uncounted(&mut self) {
+        self.invalidate_decode_frontend();
+        #[cfg(feature = "jit")]
+        self.jit_direct.clear();
+    }
+
+    fn invalidate_decode_frontend(&mut self) {
         self.code_page.valid = false;
         self.prefetch.invalidate();
         self.fetch_page.invalidate();
-        // Every CS-base change (CS load) and paging remap (via flush_tlb_and_code_caches) routes
-        // through here, so this is the structural hook for the decode cache too: a remap can make
-        // the same linear address decode differently (D-bit aliasing, page remap), so invalidate.
-        self.decode_cache.invalidate();
+        // Paging, mode, A20, and physical-map changes route through here. Any can make the same
+        // linear address decode from different bytes, so invalidate the lines and their SMC marks.
+        self.decode_cache.invalidate_and_clear_code_marks();
+    }
+
+    pub(super) fn invalidate_translation_code_caches(&mut self) {
+        self.perf.decode_inval_other += 1;
+        self.perf.code_invalidations += 1;
+        self.invalidate_decode_frontend();
         #[cfg(feature = "jit")]
-        self.jit_direct.clear();
+        self.jit_direct.invalidate_translation();
     }
 
     fn invalidate_direct_pages(&mut self) {
@@ -130,16 +143,22 @@ impl CpuGsw {
 
     pub(super) fn flush_tlb_and_code_caches(&mut self) {
         self.tlb.flush();
+        // Clear the physical caches with the linear FastMap so alias-verification tags and
+        // mappings are rebuilt from the current translation and permissions.
+        self.data_read_pages.invalidate();
+        self.data_write_pages.invalidate();
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
         self.jit_fast_map.invalidate_all();
-        self.invalidate_code_caches();
+        self.invalidate_translation_code_caches();
     }
 
     pub(super) fn set_eip(&mut self, eip: u32) {
+        self.rep_resume_active = false;
+        self.rep_execution.resume = None;
         self.registers.eip = eip;
         self.prefetch.invalidate();
     }
@@ -172,6 +191,25 @@ impl CpuGsw {
         self.perf.direct_map_invalidations += 1;
     }
 
+    /// Drop cached data pointers after a device aperture changes without
+    /// discarding decoded or compiled guest code. Native blocks load the shared
+    /// FastMap on every memory access, so clearing that map is sufficient.
+    pub fn note_direct_data_map_changed(&mut self) {
+        const VGA_START: u32 = 0x000a_0000;
+        const VGA_END: u32 = 0x000c_0000;
+        self.data_read_pages
+            .invalidate_physical_range(VGA_START, VGA_END);
+        self.data_write_pages
+            .invalidate_physical_range(VGA_START, VGA_END);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_fast_map.invalidate_vga_pages();
+        self.perf.direct_map_invalidations += 1;
+    }
+
     /// The decode cache's current generation. Advances on every cache invalidation (CS/paging/mode
     /// change, ISA-level change, A20 toggle, self-modifying write). Exposed for observability and so
     /// the machine can verify the A20 seam end-to-end.
@@ -179,13 +217,31 @@ impl CpuGsw {
         self.decode_cache.generation
     }
 
-    /// The machine calls this after a device (e.g. a disk/floppy DMA transfer) writes guest RAM.
-    /// Such writes bypass the CPU's own self-modifying-code tracking (which only sees CPU writes via
-    /// `note_code_write`), so if the written RAM held cached code (a loaded overlay or boot stage)
-    /// the prefetch and decode cache would replay stale bytes. This is a coarse whole-cache
-    /// invalidation, which is fine because device transfers are infrequent.
+    /// The machine calls this only when a device wrote guest RAM but cannot report the physical
+    /// range. Known ranges must use `note_device_memory_write_range` so unrelated native blocks and
+    /// decode lines survive.
     pub fn note_device_memory_write(&mut self) {
+        self.perf.device_write_coarse_resets += 1;
         self.invalidate_code_caches();
+    }
+
+    /// Report an exact physical range written by a device or HLE service. Compiled blocks and
+    /// decoded lines are invalidated only when their physical spans overlap the write. A prefetched
+    /// instruction snapshot is dropped only when the write touches bytes already in that snapshot.
+    pub fn note_device_memory_write_range(&mut self, physical: u32, width: u32) {
+        if width == 0 {
+            return;
+        }
+        self.perf.device_write_ranges += 1;
+        self.perf.device_write_bytes += u64::from(width);
+        let prefetch_hit = self.prefetch.overlaps_physical_range(physical, width);
+        let code_hit = self.note_code_write(physical, width);
+        if prefetch_hit {
+            self.prefetch.invalidate();
+        }
+        if prefetch_hit || code_hit {
+            self.perf.device_write_code_hits += 1;
+        }
     }
 
     /// A guest data write of `width` bytes to `physical`. If any written byte was decoded as part of
@@ -194,10 +250,14 @@ impl CpuGsw {
     /// tiny-model layout the benchmarks use) writes only its own two bytes, so it never disturbs the
     /// adjacent code.
     #[inline]
-    pub(super) fn note_code_write(&mut self, physical: u32, width: u32) {
+    pub(super) fn note_code_write(&mut self, physical: u32, width: u32) -> bool {
+        let mut invalidated = false;
+        #[cfg(feature = "jit")]
+        if self.jit_direct.range_hits_compiled_code(physical, width) {
+            invalidated = self.jit_direct.invalidate_physical_range(physical, width) != 0;
+        }
         if self.decode_cache.range_hits_code(physical, width) {
-            #[cfg(feature = "jit")]
-            self.jit_direct.clear();
+            invalidated = true;
             if self.profile.enabled {
                 // Flush-source census (64-byte physical blocks): locates the code/data byte
                 // sharing behind a residual SMC flush storm. Off the common path (flushes only).
@@ -243,6 +303,7 @@ impl CpuGsw {
             // The fetch-page snapshot may hold the written bytes under either outcome.
             self.fetch_page.invalidate();
         }
+        invalidated
     }
 
     pub(super) fn begin_instruction(&mut self) {
@@ -379,6 +440,8 @@ impl CpuGsw {
         self.mode = mode;
         self.timing_rem = 0;
         self.fp_rem = 0;
+        self.rep_resume_active = false;
+        *self.rep_execution = RepExecution::default();
         #[cfg(feature = "jit")]
         self.jit_regions.clear();
         self.invalidate_code_caches();

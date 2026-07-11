@@ -848,7 +848,7 @@ fn h_copy_program() -> Vec<u8> {
 fn assert_shape_identical(prog: Vec<u8>, arm: &dyn Fn(&mut CpuGsw), expect_region: bool) -> CpuGsw {
     let mut interp = fresh();
     let mut jit_cpu = fresh();
-    jit_cpu.set_jit_auto_admit(true);
+    jit_cpu.set_legacy_region_auto_admit(true);
     let mut bus_i = TestBus::with_memory(prog.clone());
     let mut bus_j = TestBus::with_memory(prog);
     arm(&mut interp);
@@ -1588,7 +1588,7 @@ fn assert_native_memory_identical(
 ) -> (CpuGsw, CpuGsw) {
     let mut interp = fresh_for(mode);
     let mut jit_cpu = fresh_for(mode);
-    jit_cpu.set_jit_auto_admit(true);
+    jit_cpu.set_legacy_region_auto_admit(true);
     let mut bus_i = TestBus::with_memory(prog.clone());
     let mut bus_j = TestBus::with_memory(prog);
     bus_i.direct_pages_enabled = true;
@@ -1849,6 +1849,11 @@ fn native_paged_permissions_side_exit_in_all_modes() {
             bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());
             cpu.tlb
                 .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, writable, user, true);
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            cpu.jit_fast_map.invalidate_all();
             cpu.reset_perf_counters();
             assert!(
                 cpu.run_straight_line(&mut bus, u64::MAX).is_err(),
@@ -1898,6 +1903,11 @@ fn native_paged_store_falls_back_to_set_the_dirty_bit_in_all_modes() {
             cpu.halted = false;
             cpu.tlb
                 .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, true, true, false);
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            cpu.jit_fast_map.invalidate_all();
             bus.memory[data_pte..data_pte + 4]
                 .copy_from_slice(&((PG_DATA_PHYS as u32) | 0x007).to_le_bytes());
             bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());
@@ -1944,6 +1954,11 @@ fn native_paged_supervisor_store_obeys_cr0_wp() {
             };
             cpu.tlb
                 .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, false, true, true);
+            #[cfg(all(
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            cpu.jit_fast_map.invalidate_all();
             bus.memory[data_pte..data_pte + 4]
                 .copy_from_slice(&((PG_DATA_PHYS as u32) | 0x065).to_le_bytes());
             bus.memory[count_phys..count_phys + 4].copy_from_slice(&1u32.to_le_bytes());

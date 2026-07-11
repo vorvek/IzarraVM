@@ -77,6 +77,433 @@ fn rep_movsb_copies_cx_bytes() {
 }
 
 #[test]
+fn budgeted_rep_movsb_yields_at_restart_eip_and_matches_atomic_timing() {
+    const ORIGIN: usize = 0x40;
+    let mut memory = vec![0; 0x1000];
+    memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xf3, 0xa4]);
+    memory[0x100..0x108].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let mut budgeted = CpuGsw::default();
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Es,
+        SegmentIndex::Ss,
+    ] {
+        budgeted.load_segment_real(segment, 0);
+    }
+    budgeted.registers.eip = ORIGIN as u32;
+    budgeted.registers.set_esi(0x100);
+    budgeted.registers.set_edi(0x200);
+    budgeted.registers.set_ecx(8);
+    let mut atomic = budgeted.clone();
+    let mut budgeted_bus = TestBus::with_memory(memory.clone());
+    budgeted_bus.direct_page_clocks = true;
+    budgeted_bus.report_batch_clocks = true;
+    let mut atomic_bus = TestBus::with_memory(memory);
+    atomic_bus.direct_page_clocks = true;
+    atomic_bus.report_batch_clocks = true;
+
+    // Decode fetch (including its lookahead), one conservative core clock, and two MOVSB
+    // iterations fit. A third does
+    // not. The partial instruction has not retired and exposes its prefix address for an IRQ frame.
+    let before_bus = budgeted_bus.trace.elapsed_clocks();
+    let first = budgeted.run_budgeted(&mut budgeted_bus, 31).unwrap();
+    assert!(
+        u64::from(first.consumed_core_clocks)
+            + budgeted_bus
+                .trace
+                .elapsed_clocks()
+                .saturating_sub(before_bus)
+            <= 31
+    );
+    assert!(!first.halted);
+    assert_eq!(budgeted.registers.eip, ORIGIN as u32);
+    assert_eq!(budgeted.registers.ecx(), 6);
+    assert_eq!(budgeted.registers.esi(), 0x102);
+    assert_eq!(budgeted.registers.edi(), 0x202);
+    assert_eq!(
+        &budgeted_bus.memory[0x200..0x208],
+        &[1, 2, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(budgeted.perf_counters().instructions, 0);
+
+    while budgeted.registers.eip == ORIGIN as u32 {
+        let before_bus = budgeted_bus.trace.elapsed_clocks();
+        let outcome = budgeted.run_budgeted(&mut budgeted_bus, 31).unwrap();
+        assert!(
+            u64::from(outcome.consumed_core_clocks)
+                + budgeted_bus
+                    .trace
+                    .elapsed_clocks()
+                    .saturating_sub(before_bus)
+                <= 31
+        );
+    }
+    atomic.cycle(&mut atomic_bus).unwrap();
+
+    assert_eq!(budgeted, atomic);
+    assert_eq!(budgeted_bus.memory, atomic_bus.memory);
+    assert_eq!(
+        budgeted_bus.trace.elapsed_clocks(),
+        atomic_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(budgeted.perf_counters().instructions, 1);
+}
+
+#[test]
+fn budgeted_rep_stosb_limits_each_dirty_chunk() {
+    const ORIGIN: usize = 0x40;
+    let mut memory = vec![0; 0x1000];
+    memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xf3, 0xaa]);
+    let mut cpu = CpuGsw::default();
+    cpu.set_mode(GswMode::Gsw386);
+    for segment in [SegmentIndex::Cs, SegmentIndex::Es, SegmentIndex::Ss] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.registers.eip = ORIGIN as u32;
+    cpu.registers.set_eax(0x5a);
+    cpu.registers.set_edi(0x200);
+    cpu.registers.set_ecx(4);
+    let mut atomic = cpu.clone();
+    let mut bus = TestBus::with_memory(memory.clone());
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+    let mut atomic_bus = TestBus::with_memory(memory);
+    atomic_bus.direct_page_clocks = true;
+    atomic_bus.report_batch_clocks = true;
+
+    let first = cpu.run_budgeted(&mut bus, 14).unwrap();
+    assert_eq!(first.consumed_core_clocks, 1);
+    assert_eq!(cpu.registers.eip, ORIGIN as u32);
+    assert_eq!(cpu.registers.ecx(), 3);
+    assert_eq!(cpu.registers.edi(), 0x201);
+    assert_eq!(&bus.memory[0x200..0x204], &[0x5a, 0, 0, 0]);
+
+    while cpu.registers.eip == ORIGIN as u32 {
+        let resumed = cpu.run_budgeted(&mut bus, 14).unwrap();
+        assert_eq!(resumed.consumed_core_clocks, 0);
+    }
+    atomic.cycle(&mut atomic_bus).unwrap();
+    assert_eq!(&bus.memory[0x200..0x204], &[0x5a; 4]);
+    assert_eq!(cpu.perf_counters().instructions, 1);
+    assert_eq!(cpu, atomic);
+    assert_eq!(bus.memory, atomic_bus.memory);
+    assert_eq!(
+        bus.trace.elapsed_clocks(),
+        atomic_bus.trace.elapsed_clocks()
+    );
+}
+
+#[test]
+fn interrupt_between_rep_chunks_pushes_the_rep_start_eip() {
+    const ORIGIN: usize = 0x40;
+    let mut memory = vec![0; 0x1000];
+    memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xf3, 0xa4]);
+    memory[0x100..0x108].copy_from_slice(&[0x6d; 8]);
+    memory[0x20..0x24].copy_from_slice(&[0x00, 0x03, 0x00, 0x00]);
+    let mut cpu = CpuGsw::default();
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Es,
+        SegmentIndex::Ss,
+    ] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.registers.eip = ORIGIN as u32;
+    cpu.registers.set_esi(0x100);
+    cpu.registers.set_edi(0x200);
+    cpu.registers.set_ecx(8);
+    cpu.registers.set_esp(0x800);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+
+    cpu.run_budgeted(&mut bus, 31).unwrap();
+    cpu.set_flag(FLAG_IF, true);
+    bus.pending_irq = Some(8);
+    let interrupt = cpu.service_pending_interrupt(&mut bus).unwrap().unwrap();
+
+    assert!(!interrupt.halted);
+    assert_eq!(cpu.registers.eip, 0x300);
+    assert_eq!(cpu.registers.esp(), 0x7fa);
+    assert_eq!(
+        u16::from_le_bytes([bus.memory[0x7fa], bus.memory[0x7fb]]),
+        ORIGIN as u16
+    );
+    assert!(cpu.rep_execution.resume.is_none());
+    assert_eq!(cpu.registers.ecx(), 6);
+}
+
+#[test]
+fn rep_resume_is_discarded_by_control_flow_cs_and_mode_changes() {
+    const ORIGIN: usize = 0x40;
+    let mut memory = vec![0; 0x1000];
+    memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xf3, 0xaa]);
+    let mut cpu = CpuGsw::default();
+    for segment in [SegmentIndex::Cs, SegmentIndex::Es, SegmentIndex::Ss] {
+        cpu.load_segment_real(segment, 0);
+    }
+    cpu.registers.eip = ORIGIN as u32;
+    cpu.registers.set_edi(0x200);
+    cpu.registers.set_ecx(8);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+
+    cpu.run_budgeted(&mut bus, 13).unwrap();
+    assert!(cpu.rep_execution.resume.is_some());
+    cpu.set_eip(0x80);
+    assert!(cpu.rep_execution.resume.is_none());
+
+    cpu.registers.eip = ORIGIN as u32;
+    cpu.run_budgeted(&mut bus, 13).unwrap();
+    assert!(cpu.rep_execution.resume.is_some());
+    cpu.load_segment_real(SegmentIndex::Cs, 1);
+    assert!(cpu.rep_execution.resume.is_none());
+
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.registers.eip = ORIGIN as u32;
+    cpu.run_budgeted(&mut bus, 13).unwrap();
+    assert!(cpu.rep_execution.resume.is_some());
+    cpu.set_mode(GswMode::Gsw486);
+    assert!(cpu.rep_execution.resume.is_none());
+}
+
+#[test]
+fn fault_after_resumed_rep_chunk_rewinds_to_original_instruction() {
+    const ORIGIN: usize = 0x40;
+    let mut memory = vec![0; 0x1000];
+    memory[ORIGIN..ORIGIN + 2].copy_from_slice(&[0xf3, 0xa4]);
+    memory[0x100..0x104].copy_from_slice(&[1, 2, 3, 4]);
+    // Real-mode IVT vector 13 points at 0000:0300.
+    memory[13 * 4..13 * 4 + 4].copy_from_slice(&[0x00, 0x03, 0x00, 0x00]);
+    let mut cpu = CpuGsw::default();
+    for segment in [
+        SegmentIndex::Cs,
+        SegmentIndex::Ds,
+        SegmentIndex::Es,
+        SegmentIndex::Ss,
+    ] {
+        cpu.load_segment_real(segment, 0);
+    }
+    let mut es = cpu.registers.segment(SegmentIndex::Es);
+    es.limit = 0x202;
+    cpu.registers.set_segment(SegmentIndex::Es, es);
+    cpu.registers.eip = ORIGIN as u32;
+    cpu.registers.set_esi(0x100);
+    cpu.registers.set_edi(0x200);
+    cpu.registers.set_ecx(4);
+    cpu.registers.set_esp(0x800);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+
+    cpu.run_budgeted(&mut bus, 31).unwrap();
+    assert_eq!(cpu.registers.ecx(), 2);
+    cpu.run_budgeted(&mut bus, u64::MAX).unwrap();
+
+    assert_eq!(&bus.memory[0x200..0x204], &[1, 2, 3, 0]);
+    assert_eq!(cpu.registers.ecx(), 1);
+    assert_eq!(cpu.registers.esi(), 0x103);
+    assert_eq!(cpu.registers.edi(), 0x203);
+    assert_eq!(cpu.registers.eip, 0x300);
+    assert_eq!(cpu.registers.esp(), 0x7fa);
+    assert_eq!(
+        u16::from_le_bytes([bus.memory[0x7fa], bus.memory[0x7fb]]),
+        ORIGIN as u16
+    );
+    assert!(cpu.rep_execution.resume.is_none());
+}
+
+#[test]
+fn paged_rep_movsb_bulk_translates_each_page_once_and_keeps_noncontiguous_frames() {
+    const PAGE_DIRECTORY: usize = 0x1000;
+    const PAGE_TABLE: usize = 0x2000;
+    const SRC_LINEAR: u32 = 0x4ff0;
+    const DST_LINEAR: u32 = 0x6ff0;
+    const COUNT: usize = 32;
+
+    let mut memory = vec![0; 0xe000];
+    memory[PAGE_DIRECTORY..PAGE_DIRECTORY + 4].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    for (linear_page, physical_page) in [(4usize, 0x8000u32), (5, 0xa000), (6, 0xc000), (7, 0xd000)]
+    {
+        let pte = PAGE_TABLE + linear_page * 4;
+        memory[pte..pte + 4].copy_from_slice(&(physical_page | 7).to_le_bytes());
+    }
+    let expected = core::array::from_fn::<_, COUNT, _>(|index| index as u8 ^ 0x5a);
+    memory[0x8ff0..0x9000].copy_from_slice(&expected[..16]);
+    memory[0xa000..0xa010].copy_from_slice(&expected[16..]);
+
+    let mut cpu = CpuGsw::default();
+    for segment in [SegmentIndex::Ds, SegmentIndex::Es] {
+        let mut descriptor = cpu.registers.segment(segment);
+        descriptor.base = 0;
+        descriptor.limit = u32::MAX;
+        descriptor.default_size_32 = true;
+        descriptor.access = 0x93;
+        cpu.registers.set_segment(segment, descriptor);
+    }
+    cpu.control.cr3 = PAGE_DIRECTORY as u32;
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.registers.set_esi(SRC_LINEAR);
+    cpu.registers.set_edi(DST_LINEAR);
+    cpu.registers.set_ecx(COUNT as u32);
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.run_string(
+        &mut bus,
+        StringOp::Movs,
+        BusWidth::Byte,
+        Prefixes {
+            rep: Some(RepKind::Repe),
+            ..Default::default()
+        },
+        AddressSize::Dword,
+    )
+    .unwrap();
+
+    assert_eq!(&bus.memory[0xcff0..0xd000], &expected[..16]);
+    assert_eq!(&bus.memory[0xd000..0xd010], &expected[16..]);
+    assert_eq!(cpu.registers.esi(), SRC_LINEAR + COUNT as u32);
+    assert_eq!(cpu.registers.edi(), DST_LINEAR + COUNT as u32);
+    assert_eq!(cpu.registers.ecx(), 0);
+    assert_eq!(cpu.perf_counters().rep_string_fast_iterations, COUNT as u64);
+}
+
+#[test]
+fn paged_rep_movsb_bulk_fault_keeps_completed_chunk_progress() {
+    let mut memory = vec![0; 0xd000];
+    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    for (linear_page, physical_page) in [(4usize, 0x8000u32), (5, 0xa000), (6, 0xc000)] {
+        let pte = 0x2000 + linear_page * 4;
+        memory[pte..pte + 4].copy_from_slice(&(physical_page | 7).to_le_bytes());
+    }
+    memory[0x8ff0..0x9000].copy_from_slice(&[0x6d; 16]);
+    memory[0xa000..0xa010].copy_from_slice(&[0x7e; 16]);
+
+    let mut cpu = CpuGsw::default();
+    for segment in [SegmentIndex::Ds, SegmentIndex::Es] {
+        let mut descriptor = cpu.registers.segment(segment);
+        descriptor.base = 0;
+        descriptor.limit = u32::MAX;
+        descriptor.default_size_32 = true;
+        descriptor.access = 0x93;
+        cpu.registers.set_segment(segment, descriptor);
+    }
+    cpu.control.cr3 = 0x1000;
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.registers.set_esi(0x4ff0);
+    cpu.registers.set_edi(0x6ff0);
+    cpu.registers.set_ecx(32);
+    let mut bus = TestBus::with_memory(memory);
+
+    let fault = cpu
+        .run_string(
+            &mut bus,
+            StringOp::Movs,
+            BusWidth::Byte,
+            Prefixes {
+                rep: Some(RepKind::Repe),
+                ..Default::default()
+            },
+            AddressSize::Dword,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        fault,
+        InternalFault::Exception {
+            vector: 14,
+            error_code: Some(_)
+        }
+    ));
+    assert_eq!(cpu.control.cr2, 0x7000);
+    assert_eq!(&bus.memory[0xcff0..0xd000], &[0x6d; 16]);
+    assert_eq!(cpu.registers.esi(), 0x5000);
+    assert_eq!(cpu.registers.edi(), 0x7000);
+    assert_eq!(cpu.registers.ecx(), 16);
+    assert_eq!(cpu.perf_counters().rep_string_fast_iterations, 16);
+}
+
+#[test]
+fn paged_movs_and_cmps_read_source_before_a_destination_page_fault() {
+    const PAGE_DIRECTORY: usize = 0x1000;
+    const PAGE_TABLE: usize = 0x2000;
+    const SRC_LINEAR: u32 = 0x4000;
+    const DST_LINEAR: u32 = 0x6000;
+    const SRC_PHYSICAL: usize = 0x8000;
+    const SRC_PTE: usize = PAGE_TABLE + 4 * 4;
+    const DST_PTE: usize = PAGE_TABLE + 6 * 4;
+
+    for op in [StringOp::Movs, StringOp::Cmps] {
+        let mut memory = vec![0; 0x9000];
+        memory[PAGE_DIRECTORY..PAGE_DIRECTORY + 4].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        memory[SRC_PTE..SRC_PTE + 4].copy_from_slice(&0x0000_8007u32.to_le_bytes());
+        memory[SRC_PHYSICAL] = 0x5a;
+        let mut cpu = CpuGsw::default();
+        for segment in [SegmentIndex::Ds, SegmentIndex::Es] {
+            cpu.registers
+                .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+        }
+        cpu.control.cr3 = PAGE_DIRECTORY as u32;
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.registers.set_esi(SRC_LINEAR);
+        cpu.registers.set_edi(DST_LINEAR);
+        cpu.registers.set_ecx(1);
+        let mut bus = TestBus::with_memory(memory);
+
+        let fault = cpu
+            .run_string(
+                &mut bus,
+                op,
+                BusWidth::Byte,
+                Prefixes {
+                    rep: Some(RepKind::Repe),
+                    ..Default::default()
+                },
+                AddressSize::Dword,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 14,
+                error_code: Some(_)
+            }
+        ));
+        let source_read = bus
+            .trace
+            .cycles()
+            .iter()
+            .position(|cycle| {
+                cycle.kind == BusAccessKind::DataRead && cycle.address == SRC_PHYSICAL as u32
+            })
+            .expect("source element must be read before the destination access");
+        let destination_pte_read = bus
+            .trace
+            .cycles()
+            .iter()
+            .position(|cycle| {
+                cycle.kind == BusAccessKind::PageWalkRead && cycle.address == DST_PTE as u32
+            })
+            .expect("destination translation must inspect its not-present PTE");
+        assert!(source_read < destination_pte_read, "operation {op:?}");
+        let source_pte = u32::from_le_bytes(bus.memory[SRC_PTE..SRC_PTE + 4].try_into().unwrap());
+        let destination_pte =
+            u32::from_le_bytes(bus.memory[DST_PTE..DST_PTE + 4].try_into().unwrap());
+        assert_ne!(source_pte & 0x20, 0, "source PTE accessed bit, {op:?}");
+        assert_eq!(source_pte & 0x40, 0, "source PTE dirty bit, {op:?}");
+        assert_eq!(destination_pte, 0, "faulting destination PTE, {op:?}");
+        assert_eq!(cpu.control.cr2, DST_LINEAR);
+        assert_eq!(cpu.registers.ecx(), 1);
+        assert_eq!(cpu.registers.esi(), SRC_LINEAR);
+        assert_eq!(cpu.registers.edi(), DST_LINEAR);
+    }
+}
+
+#[test]
 fn rep_movsb_df_set_uses_correct_slow_path() {
     let mut memory = vec![0; 1024];
     memory[0..2].copy_from_slice(&[0xf3, 0xa4]);

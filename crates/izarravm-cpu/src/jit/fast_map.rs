@@ -3,11 +3,11 @@
 
 //! Linear-page map shared by the interpreter fill path and the direct x64 backend.
 //!
-//! The interpreter does not probe this map. It only installs a mapping when its existing
-//! physical direct-page cache misses and the bus supplies a page pointer. Native memory
-//! lowering can therefore use a flat linear lookup without adding work to interpreter hits.
+//! In 486/586 modes the interpreter installs mappings from its physical direct-page cache, then
+//! consumes the same pointer biases as native code. This removes the old 64-entry TLB and physical
+//! page-cache bottleneck from ordinary warm RAM and canonical VGA accesses.
 
-use izarravm_bus::DirectPage;
+use izarravm_bus::{BusWidth, DirectPage};
 
 const PAGE_SHIFT: u32 = 12;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
@@ -48,6 +48,48 @@ impl PagePermissions {
     };
 }
 
+/// One permission-checked interpreter hit. The raw host pointer stays inside this module; callers
+/// observe the physical address, run their normal timing and SMC hooks, then commit the access.
+#[derive(Clone, Copy)]
+pub(crate) struct FastMapAccess {
+    physical: u32,
+    ptr: *mut u8,
+}
+
+impl FastMapAccess {
+    pub(crate) const fn physical(self) -> u32 {
+        self.physical
+    }
+
+    #[inline]
+    pub(crate) fn read(self, width: BusWidth) -> u32 {
+        match width {
+            BusWidth::Byte => unsafe { u32::from(*self.ptr) },
+            BusWidth::Word => unsafe {
+                u32::from(u16::from_le(std::ptr::read_unaligned(
+                    self.ptr.cast::<u16>(),
+                )))
+            },
+            BusWidth::Dword => unsafe {
+                u32::from_le(std::ptr::read_unaligned(self.ptr.cast::<u32>()))
+            },
+        }
+    }
+
+    #[inline]
+    pub(crate) fn write(self, width: BusWidth, value: u32) {
+        match width {
+            BusWidth::Byte => unsafe { *self.ptr = value as u8 },
+            BusWidth::Word => unsafe {
+                std::ptr::write_unaligned(self.ptr.cast::<u16>(), (value as u16).to_le());
+            },
+            BusWidth::Dword => unsafe {
+                std::ptr::write_unaligned(self.ptr.cast::<u32>(), value.to_le());
+            },
+        }
+    }
+}
+
 struct FastMapStorage {
     read_biases: Box<[usize]>,
     write_biases: Box<[usize]>,
@@ -55,6 +97,7 @@ struct FastMapStorage {
     flags: Box<[u8]>,
     live_pages: Box<[u64]>,
     listed_pages: Box<[u64]>,
+    listed_vga_pages: Box<[u64]>,
 }
 
 impl FastMapStorage {
@@ -66,6 +109,7 @@ impl FastMapStorage {
             flags: vec![PageKind::Unavailable as u8; LINEAR_PAGE_COUNT].into_boxed_slice(),
             live_pages: vec![0; BITSET_WORDS].into_boxed_slice(),
             listed_pages: vec![0; BITSET_WORDS].into_boxed_slice(),
+            listed_vga_pages: vec![0; BITSET_WORDS].into_boxed_slice(),
         }
     }
 
@@ -95,11 +139,12 @@ impl FastMapStorage {
 }
 
 /// A 4 GiB linear address-space map with one structure-of-arrays slot per 4 KiB page.
-/// Storage is lazy because an interpreter-only CPU never consumes the native lookup arrays.
+/// Storage is lazy because accurate-timing 386 modes never consume the lookup arrays.
 #[derive(Default)]
 pub(crate) struct FastMap {
     storage: Option<FastMapStorage>,
     populated_pages: Vec<u32>,
+    vga_pages: Vec<u32>,
 }
 
 /// Stable SoA base addresses for the direct backend. Keeping these behind accessors avoids
@@ -148,6 +193,72 @@ pub(super) const NATIVE_PAGE_WRITABLE: u8 = PAGE_WRITABLE;
 pub(super) const NATIVE_PAGE_USER: u8 = PAGE_USER;
 
 impl FastMap {
+    /// Resolve a populated linear mapping for the interpreter without revisiting the small TLB.
+    /// A write bias exists only after the page walker has committed the PTE dirty bit, so a hit is
+    /// safe to use without losing accessed/dirty side effects. Protection is checked against the
+    /// current accessor because CPL can change while a mapping remains live.
+    #[inline]
+    pub(crate) fn lookup_access(
+        &self,
+        linear: u32,
+        width: BusWidth,
+        write: bool,
+        user: bool,
+        write_protect: bool,
+    ) -> Option<FastMapAccess> {
+        let offset = linear & PAGE_MASK;
+        if offset
+            .checked_add(width.bytes())
+            .is_none_or(|end| end > PAGE_SIZE as u32)
+            || matches!(width, BusWidth::Word) && linear & 1 != 0
+            || matches!(width, BusWidth::Dword) && linear & 3 != 0
+        {
+            return None;
+        }
+        let index = (linear >> PAGE_SHIFT) as usize;
+        let storage = self.storage.as_ref()?;
+        if !FastMapStorage::bit(&storage.live_pages, index) {
+            return None;
+        }
+        let flags = storage.flags[index];
+        let bias_available = if write {
+            flags & HAS_WRITE_BIAS != 0 && storage.write_biases[index] != UNAVAILABLE_BIAS
+        } else {
+            flags & HAS_READ_BIAS != 0 && storage.read_biases[index] != UNAVAILABLE_BIAS
+        };
+        if !bias_available
+            || user && flags & PAGE_USER == 0
+            || write && (user || write_protect) && flags & PAGE_WRITABLE == 0
+        {
+            return None;
+        }
+        let physical_page = storage.physical_pages[index];
+        if physical_page == UNAVAILABLE_PHYSICAL_PAGE {
+            return None;
+        }
+        let bias = if write {
+            storage.write_biases[index]
+        } else {
+            storage.read_biases[index]
+        };
+        Some(FastMapAccess {
+            physical: physical_page | offset,
+            ptr: bias.wrapping_add(linear as usize) as *mut u8,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn lookup_physical(
+        &self,
+        linear: u32,
+        write: bool,
+        user: bool,
+        write_protect: bool,
+    ) -> Option<u32> {
+        self.lookup_access(linear, BusWidth::Byte, write, user, write_protect)
+            .map(FastMapAccess::physical)
+    }
+
     /// Return stable array bases for native code generation after the first map fill.
     #[allow(dead_code)]
     pub(super) fn native_bases(&self) -> Option<NativeMapBases> {
@@ -177,6 +288,30 @@ impl FastMap {
         permissions: PagePermissions,
     ) -> bool {
         self.populate(linear, physical, page, permissions, true)
+    }
+
+    #[inline]
+    pub(crate) fn has_read_mapping(&self, linear: u32, physical: u32) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        let Some(storage) = self.storage.as_ref() else {
+            return false;
+        };
+        FastMapStorage::bit(&storage.live_pages, index)
+            && storage.physical_pages[index] == physical & !PAGE_MASK
+            && storage.flags[index] & HAS_READ_BIAS != 0
+            && storage.read_biases[index] != UNAVAILABLE_BIAS
+    }
+
+    #[inline]
+    pub(crate) fn has_write_mapping(&self, linear: u32, physical: u32) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        let Some(storage) = self.storage.as_ref() else {
+            return false;
+        };
+        FastMapStorage::bit(&storage.live_pages, index)
+            && storage.physical_pages[index] == physical & !PAGE_MASK
+            && storage.flags[index] & HAS_WRITE_BIAS != 0
+            && storage.write_biases[index] != UNAVAILABLE_BIAS
     }
 
     fn populate(
@@ -225,12 +360,8 @@ impl FastMap {
             flags |= PAGE_USER;
         }
         if write {
-            // Canonical mode 13h has its own kind, but native stores remain disabled until
-            // generated stores also perform VGA dirty tracking and frame-generation updates.
-            if kind == PageKind::Ram {
-                storage.write_biases[index] = bias;
-                flags |= HAS_WRITE_BIAS;
-            }
+            storage.write_biases[index] = bias;
+            flags |= HAS_WRITE_BIAS;
         } else {
             storage.read_biases[index] = bias;
             flags |= HAS_READ_BIAS;
@@ -242,6 +373,10 @@ impl FastMap {
         if !FastMapStorage::bit(&storage.listed_pages, index) {
             FastMapStorage::set_bit(&mut storage.listed_pages, index);
             self.populated_pages.push(index as u32);
+        }
+        if kind == PageKind::Mode13 && !FastMapStorage::bit(&storage.listed_vga_pages, index) {
+            FastMapStorage::set_bit(&mut storage.listed_vga_pages, index);
+            self.vga_pages.push(index as u32);
         }
         true
     }
@@ -257,6 +392,23 @@ impl FastMap {
         }
     }
 
+    /// Clear the compact set of linear aliases backed by the direct VGA aperture. Draining the
+    /// registry lets an alias be listed again after the VGA plane or backing store changes.
+    pub(crate) fn invalidate_vga_pages(&mut self) {
+        let Some(storage) = self.storage.as_mut() else {
+            return;
+        };
+        for page in self.vga_pages.drain(..) {
+            let index = page as usize;
+            if FastMapStorage::bit(&storage.live_pages, index)
+                && storage.flags[index] & KIND_MASK == PageKind::Mode13 as u8
+            {
+                storage.clear_entry(index);
+            }
+            FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
+        }
+    }
+
     /// Clear only pages installed since the previous global invalidation.
     pub(crate) fn invalidate_all(&mut self) {
         let Some(storage) = self.storage.as_mut() else {
@@ -266,7 +418,9 @@ impl FastMap {
             let index = page as usize;
             storage.clear_entry(index);
             FastMapStorage::clear_bit(&mut storage.listed_pages, index);
+            FastMapStorage::clear_bit(&mut storage.listed_vga_pages, index);
         }
+        self.vga_pages.clear();
     }
 
     #[cfg(test)]
@@ -281,21 +435,6 @@ impl FastMap {
             physical_page: storage.physical_pages[index],
             flags: storage.flags[index],
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_read_mapping(&self, linear: u32) -> bool {
-        self.entry(linear).read_bias != UNAVAILABLE_BIAS
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_write_mapping(&self, linear: u32) -> bool {
-        self.entry(linear).write_bias != UNAVAILABLE_BIAS
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_allocated(&self) -> bool {
-        self.storage.is_some()
     }
 }
 
@@ -317,6 +456,7 @@ impl std::fmt::Debug for FastMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FastMap")
             .field("populated_pages", &self.populated_pages.len())
+            .field("vga_pages", &self.vga_pages.len())
             .finish()
     }
 }
@@ -431,7 +571,72 @@ mod tests {
     }
 
     #[test]
-    fn mode13_is_distinct_and_does_not_expose_native_store_bias() {
+    fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
+        let mut bytes = Box::new([0u8; PAGE_SIZE]);
+        let mut map = FastMap::default();
+        let linear = 0x8123_4564;
+        let physical = 0x0012_3564;
+        bytes[0x564..0x568].copy_from_slice(&0x4433_2211u32.to_le_bytes());
+
+        assert!(map.populate_read(
+            linear,
+            physical,
+            page(&mut bytes, 0x0012_3000, false),
+            PagePermissions {
+                writable: false,
+                user: false,
+            },
+        ));
+        assert_eq!(
+            map.lookup_physical(linear, false, false, false),
+            Some(physical)
+        );
+        assert_eq!(map.lookup_physical(linear, false, true, false), None);
+        assert_eq!(map.lookup_physical(linear, true, false, false), None);
+        assert_eq!(
+            map.lookup_access(linear, BusWidth::Dword, false, false, false)
+                .unwrap()
+                .read(BusWidth::Dword),
+            0x4433_2211
+        );
+
+        assert!(map.populate_write(
+            linear,
+            physical,
+            page(&mut bytes, 0x0012_3000, true),
+            PagePermissions {
+                writable: false,
+                user: false,
+            },
+        ));
+        assert_eq!(
+            map.lookup_physical(linear, true, false, false),
+            Some(physical)
+        );
+        assert_eq!(map.lookup_physical(linear, true, false, true), None);
+        assert_eq!(map.lookup_physical(linear, true, true, false), None);
+        map.lookup_access(linear, BusWidth::Dword, true, false, false)
+            .unwrap()
+            .write(BusWidth::Dword, 0xaabb_ccdd);
+        assert_eq!(&bytes[0x564..0x568], &0xaabb_ccddu32.to_le_bytes());
+        assert!(
+            map.lookup_access(
+                (linear & !PAGE_MASK) | 0xffe,
+                BusWidth::Dword,
+                false,
+                false,
+                false,
+            )
+            .is_none(),
+            "cross-page accesses must retain the precise slow path"
+        );
+
+        map.invalidate_page(linear);
+        assert_eq!(map.lookup_physical(linear, false, false, false), None);
+    }
+
+    #[test]
+    fn mode13_is_distinct_and_exposes_native_store_bias() {
         let mut bytes = Box::new([0u8; PAGE_SIZE]);
         let mut map = FastMap::default();
         let linear = 0x00aa_0123;
@@ -445,7 +650,10 @@ mod tests {
         ));
         let entry = map.entry(linear);
         assert_eq!(entry.kind(), PageKind::Mode13);
-        assert_eq!(entry.write_ptr(linear), None);
+        assert_eq!(
+            entry.write_ptr(linear),
+            Some(bytes.as_mut_ptr().wrapping_add(0x123))
+        );
 
         assert!(map.populate_read(
             linear,
@@ -457,6 +665,49 @@ mod tests {
             map.entry(linear).read_ptr(linear),
             Some(bytes.as_mut_ptr().wrapping_add(0x123))
         );
+    }
+
+    #[test]
+    fn vga_invalidation_handles_aliases_and_refills_without_list_growth() {
+        const PAGED_ALIAS: u32 = 0x8123_4000;
+        let mut ram = Box::new([0u8; PAGE_SIZE]);
+        let mut vga = Box::new([0u8; PAGE_SIZE]);
+        let mut map = FastMap::default();
+        assert!(map.populate_write(
+            0x2000,
+            0x2000,
+            page(&mut ram, 0x2000, true),
+            PagePermissions::UNPAGED,
+        ));
+
+        for _ in 0..3 {
+            assert!(map.populate_write(
+                MODE13_BASE,
+                MODE13_BASE,
+                page(&mut vga, MODE13_BASE, true),
+                PagePermissions::UNPAGED,
+            ));
+            assert!(map.populate_read(
+                PAGED_ALIAS,
+                MODE13_BASE,
+                page(&mut vga, MODE13_BASE, false),
+                PagePermissions {
+                    writable: true,
+                    user: false,
+                },
+            ));
+            assert_eq!(map.vga_pages.len(), 2);
+            assert_eq!(map.populated_pages.len(), 3);
+            assert!(map.has_write_mapping(MODE13_BASE, MODE13_BASE));
+            assert!(map.has_read_mapping(PAGED_ALIAS, MODE13_BASE));
+
+            map.invalidate_vga_pages();
+
+            assert!(map.vga_pages.is_empty());
+            assert!(map.has_write_mapping(0x2000, 0x2000));
+            assert!(!map.has_write_mapping(MODE13_BASE, MODE13_BASE));
+            assert!(!map.has_read_mapping(PAGED_ALIAS, MODE13_BASE));
+        }
     }
 
     #[test]
@@ -493,6 +744,7 @@ mod tests {
     #[test]
     fn global_invalidation_and_clone_leave_no_live_entries() {
         let mut bytes = Box::new([0u8; PAGE_SIZE]);
+        let mut vga = Box::new([0u8; PAGE_SIZE]);
         let mut map = FastMap::default();
         assert!(map.populate_read(
             0xffff_f000,
@@ -500,6 +752,13 @@ mod tests {
             page(&mut bytes, 0x7000, false),
             PagePermissions::UNPAGED,
         ));
+        assert!(map.populate_write(
+            MODE13_BASE,
+            MODE13_BASE,
+            page(&mut vga, MODE13_BASE, true),
+            PagePermissions::UNPAGED,
+        ));
+        assert_eq!(map.vga_pages.len(), 1);
 
         let clone = map.clone();
         assert_eq!(clone.entry(0xffff_f000).kind(), PageKind::Unavailable);
@@ -507,6 +766,17 @@ mod tests {
 
         map.invalidate_all();
         assert_eq!(map.entry(0xffff_f000).kind(), PageKind::Unavailable);
+        assert_eq!(map.entry(MODE13_BASE).kind(), PageKind::Unavailable);
         assert!(map.populated_pages.is_empty());
+        assert!(map.vga_pages.is_empty());
+
+        assert!(map.populate_write(
+            MODE13_BASE,
+            MODE13_BASE,
+            page(&mut vga, MODE13_BASE, true),
+            PagePermissions::UNPAGED,
+        ));
+        assert_eq!(map.populated_pages.len(), 1);
+        assert_eq!(map.vga_pages.len(), 1);
     }
 }

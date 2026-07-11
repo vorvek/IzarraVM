@@ -60,6 +60,7 @@ impl Machine {
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
+            direct_data_map_changed: &mut self.direct_data_map_changed,
             core_clocks_so_far: 0,
             prior_runs_core_clocks: 0,
             timeline_at_batch_start: self.timeline,
@@ -152,7 +153,7 @@ impl MachineBus<'_> {
 
 impl Drop for MachineBus<'_> {
     fn drop(&mut self) {
-        self.vega.finish_mode13_direct_batch();
+        self.vega.finish_direct_write_batch();
     }
 }
 
@@ -248,17 +249,24 @@ impl CpuBus for MachineBus<'_> {
         if out.len() % access != 0 {
             return Ok(0);
         }
-        let Some((address, start, end)) =
+        if let Some((address, start, end)) =
             self.direct_page_ram_bytes(address, out.len(), access_width)
+        {
+            self.record_direct_ram_accesses(address, out.len(), access_width, kind);
+            out.copy_from_slice(&self.memory.as_slice()[start..end]);
+            return Ok(out.len());
+        }
+        let Some((address, page_offset)) =
+            self.direct_vga_bytes(address, out.len(), access_width, false)
         else {
             return Ok(0);
         };
-        for offset in (0..out.len()).step_by(access) {
-            let at = address + offset as u32;
-            let ws = self.data_access_wait_states(at, access_width);
-            self.trace.record(kind, at, access_width, ws);
-        }
-        out.copy_from_slice(&self.memory.as_slice()[start..end]);
+        let page = address & !(RAM_LOOKUP_PAGE_MASK as u32);
+        let Some(ptr) = self.vega.mode13_direct_page(page) else {
+            return Ok(0);
+        };
+        unsafe { std::ptr::copy_nonoverlapping(ptr.add(page_offset), out.as_mut_ptr(), out.len()) };
+        self.record_direct_vga_accesses(address, out.len(), access_width, kind);
         Ok(out.len())
     }
 
@@ -276,23 +284,35 @@ impl CpuBus for MachineBus<'_> {
         if data.len() % access != 0 {
             return Ok(0);
         }
-        let Some((address, start, end)) =
+        if let Some((address, start, end)) =
             self.direct_page_ram_bytes(address, data.len(), access_width)
+        {
+            self.record_direct_ram_accesses(address, data.len(), access_width, kind);
+            self.memory.as_mut_slice()[start..end].copy_from_slice(data);
+            return Ok(data.len());
+        }
+        let Some((address, page_offset)) =
+            self.direct_vga_bytes(address, data.len(), access_width, true)
         else {
             return Ok(0);
         };
-        for offset in (0..data.len()).step_by(access) {
-            let at = address + offset as u32;
-            let ws = self.data_access_wait_states(at, access_width);
-            self.trace.record(kind, at, access_width, ws);
-        }
-        self.memory.as_mut_slice()[start..end].copy_from_slice(data);
+        let page = address & !(RAM_LOOKUP_PAGE_MASK as u32);
+        let Some(ptr) = self.vega.direct_write_page(page) else {
+            return Ok(0);
+        };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(page_offset), data.len()) };
+        self.record_direct_vga_accesses(address, data.len(), access_width, kind);
+        self.vega.note_direct_write(address, data.len());
         Ok(data.len())
     }
 
     fn direct_memory_bytes(&self, address: u32, bytes: usize, access_width: BusWidth) -> usize {
         self.direct_page_ram_bytes(address, bytes, access_width)
             .map_or(0, |(_, start, end)| end - start)
+            .max(
+                self.direct_vga_bytes(address, bytes, access_width, true)
+                    .map_or(0, |_| bytes),
+            )
     }
 
     #[inline]
@@ -306,12 +326,15 @@ impl CpuBus for MachineBus<'_> {
             return Ok(None);
         }
         let physical_page = gated & !(RAM_LOOKUP_PAGE_MASK as u32);
-        if matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
-            && (izarravm_video::VGA_MODE13H_BASE
-                ..izarravm_video::VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE)
-                .contains(&physical_page)
-            && let Some(ptr) = self.vega.mode13_direct_page(physical_page)
-        {
+        let video_page = (izarravm_video::VGA_MODE13H_BASE
+            ..izarravm_video::VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE)
+            .contains(&physical_page);
+        let video_ptr = match kind {
+            BusAccessKind::DataRead if video_page => self.vega.mode13_direct_page(physical_page),
+            BusAccessKind::DataWrite if video_page => self.vega.direct_write_page(physical_page),
+            _ => None,
+        };
+        if let Some(ptr) = video_ptr {
             return Ok(Some(DirectPage {
                 physical_page,
                 ptr,
@@ -347,8 +370,7 @@ impl CpuBus for MachineBus<'_> {
                 .is_some_and(|end| end <= video_end)
         {
             if kind == BusAccessKind::DataWrite {
-                self.vega
-                    .note_mode13_direct_write(address, width.bytes() as usize);
+                self.vega.note_direct_write(address, width.bytes() as usize);
             }
             let ws = if self.active_mode.uses_approximate_timing() {
                 video_wait_states_approx(self.active_mode.persona())
@@ -426,6 +448,119 @@ impl CpuBus for MachineBus<'_> {
             .checked_mul(u64::from(self.bus_num_at_batch_start))?
             .checked_add(self.bus_rem_at_batch_start)
             .map(|scaled| scaled / u64::from(self.bus_den_at_batch_start))
+    }
+
+    /// One instruction-fetch access of cacheable RAM: `clocks_for(_, code_fetch_wait_states)` = 2 +
+    /// the per-mode I-cache constant. Matches what `charge_physical_instruction_fetch_run`'s
+    /// cacheable-RAM fast path records for one access. The JIT cost-fold folds this per slot.
+    fn jit_fetch_cost_clocks(&self) -> u64 {
+        2 + u64::from(self.cache.code_fetch_wait_states())
+    }
+
+    fn native_fetches_are_uniform(&self) -> bool {
+        self.flat_data_cost
+    }
+
+    fn native_aggregate_accounting_allowed(&self) -> bool {
+        self.trace.tracing_mode() == TracingMode::Off
+    }
+
+    fn charge_native_cached_fetches(
+        &mut self,
+        linear_start: u32,
+        physical_start: u32,
+        fetch_lens: &[u8],
+        iterations: u64,
+    ) -> bool {
+        if linear_start & !0x0fff == (BIOS_LEGACY_IRET_LINEAR & !0x0fff) {
+            for _ in 0..iterations {
+                let mut linear = linear_start;
+                for &len in fetch_lens {
+                    self.note_code_fetch_linear(linear);
+                    linear = linear.wrapping_add(u32::from(len));
+                }
+            }
+        }
+        let physical = self.apply_a20(physical_start);
+        let fetch_cost = u64::from(izarravm_bus::BusCycle::clocks_for(
+            BusWidth::Byte,
+            self.code_fetch_wait_states(physical),
+        ));
+        let instruction_count = (fetch_lens.len() as u64).saturating_mul(iterations);
+        self.trace
+            .add_elapsed_clocks(fetch_cost.saturating_mul(instruction_count));
+        true
+    }
+
+    /// One byte-wide direct data access: `clocks_for(Byte, cost.l1)` = 2 + the flat L1 wait-state,
+    /// exactly what `charge_direct_memory` records for a direct-page hit in the Approximate class.
+    fn jit_data_byte_cost_clocks(&self) -> u64 {
+        2 + u64::from(self.cache.cost.l1)
+    }
+
+    fn jit_data_cost_clocks(&self, width: BusWidth) -> u64 {
+        u64::from(izarravm_bus::BusCycle::clocks_for(
+            width,
+            self.cache.cost.l1,
+        ))
+    }
+
+    fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
+        let wait_states = if self.active_mode.uses_approximate_timing() {
+            video_wait_states_approx(self.active_mode.persona())
+        } else {
+            self.wait_states.video
+        };
+        u64::from(izarravm_bus::BusCycle::clocks_for(width, wait_states))
+    }
+
+    fn rep_data_byte_cost_upper(&self) -> u64 {
+        let ram = if self.flat_data_cost {
+            self.cache.cost.l1
+        } else {
+            self.cache
+                .cost
+                .l1
+                .max(self.cache.cost.l2)
+                .max(self.cache.cost.ram)
+        };
+        let video = if self.flat_data_cost {
+            video_wait_states_approx(self.active_mode.persona())
+        } else {
+            self.wait_states.video
+        };
+        let wait_states = ram
+            .max(self.wait_states.ram)
+            .max(self.wait_states.rom)
+            .max(video);
+        let raw = u64::from(izarravm_bus::BusCycle::clocks_for(
+            BusWidth::Byte,
+            wait_states,
+        ));
+        let (num, den) = bus_timing(self.active_mode.persona());
+        raw.saturating_mul(u64::from(num))
+            .saturating_add(u64::from(den) - 1)
+            / u64::from(den)
+    }
+
+    fn charge_native_vga_writes(&mut self, writes: NativeVgaWrites) {
+        if writes.is_empty() {
+            return;
+        }
+        self.vega.note_direct_write_pages(writes.dirty_pages);
+        let clocks = self
+            .jit_mode13_data_cost_clocks(BusWidth::Byte)
+            .saturating_mul(writes.byte_writes)
+            .saturating_add(
+                self.jit_mode13_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(writes.dword_writes),
+            );
+        self.trace.add_elapsed_clocks(clocks);
+    }
+
+    /// Flush the JIT cost-fold's accumulated bus clocks into the trace's running total in one op.
+    fn charge_bus_clocks_bulk(&mut self, clocks: u64) {
+        self.trace.add_elapsed_clocks(clocks);
     }
 
     /// See the trait doc: the straight-line run loop adds this figure's growth
@@ -588,16 +723,19 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
+        if count != 0 && start.wrapping_sub(BIOS_LEGACY_IRET_LINEAR) < BIOS_STUB_WINDOW_LEN {
+            self.note_stub_fetch(start);
+        }
+        self.charge_physical_instruction_fetch_run(start, count)
+    }
+
+    fn charge_physical_instruction_fetch_run(
+        &mut self,
+        physical_start: u32,
+        count: u32,
+    ) -> Result<(), BusError> {
         if count == 0 {
             return Ok(());
-        }
-        // Stub recognition, run-charge seam: the trigger check runs on the
-        // run's START address only (a stub entry is always a fresh run:
-        // execution arrives by IVT far transfer or IRET return, never by
-        // falling through). `start` here is the run's LINEAR address - the
-        // same domain `note_code_fetch_linear` observes on the cold path.
-        if start.wrapping_sub(BIOS_LEGACY_IRET_LINEAR) < BIOS_STUB_WINDOW_LEN {
-            self.note_stub_fetch(start);
         }
         // Fast path: a run that lies entirely in conventional RAM (below the
         // 0xA0000 video aperture). Every address below 0x100000 has bit 20 clear,
@@ -609,18 +747,18 @@ impl CpuBus for MachineBus<'_> {
         // cacheable-RAM arm and charge ONE I-cache access at the constant
         // wait-state, so charge exactly that in one step. ROM/device/A20-edge
         // runs keep the full classification, byte-for-byte.
-        if let Some(end) = start.checked_add(count - 1) {
+        if let Some(end) = physical_start.checked_add(count - 1) {
             if end < 0x000A_0000 {
                 self.trace.record_instruction_fetch_run(
-                    start,
+                    physical_start,
                     1,
                     self.cache.code_fetch_wait_states(),
                 );
                 return Ok(());
             }
         }
-        let first = self.apply_a20(start);
-        let last = self.apply_a20(start.wrapping_add(count - 1));
+        let first = self.apply_a20(physical_start);
+        let last = self.apply_a20(physical_start.wrapping_add(count - 1));
         let first_ws = self.code_fetch_wait_states(first);
         // Uniform iff every byte lands in the same wait-state region with no A20 wrap
         // between the ends. apply_a20 already folded both ends, so equal wait-states on
@@ -655,7 +793,7 @@ impl CpuBus for MachineBus<'_> {
             }
         } else {
             for i in 0..count {
-                self.charge_instruction_fetch(start.wrapping_add(i))?;
+                self.charge_instruction_fetch(physical_start.wrapping_add(i))?;
             }
         }
         Ok(())
@@ -1173,8 +1311,8 @@ impl CpuBus for MachineBus<'_> {
             // write above recorded the request; fire the block copy here.
             if port == 0x09 && self.dma.mem_to_mem_request_armed() {
                 self.dma.mem_to_mem(self.memory);
-                // A DMA block copy wrote guest RAM directly. The run loop honors
-                // the flag at the end of the step and drops cached code.
+                // This legacy burst API reports only a byte count, not its possibly
+                // decrementing or wrapping destination spans. Retain the coarse fallback.
                 *self.device_wrote_memory = true;
             }
             return Ok(());
@@ -1243,10 +1381,10 @@ impl CpuBus for MachineBus<'_> {
         {
             return Ok(());
         }
-        let mode13_direct_before = self.vega.mode13_direct_page_available();
+        let direct_write_before = self.vega.direct_write_token();
         if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
-            if self.vega.mode13_direct_page_available() != mode13_direct_before {
-                *self.direct_map_changed = true;
+            if self.vega.direct_write_token() != direct_write_before {
+                *self.direct_data_map_changed = true;
                 *self.io_touched = true;
             }
             return Ok(());
@@ -1276,7 +1414,10 @@ impl CpuBus for MachineBus<'_> {
     fn requires_step_break(&self) -> bool {
         // End at the instruction boundary for time-dependent I/O, an HLE
         // interrupt, or a device-map change that makes a cached page stale.
-        *self.io_touched || *self.direct_map_changed || self.pending_soft_int.is_some()
+        *self.io_touched
+            || *self.direct_map_changed
+            || *self.direct_data_map_changed
+            || self.pending_soft_int.is_some()
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
@@ -1370,8 +1511,7 @@ impl MachineBus<'_> {
     /// only cleared at the next batch entry, after the service ran and
     /// execution moved to the IRET byte, whose odd offset never posts).
     ///
-    /// `address` is a LINEAR address on both seams (`note_code_fetch_linear`
-    /// per cold-fetched byte, `charge_instruction_fetch_run` per cached run):
+    /// `address` is a LINEAR address supplied through `note_code_fetch_linear`:
     /// the stub table's identity is architectural, and a paging guest that
     /// shadows the BIOS F-page (JemmEx) still dispatches through linear
     /// FF00:02xx while backing it with another physical page. Residual
@@ -1528,6 +1668,72 @@ impl MachineBus<'_> {
             address
         } else {
             address & A20_MASK
+        }
+    }
+
+    #[inline]
+    fn direct_vga_bytes(
+        &self,
+        address: u32,
+        bytes: usize,
+        access_width: BusWidth,
+        write: bool,
+    ) -> Option<(u32, usize)> {
+        let gated = self.apply_a20(address);
+        let byte_count = u32::try_from(bytes).ok()?;
+        let end = gated.checked_add(byte_count)?;
+        let video_end = izarravm_video::VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
+        if gated != address
+            || bytes == 0
+            || should_split(gated, access_width)
+            || ((gated as usize & RAM_LOOKUP_PAGE_MASK) + bytes > RAM_LOOKUP_PAGE_SIZE)
+            || gated < izarravm_video::VGA_MODE13H_BASE
+            || end > video_end
+        {
+            return None;
+        }
+        let available = if write {
+            self.vega.direct_write_token() != 0
+        } else {
+            self.vega.mode13_direct_page_available()
+        };
+        available.then_some((gated, gated as usize & RAM_LOOKUP_PAGE_MASK))
+    }
+
+    fn record_direct_vga_accesses(
+        &mut self,
+        address: u32,
+        bytes: usize,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) {
+        let wait_states = if self.active_mode.uses_approximate_timing() {
+            video_wait_states_approx(self.active_mode.persona())
+        } else {
+            self.wait_states.video
+        };
+        let count = bytes / width.bytes() as usize;
+        self.trace
+            .record_memory_run(kind, address, count as u32, width, wait_states);
+    }
+
+    fn record_direct_ram_accesses(
+        &mut self,
+        address: u32,
+        bytes: usize,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) {
+        if self.active_mode.uses_approximate_timing() {
+            let count = bytes / width.bytes() as usize;
+            self.trace
+                .record_memory_run(kind, address, count as u32, width, self.cache.cost.l1);
+            return;
+        }
+        for offset in (0..bytes).step_by(width.bytes() as usize) {
+            let at = address + offset as u32;
+            let wait_states = self.data_access_wait_states(at, width);
+            self.trace.record(kind, at, width, wait_states);
         }
     }
 

@@ -37,6 +37,169 @@ fn mov_r64_r64_known_bytes() {
 }
 
 #[test]
+fn direct_store_bookkeeping_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.or_r64_r64(Reg::RAX, Reg::RDX);
+    e.load_r32_sib_scale4(Reg::RDX, Reg::RDI, Reg::RCX);
+    e.cmp_r8_disp8(Reg::RDX, Reg::RDI, 0);
+    e.add_r64_to_mem_disp8(Reg::RSP, 0, Reg::RDX);
+    e.bt_r64_mem(Reg::RDX, Reg::RCX);
+    e.bts_r64_mem(Reg::RSP, Reg::RDX);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x48, 0x09, 0xD0, // or rax,rdx
+            0x8B, 0x14, 0x8F, // mov edx,[rdi+rcx*4]
+            0x3A, 0x57, 0x00, // cmp dl,[rdi]
+            0x48, 0x01, 0x54, 0x24, 0x00, // add qword [rsp],rdx
+            0x48, 0x0F, 0xA3, 0x0A, // bt qword [rdx],rcx
+            0x48, 0x0F, 0xAB, 0x14, 0x24, // bts qword [rsp],rdx
+        ]
+    );
+}
+
+#[test]
+fn scalar_sse_memory_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movsd_xmm_disp32(Xmm::XMM1, Reg::R12, 0x1122_3344);
+    e.movsd_disp32_xmm(Reg::R13, -4, Xmm::XMM9);
+    e.movss_xmm_disp32(Xmm::XMM10, Reg::RSP, 8);
+    e.movss_disp32_xmm(Reg::RDI, 0, Xmm::XMM3);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x41, 0x0F, 0x10, 0x8C, 0x24, 0x44, 0x33, 0x22, 0x11, 0xF2, 0x45, 0x0F, 0x11,
+            0x8D, 0xFC, 0xFF, 0xFF, 0xFF, 0xF3, 0x44, 0x0F, 0x10, 0x94, 0x24, 0x08, 0x00, 0x00,
+            0x00, 0xF3, 0x0F, 0x11, 0x9F, 0x00, 0x00, 0x00, 0x00,
+        ]
+    );
+}
+
+#[test]
+fn indexed_movsd_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movsd_xmm_sib_scale8_disp32(Xmm::XMM2, Reg::R15, Reg::R9, 0x20);
+    e.movsd_sib_scale8_disp32_xmm(Reg::R12, Reg::R10, -8, Xmm::XMM11);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x43, 0x0F, 0x10, 0x94, 0xCF, 0x20, 0x00, 0x00, 0x00, 0xF2, 0x47, 0x0F, 0x11,
+            0x9C, 0xD4, 0xF8, 0xFF, 0xFF, 0xFF,
+        ]
+    );
+}
+
+#[test]
+fn scalar_sse_arithmetic_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movsd_xmm_xmm(Xmm::XMM1, Xmm::XMM2);
+    e.cvtss2sd(Xmm::XMM1, Xmm::XMM2);
+    e.cvtsd2ss(Xmm::XMM9, Xmm::XMM10);
+    e.addsd(Xmm::XMM0, Xmm::XMM1);
+    e.mulsd(Xmm::XMM2, Xmm::XMM3);
+    e.subsd(Xmm::XMM8, Xmm::XMM9);
+    e.divsd(Xmm::XMM10, Xmm::XMM11);
+    e.sqrtsd(Xmm::XMM12, Xmm::XMM13);
+    e.ucomisd(Xmm::XMM14, Xmm::XMM15);
+    e.xorpd(Xmm::XMM1, Xmm::XMM2);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x0F, 0x10, 0xCA, 0xF3, 0x0F, 0x5A, 0xCA, 0xF2, 0x45, 0x0F, 0x5A, 0xCA, 0xF2,
+            0x0F, 0x58, 0xC1, 0xF2, 0x0F, 0x59, 0xD3, 0xF2, 0x45, 0x0F, 0x5C, 0xC1, 0xF2, 0x45,
+            0x0F, 0x5E, 0xD3, 0xF2, 0x45, 0x0F, 0x51, 0xE5, 0x66, 0x45, 0x0F, 0x2E, 0xF7, 0x66,
+            0x0F, 0x57, 0xCA,
+        ]
+    );
+}
+
+#[test]
+fn variable_shift_form_has_known_bytes() {
+    let mut e = Encoder::new();
+    e.shr_r32_cl(Reg::RDX);
+    e.shr_r32_cl(Reg::R9);
+    assert_eq!(e.finish(), vec![0xD3, 0xEA, 0x41, 0xD3, 0xE9]);
+}
+
+#[test]
+fn double_shift_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.double_shift_r32(true, Reg::RAX, Reg::RDX, Some(31));
+    e.double_shift_r32(true, Reg::R8, Reg::R9, None);
+    e.double_shift_r32(false, Reg::RCX, Reg::RBX, Some(33));
+    e.double_shift_r32(false, Reg::R10, Reg::R11, None);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x0F, 0xA4, 0xD0, 0x1F, 0x45, 0x0F, 0xA5, 0xC8, 0x0F, 0xAC, 0xD9, 0x21, 0x45, 0x0F,
+            0xAD, 0xDA,
+        ]
+    );
+}
+
+#[test]
+fn scalar_sse_integer_conversion_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.cvtsi2sd_r32(Xmm::XMM1, Reg::RAX);
+    e.cvtsi2sd_r32(Xmm::XMM9, Reg::R10);
+    e.cvttsd2si_r32(Reg::RAX, Xmm::XMM1);
+    e.cvttsd2si_r32(Reg::R9, Xmm::XMM10);
+    e.cvttsd2si_r64(Reg::RAX, Xmm::XMM1);
+    e.cvttsd2si_r64(Reg::R9, Xmm::XMM10);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x0F, 0x2A, 0xC8, 0xF2, 0x45, 0x0F, 0x2A, 0xCA, 0xF2, 0x0F, 0x2C, 0xC1, 0xF2,
+            0x45, 0x0F, 0x2C, 0xCA, 0xF2, 0x48, 0x0F, 0x2C, 0xC1, 0xF2, 0x4D, 0x0F, 0x2C, 0xCA,
+        ]
+    );
+}
+
+#[test]
+fn movq_and_movd_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movq_xmm_r64(Xmm::XMM1, Reg::RAX);
+    e.movq_xmm_r64(Xmm::XMM9, Reg::R10);
+    e.movq_r64_xmm(Reg::RAX, Xmm::XMM1);
+    e.movq_r64_xmm(Reg::R10, Xmm::XMM9);
+    e.movd_xmm_r32(Xmm::XMM1, Reg::RAX);
+    e.movd_xmm_r32(Xmm::XMM9, Reg::R10);
+    e.movd_r32_xmm(Reg::RAX, Xmm::XMM1);
+    e.movd_r32_xmm(Reg::R10, Xmm::XMM9);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0x48, 0x0F, 0x6E, 0xC8, 0x66, 0x4D, 0x0F, 0x6E, 0xCA, 0x66, 0x48, 0x0F, 0x7E,
+            0xC8, 0x66, 0x4D, 0x0F, 0x7E, 0xCA, 0x66, 0x0F, 0x6E, 0xC8, 0x66, 0x45, 0x0F, 0x6E,
+            0xCA, 0x66, 0x0F, 0x7E, 0xC8, 0x66, 0x45, 0x0F, 0x7E, 0xCA,
+        ]
+    );
+}
+
+#[test]
+fn x87_integer_support_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.and_r64_r64(Reg::RAX, Reg::RDX);
+    e.xor_r64_r64(Reg::R9, Reg::R10);
+    e.shift_r64_imm8(5, Reg::R8, 52);
+    e.shift_r64_imm8(4, Reg::RDX, 1);
+    e.movzx_r32_word_disp32(Reg::RCX, Reg::R12, 0x1234);
+    e.store_r16_disp32(Reg::R13, -2, Reg::R9);
+    e.bt_r16_mem(Reg::RDX, Reg::RCX);
+    e.btr_r16_mem(Reg::R12, Reg::R9);
+    e.bts_r16_mem(Reg::RDI, Reg::RCX);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x48, 0x21, 0xD0, 0x4D, 0x31, 0xD1, 0x49, 0xC1, 0xE8, 0x34, 0x48, 0xC1, 0xE2, 0x01,
+            0x41, 0x0F, 0xB7, 0x8C, 0x24, 0x34, 0x12, 0x00, 0x00, 0x66, 0x45, 0x89, 0x8D, 0xFE,
+            0xFF, 0xFF, 0xFF, 0x66, 0x0F, 0xA3, 0x0A, 0x66, 0x45, 0x0F, 0xB3, 0x0C, 0x24, 0x66,
+            0x0F, 0xAB, 0x0F,
+        ]
+    );
+}
+
+#[test]
 fn mov_r32_r32_known_bytes() {
     // Non-extended pair: mov eax, ecx -- no REX byte at all.
     let mut e = Encoder::new();
@@ -197,6 +360,17 @@ fn load_r32_sib_known_bytes() {
 }
 
 #[test]
+fn load_r64_sib_scale8_known_bytes() {
+    let mut e = Encoder::new();
+    e.load_r64_sib_scale8(Reg::RDI, Reg::RDX, Reg::RCX);
+    assert_eq!(e.finish(), vec![0x48, 0x8B, 0x3C, 0xCA]);
+
+    let mut e = Encoder::new();
+    e.load_r64_sib_scale8(Reg::R10, Reg::R11, Reg::R9);
+    assert_eq!(e.finish(), vec![0x4F, 0x8B, 0x14, 0xCB]);
+}
+
+#[test]
 fn add_r32_imm32_known_bytes() {
     // add eax, 0xa0 -- no REX (eax not extended), 81 /0 id. ModRM mod=11,reg=0(/0),rm=0(eax)
     // = 11_000_000 = 0xC0.
@@ -279,6 +453,21 @@ fn add_r32_r32_known_bytes() {
 }
 
 #[test]
+fn byte_alu_register_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    for op in 0..8 {
+        e.alu_r8_r8(op, Reg::RAX, Reg::RCX);
+    }
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x00, 0xC8, 0x08, 0xC8, 0x10, 0xC8, 0x18, 0xC8, 0x20, 0xC8, 0x28, 0xC8, 0x30, 0xC8,
+            0x38, 0xC8,
+        ]
+    );
+}
+
+#[test]
 fn movzx_r32_byte_sib_known_bytes() {
     // movzx eax, byte [rsi+rcx] -- no REX. 0F B6; ModRM mod=00,reg=eax(0),rm=100(SIB)=0x04;
     // SIB scale=0,index=rcx(1),base=rsi(6) = 0x0E.
@@ -290,6 +479,17 @@ fn movzx_r32_byte_sib_known_bytes() {
     let mut e = Encoder::new();
     e.movzx_r32_byte_sib(Reg::R11, Reg::R12, Reg::R9);
     assert_eq!(e.finish(), vec![0x47, 0x0F, 0xB6, 0x1C, 0x0C]);
+}
+
+#[test]
+fn movzx_r32_byte_disp8_known_bytes() {
+    let mut e = Encoder::new();
+    e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
+    assert_eq!(e.finish(), vec![0x0F, 0xB6, 0x57, 0x00]);
+
+    let mut e = Encoder::new();
+    e.movzx_r32_byte_disp8(Reg::R9, Reg::R12, -4);
+    assert_eq!(e.finish(), vec![0x45, 0x0F, 0xB6, 0x4C, 0x24, 0xFC]);
 }
 
 #[test]

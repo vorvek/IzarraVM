@@ -14,6 +14,8 @@ pub struct VgaRaster {
     /// frame (`vtotal`); the host crops to `display_height` before presenting so
     /// the active image — not the retrace region — is what fills the screen.
     pub display_height: u32,
+    /// Content generation captured with this finalized raster.
+    pub generation: u64,
     pub pixels: Vec<u8>, // DAC indices; renderer resolves through the Dac
 }
 
@@ -1054,6 +1056,7 @@ impl Vga {
             width: w,
             height: h,
             display_height: self.crtc.vdisp_end,
+            generation: self.content_gen,
             pixels: self.work.clone(),
         }
     }
@@ -1068,14 +1071,17 @@ impl Vga {
         // Every mode (planar, mode X, mode 13h, and text) sizes `work` at its
         // mode-set, so a frame built from it has the matching pixel count. The
         // empty-work guard only suppresses publication before any mode is set.
-        if !self.work.is_empty() {
-            self.presented = Some(VgaRaster {
+        let mut presented = if self.work.is_empty() {
+            None
+        } else {
+            Some(VgaRaster {
                 width: self.raster_width(),
                 height: self.raster_height(),
                 display_height: self.crtc.vdisp_end,
+                generation: 0,
                 pixels: self.work.clone(),
-            });
-        }
+            })
+        };
         if let Some(addr) = self.pending_start.take() {
             // A start-address latch changes the scanout origin with no VRAM/register
             // write of its own, so bump the content generation here (only when it
@@ -1085,9 +1091,15 @@ impl Vga {
             }
             self.crtc.start_address = addr; // latched for the next frame
         }
-        if self.mode13_settle_frames != 0 {
+        if self.graphics_settle_frames != 0 {
             self.content_gen = self.content_gen.wrapping_add(1);
-            self.mode13_settle_frames -= 1;
+            self.graphics_settle_frames -= 1;
+        }
+        if let Some(raster) = &mut presented {
+            raster.generation = self.content_gen;
+        }
+        if presented.is_some() {
+            self.presented = presented;
         }
         self.last_line = 0;
     }

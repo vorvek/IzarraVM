@@ -1870,8 +1870,8 @@ fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
         any(target_os = "windows", target_os = "linux")
     ))]
     {
-        assert!(!cpu.jit_fast_map.has_read_mapping(0x40));
-        assert!(cpu.jit_fast_map.has_read_mapping(0x1000));
+        assert!(!cpu.jit_fast_map.has_read_mapping(0x40, 0x5000));
+        assert!(cpu.jit_fast_map.has_read_mapping(0x1000, 0x6000));
     }
 }
 

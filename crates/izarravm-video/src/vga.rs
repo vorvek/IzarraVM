@@ -285,7 +285,7 @@ pub struct Vga {
     pub(crate) mode13_linear_authoritative: bool,
     mode13_dirty_pages: Cell<u16>,
     mode13_direct_batch_dirty: bool,
-    mode13_settle_frames: u8,
+    graphics_settle_frames: u8,
     mode13_argb_full_dirty: Cell<bool>,
     mode13_argb_cache: RefCell<Mode13ArgbCache>,
     pub(crate) crtc: CrtcTiming,
@@ -362,7 +362,7 @@ impl Default for Vga {
             mode13_linear_authoritative: false,
             mode13_dirty_pages: Cell::new(0),
             mode13_direct_batch_dirty: false,
-            mode13_settle_frames: 0,
+            graphics_settle_frames: 0,
             mode13_argb_full_dirty: Cell::new(true),
             mode13_argb_cache: RefCell::new(Mode13ArgbCache::default()),
             crtc: CrtcTiming::text_03h(),
@@ -793,6 +793,57 @@ impl Vga {
             && aperture.graphics
     }
 
+    fn mode_x_direct_write_plane(&self) -> Option<usize> {
+        let aperture = self.gc.aperture();
+        let mask = self.seq.map_mask;
+        (self.mode == VideoMode::ModeX
+            && self.seq.memory_mode & 0x08 == 0
+            && self.seq.memory_mode & 0x04 != 0
+            && mask.is_power_of_two()
+            && mask <= 0x08
+            && self.gc.write_mode == 0
+            && self.gc.rotate == 0
+            && self.gc.logic == 0
+            && self.gc.enable_set_reset == 0
+            && self.gc.bit_mask == 0xff
+            && self.video_memory_enabled()
+            && aperture.base == VGA_MODE13H_BASE
+            && aperture.length == VGA_PLANAR_WINDOW_SIZE
+            && aperture.graphics)
+            .then(|| mask.trailing_zeros() as usize)
+    }
+
+    /// Stable description of the current direct VGA write mapping. Zero means
+    /// no mapping, one is canonical Mode 13h, and values two through five select
+    /// a Mode X plane. The machine compares this across register writes so a
+    /// cached page cannot keep targeting an old plane.
+    pub fn direct_write_token(&self) -> u8 {
+        if self.mode13h_direct_page_available() {
+            1
+        } else {
+            self.mode_x_direct_write_plane()
+                .map_or(0, |plane| plane as u8 + 2)
+        }
+    }
+
+    /// Return one directly writable VGA aperture page when the current write
+    /// datapath is a transparent byte copy. Mode X points at the sole plane
+    /// selected by the map mask. Reads still use the VGA handler and latches.
+    pub fn direct_write_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
+        if self.mode13h_direct_page_available() {
+            return self.mode13h_direct_page_ptr(offset);
+        }
+        let plane = self.mode_x_direct_write_plane()?;
+        if offset
+            .checked_add(0x1000)
+            .is_none_or(|end| end > VGA_PLANE_SIZE)
+        {
+            return None;
+        }
+        self.sync_mode13_planar();
+        Some(self.vram[plane * VGA_PLANE_SIZE + offset..].as_mut_ptr())
+    }
+
     /// Return one page of the canonical chained Mode 13h aperture. The backing
     /// buffer is stable for the lifetime of this VGA instance. Callers must use
     /// `note_mode13h_direct_write` before mutating the returned page.
@@ -812,6 +863,13 @@ impl Vga {
     /// committed by `finish_mode13h_direct_batch`, once for the whole bus batch.
     pub fn note_mode13h_direct_write(&mut self, offset: usize, bytes: usize) {
         debug_assert!(self.mode13h_direct_page_available());
+        self.note_direct_write(offset, bytes);
+    }
+
+    /// Mark a write made through any direct VGA page. Content generation is
+    /// committed by `finish_direct_write_batch`, once for the whole bus batch.
+    pub fn note_direct_write(&mut self, offset: usize, bytes: usize) {
+        debug_assert_ne!(self.direct_write_token(), 0);
         if bytes == 0 || offset >= self.mode13_linear.len() {
             return;
         }
@@ -824,16 +882,41 @@ impl Vga {
         for page in first_page..=last_page.min(MODE13_DIRECT_PAGES - 1) {
             dirty |= 1 << page;
         }
-        self.mode13_dirty_pages.set(dirty);
-        self.mode13_linear_valid = true;
-        self.mode13_linear_authoritative = true;
-        self.mode13_direct_batch_dirty = true;
-        if self.last_line != 0 {
-            self.mode13_settle_frames = 2;
+        self.note_direct_write_pages(dirty);
+    }
+
+    /// Mark the exact set of canonical Mode 13h pages written by one native CPU block.
+    pub fn note_mode13h_direct_pages(&mut self, dirty_pages: u16) {
+        debug_assert!(self.mode13h_direct_page_available());
+        self.note_direct_write_pages(dirty_pages);
+    }
+
+    /// Mark the aperture pages written through either canonical Mode 13h or the
+    /// transparent single-plane Mode X path.
+    pub fn note_direct_write_pages(&mut self, dirty_pages: u16) {
+        let token = self.direct_write_token();
+        debug_assert_ne!(token, 0);
+        if dirty_pages == 0 {
+            return;
         }
+        if token == 1 {
+            self.mode13_dirty_pages
+                .set(self.mode13_dirty_pages.get() | dirty_pages);
+            self.mode13_linear_valid = true;
+            self.mode13_linear_authoritative = true;
+        } else {
+            self.mode13_linear_valid = false;
+            self.mode13_linear_authoritative = false;
+        }
+        self.mode13_direct_batch_dirty = true;
+        self.arm_graphics_settle();
     }
 
     pub fn finish_mode13h_direct_batch(&mut self) {
+        self.finish_direct_write_batch();
+    }
+
+    pub fn finish_direct_write_batch(&mut self) {
         if self.mode13_direct_batch_dirty {
             self.content_gen = self.content_gen.wrapping_add(1);
             self.mode13_direct_batch_dirty = false;
@@ -2086,6 +2169,7 @@ impl Vga {
             }
             self.seq.clocking_mode |= 0x01;
             self.mode = VideoMode::Text;
+            self.graphics_settle_frames = 0;
             self.resize_work();
         }
     }
@@ -2195,6 +2279,7 @@ impl Vga {
         self.last_line = 0;
         self.seq.reset = 0x03;
         self.mode = VideoMode::Text;
+        self.graphics_settle_frames = 0;
         self.presented = None;
         // A buffered start-address change from a prior graphics mode must not
         // carry across the mode switch: the text origin resets to page 0.
@@ -2679,10 +2764,17 @@ impl Vga {
     /// caller (CPU bus or HLE BIOS) drove the write. Over-bumping is harmless.
     #[inline]
     fn bump_content_gen(&mut self) {
+        self.arm_graphics_settle();
         self.mode13_argb_full_dirty.set(true);
         self.mode13_direct_batch_dirty = false;
-        self.mode13_settle_frames = 0;
         self.content_gen = self.content_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    fn arm_graphics_settle(&mut self) {
+        if !self.is_text_mode() && (self.last_line != 0 || self.beam != 0) {
+            self.graphics_settle_frames = self.graphics_settle_frames.max(2);
+        }
     }
 
     /// The CPU aperture window the Graphics Controller Miscellaneous register
@@ -2925,7 +3017,7 @@ impl Vga {
         cache.frame = frame;
         cache.valid = true;
         cache.converted_pixels = converted;
-        if frame_advanced && self.mode13_settle_frames == 0 {
+        if frame_advanced && self.graphics_settle_frames == 0 {
             self.mode13_dirty_pages.set(0);
             self.mode13_argb_full_dirty.set(false);
         }

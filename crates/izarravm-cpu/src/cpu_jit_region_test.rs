@@ -726,7 +726,7 @@ fn drawcolumn_region_baseline() {
     eprintln!("drawcolumn region baseline: {best:.0} ns/iter (15 insns), representative harness");
 }
 
-/// Round 1 hotness admission: with `set_jit_auto_admit(true)` and NO manual `try_admit`, a
+/// Round 1 hotness admission: with `set_legacy_region_auto_admit(true)` and NO manual `try_admit`, a
 /// hot loop compiles itself once its entry line crosses JIT_HOTNESS_THRESHOLD, and the
 /// auto-admitted region stays byte-identical to the interpreter. The interp CPU (auto-admit
 /// off) never compiles, proving the flag gates it.
@@ -734,7 +734,7 @@ fn drawcolumn_region_baseline() {
 fn hotness_admission_compiles_a_hot_loop_and_stays_identical() {
     let mut interp = fresh_cpu(0xffff);
     let mut jit_cpu = fresh_cpu(0xffff);
-    jit_cpu.set_jit_auto_admit(true);
+    jit_cpu.set_legacy_region_auto_admit(true);
     // A 64 KB buffer holds the ~0x2D00 that edi reaches over 64 iterations (0x500 + 64*0xa0).
     let mut bus_i = TestBus::with_memory(program_in(0x1_0000));
     let mut bus_j = TestBus::with_memory(program_in(0x1_0000));

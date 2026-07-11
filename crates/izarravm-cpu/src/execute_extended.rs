@@ -394,13 +394,15 @@ impl CpuGsw {
                                 let linear =
                                     self.segment_linear_byte(memory.segment, memory.offset, false)?;
                                 self.tlb.invalidate(linear >> 12);
+                                self.data_read_pages.invalidate();
+                                self.data_write_pages.invalidate();
                                 #[cfg(all(
                                     feature = "jit",
                                     target_arch = "x86_64",
                                     any(target_os = "windows", target_os = "linux")
                                 ))]
                                 self.jit_fast_map.invalidate_page(linear);
-                                self.invalidate_code_caches();
+                                self.invalidate_translation_code_caches();
                                 Ok(clocks(12))
                             }
                             _ => Err(undefined_opcode()),

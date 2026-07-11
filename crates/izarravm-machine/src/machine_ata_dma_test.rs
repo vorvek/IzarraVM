@@ -152,7 +152,11 @@ fn dma_read_lands_on_its_exact_master_tick_across_a_live_mode_switch() {
     machine.advance_devices_ticks(1);
 
     assert_eq!(machine.read_physical_u8(0x2000), 0x12);
-    assert_eq!(machine.cpu.decode_cache_generation(), generation + 1);
+    assert_eq!(
+        machine.cpu.decode_cache_generation(),
+        generation,
+        "DMA into unrelated data must preserve decoded and compiled code"
+    );
     assert_eq!(input(&mut machine, BM_STATUS, BusWidth::Byte) & 0x05, 0x04);
     assert_eq!(
         input(&mut machine, ATA_STATUS, BusWidth::Byte) as u8 & STATUS_BSY,

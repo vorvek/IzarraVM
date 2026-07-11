@@ -26,17 +26,17 @@ const RAMP_FRAMES: u16 = 64;
 const CALLBACK_LATE_TOLERANCE_NS: u128 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct AudioDebugSnapshot {
-    frames_produced: u64,
-    frames_consumed: u64,
-    queue_min_depth: usize,
-    queue_max_depth: usize,
-    low_water_writes: u64,
-    underruns_after_prefill: u64,
-    overruns: u64,
-    late_callbacks: u64,
-    callback_lateness_us: u64,
-    max_callback_lateness_us: u64,
+pub struct AudioDebugSnapshot {
+    pub frames_produced: u64,
+    pub frames_consumed: u64,
+    pub queue_min_depth: usize,
+    pub queue_max_depth: usize,
+    pub low_water_writes: u64,
+    pub underruns_after_prefill: u64,
+    pub overruns: u64,
+    pub late_callbacks: u64,
+    pub callback_lateness_us: u64,
+    pub max_callback_lateness_us: u64,
 }
 
 #[derive(Debug)]
@@ -70,8 +70,12 @@ impl AudioDebugCounters {
     }
 
     fn observe_queue_depth(&self, depth: usize) {
-        self.queue_min_depth.fetch_min(depth, Ordering::Relaxed);
-        self.queue_max_depth.fetch_max(depth, Ordering::Relaxed);
+        self.observe_queue_range(depth, depth);
+    }
+
+    fn observe_queue_range(&self, min_depth: usize, max_depth: usize) {
+        self.queue_min_depth.fetch_min(min_depth, Ordering::Relaxed);
+        self.queue_max_depth.fetch_max(max_depth, Ordering::Relaxed);
     }
 
     fn record_callback_lateness(&self, lateness_ns: u128) {
@@ -142,6 +146,12 @@ pub struct AudioSink {
 }
 
 impl AudioSink {
+    /// Return the optional diagnostic counters without exposing the mutable
+    /// atomics shared with the audio callback.
+    pub fn debug_snapshot(&self) -> Option<AudioDebugSnapshot> {
+        self.debug.as_ref().map(|debug| debug.snapshot())
+    }
+
     /// Queue mixer frames while holding the buffer near its 30 ms target.
     ///
     /// Falling below 15 ms records producer starvation and appends new audio
@@ -209,20 +219,33 @@ impl AudioPlayer {
         let sample_format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
         let ring = new_ring();
-        let debug = std::env::var_os("IZARRAVM_AUDIO_DEBUG")
-            .is_some()
-            .then(|| Arc::new(AudioDebugCounters::new(ring.len())));
+        let audio_debug = std::env::var_os("IZARRAVM_AUDIO_DEBUG").is_some();
+        let runtime_profile = std::env::var("IZARRAVM_RUNTIME_PROFILE").as_deref() == Ok("1");
+        let debug =
+            (audio_debug || runtime_profile).then(|| Arc::new(AudioDebugCounters::new(ring.len())));
 
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => {
-                build_stream::<f32>(&device, &config, Arc::clone(&ring), debug.clone())
-            }
-            cpal::SampleFormat::I16 => {
-                build_stream::<i16>(&device, &config, Arc::clone(&ring), debug.clone())
-            }
-            cpal::SampleFormat::U16 => {
-                build_stream::<u16>(&device, &config, Arc::clone(&ring), debug.clone())
-            }
+            cpal::SampleFormat::F32 => build_stream::<f32>(
+                &device,
+                &config,
+                Arc::clone(&ring),
+                debug.clone(),
+                audio_debug,
+            ),
+            cpal::SampleFormat::I16 => build_stream::<i16>(
+                &device,
+                &config,
+                Arc::clone(&ring),
+                debug.clone(),
+                audio_debug,
+            ),
+            cpal::SampleFormat::U16 => build_stream::<u16>(
+                &device,
+                &config,
+                Arc::clone(&ring),
+                debug.clone(),
+                audio_debug,
+            ),
             other => return Err(format!("unsupported audio sample format: {other:?}").into()),
         }?;
         stream.play()?;
@@ -246,6 +269,8 @@ struct CallbackSource {
     gain: u16,
     underruns: u64,
     prefill_remaining: usize,
+    debug_frames_consumed: u64,
+    debug_underruns_after_prefill: u64,
 }
 
 impl CallbackSource {
@@ -260,12 +285,14 @@ impl CallbackSource {
             gain: 0,
             underruns: 0,
             prefill_remaining: TARGET_FRAMES,
+            debug_frames_consumed: 0,
+            debug_underruns_after_prefill: 0,
         }
     }
 
     fn next(&mut self) -> StereoFrame {
-        if let Some(debug) = &self.debug {
-            debug.frames_consumed.fetch_add(1, Ordering::Relaxed);
+        if self.debug.is_some() {
+            self.debug_frames_consumed = self.debug_frames_consumed.saturating_add(1);
         }
         match self.ring.pop() {
             Some(QueuedFrame::Audio(frame)) => {
@@ -278,20 +305,41 @@ impl CallbackSource {
             None => {
                 self.gain = self.gain.saturating_sub(1);
                 self.underruns = self.underruns.saturating_add(1);
-                if self.prefill_remaining == 0
-                    && let Some(debug) = &self.debug
-                {
-                    debug
-                        .underruns_after_prefill
-                        .fetch_add(1, Ordering::Relaxed);
+                if self.prefill_remaining == 0 && self.debug.is_some() {
+                    self.debug_underruns_after_prefill =
+                        self.debug_underruns_after_prefill.saturating_add(1);
                 }
             }
         }
-        if let Some(debug) = &self.debug {
+        if self.debug.is_some() {
             self.prefill_remaining = self.prefill_remaining.saturating_sub(1);
-            debug.observe_queue_depth(self.ring.len());
         }
         scale_frame(self.last, self.gain)
+    }
+
+    fn flush_debug_callback(&mut self, queue_depth_before: Option<usize>) {
+        let (Some(debug), Some(queue_depth_before)) = (&self.debug, queue_depth_before) else {
+            return;
+        };
+        let queue_depth_after = self.ring.len();
+        if self.debug_frames_consumed != 0 {
+            debug
+                .frames_consumed
+                .fetch_add(self.debug_frames_consumed, Ordering::Relaxed);
+        }
+        if self.debug_underruns_after_prefill != 0 {
+            debug
+                .underruns_after_prefill
+                .fetch_add(self.debug_underruns_after_prefill, Ordering::Relaxed);
+        }
+        let min_depth = if self.debug_underruns_after_prefill == 0 {
+            queue_depth_before.min(queue_depth_after)
+        } else {
+            0
+        };
+        debug.observe_queue_range(min_depth, queue_depth_before.max(queue_depth_after));
+        self.debug_frames_consumed = 0;
+        self.debug_underruns_after_prefill = 0;
     }
 }
 
@@ -309,6 +357,7 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     ring: Arc<ArrayQueue<QueuedFrame>>,
     debug: Option<Arc<AudioDebugCounters>>,
+    emit_debug_log: bool,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + FromSample<f32>,
@@ -327,6 +376,7 @@ where
     device.build_output_stream(
         config,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let queue_depth_before = debug.as_ref().map(|_| source.ring.len());
             let callback_frames = data.len() / channels.max(1);
             if let Some(debug) = &debug {
                 let callback = info.timestamp().callback;
@@ -362,8 +412,9 @@ where
                     next = source.next();
                 }
             }
+            source.flush_debug_callback(queue_depth_before);
 
-            if let Some(debug) = &debug {
+            if emit_debug_log && let Some(debug) = &debug {
                 out_frames += callback_frames as u64;
                 if out_frames >= out_hz as u64 {
                     let snapshot = debug.snapshot();

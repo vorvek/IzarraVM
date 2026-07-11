@@ -111,10 +111,10 @@ impl Machine {
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
     pub(super) fn handle_int10(&mut self) {
-        let mode13_direct_before = self.vega.mode13_direct_page_available();
+        let direct_write_before = self.vega.direct_write_token();
         self.handle_int10_inner();
-        if self.vega.mode13_direct_page_available() != mode13_direct_before {
-            self.direct_map_changed = true;
+        if self.vega.direct_write_token() != direct_write_before {
+            self.direct_data_map_changed = true;
         }
     }
 
@@ -2366,23 +2366,35 @@ impl Machine {
     /// `(width, height)`. Legacy VGA keeps the complete beam raster here for
     /// unit-tester CRC compatibility, including rows outside the visible image.
     pub fn frame_argb(&self) -> (Vec<u32>, usize, usize) {
-        self.vega.frame_argb()
+        let start = self.host_profile.start();
+        let frame = self.vega.frame_argb();
+        self.host_profile
+            .record(MachineProfilePhaseKind::VideoConversion, start);
+        frame
     }
 
     /// The most recently completed display frame, cropped exactly as the GUI
     /// presents it and converted to native `0x00RRGGBB` words.
     pub fn presented_frame_argb(&self) -> (Vec<u32>, usize, usize) {
-        self.vega.presented_frame_argb()
+        let start = self.host_profile.start();
+        let frame = self.vega.presented_frame_argb();
+        self.host_profile
+            .record(MachineProfilePhaseKind::VideoConversion, start);
+        frame
     }
 
     /// Render the current display state immediately for a headless capture.
     /// Legacy VGA output is cropped to its visible rows; accelerated scanouts
     /// use their current front buffers.
     pub fn capture_frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
-        self.vega.capture_frame_argb()
+        let start = self.host_profile.start();
+        let frame = self.vega.capture_frame_argb();
+        self.host_profile
+            .record(MachineProfilePhaseKind::VideoConversion, start);
+        frame
     }
 
-    /// An O(1) content-generation key for the host-side dirty-framebuffer cache.
+    /// An O(1) live content-generation key for graphics mutations.
     ///
     /// Returns `Some(key)` only when the output is a pure function of guest writes —
     /// the active display is the VGA raster AND the mode is a graphics mode (mode 13h,
@@ -2398,9 +2410,18 @@ impl Machine {
     /// Returns `None` for text mode (time-based cursor/attribute blink toggles with no
     /// guest write, so writes alone cannot capture it — text keeps re-rendering), and —
     /// in v1 — for Margo LFB / Distira (their own scanout; a generation for them is
-    /// deferred to v2). Pure `&self`: no rendering, no timing side effects.
+    /// deferred to v2). Consumers of [`Self::presented_frame_argb`] should use
+    /// [`Self::presented_frame_generation`] so the key and raster are finalized
+    /// together. Pure `&self`: no rendering, no timing side effects.
     pub fn frame_generation(&self) -> Option<u64> {
         self.vega.frame_generation()
+    }
+
+    /// Generation paired with the most recently completed graphics raster.
+    /// Unlike [`Self::frame_generation`], writes to an in-progress frame do not
+    /// move this key until that raster is finalized.
+    pub fn presented_frame_generation(&self) -> Option<u64> {
+        self.vega.presented_frame_generation()
     }
 
     /// zlib/IEEE CRC-32 of a framebuffer rectangle, each pixel hashed as its four
