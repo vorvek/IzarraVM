@@ -1002,6 +1002,15 @@ impl CpuGsw {
 
         let final_eip = self.registers.eip;
         let cs_base = self.registers.cs().base;
+        if exit.dynamic_link_cell != 0 {
+            debug_assert_eq!(exit.dynamic_target_eip, final_eip);
+            self.jit_direct.bind_dynamic_successor(
+                exit.dynamic_link_cell,
+                exit.dynamic_target_eip,
+                cs_base.wrapping_add(exit.dynamic_target_eip),
+                span.key.mode_key,
+            );
+        }
         let instructions = exit.instructions;
         let fp = jit::native_x87::scale_weighted_fp_clocks(exit.weighted_fp_clocks, self.fp_rem);
         self.fp_rem = fp.remainder;

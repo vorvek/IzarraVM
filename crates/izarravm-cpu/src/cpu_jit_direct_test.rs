@@ -3129,6 +3129,159 @@ fn direct_stack_call_jump_and_return_chain_matches_interpreter() {
         native.perf_counters().jit_direct_linked_transfers - transfers,
         3
     );
+
+    // The first RET above observed and bound RETURN. On the next identical call chain, the RET
+    // stays native and reaches the return site without another host entry.
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+    native_bus.memory.copy_from_slice(&pristine);
+    interp_bus.memory.copy_from_slice(&pristine);
+    native_bus.trace = BusTrace::default();
+    interp_bus.trace = BusTrace::default();
+    let entries = native.perf_counters().jit_direct_entries;
+    let transfers = native.perf_counters().jit_direct_linked_transfers;
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, entry_block)
+            .unwrap()
+    );
+    for _ in 0..13 {
+        interp.cycle(&mut interp_bus).unwrap();
+    }
+
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, HALT);
+    assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - transfers,
+        4
+    );
+}
+
+#[test]
+fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
+    const ENTRY: u32 = 0x180;
+    const FIRST: u32 = 0x200;
+    const FIRST_HALT: u32 = 0x210;
+    const SECOND: u32 = 0x220;
+    const SECOND_HALT: u32 = 0x230;
+    const INITIAL_ESP: u32 = 0x3000;
+
+    let mut pristine = vec![0; 0x5000];
+    pristine[ENTRY as usize] = 0xc3;
+    pristine[FIRST as usize..FIRST as usize + 9].copy_from_slice(&[
+        0xb8, 0x11, 0, 0, 0, // mov eax,0x11
+        0x89, 0xc1, // mov ecx,eax
+        0xeb, 0x07, // jmp FIRST_HALT
+    ]);
+    pristine[FIRST_HALT as usize] = 0xf4;
+    pristine[SECOND as usize..SECOND as usize + 9].copy_from_slice(&[
+        0xb8, 0x22, 0, 0, 0, // mov eax,0x22
+        0x89, 0xc1, // mov ecx,eax
+        0xeb, 0x07, // jmp SECOND_HALT
+    ]);
+    pristine[SECOND_HALT as usize] = 0xf4;
+
+    let mut native = flat_stack_cpu(ENTRY);
+    let mut interp = flat_stack_cpu(ENTRY);
+    let mut native_bus = TestBus::with_memory(pristine.clone());
+    let mut interp_bus = TestBus::with_memory(pristine.clone());
+    for bus in [&mut native_bus, &mut interp_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let starts = [
+        ENTRY,
+        FIRST,
+        FIRST + 5,
+        FIRST + 7,
+        SECOND,
+        SECOND + 5,
+        SECOND + 7,
+    ];
+    decode_fixture(&mut native, &mut native_bus, &starts);
+    decode_fixture(&mut interp, &mut interp_bus, &starts);
+    map_direct_page(
+        &mut native,
+        &mut native_bus,
+        INITIAL_ESP,
+        INITIAL_ESP,
+        jit::fast_map::PagePermissions::UNPAGED,
+        true,
+        false,
+    );
+    let ret_block = install_fixture_block(&mut native, ENTRY);
+    install_fixture_block(&mut native, FIRST);
+    install_fixture_block(&mut native, SECOND);
+
+    // Populate both ways. The first execution has quota one but still reports the target for
+    // binding. The second target misses the first tag and occupies the other way.
+    for target in [FIRST, SECOND] {
+        arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+        native_bus.memory.copy_from_slice(&pristine);
+        native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+            .copy_from_slice(&target.to_le_bytes());
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, ret_block)
+                .unwrap()
+        );
+        assert_eq!(native.registers.eip, target);
+    }
+
+    for (target, expected_halt, expected_value) in [
+        (FIRST, FIRST_HALT, 0x11),
+        (SECOND, SECOND_HALT, 0x22),
+        (FIRST, FIRST_HALT, 0x11),
+        (SECOND, SECOND_HALT, 0x22),
+    ] {
+        arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+        arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+        native_bus.memory.copy_from_slice(&pristine);
+        interp_bus.memory.copy_from_slice(&pristine);
+        native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+            .copy_from_slice(&target.to_le_bytes());
+        interp_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+            .copy_from_slice(&target.to_le_bytes());
+        native_bus.trace = BusTrace::default();
+        interp_bus.trace = BusTrace::default();
+        let entries = native.perf_counters().jit_direct_entries;
+        let transfers = native.perf_counters().jit_direct_linked_transfers;
+
+        assert!(
+            native
+                .try_run_direct_block_for_test(&mut native_bus, ret_block)
+                .unwrap()
+        );
+        for _ in 0..4 {
+            interp.cycle(&mut interp_bus).unwrap();
+        }
+
+        assert_eq!(native.registers, interp.registers);
+        assert_eq!(native.pending_flags, interp.pending_flags);
+        assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(native_bus.memory, interp_bus.memory);
+        assert_eq!(
+            native_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(native.registers.eip, expected_halt);
+        assert_eq!(native.registers.eax(), expected_value);
+        assert_eq!(native.registers.ecx(), expected_value);
+        assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
+        assert_eq!(
+            native.perf_counters().jit_direct_linked_transfers - transfers,
+            1
+        );
+    }
 }
 
 #[test]
