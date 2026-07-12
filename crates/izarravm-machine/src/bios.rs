@@ -178,7 +178,7 @@ impl Machine {
         if next >= KBD_RING_END {
             next = KBD_RING_START;
         }
-        let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_HEAD, next);
+        let _ = self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, next);
         self.set_ax(word);
     }
 
@@ -572,11 +572,9 @@ impl Machine {
                 let device = (bx >> 8) as u8;
                 let error = bx as u8;
                 let addr = BIOS_POST_ERROR_LOG_ADDR + u32::from(count) * 2;
-                let _ = self.memory.write_u8(addr as usize, error);
-                let _ = self.memory.write_u8(addr as usize + 1, device);
-                let _ = self
-                    .memory
-                    .write_u8(BIOS_POST_ERROR_LOG_COUNT_ADDR as usize, count + 1);
+                let _ = self.write_guest_ram_u8(addr as usize, error);
+                let _ = self.write_guest_ram_u8(addr as usize + 1, device);
+                let _ = self.write_guest_ram_u8(BIOS_POST_ERROR_LOG_COUNT_ADDR as usize, count + 1);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -599,7 +597,7 @@ impl Machine {
                 let addr = es.wrapping_add(u32::from(bx));
                 self.stall_for_micros(micros);
                 let byte = self.read_physical_u8(addr);
-                let _ = self.memory.write_u8(addr as usize, byte | 0x80);
+                let _ = self.write_guest_ram_u8(addr as usize, byte | 0x80);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -885,7 +883,7 @@ impl Machine {
             0x00 => {
                 let ticks = self.read_guest_dword(0x46c);
                 let rollover = self.read_physical_u8(0x470);
-                let _ = self.memory.write_u8(0x470, 0);
+                let _ = self.write_guest_ram_u8(0x470, 0);
                 self.set_eax_al(rollover);
                 self.set_cx((ticks >> 16) as u16);
                 self.set_dx(ticks as u16);
@@ -893,9 +891,9 @@ impl Machine {
             0x01 => {
                 let cx = self.cpu.registers.ecx() as u16;
                 let dx = self.cpu.registers.edx() as u16;
-                let _ = self.memory.write_u16(0x46c, dx);
-                let _ = self.memory.write_u16(0x46e, cx);
-                let _ = self.memory.write_u8(0x470, 0);
+                let _ = self.write_guest_ram_u16(0x46c, dx);
+                let _ = self.write_guest_ram_u16(0x46e, cx);
+                let _ = self.write_guest_ram_u8(0x470, 0);
             }
             0x02 => {
                 let (_, _, _, _, hour, minute, second) = self.rtc.clock();
@@ -965,7 +963,7 @@ impl Machine {
             // for AH=0Ah, so this is a write-through latch the BIOS keeps for the OS.
             0x0B => {
                 let cx = self.cpu.registers.ecx() as u16;
-                let _ = self.memory.write_u16(BDA_DAY_COUNT, cx);
+                let _ = self.write_guest_ram_u16(BDA_DAY_COUNT, cx);
                 self.set_int_frame_carry(false);
             }
             // AH=06h/07h set/cancel alarm: no alarm hardware modeled, accept and ignore.

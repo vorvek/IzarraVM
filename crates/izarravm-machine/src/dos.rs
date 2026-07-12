@@ -68,20 +68,16 @@ impl Machine {
         const KBD_RING_START: u16 = 0x1e;
         const KBD_RING_END: u16 = 0x3e;
         debug_assert!(bytes.len() < 16, "keyboard ring holds 15 entries");
-        let _ = self
-            .memory
-            .write_u16(KBD_BDA_BASE + KBD_HEAD, KBD_RING_START);
+        let _ = self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, KBD_RING_START);
         let mut off = KBD_RING_START;
         for &b in bytes {
-            let _ = self
-                .memory
-                .write_u16(KBD_BDA_BASE + off as usize, u16::from(b));
+            let _ = self.write_guest_ram_u16(KBD_BDA_BASE + off as usize, u16::from(b));
             off += 2;
             if off >= KBD_RING_END {
                 off = KBD_RING_START;
             }
         }
-        let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_TAIL, off);
+        let _ = self.write_guest_ram_u16(KBD_BDA_BASE + KBD_TAIL, off);
     }
 
     /// Set the CPU to a loaded raw program's entry from its six-field
@@ -363,7 +359,7 @@ impl Machine {
                 let sp = self.cpu.registers.esp() as u16;
                 let marker_addr = ss + u32::from(sp.wrapping_add(6));
                 if self.read_guest_word(marker_addr) == 0xDADA {
-                    let _ = self.memory.write_u16(marker_addr as usize, 0xADAD);
+                    let _ = self.write_guest_ram_u16(marker_addr as usize, 0xADAD);
                     self.set_eax_al(0xFF);
                 } else {
                     self.set_eax_al(0x00);
@@ -657,10 +653,10 @@ impl Machine {
                     // before the retry (a wait-for-key spin).
                     let ip_addr = (ss + u32::from(sp)) as usize;
                     let ret_ip = self.memory.read_u16(ip_addr)?;
-                    self.memory.write_u16(ip_addr, ret_ip.wrapping_sub(2))?;
+                    self.write_guest_ram_u16(ip_addr, ret_ip.wrapping_sub(2))?;
                     let mut flags = self.memory.read_u16(flags_addr)?;
                     flags |= 0x0200; // IF
-                    self.memory.write_u16(flags_addr, flags)?;
+                    self.write_guest_ram_u16(flags_addr, flags)?;
                     return Ok(None);
                 }
                 let word = self.memory.read_u16(KBD_BDA_BASE + usize::from(head))?;
@@ -668,7 +664,7 @@ impl Machine {
                 if next >= KBD_RING_END {
                     next = KBD_RING_START;
                 }
-                self.memory.write_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+                self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
                 let ch = word as u8;
                 self.program_output.push(ch);
                 self.cpu.registers.set_eax(u32::from(ch));
@@ -699,11 +695,11 @@ impl Machine {
                         if next >= KBD_RING_END {
                             next = KBD_RING_START;
                         }
-                        self.memory.write_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+                        self.write_guest_ram_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
                         flags &= !0x0040; // ZF clear: a char is in AL
                         self.cpu.registers.set_eax(u32::from(word as u8));
                     }
-                    self.memory.write_u16(flags_addr, flags)?;
+                    self.write_guest_ram_u16(flags_addr, flags)?;
                 } else {
                     self.program_output.push(dl);
                 }
@@ -724,7 +720,7 @@ impl Machine {
             _ => {
                 let mut flags = self.memory.read_u16(flags_addr)?;
                 flags |= 0x0001; // CF
-                self.memory.write_u16(flags_addr, flags)?;
+                self.write_guest_ram_u16(flags_addr, flags)?;
                 self.cpu.registers.set_eax(0x0007);
             }
         }

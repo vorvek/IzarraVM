@@ -152,14 +152,14 @@ impl Machine {
             // EGA planar graphics modes page in byte-address units.
             let mode = self.read_physical_u8(0x449) & 0x7F;
             if matches!(mode, 0x04..=0x06) {
-                let _ = self.memory.write_u8(0x462, 0);
-                let _ = self.memory.write_u16(0x44e, 0);
+                let _ = self.write_guest_ram_u8(0x462, 0);
+                let _ = self.write_guest_ram_u16(0x44e, 0);
                 return;
             }
             if let Some((page, page_start)) = self.ega_graphics_page_start(mode, al) {
                 self.vega.legacy_mut().set_start_address(page_start);
-                let _ = self.memory.write_u8(0x462, page);
-                let _ = self.memory.write_u16(0x44e, page_start as u16);
+                let _ = self.write_guest_ram_u8(0x462, page);
+                let _ = self.write_guest_ram_u16(0x44e, page_start as u16);
                 return;
             }
             let page = self.normalize_text_page(al);
@@ -168,8 +168,8 @@ impl Machine {
             self.vega
                 .legacy_mut()
                 .set_start_address((page_start / 2) as u32);
-            let _ = self.memory.write_u8(0x462, page);
-            let _ = self.memory.write_u16(0x44e, page_start as u16);
+            let _ = self.write_guest_ram_u8(0x462, page);
+            let _ = self.write_guest_ram_u16(0x44e, page_start as u16);
             let pos = self.cursor_pos(page);
             self.set_hardware_cursor_for_page(page, pos);
             return;
@@ -298,7 +298,7 @@ impl Machine {
                     self.set_bx(u16::from(dcc));
                 }
                 0x01 => {
-                    let _ = self.memory.write_u8(0x48A, bl);
+                    let _ = self.write_guest_ram_u8(0x48A, bl);
                 }
                 _ => {}
             }
@@ -415,8 +415,8 @@ impl Machine {
             }
             _ => return false,
         }
-        let _ = self.memory.write_u8(0x488, switches);
-        let _ = self.memory.write_u8(0x489, flags);
+        let _ = self.write_guest_ram_u8(0x488, switches);
+        let _ = self.write_guest_ram_u8(0x489, flags);
         true
     }
 
@@ -453,34 +453,35 @@ impl Machine {
     /// (and INT 10h AH=0Fh) see a sane state. Columns and rows are the text-cell
     /// geometry the BIOS publishes for the mode.
     fn set_bda_video_mode(&mut self, mode: u8, columns: u16, rows: u8) {
-        let _ = self.memory.write_u8(0x449, mode);
-        let _ = self.memory.write_u16(0x44a, columns);
-        let _ = self.memory.write_u16(0x44c, self.video_page_size(mode));
-        let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
-        let _ = self
-            .memory
-            .write_u16(0x485, u16::from(self.video_char_height(mode)));
-        let _ = self.memory.write_u16(0x44e, 0);
-        let _ = self.memory.write_u8(0x462, 0);
+        let _ = self.write_guest_ram_u8(0x449, mode);
+        let _ = self.write_guest_ram_u16(0x44a, columns);
+        let page_size = self.video_page_size(mode);
+        let _ = self.write_guest_ram_u16(0x44c, page_size);
+        let _ = self.write_guest_ram_u8(0x484, rows.saturating_sub(1));
+        let char_height = self.video_char_height(mode);
+        let _ = self.write_guest_ram_u16(0x485, u16::from(char_height));
+        let _ = self.write_guest_ram_u16(0x44e, 0);
+        let _ = self.write_guest_ram_u8(0x462, 0);
         for page in 0..8usize {
-            let _ = self.memory.write_u16(0x450 + page * 2, 0);
+            let _ = self.write_guest_ram_u16(0x450 + page * 2, 0);
         }
-        let _ = self
-            .memory
-            .write_u16(0x463, Self::video_crtc_base_port(mode));
-        let _ = self.memory.write_u8(0x487, 0x60 | (mode & 0x80));
-        let _ = self
-            .memory
-            .write_u8(0x48A, self.active_display_combination_code());
-        let _ = seed_bda_video_save_pointer(&mut self.memory);
+        let _ = self.write_guest_ram_u16(0x463, Self::video_crtc_base_port(mode));
+        let _ = self.write_guest_ram_u8(0x487, 0x60 | (mode & 0x80));
+        let display_combination = self.active_display_combination_code();
+        let _ = self.write_guest_ram_u8(0x48A, display_combination);
+        let _ = (|| {
+            self.write_guest_ram_u16(
+                BDA_VIDEO_SAVE_POINTER,
+                INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
+            )?;
+            self.write_guest_ram_u16(BDA_VIDEO_SAVE_POINTER + 2, VGA_BIOS_SEGMENT)
+        })();
         if let Some(mode_control) = Self::cga_bda_mode_control(mode) {
-            let _ = self.memory.write_u8(0x465, mode_control);
-            let _ = self
-                .memory
-                .write_u8(0x466, Self::cga_bda_color_select(mode));
+            let _ = self.write_guest_ram_u8(0x465, mode_control);
+            let _ = self.write_guest_ram_u8(0x466, Self::cga_bda_color_select(mode));
         } else {
-            let _ = self.memory.write_u8(0x465, 0);
-            let _ = self.memory.write_u8(0x466, 0);
+            let _ = self.write_guest_ram_u8(0x465, 0);
+            let _ = self.write_guest_ram_u8(0x466, 0);
         }
     }
 
@@ -712,12 +713,10 @@ impl Machine {
     }
 
     fn sync_bda_cga_latches(&mut self) {
-        let _ = self
-            .memory
-            .write_u8(0x465, self.vega.legacy_mut().cga_mode_control());
-        let _ = self
-            .memory
-            .write_u8(0x466, self.vega.legacy_mut().cga_color_select());
+        let mode_control = self.vega.legacy_mut().cga_mode_control();
+        let _ = self.write_guest_ram_u8(0x465, mode_control);
+        let color_select = self.vega.legacy_mut().cga_color_select();
+        let _ = self.write_guest_ram_u8(0x466, color_select);
     }
 
     fn video_page_size(&self, mode: u8) -> u16 {
@@ -855,7 +854,7 @@ impl Machine {
 
     fn set_cursor_pos(&mut self, page: u8, pos: u16) {
         let page = self.normalize_bios_page(page);
-        let _ = self.memory.write_u16(0x450 + usize::from(page) * 2, pos);
+        let _ = self.write_guest_ram_u16(0x450 + usize::from(page) * 2, pos);
         if !self.is_bios_graphics_text_mode() && page == self.active_bios_page() {
             self.set_hardware_cursor_for_page(page, pos);
         }
@@ -1311,7 +1310,7 @@ impl Machine {
             // emulation scaling for legacy 8-scanline requests.
             0x01 => {
                 let (bda_shape, start, end) = self.bios_cursor_shape(cx);
-                let _ = self.memory.write_u16(0x460, bda_shape);
+                let _ = self.write_guest_ram_u16(0x460, bda_shape);
                 self.vega.legacy_mut().set_cursor_shape(start, end);
             }
             // AH=02h set cursor position: DH=row, DL=col.
@@ -1831,8 +1830,8 @@ impl Machine {
             0x20 => {
                 let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
                 let bp = self.cpu.registers.ebp() as u16;
-                let _ = self.memory.write_u16(0x1F * 4, bp);
-                let _ = self.memory.write_u16(0x1F * 4 + 2, es);
+                let _ = self.write_guest_ram_u16(0x1F * 4, bp);
+                let _ = self.write_guest_ram_u16(0x1F * 4 + 2, es);
             }
             0x21 => {
                 let bp = self.cpu.registers.ebp() as u16;
@@ -1860,8 +1859,8 @@ impl Machine {
     }
 
     fn set_int43_pointer(&mut self, segment: u16, offset: u16) {
-        let _ = self.memory.write_u16(0x43 * 4, offset);
-        let _ = self.memory.write_u16(0x43 * 4 + 2, segment);
+        let _ = self.write_guest_ram_u16(0x43 * 4, offset);
+        let _ = self.write_guest_ram_u16(0x43 * 4 + 2, segment);
     }
 
     fn publish_int43_font_table(&mut self) {
@@ -1870,7 +1869,7 @@ impl Machine {
         let bytes = self.vega.legacy_mut().font_table_image(table, height);
         self.write_guest_block(VGA_BIOS_INT43_FONT_ADDR, &bytes);
         self.set_int43_pointer(VGA_BIOS_SEGMENT, VGA_BIOS_FONT_TABLE_OFF);
-        let _ = self.memory.write_u8(0x485, height);
+        let _ = self.write_guest_ram_u8(0x485, height);
     }
 
     fn int10_font_info(&mut self, specifier: u8) {
@@ -1926,8 +1925,8 @@ impl Machine {
             _ => self.text_rows() as u8,
         }
         .clamp(1, 60);
-        let _ = self.memory.write_u8(0x484, rows - 1);
-        let _ = self.memory.write_u16(0x485, u16::from(bytes_per_char));
+        let _ = self.write_guest_ram_u8(0x484, rows - 1);
+        let _ = self.write_guest_ram_u16(0x485, u16::from(bytes_per_char));
     }
 
     /// Write one character to the VGA text screen at the BDA cursor, advancing it

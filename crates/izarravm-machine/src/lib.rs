@@ -696,6 +696,9 @@ pub struct Machine {
     // Set only when a bus-side DMA block copy writes guest RAM without exposing
     // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
+    // An exact RAM write performed while MachineBus owns the memory borrow. The CPU cannot be
+    // notified until that borrow ends, so the run loop consumes this before another CPU entry.
+    pending_device_memory_write_range: Option<(u32, u32)>,
     // Set when the RAM direct-map table changes, so cached host pointers in the CPU are dropped
     // before any later guest access can use a stale RAM page classification.
     direct_map_changed: bool,
@@ -1061,6 +1064,7 @@ impl Machine {
             io_touched: false,
             isa_io_batch_clocks: 0,
             device_wrote_memory: false,
+            pending_device_memory_write_range: None,
             direct_map_changed: false,
             direct_data_map_changed: false,
             direct_mapping_epoch: 1,
@@ -1572,19 +1576,38 @@ impl Machine {
             } else {
                 flags &= !0x0001;
             }
-            let _ = self.memory.write_u16(flags_addr, flags);
+            let _ = self.write_guest_ram_u16(flags_addr, flags);
         }
     }
 
-    fn write_guest_block(&mut self, addr: u32, bytes: &[u8]) {
-        for (index, &byte) in bytes.iter().enumerate() {
-            self.write_physical_u8(addr.wrapping_add(index as u32), byte);
+    fn guest_ram_scalar_physical(&self, address: usize, width: usize) -> Result<u32, BusError> {
+        let end = address.saturating_add(width);
+        if end > self.memory.len() {
+            return Err(BusError::MemoryOutOfBounds {
+                address,
+                end,
+                len: self.memory.len(),
+            });
         }
-        if let Ok(width) = u32::try_from(bytes.len()) {
-            self.cpu.note_device_memory_write_range(addr, width);
-        } else if !bytes.is_empty() {
-            self.cpu.note_device_memory_write();
-        }
+        u32::try_from(address).map_err(|_| BusError::MemoryOutOfBounds {
+            address,
+            end,
+            len: self.memory.len(),
+        })
+    }
+
+    fn write_guest_ram_u8(&mut self, address: usize, value: u8) -> Result<(), BusError> {
+        let physical = self.guest_ram_scalar_physical(address, 1)?;
+        self.memory.write_u8(address, value)?;
+        self.cpu.note_device_memory_write_range(physical, 1);
+        Ok(())
+    }
+
+    fn write_guest_ram_u16(&mut self, address: usize, value: u16) -> Result<(), BusError> {
+        let physical = self.guest_ram_scalar_physical(address, 2)?;
+        self.memory.write_u16(address, value)?;
+        self.cpu.note_device_memory_write_range(physical, 2);
+        Ok(())
     }
 
     fn read_guest_block(&mut self, addr: u32, len: usize) -> Vec<u8> {
@@ -1605,7 +1628,7 @@ impl Machine {
             } else {
                 equipment &= !BIOS_EQUIPMENT_FPU;
             }
-            let _ = self.memory.write_u16(0x410, equipment);
+            let _ = self.write_guest_ram_u16(0x410, equipment);
         }
         // The modeled cache contents are per-mode, so a mode switch starts cold.
         self.cache_model.set_mode(mode);
@@ -2054,6 +2077,7 @@ struct MachineBus<'a> {
     // Points at `Machine::isa_io_batch_clocks`.
     isa_io_clocks: &'a mut u64,
     device_wrote_memory: &'a mut bool,
+    pending_device_memory_write_range: &'a mut Option<(u32, u32)>,
     direct_map_changed: &'a mut bool,
     direct_data_map_changed: &'a mut bool,
     direct_mapping_epoch: &'a mut u64,
@@ -2955,6 +2979,10 @@ fn seed_int46_absent_fixed_disk_table(memory: &mut Memory) -> Result<(), BusErro
     memory.write_u16(0x46 * 4, 0)?;
     memory.write_u16(0x46 * 4 + 2, 0)
 }
+
+#[cfg(test)]
+#[path = "machine_code_write_coherence_test.rs"]
+mod code_write_coherence_tests;
 
 #[cfg(test)]
 #[path = "machine_test.rs"]

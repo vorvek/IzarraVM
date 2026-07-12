@@ -60,6 +60,7 @@ impl Machine {
             io_touched: &mut self.io_touched,
             isa_io_clocks: &mut self.isa_io_batch_clocks,
             device_wrote_memory: &mut self.device_wrote_memory,
+            pending_device_memory_write_range: &mut self.pending_device_memory_write_range,
             direct_map_changed: &mut self.direct_map_changed,
             direct_data_map_changed: &mut self.direct_data_map_changed,
             direct_mapping_epoch: &mut self.direct_mapping_epoch,
@@ -101,23 +102,61 @@ impl Machine {
     }
 
     pub fn write_physical_u8(&mut self, address: u32, value: u8) {
-        let mut bus = self.make_bus();
-        let _ = bus.write_memory_byte(address, value);
+        let mut footprint = RamWriteFootprint::default();
+        {
+            let mut bus = self.make_bus();
+            let _ = bus.write_memory_byte_recorded(address, value, &mut footprint);
+        }
+        footprint.notify(&mut self.cpu);
     }
 
     pub fn write_physical_u16(&mut self, address: u32, value: u16) {
-        let mut bus = self.make_bus();
-        let _ = bus.write_memory(
-            address,
-            BusWidth::Word,
-            u32::from(value),
-            BusAccessKind::DataWrite,
-        );
+        let mut footprint = RamWriteFootprint::default();
+        {
+            let mut bus = self.make_bus();
+            let _ = bus.write_memory_recorded(
+                address,
+                BusWidth::Word,
+                u32::from(value),
+                BusAccessKind::DataWrite,
+                &mut footprint,
+            );
+        }
+        footprint.notify(&mut self.cpu);
     }
 
     pub fn write_physical_u32(&mut self, address: u32, value: u32) {
-        let mut bus = self.make_bus();
-        let _ = bus.write_memory(address, BusWidth::Dword, value, BusAccessKind::DataWrite);
+        let mut footprint = RamWriteFootprint::default();
+        {
+            let mut bus = self.make_bus();
+            let _ = bus.write_memory_recorded(
+                address,
+                BusWidth::Dword,
+                value,
+                BusAccessKind::DataWrite,
+                &mut footprint,
+            );
+        }
+        footprint.notify(&mut self.cpu);
+    }
+
+    pub(super) fn write_guest_block(&mut self, address: u32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut footprint = if u32::try_from(bytes.len()).is_ok() {
+            RamWriteFootprint::default()
+        } else {
+            RamWriteFootprint::coarse()
+        };
+        for (offset, &value) in bytes.iter().enumerate() {
+            let at = address.wrapping_add(offset as u32);
+            // Keep the old per-byte bus lifetime. Dropping the bus completes a Vega direct-write
+            // batch, so widening that lifetime here would change device-visible batching.
+            let mut bus = self.make_bus();
+            let _ = bus.write_memory_byte_recorded(at, value, &mut footprint);
+        }
+        footprint.notify(&mut self.cpu);
     }
 
     pub fn bus_trace(&self) -> &BusTrace {
@@ -133,7 +172,114 @@ impl Machine {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ByteRoute {
+    DirectRam(usize),
+    Rom,
+    OpenBus,
+    DeviceOrFallbackRam,
+}
+
+trait RamWriteRecorder {
+    fn record_ram_write(&mut self, physical: u32, width: u32);
+}
+
+struct IgnoreRamWrites;
+
+impl RamWriteRecorder for IgnoreRamWrites {
+    #[inline(always)]
+    fn record_ram_write(&mut self, _physical: u32, _width: u32) {}
+}
+
+const RAM_WRITE_INLINE_SPANS: usize = 4;
+
+struct RamWriteFootprint {
+    spans: [(u32, u32); RAM_WRITE_INLINE_SPANS],
+    span_count: usize,
+    wrote_ram: bool,
+    coarse: bool,
+}
+
+impl Default for RamWriteFootprint {
+    fn default() -> Self {
+        Self {
+            spans: [(0, 0); RAM_WRITE_INLINE_SPANS],
+            span_count: 0,
+            wrote_ram: false,
+            coarse: false,
+        }
+    }
+}
+
+impl RamWriteFootprint {
+    // A scalar write can create at most four discontiguous byte footprints. Keeping those spans
+    // inline avoids allocating on the public u8/u16/u32 paths. More fragmented bulk writes use a
+    // conservative global code-cache reset instead of growing an unbounded footprint.
+    fn coarse() -> Self {
+        Self {
+            coarse: true,
+            ..Self::default()
+        }
+    }
+
+    fn notify(self, cpu: &mut CpuGsw) {
+        if !self.wrote_ram {
+            return;
+        }
+        if self.coarse {
+            cpu.note_device_memory_write();
+            return;
+        }
+        for &(address, width) in &self.spans[..self.span_count] {
+            cpu.note_device_memory_write_range(address, width);
+        }
+    }
+}
+
+impl RamWriteRecorder for RamWriteFootprint {
+    fn record_ram_write(&mut self, physical: u32, width: u32) {
+        debug_assert_ne!(width, 0);
+        self.wrote_ram = true;
+        if self.coarse {
+            return;
+        }
+        if self.span_count != 0
+            && let (start, len) = &mut self.spans[self.span_count - 1]
+            && start.checked_add(*len) == Some(physical)
+            && let Some(combined) = len.checked_add(width)
+        {
+            *len = combined;
+            return;
+        }
+        if self.span_count == RAM_WRITE_INLINE_SPANS {
+            self.span_count = 0;
+            self.coarse = true;
+            return;
+        }
+        self.spans[self.span_count] = (physical, width);
+        self.span_count += 1;
+    }
+}
+
 impl MachineBus<'_> {
+    fn record_pending_device_memory_write(&mut self, physical: u32, width: u32) {
+        if width == 0 || *self.device_wrote_memory {
+            return;
+        }
+        match self.pending_device_memory_write_range {
+            Some((start, pending_width)) if *start == physical => {
+                *pending_width = (*pending_width).max(width);
+            }
+            None => {
+                *self.pending_device_memory_write_range = Some((physical, width));
+            }
+            Some(_) => {
+                *self.pending_device_memory_write_range = None;
+                *self.device_wrote_memory = true;
+            }
+        }
+    }
+
     fn advance_direct_mapping_epoch(&mut self) {
         advance_direct_mapping_epoch(self.direct_mapping_epoch);
     }
@@ -745,53 +891,7 @@ impl CpuBus for MachineBus<'_> {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
-        let address = self.apply_a20(address);
-        if self.vega.write_wide_memory(address, width, value) {
-            let ws = self.data_access_wait_states(address, width);
-            self.trace.record(kind, address, width, ws);
-            return Ok(());
-        }
-
-        if should_split(address, width) {
-            for offset in 0..width.bytes() {
-                self.write_memory(
-                    address + offset,
-                    BusWidth::Byte,
-                    (value >> (offset * 8)) & 0xff,
-                    kind,
-                )?;
-            }
-            return Ok(());
-        }
-
-        if let Some((start, _)) = self.direct_ram_range(address, width) {
-            let ws = self.data_access_wait_states(address, width);
-            self.trace.record(kind, address, width, ws);
-            return match width {
-                BusWidth::Byte => self.memory.write_u8(start, value as u8),
-                BusWidth::Word => self.memory.write_u16(start, value as u16),
-                BusWidth::Dword => self.memory.write_u32(start, value),
-            };
-        }
-
-        let ws = self.data_access_wait_states(address, width);
-        self.trace.record(kind, address, width, ws);
-
-        match width {
-            BusWidth::Byte => self.write_memory_byte(address, value as u8),
-            BusWidth::Word => {
-                for (offset, byte) in (value as u16).to_le_bytes().into_iter().enumerate() {
-                    self.write_memory_byte(address + offset as u32, byte)?;
-                }
-                Ok(())
-            }
-            BusWidth::Dword => {
-                for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
-                    self.write_memory_byte(address + offset as u32, byte)?;
-                }
-                Ok(())
-            }
-        }
+        self.write_memory_recorded(address, width, value, kind, &mut IgnoreRamWrites)
     }
 
     fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
@@ -1304,7 +1404,7 @@ impl CpuBus for MachineBus<'_> {
         // cached direct pages before it executes another guest instruction.
         let skip_io_touched = cpu_is_ring0_pm
             && self.lazy_port_reads
-            && !matches!(port, 0x60 | 0x64 | 0x92)
+            && !matches!(port, 0x60 | 0x64 | 0x92 | 0x00e7)
             && !(PCI_CONFIG_ADDRESS_PORT..=PCI_CONFIG_DATA_END).contains(&port);
         if !skip_io_touched {
             *self.io_touched = true;
@@ -1489,11 +1589,18 @@ impl CpuBus for MachineBus<'_> {
                 let (size_off, len) = [(0usize, 4096usize), (4096, 3584), (7680, 2048)][size_index];
                 let off = cp * 9728 + size_off;
                 let page = &izarravm_firmware::CODEPAGE_FONTS[off..off + len];
+                let mut written = 0u32;
                 for (i, &byte) in page.iter().enumerate() {
-                    let _ = self
+                    if self
                         .memory
-                        .write_u8(CODEPAGE_FONT_WINDOW as usize + i, byte);
+                        .write_u8(CODEPAGE_FONT_WINDOW as usize + i, byte)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    written += 1;
                 }
+                self.record_pending_device_memory_write(CODEPAGE_FONT_WINDOW, written);
             }
             return Ok(());
         }
@@ -1945,30 +2052,103 @@ impl MachineBus<'_> {
         Ok(())
     }
 
-    fn write_memory_byte(&mut self, address: u32, value: u8) -> Result<(), BusError> {
-        if let Some((addr, _)) = self.direct_ram_bytes(address, 1) {
-            return self.memory.write_u8(addr, value);
-        }
-
-        if rom_offset(address, 1).is_some() {
+    fn write_memory_recorded<R: RamWriteRecorder>(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+        recorder: &mut R,
+    ) -> Result<(), BusError> {
+        let address = self.apply_a20(address);
+        if self.vega.write_wide_memory(address, width, value) {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
             return Ok(());
         }
 
-        if is_open_bus_uma(address, 1) {
-            // Unoccupied upper memory: open bus, a write with nothing wired to
-            // receive it.
+        if should_split(address, width) {
+            for offset in 0..width.bytes() {
+                self.write_memory_recorded(
+                    address + offset,
+                    BusWidth::Byte,
+                    (value >> (offset * 8)) & 0xff,
+                    kind,
+                    recorder,
+                )?;
+            }
             return Ok(());
         }
 
-        if self.vega.write_memory_u8(address, value) {
+        if let Some((start, _)) = self.direct_ram_range(address, width) {
+            let ws = self.data_access_wait_states(address, width);
+            self.trace.record(kind, address, width, ws);
+            match width {
+                BusWidth::Byte => self.memory.write_u8(start, value as u8),
+                BusWidth::Word => self.memory.write_u16(start, value as u16),
+                BusWidth::Dword => self.memory.write_u32(start, value),
+            }?;
+            recorder.record_ram_write(address, width.bytes());
             return Ok(());
         }
 
-        if (address as usize) < self.memory.len() {
-            return self.memory.write_u8(address as usize, value);
-        }
+        let ws = self.data_access_wait_states(address, width);
+        self.trace.record(kind, address, width, ws);
 
-        // Writes to an unclaimed physical address have no receiver.
+        match width {
+            BusWidth::Byte => self.write_memory_byte_recorded(address, value as u8, recorder),
+            BusWidth::Word => {
+                for (offset, byte) in (value as u16).to_le_bytes().into_iter().enumerate() {
+                    self.write_memory_byte_recorded(address + offset as u32, byte, recorder)?;
+                }
+                Ok(())
+            }
+            BusWidth::Dword => {
+                for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+                    self.write_memory_byte_recorded(address + offset as u32, byte, recorder)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[inline]
+    fn byte_route(&self, address: u32) -> ByteRoute {
+        if let Some((backing, _)) = self.direct_ram_bytes(address, 1) {
+            ByteRoute::DirectRam(backing)
+        } else if rom_offset(address, 1).is_some() {
+            ByteRoute::Rom
+        } else if is_open_bus_uma(address, 1) {
+            ByteRoute::OpenBus
+        } else {
+            // VGA acceptance depends on live device state. Keep that final decision in the
+            // mutation path, then distinguish a rejected device route from fallback RAM there.
+            ByteRoute::DeviceOrFallbackRam
+        }
+    }
+
+    fn write_memory_byte_recorded<R: RamWriteRecorder>(
+        &mut self,
+        address: u32,
+        value: u8,
+        recorder: &mut R,
+    ) -> Result<(), BusError> {
+        match self.byte_route(address) {
+            ByteRoute::DirectRam(backing) => {
+                self.memory.write_u8(backing, value)?;
+                recorder.record_ram_write(address, 1);
+            }
+            ByteRoute::Rom | ByteRoute::OpenBus => {}
+            ByteRoute::DeviceOrFallbackRam => {
+                if self.vega.write_memory_u8(address, value) {
+                    return Ok(());
+                }
+                if (address as usize) < self.memory.len() {
+                    self.memory.write_u8(address as usize, value)?;
+                    recorder.record_ram_write(address, 1);
+                }
+            }
+        }
         Ok(())
     }
 

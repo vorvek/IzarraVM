@@ -4,6 +4,12 @@
 use super::*;
 
 impl Machine {
+    fn consume_pending_device_memory_write_range(&mut self) {
+        if let Some((physical, width)) = self.pending_device_memory_write_range.take() {
+            self.cpu.note_device_memory_write_range(physical, width);
+        }
+    }
+
     /// Preload the Neurketa benchmark selector the guest reads at start to pick
     /// its payload. Call before `run_until_halt_or_cycles`.
     pub fn set_bench_selector(&mut self, selector: u8) {
@@ -166,6 +172,10 @@ impl Machine {
         deadline_ticks: u64,
         requested: u64,
     ) -> Result<StopReason, MachineError> {
+        self.consume_pending_device_memory_write_range();
+        if std::mem::take(&mut self.device_wrote_memory) {
+            self.cpu.note_device_memory_write();
+        }
         while self.timeline.now_ticks() < deadline_ticks {
             if self.direct_map_changed {
                 self.cpu.note_direct_map_changed();
@@ -272,6 +282,7 @@ impl Machine {
                     io_touched,
                     isa_io_batch_clocks,
                     device_wrote_memory,
+                    pending_device_memory_write_range,
                     direct_map_changed,
                     direct_data_map_changed,
                     #[cfg(test)]
@@ -326,6 +337,7 @@ impl Machine {
                     io_touched,
                     isa_io_clocks: isa_io_batch_clocks,
                     device_wrote_memory,
+                    pending_device_memory_write_range,
                     direct_map_changed,
                     direct_data_map_changed,
                     direct_mapping_epoch: &mut self.direct_mapping_epoch,
@@ -462,6 +474,7 @@ impl Machine {
                     }),
                 }
             };
+            self.consume_pending_device_memory_write_range();
             self.host_profile
                 .record(MachineProfilePhaseKind::CpuBatch, cpu_batch_start);
 
@@ -618,7 +631,7 @@ impl Machine {
                     }
                     // A bus-side DMA copy without a reported destination range wrote guest RAM.
                     // Range-aware HLE, floppy, and bus-master IDE paths notify the CPU directly.
-                    if self.device_wrote_memory {
+                    if std::mem::take(&mut self.device_wrote_memory) {
                         self.cpu.note_device_memory_write();
                     }
                     if self.direct_map_changed {

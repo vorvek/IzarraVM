@@ -334,6 +334,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         io_touched: &mut machine.io_touched,
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
         device_wrote_memory: &mut machine.device_wrote_memory,
+        pending_device_memory_write_range: &mut machine.pending_device_memory_write_range,
         direct_map_changed: &mut machine.direct_map_changed,
         direct_data_map_changed: &mut machine.direct_data_map_changed,
         direct_mapping_epoch: &mut machine.direct_mapping_epoch,

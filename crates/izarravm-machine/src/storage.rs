@@ -138,10 +138,10 @@ impl Machine {
         } else {
             word &= !0x00C1;
         }
-        let _ = self.memory.write_u16(0x410, word);
+        let _ = self.write_guest_ram_u16(0x410, word);
         let hard_count = u8::from(self.ata.is_some())
             + u8::from(matches!(emulated, Some(ElToritoMedia::HardDisk)));
-        let _ = self.memory.write_u8(0x475, hard_count);
+        let _ = self.write_guest_ram_u8(0x475, hard_count);
     }
 
     /// Eject the A: floppy, returning its current image bytes (including any
@@ -326,24 +326,23 @@ impl Machine {
         let heads = disk.heads().min(u32::from(u8::MAX)) as u8;
         let spt = disk.sectors_per_track().min(u32::from(u8::MAX)) as u8;
         let base = BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR as usize;
-        self.memory.write_u16(base, cylinders)?;
-        self.memory.write_u8(base + 2, heads)?;
-        self.memory.write_u16(base + 3, 0)?; // reduced write current, XT only
-        self.memory.write_u16(base + 5, 0)?; // write precompensation
-        self.memory.write_u8(base + 7, 0)?; // ECC burst length, XT only
-        self.memory
-            .write_u8(base + 8, if heads > 8 { 0x08 } else { 0x00 })?;
-        self.memory.write_u8(base + 9, 0)?; // standard timeout, XT only
-        self.memory.write_u8(base + 10, 0)?; // formatting timeout, XT only
-        self.memory.write_u8(base + 11, 0)?; // drive-check timeout, XT only
-        self.memory.write_u16(base + 12, cylinders)?;
-        self.memory.write_u8(base + 14, spt)?;
-        self.memory.write_u8(base + 15, 0)?;
-        self.memory.write_u16(
+        self.write_guest_ram_u16(base, cylinders)?;
+        self.write_guest_ram_u8(base + 2, heads)?;
+        self.write_guest_ram_u16(base + 3, 0)?; // reduced write current, XT only
+        self.write_guest_ram_u16(base + 5, 0)?; // write precompensation
+        self.write_guest_ram_u8(base + 7, 0)?; // ECC burst length, XT only
+        self.write_guest_ram_u8(base + 8, if heads > 8 { 0x08 } else { 0x00 })?;
+        self.write_guest_ram_u8(base + 9, 0)?; // standard timeout, XT only
+        self.write_guest_ram_u8(base + 10, 0)?; // formatting timeout, XT only
+        self.write_guest_ram_u8(base + 11, 0)?; // drive-check timeout, XT only
+        self.write_guest_ram_u16(base + 12, cylinders)?;
+        self.write_guest_ram_u8(base + 14, spt)?;
+        self.write_guest_ram_u8(base + 15, 0)?;
+        self.write_guest_ram_u16(
             0x41 * 4,
             (BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR & 0x0F) as u16,
         )?;
-        self.memory.write_u16(
+        self.write_guest_ram_u16(
             0x41 * 4 + 2,
             (BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR >> 4) as u16,
         )?;
@@ -352,11 +351,10 @@ impl Machine {
 
     fn clear_fixed_disk_parameter_table(&mut self) -> Result<(), BusError> {
         for i in 0..16 {
-            self.memory
-                .write_u8(BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR as usize + i, 0)?;
+            self.write_guest_ram_u8(BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR as usize + i, 0)?;
         }
-        self.memory.write_u16(0x41 * 4, 0)?;
-        self.memory.write_u16(0x41 * 4 + 2, 0)
+        self.write_guest_ram_u16(0x41 * 4, 0)?;
+        self.write_guest_ram_u16(0x41 * 4 + 2, 0)
     }
 
     /// Whether a disc is currently mounted in the ATAPI drive.
@@ -527,7 +525,7 @@ impl Machine {
             _ => {}
         }
         // Write the status word back into the header (offset 3).
-        let _ = self.memory.write_u16(header as usize + 3, status);
+        let _ = self.write_guest_ram_u16(header as usize + 3, status);
     }
 
     /// Convert a CD device-driver address (HSG LBA when `addr_mode` == 0, packed
@@ -705,7 +703,7 @@ impl Machine {
     /// Record the INT 13h result in BDA 0040:0041 (last disk status) so AH=01h can
     /// report it. 0x00 is success; any other value is the error code.
     fn set_disk_status(&mut self, status: u8) {
-        let _ = self.memory.write_u8(0x441, status);
+        let _ = self.write_guest_ram_u8(0x441, status);
     }
 
     fn int13_floppy_error(&mut self, status: u8) {
@@ -1373,7 +1371,7 @@ impl Machine {
     /// Record the fixed-disk INT 13h result in BDA 0040:0074 so AH=01h can report
     /// it. Floppies use 0040:0041; the hard disk has its own status byte.
     fn set_fixed_disk_status(&mut self, status: u8) {
-        let _ = self.memory.write_u8(0x474, status);
+        let _ = self.write_guest_ram_u8(0x474, status);
     }
 
     /// Common success for a fixed-disk control call: AH=0, status byte 0, CF clear.
