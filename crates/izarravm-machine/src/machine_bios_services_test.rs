@@ -3,6 +3,120 @@
 
 use super::*;
 
+fn pci_bios_call(m: &mut Machine, function: u16) -> (u8, bool) {
+    prime_dos_int_frame(m);
+    m.cpu.registers.set_eax(u32::from(function));
+    m.handle_int1a();
+    (
+        ((m.cpu.registers.eax() >> 8) & 0xff) as u8,
+        dos_int_flags(m) & 1 != 0,
+    )
+}
+
+#[test]
+fn pci_bios_installs_finds_and_accesses_every_modeled_function() {
+    let mut m = int15_machine(16);
+    let (status, carry) = pci_bios_call(&mut m, 0xB101);
+    assert_eq!((status, carry), (0, false));
+    assert_eq!(m.cpu.registers.edx(), 0x2049_4350);
+    assert_eq!(m.cpu.registers.ebx() as u16, 0x0210);
+    assert_eq!(m.cpu.registers.ecx() as u8, 0);
+    assert_eq!(m.cpu.registers.eax() as u8, 1);
+
+    for (vendor, device, occurrence, expected) in [
+        (0x8086u16, 0x7110u16, 0u16, 0x0038u16),
+        (0x8086, 0x7111, 0, 0x0039),
+        (0x121a, 0x0001, 0, 0x0080),
+    ] {
+        m.cpu.registers.set_edx(u32::from(vendor));
+        m.cpu.registers.set_ecx(u32::from(device));
+        m.cpu.registers.set_esi(u32::from(occurrence));
+        let (status, carry) = pci_bios_call(&mut m, 0xB102);
+        assert_eq!((status, carry), (0, false));
+        assert_eq!(m.cpu.registers.ebx() as u16, expected);
+    }
+
+    m.cpu.registers.set_ecx(0x0001_0180); // IDE class/subclass/interface
+    m.cpu.registers.set_esi(0);
+    assert_eq!(pci_bios_call(&mut m, 0xB103), (0, false));
+    assert_eq!(m.cpu.registers.ebx() as u16, 0x0039);
+
+    m.cpu.registers.set_ebx(0x0039);
+    m.cpu.registers.set_edi(0);
+    assert_eq!(pci_bios_call(&mut m, 0xB10A), (0, false));
+    assert_eq!(m.cpu.registers.ecx(), 0x7111_8086);
+
+    m.cpu.registers.set_ebx(0x0039);
+    m.cpu.registers.set_edi(4);
+    m.cpu.registers.set_ecx(0);
+    assert_eq!(pci_bios_call(&mut m, 0xB10C), (0, false));
+    m.cpu.registers.set_ebx(0x0039);
+    m.cpu.registers.set_edi(4);
+    assert_eq!(pci_bios_call(&mut m, 0xB109), (0, false));
+    assert_eq!(m.cpu.registers.ecx() as u16, 0);
+
+    m.cpu.registers.set_ebx(0x0039);
+    m.cpu.registers.set_edi(4);
+    m.cpu.registers.set_ecx(1);
+    assert_eq!(pci_bios_call(&mut m, 0xB10B), (0, false));
+    m.cpu.registers.set_ebx(0x0039);
+    m.cpu.registers.set_edi(4);
+    assert_eq!(pci_bios_call(&mut m, 0xB108), (0, false));
+    assert_eq!(m.cpu.registers.ecx() as u8, 1);
+
+    m.cpu.registers.set_ebx(0x0080);
+    m.cpu.registers.set_edi(0x40);
+    m.cpu.registers.set_ecx(0xA55A_1234);
+    assert_eq!(pci_bios_call(&mut m, 0xB10D), (0, false));
+    m.cpu.registers.set_ebx(0x0080);
+    m.cpu.registers.set_edi(0x40);
+    assert_eq!(pci_bios_call(&mut m, 0xB10A), (0, false));
+    assert_eq!(m.cpu.registers.ecx(), 0xA55A_1234);
+}
+
+#[test]
+fn pci_bios_reports_search_register_and_function_errors() {
+    let mut m = int15_machine(16);
+    m.cpu.registers.set_edx(0xffff);
+    assert_eq!(pci_bios_call(&mut m, 0xB102), (0x83, true));
+    m.cpu.registers.set_edx(0x1234);
+    m.cpu.registers.set_ecx(0x5678);
+    m.cpu.registers.set_esi(0);
+    assert_eq!(pci_bios_call(&mut m, 0xB102), (0x86, true));
+    m.cpu.registers.set_ebx(0x0039);
+    m.cpu.registers.set_edi(3); // unaligned dword
+    assert_eq!(pci_bios_call(&mut m, 0xB10A), (0x87, true));
+    assert_eq!(pci_bios_call(&mut m, 0xB10E), (0x81, true));
+}
+
+#[test]
+fn bios32_header_and_far_call_stubs_resolve_pci() {
+    let prog = [
+        0x66, 0xB8, b'$', b'P', b'C', b'I', // mov eax,'$PCI'
+        0x9A, 0x10, 0xEA, 0x00, 0xF0, // call far F000:EA10
+        0xEB, 0xFE, // loop
+    ];
+    let mut m =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), &prog).unwrap();
+    let header = m.read_guest_block(0xFEA00, 16);
+    assert_eq!(&header[..4], b"_32_");
+    assert_eq!(
+        header.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        0
+    );
+    m.run_until_halt_or_cycles(100_000).unwrap();
+    assert_eq!(m.cpu.registers.eax() as u8, 0);
+    assert_eq!(m.cpu.registers.ebx(), 0x000F_0000);
+    assert_eq!(m.cpu.registers.ecx(), 0x0001_0000);
+    assert_eq!(m.cpu.registers.edx(), 0xEA20);
+
+    m.cpu.registers.set_eax(0xB101);
+    m.cpu.registers.eflags |= 1;
+    m.handle_pci_bios(true);
+    assert_eq!(m.cpu.registers.eflags & 1, 0);
+    assert_eq!(m.cpu.registers.edx(), 0x2049_4350);
+}
+
 #[test]
 fn new_raw_program_leaves_pit_counter0_running() {
     // A directly-loaded DOS program must see PIT counter 0 ticking, the way the

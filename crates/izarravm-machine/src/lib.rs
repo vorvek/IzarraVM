@@ -647,6 +647,7 @@ pub struct Machine {
     pci: PciConfig,
     text_scanline_override: Option<u16>,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
+    pending_bios32: Option<Bios32Call>,
     // The vector of the last host-intercepted `INT n` opcode, stashed so the
     // legacy shared FF00:0000 chain target can attribute a landing there (that
     // address is shared by every vector, so the fetch seam cannot key it the
@@ -1016,6 +1017,7 @@ impl Machine {
             pci,
             text_scanline_override: None,
             pending_soft_int: None,
+            pending_bios32: None,
             last_int_vector: None,
             io_touched: false,
             isa_io_batch_clocks: 0,
@@ -1914,6 +1916,7 @@ struct MachineBus<'a> {
     bmide: &'a mut bmide::BusMasterIde,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
+    pending_bios32: &'a mut Option<Bios32Call>,
     last_int_vector: &'a mut Option<u8>,
     active_mode: GswMode,                  // a copy, for the 0xE1 read
     pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
@@ -2309,6 +2312,18 @@ const BIOS_LEGACY_IRET_LINEAR: u32 = 0xFF000;
 const BIOS_STUB_WINDOW_LEN: u32 = 0x400;
 const BIOS_LEGACY_IRET_ROM_OFFSET: usize = 0xF000;
 
+const BIOS32_HEADER_ROM_OFFSET: usize = 0xEA00;
+const BIOS32_DIRECTORY_ROM_OFFSET: usize = 0xEA10;
+const BIOS32_PCI_ROM_OFFSET: usize = 0xEA20;
+const BIOS32_DIRECTORY_LINEAR: u32 = 0xFEA10;
+const BIOS32_PCI_LINEAR: u32 = 0xFEA20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bios32Call {
+    Directory,
+    Pci,
+}
+
 const fn bios_int_stub_off(vector: u8) -> u16 {
     0x0200 + (vector as u16) * 2
 }
@@ -2341,6 +2356,17 @@ fn write_bios_int_stub_table(rom: &mut [u8]) {
     // HLE ROMs relied on the constructors writing the IRET byte.
     rom[BIOS_LEGACY_IRET_ROM_OFFSET] = 0x90; // nop
     rom[BIOS_LEGACY_IRET_ROM_OFFSET + 1] = 0xCF; // iret
+
+    let mut header = [0u8; 16];
+    header[..4].copy_from_slice(b"_32_");
+    header[4..8].copy_from_slice(&BIOS32_DIRECTORY_LINEAR.to_le_bytes());
+    header[9] = 1; // one 16-byte paragraph
+    header[10] = 0u8.wrapping_sub(header.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)));
+    rom[BIOS32_HEADER_ROM_OFFSET..BIOS32_HEADER_ROM_OFFSET + 16].copy_from_slice(&header);
+    rom[BIOS32_DIRECTORY_ROM_OFFSET] = 0x90; // nop
+    rom[BIOS32_DIRECTORY_ROM_OFFSET + 1] = 0xCB; // lret
+    rom[BIOS32_PCI_ROM_OFFSET] = 0x90; // nop
+    rom[BIOS32_PCI_ROM_OFFSET + 1] = 0xCB; // lret
 }
 
 const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;

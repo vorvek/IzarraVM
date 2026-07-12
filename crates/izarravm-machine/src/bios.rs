@@ -832,6 +832,11 @@ impl Machine {
     /// contract, converted from the binary CMOS). AH=03h/05h/06h/07h are accepted
     /// as no-ops with CF clear, since the host drives the clock.
     pub(super) fn handle_int1a(&mut self) {
+        let ax = self.cpu.registers.eax() as u16;
+        if ax & 0xff00 == 0xb100 {
+            self.handle_pci_bios(false);
+            return;
+        }
         let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
         match ah {
             // AH=00h/01h read and set the BIOS tick count; neither reports status
@@ -934,6 +939,126 @@ impl Machine {
             0x80 => {}
             _ => self.set_int_frame_carry(true),
         }
+    }
+
+    /// PCI BIOS 2.10 services shared by real-mode INT 1Ah and the BIOS32 entry.
+    /// BIOS32 calls report carry in live EFLAGS; INT 1Ah patches the saved FLAGS.
+    pub(super) fn handle_pci_bios(&mut self, live_flags: bool) {
+        const SUCCESS: u8 = 0x00;
+        const FUNC_NOT_SUPPORTED: u8 = 0x81;
+        const BAD_VENDOR_ID: u8 = 0x83;
+        const DEVICE_NOT_FOUND: u8 = 0x86;
+        const BAD_REGISTER: u8 = 0x87;
+
+        let function = self.cpu.registers.eax() as u16;
+        let mut status = SUCCESS;
+        match function {
+            0xB101 => {
+                self.cpu.registers.set_edx(0x2049_4350); // "PCI "
+                self.set_bx(0x0210); // PCI BIOS 2.10
+                self.set_cl(0); // last bus
+                self.set_eax_al(1); // configuration mechanism #1
+            }
+            0xB102 => {
+                let vendor = self.cpu.registers.edx() as u16;
+                let device = self.cpu.registers.ecx() as u16;
+                let occurrence = self.cpu.registers.esi() as u16;
+                if vendor == 0xffff {
+                    status = BAD_VENDOR_ID;
+                } else if let Some((bus, devfn)) = self.pci_find(occurrence, |id, _| {
+                    id as u16 == vendor && (id >> 16) as u16 == device
+                }) {
+                    self.set_bx((u16::from(bus) << 8) | u16::from(devfn));
+                } else {
+                    status = DEVICE_NOT_FOUND;
+                }
+            }
+            0xB103 => {
+                let class = self.cpu.registers.ecx() & 0x00ff_ffff;
+                let occurrence = self.cpu.registers.esi() as u16;
+                if let Some((bus, devfn)) =
+                    self.pci_find(occurrence, |_, class_reg| class_reg >> 8 == class)
+                {
+                    self.set_bx((u16::from(bus) << 8) | u16::from(devfn));
+                } else {
+                    status = DEVICE_NOT_FOUND;
+                }
+            }
+            0xB108 | 0xB109 | 0xB10A | 0xB10B | 0xB10C | 0xB10D => {
+                let bx = self.cpu.registers.ebx() as u16;
+                let bus = (bx >> 8) as u8;
+                let devfn = bx as u8;
+                let offset = self.cpu.registers.edi() as u16;
+                let width = match function {
+                    0xB108 | 0xB10B => BusWidth::Byte,
+                    0xB109 | 0xB10C => BusWidth::Word,
+                    _ => BusWidth::Dword,
+                };
+                let size = width.bytes() as u16;
+                if offset + size > 0x100 || offset & (size - 1) != 0 {
+                    status = BAD_REGISTER;
+                } else if self.pci.read_bdf(bus, devfn, 0, BusWidth::Word, &self.vega) == 0xffff {
+                    status = DEVICE_NOT_FOUND;
+                } else if function <= 0xB10A {
+                    let value = self
+                        .pci
+                        .read_bdf(bus, devfn, offset as u8, width, &self.vega);
+                    match width {
+                        BusWidth::Byte => self.set_cl(value as u8),
+                        BusWidth::Word => self.set_cx(value as u16),
+                        BusWidth::Dword => self.cpu.registers.set_ecx(value),
+                    }
+                } else {
+                    let value = self.cpu.registers.ecx();
+                    self.pci
+                        .write_bdf(bus, devfn, offset as u8, width, value, &mut self.vega);
+                }
+            }
+            _ => status = FUNC_NOT_SUPPORTED,
+        }
+        self.set_eax_ah(status);
+        if live_flags {
+            if status == SUCCESS {
+                self.cpu.registers.eflags &= !1;
+            } else {
+                self.cpu.registers.eflags |= 1;
+            }
+        } else {
+            self.set_int_frame_carry(status != SUCCESS);
+        }
+    }
+
+    pub(super) fn handle_bios32_directory(&mut self) {
+        if self.cpu.registers.eax() == u32::from_le_bytes(*b"$PCI") {
+            self.set_eax_al(0);
+            self.cpu.registers.set_ebx(0x000F_0000);
+            self.cpu.registers.set_ecx(0x0001_0000);
+            self.cpu.registers.set_edx(BIOS32_PCI_ROM_OFFSET as u32);
+        } else {
+            self.set_eax_al(0x80);
+        }
+    }
+
+    fn pci_find(
+        &self,
+        occurrence: u16,
+        mut matches: impl FnMut(u32, u32) -> bool,
+    ) -> Option<(u8, u8)> {
+        let mut found = 0u16;
+        for devfn in 0u8..=u8::MAX {
+            let id = self.pci.read_bdf(0, devfn, 0, BusWidth::Dword, &self.vega);
+            if id as u16 == 0xffff {
+                continue;
+            }
+            let class = self.pci.read_bdf(0, devfn, 8, BusWidth::Dword, &self.vega);
+            if matches(id, class) {
+                if found == occurrence {
+                    return Some((0, devfn));
+                }
+                found = found.wrapping_add(1);
+            }
+        }
+        None
     }
 
     /// Point CS:IP at a real-mode far address. Used by the boot vectors to

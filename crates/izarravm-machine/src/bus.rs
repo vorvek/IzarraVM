@@ -43,6 +43,7 @@ impl Machine {
             bmide: &mut self.bmide,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
+            pending_bios32: &mut self.pending_bios32,
             last_int_vector: &mut self.last_int_vector,
             active_mode: self.active_mode,
             pending_mode: &mut self.pending_mode,
@@ -530,6 +531,13 @@ impl CpuBus for MachineBus<'_> {
 
     #[inline]
     fn note_code_fetch_linear(&mut self, linear: u32) {
+        if self.pending_bios32.is_none() {
+            *self.pending_bios32 = match linear {
+                BIOS32_DIRECTORY_LINEAR => Some(Bios32Call::Directory),
+                BIOS32_PCI_LINEAR => Some(Bios32Call::Pci),
+                _ => None,
+            };
+        }
         // One range compare (0xFF000..0xFF400: the legacy FF00:0000 target
         // through the end of the per-vector stub table) keeps this out of the
         // way of every ordinary fetch.

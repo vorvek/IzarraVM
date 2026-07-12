@@ -284,6 +284,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         bmide: &mut machine.bmide,
         trace: &mut machine.trace,
         pending_soft_int: &mut machine.pending_soft_int,
+        pending_bios32: &mut machine.pending_bios32,
         last_int_vector: &mut machine.last_int_vector,
         active_mode: machine.active_mode,
         pending_mode: &mut machine.pending_mode,

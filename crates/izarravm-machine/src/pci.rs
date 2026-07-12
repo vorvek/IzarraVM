@@ -30,8 +30,8 @@ impl PciConfig {
     pub(crate) fn new() -> Self {
         Self {
             address: 0,
-            // There is no PCI BIOS yet, so the legacy IDE controller powers on
-            // decoded and bus-master capable at its fixed 0xF000 BAR4.
+            // The legacy IDE controller powers on decoded and bus-master capable
+            // at its fixed 0xF000 BAR4.
             piix_ide_command: PCI_COMMAND_IO | PCI_COMMAND_BUS_MASTER,
             piix_ide_bm_base: PIIX4_BMIDE_POWER_ON_BASE,
         }
@@ -94,29 +94,76 @@ impl PciConfig {
         (self.piix_ide_bm_base <= u32::from(u16::MAX) - 15).then_some(self.piix_ide_bm_base as u16)
     }
 
-    fn read_data(&self, port_offset: u16, width: BusWidth, vega: &Vega) -> u32 {
-        let base = (self.address & 0xfc) + u32::from(port_offset);
+    /// Configuration-space access shared by mechanism #1 port I/O and PCI BIOS.
+    /// `devfn` uses the standard device-in-bits-7:3/function-in-bits-2:0 form.
+    pub(crate) fn read_bdf(
+        &self,
+        bus: u8,
+        devfn: u8,
+        offset: u8,
+        width: BusWidth,
+        vega: &Vega,
+    ) -> u32 {
         (0..width.bytes())
-            .map(|index| u32::from(self.read_config_byte(base + index, vega)) << (index * 8))
+            .map(|index| {
+                u32::from(self.read_bdf_byte(bus, devfn, offset.wrapping_add(index as u8), vega))
+                    << (index * 8)
+            })
             .fold(0, |a, b| a | b)
     }
 
-    fn write_data(&mut self, port_offset: u16, width: BusWidth, value: u32, vega: &mut Vega) {
-        let base = (self.address & 0xfc) + u32::from(port_offset);
+    pub(crate) fn write_bdf(
+        &mut self,
+        bus: u8,
+        devfn: u8,
+        offset: u8,
+        width: BusWidth,
+        value: u32,
+        vega: &mut Vega,
+    ) {
         for index in 0..width.bytes() {
-            self.write_config_byte(base + index, ((value >> (index * 8)) & 0xff) as u8, vega);
+            self.write_bdf_byte(
+                bus,
+                devfn,
+                offset.wrapping_add(index as u8),
+                ((value >> (index * 8)) & 0xff) as u8,
+                vega,
+            );
         }
     }
 
-    fn read_config_byte(&self, offset: u32, vega: &Vega) -> u8 {
-        if self.piix_selected(0) {
-            return read_piix4_isa_byte(offset);
+    fn read_data(&self, port_offset: u16, width: BusWidth, vega: &Vega) -> u32 {
+        let bus = (self.address >> 16) as u8;
+        let devfn = (self.address >> 8) as u8;
+        let offset = ((self.address & 0xfc) as u8).wrapping_add(port_offset as u8);
+        if self.address & 0x8000_0000 == 0 {
+            return match width {
+                BusWidth::Byte => 0xff,
+                BusWidth::Word => 0xffff,
+                BusWidth::Dword => u32::MAX,
+            };
         }
-        if self.piix_selected(1) {
-            return self.read_piix4_ide_byte(offset);
+        self.read_bdf(bus, devfn, offset, width, vega)
+    }
+
+    fn write_data(&mut self, port_offset: u16, width: BusWidth, value: u32, vega: &mut Vega) {
+        if self.address & 0x8000_0000 != 0 {
+            let bus = (self.address >> 16) as u8;
+            let devfn = (self.address >> 8) as u8;
+            let offset = ((self.address & 0xfc) as u8).wrapping_add(port_offset as u8);
+            self.write_bdf(bus, devfn, offset, width, value, vega);
         }
-        if self.distira_selected() {
-            return vega.pci_read_config_byte(offset);
+    }
+
+    fn read_bdf_byte(&self, bus: u8, devfn: u8, offset: u8, vega: &Vega) -> u8 {
+        if bus == 0 && devfn == PIIX_SLOT << 3 {
+            return read_piix4_isa_byte(u32::from(offset));
+        }
+        if bus == 0 && devfn == (PIIX_SLOT << 3 | 1) {
+            return self.read_piix4_ide_byte(u32::from(offset));
+        }
+        if bus == 0 && devfn == DISTIRA_PCI_SLOT << 3 {
+            return vega.pci_read_config_byte(u32::from(offset));
         }
         0xff
     }
@@ -145,13 +192,13 @@ impl PciConfig {
         }
     }
 
-    fn write_config_byte(&mut self, offset: u32, value: u8, vega: &mut Vega) {
-        if self.piix_selected(1) {
-            self.write_piix4_ide_byte(offset, value);
+    fn write_bdf_byte(&mut self, bus: u8, devfn: u8, offset: u8, value: u8, vega: &mut Vega) {
+        if bus == 0 && devfn == (PIIX_SLOT << 3 | 1) {
+            self.write_piix4_ide_byte(u32::from(offset), value);
             return;
         }
-        if self.distira_selected() {
-            vega.pci_write_config_byte(offset, value);
+        if bus == 0 && devfn == DISTIRA_PCI_SLOT << 3 {
+            vega.pci_write_config_byte(u32::from(offset), value);
         }
     }
 
@@ -170,20 +217,6 @@ impl PciConfig {
             }
             _ => {}
         }
-    }
-
-    fn distira_selected(&self) -> bool {
-        self.address & 0x8000_0000 != 0
-            && ((self.address >> 16) & 0xff) == 0
-            && ((self.address >> 11) & 0x1f) as u8 == DISTIRA_PCI_SLOT
-            && ((self.address >> 8) & 0x07) == 0
-    }
-
-    fn piix_selected(&self, function: u8) -> bool {
-        self.address & 0x8000_0000 != 0
-            && ((self.address >> 16) & 0xff) == 0
-            && ((self.address >> 11) & 0x1f) as u8 == PIIX_SLOT
-            && ((self.address >> 8) & 0x07) as u8 == function
     }
 }
 

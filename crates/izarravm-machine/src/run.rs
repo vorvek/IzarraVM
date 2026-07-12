@@ -256,6 +256,7 @@ impl Machine {
                     bmide,
                     trace,
                     pending_soft_int,
+                    pending_bios32,
                     last_int_vector,
                     fast_post,
                     booter_inert,
@@ -303,6 +304,7 @@ impl Machine {
                     bmide,
                     trace,
                     pending_soft_int,
+                    pending_bios32,
                     last_int_vector,
                     active_mode: *active_mode,
                     pending_mode,
@@ -511,6 +513,13 @@ impl Machine {
                         serviced = true;
                         if let Some(code) = self.perform_unittester(cmd) {
                             service_stop = Some(StopReason::TestExit { code });
+                        }
+                    }
+                    if let Some(call) = self.pending_bios32.take() {
+                        serviced = true;
+                        match call {
+                            Bios32Call::Directory => self.handle_bios32_directory(),
+                            Bios32Call::Pci => self.handle_pci_bios(true),
                         }
                     }
                     // A software INT taken by a V86 guest faults to the TOKAEMM monitor
