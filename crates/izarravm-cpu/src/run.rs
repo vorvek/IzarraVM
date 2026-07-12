@@ -632,15 +632,32 @@ impl CpuGsw {
     /// setting it never makes an otherwise-identical CPU compare unequal.
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
+        let was_enabled = self.jit_direct.execution_enabled();
         self.jit_regions.set_auto_admit(false);
         self.jit_direct.set_auto_admit(on && jit::host_supported());
+        self.finish_direct_execution_transition(was_enabled);
     }
 
     /// Enable or disable every native execution path, including forced legacy regions.
     /// Unsupported hosts cannot be enabled.
     #[cfg(feature = "jit")]
     pub fn set_native_backend_enabled(&mut self, on: bool) {
+        let was_enabled = self.jit_direct.execution_enabled();
         self.jit_direct.set_backend_enabled(on);
+        self.finish_direct_execution_transition(was_enabled);
+    }
+
+    #[cfg(feature = "jit")]
+    fn finish_direct_execution_transition(&mut self, was_enabled: bool) {
+        if was_enabled == self.jit_direct.execution_enabled() {
+            return;
+        }
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_fast_map.invalidate_all();
+        self.jit_direct.invalidate_translation();
     }
 
     #[cfg(all(feature = "jit", test))]
@@ -652,15 +669,10 @@ impl CpuGsw {
         allow(dead_code)
     )]
     pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
+        let was_enabled = self.jit_direct.execution_enabled();
         self.jit_direct.set_auto_admit(false);
         self.jit_regions.set_auto_admit(on && jit::host_supported());
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if on {
-            self.jit_fast_map.invalidate_all();
-        }
+        self.finish_direct_execution_transition(was_enabled);
     }
 
     #[cfg(feature = "jit")]
@@ -677,7 +689,10 @@ impl CpuGsw {
         if !self.jit_direct.auto_admit() {
             return Ok(DirectContinuation::Interpret);
         }
-        if !self.decode_cache.direct_hot(lin, d) {
+        if !self
+            .decode_cache
+            .direct_hot(lin, d, self.jit_direct.admission_heat())
+        {
             return Ok(DirectContinuation::Interpret);
         }
         let Some(key) = jit::direct::key_for(self, lin, d) else {

@@ -8,6 +8,7 @@ const DATA: usize = 0x200;
 
 fn x87_cpu(mode: GswMode) -> CpuGsw {
     let mut cpu = CpuGsw::default();
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
     cpu.set_mode(mode);
     for segment in [
         SegmentIndex::Cs,

@@ -26,6 +26,7 @@ fn fixture(code: &[u8]) -> (CpuGsw, TestBus) {
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     let mut cpu = fresh();
+    cpu.jit_direct.set_fast_map_enabled_for_test(true);
     cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
         .expect("initialize direct map");
     (cpu, bus)
@@ -167,6 +168,28 @@ fn retry_state_stays_dormant_after_decode_recovery_until_cache_clear() {
     assert_eq!(
         cpu.perf_counters().jit_direct_blocks_installed,
         installed + 1
+    );
+}
+
+#[test]
+fn direct_admission_waits_for_the_configured_heat() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    cpu.jit_direct.set_admission_heat_for_test(8);
+    let attempts = cpu.perf_counters().jit_direct_compile_attempts;
+
+    for _ in 0..8 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("heat observation");
+    }
+    assert_eq!(cpu.perf_counters().jit_direct_compile_attempts, attempts);
+
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("compile after heat threshold");
+    assert_eq!(
+        cpu.perf_counters().jit_direct_compile_attempts,
+        attempts + 1
     );
 }
 

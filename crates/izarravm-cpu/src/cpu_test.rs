@@ -112,7 +112,7 @@ fn structural_code_invalidation_clears_stale_native_watch_marks() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
+fn interpreter_direct_pages_skip_fast_map_when_native_admission_is_disabled() {
     let mut bus = TestBus::with_memory(vec![0; 0x6000]);
     bus.direct_pages_enabled = true;
     bus.memory[0x2456] = 0x3c;
@@ -124,8 +124,8 @@ fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
             .unwrap(),
         0x3c
     );
-    assert!(cpu.jit_fast_map.has_read_mapping(0x2456, 0x2456));
-    cpu.set_jit_auto_admit(false);
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x2456, 0x2456));
+    cpu.set_jit_auto_admit(true);
 
     assert_eq!(
         cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x3456, BusAccessKind::DataRead,)
@@ -134,6 +134,8 @@ fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
     );
     assert!(cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
     assert!(!cpu.jit_fast_map.has_write_mapping(0x3456, 0x3456));
+    cpu.set_jit_auto_admit(false);
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
 
     cpu.write_memory_u8(
         &mut bus,
@@ -143,7 +145,7 @@ fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
         BusAccessKind::DataWrite,
     )
     .unwrap();
-    assert!(cpu.jit_fast_map.has_write_mapping(0x3456, 0x3456));
+    assert!(!cpu.jit_fast_map.has_write_mapping(0x3456, 0x3456));
     assert_eq!(bus.memory[0x3456], 0xa5);
 
     cpu.note_direct_map_changed();
@@ -155,7 +157,7 @@ fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
             .unwrap(),
         0xa5
     );
-    assert!(cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
 
     cpu.flush_tlb_and_code_caches();
     assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
@@ -164,10 +166,19 @@ fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
             .unwrap(),
         0xa5
     );
-    assert!(
-        cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456),
-        "the TLB flush must also clear the physical DPC so the next access refills both maps"
-    );
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_admission_heat_is_per_cpu_instance() {
+    let mut changed = CpuGsw::default();
+    let unchanged = CpuGsw::default();
+
+    changed.jit_direct.set_admission_heat_for_test(8);
+
+    assert_eq!(changed.jit_direct.admission_heat(), 8);
+    assert_eq!(unchanged.jit_direct.admission_heat(), 1);
 }
 
 #[cfg(all(
@@ -343,7 +354,7 @@ fn physical_page_cache_hits_fill_every_paging_alias() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn interpreter_fast_map_survives_small_tlb_collision_without_page_walk() {
+fn active_fast_map_survives_small_tlb_collision_without_page_walk() {
     const LINEAR_A: u32 = 0x0000_3000;
     const LINEAR_B: u32 = LINEAR_A + TLB_ENTRIES as u32 * 0x1000;
     const FRAME_A: u32 = 0x0000_5000;
@@ -361,7 +372,7 @@ fn interpreter_fast_map_survives_small_tlb_collision_without_page_walk() {
     let mut bus = TestBus::with_memory(memory);
     bus.direct_pages_enabled = true;
     let mut cpu = CpuGsw::default();
-    cpu.set_jit_auto_admit(false);
+    cpu.set_jit_auto_admit(true);
     cpu.control.cr0 |= CR0_PE | CR0_PG;
     cpu.control.cr3 = 0x1000;
     cpu.registers
