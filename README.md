@@ -40,7 +40,7 @@ further beyond office work, especially as better graphics, sound, and CD-ROMs
 made multimedia and home use more practical.
 
 The Izarra 3000 was the big swing: a custom 586-class workstation with its own
-BIOS, Toka-DOS 3.0, VEGA graphics, and ReSonique sound. Unfortunately, it was
+BIOS, Toka-DOS 3.0, VEGA graphics, and ReSonique 2 sound. Unfortunately, it was
 ready for a market that had already moved on. Buyers expected Windows 95, which
 the machine could not run, and MS-DOS compatibility was no longer enough to
 justify the cost of Izarra's custom approach. The 3000 never reached stores.
