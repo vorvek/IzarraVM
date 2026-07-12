@@ -342,7 +342,7 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     native_machine.trace = BusTrace::default();
     native_machine.trace.set_tracing_mode(TracingMode::Off);
     native_cpu.set_jit_auto_admit(true);
-    for _ in 0..3 {
+    for _ in 0..12 {
         interp_machine.write_physical_u32(FRAME_A, VALUE_A);
         native_machine.write_physical_u32(FRAME_A, VALUE_A);
         arm(&mut interp_cpu, MEASURE_CODE_LINEAR);

@@ -1163,6 +1163,8 @@ fn ram_lookup_rebuilds_on_each_effective_distira_decode_change() {
             *bus.direct_map_changed,
             "BAR relocation marks CPU direct caches stale"
         );
+        assert!(*bus.io_touched);
+        assert!(bus.requires_step_break());
         bus.write_memory(RAM_ADDR, BusWidth::Byte, 0xa5, BusAccessKind::DataWrite)
             .unwrap();
 

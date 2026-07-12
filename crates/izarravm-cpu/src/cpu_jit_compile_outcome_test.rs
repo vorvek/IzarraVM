@@ -194,6 +194,34 @@ fn direct_admission_waits_for_the_configured_heat() {
 }
 
 #[test]
+fn disabled_native_continuations_leave_direct_counters_cold() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(
+        &mut cpu,
+        &mut bus,
+        &[ENTRY, ENTRY + 1, ENTRY + 2, ENTRY + 3],
+    );
+    cpu.jit_direct.set_fast_map_enabled_for_test(false);
+    cpu.set_jit_auto_admit(false);
+    cpu.registers.eip = ENTRY;
+
+    for _ in 0..4 {
+        let outcome = cpu.run_budgeted(&mut bus, u64::MAX).expect("JIT-off run");
+        if outcome.halted {
+            break;
+        }
+    }
+
+    assert!(cpu.halted);
+    let perf = cpu.perf_counters();
+    assert_eq!(perf.jit_direct_entries, 0);
+    assert_eq!(perf.jit_direct_compile_attempts, 0);
+    assert_eq!(perf.jit_direct_hot_hits, 0);
+    assert_eq!(perf.jit_direct_hash_hits, 0);
+    assert_eq!(perf.jit_direct_lookup_misses, 0);
+}
+
+#[test]
 fn page_straddling_barrier_retries_instead_of_becoming_persistent() {
     let mut memory = vec![0; 0x2000];
     memory[0xfff..0x1001].copy_from_slice(&[0xcd, 0x80]);

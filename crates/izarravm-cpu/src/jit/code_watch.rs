@@ -420,7 +420,7 @@ impl NativeCodeWatch {
     }
 
     pub(crate) fn range_watched(&self, physical: u32, len: u32) -> bool {
-        if len == 0 {
+        if len == 0 || self.pages.is_empty() {
             return false;
         }
         let mut chunk = physical & !((1 << CHUNK_SHIFT) - 1);

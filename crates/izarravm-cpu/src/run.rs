@@ -462,6 +462,12 @@ impl CpuGsw {
         let mut first = true;
         #[cfg(feature = "jit")]
         let mut skip_direct_once = false;
+        #[cfg(feature = "jit")]
+        let native_continuations_active = self.jit_direct.execution_enabled()
+            || self.jit_direct.backend_enabled()
+                && (jit_forced_region_lin().is_some()
+                    || self.jit_regions.auto_admit()
+                    || self.jit_regions.len() != 0);
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
         // derives it from PIT-edge instants), but `total` counts core clocks
         // only. Track the batch's scaled-bus growth across this run so a
@@ -510,45 +516,45 @@ impl CpuGsw {
                 // break checks below then fire at exactly the boundary the region stopped at.
                 // The probe read+branch is the whole per-continuation dispatch cost.
                 #[cfg(feature = "jit")]
-                let stamped_region = self.decode_cache.region_at(lin, cs.default_size_32);
-                #[cfg(feature = "jit")]
-                let continuation_budget = ContinuationBudget {
-                    total,
-                    bus_at_entry,
-                    cap,
-                };
-                #[cfg(feature = "jit")]
-                let region_outcome = if !self.jit_direct.backend_enabled()
-                    || std::mem::take(&mut skip_direct_once)
-                {
+                let region_outcome = if !native_continuations_active {
                     None
-                } else if jit_forced_region_lin() == Some(lin)
-                    || !self.jit_direct.auto_admit()
-                        && (self.jit_regions.auto_admit() || stamped_region.is_some())
-                {
-                    self.try_region_continuation(
-                        bus,
-                        lin,
-                        cs.default_size_32,
-                        stamped_region,
-                        continuation_budget,
-                    )?
-                } else if self.mode().uses_approximate_timing() {
-                    match self.try_direct_continuation(
-                        bus,
-                        lin,
-                        cs.default_size_32,
-                        continuation_budget,
-                    )? {
-                        DirectContinuation::Run(outcome) => Some(outcome),
-                        DirectContinuation::Prefix(outcome) => {
-                            skip_direct_once = true;
-                            Some(outcome)
-                        }
-                        DirectContinuation::Interpret => None,
-                    }
                 } else {
-                    None
+                    let stamped_region = self.decode_cache.region_at(lin, cs.default_size_32);
+                    let continuation_budget = ContinuationBudget {
+                        total,
+                        bus_at_entry,
+                        cap,
+                    };
+                    if !self.jit_direct.backend_enabled() || std::mem::take(&mut skip_direct_once) {
+                        None
+                    } else if jit_forced_region_lin() == Some(lin)
+                        || !self.jit_direct.auto_admit()
+                            && (self.jit_regions.auto_admit() || stamped_region.is_some())
+                    {
+                        self.try_region_continuation(
+                            bus,
+                            lin,
+                            cs.default_size_32,
+                            stamped_region,
+                            continuation_budget,
+                        )?
+                    } else if self.mode().uses_approximate_timing() {
+                        match self.try_direct_continuation(
+                            bus,
+                            lin,
+                            cs.default_size_32,
+                            continuation_budget,
+                        )? {
+                            DirectContinuation::Run(outcome) => Some(outcome),
+                            DirectContinuation::Prefix(outcome) => {
+                                skip_direct_once = true;
+                                Some(outcome)
+                            }
+                            DirectContinuation::Interpret => None,
+                        }
+                    } else {
+                        None
+                    }
                 };
                 #[cfg(not(feature = "jit"))]
                 let region_outcome: Option<CycleOutcome> = None;
@@ -560,7 +566,11 @@ impl CpuGsw {
                         // total is exactly the prior instructions' charge in this run, not
                         // including the continuation about to execute.
                         self.core_clocks_so_far = total;
-                        self.run_one_cached(bus, &insn, lin, rep_budget)?
+                        if insn.prefixes.rep.is_some() {
+                            self.run_one_cached_budgeted(bus, &insn, lin, rep_budget)?
+                        } else {
+                            self.run_one_cached(bus, &insn, lin)?
+                        }
                     }
                 }
             };
@@ -1571,8 +1581,65 @@ impl CpuGsw {
         bus: &mut B,
         insn: &DecodedInsn,
         lin: u32,
+    ) -> Result<CycleOutcome, CpuError> {
+        self.interrupt_shadow = false;
+        self.begin_instruction();
+        let start_eip = self.registers.eip;
+        let start_cs = self.registers.cs().selector;
+        let profiling = self.profile.enabled;
+        if !profiling {
+            return match self
+                .charge_cached_fetch(bus, lin, insn.len)
+                .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus))
+            {
+                Ok(outcome) => {
+                    let charged = self.scale_clocks(outcome.core_clocks);
+                    self.elapsed_clocks += charged;
+                    self.perf.instructions += 1;
+                    if self.is_ring0_protected() {
+                        self.perf.monitor_resident_core_clocks += charged;
+                    }
+                    if diff_trace_enabled() {
+                        self.emit_diff_trace_line(start_cs, start_eip);
+                    }
+                    Ok(CycleOutcome {
+                        core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+                        halted: outcome.halted,
+                    })
+                }
+                Err(fault) => {
+                    self.finish_instruction(bus, Err(fault), start_eip, start_cs, 0, None, None)
+                }
+            };
+        }
+        let profile_start = self.profile.sample_start();
+        let result = self
+            .charge_cached_fetch(bus, lin, insn.len)
+            .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus));
+        self.finish_instruction(
+            bus,
+            result,
+            start_eip,
+            start_cs,
+            0,
+            profiling.then_some((
+                insn.group,
+                cpu_profile_opcode(insn),
+                CpuProfileOperandForm::from_insn(insn),
+            )),
+            profile_start,
+        )
+    }
+
+    #[inline]
+    fn run_one_cached_budgeted<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        insn: &DecodedInsn,
+        lin: u32,
         rep_budget: RepBudget,
     ) -> Result<CycleOutcome, CpuError> {
+        debug_assert!(insn.prefixes.rep.is_some());
         self.interrupt_shadow = false;
         self.begin_instruction();
         let start_eip = self.registers.eip;
@@ -1701,7 +1768,10 @@ impl CpuGsw {
             }
             _ => {}
         }
-        self.execute_decoded_with_rep_budget(insn, bus, rep_budget)
+        match rep_budget {
+            Some(rep_budget) => self.execute_decoded_with_rep_budget(insn, bus, Some(rep_budget)),
+            None => self.execute_decoded(insn, bus),
+        }
     }
 
     /// Hot cached-instruction subset that never touches the bus and cannot fault. EIP has already

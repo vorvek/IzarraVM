@@ -895,6 +895,29 @@ fn straight_line_run_chains_rep_movs_mid_run() {
 }
 
 #[test]
+fn ignored_rep_prefix_uses_the_non_yielding_cached_path() {
+    let code = [
+        0xb8, 0x00, 0x00, // MOV AX, 0
+        0xf3, 0x40, // REP INC AX; REP is ignored
+        0xf4, // HLT
+    ];
+    let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+    let mut bus = TestBus::with_memory(memory);
+    drive_straight_line_runs(&mut cpu, &mut bus);
+
+    cpu.registers.eip = 0;
+    cpu.write_reg16(Reg16::Ax, 0xffff);
+    cpu.halted = false;
+    let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+
+    assert!(!outcome.halted);
+    assert_eq!(cpu.read_reg16(Reg16::Ax), 1);
+    assert_eq!(cpu.registers.eip, 5);
+    assert!(!cpu.rep_resume_active);
+    assert!(cpu.rep_execution.resume.is_none());
+}
+
+#[test]
 fn straight_line_run_still_breaks_at_string_port_io() {
     // OUTSB (0x6E, Misc group) touches a port, so it must never run as a continuation
     // even warm: the run breaks at the gate and OUTSB runs on the next runner entry.
