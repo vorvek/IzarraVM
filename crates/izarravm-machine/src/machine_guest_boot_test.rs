@@ -700,11 +700,11 @@ fn int13_ah01_returns_last_status() {
     machine.mount_floppy(vec![0u8; 737_280]).unwrap();
     let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted);
-    // Drive B: is unbacked: the transfer reported AH=0x80 (timeout); AH=01h returns it
+    // Drive B: is unbacked: the transfer reported AH=01 (invalid drive); AH=01h returns it
     // in AH (the documented register) and mirrors it into AL for PS/2 compatibility.
     let ax = machine.cpu().registers.eax() as u16;
-    assert_eq!(ax as u8, 0x80, "AL = last disk status");
-    assert_eq!((ax >> 8) as u8, 0x80, "AH = last disk status");
+    assert_eq!(ax as u8, 0x01, "AL = last disk status");
+    assert_eq!((ax >> 8) as u8, 0x01, "AH = last disk status");
 }
 
 #[test]
@@ -864,7 +864,7 @@ fn hook_chain_to_legacy_iret_survives_an_uninterceded_stub_landing() {
     let ax = machine.cpu().registers.eax() as u16;
     assert_eq!(
         (ax >> 8) as u8,
-        0x80,
+        0x01,
         "the hook-chained INT 13h must survive an interleaved non-intercepted \
              stub landing (AH = last status)"
     );
@@ -897,7 +897,7 @@ fn booter_hardcoded_legacy_iret_keeps_int13_serviced() {
     let ax = machine.cpu().registers.eax() as u16;
     assert_eq!(
         (ax >> 8) as u8,
-        0x80,
+        0x01,
         "the hardcoded-legacy-vector INT 13h was still serviced (AH = last status)"
     );
 }

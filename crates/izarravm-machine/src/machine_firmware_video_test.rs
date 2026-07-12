@@ -1412,13 +1412,13 @@ fn int13_ah05_format_track_rejects_bad_track_and_fixed_disk() {
         m.floppy.as_ref().unwrap().read_sector(0, 0, 1).unwrap()[0],
         0x00
     );
-    // A fixed-disk unit (DL>=0x80) reports no such drive (AH=0x80).
+    // A fixed-disk unit (DL>=0x80) reports invalid drive (AH=0x01).
     m.cpu.registers.set_eax(0x0509);
     m.cpu.registers.set_ecx(0x0000);
     m.cpu.registers.set_edx(0x0080); // DL = 0x80
     m.handle_int13();
-    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x80, "no fixed disk");
-    assert_eq!(m.memory.read_u8(0x441).unwrap(), 0x80, "status = no drive");
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x01, "no fixed disk");
+    assert_eq!(m.memory.read_u8(0x474).unwrap(), 0x01, "status = no drive");
 }
 
 #[test]

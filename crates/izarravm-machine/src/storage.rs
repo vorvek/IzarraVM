@@ -431,15 +431,35 @@ impl Machine {
         let dx = self.cpu.registers.edx() as u16;
         let dl = dx as u8;
 
-        // Fixed-disk path: DL bit 7 selects a hard drive (0x80 = C:). Serviced
-        // before the floppy early-return so a guest with no floppy but a mounted
-        // hard disk still boots. EDD AH=41h-48h dispatch here too. Only taken when
-        // a hard disk is actually mounted: with no disk the call falls through to
-        // the no-op return below, which the firmware boot suite relies on (it
-        // places its second stage in memory directly and issues INT 13h AH=02 with
-        // DL=0x80 and carry pre-cleared, expecting a no-op success).
-        if dl >= 0x80 && self.ata.is_some() {
+        // AH=01h reports the latched status for the selected drive class even if
+        // that unit is no longer present. This lets software retrieve the error
+        // from a failed probe of B: or 81h instead of replacing it with another
+        // invalid-drive result.
+        if ah == 0x01 {
+            let status_addr = if dl >= 0x80 { 0x474 } else { 0x441 };
+            let status = self.read_physical_u8(status_addr);
+            self.set_eax_ah(status);
+            if dl < 0x80 {
+                self.set_eax_al(status);
+            }
+            self.set_int_frame_carry(status != 0);
+            return;
+        }
+
+        // DL bit 7 selects a fixed disk. Always dispatch by drive class before
+        // checking media presence so an absent hard disk returns a deterministic
+        // BIOS error instead of inheriting the caller's AH and carry flag.
+        if dl >= 0x80 {
             self.int13_hdd(ah, dl);
+            return;
+        }
+
+        // This machine exposes only floppy A:. A missing image means there is no
+        // BIOS drive installed, matching the equipment word maintained by
+        // mount_floppy/eject_floppy. Do not leave the result dependent on the
+        // caller's incoming FLAGS.
+        if dl != 0x00 || self.floppy.is_none() {
+            self.int13_floppy_error(0x01);
             return;
         }
 
@@ -459,13 +479,6 @@ impl Machine {
                 return;
             }
             _ => {}
-        }
-
-        // With no floppy image mounted there is no drive to service. Leave the
-        // registers and the IRET FLAGS image untouched so the guest sees the same
-        // result the bare IRET stub gave before this handler existed.
-        if self.floppy.is_none() {
-            return;
         }
 
         match ah {
@@ -523,6 +536,12 @@ impl Machine {
     /// report it. 0x00 is success; any other value is the error code.
     fn set_disk_status(&mut self, status: u8) {
         let _ = self.memory.write_u8(0x441, status);
+    }
+
+    fn int13_floppy_error(&mut self, status: u8) {
+        self.set_eax_ah(status);
+        self.set_disk_status(status);
+        self.set_int_frame_carry(true);
     }
 
     /// AH=04h verify: confirm the requested sectors are readable without copying

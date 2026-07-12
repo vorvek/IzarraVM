@@ -1229,6 +1229,12 @@ impl Machine {
         }
 
         install_boot_bios_stubs(&mut machine.memory, machine.active_mode)?;
+        // The fixture enters with DL=80h and its boot sector loads stage 2 through
+        // INT 13h. Back that request with the supplied image instead of relying on
+        // an absent fixed disk to inherit a pre-cleared carry flag. Stage 2 remains
+        // preloaded above as a useful assertion aid, but the guest now performs a
+        // real BIOS transfer over the same bytes.
+        machine.mount_hdd(image.to_vec());
         Ok(machine)
     }
 

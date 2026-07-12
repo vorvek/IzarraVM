@@ -1489,8 +1489,8 @@ fn int13_drive_parameters_reject_fixed_disk() {
     m.handle_int13();
     assert_eq!(
         (m.cpu.registers.eax() >> 8) as u8,
-        0x80,
-        "AH = timeout/no drive"
+        0x01,
+        "AH = invalid drive"
     );
 }
 
@@ -1507,15 +1507,35 @@ fn int13_dasd_type_honors_drive_presence() {
         0x01,
         "AH = floppy, no change line"
     );
-    // DL=1 is an absent second floppy: AH=00 (no such drive).
+    // DL=1 is an absent second floppy: AH=01 and CF set.
     m.cpu.registers.set_eax(0x1500);
     m.cpu.registers.set_edx(0x0001);
     m.handle_int13();
     assert_eq!(
         (m.cpu.registers.eax() >> 8) as u8,
-        0x00,
+        0x01,
         "AH = no such drive"
     );
+}
+
+#[test]
+fn int13_absent_drives_set_a_deterministic_error_for_either_incoming_carry() {
+    for incoming_carry in [false, true] {
+        for drive in [0x00u8, 0x80] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.memory
+                .write_u16(0x9000 * 16 + 0x0104, u16::from(incoming_carry))
+                .unwrap();
+            m.cpu.registers.set_eax(0x0201);
+            m.cpu.registers.set_edx(u32::from(drive));
+            m.handle_int13();
+            assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x01);
+            assert_ne!(dos_int_flags(&m) & 1, 0, "drive {drive:02X} CF");
+            let status = if drive >= 0x80 { 0x474 } else { 0x441 };
+            assert_eq!(m.read_physical_u8(status), 0x01, "drive {drive:02X} status");
+        }
+    }
 }
 
 #[test]
