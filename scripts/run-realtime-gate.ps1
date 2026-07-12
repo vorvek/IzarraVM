@@ -11,6 +11,7 @@ param(
     [int]$Runs = 6,
     [int]$PairSeed = 0,
     [int]$HostTimeoutSeconds = 900,
+    [int]$ProcessorIndex = -1,
     [ValidateSet("Both", "Doom", "Doom586", "Quake")]
     [string]$Workload = "Both",
     [ValidateSet("0", "1")]
@@ -28,6 +29,17 @@ $minimumDirectCoverage = 0.90
 $maximumDirectExitsPer100 = 5.0
 $minimumFloorPasses = 4
 $gateScriptHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+function Set-GateProcessEnvironment([string]$Name, [object]$Value) {
+    if ($null -eq $Value) {
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+        if ($null -ne [Environment]::GetEnvironmentVariable($Name, "Process")) {
+            throw "Unable to remove process environment variable '$Name'."
+        }
+        return
+    }
+    [Environment]::SetEnvironmentVariable($Name, [string]$Value, "Process")
+}
 
 function Get-NormalizedCargoArguments([string[]]$Arguments) {
     $normalized = @()
@@ -303,6 +315,29 @@ function Get-Median([double[]]$Values) {
     return ($ordered[$middle - 1] + $ordered[$middle]) / 2.0
 }
 
+function Get-OneSided95TCritical([int]$SampleCount) {
+    if ($SampleCount -lt 2) {
+        throw "A Student-t confidence bound requires at least two samples."
+    }
+    $criticalByDegreesOfFreedom = [double[]](
+        6.313751515, 2.919985580, 2.353363435, 2.131846786, 2.015048,
+        1.943180281, 1.894578605, 1.859548038, 1.833112933, 1.812461123,
+        1.795884819, 1.782287556, 1.770933396, 1.761310136, 1.753050356,
+        1.745883676, 1.739606726, 1.734063607, 1.729132812, 1.724718243,
+        1.720742903, 1.717144374, 1.713871528, 1.710882080, 1.708140761,
+        1.705617920, 1.703288446, 1.701130934, 1.699127027, 1.697260887
+    )
+    $degreesOfFreedom = $SampleCount - 1
+    if ($degreesOfFreedom -gt $criticalByDegreesOfFreedom.Count) {
+        return $criticalByDegreesOfFreedom[-1]
+    }
+    return $criticalByDegreesOfFreedom[$degreesOfFreedom - 1]
+}
+
+function Format-AffinityMask([int64]$Mask) {
+    return "0x" + $Mask.ToString("x16", [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Get-PairedMetric([double[]]$Ratios) {
     if ($Ratios.Count -lt 2) {
         throw "Paired metrics require at least two ratios."
@@ -319,13 +354,14 @@ function Get-PairedMetric([double[]]$Ratios) {
         $sumSquares += ($value - $mean) * ($value - $mean)
     }
     $sampleDeviation = [Math]::Sqrt($sumSquares / ($logs.Count - 1))
-    $critical = if ($logs.Count -eq 6) { 2.015048 } else { 1.96 }
+    $critical = Get-OneSided95TCritical $logs.Count
     $lower95 = [Math]::Exp($mean - $critical * $sampleDeviation / [Math]::Sqrt($logs.Count))
     $median = Get-Median $Ratios
     $verdict = Get-PairedMetricVerdict $median $lower95
     return [pscustomobject][ordered]@{
         median_ratio = $median
         lower_95_ratio = $lower95
+        lower_bound_confidence = "one-sided 95% Student-t"
         verdict = $verdict
     }
 }
@@ -386,6 +422,48 @@ if ($SelfTest) {
         (Get-PairedMetric ([double[]](0.97, 0.97, 0.97, 0.97, 0.97, 0.97))).verdict -ne "regression" -or
         (Get-PairedMetric ([double[]](0.90, 0.91, 1.00, 1.01, 1.10, 1.11))).verdict -ne "inconclusive") {
         throw "Paired metric verdict boundaries are wrong."
+    }
+    $expectedCriticals = [ordered]@{
+        2 = 6.313751515
+        3 = 2.919985580
+        4 = 2.353363435
+        5 = 2.131846786
+        6 = 2.015048
+    }
+    foreach ($entry in $expectedCriticals.GetEnumerator()) {
+        if ([Math]::Abs((Get-OneSided95TCritical $entry.Key) - $entry.Value) -gt 1.0e-9) {
+            throw "The one-sided Student-t critical for $($entry.Key) samples is wrong."
+        }
+    }
+    if ((Get-OneSided95TCritical 100) -ne 1.697260887) {
+        throw "Large paired samples must use the conservative 30-degree critical."
+    }
+    $twoSampleMetric = Get-PairedMetric ([double[]](1.0, 2.0))
+    $expectedTwoSampleLower = [Math]::Exp(
+        [Math]::Log(2.0) / 2.0 - 6.313751515 * [Math]::Log(2.0) / 2.0
+    )
+    if ([Math]::Abs($twoSampleMetric.lower_95_ratio - $expectedTwoSampleLower) -gt 1.0e-12) {
+        throw "The two-sample one-sided lower confidence bound is wrong."
+    }
+    Assert-SelfTestThrows {
+        Get-OneSided95TCritical 1
+    } "at least two samples"
+    if ((Format-AffinityMask ([int64]1 -shl 62)) -ne "0x4000000000000000") {
+        throw "Affinity masks are not serialized as fixed-width hexadecimal strings."
+    }
+    $environmentSelfTestName = "IZARRAVM_GATE_SELF_TEST_$([guid]::NewGuid().ToString('N'))"
+    try {
+        Set-GateProcessEnvironment $environmentSelfTestName "present"
+        if ([Environment]::GetEnvironmentVariable($environmentSelfTestName, "Process") -ne
+            "present") {
+            throw "The gate process environment helper did not set a value."
+        }
+        Set-GateProcessEnvironment $environmentSelfTestName $null
+        if (Test-Path -LiteralPath "Env:$environmentSelfTestName") {
+            throw "The gate process environment helper left an empty variable behind."
+        }
+    } finally {
+        Set-GateProcessEnvironment $environmentSelfTestName $null
     }
     if ((Get-PairedMetricVerdict 0.98 0.97) -ne "pass" -or
         (Get-PairedMetricVerdict 0.979999 0.99) -ne "regression" -or
@@ -532,6 +610,69 @@ if ($PairSeed -eq 0) {
 if ($HostTimeoutSeconds -lt 1) {
     throw "HostTimeoutSeconds must be positive."
 }
+if ($ProcessorIndex -lt -1 -or $ProcessorIndex -gt 62) {
+    throw "ProcessorIndex must be -1 (unpinned) or a bit index from 0 through 62."
+}
+if (-not $ReportOnly -and $ProcessorIndex -lt 0) {
+    throw "The formal gate requires an explicit ProcessorIndex."
+}
+
+$runtimeInformation = [Runtime.InteropServices.RuntimeInformation]
+$isWindowsHost = $runtimeInformation::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Windows)
+$logicalProcessorCount = [Environment]::ProcessorCount
+$gateProcess = $null
+$originalGateAffinity = $null
+$requestedProcessorMask = $null
+if ($isWindowsHost) {
+    $gateProcess = [Diagnostics.Process]::GetCurrentProcess()
+    $gateProcess.Refresh()
+    $originalGateAffinity = $gateProcess.ProcessorAffinity.ToInt64()
+}
+if ($ProcessorIndex -ge 0) {
+    if (-not $isWindowsHost -or -not [Environment]::Is64BitProcess -or [IntPtr]::Size -ne 8) {
+        throw "Pinned measurements require 64-bit PowerShell on Windows."
+    }
+    if ($logicalProcessorCount -gt 64) {
+        throw "ProcessorAffinity is ambiguous across processor groups on hosts with more than 64 logical processors."
+    }
+    $requestedProcessorMask = [int64]1 -shl $ProcessorIndex
+    if (($originalGateAffinity -band $requestedProcessorMask) -ne $requestedProcessorMask) {
+        throw "ProcessorIndex $ProcessorIndex is not available in the gate process affinity mask."
+    }
+}
+
+$processorIdentifier = [Environment]::GetEnvironmentVariable("PROCESSOR_IDENTIFIER", "Process")
+$processorName = $null
+$activePowerScheme = $null
+if ($isWindowsHost) {
+    try {
+        $processorName = (Get-ItemProperty `
+            -LiteralPath "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0" `
+            -ErrorAction Stop).ProcessorNameString.Trim()
+    } catch {
+        $processorName = $null
+    }
+    try {
+        $powercfg = Get-Command powercfg.exe -CommandType Application -ErrorAction Stop
+        $powerOutput = @(& $powercfg.Source /getactivescheme 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $activePowerScheme = ($powerOutput -join " ").Trim()
+        }
+    } catch {
+        $activePowerScheme = $null
+    }
+}
+$hostIdentity = [ordered]@{
+    os_description = $runtimeInformation::OSDescription
+    os_architecture = $runtimeInformation::OSArchitecture.ToString()
+    process_architecture = $runtimeInformation::ProcessArchitecture.ToString()
+    framework_description = $runtimeInformation::FrameworkDescription
+    logical_processor_count = $logicalProcessorCount
+    processor_name = $processorName
+    processor_identifier = $processorIdentifier
+    active_power_scheme = $activePowerScheme
+}
+$verifiedChildAffinityMasks = [Collections.Generic.List[string]]::new()
 
 function Get-RepositoryState([string]$Root) {
     $head = (& git -C $Root rev-parse --verify HEAD).Trim()
@@ -834,15 +975,15 @@ function Invoke-IsolatedRevisionBuild(
     [string]$Label,
     [string]$DestinationDirectory
 ) {
-    $scratch = Join-Path ([IO.Path]::GetTempPath()) ("izarravm-build-" + [guid]::NewGuid())
+    $scratch = [IO.Directory]::CreateTempSubdirectory().FullName
     $source = Join-Path $scratch "source"
     $target = Join-Path $scratch "target"
     $isolatedCargoHome = Join-Path $scratch "cargo-home"
     $archive = Join-Path $scratch "source.tar"
-    New-Item -ItemType Directory -Path $source | Out-Null
-    New-Item -ItemType Directory -Path $isolatedCargoHome | Out-Null
     $started = [DateTime]::UtcNow
     try {
+        New-Item -ItemType Directory -Path $source -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Path $isolatedCargoHome -ErrorAction Stop | Out-Null
         & git -C $RepositoryRoot archive --format=tar --output=$archive $Revision
         if ($LASTEXITCODE -ne 0) {
             throw "Unable to archive revision $Revision."
@@ -889,9 +1030,9 @@ function Invoke-IsolatedRevisionBuild(
         try {
             foreach ($name in $buildIsolationNames) {
                 $savedBuildEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
-                [Environment]::SetEnvironmentVariable($name, $null, "Process")
+                Set-GateProcessEnvironment $name $null
             }
-            [Environment]::SetEnvironmentVariable("CARGO_HOME", $isolatedCargoHome, "Process")
+            Set-GateProcessEnvironment "CARGO_HOME" $isolatedCargoHome
             Write-Host "Building $Label from $($Revision.Substring(0, 12)) in an isolated target..."
             Push-Location $source
             try {
@@ -912,7 +1053,7 @@ function Invoke-IsolatedRevisionBuild(
             }
         } finally {
             foreach ($entry in $savedBuildEnvironment.GetEnumerator()) {
-                [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+                Set-GateProcessEnvironment $entry.Key $entry.Value
             }
         }
         if ($cargoExit -ne 0) {
@@ -1174,9 +1315,70 @@ function Invoke-IzarraProcess(
     } elseif (-not $ReportOnly) {
         throw "The formal gate requires PowerShell Start-Process environment isolation."
     }
-    $process = Start-Process @start
-    # Keep the native handle alive so ExitCode remains available after a fast child exit.
-    $null = $process.Handle
+    $process = $null
+    $effectiveAffinityMask = $null
+    if ($ProcessorIndex -ge 0) {
+        $spawnFailure = $null
+        $restoreFailure = $null
+        $gateProcess.Refresh()
+        $parentMaskBeforeSpawn = $gateProcess.ProcessorAffinity.ToInt64()
+        try {
+            if (($parentMaskBeforeSpawn -band $requestedProcessorMask) -ne $requestedProcessorMask) {
+                throw "The requested processor left the gate process affinity mask before launch."
+            }
+            $gateProcess.ProcessorAffinity = [IntPtr]$requestedProcessorMask
+            $gateProcess.Refresh()
+            if ($gateProcess.ProcessorAffinity.ToInt64() -ne $requestedProcessorMask) {
+                throw "The gate process did not accept the requested one-processor affinity."
+            }
+            $process = Start-Process @start
+            # Keep the native handle alive so ExitCode remains available after a fast child exit.
+            $null = $process.Handle
+            $process.Refresh()
+            $effectiveAffinityMask = $process.ProcessorAffinity.ToInt64()
+            if ($effectiveAffinityMask -ne $requestedProcessorMask) {
+                throw "The benchmark child did not inherit the requested one-processor affinity."
+            }
+        } catch {
+            $spawnFailure = $_
+        } finally {
+            try {
+                $gateProcess.ProcessorAffinity = [IntPtr]$parentMaskBeforeSpawn
+                $gateProcess.Refresh()
+                if ($gateProcess.ProcessorAffinity.ToInt64() -ne $parentMaskBeforeSpawn) {
+                    throw "The gate process affinity did not restore after child launch."
+                }
+            } catch {
+                $restoreFailure = $_
+            }
+        }
+        if ($null -ne $spawnFailure -or $null -ne $restoreFailure) {
+            if ($null -ne $process) {
+                try {
+                    if (-not $process.HasExited) {
+                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    }
+                } finally {
+                    $process.Dispose()
+                }
+            }
+            if ($null -ne $spawnFailure) {
+                if ($null -ne $restoreFailure) {
+                    throw [InvalidOperationException]::new(
+                        "$($spawnFailure.Exception.Message) Parent affinity restoration also failed: $($restoreFailure.Exception.Message)",
+                        $spawnFailure.Exception
+                    )
+                }
+                throw $spawnFailure
+            }
+            throw $restoreFailure
+        }
+        $verifiedChildAffinityMasks.Add((Format-AffinityMask $effectiveAffinityMask))
+    } else {
+        $process = Start-Process @start
+        # Keep the native handle alive so ExitCode remains available after a fast child exit.
+        $null = $process.Handle
+    }
     $watch = [Diagnostics.Stopwatch]::StartNew()
     while (-not $process.WaitForExit(1000)) {
         foreach ($path in @($StdoutPath, $StderrPath)) {
@@ -1202,7 +1404,16 @@ function Invoke-IzarraProcess(
     if ($null -eq $process.ExitCode) {
         throw "IzarraVM exited without a readable process exit code."
     }
-    return [int]$process.ExitCode
+    return [pscustomobject][ordered]@{
+        exit_code = [int]$process.ExitCode
+        processor_index = if ($ProcessorIndex -ge 0) { $ProcessorIndex } else { $null }
+        processor_affinity_mask = if ($null -ne $effectiveAffinityMask) {
+            Format-AffinityMask $effectiveAffinityMask
+        } else {
+            $null
+        }
+        processor_affinity_verified = $ProcessorIndex -ge 0
+    }
 }
 
 $exitVmBytes = [byte[]](
@@ -1337,9 +1548,9 @@ function Invoke-Observation(
     if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
         $processArguments += "--expect-test-exit"
     }
-    $exitCode = Invoke-IzarraProcess $ExecutablePath $processArguments $stdoutPath $stderrPath $observationHome
-    if ($exitCode -ne 0) {
-        throw "$context failed with exit code $exitCode. See $stdoutPath and $stderrPath."
+    $processResult = Invoke-IzarraProcess $ExecutablePath $processArguments $stdoutPath $stderrPath $observationHome
+    if ($processResult.exit_code -ne 0) {
+        throw "$context failed with exit code $($processResult.exit_code). See $stdoutPath and $stderrPath."
     }
     if (-not (Test-Path -LiteralPath $jsonPath -PathType Leaf)) {
         throw "$context did not produce its profile JSON."
@@ -1405,6 +1616,9 @@ function Invoke-Observation(
     }
     $sample | Add-Member -NotePropertyName gate_role -NotePropertyValue $Role
     $sample | Add-Member -NotePropertyName gate_observation -NotePropertyValue $ObservationId
+    $sample | Add-Member -NotePropertyName gate_processor_index -NotePropertyValue $processResult.processor_index
+    $sample | Add-Member -NotePropertyName gate_processor_affinity_mask -NotePropertyValue $processResult.processor_affinity_mask
+    $sample | Add-Member -NotePropertyName gate_processor_affinity_verified -NotePropertyValue $processResult.processor_affinity_verified
     return $sample
 }
 
@@ -1475,13 +1689,15 @@ $candidateExecutableLock = $null
 $baselineExecutableLock = $null
 $candidateHashAfter = $null
 $baselineHashAfter = $null
+$measurementFailure = $null
+$outerAffinityRestoreFailure = $null
 try {
     $savedEnvironment["IZARRAVM_JIT"] = [Environment]::GetEnvironmentVariable("IZARRAVM_JIT", "Process")
     foreach ($name in $diagnosticVariables) {
         $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
-        [Environment]::SetEnvironmentVariable($name, $null, "Process")
+        Set-GateProcessEnvironment $name $null
     }
-    [Environment]::SetEnvironmentVariable("IZARRAVM_JIT", $Jit, "Process")
+    Set-GateProcessEnvironment "IZARRAVM_JIT" $Jit
     $candidateExecutableLock = [IO.File]::Open(
         $candidateArtifact.executed_copy_path,
         [IO.FileMode]::Open,
@@ -1578,7 +1794,20 @@ try {
         (Get-DirectoryTreeSha256 $quakeSnapshot.frozen_path) -ne $quakeSnapshot.frozen_sha256) {
         throw "The frozen Quake workload changed during the gate."
     }
+} catch {
+    $measurementFailure = $_
 } finally {
+    if ($ProcessorIndex -ge 0) {
+        try {
+            $gateProcess.ProcessorAffinity = [IntPtr]$originalGateAffinity
+            $gateProcess.Refresh()
+            if ($gateProcess.ProcessorAffinity.ToInt64() -ne $originalGateAffinity) {
+                throw "The gate process affinity did not restore to its entry mask."
+            }
+        } catch {
+            $outerAffinityRestoreFailure = $_
+        }
+    }
     if ($null -ne $baselineExecutableLock) {
         $baselineExecutableLock.Dispose()
     }
@@ -1586,9 +1815,32 @@ try {
         $candidateExecutableLock.Dispose()
     }
     foreach ($entry in $savedEnvironment.GetEnumerator()) {
-        [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
+        Set-GateProcessEnvironment $entry.Key $entry.Value
     }
     Remove-GateTemporaryRoot $temporaryRoot
+}
+if ($null -ne $measurementFailure) {
+    if ($null -ne $outerAffinityRestoreFailure) {
+        throw [InvalidOperationException]::new(
+            "$($measurementFailure.Exception.Message) Gate affinity restoration also failed: $($outerAffinityRestoreFailure.Exception.Message)",
+            $measurementFailure.Exception
+        )
+    }
+    throw $measurementFailure
+}
+if ($null -ne $outerAffinityRestoreFailure) {
+    throw $outerAffinityRestoreFailure
+}
+
+if ($ProcessorIndex -ge 0) {
+    $expectedVerifiedChildren = if ($pairedRun) {
+        $policies.Count * (2 + 2 * $Runs)
+    } else {
+        $policies.Count * $Runs
+    }
+    if ($verifiedChildAffinityMasks.Count -ne $expectedVerifiedChildren) {
+        throw "Not every warmup and measured child received a verified processor affinity."
+    }
 }
 
 if ($candidateHashAfter -ne $candidateArtifact.sha256) {
@@ -1623,7 +1875,8 @@ if (-not $ReportOnly -and
 }
 
 $formalGateEligible = -not $ReportOnly -and $candidateArtifact.verified -and
-    $pairedRun -and $baselineArtifact.verified -and -not $repositoryAtSelection.dirty
+    $pairedRun -and $baselineArtifact.verified -and -not $repositoryAtSelection.dirty -and
+    $ProcessorIndex -ge 0
 $formalFailures = @()
 foreach ($workloadResult in $workloads) {
     $reasons = @()
@@ -1703,6 +1956,28 @@ $summary = [ordered]@{
     workload_trees_sha256 = $workloadTreeHashes
     workload_canonical_trees_sha256 = $workloadCanonicalTreeHashes
     generated_utc = [DateTime]::UtcNow.ToString("o")
+    host = $hostIdentity
+    processor_affinity = [ordered]@{
+        policy = if ($ProcessorIndex -ge 0) { "one inherited processor per child" } else { "unpinned" }
+        requested_processor_index = if ($ProcessorIndex -ge 0) { $ProcessorIndex } else { $null }
+        effective_processor_index = if ($verifiedChildAffinityMasks.Count -gt 0) { $ProcessorIndex } else { $null }
+        requested_mask = if ($null -ne $requestedProcessorMask) {
+            Format-AffinityMask $requestedProcessorMask
+        } else {
+            $null
+        }
+        original_gate_process_mask = if ($null -ne $originalGateAffinity) {
+            Format-AffinityMask $originalGateAffinity
+        } else {
+            $null
+        }
+        verified_child_masks = @($verifiedChildAffinityMasks | Sort-Object -Unique)
+        verified_child_processes = $verifiedChildAffinityMasks.Count
+        child_inheritance_verified = $ProcessorIndex -ge 0 -and
+            $verifiedChildAffinityMasks.Count -gt 0
+        parent_restore_policy = "restore the exact pre-launch mask immediately after each child readback"
+        processor_group_policy = "single ProcessorAffinity group, at most 64 logical processors"
+    }
     measured_pairs_per_workload = if ($pairedRun) { $Runs } else { 0 }
     measured_candidate_runs_per_workload = $Runs
     discarded_warmups_per_executable_and_workload = if ($pairedRun) { 1 } else { 0 }
@@ -1727,6 +2002,8 @@ $summary = [ordered]@{
         maximum_direct_slow_exits_per_100_instructions = $maximumDirectExitsPer100
         minimum_paired_median_ratio = 0.98
         minimum_paired_lower_95_ratio = 0.97
+        paired_lower_bound = "one-sided 95% Student-t"
+        required_processor_index = if (-not $ReportOnly) { $ProcessorIndex } else { $null }
         minimum_samples_meeting_real_time_floor = $minimumFloorPasses
     }
     workloads = $workloads

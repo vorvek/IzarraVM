@@ -1623,9 +1623,8 @@ struct DecodeLine {
     /// is the other such input; it is re-checked live at the hit sites, not stored.
     d: bool,
     /// Physical address of the instruction's first byte at decode time, for the narrow SMC
-    /// path's covers-the-written-byte check. `phys_start..phys_start + len` is the physical
-    /// span; contiguity holds because pages holding a page-straddling instruction take the
-    /// global flush instead (see `PageCodeInfo::straddled`).
+    /// path's covers-the-written-byte check. `phys_start..phys_start + len` is contiguous because
+    /// page-straddling instructions are never inserted into this cache.
     phys_start: u32,
     /// 1-based index into the JIT's compiled-region table, `None` when no region starts at this
     /// line's address. Lives IN the decode line (not a separate map) so region lookup rides the
@@ -1646,19 +1645,15 @@ struct DecodeLine {
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
-/// physical page was decoded through, plus the two conditions that force the sound global-flush
-/// fallback. Rebuilt from scratch after every global flush (cleared with the marks), so it never
-/// outlives the lines it describes.
+/// physical page was decoded through, plus the alias condition that forces the sound global-flush
+/// fallback. Page-straddling instructions are not cached. Rebuilt from scratch after every global
+/// flush (cleared with the marks), so it never outlives the lines it describes.
 #[derive(Debug, Clone, Copy)]
 struct PageCodeInfo {
     lin_page: u32,
     /// A later decode saw a DIFFERENT linear page mapping this physical page: the
     /// physical-to-linear reconstruction is ambiguous, so writes here must flush globally.
     aliased: bool,
-    /// An instruction starting on this page crosses into the next page (or one crossed into this
-    /// page): physical contiguity of a line's span is not guaranteed, so writes here (and on the
-    /// neighbor, which sets its own flag) must flush globally.
-    straddled: bool,
 }
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
@@ -1696,7 +1691,7 @@ struct DecodeCache {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    native_code_watch: Box<jit::code_watch::NativeCodeWatch>,
+    native_code_watch: Box<jit::code_watch::StickyDecodeCodeWatch>,
     /// Indices of `code_bytes` / `code_pages` words holding marks from the CURRENT generation,
     /// pushed on a word's 0 -> nonzero transition. Makes the mark clear proportional to the
     /// marked working set (a few KB of word writes) instead of a 384 KB memset: Doom's 3.9M
@@ -1778,7 +1773,7 @@ impl DecodeCache {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.native_code_watch.mark(physical, len);
+        self.native_code_watch.mark_range(physical, u32::from(len));
         let first_page = physical >> 12;
         let last_page = physical.wrapping_add(u32::from(len).saturating_sub(1)) >> 12;
         for page in first_page..=last_page {
@@ -1807,6 +1802,36 @@ impl DecodeCache {
     ))]
     fn native_code_watch_table(&mut self) -> usize {
         self.native_code_watch.table_base()
+    }
+
+    #[cfg(all(
+        test,
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn assert_native_watch_consistent(&self) {
+        let mut expected = std::collections::HashSet::new();
+        for line in &self.lines {
+            if line.generation != self.generation {
+                continue;
+            }
+            let Some(insn) = line.insn else {
+                continue;
+            };
+            let mut chunk = line.phys_start & !0xf;
+            let last = line.phys_start.wrapping_add(u32::from(insn.len) - 1) & !0xf;
+            loop {
+                expected.insert(chunk);
+                if chunk == last {
+                    break;
+                }
+                chunk = chunk.wrapping_add(16);
+            }
+        }
+        for chunk in expected {
+            assert!(self.native_code_watch.is_watched(chunk));
+        }
     }
 
     /// Whether this physical byte was decoded as part of a cached instruction: byte-granular
@@ -1838,40 +1863,42 @@ impl DecodeCache {
     }
 
     #[inline]
-    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) {
-        // Narrow-SMC bookkeeping: record (or verify) the linear page this physical page's code
-        // decodes through, and flag the two conditions that force the global-flush fallback. A
-        // page-straddling instruction flags BOTH pages (its span's physical contiguity is not
-        // guaranteed, and a write to either page could hit it).
+    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) -> bool {
         let len = u32::from(insn.len);
-        let straddles = (lin & 0xfff) + len > 0x1000;
-        let pages: [Option<u32>; 2] = [
-            Some(phys >> 12),
-            straddles.then(|| phys.wrapping_add(len - 1) >> 12),
-        ];
-        for page in pages.into_iter().flatten() {
-            let lin_page = if page == phys >> 12 {
-                lin >> 12
-            } else {
-                (lin.wrapping_add(len - 1)) >> 12
-            };
-            match self.code_page_lin.entry(page) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(PageCodeInfo {
-                        lin_page,
-                        aliased: false,
-                        straddled: straddles,
-                    });
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let info = e.get_mut();
-                    info.aliased |= info.lin_page != lin_page;
-                    info.straddled |= straddles;
-                }
-            }
+        if len == 0 {
+            return false;
         }
+        let Some(linear_last) = lin.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        let Some(physical_last) = phys.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        if lin >> 12 != linear_last >> 12 || phys >> 12 != physical_last >> 12 {
+            // The tail can map to a noncontiguous physical page. Re-decode page-straddling
+            // instructions instead of publishing a fictitious contiguous watch.
+            return false;
+        }
+
         let index = (lin & self.mask) as usize;
         let previous = self.lines[index];
+        // Decode-native marks are generation-sticky. Mark the replacement before publishing it;
+        // a displaced line deliberately leaves a conservative mark until global invalidation.
+        self.mark_code_range(phys, insn.len);
+
+        let page = phys >> 12;
+        match self.code_page_lin.entry(page) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(PageCodeInfo {
+                    lin_page: lin >> 12,
+                    aliased: false,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let info = e.get_mut();
+                info.aliased |= info.lin_page != lin >> 12;
+            }
+        }
         if previous.generation == self.generation
             && previous.insn.is_some()
             && (previous.tag != lin || previous.d != d)
@@ -1891,17 +1918,19 @@ impl DecodeCache {
             #[cfg(feature = "jit")]
             jit_direct_hotness: 0,
         };
+
+        true
     }
 
     /// Try to invalidate ONLY the lines covering the written physical byte `physical` (already
     /// known to be a marked code byte). Returns true when handled narrowly; false means the
-    /// caller must fall back to the whole-cache flush (unknown page, an aliased or straddled
-    /// page, or any other reason the physical-to-linear reconstruction is unsound). The mark
+    /// caller must fall back to the whole-cache flush (unknown page, an aliased page, or any other
+    /// reason the physical-to-linear reconstruction is unsound). The mark
     /// stays set either way: a stale mark only costs a future narrow attempt, never correctness.
     #[inline]
     fn narrow_invalidate(&mut self, physical: u32) -> Option<u32> {
         let info = *self.code_page_lin.get(&(physical >> 12))?;
-        if info.aliased || info.straddled {
+        if info.aliased {
             return None;
         }
         // Within one page the offset is mapping-invariant, so the code-side linear of the
@@ -1911,15 +1940,22 @@ impl DecodeCache {
         let written_lin = (info.lin_page << 12) | (physical & 0xfff);
         let mut killed = 0u32;
         for candidate in written_lin.saturating_sub(14)..=written_lin {
-            let line = &mut self.lines[(candidate & self.mask) as usize];
-            if line.generation != self.generation || line.tag != candidate {
-                continue;
-            }
-            let len = line.insn.map_or(0, |i| u32::from(i.len));
-            if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
-                // Generation 0 can never match the live generation (invalidate skips 0 on
-                // wrap), so the line is dead until re-decoded; a JIT region stamp dies with it.
-                line.generation = 0;
+            let removed = {
+                let line = &mut self.lines[(candidate & self.mask) as usize];
+                if line.generation != self.generation || line.tag != candidate {
+                    false
+                } else {
+                    let len = line.insn.map_or(0, |i| u32::from(i.len));
+                    if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
+                        // The sticky native mark stays conservative until global invalidation.
+                        line.generation = 0;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if removed {
                 killed += 1;
             }
         }
@@ -2031,21 +2067,18 @@ impl DecodeCache {
         line.jit_direct_hotness == JIT_DIRECT_HOTNESS_THRESHOLD
     }
 
-    /// Invalidate every cached line by advancing the generation. O(1): stamped lines fail the
-    /// generation check and re-decode on next use. Skips 0 on wrap so a fresh line never aliases.
-    #[inline]
-    fn invalidate(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generation = 1;
-        }
-    }
-
-    /// `invalidate`, plus reset the SMC watch bitmap. No decode line survives a global
-    /// invalidation, so its physical marks must not survive either. Without this, a remap or mode
-    /// change leaves stale native-store watches on pages that no longer hold cached code.
+    /// Invalidate every cached line and drop every matching code watch. The generation advance and
+    /// watch clear stay one operation so no dead decode line can leave an unowned native watch.
     fn invalidate_and_clear_code_marks(&mut self) {
-        self.invalidate();
+        if self.generation == u32::MAX {
+            // Clear old generation-1 lines before 1 can become live again. Changing the
+            // replacement half of the residency token also forces direct blocks to revalidate.
+            self.lines.fill(DecodeLine::default());
+            self.replacement_epoch = self.replacement_epoch.wrapping_add(1);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
         // Zero only the words marked since the last clear (the dirty lists), not the whole
         // 384 KB: with millions of SMC flushes per timedemo the full memset was a measured
         // wall regression. Every set bit lives in a dirty-listed word by construction

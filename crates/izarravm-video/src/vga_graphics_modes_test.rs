@@ -276,6 +276,69 @@ fn mode13h_noncanonical_scanout_reads_authoritative_planar_vram() {
 }
 
 #[test]
+fn hle_pixel_pan_materializes_direct_mode13_pixels_before_disabling_the_mapping() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    assert_eq!(video.direct_write_token(), 1);
+    assert!(video.mode13h_direct_page_ptr(0).is_some());
+    video.note_mode13h_direct_write(0, 4);
+    video.mode13_linear[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    assert!(video.mode13_linear_authoritative);
+    assert_eq!(video.vram[0], 0);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0);
+
+    video.set_attr_register(0x00, 0x07);
+    assert!(video.mode13_linear_authoritative);
+    video.set_attr_register(0x13, 0);
+    assert!(video.mode13_linear_authoritative);
+
+    video.set_attr_register(0x13, 1);
+
+    assert_eq!(video.direct_write_token(), 0);
+    assert!(!video.mode13_linear_authoritative);
+    assert_eq!(video.vram[0], 0x11);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0x22);
+    assert_eq!(video.vram[2 * VGA_PLANE_SIZE], 0x33);
+    assert_eq!(video.vram[3 * VGA_PLANE_SIZE], 0x44);
+    assert_eq!(&video.render_256color_row(0)[..3], &[0x22, 0x33, 0x44]);
+}
+
+#[test]
+fn hle_char_height_materializes_direct_mode13_pixels_only_when_it_changes() {
+    let mut unchanged = Vga::default();
+    unchanged.set_mode13h_with_clear(true);
+    unchanged.note_mode13h_direct_write(0, 1);
+    unchanged.mode13_linear[0] = 0x5a;
+    assert!(unchanged.mode13_linear_authoritative);
+    unchanged.set_char_height(unchanged.char_height());
+    assert_eq!(unchanged.direct_write_token(), 1);
+    assert!(unchanged.mode13_linear_authoritative);
+
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    assert!(video.mode13h_direct_page_ptr(0).is_some());
+    video.note_mode13h_direct_write(0, 4);
+    video.mode13_linear[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    assert!(video.mode13_linear_authoritative);
+    assert_eq!(video.vram[0], 0);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0);
+
+    video.set_char_height(8);
+
+    assert_eq!(video.direct_write_token(), 0);
+    assert!(!video.mode13_linear_authoritative);
+    assert_eq!(video.char_height(), 8);
+    assert_eq!(video.vram[0], 0x11);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0x22);
+    assert_eq!(video.vram[2 * VGA_PLANE_SIZE], 0x33);
+    assert_eq!(video.vram[3 * VGA_PLANE_SIZE], 0x44);
+    assert_eq!(
+        &video.render_256color_row(0)[..4],
+        &[0x11, 0x22, 0x33, 0x44]
+    );
+}
+
+#[test]
 fn planar_write_invalidates_mode13h_linear_scanout() {
     let mut video = Vga::default();
     video.set_mode13h_with_clear(true);

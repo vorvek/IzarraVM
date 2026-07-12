@@ -17,9 +17,25 @@ use crate::{
     VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
     VideoError, VideoMode,
 };
+mod datapath;
+mod legacy;
 mod scanout;
 mod timing;
 
+pub use datapath::{
+    GfxAperture, GfxController, display_counter, display_offset, display_offset_row, read_planes,
+    write_planes,
+};
+use legacy::{CGA_BLACK, CGA_WHITE, HGC_MODE_GRAPHICS, HGC_MODE_VIDEO_ENABLE};
+#[cfg(test)]
+use legacy::{
+    CGA_BROWN, CGA_CYAN, CGA_GREEN, CGA_LIGHT_CYAN, CGA_LIGHT_GRAY, CGA_LIGHT_GREEN,
+    CGA_LIGHT_MAGENTA, CGA_LIGHT_RED, CGA_MAGENTA, CGA_RED, CGA_YELLOW, HGC_MODE_PAGE1,
+};
+pub use legacy::{
+    CGA_BYTES_PER_LINE, CGA_FB_SIZE, CGA_ODD_BANK, Cga, CgaMode, HGC_BANK_SIZE, HGC_BYTES_PER_LINE,
+    HGC_FB_SIZE, HGC_PAGE1_OFFSET, Hgc,
+};
 pub use scanout::VgaRaster;
 pub use timing::{
     Attribute, CrtcRegs, CrtcTiming, Sequencer, beam_display_enable, beam_dot, beam_hsync,
@@ -66,209 +82,6 @@ impl Default for Mode13ArgbCache {
             valid: false,
             converted_pixels: 0,
         }
-    }
-}
-
-/// CGA graphics framebuffer size: 16 KiB at B800:0000. Two 8000-byte banks
-/// (100 scanlines x 80 bytes each) hold the even and odd scanlines.
-pub const CGA_FB_SIZE: usize = 16 * 1024;
-/// Byte offset of the odd-scanline bank inside the CGA framebuffer. Even
-/// scanlines (0, 2, 4, ...) live at 0x0000; odd scanlines (1, 3, 5, ...) at
-/// 0x2000. Each bank is 8000 bytes (100 lines x 80 bytes per line).
-pub const CGA_ODD_BANK: usize = 0x2000;
-/// Standard CGA graphics bytes per scanline. Register-banged horizontal modes
-/// derive the live pitch from `hdisp_end` instead.
-pub const CGA_BYTES_PER_LINE: usize = 80;
-
-/// The CGA graphics submode the B800 framebuffer is decoded as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CgaMode {
-    /// 320x200, 4 colors, 2 bits per pixel (INT 10h modes 04h and 05h).
-    Graphics320x200,
-    /// 640x200, 2 colors, 1 bit per pixel (INT 10h mode 06h).
-    Graphics640x200,
-}
-
-/// CGA graphics state: the framebuffer plus the two control registers the CGA
-/// exposes (mode control 0x3D8 and color select 0x3D9). The mode-control
-/// register drives the CGA text/graphics personality and blanking; color decode
-/// reads `color_select`.
-#[derive(Debug, Clone)]
-pub struct Cga {
-    pub fb: Vec<u8>,
-    pub submode: CgaMode,
-    /// INT 10h mode number (04h, 05h, or 06h). Mode 05h forces the alternate
-    /// red/cyan/white palette regardless of the color-select palette bit.
-    pub bios_mode: u8,
-    pub mode_control: u8, // port 0x3D8 output latch
-    pub color_select: u8, // port 0x3D9
-    pub light_pen_triggered: bool,
-    pub light_pen_latch: u16,
-    pub light_pen_pixel_col: u16,
-    pub light_pen_pixel_row: u16,
-}
-
-impl Default for Cga {
-    fn default() -> Self {
-        Self {
-            fb: vec![0; CGA_FB_SIZE],
-            submode: CgaMode::Graphics320x200,
-            bios_mode: 0x04,
-            mode_control: 0x00,
-            color_select: 0x00,
-            light_pen_triggered: false,
-            light_pen_latch: 0,
-            light_pen_pixel_col: 0,
-            light_pen_pixel_row: 0,
-        }
-    }
-}
-
-// Hercules Mode Control register (port 3B8h) bits (seasip.info "Hercules
-// Graphics Card Plus Notes"): bit 1 selects graphics vs text, bit 3 gates
-// video output, bit 5 picks blink vs high-intensity background in text mode,
-// bit 7 picks which 32K page (B0000 or B8000) the CRTC scans out.
-const HGC_MODE_GRAPHICS: u8 = 0x02;
-const HGC_MODE_VIDEO_ENABLE: u8 = 0x08;
-const HGC_MODE_PAGE1: u8 = 0x80;
-
-// Hercules Configuration Switch register (port 3BFh, write-only): bit 0
-// allows the Mode Control register's graphics bit to take effect and unlocks
-// the B1000h-B7FFFh half of the first page; bit 1 pages the second 32K bank
-// in at B8000h. A real HGC's graphics mode is refused (stays text) unless the
-// guest has first unlocked it here -- this is the two-step "configure then
-// switch" sequence Hercules software issues before painting graphics.
-const HGC_CONFIG_ALLOW_GRAPHICS: u8 = 0x01;
-const HGC_CONFIG_ENABLE_PAGE1: u8 = 0x02;
-
-/// Hercules graphics state: the two 32K pages (B0000 and B8000) plus the
-/// Mode Control (3B8h) and Configuration Switch (3BFh) latches. Mirrors `Cga`
-/// for the third legacy personality this raster core hosts.
-#[derive(Debug, Clone)]
-pub struct Hgc {
-    /// Both 32K pages back to back: page 0 (B0000) at offset 0, page 1
-    /// (B8000) at offset 0x8000. Real hardware only backs page 1 with RAM
-    /// when a full (non-"Plus") HGC or an HGC+ with the RAM option is fitted;
-    /// this core always backs it so a guest that pages it in before checking
-    /// for it (a common detection shortcut) sees ordinary RAM, not open bus.
-    pub fb: Vec<u8>,
-    pub mode_control: u8,  // port 0x3B8 output latch
-    pub config_switch: u8, // port 0x3BF output latch
-}
-
-pub const HGC_FB_SIZE: usize = 32 * 1024;
-pub const HGC_PAGE1_OFFSET: usize = 0x8000;
-/// Byte offset of interleave bank N (0..=3) inside one 32K Hercules page.
-/// Scanline `y` maps to bank `y & 3` at `(y & 3) * HGC_BANK_SIZE`, the
-/// four-way generalization of CGA's two-bank even/odd interleave.
-pub const HGC_BANK_SIZE: usize = 0x2000;
-/// Hercules graphics bytes per scanline: 720 pixels / 8 bits-per-byte.
-pub const HGC_BYTES_PER_LINE: usize = 90;
-
-impl Default for Hgc {
-    fn default() -> Self {
-        Self {
-            fb: vec![0; HGC_FB_SIZE * 2],
-            mode_control: 0x00,
-            config_switch: 0x00,
-        }
-    }
-}
-
-impl Hgc {
-    fn graphics_allowed(&self) -> bool {
-        self.config_switch & HGC_CONFIG_ALLOW_GRAPHICS != 0
-    }
-
-    fn page1_enabled(&self) -> bool {
-        self.config_switch & HGC_CONFIG_ENABLE_PAGE1 != 0
-    }
-
-    /// Which 32K page (0 or 1) the CRTC currently scans out: Mode Control bit
-    /// 7, but a page-1 select only takes effect once 3BFh has paged it in
-    /// (real hardware: the second bank is simply not there otherwise).
-    fn active_page(&self) -> usize {
-        if self.mode_control & HGC_MODE_PAGE1 != 0 && self.page1_enabled() {
-            1
-        } else {
-            0
-        }
-    }
-}
-
-/// The 16 EGA/CGA color numbers as DAC indices. On the stock VGA palette the
-/// first 16 entries are the EGA colors, so a CGA color number is its own DAC
-/// index. Named for the four-color and two-color palette tables below.
-const CGA_BLACK: u8 = 0;
-const CGA_GREEN: u8 = 2;
-const CGA_CYAN: u8 = 3;
-const CGA_RED: u8 = 4;
-const CGA_MAGENTA: u8 = 5;
-const CGA_BROWN: u8 = 6;
-const CGA_LIGHT_GRAY: u8 = 7;
-const CGA_LIGHT_GREEN: u8 = 10;
-const CGA_LIGHT_CYAN: u8 = 11;
-const CGA_LIGHT_RED: u8 = 12;
-const CGA_LIGHT_MAGENTA: u8 = 13;
-const CGA_YELLOW: u8 = 14;
-const CGA_WHITE: u8 = 15;
-
-impl Cga {
-    /// The three foreground colors (pixel values 1, 2, 3) for 320x200x4, decoded
-    /// from the color-select register (port 0x3D9). Bit 5 selects palette 1
-    /// (cyan/magenta/white) over palette 0 (green/red/brown); bit 4 brightens all
-    /// three to their light variants. Mode 05h overrides the palette to the fixed
-    /// cyan/red/white set (IBM CGA / DOSBox), still honoring the intensity bit.
-    /// Pixel value 0 is the background/border from `background_index`.
-    fn palette_320x200(&self) -> [u8; 3] {
-        let intensity = self.color_select & 0x10 != 0;
-        if self.bios_mode == 0x05 {
-            // Alternate palette: cyan / red / white.
-            return if intensity {
-                [CGA_LIGHT_CYAN, CGA_LIGHT_RED, CGA_WHITE]
-            } else {
-                [CGA_CYAN, CGA_RED, CGA_LIGHT_GRAY]
-            };
-        }
-        let palette1 = self.color_select & 0x20 != 0;
-        match (palette1, intensity) {
-            (false, false) => [CGA_GREEN, CGA_RED, CGA_BROWN],
-            (false, true) => [CGA_LIGHT_GREEN, CGA_LIGHT_RED, CGA_YELLOW],
-            (true, false) => [CGA_CYAN, CGA_MAGENTA, CGA_LIGHT_GRAY],
-            (true, true) => [CGA_LIGHT_CYAN, CGA_LIGHT_MAGENTA, CGA_WHITE],
-        }
-    }
-
-    /// The background/border color (pixel value 0 in 320x200x4, the 0 bit in
-    /// 640x200x2): color-select bits 0-3 with bit 4 as the intensity bit, a full
-    /// 4-bit CGA color number, which is its own DAC index on the stock palette.
-    fn background_index(&self) -> u8 {
-        self.color_select & 0x0F
-    }
-
-    /// The foreground color for the 1 bits in 640x200x2: color-select bits 0-3,
-    /// the same field as the background nibble. The background is always black.
-    fn foreground_640x200(&self) -> u8 {
-        self.color_select & 0x0F
-    }
-
-    /// Decode the four DAC indices a 320x200x4 framebuffer byte holds, MSB-first:
-    /// bits 7-6 are pixel 0, 5-4 pixel 1, 3-2 pixel 2, 1-0 pixel 3. Value 0 is the
-    /// background; values 1-3 select from the active four-color palette.
-    fn decode_byte_320x200(&self, byte: u8) -> [u8; 4] {
-        let bg = self.background_index();
-        let fg = self.palette_320x200();
-        let mut out = [0u8; 4];
-        for (px, slot) in out.iter_mut().enumerate() {
-            let shift = 6 - px * 2;
-            let value = (byte >> shift) & 0x03;
-            *slot = if value == 0 {
-                bg
-            } else {
-                fg[(value - 1) as usize]
-            };
-        }
-        out
     }
 }
 
@@ -706,7 +519,11 @@ impl Vga {
     /// which only records BIOS mode-set policy in the BDA and does not touch
     /// this CRTC register.
     pub fn set_char_height(&mut self, height: u8) {
-        self.crtc.max_scan = u32::from(height.saturating_sub(1));
+        let max_scan = u32::from(height.saturating_sub(1));
+        if self.crtc.max_scan != max_scan {
+            self.sync_mode13_planar();
+            self.crtc.max_scan = max_scan;
+        }
     }
 
     pub fn char_height(&self) -> u8 {
@@ -2846,7 +2663,13 @@ impl Vga {
             0x10 => self.attr.mode_control = value,
             0x11 => self.set_overscan(value),
             0x12 => self.attr.plane_enable = value,
-            0x13 => self.attr.pixel_pan = value & 0x0F,
+            0x13 => {
+                let pixel_pan = value & 0x0F;
+                if self.attr.pixel_pan != pixel_pan {
+                    self.sync_mode13_planar();
+                    self.attr.pixel_pan = pixel_pan;
+                }
+            }
             0x14 => self.attr.color_select = value,
             _ => {}
         }
@@ -3078,200 +2901,6 @@ fn char_map_a_decode(spec: u8) -> usize {
 /// selects map B (set) or map A (clear) in 512-glyph mode.
 fn char_map_b_decode(spec: u8) -> usize {
     char_map_decode(spec, 2, 3, 5)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GfxController {
-    pub set_reset: u8,        // idx 0, low 4 bits
-    pub enable_set_reset: u8, // idx 1, low 4 bits
-    pub color_compare: u8,    // idx 2
-    pub rotate: u8,           // idx 3 bits 0..2
-    pub logic: u8,            // idx 3 bits 3..4: 0 copy,1 AND,2 OR,3 XOR
-    pub read_map: u8,         // idx 4
-    pub write_mode: u8,       // idx 5 bits 0..1
-    pub read_mode: u8,        // idx 5 bit 3
-    pub mode_flags: u8,       // idx 5 bits 4..6: odd/even + shift modes
-    pub color_dont_care: u8,  // idx 7
-    pub bit_mask: u8,         // idx 8
-    // idx 6 Miscellaneous Graphics: bit 0 graphics (vs alphanumeric), bit 1 chain
-    // odd/even, bits 3-2 memory map select. Stored as written; the fields are
-    // decoded by `aperture` (FreeVGA gfxreg.htm 06h).
-    pub misc: u8,
-}
-
-impl GfxController {
-    fn mode_odd_even(&self) -> bool {
-        self.mode_flags & 0x10 != 0
-    }
-}
-
-/// The decoded Graphics Controller Miscellaneous register (index 06h): the CPU
-/// aperture window the legacy A0000/B0000 mapping points at, plus the two mode
-/// flags the bus and the read/write decode consult.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GfxAperture {
-    /// Aperture base linear address (A0000, A0000, B0000, or B8000).
-    pub base: u32,
-    /// Aperture length in bytes (0x20000, 0x10000, 0x8000, or 0x8000).
-    pub length: u32,
-    /// Misc bit 0: graphics mode (clear = alphanumeric/text).
-    pub graphics: bool,
-    /// Misc bit 1: chain odd/even enable.
-    pub chain_odd_even: bool,
-}
-
-impl GfxController {
-    /// Decode the Miscellaneous register (06h) into the selected aperture window
-    /// and the graphics / chain-odd-even flags. Memory Map Select (bits 3-2):
-    /// 00 = A0000-BFFFF (128K), 01 = A0000-AFFFF (64K), 10 = B0000-B7FFF (32K),
-    /// 11 = B8000-BFFFF (32K). FreeVGA gfxreg.htm 06h.
-    pub fn aperture(&self) -> GfxAperture {
-        let (base, length) = match (self.misc >> 2) & 0x03 {
-            0b00 => (0xA_0000, 0x2_0000),
-            0b01 => (0xA_0000, 0x1_0000),
-            0b10 => (0xB_0000, 0x0_8000),
-            _ => (0xB_8000, 0x0_8000),
-        };
-        GfxAperture {
-            base,
-            length,
-            graphics: self.misc & 0x01 != 0,
-            chain_odd_even: self.misc & 0x02 != 0,
-        }
-    }
-}
-
-fn apply_logic(logic: u8, value: u8, latch: u8) -> u8 {
-    match logic {
-        1 => value & latch,
-        2 => value | latch,
-        3 => value ^ latch,
-        _ => value,
-    }
-}
-
-/// Read one byte through the VGA read datapath, loading the four latches.
-/// Spec section 4.
-pub fn read_planes(
-    planes: &[[u8; 1]; VGA_PLANES],
-    gc: &GfxController,
-    latches: &mut [u8; VGA_PLANES],
-) -> u8 {
-    for plane in 0..VGA_PLANES {
-        latches[plane] = planes[plane][0];
-    }
-    if gc.read_mode == 0 {
-        return planes[(gc.read_map & 3) as usize][0];
-    }
-    // Read mode 1: per bit, set the result bit where every cared-about plane
-    // matches the corresponding color_compare bit.
-    let mut result = 0u8;
-    for bit in 0..8 {
-        let mut matches = true;
-        for (plane, slot) in planes.iter().enumerate() {
-            if (gc.color_dont_care >> plane) & 1 == 0 {
-                continue;
-            }
-            let plane_bit = (slot[0] >> bit) & 1;
-            let cmp_bit = (gc.color_compare >> plane) & 1;
-            if plane_bit != cmp_bit {
-                matches = false;
-                break;
-            }
-        }
-        if matches {
-            result |= 1 << bit;
-        }
-    }
-    result
-}
-
-/// Write one byte through the VGA write datapath into all four planes. `planes[i]`
-/// is plane i's slice; `latches` are the four latch registers. Spec section 4.
-pub fn write_planes(
-    planes: &mut [[u8; 1]; VGA_PLANES],
-    data: u8,
-    gc: &GfxController,
-    latches: &[u8; VGA_PLANES],
-) {
-    let rotated = data.rotate_right(u32::from(gc.rotate & 7));
-    for plane in 0..VGA_PLANES {
-        let latch = latches[plane];
-        let value = match gc.write_mode {
-            1 => {
-                planes[plane][0] = latch; // WM1: latches straight to planes
-                continue;
-            }
-            2 => {
-                if (data >> plane) & 1 != 0 { 0xFF } else { 0x00 } // WM2
-            }
-            3 => {
-                if (gc.set_reset >> plane) & 1 != 0 {
-                    0xFF
-                } else {
-                    0x00
-                } // WM3 color
-            }
-            _ => {
-                // WM0: set/reset substitution where enabled, else rotated data.
-                if (gc.enable_set_reset >> plane) & 1 != 0 {
-                    if (gc.set_reset >> plane) & 1 != 0 {
-                        0xFF
-                    } else {
-                        0x00
-                    }
-                } else {
-                    rotated
-                }
-            }
-        };
-        let mask = if gc.write_mode == 3 {
-            gc.bit_mask & rotated
-        } else {
-            gc.bit_mask
-        };
-        let alu = apply_logic(gc.logic, value, latch);
-        planes[plane][0] = (alu & mask) | (latch & !mask);
-    }
-}
-
-/// Map a display-address counter value `ma` to a per-plane byte offset, applying
-/// the CRTC byte/word/doubleword addressing transform and the 16-bit (64 KB)
-/// counter wrap. `mode_control` is CRTC index 17h, `underline_loc` is index 14h.
-pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
-    display_offset_row(mode_control, underline_loc, ma, 0)
-}
-
-pub fn display_counter(mode_control: u8, underline_loc: u8, row_base: u32, column: u32) -> u32 {
-    let divisor = if underline_loc & 0x20 != 0 {
-        4
-    } else if mode_control & 0x08 != 0 {
-        2
-    } else {
-        1
-    };
-    row_base + column / divisor
-}
-
-pub fn display_offset_row(mode_control: u8, underline_loc: u8, ma: u32, row_scan: u32) -> usize {
-    let mut addr = if mode_control & 0x40 != 0 {
-        ma // byte mode (CR17 bit 6): identity
-    } else if underline_loc & 0x40 != 0 {
-        // Doubleword mode (CR14 bit 6): MA0/MA1 are forced low, MA2..MA15 receive
-        // A0..A13; CR17 bits 0/1 may still replace MA13/MA14 with row-scan bits.
-        ma << 2
-    } else {
-        // word mode: rotate left 1, MA15 (CR17 bit 5 = 1) or MA13 (= 0) -> bit 0
-        let wrap_bit = if mode_control & 0x20 != 0 { 15 } else { 13 };
-        (ma << 1) | ((ma >> wrap_bit) & 1)
-    };
-    if mode_control & 0x01 == 0 {
-        addr = (addr & !(1 << 13)) | ((row_scan & 0x01) << 13);
-    }
-    if mode_control & 0x02 == 0 {
-        addr = (addr & !(1 << 14)) | (((row_scan >> 1) & 0x01) << 14);
-    }
-    (addr as usize) % VGA_PLANE_SIZE
 }
 
 #[cfg(test)]

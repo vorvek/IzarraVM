@@ -253,7 +253,7 @@ mod os {
     // 8-byte affinity mask, then 16 bytes of processor/allocation-granularity fields. We only
     // read dwPageSize; the rest is dead weight kept solely so GetSystemInfo (which writes the
     // full struct unconditionally) never writes past the end of `info`.
-    #[repr(C)]
+    #[repr(C, align(8))]
     struct SystemInfo {
         _processor_architecture: [u8; 4],
         page_size: u32,
@@ -261,6 +261,7 @@ mod os {
     }
 
     const _: () = assert!(std::mem::size_of::<SystemInfo>() == 48);
+    const _: () = assert!(std::mem::align_of::<SystemInfo>() == 8);
 
     pub(super) fn page_size() -> usize {
         let mut info: SystemInfo = unsafe { std::mem::zeroed() };

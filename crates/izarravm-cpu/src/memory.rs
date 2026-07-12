@@ -318,7 +318,28 @@ impl CpuGsw {
     pub(super) fn read_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        _linear: u32,
+        linear: u32,
+        physical: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u8>> {
+        self.read_direct_byte_page_cached_inner(bus, Some(linear), physical, kind)
+    }
+
+    #[inline]
+    pub(super) fn read_direct_byte_page_cached_without_fast_map<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u8>> {
+        self.read_direct_byte_page_cached_inner(bus, None, physical, kind)
+    }
+
+    #[inline]
+    fn read_direct_byte_page_cached_inner<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        _linear: Option<u32>,
         physical: u32,
         kind: BusAccessKind,
     ) -> ExecResult<Option<u8>> {
@@ -328,7 +349,9 @@ impl CpuGsw {
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            self.populate_fast_map_from_cached(_linear, physical, entry, false);
+            if let Some(linear) = _linear {
+                self.populate_fast_map_from_cached(linear, physical, entry, false);
+            }
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             self.record_data_read(kind, true);
             self.perf.direct_data_pointer_reads += 1;
@@ -351,8 +374,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.populate_fast_map(_linear, physical, page, false) {
-            self.data_read_pages.note_fast_map_linear(physical, _linear);
+        if let Some(linear) = _linear {
+            if self.populate_fast_map(linear, physical, page, false) {
+                self.data_read_pages.note_fast_map_linear(physical, linear);
+            }
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, true);
@@ -427,7 +452,31 @@ impl CpuGsw {
     pub(super) fn write_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        _linear: u32,
+        linear: u32,
+        physical: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<bool>> {
+        self.write_direct_byte_page_cached_inner(bus, Some(linear), physical, value, kind)
+    }
+
+    /// `Some(changed)` means the direct write completed; `None` asks the caller to use the bus path.
+    #[inline]
+    pub(super) fn write_direct_byte_page_cached_without_fast_map<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<bool>> {
+        self.write_direct_byte_page_cached_inner(bus, None, physical, value, kind)
+    }
+
+    #[inline]
+    fn write_direct_byte_page_cached_inner<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        _linear: Option<u32>,
         physical: u32,
         value: u8,
         kind: BusAccessKind,
@@ -438,7 +487,9 @@ impl CpuGsw {
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            self.populate_fast_map_from_cached(_linear, physical, entry, true);
+            if let Some(linear) = _linear {
+                self.populate_fast_map_from_cached(linear, physical, entry, true);
+            }
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             let offset = (physical & 0x0fff) as usize;
             let changed = unsafe { *entry.ptr.add(offset) != value };
@@ -465,9 +516,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.populate_fast_map(_linear, physical, page, true) {
-            self.data_write_pages
-                .note_fast_map_linear(physical, _linear);
+        if let Some(linear) = _linear {
+            if self.populate_fast_map(linear, physical, page, true) {
+                self.data_write_pages.note_fast_map_linear(physical, linear);
+            }
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         let changed = unsafe { *page.ptr.add(offset) != value };

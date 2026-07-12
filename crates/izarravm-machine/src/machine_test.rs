@@ -544,6 +544,9 @@ mod midi;
 #[path = "machine_mouse_test.rs"]
 mod mouse;
 #[cfg(test)]
+#[path = "machine_native_bus_timing_test.rs"]
+mod native_bus_timing;
+#[cfg(test)]
 #[path = "machine_storage_test.rs"]
 mod storage;
 #[cfg(test)]

@@ -1,0 +1,538 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+use super::*;
+use crate::{AddressSize, DecodedOperand, OperandSize, Prefixes, RepKind, SegmentIndex};
+
+fn addr() -> AddrMode {
+    AddrMode {
+        segment: SegmentIndex::Ds,
+        base: Some(3),
+        index: Some(6),
+        scale: 2,
+        disp: -12,
+        address_size: AddressSize::Dword,
+    }
+}
+
+fn insn(opcode: u16, mode: u8, reg: u8, rm: u8) -> DecodedInsn {
+    DecodedInsn {
+        len: 2,
+        prefixes: Prefixes::default(),
+        opcode,
+        operand_size: OperandSize::Dword,
+        address_size: AddressSize::Dword,
+        modrm: Some(crate::ModRm { mode, reg, rm }),
+        operand: (mode != 3).then_some(DecodedOperand::Mem(addr())),
+        imm: 0,
+        imm2: 0,
+        group: DecodeGroup::Fpu,
+        continuable: true,
+    }
+}
+
+fn expected_selected(opcode: u16, mode: u8, reg: u8, rm: u8) -> bool {
+    matches!(
+        (opcode, mode, reg, rm),
+        (0xd8, 0..=3, 0..=7, 0..=7)
+            | (0xd9, 0..=2, 0 | 2 | 3, 0..=7)
+            | (0xd9, 3, 0 | 1, 0..=7)
+            | (0xd9, 3, 5, 0 | 6)
+            | (0xda, 3, 5, 1)
+            | (0xdb, 0..=2, 0 | 3, 0..=7)
+            | (0xdd, 3, 2 | 3, 0..=7)
+            | (0xde, 3, 0 | 1 | 4 | 5 | 6 | 7, 0..=7)
+            | (0xde, 3, 3, 1)
+            | (0xdf, 3, 4, 0)
+    )
+}
+
+#[test]
+fn classifier_selects_exact_traced_slice() {
+    let mut accepted = 0;
+    for opcode in 0xd8..=0xdf {
+        for mode in 0..=3 {
+            for reg in 0..=7 {
+                for rm in 0..=7 {
+                    let classified = NativeX87Insn::classify(&insn(opcode, mode, reg, rm));
+                    let expected = expected_selected(opcode, mode, reg, rm);
+                    assert_eq!(
+                        classified.is_some(),
+                        expected,
+                        "opcode={opcode:02x} mode={mode} reg={reg} rm={rm}"
+                    );
+                    accepted += usize::from(classified.is_some());
+                }
+            }
+        }
+    }
+    assert_eq!(accepted, 461);
+}
+
+#[test]
+fn classifier_preserves_operations_indices_and_addresses() {
+    for extension in 0..=7 {
+        let expected = NativeX87BinaryOp::from_extension(extension).unwrap();
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xd8, 0, extension, 5)),
+            Some(NativeX87Insn::BinaryMemory {
+                op: expected,
+                addr: addr(),
+            })
+        );
+        assert_eq!(
+            NativeX87Insn::classify(&insn(0xd8, 3, extension, 5)),
+            Some(NativeX87Insn::BinaryRegister {
+                op: expected,
+                index: 5,
+            })
+        );
+    }
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 0, 7)),
+        Some(NativeX87Insn::LoadRegister { index: 7 })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 1, 6)),
+        Some(NativeX87Insn::Exchange { index: 6 })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdf, 3, 4, 0)),
+        Some(NativeX87Insn::StoreStatusAx)
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xdd, 3, 3, 5)),
+        Some(NativeX87Insn::StoreRegister {
+            index: 5,
+            pop: true,
+        })
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 5, 0)),
+        Some(NativeX87Insn::LoadOne)
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xd9, 3, 5, 6)),
+        Some(NativeX87Insn::LoadZero)
+    );
+    assert_eq!(
+        NativeX87Insn::classify(&insn(0xde, 3, 6, 2)),
+        Some(NativeX87Insn::PopBinary {
+            op: NativeX87PopOp::DivideReverse,
+            index: 2,
+        })
+    );
+    for opcode in [0xda, 0xde] {
+        let (reg, rm) = if opcode == 0xda { (5, 1) } else { (3, 1) };
+        assert_eq!(
+            NativeX87Insn::classify(&insn(opcode, 3, reg, rm)),
+            Some(NativeX87Insn::ComparePopPop)
+        );
+    }
+}
+
+#[test]
+fn classifier_rejects_bad_prefixes_and_malformed_decodes() {
+    let mut candidate = insn(0xd8, 0, 0, 0);
+    candidate.prefixes.lock = true;
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+
+    candidate = insn(0xd8, 0, 0, 0);
+    candidate.prefixes.rep = Some(RepKind::Repe);
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+
+    candidate = insn(0xd8, 0, 0, 0);
+    candidate.prefixes.operand_size_override = true;
+    candidate.prefixes.address_size_override = true;
+    candidate.prefixes.segment_override = Some(SegmentIndex::Fs);
+    assert!(NativeX87Insn::classify(&candidate).is_some());
+
+    candidate = insn(0xd8, 0, 0, 0);
+    candidate.operand = None;
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+    candidate.operand = Some(DecodedOperand::Reg(0));
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+
+    candidate = insn(0xd8, 3, 0, 0);
+    candidate.operand = Some(DecodedOperand::Mem(addr()));
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+
+    for bad in [
+        crate::ModRm {
+            mode: 4,
+            reg: 0,
+            rm: 0,
+        },
+        crate::ModRm {
+            mode: 0,
+            reg: 8,
+            rm: 0,
+        },
+        crate::ModRm {
+            mode: 0,
+            reg: 0,
+            rm: 8,
+        },
+    ] {
+        candidate = insn(0xd8, 0, 0, 0);
+        candidate.modrm = Some(bad);
+        assert!(NativeX87Insn::classify(&candidate).is_none());
+    }
+
+    candidate = insn(0xd8, 0, 0, 0);
+    candidate.group = DecodeGroup::Alu;
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+    candidate = insn(0xd8, 0, 0, 0);
+    candidate.imm = 1;
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+    candidate = insn(0xd8, 0, 0, 0);
+    candidate.modrm = None;
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+    candidate = insn(0x9b, 3, 0, 0);
+    candidate.modrm = None;
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+    candidate = insn(0x1d8, 0, 0, 0);
+    assert!(NativeX87Insn::classify(&candidate).is_none());
+}
+
+#[test]
+fn classifier_preserves_16_bit_memory_addressing_for_the_emitter() {
+    let mut candidate = insn(0xd9, 0, 0, 6);
+    candidate.prefixes.address_size_override = true;
+    candidate.address_size = AddressSize::Word;
+    let mut word_addr = addr();
+    word_addr.address_size = AddressSize::Word;
+    candidate.operand = Some(DecodedOperand::Mem(word_addr));
+
+    // Classification is architectural. A backend without 16-bit EA lowering can reject it.
+    let classified = NativeX87Insn::classify(&candidate).unwrap();
+    assert_eq!(classified, NativeX87Insn::LoadF32 { addr: word_addr });
+    assert_eq!(classified.metadata().memory.unwrap().width, 4);
+}
+
+#[test]
+fn stack_effects_advance_every_top_with_wraparound() {
+    let push = NativeX87Insn::LoadOne;
+    let pop = NativeX87Insn::PopBinary {
+        op: NativeX87PopOp::Add,
+        index: 1,
+    };
+    let pop_twice = NativeX87Insn::ComparePopPop;
+
+    for top in 0..8 {
+        assert_eq!(push.advance_top(top), top.wrapping_add(7) & 7);
+        assert_eq!(pop.advance_top(top), top.wrapping_add(1) & 7);
+        assert_eq!(pop_twice.advance_top(top), top.wrapping_add(2) & 7);
+    }
+}
+
+#[test]
+fn metadata_matches_interpreter_timing_and_memory_effects() {
+    let cases = [
+        (
+            insn(0xd8, 0, 3, 0),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::F32Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 4,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd8, 3, 1, 2),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 0, 0, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F32Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 4,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 0, 2, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F32Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 4,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 0, 3, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::F32Mem,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 4,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 3, 1, 1),
+            NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xdb, 0, 0, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert32,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Read,
+                    width: 4,
+                }),
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xdb, 0, 3, 0),
+            NativeX87Metadata {
+                raw_clocks: 14,
+                fp_class: FpOpClass::IntConvert32,
+                memory: Some(NativeX87MemoryAccess {
+                    direction: NativeX87MemoryDirection::Write,
+                    width: 4,
+                }),
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xde, 3, 0, 1),
+            NativeX87Metadata {
+                raw_clocks: 20,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xdd, 3, 3, 1),
+            NativeX87Metadata {
+                raw_clocks: 3,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xd9, 3, 5, 0),
+            NativeX87Metadata {
+                raw_clocks: 4,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xde, 3, 3, 1),
+            NativeX87Metadata {
+                raw_clocks: 5,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: true,
+                terminates_block: false,
+            },
+        ),
+        (
+            insn(0xdf, 3, 4, 0),
+            NativeX87Metadata {
+                raw_clocks: 3,
+                fp_class: FpOpClass::Register,
+                memory: None,
+                pops: false,
+                terminates_block: false,
+            },
+        ),
+    ];
+    for (insn, expected) in cases {
+        assert_eq!(NativeX87Insn::classify(&insn).unwrap().metadata(), expected);
+    }
+}
+
+#[test]
+fn native_gate_has_architectural_priority() {
+    assert_eq!(
+        native_x87_gate(CpuPersona::I386, CR0_NE, 0, 1),
+        NativeX87Gate::DeviceNotAvailable
+    );
+    assert_eq!(
+        native_x87_gate(CpuPersona::I586, CR0_EM | CR0_NE, 0, 1),
+        NativeX87Gate::DeviceNotAvailable
+    );
+    assert_eq!(
+        native_x87_gate(CpuPersona::I586, CR0_TS, 0, 0),
+        NativeX87Gate::DeviceNotAvailable
+    );
+    assert_eq!(
+        native_x87_gate(CpuPersona::I586, CR0_NE, 0x003e, 0x0001),
+        NativeX87Gate::PendingException
+    );
+    assert_eq!(
+        native_x87_gate(CpuPersona::I586, CR0_NE, 0x003f, 0x0001),
+        NativeX87Gate::Ready
+    );
+    assert_eq!(
+        native_x87_gate(CpuPersona::I586, 0, 0, 1),
+        NativeX87Gate::Ready
+    );
+}
+
+#[test]
+fn top_and_tag_helpers_cover_wraparound_and_value_classes() {
+    let status = x87_with_top(0x4001, 7);
+    assert_eq!(x87_top(status), 7);
+    assert_eq!(x87_physical_index(status, 2), 1);
+    assert_eq!(x87_top(x87_push_top(status)), 6);
+    assert_eq!(x87_top(x87_pop_top(status)), 0);
+    assert_eq!(status & !X87_TOP_MASK, 0x4001 & !X87_TOP_MASK);
+
+    let mut tags = 0xffff;
+    tags = x87_with_tag(tags, 7, NativeX87Tag::Valid);
+    tags = x87_with_tag(tags, 0, NativeX87Tag::Zero);
+    tags = x87_with_tag(tags, 1, NativeX87Tag::Special);
+    assert_eq!(x87_tag_at(tags, 7), NativeX87Tag::Valid);
+    assert_eq!(x87_tag_at(tags, 0), NativeX87Tag::Zero);
+    assert_eq!(x87_tag_at(tags, 1), NativeX87Tag::Special);
+    assert_eq!(x87_tag_at(tags, 2), NativeX87Tag::Empty);
+
+    assert_eq!(x87_value_tag(1.0), NativeX87Tag::Valid);
+    assert_eq!(x87_value_tag(f64::MIN_POSITIVE / 2.0), NativeX87Tag::Valid);
+    assert_eq!(x87_value_tag(0.0), NativeX87Tag::Zero);
+    assert_eq!(x87_value_tag(-0.0), NativeX87Tag::Zero);
+    assert_eq!(x87_value_tag(f64::INFINITY), NativeX87Tag::Special);
+    assert_eq!(x87_value_tag(f64::NAN), NativeX87Tag::Special);
+}
+
+#[test]
+fn finite_and_rounding_eligibility_match_the_fast_slice() {
+    assert!(native_x87_compare_eligible(1.0, -2.0));
+    assert!(!native_x87_compare_eligible(f64::NAN, 1.0));
+    assert!(native_x87_binary_result_eligible(
+        NativeX87BinaryOp::Multiply,
+        2.0,
+        3.0,
+        6.0
+    ));
+    assert!(!native_x87_binary_result_eligible(
+        NativeX87BinaryOp::Divide,
+        1.0,
+        0.0,
+        f64::INFINITY
+    ));
+    assert!(!native_x87_binary_result_eligible(
+        NativeX87BinaryOp::Add,
+        f64::MAX,
+        f64::MAX,
+        f64::INFINITY
+    ));
+
+    assert_eq!(
+        NativeX87RoundingMode::from_control(0x037f),
+        NativeX87RoundingMode::NearestEven
+    );
+    assert_eq!(
+        NativeX87RoundingMode::from_control(0x0f7f),
+        NativeX87RoundingMode::Truncate
+    );
+    assert_eq!(native_x87_i32_result(0x037f, 2.5), Some(2));
+    assert_eq!(native_x87_i32_result(0x037f, 3.5), Some(4));
+    assert_eq!(native_x87_i32_result(0x0f7f, -3.9), Some(-3));
+    assert_eq!(native_x87_i32_result(0x077f, 1.0), None);
+    assert_eq!(native_x87_i32_result(0x0b7f, 1.0), None);
+    assert_eq!(native_x87_i32_result(0x037f, f64::NAN), None);
+    assert_eq!(native_x87_i32_result(0x037f, 2_147_483_648.0), None);
+    assert_eq!(
+        native_x87_i32_result(0x0f7f, -2_147_483_648.9),
+        Some(i32::MIN)
+    );
+}
+
+#[test]
+fn weighted_timing_batches_exactly() {
+    let sequence = [
+        NativeX87Insn::classify(&insn(0xd8, 3, 1, 1)).unwrap(),
+        NativeX87Insn::classify(&insn(0xd9, 0, 0, 1)).unwrap(),
+        NativeX87Insn::classify(&insn(0xdb, 0, 0, 1)).unwrap(),
+        NativeX87Insn::classify(&insn(0xdf, 3, 4, 0)).unwrap(),
+    ];
+    for persona in [CpuPersona::I486, CpuPersona::I586] {
+        let weighted = sequence
+            .iter()
+            .map(|op| op.metadata().weighted_fp_clocks(persona))
+            .sum::<u64>();
+        let aggregate = scale_weighted_fp_clocks(weighted, 3);
+
+        let mut individual_clocks = 0;
+        let mut remainder = 3;
+        for op in sequence {
+            let step =
+                scale_weighted_fp_clocks(op.metadata().weighted_fp_clocks(persona), remainder);
+            individual_clocks += step.clocks;
+            remainder = step.remainder;
+        }
+        assert_eq!(aggregate.clocks, individual_clocks);
+        assert_eq!(aggregate.remainder, remainder);
+    }
+
+    assert_eq!(
+        repeated_weighted_fp_clocks(3_808, 4_096, 160),
+        Some(15_597_728)
+    );
+    assert_eq!(repeated_weighted_fp_clocks(u64::MAX, 2, 0), None);
+}
+
+#[test]
+fn substrate_layout_stays_compact() {
+    assert!(core::mem::size_of::<NativeX87Insn>() <= 24);
+    assert!(core::mem::size_of::<NativeX87Metadata>() <= 12);
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    {
+        let layout = native_x87_layout();
+        let state_size = core::mem::size_of::<X87>();
+        assert_eq!(layout.st_stride, core::mem::size_of::<f64>());
+        assert!(layout.st + 8 * layout.st_stride <= state_size);
+        assert!(layout.control + core::mem::size_of::<u16>() <= state_size);
+        assert!(layout.status + core::mem::size_of::<u16>() <= state_size);
+        assert!(layout.tag + core::mem::size_of::<u16>() <= state_size);
+        assert_ne!(layout.control, layout.status);
+        assert_ne!(layout.status, layout.tag);
+    }
+}

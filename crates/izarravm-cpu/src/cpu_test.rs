@@ -1252,6 +1252,7 @@ struct TestBus {
     direct_memory_max_clock_override: Option<u64>,
     project_additional_bus_clocks: bool,
     native_aggregate_accounting_disabled: bool,
+    jit_cached_fetch_requests: std::cell::RefCell<Vec<(u32, u32)>>,
     mode13_dirty_pages: u16,
     mode13_byte_writes: u64,
     mode13_word_writes: u64,
@@ -1279,6 +1280,7 @@ impl TestBus {
             direct_memory_max_clock_override: None,
             project_additional_bus_clocks: false,
             native_aggregate_accounting_disabled: false,
+            jit_cached_fetch_requests: std::cell::RefCell::new(Vec::new()),
             mode13_dirty_pages: 0,
             mode13_byte_writes: 0,
             mode13_word_writes: 0,
@@ -1632,7 +1634,10 @@ impl CpuBus for TestBus {
         Some(self.direct_memory_max_clock_override.unwrap_or(0))
     }
 
-    fn jit_cached_fetch_run_clocks(&self, _start: u32, count: u32) -> Option<u64> {
+    fn jit_cached_fetch_run_clocks(&self, start: u32, count: u32) -> Option<u64> {
+        self.jit_cached_fetch_requests
+            .borrow_mut()
+            .push((start, count));
         Some(u64::from(count) * 2)
     }
 
@@ -2024,6 +2029,14 @@ mod jit_general;
 ))]
 #[path = "cpu_jit_direct_test.rs"]
 mod jit_direct;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_compile_outcome_test.rs"]
+mod jit_compile_outcome;
 
 #[cfg(all(
     feature = "jit",

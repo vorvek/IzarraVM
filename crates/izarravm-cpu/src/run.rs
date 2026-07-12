@@ -695,16 +695,21 @@ impl CpuGsw {
                 .expect("ready direct block must remain live"),
             jit::direct::BlockProbe::Compile => {
                 let compile_start = std::time::Instant::now();
-                let Some(compilation) = jit::direct::compile(self, lin, d) else {
-                    self.perf.jit_direct_compile_attempts += 1;
-                    self.perf.jit_direct_compile_ns +=
-                        compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-                    self.jit_direct.reject(key);
-                    return Ok(DirectContinuation::Interpret);
-                };
+                let outcome = jit::direct::compile(self, lin, d);
                 self.perf.jit_direct_compile_attempts += 1;
                 self.perf.jit_direct_compile_ns +=
                     compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                let compilation = match outcome {
+                    jit::direct::CompileOutcome::Compiled(compilation) => compilation,
+                    jit::direct::CompileOutcome::StructuralReject(span) => {
+                        self.jit_direct.reject(span);
+                        return Ok(DirectContinuation::Interpret);
+                    }
+                    jit::direct::CompileOutcome::Retry => {
+                        self.jit_direct.dormant(key);
+                        return Ok(DirectContinuation::Interpret);
+                    }
+                };
                 let code_page =
                     bus.direct_page(key.physical, BusAccessKind::InstructionPrefetch)?;
                 let code_page_covers_block = code_page.is_some_and(|page| {
@@ -714,11 +719,11 @@ impl CpuGsw {
                             .is_some_and(|end| end as usize <= page.len)
                 });
                 if !code_page_covers_block {
-                    self.jit_direct.reject(key);
+                    self.jit_direct.dormant(key);
                     return Ok(DirectContinuation::Interpret);
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {
-                    self.jit_direct.reject(key);
+                    self.jit_direct.dormant(key);
                     return Ok(DirectContinuation::Interpret);
                 };
                 self.perf.jit_direct_blocks_installed += 1;
@@ -763,6 +768,31 @@ impl CpuGsw {
             DirectBlockOutcome::Prefix(outcome) => Ok(DirectContinuation::Prefix(outcome)),
             DirectBlockOutcome::NotRun => Ok(DirectContinuation::Interpret),
         }
+    }
+
+    #[cfg(all(
+        test,
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(super) fn try_direct_continuation_for_test<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        d: bool,
+    ) -> Result<(), CpuError> {
+        let _ = self.try_direct_continuation(
+            bus,
+            lin,
+            d,
+            ContinuationBudget {
+                total: 0,
+                bus_at_entry: 0,
+                cap: u64::MAX,
+            },
+        )?;
+        Ok(())
     }
 
     #[cfg(feature = "jit")]
@@ -879,32 +909,22 @@ impl CpuGsw {
         let fetch_upper = bus
             .jit_fetch_cost_clocks()
             .saturating_mul(u64::from(span.instructions));
-        let data_upper = bus
+        let byte_data_upper = bus
             .jit_data_cost_clocks(BusWidth::Byte)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
+        let word_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Word)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word));
+        let dword_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Dword)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+        let data_upper = byte_data_upper
             .saturating_mul(u64::from(block.byte_reads()))
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Word)
-                    .saturating_mul(u64::from(block.word_reads())),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Dword)
-                    .saturating_mul(u64::from(block.dword_reads())),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Byte)
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte))
-                    .saturating_mul(u64::from(block.byte_stores())),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Word)
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word))
-                    .saturating_mul(u64::from(block.word_stores())),
-            )
-            .saturating_add(
-                bus.jit_data_cost_clocks(BusWidth::Dword)
-                    .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword))
-                    .saturating_mul(u64::from(block.dword_stores())),
-            );
+            .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_reads())))
+            .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_reads())))
+            .saturating_add(byte_data_upper.saturating_mul(u64::from(block.byte_stores())))
+            .saturating_add(word_data_upper.saturating_mul(u64::from(block.word_stores())))
+            .saturating_add(dword_data_upper.saturating_mul(u64::from(block.dword_stores())));
         let raw_bus_upper = fetch_upper.saturating_add(data_upper);
         // `cap` and `bus_growth` use the bus's scaled guest-clock domain. Fold the raw
         // fetch/data bound through that same scale before deciding how much native work fits.
@@ -1358,47 +1378,47 @@ impl CpuGsw {
             }
             let can_native_load = region.has_native_load && ds_flat && ds_readable;
             let can_native_store = region.has_native_store && ds_flat && ds_writable;
-            let native_u8_clock_bound =
-                if cap == u64::MAX || (!can_native_load && !can_native_store) {
-                    Some(0)
-                } else {
-                    (|| {
-                        let mut fetch_max = 0;
-                        for slot in &ctx.slots {
-                            if matches!(
-                                slot.kind,
-                                jit::step::SlotKind::MemLoadU8 | jit::step::SlotKind::MemStoreU8
-                            ) {
-                                fetch_max = fetch_max.max(bus.jit_cached_fetch_run_clocks(
-                                    slot.lin,
-                                    u32::from(slot.insn.len),
-                                )?);
-                            }
-                        }
-                        let mut data_max = 0;
-                        if can_native_load {
-                            data_max = data_max.max(bus.jit_direct_memory_max_clocks(
-                                BusWidth::Byte,
-                                BusAccessKind::DataRead,
+            let native_u8_clock_bound = if cap == u64::MAX
+                || (!can_native_load && !can_native_store)
+            {
+                Some(0)
+            } else {
+                (|| {
+                    let mut fetch_max = 0;
+                    for slot in &ctx.slots {
+                        if matches!(
+                            slot.kind,
+                            jit::step::SlotKind::MemLoadU8 | jit::step::SlotKind::MemStoreU8
+                        ) {
+                            fetch_max = fetch_max.max(bus.jit_cached_fetch_run_clocks(
+                                slot.physical,
+                                u32::from(slot.insn.len),
                             )?);
                         }
-                        if can_native_store {
-                            data_max = data_max.max(bus.jit_direct_memory_max_clocks(
-                                BusWidth::Byte,
-                                BusAccessKind::DataWrite,
-                            )?);
-                        }
-                        let additional_bus = fetch_max.checked_add(data_max)?;
-                        let bus_now = bus.in_batch_scaled_bus_clocks();
-                        let bus_after =
-                            bus.jit_projected_batch_scaled_bus_clocks(additional_bus)?;
-                        let bus_bound = bus_after.checked_sub(bus_now)?.saturating_add(1);
-                        let num = u64::from(num);
-                        let den = u64::from(den);
-                        let core_bound = (2 * num).div_ceil(den);
-                        core_bound.checked_add(bus_bound)
-                    })()
-                };
+                    }
+                    let mut data_max = 0;
+                    if can_native_load {
+                        data_max = data_max.max(bus.jit_direct_memory_max_clocks(
+                            BusWidth::Byte,
+                            BusAccessKind::DataRead,
+                        )?);
+                    }
+                    if can_native_store {
+                        data_max = data_max.max(bus.jit_direct_memory_max_clocks(
+                            BusWidth::Byte,
+                            BusAccessKind::DataWrite,
+                        )?);
+                    }
+                    let additional_bus = fetch_max.checked_add(data_max)?;
+                    let bus_now = bus.in_batch_scaled_bus_clocks();
+                    let bus_after = bus.jit_projected_batch_scaled_bus_clocks(additional_bus)?;
+                    let bus_bound = bus_after.checked_sub(bus_now)?.saturating_add(1);
+                    let num = u64::from(num);
+                    let den = u64::from(den);
+                    let core_bound = (2 * num).div_ceil(den);
+                    core_bound.checked_add(bus_bound)
+                })()
+            };
             let native_memory_timing = native_u8_clock_bound.is_some();
             ctx.step_fn = Some(step_fn);
             ctx.inline_step_fn =

@@ -29,6 +29,12 @@ jobs:
       - name: File policy
         run: python scripts/check_file_policy.py
 
+      - name: Policy self-checks
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/run-realtime-gate.ps1 -SelfTest
+          cargo check -p izarravm --no-default-features
+
       - name: Format
         run: cargo fmt --check
 

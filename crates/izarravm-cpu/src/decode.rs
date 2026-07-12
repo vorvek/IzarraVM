@@ -66,7 +66,8 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// Gated on `persona` (not a runtime bus flag) so the Accurate 386 class keeps
 /// byte-identical batch structure: `block_continuable` is called once
 /// per decode, and `CpuGsw::set_mode` unconditionally invalidates the decode cache
-/// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
+/// (`self.decode_cache.invalidate_and_clear_code_marks()`), so every decode-cache line is
+/// re-decoded -- and this
 /// admission re-resolved -- after any mode change.
 fn block_continuable(
     group: DecodeGroup,
@@ -316,13 +317,11 @@ impl CpuGsw {
         // cached replay would under-charge them) and raises #UD for a non-lockable target. Replaying
         // it from the cache would skip both. LOCK is rare, so re-decoding it every time is free.
         if !insn.prefixes.lock {
-            // Mark the physical block(s) this instruction occupies so a later write into them
-            // invalidates the cache (cross-page SMC). decode just warmed the code-page translation,
-            // so resolving the physical start is a cache hit (and the identity map without paging). A
-            // page-straddling instruction under paging marks the tail block from the contiguous
-            // physical of its first page, which is the one remaining exotic gap.
+            // `put` owns both cache insertion and SMC-watch acquisition. Decode just warmed the
+            // first code-page translation, so resolving the physical start is a cache hit (and the
+            // identity map without paging). Page-straddling instructions remain uncached because
+            // their next linear page can map to a noncontiguous physical page.
             let physical = self.translate_code_linear(bus, lin)?;
-            self.decode_cache.mark_code_range(physical, insn.len);
             self.decode_cache
                 .put(lin, insn, cs.default_size_32, physical);
         }
