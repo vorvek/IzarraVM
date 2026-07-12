@@ -3,7 +3,7 @@
 
 # <img src="docs/star.svg" alt="" height="30"> IzarraVM
 
-IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era games computer that
+IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era workstation that
 almost shipped in 1997. It models one fixed machine: custom video and audio
 around an MS-DOS compatible core, booting Toka-DOS: a real FreeDOS-based
 system running in virtual-8086 mode under the machine's own memory manager.
@@ -21,23 +21,31 @@ being tuned.
 
 ## Origin
 
-Izarra Computer Systems started in 1987 as a small Spanish workstation shop that
-built graphics terminals for schools and local studios. Its engineers wanted a
-home computer that could run DOS games without feeling like a beige PC, and they
-spent the next decade chasing that idea across three machines.
+Izarra started in Zamudio, Bizkaia, in 1982. Mikel Etxeberria handled the
+hardware and repairs; Txema Goikoetxea handled customers, parts, and the less
+glamorous business of getting invoices paid. Their first products were
+electronic typewriters, backed by the sort of local service that meant a broken
+machine did not have to be shipped away for weeks. Izarra also made parts for
+Olivetti, steady work that helped keep the lights on.
 
-The Izarra 1000 arrived in 1990 around a 286 at 12 MHz, followed in 1993 by the
-386-based Izarra 2000 at 25 MHz. Both sold modestly to the schools and studios
-that already knew the brand. Work on the 3000 began in late 1994 as the most
-ambitious of the three: a tight motherboard around VGA, MIDI, CD-ROM audio, and
-a friendly ROM shell, fast enough to make DOS games feel at home.
+By the late 1980s, those same customers were asking about PCs. Izarra moved into
+custom workstations instead of simply rebadging AT compatibles, keeping familiar
+DOS software but building its own hardware and operating-system stack around it.
+That made the machines distinctive -- some Spanish magazines called Izarra
+"the Basque Amiga" -- but it also made them expensive.
 
-The prototype was fast, but the timing was brutal. Windows 95 made compatibility
-the only spec retailers cared about, so Izarra kept adding bridge chips and
-fallback modes to reassure publishers. The board became expensive and late. In
-April 1997, with the first production run still in testing and suppliers asking
-for cash, the company filed for bankruptcy. IzarraVM is what survived in the lab
-notes.
+The computer line began with the 286-based Izarra 1000 in 1990, followed by the
+386-based 2000 in 1992 and the 486-based 2700 in 1994. Each pushed a little
+further beyond office work, especially as better graphics, sound, and CD-ROMs
+made multimedia and home use more practical.
+
+The Izarra 3000 was the big swing: a custom 586-class workstation with its own
+BIOS, Toka-DOS 3.0, VEGA graphics, and ReSonique sound. Unfortunately, it was
+ready for a market that had already moved on. Buyers expected Windows 95, which
+the machine could not run, and MS-DOS compatibility was no longer enough to
+justify the cost of Izarra's custom approach. The 3000 never reached stores.
+What survived were photos, manuals, BIOS dumps, unfinished developer notes, and
+enough affection for the machine to give IzarraVM something worth preserving.
 
 ## Tech Specs
 
