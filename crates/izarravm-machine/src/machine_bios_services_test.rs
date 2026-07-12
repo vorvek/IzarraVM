@@ -2252,10 +2252,12 @@ fn int10_1b_fills_state_block_and_signals_vga() {
     m.cpu.registers.set_eax(0x1B00); // ES:DI = 0:0 -> block at physical 0
     m.handle_int10();
     assert_eq!(m.cpu.registers.eax() as u8, 0x1B);
-    assert_eq!(m.read_physical_u16(0), 0x0000); // functionality table offset
+    assert_eq!(m.read_physical_u16(0), INT10_FUNCTIONALITY_TABLE_OFFSET);
     assert_eq!(m.read_physical_u16(2), VGA_BIOS_SEGMENT); // functionality table segment
     let table: Vec<u8> = (0..16)
-        .map(|offset| m.read_physical_u8(VGA_BIOS_BASE + offset))
+        .map(|offset| {
+            m.read_physical_u8(VGA_BIOS_BASE + u32::from(INT10_FUNCTIONALITY_TABLE_OFFSET) + offset)
+        })
         .collect();
     assert_eq!(table.as_slice(), &INT10_STATIC_FUNCTIONALITY);
     assert_eq!(m.read_physical_u8(4), 0x04); // video mode at +4
@@ -2268,6 +2270,42 @@ fn int10_1b_fills_state_block_and_signals_vga() {
     assert_eq!(m.read_physical_u16(0x27), 4); // CGA mode 04h colors
     assert_eq!(m.read_physical_u8(0x29), 1); // CGA graphics has one page
     assert_eq!(m.read_physical_u8(0x2A), 0x00); // 200 scan lines
+}
+
+#[test]
+fn vga_option_rom_has_a_safe_entry_declared_size_and_checksum() {
+    let mut m = int15_machine(16);
+    assert_eq!(m.read_physical_u16(VGA_BIOS_BASE), 0xAA55);
+    assert_eq!(m.read_physical_u8(VGA_BIOS_BASE + 2), 0x40);
+    assert_eq!(m.read_physical_u8(VGA_BIOS_BASE + 3), 0xCB);
+    let sum = (0..VGA_BIOS_SPAN_SIZE).fold(0u8, |sum, offset| {
+        sum.wrapping_add(m.read_physical_u8(VGA_BIOS_BASE + offset))
+    });
+    assert_eq!(sum, 0);
+    assert_eq!(m.read_physical_u16(BDA_VIDEO_SAVE_POINTER as u32), 0x0110);
+
+    let program = [
+        0x9A, 0x03, 0x00, 0x00, 0xC0, // call far C000:0003
+        0xC6, 0x06, 0x00, 0x70, 0x5A, // mov byte [7000h],5Ah
+        0xFA, 0xF4, // cli; hlt
+    ];
+    for (offset, byte) in program.iter().copied().enumerate() {
+        m.write_physical_u8(0x8000 + offset as u32, byte);
+    }
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::real(0));
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+    m.cpu.registers.eip = 0x8000;
+    m.cpu.registers.set_esp(0x9000);
+    m.run_until_halt_or_cycles(100_000).unwrap();
+    assert_eq!(
+        m.read_physical_u8(0x7000),
+        0x5A,
+        "ROM entry returned with RETF"
+    );
 }
 
 #[test]

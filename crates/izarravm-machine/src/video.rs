@@ -354,7 +354,7 @@ impl Machine {
         let cursor_type = self.read_guest_word(0x460);
         let char_height = self.read_guest_word(0x485);
         let mut block = [0u8; 64];
-        block[0..2].copy_from_slice(&0u16.to_le_bytes());
+        block[0..2].copy_from_slice(&INT10_FUNCTIONALITY_TABLE_OFFSET.to_le_bytes());
         block[2..4].copy_from_slice(&VGA_BIOS_SEGMENT.to_le_bytes());
         block[4] = mode;
         block[5..7].copy_from_slice(&cols.to_le_bytes());

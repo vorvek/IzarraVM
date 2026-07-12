@@ -68,13 +68,14 @@ pub(crate) use video_params::{
     BDA_VIDEO_SAVE_POINTER, BIOS_FONT_8X8_HIGH_ROM_OFFSET, BIOS_FONT_8X8_ROM_OFFSET,
     BIOS_FONT_8X14_ROM_OFFSET, BIOS_FONT_8X16_ROM_OFFSET, DISTIRA_PCI_BAR_SIZE,
     DISTIRA_PCI_DEVICE_ID, DISTIRA_PCI_LFB_OFFSET, DISTIRA_PCI_REVISION, DISTIRA_PCI_SLOT,
-    DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID, INT10_STATE_BDA_LEN,
-    INT10_STATE_CGA_LATCH_MARKER, INT10_STATE_CGA_LATCH_OFFSET, INT10_STATE_DAC_LEN,
-    INT10_STATE_HARDWARE_LEN, INT10_STATIC_FUNCTIONALITY, INT10_VIDEO_PARAM_ENTRIES,
-    INT10_VIDEO_PARAM_ENTRY_LEN, INT10_VIDEO_PARAM_TABLE_ENTRIES, INT10_VIDEO_PARAM_TABLE_OFFSET,
-    INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_PTRS,
-    PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_END, PCI_CONFIG_DATA_PORT, RAM_LOOKUP_PAGE_BITS,
-    RAM_LOOKUP_PAGE_MASK, RAM_LOOKUP_PAGE_SIZE, RAM_LOOKUP_SLOW,
+    DISTIRA_PCI_TEX_OFFSET, DISTIRA_PCI_VENDOR_ID, INT10_FUNCTIONALITY_TABLE_OFFSET,
+    INT10_STATE_BDA_LEN, INT10_STATE_CGA_LATCH_MARKER, INT10_STATE_CGA_LATCH_OFFSET,
+    INT10_STATE_DAC_LEN, INT10_STATE_HARDWARE_LEN, INT10_STATIC_FUNCTIONALITY,
+    INT10_VIDEO_PARAM_ENTRIES, INT10_VIDEO_PARAM_ENTRY_LEN, INT10_VIDEO_PARAM_TABLE_ENTRIES,
+    INT10_VIDEO_PARAM_TABLE_OFFSET, INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
+    INT10_VIDEO_SAVE_POINTER_TABLE_PTRS, PCI_CONFIG_ADDRESS_PORT, PCI_CONFIG_DATA_END,
+    PCI_CONFIG_DATA_PORT, RAM_LOOKUP_PAGE_BITS, RAM_LOOKUP_PAGE_MASK, RAM_LOOKUP_PAGE_SIZE,
+    RAM_LOOKUP_SLOW,
 };
 mod fat32;
 mod fat32_volume;
@@ -110,7 +111,7 @@ pub use memmap::{
 
 /// The video BIOS ROM sits in the first 32 KiB of the upper-memory window on a
 /// VGA machine (0xC0000-0xC7FFF), matching where a real adapter's option ROM
-/// lives even though this machine does not yet map a BIOS image into that span.
+/// lives. The runtime image carries a valid option-ROM header and checksum.
 const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
 const VGA_BIOS_SEGMENT: u16 = (VGA_BIOS_BASE >> 4) as u16; // 0xC000
 const VGA_BIOS_INT1D_VIDEO_TABLE_OFF: u16 = 0x1000;
@@ -2441,7 +2442,10 @@ fn seed_bda_video_save_pointer(memory: &mut Memory) -> Result<(), BusError> {
 fn seed_video_bios_tables(memory: &mut Memory) -> Result<(), BusError> {
     let vga_base = VGA_BIOS_BASE as usize;
     for (index, byte) in INT10_STATIC_FUNCTIONALITY.iter().copied().enumerate() {
-        memory.write_u8(vga_base + index, byte)?;
+        memory.write_u8(
+            vga_base + usize::from(INT10_FUNCTIONALITY_TABLE_OFFSET) + index,
+            byte,
+        )?;
     }
 
     let save_ptr = vga_base + usize::from(INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET);
@@ -2463,6 +2467,33 @@ fn seed_video_bios_tables(memory: &mut Memory) -> Result<(), BusError> {
         }
     }
     Ok(())
+}
+
+fn seed_vga_option_rom_header(memory: &mut Memory) -> Result<(), BusError> {
+    let base = VGA_BIOS_BASE as usize;
+    for offset in 0..VGA_BIOS_SPAN_SIZE as usize {
+        memory.write_u8(base + offset, 0)?;
+    }
+    memory.write_u8(base, 0x55)?;
+    memory.write_u8(base + 1, 0xAA)?;
+    memory.write_u8(base + 2, 0x40)?; // 32 KiB in 512-byte units
+    memory.write_u8(base + 3, 0xCB)?; // safe initialization RETF
+    for (index, byte) in b"IzarraVM VGA BIOS".iter().copied().enumerate() {
+        memory.write_u8(base + 4 + index, byte)?;
+    }
+    Ok(())
+}
+
+fn finalize_vga_option_rom_checksum(memory: &mut Memory) -> Result<(), BusError> {
+    let base = VGA_BIOS_BASE as usize;
+    let checksum_at = base + VGA_BIOS_SPAN_SIZE as usize - 1;
+    memory.write_u8(checksum_at, 0)?;
+    let sum = (0..VGA_BIOS_SPAN_SIZE as usize).try_fold(0u8, |sum, offset| {
+        memory
+            .read_u8(base + offset)
+            .map(|byte| sum.wrapping_add(byte))
+    })?;
+    memory.write_u8(checksum_at, 0u8.wrapping_sub(sum))
 }
 
 fn install_boot_bios_stubs(memory: &mut Memory, mode: GswMode) -> Result<(), BusError> {
@@ -2534,6 +2565,7 @@ fn install_boot_bios_stubs(memory: &mut Memory, mode: GswMode) -> Result<(), Bus
     install_rtc_isr_stub(memory)?;
     install_slave_irq_isr_stub(memory)?;
     install_dos_low_memory_stubs(memory)?;
+    seed_vga_option_rom_header(memory)?;
     seed_int1d_video_parameter_table(memory)?;
     seed_int1e_diskette_parameter_table(memory)?;
     seed_int1f_graphics_font_table(memory)?;
@@ -2541,6 +2573,7 @@ fn install_boot_bios_stubs(memory: &mut Memory, mode: GswMode) -> Result<(), Bus
     seed_int44_font_table(memory)?;
     seed_int46_absent_fixed_disk_table(memory)?;
     seed_video_bios_tables(memory)?;
+    finalize_vga_option_rom_checksum(memory)?;
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
