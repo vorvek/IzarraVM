@@ -500,6 +500,7 @@ pub struct MachineProfilePhase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineHostProfileSnapshot {
+    pub machine_phase_timing_enabled: bool,
     pub phases: Vec<MachineProfilePhase>,
 }
 
@@ -618,6 +619,7 @@ impl MachineHostProfile {
 
     fn snapshot(&self) -> MachineHostProfileSnapshot {
         MachineHostProfileSnapshot {
+            machine_phase_timing_enabled: self.enabled,
             phases: MachineProfilePhaseKind::ALL
                 .iter()
                 .map(|&phase| {

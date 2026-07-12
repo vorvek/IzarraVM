@@ -104,6 +104,16 @@ fn cli_accepts_hdd_folder_profile_json_output() {
 }
 
 #[test]
+fn machine_profile_environment_gate_is_explicit() {
+    for value in [None, Some(""), Some("0")] {
+        assert!(!machine_profile_requested(value));
+    }
+    for value in [Some("1"), Some("true"), Some("enabled")] {
+        assert!(machine_profile_requested(value));
+    }
+}
+
+#[test]
 fn cli_rejects_multiple_run_modes() {
     for arguments in [
         vec![
@@ -150,6 +160,7 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     assert_eq!(report["stop"]["kind"], "dos_exit");
     assert_eq!(report["stop"]["code"], 0);
     assert_eq!(report["timedemo"]["gametics"], 35);
+    assert_eq!(report["machine_phase_timing_enabled"], true);
     assert!(report["guest_seconds"].as_f64().unwrap() > 0.0);
     assert!(report["direct_native_coverage"].as_f64().is_some());
     assert!(
@@ -208,6 +219,45 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
                 .any(|phase| phase["name"] == name)
         );
     }
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn hdd_profile_json_does_not_enable_machine_phase_timing() {
+    let dir = munt_test_dir("hdd-profile-uninstrumented");
+    let path = dir.join("run.json");
+    let mut machine = Machine::new_raw_program(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        &[0xb8, 0x00, 0x4c, 0xcd, 0x21],
+    )
+    .expect("build raw machine");
+    let stop = machine
+        .run_until_halt_or_cycles(100_000)
+        .expect("run raw program");
+
+    write_hdd_profile_json(
+        &path,
+        Path::new("fixture"),
+        GswMode::Gsw386,
+        100_000,
+        std::time::Duration::from_secs(1),
+        &stop,
+        None,
+        &machine,
+    )
+    .expect("write profile JSON");
+
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(report["machine_phase_timing_enabled"], false);
+    assert_eq!(report["classified_wall_ns"], 0);
+    assert!(
+        report["machine_phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|phase| phase["wall_ns"] == 0 && phase["count"] == 0)
+    );
 
     std::fs::remove_dir_all(dir).unwrap();
 }

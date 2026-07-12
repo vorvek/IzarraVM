@@ -78,6 +78,16 @@ function Assert-SelfTestThrows([scriptblock]$Action, [string]$MessagePart) {
     throw "Self-test expected an error containing '$MessagePart'."
 }
 
+function Assert-UninstrumentedProfileSample($Sample, [string]$Context) {
+    $property = $Sample.PSObject.Properties["machine_phase_timing_enabled"]
+    if ($null -eq $property -or $property.Value -isnot [bool]) {
+        throw "$Context profile is missing a boolean machine_phase_timing_enabled field."
+    }
+    if ($property.Value) {
+        throw "$Context enabled machine phase timing and contaminated its wall sample."
+    }
+}
+
 if ($SelfTest) {
     $identity = ConvertFrom-QuakeTimedemoLine "969 frames  22.8 seconds  42.6 fps"
     if ($null -eq $identity -or $identity.frames -ne 969 -or
@@ -94,6 +104,17 @@ if ($SelfTest) {
     Assert-SelfTestThrows {
         Assert-QuakeAutoexecText "quake.exe -nosound"
     } "must launch +timedemo demo1"
+    Assert-UninstrumentedProfileSample ([pscustomobject]@{
+        machine_phase_timing_enabled = $false
+    }) "clean sample"
+    Assert-SelfTestThrows {
+        Assert-UninstrumentedProfileSample ([pscustomobject]@{
+            machine_phase_timing_enabled = $true
+        }) "instrumented sample"
+    } "contaminated"
+    Assert-SelfTestThrows {
+        Assert-UninstrumentedProfileSample ([pscustomobject]@{}) "legacy sample"
+    } "missing a boolean"
     Write-Host "run-realtime-gate self-test passed"
     return
 }
@@ -359,6 +380,7 @@ function Invoke-Workload(
         if ($sample.schema -ne "izarravm-hdd-profile-v1" -or $sample.mode -ne $Mode) {
             throw "$Name run $run produced an unexpected schema or CPU mode."
         }
+        Assert-UninstrumentedProfileSample $sample "$Name run $run"
         if ($Name.StartsWith("doom-", [StringComparison]::Ordinal)) {
             if ($sample.stop.kind -ne "test_exit" -or $sample.stop.code -ne 0) {
                 throw "$Name run $run did not reach TestExit code 0."

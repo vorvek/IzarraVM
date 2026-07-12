@@ -652,7 +652,7 @@ pub(super) fn run_profile_exe(
     let exe = std::fs::read(path)?;
     let mode = GswMode::Gsw586;
     let source = BenchSource::DosExe(exe);
-    let baseline = run_bench_one(hardware, mode, &source, BENCH_BUDGET)?;
+    let baseline = run_bench_one_profiled(hardware, mode, &source, BENCH_BUDGET, None)?;
     let profiled =
         run_bench_one_profiled(hardware, mode, &source, BENCH_BUDGET, Some(sample_stride))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("exe");
@@ -891,6 +891,7 @@ fn write_profile_json(
         "mode": "586",
         "sample_stride": sample_stride.max(1),
         "baseline": {
+            "machine_phase_timing_enabled": baseline.machine_profile.machine_phase_timing_enabled,
             "wall_ms": baseline_metrics.wall_ms,
             "guest_ms": baseline_metrics.guest_ms,
             "rt_factor": baseline_metrics.rt_factor,
@@ -900,6 +901,7 @@ fn write_profile_json(
         },
         "profile": {
             "wall_ms": profiled.wall.as_secs_f64() * 1000.0,
+            "machine_phase_timing_enabled": profiled.machine_profile.machine_phase_timing_enabled,
             "machine_phases": machine_phases.iter().map(|phase| json!({
                 "name": phase.name,
                 "wall_ns": phase.wall_ns,
