@@ -518,7 +518,9 @@ impl CpuGsw {
                     cap,
                 };
                 #[cfg(feature = "jit")]
-                let region_outcome = if std::mem::take(&mut skip_direct_once) {
+                let region_outcome = if !self.jit_direct.backend_enabled()
+                    || std::mem::take(&mut skip_direct_once)
+                {
                     None
                 } else if jit_forced_region_lin() == Some(lin)
                     || !self.jit_direct.auto_admit()
@@ -634,7 +636,21 @@ impl CpuGsw {
         self.jit_direct.set_auto_admit(on && jit::host_supported());
     }
 
+    /// Enable or disable every native execution path, including forced legacy regions.
+    /// Unsupported hosts cannot be enabled.
+    #[cfg(feature = "jit")]
+    pub fn set_native_backend_enabled(&mut self, on: bool) {
+        self.jit_direct.set_backend_enabled(on);
+    }
+
     #[cfg(all(feature = "jit", test))]
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
         self.jit_direct.set_auto_admit(false);
         self.jit_regions.set_auto_admit(on && jit::host_supported());
@@ -1188,6 +1204,13 @@ impl CpuGsw {
     }
 
     #[cfg(all(feature = "jit", test))]
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn try_run_direct_block_for_test<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1197,6 +1220,13 @@ impl CpuGsw {
     }
 
     #[cfg(all(feature = "jit", test))]
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn try_run_direct_block_with_cap_for_test<B: CpuBus>(
         &mut self,
         bus: &mut B,

@@ -9,11 +9,21 @@ pub(crate) fn host_supported() -> bool {
 }
 
 pub(crate) mod block;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
-))]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 pub(crate) mod code_watch;
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 pub(crate) mod direct;
 pub(crate) mod encoder;
 pub(crate) mod exec_mem;

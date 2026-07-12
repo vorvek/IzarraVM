@@ -977,12 +977,12 @@ fn jit_auto_admit_policy(
     backend == ExecutionBackend::Automatic && jit_available && !matches!(value, Some("" | "0"))
 }
 
-fn jit_auto_admit_default() -> bool {
+fn jit_auto_admit_default(backend: ExecutionBackend) -> bool {
     let value = std::env::var("IZARRAVM_JIT").ok();
     jit_auto_admit_policy(
         value.as_deref(),
         izarravm_cpu::native_backend_available(),
-        process_execution_backend(),
+        backend,
     )
 }
 
@@ -1136,7 +1136,12 @@ impl Machine {
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
-        machine.set_jit_auto_admit(jit_auto_admit_default());
+        let execution_backend = process_execution_backend();
+        #[cfg(feature = "jit")]
+        machine
+            .cpu
+            .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
+        machine.set_jit_auto_admit(jit_auto_admit_default(execution_backend));
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.

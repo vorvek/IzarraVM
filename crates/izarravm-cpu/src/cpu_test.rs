@@ -1959,16 +1959,28 @@ mod strings_segments;
 mod v86;
 
 /// Differential tests for the compiled loop-region.
-#[cfg(feature = "jit")]
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_region_test.rs"]
 mod jit_region;
 
 /// Differential tests for the generic JIT block builder.
-#[cfg(feature = "jit")]
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_general_test.rs"]
 mod jit_general;
 
-#[cfg(feature = "jit")]
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_direct_test.rs"]
 mod jit_direct;
 

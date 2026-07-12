@@ -158,6 +158,41 @@ fn assert_identical(interp: &CpuGsw, bus_i: &TestBus, jit_cpu: &CpuGsw, bus_j: &
 }
 
 #[test]
+fn hard_backend_disable_blocks_a_stamped_region() {
+    let mut interp = fresh_cpu(0xffff);
+    let mut disabled = fresh_cpu(0xffff);
+    let mut bus_i = TestBus::with_memory(program_in(0x1_0000));
+    let mut bus_d = TestBus::with_memory(program_in(0x1_0000));
+    warm_and_admit(&mut interp, &mut bus_i, &mut disabled, &mut bus_d);
+    disabled.set_native_backend_enabled(false);
+    interp.reset_perf_counters();
+    disabled.reset_perf_counters();
+
+    arm_loop(&mut interp, &mut bus_i, 8);
+    arm_loop(&mut disabled, &mut bus_d, 8);
+    let interp_calls = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+    let disabled_calls = drive_to_halt(&mut disabled, &mut bus_d, u64::MAX);
+
+    assert_eq!(interp_calls, disabled_calls);
+    assert_identical(&interp, &bus_i, &disabled, &bus_d);
+    let perf = disabled.perf_counters();
+    assert_eq!(perf.jit_region_entries, 0);
+    assert_eq!(perf.jit_direct_entries, 0);
+    assert_eq!(perf.jit_native_insns, 0);
+}
+
+#[test]
+fn hard_backend_disable_survives_clone_and_reset() {
+    let mut cpu = CpuGsw::default();
+    cpu.set_native_backend_enabled(false);
+    let clone = cpu.clone();
+    assert!(!clone.jit_direct.backend_enabled());
+
+    cpu.reset();
+    assert!(!cpu.jit_direct.backend_enabled());
+}
+
+#[test]
 fn switching_between_386_modes_clears_regions_stamps_and_remainders() {
     let mut interp = fresh_cpu(u32::MAX);
     let mut jit_cpu = fresh_cpu(u32::MAX);

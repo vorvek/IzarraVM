@@ -460,6 +460,7 @@ pub(crate) struct BlockCache {
     arena: Option<ExecutableArena>,
     entry_cap: usize,
     disabled: bool,
+    backend_enabled: bool,
     auto_admit: bool,
     stats: BlockCacheStats,
     code_watch: Box<NativeCodeWatch>,
@@ -500,6 +501,7 @@ impl BlockCache {
             arena: None,
             entry_cap,
             disabled: false,
+            backend_enabled: super::host_supported(),
             auto_admit: false,
             stats: BlockCacheStats::default(),
             code_watch: Box::default(),
@@ -510,6 +512,14 @@ impl BlockCache {
 
     pub(crate) fn auto_admit(&self) -> bool {
         self.auto_admit
+    }
+
+    pub(crate) fn backend_enabled(&self) -> bool {
+        self.backend_enabled
+    }
+
+    pub(crate) fn set_backend_enabled(&mut self, on: bool) {
+        self.backend_enabled = on && super::host_supported();
     }
 
     pub(crate) fn set_auto_admit(&mut self, on: bool) {
@@ -1292,7 +1302,10 @@ impl Eq for BlockCache {}
 
 impl Clone for BlockCache {
     fn clone(&self) -> Self {
-        Self::default()
+        Self {
+            backend_enabled: self.backend_enabled,
+            ..Self::default()
+        }
     }
 }
 
@@ -4267,6 +4280,42 @@ fn emit_mode13_read_completion(e: &mut Encoder, width: MemoryWidth) {
         MemoryWidth::Dword => emit_dynamic_increment(e, STACK_MODE13_DWORD_READS),
     }
     e.place(done);
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_ram_read_pointer(
+    _: &mut Encoder,
+    _: MemoryWidth,
+    _: DirectAddr,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_ram_read_pointer_inner(
+    _: &mut Encoder,
+    _: MemoryWidth,
+    _: DirectAddr,
+    _: MemoryEmitContext,
+    _: MemorySideExits,
+) {
+    unreachable!("direct memory lowering is x86-64-only")
+}
+
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+fn emit_mode13_read_completion(_: &mut Encoder, _: MemoryWidth) {
+    unreachable!("direct memory lowering is x86-64-only")
 }
 
 #[cfg(not(all(

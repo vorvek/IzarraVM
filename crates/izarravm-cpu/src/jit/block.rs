@@ -185,6 +185,13 @@ pub(crate) fn changes_native_memory_context(insn: &DecodedInsn) -> bool {
 /// that fails it either ends the block (control transfer / IF-shadow change, as the terminal slot)
 /// or is a hard terminator (`!continuable`). Exposed for the terminator-contract test.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn is_interior_eligible(insn: &DecodedInsn) -> bool {
     insn.continuable
         && insn.prefixes == Prefixes::default()
@@ -850,6 +857,13 @@ const SET_SHIFT_FLAGS_FN_OFF: i8 = 24;
 /// production auto-admission uses `try_admit_gated` with `reject_linear` set, and the forced-address
 /// override passes `reject_linear = false` directly.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn try_admit(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
     try_admit_gated(cpu, entry_lin, d, false)
 }

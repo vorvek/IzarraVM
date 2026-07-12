@@ -186,6 +186,13 @@ impl ExecutableArena {
     }
 
     #[cfg(test)]
+    #[cfg_attr(
+        not(all(
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn used_slots(&self) -> usize {
         self.used / self.page_len
     }

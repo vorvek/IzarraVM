@@ -8,12 +8,8 @@
 # profile -> rebuild with the profile. This is a RELEASE recipe, not the default
 # `cargo build` (which is untouched).
 #
-# Why --config instead of $env:RUSTFLAGS: the project pins
-# `target.x86_64-pc-windows-msvc.rustflags = ["-C","target-cpu=x86-64-v3"]` in
-# .cargo/config.toml. Setting RUSTFLAGS would REPLACE (not merge) that, silently
-# dropping target-cpu=x86-64-v3 from both PGO stages -- shipping a wrong binary
-# and invalidating the A/B. Overriding the same target key via --config keeps the
-# flag explicit and merges nothing implicitly.
+# The PGO stages use the same baseline x86-64 target as an ordinary release
+# build. AVX2 remains confined to the runtime-gated native backend.
 #
 # Usage:  pwsh scripts/pgo-build.ps1
 # Leaves the optimized binary in target/release/izarravm.exe and prints a
@@ -23,7 +19,6 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $triple = "x86_64-pc-windows-msvc"
-$targetCpu = "x86-64-v3"  # must match .cargo/config.toml
 $profRaw = Join-Path $env:TEMP "izarravm-pgo\raw"
 $profData = Join-Path $env:TEMP "izarravm-pgo\merged.profdata"
 $bin = "target/release/izarravm.exe"
@@ -51,7 +46,7 @@ if ($rustcLlvm -ne $pdLlvm) {
 }
 Write-Host "llvm-profdata: $profdataExe (LLVM $pdLlvm, matches rustc)" -ForegroundColor Green
 
-# --- baseline (plain release, target-cpu=v3 from config) -------------------
+# --- baseline (plain portable release) -------------------------------------
 Write-Host "`n[1/5] baseline release build..." -ForegroundColor Cyan
 cargo build --release -p izarravm
 Write-Host "[1/5] baseline --headless-bench..." -ForegroundColor Cyan
@@ -61,7 +56,7 @@ $baseline = & $bin --headless-bench 2>$null
 Write-Host "`n[2/5] instrumented build (profile-generate)..." -ForegroundColor Cyan
 if (Test-Path $profRaw) { Remove-Item -Recurse -Force $profRaw }
 New-Item -ItemType Directory -Force -Path $profRaw | Out-Null
-cargo build --release -p izarravm --config (Rustflags @("-C", "target-cpu=$targetCpu", "-C", "profile-generate=$profRaw"))
+cargo build --release -p izarravm --config (Rustflags @("-C", "profile-generate=$profRaw"))
 
 # --- gather a representative profile ---------------------------------------
 Write-Host "[3/5] gathering profile (bench + boot suite)..." -ForegroundColor Cyan
@@ -74,7 +69,7 @@ Write-Host "[4/5] merging profraw -> profdata..." -ForegroundColor Cyan
 
 # --- stage 2: optimized build ----------------------------------------------
 Write-Host "`n[5/5] optimized build (profile-use)..." -ForegroundColor Cyan
-cargo build --release -p izarravm --config (Rustflags @("-C", "target-cpu=$targetCpu", "-C", "profile-use=$profData"))
+cargo build --release -p izarravm --config (Rustflags @("-C", "profile-use=$profData"))
 $pgo = & $bin --headless-bench 2>$null
 
 # --- report -----------------------------------------------------------------
@@ -83,8 +78,8 @@ function Bench586($lines) {
         $f = $_ -split "\s+"; "{0,-10} {1,8}" -f $f[0], $f[8]
     }
 }
-Write-Host "`n=== baseline (release, v3) 586 rt_factor ===" -ForegroundColor Yellow
+Write-Host "`n=== baseline (portable release) 586 rt_factor ===" -ForegroundColor Yellow
 Bench586 $baseline
-Write-Host "=== PGO (release, v3 + profile-use) 586 rt_factor ===" -ForegroundColor Yellow
+Write-Host "=== PGO (portable release + profile-use) 586 rt_factor ===" -ForegroundColor Yellow
 Bench586 $pgo
 Write-Host "`nOptimized binary: $bin" -ForegroundColor Green
