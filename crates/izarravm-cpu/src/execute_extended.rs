@@ -19,6 +19,36 @@ fn bit_op(op: u8, value: u32, bit: u32) -> (bool, u32) {
 }
 
 impl CpuGsw {
+    fn near_return<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand_size: OperandSize,
+        release: u16,
+    ) -> ExecResult<()> {
+        let stack_offset = if self.stack_is_32bit() {
+            self.registers.esp()
+        } else {
+            u32::from(self.read_gpr16(4))
+        };
+        let target = self.read_memory_sized(
+            bus,
+            SegmentIndex::Ss,
+            stack_offset,
+            operand_size,
+            BusAccessKind::DataRead,
+        )? & operand_size.mask();
+        if target > self.registers.cs().limit {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
+        }
+        self.release_stack(operand_size.bytes() as u16);
+        self.set_eip(target);
+        self.release_stack(release);
+        Ok(())
+    }
+
     /// The two-byte bit-manipulation block (BT/BTS/BTR/BTC reg+imm8, BSF/BSR, SHLD/SHRD, CMPXCHG,
     /// XADD) through the decode/execute split. Each arm mirrors the former `execute_two_byte`
     /// handler verbatim — same operand wiring, same read/write order, same clocks — but consumes the
@@ -382,8 +412,8 @@ impl CpuGsw {
                                 Ok(clocks(11))
                             }
                             7 => {
-                                // INVLPG m: privileged on the 486. Flush the whole TLB (a
-                                // single-page invalidate is a permitted superset).
+                                // INVLPG m: privileged on the 486. The operand supplies an address;
+                                // its memory contents are not read.
                                 self.require_isa_generation(IsaGeneration::I486)?;
                                 if self.current_privilege_level() != 0 {
                                     return Err(InternalFault::Exception {
@@ -391,7 +421,18 @@ impl CpuGsw {
                                         error_code: None,
                                     });
                                 }
-                                self.flush_tlb_and_code_caches();
+                                let linear =
+                                    self.segment_linear_byte(memory.segment, memory.offset, false)?;
+                                self.tlb.invalidate(linear >> 12);
+                                self.data_read_pages.invalidate();
+                                self.data_write_pages.invalidate();
+                                #[cfg(all(
+                                    feature = "jit",
+                                    target_arch = "x86_64",
+                                    any(target_os = "windows", target_os = "linux")
+                                ))]
+                                self.jit_fast_map.invalidate_page(linear);
+                                self.invalidate_translation_code_caches();
                                 Ok(clocks(12))
                             }
                             _ => Err(undefined_opcode()),
@@ -800,17 +841,12 @@ impl CpuGsw {
             }
             0xc2 => {
                 // RET near, release imm16 bytes of arguments. `decode` fetched the release count into
-                // `imm`; pop the return offset (operand-size wide) THEN release, the same order the
-                // fused handler used.
-                let release = insn.imm as u16;
-                let target = self.pop(bus, operand_size)?;
-                self.set_eip(target & operand_size.mask());
-                self.release_stack(release);
+                // `imm`; validate the return offset before committing either stack adjustment.
+                self.near_return(bus, operand_size, insn.imm as u16)?;
                 Ok(clocks(10))
             }
             0xc3 => {
-                let target = self.pop(bus, operand_size)?;
-                self.set_eip(target & operand_size.mask());
+                self.near_return(bus, operand_size, 0)?;
                 Ok(clocks(10))
             }
             0xca => {

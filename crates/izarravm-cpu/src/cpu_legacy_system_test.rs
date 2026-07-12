@@ -1829,6 +1829,7 @@ fn v86_far_call_uses_real_mode_segments() {
     let (mut cpu, memory) = real_mode_cpu(&[0x9a, 0x34, 0x12, 0xa9, 0x8f], 0x200);
     cpu.control.cr0 |= CR0_PE;
     cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+    cpu.cpl = 3;
     cpu.registers.set_esp(0x100);
     let mut bus = TestBus::with_memory(memory);
     cpu.cycle(&mut bus).unwrap();

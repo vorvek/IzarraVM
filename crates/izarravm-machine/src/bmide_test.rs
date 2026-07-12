@@ -138,6 +138,24 @@ fn read_dma_is_asynchronous_and_supports_both_arming_orders() {
 }
 
 #[test]
+fn read_dma_reports_exact_guest_write_spans() {
+    let (mut controller, mut memory, mut disk) = active_read(false);
+    let deadline = controller.ticks_until_completion().unwrap();
+
+    let spans = controller
+        .advance_master_ticks_with_writes(deadline, &mut memory, &mut disk)
+        .expect("device-to-memory completion reports spans");
+
+    assert_eq!(
+        spans,
+        vec![DmaWriteSpan {
+            address: BUFFER as u32,
+            len: SECTOR as u32,
+        }]
+    );
+}
+
+#[test]
 fn write_dma_gathers_multiple_prds_without_a_pio_loop() {
     let mut controller = BusMasterIde::default();
     let mut memory = Memory::new(2 * 1024 * 1024).unwrap();

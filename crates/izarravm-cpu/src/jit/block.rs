@@ -185,6 +185,13 @@ pub(crate) fn changes_native_memory_context(insn: &DecodedInsn) -> bool {
 /// that fails it either ends the block (control transfer / IF-shadow change, as the terminal slot)
 /// or is a hard terminator (`!continuable`). Exposed for the terminator-contract test.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn is_interior_eligible(insn: &DecodedInsn) -> bool {
     insn.continuable
         && insn.prefixes == Prefixes::default()
@@ -227,6 +234,7 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
             Some(i) => i,
             None => break false, // cold ahead: the block is whatever we have so far (linear).
         };
+        let physical = cpu.decode_cache.line_phys_start(lin, d)?;
         // The run loop's own continuation gate: unprefixed + continuable + page-local. A slot that
         // fails it is a terminator; the block ends before it (linear).
         if insn.prefixes != Prefixes::default() || !insn.continuable {
@@ -246,6 +254,7 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
         slots.push(Slot {
             insn,
             lin: this_lin,
+            physical,
             kind: classify_slot(&insn),
         });
         if ends_block {
@@ -848,6 +857,13 @@ const SET_SHIFT_FLAGS_FN_OFF: i8 = 24;
 /// production auto-admission uses `try_admit_gated` with `reject_linear` set, and the forced-address
 /// override passes `reject_linear = false` directly.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn try_admit(cpu: &mut CpuGsw, entry_lin: u32, d: bool) -> Option<NonZeroU32> {
     try_admit_gated(cpu, entry_lin, d, false)
 }
@@ -943,7 +959,8 @@ pub(crate) fn try_admit_gated(
             // into the now-empty table (the clear() contract). The caller treats None as "not
             // admitted" and interprets instead.
             cpu.jit_regions.clear();
-            cpu.decode_cache.invalidate();
+            cpu.jit_direct.clear();
+            cpu.decode_cache.invalidate_and_clear_code_marks();
             cpu.perf.code_invalidations += 1;
             return None;
         }
@@ -954,7 +971,8 @@ pub(crate) fn try_admit_gated(
     // re-admits on the next warm hit. Coarse but O(1) and correct (JIT_REGION_TABLE_CAP).
     if cpu.jit_regions.len() >= JIT_REGION_TABLE_CAP {
         cpu.jit_regions.clear();
-        cpu.decode_cache.invalidate();
+        cpu.jit_direct.clear();
+        cpu.decode_cache.invalidate_and_clear_code_marks();
         cpu.perf.code_invalidations += 1;
         cpu.perf.jit_table_clears += 1;
         return None;

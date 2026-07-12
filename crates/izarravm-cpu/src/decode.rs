@@ -66,7 +66,8 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// Gated on `persona` (not a runtime bus flag) so the Accurate 386 class keeps
 /// byte-identical batch structure: `block_continuable` is called once
 /// per decode, and `CpuGsw::set_mode` unconditionally invalidates the decode cache
-/// (`self.decode_cache.invalidate()`), so every decode-cache line is re-decoded -- and this
+/// (`self.decode_cache.invalidate_and_clear_code_marks()`), so every decode-cache line is
+/// re-decoded -- and this
 /// admission re-resolved -- after any mode change.
 fn block_continuable(
     group: DecodeGroup,
@@ -78,12 +79,10 @@ fn block_continuable(
         return true;
     }
     // String ops (MOVS/CMPS/STOS/LODS/SCAS, REP or not) fall through, never touch a port
-    // (INS/OUTS are Misc and stay terminators), and never change CS. The REP forms are
-    // safe too because `run_string` executes the WHOLE repeat atomically inside one
-    // instruction dispatch (no mid-instruction yield or eip-resume seam exists), so the
-    // interrupt window is the instruction boundary in both run positions — identical to
-    // the per-instruction loop. A faulting iteration routes through finish_instruction's
-    // rewind exactly as on the one-instruction path.
+    // (INS/OUTS are Misc and stay terminators), and never change CS. A budgeted REP may return
+    // after a bounded chunk. The run loop stops at that return, exposes the REP start EIP, and
+    // resumes the saved decode only after the machine's event and interrupt checks. A faulting
+    // iteration still routes through finish_instruction's original-instruction rewind.
     if group == DecodeGroup::StringOps {
         return true;
     }
@@ -318,13 +317,11 @@ impl CpuGsw {
         // cached replay would under-charge them) and raises #UD for a non-lockable target. Replaying
         // it from the cache would skip both. LOCK is rare, so re-decoding it every time is free.
         if !insn.prefixes.lock {
-            // Mark the physical block(s) this instruction occupies so a later write into them
-            // invalidates the cache (cross-page SMC). decode just warmed the code-page translation,
-            // so resolving the physical start is a cache hit (and the identity map without paging). A
-            // page-straddling instruction under paging marks the tail block from the contiguous
-            // physical of its first page, which is the one remaining exotic gap.
+            // `put` owns both cache insertion and SMC-watch acquisition. Decode just warmed the
+            // first code-page translation, so resolving the physical start is a cache hit (and the
+            // identity map without paging). Page-straddling instructions remain uncached because
+            // their next linear page can map to a noncontiguous physical page.
             let physical = self.translate_code_linear(bus, lin)?;
-            self.decode_cache.mark_code_range(physical, insn.len);
             self.decode_cache
                 .put(lin, insn, cs.default_size_32, physical);
         }
@@ -333,8 +330,10 @@ impl CpuGsw {
 
     /// Charge the instruction-fetch bus clocks for a decode-cache HIT and advance eip past the
     /// instruction. This is an I-CACHE HIT: the (already-decoded) instruction is served from the
-    /// instruction cache, so `charge_instruction_fetch_run` charges it as a SINGLE I-cache access for
-    /// cacheable RAM (the bus collapses the run to one cycle there; ROM/device code stays per byte).
+    /// instruction cache, so `charge_physical_instruction_fetch_run` charges it as a SINGLE I-cache
+    /// access for cacheable RAM (the bus collapses the run to one cycle there; ROM/device code stays
+    /// per byte). The decode line supplies its translated physical start; linear observation stays
+    /// on `note_code_fetch_linear`.
     ///
     /// Calibration note (B-T8/B-T9): the COLD decode path (`decode` -> `fetch_u8`) still charges one
     /// fetch cycle per byte PLUS the opcode double-charge (`read_prefixes` peeks the opcode, then
@@ -351,7 +350,26 @@ impl CpuGsw {
         lin: u32,
         len: u8,
     ) -> ExecResult<()> {
-        bus.charge_instruction_fetch_run(lin, u32::from(len))?;
+        bus.note_code_fetch_linear(lin);
+        let d = self.registers.cs().default_size_32;
+        let physical = match self.decode_cache.line_phys_start(lin, d) {
+            Some(physical) => physical,
+            None => self.translate_code_linear(bus, lin)?,
+        };
+        let count = u32::from(len);
+        let first_count = count.min(0x1000 - (lin & 0x0fff));
+        if first_count == count {
+            bus.charge_physical_instruction_fetch_run(physical, count)?;
+        } else {
+            let tail_linear = lin.wrapping_add(first_count);
+            let tail_physical = self.translate_code_linear(bus, tail_linear)?;
+            if tail_physical == physical.wrapping_add(first_count) {
+                bus.charge_physical_instruction_fetch_run(physical, count)?;
+            } else {
+                bus.charge_physical_instruction_fetch_run(physical, first_count)?;
+                bus.charge_physical_instruction_fetch_run(tail_physical, count - first_count)?;
+            }
+        }
         self.registers.eip = self.registers.eip.wrapping_add(u32::from(len));
         Ok(())
     }

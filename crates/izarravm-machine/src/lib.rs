@@ -11,7 +11,7 @@ use izarravm_audio::{
 };
 use izarravm_bus::{
     BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead,
-    DirectMemoryWrite, DirectPage, Memory, TracingMode,
+    DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
 };
 use izarravm_core::{
     CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,
@@ -28,6 +28,7 @@ use izarravm_video::{
 pub use izarravm_video::{MARGO_ID_VALUE, VideoMode};
 #[cfg(test)]
 use izarravm_video::{Margo, Vga, VgaRaster};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 mod ata;
@@ -177,6 +178,37 @@ pub enum MachineError {
     InvalidBootImageSize(usize),
 }
 
+/// Process default for CPU execution in machines constructed afterwards.
+///
+/// The application selects this once before it creates worker threads. Library
+/// users keep automatic native admission unless they explicitly opt into the
+/// interpreter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecutionBackend {
+    #[default]
+    Automatic,
+    Interpreter,
+}
+
+static PROCESS_INTERPRETER_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Set the execution backend inherited by subsequently constructed machines.
+pub fn set_process_execution_backend(backend: ExecutionBackend) {
+    PROCESS_INTERPRETER_ONLY.store(
+        matches!(backend, ExecutionBackend::Interpreter),
+        Ordering::Release,
+    );
+}
+
+/// Return the execution backend currently inherited by new machines.
+pub fn process_execution_backend() -> ExecutionBackend {
+    if PROCESS_INTERPRETER_ONLY.load(Ordering::Acquire) {
+        ExecutionBackend::Interpreter
+    } else {
+        ExecutionBackend::Automatic
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WaitStateProfile {
     pub ram: u8,
@@ -279,47 +311,31 @@ pub enum ActiveDisplay {
 /// wall second, so a guest that never polls pays ~140k clocks/s (~0.2 percent).
 pub const VRETRACE_PEEK_CLOCKS: u64 = 2_000;
 
-/// Per-mode VIDEO-window wait states for the Approximate class (486/586).
-/// A real VGA card sits across an expansion bus whose per-access latency does
-/// not scale with CPU speed, but the flat
-/// `WaitStateProfile.video = 1` rode `scale_bus` (486 x1/3, 586 x7/30), pricing a
-/// VRAM byte write at ~15 ns / ~3.5 ns where real VLB / PCI writes cost
-/// ~100-450 ns. Doom is framebuffer-bound (measured: ~61,500 VRAM data accesses
-/// per frame at max detail), so the 486/586 personas ran demo3 1.27x / 1.56x too
-/// fast while every synthetic bench (no VRAM traffic) sat era-exact. These values
-/// are calibrated POST-`scale_bus`: the charged clocks are `(2 + ws) *
-/// bus_num/bus_den`.
+/// Per-mode video-window wait states for the Approximate class (486/586).
+/// A real VGA card sits across an expansion bus whose access latency does not
+/// scale with CPU speed. The flat `WaitStateProfile.video = 1` rode `scale_bus`
+/// (486 x1/3, 586 x7/30), which priced VRAM far below VLB and PCI latency. Doom
+/// issues about 131 million VGA accesses in the max-detail demo3 timedemo, so it
+/// exposes this error while the synthetic CPU benchmarks do not.
 ///
-/// The 586 value of 88 produces 913 realtics, or 81.8 fps, near the ~82 fps
-/// P55C target. A sweep confirmed the synthetic bench cycles-per-iteration columns
-/// (sieve 120503.05, dhrystone 663.62, all four modes) are byte-identical across
-/// the sweep because the benches do no VRAM traffic. Quake's software renderer
-/// is less isolated: nosound demo1 changes from 42.4 fps at ws=62 to 41.5 fps at
-/// ws=88, a 2.1 percent shift compared with Doom's 15.3 percent shift.
+/// Narrow SMC invalidation removed an accidental cold-decode timing tax. The 586
+/// value was recalibrated at that point, but the 486 value was left stale. The
+/// current values are measured after that change and after `scale_bus`:
 ///
-/// The shipped 486 value stays at the flat 1 (see the arm comment: with honest
-/// tick delivery the DX2-66 persona hits its target with no surcharge, so no
-/// VLB-class value ships). If `bus_timing` is ever retuned, recalibrate these with
-/// it. The Accurate 386 class keeps the frozen `WaitStateProfile.video`
-/// path bit-for-bit (byte-identity gate).
+/// - 486 ws=45: 2980 realtics, 25.1 fps (target about 3000 realtics)
+/// - 586 ws=75: 833 realtics, 89.7 fps (target 820 to 850 realtics)
+///
+/// Interpreter, direct-page, REP, and native VGA paths all use this table. The
+/// Accurate 386 class keeps the frozen `WaitStateProfile.video` path. Recalibrate
+/// these values if `bus_timing` changes.
 const fn video_wait_states_approx(persona: CpuPersona) -> u8 {
     match persona {
-        // Unreachable in practice (Accurate class takes the profile path), but
-        // keep the frozen classes on the profile default should routing change.
+        // Unreachable in practice because the Accurate class takes the profile path.
         CpuPersona::I386 => 1,
-        // The 486 keeps the flat profile value: once the batch cap counts bus
-        // clocks (no more coalesced IRQ0 ticks), the DX2-66 persona lands the
-        // 29-30 fps demo3 target with no video surcharge. Its
-        // Dhrystone-pinned bus dial already prices every access fat enough that
-        // the real VLB video cost is absorbed. Charging the physical ~130 ns on
-        // top would undershoot the target (~27 fps). Composition infidelity
-        // accepted and recorded: the 486's Doom time leans more on ordinary bus
-        // than a real DX2-66's (which leans on the video bus); the NET frame
-        // rate is what is calibrated. Revisit alongside any bus_timing retune.
-        CpuPersona::I486 => 1,
-        // ws=88 -> 913 realtics -> 81.8 fps (era target ~82).
-        // See the function-level doc for the sweep data and the isolation proof.
-        CpuPersona::I586 => 88,
+        // (2 + 45) * 1/3 clocks at 66 MHz is about 237 ns per access.
+        CpuPersona::I486 => 45,
+        // (2 + 75) * 7/30 clocks at 200 MHz is about 90 ns per access.
+        CpuPersona::I586 => 75,
     }
 }
 
@@ -474,7 +490,7 @@ pub struct BandwidthSample {
     pub clocks: u64,
 }
 
-const MACHINE_PROFILE_PHASES: usize = 5;
+const MACHINE_PROFILE_PHASES: usize = 7;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MachineProfilePhase {
@@ -485,6 +501,7 @@ pub struct MachineProfilePhase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MachineHostProfileSnapshot {
+    pub machine_phase_timing_enabled: bool,
     pub phases: Vec<MachineProfilePhase>,
 }
 
@@ -492,6 +509,8 @@ pub struct MachineHostProfileSnapshot {
 enum MachineProfilePhaseKind {
     CpuBatch,
     AdvanceDevices,
+    VideoConversion,
+    AudioRender,
     SoftInt,
     ConsoleFlush,
     HaltFastForward,
@@ -501,6 +520,8 @@ impl MachineProfilePhaseKind {
     const ALL: [Self; MACHINE_PROFILE_PHASES] = [
         Self::CpuBatch,
         Self::AdvanceDevices,
+        Self::VideoConversion,
+        Self::AudioRender,
         Self::SoftInt,
         Self::ConsoleFlush,
         Self::HaltFastForward,
@@ -510,9 +531,11 @@ impl MachineProfilePhaseKind {
         match self {
             Self::CpuBatch => 0,
             Self::AdvanceDevices => 1,
-            Self::SoftInt => 2,
-            Self::ConsoleFlush => 3,
-            Self::HaltFastForward => 4,
+            Self::VideoConversion => 2,
+            Self::AudioRender => 3,
+            Self::SoftInt => 4,
+            Self::ConsoleFlush => 5,
+            Self::HaltFastForward => 6,
         }
     }
 
@@ -520,6 +543,8 @@ impl MachineProfilePhaseKind {
         match self {
             Self::CpuBatch => "cpu_batch",
             Self::AdvanceDevices => "advance_devices",
+            Self::VideoConversion => "video_conversion",
+            Self::AudioRender => "audio_render",
             Self::SoftInt => "soft_int",
             Self::ConsoleFlush => "console_flush",
             Self::HaltFastForward => "halt_fast_forward",
@@ -536,14 +561,16 @@ struct MachineProfilePhaseState {
 #[derive(Clone)]
 struct MachineHostProfile {
     enabled: bool,
-    phases: [MachineProfilePhaseState; MACHINE_PROFILE_PHASES],
+    phases: std::cell::Cell<[MachineProfilePhaseState; MACHINE_PROFILE_PHASES]>,
 }
 
 impl Default for MachineHostProfile {
     fn default() -> Self {
         Self {
             enabled: false,
-            phases: [MachineProfilePhaseState::default(); MACHINE_PROFILE_PHASES],
+            phases: std::cell::Cell::new(
+                [MachineProfilePhaseState::default(); MACHINE_PROFILE_PHASES],
+            ),
         }
     }
 }
@@ -563,10 +590,9 @@ impl std::fmt::Debug for MachineHostProfile {
 
 impl MachineHostProfile {
     fn enable(&mut self) {
-        *self = Self {
-            enabled: true,
-            phases: [MachineProfilePhaseState::default(); MACHINE_PROFILE_PHASES],
-        };
+        self.enabled = true;
+        self.phases
+            .set([MachineProfilePhaseState::default(); MACHINE_PROFILE_PHASES]);
     }
 
     fn disable(&mut self) {
@@ -579,23 +605,26 @@ impl MachineHostProfile {
     }
 
     #[inline]
-    fn record(&mut self, phase: MachineProfilePhaseKind, start: Option<std::time::Instant>) {
+    fn record(&self, phase: MachineProfilePhaseKind, start: Option<std::time::Instant>) {
         let Some(start) = start else {
             return;
         };
-        let bucket = &mut self.phases[phase.index()];
+        let mut phases = self.phases.get();
+        let bucket = &mut phases[phase.index()];
         bucket.count += 1;
         bucket.wall_ns = bucket
             .wall_ns
             .saturating_add(duration_ns_u64(start.elapsed()));
+        self.phases.set(phases);
     }
 
     fn snapshot(&self) -> MachineHostProfileSnapshot {
         MachineHostProfileSnapshot {
+            machine_phase_timing_enabled: self.enabled,
             phases: MachineProfilePhaseKind::ALL
                 .iter()
                 .map(|&phase| {
-                    let bucket = self.phases[phase.index()];
+                    let bucket = self.phases.get()[phase.index()];
                     MachineProfilePhase {
                         name: phase.name(),
                         wall_ns: bucket.wall_ns,
@@ -664,12 +693,15 @@ pub struct Machine {
     // run_until_tick and the accrual in read_io. Consumed (zeroed) each batch via
     // mem::take.
     isa_io_batch_clocks: u64,
-    // Set when a bus-side DMA block copy or HLE service writes guest RAM. The
-    // run loop drops CPU prefetch and decoded code before the next instruction.
+    // Set only when a bus-side DMA block copy writes guest RAM without exposing
+    // its destination range. Range-aware HLE and device paths notify the CPU directly.
     device_wrote_memory: bool,
     // Set when the RAM direct-map table changes, so cached host pointers in the CPU are dropped
     // before any later guest access can use a stale RAM page classification.
     direct_map_changed: bool,
+    // Set when only a device data aperture changes. The CPU drops data pointers
+    // and its FastMap while retaining decoded and compiled code.
+    direct_data_map_changed: bool,
     host_profile: MachineHostProfile,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
@@ -945,18 +977,21 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
-fn jit_auto_admit_policy(value: Option<&str>, jit_available: bool) -> bool {
-    jit_available && !matches!(value, Some("" | "0"))
+fn jit_auto_admit_policy(
+    value: Option<&str>,
+    jit_available: bool,
+    backend: ExecutionBackend,
+) -> bool {
+    backend == ExecutionBackend::Automatic && jit_available && !matches!(value, Some("" | "0"))
 }
 
-fn jit_auto_admit_default() -> bool {
+fn jit_auto_admit_default(backend: ExecutionBackend) -> bool {
     let value = std::env::var("IZARRAVM_JIT").ok();
-    let jit_available = cfg!(feature = "jit")
-        && cfg!(all(
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ));
-    jit_auto_admit_policy(value.as_deref(), jit_available)
+    jit_auto_admit_policy(
+        value.as_deref(),
+        izarravm_cpu::native_backend_available(),
+        backend,
+    )
 }
 
 impl Machine {
@@ -1024,6 +1059,7 @@ impl Machine {
             isa_io_batch_clocks: 0,
             device_wrote_memory: false,
             direct_map_changed: false,
+            direct_data_map_changed: false,
             host_profile: MachineHostProfile::default(),
             pending_toka_service: None,
             toka_service_status: 0,
@@ -1111,7 +1147,12 @@ impl Machine {
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
-        machine.set_jit_auto_admit(jit_auto_admit_default());
+        let execution_backend = process_execution_backend();
+        #[cfg(feature = "jit")]
+        machine
+            .cpu
+            .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
+        machine.set_jit_auto_admit(jit_auto_admit_default(execution_backend));
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.
@@ -1275,6 +1316,14 @@ impl Machine {
         self.cpu.enable_profiling(sample_stride);
     }
 
+    /// Measure whole-machine batch phases without enabling the per-instruction CPU sampler.
+    /// This keeps native block execution enabled while attributing host time around the VM's
+    /// existing subsystem boundaries.
+    pub fn enable_machine_profiling(&mut self) {
+        self.host_profile.enable();
+        self.cpu.disable_profiling();
+    }
+
     pub fn disable_host_profiling(&mut self) {
         self.host_profile.disable();
         self.cpu.disable_profiling();
@@ -1282,6 +1331,12 @@ impl Machine {
 
     pub fn host_profile_snapshot(&self) -> MachineHostProfileSnapshot {
         self.host_profile.snapshot()
+    }
+
+    /// Raw bus clocks charged by instruction fetches and data accesses since reset.
+    /// The machine timeline applies the active mode's bus ratio separately.
+    pub fn raw_bus_clocks(&self) -> u64 {
+        self.trace.elapsed_clocks()
     }
 
     pub fn memory(&self) -> &Memory {
@@ -1519,10 +1574,12 @@ impl Machine {
 
     fn write_guest_block(&mut self, addr: u32, bytes: &[u8]) {
         for (index, &byte) in bytes.iter().enumerate() {
-            self.write_physical_u8(addr + index as u32, byte);
+            self.write_physical_u8(addr.wrapping_add(index as u32), byte);
         }
-        if !bytes.is_empty() {
-            self.device_wrote_memory = true;
+        if let Ok(width) = u32::try_from(bytes.len()) {
+            self.cpu.note_device_memory_write_range(addr, width);
+        } else if !bytes.is_empty() {
+            self.cpu.note_device_memory_write();
         }
     }
 
@@ -1714,6 +1771,7 @@ impl Machine {
     /// codec, and CD-audio through the card's CD-in) but NOT to the PC speaker,
     /// which is motherboard hardware that does not pass through the card's amp.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        let render_start = self.host_profile.start();
         let card_amp = self.card_amp;
         let speaker_volume = self.speaker_volume;
         let opl_native: Vec<(i32, i32)> = (0..native_samples)
@@ -1783,7 +1841,7 @@ impl Machine {
         // AUDIO is active. This realizes CD audio through the ReSonique 2 DAC.
         let (cd_l_gain, cd_r_gain) = self.mixer.cd_gain();
         let cd = self.pull_cd_audio_samples(len);
-        (0..len)
+        let mixed = (0..len)
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
@@ -1814,7 +1872,10 @@ impl Machine {
                 let r = clamp_i16(card_r as i32 + s);
                 (l, r)
             })
-            .collect()
+            .collect();
+        self.host_profile
+            .record(MachineProfilePhaseKind::AudioRender, render_start);
+        mixed
     }
 
     /// Pull `count` stereo CD-audio samples (44.1 kHz, the DAC rate) from the
@@ -1968,6 +2029,7 @@ struct MachineBus<'a> {
     isa_io_clocks: &'a mut u64,
     device_wrote_memory: &'a mut bool,
     direct_map_changed: &'a mut bool,
+    direct_data_map_changed: &'a mut bool,
     // A copy of the current read_io call's core_clocks_so_far argument (CPU core
     // clocks charged by prior instructions in this straight-line run, not
     // including the in-flight IN). Written at the top of every read_io call so a

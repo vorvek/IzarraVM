@@ -47,6 +47,249 @@ fn cli_parses_munt_roms_and_stable_external_port_identity() {
 }
 
 #[test]
+fn cli_accepts_explicit_interpreter_backend() {
+    let cli = Cli::try_parse_from(["izarravm", "--interpreter"]).unwrap();
+    assert!(cli.interpreter);
+}
+
+#[test]
+fn execution_backend_requires_avx2_only_for_native_builds() {
+    assert_eq!(
+        requested_execution_backend(false, true, true),
+        Ok(ExecutionBackend::Automatic)
+    );
+    assert!(
+        requested_execution_backend(false, true, false)
+            .unwrap_err()
+            .contains("AVX2")
+    );
+    assert_eq!(
+        requested_execution_backend(true, true, false),
+        Ok(ExecutionBackend::Interpreter)
+    );
+    assert_eq!(
+        requested_execution_backend(false, false, false),
+        Ok(ExecutionBackend::Interpreter)
+    );
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn windows_build_keeps_avx2_runtime_detectable() {
+    assert!(
+        !cfg!(target_feature = "avx2"),
+        "the portable host binary must not enable AVX2 at compile time"
+    );
+}
+
+#[test]
+fn cli_accepts_hdd_folder_profile_json_output() {
+    let cli = Cli::try_parse_from([
+        "izarravm",
+        "--hdd-folder",
+        "game",
+        "--profile-json",
+        "results/run.json",
+        "--expect-test-exit",
+    ])
+    .unwrap();
+
+    assert_eq!(cli.hdd_folder.as_deref(), Some(Path::new("game")));
+    assert_eq!(
+        cli.profile_json.as_deref(),
+        Some(Path::new("results/run.json"))
+    );
+    assert!(cli.expect_test_exit);
+}
+
+#[test]
+fn machine_profile_environment_gate_is_explicit() {
+    for value in [None, Some(""), Some("0")] {
+        assert!(!machine_profile_requested(value));
+    }
+    for value in [Some("1"), Some("true"), Some("enabled")] {
+        assert!(machine_profile_requested(value));
+    }
+}
+
+#[test]
+fn cli_rejects_multiple_run_modes() {
+    for arguments in [
+        vec![
+            "izarravm",
+            "--hdd-folder",
+            "game",
+            "--headless-profile-exe",
+            "probe.exe",
+        ],
+        vec!["izarravm", "--hdd-folder", "game", "--headless-bench"],
+    ] {
+        assert!(Cli::try_parse_from(arguments).is_err());
+    }
+}
+
+#[test]
+fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
+    let dir = munt_test_dir("hdd-profile");
+    let path = dir.join("run.json");
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw486;
+    let mut machine = Machine::new_raw_program(profile, &[0xb8, 0x00, 0x4c, 0xcd, 0x21])
+        .expect("build raw machine");
+    machine.enable_machine_profiling();
+    let stop = machine
+        .run_until_halt_or_cycles(100_000)
+        .expect("run raw program");
+
+    write_hdd_profile_json(
+        &path,
+        Path::new("fixture"),
+        GswMode::Gsw486,
+        100_000,
+        std::time::Duration::from_secs(1),
+        &stop,
+        Some((35, 70)),
+        &machine,
+    )
+    .expect("write profile JSON");
+
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(report["schema"], "izarravm-hdd-profile-v1");
+    assert_eq!(report["mode"], "486");
+    assert_eq!(report["stop"]["kind"], "dos_exit");
+    assert_eq!(report["stop"]["code"], 0);
+    assert_eq!(report["timedemo"]["gametics"], 35);
+    assert_eq!(report["machine_phase_timing_enabled"], true);
+    assert!(report["guest_seconds"].as_f64().unwrap() > 0.0);
+    assert!(report["direct_native_coverage"].as_f64().is_some());
+    assert!(
+        report["direct_slow_exits_per_100_instructions"]
+            .as_f64()
+            .is_some()
+    );
+    assert!(report["perf"]["instructions"].as_u64().unwrap() > 0);
+    assert!(report["raw_bus_clocks"].as_u64().unwrap() > 0);
+    assert!(report["perf"]["jit_direct_entries"].as_u64().is_some());
+    assert!(report["perf"]["jit_direct_insns"].as_u64().is_some());
+    assert!(report["perf"]["jit_direct_side_exits"].as_u64().is_some());
+    for field in [
+        "jit_direct_exit_cross_page_or_alignment",
+        "jit_direct_exit_unavailable_or_kind",
+        "jit_direct_exit_permission",
+        "jit_direct_exit_code_watch",
+        "jit_direct_exit_other",
+        "jit_direct_arena_compactions",
+        "jit_direct_arena_compaction_live_blocks",
+        "jit_direct_arena_compaction_bytes",
+        "jit_direct_arena_compaction_failures",
+        "jit_direct_reject_observer",
+        "jit_direct_reject_interrupt_shadow",
+        "jit_direct_reject_aggregate_accounting",
+        "jit_direct_reject_mode_key",
+        "jit_direct_reject_x87_top",
+        "jit_direct_reject_cs_layout",
+        "jit_direct_reject_cpl",
+        "jit_direct_reject_data_segment",
+        "jit_direct_reject_alignment",
+        "jit_direct_reject_fetch_limit",
+        "jit_direct_reject_zero_budget",
+    ] {
+        assert!(report["perf"][field].as_u64().is_some());
+    }
+    assert!(report["classified_wall_ns"].as_u64().is_some());
+    assert!(report["unattributed_wall_ns"].as_u64().is_some());
+    assert!(
+        report["classified_wall_ns"].as_u64().unwrap()
+            <= std::time::Duration::from_secs(1).as_nanos() as u64
+    );
+    assert!(
+        report["machine_phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase["name"] == "cpu_batch" && phase["count"].as_u64().unwrap() > 0)
+    );
+    for name in ["video_conversion", "audio_render"] {
+        assert!(
+            report["machine_phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|phase| phase["name"] == name)
+        );
+    }
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn hdd_profile_json_does_not_enable_machine_phase_timing() {
+    let dir = munt_test_dir("hdd-profile-uninstrumented");
+    let path = dir.join("run.json");
+    let mut machine = Machine::new_raw_program(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        &[0xb8, 0x00, 0x4c, 0xcd, 0x21],
+    )
+    .expect("build raw machine");
+    let stop = machine
+        .run_until_halt_or_cycles(100_000)
+        .expect("run raw program");
+
+    write_hdd_profile_json(
+        &path,
+        Path::new("fixture"),
+        GswMode::Gsw386,
+        100_000,
+        std::time::Duration::from_secs(1),
+        &stop,
+        None,
+        &machine,
+    )
+    .expect("write profile JSON");
+
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(report["machine_phase_timing_enabled"], false);
+    assert_eq!(report["classified_wall_ns"], 0);
+    assert!(
+        report["machine_phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|phase| phase["wall_ns"] == 0 && phase["count"] == 0)
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stop_reason_json_preserves_each_outcome() {
+    let cases = [
+        (StopReason::Halted, json!({ "kind": "halted" })),
+        (
+            StopReason::CycleLimit { requested: 123 },
+            json!({ "kind": "cycle_limit", "requested": 123 }),
+        ),
+        (
+            StopReason::CpuError("bad opcode".into()),
+            json!({ "kind": "cpu_error", "message": "bad opcode" }),
+        ),
+        (
+            StopReason::DosExit { code: 7 },
+            json!({ "kind": "dos_exit", "code": 7 }),
+        ),
+        (
+            StopReason::TestExit { code: 9 },
+            json!({ "kind": "test_exit", "code": 9 }),
+        ),
+    ];
+
+    for (stop, expected) in cases {
+        assert_eq!(stop_reason_json(&stop), expected);
+    }
+}
+
+#[test]
 fn saved_midi_preferences_fill_only_keys_absent_from_cli_and_toml() {
     let mut config = MidiConfig::default();
     let saved = MidiConfig {

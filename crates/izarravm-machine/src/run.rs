@@ -170,6 +170,10 @@ impl Machine {
             if self.direct_map_changed {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
+                self.direct_data_map_changed = false;
+            } else if self.direct_data_map_changed {
+                self.cpu.note_direct_data_map_changed();
+                self.direct_data_map_changed = false;
             }
             // pending_soft_int is posted at a stub LANDING (V86 or real mode), so
             // for a monitor-reflected V86 INT it is set only after the monitor has
@@ -269,6 +273,7 @@ impl Machine {
                     isa_io_batch_clocks,
                     device_wrote_memory,
                     direct_map_changed,
+                    direct_data_map_changed,
                     #[cfg(test)]
                     test_prior_core_pushes,
                     ..
@@ -322,6 +327,7 @@ impl Machine {
                     isa_io_clocks: isa_io_batch_clocks,
                     device_wrote_memory,
                     direct_map_changed,
+                    direct_data_map_changed,
                     core_clocks_so_far: 0,
                     prior_runs_core_clocks: 0,
                     timeline_at_batch_start,
@@ -417,9 +423,9 @@ impl Machine {
                             .last_mut()
                             .expect("opened at batch entry")
                             .push(bus.prior_runs_core_clocks);
-                        match cpu.run_straight_line(&mut bus, remaining) {
+                        match cpu.run_budgeted(&mut bus, remaining) {
                             Ok(o) => {
-                                batch_core = batch_core.saturating_add(o.core_clocks);
+                                batch_core = batch_core.saturating_add(o.consumed_core_clocks);
                                 if o.halted {
                                     halted = true;
                                     break;
@@ -609,14 +615,18 @@ impl Machine {
                     if self.keyboard.a20_enabled() != a20_before {
                         self.cpu.note_a20_changed();
                     }
-                    // A bus-side DMA copy or HLE service wrote guest RAM this step,
-                    // bypassing CPU SMC tracking. Drop prefetch and decoded code.
+                    // A bus-side DMA copy without a reported destination range wrote guest RAM.
+                    // Range-aware HLE, floppy, and bus-master IDE paths notify the CPU directly.
                     if self.device_wrote_memory {
                         self.cpu.note_device_memory_write();
                     }
                     if self.direct_map_changed {
                         self.cpu.note_direct_map_changed();
                         self.direct_map_changed = false;
+                        self.direct_data_map_changed = false;
+                    } else if self.direct_data_map_changed {
+                        self.cpu.note_direct_data_map_changed();
+                        self.direct_data_map_changed = false;
                     }
                 }
                 Err(error) => {

@@ -564,6 +564,7 @@ fn nested_fault_during_delivery_reports_truthfully_not_as_idt_limit() {
         }),
         start_eip,
         start_cs,
+        0,
         None,
         None,
     );

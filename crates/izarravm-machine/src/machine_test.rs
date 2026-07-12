@@ -12,13 +12,46 @@ const BIOS_TEXT_WHITE: u8 = 0x3F;
 
 #[test]
 fn jit_auto_admission_policy_defaults_on_only_when_available() {
-    assert!(jit_auto_admit_policy(None, true));
-    assert!(jit_auto_admit_policy(Some("1"), true));
-    assert!(jit_auto_admit_policy(Some("yes"), true));
-    assert!(!jit_auto_admit_policy(Some("0"), true));
-    assert!(!jit_auto_admit_policy(Some(""), true));
-    assert!(!jit_auto_admit_policy(None, false));
-    assert!(!jit_auto_admit_policy(Some("1"), false));
+    assert!(jit_auto_admit_policy(
+        None,
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(jit_auto_admit_policy(
+        Some("1"),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(jit_auto_admit_policy(
+        Some("yes"),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some("0"),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some(""),
+        true,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        None,
+        false,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some("1"),
+        false,
+        ExecutionBackend::Automatic
+    ));
+    assert!(!jit_auto_admit_policy(
+        Some("1"),
+        true,
+        ExecutionBackend::Interpreter
+    ));
 }
 
 // The CacheModel tests below exercise tier IDENTITY, not the wait-state numbers:
@@ -302,6 +335,7 @@ fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R
         isa_io_clocks: &mut machine.isa_io_batch_clocks,
         device_wrote_memory: &mut machine.device_wrote_memory,
         direct_map_changed: &mut machine.direct_map_changed,
+        direct_data_map_changed: &mut machine.direct_data_map_changed,
         core_clocks_so_far: 0,
         prior_runs_core_clocks: 0,
         timeline_at_batch_start: machine.timeline,
@@ -510,6 +544,9 @@ mod midi;
 #[cfg(test)]
 #[path = "machine_mouse_test.rs"]
 mod mouse;
+#[cfg(test)]
+#[path = "machine_native_bus_timing_test.rs"]
+mod native_bus_timing;
 #[cfg(test)]
 #[path = "machine_storage_test.rs"]
 mod storage;

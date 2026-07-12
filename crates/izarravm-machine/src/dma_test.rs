@@ -645,7 +645,7 @@ fn one_device_request_consumes_one_channel_cycle() {
     let mut memory = Memory::new(0x40).unwrap();
 
     assert_eq!(dma.master.channels[2].transfer_cycles, 0);
-    dma.write_byte(2, &mut memory, 0xA5).unwrap();
+    assert_eq!(dma.write_byte(2, &mut memory, 0xA5), Some(0x20));
     let channel = &dma.master.channels[2];
     assert_eq!(channel.transfer_cycles, 1);
     assert_eq!(channel.cur_addr, 0x0021);

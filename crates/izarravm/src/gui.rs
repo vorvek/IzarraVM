@@ -3,19 +3,22 @@
 
 #[path = "gui_runtime.rs"]
 mod runtime;
+#[path = "gui_ui.rs"]
+mod ui;
 
 pub use runtime::run;
 
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
-use izarravm_audio::{AudioPlayer, AudioSink, MidiEngine};
+use izarravm_audio::{AudioDebugSnapshot, AudioPlayer, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
 use izarravm_input::HostKeyboard;
-use izarravm_machine::{Machine, MachineProfile, StopReason, VRETRACE_PEEK_CLOCKS};
+use izarravm_machine::{Machine, MachineProfile, StopReason};
+use serde::Serialize;
 use std::cell::Cell;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -52,12 +55,15 @@ fn volume_gain(volume: f32) -> f32 {
     volume.clamp(0.0, 1.0).powi(3)
 }
 
-/// How long the emulation thread sleeps between work slices. The wall-clock
-/// catch-up pacing absorbs the coarse Windows timer granularity, so realtime
+/// How long the emulation thread sleeps when the guest is caught up. The
+/// wall-clock pacing absorbs the coarse Windows timer granularity, so realtime
 /// holds regardless of the exact wake interval as long as it stays well under
 /// the 50 ms master-tick budget cap.
 const EMU_SLICE: Duration = Duration::from_millis(1);
+const FAST_EMU_QUANTUM_TICKS: u64 = MASTER_CLOCK_HZ / 1000;
 const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_PROFILE_INTERVAL: Duration = Duration::from_secs(1);
+const RUNTIME_PROFILE_SCHEMA: &str = "izarravm.runtime.v1";
 
 /// Ceiling on how often accumulated mouse motion is flushed into the guest,
 /// independent of (and generally faster than) the video refresh rate that
@@ -129,25 +135,55 @@ fn words_to_rgba(words: &[u32], width: usize, height: usize) -> Vec<u8> {
 }
 
 /// Refill the pacing credit by the wall time elapsed this slice, capping the
-/// backlog at `cap`. The cap forgives a long host stall (the OS starving the
-/// thread) instead of banking it, so the guest never sprints above realtime to
-/// repay it. The caller runs `credit.max(0)` master ticks, then subtracts what
-/// actually ran. A floppy read that overshoots its budget drives credit negative
-/// and holds the guest until wall-clock catches up.
+/// backlog at `cap`. The cap limits catch-up after a long host stall to 50 ms and
+/// forgives anything beyond it. The caller subtracts only guest time that actually
+/// ran. A floppy read that overshoots its budget drives credit negative and holds
+/// the guest until wall-clock catches up.
 fn refill_credit(credit: i64, dt: Duration, cap: u64) -> i64 {
     let wall_ticks =
         (dt.as_nanos() * u128::from(MASTER_CLOCK_HZ) / 1_000_000_000).min(i64::MAX as u128) as i64;
     credit.saturating_add(wall_ticks).min(cap as i64)
 }
 
-fn duration_for_master_ticks(master_ticks: u64) -> Duration {
-    let seconds = master_ticks / MASTER_CLOCK_HZ;
-    let remainder = master_ticks % MASTER_CLOCK_HZ;
-    let nanos = (u128::from(remainder) * 1_000_000_000).div_ceil(u128::from(MASTER_CLOCK_HZ));
-    Duration::new(
-        seconds.saturating_add((nanos / 1_000_000_000) as u64),
-        (nanos % 1_000_000_000) as u32,
-    )
+fn settle_credit(credit: i64, executed_ticks: u64, dt: Duration, cap: u64) -> i64 {
+    let executed = i64::try_from(executed_ticks).unwrap_or(i64::MAX);
+    refill_credit(credit.saturating_sub(executed), dt, cap)
+}
+
+fn execution_budget(credit: i64, approximate: bool) -> u64 {
+    let available = credit.max(0) as u64;
+    if approximate {
+        available.min(FAST_EMU_QUANTUM_TICKS)
+    } else {
+        available
+    }
+}
+
+fn halted_device_top_up(budget: u64, executed: u64, halted: bool) -> u64 {
+    if halted {
+        budget.saturating_sub(executed)
+    } else {
+        0
+    }
+}
+
+fn should_publish_frame(
+    current_seq: u64,
+    published_seq: u64,
+    consumed_seq: u64,
+    frame_generation: Option<u64>,
+    published_generation: Option<u64>,
+) -> bool {
+    current_seq != published_seq
+        && consumed_seq == published_seq
+        && !matches!(
+            (frame_generation, published_generation),
+            (Some(current), Some(published)) if current == published
+        )
+}
+
+fn emulation_should_sleep(credit: i64, terminal_stop: bool) -> bool {
+    terminal_stop || credit <= 0
 }
 
 fn speed_sample(
@@ -167,11 +203,393 @@ fn speed_sample(
     (ratio, idle)
 }
 
-fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
-    match machine.run_cycles(cycles) {
-        Ok(StopReason::CycleLimit { .. }) => None,
-        Ok(reason) => Some(reason),
-        Err(err) => Some(StopReason::CpuError(err.to_string())),
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RuntimeProfileMetrics {
+    emulation_work_wall_ns: u64,
+    host_audio_mix_queue_wall_ns: u64,
+    frame_conversion_publish_wall_ns: u64,
+    presentation_backpressure_wall_ns: u64,
+    throttle_sleep_wall_ns: u64,
+    guest_master_ticks: u64,
+    current_pacing_credit_ticks: i64,
+    max_catchup_credit_ticks: u64,
+    max_throttle_ahead_ticks: u64,
+    frames_produced: u64,
+    frames_skipped: u64,
+}
+
+impl RuntimeProfileMetrics {
+    fn record_work(&mut self, emulation: Duration, audio: Duration, frame: Duration) {
+        self.emulation_work_wall_ns = self
+            .emulation_work_wall_ns
+            .saturating_add(duration_ns(emulation));
+        self.host_audio_mix_queue_wall_ns = self
+            .host_audio_mix_queue_wall_ns
+            .saturating_add(duration_ns(audio));
+        self.frame_conversion_publish_wall_ns = self
+            .frame_conversion_publish_wall_ns
+            .saturating_add(duration_ns(frame));
+    }
+
+    fn record_backpressure(&mut self, duration: Duration) {
+        self.presentation_backpressure_wall_ns = self
+            .presentation_backpressure_wall_ns
+            .saturating_add(duration_ns(duration));
+    }
+
+    fn record_sleep(&mut self, duration: Duration) {
+        self.throttle_sleep_wall_ns = self
+            .throttle_sleep_wall_ns
+            .saturating_add(duration_ns(duration));
+    }
+
+    fn record_guest_ticks(&mut self, ticks: u64) {
+        self.guest_master_ticks = self.guest_master_ticks.saturating_add(ticks);
+    }
+
+    fn observe_credit(&mut self, credit: i64) {
+        self.current_pacing_credit_ticks = credit;
+        self.max_catchup_credit_ticks = self.max_catchup_credit_ticks.max(credit.max(0) as u64);
+        if credit < 0 {
+            self.max_throttle_ahead_ticks =
+                self.max_throttle_ahead_ticks.max(credit.unsigned_abs());
+        }
+    }
+
+    fn record_frame(&mut self, current_seq: u64, published_seq: u64, produced: bool) {
+        if !produced {
+            return;
+        }
+        self.frames_produced = self.frames_produced.saturating_add(1);
+        if published_seq != u64::MAX && current_seq > published_seq {
+            self.frames_skipped = self
+                .frames_skipped
+                .saturating_add(current_seq - published_seq - 1);
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeProfileReport {
+    schema: &'static str,
+    scope: &'static str,
+    interval_index: u64,
+    wall_ns: u64,
+    emulation_work_wall_ns: u64,
+    host_audio_mix_queue_wall_ns: u64,
+    frame_conversion_publish_wall_ns: u64,
+    active_work_wall_ns: u64,
+    presentation_backpressure_wall_ns: u64,
+    throttle_sleep_wall_ns: u64,
+    guest_master_ticks: u64,
+    wall_master_ticks: u64,
+    guest_realtime_factor: f64,
+    uncapped_wall_guest_lag_ticks: i64,
+    uncapped_wall_guest_lag_seconds: f64,
+    total_guest_realtime_factor: f64,
+    uncapped_total_wall_guest_lag_ticks: i64,
+    uncapped_total_wall_guest_lag_seconds: f64,
+    current_pacing_credit_ticks: i64,
+    current_catchup_credit_ticks: u64,
+    current_throttle_ahead_ticks: u64,
+    max_catchup_credit_ticks: u64,
+    max_throttle_ahead_ticks: u64,
+    current_catchup_credit_seconds: f64,
+    current_throttle_ahead_seconds: f64,
+    max_catchup_credit_seconds: f64,
+    max_throttle_ahead_seconds: f64,
+    frames_produced: u64,
+    frames_skipped: u64,
+    audio_debug_available: bool,
+    audio_frames_produced: u64,
+    audio_frames_consumed: u64,
+    audio_queue_lifetime_min_depth: usize,
+    audio_queue_lifetime_max_depth: usize,
+    audio_underruns_after_prefill: u64,
+    audio_overruns: u64,
+    audio_late_callbacks: u64,
+    audio_callback_lateness_us: u64,
+    audio_lifetime_max_callback_lateness_us: u64,
+}
+
+impl RuntimeProfileReport {
+    fn new(
+        scope: &'static str,
+        interval_index: u64,
+        wall: Duration,
+        metrics: RuntimeProfileMetrics,
+        total_wall: Duration,
+        total_metrics: RuntimeProfileMetrics,
+        audio: Option<AudioDebugSnapshot>,
+    ) -> Self {
+        let audio_debug_available = audio.is_some();
+        let audio = audio.unwrap_or_default();
+        let current_catchup_credit_ticks = metrics.current_pacing_credit_ticks.max(0) as u64;
+        let current_throttle_ahead_ticks = if metrics.current_pacing_credit_ticks < 0 {
+            metrics.current_pacing_credit_ticks.unsigned_abs()
+        } else {
+            0
+        };
+        let ticks_per_second = MASTER_CLOCK_HZ as f64;
+        let wall_master_ticks = master_ticks_for_duration(wall);
+        let total_wall_master_ticks = master_ticks_for_duration(total_wall);
+        let uncapped_wall_guest_lag_ticks =
+            signed_tick_difference(wall_master_ticks, metrics.guest_master_ticks);
+        let uncapped_total_wall_guest_lag_ticks =
+            signed_tick_difference(total_wall_master_ticks, total_metrics.guest_master_ticks);
+        let active_work_wall_ns = metrics
+            .emulation_work_wall_ns
+            .saturating_add(metrics.host_audio_mix_queue_wall_ns)
+            .saturating_add(metrics.frame_conversion_publish_wall_ns);
+        Self {
+            schema: RUNTIME_PROFILE_SCHEMA,
+            scope,
+            interval_index,
+            wall_ns: duration_ns(wall),
+            emulation_work_wall_ns: metrics.emulation_work_wall_ns,
+            host_audio_mix_queue_wall_ns: metrics.host_audio_mix_queue_wall_ns,
+            frame_conversion_publish_wall_ns: metrics.frame_conversion_publish_wall_ns,
+            active_work_wall_ns,
+            presentation_backpressure_wall_ns: metrics.presentation_backpressure_wall_ns,
+            throttle_sleep_wall_ns: metrics.throttle_sleep_wall_ns,
+            guest_master_ticks: metrics.guest_master_ticks,
+            wall_master_ticks,
+            guest_realtime_factor: realtime_factor(metrics.guest_master_ticks, wall_master_ticks),
+            uncapped_wall_guest_lag_ticks,
+            uncapped_wall_guest_lag_seconds: uncapped_wall_guest_lag_ticks as f64
+                / ticks_per_second,
+            total_guest_realtime_factor: realtime_factor(
+                total_metrics.guest_master_ticks,
+                total_wall_master_ticks,
+            ),
+            uncapped_total_wall_guest_lag_ticks,
+            uncapped_total_wall_guest_lag_seconds: uncapped_total_wall_guest_lag_ticks as f64
+                / ticks_per_second,
+            current_pacing_credit_ticks: metrics.current_pacing_credit_ticks,
+            current_catchup_credit_ticks,
+            current_throttle_ahead_ticks,
+            max_catchup_credit_ticks: metrics.max_catchup_credit_ticks,
+            max_throttle_ahead_ticks: metrics.max_throttle_ahead_ticks,
+            current_catchup_credit_seconds: current_catchup_credit_ticks as f64 / ticks_per_second,
+            current_throttle_ahead_seconds: current_throttle_ahead_ticks as f64 / ticks_per_second,
+            max_catchup_credit_seconds: metrics.max_catchup_credit_ticks as f64 / ticks_per_second,
+            max_throttle_ahead_seconds: metrics.max_throttle_ahead_ticks as f64 / ticks_per_second,
+            frames_produced: metrics.frames_produced,
+            frames_skipped: metrics.frames_skipped,
+            audio_debug_available,
+            audio_frames_produced: audio.frames_produced,
+            audio_frames_consumed: audio.frames_consumed,
+            audio_queue_lifetime_min_depth: audio.queue_min_depth,
+            audio_queue_lifetime_max_depth: audio.queue_max_depth,
+            audio_underruns_after_prefill: audio.underruns_after_prefill,
+            audio_overruns: audio.overruns,
+            audio_late_callbacks: audio.late_callbacks,
+            audio_callback_lateness_us: audio.callback_lateness_us,
+            audio_lifetime_max_callback_lateness_us: audio.max_callback_lateness_us,
+        }
+    }
+}
+
+fn master_ticks_for_duration(duration: Duration) -> u64 {
+    (duration
+        .as_nanos()
+        .saturating_mul(u128::from(MASTER_CLOCK_HZ))
+        / 1_000_000_000)
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn signed_tick_difference(left: u64, right: u64) -> i64 {
+    if left >= right {
+        i64::try_from(left - right).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(right - left).unwrap_or(i64::MAX)
+    }
+}
+
+fn realtime_factor(guest_ticks: u64, wall_ticks: u64) -> f64 {
+    if wall_ticks == 0 {
+        0.0
+    } else {
+        guest_ticks as f64 / wall_ticks as f64
+    }
+}
+
+fn audio_snapshot_delta(
+    current: AudioDebugSnapshot,
+    previous: AudioDebugSnapshot,
+) -> AudioDebugSnapshot {
+    AudioDebugSnapshot {
+        frames_produced: current
+            .frames_produced
+            .saturating_sub(previous.frames_produced),
+        frames_consumed: current
+            .frames_consumed
+            .saturating_sub(previous.frames_consumed),
+        queue_min_depth: current.queue_min_depth,
+        queue_max_depth: current.queue_max_depth,
+        low_water_writes: current
+            .low_water_writes
+            .saturating_sub(previous.low_water_writes),
+        underruns_after_prefill: current
+            .underruns_after_prefill
+            .saturating_sub(previous.underruns_after_prefill),
+        overruns: current.overruns.saturating_sub(previous.overruns),
+        late_callbacks: current
+            .late_callbacks
+            .saturating_sub(previous.late_callbacks),
+        callback_lateness_us: current
+            .callback_lateness_us
+            .saturating_sub(previous.callback_lateness_us),
+        max_callback_lateness_us: current.max_callback_lateness_us,
+    }
+}
+
+fn audio_snapshot_since(
+    current: Option<AudioDebugSnapshot>,
+    baseline: Option<AudioDebugSnapshot>,
+) -> Option<AudioDebugSnapshot> {
+    match (current, baseline) {
+        (Some(current), Some(baseline)) => Some(audio_snapshot_delta(current, baseline)),
+        (Some(current), None) => Some(current),
+        (None, _) => None,
+    }
+}
+
+struct RuntimeProfiler {
+    started: Instant,
+    interval_started: Instant,
+    interval_index: u64,
+    interval: RuntimeProfileMetrics,
+    total: RuntimeProfileMetrics,
+    initial_audio: Option<AudioDebugSnapshot>,
+    last_audio: Option<AudioDebugSnapshot>,
+    backpressure_started: Option<Instant>,
+}
+
+impl RuntimeProfiler {
+    fn new(now: Instant, audio: Option<AudioDebugSnapshot>) -> Self {
+        Self {
+            started: now,
+            interval_started: now,
+            interval_index: 0,
+            interval: RuntimeProfileMetrics::default(),
+            total: RuntimeProfileMetrics::default(),
+            initial_audio: audio,
+            last_audio: audio,
+            backpressure_started: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_slice(
+        &mut self,
+        emulation: Duration,
+        audio: Duration,
+        frame: Duration,
+        sleep: Duration,
+        guest_ticks: u64,
+        credit: i64,
+        current_seq: u64,
+        published_seq: u64,
+        frame_produced: bool,
+        backpressured: bool,
+        now: Instant,
+    ) {
+        self.interval.record_work(emulation, audio, frame);
+        self.total.record_work(emulation, audio, frame);
+        self.interval.record_sleep(sleep);
+        self.total.record_sleep(sleep);
+        self.interval.record_guest_ticks(guest_ticks);
+        self.total.record_guest_ticks(guest_ticks);
+        self.interval.observe_credit(credit);
+        self.total.observe_credit(credit);
+        self.interval
+            .record_frame(current_seq, published_seq, frame_produced);
+        self.total
+            .record_frame(current_seq, published_seq, frame_produced);
+
+        match (self.backpressure_started, backpressured) {
+            (None, true) => self.backpressure_started = Some(now),
+            (Some(start), false) => {
+                let duration = now.duration_since(start);
+                self.interval.record_backpressure(duration);
+                self.total.record_backpressure(duration);
+                self.backpressure_started = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn settle_backpressure(&mut self, now: Instant) {
+        let Some(start) = self.backpressure_started else {
+            return;
+        };
+        let duration = now.duration_since(start);
+        self.interval.record_backpressure(duration);
+        self.total.record_backpressure(duration);
+        self.backpressure_started = Some(now);
+    }
+
+    fn maybe_emit(&mut self, now: Instant, sink: Option<&AudioSink>) {
+        let wall = now.duration_since(self.interval_started);
+        if wall < RUNTIME_PROFILE_INTERVAL {
+            return;
+        }
+        self.settle_backpressure(now);
+        let audio = sink.and_then(AudioSink::debug_snapshot);
+        let audio_delta = audio_snapshot_since(audio, self.last_audio);
+        emit_runtime_profile(RuntimeProfileReport::new(
+            "interval",
+            self.interval_index,
+            wall,
+            self.interval,
+            now.duration_since(self.started),
+            self.total,
+            audio_delta,
+        ));
+        self.interval = RuntimeProfileMetrics::default();
+        self.interval
+            .observe_credit(self.total.current_pacing_credit_ticks);
+        self.interval_started = now;
+        self.interval_index = self.interval_index.saturating_add(1);
+        self.last_audio = audio;
+    }
+
+    fn finish(&mut self, now: Instant, sink: Option<&AudioSink>) {
+        self.settle_backpressure(now);
+        let audio =
+            audio_snapshot_since(sink.and_then(AudioSink::debug_snapshot), self.initial_audio);
+        let wall = now.duration_since(self.started);
+        emit_runtime_profile(RuntimeProfileReport::new(
+            "final",
+            self.interval_index,
+            wall,
+            self.total,
+            wall,
+            self.total,
+            audio,
+        ));
+    }
+}
+
+fn emit_runtime_profile(report: RuntimeProfileReport) {
+    match serde_json::to_string(&report) {
+        Ok(line) => eprintln!("{line}"),
+        Err(err) => error!(%err, "could not serialize runtime profile"),
+    }
+}
+
+fn runtime_profile_enabled() -> bool {
+    std::env::var("IZARRAVM_RUNTIME_PROFILE").as_deref() == Ok("1")
+}
+
+fn finish_runtime_profile(profile: &mut Option<RuntimeProfiler>, sink: Option<&AudioSink>) {
+    if let Some(profile) = profile {
+        profile.finish(Instant::now(), sink);
     }
 }
 
@@ -180,67 +598,6 @@ fn tick_machine_ticks(machine: &mut Machine, master_ticks: u64) -> Option<StopRe
         Ok(StopReason::CycleLimit { .. }) => None,
         Ok(reason) => Some(reason),
         Err(err) => Some(StopReason::CpuError(err.to_string())),
-    }
-}
-
-/// Result of `top_up_shortfall`, in master ticks. `topped_up_ticks` is device
-/// time created without executing instructions. `peeked_ticks` is elapsed guest
-/// time created by the retrace peeks. The caller drains credit for both.
-struct TopUp {
-    topped_up_ticks: u64,
-    peeked_ticks: u64,
-}
-
-/// Consume a fast-mode wall-pacing shortfall, stopping at scanout edges.
-///
-/// `advance_wall_shortfall_ticks` stops at each VGA vertical-retrace start edge
-/// inside the span (a bare top-up sweeps the beam across a whole mode-13h frame with
-/// zero instructions executing, so a guest polling 0x3DA caught only 12.8
-/// percent of the windows), and the CPU gets a small peek quantum at every stop
-/// so the window is observable. The slice may thus consume slightly more than
-/// its budget (at most a few peeks' worth), which the credit bucket absorbs.
-/// This applies in text modes too: uniform behavior, and a non-polling guest
-/// pays only ~70 edge-stops + peeks per wall second (~0.2 percent of a 486
-/// slice).
-///
-/// Termination: `advance_wall_shortfall_ticks` consumes at least one tick per
-/// call, and a defensive stop cap bounds the peek work. Normal VGA frames are
-/// 60-70 Hz, so a slice's shortfall (at most 50 ms) sees a handful of edges.
-/// The cap budgets one stop per 10 ms of shortfall plus slack, and a pathological
-/// guest-programmed CRTC (kHz-rate frames) then degrades to an unclamped
-/// top-up instead of livelocking the emulate thread in peeks. A peek that
-/// halts or faults aborts the top-up; the unrun remainder stays as credit for
-/// the next slice, which sees the new machine state per its own stop handling.
-fn top_up_shortfall(machine: &mut Machine, mut remaining: u64) -> TopUp {
-    let mut stops_left = remaining / (MASTER_CLOCK_HZ / 100) + 2;
-    let mut topped_up_ticks = 0u64;
-    let mut peeked_ticks = 0u64;
-    while remaining > 0 {
-        let consumed = machine.advance_wall_shortfall_ticks(remaining);
-        topped_up_ticks += consumed;
-        remaining = remaining.saturating_sub(consumed.max(1));
-        if remaining == 0 {
-            break;
-        }
-        if stops_left == 0 {
-            machine.advance_devices_ticks(remaining);
-            topped_up_ticks += remaining;
-            break;
-        }
-        stops_left -= 1;
-        // Stopped at a vretrace start edge (bit 3 of 0x3DA already reads set):
-        // let the guest run a peek so a polling loop observes the window before
-        // the top-up sweeps past it.
-        let peek_before = machine.master_ticks();
-        let peek_stop = tick_machine(machine, VRETRACE_PEEK_CLOCKS);
-        peeked_ticks += machine.master_ticks().saturating_sub(peek_before);
-        if peek_stop.is_some() {
-            break;
-        }
-    }
-    TopUp {
-        topped_up_ticks,
-        peeked_ticks,
     }
 }
 
@@ -774,6 +1131,7 @@ impl SharedGain {
 struct Emulator {
     commands: Sender<Command>,
     frame: Arc<Mutex<Frame>>,
+    consumed_frame_seq: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -794,8 +1152,10 @@ impl Emulator {
         speaker_vol: SharedGain,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
+        let consumed_frame_seq = Arc::new(AtomicU64::new(u64::MAX));
         let (commands, rx) = mpsc::channel();
         let frame_thread = Arc::clone(&frame);
+        let consumed_frame_seq_thread = Arc::clone(&consumed_frame_seq);
         let join = std::thread::Builder::new()
             .name("izarravm-emu".into())
             .spawn(move || {
@@ -813,12 +1173,14 @@ impl Emulator {
                     speaker_vol,
                     rx,
                     frame_thread,
+                    consumed_frame_seq_thread,
                 )
             })
             .expect("spawn emulation thread");
         Self {
             commands,
             frame,
+            consumed_frame_seq,
             join: Some(join),
         }
     }
@@ -902,6 +1264,7 @@ fn emulate(
     speaker_vol: SharedGain,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
+    consumed_frame_seq: Arc<AtomicU64>,
 ) {
     let mut machine = match Machine::new(profile, &rom) {
         Ok(m) => m,
@@ -972,13 +1335,17 @@ fn emulate(
     // time drains it. A disk read that consumes more than its slice drives
     // it negative, pausing the guest for the disk's duration.
     let mut credit: i64 = 0;
-    let mut last = Instant::now();
+    let mut last_pace = Instant::now();
+    let mut last_media = last_pace;
+    let mut runtime_profile = runtime_profile_enabled().then(|| {
+        RuntimeProfiler::new(last_pace, sink.as_ref().and_then(AudioSink::debug_snapshot))
+    });
     let mut published_seq = u64::MAX; // force the first publish
     // Dirty-framebuffer cache (graphics modes only, v1): the content-generation key
     // of the last frame we palette-mapped + published. The guest's vsync counter
     // (`seq`) advances every retrace even on a totally static mode-13h screen, which
     // would re-run the 64 KB palette conversion ~70x/s for nothing. When
-    // `frame_generation()` returns `Some(k)` and k is unchanged, the graphics output
+    // `presented_frame_generation()` returns `Some(k)` and k is unchanged, the graphics output
     // cannot have changed, so we skip the render + publish: `f.seq` stays put, so the
     // UI's existing per-seq texture-upload guard skips the upload too. `None` (text
     // mode / Margo / Distira) always renders, today's behavior (text-cursor blink).
@@ -1031,6 +1398,9 @@ fn emulate(
                     // Flush the Katea host folder, the floppy, and the final CMOS
                     // state before exiting (this arm also runs on Reset, which
                     // shuts the thread down and respawns).
+                    // Close profiling first so persistence latency is not charged
+                    // to emulation work or uncapped guest lag.
+                    finish_runtime_profile(&mut runtime_profile, sink.as_ref());
                     machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                     crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
@@ -1040,6 +1410,7 @@ fn emulate(
                 Err(TryRecvError::Disconnected) => {
                     // Channel closed (the GUI dropped the sender on exit); same
                     // flush sequence as Shutdown before the thread ends.
+                    finish_runtime_profile(&mut runtime_profile, sink.as_ref());
                     machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                     crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
@@ -1048,90 +1419,70 @@ fn emulate(
             }
         }
 
-        // Pace by the wall time since the last slice. The credit bucket forgives a
-        // host stall (capped backlog, no catch-up sprint) and, in the other
-        // direction, makes a disk read that advances guest time cost real
-        // wall-clock time: the overshoot drives credit negative and the next
-        // slices run nothing until wall time refills it.
-        let now = Instant::now();
-        let dt = now.duration_since(last);
-        let dt_secs = dt.as_secs_f64();
-        speed_wall = speed_wall.saturating_add(dt);
-        last = now;
+        // Refill before issuing work. Fast modes run at most one millisecond of
+        // guest time per pass so a slow CPU keeps audio, input, and frame
+        // publication responsive while retaining its unexecuted catch-up credit.
+        let run_started = Instant::now();
         // Credit stays in fixed master ticks across guest-driven CPU-mode changes.
         let cap = MASTER_CLOCK_HZ / 20;
-        credit = refill_credit(credit, dt, cap);
+        credit = refill_credit(credit, run_started.duration_since(last_pace), cap);
+        last_pace = run_started;
         let budget = credit.max(0) as u64;
+        let mut terminal_stop = false;
+        let mut consumed_ticks = 0u64;
         if budget > 0 {
             let before = machine.master_ticks();
             let stall_before = machine.io_stall_ticks();
             let halted_before = machine.halted_ticks();
             let approximate = machine.active_mode().uses_approximate_timing();
-            let stop = if approximate {
-                // The fast modes are sub-sliced in 1 ms master-time quanta so a
-                // slow host can stop issuing work at the wall deadline. Any
-                // unrun duration is topped up below to keep devices realtime.
-                let quantum = MASTER_CLOCK_HZ / 1000;
-                let deadline = now + duration_for_master_ticks(budget);
-                let mut stop = None;
-                loop {
-                    let ran_so_far = machine.master_ticks().saturating_sub(before);
-                    let remaining = budget.saturating_sub(ran_so_far);
-                    if remaining == 0 {
-                        break;
-                    }
-                    stop = tick_machine_ticks(&mut machine, quantum.min(remaining));
-                    if stop.is_some() || Instant::now() >= deadline {
-                        break;
-                    }
-                }
-                stop
-            } else {
-                tick_machine_ticks(&mut machine, budget)
-            };
-            let mut ran = machine.master_ticks().saturating_sub(before);
+            let stop = tick_machine_ticks(&mut machine, execution_budget(credit, approximate));
+            terminal_stop = matches!(
+                stop,
+                Some(
+                    StopReason::CpuError(_)
+                        | StopReason::DosExit { .. }
+                        | StopReason::TestExit { .. }
+                )
+            );
+            let ran = machine.master_ticks().saturating_sub(before);
             // Some elapsed ticks may be a device-I/O stall. Drain the full
             // ran from the credit so the stall still costs wall-clock time, but
             // exclude it from the speed measurement below.
-            let mut stalled = machine.io_stall_ticks().saturating_sub(stall_before);
-            let mut topped_up = 0u64;
-            let mut halt_top_up = 0u64;
+            let stalled = machine.io_stall_ticks().saturating_sub(stall_before);
+            let halt_top_up =
+                halted_device_top_up(budget, ran, matches!(stop, Some(StopReason::Halted)));
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
             // framebuffer is presented instead.
-            if matches!(stop, Some(StopReason::Halted)) {
-                halt_top_up = budget.saturating_sub(ran);
+            if halt_top_up > 0 {
                 machine.advance_devices_ticks(halt_top_up);
-                topped_up = halt_top_up;
-            } else if approximate && stop.is_none() {
-                // The host ran out of wall time before the budget was consumed
-                // (the deadline bail-out above). Top up devices and the master
-                // timeline by the genuinely unrun remainder so guest time keeps
-                // tracking wall time; the shortfall is wall-backed by
-                // construction, so draining credit for it below is correct.
-                // Stall jumps already count as progress in `ran`, so they are
-                // not double-counted here. Fatal stops (CpuError/DosExit/
-                // TestExit) skip the top-up and keep devices frozen.
-                //
-                // The top-up stops at VGA vretrace start edges and peeks the
-                // CPU there (see top_up_shortfall). The peek executes guest time
-                // backed by the wall time spent running it, so it
-                // folds into `ran` and drains credit like any other execution.
-                let top_up = top_up_shortfall(&mut machine, budget.saturating_sub(ran));
-                topped_up += top_up.topped_up_ticks;
-                ran += top_up.peeked_ticks;
-                stalled = machine.io_stall_ticks().saturating_sub(stall_before);
             }
-            credit -= i64::try_from(ran.saturating_add(topped_up)).unwrap_or(i64::MAX);
+            consumed_ticks = ran.saturating_add(halt_top_up);
             let halted = machine.halted_ticks().saturating_sub(halted_before);
             // Speed reflects active CPU work. Device-I/O stalls and HLT
             // fast-forward are intentional waits, not CPU throughput.
             speed_executed =
                 speed_executed.saturating_add(ran.saturating_sub(stalled).saturating_sub(halted));
             speed_halted = speed_halted.saturating_add(halted.saturating_add(halt_top_up));
-            speed_advanced = speed_advanced.saturating_add(ran.saturating_add(topped_up));
+            speed_advanced = speed_advanced.saturating_add(consumed_ticks);
         }
+        // Credit wall time spent executing before deciding whether to sleep. A
+        // slow guest therefore keeps positive catch-up credit and immediately runs the
+        // next bounded quantum. An I/O stall still goes negative because the
+        // full guest-time jump is debited above.
+        let run_finished = Instant::now();
+        credit = settle_credit(
+            credit,
+            consumed_ticks,
+            run_finished.duration_since(last_pace),
+            cap,
+        );
+        last_pace = run_finished;
+        let dt = run_finished.duration_since(last_media);
+        let dt_secs = dt.as_secs_f64();
+        speed_wall = speed_wall.saturating_add(dt);
+        last_media = run_finished;
         if speed_wall >= SPEED_SAMPLE_INTERVAL {
             (speed_ratio, speed_idle) =
                 speed_sample(speed_executed, speed_halted, speed_advanced, speed_wall);
@@ -1154,18 +1505,22 @@ fn emulate(
                 speaker_vol.get(),
             );
         }
+        let audio_finished = runtime_profile.as_ref().map(|_| Instant::now());
 
         // Publish: clone the framebuffer only when the guest presents a new
         // frame; refresh the light fields every pass so the readout stays live.
         let seq = machine.frame_sequence();
-        // Dirty-framebuffer guard: in a graphics mode whose content key is unchanged
-        // since the last published frame, the output is bit-identical, so skip the
-        // palette map + publish even though `seq` advanced. `None` (text/Margo/
-        // Distira) never short-circuits, preserving today's per-vsync render.
-        let frame_gen = machine.frame_generation();
-        let content_unchanged = matches!((frame_gen, last_frame_gen), (Some(k), Some(p)) if k == p);
-        let new_frame = seq != published_seq && !content_unchanged;
+        let published_before = published_seq;
+        // Do not convert another frame until the UI has copied the one-slot
+        // publication. Once it acknowledges that slot, render the current guest
+        // frame, skipping every intermediate frame that elapsed meanwhile.
+        let frame_gen = machine.presented_frame_generation();
+        let consumed_seq = consumed_frame_seq.load(Ordering::Acquire);
+        let backpressured = seq != published_seq && consumed_seq != published_seq;
+        let new_frame =
+            should_publish_frame(seq, published_seq, consumed_seq, frame_gen, last_frame_gen);
         let rendered = new_frame.then(|| machine.presented_frame_argb());
+        let frame_produced = rendered.is_some();
         let serial = new_frame.then(|| machine.serial_text());
         let mode = machine.active_mode();
         let refresh_hz = machine.display_refresh_hz();
@@ -1181,6 +1536,7 @@ fn emulate(
                 // Remember the published frame's content key so the next vsync with the
                 // same key (static screen) is short-circuited above.
                 last_frame_gen = frame_gen;
+                published_seq = seq;
             }
             if let Some(serial) = serial {
                 f.serial = serial;
@@ -1195,15 +1551,44 @@ fn emulate(
             f.wavetable_status = wavetable.status();
             f.midi_status = midi_receiver.status();
         }
-        published_seq = seq;
-
         // Persist cmos.bin when the guest wrote an NVRAM byte (a setup-page
         // save). take_cmos_dirty clears the flag so we write only on a change.
         if machine.take_cmos_dirty() {
             crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
         }
 
-        std::thread::sleep(EMU_SLICE);
+        // Audio mixing and frame publication are host work too. Credit them
+        // before the sleep decision so any slow subsystem keeps the guest in
+        // catch-up mode instead of adding an avoidable fixed sleep.
+        let before_sleep = Instant::now();
+        credit = refill_credit(credit, before_sleep.duration_since(last_pace), cap);
+        last_pace = before_sleep;
+        let should_sleep = emulation_should_sleep(credit, terminal_stop);
+        if should_sleep {
+            std::thread::sleep(EMU_SLICE);
+        }
+        if let (Some(profile), Some(audio_finished)) = (runtime_profile.as_mut(), audio_finished) {
+            let profile_finished = Instant::now();
+            let sleep = if should_sleep {
+                profile_finished.duration_since(before_sleep)
+            } else {
+                Duration::ZERO
+            };
+            profile.record_slice(
+                run_finished.duration_since(run_started),
+                audio_finished.duration_since(run_finished),
+                before_sleep.duration_since(audio_finished),
+                sleep,
+                consumed_ticks,
+                credit,
+                seq,
+                published_before,
+                frame_produced,
+                backpressured,
+                before_sleep,
+            );
+            profile.maybe_emit(profile_finished, sink.as_ref());
+        }
     }
 }
 
@@ -1650,22 +2035,25 @@ impl GuiApp {
             ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
             return;
         };
-        // Pull a fresh framebuffer only when the guest frame counter advanced;
-        // otherwise the persistent GPU texture is reused. The lock is held only
-        // for the copy.
-        let frame = {
+        // Copy the one-slot publication while locked, acknowledge it, then do
+        // the full pixel conversion after releasing the emulation-thread mutex.
+        let snapshot = {
             let f = emu.frame.lock().expect("frame snapshot poisoned");
             if f.width > 0 && f.seq != self.frame_seq {
                 self.frame_seq = f.seq;
-                Some(crate::crt::CrtFrame {
-                    rgba: words_to_rgba(&f.words, f.width, f.height),
-                    width: f.width as u32,
-                    height: f.height as u32,
-                })
+                Some((f.seq, f.words.clone(), f.width, f.height))
             } else {
                 None
             }
         };
+        let frame = snapshot.map(|(seq, words, width, height)| {
+            emu.consumed_frame_seq.store(seq, Ordering::Release);
+            crate::crt::CrtFrame {
+                rgba: words_to_rgba(&words, width, height),
+                width: width as u32,
+                height: height as u32,
+            }
+        });
         // Paint the guest screen through the wgpu shader pass: aspect-fill to the
         // 4:3 rect, sharp upscale, and the CRT model for the chosen style. The Ye
         // Olde grain animates, so keep repainting while it is active.
@@ -1826,691 +2214,9 @@ impl GuiApp {
             }
         }
     }
+}
 
-    /// Toggle the panel and persist the new state.
-    fn toggle_panel(&mut self) {
-        self.panel_open = !self.panel_open;
-        self.prefs.panel_open = self.panel_open;
-        self.save_prefs();
-    }
-
-    /// The close tab while the panel is open: the full-height left edge of the
-    /// panel is clickable, the same beige as the background so it reads as the
-    /// border, with a small triangle icon. It highlights on hover. Clicking
-    /// collapses the panel.
-    fn open_handle(&mut self, ui: &mut egui::Ui) {
-        let h = ui.available_height().max(40.0);
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, h), egui::Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(rect, 0.0, BEVEL_HI);
-        }
-        // Triangle icon pointing inward (collapse the panel).
-        let c = rect.center();
-        let tri = vec![
-            c + egui::vec2(-2.5, -5.0),
-            c + egui::vec2(-2.5, 5.0),
-            c + egui::vec2(3.5, 0.0),
-        ];
-        ui.painter()
-            .add(egui::Shape::convex_polygon(tri, LABEL, egui::Stroke::NONE));
-        if resp.clicked() {
-            self.toggle_panel();
-        }
-    }
-
-    /// The collapsed strip pinned to the window's right edge: the whole strip is
-    /// the clickable reopen tab, flat with a small triangle icon. Clicking
-    /// expands the panel.
-    fn collapsed_tab(&mut self, ui: &mut egui::Ui) {
-        let size = egui::vec2(ui.available_width(), ui.available_height());
-        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-        let fill = if resp.hovered() { BEVEL_HI } else { PANEL_FACE };
-        ui.painter().rect_filled(rect, 0.0, fill);
-        // Triangle icon pointing outward (pull the panel out).
-        let c = rect.center();
-        let tri = vec![
-            c + egui::vec2(2.5, -5.0),
-            c + egui::vec2(2.5, 5.0),
-            c + egui::vec2(-3.5, 0.0),
-        ];
-        ui.painter()
-            .add(egui::Shape::convex_polygon(tri, LABEL, egui::Stroke::NONE));
-        if resp.clicked() {
-            self.toggle_panel();
-        }
-    }
-
-    fn controls_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_top(|ui| {
-            self.open_handle(ui);
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.add_space(12.0);
-                beige_visuals(ui);
-                self.panel_body(ui);
-            });
-        });
-    }
-
-    /// The top row: the logo aligned left, then the power LED and the square
-    /// Power and Reset buttons (Reset smaller) aligned to the right, all sharing
-    /// one bottom baseline. The logo texture is built once and cached.
-    fn panel_header(&mut self, ui: &mut egui::Ui) {
-        let tex = self.logo.get_or_insert_with(|| {
-            let rgba = recolor_logo(LOGO_RGBA, PANEL_FACE_F32);
-            let image = egui::ColorImage::from_rgba_unmultiplied([LOGO_W, LOGO_H], &rgba);
-            ui.ctx()
-                .load_texture("izarra-logo", image, egui::TextureOptions::LINEAR)
-        });
-        let id = tex.id();
-        let scale = 34.0 / LOGO_H as f32;
-        let size = egui::vec2(LOGO_W as f32 * scale, LOGO_H as f32 * scale);
-        let running = self.emu.is_some();
-        // A fixed-height row, bottom-aligned, so the logo, LED, and buttons
-        // share one baseline (the Power button's). The explicit height stops the
-        // Align::Max layout from expanding to fill the whole panel.
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 48.0),
-            egui::Layout::left_to_right(egui::Align::Max),
-            |ui| {
-                ui.image((id, size));
-                // Right side, added right to left so it reads LED, Power, Reset.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                    let reset = ui
-                        .add_enabled_ui(running, |ui| {
-                            ui.add_sized(
-                                [36.0, 36.0],
-                                egui::Button::new(egui::RichText::new("RESET").size(10.0)),
-                            )
-                        })
-                        .inner;
-                    if reset.clicked() {
-                        self.start();
-                    }
-                    if ui
-                        .add_sized(
-                            [48.0, 48.0],
-                            egui::Button::new(egui::RichText::new("POWER").size(13.0)),
-                        )
-                        .clicked()
-                    {
-                        if running {
-                            self.stop();
-                        } else {
-                            self.start();
-                        }
-                    }
-                    // A tall box so the LED centres vertically against the Power button.
-                    let (led, _) =
-                        ui.allocate_exact_size(egui::vec2(16.0, 48.0), egui::Sense::hover());
-                    let c = led.center();
-                    ui.painter()
-                        .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
-                    if running {
-                        ui.painter().circle_filled(
-                            c,
-                            2.5,
-                            egui::Color32::from_rgb(0xC8, 0xFF, 0xCE),
-                        );
-                    }
-                    ui.painter()
-                        .circle_stroke(c, 6.0, egui::Stroke::new(1.0_f32, BEVEL_LO));
-                });
-            },
-        );
-    }
-
-    fn panel_body(&mut self, ui: &mut egui::Ui) {
-        let running = self.emu.is_some();
-        let (mode, speed, idle, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
-            Some(emu) => {
-                let f = emu.frame.lock().expect("frame snapshot poisoned");
-                (
-                    f.mode,
-                    f.speed_ratio,
-                    f.idle,
-                    f.floppy_accesses,
-                    f.c_accesses,
-                    f.cd_accesses,
-                )
-            }
-            None => (
-                None,
-                0.0,
-                false,
-                self.floppy_access_seen,
-                self.c_access_seen,
-                self.cd_access_seen,
-            ),
-        };
-        // Light a drive LED whenever its access count advanced since last frame.
-        let now = Instant::now();
-        if floppy_accesses != self.floppy_access_seen {
-            self.floppy_access_seen = floppy_accesses;
-            self.floppy_access_at = Some(now);
-        }
-        if c_accesses != self.c_access_seen {
-            self.c_access_seen = c_accesses;
-            self.c_access_at = Some(now);
-        }
-        if cd_accesses != self.cd_access_seen {
-            self.cd_access_seen = cd_accesses;
-            self.cd_access_at = Some(now);
-        }
-
-        self.panel_header(ui);
-        ui.separator();
-        self.drives_ui(ui, running);
-
-        // Push the readout, volume, COM1, and vents to the bottom of the panel.
-        let mode = mode.unwrap_or(self.profile.cpu);
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.separator();
-                let line = |ui: &mut egui::Ui, text: String| {
-                    ui.label(egui::RichText::new(text).color(MUTED).size(12.0));
-                };
-                // CPU and mode line, with the COM1 toggle aligned to its right.
-                ui.horizontal(|ui| {
-                    line(ui, cpu_mode_label(mode));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if info_button(ui).on_hover_text("About").clicked() {
-                            self.show_about = true;
-                        }
-                        if ui
-                            .button("\u{2699}")
-                            .on_hover_text("Configuration")
-                            .clicked()
-                        {
-                            self.open_config_dialog();
-                        }
-                    });
-                });
-                ui.horizontal(|ui| {
-                    let text = if idle {
-                        format!("Idle - {} MB", self.profile.memory_mib)
-                    } else {
-                        format!(
-                            "Speed {:.0}% - {} MB",
-                            speed * 100.0,
-                            self.profile.memory_mib
-                        )
-                    };
-                    line(ui, text);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
-                        if ui.button(com1_label).clicked() {
-                            self.show_com1 = !self.show_com1;
-                        }
-                    });
-                });
-                line(ui, format!("Host {:.0} fps", self.host_fps));
-
-                ui.add_space(6.0);
-                // Volume row: the classic ascending-bars icon and a slider that
-                // stretches to fill the remaining width.
-                ui.horizontal(|ui| {
-                    volume_icon(ui);
-                    ui.add_space(4.0);
-                    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(40.0);
-                    let slider =
-                        ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
-                    if slider.changed() {
-                        self.gain.set(volume_gain(self.volume));
-                        self.prefs.master_volume = self.volume;
-                        self.save_prefs();
-                    }
-                });
-
-                ui.add_space(8.0);
-                // Vent grille: four rows, kept clear of the right border.
-                let cols = 5;
-                let rows = 4;
-                let row_h = 3.0;
-                let row_gap = 3.0;
-                let col_gap = 4.0;
-                let right_margin = 8.0;
-                let grille_w = (ui.available_width() - right_margin).max(20.0);
-                let grille_h = rows as f32 * row_h + (rows as f32 - 1.0) * row_gap;
-                let (grille, _) =
-                    ui.allocate_exact_size(egui::vec2(grille_w, grille_h), egui::Sense::hover());
-                let slot_w = (grille_w - col_gap * (cols as f32 - 1.0)) / cols as f32;
-                let p = ui.painter();
-                for r in 0..rows {
-                    for col in 0..cols {
-                        let x = grille.left() + col as f32 * (slot_w + col_gap);
-                        let y = grille.top() + r as f32 * (row_h + row_gap);
-                        let slot =
-                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(slot_w, row_h));
-                        p.rect_filled(slot, 1.0, RECESS);
-                    }
-                }
-            });
-        });
-    }
-
-    /// Open the configuration modal, seeding its staged settings from the live
-    /// values so Cancel can discard cleanly.
-    fn open_config_dialog(&mut self) {
-        self.config_dialog = Some(ConfigDialog {
-            input_release: self.input_release.clone(),
-            fullscreen: self.fullscreen_key.clone(),
-            crt_style: self.crt_style,
-            amp_gain: self.amp_gain,
-            pc_speaker_volume: self.pc_speaker_volume,
-            midi_backend: self.midi_config.backend,
-            external_midi_port: self.midi_config.external_port.clone(),
-            soundfont: self.midi_config.soundfont.clone(),
-            mt32_control_rom: path_text(self.midi_config.mt32_control_rom.as_ref()),
-            mt32_pcm_rom: path_text(self.midi_config.mt32_pcm_rom.as_ref()),
-            midi_ports: MidiEngine::external_ports(),
-            capturing: None,
-        });
-    }
-
-    /// True while the dialog is waiting to capture a hotkey, so the event loop
-    /// swallows the next key instead of toggling capture or forwarding to the guest.
-    fn is_capturing_bind(&self) -> bool {
-        self.config_dialog
-            .as_ref()
-            .is_some_and(|d| d.capturing.is_some())
-    }
-
-    /// Record a captured combo into the staged binding the dialog is waiting on,
-    /// then stop capturing. `key` is the winit `KeyCode` debug name.
-    fn record_bind(&mut self, key: &str, ctrl: bool, shift: bool, alt: bool) {
-        if let Some(dialog) = &mut self.config_dialog {
-            if let Some(target) = dialog.capturing.take() {
-                let binding = KeyBinding::new(ctrl, shift, alt, key);
-                match target {
-                    BindTarget::InputRelease => dialog.input_release = binding,
-                    BindTarget::Fullscreen => dialog.fullscreen = binding,
-                }
-            }
-        }
-    }
-
-    /// Render the configuration modal. Accept applies the staged settings and
-    /// closes; Cancel, the backdrop, or Esc discards and closes.
-    fn config_ui(&mut self, ctx: &egui::Context) {
-        let (wavetable_status, midi_status) = self
-            .emu
-            .as_ref()
-            .map(|emu| {
-                let frame = emu.frame.lock().expect("frame snapshot poisoned");
-                (frame.wavetable_status, frame.midi_status)
-            })
-            .unwrap_or((
-                MidiStatus::InitializationFailed,
-                MidiStatus::InitializationFailed,
-            ));
-        let Some(mut dialog) = self.config_dialog.take() else {
-            return;
-        };
-        let mut keep_open = true;
-        let mut accept = false;
-        let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(PANEL_FACE)
-                .inner_margin(egui::Margin {
-                    left: 14,
-                    right: 14,
-                    top: 12,
-                    bottom: 12,
-                })
-                .corner_radius(4.0)
-                .show(ui, |ui| {
-                    beige_visuals(ui);
-                    ui.set_width(440.0);
-                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
-
-                    ui.vertical_centered(|ui| {
-                        ui.label(header_text("Configuration", 18.0));
-                    });
-                    ui.add_space(6.0);
-
-                    ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
-                    beige_group(ui, |ui| {
-                        egui::Grid::new("config-keys")
-                            .num_columns(2)
-                            .spacing([16.0, 10.0])
-                            .show(ui, |ui| {
-                                ui.label("Input release");
-                                bind_button(ui, &mut dialog, BindTarget::InputRelease);
-                                ui.end_row();
-                                ui.label("Full screen");
-                                bind_button(ui, &mut dialog, BindTarget::Fullscreen);
-                                ui.end_row();
-                            });
-                    });
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("DISPLAY").color(LABEL).size(11.0));
-                    beige_group(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("CRT emulation");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.selectable_value(
-                                        &mut dialog.crt_style,
-                                        CrtStyle::YeOlde,
-                                        "Ye Olde Screene",
-                                    );
-                                    ui.selectable_value(
-                                        &mut dialog.crt_style,
-                                        CrtStyle::Subtle,
-                                        "Subtle",
-                                    );
-                                    ui.selectable_value(&mut dialog.crt_style, CrtStyle::Off, "No");
-                                },
-                            );
-                        });
-                    });
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("AUDIO").color(LABEL).size(11.0));
-                    beige_group(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("ReSonique 2 amp gain");
-                            ui.add(
-                                egui::Slider::new(&mut dialog.amp_gain, 0..=prefs::AMP_GAIN_MAX)
-                                    .custom_formatter(|n, _| format!("{:.1}x", n / 10.0)),
-                            )
-                            .on_hover_text(
-                                "Output gain for the sound card's analog stage. Raise if a \
-                                 game's sound is too quiet, lower if it clips.",
-                            );
-                        });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("PC speaker volume");
-                            ui.add(
-                                egui::Slider::new(&mut dialog.pc_speaker_volume, 0..=100)
-                                    .custom_formatter(|n, _| {
-                                        if n <= 0.0 {
-                                            "Muted".to_string()
-                                        } else {
-                                            format!("{n:.0}%")
-                                        }
-                                    }),
-                            )
-                            .on_hover_text(
-                                "Volume of the motherboard PC speaker (the beeps), separate \
-                                 from the sound card. Set to 0 to mute it.",
-                            );
-                        });
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("P300 wavetable output");
-                            ui.label("FluidSynth");
-                        });
-                        soundfont_picker(ui, &mut dialog.soundfont);
-                        let wavetable_color = if wavetable_status == MidiStatus::Ready {
-                            INK
-                        } else {
-                            egui::Color32::from_rgb(170, 62, 48)
-                        };
-                        ui.colored_label(wavetable_color, midi_status_text(wavetable_status));
-                        ui.add_space(6.0);
-                        let munt_ready =
-                            munt_roms_available(&dialog.mt32_control_rom, &dialog.mt32_pcm_rom);
-                        let munt_label = if munt_ready {
-                            "Munt (MT-32)"
-                        } else {
-                            "Munt (MT-32) (missing ROMs)"
-                        };
-                        let receiver_label = match dialog.midi_backend {
-                            MidiBackend::Off => midi_backend_label(MidiBackend::Off).to_owned(),
-                            MidiBackend::Munt => munt_label.to_owned(),
-                            MidiBackend::External => dialog
-                                .external_midi_port
-                                .as_ref()
-                                .map(midi_port_label)
-                                .unwrap_or_else(|| "Select a host MIDI device".to_owned()),
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label("P330 MIDI receiver");
-                            egui::ComboBox::from_id_salt("midi-backend")
-                                .selected_text(receiver_label)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut dialog.midi_backend,
-                                        MidiBackend::Off,
-                                        midi_backend_label(MidiBackend::Off),
-                                    );
-                                    ui.add_enabled_ui(munt_ready, |ui| {
-                                        ui.selectable_value(
-                                            &mut dialog.midi_backend,
-                                            MidiBackend::Munt,
-                                            munt_label,
-                                        );
-                                    });
-                                    for port in &dialog.midi_ports {
-                                        let selected = dialog.midi_backend == MidiBackend::External
-                                            && dialog.external_midi_port.as_ref() == Some(port);
-                                        if ui
-                                            .selectable_label(selected, midi_port_label(port))
-                                            .clicked()
-                                        {
-                                            dialog.midi_backend = MidiBackend::External;
-                                            dialog.external_midi_port = Some(port.clone());
-                                        }
-                                    }
-                                });
-                        });
-                        if dialog.midi_ports.is_empty() {
-                            ui.small("No host MIDI destination ports were found.");
-                        }
-                        if dialog.midi_backend == MidiBackend::Munt || !munt_ready {
-                            midi_path_picker(
-                                ui,
-                                "MT-32 control ROM",
-                                &mut dialog.mt32_control_rom,
-                                "ROM image",
-                                &["rom", "bin"],
-                                "Required",
-                            );
-                            midi_path_picker(
-                                ui,
-                                "MT-32 PCM ROM",
-                                &mut dialog.mt32_pcm_rom,
-                                "ROM image",
-                                &["rom", "bin"],
-                                "Required",
-                            );
-                        }
-                        let status_color = if midi_status == MidiStatus::Ready {
-                            INK
-                        } else {
-                            egui::Color32::from_rgb(170, 62, 48)
-                        };
-                        ui.colored_label(status_color, midi_status_text(midi_status));
-                    });
-
-                    ui.add_space(14.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Accept").clicked() {
-                            accept = true;
-                            keep_open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep_open = false;
-                        }
-                    });
-                });
-        });
-        if modal.should_close() {
-            keep_open = false;
-        }
-        if accept {
-            self.apply_config(&dialog);
-        }
-        if keep_open {
-            self.config_dialog = Some(dialog);
-        }
-    }
-
-    /// Push the staged config to the live fields, the emulation thread, and prefs.
-    fn apply_config(&mut self, dialog: &ConfigDialog) {
-        self.input_release = dialog.input_release.clone();
-        self.fullscreen_key = dialog.fullscreen.clone();
-        self.crt_style = dialog.crt_style;
-        self.prefs.input_release = dialog.input_release.clone();
-        self.prefs.fullscreen = dialog.fullscreen.clone();
-        self.prefs.crt_style = dialog.crt_style;
-        // Amp gain: update the live value + prefs and push the new multiplier to
-        // the shared amp atomic so the emulation thread's audio pump picks it up
-        // without a restart.
-        if dialog.amp_gain != self.amp_gain {
-            self.amp_gain = dialog.amp_gain;
-            self.prefs.amp_gain = dialog.amp_gain;
-            self.amp.set(amp_multiplier(self.amp_gain));
-        }
-        // PC speaker volume: same live-update path as the amp gain.
-        if dialog.pc_speaker_volume != self.pc_speaker_volume {
-            self.pc_speaker_volume = dialog.pc_speaker_volume;
-            self.prefs.pc_speaker_volume = dialog.pc_speaker_volume;
-            self.speaker_vol
-                .set(speaker_multiplier(self.pc_speaker_volume));
-        }
-        let midi_config = MidiConfig {
-            backend: dialog.midi_backend,
-            external_port: dialog.external_midi_port.clone(),
-            soundfont: dialog.soundfont.clone(),
-            mt32_control_rom: optional_path(&dialog.mt32_control_rom),
-            mt32_pcm_rom: optional_path(&dialog.mt32_pcm_rom),
-        };
-        if midi_config != self.midi_config {
-            self.midi_config = midi_config.clone();
-            if let Some(emu) = &self.emu {
-                emu.configure_midi(midi_config.clone());
-            }
-        }
-        self.prefs.midi = midi_config;
-        self.save_prefs();
-    }
-
-    /// The floating COM1 window: black monospace serial log on white, auto-scrolled
-    /// to the bottom, inside the shared beige chrome. The window is draggable,
-    /// resizable, and closable; its open state is bound to `show_com1` so the
-    /// close control and the footer button stay in sync.
-    fn com1_window(&mut self, ctx: &egui::Context) {
-        let serial = match &self.emu {
-            Some(emu) => emu
-                .frame
-                .lock()
-                .expect("frame snapshot poisoned")
-                .serial
-                .clone(),
-            None => String::new(),
-        };
-        let mut open = self.show_com1;
-        beige_window(ctx, "COM1", &mut open, true, [480.0, 320.0], |ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::WHITE)
-                .inner_margin(egui::Margin::same(4))
-                .show(ui, |ui| {
-                    ui.style_mut().spacing.scroll.bar_width = 6.0;
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(serial)
-                                    .monospace()
-                                    .color(egui::Color32::BLACK),
-                            ));
-                        });
-                });
-        });
-        self.show_com1 = open;
-    }
-
-    /// The floating License window: the full GPL-3.0-only text, black monospace on
-    /// white inside the shared beige chrome. Opened from the About window.
-    fn license_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_license;
-        beige_window(
-            ctx,
-            "License (GPL-3.0-only)",
-            &mut open,
-            true,
-            [640.0, 520.0],
-            |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .inner_margin(egui::Margin::same(4))
-                    .show(ui, |ui| {
-                        ui.style_mut().spacing.scroll.bar_width = 6.0;
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(include_str!("../../../LICENSE"))
-                                        .monospace()
-                                        .color(egui::Color32::BLACK),
-                                ));
-                            });
-                    });
-            },
-        );
-        self.show_license = open;
-    }
-
-    /// The floating About window: product/version/copyright and a GitHub link
-    /// first, then the bundled third-party attribution (verbatim NOTICE), then
-    /// a button to open the full license.
-    fn about_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_about;
-        let mut open_license = self.show_license;
-        beige_window(
-            ctx,
-            "About IzarraVM",
-            &mut open,
-            false,
-            [540.0, 420.0],
-            |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.visuals_mut().hyperlink_color = LINK_BLUE;
-                    ui.label(
-                        egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
-                            .color(INK)
-                            .size(18.0)
-                            .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("the Izarra 3000 virtual machine")
-                            .color(MUTED)
-                            .size(12.0),
-                    );
-                    ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
-                    ui.label(
-                        egui::RichText::new(
-                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0-only",
-                        )
-                        .color(MUTED)
-                        .size(12.0),
-                    );
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Bundled software")
-                            .color(LABEL)
-                            .size(11.0)
-                            .strong(),
-                    );
-                    notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
-                    ui.add_space(8.0);
-                    if ui.button("View license").clicked() {
-                        open_license = true;
-                    }
-                });
-            },
-        );
-        self.show_about = open;
-        self.show_license = open_license;
-    }
-
+impl GuiApp {
     /// Write the current prefs to disk. Best-effort: GuiPrefs::save logs and
     /// swallows any IO error, so this never interrupts the UI.
     fn save_prefs(&self) {
@@ -2828,68 +2534,6 @@ fn cue_bin_path(cue_path: &Path, cue: &str) -> PathBuf {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     ))
-}
-
-impl GuiApp {
-    /// Build one egui frame: the title, the sidebar, the monitor, and the optional
-    /// COM1 window. Keyboard, mouse capture, and focus loss are handled in the
-    /// winit event loop now, not here, so the guest reads raw physical keys.
-    fn ui(&mut self, ctx: &egui::Context) {
-        // The window title (capture-lock hint) is set directly on the winit window
-        // from the event loop now; viewport commands are not applied without eframe.
-        // Host render rate: count this frame, roll the rate up once a second.
-        let now = Instant::now();
-        self.frames_since += 1;
-        let mark = *self.metrics_mark.get_or_insert(now);
-        let window = now.duration_since(mark).as_secs_f64();
-        if window >= 1.0 {
-            self.host_fps = self.frames_since as f64 / window;
-            self.frames_since = 0;
-            self.metrics_mark = Some(now);
-        }
-        // Mirror the host lock keys onto the guest each frame.
-        self.sync_guest_locks();
-        if self.panel_open {
-            // No left/top/bottom margin so the close tab is flush to the left
-            // edge and spans the full height; the body adds its own padding.
-            let open_frame = egui::Frame::new()
-                .fill(PANEL_FACE)
-                .inner_margin(egui::Margin {
-                    left: 0,
-                    right: 12,
-                    top: 0,
-                    bottom: 0,
-                });
-            egui::SidePanel::right("controls")
-                .exact_width(320.0)
-                .resizable(false)
-                .frame(open_frame)
-                .show(ctx, |ui| self.controls_ui(ui));
-        } else {
-            egui::SidePanel::right("controls-tab")
-                .exact_width(18.0)
-                .resizable(false)
-                .frame(egui::Frame::new().fill(PANEL_FACE))
-                .show(ctx, |ui| self.collapsed_tab(ui));
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| self.monitor_ui(ui));
-        // The COM1 console floats over the central panel when toggled open.
-        if self.show_com1 {
-            self.com1_window(ctx);
-        }
-        // The configuration modal renders on top of everything when open.
-        self.config_ui(ctx);
-        // About must dispatch before License: its "View license" button sets
-        // show_license, so this order opens the License window the same frame.
-        if self.show_about {
-            self.about_window(ctx);
-        }
-        if self.show_license {
-            self.license_window(ctx);
-        }
-    }
 }
 
 /// Bump every UI text style up a couple of points for legibility. Applied once

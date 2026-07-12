@@ -167,6 +167,59 @@ fn record_instruction_fetch_run_matches_per_byte_record_loop() {
 }
 
 #[test]
+fn record_memory_run_matches_equal_width_record_loop() {
+    const ADDR: u32 = 0x12_3400;
+    const COUNT: u32 = 5;
+    const WAIT: u8 = 2;
+
+    for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+        for (mode, capacity) in [
+            (TracingMode::Off, DEFAULT_BUS_TRACE_CAPACITY),
+            (TracingMode::Counts, DEFAULT_BUS_TRACE_CAPACITY),
+            (TracingMode::Full, 3),
+        ] {
+            let mut bulk = BusTrace::with_capacity(capacity);
+            bulk.set_tracing_mode(mode);
+            let mut loop_ = BusTrace::with_capacity(capacity);
+            loop_.set_tracing_mode(mode);
+
+            bulk.record_memory_run(BusAccessKind::DataWrite, ADDR, COUNT, width, WAIT);
+            for i in 0..COUNT {
+                loop_.record(
+                    BusAccessKind::DataWrite,
+                    ADDR.wrapping_add(i * width.bytes()),
+                    width,
+                    WAIT,
+                );
+            }
+
+            assert_eq!(bulk.elapsed_clocks(), loop_.elapsed_clocks());
+            assert_eq!(bulk.access_count(), loop_.access_count());
+            assert_eq!(bulk.cycles(), loop_.cycles());
+        }
+    }
+}
+
+#[test]
+fn add_elapsed_clocks_bumps_only_the_clock_total() {
+    // The JIT cost-fold's bulk flush must advance elapsed_clocks by exactly the amount given,
+    // and touch nothing else (no access-count bump, no per-cycle detail): it stands in for the
+    // clocks a run of already-accounted accesses would have added, recorded in one op.
+    let mut t = BusTrace::default();
+    t.record(BusAccessKind::DataRead, 0x1000, BusWidth::Byte, 1); // 3 clocks, 1 access
+    let clocks_before = t.elapsed_clocks();
+    let count_before = t.access_count();
+    let cycles_before = t.cycles().len();
+    t.add_elapsed_clocks(40);
+    assert_eq!(t.elapsed_clocks(), clocks_before + 40);
+    assert_eq!(t.access_count(), count_before, "no access-count bump");
+    assert_eq!(t.cycles().len(), cycles_before, "no per-cycle detail added");
+    // Additive.
+    t.add_elapsed_clocks(2);
+    assert_eq!(t.elapsed_clocks(), clocks_before + 42);
+}
+
+#[test]
 fn io_bus_tracks_claimed_ports() {
     let mut bus = IoBus::default();
     bus.claim(PortRange::new(0x220, 0x22f));
