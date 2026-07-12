@@ -1292,9 +1292,17 @@ impl Machine {
         self.serial.output()
     }
 
+    pub fn serial2_output(&self) -> &[u8] {
+        self.serial2.output()
+    }
+
     /// Bytes captured by the LPT1 printer port (strobed prints, in order).
     pub fn lpt_output(&self) -> &[u8] {
         self.lpt.output()
+    }
+
+    pub fn lpt2_output(&self) -> &[u8] {
+        self.lpt2.output()
     }
 
     /// The LPT1 capture decoded as text, the printer-side mirror of serial_text.

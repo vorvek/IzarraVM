@@ -701,14 +701,57 @@ fn int14_modem_control_read_write_round_trips() {
 fn int14_unwired_port_times_out() {
     let mut m = int15_machine(16);
     m.cpu.registers.set_eax(0x0300);
-    // INT 14h only services COM1 (DX=0); the COM2 hardware exists but the
-    // BIOS service does not drive it, so DX=1 reads as a timeout.
-    m.cpu.registers.set_edx(1);
+    m.cpu.registers.set_edx(2);
     m.handle_int14();
     assert_eq!(
         (m.cpu.registers.eax() >> 8) as u8 & 0x80,
         0x80,
         "timeout bit set"
+    );
+}
+
+#[test]
+fn int14_services_com1_and_com2_with_isolated_state_and_capture() {
+    let mut m = int15_machine(16);
+    for (index, byte) in [(0u32, b'A'), (1, b'B')] {
+        m.cpu.registers.set_eax(0x00E3); // 9600 8N1
+        m.cpu.registers.set_edx(index);
+        m.handle_int14();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x60);
+
+        m.cpu.registers.set_eax(0x0100 | u32::from(byte));
+        m.cpu.registers.set_edx(index);
+        m.handle_int14();
+
+        m.cpu.registers.set_eax(0x0501); // independent MCR loopback state
+        m.cpu.registers.set_ebx(0x0010);
+        m.cpu.registers.set_edx(index);
+        m.handle_int14();
+        m.cpu.registers.set_eax(0x0152); // send 'R' through loopback
+        m.cpu.registers.set_edx(index);
+        m.handle_int14();
+        m.cpu.registers.set_eax(0x0200);
+        m.cpu.registers.set_edx(index);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u8, b'R');
+    }
+    assert_eq!(m.serial_output(), b"A");
+    assert_eq!(m.serial2_output(), b"B");
+
+    m.write_guest_block(0x4000, b"12");
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0x400));
+    m.cpu.registers.set_edi(0);
+    m.cpu.registers.set_ecx(2);
+    m.cpu.registers.set_eax(0x1900);
+    m.cpu.registers.set_edx(1);
+    m.handle_int14();
+    assert_eq!(m.cpu.registers.eax() as u16, 2);
+    assert_eq!(
+        m.serial2_output(),
+        b"B",
+        "loopback keeps FOSSIL bytes off capture"
     );
 }
 
@@ -841,6 +884,27 @@ fn int17_status_reports_ready_printer() {
         "ready status in AH"
     );
     assert!(m.lpt_output().is_empty(), "status query prints nothing");
+}
+
+#[test]
+fn int17_services_lpt1_and_lpt2_and_rejects_lpt3() {
+    let mut m = int15_machine(16);
+    for (index, byte) in [(0u32, b'1'), (1, b'2')] {
+        m.cpu.registers.set_eax(0x0100); // initialize selected port
+        m.cpu.registers.set_edx(index);
+        m.handle_int17();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x90);
+        m.cpu.registers.set_eax(u32::from(byte));
+        m.cpu.registers.set_edx(index);
+        m.handle_int17();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x90);
+    }
+    assert_eq!(m.lpt_output(), b"1");
+    assert_eq!(m.lpt2_output(), b"2");
+    m.cpu.registers.set_eax(0x0200);
+    m.cpu.registers.set_edx(2);
+    m.handle_int17();
+    assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x01);
 }
 
 #[test]

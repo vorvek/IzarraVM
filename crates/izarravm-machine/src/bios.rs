@@ -23,11 +23,10 @@ impl Machine {
         self.cpu.registers.set_eax(eax);
     }
 
-    /// Service INT 14h over the COM1 UART. DX selects the serial port; only COM1
-    /// (DX=0) is wired. The BIOS functions cover AH=00h-05h, and the FOSSIL calls
+    /// Service INT 14h over COM1/COM2 selected by DX=0/1. The BIOS functions cover
+    /// AH=00h-05h, and the FOSSIL calls
     /// use the same timed UART plus the BIOS text cursor and keyboard ring.
     pub(super) fn handle_int14(&mut self) {
-        const COM1: u16 = 0x03f8;
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
         let al = ax as u8;
@@ -69,28 +68,30 @@ impl Machine {
             _ => {}
         }
 
-        if self.cpu.registers.edx() as u16 != 0 {
+        let port = self.cpu.registers.edx() as u16;
+        if port >= 2 {
             self.set_eax_ah(0x80); // bit7 timeout: no such serial port
             return;
         }
+        let second = port == 1;
         match ah {
             0x00 => {
-                self.uart_init(al);
-                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
-                let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                self.uart_init(second, al);
+                let lsr = self.uart_read(second, 5);
+                let msr = self.uart_read(second, 6);
                 self.set_eax_ah(lsr);
                 self.set_eax_al(msr);
             }
             0x01 => {
-                self.serial.write_port(COM1, al);
-                self.finish_uart_transmit();
-                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                self.uart_write(second, 0, al);
+                self.finish_uart_transmit(second);
+                let lsr = self.uart_read(second, 5);
                 self.set_eax_ah(lsr & 0x7f); // bit7 clear = sent
             }
             0x02 => {
-                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                let lsr = self.uart_read(second, 5);
                 if lsr & 0x01 != 0 {
-                    let byte = self.serial.read_port(COM1).unwrap_or(0);
+                    let byte = self.uart_read(second, 0);
                     self.set_eax_al(byte);
                     self.set_eax_ah(lsr & 0x1e); // line status, data-ready/timeout clear
                 } else {
@@ -100,58 +101,57 @@ impl Machine {
                 }
             }
             0x03 => {
-                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
-                let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                let lsr = self.uart_read(second, 5);
+                let msr = self.uart_read(second, 6);
                 self.set_eax_ah(lsr);
                 self.set_eax_al(msr);
             }
             0x04 if bx == 0x4F50 => {
-                let mcr = self.serial.read_port(COM1 + 4).unwrap_or(0) | 0x01;
-                self.serial.write_port(COM1 + 4, mcr);
+                let mcr = self.uart_read(second, 4) | 0x01;
+                self.uart_write(second, 4, mcr);
                 self.set_ax(0x1954);
                 self.set_bx(0x001B);
             }
             0x04 if self.int14_extended_params_valid() => {
-                self.uart_extended_init();
-                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
-                let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                self.uart_extended_init(second);
+                let lsr = self.uart_read(second, 5);
+                let msr = self.uart_read(second, 6);
                 self.set_eax_ah(lsr);
                 self.set_eax_al(msr);
             }
             0x05 => match al {
                 0x00 => {
-                    let mcr = self.serial.read_port(COM1 + 4).unwrap_or(0);
+                    let mcr = self.uart_read(second, 4);
                     self.set_bx((self.cpu.registers.ebx() as u16 & 0xff00) | u16::from(mcr));
                     self.set_eax_ah(0x00);
                 }
                 0x01 => {
-                    self.serial
-                        .write_port(COM1 + 4, self.cpu.registers.ebx() as u8);
-                    let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
-                    let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                    self.uart_write(second, 4, self.cpu.registers.ebx() as u8);
+                    let lsr = self.uart_read(second, 5);
+                    let msr = self.uart_read(second, 6);
                     self.set_eax_ah(lsr);
                     self.set_eax_al(msr);
                 }
                 _ => self.set_eax_ah(0x80),
             },
             0x06 => {
-                let mcr = self.serial.read_port(COM1 + 4).unwrap_or(0);
+                let mcr = self.uart_read(second, 4);
                 let mcr = if al == 0 { mcr & !0x01 } else { mcr | 0x01 };
-                self.serial.write_port(COM1 + 4, mcr);
+                self.uart_write(second, 4, mcr);
             }
             0x08 | 0x09 | 0x0F | 0x10 | 0x14 | 0x1A => {}
             0x0A => {
-                while self.serial.read_port(COM1 + 5).unwrap_or(0) & 0x01 != 0 {
-                    let _ = self.serial.read_port(COM1);
+                while self.uart_read(second, 5) & 0x01 != 0 {
+                    let _ = self.uart_read(second, 0);
                 }
             }
             0x0B => {
-                self.serial.write_port(COM1, al);
-                self.finish_uart_transmit();
+                self.uart_write(second, 0, al);
+                self.finish_uart_transmit(second);
                 self.set_ax(0x0001);
             }
-            0x18 => self.int14_fossil_read_block(),
-            0x19 => self.int14_fossil_write_block(),
+            0x18 => self.int14_fossil_read_block(second),
+            0x19 => self.int14_fossil_write_block(second),
             0x1B => self.int14_fossil_driver_info(),
             _ => self.set_eax_ah(0x80),
         }
@@ -182,15 +182,14 @@ impl Machine {
         self.set_ax(word);
     }
 
-    fn int14_fossil_read_block(&mut self) {
-        const COM1: u16 = 0x03f8;
+    fn int14_fossil_read_block(&mut self, second: bool) {
         let max = self.cpu.registers.ecx() as u16;
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
         let mut dst = es + u32::from(di);
         let mut count = 0u16;
-        while count < max && self.serial.read_port(COM1 + 5).unwrap_or(0) & 0x01 != 0 {
-            let byte = self.serial.read_port(COM1).unwrap_or(0);
+        while count < max && self.uart_read(second, 5) & 0x01 != 0 {
+            let byte = self.uart_read(second, 0);
             self.write_physical_u8(dst, byte);
             dst = dst.wrapping_add(1);
             count += 1;
@@ -198,15 +197,14 @@ impl Machine {
         self.set_ax(count);
     }
 
-    fn int14_fossil_write_block(&mut self) {
-        const COM1: u16 = 0x03f8;
+    fn int14_fossil_write_block(&mut self, second: bool) {
         let count = self.cpu.registers.ecx() as u16;
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
         for index in 0..count {
             let byte = self.read_physical_u8(es + u32::from(di.wrapping_add(index)));
-            self.serial.write_port(COM1, byte);
-            self.finish_uart_transmit();
+            self.uart_write(second, 0, byte);
+            self.finish_uart_transmit(second);
         }
         self.set_ax(count);
     }
@@ -226,11 +224,26 @@ impl Machine {
         self.set_ax(count as u16);
     }
 
-    /// Program the COM1 UART from an INT 14h AH=00h parameter byte: bits 7-5 baud
+    fn uart_read(&mut self, second: bool, register: u16) -> u8 {
+        if second {
+            self.serial2.read_port(0x02f8 + register).unwrap_or(0)
+        } else {
+            self.serial.read_port(0x03f8 + register).unwrap_or(0)
+        }
+    }
+
+    fn uart_write(&mut self, second: bool, register: u16, value: u8) {
+        if second {
+            self.serial2.write_port(0x02f8 + register, value);
+        } else {
+            self.serial.write_port(0x03f8 + register, value);
+        }
+    }
+
+    /// Program the selected UART from an INT 14h AH=00h parameter byte: bits 7-5 baud
     /// rate, 4-3 parity, 2 stop bits, 1-0 word length. The divisor is stored for
     /// fidelity and drives transmit timing.
-    fn uart_init(&mut self, params: u8) {
-        const COM1: u16 = 0x03f8;
+    fn uart_init(&mut self, second: bool, params: u8) {
         let divisor: u16 = match params >> 5 {
             0 => 1047, // 110 baud at 1.8432 MHz
             1 => 768,  // 150
@@ -249,14 +262,18 @@ impl Machine {
             0b11 => lcr |= 0x08 | 0x10, // parity enable, even
             _ => {}                     // no parity
         }
-        self.serial.write_port(COM1 + 3, 0x80); // LCR DLAB=1
-        self.serial.write_port(COM1, (divisor & 0xff) as u8); // DLL
-        self.serial.write_port(COM1 + 1, (divisor >> 8) as u8); // DLM
-        self.serial.write_port(COM1 + 3, lcr); // LCR, clears DLAB
+        self.uart_write(second, 3, 0x80); // LCR DLAB=1
+        self.uart_write(second, 0, (divisor & 0xff) as u8); // DLL
+        self.uart_write(second, 1, (divisor >> 8) as u8); // DLM
+        self.uart_write(second, 3, lcr); // LCR, clears DLAB
     }
 
-    fn finish_uart_transmit(&mut self) {
-        let ticks = self.serial.ticks_until_idle();
+    fn finish_uart_transmit(&mut self, second: bool) {
+        let ticks = if second {
+            self.serial2.ticks_until_idle()
+        } else {
+            self.serial.ticks_until_idle()
+        };
         self.stall_for_master_ticks(ticks);
     }
 
@@ -272,10 +289,9 @@ impl Machine {
         al <= 1 && bh <= 4 && bl <= 1 && ch <= 3 && cl <= 0x0b
     }
 
-    /// Program the COM1 UART from the PS/2 INT 14h AH=04h extended-configuration
+    /// Program the selected UART from the PS/2 INT 14h AH=04h extended-configuration
     /// fields: BH parity, BL stop bits, CH word length, CL baud-rate index.
-    fn uart_extended_init(&mut self) {
-        const COM1: u16 = 0x03f8;
+    fn uart_extended_init(&mut self, second: bool) {
         let bx = self.cpu.registers.ebx() as u16;
         let cx = self.cpu.registers.ecx() as u16;
         let parity = (bx >> 8) as u8;
@@ -307,43 +323,68 @@ impl Machine {
             4 => lcr |= 0x08 | 0x10 | 0x20, // stick even
             _ => {}
         }
-        self.serial.write_port(COM1 + 3, 0x80);
-        self.serial.write_port(COM1, (divisor & 0xff) as u8);
-        self.serial.write_port(COM1 + 1, (divisor >> 8) as u8);
-        self.serial.write_port(COM1 + 3, lcr);
+        self.uart_write(second, 3, 0x80);
+        self.uart_write(second, 0, (divisor & 0xff) as u8);
+        self.uart_write(second, 1, (divisor >> 8) as u8);
+        self.uart_write(second, 3, lcr);
     }
 
-    /// Service INT 17h (PRINTER) over LPT1. DX selects the port; only LPT1 (DX=0)
-    /// is wired. AH=00h prints AL, AH=01h initializes, AH=02h reads status. AH
+    /// Service INT 17h (PRINTER) over LPT1/LPT2 selected by DX=0/1. AH=00h
+    /// prints AL, AH=01h initializes, AH=02h reads status. AH
     /// returns the BIOS printer-status byte.
     pub(super) fn handle_int17(&mut self) {
-        const LPT1: u16 = 0x0378;
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
         let al = ax as u8;
-        if self.cpu.registers.edx() as u16 != 0 {
+        let port = self.cpu.registers.edx() as u16;
+        if port >= 2 {
             self.set_eax_ah(0x01); // bit0 timeout: no such printer
             return;
         }
+        let second = port == 1;
         if ah == 0x00 {
             // Latch the byte and pulse -Strobe so the LPT captures it.
-            self.lpt.write_port(LPT1, al);
-            let base = self.lpt.read_port(LPT1 + 2).unwrap_or(0) & 0x1e; // keep bits 1-4
-            self.lpt.write_port(LPT1 + 2, base | 0x01); // assert -Strobe (edge captures)
-            self.lpt.write_port(LPT1 + 2, base); // de-assert
-            self.stall_for_master_ticks(self.lpt.ticks_until_idle());
+            self.lpt_write(second, 0, al);
+            let base = self.lpt_read(second, 2) & 0x1e; // keep bits 1-4
+            self.lpt_write(second, 2, base | 0x01); // assert -Strobe (edge captures)
+            self.lpt_write(second, 2, base); // de-assert
+            let ticks = if second {
+                self.lpt2.ticks_until_idle()
+            } else {
+                self.lpt.ticks_until_idle()
+            };
+            self.stall_for_master_ticks(ticks);
+        } else if ah == 0x01 {
+            self.lpt_write(second, 2, 0x00); // pulse active-low -Init
+            self.lpt_write(second, 2, 0x04);
         }
         // AH=01h initialize and AH=02h are status-only. A completed print has
         // already passed through BUSY and -ACK, so the returned status is idle.
-        let status = self.int17_printer_status();
+        let status = self.int17_printer_status(second);
         self.set_eax_ah(status);
     }
 
-    /// Translate the LPT1 status port into the INT 17h status byte: keep bits 7-3
+    fn lpt_read(&self, second: bool, register: u16) -> u8 {
+        if second {
+            self.lpt2.read_port(0x0278 + register).unwrap_or(0)
+        } else {
+            self.lpt.read_port(0x0378 + register).unwrap_or(0)
+        }
+    }
+
+    fn lpt_write(&mut self, second: bool, register: u16, value: u8) {
+        if second {
+            self.lpt2.write_port(0x0278 + register, value);
+        } else {
+            self.lpt.write_port(0x0378 + register, value);
+        }
+    }
+
+    /// Translate the selected LPT status port into the INT 17h status byte: keep bits 7-3
     /// and flip -ACK (bit6) and -Error (bit3) so "acknowledge" and "I/O error" read
     /// in the BIOS sense. An always-ready printer yields 0x90 (not busy, selected).
-    fn int17_printer_status(&self) -> u8 {
-        let port = self.lpt.read_port(0x0379).unwrap_or(0);
+    fn int17_printer_status(&self, second: bool) -> u8 {
+        let port = self.lpt_read(second, 1);
         (port & 0xf8) ^ 0x48
     }
 
