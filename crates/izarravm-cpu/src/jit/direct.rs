@@ -62,6 +62,10 @@ const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 3_928;
 const DEFAULT_ENTRY_CAP: usize = 131_072;
 const BLOCK_PAGE_SHIFT: u32 = 12;
+#[cfg(not(test))]
+const DEFAULT_ADMISSION_HEAT: u8 = 8;
+#[cfg(test)]
+const DEFAULT_ADMISSION_HEAT: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct LinkTarget {
@@ -499,10 +503,13 @@ pub(crate) struct BlockCache {
     disabled: bool,
     backend_enabled: bool,
     auto_admit: bool,
+    admission_heat: u8,
     stats: BlockCacheStats,
     code_watch: Box<NativeCodeWatch>,
     #[cfg(test)]
     defer_short_for_test: bool,
+    #[cfg(test)]
+    fast_map_enabled_for_test: bool,
 }
 
 impl Default for BlockCache {
@@ -540,10 +547,13 @@ impl BlockCache {
             disabled: false,
             backend_enabled: super::host_supported(),
             auto_admit: false,
+            admission_heat: DEFAULT_ADMISSION_HEAT,
             stats: BlockCacheStats::default(),
             code_watch: Box::default(),
             #[cfg(test)]
             defer_short_for_test: false,
+            #[cfg(test)]
+            fast_map_enabled_for_test: false,
         }
     }
 
@@ -555,12 +565,38 @@ impl BlockCache {
         self.backend_enabled
     }
 
+    pub(crate) fn execution_enabled(&self) -> bool {
+        self.backend_enabled && self.auto_admit
+    }
+
+    pub(crate) fn fast_map_enabled(&self) -> bool {
+        #[cfg(test)]
+        if self.fast_map_enabled_for_test {
+            return true;
+        }
+        self.execution_enabled()
+    }
+
+    pub(crate) fn admission_heat(&self) -> u8 {
+        self.admission_heat
+    }
+
     pub(crate) fn set_backend_enabled(&mut self, on: bool) {
         self.backend_enabled = on && super::host_supported();
     }
 
     pub(crate) fn set_auto_admit(&mut self, on: bool) {
         self.auto_admit = on;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_admission_heat_for_test(&mut self, heat: u8) {
+        self.admission_heat = heat.max(1);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fast_map_enabled_for_test(&mut self, enabled: bool) {
+        self.fast_map_enabled_for_test = enabled;
     }
 
     pub(crate) fn probe(&mut self, key: BlockKey) -> BlockProbe {
@@ -1364,6 +1400,7 @@ impl Clone for BlockCache {
     fn clone(&self) -> Self {
         Self {
             backend_enabled: self.backend_enabled,
+            admission_heat: self.admission_heat,
             ..Self::default()
         }
     }

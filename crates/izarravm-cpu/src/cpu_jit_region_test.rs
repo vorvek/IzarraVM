@@ -766,6 +766,7 @@ fn paged_legacy_native_u8_uses_physical_fetches_without_publishing_a_false_alias
         memory[ALIAS_PHYSICAL as usize] = 0x92;
 
         let mut cpu = CpuGsw::default();
+        cpu.jit_direct.set_fast_map_enabled_for_test(true);
         cpu.set_mode(GswMode::Gsw586);
         cpu.control.cr0 |= CR0_PE | CR0_PG;
         cpu.control.cr3 = 0x1000;

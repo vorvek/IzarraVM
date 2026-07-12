@@ -1581,12 +1581,6 @@ fn decode_cache_lines() -> usize {
 #[cfg(feature = "jit")]
 const JIT_HOTNESS_THRESHOLD: u16 = 32;
 
-/// Continuation encounters before a decode line enters the direct-code cache's own
-/// observe-then-compile admission sequence. A one-shot straight-line continuation stays cold;
-/// a loop head reaches the direct probe on its second encounter.
-#[cfg(feature = "jit")]
-const JIT_DIRECT_HOTNESS_THRESHOLD: u8 = 1;
-
 /// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
 /// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
 /// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
@@ -2056,15 +2050,15 @@ impl DecodeCache {
     /// hot, later encounters stay eligible for the direct cache's separate first-seen/compile probe.
     #[cfg(feature = "jit")]
     #[inline]
-    fn direct_hot(&mut self, lin: u32, d: bool) -> bool {
+    fn direct_hot(&mut self, lin: u32, d: bool, threshold: u8) -> bool {
         let line = &mut self.lines[(lin & self.mask) as usize];
         if line.generation != self.generation || line.tag != lin || line.d != d {
             return false;
         }
-        if line.jit_direct_hotness < JIT_DIRECT_HOTNESS_THRESHOLD {
+        if line.jit_direct_hotness < threshold {
             line.jit_direct_hotness += 1;
         }
-        line.jit_direct_hotness == JIT_DIRECT_HOTNESS_THRESHOLD
+        line.jit_direct_hotness == threshold
     }
 
     /// Invalidate every cached line and drop every matching code watch. The generation advance and

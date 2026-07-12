@@ -34,7 +34,9 @@ impl CpuGsw {
     ))]
     #[inline(always)]
     fn fast_map_population_enabled(&self) -> bool {
-        self.mode().uses_approximate_timing() && !self.jit_regions.auto_admit()
+        self.mode().uses_approximate_timing()
+            && self.jit_direct.fast_map_enabled()
+            && !self.jit_regions.auto_admit()
     }
 
     #[cfg(all(
@@ -1077,7 +1079,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if self.mode().uses_approximate_timing()
+        if self.fast_map_population_enabled()
             && let Some(physical) = self.jit_fast_map.lookup_physical(linear, write, user, wp)
         {
             if write {
