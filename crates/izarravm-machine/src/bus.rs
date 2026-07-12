@@ -1243,6 +1243,7 @@ impl CpuBus for MachineBus<'_> {
             if self.vega.memory_decode_key() != pci_decode {
                 self.ram_lookup.rebuild(self.memory.len(), self.vega);
                 *self.direct_map_changed = true;
+                debug_assert!(*self.io_touched);
             }
             if let Some(disk) = self.ata.as_mut() {
                 self.bmide
@@ -1433,6 +1434,7 @@ impl CpuBus for MachineBus<'_> {
             if self.vega.direct_write_token() != direct_write_before {
                 *self.direct_data_map_changed = true;
                 *self.io_touched = true;
+                debug_assert!(*self.io_touched);
             }
             return Ok(());
         }
@@ -1459,12 +1461,7 @@ impl CpuBus for MachineBus<'_> {
 
     #[inline]
     fn requires_step_break(&self) -> bool {
-        // End at the instruction boundary for time-dependent I/O, an HLE
-        // interrupt, or a device-map change that makes a cached page stale.
-        *self.io_touched
-            || *self.direct_map_changed
-            || *self.direct_data_map_changed
-            || self.pending_soft_int.is_some()
+        *self.io_touched || self.pending_soft_int.is_some()
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {

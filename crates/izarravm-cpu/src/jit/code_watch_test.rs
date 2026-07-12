@@ -140,6 +140,27 @@ fn marks_every_chunk_touched_and_clears_without_moving_the_table() {
 }
 
 #[test]
+fn empty_and_inactive_native_watch_ranges_are_unwatched() {
+    let mut watch = NativeCodeWatch::default();
+    assert!(!watch.range_watched(0x12_340, 1));
+    assert!(!watch.range_watched(0x12_340, 0));
+
+    let base = watch.table_base();
+    assert!(!watch.range_watched(0x12_340, 1));
+
+    watch.acquire_range(0x12_340, 1);
+    assert!(watch.range_watched(0x12_340, 1));
+    watch.release_range(0x12_340, 1);
+    assert_eq!(watch.inactive_pages(), 1);
+    assert!(!watch.range_watched(0x12_340, 1));
+
+    watch.clear();
+    assert_eq!(watch.table_base(), base);
+    assert!(!watch.has_resident_pages());
+    assert!(!watch.range_watched(0x12_340, 1));
+}
+
+#[test]
 fn refcounted_ranges_keep_shared_chunks_until_the_last_owner_leaves() {
     let mut watch = NativeCodeWatch::default();
     watch.acquire_range(0x100, 16);
@@ -186,6 +207,7 @@ fn wrapping_range_owns_and_releases_both_end_pages() {
     watch.acquire_range(0xffff_fff8, 16);
     assert!(watch.is_watched(0xffff_fff0));
     assert!(watch.is_watched(0));
+    assert!(watch.range_watched(0xffff_fff8, 16));
     assert_eq!(watch.active_pages(), 2);
 
     watch.release_range(0xffff_fff8, 16);
