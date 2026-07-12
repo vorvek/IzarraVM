@@ -316,6 +316,167 @@ fn fault_after_resumed_rep_chunk_rewinds_to_original_instruction() {
     assert!(cpu.rep_execution.resume.is_none());
 }
 
+const BUDGETED_PAGED_REP_ORIGIN: u32 = 0x100;
+const BUDGETED_PAGED_REP_SOURCE: u32 = 0x003f_fff0;
+const BUDGETED_PAGED_REP_DESTINATION: u32 = 0x0080_1000;
+const BUDGETED_PAGED_REP_COUNT: u32 = 32;
+const BUDGETED_PAGED_REP_PD: usize = 0x1000;
+const BUDGETED_PAGED_REP_PT0: usize = 0x2000;
+const BUDGETED_PAGED_REP_PT1: usize = 0x3000;
+const BUDGETED_PAGED_REP_PT2: usize = 0x7000;
+
+fn budgeted_paged_rep_fixture() -> (CpuGsw, TestBus) {
+    let mut memory = vec![0; 0xa000];
+    memory[BUDGETED_PAGED_REP_PD..BUDGETED_PAGED_REP_PD + 4]
+        .copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    memory[BUDGETED_PAGED_REP_PD + 4..BUDGETED_PAGED_REP_PD + 8]
+        .copy_from_slice(&0x0000_3007u32.to_le_bytes());
+    memory[BUDGETED_PAGED_REP_PD + 8..BUDGETED_PAGED_REP_PD + 12]
+        .copy_from_slice(&0x0000_7007u32.to_le_bytes());
+    memory[BUDGETED_PAGED_REP_PT0..BUDGETED_PAGED_REP_PT0 + 4]
+        .copy_from_slice(&0x0000_4007u32.to_le_bytes());
+    memory[BUDGETED_PAGED_REP_PT0 + 1023 * 4..BUDGETED_PAGED_REP_PT0 + 1024 * 4]
+        .copy_from_slice(&0x0000_5007u32.to_le_bytes());
+    memory[BUDGETED_PAGED_REP_PT1..BUDGETED_PAGED_REP_PT1 + 4]
+        .copy_from_slice(&0x0000_6007u32.to_le_bytes());
+    memory[BUDGETED_PAGED_REP_PT2 + 4..BUDGETED_PAGED_REP_PT2 + 8]
+        .copy_from_slice(&0x0000_8007u32.to_le_bytes());
+    let code = 0x4000 + BUDGETED_PAGED_REP_ORIGIN as usize;
+    memory[code..code + 3].copy_from_slice(&[0xf3, 0xa4, 0xf4]);
+    for index in 0..BUDGETED_PAGED_REP_COUNT as usize {
+        let physical = if index < 16 {
+            0x5ff0 + index
+        } else {
+            0x6000 + index - 16
+        };
+        memory[physical] = index as u8 ^ 0x5a;
+    }
+
+    let mut cpu = CpuGsw::default();
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x08, 0x9b));
+    for segment in [SegmentIndex::Ds, SegmentIndex::Es, SegmentIndex::Ss] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+    }
+    cpu.control.cr3 = BUDGETED_PAGED_REP_PD as u32;
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.registers.eip = BUDGETED_PAGED_REP_ORIGIN;
+    cpu.registers.set_esi(BUDGETED_PAGED_REP_SOURCE);
+    cpu.registers.set_edi(BUDGETED_PAGED_REP_DESTINATION);
+    cpu.registers.set_ecx(BUDGETED_PAGED_REP_COUNT);
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+    bus.rep_data_byte_cost_override = Some(2);
+    (cpu, bus)
+}
+
+#[test]
+fn budgeted_paged_rep_reserves_the_next_four_mib_page_walk() {
+    let (mut cpu, mut bus) = budgeted_paged_rep_fixture();
+
+    let before_bus = bus.trace.elapsed_clocks();
+    let outcome = cpu.run_budgeted(&mut bus, 100).unwrap();
+    let charged = u64::from(outcome.consumed_core_clocks)
+        + bus.trace.elapsed_clocks().saturating_sub(before_bus);
+
+    assert!(charged <= 100, "charged {charged} clocks");
+    assert_eq!(cpu.registers.eip, BUDGETED_PAGED_REP_ORIGIN);
+    assert_eq!(cpu.registers.ecx(), 16);
+    assert_eq!(cpu.registers.esi(), 0x0040_0000);
+    assert_eq!(cpu.registers.edi(), BUDGETED_PAGED_REP_DESTINATION + 16);
+    assert_eq!(
+        &bus.memory[0x8000..0x8010],
+        &(0..16).map(|index| index as u8 ^ 0x5a).collect::<Vec<_>>()
+    );
+    let next_pde = u32::from_le_bytes(
+        bus.memory[BUDGETED_PAGED_REP_PD + 4..BUDGETED_PAGED_REP_PD + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let next_pte = u32::from_le_bytes(
+        bus.memory[BUDGETED_PAGED_REP_PT1..BUDGETED_PAGED_REP_PT1 + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(next_pde & 0x20, 0, "the next PDE was walked early");
+    assert_eq!(next_pte & 0x60, 0, "the next PTE was walked early");
+}
+
+#[test]
+fn budgeted_paged_movsw_reserves_both_sides_of_each_split_operand() {
+    const SOURCE: u32 = 0x003f_ffff;
+    const DESTINATION: u32 = 0x0080_1fff;
+    let mut memory = vec![0; 0xa000];
+    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    memory[0x1004..0x1008].copy_from_slice(&0x0000_3007u32.to_le_bytes());
+    memory[0x1008..0x100c].copy_from_slice(&0x0000_7007u32.to_le_bytes());
+    memory[0x2000..0x2004].copy_from_slice(&0x0000_4007u32.to_le_bytes());
+    memory[0x2ffc..0x3000].copy_from_slice(&0x0000_5007u32.to_le_bytes());
+    memory[0x3000..0x3004].copy_from_slice(&0x0000_6007u32.to_le_bytes());
+    memory[0x7004..0x7008].copy_from_slice(&0x0000_8007u32.to_le_bytes());
+    memory[0x7008..0x700c].copy_from_slice(&0x0000_9007u32.to_le_bytes());
+    memory[0x4100..0x4104].copy_from_slice(&[0xf3, 0x66, 0xa5, 0xf4]);
+    memory[0x5fff] = 0xa5;
+    memory[0x6000] = 0x5a;
+
+    let mut cpu = CpuGsw::default();
+    cpu.registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x08, 0x9b));
+    for segment in [SegmentIndex::Ds, SegmentIndex::Es, SegmentIndex::Ss] {
+        cpu.registers
+            .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+    }
+    cpu.control.cr3 = 0x1000;
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.registers.eip = 0x100;
+    cpu.registers.set_esi(SOURCE);
+    cpu.registers.set_edi(DESTINATION);
+    cpu.registers.set_ecx(1);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_page_clocks = true;
+    bus.report_batch_clocks = true;
+    bus.rep_data_byte_cost_override = Some(2);
+
+    cpu.run_budgeted(&mut bus, 50).unwrap();
+    assert_eq!(cpu.registers.eip, 0x100);
+    assert_eq!(cpu.registers.ecx(), 1);
+    assert_eq!(cpu.registers.esi(), SOURCE);
+    assert_eq!(cpu.registers.edi(), DESTINATION);
+    assert_eq!(&bus.memory[0x8fff..0x9001], &[0, 0]);
+    for entry in [0x2ffc, 0x3000, 0x7004, 0x7008] {
+        let value = u32::from_le_bytes(bus.memory[entry..entry + 4].try_into().unwrap());
+        assert_eq!(value & 0x60, 0, "page-table entry {entry:#x} was touched");
+    }
+
+    cpu.run_budgeted(&mut bus, 1).unwrap();
+    assert_eq!(cpu.registers.ecx(), 0);
+    assert_eq!(cpu.registers.esi(), SOURCE + 2);
+    assert_eq!(cpu.registers.edi(), DESTINATION + 2);
+    assert_eq!(&bus.memory[0x8fff..0x9001], &[0xa5, 0x5a]);
+}
+
+#[test]
+fn paged_rep_without_a_walk_bound_advances_once_per_resumed_batch() {
+    let (mut cpu, mut bus) = budgeted_paged_rep_fixture();
+    bus.page_walk_bound_available = false;
+
+    cpu.run_budgeted(&mut bus, 1).unwrap();
+    assert_eq!(cpu.registers.ecx(), BUDGETED_PAGED_REP_COUNT);
+    assert_eq!(cpu.registers.eip, BUDGETED_PAGED_REP_ORIGIN);
+
+    for completed in 1..=BUDGETED_PAGED_REP_COUNT {
+        cpu.run_budgeted(&mut bus, 1).unwrap();
+        assert_eq!(cpu.registers.ecx(), BUDGETED_PAGED_REP_COUNT - completed);
+        assert_eq!(cpu.registers.esi(), BUDGETED_PAGED_REP_SOURCE + completed);
+        if completed != BUDGETED_PAGED_REP_COUNT {
+            assert_eq!(cpu.registers.eip, BUDGETED_PAGED_REP_ORIGIN);
+        }
+    }
+}
+
 #[test]
 fn paged_rep_movsb_bulk_translates_each_page_once_and_keeps_noncontiguous_frames() {
     const PAGE_DIRECTORY: usize = 0x1000;

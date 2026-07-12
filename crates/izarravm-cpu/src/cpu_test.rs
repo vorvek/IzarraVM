@@ -1247,6 +1247,10 @@ struct TestBus {
     // Opt-in batch-clock reporting for tight event-budget tests. Historical CPU tests leave it
     // off because their TestBus predates machine-level combined core/bus caps.
     report_batch_clocks: bool,
+    page_walk_bound_available: bool,
+    rep_data_byte_cost_override: Option<u64>,
+    direct_memory_max_clock_override: Option<u64>,
+    project_additional_bus_clocks: bool,
     native_aggregate_accounting_disabled: bool,
     mode13_dirty_pages: u16,
     mode13_byte_writes: u64,
@@ -1270,6 +1274,10 @@ impl TestBus {
             uniform_native_fetches: false,
             direct_page_clocks: false,
             report_batch_clocks: false,
+            page_walk_bound_available: true,
+            rep_data_byte_cost_override: None,
+            direct_memory_max_clock_override: None,
+            project_additional_bus_clocks: false,
             native_aggregate_accounting_disabled: false,
             mode13_dirty_pages: 0,
             mode13_byte_writes: 0,
@@ -1368,7 +1376,7 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<DirectMemoryRead, BusError> {
-        if self.direct_memory_bytes(address, width.bytes() as usize, width)
+        if self.direct_memory_bytes(address, width.bytes() as usize, width, kind)
             == width.bytes() as usize
         {
             return self
@@ -1392,7 +1400,7 @@ impl CpuBus for TestBus {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<DirectMemoryWrite, BusError> {
-        if self.direct_memory_bytes(address, width.bytes() as usize, width)
+        if self.direct_memory_bytes(address, width.bytes() as usize, width, kind)
             == width.bytes() as usize
         {
             self.write_memory(address, width, value, kind)?;
@@ -1409,7 +1417,10 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<usize, BusError> {
-        if self.direct_memory_bytes(address, out.len(), width) != out.len() {
+        if kind != BusAccessKind::DataRead {
+            return Ok(0);
+        }
+        if self.direct_memory_bytes(address, out.len(), width, kind) != out.len() {
             return Ok(0);
         }
         let access = width.bytes() as usize;
@@ -1429,7 +1440,10 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<usize, BusError> {
-        if self.direct_memory_bytes(address, data.len(), width) != data.len() {
+        if kind != BusAccessKind::DataWrite {
+            return Ok(0);
+        }
+        if self.direct_memory_bytes(address, data.len(), width, kind) != data.len() {
             return Ok(0);
         }
         let access = width.bytes() as usize;
@@ -1442,8 +1456,18 @@ impl CpuBus for TestBus {
         Ok(data.len())
     }
 
-    fn direct_memory_bytes(&self, address: u32, bytes: usize, width: BusWidth) -> usize {
-        if bytes == 0 || (address as usize & 0x0fff) + bytes > 0x1000 {
+    fn direct_memory_bytes(
+        &self,
+        address: u32,
+        bytes: usize,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> usize {
+        if !matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
+            || bytes == 0
+            || bytes % width.bytes() as usize != 0
+            || (address as usize & 0x0fff) + bytes > 0x1000
+        {
             return 0;
         }
         if matches!(width, BusWidth::Word) && address & 1 != 0
@@ -1549,6 +1573,18 @@ impl CpuBus for TestBus {
         }
     }
 
+    fn rep_page_walk_cost_upper(&self) -> Option<u64> {
+        self.page_walk_bound_available
+            .then_some(if self.report_batch_clocks { 8 } else { 0 })
+    }
+
+    fn rep_data_byte_cost_upper(&self) -> u64 {
+        self.rep_data_byte_cost_override.unwrap_or_else(|| {
+            self.jit_data_cost_clocks(BusWidth::Byte)
+                .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
+        })
+    }
+
     fn charge_native_mode13_writes(&mut self, writes: izarravm_bus::NativeMode13Writes) {
         self.mode13_dirty_pages |= writes.dirty_pages;
         self.mode13_byte_writes += writes.byte_writes;
@@ -1593,15 +1629,20 @@ impl CpuBus for TestBus {
     }
 
     fn jit_direct_memory_max_clocks(&self, _width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
-        Some(0)
+        Some(self.direct_memory_max_clock_override.unwrap_or(0))
     }
 
     fn jit_cached_fetch_run_clocks(&self, _start: u32, count: u32) -> Option<u64> {
         Some(u64::from(count) * 2)
     }
 
-    fn jit_projected_batch_scaled_bus_clocks(&self, _additional_raw: u64) -> Option<u64> {
-        Some(0)
+    fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        Some(if self.project_additional_bus_clocks {
+            self.in_batch_scaled_bus_clocks()
+                .saturating_add(additional_raw)
+        } else {
+            0
+        })
     }
 
     // Hand out a host-pointer page into `memory`, mirroring MachineBus::direct_page, so the

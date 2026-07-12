@@ -1777,7 +1777,7 @@ fn native_memory_preflights_finite_caps_in_all_modes() {
         GswMode::Gsw386,
         GswMode::Gsw386Slow,
     ] {
-        for cap in [3, 7, 13] {
+        for (cap, direct_bound) in [(3, None), (7, None), (13, None), (13, Some(64))] {
             let mut program = h_copy_program();
             program[H_COUNT..H_COUNT + 4].copy_from_slice(&2u32.to_le_bytes());
             let mut interp = fresh_for(mode);
@@ -1786,6 +1786,14 @@ fn native_memory_preflights_finite_caps_in_all_modes() {
             let mut bus_j = TestBus::with_memory(program);
             bus_i.direct_pages_enabled = true;
             bus_j.direct_pages_enabled = true;
+            if cap == 13 {
+                bus_j.project_additional_bus_clocks = true;
+            }
+            if let Some(bound) = direct_bound {
+                // Model a direct device page whose access cost exceeds the remaining event cap.
+                // The region must execute the memory slot through its precise helper instead.
+                bus_j.direct_memory_max_clock_override = Some(bound);
+            }
             flat_ds_arm(0x2000, 0x3000)(&mut interp);
             flat_ds_arm(0x2000, 0x3000)(&mut jit_cpu);
             drive_to_halt(&mut interp, &mut bus_i);
@@ -1803,17 +1811,33 @@ fn native_memory_preflights_finite_caps_in_all_modes() {
             jit_cpu.reset_perf_counters();
             let calls_i = drive(&mut interp, &mut bus_i, cap);
             let calls_j = drive(&mut jit_cpu, &mut bus_j, cap);
-            assert_eq!(calls_i, calls_j, "{mode:?}, cap {cap}");
+            assert_eq!(
+                calls_i, calls_j,
+                "{mode:?}, cap {cap}, bound {direct_bound:?}"
+            );
             assert_state_identical(&interp, &jit_cpu);
             assert_eq!(interp.elapsed_clocks, jit_cpu.elapsed_clocks);
             assert_eq!(bus_i.memory, bus_j.memory);
             let perf = jit_cpu.perf_counters();
             assert!(perf.jit_native_memory_helpers > 0, "{mode:?}, cap {cap}");
-            if cap == 3 {
+            if cap == 3 || direct_bound.is_some() {
                 assert!(
                     perf.jit_native_memory_helpers
                         > perf.jit_native_load_hits + perf.jit_native_store_hits,
-                    "{mode:?}: no native memory instruction used the cap fallback"
+                    "{mode:?}, cap {cap}, bound {direct_bound:?}: no cap fallback"
+                );
+            }
+            if cap == 13 && direct_bound.is_none() {
+                assert!(
+                    perf.jit_native_load_hits + perf.jit_native_store_hits > 0,
+                    "{mode:?}: cap-13 control recorded no native memory hits"
+                );
+            }
+            if direct_bound.is_some() {
+                assert_eq!(
+                    perf.jit_native_load_hits + perf.jit_native_store_hits,
+                    0,
+                    "{mode:?}: high-latency device access ran natively"
                 );
             }
         }

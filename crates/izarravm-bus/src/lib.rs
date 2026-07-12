@@ -533,7 +533,16 @@ pub trait CpuBus {
         Ok(0)
     }
 
-    fn direct_memory_bytes(&self, _address: u32, _bytes: usize, _access_width: BusWidth) -> usize {
+    /// Return the page-local byte count available to the matching bulk data operation.
+    /// A full result promises that the corresponding direct read or write can complete without
+    /// falling through to a device handler. Other access kinds must return zero for device pages.
+    fn direct_memory_bytes(
+        &self,
+        _address: u32,
+        _bytes: usize,
+        _access_width: BusWidth,
+        _kind: BusAccessKind,
+    ) -> usize {
         0
     }
 
@@ -656,6 +665,13 @@ pub trait CpuBus {
     fn rep_data_byte_cost_upper(&self) -> u64 {
         self.jit_data_cost_clocks(BusWidth::Byte)
             .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
+    }
+
+    /// Return a scaled-clock upper bound for one successful cold page translation, including
+    /// PDE and PTE reads plus their possible accessed/dirty writes. `None` makes a budgeted paged
+    /// REP yield before initial progress; a resumed instruction may still advance one iteration.
+    fn rep_page_walk_cost_upper(&self) -> Option<u64> {
+        None
     }
 
     /// Commit native VGA writes at a block-chain boundary. Implementations update

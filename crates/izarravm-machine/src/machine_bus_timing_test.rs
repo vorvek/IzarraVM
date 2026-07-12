@@ -142,6 +142,7 @@ fn jit_direct_memory_preview_bounds_the_live_bus_charge() {
     ] {
         let mut machine = test_machine();
         machine.set_mode(mode);
+        assert!(machine.set_vga_mode(0x13));
         with_bus(&mut machine, |bus| {
             let data_bound = bus
                 .jit_direct_memory_max_clocks(BusWidth::Byte, BusAccessKind::DataRead)
@@ -173,8 +174,41 @@ fn jit_direct_memory_preview_bounds_the_live_bus_charge() {
                 charged <= data_bound,
                 "{mode:?}: charged {charged}, bound {data_bound}"
             );
+
+            for kind in [BusAccessKind::DataRead, BusAccessKind::DataWrite] {
+                assert!(
+                    bus.direct_page(0xA_1000, kind).unwrap().is_some(),
+                    "{mode:?}: canonical Mode 13h must expose a direct page"
+                );
+                let before = bus.trace.elapsed_clocks();
+                bus.charge_direct_memory(0xA_1234, BusWidth::Byte, kind)
+                    .unwrap();
+                let charged = bus.trace.elapsed_clocks() - before;
+                assert!(
+                    charged <= data_bound,
+                    "{mode:?} {kind:?}: VGA charged {charged}, bound {data_bound}"
+                );
+            }
         });
     }
+}
+
+#[test]
+fn accurate_direct_memory_preview_includes_custom_video_wait_states() {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.wait_states.video = 123;
+    let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+
+    with_bus(&mut machine, |bus| {
+        let bound = bus
+            .jit_direct_memory_max_clocks(BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        let before = bus.trace.elapsed_clocks();
+        bus.charge_direct_memory(0xA_1200, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        assert_eq!(bus.trace.elapsed_clocks() - before, bound);
+    });
 }
 
 #[test]
@@ -1351,20 +1385,30 @@ fn direct_memory_helpers_accept_only_page_local_ram() {
             "ordinary RAM writes are direct"
         );
         assert_eq!(
-            bus.direct_memory_bytes(0x2ff0, 16, BusWidth::Byte),
+            bus.direct_memory_bytes(0x2ff0, 16, BusWidth::Byte, BusAccessKind::DataRead),
             16,
             "same-page RAM span is direct"
         );
 
         assert_eq!(
-            bus.direct_memory_bytes(0x2fff, 2, BusWidth::Byte),
+            bus.direct_memory_bytes(0x2fff, 2, BusWidth::Byte, BusAccessKind::DataRead),
             0,
             "cross-page spans fall back"
         );
         assert_eq!(
-            bus.direct_memory_bytes(0x2001, 2, BusWidth::Word),
+            bus.direct_memory_bytes(0x2001, 2, BusWidth::Word, BusAccessKind::DataRead),
             0,
             "split word spans fall back"
+        );
+        assert_eq!(
+            bus.direct_memory_bytes(0x2000, 3, BusWidth::Word, BusAccessKind::DataRead),
+            0,
+            "partial-width RAM spans fall back"
+        );
+        assert_eq!(
+            bus.direct_memory_bytes(0x2000, 4, BusWidth::Dword, BusAccessKind::PageWalkRead),
+            0,
+            "non-data RAM spans fall back"
         );
         assert!(
             !bus.read_memory_direct(LOW_BIOS_BASE, BusWidth::Dword, BusAccessKind::DataRead)
@@ -1396,7 +1440,7 @@ fn direct_memory_helpers_accept_only_page_local_ram() {
             "VGA memory has no direct page"
         );
         assert_eq!(
-            bus.direct_memory_bytes(0x0E_0000, 4, BusWidth::Dword),
+            bus.direct_memory_bytes(0x0E_0000, 4, BusWidth::Dword, BusAccessKind::DataRead,),
             0,
             "upper-memory window falls back"
         );
@@ -1473,8 +1517,31 @@ fn canonical_mode13_bulk_read_uses_the_linear_page() {
     }
 
     with_bus(&mut machine, |bus| {
-        assert_eq!(bus.direct_memory_bytes(0xA_1200, 4, BusWidth::Dword), 4);
+        assert_eq!(
+            bus.direct_memory_bytes(0xA_1200, 4, BusWidth::Dword, BusAccessKind::DataRead,),
+            4
+        );
+        assert_eq!(
+            bus.direct_memory_bytes(0xA_1200, 4, BusWidth::Dword, BusAccessKind::DataWrite,),
+            4
+        );
+        assert_eq!(
+            bus.direct_memory_bytes(0xA_1200, 3, BusWidth::Word, BusAccessKind::DataRead,),
+            0,
+            "partial-width VGA spans fall back"
+        );
         let mut bytes = [0; 4];
+        assert_eq!(
+            bus.read_memory_bytes_direct(
+                0xA_1200,
+                &mut bytes,
+                BusWidth::Dword,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap(),
+            0,
+            "the read helper rejects write access kinds"
+        );
         assert_eq!(
             bus.read_memory_bytes_direct(
                 0xA_1200,
@@ -1487,6 +1554,168 @@ fn canonical_mode13_bulk_read_uses_the_linear_page() {
         );
         assert_eq!(bytes, [0x11, 0x22, 0x33, 0x44]);
     });
+}
+
+fn assert_exact_vga_read_cycles(machine: &Machine, start: u32, count: u32) {
+    let cycles: Vec<_> = machine
+        .trace
+        .cycles()
+        .iter()
+        .filter(|cycle| {
+            cycle.kind == BusAccessKind::DataRead && cycle.address.wrapping_sub(start) < count
+        })
+        .collect();
+    assert_eq!(cycles.len(), count as usize);
+    let expected = BusCycle::clocks_for(BusWidth::Byte, machine.profile.wait_states.video);
+    for (offset, cycle) in cycles.into_iter().enumerate() {
+        assert_eq!(cycle.address, start + offset as u32);
+        assert_eq!(cycle.width, BusWidth::Byte);
+        assert_eq!(cycle.clocks, expected);
+    }
+}
+
+#[test]
+fn rep_movsb_reads_canonical_mode13_once_per_iteration() {
+    const PROGRAM: &[u8] = &[0xF3, 0xA4, 0xCD, 0x20];
+    const VALUES: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    for (offset, value) in VALUES.into_iter().enumerate() {
+        machine.video_mut().cpu_write_chain4(0x1200 + offset, value);
+    }
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xA000));
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(DOS_LOAD_SEGMENT));
+    machine.cpu.registers.set_esi(0x1200);
+    machine.cpu.registers.set_edi(0x0180);
+    machine.cpu.registers.set_ecx(VALUES.len() as u32);
+    machine.trace.set_tracing_mode(TracingMode::Full);
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+
+    let destination = (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x0180;
+    for (offset, expected) in VALUES.into_iter().enumerate() {
+        assert_eq!(
+            machine.read_physical_u8(destination + offset as u32),
+            expected
+        );
+    }
+    assert_exact_vga_read_cycles(&machine, 0xA_1200, VALUES.len() as u32);
+}
+
+#[test]
+fn rep_movsb_mode_x_reads_once_and_leaves_the_last_latches() {
+    const PROGRAM: &[u8] = &[0xF3, 0xA4, 0xCD, 0x20];
+    const PLANE_ZERO: [u8; 4] = [0x31, 0x32, 0x33, 0x34];
+    const LAST_LATCHES: [u8; 4] = [0x34, 0x52, 0x73, 0x94];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    {
+        let vga = machine.video_mut();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        for (plane, last_latch) in LAST_LATCHES.into_iter().enumerate() {
+            vga.write_port(0x3C4, 0x02);
+            vga.write_port(0x3C5, 1 << plane);
+            for (offset, plane_zero) in PLANE_ZERO.into_iter().enumerate() {
+                let value = if offset == 3 {
+                    last_latch
+                } else if plane == 0 {
+                    plane_zero
+                } else {
+                    0xA0 | plane as u8
+                };
+                vga.cpu_write(0x1200 + offset, value);
+            }
+        }
+    }
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0xA000));
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(DOS_LOAD_SEGMENT));
+    machine.cpu.registers.set_esi(0x1200);
+    machine.cpu.registers.set_edi(0x0180);
+    machine.cpu.registers.set_ecx(PLANE_ZERO.len() as u32);
+    machine.trace.set_tracing_mode(TracingMode::Full);
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+
+    let destination = (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x0180;
+    for (offset, expected) in PLANE_ZERO.into_iter().enumerate() {
+        assert_eq!(
+            machine.read_physical_u8(destination + offset as u32),
+            expected
+        );
+    }
+    assert_exact_vga_read_cycles(&machine, 0xA_1200, PLANE_ZERO.len() as u32);
+    let vga = machine.video_mut();
+    vga.write_port(0x3C4, 0x02);
+    vga.write_port(0x3C5, 0x0F);
+    vga.write_port(0x3CE, 0x05);
+    vga.write_port(0x3CF, 0x41);
+    vga.cpu_write(0x1300, 0);
+    for (plane, expected) in LAST_LATCHES.into_iter().enumerate() {
+        assert_eq!(vga.plane_byte(plane, 0x1300), expected);
+    }
+}
+
+#[test]
+fn repe_cmpsb_mode_x_reads_the_destination_once() {
+    const PROGRAM: &[u8] = &[0xF3, 0xA6, 0xCD, 0x20];
+    const VALUES: [u8; 4] = [0x61, 0x62, 0x63, 0x64];
+    let mut machine =
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Vega), PROGRAM).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    {
+        let vga = machine.video_mut();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        vga.write_port(0x3C4, 0x02);
+        vga.write_port(0x3C5, 0x01);
+        for (offset, value) in VALUES.into_iter().enumerate() {
+            vga.cpu_write(0x1200 + offset, value);
+        }
+    }
+    let source = (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x0180;
+    for (offset, value) in VALUES.into_iter().enumerate() {
+        machine.write_physical_u8(source + offset as u32, value);
+    }
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(DOS_LOAD_SEGMENT));
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Es, SegmentRegister::real(0xA000));
+    machine.cpu.registers.set_esi(0x0180);
+    machine.cpu.registers.set_edi(0x1200);
+    machine.cpu.registers.set_ecx(VALUES.len() as u32);
+    machine.trace.set_tracing_mode(TracingMode::Full);
+
+    assert_eq!(
+        machine.run_until_halt_or_cycles(100_000).unwrap(),
+        StopReason::DosExit { code: 0 }
+    );
+    assert_eq!(machine.cpu.registers.ecx(), 0);
+    assert_exact_vga_read_cycles(&machine, 0xA_1200, VALUES.len() as u32);
 }
 
 #[test]
@@ -1588,7 +1817,14 @@ fn mode_x_direct_page_writes_one_plane_and_keeps_reads_on_the_handler() {
             word_writes: 0,
             dword_writes: 0,
         });
-        assert_eq!(bus.direct_memory_bytes(0xA_1240, 4, BusWidth::Dword), 4);
+        assert_eq!(
+            bus.direct_memory_bytes(0xA_1240, 4, BusWidth::Dword, BusAccessKind::DataRead,),
+            0
+        );
+        assert_eq!(
+            bus.direct_memory_bytes(0xA_1240, 4, BusWidth::Dword, BusAccessKind::DataWrite,),
+            4
+        );
         let mut readback = [0; 4];
         assert_eq!(
             bus.read_memory_bytes_direct(
@@ -1816,6 +2052,36 @@ fn native_deadline_bound_uses_the_same_bus_scale_as_batch_accounting() {
         with_bus(&mut machine, |bus| {
             assert_eq!(bus.jit_scale_bus_cost_upper(RAW_CLOCKS), expected);
         });
+    }
+}
+
+#[test]
+fn rep_page_walk_bound_covers_four_scaled_page_table_cycles() {
+    for mode in [GswMode::Gsw386, GswMode::Gsw486, GswMode::Gsw586] {
+        for address in [0x3000, LOW_BIOS_BASE, 0xA_1000] {
+            let mut machine = test_machine();
+            machine.set_mode(mode);
+            assert!(machine.set_vga_mode(0x13));
+            with_bus(&mut machine, |bus| {
+                let bound = bus
+                    .rep_page_walk_cost_upper()
+                    .expect("MachineBus supplies a cold page-walk bound");
+                let before = bus.in_batch_scaled_bus_clocks();
+                bus.read_memory(address, BusWidth::Dword, BusAccessKind::PageWalkRead)
+                    .unwrap();
+                bus.write_memory(address, BusWidth::Dword, 0, BusAccessKind::PageWalkWrite)
+                    .unwrap();
+                bus.read_memory(address, BusWidth::Dword, BusAccessKind::PageWalkRead)
+                    .unwrap();
+                bus.write_memory(address, BusWidth::Dword, 0, BusAccessKind::PageWalkWrite)
+                    .unwrap();
+                let growth = bus.in_batch_scaled_bus_clocks() - before;
+                assert!(
+                    growth <= bound,
+                    "{mode:?} address {address:#x}: growth {growth}, bound {bound}"
+                );
+            });
+        }
     }
 }
 
