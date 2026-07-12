@@ -507,13 +507,25 @@ fn paged_read_only_memory_runs_natively_at_cpl3() {
         user: true,
     };
     let mut fixture = prepare_paged_case(0x8000, 0x8025, permissions);
-    map_read_page(
-        &mut fixture.interpreter,
-        &mut fixture.interpreter_bus,
-        0x8000,
-        0x8000,
-        permissions,
-    );
+    for (cpu, bus) in [
+        (&mut fixture.native, &mut fixture.native_bus),
+        (&mut fixture.interpreter, &mut fixture.interpreter_bus),
+    ] {
+        assert_eq!(
+            cpu.read_memory_sized(
+                bus,
+                SegmentIndex::Ds,
+                0x8000,
+                OperandSize::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+            0x8000_0001
+        );
+        assert_eq!(cpu.tlb.lookup(0x8000 >> 12).unwrap().phys, 0x8000);
+        assert!(cpu.jit_fast_map.has_read_mapping(0x8000, 0x8000));
+        bus.trace.clear();
+    }
     finish_and_compare(fixture, "paged read-only TEST");
 }
 

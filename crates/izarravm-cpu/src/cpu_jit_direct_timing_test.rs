@@ -848,18 +848,21 @@ fn finite_cs_near_returns_run_directly_and_match_interpreter() {
             (&mut native, &mut native_bus),
             (&mut interp, &mut interp_bus),
         ] {
-            map_direct_page(
-                cpu,
-                bus,
-                QUAKE_SEGMENT_BASE + INITIAL_ESP,
-                0x7000,
-                jit::fast_map::PagePermissions {
-                    writable: true,
-                    user: true,
-                },
-                true,
-                false,
+            assert_eq!(
+                cpu.read_memory_sized(
+                    bus,
+                    SegmentIndex::Ss,
+                    INITIAL_ESP,
+                    OperandSize::Dword,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap(),
+                TARGET
             );
+            let linear = QUAKE_SEGMENT_BASE + INITIAL_ESP;
+            assert_eq!(cpu.tlb.lookup(linear >> 12).unwrap().phys, 0x7000);
+            assert!(cpu.jit_fast_map.has_read_mapping(linear, 0x7000));
+            bus.trace.clear();
         }
         let block = install_fixture_block(&mut native, QUAKE_SEGMENT_BASE + ENTRY);
         assert_eq!(block.span().instructions, 3);

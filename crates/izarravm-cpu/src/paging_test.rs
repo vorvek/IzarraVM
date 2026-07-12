@@ -9,14 +9,18 @@ fn direct_mapped_tlb_replaces_only_the_colliding_slot() {
     let first = 3;
     let collision = first + TLB_ENTRIES as u32;
 
-    tlb.insert(first, 0x5000, true, false, true);
+    assert!(tlb.insert(first, 0x5000, true, false, true).is_none());
     let first_entry = tlb.lookup(first).unwrap();
     assert_eq!(first_entry.phys, 0x5000);
     assert!(first_entry.writable);
     assert!(!first_entry.user);
     assert!(first_entry.dirty);
 
-    tlb.insert(collision, 0x9000, false, true, false);
+    let evicted = tlb
+        .insert(collision, 0x9000, false, true, false)
+        .expect("colliding insert must expose the live entry");
+    assert_eq!(evicted.tag, first);
+    assert_eq!(evicted.phys, 0x5000);
     assert!(tlb.lookup(first).is_none());
     let collision_entry = tlb.lookup(collision).unwrap();
     assert_eq!(collision_entry.phys, 0x9000);
@@ -31,10 +35,32 @@ fn direct_mapped_tlb_replaces_only_the_colliding_slot() {
     tlb.invalidate(collision);
     assert!(tlb.lookup(collision).is_none());
 
-    tlb.insert(collision, 0x9000, false, true, false);
+    assert!(tlb.insert(collision, 0x9000, false, true, false).is_none());
 
     tlb.flush();
     assert!(tlb.lookup(collision).is_none());
+}
+
+#[test]
+fn tlb_insert_exposes_same_tag_replacements_and_dirty_upgrades() {
+    let mut tlb = Tlb::default();
+    let page = 7;
+
+    assert!(tlb.insert(page, 0x5000, true, true, false).is_none());
+    let clean = tlb
+        .insert(page, 0x5000, true, true, true)
+        .expect("dirty upgrade must expose the clean entry");
+    assert_eq!(clean.tag, page);
+    assert_eq!(clean.phys, 0x5000);
+    assert!(!clean.dirty);
+
+    let old_mapping = tlb
+        .insert(page, 0x9000, false, false, false)
+        .expect("same-tag remap must expose the old mapping");
+    assert_eq!(old_mapping.phys, 0x5000);
+    assert!(old_mapping.writable);
+    assert!(old_mapping.user);
+    assert!(old_mapping.dirty);
 }
 
 #[test]

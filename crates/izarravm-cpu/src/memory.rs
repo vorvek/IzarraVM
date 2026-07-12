@@ -15,16 +15,22 @@ impl CpuGsw {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    fn fast_map_permissions(&self, linear: u32) -> Option<jit::fast_map::PagePermissions> {
+    fn fast_map_permissions(
+        &self,
+        linear: u32,
+        physical: u32,
+        write: bool,
+    ) -> Option<jit::fast_map::PagePermissions> {
         if !self.is_paging_enabled() {
             return Some(jit::fast_map::PagePermissions::UNPAGED);
         }
-        self.tlb
-            .lookup(linear >> 12)
-            .map(|entry| jit::fast_map::PagePermissions {
+        let entry = self.tlb.lookup(linear >> 12)?;
+        (entry.phys == physical & !0x0fff && (!write || entry.dirty)).then_some(
+            jit::fast_map::PagePermissions {
                 writable: entry.writable,
                 user: entry.user,
-            })
+            },
+        )
     }
 
     #[cfg(all(
@@ -56,6 +62,9 @@ impl CpuGsw {
         page: DirectPage,
         write: bool,
     ) -> bool {
+        let Some(permissions) = self.fast_map_permissions(linear, physical, write) else {
+            return false;
+        };
         let mapped = if write {
             self.jit_fast_map.has_write_mapping(linear, physical)
         } else {
@@ -64,9 +73,6 @@ impl CpuGsw {
         if mapped {
             return true;
         }
-        let Some(permissions) = self.fast_map_permissions(linear) else {
-            return false;
-        };
         if write {
             self.jit_fast_map
                 .populate_write(linear, physical, page, permissions)
@@ -127,75 +133,6 @@ impl CpuGsw {
         } else {
             self.data_read_pages.note_fast_map_linear(physical, linear);
         }
-    }
-
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    #[inline]
-    fn read_fast_map<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        linear: u32,
-        width: BusWidth,
-        kind: BusAccessKind,
-    ) -> ExecResult<Option<u32>> {
-        if !self.fast_map_population_enabled() {
-            return Ok(None);
-        }
-        let Some(access) = self.jit_fast_map.lookup_access(
-            linear,
-            width,
-            false,
-            self.current_privilege_level() == 3,
-            self.control.cr0 & CR0_WP != 0,
-        ) else {
-            return Ok(None);
-        };
-        bus.charge_direct_memory(access.physical(), width, kind)?;
-        self.record_data_read(kind, true);
-        self.perf.direct_data_pointer_reads += 1;
-        Ok(Some(access.read(width)))
-    }
-
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    #[inline]
-    fn write_fast_map<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        linear: u32,
-        width: BusWidth,
-        value: u32,
-        kind: BusAccessKind,
-    ) -> ExecResult<bool> {
-        if !self.fast_map_population_enabled() {
-            return Ok(false);
-        }
-        let Some(access) = self.jit_fast_map.lookup_access(
-            linear,
-            width,
-            true,
-            self.current_privilege_level() == 3,
-            self.control.cr0 & CR0_WP != 0,
-        ) else {
-            return Ok(false);
-        };
-        let physical = access.physical();
-        self.record_write_page(physical);
-        if access.read(width) != value {
-            self.note_code_write(physical, width.bytes());
-        }
-        bus.charge_direct_memory(physical, width, kind)?;
-        access.write(width, value);
-        self.record_data_write(kind, true);
-        self.perf.direct_data_pointer_writes += 1;
-        Ok(true)
     }
 
     #[inline]
@@ -633,14 +570,6 @@ impl CpuGsw {
         linear: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
-        #[cfg(all(
-            feature = "jit",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if let Some(value) = self.read_fast_map(bus, linear, BusWidth::Byte, kind)? {
-            return Ok(value as u8);
-        }
         let physical = if self.control.cr0 & CR0_PG == 0 {
             linear
         } else {
@@ -673,14 +602,6 @@ impl CpuGsw {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
-        #[cfg(all(
-            feature = "jit",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if self.write_fast_map(bus, linear, BusWidth::Byte, u32::from(value), kind)? {
-            return Ok(());
-        }
         let physical = if self.control.cr0 & CR0_PG == 0 {
             self.record_write_page(linear);
             linear
@@ -899,14 +820,6 @@ impl CpuGsw {
         if width == BusWidth::Byte {
             return self.read_linear_u8(bus, linear, kind).map(u32::from);
         }
-        #[cfg(all(
-            feature = "jit",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if let Some(value) = self.read_fast_map(bus, linear, width, kind)? {
-            return Ok(value);
-        }
         let physical = self.translate_linear(bus, linear, false)?;
         if let Some(value) = self.read_direct_page_cached(bus, linear, physical, width, kind)? {
             return Ok(value);
@@ -926,14 +839,6 @@ impl CpuGsw {
     ) -> ExecResult<()> {
         if width == BusWidth::Byte {
             return self.write_linear_u8(bus, linear, value as u8, kind);
-        }
-        #[cfg(all(
-            feature = "jit",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if self.write_fast_map(bus, linear, width, value, kind)? {
-            return Ok(());
         }
         let physical = self.translate_linear(bus, linear, true)?;
         self.note_code_write(physical, width.bytes());
@@ -1074,24 +979,6 @@ impl CpuGsw {
         // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
         let wp = self.control.cr0 & CR0_WP != 0;
 
-        // The large linear map is the shared translation cache for approximate-timing modes.
-        // Read entries are installed only after the page walker has set A; write entries only
-        // after it has also set D. It is invalidated with the TLB on every translation-affecting
-        // event, while the live permission check below handles a CPL change without a flush.
-        #[cfg(all(
-            feature = "jit",
-            target_arch = "x86_64",
-            any(target_os = "windows", target_os = "linux")
-        ))]
-        if self.fast_map_population_enabled()
-            && let Some(physical) = self.jit_fast_map.lookup_physical(linear, write, user, wp)
-        {
-            if write {
-                self.record_write_page(physical);
-            }
-            return Ok(physical);
-        }
-
         // TLB fast path: a cached entry skips the two page-table reads (and the
         // accessed-bit write the fill already did). The protection check is redone
         // from the cached page bits against the *current* accessor (CPL can change
@@ -1198,15 +1085,34 @@ impl CpuGsw {
         // page that faulted (not present / protection) is never cached. `dirty`
         // records whether the PTE's D bit is now set, so a later read hits but a
         // first write to a still-clean page re-walks to set it.
-        self.tlb.insert(
-            page,
-            pte & 0xffff_f000,
-            writable,
-            user_accessible,
-            pte & 0x40 != 0,
-        );
+        let physical_page = pte & 0xffff_f000;
+        let entry_dirty = pte & 0x40 != 0;
+        let previous = self
+            .tlb
+            .insert(page, physical_page, writable, user_accessible, entry_dirty);
+        #[cfg(not(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )))]
+        let _ = previous;
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(previous) = previous {
+            let same_residency = previous.tag == page
+                && previous.phys == physical_page
+                && previous.writable == writable
+                && previous.user == user_accessible
+                && (!previous.dirty || entry_dirty);
+            if !same_residency {
+                self.jit_fast_map.invalidate_page(previous.tag << 12);
+            }
+        }
 
-        let physical = (pte & 0xffff_f000) | (linear & 0x0000_0fff);
+        let physical = physical_page | (linear & 0x0000_0fff);
         if write {
             self.record_write_page(physical);
         }

@@ -357,17 +357,51 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
         native_cpu.perf_counters()
     );
 
-    interp_machine.write_physical_u32(FRAME_A, VALUE_A);
-    native_machine.write_physical_u32(FRAME_A, VALUE_A);
+    for (cpu, machine) in [
+        (&mut interp_cpu, &mut interp_machine),
+        (&mut native_cpu, &mut native_machine),
+    ] {
+        machine.trace = BusTrace::default();
+        machine.trace.set_tracing_mode(TracingMode::Full);
+        arm(cpu, WARM_CODE_LINEAR);
+        let outcomes = drive_native_fetch_loop(cpu, machine);
+        assert!(outcomes.last().is_some_and(|outcome| outcome.halted));
+        let data_walks: Vec<_> = machine
+            .trace
+            .cycles()
+            .iter()
+            .filter(|cycle| {
+                cycle.kind == BusAccessKind::PageWalkRead && matches!(cycle.address, PTE_A | PTE_B)
+            })
+            .collect();
+        assert!(!data_walks.is_empty());
+        assert_eq!(data_walks.last().unwrap().address, PTE_B);
+        machine
+            .memory
+            .write_u32(PAGE_DIRECTORY as usize, PAGE_TABLE | 7)
+            .unwrap();
+        machine
+            .memory
+            .write_u32(PTE_A as usize, FRAME_A | 7)
+            .unwrap();
+    }
+
     interp_machine.trace = BusTrace::default();
     interp_machine.trace.set_tracing_mode(TracingMode::Off);
     native_machine.trace = BusTrace::default();
     native_machine.trace.set_tracing_mode(TracingMode::Off);
+    interp_machine.bus_rem = 2;
+    native_machine.bus_rem = 2;
     arm(&mut interp_cpu, MEASURE_CODE_LINEAR);
     arm(&mut native_cpu, MEASURE_CODE_LINEAR);
     interp_cpu.elapsed_clocks = 0;
     native_cpu.elapsed_clocks = 0;
-    let direct_insns = native_cpu.perf_counters().jit_direct_insns;
+    let interp_instructions = interp_cpu.perf_counters().instructions;
+    let native_instructions = native_cpu.perf_counters().instructions;
+    let side_exits = native_cpu.perf_counters().jit_direct_side_exits;
+    let unavailable_exits = native_cpu
+        .perf_counters()
+        .jit_direct_exit_unavailable_or_kind;
     let direct_loads = native_cpu.perf_counters().jit_native_load_hits;
 
     let interp_outcomes = drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
@@ -375,19 +409,71 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
 
     assert_eq!(native_outcomes, interp_outcomes);
     assert_eq!(native_cpu, interp_cpu);
+    let interp_raw = interp_machine.trace.elapsed_clocks();
+    let native_raw = native_machine.trace.elapsed_clocks();
     assert_eq!(
-        native_machine.trace.elapsed_clocks(),
-        interp_machine.trace.elapsed_clocks(),
+        native_raw, interp_raw,
         "production aggregate accounting must preserve raw bus clocks"
     );
     assert_eq!(
-        native_cpu.perf_counters().jit_direct_insns - direct_insns,
-        3
+        interp_cpu.perf_counters().instructions - interp_instructions,
+        5
+    );
+    assert_eq!(
+        native_cpu.perf_counters().instructions - native_instructions,
+        5
+    );
+    assert_eq!(
+        native_cpu.perf_counters().jit_direct_side_exits - side_exits,
+        1
+    );
+    assert_eq!(
+        native_cpu
+            .perf_counters()
+            .jit_direct_exit_unavailable_or_kind
+            - unavailable_exits,
+        1
     );
     assert_eq!(
         native_cpu.perf_counters().jit_native_load_hits - direct_loads,
-        1,
-        "the evicted first alias must be read by native code"
+        0,
+        "the evicted first alias must leave native code before the load"
+    );
+    let interp_scaled = interp_machine.scale_bus(interp_raw);
+    let native_scaled = native_machine.scale_bus(native_raw);
+    assert_eq!(native_scaled, interp_scaled);
+    assert_eq!(native_machine.bus_rem, interp_machine.bus_rem);
+    assert_eq!(
+        native_scaled,
+        (native_raw * u64::from(bus_timing(GswMode::Gsw486.persona()).0) + 2)
+            / u64::from(bus_timing(GswMode::Gsw486.persona()).1)
+    );
+    assert_eq!(
+        interp_machine
+            .memory
+            .read_u32(PAGE_DIRECTORY as usize)
+            .unwrap(),
+        PAGE_TABLE | 0x27
+    );
+    assert_eq!(
+        interp_machine.memory.read_u32(PTE_A as usize).unwrap(),
+        FRAME_A | 0x27
+    );
+    assert_eq!(
+        interp_machine.memory.read_u32(PTE_A as usize).unwrap() & 0x40,
+        0,
+        "a read must not set the PTE dirty bit"
+    );
+    assert_eq!(
+        native_machine
+            .memory
+            .read_u32(PAGE_DIRECTORY as usize)
+            .unwrap(),
+        PAGE_TABLE | 0x27
+    );
+    assert_eq!(
+        native_machine.memory.read_u32(PTE_A as usize).unwrap(),
+        FRAME_A | 0x27
     );
     assert_eq!(
         native_machine.memory.as_slice(),
@@ -400,19 +486,6 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     assert_eq!(
         interp_machine.memory.read_u32(FRAME_B as usize).unwrap(),
         VALUE_B
-    );
-
-    interp_machine.write_physical_u32(FRAME_A, VALUE_A);
-    interp_machine.trace = BusTrace::default();
-    interp_machine.trace.set_tracing_mode(TracingMode::Full);
-    arm(&mut interp_cpu, MEASURE_CODE_LINEAR);
-    drive_native_fetch_loop(&mut interp_cpu, &mut interp_machine);
-    assert!(
-        interp_machine.trace.cycles().iter().all(|cycle| !matches!(
-            cycle.kind,
-            BusAccessKind::PageWalkRead | BusAccessKind::PageWalkWrite
-        )),
-        "the shared FastMap must survive the old 64-entry TLB collision"
     );
 }
 

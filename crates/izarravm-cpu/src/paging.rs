@@ -85,8 +85,17 @@ impl Tlb {
     }
 
     #[inline]
-    pub(crate) fn insert(&mut self, page: u32, phys: u32, writable: bool, user: bool, dirty: bool) {
-        self.entries[Self::slot(page)] = TlbEntry {
+    pub(crate) fn insert(
+        &mut self,
+        page: u32,
+        phys: u32,
+        writable: bool,
+        user: bool,
+        dirty: bool,
+    ) -> Option<TlbEntry> {
+        let slot = Self::slot(page);
+        let previous = self.entries[slot];
+        self.entries[slot] = TlbEntry {
             tag: page,
             phys,
             generation: self.generation,
@@ -94,6 +103,7 @@ impl Tlb {
             user,
             dirty,
         };
+        (previous.generation == self.generation).then_some(previous)
     }
 
     #[inline]

@@ -1,13 +1,15 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Linear-page map shared by the interpreter fill path and the direct x64 backend.
+//! Linear-page map filled by the interpreter and consumed by the direct x64 backend.
 //!
-//! In 486/586 modes the interpreter installs mappings from its physical direct-page cache, then
-//! consumes the same pointer biases as native code. This removes the old 64-entry TLB and physical
-//! page-cache bottleneck from ordinary warm RAM and canonical VGA accesses.
+//! The interpreter publishes a mapping only after canonical paging and direct-page lookup succeed.
+//! Native code can then use the pointer bias while the mapping remains shadowed by the modeled TLB.
+//! Interpreter accesses continue through the canonical translation path.
 
-use izarravm_bus::{BusWidth, DirectPage};
+#[cfg(test)]
+use izarravm_bus::BusWidth;
+use izarravm_bus::DirectPage;
 
 const PAGE_SHIFT: u32 = 12;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
@@ -48,14 +50,15 @@ impl PagePermissions {
     };
 }
 
-/// One permission-checked interpreter hit. The raw host pointer stays inside this module; callers
-/// observe the physical address, run their normal timing and SMC hooks, then commit the access.
+/// One permission-checked lookup used to test the same entry rules as native code.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub(crate) struct FastMapAccess {
     physical: u32,
     ptr: *mut u8,
 }
 
+#[cfg(test)]
 impl FastMapAccess {
     pub(crate) const fn physical(self) -> u32 {
         self.physical
@@ -197,6 +200,7 @@ impl FastMap {
     /// A write bias exists only after the page walker has committed the PTE dirty bit, so a hit is
     /// safe to use without losing accessed/dirty side effects. Protection is checked against the
     /// current accessor because CPL can change while a mapping remains live.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn lookup_access(
         &self,
@@ -247,6 +251,7 @@ impl FastMap {
         })
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn lookup_physical(
         &self,

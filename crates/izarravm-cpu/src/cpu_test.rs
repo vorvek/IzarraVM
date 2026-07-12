@@ -392,7 +392,7 @@ fn physical_page_cache_hits_fill_every_paging_alias() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn active_fast_map_survives_small_tlb_collision_without_page_walk() {
+fn active_fast_map_tracks_tlb_collision_and_rewalks_canonically() {
     const LINEAR_A: u32 = 0x0000_3000;
     const LINEAR_B: u32 = LINEAR_A + TLB_ENTRIES as u32 * 0x1000;
     const FRAME_A: u32 = 0x0000_5000;
@@ -437,7 +437,7 @@ fn active_fast_map_survives_small_tlb_collision_without_page_walk() {
         0x5a
     );
     assert!(cpu.tlb.lookup(LINEAR_A >> 12).is_none());
-    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR_A, FRAME_A));
+    assert!(!cpu.jit_fast_map.has_read_mapping(LINEAR_A, FRAME_A));
 
     bus.trace.clear();
     assert_eq!(
@@ -450,10 +450,138 @@ fn active_fast_map_survives_small_tlb_collision_without_page_walk() {
         .unwrap(),
         0xa5
     );
-    assert!(bus.trace.cycles().iter().all(|cycle| !matches!(
-        cycle.kind,
-        BusAccessKind::PageWalkRead | BusAccessKind::PageWalkWrite
-    )));
+    assert_eq!(
+        bus.trace
+            .cycles()
+            .iter()
+            .filter(|cycle| cycle.kind == BusAccessKind::PageWalkRead)
+            .count(),
+        2
+    );
+    assert!(
+        bus.trace
+            .cycles()
+            .iter()
+            .all(|cycle| cycle.kind != BusAccessKind::PageWalkWrite)
+    );
+    assert!(cpu.tlb.lookup(LINEAR_A >> 12).is_some());
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR_A, FRAME_A));
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_same_tag_dirty_upgrade_keeps_read_residency() {
+    const LINEAR: u32 = 0x3000;
+    const FRAME: u32 = 0x5000;
+    const PTE: usize = 0x2000 + ((LINEAR >> 12) as usize * 4);
+
+    let mut memory = vec![0; 0x8000];
+    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    memory[PTE..PTE + 4].copy_from_slice(&(FRAME | 7).to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(true);
+    cpu.control.cr0 |= CR0_PE | CR0_PG | CR0_WP;
+    cpu.control.cr3 = 0x1000;
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, LINEAR, BusAccessKind::DataRead)
+        .unwrap();
+    assert!(!cpu.tlb.lookup(LINEAR >> 12).unwrap().dirty);
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR, FRAME));
+    assert!(!cpu.jit_fast_map.has_write_mapping(LINEAR, FRAME));
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        0xa5,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(cpu.tlb.lookup(LINEAR >> 12).unwrap().dirty);
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR, FRAME));
+    assert!(cpu.jit_fast_map.has_write_mapping(LINEAR, FRAME));
+    assert_eq!(
+        u32::from_le_bytes(bus.memory[PTE..PTE + 4].try_into().unwrap()) & 0x60,
+        0x60
+    );
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn fast_map_same_tag_remap_replaces_residency_and_fault_keeps_read_mapping() {
+    const LINEAR: u32 = 0x3000;
+    const FRAME_A: u32 = 0x5000;
+    const FRAME_B: u32 = 0x6000;
+    const PTE: usize = 0x2000 + ((LINEAR >> 12) as usize * 4);
+
+    let make_fixture = || {
+        let mut memory = vec![0; 0x8000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        memory[PTE..PTE + 4].copy_from_slice(&(FRAME_A | 7).to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+        let mut cpu = CpuGsw::default();
+        cpu.set_jit_auto_admit(true);
+        cpu.control.cr0 |= CR0_PE | CR0_PG | CR0_WP;
+        cpu.control.cr3 = 0x1000;
+        cpu.registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+        (cpu, bus)
+    };
+
+    let (mut cpu, mut bus) = make_fixture();
+    cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, LINEAR, BusAccessKind::DataRead)
+        .unwrap();
+    bus.memory[PTE..PTE + 4].copy_from_slice(&(FRAME_B | 0x27).to_le_bytes());
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        LINEAR,
+        0x5a,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(!cpu.jit_fast_map.has_read_mapping(LINEAR, FRAME_A));
+    assert!(cpu.jit_fast_map.has_write_mapping(LINEAR, FRAME_B));
+    assert_eq!(bus.memory[FRAME_A as usize], 0);
+    assert_eq!(bus.memory[FRAME_B as usize], 0x5a);
+
+    let (mut denied_cpu, mut denied_bus) = make_fixture();
+    denied_cpu
+        .read_memory_u8(
+            &mut denied_bus,
+            SegmentIndex::Ds,
+            LINEAR,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+    denied_bus.memory[PTE..PTE + 4].copy_from_slice(&(FRAME_B | 0x25).to_le_bytes());
+    assert!(matches!(
+        denied_cpu.write_memory_u8(
+            &mut denied_bus,
+            SegmentIndex::Ds,
+            LINEAR,
+            0x3c,
+            BusAccessKind::DataWrite,
+        ),
+        Err(InternalFault::Exception { vector: 14, .. })
+    ));
+    assert!(denied_cpu.jit_fast_map.has_read_mapping(LINEAR, FRAME_A));
+    assert!(!denied_cpu.jit_fast_map.has_write_mapping(LINEAR, FRAME_A));
+    assert_eq!(denied_bus.memory[FRAME_A as usize], 0);
+    assert_eq!(denied_bus.memory[FRAME_B as usize], 0);
 }
 
 #[test]
