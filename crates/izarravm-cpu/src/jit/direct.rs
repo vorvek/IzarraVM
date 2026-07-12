@@ -569,12 +569,9 @@ impl BlockCache {
         self.backend_enabled && self.auto_admit
     }
 
+    #[cfg(test)]
     pub(crate) fn fast_map_enabled(&self) -> bool {
-        #[cfg(test)]
-        if self.fast_map_enabled_for_test {
-            return true;
-        }
-        self.execution_enabled()
+        self.fast_map_enabled_for_test || self.execution_enabled()
     }
 
     pub(crate) fn admission_heat(&self) -> u8 {

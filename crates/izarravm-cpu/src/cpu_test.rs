@@ -171,6 +171,44 @@ fn interpreter_direct_pages_skip_fast_map_when_native_admission_is_disabled() {
 
 #[cfg(feature = "jit")]
 #[test]
+fn direct_runtime_admission_tracks_backend_policy_and_clones_cold() {
+    let mut cpu = CpuGsw::default();
+    let assert_synchronized = |cpu: &CpuGsw| {
+        assert_eq!(
+            cpu.direct_runtime.admission_active,
+            cpu.jit_direct.execution_enabled()
+        );
+    };
+
+    assert_synchronized(&cpu);
+    cpu.set_jit_auto_admit(true);
+    assert_synchronized(&cpu);
+
+    let clone = cpu.clone();
+    assert!(!clone.direct_runtime.admission_active);
+    assert_synchronized(&clone);
+
+    cpu.set_native_backend_enabled(false);
+    assert_synchronized(&cpu);
+    cpu.set_jit_auto_admit(true);
+    assert_synchronized(&cpu);
+    cpu.set_native_backend_enabled(true);
+    assert_synchronized(&cpu);
+    cpu.set_jit_auto_admit(false);
+    assert_synchronized(&cpu);
+
+    cpu.set_jit_auto_admit(true);
+    cpu.set_legacy_region_auto_admit(true);
+    assert!(!cpu.direct_runtime.admission_active);
+    assert_synchronized(&cpu);
+
+    cpu.reset();
+    assert!(!cpu.direct_runtime.admission_active);
+    assert_synchronized(&cpu);
+}
+
+#[cfg(feature = "jit")]
+#[test]
 fn direct_admission_heat_is_per_cpu_instance() {
     let mut changed = CpuGsw::default();
     let unchanged = CpuGsw::default();

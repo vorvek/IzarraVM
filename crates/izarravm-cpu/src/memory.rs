@@ -34,9 +34,13 @@ impl CpuGsw {
     ))]
     #[inline(always)]
     fn fast_map_population_enabled(&self) -> bool {
-        self.mode().uses_approximate_timing()
-            && self.jit_direct.fast_map_enabled()
-            && !self.jit_regions.auto_admit()
+        #[cfg(test)]
+        let admission_active =
+            self.direct_runtime.admission_active || self.jit_direct.fast_map_enabled();
+        #[cfg(not(test))]
+        let admission_active = self.direct_runtime.admission_active;
+
+        admission_active && self.mode().uses_approximate_timing() && !self.jit_regions.auto_admit()
     }
 
     #[cfg(all(

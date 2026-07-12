@@ -798,6 +798,30 @@ impl std::fmt::Debug for CpuProfileState {
     }
 }
 
+#[cfg(feature = "jit")]
+#[derive(Debug, Default)]
+struct DirectRuntimeState {
+    // Inline host policy for interpreter hot paths. Dynamic entry guards remain in the backend.
+    admission_active: bool,
+}
+
+#[cfg(feature = "jit")]
+impl Clone for DirectRuntimeState {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[cfg(feature = "jit")]
+impl PartialEq for DirectRuntimeState {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Eq for DirectRuntimeState {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuGsw {
     pub registers: Registers,
@@ -872,6 +896,8 @@ pub struct CpuGsw {
     /// accelerator state and clones empty.
     #[cfg(feature = "jit")]
     jit_direct: Box<jit::direct::BlockCache>,
+    #[cfg(feature = "jit")]
+    direct_runtime: DirectRuntimeState,
     /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
     /// clones start empty like the other host-only accelerator caches.
     #[cfg(all(
@@ -948,6 +974,8 @@ impl Default for CpuGsw {
             jit_regions: jit::RegionTable::default(),
             #[cfg(feature = "jit")]
             jit_direct: Box::new(jit::direct::BlockCache::default()),
+            #[cfg(feature = "jit")]
+            direct_runtime: DirectRuntimeState::default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
