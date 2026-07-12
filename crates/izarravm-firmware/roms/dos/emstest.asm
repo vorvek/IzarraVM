@@ -36,14 +36,14 @@ start:
     cmp bx, 0xE000
     jne f_frame
 
-    ; 3. page counts (42h): total = free = 256 (4 MB pool on the 16 MB box)
+    ; 3. page counts (42h): total = free = 192 (the default 3 MB pool)
     mov ah, 0x42
     int 0x67
     or ah, ah
     jnz f_counts
-    cmp dx, 256
+    cmp dx, 192
     jne f_counts
-    cmp bx, 256
+    cmp bx, 192
     jne f_counts
 
     ; 4. allocate 4 logical pages (43h) -> DX = handle
@@ -133,12 +133,12 @@ start:
     cmp dword [es:0], PAT_B
     jne f_restore
 
-    ; 12. counts reflect the allocation (42h): free = 252 of 256
+    ; 12. counts reflect the allocation (42h): free = 188 of 192
     mov ah, 0x42
     int 0x67
     or ah, ah
     jnz f_counts2
-    cmp bx, 252
+    cmp bx, 188
     jne f_counts2
 
     ; 13. pages for the handle (4Ch) = 4; open handles (4Bh) = 1
@@ -164,7 +164,7 @@ start:
     jnz f_free
     mov ah, 0x42
     int 0x67
-    cmp bx, 256
+    cmp bx, 192
     jne f_free
     mov ah, 0x4B
     int 0x67

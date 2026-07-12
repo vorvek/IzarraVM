@@ -39,16 +39,22 @@ Rebrand: move src/version.h + move.c product-name string; sort src/sort.c banner
   unit); `prf.c` and `kitten.c` are compiled and linked in separately, matching
   upstream's `MEM_OBJS=prf.obj kitten.obj $(MEMSUPT)` (MEMSUPT is empty for the
   Watcom target, so `memsupt.asm` is unused/unbuilt).
-- Toka-DOS divergence from upstream switch semantics: upstream's MEM has NO `/P`
-  switch. `/P` is a bare prefix match against `/PAGE` ("pause after each
-  screenful"); the per-program size+segment listing lives under `/FULL`
-  (new-style `/F`, or `/DEBUG`/new-style `/D` for the fuller device-inclusive
-  form). The Toka-DOS spec requires `MEM /P` to list the programs in memory
-  with their size and memory position, so `source/mem2.c`'s `main()` was
-  patched (smallest possible change, commented "modified by the Toka-DOS
-  project, 2026") to make `/PAGE` (and therefore its `/P` prefix) also imply
-  `/FULL`, on top of upstream's original pagination behavior. `/FULL` itself
-  (and `/DEBUG`) are unchanged and still work as upstream intends.
+- Toka-DOS changes `/P` handling. Upstream MEM treats `/P` as a prefix for
+  `/PAGE`, which only pauses after each screenful. The program list normally
+  needs `/FULL` or `/DEBUG`. Toka-DOS makes `/PAGE`, including its `/P` prefix,
+  imply `/FULL` while keeping the pause. `/FULL` and `/DEBUG` still work by
+  themselves.
+- Toka-DOS replaces the default summary with category bars for conventional,
+  upper, EMS, and XMS memory. It writes used blocks as CP437 `B2` with BIOS
+  attribute `0x0C` (light red), and free blocks as CP437 `B0` with attribute
+  `0x0A` (light green). MEM uses 640 KiB conventional and 384 KiB upper
+  categories. TOKAEMM supplies the 3 MiB EMS and 20 MiB XMS category sizes
+  through its private XMS query on the 24 MiB machine. The upper region includes
+  video memory and ROMs; only 96 KiB is available for UMB allocation with the
+  default EMS frame, or 160 KiB under `NOEMS`. EMS has its own top-of-RAM
+  partition. XMS and VCPI share the allocation arena inside the XMS category.
+  Under `NOEMS`, the EMS category becomes zero and the XMS category grows to
+  23 MiB.
 
 ## Audit items 3+10 external tool batch (ATTRIB, CHOICE, MORE, FIND, DELTREE)
 

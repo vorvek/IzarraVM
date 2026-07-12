@@ -311,6 +311,16 @@ if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
 Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
 
+# --- TOKAEMM (XMS, UMB, EMS, and VCPI memory manager) ---
+$tokaemmDir = (Resolve-Path (Join-Path $root '..\crates\izarravm-firmware\roms\dos')).Path
+$tokaemmSrc = Join-Path $tokaemmDir 'tokaemm.asm'
+$tokaemmOut = Join-Path $tokaemmDir 'tokaemm.sys'
+$tokaemmSourceDir = ($tokaemmDir -replace '\\', '/') + '/'
+& nasm -f bin "-dTOKAEMM_SOURCE_DIR=`"$tokaemmSourceDir`"" $tokaemmSrc -o $tokaemmOut
+if ($LASTEXITCODE) { throw "nasm tokaemm failed" }
+if (-not (Test-Path $tokaemmOut)) { throw "TOKAEMM.SYS not produced" }
+Write-Host "TOKAEMM.SYS: $((Get-Item $tokaemmOut).Length) bytes"
+
 # --- GSWMODE (runtime CPU-speed switch via Lotura port 0xE1; committed source
 # lives in the firmware crate alongside the other small DOS .COM fixtures) ---
 $gswmodeSrc = Join-Path $root '..\crates\izarravm-firmware\roms\dos\gswmode.asm'

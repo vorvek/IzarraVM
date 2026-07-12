@@ -131,21 +131,31 @@ out of memory, or a bad path), 5 disk write error.
 
 ## MEM
 
-Reports memory usage. Toka-DOS's MEM carries one deliberate behavior change
-from stock FreeDOS MEM.
+Reports memory usage. Toka-DOS adds a category display and changes how `/P`
+works compared with stock FreeDOS MEM.
 
 ```
 MEM [/P] [/FULL] [/DEBUG] [/PAGE] [...]
 ```
 
-By default, `MEM` prints the usual conventional/upper/extended summary.
-Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE` (pause after
-each screenful). The per-program size-and-segment listing normally needs
-`/FULL` or `/DEBUG` instead. **Toka-DOS divergence:** `MEM /P` pauses *and*
-lists every program in memory with its size and position, folding `/FULL`'s
-behavior into `/P` so the one switch does what a Toka-DOS user would expect
-from the letter P. `/FULL` and `/DEBUG` are unchanged from upstream and
-still work on their own.
+By default, `MEM` shows a summary with colored block bars. A light-red `▓`
+(CP437 `B2`) marks memory in use, and a light-green `░` (CP437 `B0`) marks
+free memory. On the standard 24 MiB Izarra 3000, the summary categories are
+640 KiB conventional memory, the full 384 KiB upper region, 3 MiB EMS, and
+20 MiB XMS. The upper category covers the whole `A0000` to `FFFFF` address
+region, including video memory and ROMs. TOKAEMM can allocate 96 KiB there
+with its default EMS frame. Under `NOEMS`, the EMS category becomes zero, the
+XMS category grows to 23 MiB, and the allocatable UMB space grows to 160 KiB.
+
+The 3 MiB EMS pool is a separate top-of-RAM partition. XMS allocations and
+VCPI pages share an arena inside the 20 MiB XMS category, so activity from
+either API changes the free part of that category.
+
+Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE`, which pauses
+after each screenful. The per-program size and segment listing normally needs
+`/FULL` or `/DEBUG`. In Toka-DOS, `MEM /P` pauses and lists every program in
+memory with its size and position. `/FULL` and `/DEBUG` still work on their
+own.
 
 ## ATTRIB
 

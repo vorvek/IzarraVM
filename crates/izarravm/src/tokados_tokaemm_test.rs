@@ -76,6 +76,55 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
+#[test]
+#[ignore = "boots three full DOS images in V86 (slow in debug); run with --ignored"]
+fn tokaemm_small_ram_layouts_do_not_expose_out_of_range_pools() {
+    for memory_mib in [1, 2, 4] {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_small_{memory_mib}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let config = b"FILES=20\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:1024 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+        let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVER\r\n".to_vec();
+        let profile = MachineProfile::gsw_386(memory_mib, VideoCard::Vega);
+        let mut machine =
+            Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    ("AUTOEXEC.BAT".to_string(), autoexec),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("machine run");
+        let text = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("TOKAEMM faulted with {memory_mib} MiB: {msg}\n{text}");
+        }
+        assert!(
+            text.to_ascii_lowercase().contains("c:\\>"),
+            "Toka-DOS did not reach a prompt with {memory_mib} MiB (stop={stop:?}).\n{text}"
+        );
+    }
+}
+
 /// A guest program install-checks XMS, allocates a 64 KB EMB,
 /// locks it, moves a pattern conventional->EMB->conventional, verifies it, then
 /// unlocks and frees — all in V86 under TOKAEMM's monitor (block MOVE traps to
@@ -99,7 +148,7 @@ fn tokaemm_m1_xms_alloc_move_free_in_v86() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nXMSTEST\r\n".to_vec();
@@ -157,7 +206,7 @@ fn tokaemm_m3_umb_load_high_in_v86() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDOS=UMB\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBTEST\r\n".to_vec();
@@ -213,7 +262,7 @@ fn tokaemm_m3_umb_direct_xms_in_v86() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nUMBMECH\r\n".to_vec();
@@ -367,13 +416,13 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// A bare DEVICE=TOKAEMM.SYS (no RAM argument)
+/// DEVICE=TOKAEMM.SYS NOEMS
 /// presents a FRAMELESS manager — INT 67h answers present/version 4.0, the
 /// frame query returns 80h, page counts are zero, and allocation is refused
 /// with 87h (the EMM386 NOEMS contract). EMSNONE signals 0xA5 / 0xEn.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-fn tokaemm_m2_ems_frameless_default_in_v86() {
+fn tokaemm_m2_ems_frameless_noems_in_v86() {
     let dir = std::env::temp_dir().join(format!(
         "tokaemm_m2f_{}_{}",
         std::process::id(),
@@ -384,7 +433,7 @@ fn tokaemm_m2_ems_frameless_default_in_v86() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nEMSNONE\r\n".to_vec();
@@ -423,7 +472,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// VCPI presence under a bare DEVICE=TOKAEMM.SYS (frameless default,
+/// VCPI presence under DEVICE=TOKAEMM.SYS NOEMS (frameless mode,
 /// no EMS pool — the stock-boot shape), INT 67h AX=DE00h answers VCPI 1.0
 /// present (AH=0, BX=0100h), a not-yet-implemented DExx subfunction
 /// answers 8Fh, untouched registers survive the call, and the plain EMS
@@ -431,7 +480,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 /// 0xA5 / 0xEn.
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
-fn tokaemm_vcpi_m0_de00_present_on_frameless_default() {
+fn tokaemm_vcpi_m0_de00_present_on_frameless_noems() {
     let dir = std::env::temp_dir().join(format!(
         "tokaemm_vcpi0_{}_{}",
         std::process::id(),
@@ -442,7 +491,7 @@ fn tokaemm_vcpi_m0_de00_present_on_frameless_default() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIDET\r\n".to_vec();
@@ -481,7 +530,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// VCPI queries and page-pool behavior under a bare DEVICE=TOKAEMM.SYS. The
+/// VCPI queries and page-pool behavior under DEVICE=TOKAEMM.SYS NOEMS. The
 /// DE02-DE0B set answers — free-page count over a real pool, max-page
 /// query, alloc/free round-trip with 12-LSB masking, bad-free and
 /// double-free rejection, V86 page-table lookups (identity + out-of-range
@@ -500,7 +549,7 @@ fn tokaemm_vcpi_m1_queries_and_page_pool() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIMEM\r\n".to_vec();
@@ -539,7 +588,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
     );
 }
 
-/// Under a bare DEVICE=TOKAEMM.SYS, VCPI DE01 Get Protected Mode
+/// Under DEVICE=TOKAEMM.SYS NOEMS, VCPI DE01 Get Protected Mode
 /// Interface fills the client page-table buffer (identity first-MB
 /// entries, software bits 9-11 cleared, exactly 0x110 entries, DI
 /// advanced), furnishes the three server GDT descriptors (32-bit CPL0
@@ -560,7 +609,7 @@ fn tokaemm_vcpi_m2_de01_pm_interface() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPIIF\r\n".to_vec();
@@ -600,7 +649,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// A minimal real VCPI client uses DE0C to walk the full extender
-/// lifecycle under a bare DEVICE=TOKAEMM.SYS — DE01 interface setup,
+/// lifecycle under DEVICE=TOKAEMM.SYS NOEMS: DE01 interface setup,
 /// DE0C into 16-bit protected mode under its own CR3/GDT/TSS (the
 /// JEMM-traced switch flow), far-calls to the server PM entry (DE03
 /// equal to the V86 baseline, DE04/DE05 round-trip), DE0C back to V86,
@@ -620,7 +669,7 @@ fn tokaemm_vcpi_m3_de0c_switch_round_trip() {
     ));
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
-    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS\r\n\
+    let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n\
 SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         .to_vec();
     let autoexec = b"@ECHO OFF\r\nPATH C:\\DOS\r\nVCPISW\r\n".to_vec();
@@ -775,7 +824,7 @@ SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
 }
 
 /// A fresh empty user folder gets the current defaults seeded
-/// (`ensure_user_config`) — DEVICE=TOKAEMM.SYS NOEMS + DOS=HIGH,UMB + LH
+/// (`ensure_user_config`): DEVICE=TOKAEMM.SYS RAM + DOS=HIGH,UMB + LH
 /// TOKAMOUS — and the boot reaches a C:\> prompt RUNNING IN V86 under the
 /// TOKAEMM monitor, with the driver's signon banner on screen.
 #[test]
@@ -799,7 +848,7 @@ fn tokaemm_m4_default_boot_runs_v86() {
     // The seeding wrote real, editable defaults into the user folder.
     let seeded = std::fs::read_to_string(dir.join("CONFIG.SYS")).expect("seeded CONFIG.SYS");
     assert!(
-        seeded.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS") && seeded.contains("DOS=HIGH,UMB"),
+        seeded.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM") && seeded.contains("DOS=HIGH,UMB"),
         "seeded CONFIG.SYS lacks the expected defaults:\n{seeded}"
     );
 
@@ -961,7 +1010,13 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
 /// 25-row text console can't hold both outputs at once — /P's per-program
 /// table alone is longer than a screenful), driven by AUTOEXEC.BAT (never
 /// injected keystrokes, per the guest-testing convention).
-fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (String, StopReason) {
+struct MemScreen {
+    text: String,
+    columns: usize,
+    cells: Vec<(u8, u8)>,
+}
+
+fn run_mem_autoexec(dir_suffix: &str, commands: &str) -> (MemScreen, StopReason) {
     let dir = std::env::temp_dir().join(format!(
         "tokaemm_mem_{dir_suffix}_{}_{}",
         std::process::id(),
@@ -973,8 +1028,8 @@ fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (String, StopReason) {
     std::fs::create_dir_all(&dir).expect("scratch dir");
 
     let autoexec =
-        format!("@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\nMEM {mem_args}\r\n").into_bytes();
-    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+        format!("@ECHO OFF\r\nPATH C:\\DOS\r\nLH TOKAMOUS\r\n{commands}\r\n").into_bytes();
+    let profile = MachineProfile::gsw_386(24, VideoCard::Vega);
     let mut machine =
         Machine::new(profile, izarravm_firmware::izarra_bios()).expect("build machine");
     machine
@@ -999,15 +1054,43 @@ fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (String, StopReason) {
             .run_until_halt_or_cycles(150_000_000)
             .expect("machine re-run");
     }
-    let text = machine.screen_text().as_text();
+    let frame = machine.screen_text();
+    let screen = MemScreen {
+        text: frame.as_text(),
+        columns: frame.columns,
+        cells: frame
+            .cells
+            .iter()
+            .map(|cell| (cell.character, cell.attribute))
+            .collect(),
+    };
     std::fs::remove_dir_all(&dir).ok();
-    (text, stop)
+    (screen, stop)
+}
+
+fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (MemScreen, StopReason) {
+    run_mem_autoexec(dir_suffix, &format!("MEM {mem_args}"))
+}
+
+fn memory_bar<'a>(screen: &'a MemScreen, label: &str) -> &'a [(u8, u8)] {
+    let row = screen
+        .text
+        .lines()
+        .position(|line| line.starts_with(label))
+        .unwrap_or_else(|| panic!("MEM row {label:?} missing.\n{}", screen.text));
+    let cells = &screen.cells[row * screen.columns..(row + 1) * screen.columns];
+    let start = cells
+        .iter()
+        .position(|(character, _)| matches!(*character, 0xB0 | 0xB2))
+        .unwrap_or_else(|| panic!("MEM row {label:?} has no usage bar.\n{}", screen.text));
+    &cells[start..start + 24]
 }
 
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_plain_reports_conventional_memory() {
-    let (text, stop) = run_mem_command("plain", "");
+    let (screen, stop) = run_mem_command("plain", "");
+    let text = &screen.text;
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running MEM under V86: {msg}\n{text}");
     }
@@ -1020,12 +1103,60 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         lower.contains("conventional"),
         "MEM output doesn't mention conventional memory (stop={stop:?}).\n{text}"
     );
+    assert!(
+        !lower.contains("ems internal error"),
+        "MEM could not enumerate TokaEMM's EMS handles.\n{text}"
+    );
+    for (label, total) in [
+        ("Conventional", "640K"),
+        ("Upper", "384K"),
+        ("Expanded (EMS)", "3,072K"),
+        ("Extended (XMS)", "20,480K"),
+    ] {
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(label))
+            .unwrap_or_else(|| panic!("MEM row {label:?} missing.\n{text}"));
+        assert!(
+            line.contains(total),
+            "MEM row {label:?} has the wrong total.\n{text}"
+        );
+        for &(character, attribute) in memory_bar(&screen, label) {
+            assert!(matches!(character, 0xB0 | 0xB2));
+            assert_eq!(attribute, if character == 0xB2 { 0x0C } else { 0x0A });
+        }
+    }
+}
+
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_redirect_keeps_raw_uncolored_bars() {
+    let (screen, stop) = run_mem_autoexec("redirect", "MEM > C:\\MEM.TXT\r\nTYPE C:\\MEM.TXT");
+    if let StopReason::CpuError(msg) = &stop {
+        panic!(
+            "CPU fault while redirecting MEM under V86: {msg}\n{}",
+            screen.text
+        );
+    }
+    for label in ["Conventional", "Upper", "Expanded (EMS)", "Extended (XMS)"] {
+        let bar = memory_bar(&screen, label);
+        assert_eq!(bar.len(), 24);
+        assert!(
+            bar.iter()
+                .all(|(character, _)| matches!(*character, 0xB0 | 0xB2))
+        );
+        assert!(
+            bar.iter()
+                .all(|(_, attribute)| !matches!(*attribute, 0x0A | 0x0C))
+        );
+    }
 }
 
 #[test]
 #[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
 fn tokaemm_mem_p_lists_resident_programs() {
-    let (text, stop) = run_mem_command("p", "/P");
+    let (screen, stop) = run_mem_command("p", "/P");
+    let text = &screen.text;
     if let StopReason::CpuError(msg) = &stop {
         panic!("CPU fault while running MEM /P under V86: {msg}\n{text}");
     }
