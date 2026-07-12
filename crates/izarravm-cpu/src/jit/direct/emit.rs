@@ -924,6 +924,15 @@ fn emit_increment_exit_u32(e: &mut Encoder, offset: usize) {
     e.store_r32_disp32(Reg::RAX, offset as i32, Reg::RDI);
 }
 
+fn emit_store_unresolved_reason(e: &mut Encoder, reason: UnresolvedReason) {
+    e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
+    e.store_u32_imm_disp32(
+        Reg::RAX,
+        core::mem::offset_of!(NativeExit, unresolved_reason) as i32,
+        reason as u32,
+    );
+}
+
 fn emit_advance_eip(e: &mut Encoder, delta: u32) {
     if delta == 0 {
         return;
@@ -976,7 +985,19 @@ fn emit_completed_path(
         e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RDI);
         e.jmp_r64(Reg::RDX);
         e.place(unresolved);
-        emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, unresolved_exits));
+        let hidden = e.label();
+        e.load_r64_disp8(
+            Reg::RDX,
+            Reg::RAX,
+            core::mem::offset_of!(LinkCell, portal) as i8,
+        );
+        e.mov_r64_imm64(Reg::RDI, zero_portal().address() as u64);
+        e.cmp_r64_r64(Reg::RDX, Reg::RDI);
+        e.jnz(hidden);
+        emit_store_unresolved_reason(e, UnresolvedReason::StaticUnbound);
+        e.jmp(returning);
+        e.place(hidden);
+        emit_store_unresolved_reason(e, UnresolvedReason::StaticHidden);
         e.place(returning);
     }
     e.jmp(shared_return);
@@ -1000,7 +1021,8 @@ fn emit_completed_dynamic_path(
         accounting,
     );
     e.load_r32_disp32(Reg::RDX, Reg::R15, eip_offset());
-    let unresolved = e.label();
+    let dynamic_hidden_or_unbound = e.label();
+    let unresolved_done = e.label();
     for link_cell in link_cells {
         let next = e.label();
         e.mov_r64_imm64(Reg::RAX, link_cell as u64);
@@ -1021,7 +1043,7 @@ fn emit_completed_dynamic_path(
             core::mem::offset_of!(BlockPortal, body) as i8,
         );
         e.cmp_r64_imm32(Reg::RCX, 0);
-        e.jz(unresolved);
+        e.jz(dynamic_hidden_or_unbound);
         e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_QUOTA);
         e.sub_r64_imm32(Reg::RDI, 1);
         e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RDI);
@@ -1033,8 +1055,23 @@ fn emit_completed_dynamic_path(
         e.jmp_r64(Reg::RCX);
         e.place(next);
     }
-    e.place(unresolved);
-    emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, unresolved_exits));
+    emit_store_unresolved_reason(e, UnresolvedReason::DynamicMissOrUnbound);
+    e.jmp(unresolved_done);
+    e.place(dynamic_hidden_or_unbound);
+    let dynamic_hidden = e.label();
+    e.load_r64_disp8(
+        Reg::RCX,
+        Reg::RAX,
+        core::mem::offset_of!(LinkCell, portal) as i8,
+    );
+    e.mov_r64_imm64(Reg::RDI, zero_portal().address() as u64);
+    e.cmp_r64_r64(Reg::RCX, Reg::RDI);
+    e.jnz(dynamic_hidden);
+    emit_store_unresolved_reason(e, UnresolvedReason::DynamicMissOrUnbound);
+    e.jmp(unresolved_done);
+    e.place(dynamic_hidden);
+    emit_store_unresolved_reason(e, UnresolvedReason::DynamicHidden);
+    e.place(unresolved_done);
     e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
     e.mov_r64_imm64(Reg::RCX, link_cells[0] as u64);
     e.store_r64_disp32(

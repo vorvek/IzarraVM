@@ -330,8 +330,8 @@ impl CpuGsw {
                 if self.decode_cache.line_count() == self.jit_direct.decode_slot_count() {
                     self.jit_direct.suspend_decode_slot(slot as usize);
                 } else {
-                    // A test-only cache-size replacement makes slot identities incomparable.
-                    // Hiding all portals is the conservative equivalent of an exact suspension.
+                    // Test-only cache replacement can change the direct-map shape. Hide every
+                    // portal until root dispatch validates the current lines.
                     self.jit_direct.invalidate_translation();
                 }
             }

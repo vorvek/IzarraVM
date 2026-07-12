@@ -359,7 +359,6 @@ pub(crate) struct CompiledBlock {
     entry: usize,
     body_entry: usize,
     code_len: u32,
-    decode_residency_epoch: u64,
     fetch_lens: [u8; MAX_BLOCK_INSTRUCTIONS],
     raw_clocks: u16,
     weighted_fp_clocks: u32,
@@ -760,7 +759,6 @@ impl BlockCache {
             entry: entry as usize,
             body_entry: (entry as usize).checked_add(compilation.body_offset)?,
             code_len,
-            decode_residency_epoch: compilation.decode_residency_epoch,
             fetch_lens: compilation.fetch_lens,
             raw_clocks,
             weighted_fp_clocks: compilation.weighted_fp_clocks,
@@ -877,9 +875,8 @@ impl BlockCache {
         self.disabled = false;
     }
 
-    /// Drop translation-dependent links while retaining physical compiled code. A block is not
-    /// eligible as a successor again until its decode lines have been checked in the new decode
-    /// residency epoch.
+    /// Drop translation-dependent links while retaining physical compiled code. The root dispatch
+    /// must validate the block's canonical key before making it visible again.
     pub(crate) fn invalidate_translation(&mut self) {
         for (index, portal) in self.block_portals.iter().enumerate() {
             if self.block_active.get(index) == Some(&true) {
@@ -909,7 +906,7 @@ impl BlockCache {
     }
 
     /// Hide every block that depends on one displaced decode slot. Logical links stay intact and
-    /// will become usable again when residency validation republishes the matching portals.
+    /// will become usable again when root dispatch republishes the matching portals.
     pub(crate) fn suspend_decode_slot(&mut self, slot: usize) -> usize {
         let Some(dependency_len) = self.decode_dependencies.get(slot).map(Vec::len) else {
             return 0;
@@ -939,6 +936,18 @@ impl BlockCache {
         self.active_index(id).is_some_and(|index| {
             self.block_link_epochs[index] == self.link_epoch && self.block_portals[index].visible()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hide_portal_for_test(&mut self, id: BlockId) -> bool {
+        let Some(index) = self.active_index(id) else {
+            return false;
+        };
+        if !self.block_portals[index].visible() {
+            return false;
+        }
+        self.block_portals[index].clear();
+        true
     }
 
     /// Remove direct-cache entries whose translated physical bytes overlap a guest write. Block
@@ -1123,18 +1132,12 @@ impl BlockCache {
         self.block(id)
     }
 
-    /// Record that every decode slot in `key`'s block was revalidated against `epoch`.
-    pub(crate) fn refresh_decode_residency(
-        &mut self,
-        key: BlockKey,
-        epoch: u64,
-    ) -> Option<CompiledBlock> {
+    /// Republish a block after root dispatch has revalidated its canonical translation key.
+    pub(crate) fn revalidate_translation(&mut self, key: BlockKey) -> Option<CompiledBlock> {
         let BlockState::Compiled(id) = self.entries.get(&key).copied()? else {
             return None;
         };
         let index = self.active_index(id)?;
-        let block = self.blocks.get_mut(index)?;
-        block.decode_residency_epoch = epoch;
         self.make_link_visible(id);
         self.blocks.get(index).copied()
     }
@@ -1166,8 +1169,7 @@ impl BlockCache {
             if fetch_len == 0 {
                 return None;
             }
-            let slot = (linear as usize) & self.decode_slot_mask;
-            let slot = u32::try_from(slot).ok()?;
+            let slot = u32::try_from((linear as usize) & self.decode_slot_mask).ok()?;
             if !slots[..slot_len].contains(&slot) {
                 slots[slot_len] = slot;
                 slot_len += 1;
@@ -1624,6 +1626,17 @@ pub(crate) enum SideExitReason {
     Other = 5,
 }
 
+#[repr(u32)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnresolvedReason {
+    #[default]
+    None = 0,
+    StaticUnbound,
+    StaticHidden,
+    DynamicMissOrUnbound,
+    DynamicHidden,
+}
+
 /// Fetch replay retained for buses that observe individual code addresses. Production RAM timing
 /// uses the aggregate counters in `NativeExit` and leaves this trace disabled.
 #[repr(C)]
@@ -1656,7 +1669,7 @@ pub(crate) struct NativeExit {
     pub(crate) side_exit_reason: u32,
     pub(crate) trace_len: u32,
     pub(crate) linked_transfers: u32,
-    pub(crate) unresolved_exits: u32,
+    pub(crate) unresolved_reason: UnresolvedReason,
     pub(crate) trace_ptr: usize,
     pub(crate) dynamic_link_cell: usize,
     pub(crate) dynamic_target_eip: u32,
@@ -1702,7 +1715,6 @@ impl CompileOutcome {
 
 pub(crate) struct Compilation {
     pub span: BlockSpan,
-    pub decode_residency_epoch: u64,
     pub fetch_lens: [u8; MAX_BLOCK_INSTRUCTIONS],
     pub raw_clocks: u32,
     pub weighted_fp_clocks: u32,
@@ -2861,7 +2873,6 @@ fn compile_with_instruction_limit(
     });
     CompileOutcome::Compiled(Compilation {
         span,
-        decode_residency_epoch: cpu.decode_cache.residency_epoch(),
         fetch_lens,
         raw_clocks,
         weighted_fp_clocks,

@@ -585,7 +585,12 @@ pub struct PerfCounters {
     pub jit_direct_hash_hits: u64,
     pub jit_direct_lookup_misses: u64,
     pub jit_direct_linked_transfers: u64,
+    /// Cold chain returns. The four reason counters below partition this total exactly.
     pub jit_direct_unresolved_exits: u64,
+    pub jit_direct_unresolved_static_unbound: u64,
+    pub jit_direct_unresolved_static_hidden: u64,
+    pub jit_direct_unresolved_dynamic_miss_or_unbound: u64,
+    pub jit_direct_unresolved_dynamic_hidden: u64,
     pub jit_direct_deferred_short: u64,
     pub jit_direct_reject_observer: u64,
     pub jit_direct_reject_interrupt_shadow: u64,
@@ -607,8 +612,7 @@ pub struct PerfCounters {
     pub jit_direct_links_cleared: u64,
     /// Reverse-index dependency IDs examined after a direct-mapped decode slot was displaced.
     pub jit_direct_decode_dependencies_scanned: u64,
-    /// Guarded entry portals hidden because one of their direct-mapped decode dependencies was
-    /// displaced.
+    /// Compiled portals hidden because one of their live decode lines was displaced.
     pub jit_direct_portals_hidden: u64,
     /// Guest instructions completed by emitted native operations, excluding instructions run by
     /// `region_step`. Compare with `jit_region_insns` to measure native opcode coverage.
@@ -1594,8 +1598,8 @@ struct RepExecution {
 const DECODE_CACHE_LINES: usize = 4096;
 
 /// Sweep knob: `IZARRAVM_DECODE_CACHE_LINES=<power of two>` overrides the decode-cache size at
-/// construction. Host-side only (a bigger cache changes wall time, never guest state - hit or
-/// miss produces the identical DecodedInsn and identical clock charges). Read once, cached.
+/// construction. Decode replacement changes cold-fetch timing, so performance comparisons must
+/// keep this value fixed. Read once, cached.
 /// Motivation: the Doom 586 census measured decode_hit=21% / insns/run=1.3 at 2048 lines - the
 /// direct-mapped cache thrashes on a 32-bit pmode code footprint; the bench-derived knee (2048,
 /// tiny real-mode payloads) does not transfer.
@@ -1703,9 +1707,6 @@ struct DecodeCache {
     lines: Box<[DecodeLine]>,
     mask: u32,
     generation: u32,
-    /// Changes only when a fill displaces a different live decode line. It remains part of the
-    /// compiled residency token, but dispatch correctness now comes from exact portal suspension.
-    replacement_epoch: u32,
     /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
     /// been cached from. A write touching a marked byte advances the generation. Marks are cleared
     /// whenever an SMC flush bumps the generation (no line survives, so live code re-marks on
@@ -1740,8 +1741,8 @@ struct DecodeCache {
     jit_smc_epoch: u32,
 }
 
-/// Result of publishing one decoded instruction. A live direct-mapped slot displaced by another
-/// key must be suspended from compiled dispatch before guest execution continues.
+/// Result of publishing one decoded instruction. A different live key reports the displaced slot
+/// so compiled blocks can preserve the interpreter's cold-fetch timing.
 #[must_use]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DecodeInsertOutcome {
@@ -1792,7 +1793,6 @@ impl DecodeCache {
             mask: (lines - 1) as u32,
             // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
             generation: 1,
-            replacement_epoch: 0,
             code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
             code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
             #[cfg(all(
@@ -1956,9 +1956,6 @@ impl DecodeCache {
         let displaced = previous.generation == self.generation
             && previous.insn.is_some()
             && (previous.tag != lin || previous.d != d);
-        if displaced {
-            self.replacement_epoch = self.replacement_epoch.wrapping_add(1);
-        }
         self.lines[index] = DecodeLine {
             tag: lin,
             generation: self.generation,
@@ -2052,14 +2049,6 @@ impl DecodeCache {
         line.generation == self.generation && line.tag == lin && line.d == d
     }
 
-    /// Token for the set of resident decode lines. Global invalidation changes the high half;
-    /// direct-mapped replacement changes the low half.
-    #[cfg(feature = "jit")]
-    #[inline]
-    fn residency_epoch(&self) -> u64 {
-        (u64::from(self.generation) << 32) | u64::from(self.replacement_epoch)
-    }
-
     /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow SMC
     /// kill inside its span or a mode-key mismatch; the next probe misses and re-admission refreshes
     /// the slots). The line was hot enough to carry a region and is being unstamped because the
@@ -2128,10 +2117,8 @@ impl DecodeCache {
     /// watch clear stay one operation so no dead decode line can leave an unowned native watch.
     fn invalidate_and_clear_code_marks(&mut self) {
         if self.generation == u32::MAX {
-            // Clear old generation-1 lines before 1 can become live again. Changing the
-            // replacement half of the residency token also forces direct blocks to revalidate.
+            // Clear old generation-1 lines before 1 can become live again.
             self.lines.fill(DecodeLine::default());
-            self.replacement_epoch = self.replacement_epoch.wrapping_add(1);
             self.generation = 1;
         } else {
             self.generation += 1;

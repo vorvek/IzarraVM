@@ -5,6 +5,44 @@ use super::*;
 
 const GAME_LOOP_ENTRY: u32 = 0x101;
 
+fn invoke_native_entry(
+    cpu: &mut CpuGsw,
+    block: jit::direct::CompiledBlock,
+    quota: u32,
+) -> jit::direct::NativeExit {
+    let mut exit = jit::direct::NativeExit::default();
+    let entry: jit::direct::DirectEntryFn = unsafe { std::mem::transmute(block.entry_ptr()) };
+    let flags = cpu.eflags();
+    unsafe {
+        entry(
+            cpu as *mut CpuGsw,
+            flags,
+            quota,
+            &mut exit as *mut jit::direct::NativeExit,
+        );
+    }
+    exit
+}
+
+fn assert_unresolved_reason_deltas(
+    before: &PerfCounters,
+    after: &PerfCounters,
+    expected: [u64; 4],
+) {
+    let actual = [
+        after.jit_direct_unresolved_static_unbound - before.jit_direct_unresolved_static_unbound,
+        after.jit_direct_unresolved_static_hidden - before.jit_direct_unresolved_static_hidden,
+        after.jit_direct_unresolved_dynamic_miss_or_unbound
+            - before.jit_direct_unresolved_dynamic_miss_or_unbound,
+        after.jit_direct_unresolved_dynamic_hidden - before.jit_direct_unresolved_dynamic_hidden,
+    ];
+    assert_eq!(actual, expected);
+    assert_eq!(
+        after.jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
+        actual.into_iter().sum::<u64>()
+    );
+}
+
 fn quake_loop_program() -> Vec<u8> {
     let mut memory = vec![0; 0x000e_0000];
     memory[0x100] = 0x90;
@@ -915,12 +953,14 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
         native_bus.memory.copy_from_slice(&pristine);
         native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
             .copy_from_slice(&target.to_le_bytes());
+        let before = native.perf_counters().clone();
         assert!(
             native
                 .try_run_direct_block_for_test(&mut native_bus, ret_block)
                 .unwrap()
         );
         assert_eq!(native.registers.eip, target);
+        assert_unresolved_reason_deltas(&before, native.perf_counters(), [0, 0, 1, 0]);
     }
 
     for (target, expected_halt, expected_value) in [
@@ -939,8 +979,7 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
             .copy_from_slice(&target.to_le_bytes());
         native_bus.trace = BusTrace::default();
         interp_bus.trace = BusTrace::default();
-        let entries = native.perf_counters().jit_direct_entries;
-        let transfers = native.perf_counters().jit_direct_linked_transfers;
+        let before = native.perf_counters().clone();
 
         assert!(
             native
@@ -962,18 +1001,50 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
         assert_eq!(native.registers.eip, expected_halt);
         assert_eq!(native.registers.eax(), expected_value);
         assert_eq!(native.registers.ecx(), expected_value);
-        assert_eq!(native.perf_counters().jit_direct_entries - entries, 1);
         assert_eq!(
-            native.perf_counters().jit_direct_linked_transfers - transfers,
+            native.perf_counters().jit_direct_entries - before.jit_direct_entries,
             1
         );
+        assert_eq!(
+            native.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+            1
+        );
+        assert_unresolved_reason_deltas(&before, native.perf_counters(), [1, 0, 0, 0]);
     }
+
+    // Exercise the first PIC way independently. A matching tag whose real portal has no body is
+    // a hidden target, not an unbound dynamic miss.
+    assert!(native.jit_direct.hide_portal_for_test(first_block.id()));
+    assert!(!native.jit_direct.is_link_visible(first_block.id()));
+    assert!(native.jit_direct.is_link_visible(second_block.id()));
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    native_bus.memory.copy_from_slice(&pristine);
+    native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+        .copy_from_slice(&FIRST.to_le_bytes());
+    let before = native.perf_counters().clone();
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, ret_block)
+            .unwrap()
+    );
+    assert_eq!(native.registers.eip, FIRST);
+    assert_eq!(native.registers.eax(), 0);
+    assert_eq!(native.registers.ecx(), 0);
+    assert_unresolved_reason_deltas(&before, native.perf_counters(), [0, 0, 0, 1]);
+
+    native.jit_direct.set_auto_admit(true);
+    native.jit_direct.set_admission_heat_for_test(1);
+    native.set_eip(FIRST);
+    native
+        .try_direct_continuation_for_test(&mut native_bus, FIRST, true)
+        .unwrap();
+    native.jit_direct.set_auto_admit(false);
+    assert!(native.jit_direct.is_link_visible(first_block.id()));
 
     // Hide only the second target's body. Its PIC tag and logical edge remain in place while the
     // first way stays live, so a return to SECOND must commit the transfer and stop at the hidden
     // portal instead of falling through to either native target.
-    let second_slot = SECOND as usize & (native.jit_direct.decode_slot_count() - 1);
-    assert_eq!(native.jit_direct.suspend_decode_slot(second_slot), 1);
+    assert!(native.jit_direct.hide_portal_for_test(second_block.id()));
     assert!(native.jit_direct.is_link_visible(ret_block.id()));
     assert!(native.jit_direct.is_link_visible(first_block.id()));
     assert!(!native.jit_direct.is_link_visible(second_block.id()));
@@ -1030,6 +1101,7 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
         native.perf_counters().jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
         1
     );
+    assert_unresolved_reason_deltas(&before, native.perf_counters(), [0, 0, 0, 1]);
     assert_eq!(
         native.perf_counters().jit_direct_side_exits - before.jit_direct_side_exits,
         0
@@ -1046,6 +1118,24 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
         .unwrap();
     native.jit_direct.set_auto_admit(false);
     assert!(native.jit_direct.is_link_visible(second_block.id()));
+
+    // A live matching edge that exhausts its quota commits the RET but neither enters the target
+    // nor reports an unresolved reason.
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    native_bus.memory.copy_from_slice(&pristine);
+    native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+        .copy_from_slice(&SECOND.to_le_bytes());
+    let quota_exit = invoke_native_entry(&mut native, ret_block, 1);
+    assert_eq!(native.registers.eip, SECOND);
+    assert_eq!(native.registers.esp(), INITIAL_ESP + 4);
+    assert_eq!(quota_exit.instructions, 1);
+    assert_eq!(quota_exit.linked_transfers, 0);
+    assert_eq!(
+        quota_exit.unresolved_reason,
+        jit::direct::UnresolvedReason::None
+    );
+    assert_eq!(quota_exit.dynamic_link_cell, 0);
+    assert_eq!(quota_exit.dynamic_target_eip, 0);
 
     arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
     native_bus.memory.copy_from_slice(&pristine);
@@ -1080,6 +1170,48 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
         native.perf_counters().jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
         1
     );
+    assert_unresolved_reason_deltas(&before, native.perf_counters(), [1, 0, 0, 0]);
+}
+
+#[test]
+fn static_hidden_portal_reports_reason_before_target_body() {
+    const ENTRY: u32 = 0x300;
+    const TARGET: u32 = 0x320;
+
+    let mut memory = vec![0; 0x1000];
+    memory[ENTRY as usize..ENTRY as usize + 10].copy_from_slice(&[
+        0xb8, 1, 0, 0, 0, // mov eax,1
+        0xe9, 0x16, 0, 0, 0, // jmp TARGET
+    ]);
+    memory[TARGET as usize..TARGET as usize + 2].copy_from_slice(&[
+        0xeb, 0xfe, // jmp TARGET
+    ]);
+
+    let mut cpu = flat_stack_cpu(ENTRY);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    decode_fixture(&mut cpu, &mut bus, &[ENTRY, ENTRY + 5, TARGET]);
+    let source = install_fixture_block(&mut cpu, ENTRY);
+    let target = install_fixture_block(&mut cpu, TARGET);
+    assert!(cpu.jit_direct.has_linked_successor(source));
+
+    assert!(cpu.jit_direct.hide_portal_for_test(target.id()));
+    assert!(cpu.jit_direct.is_link_visible(source.id()));
+    assert!(!cpu.jit_direct.is_link_visible(target.id()));
+
+    arm_stack_fixture(&mut cpu, ENTRY, 0x800);
+    let before = cpu.perf_counters().clone();
+    assert!(cpu.try_run_direct_block_for_test(&mut bus, source).unwrap());
+
+    assert_eq!(cpu.registers.eip, TARGET);
+    assert_eq!(cpu.registers.eax(), 1);
+    assert_eq!(cpu.perf_counters().instructions - before.instructions, 2);
+    assert_eq!(
+        cpu.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        0
+    );
+    assert_unresolved_reason_deltas(&before, cpu.perf_counters(), [0, 1, 0, 0]);
 }
 
 #[test]

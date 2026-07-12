@@ -874,7 +874,7 @@ fn decode_cache_hits_only_on_matching_tag_and_generation() {
 }
 
 #[test]
-fn decode_cache_reports_only_live_key_eviction_slots() {
+fn decode_cache_put_reports_accepted_and_rejected_lines() {
     let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
     let mut bus = TestBus::with_memory(mem);
     let mut insn = cpu.decode(&mut bus).unwrap();
@@ -905,7 +905,7 @@ fn decode_cache_reports_only_live_key_eviction_slots() {
 
 #[cfg(feature = "jit")]
 #[test]
-fn direct_dependency_slots_match_the_decode_cache_after_clone() {
+fn direct_dependency_shape_matches_the_decode_cache_after_clone() {
     let cpu = CpuGsw::default();
     assert_eq!(
         cpu.jit_direct.decode_slot_count(),
@@ -925,13 +925,12 @@ fn direct_dependency_slots_match_the_decode_cache_after_clone() {
     any(target_os = "windows", target_os = "linux")
 ))]
 #[test]
-fn decode_cache_generation_wrap_clears_lines_watches_and_residency_token() {
+fn decode_cache_generation_wrap_clears_lines_and_watches() {
     let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
     let mut bus = TestBus::with_memory(mem);
     let insn = cpu.decode(&mut bus).unwrap();
     let mut cache = DecodeCache::new(2);
     assert!(cache.put(0x100, insn, false, 0x100).inserted);
-    let old_token = cache.residency_epoch();
     let table_base = cache.native_code_watch_table();
     assert!(cache.native_code_watch.is_watched(0x100));
 
@@ -943,7 +942,6 @@ fn decode_cache_generation_wrap_clears_lines_watches_and_residency_token() {
     assert_eq!(cache.native_code_watch.precise_pages(), 0);
     assert_eq!(cache.native_code_watch.coarse_page_count(), 0);
     assert_eq!(cache.native_code_watch_table(), table_base);
-    assert_ne!(cache.residency_epoch(), old_token);
     cache.assert_native_watch_consistent();
 }
 

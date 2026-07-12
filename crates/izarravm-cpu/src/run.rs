@@ -769,16 +769,12 @@ impl CpuGsw {
                     .expect("installed direct block must be live")
             }
         };
-        // Tests can replace the decode cache with a different direct-map size. Its slots no
-        // longer name the backend's dependency lists, so hide every portal and take the checked
-        // root path until the sizes agree again.
         if self.decode_cache.line_count() != self.jit_direct.decode_slot_count() {
             self.jit_direct.invalidate_translation();
         }
         let block = if self.jit_direct.is_link_visible(block.id()) {
             block
         } else {
-            let residency_epoch = self.decode_cache.residency_epoch();
             let mut slot_lin = block.span().key.linear;
             if block.fetch_lens().iter().any(|&len| {
                 let live = self.decode_cache.line_live(slot_lin, d);
@@ -787,17 +783,14 @@ impl CpuGsw {
             }) {
                 return Ok(DirectContinuation::Interpret);
             }
-            let Some(block) = self
-                .jit_direct
-                .refresh_decode_residency(block.span().key, residency_epoch)
-            else {
+            let Some(block) = self.jit_direct.revalidate_translation(block.span().key) else {
                 return Ok(DirectContinuation::Interpret);
             };
             block
         };
-        // A stale short block must pass the residency scan above so it can become a link target in
-        // the new translation epoch. Once current, avoid the heavier native-entry validation until
-        // one of its own successor cells is live.
+        // A hidden short block must pass the canonical decode scan above before it becomes a link
+        // target again. Once current, avoid the heavier native-entry validation until one of its
+        // own successor cells is live.
         if self.jit_direct.defer_short_enabled()
             && !block.is_self_loop()
             && block.span().instructions < jit::direct::MIN_STANDALONE_INSTRUCTIONS
@@ -1228,7 +1221,25 @@ impl CpuGsw {
         self.perf.jit_direct_entries += 1;
         self.perf.jit_direct_insns += instructions;
         self.perf.jit_direct_linked_transfers += u64::from(exit.linked_transfers);
-        self.perf.jit_direct_unresolved_exits += u64::from(exit.unresolved_exits);
+        match exit.unresolved_reason {
+            jit::direct::UnresolvedReason::None => {}
+            jit::direct::UnresolvedReason::StaticUnbound => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_static_unbound += 1;
+            }
+            jit::direct::UnresolvedReason::StaticHidden => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_static_hidden += 1;
+            }
+            jit::direct::UnresolvedReason::DynamicMissOrUnbound => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_dynamic_miss_or_unbound += 1;
+            }
+            jit::direct::UnresolvedReason::DynamicHidden => {
+                self.perf.jit_direct_unresolved_exits += 1;
+                self.perf.jit_direct_unresolved_dynamic_hidden += 1;
+            }
+        }
         self.perf.jit_native_load_hits += reads;
         self.perf.data_direct_reads += reads;
         self.perf.direct_data_pointer_reads += reads;

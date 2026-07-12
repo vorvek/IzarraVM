@@ -558,6 +558,23 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
         after.jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
         1
     );
+    assert_eq!(
+        after.jit_direct_unresolved_static_unbound - before.jit_direct_unresolved_static_unbound,
+        0
+    );
+    assert_eq!(
+        after.jit_direct_unresolved_static_hidden - before.jit_direct_unresolved_static_hidden,
+        1
+    );
+    assert_eq!(
+        after.jit_direct_unresolved_dynamic_miss_or_unbound
+            - before.jit_direct_unresolved_dynamic_miss_or_unbound,
+        0
+    );
+    assert_eq!(
+        after.jit_direct_unresolved_dynamic_hidden - before.jit_direct_unresolved_dynamic_hidden,
+        0
+    );
 }
 
 fn shift_program() -> Vec<u8> {

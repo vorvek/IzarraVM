@@ -987,6 +987,10 @@ pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "jit_direct_lookup_misses": perf.jit_direct_lookup_misses,
         "jit_direct_linked_transfers": perf.jit_direct_linked_transfers,
         "jit_direct_unresolved_exits": perf.jit_direct_unresolved_exits,
+        "jit_direct_unresolved_static_unbound": perf.jit_direct_unresolved_static_unbound,
+        "jit_direct_unresolved_static_hidden": perf.jit_direct_unresolved_static_hidden,
+        "jit_direct_unresolved_dynamic_miss_or_unbound": perf.jit_direct_unresolved_dynamic_miss_or_unbound,
+        "jit_direct_unresolved_dynamic_hidden": perf.jit_direct_unresolved_dynamic_hidden,
         "jit_direct_deferred_short": perf.jit_direct_deferred_short,
         "jit_direct_reject_observer": perf.jit_direct_reject_observer,
         "jit_direct_reject_interrupt_shadow": perf.jit_direct_reject_interrupt_shadow,
@@ -1028,6 +1032,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
          page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
          jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
+         unresolved[static-unbound/static-hidden/dynamic-miss/dynamic-hidden]={}/{}/{}/{}  \
          compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
          portal[scan/hide]={}/{}  \
          arena[compact/live/bytes/fail]={}/{}/{}/{}  \
@@ -1078,6 +1083,10 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.jit_direct_linked_transfers,
         perf.jit_direct_unresolved_exits,
         perf.jit_direct_deferred_short,
+        perf.jit_direct_unresolved_static_unbound,
+        perf.jit_direct_unresolved_static_hidden,
+        perf.jit_direct_unresolved_dynamic_miss_or_unbound,
+        perf.jit_direct_unresolved_dynamic_hidden,
         perf.jit_direct_compile_attempts,
         perf.jit_direct_blocks_installed,
         perf.jit_direct_compile_ns,

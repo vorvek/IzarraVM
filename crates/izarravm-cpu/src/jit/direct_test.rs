@@ -22,7 +22,6 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
     fetch_lens[0] = u8::try_from(span.guest_len).expect("test instruction length must fit");
     Compilation {
         span,
-        decode_residency_epoch: 0,
         fetch_lens,
         raw_clocks: 1,
         weighted_fp_clocks: 0,
@@ -586,7 +585,7 @@ fn dynamic_ret_pic_stays_unlinked_until_both_translation_epochs_are_current() {
     ));
 
     cache
-        .refresh_decode_residency(source, 1)
+        .revalidate_translation(source)
         .expect("source revalidation");
     assert!(!cache.bind_dynamic_successor(
         site_cell,
@@ -595,7 +594,7 @@ fn dynamic_ret_pic_stays_unlinked_until_both_translation_epochs_are_current() {
         target.mode_key
     ));
     cache
-        .refresh_decode_residency(target, 1)
+        .revalidate_translation(target)
         .expect("target revalidation");
     assert!(cache.bind_dynamic_successor(site_cell, target.linear, target.linear, target.mode_key));
     assert!(cell.linked());
@@ -645,7 +644,7 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     assert!(matches!(cache.probe(source), BlockProbe::Ready(id) if id == source_id));
 
     cache
-        .refresh_decode_residency(source, 1)
+        .revalidate_translation(source)
         .expect("source revalidation");
     assert!(
         !cells[0].linked(),
@@ -663,7 +662,7 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
 
     assert!(matches!(cache.probe(target), BlockProbe::Ready(_)));
     cache
-        .refresh_decode_residency(target, 1)
+        .revalidate_translation(target)
         .expect("same mapping revalidation");
     assert!(cells[0].linked());
     assert_eq!(cache.arena.as_ref().expect("arena").used_slots(), slots);
@@ -674,7 +673,7 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 #[test]
-fn decode_slot_suspension_requires_revalidation_even_when_the_token_matches() {
+fn decode_slot_suspension_requires_revalidation() {
     let mut cache = BlockCache::default();
     let block = key(0x4100);
     let id = install_trivial(&mut cache, block, 1);
@@ -685,7 +684,7 @@ fn decode_slot_suspension_requires_revalidation_even_when_the_token_matches() {
     assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
 
     cache
-        .refresh_decode_residency(block, 0)
+        .revalidate_translation(block)
         .expect("decode revalidation");
     assert!(cache.is_link_visible(id));
 }
@@ -770,12 +769,12 @@ fn repeated_source_revalidation_does_not_rebuild_its_link_graph() {
         .each_ref()
         .map(|cell| cell.portal.load(Ordering::Acquire));
 
-    for residency_epoch in 1..=16 {
+    for _ in 0..16 {
         assert_eq!(cache.suspend_decode_slot(1), 1);
         assert!(!cache.is_link_visible(source_id));
         assert_eq!(cache.block_link_epochs, graph_epochs);
         cache
-            .refresh_decode_residency(source, residency_epoch)
+            .revalidate_translation(source)
             .expect("source revalidation");
         assert!(cache.is_link_visible(source_id));
         assert!(!cache.is_link_visible(hidden_id));
@@ -1020,11 +1019,11 @@ fn translation_invalid_blocks_stay_invisible_through_compaction() {
     assert!(cache.waiting.is_empty());
     assert!(!source_cell.linked());
     cache
-        .refresh_decode_residency(source, 1)
+        .revalidate_translation(source)
         .expect("source revalidation");
     assert!(!source_cell.linked());
     cache
-        .refresh_decode_residency(target, 1)
+        .revalidate_translation(target)
         .expect("target revalidation");
     assert!(source_cell.linked());
     assert_eq!(cache.outbound[source_id.index()][0], Some(target_id));
@@ -1065,7 +1064,7 @@ fn compaction_republishes_only_portals_that_were_visible() {
         old_visible_body
     );
     cache
-        .refresh_decode_residency(hidden, 1)
+        .revalidate_translation(hidden)
         .expect("hidden block revalidation");
     assert!(cache.is_link_visible(hidden_id));
     assert_eq!(
