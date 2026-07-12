@@ -21,7 +21,7 @@ pub use midi::MidiEngine;
 pub use mixer::SbMixer;
 pub use mpu401::{Mpu401, TimedMidiMessage};
 pub use opl::OplChip;
-pub use output::{AudioPlayer, AudioSink};
+pub use output::{AudioDebugSnapshot, AudioPlayer, AudioSink};
 pub use resample::Resampler;
 pub use soundfont::{EMBEDDED_SOUNDFONT_SHA256, embedded_soundfont_path};
 pub use wss::{Ad1848, Ad1848Config};

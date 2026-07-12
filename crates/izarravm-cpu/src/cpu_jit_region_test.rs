@@ -158,6 +158,41 @@ fn assert_identical(interp: &CpuGsw, bus_i: &TestBus, jit_cpu: &CpuGsw, bus_j: &
 }
 
 #[test]
+fn hard_backend_disable_blocks_a_stamped_region() {
+    let mut interp = fresh_cpu(0xffff);
+    let mut disabled = fresh_cpu(0xffff);
+    let mut bus_i = TestBus::with_memory(program_in(0x1_0000));
+    let mut bus_d = TestBus::with_memory(program_in(0x1_0000));
+    warm_and_admit(&mut interp, &mut bus_i, &mut disabled, &mut bus_d);
+    disabled.set_native_backend_enabled(false);
+    interp.reset_perf_counters();
+    disabled.reset_perf_counters();
+
+    arm_loop(&mut interp, &mut bus_i, 8);
+    arm_loop(&mut disabled, &mut bus_d, 8);
+    let interp_calls = drive_to_halt(&mut interp, &mut bus_i, u64::MAX);
+    let disabled_calls = drive_to_halt(&mut disabled, &mut bus_d, u64::MAX);
+
+    assert_eq!(interp_calls, disabled_calls);
+    assert_identical(&interp, &bus_i, &disabled, &bus_d);
+    let perf = disabled.perf_counters();
+    assert_eq!(perf.jit_region_entries, 0);
+    assert_eq!(perf.jit_direct_entries, 0);
+    assert_eq!(perf.jit_native_insns, 0);
+}
+
+#[test]
+fn hard_backend_disable_survives_clone_and_reset() {
+    let mut cpu = CpuGsw::default();
+    cpu.set_native_backend_enabled(false);
+    let clone = cpu.clone();
+    assert!(!clone.jit_direct.backend_enabled());
+
+    cpu.reset();
+    assert!(!cpu.jit_direct.backend_enabled());
+}
+
+#[test]
 fn switching_between_386_modes_clears_regions_stamps_and_remainders() {
     let mut interp = fresh_cpu(u32::MAX);
     let mut jit_cpu = fresh_cpu(u32::MAX);
@@ -617,16 +652,15 @@ fn narrow_smc_falls_back_globally_on_an_aliased_page() {
 }
 
 #[test]
-fn narrow_smc_falls_back_globally_on_a_straddling_instruction() {
+fn decode_cache_refuses_a_straddling_instruction() {
     let mut cpu = fresh_cpu(0xffff);
     let mut bus = TestBus::with_memory(program());
     arm_loop(&mut cpu, &mut bus, 2);
     drive_to_halt(&mut cpu, &mut bus, u64::MAX);
     let insn = cpu.decode_cache.get(0x102, true).unwrap(); // 6-byte add
-    // Pretend it was decoded straddling the page edge at 0xffe: both pages flag.
-    cpu.decode_cache.put(0xffe, insn, true, 0xffe);
-    assert!(cpu.decode_cache.narrow_invalidate(0xffe).is_none());
-    assert!(cpu.decode_cache.narrow_invalidate(0x1001).is_none());
+    assert!(!cpu.decode_cache.put(0xffe, insn, true, 0xffe));
+    assert!(!cpu.decode_cache.line_live(0xffe, true));
+    assert!(!cpu.decode_cache.range_hits_code(0xffe, 6));
 }
 
 #[test]
@@ -695,6 +729,156 @@ fn region_is_byte_identical_on_the_direct_page_path() {
     );
 }
 
+#[test]
+fn paged_legacy_native_u8_uses_physical_fetches_without_publishing_a_false_alias() {
+    const CODE_LINEAR: u32 = 0x0001_0000;
+    const CODE_PHYSICAL: u32 = 0x0000_8000;
+    const DATA_LINEAR: u32 = 0x0003_0000;
+    const DATA_PHYSICAL: u32 = 0x0000_9000;
+    const ALIAS_PHYSICAL: u32 = 0x0000_a000;
+    const ENTRY_LINEAR: u32 = CODE_LINEAR + 1;
+    const ENTRY_PHYSICAL: u32 = CODE_PHYSICAL + 1;
+
+    for store in [false, true] {
+        let mut memory = vec![0; 0x0002_0000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+        for (linear, physical) in [
+            (CODE_LINEAR, CODE_PHYSICAL),
+            (DATA_LINEAR, DATA_PHYSICAL),
+            (DATA_PHYSICAL, ALIAS_PHYSICAL),
+        ] {
+            let pte = 0x2000 + ((linear >> 12) as usize * 4);
+            memory[pte..pte + 4].copy_from_slice(&(physical | 0x007).to_le_bytes());
+        }
+        memory[CODE_PHYSICAL as usize] = 0x90;
+        let memory_opcode = if store { [0x88, 0x07] } else { [0x8a, 0x06] };
+        let body = [
+            memory_opcode[0],
+            memory_opcode[1],
+            0x49, // dec ecx
+            0x75,
+            0xfb, // jnz ENTRY_LINEAR
+            0xf4, // hlt
+        ];
+        memory[ENTRY_PHYSICAL as usize..ENTRY_PHYSICAL as usize + body.len()]
+            .copy_from_slice(&body);
+        memory[DATA_PHYSICAL as usize] = 0x31;
+        memory[ALIAS_PHYSICAL as usize] = 0x92;
+
+        let mut cpu = CpuGsw::default();
+        cpu.set_mode(GswMode::Gsw586);
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        cpu.cpl = 0;
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x08, 0x9b));
+        for segment in [SegmentIndex::Ds, SegmentIndex::Ss, SegmentIndex::Es] {
+            cpu.registers
+                .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+        }
+        let mut bus = TestBus::with_memory(memory);
+        bus.direct_pages_enabled = true;
+
+        let arm = |cpu: &mut CpuGsw, iterations: u32| {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.eip = CODE_LINEAR;
+            cpu.registers.set_ecx(iterations);
+            cpu.registers.set_esi(DATA_LINEAR);
+            cpu.registers.set_edi(DATA_LINEAR);
+            cpu.registers.set_eax(0x44);
+        };
+        arm(&mut cpu, 2);
+        drive_to_halt(&mut cpu, &mut bus, u64::MAX);
+        if store {
+            assert!(cpu.data_write_pages.get(DATA_PHYSICAL).is_some());
+        } else {
+            assert!(cpu.data_read_pages.get(DATA_PHYSICAL).is_some());
+        }
+
+        let idx = jit::block::try_admit(&mut cpu, ENTRY_LINEAR, true)
+            .expect("the warmed paged byte loop must admit");
+        let expected_kind = if store {
+            jit::step::SlotKind::MemStoreU8
+        } else {
+            jit::step::SlotKind::MemLoadU8
+        };
+        assert_eq!(
+            cpu.jit_regions.get_mut(idx).unwrap().ctx.slots[0].kind,
+            expected_kind
+        );
+        cpu.decode_cache.stamp_region(ENTRY_LINEAR, true, idx);
+
+        cpu.jit_fast_map.invalidate_page(DATA_PHYSICAL);
+        assert_eq!(
+            cpu.translate_linear(&mut bus, DATA_PHYSICAL, store)
+                .unwrap(),
+            ALIAS_PHYSICAL
+        );
+        assert!(
+            !cpu.jit_fast_map
+                .has_read_mapping(DATA_PHYSICAL, DATA_PHYSICAL)
+        );
+        assert!(
+            !cpu.jit_fast_map
+                .has_write_mapping(DATA_PHYSICAL, DATA_PHYSICAL)
+        );
+        bus.jit_cached_fetch_requests.borrow_mut().clear();
+        let entries = cpu.perf_counters().jit_region_entries;
+
+        arm(&mut cpu, 1);
+        drive_to_halt(&mut cpu, &mut bus, 1_000);
+
+        assert!(cpu.perf_counters().jit_region_entries > entries);
+        let fetch_requests = bus.jit_cached_fetch_requests.borrow();
+        assert!(fetch_requests.contains(&(ENTRY_PHYSICAL, 2)));
+        assert!(!fetch_requests.contains(&(ENTRY_LINEAR, 2)));
+        drop(fetch_requests);
+        assert!(
+            !cpu.jit_fast_map
+                .has_read_mapping(DATA_PHYSICAL, DATA_PHYSICAL)
+        );
+        assert!(
+            !cpu.jit_fast_map
+                .has_write_mapping(DATA_PHYSICAL, DATA_PHYSICAL)
+        );
+
+        if store {
+            let stored = bus.memory[DATA_PHYSICAL as usize];
+            cpu.write_memory_u8(
+                &mut bus,
+                SegmentIndex::Ds,
+                DATA_PHYSICAL,
+                0x77,
+                BusAccessKind::DataWrite,
+            )
+            .unwrap();
+            assert_eq!(bus.memory[DATA_PHYSICAL as usize], stored);
+            assert_eq!(bus.memory[ALIAS_PHYSICAL as usize], 0x77);
+            assert!(
+                cpu.jit_fast_map
+                    .has_write_mapping(DATA_PHYSICAL, ALIAS_PHYSICAL)
+            );
+        } else {
+            assert_eq!(cpu.registers.eax() & 0xff, 0x31);
+            assert_eq!(
+                cpu.read_memory_u8(
+                    &mut bus,
+                    SegmentIndex::Ds,
+                    DATA_PHYSICAL,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap(),
+                0x92
+            );
+            assert!(
+                cpu.jit_fast_map
+                    .has_read_mapping(DATA_PHYSICAL, ALIAS_PHYSICAL)
+            );
+        }
+    }
+}
+
 /// Baseline drawcolumn region throughput on a production-representative harness (the one-op
 /// instruction-fetch charge and host-pointer direct pages, both matching MachineBus). The
 /// reference for native-template A/B measurements. The current owner-machine result is about
@@ -726,7 +910,7 @@ fn drawcolumn_region_baseline() {
     eprintln!("drawcolumn region baseline: {best:.0} ns/iter (15 insns), representative harness");
 }
 
-/// Round 1 hotness admission: with `set_jit_auto_admit(true)` and NO manual `try_admit`, a
+/// Round 1 hotness admission: with `set_legacy_region_auto_admit(true)` and NO manual `try_admit`, a
 /// hot loop compiles itself once its entry line crosses JIT_HOTNESS_THRESHOLD, and the
 /// auto-admitted region stays byte-identical to the interpreter. The interp CPU (auto-admit
 /// off) never compiles, proving the flag gates it.
@@ -734,7 +918,7 @@ fn drawcolumn_region_baseline() {
 fn hotness_admission_compiles_a_hot_loop_and_stays_identical() {
     let mut interp = fresh_cpu(0xffff);
     let mut jit_cpu = fresh_cpu(0xffff);
-    jit_cpu.set_jit_auto_admit(true);
+    jit_cpu.set_legacy_region_auto_admit(true);
     // A 64 KB buffer holds the ~0x2D00 that edi reaches over 64 iterations (0x500 + 64*0xa0).
     let mut bus_i = TestBus::with_memory(program_in(0x1_0000));
     let mut bus_j = TestBus::with_memory(program_in(0x1_0000));
@@ -786,7 +970,7 @@ fn clear_and_invalidate_drops_region_stamps() {
     cpu.decode_cache.stamp_region(ENTRY, true, idx);
     assert_eq!(cpu.decode_cache.region_at(ENTRY, true), Some(idx));
     cpu.jit_regions.clear();
-    cpu.decode_cache.invalidate();
+    cpu.decode_cache.invalidate_and_clear_code_marks();
     assert_eq!(
         cpu.decode_cache.region_at(ENTRY, true),
         None,

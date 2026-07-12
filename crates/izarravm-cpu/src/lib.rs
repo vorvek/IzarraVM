@@ -26,6 +26,38 @@ mod run;
 mod strings;
 pub use fpu::X87;
 
+/// Whether this build contains the native x64 execution backend.
+///
+/// Windows and Linux x86-64 are the release targets for native execution.
+/// Other targets and interpreter-only builds keep using the portable core.
+pub const NATIVE_BACKEND_COMPILED: bool = cfg!(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+));
+
+/// Whether the host can execute the native backend in this build.
+///
+/// The x64 translator is allowed to emit AVX2 unconditionally. Callers which
+/// admit native blocks must check this once before enabling the backend.
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub fn native_backend_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+)))]
+pub fn native_backend_available() -> bool {
+    false
+}
+
 pub use flags::PendingFlags;
 pub(crate) use flags::{
     FLAG_AC, FLAG_AF, FLAG_CF, FLAG_DF, FLAG_ID, FLAG_IF, FLAG_IOPL, FLAG_NT, FLAG_OF, FLAG_PF,
@@ -470,9 +502,6 @@ pub struct Msrs {
     pub tsc_offset: u64,
 }
 
-/// Direct-mapped TLB size (entries). Covers TLB_ENTRIES * 4 KiB before two pages
-/// collide on a slot; a 386/486 had 32, this keeps a few more so a fetch/execute
-/// loop's interleaved code and data pages do not evict each other every step.
 const CPU_PROFILE_GROUPS: usize = 16;
 
 /// Host-side performance counters: pure diagnostics for `--headless-bench`, NOT
@@ -521,6 +550,16 @@ pub struct PerfCounters {
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
     /// global-flush fallbacks only, so the two together split the SMC write traffic.
     pub smc_narrow_kills: u64,
+    /// Device and HLE writes reported with an exact physical range. These writes use the same
+    /// narrow code invalidation path as CPU stores instead of clearing the whole code cache.
+    pub device_write_ranges: u64,
+    pub device_write_bytes: u64,
+    /// Exact device-write ranges that overlapped compiled code, decoded code, or prefetched
+    /// instruction bytes and therefore invalidated at least one piece of CPU execution state.
+    pub device_write_code_hits: u64,
+    /// Device writes for which the machine could not provide a physical range. These retain the
+    /// conservative whole-cache reset and should stay near zero in normal game workloads.
+    pub device_write_coarse_resets: u64,
     /// Compiled-region executions (one per `run_region` call that passed its entry
     /// preconditions) and the instructions those executions retired. `jit_region_insns /
     /// jit_region_entries` is the mean instructions per region entry; a Doom A/B run asserts
@@ -528,6 +567,44 @@ pub struct PerfCounters {
     /// without the `jit` feature) so perf-row consumers need no feature gymnastics.
     pub jit_region_entries: u64,
     pub jit_region_insns: u64,
+    /// Direct x64 block executions, retired guest instructions, and prefix side exits. These do
+    /// not include the legacy region engine, so acceptance reports can measure direct coverage
+    /// and exits per 100 instructions without mixing the two execution models.
+    pub jit_direct_entries: u64,
+    pub jit_direct_insns: u64,
+    pub jit_direct_side_exits: u64,
+    pub jit_direct_exit_cross_page_or_alignment: u64,
+    pub jit_direct_exit_unavailable_or_kind: u64,
+    pub jit_direct_exit_permission: u64,
+    pub jit_direct_exit_code_watch: u64,
+    pub jit_direct_exit_other: u64,
+    pub jit_direct_compile_attempts: u64,
+    pub jit_direct_blocks_installed: u64,
+    pub jit_direct_compile_ns: u64,
+    pub jit_direct_hot_hits: u64,
+    pub jit_direct_hash_hits: u64,
+    pub jit_direct_lookup_misses: u64,
+    pub jit_direct_linked_transfers: u64,
+    pub jit_direct_unresolved_exits: u64,
+    pub jit_direct_deferred_short: u64,
+    pub jit_direct_reject_observer: u64,
+    pub jit_direct_reject_interrupt_shadow: u64,
+    pub jit_direct_reject_aggregate_accounting: u64,
+    pub jit_direct_reject_mode_key: u64,
+    pub jit_direct_reject_x87_top: u64,
+    pub jit_direct_reject_cs_layout: u64,
+    pub jit_direct_reject_cpl: u64,
+    pub jit_direct_reject_data_segment: u64,
+    pub jit_direct_reject_alignment: u64,
+    pub jit_direct_reject_fetch_limit: u64,
+    pub jit_direct_reject_zero_budget: u64,
+    pub jit_direct_cache_resets: u64,
+    pub jit_direct_arena_compactions: u64,
+    pub jit_direct_arena_compaction_live_blocks: u64,
+    pub jit_direct_arena_compaction_bytes: u64,
+    pub jit_direct_arena_compaction_failures: u64,
+    pub jit_direct_links_created: u64,
+    pub jit_direct_links_cleared: u64,
     /// Guest instructions completed by emitted native operations, excluding instructions run by
     /// `region_step`. Compare with `jit_region_insns` to measure native opcode coverage.
     pub jit_native_insns: u64,
@@ -651,6 +728,23 @@ impl CpuProfileOperandForm {
     }
 }
 
+/// Keep ordinary opcode buckets unchanged, but split x87 escapes by ModRM byte. The eight escape
+/// opcodes reuse that byte as their operation selector, so aggregating only D8 through DF hides the
+/// exact forms a direct backend still needs.
+fn cpu_profile_opcode(insn: &DecodedInsn) -> u16 {
+    if insn.group == DecodeGroup::Fpu
+        && matches!(insn.opcode, 0xd8..=0xdf)
+        && let Some(modrm) = insn.modrm
+    {
+        return 0x8000
+            | ((insn.opcode - 0xd8) << 8)
+            | (u16::from(modrm.mode) << 6)
+            | (u16::from(modrm.reg) << 3)
+            | u16::from(modrm.rm);
+    }
+    insn.opcode
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CpuOpcodeProfileBucketState {
     group: DecodeGroup,
@@ -739,6 +833,13 @@ pub struct CpuGsw {
     // the 386 holds off interrupts until the instruction after STI, which makes
     // the STI; HLT idle idiom safe (the HLT runs before any interrupt is taken).
     interrupt_shadow: bool,
+    // Inline hot gate for the boxed REP continuation. Ordinary run entries read this bool without
+    // chasing the cold resume-state pointer.
+    rep_resume_active: bool,
+    // Host-side continuation state for a budget-split REP instruction. A paused REP keeps its
+    // architectural EIP at the prefix byte so an interrupt frame restarts it correctly, while
+    // this state retains the decoded instruction and post-decode EIP for a no-interrupt resume.
+    rep_execution: Box<RepExecution>,
     // The active GSW mode. Its core-table row owns the guest-facing persona,
     // cache geometry, ordering, and clock identity.
     mode: GswMode,
@@ -767,6 +868,18 @@ pub struct CpuGsw {
     /// the same equality/clone exclusions as the decode cache. See `jit::region`.
     #[cfg(feature = "jit")]
     jit_regions: jit::RegionTable,
+    /// Helper-free register block cache. Like the decode and region caches, this is host-only
+    /// accelerator state and clones empty.
+    #[cfg(feature = "jit")]
+    jit_direct: Box<jit::direct::BlockCache>,
+    /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
+    /// clones start empty like the other host-only accelerator caches.
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    jit_fast_map: Box<jit::fast_map::FastMap>,
     /// Host-side performance counters (diagnostics for `--headless-bench`). Excluded from
     /// equality via `PerfCounters`'s always-equal `PartialEq`, like the decode cache.
     perf: PerfCounters,
@@ -818,6 +931,8 @@ impl Default for CpuGsw {
             fp_rem: 0,
             halted: false,
             interrupt_shadow: false,
+            rep_resume_active: false,
+            rep_execution: Box::default(),
             mode: GswMode::Gsw586,
             tlb: Tlb::default(),
             code_page: CodePageCache::default(),
@@ -831,6 +946,14 @@ impl Default for CpuGsw {
             decode_cache: DecodeCache::default(),
             #[cfg(feature = "jit")]
             jit_regions: jit::RegionTable::default(),
+            #[cfg(feature = "jit")]
+            jit_direct: Box::new(jit::direct::BlockCache::default()),
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_fast_map: Box::new(jit::fast_map::FastMap::default()),
             perf: PerfCounters::default(),
             profile: CpuProfileState::default(),
             pending_flags: PendingFlags::default(),
@@ -843,6 +966,13 @@ impl Default for CpuGsw {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleOutcome {
     pub core_clocks: u32,
+    pub halted: bool,
+}
+
+/// Result of an event-capped CPU run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetedRunOutcome {
+    pub consumed_core_clocks: u32,
     pub halted: bool,
 }
 
@@ -1361,7 +1491,7 @@ fn duration_ns_u64(duration: std::time::Duration) -> u64 {
 /// is converted to the decode/execute split; the no-operand forms (and the dead-end fallbacks) leave
 /// `modrm`/`operand` as `None` (and `imm` 0). This is the value the decode cache stores per line, so
 /// it is kept small and dense (see DecodeCache).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DecodedInsn {
     len: u8,
     prefixes: Prefixes,
@@ -1391,6 +1521,28 @@ struct DecodedInsn {
     /// recover it); resolve admission at decode, never in the run loop — this
     /// measurement is the reason.
     continuable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepBudget {
+    bus_at_entry: u64,
+    cap: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepResume {
+    insn: DecodedInsn,
+    start_eip: u32,
+    post_eip: u32,
+    cs: SegmentRegister,
+    precharged_core: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RepExecution {
+    budget: Option<RepBudget>,
+    resume: Option<RepResume>,
+    yielded: bool,
 }
 
 /// Direct-mapped decode-cache lines (power of two so the index is a mask). A break-attribution
@@ -1429,6 +1581,12 @@ fn decode_cache_lines() -> usize {
 #[cfg(feature = "jit")]
 const JIT_HOTNESS_THRESHOLD: u16 = 32;
 
+/// Continuation encounters before a decode line enters the direct-code cache's own
+/// observe-then-compile admission sequence. A one-shot straight-line continuation stays cold;
+/// a loop head reaches the direct probe on its second encounter.
+#[cfg(feature = "jit")]
+const JIT_DIRECT_HOTNESS_THRESHOLD: u8 = 1;
+
 /// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
 /// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
 /// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
@@ -1465,9 +1623,8 @@ struct DecodeLine {
     /// is the other such input; it is re-checked live at the hit sites, not stored.
     d: bool,
     /// Physical address of the instruction's first byte at decode time, for the narrow SMC
-    /// path's covers-the-written-byte check. `phys_start..phys_start + len` is the physical
-    /// span; contiguity holds because pages holding a page-straddling instruction take the
-    /// global flush instead (see `PageCodeInfo::straddled`).
+    /// path's covers-the-written-byte check. `phys_start..phys_start + len` is contiguous because
+    /// page-straddling instructions are never inserted into this cache.
     phys_start: u32,
     /// 1-based index into the JIT's compiled-region table, `None` when no region starts at this
     /// line's address. Lives IN the decode line (not a separate map) so region lookup rides the
@@ -1482,22 +1639,21 @@ struct DecodeLine {
     /// so a cold one-shot line never reaches the threshold.
     #[cfg(feature = "jit")]
     jit_hotness: u16,
+    /// Saturating direct-code admission count, independent of legacy region stamps.
+    #[cfg(feature = "jit")]
+    jit_direct_hotness: u8,
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
-/// physical page was decoded through, plus the two conditions that force the sound global-flush
-/// fallback. Rebuilt from scratch after every global flush (cleared with the marks), so it never
-/// outlives the lines it describes.
+/// physical page was decoded through, plus the alias condition that forces the sound global-flush
+/// fallback. Page-straddling instructions are not cached. Rebuilt from scratch after every global
+/// flush (cleared with the marks), so it never outlives the lines it describes.
 #[derive(Debug, Clone, Copy)]
 struct PageCodeInfo {
     lin_page: u32,
     /// A later decode saw a DIFFERENT linear page mapping this physical page: the
     /// physical-to-linear reconstruction is ambiguous, so writes here must flush globally.
     aliased: bool,
-    /// An instruction starting on this page crosses into the next page (or one crossed into this
-    /// page): physical contiguity of a line's span is not guaranteed, so writes here (and on the
-    /// neighbor, which sets its own flag) must flush globally.
-    straddled: bool,
 }
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
@@ -1517,15 +1673,25 @@ struct DecodeCache {
     lines: Box<[DecodeLine]>,
     mask: u32,
     generation: u32,
+    /// Changes only when a fill displaces a different live decode line. Direct blocks combine
+    /// this with `generation` to skip per-entry residency scans until a replacement can have
+    /// evicted one of their slots.
+    replacement_epoch: u32,
     /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
     /// been cached from. A write touching a marked byte advances the generation. Marks are cleared
     /// whenever an SMC flush bumps the generation (no line survives, so live code re-marks on
     /// re-decode); otherwise stale marks accumulate and once-code bytes reused as data flush the
     /// cache forever (measured on Doom: 5.6M spurious flushes/timedemo).
     code_bytes: Box<[u64]>,
-    /// Coarse companion above `SMC_BYTE_COVERAGE`: 1 bit per 4 KiB physical page, whole 4 GB
-    /// space. See the SMC_BYTE_COVERAGE doc for why page granularity is correct there.
+    /// Coarse interpreter companion for the whole 4 GB physical space: 1 bit per 4 KiB page.
+    /// Low memory still uses `code_bytes` for exact invalidation decisions.
     code_pages: Box<[u64]>,
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    native_code_watch: Box<jit::code_watch::StickyDecodeCodeWatch>,
     /// Indices of `code_bytes` / `code_pages` words holding marks from the CURRENT generation,
     /// pushed on a word's 0 -> nonzero transition. Makes the mark clear proportional to the
     /// marked working set (a few KB of word writes) instead of a 384 KB memset: Doom's 3.9M
@@ -1579,8 +1745,15 @@ impl DecodeCache {
             mask: (lines - 1) as u32,
             // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
             generation: 1,
+            replacement_epoch: 0,
             code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
             code_pages: vec![0u64; SMC_PAGE_WORDS].into_boxed_slice(),
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            native_code_watch: Box::default(),
             dirty_byte_words: Vec::new(),
             dirty_page_words: Vec::new(),
             code_page_lin: std::collections::HashMap::default(),
@@ -1590,10 +1763,26 @@ impl DecodeCache {
     }
 
     /// Mark the bytes `[physical, physical + len)` as holding cached code, so a later write touching
-    /// any of them invalidates the cache. An instruction is at most 15 bytes. Bytes above the
-    /// covered range are skipped (treated as non-code by `is_code_byte`).
+    /// any of them invalidates the cache. The page map covers every decoded instruction, including
+    /// code that has not become hot enough to compile, while the low-memory byte map keeps the
+    /// interpreter invalidation exact.
     #[inline]
     fn mark_code_range(&mut self, physical: u32, len: u8) {
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.native_code_watch.mark_range(physical, u32::from(len));
+        let first_page = physical >> 12;
+        let last_page = physical.wrapping_add(u32::from(len).saturating_sub(1)) >> 12;
+        for page in first_page..=last_page {
+            let word = (page >> 6) as usize;
+            if self.code_pages[word] == 0 {
+                self.dirty_page_words.push(word as u32);
+            }
+            self.code_pages[word] |= 1u64 << (page & 63);
+        }
         for i in 0..u32::from(len) {
             let addr = physical.wrapping_add(i);
             if addr < SMC_BYTE_COVERAGE {
@@ -1602,14 +1791,46 @@ impl DecodeCache {
                     self.dirty_byte_words.push(word as u32);
                 }
                 self.code_bytes[word] |= 1u64 << (addr & 63);
-            } else {
-                let page = addr >> 12;
-                let word = (page >> 6) as usize;
-                if self.code_pages[word] == 0 {
-                    self.dirty_page_words.push(word as u32);
-                }
-                self.code_pages[word] |= 1u64 << (page & 63);
             }
+        }
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn native_code_watch_table(&mut self) -> usize {
+        self.native_code_watch.table_base()
+    }
+
+    #[cfg(all(
+        test,
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn assert_native_watch_consistent(&self) {
+        let mut expected = std::collections::HashSet::new();
+        for line in &self.lines {
+            if line.generation != self.generation {
+                continue;
+            }
+            let Some(insn) = line.insn else {
+                continue;
+            };
+            let mut chunk = line.phys_start & !0xf;
+            let last = line.phys_start.wrapping_add(u32::from(insn.len) - 1) & !0xf;
+            loop {
+                expected.insert(chunk);
+                if chunk == last {
+                    break;
+                }
+                chunk = chunk.wrapping_add(16);
+            }
+        }
+        for chunk in expected {
+            assert!(self.native_code_watch.is_watched(chunk));
         }
     }
 
@@ -1642,39 +1863,49 @@ impl DecodeCache {
     }
 
     #[inline]
-    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) {
-        // Narrow-SMC bookkeeping: record (or verify) the linear page this physical page's code
-        // decodes through, and flag the two conditions that force the global-flush fallback. A
-        // page-straddling instruction flags BOTH pages (its span's physical contiguity is not
-        // guaranteed, and a write to either page could hit it).
+    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) -> bool {
         let len = u32::from(insn.len);
-        let straddles = (lin & 0xfff) + len > 0x1000;
-        let pages: [Option<u32>; 2] = [
-            Some(phys >> 12),
-            straddles.then(|| phys.wrapping_add(len - 1) >> 12),
-        ];
-        for page in pages.into_iter().flatten() {
-            let lin_page = if page == phys >> 12 {
-                lin >> 12
-            } else {
-                (lin.wrapping_add(len - 1)) >> 12
-            };
-            match self.code_page_lin.entry(page) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(PageCodeInfo {
-                        lin_page,
-                        aliased: false,
-                        straddled: straddles,
-                    });
-                }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let info = e.get_mut();
-                    info.aliased |= info.lin_page != lin_page;
-                    info.straddled |= straddles;
-                }
+        if len == 0 {
+            return false;
+        }
+        let Some(linear_last) = lin.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        let Some(physical_last) = phys.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        if lin >> 12 != linear_last >> 12 || phys >> 12 != physical_last >> 12 {
+            // The tail can map to a noncontiguous physical page. Re-decode page-straddling
+            // instructions instead of publishing a fictitious contiguous watch.
+            return false;
+        }
+
+        let index = (lin & self.mask) as usize;
+        let previous = self.lines[index];
+        // Decode-native marks are generation-sticky. Mark the replacement before publishing it;
+        // a displaced line deliberately leaves a conservative mark until global invalidation.
+        self.mark_code_range(phys, insn.len);
+
+        let page = phys >> 12;
+        match self.code_page_lin.entry(page) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(PageCodeInfo {
+                    lin_page: lin >> 12,
+                    aliased: false,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let info = e.get_mut();
+                info.aliased |= info.lin_page != lin >> 12;
             }
         }
-        self.lines[(lin & self.mask) as usize] = DecodeLine {
+        if previous.generation == self.generation
+            && previous.insn.is_some()
+            && (previous.tag != lin || previous.d != d)
+        {
+            self.replacement_epoch = self.replacement_epoch.wrapping_add(1);
+        }
+        self.lines[index] = DecodeLine {
             tag: lin,
             generation: self.generation,
             insn: Some(insn),
@@ -1684,18 +1915,22 @@ impl DecodeCache {
             jit_region: None,
             #[cfg(feature = "jit")]
             jit_hotness: 0,
+            #[cfg(feature = "jit")]
+            jit_direct_hotness: 0,
         };
+
+        true
     }
 
     /// Try to invalidate ONLY the lines covering the written physical byte `physical` (already
     /// known to be a marked code byte). Returns true when handled narrowly; false means the
-    /// caller must fall back to the whole-cache flush (unknown page, an aliased or straddled
-    /// page, or any other reason the physical-to-linear reconstruction is unsound). The mark
+    /// caller must fall back to the whole-cache flush (unknown page, an aliased page, or any other
+    /// reason the physical-to-linear reconstruction is unsound). The mark
     /// stays set either way: a stale mark only costs a future narrow attempt, never correctness.
     #[inline]
     fn narrow_invalidate(&mut self, physical: u32) -> Option<u32> {
         let info = *self.code_page_lin.get(&(physical >> 12))?;
-        if info.aliased || info.straddled {
+        if info.aliased {
             return None;
         }
         // Within one page the offset is mapping-invariant, so the code-side linear of the
@@ -1705,15 +1940,22 @@ impl DecodeCache {
         let written_lin = (info.lin_page << 12) | (physical & 0xfff);
         let mut killed = 0u32;
         for candidate in written_lin.saturating_sub(14)..=written_lin {
-            let line = &mut self.lines[(candidate & self.mask) as usize];
-            if line.generation != self.generation || line.tag != candidate {
-                continue;
-            }
-            let len = line.insn.map_or(0, |i| u32::from(i.len));
-            if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
-                // Generation 0 can never match the live generation (invalidate skips 0 on
-                // wrap), so the line is dead until re-decoded; a JIT region stamp dies with it.
-                line.generation = 0;
+            let removed = {
+                let line = &mut self.lines[(candidate & self.mask) as usize];
+                if line.generation != self.generation || line.tag != candidate {
+                    false
+                } else {
+                    let len = line.insn.map_or(0, |i| u32::from(i.len));
+                    if line.phys_start <= physical && physical < line.phys_start.wrapping_add(len) {
+                        // The sticky native mark stays conservative until global invalidation.
+                        line.generation = 0;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if removed {
                 killed += 1;
             }
         }
@@ -1734,9 +1976,8 @@ impl DecodeCache {
         }
     }
 
-    /// The stored physical start of the live line for `lin`, for region admission (the matcher
-    /// walked these lines; the region's physical span derives from the entry line's).
-    #[cfg(feature = "jit")]
+    /// The stored physical start of the live line for `lin`. Warm fetch timing uses this to retain
+    /// the translation from the cold decode; JIT admission also derives block provenance from it.
     fn line_phys_start(&self, lin: u32, d: bool) -> Option<u32> {
         let line = &self.lines[(lin & self.mask) as usize];
         (line.generation == self.generation && line.tag == lin && line.d == d)
@@ -1752,6 +1993,14 @@ impl DecodeCache {
     fn line_live(&self, lin: u32, d: bool) -> bool {
         let line = &self.lines[(lin & self.mask) as usize];
         line.generation == self.generation && line.tag == lin && line.d == d
+    }
+
+    /// Token for the set of resident decode lines. Global invalidation changes the high half;
+    /// direct-mapped replacement changes the low half.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn residency_epoch(&self) -> u64 {
+        (u64::from(self.generation) << 32) | u64::from(self.replacement_epoch)
     }
 
     /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow SMC
@@ -1803,25 +2052,33 @@ impl DecodeCache {
         }
     }
 
-    /// Invalidate every cached line by advancing the generation. O(1): stamped lines fail the
-    /// generation check and re-decode on next use. Skips 0 on wrap so a fresh line never aliases.
+    /// Observe a continuation for direct-code admission. Once the second encounter makes the line
+    /// hot, later encounters stay eligible for the direct cache's separate first-seen/compile probe.
+    #[cfg(feature = "jit")]
     #[inline]
-    fn invalidate(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generation = 1;
+    fn direct_hot(&mut self, lin: u32, d: bool) -> bool {
+        let line = &mut self.lines[(lin & self.mask) as usize];
+        if line.generation != self.generation || line.tag != lin || line.d != d {
+            return false;
         }
+        if line.jit_direct_hotness < JIT_DIRECT_HOTNESS_THRESHOLD {
+            line.jit_direct_hotness += 1;
+        }
+        line.jit_direct_hotness == JIT_DIRECT_HOTNESS_THRESHOLD
     }
 
-    /// `invalidate`, plus reset the SMC watch bitmap. For the SMC flush path (`note_code_write`):
-    /// after the generation bump no line is live, so every mark can be dropped and rebuilt from
-    /// the lines actually re-decoded. Without this the monotonic marks accumulate forever and
-    /// ordinary data writes over ONCE-code bytes (a loader region reused as heap, DOS buffers)
-    /// re-trigger whole-cache flushes for the rest of the run - the Doom 586 census measured
-    /// 5.6M such flushes in 2.6G instructions, one every ~460 instructions. The 256 KB clear is
-    /// self-rate-limiting: once cleared, the stale bytes are unmarked and stop flushing.
+    /// Invalidate every cached line and drop every matching code watch. The generation advance and
+    /// watch clear stay one operation so no dead decode line can leave an unowned native watch.
     fn invalidate_and_clear_code_marks(&mut self) {
-        self.invalidate();
+        if self.generation == u32::MAX {
+            // Clear old generation-1 lines before 1 can become live again. Changing the
+            // replacement half of the residency token also forces direct blocks to revalidate.
+            self.lines.fill(DecodeLine::default());
+            self.replacement_epoch = self.replacement_epoch.wrapping_add(1);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
         // Zero only the words marked since the last clear (the dirty lists), not the whole
         // 384 KB: with millions of SMC flushes per timedemo the full memset was a measured
         // wall regression. Every set bit lives in a dirty-listed word by construction
@@ -1834,6 +2091,12 @@ impl DecodeCache {
         }
         self.dirty_byte_words.clear();
         self.dirty_page_words.clear();
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.native_code_watch.clear();
         // The narrow-SMC page map describes exactly the markable lines; no line survives a
         // global flush, so it is rebuilt from scratch by the re-decodes.
         self.code_page_lin.clear();

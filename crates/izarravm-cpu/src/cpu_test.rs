@@ -53,7 +53,7 @@ fn cpu_registers_field_offset_is_stable() {
     // (456 -> 464 when Round 1 added the `jit_table_clears` u64 to PerfCounters, which precedes
     // `registers`; the emitter re-reads the offset, so this is a documentation update).
     assert_eq!(
-        off, 464,
+        off, 472,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -69,6 +69,345 @@ fn perf_counter_tracks_code_invalidation_events() {
 }
 
 #[test]
+fn structural_code_invalidation_clears_stale_native_watch_marks() {
+    let mut cpu = CpuGsw::default();
+    cpu.load_segment_real(SegmentIndex::Cs, 0);
+    cpu.registers.eip = 0x100;
+    let mut memory = vec![0; 0x1000];
+    memory[0x100] = 0x90;
+    let mut bus = TestBus::with_memory(memory);
+
+    cpu.cycle(&mut bus).unwrap();
+    let page = 0x100u32 >> 12;
+    assert!(cpu.decode_cache.range_hits_code(0x100, 1));
+    assert_ne!(
+        cpu.decode_cache.code_pages[(page >> 6) as usize] & (1u64 << (page & 63)),
+        0
+    );
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    assert!(cpu.decode_cache.native_code_watch.is_watched(0x100));
+
+    cpu.note_a20_changed();
+
+    assert!(!cpu.decode_cache.range_hits_code(0x100, 1));
+    assert_eq!(
+        cpu.decode_cache.code_pages[(page >> 6) as usize] & (1u64 << (page & 63)),
+        0
+    );
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    assert!(!cpu.decode_cache.native_code_watch.is_watched(0x100));
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpreter_direct_pages_share_fast_map_when_native_admission_is_disabled() {
+    let mut bus = TestBus::with_memory(vec![0; 0x6000]);
+    bus.direct_pages_enabled = true;
+    bus.memory[0x2456] = 0x3c;
+    bus.memory[0x3456] = 0x5a;
+    let mut cpu = CpuGsw::default();
+
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x2456, BusAccessKind::DataRead,)
+            .unwrap(),
+        0x3c
+    );
+    assert!(cpu.jit_fast_map.has_read_mapping(0x2456, 0x2456));
+    cpu.set_jit_auto_admit(false);
+
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x3456, BusAccessKind::DataRead,)
+            .unwrap(),
+        0x5a
+    );
+    assert!(cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
+    assert!(!cpu.jit_fast_map.has_write_mapping(0x3456, 0x3456));
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        0x3456,
+        0xa5,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(cpu.jit_fast_map.has_write_mapping(0x3456, 0x3456));
+    assert_eq!(bus.memory[0x3456], 0xa5);
+
+    cpu.note_direct_map_changed();
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
+    assert!(!cpu.jit_fast_map.has_write_mapping(0x3456, 0x3456));
+
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x3456, BusAccessKind::DataRead,)
+            .unwrap(),
+        0xa5
+    );
+    assert!(cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
+
+    cpu.flush_tlb_and_code_caches();
+    assert!(!cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456));
+    assert_eq!(
+        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0x3456, BusAccessKind::DataRead,)
+            .unwrap(),
+        0xa5
+    );
+    assert!(
+        cpu.jit_fast_map.has_read_mapping(0x3456, 0x3456),
+        "the TLB flush must also clear the physical DPC so the next access refills both maps"
+    );
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn physical_page_cache_hits_fill_every_paging_alias() {
+    const ALIAS_A: u32 = 0x3000;
+    const ALIAS_B: u32 = 0x4000;
+    const FRAME: u32 = 0x5000;
+    const OFFSET: u32 = 0x120;
+
+    let mut memory = vec![0; 0x7000];
+    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    memory[0x200c..0x2010].copy_from_slice(&0x0000_5007u32.to_le_bytes());
+    memory[0x2010..0x2014].copy_from_slice(&0x0000_5007u32.to_le_bytes());
+    memory[(FRAME + OFFSET) as usize..(FRAME + OFFSET + 4) as usize]
+        .copy_from_slice(&0x4433_2211u32.to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.control.cr3 = 0x1000;
+    cpu.set_jit_auto_admit(true);
+
+    assert_eq!(
+        cpu.read_memory_u8(
+            &mut bus,
+            SegmentIndex::Ds,
+            ALIAS_A + OFFSET,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0x11
+    );
+    let page_fills = cpu.perf_counters().direct_page_hits;
+    assert!(
+        cpu.jit_fast_map
+            .has_read_mapping(ALIAS_A + OFFSET, FRAME + OFFSET)
+    );
+    assert_eq!(
+        cpu.read_memory_u8(
+            &mut bus,
+            SegmentIndex::Ds,
+            ALIAS_B + OFFSET,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0x11
+    );
+    assert_eq!(cpu.perf_counters().direct_page_hits, page_fills);
+    assert!(
+        cpu.jit_fast_map
+            .has_read_mapping(ALIAS_B + OFFSET, FRAME + OFFSET)
+    );
+    assert!(
+        !cpu.jit_fast_map
+            .has_read_mapping(ALIAS_B + OFFSET, 0x6000 + OFFSET)
+    );
+
+    cpu.jit_fast_map.invalidate_page(ALIAS_A);
+    cpu.jit_fast_map.invalidate_page(ALIAS_B);
+    assert_eq!(
+        cpu.read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            ALIAS_A + OFFSET,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0x4433_2211
+    );
+    assert_eq!(
+        cpu.read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            ALIAS_B + OFFSET,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0x4433_2211
+    );
+    assert!(
+        cpu.jit_fast_map
+            .has_read_mapping(ALIAS_A + OFFSET, FRAME + OFFSET)
+    );
+    assert!(
+        cpu.jit_fast_map
+            .has_read_mapping(ALIAS_B + OFFSET, FRAME + OFFSET)
+    );
+
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        ALIAS_A + OFFSET,
+        0x55,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        ALIAS_B + OFFSET,
+        0x66,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(
+        cpu.jit_fast_map
+            .has_write_mapping(ALIAS_A + OFFSET, FRAME + OFFSET)
+    );
+    assert!(
+        cpu.jit_fast_map
+            .has_write_mapping(ALIAS_B + OFFSET, FRAME + OFFSET)
+    );
+
+    cpu.jit_fast_map.invalidate_page(ALIAS_A);
+    cpu.jit_fast_map.invalidate_page(ALIAS_B);
+    cpu.write_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        ALIAS_A + OFFSET,
+        OperandSize::Dword,
+        0xaabb_ccdd,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    cpu.write_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        ALIAS_B + OFFSET,
+        OperandSize::Dword,
+        0x1020_3040,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+    assert!(
+        cpu.jit_fast_map
+            .has_write_mapping(ALIAS_A + OFFSET, FRAME + OFFSET)
+    );
+    assert!(
+        cpu.jit_fast_map
+            .has_write_mapping(ALIAS_B + OFFSET, FRAME + OFFSET)
+    );
+    assert_eq!(
+        &bus.memory[(FRAME + OFFSET) as usize..(FRAME + OFFSET + 4) as usize],
+        &0x1020_3040u32.to_le_bytes()
+    );
+
+    cpu.jit_fast_map.invalidate_page(ALIAS_B);
+    assert!(
+        cpu.jit_fast_map
+            .has_write_mapping(ALIAS_A + OFFSET, FRAME + OFFSET)
+    );
+    assert!(
+        !cpu.jit_fast_map
+            .has_write_mapping(ALIAS_B + OFFSET, FRAME + OFFSET)
+    );
+    cpu.note_direct_map_changed();
+    assert!(
+        !cpu.jit_fast_map
+            .has_write_mapping(ALIAS_A + OFFSET, FRAME + OFFSET)
+    );
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn interpreter_fast_map_survives_small_tlb_collision_without_page_walk() {
+    const LINEAR_A: u32 = 0x0000_3000;
+    const LINEAR_B: u32 = LINEAR_A + TLB_ENTRIES as u32 * 0x1000;
+    const FRAME_A: u32 = 0x0000_5000;
+    const FRAME_B: u32 = 0x0000_6000;
+
+    let mut memory = vec![0; 0x8000];
+    memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes());
+    let pte_a = 0x2000 + ((LINEAR_A >> 12) as usize * 4);
+    let pte_b = 0x2000 + ((LINEAR_B >> 12) as usize * 4);
+    memory[pte_a..pte_a + 4].copy_from_slice(&(FRAME_A | 7).to_le_bytes());
+    memory[pte_b..pte_b + 4].copy_from_slice(&(FRAME_B | 7).to_le_bytes());
+    memory[FRAME_A as usize] = 0xa5;
+    memory[FRAME_B as usize] = 0x5a;
+
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    let mut cpu = CpuGsw::default();
+    cpu.set_jit_auto_admit(false);
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    cpu.control.cr3 = 0x1000;
+    cpu.registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
+
+    assert_eq!(
+        cpu.read_memory_u8(
+            &mut bus,
+            SegmentIndex::Ds,
+            LINEAR_A,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0xa5
+    );
+    assert_eq!(
+        cpu.read_memory_u8(
+            &mut bus,
+            SegmentIndex::Ds,
+            LINEAR_B,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0x5a
+    );
+    assert!(cpu.tlb.lookup(LINEAR_A >> 12).is_none());
+    assert!(cpu.jit_fast_map.has_read_mapping(LINEAR_A, FRAME_A));
+
+    bus.trace.clear();
+    assert_eq!(
+        cpu.read_memory_u8(
+            &mut bus,
+            SegmentIndex::Ds,
+            LINEAR_A,
+            BusAccessKind::DataRead,
+        )
+        .unwrap(),
+        0xa5
+    );
+    assert!(bus.trace.cycles().iter().all(|cycle| !matches!(
+        cycle.kind,
+        BusAccessKind::PageWalkRead | BusAccessKind::PageWalkWrite
+    )));
+}
+
+#[test]
 #[cfg(feature = "jit")]
 fn region_ctx_fn_pointer_offsets() {
     // Pin ALL offsets the emitted native code reads/writes so a field reorder is caught.
@@ -79,7 +418,7 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
     // Pending flags offset used by direct native writes.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 3936);
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4280);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
@@ -899,6 +1238,25 @@ struct TestBus {
     // The JIT memory microbenchmark sets it true so its numbers reflect production, not the
     // slow test path (which does not exist on the real bus).
     direct_pages_enabled: bool,
+    direct_pages_writable: bool,
+    direct_write_denied_page: Option<u32>,
+    uniform_native_fetches: bool,
+    // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
+    // timing-free, so keep that default and let direct-memory differential tests request clocks.
+    direct_page_clocks: bool,
+    // Opt-in batch-clock reporting for tight event-budget tests. Historical CPU tests leave it
+    // off because their TestBus predates machine-level combined core/bus caps.
+    report_batch_clocks: bool,
+    page_walk_bound_available: bool,
+    rep_data_byte_cost_override: Option<u64>,
+    direct_memory_max_clock_override: Option<u64>,
+    project_additional_bus_clocks: bool,
+    native_aggregate_accounting_disabled: bool,
+    jit_cached_fetch_requests: std::cell::RefCell<Vec<(u32, u32)>>,
+    mode13_dirty_pages: u16,
+    mode13_byte_writes: u64,
+    mode13_word_writes: u64,
+    mode13_dword_writes: u64,
 }
 
 impl TestBus {
@@ -912,6 +1270,49 @@ impl TestBus {
             last_read_io_core_clocks_so_far: None,
             last_write_io_core_clocks_so_far: None,
             direct_pages_enabled: false,
+            direct_pages_writable: true,
+            direct_write_denied_page: None,
+            uniform_native_fetches: false,
+            direct_page_clocks: false,
+            report_batch_clocks: false,
+            page_walk_bound_available: true,
+            rep_data_byte_cost_override: None,
+            direct_memory_max_clock_override: None,
+            project_additional_bus_clocks: false,
+            native_aggregate_accounting_disabled: false,
+            jit_cached_fetch_requests: std::cell::RefCell::new(Vec::new()),
+            mode13_dirty_pages: 0,
+            mode13_byte_writes: 0,
+            mode13_word_writes: 0,
+            mode13_dword_writes: 0,
+        }
+    }
+
+    fn direct_page_wait_states(width: BusWidth) -> u8 {
+        match width {
+            BusWidth::Byte => 0,
+            BusWidth::Word => 1,
+            BusWidth::Dword => 3,
+        }
+    }
+
+    fn mode13_wait_states(width: BusWidth) -> u8 {
+        match width {
+            BusWidth::Byte => 4,
+            BusWidth::Word => 5,
+            BusWidth::Dword => 7,
+        }
+    }
+
+    fn note_mode13_write(&mut self, address: u32, width: BusWidth) {
+        if !(0x000a_0000..0x000b_0000).contains(&address) {
+            return;
+        }
+        self.mode13_dirty_pages |= 1 << ((address - 0x000a_0000) >> 12);
+        match width {
+            BusWidth::Byte => self.mode13_byte_writes += 1,
+            BusWidth::Word => self.mode13_word_writes += 1,
+            BusWidth::Dword => self.mode13_dword_writes += 1,
         }
     }
 }
@@ -977,7 +1378,7 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<DirectMemoryRead, BusError> {
-        if self.direct_memory_bytes(address, width.bytes() as usize, width)
+        if self.direct_memory_bytes(address, width.bytes() as usize, width, kind)
             == width.bytes() as usize
         {
             return self
@@ -1001,7 +1402,7 @@ impl CpuBus for TestBus {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<DirectMemoryWrite, BusError> {
-        if self.direct_memory_bytes(address, width.bytes() as usize, width)
+        if self.direct_memory_bytes(address, width.bytes() as usize, width, kind)
             == width.bytes() as usize
         {
             self.write_memory(address, width, value, kind)?;
@@ -1018,7 +1419,10 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<usize, BusError> {
-        if self.direct_memory_bytes(address, out.len(), width) != out.len() {
+        if kind != BusAccessKind::DataRead {
+            return Ok(0);
+        }
+        if self.direct_memory_bytes(address, out.len(), width, kind) != out.len() {
             return Ok(0);
         }
         let access = width.bytes() as usize;
@@ -1038,7 +1442,10 @@ impl CpuBus for TestBus {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<usize, BusError> {
-        if self.direct_memory_bytes(address, data.len(), width) != data.len() {
+        if kind != BusAccessKind::DataWrite {
+            return Ok(0);
+        }
+        if self.direct_memory_bytes(address, data.len(), width, kind) != data.len() {
             return Ok(0);
         }
         let access = width.bytes() as usize;
@@ -1051,8 +1458,18 @@ impl CpuBus for TestBus {
         Ok(data.len())
     }
 
-    fn direct_memory_bytes(&self, address: u32, bytes: usize, width: BusWidth) -> usize {
-        if bytes == 0 || (address as usize & 0x0fff) + bytes > 0x1000 {
+    fn direct_memory_bytes(
+        &self,
+        address: u32,
+        bytes: usize,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> usize {
+        if !matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
+            || bytes == 0
+            || bytes % width.bytes() as usize != 0
+            || (address as usize & 0x0fff) + bytes > 0x1000
+        {
             return 0;
         }
         if matches!(width, BusWidth::Word) && address & 1 != 0
@@ -1099,21 +1516,138 @@ impl CpuBus for TestBus {
     // the code-fetch wait state (this keeps `count` byte accesses at wait-state 0); the
     // microbenchmark runs tracing Off, so it measures wall clock, not the fetch-clock total.
     // Do not treat this TestBus's instruction-fetch clock accounting as production-representative.
-    fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
-        self.trace.record_instruction_fetch_run(start, count, 0);
+    fn charge_physical_instruction_fetch_run(
+        &mut self,
+        physical_start: u32,
+        count: u32,
+    ) -> Result<(), BusError> {
+        self.trace.record_instruction_fetch_run(
+            physical_start,
+            if self.uniform_native_fetches && count != 0 {
+                1
+            } else {
+                count
+            },
+            0,
+        );
+        Ok(())
+    }
+
+    fn jit_fetch_cost_clocks(&self) -> u64 {
+        u64::from(self.uniform_native_fetches) * 2
+    }
+
+    fn native_fetches_are_uniform(&self) -> bool {
+        self.uniform_native_fetches
+    }
+
+    fn native_aggregate_accounting_allowed(&self) -> bool {
+        !self.native_aggregate_accounting_disabled
+    }
+
+    fn jit_data_cost_clocks(&self, width: BusWidth) -> u64 {
+        if self.direct_page_clocks {
+            u64::from(izarravm_bus::BusCycle::clocks_for(
+                width,
+                Self::direct_page_wait_states(width),
+            ))
+        } else {
+            0
+        }
+    }
+
+    fn in_batch_scaled_bus_clocks(&self) -> u64 {
+        if self.report_batch_clocks {
+            self.trace.elapsed_clocks()
+        } else {
+            0
+        }
+    }
+
+    fn jit_mode13_data_cost_clocks(&self, width: BusWidth) -> u64 {
+        if self.direct_page_clocks {
+            u64::from(izarravm_bus::BusCycle::clocks_for(
+                width,
+                Self::mode13_wait_states(width),
+            ))
+        } else {
+            0
+        }
+    }
+
+    fn rep_page_walk_cost_upper(&self) -> Option<u64> {
+        self.page_walk_bound_available
+            .then_some(if self.report_batch_clocks { 8 } else { 0 })
+    }
+
+    fn rep_data_byte_cost_upper(&self) -> u64 {
+        self.rep_data_byte_cost_override.unwrap_or_else(|| {
+            self.jit_data_cost_clocks(BusWidth::Byte)
+                .max(self.jit_mode13_data_cost_clocks(BusWidth::Byte))
+        })
+    }
+
+    fn charge_native_mode13_writes(&mut self, writes: izarravm_bus::NativeMode13Writes) {
+        self.mode13_dirty_pages |= writes.dirty_pages;
+        self.mode13_byte_writes += writes.byte_writes;
+        self.mode13_word_writes += writes.word_writes;
+        self.mode13_dword_writes += writes.dword_writes;
+        let clocks = self
+            .jit_mode13_data_cost_clocks(BusWidth::Byte)
+            .saturating_mul(writes.byte_writes)
+            .saturating_add(
+                self.jit_mode13_data_cost_clocks(BusWidth::Word)
+                    .saturating_mul(writes.word_writes),
+            )
+            .saturating_add(
+                self.jit_mode13_data_cost_clocks(BusWidth::Dword)
+                    .saturating_mul(writes.dword_writes),
+            );
+        self.trace.add_elapsed_clocks(clocks);
+    }
+
+    fn charge_bus_clocks_bulk(&mut self, clocks: u64) {
+        self.trace.add_elapsed_clocks(clocks);
+    }
+
+    fn charge_direct_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError> {
+        if kind == BusAccessKind::DataWrite {
+            self.note_mode13_write(address, width);
+        }
+        if self.direct_page_clocks {
+            let wait_states = if (0x000a_0000..0x000b_0000).contains(&address) {
+                Self::mode13_wait_states(width)
+            } else {
+                Self::direct_page_wait_states(width)
+            };
+            self.trace.record(kind, address, width, wait_states);
+        }
         Ok(())
     }
 
     fn jit_direct_memory_max_clocks(&self, _width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
-        Some(0)
+        Some(self.direct_memory_max_clock_override.unwrap_or(0))
     }
 
-    fn jit_cached_fetch_run_clocks(&self, _start: u32, count: u32) -> Option<u64> {
+    fn jit_cached_fetch_run_clocks(&self, start: u32, count: u32) -> Option<u64> {
+        self.jit_cached_fetch_requests
+            .borrow_mut()
+            .push((start, count));
         Some(u64::from(count) * 2)
     }
 
-    fn jit_projected_batch_scaled_bus_clocks(&self, _additional_raw: u64) -> Option<u64> {
-        Some(0)
+    fn jit_projected_batch_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        Some(if self.project_additional_bus_clocks {
+            self.in_batch_scaled_bus_clocks()
+                .saturating_add(additional_raw)
+        } else {
+            0
+        })
     }
 
     // Hand out a host-pointer page into `memory`, mirroring MachineBus::direct_page, so the
@@ -1129,6 +1663,11 @@ impl CpuBus for TestBus {
             return Ok(None);
         }
         let physical_page = address & !0x0fff;
+        if kind == BusAccessKind::DataWrite
+            && (!self.direct_pages_writable || self.direct_write_denied_page == Some(physical_page))
+        {
+            return Ok(None);
+        }
         let start = physical_page as usize;
         if start + 0x1000 > self.memory.len() {
             return Ok(None);
@@ -1137,7 +1676,7 @@ impl CpuBus for TestBus {
             physical_page,
             ptr: unsafe { self.memory.as_mut_ptr().add(start) },
             len: 0x1000,
-            writable: matches!(kind, BusAccessKind::DataWrite),
+            writable: matches!(kind, BusAccessKind::DataWrite) && self.direct_pages_writable,
         }))
     }
 
@@ -1466,11 +2005,67 @@ mod strings_segments;
 mod v86;
 
 /// Differential tests for the compiled loop-region.
-#[cfg(feature = "jit")]
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_region_test.rs"]
 mod jit_region;
 
 /// Differential tests for the generic JIT block builder.
-#[cfg(feature = "jit")]
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_jit_general_test.rs"]
 mod jit_general;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_direct_test.rs"]
+mod jit_direct;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_compile_outcome_test.rs"]
+mod jit_compile_outcome;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_differential_generator_test.rs"]
+mod jit_differential_generator;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_x87_direct_test.rs"]
+mod jit_x87_direct;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_double_shift_test.rs"]
+mod jit_double_shift;
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[path = "cpu_jit_test_imm_test.rs"]
+mod jit_test_imm;

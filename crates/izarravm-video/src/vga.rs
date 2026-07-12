@@ -10,13 +10,32 @@
 //! raster engine as the planar and mode-X paths; chain-4 only rewrites the CPU
 //! write/read decode.
 
+use std::cell::{Cell, RefCell};
+
 use crate::{
-    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS,
-    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS, VideoError, VideoMode,
+    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE,
+    VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
+    VideoError, VideoMode,
 };
+mod datapath;
+mod legacy;
 mod scanout;
 mod timing;
 
+pub use datapath::{
+    GfxAperture, GfxController, display_counter, display_offset, display_offset_row, read_planes,
+    write_planes,
+};
+use legacy::{CGA_BLACK, CGA_WHITE, HGC_MODE_GRAPHICS, HGC_MODE_VIDEO_ENABLE};
+#[cfg(test)]
+use legacy::{
+    CGA_BROWN, CGA_CYAN, CGA_GREEN, CGA_LIGHT_CYAN, CGA_LIGHT_GRAY, CGA_LIGHT_GREEN,
+    CGA_LIGHT_MAGENTA, CGA_LIGHT_RED, CGA_MAGENTA, CGA_RED, CGA_YELLOW, HGC_MODE_PAGE1,
+};
+pub use legacy::{
+    CGA_BYTES_PER_LINE, CGA_FB_SIZE, CGA_ODD_BANK, Cga, CgaMode, HGC_BANK_SIZE, HGC_BYTES_PER_LINE,
+    HGC_FB_SIZE, HGC_PAGE1_OFFSET, Hgc,
+};
 pub use scanout::VgaRaster;
 pub use timing::{
     Attribute, CrtcRegs, CrtcTiming, Sequencer, beam_display_enable, beam_dot, beam_hsync,
@@ -37,207 +56,32 @@ const CGA_MODE_BW: u8 = 0x04;
 const CGA_MODE_VIDEO_ENABLE: u8 = 0x08;
 const CGA_MODE_HIGH_RES: u8 = 0x10;
 const CGA_MODE_BLINK: u8 = 0x20;
+const MODE13_DIRECT_PAGES: usize = VGA_PLANAR_WINDOW_SIZE as usize / 0x1000;
 
-/// CGA graphics framebuffer size: 16 KiB at B800:0000. Two 8000-byte banks
-/// (100 scanlines x 80 bytes each) hold the even and odd scanlines.
-pub const CGA_FB_SIZE: usize = 16 * 1024;
-/// Byte offset of the odd-scanline bank inside the CGA framebuffer. Even
-/// scanlines (0, 2, 4, ...) live at 0x0000; odd scanlines (1, 3, 5, ...) at
-/// 0x2000. Each bank is 8000 bytes (100 lines x 80 bytes per line).
-pub const CGA_ODD_BANK: usize = 0x2000;
-/// Standard CGA graphics bytes per scanline. Register-banged horizontal modes
-/// derive the live pitch from `hdisp_end` instead.
-pub const CGA_BYTES_PER_LINE: usize = 80;
-
-/// The CGA graphics submode the B800 framebuffer is decoded as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CgaMode {
-    /// 320x200, 4 colors, 2 bits per pixel (INT 10h modes 04h and 05h).
-    Graphics320x200,
-    /// 640x200, 2 colors, 1 bit per pixel (INT 10h mode 06h).
-    Graphics640x200,
-}
-
-/// CGA graphics state: the framebuffer plus the two control registers the CGA
-/// exposes (mode control 0x3D8 and color select 0x3D9). The mode-control
-/// register drives the CGA text/graphics personality and blanking; color decode
-/// reads `color_select`.
 #[derive(Debug, Clone)]
-pub struct Cga {
-    pub fb: Vec<u8>,
-    pub submode: CgaMode,
-    /// INT 10h mode number (04h, 05h, or 06h). Mode 05h forces the alternate
-    /// red/cyan/white palette regardless of the color-select palette bit.
-    pub bios_mode: u8,
-    pub mode_control: u8, // port 0x3D8 output latch
-    pub color_select: u8, // port 0x3D9
-    pub light_pen_triggered: bool,
-    pub light_pen_latch: u16,
-    pub light_pen_pixel_col: u16,
-    pub light_pen_pixel_row: u16,
+struct Mode13ArgbCache {
+    words: Vec<u32>,
+    palette: [u32; DAC_ENTRIES],
+    width: usize,
+    height: usize,
+    display_height: usize,
+    frame: u64,
+    valid: bool,
+    converted_pixels: usize,
 }
 
-impl Default for Cga {
+impl Default for Mode13ArgbCache {
     fn default() -> Self {
         Self {
-            fb: vec![0; CGA_FB_SIZE],
-            submode: CgaMode::Graphics320x200,
-            bios_mode: 0x04,
-            mode_control: 0x00,
-            color_select: 0x00,
-            light_pen_triggered: false,
-            light_pen_latch: 0,
-            light_pen_pixel_col: 0,
-            light_pen_pixel_row: 0,
+            words: Vec::new(),
+            palette: [0; DAC_ENTRIES],
+            width: 0,
+            height: 0,
+            display_height: 0,
+            frame: 0,
+            valid: false,
+            converted_pixels: 0,
         }
-    }
-}
-
-// Hercules Mode Control register (port 3B8h) bits (seasip.info "Hercules
-// Graphics Card Plus Notes"): bit 1 selects graphics vs text, bit 3 gates
-// video output, bit 5 picks blink vs high-intensity background in text mode,
-// bit 7 picks which 32K page (B0000 or B8000) the CRTC scans out.
-const HGC_MODE_GRAPHICS: u8 = 0x02;
-const HGC_MODE_VIDEO_ENABLE: u8 = 0x08;
-const HGC_MODE_PAGE1: u8 = 0x80;
-
-// Hercules Configuration Switch register (port 3BFh, write-only): bit 0
-// allows the Mode Control register's graphics bit to take effect and unlocks
-// the B1000h-B7FFFh half of the first page; bit 1 pages the second 32K bank
-// in at B8000h. A real HGC's graphics mode is refused (stays text) unless the
-// guest has first unlocked it here -- this is the two-step "configure then
-// switch" sequence Hercules software issues before painting graphics.
-const HGC_CONFIG_ALLOW_GRAPHICS: u8 = 0x01;
-const HGC_CONFIG_ENABLE_PAGE1: u8 = 0x02;
-
-/// Hercules graphics state: the two 32K pages (B0000 and B8000) plus the
-/// Mode Control (3B8h) and Configuration Switch (3BFh) latches. Mirrors `Cga`
-/// for the third legacy personality this raster core hosts.
-#[derive(Debug, Clone)]
-pub struct Hgc {
-    /// Both 32K pages back to back: page 0 (B0000) at offset 0, page 1
-    /// (B8000) at offset 0x8000. Real hardware only backs page 1 with RAM
-    /// when a full (non-"Plus") HGC or an HGC+ with the RAM option is fitted;
-    /// this core always backs it so a guest that pages it in before checking
-    /// for it (a common detection shortcut) sees ordinary RAM, not open bus.
-    pub fb: Vec<u8>,
-    pub mode_control: u8,  // port 0x3B8 output latch
-    pub config_switch: u8, // port 0x3BF output latch
-}
-
-pub const HGC_FB_SIZE: usize = 32 * 1024;
-pub const HGC_PAGE1_OFFSET: usize = 0x8000;
-/// Byte offset of interleave bank N (0..=3) inside one 32K Hercules page.
-/// Scanline `y` maps to bank `y & 3` at `(y & 3) * HGC_BANK_SIZE`, the
-/// four-way generalization of CGA's two-bank even/odd interleave.
-pub const HGC_BANK_SIZE: usize = 0x2000;
-/// Hercules graphics bytes per scanline: 720 pixels / 8 bits-per-byte.
-pub const HGC_BYTES_PER_LINE: usize = 90;
-
-impl Default for Hgc {
-    fn default() -> Self {
-        Self {
-            fb: vec![0; HGC_FB_SIZE * 2],
-            mode_control: 0x00,
-            config_switch: 0x00,
-        }
-    }
-}
-
-impl Hgc {
-    fn graphics_allowed(&self) -> bool {
-        self.config_switch & HGC_CONFIG_ALLOW_GRAPHICS != 0
-    }
-
-    fn page1_enabled(&self) -> bool {
-        self.config_switch & HGC_CONFIG_ENABLE_PAGE1 != 0
-    }
-
-    /// Which 32K page (0 or 1) the CRTC currently scans out: Mode Control bit
-    /// 7, but a page-1 select only takes effect once 3BFh has paged it in
-    /// (real hardware: the second bank is simply not there otherwise).
-    fn active_page(&self) -> usize {
-        if self.mode_control & HGC_MODE_PAGE1 != 0 && self.page1_enabled() {
-            1
-        } else {
-            0
-        }
-    }
-}
-
-/// The 16 EGA/CGA color numbers as DAC indices. On the stock VGA palette the
-/// first 16 entries are the EGA colors, so a CGA color number is its own DAC
-/// index. Named for the four-color and two-color palette tables below.
-const CGA_BLACK: u8 = 0;
-const CGA_GREEN: u8 = 2;
-const CGA_CYAN: u8 = 3;
-const CGA_RED: u8 = 4;
-const CGA_MAGENTA: u8 = 5;
-const CGA_BROWN: u8 = 6;
-const CGA_LIGHT_GRAY: u8 = 7;
-const CGA_LIGHT_GREEN: u8 = 10;
-const CGA_LIGHT_CYAN: u8 = 11;
-const CGA_LIGHT_RED: u8 = 12;
-const CGA_LIGHT_MAGENTA: u8 = 13;
-const CGA_YELLOW: u8 = 14;
-const CGA_WHITE: u8 = 15;
-
-impl Cga {
-    /// The three foreground colors (pixel values 1, 2, 3) for 320x200x4, decoded
-    /// from the color-select register (port 0x3D9). Bit 5 selects palette 1
-    /// (cyan/magenta/white) over palette 0 (green/red/brown); bit 4 brightens all
-    /// three to their light variants. Mode 05h overrides the palette to the fixed
-    /// cyan/red/white set (IBM CGA / DOSBox), still honoring the intensity bit.
-    /// Pixel value 0 is the background/border from `background_index`.
-    fn palette_320x200(&self) -> [u8; 3] {
-        let intensity = self.color_select & 0x10 != 0;
-        if self.bios_mode == 0x05 {
-            // Alternate palette: cyan / red / white.
-            return if intensity {
-                [CGA_LIGHT_CYAN, CGA_LIGHT_RED, CGA_WHITE]
-            } else {
-                [CGA_CYAN, CGA_RED, CGA_LIGHT_GRAY]
-            };
-        }
-        let palette1 = self.color_select & 0x20 != 0;
-        match (palette1, intensity) {
-            (false, false) => [CGA_GREEN, CGA_RED, CGA_BROWN],
-            (false, true) => [CGA_LIGHT_GREEN, CGA_LIGHT_RED, CGA_YELLOW],
-            (true, false) => [CGA_CYAN, CGA_MAGENTA, CGA_LIGHT_GRAY],
-            (true, true) => [CGA_LIGHT_CYAN, CGA_LIGHT_MAGENTA, CGA_WHITE],
-        }
-    }
-
-    /// The background/border color (pixel value 0 in 320x200x4, the 0 bit in
-    /// 640x200x2): color-select bits 0-3 with bit 4 as the intensity bit, a full
-    /// 4-bit CGA color number, which is its own DAC index on the stock palette.
-    fn background_index(&self) -> u8 {
-        self.color_select & 0x0F
-    }
-
-    /// The foreground color for the 1 bits in 640x200x2: color-select bits 0-3,
-    /// the same field as the background nibble. The background is always black.
-    fn foreground_640x200(&self) -> u8 {
-        self.color_select & 0x0F
-    }
-
-    /// Decode the four DAC indices a 320x200x4 framebuffer byte holds, MSB-first:
-    /// bits 7-6 are pixel 0, 5-4 pixel 1, 3-2 pixel 2, 1-0 pixel 3. Value 0 is the
-    /// background; values 1-3 select from the active four-color palette.
-    fn decode_byte_320x200(&self, byte: u8) -> [u8; 4] {
-        let bg = self.background_index();
-        let fg = self.palette_320x200();
-        let mut out = [0u8; 4];
-        for (px, slot) in out.iter_mut().enumerate() {
-            let shift = 6 - px * 2;
-            let value = (byte >> shift) & 0x03;
-            *slot = if value == 0 {
-                bg
-            } else {
-                fg[(value - 1) as usize]
-            };
-        }
-        out
     }
 }
 
@@ -248,6 +92,15 @@ pub struct Vga {
     // authoritative; any write through a planar decode invalidates this cache.
     pub(crate) mode13_linear: Vec<u8>,
     pub(crate) mode13_linear_valid: bool,
+    // Direct CPU pages write the linear cache without passing through a byte
+    // mutator. Keep it authoritative until a planar or noncanonical path needs
+    // the four VGA planes, then materialize all 64 KiB once.
+    pub(crate) mode13_linear_authoritative: bool,
+    mode13_dirty_pages: Cell<u16>,
+    mode13_direct_batch_dirty: bool,
+    graphics_settle_frames: u8,
+    mode13_argb_full_dirty: Cell<bool>,
+    mode13_argb_cache: RefCell<Mode13ArgbCache>,
     pub(crate) crtc: CrtcTiming,
     pub(crate) crtc_regs: CrtcRegs,
     pub(crate) seq: Sequencer,
@@ -319,6 +172,12 @@ impl Default for Vga {
             vram: vec![0; VGA_PLANAR_SIZE],
             mode13_linear: vec![0; 0x10000],
             mode13_linear_valid: true,
+            mode13_linear_authoritative: false,
+            mode13_dirty_pages: Cell::new(0),
+            mode13_direct_batch_dirty: false,
+            graphics_settle_frames: 0,
+            mode13_argb_full_dirty: Cell::new(true),
+            mode13_argb_cache: RefCell::new(Mode13ArgbCache::default()),
             crtc: CrtcTiming::text_03h(),
             crtc_regs: CrtcRegs::default(),
             seq: Sequencer::default(),
@@ -660,7 +519,11 @@ impl Vga {
     /// which only records BIOS mode-set policy in the BDA and does not touch
     /// this CRTC register.
     pub fn set_char_height(&mut self, height: u8) {
-        self.crtc.max_scan = u32::from(height.saturating_sub(1));
+        let max_scan = u32::from(height.saturating_sub(1));
+        if self.crtc.max_scan != max_scan {
+            self.sync_mode13_planar();
+            self.crtc.max_scan = max_scan;
+        }
     }
 
     pub fn char_height(&self) -> u8 {
@@ -703,8 +566,183 @@ impl Vga {
         }
     }
 
+    fn rebuild_mode13_linear(&mut self) {
+        if self.mode13_linear_valid {
+            return;
+        }
+        for linear in 0..self.mode13_linear.len() {
+            let plane = linear & 3;
+            let plane_offset = linear >> 2;
+            self.mode13_linear[linear] = self.vram[plane * VGA_PLANE_SIZE + plane_offset];
+        }
+        self.mode13_linear_valid = true;
+    }
+
+    fn sync_mode13_planar(&mut self) {
+        if !self.mode13_linear_authoritative {
+            return;
+        }
+        for (linear, &value) in self.mode13_linear.iter().enumerate() {
+            let plane = linear & 3;
+            let plane_offset = linear >> 2;
+            self.vram[plane * VGA_PLANE_SIZE + plane_offset] = value;
+        }
+        self.mode13_linear_authoritative = false;
+    }
+
+    fn canonical_mode13_layout(&self) -> bool {
+        self.mode == VideoMode::Mode13h
+            && self.seq.memory_mode & 0x08 != 0
+            && self.attr.pixel_pan == 0
+            && self.crtc == CrtcTiming::mode13h()
+    }
+
+    /// Whether the CPU can use the stock chained Mode 13h aperture as flat
+    /// memory. The machine uses this to invalidate cached direct pages only
+    /// when a VGA write actually changes their availability.
+    pub fn mode13h_direct_page_available(&self) -> bool {
+        let aperture = self.gc.aperture();
+        self.canonical_mode13_layout()
+            && self.pending_start.is_none()
+            && self.video_memory_enabled()
+            && aperture.base == VGA_MODE13H_BASE
+            && aperture.length == VGA_PLANAR_WINDOW_SIZE
+            && aperture.graphics
+    }
+
+    fn mode_x_direct_write_plane(&self) -> Option<usize> {
+        let aperture = self.gc.aperture();
+        let mask = self.seq.map_mask;
+        (self.mode == VideoMode::ModeX
+            && self.seq.memory_mode & 0x08 == 0
+            && self.seq.memory_mode & 0x04 != 0
+            && mask.is_power_of_two()
+            && mask <= 0x08
+            && self.gc.write_mode == 0
+            && self.gc.rotate == 0
+            && self.gc.logic == 0
+            && self.gc.enable_set_reset == 0
+            && self.gc.bit_mask == 0xff
+            && self.video_memory_enabled()
+            && aperture.base == VGA_MODE13H_BASE
+            && aperture.length == VGA_PLANAR_WINDOW_SIZE
+            && aperture.graphics)
+            .then(|| mask.trailing_zeros() as usize)
+    }
+
+    /// Stable description of the current direct VGA write mapping. Zero means
+    /// no mapping, one is canonical Mode 13h, and values two through five select
+    /// a Mode X plane. The machine compares this across register writes so a
+    /// cached page cannot keep targeting an old plane.
+    pub fn direct_write_token(&self) -> u8 {
+        if self.mode13h_direct_page_available() {
+            1
+        } else {
+            self.mode_x_direct_write_plane()
+                .map_or(0, |plane| plane as u8 + 2)
+        }
+    }
+
+    /// Return one directly writable VGA aperture page when the current write
+    /// datapath is a transparent byte copy. Mode X points at the sole plane
+    /// selected by the map mask. Reads still use the VGA handler and latches.
+    pub fn direct_write_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
+        if self.mode13h_direct_page_available() {
+            return self.mode13h_direct_page_ptr(offset);
+        }
+        let plane = self.mode_x_direct_write_plane()?;
+        if offset
+            .checked_add(0x1000)
+            .is_none_or(|end| end > VGA_PLANE_SIZE)
+        {
+            return None;
+        }
+        self.sync_mode13_planar();
+        Some(self.vram[plane * VGA_PLANE_SIZE + offset..].as_mut_ptr())
+    }
+
+    /// Return one page of the canonical chained Mode 13h aperture. The backing
+    /// buffer is stable for the lifetime of this VGA instance. Callers must use
+    /// `note_mode13h_direct_write` before mutating the returned page.
+    pub fn mode13h_direct_page_ptr(&mut self, offset: usize) -> Option<*mut u8> {
+        if !self.mode13h_direct_page_available()
+            || offset
+                .checked_add(0x1000)
+                .is_none_or(|end| end > self.mode13_linear.len())
+        {
+            return None;
+        }
+        self.rebuild_mode13_linear();
+        Some(self.mode13_linear[offset..].as_mut_ptr())
+    }
+
+    /// Mark a write made through a direct Mode 13h page. Content generation is
+    /// committed by `finish_mode13h_direct_batch`, once for the whole bus batch.
+    pub fn note_mode13h_direct_write(&mut self, offset: usize, bytes: usize) {
+        debug_assert!(self.mode13h_direct_page_available());
+        self.note_direct_write(offset, bytes);
+    }
+
+    /// Mark a write made through any direct VGA page. Content generation is
+    /// committed by `finish_direct_write_batch`, once for the whole bus batch.
+    pub fn note_direct_write(&mut self, offset: usize, bytes: usize) {
+        debug_assert_ne!(self.direct_write_token(), 0);
+        if bytes == 0 || offset >= self.mode13_linear.len() {
+            return;
+        }
+        let last = offset
+            .saturating_add(bytes - 1)
+            .min(self.mode13_linear.len() - 1);
+        let first_page = offset >> 12;
+        let last_page = last >> 12;
+        let mut dirty = self.mode13_dirty_pages.get();
+        for page in first_page..=last_page.min(MODE13_DIRECT_PAGES - 1) {
+            dirty |= 1 << page;
+        }
+        self.note_direct_write_pages(dirty);
+    }
+
+    /// Mark the exact set of canonical Mode 13h pages written by one native CPU block.
+    pub fn note_mode13h_direct_pages(&mut self, dirty_pages: u16) {
+        debug_assert!(self.mode13h_direct_page_available());
+        self.note_direct_write_pages(dirty_pages);
+    }
+
+    /// Mark the aperture pages written through either canonical Mode 13h or the
+    /// transparent single-plane Mode X path.
+    pub fn note_direct_write_pages(&mut self, dirty_pages: u16) {
+        let token = self.direct_write_token();
+        debug_assert_ne!(token, 0);
+        if dirty_pages == 0 {
+            return;
+        }
+        if token == 1 {
+            self.mode13_dirty_pages
+                .set(self.mode13_dirty_pages.get() | dirty_pages);
+            self.mode13_linear_valid = true;
+            self.mode13_linear_authoritative = true;
+        } else {
+            self.mode13_linear_valid = false;
+            self.mode13_linear_authoritative = false;
+        }
+        self.mode13_direct_batch_dirty = true;
+        self.arm_graphics_settle();
+    }
+
+    pub fn finish_mode13h_direct_batch(&mut self) {
+        self.finish_direct_write_batch();
+    }
+
+    pub fn finish_direct_write_batch(&mut self) {
+        if self.mode13_direct_batch_dirty {
+            self.content_gen = self.content_gen.wrapping_add(1);
+            self.mode13_direct_batch_dirty = false;
+        }
+    }
+
     /// Install a planar mode's timing and reset the beam to the top of frame.
     fn set_planar_mode(&mut self, mode: u8, timing: CrtcTiming, clear: bool) {
+        self.sync_mode13_planar();
         // A mode change alters the scanout interpretation even between two graphics
         // modes of identical raster dims (e.g. 0Dh<->13h, both 320x449), which the
         // dimension fold in `Machine::frame_generation` cannot see. Bump so the host
@@ -731,6 +769,7 @@ impl Vga {
             self.vram.fill(0);
             self.mode13_linear.fill(0);
             self.mode13_linear_valid = true;
+            self.mode13_linear_authoritative = false;
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
@@ -772,6 +811,9 @@ impl Vga {
     }
 
     pub fn plane_byte(&self, plane: usize, offset: usize) -> u8 {
+        if self.mode13_linear_authoritative && plane < VGA_PLANES && offset < 0x4000 {
+            return self.mode13_linear[(offset << 2) | plane];
+        }
         self.vram[plane * VGA_PLANE_SIZE + offset]
     }
 
@@ -831,6 +873,7 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return;
         }
+        self.sync_mode13_planar();
         self.mode13_linear_valid = false;
         self.bump_content_gen();
         if self.seq.memory_mode & 0x04 == 0 {
@@ -848,6 +891,7 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return 0xFF;
         }
+        self.sync_mode13_planar();
         if self.gc.mode_odd_even() && self.gc.aperture().chain_odd_even {
             return self.cpu_read_odd_even(offset);
         }
@@ -895,6 +939,7 @@ impl Vga {
         let Some((offset, bit)) = self.planar_pixel_offset_at(start, x, y) else {
             return false;
         };
+        self.sync_mode13_planar();
         self.mode13_linear_valid = false;
         self.bump_content_gen();
         let old = self.planar_read_pixel_at(start, x, y);
@@ -951,6 +996,9 @@ impl Vga {
     /// `N >> 2` via the low two address bits, the symmetric counterpart to
     /// `cpu_write_chain4`.
     pub fn cpu_read_chain4(&self, offset: usize) -> u8 {
+        if self.mode13_linear_authoritative && offset < self.mode13_linear.len() {
+            return self.mode13_linear[offset];
+        }
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
         if plane_off < VGA_PLANE_SIZE {
@@ -964,6 +1012,7 @@ impl Vga {
     /// start address at the next frame boundary (finalize_frame), so mid-frame
     /// writes do not tear.
     pub fn set_start_address(&mut self, addr: u32) {
+        self.sync_mode13_planar();
         self.pending_start = Some(addr); // snapshot at next vretrace (finalize)
     }
 
@@ -1166,6 +1215,12 @@ impl Vga {
     /// new value takes effect. Returns `true` if the port is handled.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         self.catch_up();
+        let changes_mode13_layout = matches!(port, 0x3C2 | 0x3C3 | 0x3C5 | 0x3CF | 0x3D8 | 0x3B8)
+            || self.crtc_data_port_selected(port)
+            || (port == 0x3C0 && self.attr.flip_flop_data);
+        if changes_mode13_layout {
+            self.sync_mode13_planar();
+        }
         // Any VGA register / DAC write can change the scanout (palette, CRTC origin,
         // sequencer/GC/attribute state), so bump the content generation. This also
         // covers HLE BIOS palette writes (e.g. INT 10h AH=10h driving 0x3D9 directly).
@@ -1753,6 +1808,7 @@ impl Vga {
             self.vram.fill(0);
             self.mode13_linear.fill(0);
             self.mode13_linear_valid = true;
+            self.mode13_linear_authoritative = false;
         }
         self.presented = None; // drop any stale frame from a prior mode
         self.pending_start = None; // the mode set reprograms the start address
@@ -1775,6 +1831,7 @@ impl Vga {
             0x06 => (CrtcTiming::cga_640x200(), CgaMode::Graphics640x200),
             _ => return false,
         };
+        self.sync_mode13_planar();
         // A mode change alters the scanout even at identical raster dims; bump the
         // content gen so the host frame cache re-renders the switch (after validation,
         // so an unsupported mode that returns false above does not bump).
@@ -1859,6 +1916,7 @@ impl Vga {
     }
 
     fn write_cga_mode_control(&mut self, value: u8) {
+        self.sync_mode13_planar();
         let value = value & 0x3F;
         let old_control = self.cga.mode_control;
         let was_cga = self.is_cga_personality();
@@ -1928,6 +1986,7 @@ impl Vga {
             }
             self.seq.clocking_mode |= 0x01;
             self.mode = VideoMode::Text;
+            self.graphics_settle_frames = 0;
             self.resize_work();
         }
     }
@@ -2018,6 +2077,7 @@ impl Vga {
     /// and MDA-style mono text (identity attribute palette) instead need the
     /// standard 16 colors at entries 0..15, which the 256-color palette3 holds.
     fn reset_text_mode(&mut self, clear: bool, ega_attr_dac: bool) {
+        self.sync_mode13_planar();
         self.cursor_offset = 0;
         if clear {
             if self.crtc.char_width == 8 {
@@ -2036,6 +2096,7 @@ impl Vga {
         self.last_line = 0;
         self.seq.reset = 0x03;
         self.mode = VideoMode::Text;
+        self.graphics_settle_frames = 0;
         self.presented = None;
         // A buffered start-address change from a prior graphics mode must not
         // carry across the mode switch: the text origin resets to page 0.
@@ -2483,6 +2544,7 @@ impl Vga {
     /// Enter unchained 256-color (mode X / mode Y) with the 320x200 base. The guest
     /// retunes the geometry by reprogramming the vertical CRTC timing while here.
     fn enter_mode_x(&mut self) {
+        self.sync_mode13_planar();
         // seq.memory_mode already holds the chain-4-off value from the write_seq
         // call that triggered this entry, so it is not reseeded here.
         self.crtc = CrtcTiming::mode_x();
@@ -2519,7 +2581,17 @@ impl Vga {
     /// caller (CPU bus or HLE BIOS) drove the write. Over-bumping is harmless.
     #[inline]
     fn bump_content_gen(&mut self) {
+        self.arm_graphics_settle();
+        self.mode13_argb_full_dirty.set(true);
+        self.mode13_direct_batch_dirty = false;
         self.content_gen = self.content_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    fn arm_graphics_settle(&mut self) {
+        if !self.is_text_mode() && (self.last_line != 0 || self.beam != 0) {
+            self.graphics_settle_frames = self.graphics_settle_frames.max(2);
+        }
     }
 
     /// The CPU aperture window the Graphics Controller Miscellaneous register
@@ -2591,7 +2663,13 @@ impl Vga {
             0x10 => self.attr.mode_control = value,
             0x11 => self.set_overscan(value),
             0x12 => self.attr.plane_enable = value,
-            0x13 => self.attr.pixel_pan = value & 0x0F,
+            0x13 => {
+                let pixel_pan = value & 0x0F;
+                if self.attr.pixel_pan != pixel_pan {
+                    self.sync_mode13_planar();
+                    self.attr.pixel_pan = pixel_pan;
+                }
+            }
             0x14 => self.attr.color_select = value,
             _ => {}
         }
@@ -2695,6 +2773,85 @@ impl Vga {
         out
     }
 
+    /// Palette-map the latest completed canonical Mode 13h frame. The cache is
+    /// full-sized so callers can keep their existing crop behavior.
+    pub fn cached_mode13h_presented_argb(&self) -> Option<(Vec<u32>, usize, usize, usize)> {
+        if !self.canonical_mode13_layout() {
+            return None;
+        }
+        let raster = self.last_presented()?;
+        let width = raster.width as usize;
+        let height = raster.height as usize;
+        let display_height = raster.display_height.min(raster.height) as usize;
+        let palette = self.palette_argb();
+        let frame = self.frames_completed();
+        let dirty_pages = self.mode13_dirty_pages.get();
+        let full_dirty = self.mode13_argb_full_dirty.get();
+        let mut cache = self.mode13_argb_cache.borrow_mut();
+        let shape_changed = !cache.valid
+            || cache.width != width
+            || cache.height != height
+            || cache.words.len() != raster.pixels.len();
+        let frame_advanced = !cache.valid || cache.frame != frame;
+        let palette_changed = !cache.valid || cache.palette != palette;
+
+        if cache.valid && !frame_advanced && !palette_changed {
+            return Some((cache.words.clone(), width, height, display_height));
+        }
+
+        let full = shape_changed || palette_changed || full_dirty;
+        let converted = if full {
+            cache.words.resize(raster.pixels.len(), 0);
+            for (word, &index) in cache.words.iter_mut().zip(&raster.pixels) {
+                *word = palette[usize::from(index)];
+            }
+            raster.pixels.len()
+        } else {
+            let scan_factor = self.scan_factor() as usize;
+            let visible_bytes = crate::MODE13H_MEMORY_SIZE.min(self.mode13_linear.len());
+            let mut converted = 0;
+            for page in 0..MODE13_DIRECT_PAGES {
+                if dirty_pages & (1u16 << page) == 0 {
+                    continue;
+                }
+                let start = page * 0x1000;
+                let end = (start + 0x1000).min(visible_bytes);
+                for linear in start..end {
+                    let source_row = linear / width;
+                    let x = linear % width;
+                    for duplicate in 0..scan_factor {
+                        let row = source_row * scan_factor + duplicate;
+                        if row >= display_height {
+                            break;
+                        }
+                        let pixel = row * width + x;
+                        cache.words[pixel] = palette[usize::from(raster.pixels[pixel])];
+                        converted += 1;
+                    }
+                }
+            }
+            converted
+        };
+
+        cache.palette = palette;
+        cache.width = width;
+        cache.height = height;
+        cache.display_height = display_height;
+        cache.frame = frame;
+        cache.valid = true;
+        cache.converted_pixels = converted;
+        if frame_advanced && self.graphics_settle_frames == 0 {
+            self.mode13_dirty_pages.set(0);
+            self.mode13_argb_full_dirty.set(false);
+        }
+        Some((cache.words.clone(), width, height, display_height))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mode13h_last_converted_pixels(&self) -> usize {
+        self.mode13_argb_cache.borrow().converted_pixels
+    }
+
     pub fn frame(&self) -> TextFrame {
         // The visible text page, read from the start-address origin so the
         // headless cell view matches the pixel scanout (render_text_row). Mode
@@ -2744,200 +2901,6 @@ fn char_map_a_decode(spec: u8) -> usize {
 /// selects map B (set) or map A (clear) in 512-glyph mode.
 fn char_map_b_decode(spec: u8) -> usize {
     char_map_decode(spec, 2, 3, 5)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GfxController {
-    pub set_reset: u8,        // idx 0, low 4 bits
-    pub enable_set_reset: u8, // idx 1, low 4 bits
-    pub color_compare: u8,    // idx 2
-    pub rotate: u8,           // idx 3 bits 0..2
-    pub logic: u8,            // idx 3 bits 3..4: 0 copy,1 AND,2 OR,3 XOR
-    pub read_map: u8,         // idx 4
-    pub write_mode: u8,       // idx 5 bits 0..1
-    pub read_mode: u8,        // idx 5 bit 3
-    pub mode_flags: u8,       // idx 5 bits 4..6: odd/even + shift modes
-    pub color_dont_care: u8,  // idx 7
-    pub bit_mask: u8,         // idx 8
-    // idx 6 Miscellaneous Graphics: bit 0 graphics (vs alphanumeric), bit 1 chain
-    // odd/even, bits 3-2 memory map select. Stored as written; the fields are
-    // decoded by `aperture` (FreeVGA gfxreg.htm 06h).
-    pub misc: u8,
-}
-
-impl GfxController {
-    fn mode_odd_even(&self) -> bool {
-        self.mode_flags & 0x10 != 0
-    }
-}
-
-/// The decoded Graphics Controller Miscellaneous register (index 06h): the CPU
-/// aperture window the legacy A0000/B0000 mapping points at, plus the two mode
-/// flags the bus and the read/write decode consult.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GfxAperture {
-    /// Aperture base linear address (A0000, A0000, B0000, or B8000).
-    pub base: u32,
-    /// Aperture length in bytes (0x20000, 0x10000, 0x8000, or 0x8000).
-    pub length: u32,
-    /// Misc bit 0: graphics mode (clear = alphanumeric/text).
-    pub graphics: bool,
-    /// Misc bit 1: chain odd/even enable.
-    pub chain_odd_even: bool,
-}
-
-impl GfxController {
-    /// Decode the Miscellaneous register (06h) into the selected aperture window
-    /// and the graphics / chain-odd-even flags. Memory Map Select (bits 3-2):
-    /// 00 = A0000-BFFFF (128K), 01 = A0000-AFFFF (64K), 10 = B0000-B7FFF (32K),
-    /// 11 = B8000-BFFFF (32K). FreeVGA gfxreg.htm 06h.
-    pub fn aperture(&self) -> GfxAperture {
-        let (base, length) = match (self.misc >> 2) & 0x03 {
-            0b00 => (0xA_0000, 0x2_0000),
-            0b01 => (0xA_0000, 0x1_0000),
-            0b10 => (0xB_0000, 0x0_8000),
-            _ => (0xB_8000, 0x0_8000),
-        };
-        GfxAperture {
-            base,
-            length,
-            graphics: self.misc & 0x01 != 0,
-            chain_odd_even: self.misc & 0x02 != 0,
-        }
-    }
-}
-
-fn apply_logic(logic: u8, value: u8, latch: u8) -> u8 {
-    match logic {
-        1 => value & latch,
-        2 => value | latch,
-        3 => value ^ latch,
-        _ => value,
-    }
-}
-
-/// Read one byte through the VGA read datapath, loading the four latches.
-/// Spec section 4.
-pub fn read_planes(
-    planes: &[[u8; 1]; VGA_PLANES],
-    gc: &GfxController,
-    latches: &mut [u8; VGA_PLANES],
-) -> u8 {
-    for plane in 0..VGA_PLANES {
-        latches[plane] = planes[plane][0];
-    }
-    if gc.read_mode == 0 {
-        return planes[(gc.read_map & 3) as usize][0];
-    }
-    // Read mode 1: per bit, set the result bit where every cared-about plane
-    // matches the corresponding color_compare bit.
-    let mut result = 0u8;
-    for bit in 0..8 {
-        let mut matches = true;
-        for (plane, slot) in planes.iter().enumerate() {
-            if (gc.color_dont_care >> plane) & 1 == 0 {
-                continue;
-            }
-            let plane_bit = (slot[0] >> bit) & 1;
-            let cmp_bit = (gc.color_compare >> plane) & 1;
-            if plane_bit != cmp_bit {
-                matches = false;
-                break;
-            }
-        }
-        if matches {
-            result |= 1 << bit;
-        }
-    }
-    result
-}
-
-/// Write one byte through the VGA write datapath into all four planes. `planes[i]`
-/// is plane i's slice; `latches` are the four latch registers. Spec section 4.
-pub fn write_planes(
-    planes: &mut [[u8; 1]; VGA_PLANES],
-    data: u8,
-    gc: &GfxController,
-    latches: &[u8; VGA_PLANES],
-) {
-    let rotated = data.rotate_right(u32::from(gc.rotate & 7));
-    for plane in 0..VGA_PLANES {
-        let latch = latches[plane];
-        let value = match gc.write_mode {
-            1 => {
-                planes[plane][0] = latch; // WM1: latches straight to planes
-                continue;
-            }
-            2 => {
-                if (data >> plane) & 1 != 0 { 0xFF } else { 0x00 } // WM2
-            }
-            3 => {
-                if (gc.set_reset >> plane) & 1 != 0 {
-                    0xFF
-                } else {
-                    0x00
-                } // WM3 color
-            }
-            _ => {
-                // WM0: set/reset substitution where enabled, else rotated data.
-                if (gc.enable_set_reset >> plane) & 1 != 0 {
-                    if (gc.set_reset >> plane) & 1 != 0 {
-                        0xFF
-                    } else {
-                        0x00
-                    }
-                } else {
-                    rotated
-                }
-            }
-        };
-        let mask = if gc.write_mode == 3 {
-            gc.bit_mask & rotated
-        } else {
-            gc.bit_mask
-        };
-        let alu = apply_logic(gc.logic, value, latch);
-        planes[plane][0] = (alu & mask) | (latch & !mask);
-    }
-}
-
-/// Map a display-address counter value `ma` to a per-plane byte offset, applying
-/// the CRTC byte/word/doubleword addressing transform and the 16-bit (64 KB)
-/// counter wrap. `mode_control` is CRTC index 17h, `underline_loc` is index 14h.
-pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
-    display_offset_row(mode_control, underline_loc, ma, 0)
-}
-
-pub fn display_counter(mode_control: u8, underline_loc: u8, row_base: u32, column: u32) -> u32 {
-    let divisor = if underline_loc & 0x20 != 0 {
-        4
-    } else if mode_control & 0x08 != 0 {
-        2
-    } else {
-        1
-    };
-    row_base + column / divisor
-}
-
-pub fn display_offset_row(mode_control: u8, underline_loc: u8, ma: u32, row_scan: u32) -> usize {
-    let mut addr = if mode_control & 0x40 != 0 {
-        ma // byte mode (CR17 bit 6): identity
-    } else if underline_loc & 0x40 != 0 {
-        // Doubleword mode (CR14 bit 6): MA0/MA1 are forced low, MA2..MA15 receive
-        // A0..A13; CR17 bits 0/1 may still replace MA13/MA14 with row-scan bits.
-        ma << 2
-    } else {
-        // word mode: rotate left 1, MA15 (CR17 bit 5 = 1) or MA13 (= 0) -> bit 0
-        let wrap_bit = if mode_control & 0x20 != 0 { 15 } else { 13 };
-        (ma << 1) | ((ma >> wrap_bit) & 1)
-    };
-    if mode_control & 0x01 == 0 {
-        addr = (addr & !(1 << 13)) | ((row_scan & 0x01) << 13);
-    }
-    if mode_control & 0x02 == 0 {
-        addr = (addr & !(1 << 14)) | (((row_scan >> 1) & 0x01) << 14);
-    }
-    (addr as usize) % VGA_PLANE_SIZE
 }
 
 #[cfg(test)]

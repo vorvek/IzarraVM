@@ -478,6 +478,27 @@ fn profile_opcode(snapshot: &CpuProfileSnapshot, opcode: u16) -> &CpuOpcodeProfi
 }
 
 #[test]
+fn cpu_profile_splits_x87_escape_forms_by_modrm() {
+    let (mut cpu, mut bus) = profile_test_cpu(&[0xd9, 0xc0, 0xd9, 0xc8]);
+    cpu.enable_profiling(1);
+
+    cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+    cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+
+    let snapshot = cpu.profile_snapshot();
+    let fld = cpu.decode_cache.get(0, false).unwrap();
+    let fxch = cpu.decode_cache.get(2, false).unwrap();
+    assert_eq!(
+        profile_opcode(&snapshot, cpu_profile_opcode(&fld)).instructions,
+        1
+    );
+    assert_eq!(
+        profile_opcode(&snapshot, cpu_profile_opcode(&fxch)).instructions,
+        1
+    );
+}
+
+#[test]
 fn cpu_profile_disabled_records_no_groups() {
     let (mut cpu, mut bus) = profile_test_cpu(&[0x40]); // inc ax
 
@@ -517,11 +538,16 @@ fn cpu_profile_records_decode_groups() {
         assert_eq!(bucket.instructions, 1, "{name} instruction count");
         assert_eq!(bucket.samples, 1, "{name} sampled every instruction");
     }
-    for opcode in [0x05, 0x8b, 0xd9] {
+    for opcode in [0x05, 0x8b] {
         let bucket = profile_opcode(&snapshot, opcode);
         assert_eq!(bucket.instructions, 1, "opcode {opcode:#x} count");
         assert_eq!(bucket.samples, 1, "opcode {opcode:#x} samples");
     }
+    let fld1 = cpu.decode_cache.get(5, false).unwrap();
+    let opcode = cpu_profile_opcode(&fld1);
+    let bucket = profile_opcode(&snapshot, opcode);
+    assert_eq!(bucket.instructions, 1, "opcode {opcode:#x} count");
+    assert_eq!(bucket.samples, 1, "opcode {opcode:#x} samples");
 }
 
 #[test]
@@ -627,6 +653,323 @@ fn page_translation_reads_identity_mapped_memory() {
     cpu.cycle(&mut bus).unwrap();
 
     assert_eq!(cpu.registers.eip, 1);
+}
+
+const CROSS_PAGE_LINEAR: u32 = 0x8fff;
+const CROSS_PAGE_PDE: usize = 0x1000;
+const CROSS_PAGE_PTE8: usize = 0x2020;
+const CROSS_PAGE_PTE9: usize = 0x2024;
+const CROSS_PAGE_FIRST_FRAME: usize = 0x5000;
+const CROSS_PAGE_SECOND_FRAME: usize = 0x7000;
+
+fn cross_page_paging_cpu(user: bool, wp: bool) -> CpuGsw {
+    let mut cpu = CpuGsw::default();
+    cpu.control.cr0 |= CR0_PE | CR0_PG;
+    if wp {
+        cpu.control.cr0 |= CR0_WP;
+    }
+    cpu.control.cr3 = 0x1000;
+    cpu.cpl = if user { 3 } else { 0 };
+    cpu.registers.set_segment(
+        SegmentIndex::Cs,
+        SegmentRegister::flat(
+            if user { 0x0b } else { 0x08 },
+            if user { 0xfb } else { 0x9b },
+        ),
+    );
+    cpu.registers.set_segment(
+        SegmentIndex::Ds,
+        SegmentRegister::flat(
+            if user { 0x13 } else { 0x10 },
+            if user { 0xf3 } else { 0x93 },
+        ),
+    );
+    cpu
+}
+
+fn cross_page_paging_bus(first_pte: u32, second_pte: u32) -> TestBus {
+    let mut memory = vec![0; 0x8000];
+    memory[CROSS_PAGE_PDE..CROSS_PAGE_PDE + 4].copy_from_slice(&0x2007u32.to_le_bytes());
+    memory[CROSS_PAGE_PTE8..CROSS_PAGE_PTE8 + 4].copy_from_slice(&first_pte.to_le_bytes());
+    memory[CROSS_PAGE_PTE9..CROSS_PAGE_PTE9 + 4].copy_from_slice(&second_pte.to_le_bytes());
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus
+}
+
+fn paging_entry(memory: &[u8], address: usize) -> u32 {
+    u32::from_le_bytes(memory[address..address + 4].try_into().unwrap())
+}
+
+fn data_cycle_shape(bus: &TestBus, kind: BusAccessKind) -> Vec<(u32, BusWidth, u32)> {
+    bus.trace
+        .cycles()
+        .iter()
+        .filter(|cycle| cycle.kind == kind)
+        .map(|cycle| (cycle.address, cycle.width, cycle.clocks))
+        .collect()
+}
+
+#[test]
+fn paged_cross_page_dword_uses_both_noncontiguous_frames_and_sets_ad_bits() {
+    let mut cpu = cross_page_paging_cpu(false, true);
+    let mut bus = cross_page_paging_bus(0x5007, 0x7007);
+    bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff] = 0x11;
+    bus.memory[CROSS_PAGE_SECOND_FRAME..CROSS_PAGE_SECOND_FRAME + 3]
+        .copy_from_slice(&[0x22, 0x33, 0x44]);
+    bus.memory[0x6000..0x6003].copy_from_slice(&[0xaa, 0xbb, 0xcc]);
+
+    let value = cpu
+        .read_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            CROSS_PAGE_LINEAR,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )
+        .unwrap();
+
+    assert_eq!(value, 0x4433_2211);
+    assert_eq!(paging_entry(&bus.memory, CROSS_PAGE_PDE) & 0x20, 0x20);
+    assert_eq!(paging_entry(&bus.memory, CROSS_PAGE_PTE8) & 0x60, 0x20);
+    assert_eq!(paging_entry(&bus.memory, CROSS_PAGE_PTE9) & 0x60, 0x20);
+
+    cpu.write_memory_sized(
+        &mut bus,
+        SegmentIndex::Ds,
+        CROSS_PAGE_LINEAR,
+        OperandSize::Dword,
+        0xa1b2_c3d4,
+        BusAccessKind::DataWrite,
+    )
+    .unwrap();
+
+    assert_eq!(bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff], 0xd4);
+    assert_eq!(
+        &bus.memory[CROSS_PAGE_SECOND_FRAME..CROSS_PAGE_SECOND_FRAME + 3],
+        &[0xc3, 0xb2, 0xa1]
+    );
+    assert_eq!(&bus.memory[0x6000..0x6003], &[0xaa, 0xbb, 0xcc]);
+    assert_eq!(paging_entry(&bus.memory, CROSS_PAGE_PTE8) & 0x60, 0x60);
+    assert_eq!(paging_entry(&bus.memory, CROSS_PAGE_PTE9) & 0x60, 0x60);
+}
+
+#[test]
+fn paged_cross_page_dword_keeps_aligned_bus_fragment_widths() {
+    let mut word_cpu = cross_page_paging_cpu(false, true);
+    let mut word_bus = cross_page_paging_bus(0x5007, 0x7007);
+    word_bus.direct_page_clocks = true;
+    word_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff] = 1;
+    word_bus.memory[CROSS_PAGE_SECOND_FRAME] = 2;
+    assert_eq!(
+        word_cpu
+            .read_memory_sized(
+                &mut word_bus,
+                SegmentIndex::Ds,
+                CROSS_PAGE_LINEAR,
+                OperandSize::Word,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+        0x0201
+    );
+    assert_eq!(
+        data_cycle_shape(&word_bus, BusAccessKind::DataRead),
+        vec![(0x5fff, BusWidth::Byte, 2), (0x7000, BusWidth::Byte, 2)]
+    );
+
+    let mut fffe_cpu = cross_page_paging_cpu(false, true);
+    let mut fffe_bus = cross_page_paging_bus(0x5007, 0x7007);
+    fffe_bus.direct_page_clocks = true;
+    fffe_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0ffe..CROSS_PAGE_FIRST_FRAME + 0x1000]
+        .copy_from_slice(&[1, 2]);
+    fffe_bus.memory[CROSS_PAGE_SECOND_FRAME..CROSS_PAGE_SECOND_FRAME + 2].copy_from_slice(&[3, 4]);
+    assert_eq!(
+        fffe_cpu
+            .read_memory_sized(
+                &mut fffe_bus,
+                SegmentIndex::Ds,
+                0x8ffe,
+                OperandSize::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+        0x0403_0201
+    );
+    assert_eq!(
+        data_cycle_shape(&fffe_bus, BusAccessKind::DataRead),
+        vec![(0x5ffe, BusWidth::Word, 3), (0x7000, BusWidth::Word, 3)]
+    );
+
+    let mut ffff_cpu = cross_page_paging_cpu(false, true);
+    let mut ffff_bus = cross_page_paging_bus(0x5007, 0x7007);
+    ffff_bus.direct_page_clocks = true;
+    ffff_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff] = 1;
+    ffff_bus.memory[CROSS_PAGE_SECOND_FRAME..CROSS_PAGE_SECOND_FRAME + 3]
+        .copy_from_slice(&[2, 3, 4]);
+    assert_eq!(
+        ffff_cpu
+            .read_memory_sized(
+                &mut ffff_bus,
+                SegmentIndex::Ds,
+                CROSS_PAGE_LINEAR,
+                OperandSize::Dword,
+                BusAccessKind::DataRead,
+            )
+            .unwrap(),
+        0x0403_0201
+    );
+    assert_eq!(
+        data_cycle_shape(&ffff_bus, BusAccessKind::DataRead),
+        vec![
+            (0x5fff, BusWidth::Byte, 2),
+            (0x7000, BusWidth::Word, 3),
+            (0x7002, BusWidth::Byte, 2)
+        ]
+    );
+    ffff_cpu
+        .write_memory_sized(
+            &mut ffff_bus,
+            SegmentIndex::Ds,
+            CROSS_PAGE_LINEAR,
+            OperandSize::Dword,
+            0xaabb_ccdd,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+    assert_eq!(
+        data_cycle_shape(&ffff_bus, BusAccessKind::DataWrite),
+        vec![
+            (0x5fff, BusWidth::Byte, 2),
+            (0x7000, BusWidth::Word, 3),
+            (0x7002, BusWidth::Byte, 2)
+        ]
+    );
+}
+
+#[test]
+fn paged_cross_page_missing_second_page_faults_at_its_first_byte() {
+    let mut read_cpu = cross_page_paging_cpu(false, true);
+    let mut read_bus = cross_page_paging_bus(0x5007, 0);
+    read_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff] = 0x5a;
+    read_cpu.registers.set_eax(0xdead_beef);
+    let registers = read_cpu.registers.clone();
+
+    let read_fault = read_cpu.read_memory_sized(
+        &mut read_bus,
+        SegmentIndex::Ds,
+        CROSS_PAGE_LINEAR,
+        OperandSize::Dword,
+        BusAccessKind::DataRead,
+    );
+
+    assert!(matches!(
+        read_fault,
+        Err(InternalFault::Exception {
+            vector: 14,
+            error_code: Some(0)
+        })
+    ));
+    assert_eq!(read_cpu.control.cr2, 0x9000);
+    assert_eq!(read_cpu.registers, registers);
+    assert_eq!(paging_entry(&read_bus.memory, CROSS_PAGE_PTE8) & 0x60, 0x20);
+    assert_eq!(paging_entry(&read_bus.memory, CROSS_PAGE_PTE9), 0);
+
+    let mut write_cpu = cross_page_paging_cpu(false, true);
+    let mut write_bus = cross_page_paging_bus(0x5007, 0);
+    write_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff] = 0xaa;
+    let write_fault = write_cpu.write_memory_sized(
+        &mut write_bus,
+        SegmentIndex::Ds,
+        CROSS_PAGE_LINEAR,
+        OperandSize::Dword,
+        0x4433_2211,
+        BusAccessKind::DataWrite,
+    );
+
+    assert!(matches!(
+        write_fault,
+        Err(InternalFault::Exception {
+            vector: 14,
+            error_code: Some(2)
+        })
+    ));
+    assert_eq!(write_cpu.control.cr2, 0x9000);
+    assert_eq!(write_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff], 0x11);
+    assert_eq!(
+        paging_entry(&write_bus.memory, CROSS_PAGE_PTE8) & 0x60,
+        0x60
+    );
+    assert_eq!(paging_entry(&write_bus.memory, CROSS_PAGE_PTE9), 0);
+}
+
+#[test]
+fn paged_cross_page_second_page_enforces_user_and_wp_permissions() {
+    let mut user_cpu = cross_page_paging_cpu(true, false);
+    let mut user_bus = cross_page_paging_bus(0x5007, 0x7005);
+    user_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff] = 0xaa;
+    let user_fault = user_cpu.write_memory_sized(
+        &mut user_bus,
+        SegmentIndex::Ds,
+        CROSS_PAGE_LINEAR,
+        OperandSize::Dword,
+        0x4433_2211,
+        BusAccessKind::DataWrite,
+    );
+    assert!(matches!(
+        user_fault,
+        Err(InternalFault::Exception {
+            vector: 14,
+            error_code: Some(7)
+        })
+    ));
+    assert_eq!(user_cpu.control.cr2, 0x9000);
+    assert_eq!(user_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff], 0x11);
+    assert_eq!(paging_entry(&user_bus.memory, CROSS_PAGE_PTE8) & 0x60, 0x60);
+    assert_eq!(paging_entry(&user_bus.memory, CROSS_PAGE_PTE9) & 0x60, 0);
+
+    let mut wp_cpu = cross_page_paging_cpu(false, true);
+    let mut wp_bus = cross_page_paging_bus(0x5003, 0x7001);
+    let wp_fault = wp_cpu.write_memory_sized(
+        &mut wp_bus,
+        SegmentIndex::Ds,
+        CROSS_PAGE_LINEAR,
+        OperandSize::Dword,
+        0x8877_6655,
+        BusAccessKind::DataWrite,
+    );
+    assert!(matches!(
+        wp_fault,
+        Err(InternalFault::Exception {
+            vector: 14,
+            error_code: Some(3)
+        })
+    ));
+    assert_eq!(wp_cpu.control.cr2, 0x9000);
+    assert_eq!(wp_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff], 0x55);
+    assert_eq!(paging_entry(&wp_bus.memory, CROSS_PAGE_PTE9) & 0x60, 0);
+
+    let mut no_wp_cpu = cross_page_paging_cpu(false, false);
+    let mut no_wp_bus = cross_page_paging_bus(0x5003, 0x7001);
+    no_wp_cpu
+        .write_memory_sized(
+            &mut no_wp_bus,
+            SegmentIndex::Ds,
+            CROSS_PAGE_LINEAR,
+            OperandSize::Dword,
+            0xccbb_aa99,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+    assert_eq!(no_wp_bus.memory[CROSS_PAGE_FIRST_FRAME + 0x0fff], 0x99);
+    assert_eq!(
+        &no_wp_bus.memory[CROSS_PAGE_SECOND_FRAME..CROSS_PAGE_SECOND_FRAME + 3],
+        &[0xaa, 0xbb, 0xcc]
+    );
+    assert_eq!(
+        paging_entry(&no_wp_bus.memory, CROSS_PAGE_PTE9) & 0x60,
+        0x60
+    );
 }
 
 #[test]

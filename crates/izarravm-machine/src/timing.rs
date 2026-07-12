@@ -318,17 +318,20 @@ impl Machine {
         // engine schedules the following byte or enters its result phase.
         self.advance_fdc_to(self.timeline.now_ticks());
 
-        // ATA PIO and PIIX4 bus-master transfers share the authoritative master
-        // timeline. A device-to-memory completion bypasses the CPU bus, so drop
-        // cached code immediately. This also covers host-driven timeline advances
-        // that occur outside the instruction run loop.
+        // ATA PIO and PIIX4 bus-master transfers share the authoritative master timeline. A
+        // device-to-memory completion bypasses the CPU bus, so report its PRD spans directly to
+        // the CPU. This also covers host-driven advances outside the instruction run loop.
         if let Some(disk) = self.ata.as_mut() {
             disk.advance_master_ticks(advance.master_ticks);
-            if self
-                .bmide
-                .advance_master_ticks(advance.master_ticks, &mut self.memory, disk)
-            {
-                self.cpu.note_device_memory_write();
+            if let Some(spans) = self.bmide.advance_master_ticks_with_writes(
+                advance.master_ticks,
+                &mut self.memory,
+                disk,
+            ) {
+                for span in spans {
+                    self.cpu
+                        .note_device_memory_write_range(span.address, span.len);
+                }
             }
         }
         self.ide.advance_master_ticks(advance.master_ticks);
@@ -396,7 +399,7 @@ impl Machine {
 
     fn advance_fdc_to(&mut self, target_ticks: u64) {
         const FDC_DMA_CHANNEL: usize = 2;
-        let mut wrote_memory = false;
+        let mut write_ranges: Vec<(u32, u32)> = Vec::new();
         while let Some(request) = self.fdc.advance_to(target_ticks) {
             if request.offset == 0 && request.sector == request.transfer.sector {
                 self.floppy_accesses = self.floppy_accesses.saturating_add(1);
@@ -416,12 +419,22 @@ impl Machine {
                     .and_then(|sector| sector.get(usize::from(request.offset)))
                     .copied();
                 byte.is_some_and(|byte| {
-                    let wrote = self
-                        .dma
-                        .write_byte(FDC_DMA_CHANNEL, &mut self.memory, byte)
-                        .is_some();
-                    wrote_memory |= wrote;
-                    wrote
+                    let Some(address) =
+                        self.dma.write_byte(FDC_DMA_CHANNEL, &mut self.memory, byte)
+                    else {
+                        return false;
+                    };
+                    match write_ranges.last_mut() {
+                        Some((start, width)) if start.checked_add(*width) == Some(address) => {
+                            *width += 1;
+                        }
+                        Some((start, width)) if address.checked_add(1) == Some(*start) => {
+                            *start = address;
+                            *width += 1;
+                        }
+                        _ => write_ranges.push((address, 1)),
+                    }
+                    true
                 })
             } else {
                 self.dma
@@ -444,8 +457,8 @@ impl Machine {
                 terminal_count,
             });
         }
-        if wrote_memory {
-            self.cpu.note_device_memory_write();
+        for (address, width) in write_ranges {
+            self.cpu.note_device_memory_write_range(address, width);
         }
     }
 

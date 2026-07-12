@@ -3,6 +3,30 @@
 
 use super::*;
 
+fn catch_up_mid_frame(vga: &mut Vga) {
+    vga.advance(vga.frame_dots());
+    let line_dots = vga.frame_dots() / u64::from(vga.crtc.vtotal);
+    vga.advance(line_dots * 100);
+    vga.read_status1();
+    assert_eq!(vga.last_line, 100);
+}
+
+fn finish_current_frame(vga: &mut Vga) {
+    vga.advance(vga.frame_dots() - vga.beam_dots());
+}
+
+fn direct_mode_x(plane: u8) -> Vga {
+    let mut vga = Vga::default();
+    vga.set_mode13h_with_clear(true);
+    vga.write_port(0x3C4, 0x04);
+    vga.write_port(0x3C5, 0x06);
+    vga.write_port(0x3C4, 0x02);
+    vga.write_port(0x3C5, 1 << plane);
+    assert_eq!(vga.active_mode(), VideoMode::ModeX);
+    assert_eq!(vga.mode_x_direct_write_plane(), Some(usize::from(plane)));
+    vga
+}
+
 #[test]
 fn mode_set_resets_beam_and_reports_planar_geometry() {
     let mut vga = Vga::default();
@@ -72,6 +96,153 @@ fn mode13h_chain4_write_routes_byte_n_to_plane_n_mod_4() {
 }
 
 #[test]
+fn mode13h_argb_cache_converts_only_the_dirty_direct_page() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    video.advance(video.frame_dots());
+    let (initial, width, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("canonical Mode 13h frame is cacheable");
+    assert_eq!(video.mode13h_last_converted_pixels(), initial.len());
+
+    let offset = 0x1000;
+    video.note_mode13h_direct_write(offset, 1);
+    video.mode13_linear[offset] = 0x2A;
+    video.finish_mode13h_direct_batch();
+    video.advance(video.frame_dots());
+    let (updated, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("updated canonical frame stays cacheable");
+
+    assert_eq!(
+        video.mode13h_last_converted_pixels(),
+        0x1000 * 2,
+        "one 4 KiB source page updates its two double-scanned rows"
+    );
+    assert_eq!(updated[0], initial[0], "untouched page remains cached");
+    let source_row = offset / width;
+    let x = offset % width;
+    assert_eq!(
+        updated[(source_row * 2) * width + x],
+        video.palette_argb()[0x2A]
+    );
+    assert_eq!(
+        updated[(source_row * 2 + 1) * width + x],
+        video.palette_argb()[0x2A]
+    );
+}
+
+#[test]
+fn mode13h_argb_cache_settles_a_direct_write_after_catch_up() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    video.advance(video.frame_dots());
+    let (initial, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("initial frame is cacheable");
+
+    let line_dots = video.frame_dots() / u64::from(video.crtc.vtotal);
+    video.advance(line_dots * 100);
+    video.read_status1();
+    assert_eq!(video.last_line, 100);
+    video.note_mode13h_direct_write(0, 1);
+    video.mode13_linear[0] = 0x2A;
+    video.finish_mode13h_direct_batch();
+
+    video.advance(video.frame_dots() - video.beam_dots());
+    let (split, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("split frame remains cacheable");
+    assert_eq!(split[0], initial[0], "past scanline keeps its old pixel");
+
+    video.advance(video.frame_dots());
+    let (settled, _, _, _) = video
+        .cached_mode13h_presented_argb()
+        .expect("settled frame remains cacheable");
+    assert_eq!(settled[0], video.palette_argb()[0x2A]);
+    assert_eq!(
+        video.mode13h_last_converted_pixels(),
+        0x1000 * 2,
+        "the retained dirty page updates once more on the settled frame"
+    );
+}
+
+#[test]
+fn completed_raster_generation_moves_through_split_and_settled_chain4_frames() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    catch_up_mid_frame(&mut video);
+    let initial_generation = video.last_presented().unwrap().generation;
+
+    video.cpu_write_chain4(0, 0x2A);
+    assert_eq!(video.graphics_settle_frames, 2);
+    assert_eq!(
+        video.last_presented().unwrap().generation,
+        initial_generation,
+        "a live write must not relabel the completed raster"
+    );
+
+    finish_current_frame(&mut video);
+    let split_generation = video.last_presented().unwrap().generation;
+    assert_eq!(split_generation, video.content_gen());
+    assert_ne!(split_generation, initial_generation);
+    assert_eq!(video.graphics_settle_frames, 1);
+
+    video.advance(video.frame_dots());
+    let settled_generation = video.last_presented().unwrap().generation;
+    assert_ne!(settled_generation, split_generation);
+    assert_eq!(video.graphics_settle_frames, 0);
+
+    video.advance(video.frame_dots());
+    assert_eq!(
+        video.last_presented().unwrap().generation,
+        settled_generation,
+        "an unchanged completed raster keeps its generation"
+    );
+}
+
+#[test]
+fn planar_and_cga_mid_frame_writes_arm_two_completed_rasters() {
+    let mut planar = Vga::default();
+    assert!(planar.set_mode(0x0D));
+    catch_up_mid_frame(&mut planar);
+    planar.cpu_write(0, 0x5A);
+    assert_eq!(planar.graphics_settle_frames, 2);
+    finish_current_frame(&mut planar);
+    assert_eq!(planar.graphics_settle_frames, 1);
+    planar.advance(planar.frame_dots());
+    assert_eq!(planar.graphics_settle_frames, 0);
+
+    let mut cga = Vga::default();
+    assert!(cga.set_cga_mode(0x04));
+    catch_up_mid_frame(&mut cga);
+    cga.cga_write(0, 0x6C);
+    assert_eq!(cga.graphics_settle_frames, 2);
+    finish_current_frame(&mut cga);
+    assert_eq!(cga.graphics_settle_frames, 1);
+    cga.advance(cga.frame_dots());
+    assert_eq!(cga.graphics_settle_frames, 0);
+}
+
+#[test]
+fn normal_write_preserves_settle_armed_by_a_direct_mode13_write() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    catch_up_mid_frame(&mut video);
+
+    video.note_mode13h_direct_write(0, 1);
+    video.mode13_linear[0] = 0x11;
+    video.finish_mode13h_direct_batch();
+    assert_eq!(video.graphics_settle_frames, 2);
+
+    video.cpu_write_chain4(1, 0x22);
+    assert_eq!(
+        video.graphics_settle_frames, 2,
+        "the ordinary mutator must not cancel the direct-write settle"
+    );
+}
+
+#[test]
 fn mode13h_linear_scanout_is_limited_to_the_stock_layout() {
     let mut video = Vga::default();
     video.set_mode13h_with_clear(true);
@@ -102,6 +273,69 @@ fn mode13h_noncanonical_scanout_reads_authoritative_planar_vram() {
     video.attr.pixel_pan = 1;
 
     assert_eq!(video.render_256color_row(0)[0], 0x22);
+}
+
+#[test]
+fn hle_pixel_pan_materializes_direct_mode13_pixels_before_disabling_the_mapping() {
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    assert_eq!(video.direct_write_token(), 1);
+    assert!(video.mode13h_direct_page_ptr(0).is_some());
+    video.note_mode13h_direct_write(0, 4);
+    video.mode13_linear[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    assert!(video.mode13_linear_authoritative);
+    assert_eq!(video.vram[0], 0);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0);
+
+    video.set_attr_register(0x00, 0x07);
+    assert!(video.mode13_linear_authoritative);
+    video.set_attr_register(0x13, 0);
+    assert!(video.mode13_linear_authoritative);
+
+    video.set_attr_register(0x13, 1);
+
+    assert_eq!(video.direct_write_token(), 0);
+    assert!(!video.mode13_linear_authoritative);
+    assert_eq!(video.vram[0], 0x11);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0x22);
+    assert_eq!(video.vram[2 * VGA_PLANE_SIZE], 0x33);
+    assert_eq!(video.vram[3 * VGA_PLANE_SIZE], 0x44);
+    assert_eq!(&video.render_256color_row(0)[..3], &[0x22, 0x33, 0x44]);
+}
+
+#[test]
+fn hle_char_height_materializes_direct_mode13_pixels_only_when_it_changes() {
+    let mut unchanged = Vga::default();
+    unchanged.set_mode13h_with_clear(true);
+    unchanged.note_mode13h_direct_write(0, 1);
+    unchanged.mode13_linear[0] = 0x5a;
+    assert!(unchanged.mode13_linear_authoritative);
+    unchanged.set_char_height(unchanged.char_height());
+    assert_eq!(unchanged.direct_write_token(), 1);
+    assert!(unchanged.mode13_linear_authoritative);
+
+    let mut video = Vga::default();
+    video.set_mode13h_with_clear(true);
+    assert!(video.mode13h_direct_page_ptr(0).is_some());
+    video.note_mode13h_direct_write(0, 4);
+    video.mode13_linear[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+    assert!(video.mode13_linear_authoritative);
+    assert_eq!(video.vram[0], 0);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0);
+
+    video.set_char_height(8);
+
+    assert_eq!(video.direct_write_token(), 0);
+    assert!(!video.mode13_linear_authoritative);
+    assert_eq!(video.char_height(), 8);
+    assert_eq!(video.vram[0], 0x11);
+    assert_eq!(video.vram[VGA_PLANE_SIZE], 0x22);
+    assert_eq!(video.vram[2 * VGA_PLANE_SIZE], 0x33);
+    assert_eq!(video.vram[3 * VGA_PLANE_SIZE], 0x44);
+    assert_eq!(
+        &video.render_256color_row(0)[..4],
+        &[0x11, 0x22, 0x33, 0x44]
+    );
 }
 
 #[test]
@@ -892,6 +1126,75 @@ fn clearing_chain4_in_mode13h_enters_and_leaves_mode_x() {
     vga.write_port(0x3C4, 0x04);
     vga.write_port(0x3C5, 0x0E);
     assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+}
+
+#[test]
+fn mode_x_direct_write_page_tracks_the_selected_plane() {
+    let mut vga = direct_mode_x(0);
+    let plane0 = vga.vram.as_mut_ptr();
+    assert_eq!(vga.direct_write_token(), 2);
+    assert_eq!(
+        vga.direct_write_page_ptr(0x1000),
+        Some(plane0.wrapping_add(0x1000))
+    );
+
+    vga.write_port(0x3C4, 0x02);
+    vga.write_port(0x3C5, 0x04);
+    assert_eq!(vga.direct_write_token(), 4);
+    assert_eq!(
+        vga.direct_write_page_ptr(0x1000),
+        Some(plane0.wrapping_add(2 * VGA_PLANE_SIZE + 0x1000))
+    );
+}
+
+#[test]
+fn mode_x_direct_write_requires_the_transparent_planar_datapath() {
+    let cases: &[(&str, u16, u8, u8)] = &[
+        ("chain-4 disabled", 0x3C4, 0x04, 0x0E),
+        ("sequential addressing", 0x3C4, 0x04, 0x02),
+        ("one map-mask plane", 0x3C4, 0x02, 0x03),
+        ("write mode zero", 0x3CE, 0x05, 0x01),
+        ("rotate zero", 0x3CE, 0x03, 0x01),
+        ("logical replace", 0x3CE, 0x03, 0x08),
+        ("set/reset disabled", 0x3CE, 0x01, 0x01),
+        ("full bit mask", 0x3CE, 0x08, 0xFE),
+        ("A000 aperture", 0x3CE, 0x06, 0x09),
+        ("graphics aperture", 0x3CE, 0x06, 0x04),
+    ];
+    for &(name, index_port, index, value) in cases {
+        let mut vga = direct_mode_x(0);
+        vga.write_port(index_port, index);
+        vga.write_port(index_port + 1, value);
+        assert_eq!(vga.mode_x_direct_write_plane(), None, "{name}");
+    }
+
+    let mut no_plane = direct_mode_x(0);
+    no_plane.write_port(0x3C4, 0x02);
+    no_plane.write_port(0x3C5, 0x00);
+    assert_eq!(no_plane.mode_x_direct_write_plane(), None);
+
+    let mut subsystem_off = direct_mode_x(0);
+    subsystem_off.write_port(0x3C3, 0x00);
+    assert_eq!(subsystem_off.mode_x_direct_write_plane(), None);
+
+    let mut memory_off = direct_mode_x(0);
+    memory_off.write_port(0x3C2, memory_off.misc_output & !0x02);
+    assert_eq!(memory_off.mode_x_direct_write_plane(), None);
+}
+
+#[test]
+fn mode_x_direct_write_batch_invalidates_linear_cache_and_bumps_once() {
+    let mut vga = direct_mode_x(3);
+    let before = vga.content_gen();
+    assert!(vga.mode13_linear_valid);
+
+    vga.note_direct_write_pages(0b11);
+    assert!(!vga.mode13_linear_valid);
+    assert_eq!(vga.content_gen(), before);
+    vga.finish_direct_write_batch();
+    assert_eq!(vga.content_gen(), before + 1);
+    vga.finish_direct_write_batch();
+    assert_eq!(vga.content_gen(), before + 1);
 }
 
 #[test]

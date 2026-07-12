@@ -22,6 +22,23 @@ fn drive_straight_line_runs(cpu: &mut CpuGsw, bus: &mut TestBus) -> usize {
 }
 
 #[test]
+fn budgeted_run_matches_the_compatibility_wrapper() {
+    let (mut budgeted_cpu, memory) = real_mode_cpu(&[0x90, 0xf4], 32);
+    let mut legacy_cpu = budgeted_cpu.clone();
+    let mut budgeted_bus = TestBus::with_memory(memory.clone());
+    let mut legacy_bus = TestBus::with_memory(memory);
+
+    for cap in [1, u64::MAX] {
+        let budgeted = budgeted_cpu.run_budgeted(&mut budgeted_bus, cap).unwrap();
+        let legacy = legacy_cpu.run_straight_line(&mut legacy_bus, cap).unwrap();
+        assert_eq!(budgeted.consumed_core_clocks, legacy.core_clocks);
+        assert_eq!(budgeted.halted, legacy.halted);
+    }
+    assert_eq!(budgeted_cpu, legacy_cpu);
+    assert_eq!(budgeted_bus.memory, legacy_bus.memory);
+}
+
+#[test]
 fn straight_line_hot_loop_matches_per_instruction_result() {
     // MOV CX,5 ; loop: INC AX ; INC AX ; LOOP loop ; HLT. Once the loop body is cached, the
     // relative LOOP can run as a continuation too, so one hot run can chain several iterations.
@@ -528,16 +545,26 @@ fn straight_line_run_stops_at_a_page_crossing_instruction() {
         cpu.load_segment_real(SegmentIndex::Ss, 0);
         let mut bus = TestBus::with_memory(memory);
 
-        // Warm all instructions (INC 0xFFD, INC 0xFFE, MOV 0xFFF, HLT 0x1001) into the cache.
+        // Warm the page-local instructions. The crossing MOV must remain uncached because its
+        // second linear page could map to a noncontiguous physical page under paging.
         cpu.registers.eip = 0xffd;
         drive_straight_line_runs(&mut cpu, &mut bus);
         assert!(
-            cpu.decode_cache.get(0xfff, false).is_some(),
-            "the page-crossing MOV must be cached, so only the page check can stop the run"
+            cpu.decode_cache.get(0xfff, false).is_none(),
+            "the page-crossing MOV must not enter the decode cache"
         );
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        {
+            assert!(cpu.decode_cache.native_code_watch.is_watched(0x0fff));
+            assert!(cpu.decode_cache.native_code_watch.is_watched(0x1000));
+        }
 
-        // Run once from 0xFFD: INC (0xFFD, first) + INC (0xFFE, continuation) run, then the cached
-        // MOV at 0xFFF is REJECTED by the page check (0xFFF + 2 > 0x1000) and the run STOPS there.
+        // Run once from 0xFFD: INC (0xFFD, first) + INC (0xFFE, continuation) run, then the MOV
+        // misses because it is page-straddling and the run stops there.
         cpu.registers.eip = 0xffd;
         cpu.registers.set_eax(0);
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
@@ -566,6 +593,15 @@ fn straight_line_run_stops_at_a_page_crossing_instruction() {
             cpu.registers.eip, 0x1001,
             "eip advanced past the crossing MOV"
         );
+        assert!(cpu.decode_cache.get(0xfff, false).is_none());
+
+        bus.memory[0x1000] = 9;
+        cpu.registers.eip = 0xfff;
+        cpu.registers.set_eax(0);
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 9);
+        assert!(cpu.decode_cache.get(0xfff, false).is_none());
     }
 }
 

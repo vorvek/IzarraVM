@@ -74,6 +74,8 @@ fn high_watermark_drops_latency_and_marks_a_fade_boundary() {
         gain: RAMP_FRAMES,
         underruns: 0,
         prefill_remaining: TARGET_FRAMES,
+        debug_frames_consumed: 0,
+        debug_underruns_after_prefill: 0,
     };
     for step in (0..RAMP_FRAMES).rev() {
         assert_eq!(
@@ -187,12 +189,14 @@ fn debug_snapshot_records_producer_consumer_and_callback_pressure() {
     };
 
     sink.queue(&[(1, -1), (2, -2)]);
+    let queue_depth_before = ring.len();
     let mut source = CallbackSource::with_debug(Arc::clone(&ring), Some(Arc::clone(&debug)));
     source.prefill_remaining = 0;
     while !ring.is_empty() {
         source.next();
     }
     source.next();
+    source.flush_debug_callback(Some(queue_depth_before));
 
     let oversized = vec![(3, -3); CAPACITY_FRAMES * 2];
     sink.queue(&oversized);
@@ -209,4 +213,31 @@ fn debug_snapshot_records_producer_consumer_and_callback_pressure() {
     assert_eq!(snapshot.late_callbacks, 1);
     assert_eq!(snapshot.callback_lateness_us, 2_500);
     assert_eq!(snapshot.max_callback_lateness_us, 2_500);
+    assert_eq!(sink.debug_snapshot(), Some(snapshot));
+}
+
+#[test]
+fn callback_debug_counts_flush_once_at_the_callback_boundary() {
+    let ring = Arc::new(ArrayQueue::new(CAPACITY_FRAMES));
+    ring.push(QueuedFrame::Audio((1, -1))).unwrap();
+    ring.push(QueuedFrame::Audio((2, -2))).unwrap();
+    let debug = Arc::new(AudioDebugCounters::new(ring.len()));
+    let mut source = CallbackSource::with_debug(Arc::clone(&ring), Some(Arc::clone(&debug)));
+
+    source.next();
+    source.next();
+    assert_eq!(debug.snapshot().frames_consumed, 0);
+
+    source.flush_debug_callback(Some(2));
+    assert_eq!(debug.snapshot().frames_consumed, 2);
+}
+
+#[test]
+fn sink_exposes_no_snapshot_when_diagnostics_are_disabled() {
+    let sink = AudioSink {
+        ring: Arc::new(ArrayQueue::new(CAPACITY_FRAMES)),
+        debug: None,
+    };
+
+    assert_eq!(sink.debug_snapshot(), None);
 }

@@ -31,6 +31,7 @@ use crate::{CpuGsw, DecodedInsn, InternalFault};
 pub(crate) struct Slot {
     pub insn: DecodedInsn,
     pub lin: u32,
+    pub physical: u32,
     /// How the emitted code handles this slot. The register-only kinds (mov/add/shr) are inlined
     /// natively against `gpr[]` plus a flag-helper call, skipping the interpreter's full decode
     /// dispatch; the Memory kind reuses the v1 per-slot step (the bus-bound memory operand
@@ -390,7 +391,7 @@ pub(crate) unsafe extern "C" fn region_inline_slot<B: CpuBus>(
     // I/O (the only thing that sets io_touched), and no admitted shape contains an INT (the only
     // thing that sets pending_soft_int), so requires_step_break is provably false here. The
     // charge_cached_fetch above touches the bus for an instruction-fetch, which never sets
-    // io_touched (it goes through charge_instruction_fetch_run, not read_io/write_io). The cap
+    // io_touched (it goes through the physical fetch-charge seam, not read_io/write_io). The cap
     // check stays: the fetch charge can add bus clocks that push over the threshold.
     let total = ctx.run_total_at_entry + ctx.scaled_prefix(ctx.raw_clocks);
     if total + (bus.in_batch_scaled_bus_clocks() - ctx.bus_at_run_start) >= ctx.cap {
@@ -485,30 +486,33 @@ pub(crate) unsafe extern "C" fn region_native_u8<B: CpuBus>(
 
     let result = cpu.charge_cached_fetch(bus, lin, len).and_then(|()| {
         if kind == SlotKind::MemLoadU8 {
-            let value =
-                match cpu.read_direct_byte_page_cached(bus, physical, BusAccessKind::DataRead)? {
-                    Some(value) => {
-                        cpu.perf.jit_native_load_hits += 1;
-                        value
-                    }
-                    None => {
-                        let read = bus.read_memory_direct(
-                            physical,
-                            BusWidth::Byte,
-                            BusAccessKind::DataRead,
-                        )?;
-                        cpu.record_data_read(BusAccessKind::DataRead, read.direct);
-                        read.value as u8
-                    }
-                };
+            let value = match cpu.read_direct_byte_page_cached_without_fast_map(
+                bus,
+                physical,
+                BusAccessKind::DataRead,
+            )? {
+                Some(value) => {
+                    cpu.perf.jit_native_load_hits += 1;
+                    value
+                }
+                None => {
+                    let read =
+                        bus.read_memory_direct(physical, BusWidth::Byte, BusAccessKind::DataRead)?;
+                    cpu.record_data_read(BusAccessKind::DataRead, read.direct);
+                    read.value as u8
+                }
+            };
             cpu.write_gpr8(reg, value);
             Ok(())
         } else {
             let value = cpu.read_gpr8(reg);
             cpu.record_write_page(physical);
-            if let Some(changed) =
-                cpu.write_direct_byte_page_cached(bus, physical, value, BusAccessKind::DataWrite)?
-            {
+            if let Some(changed) = cpu.write_direct_byte_page_cached_without_fast_map(
+                bus,
+                physical,
+                value,
+                BusAccessKind::DataWrite,
+            )? {
                 if changed {
                     cpu.note_code_write(physical, 1);
                 }
@@ -572,7 +576,7 @@ pub(crate) unsafe extern "C" fn region_native_group_guard<B: CpuBus>(
     };
     let mut fetch_clocks = 0u64;
     for slot in slots {
-        let Some(clocks) = bus.jit_cached_fetch_run_clocks(slot.lin, u32::from(slot.insn.len))
+        let Some(clocks) = bus.jit_cached_fetch_run_clocks(slot.physical, u32::from(slot.insn.len))
         else {
             return STOP;
         };

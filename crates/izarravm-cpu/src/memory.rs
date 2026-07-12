@@ -2,8 +2,196 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+use izarravm_bus::DirectPage;
 
 impl CpuGsw {
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn fast_map_permissions(&self, linear: u32) -> Option<jit::fast_map::PagePermissions> {
+        if !self.is_paging_enabled() {
+            return Some(jit::fast_map::PagePermissions::UNPAGED);
+        }
+        self.tlb
+            .lookup(linear >> 12)
+            .map(|entry| jit::fast_map::PagePermissions {
+                writable: entry.writable,
+                user: entry.user,
+            })
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline(always)]
+    fn fast_map_population_enabled(&self) -> bool {
+        self.mode().uses_approximate_timing() && !self.jit_regions.auto_admit()
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn populate_fast_map_active(
+        &mut self,
+        linear: u32,
+        physical: u32,
+        page: DirectPage,
+        write: bool,
+    ) -> bool {
+        let mapped = if write {
+            self.jit_fast_map.has_write_mapping(linear, physical)
+        } else {
+            self.jit_fast_map.has_read_mapping(linear, physical)
+        };
+        if mapped {
+            return true;
+        }
+        let Some(permissions) = self.fast_map_permissions(linear) else {
+            return false;
+        };
+        if write {
+            self.jit_fast_map
+                .populate_write(linear, physical, page, permissions)
+        } else {
+            self.jit_fast_map
+                .populate_read(linear, physical, page, permissions)
+        }
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn populate_fast_map(
+        &mut self,
+        linear: u32,
+        physical: u32,
+        page: DirectPage,
+        write: bool,
+    ) -> bool {
+        self.fast_map_population_enabled()
+            && self.populate_fast_map_active(linear, physical, page, write)
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline(always)]
+    fn populate_fast_map_from_cached(
+        &mut self,
+        linear: u32,
+        physical: u32,
+        entry: DirectPageCacheEntry,
+        write: bool,
+    ) {
+        if !self.fast_map_population_enabled() {
+            return;
+        }
+        if !self.populate_fast_map_active(
+            linear,
+            physical,
+            DirectPage {
+                physical_page: entry.physical_page,
+                ptr: entry.ptr,
+                len: 0x1000,
+                writable: write,
+            },
+            write,
+        ) {
+            return;
+        }
+        if write {
+            self.data_write_pages.note_fast_map_linear(physical, linear);
+        } else {
+            self.data_read_pages.note_fast_map_linear(physical, linear);
+        }
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn read_fast_map<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u32>> {
+        if !self.fast_map_population_enabled() {
+            return Ok(None);
+        }
+        let Some(access) = self.jit_fast_map.lookup_access(
+            linear,
+            width,
+            false,
+            self.current_privilege_level() == 3,
+            self.control.cr0 & CR0_WP != 0,
+        ) else {
+            return Ok(None);
+        };
+        bus.charge_direct_memory(access.physical(), width, kind)?;
+        self.record_data_read(kind, true);
+        self.perf.direct_data_pointer_reads += 1;
+        Ok(Some(access.read(width)))
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn write_fast_map<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<bool> {
+        if !self.fast_map_population_enabled() {
+            return Ok(false);
+        }
+        let Some(access) = self.jit_fast_map.lookup_access(
+            linear,
+            width,
+            true,
+            self.current_privilege_level() == 3,
+            self.control.cr0 & CR0_WP != 0,
+        ) else {
+            return Ok(false);
+        };
+        let physical = access.physical();
+        self.record_write_page(physical);
+        if access.read(width) != value {
+            self.note_code_write(physical, width.bytes());
+        }
+        bus.charge_direct_memory(physical, width, kind)?;
+        access.write(width, value);
+        self.record_data_write(kind, true);
+        self.perf.direct_data_pointer_writes += 1;
+        Ok(true)
+    }
+
     #[inline]
     pub(super) fn record_data_read(&mut self, kind: BusAccessKind, direct: bool) {
         if kind == BusAccessKind::DataRead {
@@ -73,6 +261,7 @@ impl CpuGsw {
     pub(super) fn read_direct_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        _linear: u32,
         physical: u32,
         width: BusWidth,
         kind: BusAccessKind,
@@ -81,6 +270,12 @@ impl CpuGsw {
             return Ok(None);
         }
         if let Some(entry) = self.data_read_pages.get(physical) {
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            self.populate_fast_map_from_cached(_linear, physical, entry, false);
             bus.charge_direct_memory(physical, width, kind)?;
             self.record_data_read(kind, true);
             self.perf.direct_data_pointer_reads += 1;
@@ -91,18 +286,27 @@ impl CpuGsw {
             return Ok(None);
         };
         let offset = (physical & 0x0fff) as usize;
-        if offset + width.bytes() as usize > page.len {
+        if page.len < 0x1000 || offset + width.bytes() as usize > page.len {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         }
         self.perf.direct_page_hits += 1;
         self.data_read_pages.insert(page);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.populate_fast_map(_linear, physical, page, false) {
+            self.data_read_pages.note_fast_map_linear(physical, _linear);
+        }
         bus.charge_direct_memory(physical, width, kind)?;
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
         Ok(Some(Self::read_direct_entry(
             DirectPageCacheEntry {
                 physical_page: page.physical_page,
+                fast_map_linear_page: _linear & !0x0fff,
                 ptr: page.ptr,
             },
             physical,
@@ -114,10 +318,40 @@ impl CpuGsw {
     pub(super) fn read_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        linear: u32,
+        physical: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u8>> {
+        self.read_direct_byte_page_cached_inner(bus, Some(linear), physical, kind)
+    }
+
+    #[inline]
+    pub(super) fn read_direct_byte_page_cached_without_fast_map<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<u8>> {
+        self.read_direct_byte_page_cached_inner(bus, None, physical, kind)
+    }
+
+    #[inline]
+    fn read_direct_byte_page_cached_inner<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        _linear: Option<u32>,
         physical: u32,
         kind: BusAccessKind,
     ) -> ExecResult<Option<u8>> {
         if let Some(entry) = self.data_read_pages.get(physical) {
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            if let Some(linear) = _linear {
+                self.populate_fast_map_from_cached(linear, physical, entry, false);
+            }
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             self.record_data_read(kind, true);
             self.perf.direct_data_pointer_reads += 1;
@@ -129,12 +363,22 @@ impl CpuGsw {
             return Ok(None);
         };
         let offset = (physical & 0x0fff) as usize;
-        if offset >= page.len {
+        if page.len < 0x1000 || offset >= page.len {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         }
         self.perf.direct_page_hits += 1;
         self.data_read_pages.insert(page);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(linear) = _linear {
+            if self.populate_fast_map(linear, physical, page, false) {
+                self.data_read_pages.note_fast_map_linear(physical, linear);
+            }
+        }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, true);
         self.perf.direct_data_pointer_reads += 1;
@@ -145,6 +389,7 @@ impl CpuGsw {
     pub(super) fn write_direct_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        _linear: u32,
         physical: u32,
         width: BusWidth,
         value: u32,
@@ -154,6 +399,12 @@ impl CpuGsw {
             return Ok(false);
         }
         if let Some(entry) = self.data_write_pages.get(physical) {
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            self.populate_fast_map_from_cached(_linear, physical, entry, true);
             bus.charge_direct_memory(physical, width, kind)?;
             Self::write_direct_entry(entry, physical, width, value);
             self.record_data_write(kind, true);
@@ -165,16 +416,26 @@ impl CpuGsw {
             return Ok(false);
         };
         let offset = (physical & 0x0fff) as usize;
-        if !page.writable || offset + width.bytes() as usize > page.len {
+        if !page.writable || page.len < 0x1000 || offset + width.bytes() as usize > page.len {
             self.perf.direct_page_misses += 1;
             return Ok(false);
         }
         self.perf.direct_page_hits += 1;
         self.data_write_pages.insert(page);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.populate_fast_map(_linear, physical, page, true) {
+            self.data_write_pages
+                .note_fast_map_linear(physical, _linear);
+        }
         bus.charge_direct_memory(physical, width, kind)?;
         Self::write_direct_entry(
             DirectPageCacheEntry {
                 physical_page: page.physical_page,
+                fast_map_linear_page: _linear & !0x0fff,
                 ptr: page.ptr,
             },
             physical,
@@ -191,11 +452,44 @@ impl CpuGsw {
     pub(super) fn write_direct_byte_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
+        linear: u32,
+        physical: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<bool>> {
+        self.write_direct_byte_page_cached_inner(bus, Some(linear), physical, value, kind)
+    }
+
+    /// `Some(changed)` means the direct write completed; `None` asks the caller to use the bus path.
+    #[inline]
+    pub(super) fn write_direct_byte_page_cached_without_fast_map<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<Option<bool>> {
+        self.write_direct_byte_page_cached_inner(bus, None, physical, value, kind)
+    }
+
+    #[inline]
+    fn write_direct_byte_page_cached_inner<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        _linear: Option<u32>,
         physical: u32,
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<Option<bool>> {
         if let Some(entry) = self.data_write_pages.get(physical) {
+            #[cfg(all(
+                feature = "jit",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            if let Some(linear) = _linear {
+                self.populate_fast_map_from_cached(linear, physical, entry, true);
+            }
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             let offset = (physical & 0x0fff) as usize;
             let changed = unsafe { *entry.ptr.add(offset) != value };
@@ -211,12 +505,22 @@ impl CpuGsw {
             return Ok(None);
         };
         let offset = (physical & 0x0fff) as usize;
-        if !page.writable || offset >= page.len {
+        if !page.writable || page.len < 0x1000 || offset >= page.len {
             self.perf.direct_page_misses += 1;
             return Ok(None);
         }
         self.perf.direct_page_hits += 1;
         self.data_write_pages.insert(page);
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(linear) = _linear {
+            if self.populate_fast_map(linear, physical, page, true) {
+                self.data_write_pages.note_fast_map_linear(physical, linear);
+            }
+        }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         let changed = unsafe { *page.ptr.add(offset) != value };
         unsafe {
@@ -314,12 +618,29 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
         let linear = self.segment_linear_byte(segment, offset, false)?;
+        self.read_linear_u8(bus, linear, kind)
+    }
+
+    fn read_linear_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<u8> {
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(value) = self.read_fast_map(bus, linear, BusWidth::Byte, kind)? {
+            return Ok(value as u8);
+        }
         let physical = if self.control.cr0 & CR0_PG == 0 {
             linear
         } else {
             self.translate_linear(bus, linear, false)?
         };
-        if let Some(value) = self.read_direct_byte_page_cached(bus, physical, kind)? {
+        if let Some(value) = self.read_direct_byte_page_cached(bus, linear, physical, kind)? {
             return Ok(value);
         }
         let read = bus.read_memory_direct(physical, BusWidth::Byte, kind)?;
@@ -336,13 +657,33 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         let linear = self.segment_linear_byte(segment, offset, true)?;
+        self.write_linear_u8(bus, linear, value, kind)
+    }
+
+    fn write_linear_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        value: u8,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.write_fast_map(bus, linear, BusWidth::Byte, u32::from(value), kind)? {
+            return Ok(());
+        }
         let physical = if self.control.cr0 & CR0_PG == 0 {
             self.record_write_page(linear);
             linear
         } else {
             self.translate_linear(bus, linear, true)?
         };
-        if let Some(changed) = self.write_direct_byte_page_cached(bus, physical, value, kind)? {
+        if let Some(changed) =
+            self.write_direct_byte_page_cached(bus, linear, physical, value, kind)?
+        {
             if changed {
                 self.note_code_write(physical, 1);
             }
@@ -391,7 +732,7 @@ impl CpuGsw {
     }
 
     #[inline]
-    fn segment_linear_byte(
+    pub(super) fn segment_linear_byte(
         &self,
         segment: SegmentIndex,
         offset: u32,
@@ -434,13 +775,7 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<u32> {
         self.check_alignment(offset, size.bytes())?;
-        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), false)?;
-        if let Some(value) = self.read_direct_page_cached(bus, physical, size.bus_width(), kind)? {
-            return Ok(value);
-        }
-        let read = bus.read_memory_direct(physical, size.bus_width(), kind)?;
-        self.record_data_read(kind, read.direct);
-        Ok(read.value)
+        self.read_memory_bus_width(bus, segment, offset, size.bus_width(), kind)
     }
 
     pub(super) fn write_memory_sized<B: CpuBus>(
@@ -453,11 +788,153 @@ impl CpuGsw {
         kind: BusAccessKind,
     ) -> ExecResult<()> {
         self.check_alignment(offset, size.bytes())?;
-        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), true)?;
-        if self.write_direct_page_cached(bus, physical, size.bus_width(), value, kind)? {
+        self.write_memory_bus_width(bus, segment, offset, size.bus_width(), value, kind)
+    }
+
+    pub(super) fn read_memory_bus_width<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<u32> {
+        if width == BusWidth::Byte {
+            return self
+                .read_memory_u8(bus, segment, offset, kind)
+                .map(u32::from);
+        }
+        let linear = self.segment_linear_range(segment, offset, width.bytes(), false)?;
+        if self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()) {
+            return self.read_paged_cross_page(bus, linear, width.bytes(), kind);
+        }
+        self.read_linear_fragment(bus, linear, width, kind)
+    }
+
+    pub(super) fn write_memory_bus_width<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        if width == BusWidth::Byte {
+            return self.write_memory_u8(bus, segment, offset, value as u8, kind);
+        }
+        let linear = self.segment_linear_range(segment, offset, width.bytes(), true)?;
+        if self.is_paging_enabled() && Self::linear_range_crosses_page(linear, width.bytes()) {
+            return self.write_paged_cross_page(bus, linear, width.bytes(), value, kind);
+        }
+        self.write_linear_fragment(bus, linear, width, value, kind)
+    }
+
+    #[inline]
+    fn linear_range_crosses_page(linear: u32, width: u32) -> bool {
+        (linear & 0x0fff) + width > 0x1000
+    }
+
+    fn read_paged_cross_page<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<u32> {
+        let mut value = 0u32;
+        let mut completed = 0u32;
+        while completed < width {
+            let at = linear.wrapping_add(completed);
+            let fragment = Self::page_local_fragment_width(at, width - completed);
+            value |= self.read_linear_fragment(bus, at, fragment, kind)? << (completed * 8);
+            completed += fragment.bytes();
+        }
+        Ok(value)
+    }
+
+    fn write_paged_cross_page<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: u32,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        let mut completed = 0u32;
+        while completed < width {
+            let at = linear.wrapping_add(completed);
+            let fragment = Self::page_local_fragment_width(at, width - completed);
+            self.write_linear_fragment(bus, at, fragment, value >> (completed * 8), kind)?;
+            completed += fragment.bytes();
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn page_local_fragment_width(linear: u32, remaining: u32) -> BusWidth {
+        let page_remaining = 0x1000 - (linear & 0x0fff);
+        if remaining >= 4 && page_remaining >= 4 && linear & 3 == 0 {
+            BusWidth::Dword
+        } else if remaining >= 2 && page_remaining >= 2 && linear & 1 == 0 {
+            BusWidth::Word
+        } else {
+            BusWidth::Byte
+        }
+    }
+
+    fn read_linear_fragment<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> ExecResult<u32> {
+        if width == BusWidth::Byte {
+            return self.read_linear_u8(bus, linear, kind).map(u32::from);
+        }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if let Some(value) = self.read_fast_map(bus, linear, width, kind)? {
+            return Ok(value);
+        }
+        let physical = self.translate_linear(bus, linear, false)?;
+        if let Some(value) = self.read_direct_page_cached(bus, linear, physical, width, kind)? {
+            return Ok(value);
+        }
+        let read = bus.read_memory_direct(physical, width, kind)?;
+        self.record_data_read(kind, read.direct);
+        Ok(read.value)
+    }
+
+    fn write_linear_fragment<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        linear: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> ExecResult<()> {
+        if width == BusWidth::Byte {
+            return self.write_linear_u8(bus, linear, value as u8, kind);
+        }
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.write_fast_map(bus, linear, width, value, kind)? {
             return Ok(());
         }
-        let write = bus.write_memory_direct(physical, size.bus_width(), value, kind)?;
+        let physical = self.translate_linear(bus, linear, true)?;
+        self.note_code_write(physical, width.bytes());
+        if self.write_direct_page_cached(bus, linear, physical, width, value, kind)? {
+            return Ok(());
+        }
+        let write = bus.write_memory_direct(physical, width, value, kind)?;
         self.record_data_write(kind, write.direct);
         Ok(())
     }
@@ -489,6 +966,21 @@ impl CpuGsw {
         offset: u32,
         width: u32,
         write: bool,
+    ) -> ExecResult<(u32, u32)> {
+        let linear = self.segment_linear_range(segment, offset, width, write)?;
+        let physical = self.translate_linear(bus, linear, write)?;
+        if write {
+            self.note_code_write(physical, width);
+        }
+        Ok((linear, physical))
+    }
+
+    fn segment_linear_range(
+        &self,
+        segment: SegmentIndex,
+        offset: u32,
+        width: u32,
+        write: bool,
     ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
         self.check_segment_access_kind(segment, descriptor.access, write)?;
@@ -515,18 +1007,7 @@ impl CpuGsw {
             }
             descriptor.base.wrapping_add(offset)
         };
-        let physical = if self.control.cr0 & CR0_PG == 0 {
-            if write {
-                self.record_write_page(linear);
-            }
-            linear
-        } else {
-            self.translate_linear(bus, linear, write)?
-        };
-        if write {
-            self.note_code_write(physical, width);
-        }
-        Ok(physical)
+        Ok(linear)
     }
 
     pub(super) fn translate_linear<B: CpuBus>(
@@ -586,6 +1067,24 @@ impl CpuGsw {
         // CR0.WP (a 486 addition) makes supervisor writes obey the page R/W bit too.
         // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
         let wp = self.control.cr0 & CR0_WP != 0;
+
+        // The large linear map is the shared translation cache for approximate-timing modes.
+        // Read entries are installed only after the page walker has set A; write entries only
+        // after it has also set D. It is invalidated with the TLB on every translation-affecting
+        // event, while the live permission check below handles a CPL change without a flush.
+        #[cfg(all(
+            feature = "jit",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        if self.mode().uses_approximate_timing()
+            && let Some(physical) = self.jit_fast_map.lookup_physical(linear, write, user, wp)
+        {
+            if write {
+                self.record_write_page(physical);
+            }
+            return Ok(physical);
+        }
 
         // TLB fast path: a cached entry skips the two page-table reads (and the
         // accessed-bit write the fill already did). The protection check is redone

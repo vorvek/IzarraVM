@@ -37,6 +37,482 @@ fn mov_r64_r64_known_bytes() {
 }
 
 #[test]
+fn direct_store_bookkeeping_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.or_r64_r64(Reg::RAX, Reg::RDX);
+    e.load_r32_sib_scale4(Reg::RDX, Reg::RDI, Reg::RCX);
+    e.cmp_r8_disp8(Reg::RDX, Reg::RDI, 0);
+    e.add_r64_to_mem_disp8(Reg::RSP, 0, Reg::RDX);
+    e.bt_r64_mem(Reg::RDX, Reg::RCX);
+    e.bts_r64_mem(Reg::RSP, Reg::RDX);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x48, 0x09, 0xD0, // or rax,rdx
+            0x8B, 0x14, 0x8F, // mov edx,[rdi+rcx*4]
+            0x3A, 0x57, 0x00, // cmp dl,[rdi]
+            0x48, 0x01, 0x54, 0x24, 0x00, // add qword [rsp],rdx
+            0x48, 0x0F, 0xA3, 0x0A, // bt qword [rdx],rcx
+            0x48, 0x0F, 0xAB, 0x14, 0x24, // bts qword [rsp],rdx
+        ]
+    );
+}
+
+#[test]
+fn word_register_and_memory_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.mov_r16_r16(Reg::R8, Reg::R9);
+    e.alu_r16_r16(7, Reg::R10, Reg::RBX);
+    e.movzx_r32_word_disp8(Reg::RDX, Reg::RDI, 0);
+    e.store_r16_disp8(Reg::RSP, 4, Reg::R11);
+    e.cmp_r16_disp8(Reg::R9, Reg::R12, -2);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0x45, 0x89, 0xC8, // mov r8w,r9w
+            0x66, 0x41, 0x39, 0xDA, // cmp r10w,bx
+            0x0F, 0xB7, 0x57, 0x00, // movzx edx,word [rdi]
+            0x66, 0x44, 0x89, 0x5C, 0x24, 0x04, // mov word [rsp+4],r11w
+            0x66, 0x45, 0x3B, 0x4C, 0x24, 0xFE, // cmp r9w,word [r12-2]
+        ]
+    );
+}
+
+#[test]
+fn scalar_sse_memory_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movsd_xmm_disp32(Xmm::XMM1, Reg::R12, 0x1122_3344);
+    e.movsd_disp32_xmm(Reg::R13, -4, Xmm::XMM9);
+    e.movss_xmm_disp32(Xmm::XMM10, Reg::RSP, 8);
+    e.movss_disp32_xmm(Reg::RDI, 0, Xmm::XMM3);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x41, 0x0F, 0x10, 0x8C, 0x24, 0x44, 0x33, 0x22, 0x11, 0xF2, 0x45, 0x0F, 0x11,
+            0x8D, 0xFC, 0xFF, 0xFF, 0xFF, 0xF3, 0x44, 0x0F, 0x10, 0x94, 0x24, 0x08, 0x00, 0x00,
+            0x00, 0xF3, 0x0F, 0x11, 0x9F, 0x00, 0x00, 0x00, 0x00,
+        ]
+    );
+}
+
+#[test]
+fn indexed_movsd_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movsd_xmm_sib_scale8_disp32(Xmm::XMM2, Reg::R15, Reg::R9, 0x20);
+    e.movsd_sib_scale8_disp32_xmm(Reg::R12, Reg::R10, -8, Xmm::XMM11);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x43, 0x0F, 0x10, 0x94, 0xCF, 0x20, 0x00, 0x00, 0x00, 0xF2, 0x47, 0x0F, 0x11,
+            0x9C, 0xD4, 0xF8, 0xFF, 0xFF, 0xFF,
+        ]
+    );
+}
+
+#[test]
+fn scalar_sse_arithmetic_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movsd_xmm_xmm(Xmm::XMM1, Xmm::XMM2);
+    e.cvtss2sd(Xmm::XMM1, Xmm::XMM2);
+    e.cvtsd2ss(Xmm::XMM9, Xmm::XMM10);
+    e.addsd(Xmm::XMM0, Xmm::XMM1);
+    e.mulsd(Xmm::XMM2, Xmm::XMM3);
+    e.subsd(Xmm::XMM8, Xmm::XMM9);
+    e.divsd(Xmm::XMM10, Xmm::XMM11);
+    e.sqrtsd(Xmm::XMM12, Xmm::XMM13);
+    e.ucomisd(Xmm::XMM14, Xmm::XMM15);
+    e.xorpd(Xmm::XMM1, Xmm::XMM2);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x0F, 0x10, 0xCA, 0xF3, 0x0F, 0x5A, 0xCA, 0xF2, 0x45, 0x0F, 0x5A, 0xCA, 0xF2,
+            0x0F, 0x58, 0xC1, 0xF2, 0x0F, 0x59, 0xD3, 0xF2, 0x45, 0x0F, 0x5C, 0xC1, 0xF2, 0x45,
+            0x0F, 0x5E, 0xD3, 0xF2, 0x45, 0x0F, 0x51, 0xE5, 0x66, 0x45, 0x0F, 0x2E, 0xF7, 0x66,
+            0x0F, 0x57, 0xCA,
+        ]
+    );
+}
+
+#[test]
+fn avx2_packed_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.vmovupd_ymm_disp32(Ymm::YMM9, Reg::RAX, 0x1122_3344);
+    e.vmovupd_disp32_ymm(Reg::R13, -0x1122_3344, Ymm::YMM9);
+    e.vpermpd(Ymm::YMM9, Ymm::YMM10, 0x1b);
+    e.vblendpd(Ymm::YMM9, Ymm::YMM10, Ymm::YMM11, 0x0a);
+    e.vbroadcastsd(Ymm::YMM9, Xmm::XMM10);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xC5, 0x7D, 0x10, 0x88, 0x44, 0x33, 0x22, 0x11, // vmovupd ymm9,[rax+disp32]
+            0xC4, 0x41, 0x7D, 0x11, 0x8D, 0xBC, 0xCC, 0xDD, 0xEE, // vmovupd [r13+disp32],ymm9
+            0xC4, 0x43, 0xFD, 0x01, 0xCA, 0x1B, // vpermpd ymm9,ymm10,1Bh
+            0xC4, 0x43, 0x2D, 0x0D, 0xCB, 0x0A, // vblendpd ymm9,ymm10,ymm11,0Ah
+            0xC4, 0x42, 0x7D, 0x19, 0xCA, // vbroadcastsd ymm9,xmm10
+        ]
+    );
+}
+
+#[test]
+fn avx_xmm_unaligned_memory_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.vmovupd_xmm_disp32(Xmm::XMM2, Reg::RSP, 0x1122_3344);
+    e.vmovupd_disp32_xmm(Reg::RSP, -4, Xmm::XMM10);
+    e.vmovupd_xmm_disp32(Xmm::XMM9, Reg::R12, 8);
+    e.vmovupd_disp32_xmm(Reg::R12, 0, Xmm::XMM3);
+    e.vmovupd_xmm_disp32(Xmm::XMM1, Reg::R13, 0x1122_3344);
+    e.vmovupd_disp32_xmm(Reg::R13, -0x1122_3344, Xmm::XMM11);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xC5, 0xF9, 0x10, 0x94, 0x24, 0x44, 0x33, 0x22, 0x11, // vmovupd xmm2,[rsp+disp32]
+            0xC5, 0x79, 0x11, 0x94, 0x24, 0xFC, 0xFF, 0xFF,
+            0xFF, // vmovupd [rsp+disp32],xmm10
+            0xC4, 0x41, 0x79, 0x10, 0x8C, 0x24, 0x08, 0x00, 0x00,
+            0x00, // vmovupd xmm9,[r12+disp32]
+            0xC4, 0xC1, 0x79, 0x11, 0x9C, 0x24, 0x00, 0x00, 0x00,
+            0x00, // vmovupd [r12+disp32],xmm3
+            0xC4, 0xC1, 0x79, 0x10, 0x8D, 0x44, 0x33, 0x22, 0x11, // vmovupd xmm1,[r13+disp32]
+            0xC4, 0x41, 0x79, 0x11, 0x9D, 0xBC, 0xCC, 0xDD,
+            0xEE, // vmovupd [r13+disp32],xmm11
+        ]
+    );
+}
+
+#[test]
+fn avx_scalar_arithmetic_and_move_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.vaddsd(Xmm::XMM1, Xmm::XMM2, Xmm::XMM3);
+    e.vmulsd(Xmm::XMM9, Xmm::XMM10, Xmm::XMM11);
+    e.vsubsd(Xmm::XMM1, Xmm::XMM2, Xmm::XMM3);
+    e.vdivsd(Xmm::XMM9, Xmm::XMM10, Xmm::XMM11);
+    e.vucomisd(Xmm::XMM1, Xmm::XMM2);
+    e.vucomisd(Xmm::XMM9, Xmm::XMM10);
+    e.vmovsd_xmm_xmm(Xmm::XMM1, Xmm::XMM2, Xmm::XMM3);
+    e.vmovsd_xmm_disp32(Xmm::XMM9, Reg::RAX, 0x1122_3344);
+    e.vmovsd_disp32_xmm(Reg::R13, -0x1122_3344, Xmm::XMM9);
+    e.vmovss_xmm_xmm(Xmm::XMM9, Xmm::XMM10, Xmm::XMM11);
+    e.vmovss_xmm_disp32(Xmm::XMM1, Reg::R12, 0x1122_3344);
+    e.vmovss_disp32_xmm(Reg::RBX, -0x1122_3344, Xmm::XMM1);
+    e.vroundsd(Xmm::XMM9, Xmm::XMM10, Xmm::XMM11, 3);
+    e.vxorpd(Xmm::XMM1, Xmm::XMM2, Xmm::XMM3);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xC5, 0xEB, 0x58, 0xCB, // vaddsd xmm1,xmm2,xmm3
+            0xC4, 0x41, 0x2B, 0x59, 0xCB, // vmulsd xmm9,xmm10,xmm11
+            0xC5, 0xEB, 0x5C, 0xCB, // vsubsd xmm1,xmm2,xmm3
+            0xC4, 0x41, 0x2B, 0x5E, 0xCB, // vdivsd xmm9,xmm10,xmm11
+            0xC5, 0xF9, 0x2E, 0xCA, // vucomisd xmm1,xmm2
+            0xC4, 0x41, 0x79, 0x2E, 0xCA, // vucomisd xmm9,xmm10
+            0xC5, 0xEB, 0x10, 0xCB, // vmovsd xmm1,xmm2,xmm3
+            0xC5, 0x7B, 0x10, 0x88, 0x44, 0x33, 0x22, 0x11, // vmovsd xmm9,[rax+disp32]
+            0xC4, 0x41, 0x7B, 0x11, 0x8D, 0xBC, 0xCC, 0xDD, 0xEE, // vmovsd [r13+disp32],xmm9
+            0xC4, 0x41, 0x2A, 0x10, 0xCB, // vmovss xmm9,xmm10,xmm11
+            0xC4, 0xC1, 0x7A, 0x10, 0x8C, 0x24, 0x44, 0x33, 0x22,
+            0x11, // vmovss xmm1,[r12+disp32]
+            0xC5, 0xFA, 0x11, 0x8B, 0xBC, 0xCC, 0xDD, 0xEE, // vmovss [rbx+disp32],xmm1
+            0xC4, 0x43, 0x29, 0x0B, 0xCB, 0x03, // vroundsd xmm9,xmm10,xmm11,3
+            0xC5, 0xE9, 0x57, 0xCB, // vxorpd xmm1,xmm2,xmm3
+        ]
+    );
+}
+
+#[test]
+fn avx_conversion_and_utility_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.vcvtss2sd(Xmm::XMM1, Xmm::XMM2, Xmm::XMM3);
+    e.vcvtss2sd_disp32(Xmm::XMM9, Xmm::XMM10, Reg::R13, -0x1122_3344);
+    e.vcvtsd2ss(Xmm::XMM9, Xmm::XMM10, Xmm::XMM11);
+    e.vcvtsd2ss_disp32(Xmm::XMM1, Xmm::XMM2, Reg::R12, 0x1122_3344);
+    e.vcvtsi2sd_r32(Xmm::XMM1, Xmm::XMM2, Reg::RAX);
+    e.vcvtsi2sd_r64(Xmm::XMM9, Xmm::XMM10, Reg::R11);
+    e.vcvtsi2sd_i32_disp32(Xmm::XMM9, Xmm::XMM10, Reg::R13, -0x1122_3344);
+    e.vcvttsd2si_r32(Reg::R9, Xmm::XMM10);
+    e.vcvttsd2si_r64(Reg::RAX, Xmm::XMM1);
+    e.vmovq_xmm_r64(Xmm::XMM1, Reg::RAX);
+    e.vmovq_xmm_r64(Xmm::XMM9, Reg::R10);
+    e.vmovq_r64_xmm(Reg::RAX, Xmm::XMM1);
+    e.vmovq_r64_xmm(Reg::R10, Xmm::XMM9);
+    e.vzeroupper();
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xC5, 0xEA, 0x5A, 0xCB, // vcvtss2sd xmm1,xmm2,xmm3
+            0xC4, 0x41, 0x2A, 0x5A, 0x8D, 0xBC, 0xCC, 0xDD,
+            0xEE, // vcvtss2sd xmm9,xmm10,[r13+disp32]
+            0xC4, 0x41, 0x2B, 0x5A, 0xCB, // vcvtsd2ss xmm9,xmm10,xmm11
+            0xC4, 0xC1, 0x6B, 0x5A, 0x8C, 0x24, 0x44, 0x33, 0x22,
+            0x11, // vcvtsd2ss xmm1,xmm2,[r12+disp32]
+            0xC5, 0xEB, 0x2A, 0xC8, // vcvtsi2sd xmm1,xmm2,eax
+            0xC4, 0x41, 0xAB, 0x2A, 0xCB, // vcvtsi2sd xmm9,xmm10,r11
+            0xC4, 0x41, 0x2B, 0x2A, 0x8D, 0xBC, 0xCC, 0xDD,
+            0xEE, // vcvtsi2sd xmm9,xmm10,[r13+disp32]
+            0xC4, 0x41, 0x7B, 0x2C, 0xCA, // vcvttsd2si r9d,xmm10
+            0xC4, 0xE1, 0xFB, 0x2C, 0xC1, // vcvttsd2si rax,xmm1
+            0xC4, 0xE1, 0xF9, 0x6E, 0xC8, // vmovq xmm1,rax
+            0xC4, 0x41, 0xF9, 0x6E, 0xCA, // vmovq xmm9,r10
+            0xC4, 0xE1, 0xF9, 0x7E, 0xC8, // vmovq rax,xmm1
+            0xC4, 0x41, 0xF9, 0x7E, 0xCA, // vmovq r10,xmm9
+            0xC5, 0xF8, 0x77, // vzeroupper
+        ]
+    );
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn avx2_packed_permute_blend_and_broadcast_execute() {
+    if !std::is_x86_feature_detected!("avx2") {
+        return;
+    }
+
+    use super::super::exec_mem::ExecutableBuffer;
+    let mut e = Encoder::new();
+    #[cfg(windows)]
+    let base = Reg::RCX;
+    #[cfg(not(windows))]
+    let base = Reg::RDI;
+    e.vmovupd_ymm_disp32(Ymm::YMM0, base, 0);
+    e.vpermpd(Ymm::YMM1, Ymm::YMM0, 0x1b);
+    e.vmovsd_xmm_disp32(Xmm::XMM2, base, 32);
+    e.vbroadcastsd(Ymm::YMM2, Xmm::XMM2);
+    e.vblendpd(Ymm::YMM3, Ymm::YMM1, Ymm::YMM2, 0b1010);
+    e.vmovupd_disp32_ymm(base, 40, Ymm::YMM3);
+    e.vzeroupper();
+    e.ret();
+
+    let bytes = e.finish();
+    let buffer = ExecutableBuffer::new(&bytes).expect("AVX2 test code must allocate");
+    let run: extern "C" fn(*mut f64) = unsafe { std::mem::transmute(buffer.entry_ptr()) };
+    let mut values = [1.0f64, 2.0, 3.0, 4.0, 10.0, 0.0, 0.0, 0.0, 0.0];
+    run(values.as_mut_ptr());
+    assert_eq!(&values[5..9], &[4.0, 10.0, 2.0, 10.0]);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn avx_xmm_unaligned_moves_execute_and_restore_nonvolatile_registers() {
+    if !std::is_x86_feature_detected!("avx2") {
+        return;
+    }
+
+    use super::super::exec_mem::ExecutableBuffer;
+    let mut e = Encoder::new();
+    #[cfg(windows)]
+    let base = Reg::RCX;
+    #[cfg(not(windows))]
+    let base = Reg::RDI;
+
+    e.vmovupd_disp32_xmm(base, 64, Xmm::XMM6);
+    e.vmovupd_disp32_xmm(base, 80, Xmm::XMM11);
+    e.vmovupd_xmm_disp32(Xmm::XMM6, base, 0);
+    e.vmovupd_xmm_disp32(Xmm::XMM11, base, 16);
+    e.vmovupd_disp32_xmm(base, 32, Xmm::XMM6);
+    e.vmovupd_disp32_xmm(base, 48, Xmm::XMM11);
+    e.vmovupd_xmm_disp32(Xmm::XMM6, base, 64);
+    e.vmovupd_xmm_disp32(Xmm::XMM11, base, 80);
+    e.vzeroupper();
+    e.ret();
+
+    let bytes = e.finish();
+    let buffer = ExecutableBuffer::new(&bytes).expect("AVX test code must allocate");
+    let run: extern "C" fn(*mut u64) = unsafe { std::mem::transmute(buffer.entry_ptr()) };
+    let mut values = [0u64; 12];
+    values[0..4].copy_from_slice(&[
+        1.25f64.to_bits(),
+        (-2.5f64).to_bits(),
+        3.75f64.to_bits(),
+        (-4.125f64).to_bits(),
+    ]);
+    run(values.as_mut_ptr());
+
+    assert_eq!(&values[4..8], &values[0..4]);
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn avx2_scalar_arithmetic_moves_and_conversions_execute() {
+    if !std::is_x86_feature_detected!("avx2") {
+        return;
+    }
+
+    use super::super::exec_mem::ExecutableBuffer;
+    let mut e = Encoder::new();
+    #[cfg(windows)]
+    let base = Reg::RCX;
+    #[cfg(not(windows))]
+    let base = Reg::RDI;
+
+    e.vmovsd_xmm_disp32(Xmm::XMM0, base, 0);
+    e.vmovsd_xmm_disp32(Xmm::XMM1, base, 8);
+    e.vaddsd(Xmm::XMM2, Xmm::XMM0, Xmm::XMM1);
+    e.vmovsd_disp32_xmm(base, 32, Xmm::XMM2);
+    e.vmulsd(Xmm::XMM3, Xmm::XMM2, Xmm::XMM1);
+    e.vsubsd(Xmm::XMM4, Xmm::XMM3, Xmm::XMM0);
+    e.vdivsd(Xmm::XMM5, Xmm::XMM4, Xmm::XMM1);
+    e.vmovsd_disp32_xmm(base, 40, Xmm::XMM5);
+    e.vroundsd(Xmm::XMM2, Xmm::XMM0, Xmm::XMM5, 0x0b);
+    e.vmovsd_disp32_xmm(base, 48, Xmm::XMM2);
+
+    e.vxorpd(Xmm::XMM3, Xmm::XMM3, Xmm::XMM3);
+    e.vcvtss2sd_disp32(Xmm::XMM4, Xmm::XMM3, base, 16);
+    e.vmovsd_disp32_xmm(base, 56, Xmm::XMM4);
+    e.vcvtsi2sd_i32_disp32(Xmm::XMM5, Xmm::XMM3, base, 20);
+    e.vmovsd_disp32_xmm(base, 64, Xmm::XMM5);
+    e.vcvtsd2ss(Xmm::XMM4, Xmm::XMM3, Xmm::XMM5);
+    e.vmovss_disp32_xmm(base, 72, Xmm::XMM4);
+
+    e.vucomisd(Xmm::XMM1, Xmm::XMM1);
+    let equal = e.label();
+    let compared = e.label();
+    e.jz(equal);
+    e.store_u32_imm_disp32(base, 80, 0);
+    e.jmp(compared);
+    e.place(equal);
+    e.store_u32_imm_disp32(base, 80, 1);
+    e.place(compared);
+
+    e.vcvttsd2si_r64(Reg::RAX, Xmm::XMM5);
+    e.store_r64_disp32(base, 88, Reg::RAX);
+    e.load_r64_disp32(Reg::RAX, base, 0);
+    e.vmovq_xmm_r64(Xmm::XMM2, Reg::RAX);
+    e.vmovq_r64_xmm(Reg::RDX, Xmm::XMM2);
+    e.store_r64_disp32(base, 96, Reg::RDX);
+    e.vmovsd_xmm_xmm(Xmm::XMM2, Xmm::XMM3, Xmm::XMM0);
+    e.vmovsd_disp32_xmm(base, 104, Xmm::XMM2);
+
+    e.load_r32_disp32(Reg::RAX, base, 20);
+    e.vcvtsi2sd_r32(Xmm::XMM4, Xmm::XMM3, Reg::RAX);
+    e.vmovsd_disp32_xmm(base, 112, Xmm::XMM4);
+    e.load_r64_disp32(Reg::RAX, base, 24);
+    e.vcvtsi2sd_r64(Xmm::XMM5, Xmm::XMM3, Reg::RAX);
+    e.vmovsd_disp32_xmm(base, 120, Xmm::XMM5);
+    e.vcvttsd2si_r32(Reg::RDX, Xmm::XMM2);
+    e.store_r32_disp32(base, 128, Reg::RDX);
+    e.vzeroupper();
+    e.ret();
+
+    let bytes = e.finish();
+    let buffer = ExecutableBuffer::new(&bytes).expect("AVX2 test code must allocate");
+    let run: extern "C" fn(*mut u64) = unsafe { std::mem::transmute(buffer.entry_ptr()) };
+    let mut values = [0u64; 20];
+    values[0] = 1.5f64.to_bits();
+    values[1] = 2.0f64.to_bits();
+    values[2] = u64::from(3.25f32.to_bits()) | (u64::from((-7i32) as u32) << 32);
+    values[3] = ((1i64 << 40) + 3) as u64;
+    run(values.as_mut_ptr());
+
+    assert_eq!(f64::from_bits(values[4]), 3.5);
+    assert_eq!(f64::from_bits(values[5]), 2.75);
+    assert_eq!(f64::from_bits(values[6]), 2.0);
+    assert_eq!(f64::from_bits(values[7]), 3.25);
+    assert_eq!(f64::from_bits(values[8]), -7.0);
+    assert_eq!(values[9] as u32, (-7.0f32).to_bits());
+    assert_eq!(values[10] as u32, 1);
+    assert_eq!(values[11] as i64, -7);
+    assert_eq!(values[12], 1.5f64.to_bits());
+    assert_eq!(f64::from_bits(values[13]), 1.5);
+    assert_eq!(f64::from_bits(values[14]), -7.0);
+    assert_eq!(f64::from_bits(values[15]), ((1i64 << 40) + 3) as f64);
+    assert_eq!(values[16] as u32, 1);
+}
+
+#[test]
+fn variable_shift_form_has_known_bytes() {
+    let mut e = Encoder::new();
+    e.shr_r32_cl(Reg::RDX);
+    e.shr_r32_cl(Reg::R9);
+    assert_eq!(e.finish(), vec![0xD3, 0xEA, 0x41, 0xD3, 0xE9]);
+}
+
+#[test]
+fn double_shift_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.double_shift_r32(true, Reg::RAX, Reg::RDX, Some(31));
+    e.double_shift_r32(true, Reg::R8, Reg::R9, None);
+    e.double_shift_r32(false, Reg::RCX, Reg::RBX, Some(33));
+    e.double_shift_r32(false, Reg::R10, Reg::R11, None);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x0F, 0xA4, 0xD0, 0x1F, 0x45, 0x0F, 0xA5, 0xC8, 0x0F, 0xAC, 0xD9, 0x21, 0x45, 0x0F,
+            0xAD, 0xDA,
+        ]
+    );
+}
+
+#[test]
+fn scalar_sse_integer_conversion_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.cvtsi2sd_r32(Xmm::XMM1, Reg::RAX);
+    e.cvtsi2sd_r32(Xmm::XMM9, Reg::R10);
+    e.cvttsd2si_r32(Reg::RAX, Xmm::XMM1);
+    e.cvttsd2si_r32(Reg::R9, Xmm::XMM10);
+    e.cvttsd2si_r64(Reg::RAX, Xmm::XMM1);
+    e.cvttsd2si_r64(Reg::R9, Xmm::XMM10);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0xF2, 0x0F, 0x2A, 0xC8, 0xF2, 0x45, 0x0F, 0x2A, 0xCA, 0xF2, 0x0F, 0x2C, 0xC1, 0xF2,
+            0x45, 0x0F, 0x2C, 0xCA, 0xF2, 0x48, 0x0F, 0x2C, 0xC1, 0xF2, 0x4D, 0x0F, 0x2C, 0xCA,
+        ]
+    );
+}
+
+#[test]
+fn movq_and_movd_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.movq_xmm_r64(Xmm::XMM1, Reg::RAX);
+    e.movq_xmm_r64(Xmm::XMM9, Reg::R10);
+    e.movq_r64_xmm(Reg::RAX, Xmm::XMM1);
+    e.movq_r64_xmm(Reg::R10, Xmm::XMM9);
+    e.movd_xmm_r32(Xmm::XMM1, Reg::RAX);
+    e.movd_xmm_r32(Xmm::XMM9, Reg::R10);
+    e.movd_r32_xmm(Reg::RAX, Xmm::XMM1);
+    e.movd_r32_xmm(Reg::R10, Xmm::XMM9);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x66, 0x48, 0x0F, 0x6E, 0xC8, 0x66, 0x4D, 0x0F, 0x6E, 0xCA, 0x66, 0x48, 0x0F, 0x7E,
+            0xC8, 0x66, 0x4D, 0x0F, 0x7E, 0xCA, 0x66, 0x0F, 0x6E, 0xC8, 0x66, 0x45, 0x0F, 0x6E,
+            0xCA, 0x66, 0x0F, 0x7E, 0xC8, 0x66, 0x45, 0x0F, 0x7E, 0xCA,
+        ]
+    );
+}
+
+#[test]
+fn x87_integer_support_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    e.and_r64_r64(Reg::RAX, Reg::RDX);
+    e.xor_r64_r64(Reg::R9, Reg::R10);
+    e.shift_r64_imm8(5, Reg::R8, 52);
+    e.shift_r64_imm8(4, Reg::RDX, 1);
+    e.movzx_r32_word_disp32(Reg::RCX, Reg::R12, 0x1234);
+    e.store_r16_disp32(Reg::R13, -2, Reg::R9);
+    e.bt_r16_mem(Reg::RDX, Reg::RCX);
+    e.btr_r16_mem(Reg::R12, Reg::R9);
+    e.bts_r16_mem(Reg::RDI, Reg::RCX);
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x48, 0x21, 0xD0, 0x4D, 0x31, 0xD1, 0x49, 0xC1, 0xE8, 0x34, 0x48, 0xC1, 0xE2, 0x01,
+            0x41, 0x0F, 0xB7, 0x8C, 0x24, 0x34, 0x12, 0x00, 0x00, 0x66, 0x45, 0x89, 0x8D, 0xFE,
+            0xFF, 0xFF, 0xFF, 0x66, 0x0F, 0xA3, 0x0A, 0x66, 0x45, 0x0F, 0xB3, 0x0C, 0x24, 0x66,
+            0x0F, 0xAB, 0x0F,
+        ]
+    );
+}
+
+#[test]
 fn mov_r32_r32_known_bytes() {
     // Non-extended pair: mov eax, ecx -- no REX byte at all.
     let mut e = Encoder::new();
@@ -197,6 +673,17 @@ fn load_r32_sib_known_bytes() {
 }
 
 #[test]
+fn load_r64_sib_scale8_known_bytes() {
+    let mut e = Encoder::new();
+    e.load_r64_sib_scale8(Reg::RDI, Reg::RDX, Reg::RCX);
+    assert_eq!(e.finish(), vec![0x48, 0x8B, 0x3C, 0xCA]);
+
+    let mut e = Encoder::new();
+    e.load_r64_sib_scale8(Reg::R10, Reg::R11, Reg::R9);
+    assert_eq!(e.finish(), vec![0x4F, 0x8B, 0x14, 0xCB]);
+}
+
+#[test]
 fn add_r32_imm32_known_bytes() {
     // add eax, 0xa0 -- no REX (eax not extended), 81 /0 id. ModRM mod=11,reg=0(/0),rm=0(eax)
     // = 11_000_000 = 0xC0.
@@ -279,6 +766,21 @@ fn add_r32_r32_known_bytes() {
 }
 
 #[test]
+fn byte_alu_register_forms_have_known_bytes() {
+    let mut e = Encoder::new();
+    for op in 0..8 {
+        e.alu_r8_r8(op, Reg::RAX, Reg::RCX);
+    }
+    assert_eq!(
+        e.finish(),
+        vec![
+            0x00, 0xC8, 0x08, 0xC8, 0x10, 0xC8, 0x18, 0xC8, 0x20, 0xC8, 0x28, 0xC8, 0x30, 0xC8,
+            0x38, 0xC8,
+        ]
+    );
+}
+
+#[test]
 fn movzx_r32_byte_sib_known_bytes() {
     // movzx eax, byte [rsi+rcx] -- no REX. 0F B6; ModRM mod=00,reg=eax(0),rm=100(SIB)=0x04;
     // SIB scale=0,index=rcx(1),base=rsi(6) = 0x0E.
@@ -290,6 +792,17 @@ fn movzx_r32_byte_sib_known_bytes() {
     let mut e = Encoder::new();
     e.movzx_r32_byte_sib(Reg::R11, Reg::R12, Reg::R9);
     assert_eq!(e.finish(), vec![0x47, 0x0F, 0xB6, 0x1C, 0x0C]);
+}
+
+#[test]
+fn movzx_r32_byte_disp8_known_bytes() {
+    let mut e = Encoder::new();
+    e.movzx_r32_byte_disp8(Reg::RDX, Reg::RDI, 0);
+    assert_eq!(e.finish(), vec![0x0F, 0xB6, 0x57, 0x00]);
+
+    let mut e = Encoder::new();
+    e.movzx_r32_byte_disp8(Reg::R9, Reg::R12, -4);
+    assert_eq!(e.finish(), vec![0x45, 0x0F, 0xB6, 0x4C, 0x24, 0xFC]);
 }
 
 #[test]
