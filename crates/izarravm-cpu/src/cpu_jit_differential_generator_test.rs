@@ -824,7 +824,7 @@ fn watched_store_case(value: u32, target: u32) -> GeneratedCase {
 }
 
 #[test]
-fn generated_watched_store_distinguishes_same_value_from_changed_code() {
+fn generated_watched_store_exits_for_same_and_changed_code() {
     let prime = watched_store_case(1, 0x1080);
     let same = watched_store_case(1, 0x1080);
     let changed = watched_store_case(2, 0x1080);
@@ -868,11 +868,18 @@ fn generated_watched_store_distinguishes_same_value_from_changed_code() {
             true,
         ) > 0
     );
-    assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits);
+    assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits + 1);
     assert!(matches!(
         direct.jit_direct.probe(rejected),
-        jit::direct::BlockProbe::Rejected
+        jit::direct::BlockProbe::Interpret
     ));
+    assert!(matches!(
+        direct.jit_direct.probe(rejected),
+        jit::direct::BlockProbe::Compile
+    ));
+    direct
+        .jit_direct
+        .reject(jit::direct::RejectedSpan::new(rejected, 4).expect("page-local rejected fixture"));
 
     let native = assert_measured_pair(
         &mut interpreter,
@@ -884,7 +891,7 @@ fn generated_watched_store_distinguishes_same_value_from_changed_code() {
         true,
     );
     assert!(native > 0, "changed watched store lost its native prefix");
-    assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits + 1);
+    assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits + 2);
     assert!(matches!(
         direct.jit_direct.probe(rejected),
         jit::direct::BlockProbe::Interpret

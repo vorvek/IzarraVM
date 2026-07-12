@@ -1613,7 +1613,7 @@ fn immediate_store_exit_program(target: u32) -> Vec<u8> {
 fn immediate_ram_store_watch_and_map_miss_side_exits_are_precise() {
     const TARGET: u32 = 0x4100;
     for (name, initial, watched, map_miss, expected_writes, expected_reason) in [
-        ("same value", 0x5a, true, false, 2, None),
+        ("same value", 0x5a, true, false, 1, Some(true)),
         ("changed code", 0x00, true, false, 1, Some(true)),
         ("map miss", 0x00, false, true, 1, Some(false)),
     ] {
@@ -2002,7 +2002,7 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
     for (target, marked, same_value, expected_stores, expected_exits) in [
         (0x4100u32, 0x4100u32, false, 1, 1),
         (0x410fu32, 0x4110u32, false, 1, 1),
-        (0x4100u32, 0x4100u32, true, 2, 0),
+        (0x4100u32, 0x4100u32, true, 1, 1),
     ] {
         let mut cpu = fresh();
         let mut bus = TestBus::with_memory(store_exit_program(target));
@@ -2064,6 +2064,76 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
     }
 }
 
+#[test]
+fn same_value_watched_dword_store_invalidates_and_replays_a_cold_decode() {
+    const TARGET: u32 = 0x4200;
+    const VALUE: u32 = 0x1234_5678;
+
+    let memory = store_exit_program(TARGET);
+    let mut interp = fresh();
+    let mut native = fresh();
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut native_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut native_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    arm_store_fixture(&mut interp);
+    drive(&mut interp, &mut interp_bus);
+    prime_direct_store_block(&mut native, &mut native_bus);
+
+    for (cpu, bus) in [
+        (&mut interp, &mut interp_bus),
+        (&mut native, &mut native_bus),
+    ] {
+        bus.memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&VALUE.to_le_bytes());
+        cpu.registers.eip = TARGET;
+        cpu.begin_instruction();
+        cpu.fetch_decoded(bus, TARGET).expect("target decode");
+        arm_store_fixture(cpu);
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.fp_rem = 0;
+        cpu.core_clocks_so_far = 0;
+        bus.trace = BusTrace::default();
+    }
+    let interp_invalidations = interp.perf_counters().code_invalidations;
+    let native_invalidations = native.perf_counters().code_invalidations;
+
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    let native_outcomes = drive(&mut native, &mut native_bus);
+
+    assert_eq!(native, interp);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert!(native_outcomes.last().is_some_and(|outcome| outcome.2));
+    assert!(interp_outcomes.last().is_some_and(|outcome| outcome.2));
+    assert_eq!(
+        interp.perf_counters().code_invalidations,
+        interp_invalidations + 1
+    );
+    assert_eq!(
+        native.perf_counters().code_invalidations,
+        native_invalidations + 1
+    );
+
+    let interp_misses = interp.perf_counters().decode_misses;
+    let native_misses = native.perf_counters().decode_misses;
+    for (cpu, bus) in [
+        (&mut interp, &mut interp_bus),
+        (&mut native, &mut native_bus),
+    ] {
+        cpu.registers.eip = TARGET;
+        cpu.begin_instruction();
+        cpu.fetch_decoded(bus, TARGET).expect("cold target decode");
+    }
+    assert_eq!(interp.perf_counters().decode_misses, interp_misses + 1);
+    assert_eq!(native.perf_counters().decode_misses, native_misses + 1);
+}
+
 fn watched_byte_store_program(target: u32) -> Vec<u8> {
     let mut memory = vec![0; 0x7000];
     memory[(STORE_ENTRY - 1) as usize] = 0x90;
@@ -2081,7 +2151,7 @@ fn watched_byte_store_program(target: u32) -> Vec<u8> {
 fn native_byte_store_watch_checks_chunk_and_same_value() {
     for (marked, initial, expected_writes, expected_exits) in [
         (0x4100u32, 0u8, 0, 1),
-        (0x4100u32, 0xd4u8, 1, 0),
+        (0x4100u32, 0xd4u8, 0, 1),
         (0x4110u32, 0u8, 1, 0),
     ] {
         let target = 0x4100u32;

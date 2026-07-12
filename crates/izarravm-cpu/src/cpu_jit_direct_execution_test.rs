@@ -1350,16 +1350,12 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
             .try_run_direct_block_for_test(&mut native_bus, block)
             .unwrap()
     );
-    if same_value {
-        assert_eq!(native.perf_counters().jit_direct_exit_code_watch, exits);
-    } else {
-        assert_eq!(native.registers, registers);
-        assert_eq!(native.pending_flags, pending);
-        assert_eq!(native_bus.memory, memory);
-        assert_eq!(native.perf_counters().jit_direct_exit_code_watch - exits, 1);
-        for _ in 0..3 {
-            native.cycle(&mut native_bus).unwrap();
-        }
+    assert_eq!(native.registers, registers);
+    assert_eq!(native.pending_flags, pending);
+    assert_eq!(native_bus.memory, memory);
+    assert_eq!(native.perf_counters().jit_direct_exit_code_watch - exits, 1);
+    for _ in 0..3 {
+        native.cycle(&mut native_bus).unwrap();
     }
     for _ in 0..3 {
         interp.cycle(&mut interp_bus).unwrap();
@@ -1375,7 +1371,7 @@ fn run_watched_memory_alu(form: u8, same_value: bool) {
 }
 
 #[test]
-fn direct_memory_alu_watched_same_value_commits_and_changed_value_exits_transactionally() {
+fn direct_memory_alu_watched_writes_exit_transactionally() {
     for form in [0, 1, 3] {
         run_watched_memory_alu(form, true);
         run_watched_memory_alu(form, false);

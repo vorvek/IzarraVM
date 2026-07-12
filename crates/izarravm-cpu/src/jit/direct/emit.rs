@@ -1761,7 +1761,7 @@ fn emit_store(
     e.place(ram);
     emit_write_permission_check(e, memory.cpl3, sides.permission);
     emit_write_pointer(e, map, sides.unavailable_or_kind);
-    emit_watched_store_guard(e, source, width, map, code_watch_tables, sides.code_watch);
+    emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
     emit_store_value(e, source, width);
     match width {
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_RAM_BYTE_WRITES),
@@ -1773,7 +1773,7 @@ fn emit_store(
     e.place(mode13);
     emit_write_permission_check(e, memory.cpl3, sides.permission);
     emit_write_pointer(e, map, sides.unavailable_or_kind);
-    emit_watched_store_guard(e, source, width, map, code_watch_tables, sides.code_watch);
+    emit_watched_store_guard(e, width, map, code_watch_tables, sides.code_watch);
     emit_store_value(e, source, width);
     match width {
         MemoryWidth::Byte => emit_dynamic_increment(e, STACK_MODE13_BYTE_WRITES),
@@ -2053,23 +2053,13 @@ fn emit_write_pointer(e: &mut Encoder, map: NativeMapBases, side: Label) {
 ))]
 fn emit_watched_store_guard(
     e: &mut Encoder,
-    source: StoreSource,
     width: MemoryWidth,
     map: NativeMapBases,
     code_watch_tables: [usize; 2],
     side: Label,
 ) {
-    let watched = e.label();
     let unwatched = e.label();
-    emit_code_watch_branch(e, width, map, code_watch_tables, watched, unwatched);
-    e.place(watched);
-    emit_read_store_value(e, source, width, Reg::RDX);
-    match width {
-        MemoryWidth::Byte => e.cmp_r8_disp8(Reg::RDX, Reg::RDI, 0),
-        MemoryWidth::Word => e.cmp_r16_disp8(Reg::RDX, Reg::RDI, 0),
-        MemoryWidth::Dword => e.cmp_r32_disp8(Reg::RDX, Reg::RDI, 0),
-    }
-    e.jnz(side);
+    emit_code_watch_branch(e, width, map, code_watch_tables, side, unwatched);
     e.place(unwatched);
 }
 
@@ -2084,17 +2074,8 @@ fn emit_watched_alu_result_guard(
     code_watch_tables: [usize; 2],
     side: Label,
 ) {
-    let watched = e.label();
     let unwatched = e.label();
-    emit_code_watch_branch(e, width, map, code_watch_tables, watched, unwatched);
-    e.place(watched);
-    e.load_r32_disp32(Reg::RDX, Reg::RSP, STACK_ALU_OLD_RESULT + 4);
-    match width {
-        MemoryWidth::Byte => e.cmp_r8_disp8(Reg::RDX, Reg::RDI, 0),
-        MemoryWidth::Word => e.cmp_r16_disp8(Reg::RDX, Reg::RDI, 0),
-        MemoryWidth::Dword => e.cmp_r32_disp8(Reg::RDX, Reg::RDI, 0),
-    }
-    e.jnz(side);
+    emit_code_watch_branch(e, width, map, code_watch_tables, side, unwatched);
     e.place(unwatched);
 }
 

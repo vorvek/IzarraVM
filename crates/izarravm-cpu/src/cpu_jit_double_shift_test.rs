@@ -354,7 +354,7 @@ fn mode13_double_shift_accounts_read_write_and_dirty_page() {
 }
 
 #[test]
-fn watched_same_value_commits_and_changed_value_exits_transactionally() {
+fn watched_double_shift_writes_exit_transactionally() {
     for count in [0, 1] {
         let mut fixture = prepare_flat(
             GswMode::Gsw586,
@@ -375,22 +375,15 @@ fn watched_same_value_commits_and_changed_value_exits_transactionally() {
                 .try_run_direct_block_for_test(&mut fixture.native_bus, fixture.block)
                 .unwrap()
         );
-        if count == 0 {
-            assert_eq!(
-                fixture.native.perf_counters().jit_direct_exit_code_watch,
-                exits
-            );
-        } else {
-            assert_eq!(fixture.native.registers, registers);
-            assert_eq!(fixture.native.pending_flags, pending);
-            assert_eq!(fixture.native_bus.memory, memory);
-            assert_eq!(
-                fixture.native.perf_counters().jit_direct_exit_code_watch - exits,
-                1
-            );
-            for _ in 0..3 {
-                fixture.native.cycle(&mut fixture.native_bus).unwrap();
-            }
+        assert_eq!(fixture.native.registers, registers);
+        assert_eq!(fixture.native.pending_flags, pending);
+        assert_eq!(fixture.native_bus.memory, memory);
+        assert_eq!(
+            fixture.native.perf_counters().jit_direct_exit_code_watch - exits,
+            1
+        );
+        for _ in 0..3 {
+            fixture.native.cycle(&mut fixture.native_bus).unwrap();
         }
         for _ in 0..3 {
             fixture
