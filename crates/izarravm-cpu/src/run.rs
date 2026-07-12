@@ -463,11 +463,19 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         let mut skip_direct_once = false;
         #[cfg(feature = "jit")]
-        let native_continuations_active = self.jit_direct.execution_enabled()
-            || self.jit_direct.backend_enabled()
-                && (jit_forced_region_lin().is_some()
-                    || self.jit_regions.auto_admit()
-                    || self.jit_regions.len() != 0);
+        let forced_region_lin = jit_forced_region_lin();
+        #[cfg(feature = "jit")]
+        let native_continuations_active = {
+            debug_assert_eq!(
+                self.direct_runtime.admission_active,
+                self.jit_direct.execution_enabled()
+            );
+            let legacy_requested = forced_region_lin.is_some()
+                || self.jit_regions.auto_admit()
+                || self.jit_regions.len() != 0;
+            self.direct_runtime.admission_active
+                || legacy_requested && self.jit_direct.backend_enabled()
+        };
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
         // derives it from PIT-edge instants), but `total` counts core clocks
         // only. Track the batch's scaled-bus growth across this run so a
@@ -527,7 +535,7 @@ impl CpuGsw {
                     };
                     if !self.jit_direct.backend_enabled() || std::mem::take(&mut skip_direct_once) {
                         None
-                    } else if jit_forced_region_lin() == Some(lin)
+                    } else if forced_region_lin == Some(lin)
                         || !self.jit_direct.auto_admit()
                             && (self.jit_regions.auto_admit() || stamped_region.is_some())
                     {
@@ -642,7 +650,7 @@ impl CpuGsw {
     /// setting it never makes an otherwise-identical CPU compare unequal.
     #[cfg(feature = "jit")]
     pub fn set_jit_auto_admit(&mut self, on: bool) {
-        let was_enabled = self.jit_direct.execution_enabled();
+        let was_enabled = self.direct_runtime.admission_active;
         self.jit_regions.set_auto_admit(false);
         self.jit_direct.set_auto_admit(on && jit::host_supported());
         self.finish_direct_execution_transition(was_enabled);
@@ -652,14 +660,20 @@ impl CpuGsw {
     /// Unsupported hosts cannot be enabled.
     #[cfg(feature = "jit")]
     pub fn set_native_backend_enabled(&mut self, on: bool) {
-        let was_enabled = self.jit_direct.execution_enabled();
+        let was_enabled = self.direct_runtime.admission_active;
         self.jit_direct.set_backend_enabled(on);
         self.finish_direct_execution_transition(was_enabled);
     }
 
     #[cfg(feature = "jit")]
     fn finish_direct_execution_transition(&mut self, was_enabled: bool) {
-        if was_enabled == self.jit_direct.execution_enabled() {
+        let enabled = self.jit_direct.execution_enabled();
+        self.direct_runtime.admission_active = enabled;
+        debug_assert_eq!(
+            self.direct_runtime.admission_active,
+            self.jit_direct.execution_enabled()
+        );
+        if was_enabled == enabled {
             return;
         }
         #[cfg(all(
@@ -679,10 +693,8 @@ impl CpuGsw {
         allow(dead_code)
     )]
     pub(crate) fn set_legacy_region_auto_admit(&mut self, on: bool) {
-        let was_enabled = self.jit_direct.execution_enabled();
-        self.jit_direct.set_auto_admit(false);
+        self.set_jit_auto_admit(false);
         self.jit_regions.set_auto_admit(on && jit::host_supported());
-        self.finish_direct_execution_transition(was_enabled);
     }
 
     #[cfg(feature = "jit")]
