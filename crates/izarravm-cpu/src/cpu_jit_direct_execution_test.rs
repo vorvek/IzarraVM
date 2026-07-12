@@ -905,8 +905,8 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
         false,
     );
     let ret_block = install_fixture_block(&mut native, ENTRY);
-    install_fixture_block(&mut native, FIRST);
-    install_fixture_block(&mut native, SECOND);
+    let first_block = install_fixture_block(&mut native, FIRST);
+    let second_block = install_fixture_block(&mut native, SECOND);
 
     // Populate both ways. The first execution has quota one but still reports the target for
     // binding. The second target misses the first tag and occupies the other way.
@@ -968,6 +968,118 @@ fn direct_ret_pic_keeps_two_return_sites_hot_and_matches_interpreter() {
             1
         );
     }
+
+    // Hide only the second target's body. Its PIC tag and logical edge remain in place while the
+    // first way stays live, so a return to SECOND must commit the transfer and stop at the hidden
+    // portal instead of falling through to either native target.
+    let second_slot = SECOND as usize & (native.jit_direct.decode_slot_count() - 1);
+    assert_eq!(native.jit_direct.suspend_decode_slot(second_slot), 1);
+    assert!(native.jit_direct.is_link_visible(ret_block.id()));
+    assert!(native.jit_direct.is_link_visible(first_block.id()));
+    assert!(!native.jit_direct.is_link_visible(second_block.id()));
+
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    arm_stack_fixture(&mut interp, ENTRY, INITIAL_ESP);
+    native_bus.memory.copy_from_slice(&pristine);
+    interp_bus.memory.copy_from_slice(&pristine);
+    native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+        .copy_from_slice(&SECOND.to_le_bytes());
+    interp_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+        .copy_from_slice(&SECOND.to_le_bytes());
+    native_bus.trace = BusTrace::default();
+    interp_bus.trace = BusTrace::default();
+    let memory_before = native_bus.memory.clone();
+    let flags_before = native.registers.eflags;
+    let before = native.perf_counters().clone();
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, ret_block)
+            .unwrap()
+    );
+    interp.cycle(&mut interp_bus).unwrap();
+
+    assert_eq!(native.registers, interp.registers);
+    assert_eq!(native.pending_flags, interp.pending_flags);
+    assert_eq!(native.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(native_bus.memory, interp_bus.memory);
+    assert_eq!(native_bus.memory, memory_before);
+    assert_eq!(
+        native_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+    assert_eq!(native.registers.eip, SECOND);
+    assert_eq!(native.registers.esp(), INITIAL_ESP + 4);
+    assert_eq!(native.registers.eax(), 0);
+    assert_eq!(native.registers.ecx(), 0);
+    assert_eq!(native.registers.eflags, flags_before);
+    assert_eq!(native.perf_counters().instructions - before.instructions, 1);
+    assert_eq!(
+        native.perf_counters().jit_direct_entries - before.jit_direct_entries,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - before.jit_direct_insns,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        0
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_side_exits - before.jit_direct_side_exits,
+        0
+    );
+    assert!(!native.jit_direct.is_link_visible(second_block.id()));
+
+    // The normal checked continuation path validates the still-live decode lines and republishes
+    // the portal. Reset after that probe, then prove the RET reaches the target in the same entry.
+    native.jit_direct.set_auto_admit(true);
+    native.jit_direct.set_admission_heat_for_test(1);
+    native.set_eip(SECOND);
+    native
+        .try_direct_continuation_for_test(&mut native_bus, SECOND, true)
+        .unwrap();
+    native.jit_direct.set_auto_admit(false);
+    assert!(native.jit_direct.is_link_visible(second_block.id()));
+
+    arm_stack_fixture(&mut native, ENTRY, INITIAL_ESP);
+    native_bus.memory.copy_from_slice(&pristine);
+    native_bus.memory[INITIAL_ESP as usize..INITIAL_ESP as usize + 4]
+        .copy_from_slice(&SECOND.to_le_bytes());
+    native_bus.trace = BusTrace::default();
+    let before = native.perf_counters().clone();
+
+    assert!(
+        native
+            .try_run_direct_block_for_test(&mut native_bus, ret_block)
+            .unwrap()
+    );
+    assert_eq!(native.registers.eip, SECOND_HALT);
+    assert_eq!(native.registers.esp(), INITIAL_ESP + 4);
+    assert_eq!(native.registers.eax(), 0x22);
+    assert_eq!(native.registers.ecx(), 0x22);
+    assert_eq!(native.perf_counters().instructions - before.instructions, 4);
+    assert_eq!(
+        native.perf_counters().jit_direct_entries - before.jit_direct_entries,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_insns - before.jit_direct_insns,
+        4
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        1
+    );
+    assert_eq!(
+        native.perf_counters().jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
+        1
+    );
 }
 
 #[test]

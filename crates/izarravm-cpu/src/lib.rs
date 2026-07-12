@@ -605,6 +605,11 @@ pub struct PerfCounters {
     pub jit_direct_arena_compaction_failures: u64,
     pub jit_direct_links_created: u64,
     pub jit_direct_links_cleared: u64,
+    /// Reverse-index dependency IDs examined after a direct-mapped decode slot was displaced.
+    pub jit_direct_decode_dependencies_scanned: u64,
+    /// Guarded entry portals hidden because one of their direct-mapped decode dependencies was
+    /// displaced.
+    pub jit_direct_portals_hidden: u64,
     /// Guest instructions completed by emitted native operations, excluding instructions run by
     /// `region_step`. Compare with `jit_region_insns` to measure native opcode coverage.
     pub jit_native_insns: u64,
@@ -942,6 +947,9 @@ pub struct CpuGsw {
 
 impl Default for CpuGsw {
     fn default() -> Self {
+        let decode_cache = DecodeCache::default();
+        #[cfg(feature = "jit")]
+        let jit_direct = Box::new(jit::direct::BlockCache::new(decode_cache.line_count()));
         Self {
             registers: Registers::default(),
             fpu: X87::default(),
@@ -969,11 +977,11 @@ impl Default for CpuGsw {
             written_pages: [None; TRACKED_WRITE_PAGES],
             written_count: 0,
             written_pages_overflow: false,
-            decode_cache: DecodeCache::default(),
+            decode_cache,
             #[cfg(feature = "jit")]
             jit_regions: jit::RegionTable::default(),
             #[cfg(feature = "jit")]
-            jit_direct: Box::new(jit::direct::BlockCache::default()),
+            jit_direct,
             #[cfg(feature = "jit")]
             direct_runtime: DirectRuntimeState::default(),
             #[cfg(all(
@@ -1695,9 +1703,8 @@ struct DecodeCache {
     lines: Box<[DecodeLine]>,
     mask: u32,
     generation: u32,
-    /// Changes only when a fill displaces a different live decode line. Direct blocks combine
-    /// this with `generation` to skip per-entry residency scans until a replacement can have
-    /// evicted one of their slots.
+    /// Changes only when a fill displaces a different live decode line. It remains part of the
+    /// compiled residency token, but dispatch correctness now comes from exact portal suspension.
     replacement_epoch: u32,
     /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
     /// been cached from. A write touching a marked byte advances the generation. Marks are cleared
@@ -1733,20 +1740,20 @@ struct DecodeCache {
     jit_smc_epoch: u32,
 }
 
-/// Result of publishing one decoded instruction. A live line displaced from another linear page
-/// must be hidden from compiled dispatch before guest execution continues.
+/// Result of publishing one decoded instruction. A live direct-mapped slot displaced by another
+/// key must be suspended from compiled dispatch before guest execution continues.
 #[must_use]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DecodeInsertOutcome {
     inserted: bool,
-    evicted_linear_page: Option<u32>,
+    evicted_slot: Option<u32>,
 }
 
 impl DecodeInsertOutcome {
     const fn rejected() -> Self {
         Self {
             inserted: false,
-            evicted_linear_page: None,
+            evicted_slot: None,
         }
     }
 }
@@ -1800,6 +1807,12 @@ impl DecodeCache {
             #[cfg(feature = "jit")]
             jit_smc_epoch: 0,
         }
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn line_count(&self) -> usize {
+        self.lines.len()
     }
 
     /// Mark the bytes `[physical, physical + len)` as holding cached code, so a later write touching
@@ -1920,7 +1933,8 @@ impl DecodeCache {
             return DecodeInsertOutcome::rejected();
         }
 
-        let index = (lin & self.mask) as usize;
+        let slot = lin & self.mask;
+        let index = slot as usize;
         let previous = self.lines[index];
         // Decode-native marks are generation-sticky. Mark the replacement before publishing it;
         // a displaced line deliberately leaves a conservative mark until global invalidation.
@@ -1961,7 +1975,7 @@ impl DecodeCache {
 
         DecodeInsertOutcome {
             inserted: true,
-            evicted_linear_page: displaced.then_some(previous.tag >> 12),
+            evicted_slot: displaced.then_some(slot),
         }
     }
 
@@ -2029,8 +2043,8 @@ impl DecodeCache {
 
     /// Whether the line for `lin` is live for exactly this key: the same condition `get` uses,
     /// without copying the insn. The region step probes this per slot, which is the
-    /// interpreter's own next-continuation decode probe in miss-detection terms. Consumed by
-    /// the jit region step and by tests; harmless dead code in base builds.
+    /// interpreter's own next-continuation decode probe in miss-detection terms. Compiled root
+    /// dispatch uses it to validate a suspended portal before republishing it.
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     #[inline]
     fn line_live(&self, lin: u32, d: bool) -> bool {

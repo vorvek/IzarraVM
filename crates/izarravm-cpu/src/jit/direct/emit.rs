@@ -954,15 +954,23 @@ fn emit_completed_path(
     if let Some(link_cell) = link_cell {
         let unresolved = e.label();
         let returning = e.label();
+        e.mov_r64_imm64(Reg::RAX, link_cell as u64);
+        e.load_r64_disp8(
+            Reg::RDX,
+            Reg::RAX,
+            core::mem::offset_of!(LinkCell, portal) as i8,
+        );
+        e.load_r64_disp8(
+            Reg::RDX,
+            Reg::RDX,
+            core::mem::offset_of!(BlockPortal, body) as i8,
+        );
+        e.cmp_r64_imm32(Reg::RDX, 0);
+        e.jz(unresolved);
         e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_QUOTA);
         e.sub_r64_imm32(Reg::RAX, 1);
         e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RAX);
         e.jz(returning);
-        e.mov_r64_imm64(Reg::RAX, link_cell as u64);
-        e.load_r64_disp32(Reg::RAX, Reg::RAX, 0);
-        e.cmp_r64_imm32(Reg::RAX, 0);
-        e.jz(unresolved);
-        e.mov_r64_r64(Reg::RDX, Reg::RAX);
         emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, linked_transfers));
         e.xor_r64_self(Reg::RDI);
         e.store_r64_disp8(Reg::RSP, STACK_ITERATIONS, Reg::RDI);
@@ -992,26 +1000,31 @@ fn emit_completed_dynamic_path(
         accounting,
     );
     e.load_r32_disp32(Reg::RDX, Reg::R15, eip_offset());
-    let bind = e.label();
-    e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_QUOTA);
-    e.sub_r64_imm32(Reg::RDI, 1);
-    e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RDI);
+    let unresolved = e.label();
     for link_cell in link_cells {
         let next = e.label();
         e.mov_r64_imm64(Reg::RAX, link_cell as u64);
-        e.load_r64_disp8(
-            Reg::RCX,
-            Reg::RAX,
-            core::mem::offset_of!(LinkCell, body) as i8,
-        );
-        e.cmp_r64_imm32(Reg::RCX, 0);
-        e.jz(next);
         e.cmp_r32_disp8(
             Reg::RDX,
             Reg::RAX,
             core::mem::offset_of!(LinkCell, target_eip) as i8,
         );
         e.jnz(next);
+        e.load_r64_disp8(
+            Reg::RCX,
+            Reg::RAX,
+            core::mem::offset_of!(LinkCell, portal) as i8,
+        );
+        e.load_r64_disp8(
+            Reg::RCX,
+            Reg::RCX,
+            core::mem::offset_of!(BlockPortal, body) as i8,
+        );
+        e.cmp_r64_imm32(Reg::RCX, 0);
+        e.jz(unresolved);
+        e.load_r64_disp8(Reg::RDI, Reg::RSP, STACK_QUOTA);
+        e.sub_r64_imm32(Reg::RDI, 1);
+        e.store_r64_disp8(Reg::RSP, STACK_QUOTA, Reg::RDI);
         e.cmp_r64_imm32(Reg::RDI, 0);
         e.jz(shared_return);
         emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, linked_transfers));
@@ -1020,10 +1033,8 @@ fn emit_completed_dynamic_path(
         e.jmp_r64(Reg::RCX);
         e.place(next);
     }
-    e.cmp_r64_imm32(Reg::RDI, 0);
-    e.jz(bind);
+    e.place(unresolved);
     emit_increment_exit_u32(e, core::mem::offset_of!(NativeExit, unresolved_exits));
-    e.place(bind);
     e.load_r64_disp8(Reg::RAX, Reg::RSP, STACK_EXIT);
     e.mov_r64_imm64(Reg::RCX, link_cells[0] as u64);
     e.store_r64_disp32(

@@ -7,9 +7,19 @@ fn key(linear: u32) -> BlockKey {
     BlockKey::new(linear, 0x20_000 + (linear & 0xfff), 7)
 }
 
+fn cell_portal(cell: &LinkCell) -> &BlockPortal {
+    let address = cell.portal.load(Ordering::Acquire);
+    assert_ne!(address, 0);
+    unsafe { &*(address as *const BlockPortal) }
+}
+
+fn cell_body(cell: &LinkCell) -> usize {
+    cell_portal(cell).body.load(Ordering::Acquire)
+}
+
 fn trivial_compilation(span: BlockSpan) -> Compilation {
     let mut fetch_lens = [0; MAX_BLOCK_INSTRUCTIONS];
-    fetch_lens[0] = 1;
+    fetch_lens[0] = u8::try_from(span.guest_len).expect("test instruction length must fit");
     Compilation {
         span,
         decode_residency_epoch: 0,
@@ -36,6 +46,16 @@ fn trivial_compilation(span: BlockSpan) -> Compilation {
         body_offset: 0,
         code: vec![0xc3],
     }
+}
+
+fn compilation_with_fetch_lens(key: BlockKey, fetch_lens: &[u8]) -> Compilation {
+    assert!(!fetch_lens.is_empty());
+    let guest_len = fetch_lens.iter().map(|len| usize::from(*len)).sum();
+    let span = BlockSpan::new(key, guest_len, fetch_lens.len()).expect("test block span");
+    let mut compilation = trivial_compilation(span);
+    compilation.fetch_lens.fill(0);
+    compilation.fetch_lens[..fetch_lens.len()].copy_from_slice(fetch_lens);
+    compilation
 }
 
 fn reject(cache: &mut BlockCache, key: BlockKey, guest_len: usize) {
@@ -70,6 +90,18 @@ fn install_dynamic_trivial(cache: &mut BlockCache, key: BlockKey) -> BlockId {
         .expect("dynamic test block must install")
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+fn install_with_fetch_lens(cache: &mut BlockCache, key: BlockKey, fetch_lens: &[u8]) -> BlockId {
+    assert!(matches!(cache.probe(key), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(key), BlockProbe::Compile));
+    cache
+        .install(&compilation_with_fetch_lens(key, fetch_lens))
+        .expect("test block must install")
+}
+
 #[test]
 fn span_is_bounded_and_page_local() {
     assert!(BlockSpan::new(key(0x1234), 64, MAX_BLOCK_INSTRUCTIONS).is_some());
@@ -85,6 +117,27 @@ fn default_metadata_is_bounded_above_the_executable_arena() {
     let arena_slots =
         super::super::exec_mem::EXECUTABLE_ARENA_LEN / super::super::exec_mem::host_page_len();
     assert!(cache.entry_cap > arena_slots);
+}
+
+#[test]
+fn clone_preserves_cache_shape_but_resets_runtime_admission() {
+    let mut cache = BlockCache::new(16);
+    cache.entry_cap = 7;
+    cache.backend_enabled = false;
+    cache.admission_heat = 11;
+    cache.auto_admit = true;
+    cache.defer_short_for_test = true;
+    cache.fast_map_enabled_for_test = true;
+
+    let clone = cache.clone();
+
+    assert_eq!(clone.decode_slot_count(), 16);
+    assert_eq!(clone.entry_cap, 7);
+    assert!(!clone.backend_enabled);
+    assert_eq!(clone.admission_heat, 11);
+    assert!(!clone.auto_admit);
+    assert!(clone.defer_short_for_test);
+    assert!(clone.fast_map_enabled_for_test);
 }
 
 #[test]
@@ -335,19 +388,10 @@ fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
     assert_eq!(cells[0].target_eip.load(Ordering::Acquire), first.linear);
     assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
     let cell_addresses = [cells[0].address(), cells[1].address()];
-    let old_bodies = [
-        cells[0].body.load(Ordering::Acquire),
-        cells[1].body.load(Ordering::Acquire),
-    ];
+    let old_bodies = [cell_body(&cells[0]), cell_body(&cells[1])];
     assert!(cache.compact_arena());
     assert_eq!([cells[0].address(), cells[1].address()], cell_addresses);
-    assert_ne!(
-        [
-            cells[0].body.load(Ordering::Acquire),
-            cells[1].body.load(Ordering::Acquire),
-        ],
-        old_bodies
-    );
+    assert_ne!([cell_body(&cells[0]), cell_body(&cells[1]),], old_bodies);
     assert_eq!(cells[0].target_eip.load(Ordering::Acquire), first.linear);
     assert_eq!(cells[1].target_eip.load(Ordering::Acquire), second.linear);
 
@@ -371,6 +415,79 @@ fn dynamic_ret_pic_keeps_two_targets_and_unlinks_replaced_or_retired_blocks() {
     let stats = cache.take_stats();
     assert_eq!(stats.links, 3);
     assert_eq!(stats.unlinks, 3);
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn dynamic_ret_does_not_rebind_when_a_target_portal_slot_is_reused() {
+    let mut cache = BlockCache::new(8);
+    let source = key(0x2000);
+    let old_target = key(0x2100);
+    let replacement = key(0x2201);
+    let source_id = install_dynamic_trivial(&mut cache, source);
+    let old_target_id = install_trivial(&mut cache, old_target, 1);
+    let cell = cache.link_cells[source_id.index()][0].clone();
+    let site_cell = cell.address();
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        old_target.linear,
+        old_target.linear,
+        old_target.mode_key
+    ));
+    let old_portal = cache.block_portals[old_target_id.index()].address();
+    assert!(cell.linked());
+
+    assert_eq!(cache.invalidate_physical_range(old_target.physical, 1), 1);
+    assert!(!cell.linked());
+    assert_eq!(cell.portal.load(Ordering::Acquire), zero_portal().address());
+
+    let replacement_id = install_trivial(&mut cache, replacement, 1);
+    assert_eq!(replacement_id.index(), old_target_id.index());
+    assert_eq!(
+        cache.block_portals[replacement_id.index()].address(),
+        old_portal
+    );
+    assert!(cache.is_link_visible(replacement_id));
+    assert!(!cell.linked());
+    assert_eq!(cell.portal.load(Ordering::Acquire), zero_portal().address());
+
+    assert!(cache.bind_dynamic_successor(
+        site_cell,
+        replacement.linear,
+        replacement.linear,
+        replacement.mode_key
+    ));
+    assert!(cell.linked());
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn retained_link_cell_is_unlinked_when_its_cache_drops() {
+    let cell = {
+        let mut cache = BlockCache::default();
+        let source = key(0x2300);
+        let target = key(0x2400);
+        let source_id = install_dynamic_trivial(&mut cache, source);
+        install_trivial(&mut cache, target, 1);
+        let cell = cache.link_cells[source_id.index()][0].clone();
+        assert!(cache.bind_dynamic_successor(
+            cell.address(),
+            target.linear,
+            target.linear,
+            target.mode_key
+        ));
+        assert!(cell.linked());
+        cell
+    };
+
+    assert_eq!(cell.portal.load(Ordering::Acquire), zero_portal().address());
+    assert!(!cell.linked());
 }
 
 #[cfg(any(
@@ -557,13 +674,13 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 #[test]
-fn decode_page_hiding_requires_revalidation_even_when_the_token_matches() {
+fn decode_slot_suspension_requires_revalidation_even_when_the_token_matches() {
     let mut cache = BlockCache::default();
     let block = key(0x4100);
     let id = install_trivial(&mut cache, block, 1);
     assert!(cache.is_link_visible(id));
 
-    cache.hide_decode_page(block.linear >> BLOCK_PAGE_SHIFT);
+    cache.suspend_decode_slot(block.linear as usize & cache.decode_slot_mask);
     assert!(!cache.is_link_visible(id));
     assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
 
@@ -571,6 +688,147 @@ fn decode_page_hiding_requires_revalidation_even_when_the_token_matches() {
         .refresh_decode_residency(block, 0)
         .expect("decode revalidation");
     assert!(cache.is_link_visible(id));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn decode_slot_suspension_is_exact_and_keeps_logical_links_intact() {
+    let mut cache = BlockCache::new(8);
+    let outer = key(0x4000);
+    let overlap = key(0x4002);
+    let neighbor = key(0x4001);
+    let outer_id = install_with_fetch_lens(&mut cache, outer, &[2, 2, 1]);
+    let overlap_id = install_with_fetch_lens(&mut cache, overlap, &[2, 1]);
+    let neighbor_id = install_with_fetch_lens(&mut cache, neighbor, &[1]);
+    let outbound = cache.outbound.clone();
+    let inbound = cache.inbound.clone();
+    let waiting = cache.waiting.clone();
+    let linear_blocks = cache.linear_blocks.clone();
+
+    assert_eq!(cache.suspend_decode_slot(4), 2);
+    assert!(!cache.is_link_visible(outer_id));
+    assert!(!cache.is_link_visible(overlap_id));
+    assert!(cache.is_link_visible(neighbor_id));
+    assert_eq!(cache.outbound, outbound);
+    assert_eq!(cache.inbound, inbound);
+    assert_eq!(cache.waiting, waiting);
+    assert_eq!(cache.linear_blocks, linear_blocks);
+
+    assert_eq!(cache.suspend_decode_slot(3), 0);
+    assert!(cache.is_link_visible(neighbor_id));
+    assert_eq!(cache.suspend_decode_slot(4), 0);
+    let stats = cache.take_stats();
+    assert_eq!(stats.decode_dependencies_scanned, 4);
+    assert_eq!(stats.portals_hidden, 2);
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn repeated_source_revalidation_does_not_rebuild_its_link_graph() {
+    let mut cache = BlockCache::new(16);
+    let source = key(0x4101);
+    let hidden_target = key(0x4202);
+    let unresolved_target = key(0x4303);
+    let hidden_id = install_trivial(&mut cache, hidden_target, 1);
+    assert_eq!(cache.suspend_decode_slot(2), 1);
+    assert!(!cache.is_link_visible(hidden_id));
+
+    assert!(matches!(cache.probe(source), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(source), BlockProbe::Compile));
+    let mut source_compilation =
+        trivial_compilation(BlockSpan::new(source, 1, 1).expect("source span"));
+    source_compilation.successors = [
+        Some(LinkTarget {
+            linear: unresolved_target.linear,
+            mode_key: unresolved_target.mode_key,
+        }),
+        Some(LinkTarget {
+            linear: hidden_target.linear,
+            mode_key: hidden_target.mode_key,
+        }),
+    ];
+    let source_id = cache.install(&source_compilation).expect("source install");
+    assert_eq!(cache.waiting.values().map(Vec::len).sum::<usize>(), 1);
+    assert_eq!(cache.inbound.values().map(Vec::len).sum::<usize>(), 1);
+    assert_eq!(cache.outbound[source_id.index()][0], None);
+    assert_eq!(cache.outbound[source_id.index()][1], Some(hidden_id));
+    assert!(!cache.link_cells[source_id.index()][1].linked());
+
+    let outbound = cache.outbound.clone();
+    let inbound = cache.inbound.clone();
+    let waiting = cache.waiting.clone();
+    let linear_blocks = cache.linear_blocks.clone();
+    let graph_epochs = cache.block_link_epochs.clone();
+    let cells = cache.link_cells[source_id.index()].clone();
+    let portal_handles = cells
+        .each_ref()
+        .map(|cell| cell.portal.load(Ordering::Acquire));
+
+    for residency_epoch in 1..=16 {
+        assert_eq!(cache.suspend_decode_slot(1), 1);
+        assert!(!cache.is_link_visible(source_id));
+        assert_eq!(cache.block_link_epochs, graph_epochs);
+        cache
+            .refresh_decode_residency(source, residency_epoch)
+            .expect("source revalidation");
+        assert!(cache.is_link_visible(source_id));
+        assert!(!cache.is_link_visible(hidden_id));
+        assert_eq!(cache.outbound, outbound);
+        assert_eq!(cache.inbound, inbound);
+        assert_eq!(cache.waiting, waiting);
+        assert_eq!(cache.linear_blocks, linear_blocks);
+        assert_eq!(cache.block_link_epochs, graph_epochs);
+        assert_eq!(
+            cells
+                .each_ref()
+                .map(|cell| cell.portal.load(Ordering::Acquire)),
+            portal_handles
+        );
+    }
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn retired_slot_dependencies_do_not_hide_a_reused_metadata_portal() {
+    let mut cache = BlockCache::new(8);
+    let old = key(0x5000);
+    let old_id = install_with_fetch_lens(&mut cache, old, &[2, 2]);
+    let portal_address = cache.block_portals[old_id.index()].address();
+    let dependency_capacity = cache.decode_dependencies[0].capacity();
+    let block_slot_capacity = cache.block_decode_slots[old_id.index()].capacity();
+
+    assert_eq!(cache.invalidate_physical_range(old.physical, 4), 1);
+    assert!(cache.decode_dependencies[0].is_empty());
+    assert!(cache.block_decode_slots[old_id.index()].is_empty());
+    assert!(cache.decode_dependencies[0].capacity() >= dependency_capacity);
+    assert!(cache.block_decode_slots[old_id.index()].capacity() >= block_slot_capacity);
+
+    let replacement = key(0x5001);
+    let replacement_id = install_with_fetch_lens(&mut cache, replacement, &[1]);
+    assert_eq!(replacement_id.index(), old_id.index());
+    assert_eq!(
+        cache.block_portals[replacement_id.index()].address(),
+        portal_address
+    );
+    assert_eq!(cache.suspend_decode_slot(0), 0);
+    assert!(cache.is_link_visible(replacement_id));
+    assert_eq!(cache.suspend_decode_slot(1), 1);
+    assert!(!cache.is_link_visible(replacement_id));
+
+    let replacement_dependency_capacity = cache.decode_dependencies[1].capacity();
+    cache.clear();
+    assert!(cache.decode_dependencies[1].is_empty());
+    assert!(cache.decode_dependencies[1].capacity() >= replacement_dependency_capacity);
+    assert!(cache.block_decode_slots[replacement_id.index()].is_empty());
 }
 
 #[test]
@@ -652,19 +910,21 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     source_compilation
         .code
         .extend_from_slice(&(source_cell_address as u64).to_le_bytes());
-    source_compilation.code.extend_from_slice(&[0xff, 0x20]);
+    source_compilation
+        .code
+        .extend_from_slice(&[0x48, 0x8b, 0x00, 0xff, 0x20]);
     let source_id = cache.install(&source_compilation).expect("source install");
     let target_id = install_trivial(&mut cache, target, 1);
     let dead_id = install_trivial(&mut cache, dead, 1);
     let source_cell = cache.link_cells[source_id.index()][0].clone();
     let old_source_entry = cache.block(source_id).expect("source").entry;
     let old_target_body = cache.block(target_id).expect("target").body_ptr();
-    let link_epochs = cache.block_link_epochs.clone();
-    assert_eq!(source_cell.body.load(Ordering::Acquire), old_target_body);
+    assert_eq!(cell_body(&source_cell), old_target_body);
     let old_entry: extern "C" fn() =
         unsafe { std::mem::transmute(cache.block(source_id).expect("source").entry_ptr()) };
     old_entry();
     assert_eq!(cache.invalidate_physical_range(dead.physical, 1), 1);
+    let link_epochs = cache.block_link_epochs.clone();
 
     assert!(cache.compact_arena());
 
@@ -673,10 +933,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     assert_ne!(relocated_source.entry, old_source_entry);
     assert_ne!(relocated_target.body_ptr(), old_target_body);
     assert_eq!(source_cell.address(), source_cell_address);
-    assert_eq!(
-        source_cell.body.load(Ordering::Acquire),
-        relocated_target.body_ptr()
-    );
+    assert_eq!(cell_body(&source_cell), relocated_target.body_ptr());
     assert_eq!(cache.block_link_epochs, link_epochs);
     assert!(cache.range_hits_compiled_code(source.physical, 1));
     assert!(cache.range_hits_compiled_code(target.physical, 1));
@@ -690,7 +947,7 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     let stats = cache.take_stats();
     assert_eq!(stats.arena_compactions, 1);
     assert_eq!(stats.arena_compaction_live_blocks, 2);
-    assert_eq!(stats.arena_compaction_bytes, 13);
+    assert_eq!(stats.arena_compaction_bytes, 16);
     assert_eq!(stats.arena_compaction_failures, 0);
     assert_eq!(stats.cache_resets, 0);
 }
@@ -725,9 +982,7 @@ fn unresolved_waiting_edge_survives_arena_compaction() {
     let target_id = install_trivial(&mut cache, target, 1);
     assert_eq!(cache.outbound[source_id.index()][0], Some(target_id));
     assert_eq!(
-        cache.link_cells[source_id.index()][0]
-            .body
-            .load(Ordering::Acquire),
+        cell_body(&cache.link_cells[source_id.index()][0]),
         cache.block(target_id).expect("target").body_ptr()
     );
 }
@@ -773,6 +1028,55 @@ fn translation_invalid_blocks_stay_invisible_through_compaction() {
         .expect("target revalidation");
     assert!(source_cell.linked());
     assert_eq!(cache.outbound[source_id.index()][0], Some(target_id));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn compaction_republishes_only_portals_that_were_visible() {
+    let mut cache = BlockCache::new(8);
+    let hidden = key(0x3000);
+    let visible = key(0x3001);
+    let hidden_id = install_trivial(&mut cache, hidden, 1);
+    let visible_id = install_trivial(&mut cache, visible, 1);
+    let old_visible_body = cache.block_portals[visible_id.index()]
+        .body
+        .load(Ordering::Acquire);
+
+    assert_eq!(cache.suspend_decode_slot(0), 1);
+    assert!(!cache.is_link_visible(hidden_id));
+    assert!(cache.is_link_visible(visible_id));
+    assert!(cache.compact_arena());
+
+    assert_eq!(
+        cache.block_portals[hidden_id.index()]
+            .body
+            .load(Ordering::Acquire),
+        0
+    );
+    assert!(!cache.is_link_visible(hidden_id));
+    assert!(cache.is_link_visible(visible_id));
+    assert_ne!(
+        cache.block_portals[visible_id.index()]
+            .body
+            .load(Ordering::Acquire),
+        old_visible_body
+    );
+    cache
+        .refresh_decode_residency(hidden, 1)
+        .expect("hidden block revalidation");
+    assert!(cache.is_link_visible(hidden_id));
+    assert_eq!(
+        cache.block_portals[hidden_id.index()]
+            .body
+            .load(Ordering::Acquire),
+        cache
+            .block(hidden_id)
+            .expect("relocated hidden block")
+            .body_ptr()
+    );
 }
 
 #[cfg(any(

@@ -485,7 +485,7 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
     assert!(native.decode_cache.line_live(COLLISION, true));
     assert!(
         !native.jit_direct.has_linked_successor(source),
-        "evicting the target page must clear the source's inbound edge"
+        "evicting the target slot must hide its portal from the source edge"
     );
 
     for cpu in [&mut native, &mut interp] {
@@ -556,7 +556,7 @@ fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
     );
     assert_eq!(
         after.jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
-        0
+        1
     );
 }
 

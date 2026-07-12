@@ -326,8 +326,14 @@ impl CpuGsw {
                 .decode_cache
                 .put(lin, insn, cs.default_size_32, physical);
             #[cfg(feature = "jit")]
-            if let Some(page) = inserted.evicted_linear_page {
-                self.jit_direct.hide_decode_page(page);
+            if let Some(slot) = inserted.evicted_slot {
+                if self.decode_cache.line_count() == self.jit_direct.decode_slot_count() {
+                    self.jit_direct.suspend_decode_slot(slot as usize);
+                } else {
+                    // A test-only cache-size replacement makes slot identities incomparable.
+                    // Hiding all portals is the conservative equivalent of an exact suspension.
+                    self.jit_direct.invalidate_translation();
+                }
             }
             #[cfg(not(feature = "jit"))]
             let _ = inserted;

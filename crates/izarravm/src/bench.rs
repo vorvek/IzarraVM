@@ -1006,6 +1006,8 @@ pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "jit_direct_arena_compaction_failures": perf.jit_direct_arena_compaction_failures,
         "jit_direct_links_created": perf.jit_direct_links_created,
         "jit_direct_links_cleared": perf.jit_direct_links_cleared,
+        "jit_direct_decode_dependencies_scanned": perf.jit_direct_decode_dependencies_scanned,
+        "jit_direct_portals_hidden": perf.jit_direct_portals_hidden,
         "jit_native_block_ns": perf.jit_native_block_ns,
         "jit_native_block_samples": perf.jit_native_block_samples,
         "jit_native_load_hits": perf.jit_native_load_hits,
@@ -1027,6 +1029,7 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
          map_inv={}  dev_write[range/bytes/hit/coarse]={}/{}/{}/{}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}  \
          jit[entries/insns/native/helper]={}/{}/{}/{} direct[e/i/x/link/unres/defer]={}/{}/{}/{}/{}/{}  \
          compile[attempt/installed/ns]={}/{}/{} lookup[hot/hash/miss]={}/{}/{} links[new/clear/reset]={}/{}/{}  \
+         portal[scan/hide]={}/{}  \
          arena[compact/live/bytes/fail]={}/{}/{}/{}  \
          gate[obs/shadow/agg/mode/top/cs/cpl/data/align/fetch/short/budget]={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}  \
          jit_mem[load/store/tlb/helper]={}/{}/{}/{}  jit_time[ns/samples]={}/{}",
@@ -1084,6 +1087,8 @@ pub(super) fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCount
         perf.jit_direct_links_created,
         perf.jit_direct_links_cleared,
         perf.jit_direct_cache_resets,
+        perf.jit_direct_decode_dependencies_scanned,
+        perf.jit_direct_portals_hidden,
         perf.jit_direct_arena_compactions,
         perf.jit_direct_arena_compaction_live_blocks,
         perf.jit_direct_arena_compaction_bytes,

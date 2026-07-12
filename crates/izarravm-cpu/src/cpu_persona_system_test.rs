@@ -873,6 +873,52 @@ fn decode_cache_hits_only_on_matching_tag_and_generation() {
     );
 }
 
+#[test]
+fn decode_cache_reports_only_live_key_eviction_slots() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let mut insn = cpu.decode(&mut bus).unwrap();
+    let mut cache = DecodeCache::new(4);
+
+    let first = cache.put(0x100, insn, false, 0x100);
+    assert!(first.inserted);
+    assert_eq!(first.evicted_slot, None);
+
+    let refill = cache.put(0x100, insn, false, 0x100);
+    assert!(refill.inserted);
+    assert_eq!(refill.evicted_slot, None);
+
+    let different_decode_key = cache.put(0x100, insn, true, 0x100);
+    assert!(different_decode_key.inserted);
+    assert_eq!(different_decode_key.evicted_slot, Some(0));
+
+    cache.invalidate_and_clear_code_marks();
+    let dead_collision = cache.put(0x104, insn, false, 0x104);
+    assert!(dead_collision.inserted);
+    assert_eq!(dead_collision.evicted_slot, None);
+
+    insn.len = 2;
+    let rejected = cache.put(0x0fff, insn, false, 0x0fff);
+    assert!(!rejected.inserted);
+    assert_eq!(rejected.evicted_slot, None);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn direct_dependency_slots_match_the_decode_cache_after_clone() {
+    let cpu = CpuGsw::default();
+    assert_eq!(
+        cpu.jit_direct.decode_slot_count(),
+        cpu.decode_cache.line_count()
+    );
+
+    let cloned = cpu.clone();
+    assert_eq!(
+        cloned.jit_direct.decode_slot_count(),
+        cloned.decode_cache.line_count()
+    );
+}
+
 #[cfg(all(
     feature = "jit",
     target_arch = "x86_64",
@@ -915,16 +961,16 @@ fn decode_cache_replacement_and_refill_retain_conservative_native_marks() {
 
     let first = cache.put(0x100, insn, false, 0x100);
     assert!(first.inserted);
-    assert_eq!(first.evicted_linear_page, None);
+    assert_eq!(first.evicted_slot, None);
     let refill = cache.put(0x100, insn, false, 0x100);
     assert!(refill.inserted);
-    assert_eq!(refill.evicted_linear_page, None);
+    assert_eq!(refill.evicted_slot, None);
     assert_eq!(cache.native_code_watch.precise_pages(), 1);
     cache.assert_native_watch_consistent();
 
     let replacement = cache.put(0x102, insn, false, 0x108);
     assert!(replacement.inserted);
-    assert_eq!(replacement.evicted_linear_page, Some(0));
+    assert_eq!(replacement.evicted_slot, Some(0));
     assert!(cache.native_code_watch.is_watched(0x100));
     assert_eq!(cache.native_code_watch.precise_pages(), 1);
     cache.assert_native_watch_consistent();

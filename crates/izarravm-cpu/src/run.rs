@@ -769,12 +769,16 @@ impl CpuGsw {
                     .expect("installed direct block must be live")
             }
         };
-        let residency_epoch = self.decode_cache.residency_epoch();
-        let block = if block.decode_residency_epoch() == residency_epoch
-            && self.jit_direct.is_link_visible(block.id())
-        {
+        // Tests can replace the decode cache with a different direct-map size. Its slots no
+        // longer name the backend's dependency lists, so hide every portal and take the checked
+        // root path until the sizes agree again.
+        if self.decode_cache.line_count() != self.jit_direct.decode_slot_count() {
+            self.jit_direct.invalidate_translation();
+        }
+        let block = if self.jit_direct.is_link_visible(block.id()) {
             block
         } else {
+            let residency_epoch = self.decode_cache.residency_epoch();
             let mut slot_lin = block.span().key.linear;
             if block.fetch_lens().iter().any(|&len| {
                 let live = self.decode_cache.line_live(slot_lin, d);
@@ -847,6 +851,8 @@ impl CpuGsw {
         self.perf.jit_direct_arena_compaction_failures += stats.arena_compaction_failures;
         self.perf.jit_direct_links_created += stats.links;
         self.perf.jit_direct_links_cleared += stats.unlinks;
+        self.perf.jit_direct_decode_dependencies_scanned += stats.decode_dependencies_scanned;
+        self.perf.jit_direct_portals_hidden += stats.portals_hidden;
     }
 
     #[cfg(feature = "jit")]

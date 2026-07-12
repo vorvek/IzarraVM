@@ -9,7 +9,7 @@ mod emit;
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU32, AtomicUsize, Ordering},
     },
 };
@@ -61,6 +61,7 @@ const MAX_MEMORY_ALU_BLOCK_INSTRUCTIONS: usize = 4;
 const MAX_MEMORY_ALU_SLOTS: u8 = 3;
 pub(crate) const MAX_X87_BLOCK_CORE_CLOCKS: u64 = 3_928;
 const DEFAULT_ENTRY_CAP: usize = 131_072;
+const DEFAULT_DECODE_SLOT_COUNT: usize = 4_096;
 const BLOCK_PAGE_SHIFT: u32 = 12;
 #[cfg(not(test))]
 const DEFAULT_ADMISSION_HEAT: u8 = 8;
@@ -74,38 +75,80 @@ struct LinkTarget {
 }
 
 #[repr(C)]
-struct LinkCell {
+struct BlockPortal {
     body: AtomicUsize,
-    target_eip: AtomicU32,
 }
 
-impl LinkCell {
+impl BlockPortal {
     fn new() -> Self {
         Self {
             body: AtomicUsize::new(0),
-            target_eip: AtomicU32::new(0),
         }
     }
 
     fn address(&self) -> usize {
-        std::ptr::from_ref(&self.body) as usize
+        std::ptr::from_ref(self) as usize
     }
 
     fn clear(&self) {
         self.body.store(0, Ordering::Release);
     }
 
-    fn set(&self, body: usize) {
+    fn publish(&self, body: usize) {
+        debug_assert_ne!(body, 0);
         self.body.store(body, Ordering::Release);
     }
 
-    fn set_dynamic(&self, target_eip: u32, body: usize) {
+    fn visible(&self) -> bool {
+        self.body.load(Ordering::Acquire) != 0
+    }
+}
+
+fn zero_portal() -> &'static BlockPortal {
+    static ZERO_PORTAL: OnceLock<BlockPortal> = OnceLock::new();
+    ZERO_PORTAL.get_or_init(BlockPortal::new)
+}
+
+#[repr(C)]
+struct LinkCell {
+    portal: AtomicUsize,
+    target_eip: AtomicU32,
+}
+
+impl LinkCell {
+    fn new() -> Self {
+        Self {
+            portal: AtomicUsize::new(zero_portal().address()),
+            target_eip: AtomicU32::new(0),
+        }
+    }
+
+    fn address(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    fn clear(&self) {
+        self.portal
+            .store(zero_portal().address(), Ordering::Release);
+    }
+
+    fn set(&self, portal: &BlockPortal) {
+        self.portal.store(portal.address(), Ordering::Release);
+    }
+
+    fn set_dynamic(&self, target_eip: u32, portal: &BlockPortal) {
         self.target_eip.store(target_eip, Ordering::Relaxed);
-        self.body.store(body, Ordering::Release);
+        self.set(portal);
     }
 
     fn linked(&self) -> bool {
-        self.body.load(Ordering::Acquire) != 0
+        let portal = self.portal.load(Ordering::Acquire);
+        if portal == zero_portal().address() {
+            return false;
+        }
+        // A live cache owns every published portal in stable Arc storage. BlockCache::drop clears
+        // every cell to the permanent sentinel before releasing that storage.
+        unsafe { &*(portal as *const BlockPortal) }.visible()
     }
 }
 
@@ -127,6 +170,8 @@ pub(crate) struct BlockCacheStats {
     pub arena_compaction_failures: u64,
     pub links: u64,
     pub unlinks: u64,
+    pub decode_dependencies_scanned: u64,
+    pub portals_hidden: u64,
 }
 
 /// Everything that can change the meaning of bytes at a linear entry point.
@@ -352,10 +397,6 @@ impl CompiledBlock {
         self.body_entry
     }
 
-    pub(crate) fn decode_residency_epoch(&self) -> u64 {
-        self.decode_residency_epoch
-    }
-
     pub(crate) fn fetch_lens(&self) -> &[u8] {
         &self.fetch_lens[..usize::from(self.span.instructions)]
     }
@@ -483,6 +524,7 @@ pub(crate) struct BlockCache {
     entries: HashMap<BlockKey, BlockState>,
     physical_keys: HashMap<u32, Vec<BlockKey>, U32BuildHasher>,
     blocks: Vec<CompiledBlock>,
+    block_portals: Vec<Arc<BlockPortal>>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
     link_sources: HashMap<usize, LinkSource>,
     outbound: Vec<[Option<BlockId>; 2]>,
@@ -490,7 +532,9 @@ pub(crate) struct BlockCache {
     inbound: HashMap<BlockId, Vec<LinkSource>>,
     waiting: HashMap<LinkTarget, Vec<LinkSource>>,
     linear_blocks: HashMap<LinkTarget, BlockId>,
-    linear_pages: HashMap<u32, Vec<BlockId>, U32BuildHasher>,
+    decode_dependencies: Box<[Vec<BlockId>]>,
+    block_decode_slots: Vec<Vec<u32>>,
+    decode_slot_mask: usize,
     block_link_epochs: Vec<u64>,
     link_epoch: u64,
     block_active: Vec<bool>,
@@ -518,16 +562,30 @@ impl Default for BlockCache {
         // Executable arena pressure normally resets compiled code first. Keep a separate, much
         // larger bound for seen and rejected keys so unsupported one-shot code cannot grow the
         // metadata maps without limit during a long-running guest.
-        Self::with_entry_cap(DEFAULT_ENTRY_CAP)
+        Self::new(DEFAULT_DECODE_SLOT_COUNT)
     }
 }
 
 impl BlockCache {
+    pub(crate) fn new(decode_slot_count: usize) -> Self {
+        Self::with_entry_cap_and_decode_slots(DEFAULT_ENTRY_CAP, decode_slot_count)
+    }
+
+    #[cfg(test)]
     fn with_entry_cap(entry_cap: usize) -> Self {
+        Self::with_entry_cap_and_decode_slots(entry_cap, DEFAULT_DECODE_SLOT_COUNT)
+    }
+
+    fn with_entry_cap_and_decode_slots(entry_cap: usize, decode_slot_count: usize) -> Self {
+        assert!(
+            decode_slot_count.is_power_of_two(),
+            "decode slot count must be a nonzero power of two"
+        );
         Self {
             entries: HashMap::new(),
             physical_keys: HashMap::default(),
             blocks: Vec::new(),
+            block_portals: Vec::new(),
             link_cells: Vec::new(),
             link_sources: HashMap::new(),
             outbound: Vec::new(),
@@ -535,7 +593,12 @@ impl BlockCache {
             inbound: HashMap::new(),
             waiting: HashMap::new(),
             linear_blocks: HashMap::new(),
-            linear_pages: HashMap::default(),
+            decode_dependencies: (0..decode_slot_count)
+                .map(|_| Vec::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            block_decode_slots: Vec::new(),
+            decode_slot_mask: decode_slot_count - 1,
             block_link_epochs: Vec::new(),
             link_epoch: 1,
             block_active: Vec::new(),
@@ -557,6 +620,10 @@ impl BlockCache {
             #[cfg(test)]
             fast_map_enabled_for_test: false,
         }
+    }
+
+    pub(crate) fn decode_slot_count(&self) -> usize {
+        self.decode_dependencies.len()
     }
 
     pub(crate) fn auto_admit(&self) -> bool {
@@ -651,6 +718,7 @@ impl BlockCache {
         {
             return None;
         }
+        let (decode_slots, decode_slot_len) = self.compilation_decode_slots(compilation)?;
         if self.arena.as_ref().is_some_and(ExecutableArena::is_full) {
             let capacity = self
                 .arena
@@ -716,13 +784,27 @@ impl BlockCache {
             .acquire_range(span.key.physical, u32::from(span.guest_len));
         if index == self.blocks.len() {
             self.blocks.push(block);
+            if index == self.block_portals.len() {
+                self.block_portals.push(Arc::new(BlockPortal::new()));
+            } else {
+                debug_assert!(index < self.block_portals.len());
+                self.block_portals[index].clear();
+            }
             self.link_cells.push(compilation.link_cells.clone());
             self.outbound.push([None, None]);
             self.dynamic_next_slots.push(0);
             self.block_link_epochs.push(0);
             self.block_active.push(true);
+            if index == self.block_decode_slots.len() {
+                self.block_decode_slots.push(Vec::new());
+            } else {
+                debug_assert!(index < self.block_decode_slots.len());
+                self.block_decode_slots[index].clear();
+            }
         } else {
             debug_assert!(!self.block_active[index]);
+            debug_assert!(!self.block_portals[index].visible());
+            debug_assert!(self.block_decode_slots[index].is_empty());
             self.blocks[index] = block;
             self.link_cells[index] = compilation.link_cells.clone();
             self.outbound[index] = [None, None];
@@ -730,16 +812,13 @@ impl BlockCache {
             self.block_link_epochs[index] = 0;
             self.block_active[index] = true;
         }
+        self.register_decode_dependencies(id, &decode_slots[..decode_slot_len]);
         if compilation.dynamic_successor {
             let cell = &compilation.link_cells[0];
             self.link_sources
                 .insert(cell.address(), LinkSource { block: id, slot: 0 });
         }
         self.live_blocks += 1;
-        self.linear_pages
-            .entry(span.key.linear >> BLOCK_PAGE_SHIFT)
-            .or_default()
-            .push(id);
         self.entries.insert(span.key, BlockState::Compiled(id));
         self.hot[span.key.hot_index()] = Some(HotEntry {
             key: span.key,
@@ -802,6 +881,11 @@ impl BlockCache {
     /// eligible as a successor again until its decode lines have been checked in the new decode
     /// residency epoch.
     pub(crate) fn invalidate_translation(&mut self) {
+        for (index, portal) in self.block_portals.iter().enumerate() {
+            if self.block_active.get(index) == Some(&true) {
+                portal.clear();
+            }
+        }
         let mut links = 0;
         for sources in self.inbound.values() {
             for source in sources {
@@ -824,32 +908,37 @@ impl BlockCache {
         }
     }
 
-    /// Hide every compiled entry on a linear page whose live decode line was displaced. Code
-    /// bytes remain installed, but no root or linked predecessor may enter them until the root
-    /// residency scan republishes the block.
-    pub(crate) fn hide_decode_page(&mut self, linear_page: u32) {
-        let mut offset = 0;
-        while let Some(id) = self
-            .linear_pages
-            .get(&linear_page)
-            .and_then(|blocks| blocks.get(offset))
-            .copied()
-        {
-            offset += 1;
+    /// Hide every block that depends on one displaced decode slot. Logical links stay intact and
+    /// will become usable again when residency validation republishes the matching portals.
+    pub(crate) fn suspend_decode_slot(&mut self, slot: usize) -> usize {
+        let Some(dependency_len) = self.decode_dependencies.get(slot).map(Vec::len) else {
+            return 0;
+        };
+        self.stats.decode_dependencies_scanned = self
+            .stats
+            .decode_dependencies_scanned
+            .saturating_add(dependency_len as u64);
+        let mut hidden = 0;
+        for offset in 0..dependency_len {
+            let id = self.decode_dependencies[slot][offset];
             let Some(index) = self.active_index(id) else {
                 continue;
             };
-            if self.block_link_epochs.get(index).copied() != Some(self.link_epoch) {
+            if !self.block_portals[index].visible() {
                 continue;
             }
-            self.unlink_block(id);
-            self.block_link_epochs[index] = 0;
+            debug_assert_eq!(self.block_link_epochs[index], self.link_epoch);
+            self.block_portals[index].clear();
+            hidden += 1;
         }
+        self.stats.portals_hidden = self.stats.portals_hidden.saturating_add(hidden as u64);
+        hidden
     }
 
     pub(crate) fn is_link_visible(&self, id: BlockId) -> bool {
-        self.active_index(id)
-            .is_some_and(|index| self.block_link_epochs[index] == self.link_epoch)
+        self.active_index(id).is_some_and(|index| {
+            self.block_link_epochs[index] == self.link_epoch && self.block_portals[index].visible()
+        })
     }
 
     /// Remove direct-cache entries whose translated physical bytes overlap a guest write. Block
@@ -1062,6 +1151,51 @@ impl BlockCache {
         .then_some(index)
     }
 
+    fn compilation_decode_slots(
+        &self,
+        compilation: &Compilation,
+    ) -> Option<([u32; MAX_BLOCK_INSTRUCTIONS], usize)> {
+        let mut slots = [0u32; MAX_BLOCK_INSTRUCTIONS];
+        let mut slot_len = 0;
+        let mut linear = compilation.span.key.linear;
+        for &fetch_len in compilation
+            .fetch_lens
+            .iter()
+            .take(usize::from(compilation.span.instructions))
+        {
+            if fetch_len == 0 {
+                return None;
+            }
+            let slot = (linear as usize) & self.decode_slot_mask;
+            let slot = u32::try_from(slot).ok()?;
+            if !slots[..slot_len].contains(&slot) {
+                slots[slot_len] = slot;
+                slot_len += 1;
+            }
+            linear = linear.checked_add(u32::from(fetch_len))?;
+        }
+        (linear.wrapping_sub(compilation.span.key.linear) == u32::from(compilation.span.guest_len))
+            .then_some((slots, slot_len))
+    }
+
+    fn register_decode_dependencies(&mut self, id: BlockId, slots: &[u32]) {
+        let index = self
+            .active_index(id)
+            .expect("decode dependencies require an active block");
+        debug_assert!(self.block_decode_slots[index].is_empty());
+        for &slot in slots {
+            let slot_index = slot as usize;
+            self.decode_dependencies[slot_index].push(id);
+            self.block_decode_slots[index].push(slot);
+        }
+    }
+
+    fn unregister_decode_dependencies(&mut self, id: BlockId, index: usize) {
+        for slot in self.block_decode_slots[index].drain(..) {
+            self.decode_dependencies[slot as usize].retain(|candidate| *candidate != id);
+        }
+    }
+
     fn fresh_block_id(&mut self, index: usize) -> Option<BlockId> {
         let index = u16::try_from(index).ok()?;
         let id = BlockId::new(index, self.next_block_generation)?;
@@ -1141,9 +1275,16 @@ impl BlockCache {
             }
         }
 
-        for cells in &self.link_cells {
-            cells[0].clear();
-            cells[1].clear();
+        let portal_visibility: Vec<_> = self
+            .block_portals
+            .iter()
+            .enumerate()
+            .map(|(index, portal)| self.block_active.get(index) == Some(&true) && portal.visible())
+            .collect();
+        for (index, portal) in self.block_portals.iter().enumerate() {
+            if self.block_active.get(index) == Some(&true) {
+                portal.clear();
+            }
         }
         for block in self
             .blocks
@@ -1158,17 +1299,9 @@ impl BlockCache {
             self.blocks[index].entry = entry;
             self.blocks[index].body_entry = body_entry;
         }
-        for (source_index, targets) in self.outbound.iter().enumerate() {
-            if !self.block_active[source_index] {
-                continue;
-            }
-            for (slot, target) in targets.iter().copied().enumerate() {
-                if let Some(target) = target {
-                    let target_index = self
-                        .active_index(target)
-                        .expect("outbound target was validated before relocation");
-                    self.link_cells[source_index][slot].set(self.blocks[target_index].body_ptr());
-                }
+        for (index, portal) in self.block_portals.iter().enumerate() {
+            if portal_visibility.get(index) == Some(&true) {
+                portal.publish(self.blocks[index].body_ptr());
             }
         }
 
@@ -1192,6 +1325,9 @@ impl BlockCache {
             .flatten()
             .filter(|target| target.is_some())
             .count() as u64;
+        for portal in &self.block_portals {
+            portal.clear();
+        }
         for cells in &self.link_cells {
             cells[0].clear();
             cells[1].clear();
@@ -1208,7 +1344,12 @@ impl BlockCache {
         self.inbound.clear();
         self.waiting.clear();
         self.linear_blocks.clear();
-        self.linear_pages.clear();
+        for dependencies in &mut self.decode_dependencies {
+            dependencies.clear();
+        }
+        for slots in &mut self.block_decode_slots {
+            slots.clear();
+        }
         self.block_link_epochs.clear();
         self.code_watch.clear();
         self.block_active.clear();
@@ -1287,16 +1428,17 @@ impl BlockCache {
         if self.outbound[source_index][slot_index] == Some(target) {
             if let Some(target_eip) = target_eip {
                 self.link_cells[source_index][slot_index]
-                    .set_dynamic(target_eip, self.blocks[target_index].body_ptr());
+                    .set_dynamic(target_eip, self.block_portals[target_index].as_ref());
             }
             return true;
         }
         self.unlink_outbound(source, slot);
         if let Some(target_eip) = target_eip {
             self.link_cells[source_index][slot_index]
-                .set_dynamic(target_eip, self.blocks[target_index].body_ptr());
+                .set_dynamic(target_eip, self.block_portals[target_index].as_ref());
         } else {
-            self.link_cells[source_index][slot_index].set(self.blocks[target_index].body_ptr());
+            self.link_cells[source_index][slot_index]
+                .set(self.block_portals[target_index].as_ref());
         }
         self.outbound[source_index][slot_index] = Some(target);
         self.inbound.entry(target).or_default().push(LinkSource {
@@ -1371,21 +1513,14 @@ impl BlockCache {
             return;
         };
         let span = self.blocks[index].span;
+        self.block_portals[index].clear();
+        self.block_link_epochs[index] = 0;
+        self.unregister_decode_dependencies(id, index);
         if self.blocks[index].dynamic_successor {
             self.link_sources
                 .remove(&self.link_cells[index][0].address());
         }
         self.unlink_block(id);
-        let linear_page = span.key.linear >> BLOCK_PAGE_SHIFT;
-        let remove_page = if let Some(blocks) = self.linear_pages.get_mut(&linear_page) {
-            blocks.retain(|candidate| *candidate != id);
-            blocks.is_empty()
-        } else {
-            false
-        };
-        if remove_page {
-            self.linear_pages.remove(&linear_page);
-        }
         self.block_active[index] = false;
         self.blocks[index].entry = 0;
         self.blocks[index].body_entry = 0;
@@ -1408,8 +1543,12 @@ impl BlockCache {
             return;
         };
         if self.block_link_epochs.get(index).copied() == Some(self.link_epoch) {
+            if !self.block_portals[index].visible() {
+                self.block_portals[index].publish(self.blocks[index].body_ptr());
+            }
             return;
         }
+        self.block_portals[index].clear();
         self.block_link_epochs[index] = self.link_epoch;
         let span = self.blocks[index].span;
         let target = LinkTarget {
@@ -1419,6 +1558,7 @@ impl BlockCache {
         self.linear_blocks.insert(target, id);
         self.resolve_successors(id);
         self.resolve_waiting(target, id);
+        self.block_portals[index].publish(self.blocks[index].body_ptr());
     }
 }
 
@@ -1438,13 +1578,30 @@ impl PartialEq for BlockCache {
 
 impl Eq for BlockCache {}
 
+impl Drop for BlockCache {
+    fn drop(&mut self) {
+        for portal in &self.block_portals {
+            portal.clear();
+        }
+        for cells in &self.link_cells {
+            cells[0].clear();
+            cells[1].clear();
+        }
+    }
+}
+
 impl Clone for BlockCache {
     fn clone(&self) -> Self {
-        Self {
-            backend_enabled: self.backend_enabled,
-            admission_heat: self.admission_heat,
-            ..Self::default()
+        let mut cache = Self::new(self.decode_slot_count());
+        cache.backend_enabled = self.backend_enabled;
+        cache.admission_heat = self.admission_heat;
+        cache.entry_cap = self.entry_cap;
+        #[cfg(test)]
+        {
+            cache.defer_short_for_test = self.defer_short_for_test;
+            cache.fast_map_enabled_for_test = self.fast_map_enabled_for_test;
         }
+        cache
     }
 }
 

@@ -1025,7 +1025,7 @@ impl Machine {
                     status = DEVICE_NOT_FOUND;
                 }
             }
-            0xB108 | 0xB109 | 0xB10A | 0xB10B | 0xB10C | 0xB10D => {
+            0xB108..=0xB10D => {
                 let bx = self.cpu.registers.ebx() as u16;
                 let bus = (bx >> 8) as u8;
                 let devfn = bx as u8;
