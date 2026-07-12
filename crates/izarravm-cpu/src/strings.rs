@@ -70,11 +70,13 @@ impl CpuGsw {
         let access_upper = byte_cost.saturating_mul(u64::from(width.bytes()));
         let per_iteration = access_upper.saturating_mul(Self::rep_memory_accesses(op));
         let paging_setup = if self.is_paging_enabled() {
-            // A cold two-level walk reads at most one PDE and one PTE for each string operand.
-            byte_cost
-                .saturating_mul(4)
-                .saturating_mul(2)
+            let Some(walk_cost) = bus.rep_page_walk_cost_upper() else {
+                return Some(0);
+            };
+            let translations_per_operand = if width == BusWidth::Byte { 1 } else { 2 };
+            walk_cost
                 .saturating_mul(Self::rep_memory_accesses(op))
+                .saturating_mul(translations_per_operand)
         } else {
             0
         };
@@ -87,13 +89,7 @@ impl CpuGsw {
             .checked_div(per_iteration)
             .unwrap_or(u64::from(Self::MAX_BUDGETED_REP_ITERATIONS))
             .min(u64::from(Self::MAX_BUDGETED_REP_ITERATIONS)) as u32;
-        // Once fetch and core have already been charged, a permanently tiny event interval must
-        // still make forward progress. The overshoot is then bounded to one string iteration.
-        Some(if limit == 0 && self.rep_resume_active {
-            1
-        } else {
-            limit
-        })
+        Some(limit)
     }
 
     fn rep_budget_exhausted<B: CpuBus>(&self, bus: &B, op: StringOp) -> bool {
@@ -218,18 +214,27 @@ impl CpuGsw {
         physical: u32,
         width: BusWidth,
     ) -> Result<Option<u32>, BusError> {
-        if bus.direct_memory_bytes(physical, width.bytes() as usize, width)
-            != width.bytes() as usize
-        {
+        let access = width.bytes() as usize;
+        if bus.direct_memory_bytes(physical, access, width, BusAccessKind::DataRead) != access {
             return Ok(None);
         }
-        let read = bus.read_memory_direct(physical, width, BusAccessKind::DataRead)?;
-        self.record_data_read(BusAccessKind::DataRead, read.direct);
-        if read.direct {
-            Ok(Some(read.value))
-        } else {
-            Ok(None)
+        let mut bytes = [0u8; 4];
+        let got = bus.read_memory_bytes_direct(
+            physical,
+            &mut bytes[..access],
+            width,
+            BusAccessKind::DataRead,
+        )?;
+        debug_assert!(got == 0 || got == access);
+        if got != access {
+            return Ok(None);
         }
+        self.record_data_read(BusAccessKind::DataRead, true);
+        Ok(Some(match width {
+            BusWidth::Byte => u32::from(bytes[0]),
+            BusWidth::Word => u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+            BusWidth::Dword => u32::from_le_bytes(bytes),
+        }))
     }
 
     fn ranges_overlap(a: u32, b: u32, bytes: usize) -> bool {
@@ -381,8 +386,9 @@ impl CpuGsw {
                 let (_, dst) =
                     self.translate_segmented(bus, SegmentIndex::Es, dst_off, width.bytes(), true)?;
                 let bulk_direct = !Self::ranges_overlap(src, dst, bytes)
-                    && bus.direct_memory_bytes(src, bytes, width) == bytes
-                    && bus.direct_memory_bytes(dst, bytes, width) == bytes;
+                    && bus.direct_memory_bytes(src, bytes, width, BusAccessKind::DataRead) == bytes
+                    && bus.direct_memory_bytes(dst, bytes, width, BusAccessKind::DataWrite)
+                        == bytes;
                 if !bulk_direct {
                     return self
                         .finish_buffered_movs_first(bus, dst, width, first, address_size)
@@ -444,7 +450,7 @@ impl CpuGsw {
                 let bytes = iterations as usize * access;
                 let (_, dst) =
                     self.translate_segmented(bus, SegmentIndex::Es, dst_off, bytes as u32, true)?;
-                if bus.direct_memory_bytes(dst, bytes, width) != bytes {
+                if bus.direct_memory_bytes(dst, bytes, width, BusAccessKind::DataWrite) != bytes {
                     return Ok(None);
                 }
 
@@ -492,7 +498,7 @@ impl CpuGsw {
                 let bytes = iterations as usize * access;
                 let (_, src) =
                     self.translate_segmented(bus, src_segment, src_off, bytes as u32, false)?;
-                if bus.direct_memory_bytes(src, bytes, width) != bytes {
+                if bus.direct_memory_bytes(src, bytes, width, BusAccessKind::DataRead) != bytes {
                     return Ok(None);
                 }
 
@@ -615,15 +621,25 @@ impl CpuGsw {
         match prefixes.rep {
             None => self.string_step(bus, op, width, prefixes, address_size)?,
             Some(kind) => {
-                let chunk_limit = self.rep_chunk_limit(bus, op, width);
                 let mut chunk_iterations = 0u32;
+                let mut allowance = self.rep_chunk_limit(bus, op, width);
                 loop {
                     if self.string_count(address_size) == 0 {
                         break;
                     }
-                    let remaining = chunk_limit
-                        .map(|limit| limit.saturating_sub(chunk_iterations))
-                        .unwrap_or(u32::MAX);
+                    let remaining = match allowance {
+                        None => u32::MAX,
+                        Some(available) => {
+                            let natural = available.min(
+                                Self::MAX_BUDGETED_REP_ITERATIONS.saturating_sub(chunk_iterations),
+                            );
+                            if natural == 0 && self.rep_resume_active && chunk_iterations == 0 {
+                                1
+                            } else {
+                                natural
+                            }
+                        }
+                    };
                     if remaining == 0 {
                         self.rep_execution.yielded = true;
                         break;
@@ -640,12 +656,21 @@ impl CpuGsw {
                         self.perf.rep_string_iterations += u64::from(fast.iterations);
                         self.perf.rep_string_fast_iterations += u64::from(fast.iterations);
                         chunk_iterations = chunk_iterations.saturating_add(fast.iterations);
+                        if let Some(available) = allowance.as_mut() {
+                            *available = available.saturating_sub(fast.iterations);
+                        }
                         if fast.stop {
                             break;
                         }
+                        if let Some(refreshed) = self.rep_chunk_limit(bus, op, width) {
+                            allowance = Some(
+                                allowance.map_or(refreshed, |available| available.min(refreshed)),
+                            );
+                        }
                         if self.string_count(address_size) != 0
-                            && chunk_limit.is_some()
-                            && (chunk_limit.is_some_and(|limit| chunk_iterations >= limit)
+                            && self.rep_execution.budget.is_some()
+                            && (allowance == Some(0)
+                                || chunk_iterations >= Self::MAX_BUDGETED_REP_ITERATIONS
                                 || bus.requires_step_break()
                                 || self.rep_budget_exhausted(bus, op))
                         {
@@ -657,6 +682,9 @@ impl CpuGsw {
                     self.string_step(bus, op, width, prefixes, address_size)?;
                     self.perf.rep_string_iterations += 1;
                     chunk_iterations += 1;
+                    if let Some(available) = allowance.as_mut() {
+                        *available = available.saturating_sub(1);
+                    }
                     self.decrement_string_count(address_size);
                     // CMPS/SCAS also end the repeat on the ZF condition. REPE continues while
                     // ZF is set; REPNE continues while ZF is clear. MOVS/STOS/LODS ignore ZF.
@@ -670,9 +698,14 @@ impl CpuGsw {
                             break;
                         }
                     }
+                    if let Some(refreshed) = self.rep_chunk_limit(bus, op, width) {
+                        allowance =
+                            Some(allowance.map_or(refreshed, |available| available.min(refreshed)));
+                    }
                     if self.string_count(address_size) != 0
-                        && chunk_limit.is_some()
-                        && (chunk_limit.is_some_and(|limit| chunk_iterations >= limit)
+                        && self.rep_execution.budget.is_some()
+                        && (allowance == Some(0)
+                            || chunk_iterations >= Self::MAX_BUDGETED_REP_ITERATIONS
                             || bus.requires_step_break()
                             || self.rep_budget_exhausted(bus, op))
                     {

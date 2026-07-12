@@ -5,7 +5,11 @@ use super::*;
 
 impl CpuGsw {
     pub fn reset(&mut self) {
+        #[cfg(feature = "jit")]
+        let native_backend_enabled = self.jit_direct.backend_enabled();
         *self = Self::default();
+        #[cfg(feature = "jit")]
+        self.jit_direct.set_backend_enabled(native_backend_enabled);
     }
 
     /// Compute the six arithmetic flags `pending_flags` represents, returning the full eflags value with

@@ -486,9 +486,8 @@ pub(crate) unsafe extern "C" fn region_native_u8<B: CpuBus>(
 
     let result = cpu.charge_cached_fetch(bus, lin, len).and_then(|()| {
         if kind == SlotKind::MemLoadU8 {
-            let value = match cpu.read_direct_byte_page_cached(
+            let value = match cpu.read_direct_byte_page_cached_without_fast_map(
                 bus,
-                physical,
                 physical,
                 BusAccessKind::DataRead,
             )? {
@@ -508,9 +507,8 @@ pub(crate) unsafe extern "C" fn region_native_u8<B: CpuBus>(
         } else {
             let value = cpu.read_gpr8(reg);
             cpu.record_write_page(physical);
-            if let Some(changed) = cpu.write_direct_byte_page_cached(
+            if let Some(changed) = cpu.write_direct_byte_page_cached_without_fast_map(
                 bus,
-                physical,
                 physical,
                 value,
                 BusAccessKind::DataWrite,

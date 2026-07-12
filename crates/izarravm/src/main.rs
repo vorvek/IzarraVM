@@ -105,7 +105,8 @@ struct Cli {
     #[arg(long, group = "run_mode")]
     headless_profile_exe: Option<PathBuf>,
     /// Write profiling output as pretty JSON. Supported by --headless-profile-exe and
-    /// --hdd-folder. The parent directory must exist.
+    /// --hdd-folder. HDD machine-phase timing requires IZARRAVM_MACHINE_PROFILE or
+    /// IZARRAVM_CPU_PROFILE. The parent directory must exist.
     #[arg(long)]
     profile_json: Option<PathBuf>,
     /// Sample every Nth instruction in --headless-profile-exe.
@@ -717,10 +718,8 @@ fn run_boot_hdd_folder(
     let cpu_profile_stride = std::env::var("IZARRAVM_CPU_PROFILE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
-    let machine_profile = profile_json.is_some()
-        || std::env::var("IZARRAVM_MACHINE_PROFILE")
-            .ok()
-            .is_some_and(|value| !matches!(value.as_str(), "" | "0"));
+    let machine_profile_value = std::env::var("IZARRAVM_MACHINE_PROFILE").ok();
+    let machine_profile = machine_profile_requested(machine_profile_value.as_deref());
     if let Some(stride) = cpu_profile_stride {
         machine.enable_host_profiling(stride);
     } else if machine_profile {
@@ -810,8 +809,9 @@ fn run_boot_hdd_folder(
             }
         }
     }
-    if machine_profile {
-        bench::print_machine_profile(&machine.host_profile_snapshot(), wall);
+    let machine_profile_snapshot = machine.host_profile_snapshot();
+    if machine_profile_snapshot.machine_phase_timing_enabled {
+        bench::print_machine_profile(&machine_profile_snapshot, wall);
     }
     // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
     // always maintained, so unlike the sampled profile above this print costs nothing.
@@ -883,7 +883,8 @@ fn write_hdd_profile_json(
     let guest_seconds = master_ticks as f64 / MASTER_CLOCK_HZ as f64;
     let perf = machine.cpu().perf_counters();
     let instructions = perf.instructions.max(1);
-    let machine_phases = machine.host_profile_snapshot().phases;
+    let machine_profile = machine.host_profile_snapshot();
+    let machine_phases = machine_profile.phases;
     let classified_wall_ns = machine_phases
         .iter()
         .map(|phase| phase.wall_ns)
@@ -913,6 +914,7 @@ fn write_hdd_profile_json(
             "gametics": gametics,
             "realtics": realtics,
         })),
+        "machine_phase_timing_enabled": machine_profile.machine_phase_timing_enabled,
         "machine_phases": machine_phases.iter().map(|phase| json!({
             "name": phase.name,
             "wall_ns": phase.wall_ns,
@@ -924,6 +926,10 @@ fn write_hdd_profile_json(
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
+}
+
+fn machine_profile_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !matches!(value, "" | "0"))
 }
 
 fn validate_profile_json_parent(path: &Path) -> Result<(), Box<dyn Error>> {

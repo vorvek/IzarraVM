@@ -71,6 +71,7 @@ fn raw_program_profile_records_cpu_batch_phase() {
 
     assert_eq!(reason, StopReason::DosExit { code: 0 });
     let host = m.host_profile_snapshot();
+    assert!(host.machine_phase_timing_enabled);
     let cpu_batch = host
         .phases
         .iter()
@@ -86,6 +87,15 @@ fn raw_program_profile_records_cpu_batch_phase() {
         cpu.groups.iter().any(|bucket| bucket.instructions > 0),
         "CPU group profile should record retired instructions"
     );
+    m.disable_host_profiling();
+    let reset = m.host_profile_snapshot();
+    assert!(!reset.machine_phase_timing_enabled);
+    assert!(
+        reset
+            .phases
+            .iter()
+            .all(|phase| phase.count == 0 && phase.wall_ns == 0)
+    );
 }
 
 #[test]
@@ -99,6 +109,7 @@ fn machine_only_profile_keeps_the_cpu_sampler_disabled() {
     let reason = m.run_until_halt_or_cycles(100_000).unwrap();
 
     assert_eq!(reason, StopReason::DosExit { code: 0 });
+    assert!(m.host_profile_snapshot().machine_phase_timing_enabled);
     assert!(
         m.host_profile_snapshot()
             .phases

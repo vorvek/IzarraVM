@@ -242,7 +242,7 @@ impl CpuBus for MachineBus<'_> {
         access_width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<usize, BusError> {
-        if out.is_empty() {
+        if kind != BusAccessKind::DataRead || out.is_empty() {
             return Ok(0);
         }
         let access = access_width.bytes() as usize;
@@ -277,7 +277,7 @@ impl CpuBus for MachineBus<'_> {
         access_width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<usize, BusError> {
-        if data.is_empty() {
+        if kind != BusAccessKind::DataWrite || data.is_empty() {
             return Ok(0);
         }
         let access = access_width.bytes() as usize;
@@ -306,13 +306,29 @@ impl CpuBus for MachineBus<'_> {
         Ok(data.len())
     }
 
-    fn direct_memory_bytes(&self, address: u32, bytes: usize, access_width: BusWidth) -> usize {
-        self.direct_page_ram_bytes(address, bytes, access_width)
-            .map_or(0, |(_, start, end)| end - start)
-            .max(
-                self.direct_vga_bytes(address, bytes, access_width, true)
-                    .map_or(0, |_| bytes),
-            )
+    fn direct_memory_bytes(
+        &self,
+        address: u32,
+        bytes: usize,
+        access_width: BusWidth,
+        kind: BusAccessKind,
+    ) -> usize {
+        if !matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
+            || bytes == 0
+            || bytes % access_width.bytes() as usize != 0
+        {
+            return 0;
+        }
+        let ram = self
+            .direct_page_ram_bytes(address, bytes, access_width)
+            .map_or(0, |(_, start, end)| end - start);
+        let vga = match kind {
+            BusAccessKind::DataRead => self.direct_vga_bytes(address, bytes, access_width, false),
+            BusAccessKind::DataWrite => self.direct_vga_bytes(address, bytes, access_width, true),
+            _ => None,
+        }
+        .map_or(0, |_| bytes);
+        ram.max(vga)
     }
 
     #[inline]
@@ -407,7 +423,7 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn jit_direct_memory_max_clocks(&self, width: BusWidth, _kind: BusAccessKind) -> Option<u64> {
-        let wait_states = if self.flat_data_cost {
+        let ram_wait_states = if self.flat_data_cost {
             self.cache.cost.l1
         } else {
             self.cache
@@ -416,7 +432,8 @@ impl CpuBus for MachineBus<'_> {
                 .max(self.cache.cost.l2)
                 .max(self.cache.cost.ram)
         };
-        Some(u64::from(BusCycle::clocks_for(width, wait_states)))
+        let ram = u64::from(BusCycle::clocks_for(width, ram_wait_states));
+        Some(ram.max(self.jit_mode13_data_cost_clocks(width)))
     }
 
     fn jit_cached_fetch_run_clocks(&self, start: u32, count: u32) -> Option<u64> {
@@ -548,6 +565,25 @@ impl CpuBus for MachineBus<'_> {
         raw.saturating_mul(u64::from(num))
             .saturating_add(u64::from(den) - 1)
             / u64::from(den)
+    }
+
+    fn rep_page_walk_cost_upper(&self) -> Option<u64> {
+        let video = if self.active_mode.uses_approximate_timing() {
+            video_wait_states_approx(self.active_mode.persona())
+        } else {
+            self.wait_states.video
+        };
+        let wait_states = self
+            .cache
+            .cost
+            .l1
+            .max(self.cache.cost.l2)
+            .max(self.cache.cost.ram)
+            .max(self.wait_states.ram)
+            .max(self.wait_states.rom)
+            .max(video);
+        let raw = u64::from(BusCycle::clocks_for(BusWidth::Dword, wait_states)).saturating_mul(4);
+        Some(self.jit_scale_bus_cost_upper(raw))
     }
 
     fn charge_native_vga_writes(&mut self, writes: NativeVgaWrites) {

@@ -827,7 +827,7 @@ fn watched_store_case(value: u32, target: u32) -> GeneratedCase {
 fn generated_watched_store_distinguishes_same_value_from_changed_code() {
     let prime = watched_store_case(1, 0x1080);
     let same = watched_store_case(1, 0x1080);
-    let changed = watched_store_case(2, 0x1004);
+    let changed = watched_store_case(2, 0x1080);
     let mut pristine = single_case_memory(&prime);
     pristine[0x1080..0x1084].copy_from_slice(&1u32.to_le_bytes());
     let mut interpreter = generated_cpu(GswMode::Gsw486);
@@ -843,8 +843,18 @@ fn generated_watched_store_distinguishes_same_value_from_changed_code() {
     arm(&mut interpreter, &prime);
     run_to_halt(&mut interpreter, &mut interpreter_bus, &prime).unwrap();
     prime_direct(&mut direct, &mut direct_bus, &pristine, &prime);
-    direct.decode_cache.mark_code_range(0x1080, 4);
-    direct.jit_direct.mark_code_range(0x1080, 4);
+    let rejected = jit::direct::BlockKey::new(0x1080, 0x1080, direct.jit_mode_key());
+    assert!(matches!(
+        direct.jit_direct.probe(rejected),
+        jit::direct::BlockProbe::Interpret
+    ));
+    assert!(matches!(
+        direct.jit_direct.probe(rejected),
+        jit::direct::BlockProbe::Compile
+    ));
+    direct
+        .jit_direct
+        .reject(jit::direct::RejectedSpan::new(rejected, 4).expect("page-local rejected fixture"));
 
     let exits = direct.perf_counters().jit_direct_exit_code_watch;
     assert!(
@@ -859,6 +869,10 @@ fn generated_watched_store_distinguishes_same_value_from_changed_code() {
         ) > 0
     );
     assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits);
+    assert!(matches!(
+        direct.jit_direct.probe(rejected),
+        jit::direct::BlockProbe::Rejected
+    ));
 
     let native = assert_measured_pair(
         &mut interpreter,
@@ -871,6 +885,10 @@ fn generated_watched_store_distinguishes_same_value_from_changed_code() {
     );
     assert!(native > 0, "changed watched store lost its native prefix");
     assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits + 1);
+    assert!(matches!(
+        direct.jit_direct.probe(rejected),
+        jit::direct::BlockProbe::Interpret
+    ));
 }
 
 struct A20Bus {

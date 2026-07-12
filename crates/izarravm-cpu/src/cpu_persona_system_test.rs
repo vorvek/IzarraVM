@@ -861,7 +861,7 @@ fn decode_cache_hits_only_on_matching_tag_and_generation() {
         cache.get(lin + 4, false).is_none(),
         "a different tag in the same slot misses (no false hit)"
     );
-    cache.invalidate();
+    cache.invalidate_and_clear_code_marks();
     assert!(
         cache.get(lin, false).is_none(),
         "a generation bump invalidates every stamped line"
@@ -873,13 +873,195 @@ fn decode_cache_hits_only_on_matching_tag_and_generation() {
     );
 }
 
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[test]
-fn decode_cache_invalidate_skips_zero_on_wrap() {
-    // The generation must never land back on 0 (a fresh line's default), or stale lines alias.
+fn decode_cache_generation_wrap_clears_lines_watches_and_residency_token() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let insn = cpu.decode(&mut bus).unwrap();
     let mut cache = DecodeCache::new(2);
+    cache.put(0x100, insn, false, 0x100);
+    let old_token = cache.residency_epoch();
+    let table_base = cache.native_code_watch_table();
+    assert!(cache.native_code_watch.is_watched(0x100));
+
     cache.generation = u32::MAX;
-    cache.invalidate();
+    cache.invalidate_and_clear_code_marks();
     assert_eq!(cache.generation, 1, "wrap skips 0");
+    assert!(cache.get(0x100, false).is_none());
+    assert!(!cache.native_code_watch.is_watched(0x100));
+    assert_eq!(cache.native_code_watch.precise_pages(), 0);
+    assert_eq!(cache.native_code_watch.coarse_page_count(), 0);
+    assert_eq!(cache.native_code_watch_table(), table_base);
+    assert_ne!(cache.residency_epoch(), old_token);
+    cache.assert_native_watch_consistent();
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn decode_cache_replacement_and_refill_retain_conservative_native_marks() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let insn = cpu.decode(&mut bus).unwrap();
+    let mut cache = DecodeCache::new(2);
+
+    assert!(cache.put(0x100, insn, false, 0x100));
+    assert!(cache.put(0x100, insn, false, 0x100));
+    assert_eq!(cache.native_code_watch.precise_pages(), 1);
+    cache.assert_native_watch_consistent();
+
+    assert!(cache.put(0x102, insn, false, 0x108));
+    assert!(cache.native_code_watch.is_watched(0x100));
+    assert_eq!(cache.native_code_watch.precise_pages(), 1);
+    cache.assert_native_watch_consistent();
+
+    assert!(cache.put(0x104, insn, false, 0x130));
+    assert!(cache.native_code_watch.is_watched(0x100));
+    assert!(cache.native_code_watch.is_watched(0x130));
+    cache.assert_native_watch_consistent();
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn decode_cache_narrow_kills_retain_sticky_native_chunks_until_global_clear() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let insn = cpu.decode(&mut bus).unwrap();
+    let mut cache = DecodeCache::new(4);
+    assert!(cache.put(0x100, insn, false, 0x100));
+    assert!(cache.put(0x101, insn, false, 0x108));
+    assert!(cache.native_code_watch.is_watched(0x100));
+
+    assert_eq!(cache.narrow_invalidate(0x100), Some(1));
+    assert!(cache.native_code_watch.is_watched(0x100));
+    cache.assert_native_watch_consistent();
+
+    assert_eq!(cache.narrow_invalidate(0x108), Some(1));
+    assert!(cache.native_code_watch.is_watched(0x100));
+    cache.assert_native_watch_consistent();
+
+    cache.invalidate_and_clear_code_marks();
+    assert!(!cache.native_code_watch.is_watched(0x100));
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn decode_cache_global_clear_drops_marks_but_narrow_kill_does_not() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let insn = cpu.decode(&mut bus).unwrap();
+    let mut cache = DecodeCache::new(4);
+    assert!(cache.put(0x100, insn, false, 0x100));
+    assert!(cache.native_code_watch.is_watched(0x100));
+
+    cache.invalidate_and_clear_code_marks();
+    assert!(!cache.native_code_watch.is_watched(0x100));
+    cache.assert_native_watch_consistent();
+
+    assert!(cache.put(0x100, insn, false, 0x100));
+    assert_eq!(cache.narrow_invalidate(0x100), Some(1));
+    assert!(cache.native_code_watch.is_watched(0x100));
+    cache.assert_native_watch_consistent();
+
+    cache.invalidate_and_clear_code_marks();
+    assert!(!cache.native_code_watch.is_watched(0x100));
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn cloning_a_populated_decode_cache_starts_empty() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let insn = cpu.decode(&mut bus).unwrap();
+    let mut cache = DecodeCache::new(4);
+    assert!(cache.put(0x100, insn, false, 0x100));
+
+    let clone = cache.clone();
+    assert!(clone.get(0x100, false).is_none());
+    assert_eq!(clone.native_code_watch.precise_pages(), 0);
+    assert_eq!(clone.native_code_watch.coarse_page_count(), 0);
+    assert!(!clone.native_code_watch.is_watched(0x100));
+    clone.assert_native_watch_consistent();
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn decode_cache_marks_every_chunk_of_an_overlong_page_local_instruction() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let mut insn = cpu.decode(&mut bus).unwrap();
+    insn.len = 33;
+    let mut cache = DecodeCache::new(4);
+
+    assert!(cache.put(0x100, insn, false, 0x100));
+    assert!(cache.native_code_watch.is_watched(0x100));
+    assert!(cache.native_code_watch.is_watched(0x110));
+    assert!(cache.native_code_watch.is_watched(0x120));
+    assert!(!cache.native_code_watch.is_watched(0x130));
+    cache.assert_native_watch_consistent();
+}
+
+#[cfg(all(
+    feature = "jit",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[test]
+fn decode_cache_refuses_straddling_fill_without_evicting_collision() {
+    let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+    let mut bus = TestBus::with_memory(mem);
+    let mut insn = cpu.decode(&mut bus).unwrap();
+    let mut cache = DecodeCache::new(4);
+    assert!(cache.put(0x103, insn, false, 0x203));
+    cache.assert_native_watch_consistent();
+
+    insn.len = 3;
+    assert!(!cache.put(0x0fff, insn, false, 0x0fff));
+    assert!(cache.get(0x103, false).is_some());
+    assert!(cache.native_code_watch.is_watched(0x203));
+    assert!(!cache.native_code_watch.is_watched(0x0fff));
+    cache.assert_native_watch_consistent();
+
+    assert!(!cache.put(0x107, insn, false, 0x0fff));
+    assert!(cache.get(0x103, false).is_some());
+    assert!(!cache.native_code_watch.is_watched(0x0fff));
+    cache.assert_native_watch_consistent();
+
+    assert!(!cache.put(u32::MAX, insn, false, 0x300));
+    assert!(cache.get(0x103, false).is_some());
+    assert!(!cache.put(0x107, insn, false, u32::MAX));
+    assert!(cache.get(0x103, false).is_some());
+    cache.assert_native_watch_consistent();
+
+    insn.len = 1;
+    assert!(cache.put(0x0fff, insn, false, 0x0fff));
+    assert!(cache.get(0x0fff, false).is_some());
+    assert!(cache.native_code_watch.is_watched(0x0fff));
+    cache.assert_native_watch_consistent();
 }
 
 #[test]
