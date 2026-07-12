@@ -34,7 +34,7 @@ const SPIN_UP_TICKS: u64 = MASTER_CLOCK_HZ / 5; // 200 ms
 const MAX_SEEK_TICKS: u64 = MASTER_CLOCK_HZ / 10; // 100 ms
 const CD_BYTES_PER_SECOND: u64 = 1_800 * 1024; // 12x CD-ROM
 
-fn sector_transfer_ticks() -> u64 {
+pub(crate) fn sector_transfer_ticks() -> u64 {
     (DATA_SECTOR as u128 * MASTER_CLOCK_HZ as u128).div_ceil(CD_BYTES_PER_SECOND as u128) as u64
 }
 

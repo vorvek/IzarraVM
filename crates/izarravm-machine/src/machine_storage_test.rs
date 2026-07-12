@@ -3,6 +3,131 @@
 
 use super::*;
 
+fn el_torito_iso(media: u8) -> CdImage {
+    let image_lba = 20u32;
+    let image_512 = match media {
+        1 => 2400,
+        2 => 2880,
+        3 => 5760,
+        _ => 64,
+    };
+    let sectors = image_lba as usize + (image_512 as usize).div_ceil(4);
+    let mut iso = vec![0u8; sectors * cdimage::DATA_SECTOR];
+    let record = 17 * cdimage::DATA_SECTOR;
+    iso[record] = 0;
+    iso[record + 1..record + 7].copy_from_slice(b"CD001\x01");
+    iso[record + 7..record + 30].copy_from_slice(b"EL TORITO SPECIFICATION");
+    iso[record + 0x47..record + 0x4B].copy_from_slice(&18u32.to_le_bytes());
+    let catalog = 18 * cdimage::DATA_SECTOR;
+    iso[catalog] = 1;
+    iso[catalog + 1] = 0;
+    iso[catalog + 30] = 0x55;
+    iso[catalog + 31] = 0xAA;
+    let sum = iso[catalog..catalog + 32]
+        .chunks_exact(2)
+        .fold(0u16, |sum, w| {
+            sum.wrapping_add(u16::from_le_bytes([w[0], w[1]]))
+        });
+    iso[catalog + 28..catalog + 30].copy_from_slice(&0u16.wrapping_sub(sum).to_le_bytes());
+    iso[catalog + 32] = 0x88;
+    iso[catalog + 33] = media;
+    iso[catalog + 34..catalog + 36].copy_from_slice(&0x2000u16.to_le_bytes());
+    iso[catalog + 38..catalog + 40].copy_from_slice(&4u16.to_le_bytes());
+    iso[catalog + 40..catalog + 44].copy_from_slice(&image_lba.to_le_bytes());
+    let boot = image_lba as usize * cdimage::DATA_SECTOR;
+    iso[boot..boot + 8].copy_from_slice(&[0xFA, 0xBB, 0x00, 0x05, 0x88, 0x17, 0xF4, 0x90]); // CLI; MOV BX,0500; MOV [BX],DL; HLT
+    iso[boot + 512] = 0xA5;
+    CdImage::from_iso(iso).unwrap()
+}
+
+#[test]
+fn el_torito_boots_no_emulation_and_every_common_emulation_mode() {
+    for media in 0u8..=4 {
+        let mut m = int15_machine(16);
+        m.mount_cd(el_torito_iso(media));
+        assert_eq!(
+            m.read_physical_u8(0x9FC0C),
+            1,
+            "media {media} bootable flag"
+        );
+        m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+        m.handle_int19();
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Cs).selector, 0x2000);
+        assert_eq!(
+            m.cpu.registers.edx() as u8,
+            if media == 0 {
+                0xE0
+            } else if media == 4 {
+                0x80
+            } else {
+                0
+            }
+        );
+        assert_eq!(m.read_physical_u8(0x20000), 0xFA);
+        if media != 0 {
+            prime_dos_int_frame(&mut m);
+            m.cpu
+                .registers
+                .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+            m.cpu.registers.set_ebx(0);
+            m.cpu.registers.set_eax(0x0201);
+            m.cpu.registers.set_ecx(0x0002);
+            m.cpu.registers.set_edx(if media == 4 { 0x80 } else { 0 });
+            m.handle_int13();
+            assert_eq!(
+                m.read_physical_u8(0x30000),
+                0xA5,
+                "media {media} emulated read"
+            );
+            assert_eq!(dos_int_flags(&m) & 1, 0);
+        }
+    }
+}
+
+#[test]
+fn el_torito_cd_edd_reads_2048_byte_blocks_and_4b_terminates_emulation() {
+    let mut m = int15_machine(16);
+    m.mount_cd(el_torito_iso(2));
+    m.write_physical_u8(BIOS_BOOT_CHOICE_ADDR, 2);
+    m.handle_int19();
+
+    prime_dos_int_frame(&mut m);
+    m.cpu
+        .registers
+        .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+    m.cpu.registers.set_esi(0x1000);
+    let mut dap = [0u8; 16];
+    dap[0] = 16;
+    dap[2..4].copy_from_slice(&1u16.to_le_bytes());
+    dap[6..8].copy_from_slice(&0x3000u16.to_le_bytes());
+    dap[8..16].copy_from_slice(&20u64.to_le_bytes());
+    m.write_guest_block(0x1000, &dap);
+    m.cpu.registers.set_eax(0x4200);
+    m.cpu.registers.set_edx(0xE0);
+    m.handle_int13();
+    assert_eq!(m.read_physical_u8(0x30000), 0xFA);
+
+    m.cpu.registers.set_esi(0x1200);
+    m.cpu.registers.set_eax(0x4B00);
+    m.cpu.registers.set_edx(0);
+    m.handle_int13();
+    assert_eq!(
+        m.read_physical_u8(0x1201),
+        2,
+        "reported floppy-emulation media"
+    );
+    assert!(m.eltorito_emulation.is_none());
+}
+
+#[test]
+fn invalid_el_torito_catalog_is_not_advertised() {
+    // Rebuild a plain non-bootable ISO rather than reaching through CdImage internals.
+    let image = CdImage::from_iso(vec![0u8; 32 * cdimage::DATA_SECTOR]).unwrap();
+    let mut m = int15_machine(16);
+    m.mount_cd(image);
+    assert_eq!(m.read_physical_u8(0x9FC0C), 0);
+}
+
 #[test]
 fn mount_hdd_seeds_the_bda_fixed_disk_count() {
     let m = machine_with_hdd(64);

@@ -68,7 +68,7 @@
 ; it opens the boot-device menu instead of the setup page.
 %define BOOTMENU_HOTKEY 0x0f
 
-; CMOS NVRAM byte 0x11 holds the boot order: 0 = floppy-first, 1 = disk-first.
+; CMOS NVRAM byte 0x11 holds the boot choice: 0 = floppy, 1 = disk, 2 = CD-ROM.
 ; The boot menu seeds its default highlight from this byte.
 %define BOOT_CMOS_ORDER 0x11
 
@@ -246,6 +246,7 @@
 ; IntelliMouse knock bumps it to 4 so int74 assembles the wheel byte. Free EBDA
 ; byte just past EBDA_MOUSE_IDX; nothing else in this ROM touches 0x0A..0x0B.
 %define EBDA_MOUSE_PKT_SIZE 0x000B  ; bytes per packet (3 standard, 4 IntelliMouse)
+%define EBDA_CD_BOOTABLE    0x000C  ; host sets nonzero for a valid x86 El Torito entry
 
 ; Boxed-menu draw scratch (segment 0 RAM, above BMX_SAVE which ends at 0x0A1F).
 ; The renderer is single-threaded, so these are reused freely between helpers.

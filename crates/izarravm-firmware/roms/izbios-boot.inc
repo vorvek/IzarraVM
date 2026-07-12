@@ -137,8 +137,8 @@ boot_entry:
     mov ax, 0x0201             ; AH=02 read, AL=01 one sector
     mov cx, 0x0001             ; CH=0 cylinder, CL=1 sector (sectors are 1-based)
     xor dx, dx                  ; DH=0 head, DL=00 drive A:
-    stc                         ; preset CF: with no media the host INT 13h is a
-                                ; no-op, so a left-set CF means "no disk, do not boot"
+    stc                         ; preset CF defensively; absent media returns a
+                                ; deterministic CF=1/AH=01h from INT 13h
     int 0x13
     jc .read_error
 
@@ -167,17 +167,14 @@ boot_entry:
     ; at CHS(0,0,1) of drive 0x80 to 0000:7C00 and enter it, exactly like the
     ; floppy path above. The MBR relocates itself and chains to the active
     ; partition's VBR, which loads the kernel. With no fixed disk present the host
-    ; INT 13h is a no-op that leaves FLAGS untouched, so the preset CF survives as
-    ; "no disk" and we fall through to the HLE Toka-DOS C: shim below. This is what
-    ; lets the real FreeDOS kernel boot from an ATA disk while the legacy host-
-    ; backed C: still works when no disk is attached.
+    ; INT 13h returns CF=1/AH=01h, so we fall through to the next boot source.
     xor ax, ax
     mov es, ax                  ; ES = 0
     mov bx, 0x7c00             ; ES:BX = 0000:7C00 destination
     mov ax, 0x0201            ; AH=02 read, AL=01 one sector
     mov cx, 0x0001            ; CH=0 cylinder, CL=1 sector (1-based)
     mov dx, 0x0080            ; DH=0 head, DL=80h first fixed disk
-    stc                        ; preset CF: no disk -> host no-op leaves it set
+    stc                        ; preset CF defensively; no disk returns CF=1
     int 0x13
     jc .disk_hle               ; no fixed disk attached: fall back to the HLE shim
 
@@ -219,7 +216,18 @@ boot_entry:
     ; fall through into .cdrom
 
 .cdrom:
-    ; El Torito boot is not modeled yet. Report and idle (return to the caller's loop).
+    ; The host-side INT 19h path validates and loads the cached El Torito entry,
+    ; establishes any requested disk emulation, and redirects CS:IP. Only enter
+    ; that path when CD was explicitly selected; ordinary floppy/HDD fall-through
+    ; retains the POST idle loop when no boot media is mounted.
+    push ds
+    xor ax, ax
+    mov ds, ax
+    cmp byte [BOOT_CHOICE], BOOT_DEV_CDROM
+    pop ds
+    jne .cd_absent
+    int 0x19
+.cd_absent:
     mov si, bm_str_cd_msg
     call boot_status_line
     ret

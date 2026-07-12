@@ -3,6 +3,108 @@
 
 use super::*;
 
+const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
+const ELTORITO_CD_DRIVE: u8 = 0xE0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ElToritoMedia {
+    None,
+    Floppy1200,
+    Floppy1440,
+    Floppy2880,
+    HardDisk,
+}
+
+impl ElToritoMedia {
+    fn from_catalog(value: u8) -> Option<Self> {
+        Some(match value {
+            0 => Self::None,
+            1 => Self::Floppy1200,
+            2 => Self::Floppy1440,
+            3 => Self::Floppy2880,
+            4 => Self::HardDisk,
+            _ => return None,
+        })
+    }
+
+    fn catalog_code(self) -> u8 {
+        self as u8
+    }
+
+    fn emulated_drive(self) -> u8 {
+        if self == Self::HardDisk { 0x80 } else { 0x00 }
+    }
+
+    fn floppy_sectors(self) -> Option<u32> {
+        match self {
+            Self::Floppy1200 => Some(2400),
+            Self::Floppy1440 => Some(2880),
+            Self::Floppy2880 => Some(5760),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ElToritoBoot {
+    media: ElToritoMedia,
+    load_segment: u16,
+    sector_count: u16,
+    image_lba: u32,
+    image_sectors_512: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ElToritoEmulation {
+    boot: ElToritoBoot,
+}
+
+fn parse_el_torito(image: &CdImage) -> Option<ElToritoBoot> {
+    let record = image.read_data_sector(ELTORITO_BOOT_RECORD_LBA)?;
+    if record[0] != 0
+        || &record[1..7] != b"CD001\x01"
+        || !record[7..39].starts_with(b"EL TORITO SPECIFICATION")
+    {
+        return None;
+    }
+    let catalog_lba = u32::from_le_bytes(record[0x47..0x4b].try_into().ok()?);
+    let catalog = image.read_data_sector(catalog_lba)?;
+    if catalog[0] != 1 || catalog[1] != 0 || catalog[30] != 0x55 || catalog[31] != 0xAA {
+        return None;
+    }
+    let checksum = catalog[..32].chunks_exact(2).fold(0u16, |sum, word| {
+        sum.wrapping_add(u16::from_le_bytes([word[0], word[1]]))
+    });
+    if checksum != 0 || catalog[32] != 0x88 {
+        return None;
+    }
+    let media = ElToritoMedia::from_catalog(catalog[33])?;
+    let mut load_segment = u16::from_le_bytes([catalog[34], catalog[35]]);
+    if load_segment == 0 {
+        load_segment = 0x07C0;
+    }
+    let sector_count = u16::from_le_bytes([catalog[38], catalog[39]]);
+    if sector_count == 0 {
+        return None;
+    }
+    let image_lba = u32::from_le_bytes(catalog[40..44].try_into().ok()?);
+    let remaining_512 = image
+        .total_sectors()
+        .checked_sub(image_lba)?
+        .checked_mul(4)?;
+    let image_sectors_512 = media.floppy_sectors().unwrap_or(remaining_512);
+    if image_sectors_512 > remaining_512 || u32::from(sector_count) > remaining_512 {
+        return None;
+    }
+    Some(ElToritoBoot {
+        media,
+        load_segment,
+        sector_count,
+        image_lba,
+        image_sectors_512,
+    })
+}
+
 impl Machine {
     /// Mount a raw floppy image into drive A:. The geometry is derived from the
     /// image length; an unrecognized size returns an error and leaves any
@@ -11,7 +113,7 @@ impl Machine {
         let floppy = floppy::Floppy::from_image(bytes)?;
         let geometry = floppy.geometry();
         self.floppy = Some(floppy);
-        self.set_equipment_floppy(true);
+        self.refresh_bios_drive_counts();
         self.fdc.set_media_geometry(Some(geometry));
         Ok(())
     }
@@ -19,14 +121,27 @@ impl Machine {
     /// Track drive A: in the BDA equipment word (0040:0010) that INT 11h returns. Bit 0 is
     /// the floppy-installed flag and bits 7-6 the drive count minus one; with one drive
     /// modeled, present means bit 0 set with bits 7-6 clear, absent means both cleared.
-    fn set_equipment_floppy(&mut self, present: bool) {
+    fn refresh_bios_drive_counts(&mut self) {
+        let emulated = self.eltorito_emulation.map(|e| e.boot.media);
+        let floppy_count = u8::from(self.floppy.is_some())
+            + u8::from(matches!(
+                emulated,
+                Some(
+                    ElToritoMedia::Floppy1200
+                        | ElToritoMedia::Floppy1440
+                        | ElToritoMedia::Floppy2880
+                )
+            ));
         let mut word = self.memory.read_u16(0x410).unwrap_or(BIOS_EQUIPMENT_WORD);
-        if present {
-            word = (word & !0x00C0) | 0x0001;
+        if floppy_count != 0 {
+            word = (word & !0x00C0) | 0x0001 | (u16::from(floppy_count - 1) << 6);
         } else {
             word &= !0x00C1;
         }
         let _ = self.memory.write_u16(0x410, word);
+        let hard_count = u8::from(self.ata.is_some())
+            + u8::from(matches!(emulated, Some(ElToritoMedia::HardDisk)));
+        let _ = self.memory.write_u8(0x475, hard_count);
     }
 
     /// Eject the A: floppy, returning its current image bytes (including any
@@ -34,7 +149,7 @@ impl Machine {
     /// None when the drive is empty.
     pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
         let bytes = self.floppy.take().map(|f| f.bytes().to_vec());
-        self.set_equipment_floppy(false);
+        self.refresh_bios_drive_counts();
         self.fdc.set_media_geometry(None);
         bytes
     }
@@ -63,12 +178,22 @@ impl Machine {
     /// built by the caller from an ISO or a CUE/BIN pair, so the machine stays
     /// agnostic to the host file layout.
     pub fn mount_cd(&mut self, image: CdImage) {
+        self.eltorito_boot = parse_el_torito(&image);
+        let bootable = u8::from(self.eltorito_boot.is_some());
         self.ide.device_mut().insert(image);
+        self.write_physical_u8(
+            (u32::from(EBDA_SEGMENT) << 4) + EBDA_CD_BOOTABLE_OFF,
+            bootable,
+        );
     }
 
     /// Eject the CD, leaving the ATAPI drive empty.
     pub fn eject_cd(&mut self) {
         self.ide.device_mut().eject();
+        self.eltorito_boot = None;
+        self.eltorito_emulation = None;
+        self.write_physical_u8((u32::from(EBDA_SEGMENT) << 4) + EBDA_CD_BOOTABLE_OFF, 0);
+        self.refresh_bios_drive_counts();
     }
 
     /// Mount a flat hard-disk image as the primary master (C:). The geometry is
@@ -79,7 +204,7 @@ impl Machine {
         self.bmide.reset_primary();
         self.ata = Some(ata::AtaDisk::new(bytes));
         let _ = self.publish_fixed_disk_parameter_table();
-        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        self.refresh_bios_drive_counts();
     }
 
     /// Mount a host folder as C: through Katea with extra InMemory system files
@@ -111,7 +236,7 @@ impl Machine {
         self.bmide.reset_primary();
         self.ata = Some(ata::AtaDisk::from_host_folder(volume));
         let _ = self.publish_fixed_disk_parameter_table();
-        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        self.refresh_bios_drive_counts();
         Ok(())
     }
 
@@ -140,7 +265,7 @@ impl Machine {
         self.ata = Some(ata::AtaDisk::from_host_folder(volume));
         self.katea_root = Some(dir.to_path_buf());
         let _ = self.publish_fixed_disk_parameter_table();
-        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        self.refresh_bios_drive_counts();
         Ok(())
     }
 
@@ -173,7 +298,7 @@ impl Machine {
             .filter(ata::AtaDisk::is_image)
             .map(|d| d.bytes().to_vec());
         let _ = self.clear_fixed_disk_parameter_table();
-        let _ = self.memory.write_u8(0x475, 0);
+        self.refresh_bios_drive_counts();
         bytes
     }
 
@@ -446,6 +571,51 @@ impl Machine {
             return;
         }
 
+        // El Torito AH=4Bh is addressed to the active emulated drive (or E0h
+        // for no-emulation media), but its packet describes the whole emulation
+        // state, so service it before normal drive remapping.
+        if ah == 0x4B {
+            self.int13_el_torito_status(ax as u8);
+            return;
+        }
+
+        if let Some(emulation) = self.eltorito_emulation {
+            let emulated_drive = emulation.boot.media.emulated_drive();
+            if dl == emulated_drive {
+                self.int13_el_torito_emulated(ah, emulation);
+                return;
+            }
+            let displaced = match emulation.boot.media {
+                ElToritoMedia::Floppy1200
+                | ElToritoMedia::Floppy1440
+                | ElToritoMedia::Floppy2880
+                    if dl == 0x01 =>
+                {
+                    Some(0x00)
+                }
+                ElToritoMedia::HardDisk if dl == 0x81 => Some(0x80),
+                _ => None,
+            };
+            if let Some(real_drive) = displaced {
+                let saved_dx = self.cpu.registers.edx();
+                self.eltorito_emulation = None;
+                self.cpu.registers.set_edx((saved_dx & !0xFF) | real_drive);
+                self.handle_int13();
+                self.eltorito_emulation = Some(emulation);
+                if ah != 0x08 {
+                    self.cpu
+                        .registers
+                        .set_edx((self.cpu.registers.edx() & !0xFF) | u32::from(dl));
+                }
+                return;
+            }
+        }
+
+        if dl >= ELTORITO_CD_DRIVE {
+            self.int13_cd(ah, dl);
+            return;
+        }
+
         // DL bit 7 selects a fixed disk. Always dispatch by drive class before
         // checking media presence so an absent hard disk returns a deterministic
         // BIOS error instead of inheriting the caller's AH and carry flag.
@@ -542,6 +712,260 @@ impl Machine {
         self.set_eax_ah(status);
         self.set_disk_status(status);
         self.set_int_frame_carry(true);
+    }
+
+    fn int13_class_result(&mut self, drive: u8, status: u8) {
+        self.set_eax_ah(status);
+        if drive >= 0x80 {
+            self.set_fixed_disk_status(status);
+        } else {
+            self.set_disk_status(status);
+        }
+        self.set_int_frame_carry(status != 0);
+    }
+
+    fn read_el_torito_sector(&self, boot: ElToritoBoot, sector_512: u32) -> Option<[u8; 512]> {
+        if sector_512 >= boot.image_sectors_512 {
+            return None;
+        }
+        let cd_lba = boot.image_lba + sector_512 / 4;
+        let quarter = (sector_512 % 4) as usize;
+        let cd = self.ide.device().image()?.read_data_sector(cd_lba)?;
+        let mut out = [0u8; 512];
+        out.copy_from_slice(&cd[quarter * 512..quarter * 512 + 512]);
+        Some(out)
+    }
+
+    fn int13_el_torito_emulated(&mut self, ah: u8, emulation: ElToritoEmulation) {
+        let drive = emulation.boot.media.emulated_drive();
+        let (cylinders, heads, sectors) = match emulation.boot.media {
+            ElToritoMedia::Floppy1200 => (80u32, 2u32, 15u32),
+            ElToritoMedia::Floppy1440 => (80, 2, 18),
+            ElToritoMedia::Floppy2880 => (80, 2, 36),
+            ElToritoMedia::HardDisk => {
+                let heads = 16;
+                let sectors = 63;
+                let cylinders = emulation
+                    .boot
+                    .image_sectors_512
+                    .div_ceil(heads * sectors)
+                    .min(1024);
+                (cylinders, heads, sectors)
+            }
+            ElToritoMedia::None => {
+                self.int13_class_result(drive, 0x01);
+                return;
+            }
+        };
+        match ah {
+            0x00 => self.int13_class_result(drive, 0),
+            0x02 | 0x04 => {
+                let count = self.cpu.registers.eax() as u8;
+                let (cyl, head, sector) = self.int13_chs();
+                if count == 0
+                    || sector == 0
+                    || cyl >= cylinders
+                    || head >= heads
+                    || sector > sectors
+                {
+                    self.int13_class_result(drive, 0x04);
+                    return;
+                }
+                let first = (cyl * heads + head) * sectors + sector - 1;
+                let mut blocks = Vec::with_capacity(count as usize);
+                for index in 0..u32::from(count) {
+                    let Some(bytes) = self.read_el_torito_sector(emulation.boot, first + index)
+                    else {
+                        self.set_eax_al(index as u8);
+                        self.int13_class_result(drive, 0x04);
+                        return;
+                    };
+                    blocks.push(bytes);
+                }
+                if ah == 0x02 {
+                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                    let bx = self.cpu.registers.ebx() as u16;
+                    for (index, bytes) in blocks.iter().enumerate() {
+                        self.write_guest_block(es + u32::from(bx) + index as u32 * 512, bytes);
+                    }
+                }
+                self.cd_accesses += 1;
+                self.stall_for_master_ticks(
+                    ide::sector_transfer_ticks() * u64::from(count).div_ceil(4),
+                );
+                self.set_eax_al(count);
+                self.int13_class_result(drive, 0);
+            }
+            0x03 | 0x05 => self.int13_class_result(drive, 0x03),
+            0x08 => {
+                let max_cyl = cylinders.saturating_sub(1);
+                let cx = ((max_cyl as u16 & 0x00FF) << 8)
+                    | (((max_cyl as u16 >> 2) & 0x00C0) | sectors as u16);
+                self.set_cx(cx);
+                let drive_count = if drive >= 0x80 {
+                    self.read_physical_u8(0x475)
+                } else {
+                    self.floppy_count()
+                };
+                self.set_dx(((heads.saturating_sub(1) as u16) << 8) | u16::from(drive_count));
+                self.int13_class_result(drive, 0);
+            }
+            0x15 => {
+                self.set_eax_ah(if drive >= 0x80 { 3 } else { 1 });
+                if drive >= 0x80 {
+                    self.set_cx((emulation.boot.image_sectors_512 >> 16) as u16);
+                    self.set_dx(emulation.boot.image_sectors_512 as u16);
+                }
+                self.set_int_frame_carry(false);
+            }
+            _ => self.int13_class_result(drive, 0x01),
+        }
+    }
+
+    fn int13_cd(&mut self, ah: u8, drive: u8) {
+        if drive != ELTORITO_CD_DRIVE || self.ide.device().image().is_none() {
+            self.int13_class_result(drive, 0x01);
+            return;
+        }
+        match ah {
+            0x00 => self.int13_class_result(drive, 0),
+            0x41 if self.cpu.registers.ebx() as u16 == 0x55AA => {
+                self.set_bx(0xAA55);
+                self.set_eax_ah(0x30);
+                self.set_cx(0x0001);
+                self.set_fixed_disk_status(0);
+                self.set_int_frame_carry(false);
+            }
+            0x42 | 0x44 => self.int13_cd_extended(ah),
+            0x48 => self.int13_cd_parameters(),
+            _ => self.int13_class_result(drive, 0x01),
+        }
+    }
+
+    fn int13_cd_extended(&mut self, ah: u8) {
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let dap = ds + u32::from(si);
+        let packet = self.read_guest_block(dap, 16);
+        let count = u16::from_le_bytes([packet[2], packet[3]]);
+        let off = u16::from_le_bytes([packet[4], packet[5]]);
+        let seg = u16::from_le_bytes([packet[6], packet[7]]);
+        let lba = u64::from_le_bytes(packet[8..16].try_into().unwrap());
+        let total = self.ide.device().image().map_or(0, CdImage::total_sectors);
+        if packet[0] < 16
+            || count == 0
+            || lba > u64::from(u32::MAX)
+            || (lba as u32).saturating_add(u32::from(count)) > total
+        {
+            self.set_dap_blocks(dap, 0);
+            self.int13_class_result(ELTORITO_CD_DRIVE, 0x04);
+            return;
+        }
+        let mut sectors = Vec::with_capacity(count as usize);
+        for index in 0..u32::from(count) {
+            sectors.push(
+                self.ide
+                    .device()
+                    .image()
+                    .unwrap()
+                    .read_data_sector(lba as u32 + index)
+                    .unwrap(),
+            );
+        }
+        if ah == 0x42 {
+            let dst = (u32::from(seg) << 4) + u32::from(off);
+            for (index, sector) in sectors.iter().enumerate() {
+                self.write_guest_block(dst + index as u32 * cdimage::DATA_SECTOR as u32, sector);
+            }
+        }
+        self.set_dap_blocks(dap, count);
+        self.cd_accesses += 1;
+        self.stall_for_master_ticks(ide::sector_transfer_ticks() * u64::from(count));
+        self.int13_class_result(ELTORITO_CD_DRIVE, 0);
+    }
+
+    fn int13_cd_parameters(&mut self) {
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let dst = ds + u32::from(si);
+        let requested = self.read_guest_word(dst).max(2) as usize;
+        let total = u64::from(self.ide.device().image().unwrap().total_sectors());
+        let mut out = [0u8; 26];
+        out[0..2].copy_from_slice(&26u16.to_le_bytes());
+        out[2..4].copy_from_slice(&0x0004u16.to_le_bytes()); // removable
+        out[16..24].copy_from_slice(&total.to_le_bytes());
+        out[24..26].copy_from_slice(&(cdimage::DATA_SECTOR as u16).to_le_bytes());
+        self.write_guest_block(dst, &out[..requested.min(out.len())]);
+        self.int13_class_result(ELTORITO_CD_DRIVE, 0);
+    }
+
+    fn int13_el_torito_status(&mut self, subfunction: u8) {
+        let boot = self
+            .eltorito_emulation
+            .map(|e| e.boot)
+            .or(self.eltorito_boot);
+        let Some(boot) = boot else {
+            self.int13_class_result(ELTORITO_CD_DRIVE, 0x01);
+            return;
+        };
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let mut packet = [0u8; 19];
+        packet[0] = packet.len() as u8;
+        packet[1] = if self.eltorito_emulation.is_some() {
+            boot.media.catalog_code()
+        } else {
+            0
+        };
+        packet[2] = if boot.media == ElToritoMedia::None {
+            ELTORITO_CD_DRIVE
+        } else {
+            boot.media.emulated_drive()
+        };
+        packet[4..8].copy_from_slice(&boot.image_lba.to_le_bytes());
+        packet[12..14].copy_from_slice(&boot.load_segment.to_le_bytes());
+        packet[14..16].copy_from_slice(&boot.sector_count.to_le_bytes());
+        self.write_guest_block(ds + u32::from(si), &packet);
+        if subfunction == 0 {
+            self.eltorito_emulation = None;
+            self.refresh_bios_drive_counts();
+        }
+        self.int13_class_result(packet[2], 0);
+    }
+
+    pub(super) fn boot_el_torito(&mut self) -> bool {
+        let Some(boot) = self.eltorito_boot else {
+            return false;
+        };
+        let mut initial = Vec::with_capacity(usize::from(boot.sector_count) * 512);
+        for sector in 0..u32::from(boot.sector_count) {
+            let Some(bytes) = self.read_el_torito_sector(boot, sector) else {
+                return false;
+            };
+            initial.extend_from_slice(&bytes);
+        }
+        let destination = u32::from(boot.load_segment) << 4;
+        self.write_guest_block(destination, &initial);
+        self.cd_accesses += 1;
+        self.stall_for_master_ticks(
+            ide::sector_transfer_ticks() * u64::from(boot.sector_count).div_ceil(4),
+        );
+        self.eltorito_emulation =
+            (boot.media != ElToritoMedia::None).then_some(ElToritoEmulation { boot });
+        self.refresh_bios_drive_counts();
+        self.cpu
+            .registers
+            .set_edx(u32::from(if boot.media == ElToritoMedia::None {
+                ELTORITO_CD_DRIVE
+            } else {
+                boot.media.emulated_drive()
+            }));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(boot.load_segment));
+        self.cpu.registers.eip = 0;
+        self.booter_inert = true;
+        true
     }
 
     /// AH=04h verify: confirm the requested sectors are readable without copying

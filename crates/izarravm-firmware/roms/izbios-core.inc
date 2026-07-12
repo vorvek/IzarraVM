@@ -34,13 +34,13 @@ bios_start:
     mov [KB_LAYOUT], al
     xor ax, ax
     mov ds, ax                  ; DS = 0 for the IVT and the result block
-    ; Seed the boot-device choice from CMOS 0x11 (boot order: 0 floppy-first,
-    ; 1 disk-first). The Tab boot menu re-reads this for its default highlight; the
+    ; Seed the boot-device choice from CMOS 0x11 (0 floppy, 1 disk, 2 CD-ROM).
+    ; The Tab boot menu re-reads this for its default highlight; the
     ; copy here is what boot_entry uses when no menu runs. Clamp to floppy.
     mov al, BOOT_CMOS_ORDER
     out 0x70, al
     in al, 0x71
-    cmp al, 1
+    cmp al, 2
     jbe .order_ok
     xor al, al
 .order_ok:

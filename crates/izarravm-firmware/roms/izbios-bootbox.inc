@@ -99,20 +99,32 @@ bx_seed:
     jne .no_hdd
     or byte [BMX_AVAIL], 0x01
 .no_hdd:
-    call probe_optical
-    cmp al, HRES_PASS
-    jne .no_cd
+    ; The drive probe only proves that ATAPI hardware exists. The host parses the
+    ; mounted disc's El Torito catalog and publishes actual bootability in EBDA.
+    push ds
+    mov ax, EBDA_SEG
+    mov ds, ax
+    cmp byte [EBDA_CD_BOOTABLE], 0
+    pop ds
+    je .no_cd
     or byte [BMX_AVAIL], 0x02
 .no_cd:
-    ; Marked device from CMOS 0x11: 1 (disk-first) -> HDD if available, else floppy.
+    ; Marked device from CMOS 0x11, falling back to floppy if its media vanished.
     mov al, BOOT_CMOS_ORDER
     out 0x70, al
     in al, 0x71
+    cmp al, 2
+    je .dev_cd
     cmp al, 1
     jne .dev_floppy
     test byte [BMX_AVAIL], 0x01
     jz .dev_floppy
     mov al, BMX_RG_DEV_HDD
+    jmp .dev_store
+.dev_cd:
+    test byte [BMX_AVAIL], 0x02
+    jz .dev_floppy
+    mov al, BMX_RG_DEV_CD
     jmp .dev_store
 .dev_floppy:
     mov al, BMX_RG_DEV_FLPY
@@ -216,16 +228,21 @@ bx_accept:
     mov al, [BMX_DCODE]
     mov ah, SU_NVRAM_GSW
     call su_cmos_write
-    ; Persist device order to CMOS 0x11: HDD -> 1 (disk-first), else 0.
+    ; Persist the selected device to CMOS 0x11: floppy 0, HDD 1, CD-ROM 2.
     xor cx, cx
     mov ds, cx
     mov al, [BMX_MARK_DEV]
     cmp al, BMX_RG_DEV_HDD
-    jne .order_floppy
+    je .order_hdd
+    cmp al, BMX_RG_DEV_CD
+    je .order_cd
+    xor al, al
+    jmp .order_store
+.order_hdd:
     mov al, 1
     jmp .order_store
-.order_floppy:
-    xor al, al
+.order_cd:
+    mov al, 2
 .order_store:
     mov ah, BOOT_CMOS_ORDER
     call su_cmos_write

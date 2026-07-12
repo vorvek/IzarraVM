@@ -27,7 +27,9 @@
 
 use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
-use izarravm_machine::{ActiveDisplay, MARGO_LFB_BASE, Machine, MachineProfile, VideoMode};
+use izarravm_machine::{
+    ActiveDisplay, CdImage, MARGO_LFB_BASE, Machine, MachineProfile, VideoMode,
+};
 
 // Set 1 make/break codes used by the boot menu.
 const TAB_MAKE: u8 = 0x0f;
@@ -44,6 +46,42 @@ const ESC_BREAK: u8 = 0x81;
 const F10_MAKE: u8 = 0x44;
 const F10_BREAK: u8 = 0xc4;
 const BOOT_CHOICE_ADDR: u32 = 0x0537;
+
+fn bootable_cd() -> CdImage {
+    const SECTOR: usize = 2048;
+    let mut iso = vec![0u8; 32 * SECTOR];
+    let record = 17 * SECTOR;
+    iso[record] = 0;
+    iso[record + 1..record + 6].copy_from_slice(b"CD001");
+    iso[record + 6] = 1;
+    iso[record + 7..record + 30].copy_from_slice(b"EL TORITO SPECIFICATION");
+    iso[record + 71..record + 75].copy_from_slice(&18u32.to_le_bytes());
+
+    let catalog = 18 * SECTOR;
+    iso[catalog] = 1;
+    iso[catalog + 30] = 0x55;
+    iso[catalog + 31] = 0xAA;
+    let validation_sum = (0..16).fold(0u16, |sum, word| {
+        let at = catalog + word * 2;
+        sum.wrapping_add(u16::from_le_bytes([iso[at], iso[at + 1]]))
+    });
+    iso[catalog + 28..catalog + 30].copy_from_slice(&validation_sum.wrapping_neg().to_le_bytes());
+    iso[catalog + 32] = 0x88;
+    iso[catalog + 33] = 0; // no emulation
+    iso[catalog + 34..catalog + 36].copy_from_slice(&0x2000u16.to_le_bytes());
+    iso[catalog + 38..catalog + 40].copy_from_slice(&1u16.to_le_bytes());
+    iso[catalog + 40..catalog + 44].copy_from_slice(&20u32.to_le_bytes());
+
+    let boot = 20 * SECTOR;
+    iso[boot..boot + 12].copy_from_slice(&[
+        0xBB, 0x00, 0x05, // mov bx,0500h
+        0xB0, 0x43, // mov al,43h
+        0x88, 0x07, // mov [bx],al
+        0x88, 0x57, 0x01, // mov [bx+1],dl
+        0xF4, 0x90, // hlt; nop
+    ]);
+    CdImage::from_iso(iso).unwrap()
+}
 
 // The real Wizardry III booter image. The headless boot-floppy smoke command uses
 // the same path; the test is skipped when the corpus is not present so it stays
@@ -267,6 +305,7 @@ fn tab_selects_available_hard_disk_and_boots_it() {
 #[test]
 fn tab_selects_available_cd_rom_row() {
     let mut machine = boot_machine();
+    machine.mount_cd(bootable_cd());
     open_boot_menu(&mut machine);
     press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
     press(&mut machine, ENTER_MAKE, ENTER_BREAK, 3_000_000);
@@ -277,4 +316,11 @@ fn tab_selects_available_cd_rom_row() {
         2,
         "Accept committed CD-ROM as this session's boot device"
     );
+    assert_eq!(machine.read_physical_u8(0x0500), 0x43, "the CD image ran");
+    assert_eq!(
+        machine.read_physical_u8(0x0501),
+        0xE0,
+        "no-emulation boot used DL=E0h"
+    );
+    assert_eq!(machine.cmos_byte(0x11), 2, "CD choice persisted in CMOS");
 }

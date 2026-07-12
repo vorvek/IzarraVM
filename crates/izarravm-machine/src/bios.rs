@@ -963,6 +963,13 @@ impl Machine {
     /// and lets it chain to the active partition. The retired Rust Toka-DOS HLE
     /// boot record no longer backs a non-bootable C: drive.
     pub(super) fn handle_int19(&mut self) {
+        if self.read_physical_u8(BIOS_BOOT_CHOICE_ADDR) == 2 {
+            if self.boot_el_torito() {
+                return;
+            }
+            self.handle_int18();
+            return;
+        }
         // A: floppy first. Copy its boot sector (CHS 0,0,1) to 0000:7C00 and jump
         // there. A mounted floppy is bootable (matching the ROM path); only an
         // unreadable sector 0 falls through.

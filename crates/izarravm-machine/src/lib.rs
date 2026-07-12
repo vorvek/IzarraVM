@@ -768,6 +768,10 @@ pub struct Machine {
     // owns the mounted disc image, the ATA register file, and the CD-audio
     // playback state the mixer streams.
     ide: ide::IdeChannel,
+    // Parsed x86 El Torito initial/default entry for the mounted CD and the
+    // optional drive-emulation state established when that entry boots.
+    eltorito_boot: Option<storage::ElToritoBoot>,
+    eltorito_emulation: Option<storage::ElToritoEmulation>,
     // MSCDEX/IZCDEX volume-descriptor preference. The default selects the primary
     // volume descriptor.
     icdex_vd_preference: u16,
@@ -1079,6 +1083,8 @@ impl Machine {
             floppy_accesses: 0,
             c_accesses: 0,
             ide: ide::IdeChannel::new(),
+            eltorito_boot: None,
+            eltorito_emulation: None,
             icdex_vd_preference: 0x0100,
             ata: None,
             bmide: bmide::BusMasterIde::default(),
@@ -2140,6 +2146,8 @@ const BIOS_BASE_MEMORY_KIB: u16 = 640;
 /// later read. It sits in the inter-application scratch area at 0040:00F0, which no
 /// other field here uses.
 const BDA_DAY_COUNT: usize = 0x4f0;
+/// Low-memory byte shared with the Izarra ROM's BOOT_CHOICE definition.
+const BIOS_BOOT_CHOICE_ADDR: u32 = 0x0537;
 
 /// Segment of the ROM-resident IRET the BIOS keeps at ROM offset 0xF000, i.e.
 /// FF00:0000. The host intercepts the BIOS service interrupts by vector number,
@@ -2190,6 +2198,9 @@ const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0002;
 /// 3 for a standard mouse, 4 once the platform enables IntelliMouse wheel mode. The
 /// BIOS INT 74h ISR accumulates this many aux bytes before dispatching a frame.
 const EBDA_MOUSE_PKT_SIZE_OFF: u32 = 0x000B;
+/// Private firmware/media handshake: nonzero when the mounted CD has a valid
+/// x86 El Torito initial/default entry. The boot menu reads the matching offset.
+const EBDA_CD_BOOTABLE_OFF: u32 = 0x000C;
 
 /// Physical address of the CP/M CALL 5 entry. DOSINTS names this as INT 30h, but
 /// it is code over the IVT bytes for INT 30h and INT 31h rather than a real
