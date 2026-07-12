@@ -63,17 +63,6 @@ reproduces the Izarra 3000 exactly as it was built.
 | Firmware | 2 MB ROM with the Izarra BIOS, Toka-DOS, and bundled tools. |
 | I/O | PS/2 keyboard and mouse, serial, parallel, VGA, line out, line in, and MIDI/game port. |
 
-## How it works
-
-The firmware is a clean-room BIOS with a graphical POST, a boot menu, and a
-full setup panel. It boots a real FreeDOS kernel and shell (rebranded
-Toka-DOS 3.0) inside virtual-8086 mode under TOKAEMM, a guest-side memory
-manager that provides XMS, EMS, and UMBs through the CPU's own paging, the
-same way a period memory manager did it. The C: drive is a folder on the host,
-served to the guest as a real ATA disk; the classic external DOS tools
-(XCOPY, ATTRIB, FIND, MORE, MEM, CHOICE, DELTREE, MOVE, SORT, LABEL, and more)
-ship on it, built from FreeDOS sources or written for the project.
-
 ## Current State
 
 The emulator boots to a usable DOS with sound, mouse, CD-ROM (ISO, CUE/BIN, or
