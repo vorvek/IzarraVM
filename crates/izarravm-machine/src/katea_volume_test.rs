@@ -58,7 +58,7 @@ fn extracts_the_embedded_image_payload() {
     );
 
     // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
-    // loads it (frameless NOEMS) with DOS=HIGH,UMB — every default boot runs
+    // loads its 3 MB EMS pool with DOS=HIGH,UMB, so every default boot runs
     // FreeDOS in V86 under the guest memory manager. BYTE compare, not a
     // length compare: the driver's resident envelope is padded to a fixed
     // size, so two different builds are routinely the same length — a stale
@@ -74,7 +74,7 @@ fn extracts_the_embedded_image_payload() {
     let config = by_name.get("CONFIG.SYS").expect("CONFIG.SYS present");
     let config_text = String::from_utf8_lossy(config);
     assert!(
-        config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS"),
+        config_text.contains("DEVICE=C:\\DOS\\TOKAEMM.SYS RAM"),
         "default CONFIG.SYS loads TOKAEMM from C:\\DOS"
     );
     assert!(

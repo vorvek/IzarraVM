@@ -534,6 +534,11 @@ struct e820map
 typedef void far (*xms_drv_t)(void);
 void far (*xms_drv)(void);
 
+#define TOKA_CATEGORY_MAGIC 0x544B
+
+static ushort toka_xms_category_k;
+static ushort toka_ems_category_k;
+
 /*
  * The last segment address that is in conventional memory.
  */
@@ -692,6 +697,14 @@ ulong call_xms_driver_eax(unsigned char ah, ushort dx);
     "shr edx, 16" \
     ".8086" \
 parm [ah] [dx] value [dx ax] modify [bx]
+
+unsigned toka_xms_categories(void);
+#pragma aux toka_xms_categories = \
+    "mov ax, 0xf000" \
+    "call dword ptr [xms_drv]" \
+    "mov [toka_xms_category_k], bx" \
+    "mov [toka_ems_category_k], cx" \
+value [ax] modify [bx cx]
 
 unsigned check_8800(void);
 #pragma aux check_8800 =\
@@ -914,6 +927,23 @@ static xms_drv_t get_xms_drv(void)
     regs.x.ax = 0x4310;
     int86x(0x2f, &regs, &regs, &sregs);
     return MK_FP(sregs.es, regs.x.bx);
+}
+
+static unsigned toka_xms_categories(void)
+{
+    unsigned magic;
+
+    asm push bx
+    asm push cx
+    asm mov ax, 0f000h
+    asm call dword ptr xms_drv
+    asm mov magic, ax
+    asm mov toka_xms_category_k, bx
+    asm mov toka_ems_category_k, cx
+    asm pop cx
+    asm pop bx
+
+    return magic;
 }
 
 extern ulong cdecl call_xms_driver_dx_bl_al(unsigned char rah, ushort rdx);

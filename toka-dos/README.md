@@ -27,9 +27,9 @@ switch) are Izarra-specific additions layered on top of stock FreeDOS.
   not vendored FreeDOS), assembled straight into `TOKAMOUS.COM`.
 - `build-freedos.ps1` the build script: builds the FreeDOS kernel + FreeCOM
   shell (Open Watcom cross-compile), builds `MOVE.EXE`/`SORT.EXE` from the
-  vendored userland sources, assembles `TOKAMOUS.COM` and `GSWMODE.COM`, then
-  invokes `scripts/build-freedos-hdd-image.py` to assemble the committed disk
-  image.
+  vendored userland sources, assembles `TOKAMOUS.COM`, `TOKAEMM.SYS`, and
+  `GSWMODE.COM`, then invokes `scripts/build-freedos-hdd-image.py` to assemble
+  the committed disk image.
 
 Small standalone guest `.COM`/`.SYS` tools that aren't vendored FreeDOS source
 (`TOKAEMM.SYS`, `GSWMODE.COM`, and DOS test fixtures like `MOUSETST.COM`) live
@@ -48,9 +48,9 @@ Requires Open Watcom (`D:\DevTools\OpenWatcom`) and NASM on PATH.
     pwsh toka-dos/build-freedos.ps1
 
 This builds `kernel.sys`, the FAT12/FAT32-LBA/MBR boot sectors, `command.com`,
-`MOVE.EXE`, `SORT.EXE`, `TOKAMOUS.COM`, and `GSWMODE.COM` (all gitignored
-intermediates), then runs `scripts/build-freedos-hdd-image.py` to assemble
-those into `crates/izarravm-firmware/roms/tokados-hdd.img`. At runtime,
+`MOVE.EXE`, `SORT.EXE`, `TOKAMOUS.COM`, `TOKAEMM.SYS`, and `GSWMODE.COM`, then
+runs `scripts/build-freedos-hdd-image.py` to assemble those into
+`crates/izarravm-firmware/roms/tokados-hdd.img`. At runtime,
 `crates/izarravm-machine/src/katea_volume.rs::extract_system_payload` parses
 that image and overlays every payload file except `HELLO.TXT`/`CONFIG.SYS`/
 `AUTOEXEC.BAT` onto the guest's C: drive.

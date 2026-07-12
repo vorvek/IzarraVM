@@ -13,28 +13,34 @@ and upper memory blocks (UMBs), in the tradition of EMM386.EXE on a real
 `CONFIG.SYS` loads TOKAEMM as a device driver, before `DOS=HIGH,UMB`:
 
 ```
-DEVICE=C:\DOS\TOKAEMM.SYS [NOEMS | RAM]
+DEVICE=C:\DOS\TOKAEMM.SYS [RAM | NOEMS]
 ```
 
 The Toka-DOS default ships as:
 
 ```
-DEVICE=C:\DOS\TOKAEMM.SYS NOEMS
+DEVICE=C:\DOS\TOKAEMM.SYS RAM
 DOS=HIGH,UMB
 ```
 
 ## Switches
 
-TOKAEMM recognizes exactly one command-line keyword: **RAM**. Everything
-else on the `DEVICE=` line (including `NOEMS`) is accepted but not
-specially parsed; the driver is frameless by default, and writing `NOEMS`
-explicitly is just documentation of that default, the same convention
-EMM386.EXE uses. There is no `FRAME=` switch and no memory-size argument.
+TOKAEMM starts with EMS enabled when the `DEVICE=` line has no argument.
+`RAM` selects that same default explicitly. Use `NOEMS` when a program needs
+the manager to run without an EMS page frame. There is no `FRAME=` switch or
+memory-size argument.
 
 | Argument | Effect |
 | --- | --- |
-| *(none)*, or `NOEMS` | Frameless: XMS, UMBs, and HMA are provided; `INT 67h` answers "present" but with zero EMS pages. This is the shipped default. |
-| `RAM` | Provisions a real EMS 4.0 page frame at segment `E000`, backed by a pool carved from extended memory, in addition to everything the frameless mode provides. |
+| *(none)*, or `RAM` | Provide XMS, UMBs, HMA, and a 3 MiB EMS 4.0 pool with its page frame at segment `E000`. This is the shipped default. |
+| `NOEMS` | Keep XMS, UMBs, and HMA, but disable the EMS page frame and page pool. `INT 67h` still reports the manager as present with zero EMS pages. |
+
+On the Izarra 3000's 24 MiB memory map, Toka-DOS reports 640 KiB of
+conventional memory, a 384 KiB upper region, a 20 MiB XMS category, and a
+separate 3 MiB EMS partition at the top of RAM. XMS allocations and VCPI pages
+share the allocation arena inside the 20 MiB category. EMS does not share that
+arena. Under `NOEMS`, the EMS category is zero and its 3 MiB returns to the
+shared XMS/VCPI arena, making the XMS category 23 MiB.
 
 ## XMS
 
@@ -47,8 +53,8 @@ and drivers rely on:
 - **A20 control**: global and local enable/disable, with nesting, plus a
   query function (03h-07h).
 - **Extended memory blocks**: allocate, free, resize, lock/unlock, and query
-  free space (08h-0Fh), through a 32-handle allocator over the machine's
-  extended memory.
+  free space (08h-0Fh), through a 32-handle allocator in the shared XMS/VCPI
+  arena.
 - **Block moves**: the `INT 21h`-style bulk-copy function (0Bh) that moves
   data between conventional and extended memory, or between two extended
   blocks.
@@ -66,18 +72,24 @@ upper memory window with real extended RAM mapped in over the address hole
 above the video BIOS, so loading high genuinely frees conventional memory
 rather than faking it.
 
+The full upper memory region from `A0000` through `FFFFF` is 384 KiB. Video
+memory and ROMs occupy part of it. With the default EMS frame at `E000`,
+TOKAEMM can allocate 96 KiB of UMB space from `C800` through `DFFF`. `NOEMS`
+removes the frame and raises the allocatable UMB space to 160 KiB, from
+`C800` through `EFFF`.
+
 ## EMS 4.0 (the RAM keyword)
 
 `DEVICE=C:\DOS\TOKAEMM.SYS RAM` turns on Lotus/Intel/Microsoft Expanded Memory
 Specification 4.0 support: a 64 KB page frame at segment `E000`, mapped in
-16 KB pages backed by a 4 MB pool of extended memory. Software that checks
-for EMS the standard way (looking for the `EMMXXXX0` device name) finds
-it, and `INT 67h` answers the LIM 4.0 function set: status, frame address,
+16 KB pages backed by a separate 3 MiB partition at the top of RAM. Software
+that checks for EMS the standard way (looking for the `EMMXXXX0` device name)
+finds it, and `INT 67h` answers the LIM 4.0 function set: status, frame address,
 page counts, allocate/map/free/save/restore, and version.
 
-The shipped Toka-DOS `CONFIG.SYS` uses the frameless default instead, so EMS
-page mapping is off out of the box; add `RAM` to the `DEVICE=` line to turn
-it on for software that specifically wants EMS pages rather than XMS.
+The shipped Toka-DOS `CONFIG.SYS` writes `RAM` explicitly. A bare `DEVICE=`
+line behaves the same way. Replace `RAM` with `NOEMS` to turn off EMS and make
+the page-frame area available for UMB allocation.
 
 ## HMA and DOS=HIGH
 

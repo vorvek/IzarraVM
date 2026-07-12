@@ -288,14 +288,15 @@ def main():
         repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD). TOKAEMM
-    # loads as the memory manager (frameless NOEMS; the system runs in V86 under
-    # its monitor), DOS=HIGH,UMB uses the HMA + TOKAEMM's UMBs, LASTDRIVE=D
+    # loads as the memory manager with its default 3 MiB EMS pool, and the system
+    # runs in V86 under its monitor. DOS=HIGH,UMB uses the HMA + TOKAEMM's UMBs,
+    # while LASTDRIVE=D
     # covers A: floppy / C: HDD / D: CD-ROM without wasting CDS entries. The system
     # binaries live in C:\DOS (see the file layout below), so DEVICE= and SHELL=
     # name that subdirectory; only CONFIG.SYS/AUTOEXEC.BAT stay in the root. The
     # SHELL= dir argument (C:\DOS) is where FreeCOM builds COMSPEC from.
     config_sys = (b"FILES=40\r\nLASTDRIVE=D\r\n"
-                  b"DEVICE=C:\\DOS\\TOKAEMM.SYS NOEMS\r\n"
+                  b"DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n"
                   b"DOS=HIGH,UMB\r\n"
                   b"SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS

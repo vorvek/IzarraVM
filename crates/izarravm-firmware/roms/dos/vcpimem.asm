@@ -15,7 +15,30 @@ org 0x100
 %define OK 0xA5
 
 start:
-    ; 1. DE03: free page count > 256 (a real pool, at least 1 MB on this box)
+    ; Reserve one shared-arena page through XMS before VCPI starts. The two
+    ; interfaces must not return or release each other's pages.
+    mov ax, 0x4300
+    int 0x2F
+    cmp al, 0x80
+    jne f_xms
+    mov ax, 0x4310
+    int 0x2F
+    mov [xms_entry], bx
+    mov [xms_entry+2], es
+    mov ah, 0x09
+    mov dx, 4
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov [xms_handle], dx
+    mov ah, 0x0C
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov [xms_page], bx
+    mov [xms_page+2], dx
+
+    ; 1. DE03: free page count >= 256 (a real pool, at least 1 MB on this box)
     mov ax, 0xDE03
     int 0x67
     or ah, ah
@@ -47,6 +70,8 @@ start:
     jb f_alloc
     cmp edx, [maxpg]
     ja f_alloc
+    cmp edx, [xms_page]
+    je f_owner
     mov [page1], edx
     mov ax, 0xDE03
     int 0x67
@@ -67,6 +92,13 @@ start:
     int 0x67
     cmp edx, [free0]
     jne f_free
+
+    ; DE05 must reject the page owned by the live XMS handle.
+    mov edx, [xms_page]
+    mov ax, 0xDE05
+    int 0x67
+    or ah, ah
+    jz f_owner
 
     ; 5. DE05 on conventional memory (never a pool page) -> nonzero AH
     mov edx, 0x5000
@@ -166,6 +198,17 @@ start:
     or ah, ah
     jnz f_pic
 
+    mov ah, 0x0D                 ; release the XMS page after the VCPI checks
+    mov dx, [xms_handle]
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+    mov ah, 0x0A
+    mov dx, [xms_handle]
+    call far [xms_entry]
+    or ax, ax
+    jz f_xms
+
     mov al, OK
     jmp sig
 
@@ -188,6 +231,10 @@ f_cr0:    mov al, 0xE8
 f_dr:     mov al, 0xE9
           jmp sig
 f_pic:    mov al, 0xEA
+          jmp sig
+f_xms:    mov al, 0xEB
+          jmp sig
+f_owner:  mov al, 0xEC
 
 sig:
     mov ah, al
@@ -203,4 +250,7 @@ align 4
 free0:  dd 0
 maxpg:  dd 0
 page1:  dd 0
+xms_entry: dd 0
+xms_page: dd 0
+xms_handle: dw 0
 drbuf:  times 32 db 0

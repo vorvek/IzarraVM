@@ -22,8 +22,8 @@
 ; real-mode IVT through the null DS (base 0 == flat) and its own data through FS.
 ;
 ; All four GSW modes expose at least the 386 ISA. The guest-facing XMS/EMS/UMB
-; entry points keep a 16-bit ABI and use KB units internally. The 16 MB map
-; keeps each KB count under 0x4000. They pass 32-bit arguments to INT 0xC0
+; entry points keep a 16-bit ABI and use KB units internally. The 24 MB map
+; keeps each KB count under 0x6000. They pass 32-bit arguments to INT 0xC0
 ; monitor services through driver-resident scratch dwords read through FS.
 cpu 386
 org 0
@@ -70,8 +70,10 @@ vip: dw 0                         ; pending IRQ lines held while VIF=0 (bit N =
 
 ; ---- XMS state (resident; reached via cs: overrides from V86) ----
 old_2f:   dd 0                     ; previous INT 2Fh vector (chain target)
-xms_pool_base: dd 0               ; first linear byte the EMB allocator hands out
-xms_pool_end:  dd 0               ; one past the last (capped to the 16 MB map)
+xms_pool_base: dd 0               ; first byte in the shared XMS/VCPI arena
+xms_pool_end:  dd 0               ; one past the arena (capped to the 24 MB map)
+xms_category_kb: dw 0             ; whole XMS partition, including HMA/UMB backing
+hma_available: db 0               ; fixed HMA lies inside detected physical RAM
 hma_owned: db 0                   ; 1 once a guest (DOS=HIGH) claims the HMA
 a20_count: dw 0                   ; XMS local-A20 enable nesting (fns 05h/06h)
 xms_disp:  dw 0                   ; dispatch scratch (register-safe table jump)
@@ -82,10 +84,11 @@ xms_mv_dst: dd 0                  ;  via FS; the 16-bit V86 ABI has no
 xms_slot_save: dw 0               ; 0Fh resize: keep the slot across find_gap (clobbers SI)
 xms_rv_off: dd 0                  ; resolve input: the endpoint's 32-bit offset
 xms_need_kb: dw 0                 ; find_gap input: KB wanted
+xms_need_pages: dw 0              ; rounded 4 KB pages reserved for that request
 
 ; 32 EMB handles. handle h (1-based) -> slot at xms_table + (h-1)*XMS_SLOT.
-; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_kb(w) +6 pad. Bases are
-; KB-granular (find_gap allocates in KB units); linear = base_kb << 10.
+; slot: +0 inuse(b) +1 lock(b) +2 size_kb(w) +4 base_kb(w) +6 pages(w). Bases
+; are 4 KB-aligned; linear = base_kb << 10. The page count includes padding.
 XMS_HANDLES equ 32
 XMS_SLOT    equ 8
 xms_table: times XMS_HANDLES*XMS_SLOT db 0
@@ -99,19 +102,16 @@ UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
 UMB_SEG_BASE  equ 0x0C800         ; first UMB paragraph (segment); the window
                                   ; ends at the runtime umb_win_end
+umb_available: db 0               ; backing fits inside detected physical RAM
 ; UMB sub-blocks handed out by 10h. slot: +0 inuse(b) +1 pad +2 seg(w) +4 paras(w)
 UMB_SLOTS equ 8
 UMB_SLOT  equ 6
 umb_table: times UMB_SLOTS*UMB_SLOT db 0
 
 ; ---- EMS state (resident; reached via cs: overrides from V86) ----
-; Default-off: DEVICE=C:\DOS\TOKAEMM.SYS presents a frameless manager (INT 67h
-; answers present/version/0 pages, like EMM386 NOEMS); the RAM argument
-; provisions the page frame [0xE000,0xF000) + a backing pool carved from
-; extended RAM just past the UMB backing, and the UMB window shrinks to
-; end below the frame.
-EMS_PHYS_BASE equ 0x00138000      ; backing pool base (= UMB_PHYS_BASE+UMB_BYTES)
-EMS_MAX_PAGES equ 256             ; 4 MB pool ceiling (16 KB pages)
+; EMS is on by default and owns the top 3 MB of a 24 MB machine. NOEMS keeps
+; the manager frameless and returns that partition to the shared XMS/VCPI arena.
+EMS_MAX_PAGES equ 192             ; 3 MB pool ceiling (16 KB pages)
 EMS_FRAME_SEG equ 0xE000          ; page frame segment (4 slots x 16 KB)
 EMS_FRAME_LIN equ 0x000E0000
 EMS_HANDLES   equ 32
@@ -120,9 +120,11 @@ EMS_HANDLES   equ 32
 ; (logical page L -> backing page first+L); contiguity is invisible to apps.
 ; Limit: a fragmented pool can 88h an alloc that per-page bookkeeping would satisfy.
 EMS_SLOT      equ 16
-ems_on:      db 0                 ; 1 = RAM argument seen and pages provisioned
+ems_on:      db 1                 ; 1 unless the command line contains NOEMS
 ems_pages:   dw 0                 ; total 16 KB pages (<= EMS_MAX_PAGES)
 ems_free:    dw 0                 ; free pages
+ems_category_kb: dw 0             ; private F0 query, pages converted to KB
+ems_phys_base: dd 0               ; runtime top-of-RAM backing pool base
 ems_disp:    dw 0                 ; dispatch scratch (mirrors xms_disp)
 umb_win_end: dw 0xF000            ; UMB window end segment (0xE000 with EMS on)
 ems_table: times EMS_HANDLES*EMS_SLOT db 0
@@ -134,24 +136,20 @@ ems_frame_map: dw 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
 ems_rm_lin:  dd 0
 ems_rm_phys: dd 0
 
-; ---- VCPI server state (monitor-side only, reached via FS). The page
-; pool is a STATIC carve of the XMS arena made at INIT: XMS keeps a fixed low
-; reserve for EMBs (stock DOS barely allocates any -- DOS=HIGH uses the HMA,
-; not EMBs), the VCPI bitmap owns everything above it. Disjoint from the EMS
-; pool and the XMS arena by construction: no double allocation is possible.
-; The bitmap indexes ABSOLUTE 4K page numbers over the full 16 MB map (4096
-; bits); only pages inside [vcpi_pool_base, vcpi_pool_end) can ever be set,
-; enforced by the range checks in vcpi_page_alloc/vcpi_page_free.
-VCPI_XMS_KEEP equ 0x200000        ; 2 MB stays XMS EMB arena
+; ---- Shared XMS/VCPI arena. Both allocators use arena_bmp; vcpi_owner_bmp
+; distinguishes pages DE05 may release. The bitmaps use absolute 4 KB page
+; numbers over the 24 MB map (6144 bits). XMS reserves contiguous page runs;
+; VCPI reserves single pages. EMS owns a separate physical partition.
 align 4
 vcpi_pool_base: dd 0              ; first pool byte (4K-aligned)
 vcpi_pool_end:  dd 0              ; one past the last pool byte (4K-aligned)
-vcpi_free:      dw 0              ; free 4K pages
+arena_free:     dw 0              ; free 4K pages shared by XMS and VCPI
 vcpi_cursor:    dw 0              ; next-fit absolute-page scan cursor
 vcpi_pic_master: dw 8             ; DE0Ah/DE0Bh: current 8259 vector bases
 vcpi_pic_slave:  dw 0x70          ; (the DOS-default mapping until a client
                                   ;  reports a remap; store-and-report only)
-vcpi_bmp: times 512 db 0          ; the absolute-page allocation bitmap
+arena_bmp: times 768 db 0         ; one allocation bit per physical 4 KB page
+vcpi_owner_bmp: times 768 db 0    ; set only for VCPI-owned allocated pages
 
 strategy:
     mov [cs:rh_ptr], bx
@@ -195,9 +193,10 @@ init:
     mov word [es:bx+16], cs
     mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
-    ; Parse the DEVICE= tail for a whole-token "RAM" argument.
+    ; Parse the DEVICE= tail for a whole-token "NOEMS" argument.
     ; r_bpbptr (+18) points at the raw command line, driver path first
-    ; (FreeDOS init_device). Case-insensitive; NOEMS/anything else = default off.
+    ; (FreeDOS init_device). Bare and RAM both use the default 3 MB EMS pool;
+    ; NOEMS wins regardless of token order because no other token sets it back.
     push ds
     lds si, [es:bx+18]
 .p_path:                          ; skip the path token
@@ -215,16 +214,25 @@ init:
     cmp ah, 2
     je .p_done
     and al, 0xDF                  ; token first char, upcased
-    cmp al, 'R'
+    cmp al, 'N'
     jne .p_skiptok
     lodsb
     call cls_al
     cmp ah, 1
-    je .p_gap                     ; token was just "R"
+    je .p_gap                     ; token was just "N"
     cmp ah, 2
     je .p_done
     and al, 0xDF
-    cmp al, 'A'
+    cmp al, 'O'
+    jne .p_skiptok
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF
+    cmp al, 'E'
     jne .p_skiptok
     lodsb
     call cls_al
@@ -235,11 +243,22 @@ init:
     and al, 0xDF
     cmp al, 'M'
     jne .p_skiptok
-    lodsb                         ; the char after "RAM" must end the token
+    lodsb
+    call cls_al
+    cmp ah, 1
+    je .p_gap
+    cmp ah, 2
+    je .p_done
+    and al, 0xDF
+    cmp al, 'S'
+    jne .p_skiptok
+    lodsb                         ; the char after "NOEMS" must end the token
     call cls_al
     cmp ah, 0
-    je .p_skiptok                 ; longer token (e.g. RAMX): not ours
-    mov byte [cs:ems_on], 1
+    je .p_skiptok                 ; longer token (for example NOEMSX)
+    mov byte [cs:ems_on], 0
+    cmp ah, 1
+    je .p_gap
     jmp .p_done
 .p_skiptok:                       ; consume the rest of the current token
     lodsb
@@ -261,70 +280,126 @@ init:
     jmp .bl
 .bdone:
 
-    ; Size the XMS pool and hook INT 2Fh in real mode before entering V86.
-    ; INT 15h AH=88h -> AX = KB of extended memory above 1 MB. Extended layout:
-    ; HMA [1MB,+64KB), UMB backing [0x110000,+160KB), XMS pool [0x138000, top).
+    ; Discover physical RAM before entering V86. E801 reports KB between 1 and
+    ; 16 MB plus 64 KB blocks above 16 MB. Some BIOSes use AX/BX and others use
+    ; CX/DX, so accept the first nonzero pair. AH=88h is the fallback.
+    mov ax, 0xE801
+    int 0x15
+    jc .mem_88
+    mov si, ax
+    mov di, bx
+    mov ax, si
+    or ax, di
+    jnz .mem_e801
+    mov si, cx
+    mov di, dx
+.mem_e801:
+    movzx eax, si                 ; KB from 1 MB through 16 MB
+    movzx ebx, di                 ; 64 KB blocks above 16 MB
+    shl eax, 10
+    shl ebx, 16
+    add eax, ebx
+    jnz .mem_got_ext
+.mem_88:
     mov ah, 0x88
-    int 0x15                      ; AX = extended KB (real mode, before V86)
+    int 0x15
+    jc .mem_none
     movzx eax, ax
-    cmp eax, 15*1024              ; cap to the 15 MB above 1 MB the map covers
-    jbe .pool_ok
-    mov eax, 15*1024
-.pool_ok:
-    sub eax, 64                   ; drop the HMA (first 64 KB of extended memory)
-    shl eax, 10                   ; KB -> bytes
-    add eax, 0x00110000           ; eax = top of extended (pool_end)
-    mov [cs:xms_pool_end], eax
-    ; The 160 KB UMB backing sits just above the HMA; XMS starts past it.
-    mov dword [cs:xms_pool_base], UMB_PHYS_BASE + UMB_BYTES
+    shl eax, 10
+    jmp .mem_got_ext
+.mem_none:
+    xor eax, eax
+.mem_got_ext:
+    add eax, 0x00100000           ; convert extended bytes to physical top
+    cmp eax, 0x01800000           ; this monitor maps at most 24 MB
+    jbe .mem_top_ok
+    mov eax, 0x01800000
+.mem_top_ok:
+    and eax, 0xFFFFF000
+    mov edi, eax                  ; EDI = detected/capped physical top
 
-    ; With RAM enabled, carve the EMS pool [EMS_PHYS_BASE, +pages*16K),
-    ; shift the XMS pool past it, and end the UMB window below the page frame.
+    ; Fixed low extended-memory services are available only when their complete
+    ; physical backing fits. A small machine still gets the V86 monitor, but no
+    ; service advertises memory beyond the detected top.
+    cmp edi, 0x00110000
+    jb .no_hma
+    mov byte [cs:hma_available], 1
+.no_hma:
+    cmp edi, UMB_PHYS_BASE + UMB_BYTES
+    jb .no_umb
+    mov byte [cs:umb_available], 1
+    mov eax, UMB_PHYS_BASE + UMB_BYTES
+    jmp .arena_base
+.no_umb:
+    mov word [cs:umb_win_end], UMB_SEG_BASE
+    mov eax, edi                  ; empty arena when the UMB backing cannot fit
+.arena_base:
+    mov [cs:xms_pool_base], eax
+
+    ; Keep at least 1 MB for the shared XMS/VCPI arena when possible, then put
+    ; up to 3 MB of EMS at the top. On the 24 MB product profile this makes the
+    ; XMS category [1 MB,21 MB) and EMS [21 MB,24 MB).
+    mov ebx, edi                  ; default frameless: arena reaches RAM top
     cmp byte [cs:ems_on], 0
-    je .ems_done
-    mov eax, [cs:xms_pool_end]
-    cmp eax, EMS_PHYS_BASE + 0x4000  ; at least one 16 KB page available?
-    jb .ems_off                      ; degenerate small-RAM box: stay frameless
-    sub eax, EMS_PHYS_BASE
-    shr eax, 14                      ; bytes -> 16 KB pages
-    cmp eax, EMS_MAX_PAGES
-    jbe .ems_clamped
-    mov eax, EMS_MAX_PAGES
-.ems_clamped:
+    je .ems_layout_done
+    cmp byte [cs:umb_available], 0
+    je .ems_disable
+    mov eax, edi
+    sub eax, UMB_PHYS_BASE + UMB_BYTES
+    jc .ems_disable
+    cmp eax, 0x00100000           ; retain a 1 MB shared arena
+    jbe .ems_disable
+    sub eax, 0x00100000
+    and eax, 0xFFFFC000           ; EMS pages are 16 KB
+    cmp eax, EMS_MAX_PAGES * 0x4000
+    jbe .ems_size_ok
+    mov eax, EMS_MAX_PAGES * 0x4000
+.ems_size_ok:
+    test eax, eax
+    jz .ems_disable
+    mov ebx, edi
+    sub ebx, eax                  ; EBX = EMS base / XMS category end
+    mov [cs:ems_phys_base], ebx
+    shr eax, 14
     mov [cs:ems_pages], ax
     mov [cs:ems_free], ax
-    shl eax, 14
-    add eax, EMS_PHYS_BASE
-    mov [cs:xms_pool_base], eax      ; XMS pool starts past the EMS pool
+    shl ax, 4                     ; pages * 16 KB -> category KB
+    mov [cs:ems_category_kb], ax
     mov word [cs:umb_win_end], EMS_FRAME_SEG
-    jmp .ems_done
-.ems_off:
+    jmp .ems_layout_done
+.ems_disable:
     mov byte [cs:ems_on], 0
-.ems_done:
+    mov [cs:ems_phys_base], edi
+.ems_layout_done:
+    mov [cs:xms_pool_end], ebx
+    mov eax, ebx
+    sub eax, 0x00100000
+    jnc .xms_category_ok
+    xor eax, eax
+.xms_category_ok:
+    shr eax, 10
+    mov [cs:xms_category_kb], ax
 
-    ; Carve the VCPI page pool from the top of the post-EMS XMS region.
-    ; arena. XMS keeps VCPI_XMS_KEEP; the bitmap owns the rest. Shrinking
-    ; xms_pool_end here is what makes the two allocators disjoint. On a
-    ; degenerate small-RAM box the pool is simply empty (DE04 answers 88h).
+    ; The shared arena is page-aligned and feeds both XMS EMBs and VCPI pages.
     mov eax, [cs:xms_pool_base]
-    add eax, VCPI_XMS_KEEP
     add eax, 0xFFF
-    and eax, 0xFFFFF000           ; pool base: 4K-aligned above the reserve
+    and eax, 0xFFFFF000
     mov ebx, [cs:xms_pool_end]
-    and ebx, 0xFFFFF000           ; pool end: 4K-aligned down
+    and ebx, 0xFFFFF000
     cmp eax, ebx
-    jbe .vcpi_carve
-    mov eax, ebx                  ; reserve doesn't fit: empty pool
-.vcpi_carve:
+    jbe .arena_bounds_ok
+    mov eax, ebx
+.arena_bounds_ok:
+    mov [cs:xms_pool_base], eax
+    mov [cs:xms_pool_end], ebx
     mov [cs:vcpi_pool_base], eax
     mov [cs:vcpi_pool_end], ebx
-    mov [cs:xms_pool_end], eax    ; the XMS arena now ends at the pool base
     mov ecx, ebx
     sub ecx, eax
     shr ecx, 12
-    mov [cs:vcpi_free], cx
+    mov [cs:arena_free], cx
     shr eax, 12
-    mov [cs:vcpi_cursor], ax      ; next-fit cursor starts at the pool base
+    mov [cs:vcpi_cursor], ax
 
     ; Hook INT 2Fh (chain) + own INT 67h outright (IVT at linear 0). The EMS
     ; manager answers in BOTH modes: frameless is EMM386-NOEMS's contract.
@@ -412,8 +487,10 @@ init:
     mov cr0, eax
     jmp dword 0x08:pm_init        ; code sel base = base -> linear base+pm_init
 
-%strlen TOKAEMM_SOURCE_PATH_LEN __FILE__
-%substr TOKAEMM_SOURCE_DIR __FILE__ 1, TOKAEMM_SOURCE_PATH_LEN-11
+%ifndef TOKAEMM_SOURCE_DIR
+    %strlen TOKAEMM_SOURCE_PATH_LEN __FILE__
+    %substr TOKAEMM_SOURCE_DIR __FILE__ 1, TOKAEMM_SOURCE_PATH_LEN-11
+%endif
 %strcat TOKAEMM_XMS_INC TOKAEMM_SOURCE_DIR, "tokaemm-xms.inc"
 %include TOKAEMM_XMS_INC
 
@@ -427,7 +504,7 @@ init:
 ems_int67:
     cmp ah, 0x40
     jb ef_undef
-    cmp ah, 0x4C
+    cmp ah, 0x4D
     ja ef_undef
     push bx
     mov bl, ah                    ; zero-extend AH through the 16-bit ABI
@@ -442,7 +519,7 @@ ems_jt:
     dw ef_status, ef_frame, ef_counts, ef_alloc     ; 40h-43h
     dw ef_map, ef_free, ef_version, ef_save         ; 44h-47h
     dw ef_restore, ef_undef, ef_undef, ef_count     ; 48h-4Bh (49/4A reserved)
-    dw ef_pages                                     ; 4Ch
+    dw ef_pages, ef_all_pages                       ; 4Ch-4Dh
 
 ef_undef:
     mov ah, 0x84                  ; undefined function
@@ -758,6 +835,39 @@ ef_pages:
     pop si
     iret
 
+; 4Dh get pages for every open handle. ES:DI receives {handle,pages} word
+; pairs and BX receives the number written. This is the LIM enumeration MEM
+; uses after 4Bh; empty slots are omitted.
+ef_all_pages:
+    push ax
+    push cx
+    push dx
+    push si
+    push di
+    xor bx, bx
+    xor dx, dx                    ; one-based handle number
+    mov si, ems_table
+    mov cx, EMS_HANDLES
+.scan:
+    inc dx
+    cmp byte [cs:si], 0
+    je .next
+    mov [es:di], dx
+    mov ax, [cs:si+2]
+    mov [es:di+2], ax
+    add di, 4
+    inc bx
+.next:
+    add si, EMS_SLOT
+    loop .scan
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop ax
+    xor ah, ah
+    iret
+
 ; --- EMS helpers --------------------------------------------------------------
 
 ; DX = EMS handle -> SI = slot offset, CF clear; or CF set + AH = 0x83.
@@ -823,6 +933,7 @@ ems_find_run:
 ; The two 32-bit args (slot linear base, backing physical base) are staged in
 ; [cs:ems_rm_*] as word pairs; the monitor reads them via FS.
 ems_remap_slot:
+    push eax
     push dx
     mov dx, ax
     and dx, 3                     ; slot linear = EMS_FRAME_LIN + slot*16K:
@@ -831,15 +942,10 @@ ems_remap_slot:
     mov word [cs:ems_rm_lin+2], EMS_FRAME_LIN >> 16   ; high word = 0x000E
     cmp cx, 0xFFFF
     je .unmap
-    mov dx, cx                    ; backing = EMS_PHYS_BASE + page*16K:
-    shr dx, 2                     ; high word = (page >> 2) + base high
-    add dx, EMS_PHYS_BASE >> 16
-    mov [cs:ems_rm_phys+2], dx
-    mov dx, cx
-    shl dx, 14                    ; low word = (page << 14) + base low, with
-    add dx, EMS_PHYS_BASE & 0xFFFF
-    mov [cs:ems_rm_phys], dx
-    adc word [cs:ems_rm_phys+2], 0 ; the add's carry folded into the high word
+    movzx eax, cx                 ; backing = runtime base + page*16K
+    shl eax, 14
+    add eax, [cs:ems_phys_base]
+    mov [cs:ems_rm_phys], eax
     jmp .go
 .unmap:
     mov word [cs:ems_rm_phys], 0  ; 0 = restore the INIT mapping
@@ -848,6 +954,7 @@ ems_remap_slot:
     mov dx, 0x4D50                ; 'PM' monitor-call cookie
     int 0xC0
     pop dx
+    pop eax
     ret
 
 ; Classify AL for the INIT command-line parse: AH = 0 ordinary char,
@@ -988,20 +1095,20 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     mov es, ax
     mov ss, ax
     mov esp, ebx                  ; monitor ring-0 stack (driver-resident)
-    ; PD[0..3] -> the four PTs that follow the PD (each PT maps 4 MiB), so the
-    ; identity map covers 0..16 MiB and the XMS-move memcpy can reach every EMB.
+    ; PD[0..5] -> the six PTs that follow the PD (each PT maps 4 MiB), so the
+    ; identity map covers 0..24 MiB and the XMS-move memcpy can reach every EMB.
     lea eax, [ebp + 0x1000]       ; first PT linear = PD + 0x1000
     or eax, 7
     mov edi, ebp                  ; write PD entries
-    mov ecx, 4
+    mov ecx, 6
 .pde:
     mov [edi], eax
     add eax, 0x1000               ; next PT is one page further
     add edi, 4
     loop .pde
-    lea edi, [ebp + 0x1000]       ; 4096 identity entries (0..16 MiB), present/rw/user
+    lea edi, [ebp + 0x1000]       ; 6144 entries (0..24 MiB), present/rw/user
     mov eax, 7
-    mov ecx, 4096
+    mov ecx, 6144
 .pt:
     mov [edi], eax
     add eax, 0x1000
@@ -1013,6 +1120,10 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     ; read_phys's fallback, so identity would work too -- but mapping proper extended
     ; RAM is faithful and keeps the UMB accounted against extended memory, not phantom
     ; RAM.) ROM/video PTEs stay identity; only these 40 move.
+    mov edx, esi
+    shl edx, 4
+    cmp byte [edx + umb_available], 0
+    je .umb_map_done
     lea edi, [ebp + 0x1000 + (UMB_LIN_BASE >> 12) * 4]  ; PT0 entry for 0xC8000
     mov eax, UMB_PHYS_BASE | 7                          ; backing base, present/rw/user
     mov ecx, UMB_BYTES >> 12                            ; 40 pages
@@ -1021,6 +1132,7 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     add eax, 0x1000
     add edi, 4
     loop .umb_map
+.umb_map_done:
     mov cr3, ebp
     mov eax, cr0
     or eax, 0x80000000            ; paging on
@@ -1975,7 +2087,7 @@ vcpi_dispatch:
     ret
 
 .de03:                            ; free 4K page count -> EDX
-    movzx eax, word [fs:vcpi_free]
+    movzx eax, word [fs:arena_free]
     mov [esi+20], eax
     mov byte [esi+29], 0
     ret
@@ -2159,10 +2271,10 @@ vcpi_dr_buf:
 
 ; Allocate the lowest free pool page from the next-fit cursor. -> EAX = the
 ; page's physical address, CF clear; or CF set (pool exhausted). The scan
-; terminates because vcpi_free > 0 guarantees a clear bit inside the pool
+; terminates because arena_free > 0 guarantees a clear bit inside the pool
 ; range. BT/BTS take the full bit index (bit-string form). Clobbers ecx, edx.
 vcpi_page_alloc:
-    cmp word [fs:vcpi_free], 0
+    cmp word [fs:arena_free], 0
     je .none
     movzx eax, word [fs:vcpi_cursor]
     mov ecx, [fs:vcpi_pool_end]
@@ -2173,13 +2285,14 @@ vcpi_page_alloc:
     mov eax, [fs:vcpi_pool_base]  ; wrap to the pool base
     shr eax, 12
 .test:
-    bt [fs:vcpi_bmp], eax
+    bt [fs:arena_bmp], eax
     jnc .take
     inc eax
     jmp .scan
 .take:
-    bts [fs:vcpi_bmp], eax
-    dec word [fs:vcpi_free]
+    bts [fs:arena_bmp], eax
+    bts [fs:vcpi_owner_bmp], eax
+    dec word [fs:arena_free]
     lea edx, [eax+1]
     mov [fs:vcpi_cursor], dx
     shl eax, 12
@@ -2197,10 +2310,13 @@ vcpi_page_free:
     cmp eax, [fs:vcpi_pool_end]
     jae .bad
     shr eax, 12
-    bt [fs:vcpi_bmp], eax
+    bt [fs:arena_bmp], eax
     jnc .bad
-    btr [fs:vcpi_bmp], eax
-    inc word [fs:vcpi_free]
+    bt [fs:vcpi_owner_bmp], eax
+    jnc .bad
+    btr [fs:vcpi_owner_bmp], eax
+    btr [fs:arena_bmp], eax
+    inc word [fs:arena_free]
     clc
     ret
 .bad:
@@ -2249,7 +2365,7 @@ vcpi_pm_entry:
 .de03:                            ; free 4K page count -> EDX
     pushfd
     cli
-    movzx edx, word [fs:vcpi_free]
+    movzx edx, word [fs:arena_free]
     popfd
     xor ah, ah
     jmp .out
@@ -2596,7 +2712,10 @@ mon_stack_top:
 
 align 4096
 tables:
-    ; PD (1 page) + 4 PT (4 pages) = 0x5000, plus up to 0xFF0 of page-rounding slack
-    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned) -> 0x6000.
-    times 0x6000 db 0
+    ; PD (1 page) + 6 PT (6 pages) = 0x7000, plus up to 0xFF0 of page-rounding slack
+    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned) -> 0x8000.
+    times 0x8000 db 0
 resident_end:
+%if ($ - $$) >= 0x10000
+    %error "TOKAEMM resident image exceeds the 16-bit driver offset limit"
+%endif

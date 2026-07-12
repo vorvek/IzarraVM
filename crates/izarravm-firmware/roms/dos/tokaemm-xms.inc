@@ -32,6 +32,8 @@ xms_2f_handler:
 ; (AX=1 success / AX=0 + BL=error). Register-safe table dispatch (only BX is
 ; touched, then restored, so CX/DX/SI/DI/BP/DS inputs survive to the handler).
 xms_entry:
+    cmp ah, 0xF0
+    je xf_toka_pools
     cmp ah, 0x12
     ja .unimpl                   ; 13h+ : not implemented
     push bx
@@ -66,17 +68,31 @@ xms_fail:                        ; enter with BL = error code
 xf_version:
     mov ax, 0x0300
     mov bx, 0x0300
-    mov dx, 1
+    xor dx, dx
+    mov dl, [cs:hma_available]
+    retf
+
+; F0h private pool query used by Toka-DOS MEM. AL is ignored. The magic in AX
+; is the success indication; BX/CX are the disjoint XMS/EMS category sizes in KB.
+xf_toka_pools:
+    mov ax, 0x544B               ; 'TK'
+    mov bx, [cs:xms_category_kb]
+    mov cx, [cs:ems_category_kb]
     retf
 
 ; 01h request HMA / 02h release HMA (a flag; no /HMAMIN gate).
 xf_req_hma:
+    cmp byte [cs:hma_available], 0
+    je .absent
     cmp byte [cs:hma_owned], 0
     jne .inuse
     mov byte [cs:hma_owned], 1
     jmp xms_ok
 .inuse:
     mov bl, 0x91                 ; HMA already in use
+    jmp xms_fail
+.absent:
+    mov bl, 0x90                 ; HMA does not exist
     jmp xms_fail
 xf_rel_hma:
     cmp byte [cs:hma_owned], 0
@@ -128,98 +144,121 @@ a20_off:
     ret
 
 ; 08h query free extended memory: AX=largest free KB, DX=total free KB, BL=0.
-; Largest is approximated as total (a first-fit pool rarely fragments, and
-; over-reporting only turns a would-be-large alloc into an A0h failure).
-; 16-bit KB arithmetic throughout: the pool tops out at the 16 MB map, so
-; every KB count fits comfortably under 0x4000 (no 0xFFFF cap needed).
 xf_query_free:
-    push cx
-    push si
-    mov ax, [cs:xms_pool_end]     ; end KB = (dword >> 10) via the word pair
-    mov bx, [cs:xms_pool_end+2]
-    shr ax, 10
-    shl bx, 6
-    or ax, bx
-    mov dx, [cs:xms_pool_base]    ; base KB likewise
-    mov bx, [cs:xms_pool_base+2]
-    shr dx, 10
-    shl bx, 6
-    or dx, bx
-    sub ax, dx                   ; pool size KB
-    mov si, xms_table
-    mov cx, XMS_HANDLES
-.sum:
-    cmp byte [cs:si], 0
-    je .skip
-    sub ax, [cs:si+2]
-.skip:
-    add si, XMS_SLOT
-    loop .sum
-    mov dx, ax                   ; total free KB (AX = largest = total)
+    pushf
+    cli
+    call arena_longest_clear      ; AX = longest contiguous run in 4 KB pages
+    mov dx, [cs:arena_free]
+    shl ax, 2                     ; pages -> KB
+    shl dx, 2
     xor bl, bl
-    pop si
-    pop cx
+    popf
     retf
 
-; 09h allocate EMB: DX=KB in -> DX=handle. First-fit gap + first free slot.
+; 09h allocate EMB: DX=KB in -> DX=handle. The shared arena is reserved in
+; 4 KB pages, while the handle retains the exact requested size for bounds.
 xf_alloc:
     push cx
     push si
     push di
     push bp
+    pushf
+    cli
     mov [cs:xms_need_kb], dx
-    call find_gap                 ; -> AX = base KB, or CF (oom)
-    jc .oom
-    mov di, ax                    ; hold the base KB across the slot scan
+    mov ax, dx
+    mov cx, ax
+    shr cx, 2
+    and ax, 3
+    jz .pages_ready
+    inc cx                        ; ceil(requested KB / 4)
+.pages_ready:
+    mov [cs:xms_need_pages], cx
     mov si, xms_table
-    mov cx, XMS_HANDLES
+    mov di, XMS_HANDLES
     xor bp, bp                    ; handle counter (1-based)
 .slot:
     inc bp
     cmp byte [cs:si], 0
     je .got
     add si, XMS_SLOT
-    loop .slot
+    dec di
+    jnz .slot
     mov bl, 0xA1                  ; out of handles
     jmp .fail
 .got:
+    call arena_find_clear_run     ; CX pages -> AX = absolute start page
+    jc .oom
+    mov di, ax
+    call arena_mark_xms           ; marks shared bits and clears owner bits
     mov byte [cs:si], 1
     mov byte [cs:si+1], 0
-    mov ax, [cs:xms_need_kb]      ; size_kb (find_gap clobbered DX)
+    mov ax, [cs:xms_need_kb]
     mov [cs:si+2], ax
-    mov [cs:si+4], di             ; base_kb
+    mov ax, di
+    shl ax, 2
+    mov [cs:si+4], ax             ; base_kb = absolute page * 4
+    mov ax, [cs:xms_need_pages]
+    mov [cs:si+6], ax
+    sub [cs:arena_free], ax
     mov dx, bp                    ; handle out
+    mov ax, 1
+    xor bl, bl
+    popf
     pop bp
     pop di
     pop si
     pop cx
-    jmp xms_ok
+    retf
 .oom:
     mov bl, 0xA0
 .fail:
+    xor ax, ax
+    popf
     pop bp
     pop di
     pop si
     pop cx
-    jmp xms_fail
+    retf
 
 ; 0Ah free EMB: DX=handle.
 xf_free:
+    push cx
     push si
+    pushf
+    cli
     call slot_of                  ; -> SI = slot, or CF + BL=0xA2
     jc .bad
     cmp byte [cs:si+1], 0         ; locked?
     jne .locked
-    mov byte [cs:si], 0
+    mov ax, [cs:si+4]
+    shr ax, 2                     ; base_kb -> absolute page
+    mov cx, [cs:si+6]
+    call arena_owner_clear
+    jc .owned
+    call arena_clear_xms
+    add [cs:arena_free], cx
+    mov word [cs:si], 0
+    mov word [cs:si+2], 0
+    mov word [cs:si+4], 0
+    mov word [cs:si+6], 0
+    mov ax, 1
+    xor bl, bl
+    popf
     pop si
-    jmp xms_ok
+    pop cx
+    retf
 .locked:
     mov bl, 0xAB
-    pop si
-    jmp xms_fail
+    jmp .fail
+.owned:
+    mov bl, 0xA2                  ; conflicting ownership makes the handle invalid
 .bad:
+.fail:
+    xor ax, ax
+    popf
     pop si
-    jmp xms_fail
+    pop cx
+    retf
 
 ; 0Ch lock EMB: DX=handle -> DX:BX = 32-bit linear base, lock++.
 xf_lock:
@@ -292,63 +331,81 @@ xf_info:
     pop si
     jmp xms_fail
 
-; 0Fh resize EMB: BX=new KB, DX=handle. Free + re-place; restore on failure.
+; 0Fh resize EMB: BX=new KB, DX=handle. Release and re-place atomically.
 ; Re-places without copying the old contents to the new base — data is
-; preserved only when find_gap returns the same base (no fragmentation). This
+; preserved only when the allocator returns the same base (no fragmentation). This
 ; mirrors the retired FlatEmbAllocator::resize; a
 ; copy-on-relocate (via the INT 0xC0 memcpy) is a future-milestone fidelity item.
 xf_resize:
     push cx
     push si
     push di
+    pushf
+    cli
     call slot_of
     jc .bad
-    mov [cs:xms_slot_save], si    ; find_gap clobbers SI; keep the slot offset
     cmp byte [cs:si+1], 0         ; locked?
     jne .locked
     cmp bx, [cs:si+2]             ; same size?
     je .ok
-    push word [cs:si+2]           ; save old size_kb
-    push word [cs:si+4]           ; save old base_kb
-    mov byte [cs:si], 0           ; temporarily free the slot
+    mov ax, [cs:si+4]
+    shr ax, 2                     ; old absolute start page
+    mov cx, [cs:si+6]
+    call arena_owner_clear
+    jc .owned
+    call arena_clear_xms
+    add [cs:arena_free], cx
     mov [cs:xms_need_kb], bx
-    call find_gap
-    mov si, [cs:xms_slot_save]    ; restore the slot offset (find_gap clobbered SI)
+    mov ax, bx
+    mov cx, ax
+    shr cx, 2
+    and ax, 3
+    jz .pages_ready
+    inc cx
+.pages_ready:
+    mov [cs:xms_need_pages], cx
+    call arena_find_clear_run
     jc .restore
-    mov byte [cs:si], 1
-    mov byte [cs:si+1], 0
-    mov di, ax                    ; new base_kb
-    mov ax, [cs:xms_need_kb]      ; size_kb (find_gap clobbered BX)
+    mov di, ax                    ; new absolute start page
+    call arena_mark_xms
+    sub [cs:arena_free], cx
+    mov ax, [cs:xms_need_kb]
     mov [cs:si+2], ax
-    mov [cs:si+4], di
-    add sp, 4                     ; discard saved old (two words)
-.ok:
-    pop di
-    pop si
-    pop cx
-    jmp xms_ok
-.restore:
-    pop ax                        ; old base_kb
+    mov ax, di
+    shl ax, 2
     mov [cs:si+4], ax
-    pop ax                        ; old size_kb
-    mov [cs:si+2], ax
-    mov byte [cs:si], 1
-    mov bl, 0xA0
+    mov ax, [cs:xms_need_pages]
+    mov [cs:si+6], ax
+.ok:
+    mov ax, 1
+    xor bl, bl
+    popf
     pop di
     pop si
     pop cx
-    jmp xms_fail
+    retf
+.restore:
+    mov ax, [cs:si+4]
+    shr ax, 2
+    mov cx, [cs:si+6]
+    call arena_mark_xms
+    sub [cs:arena_free], cx
+    mov bl, 0xA0
+    jmp .fail
+.owned:
+    mov bl, 0xA2                  ; do not release a VCPI-owned page
+.fail:
+    xor ax, ax
+    popf
+    pop di
+    pop si
+    pop cx
+    retf
 .locked:
     mov bl, 0xAB
-    pop di
-    pop si
-    pop cx
-    jmp xms_fail
+    jmp .fail
 .bad:
-    pop di
-    pop si
-    pop cx
-    jmp xms_fail
+    jmp .fail
 
 ; 0Bh move EMB: DS:SI -> descriptor {len(dd) srcH(w) srcOff(dd) dstH(w) dstOff(dd)}.
 ; Resolve both endpoints to linear, then trap to the monitor for the flat copy.
@@ -445,48 +502,156 @@ slot_of:
     stc
     ret
 
-; First-fit gap for [cs:xms_need_kb] KB over [pool_base, pool_end). Restart-on-
-; overlap. All KB units in 16-bit registers (pool KB counts stay under 0x4000;
-; only a caller-supplied need can push cursor+need past 0xFFFF, caught by JC).
-; out: AX = base KB, CF clear; or CF set (out of memory).
-; Clobbers bx, cx, dx, si, di.
-find_gap:
-    mov ax, [cs:xms_pool_end]     ; pool end KB = (dword >> 10) via the word pair
-    mov dx, [cs:xms_pool_end+2]
-    shr ax, 10
-    shl dx, 6
-    or dx, ax                     ; DX = pool end KB
-    mov ax, [cs:xms_pool_base]
-    mov di, [cs:xms_pool_base+2]
-    shr ax, 10
-    shl di, 6
-    or di, ax                     ; DI = cursor KB
-.restart:
-    mov ax, di
-    add ax, [cs:xms_need_kb]      ; cursor + need
-    jc .oom                       ; 16-bit wrap: a huge request can't fit
-    cmp ax, dx
-    ja .oom
-    mov si, xms_table
-    mov cx, XMS_HANDLES
+; First clear run in the shared arena. in: CX = page count. out: AX = absolute
+; start page, CF clear; or CF set. Preserves BX/CX/DX/SI/DI.
+arena_find_clear_run:
+    push bx
+    push dx
+    push si
+    push di
+    mov bx, [cs:xms_pool_base]
+    mov ax, [cs:xms_pool_base+2]
+    shr bx, 12
+    shl ax, 4
+    or bx, ax                     ; BX = first absolute page
+    mov dx, [cs:xms_pool_end]
+    mov ax, [cs:xms_pool_end+2]
+    shr dx, 12
+    shl ax, 4
+    or dx, ax                     ; DX = one-past-last absolute page
+    jcxz .found_empty
+    xor si, si                    ; current clear-run length
 .scan:
-    cmp byte [cs:si], 0
-    je .next
-    mov bx, [cs:si+4]             ; b.base KB
-    add bx, [cs:si+2]             ; b.top KB
-    cmp bx, di                    ; b.top <= cursor? (block below)
-    jbe .next
-    cmp [cs:si+4], ax             ; b.base >= cursor+need? (block above)
-    jae .next
-    mov di, bx                    ; overlap: cursor = b.top, restart
-    jmp .restart
+    cmp bx, dx
+    jae .none
+    bt word [cs:arena_bmp], bx
+    jc .allocated
+    test si, si
+    jnz .extend
+    mov di, bx                    ; start of this clear run
+.extend:
+    inc si
+    cmp si, cx
+    jae .found
+    jmp .next
+.allocated:
+    xor si, si
 .next:
-    add si, XMS_SLOT
-    loop .scan
-    mov ax, di                    ; found: AX = base KB
+    inc bx
+    jmp .scan
+.found_empty:
+    mov di, bx
+.found:
+    mov ax, di
+    pop di
+    pop si
+    pop dx
+    pop bx
     clc
     ret
-.oom:
+.none:
+    pop di
+    pop si
+    pop dx
+    pop bx
+    stc
+    ret
+
+; Longest clear run in the shared arena. out: AX = page count. Preserves all
+; other registers used by the helper.
+arena_longest_clear:
+    push bx
+    push cx
+    push dx
+    push si
+    mov bx, [cs:xms_pool_base]
+    mov ax, [cs:xms_pool_base+2]
+    shr bx, 12
+    shl ax, 4
+    or bx, ax
+    mov dx, [cs:xms_pool_end]
+    mov ax, [cs:xms_pool_end+2]
+    shr dx, 12
+    shl ax, 4
+    or dx, ax
+    xor cx, cx                    ; current clear-run length
+    xor si, si                    ; longest clear-run length
+.scan:
+    cmp bx, dx
+    jae .done
+    bt word [cs:arena_bmp], bx
+    jc .allocated
+    inc cx
+    cmp cx, si
+    jbe .next
+    mov si, cx
+    jmp .next
+.allocated:
+    xor cx, cx
+.next:
+    inc bx
+    jmp .scan
+.done:
+    mov ax, si
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+; Mark an XMS-owned run. Shared allocation bits are set and VCPI ownership
+; bits are cleared. in: AX = absolute start page, CX = page count.
+arena_mark_xms:
+    push bx
+    push cx
+    mov bx, ax
+    jcxz .done
+.next:
+    bts word [cs:arena_bmp], bx
+    btr word [cs:vcpi_owner_bmp], bx
+    inc bx
+    loop .next
+.done:
+    pop cx
+    pop bx
+    ret
+
+; Clear an XMS-owned run from the shared allocation bitmap.
+; in: AX = absolute start page, CX = page count.
+arena_clear_xms:
+    push bx
+    push cx
+    mov bx, ax
+    jcxz .done
+.next:
+    btr word [cs:arena_bmp], bx
+    inc bx
+    loop .next
+.done:
+    pop cx
+    pop bx
+    ret
+
+; Verify that no page in a run is VCPI-owned. in: AX = absolute start page,
+; CX = page count. out: CF clear when all ownership bits are clear.
+arena_owner_clear:
+    push bx
+    push cx
+    mov bx, ax
+    jcxz .clear
+.next:
+    bt word [cs:vcpi_owner_bmp], bx
+    jc .owned
+    inc bx
+    loop .next
+.clear:
+    pop cx
+    pop bx
+    clc
+    ret
+.owned:
+    pop cx
+    pop bx
     stc
     ret
 

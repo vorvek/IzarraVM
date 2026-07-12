@@ -115,6 +115,193 @@ static void print_normal_entry(char *text, unsigned long total,
     convert("%9sK\n", free);
 }
 
+#define TOKA_USAGE_WIDTH 24
+#define TOKA_USED_BLOCK  0xB2
+#define TOKA_FREE_BLOCK  0xB0
+#define TOKA_USED_ATTR   0x0C
+#define TOKA_FREE_ATTR   0x0A
+
+static int stdout_is_console(void)
+{
+    union REGS regs;
+
+    regs.x.ax = 0x4400;
+    regs.x.bx = 1;
+    int86(0x21, &regs, &regs);
+
+    return !regs.x.cflag && (regs.x.dx & 0x0087) == 0x0083;
+}
+
+static void video_get_cursor(uchar *page, uchar *row, uchar *column)
+{
+    union REGS regs;
+
+    regs.h.ah = 0x0f;
+    int86(0x10, &regs, &regs);
+    *page = regs.h.bh;
+
+    regs.h.ah = 0x03;
+    regs.h.bh = *page;
+    int86(0x10, &regs, &regs);
+    *row = regs.h.dh;
+    *column = regs.h.dl;
+}
+
+static void video_get_cursor_on_page(uchar page, uchar *row, uchar *column)
+{
+    union REGS regs;
+
+    regs.h.ah = 0x03;
+    regs.h.bh = page;
+    int86(0x10, &regs, &regs);
+    *row = regs.h.dh;
+    *column = regs.h.dl;
+}
+
+static void video_set_cursor(uchar page, uchar row, uchar column)
+{
+    union REGS regs;
+
+    regs.h.ah = 0x02;
+    regs.h.bh = page;
+    regs.h.dh = row;
+    regs.h.dl = column;
+    int86(0x10, &regs, &regs);
+}
+
+static void video_write_run(uchar page, uchar row, uchar column,
+			    uchar character, uchar attribute, unsigned count)
+{
+    union REGS regs;
+
+    if (count == 0)
+	return;
+
+    video_set_cursor(page, row, column);
+    regs.h.ah = 0x09;
+    regs.h.al = character;
+    regs.h.bh = page;
+    regs.h.bl = attribute;
+    regs.x.cx = count;
+    int86(0x10, &regs, &regs);
+}
+
+static unsigned toka_usage_cells(unsigned long total, unsigned long used)
+{
+    unsigned cells;
+
+    if (total == 0)
+	return 0;
+    if (used == 0)
+	return 0;
+    if (used >= total)
+	return TOKA_USAGE_WIDTH;
+
+    cells = (unsigned)((used * TOKA_USAGE_WIDTH + total / 2) / total);
+    if (cells == 0)
+	return 1;
+    if (cells >= TOKA_USAGE_WIDTH)
+	return TOKA_USAGE_WIDTH - 1;
+    return cells;
+}
+
+static void print_toka_usage_bar(unsigned long total, unsigned long used,
+				 int color)
+{
+    char blocks[TOKA_USAGE_WIDTH + 1];
+    unsigned used_cells, i;
+    uchar page = 0, start_row = 0, start_column = 0;
+    uchar post_row = 0, post_column = 0;
+
+    if (total == 0) {
+	printf("%-24s\n", "Not available");
+	return;
+    }
+
+    used_cells = toka_usage_cells(total, used);
+    for (i = 0; i < TOKA_USAGE_WIDTH; i++)
+	blocks[i] = (char)(i < used_cells ? TOKA_USED_BLOCK : TOKA_FREE_BLOCK);
+    blocks[TOKA_USAGE_WIDTH] = '\0';
+
+    if (color)
+	video_get_cursor(&page, &start_row, &start_column);
+
+    printf("%s", blocks);
+
+    if (color) {
+	video_get_cursor_on_page(page, &post_row, &post_column);
+	video_write_run(page, start_row, start_column, TOKA_USED_BLOCK,
+			TOKA_USED_ATTR, used_cells);
+	video_write_run(page, start_row, (uchar)(start_column + used_cells),
+			TOKA_FREE_BLOCK, TOKA_FREE_ATTR,
+			TOKA_USAGE_WIDTH - used_cells);
+	video_set_cursor(page, post_row, post_column);
+    }
+    printf("\n");
+}
+
+static void print_toka_entry(char *text, unsigned long total,
+			     unsigned long free, int color)
+{
+    unsigned long used;
+    char label[15];
+
+    if (free > total)
+	free = total;
+    used = total - free;
+
+    strncpy(label, text, sizeof(label) - 1);
+    label[sizeof(label) - 1] = '\0';
+    printf("%-14s", label);
+    convert("%8sK ", total);
+    convert("%8sK ", used);
+    convert("%8sK  ", free);
+    print_toka_usage_bar(total, used, color);
+}
+
+static void print_toka_summary(unsigned memfree, unsigned umbfree,
+			       XMSINFO *xms, EMSINFO *ems)
+{
+    unsigned long conv_free, upper_free, ems_free, xms_free;
+    unsigned long total, free;
+    int color;
+
+    conv_free = memfree;
+    if (conv_free > 640)
+	conv_free = 640;
+    upper_free = umbfree;
+    if (upper_free > 384)
+	upper_free = 384;
+    ems_free = (unsigned long)ems->free * 16UL;
+    if (ems_free > toka_ems_category_k)
+	ems_free = toka_ems_category_k;
+    xms_free = round_kb(xms->free);
+    if (xms_free > toka_xms_category_k)
+	xms_free = toka_xms_category_k;
+
+    color = stdout_is_console();
+    printf("\n");
+    printf("Memory Type       Total      Used      Free  Usage\n");
+    printf("-------------- --------- --------- ---------  "
+	   "------------------------\n");
+    print_toka_entry(_(2,1,"Conventional"), 640, conv_free, color);
+    print_toka_entry(_(2,2,"Upper"), 384, upper_free, color);
+    print_toka_entry("Expanded (EMS)", toka_ems_category_k, ems_free,
+		     color);
+    print_toka_entry(_(2,4,"Extended (XMS)"), toka_xms_category_k,
+		     xms_free, color);
+    printf("-------------- --------- --------- ---------  "
+	   "------------------------\n");
+
+    total = 1024UL + toka_ems_category_k + toka_xms_category_k;
+    free = conv_free + upper_free + ems_free + xms_free;
+    print_normal_entry(_(2,5,"Total memory"), total, total - free, free);
+    printf("\n");
+    free = conv_free + upper_free;
+    print_normal_entry(_(2,6,"Total under 1 MB"), 1024,
+		       1024UL - free, free);
+}
+
 /*
  * There are a number of possibilities:
  *
@@ -248,6 +435,7 @@ static void normal_list(unsigned memfree, UPPERINFO *upper, int show_hma_free,
     unsigned memory, memused, largest_executable, reserved;
     unsigned umbfree = 0, umbtotal = 0;
     unsigned long xms_total_k, xms_free_k;
+    int toka_summary = FALSE;
     XMSINFO *xms;
     EMSINFO *ems;
 
@@ -273,30 +461,44 @@ static void normal_list(unsigned memfree, UPPERINFO *upper, int show_hma_free,
     memory=biosmemory();
     memfree=round_seg_kb(memfree);
     memused=memory - memfree;
-    printf("\n");
-    printf(_(2,0,"Memory Type         Total      Used       Free\n"));
-    printf(	 "----------------  --------   --------   --------\n");
-    print_normal_entry(_(2,1,"Conventional"), memory, memused, memfree);
     if (upper) {
 	umbfree=round_seg_kb(upper->free);
 	umbtotal=round_seg_kb(upper->total);
     }
-    print_normal_entry(_(2,2,"Upper"), umbtotal, umbtotal-umbfree, umbfree);
-    reserved = 1024 - memory - umbtotal;
-    print_normal_entry(_(2,3,"Reserved"), reserved, reserved, 0);
-    xms_total_k = round_kb(xms->total);
-    xms_free_k = round_kb(xms->free);
-    print_normal_entry(_(2,4,"Extended (XMS)"), xms_total_k,
-        xms_total_k - xms_free_k, xms_free_k);
-    printf(      "----------------  --------   --------   --------\n");
-    print_normal_entry(_(2,5,"Total memory"), 1024 + xms_total_k,
-		       1024 - memfree - umbfree + xms_total_k - xms_free_k,
-		       memfree + umbfree + xms_free_k);
-    printf("\n");
-    print_normal_entry(_(2,6,"Total under 1 MB"), 1024 - reserved,
-	   memused + umbtotal - umbfree, memfree + umbfree);
-    printf("\n");
-    if (ems != NULL) {
+
+    if ((memory == 639 || memory == 640) && ems != NULL
+	&& xms_available() == XMS_AVAILABLE_RESULT) {
+	xms_drv = get_xms_drv();
+	if (toka_xms_categories() == TOKA_CATEGORY_MAGIC
+	    && (ulong)toka_ems_category_k == (ulong)ems->size * 16UL)
+	    toka_summary = TRUE;
+    }
+
+    if (toka_summary) {
+	print_toka_summary(memfree, umbfree, xms, ems);
+    } else {
+	printf("\n");
+	printf(_(2,0,"Memory Type         Total      Used       Free\n"));
+	printf(      "----------------  --------   --------   --------\n");
+	print_normal_entry(_(2,1,"Conventional"), memory, memused, memfree);
+	print_normal_entry(_(2,2,"Upper"), umbtotal, umbtotal-umbfree,
+			   umbfree);
+	reserved = 1024 - memory - umbtotal;
+	print_normal_entry(_(2,3,"Reserved"), reserved, reserved, 0);
+	xms_total_k = round_kb(xms->total);
+	xms_free_k = round_kb(xms->free);
+	print_normal_entry(_(2,4,"Extended (XMS)"), xms_total_k,
+			   xms_total_k - xms_free_k, xms_free_k);
+	printf(      "----------------  --------   --------   --------\n");
+	print_normal_entry(_(2,5,"Total memory"), 1024 + xms_total_k,
+			   1024 - memfree - umbfree + xms_total_k
+			   - xms_free_k, memfree + umbfree + xms_free_k);
+	printf("\n");
+	print_normal_entry(_(2,6,"Total under 1 MB"), 1024 - reserved,
+			   memused + umbtotal - umbfree, memfree + umbfree);
+	printf("\n");
+    }
+    if (!toka_summary && ems != NULL) {
 	printf("%-36s",_(2,7,"Total Expanded (EMS)"));
 	print_normalized_ems_size(ems->size);
 	printf("%-36s",_(2,8,"Free Expanded (EMS)"));
