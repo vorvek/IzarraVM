@@ -1951,7 +1951,7 @@ fn mode_x_direct_page_writes_one_plane_and_keeps_reads_on_the_handler() {
 }
 
 #[test]
-fn mode_x_plane_switch_invalidates_only_vga_data_mappings() {
+fn mode_x_plane_switch_invalidates_data_mappings_without_flushing_code() {
     let mut machine = test_machine();
     assert!(machine.set_vga_mode(0x13));
     {

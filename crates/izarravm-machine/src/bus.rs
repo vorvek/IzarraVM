@@ -62,6 +62,7 @@ impl Machine {
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
             direct_data_map_changed: &mut self.direct_data_map_changed,
+            direct_mapping_epoch: &mut self.direct_mapping_epoch,
             core_clocks_so_far: 0,
             prior_runs_core_clocks: 0,
             timeline_at_batch_start: self.timeline,
@@ -133,6 +134,27 @@ impl Machine {
 }
 
 impl MachineBus<'_> {
+    fn advance_direct_mapping_epoch(&mut self) {
+        advance_direct_mapping_epoch(self.direct_mapping_epoch);
+    }
+
+    fn mark_direct_map_changed(&mut self) {
+        self.advance_direct_mapping_epoch();
+        *self.direct_map_changed = true;
+    }
+
+    fn mark_direct_data_map_changed(&mut self) {
+        self.advance_direct_mapping_epoch();
+        *self.direct_data_map_changed = true;
+    }
+
+    fn set_a20_gate(&mut self, enabled: bool) {
+        if self.keyboard.a20_enabled() != enabled {
+            self.keyboard.set_a20(enabled);
+            self.advance_direct_mapping_epoch();
+        }
+    }
+
     pub(crate) fn write_io(
         &mut self,
         port: u16,
@@ -357,6 +379,7 @@ impl CpuBus for MachineBus<'_> {
                 ptr,
                 len: RAM_LOOKUP_PAGE_SIZE,
                 writable: kind == BusAccessKind::DataWrite,
+                mapping_epoch: *self.direct_mapping_epoch,
             }));
         }
         let Some((start, end)) = self.direct_ram_bytes(physical_page, RAM_LOOKUP_PAGE_SIZE) else {
@@ -370,7 +393,54 @@ impl CpuBus for MachineBus<'_> {
             ptr: unsafe { self.memory.as_mut_ptr().add(start) },
             len: RAM_LOOKUP_PAGE_SIZE,
             writable: matches!(kind, BusAccessKind::DataWrite),
+            mapping_epoch: *self.direct_mapping_epoch,
         }))
+    }
+
+    fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
+        if !self.flat_data_cost {
+            return None;
+        }
+        let raw = self
+            .trace
+            .elapsed_clocks()
+            .checked_sub(self.trace_elapsed_at_batch_start)?;
+        CompiledBusWindow::certify(
+            *self.direct_mapping_epoch,
+            self.trace.tracing_mode(),
+            self.jit_fetch_cost_clocks(),
+            [
+                self.jit_data_cost_clocks(BusWidth::Byte),
+                self.jit_data_cost_clocks(BusWidth::Word),
+                self.jit_data_cost_clocks(BusWidth::Dword),
+            ],
+            [
+                self.jit_mode13_data_cost_clocks(BusWidth::Byte),
+                self.jit_mode13_data_cost_clocks(BusWidth::Word),
+                self.jit_mode13_data_cost_clocks(BusWidth::Dword),
+            ],
+            raw,
+            self.bus_rem_at_batch_start,
+            self.bus_num_at_batch_start,
+            self.bus_den_at_batch_start,
+        )
+    }
+
+    fn finish_compiled_window(&mut self, window: CompiledBusWindow, delta: CompiledBusDelta) {
+        debug_assert_eq!(window.mapping_epoch(), *self.direct_mapping_epoch);
+        debug_assert_eq!(
+            window.batch_raw_clocks(),
+            self.trace
+                .elapsed_clocks()
+                .saturating_sub(self.trace_elapsed_at_batch_start)
+        );
+        let writes = delta.vga_writes();
+        debug_assert_eq!(writes.is_empty(), writes.dirty_pages == 0);
+        if !writes.is_empty() {
+            self.vega.note_direct_write_pages(writes.dirty_pages);
+        }
+        self.trace
+            .add_elapsed_clocks(window.delta_raw_clocks(&delta));
     }
 
     #[inline]
@@ -1250,7 +1320,7 @@ impl CpuBus for MachineBus<'_> {
         if self.pci.write_io(port, width, value, self.vega) {
             if self.vega.memory_decode_key() != pci_decode {
                 self.ram_lookup.rebuild(self.memory.len(), self.vega);
-                *self.direct_map_changed = true;
+                self.mark_direct_map_changed();
                 debug_assert!(*self.io_touched);
             }
             if let Some(disk) = self.ata.as_mut() {
@@ -1381,7 +1451,7 @@ impl CpuBus for MachineBus<'_> {
         if port == 0x0092 {
             // Fast A20 gate: bit 1 drives A20, routed through the 8042 so every A20
             // method agrees. Bit 0 (fast CPU reset) is not modeled.
-            self.keyboard.set_a20(value & 0x02 != 0);
+            self.set_a20_gate(value & 0x02 != 0);
             return Ok(());
         }
         if (0x0200..=0x0207).contains(&port) {
@@ -1440,23 +1510,29 @@ impl CpuBus for MachineBus<'_> {
         let direct_write_before = self.vega.direct_write_token();
         if self.vega.port_enabled(port) && self.vega.write_port(port, value as u8) {
             if self.vega.direct_write_token() != direct_write_before {
-                *self.direct_data_map_changed = true;
+                self.mark_direct_data_map_changed();
                 *self.io_touched = true;
                 debug_assert!(*self.io_touched);
             }
             return Ok(());
         }
-        if self.pit.write_port(port, value as u8)
-            || self.pic.write_port(port, value as u8)
-            || self.keyboard.write_port(port, value as u8)
-            || self
-                .device_ports
-                .write_port(dma_page_register_port(port), value as u8)
-        {
-            Ok(())
-        } else {
-            Err(BusError::UnsupportedPort { port })
+        if self.pit.write_port(port, value as u8) || self.pic.write_port(port, value as u8) {
+            return Ok(());
         }
+        let a20_before = self.keyboard.a20_enabled();
+        if self.keyboard.write_port(port, value as u8) {
+            if self.keyboard.a20_enabled() != a20_before {
+                self.advance_direct_mapping_epoch();
+            }
+            return Ok(());
+        }
+        if self
+            .device_ports
+            .write_port(dma_page_register_port(port), value as u8)
+        {
+            return Ok(());
+        }
+        Err(BusError::UnsupportedPort { port })
     }
 
     fn interrupt_pending(&self) -> bool {

@@ -66,9 +66,11 @@ impl CpuGsw {
             return false;
         };
         let mapped = if write {
-            self.jit_fast_map.has_write_mapping(linear, physical)
+            self.jit_fast_map
+                .has_write_mapping_at_epoch(linear, physical, page.mapping_epoch)
         } else {
-            self.jit_fast_map.has_read_mapping(linear, physical)
+            self.jit_fast_map
+                .has_read_mapping_at_epoch(linear, physical, page.mapping_epoch)
         };
         if mapped {
             return true;
@@ -110,6 +112,7 @@ impl CpuGsw {
         linear: u32,
         physical: u32,
         entry: DirectPageCacheEntry,
+        mapping_epoch: u64,
         write: bool,
     ) {
         if !self.fast_map_population_enabled() {
@@ -123,6 +126,7 @@ impl CpuGsw {
                 ptr: entry.ptr,
                 len: 0x1000,
                 writable: write,
+                mapping_epoch,
             },
             write,
         ) {
@@ -218,7 +222,13 @@ impl CpuGsw {
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            self.populate_fast_map_from_cached(_linear, physical, entry, false);
+            self.populate_fast_map_from_cached(
+                _linear,
+                physical,
+                entry,
+                self.data_read_pages.mapping_epoch(),
+                false,
+            );
             bus.charge_direct_memory(physical, width, kind)?;
             self.record_data_read(kind, true);
             self.perf.direct_data_pointer_reads += 1;
@@ -293,7 +303,13 @@ impl CpuGsw {
                 any(target_os = "windows", target_os = "linux")
             ))]
             if let Some(linear) = _linear {
-                self.populate_fast_map_from_cached(linear, physical, entry, false);
+                self.populate_fast_map_from_cached(
+                    linear,
+                    physical,
+                    entry,
+                    self.data_read_pages.mapping_epoch(),
+                    false,
+                );
             }
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             self.record_data_read(kind, true);
@@ -347,7 +363,13 @@ impl CpuGsw {
                 target_arch = "x86_64",
                 any(target_os = "windows", target_os = "linux")
             ))]
-            self.populate_fast_map_from_cached(_linear, physical, entry, true);
+            self.populate_fast_map_from_cached(
+                _linear,
+                physical,
+                entry,
+                self.data_write_pages.mapping_epoch(),
+                true,
+            );
             bus.charge_direct_memory(physical, width, kind)?;
             Self::write_direct_entry(entry, physical, width, value);
             self.record_data_write(kind, true);
@@ -431,7 +453,13 @@ impl CpuGsw {
                 any(target_os = "windows", target_os = "linux")
             ))]
             if let Some(linear) = _linear {
-                self.populate_fast_map_from_cached(linear, physical, entry, true);
+                self.populate_fast_map_from_cached(
+                    linear,
+                    physical,
+                    entry,
+                    self.data_write_pages.mapping_epoch(),
+                    true,
+                );
             }
             bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
             let offset = (physical & 0x0fff) as usize;
@@ -949,6 +977,23 @@ impl CpuGsw {
         self.translate_linear_checked(bus, linear, write, PagingAccessor::Supervisor)
     }
 
+    fn write_page_walk_entry<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        physical: u32,
+        value: u32,
+    ) -> ExecResult<()> {
+        bus.write_memory(
+            physical,
+            BusWidth::Dword,
+            value,
+            BusAccessKind::PageWalkWrite,
+        )?;
+        self.record_write_page(physical);
+        self.note_code_write(physical, BusWidth::Dword.bytes());
+        Ok(())
+    }
+
     fn translate_linear_checked<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1025,12 +1070,7 @@ impl CpuGsw {
         }
         if pde & 0x20 == 0 {
             pde |= 0x20;
-            bus.write_memory(
-                directory_address,
-                BusWidth::Dword,
-                pde,
-                BusAccessKind::PageWalkWrite,
-            )?;
+            self.write_page_walk_entry(bus, directory_address, pde)?;
         }
 
         let table_address = (pde & 0xffff_f000) + (((linear >> 12) & 0x03ff) * 4);
@@ -1073,12 +1113,7 @@ impl CpuGsw {
         let accessed_dirty = 0x20 | dirty;
         if pte & accessed_dirty != accessed_dirty {
             pte |= accessed_dirty;
-            bus.write_memory(
-                table_address,
-                BusWidth::Dword,
-                pte,
-                BusAccessKind::PageWalkWrite,
-            )?;
+            self.write_page_walk_entry(bus, table_address, pte)?;
         }
 
         // Cache the completed translation. Only reached on the success path, so a

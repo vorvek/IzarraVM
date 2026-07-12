@@ -552,6 +552,27 @@ fn translation_epoch_preserves_code_and_relinks_only_revalidated_blocks() {
     assert_eq!(cache.arena.as_ref().expect("arena").used_slots(), slots);
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn decode_page_hiding_requires_revalidation_even_when_the_token_matches() {
+    let mut cache = BlockCache::default();
+    let block = key(0x4100);
+    let id = install_trivial(&mut cache, block, 1);
+    assert!(cache.is_link_visible(id));
+
+    cache.hide_decode_page(block.linear >> BLOCK_PAGE_SHIFT);
+    assert!(!cache.is_link_visible(id));
+    assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
+
+    cache
+        .refresh_decode_residency(block, 0)
+        .expect("decode revalidation");
+    assert!(cache.is_link_visible(id));
+}
+
 #[test]
 fn full_arena_compacts_only_when_it_can_reclaim_a_slot() {
     assert!(!BlockCache::arena_compaction_can_reclaim(0, 8));

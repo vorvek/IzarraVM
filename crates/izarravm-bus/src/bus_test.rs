@@ -220,6 +220,84 @@ fn add_elapsed_clocks_bumps_only_the_clock_total() {
 }
 
 #[test]
+fn compiled_window_rejects_observable_tracing_and_projects_exact_batch_scaling() {
+    assert!(
+        CompiledBusWindow::certify(
+            7,
+            TracingMode::Counts,
+            3,
+            [4, 5, 7],
+            [10, 11, 14],
+            17,
+            2,
+            7,
+            30,
+        )
+        .is_none()
+    );
+    assert!(
+        CompiledBusWindow::certify(7, TracingMode::Off, 3, [4, 5, 7], [10, 11, 14], 17, 2, 7, 0)
+            .is_none()
+    );
+
+    let window = CompiledBusWindow::certify(
+        7,
+        TracingMode::Off,
+        3,
+        [4, 5, 7],
+        [10, 11, 14],
+        17,
+        2,
+        7,
+        30,
+    )
+    .unwrap();
+    let mut delta = CompiledBusDelta::default();
+    delta.add_instruction_fetches(4);
+    delta.add_ram_accesses(BusWidth::Byte, 2);
+    delta.add_ram_accesses(BusWidth::Word, 1);
+    delta.add_vga_reads(BusWidth::Word, 3);
+    delta.add_vga_writes(NativeVgaWrites {
+        dirty_pages: 0b0101,
+        byte_writes: 2,
+        word_writes: 0,
+        dword_writes: 1,
+    });
+
+    assert_eq!(window.mapping_epoch(), 7);
+    assert_eq!(window.tracing_mode(), TracingMode::Off);
+    assert_eq!(window.delta_raw_clocks(&delta), 92);
+    assert_eq!(window.projected_scaled_bus_clocks(92), Some(25));
+}
+
+#[test]
+fn compiled_delta_merges_vga_dirty_pages_and_width_counts() {
+    let mut delta = CompiledBusDelta::default();
+    delta.add_vga_writes(NativeVgaWrites {
+        dirty_pages: 0b0001,
+        byte_writes: 2,
+        word_writes: 3,
+        dword_writes: 4,
+    });
+    delta.add_vga_writes(NativeVgaWrites {
+        dirty_pages: 0b1000,
+        byte_writes: 5,
+        word_writes: 6,
+        dword_writes: 7,
+    });
+
+    assert_eq!(
+        delta.vga_writes(),
+        NativeVgaWrites {
+            dirty_pages: 0b1001,
+            byte_writes: 7,
+            word_writes: 9,
+            dword_writes: 11,
+        }
+    );
+}
+
+#[test]
 fn io_bus_tracks_claimed_ports() {
     let mut bus = IoBus::default();
     bus.claim(PortRange::new(0x220, 0x22f));

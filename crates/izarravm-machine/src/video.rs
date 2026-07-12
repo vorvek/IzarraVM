@@ -29,13 +29,13 @@ impl Machine {
 
     #[cfg(test)]
     pub(crate) fn video_mut(&mut self) -> &mut Vga {
-        self.direct_map_changed = true;
+        self.mark_direct_map_changed();
         self.vega.legacy_mut()
     }
 
     pub fn set_vga_mode_0dh(&mut self) {
         self.vega.legacy_mut().set_mode_0dh();
-        self.direct_map_changed = true;
+        self.mark_direct_map_changed();
     }
 
     /// Select a VGA graphics mode by its INT 10h number from the host side. Returns
@@ -49,7 +49,7 @@ impl Machine {
         let ok = self.vega.legacy_mut().set_mode_with_clear(mode, clear);
         if ok {
             self.vega.select_legacy();
-            self.direct_map_changed = true;
+            self.mark_direct_map_changed();
         }
         ok
     }
@@ -114,7 +114,7 @@ impl Machine {
         let direct_write_before = self.vega.direct_write_token();
         self.handle_int10_inner();
         if self.vega.direct_write_token() != direct_write_before {
-            self.direct_data_map_changed = true;
+            self.mark_direct_data_map_changed();
         }
     }
 

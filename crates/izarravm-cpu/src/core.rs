@@ -196,21 +196,18 @@ impl CpuGsw {
     }
 
     /// Drop cached data pointers after a device aperture changes without
-    /// discarding decoded or compiled guest code. Native blocks load the shared
-    /// FastMap on every memory access, so clearing that map is sufficient.
+    /// discarding decoded or compiled guest code. The bus mapping epoch is
+    /// global, so RAM entries from the previous epoch must leave with the VGA
+    /// entries even though their host pointers did not change.
     pub fn note_direct_data_map_changed(&mut self) {
-        const VGA_START: u32 = 0x000a_0000;
-        const VGA_END: u32 = 0x000c_0000;
-        self.data_read_pages
-            .invalidate_physical_range(VGA_START, VGA_END);
-        self.data_write_pages
-            .invalidate_physical_range(VGA_START, VGA_END);
+        self.data_read_pages.invalidate();
+        self.data_write_pages.invalidate();
         #[cfg(all(
             feature = "jit",
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_fast_map.invalidate_vga_pages();
+        self.jit_fast_map.invalidate_all();
         self.perf.direct_map_invalidations += 1;
     }
 
@@ -302,6 +299,8 @@ impl CpuGsw {
                     self.perf.decode_inval_smc += 1;
                     self.perf.code_invalidations += 1;
                     self.decode_cache.invalidate_and_clear_code_marks();
+                    #[cfg(feature = "jit")]
+                    self.jit_direct.invalidate_translation();
                 }
             }
             // The fetch-page snapshot may hold the written bytes under either outcome.

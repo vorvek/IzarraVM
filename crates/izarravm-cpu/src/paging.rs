@@ -162,12 +162,14 @@ impl Default for DirectPageCacheEntry {
 
 pub(crate) struct DirectPageCache {
     pub(crate) entries: [DirectPageCacheEntry; DIRECT_PAGE_CACHE_LINES],
+    mapping_epoch: u64,
 }
 
 impl Default for DirectPageCache {
     fn default() -> Self {
         Self {
             entries: [DirectPageCacheEntry::default(); DIRECT_PAGE_CACHE_LINES],
+            mapping_epoch: 0,
         }
     }
 }
@@ -187,11 +189,20 @@ impl DirectPageCache {
 
     #[inline]
     pub(crate) fn insert(&mut self, page: DirectPage) {
+        if self.mapping_epoch != page.mapping_epoch {
+            self.entries.fill(DirectPageCacheEntry::default());
+            self.mapping_epoch = page.mapping_epoch;
+        }
         self.entries[Self::slot(page.physical_page)] = DirectPageCacheEntry {
             physical_page: page.physical_page,
             fast_map_linear_page: u32::MAX,
             ptr: page.ptr,
         };
+    }
+
+    #[inline]
+    pub(crate) fn mapping_epoch(&self) -> u64 {
+        self.mapping_epoch
     }
 
     #[cfg(all(
@@ -211,9 +222,11 @@ impl DirectPageCache {
     #[inline]
     pub(crate) fn invalidate(&mut self) {
         self.entries.fill(DirectPageCacheEntry::default());
+        self.mapping_epoch = 0;
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn invalidate_physical_range(&mut self, start: u32, end: u32) {
         for entry in &mut self.entries {
             if (start..end).contains(&entry.physical_page) {

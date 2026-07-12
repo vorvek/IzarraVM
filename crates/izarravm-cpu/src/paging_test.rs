@@ -4,6 +4,11 @@
 use super::*;
 
 #[test]
+fn direct_page_cache_entries_remain_compact() {
+    assert_eq!(core::mem::size_of::<DirectPageCacheEntry>(), 16);
+}
+
+#[test]
 fn direct_mapped_tlb_replaces_only_the_colliding_slot() {
     let mut tlb = Tlb::default();
     let first = 3;
@@ -73,12 +78,14 @@ fn direct_page_cache_range_invalidation_preserves_other_pages() {
         ptr: low.as_mut_ptr(),
         len: 0x1000,
         writable: true,
+        mapping_epoch: 1,
     });
     cache.insert(DirectPage {
         physical_page: 0xA_0000,
         ptr: vga.as_mut_ptr(),
         len: 0x1000,
         writable: true,
+        mapping_epoch: 1,
     });
 
     cache.invalidate_physical_range(0xA_0000, 0xC_0000);
@@ -90,30 +97,44 @@ fn direct_page_cache_range_invalidation_preserves_other_pages() {
 #[test]
 fn physical_page_cache_tags_collisions_and_invalidates_all_entries() {
     let mut first_bytes = Box::new([0u8; 4096]);
+    let mut other_bytes = Box::new([0u8; 4096]);
     let mut collision_bytes = Box::new([0u8; 4096]);
     let first = DirectPage {
         physical_page: 0x1000,
         ptr: first_bytes.as_mut_ptr(),
         len: first_bytes.len(),
         writable: true,
+        mapping_epoch: 1,
     };
     let collision = DirectPage {
         physical_page: first.physical_page + (DIRECT_PAGE_CACHE_LINES as u32 * 0x1000),
         ptr: collision_bytes.as_mut_ptr(),
         len: collision_bytes.len(),
         writable: true,
+        mapping_epoch: 2,
+    };
+    let other = DirectPage {
+        physical_page: 0x2000,
+        ptr: other_bytes.as_mut_ptr(),
+        len: other_bytes.len(),
+        writable: true,
+        mapping_epoch: 1,
     };
     let mut pages = DirectPageCache::default();
 
     pages.insert(first);
-    assert_eq!(pages.get(first.physical_page).unwrap().ptr, first.ptr);
+    pages.insert(other);
+    let cached_first = pages.get(first.physical_page).unwrap();
+    assert_eq!(cached_first.ptr, first.ptr);
+    assert_eq!(pages.mapping_epoch(), 1);
+    assert!(pages.get(other.physical_page).is_some());
 
     pages.insert(collision);
     assert!(pages.get(first.physical_page).is_none());
-    assert_eq!(
-        pages.get(collision.physical_page).unwrap().ptr,
-        collision.ptr
-    );
+    assert!(pages.get(other.physical_page).is_none());
+    let cached_collision = pages.get(collision.physical_page).unwrap();
+    assert_eq!(cached_collision.ptr, collision.ptr);
+    assert_eq!(pages.mapping_epoch(), 2);
 
     pages.insert(first);
     assert!(pages.get(collision.physical_page).is_none());

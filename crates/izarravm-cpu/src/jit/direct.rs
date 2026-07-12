@@ -490,6 +490,7 @@ pub(crate) struct BlockCache {
     inbound: HashMap<BlockId, Vec<LinkSource>>,
     waiting: HashMap<LinkTarget, Vec<LinkSource>>,
     linear_blocks: HashMap<LinkTarget, BlockId>,
+    linear_pages: HashMap<u32, Vec<BlockId>, U32BuildHasher>,
     block_link_epochs: Vec<u64>,
     link_epoch: u64,
     block_active: Vec<bool>,
@@ -534,6 +535,7 @@ impl BlockCache {
             inbound: HashMap::new(),
             waiting: HashMap::new(),
             linear_blocks: HashMap::new(),
+            linear_pages: HashMap::default(),
             block_link_epochs: Vec::new(),
             link_epoch: 1,
             block_active: Vec::new(),
@@ -734,6 +736,10 @@ impl BlockCache {
                 .insert(cell.address(), LinkSource { block: id, slot: 0 });
         }
         self.live_blocks += 1;
+        self.linear_pages
+            .entry(span.key.linear >> BLOCK_PAGE_SHIFT)
+            .or_default()
+            .push(id);
         self.entries.insert(span.key, BlockState::Compiled(id));
         self.hot[span.key.hot_index()] = Some(HotEntry {
             key: span.key,
@@ -816,6 +822,34 @@ impl BlockCache {
             self.block_link_epochs.fill(0);
             self.link_epoch = 1;
         }
+    }
+
+    /// Hide every compiled entry on a linear page whose live decode line was displaced. Code
+    /// bytes remain installed, but no root or linked predecessor may enter them until the root
+    /// residency scan republishes the block.
+    pub(crate) fn hide_decode_page(&mut self, linear_page: u32) {
+        let mut offset = 0;
+        while let Some(id) = self
+            .linear_pages
+            .get(&linear_page)
+            .and_then(|blocks| blocks.get(offset))
+            .copied()
+        {
+            offset += 1;
+            let Some(index) = self.active_index(id) else {
+                continue;
+            };
+            if self.block_link_epochs.get(index).copied() != Some(self.link_epoch) {
+                continue;
+            }
+            self.unlink_block(id);
+            self.block_link_epochs[index] = 0;
+        }
+    }
+
+    pub(crate) fn is_link_visible(&self, id: BlockId) -> bool {
+        self.active_index(id)
+            .is_some_and(|index| self.block_link_epochs[index] == self.link_epoch)
     }
 
     /// Remove direct-cache entries whose translated physical bytes overlap a guest write. Block
@@ -1174,6 +1208,7 @@ impl BlockCache {
         self.inbound.clear();
         self.waiting.clear();
         self.linear_blocks.clear();
+        self.linear_pages.clear();
         self.block_link_epochs.clear();
         self.code_watch.clear();
         self.block_active.clear();
@@ -1341,6 +1376,16 @@ impl BlockCache {
                 .remove(&self.link_cells[index][0].address());
         }
         self.unlink_block(id);
+        let linear_page = span.key.linear >> BLOCK_PAGE_SHIFT;
+        let remove_page = if let Some(blocks) = self.linear_pages.get_mut(&linear_page) {
+            blocks.retain(|candidate| *candidate != id);
+            blocks.is_empty()
+        } else {
+            false
+        };
+        if remove_page {
+            self.linear_pages.remove(&linear_page);
+        }
         self.block_active[index] = false;
         self.blocks[index].entry = 0;
         self.blocks[index].body_entry = 0;

@@ -403,6 +403,163 @@ fn direct_block_replays_cold_fetch_after_internal_decode_line_collision() {
     assert!(native.perf_counters().jit_direct_entries > replay_entries);
 }
 
+#[test]
+fn linked_target_eviction_returns_before_target_and_replays_cold_fetch() {
+    const ENTRY: u32 = 0x100;
+    const SOURCE: u32 = 0x101;
+    const TARGET: u32 = 0x1200;
+    const HLT: u32 = 0x120a;
+    const COLLISION: u32 = 0x2200;
+
+    let mut memory = vec![0; COLLISION as usize + 1];
+    memory[ENTRY as usize] = 0x90;
+    memory[SOURCE as usize..SOURCE as usize + 13].copy_from_slice(&[
+        0xb8, 1, 0, 0, 0, // mov eax,1
+        0x83, 0xc0, 2, // add eax,2
+        0xe9, 0xf2, 0x10, 0, 0, // jmp TARGET
+    ]);
+    memory[TARGET as usize..TARGET as usize + 10].copy_from_slice(&[
+        0xbb, 3, 0, 0, 0, // mov ebx,3
+        0x83, 0xc3, 4, // add ebx,4
+        0xeb, 0, // jmp HLT
+    ]);
+    memory[HLT as usize] = 0xf4;
+    memory[COLLISION as usize] = 0x90;
+
+    let mut native = fresh();
+    let mut interp = fresh();
+    native.decode_cache = DecodeCache::new(0x1000);
+    interp.decode_cache = DecodeCache::new(0x1000);
+    let mut native_bus = TestBus::with_memory(memory.clone());
+    let mut interp_bus = TestBus::with_memory(memory);
+    native_bus.direct_pages_enabled = true;
+    interp_bus.direct_pages_enabled = true;
+    native_bus.direct_page_clocks = true;
+    interp_bus.direct_page_clocks = true;
+
+    native.set_jit_auto_admit(true);
+    native.jit_direct.set_admission_heat_for_test(1);
+    let decode_at = |cpu: &mut CpuGsw, bus: &mut TestBus, linear: u32| {
+        cpu.registers.eip = linear;
+        cpu.fetch_decoded(bus, linear).expect("fixture decode");
+    };
+    for linear in [
+        ENTRY,
+        SOURCE,
+        SOURCE + 5,
+        SOURCE + 8,
+        TARGET,
+        TARGET + 5,
+        TARGET + 8,
+        HLT,
+    ] {
+        decode_at(&mut native, &mut native_bus, linear);
+        decode_at(&mut interp, &mut interp_bus, linear);
+    }
+
+    let install = |cpu: &mut CpuGsw, linear: u32| {
+        let key = jit::direct::key_for(cpu, linear, true).expect("fixture block key");
+        assert!(matches!(
+            cpu.jit_direct.probe(key),
+            jit::direct::BlockProbe::Interpret
+        ));
+        let compilation = jit::direct::compile(cpu, linear, true).expect("fixture block");
+        cpu.jit_direct
+            .install(&compilation)
+            .expect("fixture install")
+    };
+    let source_id = install(&mut native, SOURCE);
+    install(&mut native, TARGET);
+    let source = native
+        .jit_direct
+        .block(source_id)
+        .expect("source remains live");
+    assert!(native.jit_direct.has_linked_successor(source));
+
+    decode_at(&mut native, &mut native_bus, COLLISION);
+    decode_at(&mut interp, &mut interp_bus, COLLISION);
+    assert!(native.decode_cache.line_live(SOURCE, true));
+    assert!(!native.decode_cache.line_live(TARGET, true));
+    assert!(native.decode_cache.line_live(TARGET + 5, true));
+    assert!(native.decode_cache.line_live(TARGET + 8, true));
+    assert!(native.decode_cache.line_live(COLLISION, true));
+    assert!(
+        !native.jit_direct.has_linked_successor(source),
+        "evicting the target page must clear the source's inbound edge"
+    );
+
+    for cpu in [&mut native, &mut interp] {
+        cpu.halted = false;
+        cpu.registers.eip = ENTRY;
+        cpu.registers.gpr.fill(0);
+        cpu.registers.eflags = 0x2;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.elapsed_clocks = 0;
+        cpu.timing_rem = 0;
+        cpu.fp_rem = 0;
+        cpu.core_clocks_so_far = 0;
+    }
+    native_bus.trace = BusTrace::default();
+    interp_bus.trace = BusTrace::default();
+    let before = native.perf_counters().clone();
+
+    let native_outcomes = drive(&mut native, &mut native_bus);
+    let interp_outcomes = drive(&mut interp, &mut interp_bus);
+    assert_eq!(native_outcomes, interp_outcomes);
+    assert_eq!(
+        native_outcomes
+            .iter()
+            .map(|(_, eip, halted)| (*eip, *halted))
+            .collect::<Vec<_>>(),
+        vec![(TARGET, false), (HLT, false), (HLT + 1, true)]
+    );
+    assert_eq!(native, interp);
+    assert_eq!(native.registers.eax(), 3);
+    assert_eq!(native.registers.ebx(), 7);
+    assert_eq!(native_bus.trace.cycles(), interp_bus.trace.cycles());
+    assert_eq!(native_bus.trace.cycles().len(), 26);
+    assert_eq!(native_bus.trace.elapsed_clocks(), 52);
+    assert_eq!(
+        native_bus
+            .trace
+            .cycles()
+            .iter()
+            .skip(14)
+            .take(6)
+            .map(|cycle| cycle.address)
+            .collect::<Vec<_>>(),
+        vec![
+            TARGET,
+            TARGET,
+            TARGET + 1,
+            TARGET + 2,
+            TARGET + 3,
+            TARGET + 4
+        ]
+    );
+
+    let after = native.perf_counters();
+    assert_eq!(after.instructions - before.instructions, 8);
+    assert_eq!(after.decode_misses - before.decode_misses, 1);
+    assert_eq!(after.straight_line_runs - before.straight_line_runs, 3);
+    assert_eq!(after.brk_cont_decode_miss - before.brk_cont_decode_miss, 1);
+    assert_eq!(
+        after.brk_cont_not_continuable - before.brk_cont_not_continuable,
+        1
+    );
+    assert_eq!(after.brk_halt - before.brk_halt, 1);
+    assert_eq!(after.jit_direct_entries - before.jit_direct_entries, 1);
+    assert_eq!(after.jit_direct_insns - before.jit_direct_insns, 3);
+    assert_eq!(
+        after.jit_direct_linked_transfers - before.jit_direct_linked_transfers,
+        0
+    );
+    assert_eq!(
+        after.jit_direct_unresolved_exits - before.jit_direct_unresolved_exits,
+        0
+    );
+}
+
 fn shift_program() -> Vec<u8> {
     let mut memory = vec![0; 0x1000];
     memory[0x100..0x10c].copy_from_slice(&[

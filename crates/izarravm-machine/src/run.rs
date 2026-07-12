@@ -328,6 +328,7 @@ impl Machine {
                     device_wrote_memory,
                     direct_map_changed,
                     direct_data_map_changed,
+                    direct_mapping_epoch: &mut self.direct_mapping_epoch,
                     core_clocks_so_far: 0,
                     prior_runs_core_clocks: 0,
                     timeline_at_batch_start,

@@ -644,7 +644,7 @@ fn narrow_smc_falls_back_globally_on_an_aliased_page() {
     drive_to_halt(&mut cpu, &mut bus, u64::MAX);
     let insn = cpu.decode_cache.get(ENTRY, true).unwrap();
     // A second mapping: linear 0x5100 claims the same physical 0x100.
-    cpu.decode_cache.put(0x5100, insn, true, ENTRY);
+    assert!(cpu.decode_cache.put(0x5100, insn, true, ENTRY).inserted);
     assert!(
         cpu.decode_cache.narrow_invalidate(ENTRY).is_none(),
         "an aliased physical page must force the global flush"
@@ -658,7 +658,7 @@ fn decode_cache_refuses_a_straddling_instruction() {
     arm_loop(&mut cpu, &mut bus, 2);
     drive_to_halt(&mut cpu, &mut bus, u64::MAX);
     let insn = cpu.decode_cache.get(0x102, true).unwrap(); // 6-byte add
-    assert!(!cpu.decode_cache.put(0xffe, insn, true, 0xffe));
+    assert!(!cpu.decode_cache.put(0xffe, insn, true, 0xffe).inserted);
     assert!(!cpu.decode_cache.line_live(0xffe, true));
     assert!(!cpu.decode_cache.range_hits_code(0xffe, 6));
 }

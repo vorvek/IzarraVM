@@ -322,8 +322,15 @@ impl CpuGsw {
             // identity map without paging). Page-straddling instructions remain uncached because
             // their next linear page can map to a noncontiguous physical page.
             let physical = self.translate_code_linear(bus, lin)?;
-            self.decode_cache
+            let inserted = self
+                .decode_cache
                 .put(lin, insn, cs.default_size_32, physical);
+            #[cfg(feature = "jit")]
+            if let Some(page) = inserted.evicted_linear_page {
+                self.jit_direct.hide_decode_page(page);
+            }
+            #[cfg(not(feature = "jit"))]
+            let _ = inserted;
         }
         Ok(insn)
     }

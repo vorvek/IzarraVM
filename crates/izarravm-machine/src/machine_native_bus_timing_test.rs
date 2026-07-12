@@ -4,6 +4,100 @@
 use super::*;
 
 #[test]
+fn compiled_window_requires_approximate_timing_and_trace_off() {
+    let mut machine = test_machine();
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    machine.set_mode(GswMode::Gsw386);
+    assert!(with_bus(&mut machine, |bus| bus.begin_compiled_window()).is_none());
+
+    machine.set_mode(GswMode::Gsw486);
+    machine.trace.set_tracing_mode(TracingMode::Full);
+    assert!(with_bus(&mut machine, |bus| bus.begin_compiled_window()).is_none());
+
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    let epoch = machine.direct_mapping_epoch;
+    let window = with_bus(&mut machine, |bus| bus.begin_compiled_window()).unwrap();
+    assert_eq!(window.mapping_epoch(), epoch);
+    assert_eq!(window.tracing_mode(), TracingMode::Off);
+}
+
+#[test]
+fn compiled_window_finish_applies_one_exact_aggregate_charge() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    assert!(machine.set_vga_mode(0x13));
+    machine.trace.set_tracing_mode(TracingMode::Off);
+
+    with_bus(&mut machine, |bus| {
+        bus.read_memory(0x2000, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap();
+        let window = bus.begin_compiled_window().unwrap();
+        assert_eq!(
+            window.batch_raw_clocks(),
+            bus.trace.elapsed_clocks() - bus.trace_elapsed_at_batch_start
+        );
+        let mut delta = CompiledBusDelta::default();
+        delta.add_instruction_fetches(5);
+        delta.add_ram_accesses(BusWidth::Byte, 2);
+        delta.add_ram_accesses(BusWidth::Dword, 3);
+        delta.add_vga_reads(BusWidth::Word, 4);
+        delta.add_vga_writes(NativeVgaWrites {
+            dirty_pages: 0b0010,
+            byte_writes: 7,
+            word_writes: 1,
+            dword_writes: 2,
+        });
+        let expected = window.delta_raw_clocks(&delta);
+        let before = bus.trace.elapsed_clocks();
+        bus.finish_compiled_window(window, delta);
+        assert_eq!(bus.trace.elapsed_clocks() - before, expected);
+    });
+}
+
+#[test]
+fn empty_compiled_window_finishes_without_a_vga_direct_aperture() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw586);
+    machine.trace.set_tracing_mode(TracingMode::Off);
+
+    with_bus(&mut machine, |bus| {
+        let window = bus.begin_compiled_window().unwrap();
+        let before = bus.trace.elapsed_clocks();
+        bus.finish_compiled_window(window, CompiledBusDelta::default());
+        assert_eq!(bus.trace.elapsed_clocks(), before);
+    });
+}
+
+#[test]
+fn direct_page_epoch_advances_for_a20_and_vga_mapping_changes() {
+    let mut machine = test_machine();
+    machine.set_mode(GswMode::Gsw486);
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    let initial = machine.direct_mapping_epoch;
+    let first_page = with_bus(&mut machine, |bus| {
+        bus.direct_page(0x2000, BusAccessKind::DataRead)
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(first_page.mapping_epoch, initial);
+
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x92, BusWidth::Byte, 0, false).unwrap();
+    });
+    let after_a20 = machine.direct_mapping_epoch;
+    assert_ne!(after_a20, initial);
+    let second_page = with_bus(&mut machine, |bus| {
+        bus.direct_page(0x2000, BusAccessKind::DataRead)
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(second_page.mapping_epoch, after_a20);
+
+    assert!(machine.set_vga_mode(0x13));
+    assert_ne!(machine.direct_mapping_epoch, after_a20);
+}
+
+#[test]
 fn native_cached_fetch_batch_charges_the_exact_warm_ram_cost() {
     const FETCHES: u64 = 25_000;
     const FETCH_LENS: &[u8] = &[1, 3, 2, 4];

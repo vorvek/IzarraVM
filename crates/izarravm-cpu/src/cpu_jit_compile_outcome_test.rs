@@ -502,7 +502,7 @@ fn rejected_after_decode_eviction() -> (CpuGsw, TestBus, jit::direct::BlockKey) 
         .get(ENTRY, true)
         .expect("rejected instruction decode");
     let collision = ENTRY + cpu.decode_cache.lines.len() as u32;
-    assert!(cpu.decode_cache.put(collision, insn, true, 0x800));
+    assert!(cpu.decode_cache.put(collision, insn, true, 0x800).inserted);
     assert!(cpu.decode_cache.get(ENTRY, true).is_none());
     assert!(cpu.jit_direct.range_hits_compiled_code(ENTRY, 1));
     (cpu, bus, key)

@@ -10,8 +10,8 @@ use izarravm_audio::{
     Ad1848, Ad1848Config, Mpu401, OplChip, Resampler, SbDsp, SbMixer, TimedMidiMessage,
 };
 use izarravm_bus::{
-    BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, DirectMemoryRead,
-    DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
+    BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CompiledBusDelta, CompiledBusWindow,
+    CpuBus, DirectMemoryRead, DirectMemoryWrite, DirectPage, Memory, NativeVgaWrites, TracingMode,
 };
 use izarravm_core::{
     CpuPersona, GswMode, HardwareProfile, MIDI_MPU_BASE, SoundBlasterConfig, VideoCard,
@@ -702,6 +702,9 @@ pub struct Machine {
     // Set when only a device data aperture changes. The CPU drops data pointers
     // and its FastMap while retaining decoded and compiled code.
     direct_data_map_changed: bool,
+    // Generation stamped onto every direct host pointer. Any change that can
+    // replace or reinterpret a mapping advances it before another CPU batch.
+    direct_mapping_epoch: u64,
     host_profile: MachineHostProfile,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
@@ -1060,6 +1063,7 @@ impl Machine {
             device_wrote_memory: false,
             direct_map_changed: false,
             direct_data_map_changed: false,
+            direct_mapping_epoch: 1,
             host_profile: MachineHostProfile::default(),
             pending_toka_service: None,
             toka_service_status: 0,
@@ -1609,6 +1613,28 @@ impl Machine {
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
         self.bus_rem = 0;
+        self.advance_direct_mapping_epoch();
+    }
+
+    fn advance_direct_mapping_epoch(&mut self) {
+        advance_direct_mapping_epoch(&mut self.direct_mapping_epoch);
+    }
+
+    fn mark_direct_map_changed(&mut self) {
+        self.advance_direct_mapping_epoch();
+        self.direct_map_changed = true;
+    }
+
+    fn mark_direct_data_map_changed(&mut self) {
+        self.advance_direct_mapping_epoch();
+        self.direct_data_map_changed = true;
+    }
+
+    fn set_a20_gate(&mut self, enabled: bool) {
+        if self.keyboard.a20_enabled() != enabled {
+            self.keyboard.set_a20(enabled);
+            self.advance_direct_mapping_epoch();
+        }
     }
 
     /// The reported (L1 KB, L2 KB) cache for the live mode (the L2 models a
@@ -2030,6 +2056,7 @@ struct MachineBus<'a> {
     device_wrote_memory: &'a mut bool,
     direct_map_changed: &'a mut bool,
     direct_data_map_changed: &'a mut bool,
+    direct_mapping_epoch: &'a mut u64,
     // A copy of the current read_io call's core_clocks_so_far argument (CPU core
     // clocks charged by prior instructions in this straight-line run, not
     // including the in-flight IN). Written at the top of every read_io call so a
@@ -2062,6 +2089,13 @@ struct MachineBus<'a> {
     // end-of-batch `scale_bus` call.
     bus_num_at_batch_start: u32,
     bus_den_at_batch_start: u32,
+}
+
+fn advance_direct_mapping_epoch(epoch: &mut u64) {
+    *epoch = epoch.wrapping_add(1);
+    if *epoch == 0 {
+        *epoch = 1;
+    }
 }
 
 fn icdex_iso_child_record(image: &CdImage, dir_record: &[u8], component: &str) -> Option<Vec<u8>> {

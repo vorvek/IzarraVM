@@ -770,7 +770,9 @@ impl CpuGsw {
             }
         };
         let residency_epoch = self.decode_cache.residency_epoch();
-        let block = if block.decode_residency_epoch() == residency_epoch {
+        let block = if block.decode_residency_epoch() == residency_epoch
+            && self.jit_direct.is_link_visible(block.id())
+        {
             block
         } else {
             let mut slot_lin = block.span().key.linear;

@@ -3,12 +3,15 @@
 
 use super::*;
 
+const MAPPING_EPOCH: u64 = 7;
+
 fn page(bytes: &mut [u8; PAGE_SIZE], physical_page: u32, writable: bool) -> DirectPage {
     DirectPage {
         physical_page,
         ptr: bytes.as_mut_ptr(),
         len: bytes.len(),
         writable,
+        mapping_epoch: MAPPING_EPOCH,
     }
 }
 
@@ -31,6 +34,7 @@ fn ram_read_and_write_fill_independent_biases() {
     let read = map.entry(linear);
     assert_eq!(read.kind(), PageKind::Ram);
     assert_eq!(read.physical_page, 0x0012_3000);
+    assert_eq!(read.mapping_epoch, MAPPING_EPOCH);
     assert_eq!(
         read.read_ptr(linear),
         Some(bytes.as_mut_ptr().wrapping_add(0x567))
@@ -79,13 +83,19 @@ fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
         },
     ));
     assert_eq!(
-        map.lookup_physical(linear, false, false, false),
+        map.lookup_physical(linear, MAPPING_EPOCH, false, false, false),
         Some(physical)
     );
-    assert_eq!(map.lookup_physical(linear, false, true, false), None);
-    assert_eq!(map.lookup_physical(linear, true, false, false), None);
     assert_eq!(
-        map.lookup_access(linear, BusWidth::Dword, false, false, false)
+        map.lookup_physical(linear, MAPPING_EPOCH, false, true, false),
+        None
+    );
+    assert_eq!(
+        map.lookup_physical(linear, MAPPING_EPOCH, true, false, false),
+        None
+    );
+    assert_eq!(
+        map.lookup_access(linear, MAPPING_EPOCH, BusWidth::Dword, false, false, false,)
             .unwrap()
             .read(BusWidth::Dword),
         0x4433_2211
@@ -101,18 +111,25 @@ fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
         },
     ));
     assert_eq!(
-        map.lookup_physical(linear, true, false, false),
+        map.lookup_physical(linear, MAPPING_EPOCH, true, false, false),
         Some(physical)
     );
-    assert_eq!(map.lookup_physical(linear, true, false, true), None);
-    assert_eq!(map.lookup_physical(linear, true, true, false), None);
-    map.lookup_access(linear, BusWidth::Dword, true, false, false)
+    assert_eq!(
+        map.lookup_physical(linear, MAPPING_EPOCH, true, false, true),
+        None
+    );
+    assert_eq!(
+        map.lookup_physical(linear, MAPPING_EPOCH, true, true, false),
+        None
+    );
+    map.lookup_access(linear, MAPPING_EPOCH, BusWidth::Dword, true, false, false)
         .unwrap()
         .write(BusWidth::Dword, 0xaabb_ccdd);
     assert_eq!(&bytes[0x564..0x568], &0xaabb_ccddu32.to_le_bytes());
     assert!(
         map.lookup_access(
             (linear & !PAGE_MASK) | 0xffe,
+            MAPPING_EPOCH,
             BusWidth::Dword,
             false,
             false,
@@ -123,7 +140,38 @@ fn interpreter_lookup_requires_a_live_bias_and_current_permissions() {
     );
 
     map.invalidate_page(linear);
-    assert_eq!(map.lookup_physical(linear, false, false, false), None);
+    assert_eq!(
+        map.lookup_physical(linear, MAPPING_EPOCH, false, false, false),
+        None
+    );
+}
+
+#[test]
+fn access_rejects_a_mapping_from_an_old_bus_epoch() {
+    let mut bytes = Box::new([0u8; PAGE_SIZE]);
+    let mut map = FastMap::default();
+    let linear = 0x7123_4000;
+    let physical = 0x0023_4000;
+
+    assert!(map.populate_read(
+        linear,
+        physical,
+        page(&mut bytes, physical, false),
+        PagePermissions::UNPAGED,
+    ));
+    assert!(map.has_read_mapping_at_epoch(linear, physical, MAPPING_EPOCH));
+    assert!(!map.has_read_mapping_at_epoch(linear, physical, MAPPING_EPOCH + 1));
+    assert!(
+        map.lookup_access(
+            linear,
+            MAPPING_EPOCH + 1,
+            BusWidth::Byte,
+            false,
+            false,
+            false,
+        )
+        .is_none()
+    );
 }
 
 #[test]

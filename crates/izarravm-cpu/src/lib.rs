@@ -1733,6 +1733,24 @@ struct DecodeCache {
     jit_smc_epoch: u32,
 }
 
+/// Result of publishing one decoded instruction. A live line displaced from another linear page
+/// must be hidden from compiled dispatch before guest execution continues.
+#[must_use]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DecodeInsertOutcome {
+    inserted: bool,
+    evicted_linear_page: Option<u32>,
+}
+
+impl DecodeInsertOutcome {
+    const fn rejected() -> Self {
+        Self {
+            inserted: false,
+            evicted_linear_page: None,
+        }
+    }
+}
+
 /// A tiny multiplicative hasher for the decode cache's `u32`-keyed `code_page_lin` map, replacing
 /// std's SipHash. `put` runs it on every decode-cache miss-fill; SipHash's
 /// per-lookup cost is wasted on a small integer key. No new dependency: one Fibonacci-multiply on the
@@ -1885,21 +1903,21 @@ impl DecodeCache {
     }
 
     #[inline]
-    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) -> bool {
+    fn put(&mut self, lin: u32, insn: DecodedInsn, d: bool, phys: u32) -> DecodeInsertOutcome {
         let len = u32::from(insn.len);
         if len == 0 {
-            return false;
+            return DecodeInsertOutcome::rejected();
         }
         let Some(linear_last) = lin.checked_add(len.saturating_sub(1)) else {
-            return false;
+            return DecodeInsertOutcome::rejected();
         };
         let Some(physical_last) = phys.checked_add(len.saturating_sub(1)) else {
-            return false;
+            return DecodeInsertOutcome::rejected();
         };
         if lin >> 12 != linear_last >> 12 || phys >> 12 != physical_last >> 12 {
             // The tail can map to a noncontiguous physical page. Re-decode page-straddling
             // instructions instead of publishing a fictitious contiguous watch.
-            return false;
+            return DecodeInsertOutcome::rejected();
         }
 
         let index = (lin & self.mask) as usize;
@@ -1921,10 +1939,10 @@ impl DecodeCache {
                 info.aliased |= info.lin_page != lin >> 12;
             }
         }
-        if previous.generation == self.generation
+        let displaced = previous.generation == self.generation
             && previous.insn.is_some()
-            && (previous.tag != lin || previous.d != d)
-        {
+            && (previous.tag != lin || previous.d != d);
+        if displaced {
             self.replacement_epoch = self.replacement_epoch.wrapping_add(1);
         }
         self.lines[index] = DecodeLine {
@@ -1941,7 +1959,10 @@ impl DecodeCache {
             jit_direct_hotness: 0,
         };
 
-        true
+        DecodeInsertOutcome {
+            inserted: true,
+            evicted_linear_page: displaced.then_some(previous.tag >> 12),
+        }
     }
 
     /// Try to invalidate ONLY the lines covering the written physical byte `physical` (already

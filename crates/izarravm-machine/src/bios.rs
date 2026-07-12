@@ -466,12 +466,12 @@ impl Machine {
             // masking. AL selects: 00 disable, 01 enable, 02 status, 03 support.
             0x24 => match al {
                 0x00 => {
-                    self.keyboard.set_a20(false);
+                    self.set_a20_gate(false);
                     self.set_eax_ah(0x00);
                     self.set_int_frame_carry(false);
                 }
                 0x01 => {
-                    self.keyboard.set_a20(true);
+                    self.set_a20_gate(true);
                     self.set_eax_ah(0x00);
                     self.set_int_frame_carry(false);
                 }

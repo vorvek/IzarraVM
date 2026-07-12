@@ -97,6 +97,7 @@ struct FastMapStorage {
     read_biases: Box<[usize]>,
     write_biases: Box<[usize]>,
     physical_pages: Box<[u32]>,
+    mapping_epochs: Box<[u64]>,
     flags: Box<[u8]>,
     live_pages: Box<[u64]>,
     listed_pages: Box<[u64]>,
@@ -109,6 +110,7 @@ impl FastMapStorage {
             read_biases: vec![UNAVAILABLE_BIAS; LINEAR_PAGE_COUNT].into_boxed_slice(),
             write_biases: vec![UNAVAILABLE_BIAS; LINEAR_PAGE_COUNT].into_boxed_slice(),
             physical_pages: vec![UNAVAILABLE_PHYSICAL_PAGE; LINEAR_PAGE_COUNT].into_boxed_slice(),
+            mapping_epochs: vec![0; LINEAR_PAGE_COUNT].into_boxed_slice(),
             flags: vec![PageKind::Unavailable as u8; LINEAR_PAGE_COUNT].into_boxed_slice(),
             live_pages: vec![0; BITSET_WORDS].into_boxed_slice(),
             listed_pages: vec![0; BITSET_WORDS].into_boxed_slice(),
@@ -136,6 +138,7 @@ impl FastMapStorage {
         self.read_biases[index] = UNAVAILABLE_BIAS;
         self.write_biases[index] = UNAVAILABLE_BIAS;
         self.physical_pages[index] = UNAVAILABLE_PHYSICAL_PAGE;
+        self.mapping_epochs[index] = 0;
         self.flags[index] = PageKind::Unavailable as u8;
         Self::clear_bit(&mut self.live_pages, index);
     }
@@ -158,6 +161,7 @@ pub(super) struct NativeMapBases {
     read_biases: usize,
     write_biases: usize,
     physical_pages: usize,
+    mapping_epochs: usize,
     flags: usize,
 }
 
@@ -173,6 +177,10 @@ impl NativeMapBases {
 
     pub(super) const fn physical_pages(self) -> usize {
         self.physical_pages
+    }
+
+    pub(super) const fn mapping_epochs(self) -> usize {
+        self.mapping_epochs
     }
 
     pub(super) const fn flags(self) -> usize {
@@ -205,6 +213,7 @@ impl FastMap {
     pub(crate) fn lookup_access(
         &self,
         linear: u32,
+        mapping_epoch: u64,
         width: BusWidth,
         write: bool,
         user: bool,
@@ -222,6 +231,9 @@ impl FastMap {
         let index = (linear >> PAGE_SHIFT) as usize;
         let storage = self.storage.as_ref()?;
         if !FastMapStorage::bit(&storage.live_pages, index) {
+            return None;
+        }
+        if storage.mapping_epochs[index] != mapping_epoch {
             return None;
         }
         let flags = storage.flags[index];
@@ -256,12 +268,20 @@ impl FastMap {
     pub(crate) fn lookup_physical(
         &self,
         linear: u32,
+        mapping_epoch: u64,
         write: bool,
         user: bool,
         write_protect: bool,
     ) -> Option<u32> {
-        self.lookup_access(linear, BusWidth::Byte, write, user, write_protect)
-            .map(FastMapAccess::physical)
+        self.lookup_access(
+            linear,
+            mapping_epoch,
+            BusWidth::Byte,
+            write,
+            user,
+            write_protect,
+        )
+        .map(FastMapAccess::physical)
     }
 
     /// Return stable array bases for native code generation after the first map fill.
@@ -271,6 +291,7 @@ impl FastMap {
             read_biases: storage.read_biases.as_ptr() as usize,
             write_biases: storage.write_biases.as_ptr() as usize,
             physical_pages: storage.physical_pages.as_ptr() as usize,
+            mapping_epochs: storage.mapping_epochs.as_ptr() as usize,
             flags: storage.flags.as_ptr() as usize,
         })
     }
@@ -319,6 +340,36 @@ impl FastMap {
             && storage.write_biases[index] != UNAVAILABLE_BIAS
     }
 
+    #[inline]
+    pub(crate) fn has_read_mapping_at_epoch(
+        &self,
+        linear: u32,
+        physical: u32,
+        mapping_epoch: u64,
+    ) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.has_read_mapping(linear, physical)
+            && self
+                .storage
+                .as_ref()
+                .is_some_and(|storage| storage.mapping_epochs[index] == mapping_epoch)
+    }
+
+    #[inline]
+    pub(crate) fn has_write_mapping_at_epoch(
+        &self,
+        linear: u32,
+        physical: u32,
+        mapping_epoch: u64,
+    ) -> bool {
+        let index = (linear >> PAGE_SHIFT) as usize;
+        self.has_write_mapping(linear, physical)
+            && self
+                .storage
+                .as_ref()
+                .is_some_and(|storage| storage.mapping_epochs[index] == mapping_epoch)
+    }
+
     fn populate(
         &mut self,
         linear: u32,
@@ -348,6 +399,7 @@ impl FastMap {
 
         let same_mapping = FastMapStorage::bit(&storage.live_pages, index)
             && storage.physical_pages[index] == physical_page
+            && storage.mapping_epochs[index] == page.mapping_epoch
             && storage.flags[index] & KIND_MASK == kind as u8;
         let access_flags = if same_mapping {
             storage.flags[index] & (HAS_READ_BIAS | HAS_WRITE_BIAS)
@@ -373,6 +425,7 @@ impl FastMap {
         }
 
         storage.physical_pages[index] = physical_page;
+        storage.mapping_epochs[index] = page.mapping_epoch;
         storage.flags[index] = flags;
         FastMapStorage::set_bit(&mut storage.live_pages, index);
         if !FastMapStorage::bit(&storage.listed_pages, index) {
@@ -399,6 +452,7 @@ impl FastMap {
 
     /// Clear the compact set of linear aliases backed by the direct VGA aperture. Draining the
     /// registry lets an alias be listed again after the VGA plane or backing store changes.
+    #[cfg(test)]
     pub(crate) fn invalidate_vga_pages(&mut self) {
         let Some(storage) = self.storage.as_mut() else {
             return;
@@ -438,6 +492,7 @@ impl FastMap {
             read_bias: storage.read_biases[index],
             write_bias: storage.write_biases[index],
             physical_page: storage.physical_pages[index],
+            mapping_epoch: storage.mapping_epochs[index],
             flags: storage.flags[index],
         }
     }
@@ -472,6 +527,7 @@ struct FastMapEntry {
     read_bias: usize,
     write_bias: usize,
     physical_page: u32,
+    mapping_epoch: u64,
     flags: u8,
 }
 
@@ -482,6 +538,7 @@ impl FastMapEntry {
             read_bias: UNAVAILABLE_BIAS,
             write_bias: UNAVAILABLE_BIAS,
             physical_page: UNAVAILABLE_PHYSICAL_PAGE,
+            mapping_epoch: 0,
             flags: PageKind::Unavailable as u8,
         }
     }

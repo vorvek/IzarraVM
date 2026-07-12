@@ -180,6 +180,8 @@ pub struct DirectPage {
     pub ptr: *mut u8,
     pub len: usize,
     pub writable: bool,
+    /// Generation of the host mapping that produced `ptr`.
+    pub mapping_epoch: u64,
 }
 
 /// Writes completed through a native VGA aperture fast path during one CPU block chain.
@@ -201,6 +203,204 @@ impl NativeVgaWrites {
 /// Compatibility name retained while the direct CPU backend still labels the
 /// VGA aperture page kind as Mode 13h.
 pub type NativeMode13Writes = NativeVgaWrites;
+
+const fn compiled_width_index(width: BusWidth) -> usize {
+    match width {
+        BusWidth::Byte => 0,
+        BusWidth::Word => 1,
+        BusWidth::Dword => 2,
+    }
+}
+
+/// Aggregate effects produced while the CPU remains in compiled execution.
+///
+/// RAM reads and writes share one count because the fixed direct-RAM timing is
+/// identical for both directions. VGA writes retain their dirty-page mask so
+/// the bus can publish display changes when the compiled window closes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompiledBusDelta {
+    instruction_fetches: u64,
+    ram_accesses: [u64; 3],
+    vga_reads: [u64; 3],
+    vga_writes: NativeVgaWrites,
+}
+
+impl CompiledBusDelta {
+    pub fn add_instruction_fetches(&mut self, count: u64) {
+        self.instruction_fetches = self.instruction_fetches.saturating_add(count);
+    }
+
+    pub fn add_ram_accesses(&mut self, width: BusWidth, count: u64) {
+        let slot = &mut self.ram_accesses[compiled_width_index(width)];
+        *slot = slot.saturating_add(count);
+    }
+
+    pub fn add_vga_reads(&mut self, width: BusWidth, count: u64) {
+        let slot = &mut self.vga_reads[compiled_width_index(width)];
+        *slot = slot.saturating_add(count);
+    }
+
+    pub fn add_vga_writes(&mut self, writes: NativeVgaWrites) {
+        self.vga_writes.dirty_pages |= writes.dirty_pages;
+        self.vga_writes.byte_writes = self
+            .vga_writes
+            .byte_writes
+            .saturating_add(writes.byte_writes);
+        self.vga_writes.word_writes = self
+            .vga_writes
+            .word_writes
+            .saturating_add(writes.word_writes);
+        self.vga_writes.dword_writes = self
+            .vga_writes
+            .dword_writes
+            .saturating_add(writes.dword_writes);
+    }
+
+    pub const fn instruction_fetches(&self) -> u64 {
+        self.instruction_fetches
+    }
+
+    pub const fn ram_accesses(&self, width: BusWidth) -> u64 {
+        self.ram_accesses[compiled_width_index(width)]
+    }
+
+    pub const fn vga_reads(&self, width: BusWidth) -> u64 {
+        self.vga_reads[compiled_width_index(width)]
+    }
+
+    pub const fn vga_writes(&self) -> NativeVgaWrites {
+        self.vga_writes
+    }
+}
+
+/// Stable bus state certified for one compiled-execution residency window.
+///
+/// The value is neither `Copy` nor `Clone`. Passing it to
+/// `CpuBus::finish_compiled_window` prevents a second finish in safe Rust. A bus
+/// returns a window only when aggregate accounting is exact and direct mappings
+/// remain valid for its `mapping_epoch` until a side exit.
+#[must_use = "a compiled bus window must be finished exactly once"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompiledBusWindow {
+    mapping_epoch: u64,
+    tracing_mode: TracingMode,
+    fetch_raw_clocks: u64,
+    ram_raw_clocks: [u64; 3],
+    vga_raw_clocks: [u64; 3],
+    batch_raw_clocks: u64,
+    bus_scale_remainder: u64,
+    bus_scale_numerator: u32,
+    bus_scale_denominator: u32,
+}
+
+impl CompiledBusWindow {
+    /// Build a window after the bus has checked mapping and timing stability.
+    /// Full and count tracing require individual observations, so only off mode
+    /// supports aggregate effects.
+    #[allow(clippy::too_many_arguments)]
+    pub fn certify(
+        mapping_epoch: u64,
+        tracing_mode: TracingMode,
+        fetch_raw_clocks: u64,
+        ram_raw_clocks: [u64; 3],
+        vga_raw_clocks: [u64; 3],
+        batch_raw_clocks: u64,
+        bus_scale_remainder: u64,
+        bus_scale_numerator: u32,
+        bus_scale_denominator: u32,
+    ) -> Option<Self> {
+        if tracing_mode != TracingMode::Off || bus_scale_denominator == 0 {
+            return None;
+        }
+        Some(Self {
+            mapping_epoch,
+            tracing_mode,
+            fetch_raw_clocks,
+            ram_raw_clocks,
+            vga_raw_clocks,
+            batch_raw_clocks,
+            bus_scale_remainder,
+            bus_scale_numerator,
+            bus_scale_denominator,
+        })
+    }
+
+    pub const fn mapping_epoch(&self) -> u64 {
+        self.mapping_epoch
+    }
+
+    pub const fn tracing_mode(&self) -> TracingMode {
+        self.tracing_mode
+    }
+
+    pub const fn fetch_raw_clocks(&self) -> u64 {
+        self.fetch_raw_clocks
+    }
+
+    pub const fn ram_raw_clocks(&self, width: BusWidth) -> u64 {
+        self.ram_raw_clocks[compiled_width_index(width)]
+    }
+
+    pub const fn vga_raw_clocks(&self, width: BusWidth) -> u64 {
+        self.vga_raw_clocks[compiled_width_index(width)]
+    }
+
+    /// Raw bus clocks accumulated by this CPU batch before compiled entry.
+    pub const fn batch_raw_clocks(&self) -> u64 {
+        self.batch_raw_clocks
+    }
+
+    pub const fn bus_scale_remainder(&self) -> u64 {
+        self.bus_scale_remainder
+    }
+
+    pub const fn bus_scale_numerator(&self) -> u32 {
+        self.bus_scale_numerator
+    }
+
+    pub const fn bus_scale_denominator(&self) -> u32 {
+        self.bus_scale_denominator
+    }
+
+    /// Raw clocks represented by `delta` under this window's fixed costs.
+    pub fn delta_raw_clocks(&self, delta: &CompiledBusDelta) -> u64 {
+        let mut clocks = self
+            .fetch_raw_clocks
+            .saturating_mul(delta.instruction_fetches);
+        for width in [BusWidth::Byte, BusWidth::Word, BusWidth::Dword] {
+            clocks = clocks.saturating_add(
+                self.ram_raw_clocks(width)
+                    .saturating_mul(delta.ram_accesses(width)),
+            );
+            clocks = clocks.saturating_add(
+                self.vga_raw_clocks(width)
+                    .saturating_mul(delta.vga_reads(width)),
+            );
+        }
+        let writes = delta.vga_writes;
+        clocks = clocks.saturating_add(
+            self.vga_raw_clocks(BusWidth::Byte)
+                .saturating_mul(writes.byte_writes),
+        );
+        clocks = clocks.saturating_add(
+            self.vga_raw_clocks(BusWidth::Word)
+                .saturating_mul(writes.word_writes),
+        );
+        clocks.saturating_add(
+            self.vga_raw_clocks(BusWidth::Dword)
+                .saturating_mul(writes.dword_writes),
+        )
+    }
+
+    /// Exact scaled bus total after an additional raw-clock charge.
+    pub fn projected_scaled_bus_clocks(&self, additional_raw: u64) -> Option<u64> {
+        self.batch_raw_clocks
+            .checked_add(additional_raw)?
+            .checked_mul(u64::from(self.bus_scale_numerator))?
+            .checked_add(self.bus_scale_remainder)
+            .map(|scaled| scaled / u64::from(self.bus_scale_denominator))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusState {
@@ -553,6 +753,16 @@ pub trait CpuBus {
     ) -> Result<Option<DirectPage>, BusError> {
         Ok(None)
     }
+
+    /// Open a native-residency window. The default declines and keeps the
+    /// interpreter path for buses without stable direct mappings and timing.
+    fn begin_compiled_window(&mut self) -> Option<CompiledBusWindow> {
+        None
+    }
+
+    /// Apply the aggregate effects from one completed native-residency window.
+    /// Implementations must not fail after returning a window from `begin`.
+    fn finish_compiled_window(&mut self, _window: CompiledBusWindow, _delta: CompiledBusDelta) {}
 
     /// Scaled bus clocks this batch has accumulated so far, in GUEST clocks.
     /// The straight-line run loop adds the growth of this figure to its core

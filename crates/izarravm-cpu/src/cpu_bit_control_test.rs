@@ -1841,6 +1841,7 @@ fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
                 ptr: first_page.as_mut_ptr(),
                 len: first_page.len(),
                 writable: false,
+                mapping_epoch: 1,
             },
             permissions,
         ));
@@ -1852,6 +1853,7 @@ fn invlpg_invalidates_only_the_addressed_page_at_cpl0() {
                 ptr: second_page.as_mut_ptr(),
                 len: second_page.len(),
                 writable: false,
+                mapping_epoch: 1,
             },
             permissions,
         ));
