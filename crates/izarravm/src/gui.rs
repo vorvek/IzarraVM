@@ -12,7 +12,7 @@ use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioDebugSnapshot, AudioPlayer, AudioSink, MidiEngine};
 use izarravm_core::{GswMode, MASTER_CLOCK_HZ, MidiBackend, MidiConfig, MidiPortId, MidiStatus};
 use izarravm_input::HostKeyboard;
-use izarravm_machine::{Machine, MachineProfile, StopReason};
+use izarravm_machine::{CdAudioState, Machine, MachineProfile, StopReason};
 use serde::Serialize;
 use std::cell::Cell;
 use std::error::Error;
@@ -687,6 +687,7 @@ struct Frame {
     floppy_accesses: u64,  // monotonic A: access count, drives the LED
     c_accesses: u64,       // monotonic C: access count, drives the LED
     cd_accesses: u64,      // monotonic CD access count, drives the LED
+    cd_audio: CdAudioState,
     wavetable_status: MidiStatus,
     midi_status: MidiStatus,
 }
@@ -714,9 +715,44 @@ enum Command {
     MountCd(izarravm_machine::CdImage),
     /// Eject the CD.
     EjectCd,
+    /// Start the first audio track, or resume a paused range.
+    CdPlay,
+    /// Stop CD audio playback.
+    CdStop,
+    /// Set both guest-visible CT1745 CD mixer levels.
+    CdLinkedLevel(u8),
     /// Reconfigure host MIDI without resetting either guest MPU.
     MidiConfig(MidiConfig),
     Shutdown,
+}
+
+/// Apply one CD command taken from the shared UI FIFO. Returning the original
+/// non-CD command lets the emulation loop preserve ordering across all command
+/// kinds while keeping the CD path small enough to exercise directly.
+fn apply_cd_fifo_command(machine: &mut Machine, command: Command) -> Option<Command> {
+    match command {
+        Command::MountCd(image) => {
+            machine.mount_cd(image);
+            None
+        }
+        Command::EjectCd => {
+            machine.eject_cd();
+            None
+        }
+        Command::CdPlay => {
+            machine.cd_front_panel_play();
+            None
+        }
+        Command::CdStop => {
+            machine.cd_front_panel_stop();
+            None
+        }
+        Command::CdLinkedLevel(level) => {
+            machine.set_cd_linked_level(level);
+            None
+        }
+        command => Some(command),
+    }
 }
 
 /// Open the host file manager at `path`. A small portable shim over the platform
@@ -1215,6 +1251,18 @@ impl Emulator {
         let _ = self.commands.send(Command::EjectCd);
     }
 
+    fn cd_play(&self) {
+        let _ = self.commands.send(Command::CdPlay);
+    }
+
+    fn cd_stop(&self) {
+        let _ = self.commands.send(Command::CdStop);
+    }
+
+    fn set_cd_linked_level(&self, level: u8) {
+        let _ = self.commands.send(Command::CdLinkedLevel(level));
+    }
+
     fn configure_midi(&self, config: MidiConfig) {
         let _ = self.commands.send(Command::MidiConfig(config));
     }
@@ -1357,24 +1405,41 @@ fn emulate(
     let mut floppy_flush_path: Option<PathBuf> = None;
     loop {
         loop {
-            match commands.try_recv() {
-                Ok(Command::Keys(codes)) => machine.inject_key_scancodes(&codes),
-                Ok(Command::MouseRelative(dx, dy, buttons)) => {
+            let command = match commands.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Channel closed (the GUI dropped the sender on exit); same
+                    // flush sequence as Shutdown before the thread ends.
+                    finish_runtime_profile(&mut runtime_profile, sink.as_ref());
+                    machine.flush_hdd_folder();
+                    flush_floppy(&mut machine, &mut floppy_flush_path);
+                    crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+                    return;
+                }
+            };
+            let Some(command) = apply_cd_fifo_command(&mut machine, command) else {
+                continue;
+            };
+            match command {
+                Command::Keys(codes) => machine.inject_key_scancodes(&codes),
+                Command::MouseRelative(dx, dy, buttons) => {
                     machine.inject_mouse_relative(dx, dy, buttons)
                 }
-                Ok(Command::MouseWheel(dz)) => machine.inject_mouse_wheel(dz),
-                Ok(Command::MountFloppy { bytes, flush_path }) => {
-                    match machine.mount_floppy(bytes) {
-                        Ok(()) => floppy_flush_path = flush_path,
-                        Err(err) => error!(%err, "failed to mount floppy image"),
-                    }
-                }
-                Ok(Command::EjectFloppy) => {
+                Command::MouseWheel(dz) => machine.inject_mouse_wheel(dz),
+                Command::MountFloppy { bytes, flush_path } => match machine.mount_floppy(bytes) {
+                    Ok(()) => floppy_flush_path = flush_path,
+                    Err(err) => error!(%err, "failed to mount floppy image"),
+                },
+                Command::EjectFloppy => {
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                 }
-                Ok(Command::MountCd(image)) => machine.mount_cd(image),
-                Ok(Command::EjectCd) => machine.eject_cd(),
-                Ok(Command::MidiConfig(config)) => {
+                Command::MountCd(_)
+                | Command::EjectCd
+                | Command::CdPlay
+                | Command::CdStop
+                | Command::CdLinkedLevel(_) => unreachable!("CD command handled by FIFO seam"),
+                Command::MidiConfig(config) => {
                     wavetable.reconfigure(&config);
                     midi_receiver.reconfigure(&config);
                     if !matches!(
@@ -1394,22 +1459,12 @@ fn emulate(
                         );
                     }
                 }
-                Ok(Command::Shutdown) => {
+                Command::Shutdown => {
                     // Flush the Katea host folder, the floppy, and the final CMOS
                     // state before exiting (this arm also runs on Reset, which
                     // shuts the thread down and respawns).
                     // Close profiling first so persistence latency is not charged
                     // to emulation work or uncapped guest lag.
-                    finish_runtime_profile(&mut runtime_profile, sink.as_ref());
-                    machine.flush_hdd_folder();
-                    flush_floppy(&mut machine, &mut floppy_flush_path);
-                    crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
-                    return;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // Channel closed (the GUI dropped the sender on exit); same
-                    // flush sequence as Shutdown before the thread ends.
                     finish_runtime_profile(&mut runtime_profile, sink.as_ref());
                     machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
@@ -1526,6 +1581,7 @@ fn emulate(
         let refresh_hz = machine.display_refresh_hz();
         let (floppy_accesses, c_accesses) = machine.drive_access_counts();
         let cd_accesses = machine.cd_access_count();
+        let cd_audio = machine.cd_audio_state();
         {
             let mut f = frame.lock().expect("frame snapshot poisoned");
             if let Some((words, width, height)) = rendered {
@@ -1548,6 +1604,7 @@ fn emulate(
             f.floppy_accesses = floppy_accesses;
             f.c_accesses = c_accesses;
             f.cd_accesses = cd_accesses;
+            f.cd_audio = cd_audio;
             f.wavetable_status = wavetable.status();
             f.midi_status = midi_receiver.status();
         }
@@ -1596,6 +1653,39 @@ fn emulate(
 /// reset flushes dirty guest writes back to the source IMG first, so the
 /// re-read keeps them.
 struct FloppySource(PathBuf);
+
+/// Host source for the live CD mount. This is session state rather than a
+/// preference: Reset remounts it into the new machine, while Stop and Eject
+/// forget it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CdSource {
+    Image(PathBuf),
+    Folder(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CdMountSession {
+    label: Option<String>,
+    source: Option<CdSource>,
+}
+
+impl CdMountSession {
+    fn remember(&mut self, label: String, source: CdSource) {
+        self.label = Some(label);
+        self.source = Some(source);
+    }
+
+    /// Clear the display while preserving and returning the source for Reset.
+    fn begin_reset(&mut self) -> Option<CdSource> {
+        self.label = None;
+        self.source.clone()
+    }
+
+    fn clear(&mut self) {
+        self.label = None;
+        self.source = None;
+    }
+}
 
 /// Pick the floppy mount to restore from saved prefs, if its source still
 /// exists. A path that has since been deleted or moved is skipped (the drive
@@ -1670,7 +1760,7 @@ pub struct GuiApp {
     c_access_at: Option<Instant>,
     // What is mounted in the CD-ROM drive (D:), for the label. None shows
     // "(empty)". The emulation thread owns the mount; this mirrors it.
-    cd_label: Option<String>,
+    cd_mount: CdMountSession,
     cd_access_seen: u64,
     cd_access_at: Option<Instant>,
     // Whether the floating COM1 window is open. The footer button and the
@@ -1914,7 +2004,7 @@ impl GuiApp {
             c_access_seen: 0,
             floppy_access_at: None,
             c_access_at: None,
-            cd_label: None,
+            cd_mount: CdMountSession::default(),
             cd_access_seen: 0,
             cd_access_at: None,
             show_com1: false,
@@ -1985,6 +2075,9 @@ impl GuiApp {
         if let Some(source) = self.floppy_source.take() {
             self.mount_floppy_source(source);
         }
+        if let Some(source) = self.cd_mount.begin_reset() {
+            self.mount_cd_source(source);
+        }
     }
 
     fn stop(&mut self) {
@@ -1994,6 +2087,7 @@ impl GuiApp {
         self.frame_seq = u64::MAX;
         self.floppy_label = None;
         self.floppy_source = None;
+        self.cd_mount.clear();
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
     }
 
@@ -2230,6 +2324,11 @@ impl GuiApp {
         let floppy_lit = lit(self.floppy_access_at);
         let c_lit = lit(self.c_access_at);
         let cd_lit = lit(self.cd_access_at);
+        let cd_audio = self
+            .emu
+            .as_ref()
+            .map(|emu| emu.frame.lock().expect("frame snapshot poisoned").cd_audio)
+            .unwrap_or_default();
 
         // Floppy A:
         beige_group(ui, |ui| {
@@ -2287,13 +2386,12 @@ impl GuiApp {
                     ],
                     egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x3D, 0x38, 0x2D)),
                 );
-                let mounted = self.cd_label.is_some();
-                if eject_button(ui, running && mounted) {
+                if eject_button(ui, cd_eject_enabled(running, cd_audio)) {
                     self.eject_cd_action();
                 }
             });
             ui.label(
-                egui::RichText::new(self.cd_label.as_deref().unwrap_or("(empty)"))
+                egui::RichText::new(self.cd_mount.label.as_deref().unwrap_or("(empty)"))
                     .color(MUTED)
                     .italics()
                     .size(11.0),
@@ -2310,6 +2408,44 @@ impl GuiApp {
                     .clicked()
                 {
                     self.load_cd_folder();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        running
+                            && cd_audio.media_present
+                            && cd_audio.audio_capable
+                            && !cd_audio.playing,
+                        egui::Button::new("Play"),
+                    )
+                    .clicked()
+                    && let Some(emu) = &self.emu
+                {
+                    emu.cd_play();
+                }
+                if ui
+                    .add_enabled(
+                        running && (cd_audio.playing || cd_audio.paused),
+                        egui::Button::new("Stop"),
+                    )
+                    .clicked()
+                    && let Some(emu) = &self.emu
+                {
+                    emu.cd_stop();
+                }
+                let mut percent = cd_level_percent(cd_audio.left_level, cd_audio.right_level);
+                if ui
+                    .add_enabled(
+                        running,
+                        egui::Slider::new(&mut percent, 0..=100)
+                            .text("Volume")
+                            .show_value(false),
+                    )
+                    .changed()
+                    && let Some(emu) = &self.emu
+                {
+                    emu.set_cd_linked_level(cd_percent_level(percent));
                 }
             });
         });
@@ -2349,7 +2485,7 @@ impl GuiApp {
         if let Some(emu) = &self.emu {
             emu.eject_cd();
         }
-        self.cd_label = None;
+        self.cd_mount.clear();
         self.prefs.last_cd_image = None;
         self.prefs.last_cd_folder = None;
         self.save_prefs();
@@ -2428,7 +2564,8 @@ impl GuiApp {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         emu.mount_cd(image);
-        self.cd_label = Some(label);
+        self.cd_mount
+            .remember(label, CdSource::Image(path.to_path_buf()));
         // An ISO/CUE mount and a folder mount are mutually exclusive in the
         // CD drive, so recording one clears the other.
         self.prefs.last_cd_image = Some(path.to_path_buf());
@@ -2477,11 +2614,32 @@ impl GuiApp {
                 .unwrap_or_else(|| dir.display().to_string())
         );
         emu.mount_cd(image);
-        self.cd_label = Some(label);
+        self.cd_mount
+            .remember(label, CdSource::Folder(dir.to_path_buf()));
         self.prefs.last_cd_folder = Some(dir.to_path_buf());
         self.prefs.last_cd_image = None;
         self.save_prefs();
     }
+
+    fn mount_cd_source(&mut self, source: CdSource) {
+        match source {
+            CdSource::Image(path) => self.mount_cd_from_path(&path),
+            CdSource::Folder(path) => self.mount_cd_from_folder(&path),
+        }
+    }
+}
+
+fn cd_level_percent(left: u8, right: u8) -> u8 {
+    let sum = u16::from(left.min(31)) + u16::from(right.min(31));
+    ((sum * 100 + 31) / 62) as u8
+}
+
+fn cd_eject_enabled(running: bool, state: CdAudioState) -> bool {
+    running && state.media_present
+}
+
+fn cd_percent_level(percent: u8) -> u8 {
+    ((u16::from(percent.min(100)) * 31 + 50) / 100) as u8
 }
 
 /// Build a `CdImage` from a host path. A `.cue` is read as text and parsed

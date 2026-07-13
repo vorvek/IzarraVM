@@ -1,6 +1,7 @@
 IzarraVM bundles Toka-DOS, built from FreeDOS source (https://www.freedos.org/).
 FreeDOS kernel: © 1995-2012 Pasquale J. Villani and The FreeDOS Project, GPLv2-or-later.
 FreeCOM: © 1994-2005 Tim Norman and others, GPLv2-or-later.
+SHSUCDX: © 2005-2020 Jason Hood, Zlib license. Toka-DOS ships the redirector as IZCDEX.
 Modified by the Toka-DOS project (2026). Corresponding source: toka-dos/freedos/.
 Project license: GPL-3.0-only (see LICENSE).
 FreeDOS MOVE: © 1997-2002 Joe Cosentino, © 2003-2004 Imre Leber, GPLv2-or-later.
@@ -70,7 +71,8 @@ LICENSE_MANIFEST.tsv records the origin, license, and SHA-256 of tracked
 binary, generated, and non-commentable files. LicenseRef-IzarraVM-TokaDOS-Aggregate
 identifies the Toka-DOS disk image as an aggregation of GPL-3.0-only project
 files, GPL-2.0-or-later FreeDOS and tnyprntf files, LGPL-2.0-or-later FreeCOM
-supplement-library files, and LGPL-2.1-or-later kitten files. Each component
+supplement-library files, LGPL-2.1-or-later kitten files, and Zlib-licensed
+SHSUCDX redirector files. Each component
 retains its own license and notice.
 LicenseRef-FluidSynth-2.5.6-Source-Archive,
 LicenseRef-libsndfile-1.2.2-Source-Archive,

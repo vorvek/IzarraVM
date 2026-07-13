@@ -4,8 +4,7 @@
 use super::*;
 
 /// The extractor pulls the exact system payload back out of the committed,
-/// proven-bootable image: the five files at their known sizes/first bytes, and
-/// both boot sectors carrying the 0x55AA signature.
+/// proven-bootable image, including both boot sectors with the 0x55AA signature.
 #[test]
 fn extracts_the_embedded_image_payload() {
     let img = izarravm_firmware::tokados_hdd_img();
@@ -56,6 +55,19 @@ fn extracts_the_embedded_image_payload() {
         String::from_utf8_lossy(autoexec).contains("LH TOKAMOUS"),
         "default AUTOEXEC loads the mouse driver high"
     );
+    assert!(by_name.contains_key("TOKACD.SYS"), "TOKACD.SYS present");
+    assert!(by_name.contains_key("IZCDEX.COM"), "IZCDEX.COM present");
+    let autoexec_text = String::from_utf8_lossy(autoexec);
+    let izcdex_pos = autoexec_text
+        .find("IZCDEX /I /D:TOKACD01 /L:D /Q")
+        .expect("default AUTOEXEC assigns the guest CD-ROM as D:");
+    let mouse_pos = autoexec_text
+        .find("LH TOKAMOUS")
+        .expect("default AUTOEXEC loads the mouse driver");
+    assert!(
+        izcdex_pos < mouse_pos,
+        "default AUTOEXEC installs IZCDEX before the mouse driver"
+    );
 
     // TOKAEMM.SYS ships on the payload and the default CONFIG.SYS
     // loads its 3 MB EMS pool with DOS=HIGH,UMB, so every default boot runs
@@ -80,6 +92,16 @@ fn extracts_the_embedded_image_payload() {
     assert!(
         config_text.contains("DOS=HIGH,UMB"),
         "default CONFIG.SYS uses the HMA + UMBs"
+    );
+    let umb_pos = config_text
+        .find("DOS=HIGH,UMB")
+        .expect("default CONFIG.SYS enables upper memory");
+    let tokacd_pos = config_text
+        .find("DEVICEHIGH=C:\\DOS\\TOKACD.SYS")
+        .expect("default CONFIG.SYS loads TOKACD high");
+    assert!(
+        umb_pos < tokacd_pos,
+        "default CONFIG.SYS enables upper memory before TOKACD"
     );
     assert!(
         config_text.contains("LASTDRIVE=D"),

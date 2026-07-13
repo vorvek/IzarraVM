@@ -6,7 +6,7 @@
 The Izarra 3000's bundled operating system: a rebranded, real **FreeDOS**. The
 kernel and shell are vendored FreeDOS source (see `freedos/VENDOR.md` for exact
 tags/commits and the local rebrand patches), built from source and packaged
-into a bootable FAT32 hard-disk image. There is no custom DOS clone here — the
+into a bootable FAT32 hard-disk image. There is no custom DOS clone here; the
 guest runs the genuine FreeDOS kernel and FreeCOM shell under the Izarra BIOS.
 
 The product banner reads "Toka-DOS 3.0"; the kernel reports DOS compatibility
@@ -14,28 +14,30 @@ The product banner reads "Toka-DOS 3.0"; the kernel reports DOS compatibility
 (XMS/UMB/EMS + the V86 monitor everything else runs under), and small guest
 tools like `TOKAMOUS.COM` (PS/2 mouse TSR) and `GSWMODE.COM` (runtime CPU-speed
 switch) are Izarra-specific additions layered on top of stock FreeDOS.
+`TOKACD.SYS` and `IZCDEX.COM` provide the guest-owned ATAPI and ISO 9660 CD-ROM
+stack for drive D:.
 
 ## Layout
 
-- `freedos/` vendored FreeDOS source trees (`kernel`, `freecom`, `move`, `sort`),
-  each with its own `.github`/build scripts from upstream plus the local
-  rebrand patches described in `freedos/VENDOR.md`.
+- `freedos/` vendored FreeDOS source trees plus the permissively licensed
+  SHSUCDX redirector, with upstream revisions and local patches recorded in
+  `freedos/VENDOR.md`.
 - `tools-src/` original (not vendored) Toka-DOS project tools, GPL-3, written
   from documented command-line behavior rather than ported from another
-  project — see `tools-src/README.md`.
+  project. See `tools-src/README.md`.
 - `tools/tokamous.asm` the INT 33h PS/2 mouse driver TSR (hand-written NASM,
   not vendored FreeDOS), assembled straight into `TOKAMOUS.COM`.
 - `build-freedos.ps1` the build script: builds the FreeDOS kernel + FreeCOM
   shell (Open Watcom cross-compile), builds `MOVE.EXE`/`SORT.EXE` from the
   vendored userland sources, assembles `TOKAMOUS.COM`, `TOKAEMM.SYS`, and
-  `GSWMODE.COM`, then invokes `scripts/build-freedos-hdd-image.py` to assemble
-  the committed disk image.
+  `TOKACD.SYS`, builds `IZCDEX.COM`, and invokes
+  `scripts/build-freedos-hdd-image.py` to assemble the committed disk image.
 
 Small standalone guest `.COM`/`.SYS` tools that aren't vendored FreeDOS source
 (`TOKAEMM.SYS`, `GSWMODE.COM`, and DOS test fixtures like `MOUSETST.COM`) live
 as NASM source + a committed built binary under
 `crates/izarravm-firmware/roms/dos/`, next to the other small DOS fixtures the
-firmware crate embeds — not under `toka-dos/`.
+firmware crate embeds, not under `toka-dos/`.
 
 ## Building
 
@@ -48,8 +50,8 @@ Requires Open Watcom (`D:\DevTools\OpenWatcom`) and NASM on PATH.
     pwsh toka-dos/build-freedos.ps1
 
 This builds `kernel.sys`, the FAT12/FAT32-LBA/MBR boot sectors, `command.com`,
-`MOVE.EXE`, `SORT.EXE`, `TOKAMOUS.COM`, `TOKAEMM.SYS`, and `GSWMODE.COM`, then
-runs `scripts/build-freedos-hdd-image.py` to assemble those into
+the DOS tools and drivers, `IZCDEX.COM`, and `GSWMODE.COM`, then runs
+`scripts/build-freedos-hdd-image.py` to assemble them into
 `crates/izarravm-firmware/roms/tokados-hdd.img`. At runtime,
 `crates/izarravm-machine/src/katea_volume.rs::extract_system_payload` parses
 that image and overlays every payload file except `HELLO.TXT`/`CONFIG.SYS`/
@@ -58,8 +60,24 @@ that image and overlays every payload file except `HELLO.TXT`/`CONFIG.SYS`/
 If the Open Watcom kernel/FreeCOM build artifacts are absent (e.g. a
 from-image rebuild after only touching `build-freedos-hdd-image.py` itself),
 the Python script falls back to re-extracting `KERNEL.SYS`/`COMMAND.COM`/
-`TOKAMOUS.COM` from the previously committed image, so the image can still be
-regenerated without a full Open Watcom rebuild.
+`TOKAMOUS.COM`/`IZCDEX.COM` from the previously committed image, so the image
+can still be regenerated without a full Open Watcom rebuild.
+
+## Default CD-ROM setup
+
+The stock `CONFIG.SYS` loads `TOKACD.SYS` high after TOKAEMM has enabled upper
+memory. `AUTOEXEC.BAT` then assigns D: with IZCDEX before loading the mouse
+driver. Host-folder installations upgrade each file only when its bytes match
+the immediately preceding stock version. Customized files are left alone. Add
+these lines manually when keeping a customized setup:
+
+    DEVICEHIGH=C:\DOS\TOKACD.SYS
+    IZCDEX /I /D:TOKACD01 /L:D /Q
+
+The first line belongs after `DOS=HIGH,UMB` in `CONFIG.SYS`; the second belongs
+after `SET BLASTER` and before `LH TOKAMOUS` in `AUTOEXEC.BAT`. BIOS Setup's
+Repair Toka-DOS command still backs up both files and restores the complete
+current defaults.
 
 ## Adding a new guest tool
 
@@ -73,7 +91,7 @@ regenerated without a full Open Watcom rebuild.
   which runs it as its last step) to regenerate and commit
   `tokados-hdd.img`.
 - A real FreeDOS/MS-DOS-4.0 userland tool: vendor its source under
-  `toka-dos/freedos/<tool>/` (see `freedos/VENDOR.md` for the pattern —
+  `toka-dos/freedos/<tool>/` (see `freedos/VENDOR.md` for the pattern,
   upstream tag/commit recorded, local patches noted per file), add a build
   step to `build-freedos.ps1` mirroring the existing `move`/`sort` steps, and
   wire the built binary into `build-freedos-hdd-image.py` the same way.

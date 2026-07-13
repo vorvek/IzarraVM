@@ -6,6 +6,36 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
+// Stock files from the release immediately before the guest CD-ROM stack. Keep
+// these exact: they are a one-version migration key, not configuration templates.
+pub(super) const PREVIOUS_STOCK_CONFIG_SYS: &[u8] = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n";
+pub(super) const PREVIOUS_STOCK_AUTOEXEC_BAT: &[u8] =
+    b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n\
+SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
+
+/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if absent. A file that
+/// byte-for-byte matches the immediately preceding stock version is upgraded to
+/// the current default. Every other existing file remains user-owned.
+pub(super) fn ensure_user_config(
+    dir: &std::path::Path,
+    config: &[u8],
+    autoexec: &[u8],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (name, previous, current) in [
+        ("CONFIG.SYS", PREVIOUS_STOCK_CONFIG_SYS, config),
+        ("AUTOEXEC.BAT", PREVIOUS_STOCK_AUTOEXEC_BAT, autoexec),
+    ] {
+        let path = dir.join(name);
+        if !path.exists() || std::fs::read(&path)? == previous {
+            std::fs::write(path, current)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ElToritoMedia {
     None,
@@ -172,6 +202,19 @@ impl Machine {
     /// drive's access LED; it advances on every data read the ATAPI device serves.
     pub fn cd_access_count(&self) -> u64 {
         self.cd_accesses
+    }
+
+    /// Bytes transferred through the secondary IDE/ATAPI data path. Host INT 2Fh
+    /// compatibility services do not affect this counter.
+    pub fn cd_pio_byte_count(&self) -> u64 {
+        self.cd_pio_bytes
+    }
+
+    /// Leave ATAPI PACKET commands unanswered. This is a guest-driver timeout
+    /// test seam; normal machines never enable it.
+    #[doc(hidden)]
+    pub fn set_test_cd_packet_stall(&mut self, enabled: bool) {
+        self.ide.set_test_stall_packet(enabled);
     }
 
     /// Mount a CD image into the ATAPI drive. The image is a parsed `CdImage`
@@ -360,6 +403,36 @@ impl Machine {
     /// Whether a disc is currently mounted in the ATAPI drive.
     pub fn cd_loaded(&self) -> bool {
         self.ide.device().is_loaded()
+    }
+
+    /// Live CD playback and guest mixer state for a host front panel.
+    pub fn cd_audio_state(&self) -> crate::CdAudioState {
+        let playback = self.ide.device().playback();
+        let (left_level, right_level) = self.mixer.cd_levels();
+        crate::CdAudioState {
+            media_present: self.ide.device().is_loaded(),
+            audio_capable: self.ide.device().audio_capable(),
+            playing: playback.playing,
+            paused: playback.paused,
+            left_level,
+            right_level,
+        }
+    }
+
+    /// Start the first audio track, or resume the current paused range. This is
+    /// a front-panel mutation and does not execute an ATAPI packet command.
+    pub fn cd_front_panel_play(&mut self) {
+        self.ide.device_mut().front_panel_play();
+    }
+
+    /// Stop CD audio without executing an ATAPI packet command.
+    pub fn cd_front_panel_stop(&mut self) {
+        self.ide.device_mut().front_panel_stop();
+    }
+
+    /// Set both guest-visible CT1745 CD levels to one linked raw value.
+    pub fn set_cd_linked_level(&mut self, level: u8) {
+        self.mixer.set_cd_levels(level, level);
     }
 
     pub(super) fn icdex_cd_drive_number(&self) -> Option<u8> {

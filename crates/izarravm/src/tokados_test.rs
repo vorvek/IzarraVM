@@ -23,5 +23,8 @@ fn boot_hdd(cycles: u64) -> (Machine, StopReason) {
 #[path = "tokados_katea_test.rs"]
 mod katea;
 
+#[path = "tokados_cd_test.rs"]
+mod cd;
+
 #[path = "tokados_tokaemm_test.rs"]
 mod tokaemm;

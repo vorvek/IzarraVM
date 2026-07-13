@@ -682,6 +682,103 @@ fn cd_audio_is_silent_with_the_volume_muted() {
 }
 
 #[test]
+fn front_panel_cd_controls_preserve_transport_sense_and_time() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(20));
+    machine.set_cd_linked_level(19);
+
+    let transport = machine.ide.transport_state_snapshot();
+    let ticks = machine.master_ticks();
+    machine.cd_front_panel_play();
+    assert!(machine.cd_audio_state().playing);
+    assert_eq!(machine.cd_audio_state().left_level, 19);
+    assert_eq!(machine.cd_audio_state().right_level, 19);
+    assert_eq!(machine.ide.transport_state_snapshot(), transport);
+    assert_eq!(machine.master_ticks(), ticks);
+
+    let transport = machine.ide.transport_state_snapshot();
+    machine.cd_front_panel_stop();
+    assert!(!machine.cd_audio_state().playing);
+    assert_eq!(machine.ide.transport_state_snapshot(), transport);
+    assert_eq!(machine.master_ticks(), ticks);
+}
+
+#[test]
+fn pending_guest_play_completed_after_host_stop_wins() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(20));
+    machine.cd_front_panel_play();
+
+    with_bus(&mut machine, |bus| {
+        bus.write_io(0x177, BusWidth::Byte, 0xa0, false).unwrap();
+    });
+    let accept = machine.ide.ticks_until_completion().unwrap();
+    machine.advance_devices_ticks(accept);
+    let mut play = [0u8; 12];
+    play[0] = 0x45;
+    play[5] = 2;
+    play[8] = 8;
+    with_bus(&mut machine, |bus| {
+        for byte in play {
+            bus.write_io(0x170, BusWidth::Byte, u32::from(byte), false)
+                .unwrap();
+        }
+    });
+    assert!(machine.ide.ticks_until_completion().is_some());
+    machine.cd_front_panel_stop();
+    assert!(!machine.cd_audio_state().playing);
+    while let Some(ticks) = machine.ide.ticks_until_completion() {
+        machine.advance_devices_ticks(ticks);
+    }
+    assert!(machine.cd_audio_state().playing);
+    assert_eq!(machine.ide.device().playback().current_lba, 2);
+}
+
+#[test]
+fn guest_eject_is_visible_in_live_cd_state() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(20));
+    assert!(machine.cd_audio_state().media_present);
+
+    let mut eject = [0u8; 12];
+    eject[0] = 0x1B;
+    eject[4] = 0x02;
+    timed_packet(&mut machine, eject);
+
+    assert!(!machine.cd_audio_state().media_present);
+    assert!(!machine.cd_audio_state().audio_capable);
+}
+
+#[test]
+fn cd_mixer_cursor_resets_on_epoch_but_not_pause_resume() {
+    let mut machine = test_machine();
+    machine.mount_cd(audio_cd(20));
+    machine.set_cd_linked_level(31);
+    machine.cd_front_panel_play();
+    let _ = machine.render_audio(100);
+    let before_pause = machine.cd_audio_sample;
+    assert!(before_pause > 0);
+
+    let mut pause = [0u8; 12];
+    pause[0] = 0x4B;
+    timed_packet(&mut machine, pause);
+    assert!(machine.cd_audio_state().paused);
+    let paused_epoch = machine.ide.device().playback_epoch();
+    let _ = machine.render_audio(100);
+    assert_eq!(machine.cd_audio_sample, before_pause);
+
+    machine.cd_front_panel_play();
+    assert_eq!(machine.ide.device().playback_epoch(), paused_epoch);
+    let _ = machine.render_audio(100);
+    assert!(machine.cd_audio_sample > before_pause);
+
+    machine.cd_front_panel_stop();
+    assert_ne!(machine.ide.device().playback_epoch(), paused_epoch);
+    let _ = machine.render_audio(1);
+    assert_eq!(machine.cd_audio_sample, 0);
+}
+
+#[test]
 fn icdex_install_check_reports_installed() {
     let mut machine = test_machine();
     // The probe pushes DADAh, then the INT pushed IP, CS, FLAGS over it, so

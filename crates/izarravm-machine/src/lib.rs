@@ -54,6 +54,19 @@ mod video_params;
 use timeline::{DeviceAdvance, DeviceRates, RatePhase, Timeline};
 use vega::Vega;
 
+/// Lightweight live state for the CD-ROM controls and status display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CdAudioState {
+    pub media_present: bool,
+    pub audio_capable: bool,
+    pub playing: bool,
+    pub paused: bool,
+    /// Raw CT1745 register `0x36` level (`0..=31`).
+    pub left_level: u8,
+    /// Raw CT1745 register `0x37` level (`0..=31`).
+    pub right_level: u8,
+}
+
 pub(crate) use ram_lookup::RamPageLookup;
 #[cfg(test)]
 pub(crate) use timing::PIT_INPUT_HZ;
@@ -830,8 +843,15 @@ pub struct Machine {
     // vs this) remains an install-layout decision.
     fat32_c: Option<Fat32Volume>,
     cd_accesses: u64,
+    // Bytes transferred through the secondary IDE data phases. Unlike
+    // cd_accesses, this excludes the legacy INT 2Fh compatibility path and lets
+    // guest-stack tests prove TOKACD reached the real ATAPI transport.
+    cd_pio_bytes: u64,
     // Fractional Red Book frames owed to the CD-audio mixer from the DAC clock.
     cd_audio_sample: usize,
+    // Playback generation observed by the audio mixer. Only a new range, stop,
+    // mount, or eject changes it; pause/resume keeps the intra-frame cursor.
+    cd_audio_epoch: u64,
     // MC146818 RTC and CMOS NVRAM at ports 0x70/0x71.
     rtc: rtc::Rtc,
     // Cosmetic POST pacing flag, read by the BIOS at port 0xE2. True (the
@@ -917,9 +937,9 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
 /// config files the user owns on C:.
 const USER_OWNED_OR_DEMO: &[&str] = &["HELLO.TXT", "CONFIG.SYS", "AUTOEXEC.BAT"];
 
-/// The payload files overlaid in user-folder mode: the binaries (KERNEL.SYS,
-/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM, TOKAEMM.SYS) but not the demo file
-/// or the user's CONFIG.SYS/AUTOEXEC.BAT.
+/// The payload files overlaid in user-folder mode: the kernel, shell, licenses,
+/// command-line tools, and drivers, but not the demo file or the user's
+/// `CONFIG.SYS`/`AUTOEXEC.BAT`.
 fn user_folder_overlay(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
     files
         .into_iter()
@@ -929,24 +949,6 @@ fn user_folder_overlay(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> 
                 .any(|d| name.eq_ignore_ascii_case(d))
         })
         .collect()
-}
-
-/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if they are absent, so the
-/// user always has real, editable copies. Existing files are left untouched (the
-/// user owns them). Case-insensitive on Windows, the supported host.
-fn ensure_user_config(
-    dir: &std::path::Path,
-    config: &[u8],
-    autoexec: &[u8],
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    if !dir.join("CONFIG.SYS").exists() {
-        std::fs::write(dir.join("CONFIG.SYS"), config)?;
-    }
-    if !dir.join("AUTOEXEC.BAT").exists() {
-        std::fs::write(dir.join("AUTOEXEC.BAT"), autoexec)?;
-    }
-    Ok(())
 }
 
 /// A payload file's bytes by 8.3 name. Panics if absent: the image is a committed
@@ -1137,7 +1139,9 @@ impl Machine {
             bmide: bmide::BusMasterIde::default(),
             fat32_c: None,
             cd_accesses: 0,
+            cd_pio_bytes: 0,
             cd_audio_sample: 0,
+            cd_audio_epoch: 0,
             rtc: rtc::Rtc::new(),
             fast_post: true,
             booter_inert: false,
@@ -1936,8 +1940,12 @@ impl Machine {
     fn pull_cd_audio_samples(&mut self, count: usize) -> Vec<(i32, i32)> {
         const SAMPLES_PER_FRAME: usize = crate::cdimage::RAW_SECTOR / 4; // 588
         let mut out = Vec::with_capacity(count);
-        if !self.ide.device().mixer_audio_active() {
+        let epoch = self.ide.device().playback_epoch();
+        if epoch != self.cd_audio_epoch {
+            self.cd_audio_epoch = epoch;
             self.cd_audio_sample = 0;
+        }
+        if !self.ide.device().mixer_audio_active() {
             return out;
         }
         let [left_volume, right_volume] = self.ide.device().audio_volume();

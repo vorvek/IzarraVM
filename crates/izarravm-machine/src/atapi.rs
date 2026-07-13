@@ -19,7 +19,7 @@
 //! SUB-CHANNEL. IDENTIFY PACKET DEVICE is answered by the register file directly
 //! since it is an ATA command, not a packet command.
 
-use crate::cdimage::{CdImage, DATA_SECTOR, lba_to_msf, msf_to_lba};
+use crate::cdimage::{CdImage, DATA_SECTOR, FRAMES_PER_SEC, lba_to_msf, msf_to_lba};
 
 /// 12x CD-ROM transfer ceiling reported by MODE SENSE: about 1800 KB/s.
 pub const CD_BYTES_PER_SEC: f64 = 1_800.0 * 1024.0;
@@ -102,6 +102,10 @@ pub struct AtapiDevice {
     image: Option<CdImage>,
     play: Playback,
     mixer_lba: Option<u32>,
+    /// Changes whenever playback begins a new range or is explicitly stopped,
+    /// and whenever media changes. The machine mixer uses this to reset its
+    /// intra-sector sample cursor without treating pause/resume as a restart.
+    playback_epoch: u64,
     /// Latched sense: (key, asc, ascq). REQUEST SENSE returns and clears it.
     sense_key: u8,
     asc: u8,
@@ -150,6 +154,7 @@ impl AtapiDevice {
         self.started = false;
         self.play = Playback::default();
         self.mixer_lba = None;
+        self.bump_playback_epoch();
         self.set_sense(
             sense_key::UNIT_ATTENTION,
             asc::MEDIUM_MAY_HAVE_CHANGED.0,
@@ -162,8 +167,10 @@ impl AtapiDevice {
         self.image = None;
         self.media_changed = true;
         self.started = false;
+        self.prevent_removal = false;
         self.play = Playback::default();
         self.mixer_lba = None;
+        self.bump_playback_epoch();
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -176,6 +183,84 @@ impl AtapiDevice {
 
     pub fn playback(&self) -> Playback {
         self.play
+    }
+
+    pub(crate) fn audio_capable(&self) -> bool {
+        self.image
+            .as_ref()
+            .is_some_and(|image| image.tracks().iter().any(|track| track.mode.is_audio()))
+    }
+
+    pub(crate) fn playback_epoch(&self) -> u64 {
+        self.playback_epoch
+    }
+
+    /// Start or resume playback from the drive's front panel. This changes only
+    /// playback state and never passes through the packet-command interpreter.
+    pub(crate) fn front_panel_play(&mut self) {
+        if self.play.paused {
+            self.play.paused = false;
+            self.play.playing = self.play.current_lba < self.play.end_lba;
+            return;
+        }
+        let Some((start, end)) = self.image.as_ref().and_then(|image| {
+            image
+                .tracks()
+                .iter()
+                .find(|track| track.mode.is_audio())
+                .map(|track| (track.start_lba, image.total_sectors()))
+        }) else {
+            return;
+        };
+        self.set_play_range(start, end);
+    }
+
+    /// Stop playback from the drive's front panel without executing a CDB.
+    pub(crate) fn front_panel_stop(&mut self) {
+        self.stop_playback();
+    }
+
+    fn bump_playback_epoch(&mut self) {
+        self.playback_epoch = self.playback_epoch.wrapping_add(1);
+    }
+
+    fn set_play_range(&mut self, start: u32, end: u32) {
+        self.play = Playback {
+            playing: start < end,
+            paused: false,
+            current_lba: start,
+            end_lba: end,
+        };
+        self.mixer_lba = (start < end).then_some(start);
+        self.bump_playback_epoch();
+    }
+
+    fn stop_playback(&mut self) {
+        self.play.stop();
+        self.mixer_lba = None;
+        self.bump_playback_epoch();
+    }
+
+    fn interrupt_audio_for_head_movement(&mut self) {
+        if self.play.playing || self.play.paused {
+            self.stop_playback();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn non_playback_state_snapshot(&self) -> String {
+        format!(
+            "{}:{}:{}:{:?}:{}:{}:{}:{}:{:?}",
+            self.sense_key,
+            self.asc,
+            self.ascq,
+            self.sense_information,
+            self.media_changed,
+            self.prevent_removal,
+            self.started,
+            self.interrupt_reason,
+            self.audio_volume
+        )
     }
 
     // Limit: these two tray/spin queries feed ide.rs (status port), which does
@@ -447,12 +532,14 @@ impl AtapiDevice {
     }
 
     /// PREVENT/ALLOW MEDIUM REMOVAL (0x1E). Byte 4 bit 0 latches the prevent flag,
-    /// locking the tray against an eject. NOT READY when the drive is empty.
+    /// locking the tray against an eject. Locking an empty drive reports NOT READY,
+    /// but an unlock always succeeds so reset software can clear a stale latch.
     fn prevent_allow_removal(&mut self, cdb: &[u8; 12]) -> CmdResult {
-        if self.image.is_none() {
+        let prevent = cdb[4] & 0x01 != 0;
+        if prevent && self.image.is_none() {
             return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
         }
-        self.prevent_removal = cdb[4] & 0x01 != 0;
+        self.prevent_removal = prevent;
         CmdResult::Data(Vec::new())
     }
 
@@ -558,6 +645,7 @@ impl AtapiDevice {
         if lba >= image.total_sectors() {
             return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
         }
+        self.interrupt_audio_for_head_movement();
         CmdResult::Data(Vec::new())
     }
 
@@ -607,6 +695,7 @@ impl AtapiDevice {
                 None => return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB),
             }
         }
+        self.interrupt_audio_for_head_movement();
         CmdResult::Data(buf)
     }
 
@@ -757,19 +846,23 @@ impl AtapiDevice {
     }
 
     fn start_play(&mut self, start: u32, end: u32) -> CmdResult {
-        if self.image.is_none() {
+        let Some(image) = self.image.as_ref() else {
             return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
-        }
-        if end < start {
+        };
+        if end < start || end > image.total_sectors() {
             return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
         }
-        self.play = Playback {
-            playing: start < end,
-            paused: false,
-            current_lba: start,
-            end_lba: end,
-        };
-        self.mixer_lba = (start < end).then_some(start);
+        let mut lba = start;
+        while lba < end {
+            let Some(track) = image.track_at_lba(lba) else {
+                return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+            };
+            if !track.mode.is_audio() {
+                return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+            }
+            lba = track.end_lba().min(end);
+        }
+        self.set_play_range(start, end);
         CmdResult::Data(Vec::new())
     }
 
@@ -789,8 +882,7 @@ impl AtapiDevice {
     }
 
     fn stop_audio(&mut self) -> CmdResult {
-        self.play.stop();
-        self.mixer_lba = None;
+        self.stop_playback();
         CmdResult::Data(Vec::new())
     }
 
@@ -815,19 +907,23 @@ impl AtapiDevice {
         if subq && format == 0x01 {
             // CURRENT POSITION data block (12 bytes).
             let lba = self.play.current_lba;
-            let track = self
-                .image
-                .as_ref()
-                .and_then(|i| i.track_at_lba(lba))
-                .map(|t| t.number)
-                .unwrap_or(1);
+            let track = self.image.as_ref().and_then(|image| {
+                image.track_at_lba(lba).or_else(|| {
+                    image
+                        .tracks()
+                        .iter()
+                        .rev()
+                        .find(|track| track.start_lba <= lba)
+                })
+            });
             let mut block = vec![0u8; 12];
             block[0] = 0x01; // sub-channel data format code
-            block[1] = 0x10; // ADR=1, control=data/audio (audio here)
-            block[2] = track;
+            block[1] = track_control(track.is_some_and(|track| track.mode.is_audio()));
+            block[2] = track.map_or(1, |track| track.number);
             block[3] = 1; // index
             put_addr(&mut block[4..8], lba, msf); // absolute address
-            put_addr(&mut block[8..12], lba, msf); // track-relative (approx)
+            let relative_lba = track.map_or(lba, |track| lba.saturating_sub(track.start_lba));
+            put_relative_addr(&mut block[8..12], relative_lba, msf);
             buf.extend_from_slice(&block);
         }
         let data_len = (buf.len() - 2) as u16;
@@ -866,6 +962,19 @@ fn put_addr(out: &mut [u8], lba: u32, msf: bool) {
         out[3] = f;
     } else {
         out.copy_from_slice(&lba.to_be_bytes());
+    }
+}
+
+/// Write a track-relative address. Unlike an absolute MSF address, this has no
+/// 150-frame lead-in offset.
+fn put_relative_addr(out: &mut [u8], frames: u32, msf: bool) {
+    if msf {
+        out[0] = 0;
+        out[1] = (frames / (FRAMES_PER_SEC * 60)) as u8;
+        out[2] = ((frames / FRAMES_PER_SEC) % 60) as u8;
+        out[3] = (frames % FRAMES_PER_SEC) as u8;
+    } else {
+        out.copy_from_slice(&frames.to_be_bytes());
     }
 }
 

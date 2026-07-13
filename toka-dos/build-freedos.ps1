@@ -321,6 +321,25 @@ if ($LASTEXITCODE) { throw "nasm tokaemm failed" }
 if (-not (Test-Path $tokaemmOut)) { throw "TOKAEMM.SYS not produced" }
 Write-Host "TOKAEMM.SYS: $((Get-Item $tokaemmOut).Length) bytes"
 
+# --- TOKACD (Toka-DOS driver for Izarra's fixed ATAPI CD-ROM) ---
+$tokacdSrc = Join-Path $tokaemmDir 'tokacd.asm'
+$tokacdOut = Join-Path $tokaemmDir 'tokacd.sys'
+& nasm -f bin $tokacdSrc -o $tokacdOut
+if ($LASTEXITCODE) { throw "nasm tokacd failed" }
+if (-not (Test-Path $tokacdOut)) { throw "TOKACD.SYS not produced" }
+Write-Host "TOKACD.SYS: $((Get-Item $tokacdOut).Length) bytes"
+
+# --- IZCDEX (8086 SHSUCDX build, minimally rebranded for Toka-DOS) ---
+$izcdexDir = Join-Path $fd 'shsucd'
+$izcdexOut = Join-Path $root 'build-freedos-izcdex.com'
+Push-Location $izcdexDir
+try {
+    & nasm -O9 -Di8086 -o $izcdexOut shsucdx.nsm
+    if ($LASTEXITCODE) { throw "nasm izcdex failed" }
+} finally { Pop-Location }
+if (-not (Test-Path $izcdexOut)) { throw "IZCDEX.COM not produced" }
+Write-Host "IZCDEX.COM: $((Get-Item $izcdexOut).Length) bytes"
+
 # --- GSWMODE (runtime CPU-speed switch via Lotura port 0xE1; committed source
 # lives in the firmware crate alongside the other small DOS .COM fixtures) ---
 $gswmodeSrc = Join-Path $root '..\crates\izarravm-firmware\roms\dos\gswmode.asm'
