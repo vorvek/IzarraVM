@@ -1400,6 +1400,10 @@ impl CpuGsw {
         let ds_flat = self.jit_segment_flat(SegmentIndex::Ds);
         let ds_readable = self.jit_segment_readable(SegmentIndex::Ds);
         let ds_writable = self.jit_segment_writable(SegmentIndex::Ds);
+        // CpuGsw can move while an installed region survives. Capture the view from the running
+        // instance on every entry, before `jit_regions` is mutably borrowed, and keep it valid only
+        // for the native call below.
+        let compiled_tlb = self.tlb.compiled_view();
         let step_fn = jit::step::region_step::<B> as jit::step::RegionStepFn;
         let (entry, ctx_ptr) = {
             let Some(region) = self.jit_regions.get_mut(idx) else {
@@ -1494,6 +1498,7 @@ impl CpuGsw {
                 )
             });
             ctx.native_u8_fn = Some(jit::step::region_native_u8::<B> as jit::step::NativeU8Fn);
+            ctx.compiled_tlb = compiled_tlb;
             ctx.native_group_guard_fn =
                 Some(jit::step::region_native_group_guard::<B> as jit::step::NativeGroupGuardFn);
             ctx.native_group_finish_fn =

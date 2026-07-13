@@ -1138,6 +1138,16 @@ fn pg_arm(esi: u32, edi: u32) -> impl Fn(&mut CpuGsw) {
     }
 }
 
+fn arm_single_paged_copy(cpu: &mut CpuGsw, bus: &mut TestBus, data_phys: usize, value: u8) {
+    pg_arm(PG_SRC_LIN, PG_DST_LIN)(cpu);
+    cpu.halted = false;
+    let count = data_phys + (PG_COUNT_LIN - PG_DATA_LIN) as usize;
+    let destination = data_phys + (PG_DST_LIN - PG_DATA_LIN) as usize;
+    bus.memory[count..count + 4].copy_from_slice(&1u32.to_le_bytes());
+    bus.memory[data_phys] = value;
+    bus.memory[destination] = 0;
+}
+
 /// A 200-iteration byte copy under NON-IDENTITY paging stays byte-identical (state + timing)
 /// between the interpreter and the auto-admitting JIT, and the JIT runs a real paged region.
 /// This is the gating harness for the Round 3 paged memory probe: a probe that indexes the
@@ -1743,7 +1753,7 @@ fn native_paged_copy_loop_is_exact_in_all_modes() {
         GswMode::Gsw386,
         GswMode::Gsw386Slow,
     ] {
-        let (interp, _) = assert_native_memory_identical(
+        let (interp, jit_cpu) = assert_native_memory_identical(
             mode,
             paged_copy_program(200),
             &pg_arm(PG_SRC_LIN, PG_DST_LIN),
@@ -1755,7 +1765,76 @@ fn native_paged_copy_loop_is_exact_in_all_modes() {
             interp.is_paging_enabled(),
             "{mode:?} must keep paging enabled"
         );
+        assert!(
+            jit_cpu.perf_counters().jit_region_entries > 0,
+            "{mode:?} must enter the forced paged native region"
+        );
+        assert!(
+            jit_cpu.perf_counters().jit_paged_tlb_successes > 0,
+            "{mode:?} must complete a native TLB probe"
+        );
     }
+}
+
+#[test]
+fn native_paged_view_refreshes_after_tlb_flush_and_cpu_swap() {
+    const ALT_DATA_PHYS: usize = 0x0000_a000;
+    let data_pte = 0x2000 + (PG_DATA_LIN as usize >> 12) * 4;
+
+    let image_a = paged_copy_program(1);
+    let mut image_b = image_a.clone();
+    let data_page = image_b[PG_DATA_PHYS..PG_DATA_PHYS + 0x1000].to_vec();
+    image_b[ALT_DATA_PHYS..ALT_DATA_PHYS + 0x1000].copy_from_slice(&data_page);
+    image_b[data_pte..data_pte + 4]
+        .copy_from_slice(&((ALT_DATA_PHYS as u32) | 0x007).to_le_bytes());
+
+    let mut cpu_a = fresh_for(GswMode::Gsw586);
+    let mut cpu_b = fresh_for(GswMode::Gsw586);
+    let mut bus_a = TestBus::with_memory(image_a);
+    let mut bus_b = TestBus::with_memory(image_b);
+    bus_a.direct_pages_enabled = true;
+    bus_b.direct_pages_enabled = true;
+
+    for (cpu, bus) in [(&mut cpu_a, &mut bus_a), (&mut cpu_b, &mut bus_b)] {
+        pg_arm(PG_SRC_LIN, PG_DST_LIN)(cpu);
+        drive_to_halt(cpu, bus);
+        let index = jit::block::try_admit(cpu, PG_ENTRY_LIN, true).expect("admit paged copy loop");
+        cpu.decode_cache.stamp_region(PG_ENTRY_LIN, true, index);
+    }
+
+    arm_single_paged_copy(&mut cpu_a, &mut bus_a, PG_DATA_PHYS, 0x5a);
+    arm_single_paged_copy(&mut cpu_b, &mut bus_b, ALT_DATA_PHYS, 0xc3);
+    drive_to_halt(&mut cpu_a, &mut bus_a);
+    drive_to_halt(&mut cpu_b, &mut bus_b);
+    assert!(cpu_a.perf_counters().jit_region_entries > 0);
+    assert!(cpu_b.perf_counters().jit_region_entries > 0);
+
+    cpu_a.tlb.flush();
+    cpu_b.tlb.flush();
+    cpu_a
+        .tlb
+        .insert(PG_DATA_LIN >> 12, PG_DATA_PHYS as u32, true, true, true);
+    cpu_b
+        .tlb
+        .insert(PG_DATA_LIN >> 12, ALT_DATA_PHYS as u32, true, true, true);
+    arm_single_paged_copy(&mut cpu_a, &mut bus_a, PG_DATA_PHYS, 0x5a);
+    arm_single_paged_copy(&mut cpu_b, &mut bus_b, ALT_DATA_PHYS, 0xc3);
+    cpu_a.reset_perf_counters();
+    cpu_b.reset_perf_counters();
+
+    std::mem::swap(&mut cpu_a, &mut cpu_b);
+    std::mem::swap(&mut bus_a, &mut bus_b);
+    drive_to_halt(&mut cpu_a, &mut bus_a);
+    drive_to_halt(&mut cpu_b, &mut bus_b);
+
+    let alt_destination = ALT_DATA_PHYS + (PG_DST_LIN - PG_DATA_LIN) as usize;
+    let base_destination = PG_DATA_PHYS + (PG_DST_LIN - PG_DATA_LIN) as usize;
+    assert_eq!(bus_a.memory[alt_destination], 0xc3);
+    assert_eq!(bus_b.memory[base_destination], 0x5a);
+    assert!(cpu_a.perf_counters().jit_region_entries > 0);
+    assert!(cpu_b.perf_counters().jit_region_entries > 0);
+    assert!(cpu_a.perf_counters().jit_paged_tlb_successes > 0);
+    assert!(cpu_b.perf_counters().jit_paged_tlb_successes > 0);
 }
 
 #[test]
