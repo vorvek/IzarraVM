@@ -124,6 +124,9 @@ pub struct IdeChannel {
     read_lba: u32,
     /// Bytes moved by the last data command, for the access LED.
     last_access_bytes: usize,
+    /// Test seam that leaves PACKET commands unanswered so guest timeout paths
+    /// can run against a present drive.
+    test_stall_packet: bool,
 }
 
 impl Default for IdeChannel {
@@ -155,6 +158,7 @@ impl Default for IdeChannel {
             head_lba: 0,
             read_lba: 0,
             last_access_bytes: 0,
+            test_stall_packet: false,
         }
     }
 }
@@ -176,6 +180,43 @@ impl IdeChannel {
 
     pub fn device_mut(&mut self) -> &mut AtapiDevice {
         &mut self.device
+    }
+
+    pub(crate) fn set_test_stall_packet(&mut self, enabled: bool) {
+        self.test_stall_packet = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transport_state_snapshot(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:?}:{}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}",
+            self.features,
+            self.sector_count,
+            self.lba_low,
+            self.lba_mid,
+            self.lba_high,
+            self.drive_select,
+            self.status,
+            self.error,
+            self.phase,
+            self.interrupts_disabled,
+            self.packet,
+            self.packet_filled,
+            self.data_in_pos,
+            self.data_in_block_end,
+            self.data_in,
+            self.data_in_ready_end,
+            self.data_out_expected,
+            self.data_out_block_end,
+            self.byte_count_limit,
+            self.irq_pending,
+            self.head_lba,
+            self.read_lba,
+            self.last_access_bytes,
+            self.data_out.len(),
+            self.pending_command,
+            self.device.non_playback_state_snapshot()
+        )
     }
 
     /// Whether the master device is selected (drive bit 4 == 0).
@@ -342,6 +383,7 @@ impl IdeChannel {
             return;
         }
         match command {
+            0xA0 if self.test_stall_packet => {}
             0xA0 => self.schedule(PendingAction::AcceptPacket, PACKET_ACCEPT_TICKS),
             0xA1 => self.schedule(PendingAction::PrepareIdentify, COMMAND_LATENCY_TICKS),
             0x08 => self.schedule(PendingAction::DeviceReset, COMMAND_LATENCY_TICKS),

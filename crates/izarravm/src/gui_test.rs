@@ -56,6 +56,69 @@ fn volume_gain_is_cubic_and_clamped() {
 }
 
 #[test]
+fn cd_volume_mapping_links_live_stereo_levels() {
+    assert_eq!(cd_level_percent(0, 0), 0);
+    assert_eq!(cd_level_percent(31, 31), 100);
+    assert_eq!(cd_level_percent(31, 0), 50);
+    assert_eq!(cd_percent_level(0), 0);
+    assert_eq!(cd_percent_level(100), 31);
+    assert_eq!(cd_percent_level(50), 16);
+}
+
+#[test]
+fn cd_mount_session_remounts_on_reset_and_clears_on_eject_or_stop() {
+    let source = CdSource::Image(PathBuf::from("disc.cue"));
+    let mut session = CdMountSession::default();
+    session.remember("disc.cue".to_string(), source.clone());
+
+    let reset_source = session.begin_reset();
+    assert_eq!(reset_source, Some(source.clone()));
+    assert_eq!(session.source, Some(source.clone()));
+    assert_eq!(session.label, None);
+
+    session.remember("disc.cue".to_string(), reset_source.unwrap());
+    assert_eq!(session.label.as_deref(), Some("disc.cue"));
+    session.clear();
+    assert_eq!(session, CdMountSession::default());
+}
+
+#[test]
+fn cd_eject_uses_live_media_state_instead_of_a_host_label() {
+    let loaded = CdAudioState {
+        media_present: true,
+        ..CdAudioState::default()
+    };
+    assert!(cd_eject_enabled(true, loaded));
+    assert!(!cd_eject_enabled(false, loaded));
+    assert!(!cd_eject_enabled(true, CdAudioState::default()));
+}
+
+#[test]
+fn queued_cd_commands_apply_in_channel_order() {
+    let mut rom = vec![0u8; izarravm_machine::BIOS_ROM_SIZE];
+    rom[0xFFF0..0xFFF5].copy_from_slice(&[0xEA, 0x00, 0x00, 0x00, 0xF0]);
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(1, izarravm_core::VideoCard::Vega),
+        rom,
+    )
+    .unwrap();
+    let cue = "TRACK 01 AUDIO\nINDEX 01 00:00:00\n";
+    let image = izarravm_machine::CdImage::from_cue(cue, vec![0; 4 * 2352]).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    sender.send(Command::MountCd(image)).unwrap();
+    sender.send(Command::CdLinkedLevel(18)).unwrap();
+    sender.send(Command::CdPlay).unwrap();
+    sender.send(Command::CdStop).unwrap();
+
+    while let Ok(command) = receiver.try_recv() {
+        assert!(apply_cd_fifo_command(&mut machine, command).is_none());
+    }
+    assert!(!machine.cd_audio_state().playing);
+    assert_eq!(machine.cd_audio_state().left_level, 18);
+    assert_eq!(machine.cd_audio_state().right_level, 18);
+}
+
+#[test]
 fn refill_credit_clamps_a_stall() {
     let cap = MASTER_CLOCK_HZ / 20;
     // From empty, a normal ~15 ms slice yields its full wall-time worth.

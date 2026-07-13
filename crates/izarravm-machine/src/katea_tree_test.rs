@@ -323,11 +323,13 @@ fn walks_a_host_folder_into_a_tree_metadata_only_skipping_non_files() {
     fs::create_dir_all(root.join("GAMES/HELLO")).unwrap();
     fs::write(root.join("GAMES/HELLO/HELLO.COM"), vec![0u8; 600]).unwrap();
 
-    // Two in-memory "system" files overlaid (as mount does): KERNEL.SYS stays at
-    // the root, COMMAND.COM is relocated into the synthetic C:\DOS folder.
+    // In-memory "system" files overlaid as mount does: KERNEL.SYS stays at the
+    // root, while executables and drivers move into the synthetic C:\DOS folder.
     let sys = vec![
         ("KERNEL.SYS".to_string(), vec![0xEBu8; 70]),
         ("COMMAND.COM".to_string(), vec![0u8; 50]),
+        ("TOKACD.SYS".to_string(), vec![0u8; 51]),
+        ("IZCDEX.COM".to_string(), vec![0u8; 52]),
     ];
     let tree = build_tree(&root, &sys);
 
@@ -335,15 +337,17 @@ fn walks_a_host_folder_into_a_tree_metadata_only_skipping_non_files() {
     assert_eq!(tree.root.files.len(), 2, "KERNEL.SYS + hello.txt");
     assert_eq!(&tree.root.files[0].name, b"KERNEL  SYS");
     assert_eq!(tree.root.subdirs.len(), 2, "DOS + GAMES");
-    // COMMAND.COM lives in the synthetic DOS folder, not the root.
+    // The DOS binaries live in the synthetic folder, not the root.
     let dos = tree
         .root
         .subdirs
         .iter()
         .find(|s| &s.name == b"DOS        ")
         .expect("a synthetic DOS subdir");
-    assert_eq!(dos.dir.files.len(), 1);
+    assert_eq!(dos.dir.files.len(), 3);
     assert_eq!(&dos.dir.files[0].name, b"COMMAND COM");
+    assert_eq!(&dos.dir.files[1].name, b"TOKACD  SYS");
+    assert_eq!(&dos.dir.files[2].name, b"IZCDEX  COM");
     assert!(
         !tree.root.files.iter().any(|f| &f.name == b"COMMAND COM"),
         "COMMAND.COM is not left at the root"

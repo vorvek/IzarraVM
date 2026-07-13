@@ -104,6 +104,24 @@ fn first_ready_after_insert_is_unit_attention_then_clears() {
 }
 
 #[test]
+fn replacing_media_raises_unit_attention_and_reads_the_new_disc() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(2));
+    let _ = dev.execute(&cdb(0x00));
+    let mut read = cdb(0x28);
+    read[8] = 1;
+    assert_eq!(data(dev.execute(&read))[0], 0x40);
+
+    let mut replacement = vec![0u8; 2 * DATA_SECTOR];
+    replacement[0] = 0xA7;
+    dev.insert(CdImage::from_iso(replacement).unwrap());
+    assert!(matches!(dev.execute(&cdb(0x00)), CmdResult::Error));
+    assert_eq!(dev.sense_key, sense_key::UNIT_ATTENTION);
+    assert!(matches!(dev.execute(&cdb(0x00)), CmdResult::Data(_)));
+    assert_eq!(data(dev.execute(&read))[0], 0xA7);
+}
+
+#[test]
 fn request_sense_returns_then_clears_latched_sense() {
     let mut dev = AtapiDevice::new();
     // No medium -> latch NOT READY.
@@ -130,6 +148,47 @@ fn audio_disc() -> CdImage {
 }
 
 #[test]
+fn front_panel_play_uses_first_audio_track_and_epoch_skips_resume() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(audio_disc());
+    let mounted_epoch = dev.playback_epoch();
+
+    dev.front_panel_play();
+    let started = dev.playback();
+    assert!(started.playing);
+    assert_eq!(started.current_lba, 1);
+    assert_eq!(started.end_lba, 101);
+    assert_ne!(dev.playback_epoch(), mounted_epoch);
+
+    let mut pause = cdb(0x4B);
+    assert!(matches!(dev.execute(&pause), CmdResult::Data(_)));
+    let paused_epoch = dev.playback_epoch();
+    assert!(dev.playback().paused);
+    dev.front_panel_play();
+    assert!(dev.playback().playing);
+    assert_eq!(dev.playback_epoch(), paused_epoch);
+
+    pause[8] = 1;
+    assert!(matches!(dev.execute(&pause), CmdResult::Data(_)));
+    assert_eq!(dev.playback_epoch(), paused_epoch);
+    dev.front_panel_stop();
+    assert!(!dev.playback().playing);
+    assert!(!dev.playback().paused);
+    assert_ne!(dev.playback_epoch(), paused_epoch);
+}
+
+#[test]
+fn front_panel_play_ignores_data_only_media() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(8));
+    let epoch = dev.playback_epoch();
+    assert!(!dev.audio_capable());
+    dev.front_panel_play();
+    assert_eq!(dev.playback(), Playback::default());
+    assert_eq!(dev.playback_epoch(), epoch);
+}
+
+#[test]
 fn play_audio_arms_playback_and_streams_frames() {
     let mut dev = AtapiDevice::new();
     dev.insert(audio_disc());
@@ -149,6 +208,23 @@ fn play_audio_arms_playback_and_streams_frames() {
     }
     assert_eq!(frames, 4);
     assert!(!dev.playback().playing);
+}
+
+#[test]
+fn play_audio_rejects_data_and_ranges_past_capacity() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(8));
+    let mut data_play = cdb(0x45);
+    data_play[8] = 1;
+    assert!(matches!(dev.execute(&data_play), CmdResult::Error));
+    assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+
+    dev.insert(audio_disc());
+    let mut past_end = cdb(0x45);
+    past_end[5] = 100;
+    past_end[8] = 2;
+    assert!(matches!(dev.execute(&past_end), CmdResult::Error));
+    assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
 }
 
 #[test]
@@ -189,6 +265,30 @@ fn read_subchannel_reports_audio_status() {
     c[8] = 48;
     let buf = data(dev.execute(&c));
     assert_eq!(buf[1], 0x11); // audio play in progress
+}
+
+#[test]
+fn read_subchannel_reports_track_control_and_relative_address() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(audio_disc());
+
+    let mut current = cdb(0x42);
+    current[1] = 0x02; // MSF
+    current[2] = 0x40; // SubQ
+    current[3] = 0x01; // current position format
+    current[8] = 16;
+    let buf = data(dev.execute(&current));
+    assert_eq!(buf[5], 0x14); // ADR=1, data control at LBA 0
+
+    let mut play = cdb(0x45);
+    play[5] = 1;
+    play[8] = 10;
+    let _ = dev.execute(&play);
+    let buf = data(dev.execute(&current));
+    assert_eq!(buf[5], 0x10); // ADR=1, audio control
+    assert_eq!(buf[6], 2);
+    assert_eq!(&buf[8..12], &[0, 0, 2, 1]); // absolute 00:02:01
+    assert_eq!(&buf[12..16], &[0, 0, 0, 0]); // start of track 2
 }
 
 #[test]
@@ -262,9 +362,11 @@ fn prevent_allow_latches_the_flag() {
 }
 
 #[test]
-fn prevent_allow_not_ready_when_empty() {
+fn prevent_is_not_ready_when_empty() {
     let mut dev = AtapiDevice::new();
-    assert!(matches!(dev.execute(&cdb(0x1E)), CmdResult::Error));
+    let mut prevent = cdb(0x1E);
+    prevent[4] = 1;
+    assert!(matches!(dev.execute(&prevent), CmdResult::Error));
     assert_eq!(dev.sense_key, sense_key::NOT_READY);
 }
 
@@ -318,6 +420,26 @@ fn seek_in_range_succeeds_with_no_data() {
     c[5] = 4; // LBA 4, in range
     let buf = data(dev.execute(&c));
     assert!(buf.is_empty());
+}
+
+#[test]
+fn successful_seek_and_read_interrupt_audio() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(audio_disc());
+    let mut play = cdb(0x45);
+    play[5] = 1;
+    play[8] = 10;
+    let _ = dev.execute(&play);
+
+    let seek = cdb(0x2B);
+    assert!(matches!(dev.execute(&seek), CmdResult::Data(_)));
+    assert!(!dev.playback().playing && !dev.playback().paused);
+
+    let _ = dev.execute(&play);
+    let mut read = cdb(0x28);
+    read[8] = 1;
+    assert!(matches!(dev.execute(&read), CmdResult::Data(_)));
+    assert!(!dev.playback().playing && !dev.playback().paused);
 }
 
 #[test]
@@ -553,6 +675,25 @@ fn mode_sense10_page_0e_reports_audio_volume() {
     // Default power-up volume is full on both output ports.
     assert_eq!(page[9], 0xFF, "port 0 volume full");
     assert_eq!(page[11], 0xFF, "port 1 volume full");
+}
+
+#[test]
+fn allow_medium_removal_clears_a_stale_lock_without_media() {
+    let mut dev = AtapiDevice::new();
+    dev.insert(data_disc(4));
+
+    let mut prevent = [0u8; 12];
+    prevent[0] = 0x1E;
+    prevent[4] = 1;
+    assert!(matches!(dev.execute(&prevent), CmdResult::Data(_)));
+    assert!(dev.removal_prevented());
+
+    dev.eject();
+    assert!(!dev.removal_prevented());
+    let mut allow = prevent;
+    allow[4] = 0;
+    assert!(matches!(dev.execute(&allow), CmdResult::Data(_)));
+    assert!(!dev.removal_prevented());
 }
 
 #[test]

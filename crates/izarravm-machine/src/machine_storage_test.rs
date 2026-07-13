@@ -185,6 +185,52 @@ fn ensure_user_config_seeds_missing_files_only() {
 }
 
 #[test]
+fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
+    let base = std::env::temp_dir().join(format!("katea_cfg_upgrade_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let new_config = b"new config\r\n";
+    let new_autoexec = b"new autoexec\r\n";
+
+    let config_only = base.join("config_only");
+    std::fs::create_dir_all(&config_only).unwrap();
+    std::fs::write(
+        config_only.join("CONFIG.SYS"),
+        super::PREVIOUS_STOCK_CONFIG_SYS,
+    )
+    .unwrap();
+    std::fs::write(config_only.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
+    super::ensure_user_config(&config_only, new_config, new_autoexec).unwrap();
+    assert_eq!(
+        std::fs::read(config_only.join("CONFIG.SYS")).unwrap(),
+        new_config
+    );
+    assert_eq!(
+        std::fs::read(config_only.join("AUTOEXEC.BAT")).unwrap(),
+        b"@ECHO OFF\r\nMYGAME\r\n"
+    );
+
+    let autoexec_only = base.join("autoexec_only");
+    std::fs::create_dir_all(&autoexec_only).unwrap();
+    std::fs::write(autoexec_only.join("CONFIG.SYS"), b"FILES=41\r\n").unwrap();
+    std::fs::write(
+        autoexec_only.join("AUTOEXEC.BAT"),
+        super::PREVIOUS_STOCK_AUTOEXEC_BAT,
+    )
+    .unwrap();
+    super::ensure_user_config(&autoexec_only, new_config, new_autoexec).unwrap();
+    assert_eq!(
+        std::fs::read(autoexec_only.join("CONFIG.SYS")).unwrap(),
+        b"FILES=41\r\n"
+    );
+    assert_eq!(
+        std::fs::read(autoexec_only.join("AUTOEXEC.BAT")).unwrap(),
+        new_autoexec
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
 fn user_folder_overlay_keeps_binaries_drops_config() {
     let payload = vec![
         ("KERNEL.SYS".to_string(), vec![1u8]),

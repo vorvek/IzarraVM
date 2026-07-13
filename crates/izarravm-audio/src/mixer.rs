@@ -188,6 +188,21 @@ impl SbMixer {
         )
     }
 
+    /// Raw (Left, Right) CD-Audio levels from registers `0x36`/`0x37`.
+    pub fn cd_levels(&self) -> (u8, u8) {
+        (self.inert[0x36] & 0x1F, self.inert[0x37] & 0x1F)
+    }
+
+    /// Set the raw CD-Audio levels without touching the guest's selected mixer
+    /// register or interrupt status. This is the host-control seam for the GUI;
+    /// guest reads through either the SB16 registers or the CT1345 alias see the
+    /// same levels.
+    pub fn set_cd_levels(&mut self, left: u8, right: u8) {
+        self.inert[0x36] = left.min(31);
+        self.inert[0x37] = right.min(31);
+        self.inert[0x28] = pack_compat(self.inert[0x36], self.inert[0x37]);
+    }
+
     /// Decode the `0x224`/`0x225` port pair. Returns `true` if the port belongs
     /// to the mixer.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
@@ -219,6 +234,7 @@ impl SbMixer {
             0x00 => 0x00,                        // Reset Mixer reads 0x00.
             0x04 => self.voice_compat_packed(),  // CT1345 voice alias of 0x32/0x33
             0x22 => self.master_compat_packed(), // CT1345 master alias of 0x30/0x31
+            0x28 => pack_compat(self.inert[0x36], self.inert[0x37]),
             0x30 => self.master_l,
             0x31 => self.master_r,
             0x32 => self.voice_l,
@@ -253,14 +269,14 @@ impl SbMixer {
             // compat byte is also kept so a read of 0x28 round-trips.
             0x28 => {
                 let (l, r) = unpack_compat(value);
-                self.inert[0x36] = l;
-                self.inert[0x37] = r;
-                self.inert[0x28] = value;
+                self.set_cd_levels(l, r);
             }
             0x30 => self.master_l = value & 0x1F,
             0x31 => self.master_r = value & 0x1F,
             0x32 => self.voice_l = value & 0x1F,
             0x33 => self.voice_r = value & 0x1F,
+            0x36 => self.set_cd_levels(value, self.inert[0x37]),
+            0x37 => self.set_cd_levels(self.inert[0x36], value),
             0x41 => self.outgain_l = value & 0x03,
             0x42 => self.outgain_r = value & 0x03,
             0x80 => self.irq_setup = value,

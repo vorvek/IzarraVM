@@ -383,8 +383,10 @@ impl Machine {
             }
         }
         // Flash the GUI CD LED for any data the drive just served.
-        if self.ide.take_access_bytes() > 0 {
+        let cd_pio_bytes = self.ide.take_access_bytes();
+        if cd_pio_bytes > 0 {
             self.cd_accesses += 1;
+            self.cd_pio_bytes = self.cd_pio_bytes.saturating_add(cd_pio_bytes as u64);
         }
 
         self.vega.advance(

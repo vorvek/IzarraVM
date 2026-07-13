@@ -233,6 +233,9 @@ def main():
         tokamous = open(
             os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb"
         ).read()
+        izcdex = open(
+            os.path.join(repo, "toka-dos", "build-freedos-izcdex.com"), "rb"
+        ).read()
         move = open(os.path.join(movedir, "move.exe"), "rb").read()
         sort = open(os.path.join(sortdir, "sort.exe"), "rb").read()
         mem = open(os.path.join(memdir, "mem.exe"), "rb").read()
@@ -251,6 +254,7 @@ def main():
         kernel = prev_files["KERNEL.SYS"]
         shell = prev_files["COMMAND.COM"]
         tokamous = prev_files["TOKAMOUS.COM"]
+        izcdex = prev_files["IZCDEX.COM"]
         move = prev_files["MOVE.EXE"]
         sort = prev_files["SORT.EXE"]
         mem = prev_files["MEM.EXE"]
@@ -279,11 +283,13 @@ def main():
         print("sourcing binaries from the committed image (build artifacts absent)")
     assert len(mbr) == 512, "MBR must be 512 bytes"
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
-    # TOKAEMM.SYS and GSWMODE.COM are committed binaries (built straight from NASM
-    # source by toka-dos/build-freedos.ps1 into the firmware crate), never extracted
-    # from the previous image.
+    # The small Toka-DOS drivers and GSWMODE.COM are committed binaries (built
+    # straight from NASM source by toka-dos/build-freedos.ps1 into the firmware
+    # crate), never extracted from the previous image.
     tokaemm = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "tokaemm.sys"), "rb").read()
+    tokacd = open(os.path.join(
+        repo, "crates", "izarravm-firmware", "roms", "dos", "tokacd.sys"), "rb").read()
     gswmode = open(os.path.join(
         repo, "crates", "izarravm-firmware", "roms", "dos", "gswmode.com"), "rb").read()
 
@@ -298,6 +304,7 @@ def main():
     config_sys = (b"FILES=40\r\nLASTDRIVE=D\r\n"
                   b"DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\n"
                   b"DOS=HIGH,UMB\r\n"
+                  b"DEVICEHIGH=C:\\DOS\\TOKACD.SYS\r\n"
                   b"SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     # Defaults the user owns (mount_hdd_folder seeds these if missing). PATH C:\DOS
     # lets the command-line tools (MOVE/SORT/MEM/...) and TOKAMOUS resolve from any
@@ -305,7 +312,9 @@ def main():
     # DMA1, high DMA5, wavetable MPU at 0x300, type 6 SB16). LH
     # loads the INT 33h mouse into a TOKAEMM UMB (LOADHIGH falls back to a low load).
     autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n"
-                b"SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n")
+                b"SET BLASTER=A220 I5 D1 H5 P300 T6\r\n"
+                b"IZCDEX /I /D:TOKACD01 /L:D /Q\r\n"
+                b"LH TOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
     # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
     license_txt = build_license_txt(repo)
@@ -372,6 +381,8 @@ def main():
         ("COMMAND.COM", shell, ATTR_ARCHIVE),
         ("TOKAMOUS.COM", tokamous, ATTR_ARCHIVE),
         ("TOKAEMM.SYS", tokaemm, ATTR_ARCHIVE),
+        ("TOKACD.SYS", tokacd, ATTR_ARCHIVE),
+        ("IZCDEX.COM", izcdex, ATTR_ARCHIVE),
         ("GSWMODE.COM", gswmode, ATTR_ARCHIVE),
         ("MOVE.EXE", move, ATTR_ARCHIVE),
         ("SORT.EXE", sort, ATTR_ARCHIVE),

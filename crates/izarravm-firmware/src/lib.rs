@@ -61,6 +61,16 @@ pub const GPEMUL_COM: &[u8] = include_bytes!("../roms/dos/gpemul.com");
 pub const GPEMUL_COM_SOURCE: &str = include_str!("../roms/dos/gpemul.asm");
 pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
 pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
+pub const TOKACD_SYS: &[u8] = include_bytes!("../roms/dos/tokacd.sys");
+pub const TOKACD_SYS_SOURCE: &str = include_str!("../roms/dos/tokacd.asm");
+pub const CDTEST_COM: &[u8] = include_bytes!("../roms/dos/cdtest.com");
+pub const CDTEST_COM_SOURCE: &str = include_str!("../roms/dos/cdtest.asm");
+pub const CDPROT_COM: &[u8] = include_bytes!("../roms/dos/cdprot.com");
+pub const CDPROT_COM_SOURCE: &str = include_str!("../roms/dos/cdprot.asm");
+pub const CDAUDIO_COM: &[u8] = include_bytes!("../roms/dos/cdaudio.com");
+pub const CDAUDIO_COM_SOURCE: &str = include_str!("../roms/dos/cdaudio.asm");
+pub const CDTIME_COM: &[u8] = include_bytes!("../roms/dos/cdtime.com");
+pub const CDTIME_COM_SOURCE: &str = include_str!("../roms/dos/cdtime.asm");
 pub const GSWMODE_COM: &[u8] = include_bytes!("../roms/dos/gswmode.com");
 pub const GSWMODE_COM_SOURCE: &str = include_str!("../roms/dos/gswmode.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
@@ -316,6 +326,34 @@ pub fn umbmech_com() -> &'static [u8] {
 /// `DEVICE=C:\DOS\TOKAEMM.SYS`.
 pub fn tokaemm_sys() -> &'static [u8] {
     TOKAEMM_SYS
+}
+
+/// TOKACD.SYS is the Toka-DOS MSCDEX hardware driver for Izarra's fixed
+/// secondary-master ATAPI CD-ROM. It uses bounded polling PIO and exposes one
+/// unit named TOKACD01.
+pub fn tokacd_sys() -> &'static [u8] {
+    TOKACD_SYS
+}
+
+/// Guest fixture for the complete IZCDEX and TOKACD path. It checks the
+/// redirector and device list, then reads a known file from D: through DOS.
+pub fn cdtest_com() -> &'static [u8] {
+    CDTEST_COM
+}
+
+/// Guest fixture that calls TOKACD's request-packet entry points directly.
+pub fn cdprot_com() -> &'static [u8] {
+    CDPROT_COM
+}
+
+/// Guest fixture for TOKACD play, pause, resume, seek, and read ordering.
+pub fn cdaudio_com() -> &'static [u8] {
+    CDAUDIO_COM
+}
+
+/// Guest fixture for TOKACD's bounded polling timeout.
+pub fn cdtime_com() -> &'static [u8] {
+    CDTIME_COM
 }
 
 pub fn exehello_exe() -> &'static [u8] {

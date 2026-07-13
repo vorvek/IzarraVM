@@ -58,6 +58,27 @@ fn cd_volume_attenuates_via_both_register_paths() {
 }
 
 #[test]
+fn direct_cd_levels_preserve_latch_irq_and_keep_alias_coherent() {
+    let mut mixer = SbMixer::default();
+    mixer.write_port(MIXER_INDEX_PORT, 0x81);
+    mixer.set_irq_status(true);
+
+    mixer.set_cd_levels(40, 17);
+
+    assert_eq!(mixer.cd_levels(), (31, 17));
+    assert_eq!(mixer.read_port(MIXER_INDEX_PORT), Some(0x81));
+    assert_eq!(mixer.read_port(MIXER_DATA_PORT), Some(0x22));
+    mixer.write_port(MIXER_INDEX_PORT, 0x82);
+    assert_eq!(mixer.read_port(MIXER_DATA_PORT), Some(0x02));
+    mixer.write_port(MIXER_INDEX_PORT, 0x28);
+    assert_eq!(mixer.read_port(MIXER_DATA_PORT), Some(0xF8));
+
+    write_reg(&mut mixer, 0x36, 11);
+    write_reg(&mut mixer, 0x37, 24);
+    assert_eq!(read_reg(&mut mixer, 0x28), 0x5C);
+}
+
+#[test]
 fn irq_decode_maps_each_bit_and_picks_the_lowest_set() {
     let mut mixer = SbMixer::default();
     for (byte, irq) in [(0x01u8, 2u8), (0x02, 5), (0x04, 7), (0x08, 10)] {
