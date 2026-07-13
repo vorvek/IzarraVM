@@ -92,18 +92,35 @@ function Enter-MeasurementLock([string]$Path) {
         throw "Measurement lock is already held or unavailable: $absolutePath"
     }
     try {
+        $acquiredUtc = [DateTime]::UtcNow.ToString("o")
         $metadata = [ordered]@{
             pid = $PID
-            acquired_utc = [DateTime]::UtcNow.ToString("o")
+            acquired_utc = $acquiredUtc
         } | ConvertTo-Json -Compress
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes($metadata + "`n")
         $stream.SetLength(0)
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
-        return $stream
+        return [pscustomobject][ordered]@{
+            handle = $stream
+            path = $absolutePath
+            pid = $PID
+            acquired_utc = $acquiredUtc
+        }
     } catch {
         $stream.Dispose()
         throw
+    }
+}
+
+function Get-MeasurementLockEvidence($Lease) {
+    return [ordered]@{
+        path = $Lease.path
+        acquired_utc = $Lease.acquired_utc
+        pid = $Lease.pid
+        share_mode = "FileShare.None"
+        scope = "cooperating campaign tools"
+        held_through_summary_write = $true
     }
 }
 
@@ -631,6 +648,184 @@ function Get-FailedBackendSurvivalComponents([Collections.IDictionary]$Aggregate
     )
 }
 
+function Get-BackendQuakeFinalTerminationReasons([string]$Role, [object[]]$Samples) {
+    $reasons = @()
+    foreach ($sample in $Samples) {
+        $stopIdentity = Get-StopIdentityKey $sample
+        if ($stopIdentity -cne "test_exit|code=0|requested=|message=") {
+            $reasons += "$Role $($sample.gate_observation) did not reach Lotura TestExit code 0 after the Quake timedemo (observed $stopIdentity)"
+        }
+    }
+    return @($reasons)
+}
+
+function Get-BackendCompatibilityReasons($Policy, [string]$Role, [object[]]$Samples) {
+    $reasons = @()
+    if ($Policy.name -eq "quake-586") {
+        $reasons += @(Get-BackendQuakeFinalTerminationReasons $Role $Samples)
+    }
+    foreach ($sample in $Samples) {
+        $label = "$Role $($sample.gate_observation)"
+        if ($sample.gate_process_exit_code -ne 0) {
+            $reasons += "$label host exit code is $($sample.gate_process_exit_code)"
+        }
+        if ($sample.gate_artifacts.result_block_status -ne "valid" -or
+            $sample.gate_artifacts.result_block_count -ne 1 -or
+            [string]$sample.gate_artifacts.result_block_sha256 -notmatch '^[0-9a-f]{64}$') {
+            $reasons += "$label did not produce exactly one hashable semantic result block"
+        }
+        if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+            if ((Get-StopIdentityKey $sample) -cne "test_exit|code=0|requested=|message=") {
+                $reasons += "$label did not reach Lotura TestExit code 0"
+            }
+            if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
+                $sample.timedemo.realtics -le 0) {
+                $reasons += "$label did not report the 2134-gametic Doom demo"
+            }
+        } else {
+            if ($sample.quake_timedemo_identity_count -ne 1 -or
+                $null -eq $sample.quake_timedemo -or
+                $sample.quake_timedemo.frames -ne 969 -or
+                $sample.quake_timedemo.seconds -le 0 -or
+                $sample.quake_timedemo.fps -le 0) {
+                $reasons += "$label did not produce exactly one valid 969-frame Quake identity"
+            } elseif ([Math]::Abs(
+                $sample.quake_timedemo.frames / $sample.quake_timedemo.seconds -
+                    $sample.quake_timedemo.fps
+            ) -gt 0.2) {
+                $reasons += "$label reported inconsistent Quake seconds and fps"
+            }
+        }
+    }
+    return @($reasons)
+}
+
+function Get-BackendTerminationProjection($Policy, [object[]]$Automatic, [object[]]$Interpreter) {
+    $compatibilityReasons = @(
+        @(Get-BackendCompatibilityReasons $Policy "automatic" $Automatic) +
+        @(Get-BackendCompatibilityReasons $Policy "interpreter" $Interpreter)
+    )
+    $finalTerminationReasons = @()
+    if ($Policy.name -eq "quake-586") {
+        $finalTerminationReasons = @(
+            @(Get-BackendQuakeFinalTerminationReasons "automatic" $Automatic) +
+            @(Get-BackendQuakeFinalTerminationReasons "interpreter" $Interpreter)
+        )
+    }
+    return [pscustomobject][ordered]@{
+        compatibility_verdict = if ($compatibilityReasons.Count -eq 0) { "pass" } else { "fail" }
+        compatibility_reasons = [object[]]$compatibilityReasons
+        final_termination_reasons = [object[]]$finalTerminationReasons
+    }
+}
+
+function Get-BackendFinalTerminationReasonsFromWorkloads([object[]]$Workloads) {
+    $reasons = @()
+    foreach ($workload in $Workloads) {
+        foreach ($reason in @($workload.checks.final_termination.failure_reasons)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$reason)) {
+                $reasons += [string]$reason
+            }
+        }
+    }
+    return @($reasons)
+}
+
+function Get-BackendFinalClassification(
+    [bool]$IsScreening,
+    [bool]$BaseFinalEligible,
+    [int]$FinalTerminationFailureCount,
+    [bool]$SurvivalPassed
+) {
+    $finalEligible = $BaseFinalEligible -and $FinalTerminationFailureCount -eq 0
+    $trackASurvival = if ($IsScreening) {
+        "not_evaluated"
+    } elseif (-not $finalEligible) {
+        "ineligible"
+    } elseif ($SurvivalPassed) {
+        "pass"
+    } else {
+        "fail"
+    }
+    $verdict = if ($IsScreening) {
+        "screening"
+    } elseif ($trackASurvival -eq "pass") {
+        "survived"
+    } elseif ($trackASurvival -eq "ineligible") {
+        "ineligible"
+    } else {
+        "failed"
+    }
+    return [pscustomobject][ordered]@{
+        final_eligible = $finalEligible
+        track_a_survival = $trackASurvival
+        verdict = $verdict
+    }
+}
+
+function Assert-BackendWarmupSample($Sample, [string]$Role, [string]$WorkloadName) {
+    foreach ($property in @(
+        "gate_role", "gate_observation", "gate_processor_index",
+        "gate_processor_affinity_mask", "gate_processor_affinity_verified",
+        "gate_artifacts"
+    )) {
+        if ($null -eq $Sample.PSObject.Properties[$property]) {
+            throw "$Role warmup is missing $property."
+        }
+    }
+    if ($Sample.gate_role -cne $Role -or $Sample.gate_observation -cne "warmup") {
+        throw "$Role warmup has the wrong role or observation identity."
+    }
+    if ($Sample.gate_processor_index -ne 8 -or
+        [string]::IsNullOrWhiteSpace([string]$Sample.gate_processor_affinity_mask) -or
+        -not $Sample.gate_processor_affinity_verified) {
+        throw "$Role warmup is missing verified processor 8 affinity metadata."
+    }
+    foreach ($property in @(
+        "profile_json_file", "profile_json_sha256", "stdout_file", "stdout_sha256",
+        "stderr_file", "stderr_sha256", "qconsole_file", "qconsole_sha256",
+        "result_block_status", "result_block_count", "result_block_sha256",
+        "result_block_normalized_bytes"
+    )) {
+        if ($null -eq $Sample.gate_artifacts.PSObject.Properties[$property]) {
+            throw "$Role warmup artifacts are missing $property."
+        }
+    }
+    foreach ($property in @("profile_json_sha256", "stdout_sha256", "stderr_sha256")) {
+        if ([string]$Sample.gate_artifacts.$property -notmatch '^[0-9a-f]{64}$') {
+            throw "$Role warmup artifact $property is not a SHA-256 value."
+        }
+    }
+    if ($Sample.gate_artifacts.result_block_status -ne "valid" -or
+        $Sample.gate_artifacts.result_block_count -ne 1 -or
+        [string]$Sample.gate_artifacts.result_block_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        $Sample.gate_artifacts.result_block_normalized_bytes -le 0) {
+        throw "$WorkloadName $Role warmup does not contain one valid semantic result block."
+    }
+    if ($WorkloadName -eq "quake-586") {
+        if ([string]::IsNullOrWhiteSpace([string]$Sample.gate_artifacts.qconsole_file) -or
+            [string]$Sample.gate_artifacts.qconsole_sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "$Role Quake warmup is missing its hashed console log."
+        }
+    } elseif ($null -ne $Sample.gate_artifacts.qconsole_file -or
+        $null -ne $Sample.gate_artifacts.qconsole_sha256) {
+        throw "$WorkloadName $Role warmup must keep explicit null qconsole fields."
+    }
+}
+
+function Get-BackendDiscardedWarmups($Bucket, [string]$WorkloadName) {
+    $packaged = [ordered]@{}
+    foreach ($role in @("automatic", "interpreter")) {
+        $samples = @($Bucket.$role)
+        if ($samples.Count -ne 1) {
+            throw "$role must have exactly one discarded warmup."
+        }
+        Assert-BackendWarmupSample $samples[0] $role $WorkloadName
+        $packaged[$role] = [object[]]$samples
+    }
+    return [pscustomobject]$packaged
+}
+
 if ($SelfTest) {
     $identity = ConvertFrom-QuakeTimedemoLine "969 frames  22.8 seconds  42.6 fps"
     if ($null -eq $identity -or $identity.frames -ne 969 -or
@@ -946,19 +1141,199 @@ if ($SelfTest) {
         -not $finalPolicy.final_eligible -or $finalPolicy.measured_pairs -ne 6) {
         throw "Backend evidence-grade eligibility is wrong."
     }
+    $quakePolicy = [pscustomobject]@{
+        name = "quake-586"
+        cycle_budget = [uint64]6200000000
+    }
+    $cycleLimitSamples = [ordered]@{
+        automatic = @()
+        interpreter = @()
+    }
+    foreach ($role in @("automatic", "interpreter")) {
+        foreach ($pair in 1..6) {
+            $cycleLimitSamples[$role] += [pscustomobject]@{
+                gate_observation = "pair$pair"
+                gate_process_exit_code = 0
+                gate_artifacts = [pscustomobject]@{
+                    result_block_status = "valid"
+                    result_block_count = 1
+                    result_block_sha256 = "a" * 64
+                }
+                stop = [pscustomobject]@{
+                    kind = "cycle_limit"
+                    requested = [uint64]6200000000
+                }
+                quake_timedemo_identity_count = 1
+                quake_timedemo = [pscustomobject]@{
+                    line = "969 frames  22.8 seconds  42.5 fps"
+                    frames = 969
+                    seconds = 22.8
+                    fps = 42.5
+                }
+            }
+        }
+    }
+    $cycleProjection = Get-BackendTerminationProjection `
+        $quakePolicy $cycleLimitSamples.automatic $cycleLimitSamples.interpreter
+    $cycleCompatibilityReasons = @($cycleProjection.compatibility_reasons)
+    $cycleTerminationReasons = @($cycleProjection.final_termination_reasons)
+    $pairedMetricSentinel = [pscustomobject]@{ median_ratio = 1.2345 }
+    $syntheticCycleWorkload = [pscustomobject]@{
+        verdicts = [pscustomobject]@{
+            compatibility = $cycleProjection.compatibility_verdict
+        }
+        checks = [pscustomobject]@{
+            final_termination = [pscustomobject]@{
+                failure_reasons = [object[]]$cycleProjection.final_termination_reasons
+            }
+        }
+        paired_metrics = $pairedMetricSentinel
+    }
+    $wiredCycleTerminationReasons = @(
+        Get-BackendFinalTerminationReasonsFromWorkloads @($syntheticCycleWorkload)
+    )
+    $cycleClassification = Get-BackendFinalClassification `
+        $false $true $wiredCycleTerminationReasons.Count $true
+    if ($cycleProjection.compatibility_verdict -ne "fail" -or
+        $cycleCompatibilityReasons.Count -ne 12 -or
+        $cycleTerminationReasons.Count -ne 12 -or
+        $wiredCycleTerminationReasons.Count -ne 12 -or
+        $syntheticCycleWorkload.paired_metrics.median_ratio -ne 1.2345 -or
+        $cycleClassification.final_eligible -or
+        $cycleClassification.track_a_survival -ne "ineligible" -or
+        $cycleClassification.verdict -ne "ineligible") {
+        throw "Fixed-cycle Quake evidence was not classified as diagnostic and ineligible."
+    }
+    $terminationCountCases = [ordered]@{
+        zero = @()
+        one = @("one")
+        many = @("one", "two", "three")
+    }
+    foreach ($case in $terminationCountCases.GetEnumerator()) {
+        $syntheticWorkload = [pscustomobject]@{
+            checks = [pscustomobject]@{
+                final_termination = [pscustomobject]@{
+                    failure_reasons = [object[]]$case.Value
+                }
+            }
+        }
+        $actualReasons = @(
+            Get-BackendFinalTerminationReasonsFromWorkloads @($syntheticWorkload)
+        )
+        if ($actualReasons.Count -ne @($case.Value).Count) {
+            throw "The $($case.Key) final-termination case was scalarized."
+        }
+    }
+    $testExitSamples = [ordered]@{
+        automatic = @()
+        interpreter = @()
+    }
+    foreach ($role in @("automatic", "interpreter")) {
+        foreach ($sample in $cycleLimitSamples[$role]) {
+            $copy = $sample.PSObject.Copy()
+            $copy.stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
+            $testExitSamples[$role] += $copy
+        }
+    }
+    $testExitProjection = Get-BackendTerminationProjection `
+        $quakePolicy $testExitSamples.automatic $testExitSamples.interpreter
+    $testExitCompatibilityReasons = @($testExitProjection.compatibility_reasons)
+    $testExitClassification = Get-BackendFinalClassification $false $true 0 $true
+    if ($testExitProjection.compatibility_verdict -ne "pass" -or
+        $testExitCompatibilityReasons.Count -ne 0 -or
+        @($testExitProjection.final_termination_reasons).Count -ne 0 -or
+        -not $testExitClassification.final_eligible -or
+        $testExitClassification.track_a_survival -ne "pass" -or
+        $testExitClassification.verdict -ne "survived") {
+        throw "TestExit Quake evidence did not retain final eligibility: compatibility=$($testExitProjection.compatibility_verdict), compatibility_reasons=$($testExitCompatibilityReasons.Count), termination_reasons=$(@($testExitProjection.final_termination_reasons).Count), final=$($testExitClassification.final_eligible), survival=$($testExitClassification.track_a_survival), verdict=$($testExitClassification.verdict)."
+    }
+    $warmupPackage = [ordered]@{}
+    foreach ($workloadName in @("doom-486", "doom-586", "quake-586")) {
+        $bucket = [ordered]@{}
+        foreach ($role in @("automatic", "interpreter")) {
+            $hash = if ($role -eq "automatic") { "b" * 64 } else { "c" * 64 }
+            $bucket[$role] = @([pscustomobject]@{
+                gate_role = $role
+                gate_observation = "warmup"
+                gate_processor_index = 8
+                gate_processor_affinity_mask = "0x0000000000000100"
+                gate_processor_affinity_verified = $true
+                gate_artifacts = [pscustomobject]@{
+                    profile_json_file = "$workloadName-$role-warmup.json"
+                    profile_json_sha256 = $hash
+                    stdout_file = "$workloadName-$role-warmup.stdout.log"
+                    stdout_sha256 = $hash
+                    stderr_file = "$workloadName-$role-warmup.stderr.log"
+                    stderr_sha256 = $hash
+                    qconsole_file = if ($workloadName -eq "quake-586") {
+                        "$workloadName-$role-warmup-qconsole.log"
+                    } else {
+                        $null
+                    }
+                    qconsole_sha256 = if ($workloadName -eq "quake-586") { $hash } else { $null }
+                    result_block_status = "valid"
+                    result_block_count = 1
+                    result_block_sha256 = $hash
+                    result_block_normalized_bytes = 128
+                }
+            })
+        }
+        $warmupPackage[$workloadName] = Get-BackendDiscardedWarmups $bucket $workloadName
+    }
+    $invalidResultWarmup = $warmupPackage["quake-586"].automatic[0] |
+        ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $invalidResultWarmup.gate_artifacts.result_block_sha256 = $null
+    Assert-SelfTestThrows {
+        Assert-BackendWarmupSample $invalidResultWarmup "automatic" "quake-586"
+    } "valid semantic result block"
+    $missingQconsoleWarmup = $warmupPackage["quake-586"].automatic[0] |
+        ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $missingQconsoleWarmup.gate_artifacts.qconsole_sha256 = $null
+    Assert-SelfTestThrows {
+        Assert-BackendWarmupSample $missingQconsoleWarmup "automatic" "quake-586"
+    } "hashed console log"
+    $warmupRoundTrip = $warmupPackage | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $representedWarmups = 0
+    foreach ($workloadName in @("doom-486", "doom-586", "quake-586")) {
+        $roundTripBucket = $warmupRoundTrip.PSObject.Properties[$workloadName].Value
+        $null = Get-BackendDiscardedWarmups $roundTripBucket $workloadName
+        foreach ($role in @("automatic", "interpreter")) {
+            $roleValue = $roundTripBucket.PSObject.Properties[$role].Value
+            if ($roleValue -isnot [array] -or @($roleValue).Count -ne 1) {
+                throw "$workloadName $role warmup did not remain a one-item JSON array."
+            }
+            $representedWarmups++
+        }
+    }
+    if ($representedWarmups -ne 6) {
+        throw "The warmup package did not represent all six discarded observations."
+    }
     $lockSelfTestPath = Join-Path ([IO.Path]::GetTempPath()) (
         "izarravm-measurement-$([guid]::NewGuid().ToString('N')).lock"
     )
     $lockSelfTest = $null
     try {
         $lockSelfTest = Enter-MeasurementLock $lockSelfTestPath
+        $lockSelfTestEvidence = Get-MeasurementLockEvidence $lockSelfTest
         Assert-SelfTestThrows {
             $secondLock = Enter-MeasurementLock $lockSelfTestPath
-            $secondLock.Dispose()
+            $secondLock.handle.Dispose()
         } "already held or unavailable"
+        $lockSelfTest.handle.Dispose()
+        $lockSelfTestRaw = Get-Content -LiteralPath $lockSelfTestPath -Raw
+        $expectedLockSelfTestRaw = ([ordered]@{
+            pid = $lockSelfTest.pid
+            acquired_utc = $lockSelfTest.acquired_utc
+        } | ConvertTo-Json -Compress) + "`n"
+        if ($lockSelfTestRaw -cne $expectedLockSelfTestRaw -or
+            $lockSelfTestEvidence.pid -ne $lockSelfTest.pid -or
+            $lockSelfTestEvidence.acquired_utc -cne $lockSelfTest.acquired_utc) {
+            throw "The lock file, lease, and summary evidence do not share exact metadata."
+        }
+        $lockSelfTest = $null
     } finally {
         if ($null -ne $lockSelfTest) {
-            $lockSelfTest.Dispose()
+            $lockSelfTest.handle.Dispose()
         }
         Remove-Item -LiteralPath $lockSelfTestPath -Force -ErrorAction SilentlyContinue
     }
@@ -1172,20 +1547,12 @@ if (-not $ReportOnly -and (Test-Path -LiteralPath $ResultsDirectory)) {
 New-Item -ItemType Directory -Path $ResultsDirectory | Out-Null
 $ResultsDirectory = (Resolve-Path -LiteralPath $ResultsDirectory).Path
 
-$measurementLockHandle = $null
+$measurementLockLease = $null
 $measurementLockEvidence = $null
 if ($BackendBakeoff) {
     $MeasurementLockPath = [IO.Path]::GetFullPath($MeasurementLockPath)
-    $measurementLockAcquiredUtc = [DateTime]::UtcNow.ToString("o")
-    $measurementLockHandle = Enter-MeasurementLock $MeasurementLockPath
-    $measurementLockEvidence = [ordered]@{
-        path = $MeasurementLockPath
-        acquired_utc = $measurementLockAcquiredUtc
-        pid = $PID
-        share_mode = "FileShare.None"
-        scope = "cooperating campaign tools"
-        held_through_summary_write = $true
-    }
+    $measurementLockLease = Enter-MeasurementLock $MeasurementLockPath
+    $measurementLockEvidence = Get-MeasurementLockEvidence $measurementLockLease
 }
 
 try {
@@ -2167,48 +2534,6 @@ function Get-PairedWorkloadSummary($Policy, [object[]]$Candidate, [object[]]$Bas
     }
 }
 
-function Get-BackendCompatibilityReasons($Policy, [string]$Role, [object[]]$Samples) {
-    $reasons = @()
-    foreach ($sample in $Samples) {
-        $label = "$Role $($sample.gate_observation)"
-        if ($sample.gate_process_exit_code -ne 0) {
-            $reasons += "$label host exit code is $($sample.gate_process_exit_code)"
-        }
-        if ($sample.gate_artifacts.result_block_status -ne "valid" -or
-            $sample.gate_artifacts.result_block_count -ne 1 -or
-            [string]$sample.gate_artifacts.result_block_sha256 -notmatch '^[0-9a-f]{64}$') {
-            $reasons += "$label did not produce exactly one hashable semantic result block"
-        }
-        if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
-            if ((Get-StopIdentityKey $sample) -cne "test_exit|code=0|requested=|message=") {
-                $reasons += "$label did not reach Lotura TestExit code 0"
-            }
-            if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
-                $sample.timedemo.realtics -le 0) {
-                $reasons += "$label did not report the 2134-gametic Doom demo"
-            }
-        } else {
-            $expectedStop = "cycle_limit|code=|requested=$($Policy.cycle_budget)|message="
-            if ((Get-StopIdentityKey $sample) -cne $expectedStop) {
-                $reasons += "$label did not reach the fixed $($Policy.cycle_budget)-clock limit"
-            }
-            if ($sample.quake_timedemo_identity_count -ne 1 -or
-                $null -eq $sample.quake_timedemo -or
-                $sample.quake_timedemo.frames -ne 969 -or
-                $sample.quake_timedemo.seconds -le 0 -or
-                $sample.quake_timedemo.fps -le 0) {
-                $reasons += "$label did not produce exactly one valid 969-frame Quake identity"
-            } elseif ([Math]::Abs(
-                $sample.quake_timedemo.frames / $sample.quake_timedemo.seconds -
-                    $sample.quake_timedemo.fps
-            ) -gt 0.2) {
-                $reasons += "$label reported inconsistent Quake seconds and fps"
-            }
-        }
-    }
-    return @($reasons)
-}
-
 function Get-BackendCalibrationReasons($Policy, [string]$Role, [object[]]$Samples) {
     $reasons = @()
     foreach ($sample in $Samples) {
@@ -2307,10 +2632,9 @@ function Get-BackendWorkloadSummary(
         $equalWorkFailures += "interpreter role: $($interpreterDeterminism.mismatched_fields -join ', ')"
     }
 
-    $compatibilityReasons = @(
-        @(Get-BackendCompatibilityReasons $Policy "automatic" $Automatic) +
-        @(Get-BackendCompatibilityReasons $Policy "interpreter" $Interpreter)
-    )
+    $terminationProjection = Get-BackendTerminationProjection $Policy $Automatic $Interpreter
+    $compatibilityReasons = @($terminationProjection.compatibility_reasons)
+    $finalTerminationReasons = @($terminationProjection.final_termination_reasons)
     $calibrationReasons = @(
         @(Get-BackendCalibrationReasons $Policy "automatic" $Automatic) +
         @(Get-BackendCalibrationReasons $Policy "interpreter" $Interpreter)
@@ -2349,6 +2673,11 @@ function Get-BackendWorkloadSummary(
         } else {
             "lotura_test_exit_after_timedemo"
         }
+        final_termination_policy = if ($Policy.name -eq "quake-586") {
+            "one_969_frame_timedemo_then_lotura_test_exit_code_0"
+        } else {
+            "lotura_test_exit_code_0"
+        }
         minimum_real_time_factor = $Policy.minimum_real_time_factor
         automatic = Get-RoleSummary "automatic" $Policy.mode $Automatic $false
         interpreter = Get-RoleSummary "interpreter" $Policy.mode $Interpreter $false
@@ -2372,7 +2701,7 @@ function Get-BackendWorkloadSummary(
             equal_work = if ($equalWorkFailures.Count -eq 0) { "pass" } else { "fail" }
             calibration = if ($calibrationReasons.Count -eq 0) { "pass" } else { "fail" }
             backend_health = if ($backendReasons.Count -eq 0) { "pass" } else { "fail" }
-            compatibility = if ($compatibilityReasons.Count -eq 0) { "pass" } else { "fail" }
+            compatibility = $terminationProjection.compatibility_verdict
         }
         checks = [ordered]@{
             product = [ordered]@{
@@ -2383,6 +2712,7 @@ function Get-BackendWorkloadSummary(
             calibration = [ordered]@{ failure_reasons = $calibrationReasons }
             backend_health = [ordered]@{ failure_reasons = $backendReasons }
             compatibility = [ordered]@{ failure_reasons = $compatibilityReasons }
+            final_termination = [ordered]@{ failure_reasons = $finalTerminationReasons }
         }
     }
 }
@@ -2434,12 +2764,16 @@ try {
         @("candidate", "baseline")
     }
     $observations = [ordered]@{}
+    $discardedWarmups = [ordered]@{}
     foreach ($policy in $policies) {
         $roleBuckets = [ordered]@{}
+        $warmupBuckets = [ordered]@{}
         foreach ($role in $pairRoles) {
             $roleBuckets[$role] = @()
+            $warmupBuckets[$role] = @()
         }
         $observations[$policy.name] = $roleBuckets
+        $discardedWarmups[$policy.name] = $warmupBuckets
     }
 
     if ($pairedRun) {
@@ -2455,7 +2789,9 @@ try {
                 } else {
                     $baselineArtifact
                 }
-                $null = Invoke-Observation $policy $sourceFolder $role "warmup" $artifact.executed_copy_path
+                $warmup = Invoke-Observation `
+                    $policy $sourceFolder $role "warmup" $artifact.executed_copy_path
+                $discardedWarmups[$policy.name][$role] += $warmup
             }
         }
         for ($pair = 1; $pair -le $Runs; $pair++) {
@@ -2497,8 +2833,11 @@ try {
     foreach ($policy in $policies) {
         $bucket = $observations[$policy.name]
         if ($BackendBakeoff) {
-            $workloads += Get-BackendWorkloadSummary `
+            $backendSummary = Get-BackendWorkloadSummary `
                 $policy $bucket.automatic $bucket.interpreter ([bool]$Screening)
+            $backendSummary["discarded_warmups"] = Get-BackendDiscardedWarmups `
+                $discardedWarmups[$policy.name] $policy.name
+            $workloads += $backendSummary
         } elseif ($pairedRun) {
             $workloads += Get-PairedWorkloadSummary $policy $bucket.candidate $bucket.baseline
         } else {
@@ -2633,7 +2972,7 @@ if ($BackendBakeoff) {
             "fail"
         }
     }
-    $finalEligible = $evidencePolicy.final_eligible -and
+    $baseFinalEligible = $evidencePolicy.final_eligible -and
         $candidateArtifact.verified -and
         $candidateArtifact.built_this_invocation -and
         -not $repositoryAtSelection.dirty -and
@@ -2645,24 +2984,17 @@ if ($BackendBakeoff) {
     $survivalComponentFailures = @(
         Get-FailedBackendSurvivalComponents $aggregateVerdicts
     )
-    $trackASurvival = if ($Screening) {
-        "not_evaluated"
-    } elseif (-not $finalEligible) {
-        "ineligible"
-    } elseif ($survivalComponentFailures.Count -eq 0 -and $survivalFailures.Count -eq 0) {
-        "pass"
-    } else {
-        "fail"
-    }
-    $verdict = if ($Screening) {
-        "screening"
-    } elseif ($trackASurvival -eq "pass") {
-        "survived"
-    } elseif ($trackASurvival -eq "ineligible") {
-        "ineligible"
-    } else {
-        "failed"
-    }
+    $finalTerminationReasons = @(
+        Get-BackendFinalTerminationReasonsFromWorkloads $workloads
+    )
+    $classification = Get-BackendFinalClassification `
+        ([bool]$Screening) `
+        $baseFinalEligible `
+        $finalTerminationReasons.Count `
+        ($survivalComponentFailures.Count -eq 0 -and $survivalFailures.Count -eq 0)
+    $finalEligible = $classification.final_eligible
+    $trackASurvival = $classification.track_a_survival
+    $verdict = $classification.verdict
     $backendFailures = @()
     if (-not $powerSchemeStable) {
         $backendFailures += if ($powerSchemeRecorded) {
@@ -2670,6 +3002,9 @@ if ($BackendBakeoff) {
         } else {
             "the active power scheme could not be recorded"
         }
+    }
+    if ($finalTerminationReasons.Count -gt 0) {
+        $backendFailures += "quake-586: $($finalTerminationReasons.Count) measured observations failed the required post-timedemo TestExit contract; final proof requires exactly one 969-frame timedemo followed by Lotura TestExit code 0"
     }
     foreach ($workloadResult in $workloads) {
         if ($workloadResult.survival.verdict -ne "pass") {
@@ -2758,8 +3093,8 @@ if ($BackendBakeoff) {
         })
         termination_policies = [ordered]@{
             doom = "Lotura TestExit code 0 after the 2134-gametic timedemo"
-            quake = "fixed 6.2G cycle limit with exactly one 969-frame identity; wall includes the minimal post-demo tail"
-            quake_test_exit_gate = "blocked: +exec bench.cfg corrupts playback before the identity"
+            quake = "exactly one 969-frame timedemo followed by Lotura TestExit code 0"
+            quake_diagnostic = "fixed 6.2G cycle limit with exactly one 969-frame identity; never final-eligible"
         }
         acceptance = [ordered]@{
             workload_real_time_factor_floors = [ordered]@{
@@ -2952,7 +3287,7 @@ if (-not $BackendBakeoff -and -not $ReportOnly -and $verdict -ne "passed") {
     throw "The paired throughput gate did not pass: $($formalFailures -join ' | ')."
 }
 } finally {
-    if ($null -ne $measurementLockHandle) {
-        $measurementLockHandle.Dispose()
+    if ($null -ne $measurementLockLease) {
+        $measurementLockLease.handle.Dispose()
     }
 }
