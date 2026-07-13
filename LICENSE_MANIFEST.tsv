@@ -113,7 +113,7 @@ toka-dos/freedos/more/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasq
 toka-dos/freedos/move/LICENSE	third-party-license-text	FreeDOS move	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
 toka-dos/freedos/move/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	7ffe1954587c77dfba1cf8eb9b2ea743671fa6e63f9e7a2f258119d42e14eefe
 toka-dos/freedos/move/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
-toka-dos/freedos/shsucd/LICENSE.txt	third-party-license-text	SHSUCD by Jason Hood	Zlib	3d09b6826663020864878a8a2a22092e99063a0b60337f23483a112ef02948ae
+toka-dos/freedos/shsucd/LICENSE.txt	third-party-license-text	SHSUCD by Jason Hood	Zlib	f3e7f1fbb471c22b452f62edeabc6264cb419cec0e829a3b0bee133046f30646
 toka-dos/freedos/shsucd/zlibcdrd.lib	vendored-library	zlib 1.2.1 with SHSUCDRD modifications	Zlib	d38f1f7c4b3ef5ae3246ecf1532d963cd979e6ecc3912c8636fdd78c0ceb49be
 toka-dos/freedos/sort/LICENSE	third-party-license-text	FreeDOS sort	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
 toka-dos/freedos/sort/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	7ffe1954587c77dfba1cf8eb9b2ea743671fa6e63f9e7a2f258119d42e14eefe
