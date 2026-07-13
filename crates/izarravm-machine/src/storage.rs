@@ -6,6 +6,36 @@ use super::*;
 const ELTORITO_BOOT_RECORD_LBA: u32 = 0x11;
 const ELTORITO_CD_DRIVE: u8 = 0xE0;
 
+// Stock files from the release immediately before the guest CD-ROM stack. Keep
+// these exact: they are a one-version migration key, not configuration templates.
+pub(super) const PREVIOUS_STOCK_CONFIG_SYS: &[u8] = b"FILES=40\r\nLASTDRIVE=D\r\n\
+DEVICE=C:\\DOS\\TOKAEMM.SYS RAM\r\nDOS=HIGH,UMB\r\n\
+SHELL=C:\\DOS\\COMMAND.COM C:\\DOS /E:2048 /P=C:\\AUTOEXEC.BAT\r\n";
+pub(super) const PREVIOUS_STOCK_AUTOEXEC_BAT: &[u8] =
+    b"@ECHO OFF\r\nPROMPT $P$G\r\nPATH C:\\DOS\r\n\
+SET BLASTER=A220 I5 D1 H5 P300 T6\r\nLH TOKAMOUS\r\n";
+
+/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if absent. A file that
+/// byte-for-byte matches the immediately preceding stock version is upgraded to
+/// the current default. Every other existing file remains user-owned.
+pub(super) fn ensure_user_config(
+    dir: &std::path::Path,
+    config: &[u8],
+    autoexec: &[u8],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (name, previous, current) in [
+        ("CONFIG.SYS", PREVIOUS_STOCK_CONFIG_SYS, config),
+        ("AUTOEXEC.BAT", PREVIOUS_STOCK_AUTOEXEC_BAT, autoexec),
+    ] {
+        let path = dir.join(name);
+        if !path.exists() || std::fs::read(&path)? == previous {
+            std::fs::write(path, current)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ElToritoMedia {
     None,

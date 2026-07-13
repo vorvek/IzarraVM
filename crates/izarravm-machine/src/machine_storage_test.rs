@@ -170,7 +170,7 @@ fn ensure_user_config_seeds_missing_files_only() {
     std::fs::create_dir_all(&dir).unwrap();
     // A user-owned AUTOEXEC stays; a missing CONFIG.SYS is seeded.
     std::fs::write(dir.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
-    super::ensure_user_config(&dir, b"FILES=40\r\n", b"@ECHO OFF\r\nDEFAULT\r\n").unwrap();
+    crate::storage::ensure_user_config(&dir, b"FILES=40\r\n", b"@ECHO OFF\r\nDEFAULT\r\n").unwrap();
     assert_eq!(
         std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(),
         b"@ECHO OFF\r\nMYGAME\r\n",
@@ -195,11 +195,11 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
     std::fs::create_dir_all(&config_only).unwrap();
     std::fs::write(
         config_only.join("CONFIG.SYS"),
-        super::PREVIOUS_STOCK_CONFIG_SYS,
+        crate::storage::PREVIOUS_STOCK_CONFIG_SYS,
     )
     .unwrap();
     std::fs::write(config_only.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
-    super::ensure_user_config(&config_only, new_config, new_autoexec).unwrap();
+    crate::storage::ensure_user_config(&config_only, new_config, new_autoexec).unwrap();
     assert_eq!(
         std::fs::read(config_only.join("CONFIG.SYS")).unwrap(),
         new_config
@@ -214,10 +214,10 @@ fn ensure_user_config_upgrades_each_previous_stock_file_independently() {
     std::fs::write(autoexec_only.join("CONFIG.SYS"), b"FILES=41\r\n").unwrap();
     std::fs::write(
         autoexec_only.join("AUTOEXEC.BAT"),
-        super::PREVIOUS_STOCK_AUTOEXEC_BAT,
+        crate::storage::PREVIOUS_STOCK_AUTOEXEC_BAT,
     )
     .unwrap();
-    super::ensure_user_config(&autoexec_only, new_config, new_autoexec).unwrap();
+    crate::storage::ensure_user_config(&autoexec_only, new_config, new_autoexec).unwrap();
     assert_eq!(
         std::fs::read(autoexec_only.join("CONFIG.SYS")).unwrap(),
         b"FILES=41\r\n"

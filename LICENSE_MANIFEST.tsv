@@ -1,12 +1,16 @@
 path	class	origin	license	sha256
 Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	7a3a6ddbcd9dfa50d818a75180e07924c41fd239bf6bde26f324624d8e54a1ce
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	1fcae7c958dd84f85578df0183b63648565d2fa31f5d1dc7f08efc195056dc87
+NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	8a836e2211363a304ed1cd6d483a39e3176cfc84e664caeb830916c7022c0fbb
 crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
 crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	12d0f8138667c06f0ed070bb672d6327a5d4cf8aa15fb0cf451999faaaeee418
 crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
 crates/izarravm-firmware/roms/codepage-fonts.bin	generated-font	Modern DOS by Jayvee Enaguas	CC0-1.0	39c4644a8b3569e5181c12a4804ce47e4ce8014996c6286962179336bff64116
 crates/izarravm-firmware/roms/disttri.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	5eef10d3488a4c1f20f89d6744617300377a34dfa5ae4f69607d012758eff03a
+crates/izarravm-firmware/roms/dos/cdaudio.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	0dd50e9d8e0f9fea185c6dbca6016a1a321b7fb93ad85ee4fe2279a1e3bcb36a
+crates/izarravm-firmware/roms/dos/cdprot.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	848476fa32dee30558d693666c1fd43ab1cb3ad22b464e62ea3ca72f3c865bc1
+crates/izarravm-firmware/roms/dos/cdtest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c7df137b61df15960b111a313dada79d92e85a076f8d16afcc3b28f6428c4603
+crates/izarravm-firmware/roms/dos/cdtime.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f5cbb4268baf525b1027522ec64e5b65d6b637703c107bd611004d786b33b44d
 crates/izarravm-firmware/roms/dos/echo.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4afb3163a32df36aaa90b742ef9f08a40a6ab9feec1d117fb6bfe9dd04626a7a
 crates/izarravm-firmware/roms/dos/emsnone.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	f3425782f72e2c89589596f3718b1d3adefa09e4c4257a0bad3ca718da0f70c4
 crates/izarravm-firmware/roms/dos/emstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	ca2a70b1e785156a9329b3adf76f3004c8a1f164df90385612ab07d273fd2033
@@ -22,6 +26,7 @@ crates/izarravm-firmware/roms/dos/mousetst.com	generated-guest-binary	IzarraVM p
 crates/izarravm-firmware/roms/dos/multihlt.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c22b14d7ad173ad2067a4b97c5a7192201a299cc10a9d852fba38abe71e3756
 crates/izarravm-firmware/roms/dos/runner.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	7904c3a69a009d641d9531b8fd0d17b84991b05a6969e2591756aa84f354bf2b
 crates/izarravm-firmware/roms/dos/sndtst.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c47c99382715572e6f1335b28556c23afde8f1f4feb699d58f7d6aa8f7c00a0b
+crates/izarravm-firmware/roms/dos/tokacd.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c061378edfb060d9dd5489971aebd6599ff3e4feb942d7689a0ee97257e60680
 crates/izarravm-firmware/roms/dos/tokaemm.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	9d8e3618d3912d213b60b8c5c70219cab903dcc19d75615cd75d70b5701b1eb1
 crates/izarravm-firmware/roms/dos/type.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	0899410e755306edd63bafa1e44afe4dafe446f1d5d533d19c7b95c8a508b899
 crates/izarravm-firmware/roms/dos/umbmech.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	06e04e3855157df3215fd14bb84df0467e56fc230ecea3e22e2d6a40d0a545cc
@@ -33,7 +38,7 @@ crates/izarravm-firmware/roms/dos/vcpimem.com	generated-guest-binary	IzarraVM pr
 crates/izarravm-firmware/roms/dos/vcpisw.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c6664e02c679def02a51188d2bff37f2cec073e42a84b7f66366511bf6bc893
 crates/izarravm-firmware/roms/dos/xmstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	abe3525797632eb696d3f925622e1c20042dbec3d2ee383d3bbe29bb5d42b752
 crates/izarravm-firmware/roms/i386dx25-test.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	ba3a1717b073d4c41b0c2f9f83aec51d082431251de1d3cb239d64c9d41c4932
-crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	396bcf9990c3e95be49f664d1a34f5bf61d02c89f8306f1bf5fcff91d42c83f4
+crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	7bf0865752a7bf37ea5464c20d2b531a45b7da60c870660026a8696b1619f3df
 crates/izarravm-firmware/roms/izbios-art.inc	generated-source	IzarraVM gen_art.py	GPL-3.0-only	9e9e9b94a787498051ccc3a89cf512bbf3e5ebc2c31d3a88b6bf194d5a09c853
 crates/izarravm-firmware/roms/izbios-logo.inc	generated-source	IzarraVM project artwork	GPL-3.0-only	55e62c1bb449c8c659e4f447d95885d2baa73c6363fb3d5a4767f9afdba227e1
 crates/izarravm-firmware/roms/kbd-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	43b71ebdd508b4c237bbad71aa2debfbcd3e07a829ca05fe7bbc9fb4f8f78973
@@ -41,7 +46,7 @@ crates/izarravm-firmware/roms/kbd-layout-meta.inc	generated-source	IzarraVM gene
 crates/izarravm-firmware/roms/kbd-layouts.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	51a5d737fd5cfac4c7d7d5c2376401536a7e427f098b84128b851130e03348b2
 crates/izarravm-firmware/roms/kbd-resident.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	2c7fee2d50c8f65157f9db4f7792eb6ab4cefc7f24f212fd1d96cf6b02e19d8e
 crates/izarravm-firmware/roms/neurketa/neurketa.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	760cdddd2c5e3bcaaa378961fd08df89a8f8d68f01f522a512f4d27d8d7e7ca9
-crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	ec5040de53804b949476ba061936752dd054df43da896f6f86cb9f313bc66cb6
+crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	5410b87824f3adf162811274d46e6ffb763f68d4ec4f474a78bd26ed7e9f9874
 crates/izarravm-machine/tests/fixtures/CBLEAK.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	9c0d52099a205491ceea7a17d850cb9a459d7d7c1580b8c8dd8f05099ca2b008
 crates/izarravm-machine/tests/fixtures/GFXCUR.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	611acec5ccda2c22c9add0e8a1d6809793068ebd8d6428df5fbb97f946176493
 crates/izarravm-machine/tests/fixtures/MTEST.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	4fc9fb2d6e67aa8fea1f789da7c97bf8a7d3dcc75595ef93843617deb4793fa9
@@ -108,6 +113,8 @@ toka-dos/freedos/more/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasq
 toka-dos/freedos/move/LICENSE	third-party-license-text	FreeDOS move	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
 toka-dos/freedos/move/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	7ffe1954587c77dfba1cf8eb9b2ea743671fa6e63f9e7a2f258119d42e14eefe
 toka-dos/freedos/move/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
+toka-dos/freedos/shsucd/LICENSE.txt	third-party-license-text	SHSUCD by Jason Hood	Zlib	3d09b6826663020864878a8a2a22092e99063a0b60337f23483a112ef02948ae
+toka-dos/freedos/shsucd/zlibcdrd.lib	vendored-library	zlib 1.2.1 with SHSUCDRD modifications	Zlib	d38f1f7c4b3ef5ae3246ecf1532d963cd979e6ecc3912c8636fdd78c0ceb49be
 toka-dos/freedos/sort/LICENSE	third-party-license-text	FreeDOS sort	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
 toka-dos/freedos/sort/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	7ffe1954587c77dfba1cf8eb9b2ea743671fa6e63f9e7a2f258119d42e14eefe
 toka-dos/freedos/sort/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	189b1af95d661151e054cea10c91b3d754e4de4d3fecfb074c1fb29476f7167b
