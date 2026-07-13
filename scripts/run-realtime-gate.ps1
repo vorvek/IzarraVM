@@ -624,6 +624,13 @@ function Get-BackendEvidencePolicy([bool]$IsScreening) {
     }
 }
 
+function Get-FailedBackendSurvivalComponents([Collections.IDictionary]$AggregateVerdicts) {
+    return @(
+        @("equal_work", "calibration", "backend_health", "compatibility") |
+            Where-Object { $AggregateVerdicts[$_] -ne "pass" }
+    )
+}
+
 if ($SelfTest) {
     $identity = ConvertFrom-QuakeTimedemoLine "969 frames  22.8 seconds  42.6 fps"
     if ($null -eq $identity -or $identity.frames -ne 969 -or
@@ -657,6 +664,37 @@ if ($SelfTest) {
         $policies[1].minimum_real_time_factor -ne 1.4 -or
         $policies[2].minimum_real_time_factor -ne 1.4) {
         throw "Both did not expand to the three workload-specific policies."
+    }
+    $singlePolicySelections = [ordered]@{
+        Doom = "doom-486"
+        Doom586 = "doom-586"
+        Quake = "quake-586"
+    }
+    foreach ($selection in $singlePolicySelections.GetEnumerator()) {
+        $singlePolicy = @(Get-WorkloadPolicies $selection.Key)
+        if ($singlePolicy.Count -ne 1 -or $singlePolicy[0].name -ne $selection.Value) {
+            throw "The $($selection.Key) workload selection did not remain a one-item array."
+        }
+    }
+    $survivalComponentSelfTest = [ordered]@{
+        equal_work = "pass"
+        calibration = "fail"
+        backend_health = "pass"
+        compatibility = "pass"
+    }
+    $failedSurvivalComponents = @(
+        Get-FailedBackendSurvivalComponents $survivalComponentSelfTest
+    )
+    if ($failedSurvivalComponents.Count -ne 1 -or
+        $failedSurvivalComponents[0] -ne "calibration") {
+        throw "A single failed backend survival component did not remain a one-item array."
+    }
+    $survivalComponentSelfTest.calibration = "pass"
+    $failedSurvivalComponents = @(
+        Get-FailedBackendSurvivalComponents $survivalComponentSelfTest
+    )
+    if ($failedSurvivalComponents.Count -ne 0) {
+        throw "An all-pass backend survival result did not remain an empty array."
     }
     if ((Get-PairOrder 1 0) -join "," -ne "candidate,baseline" -or
         (Get-PairOrder 2 0) -join "," -ne "baseline,candidate") {
@@ -2389,7 +2427,7 @@ try {
             [IO.FileShare]::Read
         )
     }
-    $policies = Get-WorkloadPolicies $Workload
+    $policies = @(Get-WorkloadPolicies $Workload)
     $pairRoles = if ($BackendBakeoff) {
         @("automatic", "interpreter")
     } else {
@@ -2604,14 +2642,14 @@ if ($BackendBakeoff) {
         $verifiedChildAffinityMasks.Count -eq $policies.Count * (2 + 2 * $Runs) -and
         $powerSchemeStable
     $survivalFailures = @($workloads | Where-Object { $_.survival.verdict -ne "pass" })
-    $survivalComponentsPass = @(
-        "equal_work", "calibration", "backend_health", "compatibility"
-    ) | Where-Object { $aggregateVerdicts[$_] -ne "pass" }
+    $survivalComponentFailures = @(
+        Get-FailedBackendSurvivalComponents $aggregateVerdicts
+    )
     $trackASurvival = if ($Screening) {
         "not_evaluated"
     } elseif (-not $finalEligible) {
         "ineligible"
-    } elseif ($survivalComponentsPass.Count -eq 0 -and $survivalFailures.Count -eq 0) {
+    } elseif ($survivalComponentFailures.Count -eq 0 -and $survivalFailures.Count -eq 0) {
         "pass"
     } else {
         "fail"
