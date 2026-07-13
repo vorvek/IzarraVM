@@ -1135,7 +1135,7 @@ static char* get_os(void)
     switch (get_oem_number())
 	{
 	case OEM_FREEDOS:
-	    return "FreeDOS";
+	    return "Toka-DOS";
 	case 0xFF:
 	    if (_osmajor <= 6)
 		return "MS-DOS";

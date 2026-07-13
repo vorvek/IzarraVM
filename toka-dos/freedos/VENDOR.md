@@ -43,8 +43,10 @@ Rebrand: move src/version.h + move.c product-name string; sort src/sort.c banner
   `/PAGE`, which only pauses after each screenful. The program list normally
   needs `/FULL` or `/DEBUG`. Toka-DOS makes `/PAGE`, including its `/P` prefix,
   imply `/FULL` while keeping the pause. It also omits the default summary so
-  the final program rows stay visible. `/P /SUMMARY` restores the summary.
-  `/FULL` and `/DEBUG` still work by themselves.
+  the final program rows stay visible, and splits the listing into conventional
+  and upper-memory sections. `/P /SUMMARY` restores the summary. `/FULL` and
+  `/DEBUG` still work by themselves. MEM also identifies the HMA resident as
+  Toka-DOS instead of the upstream FreeDOS product name.
 - Toka-DOS replaces the default summary with a four-line, 79-column map for
   conventional, upper, EMS, and XMS memory. The kinds appear consecutively
   with BIOS attributes `0x09` (light blue), `0x0B` (light cyan), `0x0D`

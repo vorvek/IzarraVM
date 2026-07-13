@@ -160,9 +160,11 @@ either API changes the free part of that category.
 Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE`, which pauses
 after each screenful. The per-program size and segment listing normally needs
 `/FULL` or `/DEBUG`. In Toka-DOS, `MEM /P` pages through every program in
-memory with its size and position. It leaves out the default summary so the
-program table remains visible at the end. Use `MEM /P /SUMMARY` to append the
-numeric summary and memory map. `/FULL` and `/DEBUG` still work on their own.
+memory with its size and segment. Separate `Conventional Memory Detail` and
+`Upper Memory Detail` headings show where each block resides. `/P` leaves out
+the default summary so the program table remains visible at the end. Use
+`MEM /P /SUMMARY` to append the numeric summary and memory map. `/FULL` and
+`/DEBUG` still work on their own.
 
 ## ATTRIB
 

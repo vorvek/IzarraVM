@@ -940,6 +940,13 @@ static void print_full_empty(memory_t memory_type)
     printf(_(1, 9, "%s Memory is not accessible\n"), memory_typename(memory_type));
 }
 
+static void paged_full_list(void)
+{
+    generic_split_list(split_mlist_conv_upper(make_mcb_list(NULL)),
+		       print_full_header_with_type, NULL, print_full_empty,
+		       print_minfo_full, NULL);
+}
+
 static void debug_list(void)
 {
     MINFO *ml;
@@ -1976,7 +1983,12 @@ int main(int argc, char *argv[])
     if (flags & F_DEBUG)  debug_list();
     if (flags & F_DEVICE) device_list();
     if (flags & F_EMS)	  ems_list();
-    if (flags & F_FULL)	  full_list();
+    if (flags & F_FULL) {
+	if (flags & F_PAGE)
+	    paged_full_list();
+	else
+	    full_list();
+    }
     if (flags & F_UPPER)  upper_list();
     if (flags & F_XMS)	  xms_list();
     if (flags & F_CLASSIFY)    classify_list(memfree, upper ? upper->free : 0);
