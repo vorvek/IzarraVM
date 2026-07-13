@@ -316,6 +316,194 @@ function Read-QuakeTimedemoIdentity([string]$Path) {
     return $identity
 }
 
+$backendQuakeWaitMarker = "IZARRA-QEMU-QUAKE-WAIT-DONE-20260713C001"
+$backendQuakeAutoexecSha256 = "c72b5c0e66ffd1743c857e430ade756b63bbf16e08d79f9c58d53108ba0f85fc"
+$backendQuakeBenchCfgSha256 = "c20a7cef0f12c7a4422781fe2cff06dbfb9e11de4fe7483333a36b3c95c7537a"
+
+function Test-BackendQuakeCompletionOverride([bool]$IsBackendBakeoff, [string]$PolicyName) {
+    return $IsBackendBakeoff -and $PolicyName -ceq "quake-586"
+}
+
+function Test-ObservationRequiresTestExit([bool]$IsBackendBakeoff, [string]$PolicyName) {
+    return $PolicyName.StartsWith("doom-", [StringComparison]::Ordinal) -or
+        (Test-BackendQuakeCompletionOverride $IsBackendBakeoff $PolicyName)
+}
+
+function Get-BackendQuakeCompletionOverrides {
+    $autoexecText = (@(
+        "@echo off",
+        "cd \QUAKE",
+        "quake.exe -nosound -nocdaudio -nojoy -condebug +timedemo demo1 +startdemos +exec bench.cfg",
+        "C:\EXITVM.COM"
+    ) -join "`n") + "`n"
+    $benchCfgText = (@(
+        'alias w10 "wait;wait;wait;wait;wait;wait;wait;wait;wait;wait"',
+        'alias w100 "w10;w10;w10;w10;w10;w10;w10;w10;w10;w10"',
+        'alias w1000 "w100;w100;w100;w100;w100;w100;w100;w100;w100;w100"',
+        "",
+        "w1000",
+        "echo $backendQuakeWaitMarker",
+        "toggleconsole",
+        "quit"
+    ) -join "`n") + "`n"
+    $ascii = [Text.Encoding]::ASCII
+    $autoexecBytes = $ascii.GetBytes($autoexecText)
+    $benchCfgBytes = $ascii.GetBytes($benchCfgText)
+    $autoexecHash = Get-BytesSha256 $autoexecBytes
+    $benchCfgHash = Get-BytesSha256 $benchCfgBytes
+    if ($autoexecHash -cne $backendQuakeAutoexecSha256 -or
+        $benchCfgHash -cne $backendQuakeBenchCfgSha256) {
+        throw "The BackendBakeoff Quake completion override bytes changed."
+    }
+    return [pscustomobject][ordered]@{
+        autoexec_bytes = $autoexecBytes
+        autoexec_sha256 = $autoexecHash
+        bench_cfg_bytes = $benchCfgBytes
+        bench_cfg_sha256 = $benchCfgHash
+        wait_marker = $backendQuakeWaitMarker
+    }
+}
+
+function Find-BackendQuakeFatalText([string[]]$Paths) {
+    $fatalMatches = [Collections.Generic.List[string]]::new()
+    foreach ($path in $Paths) {
+        if ([string]::IsNullOrWhiteSpace($path) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            continue
+        }
+        $lineNumber = 0
+        foreach ($line in [IO.File]::ReadAllLines($path)) {
+            $lineNumber++
+            if ($line -match '(?i)No demos listed with startdemos|Host_Error|Sys_Error|Demo message\s*>\s*MAX_MSGLEN|\bfatal\b') {
+                $fatalMatches.Add("$([IO.Path]::GetFileName($path)):${lineNumber}:$($line.Trim())")
+            }
+        }
+    }
+    return [object[]]$fatalMatches
+}
+
+function Read-BackendQuakeCompletion(
+    [string]$QconsolePath,
+    [string[]]$AdditionalDiagnosticPaths = @()
+) {
+    $identities = [Collections.Generic.List[object]]::new()
+    $identityLines = [Collections.Generic.List[int]]::new()
+    $markerLines = [Collections.Generic.List[int]]::new()
+    if (Test-Path -LiteralPath $QconsolePath -PathType Leaf) {
+        $lineNumber = 0
+        foreach ($line in [IO.File]::ReadAllLines($QconsolePath)) {
+            $lineNumber++
+            $identity = ConvertFrom-QuakeTimedemoLine $line
+            if ($null -ne $identity) {
+                $identities.Add($identity)
+                $identityLines.Add($lineNumber)
+            }
+            if ($line.Trim() -ceq $backendQuakeWaitMarker) {
+                $markerLines.Add($lineNumber)
+            }
+        }
+    }
+    $allDiagnosticPaths = @($QconsolePath) + @($AdditionalDiagnosticPaths)
+    $fatalMatches = @(Find-BackendQuakeFatalText $allDiagnosticPaths)
+    $identity = if ($identities.Count -eq 1) { $identities[0] } else { $null }
+    $identityLine = if ($identityLines.Count -eq 1) { $identityLines[0] } else { $null }
+    $markerLine = if ($markerLines.Count -eq 1) { $markerLines[0] } else { $null }
+    $resultBeforeMarker = $null -ne $identityLine -and $null -ne $markerLine -and
+        $identityLine -lt $markerLine
+    $reportedValuesConsistent = $null -ne $identity -and $identity.seconds -gt 0 -and
+        [Math]::Abs($identity.frames / $identity.seconds - $identity.fps) -le 0.2
+    return [pscustomobject][ordered]@{
+        identity_count = $identities.Count
+        timedemo = $identity
+        timedemo_line_number = $identityLine
+        wait_marker = $backendQuakeWaitMarker
+        wait_marker_count = $markerLines.Count
+        wait_marker_line_number = $markerLine
+        result_before_wait_marker = $resultBeforeMarker
+        reported_values_consistent = $reportedValuesConsistent
+        fatal_match_count = $fatalMatches.Count
+        fatal_matches = [object[]]$fatalMatches
+    }
+}
+
+function Get-BackendQuakeCompletionReasons($Completion, [string]$Label) {
+    $reasons = @()
+    if ($null -eq $Completion) {
+        return @("$Label is missing its Quake completion evidence")
+    }
+    if ($Completion.identity_count -ne 1 -or $null -eq $Completion.timedemo -or
+        $Completion.timedemo.frames -ne 969 -or $Completion.timedemo.seconds -le 0 -or
+        $Completion.timedemo.fps -le 0) {
+        $reasons += "$Label did not produce exactly one valid 969-frame Quake identity"
+    } elseif (-not $Completion.reported_values_consistent) {
+        $reasons += "$Label reported inconsistent Quake seconds and fps"
+    }
+    if ($Completion.wait_marker_count -ne 1) {
+        $reasons += "$Label did not produce exactly one post-timedemo wait marker"
+    } elseif (-not $Completion.result_before_wait_marker) {
+        $reasons += "$Label did not report the timedemo before the post-demo wait completed"
+    }
+    if ($Completion.fatal_match_count -ne 0) {
+        $reasons += "$Label contains fatal Quake text: $($Completion.fatal_matches -join '; ')"
+    }
+    return @($reasons)
+}
+
+function Get-BackendQuakeFixtureReasons($Fixture, [string]$Label) {
+    $reasons = @()
+    if ($null -eq $Fixture) {
+        return @("$Label is missing its disposable Quake fixture evidence")
+    }
+    foreach ($property in @(
+        "canonical_tree_sha256", "autoexec_before_sha256", "bench_cfg_before_sha256",
+        "autoexec_override_sha256", "bench_cfg_override_sha256", "exitvm_sha256",
+        "prelaunch_overridden_tree_sha256"
+    )) {
+        if ($null -eq $Fixture.PSObject.Properties[$property] -or
+            [string]$Fixture.$property -notmatch '^[0-9a-f]{64}$') {
+            $reasons += "$Label fixture evidence has an invalid $property"
+        }
+    }
+    if ($null -eq $Fixture.PSObject.Properties["autoexec_override_sha256"] -or
+        $Fixture.autoexec_override_sha256 -cne $backendQuakeAutoexecSha256) {
+        $reasons += "$Label used the wrong BackendBakeoff Quake AUTOEXEC override"
+    }
+    if ($null -eq $Fixture.PSObject.Properties["bench_cfg_override_sha256"] -or
+        $Fixture.bench_cfg_override_sha256 -cne $backendQuakeBenchCfgSha256) {
+        $reasons += "$Label used the wrong BackendBakeoff Quake bench.cfg override"
+    }
+    if ($null -eq $Fixture.PSObject.Properties["stale_qconsole_absent_before_launch"] -or
+        -not $Fixture.stale_qconsole_absent_before_launch) {
+        $reasons += "$Label launched with a stale QCONSOLE.LOG"
+    }
+    return @($reasons)
+}
+
+function Assert-BackendQuakeFixtureSet([object[]]$Samples) {
+    if ($Samples.Count -eq 0) {
+        throw "The BackendBakeoff Quake fixture set is empty."
+    }
+    $identities = @()
+    foreach ($sample in $Samples) {
+        $label = "$($sample.gate_role) $($sample.gate_observation)"
+        $fixture = if ($null -ne $sample.PSObject.Properties["gate_fixture"]) {
+            $sample.gate_fixture
+        } else {
+            $null
+        }
+        $reasons = @(Get-BackendQuakeFixtureReasons $fixture $label)
+        if ($reasons.Count -ne 0) {
+            throw "The BackendBakeoff Quake fixture set is invalid: $($reasons -join '; ')"
+        }
+        $identities += Get-MeasurementFixtureIdentityKey $sample
+    }
+    $uniqueIdentities = @($identities | Sort-Object -Unique)
+    if ($uniqueIdentities.Count -ne 1) {
+        throw "BackendBakeoff Quake did not use one identical prelaunch fixture across every observation."
+    }
+    return $uniqueIdentities[0]
+}
+
 function Assert-SelfTestThrows([scriptblock]$Action, [string]$MessagePart) {
     try {
         & $Action
@@ -513,6 +701,89 @@ function Get-FileSha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-DirectoryTreeSha256([string]$Root, [string[]]$ExcludedRelativePaths = @()) {
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $excluded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($relativePath in $ExcludedRelativePaths) {
+        $null = $excluded.Add($relativePath.Replace("\", "/"))
+    }
+    $files = @(Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force | ForEach-Object {
+        $relative = [IO.Path]::GetRelativePath($rootPath, $_.FullName).Replace("\", "/")
+        if (-not $excluded.Contains($relative)) {
+            [pscustomobject]@{
+                relative = $relative
+                path = $_.FullName
+                length = $_.Length
+            }
+        }
+    })
+    [Array]::Sort($files, [Comparison[object]]{
+        param($left, $right)
+        [StringComparer]::Ordinal.Compare($left.relative, $right.relative)
+    })
+    $records = foreach ($file in $files) {
+        $hash = (Get-FileHash -LiteralPath $file.path -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$($file.relative)`0$($file.length)`0$hash`n"
+    }
+    return Get-BytesSha256 ([Text.Encoding]::UTF8.GetBytes(($records -join "")))
+}
+
+function Set-BackendQuakeCompletionFixture(
+    [string]$Fixture,
+    [string]$ExpectedCanonicalTreeSha256,
+    [byte[]]$ExitVmBytes,
+    [string]$ExitVmSha256
+) {
+    $qconsolePath = Join-Path $Fixture "QUAKE/ID1/QCONSOLE.LOG"
+    if (Test-Path -LiteralPath $qconsolePath -PathType Leaf) {
+        Remove-Item -LiteralPath $qconsolePath
+    }
+    if (Test-Path -LiteralPath $qconsolePath) {
+        throw "The BackendBakeoff Quake fixture contains a stale QCONSOLE.LOG."
+    }
+    $canonicalTreeHash = Get-DirectoryTreeSha256 $Fixture @(
+        "EXITVM.COM", "QUAKE/ID1/QCONSOLE.LOG"
+    )
+    if ($canonicalTreeHash -cne $ExpectedCanonicalTreeSha256) {
+        throw "The disposable Quake copy does not match its verified canonical tree."
+    }
+    $autoexecPath = Join-Path $Fixture "AUTOEXEC.BAT"
+    $benchCfgPath = Join-Path $Fixture "QUAKE/ID1/bench.cfg"
+    foreach ($path in @($autoexecPath, $benchCfgPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "The BackendBakeoff Quake override target is missing: $path"
+        }
+    }
+    $autoexecBeforeHash = Get-FileSha256 $autoexecPath
+    $benchCfgBeforeHash = Get-FileSha256 $benchCfgPath
+    $overrides = Get-BackendQuakeCompletionOverrides
+    [IO.File]::WriteAllBytes((Join-Path $Fixture "EXITVM.COM"), $ExitVmBytes)
+    [IO.File]::WriteAllBytes($autoexecPath, $overrides.autoexec_bytes)
+    [IO.File]::WriteAllBytes($benchCfgPath, $overrides.bench_cfg_bytes)
+    $autoexecOverrideHash = Get-FileSha256 $autoexecPath
+    $benchCfgOverrideHash = Get-FileSha256 $benchCfgPath
+    $injectedExitVmHash = Get-FileSha256 (Join-Path $Fixture "EXITVM.COM")
+    if ($autoexecOverrideHash -cne $overrides.autoexec_sha256 -or
+        $benchCfgOverrideHash -cne $overrides.bench_cfg_sha256 -or
+        $injectedExitVmHash -cne $ExitVmSha256) {
+        throw "The BackendBakeoff Quake prelaunch bytes do not match their fixed identities."
+    }
+    if (Test-Path -LiteralPath $qconsolePath) {
+        throw "The BackendBakeoff Quake fixture recreated QCONSOLE.LOG before launch."
+    }
+    return [pscustomobject][ordered]@{
+        canonical_tree_sha256 = $canonicalTreeHash
+        autoexec_before_sha256 = $autoexecBeforeHash
+        bench_cfg_before_sha256 = $benchCfgBeforeHash
+        autoexec_override_sha256 = $autoexecOverrideHash
+        bench_cfg_override_sha256 = $benchCfgOverrideHash
+        exitvm_sha256 = $injectedExitVmHash
+        prelaunch_overridden_tree_sha256 = Get-DirectoryTreeSha256 `
+            $Fixture @("QUAKE/ID1/QCONSOLE.LOG")
+        stale_qconsole_absent_before_launch = $true
+    }
+}
+
 function Get-NormalizedResultBlock([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return [pscustomobject][ordered]@{
@@ -583,6 +854,41 @@ function Get-TimedemoIdentityKey([string]$WorkloadName, $Sample) {
     return "quake|$($Sample.quake_timedemo.line)"
 }
 
+function Get-MeasurementFixtureIdentityKey($Sample) {
+    if ($null -eq $Sample.PSObject.Properties["gate_fixture"] -or
+        $null -eq $Sample.gate_fixture) {
+        return "not_applicable"
+    }
+    $fixture = $Sample.gate_fixture
+    return @(
+        $fixture.canonical_tree_sha256,
+        $fixture.autoexec_before_sha256,
+        $fixture.bench_cfg_before_sha256,
+        $fixture.autoexec_override_sha256,
+        $fixture.bench_cfg_override_sha256,
+        $fixture.exitvm_sha256,
+        $fixture.prelaunch_overridden_tree_sha256,
+        $fixture.stale_qconsole_absent_before_launch
+    ) -join "|"
+}
+
+function Get-QuakeCompletionIdentityKey([string]$WorkloadName, $Sample) {
+    if ($WorkloadName -cne "quake-586" -or
+        $null -eq $Sample.PSObject.Properties["gate_quake_completion"] -or
+        $null -eq $Sample.gate_quake_completion) {
+        return "not_applicable"
+    }
+    $completion = $Sample.gate_quake_completion
+    return @(
+        $completion.identity_count,
+        $completion.wait_marker,
+        $completion.wait_marker_count,
+        $completion.result_before_wait_marker,
+        $completion.reported_values_consistent,
+        $completion.fatal_match_count
+    ) -join "|"
+}
+
 function Get-EqualWorkRecord([string]$WorkloadName, $Sample) {
     $resultStatus = [string]$Sample.gate_artifacts.result_block_status
     $resultHash = [string]$Sample.gate_artifacts.result_block_sha256
@@ -595,6 +901,8 @@ function Get-EqualWorkRecord([string]$WorkloadName, $Sample) {
         stop = Get-StopIdentityKey $Sample
         timedemo_identity = Get-TimedemoIdentityKey $WorkloadName $Sample
         result_block_identity = "$resultStatus|$resultHash"
+        measurement_fixture_identity = Get-MeasurementFixtureIdentityKey $Sample
+        quake_completion_identity = Get-QuakeCompletionIdentityKey $WorkloadName $Sample
     }
 }
 
@@ -683,18 +991,18 @@ function Get-BackendCompatibilityReasons($Policy, [string]$Role, [object[]]$Samp
                 $reasons += "$label did not report the 2134-gametic Doom demo"
             }
         } else {
-            if ($sample.quake_timedemo_identity_count -ne 1 -or
-                $null -eq $sample.quake_timedemo -or
-                $sample.quake_timedemo.frames -ne 969 -or
-                $sample.quake_timedemo.seconds -le 0 -or
-                $sample.quake_timedemo.fps -le 0) {
-                $reasons += "$label did not produce exactly one valid 969-frame Quake identity"
-            } elseif ([Math]::Abs(
-                $sample.quake_timedemo.frames / $sample.quake_timedemo.seconds -
-                    $sample.quake_timedemo.fps
-            ) -gt 0.2) {
-                $reasons += "$label reported inconsistent Quake seconds and fps"
+            $completion = if ($null -ne $sample.PSObject.Properties["gate_quake_completion"]) {
+                $sample.gate_quake_completion
+            } else {
+                $null
             }
+            $fixture = if ($null -ne $sample.PSObject.Properties["gate_fixture"]) {
+                $sample.gate_fixture
+            } else {
+                $null
+            }
+            $reasons += @(Get-BackendQuakeCompletionReasons $completion $label)
+            $reasons += @(Get-BackendQuakeFixtureReasons $fixture $label)
         }
     }
     return @($reasons)
@@ -807,6 +1115,29 @@ function Assert-BackendWarmupSample($Sample, [string]$Role, [string]$WorkloadNam
             [string]$Sample.gate_artifacts.qconsole_sha256 -notmatch '^[0-9a-f]{64}$') {
             throw "$Role Quake warmup is missing its hashed console log."
         }
+        if ($null -eq $Sample.PSObject.Properties["gate_process_exit_code"] -or
+            $Sample.gate_process_exit_code -ne 0 -or
+            (Get-StopIdentityKey $Sample) -cne "test_exit|code=0|requested=|message=") {
+            throw "$Role Quake warmup did not reach Lotura TestExit code 0."
+        }
+        $completion = if ($null -ne $Sample.PSObject.Properties["gate_quake_completion"]) {
+            $Sample.gate_quake_completion
+        } else {
+            $null
+        }
+        $fixture = if ($null -ne $Sample.PSObject.Properties["gate_fixture"]) {
+            $Sample.gate_fixture
+        } else {
+            $null
+        }
+        $completionReasons = @(Get-BackendQuakeCompletionReasons $completion "$Role warmup")
+        if ($completionReasons.Count -ne 0) {
+            throw "$Role Quake warmup failed its completion protocol: $($completionReasons -join '; ')"
+        }
+        $fixtureReasons = @(Get-BackendQuakeFixtureReasons $fixture "$Role warmup")
+        if ($fixtureReasons.Count -ne 0) {
+            throw "$Role Quake warmup failed its fixture contract: $($fixtureReasons -join '; ')"
+        }
     } elseif ($null -ne $Sample.gate_artifacts.qconsole_file -or
         $null -ne $Sample.gate_artifacts.qconsole_sha256) {
         throw "$WorkloadName $Role warmup must keep explicit null qconsole fields."
@@ -842,6 +1173,171 @@ if ($SelfTest) {
     Assert-SelfTestThrows {
         Assert-QuakeAutoexecText "quake.exe -nosound"
     } "must launch +timedemo demo1"
+    if (-not (Test-BackendQuakeCompletionOverride $true "quake-586") -or
+        (Test-BackendQuakeCompletionOverride $false "quake-586") -or
+        (Test-BackendQuakeCompletionOverride $true "doom-586") -or
+        (Test-BackendQuakeCompletionOverride $false "doom-586")) {
+        throw "The BackendBakeoff Quake completion override selection leaked into another policy."
+    }
+    if (-not (Test-ObservationRequiresTestExit $true "quake-586") -or
+        (Test-ObservationRequiresTestExit $false "quake-586") -or
+        -not (Test-ObservationRequiresTestExit $true "doom-586") -or
+        -not (Test-ObservationRequiresTestExit $false "doom-586")) {
+        throw "The observation TestExit selection changed a normal or BackendBakeoff policy."
+    }
+    $completionOverrides = Get-BackendQuakeCompletionOverrides
+    if ($completionOverrides.autoexec_bytes.Length -ne 125 -or
+        $completionOverrides.autoexec_sha256 -cne $backendQuakeAutoexecSha256 -or
+        $completionOverrides.bench_cfg_bytes.Length -ne 251 -or
+        $completionOverrides.bench_cfg_sha256 -cne $backendQuakeBenchCfgSha256 -or
+        [Text.Encoding]::ASCII.GetString($completionOverrides.autoexec_bytes) -notmatch
+            '\+timedemo demo1 \+startdemos \+exec bench\.cfg') {
+        throw "The BackendBakeoff Quake completion override identity is wrong."
+    }
+    $quakeCompletionSelfTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "izarravm-quake-completion-$([guid]::NewGuid().ToString('N'))"
+    )
+    New-Item -ItemType Directory -Path $quakeCompletionSelfTestRoot | Out-Null
+    $quakeCompletionLog = Join-Path $quakeCompletionSelfTestRoot "QCONSOLE.LOG"
+    $quakeCompletionStdout = Join-Path $quakeCompletionSelfTestRoot "stdout.log"
+    $quakeCompletionStderr = Join-Path $quakeCompletionSelfTestRoot "stderr.log"
+    try {
+        $newCompletionFixture = {
+            param(
+                [string]$Name,
+                [bool]$OmitBenchCfg = $false,
+                [bool]$UseStaleQconsoleDirectory = $false
+            )
+            $fixtureRoot = Join-Path $quakeCompletionSelfTestRoot $Name
+            $id1 = Join-Path $fixtureRoot "QUAKE/ID1"
+            New-Item -ItemType Directory -Path $id1 | Out-Null
+            [IO.File]::WriteAllText(
+                (Join-Path $fixtureRoot "AUTOEXEC.BAT"),
+                "canonical autoexec`n",
+                [Text.Encoding]::ASCII
+            )
+            [IO.File]::WriteAllText(
+                (Join-Path $fixtureRoot "CONFIG.SYS"),
+                "canonical config`n",
+                [Text.Encoding]::ASCII
+            )
+            if (-not $OmitBenchCfg) {
+                [IO.File]::WriteAllText(
+                    (Join-Path $id1 "bench.cfg"),
+                    "canonical bench`n",
+                    [Text.Encoding]::ASCII
+                )
+            }
+            $staleQconsole = Join-Path $id1 "QCONSOLE.LOG"
+            if ($UseStaleQconsoleDirectory) {
+                New-Item -ItemType Directory -Path $staleQconsole | Out-Null
+            } else {
+                [IO.File]::WriteAllText(
+                    $staleQconsole,
+                    "stale console`n",
+                    [Text.Encoding]::ASCII
+                )
+            }
+            return $fixtureRoot
+        }
+        $fixtureExitBytes = [Text.Encoding]::ASCII.GetBytes("exit fixture`n")
+        $fixtureExitHash = Get-BytesSha256 $fixtureExitBytes
+        $successfulFixture = & $newCompletionFixture "fixture-success"
+        $successfulCanonicalHash = Get-DirectoryTreeSha256 $successfulFixture @(
+            "EXITVM.COM", "QUAKE/ID1/QCONSOLE.LOG"
+        )
+        $fixtureEvidence = Set-BackendQuakeCompletionFixture `
+            $successfulFixture $successfulCanonicalHash $fixtureExitBytes $fixtureExitHash
+        if ($fixtureEvidence.canonical_tree_sha256 -cne $successfulCanonicalHash -or
+            $fixtureEvidence.autoexec_override_sha256 -cne $backendQuakeAutoexecSha256 -or
+            $fixtureEvidence.bench_cfg_override_sha256 -cne $backendQuakeBenchCfgSha256 -or
+            $fixtureEvidence.exitvm_sha256 -cne $fixtureExitHash -or
+            $fixtureEvidence.prelaunch_overridden_tree_sha256 -cne (
+                Get-DirectoryTreeSha256 $successfulFixture @("QUAKE/ID1/QCONSOLE.LOG")
+            ) -or
+            -not $fixtureEvidence.stale_qconsole_absent_before_launch -or
+            (Test-Path -LiteralPath (Join-Path $successfulFixture "QUAKE/ID1/QCONSOLE.LOG"))) {
+            throw "The production Quake completion fixture writer returned invalid evidence."
+        }
+        $staleDirectoryFixture = & $newCompletionFixture "fixture-stale-directory" $false $true
+        $staleDirectoryCanonicalHash = Get-DirectoryTreeSha256 $staleDirectoryFixture @(
+            "EXITVM.COM", "QUAKE/ID1/QCONSOLE.LOG"
+        )
+        Assert-SelfTestThrows {
+            Set-BackendQuakeCompletionFixture `
+                $staleDirectoryFixture $staleDirectoryCanonicalHash $fixtureExitBytes $fixtureExitHash
+        } "stale QCONSOLE.LOG"
+        $wrongCanonicalFixture = & $newCompletionFixture "fixture-wrong-canonical"
+        Assert-SelfTestThrows {
+            Set-BackendQuakeCompletionFixture `
+                $wrongCanonicalFixture ("0" * 64) $fixtureExitBytes $fixtureExitHash
+        } "verified canonical tree"
+        $missingTargetFixture = & $newCompletionFixture "fixture-missing-target" $true
+        $missingTargetCanonicalHash = Get-DirectoryTreeSha256 $missingTargetFixture @(
+            "EXITVM.COM", "QUAKE/ID1/QCONSOLE.LOG"
+        )
+        Assert-SelfTestThrows {
+            Set-BackendQuakeCompletionFixture `
+                $missingTargetFixture $missingTargetCanonicalHash $fixtureExitBytes $fixtureExitHash
+        } "override target is missing"
+        $wrongExitFixture = & $newCompletionFixture "fixture-wrong-exit"
+        $wrongExitCanonicalHash = Get-DirectoryTreeSha256 $wrongExitFixture @(
+            "EXITVM.COM", "QUAKE/ID1/QCONSOLE.LOG"
+        )
+        Assert-SelfTestThrows {
+            Set-BackendQuakeCompletionFixture `
+                $wrongExitFixture $wrongExitCanonicalHash $fixtureExitBytes ("0" * 64)
+        } "prelaunch bytes"
+        [IO.File]::WriteAllText($quakeCompletionStdout, "", [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllText($quakeCompletionStderr, "", [Text.Encoding]::ASCII)
+        $validCompletionText = "969 frames  22.8 seconds  42.5 fps`n$backendQuakeWaitMarker`n"
+        [IO.File]::WriteAllText($quakeCompletionLog, $validCompletionText, [Text.Encoding]::ASCII)
+        $validCompletion = Read-BackendQuakeCompletion `
+            $quakeCompletionLog @($quakeCompletionStdout, $quakeCompletionStderr)
+        if (@(Get-BackendQuakeCompletionReasons $validCompletion "valid").Count -ne 0) {
+            throw "The ordered Quake completion parser rejected valid evidence."
+        }
+        $invalidCompletionCases = [ordered]@{
+            missing_marker = "969 frames  22.8 seconds  42.5 fps`n"
+            duplicate_marker = "969 frames  22.8 seconds  42.5 fps`n$backendQuakeWaitMarker`n$backendQuakeWaitMarker`n"
+            result_after_marker = "$backendQuakeWaitMarker`n969 frames  22.8 seconds  42.5 fps`n"
+            duplicate_result = "969 frames  22.8 seconds  42.5 fps`n969 frames  22.8 seconds  42.5 fps`n$backendQuakeWaitMarker`n"
+        }
+        foreach ($case in $invalidCompletionCases.GetEnumerator()) {
+            [IO.File]::WriteAllText($quakeCompletionLog, $case.Value, [Text.Encoding]::ASCII)
+            $completion = Read-BackendQuakeCompletion `
+                $quakeCompletionLog @($quakeCompletionStdout, $quakeCompletionStderr)
+            if (@(Get-BackendQuakeCompletionReasons $completion $case.Key).Count -eq 0) {
+                throw "The Quake completion parser accepted $($case.Key)."
+            }
+        }
+        [IO.File]::WriteAllText($quakeCompletionLog, $validCompletionText, [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllText(
+            $quakeCompletionStdout,
+            "Host_Error: synthetic fatal path`n",
+            [Text.Encoding]::ASCII
+        )
+        $fatalCompletion = Read-BackendQuakeCompletion `
+            $quakeCompletionLog @($quakeCompletionStdout, $quakeCompletionStderr)
+        if ($fatalCompletion.fatal_match_count -ne 1 -or
+            @(Get-BackendQuakeCompletionReasons $fatalCompletion "fatal").Count -eq 0) {
+            throw "The Quake completion parser accepted fatal diagnostic text."
+        }
+    } finally {
+        if (Test-Path -LiteralPath $quakeCompletionSelfTestRoot -PathType Container) {
+            $resolvedSelfTestRoot = (Resolve-Path -LiteralPath $quakeCompletionSelfTestRoot).Path
+            $resolvedHostTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd(
+                [IO.Path]::DirectorySeparatorChar
+            )
+            if (-not $resolvedSelfTestRoot.StartsWith(
+                $resolvedHostTemp + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw "The Quake completion self-test directory escaped the host temp root."
+            }
+            Remove-Item -LiteralPath $resolvedSelfTestRoot -Recurse -Force
+        }
+    }
     Assert-UninstrumentedProfileSample ([pscustomobject]@{
         machine_phase_timing_enabled = $false
     }) "clean sample"
@@ -1145,6 +1641,54 @@ if ($SelfTest) {
         name = "quake-586"
         cycle_budget = [uint64]6200000000
     }
+    $syntheticQuakeCompletion = [pscustomobject]@{
+        identity_count = 1
+        timedemo = [pscustomobject]@{
+            line = "969 frames  22.8 seconds  42.5 fps"
+            frames = 969
+            seconds = 22.8
+            fps = 42.5
+        }
+        timedemo_line_number = 10
+        wait_marker = $backendQuakeWaitMarker
+        wait_marker_count = 1
+        wait_marker_line_number = 11
+        result_before_wait_marker = $true
+        reported_values_consistent = $true
+        fatal_match_count = 0
+        fatal_matches = [object[]]@()
+    }
+    $syntheticQuakeFixture = [pscustomobject]@{
+        canonical_tree_sha256 = "d" * 64
+        autoexec_before_sha256 = "e" * 64
+        bench_cfg_before_sha256 = "f" * 64
+        autoexec_override_sha256 = $backendQuakeAutoexecSha256
+        bench_cfg_override_sha256 = $backendQuakeBenchCfgSha256
+        exitvm_sha256 = "a" * 64
+        prelaunch_overridden_tree_sha256 = "b" * 64
+        stale_qconsole_absent_before_launch = $true
+    }
+    $fixtureSetSamples = @(
+        [pscustomobject]@{
+            gate_role = "automatic"
+            gate_observation = "warmup"
+            gate_fixture = $syntheticQuakeFixture
+        },
+        [pscustomobject]@{
+            gate_role = "interpreter"
+            gate_observation = "pair1"
+            gate_fixture = $syntheticQuakeFixture
+        }
+    )
+    $fixtureSetIdentity = Assert-BackendQuakeFixtureSet $fixtureSetSamples
+    if ([string]::IsNullOrWhiteSpace($fixtureSetIdentity)) {
+        throw "The identical BackendBakeoff Quake fixture set lost its identity."
+    }
+    $mismatchedFixtureSample = $fixtureSetSamples[1] | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $mismatchedFixtureSample.gate_fixture.prelaunch_overridden_tree_sha256 = "c" * 64
+    Assert-SelfTestThrows {
+        Assert-BackendQuakeFixtureSet @($fixtureSetSamples[0], $mismatchedFixtureSample)
+    } "one identical prelaunch fixture"
     $cycleLimitSamples = [ordered]@{
         automatic = @()
         interpreter = @()
@@ -1170,6 +1714,8 @@ if ($SelfTest) {
                     seconds = 22.8
                     fps = 42.5
                 }
+                gate_quake_completion = $syntheticQuakeCompletion
+                gate_fixture = $syntheticQuakeFixture
             }
         }
     }
@@ -1247,6 +1793,20 @@ if ($SelfTest) {
         $testExitClassification.verdict -ne "survived") {
         throw "TestExit Quake evidence did not retain final eligibility: compatibility=$($testExitProjection.compatibility_verdict), compatibility_reasons=$($testExitCompatibilityReasons.Count), termination_reasons=$(@($testExitProjection.final_termination_reasons).Count), final=$($testExitClassification.final_eligible), survival=$($testExitClassification.track_a_survival), verdict=$($testExitClassification.verdict)."
     }
+    $nonzeroExitSamples = [ordered]@{
+        automatic = @($testExitSamples.automatic)
+        interpreter = @($testExitSamples.interpreter)
+    }
+    $nonzeroExitSample = $nonzeroExitSamples.automatic[0].PSObject.Copy()
+    $nonzeroExitSample.gate_process_exit_code = 9
+    $nonzeroExitSamples.automatic[0] = $nonzeroExitSample
+    $nonzeroExitProjection = Get-BackendTerminationProjection `
+        $quakePolicy $nonzeroExitSamples.automatic $nonzeroExitSamples.interpreter
+    if ($nonzeroExitProjection.compatibility_verdict -ne "fail" -or
+        @($nonzeroExitProjection.compatibility_reasons).Count -ne 1 -or
+        $nonzeroExitProjection.compatibility_reasons[0] -notlike "*host exit code is 9*") {
+        throw "A nonzero BackendBakeoff Quake process exit was not rejected."
+    }
     $warmupPackage = [ordered]@{}
     foreach ($workloadName in @("doom-486", "doom-586", "quake-586")) {
         $bucket = [ordered]@{}
@@ -1255,9 +1815,21 @@ if ($SelfTest) {
             $bucket[$role] = @([pscustomobject]@{
                 gate_role = $role
                 gate_observation = "warmup"
+                gate_process_exit_code = 0
                 gate_processor_index = 8
                 gate_processor_affinity_mask = "0x0000000000000100"
                 gate_processor_affinity_verified = $true
+                stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
+                gate_quake_completion = if ($workloadName -eq "quake-586") {
+                    $syntheticQuakeCompletion
+                } else {
+                    $null
+                }
+                gate_fixture = if ($workloadName -eq "quake-586") {
+                    $syntheticQuakeFixture
+                } else {
+                    $null
+                }
                 gate_artifacts = [pscustomobject]@{
                     profile_json_file = "$workloadName-$role-warmup.json"
                     profile_json_sha256 = $hash
@@ -1292,6 +1864,14 @@ if ($SelfTest) {
     Assert-SelfTestThrows {
         Assert-BackendWarmupSample $missingQconsoleWarmup "automatic" "quake-586"
     } "hashed console log"
+    $missingMarkerWarmup = $warmupPackage["quake-586"].automatic[0] |
+        ConvertTo-Json -Depth 10 | ConvertFrom-Json
+    $missingMarkerWarmup.gate_quake_completion.wait_marker_count = 0
+    $missingMarkerWarmup.gate_quake_completion.wait_marker_line_number = $null
+    $missingMarkerWarmup.gate_quake_completion.result_before_wait_marker = $false
+    Assert-SelfTestThrows {
+        Assert-BackendWarmupSample $missingMarkerWarmup "automatic" "quake-586"
+    } "completion protocol"
     $warmupRoundTrip = $warmupPackage | ConvertTo-Json -Depth 10 | ConvertFrom-Json
     $representedWarmups = 0
     foreach ($workloadName in @("doom-486", "doom-586", "quake-586")) {
@@ -1605,33 +2185,6 @@ function Assert-NearlyEqual([double]$Actual, [double]$Expected, [string]$Name) {
     if ([Math]::Abs($Actual - $Expected) -gt $tolerance) {
         throw "Profile field '$Name' does not match its raw counters."
     }
-}
-
-function Get-DirectoryTreeSha256([string]$Root, [string[]]$ExcludedRelativePaths = @()) {
-    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
-    $excluded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($relativePath in $ExcludedRelativePaths) {
-        $null = $excluded.Add($relativePath.Replace("\", "/"))
-    }
-    $files = @(Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force | ForEach-Object {
-        $relative = [IO.Path]::GetRelativePath($rootPath, $_.FullName).Replace("\", "/")
-        if (-not $excluded.Contains($relative)) {
-            [pscustomobject]@{
-                relative = $relative
-                path = $_.FullName
-                length = $_.Length
-            }
-        }
-    })
-    [Array]::Sort($files, [Comparison[object]]{
-        param($left, $right)
-        [StringComparer]::Ordinal.Compare($left.relative, $right.relative)
-    })
-    $records = foreach ($file in $files) {
-        $hash = (Get-FileHash -LiteralPath $file.path -Algorithm SHA256).Hash.ToLowerInvariant()
-        "$($file.relative)`0$($file.length)`0$hash`n"
-    }
-    return Get-BytesSha256 ([Text.Encoding]::UTF8.GetBytes(($records -join "")))
 }
 
 function Get-AmbientCargoConfigurationPaths([string]$SourceRoot) {
@@ -2323,10 +2876,18 @@ function Invoke-Observation(
     $observationHome = Join-Path $temporaryRoot "home-$($Policy.name)-$Role-$ObservationId"
     Copy-Item -LiteralPath $SourceFolder -Destination $fixture -Recurse
     New-Item -ItemType Directory -Path $observationHome | Out-Null
-    [IO.File]::WriteAllBytes((Join-Path $fixture "EXITVM.COM"), $exitVmBytes)
     $qconsole = Join-Path $fixture "QUAKE/ID1/QCONSOLE.LOG"
-    if (Test-Path -LiteralPath $qconsole -PathType Leaf) {
-        Remove-Item -LiteralPath $qconsole
+    $useBackendQuakeCompletion = Test-BackendQuakeCompletionOverride `
+        ([bool]$BackendBakeoff) $Policy.name
+    $fixtureEvidence = $null
+    if ($useBackendQuakeCompletion) {
+        $fixtureEvidence = Set-BackendQuakeCompletionFixture `
+            $fixture $workloadCanonicalTreeHashes.quake $exitVmBytes $exitVmHash
+    } else {
+        [IO.File]::WriteAllBytes((Join-Path $fixture "EXITVM.COM"), $exitVmBytes)
+        if (Test-Path -LiteralPath $qconsole -PathType Leaf) {
+            Remove-Item -LiteralPath $qconsole
+        }
     }
 
     $fileStem = "$($Policy.name)-$Role-$ObservationId"
@@ -2343,7 +2904,7 @@ function Invoke-Observation(
         "--dump-result",
         "--profile-json", $jsonPath
     )
-    if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+    if (Test-ObservationRequiresTestExit ([bool]$BackendBakeoff) $Policy.name) {
         $processArguments += "--expect-test-exit"
     }
     if ($BackendBakeoff -and $Role -eq "interpreter") {
@@ -2425,16 +2986,16 @@ function Invoke-Observation(
             }
         }
         if ($BackendBakeoff) {
-            $quakeIdentities = @(Read-QuakeTimedemoIdentities $preservedQconsole)
-            $quakeIdentity = if ($quakeIdentities.Count -eq 1) {
-                $quakeIdentities[0]
-            } else {
-                $null
-            }
+            $quakeCompletion = Read-BackendQuakeCompletion `
+                $preservedQconsole @($stdoutPath, $stderrPath)
+            $quakeIdentity = $quakeCompletion.timedemo
             $sample | Add-Member `
                 -NotePropertyName quake_timedemo_identity_count `
-                -NotePropertyValue $quakeIdentities.Count
+                -NotePropertyValue $quakeCompletion.identity_count
             $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
+            $sample | Add-Member `
+                -NotePropertyName gate_quake_completion `
+                -NotePropertyValue $quakeCompletion
         } else {
             $quakeIdentity = Read-QuakeTimedemoIdentity $preservedQconsole
             $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
@@ -2446,9 +3007,10 @@ function Invoke-Observation(
             -NotePropertyName gate_process_exit_code `
             -NotePropertyValue $processResult.exit_code
         $sample | Add-Member -NotePropertyName gate_backend_policy -NotePropertyValue $Role
-        $sample | Add-Member -NotePropertyName gate_termination_policy -NotePropertyValue $(
-            if ($Policy.name -eq "quake-586") { "fixed_cycle_limit" } else { "lotura_test_exit" }
-        )
+        $sample | Add-Member `
+            -NotePropertyName gate_termination_policy `
+            -NotePropertyValue "lotura_test_exit"
+        $sample | Add-Member -NotePropertyName gate_fixture -NotePropertyValue $fixtureEvidence
         $sample | Add-Member -NotePropertyName gate_artifacts -NotePropertyValue ([pscustomobject][ordered]@{
             profile_json_file = [IO.Path]::GetFileName($jsonPath)
             profile_json_sha256 = $profileHash
@@ -2669,7 +3231,7 @@ function Get-BackendWorkloadSummary(
             cycle_budget = $Policy.cycle_budget
         }
         termination_policy = if ($Policy.name -eq "quake-586") {
-            "fixed_cycle_limit_with_post_demo_tail"
+            "one_969_frame_timedemo_then_post_demo_wait_then_lotura_test_exit_code_0"
         } else {
             "lotura_test_exit_after_timedemo"
         }
@@ -2835,8 +3397,18 @@ try {
         if ($BackendBakeoff) {
             $backendSummary = Get-BackendWorkloadSummary `
                 $policy $bucket.automatic $bucket.interpreter ([bool]$Screening)
-            $backendSummary["discarded_warmups"] = Get-BackendDiscardedWarmups `
+            $workloadWarmups = Get-BackendDiscardedWarmups `
                 $discardedWarmups[$policy.name] $policy.name
+            if ($policy.name -eq "quake-586") {
+                $allQuakeSamples = @(
+                    @($bucket.automatic) + @($bucket.interpreter) +
+                    @($discardedWarmups[$policy.name].automatic) +
+                    @($discardedWarmups[$policy.name].interpreter)
+                )
+                $backendSummary["completion_fixture_identity"] = `
+                    Assert-BackendQuakeFixtureSet $allQuakeSamples
+            }
+            $backendSummary["discarded_warmups"] = $workloadWarmups
             $workloads += $backendSummary
         } elseif ($pairedRun) {
             $workloads += Get-PairedWorkloadSummary $policy $bucket.candidate $bucket.baseline
@@ -3004,7 +3576,7 @@ if ($BackendBakeoff) {
         }
     }
     if ($finalTerminationReasons.Count -gt 0) {
-        $backendFailures += "quake-586: $($finalTerminationReasons.Count) measured observations failed the required post-timedemo TestExit contract; final proof requires exactly one 969-frame timedemo followed by Lotura TestExit code 0"
+        $backendFailures += "quake-586: $($finalTerminationReasons.Count) measured observations failed the required post-timedemo TestExit contract; final proof requires one 969-frame result, one later wait marker, and Lotura TestExit code 0"
     }
     foreach ($workloadResult in $workloads) {
         if ($workloadResult.survival.verdict -ne "pass") {
@@ -3016,6 +3588,28 @@ if ($BackendBakeoff) {
             if ($workloadResult.verdicts.$component -ne "pass") {
                 $backendFailures += "$($workloadResult.name): $component failed"
             }
+        }
+    }
+    $quakeCompletionFixtureSummary = $null
+    $quakeBackendWorkloads = @($workloads | Where-Object { $_.name -ceq "quake-586" })
+    if ($quakeBackendWorkloads.Count -eq 1) {
+        $quakeBackendWorkload = $quakeBackendWorkloads[0]
+        $firstQuakeSample = @($quakeBackendWorkload.automatic.runs)[0]
+        $firstQuakeFixture = $firstQuakeSample.gate_fixture
+        $quakeCompletionFixtureSummary = [ordered]@{
+            fixture_class = "backend_bakeoff_quake_completion_v1"
+            fresh_copy_per_observation = $true
+            canonical_tree_sha256 = $firstQuakeFixture.canonical_tree_sha256
+            autoexec_before_sha256 = $firstQuakeFixture.autoexec_before_sha256
+            bench_cfg_before_sha256 = $firstQuakeFixture.bench_cfg_before_sha256
+            izarra_autoexec_override_sha256 = $backendQuakeAutoexecSha256
+            bench_cfg_override_sha256 = $backendQuakeBenchCfgSha256
+            wait_marker = $backendQuakeWaitMarker
+            prelaunch_overridden_tree_sha256 = `
+                $firstQuakeFixture.prelaunch_overridden_tree_sha256
+            all_observations_fixture_identity = $quakeBackendWorkload.completion_fixture_identity
+            same_izarra_bytes_across_roles = $true
+            cycle_budget_is_safety_ceiling = $true
         }
     }
     $summary = [ordered]@{
@@ -3062,6 +3656,7 @@ if ($BackendBakeoff) {
         workload_inputs_sha256 = $workloadInputHashes
         workload_trees_sha256 = $workloadTreeHashes
         workload_canonical_trees_sha256 = $workloadCanonicalTreeHashes
+        quake_completion_fixture = $quakeCompletionFixtureSummary
         generated_utc = [DateTime]::UtcNow.ToString("o")
         host = [ordered]@{
             identity = $hostIdentity
@@ -3093,7 +3688,7 @@ if ($BackendBakeoff) {
         })
         termination_policies = [ordered]@{
             doom = "Lotura TestExit code 0 after the 2134-gametic timedemo"
-            quake = "exactly one 969-frame timedemo followed by Lotura TestExit code 0"
+            quake = "exactly one 969-frame timedemo, the fixed post-demo wait marker, then Lotura TestExit code 0"
             quake_diagnostic = "fixed 6.2G cycle limit with exactly one 969-frame identity; never final-eligible"
         }
         acceptance = [ordered]@{
@@ -3108,7 +3703,8 @@ if ($BackendBakeoff) {
             exact_work_fields = @(
                 "perf.instructions", "master_ticks", "elapsed_budget_clocks",
                 "executed_cpu_core_clocks", "raw_bus_clocks", "stop",
-                "timedemo_identity", "result_block_sha256"
+                "timedemo_identity", "result_block_sha256",
+                "measurement_fixture_identity", "quake_completion_identity"
             )
         }
         scope = "Headless same-executable CPU backend comparison. GUI pacing and audio require separate validation."
