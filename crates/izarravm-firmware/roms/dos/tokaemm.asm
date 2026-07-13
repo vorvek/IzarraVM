@@ -186,13 +186,6 @@ interrupt:
     retf
 
 init:
-    ; Report resident size FIRST, while ES:BX still points at the request header
-    ; (the setup below clobbers BX). r_endaddr = drv_seg:resident_end covers the
-    ; driver's code + tables, which stay resident under the monitor permanently.
-    mov word [es:bx+14], resident_end
-    mov word [es:bx+16], cs
-    mov word [es:bx+3], 0x0100    ; r_status = S_DONE
-
     ; Parse the DEVICE= tail for a whole-token "NOEMS" argument.
     ; r_bpbptr (+18) points at the raw command line, driver path first
     ; (FreeDOS init_device). Bare and RAM both use the default 3 MB EMS pool;
@@ -334,7 +327,30 @@ init:
     mov word [cs:umb_win_end], UMB_SEG_BASE
     mov eax, edi                  ; empty arena when the UMB backing cannot fit
 .arena_base:
+    ; Keep the monitor's seven paging pages out of conventional memory when
+    ; extended RAM has room.  The .SYS retains a low fallback tail for the
+    ; 1 MiB profile, but normal machines reserve these aligned pages before
+    ; the allocatable XMS/VCPI arena instead.
+    mov edx, eax
+    add edx, 0x7000
+    jc .low_tables
+    cmp edx, edi
+    ja .low_tables
+    mov [cs:pd_lin], eax
+    mov eax, edx
+    mov cx, resident_core_end
+    jmp .tables_selected
+.low_tables:
+    mov cx, resident_image_end
+.tables_selected:
     mov [cs:xms_pool_base], eax
+
+    ; BIOS calls above may clobber ES:BX.  Reload the saved INIT request and
+    ; report only the low core when the page tables were reserved high.
+    les bx, [cs:rh_ptr]
+    mov [es:bx+14], cx
+    mov word [es:bx+16], cs
+    mov word [es:bx+3], 0x0100    ; r_status = S_DONE
 
     ; Keep at least 1 MB for the shared XMS/VCPI arena when possible, then put
     ; up to 3 MB of EMS at the top. On the 24 MB product profile this makes the
@@ -345,7 +361,7 @@ init:
     cmp byte [cs:umb_available], 0
     je .ems_disable
     mov eax, edi
-    sub eax, UMB_PHYS_BASE + UMB_BYTES
+    sub eax, [cs:xms_pool_base]
     jc .ems_disable
     cmp eax, 0x00100000           ; retain a 1 MB shared arena
     jbe .ems_disable
@@ -420,10 +436,13 @@ init:
     shl eax, 4
     mov [base_lin], eax           ; base = CS<<4
 
+    cmp dword [pd_lin], 0
+    jne .pd_ready
     add eax, tables               ; pd_lin = page-align(base + tables)
     add eax, 0xFFF
     and eax, 0xFFFFF000
     mov [pd_lin], eax
+.pd_ready:
 
     mov eax, [base_lin]           ; code selector (0x08) base = base
     mov [gdt + 0x08 + 2], ax
@@ -1095,6 +1114,10 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     mov es, ax
     mov ss, ax
     mov esp, ebx                  ; monitor ring-0 stack (driver-resident)
+    mov edi, ebp                  ; high RAM is not guaranteed to start clear
+    xor eax, eax
+    mov ecx, 0x7000 / 4
+    rep stosd
     ; PD[0..5] -> the six PTs that follow the PD (each PT maps 4 MiB), so the
     ; identity map covers 0..24 MiB and the XMS-move memcpy can reach every EMB.
     lea eax, [ebp + 0x1000]       ; first PT linear = PD + 0x1000
@@ -2027,12 +2050,12 @@ vcpi_dispatch:
 ; (guest ES:DI) and three GDT descriptors (guest DS:SI), return the PM entry
 ; offset in EBX. The copy covers PT0 entries 0..0x10F -- the whole V86
 ; window this monitor furnishes (first MB + the 64K A20/HMA window), which
-; also maps the ENTIRE server (code, data, GDT, TSS, page tables are all
-; driver-resident conventional memory), so no extra above-1MB server
-; mappings are needed -- the structural gift of a low-resident monitor.
+; also maps the entire low server core (code, data, GDT, TSS, and stack).
+; The server page tables may be reserved above 1 MB, but DE0C reads pd_lin
+; from low server data before switching back to the server CR3.
 ; Software-defined PTE bits 9-11 are cleared in the copy (spec p.6; the
 ; 386MAX COPY_PTE convention). The descriptors: +0 the server code segment
-; (base = base_lin, byte limit = resident_end-1, 32-bit CPL0 code -- entry
+; (base = base_lin, byte limit = resident_core_end-1, 32-bit CPL0 code -- entry
 ; offsets are driver offsets), +8 a flat 4GB data mirror of selector 0x10,
 ; +16 a driver-data mirror of selector 0x20; the PM entry reaches them as
 ; CS+8 / CS+16 per the spec's consecutive-slot contract.
@@ -2058,7 +2081,7 @@ vcpi_dispatch:
     movzx ecx, word [esi+4]       ; guest SI
     add eax, ecx                  ; EAX = &descriptor[0]
     mov edx, [fs:base_lin]
-    mov word [eax], resident_end - 1  ; code: limit 15..0 (image < 64K)
+    mov word [eax], resident_core_end - 1 ; code: limit 15..0 (image < 64K)
     mov [eax+2], dx               ; base 15..0
     shr edx, 16
     mov [eax+4], dl               ; base 23..16
@@ -2709,13 +2732,14 @@ align 4
 mon_stack:
     times 0x400 db 0
 mon_stack_top:
+resident_core_end:
 
 align 4096
 tables:
     ; PD (1 page) + 6 PT (6 pages) = 0x7000, plus up to 0xFF0 of page-rounding slack
     ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned) -> 0x8000.
     times 0x8000 db 0
-resident_end:
+resident_image_end:
 %if ($ - $$) >= 0x10000
     %error "TOKAEMM resident image exceeds the 16-bit driver offset limit"
 %endif

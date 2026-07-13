@@ -1107,6 +1107,10 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
         !lower.contains("ems internal error"),
         "MEM could not enumerate TokaEMM's EMS handles.\n{text}"
     );
+    assert!(
+        lower.contains("toka-dos is resident in the high memory area"),
+        "MEM should use the Toka-DOS name for the HMA resident.\n{text}"
+    );
     for (label, total) in [
         ("Conventional", "640K"),
         ("Upper", "384K"),
@@ -1122,6 +1126,14 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
             "MEM row {label:?} has the wrong total.\n{text}"
         );
     }
+    let conventional = text
+        .lines()
+        .find(|line| line.starts_with("Conventional"))
+        .unwrap();
+    assert!(
+        conventional.contains("600K"),
+        "the high page tables should leave about 600 KiB conventional memory free.\n{text}"
+    );
 
     let rows = memory_map_rows(&screen);
     assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
@@ -1197,8 +1209,70 @@ fn tokaemm_mem_p_lists_resident_programs() {
              (stop={stop:?}).\n{text}"
     );
     assert!(
+        upper.contains("UPPER MEMORY DETAIL:"),
+        "MEM /P should label the upper-memory section.\n{text}"
+    );
+    assert!(
         !lower.contains("memory map:"),
         "bare MEM /P should leave the summary out.\n{text}"
+    );
+}
+
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_p_labels_both_memory_areas() {
+    let commands = "MEM /P > C:\\MEMP.TXT\r\n\
+                    FIND \"Memory Detail:\" C:\\MEMP.TXT\r\n\
+                    FIND \"TOKAMOUS\" C:\\MEMP.TXT";
+    let (screen, stop) = run_mem_autoexec("p_areas", commands);
+    if let StopReason::CpuError(msg) = &stop {
+        panic!(
+            "CPU fault while checking MEM /P area headers: {msg}\n{}",
+            screen.text
+        );
+    }
+    let upper = screen.text.to_ascii_uppercase();
+    assert!(
+        upper.contains("CONVENTIONAL MEMORY DETAIL:") && upper.contains("UPPER MEMORY DETAIL:"),
+        "MEM /P should label both memory areas.\n{}",
+        screen.text
+    );
+    assert!(
+        upper.contains("TOKAMOUS"),
+        "the redirected MEM /P listing should contain TOKAMOUS.\n{}",
+        screen.text
+    );
+}
+
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_classify_reports_reduced_low_resident_size() {
+    let (screen, stop) = run_mem_command("classify", "/CLASSIFY /NOSUMMARY");
+    if let StopReason::CpuError(msg) = &stop {
+        panic!(
+            "CPU fault while running MEM /CLASSIFY: {msg}\n{}",
+            screen.text
+        );
+    }
+    let tokaemm = screen
+        .text
+        .lines()
+        .find(|line| line.trim_start().starts_with("TOKAEMM "))
+        .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list TOKAEMM.\n{}", screen.text));
+    assert!(
+        tokaemm.contains("(23K)"),
+        "TokaEMM should retain only its 23 KiB low core.\n{}",
+        screen.text
+    );
+    let free = screen
+        .text
+        .lines()
+        .find(|line| line.trim_start().starts_with("Free"))
+        .unwrap_or_else(|| panic!("MEM /CLASSIFY did not list free memory.\n{}", screen.text));
+    assert!(
+        free.contains("(600K)"),
+        "MEM /CLASSIFY should report about 600 KiB conventional free.\n{}",
+        screen.text
     );
 }
 

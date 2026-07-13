@@ -42,6 +42,21 @@ share the allocation arena inside the 20 MiB category. EMS does not share that
 arena. Under `NOEMS`, the EMS category is zero and its 3 MiB returns to the
 shared XMS/VCPI arena, making the XMS category 23 MiB.
 
+## Resident footprint
+
+TOKAEMM keeps about 23 KiB of code, state, its task structure, and its monitor
+stack in conventional memory. On machines with enough extended RAM, its seven
+page-directory and page-table pages use 28 KiB of reserved space at the start
+of the XMS category instead. The standard 24 MiB boot therefore leaves about
+600 KiB of conventional memory free.
+
+The 1 MiB profile has no extended pages to reserve, so TOKAEMM keeps a low
+page-table fallback there. Loading the whole manager into a UMB would not help
+the normal configuration: TOKAEMM creates the UMB service during its own
+initialization, and the default EMS frame leaves only 96 KiB of allocatable
+UMB space. Keeping the paging pages in extended RAM avoids that bootstrapping
+problem and leaves the UMBs available for drivers and environments.
+
 ## XMS
 
 TOKAEMM installs as the extended memory manager via the standard `INT 2Fh`
@@ -64,7 +79,7 @@ and drivers rely on:
 
 ## Upper memory blocks (DOS=UMB)
 
-With `DOS=UMB` in `CONFIG.SYS`, FreeDOS's kernel claims upper memory blocks
+With `DOS=UMB` in `CONFIG.SYS`, the Toka-DOS kernel claims upper memory blocks
 from TOKAEMM through the XMS UMB functions above, and `DEVICEHIGH=`/`LH`
 lines (including `LH TOKAMOUS` in the stock `AUTOEXEC.BAT`) load into them
 instead of conventional memory whenever one is free. TOKAEMM backs this

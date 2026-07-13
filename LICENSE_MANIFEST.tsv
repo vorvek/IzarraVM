@@ -1,7 +1,7 @@
 path	class	origin	license	sha256
 Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	7a3a6ddbcd9dfa50d818a75180e07924c41fd239bf6bde26f324624d8e54a1ce
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	7447e3289a8d198e7d27d5885d7807a029469cd377567daaa12e35d2db069fc1
+NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	1fcae7c958dd84f85578df0183b63648565d2fa31f5d1dc7f08efc195056dc87
 crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
 crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	12d0f8138667c06f0ed070bb672d6327a5d4cf8aa15fb0cf451999faaaeee418
 crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
@@ -22,7 +22,7 @@ crates/izarravm-firmware/roms/dos/mousetst.com	generated-guest-binary	IzarraVM p
 crates/izarravm-firmware/roms/dos/multihlt.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c22b14d7ad173ad2067a4b97c5a7192201a299cc10a9d852fba38abe71e3756
 crates/izarravm-firmware/roms/dos/runner.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	7904c3a69a009d641d9531b8fd0d17b84991b05a6969e2591756aa84f354bf2b
 crates/izarravm-firmware/roms/dos/sndtst.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	c47c99382715572e6f1335b28556c23afde8f1f4feb699d58f7d6aa8f7c00a0b
-crates/izarravm-firmware/roms/dos/tokaemm.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	98b756d34ca72ec80f9d9106ec30027f5d28912b3faeae3a8cc081b5160ed7b6
+crates/izarravm-firmware/roms/dos/tokaemm.sys	generated-guest-binary	IzarraVM project source	GPL-3.0-only	9d8e3618d3912d213b60b8c5c70219cab903dcc19d75615cd75d70b5701b1eb1
 crates/izarravm-firmware/roms/dos/type.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	0899410e755306edd63bafa1e44afe4dafe446f1d5d533d19c7b95c8a508b899
 crates/izarravm-firmware/roms/dos/umbmech.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	06e04e3855157df3215fd14bb84df0467e56fc230ecea3e22e2d6a40d0a545cc
 crates/izarravm-firmware/roms/dos/umbtest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	6d6511b1040256e62f7e9f9231a01077b89623de1285655a4e1ea20d408ac42a
@@ -41,7 +41,7 @@ crates/izarravm-firmware/roms/kbd-layout-meta.inc	generated-source	IzarraVM gene
 crates/izarravm-firmware/roms/kbd-layouts.inc	generated-source	IzarraVM generator and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	51a5d737fd5cfac4c7d7d5c2376401536a7e427f098b84128b851130e03348b2
 crates/izarravm-firmware/roms/kbd-resident.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	2c7fee2d50c8f65157f9db4f7792eb6ab4cefc7f24f212fd1d96cf6b02e19d8e
 crates/izarravm-firmware/roms/neurketa/neurketa.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	760cdddd2c5e3bcaaa378961fd08df89a8f8d68f01f522a512f4d27d8d7e7ca9
-crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	f810fb793c52cbf9d828a6c26bcb671123b2e56c726b6ab21b12e395ae6dcbc5
+crates/izarravm-firmware/roms/tokados-hdd.img	generated-disk-image	IzarraVM Toka-DOS build; see NOTICE	LicenseRef-IzarraVM-TokaDOS-Aggregate	ec5040de53804b949476ba061936752dd054df43da896f6f86cb9f313bc66cb6
 crates/izarravm-machine/tests/fixtures/CBLEAK.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	9c0d52099a205491ceea7a17d850cb9a459d7d7c1580b8c8dd8f05099ca2b008
 crates/izarravm-machine/tests/fixtures/GFXCUR.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	611acec5ccda2c22c9add0e8a1d6809793068ebd8d6428df5fbb97f946176493
 crates/izarravm-machine/tests/fixtures/MTEST.COM	generated-test-fixture	IzarraVM project source	GPL-3.0-only	4fc9fb2d6e67aa8fea1f789da7c97bf8a7d3dcc75595ef93843617deb4793fa9
