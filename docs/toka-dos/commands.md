@@ -138,14 +138,20 @@ works compared with stock FreeDOS MEM.
 MEM [/P] [/FULL] [/DEBUG] [/PAGE] [...]
 ```
 
-By default, `MEM` shows a summary with colored block bars. A light-red `▓`
-(CP437 `B2`) marks memory in use, and a light-green `░` (CP437 `B0`) marks
-free memory. On the standard 24 MiB Izarra 3000, the summary categories are
-640 KiB conventional memory, the full 384 KiB upper region, 3 MiB EMS, and
-20 MiB XMS. The upper category covers the whole `A0000` to `FFFFF` address
-region, including video memory and ROMs. TOKAEMM can allocate 96 KiB there
-with its default EMS frame. Under `NOEMS`, the EMS category becomes zero, the
-XMS category grows to 23 MiB, and the allocatable UMB space grows to 160 KiB.
+By default, `MEM` shows a four-line, 79-column memory map after its numeric
+summary. Conventional, upper, EMS, and XMS memory appear consecutively in
+light blue, light cyan, light magenta, and light green. Within each colored
+range, `▓` (CP437 `B2`) marks memory in use and `░` (CP437 `B0`) marks free
+memory.
+
+On the standard 24 MiB Izarra 3000, the map gives conventional memory 8
+cells, upper memory 5, EMS 40, and XMS 263. Each of the 316 cells represents
+about 77.8 KiB. The exact summary categories are 640 KiB conventional memory,
+the full 384 KiB upper region, 3 MiB EMS, and 20 MiB XMS. The upper category
+covers the whole `A0000` to `FFFFF` address region, including video memory and
+ROMs. TOKAEMM can allocate 96 KiB there with its default EMS frame. Under
+`NOEMS`, the EMS category becomes zero, the XMS category grows to 23 MiB, and
+the allocatable UMB space grows to 160 KiB.
 
 The 3 MiB EMS pool is a separate top-of-RAM partition. XMS allocations and
 VCPI pages share an arena inside the 20 MiB XMS category, so activity from
@@ -153,9 +159,10 @@ either API changes the free part of that category.
 
 Upstream FreeDOS MEM's `/P` is only a prefix match for `/PAGE`, which pauses
 after each screenful. The per-program size and segment listing normally needs
-`/FULL` or `/DEBUG`. In Toka-DOS, `MEM /P` pauses and lists every program in
-memory with its size and position. `/FULL` and `/DEBUG` still work on their
-own.
+`/FULL` or `/DEBUG`. In Toka-DOS, `MEM /P` pages through every program in
+memory with its size and position. It leaves out the default summary so the
+program table remains visible at the end. Use `MEM /P /SUMMARY` to append the
+numeric summary and memory map. `/FULL` and `/DEBUG` still work on their own.
 
 ## ATTRIB
 

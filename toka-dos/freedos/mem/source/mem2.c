@@ -1,6 +1,6 @@
-/* modified by the Toka-DOS project, 2026: /P now also implies /FULL (see
- * the F_PAGE handling in main(), below) so "MEM /P" lists the programs in
- * memory with their size and segment, per the Toka-DOS spec. */
+/* modified by the Toka-DOS project, 2026: /P now lists programs with their
+ * size and segment, pauses after each screen, and omits the default summary
+ * unless /SUMMARY is also specified (see F_PAGE handling in main()). */
 
 typedef int (*mlist_filter_match)(MINFO *entry, void *data);
 
@@ -115,11 +115,16 @@ static void print_normal_entry(char *text, unsigned long total,
     convert("%9sK\n", free);
 }
 
-#define TOKA_USAGE_WIDTH 24
+#define TOKA_MAP_ROWS    4
+#define TOKA_MAP_WIDTH   79
+#define TOKA_MAP_CELLS   (TOKA_MAP_ROWS * TOKA_MAP_WIDTH)
+#define TOKA_KIND_COUNT  4
 #define TOKA_USED_BLOCK  0xB2
 #define TOKA_FREE_BLOCK  0xB0
-#define TOKA_USED_ATTR   0x0C
-#define TOKA_FREE_ATTR   0x0A
+#define TOKA_CONV_ATTR   0x09
+#define TOKA_UPPER_ATTR  0x0B
+#define TOKA_EMS_ATTR    0x0D
+#define TOKA_XMS_ATTR    0x0A
 
 static int stdout_is_console(void)
 {
@@ -186,83 +191,133 @@ static void video_write_run(uchar page, uchar row, uchar column,
     int86(0x10, &regs, &regs);
 }
 
-static unsigned toka_usage_cells(unsigned long total, unsigned long used)
+static unsigned toka_usage_cells(unsigned long total, unsigned long used,
+				 unsigned width)
 {
     unsigned cells;
 
+    if (width == 0)
+	return 0;
     if (total == 0)
 	return 0;
     if (used == 0)
 	return 0;
     if (used >= total)
-	return TOKA_USAGE_WIDTH;
+	return width;
 
-    cells = (unsigned)((used * TOKA_USAGE_WIDTH + total / 2) / total);
+    cells = (unsigned)((used * (unsigned long)width + total / 2) / total);
     if (cells == 0)
 	return 1;
-    if (cells >= TOKA_USAGE_WIDTH)
-	return TOKA_USAGE_WIDTH - 1;
+    if (cells >= width)
+	return width - 1;
     return cells;
 }
 
-static void print_toka_usage_bar(unsigned long total, unsigned long used,
-				 int color)
+static void print_toka_map_row(const char *blocks, const uchar *attributes,
+			       int color)
 {
-    char blocks[TOKA_USAGE_WIDTH + 1];
-    unsigned used_cells, i;
+    char row[TOKA_MAP_WIDTH + 1];
+    unsigned i, run;
     uchar page = 0, start_row = 0, start_column = 0;
     uchar post_row = 0, post_column = 0;
 
-    if (total == 0) {
-	printf("%-24s\n", "Not available");
-	return;
-    }
-
-    used_cells = toka_usage_cells(total, used);
-    for (i = 0; i < TOKA_USAGE_WIDTH; i++)
-	blocks[i] = (char)(i < used_cells ? TOKA_USED_BLOCK : TOKA_FREE_BLOCK);
-    blocks[TOKA_USAGE_WIDTH] = '\0';
+    memcpy(row, blocks, TOKA_MAP_WIDTH);
+    row[TOKA_MAP_WIDTH] = '\0';
 
     if (color)
 	video_get_cursor(&page, &start_row, &start_column);
 
-    printf("%s", blocks);
+    printf("%s", row);
 
     if (color) {
 	video_get_cursor_on_page(page, &post_row, &post_column);
-	video_write_run(page, start_row, start_column, TOKA_USED_BLOCK,
-			TOKA_USED_ATTR, used_cells);
-	video_write_run(page, start_row, (uchar)(start_column + used_cells),
-			TOKA_FREE_BLOCK, TOKA_FREE_ATTR,
-			TOKA_USAGE_WIDTH - used_cells);
+	i = 0;
+	while (i < TOKA_MAP_WIDTH) {
+	    run = 1;
+	    while (i + run < TOKA_MAP_WIDTH
+		   && blocks[i + run] == blocks[i]
+		   && attributes[i + run] == attributes[i])
+		run++;
+	    video_write_run(page, start_row, (uchar)(start_column + i),
+			    (uchar)blocks[i], attributes[i], run);
+	    i += run;
+	}
 	video_set_cursor(page, post_row, post_column);
     }
     printf("\n");
 }
 
-static void print_toka_entry(char *text, unsigned long total,
-			     unsigned long free, int color)
+static void print_toka_color_sample(char *text, uchar attribute, int color)
 {
-    unsigned long used;
-    char label[15];
+    uchar page = 0, row = 0, column = 0;
+    uchar post_row = 0, post_column = 0;
 
-    if (free > total)
-	free = total;
-    used = total - free;
+    if (color)
+	video_get_cursor(&page, &row, &column);
+    printf("%c %s", TOKA_USED_BLOCK, text);
+    if (color) {
+	video_get_cursor_on_page(page, &post_row, &post_column);
+	video_write_run(page, row, column, TOKA_USED_BLOCK, attribute, 1);
+	video_set_cursor(page, post_row, post_column);
+    }
+}
 
-    strncpy(label, text, sizeof(label) - 1);
-    label[sizeof(label) - 1] = '\0';
-    printf("%-14s", label);
-    convert("%8sK ", total);
-    convert("%8sK ", used);
-    convert("%8sK  ", free);
-    print_toka_usage_bar(total, used, color);
+static void print_toka_map(const unsigned long *totals,
+			   const unsigned long *free_k, int color)
+{
+    static const uchar kind_attributes[TOKA_KIND_COUNT] = {
+	TOKA_CONV_ATTR, TOKA_UPPER_ATTR, TOKA_EMS_ATTR, TOKA_XMS_ATTR
+    };
+    char blocks[TOKA_MAP_CELLS];
+    uchar attributes[TOKA_MAP_CELLS];
+    unsigned long grand_total = 0, cumulative = 0, used;
+    unsigned kind, pos = 0, end, count, used_cells, i, row;
+
+    for (kind = 0; kind < TOKA_KIND_COUNT; kind++)
+	grand_total += totals[kind];
+
+    for (kind = 0; kind < TOKA_KIND_COUNT; kind++) {
+	cumulative += totals[kind];
+	if (kind + 1 == TOKA_KIND_COUNT) {
+	    end = TOKA_MAP_CELLS;
+	} else if (grand_total == 0) {
+	    end = 0;
+	} else {
+	    end = (unsigned)((cumulative * (unsigned long)TOKA_MAP_CELLS
+			      + grand_total / 2) / grand_total);
+	}
+	count = end - pos;
+	used = totals[kind] - free_k[kind];
+	used_cells = toka_usage_cells(totals[kind], used, count);
+	for (i = 0; i < count; i++) {
+	    blocks[pos + i] = (char)(i < used_cells
+				     ? TOKA_USED_BLOCK : TOKA_FREE_BLOCK);
+	    attributes[pos + i] = kind_attributes[kind];
+	}
+	pos = end;
+    }
+
+    printf("\nMemory map:\n");
+    for (row = 0; row < TOKA_MAP_ROWS; row++)
+	print_toka_map_row(&blocks[row * TOKA_MAP_WIDTH],
+			   &attributes[row * TOKA_MAP_WIDTH], color);
+
+    printf("Types: ");
+    print_toka_color_sample("Conventional", TOKA_CONV_ATTR, color);
+    printf("  ");
+    print_toka_color_sample("Upper", TOKA_UPPER_ATTR, color);
+    printf("  ");
+    print_toka_color_sample("EMS", TOKA_EMS_ATTR, color);
+    printf("  ");
+    print_toka_color_sample("XMS", TOKA_XMS_ATTR, color);
+    printf("    %c used  %c free\n", TOKA_USED_BLOCK, TOKA_FREE_BLOCK);
 }
 
 static void print_toka_summary(unsigned memfree, unsigned umbfree,
 			       XMSINFO *xms, EMSINFO *ems)
 {
     unsigned long conv_free, upper_free, ems_free, xms_free;
+    unsigned long totals[TOKA_KIND_COUNT], free_k[TOKA_KIND_COUNT];
     unsigned long total, free;
     int color;
 
@@ -281,17 +336,26 @@ static void print_toka_summary(unsigned memfree, unsigned umbfree,
 
     color = stdout_is_console();
     printf("\n");
-    printf("Memory Type       Total      Used      Free  Usage\n");
-    printf("-------------- --------- --------- ---------  "
-	   "------------------------\n");
-    print_toka_entry(_(2,1,"Conventional"), 640, conv_free, color);
-    print_toka_entry(_(2,2,"Upper"), 384, upper_free, color);
-    print_toka_entry("Expanded (EMS)", toka_ems_category_k, ems_free,
-		     color);
-    print_toka_entry(_(2,4,"Extended (XMS)"), toka_xms_category_k,
-		     xms_free, color);
-    printf("-------------- --------- --------- ---------  "
-	   "------------------------\n");
+    printf(_(2,0,"Memory Type         Total      Used       Free\n"));
+    printf(      "----------------  --------   --------   --------\n");
+    print_normal_entry(_(2,1,"Conventional"), 640, 640 - conv_free,
+		       conv_free);
+    print_normal_entry(_(2,2,"Upper"), 384, 384 - upper_free, upper_free);
+    print_normal_entry("Expanded (EMS)", toka_ems_category_k,
+		       toka_ems_category_k - ems_free, ems_free);
+    print_normal_entry(_(2,4,"Extended (XMS)"), toka_xms_category_k,
+		       toka_xms_category_k - xms_free, xms_free);
+    printf(      "----------------  --------   --------   --------\n");
+
+    totals[0] = 640;
+    totals[1] = 384;
+    totals[2] = toka_ems_category_k;
+    totals[3] = toka_xms_category_k;
+    free_k[0] = conv_free;
+    free_k[1] = upper_free;
+    free_k[2] = ems_free;
+    free_k[3] = xms_free;
+    print_toka_map(totals, free_k, color);
 
     total = 1024UL + toka_ems_category_k + toka_xms_category_k;
     free = conv_free + upper_free + ems_free + xms_free;
@@ -1683,7 +1747,8 @@ char *help_for_flag(opt_flag_t opt)
     case F_XMS:	       return (_(7, 8,
 "/X[MS]       Reports all information about Extended Memory"));
     case F_PAGE:       return (_(7, 9,
-"/P[AGE]      Pauses after each screenful of information"));
+"/P[AGE]      List programs, pausing after each screenful\n"
+"             Add /SUMMARY to append the memory summary"));
     case F_CLASSIFY:   return (_(7, 5,
 "/C[LASSIFY]  Classify modules using memory below 1 MB"));
     case F_DEBUG:      return (_(7, 11,
@@ -1850,11 +1915,13 @@ int main(int argc, char *argv[])
      * programs.  The per-program size+segment listing lives under /FULL
      * (new-style /F).  The Toka-DOS spec requires "MEM /P" to list the
      * programs in memory with their size and memory position, so here we
-     * make /P (and /PAGE) also imply /FULL, on top of its original paging
-     * behavior.  modified by the Toka-DOS project, 2026.
+     * make /P (and /PAGE) imply /FULL and hide the default summary.  This
+     * keeps the final program rows visible after paging.  An explicit
+     * /SUMMARY restores the summary in the normalization below.  modified by
+     * the Toka-DOS project, 2026.
      */
     if (flags & F_PAGE) {
-	flags |= F_FULL;
+	flags |= F_FULL | F_NOSUMMARY;
     }
 
     /*

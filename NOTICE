@@ -7,8 +7,9 @@ FreeDOS MOVE: © 1997-2002 Joe Cosentino, © 2003-2004 Imre Leber, GPLv2-or-late
 FreeDOS SORT: © 1995 Jim Lynch, updated 2003-2004 Eric Auer, GPLv2-or-later.
 FreeDOS MEM: © 1997 Express Software / Joseph Cosentino, © 2001 Bart Oldeman,
 updated through 2006 by Eric Auer and others, GPLv2-or-later. Modified by the
-Toka-DOS project (2026): /P also implies /FULL, and the default report uses
-colored block bars for the Toka-DOS conventional, upper, EMS, and XMS layout.
+Toka-DOS project (2026): /P pages through the program list and omits the
+summary unless requested; the default report uses a four-line, color-coded
+map for conventional, upper, EMS, and XMS memory.
 FreeDOS ATTRIB: © 1998 Phil Brutsche, maintained by Brian E. Reifsnyder,
 GPLv2-or-later. Modified by the Toka-DOS project (2026): two small Open
 Watcom portability fixes (explicit cast, portable stpcpy), no behavior change.
