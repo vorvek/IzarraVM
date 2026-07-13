@@ -1005,11 +1005,11 @@ GSWMODE 386-slow\r\nVER\r\nGSWMODE 586\r\n"
 /// Toka-DOS diverges from upstream MEM here: upstream's `/P` is only a
 /// prefix of `/PAGE` (pause after each screenful); the owner's spec wants
 /// `/P` to list resident programs with size + segment, so mem2.c's main()
-/// was patched to make `/PAGE` (and therefore `/P`) also imply `/FULL`
-/// (see toka-dos/freedos/VENDOR.md). Each invocation gets its own boot (the
-/// 25-row text console can't hold both outputs at once — /P's per-program
-/// table alone is longer than a screenful), driven by AUTOEXEC.BAT (never
-/// injected keystrokes, per the guest-testing convention).
+/// was patched to make `/PAGE` (and therefore `/P`) imply `/FULL` and omit
+/// the summary unless `/SUMMARY` is given (see toka-dos/freedos/VENDOR.md).
+/// Each invocation gets its own boot because the 25-row text console cannot
+/// hold both outputs at once. AUTOEXEC.BAT drives the commands, with no
+/// injected typing.
 struct MemScreen {
     text: String,
     columns: usize,
@@ -1072,18 +1072,18 @@ fn run_mem_command(dir_suffix: &str, mem_args: &str) -> (MemScreen, StopReason) 
     run_mem_autoexec(dir_suffix, &format!("MEM {mem_args}"))
 }
 
-fn memory_bar<'a>(screen: &'a MemScreen, label: &str) -> &'a [(u8, u8)] {
-    let row = screen
-        .text
-        .lines()
-        .position(|line| line.starts_with(label))
-        .unwrap_or_else(|| panic!("MEM row {label:?} missing.\n{}", screen.text));
-    let cells = &screen.cells[row * screen.columns..(row + 1) * screen.columns];
-    let start = cells
-        .iter()
-        .position(|(character, _)| matches!(*character, 0xB0 | 0xB2))
-        .unwrap_or_else(|| panic!("MEM row {label:?} has no usage bar.\n{}", screen.text));
-    &cells[start..start + 24]
+fn memory_map_rows(screen: &MemScreen) -> Vec<&[(u8, u8)]> {
+    screen
+        .cells
+        .chunks_exact(screen.columns)
+        .filter_map(|row| {
+            let map = &row[..79];
+            (map.iter()
+                .all(|(character, _)| matches!(*character, 0xB0 | 0xB2))
+                && row[79].0 == b' ')
+                .then_some(map)
+        })
+        .collect()
 }
 
 #[test]
@@ -1121,10 +1121,25 @@ fn tokaemm_mem_plain_reports_conventional_memory() {
             line.contains(total),
             "MEM row {label:?} has the wrong total.\n{text}"
         );
-        for &(character, attribute) in memory_bar(&screen, label) {
-            assert!(matches!(character, 0xB0 | 0xB2));
-            assert_eq!(attribute, if character == 0xB2 { 0x0C } else { 0x0A });
-        }
+    }
+
+    let rows = memory_map_rows(&screen);
+    assert_eq!(rows.len(), 4, "MEM map should occupy four rows.\n{text}");
+    let map = rows.into_iter().flatten().copied().collect::<Vec<_>>();
+    assert_eq!(map.len(), 316);
+    assert!(
+        map.iter()
+            .all(|(character, _)| matches!(*character, 0xB0 | 0xB2))
+    );
+    assert!(map.iter().any(|(character, _)| *character == 0xB0));
+    assert!(map.iter().any(|(character, _)| *character == 0xB2));
+    for (range, attribute) in [(0..8, 0x09), (8..13, 0x0B), (13..53, 0x0D), (53..316, 0x0A)] {
+        assert!(
+            map[range.clone()]
+                .iter()
+                .all(|(_, actual)| *actual == attribute),
+            "MEM map range {range:?} should use attribute {attribute:#04x}.\n{text}"
+        );
     }
 }
 
@@ -1138,18 +1153,23 @@ fn tokaemm_mem_redirect_keeps_raw_uncolored_bars() {
             screen.text
         );
     }
-    for label in ["Conventional", "Upper", "Expanded (EMS)", "Extended (XMS)"] {
-        let bar = memory_bar(&screen, label);
-        assert_eq!(bar.len(), 24);
-        assert!(
-            bar.iter()
-                .all(|(character, _)| matches!(*character, 0xB0 | 0xB2))
-        );
-        assert!(
-            bar.iter()
-                .all(|(_, attribute)| !matches!(*attribute, 0x0A | 0x0C))
-        );
-    }
+    let rows = memory_map_rows(&screen);
+    assert_eq!(
+        rows.len(),
+        4,
+        "redirected MEM map should occupy four rows.\n{}",
+        screen.text
+    );
+    let map = rows.into_iter().flatten().copied().collect::<Vec<_>>();
+    assert_eq!(map.len(), 316);
+    assert!(
+        map.iter()
+            .all(|(character, _)| matches!(*character, 0xB0 | 0xB2))
+    );
+    assert!(
+        map.iter()
+            .all(|(_, attribute)| !matches!(*attribute, 0x09 | 0x0A | 0x0B | 0x0D))
+    );
 }
 
 #[test]
@@ -1165,15 +1185,43 @@ fn tokaemm_mem_p_lists_resident_programs() {
         lower.contains("c:\\>"),
         "no C:\\> prompt after MEM /P ran (stop={stop:?}).\n{text}"
     );
-    // Toka-DOS divergence check: /P must produce the per-program size +
-    // segment listing (upstream /P is only pagination). TOKAMOUS was
-    // loaded (LH) right before MEM /P ran, so it must be a resident name
-    // in the table; COMMAND.COM is always resident as a fallback check.
+    // Toka-DOS divergence check: /P must produce the per-program size and
+    // segment listing (upstream /P is only pagination). TOKAMOUS was loaded
+    // high right before MEM ran, so it must appear in that listing. /P omits
+    // the large summary unless /SUMMARY is also specified, which keeps the
+    // final program rows visible.
     let upper = text.to_ascii_uppercase();
     assert!(
-        upper.contains("TOKAMOUS") || upper.contains("COMMAND"),
-        "MEM /P output doesn't list a known resident program (TOKAMOUS/COMMAND) \
+        upper.contains("TOKAMOUS"),
+        "MEM /P output doesn't list the resident TOKAMOUS module \
              (stop={stop:?}).\n{text}"
+    );
+    assert!(
+        !lower.contains("memory map:"),
+        "bare MEM /P should leave the summary out.\n{text}"
+    );
+}
+
+#[test]
+#[ignore = "boots a full DOS image in V86 (slow in debug); run with --ignored"]
+fn tokaemm_mem_p_summary_restores_memory_map() {
+    let (screen, stop) = run_mem_command("p_summary", "/P /SUMMARY");
+    if let StopReason::CpuError(msg) = &stop {
+        panic!(
+            "CPU fault while running MEM /P /SUMMARY under V86: {msg}\n{}",
+            screen.text
+        );
+    }
+    assert!(
+        screen.text.to_ascii_lowercase().contains("memory map:"),
+        "MEM /P /SUMMARY should restore the memory summary.\n{}",
+        screen.text
+    );
+    assert_eq!(
+        memory_map_rows(&screen).len(),
+        4,
+        "MEM /P /SUMMARY should restore all four map rows.\n{}",
+        screen.text
     );
 }
 
