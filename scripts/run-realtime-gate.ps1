@@ -16,6 +16,9 @@ param(
     [string]$Workload = "Both",
     [ValidateSet("0", "1")]
     [string]$Jit = "1",
+    [switch]$BackendBakeoff,
+    [switch]$Screening,
+    [string]$MeasurementLockPath = "",
     [switch]$SkipBuild,
     [switch]$ReportOnly,
     [switch]$SelfTest
@@ -39,6 +42,69 @@ function Set-GateProcessEnvironment([string]$Name, [object]$Value) {
         return
     }
     [Environment]::SetEnvironmentVariable($Name, [string]$Value, "Process")
+}
+
+function Assert-BackendBakeoffMode(
+    [bool]$IsReportOnly,
+    [bool]$HasBaseline,
+    [bool]$HasExplicitJit,
+    [bool]$HasExplicitExecutable,
+    [bool]$SkipRequested,
+    [int]$RequestedProcessor,
+    [string]$LockPath
+) {
+    if ($IsReportOnly) {
+        throw "Backend bakeoff mode cannot be combined with ReportOnly."
+    }
+    if ($HasBaseline) {
+        throw "Backend bakeoff mode compares one executable and does not accept BaselineRevision."
+    }
+    if ($HasExplicitJit) {
+        throw "Backend bakeoff mode assigns IZARRAVM_JIT per role and does not accept Jit."
+    }
+    if ($HasExplicitExecutable -or $SkipRequested) {
+        throw "Backend bakeoff mode requires one clean isolated build."
+    }
+    if ($RequestedProcessor -ne 8) {
+        throw "Backend bakeoff mode requires ProcessorIndex 8."
+    }
+    if ([string]::IsNullOrWhiteSpace($LockPath) -or
+        -not [IO.Path]::IsPathFullyQualified($LockPath)) {
+        throw "Backend bakeoff mode requires an absolute MeasurementLockPath."
+    }
+}
+
+function Enter-MeasurementLock([string]$Path) {
+    $absolutePath = [IO.Path]::GetFullPath($Path)
+    $parent = [IO.Path]::GetDirectoryName($absolutePath)
+    if ([string]::IsNullOrWhiteSpace($parent) -or
+        -not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "Measurement lock parent directory does not exist: $parent"
+    }
+    try {
+        $stream = [IO.File]::Open(
+            $absolutePath,
+            [IO.FileMode]::OpenOrCreate,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+    } catch {
+        throw "Measurement lock is already held or unavailable: $absolutePath"
+    }
+    try {
+        $metadata = [ordered]@{
+            pid = $PID
+            acquired_utc = [DateTime]::UtcNow.ToString("o")
+        } | ConvertTo-Json -Compress
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($metadata + "`n")
+        $stream.SetLength(0)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        return $stream
+    } catch {
+        $stream.Dispose()
+        throw
+    }
 }
 
 function Get-NormalizedCargoArguments([string[]]$Arguments) {
@@ -198,9 +264,10 @@ function Assert-QuakeAutoexecText([string]$Text) {
     }
 }
 
-function Read-QuakeTimedemoIdentity([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "Quake did not produce QCONSOLE.LOG."
+function Read-QuakeTimedemoIdentities([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return @()
     }
     $identities = @()
     foreach ($line in [IO.File]::ReadLines($Path)) {
@@ -209,6 +276,14 @@ function Read-QuakeTimedemoIdentity([string]$Path) {
             $identities += $identity
         }
     }
+    return @($identities)
+}
+
+function Read-QuakeTimedemoIdentity([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Quake did not produce QCONSOLE.LOG."
+    }
+    $identities = @(Read-QuakeTimedemoIdentities $Path)
     if ($identities.Count -ne 1) {
         throw "Quake must produce exactly one timedemo identity line; found $($identities.Count)."
     }
@@ -293,7 +368,14 @@ function Get-WorkloadPolicies([string]$Selection) {
     return @($names | ForEach-Object { Get-WorkloadPolicy $_ })
 }
 
-function Get-PairOrder([int]$PairNumber, [int]$Seed) {
+function Get-PairOrder(
+    [int]$PairNumber,
+    [int]$Seed,
+    [string[]]$Roles = @("candidate", "baseline")
+) {
+    if ($Roles.Count -ne 2 -or $Roles[0] -eq $Roles[1]) {
+        throw "Paired measurements require two distinct role names."
+    }
     $candidateFirstOnOddPairs = ($Seed -band 1) -eq 0
     $candidateFirst = if ($PairNumber % 2 -eq 1) {
         $candidateFirstOnOddPairs
@@ -301,9 +383,9 @@ function Get-PairOrder([int]$PairNumber, [int]$Seed) {
         -not $candidateFirstOnOddPairs
     }
     if ($candidateFirst) {
-        return @("candidate", "baseline")
+        return @($Roles[0], $Roles[1])
     }
-    return @("baseline", "candidate")
+    return @($Roles[1], $Roles[0])
 }
 
 function Get-Median([double[]]$Values) {
@@ -366,6 +448,24 @@ function Get-PairedMetric([double[]]$Ratios) {
     }
 }
 
+function Get-BackendPairedMetric([double[]]$Ratios) {
+    $metric = Get-PairedMetric $Ratios
+    $survivalVerdict = if ($metric.median_ratio -ge 1.05 -and
+        $metric.lower_95_ratio -gt 1.0) {
+        "pass"
+    } else {
+        "fail"
+    }
+    return [pscustomobject][ordered]@{
+        median_ratio = $metric.median_ratio
+        lower_95_ratio = $metric.lower_95_ratio
+        lower_bound_confidence = $metric.lower_bound_confidence
+        required_median_ratio = 1.05
+        required_lower_95_ratio_exclusive = 1.0
+        verdict = $survivalVerdict
+    }
+}
+
 function Get-ArtifactSelectionPolicy(
     [bool]$IsReportOnly,
     [bool]$ExplicitExecutable,
@@ -378,6 +478,150 @@ function Get-ArtifactSelectionPolicy(
         return "unverified_prebuilt"
     }
     return "isolated_build"
+}
+
+function Get-BytesSha256([byte[]]$Bytes) {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-FileSha256([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Evidence artifact is missing: $Path"
+    }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-NormalizedResultBlock([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject][ordered]@{
+            status = "missing_file"
+            block_count = 0
+            sha256 = $null
+            normalized_bytes = 0
+        }
+    }
+    $normalized = [IO.File]::ReadAllText($Path).Replace("`r`n", "`n").Replace("`r", "`n")
+    $pattern = '(?ms)^--- BEGIN RESULT ---\n.*?^--- END RESULT ---[ \t]*(?:\n|$)'
+    $matches = [regex]::Matches($normalized, $pattern)
+    if ($matches.Count -ne 1) {
+        return [pscustomobject][ordered]@{
+            status = "invalid_block_count"
+            block_count = $matches.Count
+            sha256 = $null
+            normalized_bytes = 0
+        }
+    }
+    $block = $matches[0].Value.TrimEnd() + "`n"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($block)
+    return [pscustomobject][ordered]@{
+        status = "valid"
+        block_count = 1
+        sha256 = Get-BytesSha256 $bytes
+        normalized_bytes = $bytes.Length
+    }
+}
+
+function Get-StopIdentityKey($Sample) {
+    if ($null -eq $Sample.stop) {
+        return "missing"
+    }
+    $code = if ($null -ne $Sample.stop.PSObject.Properties["code"]) {
+        [string]$Sample.stop.code
+    } else {
+        ""
+    }
+    $requested = if ($null -ne $Sample.stop.PSObject.Properties["requested"]) {
+        [string]$Sample.stop.requested
+    } else {
+        ""
+    }
+    $message = if ($null -ne $Sample.stop.PSObject.Properties["message"]) {
+        [string]$Sample.stop.message
+    } else {
+        ""
+    }
+    return "$($Sample.stop.kind)|code=$code|requested=$requested|message=$message"
+}
+
+function Get-TimedemoIdentityKey([string]$WorkloadName, $Sample) {
+    if ($WorkloadName.StartsWith("doom-", [StringComparison]::Ordinal)) {
+        if ($null -eq $Sample.timedemo) {
+            return "missing"
+        }
+        return "doom|$($Sample.timedemo.gametics)|$($Sample.timedemo.realtics)"
+    }
+    if ($null -eq $Sample.quake_timedemo) {
+        $count = if ($null -ne $Sample.PSObject.Properties["quake_timedemo_identity_count"]) {
+            $Sample.quake_timedemo_identity_count
+        } else {
+            "missing"
+        }
+        return "quake|missing|count=$count"
+    }
+    return "quake|$($Sample.quake_timedemo.line)"
+}
+
+function Get-EqualWorkRecord([string]$WorkloadName, $Sample) {
+    $resultStatus = [string]$Sample.gate_artifacts.result_block_status
+    $resultHash = [string]$Sample.gate_artifacts.result_block_sha256
+    return [ordered]@{
+        instructions = [uint64]$Sample.perf.instructions
+        master_ticks = [uint64]$Sample.master_ticks
+        elapsed_budget_clocks = [uint64]$Sample.elapsed_budget_clocks
+        executed_cpu_core_clocks = [uint64]$Sample.executed_cpu_core_clocks
+        raw_bus_clocks = [uint64]$Sample.raw_bus_clocks
+        stop = Get-StopIdentityKey $Sample
+        timedemo_identity = Get-TimedemoIdentityKey $WorkloadName $Sample
+        result_block_identity = "$resultStatus|$resultHash"
+    }
+}
+
+function Compare-EqualWorkRecords($Left, $Right) {
+    $mismatches = @()
+    foreach ($field in $Left.Keys) {
+        if ([string]$Left[$field] -cne [string]$Right[$field]) {
+            $mismatches += $field
+        }
+    }
+    return [pscustomobject][ordered]@{
+        matches = $mismatches.Count -eq 0
+        mismatched_fields = $mismatches
+    }
+}
+
+function Get-RoleExactDeterminism([string]$WorkloadName, [object[]]$Samples) {
+    if ($Samples.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            deterministic = $false
+            mismatched_fields = @("missing_samples")
+        }
+    }
+    $reference = Get-EqualWorkRecord $WorkloadName $Samples[0]
+    $mismatches = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    for ($index = 1; $index -lt $Samples.Count; $index++) {
+        $comparison = Compare-EqualWorkRecords `
+            $reference (Get-EqualWorkRecord $WorkloadName $Samples[$index])
+        foreach ($field in $comparison.mismatched_fields) {
+            $null = $mismatches.Add($field)
+        }
+    }
+    return [pscustomobject][ordered]@{
+        deterministic = $mismatches.Count -eq 0
+        mismatched_fields = @($mismatches | Sort-Object)
+    }
+}
+
+function Get-BackendEvidencePolicy([bool]$IsScreening) {
+    return [pscustomobject][ordered]@{
+        evidence_grade = if ($IsScreening) { "screening" } else { "final" }
+        measured_pairs = if ($IsScreening) { 3 } else { 6 }
+        final_eligible = -not $IsScreening
+    }
 }
 
 if ($SelfTest) {
@@ -418,10 +662,23 @@ if ($SelfTest) {
         (Get-PairOrder 2 0) -join "," -ne "baseline,candidate") {
         throw "Pair order did not alternate."
     }
+    $backendRoles = @("automatic", "interpreter")
+    if ((Get-PairOrder 1 0 $backendRoles) -join "," -ne "automatic,interpreter" -or
+        (Get-PairOrder 2 0 $backendRoles) -join "," -ne "interpreter,automatic") {
+        throw "Backend pair order did not alternate."
+    }
+    Assert-SelfTestThrows {
+        Get-PairOrder 1 0 @("automatic", "automatic")
+    } "distinct role names"
     if ((Get-PairedMetric ([double[]](1, 1, 1, 1, 1, 1))).verdict -ne "pass" -or
         (Get-PairedMetric ([double[]](0.97, 0.97, 0.97, 0.97, 0.97, 0.97))).verdict -ne "regression" -or
         (Get-PairedMetric ([double[]](0.90, 0.91, 1.00, 1.01, 1.10, 1.11))).verdict -ne "inconclusive") {
         throw "Paired metric verdict boundaries are wrong."
+    }
+    if ((Get-BackendPairedMetric ([double[]](1.05, 1.05, 1.05, 1.05, 1.05, 1.05))).verdict -ne "pass" -or
+        (Get-BackendPairedMetric ([double[]](1.049, 1.049, 1.049, 1.049, 1.049, 1.049))).verdict -ne "fail" -or
+        (Get-BackendPairedMetric ([double[]](0.9, 1.2, 0.9, 1.2, 0.9, 1.2))).verdict -ne "fail") {
+        throw "Backend survival boundaries are wrong."
     }
     $expectedCriticals = [ordered]@{
         2 = 6.313751515
@@ -580,29 +837,143 @@ if ($SelfTest) {
     Assert-SelfTestThrows {
         Get-ArtifactSelectionPolicy $false $false $true
     } "refuses custom"
+    Assert-SelfTestThrows {
+        Assert-BackendBakeoffMode $true $false $false $false $false 8 "C:\gate.lock"
+    } "ReportOnly"
+    Assert-SelfTestThrows {
+        Assert-BackendBakeoffMode $false $true $false $false $false 8 "C:\gate.lock"
+    } "BaselineRevision"
+    Assert-SelfTestThrows {
+        Assert-BackendBakeoffMode $false $false $true $false $false 8 "C:\gate.lock"
+    } "does not accept Jit"
+    Assert-SelfTestThrows {
+        Assert-BackendBakeoffMode $false $false $false $false $false 7 "C:\gate.lock"
+    } "ProcessorIndex 8"
+    Assert-SelfTestThrows {
+        Assert-BackendBakeoffMode $false $false $false $false $false 8 "relative.lock"
+    } "absolute MeasurementLockPath"
+    $resultBlockSelfTestPath = Join-Path ([IO.Path]::GetTempPath()) (
+        "izarravm-result-block-$([guid]::NewGuid().ToString('N')).log"
+    )
+    try {
+        [IO.File]::WriteAllText(
+            $resultBlockSelfTestPath,
+            "prefix`r`n--- BEGIN RESULT ---`r`nstop: TestExit { code: 0 }`r`n--- END RESULT ---`r`nwall: 1.0s`r`n"
+        )
+        $resultBlock = Get-NormalizedResultBlock $resultBlockSelfTestPath
+        if ($resultBlock.status -ne "valid" -or $resultBlock.block_count -ne 1 -or
+            $resultBlock.normalized_bytes -le 0 -or $resultBlock.sha256.Length -ne 64) {
+            throw "Normalized result-block evidence is incomplete."
+        }
+        [IO.File]::WriteAllText($resultBlockSelfTestPath, "no result block`n")
+        $invalidResultBlock = Get-NormalizedResultBlock $resultBlockSelfTestPath
+        if ($invalidResultBlock.status -ne "invalid_block_count" -or
+            $invalidResultBlock.block_count -ne 0 -or $null -ne $invalidResultBlock.sha256) {
+            throw "Invalid result-block evidence was not preserved as summary data."
+        }
+    } finally {
+        Remove-Item -LiteralPath $resultBlockSelfTestPath -Force -ErrorAction SilentlyContinue
+    }
+    $exactSampleA = [pscustomobject]@{
+        perf = [pscustomobject]@{ instructions = 10 }
+        master_ticks = 20
+        elapsed_budget_clocks = 30
+        executed_cpu_core_clocks = 11
+        raw_bus_clocks = 19
+        stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
+        timedemo = [pscustomobject]@{ gametics = 2134; realtics = 830 }
+        gate_artifacts = [pscustomobject]@{
+            result_block_status = "valid"
+            result_block_sha256 = "a" * 64
+        }
+    }
+    $exactSampleB = $exactSampleA.PSObject.Copy()
+    $equalComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if (-not $equalComparison.matches) {
+        throw "Equal-work comparison rejected identical samples."
+    }
+    $exactSampleB.raw_bus_clocks = 18
+    $unequalComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($unequalComparison.matches -or
+        $unequalComparison.mismatched_fields -notcontains "raw_bus_clocks") {
+        throw "Equal-work comparison did not preserve a valid negative result."
+    }
+    $screeningPolicy = Get-BackendEvidencePolicy $true
+    $finalPolicy = Get-BackendEvidencePolicy $false
+    if ($screeningPolicy.final_eligible -or $screeningPolicy.measured_pairs -ne 3 -or
+        -not $finalPolicy.final_eligible -or $finalPolicy.measured_pairs -ne 6) {
+        throw "Backend evidence-grade eligibility is wrong."
+    }
+    $lockSelfTestPath = Join-Path ([IO.Path]::GetTempPath()) (
+        "izarravm-measurement-$([guid]::NewGuid().ToString('N')).lock"
+    )
+    $lockSelfTest = $null
+    try {
+        $lockSelfTest = Enter-MeasurementLock $lockSelfTestPath
+        Assert-SelfTestThrows {
+            $secondLock = Enter-MeasurementLock $lockSelfTestPath
+            $secondLock.Dispose()
+        } "already held or unavailable"
+    } finally {
+        if ($null -ne $lockSelfTest) {
+            $lockSelfTest.Dispose()
+        }
+        Remove-Item -LiteralPath $lockSelfTestPath -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "run-realtime-gate self-test passed"
     return
 }
 
-if ($Runs -lt 1) {
-    throw "Runs must be at least one."
-}
-if (-not $ReportOnly -and $Runs -ne 6) {
-    throw "The throughput gate requires exactly six clean pairs. Use -ReportOnly for ad hoc counts."
-}
-if (-not $ReportOnly -and $Workload -ne "Both") {
-    throw "The throughput gate requires all three workloads. Use -ReportOnly for a subset."
-}
-if (-not $ReportOnly -and $Jit -ne "1") {
-    throw "The throughput gate requires the direct JIT. Use -ReportOnly for a JIT-off control."
-}
-if (-not $ReportOnly -and [string]::IsNullOrWhiteSpace($BaselineRevision)) {
-    throw "The throughput gate requires an explicit accepted BaselineRevision."
-}
-if ($ReportOnly -and -not [string]::IsNullOrWhiteSpace($BaselineRevision) -and $Runs -lt 2) {
-    throw "Paired report-only measurements require at least two pairs."
-}
 $explicitExecutable = $PSBoundParameters.ContainsKey("Executable")
+$explicitJit = $PSBoundParameters.ContainsKey("Jit")
+$explicitRuns = $PSBoundParameters.ContainsKey("Runs")
+if ($Screening -and -not $BackendBakeoff) {
+    throw "Screening is only valid with BackendBakeoff."
+}
+if ($BackendBakeoff) {
+    Assert-BackendBakeoffMode `
+        ([bool]$ReportOnly) `
+        (-not [string]::IsNullOrWhiteSpace($BaselineRevision)) `
+        $explicitJit `
+        $explicitExecutable `
+        ([bool]$SkipBuild) `
+        $ProcessorIndex `
+        $MeasurementLockPath
+    if ($Screening) {
+        if ($explicitRuns -and $Runs -ne 3) {
+            throw "Backend screening requires exactly three measured pairs."
+        }
+        $Runs = 3
+    } elseif ($Runs -ne 6) {
+        throw "Final backend bakeoff requires exactly six measured pairs."
+    }
+    if ($Workload -ne "Both") {
+        throw "Backend bakeoff requires all three workloads."
+    }
+} else {
+    if ($Runs -lt 1) {
+        throw "Runs must be at least one."
+    }
+    if (-not $ReportOnly -and $Runs -ne 6) {
+        throw "The throughput gate requires exactly six clean pairs. Use -ReportOnly for ad hoc counts."
+    }
+    if (-not $ReportOnly -and $Workload -ne "Both") {
+        throw "The throughput gate requires all three workloads. Use -ReportOnly for a subset."
+    }
+    if (-not $ReportOnly -and $Jit -ne "1") {
+        throw "The throughput gate requires the direct JIT. Use -ReportOnly for a JIT-off control."
+    }
+    if (-not $ReportOnly -and [string]::IsNullOrWhiteSpace($BaselineRevision)) {
+        throw "The throughput gate requires an explicit accepted BaselineRevision."
+    }
+    if ($ReportOnly -and -not [string]::IsNullOrWhiteSpace($BaselineRevision) -and $Runs -lt 2) {
+        throw "Paired report-only measurements require at least two pairs."
+    }
+}
 $artifactSelection = Get-ArtifactSelectionPolicy ([bool]$ReportOnly) $explicitExecutable ([bool]$SkipBuild)
 if ($PairSeed -eq 0) {
     $PairSeed = [Security.Cryptography.RandomNumberGenerator]::GetInt32(1, [int]::MaxValue)
@@ -644,6 +1015,18 @@ if ($ProcessorIndex -ge 0) {
 $processorIdentifier = [Environment]::GetEnvironmentVariable("PROCESSOR_IDENTIFIER", "Process")
 $processorName = $null
 $activePowerScheme = $null
+function Get-ActivePowerScheme {
+    try {
+        $powercfg = Get-Command powercfg.exe -CommandType Application -ErrorAction Stop
+        $powerOutput = @(& $powercfg.Source /getactivescheme 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            return ($powerOutput -join " ").Trim()
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
 if ($isWindowsHost) {
     try {
         $processorName = (Get-ItemProperty `
@@ -652,15 +1035,7 @@ if ($isWindowsHost) {
     } catch {
         $processorName = $null
     }
-    try {
-        $powercfg = Get-Command powercfg.exe -CommandType Application -ErrorAction Stop
-        $powerOutput = @(& $powercfg.Source /getactivescheme 2>$null)
-        if ($LASTEXITCODE -eq 0) {
-            $activePowerScheme = ($powerOutput -join " ").Trim()
-        }
-    } catch {
-        $activePowerScheme = $null
-    }
+    $activePowerScheme = Get-ActivePowerScheme
 }
 $hostIdentity = [ordered]@{
     os_description = $runtimeInformation::OSDescription
@@ -759,6 +1134,24 @@ if (-not $ReportOnly -and (Test-Path -LiteralPath $ResultsDirectory)) {
 New-Item -ItemType Directory -Path $ResultsDirectory | Out-Null
 $ResultsDirectory = (Resolve-Path -LiteralPath $ResultsDirectory).Path
 
+$measurementLockHandle = $null
+$measurementLockEvidence = $null
+if ($BackendBakeoff) {
+    $MeasurementLockPath = [IO.Path]::GetFullPath($MeasurementLockPath)
+    $measurementLockAcquiredUtc = [DateTime]::UtcNow.ToString("o")
+    $measurementLockHandle = Enter-MeasurementLock $MeasurementLockPath
+    $measurementLockEvidence = [ordered]@{
+        path = $MeasurementLockPath
+        acquired_utc = $measurementLockAcquiredUtc
+        pid = $PID
+        share_mode = "FileShare.None"
+        scope = "cooperating campaign tools"
+        held_through_summary_write = $true
+    }
+}
+
+try {
+
 $buildOverrideNames = @(Get-ChildItem Env: | Where-Object {
     ($_.Name.StartsWith("CARGO_", [StringComparison]::OrdinalIgnoreCase) -and
         $_.Name -ne "CARGO_HOME") -or
@@ -806,15 +1199,6 @@ function Assert-NearlyEqual([double]$Actual, [double]$Expected, [string]$Name) {
     $tolerance = 1.0e-9 * [Math]::Max(1.0, [Math]::Abs($Expected))
     if ([Math]::Abs($Actual - $Expected) -gt $tolerance) {
         throw "Profile field '$Name' does not match its raw counters."
-    }
-}
-
-function Get-BytesSha256([byte[]]$Bytes) {
-    $algorithm = [Security.Cryptography.SHA256]::Create()
-    try {
-        return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
-    } finally {
-        $algorithm.Dispose()
     }
 }
 
@@ -1267,11 +1651,12 @@ $baselineArtifact = $null
 if ($null -ne $baselineCommit) {
     $baselineArtifact = Invoke-IsolatedRevisionBuild $repositoryRoot $baselineCommit "baseline" $ResultsDirectory
 }
-$pairedRun = $null -ne $baselineArtifact
+$revisionPairedRun = $null -ne $baselineArtifact
+$pairedRun = $BackendBakeoff -or $revisionPairedRun
 if (-not $ReportOnly -and -not $pairedRun) {
     throw "The formal gate requires a freshly built baseline artifact."
 }
-if ($pairedRun -and $candidateArtifact.verified -and $baselineArtifact.verified -and
+if ($revisionPairedRun -and $candidateArtifact.verified -and $baselineArtifact.verified -and
     $candidateArtifact.build.recipe_fingerprint_sha256 -ne
         $baselineArtifact.build.recipe_fingerprint_sha256) {
     throw "Candidate and baseline were not built with the same isolated recipe and toolchain."
@@ -1289,8 +1674,12 @@ function Invoke-IzarraProcess(
     [string[]]$Arguments,
     [string]$StdoutPath,
     [string]$StderrPath,
-    [string]$HomePath
+    [string]$HomePath,
+    [string]$BackendRole
 ) {
+    if ($BackendBakeoff -and $BackendRole -notin @("automatic", "interpreter")) {
+        throw "Unknown backend bakeoff role '$BackendRole'."
+    }
     $argumentLine = ($Arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
     $childEnvironment = @{
         HOME = $HomePath
@@ -1301,7 +1690,11 @@ function Invoke-IzarraProcess(
     foreach ($name in $diagnosticVariables) {
         $childEnvironment[$name] = $null
     }
-    $childEnvironment["IZARRAVM_JIT"] = $Jit
+    $childEnvironment["IZARRAVM_JIT"] = if ($BackendBakeoff) {
+        if ($BackendRole -eq "automatic") { "1" } else { "0" }
+    } else {
+        $Jit
+    }
     $start = @{
         FilePath = $ExecutablePath
         ArgumentList = $argumentLine
@@ -1548,24 +1941,31 @@ function Invoke-Observation(
     if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
         $processArguments += "--expect-test-exit"
     }
-    $processResult = Invoke-IzarraProcess $ExecutablePath $processArguments $stdoutPath $stderrPath $observationHome
-    if ($processResult.exit_code -ne 0) {
+    if ($BackendBakeoff -and $Role -eq "interpreter") {
+        $processArguments += "--interpreter"
+    }
+    $processResult = Invoke-IzarraProcess `
+        $ExecutablePath $processArguments $stdoutPath $stderrPath $observationHome $Role
+    if ($processResult.exit_code -ne 0 -and -not $BackendBakeoff) {
         throw "$context failed with exit code $($processResult.exit_code). See $stdoutPath and $stderrPath."
     }
     if (-not (Test-Path -LiteralPath $jsonPath -PathType Leaf)) {
         throw "$context did not produce its profile JSON."
     }
+    $profileHash = if ($BackendBakeoff) { Get-FileSha256 $jsonPath } else { $null }
     $sample = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json
     if ($sample.schema -ne "izarravm-hdd-profile-v1" -or $sample.mode -ne $Policy.mode) {
         throw "$context produced an unexpected schema or CPU mode."
     }
     Assert-UninstrumentedProfileSample $sample $context
-    if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+    if (-not $BackendBakeoff -and
+        $Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
         if ($sample.stop.kind -ne "test_exit" -or $sample.stop.code -ne 0) {
             throw "$context did not reach TestExit code 0."
         }
-    } elseif ($sample.stop.kind -ne "cycle_limit" -or
-        [uint64]$sample.stop.requested -ne $Policy.cycle_budget) {
+    } elseif (-not $BackendBakeoff -and
+        ($sample.stop.kind -ne "cycle_limit" -or
+         [uint64]$sample.stop.requested -ne $Policy.cycle_budget)) {
         throw "$context did not reach its fixed cycle limit."
     }
     $wallSeconds = Get-FiniteNumber $sample.wall_seconds "wall_seconds"
@@ -1597,22 +1997,71 @@ function Invoke-Observation(
     Assert-NearlyEqual $instructionsPerSecond ($instructions / $wallSeconds) "instructions_per_host_second"
     Assert-NearlyEqual $directCoverage ($directInstructions / $instructions) "direct_native_coverage"
     Assert-NearlyEqual $directExitsPer100 (100.0 * $directSideExits / $instructions) "direct_slow_exits_per_100_instructions"
+    $preservedQconsole = $null
+    $qconsoleHash = $null
     if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
-        if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
-            $sample.timedemo.realtics -lt $Policy.minimum_realtics -or
-            $sample.timedemo.realtics -gt $Policy.maximum_realtics) {
+        if (-not $BackendBakeoff -and
+            ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
+             $sample.timedemo.realtics -lt $Policy.minimum_realtics -or
+             $sample.timedemo.realtics -gt $Policy.maximum_realtics)) {
             throw "$context failed its 2134-gametic timing identity check."
         }
-        $doomFps = 35.0 * $sample.timedemo.gametics / $sample.timedemo.realtics
-        $sample | Add-Member -NotePropertyName doom_fps -NotePropertyValue $doomFps
+        if ($null -ne $sample.timedemo -and $sample.timedemo.realtics -gt 0) {
+            $doomFps = 35.0 * $sample.timedemo.gametics / $sample.timedemo.realtics
+            $sample | Add-Member -NotePropertyName doom_fps -NotePropertyValue $doomFps
+        }
     } else {
         $preservedQconsole = Join-Path $ResultsDirectory "$fileStem-qconsole.log"
         Remove-Item -LiteralPath $preservedQconsole -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $qconsole -PathType Leaf) {
             Copy-Item -LiteralPath $qconsole -Destination $preservedQconsole
+            if ($BackendBakeoff) {
+                $qconsoleHash = Get-FileSha256 $preservedQconsole
+            }
         }
-        $quakeIdentity = Read-QuakeTimedemoIdentity $preservedQconsole
-        $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
+        if ($BackendBakeoff) {
+            $quakeIdentities = @(Read-QuakeTimedemoIdentities $preservedQconsole)
+            $quakeIdentity = if ($quakeIdentities.Count -eq 1) {
+                $quakeIdentities[0]
+            } else {
+                $null
+            }
+            $sample | Add-Member `
+                -NotePropertyName quake_timedemo_identity_count `
+                -NotePropertyValue $quakeIdentities.Count
+            $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
+        } else {
+            $quakeIdentity = Read-QuakeTimedemoIdentity $preservedQconsole
+            $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
+        }
+    }
+    if ($BackendBakeoff) {
+        $resultBlock = Get-NormalizedResultBlock $stdoutPath
+        $sample | Add-Member `
+            -NotePropertyName gate_process_exit_code `
+            -NotePropertyValue $processResult.exit_code
+        $sample | Add-Member -NotePropertyName gate_backend_policy -NotePropertyValue $Role
+        $sample | Add-Member -NotePropertyName gate_termination_policy -NotePropertyValue $(
+            if ($Policy.name -eq "quake-586") { "fixed_cycle_limit" } else { "lotura_test_exit" }
+        )
+        $sample | Add-Member -NotePropertyName gate_artifacts -NotePropertyValue ([pscustomobject][ordered]@{
+            profile_json_file = [IO.Path]::GetFileName($jsonPath)
+            profile_json_sha256 = $profileHash
+            stdout_file = [IO.Path]::GetFileName($stdoutPath)
+            stdout_sha256 = Get-FileSha256 $stdoutPath
+            stderr_file = [IO.Path]::GetFileName($stderrPath)
+            stderr_sha256 = Get-FileSha256 $stderrPath
+            qconsole_file = if ($null -ne $preservedQconsole) {
+                [IO.Path]::GetFileName($preservedQconsole)
+            } else {
+                $null
+            }
+            qconsole_sha256 = $qconsoleHash
+            result_block_status = $resultBlock.status
+            result_block_count = $resultBlock.block_count
+            result_block_sha256 = $resultBlock.sha256
+            result_block_normalized_bytes = $resultBlock.normalized_bytes
+        })
     }
     $sample | Add-Member -NotePropertyName gate_role -NotePropertyValue $Role
     $sample | Add-Member -NotePropertyName gate_observation -NotePropertyValue $ObservationId
@@ -1622,8 +2071,15 @@ function Invoke-Observation(
     return $sample
 }
 
-function Get-RoleSummary([string]$Name, [string]$Mode, [object[]]$Samples) {
-    Assert-RoleDeterminism $Name $Samples
+function Get-RoleSummary(
+    [string]$Name,
+    [string]$Mode,
+    [object[]]$Samples,
+    [bool]$EnforceDeterminism = $true
+) {
+    if ($EnforceDeterminism) {
+        Assert-RoleDeterminism $Name $Samples
+    }
     return [ordered]@{
         name = $Name
         mode = $Mode
@@ -1673,6 +2129,226 @@ function Get-PairedWorkloadSummary($Policy, [object[]]$Candidate, [object[]]$Bas
     }
 }
 
+function Get-BackendCompatibilityReasons($Policy, [string]$Role, [object[]]$Samples) {
+    $reasons = @()
+    foreach ($sample in $Samples) {
+        $label = "$Role $($sample.gate_observation)"
+        if ($sample.gate_process_exit_code -ne 0) {
+            $reasons += "$label host exit code is $($sample.gate_process_exit_code)"
+        }
+        if ($sample.gate_artifacts.result_block_status -ne "valid" -or
+            $sample.gate_artifacts.result_block_count -ne 1 -or
+            [string]$sample.gate_artifacts.result_block_sha256 -notmatch '^[0-9a-f]{64}$') {
+            $reasons += "$label did not produce exactly one hashable semantic result block"
+        }
+        if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+            if ((Get-StopIdentityKey $sample) -cne "test_exit|code=0|requested=|message=") {
+                $reasons += "$label did not reach Lotura TestExit code 0"
+            }
+            if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
+                $sample.timedemo.realtics -le 0) {
+                $reasons += "$label did not report the 2134-gametic Doom demo"
+            }
+        } else {
+            $expectedStop = "cycle_limit|code=|requested=$($Policy.cycle_budget)|message="
+            if ((Get-StopIdentityKey $sample) -cne $expectedStop) {
+                $reasons += "$label did not reach the fixed $($Policy.cycle_budget)-clock limit"
+            }
+            if ($sample.quake_timedemo_identity_count -ne 1 -or
+                $null -eq $sample.quake_timedemo -or
+                $sample.quake_timedemo.frames -ne 969 -or
+                $sample.quake_timedemo.seconds -le 0 -or
+                $sample.quake_timedemo.fps -le 0) {
+                $reasons += "$label did not produce exactly one valid 969-frame Quake identity"
+            } elseif ([Math]::Abs(
+                $sample.quake_timedemo.frames / $sample.quake_timedemo.seconds -
+                    $sample.quake_timedemo.fps
+            ) -gt 0.2) {
+                $reasons += "$label reported inconsistent Quake seconds and fps"
+            }
+        }
+    }
+    return @($reasons)
+}
+
+function Get-BackendCalibrationReasons($Policy, [string]$Role, [object[]]$Samples) {
+    $reasons = @()
+    foreach ($sample in $Samples) {
+        $label = "$Role $($sample.gate_observation)"
+        if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+            if ($null -eq $sample.timedemo -or
+                $sample.timedemo.realtics -lt $Policy.minimum_realtics -or
+                $sample.timedemo.realtics -gt $Policy.maximum_realtics) {
+                $reasons += "$label is outside the Doom realtics calibration band"
+            }
+        } elseif ($null -eq $sample.quake_timedemo -or
+            $sample.quake_timedemo.fps -lt 41.0 -or
+            $sample.quake_timedemo.fps -gt 44.0) {
+            $reasons += "$label is outside the Quake 41-44 fps calibration band"
+        }
+    }
+    return @($reasons)
+}
+
+function Get-BackendSelectionReasons(
+    [object[]]$Automatic,
+    [object[]]$Interpreter
+) {
+    $reasons = @()
+    foreach ($sample in $Automatic) {
+        if ($sample.perf.jit_direct_entries -le 0 -or $sample.perf.jit_direct_insns -le 0) {
+            $reasons += "automatic $($sample.gate_observation) did not execute the direct backend"
+        }
+    }
+    $zeroFields = @(
+        "jit_region_entries", "jit_region_insns", "jit_native_insns",
+        "jit_direct_entries", "jit_direct_insns"
+    )
+    foreach ($sample in $Interpreter) {
+        foreach ($field in $zeroFields) {
+            if ($sample.perf.$field -ne 0) {
+                $reasons += "interpreter $($sample.gate_observation) reported nonzero $field"
+            }
+        }
+    }
+    return @($reasons)
+}
+
+function Get-BackendWorkloadSummary(
+    $Policy,
+    [object[]]$Automatic,
+    [object[]]$Interpreter,
+    [bool]$IsScreening
+) {
+    if ($Automatic.Count -ne $Interpreter.Count) {
+        throw "$($Policy.name) has incomplete backend pairs."
+    }
+    $ipsRatios = @()
+    $rtfRatios = @()
+    $equalWorkFailures = @()
+    $pairs = for ($index = 0; $index -lt $Automatic.Count; $index++) {
+        $ipsRatio = $Automatic[$index].instructions_per_host_second /
+            $Interpreter[$index].instructions_per_host_second
+        $rtfRatio = $Automatic[$index].real_time_factor /
+            $Interpreter[$index].real_time_factor
+        $ipsRatios += $ipsRatio
+        $rtfRatios += $rtfRatio
+        $automaticWork = Get-EqualWorkRecord $Policy.name $Automatic[$index]
+        $interpreterWork = Get-EqualWorkRecord $Policy.name $Interpreter[$index]
+        $equalWork = Compare-EqualWorkRecords $automaticWork $interpreterWork
+        if ($Automatic[$index].gate_artifacts.result_block_status -ne "valid" -or
+            $Interpreter[$index].gate_artifacts.result_block_status -ne "valid") {
+            $equalWork = [pscustomobject][ordered]@{
+                matches = $false
+                mismatched_fields = @(
+                    @($equalWork.mismatched_fields) + "result_block_identity" |
+                        Sort-Object -Unique
+                )
+            }
+            $equalWorkFailures += "pair $($index + 1): semantic result block is invalid"
+        }
+        if (-not $equalWork.matches) {
+            $equalWorkFailures += "pair $($index + 1): $($equalWork.mismatched_fields -join ', ')"
+        }
+        [ordered]@{
+            pair = $index + 1
+            automatic_observation = $Automatic[$index].gate_observation
+            interpreter_observation = $Interpreter[$index].gate_observation
+            ips_ratio = $ipsRatio
+            real_time_factor_ratio = $rtfRatio
+            equal_work = $equalWork
+        }
+    }
+
+    $automaticDeterminism = Get-RoleExactDeterminism $Policy.name $Automatic
+    $interpreterDeterminism = Get-RoleExactDeterminism $Policy.name $Interpreter
+    if (-not $automaticDeterminism.deterministic) {
+        $equalWorkFailures += "automatic role: $($automaticDeterminism.mismatched_fields -join ', ')"
+    }
+    if (-not $interpreterDeterminism.deterministic) {
+        $equalWorkFailures += "interpreter role: $($interpreterDeterminism.mismatched_fields -join ', ')"
+    }
+
+    $compatibilityReasons = @(
+        @(Get-BackendCompatibilityReasons $Policy "automatic" $Automatic) +
+        @(Get-BackendCompatibilityReasons $Policy "interpreter" $Interpreter)
+    )
+    $calibrationReasons = @(
+        @(Get-BackendCalibrationReasons $Policy "automatic" $Automatic) +
+        @(Get-BackendCalibrationReasons $Policy "interpreter" $Interpreter)
+    )
+    $backendReasons = @(Get-BackendSelectionReasons $Automatic $Interpreter)
+    $ipsMetric = Get-BackendPairedMetric ([double[]]$ipsRatios)
+    $rtfMetric = Get-BackendPairedMetric ([double[]]$rtfRatios)
+    $survivalReasons = @()
+    if ($ipsMetric.verdict -ne "pass") {
+        $survivalReasons += "IPS survival threshold failed"
+    }
+    if ($rtfMetric.verdict -ne "pass") {
+        $survivalReasons += "real-time-factor survival threshold failed"
+    }
+
+    $requiredFloorPasses = if ($IsScreening) { 2 } else { $minimumFloorPasses }
+    $productFloorPasses = @($Automatic | Where-Object {
+        $_.real_time_factor -ge $Policy.minimum_real_time_factor
+    }).Count
+    $productReasons = @()
+    if ($productFloorPasses -lt $requiredFloorPasses) {
+        $productReasons += "$productFloorPasses of $($Automatic.Count) automatic samples meet the product floor"
+    }
+
+    return [ordered]@{
+        name = $Policy.name
+        mode = $Policy.mode
+        configuration = [ordered]@{
+            cpu_mode = $Policy.mode
+            memory_mib = 24
+            video = "vega"
+            cycle_budget = $Policy.cycle_budget
+        }
+        termination_policy = if ($Policy.name -eq "quake-586") {
+            "fixed_cycle_limit_with_post_demo_tail"
+        } else {
+            "lotura_test_exit_after_timedemo"
+        }
+        minimum_real_time_factor = $Policy.minimum_real_time_factor
+        automatic = Get-RoleSummary "automatic" $Policy.mode $Automatic $false
+        interpreter = Get-RoleSummary "interpreter" $Policy.mode $Interpreter $false
+        pairs = $pairs
+        paired_metrics = [ordered]@{
+            instructions_per_host_second = $ipsMetric
+            real_time_factor = $rtfMetric
+        }
+        survival = [ordered]@{
+            verdict = if ($survivalReasons.Count -eq 0) { "pass" } else { "fail" }
+            failure_reasons = $survivalReasons
+        }
+        equal_work = [ordered]@{
+            verdict = if ($equalWorkFailures.Count -eq 0) { "pass" } else { "fail" }
+            automatic_role_determinism = $automaticDeterminism
+            interpreter_role_determinism = $interpreterDeterminism
+            failure_reasons = $equalWorkFailures
+        }
+        verdicts = [ordered]@{
+            product = if ($productReasons.Count -eq 0) { "pass" } else { "fail" }
+            equal_work = if ($equalWorkFailures.Count -eq 0) { "pass" } else { "fail" }
+            calibration = if ($calibrationReasons.Count -eq 0) { "pass" } else { "fail" }
+            backend_health = if ($backendReasons.Count -eq 0) { "pass" } else { "fail" }
+            compatibility = if ($compatibilityReasons.Count -eq 0) { "pass" } else { "fail" }
+        }
+        checks = [ordered]@{
+            product = [ordered]@{
+                required_floor_passes = $requiredFloorPasses
+                actual_floor_passes = $productFloorPasses
+                failure_reasons = $productReasons
+            }
+            calibration = [ordered]@{ failure_reasons = $calibrationReasons }
+            backend_health = [ordered]@{ failure_reasons = $backendReasons }
+            compatibility = [ordered]@{ failure_reasons = $compatibilityReasons }
+        }
+    }
+}
+
 $knownDiagnosticVariables = @(
     "IZARRAVM_AUDIO_DEBUG", "IZARRAVM_CPU_PROFILE", "IZARRAVM_DECODE_CACHE_LINES",
     "IZARRAVM_DIFF_TRACE", "IZARRAVM_DUMP_LINEAR", "IZARRAVM_FAULT_TRACE",
@@ -1697,14 +2373,15 @@ try {
         $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
         Set-GateProcessEnvironment $name $null
     }
-    Set-GateProcessEnvironment "IZARRAVM_JIT" $Jit
+    $gateJitEnvironment = if ($BackendBakeoff) { $null } else { $Jit }
+    Set-GateProcessEnvironment "IZARRAVM_JIT" $gateJitEnvironment
     $candidateExecutableLock = [IO.File]::Open(
         $candidateArtifact.executed_copy_path,
         [IO.FileMode]::Open,
         [IO.FileAccess]::Read,
         [IO.FileShare]::Read
     )
-    if ($pairedRun) {
+    if ($revisionPairedRun) {
         $baselineExecutableLock = [IO.File]::Open(
             $baselineArtifact.executed_copy_path,
             [IO.FileMode]::Open,
@@ -1713,9 +2390,18 @@ try {
         )
     }
     $policies = Get-WorkloadPolicies $Workload
+    $pairRoles = if ($BackendBakeoff) {
+        @("automatic", "interpreter")
+    } else {
+        @("candidate", "baseline")
+    }
     $observations = [ordered]@{}
     foreach ($policy in $policies) {
-        $observations[$policy.name] = [ordered]@{ candidate = @(); baseline = @() }
+        $roleBuckets = [ordered]@{}
+        foreach ($role in $pairRoles) {
+            $roleBuckets[$role] = @()
+        }
+        $observations[$policy.name] = $roleBuckets
     }
 
     if ($pairedRun) {
@@ -1725,13 +2411,17 @@ try {
             } else {
                 $quakeSnapshot.frozen_path
             }
-            foreach ($role in (Get-PairOrder 1 $PairSeed)) {
-                $artifact = if ($role -eq "candidate") { $candidateArtifact } else { $baselineArtifact }
+            foreach ($role in (Get-PairOrder 1 $PairSeed $pairRoles)) {
+                $artifact = if ($BackendBakeoff -or $role -eq "candidate") {
+                    $candidateArtifact
+                } else {
+                    $baselineArtifact
+                }
                 $null = Invoke-Observation $policy $sourceFolder $role "warmup" $artifact.executed_copy_path
             }
         }
         for ($pair = 1; $pair -le $Runs; $pair++) {
-            $roleOrder = Get-PairOrder $pair $PairSeed
+            $roleOrder = Get-PairOrder $pair $PairSeed $pairRoles
             for ($workloadOffset = 0; $workloadOffset -lt $policies.Count; $workloadOffset++) {
                 $policy = $policies[($workloadOffset + $pair - 1) % $policies.Count]
                 $sourceFolder = if ($policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
@@ -1740,7 +2430,11 @@ try {
                     $quakeSnapshot.frozen_path
                 }
                 foreach ($role in $roleOrder) {
-                    $artifact = if ($role -eq "candidate") { $candidateArtifact } else { $baselineArtifact }
+                    $artifact = if ($BackendBakeoff -or $role -eq "candidate") {
+                        $candidateArtifact
+                    } else {
+                        $baselineArtifact
+                    }
                     $sample = Invoke-Observation $policy $sourceFolder $role "pair$pair" $artifact.executed_copy_path
                     $bucket = $observations[$policy.name]
                     $bucket[$role] += $sample
@@ -1764,7 +2458,10 @@ try {
     $workloads = @()
     foreach ($policy in $policies) {
         $bucket = $observations[$policy.name]
-        if ($pairedRun) {
+        if ($BackendBakeoff) {
+            $workloads += Get-BackendWorkloadSummary `
+                $policy $bucket.automatic $bucket.interpreter ([bool]$Screening)
+        } elseif ($pairedRun) {
             $workloads += Get-PairedWorkloadSummary $policy $bucket.candidate $bucket.baseline
         } else {
             $candidateSummary = Get-RoleSummary $policy.name $policy.mode $bucket.candidate
@@ -1783,7 +2480,7 @@ try {
         }
     }
     $candidateHashAfter = (Get-FileHash -LiteralPath $candidateArtifact.executed_copy_path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($pairedRun) {
+    if ($revisionPairedRun) {
         $baselineHashAfter = (Get-FileHash -LiteralPath $baselineArtifact.executed_copy_path -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     if ($null -ne $doomSnapshot -and
@@ -1846,7 +2543,7 @@ if ($ProcessorIndex -ge 0) {
 if ($candidateHashAfter -ne $candidateArtifact.sha256) {
     throw "The frozen candidate executable changed during the gate."
 }
-if ($pairedRun) {
+if ($revisionPairedRun) {
     if ($baselineHashAfter -ne $baselineArtifact.sha256) {
         throw "The frozen baseline executable changed during the gate."
     }
@@ -1873,7 +2570,179 @@ if (-not $ReportOnly -and
      ($repositoryAtCompletion.status -join "`n") -ne ($repositoryAtSelection.status -join "`n"))) {
     throw "The candidate repository changed during the formal gate."
 }
+$activePowerSchemeAtCompletion = if ($isWindowsHost) {
+    Get-ActivePowerScheme
+} else {
+    $null
+}
+$powerSchemeRecorded = -not [string]::IsNullOrWhiteSpace([string]$activePowerScheme) -and
+    -not [string]::IsNullOrWhiteSpace([string]$activePowerSchemeAtCompletion)
+$powerSchemeStable = $powerSchemeRecorded -and
+    $activePowerScheme -eq $activePowerSchemeAtCompletion
 
+if ($BackendBakeoff) {
+    $evidencePolicy = Get-BackendEvidencePolicy ([bool]$Screening)
+    $aggregateVerdicts = [ordered]@{}
+    foreach ($component in @(
+        "product", "equal_work", "calibration", "backend_health", "compatibility"
+    )) {
+        $failedWorkloads = @($workloads | Where-Object {
+            $_.verdicts.$component -ne "pass"
+        })
+        $aggregateVerdicts[$component] = if ($failedWorkloads.Count -eq 0) {
+            "pass"
+        } else {
+            "fail"
+        }
+    }
+    $finalEligible = $evidencePolicy.final_eligible -and
+        $candidateArtifact.verified -and
+        $candidateArtifact.built_this_invocation -and
+        -not $repositoryAtSelection.dirty -and
+        $Runs -eq 6 -and
+        $ProcessorIndex -eq 8 -and
+        $verifiedChildAffinityMasks.Count -eq $policies.Count * (2 + 2 * $Runs) -and
+        $powerSchemeStable
+    $survivalFailures = @($workloads | Where-Object { $_.survival.verdict -ne "pass" })
+    $survivalComponentsPass = @(
+        "equal_work", "calibration", "backend_health", "compatibility"
+    ) | Where-Object { $aggregateVerdicts[$_] -ne "pass" }
+    $trackASurvival = if ($Screening) {
+        "not_evaluated"
+    } elseif (-not $finalEligible) {
+        "ineligible"
+    } elseif ($survivalComponentsPass.Count -eq 0 -and $survivalFailures.Count -eq 0) {
+        "pass"
+    } else {
+        "fail"
+    }
+    $verdict = if ($Screening) {
+        "screening"
+    } elseif ($trackASurvival -eq "pass") {
+        "survived"
+    } elseif ($trackASurvival -eq "ineligible") {
+        "ineligible"
+    } else {
+        "failed"
+    }
+    $backendFailures = @()
+    if (-not $powerSchemeStable) {
+        $backendFailures += if ($powerSchemeRecorded) {
+            "the active power scheme changed during the bakeoff"
+        } else {
+            "the active power scheme could not be recorded"
+        }
+    }
+    foreach ($workloadResult in $workloads) {
+        if ($workloadResult.survival.verdict -ne "pass") {
+            $backendFailures += "$($workloadResult.name): survival threshold failed"
+        }
+        foreach ($component in @(
+            "product", "equal_work", "calibration", "backend_health", "compatibility"
+        )) {
+            if ($workloadResult.verdicts.$component -ne "pass") {
+                $backendFailures += "$($workloadResult.name): $component failed"
+            }
+        }
+    }
+    $summary = [ordered]@{
+        schema = "izarravm-cpu-bakeoff-v1"
+        comparison_class = "same_executable_backend"
+        evidence_grade = $evidencePolicy.evidence_grade
+        final_eligible = $finalEligible
+        verdict = $verdict
+        track_a_survival = $trackASurvival
+        verdicts = $aggregateVerdicts
+        fresh_build = $candidateArtifact.built_this_invocation
+        revision = $candidateArtifact.artifact_source.head_commit
+        repository_at_selection = $repositoryAtSelection
+        repository_at_completion = $repositoryAtCompletion
+        executable = $candidateArtifact
+        roles = [ordered]@{
+            automatic = [ordered]@{
+                executable_sha256 = $candidateArtifact.sha256
+                cli = "default automatic backend"
+                environment = [ordered]@{ IZARRAVM_JIT = "1" }
+            }
+            interpreter = [ordered]@{
+                executable_sha256 = $candidateArtifact.sha256
+                cli = "--interpreter"
+                environment = [ordered]@{ IZARRAVM_JIT = "0" }
+            }
+            same_frozen_executable = $true
+        }
+        verification = [ordered]@{
+            executable_status = "built_and_verified"
+            workload_manifest_matches = $fixtureManifestMatches
+            build_environment_override_names = @($detectedBuildEnvironmentOverrides.Keys | Sort-Object)
+        }
+        measurement_lock = $measurementLockEvidence
+        gate_script_sha256 = [ordered]@{
+            at_entry = $gateScriptHash
+            at_completion = $gateScriptHashAfter
+        }
+        workload_manifest_sha256 = [ordered]@{
+            at_entry = $fixtureManifestHash
+            at_completion = $fixtureManifestHashAfter
+        }
+        injected_exitvm_sha256 = $exitVmHash
+        workload_inputs_sha256 = $workloadInputHashes
+        workload_trees_sha256 = $workloadTreeHashes
+        workload_canonical_trees_sha256 = $workloadCanonicalTreeHashes
+        generated_utc = [DateTime]::UtcNow.ToString("o")
+        host = [ordered]@{
+            identity = $hostIdentity
+            active_power_scheme_at_completion = $activePowerSchemeAtCompletion
+            active_power_scheme_recorded = $powerSchemeRecorded
+            active_power_scheme_stable = $powerSchemeStable
+        }
+        processor_affinity = [ordered]@{
+            policy = "one inherited processor per child"
+            requested_processor_index = $ProcessorIndex
+            effective_processor_index = $ProcessorIndex
+            requested_mask = Format-AffinityMask $requestedProcessorMask
+            original_gate_process_mask = Format-AffinityMask $originalGateAffinity
+            verified_child_masks = @($verifiedChildAffinityMasks | Sort-Object -Unique)
+            verified_child_processes = $verifiedChildAffinityMasks.Count
+            child_inheritance_verified = $true
+            parent_restore_policy = "restore the exact pre-launch mask immediately after each child readback"
+            processor_group_policy = "single ProcessorAffinity group, at most 64 logical processors"
+        }
+        measured_pairs_per_workload = $Runs
+        measured_runs_per_role_and_workload = $Runs
+        discarded_warmups_per_role_and_workload = 1
+        pair_seed = $PairSeed
+        pair_order = @(1..$Runs | ForEach-Object {
+            [ordered]@{
+                pair = $_
+                roles = @(Get-PairOrder $_ $PairSeed $pairRoles)
+            }
+        })
+        termination_policies = [ordered]@{
+            doom = "Lotura TestExit code 0 after the 2134-gametic timedemo"
+            quake = "fixed 6.2G cycle limit with exactly one 969-frame identity; wall includes the minimal post-demo tail"
+            quake_test_exit_gate = "blocked: +exec bench.cfg corrupts playback before the identity"
+        }
+        acceptance = [ordered]@{
+            workload_real_time_factor_floors = [ordered]@{
+                doom_486 = 3.5
+                doom_586 = 1.4
+                quake_586 = 1.4
+            }
+            minimum_backend_median_ratio = 1.05
+            minimum_backend_lower_95_ratio_exclusive = 1.0
+            paired_lower_bound = "one-sided 95% Student-t"
+            exact_work_fields = @(
+                "perf.instructions", "master_ticks", "elapsed_budget_clocks",
+                "executed_cpu_core_clocks", "raw_bus_clocks", "stop",
+                "timedemo_identity", "result_block_sha256"
+            )
+        }
+        scope = "Headless same-executable CPU backend comparison. GUI pacing and audio require separate validation."
+        workloads = $workloads
+        failure_reasons = $backendFailures
+    }
+} else {
 $formalGateEligible = -not $ReportOnly -and $candidateArtifact.verified -and
     $pairedRun -and $baselineArtifact.verified -and -not $repositoryAtSelection.dirty -and
     $ProcessorIndex -ge 0
@@ -2009,15 +2878,25 @@ $summary = [ordered]@{
     workloads = $workloads
     failure_reasons = $formalFailures
 }
+}
 
 $summaryPath = Join-Path $ResultsDirectory "summary.json"
 $summary | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $summaryPath -Encoding utf8
 
 foreach ($workloadResult in $summary.workloads) {
-    $median = $workloadResult.candidate.median
-    Write-Host ("{0}: candidate rt={1:N3} direct-native={2:P2} direct-exits/100={3:N3}" -f `
-        $workloadResult.name, $median.real_time_factor, $median.direct_native_coverage, `
-        $median.direct_slow_exits_per_100_instructions)
+    if ($BackendBakeoff) {
+        $median = $workloadResult.automatic.median
+        Write-Host ("{0}: automatic rt={1:N3} direct-native={2:P2} verdicts={3}" -f `
+            $workloadResult.name, $median.real_time_factor, $median.direct_native_coverage, `
+            (($workloadResult.verdicts.GetEnumerator() | ForEach-Object {
+                "$($_.Key)=$($_.Value)"
+            }) -join ","))
+    } else {
+        $median = $workloadResult.candidate.median
+        Write-Host ("{0}: candidate rt={1:N3} direct-native={2:P2} direct-exits/100={3:N3}" -f `
+            $workloadResult.name, $median.real_time_factor, $median.direct_native_coverage, `
+            $median.direct_slow_exits_per_100_instructions)
+    }
     if ($null -ne $workloadResult.paired_metrics) {
         Write-Host ("  paired IPS={0:N3} (lower95={1:N3}) RTF={2:N3} (lower95={3:N3})" -f `
             $workloadResult.paired_metrics.instructions_per_host_second.median_ratio,
@@ -2028,6 +2907,14 @@ foreach ($workloadResult in $summary.workloads) {
 }
 Write-Host "Summary: $summaryPath"
 
-if (-not $ReportOnly -and $verdict -ne "passed") {
+if ($BackendBakeoff -and -not $Screening -and $summary.track_a_survival -ne "pass") {
+    throw "The backend bakeoff did not meet its survival gate: $($summary.failure_reasons -join ' | ')."
+}
+if (-not $BackendBakeoff -and -not $ReportOnly -and $verdict -ne "passed") {
     throw "The paired throughput gate did not pass: $($formalFailures -join ' | ')."
+}
+} finally {
+    if ($null -ne $measurementLockHandle) {
+        $measurementLockHandle.Dispose()
+    }
 }
