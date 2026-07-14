@@ -701,18 +701,21 @@ impl CpuGsw {
     /// architectural state unchanged (it is excluded from `CpuGsw` equality).
     #[cfg(feature = "jit")]
     pub fn set_unit_sim_enabled(&mut self, on: bool) {
-        self.unit_sim.0 = on.then(|| Box::new(jit::unit_sim::UnitSim::default()));
+        self.unit_sim.0 = on.then(|| Box::new(jit::unit_sim::SimLadder::new()));
     }
 
-    /// Take the unit simulator's headline report and its per-unit `(member_count, entry_physical
-    /// _page)` histogram, disabling the sim in the process. `None` when the sim was not enabled.
-    /// The histogram entries are `(member_count, entry_physical_page)`; see `SimReport` and
-    /// `jit::unit_sim` for the counter meanings. Consumed by the measurement tests and Track C
-    /// tooling.
+    /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. `None`
+    /// when the sim was not enabled. Each element is `(cfg_label, headline, histogram)` for one
+    /// ladder rung (`L0..L4`), where the histogram entries are `(member_count, entry_physical_page)`;
+    /// see `SimReport` and `jit::unit_sim` for the counter meanings. Consumed by the measurement
+    /// tests and Track C tooling.
     #[cfg(feature = "jit")]
-    pub fn take_unit_sim_report(&mut self) -> Option<(SimReport, Vec<(usize, u32)>)> {
-        let sim = self.unit_sim.0.take()?;
-        Some((sim.report(), sim.unit_member_histogram()))
+    #[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
+    pub fn take_unit_sim_report(
+        &mut self,
+    ) -> Option<Vec<(&'static str, SimReport, Vec<(usize, u32)>)>> {
+        let ladder = self.unit_sim.0.take()?;
+        Some(ladder.reports())
     }
 
     /// Feed one retired interpreter instruction into the optional unit simulator. A no-op (one

@@ -646,16 +646,17 @@ fn unit_sim_report_lines_format_headline_and_histogram() {
         (9, 0x0012),
         (65, 0x0013),
     ];
-    let lines = unit_sim_report_lines(&report, &histogram);
+    let reports = vec![("L0", report, histogram)];
+    let lines = unit_sim_report_lines(&reports);
     assert_eq!(
         lines,
         vec![
-            "unit_sim entries=1000 retired_in_units=3500 linked_transfers=42 unresolved_exits=7 \
-side_exits_io=3 side_exits_async=2 sim_invalidations=5 units_built=120 units_rebuilt=4 \
-insns_per_entry=3.500000"
+            "unit_sim cfg=L0 entries=1000 retired_in_units=3500 linked_transfers=42 loop_links=0 \
+call_links=0 ret_links=0 itc_hits=0 unresolved_exits=7 side_exits_io=3 side_exits_async=2 \
+sim_invalidations=5 sim_restamps=0 units_built=120 units_rebuilt=4 insns_per_entry=3.500000"
                 .to_string(),
-            "unit_sim_hist units=10 members_p50=5 members_p90=9 members_max=65 units_over_64=1 \
-units_over_128=0 units_over_256=0 excl_units=2"
+            "unit_sim_hist cfg=L0 units=10 members_p50=5 members_p90=9 members_max=65 \
+units_over_64=1 units_over_128=0 units_over_256=0 excl_units=2"
                 .to_string(),
         ]
     );
@@ -664,16 +665,28 @@ units_over_128=0 units_over_256=0 excl_units=2"
 #[cfg(feature = "jit")]
 #[test]
 fn unit_sim_report_lines_handle_empty_run() {
-    let report = izarravm_cpu::SimReport::default();
-    let lines = unit_sim_report_lines(&report, &[]);
+    // Two empty rungs prove the per-rung fan-out: each rung emits its own labeled pair, so the
+    // ladder's five rungs would produce ten lines.
+    let reports = vec![
+        ("L0", izarravm_cpu::SimReport::default(), Vec::new()),
+        ("L1", izarravm_cpu::SimReport::default(), Vec::new()),
+    ];
+    let lines = unit_sim_report_lines(&reports);
     assert_eq!(
         lines,
         vec![
-            "unit_sim entries=0 retired_in_units=0 linked_transfers=0 unresolved_exits=0 \
-side_exits_io=0 side_exits_async=0 sim_invalidations=0 units_built=0 units_rebuilt=0 \
-insns_per_entry=0.000000"
+            "unit_sim cfg=L0 entries=0 retired_in_units=0 linked_transfers=0 loop_links=0 \
+call_links=0 ret_links=0 itc_hits=0 unresolved_exits=0 side_exits_io=0 side_exits_async=0 \
+sim_invalidations=0 sim_restamps=0 units_built=0 units_rebuilt=0 insns_per_entry=0.000000"
                 .to_string(),
-            "unit_sim_hist units=0 members_p50=0 members_p90=0 members_max=0 units_over_64=0 \
+            "unit_sim_hist cfg=L0 units=0 members_p50=0 members_p90=0 members_max=0 units_over_64=0 \
+units_over_128=0 units_over_256=0 excl_units=0"
+                .to_string(),
+            "unit_sim cfg=L1 entries=0 retired_in_units=0 linked_transfers=0 loop_links=0 \
+call_links=0 ret_links=0 itc_hits=0 unresolved_exits=0 side_exits_io=0 side_exits_async=0 \
+sim_invalidations=0 sim_restamps=0 units_built=0 units_rebuilt=0 insns_per_entry=0.000000"
+                .to_string(),
+            "unit_sim_hist cfg=L1 units=0 members_p50=0 members_p90=0 members_max=0 units_over_64=0 \
 units_over_128=0 units_over_256=0 excl_units=0"
                 .to_string(),
         ]

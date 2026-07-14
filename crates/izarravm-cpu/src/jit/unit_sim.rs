@@ -90,7 +90,6 @@ pub(crate) struct SimConfig {
 impl SimConfig {
     /// The config for ladder rung `rung` (`0..=4`). Each rung is a strict superset of the one below,
     /// so `ladder(0)` is `L0` (all mechanisms off, v1 parity) and `ladder(4)` enables all four.
-    #[allow(dead_code)] // Wired into the CPU ladder in Track C task 3; exercised by tests now.
     pub(crate) fn ladder(rung: u8) -> Self {
         SimConfig {
             loop_direct: rung >= 1,
@@ -232,7 +231,6 @@ const SHADOW_CAP: usize = 64;
 impl UnitSim {
     /// Build a sim running under `config`. `UnitSim::default()` is `with_config(SimConfig::default())`
     /// which is ladder rung 0 (v1 parity).
-    #[allow(dead_code)] // Wired into the CPU ladder in Track C task 3; exercised by tests now.
     pub(crate) fn with_config(config: SimConfig) -> Self {
         Self {
             config,
@@ -767,14 +765,12 @@ fn page_write_range(physical: u32, width: u32, page: u32) -> (u32, u32) {
 }
 
 /// Fans one observation stream out to all five ladder rungs (`L0..=L4`), so a single guest run
-/// measures the marginal value of each mechanism against the same trace. Wired into the CPU in
-/// Track C task 3; unit-tested here.
-#[allow(dead_code)]
+/// measures the marginal value of each mechanism against the same trace. Wired into the CPU via
+/// `set_unit_sim_enabled`; unit-tested here.
 pub(crate) struct SimLadder {
     sims: Vec<(&'static str, UnitSim)>,
 }
 
-#[allow(dead_code)]
 impl SimLadder {
     /// One sim per ladder rung, named `L0..L4`.
     pub(crate) fn new() -> Self {
