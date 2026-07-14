@@ -615,3 +615,66 @@ fn state_glide_ovl_discovery_is_case_insensitive() {
     assert_eq!(load_state_glide_ovl(&dir), Some(b"state fallback".to_vec()));
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[cfg(feature = "jit")]
+#[test]
+fn unit_sim_report_lines_format_headline_and_histogram() {
+    let report = izarravm_cpu::SimReport {
+        entries: 1000,
+        retired_in_units: 3500,
+        linked_transfers: 42,
+        unresolved_exits: 7,
+        side_exits_io: 3,
+        side_exits_async: 2,
+        sim_invalidations: 5,
+        units_built: 120,
+        units_rebuilt: 4,
+    };
+    // Ten units: member counts 1..=10 spread across code/UMA/BIOS entry pages. p50 (nearest rank of
+    // 10 items) lands on the 5th smallest (5), p90 on the 9th (9), max 10. Two units sit in the
+    // excluded window (page 0xF0 and page 0xA0); one code unit exceeds 64 members.
+    let histogram: Vec<(usize, u32)> = vec![
+        (1, 0x0010),
+        (2, 0x0010),
+        (3, 0x0010),
+        (4, 0x0011),
+        (5, 0x0011),
+        (6, 0x0012),
+        (7, 0x00f0),
+        (8, 0x00a0),
+        (9, 0x0012),
+        (65, 0x0013),
+    ];
+    let lines = unit_sim_report_lines(&report, &histogram);
+    assert_eq!(
+        lines,
+        vec![
+            "unit_sim entries=1000 retired_in_units=3500 linked_transfers=42 unresolved_exits=7 \
+side_exits_io=3 side_exits_async=2 sim_invalidations=5 units_built=120 units_rebuilt=4 \
+insns_per_entry=3.500000"
+                .to_string(),
+            "unit_sim_hist units=10 members_p50=5 members_p90=9 members_max=65 units_over_64=1 \
+units_over_128=0 units_over_256=0 excl_units=2"
+                .to_string(),
+        ]
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn unit_sim_report_lines_handle_empty_run() {
+    let report = izarravm_cpu::SimReport::default();
+    let lines = unit_sim_report_lines(&report, &[]);
+    assert_eq!(
+        lines,
+        vec![
+            "unit_sim entries=0 retired_in_units=0 linked_transfers=0 unresolved_exits=0 \
+side_exits_io=0 side_exits_async=0 sim_invalidations=0 units_built=0 units_rebuilt=0 \
+insns_per_entry=0.000000"
+                .to_string(),
+            "unit_sim_hist units=0 members_p50=0 members_p90=0 members_max=0 units_over_64=0 \
+units_over_128=0 units_over_256=0 excl_units=0"
+                .to_string(),
+        ]
+    );
+}
