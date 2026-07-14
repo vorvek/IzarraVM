@@ -255,15 +255,13 @@ impl CpuGsw {
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
-        // Notify the first byte's page and, when the store spans a page boundary, the last byte's
-        // page too (a store touches at most two pages here).
+        // The sim takes the whole store range and internally visits the first byte's page and, when
+        // the store spans a page boundary, the last byte's page too (a store touches at most two
+        // pages here); the two-page visit lives inside the sim so it can classify the store's byte
+        // range against unit members (L3 restamp) rather than kill unconditionally.
         #[cfg(feature = "jit")]
         if let Some(sim) = self.unit_sim.0.as_mut() {
-            sim.note_code_write(physical);
-            let last = physical.wrapping_add(width.saturating_sub(1));
-            if last >> 12 != physical >> 12 {
-                sim.note_code_write(last);
-            }
+            sim.note_code_write(physical, width);
         }
         let mut invalidated = false;
         #[cfg(feature = "jit")]

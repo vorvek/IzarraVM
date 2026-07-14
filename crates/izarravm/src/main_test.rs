@@ -629,6 +629,7 @@ fn unit_sim_report_lines_format_headline_and_histogram() {
         sim_invalidations: 5,
         units_built: 120,
         units_rebuilt: 4,
+        ..Default::default()
     };
     // Ten units: member counts 1..=10 spread across code/UMA/BIOS entry pages. p50 (nearest rank of
     // 10 items) lands on the 5th smallest (5), p90 on the 9th (9), max 10. Two units sit in the
