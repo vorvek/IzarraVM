@@ -1373,6 +1373,10 @@ fn roundtrip_cpu(entry_b: u32) -> (CpuGsw, TestBus) {
     // the measured linked-transfer cost reflects steady-state native dispatch rather than the
     // per-block trace bookkeeping.
     bus.uniform_native_fetches = true;
+    // Production runs with bus tracing off when the JIT is active; the TestBus default (Full)
+    // would make every interpreted instruction in the UNRESOLVED config push BusCycles into the
+    // trace VecDeque, a cost production never pays.
+    bus.trace.set_tracing_mode(TracingMode::Off);
     (cpu, bus)
 }
 
@@ -1410,9 +1414,14 @@ fn roundtrip_median(mut samples: Vec<f64>) -> f64 {
 #[ignore = "timing probe; run explicitly with --ignored roundtrip --nocapture"]
 #[test]
 fn roundtrip_unresolved_exit_versus_linked_transfer_ns() {
+    if cfg!(debug_assertions) {
+        panic!("run this probe with --release; a debug build prints a garbage gate number");
+    }
     // CAP bounds one native chain sweep in the LINKED config (the UNRESOLVED config breaks at B's
     // non-continuable jump every round regardless). TARGET is the per-sample counter goal; WARM
-    // drives each config to steady state before the timed samples.
+    // drives each config to steady state before the timed samples. In UNRESOLVED, run_budgeted
+    // returns once per round and the test loop re-invokes it, standing in for the machine batch
+    // loop; that slightly under-counts the production round cost (the conservative direction).
     const CAP: u64 = 2_000_000;
     const TARGET: u64 = 2_000_000;
     const WARM: u64 = 50_000;
@@ -1444,13 +1453,14 @@ fn roundtrip_unresolved_exit_versus_linked_transfer_ns() {
         let elapsed_ns = started.elapsed().as_nanos() as f64;
         let linked = cpu.perf_counters().jit_direct_linked_transfers - linked0;
         let unresolved = cpu.perf_counters().jit_direct_unresolved_exits - unresolved0;
-        if sample == 0 {
-            assert!(linked >= TARGET, "LINKED sample under target: {linked}");
-            assert!(
-                unresolved.saturating_mul(100) < linked,
-                "LINKED config must stay native, saw unresolved={unresolved} linked={linked}"
-            );
-        }
+        assert!(
+            linked >= TARGET,
+            "LINKED sample {sample} under target: {linked}"
+        );
+        assert!(
+            unresolved.saturating_mul(100) < linked,
+            "LINKED sample {sample} must stay native, saw unresolved={unresolved} linked={linked}"
+        );
         linked_samples.push(elapsed_ns / linked as f64);
     }
 
@@ -1487,21 +1497,22 @@ fn roundtrip_unresolved_exit_versus_linked_transfer_ns() {
         let entries = cpu.perf_counters().jit_direct_entries - entries0;
         let static_unbound =
             cpu.perf_counters().jit_direct_unresolved_static_unbound - static_unbound0;
-        if sample == 0 {
-            assert_eq!(linked, 0, "UNRESOLVED config must never link a transfer");
-            assert!(
-                unresolved >= TARGET,
-                "UNRESOLVED sample under target: {unresolved}"
-            );
-            assert_eq!(
-                static_unbound, unresolved,
-                "every unresolved exit must be a static-unbound A->B edge"
-            );
-            assert!(
-                entries >= unresolved && entries - unresolved <= unresolved / 100,
-                "expect one native A entry per unresolved round, entries={entries} unresolved={unresolved}"
-            );
-        }
+        assert_eq!(
+            linked, 0,
+            "UNRESOLVED sample {sample} must never link a transfer"
+        );
+        assert!(
+            unresolved >= TARGET,
+            "UNRESOLVED sample {sample} under target: {unresolved}"
+        );
+        assert_eq!(
+            static_unbound, unresolved,
+            "sample {sample}: every unresolved exit must be a static-unbound A->B edge"
+        );
+        assert!(
+            entries >= unresolved && entries - unresolved <= unresolved / 100,
+            "sample {sample}: expect one native A entry per unresolved round, entries={entries} unresolved={unresolved}"
+        );
         unresolved_samples.push(elapsed_ns / unresolved as f64);
     }
 
