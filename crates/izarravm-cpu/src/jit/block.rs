@@ -407,7 +407,8 @@ fn emit_native_register_slot(e: &mut Encoder, slot: &Slot) {
 /// TEMPLATE ABI (the contract a native slot template emits against; win64 + SysV64):
 /// - PINNED (do not clobber for calls): R12=cpu, R13=bus, R15=ctx, RBX=guest_ebp (hot), R14=guest_edi (hot).
 /// - RBP holds the regs base (cpu + regs_offset) for non-hot gpr[] access.
-/// - SCRATCH, free to use: RAX/RCX/RDX (volatile). Fn pointers (step etc) loaded on demand from ctx into RAX.
+/// - SCRATCH, free to use: RAX/RCX/RDX/R10/R11 (volatile). Function pointers are loaded from ctx
+///   into RAX on demand.
 /// - Guest gpr[i] lives at `[RBP + 4*i]`; hot 5/7 live in RBX/R14 with zero traffic.
 /// - EARLY EXIT: a slot that must leave the block (fault or run boundary) jumps to the shared `exit`
 ///   label. Today only Memory/BackEdge slots exit, via the step fn's nonzero return + `jnz exit`; a
@@ -570,7 +571,8 @@ fn emit_load_guest32(e: &mut Encoder, dst: Reg, gpr: u8) {
 /// Entry: linear EA in RAX. On TLB-HIT + present (implied by cached) + permitted + (for write: dirty
 /// already set), leaves physical (phys_base | (lin & 0xfff)) in RAX and falls through. On any miss,
 /// #PF condition, or write-to-clean, jumps to `miss` (caller does region_step which walks/faults
-/// correctly). Never raises fault inside the native sequence. Uses scratch RAX/RCX/RDX; R12=cpu.
+/// correctly). Never raises fault inside the native sequence. Uses RAX/RCX/RDX plus R11 for the
+/// read-only compiled TLB view; R12=cpu and R15=ctx.
 fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
     // On entry RAX holds linear (flat DS EA).
     // Save lin_off = linear & 0xfff in RCX for final phys combine; turn RAX into page_num (>>12) for tag/slot.
@@ -580,22 +582,32 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
 
     // slot = page_num & 63; RDX = &entries[slot]
     e.mov_r32_r32(Reg::RDX, Reg::RAX);
-    e.and_r32_imm32(Reg::RDX, (crate::TLB_ENTRIES as u32) - 1);
-    e.shl_r32_imm8(Reg::RDX, 4);
-    let tlb_ent_off = core::mem::offset_of!(CpuGsw, tlb) as u32
-        + core::mem::offset_of!(crate::Tlb, entries) as u32;
-    e.add_r64_imm32(Reg::RDX, tlb_ent_off);
-    e.add_r64_r64(Reg::RDX, Reg::R12); // RDX = &TlbEntry
+    e.and_r32_imm32(Reg::RDX, crate::CompiledTlbView::ENTRY_MASK);
+    e.shl_r32_imm8(Reg::RDX, crate::CompiledTlbView::ENTRY_SHIFT);
+    let tlb_view_off = core::mem::offset_of!(RegionCtx, compiled_tlb) as i32;
+    e.load_r64_disp32(
+        Reg::R11,
+        Reg::R15,
+        tlb_view_off + crate::CompiledTlbView::ENTRIES_BASE_OFFSET,
+    );
+    e.add_r64_r64(Reg::RDX, Reg::R11); // RDX = compiled entry address
 
     // Tag check (must precede gen check; direct-mapped TLB can alias on slot).
-    e.cmp_r32_disp8(Reg::RAX, Reg::RDX, 0);
+    e.cmp_r32_disp8(Reg::RAX, Reg::RDX, crate::CompiledTlbView::TAG_OFFSET);
     e.jnz(miss);
 
-    // gen match
-    let tlb_gen_off = core::mem::offset_of!(CpuGsw, tlb) as u32
-        + core::mem::offset_of!(crate::Tlb, generation) as u32;
-    e.load_r32_disp32(Reg::RAX, Reg::R12, tlb_gen_off as i32);
-    e.cmp_r32_disp8(Reg::RAX, Reg::RDX, 8);
+    // Generation snapshot match. Paging-context changers are region terminators, so the snapshot
+    // remains current for the whole native call and is refreshed on its next entry.
+    e.load_r32_disp32(
+        Reg::RAX,
+        Reg::R15,
+        tlb_view_off + crate::CompiledTlbView::GENERATION_OFFSET,
+    );
+    e.cmp_r32_disp8(
+        Reg::RAX,
+        Reg::RDX,
+        crate::CompiledTlbView::ENTRY_GENERATION_OFFSET,
+    );
     e.jnz(miss);
 
     // Protection and dirty checks (mirror translate_linear_checked hit path).
@@ -616,7 +628,11 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
         e.and_r32_imm32(Reg::RAX, crate::CR0_WP);
         let no_wp = e.label();
         e.jz(no_wp);
-        e.movzx_r32_byte_disp32(Reg::RAX, Reg::RDX, 12);
+        e.movzx_r32_byte_disp32(
+            Reg::RAX,
+            Reg::RDX,
+            i32::from(crate::CompiledTlbView::WRITABLE_OFFSET),
+        );
         e.cmp_r32_imm32(Reg::RAX, 0);
         e.jz(miss);
         e.place(no_wp);
@@ -625,11 +641,19 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
 
     e.place(is_user);
     // user: !entry.user -> miss ; if write && !writable -> miss
-    e.movzx_r32_byte_disp32(Reg::RAX, Reg::RDX, 13);
+    e.movzx_r32_byte_disp32(
+        Reg::RAX,
+        Reg::RDX,
+        i32::from(crate::CompiledTlbView::USER_OFFSET),
+    );
     e.cmp_r32_imm32(Reg::RAX, 0);
     e.jz(miss);
     if is_write {
-        e.movzx_r32_byte_disp32(Reg::RAX, Reg::RDX, 12);
+        e.movzx_r32_byte_disp32(
+            Reg::RAX,
+            Reg::RDX,
+            i32::from(crate::CompiledTlbView::WRITABLE_OFFSET),
+        );
         e.cmp_r32_imm32(Reg::RAX, 0);
         e.jz(miss);
     }
@@ -637,7 +661,11 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
 
     // write to non-dirty: bail so interpreter walk sets D
     if is_write {
-        e.movzx_r32_byte_disp32(Reg::RAX, Reg::RDX, 14);
+        e.movzx_r32_byte_disp32(
+            Reg::RAX,
+            Reg::RDX,
+            i32::from(crate::CompiledTlbView::DIRTY_OFFSET),
+        );
         e.cmp_r32_imm32(Reg::RAX, 0);
         e.jz(miss);
     }
@@ -649,7 +677,7 @@ fn emit_tlb_translate(e: &mut Encoder, miss: Label, is_write: bool) {
     );
 
     // phys = entry.phys | lin_off; result in RAX for the byte helper
-    e.load_r32_disp8(Reg::RAX, Reg::RDX, 4);
+    e.load_r32_disp8(Reg::RAX, Reg::RDX, crate::CompiledTlbView::PHYS_OFFSET);
     e.or_r32_r32(Reg::RAX, Reg::RCX);
 }
 
@@ -672,12 +700,7 @@ pub(crate) fn emit_u8_address(
     miss: Label,
     paged: bool,
 ) {
-    debug_assert_eq!(core::mem::size_of::<crate::TlbEntry>(), 16);
-    debug_assert_eq!(
-        core::mem::offset_of!(crate::TlbEntry, phys),
-        4,
-        "TLB probe loads entry.phys from [entry+4]"
-    );
+    debug_assert_eq!(crate::CompiledTlbView::ENTRY_STRIDE, 16);
 
     // RAX = EA = base [+ index] [+ disp]. This is linear under the runtime flat-DS gate.
     emit_load_guest32(e, Reg::RAX, base);
@@ -991,6 +1014,7 @@ pub(crate) fn try_admit_gated(
         set_pending_add_fn: None, // written by the dispatch on every entry
         set_shift_flags_fn: None, // written by the dispatch on every entry
         native_u8_fn: None,       // written by the dispatch on every entry
+        compiled_tlb: crate::CompiledTlbView::EMPTY,
         slots,
         terminal_slot,
         is_loop,

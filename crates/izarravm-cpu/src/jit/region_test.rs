@@ -22,6 +22,7 @@ fn stub_region(entry_lin: u32, d: bool) -> CompiledRegion {
             set_pending_add_fn: None,
             set_shift_flags_fn: None,
             native_u8_fn: None,
+            compiled_tlb: crate::CompiledTlbView::EMPTY,
             slots: Vec::new(),
             terminal_slot: 0,
             is_loop: true,

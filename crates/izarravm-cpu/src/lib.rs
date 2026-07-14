@@ -66,8 +66,9 @@ pub(crate) use flags::{
 
 #[allow(unused_imports)]
 pub(crate) use paging::{
-    CodePageCache, DIRECT_PAGE_CACHE_LINES, DirectPageCache, DirectPageCacheEntry, FetchPageCache,
-    PREFETCH_WINDOW_BYTES, PrefetchWindow, TLB_ENTRIES, TRACKED_WRITE_PAGES, Tlb, TlbEntry,
+    CodePageCache, CompiledTlbView, DIRECT_PAGE_CACHE_LINES, DirectPageCache, DirectPageCacheEntry,
+    FetchPageCache, PREFETCH_WINDOW_BYTES, PrefetchWindow, TLB_ENTRIES, TRACKED_WRITE_PAGES, Tlb,
+    TlbEntry,
 };
 
 /// Gate for the opt-in `#UD` diagnostic trace (T1.5: making a reflected #UD

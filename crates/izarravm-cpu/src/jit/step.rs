@@ -150,6 +150,9 @@ pub(crate) struct RegionCtx {
     /// Exact byte-memory helper specialized for the live bus type. At `[ctx + 32]`.
     #[cfg(feature = "jit")]
     pub native_u8_fn: Option<NativeU8Fn>,
+    /// Read-only modeled-TLB view refreshed by `run_region` immediately before every native call.
+    /// It follows the five fixed-position function pointers so their emitted offsets do not move.
+    pub compiled_tlb: crate::CompiledTlbView,
     pub slots: Vec<Slot>,
     /// Index of the block's terminal slot. For a self-loop (`is_loop`) it is the back-edge branch:
     /// taken = native back-edge, not taken = `LoopDone`. For a linear block it is the last slot:

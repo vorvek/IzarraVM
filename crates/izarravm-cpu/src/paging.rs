@@ -23,7 +23,7 @@ pub(crate) const FETCH_PAGE_CACHE_ENTRIES: usize = 4;
 
 // --- TLB ---
 
-// The JIT's paged memory probe emits the entry stride and field offsets directly.
+// Compiled consumers see this private layout only through `CompiledTlbView`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct TlbEntry {
@@ -39,6 +39,56 @@ pub(crate) struct TlbEntry {
     pub(crate) user: bool,
     /// PTE dirty bit already set, so a write hit needs no page-table update.
     pub(crate) dirty: bool,
+}
+
+/// Read-only TLB layout consumed by emitted code during one compiled-region entry.
+///
+/// The view is refreshed immediately before every native call. `entries_base` points into the
+/// running CPU, which is borrowed for the full call and therefore cannot move. The generation is
+/// a per-entry snapshot: region admission excludes CR0/CR3 writes, task switches, and INVLPG, and
+/// any future instruction that can invalidate the TLB must terminate the region before doing so.
+/// Emitted code may read the pointer only while that call is active. Safe Rust never dereferences
+/// it, and neither the pointer nor the snapshot may be retained after the call returns.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompiledTlbView {
+    entries_base: *const u8,
+    generation: u32,
+}
+
+impl CompiledTlbView {
+    pub(crate) const EMPTY: Self = Self {
+        entries_base: std::ptr::null(),
+        generation: 0,
+    };
+
+    pub(crate) const ENTRY_COUNT: u32 = TLB_ENTRIES as u32;
+    pub(crate) const ENTRY_MASK: u32 = Self::ENTRY_COUNT - 1;
+    pub(crate) const ENTRY_STRIDE: u32 = core::mem::size_of::<TlbEntry>() as u32;
+    pub(crate) const ENTRY_SHIFT: u8 = Self::ENTRY_STRIDE.trailing_zeros() as u8;
+
+    pub(crate) const TAG_OFFSET: i8 = core::mem::offset_of!(TlbEntry, tag) as i8;
+    pub(crate) const PHYS_OFFSET: i8 = core::mem::offset_of!(TlbEntry, phys) as i8;
+    pub(crate) const ENTRY_GENERATION_OFFSET: i8 =
+        core::mem::offset_of!(TlbEntry, generation) as i8;
+    pub(crate) const WRITABLE_OFFSET: i8 = core::mem::offset_of!(TlbEntry, writable) as i8;
+    pub(crate) const USER_OFFSET: i8 = core::mem::offset_of!(TlbEntry, user) as i8;
+    pub(crate) const DIRTY_OFFSET: i8 = core::mem::offset_of!(TlbEntry, dirty) as i8;
+
+    pub(crate) const ENTRIES_BASE_OFFSET: i32 =
+        core::mem::offset_of!(CompiledTlbView, entries_base) as i32;
+    pub(crate) const GENERATION_OFFSET: i32 =
+        core::mem::offset_of!(CompiledTlbView, generation) as i32;
+
+    #[cfg(test)]
+    pub(crate) const fn entries_base(self) -> *const u8 {
+        self.entries_base
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 impl TlbEntry {
@@ -73,6 +123,14 @@ impl Default for Tlb {
 }
 
 impl Tlb {
+    #[inline]
+    pub(crate) fn compiled_view(&self) -> CompiledTlbView {
+        CompiledTlbView {
+            entries_base: self.entries.as_ptr().cast(),
+            generation: self.generation,
+        }
+    }
+
     #[inline]
     pub(crate) fn slot(page: u32) -> usize {
         (page as usize) & (TLB_ENTRIES - 1)

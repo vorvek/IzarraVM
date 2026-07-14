@@ -24,17 +24,48 @@ fn registers_repr_c_offsets_are_stable() {
     assert_eq!(core::mem::offset_of!(Registers, eflags), eip_off + 4);
 }
 
-/// The paged JIT probe bakes this entry stride and these field offsets into native code.
+/// The paging Adapter publishes the private entry layout through the compiled-view Interface.
 #[test]
 #[cfg(feature = "jit")]
-fn tlb_entry_repr_c_offsets_are_stable() {
-    assert_eq!(core::mem::size_of::<TlbEntry>(), 16);
-    assert_eq!(core::mem::offset_of!(TlbEntry, tag), 0);
-    assert_eq!(core::mem::offset_of!(TlbEntry, phys), 4);
-    assert_eq!(core::mem::offset_of!(TlbEntry, generation), 8);
-    assert_eq!(core::mem::offset_of!(TlbEntry, writable), 12);
-    assert_eq!(core::mem::offset_of!(TlbEntry, user), 13);
-    assert_eq!(core::mem::offset_of!(TlbEntry, dirty), 14);
+fn compiled_tlb_view_describes_the_private_entry_layout() {
+    assert_eq!(
+        CompiledTlbView::ENTRY_STRIDE,
+        core::mem::size_of::<TlbEntry>() as u32
+    );
+    assert_eq!(
+        CompiledTlbView::TAG_OFFSET,
+        core::mem::offset_of!(TlbEntry, tag) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::PHYS_OFFSET,
+        core::mem::offset_of!(TlbEntry, phys) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::ENTRY_GENERATION_OFFSET,
+        core::mem::offset_of!(TlbEntry, generation) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::WRITABLE_OFFSET,
+        core::mem::offset_of!(TlbEntry, writable) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::USER_OFFSET,
+        core::mem::offset_of!(TlbEntry, user) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::DIRTY_OFFSET,
+        core::mem::offset_of!(TlbEntry, dirty) as i8
+    );
+}
+
+#[test]
+#[cfg(feature = "jit")]
+fn native_emitter_uses_only_the_compiled_tlb_interface() {
+    let source = include_str!("jit/block.rs");
+    assert!(!source.contains("offset_of!(CpuGsw, tlb)"));
+    assert!(!source.contains("offset_of!(crate::CpuGsw, tlb)"));
+    assert!(!source.contains("crate::TlbEntry"));
+    assert!(!source.contains("crate::Tlb::"));
 }
 
 /// The v2 region emitter bakes `offset_of!(CpuGsw, registers)` into its emitted bytes (the
@@ -219,205 +250,6 @@ fn direct_admission_heat_is_per_cpu_instance() {
 
     assert_eq!(changed.jit_direct.admission_heat(), 8);
     assert_eq!(unchanged.jit_direct.admission_heat(), 1);
-}
-
-const PAGE_WALK_DIRECTORY: u32 = 0x1000;
-const PAGE_WALK_TABLE: u32 = 0x3000;
-const PAGE_WALK_FRAME: u32 = 0x5000;
-
-fn page_walk_overlap_cpu() -> CpuGsw {
-    let mut cpu = CpuGsw::default();
-    cpu.set_mode(GswMode::Gsw586);
-    cpu.load_segment_real(SegmentIndex::Cs, 0);
-    let mut cs = cpu.registers.cs();
-    cs.default_size_32 = true;
-    cpu.registers.set_segment(SegmentIndex::Cs, cs);
-    cpu
-}
-
-fn decode_page_walk_overlap(cpu: &mut CpuGsw, bus: &mut TestBus, entry: u32) {
-    for linear in std::iter::once(entry).chain(entry + 5..entry + 13) {
-        cpu.set_eip(linear);
-        cpu.fetch_decoded(bus, linear).expect("overlap decode");
-    }
-    assert!(cpu.decode_cache.line_live(entry, true));
-
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    {
-        let key = jit::direct::key_for(cpu, entry, true).expect("overlap block key");
-        assert!(matches!(
-            cpu.jit_direct.probe(key),
-            jit::direct::BlockProbe::Interpret
-        ));
-        let compilation = jit::direct::compile(cpu, entry, true).unwrap();
-        cpu.jit_direct
-            .install(&compilation)
-            .expect("overlap block install");
-        assert!(
-            cpu.jit_direct
-                .range_hits_compiled_code(compilation.span.key.physical, 1)
-        );
-    }
-
-    bus.trace.clear();
-}
-
-fn enable_page_walk_overlap_paging(cpu: &mut CpuGsw) {
-    cpu.control.cr0 |= CR0_PE | CR0_PG | CR0_WP;
-    cpu.control.cr3 = PAGE_WALK_DIRECTORY;
-    cpu.registers
-        .set_segment(SegmentIndex::Ds, SegmentRegister::flat(0x10, 0x93));
-}
-
-fn assert_page_walk_code_live(cpu: &CpuGsw, entry: u32, physical: u32) {
-    assert!(cpu.decode_cache.line_live(entry, true));
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    assert!(cpu.jit_direct.range_hits_compiled_code(physical, 1));
-}
-
-fn assert_page_walk_code_invalidated(cpu: &CpuGsw, entry: u32, physical: u32) {
-    assert!(!cpu.decode_cache.line_live(entry, true));
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "x86_64",
-        any(target_os = "windows", target_os = "linux")
-    ))]
-    assert!(!cpu.jit_direct.range_hits_compiled_code(physical, 1));
-}
-
-fn page_walk_write_addresses(bus: &TestBus) -> Vec<u32> {
-    bus.trace
-        .cycles()
-        .iter()
-        .filter(|cycle| cycle.kind == BusAccessKind::PageWalkWrite)
-        .map(|cycle| cycle.address)
-        .collect()
-}
-
-#[test]
-fn pde_accessed_write_invalidates_overlapping_decoded_and_compiled_code() {
-    let entry = PAGE_WALK_DIRECTORY;
-    let mut memory = vec![0; 0x7000];
-    memory[entry as usize..entry as usize + 4]
-        .copy_from_slice(&(PAGE_WALK_TABLE | 0x05).to_le_bytes());
-    memory[entry as usize + 4] = 0x40;
-    memory[entry as usize + 5..entry as usize + 13].fill(0x40);
-    memory[PAGE_WALK_TABLE as usize..PAGE_WALK_TABLE as usize + 4]
-        .copy_from_slice(&(PAGE_WALK_FRAME | 0x25).to_le_bytes());
-    memory[PAGE_WALK_FRAME as usize] = 0xa5;
-    let mut bus = TestBus::with_memory(memory);
-    let mut cpu = page_walk_overlap_cpu();
-    decode_page_walk_overlap(&mut cpu, &mut bus, entry);
-    enable_page_walk_overlap_paging(&mut cpu);
-    assert_page_walk_code_live(&cpu, entry, entry);
-    let invalidations = cpu.perf_counters().code_invalidations;
-
-    assert_eq!(
-        cpu.read_memory_u8(&mut bus, SegmentIndex::Ds, 0, BusAccessKind::DataRead)
-            .unwrap(),
-        0xa5
-    );
-
-    assert_eq!(
-        u32::from_le_bytes(
-            bus.memory[entry as usize..entry as usize + 4]
-                .try_into()
-                .unwrap()
-        ),
-        PAGE_WALK_TABLE | 0x25
-    );
-    assert_page_walk_code_invalidated(&cpu, entry, entry);
-    assert_eq!(cpu.perf_counters().code_invalidations, invalidations + 1);
-    assert!(cpu.written_pages.contains(&Some(PAGE_WALK_DIRECTORY >> 12)));
-    assert_eq!(page_walk_write_addresses(&bus), vec![PAGE_WALK_DIRECTORY]);
-}
-
-fn pte_dirty_overlap_fixture() -> (CpuGsw, TestBus, u32, u32) {
-    let linear = 0x1000;
-    let pte = PAGE_WALK_TABLE + 4;
-    let entry = pte - 1;
-    let mut memory = vec![0; 0x7000];
-    memory[PAGE_WALK_DIRECTORY as usize..PAGE_WALK_DIRECTORY as usize + 4]
-        .copy_from_slice(&(PAGE_WALK_TABLE | 0x27).to_le_bytes());
-    memory[entry as usize] = 0x05;
-    memory[pte as usize..pte as usize + 4].copy_from_slice(&(PAGE_WALK_FRAME | 0x27).to_le_bytes());
-    memory[entry as usize + 5..entry as usize + 13].fill(0x40);
-    let mut bus = TestBus::with_memory(memory);
-    let mut cpu = page_walk_overlap_cpu();
-    decode_page_walk_overlap(&mut cpu, &mut bus, entry);
-    enable_page_walk_overlap_paging(&mut cpu);
-    (cpu, bus, entry, linear)
-}
-
-#[test]
-fn pte_dirty_write_invalidates_overlapping_decoded_and_compiled_code() {
-    let (mut cpu, mut bus, entry, linear) = pte_dirty_overlap_fixture();
-    let pte = PAGE_WALK_TABLE + 4;
-    assert_page_walk_code_live(&cpu, entry, pte);
-    let invalidations = cpu.perf_counters().code_invalidations;
-
-    cpu.write_memory_u8(
-        &mut bus,
-        SegmentIndex::Ds,
-        linear,
-        0x5a,
-        BusAccessKind::DataWrite,
-    )
-    .unwrap();
-
-    assert_eq!(
-        u32::from_le_bytes(
-            bus.memory[pte as usize..pte as usize + 4]
-                .try_into()
-                .unwrap()
-        ),
-        PAGE_WALK_FRAME | 0x67
-    );
-    assert_eq!(bus.memory[PAGE_WALK_FRAME as usize], 0x5a);
-    assert_page_walk_code_invalidated(&cpu, entry, pte);
-    assert_eq!(cpu.perf_counters().code_invalidations, invalidations + 1);
-    assert!(cpu.written_pages.contains(&Some(PAGE_WALK_TABLE >> 12)));
-    assert!(cpu.written_pages.contains(&Some(PAGE_WALK_FRAME >> 12)));
-    assert_eq!(page_walk_write_addresses(&bus), vec![pte]);
-}
-
-#[test]
-fn failed_pte_dirty_write_does_not_notify_or_partially_commit() {
-    let (mut cpu, mut bus, entry, linear) = pte_dirty_overlap_fixture();
-    let pte = PAGE_WALK_TABLE + 4;
-    let pte_before = bus.memory[pte as usize..pte as usize + 4].to_vec();
-    let invalidations = cpu.perf_counters().code_invalidations;
-    bus.fail_write_address = Some(pte);
-
-    assert!(
-        cpu.write_memory_u8(
-            &mut bus,
-            SegmentIndex::Ds,
-            linear,
-            0x5a,
-            BusAccessKind::DataWrite,
-        )
-        .is_err()
-    );
-
-    assert_eq!(
-        &bus.memory[pte as usize..pte as usize + 4],
-        pte_before.as_slice()
-    );
-    assert_eq!(bus.memory[PAGE_WALK_FRAME as usize], 0);
-    assert_page_walk_code_live(&cpu, entry, pte);
-    assert_eq!(cpu.perf_counters().code_invalidations, invalidations);
-    assert_eq!(cpu.written_count, 0);
-    assert!(cpu.tlb.lookup(linear >> 12).is_none());
-    assert_eq!(page_walk_write_addresses(&bus), vec![pte]);
 }
 
 #[cfg(all(
@@ -795,6 +627,10 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
+    assert_eq!(
+        core::mem::offset_of!(RegionCtx, compiled_tlb),
+        5 * core::mem::size_of::<usize>()
+    );
     // Pending flags offset used by direct native writes.
     assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4344);
 }
@@ -1668,6 +1504,12 @@ fn data_mapping_epoch_change_drops_ram_and_vga_direct_pages() {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageWalkFailure {
+    kind: BusAccessKind,
+    ordinal: usize,
+}
+
 #[derive(Default)]
 struct TestBus {
     memory: Vec<u8>,
@@ -1710,7 +1552,9 @@ struct TestBus {
     project_additional_bus_clocks: bool,
     native_aggregate_accounting_disabled: bool,
     jit_cached_fetch_requests: std::cell::RefCell<Vec<(u32, u32)>>,
-    fail_write_address: Option<u32>,
+    page_walk_failure: Option<PageWalkFailure>,
+    page_walk_reads: usize,
+    page_walk_writes: usize,
     mode13_dirty_pages: u16,
     mode13_byte_writes: u64,
     mode13_word_writes: u64,
@@ -1740,7 +1584,9 @@ impl TestBus {
             project_additional_bus_clocks: false,
             native_aggregate_accounting_disabled: false,
             jit_cached_fetch_requests: std::cell::RefCell::new(Vec::new()),
-            fail_write_address: None,
+            page_walk_failure: None,
+            page_walk_reads: 0,
+            page_walk_writes: 0,
             mode13_dirty_pages: 0,
             mode13_byte_writes: 0,
             mode13_word_writes: 0,
@@ -1776,6 +1622,17 @@ impl TestBus {
             BusWidth::Dword => self.mode13_dword_writes += 1,
         }
     }
+
+    fn fail_page_walk(&mut self, kind: BusAccessKind, ordinal: usize) {
+        assert!(matches!(
+            kind,
+            BusAccessKind::PageWalkRead | BusAccessKind::PageWalkWrite
+        ));
+        assert!(ordinal > 0, "page-walk failure ordinals are one-based");
+        self.page_walk_failure = Some(PageWalkFailure { kind, ordinal });
+        self.page_walk_reads = 0;
+        self.page_walk_writes = 0;
+    }
 }
 
 impl CpuBus for TestBus {
@@ -1786,6 +1643,17 @@ impl CpuBus for TestBus {
         kind: BusAccessKind,
     ) -> Result<u32, BusError> {
         self.trace.push(BusCycle::new(kind, address, width, 0));
+        if kind == BusAccessKind::PageWalkRead {
+            self.page_walk_reads += 1;
+            if self.page_walk_failure
+                == Some(PageWalkFailure {
+                    kind,
+                    ordinal: self.page_walk_reads,
+                })
+            {
+                return Err(BusError::UnmappedMemory { address });
+            }
+        }
         let start = address as usize;
         let end = start
             .checked_add(width.bytes() as usize)
@@ -1816,8 +1684,16 @@ impl CpuBus for TestBus {
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
         self.trace.push(BusCycle::new(kind, address, width, 0));
-        if self.fail_write_address == Some(address) {
-            return Err(BusError::UnmappedMemory { address });
+        if kind == BusAccessKind::PageWalkWrite {
+            self.page_walk_writes += 1;
+            if self.page_walk_failure
+                == Some(PageWalkFailure {
+                    kind,
+                    ordinal: self.page_walk_writes,
+                })
+            {
+                return Err(BusError::UnmappedMemory { address });
+            }
         }
         let start = address as usize;
         let end = start
@@ -2498,6 +2374,8 @@ mod execution;
 mod fpu_flags;
 #[path = "cpu_legacy_system_test.rs"]
 mod legacy_system;
+#[path = "cpu_paging_contract_test.rs"]
+mod paging_contract;
 #[path = "cpu_persona_system_test.rs"]
 mod persona_system;
 #[path = "cpu_stack_branch_test.rs"]

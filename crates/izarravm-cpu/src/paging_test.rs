@@ -4,6 +4,84 @@
 use super::*;
 
 #[test]
+fn compiled_tlb_view_matches_private_layout_and_refreshes_generation_snapshot() {
+    assert!(CompiledTlbView::ENTRY_COUNT.is_power_of_two());
+    assert_eq!(CompiledTlbView::ENTRY_COUNT as usize, TLB_ENTRIES);
+    assert_eq!(CompiledTlbView::ENTRY_MASK, TLB_ENTRIES as u32 - 1);
+    assert!(CompiledTlbView::ENTRY_STRIDE.is_power_of_two());
+    assert_eq!(CompiledTlbView::ENTRY_STRIDE, 16);
+    assert_eq!(
+        CompiledTlbView::ENTRY_STRIDE as usize,
+        core::mem::size_of::<TlbEntry>()
+    );
+    assert_eq!(CompiledTlbView::ENTRY_SHIFT, 4);
+    assert_eq!(
+        CompiledTlbView::TAG_OFFSET,
+        core::mem::offset_of!(TlbEntry, tag) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::PHYS_OFFSET,
+        core::mem::offset_of!(TlbEntry, phys) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::ENTRY_GENERATION_OFFSET,
+        core::mem::offset_of!(TlbEntry, generation) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::WRITABLE_OFFSET,
+        core::mem::offset_of!(TlbEntry, writable) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::USER_OFFSET,
+        core::mem::offset_of!(TlbEntry, user) as i8
+    );
+    assert_eq!(
+        CompiledTlbView::DIRTY_OFFSET,
+        core::mem::offset_of!(TlbEntry, dirty) as i8
+    );
+
+    let mut tlb = Tlb::default();
+    let cold = tlb.compiled_view();
+    assert!(!cold.entries_base().is_null());
+    assert_eq!(
+        cold.entries_base()
+            .align_offset(core::mem::align_of::<TlbEntry>()),
+        0
+    );
+
+    let page = 7;
+    tlb.insert(page, 0x5000, true, false, true);
+    // SAFETY: the view points into `tlb`, which has not moved and remains live for this read. The
+    // slot and representation are checked above, and TlbEntry is Copy.
+    let observed = unsafe { *cold.entries_base().cast::<TlbEntry>().add(Tlb::slot(page)) };
+    assert_eq!(observed.tag, page);
+    assert_eq!(observed.phys, 0x5000);
+    assert_eq!(observed.generation, cold.generation());
+
+    let base = cold.entries_base();
+    tlb.flush();
+    let refreshed = tlb.compiled_view();
+    assert_eq!(refreshed.entries_base(), base);
+    assert_ne!(refreshed.generation(), cold.generation());
+}
+
+#[test]
+fn tlb_generation_wrap_clears_every_stale_entry() {
+    let mut tlb = Tlb {
+        generation: u32::MAX,
+        ..Tlb::default()
+    };
+    tlb.insert(3, 0x5000, true, true, true);
+    assert!(tlb.lookup(3).is_some());
+
+    tlb.flush();
+
+    assert_eq!(tlb.generation, 1);
+    assert!(tlb.entries.iter().all(|entry| entry.generation == 0));
+    assert!(tlb.lookup(3).is_none());
+}
+
+#[test]
 fn direct_page_cache_entries_remain_compact() {
     assert_eq!(core::mem::size_of::<DirectPageCacheEntry>(), 16);
 }
