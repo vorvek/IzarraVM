@@ -214,7 +214,12 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         if result.is_ok() {
             if let Some(insn) = &decoded {
-                self.unit_sim_observe(insn, lin, start_cs_register.default_size_32);
+                self.unit_sim_observe(
+                    insn,
+                    lin,
+                    start_cs_register.default_size_32,
+                    start_cs_register.base,
+                );
             }
         }
         self.finish_instruction(
@@ -308,7 +313,7 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         if result.is_ok() {
             let lin = resume.cs.base.wrapping_add(resume.start_eip);
-            self.unit_sim_observe(&resume.insn, lin, resume.cs.default_size_32);
+            self.unit_sim_observe(&resume.insn, lin, resume.cs.default_size_32, resume.cs.base);
         }
         self.finish_instruction(
             bus,
@@ -490,6 +495,20 @@ impl CpuGsw {
         bus: &mut B,
         cap: u64,
     ) -> Result<BudgetedRunOutcome, CpuError> {
+        let result = self.run_budgeted_inner(bus, cap);
+        // Close the unit simulator's batch on EVERY return path, including the `?` error
+        // propagations inside the loop, so an open sim entry never leaks across batches.
+        #[cfg(feature = "jit")]
+        self.unit_sim_batch_end();
+        result
+    }
+
+    /// The `run_budgeted` body; the public wrapper owns the per-return batch bookkeeping.
+    fn run_budgeted_inner<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        cap: u64,
+    ) -> Result<BudgetedRunOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
         #[cfg(feature = "jit")]
@@ -627,8 +646,6 @@ impl CpuGsw {
                 self.perf.brk_halt += 1;
                 #[cfg(feature = "jit")]
                 self.flush_direct_cache_stats();
-                #[cfg(feature = "jit")]
-                self.unit_sim_batch_end();
                 return Ok(BudgetedRunOutcome {
                     consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
@@ -659,8 +676,6 @@ impl CpuGsw {
         }
         #[cfg(feature = "jit")]
         self.flush_direct_cache_stats();
-        #[cfg(feature = "jit")]
-        self.unit_sim_batch_end();
         Ok(BudgetedRunOutcome {
             consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,
@@ -705,11 +720,14 @@ impl CpuGsw {
     /// almost nothing. Called exactly once per retired instruction at every interpreter retire site
     /// (the `cycle_no_interrupt_check` first-instruction path, both `run_one_cached` fast tails, the
     /// profiling `finish_instruction` calls, and the REP resume path) so the observed count equals
-    /// the `perf.instructions` delta. `d` is the pre-execution decode key (`CS.default_size_32`),
-    /// which the caller captures before the instruction runs so the decode line lookup matches.
+    /// the `perf.instructions` delta. `d` is the pre-execution decode key (`CS.default_size_32`)
+    /// and `cs_base` the pre-execution CS base, both captured by the caller before the instruction
+    /// runs so the decode-line lookup and the branch-target arithmetic match the instruction that
+    /// retired (a near branch never changes either, but capturing before execution is
+    /// unconditionally correct).
     #[cfg(feature = "jit")]
     #[inline]
-    fn unit_sim_observe(&mut self, insn: &DecodedInsn, lin: u32, d: bool) {
+    fn unit_sim_observe(&mut self, insn: &DecodedInsn, lin: u32, d: bool, cs_base: u32) {
         if self.unit_sim.0.is_none() {
             return;
         }
@@ -726,17 +744,15 @@ impl CpuGsw {
             len: insn.len,
             physical_page,
             mode_key: self.jit_mode_key(),
-            transfer: jit::block::observed_transfer(insn, lin),
+            transfer: jit::block::observed_transfer(insn, lin, cs_base),
             is_terminator: !insn.continuable
                 || jit::block::changes_interrupt_visibility(insn)
                 || jit::block::changes_native_memory_context(insn),
             touches_io: unit_sim_touches_io(insn.opcode),
         };
-        self.unit_sim
-            .0
-            .as_mut()
-            .expect("sim present after the is_none early return")
-            .observe(observed);
+        if let Some(sim) = self.unit_sim.0.as_mut() {
+            sim.observe(observed);
+        }
     }
 
     /// Close the current unit-simulator batch at a `run_budgeted` return, if the sim is enabled.
@@ -1722,12 +1738,11 @@ impl CpuGsw {
         self.interrupt_shadow = false;
         self.begin_instruction();
         let start_eip = self.registers.eip;
-        let start_cs = self.registers.cs().selector;
-        // Pre-execution decode key, so the sim's decode-line lookup matches the instruction that
-        // is about to retire even if it moves control (a near RET / indirect JMP does not change
-        // the key, but capturing it before execution is unconditionally correct).
-        #[cfg(feature = "jit")]
-        let d = self.registers.cs().default_size_32;
+        // One pre-execution CS snapshot: the selector for the fault rewind, and (jit) the decode
+        // key + base for the sim's decode-line lookup and branch-target arithmetic, captured
+        // before the instruction runs so they match the instruction that is about to retire.
+        let start_cs_register = self.registers.cs();
+        let start_cs = start_cs_register.selector;
         let profiling = self.profile.enabled;
         if !profiling {
             return match self
@@ -1741,7 +1756,12 @@ impl CpuGsw {
                     // This non-profiling fast tail is the COMMON continuation retire path; observe
                     // the instruction here (once) so the sim count tracks perf.instructions.
                     #[cfg(feature = "jit")]
-                    self.unit_sim_observe(insn, lin, d);
+                    self.unit_sim_observe(
+                        insn,
+                        lin,
+                        start_cs_register.default_size_32,
+                        start_cs_register.base,
+                    );
                     if self.is_ring0_protected() {
                         self.perf.monitor_resident_core_clocks += charged;
                     }
@@ -1766,7 +1786,12 @@ impl CpuGsw {
         // the same Ok retirements here so the count stays exact when profiling is enabled.
         #[cfg(feature = "jit")]
         if result.is_ok() {
-            self.unit_sim_observe(insn, lin, d);
+            self.unit_sim_observe(
+                insn,
+                lin,
+                start_cs_register.default_size_32,
+                start_cs_register.base,
+            );
         }
         self.finish_instruction(
             bus,
@@ -1797,9 +1822,6 @@ impl CpuGsw {
         let start_eip = self.registers.eip;
         let start_cs_register = self.registers.cs();
         let start_cs = start_cs_register.selector;
-        // Pre-execution decode key for the sim's decode-line lookup (see run_one_cached).
-        #[cfg(feature = "jit")]
-        let d = start_cs_register.default_size_32;
         let profiling = self.profile.enabled;
         self.rep_execution.yielded = false;
         if !profiling {
@@ -1817,7 +1839,12 @@ impl CpuGsw {
                     // A budgeted REP retires (does not yield) here; observe it once. The yielding
                     // arm above returns without retiring, so it is deliberately not observed.
                     #[cfg(feature = "jit")]
-                    self.unit_sim_observe(insn, lin, d);
+                    self.unit_sim_observe(
+                        insn,
+                        lin,
+                        start_cs_register.default_size_32,
+                        start_cs_register.base,
+                    );
                     // V86 trap tax residency: the monitor's own straight-line
                     // instructions chain through this cached fast tail, not
                     // finish_instruction, so the residency attribution must
@@ -1854,7 +1881,12 @@ impl CpuGsw {
         // observe the same Ok retirements so the count stays exact when profiling is enabled.
         #[cfg(feature = "jit")]
         if result.is_ok() {
-            self.unit_sim_observe(insn, lin, d);
+            self.unit_sim_observe(
+                insn,
+                lin,
+                start_cs_register.default_size_32,
+                start_cs_register.base,
+            );
         }
         self.finish_instruction(
             bus,
