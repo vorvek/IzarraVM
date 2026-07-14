@@ -54,6 +54,9 @@ pub(crate) struct SimReport {
 struct Unit {
     /// Linear PCs discovered as members while the unit executed.
     members: HashSet<u32>,
+    /// Physical pages this unit owns entries for in `page_owners`, so invalidation only visits
+    /// the pages that actually reference the unit.
+    pages: HashSet<u32>,
     /// Physical page of the unit's entry instruction, kept for the cap-sweep metric.
     entry_physical_page: u32,
 }
@@ -147,9 +150,9 @@ impl UnitSim {
         let open_key = self.open.as_ref().map(|open| open.key);
         let mut hit_open = false;
         for key in owners {
-            if self.units.remove(&key).is_some() {
+            if let Some(unit) = self.units.remove(&key) {
                 self.report.sim_invalidations += 1;
-                self.drop_ownership(&key);
+                self.drop_ownership(&key, &unit.pages);
             }
             if Some(key) == open_key {
                 hit_open = true;
@@ -176,10 +179,14 @@ impl UnitSim {
     /// Per-unit `(member_count, entry_physical_page)` pairs, for recomputing the structural metric
     /// under member caps and physical-window exclusions during the cap sweep.
     pub(crate) fn unit_member_histogram(&self) -> Vec<(usize, u32)> {
-        self.units
+        let mut v: Vec<(usize, u32)> = self
+            .units
             .values()
             .map(|unit| (unit.members.len(), unit.entry_physical_page))
-            .collect()
+            .collect();
+        // Sorted so evidence output is deterministic across runs despite hash-map iteration order.
+        v.sort_unstable();
+        v
     }
 
     /// Open a new entry on `insn`, building or rebuilding its unit as needed, then accrue it.
@@ -188,16 +195,16 @@ impl UnitSim {
         self.report.entries += 1;
 
         if !self.units.contains_key(&key) {
-            if self.ever_built.contains(&key) {
-                self.report.units_rebuilt += 1;
-            } else {
+            if self.ever_built.insert(key) {
                 self.report.units_built += 1;
+            } else {
+                self.report.units_rebuilt += 1;
             }
-            self.ever_built.insert(key);
             self.units.insert(
                 key,
                 Unit {
                     members: HashSet::new(),
+                    pages: HashSet::new(),
                     entry_physical_page: insn.physical_page,
                 },
             );
@@ -219,13 +226,17 @@ impl UnitSim {
         self.report.retired_in_units += 1;
 
         let key = self.open.as_ref().expect("accrue with an open entry").key;
-        if let Some(unit) = self.units.get_mut(&key) {
-            unit.members.insert(insn.linear);
+        let unit = self.units.get_mut(&key).expect("open entry's unit exists");
+        // Ownership only needs recording when the PC is new to the unit. Caveat, accepted: if a
+        // linear PC's physical page is remapped while the unit lives, the new page is not
+        // recorded (acceptable for this linear-keyed diagnostic).
+        if unit.members.insert(insn.linear) {
+            unit.pages.insert(insn.physical_page);
+            self.page_owners
+                .entry(insn.physical_page)
+                .or_default()
+                .insert(key);
         }
-        self.page_owners
-            .entry(insn.physical_page)
-            .or_default()
-            .insert(key);
 
         // Terminators end the unit even when they also carry a transfer or touch I/O.
         if insn.is_terminator {
@@ -250,20 +261,19 @@ impl UnitSim {
 
     /// Apply the direct-near branch rules for the just-accrued branch at `insn` targeting `target`.
     fn handle_direct(&mut self, insn: ObservedInsn, target: u32) {
-        let (key, window, mode_key, quota_used) = {
+        let (window, mode_key, quota_used) = {
             let open = self.open.as_ref().expect("open entry present");
-            (open.key, open.window, open.mode_key, open.quota_used)
+            (open.window, open.mode_key, open.quota_used)
         };
         let fall = insn.linear.wrapping_add(insn.len as u32);
-        let is_member = self
-            .units
-            .get(&key)
-            .is_some_and(|unit| unit.members.contains(&target));
+        // Members are only ever inserted under the open window check and the window always equals
+        // the current unit's entry page (including after a linked-transfer switch), so membership
+        // implies in_window; testing the window alone is exact.
         let in_window = (target >> 12) == window;
 
-        // A back-edge to a member or any in-window target keeps the entry open; the target joins
-        // when it is next observed. Both the target and the fall-through remain valid successors.
-        if is_member || in_window {
+        // A back-edge or any in-window target keeps the entry open; the target joins when it is
+        // next observed. Both the target and the fall-through remain valid successors.
+        if in_window {
             let open = self.open.as_mut().expect("open entry present");
             open.predicted_fallthrough = fall;
             open.direct_target = Some(target);
@@ -299,12 +309,16 @@ impl UnitSim {
         self.open = None;
     }
 
-    /// Remove a unit key from every physical page it owned.
-    fn drop_ownership(&mut self, key: &UnitKey) {
-        self.page_owners.retain(|_, owners| {
-            owners.remove(key);
-            !owners.is_empty()
-        });
+    /// Remove a unit key from the physical pages it owned, visiting only those pages.
+    fn drop_ownership(&mut self, key: &UnitKey, pages: &HashSet<u32>) {
+        for page in pages {
+            if let Some(owners) = self.page_owners.get_mut(page) {
+                owners.remove(key);
+                if owners.is_empty() {
+                    self.page_owners.remove(page);
+                }
+            }
+        }
     }
 }
 
