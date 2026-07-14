@@ -193,6 +193,73 @@ fn poll_loop_is_bounded_by_batch_ends() {
 }
 
 #[test]
+fn rich_kinds_map_to_indirect_under_default_config() {
+    // A near CALL rel is classified `CallNear` by the hook, but the default config lowers it to
+    // `Indirect`, so the entry closes as an unresolved exit exactly like a raw indirect.
+    let mut sim = UnitSim::default();
+    let mut call = insn(0x1000, 5);
+    call.transfer = TransferKind::CallNear { target: 0x3000 };
+    sim.observe(call);
+
+    let r = sim.report();
+    assert_eq!(r.entries, 1);
+    assert_eq!(r.retired_in_units, 1);
+    assert_eq!(r.unresolved_exits, 1);
+    assert_eq!(r.linked_transfers, 0);
+    assert_eq!(r.side_exits_io, 0);
+    assert_eq!(r.side_exits_async, 0);
+}
+
+#[test]
+fn return_maps_to_indirect_under_default_config() {
+    // A near RET is `Return` at the classifier, `Indirect` under the default config.
+    let mut sim = UnitSim::default();
+    let mut ret = insn(0x1000, 1);
+    ret.transfer = TransferKind::Return;
+    sim.observe(ret);
+
+    let r = sim.report();
+    assert_eq!(r.entries, 1);
+    assert_eq!(r.retired_in_units, 1);
+    assert_eq!(r.unresolved_exits, 1);
+}
+
+#[test]
+fn loop_near_maps_to_indirect_under_default_config() {
+    // A LOOP back-edge: were `LoopNear` (mis)treated as `DirectNear`, the in-window target would
+    // keep the entry open and `unresolved_exits` would stay 0. Under the default config it lowers
+    // to `Indirect`, so the entry CLOSES unresolved. This pins that L0 never confuses the two.
+    let mut sim = UnitSim::default();
+    sim.observe(insn(0x1000, 2));
+    let mut back = insn(0x1002, 2);
+    back.transfer = TransferKind::LoopNear { target: 0x1000 };
+    sim.observe(back);
+
+    let r = sim.report();
+    assert_eq!(r.entries, 1);
+    assert_eq!(r.retired_in_units, 2);
+    assert_eq!(r.unresolved_exits, 1);
+}
+
+#[test]
+fn call_indirect_maps_to_indirect_under_default_config() {
+    // A near indirect CALL is `CallIndirect` at the classifier, `Indirect` under the default
+    // config: one unresolved exit, and nothing else moves.
+    let mut sim = UnitSim::default();
+    let mut call = insn(0x1000, 2);
+    call.transfer = TransferKind::CallIndirect;
+    sim.observe(call);
+
+    let r = sim.report();
+    assert_eq!(r.entries, 1);
+    assert_eq!(r.retired_in_units, 1);
+    assert_eq!(r.unresolved_exits, 1);
+    assert_eq!(r.linked_transfers, 0);
+    assert_eq!(r.side_exits_io, 0);
+    assert_eq!(r.side_exits_async, 0);
+}
+
+#[test]
 fn instruction_end_crossing_the_window_closes_growth() {
     let mut sim = UnitSim::default();
     // Root a unit in page 0x1.

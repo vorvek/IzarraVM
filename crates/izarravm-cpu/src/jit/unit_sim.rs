@@ -16,11 +16,31 @@
 use std::collections::{HashMap, HashSet};
 
 /// The control-transfer shape of an observed instruction, as far as the unit model cares.
+///
+/// The classifier (`block::observed_transfer`) emits the precise kind for every control transfer;
+/// the four rich kinds carry information (call/return structure, loop back-edges) that later Track C
+/// configs exploit. `UnitSim::effective_kind` lowers them per the sim's config before any side
+/// effect, so the DEFAULT config (which lowers all four rich kinds to `Indirect`) reproduces the v1
+/// semantics exactly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransferKind {
     None,
-    DirectNear { target: u32 },
+    DirectNear {
+        target: u32,
+    },
     Indirect,
+    /// A near CALL rel with a statically computable target (recursion, not a loop back-edge).
+    CallNear {
+        target: u32,
+    },
+    /// A near indirect CALL (0xFF /2): the target is not statically known.
+    CallIndirect,
+    /// A near RET (0xC2/0xC3).
+    Return,
+    /// A LOOP/LOOPcc/JCXZ near branch with a statically computable target.
+    LoopNear {
+        target: u32,
+    },
 }
 
 /// One retired guest instruction, described by the facts the simulator needs.
@@ -249,7 +269,7 @@ impl UnitSim {
             return;
         }
 
-        match insn.transfer {
+        match self.effective_kind(insn.transfer) {
             TransferKind::Indirect => self.close(ExitReason::Unresolved),
             TransferKind::DirectNear { target } => self.handle_direct(insn, target),
             TransferKind::None => {
@@ -257,6 +277,37 @@ impl UnitSim {
                 open.predicted_fallthrough = insn.linear.wrapping_add(insn.len as u32);
                 open.direct_target = None;
             }
+            // `effective_kind` lowers every rich kind to one of the three cases above, so none of
+            // them ever reach the accrue match. The arm keeps the match exhaustive and turns a
+            // future config that forgets to lower a kind into a loud panic rather than silent drift.
+            TransferKind::CallNear { .. }
+            | TransferKind::CallIndirect
+            | TransferKind::Return
+            | TransferKind::LoopNear { .. } => {
+                unreachable!("effective_kind must lower every rich kind before accrue")
+            }
+        }
+    }
+
+    /// Lower a classifier-emitted `TransferKind` to the shape the accrue logic acts on, per the
+    /// sim's config. This is the seam where later Track C configs will let a `CallNear`,
+    /// `CallIndirect`, `Return`, or `LoopNear` drive richer behaviour (call/return stacks, resolved
+    /// loop back-edges). There is no config yet: this L0 mapping is unconditional and lowers ALL
+    /// FOUR rich kinds to `Indirect`, so every observed behaviour is byte-identical to the v1 sim.
+    ///
+    /// ORDERING CONTRACT (Task 2 must honour it): `effective_kind` runs BEFORE any side effect of
+    /// the transfer. A kind lowered to `Indirect` here must be indistinguishable from a raw
+    /// `Indirect` at the observation point: no pushes onto a call stack, no cached back-edge target,
+    /// no deferred resolution check may happen for it. None of those mechanisms exist yet, but any
+    /// future config that adds them must gate them here, on the lowered kind, so that a
+    /// lowered-to-`Indirect` transfer performs exactly what a raw `Indirect` would and no more.
+    fn effective_kind(&self, t: TransferKind) -> TransferKind {
+        match t {
+            TransferKind::CallNear { .. }
+            | TransferKind::CallIndirect
+            | TransferKind::Return
+            | TransferKind::LoopNear { .. } => TransferKind::Indirect,
+            TransferKind::None | TransferKind::DirectNear { .. } | TransferKind::Indirect => t,
         }
     }
 
