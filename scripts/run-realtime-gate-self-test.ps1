@@ -425,6 +425,63 @@ function Invoke-RealtimeGateSelfTest {
     Assert-SelfTestThrows {
         Assert-BackendBakeoffMode $false $false $false $false $false 8 "relative.lock"
     } "absolute MeasurementLockPath"
+    Assert-TrackMComparisonMode `
+        $false $false $false $false $false $false "automatic" `
+        $true $false 6 "Both" 8 "C:\gate.lock"
+    Assert-TrackMComparisonMode `
+        $false $false $false $false $false $false "interpreter" `
+        $false $true 6 "Both" 8 "C:\gate.lock"
+    $trackMModeFailures = [ordered]@{
+        backend = { Assert-TrackMComparisonMode $true $false $false $false $false $false "automatic" $true $false 6 "Both" 8 "C:\gate.lock" }
+        report = { Assert-TrackMComparisonMode $false $true $false $false $false $false "automatic" $true $false 6 "Both" 8 "C:\gate.lock" }
+        baseline = { Assert-TrackMComparisonMode $false $false $true $false $false $false "automatic" $true $false 6 "Both" 8 "C:\gate.lock" }
+        jit = { Assert-TrackMComparisonMode $false $false $false $true $false $false "automatic" $true $false 6 "Both" 8 "C:\gate.lock" }
+        executable = { Assert-TrackMComparisonMode $false $false $false $false $true $false "automatic" $true $false 6 "Both" 8 "C:\gate.lock" }
+        skip = { Assert-TrackMComparisonMode $false $false $false $false $false $true "automatic" $true $false 6 "Both" 8 "C:\gate.lock" }
+        role = { Assert-TrackMComparisonMode $false $false $false $false $false $false "" $true $false 6 "Both" 8 "C:\gate.lock" }
+        workload = { Assert-TrackMComparisonMode $false $false $false $false $false $false "automatic" $true $false 6 "Quake" 8 "C:\gate.lock" }
+        processor = { Assert-TrackMComparisonMode $false $false $false $false $false $false "automatic" $true $false 6 "Both" 7 "C:\gate.lock" }
+        lock = { Assert-TrackMComparisonMode $false $false $false $false $false $false "automatic" $true $false 6 "Both" 8 "gate.lock" }
+        screening_runs = { Assert-TrackMComparisonMode $false $false $false $false $false $false "automatic" $true $true 6 "Both" 8 "C:\gate.lock" }
+        confirmation_runs = { Assert-TrackMComparisonMode $false $false $false $false $false $false "automatic" $false $true 3 "Both" 8 "C:\gate.lock" }
+    }
+    foreach ($case in $trackMModeFailures.GetEnumerator()) {
+        Assert-SelfTestThrows $case.Value "Track M"
+    }
+    $automaticPolicy = Get-TrackMExecutionPolicy "automatic"
+    $interpreterPolicy = Get-TrackMExecutionPolicy "interpreter"
+    if ($automaticPolicy.cli -cne "default automatic backend" -or
+        $automaticPolicy.jit -cne "1" -or $interpreterPolicy.cli -cne "--interpreter" -or
+        $interpreterPolicy.jit -cne "0") {
+        throw "Track M execution policies do not force the requested backend."
+    }
+    $candidateCommit = "1" * 40
+    $parentCommit = "2" * 40
+    if ((Get-TrackMParentFromRevisionLine "$candidateCommit $parentCommit" $candidateCommit) -cne
+        $parentCommit) {
+        throw "Track M did not derive the unique immediate parent."
+    }
+    Assert-SelfTestThrows {
+        Get-TrackMParentFromRevisionLine $candidateCommit $candidateCommit
+    } "root commit"
+    Assert-SelfTestThrows {
+        Get-TrackMParentFromRevisionLine "$candidateCommit $parentCommit $('3' * 40)" $candidateCommit
+    } "exactly one immediate parent"
+    Assert-SelfTestThrows {
+        Get-TrackMParentFromRevisionLine "$candidateCommit $parentCommit" ("4" * 40)
+    } "candidate revision"
+    Assert-SelfTestThrows {
+        Get-TrackMParentFromRevisionLine "$candidateCommit invalid" $candidateCommit
+    } "invalid immediate parent"
+    if ((Get-TrackMPairedMetric ([double[]](0.99, 0.99, 0.99))).verdict -ne "pass" -or
+        (Get-TrackMPairedMetric ([double[]](0.989, 0.989, 0.989))).verdict -ne "regression" -or
+        (Get-TrackMPairedMetric ([double[]](0.90, 0.99, 1.08))).verdict -ne "inconclusive" -or
+        (Get-TrackMPairedMetricVerdict 0.99 0.97) -ne "pass" -or
+        (Get-TrackMPairedMetricVerdict 0.99 0.969999) -ne "inconclusive" -or
+        (Get-TrackMPairedMetricVerdict 0.989999 0.99) -ne "regression" -or
+        (Get-PairedMetricVerdict 0.98 0.97) -ne "pass") {
+        throw "Track M or generic paired threshold boundaries changed."
+    }
     $resultBlockSelfTestPath = Join-Path ([IO.Path]::GetTempPath()) (
         "izarravm-result-block-$([guid]::NewGuid().ToString('N')).log"
     )
@@ -850,6 +907,575 @@ function Invoke-RealtimeGateSelfTest {
         } "Invalid gate source label"
     } finally {
         Remove-Item -LiteralPath $sourceClosureRoot -Recurse -Force
+    }
+
+    $newTrackMSample = {
+        param($Policy, [string]$RevisionRole, [string]$Observation, $ExecutionPolicy, [double]$Ratio)
+        $isQuake = $Policy.name -ceq "quake-586"
+        $automatic = $ExecutionPolicy.name -ceq "automatic"
+        $fixture = if ($isQuake) {
+            $syntheticQuakeFixture | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+        } else {
+            $null
+        }
+        $completion = if ($isQuake) {
+            $syntheticQuakeCompletion | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+        } else {
+            $null
+        }
+        $fixtureHash = if ($isQuake) {
+            $fixture.prelaunch_overridden_tree_sha256
+        } else {
+            "c" * 64
+        }
+        return [pscustomobject][ordered]@{
+            wall_seconds = 10.0
+            guest_seconds = 10.0 * $Ratio
+            real_time_factor = $Ratio
+            instructions_per_host_second = 100.0 * $Ratio
+            direct_native_coverage = if ($automatic) { 0.9 } else { 0.0 }
+            direct_slow_exits_per_100_instructions = 0.0
+            perf = [pscustomobject][ordered]@{
+                instructions = [uint64]1000
+                jit_region_entries = if ($automatic) { 1 } else { 0 }
+                jit_region_insns = if ($automatic) { 100 } else { 0 }
+                jit_native_insns = if ($automatic) { 100 } else { 0 }
+                jit_direct_entries = if ($automatic) { 90 } else { 0 }
+                jit_direct_insns = if ($automatic) { 900 } else { 0 }
+                jit_direct_side_exits = 0
+            }
+            master_ticks = [uint64]2000
+            elapsed_budget_clocks = [uint64]3000
+            executed_cpu_core_clocks = [uint64]1100
+            raw_bus_clocks = [uint64]1900
+            stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
+            timedemo = if ($isQuake) { $null } else {
+                [pscustomobject]@{ gametics = 2134; realtics = 830 }
+            }
+            quake_timedemo_identity_count = if ($isQuake) { 1 } else { $null }
+            quake_timedemo = if ($isQuake) { $completion.timedemo } else { $null }
+            gate_quake_completion = $completion
+            gate_fixture = $fixture
+            gate_process_exit_code = 0
+            gate_role = $RevisionRole
+            gate_observation = $Observation
+            gate_processor_index = 8
+            gate_processor_affinity_mask = "0x0000000000000100"
+            gate_processor_affinity_verified = $true
+            gate_execution_role = $ExecutionPolicy.name
+            gate_execution_cli = $ExecutionPolicy.cli
+            gate_execution_jit = $ExecutionPolicy.jit
+            gate_measurement_fixture_sha256 = $fixtureHash
+            gate_termination_policy = "lotura_test_exit"
+            gate_artifacts = [pscustomobject][ordered]@{
+                profile_json_file = "$($Policy.name)-$RevisionRole-$Observation.json"
+                profile_json_sha256 = "4" * 64
+                stdout_file = "$($Policy.name)-$RevisionRole-$Observation.stdout.log"
+                stdout_sha256 = "5" * 64
+                stderr_file = "$($Policy.name)-$RevisionRole-$Observation.stderr.log"
+                stderr_sha256 = "6" * 64
+                qconsole_file = if ($isQuake) {
+                    "$($Policy.name)-$RevisionRole-$Observation-qconsole.log"
+                } else {
+                    $null
+                }
+                qconsole_sha256 = if ($isQuake) { "8" * 64 } else { $null }
+                result_block_status = "valid"
+                result_block_count = 1
+                result_block_sha256 = "7" * 64
+                result_block_normalized_bytes = 128
+            }
+        }
+    }
+    $newTrackMScreen = {
+        param($Policy, $ExecutionPolicy, [int]$Pairs, [double[]]$Ratios)
+        $candidate = @()
+        $parent = @()
+        foreach ($pair in 1..$Pairs) {
+            $candidate += & $newTrackMSample `
+                $Policy "candidate" "pair$pair" $ExecutionPolicy $Ratios[$pair - 1]
+            $parent += & $newTrackMSample $Policy "parent" "pair$pair" $ExecutionPolicy 1.0
+        }
+        return [pscustomobject][ordered]@{
+            candidate = [object[]]$candidate
+            parent = [object[]]$parent
+            warmups = [pscustomobject][ordered]@{
+                candidate = [object[]]@(& $newTrackMSample `
+                    $Policy "candidate" "warmup" $ExecutionPolicy 1.0)
+                parent = [object[]]@(& $newTrackMSample `
+                    $Policy "parent" "warmup" $ExecutionPolicy 1.0)
+            }
+        }
+    }
+    $trackMPolicies = @(Get-WorkloadPolicies "Both")
+    $trackMAutomaticWorkloads = @()
+    foreach ($policy in $trackMPolicies) {
+        $screen = & $newTrackMScreen $policy $automaticPolicy 3 ([double[]](1, 1, 1))
+        $result = Get-TrackMWorkloadSummary `
+            $policy $screen.candidate $screen.parent $screen.warmups $automaticPolicy
+        if (@($result.verdicts.Values | Where-Object { $_ -ne "pass" }).Count -ne 0) {
+            throw "$($policy.name) automatic Track M pass screen was rejected."
+        }
+        $trackMAutomaticWorkloads += $result
+    }
+    $interpreterScreen = & $newTrackMScreen `
+        $trackMPolicies[2] $interpreterPolicy 6 ([double[]](1, 1, 1, 1, 1, 1))
+    $interpreterResult = Get-TrackMWorkloadSummary `
+        $trackMPolicies[2] $interpreterScreen.candidate $interpreterScreen.parent `
+        $interpreterScreen.warmups $interpreterPolicy
+    if (@($interpreterResult.verdicts.Values | Where-Object { $_ -ne "pass" }).Count -ne 0) {
+        throw "The six-pair interpreter Track M pass screen was rejected."
+    }
+
+    $exactMutations = [ordered]@{
+        instructions = { param($sample) $sample.perf.instructions++ }
+        master_ticks = { param($sample) $sample.master_ticks++ }
+        elapsed_budget_clocks = { param($sample) $sample.elapsed_budget_clocks++ }
+        executed_cpu_core_clocks = { param($sample) $sample.executed_cpu_core_clocks++ }
+        raw_bus_clocks = { param($sample) $sample.raw_bus_clocks++ }
+        stop = { param($sample) $sample.stop.code = 1 }
+        timedemo_identity = { param($sample) $sample.quake_timedemo.line = "969 frames  22.7 seconds  42.6 fps" }
+        result_block_identity = { param($sample) $sample.gate_artifacts.result_block_sha256 = "9" * 64 }
+        measurement_fixture_identity = { param($sample) $sample.gate_fixture.prelaunch_overridden_tree_sha256 = "9" * 64 }
+        quake_completion_identity = { param($sample) $sample.gate_quake_completion.wait_marker_count = 0 }
+        qconsole_sha256 = { param($sample) $sample.gate_artifacts.qconsole_sha256 = "9" * 64 }
+    }
+    foreach ($mutation in $exactMutations.GetEnumerator()) {
+        $screen = & $newTrackMScreen `
+            $trackMPolicies[2] $automaticPolicy 3 ([double[]](1, 1, 1))
+        & $mutation.Value $screen.candidate[0]
+        $result = Get-TrackMWorkloadSummary `
+            $trackMPolicies[2] $screen.candidate $screen.parent $screen.warmups $automaticPolicy
+        if ($result.verdicts.exact_work -ne "fail") {
+            throw "Track M exact-work mutation $($mutation.Key) was accepted."
+        }
+    }
+    $warmupMismatchScreen = & $newTrackMScreen `
+        $trackMPolicies[0] $automaticPolicy 3 ([double[]](1, 1, 1))
+    $warmupMismatchScreen.warmups.candidate[0].raw_bus_clocks++
+    $warmupMismatchResult = Get-TrackMWorkloadSummary `
+        $trackMPolicies[0] $warmupMismatchScreen.candidate $warmupMismatchScreen.parent `
+        $warmupMismatchScreen.warmups $automaticPolicy
+    if ($warmupMismatchResult.verdicts.exact_work -ne "fail") {
+        throw "Track M accepted unequal discarded warmups."
+    }
+
+    $semanticMutations = [ordered]@{
+        test_exit = { param($sample) $sample.stop.code = 7 }
+        host_exit = { param($sample) $sample.gate_process_exit_code = 7 }
+        result_block = { param($sample) $sample.gate_artifacts.result_block_status = "invalid" }
+        completion_order = { param($sample) $sample.gate_quake_completion.result_before_wait_marker = $false }
+        fatal_text = {
+            param($sample)
+            $sample.gate_quake_completion.fatal_match_count = 1
+            $sample.gate_quake_completion.fatal_matches = @("synthetic fatal")
+        }
+    }
+    foreach ($mutation in $semanticMutations.GetEnumerator()) {
+        $screen = & $newTrackMScreen `
+            $trackMPolicies[2] $automaticPolicy 3 ([double[]](1, 1, 1))
+        & $mutation.Value $screen.candidate[0]
+        $result = Get-TrackMWorkloadSummary `
+            $trackMPolicies[2] $screen.candidate $screen.parent $screen.warmups $automaticPolicy
+        if ($result.verdicts.semantic -ne "fail") {
+            throw "Track M semantic mutation $($mutation.Key) was accepted."
+        }
+    }
+    $provenanceMutations = [ordered]@{
+        observation = { param($sample) $sample.gate_observation = "pair9" }
+        fixture = { param($sample) $sample.gate_measurement_fixture_sha256 = "9" * 64 }
+        affinity = { param($sample) $sample.gate_processor_index = 7 }
+        execution = { param($sample) $sample.gate_execution_jit = "0" }
+        automatic_backend = { param($sample) $sample.perf.jit_direct_entries = 0 }
+        result_bytes = { param($sample) $sample.gate_artifacts.result_block_normalized_bytes = 0 }
+    }
+    foreach ($mutation in $provenanceMutations.GetEnumerator()) {
+        $screen = & $newTrackMScreen `
+            $trackMPolicies[2] $automaticPolicy 3 ([double[]](1, 1, 1))
+        & $mutation.Value $screen.candidate[0]
+        $result = Get-TrackMWorkloadSummary `
+            $trackMPolicies[2] $screen.candidate $screen.parent $screen.warmups $automaticPolicy
+        if ($result.verdicts.provenance -ne "fail") {
+            throw "Track M provenance mutation $($mutation.Key) was accepted."
+        }
+    }
+    foreach ($field in @(
+        "jit_region_entries", "jit_region_insns", "jit_native_insns",
+        "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
+    )) {
+        $interpreterPolarityScreen = & $newTrackMScreen `
+            $trackMPolicies[0] $interpreterPolicy 3 ([double[]](1, 1, 1))
+        $interpreterPolarityScreen.candidate[0].perf.$field = 1
+        $interpreterPolarityResult = Get-TrackMWorkloadSummary `
+            $trackMPolicies[0] $interpreterPolarityScreen.candidate `
+            $interpreterPolarityScreen.parent $interpreterPolarityScreen.warmups $interpreterPolicy
+        if ($interpreterPolarityResult.verdicts.provenance -ne "fail") {
+            throw "Track M accepted nonzero interpreter counter $field."
+        }
+    }
+
+    $revision = "1" * 40
+    $baselineCommit = "2" * 40
+    $candidateTree = "3" * 40
+    $baselineTree = "4" * 40
+    $buildFingerprint = "5" * 64
+    $candidateArtifact = [pscustomobject][ordered]@{
+        executed_copy_path = "C:\evidence\candidate-izarravm.exe"
+        sha256 = "6" * 64
+        verified = $true
+        built_this_invocation = $true
+        artifact_source = [pscustomobject]@{
+            head_commit = $revision
+            head_tree = $candidateTree
+        }
+        build = [pscustomobject]@{ recipe_fingerprint_sha256 = $buildFingerprint }
+    }
+    $baselineArtifact = [pscustomobject][ordered]@{
+        executed_copy_path = "C:\evidence\parent-izarravm.exe"
+        sha256 = "7" * 64
+        verified = $true
+        built_this_invocation = $true
+        artifact_source = [pscustomobject]@{
+            head_commit = $baselineCommit
+            head_tree = $baselineTree
+        }
+        build = [pscustomobject]@{ recipe_fingerprint_sha256 = $buildFingerprint }
+    }
+    $repositoryAtSelection = [pscustomobject]@{
+        head_commit = $revision; head_tree = $candidateTree; dirty = $false; status = @()
+    }
+    $repositoryAtCompletion = $repositoryAtSelection.PSObject.Copy()
+    $repositoryStable = $true
+    $candidateExecutableStable = $true
+    $parentExecutableStable = $true
+    $doomFrozenStable = $true
+    $quakeFrozenStable = $true
+    $doomSourceStable = $true
+    $quakeSourceStable = $true
+    $gateSourceClosureStable = $true
+    $gateScriptHash = "8" * 64
+    $gateScriptHashAfter = $gateScriptHash
+    $fixtureManifestStable = $true
+    $verifiedChildAffinityStable = $true
+    $outerAffinityRestoreFailure = $null
+    $powerSchemeRecorded = $true
+    $powerSchemeStable = $true
+    $activePowerSchemeAtCompletion = "test power scheme"
+    $MeasurementLockPath = "C:\gate.lock"
+    $measurementLockEvidence = [pscustomobject]@{ path = $MeasurementLockPath }
+    $detectedBuildEnvironmentOverrides = @{}
+    $Runs = 3
+    $Screening = $true
+    $policies = $trackMPolicies
+    $trackMExecutionPolicy = $automaticPolicy
+    $verifiedChildAffinityMasks = [Collections.Generic.List[string]]::new()
+    foreach ($child in 1..($policies.Count * (2 + 2 * $Runs))) {
+        $verifiedChildAffinityMasks.Add("0x0000000000000100")
+    }
+    $fixtureManifestMatches = [ordered]@{ doom = $true; quake = $true }
+    $gateSourceClosureEvidence = [ordered]@{ schema = "test" }
+    $fixtureManifestHash = "9" * 64
+    $fixtureManifestHashAfter = $fixtureManifestHash
+    $workloadInputHashes = [ordered]@{}
+    $workloadTreeHashes = [ordered]@{}
+    $workloadCanonicalTreeHashes = [ordered]@{}
+    $exitVmHash = "a" * 64
+    $hostIdentity = [ordered]@{ os = "self-test" }
+    $ProcessorIndex = 8
+    $requestedProcessorMask = [int64]1 -shl 8
+    $PairSeed = 2
+    $pairRoles = @("candidate", "parent")
+    $trackMSummary = New-TrackMComparisonSummary $trackMAutomaticWorkloads
+    if ($trackMSummary.schema -cne "izarravm-track-m-revision-pair-v1" -or
+        $trackMSummary.verdict -cne "passed" -or -not $trackMSummary.retention_eligible -or
+        $trackMSummary.six_pair_rerun_eligible -or
+        $trackMSummary.revision_pair.candidate_commit -cne $revision -or
+        $trackMSummary.revision_pair.parent_commit -cne $baselineCommit -or
+        $trackMSummary.revision_pair.candidate_tree -cne $candidateTree -or
+        $trackMSummary.revision_pair.parent_tree -cne $baselineTree -or
+        $trackMSummary.Contains("accepted_baseline")) {
+        throw "The Track M top-level pass summary is incomplete or uses a stale baseline identity."
+    }
+    $inconclusiveWorkloads = $trackMAutomaticWorkloads |
+        ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $inconclusiveWorkloads[0].verdicts.performance = "inconclusive"
+    $inconclusiveWorkloads[0].checks.performance.verdict = "inconclusive"
+    $inconclusiveWorkloads[0].failure_reasons = @("synthetic lower-bound miss")
+    $inconclusiveSummary = New-TrackMComparisonSummary $inconclusiveWorkloads
+    if ($inconclusiveSummary.verdict -cne "inconclusive" -or
+        $inconclusiveSummary.retention_eligible -or
+        -not $inconclusiveSummary.six_pair_rerun_eligible) {
+        throw "Track M did not preserve a lower-bound-only screening result as inconclusive."
+    }
+    $regressionWorkloads = $trackMAutomaticWorkloads |
+        ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $regressionWorkloads[0].verdicts.performance = "regression"
+    $regressionWorkloads[0].checks.performance.verdict = "regression"
+    $regressionWorkloads[0].failure_reasons = @("synthetic median miss")
+    $regressionSummary = New-TrackMComparisonSummary $regressionWorkloads
+    if ($regressionSummary.verdict -cne "failed" -or
+        $regressionSummary.retention_eligible -or $regressionSummary.six_pair_rerun_eligible) {
+        throw "Track M did not classify a median miss as a failed retention screen."
+    }
+    $caseWorkloads = $trackMAutomaticWorkloads
+    $globalProvenanceCases = [ordered]@{
+        build = [pscustomobject]@{
+            mutate = { $candidateArtifact.verified = $false }
+            restore = { $candidateArtifact.verified = $true }
+        }
+        revision = [pscustomobject]@{
+            mutate = { $baselineArtifact.artifact_source.head_commit = "f" * 40 }
+            restore = { $baselineArtifact.artifact_source.head_commit = $baselineCommit }
+        }
+        recipe = [pscustomobject]@{
+            mutate = { $baselineArtifact.build.recipe_fingerprint_sha256 = "f" * 64 }
+            restore = { $baselineArtifact.build.recipe_fingerprint_sha256 = $buildFingerprint }
+        }
+        repository = [pscustomobject]@{
+            mutate = { $repositoryAtSelection.dirty = $true }
+            restore = { $repositoryAtSelection.dirty = $false }
+        }
+        executable = [pscustomobject]@{
+            mutate = { $candidateExecutableStable = $false }
+            restore = { $candidateExecutableStable = $true }
+        }
+        workload_tree = [pscustomobject]@{
+            mutate = { $doomFrozenStable = $false }
+            restore = { $doomFrozenStable = $true }
+        }
+        source_closure = [pscustomobject]@{
+            mutate = { $gateSourceClosureStable = $false }
+            restore = { $gateSourceClosureStable = $true }
+        }
+        workload_manifest = [pscustomobject]@{
+            mutate = { $fixtureManifestStable = $false }
+            restore = { $fixtureManifestStable = $true }
+        }
+        child_affinity = [pscustomobject]@{
+            mutate = { $verifiedChildAffinityStable = $false }
+            restore = { $verifiedChildAffinityStable = $true }
+        }
+        affinity_restore = [pscustomobject]@{
+            mutate = { $outerAffinityRestoreFailure = [Exception]::new("self-test") }
+            restore = { $outerAffinityRestoreFailure = $null }
+        }
+        power = [pscustomobject]@{
+            mutate = { $powerSchemeStable = $false }
+            restore = { $powerSchemeStable = $true }
+        }
+        lock = [pscustomobject]@{
+            mutate = { $measurementLockEvidence.path = "C:\wrong.lock" }
+            restore = { $measurementLockEvidence.path = $MeasurementLockPath }
+        }
+        build_environment = [pscustomobject]@{
+            mutate = { $detectedBuildEnvironmentOverrides["RUSTFLAGS"] = "self-test" }
+            restore = { $detectedBuildEnvironmentOverrides.Remove("RUSTFLAGS") }
+        }
+        workload_count = [pscustomobject]@{
+            mutate = { $caseWorkloads = [object[]]$trackMAutomaticWorkloads[0..1] }
+            restore = { $caseWorkloads = $trackMAutomaticWorkloads }
+        }
+    }
+    foreach ($case in $globalProvenanceCases.GetEnumerator()) {
+        $mutate = $case.Value.mutate
+        $restore = $case.Value.restore
+        try {
+            . $mutate
+            $failedSummary = New-TrackMComparisonSummary $caseWorkloads
+            if ($failedSummary.verdict -cne "failed" -or
+                $failedSummary.retention_eligible -or
+                $failedSummary.six_pair_rerun_eligible -or
+                $failedSummary.verdicts.provenance -cne "fail") {
+                throw "Track M global provenance mutation $($case.Key) was accepted."
+            }
+        } finally {
+            . $restore
+        }
+    }
+
+    $evidenceRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "izarravm-track-m-evidence-$([guid]::NewGuid().ToString('N'))"
+    )
+    $evidenceResults = Join-Path $evidenceRoot "results"
+    $evidenceSources = Join-Path $evidenceRoot "sources"
+    New-Item -ItemType Directory -Path $evidenceResults, $evidenceSources | Out-Null
+    try {
+        $evidenceCandidatePath = Join-Path $evidenceResults "candidate-izarravm.exe"
+        $evidenceParentPath = Join-Path $evidenceResults "parent-izarravm.exe"
+        [IO.File]::WriteAllText($evidenceCandidatePath, "candidate executable`n")
+        [IO.File]::WriteAllText($evidenceParentPath, "parent executable`n")
+        $evidenceCandidate = [pscustomobject]@{
+            executed_copy_path = $evidenceCandidatePath
+            sha256 = Get-FileSha256 $evidenceCandidatePath
+        }
+        $evidenceParent = [pscustomobject]@{
+            executed_copy_path = $evidenceParentPath
+            sha256 = Get-FileSha256 $evidenceParentPath
+        }
+        $evidenceSummary = [pscustomobject][ordered]@{
+            schema = "izarravm-track-m-revision-pair-v1"
+            verdict = "passed"
+            retention_eligible = $true
+            execution = [pscustomobject]@{ role = "automatic" }
+            revision_pair = [pscustomobject]@{
+                candidate_commit = $revision
+                candidate_tree = $candidateTree
+                parent_commit = $baselineCommit
+                parent_tree = $baselineTree
+            }
+            workload_manifest_sha256 = [pscustomobject]@{ at_completion = $null }
+            workloads = [object[]]@(
+                $trackMAutomaticWorkloads[0],
+                $trackMAutomaticWorkloads[2]
+            )
+        }
+        foreach ($workload in $evidenceSummary.workloads) {
+            foreach ($role in @("candidate", "parent")) {
+                $samples = @($workload.discarded_warmups.$role) + @($workload.$role.runs)
+                foreach ($sample in $samples) {
+                    foreach ($name in @("profile_json", "stdout", "stderr")) {
+                        $fileProperty = "${name}_file"
+                        $hashProperty = "${name}_sha256"
+                        $path = Join-Path $evidenceResults $sample.gate_artifacts.$fileProperty
+                        [IO.File]::WriteAllText(
+                            $path,
+                            "$($workload.name) $role $($sample.gate_observation) $name`n"
+                        )
+                        $sample.gate_artifacts.$hashProperty = Get-FileSha256 $path
+                    }
+                    if ($workload.name -ceq "quake-586") {
+                        $path = Join-Path $evidenceResults $sample.gate_artifacts.qconsole_file
+                        [IO.File]::WriteAllText(
+                            $path,
+                            "$($workload.name) $role $($sample.gate_observation) qconsole`n"
+                        )
+                        $sample.gate_artifacts.qconsole_sha256 = Get-FileSha256 $path
+                    }
+                }
+            }
+        }
+        $evidenceMain = Join-Path $evidenceSources "run-realtime-gate.ps1"
+        $evidenceSelfTest = Join-Path $evidenceSources "run-realtime-gate-self-test.ps1"
+        $evidenceSummaryScript = Join-Path $evidenceSources "run-realtime-gate-summary.ps1"
+        Copy-Item -LiteralPath $gateMainScriptPath -Destination $evidenceMain
+        Copy-Item -LiteralPath $gateSelfTestScriptPath -Destination $evidenceSelfTest
+        Copy-Item -LiteralPath $gateSummaryScriptPath -Destination $evidenceSummaryScript
+        $evidenceClosure = Get-GateSourceClosureIdentity `
+            $evidenceMain $evidenceSelfTest $evidenceSummaryScript
+        $evidenceFixtureManifest = Join-Path $evidenceSources "realtime-gate-inputs.json"
+        [IO.File]::WriteAllText($evidenceFixtureManifest, "{`"schema`":`"self-test`"}`n")
+        $evidenceSummary.workload_manifest_sha256.at_completion = `
+            Get-FileSha256 $evidenceFixtureManifest
+        $evidenceSummaryPath = Join-Path $evidenceResults "summary.json"
+        $evidenceSummary | ConvertTo-Json -Depth 20 |
+            Set-Content -LiteralPath $evidenceSummaryPath -Encoding utf8
+        $evidencePackage = Write-TrackMEvidencePackage `
+            $evidenceResults $evidenceSummaryPath $evidenceSummary `
+            $evidenceCandidate $evidenceParent $evidenceClosure `
+            $evidenceMain $evidenceSelfTest $evidenceSummaryScript $evidenceFixtureManifest
+        $manifest = Get-Content -LiteralPath $evidencePackage.manifest_path -Raw | ConvertFrom-Json
+        $resultLog = Get-Content -LiteralPath $evidencePackage.result_log_path -Raw
+        $manifestPaths = @($manifest.result_directory_files.path)
+        if ($manifest.integrity_verdict -cne "pass" -or
+            $manifest.gate_source_members.Count -ne 3 -or
+            $manifest.result_directory_files.Count -ne 59 -or
+            ($manifestPaths -join "`n") -cne (($manifestPaths | Sort-Object) -join "`n") -or
+            $resultLog -notlike "*summary_sha256=$($evidencePackage.summary_sha256)*" -or
+            $resultLog -notlike "*evidence_manifest_sha256=$($evidencePackage.manifest_sha256)*") {
+            throw "The Track M evidence package is incomplete, unsorted, or not closed by result.log."
+        }
+        $finalSourcePaths = [ordered]@{
+            "scripts/run-realtime-gate.ps1" = $evidenceMain
+            "scripts/run-realtime-gate-self-test.ps1" = $evidenceSelfTest
+            "scripts/run-realtime-gate-summary.ps1" = $evidenceSummaryScript
+        }
+        $postCapturePath = Join-Path $evidenceResults `
+            $evidenceSummary.workloads[0].candidate.runs[0].gate_artifacts.stdout_file
+        $postCaptureBytes = [IO.File]::ReadAllBytes($postCapturePath)
+        try {
+            [IO.File]::WriteAllText($postCapturePath, "post-capture mutation`n")
+            $postCaptureFailures = @(Get-TrackMEvidenceFinalVerificationFailures `
+                $evidenceResults $manifest.result_directory_files `
+                $manifest.gate_source_members $finalSourcePaths $manifest.workload_manifest `
+                $evidenceFixtureManifest $evidencePackage.manifest_path `
+                $evidencePackage.manifest_sha256 $evidencePackage.result_log_path `
+                (Get-FileSha256 $evidencePackage.result_log_path))
+            if (@($postCaptureFailures | Where-Object {
+                $_ -like "*changed after manifest capture*"
+            }).Count -eq 0) {
+                throw "Final Track M verification accepted a post-capture raw artifact mutation."
+            }
+        } finally {
+            [IO.File]::WriteAllBytes($postCapturePath, $postCaptureBytes)
+        }
+
+        $expectedProbe = [Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+        $failureProbe = [Collections.Generic.List[string]]::new()
+        Add-TrackMExpectedResultArtifact `
+            $expectedProbe $failureProbe "probe.log" ("a" * 64) "probe" "first probe"
+        Add-TrackMExpectedResultArtifact `
+            $expectedProbe $failureProbe "probe.log" ("a" * 64) "probe" "duplicate probe"
+        Add-TrackMExpectedResultArtifact `
+            $expectedProbe $failureProbe "../escape.log" ("a" * 64) "probe" "traversal probe"
+        if ($failureProbe.Count -ne 2) {
+            throw "Track M evidence did not reject duplicate and traversal artifact names."
+        }
+
+        $generatedEvidence = @($evidencePackage.manifest_path, $evidencePackage.result_log_path)
+        Remove-Item -LiteralPath $generatedEvidence -Force
+        $tamperPath = Join-Path $evidenceResults `
+            $evidenceSummary.workloads[0].candidate.runs[0].gate_artifacts.stdout_file
+        $tamperBytes = [IO.File]::ReadAllBytes($tamperPath)
+        try {
+            [IO.File]::WriteAllText($tamperPath, "tampered`n")
+            Assert-SelfTestThrows {
+                Write-TrackMEvidencePackage `
+                    $evidenceResults $evidenceSummaryPath $evidenceSummary `
+                    $evidenceCandidate $evidenceParent $evidenceClosure `
+                    $evidenceMain $evidenceSelfTest $evidenceSummaryScript $evidenceFixtureManifest
+            } "integrity failed after packaging"
+            if (-not (Test-Path -LiteralPath (Join-Path $evidenceResults "evidence-manifest.json")) -or
+                -not (Test-Path -LiteralPath (Join-Path $evidenceResults "result.log"))) {
+                throw "Failed Track M evidence was not packaged before rejection."
+            }
+        } finally {
+            [IO.File]::WriteAllBytes($tamperPath, $tamperBytes)
+        }
+        Remove-Item -LiteralPath `
+            (Join-Path $evidenceResults "evidence-manifest.json"), `
+            (Join-Path $evidenceResults "result.log") -Force
+        $missingPath = Join-Path $evidenceResults `
+            $evidenceSummary.workloads[0].parent.runs[0].gate_artifacts.stderr_file
+        $missingBytes = [IO.File]::ReadAllBytes($missingPath)
+        Remove-Item -LiteralPath $missingPath -Force
+        try {
+            Assert-SelfTestThrows {
+                Write-TrackMEvidencePackage `
+                    $evidenceResults $evidenceSummaryPath $evidenceSummary `
+                    $evidenceCandidate $evidenceParent $evidenceClosure `
+                    $evidenceMain $evidenceSelfTest $evidenceSummaryScript $evidenceFixtureManifest
+            } "missing result artifact"
+        } finally {
+            [IO.File]::WriteAllBytes($missingPath, $missingBytes)
+        }
+        Remove-Item -LiteralPath `
+            (Join-Path $evidenceResults "evidence-manifest.json"), `
+            (Join-Path $evidenceResults "result.log") -Force
+        $unexpectedDirectory = Join-Path $evidenceResults "nested"
+        New-Item -ItemType Directory -Path $unexpectedDirectory | Out-Null
+        $unexpectedPath = Join-Path $unexpectedDirectory "unexpected.log"
+        [IO.File]::WriteAllText($unexpectedPath, "unexpected`n")
+        [IO.File]::SetAttributes($unexpectedPath, [IO.FileAttributes]::Hidden)
+        Assert-SelfTestThrows {
+            Write-TrackMEvidencePackage `
+                $evidenceResults $evidenceSummaryPath $evidenceSummary `
+                $evidenceCandidate $evidenceParent $evidenceClosure `
+                $evidenceMain $evidenceSelfTest $evidenceSummaryScript $evidenceFixtureManifest
+        } "unexpected result artifact"
+    } finally {
+        Remove-Item -LiteralPath $evidenceRoot -Recurse -Force
     }
 
     $movedSummaryProbe = Get-RoleSummary "self-test" "486" @(

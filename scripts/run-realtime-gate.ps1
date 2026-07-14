@@ -17,6 +17,8 @@ param(
     [ValidateSet("0", "1")]
     [string]$Jit = "1",
     [switch]$BackendBakeoff,
+    [switch]$TrackMComparison,
+    [string]$ExecutionRole = "",
     [switch]$Screening,
     [string]$MeasurementLockPath = "",
     [switch]$SkipBuild,
@@ -979,6 +981,10 @@ function Get-TimedemoIdentityKey([string]$WorkloadName, $Sample) {
 function Get-MeasurementFixtureIdentityKey($Sample) {
     if ($null -eq $Sample.PSObject.Properties["gate_fixture"] -or
         $null -eq $Sample.gate_fixture) {
+        if ($null -ne $Sample.PSObject.Properties["gate_measurement_fixture_sha256"] -and
+            [string]$Sample.gate_measurement_fixture_sha256 -match '^[0-9a-f]{64}$') {
+            return [string]$Sample.gate_measurement_fixture_sha256
+        }
         return "not_applicable"
     }
     $fixture = $Sample.gate_fixture
@@ -1007,7 +1013,8 @@ function Get-QuakeCompletionIdentityKey([string]$WorkloadName, $Sample) {
         $completion.wait_marker_count,
         $completion.result_before_wait_marker,
         $completion.reported_values_consistent,
-        $completion.fatal_match_count
+        $completion.fatal_match_count,
+        $Sample.gate_artifacts.qconsole_sha256
     ) -join "|"
 }
 
@@ -1165,7 +1172,19 @@ if ($SelfTest) {
 $explicitExecutable = $PSBoundParameters.ContainsKey("Executable")
 $explicitJit = $PSBoundParameters.ContainsKey("Jit")
 $explicitRuns = $PSBoundParameters.ContainsKey("Runs")
-if ($Screening -and -not $BackendBakeoff) {
+$explicitBaseline = $PSBoundParameters.ContainsKey("BaselineRevision")
+$trackMExecutionPolicy = $null
+if ($TrackMComparison) {
+    Assert-TrackMComparisonMode `
+        ([bool]$BackendBakeoff) ([bool]$ReportOnly) $explicitBaseline `
+        $explicitJit $explicitExecutable ([bool]$SkipBuild) `
+        $ExecutionRole ([bool]$Screening) $explicitRuns $Runs `
+        $Workload $ProcessorIndex $MeasurementLockPath
+    $trackMExecutionPolicy = Get-TrackMExecutionPolicy $ExecutionRole
+    if ($Screening) {
+        $Runs = 3
+    }
+} elseif ($Screening -and -not $BackendBakeoff) {
     throw "Screening is only valid with BackendBakeoff."
 }
 if ($BackendBakeoff) {
@@ -1188,7 +1207,7 @@ if ($BackendBakeoff) {
     if ($Workload -ne "Both") {
         throw "Backend bakeoff requires all three workloads."
     }
-} else {
+} elseif (-not $TrackMComparison) {
     if ($Runs -lt 1) {
         throw "Runs must be at least one."
     }
@@ -1208,6 +1227,7 @@ if ($BackendBakeoff) {
         throw "Paired report-only measurements require at least two pairs."
     }
 }
+$captureProofArtifacts = [bool]($BackendBakeoff -or $TrackMComparison)
 $artifactSelection = Get-ArtifactSelectionPolicy ([bool]$ReportOnly) $explicitExecutable ([bool]$SkipBuild)
 if ($PairSeed -eq 0) {
     $PairSeed = [Security.Cryptography.RandomNumberGenerator]::GetInt32(1, [int]::MaxValue)
@@ -1342,7 +1362,14 @@ $revision = $repositoryAtSelection.head_commit
 $shortRevision = $revision.Substring(0, 12)
 $baselineCommit = $null
 $baselineTree = $null
-if (-not [string]::IsNullOrWhiteSpace($BaselineRevision)) {
+if ($TrackMComparison) {
+    $baselineCommit = Get-TrackMImmediateParent $repositoryRoot $revision
+    $baselineTree = (& git -C $repositoryRoot rev-parse --verify "$baselineCommit^{tree}").Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($baselineTree)) {
+        throw "Unable to resolve the Track M parent tree."
+    }
+    $BaselineRevision = $baselineCommit
+} elseif (-not [string]::IsNullOrWhiteSpace($BaselineRevision)) {
     $baselineCommit = (& git -C $repositoryRoot rev-parse --verify "${BaselineRevision}^{commit}").Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($baselineCommit)) {
         throw "Unable to resolve BaselineRevision '$BaselineRevision'."
@@ -1370,7 +1397,7 @@ $ResultsDirectory = (Resolve-Path -LiteralPath $ResultsDirectory).Path
 
 $measurementLockLease = $null
 $measurementLockEvidence = $null
-if ($BackendBakeoff) {
+if ($captureProofArtifacts) {
     $MeasurementLockPath = [IO.Path]::GetFullPath($MeasurementLockPath)
     $measurementLockLease = Enter-MeasurementLock $MeasurementLockPath
     $measurementLockEvidence = Get-MeasurementLockEvidence $measurementLockLease
@@ -1848,7 +1875,8 @@ $candidateArtifact = if ($artifactSelection -eq "isolated_build") {
 }
 $baselineArtifact = $null
 if ($null -ne $baselineCommit) {
-    $baselineArtifact = Invoke-IsolatedRevisionBuild $repositoryRoot $baselineCommit "baseline" $ResultsDirectory
+    $artifactLabel = if ($TrackMComparison) { "parent" } else { "baseline" }
+    $baselineArtifact = Invoke-IsolatedRevisionBuild $repositoryRoot $baselineCommit $artifactLabel $ResultsDirectory
 }
 $revisionPairedRun = $null -ne $baselineArtifact
 $pairedRun = $BackendBakeoff -or $revisionPairedRun
@@ -1879,6 +1907,9 @@ function Invoke-IzarraProcess(
     if ($BackendBakeoff -and $BackendRole -notin @("automatic", "interpreter")) {
         throw "Unknown backend bakeoff role '$BackendRole'."
     }
+    if ($TrackMComparison -and $BackendRole -notin @("candidate", "parent")) {
+        throw "Unknown Track M revision role '$BackendRole'."
+    }
     $argumentLine = ($Arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
     $childEnvironment = @{
         HOME = $HomePath
@@ -1891,6 +1922,8 @@ function Invoke-IzarraProcess(
     }
     $childEnvironment["IZARRAVM_JIT"] = if ($BackendBakeoff) {
         if ($BackendRole -eq "automatic") { "1" } else { "0" }
+    } elseif ($TrackMComparison) {
+        $trackMExecutionPolicy.jit
     } else {
         $Jit
     }
@@ -2119,7 +2152,7 @@ function Invoke-Observation(
     New-Item -ItemType Directory -Path $observationHome | Out-Null
     $qconsole = Join-Path $fixture "QUAKE/ID1/QCONSOLE.LOG"
     $useBackendQuakeCompletion = Test-BackendQuakeCompletionOverride `
-        ([bool]$BackendBakeoff) $Policy.name
+        $captureProofArtifacts $Policy.name
     $fixtureEvidence = $null
     if ($useBackendQuakeCompletion) {
         $fixtureEvidence = Set-BackendQuakeCompletionFixture `
@@ -2129,6 +2162,11 @@ function Invoke-Observation(
         if (Test-Path -LiteralPath $qconsole -PathType Leaf) {
             Remove-Item -LiteralPath $qconsole
         }
+    }
+    $measurementFixtureHash = if ($TrackMComparison) {
+        Get-DirectoryTreeSha256 $fixture
+    } else {
+        $null
     }
 
     $fileStem = "$($Policy.name)-$Role-$ObservationId"
@@ -2145,32 +2183,33 @@ function Invoke-Observation(
         "--dump-result",
         "--profile-json", $jsonPath
     )
-    if (Test-ObservationRequiresTestExit ([bool]$BackendBakeoff) $Policy.name) {
+    if (Test-ObservationRequiresTestExit $captureProofArtifacts $Policy.name) {
         $processArguments += "--expect-test-exit"
     }
-    if ($BackendBakeoff -and $Role -eq "interpreter") {
+    if (($BackendBakeoff -and $Role -eq "interpreter") -or
+        ($TrackMComparison -and $trackMExecutionPolicy.name -eq "interpreter")) {
         $processArguments += "--interpreter"
     }
     $processResult = Invoke-IzarraProcess `
         $ExecutablePath $processArguments $stdoutPath $stderrPath $observationHome $Role
-    if ($processResult.exit_code -ne 0 -and -not $BackendBakeoff) {
+    if ($processResult.exit_code -ne 0 -and -not $captureProofArtifacts) {
         throw "$context failed with exit code $($processResult.exit_code). See $stdoutPath and $stderrPath."
     }
     if (-not (Test-Path -LiteralPath $jsonPath -PathType Leaf)) {
         throw "$context did not produce its profile JSON."
     }
-    $profileHash = if ($BackendBakeoff) { Get-FileSha256 $jsonPath } else { $null }
+    $profileHash = if ($captureProofArtifacts) { Get-FileSha256 $jsonPath } else { $null }
     $sample = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json
     if ($sample.schema -ne "izarravm-hdd-profile-v1" -or $sample.mode -ne $Policy.mode) {
         throw "$context produced an unexpected schema or CPU mode."
     }
     Assert-UninstrumentedProfileSample $sample $context
-    if (-not $BackendBakeoff -and
+    if (-not $captureProofArtifacts -and
         $Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
         if ($sample.stop.kind -ne "test_exit" -or $sample.stop.code -ne 0) {
             throw "$context did not reach TestExit code 0."
         }
-    } elseif (-not $BackendBakeoff -and
+    } elseif (-not $captureProofArtifacts -and
         ($sample.stop.kind -ne "cycle_limit" -or
          [uint64]$sample.stop.requested -ne $Policy.cycle_budget)) {
         throw "$context did not reach its fixed cycle limit."
@@ -2207,7 +2246,7 @@ function Invoke-Observation(
     $preservedQconsole = $null
     $qconsoleHash = $null
     if ($Policy.name.StartsWith("doom-", [StringComparison]::Ordinal)) {
-        if (-not $BackendBakeoff -and
+        if (-not $captureProofArtifacts -and
             ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
              $sample.timedemo.realtics -lt $Policy.minimum_realtics -or
              $sample.timedemo.realtics -gt $Policy.maximum_realtics)) {
@@ -2222,11 +2261,11 @@ function Invoke-Observation(
         Remove-Item -LiteralPath $preservedQconsole -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $qconsole -PathType Leaf) {
             Copy-Item -LiteralPath $qconsole -Destination $preservedQconsole
-            if ($BackendBakeoff) {
+            if ($captureProofArtifacts) {
                 $qconsoleHash = Get-FileSha256 $preservedQconsole
             }
         }
-        if ($BackendBakeoff) {
+        if ($captureProofArtifacts) {
             $quakeCompletion = Read-BackendQuakeCompletion `
                 $preservedQconsole @($stdoutPath, $stderrPath)
             $quakeIdentity = $quakeCompletion.timedemo
@@ -2242,12 +2281,23 @@ function Invoke-Observation(
             $sample | Add-Member -NotePropertyName quake_timedemo -NotePropertyValue $quakeIdentity
         }
     }
-    if ($BackendBakeoff) {
+    if ($captureProofArtifacts) {
         $resultBlock = Get-NormalizedResultBlock $stdoutPath
         $sample | Add-Member `
             -NotePropertyName gate_process_exit_code `
             -NotePropertyValue $processResult.exit_code
-        $sample | Add-Member -NotePropertyName gate_backend_policy -NotePropertyValue $Role
+        if ($BackendBakeoff) {
+            $sample | Add-Member -NotePropertyName gate_backend_policy -NotePropertyValue $Role
+        } else {
+            $sample | Add-Member -NotePropertyName gate_execution_role `
+                -NotePropertyValue $trackMExecutionPolicy.name
+            $sample | Add-Member -NotePropertyName gate_execution_cli `
+                -NotePropertyValue $trackMExecutionPolicy.cli
+            $sample | Add-Member -NotePropertyName gate_execution_jit `
+                -NotePropertyValue $trackMExecutionPolicy.jit
+            $sample | Add-Member -NotePropertyName gate_measurement_fixture_sha256 `
+                -NotePropertyValue $measurementFixtureHash
+        }
         $sample | Add-Member `
             -NotePropertyName gate_termination_policy `
             -NotePropertyValue "lotura_test_exit"
@@ -2298,13 +2348,15 @@ $candidateHashAfter = $null
 $baselineHashAfter = $null
 $measurementFailure = $null
 $outerAffinityRestoreFailure = $null
+$doomFrozenStable = $true
+$quakeFrozenStable = $true
 try {
     $savedEnvironment["IZARRAVM_JIT"] = [Environment]::GetEnvironmentVariable("IZARRAVM_JIT", "Process")
     foreach ($name in $diagnosticVariables) {
         $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
         Set-GateProcessEnvironment $name $null
     }
-    $gateJitEnvironment = if ($BackendBakeoff) { $null } else { $Jit }
+    $gateJitEnvironment = if ($captureProofArtifacts) { $null } else { $Jit }
     Set-GateProcessEnvironment "IZARRAVM_JIT" $gateJitEnvironment
     $candidateExecutableLock = [IO.File]::Open(
         $candidateArtifact.executed_copy_path,
@@ -2323,6 +2375,8 @@ try {
     $policies = @(Get-WorkloadPolicies $Workload)
     $pairRoles = if ($BackendBakeoff) {
         @("automatic", "interpreter")
+    } elseif ($TrackMComparison) {
+        @("candidate", "parent")
     } else {
         @("candidate", "baseline")
     }
@@ -2395,7 +2449,11 @@ try {
     $workloads = @()
     foreach ($policy in $policies) {
         $bucket = $observations[$policy.name]
-        if ($BackendBakeoff) {
+        if ($TrackMComparison) {
+            $workloads += Get-TrackMWorkloadSummary `
+                $policy $bucket.candidate $bucket.parent `
+                $discardedWarmups[$policy.name] $trackMExecutionPolicy
+        } elseif ($BackendBakeoff) {
             $backendSummary = Get-BackendWorkloadSummary `
                 $policy $bucket.automatic $bucket.interpreter ([bool]$Screening)
             $workloadWarmups = Get-BackendDiscardedWarmups `
@@ -2433,12 +2491,14 @@ try {
     if ($revisionPairedRun) {
         $baselineHashAfter = (Get-FileHash -LiteralPath $baselineArtifact.executed_copy_path -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    if ($null -ne $doomSnapshot -and
-        (Get-DirectoryTreeSha256 $doomSnapshot.frozen_path) -ne $doomSnapshot.frozen_sha256) {
+    $doomFrozenStable = $null -eq $doomSnapshot -or
+        (Get-DirectoryTreeSha256 $doomSnapshot.frozen_path) -eq $doomSnapshot.frozen_sha256
+    $quakeFrozenStable = $null -eq $quakeSnapshot -or
+        (Get-DirectoryTreeSha256 $quakeSnapshot.frozen_path) -eq $quakeSnapshot.frozen_sha256
+    if (-not $TrackMComparison -and -not $doomFrozenStable) {
         throw "The frozen Doom workload changed during the gate."
     }
-    if ($null -ne $quakeSnapshot -and
-        (Get-DirectoryTreeSha256 $quakeSnapshot.frozen_path) -ne $quakeSnapshot.frozen_sha256) {
+    if (-not $TrackMComparison -and -not $quakeFrozenStable) {
         throw "The frozen Quake workload changed during the gate."
     }
 } catch {
@@ -2475,43 +2535,54 @@ if ($null -ne $measurementFailure) {
     }
     throw $measurementFailure
 }
-if ($null -ne $outerAffinityRestoreFailure) {
+if ($null -ne $outerAffinityRestoreFailure -and -not $TrackMComparison) {
     throw $outerAffinityRestoreFailure
 }
 
+$verifiedChildAffinityStable = $true
 if ($ProcessorIndex -ge 0) {
     $expectedVerifiedChildren = if ($pairedRun) {
         $policies.Count * (2 + 2 * $Runs)
     } else {
         $policies.Count * $Runs
     }
-    if ($verifiedChildAffinityMasks.Count -ne $expectedVerifiedChildren) {
+    $verifiedChildAffinityStable = $verifiedChildAffinityMasks.Count -eq $expectedVerifiedChildren
+    if (-not $TrackMComparison -and -not $verifiedChildAffinityStable) {
         throw "Not every warmup and measured child received a verified processor affinity."
     }
 }
 
-if ($candidateHashAfter -ne $candidateArtifact.sha256) {
+$candidateExecutableStable = $candidateHashAfter -eq $candidateArtifact.sha256
+if (-not $TrackMComparison -and -not $candidateExecutableStable) {
     throw "The frozen candidate executable changed during the gate."
 }
+$parentExecutableStable = $true
 if ($revisionPairedRun) {
-    if ($baselineHashAfter -ne $baselineArtifact.sha256) {
+    $parentExecutableStable = $baselineHashAfter -eq $baselineArtifact.sha256
+    if (-not $TrackMComparison -and -not $parentExecutableStable) {
         throw "The frozen baseline executable changed during the gate."
     }
 }
-if ($null -ne $doomSnapshot -and
-    (Get-DirectoryTreeSha256 $DoomFolder) -ne $doomSnapshot.source_initial_sha256) {
+$doomSourceStable = $null -eq $doomSnapshot -or
+    (Get-DirectoryTreeSha256 $DoomFolder) -eq $doomSnapshot.source_initial_sha256
+$quakeSourceStable = $null -eq $quakeSnapshot -or
+    (Get-DirectoryTreeSha256 $QuakeFolder) -eq $quakeSnapshot.source_initial_sha256
+if (-not $TrackMComparison -and -not $doomSourceStable) {
     throw "The Doom workload tree changed during the gate."
 }
-if ($null -ne $quakeSnapshot -and
-    (Get-DirectoryTreeSha256 $QuakeFolder) -ne $quakeSnapshot.source_initial_sha256) {
+if (-not $TrackMComparison -and -not $quakeSourceStable) {
     throw "The Quake workload tree changed during the gate."
 }
 $gateSourceClosureAtCompletion = Get-GateSourceClosureIdentity `
     $gateMainScriptPath $gateSelfTestScriptPath $gateSummaryScriptPath
-Assert-GateSourceClosureUnchanged `
-    $gateSourceClosureAtEntry $gateSourceClosureAtCompletion "during the measurement"
+$gateSourceClosureStable = @(Get-GateSourceClosureMismatches `
+    $gateSourceClosureAtEntry $gateSourceClosureAtCompletion).Count -eq 0
+if (-not $TrackMComparison) {
+    Assert-GateSourceClosureUnchanged `
+        $gateSourceClosureAtEntry $gateSourceClosureAtCompletion "during the measurement"
+}
 $gateScriptHashAfter = $gateSourceClosureAtCompletion.members[0].sha256
-if ($gateScriptHashAfter -ne $gateScriptHash) {
+if (-not $TrackMComparison -and $gateScriptHashAfter -ne $gateScriptHash) {
     throw "The throughput gate script changed during the measurement."
 }
 $gateSourceClosureEvidence = [ordered]@{
@@ -2520,13 +2591,14 @@ $gateSourceClosureEvidence = [ordered]@{
     at_completion = ConvertTo-GateSourceClosureEvidence $gateSourceClosureAtCompletion
 }
 $fixtureManifestHashAfter = (Get-FileHash -LiteralPath $fixtureManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($fixtureManifestHashAfter -ne $fixtureManifestHash) {
+$fixtureManifestStable = $fixtureManifestHashAfter -eq $fixtureManifestHash
+if (-not $TrackMComparison -and -not $fixtureManifestStable) {
     throw "The accepted workload manifest changed during the measurement."
 }
 $repositoryAtCompletion = Get-RepositoryState $repositoryRoot
-if (-not $ReportOnly -and
-    ($repositoryAtCompletion.head_commit -ne $repositoryAtSelection.head_commit -or
-     ($repositoryAtCompletion.status -join "`n") -ne ($repositoryAtSelection.status -join "`n"))) {
+$repositoryStable = $repositoryAtCompletion.head_commit -eq $repositoryAtSelection.head_commit -and
+    ($repositoryAtCompletion.status -join "`n") -eq ($repositoryAtSelection.status -join "`n")
+if (-not $TrackMComparison -and -not $ReportOnly -and -not $repositoryStable) {
     throw "The candidate repository changed during the formal gate."
 }
 $activePowerSchemeAtCompletion = if ($isWindowsHost) {
@@ -2539,7 +2611,9 @@ $powerSchemeRecorded = -not [string]::IsNullOrWhiteSpace([string]$activePowerSch
 $powerSchemeStable = $powerSchemeRecorded -and
     $activePowerScheme -eq $activePowerSchemeAtCompletion
 
-if ($BackendBakeoff) {
+if ($TrackMComparison) {
+    $summary = New-TrackMComparisonSummary $workloads
+} elseif ($BackendBakeoff) {
     $evidencePolicy = Get-BackendEvidencePolicy ([bool]$Screening)
     $aggregateVerdicts = [ordered]@{}
     foreach ($component in @(
@@ -2863,6 +2937,13 @@ $summary = [ordered]@{
 
 $summaryPath = Join-Path $ResultsDirectory "summary.json"
 $summary | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $summaryPath -Encoding utf8
+$trackMEvidence = $null
+if ($TrackMComparison) {
+    $trackMEvidence = Write-TrackMEvidencePackage `
+        $ResultsDirectory $summaryPath $summary $candidateArtifact $baselineArtifact `
+        $gateSourceClosureAtCompletion $gateMainScriptPath $gateSelfTestScriptPath `
+        $gateSummaryScriptPath $fixtureManifestPath
+}
 
 foreach ($workloadResult in $summary.workloads) {
     if ($BackendBakeoff) {
@@ -2887,11 +2968,19 @@ foreach ($workloadResult in $summary.workloads) {
     }
 }
 Write-Host "Summary: $summaryPath"
+if ($TrackMComparison) {
+    Write-Host "Evidence manifest: $($trackMEvidence.manifest_path)"
+    Write-Host "Evidence manifest SHA-256: $($trackMEvidence.manifest_sha256)"
+    Write-Host "Result log: $($trackMEvidence.result_log_path)"
+}
 
-if ($BackendBakeoff -and -not $Screening -and $summary.track_a_survival -ne "pass") {
+if ($TrackMComparison -and $summary.verdict -ne "passed") {
+    throw "The Track M comparison did not pass: $($summary.failure_reasons -join ' | ')."
+} elseif ($BackendBakeoff -and -not $Screening -and $summary.track_a_survival -ne "pass") {
     throw "The backend bakeoff did not meet its survival gate: $($summary.failure_reasons -join ' | ')."
 }
-if (-not $BackendBakeoff -and -not $ReportOnly -and $verdict -ne "passed") {
+if (-not $TrackMComparison -and -not $BackendBakeoff -and
+    -not $ReportOnly -and $verdict -ne "passed") {
     throw "The paired throughput gate did not pass: $($formalFailures -join ' | ')."
 }
 } finally {
