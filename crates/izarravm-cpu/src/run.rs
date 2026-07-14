@@ -27,6 +27,19 @@ fn jit_forced_region_lin() -> Option<u32> {
     })
 }
 
+/// Whether an opcode is a port-I/O instruction (IN / OUT / INS / OUTS), for the unit simulator's
+/// `touches_io` fact. IN (0xE4/0xE5 imm, 0xEC/0xED DX) and the string forms INS (0x6C/0x6D) / OUTS
+/// (0x6E/0x6F) plus OUT (0xE6/0xE7 imm, 0xEE/0xEF DX). OUT/INS/OUTS are also non-continuable, so the
+/// sim closes them as terminators before the I/O flag matters; IN is the Approximate-class interior
+/// form whose observation this flag actually drives.
+#[cfg(feature = "jit")]
+fn unit_sim_touches_io(opcode: u16) -> bool {
+    matches!(
+        opcode,
+        0xe4 | 0xe5 | 0xe6 | 0xe7 | 0xec | 0xed | 0xee | 0xef | 0x6c | 0x6d | 0x6e | 0x6f
+    )
+}
+
 #[cfg(feature = "jit")]
 enum DirectContinuation {
     Run(CycleOutcome),
@@ -193,6 +206,17 @@ impl CpuGsw {
             let outcome = result.expect("a faulting REP chunk cannot also yield");
             return Ok(self.pause_rep_instruction(insn, start_eip, start_cs_register, outcome));
         }
+        // Observe the retired instruction (this is the FIRST-instruction / standalone retire path;
+        // continuations retire through the run_one_cached fast tails). `finish_instruction`
+        // increments perf.instructions on Ok and on a delivered Exception; the unit simulator
+        // measures fault-free hot code, so observe only the Ok retirements (a decode miss leaves
+        // `decoded` None and never observes). `d` is the pre-execution decode key.
+        #[cfg(feature = "jit")]
+        if result.is_ok() {
+            if let Some(insn) = &decoded {
+                self.unit_sim_observe(insn, lin, start_cs_register.default_size_32);
+            }
+        }
         self.finish_instruction(
             bus,
             result,
@@ -278,6 +302,14 @@ impl CpuGsw {
             core_clocks: 0,
             halted: outcome.halted,
         });
+        // The REP resume completes the paused instruction; observe it once here (the paused chunks
+        // yielded without retiring). `.map` above preserves the Ok/Err split, so the same
+        // Ok-only rule as the other retire sites holds.
+        #[cfg(feature = "jit")]
+        if result.is_ok() {
+            let lin = resume.cs.base.wrapping_add(resume.start_eip);
+            self.unit_sim_observe(&resume.insn, lin, resume.cs.default_size_32);
+        }
         self.finish_instruction(
             bus,
             result,
@@ -595,6 +627,8 @@ impl CpuGsw {
                 self.perf.brk_halt += 1;
                 #[cfg(feature = "jit")]
                 self.flush_direct_cache_stats();
+                #[cfg(feature = "jit")]
+                self.unit_sim_batch_end();
                 return Ok(BudgetedRunOutcome {
                     consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
@@ -625,6 +659,8 @@ impl CpuGsw {
         }
         #[cfg(feature = "jit")]
         self.flush_direct_cache_stats();
+        #[cfg(feature = "jit")]
+        self.unit_sim_batch_end();
         Ok(BudgetedRunOutcome {
             consumed_core_clocks: total.min(u64::from(u32::MAX)) as u32,
             halted: false,
@@ -642,6 +678,76 @@ impl CpuGsw {
             core_clocks: outcome.consumed_core_clocks,
             halted: outcome.halted,
         })
+    }
+
+    /// Enable or disable the trace-driven unit simulator (feature `jit`, diagnostic). Enabling
+    /// installs a fresh `UnitSim`; disabling drops any accumulated state. The sim only observes
+    /// retired interpreter instructions and never influences execution, so toggling it leaves
+    /// architectural state unchanged (it is excluded from `CpuGsw` equality).
+    #[cfg(feature = "jit")]
+    pub fn set_unit_sim_enabled(&mut self, on: bool) {
+        self.unit_sim.0 = on.then(|| Box::new(jit::unit_sim::UnitSim::default()));
+    }
+
+    /// Take the unit simulator's headline report and its per-unit `(member_count, entry_physical
+    /// _page)` histogram, disabling the sim in the process. `None` when the sim was not enabled.
+    /// The histogram entries are `(member_count, entry_physical_page)`; see `SimReport` and
+    /// `jit::unit_sim` for the counter meanings. Consumed by the measurement tests and Track C
+    /// tooling.
+    #[cfg(feature = "jit")]
+    pub fn take_unit_sim_report(&mut self) -> Option<(SimReport, Vec<(usize, u32)>)> {
+        let sim = self.unit_sim.0.take()?;
+        Some((sim.report(), sim.unit_member_histogram()))
+    }
+
+    /// Feed one retired interpreter instruction into the optional unit simulator. A no-op (one
+    /// `Option` test) when the sim is disabled, the production default, so the hot retire paths pay
+    /// almost nothing. Called exactly once per retired instruction at every interpreter retire site
+    /// (the `cycle_no_interrupt_check` first-instruction path, both `run_one_cached` fast tails, the
+    /// profiling `finish_instruction` calls, and the REP resume path) so the observed count equals
+    /// the `perf.instructions` delta. `d` is the pre-execution decode key (`CS.default_size_32`),
+    /// which the caller captures before the instruction runs so the decode line lookup matches.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn unit_sim_observe(&mut self, insn: &DecodedInsn, lin: u32, d: bool) {
+        if self.unit_sim.0.is_none() {
+            return;
+        }
+        // The retired instruction's decode line is live (we just fetched or cached it), so
+        // `line_phys_start` is Some and carries the true physical page even under CR0.PG=0. Fall
+        // back to the linear page only if the line went unexpectedly cold (an instruction that
+        // patched its own decode line via SMC); documented and rare, never on the tested hot code.
+        let physical_page = self
+            .decode_cache
+            .line_phys_start(lin, d)
+            .map_or(lin >> 12, |phys| phys >> 12);
+        let observed = jit::unit_sim::ObservedInsn {
+            linear: lin,
+            len: insn.len,
+            physical_page,
+            mode_key: self.jit_mode_key(),
+            transfer: jit::block::observed_transfer(insn, lin),
+            is_terminator: !insn.continuable
+                || jit::block::changes_interrupt_visibility(insn)
+                || jit::block::changes_native_memory_context(insn),
+            touches_io: unit_sim_touches_io(insn.opcode),
+        };
+        self.unit_sim
+            .0
+            .as_mut()
+            .expect("sim present after the is_none early return")
+            .observe(observed);
+    }
+
+    /// Close the current unit-simulator batch at a `run_budgeted` return, if the sim is enabled.
+    /// Mirrors the real backend where each budget yield is a fresh dispatcher round trip, so any
+    /// open entry ends without charging an exit counter.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn unit_sim_batch_end(&mut self) {
+        if let Some(sim) = self.unit_sim.0.as_mut() {
+            sim.note_batch_end();
+        }
     }
 
     /// Enable or disable hotness-driven JIT admission (feature `jit`). Unsupported hosts always
@@ -1617,6 +1723,11 @@ impl CpuGsw {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
+        // Pre-execution decode key, so the sim's decode-line lookup matches the instruction that
+        // is about to retire even if it moves control (a near RET / indirect JMP does not change
+        // the key, but capturing it before execution is unconditionally correct).
+        #[cfg(feature = "jit")]
+        let d = self.registers.cs().default_size_32;
         let profiling = self.profile.enabled;
         if !profiling {
             return match self
@@ -1627,6 +1738,10 @@ impl CpuGsw {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     self.perf.instructions += 1;
+                    // This non-profiling fast tail is the COMMON continuation retire path; observe
+                    // the instruction here (once) so the sim count tracks perf.instructions.
+                    #[cfg(feature = "jit")]
+                    self.unit_sim_observe(insn, lin, d);
                     if self.is_ring0_protected() {
                         self.perf.monitor_resident_core_clocks += charged;
                     }
@@ -1647,6 +1762,12 @@ impl CpuGsw {
         let result = self
             .charge_cached_fetch(bus, lin, insn.len)
             .and_then(|()| self.execute_hot_cached_or_decoded(insn, bus));
+        // Profiling path: finish_instruction retires (increments perf.instructions) on Ok; observe
+        // the same Ok retirements here so the count stays exact when profiling is enabled.
+        #[cfg(feature = "jit")]
+        if result.is_ok() {
+            self.unit_sim_observe(insn, lin, d);
+        }
         self.finish_instruction(
             bus,
             result,
@@ -1676,6 +1797,9 @@ impl CpuGsw {
         let start_eip = self.registers.eip;
         let start_cs_register = self.registers.cs();
         let start_cs = start_cs_register.selector;
+        // Pre-execution decode key for the sim's decode-line lookup (see run_one_cached).
+        #[cfg(feature = "jit")]
+        let d = start_cs_register.default_size_32;
         let profiling = self.profile.enabled;
         self.rep_execution.yielded = false;
         if !profiling {
@@ -1690,6 +1814,10 @@ impl CpuGsw {
                     let charged = self.scale_clocks(outcome.core_clocks);
                     self.elapsed_clocks += charged;
                     self.perf.instructions += 1;
+                    // A budgeted REP retires (does not yield) here; observe it once. The yielding
+                    // arm above returns without retiring, so it is deliberately not observed.
+                    #[cfg(feature = "jit")]
+                    self.unit_sim_observe(insn, lin, d);
                     // V86 trap tax residency: the monitor's own straight-line
                     // instructions chain through this cached fast tail, not
                     // finish_instruction, so the residency attribution must
@@ -1721,6 +1849,12 @@ impl CpuGsw {
         if self.rep_execution.yielded {
             let outcome = result.expect("a faulting REP chunk cannot also yield");
             return Ok(self.pause_rep_instruction(*insn, start_eip, start_cs_register, outcome));
+        }
+        // Profiling path: past the yield check, an Ok result retires through finish_instruction;
+        // observe the same Ok retirements so the count stays exact when profiling is enabled.
+        #[cfg(feature = "jit")]
+        if result.is_ok() {
+            self.unit_sim_observe(insn, lin, d);
         }
         self.finish_instruction(
             bus,

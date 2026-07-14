@@ -2148,3 +2148,153 @@ fn native_ds_access_gates_match_protected_mode() {
         assert_eq!(cpu.perf_counters().jit_native_store_hits, 0);
     }
 }
+
+// ---- Unit-simulator feed from the interpreter (Track C, Task 2) ----
+//
+// These tests drive small guest programs through the plain interpreter (no JIT admission, so
+// `run_budgeted`'s native continuation path stays off and every retired instruction flows through
+// an observe site) and check the trace the simulator reconstructs. The simulator never influences
+// execution, so a sim-on run must match a sim-off run bit-for-bit.
+
+/// The unit-sim probe loop base. A NOP starter so the loop head is reached as a continuation,
+/// then a small ALU body decrementing ECX (all `0x83`-form, so continuable and fall-through), and
+/// a `jnz` rel8 self-loop back-edge; a trailing HLT at the fall-through halts the machine.
+const USIM_START: u32 = 0x200;
+const USIM_LOOP: u32 = 0x201;
+
+/// Build the probe program with `body_adds` leading `add r32,1` instructions before the
+/// `sub ecx,1` / `jnz` back-edge. `body_adds = 3` gives the "few ALU ops + a near branch" shape;
+/// `body_adds = 0` gives the tight two-instruction self-loop.
+fn usim_program(body_adds: usize) -> Vec<u8> {
+    let mut m = vec![0u8; 0x1000];
+    m[USIM_START as usize] = 0x90; // nop starter
+    let mut body: Vec<u8> = Vec::new();
+    // add eax,1 / add ebx,1 / add edx,1 (0x83 /0, ModRM mode 3): continuable ALU, no transfer.
+    for &rm in [0xc0u8, 0xc3, 0xc2].iter().take(body_adds) {
+        body.extend_from_slice(&[0x83, rm, 0x01]);
+    }
+    body.extend_from_slice(&[0x83, 0xe9, 0x01]); // sub ecx,1 (0x83 /5): sets ZF at ecx==0
+    let jnz_at = USIM_LOOP as usize + body.len();
+    let rel = (USIM_LOOP as i32 - (jnz_at as i32 + 2)) as i8;
+    body.push(0x75); // jnz rel8
+    body.push(rel as u8);
+    m[USIM_LOOP as usize..USIM_LOOP as usize + body.len()].copy_from_slice(&body);
+    m[USIM_LOOP as usize + body.len()] = 0xf4; // hlt at the loop fall-through
+    m
+}
+
+fn usim_arm(cpu: &mut CpuGsw, count: u32) {
+    cpu.registers.eip = USIM_START;
+    cpu.registers.set_esp(0x0700);
+    cpu.registers.set_eax(0);
+    cpu.registers.set_ebx(0);
+    cpu.registers.set_edx(0);
+    cpu.registers.set_ecx(count);
+}
+
+/// Enabling the simulator must not perturb architectural state (it is excluded from `CpuGsw`
+/// equality), and a sim-on run must produce a non-empty trace.
+#[test]
+fn unit_sim_feed_is_state_neutral() {
+    let mut sim_off = fresh();
+    let mut sim_on = fresh();
+    let mut bus_off = TestBus::with_memory(usim_program(3));
+    let mut bus_on = TestBus::with_memory(usim_program(3));
+
+    usim_arm(&mut sim_off, 6);
+    usim_arm(&mut sim_on, 6);
+    sim_on.set_unit_sim_enabled(true);
+
+    drive_to_halt(&mut sim_off, &mut bus_off);
+    drive_to_halt(&mut sim_on, &mut bus_on);
+
+    // The sim slot is excluded from equality, so the two CPUs must compare equal despite one
+    // carrying an enabled simulator. (If the field ever leaked into the derived PartialEq this
+    // assertion would fail, which is exactly the signal the plan calls for.)
+    assert_eq!(sim_off, sim_on, "enabling the unit sim changed CPU state");
+    assert_eq!(bus_off.memory, bus_on.memory, "guest memory diverged");
+
+    let (report, histogram) = sim_on
+        .take_unit_sim_report()
+        .expect("the sim was enabled, so a report exists");
+    assert!(report.entries > 0, "sim-on run recorded no entries");
+    assert!(
+        report.retired_in_units > 0,
+        "sim-on run accrued no retired instructions"
+    );
+    assert!(
+        !histogram.is_empty(),
+        "at least one unit should appear in the histogram"
+    );
+    // Taking the report disables the sim.
+    assert!(
+        sim_on.take_unit_sim_report().is_none(),
+        "the report was already taken; the sim is disabled"
+    );
+}
+
+/// Coverage invariant (review finding B2): every retired interpreter instruction is observed
+/// exactly once, so `retired_in_units` equals the run's `perf.instructions` delta. Each `observe`
+/// accrues exactly once, so `retired_in_units` is the total observed count.
+#[test]
+fn unit_sim_observes_every_retired_instruction() {
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(usim_program(3));
+    usim_arm(&mut cpu, 9);
+    cpu.set_unit_sim_enabled(true);
+    cpu.reset_perf_counters();
+
+    drive_to_halt(&mut cpu, &mut bus);
+
+    let retired = cpu.perf_counters().instructions;
+    let (report, _) = cpu.take_unit_sim_report().expect("sim enabled");
+    assert!(retired > 0, "the program retired no instructions");
+    assert_eq!(
+        report.retired_in_units, retired,
+        "the sim must observe every retired instruction exactly once \
+         (retired_in_units {} vs perf.instructions {})",
+        report.retired_in_units, retired,
+    );
+}
+
+/// A tight two-instruction self-loop: the `jnz` back-edge is a `DirectNear` transfer to the loop
+/// head, so the open entry stays open across it and the fall-through body accrues to the same
+/// entry. `entries` is therefore bounded by the batch count (one open entry per batch), never by
+/// the far larger retired-instruction count.
+#[test]
+fn unit_sim_self_loop_keeps_entry_open() {
+    let mut cpu = fresh();
+    let mut bus = TestBus::with_memory(usim_program(0));
+    usim_arm(&mut cpu, 60);
+    cpu.set_unit_sim_enabled(true);
+    cpu.reset_perf_counters();
+
+    drive_to_halt(&mut cpu, &mut bus);
+
+    let batches = cpu.perf_counters().straight_line_runs;
+    let (report, _) = cpu.take_unit_sim_report().expect("sim enabled");
+
+    // The loop runs 60 iterations of `sub ecx,1; jnz`, so retired is large.
+    assert!(
+        report.retired_in_units >= 100,
+        "expected a long retired stream, got {}",
+        report.retired_in_units
+    );
+    // Exactly one entry opens per batch: the `jnz` back-edge is `DirectNear`, so it keeps the open
+    // entry alive and the fall-through `sub` accrues to it rather than opening a second entry. A
+    // broken back-edge (treating `jnz` as `Indirect`) would close after the branch and reopen on
+    // the body, pushing entries past the batch count. So `entries <= batches` is the discriminating
+    // proof, and entries stays strictly below the far larger retired stream.
+    assert!(
+        report.entries <= batches,
+        "entries {} exceeded the batch count {} (back-edge did not keep the entry open)",
+        report.entries,
+        batches
+    );
+    assert!(
+        report.entries < report.retired_in_units,
+        "entries {} should stay below the retired stream {}",
+        report.entries,
+        report.retired_in_units
+    );
+}

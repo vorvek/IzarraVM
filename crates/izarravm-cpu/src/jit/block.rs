@@ -152,6 +152,29 @@ pub(crate) fn is_control_transfer(insn: &DecodedInsn) -> bool {
     }
 }
 
+/// The transfer shape the unit simulator records for `insn` starting at linear `lin`. A relative
+/// near JMP (0xEB / 0xE9) or Jcc (short 0x70-0x7F, near 0x0F80-0x0F8F) has a statically computable
+/// target `lin + len + imm` and is `DirectNear` (the sim keeps the entry open across an in-window
+/// back-edge). CALL rel (0xE8, recursion not a loop back-edge) and every other `is_control_transfer`
+/// form (near RET, near indirect CALL/JMP, LOOP, JCXZ) is `Indirect`; a non-control-transfer
+/// instruction is `None`. Reuses `is_control_transfer` as the single control-flow authority, so the
+/// far / INT / IRET terminators (not `continuable`, hence never `is_control_transfer` here) fall to
+/// `None` and are closed by the sim's `is_terminator` check instead.
+pub(crate) fn observed_transfer(insn: &DecodedInsn, lin: u32) -> super::unit_sim::TransferKind {
+    use super::unit_sim::TransferKind;
+    if !is_control_transfer(insn) {
+        return TransferKind::None;
+    }
+    let direct_near =
+        matches!(insn.opcode, 0xeb | 0xe9 | 0x70..=0x7f) || matches!(insn.opcode, 0x0f80..=0x0f8f);
+    if direct_near {
+        let target = lin.wrapping_add(u32::from(insn.len)).wrapping_add(insn.imm);
+        TransferKind::DirectNear { target }
+    } else {
+        TransferKind::Indirect
+    }
+}
+
 /// Whether an instruction changes interrupt visibility (IF/TF) or arms the one-instruction
 /// interrupt shadow. These are `continuable` (the interpreter runs them inline, with its
 /// per-instruction interrupt-transition check), but the region DEFERS that check to the whole-

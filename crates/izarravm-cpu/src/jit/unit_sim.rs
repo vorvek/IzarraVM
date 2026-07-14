@@ -36,9 +36,10 @@ pub(crate) struct ObservedInsn {
     pub touches_io: bool,
 }
 
-/// Headline counters produced by the simulation.
+/// Headline counters produced by the simulation. Public because it is returned by
+/// `CpuGsw::take_unit_sim_report`, the diagnostic accessor Track C tooling reads.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SimReport {
+pub struct SimReport {
     pub entries: u64,
     pub retired_in_units: u64,
     pub linked_transfers: u64,

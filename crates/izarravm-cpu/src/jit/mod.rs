@@ -36,7 +36,6 @@ pub(crate) mod fast_map;
 pub(crate) mod native_x87;
 mod region;
 pub(crate) mod step;
-#[allow(dead_code)]
 pub(crate) mod unit_sim;
 #[cfg(all(
     target_arch = "x86_64",

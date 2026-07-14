@@ -18,6 +18,10 @@ mod fpu;
 mod fpu_exec;
 #[cfg(feature = "jit")]
 mod jit;
+/// The unit simulator's headline report, returned by `CpuGsw::take_unit_sim_report` (a diagnostic
+/// measurement aid; see `jit::unit_sim`).
+#[cfg(feature = "jit")]
+pub use jit::unit_sim::SimReport;
 mod memory;
 mod mmx;
 mod mmx_exec;
@@ -935,6 +939,13 @@ pub struct CpuGsw {
     /// method for the chokepoint inventory). `Default`/`reset` leave it `false`, matching
     /// the reset images (CR0 without AM, EFLAGS 0x2); `Clone` copies it consistently.
     alignment_armed: bool,
+    /// Optional trace-driven unit simulator (feature `jit`, diagnostic). Off by default and enabled
+    /// per-CPU via `set_unit_sim_enabled`; when on it observes every retired interpreter instruction
+    /// to measure hypothetical superblock units. Non-architectural: excluded from CPU equality (a
+    /// `UnitSimSlot`'s always-true `PartialEq`, like the decode cache) and cloned off, so enabling it
+    /// never makes an otherwise-identical CPU compare unequal. See `jit::unit_sim`.
+    #[cfg(feature = "jit")]
+    unit_sim: UnitSimSlot,
     /// Current privilege level. Per the 386 PRM, CPL is a *cached* quantity carried in
     /// (the hidden part of) CS, updated only at defined transition points -- it is not a
     /// live formula over the current CS selector. Updated at: real mode / PE clear (0);
@@ -998,8 +1009,47 @@ impl Default for CpuGsw {
             profile: CpuProfileState::default(),
             pending_flags: PendingFlags::default(),
             alignment_armed: false,
+            #[cfg(feature = "jit")]
+            unit_sim: UnitSimSlot::default(),
             cpl: 0,
         }
+    }
+}
+
+/// Non-architectural slot holding the optional unit simulator (feature `jit`). Wrapping the boxed
+/// `UnitSim` lets `CpuGsw` keep its derived `PartialEq`/`Eq`/`Clone`/`Debug`: this type reports
+/// always-equal (two CPUs differing only in diagnostic sim state are the same machine), clones with
+/// the sim disabled (a transparent diagnostic, like the decode and region caches that clone empty),
+/// and prints opaquely. See `jit::unit_sim`.
+#[cfg(feature = "jit")]
+#[derive(Default)]
+struct UnitSimSlot(Option<Box<jit::unit_sim::UnitSim>>);
+
+#[cfg(feature = "jit")]
+impl PartialEq for UnitSimSlot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Eq for UnitSimSlot {}
+
+#[cfg(feature = "jit")]
+impl Clone for UnitSimSlot {
+    fn clone(&self) -> Self {
+        // Diagnostic accelerator: a clone starts with the sim disabled, matching the decode/region
+        // caches that clone empty. Re-enable it on the clone if measurement is wanted there.
+        Self(None)
+    }
+}
+
+#[cfg(feature = "jit")]
+impl std::fmt::Debug for UnitSimSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnitSimSlot")
+            .field("enabled", &self.0.is_some())
+            .finish()
     }
 }
 
