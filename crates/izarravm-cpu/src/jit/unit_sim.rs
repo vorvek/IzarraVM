@@ -213,9 +213,14 @@ pub(crate) struct UnitSim {
     page_owners: HashMap<u32, HashSet<UnitKey>>,
     /// Keys ever built, so a rebuild after invalidation is not miscounted as a first build.
     ever_built: HashSet<UnitKey>,
-    /// Shadow return-address stack (L2+), capped at 64 with drop-oldest on overflow.
+    /// Shadow return-address stack (L2+), capped at 64 with drop-oldest on overflow. Reviewed
+    /// semantics, frozen: the stack is per-sim, survives batch ends, entry closes, and SMC
+    /// invalidations, and carries no mode tagging; stale frames bias approximately neutral (a false
+    /// ret_link needs the next instruction to coincidentally match a stale address AND be a known
+    /// same-mode unit entry).
     shadow: Vec<u32>,
-    /// Inline target cache (L4): `(unit key, exit linear) -> last observed target`.
+    /// Inline target cache (L4): `(unit key, exit linear) -> last observed target`. Entries rooted
+    /// at a unit are flushed when that unit is killed (see `flush_itc_for`).
     itc_cache: HashMap<(UnitKey, u32), u32>,
     open: Option<OpenEntry>,
     report: SimReport,
@@ -314,6 +319,7 @@ impl UnitSim {
                 if let Some(unit) = self.units.remove(&key) {
                     self.report.sim_invalidations += 1;
                     self.drop_ownership(&key, &unit.pages);
+                    self.flush_itc_for(&key);
                 }
                 if Some(key) == open_key {
                     hit_open = true;
@@ -340,6 +346,7 @@ impl UnitSim {
                     if let Some(unit) = self.units.remove(&key) {
                         self.report.sim_invalidations += 1;
                         self.drop_ownership(&key, &unit.pages);
+                        self.flush_itc_for(&key);
                     }
                     if Some(key) == open_key {
                         hit_open = true;
@@ -367,6 +374,11 @@ impl UnitSim {
     /// of a unit's members share one linear window, so their offset-within-page is directly
     /// comparable with the store's (the physical-remap caveat is documented on `accrue`).
     fn classify_write(&self, key: &UnitKey, wlo: u32, whi: u32) -> WriteAction {
+        // An empty range writes nothing; without this guard a zero-width store strictly inside a
+        // member span would satisfy the tail-confinement test and restamp spuriously.
+        if wlo == whi {
+            return WriteAction::Ignore;
+        }
         let unit = match self.units.get(key) {
             Some(unit) => unit,
             None => return WriteAction::Ignore,
@@ -719,6 +731,13 @@ impl UnitSim {
             ExitReason::Io => self.report.side_exits_io += 1,
         }
         self.open = None;
+    }
+
+    /// Drop every inline-target-cache entry rooted at a killed unit. A real inline cache is
+    /// embedded in the discarded code, so a rebuilt unit pays the first-encounter miss again;
+    /// without this flush `itc_hits` would be biased upward across SMC kills.
+    fn flush_itc_for(&mut self, key: &UnitKey) {
+        self.itc_cache.retain(|(unit, _), _| unit != key);
     }
 
     /// Remove a unit key from the physical pages it owned, visiting only those pages.

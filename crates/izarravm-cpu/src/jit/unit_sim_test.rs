@@ -613,3 +613,179 @@ fn ladder_feeds_five_sims_and_l0_matches_solo_v1() {
     assert_eq!(reports[0].1, solo.report());
     assert_eq!(reports[0].2, solo.unit_member_histogram());
 }
+
+// --- Review pins: cache flush on kill, shadow-stack edges, quota via the new link kinds ---
+
+#[test]
+fn l4_unit_kill_flushes_its_itc_entries() {
+    let mut sim = UnitSim::with_config(SimConfig::ladder(4));
+    build_known(&mut sim, 0x3000); // known target B
+
+    // First A->B fills the cache; second A->B hits.
+    run_a_indirect(&mut sim, 0x3000);
+    sim.note_batch_end();
+    run_a_indirect(&mut sim, 0x3000);
+    assert_eq!(sim.report().itc_hits, 1);
+    sim.note_batch_end();
+
+    // SMC-kill A (first-byte write to its entry member kills even under L3+).
+    sim.note_code_write(0x1000, 1);
+    assert_eq!(sim.report().sim_invalidations, 1);
+
+    // The rebuilt A pays the first-encounter miss again: unresolved + refill, NOT a hit.
+    run_a_indirect(&mut sim, 0x3000);
+    assert_eq!(sim.report().itc_hits, 1);
+    assert_eq!(sim.report().units_rebuilt, 1);
+    sim.note_batch_end();
+
+    // The refill re-arms the site: the next stable pass hits again.
+    run_a_indirect(&mut sim, 0x3000);
+    assert_eq!(sim.report().itc_hits, 2);
+}
+
+#[test]
+fn l2_shadow_stack_drops_oldest_at_cap() {
+    let mut sim = UnitSim::with_config(SimConfig::ladder(2));
+    // 65 indirect calls, each pushing its return address (a known unit entry, own page).
+    let ret_addr = |i: u32| 0x10000 + i * 0x1000;
+    for i in 0..65 {
+        build_known(&mut sim, ret_addr(i));
+        sim.observe(call_indirect(ret_addr(i) - 2, 2)); // pushes ret_addr(i), closes unresolved
+        sim.note_batch_end();
+    }
+
+    // 64 returns unwind the NEWEST 64 frames (LIFO: 64 down to 1); each links.
+    for i in (1..65).rev() {
+        sim.observe(ret(0x90000, 1));
+        sim.observe(insn(ret_addr(i), 2));
+        sim.note_batch_end();
+    }
+    assert_eq!(sim.report().ret_links, 64);
+
+    // The 65th return finds an empty stack: frame 0 (the oldest) was dropped at the cap.
+    let unresolved_before = sim.report().unresolved_exits;
+    sim.observe(ret(0x90000, 1));
+    assert_eq!(sim.report().ret_links, 64);
+    assert_eq!(sim.report().unresolved_exits, unresolved_before + 1);
+}
+
+#[test]
+fn l2_ret_mode_mismatch_at_resolution_is_unresolved() {
+    let mut sim = UnitSim::with_config(SimConfig::ladder(2));
+    build_known(&mut sim, 0x1002); // known in mode 0
+    sim.observe(call_indirect(0x1000, 2)); // pushes 0x1002, closes unresolved
+    sim.observe(ret(0x2000, 1)); // pops 0x1002, arms the deferred check
+    let unresolved_before = sim.report().unresolved_exits;
+
+    // The observed linear MATCHES the popped address, but the mode key differs: no ret-link.
+    let mut wrong_mode = insn(0x1002, 2);
+    wrong_mode.mode_key = 1;
+    sim.observe(wrong_mode);
+
+    let r = sim.report();
+    assert_eq!(r.ret_links, 0);
+    assert_eq!(r.unresolved_exits, unresolved_before + 1);
+}
+
+#[test]
+fn l2_call_and_ret_links_consume_quota() {
+    let quota = crate::jit::direct::MAX_CHAIN_BLOCKS;
+    let mut sim = UnitSim::with_config(SimConfig::ladder(2));
+    // K at 0x2000 self-calls; its return address 0x2005 is also a known unit.
+    build_known(&mut sim, 0x2000);
+    build_known(&mut sim, 0x2005);
+    let entries_before = sim.report().entries;
+
+    // quota-6 recursive self-calls, all inside one open entry (each links and burns one slot).
+    sim.observe(call_near(0x2000, 5, 0x2000));
+    for _ in 1..(quota - 6) {
+        sim.observe(call_near(0x2000, 5, 0x2000));
+    }
+    assert_eq!(sim.report().call_links, (quota - 6) as u64);
+    assert_eq!(sim.report().entries, entries_before + 1);
+
+    // Six returns link back to 0x2005 (the shadow stack holds 64 copies), burning the rest.
+    sim.observe(ret(0x2005, 1));
+    sim.observe(insn(0x2005, 2)); // ret-link; accrues with fall-through 0x2007
+    for _ in 1..6 {
+        sim.observe(ret(0x2007, 1));
+        sim.observe(insn(0x2005, 2));
+    }
+    assert_eq!(sim.report().ret_links, 6);
+    assert_eq!(sim.report().entries, entries_before + 1);
+    let unresolved_before = sim.report().unresolved_exits;
+
+    // Quota is saturated: the next return's resolution closes unresolved and the target
+    // reprocesses as a fresh entry.
+    sim.observe(ret(0x2007, 1));
+    sim.observe(insn(0x2005, 2));
+    let r = sim.report();
+    assert_eq!(r.ret_links, 6);
+    assert_eq!(r.unresolved_exits, unresolved_before + 1);
+    assert_eq!(r.entries, entries_before + 2);
+}
+
+#[test]
+fn l1_loop_links_consume_quota() {
+    let quota = crate::jit::direct::MAX_CHAIN_BLOCKS;
+    let mut sim = UnitSim::with_config(SimConfig::ladder(1));
+    build_known(&mut sim, 0x1000);
+    build_known(&mut sim, 0x2000);
+    let entries_before = sim.report().entries;
+
+    // Open at 0x5000, then ping-pong A<->B via out-of-window LoopNear links until quota saturates.
+    sim.observe(loop_near(0x5000, 2, 0x1000));
+    let mut at_a = true;
+    for _ in 1..quota {
+        let (here, there) = if at_a {
+            (0x1000, 0x2000)
+        } else {
+            (0x2000, 0x1000)
+        };
+        sim.observe(loop_near(here, 2, there));
+        at_a = !at_a;
+    }
+    assert_eq!(sim.report().loop_links, quota as u64);
+    assert_eq!(sim.report().entries, entries_before + 1);
+
+    // The next out-of-window loop link exhausts the quota and closes the entry unresolved.
+    let (here, there) = if at_a {
+        (0x1000, 0x2000)
+    } else {
+        (0x2000, 0x1000)
+    };
+    let unresolved_before = sim.report().unresolved_exits;
+    sim.observe(loop_near(here, 2, there));
+    assert_eq!(sim.report().loop_links, quota as u64);
+    assert_eq!(sim.report().unresolved_exits, unresolved_before + 1);
+}
+
+#[test]
+fn l2_ret_to_unknown_entry_is_unresolved() {
+    let mut sim = UnitSim::with_config(SimConfig::ladder(2));
+    // 0x1002 is pushed but never made a unit entry.
+    sim.observe(call_indirect(0x1000, 2));
+    sim.observe(ret(0x2000, 1)); // pops 0x1002, arms the deferred check
+    let unresolved_before = sim.report().unresolved_exits;
+
+    // The observed linear matches the popped address, but it is not a known unit entry.
+    sim.observe(insn(0x1002, 2));
+    let r = sim.report();
+    assert_eq!(r.ret_links, 0);
+    assert_eq!(r.unresolved_exits, unresolved_before + 1);
+}
+
+#[test]
+fn l2_failed_call_link_still_pushes_shadow_stack() {
+    let mut sim = UnitSim::with_config(SimConfig::ladder(2));
+    build_known(&mut sim, 0x1007); // the call's return address, known for the later ret-link
+
+    // The call's TARGET is unknown, so the link fails (unresolved close), but the push happened.
+    sim.observe(call_near(0x1002, 5, 0xdea_d000));
+    assert_eq!(sim.report().call_links, 0);
+
+    // A later return still links back to call.next via the pushed frame.
+    sim.observe(ret(0x3000, 1));
+    sim.observe(insn(0x1007, 2));
+    assert_eq!(sim.report().ret_links, 1);
+}
