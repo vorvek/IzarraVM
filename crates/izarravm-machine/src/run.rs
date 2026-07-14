@@ -4,6 +4,23 @@
 use super::*;
 
 impl Machine {
+    /// Enable or disable the trace-driven unit-growth simulator on the CPU (feature `jit`,
+    /// diagnostic). A no-op without feature `jit`. See `CpuGsw::set_unit_sim_enabled`.
+    pub fn set_unit_sim_enabled(&mut self, on: bool) {
+        #[cfg(feature = "jit")]
+        self.cpu.set_unit_sim_enabled(on);
+        #[cfg(not(feature = "jit"))]
+        let _ = on;
+    }
+
+    /// Take the unit simulator's headline report and its per-unit `(member_count, entry_physical
+    /// _page)` histogram, disabling the sim in the process. `None` when the sim was not enabled.
+    /// Only present with feature `jit`; see `CpuGsw::take_unit_sim_report`.
+    #[cfg(feature = "jit")]
+    pub fn take_unit_sim_report(&mut self) -> Option<(izarravm_cpu::SimReport, Vec<(usize, u32)>)> {
+        self.cpu.take_unit_sim_report()
+    }
+
     fn consume_pending_device_memory_write_range(&mut self) {
         if let Some((physical, width)) = self.pending_device_memory_write_range.take() {
             self.cpu.note_device_memory_write_range(physical, width);

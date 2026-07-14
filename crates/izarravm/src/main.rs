@@ -396,6 +396,7 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         MachineProfile::from_hardware_profile(hardware),
         boot_test_image(),
     )?;
+    maybe_enable_unit_sim(&mut machine);
     // The suite is wall-time-bound (PIT ticks and device-settle delays), so the
     // cycle budget scales with the clock to cover the same span at any GSW mode.
     // Half a second covers the timer probe and the 453-byte report at 38400 baud.
@@ -419,6 +420,7 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("stop: {stop_reason:?}");
     print_com1(&machine.serial_text());
+    maybe_report_unit_sim(&mut machine);
     if let Some(message) = boot_suite_failure_summary(&results) {
         return Err(message.into());
     }
@@ -447,6 +449,7 @@ fn run_test_rom(
 ) -> Result<(), Box<dyn Error>> {
     let rom = select_rom(bios)?;
     let mut machine = Machine::new(MachineProfile::from_hardware_profile(hardware), &rom)?;
+    maybe_enable_unit_sim(&mut machine);
     let budget = cycles.unwrap_or(DEFAULT_TEST_ROM_CYCLES);
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let screen = machine.screen_text();
@@ -462,6 +465,7 @@ fn run_test_rom(
     print_com1(&machine.serial_text());
     println!("post: {:#04x}", machine.io_port(0x80).unwrap_or(0));
     println!("stop: {stop_reason:?}");
+    maybe_report_unit_sim(&mut machine);
     Ok(())
 }
 
@@ -709,6 +713,7 @@ fn run_boot_hdd_folder(
         .map(|bytes| ("GLIDE2X.OVL".to_string(), bytes))
         .collect();
     machine.mount_hdd_folder_with_user_overrides(dir, overlays)?;
+    maybe_enable_unit_sim(&mut machine);
     // Calibration census tool: IZARRAVM_CPU_PROFILE=<stride> turns on the same
     // sampled per-opcode CPU profile the bench harness uses, dumped after the
     // run. Reads the guest-clock attribution of e.g. the x87 opcode rows
@@ -816,6 +821,7 @@ fn run_boot_hdd_folder(
     // Run-shape diagnostics (insns/run + break reasons). Unconditional: the counters are
     // always maintained, so unlike the sampled profile above this print costs nothing.
     bench::print_perf_counter_row("hdd-folder", hardware.cpu, machine.cpu().perf_counters());
+    maybe_report_unit_sim(&mut machine);
     // Diff-trace prototype (IZARRAVM_DIFF_TRACE): flush the buffered trace writer now
     // that the run loop returned, or its last partial buffer's worth of lines -- most
     // often exactly the tail we care about -- is silently lost at process exit. This
@@ -930,6 +936,106 @@ fn write_hdd_profile_json(
 
 fn machine_profile_requested(value: Option<&str>) -> bool {
     value.is_some_and(|value| !matches!(value, "" | "0"))
+}
+
+/// True when IZARRAVM_UNIT_SIM requests the trace-driven unit-growth simulator (any value other
+/// than "" or "0"). The simulator only observes retired interpreter instructions and never touches
+/// guest-visible state, so a headless game/binary run stays byte-identical whether it is on or off.
+fn unit_sim_requested() -> bool {
+    std::env::var("IZARRAVM_UNIT_SIM")
+        .ok()
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "" | "0"))
+}
+
+/// Turn on the unit simulator before a headless run when IZARRAVM_UNIT_SIM asks for it. Enabling
+/// early means the sim observes the whole run. A no-op when the env var is unset or the binary was
+/// built without feature `jit`.
+fn maybe_enable_unit_sim(machine: &mut Machine) {
+    if unit_sim_requested() {
+        machine.set_unit_sim_enabled(true);
+    }
+}
+
+/// Take the unit simulator's report at the end of a headless run and print its two evidence lines.
+/// A no-op when the sim was never enabled (`take_unit_sim_report` returns `None`) or the binary was
+/// built without feature `jit`.
+#[cfg(feature = "jit")]
+fn maybe_report_unit_sim(machine: &mut Machine) {
+    if let Some((report, histogram)) = machine.take_unit_sim_report() {
+        for line in unit_sim_report_lines(&report, &histogram) {
+            println!("{line}");
+        }
+    }
+}
+
+#[cfg(not(feature = "jit"))]
+fn maybe_report_unit_sim(_machine: &mut Machine) {}
+
+/// Nearest-rank percentile of an ascending-sorted slice. `p` is a whole percent (50, 90). Empty
+/// input yields 0.
+#[cfg(feature = "jit")]
+fn nearest_rank_percentile(sorted_ascending: &[usize], p: u32) -> u64 {
+    if sorted_ascending.is_empty() {
+        return 0;
+    }
+    let n = sorted_ascending.len();
+    let rank = ((f64::from(p) / 100.0) * n as f64).ceil() as usize;
+    let index = rank.saturating_sub(1).min(n - 1);
+    sorted_ascending[index] as u64
+}
+
+/// Format the unit simulator's two evidence lines from its headline report and per-unit
+/// `(member_count, entry_physical_page)` histogram. The first line is the headline counters plus the
+/// structural `insns_per_entry` metric (`retired_in_units / entries`, 0.000000 when `entries == 0`).
+/// The second line summarizes the member-count distribution so the evaluation step can reason about
+/// member caps without a per-unit retired count (which the API does not expose). `excl_units` counts
+/// units whose entry sits in the BIOS/UMA physical window (page 0xF0, or pages 0xA0..=0xFF).
+#[cfg(feature = "jit")]
+pub(crate) fn unit_sim_report_lines(
+    report: &izarravm_cpu::SimReport,
+    histogram: &[(usize, u32)],
+) -> Vec<String> {
+    let insns_per_entry = if report.entries == 0 {
+        0.0
+    } else {
+        report.retired_in_units as f64 / report.entries as f64
+    };
+    let headline = format!(
+        "unit_sim entries={} retired_in_units={} linked_transfers={} unresolved_exits={} \
+side_exits_io={} side_exits_async={} sim_invalidations={} units_built={} units_rebuilt={} \
+insns_per_entry={insns_per_entry:.6}",
+        report.entries,
+        report.retired_in_units,
+        report.linked_transfers,
+        report.unresolved_exits,
+        report.side_exits_io,
+        report.side_exits_async,
+        report.sim_invalidations,
+        report.units_built,
+        report.units_rebuilt,
+    );
+
+    let mut members: Vec<usize> = histogram.iter().map(|&(count, _)| count).collect();
+    members.sort_unstable();
+    let members_max = members.last().copied().unwrap_or(0) as u64;
+    let over = |threshold: usize| members.iter().filter(|&&m| m > threshold).count();
+    let excl_units = histogram
+        .iter()
+        .filter(|&&(_, page)| page == 0xF0 || (0xA0..=0xFF).contains(&page))
+        .count();
+    let hist = format!(
+        "unit_sim_hist units={} members_p50={} members_p90={} members_max={members_max} \
+units_over_64={} units_over_128={} units_over_256={} excl_units={excl_units}",
+        histogram.len(),
+        nearest_rank_percentile(&members, 50),
+        nearest_rank_percentile(&members, 90),
+        over(64),
+        over(128),
+        over(256),
+    );
+
+    vec![headline, hist]
 }
 
 fn validate_profile_json_parent(path: &Path) -> Result<(), Box<dyn Error>> {

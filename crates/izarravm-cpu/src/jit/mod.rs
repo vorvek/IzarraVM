@@ -36,6 +36,7 @@ pub(crate) mod fast_map;
 pub(crate) mod native_x87;
 mod region;
 pub(crate) mod step;
+pub(crate) mod unit_sim;
 #[cfg(all(
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")

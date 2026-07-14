@@ -1331,3 +1331,202 @@ fn quake_word_renderer_families_match_interpreter_state_flags_memory_and_timing(
         &[0x34, 0x12, 0xff, 0xff]
     );
 }
+
+const RT_ENTRY_A: u32 = 0x101;
+const RT_ENTRY_B_NORMAL: u32 = 0x201;
+// `key_for` returns None for physical addresses in 0xA0000..0x100000, so an entry placed here is
+// never admitted to the direct backend and stays on the interpreter forever.
+const RT_ENTRY_B_EXCLUDED: u32 = 0x000a_1000;
+
+// Two blocks, each one register ALU op followed by an unconditional near jump to the other, so the
+// guest is an endless A -> B -> A loop. Bodies are kept to a single ALU op so that when B falls to
+// the interpreter (the UNRESOLVED config) its interpret-vs-native residual stays minimal.
+fn roundtrip_pair_memory(entry_b: u32) -> Vec<u8> {
+    let mut memory = vec![0; (entry_b as usize + 16).max(0x1000)];
+    let write_block = |memory: &mut Vec<u8>, entry: u32, alu: [u8; 3], target: u32| {
+        let base = entry as usize;
+        memory[base..base + 3].copy_from_slice(&alu);
+        let jmp_at = entry + 3;
+        memory[jmp_at as usize] = 0xe9;
+        let rel = i64::from(target) - (i64::from(jmp_at) + 5);
+        memory[jmp_at as usize + 1..jmp_at as usize + 5]
+            .copy_from_slice(&(rel as i32).to_le_bytes());
+    };
+    // A: add eax,1 ; jmp B
+    write_block(&mut memory, RT_ENTRY_A, [0x83, 0xc0, 0x01], entry_b);
+    // B: add edx,1 ; jmp A
+    write_block(&mut memory, entry_b, [0x83, 0xc2, 0x01], RT_ENTRY_A);
+    memory
+}
+
+fn roundtrip_cpu(entry_b: u32) -> (CpuGsw, TestBus) {
+    let mut cpu = flat_stack_cpu(RT_ENTRY_A);
+    cpu.registers.gpr.fill(0);
+    cpu.registers.eflags = 0x2; // IF clear: no interrupt-transition run breaks.
+    cpu.pending_flags = PendingFlags::default();
+    cpu.jit_direct.set_admission_heat_for_test(1);
+    cpu.set_jit_auto_admit(true);
+    let mut bus = TestBus::with_memory(roundtrip_pair_memory(entry_b));
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    // Uniform native fetches take the trace-free native path (no per-entry trace allocation), so
+    // the measured linked-transfer cost reflects steady-state native dispatch rather than the
+    // per-block trace bookkeeping.
+    bus.uniform_native_fetches = true;
+    // Production runs with bus tracing off when the JIT is active; the TestBus default (Full)
+    // would make every interpreted instruction in the UNRESOLVED config push BusCycles into the
+    // trace VecDeque, a cost production never pays.
+    bus.trace.set_tracing_mode(TracingMode::Off);
+    (cpu, bus)
+}
+
+fn roundtrip_median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = samples.len();
+    if n % 2 == 1 {
+        samples[n / 2]
+    } else {
+        (samples[n / 2 - 1] + samples[n / 2]) / 2.0
+    }
+}
+
+/// Measure, on the production `run_budgeted` dispatch path, the wall cost of an unresolved native
+/// exit that returns to the interpreter and re-dispatches, relative to a native linked transfer
+/// that stays in compiled code. This replaces the 2011-literature inference the superblock-JIT
+/// performance thesis rested on with a number taken on the real path.
+///
+/// The guest is a two-block A <-> B loop (each block one ALU op plus a near jump to the other) run
+/// at equal guest work in two configurations:
+///   LINKED     - both blocks admitted; the A<->B edges link natively (no return to Rust per edge).
+///   UNRESOLVED - block A admitted, block B placed in the `key_for` physical-exclusion window so it
+///                is never admitted; every A->B edge is an unresolved static-unbound exit and B
+///                runs on the interpreter.
+///
+/// The difference isolates the round-trip cost: the block bodies and per-block accounting appear in
+/// both configs and cancel. B interprets instead of running natively in UNRESOLVED, which does not
+/// fully cancel, so the printed unresolved number is a small OVERESTIMATE by B's interpret-vs-native
+/// delta (B is one ALU op plus a jump to keep that residual small).
+///
+/// Normalization is counter-based, never by intended iteration count. One unresolved exit advances
+/// the guest by one full A->B->A round (A native, B interpreted); the equal-work linked cost of
+/// that round is two linked transfers (the A->B and B->A edges). Hence the headline subtracts twice
+/// the per-linked-transfer time from the per-unresolved-exit time.
+#[ignore = "timing probe; run explicitly with --ignored roundtrip --nocapture"]
+#[test]
+fn roundtrip_unresolved_exit_versus_linked_transfer_ns() {
+    if cfg!(debug_assertions) {
+        panic!("run this probe with --release; a debug build prints a garbage gate number");
+    }
+    // CAP bounds one native chain sweep in the LINKED config (the UNRESOLVED config breaks at B's
+    // non-continuable jump every round regardless). TARGET is the per-sample counter goal; WARM
+    // drives each config to steady state before the timed samples. In UNRESOLVED, run_budgeted
+    // returns once per round and the test loop re-invokes it, standing in for the machine batch
+    // loop; that slightly under-counts the production round cost (the conservative direction).
+    const CAP: u64 = 2_000_000;
+    const TARGET: u64 = 2_000_000;
+    const WARM: u64 = 50_000;
+    const SAMPLES: usize = 5;
+
+    // ---- LINKED: both A and B admitted, A<->B edges link natively. ----
+    let (mut cpu, mut bus) = roundtrip_cpu(RT_ENTRY_B_NORMAL);
+    let warm_from = cpu.perf_counters().jit_direct_linked_transfers;
+    while cpu.perf_counters().jit_direct_linked_transfers - warm_from < WARM {
+        cpu.run_budgeted(&mut bus, CAP).unwrap();
+    }
+    assert!(
+        cpu.jit_direct.len() >= 2,
+        "LINKED config must admit both A and B, got {}",
+        cpu.jit_direct.len()
+    );
+
+    let mut linked_samples = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        let linked0 = cpu.perf_counters().jit_direct_linked_transfers;
+        let unresolved0 = cpu.perf_counters().jit_direct_unresolved_exits;
+        let started = std::time::Instant::now();
+        loop {
+            cpu.run_budgeted(&mut bus, CAP).unwrap();
+            if cpu.perf_counters().jit_direct_linked_transfers - linked0 >= TARGET {
+                break;
+            }
+        }
+        let elapsed_ns = started.elapsed().as_nanos() as f64;
+        let linked = cpu.perf_counters().jit_direct_linked_transfers - linked0;
+        let unresolved = cpu.perf_counters().jit_direct_unresolved_exits - unresolved0;
+        assert!(
+            linked >= TARGET,
+            "LINKED sample {sample} under target: {linked}"
+        );
+        assert!(
+            unresolved.saturating_mul(100) < linked,
+            "LINKED sample {sample} must stay native, saw unresolved={unresolved} linked={linked}"
+        );
+        linked_samples.push(elapsed_ns / linked as f64);
+    }
+
+    // ---- UNRESOLVED: B excluded from admission, so every A->B edge round-trips through Rust. ----
+    let (mut cpu, mut bus) = roundtrip_cpu(RT_ENTRY_B_EXCLUDED);
+    let warm_from = cpu.perf_counters().jit_direct_unresolved_exits;
+    while cpu.perf_counters().jit_direct_unresolved_exits - warm_from < WARM {
+        cpu.run_budgeted(&mut bus, CAP).unwrap();
+    }
+    // B's entry is inside the JIT physical-exclusion window, so it can never be admitted: `key_for`
+    // returns None for it regardless of hotness. The counter proofs below (linked == 0, every
+    // unresolved exit static-unbound) confirm B never becomes a native or linked target at runtime.
+    assert!(
+        jit::direct::key_for(&cpu, RT_ENTRY_B_EXCLUDED, true).is_none(),
+        "B's entry must fall in the key_for physical-exclusion window"
+    );
+
+    let mut unresolved_samples = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        let linked0 = cpu.perf_counters().jit_direct_linked_transfers;
+        let unresolved0 = cpu.perf_counters().jit_direct_unresolved_exits;
+        let entries0 = cpu.perf_counters().jit_direct_entries;
+        let static_unbound0 = cpu.perf_counters().jit_direct_unresolved_static_unbound;
+        let started = std::time::Instant::now();
+        loop {
+            cpu.run_budgeted(&mut bus, CAP).unwrap();
+            if cpu.perf_counters().jit_direct_unresolved_exits - unresolved0 >= TARGET {
+                break;
+            }
+        }
+        let elapsed_ns = started.elapsed().as_nanos() as f64;
+        let linked = cpu.perf_counters().jit_direct_linked_transfers - linked0;
+        let unresolved = cpu.perf_counters().jit_direct_unresolved_exits - unresolved0;
+        let entries = cpu.perf_counters().jit_direct_entries - entries0;
+        let static_unbound =
+            cpu.perf_counters().jit_direct_unresolved_static_unbound - static_unbound0;
+        assert_eq!(
+            linked, 0,
+            "UNRESOLVED sample {sample} must never link a transfer"
+        );
+        assert!(
+            unresolved >= TARGET,
+            "UNRESOLVED sample {sample} under target: {unresolved}"
+        );
+        assert_eq!(
+            static_unbound, unresolved,
+            "sample {sample}: every unresolved exit must be a static-unbound A->B edge"
+        );
+        assert!(
+            entries >= unresolved && entries - unresolved <= unresolved / 100,
+            "sample {sample}: expect one native A entry per unresolved round, entries={entries} unresolved={unresolved}"
+        );
+        unresolved_samples.push(elapsed_ns / unresolved as f64);
+    }
+
+    let linked_ns_per_transfer = roundtrip_median(linked_samples);
+    let unresolved_ns_per_exit = roundtrip_median(unresolved_samples);
+    // One unresolved exit == one A->B->A round == two linked transfers of equal guest work. The
+    // difference is a small overestimate of the pure round-trip cost by B's interpret-vs-native
+    // delta (see the doc comment).
+    let unresolved_minus_linked_ns_per_exit = unresolved_ns_per_exit - 2.0 * linked_ns_per_transfer;
+    println!(
+        "roundtrip unresolved_minus_linked_ns_per_exit={unresolved_minus_linked_ns_per_exit:.3} unresolved_ns_per_exit={unresolved_ns_per_exit:.3} linked_ns_per_transfer={linked_ns_per_transfer:.3}"
+    );
+    assert!(
+        unresolved_minus_linked_ns_per_exit > 0.0,
+        "an unresolved round-trip must cost more than staying in linked native code"
+    );
+}

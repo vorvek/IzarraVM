@@ -252,6 +252,19 @@ impl CpuGsw {
     /// adjacent code.
     #[inline]
     pub(super) fn note_code_write(&mut self, physical: u32, width: u32) -> bool {
+        // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
+        // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
+        // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
+        // Notify the first byte's page and, when the store spans a page boundary, the last byte's
+        // page too (a store touches at most two pages here).
+        #[cfg(feature = "jit")]
+        if let Some(sim) = self.unit_sim.0.as_mut() {
+            sim.note_code_write(physical);
+            let last = physical.wrapping_add(width.saturating_sub(1));
+            if last >> 12 != physical >> 12 {
+                sim.note_code_write(last);
+            }
+        }
         let mut invalidated = false;
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
