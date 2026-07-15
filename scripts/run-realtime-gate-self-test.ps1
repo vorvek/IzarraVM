@@ -496,19 +496,22 @@ function Invoke-RealtimeGateSelfTest {
             throw "POLL-SKIP measured role order did not alternate for seed $seed."
         }
     }
-    $requiredDiagnostics = @(
-        "IZARRAVM_POLL_SKIP_DIAG", "IZARRAVM_UNIT_SIM",
+    $requiredScrubVariables = @(
+        "IZARRAVM_POLL_SKIP", "IZARRAVM_POLL_SKIP_DIAG", "IZARRAVM_UNIT_SIM",
         "IZARRAVM_IO_HIST", "IZARRAVM_PROFILE_ITERS"
     )
     $knownDiagnostics = @(Get-KnownDiagnosticVariables)
-    foreach ($name in $requiredDiagnostics) {
+    foreach ($name in $requiredScrubVariables) {
         if ($knownDiagnostics -cnotcontains $name) {
-            throw "The fixed diagnostic scrub list is missing $name."
+            throw "The fixed child environment scrub list is missing $name."
         }
     }
     $childEnvironment = New-IzarraChildEnvironment `
         "C:\isolated-home" $knownDiagnostics $skipOnPolicy.environment
-    foreach ($name in $requiredDiagnostics) {
+    foreach ($name in @(
+        "IZARRAVM_POLL_SKIP_DIAG", "IZARRAVM_UNIT_SIM",
+        "IZARRAVM_IO_HIST", "IZARRAVM_PROFILE_ITERS"
+    )) {
         if (-not $childEnvironment.ContainsKey($name) -or $null -ne $childEnvironment[$name]) {
             throw "The child environment did not explicitly unset $name."
         }
@@ -521,9 +524,36 @@ function Invoke-RealtimeGateSelfTest {
     $automaticPolicy = Get-TrackMExecutionPolicy "automatic"
     $interpreterPolicy = Get-TrackMExecutionPolicy "interpreter"
     if ($automaticPolicy.cli -cne "default automatic backend" -or
-        $automaticPolicy.jit -cne "1" -or $interpreterPolicy.cli -cne "--interpreter" -or
-        $interpreterPolicy.jit -cne "0") {
+        @($automaticPolicy.environment.Keys) -join "," -cne
+            "IZARRAVM_JIT,IZARRAVM_POLL_SKIP" -or
+        $automaticPolicy.environment.IZARRAVM_JIT -cne "1" -or
+        $automaticPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
+        $interpreterPolicy.cli -cne "--interpreter" -or
+        @($interpreterPolicy.environment.Keys) -join "," -cne
+            "IZARRAVM_JIT,IZARRAVM_POLL_SKIP" -or
+        $interpreterPolicy.environment.IZARRAVM_JIT -cne "0" -or
+        $interpreterPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
+        $null -ne $automaticPolicy.PSObject.Properties["jit"] -or
+        $null -ne $interpreterPolicy.PSObject.Properties["jit"] -or
+        @($automaticPolicy.required_zero_counters) -join "," -cne
+            "poll_skip_spans,poll_skip_iterations" -or
+        @($interpreterPolicy.required_zero_counters) -join "," -cne
+            "poll_skip_spans,poll_skip_iterations") {
         throw "Track M execution policies do not force the requested backend."
+    }
+    $trackMChildEnvironment = New-IzarraChildEnvironment `
+        "C:\track-m-home" $knownDiagnostics $interpreterPolicy.environment
+    if ($trackMChildEnvironment.IZARRAVM_JIT -cne "0" -or
+        $trackMChildEnvironment.IZARRAVM_POLL_SKIP -cne "0" -or
+        $trackMChildEnvironment.IZARRAVM_POLL_SKIP_DIAG -ne $null -or
+        $trackMChildEnvironment.HOME -cne "C:\track-m-home") {
+        throw "Track M child launch did not derive its isolated environment from the policy."
+    }
+    $automaticChildEnvironment = New-IzarraChildEnvironment `
+        "C:\track-m-auto-home" $knownDiagnostics $automaticPolicy.environment
+    if ($automaticChildEnvironment.IZARRAVM_JIT -cne "1" -or
+        $automaticChildEnvironment.IZARRAVM_POLL_SKIP -cne "0") {
+        throw "Automatic Track M child launch did not preserve the policy environment."
     }
     $candidateCommit = "1" * 40
     $parentCommit = "2" * 40
@@ -1074,6 +1104,8 @@ function Invoke-RealtimeGateSelfTest {
                 jit_direct_entries = if ($automatic) { 90 } else { 0 }
                 jit_direct_insns = if ($automatic) { 900 } else { 0 }
                 jit_direct_side_exits = 0
+                poll_skip_spans = 0
+                poll_skip_iterations = 0
             }
             master_ticks = [uint64]2000
             elapsed_budget_clocks = [uint64]3000
@@ -1095,7 +1127,8 @@ function Invoke-RealtimeGateSelfTest {
             gate_processor_affinity_verified = $true
             gate_execution_role = $ExecutionPolicy.name
             gate_execution_cli = $ExecutionPolicy.cli
-            gate_execution_jit = $ExecutionPolicy.jit
+            gate_execution_jit = $ExecutionPolicy.environment.IZARRAVM_JIT
+            gate_poll_skip = $ExecutionPolicy.environment.IZARRAVM_POLL_SKIP
             gate_measurement_fixture_sha256 = $fixtureHash
             gate_termination_policy = "lotura_test_exit"
             gate_artifacts = [pscustomobject][ordered]@{
@@ -1217,6 +1250,7 @@ function Invoke-RealtimeGateSelfTest {
         fixture = { param($sample) $sample.gate_measurement_fixture_sha256 = "9" * 64 }
         affinity = { param($sample) $sample.gate_processor_index = 7 }
         execution = { param($sample) $sample.gate_execution_jit = "0" }
+        poll_skip_policy = { param($sample) $sample.gate_poll_skip = "1" }
         automatic_backend = { param($sample) $sample.perf.jit_direct_entries = 0 }
         result_bytes = { param($sample) $sample.gate_artifacts.result_block_normalized_bytes = 0 }
     }
@@ -1228,6 +1262,32 @@ function Invoke-RealtimeGateSelfTest {
             $trackMPolicies[2] $screen.candidate $screen.parent $screen.warmups $automaticPolicy
         if ($result.verdicts.provenance -ne "fail") {
             throw "Track M provenance mutation $($mutation.Key) was accepted."
+        }
+    }
+    $trackMSampleLocations = [ordered]@{
+        candidate_warmup = { param($screen) $screen.warmups.candidate[0] }
+        parent_warmup = { param($screen) $screen.warmups.parent[0] }
+        candidate_pair = { param($screen) $screen.candidate[0] }
+        parent_pair = { param($screen) $screen.parent[0] }
+    }
+    $zeroCounterMutations = [ordered]@{
+        nonzero = { param($sample, $field) $sample.perf.$field = 1 }
+        missing = { param($sample, $field) $sample.perf.PSObject.Properties.Remove($field) }
+    }
+    foreach ($field in @($automaticPolicy.required_zero_counters)) {
+        foreach ($location in $trackMSampleLocations.GetEnumerator()) {
+            foreach ($mutation in $zeroCounterMutations.GetEnumerator()) {
+                $screen = & $newTrackMScreen `
+                    $trackMPolicies[0] $automaticPolicy 3 ([double[]](1, 1, 1))
+                $sample = & $location.Value $screen
+                & $mutation.Value $sample $field
+                $result = Get-TrackMWorkloadSummary `
+                    $trackMPolicies[0] $screen.candidate $screen.parent `
+                    $screen.warmups $automaticPolicy
+                if ($result.verdicts.provenance -ne "fail") {
+                    throw "Track M accepted $($mutation.Key) $field in $($location.Key)."
+                }
+            }
         }
     }
     foreach ($field in @(
@@ -1324,6 +1384,12 @@ function Invoke-RealtimeGateSelfTest {
         $trackMSummary.revision_pair.parent_commit -cne $baselineCommit -or
         $trackMSummary.revision_pair.candidate_tree -cne $candidateTree -or
         $trackMSummary.revision_pair.parent_tree -cne $baselineTree -or
+        $trackMSummary.execution.candidate.environment.IZARRAVM_JIT -cne "1" -or
+        $trackMSummary.execution.candidate.environment.IZARRAVM_POLL_SKIP -cne "0" -or
+        $trackMSummary.execution.parent.environment.IZARRAVM_JIT -cne "1" -or
+        $trackMSummary.execution.parent.environment.IZARRAVM_POLL_SKIP -cne "0" -or
+        @($trackMSummary.execution.required_zero_counters) -join "," -cne
+            "poll_skip_spans,poll_skip_iterations" -or
         $trackMSummary.Contains("accepted_baseline")) {
         throw "The Track M top-level pass summary is incomplete or uses a stale baseline identity."
     }
@@ -1787,6 +1853,10 @@ function Invoke-RealtimeGateSelfTest {
         $pollSummary.role_executables.skip_on.path -cne $pollSummary.role_executables.skip_off.path -or
         $pollSummary.role_executables.skip_on.sha256 -cne $pollSummary.role_executables.skip_off.sha256 -or
         ($pollSummary.warmup_order -join ",") -cne "skip_off,skip_on" -or
+        $pollSummary.execution.diagnostics_unset -contains "IZARRAVM_JIT" -or
+        $pollSummary.execution.diagnostics_unset -contains "IZARRAVM_POLL_SKIP" -or
+        $pollSummary.execution.diagnostics_unset -notcontains "IZARRAVM_POLL_SKIP_DIAG" -or
+        $pollSummary.execution.diagnostics_unset -notcontains "IZARRAVM_UNIT_SIM" -or
         $pollSummary.acceptance.ips_is_diagnostic_only -ne $true) {
         throw "The POLL-SKIP top-level proof summary is incomplete."
     }
