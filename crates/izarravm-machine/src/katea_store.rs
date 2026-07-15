@@ -377,6 +377,12 @@ impl SectorStore {
         self.fail_reads = true;
     }
 
+    /// End test fault injection so a reconcile retry can read the spill again.
+    #[cfg(test)]
+    pub(crate) fn restore_spill_reads(&mut self) {
+        self.fail_reads = false;
+    }
+
     /// Write the least recently written sector out to the spill and drop it from
     /// RAM. Returns false when nothing was evicted, which also ends the caller's
     /// loop.

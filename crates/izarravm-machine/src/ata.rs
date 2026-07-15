@@ -834,7 +834,7 @@ impl AtaDisk {
             }
         }
         if let Backing::HostFolder(volume) = &mut self.backing {
-            volume.reconcile();
+            volume.reconcile_after_write();
         }
         self.last_access_bytes = data.len();
         self.advance_dma_task_file(request);
@@ -904,7 +904,7 @@ impl AtaDisk {
             self.status = status::DRDY | status::DSC;
             self.error = 0;
             if let Backing::HostFolder(volume) = &mut self.backing {
-                volume.reconcile();
+                volume.reconcile_after_write();
             }
             self.raise_irq();
         }

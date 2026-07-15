@@ -73,6 +73,38 @@ fn stamp_file(
     first + nclu
 }
 
+/// Rewrite a one-cluster file in place and update its existing directory entry.
+/// This models successive guest write commands without creating duplicate names.
+#[cfg(test)]
+fn rewrite_single_cluster_file(
+    vol: &mut KateaTreeVolume,
+    dir_cluster: u32,
+    name: &str,
+    first: u32,
+    data: &[u8],
+) {
+    let cluster_bytes = usize::from(vol.geo.spc) * SECTOR;
+    assert!(data.len() <= cluster_bytes);
+    for (sector, bytes) in data.chunks(SECTOR).enumerate() {
+        let mut out = [0u8; SECTOR];
+        out[..bytes.len()].copy_from_slice(bytes);
+        vol.write_sector(vol.cluster_to_lba(first) + sector as u32, &out);
+    }
+
+    let mut name83 = [b' '; 11];
+    let (base, ext) = name.split_once('.').unwrap_or((name, ""));
+    name83[..base.len()].copy_from_slice(base.as_bytes());
+    name83[8..8 + ext.len()].copy_from_slice(ext.as_bytes());
+    let dir_lba = vol.cluster_to_lba(dir_cluster);
+    let mut directory = vol.read_sector(dir_lba);
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| directory[offset..offset + 11] == name83)
+        .expect("existing file entry");
+    directory[slot + 28..slot + 32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    vol.write_sector(dir_lba, &directory);
+}
+
 #[cfg(test)]
 fn fresh_vol(tag: &str) -> (KateaTreeVolume, std::path::PathBuf) {
     let root = scratch(tag);
@@ -182,6 +214,80 @@ fn reconcile_grows_a_file() {
     assert_eq!(
         std::fs::read(root.join("GROW.TXT")).unwrap(),
         b"line1\r\nline2\r\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn after_write_defers_a_growing_file_until_the_final_reconcile() {
+    let (mut vol, root) = fresh_vol("rec_grow_deferred");
+    let first = vol.next_free + 1000;
+    let initial = vec![0x11; 32];
+    stamp_file(&mut vol, 2, "GROW.BIN", 0x20, first, &initial);
+    vol.reconcile_after_write();
+
+    assert_eq!(std::fs::read(root.join("GROW.BIN")).unwrap(), initial);
+    let first_gathers = vol.gathers();
+    let first_gathered_bytes = vol.gathered_bytes();
+    let first_writes = vol.atomic_writes();
+    let first_write_bytes = vol.atomic_write_bytes();
+    assert_eq!(first_gathers, 1, "the first shape is mirrored immediately");
+    assert_eq!(first_writes, 1, "the first shape is written immediately");
+
+    let mut final_payload = Vec::new();
+    for step in 1..=6u8 {
+        final_payload = vec![step; 32 + usize::from(step) * 64];
+        rewrite_single_cluster_file(&mut vol, 2, "GROW.BIN", first, &final_payload);
+        vol.reconcile_after_write();
+
+        // Real DOS traffic interleaves data with metadata and unrelated commands.
+        // None of those AfterWrite passes proves that GROW.BIN is finished.
+        let fsinfo_lba = vol.geo.part_start + u32::from(FSINFO_SECTOR);
+        let fsinfo = vol.read_sector(fsinfo_lba);
+        vol.write_sector(fsinfo_lba, &fsinfo);
+        vol.reconcile_after_write();
+        let unrelated_lba = vol.cluster_to_lba(first + 5000 + u32::from(step));
+        vol.write_sector(unrelated_lba, &[step; SECTOR]);
+        vol.reconcile_after_write();
+    }
+
+    assert_eq!(
+        vol.gathers(),
+        first_gathers,
+        "growth must not re-gather prefixes"
+    );
+    assert_eq!(
+        vol.gathered_bytes(),
+        first_gathered_bytes,
+        "growth must add no gathered bytes"
+    );
+    assert_eq!(
+        vol.atomic_writes(),
+        first_writes,
+        "growth must not rewrite prefixes"
+    );
+    assert_eq!(
+        vol.atomic_write_bytes(),
+        first_write_bytes,
+        "growth must add no materialized bytes"
+    );
+    assert_eq!(
+        std::fs::read(root.join("GROW.BIN")).unwrap(),
+        initial,
+        "the host keeps the last completed shape until flush"
+    );
+
+    vol.reconcile();
+    assert_eq!(std::fs::read(root.join("GROW.BIN")).unwrap(), final_payload);
+    assert_eq!(vol.gathers(), first_gathers + 1);
+    assert_eq!(
+        vol.gathered_bytes(),
+        first_gathered_bytes + final_payload.len() as u64
+    );
+    assert_eq!(vol.atomic_writes(), first_writes + 1);
+    assert_eq!(
+        vol.atomic_write_bytes(),
+        first_write_bytes + final_payload.len() as u64
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1449,6 +1555,19 @@ fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
         payload,
         "a file whose data cannot be read back must be held, never materialized \
          from the zeros that a failed read returns"
+    );
+
+    // The failed final pass records this exact file state for retry. Once the spill
+    // recovers, even an inline AfterWrite pass retries it immediately rather than
+    // treating it as ordinary in-progress growth.
+    vol.store.restore_spill_reads();
+    vol.reconcile_after_write();
+    let mut recovered = vec![0xEE; SECTOR];
+    recovered.extend_from_slice(&payload[SECTOR..]);
+    assert_eq!(
+        std::fs::read(root.join("DATA.BIN")).unwrap(),
+        recovered,
+        "the exact failed state must be retried on the next pass"
     );
     std::fs::remove_dir_all(&root).ok();
 }
