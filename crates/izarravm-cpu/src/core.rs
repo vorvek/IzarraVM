@@ -287,9 +287,16 @@ impl CpuGsw {
             sim.note_code_write(physical, width);
         }
         let mut invalidated = false;
+        // G1: heat is incremented only on a byte-precise ACTUAL invalidation (a killed compiled
+        // block or a narrow decode kill), never on the coarse global-flush fallback and never when
+        // the write hit no code. That precision dissolves the 16-byte false-demotion concern: a
+        // data byte sharing a chunk with cold code kills nothing, so it never heats the chunk.
+        let mut heat_hit = false;
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
-            invalidated = self.jit_direct.invalidate_physical_range(physical, width) != 0;
+            let killed = self.jit_direct.invalidate_physical_range(physical, width);
+            invalidated = killed != 0;
+            heat_hit |= killed != 0;
         }
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
@@ -319,6 +326,7 @@ impl CpuGsw {
                     self.perf.smc_narrow_kills += u64::from(kills);
                     if kills > 0 {
                         self.perf.code_invalidations += 1;
+                        heat_hit = true;
                     }
                     // A kill inside an installed region's physical span stales its slot table
                     // even though the entry line's stamp may survive; bump the epoch so entry
@@ -340,7 +348,24 @@ impl CpuGsw {
             // The fetch-page snapshot may hold the written bytes under either outcome.
             self.fetch_page.invalidate();
         }
+        #[cfg(feature = "jit")]
+        if heat_hit {
+            let epoch = self.smc_heat_epoch();
+            let newly_hot = self.jit_direct.smc_heat_bump(physical, width, epoch);
+            self.perf.smc_heat_chunks_hot += u64::from(newly_hot);
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = heat_hit;
         invalidated
+    }
+
+    /// G1 heat epoch: the retired-instruction megacount. Both the invalidation choke (which bumps
+    /// heat) and the admission gate (which reads it) derive the epoch from this one clock, so a
+    /// chunk's churn count is only live within the ~1M-instruction window it accrued in.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(super) fn smc_heat_epoch(&self) -> u32 {
+        (self.perf.instructions >> jit::direct::SMC_HEAT_EPOCH_SHIFT) as u32
     }
 
     pub(super) fn begin_instruction(&mut self) {

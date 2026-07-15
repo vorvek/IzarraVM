@@ -860,6 +860,17 @@ impl CpuGsw {
                 .block(id)
                 .expect("ready direct block must remain live"),
             jit::direct::BlockProbe::Compile => {
+                // G1 pre-compile gate (cheap, entry chunk only): if the block's first 16-byte
+                // chunk is churning this heat epoch, park it Dormant and interpret without paying a
+                // compile. Dormant (not Rejected) because Rejected would acquire watch ranges and
+                // keep the demoted page alive; existing valid blocks keep running and links only
+                // form to installed blocks, so a demoted region starves naturally.
+                let heat_epoch = self.smc_heat_epoch();
+                if self.jit_direct.smc_heat_chunk_hot(key.physical, heat_epoch) {
+                    self.jit_direct.dormant(key);
+                    self.perf.smc_heat_demotions += 1;
+                    return Ok(DirectContinuation::Interpret);
+                }
                 let compile_start = std::time::Instant::now();
                 let outcome = jit::direct::compile(self, lin, d);
                 self.perf.jit_direct_compile_attempts += 1;
@@ -886,6 +897,18 @@ impl CpuGsw {
                 });
                 if !code_page_covers_block {
                     self.jit_direct.dormant(key);
+                    return Ok(DirectContinuation::Interpret);
+                }
+                // G1 pre-install gate (full span): the compiled block may cover chunks past its
+                // entry that are churning even when the entry chunk is cold. Refuse installation
+                // and park it Dormant so the whole span runs on the interpreter.
+                if self.jit_direct.smc_heat_span_hot(
+                    key.physical,
+                    u32::from(compilation.span.guest_len),
+                    heat_epoch,
+                ) {
+                    self.jit_direct.dormant(key);
+                    self.perf.smc_heat_demotions += 1;
                     return Ok(DirectContinuation::Interpret);
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {

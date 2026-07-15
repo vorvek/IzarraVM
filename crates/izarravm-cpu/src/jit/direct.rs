@@ -68,6 +68,8 @@ const DEFAULT_ADMISSION_HEAT: u8 = 8;
 #[cfg(test)]
 const DEFAULT_ADMISSION_HEAT: u8 = 1;
 
+pub(crate) use super::smc_heat::{SMC_HEAT_EPOCH_SHIFT, SMC_HEAT_THRESHOLD, SmcHeatMap};
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct LinkTarget {
     linear: u32,
@@ -548,6 +550,9 @@ pub(crate) struct BlockCache {
     backend_enabled: bool,
     auto_admit: bool,
     admission_heat: u8,
+    /// G1 SMC heat (super::smc_heat): kept out of the refcounted watch pages; cleared ONLY on reset.
+    smc_heat: SmcHeatMap,
+    smc_heat_threshold: u8,
     stats: BlockCacheStats,
     code_watch: Box<NativeCodeWatch>,
     #[cfg(test)]
@@ -612,6 +617,8 @@ impl BlockCache {
             backend_enabled: super::host_supported(),
             auto_admit: false,
             admission_heat: DEFAULT_ADMISSION_HEAT,
+            smc_heat: SmcHeatMap::default(),
+            smc_heat_threshold: SMC_HEAT_THRESHOLD,
             stats: BlockCacheStats::default(),
             code_watch: Box::default(),
             #[cfg(test)]
@@ -844,6 +851,29 @@ impl BlockCache {
         }
     }
 
+    /// G1: record `width` bytes of code invalidation at `physical` for `epoch` (the choke calls
+    /// this ONLY on an actual kill). Returns chunks that newly crossed the demotion threshold.
+    pub(crate) fn smc_heat_bump(&mut self, physical: u32, width: u32, epoch: u32) -> u32 {
+        self.smc_heat
+            .bump(physical, width, epoch, self.smc_heat_threshold)
+    }
+
+    /// G1 cheap pre-compile gate: is the entry chunk at `physical` hot this epoch?
+    pub(crate) fn smc_heat_chunk_hot(&self, physical: u32, epoch: u32) -> bool {
+        self.smc_heat.effective(physical, epoch) >= self.smc_heat_threshold
+    }
+
+    /// G1 full-span gate: does any chunk under `[physical, physical+len)` read hot this epoch?
+    pub(crate) fn smc_heat_span_hot(&self, physical: u32, len: u32, epoch: u32) -> bool {
+        self.smc_heat
+            .span_hot(physical, len, epoch, self.smc_heat_threshold)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_smc_heat_threshold(&mut self, threshold: u8) {
+        self.smc_heat_threshold = threshold;
+    }
+
     /// Retire one descriptor-specialized block while keeping its key in the observed state. The
     /// current encounter falls back to the interpreter; the next encounter recompiles directly
     /// for the then-current segment layout instead of paying another first-seen pass.
@@ -868,6 +898,8 @@ impl BlockCache {
             if self.code_watch.has_resident_pages() {
                 self.code_watch.clear();
             }
+            // A full clear is the only place heat is dropped (cheap no-op when already empty).
+            self.smc_heat.clear();
             self.disabled = false;
             return;
         }
@@ -1354,6 +1386,7 @@ impl BlockCache {
         }
         self.block_link_epochs.clear();
         self.code_watch.clear();
+        self.smc_heat.clear();
         self.block_active.clear();
         self.free_block_slots.clear();
         self.live_blocks = 0;
@@ -2636,6 +2669,8 @@ fn compile_with_instruction_limit(
         // Quake's 586 renderer benefits from native word operations. Doom's 486 self-patching
         // renderer recompiles the wider blocks often enough to lose throughput, so keep word
         // instructions as precise interpreter barriers in that mode.
+        // Follow-up (dev_docs/specs/2026-07-15-smc-hardening-design.md, G1): with heat demotion
+        // landed, A/B re-enabling 486 word ops - heat should now bound the churn this defends.
         if insn.operand_size == OperandSize::Word && cpu.persona() != CpuPersona::I586 {
             stop = structural_span.map_or(CompileStop::Retry, CompileStop::Structural);
             break;

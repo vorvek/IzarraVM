@@ -537,3 +537,115 @@ fn device_write_recovers_rejection_after_decode_eviction() {
         jit::direct::BlockProbe::Interpret
     ));
 }
+
+// ---- G1 SMC heat demotion gate ----
+
+#[test]
+fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    // Heat the entry 16-byte chunk past the churn threshold within epoch 0.
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat_bump(ENTRY, 1, 0);
+    }
+    let attempts = cpu.perf_counters().jit_direct_compile_attempts;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    let demotions = cpu.perf_counters().smc_heat_demotions;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    // The cheap entry-chunk gate refuses admission before a compile is even attempted.
+    assert_eq!(
+        cpu.perf_counters().jit_direct_compile_attempts,
+        attempts,
+        "no compile should be paid"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed,
+        "the block must not install"
+    );
+    assert!(cpu.perf_counters().smc_heat_demotions > demotions);
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+}
+
+#[test]
+fn smc_heat_pre_install_gate_demotes_a_hot_span_after_compiling() {
+    let code: Vec<u8> = std::iter::repeat_n(0x40u8, 20).chain([0xf4]).collect();
+    let addresses: Vec<u32> = (ENTRY..ENTRY + code.len() as u32).collect();
+    // Learn the compiled span so the assertion below is self-checking.
+    let (mut probe_cpu, mut probe_bus) = fixture(&code);
+    warm(&mut probe_cpu, &mut probe_bus, &addresses);
+    let span_len = compiled(jit::direct::compile(&mut probe_cpu, ENTRY, true))
+        .span
+        .guest_len;
+    assert!(
+        span_len > 16,
+        "block must cross into the second 16-byte chunk (len={span_len})"
+    );
+
+    let (mut cpu, mut bus) = fixture(&code);
+    warm(&mut cpu, &mut bus, &addresses);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    // Heat a chunk inside the span but NOT the entry chunk: the cheap pre-compile gate passes and
+    // the full-span gate after compilation must catch it before install.
+    let far = ENTRY + 16;
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat_bump(far, 1, 0);
+    }
+    assert!(
+        !cpu.jit_direct.smc_heat_chunk_hot(ENTRY, 0),
+        "entry chunk stays cold"
+    );
+    let attempts = cpu.perf_counters().jit_direct_compile_attempts;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    let demotions = cpu.perf_counters().smc_heat_demotions;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert!(
+        cpu.perf_counters().jit_direct_compile_attempts > attempts,
+        "the block compiles (this is the post-compile gate)"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed,
+        "the block must not install"
+    );
+    assert!(cpu.perf_counters().smc_heat_demotions > demotions);
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+}
+
+#[test]
+fn smc_heat_demotion_lifts_once_the_epoch_advances() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat_bump(ENTRY, 1, 0);
+    }
+    // Advance retired instructions past one heat epoch: the gate now reads a fresh (zero) epoch, so
+    // the stale count no longer demotes and admission proceeds.
+    cpu.perf.instructions = 1u64 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed + 1,
+        "a fresh epoch re-enables admission"
+    );
+}
