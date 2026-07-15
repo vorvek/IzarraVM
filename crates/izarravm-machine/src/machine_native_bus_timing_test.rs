@@ -3,6 +3,733 @@
 
 use super::*;
 
+#[cfg(feature = "jit")]
+fn poll_skip_test_machine(enabled: bool, tracing: TracingMode, mode: GswMode, mask: u8) -> Machine {
+    let program = [
+        0xba, 0xda, 0x03, // mov dx,3DAh
+        0xec, 0xa8, mask, 0x75, 0xfb, // wait while the status bit is set
+        0xec, 0xa8, mask, 0x74, 0xfb, // wait until the status bit is set
+        0xeb, 0xf4, // repeat both phases
+    ];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = mode;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    machine.cpu.registers.set_edx(0x03da);
+    machine.cpu.registers.eip = 0x103;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = enabled;
+    machine.trace.set_tracing_mode(tracing);
+    machine
+}
+
+#[cfg(feature = "jit")]
+fn assert_poll_machine_boundary_eq(skipped: &Machine, baseline: &Machine) {
+    // `core_clocks_so_far` is public-run scratch. The next run resets it before
+    // executing its first instruction, and the production path deliberately no
+    // longer canonicalizes it on return. Compare the architectural and persistent
+    // timing fields directly so this boundary assertion does not turn that scratch
+    // partition into production behavior.
+    assert_eq!(skipped.cpu.registers, baseline.cpu.registers);
+    assert_eq!(skipped.cpu.fpu, baseline.cpu.fpu);
+    assert_eq!(skipped.cpu.control, baseline.cpu.control);
+    assert_eq!(skipped.cpu.msr, baseline.cpu.msr);
+    assert_eq!(skipped.cpu.gdtr, baseline.cpu.gdtr);
+    assert_eq!(skipped.cpu.idtr, baseline.cpu.idtr);
+    assert_eq!(skipped.cpu.ldtr, baseline.cpu.ldtr);
+    assert_eq!(skipped.cpu.tr, baseline.cpu.tr);
+    assert_eq!(skipped.cpu.elapsed_clocks, baseline.cpu.elapsed_clocks);
+    assert_eq!(skipped.cpu.halted, baseline.cpu.halted);
+    assert_eq!(
+        skipped.cpu.poll_skip_timing_remainder(),
+        baseline.cpu.poll_skip_timing_remainder()
+    );
+    assert_eq!(skipped.timeline, baseline.timeline);
+    assert_eq!(skipped.bus_rem, baseline.bus_rem);
+    assert_eq!(skipped.elapsed_clocks, baseline.elapsed_clocks);
+    assert_eq!(
+        skipped.trace.elapsed_clocks(),
+        baseline.trace.elapsed_clocks()
+    );
+    assert_eq!(skipped.vega.beam_dots(), baseline.vega.beam_dots());
+    assert_eq!(
+        skipped.vega.frame_sequence(),
+        baseline.vega.frame_sequence()
+    );
+    let beam = skipped.vega.beam_dots();
+    assert_eq!(
+        skipped.vega.status1_bits(beam),
+        baseline.vega.status1_bits(beam)
+    );
+    assert_eq!(skipped.pit, baseline.pit);
+    assert_eq!(skipped.pic, baseline.pic);
+    assert_eq!(skipped.serial, baseline.serial);
+    assert_eq!(skipped.serial2, baseline.serial2);
+    assert_eq!(skipped.lpt, baseline.lpt);
+    assert_eq!(skipped.lpt2, baseline.lpt2);
+    assert_eq!(skipped.keyboard, baseline.keyboard);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for mask in [0x01, 0x08] {
+            let mut baseline = poll_skip_test_machine(false, TracingMode::Off, mode, mask);
+            let mut skipped = poll_skip_test_machine(true, TracingMode::Off, mode, mask);
+
+            skipped.poll_skip_enabled = false;
+            baseline.run_cycles(1_000).unwrap();
+            skipped.run_cycles(1_000).unwrap();
+            assert_eq!(skipped.cpu, baseline.cpu);
+            for machine in [&mut baseline, &mut skipped] {
+                machine.cpu.registers.eip = 0x108;
+                machine.cpu.poll_skip_backedge_housekeeping();
+                let poll = machine.cpu.poll_loop().expect("warm direct poll loop");
+                for _ in 0..2 {
+                    machine
+                        .cpu
+                        .commit_poll_skip_core(poll, 1)
+                        .expect("one iteration advances the CPU timing remainder");
+                    if machine.cpu.poll_skip_timing_remainder() != 0 {
+                        break;
+                    }
+                }
+                machine.cpu.reset_perf_counters();
+                machine.bus_rem = 2;
+                assert_ne!(machine.cpu.poll_skip_timing_remainder(), 0);
+                assert_ne!(machine.bus_rem, 0);
+            }
+            skipped.poll_skip_enabled = true;
+
+            let baseline_stop = baseline.run_cycles(100_000).unwrap();
+            let skipped_stop = skipped.run_cycles(100_000).unwrap();
+            assert_eq!(
+                skipped_stop, baseline_stop,
+                "mode={mode:?} mask={mask:#04x}"
+            );
+            assert!(
+                skipped.cpu.perf_counters().poll_skip_spans > 0,
+                "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={:?}",
+                skipped.cpu.registers.eip,
+                skipped.cpu.linear_eip(),
+                skipped.cpu.registers.edx() as u16,
+                skipped.cpu.poll_skip_eligible(),
+                skipped.cpu.poll_loop()
+            );
+            assert!(skipped.cpu.perf_counters().poll_skip_iterations > 1);
+            assert!(
+                skipped.cpu.perf_counters().instructions
+                    < baseline.cpu.perf_counters().instructions
+            );
+            assert_poll_machine_boundary_eq(&skipped, &baseline);
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_declines_when_bus_tracing_is_active() {
+    for tracing in [TracingMode::Counts, TracingMode::Full] {
+        let mut baseline = poll_skip_test_machine(false, tracing, GswMode::Gsw586, 0x08);
+        let mut skipped = poll_skip_test_machine(false, tracing, GswMode::Gsw586, 0x08);
+        baseline.run_cycles(1_000).unwrap();
+        skipped.run_cycles(1_000).unwrap();
+        for machine in [&mut baseline, &mut skipped] {
+            machine.cpu.registers.eip = 0x108;
+            machine.cpu.poll_skip_backedge_housekeeping();
+            machine.cpu.reset_perf_counters();
+        }
+        skipped.poll_skip_enabled = true;
+        let baseline_stop = baseline.run_cycles(20_000).unwrap();
+        let skipped_stop = skipped.run_cycles(20_000).unwrap();
+        assert_eq!(skipped_stop, baseline_stop);
+        assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+        assert_eq!(
+            skipped.cpu.perf_counters().instructions,
+            baseline.cpu.perf_counters().instructions
+        );
+        assert_poll_machine_boundary_eq(&skipped, &baseline);
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_bus_certificate_rejects_instruction_fetches_from_a_device_window() {
+    const BASE: u32 = 0x000a_0000;
+    const CODE: &[u8] = &[0xec, 0xa8, 0x08, 0x74, 0xfb];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &[0xf4]).unwrap();
+    assert!(machine.set_vga_mode(0x13));
+    for (offset, byte) in CODE.iter().copied().enumerate() {
+        machine.write_physical_u8(BASE + offset as u32, byte);
+    }
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        let mut cs = SegmentRegister::real(0xa000);
+        cs.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        cpu.registers.set_edx(0x03da);
+        cpu.set_native_backend_enabled(false);
+        for offset in [0, 1, 3] {
+            cpu.registers.eip = offset;
+            cpu.poll_skip_backedge_housekeeping();
+            cpu.run_budgeted(bus, 0)
+                .expect("decode poll from VGA aperture");
+        }
+        cpu.registers.set_edx(0x03da);
+        cpu.registers.eip = 0;
+        cpu.poll_skip_backedge_housekeeping();
+        let poll = cpu.poll_loop().expect("device-backed shape is structural");
+        assert!(
+            bus.poll_bus_certificate(poll).is_none(),
+            "device-backed instruction fetches cannot be aggregated"
+        );
+    });
+}
+
+#[cfg(feature = "jit")]
+fn setup_poll_machine(enabled: bool, ecx: bool, paired: bool, source: u32) -> Machine {
+    setup_poll_machine_case(enabled, ecx, paired, source, GswMode::Gsw586, 0x08, !paired)
+}
+
+#[cfg(feature = "jit")]
+fn setup_poll_machine_case(
+    enabled: bool,
+    ecx: bool,
+    paired: bool,
+    source: u32,
+    mode: GswMode,
+    mask: u8,
+    jz: bool,
+) -> Machine {
+    let mut program = Vec::new();
+    program.push(if ecx { 0xb9 } else { 0xbb });
+    program.extend_from_slice(&source.to_le_bytes());
+    program.push(0xb8);
+    program.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+    program.push(0xf9); // stc: prove the loop's TEST flags replace incoming flags
+    program.extend_from_slice(&[
+        0x89,
+        if ecx { 0xca } else { 0xda },
+        0x29,
+        0xc0,
+        0xec,
+        0xa8,
+        mask,
+        if jz { 0x74 } else { 0x75 },
+        if paired { 0x02 } else { 0xf7 },
+    ]);
+    if paired {
+        program.extend_from_slice(&[0xeb, 0xf5]);
+    }
+    program.push(0xf4);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = mode;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = enabled;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    machine
+}
+
+#[cfg(feature = "jit")]
+fn with_cpu_and_bus<R>(
+    machine: &mut Machine,
+    f: impl FnOnce(&mut CpuGsw, &mut MachineBus<'_>) -> R,
+) -> R {
+    let mut cpu = std::mem::take(&mut machine.cpu);
+    let result = with_bus(machine, |bus| f(&mut cpu, bus));
+    machine.cpu = cpu;
+    result
+}
+
+#[cfg(feature = "jit")]
+fn move_beam_to(machine: &mut Machine, target: u64) {
+    let frame = machine.vega.frame_dots();
+    assert_ne!(frame, 0);
+    let current = machine.vega.beam_dots();
+    let advance = (target + frame - current) % frame;
+    machine.vega.advance(0, 0, 0, advance);
+    assert_eq!(machine.vega.beam_dots(), target % frame);
+}
+
+#[cfg(feature = "jit")]
+fn set_status1_bit(machine: &mut Machine, mask: u8, target: bool) {
+    let bit = mask.trailing_zeros() as u8;
+    let beam = machine.vega.beam_dots();
+    let current = machine.vega.status1_bits(beam) & mask != 0;
+    if current != target {
+        let dots = machine
+            .vega
+            .dots_until_status1_bit_change_from(beam, bit, target)
+            .expect("status bit has a geometric edge");
+        machine.vega.advance(0, 0, 0, dots);
+    }
+    let beam = machine.vega.beam_dots();
+    assert_eq!(machine.vega.status1_bits(beam) & mask != 0, target);
+}
+
+#[cfg(feature = "jit")]
+fn prepare_setup_poll_head(
+    machine: &mut Machine,
+    ecx: bool,
+    paired: bool,
+    source: u32,
+    mask: u8,
+    jz: bool,
+) {
+    const HEAD: u32 = 0x10b;
+    let starts: &[u32] = if paired {
+        &[0, 2, 4, 5, 7, 9]
+    } else {
+        &[0, 2, 4, 5, 7]
+    };
+    with_cpu_and_bus(machine, |cpu, bus| {
+        let initial_eflags = cpu.registers.eflags | 1;
+        cpu.registers.set_eax(0xdead_beef);
+        cpu.registers
+            .set_ebx(if ecx { 0xaaaa_1234 } else { source });
+        cpu.registers
+            .set_ecx(if ecx { source } else { 0xbbbb_5678 });
+        cpu.registers.set_edx(0xcccc_9abc);
+        cpu.registers.eflags = initial_eflags;
+        for offset in starts {
+            if *offset == 4 {
+                cpu.registers.set_edx(0x03da);
+            }
+            cpu.registers.eip = HEAD + offset;
+            cpu.poll_skip_backedge_housekeeping();
+            cpu.run_budgeted(bus, 0)
+                .expect("warm exact setup poll phase");
+        }
+        cpu.registers.set_eax(0xdead_beef);
+        cpu.registers
+            .set_ebx(if ecx { 0xaaaa_1234 } else { source });
+        cpu.registers
+            .set_ecx(if ecx { source } else { 0xbbbb_5678 });
+        cpu.registers.set_edx(0xcccc_9abc);
+        cpu.registers.eflags = initial_eflags;
+        cpu.registers.eip = HEAD;
+        cpu.poll_skip_backedge_housekeeping();
+        assert!(cpu.poll_loop().is_some());
+        cpu.reset_perf_counters();
+    });
+    set_status1_bit(machine, mask, jz == paired);
+}
+
+#[cfg(feature = "jit")]
+fn projected_poll_total(machine: &mut Machine, iterations: u64, batch_core: u32) -> u64 {
+    with_cpu_and_bus(machine, |cpu, bus| {
+        let poll = cpu.poll_loop().expect("warm poll descriptor");
+        let certificate = bus
+            .poll_bus_certificate(poll)
+            .expect("RAM poll bus certificate");
+        let core = cpu
+            .project_poll_skip_core(poll, iterations)
+            .expect("poll core projection");
+        let scaled_bus = bus
+            .poll_project_scaled_bus_clocks(certificate, iterations)
+            .expect("poll bus projection");
+        u64::from(batch_core) + core + scaled_bus
+    })
+}
+
+#[cfg(feature = "jit")]
+fn projected_poll_dots(machine: &mut Machine, iterations: u64, batch_core: u32) -> u64 {
+    with_cpu_and_bus(machine, |cpu, bus| {
+        let poll = cpu.poll_loop().expect("warm poll descriptor");
+        let certificate = bus
+            .poll_bus_certificate(poll)
+            .expect("RAM poll bus certificate");
+        let core = cpu
+            .project_poll_skip_core(poll, iterations)
+            .expect("poll core projection");
+        let scaled_bus = bus
+            .poll_project_scaled_bus_clocks(certificate, iterations)
+            .expect("poll bus projection");
+        bus.poll_project_dot_advance(u64::from(batch_core) + core + scaled_bus)
+            .expect("poll dot projection")
+    })
+}
+
+#[cfg(feature = "jit")]
+fn attempt_poll_skip(machine: &mut Machine, batch_core: u32, cap: u64) -> Option<u32> {
+    let mut diagnostics = run::PollSkipDiagnostics::default();
+    with_cpu_and_bus(machine, |cpu, bus| {
+        bus.prior_runs_core_clocks = u64::from(batch_core);
+        bus.core_clocks_so_far = 0;
+        run::try_poll_skip(cpu, bus, &mut diagnostics, batch_core, cap)
+    })
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn setup_direct_and_paired_poll_skip_preserve_full_registers_flags_and_boundaries() {
+    let cases = [
+        (GswMode::Gsw486, false, false, 0x01, true),
+        (GswMode::Gsw486, false, false, 0x08, false),
+        (GswMode::Gsw486, false, true, 0x01, true),
+        (GswMode::Gsw486, false, true, 0x08, false),
+        (GswMode::Gsw586, true, false, 0x08, true),
+        (GswMode::Gsw586, true, false, 0x01, false),
+        (GswMode::Gsw586, true, true, 0x08, true),
+        (GswMode::Gsw586, true, true, 0x01, false),
+    ];
+    for (mode, ecx, paired, mask, jz) in cases {
+        let source = if ecx { 0x5678_03da } else { 0x1234_03da };
+        let mut baseline = setup_poll_machine_case(false, ecx, paired, source, mode, mask, jz);
+        let mut skipped = setup_poll_machine_case(true, ecx, paired, source, mode, mask, jz);
+        prepare_setup_poll_head(&mut baseline, ecx, paired, source, mask, jz);
+        prepare_setup_poll_head(&mut skipped, ecx, paired, source, mask, jz);
+
+        let mut halted = false;
+        for boundary in 0..128 {
+            let baseline_stop = baseline.run_cycles(100_000).unwrap();
+            let skipped_stop = skipped.run_cycles(100_000).unwrap();
+            assert_eq!(
+                skipped_stop, baseline_stop,
+                "mode={mode:?} ecx={ecx} paired={paired} mask={mask:#04x} jz={jz} boundary={boundary}"
+            );
+            assert_poll_machine_boundary_eq(&skipped, &baseline);
+            if baseline_stop == StopReason::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(
+            halted,
+            "poll did not reach its edge: mode={mode:?} ecx={ecx} paired={paired} mask={mask:#04x} jz={jz}"
+        );
+        assert!(
+            skipped.cpu.perf_counters().poll_skip_spans > 0,
+            "mode={mode:?} ecx={ecx} paired={paired} mask={mask:#04x} jz={jz}"
+        );
+        assert!(
+            skipped.cpu.perf_counters().instructions < baseline.cpu.perf_counters().instructions,
+            "bulk span did not replace real iterations"
+        );
+        assert_eq!(skipped.cpu.registers.edx(), source);
+        assert_eq!(skipped.cpu.registers.eax() & !0xff, 0);
+        assert_eq!(skipped.cpu.eflags(), baseline.cpu.eflags());
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn setup_poll_source_mismatch_and_tiny_cap_never_bulk_charge_prefix_state() {
+    let mut baseline = setup_poll_machine(false, false, true, 0x1234_1234);
+    let mut skipped = setup_poll_machine(true, false, true, 0x1234_1234);
+    prepare_setup_poll_head(&mut baseline, false, true, 0x1234_1234, 0x08, false);
+    prepare_setup_poll_head(&mut skipped, false, true, 0x1234_1234, 0x08, false);
+    baseline.cpu.registers.set_edx(0xaaaa_03da);
+    skipped.cpu.registers.set_edx(0xaaaa_03da);
+    let baseline_stop = baseline.run_cycles(50_000).unwrap();
+    let skipped_stop = skipped.run_cycles(50_000).unwrap();
+    assert_eq!(skipped_stop, baseline_stop);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_iterations, 0);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+
+    let mut baseline = setup_poll_machine(false, false, false, 0x1234_03da);
+    let mut skipped = setup_poll_machine(true, false, false, 0x1234_03da);
+    skipped.poll_skip_enabled = false;
+    baseline.run_cycles(1_000).unwrap();
+    skipped.run_cycles(1_000).unwrap();
+    skipped.poll_skip_enabled = true;
+    baseline.cpu.reset_perf_counters();
+    skipped.cpu.reset_perf_counters();
+    let baseline_stop = baseline.run_cycles(1).unwrap();
+    let skipped_stop = skipped.run_cycles(1).unwrap();
+    assert_eq!(skipped_stop, baseline_stop);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_reserves_k_plus_one_at_the_exact_cap_with_fractional_carries() {
+    const BATCH_CORE: u32 = 7;
+    const K: u64 = 2;
+    for at_cap in [false, true] {
+        let mut machine =
+            setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+        prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+        machine.bus_rem = 2;
+        with_cpu_and_bus(&mut machine, |cpu, _| {
+            let poll = cpu.poll_loop().expect("warm direct setup poll");
+            cpu.commit_poll_skip_core(poll, 1)
+                .expect("seed nonzero CPU timing carry");
+            assert_ne!(cpu.poll_skip_timing_remainder(), 0);
+            cpu.reset_perf_counters();
+        });
+        assert_ne!(machine.bus_rem, 0);
+
+        let exact_cap = projected_poll_total(&mut machine, K + 1, BATCH_CORE);
+        let cap = if at_cap { exact_cap } else { exact_cap - 1 };
+        let charged = attempt_poll_skip(&mut machine, BATCH_CORE, cap);
+        if at_cap {
+            assert!(charged.is_some(), "K+1 reservation must fit at equality");
+            assert_eq!(machine.cpu.perf_counters().poll_skip_spans, 1);
+            assert_eq!(machine.cpu.perf_counters().poll_skip_iterations, K);
+        } else {
+            assert!(charged.is_none(), "K+1 reservation crossed the cap");
+            assert_eq!(machine.cpu.perf_counters().poll_skip_spans, 0);
+            assert_eq!(machine.cpu.perf_counters().poll_skip_iterations, 0);
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_edge_is_strict_and_the_reserved_final_iteration_runs_real() {
+    const K: u64 = 2;
+    fn edge_machine() -> Machine {
+        let mut machine =
+            setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+        prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+        move_beam_to(&mut machine, 0);
+        machine
+    }
+
+    let mut exact = edge_machine();
+    let candidate_dots = projected_poll_dots(&mut exact, K, 0);
+    let edge = exact
+        .vega
+        .dots_until_status1_bit_change_from(0, 3, true)
+        .expect("vertical retrace start");
+    assert!(edge > candidate_dots + 1);
+    let cap = projected_poll_total(&mut exact, K + 1, 0);
+    move_beam_to(&mut exact, edge - candidate_dots);
+    assert!(attempt_poll_skip(&mut exact, 0, cap).is_none());
+    assert_eq!(exact.cpu.perf_counters().poll_skip_iterations, 0);
+
+    let mut after = edge_machine();
+    let cap = projected_poll_total(&mut after, K + 1, 0);
+    move_beam_to(&mut after, edge - candidate_dots - 1);
+    let mut diagnostics = run::PollSkipDiagnostics::default();
+    let (charged, retired, final_eip) = with_cpu_and_bus(&mut after, |cpu, bus| {
+        bus.prior_runs_core_clocks = 0;
+        bus.core_clocks_so_far = 0;
+        let poll = cpu.poll_loop().expect("warm poll before bulk commit");
+        let certificate = bus
+            .poll_bus_certificate(poll)
+            .expect("RAM poll certificate before bulk commit");
+        let charged = run::try_poll_skip(cpu, bus, &mut diagnostics, 0, cap)
+            .expect("edge one dot after the bulk boundary admits K");
+        assert_eq!(cpu.perf_counters().poll_skip_iterations, K);
+
+        let mut batch_core = charged;
+        let before = cpu.perf_counters().instructions;
+        for _ in 0..6 {
+            let spent_bus = bus
+                .poll_project_scaled_bus_clocks(certificate, 0)
+                .expect("committed bus projection");
+            let spent = u64::from(batch_core) + spent_bus;
+            let remaining = cap.checked_sub(spent).expect("K+1 reserved tail");
+            bus.prior_runs_core_clocks = u64::from(batch_core);
+            let outcome = cpu
+                .run_budgeted(bus, remaining)
+                .expect("reserved real iteration run");
+            batch_core = batch_core
+                .checked_add(outcome.consumed_core_clocks)
+                .expect("reserved batch core total");
+            if cpu.registers.eip == 0x114 || outcome.halted {
+                break;
+            }
+        }
+        (
+            charged,
+            cpu.perf_counters().instructions - before,
+            cpu.registers.eip,
+        )
+    });
+    assert_ne!(charged, 0);
+    assert!(retired >= 5, "the complete setup poll iteration retired");
+    assert_ne!(final_eip, 0x10b, "the real edge iteration exited the loop");
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn pending_interrupt_preempts_setup_poll_skip_before_any_bulk_commit() {
+    const IRQ_HANDLER: u32 = 0x300;
+    let mut baseline = setup_poll_machine(false, false, false, 0x1234_03da);
+    let mut skipped = setup_poll_machine(true, false, false, 0x1234_03da);
+    skipped.poll_skip_enabled = false;
+    baseline.run_cycles(1_000).unwrap();
+    skipped.run_cycles(1_000).unwrap();
+    for machine in [&mut baseline, &mut skipped] {
+        machine.cpu.registers.eip = 0x10b;
+        machine.cpu.poll_skip_backedge_housekeeping();
+        machine.write_physical_u16(8 * 4, IRQ_HANDLER as u16);
+        machine.write_physical_u16(8 * 4 + 2, 0);
+        machine.write_physical_u8(IRQ_HANDLER, 0xf4);
+        machine.pic.write_port(0x20, 0x11);
+        machine.pic.write_port(0x21, 0x08);
+        machine.pic.write_port(0x21, 0x04);
+        machine.pic.write_port(0x21, 0x01);
+        machine.pic.set_irq_level(0, true);
+        machine.cpu.registers.eflags |= 0x0200; // IF
+        machine.cpu.reset_perf_counters();
+    }
+    skipped.poll_skip_enabled = true;
+
+    let baseline_stop = baseline.run_until_halt_or_cycles(10_000).unwrap();
+    let skipped_stop = skipped.run_until_halt_or_cycles(10_000).unwrap();
+    assert_eq!(baseline_stop, StopReason::Halted);
+    assert_eq!(skipped_stop, baseline_stop);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_iterations, 0);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_declines_when_the_vga_subsystem_is_disabled() {
+    let mut baseline = poll_skip_test_machine(false, TracingMode::Off, GswMode::Gsw586, 0x08);
+    let mut skipped = poll_skip_test_machine(true, TracingMode::Off, GswMode::Gsw586, 0x08);
+    for machine in [&mut baseline, &mut skipped] {
+        with_bus(machine, |bus| {
+            bus.write_io(0x3c3, BusWidth::Byte, 0, false).unwrap();
+        });
+        assert!(!machine.vega.poll_skip_status1_port_active());
+        machine.cpu.reset_perf_counters();
+    }
+
+    let baseline_stop = baseline.run_cycles(50_000).unwrap();
+    let skipped_stop = skipped.run_cycles(50_000).unwrap();
+    assert_eq!(skipped_stop, baseline_stop);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_iterations, 0);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_declines_for_a_hercules_color_status_alias() {
+    let mut baseline = poll_skip_test_machine(false, TracingMode::Off, GswMode::Gsw586, 0x08);
+    let mut skipped = poll_skip_test_machine(true, TracingMode::Off, GswMode::Gsw586, 0x08);
+    for machine in [&mut baseline, &mut skipped] {
+        machine.video_mut().set_mono_text_mode();
+        with_bus(machine, |bus| {
+            bus.write_io(0x3bf, BusWidth::Byte, 0x01, false).unwrap();
+            bus.write_io(0x3b8, BusWidth::Byte, 0x0a, false).unwrap();
+            bus.write_io(0x3c2, BusWidth::Byte, 0x03, false).unwrap();
+        });
+        assert!(machine.vega.legacy().is_hercules_personality());
+        assert!(machine.vega.legacy().color_status1_port_active());
+        assert!(!machine.vega.poll_skip_status1_port_active());
+        machine.cpu.reset_perf_counters();
+    }
+
+    let baseline_stop = baseline.run_cycles(50_000).unwrap();
+    let skipped_stop = skipped.run_cycles(50_000).unwrap();
+    assert_eq!(skipped_stop, baseline_stop);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_iterations, 0);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_preserves_a_live_cs_limit_fault_after_the_in() {
+    const GP_HANDLER: u32 = 0x300;
+    let mut baseline = poll_skip_test_machine(false, TracingMode::Off, GswMode::Gsw586, 0x08);
+    let mut skipped = poll_skip_test_machine(true, TracingMode::Off, GswMode::Gsw586, 0x08);
+
+    skipped.poll_skip_enabled = false;
+    baseline.run_cycles(1_000).unwrap();
+    skipped.run_cycles(1_000).unwrap();
+    for machine in [&mut baseline, &mut skipped] {
+        machine.write_physical_u16(13 * 4, GP_HANDLER as u16);
+        machine.write_physical_u16(13 * 4 + 2, 0);
+        machine.write_physical_u8(GP_HANDLER, 0xf4);
+        machine.cpu.registers.eip = 0x108;
+        machine.cpu.poll_skip_backedge_housekeeping();
+        let mut cs = machine.cpu.registers.cs();
+        cs.limit = 0x109;
+        machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        assert!(machine.cpu.poll_loop().is_none());
+        machine.cpu.reset_perf_counters();
+    }
+    skipped.poll_skip_enabled = true;
+    let baseline_before = baseline.cpu.elapsed_clocks;
+    let skipped_before = skipped.cpu.elapsed_clocks;
+
+    let baseline_stop = baseline.run_until_halt_or_cycles(10_000).unwrap();
+    let skipped_stop = skipped.run_until_halt_or_cycles(10_000).unwrap();
+    assert_eq!(baseline_stop, StopReason::Halted);
+    assert_eq!(skipped_stop, baseline_stop);
+    assert!(baseline.cpu.elapsed_clocks > baseline_before);
+    assert!(skipped.cpu.elapsed_clocks > skipped_before);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_iterations, 0);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_replays_the_attribute_flip_flop_reset_guest_visibly() {
+    const PROGRAM: &[u8] = &[
+        0xba, 0xc0, 0x03, 0x00, 0x00, // mov edx,3C0h
+        0xb0, 0x12, // mov al,12h
+        0xee, // out dx,al: select register 12h and leave the data phase armed
+        0xba, 0xda, 0x03, 0x00, 0x00, // mov edx,3DAh
+        0xec, 0xa8, 0x08, 0x75, 0xfb, // wait while retrace is set
+        0xec, 0xa8, 0x08, 0x74, 0xfb, // wait until retrace is set
+        0xba, 0xc0, 0x03, 0x00, 0x00, // mov edx,3C0h
+        0xb0, 0x05, 0xee, // next write must select attribute register 5
+        0xb0, 0x2a, 0xee, // write its data
+        0xba, 0xc1, 0x03, 0x00, 0x00, // mov edx,3C1h
+        0xec, // in al,dx: read attribute register 5
+        0xf4, // hlt
+    ];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut baseline = Machine::new_raw_program(profile.clone(), PROGRAM).unwrap();
+    let mut skipped = Machine::new_raw_program(profile, PROGRAM).unwrap();
+    for machine in [&mut baseline, &mut skipped] {
+        let mut cs = machine.cpu.registers.cs();
+        cs.default_size_32 = true;
+        machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        machine.cpu.set_native_backend_enabled(false);
+        machine.trace.set_tracing_mode(TracingMode::Off);
+    }
+    baseline.poll_skip_enabled = false;
+    skipped.poll_skip_enabled = true;
+
+    let baseline_stop = baseline.run_until_halt_or_cycles(10_000_000).unwrap();
+    let skipped_stop = skipped.run_until_halt_or_cycles(10_000_000).unwrap();
+    assert_eq!(baseline_stop, StopReason::Halted);
+    assert_eq!(skipped_stop, baseline_stop);
+    assert!(skipped.cpu.perf_counters().poll_skip_spans > 0);
+    assert_eq!(baseline.cpu.registers.eax() as u8, 0x2a);
+    assert_eq!(skipped.cpu.registers.eax() as u8, 0x2a);
+    assert_poll_machine_boundary_eq(&skipped, &baseline);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn natural_event_caps_eventually_offer_a_poll_loop_head() {
+    let mut machine = poll_skip_test_machine(true, TracingMode::Off, GswMode::Gsw586, 0x08);
+    for _ in 0..32 {
+        machine.run_cycles(100_000).unwrap();
+        if machine.cpu.perf_counters().poll_skip_spans != 0 {
+            return;
+        }
+    }
+    panic!(
+        "32 natural caps never offered IN at a warm loop head; final eip={:08x}",
+        machine.cpu.registers.eip
+    );
+}
+
 #[test]
 fn compiled_window_requires_approximate_timing_and_trace_off() {
     let mut machine = test_machine();

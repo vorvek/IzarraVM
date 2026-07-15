@@ -608,6 +608,10 @@ pub struct PerfCounters {
     pub jit_direct_reject_observer: u64,
     pub jit_direct_reject_interrupt_shadow: u64,
     pub jit_direct_reject_aggregate_accounting: u64,
+    /// Machine-level VGA poll spans and complete guest loop iterations elided while
+    /// `IZARRAVM_POLL_SKIP` is enabled. They are diagnostics, not retired instructions.
+    pub poll_skip_spans: u64,
+    pub poll_skip_iterations: u64,
     pub jit_direct_reject_mode_key: u64,
     pub jit_direct_reject_x87_top: u64,
     pub jit_direct_reject_cs_layout: u64,
@@ -680,6 +684,93 @@ pub struct PerfCounters {
     /// monitor's ISA-priced port-access WAIT states travel through the bus-clock
     /// trace, not core clocks, and are not in this bucket.
     pub monitor_resident_core_clocks: u64,
+}
+
+/// One of the closed, page-local, warm 3DA polling-loop shapes certified by the
+/// JIT block builder.
+///
+/// Fields stay private so machine code can only consume the classifier's certified
+/// shape through the accessors below.
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollLoop {
+    fetches: [(u32, u32, u8); 6],
+    fetch_count: u8,
+    port_source: PollPortSource,
+    branch_shape: PollBranchShape,
+    status_mask: u8,
+    branch_when_zero: bool,
+    raw_core_clocks: u64,
+    at_head: bool,
+}
+
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollPortSource {
+    CurrentDx,
+    Ebx,
+    Ecx,
+}
+
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollBranchShape {
+    Direct,
+    PairedJmp,
+}
+
+#[cfg(feature = "jit")]
+impl PollLoop {
+    pub fn fetch_count(self) -> usize {
+        usize::from(self.fetch_count)
+    }
+
+    pub fn fetch(self, index: usize) -> Option<(u32, u32, u8)> {
+        (index < self.fetch_count()).then_some(self.fetches[index])
+    }
+
+    pub fn status_mask(self) -> u8 {
+        self.status_mask
+    }
+
+    pub fn at_head(self) -> bool {
+        self.at_head
+    }
+
+    pub fn resolved_port(self, cpu: &CpuGsw) -> u16 {
+        let value = match self.port_source {
+            PollPortSource::CurrentDx => cpu.registers.edx(),
+            PollPortSource::Ebx => cpu.registers.ebx(),
+            PollPortSource::Ecx => cpu.registers.ecx(),
+        };
+        value as u16
+    }
+
+    pub fn raw_core_clocks(self) -> u64 {
+        self.raw_core_clocks
+    }
+
+    pub fn diagnostic_class(self) -> u8 {
+        match (self.port_source, self.branch_shape) {
+            (PollPortSource::CurrentDx, PollBranchShape::Direct) => 0,
+            (PollPortSource::Ebx | PollPortSource::Ecx, PollBranchShape::Direct) => 1,
+            (PollPortSource::Ebx | PollPortSource::Ecx, PollBranchShape::PairedJmp) => 2,
+            (PollPortSource::CurrentDx, PollBranchShape::PairedJmp) => unreachable!(),
+        }
+    }
+
+    pub fn fresh_iteration_spins(self, status: u8) -> bool {
+        let zero = status & self.status_mask == 0;
+        let branch_taken = zero == self.branch_when_zero;
+        match self.branch_shape {
+            PollBranchShape::Direct => branch_taken,
+            PollBranchShape::PairedJmp => !branch_taken,
+        }
+    }
+
+    pub fn fresh_backedge_taken(self, status: u8) -> bool {
+        self.fresh_iteration_spins(status)
+    }
 }
 
 impl PartialEq for PerfCounters {

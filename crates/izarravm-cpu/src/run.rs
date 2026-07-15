@@ -10,7 +10,7 @@ use super::*;
 /// that could accidentally widen the fault trace's cost. Cached after the
 /// first check, same pattern as `ud_trace_enabled`, so the steady-state cost
 /// when unset is one relaxed load per instruction, not a syscall.
-fn diff_trace_enabled() -> bool {
+pub(super) fn diff_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("IZARRAVM_DIFF_TRACE").is_some())
 }

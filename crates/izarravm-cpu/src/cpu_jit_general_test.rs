@@ -31,6 +31,131 @@ fn drive_to_halt(cpu: &mut CpuGsw, bus: &mut TestBus) {
     panic!("guest never halted");
 }
 
+fn warm_poll_shape(code: &[u8], dx: u16) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0xf4; 0x1000];
+    memory[..code.len()].copy_from_slice(code);
+    let mut bus = TestBus::with_memory(memory);
+    bus.lazy_io_reads = true;
+    let mut cpu = fresh();
+    cpu.set_native_backend_enabled(false);
+    cpu.write_reg16(Reg16::Dx, dx);
+    cpu.registers.eip = 0;
+    for _ in 0..4 {
+        let _ = cpu.run_budgeted(&mut bus, 100).unwrap();
+    }
+    cpu.set_eip(0);
+    (cpu, bus)
+}
+
+#[test]
+fn poll_loop_classifier_accepts_only_the_v1_shapes_and_restamps_smc() {
+    let (mut cpu, mut bus) = warm_poll_shape(&[0xec, 0xa8, 0x08, 0x74, 0xfb], 0x03da);
+    assert!(cpu.poll_skip_eligible());
+    assert_eq!(cpu.read_reg16(Reg16::Dx), 0x03da);
+    let built = jit::block::build_block(&cpu, 0, true).map(|(slots, is_loop)| {
+        (
+            slots
+                .iter()
+                .map(|slot| slot.insn.opcode)
+                .collect::<Vec<_>>(),
+            is_loop,
+        )
+    });
+    assert_eq!(built, Some((vec![0xec, 0xa8, 0x74], true)));
+    let bit3 = cpu.poll_loop().expect("JZ bit-3 poll");
+    assert!(bit3.at_head());
+    assert_eq!(bit3.status_mask(), 0x08);
+    assert!(bit3.fresh_backedge_taken(0x00));
+    assert!(!bit3.fresh_backedge_taken(0x08));
+    cpu.set_eip(1);
+    assert!(!cpu.poll_loop().expect("TEST slot membership").at_head());
+    cpu.set_eip(3);
+    assert!(!cpu.poll_loop().expect("Jcc slot membership").at_head());
+    cpu.set_eip(0);
+
+    bus.memory[2] = 0x01;
+    assert!(cpu.note_code_write(2, 1));
+    for _ in 0..4 {
+        let _ = cpu.run_budgeted(&mut bus, 100).unwrap();
+    }
+    cpu.set_eip(0);
+    let bit1 = cpu.poll_loop().expect("restamped bit-1 poll");
+    assert_eq!(bit1.status_mask(), 0x01);
+
+    let (cpu, _) = warm_poll_shape(&[0xec, 0xa8, 0x01, 0x75, 0xfb], 0x03da);
+    assert!(cpu.poll_loop().is_some(), "JNZ bit-1 poll");
+    for (code, dx) in [
+        (&[0xec, 0xa8, 0x02, 0x74, 0xfb][..], 0x03da),
+        (&[0xec, 0x90, 0xa8, 0x08, 0x74, 0xfa][..], 0x03da),
+        (&[0x66, 0xec, 0xa8, 0x08, 0x74, 0xfa][..], 0x03da),
+        (&[0xec, 0xa8, 0x08, 0x74, 0xfb][..], 0x03ba),
+    ] {
+        let (cpu, _) = warm_poll_shape(code, dx);
+        assert!(cpu.poll_loop().is_none(), "rejected shape {code:02x?}");
+    }
+
+    let (mut cpu, _) = warm_poll_shape(&[0xec, 0xa8, 0x08, 0x74, 0xfb], 0x03da);
+    assert!(
+        cpu.poll_loop().is_some(),
+        "broad warm limit recognizes the loop"
+    );
+
+    let mut cs = cpu.registers.cs();
+    cs.limit = 1;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    cpu.set_eip(0);
+
+    assert!(
+        cpu.poll_loop().is_none(),
+        "live limit admits IN but rejects the two-byte TEST fetch"
+    );
+}
+
+#[test]
+fn poll_skip_eligibility_rejects_native_privilege_v86_and_shadow() {
+    let mut cpu = fresh();
+    cpu.set_native_backend_enabled(false);
+    assert!(cpu.poll_skip_eligible());
+
+    cpu.set_native_backend_enabled(true);
+    assert!(!cpu.poll_skip_eligible());
+    cpu.set_native_backend_enabled(false);
+
+    cpu.interrupt_shadow = true;
+    assert!(!cpu.poll_skip_eligible());
+    cpu.interrupt_shadow = false;
+
+    cpu.enable_profiling(1);
+    assert!(!cpu.poll_skip_eligible());
+    cpu.disable_profiling();
+
+    cpu.control.cr0 |= CR0_PE;
+    cpu.cpl = 3;
+    cpu.registers.eflags &= !FLAG_IOPL;
+    assert!(!cpu.poll_skip_eligible());
+
+    cpu.registers.eflags |= FLAG_VM | FLAG_IOPL;
+    assert!(!cpu.poll_skip_eligible());
+}
+
+#[test]
+fn poll_head_alignment_runs_one_real_instruction_per_zero_cap() {
+    let (mut taken, mut taken_bus) = warm_poll_shape(&[0xec, 0xa8, 0x08, 0x74, 0xfb], 0x03da);
+    taken.set_eip(1);
+    assert!(!taken.poll_loop().unwrap().at_head());
+    taken.run_budgeted(&mut taken_bus, 0).unwrap();
+    assert_eq!(taken.registers.eip, 3, "TEST advances to Jcc");
+    taken.run_budgeted(&mut taken_bus, 0).unwrap();
+    assert_eq!(taken.registers.eip, 0, "taken Jcc reaches the IN head");
+
+    let (mut not_taken, mut not_taken_bus) =
+        warm_poll_shape(&[0xec, 0xa8, 0x01, 0x75, 0xfb], 0x03da);
+    not_taken.set_eip(3);
+    assert!(!not_taken.poll_loop().unwrap().at_head());
+    not_taken.run_budgeted(&mut not_taken_bus, 0).unwrap();
+    assert_eq!(not_taken.registers.eip, 5, "non-taken Jcc exits the loop");
+}
+
 // ---- 1. Four-accumulator identity on an x87-containing loop ----
 
 const X87_START: u32 = 0x100;

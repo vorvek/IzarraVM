@@ -602,6 +602,51 @@ impl CpuGsw {
         self.perf = PerfCounters::default();
     }
 
+    #[cfg(feature = "jit")]
+    fn poll_skip_core_projection(&self, poll: PollLoop, iterations: u64) -> Option<(u64, u64)> {
+        let raw = poll.raw_core_clocks().checked_mul(iterations)?;
+        let (num, den) = level_timing(self.persona());
+        let scaled = raw
+            .checked_mul(u64::from(num))?
+            .checked_add(self.timing_rem)?;
+        Some((scaled / u64::from(den), scaled % u64::from(den)))
+    }
+
+    /// Exact non-mutating core-clock projection for complete poll-loop iterations.
+    #[cfg(feature = "jit")]
+    pub fn project_poll_skip_core(&self, poll: PollLoop, iterations: u64) -> Option<u64> {
+        let (charged, _) = self.poll_skip_core_projection(poll, iterations)?;
+        self.elapsed_clocks.checked_add(charged)?;
+        Some(charged)
+    }
+
+    /// Fractional core-timing carry, exposed with the poll-skip diagnostics so
+    /// machine boundary tests and measurement reports can verify exact scaling.
+    #[cfg(feature = "jit")]
+    pub fn poll_skip_timing_remainder(&self) -> u64 {
+        self.timing_rem
+    }
+
+    /// Commit complete poll-loop iterations through the same remainder-carry scaler
+    /// used by normal execution. Retired-instruction and unit-simulator counts stay
+    /// unchanged because these instructions did not execute.
+    #[cfg(feature = "jit")]
+    pub fn commit_poll_skip_core(&mut self, poll: PollLoop, iterations: u64) -> Option<u64> {
+        let (charged, remainder) = self.poll_skip_core_projection(poll, iterations)?;
+        self.elapsed_clocks = self.elapsed_clocks.checked_add(charged)?;
+        self.timing_rem = remainder;
+        self.perf.poll_skip_spans = self.perf.poll_skip_spans.saturating_add(1);
+        self.perf.poll_skip_iterations = self.perf.poll_skip_iterations.saturating_add(iterations);
+        Some(charged)
+    }
+
+    /// Apply the non-architectural housekeeping a taken backedge performs while
+    /// leaving the architectural loop-head EIP unchanged.
+    #[cfg(feature = "jit")]
+    pub fn poll_skip_backedge_housekeeping(&mut self) {
+        self.set_eip(self.registers.eip);
+    }
+
     /// Enable host-side CPU bucket profiling. Guest-visible state and timing are unchanged.
     pub fn enable_profiling(&mut self, sample_stride: u64) {
         self.profile.enable(sample_stride);
