@@ -1676,27 +1676,22 @@ struct TestBus {
     // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
     // reports the same step-break edge the real bus does.
     io_touched: bool,
-    // When true, `read_io` does NOT set `io_touched`, modeling the machine's
-    // Approximate-class lazy status-port path (MachineBus::read_io's
-    // 3DA/3BA/3C2 arm), so poll-loop chaining across an IN can be exercised
-    // through the CPU alone. Writes still set io_touched (no lazy write path
-    // exists on the machine either). Default false: the classic every-port-
-    // access-breaks behavior.
+    // When true, `read_io` does NOT set `io_touched`, modeling the machine's Approximate-class lazy
+    // status-port path (MachineBus::read_io's 3DA/3BA/3C2 arm), so poll-loop chaining across an IN
+    // can be exercised through the CPU alone. Writes still set io_touched. Default false.
     lazy_io_reads: bool,
-    // Records the `core_clocks_so_far` value the CPU threaded into the most recent
-    // `read_io` call, so tests can assert on it directly (see
-    // `core_clocks_so_far_reflects_prior_instructions_not_the_in_flight_one`).
+    // Records the `core_clocks_so_far` the CPU threaded into the most recent `read_io` call, so
+    // tests can assert on it (see core_clocks_so_far_reflects_prior_instructions_not_the_in_flight).
     last_read_io_core_clocks_so_far: Option<u64>,
     last_write_io_core_clocks_so_far: Option<u64>,
-    // When true, `direct_page` hands out host-pointer pages into `memory` (mirroring the
-    // production MachineBus), so data accesses take the CPU's cached host-pointer deref path
-    // instead of the slow `read_memory_direct` fallback. Default false: the historical
-    // no-direct-page behavior every existing test relies on (data accesses push trace cycles).
-    // The JIT memory microbenchmark sets it true so its numbers reflect production, not the
-    // slow test path (which does not exist on the real bus).
+    // When true, `direct_page` hands out host-pointer pages into `memory` (mirroring the production
+    // MachineBus), so data accesses take the CPU's cached host-pointer deref path instead of the
+    // slow `read_memory_direct` fallback. Default false (the historical no-direct-page behavior).
     direct_pages_enabled: bool,
     direct_pages_writable: bool,
     direct_write_denied_page: Option<u32>,
+    // G4: deny direct pages under InstructionPrefetch only, modeling a non-RAM code page.
+    deny_instruction_prefetch_direct_page: bool,
     uniform_native_fetches: bool,
     // Opt-in width-sensitive timing for direct-page tests. Historical TestBus direct pages were
     // timing-free, so keep that default and let direct-memory differential tests request clocks.
@@ -1731,6 +1726,7 @@ impl TestBus {
             direct_pages_enabled: false,
             direct_pages_writable: true,
             direct_write_denied_page: None,
+            deny_instruction_prefetch_direct_page: false,
             uniform_native_fetches: false,
             direct_page_clocks: false,
             report_batch_clocks: false,
@@ -2124,6 +2120,10 @@ impl CpuBus for TestBus {
         kind: BusAccessKind,
     ) -> Result<Option<DirectPage>, BusError> {
         if !self.direct_pages_enabled {
+            return Ok(None);
+        }
+        if self.deny_instruction_prefetch_direct_page && kind == BusAccessKind::InstructionPrefetch
+        {
             return Ok(None);
         }
         let physical_page = address & !0x0fff;

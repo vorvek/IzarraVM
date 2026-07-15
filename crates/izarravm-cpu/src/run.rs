@@ -887,6 +887,13 @@ impl CpuGsw {
                         return Ok(DirectContinuation::Interpret);
                     }
                 };
+                // G4 guarantee (dev_docs/specs/2026-07-15-smc-hardening-design.md): a block only
+                // installs when a real RAM direct page covers its whole physical span. The kind
+                // MUST stay InstructionPrefetch: the production bus yields a direct page under that
+                // kind ONLY for true RAM, so video/MMIO windows (the mode-13 window answers Data
+                // kinds only), ROM, and A20-gated aliases all return None here and can never host
+                // compiled code. Switching this to a Data kind would let the VGA window pass and is
+                // pinned against by the G4 CPU test.
                 let code_page =
                     bus.direct_page(key.physical, BusAccessKind::InstructionPrefetch)?;
                 let code_page_covers_block = code_page.is_some_and(|page| {

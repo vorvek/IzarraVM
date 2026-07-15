@@ -627,6 +627,50 @@ fn smc_heat_pre_install_gate_demotes_a_hot_span_after_compiling() {
     ));
 }
 
+// ---- G4 non-RAM code admission ----
+
+#[test]
+fn g4_admission_refuses_a_page_without_instruction_prefetch_cover() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    // Model a non-RAM code page: the bus serves Data kinds (decode still works) but yields no
+    // direct page under InstructionPrefetch. The install-time cover check MUST use
+    // InstructionPrefetch, so admission is refused and the block parks Dormant with no install.
+    // Switching that check to a Data kind would let this install and fail the assertion below.
+    bus.deny_instruction_prefetch_direct_page = true;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed,
+        "no install without InstructionPrefetch cover"
+    );
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+
+    // Positive control: restoring the cover installs the identical block, proving the missing
+    // InstructionPrefetch page was the only thing that refused admission.
+    bus.deny_instruction_prefetch_direct_page = false;
+    cpu.jit_direct.clear();
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed + 1,
+        "installs once RAM covers the page under InstructionPrefetch"
+    );
+}
+
 #[test]
 fn smc_heat_demotion_lifts_once_the_epoch_advances() {
     let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);

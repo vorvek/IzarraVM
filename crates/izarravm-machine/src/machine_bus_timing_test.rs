@@ -1472,6 +1472,31 @@ fn direct_memory_helpers_accept_only_page_local_ram() {
 }
 
 #[test]
+fn instruction_prefetch_direct_pages_pin_admission_to_ram_g4() {
+    // G4 guarantee: the JIT admits a block only where bus.direct_page(_, InstructionPrefetch)
+    // covers true RAM. The VGA mode-13 aperture answers Data kinds only, ROM never yields a direct
+    // page, and above-RAM space is unmapped, so InstructionPrefetch returns None for all three and
+    // compiled code can never be hosted from video/MMIO/ROM. Above-RAM = 32 MiB, past the 16 MiB
+    // test machine's RAM top.
+    let mut machine = test_machine();
+    with_bus(&mut machine, |bus| {
+        for &addr in &[
+            izarravm_video::VGA_MODE13H_BASE,
+            VGA_TEXT_BASE,
+            LOW_BIOS_BASE,
+            0x0200_0000,
+        ] {
+            assert!(
+                bus.direct_page(addr, BusAccessKind::InstructionPrefetch)
+                    .unwrap()
+                    .is_none(),
+                "InstructionPrefetch must not yield a direct page at {addr:#x}"
+            );
+        }
+    });
+}
+
+#[test]
 fn canonical_mode13_page_round_trips_through_the_cpu_cache() {
     const RESULT_OFFSET: u32 = 0x0130;
     const PROGRAM: &[u8] = &[
