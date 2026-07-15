@@ -13,11 +13,15 @@ impl Machine {
         let _ = on;
     }
 
-    /// Take the unit simulator's headline report and its per-unit `(member_count, entry_physical
-    /// _page)` histogram, disabling the sim in the process. `None` when the sim was not enabled.
-    /// Only present with feature `jit`; see `CpuGsw::take_unit_sim_report`.
+    /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. Each
+    /// element is `(cfg_label, headline, histogram)` for one ladder rung (`L0..L4`), where the
+    /// histogram entries are `(member_count, entry_physical_page)`. `None` when the sim was not
+    /// enabled. Only present with feature `jit`; see `CpuGsw::take_unit_sim_report`.
     #[cfg(feature = "jit")]
-    pub fn take_unit_sim_report(&mut self) -> Option<(izarravm_cpu::SimReport, Vec<(usize, u32)>)> {
+    #[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
+    pub fn take_unit_sim_report(
+        &mut self,
+    ) -> Option<Vec<(&'static str, izarravm_cpu::SimReport, Vec<(usize, u32)>)>> {
         self.cpu.take_unit_sim_report()
     }
 

@@ -1023,7 +1023,7 @@ impl Default for CpuGsw {
 /// and prints opaquely. See `jit::unit_sim`.
 #[cfg(feature = "jit")]
 #[derive(Default)]
-struct UnitSimSlot(Option<Box<jit::unit_sim::UnitSim>>);
+struct UnitSimSlot(Option<Box<jit::unit_sim::SimLadder>>);
 
 #[cfg(feature = "jit")]
 impl PartialEq for UnitSimSlot {

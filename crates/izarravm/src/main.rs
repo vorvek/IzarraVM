@@ -957,13 +957,13 @@ fn maybe_enable_unit_sim(machine: &mut Machine) {
     }
 }
 
-/// Take the unit simulator's report at the end of a headless run and print its two evidence lines.
-/// A no-op when the sim was never enabled (`take_unit_sim_report` returns `None`) or the binary was
-/// built without feature `jit`.
+/// Take the unit simulator's ladder report at the end of a headless run and print its per-rung
+/// evidence lines (two per rung, ten total for the five-rung ladder). A no-op when the sim was never
+/// enabled (`take_unit_sim_report` returns `None`) or the binary was built without feature `jit`.
 #[cfg(feature = "jit")]
 fn maybe_report_unit_sim(machine: &mut Machine) {
-    if let Some((report, histogram)) = machine.take_unit_sim_report() {
-        for line in unit_sim_report_lines(&report, &histogram) {
+    if let Some(reports) = machine.take_unit_sim_report() {
+        for line in unit_sim_report_lines(&reports) {
             println!("{line}");
         }
     }
@@ -985,14 +985,30 @@ fn nearest_rank_percentile(sorted_ascending: &[usize], p: u32) -> u64 {
     sorted_ascending[index] as u64
 }
 
-/// Format the unit simulator's two evidence lines from its headline report and per-unit
+/// Format the unit-simulator ladder's evidence lines: two lines per rung (`cfg=L0..cfg=L4`), so a
+/// five-rung ladder emits ten lines. The `cfg=` tag is the SECOND field of every line (tag first, so
+/// the rungs eyeball-diff against the C-pre evidence). See [`unit_sim_rung_lines`] for the per-rung
+/// field layout.
+#[cfg(feature = "jit")]
+#[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
+pub(crate) fn unit_sim_report_lines(
+    reports: &[(&'static str, izarravm_cpu::SimReport, Vec<(usize, u32)>)],
+) -> Vec<String> {
+    reports
+        .iter()
+        .flat_map(|(cfg, report, histogram)| unit_sim_rung_lines(cfg, report, histogram))
+        .collect()
+}
+
+/// Format one ladder rung's two evidence lines from its label, headline report, and per-unit
 /// `(member_count, entry_physical_page)` histogram. The first line is the headline counters plus the
 /// structural `insns_per_entry` metric (`retired_in_units / entries`, 0.000000 when `entries == 0`).
 /// The second line summarizes the member-count distribution so the evaluation step can reason about
 /// member caps without a per-unit retired count (which the API does not expose). `excl_units` counts
 /// units whose entry sits in the BIOS/UMA physical window (page 0xF0, or pages 0xA0..=0xFF).
 #[cfg(feature = "jit")]
-pub(crate) fn unit_sim_report_lines(
+fn unit_sim_rung_lines(
+    cfg: &str,
     report: &izarravm_cpu::SimReport,
     histogram: &[(usize, u32)],
 ) -> Vec<String> {
@@ -1002,16 +1018,22 @@ pub(crate) fn unit_sim_report_lines(
         report.retired_in_units as f64 / report.entries as f64
     };
     let headline = format!(
-        "unit_sim entries={} retired_in_units={} linked_transfers={} unresolved_exits={} \
-side_exits_io={} side_exits_async={} sim_invalidations={} units_built={} units_rebuilt={} \
+        "unit_sim cfg={cfg} entries={} retired_in_units={} linked_transfers={} loop_links={} \
+call_links={} ret_links={} itc_hits={} unresolved_exits={} side_exits_io={} side_exits_async={} \
+sim_invalidations={} sim_restamps={} units_built={} units_rebuilt={} \
 insns_per_entry={insns_per_entry:.6}",
         report.entries,
         report.retired_in_units,
         report.linked_transfers,
+        report.loop_links,
+        report.call_links,
+        report.ret_links,
+        report.itc_hits,
         report.unresolved_exits,
         report.side_exits_io,
         report.side_exits_async,
         report.sim_invalidations,
+        report.sim_restamps,
         report.units_built,
         report.units_rebuilt,
     );
@@ -1025,7 +1047,7 @@ insns_per_entry={insns_per_entry:.6}",
         .filter(|&&(_, page)| page == 0xF0 || (0xA0..=0xFF).contains(&page))
         .count();
     let hist = format!(
-        "unit_sim_hist units={} members_p50={} members_p90={} members_max={members_max} \
+        "unit_sim_hist cfg={cfg} units={} members_p50={} members_p90={} members_max={members_max} \
 units_over_64={} units_over_128={} units_over_256={} excl_units={excl_units}",
         histogram.len(),
         nearest_rank_percentile(&members, 50),

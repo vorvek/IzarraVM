@@ -152,20 +152,30 @@ pub(crate) fn is_control_transfer(insn: &DecodedInsn) -> bool {
     }
 }
 
-/// The transfer shape the unit simulator records for `insn` starting at linear `lin` in the code
-/// segment based at `cs_base`. A relative near JMP (0xEB / 0xE9) or Jcc (short 0x70-0x7F, near
-/// 0x0F80-0x0F8F) has a statically computable target and is `DirectNear` (the sim keeps the entry
-/// open across an in-window back-edge). CALL rel (0xE8, recursion not a loop back-edge) and every
-/// other `is_control_transfer` form (near RET, near indirect CALL/JMP, LOOP, JCXZ) is `Indirect`; a
-/// non-control-transfer instruction is `None`. Reuses `is_control_transfer` as the single
-/// control-flow authority, so the far / INT / IRET terminators (not `continuable`, hence never
-/// `is_control_transfer` here) fall to `None` and are closed by the sim's `is_terminator` check.
+/// The precise transfer shape the unit simulator records for `insn` starting at linear `lin` in the
+/// code segment based at `cs_base`. This hook emits the EXACT kind of every control transfer; the
+/// sim's `effective_kind` then lowers the rich kinds per its config (the default config lowers all
+/// four to `Indirect`, preserving v1 semantics). The classification:
+/// - a relative near JMP (0xEB / 0xE9) or Jcc (short 0x70-0x7F, near 0x0F80-0x0F8F) has a statically
+///   computable target and is `DirectNear`;
+/// - a near CALL rel (0xE8) is `CallNear` with the same statically computable target (recursion, not
+///   a loop back-edge);
+/// - a LOOP/LOOPcc/JCXZ near branch (0xE0-0xE3) is `LoopNear` with the same rel8 target arithmetic;
+/// - a near indirect CALL (0xFF /2) is `CallIndirect` (no static target);
+/// - a near RET (0xC2/0xC3) is `Return`;
+/// - every other `is_control_transfer` form (the near indirect JMP 0xFF /4) is `Indirect`;
+/// - a non-control-transfer instruction is `None`.
+///
+/// Reuses `is_control_transfer` as the single control-flow authority, so the far / INT / IRET /
+/// RETF terminators (not `continuable`, hence never `is_control_transfer` here) fall to `None` and
+/// are closed by the sim's `is_terminator` check.
 ///
 /// Target convention: the sim keys everything by LINEAR address, but `relative_jump` masks the new
 /// EIP with `operand_size.mask()` (a 16-bit-operand branch truncates the IP within the segment), so
 /// the delta arithmetic runs in offset-within-segment space and only then rebases: `target =
 /// cs_base + ((lin - cs_base + len + imm) & mask)`. Without the mask a wrapping 16-bit branch would
-/// record a wrong DirectNear target.
+/// record a wrong target. `CallNear` and `LoopNear` use the IDENTICAL arithmetic (they too carry a
+/// sign-extended relative displacement in `insn.imm`).
 pub(crate) fn observed_transfer(
     insn: &DecodedInsn,
     lin: u32,
@@ -175,19 +185,31 @@ pub(crate) fn observed_transfer(
     if !is_control_transfer(insn) {
         return TransferKind::None;
     }
-    let direct_near =
-        matches!(insn.opcode, 0xeb | 0xe9 | 0x70..=0x7f) || matches!(insn.opcode, 0x0f80..=0x0f8f);
-    if direct_near {
+    // The masked, rebased linear target shared by DirectNear / CallNear / LoopNear (all three carry
+    // a sign-extended relative displacement in `insn.imm`).
+    let relative_target = || {
         let target_eip = lin
             .wrapping_sub(cs_base)
             .wrapping_add(u32::from(insn.len))
             .wrapping_add(insn.imm)
             & insn.operand_size.mask();
-        TransferKind::DirectNear {
-            target: cs_base.wrapping_add(target_eip),
-        }
-    } else {
-        TransferKind::Indirect
+        cs_base.wrapping_add(target_eip)
+    };
+    match insn.opcode {
+        0xeb | 0xe9 | 0x70..=0x7f | 0x0f80..=0x0f8f => TransferKind::DirectNear {
+            target: relative_target(),
+        },
+        0xe8 => TransferKind::CallNear {
+            target: relative_target(),
+        },
+        0xe0..=0xe3 => TransferKind::LoopNear {
+            target: relative_target(),
+        },
+        0xc2 | 0xc3 => TransferKind::Return,
+        // Near indirect CALL is 0xFF /2; the only other `is_control_transfer` 0xFF form is /4 (near
+        // indirect JMP), which stays `Indirect`.
+        0xff if matches!(insn.modrm.map(|m| m.reg), Some(2)) => TransferKind::CallIndirect,
+        _ => TransferKind::Indirect,
     }
 }
 

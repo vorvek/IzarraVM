@@ -2214,18 +2214,22 @@ fn unit_sim_feed_is_state_neutral() {
     assert_eq!(sim_off, sim_on, "enabling the unit sim changed CPU state");
     assert_eq!(bus_off.memory, bus_on.memory, "guest memory diverged");
 
-    let (report, histogram) = sim_on
+    let reports = sim_on
         .take_unit_sim_report()
         .expect("the sim was enabled, so a report exists");
-    assert!(report.entries > 0, "sim-on run recorded no entries");
-    assert!(
-        report.retired_in_units > 0,
-        "sim-on run accrued no retired instructions"
-    );
-    assert!(
-        !histogram.is_empty(),
-        "at least one unit should appear in the histogram"
-    );
+    // The ladder fans out to five rungs (L0..L4); every rung sees the same non-empty trace.
+    assert_eq!(reports.len(), 5, "the ladder must report all five rungs");
+    for (cfg, report, histogram) in &reports {
+        assert!(report.entries > 0, "rung {cfg} recorded no entries");
+        assert!(
+            report.retired_in_units > 0,
+            "rung {cfg} accrued no retired instructions"
+        );
+        assert!(
+            !histogram.is_empty(),
+            "rung {cfg} should show at least one unit in the histogram"
+        );
+    }
     // Taking the report disables the sim.
     assert!(
         sim_on.take_unit_sim_report().is_none(),
@@ -2236,6 +2240,13 @@ fn unit_sim_feed_is_state_neutral() {
 /// Coverage invariant (review finding B2): every retired interpreter instruction is observed
 /// exactly once, so `retired_in_units` equals the run's `perf.instructions` delta. Each `observe`
 /// accrues exactly once, so `retired_in_units` is the total observed count.
+///
+/// The ladder fans one stream to all five rungs, and each observed instruction accrues to exactly
+/// one open entry in every rung (a deferred L2/L4 check keeps the entry open across the closing
+/// transfer, but that transfer already accrued, and the next instruction accrues to the switched
+/// unit or a fresh entry either way). So `retired_in_units` is config-independent: EVERY rung must
+/// report the same total, equal to the perf delta. A rung that differs is a ladder bug, not a test
+/// artifact.
 #[test]
 fn unit_sim_observes_every_retired_instruction() {
     let mut cpu = fresh();
@@ -2247,14 +2258,17 @@ fn unit_sim_observes_every_retired_instruction() {
     drive_to_halt(&mut cpu, &mut bus);
 
     let retired = cpu.perf_counters().instructions;
-    let (report, _) = cpu.take_unit_sim_report().expect("sim enabled");
+    let reports = cpu.take_unit_sim_report().expect("sim enabled");
     assert!(retired > 0, "the program retired no instructions");
-    assert_eq!(
-        report.retired_in_units, retired,
-        "the sim must observe every retired instruction exactly once \
-         (retired_in_units {} vs perf.instructions {})",
-        report.retired_in_units, retired,
-    );
+    assert_eq!(reports.len(), 5, "the ladder must report all five rungs");
+    for (cfg, report, _) in &reports {
+        assert_eq!(
+            report.retired_in_units, retired,
+            "rung {cfg} must observe every retired instruction exactly once \
+             (retired_in_units {} vs perf.instructions {retired})",
+            report.retired_in_units,
+        );
+    }
 }
 
 /// A tight two-instruction self-loop: the `jnz` back-edge is a `DirectNear` transfer to the loop
@@ -2272,7 +2286,10 @@ fn unit_sim_self_loop_keeps_entry_open() {
     drive_to_halt(&mut cpu, &mut bus);
 
     let batches = cpu.perf_counters().straight_line_runs;
-    let (report, _) = cpu.take_unit_sim_report().expect("sim enabled");
+    let reports = cpu.take_unit_sim_report().expect("sim enabled");
+    // Assert on the L0 rung (v1 parity): its `DirectNear` back-edge keeps the entry open.
+    let (cfg, report, _) = &reports[0];
+    assert_eq!(*cfg, "L0", "the first ladder rung is L0");
 
     // The loop runs 60 iterations of `sub ecx,1; jnz`, so retired is large.
     assert!(
