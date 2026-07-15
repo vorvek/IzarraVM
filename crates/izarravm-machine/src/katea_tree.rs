@@ -648,9 +648,11 @@ pub(crate) struct KateaTreeVolume {
     files: Vec<FlatFile>,
     /// `(first_cluster, last_cluster, role)` runs, sorted by `first_cluster`.
     runs: Vec<(u32, u32, Role)>,
-    /// Sparse write overlay: guest writes land here, reads consult it first. Held
-    /// until eject with no eviction. RAM is bounded by bytes written this session.
-    overlay: HashMap<u32, [u8; SECTOR]>,
+    /// Guest writes land here and reads consult it first. A bounded RAM cache over
+    /// a spill file (`katea_store`), so RAM tracks the cache size rather than the
+    /// bytes written this session. Presence is exact and outlives eviction, which
+    /// is what `reconcile`'s touched-this-session tests read.
+    store: crate::katea_store::SectorStore,
     /// Directory first-cluster -> its host-filesystem path. Seeded from the tree;
     /// extended on guest MKDIR. Reconcile materializes a file in this directory to
     /// `host_path / 8.3-name`.
@@ -663,6 +665,9 @@ pub(crate) struct KateaTreeVolume {
     mirrored: HashMap<(u32, [u8; 11]), MirrorEntry>,
     /// Folded 8.3 names of the InMemory boot files; never materialized to the host.
     system_names: HashSet<[u8; 11]>,
+    /// Files whose bytes `reconcile` has re-read from the disk. Counts the work the
+    /// `last_gather` skip exists to avoid, so a test can prove the skip fires.
+    gathers: u64,
 }
 
 /// Katea's belief about one host-side entry (file or dir): where it lives, the
@@ -676,6 +681,42 @@ struct MirrorEntry {
     /// True when this entry is a directory.
     is_dir: bool,
     last_fingerprint: Option<u64>,
+    /// What the last completed decision for this entry saw, so a later pass can
+    /// prove the file cannot have changed and skip re-reading it. `None` means
+    /// "always gather", which is the safe default for a fresh or held entry.
+    last_gather: Option<Gather>,
+}
+
+/// The inputs to one file's gathered bytes, as of the last pass that finished a
+/// decision about it (a successful materialize, or a fingerprint match).
+///
+/// The gathered bytes are a function of the cluster chain, the declared size, the
+/// store's copy of any written chain sector, and the base view under any chain
+/// sector the guest never wrote. `all_present` records that the fourth input was
+/// absent, which is what lets the other three stand in for the whole function.
+/// Only ever compared field by field, never trusted as content.
+#[derive(Clone, Copy, Debug)]
+struct Gather {
+    /// The directory entry's declared size at that decision.
+    size: u32,
+    /// A hash of the cluster chain at that decision.
+    chain_id: u64,
+    /// The store's write counter at that decision.
+    seq: u64,
+    /// Whether every sector the gather read came from the store rather than the
+    /// base view. When false the skip is never taken, because reconcile's own
+    /// `atomic_write` can change the host file that the base view reads from, and
+    /// no watermark can see that happen.
+    all_present: bool,
+}
+
+/// Hash a cluster chain into a comparable id. Cheap and session-only, like
+/// `katea_write::fingerprint`: never persisted, only compared within one run.
+fn chain_id(chain: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    chain.hash(&mut h);
+    h.finish()
 }
 
 /// One live directory entry seen during the gather phase.
@@ -696,6 +737,10 @@ struct PendingWrite {
     key: (u32, [u8; 11]),
     fingerprint: u64,
     first_cluster: u32,
+    /// What this gather saw, recorded on the mirror entry only if the write
+    /// lands. A held or failed write leaves the entry's watermark alone, so the
+    /// next pass gathers again.
+    gather: Gather,
 }
 
 /// A disappeared mirrored entry (file or dir) whose clusters are now claimed by
@@ -784,6 +829,7 @@ impl KateaTreeVolume {
                             first_cluster: f.first_cluster,
                             is_dir: false,
                             last_fingerprint: None,
+                            last_gather: None,
                         },
                     );
                 }
@@ -796,6 +842,7 @@ impl KateaTreeVolume {
                         first_cluster: s.dir.first_cluster,
                         is_dir: true,
                         last_fingerprint: None,
+                        last_gather: None,
                     },
                 );
                 seed(&s.dir, dir_paths, mirrored);
@@ -836,11 +883,19 @@ impl KateaTreeVolume {
             dirs,
             files,
             runs,
-            overlay: HashMap::new(),
+            store: crate::katea_store::SectorStore::new(),
             dir_paths,
             mirrored,
             system_names,
+            gathers: 0,
         })
+    }
+
+    /// How many file bodies `reconcile` has re-read. Test-only: the live path only
+    /// ever increments it. See `gathers`.
+    #[allow(dead_code)]
+    pub(crate) fn gathers(&self) -> u64 {
+        self.gathers
     }
 
     /// The whole-disk sector count, so the ATA layer can derive its geometry.
@@ -964,8 +1019,25 @@ impl KateaTreeVolume {
     /// incomplete or ambiguous entry is held in the overlay and retried next pass.
     /// Called after each HostFolder ATA write command and at eject/flush.
     pub(crate) fn reconcile(&mut self) {
+        // A guest-written sector that cannot be read back reads as zeros, and zeros
+        // are not a safe input here: phase 2 reads a zeroed FAT entry as "chain
+        // freed" and deletes the host file, `parse_dir` stops at the first zero
+        // byte and hides live entries, and a zeroed data sector would be written
+        // straight into a real host file. So every decision below is bracketed by a
+        // snapshot of the store's read-error count, and any unit whose reads failed
+        // is held for the next pass instead of acted on. Checking once on entry
+        // would not do: the failure is discovered mid-pass, and it is this pass that
+        // would do the damage.
+        let errors_at_entry = self.store.read_errors();
+
         // PHASE 1: gather all live entries (read-only).
         let live = self.gather_live();
+        if self.store.read_errors() != errors_at_entry {
+            // The live set is what every later phase reasons against, so a hole in
+            // it cannot be scoped to one chain. Do nothing at all this pass.
+            eprintln!("katea: skipping reconcile after a failed read of guest-written data");
+            return;
+        }
         let live_keys: HashSet<(u32, [u8; 11])> =
             live.iter().map(|l| (l.dir_cluster, l.name)).collect();
         // first_cluster -> the live entries claiming it (for rename matching in phase 2).
@@ -1023,7 +1095,18 @@ impl KateaTreeVolume {
                 }
             }
             // Delete: empty file/dir, or chain freed with no claimant. Else HOLD.
+            // `fat_entry` reads a sector, so bracket it: an unreadable FAT sector
+            // reads as zeros, which looks exactly like a freed chain and would
+            // delete a real host file on the strength of an I/O failure.
+            let errors_before = self.store.read_errors();
             let freed = m.first_cluster < 2 || self.fat_entry(m.first_cluster) == 0;
+            if self.store.read_errors() != errors_before {
+                eprintln!(
+                    "katea: holding {} after a failed read of its FAT chain",
+                    m.host_path.display()
+                );
+                continue; // hold this entry, retry next pass
+            }
             let claimed = live_by_cluster.contains_key(&m.first_cluster);
             if freed && !claimed {
                 deletes.push(PendingDelete {
@@ -1052,6 +1135,10 @@ impl KateaTreeVolume {
                     first_cluster: r.first_cluster,
                     is_dir: r.is_dir,
                     last_fingerprint: None,
+                    // A rename moves the host path, so the base view under this
+                    // chain moves with it. Carrying a watermark across would let a
+                    // later pass skip a gather on the strength of the old path.
+                    last_gather: None,
                 },
             );
             if r.is_dir {
@@ -1098,6 +1185,9 @@ impl KateaTreeVolume {
             };
 
             // Read the directory's full bytes by following its own cluster chain.
+            // Bracketed: a zeroed directory sector would make `parse_dir` stop early
+            // and hide live entries, which phase 2 would read as disappearances.
+            let dir_errors_before = self.store.read_errors();
             let Some(dir_chain) =
                 crate::katea_write::chain(dir_cluster, max, |c| self.fat_entry(c))
             else {
@@ -1113,14 +1203,26 @@ impl KateaTreeVolume {
                     dir_bytes.extend_from_slice(&self.read_sector(base + s));
                 }
             }
+            if self.store.read_errors() != dir_errors_before {
+                // This directory's own bytes are unreliable, so nothing derived from
+                // them can be trusted. Hold the whole directory for the next pass.
+                eprintln!("katea: holding a directory after a failed read of guest-written data");
+                continue;
+            }
             let dir_written = dir_chain.iter().any(|c| {
                 let base = self.cluster_to_lba(*c);
-                (0..spc).any(|s| self.overlay.contains_key(&(base + s)))
+                (0..spc).any(|s| self.store.was_written(base + s))
             });
 
             // Decide every entry (read-only); collect actions, then apply.
             let mut mkdirs: Vec<(u32, [u8; 11], u32, std::path::PathBuf)> = Vec::new();
             let mut writes: Vec<PendingWrite> = Vec::new();
+            // Entries whose bytes matched what the host already holds: nothing to
+            // write, but the decision is complete, so date them.
+            let mut watermarks: Vec<((u32, [u8; 11]), Gather)> = Vec::new();
+            // Counted here and folded in below: the decision loop holds `self`
+            // shared, so it cannot touch `self.gathers` directly.
+            let mut gathers = 0u64;
 
             for e in crate::katea_write::parse_dir(&dir_bytes) {
                 match crate::katea_write::classify(&e, &self.system_names) {
@@ -1140,6 +1242,12 @@ impl KateaTreeVolume {
                         first_cluster,
                         size,
                     } => {
+                        // Bracket the whole decision, starting before the first read
+                        // it makes. A zeroed FAT sector would already end the chain
+                        // walk below as "incomplete" and hold, but relying on that
+                        // would make this file's safety depend on the shape of the
+                        // corruption rather than on the failure itself.
+                        let errors_before = self.store.read_errors();
                         let Some(fchain) =
                             crate::katea_write::chain(first_cluster, max, |c| self.fat_entry(c))
                         else {
@@ -1152,12 +1260,14 @@ impl KateaTreeVolume {
                         if u64::from(size) > capacity {
                             continue; // not enough clusters yet: hold
                         }
-                        // Touched this session? Non-empty files must have overlay
+                        // Touched this session? Non-empty files must have written
                         // data; a brand-new name in a written directory counts even
-                        // when empty. Untouched tree/system files are skipped.
+                        // when empty. Untouched tree/system files are skipped. This
+                        // asks the store's presence bits, which never clear, so an
+                        // evicted sector still reads as touched.
                         let data_written = fchain.iter().any(|c| {
                             let base = self.cluster_to_lba(*c);
-                            (0..spc).any(|s| self.overlay.contains_key(&(base + s)))
+                            (0..spc).any(|s| self.store.was_written(base + s))
                         });
                         let is_new = !self.mirrored.contains_key(&(dir_cluster, name));
                         if handled.contains(&(dir_cluster, name)) {
@@ -1167,7 +1277,42 @@ impl KateaTreeVolume {
                             continue;
                         }
 
-                        // Gather the file bytes (overlay-then-tree), truncate to size.
+                        // `data_written` never resets, so without this a file the
+                        // guest touched once is re-read in full on every later pass
+                        // for the rest of the session, just to have the fingerprint
+                        // below reject it. The gathered bytes are a function of the
+                        // chain, the size, the store's copy of any written chain
+                        // sector, and the base view under any unwritten one. If the
+                        // first two are unchanged, no chunk the chain touches has
+                        // been written since, and the last gather read nothing from
+                        // the base view, then the bytes are identical and the
+                        // fingerprint would match: same outcome, no read.
+                        let chain_now = chain_id(&fchain);
+                        let chain_seq = fchain
+                            .iter()
+                            .map(|c| self.store.max_seq_in(self.cluster_to_lba(*c), spc))
+                            .max()
+                            .unwrap_or(0);
+                        if let Some(g) = self
+                            .mirrored
+                            .get(&(dir_cluster, name))
+                            .and_then(|m| m.last_gather)
+                            && g.all_present
+                            && g.size == size
+                            && g.chain_id == chain_now
+                            && chain_seq <= g.seq
+                        {
+                            continue; // provably unchanged since the last decision
+                        }
+
+                        // Gather the file bytes (store-then-base), truncate to size.
+                        // `all_present` records whether the base view contributed:
+                        // if it did, the bytes can change without any guest write
+                        // (our own atomic_write rewrites the very host file the base
+                        // view reads), so the skip above must not fire next pass.
+                        let decided_at = self.store.seq();
+                        gathers += 1;
+                        let mut all_present = true;
                         let mut data = Vec::with_capacity(size as usize);
                         'gather: for c in &fchain {
                             let base = self.cluster_to_lba(*c);
@@ -1175,19 +1320,40 @@ impl KateaTreeVolume {
                                 if data.len() >= size as usize {
                                     break 'gather;
                                 }
+                                all_present &= self.store.was_written(base + s);
                                 data.extend_from_slice(&self.read_sector(base + s));
                             }
                         }
                         data.truncate(size as usize);
+                        if self.store.read_errors() != errors_before {
+                            // A guest-written sector of this file could not be read
+                            // back, so `data` holds zeros where its bytes should be.
+                            // Writing that to the host file would destroy real
+                            // content: hold this file and retry next pass.
+                            eprintln!(
+                                "katea: holding {} after a failed read of its own data",
+                                crate::katea_volume::decode_83(&name)
+                            );
+                            continue;
+                        }
 
                         let fp = crate::katea_write::fingerprint(&data);
+                        let gather = Gather {
+                            size,
+                            chain_id: chain_now,
+                            seq: decided_at,
+                            all_present,
+                        };
                         if self
                             .mirrored
                             .get(&(dir_cluster, name))
                             .and_then(|m| m.last_fingerprint)
                             == Some(fp)
                         {
-                            continue; // unchanged since last pass
+                            // Unchanged since last pass. Date the entry so the skip
+                            // above can spare the next pass this same re-read.
+                            watermarks.push(((dir_cluster, name), gather));
+                            continue;
                         }
                         let host_path = self
                             .mirrored
@@ -1202,12 +1368,19 @@ impl KateaTreeVolume {
                             key: (dir_cluster, name),
                             fingerprint: fp,
                             first_cluster,
+                            gather,
                         });
                     }
                 }
             }
 
             // Apply mutations + host I/O (no `self` borrow held across reads now).
+            self.gathers += gathers;
+            for (key, gather) in watermarks {
+                if let Some(m) = self.mirrored.get_mut(&key) {
+                    m.last_gather = Some(gather);
+                }
+            }
             for (parent, name, first_cluster, path) in mkdirs {
                 if let Err(e) = std::fs::create_dir_all(&path) {
                     eprintln!("katea: mkdir {} failed: {e}", path.display());
@@ -1219,6 +1392,7 @@ impl KateaTreeVolume {
                     first_cluster,
                     is_dir: true,
                     last_fingerprint: None,
+                    last_gather: None,
                 });
                 if !seen.contains(&first_cluster) {
                     work.push(first_cluster);
@@ -1234,6 +1408,10 @@ impl KateaTreeVolume {
                                 first_cluster: w.first_cluster,
                                 is_dir: false,
                                 last_fingerprint: Some(w.fingerprint),
+                                // Must be carried: this rebuilds the entry
+                                // wholesale, so dropping the watermark here would
+                                // silently disable the skip on every write.
+                                last_gather: Some(w.gather),
                             },
                         );
                     }
@@ -1247,19 +1425,31 @@ impl KateaTreeVolume {
         }
     }
 
-    /// Store one guest-written sector in the overlay. Reads of this LBA now return
-    /// `data` until eject. The interpreter (`reconcile`) reads the overlay to
-    /// mirror finished files to the host folder.
+    /// Store one guest-written sector. Reads of this LBA now return `data` until
+    /// eject. The interpreter (`reconcile`) reads it back to mirror finished files
+    /// to the host folder. The payload may be spilled to disk, which is invisible
+    /// here and to every reader.
     pub(crate) fn write_sector(&mut self, lba: u32, data: &[u8; SECTOR]) {
-        self.overlay.insert(lba, *data);
+        self.store.insert(lba, data);
     }
 
     /// Read one whole-disk sector by absolute LBA. Resolves entirely from
-    /// in-memory metadata except for `HostFile` data, read on demand. Out-of-range
-    /// or unmapped sectors read back as zeros.
+    /// in-memory metadata except for `HostFile` data and spilled guest writes,
+    /// read on demand. Out-of-range or unmapped sectors read back as zeros.
     pub(crate) fn read_sector(&self, lba: u32) -> [u8; SECTOR] {
-        if let Some(s) = self.overlay.get(&lba) {
-            return *s;
+        match self.store.get(lba) {
+            Ok(Some(s)) => return s,
+            Ok(None) => {}
+            Err(e) => {
+                // The sector exists but its payload could not be read back. Never
+                // fall through to the base view: that would silently regress a
+                // guest-written sector to its pre-write content. Zeros match how
+                // this module already treats an unreadable host file, and the
+                // store's error count makes `reconcile` hold this chain rather
+                // than act on what we are about to return.
+                eprintln!("katea: guest-written sector {lba} could not be read back: {e}");
+                return [0u8; SECTOR];
+            }
         }
         if lba == 0 {
             return self.mbr;

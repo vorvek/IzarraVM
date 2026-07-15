@@ -1065,3 +1065,390 @@ fn reconcile_moves_a_host_file_into_a_subdir() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Give `vol` a tiny write cache, so anything it writes from here on is evicted to
+/// the spill almost immediately. Must run before the first write: it replaces the
+/// store wholesale.
+#[cfg(test)]
+fn shrink_cache(vol: &mut KateaTreeVolume, capacity: usize) {
+    vol.store = crate::katea_store::SectorStore::with_capacity(capacity);
+}
+
+/// The guest's view must not depend on whether a sector's payload is still in RAM.
+/// Reads consult the store first, evicted or not, and fall through to the computed
+/// base view only for sectors the guest never wrote.
+#[test]
+fn read_sector_is_identical_once_every_write_has_been_evicted() {
+    let (mut vol, root) = fresh_vol("evict_view");
+    shrink_cache(&mut vol, 2);
+
+    let base_mbr = vol.read_sector(0);
+    let free = vol.next_free;
+    let data_lba = vol.cluster_to_lba(free);
+    let fat_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS);
+
+    // A mix of the regions that have no host-file home at all: the MBR shadow, a
+    // FAT sector, and a data sector in free space.
+    let mut want = std::collections::HashMap::new();
+    for (lba, seed) in [(0u32, 0xABu8), (fat_lba, 0x11), (data_lba, 0x22)] {
+        let mut s = [seed; SECTOR];
+        s[7] = 0x5A;
+        vol.write_sector(lba, &s);
+        want.insert(lba, s);
+    }
+    // Push far more through the cache than it can hold, so the three above are
+    // certainly spilled.
+    for i in 0..200u32 {
+        vol.write_sector(data_lba + 100 + i, &[i as u8; SECTOR]);
+    }
+    // Rewrite one of them after it was evicted: the new bytes must win over the
+    // spilled ones.
+    let mut rewritten = [0xCC; SECTOR];
+    rewritten[1] = 0x99;
+    vol.write_sector(fat_lba, &rewritten);
+    want.insert(fat_lba, rewritten);
+
+    for (lba, expect) in &want {
+        assert_eq!(
+            &vol.read_sector(*lba),
+            expect,
+            "sector {lba} after eviction"
+        );
+    }
+    for i in 0..200u32 {
+        assert_eq!(
+            vol.read_sector(data_lba + 100 + i),
+            [i as u8; SECTOR],
+            "streamed sector {i}"
+        );
+    }
+    // A sector the guest never wrote still reads the computed base view.
+    assert_eq!(
+        vol.read_sector(1),
+        [0u8; SECTOR],
+        "unwritten reserved sector"
+    );
+    assert_ne!(base_mbr, want[&0], "the test must actually shadow the MBR");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The `was_written` hazard: reconcile decides what to mirror by asking whether a
+/// chain was touched this session. That answer must outlive the payload's
+/// residency, or a spilled file silently never reaches the host folder.
+#[test]
+fn reconcile_materializes_a_file_whose_sectors_were_all_evicted() {
+    let (mut vol, root) = fresh_vol("evict_reconcile");
+    shrink_cache(&mut vol, 2);
+    let free = vol.next_free;
+    // 16 sectors of payload against a 2-sector cache: everything is spilled well
+    // before reconcile runs.
+    let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    stamp_file(&mut vol, 2, "BIG.BIN", 0x20, free, &payload);
+    vol.reconcile();
+    let got = std::fs::read(root.join("BIG.BIN")).expect("BIG.BIN materialized");
+    assert_eq!(
+        got, payload,
+        "a spilled file must materialize byte-identically"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Reconcile re-reads a file's whole body before the fingerprint can reject it, and
+/// `data_written` never resets, so without a watermark every file the guest ever
+/// touched is re-read on every later pass forever. The skip must fire on the pass
+/// after one that ended in a materialize.
+#[test]
+fn reconcile_skips_re_reading_a_file_that_cannot_have_changed() {
+    let (mut vol, root) = fresh_vol("gather_skip");
+    // Place A's data well clear of the root directory's own sector. The watermark
+    // is per 128 KiB chunk, so a file parked next to the directory (as `next_free`
+    // is on a fresh volume) is re-read whenever any entry is added to that
+    // directory. That over-approximation is safe, it just costs a read, and it is
+    // not what this test is about.
+    let free = vol.next_free + 1000;
+    stamp_file(&mut vol, 2, "A.TXT", 0x20, free, b"first file\r\n");
+    vol.reconcile();
+    assert!(std::fs::read(root.join("A.TXT")).is_ok());
+    assert!(
+        vol.gathers() >= 1,
+        "the first pass must read A to materialize it"
+    );
+
+    // Nothing changed at all: the second pass must not re-read A. This is also what
+    // catches the success arm dropping the watermark when it rebuilds MirrorEntry.
+    let before = vol.gathers();
+    vol.reconcile();
+    assert_eq!(
+        vol.gathers(),
+        before,
+        "an unchanged file must not be re-read after a pass that materialized it"
+    );
+
+    // A write to an unrelated file, placed past this chunk (256 sectors, and spc is
+    // 1 here) so it cannot share A's 128 KiB span, must not disturb A either.
+    let b_first = free + 1000;
+    stamp_file(&mut vol, 2, "B.TXT", 0x20, b_first, b"second file\r\n");
+    let before = vol.gathers();
+    vol.reconcile();
+    assert_eq!(
+        vol.gathers(),
+        before + 1,
+        "only B should have been read, not A as well"
+    );
+    assert_eq!(
+        std::fs::read(root.join("B.TXT")).unwrap(),
+        b"second file\r\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("A.TXT")).unwrap(),
+        b"first file\r\n",
+        "A's host bytes must be untouched"
+    );
+
+    // Rewriting A must be noticed again: the skip is a shortcut, not a stop.
+    stamp_file(&mut vol, 2, "A.TXT", 0x20, free, b"rewritten!!\r\n");
+    vol.reconcile();
+    assert_eq!(
+        std::fs::read(root.join("A.TXT")).unwrap(),
+        b"rewritten!!\r\n",
+        "a changed file must still be re-read and rewritten"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A genuinely broken spill file (not an injected fault) must surface as read
+/// errors and cost nothing on the host. Here the live scan itself cannot be read,
+/// which is the one failure that cannot be scoped to a single chain: the live set
+/// is what every later phase reasons against, so the whole pass is abandoned.
+#[test]
+fn a_failed_read_in_the_live_scan_abandons_the_whole_pass() {
+    let (mut vol, root) = fresh_vol("read_fail");
+    shrink_cache(&mut vol, 2);
+    let free = vol.next_free;
+    let payload: Vec<u8> = (0..4096u32).map(|i| (i % 97) as u8).collect();
+    stamp_file(&mut vol, 2, "KEEP.BIN", 0x20, free, &payload);
+    vol.reconcile();
+    assert_eq!(
+        std::fs::read(root.join("KEEP.BIN")).unwrap(),
+        payload,
+        "materialized before the spill breaks"
+    );
+
+    // Break the spill under the store: every evicted sector now fails to read.
+    let spill = vol.store.spill_path().to_path_buf();
+    assert!(spill.exists(), "the tiny cache must have forced a spill");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&spill)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+
+    vol.reconcile();
+    assert!(
+        vol.store.read_errors() > 0,
+        "the broken spill must surface as read errors"
+    );
+    assert!(
+        root.join("KEEP.BIN").exists(),
+        "a failed read must never be taken as the guest deleting the file"
+    );
+    assert_eq!(
+        std::fs::read(root.join("KEEP.BIN")).unwrap(),
+        payload,
+        "a failed read must never overwrite the host file with zeros"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The skip is only sound when the gather read nothing from the base view. A file
+/// whose bytes come partly from its host file has a fourth input the watermark
+/// cannot see: reconcile's own `atomic_write` rewrites that very host file, so its
+/// base bytes can change with no guest write anywhere. Such a file must keep being
+/// re-read, exactly as it is today.
+#[test]
+fn the_skip_never_fires_while_a_file_still_reads_from_its_host_bytes() {
+    let root = scratch("skip_base");
+    // Two sectors of host content, so overwriting the first leaves the second to be
+    // read from the host file itself.
+    let original: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(root.join("MIXED.BIN"), &original).unwrap();
+    let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+    let img = izarravm_firmware::tokados_hdd_img();
+    let mut mbr = [0u8; 512];
+    mbr.copy_from_slice(&img[0..512]);
+    let mut vbr = [0u8; 512];
+    vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+    let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+    let fc = vol
+        .tree()
+        .root
+        .files
+        .iter()
+        .find(|f| &f.name == b"MIXED   BIN")
+        .unwrap()
+        .first_cluster;
+
+    // The guest overwrites only the first sector, leaving the second to come from
+    // the host file. The directory entry keeps the original 1024-byte size.
+    let mut first = [0xA5u8; SECTOR];
+    first[0] = 0x01;
+    vol.write_sector(vol.cluster_to_lba(fc), &first);
+    vol.reconcile();
+    let mut expect = first.to_vec();
+    expect.extend_from_slice(&original[512..]);
+    assert_eq!(
+        std::fs::read(root.join("MIXED.BIN")).unwrap(),
+        expect,
+        "the merged file is materialized from store bytes plus host bytes"
+    );
+
+    // Nothing changed, but half this file's bytes still come from the host, so the
+    // skip must not fire. Its watermark inputs (size, chain, chunk seq) are all
+    // identical: only `all_present` stands between this and an unsound skip.
+    let before = vol.gathers();
+    vol.reconcile();
+    assert!(
+        vol.gathers() > before,
+        "a file that reads from its host bytes must not be skipped: the host file \
+         can change under it without any guest write"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A rename moves the host path, so the base view under the chain moves with it.
+/// The watermark must not survive that, or a later pass could skip a gather on the
+/// strength of where the file used to be.
+#[test]
+fn a_rename_clears_the_gather_watermark() {
+    let (mut vol, root) = fresh_vol("rename_watermark");
+    let free = vol.next_free + 1000;
+    stamp_file(&mut vol, 2, "BEFORE.TXT", 0x20, free, b"contents\r\n");
+    vol.reconcile();
+    // Skip-eligible now: a second pass leaves it alone.
+    let before = vol.gathers();
+    vol.reconcile();
+    assert_eq!(vol.gathers(), before, "the file should be skip-eligible");
+
+    rename_entry(&mut vol, 2, "BEFORE.TXT", "AFTER.TXT");
+    vol.reconcile();
+    assert!(
+        root.join("AFTER.TXT").exists(),
+        "the rename should reach the host"
+    );
+    // The renamed entry is a fresh mirror entry with no watermark, so the next pass
+    // must re-read it rather than trust the old one.
+    let before = vol.gathers();
+    vol.reconcile();
+    assert!(
+        vol.gathers() > before,
+        "a renamed file must be re-read: its watermark described the old path"
+    );
+    assert_eq!(
+        std::fs::read(root.join("AFTER.TXT")).unwrap(),
+        b"contents\r\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Push `count` unrelated sectors through the cache, so anything written before
+/// them is evicted to the spill.
+#[cfg(test)]
+fn flush_cache(vol: &mut KateaTreeVolume, count: u32) {
+    let cold = vol.cluster_to_lba(vol.next_free + 5000);
+    for i in 0..count {
+        vol.write_sector(cold + i, &[0x77; SECTOR]);
+    }
+}
+
+/// The dangerous case for phase 2: an entry the guest removed from its directory
+/// while its chain is still allocated. Reconcile decides "deleted" by reading the
+/// chain's FAT entry, so if that read fails and returns zeros, an intact chain
+/// looks freed and a real host file gets removed on the strength of an I/O error.
+#[test]
+fn a_failed_fat_read_never_deletes_the_host_file() {
+    let (mut vol, root) = fresh_vol("read_fail_delete");
+    shrink_cache(&mut vol, 30);
+    // Clear of the root directory, so the directory's own FAT sector is never
+    // written and phase 1 can still read it from the computed base view.
+    let first = vol.next_free + 1000;
+    stamp_file(
+        &mut vol,
+        2,
+        "COLD.BIN",
+        0x20,
+        first,
+        b"precious contents\r\n",
+    );
+    vol.reconcile();
+    assert!(root.join("COLD.BIN").exists());
+
+    // Evict this file's FAT sector, then drop its directory entry while leaving the
+    // chain allocated: exactly the shape of a guest delete, minus the freed chain.
+    flush_cache(&mut vol, 40);
+    delete_entry(&mut vol, 2, "COLD.BIN");
+    vol.store.fail_spill_reads();
+    vol.reconcile();
+
+    assert!(
+        vol.store.read_errors() > 0,
+        "the FAT read for the vanished entry must have failed"
+    );
+    assert!(
+        root.join("COLD.BIN").exists(),
+        "an unreadable FAT entry must not be taken as a freed chain: the host file \
+         would be deleted on the strength of an I/O failure"
+    );
+    assert_eq!(
+        std::fs::read(root.join("COLD.BIN")).unwrap(),
+        b"precious contents\r\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The dangerous case for phase 3: the chain reads fine but the file's own data
+/// does not. The gathered bytes would be part real and part zeros, and reconcile
+/// would write that straight over a good host file.
+#[test]
+fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
+    let (mut vol, root) = fresh_vol("read_fail_data");
+    shrink_cache(&mut vol, 30);
+    let first = vol.next_free + 1000;
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    stamp_file(&mut vol, 2, "DATA.BIN", 0x20, first, &payload);
+    vol.reconcile();
+    assert_eq!(std::fs::read(root.join("DATA.BIN")).unwrap(), payload);
+
+    // Evict the file's data, then bring its FAT sectors and the root directory back
+    // into the cache by rewriting them unchanged, so phase 1 and the chain walk both
+    // still succeed while the data behind them does not. This is the whole point:
+    // with the directory spilled too, phase 1 aborts the pass and the per-file
+    // bracket under test is never reached. Reads must happen before arming.
+    flush_cache(&mut vol, 40);
+    let dir_lba = vol.cluster_to_lba(2);
+    let dir_sec = vol.read_sector(dir_lba);
+    vol.write_sector(dir_lba, &dir_sec);
+    for c in 0..4u32 {
+        let byte = (first + c) as usize * 4;
+        let fat_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let sec = vol.read_sector(fat_lba);
+        vol.write_sector(fat_lba, &sec);
+    }
+    // Touch one data sector, so the file is not skip-eligible and reconcile really
+    // does try to re-read the whole body.
+    vol.write_sector(vol.cluster_to_lba(first), &[0xEE; SECTOR]);
+    vol.store.fail_spill_reads();
+    vol.reconcile();
+
+    assert!(
+        vol.store.read_errors() > 0,
+        "the spilled tail of the file must have failed to read"
+    );
+    assert_eq!(
+        std::fs::read(root.join("DATA.BIN")).unwrap(),
+        payload,
+        "a file whose data cannot be read back must be held, never materialized \
+         from the zeros that a failed read returns"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
