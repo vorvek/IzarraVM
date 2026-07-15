@@ -281,6 +281,53 @@ fn decode_one(bytes: &[u8]) -> DecodedInsn {
 }
 
 #[test]
+fn writes_memory_classifier_recognizes_poll_bodies_and_stores() {
+    // The rung-P poll-wait disqualifier. It must return FALSE for the read-only instructions a device
+    // poll is built from (so the loop stays elidable) and TRUE for any store (conservatively, plus
+    // anything unrecognized). The load-bearing case is `test al,imm8` (0xA8, Doom's retrace poll
+    // compare), which routes to the Misc catch-all and must be recognized as a non-writer.
+    for (bytes, name) in [
+        (&[0xec][..], "in al,dx"),
+        (&[0xa8, 0x08][..], "test al,8 (0xA8, the poll compare)"),
+        (&[0xa9, 0x08, 0x00][..], "test ax,imm (0xA9)"),
+        (&[0x84, 0xc3][..], "test al,bl"),
+        (
+            &[0x3b, 0x03][..],
+            "cmp eax,[ebx] (reads memory, writes none)",
+        ),
+        (&[0x24, 0x08][..], "and al,8"),
+        (&[0x3c, 0x08][..], "cmp al,8"),
+        (&[0x8b, 0x03][..], "mov eax,[ebx] (load)"),
+        (&[0xba, 0xda, 0x03][..], "mov dx,0x3da"),
+        (&[0x39, 0xc3][..], "cmp ebx,eax (register form)"),
+        (&[0x74, 0xfa][..], "jz (branch)"),
+    ] {
+        let insn = decode_one(bytes);
+        assert!(
+            !jit::block::writes_memory(&insn),
+            "{name} does not write memory"
+        );
+    }
+
+    for (bytes, name) in [
+        (&[0x89, 0x03][..], "mov [ebx],eax (store)"),
+        (&[0x88, 0x03][..], "mov [ebx],al (store)"),
+        (&[0x01, 0x03][..], "add [ebx],eax (rmw store)"),
+        (&[0x87, 0x03][..], "xchg [ebx],eax"),
+        (&[0xc7, 0x03, 0x01, 0x00, 0x00, 0x00][..], "mov [ebx],imm"),
+        (&[0xff, 0x03][..], "inc dword [ebx] (group 5)"),
+        (&[0x50][..], "push eax (stack)"),
+        (&[0xaa][..], "stosb (string writer)"),
+    ] {
+        let insn = decode_one(bytes);
+        assert!(
+            jit::block::writes_memory(&insn),
+            "{name} may write memory (disqualifying)"
+        );
+    }
+}
+
+#[test]
 fn terminator_predicate_covers_clock_device_and_interrupt_ops() {
     // Interior-eligible ops: fall through, no interrupt-visibility change, continuable.
     for (bytes, name) in [
@@ -2217,7 +2264,7 @@ fn unit_sim_feed_is_state_neutral() {
     let reports = sim_on
         .take_unit_sim_report()
         .expect("the sim was enabled, so a report exists");
-    // The wired ladder fans out to the measurement set {L0, L4, L5, L6}; every rung sees the same
+    // The wired ladder fans out to the measurement set {L0, L4, L6, P}; every rung sees the same
     // non-empty trace.
     assert_eq!(
         reports.len(),

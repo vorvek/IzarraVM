@@ -40,6 +40,37 @@ fn unit_sim_touches_io(opcode: u16) -> bool {
     )
 }
 
+/// Whether an opcode is a port IN, for the unit simulator's `io_read` fact (rung P): the immediate
+/// forms 0xE4/0xE5 and the DX forms 0xEC/0xED. OUT and the string I/O forms are excluded - only a
+/// port READ can be the side-effect-free device poll that P models.
+#[cfg(feature = "jit")]
+fn unit_sim_io_read(opcode: u16) -> bool {
+    matches!(opcode, 0xe4 | 0xe5 | 0xec | 0xed)
+}
+
+/// The port number an IN reads: the imm8 for 0xE4/0xE5, else the live DX (0xEC/0xED). Used only by
+/// the `IZARRAVM_IO_HIST` per-port histogram.
+#[cfg(feature = "jit")]
+fn unit_sim_io_port(insn: &DecodedInsn, dx: u16) -> u16 {
+    match insn.opcode {
+        0xe4 | 0xe5 => (insn.imm & 0xff) as u16,
+        _ => dx,
+    }
+}
+
+/// True when `IZARRAVM_IO_HIST` requests the per-port io-read histogram (any value other than "" or
+/// "0"). Off by default and read once; the histogram is a diagnostic that never touches guest state.
+#[cfg(feature = "jit")]
+fn io_hist_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var("IZARRAVM_IO_HIST")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "" | "0"))
+    })
+}
+
 #[cfg(feature = "jit")]
 enum DirectContinuation {
     Run(CycleOutcome),
@@ -701,10 +732,17 @@ impl CpuGsw {
     /// architectural state unchanged (it is excluded from `CpuGsw` equality).
     #[cfg(feature = "jit")]
     pub fn set_unit_sim_enabled(&mut self, on: bool) {
-        // The C-pre-3 measurement set is {L0, L4, L5, L6}: the L0 anchor, the L4->L5 marginal, and
-        // the L5->L6 marginal. Running only these four rungs is cheaper than the full L0..L6 ladder;
-        // the complete ladder stays available via `SimLadder::new()` for tests.
-        self.unit_sim.0 = on.then(|| Box::new(jit::unit_sim::SimLadder::with_rungs(&[0, 4, 5, 6])));
+        // The C-pre-4 measurement set is {L0, L4, L6, P}: the L0 anchor, L4 as the secondary anchor,
+        // L6 as the poll-wait rung's baseline, and P itself. L5 is DROPPED from the measurement set
+        // (C-pre-3 recorded its global-hashed-table result as a net negative on both Dooms; it is not
+        // re-run here). The complete ladder stays available via `SimLadder::new()` for tests.
+        self.unit_sim.0 = on.then(|| {
+            let mut ladder = jit::unit_sim::SimLadder::with_rungs(&[0, 4, 6, 7]);
+            if io_hist_requested() {
+                ladder.enable_io_hist();
+            }
+            Box::new(ladder)
+        });
     }
 
     /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. `None`
@@ -720,6 +758,14 @@ impl CpuGsw {
     ) -> Option<Vec<(&'static str, SimReport, Vec<(usize, u32)>)>> {
         let ladder = self.unit_sim.0.take()?;
         Some(ladder.reports())
+    }
+
+    /// The per-port io-read histogram (behind `IZARRAVM_IO_HIST=1`), sorted by count descending.
+    /// `None` when the sim or the histogram was not enabled. Borrows (does not take) the sim, so it
+    /// must be read BEFORE `take_unit_sim_report`. Consumed by the headless reporter.
+    #[cfg(feature = "jit")]
+    pub fn unit_sim_io_hist(&self) -> Option<Vec<(u16, u64)>> {
+        self.unit_sim.0.as_ref()?.io_hist_sorted()
     }
 
     /// Feed one retired interpreter instruction into the optional unit simulator. A no-op (one
@@ -746,6 +792,9 @@ impl CpuGsw {
             .decode_cache
             .line_phys_start(lin, d)
             .map_or(lin >> 12, |phys| phys >> 12);
+        // `writes_memory` / `io_read` are derived HERE, after the sim-disabled early return, so the
+        // production (sim-off) path never runs the classifier; only rung P reads either fact.
+        let io_read = unit_sim_io_read(insn.opcode);
         let observed = jit::unit_sim::ObservedInsn {
             linear: lin,
             len: insn.len,
@@ -756,8 +805,17 @@ impl CpuGsw {
                 || jit::block::changes_interrupt_visibility(insn)
                 || jit::block::changes_native_memory_context(insn),
             touches_io: unit_sim_touches_io(insn.opcode),
+            writes_memory: jit::block::writes_memory(insn),
+            io_read,
         };
+        // The per-port io histogram is counted once per retirement (on the ladder, not per rung); the
+        // DX-form port is a runtime register value read here, so resolve it before the sim borrow.
+        let io_port = (io_read && io_hist_requested())
+            .then(|| unit_sim_io_port(insn, self.registers.edx() as u16));
         if let Some(sim) = self.unit_sim.0.as_mut() {
+            if let Some(port) = io_port {
+                sim.record_io_read(port);
+            }
             sim.observe(observed);
         }
     }

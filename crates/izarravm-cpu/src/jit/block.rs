@@ -213,6 +213,66 @@ pub(crate) fn observed_transfer(
     }
 }
 
+/// Whether the decoded operand is a memory reference (as opposed to a register or no operand).
+fn operand_is_mem(insn: &DecodedInsn) -> bool {
+    matches!(insn.operand, Some(DecodedOperand::Mem(_)))
+}
+
+/// Whether `insn` MAY write memory, for the rung-P poll-wait detector (feature `jit`, diagnostic
+/// only; consumed exclusively via `ObservedInsn::writes_memory` at rung P). CONSERVATIVE: it returns
+/// `false` only for forms we can confirm never store to memory, and `true` for everything else,
+/// because a false positive merely under-detects a poll loop (safe) while a false negative could
+/// elide a loop that mutates state (unsafe). The recognized non-writers cover the shapes a device
+/// poll loop is built from - port IN, TEST/CMP against memory, register ALU, memory loads, branches.
+/// A CALL / PUSH / string writer / anything unrecognized is disqualifying (`true`).
+pub(crate) fn writes_memory(insn: &DecodedInsn) -> bool {
+    match insn.group {
+        // Relative branches and port IN/OUT never touch memory operands.
+        DecodeGroup::Branch | DecodeGroup::PortIo => false,
+        // TEST r/m,reg (0x84/0x85) reads; INC/DEC reg, CBW.., the flag ops, SAHF/LAHF write no memory.
+        DecodeGroup::FlagsMisc => false,
+        // ALU forms 0-5: a store to a memory r/m happens only for the store-direction forms 0/1 of a
+        // non-CMP operation with a memory operand. CMP (operation 7) and the load/accumulator forms
+        // (2-5) never write memory.
+        DecodeGroup::Alu => {
+            let operation = (insn.opcode >> 3) & 7;
+            let form = insn.opcode & 7;
+            operation != 7 && matches!(form, 0 | 1) && operand_is_mem(insn)
+        }
+        // DataMove: the store-direction MOV/XCHG r/m forms write memory when the operand is memory;
+        // MOV moffs,accumulator (0xa2/0xa3) always writes memory. Loads (0x8a/0x8b/0xa0/0xa1),
+        // LEA (0x8d), MOV Sreg (0x8e), MOV reg,imm, XCHG reg,eAX, and MOVZX/MOVSX write no memory.
+        DecodeGroup::DataMove => match insn.opcode {
+            0x88 | 0x89 | 0x8c | 0x86 | 0x87 | 0xc6 | 0xc7 => operand_is_mem(insn),
+            0xa2 | 0xa3 => true,
+            _ => false,
+        },
+        // The /ext groups 1-4: a register-form r/m writes no memory. For a memory r/m, CMP (group 1
+        // reg 7) and TEST (group 3 reg 0/1) read only; every other sub-op (ALU-imm, shift/rotate,
+        // NOT/NEG/MUL/IMUL/DIV read-modify, INC/DEC) is treated as a memory write (MUL/DIV are
+        // conservatively included though they only read the operand).
+        DecodeGroup::Group => {
+            if !operand_is_mem(insn) {
+                return false;
+            }
+            let reg = insn.modrm.map_or(0, |m| m.reg);
+            match insn.opcode {
+                0x80..=0x83 => reg != 7,
+                0xf6 | 0xf7 => reg >= 2,
+                _ => true,
+            }
+        }
+        // The heterogeneous catch-all: only the accumulator-immediate TEST forms (0xA8/0xA9) are
+        // confirmed non-writers here, and they are exactly the common poll-loop compare (Doom's
+        // `in al,dx; test al,8; jz`). Everything else in Misc (string port I/O, IMUL-imm, BCD, XLAT,
+        // CPUID/RDTSC, ...) is conservatively disqualifying.
+        DecodeGroup::Misc => !matches!(insn.opcode, 0xa8 | 0xa9),
+        // Stack (push/pop/call/enter), control flow (call/int push), string ops (movs/stos), FPU,
+        // system/segment, and every remaining form: conservatively disqualifying.
+        _ => true,
+    }
+}
+
 /// Whether an instruction changes interrupt visibility (IF/TF) or arms the one-instruction
 /// interrupt shadow. These are `continuable` (the interpreter runs them inline, with its
 /// per-instruction interrupt-transition check), but the region DEFERS that check to the whole-

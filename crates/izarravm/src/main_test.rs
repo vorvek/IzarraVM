@@ -654,13 +654,64 @@ fn unit_sim_report_lines_format_headline_and_histogram() {
             "unit_sim cfg=L0 entries=1000 retired_in_units=3500 linked_transfers=42 loop_links=0 \
 call_links=0 ret_links=0 itc_hits=0 ght_hits=0 ght_ret_hits=0 unresolved_exits=7 side_exits_io=3 \
 side_exits_async=2 io_callouts=0 sim_invalidations=5 sim_restamps=0 units_built=120 \
-units_rebuilt=4 insns_per_entry=3.500000"
+units_rebuilt=4 elided_insns=0 elided_waits=0 wait_batch_ends=0 spin_noio_insns=0 \
+insns_per_entry=3.500000 ipe_active=3.500000 ipe_active_slice=3.500000"
                 .to_string(),
             "unit_sim_hist cfg=L0 units=10 members_p50=5 members_p90=9 members_max=65 \
 units_over_64=1 units_over_128=0 units_over_256=0 excl_units=2"
                 .to_string(),
         ]
     );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn unit_sim_report_lines_format_p_rung_both_quotients() {
+    // The P rung: elided iterations and absorbed budget yields make the two active-stream quotients
+    // diverge from each other and from the structural metric. entries=100, retired=1000,
+    // elided_insns=400, wait_batch_ends=100. insns_per_entry = 1000/100 = 10; ipe_active =
+    // (1000-400)/100 = 6; ipe_active_slice = 600/(100+100) = 3.
+    let report = izarravm_cpu::SimReport {
+        entries: 100,
+        retired_in_units: 1000,
+        io_callouts: 50,
+        elided_insns: 400,
+        elided_waits: 3,
+        wait_batch_ends: 100,
+        spin_noio_insns: 20,
+        ..Default::default()
+    };
+    let reports = vec![("P", report, Vec::new())];
+    let lines = unit_sim_report_lines(&reports);
+    assert_eq!(
+        lines[0],
+        "unit_sim cfg=P entries=100 retired_in_units=1000 linked_transfers=0 loop_links=0 \
+call_links=0 ret_links=0 itc_hits=0 ght_hits=0 ght_ret_hits=0 unresolved_exits=0 side_exits_io=0 \
+side_exits_async=0 io_callouts=50 sim_invalidations=0 sim_restamps=0 units_built=0 units_rebuilt=0 \
+elided_insns=400 elided_waits=3 wait_batch_ends=100 spin_noio_insns=20 insns_per_entry=10.000000 \
+ipe_active=6.000000 ipe_active_slice=3.000000"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn io_hist_lines_format_top_ports_descending() {
+    // Already-sorted (count desc, port asc) input; the formatter emits `io_hist port=0xNNN count=...`
+    // and caps at the top 16.
+    let hist: Vec<(u16, u64)> = vec![(0x03da, 4000), (0x0061, 1200), (0x0388, 30)];
+    let lines = io_hist_lines(&hist);
+    assert_eq!(
+        lines,
+        vec![
+            "io_hist port=0x03da count=4000".to_string(),
+            "io_hist port=0x0061 count=1200".to_string(),
+            "io_hist port=0x0388 count=30".to_string(),
+        ]
+    );
+
+    // A run of 20 ports is capped at 16 lines.
+    let many: Vec<(u16, u64)> = (0..20u16).map(|i| (i, 100 - u64::from(i))).collect();
+    assert_eq!(io_hist_lines(&many).len(), 16);
 }
 
 #[cfg(feature = "jit")]
@@ -679,7 +730,8 @@ fn unit_sim_report_lines_handle_empty_run() {
             "unit_sim cfg=L0 entries=0 retired_in_units=0 linked_transfers=0 loop_links=0 \
 call_links=0 ret_links=0 itc_hits=0 ght_hits=0 ght_ret_hits=0 unresolved_exits=0 side_exits_io=0 \
 side_exits_async=0 io_callouts=0 sim_invalidations=0 sim_restamps=0 units_built=0 units_rebuilt=0 \
-insns_per_entry=0.000000"
+elided_insns=0 elided_waits=0 wait_batch_ends=0 spin_noio_insns=0 insns_per_entry=0.000000 \
+ipe_active=0.000000 ipe_active_slice=0.000000"
                 .to_string(),
             "unit_sim_hist cfg=L0 units=0 members_p50=0 members_p90=0 members_max=0 units_over_64=0 \
 units_over_128=0 units_over_256=0 excl_units=0"
@@ -687,7 +739,8 @@ units_over_128=0 units_over_256=0 excl_units=0"
             "unit_sim cfg=L1 entries=0 retired_in_units=0 linked_transfers=0 loop_links=0 \
 call_links=0 ret_links=0 itc_hits=0 ght_hits=0 ght_ret_hits=0 unresolved_exits=0 side_exits_io=0 \
 side_exits_async=0 io_callouts=0 sim_invalidations=0 sim_restamps=0 units_built=0 units_rebuilt=0 \
-insns_per_entry=0.000000"
+elided_insns=0 elided_waits=0 wait_batch_ends=0 spin_noio_insns=0 insns_per_entry=0.000000 \
+ipe_active=0.000000 ipe_active_slice=0.000000"
                 .to_string(),
             "unit_sim_hist cfg=L1 units=0 members_p50=0 members_p90=0 members_max=0 units_over_64=0 \
 units_over_128=0 units_over_256=0 excl_units=0"

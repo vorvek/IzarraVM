@@ -14,15 +14,24 @@ impl Machine {
     }
 
     /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. Each
-    /// element is `(cfg_label, headline, histogram)` for one ladder rung (`L0..L4`), where the
-    /// histogram entries are `(member_count, entry_physical_page)`. `None` when the sim was not
-    /// enabled. Only present with feature `jit`; see `CpuGsw::take_unit_sim_report`.
+    /// element is `(cfg_label, headline, histogram)` for one ladder rung (the measurement set
+    /// `{L0, L4, L6, P}`), where the histogram entries are `(member_count, entry_physical_page)`.
+    /// `None` when the sim was not enabled. Only present with feature `jit`; see
+    /// `CpuGsw::take_unit_sim_report`.
     #[cfg(feature = "jit")]
     #[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
     pub fn take_unit_sim_report(
         &mut self,
     ) -> Option<Vec<(&'static str, izarravm_cpu::SimReport, Vec<(usize, u32)>)>> {
         self.cpu.take_unit_sim_report()
+    }
+
+    /// The per-port io-read histogram (behind `IZARRAVM_IO_HIST=1`), sorted by count descending.
+    /// `None` without the histogram. Must be read before `take_unit_sim_report` (it borrows the sim);
+    /// only present with feature `jit`. See `CpuGsw::unit_sim_io_hist`.
+    #[cfg(feature = "jit")]
+    pub fn unit_sim_io_hist(&self) -> Option<Vec<(u16, u64)>> {
+        self.cpu.unit_sim_io_hist()
     }
 
     fn consume_pending_device_memory_write_range(&mut self) {
