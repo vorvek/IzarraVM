@@ -701,12 +701,16 @@ impl CpuGsw {
     /// architectural state unchanged (it is excluded from `CpuGsw` equality).
     #[cfg(feature = "jit")]
     pub fn set_unit_sim_enabled(&mut self, on: bool) {
-        self.unit_sim.0 = on.then(|| Box::new(jit::unit_sim::SimLadder::new()));
+        // The C-pre-3 measurement set is {L0, L4, L5, L6}: the L0 anchor, the L4->L5 marginal, and
+        // the L5->L6 marginal. Running only these four rungs is cheaper than the full L0..L6 ladder;
+        // the complete ladder stays available via `SimLadder::new()` for tests.
+        self.unit_sim.0 = on.then(|| Box::new(jit::unit_sim::SimLadder::with_rungs(&[0, 4, 5, 6])));
     }
 
     /// Take the unit-simulator ladder's per-rung reports, disabling the sim in the process. `None`
     /// when the sim was not enabled. Each element is `(cfg_label, headline, histogram)` for one
-    /// ladder rung (`L0..L4`), where the histogram entries are `(member_count, entry_physical_page)`;
+    /// ladder rung (the measurement set `L0, L4, L5, L6`), where the histogram entries are
+    /// `(member_count, entry_physical_page)`;
     /// see `SimReport` and `jit::unit_sim` for the counter meanings. Consumed by the measurement
     /// tests and Track C tooling.
     #[cfg(feature = "jit")]

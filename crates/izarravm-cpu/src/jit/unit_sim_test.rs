@@ -608,7 +608,11 @@ fn ladder_feeds_five_sims_and_l0_matches_solo_v1() {
     }
 
     let reports = ladder.reports();
-    assert_eq!(reports.len(), 5);
+    assert_eq!(
+        reports.len(),
+        7,
+        "SimLadder::new() fans out to the full L0..L6"
+    );
     assert_eq!(reports[0].0, "L0");
     assert_eq!(reports[0].1, solo.report());
     assert_eq!(reports[0].2, solo.unit_member_histogram());
@@ -788,4 +792,299 @@ fn l2_failed_call_link_still_pushes_shadow_stack() {
     sim.observe(ret(0x3000, 1));
     sim.observe(insn(0x1007, 2));
     assert_eq!(sim.report().ret_links, 1);
+}
+
+// --- C-pre-3: L5 global hashed target lookup and L6 io call-outs ---
+
+#[test]
+fn ght_hash_pins_qemu_shape() {
+    // The index is a function of the LOW address bits only. Deriving from the pinned formula
+    // (index depends on tmp bits {0..5, 12..17}, i.e. linear bits 0..23), two linears differing
+    // ONLY above bit 23 collide, while adjacent same-page linears map to distinct slots. This pins
+    // the shape of QEMU's tb_jmp_cache_hash_func. (The addendum's "above bit 17" is imprecise: the
+    // formula's masks make bits 18..23 matter; bit 24 and up never change the slot.)
+    assert_eq!(ght_index(0x2000), ght_index(0x2000 + (1 << 24)));
+    assert_eq!(ght_index(0x2000), ght_index(0x2000 + (1 << 27)));
+    // Adjacent same-page linears (2-byte insns) do not collide with each other.
+    assert_ne!(ght_index(0x1000), ght_index(0x1002));
+    assert_ne!(ght_index(0x1002), ght_index(0x1004));
+    assert_ne!(ght_index(0x1000), ght_index(0x1004));
+    // Every slot is in range.
+    for lin in [0u32, 0x1000, 0xdead_beef, 0xffff_ffff] {
+        assert!(ght_index(lin) < 4096);
+    }
+}
+
+#[test]
+fn l5_indirect_links_via_global_table() {
+    // A ends Indirect to B twice. The first resolution finds B unknown: it misses (unresolved),
+    // and reprocessing B opens+installs it. The second resolution hits the table (ght_hits == 1)
+    // and the switch opens no fresh entry.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(5));
+
+    sim.observe(insn(0x1000, 2));
+    sim.observe(indirect(0x1002, 2));
+    sim.observe(insn(0x3000, 2)); // B unknown: miss, B built + installed here
+    assert_eq!(sim.report().ght_hits, 0);
+    sim.note_batch_end();
+
+    sim.observe(insn(0x1000, 2));
+    sim.observe(indirect(0x1002, 2));
+    let entries_at_exit = sim.report().entries;
+    sim.observe(insn(0x3000, 2)); // B resident in the table: hit
+    assert_eq!(sim.report().ght_hits, 1);
+    assert_eq!(
+        sim.report().entries,
+        entries_at_exit,
+        "the table hit switches without opening a fresh entry"
+    );
+}
+
+#[test]
+fn l5_empty_stack_ret_arms_ght_and_links() {
+    // A Return with an EMPTY shadow stack arms a Ght check at L5 and resolves via the table when the
+    // slot holds the (known) return target. Attributed by origin: ght_ret_hits, not ght_hits.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(5));
+    build_known(&mut sim, 0x5000); // T known + installed at entry-open; shadow stays empty
+
+    sim.observe(insn(0x2000, 2)); // open a fresh entry
+    sim.observe(ret(0x2002, 1)); // empty stack -> arm Ght{from_return}
+    sim.observe(insn(0x5000, 2)); // T is table-resident: return resolves via the table
+
+    let r = sim.report();
+    assert_eq!(r.ght_ret_hits, 1);
+    assert_eq!(r.ght_hits, 0);
+    assert_eq!(r.ret_links, 0);
+}
+
+#[test]
+fn l5_ret_stage2_fallback() {
+    // A non-empty shadow stack holds a WRONG address; the observed target is a different, known,
+    // table-resident unit. Stage 1 (shadow compare) fails; stage 2 (the table) links the return.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(5));
+    build_known(&mut sim, 0x5000); // T known + installed
+
+    // Push a wrong return address (0x1002) via an indirect call, then end the batch (the pending
+    // Ght check charges unresolved and closes; the shadow frame survives).
+    sim.observe(call_indirect(0x1000, 2));
+    sim.note_batch_end();
+
+    sim.observe(insn(0x2000, 2)); // fresh entry
+    sim.observe(ret(0x2002, 1)); // pops 0x1002 -> Deferred::Return{0x1002}
+    let ret_links_before = sim.report().ret_links;
+    sim.observe(insn(0x5000, 2)); // T != 0x1002: stage 1 fails, stage 2 table hit
+
+    let r = sim.report();
+    assert_eq!(
+        r.ret_links, ret_links_before,
+        "the shadow compare did not link"
+    );
+    assert_eq!(r.ght_ret_hits, 1, "the table resolved the return");
+    assert_eq!(r.ght_hits, 0);
+}
+
+#[test]
+fn l5_linked_switch_does_not_install() {
+    // Linked switches (direct/call/loop chaining) must NOT install into the global table: only
+    // entry-open, deferred resolution, and shadow-ret-link success do. Construction: B is built once
+    // (entry-open installs it), then its slot is evicted by a colliding install, then B is reached
+    // ONLY via a CallNear linked switch. A subsequent Indirect to B must MISS, proving the linked
+    // switch did not reinstall B. X = B + (1 << 24) collides with B (the hash ignores bits >= 24).
+    const B: u32 = 0x2000;
+    const X: u32 = 0x2000 + (1 << 24);
+    assert_eq!(ght_index(B), ght_index(X), "B and X must collide");
+
+    let mut sim = UnitSim::with_config(SimConfig::ladder(5));
+    build_known(&mut sim, B); // entry-open installs B in its slot
+    build_known(&mut sim, X); // colliding install evicts B's slot (now holds X)
+
+    // Reach B ONLY via a CallNear linked switch (call-link, no install).
+    sim.observe(insn(0x8000, 2));
+    sim.observe(call_near(0x8002, 5, B));
+    assert!(sim.report().call_links >= 1, "the caller must link to B");
+    sim.note_batch_end();
+
+    // Indirect to B: B is a live unit, but its slot still holds X, so the table probe misses.
+    sim.observe(insn(0x9000, 2));
+    sim.observe(indirect(0x9002, 2));
+    let ght_hits_before = sim.report().ght_hits;
+    let unresolved_before = sim.report().unresolved_exits;
+    sim.observe(insn(B, 2));
+
+    let r = sim.report();
+    assert_eq!(
+        r.ght_hits, ght_hits_before,
+        "the linked switch must not have reinstalled B"
+    );
+    assert_eq!(r.unresolved_exits, unresolved_before + 1);
+}
+
+#[test]
+fn l5_collision_evicts() {
+    // Two units whose entries hash to the same slot; alternating indirect transfers between them
+    // thrash the direct-mapped table: each landing's resolution-install evicts the other, so the
+    // next (opposite) target always misses. P and Q = P + (1 << 24) collide.
+    const P: u32 = 0x2000;
+    const Q: u32 = 0x2000 + (1 << 24);
+    assert_eq!(ght_index(P), ght_index(Q), "P and Q must collide");
+
+    let mut sim = UnitSim::with_config(SimConfig::ladder(5));
+    build_known(&mut sim, P);
+    build_known(&mut sim, Q); // colliding: the slot now holds Q, evicting P
+
+    for &t in &[P, Q, P, Q, P, Q] {
+        sim.observe(insn(0x9000, 2));
+        sim.observe(indirect(0x9002, 2));
+        sim.observe(insn(t, 2)); // the slot holds the OTHER unit -> miss
+        sim.note_batch_end();
+    }
+    assert_eq!(
+        sim.report().ght_hits,
+        0,
+        "direct-mapped collisions must thrash, never hit"
+    );
+}
+
+#[test]
+fn l6_io_keeps_entry_open() {
+    // A poll loop with an IN instruction (touches_io) plus a back-edge. At L6 the IN accrues as an
+    // in-unit call-out: io_callouts counts each IN, the single entry stays open, side_exits_io == 0.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(6));
+    sim.observe(insn(0x1000, 2)); // open once
+    for _ in 0..5 {
+        let mut io = insn(0x1002, 2);
+        io.touches_io = true;
+        io.transfer = TransferKind::DirectNear { target: 0x1000 }; // in-window back-edge
+        sim.observe(io);
+        sim.observe(insn(0x1000, 2)); // continues via the recorded direct target
+    }
+    let r = sim.report();
+    assert_eq!(r.entries, 1, "the io call-out keeps the single entry open");
+    assert_eq!(r.io_callouts, 5);
+    assert_eq!(r.side_exits_io, 0);
+}
+
+#[test]
+fn l6_terminator_with_io_still_closes() {
+    // An instruction that is BOTH a terminator and touches io: the terminator check precedes the io
+    // rule, so it closes unresolved and never counts an io call-out.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(6));
+    let mut i = insn(0x1000, 2);
+    i.is_terminator = true;
+    i.touches_io = true;
+    sim.observe(i);
+
+    let r = sim.report();
+    assert_eq!(r.entries, 1);
+    assert_eq!(r.unresolved_exits, 1);
+    assert_eq!(r.io_callouts, 0);
+    assert_eq!(r.side_exits_io, 0);
+}
+
+#[test]
+fn l6_pending_deferred_resolves_on_io_insn() {
+    // A Return arms a deferred check; the resolving observation touches io. The deferred resolves
+    // normally (a shadow ret-link here), and the io instruction accrues into the switched unit,
+    // incrementing io_callouts without closing.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(6));
+    build_known(&mut sim, 0x1007); // return target T, known
+
+    sim.observe(call_indirect(0x1005, 2)); // pushes 0x1007, arms a Ght check
+    sim.note_batch_end(); // clear the pending check; shadow keeps 0x1007
+
+    sim.observe(insn(0x2000, 2)); // open a fresh entry
+    sim.observe(ret(0x2002, 1)); // pops 0x1007 -> Deferred::Return{0x1007}
+
+    let mut io = insn(0x1007, 2); // the resolving observation touches io
+    io.touches_io = true;
+    sim.observe(io);
+
+    let r = sim.report();
+    assert_eq!(r.ret_links, 1, "the shadow compare linked the return");
+    assert_eq!(r.io_callouts, 1, "the io insn accrued to the switched unit");
+    assert_eq!(
+        r.side_exits_io, 0,
+        "the io call-out did not close the entry"
+    );
+}
+
+#[test]
+fn with_rungs_selects_and_labels() {
+    let ladder = SimLadder::with_rungs(&[0, 4, 5, 6]);
+    let reports = ladder.reports();
+    assert_eq!(reports.len(), 4);
+    assert_eq!(reports[0].0, "L0");
+    assert_eq!(reports[1].0, "L4");
+    assert_eq!(reports[2].0, "L5");
+    assert_eq!(reports[3].0, "L6");
+}
+
+#[test]
+fn ladder_first_five_reports_unchanged() {
+    // The L0-L4 bit-identity guarantee: an identical mixed stream fed to five solo ladder(0..=4)
+    // configs and to the full L0..L6 SimLadder produces field-for-field equal reports on the first
+    // five rungs, with all new counters zero.
+    enum Ev {
+        Obs(ObservedInsn),
+        Write(u32, u32),
+        Batch,
+    }
+    let events = vec![
+        Ev::Obs(insn(0x1000, 2)),
+        Ev::Obs(loop_near(0x1002, 2, 0x1000)),
+        Ev::Obs(insn(0x1000, 2)),
+        Ev::Obs(loop_near(0x1002, 2, 0x1000)),
+        Ev::Write(0x1001, 2),
+        Ev::Batch,
+        Ev::Obs(call_near(0x2000, 5, 0x1000)),
+        Ev::Obs(insn(0x3000, 2)),
+        Ev::Obs(ret(0x3002, 1)),
+        Ev::Obs(insn(0x2005, 2)),
+        Ev::Write(0x2fff, 4),
+        Ev::Batch,
+        Ev::Obs(call_indirect(0x4000, 2)),
+        Ev::Obs(indirect(0x4002, 2)),
+        Ev::Obs(insn(0x5000, 2)),
+        Ev::Batch,
+    ];
+
+    let mut solos: Vec<UnitSim> = (0u8..=4)
+        .map(|r| UnitSim::with_config(SimConfig::ladder(r)))
+        .collect();
+    let mut ladder = SimLadder::new();
+    for ev in &events {
+        match *ev {
+            Ev::Obs(i) => {
+                for s in &mut solos {
+                    s.observe(i);
+                }
+                ladder.observe(i);
+            }
+            Ev::Write(p, w) => {
+                for s in &mut solos {
+                    s.note_code_write(p, w);
+                }
+                ladder.note_code_write(p, w);
+            }
+            Ev::Batch => {
+                for s in &mut solos {
+                    s.note_batch_end();
+                }
+                ladder.note_batch_end();
+            }
+        }
+    }
+
+    let reports = ladder.reports();
+    assert_eq!(reports.len(), 7);
+    for (r, solo) in solos.iter().enumerate() {
+        assert_eq!(reports[r].1, solo.report(), "rung L{r} report changed");
+        assert_eq!(reports[r].2, solo.unit_member_histogram());
+        assert_eq!(reports[r].1.ght_hits, 0, "L{r} ght_hits must be zero");
+        assert_eq!(
+            reports[r].1.ght_ret_hits, 0,
+            "L{r} ght_ret_hits must be zero"
+        );
+        assert_eq!(reports[r].1.io_callouts, 0, "L{r} io_callouts must be zero");
+    }
 }
