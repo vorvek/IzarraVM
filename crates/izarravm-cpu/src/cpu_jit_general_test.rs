@@ -291,7 +291,10 @@ fn writes_memory_classifier_recognizes_poll_bodies_and_stores() {
         (&[0xa8, 0x08][..], "test al,8 (0xA8, the poll compare)"),
         (&[0xa9, 0x08, 0x00][..], "test ax,imm (0xA9)"),
         (&[0x84, 0xc3][..], "test al,bl"),
-        (&[0x3b, 0x03][..], "cmp eax,[ebx] (reads memory, writes none)"),
+        (
+            &[0x3b, 0x03][..],
+            "cmp eax,[ebx] (reads memory, writes none)",
+        ),
         (&[0x24, 0x08][..], "and al,8"),
         (&[0x3c, 0x08][..], "cmp al,8"),
         (&[0x8b, 0x03][..], "mov eax,[ebx] (load)"),
