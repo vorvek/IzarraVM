@@ -236,6 +236,8 @@ impl CpuGsw {
         self.perf.device_write_ranges += 1;
         self.perf.device_write_bytes += u64::from(width);
         let prefetch_hit = self.prefetch.overlaps_physical_range(physical, width);
+        // G2 out of scope: a device/HLE write range invalidates unconditionally. The device wrote
+        // the bytes through its own path, so the CPU has no pre-write old-byte snapshot to compare.
         let code_hit = self.note_code_write(physical, width);
         if prefetch_hit {
             self.prefetch.invalidate();
@@ -250,8 +252,29 @@ impl CpuGsw {
     /// re-decode those lines. Byte-exact: a 16-bit stack push just below the code (the flat
     /// tiny-model layout the benchmarks use) writes only its own two bytes, so it never disturbs the
     /// adjacent code.
-    #[inline]
     pub(super) fn note_code_write(&mut self, physical: u32, width: u32) -> bool {
+        self.note_code_write_hit(physical, width)
+    }
+
+    /// Cheap, side-effect-free probe hoisted out of `note_code_write_hit`: does the store range
+    /// touch any watched code (a compiled block's physical span or a decoded instruction line)?
+    /// Value-aware callers (the sized-store path) gate the read-old-bytes comparison that drives
+    /// G2 same-value elision on this, paying nothing extra when the store misses all code.
+    #[inline]
+    pub(super) fn code_write_watched(&self, physical: u32, width: u32) -> bool {
+        #[cfg(feature = "jit")]
+        if self.jit_direct.range_hits_compiled_code(physical, width) {
+            return true;
+        }
+        self.decode_cache.range_hits_code(physical, width)
+    }
+
+    /// The invalidation body of a code write. Only reached once the store is known to have changed
+    /// a watched code byte (G2 elision skips it for same-value sized stores) or from a value-less
+    /// caller through `note_code_write`. The unit-sim feed lives here, behind the elision choke, so
+    /// the diagnostic mirrors the post-elision production invalidation path exactly.
+    #[inline]
+    pub(super) fn note_code_write_hit(&mut self, physical: u32, width: u32) -> bool {
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
@@ -264,9 +287,16 @@ impl CpuGsw {
             sim.note_code_write(physical, width);
         }
         let mut invalidated = false;
+        // G1: heat is incremented only on a byte-precise ACTUAL invalidation (a killed compiled
+        // block or a narrow decode kill), never on the coarse global-flush fallback and never when
+        // the write hit no code. That precision dissolves the 16-byte false-demotion concern: a
+        // data byte sharing a chunk with cold code kills nothing, so it never heats the chunk.
+        let mut heat_hit = false;
         #[cfg(feature = "jit")]
         if self.jit_direct.range_hits_compiled_code(physical, width) {
-            invalidated = self.jit_direct.invalidate_physical_range(physical, width) != 0;
+            let killed = self.jit_direct.invalidate_physical_range(physical, width);
+            invalidated = killed != 0;
+            heat_hit |= killed != 0;
         }
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
@@ -296,6 +326,7 @@ impl CpuGsw {
                     self.perf.smc_narrow_kills += u64::from(kills);
                     if kills > 0 {
                         self.perf.code_invalidations += 1;
+                        heat_hit = true;
                     }
                     // A kill inside an installed region's physical span stales its slot table
                     // even though the entry line's stamp may survive; bump the epoch so entry
@@ -317,7 +348,27 @@ impl CpuGsw {
             // The fetch-page snapshot may hold the written bytes under either outcome.
             self.fetch_page.invalidate();
         }
+        #[cfg(feature = "jit")]
+        if heat_hit {
+            let epoch = self.smc_heat_epoch();
+            let newly_hot = self.jit_direct.smc_heat_bump(physical, width, epoch);
+            self.perf.smc_heat_chunks_hot += u64::from(newly_hot);
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = heat_hit;
         invalidated
+    }
+
+    /// G1 heat epoch: the retired-instruction megacount. Both the invalidation choke (which bumps
+    /// heat) and the admission gate (which reads it) derive the epoch from this one clock, so a
+    /// chunk's churn count is only live within the ~1M-instruction window it accrued in.
+    /// Corner: `reset_perf_counters` restarts the instruction count, so epoch numbers repeat and a
+    /// stale epoch-0 stamp can briefly read as current again (one epoch of over-conservative
+    /// demotion at worst; correctness is unaffected, demotion only routes to the interpreter).
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(super) fn smc_heat_epoch(&self) -> u32 {
+        (self.perf.instructions >> jit::direct::SMC_HEAT_EPOCH_SHIFT) as u32
     }
 
     pub(super) fn begin_instruction(&mut self) {

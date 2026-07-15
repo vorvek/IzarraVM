@@ -422,6 +422,10 @@ impl CpuGsw {
                 }
                 if bytes > access {
                     let remaining_dst = dst.wrapping_add(access as u32);
+                    // G2 out of scope: bulk MOVS already streamed the new bytes into the
+                    // destination through write_memory_bytes_direct above, so the old bytes are
+                    // gone. A pre-read to compare would be an O(n) tax on the fast string path;
+                    // this invalidation stays unconditional.
                     self.note_code_write(remaining_dst, (bytes - access) as u32);
                     self.record_write_page(remaining_dst);
                 }

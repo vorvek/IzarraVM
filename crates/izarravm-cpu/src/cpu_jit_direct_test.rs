@@ -2082,7 +2082,7 @@ fn native_store_watch_covers_overlap_cross_chunk_and_same_value_cases() {
 }
 
 #[test]
-fn same_value_watched_dword_store_invalidates_and_replays_a_cold_decode() {
+fn same_value_watched_dword_store_elides_invalidation_and_replays_warm() {
     const TARGET: u32 = 0x4200;
     const VALUE: u32 = 0x1234_5678;
 
@@ -2128,14 +2128,12 @@ fn same_value_watched_dword_store_invalidates_and_replays_a_cold_decode() {
     );
     assert!(native_outcomes.last().is_some_and(|outcome| outcome.2));
     assert!(interp_outcomes.last().is_some_and(|outcome| outcome.2));
-    assert_eq!(
-        interp.perf_counters().code_invalidations,
-        interp_invalidations + 1
-    );
-    assert_eq!(
-        native.perf_counters().code_invalidations,
-        native_invalidations + 1
-    );
+    // G2: the dword store writes the same bytes already at TARGET, so the watched-code write is
+    // elided and neither side invalidates (the native store side-exits through the interpreter).
+    let interp_after = interp.perf_counters().code_invalidations;
+    let native_after = native.perf_counters().code_invalidations;
+    assert_eq!(interp_after, interp_invalidations);
+    assert_eq!(native_after, native_invalidations);
 
     let interp_misses = interp.perf_counters().decode_misses;
     let native_misses = native.perf_counters().decode_misses;
@@ -2145,10 +2143,11 @@ fn same_value_watched_dword_store_invalidates_and_replays_a_cold_decode() {
     ] {
         cpu.registers.eip = TARGET;
         cpu.begin_instruction();
-        cpu.fetch_decoded(bus, TARGET).expect("cold target decode");
+        cpu.fetch_decoded(bus, TARGET).expect("warm target decode");
     }
-    assert_eq!(interp.perf_counters().decode_misses, interp_misses + 1);
-    assert_eq!(native.perf_counters().decode_misses, native_misses + 1);
+    // The decode line at TARGET survived (no invalidation), so the replay is a warm cache hit.
+    assert_eq!(interp.perf_counters().decode_misses, interp_misses);
+    assert_eq!(native.perf_counters().decode_misses, native_misses);
 }
 
 fn watched_byte_store_program(target: u32) -> Vec<u8> {

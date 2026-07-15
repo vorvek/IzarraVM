@@ -1325,3 +1325,121 @@ fn ranged_device_write_preserves_unrelated_blocks_and_unlinks_overlap() {
     assert_eq!(cpu.perf.device_write_code_hits, 1);
     assert_eq!(cpu.perf.device_write_coarse_resets, 0);
 }
+
+// ---- G1 SMC heat map ----
+
+#[test]
+fn smc_heat_crosses_the_threshold_within_one_epoch() {
+    let mut cache = BlockCache::default();
+    let phys = 0x2_1234;
+    for _ in 0..SMC_HEAT_THRESHOLD - 1 {
+        assert_eq!(cache.smc_heat_bump(phys, 4, 0), 0);
+    }
+    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+    // The threshold-th bump crosses and reports exactly one newly-hot chunk.
+    assert_eq!(cache.smc_heat_bump(phys, 4, 0), 1);
+    assert!(cache.smc_heat_chunk_hot(phys, 0));
+    // Saturated bumps neither overflow nor re-report the chunk.
+    assert_eq!(cache.smc_heat_bump(phys, 4, 0), 0);
+    assert!(cache.smc_heat_chunk_hot(phys, 0));
+}
+
+#[test]
+fn smc_heat_ages_out_across_epochs_and_reenables_admission() {
+    let mut cache = BlockCache::default();
+    let phys = 0x2_1234;
+    for _ in 0..SMC_HEAT_THRESHOLD {
+        cache.smc_heat_bump(phys, 4, 7);
+    }
+    assert!(cache.smc_heat_chunk_hot(phys, 7));
+    // A later epoch reads the stale stamp as zero, so admission is re-enabled, and a fresh bump
+    // starts that epoch's count from one rather than inheriting the saturated older count.
+    assert!(!cache.smc_heat_chunk_hot(phys, 8));
+    assert_eq!(cache.smc_heat_bump(phys, 4, 8), 0);
+    assert!(!cache.smc_heat_chunk_hot(phys, 8));
+}
+
+#[test]
+fn smc_heat_span_hot_only_flags_overlapping_chunks() {
+    let mut cache = BlockCache::default();
+    let hot = 0x2_1234; // 16-byte chunk 0x2_123
+    for _ in 0..SMC_HEAT_THRESHOLD {
+        cache.smc_heat_bump(hot, 1, 0);
+    }
+    assert!(cache.smc_heat_span_hot(0x2_1230, 8, 0));
+    assert!(!cache.smc_heat_span_hot(0x2_1220, 8, 0));
+    assert!(!cache.smc_heat_span_hot(0x2_1240, 8, 0));
+    // A wide span reaching across the boundary into the hot chunk still demotes.
+    assert!(cache.smc_heat_span_hot(0x2_1228, 16, 0));
+}
+
+#[test]
+fn smc_heat_threshold_setter_and_clear() {
+    let mut cache = BlockCache::default();
+    cache.set_smc_heat_threshold(2);
+    let phys = 0x2_1234;
+    cache.smc_heat_bump(phys, 4, 0);
+    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+    cache.smc_heat_bump(phys, 4, 0);
+    assert!(cache.smc_heat_chunk_hot(phys, 0));
+    // A whole-cache clear is the only place heat is dropped.
+    cache.clear();
+    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn reset_storage_drops_smc_heat_but_incremental_invalidation_keeps_it() {
+    let mut cache = BlockCache::default();
+    let phys = 0x60_010;
+    for _ in 0..SMC_HEAT_THRESHOLD {
+        cache.smc_heat_bump(phys, 4, 0);
+    }
+    // Installing then draining a block (an incremental invalidation) leaves heat intact.
+    install_trivial(&mut cache, BlockKey::new(0x1000, phys, 7), 16);
+    cache.invalidate_physical_range(phys, 4);
+    assert!(
+        cache.smc_heat_chunk_hot(phys, 0),
+        "heat survives invalidation"
+    );
+    // A full reset (arena pressure / clear) is the only wipe.
+    install_trivial(&mut cache, BlockKey::new(0x1000, phys, 7), 16);
+    cache.clear();
+    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn smc_heat_accrues_only_on_actual_code_invalidation() {
+    let mut cpu = CpuGsw::default();
+    let key = BlockKey::new(0x1000, 0x60_010, 7);
+    // A churn loop: install, invalidate, repeat. Each note_code_write kills the compiled block
+    // (an actual invalidation), so the entry chunk heats and crosses the threshold in this epoch.
+    for _ in 0..u32::from(SMC_HEAT_THRESHOLD) {
+        install_trivial(&mut cpu.jit_direct, key, 16);
+        cpu.note_code_write(key.physical, 4);
+    }
+    assert!(cpu.jit_direct.smc_heat_chunk_hot(key.physical, 0));
+    assert_eq!(cpu.perf.smc_heat_chunks_hot, 1);
+
+    // A data byte sharing the same 16-byte chunk as cold code (the block watches only its own
+    // bytes) invalidates nothing, so it never heats the chunk and the block survives.
+    let mut cold = CpuGsw::default();
+    let data_key = BlockKey::new(0x2000, 0x61_000, 7);
+    install_trivial(&mut cold.jit_direct, data_key, 4); // watches 0x61_000..0x61_003
+    for _ in 0..8 {
+        cold.note_code_write(0x61_004, 1); // same chunk 0x61_00, unwatched byte
+    }
+    assert!(!cold.jit_direct.smc_heat_chunk_hot(data_key.physical, 0));
+    assert_eq!(cold.perf.smc_heat_chunks_hot, 0);
+    assert!(matches!(
+        cold.jit_direct.probe(data_key),
+        BlockProbe::Ready(_)
+    ));
+}

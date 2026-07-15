@@ -826,6 +826,14 @@ impl CpuGsw {
         self.jit_regions.set_auto_admit(on && jit::host_supported());
     }
 
+    /// G1: shared demotion tail of both admission gates. Parks the key Dormant, stamps its entry
+    /// chunk for cool-down recovery, and counts the demotion.
+    #[cfg(feature = "jit")]
+    fn smc_heat_demote(&mut self, key: jit::direct::BlockKey, epoch: u32) {
+        self.jit_direct.demote_smc_hot(key, epoch);
+        self.perf.smc_heat_demotions += 1;
+    }
+
     #[cfg(feature = "jit")]
     fn try_direct_continuation<B: CpuBus>(
         &mut self,
@@ -853,6 +861,12 @@ impl CpuGsw {
         let block = match probe {
             jit::direct::BlockProbe::Interpret => return Ok(DirectContinuation::Interpret),
             jit::direct::BlockProbe::Rejected => {
+                // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out lifts
+                // back to Seen here, so the next encounter re-admits through the normal path.
+                // Dormants without a heat stamp (Retry, G4 cover failure) stay parked. On the cold
+                // Rejected path only, so Ready hits never pay the lookup.
+                let heat_epoch = self.smc_heat_epoch();
+                self.jit_direct.lift_cold_smc_dormant(key, heat_epoch);
                 return Ok(DirectContinuation::Interpret);
             }
             jit::direct::BlockProbe::Ready(id) => self
@@ -860,6 +874,16 @@ impl CpuGsw {
                 .block(id)
                 .expect("ready direct block must remain live"),
             jit::direct::BlockProbe::Compile => {
+                // G1 pre-compile gate (cheap, entry chunk only): if the block's first 16-byte
+                // chunk is churning this heat epoch, park it Dormant and interpret without paying a
+                // compile. Dormant (not Rejected) because Rejected would acquire watch ranges and
+                // keep the demoted page alive; existing valid blocks keep running and links only
+                // form to installed blocks, so a demoted region starves naturally.
+                let heat_epoch = self.smc_heat_epoch();
+                if self.jit_direct.smc_heat_chunk_hot(key.physical, heat_epoch) {
+                    self.smc_heat_demote(key, heat_epoch);
+                    return Ok(DirectContinuation::Interpret);
+                }
                 let compile_start = std::time::Instant::now();
                 let outcome = jit::direct::compile(self, lin, d);
                 self.perf.jit_direct_compile_attempts += 1;
@@ -876,6 +900,13 @@ impl CpuGsw {
                         return Ok(DirectContinuation::Interpret);
                     }
                 };
+                // G4 guarantee (dev_docs/specs/2026-07-15-smc-hardening-design.md): a block only
+                // installs when a real RAM direct page covers its whole physical span. The kind
+                // MUST stay InstructionPrefetch: the production bus yields a direct page under that
+                // kind ONLY for true RAM, so video/MMIO windows (the mode-13 window answers Data
+                // kinds only), ROM, and A20-gated aliases all return None here and can never host
+                // compiled code. Switching this to a Data kind would let the VGA window pass and is
+                // pinned against by the G4 CPU test.
                 let code_page =
                     bus.direct_page(key.physical, BusAccessKind::InstructionPrefetch)?;
                 let code_page_covers_block = code_page.is_some_and(|page| {
@@ -886,6 +917,17 @@ impl CpuGsw {
                 });
                 if !code_page_covers_block {
                     self.jit_direct.dormant(key);
+                    return Ok(DirectContinuation::Interpret);
+                }
+                // G1 pre-install gate (full span): the compiled block may cover chunks past its
+                // entry that are churning even when the entry chunk is cold. Refuse installation
+                // and park it Dormant so the whole span runs on the interpreter.
+                if self.jit_direct.smc_heat_span_hot(
+                    key.physical,
+                    u32::from(compilation.span.guest_len),
+                    heat_epoch,
+                ) {
+                    self.smc_heat_demote(key, heat_epoch);
                     return Ok(DirectContinuation::Interpret);
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {

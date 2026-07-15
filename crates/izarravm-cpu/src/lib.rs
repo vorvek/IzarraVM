@@ -554,6 +554,15 @@ pub struct PerfCounters {
     /// invalidated individually, no whole-cache flush). decode_inval_smc keeps counting the
     /// global-flush fallbacks only, so the two together split the SMC write traffic.
     pub smc_narrow_kills: u64,
+    /// G1 SMC heat demotions: compiled-block admissions refused because the entry chunk (pre-
+    /// compile gate) or some chunk under the block span (pre-install gate) crossed the churn
+    /// threshold this heat epoch. The block is parked Dormant and the region runs on the
+    /// interpreter until an epoch with no fresh invalidation lets it re-admit.
+    pub smc_heat_demotions: u64,
+    /// Distinct 16-byte code chunks that crossed the heat threshold (one per chunk per epoch). A
+    /// diagnostic of how much genuine self-modifying churn the guest generates; near zero on the
+    /// periodic-repatch anchors.
+    pub smc_heat_chunks_hot: u64,
     /// Device and HLE writes reported with an exact physical range. These writes use the same
     /// narrow code invalidation path as CPU stores instead of clearing the whole code cache.
     pub device_write_ranges: u64,

@@ -537,3 +537,216 @@ fn device_write_recovers_rejection_after_decode_eviction() {
         jit::direct::BlockProbe::Interpret
     ));
 }
+
+// ---- G1 SMC heat demotion gate ----
+
+#[test]
+fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    // Heat the entry 16-byte chunk past the churn threshold within epoch 0.
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat_bump(ENTRY, 1, 0);
+    }
+    let attempts = cpu.perf_counters().jit_direct_compile_attempts;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    let demotions = cpu.perf_counters().smc_heat_demotions;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    // The cheap entry-chunk gate refuses admission before a compile is even attempted.
+    assert_eq!(
+        cpu.perf_counters().jit_direct_compile_attempts,
+        attempts,
+        "no compile should be paid"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed,
+        "the block must not install"
+    );
+    assert!(cpu.perf_counters().smc_heat_demotions > demotions);
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+}
+
+#[test]
+fn smc_heat_pre_install_gate_demotes_a_hot_span_after_compiling() {
+    let code: Vec<u8> = std::iter::repeat_n(0x40u8, 20).chain([0xf4]).collect();
+    let addresses: Vec<u32> = (ENTRY..ENTRY + code.len() as u32).collect();
+    // Learn the compiled span so the assertion below is self-checking.
+    let (mut probe_cpu, mut probe_bus) = fixture(&code);
+    warm(&mut probe_cpu, &mut probe_bus, &addresses);
+    let span_len = compiled(jit::direct::compile(&mut probe_cpu, ENTRY, true))
+        .span
+        .guest_len;
+    assert!(
+        span_len > 16,
+        "block must cross into the second 16-byte chunk (len={span_len})"
+    );
+
+    let (mut cpu, mut bus) = fixture(&code);
+    warm(&mut cpu, &mut bus, &addresses);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    // Heat a chunk inside the span but NOT the entry chunk: the cheap pre-compile gate passes and
+    // the full-span gate after compilation must catch it before install.
+    let far = ENTRY + 16;
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat_bump(far, 1, 0);
+    }
+    assert!(
+        !cpu.jit_direct.smc_heat_chunk_hot(ENTRY, 0),
+        "entry chunk stays cold"
+    );
+    let attempts = cpu.perf_counters().jit_direct_compile_attempts;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    let demotions = cpu.perf_counters().smc_heat_demotions;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert!(
+        cpu.perf_counters().jit_direct_compile_attempts > attempts,
+        "the block compiles (this is the post-compile gate)"
+    );
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed,
+        "the block must not install"
+    );
+    assert!(cpu.perf_counters().smc_heat_demotions > demotions);
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+}
+
+// ---- G4 non-RAM code admission ----
+
+#[test]
+fn g4_admission_refuses_a_page_without_instruction_prefetch_cover() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    // Model a non-RAM code page: the bus serves Data kinds (decode still works) but yields no
+    // direct page under InstructionPrefetch. The install-time cover check MUST use
+    // InstructionPrefetch, so admission is refused and the block parks Dormant with no install.
+    // Switching that check to a Data kind would let this install and fail the assertion below.
+    bus.deny_instruction_prefetch_direct_page = true;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed,
+        "no install without InstructionPrefetch cover"
+    );
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+
+    // A cover-failure Dormant carries no heat stamp, so G1's epoch-aging recovery never lifts it:
+    // still parked after a full epoch advance.
+    cpu.perf.instructions = 1u64 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+    cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+        .expect("gate");
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+    assert_eq!(cpu.perf_counters().jit_direct_blocks_installed, installed);
+
+    // Positive control: restoring the cover installs the identical block, proving the missing
+    // InstructionPrefetch page was the only thing that refused admission.
+    bus.deny_instruction_prefetch_direct_page = false;
+    cpu.jit_direct.clear();
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed + 1,
+        "installs once RAM covers the page under InstructionPrefetch"
+    );
+}
+
+#[test]
+fn smc_heat_demoted_key_recovers_when_its_chunk_cools() {
+    let (mut cpu, mut bus) = fixture(&[0x40, 0x41, 0x42, 0xf4]);
+    warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
+    cpu.set_jit_auto_admit(true);
+    let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat_bump(ENTRY, 1, 0);
+    }
+    // Demote through the gate: parked Dormant, no install, and probing within the same epoch does
+    // NOT lift it (the stamp still reads current).
+    let demotions = cpu.perf_counters().smc_heat_demotions;
+    let installed = cpu.perf_counters().jit_direct_blocks_installed;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert!(cpu.perf_counters().smc_heat_demotions > demotions);
+    assert_eq!(cpu.perf_counters().jit_direct_blocks_installed, installed);
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Rejected
+    ));
+
+    // Advance one heat epoch: the next probe path lifts the Dormant (stale stamp), and the normal
+    // admission path re-compiles and installs the block.
+    cpu.perf.instructions = 1u64 << jit::direct::SMC_HEAT_EPOCH_SHIFT;
+    for _ in 0..4 {
+        cpu.try_direct_continuation_for_test(&mut bus, ENTRY, true)
+            .expect("gate");
+    }
+    assert_eq!(
+        cpu.perf_counters().jit_direct_blocks_installed,
+        installed + 1,
+        "a cooled chunk re-admits and compiles"
+    );
+    assert!(matches!(
+        cpu.jit_direct.probe(key),
+        jit::direct::BlockProbe::Ready(_)
+    ));
+}
+
+// G2+G1 composition: a same-value store churn loop into watched code accrues NO heat (elision
+// keeps it out of the invalidation choke entirely), so it can never demote anything.
+#[test]
+fn same_value_store_churn_accrues_no_heat() {
+    const TARGET: u32 = 0x1800;
+    const VALUE: u32 = 0xdead_beef;
+    let (mut cpu, mut bus) = fixture(&[0x40, 0xf4]);
+    bus.memory[TARGET as usize..TARGET as usize + 4].copy_from_slice(&VALUE.to_le_bytes());
+    cpu.decode_cache.mark_code_range(TARGET, 4);
+    // Baseline after fixture setup (set_mode counts one translation-cache invalidation).
+    let invalidations = cpu.perf_counters().code_invalidations;
+    for _ in 0..16 {
+        cpu.write_memory_sized(
+            &mut bus,
+            SegmentIndex::Ds,
+            TARGET,
+            OperandSize::Dword,
+            VALUE,
+            BusAccessKind::DataWrite,
+        )
+        .expect("watched same-value store");
+    }
+    assert_eq!(cpu.perf_counters().smc_heat_chunks_hot, 0);
+    assert_eq!(cpu.perf_counters().smc_heat_demotions, 0);
+    assert_eq!(cpu.perf_counters().code_invalidations, invalidations);
+}

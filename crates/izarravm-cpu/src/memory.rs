@@ -345,6 +345,9 @@ impl CpuGsw {
     }
 
     #[inline]
+    /// `Some(changed)` means the direct sized write completed (`changed` = the old bytes differed
+    /// from `value`); `None` asks the caller to use the bus path. The `changed` flag drives G2
+    /// same-value elision, mirroring the byte variant `write_direct_byte_page_cached`.
     pub(super) fn write_direct_page_cached<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -353,9 +356,9 @@ impl CpuGsw {
         width: BusWidth,
         value: u32,
         kind: BusAccessKind,
-    ) -> ExecResult<bool> {
+    ) -> ExecResult<Option<bool>> {
         if !Self::direct_access_page_local(physical, width) {
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(entry) = self.data_write_pages.get(physical) {
             #[cfg(all(
@@ -371,19 +374,20 @@ impl CpuGsw {
                 true,
             );
             bus.charge_direct_memory(physical, width, kind)?;
+            let changed = Self::read_direct_entry(entry, physical, width) != value;
             Self::write_direct_entry(entry, physical, width, value);
             self.record_data_write(kind, true);
             self.perf.direct_data_pointer_writes += 1;
-            return Ok(true);
+            return Ok(Some(changed));
         }
         let Some(page) = bus.direct_page(physical, kind)? else {
             self.perf.direct_page_misses += 1;
-            return Ok(false);
+            return Ok(None);
         };
         let offset = (physical & 0x0fff) as usize;
         if !page.writable || page.len < 0x1000 || offset + width.bytes() as usize > page.len {
             self.perf.direct_page_misses += 1;
-            return Ok(false);
+            return Ok(None);
         }
         self.perf.direct_page_hits += 1;
         self.data_write_pages.insert(page);
@@ -397,19 +401,16 @@ impl CpuGsw {
                 .note_fast_map_linear(physical, _linear);
         }
         bus.charge_direct_memory(physical, width, kind)?;
-        Self::write_direct_entry(
-            DirectPageCacheEntry {
-                physical_page: page.physical_page,
-                fast_map_linear_page: _linear & !0x0fff,
-                ptr: page.ptr,
-            },
-            physical,
-            width,
-            value,
-        );
+        let entry = DirectPageCacheEntry {
+            physical_page: page.physical_page,
+            fast_map_linear_page: _linear & !0x0fff,
+            ptr: page.ptr,
+        };
+        let changed = Self::read_direct_entry(entry, physical, width) != value;
+        Self::write_direct_entry(entry, physical, width, value);
         self.record_data_write(kind, true);
         self.perf.direct_data_pointer_writes += 1;
-        Ok(true)
+        Ok(Some(changed))
     }
 
     /// `Some(changed)` means the direct write completed; `None` asks the caller to use the bus path.
@@ -820,7 +821,17 @@ impl CpuGsw {
         while completed < width {
             let at = linear.wrapping_add(completed);
             let fragment = Self::page_local_fragment_width(at, width - completed);
-            self.write_linear_fragment(bus, at, fragment, value >> (completed * 8), kind)?;
+            // G2: mask to the fragment width so the same-value compare in write_linear_fragment
+            // sees only the bytes this fragment stores. Unmasked high bits made every cross-page
+            // sub-dword fragment read as changed, defeating elision; the store itself writes only
+            // `fragment` bytes either way, so masking is behavior-neutral for the write.
+            let shifted = value >> (completed * 8);
+            let fragment_value = match fragment {
+                BusWidth::Byte => shifted & 0xff,
+                BusWidth::Word => shifted & 0xffff,
+                BusWidth::Dword => shifted,
+            };
+            self.write_linear_fragment(bus, at, fragment, fragment_value, kind)?;
             completed += fragment.bytes();
         }
         Ok(())
@@ -869,13 +880,32 @@ impl CpuGsw {
             return self.write_linear_u8(bus, linear, value as u8, kind);
         }
         let physical = self.translate_linear(bus, linear, true)?;
-        self.note_code_write(physical, width.bytes());
-        if self.write_direct_page_cached(bus, linear, physical, width, value, kind)? {
-            return Ok(());
+        // G2: same-value elision for sized stores. Probe the code watch first (side-effect free);
+        // when the store misses all watched code this costs exactly what the old unconditional
+        // note_code_write cost. On a direct-page hit we read the old bytes, write, and invalidate
+        // only when the value actually changed a watched code byte, so a patch-then-restore of
+        // identical bytes never triggers a cold re-decode. Ordering is compare-then-write-then-
+        // invalidate, matching the shipped byte path in write_linear_u8.
+        let watched = self.code_write_watched(physical, width.bytes());
+        match self.write_direct_page_cached(bus, linear, physical, width, value, kind)? {
+            Some(changed) => {
+                if watched && changed {
+                    self.note_code_write_hit(physical, width.bytes());
+                }
+                Ok(())
+            }
+            None => {
+                // Bus fallback (MMIO or a fragment the direct-page cache could not serve). MMIO
+                // reads are side-effecting, so the old bytes cannot be pre-read to compare; a
+                // watched store here invalidates unconditionally.
+                if watched {
+                    self.note_code_write_hit(physical, width.bytes());
+                }
+                let write = bus.write_memory_direct(physical, width, value, kind)?;
+                self.record_data_write(kind, write.direct);
+                Ok(())
+            }
         }
-        let write = bus.write_memory_direct(physical, width, value, kind)?;
-        self.record_data_write(kind, write.direct);
-        Ok(())
     }
 
     // #AC alignment check (486). A data access faults vector 17 (no error code) when
@@ -909,6 +939,9 @@ impl CpuGsw {
         let linear = self.segment_linear_range(segment, offset, width, write)?;
         let physical = self.translate_linear(bus, linear, write)?;
         if write {
+            // G2 out of scope: this is a translate-time invalidation with no value in hand yet
+            // (the store value arrives later, through the operand write path), so there is nothing
+            // to compare and the invalidation stays unconditional.
             self.note_code_write(physical, width);
         }
         Ok((linear, physical))
@@ -990,6 +1023,10 @@ impl CpuGsw {
             BusAccessKind::PageWalkWrite,
         )?;
         self.record_write_page(physical);
+        // G2 out of scope: a page-walk A/D-bit store invalidates unconditionally. The old PTE was
+        // already consumed by the walk and the bus write above committed the new bytes, so there
+        // is no old-byte snapshot to compare, and self-modifying page tables are rare enough that
+        // the extra pre-read would not earn its cost.
         self.note_code_write(physical, BusWidth::Dword.bytes());
         Ok(())
     }

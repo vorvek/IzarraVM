@@ -35,6 +35,14 @@ pub(crate) mod fast_map;
 #[allow(dead_code)]
 pub(crate) mod native_x87;
 mod region;
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
+pub(crate) mod smc_heat;
 pub(crate) mod step;
 pub(crate) mod unit_sim;
 #[cfg(all(
