@@ -51,8 +51,8 @@ use super::exec_mem::ExecutableBuffer;
 use super::region::{CompiledRegion, JIT_REGION_TABLE_CAP};
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
 use crate::{
-    AddressSize, CpuGsw, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize, Prefixes,
-    SegmentIndex,
+    AddressSize, CpuGsw, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize,
+    PollBranchShape, PollLoop, PollPortSource, Prefixes, SegmentIndex,
 };
 
 /// Cap on a compiled block's slot count, to bound the emit and the compile pass. A block that
@@ -400,6 +400,203 @@ pub(crate) fn build_block(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<(Vec<
         SlotKind::Memory
     };
     Some((slots, is_loop))
+}
+
+fn poll_slots_within_live_cs(cpu: &CpuGsw, slots: &[Slot]) -> bool {
+    let cs = cpu.registers.cs();
+    slots.iter().all(|slot| {
+        let slot_eip = slot.lin.wrapping_sub(cs.base);
+        CpuGsw::fetch_within_limit(slot_eip, slot.insn.len, cs.limit)
+    })
+}
+
+type PollFetches = ([(u32, u32, u8); 6], u8);
+
+fn poll_fetches(slots: &[Slot]) -> Option<PollFetches> {
+    let fetch_count = u8::try_from(slots.len()).ok()?;
+    if fetch_count > 6 {
+        return None;
+    }
+    let mut fetches = [(0, 0, 0); 6];
+    for (fetch, slot) in fetches.iter_mut().zip(slots) {
+        *fetch = (slot.lin, slot.physical, slot.insn.len);
+    }
+    Some((fetches, fetch_count))
+}
+
+fn exact_poll_test_branch(test: &Slot, branch: &Slot) -> Option<(u8, bool)> {
+    if test.insn.opcode != 0xa8 || test.insn.len != 2 || branch.insn.len != 2 {
+        return None;
+    }
+    let mask = u8::try_from(test.insn.imm).ok()?;
+    if !matches!(mask, 0x01 | 0x08) || !matches!(branch.insn.opcode, 0x74 | 0x75) {
+        return None;
+    }
+    Some((mask, branch.insn.opcode == 0x74))
+}
+
+/// Recognize only the reviewed 3DA poll-loop shapes from the same warm decode-cache
+/// view used by compiled blocks. Re-running this before every span makes an SMC
+/// restamp replace the descriptor rather than reusing stale bytes or addresses.
+fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
+    let d = cpu.registers.cs().default_size_32;
+    let (slots, is_loop) = build_block(cpu, entry, d)?;
+
+    if let [input, test, branch] = slots.as_slice()
+        && d
+        && is_loop
+        && input.insn.opcode == 0xec
+        && input.insn.len == 1
+        && cpu.registers.edx() as u16 == 0x03da
+        && loop_back_edge_target(&branch.insn, branch.lin) == Some(entry)
+    {
+        let (mask, branch_when_zero) = exact_poll_test_branch(test, branch)?;
+        if !poll_slots_within_live_cs(cpu, &slots) {
+            return None;
+        }
+        let (fetches, fetch_count) = poll_fetches(&slots)?;
+        return Some(PollLoop {
+            fetches,
+            fetch_count,
+            port_source: PollPortSource::CurrentDx,
+            branch_shape: PollBranchShape::Direct,
+            status_mask: mask,
+            branch_when_zero,
+            raw_core_clocks: 17,
+            at_head: cpu.linear_eip() == entry,
+        });
+    }
+
+    let [setup, clear, input, test, branch] = slots.as_slice() else {
+        return None;
+    };
+    if !d
+        || setup.insn.opcode != 0x89
+        || setup.insn.len != 2
+        || setup.insn.operand_size != OperandSize::Dword
+        || clear.insn.opcode != 0x29
+        || clear.insn.len != 2
+        || clear.insn.operand_size != OperandSize::Dword
+        || clear
+            .insn
+            .modrm
+            .is_none_or(|modrm| (modrm.mode, modrm.reg, modrm.rm) != (3, 0, 0))
+        || input.insn.opcode != 0xec
+        || input.insn.len != 1
+    {
+        return None;
+    }
+    let port_source = match setup
+        .insn
+        .modrm
+        .map(|modrm| (modrm.mode, modrm.reg, modrm.rm))
+    {
+        Some((3, 3, 2)) => PollPortSource::Ebx,
+        Some((3, 1, 2)) => PollPortSource::Ecx,
+        _ => return None,
+    };
+    let (mask, branch_when_zero) = exact_poll_test_branch(test, branch)?;
+    let branch_target = loop_back_edge_target(&branch.insn, branch.lin)?;
+    if is_loop && branch_target == entry {
+        if !poll_slots_within_live_cs(cpu, &slots) {
+            return None;
+        }
+        let (fetches, fetch_count) = poll_fetches(&slots)?;
+        return Some(PollLoop {
+            fetches,
+            fetch_count,
+            port_source,
+            branch_shape: PollBranchShape::Direct,
+            status_mask: mask,
+            branch_when_zero,
+            raw_core_clocks: 21,
+            at_head: cpu.linear_eip() == entry,
+        });
+    }
+
+    let jmp_entry = entry.checked_add(9)?;
+    let exit = entry.checked_add(11)?;
+    if is_loop
+        || branch_target != exit
+        || jmp_entry & !0x0fff != entry & !0x0fff
+        || exit.wrapping_sub(1) & !0x0fff != entry & !0x0fff
+    {
+        return None;
+    }
+    let (jmp_slots, jmp_is_loop) = build_block(cpu, jmp_entry, true)?;
+    let [jmp] = jmp_slots.as_slice() else {
+        return None;
+    };
+    if jmp_is_loop
+        || jmp.insn.opcode != 0xeb
+        || jmp.insn.len != 2
+        || loop_back_edge_target(&jmp.insn, jmp.lin) != Some(entry)
+    {
+        return None;
+    }
+    if !poll_slots_within_live_cs(cpu, &slots)
+        || !poll_slots_within_live_cs(cpu, std::slice::from_ref(jmp))
+    {
+        return None;
+    }
+    let (mut fetches, _) = poll_fetches(&slots)?;
+    fetches[5] = (jmp.lin, jmp.physical, jmp.insn.len);
+    Some(PollLoop {
+        fetches,
+        fetch_count: 6,
+        port_source,
+        branch_shape: PollBranchShape::PairedJmp,
+        status_mask: mask,
+        branch_when_zero,
+        raw_core_clocks: 28,
+        at_head: cpu.linear_eip() == entry,
+    })
+}
+
+/// Find an exact poll shape containing the current instruction start. The bounded
+/// backward scan stays in the current code page and accepts only captured slot starts.
+pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> Option<PollLoop> {
+    let current = cpu.linear_eip();
+    let page = current & !0x0fff;
+    for back in 0..=9u32 {
+        let entry = current.checked_sub(back)?;
+        if entry & !0x0fff != page {
+            break;
+        }
+        let Some(poll) = build_poll_loop_at(cpu, entry) else {
+            continue;
+        };
+        if (0..poll.fetch_count()).any(|index| {
+            poll.fetch(index)
+                .is_some_and(|(linear, _, _)| linear == current)
+        }) {
+            return Some(poll);
+        }
+    }
+    None
+}
+
+impl CpuGsw {
+    /// Conservative machine-level poll-skip entry gate. This mirrors the direct
+    /// IN permission fast path and rejects every state where the interpreter
+    /// would consult the modeled TSS I/O permission bitmap.
+    pub fn poll_skip_eligible(&self) -> bool {
+        matches!(self.persona(), CpuPersona::I486 | CpuPersona::I586)
+            && !self.jit_direct.backend_enabled()
+            && !self.profile.enabled
+            && !crate::run::diff_trace_enabled()
+            && !self.interrupt_shadow
+            && (!self.is_protected_mode()
+                || (!self.is_v86_mode() && self.current_privilege_level() <= self.iopl()))
+    }
+
+    /// Classify the current warm loop head. The result is rebuilt on every call.
+    pub fn poll_loop(&self) -> Option<PollLoop> {
+        if !self.poll_skip_eligible() {
+            return None;
+        }
+        build_poll_loop(self)
+    }
 }
 
 /// A hot linear block repays its entry cost only when its interior is a useful native group. The

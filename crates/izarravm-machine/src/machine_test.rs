@@ -12,45 +12,65 @@ const BIOS_TEXT_WHITE: u8 = 0x3F;
 
 #[test]
 fn jit_auto_admission_policy_defaults_on_only_when_available() {
-    assert!(jit_auto_admit_policy(
+    assert!(run::jit_auto_admit_policy(
         None,
         true,
         ExecutionBackend::Automatic
     ));
-    assert!(jit_auto_admit_policy(
+    assert!(run::jit_auto_admit_policy(
         Some("1"),
         true,
         ExecutionBackend::Automatic
     ));
-    assert!(jit_auto_admit_policy(
+    assert!(run::jit_auto_admit_policy(
         Some("yes"),
         true,
         ExecutionBackend::Automatic
     ));
-    assert!(!jit_auto_admit_policy(
+    assert!(!run::jit_auto_admit_policy(
         Some("0"),
         true,
         ExecutionBackend::Automatic
     ));
-    assert!(!jit_auto_admit_policy(
+    assert!(!run::jit_auto_admit_policy(
         Some(""),
         true,
         ExecutionBackend::Automatic
     ));
-    assert!(!jit_auto_admit_policy(
+    assert!(!run::jit_auto_admit_policy(
         None,
         false,
         ExecutionBackend::Automatic
     ));
-    assert!(!jit_auto_admit_policy(
+    assert!(!run::jit_auto_admit_policy(
         Some("1"),
         false,
         ExecutionBackend::Automatic
     ));
-    assert!(!jit_auto_admit_policy(
+    assert!(!run::jit_auto_admit_policy(
         Some("1"),
         true,
         ExecutionBackend::Interpreter
+    ));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_policy_is_opt_in_and_interpreter_only() {
+    for value in [None, Some(""), Some("0")] {
+        assert!(!run::poll_skip_policy(value, ExecutionBackend::Interpreter));
+    }
+    assert!(run::poll_skip_policy(
+        Some("1"),
+        ExecutionBackend::Interpreter
+    ));
+    assert!(run::poll_skip_policy(
+        Some("yes"),
+        ExecutionBackend::Interpreter
+    ));
+    assert!(!run::poll_skip_policy(
+        Some("1"),
+        ExecutionBackend::Automatic
     ));
 }
 

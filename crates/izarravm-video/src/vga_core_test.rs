@@ -167,6 +167,76 @@ fn dots_until_vretrace_start_measures_to_the_edge_from_any_beam_position() {
 }
 
 #[test]
+fn status1_bit3_geometry_finds_start_end_and_wrap_edges() {
+    let vga = Vga::default();
+    let htotal = htotal_dots(&vga.crtc);
+    let frame = vga.frame_dots();
+    let start = u64::from(vga.crtc.vretrace_start) * htotal;
+    let end = u64::from(vga.crtc.vretrace_end) * htotal;
+
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(start - 1, 3, true),
+        Some(1)
+    );
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(start, 3, false),
+        Some(end - start)
+    );
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(end, 3, true),
+        Some(frame - end + start)
+    );
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(frame - 1, 3, true),
+        Some(start + 1)
+    );
+}
+
+#[test]
+fn status1_bit0_geometry_finds_horizontal_vertical_and_frame_edges() {
+    let vga = Vga::default();
+    let htotal = htotal_dots(&vga.crtc);
+    let frame = vga.frame_dots();
+    let active = u64::from(vga.crtc.hdisp_end);
+
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(active - 1, 0, true),
+        Some(1)
+    );
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(active, 0, false),
+        Some(htotal - active)
+    );
+    let last_active_blank =
+        u64::from(vga.crtc.vdisp_end - 1) * htotal + u64::from(vga.crtc.hdisp_end);
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(last_active_blank, 0, false),
+        Some(frame - last_active_blank)
+    );
+    let vertical_blank = u64::from(vga.crtc.vdisp_end) * htotal;
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(vertical_blank, 0, false),
+        Some(frame - vertical_blank)
+    );
+    assert_eq!(
+        vga.dots_until_status1_bit_change_from(0, 0, true),
+        Some(u64::from(vga.crtc.hdisp_end))
+    );
+}
+
+#[test]
+fn status1_bit_geometry_rejects_forced_or_degenerate_sources() {
+    let mut vga = Vga::default();
+    vga.set_display_refresh_enabled(false);
+    assert_eq!(vga.dots_until_status1_bit_change_from(0, 0, false), None);
+    assert_eq!(vga.dots_until_status1_bit_change_from(0, 2, true), None);
+
+    vga.set_display_refresh_enabled(true);
+    vga.crtc.vtotal = 0;
+    assert_eq!(vga.dots_until_status1_bit_change_from(0, 3, true), None);
+}
+
+#[test]
 fn boots_with_defined_frame_dots_and_zeroed_vram() {
     let vga = Vga::default();
     assert_eq!(vga.vram.len(), VGA_PLANAR_SIZE);

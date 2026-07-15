@@ -984,6 +984,23 @@ impl MachineBus<'_> {
         (self.beam_at_batch_start + whole_dots) % frame
     }
 
+    /// Whole VGA dots between the current in-batch instant and a projected
+    /// absolute in-batch clock total.
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_project_dot_advance(&self, candidate_clocks: u64) -> Option<u64> {
+        let current_clocks = self.in_batch_clocks();
+        if candidate_clocks < current_clocks {
+            return None;
+        }
+        let (_, current_dots) = self
+            .timeline_at_batch_start
+            .preview_cpu_clocks(current_clocks, self.vega.dot_clock_hz());
+        let (_, candidate_dots) = self
+            .timeline_at_batch_start
+            .preview_cpu_clocks(candidate_clocks, self.vega.dot_clock_hz());
+        candidate_dots.checked_sub(current_dots)
+    }
+
     /// Batch-scoped CPU clocks elapsed so far. Beam and PIT predictions share
     /// this conversion so they use the same core total, bus scaling, and carry.
     fn in_batch_clocks(&self) -> u64 {

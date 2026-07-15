@@ -248,6 +248,34 @@ impl Vega {
         self.vga.dots_until_vretrace_start()
     }
 
+    #[cfg(feature = "jit")]
+    pub(crate) fn poll_skip_status1_port_active(&self) -> bool {
+        self.port_enabled(0x3da)
+            && self.vga.color_status1_port_active()
+            && !self.vga.is_hercules_personality()
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn status1_bits(&self, beam: u64) -> u8 {
+        self.vga.status1_bits(beam)
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn status1_side_effects(&mut self) {
+        self.vga.status1_side_effects();
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn dots_until_status1_bit_change_from(
+        &self,
+        beam: u64,
+        bit: u8,
+        target: bool,
+    ) -> Option<u64> {
+        self.vga
+            .dots_until_status1_bit_change_from(beam, bit, target)
+    }
+
     pub(crate) fn advance(
         &mut self,
         margo_nanoseconds: u64,

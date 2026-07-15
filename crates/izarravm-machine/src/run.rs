@@ -3,6 +3,262 @@
 
 use super::*;
 
+pub(super) fn jit_auto_admit_policy(
+    value: Option<&str>,
+    jit_available: bool,
+    backend: ExecutionBackend,
+) -> bool {
+    backend == ExecutionBackend::Automatic && jit_available && !matches!(value, Some("" | "0"))
+}
+
+pub(super) fn jit_auto_admit_default(backend: ExecutionBackend) -> bool {
+    let value = std::env::var("IZARRAVM_JIT").ok();
+    jit_auto_admit_policy(
+        value.as_deref(),
+        izarravm_cpu::native_backend_available(),
+        backend,
+    )
+}
+
+#[cfg(feature = "jit")]
+pub(super) fn poll_skip_policy(value: Option<&str>, backend: ExecutionBackend) -> bool {
+    backend == ExecutionBackend::Interpreter && poll_skip_requested(value)
+}
+
+#[cfg(feature = "jit")]
+fn poll_skip_requested(value: Option<&str>) -> bool {
+    !matches!(value, None | Some("" | "0"))
+}
+
+#[cfg(feature = "jit")]
+pub(super) fn poll_skip_default(backend: ExecutionBackend) -> bool {
+    let value = std::env::var("IZARRAVM_POLL_SKIP").ok();
+    poll_skip_policy(value.as_deref(), backend)
+}
+
+#[cfg(feature = "jit")]
+#[derive(Debug, Default)]
+pub(super) struct PollSkipDiagnostics {
+    enabled: bool,
+    policy_backend_rejections: u64,
+    cpu_eligibility_rejections: u64,
+    structural_hits_direct3: u64,
+    structural_hits_setup_direct: u64,
+    structural_hits_setup_paired: u64,
+    source_port_mismatches: u64,
+    vga_bus_certificate_rejections: u64,
+    edge_cap_rejections: u64,
+    committed_spans: u64,
+    committed_iterations: u64,
+}
+
+#[cfg(feature = "jit")]
+impl PollSkipDiagnostics {
+    pub(super) fn new(backend: ExecutionBackend) -> Self {
+        let requested_value = std::env::var("IZARRAVM_POLL_SKIP").ok();
+        let requested = poll_skip_requested(requested_value.as_deref());
+        let enabled = std::env::var("IZARRAVM_POLL_SKIP_DIAG")
+            .ok()
+            .is_some_and(|value| !matches!(value.as_str(), "" | "0"));
+        let backend_rejected = requested && backend != ExecutionBackend::Interpreter;
+        if backend_rejected {
+            eprintln!(
+                "IZARRAVM_POLL_SKIP requested with a non-interpreter backend; poll skipping is disabled"
+            );
+        }
+        Self {
+            enabled,
+            policy_backend_rejections: u64::from(backend_rejected),
+            ..Self::default()
+        }
+    }
+
+    fn increment(enabled: bool, counter: &mut u64) {
+        if enabled {
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    fn cpu_eligibility_rejection(&mut self) {
+        Self::increment(self.enabled, &mut self.cpu_eligibility_rejections);
+    }
+
+    fn structural_hit(&mut self, class: u8) {
+        let counter = match class {
+            0 => &mut self.structural_hits_direct3,
+            1 => &mut self.structural_hits_setup_direct,
+            2 => &mut self.structural_hits_setup_paired,
+            _ => return,
+        };
+        Self::increment(self.enabled, counter);
+    }
+
+    fn source_port_mismatch(&mut self) {
+        Self::increment(self.enabled, &mut self.source_port_mismatches);
+    }
+
+    fn vga_bus_certificate_rejection(&mut self) {
+        Self::increment(self.enabled, &mut self.vga_bus_certificate_rejections);
+    }
+
+    fn edge_cap_rejection(&mut self) {
+        Self::increment(self.enabled, &mut self.edge_cap_rejections);
+    }
+
+    fn committed(&mut self, iterations: u64) {
+        if self.enabled {
+            self.committed_spans = self.committed_spans.saturating_add(1);
+            self.committed_iterations = self.committed_iterations.saturating_add(iterations);
+        }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl Drop for PollSkipDiagnostics {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "poll-skip diag: policy_backend_rejections={} cpu_eligibility_rejections={} structural_hits_direct3={} structural_hits_setup_direct={} structural_hits_setup_paired={} source_port_mismatches={} vga_bus_certificate_rejections={} edge_cap_rejections={} committed_spans={} committed_iterations={}",
+            self.policy_backend_rejections,
+            self.cpu_eligibility_rejections,
+            self.structural_hits_direct3,
+            self.structural_hits_setup_direct,
+            self.structural_hits_setup_paired,
+            self.source_port_mismatches,
+            self.vga_bus_certificate_rejections,
+            self.edge_cap_rejections,
+            self.committed_spans,
+            self.committed_iterations,
+        );
+    }
+}
+
+#[cfg(feature = "jit")]
+pub(super) fn try_poll_skip(
+    cpu: &mut CpuGsw,
+    bus: &mut MachineBus<'_>,
+    diagnostics: &mut PollSkipDiagnostics,
+    batch_core: u32,
+    cap: u64,
+) -> Option<u32> {
+    if !cpu.poll_skip_eligible() {
+        diagnostics.cpu_eligibility_rejection();
+        return None;
+    }
+    let poll = cpu.poll_loop()?;
+    diagnostics.structural_hit(poll.diagnostic_class());
+    if !poll.at_head() {
+        return None;
+    }
+    if poll.resolved_port(cpu) != 0x03da {
+        diagnostics.source_port_mismatch();
+        return None;
+    }
+    if !bus.vega.poll_skip_status1_port_active() {
+        diagnostics.vga_bus_certificate_rejection();
+        return None;
+    }
+    let Some(certificate) = bus.poll_bus_certificate(poll) else {
+        diagnostics.vga_bus_certificate_rejection();
+        return None;
+    };
+    let beam = bus.predicted_beam();
+    let status = bus.vega.status1_bits(beam);
+    if !poll.fresh_iteration_spins(status) {
+        diagnostics.edge_cap_rejection();
+        return None;
+    }
+    let mask = poll.status_mask();
+    let bit = mask.trailing_zeros() as u8;
+    let current = status & mask != 0;
+    let Some(edge_dots) = bus
+        .vega
+        .dots_until_status1_bit_change_from(beam, bit, !current)
+    else {
+        diagnostics.edge_cap_rejection();
+        return None;
+    };
+
+    let current_bus = bus.poll_project_scaled_bus_clocks(certificate, 0)?;
+    let spent = u64::from(batch_core).checked_add(current_bus)?;
+    let upper = cap
+        .checked_sub(spent)?
+        .min(u64::from(u32::MAX))
+        .saturating_sub(1);
+    if upper < 2 {
+        diagnostics.edge_cap_rejection();
+        return None;
+    }
+
+    let admissible = |iterations: u64| -> bool {
+        let Some(reserved) = iterations.checked_add(1) else {
+            return false;
+        };
+        let Some(reserved_core) = cpu.project_poll_skip_core(poll, reserved) else {
+            return false;
+        };
+        let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
+            return false;
+        };
+        let Some(reserved_total) = u64::from(batch_core)
+            .checked_add(reserved_core)
+            .and_then(|total| total.checked_add(reserved_bus))
+        else {
+            return false;
+        };
+        if reserved_total > cap {
+            return false;
+        }
+
+        let Some(skipped_core) = cpu.project_poll_skip_core(poll, iterations) else {
+            return false;
+        };
+        let Some(skipped_bus) = bus.poll_project_scaled_bus_clocks(certificate, iterations) else {
+            return false;
+        };
+        let Some(candidate_total) = u64::from(batch_core)
+            .checked_add(skipped_core)
+            .and_then(|total| total.checked_add(skipped_bus))
+        else {
+            return false;
+        };
+        bus.poll_project_dot_advance(candidate_total)
+            .is_some_and(|dots| dots < edge_dots)
+    };
+
+    let mut low = 2u64;
+    let mut high = upper;
+    let mut best = 0u64;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if admissible(mid) {
+            best = mid;
+            low = mid.saturating_add(1);
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    if best < 2 {
+        diagnostics.edge_cap_rejection();
+        return None;
+    }
+
+    let charged = cpu.project_poll_skip_core(poll, best)?;
+    let charged_u32 = u32::try_from(charged).ok()?;
+    bus.poll_project_scaled_bus_clocks(certificate, best)?;
+
+    let committed = cpu
+        .commit_poll_skip_core(poll, best)
+        .expect("projected poll core commit must succeed");
+    debug_assert_eq!(committed, charged);
+    cpu.poll_skip_backedge_housekeeping();
+    bus.poll_commit_bus(certificate, best);
+    diagnostics.committed(best);
+    Some(charged_u32)
+}
+
 impl Machine {
     /// Enable or disable the trace-driven unit-growth simulator on the CPU (feature `jit`,
     /// diagnostic). A no-op without feature `jit`. See `CpuGsw::set_unit_sim_enabled`.
@@ -263,6 +519,8 @@ impl Machine {
                 .cpu_clocks_for_master_ticks_ceil(remaining_ticks)
                 .max(1);
             let cap = self.event_batch_cap(remaining);
+            #[cfg(feature = "jit")]
+            let poll_skip_enabled = self.poll_skip_enabled;
             let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
@@ -315,6 +573,8 @@ impl Machine {
                     pending_device_memory_write_range,
                     direct_map_changed,
                     direct_data_map_changed,
+                    #[cfg(feature = "jit")]
+                    poll_skip_diagnostics,
                     #[cfg(test)]
                     test_prior_core_pushes,
                     ..
@@ -448,7 +708,8 @@ impl Machine {
                         // on the collapsed outcome: the executor's internal transition check ends the
                         // RUN at the edge, and the machine's check below ends the BATCH so the next
                         // batch services the interrupt. Both are needed.
-                        let remaining = cap.saturating_sub(spent);
+                        #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+                        let mut remaining = cap.saturating_sub(spent);
                         // Publish the batch-scoped core clocks accumulated so far
                         // (the interrupt-service charge + every prior run of this
                         // batch, exactly the core component the batch-end step
@@ -457,6 +718,35 @@ impl Machine {
                         // top and see a batch-total that is monotone across run
                         // boundaries. See MachineBus::prior_runs_core_clocks.
                         bus.prior_runs_core_clocks = u64::from(batch_core);
+                        #[cfg(feature = "jit")]
+                        let align_poll_head = if poll_skip_enabled {
+                            // The CPU resets its run-scoped offset before the first
+                            // real instruction. Poll projection happens before that
+                            // public call, so canonicalize the matching bus scratch
+                            // only inside the opt-in path.
+                            bus.core_clocks_so_far = 0;
+                            let align = cpu.poll_loop().is_some_and(|poll| !poll.at_head());
+                            if !align
+                                && let Some(skipped_core) = try_poll_skip(
+                                    cpu,
+                                    &mut bus,
+                                    poll_skip_diagnostics,
+                                    batch_core,
+                                    cap,
+                                )
+                            {
+                                batch_core = batch_core
+                                    .checked_add(skipped_core)
+                                    .expect("poll projection bounded the batch core total");
+                                bus.prior_runs_core_clocks = u64::from(batch_core);
+                                let spent = u64::from(batch_core)
+                                    .saturating_add(bus.in_batch_scaled_bus_clocks());
+                                remaining = cap.saturating_sub(spent);
+                            }
+                            align
+                        } else {
+                            false
+                        };
                         // Logs the bus field itself (not an independent `batch_core`
                         // read) so `batch_loop_publishes_prior_runs_core_clocks_before_every_run`
                         // actually fails if the store above is ever deleted or the
@@ -466,7 +756,11 @@ impl Machine {
                             .last_mut()
                             .expect("opened at batch entry")
                             .push(bus.prior_runs_core_clocks);
-                        match cpu.run_budgeted(&mut bus, remaining) {
+                        #[cfg(feature = "jit")]
+                        let run_budget = if align_poll_head { 0 } else { remaining };
+                        #[cfg(not(feature = "jit"))]
+                        let run_budget = remaining;
+                        match cpu.run_budgeted(&mut bus, run_budget) {
                             Ok(o) => {
                                 batch_core = batch_core.saturating_add(o.consumed_core_clocks);
                                 if o.halted {

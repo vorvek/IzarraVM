@@ -683,6 +683,10 @@ pub struct Machine {
     // mode is not rounded to zero (mirrors the CPU's `timing_rem` for instruction
     // clocks). Reset on a mode switch (the per-mode ratio changes).
     bus_rem: u64,
+    #[cfg(feature = "jit")]
+    poll_skip_enabled: bool,
+    #[cfg(feature = "jit")]
+    poll_skip_diagnostics: run::PollSkipDiagnostics,
     memory: Memory,
     ram_lookup: RamPageLookup,
     vega: Vega,
@@ -986,23 +990,6 @@ fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Ve
     }
 }
 
-fn jit_auto_admit_policy(
-    value: Option<&str>,
-    jit_available: bool,
-    backend: ExecutionBackend,
-) -> bool {
-    backend == ExecutionBackend::Automatic && jit_available && !matches!(value, Some("" | "0"))
-}
-
-fn jit_auto_admit_default(backend: ExecutionBackend) -> bool {
-    let value = std::env::var("IZARRAVM_JIT").ok();
-    jit_auto_admit_policy(
-        value.as_deref(),
-        izarravm_cpu::native_backend_available(),
-        backend,
-    )
-}
-
 impl Machine {
     /// Shared field initialization for the public constructors. They differ only
     /// in the CPU entry state and the ROM image, so each hands those in and
@@ -1034,6 +1021,7 @@ impl Machine {
         let pci = PciConfig::new();
         let memory = Memory::from_mib(profile.memory_mib)?;
         let ram_lookup = RamPageLookup::new(memory.len(), &vega);
+        let execution_backend = process_execution_backend();
         // Lay the HLE entry stubs into ROM. PSP:0005 reaches the CALL 5 adapter
         // through the low-memory DOS entry at 0000:00C0.
         install_bios_font_mirror(&mut rom);
@@ -1056,6 +1044,10 @@ impl Machine {
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
+            #[cfg(feature = "jit")]
+            poll_skip_enabled: run::poll_skip_default(execution_backend),
+            #[cfg(feature = "jit")]
+            poll_skip_diagnostics: run::PollSkipDiagnostics::new(execution_backend),
             vega,
             paradise_non_vga: false,
             paradise_regs: [0; 6],
@@ -1160,12 +1152,11 @@ impl Machine {
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
-        let execution_backend = process_execution_backend();
         #[cfg(feature = "jit")]
         machine
             .cpu
             .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
-        machine.set_jit_auto_admit(jit_auto_admit_default(execution_backend));
+        machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded
         // cmos.bin then overwrites it with the user's saved choice.

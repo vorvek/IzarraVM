@@ -268,6 +268,82 @@ impl Vga {
         })
     }
 
+    /// Dots from a caller-supplied beam to the first positive transition of
+    /// Input Status 1 bit 3 (vertical retrace) or bit 0 (display inactive).
+    /// `target` is the value after the transition. Geometry and output-enable
+    /// state are inspected without moving the live beam.
+    pub fn dots_until_status1_bit_change_from(
+        &self,
+        beam: u64,
+        bit: u8,
+        target: bool,
+    ) -> Option<u64> {
+        let htotal = htotal_dots(&self.crtc);
+        let frame = self.frame_dots();
+        if htotal == 0 || frame == 0 || self.crtc.vtotal == 0 {
+            return None;
+        }
+        let beam = beam % frame;
+        match bit {
+            3 => {
+                if self.crtc.vretrace_start >= self.crtc.vretrace_end
+                    || self.crtc.vretrace_end > self.crtc.vtotal
+                {
+                    return None;
+                }
+                let current = beam_vretrace(&self.crtc, beam);
+                if current == target {
+                    return None;
+                }
+                let line = if target {
+                    self.crtc.vretrace_start
+                } else {
+                    self.crtc.vretrace_end
+                };
+                let edge = u64::from(line).checked_mul(htotal)?;
+                Some(if beam < edge {
+                    edge - beam
+                } else {
+                    frame - beam + edge
+                })
+            }
+            0 => {
+                let display_forced_inactive = !self.display_refresh_enabled
+                    || !self.attr.pas
+                    || !self.sequencer_outputs_enabled()
+                    || (self.is_cga_personality()
+                        && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0);
+                if display_forced_inactive
+                    || self.crtc.hdisp_end == 0
+                    || u64::from(self.crtc.hdisp_end) > htotal
+                    || self.crtc.vdisp_end == 0
+                    || self.crtc.vdisp_end > self.crtc.vtotal
+                {
+                    return None;
+                }
+                let current = !beam_display_enable(&self.crtc, beam);
+                if current == target {
+                    return None;
+                }
+                let line = beam_line(&self.crtc, beam);
+                let dot = u64::from(beam_dot(&self.crtc, beam));
+                if target {
+                    Some(u64::from(self.crtc.hdisp_end) - dot)
+                } else if line + 1 < self.crtc.vdisp_end {
+                    Some(htotal - dot)
+                } else {
+                    Some(frame - beam)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether 0x3DA is the active color Input Status 1 alias.
+    pub fn color_status1_port_active(&self) -> bool {
+        self.status1_port_selected(0x3da)
+    }
+
     pub fn dot_clock_hz(&self) -> u64 {
         match (self.misc_output >> 2) & 0x03 {
             0x01 => VGA_DOT_CLOCK_28_HZ,

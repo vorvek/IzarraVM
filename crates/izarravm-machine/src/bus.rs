@@ -2,6 +2,25 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+#[cfg(feature = "jit")]
+use izarravm_cpu::PollLoop;
+
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PollBusCertificate {
+    raw_clocks_per_iteration: u64,
+}
+
+#[cfg(feature = "jit")]
+fn ranges_overlap(start: u32, len: u32, observed_start: u32, observed_len: u32) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    let Some(observed_end) = observed_start.checked_add(observed_len) else {
+        return true;
+    };
+    start < observed_end && observed_start < end
+}
 
 impl Machine {
     pub(super) fn make_bus(&mut self) -> MachineBus<'_> {
@@ -262,6 +281,80 @@ impl RamWriteRecorder for RamWriteFootprint {
 }
 
 impl MachineBus<'_> {
+    /// Certify exact warm-RAM fetch and I/O costs for the classified poll loop.
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_bus_certificate(&self, poll: PollLoop) -> Option<PollBusCertificate> {
+        if self.trace.tracing_mode() != TracingMode::Off || !self.lazy_port_reads {
+            return None;
+        }
+        let mut raw = 0u64;
+        for index in 0..poll.fetch_count() {
+            let (linear, physical, len) = poll.fetch(index)?;
+            let len = u32::from(len);
+            if len == 0
+                || ranges_overlap(linear, len, BIOS32_DIRECTORY_LINEAR, 1)
+                || ranges_overlap(linear, len, BIOS32_PCI_LINEAR, 1)
+                || ranges_overlap(linear, len, BIOS_LEGACY_IRET_LINEAR, BIOS_STUB_WINDOW_LEN)
+            {
+                return None;
+            }
+            let last = physical.checked_add(len - 1)?;
+            let first_gated = self.apply_a20(physical);
+            let last_gated = self.apply_a20(last);
+            if last_gated != first_gated.checked_add(len - 1)?
+                || usize::try_from(last_gated).ok()? >= self.memory.len()
+            {
+                return None;
+            }
+            for offset in 0..len {
+                let address = first_gated.checked_add(offset)?;
+                if self.is_device_window(address, BusWidth::Byte) {
+                    return None;
+                }
+            }
+            raw = raw.checked_add(u64::from(BusCycle::clocks_for(
+                BusWidth::Byte,
+                self.cache.code_fetch_wait_states(),
+            )))?;
+        }
+        raw = raw.checked_add(u64::from(BusCycle::clocks_for(
+            BusWidth::Byte,
+            self.wait_states.io,
+        )))?;
+        Some(PollBusCertificate {
+            raw_clocks_per_iteration: raw,
+        })
+    }
+
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_project_scaled_bus_clocks(
+        &self,
+        certificate: PollBusCertificate,
+        iterations: u64,
+    ) -> Option<u64> {
+        let additional = certificate
+            .raw_clocks_per_iteration
+            .checked_mul(iterations)?;
+        self.trace.elapsed_clocks().checked_add(additional)?;
+        self.jit_projected_batch_scaled_bus_clocks(additional)
+    }
+
+    /// Commit the certified aggregate clocks, then replay the idempotent status
+    /// read side effects once. `io_touched` remains false like the lazy 3DA path.
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_commit_bus(&mut self, certificate: PollBusCertificate, iterations: u64) {
+        let additional = certificate
+            .raw_clocks_per_iteration
+            .checked_mul(iterations)
+            .expect("projected poll bus multiplication must succeed");
+        self.trace
+            .elapsed_clocks()
+            .checked_add(additional)
+            .expect("projected poll bus clock addition must succeed");
+        self.trace.add_elapsed_clocks(additional);
+        self.vega.status1_side_effects();
+    }
+
     fn record_pending_device_memory_write(&mut self, physical: u32, width: u32) {
         if width == 0 || *self.device_wrote_memory {
             return;

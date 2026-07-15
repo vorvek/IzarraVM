@@ -944,6 +944,8 @@ pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "brk_interrupt": perf.brk_interrupt,
         "brk_cap": perf.brk_cap,
         "brk_halt": perf.brk_halt,
+        "poll_skip_spans": perf.poll_skip_spans,
+        "poll_skip_iterations": perf.poll_skip_iterations,
         "code_invalidations": perf.code_invalidations,
         "data_direct_reads": perf.data_direct_reads,
         "data_slow_reads": perf.data_slow_reads,

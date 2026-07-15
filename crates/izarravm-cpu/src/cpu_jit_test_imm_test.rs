@@ -620,3 +620,274 @@ fn group3_non_test_subops_remain_interpreter_only() {
         assert!(jit::direct::compile(&mut cpu, ENTRY, true).is_none());
     }
 }
+
+fn warm_exact_poll(
+    code: &[u8],
+    entry: u32,
+    starts: &[u32],
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+) -> (CpuGsw, TestBus) {
+    let mut memory = vec![0xf4; 0x3000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    let mut cpu = flat_cpu(GswMode::Gsw586);
+    cpu.set_native_backend_enabled(false);
+    cpu.registers.set_ebx(ebx);
+    cpu.registers.set_ecx(ecx);
+    cpu.registers.set_edx(edx);
+    let mut bus = TestBus::with_memory(memory);
+    bus.lazy_io_reads = true;
+    for offset in starts {
+        cpu.set_eip(entry + offset);
+        cpu.fetch_decoded(&mut bus, entry + offset)
+            .expect("poll instruction decode");
+    }
+    cpu.set_eip(entry);
+    (cpu, bus)
+}
+
+fn exact_setup_poll_code(ecx: bool, paired: bool, mask: u8, jz: bool) -> Vec<u8> {
+    let mut code = vec![
+        0x89,
+        if ecx { 0xca } else { 0xda },
+        0x29,
+        0xc0,
+        0xec,
+        0xa8,
+        mask,
+        if jz { 0x74 } else { 0x75 },
+        if paired { 0x02 } else { 0xf7 },
+    ];
+    if paired {
+        code.extend_from_slice(&[0xeb, 0xf5]);
+    }
+    code
+}
+
+fn exact_setup_poll_starts(paired: bool) -> &'static [u32] {
+    if paired {
+        &[0, 2, 4, 5, 7, 9]
+    } else {
+        &[0, 2, 4, 5, 7]
+    }
+}
+
+#[test]
+fn exact_current_dx_poll_shapes_cover_masks_and_branch_senses() {
+    for mask in [0x01, 0x08] {
+        for jz in [false, true] {
+            let code = [0xec, 0xa8, mask, if jz { 0x74 } else { 0x75 }, 0xfb];
+            let (cpu, _) = warm_exact_poll(&code, ENTRY, &[0, 1, 3], 0, 0, 0xaaaa_03da);
+            let poll = cpu.poll_loop().expect("exact CurrentDx poll");
+            assert_eq!(poll.diagnostic_class(), 0);
+            assert_eq!(poll.raw_core_clocks(), 17);
+            assert_eq!(poll.fetch_count(), 3);
+            assert_eq!(poll.resolved_port(&cpu), 0x03da);
+            assert_eq!(poll.status_mask(), mask);
+            assert_eq!(poll.fresh_iteration_spins(0), jz);
+            assert_eq!(poll.fresh_iteration_spins(mask), !jz);
+        }
+    }
+}
+
+#[test]
+fn exact_setup_poll_shapes_cover_sources_senses_and_every_phase() {
+    for ecx in [false, true] {
+        for paired in [false, true] {
+            for mask in [0x01, 0x08] {
+                for jz in [false, true] {
+                    let code = exact_setup_poll_code(ecx, paired, mask, jz);
+                    let starts = exact_setup_poll_starts(paired);
+                    let ebx = 0x1234_03da;
+                    let ecx_value = 0x5678_03da;
+                    let (mut cpu, _) =
+                        warm_exact_poll(&code, ENTRY, starts, ebx, ecx_value, 0xaaaa_03da);
+                    let poll = cpu.poll_loop().expect("exact setup poll");
+                    assert_eq!(poll.diagnostic_class(), if paired { 2 } else { 1 });
+                    assert_eq!(poll.raw_core_clocks(), if paired { 28 } else { 21 });
+                    assert_eq!(poll.fetch_count(), starts.len());
+                    assert_eq!(poll.status_mask(), mask);
+                    assert_eq!(
+                        poll.resolved_port(&cpu),
+                        if ecx { ecx_value } else { ebx } as u16
+                    );
+                    assert_eq!(poll.fresh_iteration_spins(0), jz != paired);
+                    assert_eq!(poll.fresh_iteration_spins(mask), jz == paired);
+                    for (index, offset) in starts.iter().enumerate() {
+                        let expected_len = if *offset == 4 { 1 } else { 2 };
+                        assert_eq!(
+                            poll.fetch(index),
+                            Some((ENTRY + offset, ENTRY + offset, expected_len))
+                        );
+                        cpu.set_eip(ENTRY + offset);
+                        let phase = cpu.poll_loop().expect("certified phase membership");
+                        assert_eq!(phase.at_head(), index == 0, "offset={offset}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_setup_poll_rejects_mismatch_cold_prefix_mode_targets_page_cs_and_smc() {
+    let (mut direct3, _) = warm_exact_poll(
+        &[0xec, 0xa8, 0x08, 0x74, 0xfb],
+        ENTRY,
+        &[0, 1, 3],
+        0,
+        0,
+        0x03da,
+    );
+    let mut direct3_cs = direct3.registers.cs();
+    direct3_cs.default_size_32 = false;
+    direct3.registers.set_segment(SegmentIndex::Cs, direct3_cs);
+    assert!(
+        direct3.poll_loop().is_none(),
+        "the direct 3-slot form is 32-bit-code only"
+    );
+
+    const DIRECT: &[u8] = &[0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0xf7];
+    const PAIRED: &[u8] = &[
+        0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0x02, 0xeb, 0xf5,
+    ];
+    let direct_starts = exact_setup_poll_starts(false);
+    let paired_starts = exact_setup_poll_starts(true);
+
+    let (mut cpu, _) = warm_exact_poll(DIRECT, ENTRY, direct_starts, 0x1234, 0, 0xaaaa_03da);
+    let mismatch = cpu
+        .poll_loop()
+        .expect("shape is independent of live source value");
+    assert_eq!(cpu.registers.edx() as u16, 0x03da);
+    assert_ne!(mismatch.resolved_port(&cpu), 0x03da);
+
+    let mut cold = flat_cpu(GswMode::Gsw586);
+    cold.set_native_backend_enabled(false);
+    cold.registers.set_ebx(0x03da);
+    cold.set_eip(ENTRY);
+    assert!(cold.poll_loop().is_none());
+
+    let mut cs = cpu.registers.cs();
+    cs.limit = ENTRY + 7;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    assert!(cpu.poll_loop().is_none(), "setup direct live CS limit");
+    cs.limit = u32::MAX;
+    cs.default_size_32 = false;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    assert!(cpu.poll_loop().is_none(), "setup direct 16-bit code mode");
+
+    let (mut cpu, _) = warm_exact_poll(PAIRED, ENTRY, paired_starts, 0x03da, 0, 0);
+    let mut cs = cpu.registers.cs();
+    cs.limit = ENTRY + 9;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    assert!(
+        cpu.poll_loop().is_none(),
+        "paired JMP exceeds live CS limit"
+    );
+
+    let prefixed = [0x66, 0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0xf6];
+    let (cpu, _) = warm_exact_poll(&prefixed, ENTRY, &[0, 3, 5, 6, 8], 0x03da, 0, 0);
+    assert!(cpu.poll_loop().is_none());
+
+    let malformed: Vec<(&str, Vec<u8>, &[u32])> = vec![
+        (
+            "no-setup paired form",
+            vec![0xec, 0xa8, 0x08, 0x74, 0x02, 0xeb, 0xf9],
+            &[0, 1, 3, 5],
+        ),
+        (
+            "wrong MOV source",
+            vec![0x89, 0xd2, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0xf7],
+            direct_starts,
+        ),
+        (
+            "wrong MOV destination",
+            vec![0x89, 0xd8, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0xf7],
+            direct_starts,
+        ),
+        (
+            "altered SUB",
+            vec![0x89, 0xda, 0x29, 0xc9, 0xec, 0xa8, 0x08, 0x74, 0xf7],
+            direct_starts,
+        ),
+        (
+            "unsupported mask",
+            vec![0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x04, 0x74, 0xf7],
+            direct_starts,
+        ),
+        (
+            "wrong direct Jcc target",
+            vec![0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0xf8],
+            direct_starts,
+        ),
+        (
+            "wrong paired Jcc target",
+            vec![
+                0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0x01, 0xeb, 0xf5,
+            ],
+            paired_starts,
+        ),
+        (
+            "wrong paired JMP target",
+            vec![
+                0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0x02, 0xeb, 0xf4,
+            ],
+            paired_starts,
+        ),
+        (
+            "non-short paired JMP",
+            vec![
+                0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0x02, 0xe9, 0xf2, 0xff, 0xff, 0xff,
+            ],
+            paired_starts,
+        ),
+    ];
+    for (name, code, starts) in malformed {
+        let (cpu, _) = warm_exact_poll(&code, ENTRY, starts, 0x03da, 0, 0);
+        assert!(cpu.poll_loop().is_none(), "accepted {name}");
+    }
+
+    let (cpu, _) = warm_exact_poll(PAIRED, ENTRY, direct_starts, 0x03da, 0, 0);
+    assert!(cpu.poll_loop().is_none(), "paired JMP remained cold");
+
+    let (cpu, _) = warm_exact_poll(PAIRED, 0x0ff8, paired_starts, 0x03da, 0, 0);
+    assert!(cpu.poll_loop().is_none());
+
+    for (paired, mutations) in [
+        (
+            false,
+            &[(1u32, 0xd2), (3, 0xc1), (4, 0xed), (6, 0x04), (8, 0xf8)][..],
+        ),
+        (
+            true,
+            &[
+                (1u32, 0xd2),
+                (3, 0xc1),
+                (4, 0xed),
+                (6, 0x04),
+                (8, 0x01),
+                (10, 0xf4),
+            ][..],
+        ),
+    ] {
+        let code = if paired { PAIRED } else { DIRECT };
+        let starts = exact_setup_poll_starts(paired);
+        for &(mutation, replacement) in mutations {
+            let (mut cpu, mut bus) = warm_exact_poll(code, ENTRY, starts, 0x03da, 0, 0);
+            assert!(cpu.poll_loop().is_some());
+            bus.memory[(ENTRY + mutation) as usize] = replacement;
+            assert!(cpu.note_code_write(ENTRY + mutation, 1));
+            for offset in starts {
+                cpu.set_eip(ENTRY + offset);
+                cpu.fetch_decoded(&mut bus, ENTRY + offset)
+                    .expect("restamped mutated poll decode");
+            }
+            cpu.set_eip(ENTRY);
+            assert!(
+                cpu.poll_loop().is_none(),
+                "accepted paired={paired} mutation at offset {mutation}"
+            );
+        }
+    }
+}
