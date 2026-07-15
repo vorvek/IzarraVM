@@ -14,6 +14,7 @@
 //   3. Discard (Esc) leaves the live mode untouched.
 //   4. The setup page draws on the Margo LFB (mode 0x150), like the graphical POST
 //      screen and the Tab boot menu: the red title bar renders inside the box.
+//   5. The COM1 debug row starts disabled and persists Enabled on Save.
 //
 // Keys are fed as Set 1 scancodes via inject_key_scancodes. Device bytes cross
 // the PS/2 wire on timed deadlines, so navigation sends one make/break pair and
@@ -119,6 +120,36 @@ fn setup_discard_keeps_boot_mode() {
 }
 
 #[test]
+fn setup_save_enables_debug_on_com1() {
+    let mut machine = boot_machine();
+    assert_eq!(machine.cmos_byte(0x14), 0, "COM1 debug starts disabled");
+
+    enter_setup(&mut machine);
+    for _ in 0..3 {
+        let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    }
+    let _ = press(&mut machine, RIGHT_MAKE, RIGHT_BREAK, 3_000_000);
+    let reason = press(&mut machine, F10_MAKE, F10_BREAK, 30_000_000);
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "setup saves then reboots"
+    );
+    assert_eq!(machine.cmos_byte(0x14), 1, "Save persisted Enabled");
+    assert!(
+        machine.serial_text().contains("Izarra 3000 POST"),
+        "the reboot uses the saved COM1 debug setting"
+    );
+
+    let saved = machine.cmos_bytes();
+    let mut reloaded = boot_machine();
+    assert!(
+        reloaded.load_cmos(&saved),
+        "the saved CMOS checksum is valid"
+    );
+    assert_eq!(reloaded.cmos_byte(0x14), 1);
+}
+
+#[test]
 fn setup_save_then_setup_draws_the_lfb() {
     // After a Save the BIOS commits the change and cold-resets (the setup page's
     // documented exit); POST then runs again and, finding no further hotkey,
@@ -188,9 +219,9 @@ fn setup_sub_pages_open_and_return() {
     enter_setup(&mut machine);
     let _ = press(&mut machine, ENTER_MAKE, ENTER_BREAK, 4_000_000);
     let _ = press(&mut machine, ESC_MAKE, ESC_BREAK, 4_000_000);
-    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
-    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
-    let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    for _ in 0..4 {
+        let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
+    }
     let _ = press(&mut machine, ENTER_MAKE, ENTER_BREAK, 5_000_000);
     let _ = press(&mut machine, ESC_MAKE, ESC_BREAK, 4_000_000);
     let _ = press(&mut machine, DOWN_MAKE, DOWN_BREAK, 3_000_000);
