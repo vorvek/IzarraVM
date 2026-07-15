@@ -2217,8 +2217,13 @@ fn unit_sim_feed_is_state_neutral() {
     let reports = sim_on
         .take_unit_sim_report()
         .expect("the sim was enabled, so a report exists");
-    // The ladder fans out to five rungs (L0..L4); every rung sees the same non-empty trace.
-    assert_eq!(reports.len(), 5, "the ladder must report all five rungs");
+    // The wired ladder fans out to the measurement set {L0, L4, L5, L6}; every rung sees the same
+    // non-empty trace.
+    assert_eq!(
+        reports.len(),
+        4,
+        "the ladder must report the four measurement rungs"
+    );
     for (cfg, report, histogram) in &reports {
         assert!(report.entries > 0, "rung {cfg} recorded no entries");
         assert!(
@@ -2241,12 +2246,12 @@ fn unit_sim_feed_is_state_neutral() {
 /// exactly once, so `retired_in_units` equals the run's `perf.instructions` delta. Each `observe`
 /// accrues exactly once, so `retired_in_units` is the total observed count.
 ///
-/// The ladder fans one stream to all five rungs, and each observed instruction accrues to exactly
-/// one open entry in every rung (a deferred L2/L4 check keeps the entry open across the closing
+/// The ladder fans one stream to every wired rung, and each observed instruction accrues to exactly
+/// one open entry in every rung (a deferred L2/L4/L5 check keeps the entry open across the closing
 /// transfer, but that transfer already accrued, and the next instruction accrues to the switched
-/// unit or a fresh entry either way). So `retired_in_units` is config-independent: EVERY rung must
-/// report the same total, equal to the perf delta. A rung that differs is a ladder bug, not a test
-/// artifact.
+/// unit or a fresh entry either way; the L6 io call-out likewise accrues and keeps the entry open).
+/// So `retired_in_units` is config-independent: EVERY rung must report the same total, equal to the
+/// perf delta. A rung that differs is a ladder bug, not a test artifact.
 #[test]
 fn unit_sim_observes_every_retired_instruction() {
     let mut cpu = fresh();
@@ -2260,7 +2265,11 @@ fn unit_sim_observes_every_retired_instruction() {
     let retired = cpu.perf_counters().instructions;
     let reports = cpu.take_unit_sim_report().expect("sim enabled");
     assert!(retired > 0, "the program retired no instructions");
-    assert_eq!(reports.len(), 5, "the ladder must report all five rungs");
+    assert_eq!(
+        reports.len(),
+        4,
+        "the ladder must report the four measurement rungs"
+    );
     for (cfg, report, _) in &reports {
         assert_eq!(
             report.retired_in_units, retired,

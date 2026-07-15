@@ -985,10 +985,10 @@ fn nearest_rank_percentile(sorted_ascending: &[usize], p: u32) -> u64 {
     sorted_ascending[index] as u64
 }
 
-/// Format the unit-simulator ladder's evidence lines: two lines per rung (`cfg=L0..cfg=L4`), so a
-/// five-rung ladder emits ten lines. The `cfg=` tag is the SECOND field of every line (tag first, so
-/// the rungs eyeball-diff against the C-pre evidence). See [`unit_sim_rung_lines`] for the per-rung
-/// field layout.
+/// Format the unit-simulator ladder's evidence lines: two lines per rung, so the four-rung
+/// measurement set `{L0, L4, L5, L6}` emits eight lines. The `cfg=` tag is the SECOND field of every
+/// line (tag first, so the rungs eyeball-diff against the C-pre evidence). See [`unit_sim_rung_lines`]
+/// for the per-rung field layout.
 #[cfg(feature = "jit")]
 #[allow(clippy::type_complexity)] // Signature fixed by the Track C task 3 reporting contract.
 pub(crate) fn unit_sim_report_lines(
@@ -1019,9 +1019,9 @@ fn unit_sim_rung_lines(
     };
     let headline = format!(
         "unit_sim cfg={cfg} entries={} retired_in_units={} linked_transfers={} loop_links={} \
-call_links={} ret_links={} itc_hits={} unresolved_exits={} side_exits_io={} side_exits_async={} \
-sim_invalidations={} sim_restamps={} units_built={} units_rebuilt={} \
-insns_per_entry={insns_per_entry:.6}",
+call_links={} ret_links={} itc_hits={} ght_hits={} ght_ret_hits={} unresolved_exits={} \
+side_exits_io={} side_exits_async={} io_callouts={} sim_invalidations={} sim_restamps={} \
+units_built={} units_rebuilt={} insns_per_entry={insns_per_entry:.6}",
         report.entries,
         report.retired_in_units,
         report.linked_transfers,
@@ -1029,9 +1029,12 @@ insns_per_entry={insns_per_entry:.6}",
         report.call_links,
         report.ret_links,
         report.itc_hits,
+        report.ght_hits,
+        report.ght_ret_hits,
         report.unresolved_exits,
         report.side_exits_io,
         report.side_exits_async,
+        report.io_callouts,
         report.sim_invalidations,
         report.sim_restamps,
         report.units_built,

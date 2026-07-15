@@ -15,9 +15,11 @@
 //!
 //! # Mechanisms and the ladder
 //!
-//! A `UnitSim` runs under a [`SimConfig`] that turns four link mechanisms on or off. The default
-//! config (`L0`) reproduces the v1 sim byte for byte; each higher rung on [`SimConfig::ladder`]
-//! enables one more mechanism:
+//! A `UnitSim` runs under a [`SimConfig`] that turns link mechanisms on or off. The default config
+//! (`L0`) reproduces the v1 sim byte for byte; each higher rung on [`SimConfig::ladder`] enables
+//! one more mechanism. Rungs 0..=4 are strict supersets; L5 and L6 are QEMU-shaped alternatives
+//! layered on the L3 config rather than on L4 (L5 REPLACES L4's per-site inline target cache with a
+//! global hashed lookup, so `itc` is L4-only and not carried at L5+):
 //!
 //! - `L1` `loop_direct`: a `LoopNear` back-edge behaves exactly as a `DirectNear` branch.
 //! - `L2` `call_ret_link`: `CallNear`/`CallIndirect` push a shadow-stack return address and a
@@ -25,9 +27,14 @@
 //! - `L3` `smc_restamp`: a store confined to the tail of a unit's members restamps rather than
 //!   invalidating the whole unit.
 //! - `L4` `itc`: an indirect exit whose target is stable across observations links through a
-//!   one-entry inline target cache.
+//!   one-entry inline target cache (L4 only; disabled at L5+).
+//! - `L5` `ght`: a QEMU-class global hashed target lookup (a 4096-slot direct-mapped table keyed by
+//!   the pinned `tb_jmp_cache_hash_func` of the linear) resolves raw indirect exits and returns,
+//!   layered on the L2 shadow return stack. Replaces L4's monomorphic cache as the indirect policy.
+//! - `L6` `io_callout`: a `touches_io` instruction no longer closes the entry; it accrues, charges
+//!   `io_callouts`, and the entry stays open (models an in-unit port call-out).
 //!
-//! [`SimLadder`] fans one observation stream out to all five rungs so a single run measures the
+//! [`SimLadder`] fans one observation stream out to a set of rungs so a single run measures the
 //! marginal value of each mechanism against the same trace.
 
 use std::collections::{HashMap, HashSet};
@@ -83,19 +90,28 @@ pub(crate) struct SimConfig {
     pub call_ret_link: bool,
     /// L3+: a store confined to a member's tail restamps the unit rather than killing it.
     pub smc_restamp: bool,
-    /// L4: a stable indirect target links through a one-entry inline target cache.
+    /// L4 ONLY: a stable indirect target links through a one-entry inline target cache. Disabled at
+    /// L5+ (the global hashed lookup replaces it), so this is `rung == 4`, not `rung >= 4`.
     pub itc: bool,
+    /// L5+: a QEMU-class global hashed target lookup resolves raw indirect exits and returns.
+    pub ght: bool,
+    /// L6+: a `touches_io` instruction accrues as an in-unit call-out instead of closing the entry.
+    pub io_callout: bool,
 }
 
 impl SimConfig {
-    /// The config for ladder rung `rung` (`0..=4`). Each rung is a strict superset of the one below,
-    /// so `ladder(0)` is `L0` (all mechanisms off, v1 parity) and `ladder(4)` enables all four.
+    /// The config for ladder rung `rung` (`0..=6`). Rungs 0..=4 are strict supersets (`ladder(4)`
+    /// enables all four v1-superset mechanisms). L5 and L6 are QEMU-shaped: `ladder(5)` is the L3
+    /// config (loop/call-ret/smc) with `ght` on and `itc` OFF (the global lookup replaces the L4
+    /// monomorphic cache), and `ladder(6)` adds `io_callout` on top of L5.
     pub(crate) fn ladder(rung: u8) -> Self {
         SimConfig {
             loop_direct: rung >= 1,
             call_ret_link: rung >= 2,
             smc_restamp: rung >= 3,
-            itc: rung >= 4,
+            itc: rung == 4,
+            ght: rung >= 5,
+            io_callout: rung >= 6,
         }
     }
 }
@@ -103,10 +119,14 @@ impl SimConfig {
 /// Headline counters produced by the simulation. Public because it is returned by
 /// `CpuGsw::take_unit_sim_report`, the diagnostic accessor Track C tooling reads.
 ///
-/// The five link counters partition every linked transfer by the raw kind that produced it, so a
+/// The link counters partition every linked transfer by the raw kind that produced it, so a
 /// downstream summary can add them without double counting: total links = `linked_transfers`
-/// (`DirectNear`) + `loop_links` (`LoopNear`) + `call_links` (`CallNear`) + `ret_links` (`Return`) +
-/// `itc_hits` (`Indirect`/`CallIndirect` via the inline target cache).
+/// (`DirectNear`) + `loop_links` (`LoopNear`) + `call_links` (`CallNear`) + `ret_links` (`Return`
+/// via the shadow stack) + `itc_hits` (`Indirect`/`CallIndirect` via the L4 inline target cache) +
+/// `ght_hits` (`Indirect`/`CallIndirect` via the L5 global hashed table) + `ght_ret_hits` (`Return`
+/// resolved via the L5 global hashed table). `ght_ret_hits` is attributed by ORIGIN (any table hit
+/// resolving a return, whether the shadow stack was empty or its compare fell through), so that
+/// `ret_links + ght_ret_hits` bounds pure-QEMU return resolution from above.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SimReport {
     pub entries: u64,
@@ -126,6 +146,13 @@ pub struct SimReport {
     pub ret_links: u64,
     /// Indirect/`CallIndirect` links through the inline target cache to a stable target (L4).
     pub itc_hits: u64,
+    /// Indirect/`CallIndirect` links resolved through the L5 global hashed target table.
+    pub ght_hits: u64,
+    /// `Return` links resolved through the L5 global hashed target table (empty-stack returns and
+    /// non-empty returns whose shadow compare fell through to the table both count here).
+    pub ght_ret_hits: u64,
+    /// L6 `touches_io` instructions that accrued as an in-unit call-out instead of closing the entry.
+    pub io_callouts: u64,
     /// Restamps charged at unit re-entry after a tail-confined store dirtied it (L3+).
     pub sim_restamps: u64,
 }
@@ -155,23 +182,30 @@ enum ExitReason {
 type UnitKey = (u32, u32);
 
 /// A deferred resolution armed by a closing transfer that keeps the entry OPEN across it: the check
-/// is settled at the next observation. At most one is armed per closing instruction (`Return` arms
-/// `Return`; `Indirect`/`CallIndirect` arm `Itc`; those raw kinds are disjoint, so they never
-/// conflict). `None` is the L0/L1 state and leaves the dual-successor prediction untouched.
+/// is settled at the next observation. At most one is armed per closing instruction (a non-empty
+/// `Return` arms `Return`; `Indirect`/`CallIndirect` arm `Itc` at L4 or `Ght` at L5+; an empty-stack
+/// `Return` arms `Ght` at L5+; those raw kinds are disjoint, so they never conflict). `None` is the
+/// L0/L1 state and leaves the dual-successor prediction untouched.
 #[derive(Clone, Copy)]
 enum Deferred {
     None,
     /// A `Return` popped `expected` off the shadow stack; a link fires if the next observation lands
-    /// there and it is a known same-mode unit entry.
+    /// there and it is a known same-mode unit entry (stage 1), else the L5 table probe (stage 2).
     Return {
         expected: u32,
     },
     /// An indirect exit consulted the inline target cache at `cache_key`; `cached` is the remembered
     /// target (if any). A hit fires if the next observation matches `cached`; any miss refills
-    /// `cache_key` with the observed target.
+    /// `cache_key` with the observed target. L4 only.
     Itc {
         cache_key: (UnitKey, u32),
         cached: Option<u32>,
+    },
+    /// An L5 exit resolved entirely against the global hashed table at the next observation. Carries
+    /// only its ORIGIN (`from_return` distinguishes an empty-stack `Return`, which counts
+    /// `ght_ret_hits`, from a raw `Indirect`/`CallIndirect`, which counts `ght_hits`).
+    Ght {
+        from_return: bool,
     },
 }
 
@@ -193,6 +227,19 @@ struct OpenEntry {
     quota_used: usize,
 }
 
+/// Which report counter a successful deferred link charges, so `link_switch` can share one
+/// switch-and-accrue path across all four deferred-resolution kinds.
+enum LinkKind {
+    /// L2+ shadow-stack return link (`ret_links`).
+    Ret,
+    /// L4 inline-target-cache hit (`itc_hits`).
+    Itc,
+    /// L5 global-table hit resolving an indirect exit (`ght_hits`).
+    Ght,
+    /// L5 global-table hit resolving a return (`ght_ret_hits`).
+    GhtRet,
+}
+
 /// What an L3 store does to one unit whose page it touched.
 enum WriteAction {
     /// v1 whole-unit kill (invalidate + rebuild on next entry).
@@ -201,6 +248,31 @@ enum WriteAction {
     Restamp,
     /// The store hit the owned page but no member span: nothing happens.
     Ignore,
+}
+
+/// The number of slots in the L5 global hashed target table (QEMU `TB_JMP_CACHE_BITS` = 12, so
+/// `1 << 12 = 4096`, verified against master).
+const GHT_SLOTS: usize = 4096;
+
+/// The L5 global hashed target table: a 4096-slot direct-mapped array, each slot holding a
+/// `(linear, mode_key)` unit-entry key (collisions evict). Wrapped so [`UnitSim`] can keep deriving
+/// `Default` (a bare `[Option<_>; 4096]` has no `Default` impl).
+struct GhtTable(Vec<Option<(u32, u32)>>);
+
+impl Default for GhtTable {
+    fn default() -> Self {
+        GhtTable(vec![None; GHT_SLOTS])
+    }
+}
+
+/// The direct-mapped slot index for `lin`, pinned to QEMU softmmu `tb_jmp_cache_hash_func`
+/// (`accel/tcg/cputlb.c`) with `TARGET_PAGE_BITS = 12` and `TB_JMP_PAGE_BITS = 6`. Applied to the
+/// LINEAR ONLY: QEMU hashes the pc alone and validates the rest of the key in the slot compare, so
+/// the `mode_key` is stored but not hashed. `0b111111_000000 == 0xFC0` is `TB_JMP_PAGE_MASK` and
+/// `0b111111 == 0x3F` is `TB_JMP_ADDR_MASK`; the result is always in `0..4096`.
+fn ght_index(lin: u32) -> usize {
+    let tmp = lin ^ (lin >> (12 - 6));
+    (((tmp >> (12 - 6)) & 0b111111_000000) | (tmp & 0b111111)) as usize
 }
 
 /// Simulates unit growth from a stream of observed instructions.
@@ -221,6 +293,11 @@ pub(crate) struct UnitSim {
     /// Inline target cache (L4): `(unit key, exit linear) -> last observed target`. Entries rooted
     /// at a unit are flushed when that unit is killed (see `flush_itc_for`).
     itc_cache: HashMap<(UnitKey, u32), u32>,
+    /// Global hashed target table (L5): direct-mapped, indexed by [`ght_index`] of the linear.
+    /// Populated at entry-open, at deferred-check resolution, and on shadow-ret-link success; probed
+    /// at deferred-check resolution. Stale slots for killed units fail naturally (a hit requires the
+    /// unit to still exist), so no scan is needed on invalidation.
+    ght_table: GhtTable,
     open: Option<OpenEntry>,
     report: SimReport,
 }
@@ -475,6 +552,10 @@ impl UnitSim {
             deferred: Deferred::None,
             quota_used: 0,
         });
+        // L5 install hook: a dispatcher-entered unit installs its entry key in the global table.
+        if self.config.ght {
+            self.ght_install(insn.linear, insn.mode_key);
+        }
         self.accrue(insn);
     }
 
@@ -497,14 +578,23 @@ impl UnitSim {
                 .insert(key);
         }
 
-        // Terminators end the unit even when they also carry a transfer or touch I/O.
+        // Terminators end the unit even when they also carry a transfer or touch I/O. This check
+        // stays BEFORE the I/O rule: a terminator that touches I/O closes unresolved (as at L0), and
+        // never counts an io call-out.
         if insn.is_terminator {
             self.close(ExitReason::Unresolved);
             return;
         }
         if insn.touches_io {
-            self.close(ExitReason::Io);
-            return;
+            if self.config.io_callout {
+                // L6: the port access is an in-unit call-out. The instruction accrues (already done
+                // above), charges an io call-out, and processing CONTINUES to normal transfer
+                // handling so the entry stays open.
+                self.report.io_callouts += 1;
+            } else {
+                self.close(ExitReason::Io);
+                return;
+            }
         }
 
         match self.effective_kind(insn.transfer) {
@@ -628,11 +718,20 @@ impl UnitSim {
         self.close_or_arm_itc(insn);
     }
 
-    /// L2+ near RET: an empty shadow stack closes unresolved immediately (v1 parity, nothing to
-    /// defer); otherwise pop and arm a deferred return-link check that keeps the entry open.
+    /// L2+ near RET. A non-empty shadow stack pops and arms a deferred return-link check (stage-1
+    /// shadow compare, then the L5 table). An empty shadow stack closes unresolved at L2-L4 (v1
+    /// parity, nothing to defer); at L5 (review finding M2) it instead arms a plain `Ght` check so
+    /// the return can still resolve via the global table, matching pure QEMU's per-ret lookup.
     fn handle_return(&mut self) {
         match self.shadow.pop() {
-            None => self.close(ExitReason::Unresolved),
+            None => {
+                if self.config.ght {
+                    let open = self.open.as_mut().expect("open entry present");
+                    open.deferred = Deferred::Ght { from_return: true };
+                } else {
+                    self.close(ExitReason::Unresolved);
+                }
+            }
             Some(expected) => {
                 let open = self.open.as_mut().expect("open entry present");
                 open.deferred = Deferred::Return { expected };
@@ -640,18 +739,24 @@ impl UnitSim {
         }
     }
 
-    /// An indirect exit at `insn`. Under L4 it arms a deferred ITC check against the cached target
-    /// and keeps the entry open; otherwise it closes unresolved exactly like a v1 indirect.
+    /// An indirect exit at `insn`. Branch order per the L0-L4 bit-identity checklist: L4 arms a
+    /// deferred `Itc` check against the cached target; else L5 arms a `Ght` check resolved against
+    /// the global table; else (L0-L3) it closes unresolved exactly like a v1 indirect.
     fn close_or_arm_itc(&mut self, insn: ObservedInsn) {
-        if !self.config.itc {
-            self.close(ExitReason::Unresolved);
+        if self.config.itc {
+            let key = self.open.as_ref().expect("open entry present").key;
+            let cache_key = (key, insn.linear);
+            let cached = self.itc_cache.get(&cache_key).copied();
+            let open = self.open.as_mut().expect("open entry present");
+            open.deferred = Deferred::Itc { cache_key, cached };
             return;
         }
-        let key = self.open.as_ref().expect("open entry present").key;
-        let cache_key = (key, insn.linear);
-        let cached = self.itc_cache.get(&cache_key).copied();
-        let open = self.open.as_mut().expect("open entry present");
-        open.deferred = Deferred::Itc { cache_key, cached };
+        if self.config.ght {
+            let open = self.open.as_mut().expect("open entry present");
+            open.deferred = Deferred::Ght { from_return: false };
+            return;
+        }
+        self.close(ExitReason::Unresolved);
     }
 
     /// Settle the open entry's pending deferred check against the just-observed `insn`. Returns
@@ -662,42 +767,90 @@ impl UnitSim {
             let open = self.open.as_ref().expect("deferred needs an open entry");
             (open.deferred, open.mode_key, open.quota_used)
         };
-        let target = match deferred {
-            Deferred::Return { expected } => Some(expected),
-            Deferred::Itc { cached, .. } => cached,
-            Deferred::None => unreachable!("resolve_deferred with no pending check"),
-        };
-        let success = match target {
-            Some(t) => {
-                insn.mode_key == mode_key
-                    && insn.linear == t
-                    && self.units.contains_key(&(t, mode_key))
-            }
-            None => false,
-        };
 
-        // Any ITC non-hit (a miss or a first encounter) refills the cache with the observed target.
-        if let Deferred::Itc { cache_key, .. } = deferred {
+        // The L4 inline target cache keeps its original two-outcome behaviour, byte-identical: a hit
+        // links (`itc_hits`), any non-hit refills the cache and closes unresolved. L4 has `ght` off,
+        // so none of the L5 install/table machinery below is reachable here.
+        if let Deferred::Itc { cache_key, cached } = deferred {
+            let success = cached == Some(insn.linear)
+                && insn.mode_key == mode_key
+                && self.units.contains_key(&(insn.linear, mode_key));
             if !success {
                 self.itc_cache.insert(cache_key, insn.linear);
+                self.close(ExitReason::Unresolved);
+                return false;
             }
+            return self.link_switch(insn, mode_key, quota_used, LinkKind::Itc);
         }
 
-        if !success {
-            self.close(ExitReason::Unresolved);
-            return false;
+        // Whether the observed instruction is a known same-mode unit entry: the precondition for
+        // both the stage-1/stage-2 link tests and the L5 install-on-resolution rule.
+        let observed_known_unit =
+            insn.mode_key == mode_key && self.units.contains_key(&(insn.linear, mode_key));
+
+        let expected = match deferred {
+            Deferred::Return { expected } => Some(expected),
+            Deferred::Ght { .. } => None,
+            Deferred::Itc { .. } => unreachable!("Itc handled above"),
+            Deferred::None => unreachable!("resolve_deferred with no pending check"),
+        };
+        let from_return = match deferred {
+            Deferred::Return { .. } => true,
+            Deferred::Ght { from_return } => from_return,
+            _ => unreachable!(),
+        };
+
+        // Stage 1 (Return only): the shadow-stack compare.
+        let stage1 = expected == Some(insn.linear) && observed_known_unit;
+        // Stage 2 (L5): the global hashed table probe. Runs for a `Ght` check from the start and for
+        // a `Return` whose shadow compare failed. Reads the slot BEFORE any install below.
+        let stage2 = !stage1
+            && self.config.ght
+            && observed_known_unit
+            && self.ght_slot_matches(insn.linear, insn.mode_key);
+
+        // L5 install-on-resolution: install the observed target whenever it is a known same-mode
+        // unit entry, on hit AND on miss (a stage-1 shadow-ret-link success installs here too). This
+        // runs AFTER the stage-2 probe so it cannot spuriously satisfy its own lookup.
+        if self.config.ght && observed_known_unit {
+            self.ght_install(insn.linear, insn.mode_key);
         }
 
-        // A successful link consumes quota exactly like the direct-link path; exhaustion closes
-        // unresolved and reprocesses the target as a fresh entry.
+        if stage1 {
+            return self.link_switch(insn, mode_key, quota_used, LinkKind::Ret);
+        }
+        if stage2 {
+            let kind = if from_return {
+                LinkKind::GhtRet
+            } else {
+                LinkKind::Ght
+            };
+            return self.link_switch(insn, mode_key, quota_used, kind);
+        }
+        self.close(ExitReason::Unresolved);
+        false
+    }
+
+    /// Switch the open entry to the just-resolved target `insn` and accrue it, charging one link of
+    /// `kind`. A successful link consumes quota exactly like the direct-link path; exhaustion closes
+    /// unresolved and reprocesses the target as a fresh entry (returning `false`). Returns `true`
+    /// once the target has accrued into the switched unit.
+    fn link_switch(
+        &mut self,
+        insn: ObservedInsn,
+        mode_key: u32,
+        quota_used: usize,
+        kind: LinkKind,
+    ) -> bool {
         if quota_used >= crate::jit::direct::MAX_CHAIN_BLOCKS {
             self.close(ExitReason::Unresolved);
             return false;
         }
-        match deferred {
-            Deferred::Return { .. } => self.report.ret_links += 1,
-            Deferred::Itc { .. } => self.report.itc_hits += 1,
-            Deferred::None => unreachable!(),
+        match kind {
+            LinkKind::Ret => self.report.ret_links += 1,
+            LinkKind::Itc => self.report.itc_hits += 1,
+            LinkKind::Ght => self.report.ght_hits += 1,
+            LinkKind::GhtRet => self.report.ght_ret_hits += 1,
         }
         let target_key = (insn.linear, mode_key);
         {
@@ -711,6 +864,16 @@ impl UnitSim {
         }
         self.accrue(insn);
         true
+    }
+
+    /// Install `(lin, mode)` in the L5 global hashed table (direct-mapped: overwrites any collision).
+    fn ght_install(&mut self, lin: u32, mode: u32) {
+        self.ght_table.0[ght_index(lin)] = Some((lin, mode));
+    }
+
+    /// Whether the L5 table slot for `lin` holds exactly `(lin, mode)`.
+    fn ght_slot_matches(&self, lin: u32, mode: u32) -> bool {
+        self.ght_table.0[ght_index(lin)] == Some((lin, mode))
     }
 
     /// Push a return address onto the shadow stack, dropping the oldest frame on overflow.
@@ -764,27 +927,45 @@ fn page_write_range(physical: u32, width: u32, page: u32) -> (u32, u32) {
     (lo as u32, hi as u32)
 }
 
-/// Fans one observation stream out to all five ladder rungs (`L0..=L4`), so a single guest run
-/// measures the marginal value of each mechanism against the same trace. Wired into the CPU via
+/// Fans one observation stream out to a set of ladder rungs, so a single guest run measures the
+/// marginal value of each mechanism against the same trace. Wired into the CPU via
 /// `set_unit_sim_enabled`; unit-tested here.
 pub(crate) struct SimLadder {
     sims: Vec<(&'static str, UnitSim)>,
 }
 
+/// The static label for ladder rung `rung` (`0..=6`).
+fn rung_name(rung: u8) -> &'static str {
+    match rung {
+        0 => "L0",
+        1 => "L1",
+        2 => "L2",
+        3 => "L3",
+        4 => "L4",
+        5 => "L5",
+        6 => "L6",
+        _ => panic!("ladder rungs are 0..=6"),
+    }
+}
+
 impl SimLadder {
-    /// One sim per ladder rung, named `L0..L4`.
+    /// The full ladder, one sim per rung `L0..L6`. Test-only: the CPU wiring uses
+    /// [`SimLadder::with_rungs`] with the cheaper measurement set.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        let sims = (0u8..=4)
-            .map(|rung| {
-                let name: &'static str = match rung {
-                    0 => "L0",
-                    1 => "L1",
-                    2 => "L2",
-                    3 => "L3",
-                    4 => "L4",
-                    _ => unreachable!("ladder rungs are 0..=4"),
-                };
-                (name, UnitSim::with_config(SimConfig::ladder(rung)))
+        Self::with_rungs(&[0, 1, 2, 3, 4, 5, 6])
+    }
+
+    /// A ladder over an explicit list of rungs, each named `L{rung}`. Lets a run pick just the
+    /// measurement set instead of paying for every rung.
+    pub(crate) fn with_rungs(rungs: &[u8]) -> Self {
+        let sims = rungs
+            .iter()
+            .map(|&rung| {
+                (
+                    rung_name(rung),
+                    UnitSim::with_config(SimConfig::ladder(rung)),
+                )
             })
             .collect();
         Self { sims }
