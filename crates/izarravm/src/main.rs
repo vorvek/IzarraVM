@@ -958,15 +958,34 @@ fn maybe_enable_unit_sim(machine: &mut Machine) {
 }
 
 /// Take the unit simulator's ladder report at the end of a headless run and print its per-rung
-/// evidence lines (two per rung, ten total for the five-rung ladder). A no-op when the sim was never
-/// enabled (`take_unit_sim_report` returns `None`) or the binary was built without feature `jit`.
+/// evidence lines (two per rung, eight total for the four-rung measurement set `{L0, L4, L6, P}`),
+/// followed by the per-port io histogram lines when `IZARRAVM_IO_HIST=1`. A no-op when the sim was
+/// never enabled (`take_unit_sim_report` returns `None`) or the binary was built without feature
+/// `jit`.
 #[cfg(feature = "jit")]
 fn maybe_report_unit_sim(machine: &mut Machine) {
+    // Read the io histogram FIRST (it borrows the sim); `take_unit_sim_report` then consumes it.
+    let io_hist_lines = machine.unit_sim_io_hist().map(|hist| io_hist_lines(&hist));
     if let Some(reports) = machine.take_unit_sim_report() {
         for line in unit_sim_report_lines(&reports) {
             println!("{line}");
         }
     }
+    if let Some(lines) = io_hist_lines {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+}
+
+/// Format the per-port io-read histogram (`IZARRAVM_IO_HIST=1`): one `io_hist port=0xNNN count=...`
+/// line per port, sorted by count descending, capped at the top 16. `hist` is already sorted.
+#[cfg(feature = "jit")]
+fn io_hist_lines(hist: &[(u16, u64)]) -> Vec<String> {
+    hist.iter()
+        .take(16)
+        .map(|&(port, count)| format!("io_hist port={port:#06x} count={count}"))
+        .collect()
 }
 
 #[cfg(not(feature = "jit"))]
@@ -986,7 +1005,7 @@ fn nearest_rank_percentile(sorted_ascending: &[usize], p: u32) -> u64 {
 }
 
 /// Format the unit-simulator ladder's evidence lines: two lines per rung, so the four-rung
-/// measurement set `{L0, L4, L5, L6}` emits eight lines. The `cfg=` tag is the SECOND field of every
+/// measurement set `{L0, L4, L6, P}` emits eight lines. The `cfg=` tag is the SECOND field of every
 /// line (tag first, so the rungs eyeball-diff against the C-pre evidence). See [`unit_sim_rung_lines`]
 /// for the per-rung field layout.
 #[cfg(feature = "jit")]
@@ -1017,11 +1036,30 @@ fn unit_sim_rung_lines(
     } else {
         report.retired_in_units as f64 / report.entries as f64
     };
+    // The active-stream residency (rung P): the must-execute stream with elided poll iterations
+    // removed. `ipe_active` prices a wait entry at one dispatch per deadline slice (the primary
+    // quotient); `ipe_active_slice` additionally charges one dispatch per absorbed budget yield (the
+    // pessimistic quotient). Both equal `insns_per_entry` on every non-P rung (all elision counters
+    // are zero there).
+    let active = report.retired_in_units.saturating_sub(report.elided_insns);
+    let ipe_active = if report.entries == 0 {
+        0.0
+    } else {
+        active as f64 / report.entries as f64
+    };
+    let slice_denom = report.entries + report.wait_batch_ends;
+    let ipe_active_slice = if slice_denom == 0 {
+        0.0
+    } else {
+        active as f64 / slice_denom as f64
+    };
     let headline = format!(
         "unit_sim cfg={cfg} entries={} retired_in_units={} linked_transfers={} loop_links={} \
 call_links={} ret_links={} itc_hits={} ght_hits={} ght_ret_hits={} unresolved_exits={} \
 side_exits_io={} side_exits_async={} io_callouts={} sim_invalidations={} sim_restamps={} \
-units_built={} units_rebuilt={} insns_per_entry={insns_per_entry:.6}",
+units_built={} units_rebuilt={} elided_insns={} elided_waits={} wait_batch_ends={} \
+spin_noio_insns={} insns_per_entry={insns_per_entry:.6} ipe_active={ipe_active:.6} \
+ipe_active_slice={ipe_active_slice:.6}",
         report.entries,
         report.retired_in_units,
         report.linked_transfers,
@@ -1039,6 +1077,10 @@ units_built={} units_rebuilt={} insns_per_entry={insns_per_entry:.6}",
         report.sim_restamps,
         report.units_built,
         report.units_rebuilt,
+        report.elided_insns,
+        report.elided_waits,
+        report.wait_batch_ends,
+        report.spin_noio_insns,
     );
 
     let mut members: Vec<usize> = histogram.iter().map(|&(count, _)| count).collect();

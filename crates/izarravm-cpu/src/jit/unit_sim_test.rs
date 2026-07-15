@@ -14,6 +14,38 @@ fn insn(linear: u32, len: u8) -> ObservedInsn {
         transfer: TransferKind::None,
         is_terminator: false,
         touches_io: false,
+        writes_memory: false,
+        io_read: false,
+    }
+}
+
+/// An IN-shaped observation at `at`: `touches_io` + `io_read`, transfer `None` (IN is not a control
+/// transfer), no memory write.
+fn io_in(at: u32, len: u8) -> ObservedInsn {
+    let mut i = insn(at, len);
+    i.touches_io = true;
+    i.io_read = true;
+    i
+}
+
+/// An in-window `DirectNear` back-edge at `at` targeting `target` (a poll-loop `jnz`).
+fn back_edge(at: u32, len: u8, target: u32) -> ObservedInsn {
+    let mut i = insn(at, len);
+    i.transfer = TransferKind::DirectNear { target };
+    i
+}
+
+/// Feed `n` iterations of a canonical IN/TEST/Jcc poll loop at `head` to `sim` (each iteration:
+/// `in` at `head`, a `test` body instruction, a `jnz` back-edge to `head`). The loop head is the
+/// anchor. Optionally batch-ends after every iteration to model the real io-driven substrate.
+fn feed_poll_loop(sim: &mut UnitSim, head: u32, n: u32, batch_each: bool) {
+    for _ in 0..n {
+        sim.observe(io_in(head, 2)); // in al, dx
+        sim.observe(insn(head + 2, 2)); // test al, bl
+        sim.observe(back_edge(head + 4, 2, head)); // jnz head
+        if batch_each {
+            sim.note_batch_end();
+        }
     }
 }
 
@@ -1010,13 +1042,14 @@ fn l6_pending_deferred_resolves_on_io_insn() {
 
 #[test]
 fn with_rungs_selects_and_labels() {
-    let ladder = SimLadder::with_rungs(&[0, 4, 5, 6]);
+    // The C-pre-4 measurement set: L0 anchor, L4 secondary anchor, L6 poll-wait baseline, P.
+    let ladder = SimLadder::with_rungs(&[0, 4, 6, 7]);
     let reports = ladder.reports();
     assert_eq!(reports.len(), 4);
     assert_eq!(reports[0].0, "L0");
     assert_eq!(reports[1].0, "L4");
-    assert_eq!(reports[2].0, "L5");
-    assert_eq!(reports[3].0, "L6");
+    assert_eq!(reports[2].0, "L6");
+    assert_eq!(reports[3].0, "P");
 }
 
 #[test]
@@ -1087,4 +1120,337 @@ fn ladder_first_five_reports_unchanged() {
         );
         assert_eq!(reports[r].1.io_callouts, 0, "L{r} io_callouts must be zero");
     }
+}
+
+// --- Rung P: poll-wait elision ---
+
+#[test]
+fn p_detects_canonical_poll_loop_first_two_traversals_un_elided() {
+    // The canonical IN/TEST/Jcc self-loop: 5 iterations. The first two traversals warm the detector
+    // (un-elided); wait mode arms at the second identical traversal and iterations 3..5 elide (3
+    // instructions each). retired counts every iteration; io_callouts counts every IN.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    feed_poll_loop(&mut sim, 0x1000, 5, false);
+
+    let r = sim.report();
+    assert_eq!(r.entries, 1, "the loop keeps one open entry");
+    assert_eq!(r.retired_in_units, 15, "every iteration still retires");
+    assert_eq!(r.io_callouts, 5, "every IN still charges an io call-out");
+    assert_eq!(r.elided_waits, 1, "one wait episode");
+    assert_eq!(
+        r.elided_insns, 9,
+        "iterations 3..5 elide 3 instructions each; iterations 1-2 are warm-up"
+    );
+    assert_eq!(r.wait_batch_ends, 0, "no budget yields in this stream");
+    assert_eq!(r.side_exits_async, 0);
+    assert_eq!(
+        r.spin_noio_insns, 0,
+        "an io-read loop is a wait, not a spin"
+    );
+}
+
+#[test]
+fn p_two_identical_traversals_are_required_before_eliding() {
+    // Exactly two iterations: both are warm-up, so nothing elides even though wait mode armed.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    feed_poll_loop(&mut sim, 0x1000, 2, false);
+    let r = sim.report();
+    assert_eq!(
+        r.elided_waits, 1,
+        "wait armed at the second identical traversal"
+    );
+    assert_eq!(r.elided_insns, 0, "both traversals are warm-up");
+}
+
+#[test]
+fn p_storing_loop_is_never_detected() {
+    // Same loop shape but the body stores to memory (writes_memory): a store disqualifies the wait,
+    // so nothing is elided and no spin is counted.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    for _ in 0..5 {
+        sim.observe(io_in(0x1000, 2)); // in al, dx
+        let mut store = insn(0x1002, 2); // mov [mem], al
+        store.writes_memory = true;
+        sim.observe(store);
+        sim.observe(back_edge(0x1004, 2, 0x1000));
+    }
+    let r = sim.report();
+    assert_eq!(r.elided_waits, 0, "a storing loop never enters wait mode");
+    assert_eq!(r.elided_insns, 0);
+    assert_eq!(r.spin_noio_insns, 0);
+}
+
+#[test]
+fn p_out_only_loop_is_never_detected() {
+    // The device access is an OUT: it touches io but is NOT an io read (io_read=false). A qualifying
+    // wait needs >= 1 io read, so an OUT-only loop is never elided. (Pins that OUT does not set
+    // io_read.) The OUT here is modeled as a non-terminating io-touching body instruction.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    for _ in 0..5 {
+        let mut out = insn(0x1000, 2); // out dx, al
+        out.touches_io = true;
+        out.io_read = false;
+        sim.observe(out);
+        sim.observe(insn(0x1002, 2));
+        sim.observe(back_edge(0x1004, 2, 0x1000));
+    }
+    let r = sim.report();
+    assert_eq!(r.elided_waits, 0, "no io read means no qualifying wait");
+    assert_eq!(r.elided_insns, 0);
+}
+
+#[test]
+fn p_counted_io_delay_loop_elides_accepted_over_credit() {
+    // A delay loop that happens to contain an io read (an Adlib-detect-style poll of a timer port)
+    // is structurally identical to a skippable poll, so the sim elides it. This is the ACCEPTED
+    // upper-bound over-credit (gate caveat c): a real deadline-stopping skip would not fast-forward a
+    // loop whose io read is load-bearing. The counter deliberately over-credits here; the 8-insn cap
+    // bounds the magnitude.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    for _ in 0..6 {
+        sim.observe(io_in(0x2000, 2)); // in al, dx (the timer poll)
+        sim.observe(insn(0x2002, 2)); // and al, mask
+        sim.observe(insn(0x2004, 2)); // cmp al, target
+        sim.observe(back_edge(0x2006, 2, 0x2000)); // jne loop
+    }
+    let r = sim.report();
+    assert_eq!(r.elided_waits, 1);
+    // Iterations 3..6 elide a 4-instruction body each.
+    assert_eq!(r.elided_insns, 16);
+}
+
+#[test]
+fn p_isr_discontinuity_mid_wait_closes_async_and_re_entry_warms_up() {
+    // Enter wait mode, then an ISR lands mid-loop (a PC discontinuity). The wait entry closes as an
+    // async side exit (the pre-declared P drift) and detection resets; when the loop resumes it pays
+    // two fresh warm-up traversals before eliding again.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    feed_poll_loop(&mut sim, 0x1000, 4, false); // arms wait; iterations 3-4 elide
+    let after_first = sim.report();
+    assert_eq!(after_first.elided_waits, 1);
+    assert_eq!(after_first.elided_insns, 6);
+
+    // ISR landing: a discontinuous PC that continues neither the fall-through nor the recorded
+    // target. It closes the open wait entry as an async side exit.
+    sim.observe(insn(0x8000, 2));
+    assert_eq!(
+        sim.report().side_exits_async,
+        1,
+        "the wait entry closed Async"
+    );
+    sim.note_batch_end(); // clear the ISR entry cleanly
+
+    // Resume the loop: the first two new traversals are warm-up (no elision), the third elides.
+    let before_resume = sim.report().elided_insns;
+    feed_poll_loop(&mut sim, 0x1000, 2, false);
+    assert_eq!(
+        sim.report().elided_insns,
+        before_resume,
+        "re-entry pays two un-elided warm-up traversals"
+    );
+    feed_poll_loop(&mut sim, 0x1000, 1, false);
+    assert_eq!(
+        sim.report().elided_insns,
+        before_resume + 3,
+        "the third resumed traversal elides"
+    );
+    assert_eq!(
+        sim.report().elided_waits,
+        2,
+        "the re-entry is a second episode"
+    );
+}
+
+#[test]
+fn p_batch_end_in_wait_counts_wait_batch_ends_and_keeps_entry_open() {
+    // The real substrate batch-ends every io iteration. In wait mode a budget yield does NOT close
+    // the surviving entry: it charges wait_batch_ends and the entry stays open so elision continues.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    feed_poll_loop(&mut sim, 0x1000, 5, true); // batch-end after every iteration
+
+    let r = sim.report();
+    // Iteration 1 batch-ends normally (not yet in wait). Iteration 2 arms wait and its batch-end is
+    // the first absorbed one; iterations 3..5 each absorb another.
+    assert_eq!(
+        r.wait_batch_ends, 4,
+        "four budget yields absorbed while waiting"
+    );
+    assert_eq!(
+        r.entries, 2,
+        "only iterations 1 and 2 opened entries; wait held the entry open across later yields"
+    );
+    assert_eq!(r.elided_waits, 1);
+    assert_eq!(r.elided_insns, 9, "iterations 3..5 elide");
+    assert_eq!(
+        r.side_exits_async, 0,
+        "a budget yield is not a discontinuity"
+    );
+    assert_eq!(r.unresolved_exits, 0);
+}
+
+#[test]
+fn p_memory_poll_shape_counts_spin_noio_and_never_elides() {
+    // Doom's maketic tic-spin shape: `cmp eax,[mem]; jnz`. Eligible, store-free, small, but with NO
+    // io read, so it CANNOT be safely elided from trace shape alone (indistinguishable from a data
+    // scan). It is counted in spin_noio_insns (the unmodeled-headroom bound) and never elided.
+    let mut sim = UnitSim::with_config(SimConfig::ladder(7));
+    for _ in 0..5 {
+        sim.observe(insn(0x3000, 3)); // cmp eax, [mem] (reads memory, writes none)
+        sim.observe(back_edge(0x3003, 2, 0x3000)); // jnz loop
+    }
+    let r = sim.report();
+    assert_eq!(r.elided_insns, 0, "a memory poll is never elided");
+    assert_eq!(r.elided_waits, 0);
+    // Traversals 2..5 each count their 2-instruction body.
+    assert_eq!(r.spin_noio_insns, 8);
+}
+
+#[test]
+fn p_io_callouts_match_l6_cross_rung_anchor() {
+    // The measurement anchor: io_callouts(P) == io_callouts(L6) == side_exits_io(L0). Poll-wait
+    // elision changes entries and adds P-only counters, but every IN still retires and is classified
+    // identically, so the io tally is invariant across the three rungs.
+    let mut ladder = SimLadder::with_rungs(&[0, 6, 7]);
+    for _ in 0..5 {
+        ladder.observe(io_in(0x1000, 2));
+        ladder.observe(insn(0x1002, 2));
+        ladder.observe(back_edge(0x1004, 2, 0x1000));
+        ladder.note_batch_end();
+    }
+    let reports = ladder.reports();
+    let (l0, l6, p) = (&reports[0].1, &reports[1].1, &reports[2].1);
+    assert_eq!(l0.side_exits_io, 5);
+    assert_eq!(
+        l6.io_callouts, l0.side_exits_io,
+        "io_callouts(L6) == side_exits_io(L0)"
+    );
+    assert_eq!(
+        p.io_callouts, l6.io_callouts,
+        "io_callouts(P) == io_callouts(L6)"
+    );
+    assert_eq!(
+        p.retired_in_units, l6.retired_in_units,
+        "retired is config-independent across L6 and P"
+    );
+}
+
+#[test]
+fn p_does_not_perturb_l0_l4_l6_reports_or_flags() {
+    // Bit-identity checklist items 11-12: adding rung P (and the new ObservedInsn flags) must not
+    // change any L0/L4/L6 counter on an identical stream, and no rung except P reads
+    // writes_memory/io_read. Feed a mixed stream (poll loop, calls, io, code write) to the four-rung
+    // measurement ladder AND to solo L0/L4/L6 sims; the shared rungs must match field-for-field, with
+    // every P-only counter zero.
+    enum Ev {
+        Obs(ObservedInsn),
+        Write(u32, u32),
+        Batch,
+    }
+    let mut events = vec![
+        Ev::Obs(call_near(0x2000, 5, 0x1000)),
+        Ev::Obs(insn(0x1000, 2)),
+        Ev::Obs(ret(0x1002, 1)),
+        Ev::Obs(insn(0x2005, 2)),
+        Ev::Write(0x2fff, 4),
+        Ev::Batch,
+    ];
+    // A batched poll loop (the P-active shape) with the new flags set on its members.
+    for _ in 0..5 {
+        events.push(Ev::Obs(io_in(0x4000, 2)));
+        let mut body = insn(0x4002, 2);
+        body.writes_memory = true; // exercised only by P
+        events.push(Ev::Obs(body));
+        events.push(Ev::Obs(back_edge(0x4004, 2, 0x4000)));
+        events.push(Ev::Batch);
+    }
+
+    let mut solos: Vec<UnitSim> = [0u8, 4, 6]
+        .iter()
+        .map(|&r| UnitSim::with_config(SimConfig::ladder(r)))
+        .collect();
+    let mut ladder = SimLadder::with_rungs(&[0, 4, 6, 7]);
+    for ev in &events {
+        match *ev {
+            Ev::Obs(i) => {
+                for s in &mut solos {
+                    s.observe(i);
+                }
+                ladder.observe(i);
+            }
+            Ev::Write(p, w) => {
+                for s in &mut solos {
+                    s.note_code_write(p, w);
+                }
+                ladder.note_code_write(p, w);
+            }
+            Ev::Batch => {
+                for s in &mut solos {
+                    s.note_batch_end();
+                }
+                ladder.note_batch_end();
+            }
+        }
+    }
+
+    let reports = ladder.reports();
+    assert_eq!(reports.len(), 4);
+    // The shared L0/L4/L6 rungs are byte-identical to the solo runs, and every P-only counter is zero
+    // on them (proving the new flags and the poll path are invisible outside P).
+    for (i, solo) in solos.iter().enumerate() {
+        let (name, report, _) = &reports[i];
+        assert_eq!(
+            *report,
+            solo.report(),
+            "rung {name} report changed by adding P"
+        );
+        assert_eq!(
+            report.elided_insns, 0,
+            "rung {name} elided_insns must be zero"
+        );
+        assert_eq!(
+            report.elided_waits, 0,
+            "rung {name} elided_waits must be zero"
+        );
+        assert_eq!(
+            report.wait_batch_ends, 0,
+            "rung {name} wait_batch_ends must be zero"
+        );
+        assert_eq!(
+            report.spin_noio_insns, 0,
+            "rung {name} spin_noio_insns must be zero"
+        );
+    }
+    // P itself must have run the poll path (the mixed stream includes a storing loop, so it does not
+    // elide, but the storing body proves writes_memory reached the detector).
+    assert_eq!(reports[3].0, "P");
+    assert_eq!(
+        reports[3].1.elided_insns, 0,
+        "the storing poll loop does not elide"
+    );
+}
+
+#[test]
+fn p_non_p_rungs_ignore_the_new_flags() {
+    // Checklist item 11 directly: flipping writes_memory/io_read on a stream must not change any
+    // non-P rung's report (only P consults them). Compare an L6 solo run with the flags set against
+    // one with them clear.
+    let build = |flags: bool| {
+        let mut sim = UnitSim::with_config(SimConfig::ladder(6));
+        for _ in 0..4 {
+            let mut a = insn(0x1000, 2);
+            a.touches_io = true; // io_callout is an L6 fact and stays set in both runs
+            a.io_read = flags;
+            sim.observe(a);
+            let mut b = insn(0x1002, 2);
+            b.writes_memory = flags;
+            sim.observe(b);
+            sim.observe(back_edge(0x1004, 2, 0x1000));
+        }
+        sim.report()
+    };
+    assert_eq!(
+        build(true),
+        build(false),
+        "L6 must ignore writes_memory/io_read"
+    );
 }

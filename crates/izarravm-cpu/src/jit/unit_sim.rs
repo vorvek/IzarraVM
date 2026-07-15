@@ -33,6 +33,12 @@
 //!   layered on the L2 shadow return stack. Replaces L4's monomorphic cache as the indirect policy.
 //! - `L6` `io_callout`: a `touches_io` instruction no longer closes the entry; it accrues, charges
 //!   `io_callouts`, and the entry stays open (models an in-unit port call-out).
+//! - `P` `poll_skip` (rung 7, `ladder(6) + poll_skip`): models poll-wait elision. A side-effect-free
+//!   device-wait loop (identical eligible traversals, `>= 1` io read, no store) fast-forwards after a
+//!   two-traversal warm-up: elided iterations still retire (so `retired_in_units` and `io_callouts`
+//!   stay identical to L6) but count in `elided_insns`, and a budget yield no longer closes the
+//!   surviving entry (it charges `wait_batch_ends`). `spin_noio_insns` bounds the out-of-scope
+//!   memory-poll class. The report prints both `ipe_active` and `ipe_active_slice` quotients.
 //!
 //! [`SimLadder`] fans one observation stream out to a set of rungs so a single run measures the
 //! marginal value of each mechanism against the same trace.
@@ -78,6 +84,15 @@ pub(crate) struct ObservedInsn {
     pub transfer: TransferKind,
     pub is_terminator: bool,
     pub touches_io: bool,
+    /// P ONLY: this instruction may write memory (a conservative-true classifier; see
+    /// `block::writes_memory`). Read exclusively by the rung-P poll-wait detector to disqualify a
+    /// loop body that stores; no rung except P consults it (bit-identity checklist item 11). Derived
+    /// in `unit_sim_observe` after the sim-disabled early return, so the disabled path is untouched.
+    pub writes_memory: bool,
+    /// P ONLY: this instruction is a port IN (0xE4/0xE5/0xEC/0xED). Read exclusively by the rung-P
+    /// poll-wait detector (a qualifying wait needs >= 1 io read) and the io histogram; no rung except
+    /// P consults it. Derived in `unit_sim_observe` after the sim-disabled early return.
+    pub io_read: bool,
 }
 
 /// Per-sim mechanism gates. `L0` is all-false and reproduces the v1 sim; each higher ladder rung
@@ -97,13 +112,19 @@ pub(crate) struct SimConfig {
     pub ght: bool,
     /// L6+: a `touches_io` instruction accrues as an in-unit call-out instead of closing the entry.
     pub io_callout: bool,
+    /// P ONLY (rung 7): model poll-wait elision on top of the L6 config. A side-effect-free device
+    /// wait loop (identical eligible traversals, an io read, no store) fast-forwards: elided
+    /// iterations still retire but are counted in `elided_insns`, and a budget yield no longer closes
+    /// the surviving entry (`wait_batch_ends`). See the module's poll-wait section.
+    pub poll_skip: bool,
 }
 
 impl SimConfig {
-    /// The config for ladder rung `rung` (`0..=6`). Rungs 0..=4 are strict supersets (`ladder(4)`
+    /// The config for ladder rung `rung` (`0..=7`). Rungs 0..=4 are strict supersets (`ladder(4)`
     /// enables all four v1-superset mechanisms). L5 and L6 are QEMU-shaped: `ladder(5)` is the L3
     /// config (loop/call-ret/smc) with `ght` on and `itc` OFF (the global lookup replaces the L4
-    /// monomorphic cache), and `ladder(6)` adds `io_callout` on top of L5.
+    /// monomorphic cache), and `ladder(6)` adds `io_callout` on top of L5. Rung 7 (labelled `P`) is
+    /// `ladder(6)` plus `poll_skip`.
     pub(crate) fn ladder(rung: u8) -> Self {
         SimConfig {
             loop_direct: rung >= 1,
@@ -112,6 +133,7 @@ impl SimConfig {
             itc: rung == 4,
             ght: rung >= 5,
             io_callout: rung >= 6,
+            poll_skip: rung >= 7,
         }
     }
 }
@@ -155,6 +177,20 @@ pub struct SimReport {
     pub io_callouts: u64,
     /// Restamps charged at unit re-entry after a tail-confined store dirtied it (L3+).
     pub sim_restamps: u64,
+    /// P: instructions in poll-wait iterations that a deadline-stopping skip would have elided. These
+    /// iterations STILL retire (so `retired_in_units` is config-independent); this counts how many of
+    /// those retirements the skip removes from the active stream. Upper bound on real skip coverage
+    /// (a counted-io delay loop is elided here but not by a real skip); see gate caveat (c).
+    pub elided_insns: u64,
+    /// P: poll-wait episodes entered (one per loop that reached wait mode).
+    pub elided_waits: u64,
+    /// P: budget yields (`note_batch_end`) absorbed by a surviving wait-mode entry instead of closing
+    /// it. The pessimistic quotient (`ipe_active_slice`) prices one dispatch per absorbed yield.
+    pub wait_batch_ends: u64,
+    /// P DIAGNOSTIC (never elided): instructions in identical, store-free, io-FREE spin loops that
+    /// pass every wait test except the io-read requirement (Doom's maketic memory tic-spin). Bounds
+    /// the headroom a memory-poll-capable skip could add; out of scope for the io-read model here.
+    pub spin_noio_insns: u64,
 }
 
 /// A simulated translation unit, keyed by `(entry_linear, mode_key)` in the owner map.
@@ -275,6 +311,50 @@ fn ght_index(lin: u32) -> usize {
     (((tmp >> (12 - 6)) & 0b111111_000000) | (tmp & 0b111111)) as usize
 }
 
+/// The largest loop body (in instructions) rung P will treat as a candidate poll-wait, and the cap
+/// on the in-progress traversal buffer. A qualifying wait body is `<= POLL_QUAL_BODY`; `POLL_MAX_BODY`
+/// is a generous slack so a short prologue before the loop head still lets the anchor be found before
+/// the buffer is force-reset (a longer non-looping run is not a tight poll loop and never qualifies).
+const POLL_QUAL_BODY: usize = 8;
+const POLL_MAX_BODY: usize = 64;
+
+/// One instruction recorded in the in-progress traversal buffer (rung P). Only the facts the
+/// poll-wait shape test needs: the PC (for the identical-sequence compare) and the three
+/// disqualifiers/qualifiers.
+#[derive(Clone, Copy)]
+struct PollInsn {
+    pc: u32,
+    /// The lowered transfer was `None` (a straight-line body instruction). An eligible traversal is
+    /// all-`None` bodies plus the single terminating in-window back-edge.
+    none_transfer: bool,
+    io_read: bool,
+    writes_memory: bool,
+}
+
+/// Rung-P poll-wait detector state, held on the sim (NOT the open entry) so it survives budget yields
+/// (`note_batch_end`): a real device poll batch-ends every iteration, so the identical traversals
+/// that arm wait mode only accumulate across yields. Reset by `close` (a discontinuity or unresolved
+/// exit breaks the loop) and by any observation that cannot be part of the tracked loop. Inert unless
+/// `config.poll_skip`.
+#[derive(Default)]
+struct PollState {
+    /// The loop anchor: the in-window back-edge target PC (a member of the loop), once discovered.
+    anchor: Option<u32>,
+    /// The in-progress traversal, from the last anchor arrival up to and including the current
+    /// instruction. A completed traversal is the tail from the last anchor occurrence.
+    cur: Vec<PollInsn>,
+    /// The last completed traversal's PC sequence, for the identical-sequence compare.
+    ref_pcs: Vec<u32>,
+    has_ref: bool,
+    /// Consecutive identical completed traversals (reset to 1 on a mismatch). Wait mode arms at 2.
+    matches: u32,
+    /// In wait mode: elided iterations are counted and budget yields no longer close the entry.
+    wait: bool,
+    /// The previous instruction closed a traversal; the next observation is expected to re-enter at
+    /// the anchor. If it does not, the loop exited (fall-through) or was diverted: detection resets.
+    expect_anchor: bool,
+}
+
 /// Simulates unit growth from a stream of observed instructions.
 #[derive(Default)]
 pub(crate) struct UnitSim {
@@ -299,6 +379,8 @@ pub(crate) struct UnitSim {
     /// unit to still exist), so no scan is needed on invalidation.
     ght_table: GhtTable,
     open: Option<OpenEntry>,
+    /// Rung-P poll-wait detector (inert unless `config.poll_skip`).
+    poll: PollState,
     report: SimReport,
 }
 
@@ -489,11 +571,24 @@ impl UnitSim {
     /// waiting for never arrives.
     pub(crate) fn note_batch_end(&mut self) {
         if let Some(open) = self.open.as_ref() {
+            // P: a budget yield does NOT close a surviving wait-mode entry (BLOCKER-1). It charges a
+            // wait_batch_end - the substrate-yield the pessimistic quotient prices - and keeps the
+            // entry open so the poll continues to accrue and elide across the yield. An eligible
+            // wait-mode loop never has a pending deferred (its bodies are `None` + one back-edge), so
+            // this branch never strands one.
+            if self.config.poll_skip && self.poll.wait {
+                self.report.wait_batch_ends += 1;
+                return;
+            }
             if !matches!(open.deferred, Deferred::None) {
                 self.close(ExitReason::Unresolved);
                 return;
             }
         }
+        // A budget yield is not a discontinuity, so the poll detector is deliberately NOT reset here:
+        // a real poll batch-ends every iteration, and detection must survive to accumulate the
+        // identical traversals that arm wait mode. The next observation's anchor check catches a
+        // genuine loop exit across the yield.
         self.open = None;
     }
 
@@ -597,7 +692,18 @@ impl UnitSim {
             }
         }
 
-        match self.effective_kind(insn.transfer) {
+        let effective = self.effective_kind(insn.transfer);
+
+        // P: feed the poll-wait detector every non-terminating accrued instruction (a terminator
+        // closed above; `close` resets detection). This never changes retired_in_units, io_callouts,
+        // or any exit counter - it only drives the new P-only counters and the wait-mode entry
+        // survival in `note_batch_end`.
+        if self.config.poll_skip {
+            let window = self.open.as_ref().expect("open entry present").window;
+            self.poll_observe(&insn, effective, window);
+        }
+
+        match effective {
             TransferKind::Indirect => self.close_or_arm_itc(insn),
             TransferKind::DirectNear { target } => self.handle_direct(insn, target, false),
             TransferKind::LoopNear { target } => self.handle_direct(insn, target, true),
@@ -892,6 +998,13 @@ impl UnitSim {
             ExitReason::Io => self.report.side_exits_io += 1,
         }
         self.open = None;
+        // P: a real close is a discontinuity (an ISR landing, an unresolved exit): the tracked loop
+        // is broken, so wait mode ends and detection restarts (re-entry pays the 2 warm-up
+        // traversals). The pre-declared drift lives here - an ISR closing a surviving wait entry
+        // charges side_exits_async at P where the L6 batch-end cleared it counter-free.
+        if self.config.poll_skip {
+            self.poll_reset();
+        }
     }
 
     /// Drop every inline-target-cache entry rooted at a killed unit. A real inline cache is
@@ -911,6 +1024,142 @@ impl UnitSim {
                 }
             }
         }
+    }
+
+    /// P: fold one accrued instruction into the poll-wait detector. `effective` is the config-lowered
+    /// transfer and `window` the open unit's 4 KiB window (for the in-window back-edge test). Purely
+    /// observational except for its effect on `note_batch_end` survival and the P-only counters.
+    fn poll_observe(&mut self, insn: &ObservedInsn, effective: TransferKind, window: u32) {
+        let p = insn.linear;
+        let none_transfer = matches!(effective, TransferKind::None);
+        // An in-window near direct/loop branch is the only shape that can terminate an eligible
+        // traversal; carry its target so the back-edge test below can check it against the anchor.
+        let dir_target = match effective {
+            TransferKind::DirectNear { target } | TransferKind::LoopNear { target }
+                if (target >> 12) == window =>
+            {
+                Some(target)
+            }
+            _ => None,
+        };
+
+        // A completed traversal expected the loop to re-enter at its anchor. If this observation is
+        // not the anchor, the loop exited (a fall-through past the back-edge) or was diverted: leave
+        // wait mode and restart detection, then process this instruction as a fresh sequence start.
+        if self.poll.expect_anchor {
+            self.poll.expect_anchor = false;
+            if Some(p) != self.poll.anchor {
+                self.poll_reset_detection();
+            }
+        }
+
+        // Anything that is neither a straight-line body nor an in-window near branch (a raw indirect,
+        // a return, a call, an out-of-window link) cannot belong to an eligible poll loop: reset.
+        if !none_transfer && dir_target.is_none() {
+            self.poll_reset_detection();
+            return;
+        }
+
+        // Bound the in-progress buffer: a long non-looping run is not a tight poll loop.
+        if self.poll.cur.len() >= POLL_MAX_BODY {
+            self.poll_reset_detection();
+        }
+        self.poll.cur.push(PollInsn {
+            pc: p,
+            none_transfer,
+            io_read: insn.io_read,
+            writes_memory: insn.writes_memory,
+        });
+
+        // A near branch back to a member already seen this traversal closes it (and pins the anchor
+        // the first time). Any other in-window direct is a forward body branch: it stays in the
+        // buffer as a non-`None` instruction, which will disqualify the traversal at completion.
+        if let Some(target) = dir_target {
+            let body = &self.poll.cur[..self.poll.cur.len() - 1];
+            let is_backedge = match self.poll.anchor {
+                Some(a) => target == a,
+                None => body.iter().any(|x| x.pc == target),
+            };
+            if is_backedge {
+                self.poll_complete(target);
+            }
+        }
+    }
+
+    /// P: a traversal just closed on an in-window back-edge to `anchor`. Evaluate it against the
+    /// previous traversal, arm/hold/exit wait mode, and count elided or spin-noio instructions.
+    fn poll_complete(&mut self, anchor: u32) {
+        self.poll.anchor = Some(anchor);
+        // The traversal is the buffer tail from the last anchor occurrence (drop any prologue that
+        // preceded the loop head on the first pass).
+        let start = self
+            .poll
+            .cur
+            .iter()
+            .rposition(|x| x.pc == anchor)
+            .unwrap_or(0);
+        let tail = &self.poll.cur[start..];
+        let len = tail.len();
+        // Eligible: every instruction except the terminating back-edge is a straight-line body.
+        let eligible = tail
+            .iter()
+            .take(len.saturating_sub(1))
+            .all(|x| x.none_transfer);
+        let io_reads = tail.iter().filter(|x| x.io_read).count();
+        let has_write = tail.iter().any(|x| x.writes_memory);
+        let pcs: Vec<u32> = tail.iter().map(|x| x.pc).collect();
+
+        let identical = self.poll.has_ref && self.poll.ref_pcs == pcs;
+        self.poll.matches = if identical { self.poll.matches + 1 } else { 1 };
+        self.poll.ref_pcs = pcs;
+        self.poll.has_ref = true;
+
+        // The wait shape: identical eligible traversal, body within the cap, no store. An io read
+        // makes it a poll-skip candidate; its absence (but everything else passing) makes it a
+        // memory-poll spin (diagnostic only, never elided).
+        let small = eligible && len <= POLL_QUAL_BODY && !has_write;
+        let qualifies = small && io_reads >= 1;
+        let noio = small && io_reads == 0;
+
+        if self.poll.wait {
+            if qualifies && identical {
+                // An elided iteration: it still retired (accrued above), but a deadline-stopping skip
+                // would have fast-forwarded through it. Count its instructions.
+                self.report.elided_insns += len as u64;
+            } else {
+                // A diverging traversal exits wait mode; normal rules already applied to its
+                // instructions as they accrued.
+                self.poll.wait = false;
+            }
+        } else if qualifies && self.poll.matches >= 2 {
+            // Two identical eligible io-read traversals: arm wait mode. This (second) traversal is
+            // the warm-up and is NOT elided; the third onward are.
+            self.poll.wait = true;
+            self.report.elided_waits += 1;
+        }
+        if noio && identical && self.poll.matches >= 2 {
+            self.report.spin_noio_insns += len as u64;
+        }
+
+        self.poll.cur.clear();
+        self.poll.expect_anchor = true;
+    }
+
+    /// P: clear the in-progress detection (anchor, buffer, reference) but leave `wait` to the caller.
+    fn poll_reset_detection(&mut self) {
+        self.poll.wait = false;
+        self.poll.anchor = None;
+        self.poll.cur.clear();
+        self.poll.ref_pcs.clear();
+        self.poll.has_ref = false;
+        self.poll.matches = 0;
+        self.poll.expect_anchor = false;
+    }
+
+    /// P: fully reset the detector, including wait mode (called from `close`, a discontinuity).
+    fn poll_reset(&mut self) {
+        self.poll.wait = false;
+        self.poll_reset_detection();
     }
 }
 
@@ -932,9 +1181,14 @@ fn page_write_range(physical: u32, width: u32, page: u32) -> (u32, u32) {
 /// `set_unit_sim_enabled`; unit-tested here.
 pub(crate) struct SimLadder {
     sims: Vec<(&'static str, UnitSim)>,
+    /// Per-port io-read histogram (behind `IZARRAVM_IO_HIST=1`; `None` = disabled, zero cost). Kept
+    /// on the ladder, not the per-rung sims, so an io read is counted ONCE per retirement regardless
+    /// of how many rungs observe it. Populated from the observe site (the port is a runtime fact for
+    /// the DX forms), read out at the end of a headless run.
+    io_hist: Option<HashMap<u16, u64>>,
 }
 
-/// The static label for ladder rung `rung` (`0..=6`).
+/// The static label for ladder rung `rung` (`0..=7`). Rung 7 is the poll-wait rung, labelled `P`.
 fn rung_name(rung: u8) -> &'static str {
     match rung {
         0 => "L0",
@@ -944,7 +1198,8 @@ fn rung_name(rung: u8) -> &'static str {
         4 => "L4",
         5 => "L5",
         6 => "L6",
-        _ => panic!("ladder rungs are 0..=6"),
+        7 => "P",
+        _ => panic!("ladder rungs are 0..=7"),
     }
 }
 
@@ -956,8 +1211,9 @@ impl SimLadder {
         Self::with_rungs(&[0, 1, 2, 3, 4, 5, 6])
     }
 
-    /// A ladder over an explicit list of rungs, each named `L{rung}`. Lets a run pick just the
-    /// measurement set instead of paying for every rung.
+    /// A ladder over an explicit list of rungs, each named `L{rung}` (rung 7 is `P`). Lets a run pick
+    /// just the measurement set instead of paying for every rung. The io histogram is off; a headless
+    /// run turns it on with [`SimLadder::enable_io_hist`].
     pub(crate) fn with_rungs(rungs: &[u8]) -> Self {
         let sims = rungs
             .iter()
@@ -968,7 +1224,32 @@ impl SimLadder {
                 )
             })
             .collect();
-        Self { sims }
+        Self {
+            sims,
+            io_hist: None,
+        }
+    }
+
+    /// Turn on the per-port io-read histogram (headless-run diagnostic, `IZARRAVM_IO_HIST=1`).
+    pub(crate) fn enable_io_hist(&mut self) {
+        self.io_hist = Some(HashMap::new());
+    }
+
+    /// Record one io-read retirement against `port` (a no-op when the histogram is disabled).
+    pub(crate) fn record_io_read(&mut self, port: u16) {
+        if let Some(hist) = self.io_hist.as_mut() {
+            *hist.entry(port).or_insert(0) += 1;
+        }
+    }
+
+    /// The io-read histogram sorted by count descending (ties broken by ascending port), or `None`
+    /// when it was never enabled. The caller caps the printed depth.
+    pub(crate) fn io_hist_sorted(&self) -> Option<Vec<(u16, u64)>> {
+        self.io_hist.as_ref().map(|hist| {
+            let mut v: Vec<(u16, u64)> = hist.iter().map(|(&port, &count)| (port, count)).collect();
+            v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            v
+        })
     }
 
     /// Observe one retired instruction on every rung.
