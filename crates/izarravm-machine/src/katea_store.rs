@@ -199,6 +199,12 @@ pub(crate) struct SectorStore {
     /// decision so a failed read holds that chain instead of feeding zeros into a
     /// delete or an overwrite. `Atomic` only because reads take `&self`.
     read_errors: AtomicU64,
+    /// Test-only fault injection: make every spill read fail. Breaking the file on
+    /// disk is not a usable fault model, because the next eviction extends the file
+    /// again and the lost range comes back as a hole full of zeroes rather than as
+    /// an error, which is the one thing this store must never do.
+    #[cfg(test)]
+    fail_reads: bool,
 }
 
 impl SectorStore {
@@ -219,6 +225,8 @@ impl SectorStore {
             seq: 0,
             capacity: capacity.max(1),
             broken: false,
+            #[cfg(test)]
+            fail_reads: false,
             read_errors: AtomicU64::new(0),
         }
     }
@@ -245,6 +253,12 @@ impl SectorStore {
         };
         if !chunk.is_present(lba) {
             return Ok(None);
+        }
+        // The sector is present but not resident, so it is on disk from here on.
+        #[cfg(test)]
+        if self.fail_reads {
+            self.read_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(io::Error::other("katea spill: injected read failure"));
         }
         // Present but not resident means it was evicted, so the slab and the file
         // must exist. If they do not, the invariant is broken and the honest
@@ -314,7 +328,10 @@ impl SectorStore {
     /// 128 KiB can make an untouched range look newer than it is. That direction
     /// is safe (it costs an unnecessary re-read); the opposite would not be.
     pub(crate) fn max_seq_in(&self, first: u32, count: u32) -> u64 {
-        let last = first.saturating_add(count.saturating_sub(1));
+        if count == 0 {
+            return 0; // an empty span was never written
+        }
+        let last = first.saturating_add(count - 1);
         (chunk_id(first)..=chunk_id(last))
             .filter_map(|id| self.chunks.get(&id))
             .map(|c| c.last_seq)
@@ -352,6 +369,14 @@ impl SectorStore {
         &self.path
     }
 
+    /// Make every read of a spilled sector fail from now on. Resident sectors are
+    /// unaffected, which is what lets a test hold one chain's payload in RAM while
+    /// another chain's becomes unreadable.
+    #[cfg(test)]
+    pub(crate) fn fail_spill_reads(&mut self) {
+        self.fail_reads = true;
+    }
+
     /// Write the least recently written sector out to the spill and drop it from
     /// RAM. Returns false when nothing was evicted, which also ends the caller's
     /// loop.
@@ -361,7 +386,9 @@ impl SectorStore {
         };
         let Some(&(_, data)) = self.cache.get(&victim_lba) else {
             // `order` and `cache` disagreeing means a bug in this module, not an
-            // I/O problem. Drop the stale ordering entry and carry on.
+            // I/O problem. Drop the stale ordering entry and carry on, but say so:
+            // silently absorbing it would let the RAM bound fail with no trace.
+            eprintln!("katea: eviction order held sector {victim_lba}, which is not cached");
             self.order.remove(&victim_seq);
             return true;
         };

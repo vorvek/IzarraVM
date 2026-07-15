@@ -1216,11 +1216,12 @@ fn reconcile_skips_re_reading_a_file_that_cannot_have_changed() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// A guest-written sector that cannot be read back reads as zeros. Zeros must never
-/// reach a decision: a zeroed FAT entry looks like a freed chain and would delete a
-/// real host file, and zeroed data would be written over one.
+/// A genuinely broken spill file (not an injected fault) must surface as read
+/// errors and cost nothing on the host. Here the live scan itself cannot be read,
+/// which is the one failure that cannot be scoped to a single chain: the live set
+/// is what every later phase reasons against, so the whole pass is abandoned.
 #[test]
-fn a_failed_spill_read_holds_instead_of_deleting_the_host_file() {
+fn a_failed_read_in_the_live_scan_abandons_the_whole_pass() {
     let (mut vol, root) = fresh_vol("read_fail");
     shrink_cache(&mut vol, 2);
     let free = vol.next_free;
@@ -1311,6 +1312,143 @@ fn the_skip_never_fires_while_a_file_still_reads_from_its_host_bytes() {
         vol.gathers() > before,
         "a file that reads from its host bytes must not be skipped: the host file \
          can change under it without any guest write"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A rename moves the host path, so the base view under the chain moves with it.
+/// The watermark must not survive that, or a later pass could skip a gather on the
+/// strength of where the file used to be.
+#[test]
+fn a_rename_clears_the_gather_watermark() {
+    let (mut vol, root) = fresh_vol("rename_watermark");
+    let free = vol.next_free + 1000;
+    stamp_file(&mut vol, 2, "BEFORE.TXT", 0x20, free, b"contents\r\n");
+    vol.reconcile();
+    // Skip-eligible now: a second pass leaves it alone.
+    let before = vol.gathers();
+    vol.reconcile();
+    assert_eq!(vol.gathers(), before, "the file should be skip-eligible");
+
+    rename_entry(&mut vol, 2, "BEFORE.TXT", "AFTER.TXT");
+    vol.reconcile();
+    assert!(
+        root.join("AFTER.TXT").exists(),
+        "the rename should reach the host"
+    );
+    // The renamed entry is a fresh mirror entry with no watermark, so the next pass
+    // must re-read it rather than trust the old one.
+    let before = vol.gathers();
+    vol.reconcile();
+    assert!(
+        vol.gathers() > before,
+        "a renamed file must be re-read: its watermark described the old path"
+    );
+    assert_eq!(
+        std::fs::read(root.join("AFTER.TXT")).unwrap(),
+        b"contents\r\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Push `count` unrelated sectors through the cache, so anything written before
+/// them is evicted to the spill.
+#[cfg(test)]
+fn flush_cache(vol: &mut KateaTreeVolume, count: u32) {
+    let cold = vol.cluster_to_lba(vol.next_free + 5000);
+    for i in 0..count {
+        vol.write_sector(cold + i, &[0x77; SECTOR]);
+    }
+}
+
+/// The dangerous case for phase 2: an entry the guest removed from its directory
+/// while its chain is still allocated. Reconcile decides "deleted" by reading the
+/// chain's FAT entry, so if that read fails and returns zeros, an intact chain
+/// looks freed and a real host file gets removed on the strength of an I/O error.
+#[test]
+fn a_failed_fat_read_never_deletes_the_host_file() {
+    let (mut vol, root) = fresh_vol("read_fail_delete");
+    shrink_cache(&mut vol, 30);
+    // Clear of the root directory, so the directory's own FAT sector is never
+    // written and phase 1 can still read it from the computed base view.
+    let first = vol.next_free + 1000;
+    stamp_file(
+        &mut vol,
+        2,
+        "COLD.BIN",
+        0x20,
+        first,
+        b"precious contents\r\n",
+    );
+    vol.reconcile();
+    assert!(root.join("COLD.BIN").exists());
+
+    // Evict this file's FAT sector, then drop its directory entry while leaving the
+    // chain allocated: exactly the shape of a guest delete, minus the freed chain.
+    flush_cache(&mut vol, 40);
+    delete_entry(&mut vol, 2, "COLD.BIN");
+    vol.store.fail_spill_reads();
+    vol.reconcile();
+
+    assert!(
+        vol.store.read_errors() > 0,
+        "the FAT read for the vanished entry must have failed"
+    );
+    assert!(
+        root.join("COLD.BIN").exists(),
+        "an unreadable FAT entry must not be taken as a freed chain: the host file \
+         would be deleted on the strength of an I/O failure"
+    );
+    assert_eq!(
+        std::fs::read(root.join("COLD.BIN")).unwrap(),
+        b"precious contents\r\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The dangerous case for phase 3: the chain reads fine but the file's own data
+/// does not. The gathered bytes would be part real and part zeros, and reconcile
+/// would write that straight over a good host file.
+#[test]
+fn a_failed_data_read_never_overwrites_the_host_file_with_zeros() {
+    let (mut vol, root) = fresh_vol("read_fail_data");
+    shrink_cache(&mut vol, 30);
+    let first = vol.next_free + 1000;
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    stamp_file(&mut vol, 2, "DATA.BIN", 0x20, first, &payload);
+    vol.reconcile();
+    assert_eq!(std::fs::read(root.join("DATA.BIN")).unwrap(), payload);
+
+    // Evict the file's data, then bring its FAT sectors and the root directory back
+    // into the cache by rewriting them unchanged, so phase 1 and the chain walk both
+    // still succeed while the data behind them does not. This is the whole point:
+    // with the directory spilled too, phase 1 aborts the pass and the per-file
+    // bracket under test is never reached. Reads must happen before arming.
+    flush_cache(&mut vol, 40);
+    let dir_lba = vol.cluster_to_lba(2);
+    let dir_sec = vol.read_sector(dir_lba);
+    vol.write_sector(dir_lba, &dir_sec);
+    for c in 0..4u32 {
+        let byte = (first + c) as usize * 4;
+        let fat_lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let sec = vol.read_sector(fat_lba);
+        vol.write_sector(fat_lba, &sec);
+    }
+    // Touch one data sector, so the file is not skip-eligible and reconcile really
+    // does try to re-read the whole body.
+    vol.write_sector(vol.cluster_to_lba(first), &[0xEE; SECTOR]);
+    vol.store.fail_spill_reads();
+    vol.reconcile();
+
+    assert!(
+        vol.store.read_errors() > 0,
+        "the spilled tail of the file must have failed to read"
+    );
+    assert_eq!(
+        std::fs::read(root.join("DATA.BIN")).unwrap(),
+        payload,
+        "a file whose data cannot be read back must be held, never materialized \
+         from the zeros that a failed read returns"
     );
     std::fs::remove_dir_all(&root).ok();
 }

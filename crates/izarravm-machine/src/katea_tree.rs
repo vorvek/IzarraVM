@@ -694,8 +694,8 @@ struct MirrorEntry {
 /// store's copy of any written chain sector, and the base view under any chain
 /// sector the guest never wrote. `all_present` records that the fourth input was
 /// absent, which is what lets the other three stand in for the whole function.
-/// Only ever compared for equality, never trusted as content.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Only ever compared field by field, never trusted as content.
+#[derive(Clone, Copy, Debug)]
 struct Gather {
     /// The directory entry's declared size at that decision.
     size: u32,
@@ -1101,6 +1101,10 @@ impl KateaTreeVolume {
             let errors_before = self.store.read_errors();
             let freed = m.first_cluster < 2 || self.fat_entry(m.first_cluster) == 0;
             if self.store.read_errors() != errors_before {
+                eprintln!(
+                    "katea: holding {} after a failed read of its FAT chain",
+                    m.host_path.display()
+                );
                 continue; // hold this entry, retry next pass
             }
             let claimed = live_by_cluster.contains_key(&m.first_cluster);
@@ -1238,6 +1242,12 @@ impl KateaTreeVolume {
                         first_cluster,
                         size,
                     } => {
+                        // Bracket the whole decision, starting before the first read
+                        // it makes. A zeroed FAT sector would already end the chain
+                        // walk below as "incomplete" and hold, but relying on that
+                        // would make this file's safety depend on the shape of the
+                        // corruption rather than on the failure itself.
+                        let errors_before = self.store.read_errors();
                         let Some(fchain) =
                             crate::katea_write::chain(first_cluster, max, |c| self.fat_entry(c))
                         else {
@@ -1300,7 +1310,6 @@ impl KateaTreeVolume {
                         // if it did, the bytes can change without any guest write
                         // (our own atomic_write rewrites the very host file the base
                         // view reads), so the skip above must not fire next pass.
-                        let errors_before = self.store.read_errors();
                         let decided_at = self.store.seq();
                         gathers += 1;
                         let mut all_present = true;
