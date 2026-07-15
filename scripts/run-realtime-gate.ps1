@@ -18,6 +18,7 @@ param(
     [string]$Jit = "1",
     [switch]$BackendBakeoff,
     [switch]$TrackMComparison,
+    [switch]$PollSkipComparison,
     [string]$ExecutionRole = "",
     [switch]$Screening,
     [string]$MeasurementLockPath = "",
@@ -168,36 +169,6 @@ function Set-GateProcessEnvironment([string]$Name, [object]$Value) {
     [Environment]::SetEnvironmentVariable($Name, [string]$Value, "Process")
 }
 
-function Assert-BackendBakeoffMode(
-    [bool]$IsReportOnly,
-    [bool]$HasBaseline,
-    [bool]$HasExplicitJit,
-    [bool]$HasExplicitExecutable,
-    [bool]$SkipRequested,
-    [int]$RequestedProcessor,
-    [string]$LockPath
-) {
-    if ($IsReportOnly) {
-        throw "Backend bakeoff mode cannot be combined with ReportOnly."
-    }
-    if ($HasBaseline) {
-        throw "Backend bakeoff mode compares one executable and does not accept BaselineRevision."
-    }
-    if ($HasExplicitJit) {
-        throw "Backend bakeoff mode assigns IZARRAVM_JIT per role and does not accept Jit."
-    }
-    if ($HasExplicitExecutable -or $SkipRequested) {
-        throw "Backend bakeoff mode requires one clean isolated build."
-    }
-    if ($RequestedProcessor -ne 8) {
-        throw "Backend bakeoff mode requires ProcessorIndex 8."
-    }
-    if ([string]::IsNullOrWhiteSpace($LockPath) -or
-        -not [IO.Path]::IsPathFullyQualified($LockPath)) {
-        throw "Backend bakeoff mode requires an absolute MeasurementLockPath."
-    }
-}
-
 function Enter-MeasurementLock([string]$Path) {
     $absolutePath = [IO.Path]::GetFullPath($Path)
     $parent = [IO.Path]::GetDirectoryName($absolutePath)
@@ -333,53 +304,6 @@ function Assert-ExpectedSha256([string]$Actual, [string]$Expected, [string]$Cont
         throw "$Context does not match the accepted workload manifest."
     }
     return $matches
-}
-
-function Get-PairedMetricVerdict([double]$Median, [double]$Lower95) {
-    if ([double]::IsNaN($Median) -or [double]::IsInfinity($Median) -or
-        [double]::IsNaN($Lower95) -or [double]::IsInfinity($Lower95) -or
-        $Median -le 0 -or $Lower95 -le 0) {
-        throw "Paired metric verdict inputs must be finite and positive."
-    }
-    if ($Median -lt 0.98) {
-        return "regression"
-    }
-    if ($Lower95 -lt 0.97) {
-        return "inconclusive"
-    }
-    return "pass"
-}
-
-function Get-CandidateSampleChecks($Policy, [object[]]$Samples) {
-    return [pscustomobject][ordered]@{
-        samples = $Samples.Count
-        coverage_passes = @($Samples | Where-Object {
-            $_.direct_native_coverage -ge $minimumDirectCoverage
-        }).Count
-        exit_rate_passes = @($Samples | Where-Object {
-            $_.direct_slow_exits_per_100_instructions -lt $maximumDirectExitsPer100
-        }).Count
-        real_time_floor_passes = @($Samples | Where-Object {
-            $_.real_time_factor -ge $Policy.minimum_real_time_factor
-        }).Count
-    }
-}
-
-function Assert-RoleDeterminism([string]$Name, [object[]]$Samples) {
-    if (@($Samples.perf.instructions | Sort-Object -Unique).Count -ne 1 -or
-        @($Samples.perf.jit_direct_entries | Sort-Object -Unique).Count -ne 1 -or
-        @($Samples.perf.jit_direct_insns | Sort-Object -Unique).Count -ne 1 -or
-        @($Samples.perf.jit_direct_side_exits | Sort-Object -Unique).Count -ne 1) {
-        throw "$Name did not retire deterministic instruction and direct-JIT counters within one executable."
-    }
-    if ($Name.StartsWith("doom-", [StringComparison]::Ordinal)) {
-        if (@($Samples.timedemo.gametics | Sort-Object -Unique).Count -ne 1 -or
-            @($Samples.timedemo.realtics | Sort-Object -Unique).Count -ne 1) {
-            throw "$Name did not produce a deterministic timedemo identity within one executable."
-        }
-    } elseif (@($Samples.quake_timedemo.line | Sort-Object -Unique).Count -ne 1) {
-        throw "Quake did not produce a deterministic timedemo identity within one executable."
-    }
 }
 
 function ConvertFrom-QuakeTimedemoLine([string]$Line) {
@@ -1173,8 +1097,20 @@ $explicitExecutable = $PSBoundParameters.ContainsKey("Executable")
 $explicitJit = $PSBoundParameters.ContainsKey("Jit")
 $explicitRuns = $PSBoundParameters.ContainsKey("Runs")
 $explicitBaseline = $PSBoundParameters.ContainsKey("BaselineRevision")
+$explicitExecutionRole = $PSBoundParameters.ContainsKey("ExecutionRole")
 $trackMExecutionPolicy = $null
-if ($TrackMComparison) {
+$pollSkipExecutionPolicies = $null
+if ($PollSkipComparison) {
+    Assert-PollSkipComparisonMode `
+        ([bool]$BackendBakeoff) ([bool]$TrackMComparison) ([bool]$ReportOnly) `
+        $explicitBaseline $explicitJit $explicitExecutable ([bool]$SkipBuild) `
+        $explicitExecutionRole ([bool]$Screening) $Runs $Workload `
+        $ProcessorIndex $MeasurementLockPath
+    $pollSkipExecutionPolicies = [ordered]@{
+        skip_off = Get-PollSkipExecutionPolicy "skip_off"
+        skip_on = Get-PollSkipExecutionPolicy "skip_on"
+    }
+} elseif ($TrackMComparison) {
     Assert-TrackMComparisonMode `
         ([bool]$BackendBakeoff) ([bool]$ReportOnly) $explicitBaseline `
         $explicitJit $explicitExecutable ([bool]$SkipBuild) `
@@ -1207,7 +1143,7 @@ if ($BackendBakeoff) {
     if ($Workload -ne "Both") {
         throw "Backend bakeoff requires all three workloads."
     }
-} elseif (-not $TrackMComparison) {
+} elseif (-not $TrackMComparison -and -not $PollSkipComparison) {
     if ($Runs -lt 1) {
         throw "Runs must be at least one."
     }
@@ -1227,7 +1163,7 @@ if ($BackendBakeoff) {
         throw "Paired report-only measurements require at least two pairs."
     }
 }
-$captureProofArtifacts = [bool]($BackendBakeoff -or $TrackMComparison)
+$captureProofArtifacts = [bool]($BackendBakeoff -or $TrackMComparison -or $PollSkipComparison)
 $artifactSelection = Get-ArtifactSelectionPolicy ([bool]$ReportOnly) $explicitExecutable ([bool]$SkipBuild)
 if ($PairSeed -eq 0) {
     $PairSeed = [Security.Cryptography.RandomNumberGenerator]::GetInt32(1, [int]::MaxValue)
@@ -1290,6 +1226,15 @@ if ($isWindowsHost) {
         $processorName = $null
     }
     $activePowerScheme = Get-ActivePowerScheme
+}
+$highPerformancePowerSchemeGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+$pollSkipPowerSchemeEligible = -not $PollSkipComparison -or
+    ([string]$activePowerScheme).Contains(
+        $highPerformancePowerSchemeGuid,
+        [StringComparison]::OrdinalIgnoreCase
+    )
+if ($PollSkipComparison -and -not $pollSkipPowerSchemeEligible) {
+    throw "POLL-SKIP comparison requires the High Performance power scheme."
 }
 $hostIdentity = [ordered]@{
     os_description = $runtimeInformation::OSDescription
@@ -1879,7 +1824,7 @@ if ($null -ne $baselineCommit) {
     $baselineArtifact = Invoke-IsolatedRevisionBuild $repositoryRoot $baselineCommit $artifactLabel $ResultsDirectory
 }
 $revisionPairedRun = $null -ne $baselineArtifact
-$pairedRun = $BackendBakeoff -or $revisionPairedRun
+$pairedRun = $BackendBakeoff -or $PollSkipComparison -or $revisionPairedRun
 if (-not $ReportOnly -and -not $pairedRun) {
     throw "The formal gate requires a freshly built baseline artifact."
 }
@@ -1910,23 +1855,23 @@ function Invoke-IzarraProcess(
     if ($TrackMComparison -and $BackendRole -notin @("candidate", "parent")) {
         throw "Unknown Track M revision role '$BackendRole'."
     }
+    if ($PollSkipComparison -and $BackendRole -notin @("skip_off", "skip_on")) {
+        throw "Unknown POLL-SKIP comparison role '$BackendRole'."
+    }
     $argumentLine = ($Arguments | ForEach-Object { Quote-ProcessArgument $_ }) -join " "
-    $childEnvironment = @{
-        HOME = $HomePath
-        USERPROFILE = $HomePath
-        APPDATA = $HomePath
-        LOCALAPPDATA = $HomePath
-    }
-    foreach ($name in $diagnosticVariables) {
-        $childEnvironment[$name] = $null
-    }
-    $childEnvironment["IZARRAVM_JIT"] = if ($BackendBakeoff) {
-        if ($BackendRole -eq "automatic") { "1" } else { "0" }
+    $roleEnvironment = if ($PollSkipComparison) {
+        $pollSkipExecutionPolicies[$BackendRole].environment
+    } elseif ($BackendBakeoff) {
+        [ordered]@{
+            IZARRAVM_JIT = if ($BackendRole -eq "automatic") { "1" } else { "0" }
+        }
     } elseif ($TrackMComparison) {
-        $trackMExecutionPolicy.jit
+        [ordered]@{ IZARRAVM_JIT = $trackMExecutionPolicy.jit }
     } else {
-        $Jit
+        [ordered]@{ IZARRAVM_JIT = $Jit }
     }
+    $childEnvironment = New-IzarraChildEnvironment `
+        $HomePath $diagnosticVariables $roleEnvironment
     $start = @{
         FilePath = $ExecutablePath
         ArgumentList = $argumentLine
@@ -2163,7 +2108,7 @@ function Invoke-Observation(
             Remove-Item -LiteralPath $qconsole
         }
     }
-    $measurementFixtureHash = if ($TrackMComparison) {
+    $measurementFixtureHash = if ($TrackMComparison -or $PollSkipComparison) {
         Get-DirectoryTreeSha256 $fixture
     } else {
         $null
@@ -2186,7 +2131,8 @@ function Invoke-Observation(
     if (Test-ObservationRequiresTestExit $captureProofArtifacts $Policy.name) {
         $processArguments += "--expect-test-exit"
     }
-    if (($BackendBakeoff -and $Role -eq "interpreter") -or
+    if ($PollSkipComparison -or
+        ($BackendBakeoff -and $Role -eq "interpreter") -or
         ($TrackMComparison -and $trackMExecutionPolicy.name -eq "interpreter")) {
         $processArguments += "--interpreter"
     }
@@ -2286,7 +2232,17 @@ function Invoke-Observation(
         $sample | Add-Member `
             -NotePropertyName gate_process_exit_code `
             -NotePropertyValue $processResult.exit_code
-        if ($BackendBakeoff) {
+        if ($PollSkipComparison) {
+            $rolePolicy = $pollSkipExecutionPolicies[$Role]
+            $sample | Add-Member -NotePropertyName gate_execution_cli `
+                -NotePropertyValue $rolePolicy.cli
+            $sample | Add-Member -NotePropertyName gate_execution_jit `
+                -NotePropertyValue $rolePolicy.environment.IZARRAVM_JIT
+            $sample | Add-Member -NotePropertyName gate_poll_skip `
+                -NotePropertyValue $rolePolicy.environment.IZARRAVM_POLL_SKIP
+            $sample | Add-Member -NotePropertyName gate_measurement_fixture_sha256 `
+                -NotePropertyValue $measurementFixtureHash
+        } elseif ($BackendBakeoff) {
             $sample | Add-Member -NotePropertyName gate_backend_policy -NotePropertyValue $Role
         } else {
             $sample | Add-Member -NotePropertyName gate_execution_role `
@@ -2330,12 +2286,7 @@ function Invoke-Observation(
 }
 
 
-$knownDiagnosticVariables = @(
-    "IZARRAVM_AUDIO_DEBUG", "IZARRAVM_CPU_PROFILE", "IZARRAVM_DECODE_CACHE_LINES",
-    "IZARRAVM_DIFF_TRACE", "IZARRAVM_DUMP_LINEAR", "IZARRAVM_FAULT_TRACE",
-    "IZARRAVM_JIT_FOLD", "IZARRAVM_JIT_REGION", "IZARRAVM_MACHINE_PROFILE",
-    "IZARRAVM_RUNTIME_PROFILE", "RUST_LOG"
-)
+$knownDiagnosticVariables = @(Get-KnownDiagnosticVariables)
 $inheritedIzarraVariables = @(Get-ChildItem Env: | Where-Object {
     $_.Name.StartsWith("IZARRAVM_", [StringComparison]::OrdinalIgnoreCase)
 } | ForEach-Object { $_.Name })
@@ -2373,7 +2324,9 @@ try {
         )
     }
     $policies = @(Get-WorkloadPolicies $Workload)
-    $pairRoles = if ($BackendBakeoff) {
+    $pairRoles = if ($PollSkipComparison) {
+        @("skip_on", "skip_off")
+    } elseif ($BackendBakeoff) {
         @("automatic", "interpreter")
     } elseif ($TrackMComparison) {
         @("candidate", "parent")
@@ -2400,15 +2353,31 @@ try {
             } else {
                 $quakeSnapshot.frozen_path
             }
-            foreach ($role in (Get-PairOrder 1 $PairSeed $pairRoles)) {
-                $artifact = if ($BackendBakeoff -or $role -eq "candidate") {
+            $warmupOrder = if ($PollSkipComparison) {
+                Get-PollSkipWarmupOrder
+            } else {
+                Get-PairOrder 1 $PairSeed $pairRoles
+            }
+            foreach ($role in $warmupOrder) {
+                $artifact = if ($BackendBakeoff -or $PollSkipComparison -or
+                    $role -eq "candidate") {
                     $candidateArtifact
                 } else {
                     $baselineArtifact
                 }
                 $warmup = Invoke-Observation `
                     $policy $sourceFolder $role "warmup" $artifact.executed_copy_path
+                if ($PollSkipComparison) {
+                    Assert-PollSkipSample $warmup $role "warmup" $policy
+                }
                 $discardedWarmups[$policy.name][$role] += $warmup
+            }
+            if ($PollSkipComparison) {
+                $null = Assert-PollSkipPair `
+                    $policy.name `
+                    $discardedWarmups[$policy.name].skip_on[0] `
+                    $discardedWarmups[$policy.name].skip_off[0] `
+                    "warmup"
             }
         }
         for ($pair = 1; $pair -le $Runs; $pair++) {
@@ -2420,15 +2389,29 @@ try {
                 } else {
                     $quakeSnapshot.frozen_path
                 }
+                $pollSkipPairSamples = [ordered]@{}
                 foreach ($role in $roleOrder) {
-                    $artifact = if ($BackendBakeoff -or $role -eq "candidate") {
+                    $artifact = if ($BackendBakeoff -or $PollSkipComparison -or
+                        $role -eq "candidate") {
                         $candidateArtifact
                     } else {
                         $baselineArtifact
                     }
                     $sample = Invoke-Observation $policy $sourceFolder $role "pair$pair" $artifact.executed_copy_path
+                    if ($PollSkipComparison) {
+                        Assert-PollSkipSample $sample $role "pair$pair" $policy
+                        Assert-PollSkipRoleReference `
+                            $policy.name $role `
+                            $discardedWarmups[$policy.name][$role][0] $sample
+                        $pollSkipPairSamples[$role] = $sample
+                    }
                     $bucket = $observations[$policy.name]
                     $bucket[$role] += $sample
+                }
+                if ($PollSkipComparison) {
+                    $null = Assert-PollSkipPair `
+                        $policy.name $pollSkipPairSamples.skip_on `
+                        $pollSkipPairSamples.skip_off "pair $pair"
                 }
             }
         }
@@ -2449,7 +2432,11 @@ try {
     $workloads = @()
     foreach ($policy in $policies) {
         $bucket = $observations[$policy.name]
-        if ($TrackMComparison) {
+        if ($PollSkipComparison) {
+            $workloads += Get-PollSkipWorkloadSummary `
+                $policy $bucket.skip_on $bucket.skip_off `
+                $discardedWarmups[$policy.name]
+        } elseif ($TrackMComparison) {
             $workloads += Get-TrackMWorkloadSummary `
                 $policy $bucket.candidate $bucket.parent `
                 $discardedWarmups[$policy.name] $trackMExecutionPolicy
@@ -2611,7 +2598,9 @@ $powerSchemeRecorded = -not [string]::IsNullOrWhiteSpace([string]$activePowerSch
 $powerSchemeStable = $powerSchemeRecorded -and
     $activePowerScheme -eq $activePowerSchemeAtCompletion
 
-if ($TrackMComparison) {
+if ($PollSkipComparison) {
+    $summary = New-PollSkipComparisonSummary $workloads
+} elseif ($TrackMComparison) {
     $summary = New-TrackMComparisonSummary $workloads
 } elseif ($BackendBakeoff) {
     $evidencePolicy = Get-BackendEvidencePolicy ([bool]$Screening)
@@ -2946,7 +2935,12 @@ if ($TrackMComparison) {
 }
 
 foreach ($workloadResult in $summary.workloads) {
-    if ($BackendBakeoff) {
+    if ($PollSkipComparison) {
+        $metric = $workloadResult.paired_metrics.real_time_factor
+        Write-Host ("{0}: skip_on/skip_off RTF median={1:N4} geometric-mean={2:N4} lower95={3:N4} verdict={4}" -f `
+            $workloadResult.name, $metric.median_ratio, $metric.geometric_mean_ratio, `
+            $metric.lower_95_ratio, $workloadResult.verdicts.performance)
+    } elseif ($BackendBakeoff) {
         $median = $workloadResult.automatic.median
         Write-Host ("{0}: automatic rt={1:N3} direct-native={2:P2} verdicts={3}" -f `
             $workloadResult.name, $median.real_time_factor, $median.direct_native_coverage, `
@@ -2959,7 +2953,7 @@ foreach ($workloadResult in $summary.workloads) {
             $workloadResult.name, $median.real_time_factor, $median.direct_native_coverage, `
             $median.direct_slow_exits_per_100_instructions)
     }
-    if ($null -ne $workloadResult.paired_metrics) {
+    if (-not $PollSkipComparison -and $null -ne $workloadResult.paired_metrics) {
         Write-Host ("  paired IPS={0:N3} (lower95={1:N3}) RTF={2:N3} (lower95={3:N3})" -f `
             $workloadResult.paired_metrics.instructions_per_host_second.median_ratio,
             $workloadResult.paired_metrics.instructions_per_host_second.lower_95_ratio,
@@ -2974,12 +2968,14 @@ if ($TrackMComparison) {
     Write-Host "Result log: $($trackMEvidence.result_log_path)"
 }
 
-if ($TrackMComparison -and $summary.verdict -ne "passed") {
+if ($PollSkipComparison -and $summary.verdict -cne "improved") {
+    throw "The POLL-SKIP comparison did not demonstrate a speedup: $($summary.verdict)."
+} elseif ($TrackMComparison -and $summary.verdict -ne "passed") {
     throw "The Track M comparison did not pass: $($summary.failure_reasons -join ' | ')."
 } elseif ($BackendBakeoff -and -not $Screening -and $summary.track_a_survival -ne "pass") {
     throw "The backend bakeoff did not meet its survival gate: $($summary.failure_reasons -join ' | ')."
 }
-if (-not $TrackMComparison -and -not $BackendBakeoff -and
+if (-not $PollSkipComparison -and -not $TrackMComparison -and -not $BackendBakeoff -and
     -not $ReportOnly -and $verdict -ne "passed") {
     throw "The paired throughput gate did not pass: $($formalFailures -join ' | ')."
 }

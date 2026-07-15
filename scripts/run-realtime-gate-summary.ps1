@@ -1,6 +1,353 @@
 # This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 # SPDX-License-Identifier: GPL-3.0-only
 
+function Get-KnownDiagnosticVariables {
+    return @(
+        "IZARRAVM_AUDIO_DEBUG", "IZARRAVM_CPU_PROFILE", "IZARRAVM_DECODE_CACHE_LINES",
+        "IZARRAVM_DIFF_TRACE", "IZARRAVM_DUMP_LINEAR", "IZARRAVM_FAULT_TRACE",
+        "IZARRAVM_IO_HIST", "IZARRAVM_JIT_FOLD", "IZARRAVM_JIT_REGION",
+        "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_POLL_SKIP_DIAG", "IZARRAVM_PROFILE_ITERS",
+        "IZARRAVM_RUNTIME_PROFILE", "IZARRAVM_UNIT_SIM", "RUST_LOG"
+    )
+}
+
+function New-IzarraChildEnvironment(
+    [string]$HomePath,
+    [string[]]$DiagnosticVariables,
+    [Collections.IDictionary]$RoleEnvironment
+) {
+    $childEnvironment = @{
+        HOME = $HomePath
+        USERPROFILE = $HomePath
+        APPDATA = $HomePath
+        LOCALAPPDATA = $HomePath
+    }
+    foreach ($name in $DiagnosticVariables) {
+        $childEnvironment[$name] = $null
+    }
+    foreach ($entry in $RoleEnvironment.GetEnumerator()) {
+        $childEnvironment[$entry.Key] = [string]$entry.Value
+    }
+    return $childEnvironment
+}
+
+function Assert-BackendBakeoffMode(
+    [bool]$IsReportOnly,
+    [bool]$HasBaseline,
+    [bool]$HasExplicitJit,
+    [bool]$HasExplicitExecutable,
+    [bool]$SkipRequested,
+    [int]$RequestedProcessor,
+    [string]$LockPath
+) {
+    if ($IsReportOnly) {
+        throw "Backend bakeoff mode cannot be combined with ReportOnly."
+    }
+    if ($HasBaseline) {
+        throw "Backend bakeoff mode compares one executable and does not accept BaselineRevision."
+    }
+    if ($HasExplicitJit) {
+        throw "Backend bakeoff mode assigns IZARRAVM_JIT per role and does not accept Jit."
+    }
+    if ($HasExplicitExecutable -or $SkipRequested) {
+        throw "Backend bakeoff mode requires one clean isolated build."
+    }
+    if ($RequestedProcessor -ne 8) {
+        throw "Backend bakeoff mode requires ProcessorIndex 8."
+    }
+    if ([string]::IsNullOrWhiteSpace($LockPath) -or
+        -not [IO.Path]::IsPathFullyQualified($LockPath)) {
+        throw "Backend bakeoff mode requires an absolute MeasurementLockPath."
+    }
+}
+
+function Get-PairedMetricVerdict([double]$Median, [double]$Lower95) {
+    if ([double]::IsNaN($Median) -or [double]::IsInfinity($Median) -or
+        [double]::IsNaN($Lower95) -or [double]::IsInfinity($Lower95) -or
+        $Median -le 0 -or $Lower95 -le 0) {
+        throw "Paired metric verdict inputs must be finite and positive."
+    }
+    if ($Median -lt 0.98) {
+        return "regression"
+    }
+    if ($Lower95 -lt 0.97) {
+        return "inconclusive"
+    }
+    return "pass"
+}
+
+function Get-CandidateSampleChecks($Policy, [object[]]$Samples) {
+    return [pscustomobject][ordered]@{
+        samples = $Samples.Count
+        coverage_passes = @($Samples | Where-Object {
+            $_.direct_native_coverage -ge $minimumDirectCoverage
+        }).Count
+        exit_rate_passes = @($Samples | Where-Object {
+            $_.direct_slow_exits_per_100_instructions -lt $maximumDirectExitsPer100
+        }).Count
+        real_time_floor_passes = @($Samples | Where-Object {
+            $_.real_time_factor -ge $Policy.minimum_real_time_factor
+        }).Count
+    }
+}
+
+function Assert-RoleDeterminism([string]$Name, [object[]]$Samples) {
+    if (@($Samples.perf.instructions | Sort-Object -Unique).Count -ne 1 -or
+        @($Samples.perf.jit_direct_entries | Sort-Object -Unique).Count -ne 1 -or
+        @($Samples.perf.jit_direct_insns | Sort-Object -Unique).Count -ne 1 -or
+        @($Samples.perf.jit_direct_side_exits | Sort-Object -Unique).Count -ne 1) {
+        throw "$Name did not retire deterministic instruction and direct-JIT counters within one executable."
+    }
+    if ($Name.StartsWith("doom-", [StringComparison]::Ordinal)) {
+        if (@($Samples.timedemo.gametics | Sort-Object -Unique).Count -ne 1 -or
+            @($Samples.timedemo.realtics | Sort-Object -Unique).Count -ne 1) {
+            throw "$Name did not produce a deterministic timedemo identity within one executable."
+        }
+    } elseif (@($Samples.quake_timedemo.line | Sort-Object -Unique).Count -ne 1) {
+        throw "Quake did not produce a deterministic timedemo identity within one executable."
+    }
+}
+
+function Assert-PollSkipComparisonMode(
+    [bool]$IsBackendBakeoff,
+    [bool]$IsTrackMComparison,
+    [bool]$IsReportOnly,
+    [bool]$HasExplicitBaseline,
+    [bool]$HasExplicitJit,
+    [bool]$HasExplicitExecutable,
+    [bool]$SkipRequested,
+    [bool]$HasExplicitExecutionRole,
+    [bool]$IsScreening,
+    [int]$RunCount,
+    [string]$WorkloadSelection,
+    [int]$RequestedProcessorIndex,
+    [string]$LockPath
+) {
+    if ($IsBackendBakeoff -or $IsTrackMComparison -or $IsReportOnly) {
+        throw "POLL-SKIP comparison cannot be combined with another comparison mode or ReportOnly."
+    }
+    if ($HasExplicitBaseline -or $HasExplicitJit -or $HasExplicitExecutable -or
+        $SkipRequested -or $HasExplicitExecutionRole) {
+        throw "POLL-SKIP comparison builds one executable and forces both role policies."
+    }
+    if ($IsScreening) {
+        throw "POLL-SKIP comparison does not use Screening."
+    }
+    if ($RunCount -notin @(6, 12)) {
+        throw "POLL-SKIP comparison requires exactly 6 or 12 measured pairs."
+    }
+    if ($WorkloadSelection -cne "Doom586") {
+        throw "POLL-SKIP comparison requires the Doom586 workload."
+    }
+    if ($RequestedProcessorIndex -ne 8) {
+        throw "POLL-SKIP comparison requires ProcessorIndex 8."
+    }
+    if ([string]::IsNullOrWhiteSpace($LockPath) -or
+        -not [IO.Path]::IsPathFullyQualified($LockPath)) {
+        throw "POLL-SKIP comparison requires an absolute MeasurementLockPath."
+    }
+}
+
+function Get-PollSkipExecutionPolicy([string]$Role) {
+    $pollSkip = switch ($Role) {
+        "skip_off" { "0" }
+        "skip_on" { "1" }
+        default { throw "Unknown POLL-SKIP comparison role '$Role'." }
+    }
+    return [pscustomobject][ordered]@{
+        name = $Role
+        cli = "--interpreter"
+        environment = [ordered]@{
+            IZARRAVM_JIT = "0"
+            IZARRAVM_POLL_SKIP = $pollSkip
+        }
+    }
+}
+
+function Get-PollSkipWarmupOrder {
+    return @("skip_off", "skip_on")
+}
+
+function Get-PollSkipExactWorkRecord([string]$WorkloadName, $Sample) {
+    $resultStatus = [string]$Sample.gate_artifacts.result_block_status
+    $resultHash = [string]$Sample.gate_artifacts.result_block_sha256
+    return [ordered]@{
+        master_ticks = [uint64]$Sample.master_ticks
+        elapsed_budget_clocks = [uint64]$Sample.elapsed_budget_clocks
+        executed_cpu_core_clocks = [uint64]$Sample.executed_cpu_core_clocks
+        raw_bus_clocks = [uint64]$Sample.raw_bus_clocks
+        stop = Get-StopIdentityKey $Sample
+        timedemo_identity = Get-TimedemoIdentityKey $WorkloadName $Sample
+        result_block_identity = "$resultStatus|$resultHash"
+        measurement_fixture_identity = Get-MeasurementFixtureIdentityKey $Sample
+        quake_completion_identity = Get-QuakeCompletionIdentityKey $WorkloadName $Sample
+    }
+}
+
+function Get-PollSkipCounterRecord($Sample) {
+    return [ordered]@{
+        instructions = [uint64]$Sample.perf.instructions
+        poll_skip_spans = [uint64]$Sample.perf.poll_skip_spans
+        poll_skip_iterations = [uint64]$Sample.perf.poll_skip_iterations
+    }
+}
+
+function Get-PollSkipSampleFailureReasons(
+    $Sample,
+    [string]$Role,
+    [string]$Observation,
+    $Policy
+) {
+    $reasons = @()
+    $rolePolicy = Get-PollSkipExecutionPolicy $Role
+    if ($Sample.gate_role -cne $Role -or $Sample.gate_observation -cne $Observation) {
+        $reasons += "role or observation identity is wrong"
+    }
+    if ($Sample.gate_processor_index -ne 8 -or
+        -not $Sample.gate_processor_affinity_verified) {
+        $reasons += "processor 8 affinity is not verified"
+    }
+    if ($Sample.gate_execution_cli -cne $rolePolicy.cli -or
+        $Sample.gate_execution_jit -cne $rolePolicy.environment.IZARRAVM_JIT -or
+        $Sample.gate_poll_skip -cne $rolePolicy.environment.IZARRAVM_POLL_SKIP) {
+        $reasons += "execution policy is wrong"
+    }
+    if ([string]$Sample.gate_measurement_fixture_sha256 -notmatch '^[0-9a-f]{64}$') {
+        $reasons += "measurement fixture identity is missing"
+    }
+    if ($Sample.gate_process_exit_code -ne 0 -or
+        (Get-StopIdentityKey $Sample) -cne "test_exit|code=0|requested=|message=") {
+        $reasons += "Lotura TestExit code 0 was not reached"
+    }
+    if ($Sample.gate_artifacts.result_block_status -cne "valid" -or
+        $Sample.gate_artifacts.result_block_count -ne 1 -or
+        [string]$Sample.gate_artifacts.result_block_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        $Sample.gate_artifacts.result_block_normalized_bytes -le 0) {
+        $reasons += "semantic result block is invalid"
+    }
+    if ($null -eq $Sample.timedemo -or $Sample.timedemo.gametics -ne 2134 -or
+        $Sample.timedemo.realtics -ne 843) {
+        $reasons += "Doom/586 anchor is not exactly 2134 gametics and 843 realtics"
+    }
+    foreach ($field in @(
+        "jit_region_entries", "jit_region_insns", "jit_native_insns",
+        "jit_direct_entries", "jit_direct_insns", "jit_direct_side_exits"
+    )) {
+        if ($null -eq $Sample.perf.PSObject.Properties[$field] -or $Sample.perf.$field -ne 0) {
+            $reasons += "interpreter counter $field is not zero"
+        }
+    }
+    if ($null -eq $Sample.perf.PSObject.Properties["poll_skip_spans"] -or
+        $null -eq $Sample.perf.PSObject.Properties["poll_skip_iterations"]) {
+        $reasons += "POLL-SKIP counters are missing"
+    } elseif ($Role -ceq "skip_off" -and
+        ($Sample.perf.poll_skip_spans -ne 0 -or $Sample.perf.poll_skip_iterations -ne 0)) {
+        $reasons += "skip_off reported nonzero POLL-SKIP counters"
+    } elseif ($Role -ceq "skip_on" -and
+        ($Sample.perf.poll_skip_spans -le 0 -or $Sample.perf.poll_skip_iterations -le 0)) {
+        $reasons += "skip_on did not report positive POLL-SKIP counters"
+    }
+    return @($reasons)
+}
+
+function Assert-PollSkipSample(
+    $Sample,
+    [string]$Role,
+    [string]$Observation,
+    $Policy
+) {
+    $reasons = @(Get-PollSkipSampleFailureReasons $Sample $Role $Observation $Policy)
+    if ($reasons.Count -ne 0) {
+        throw "$($Policy.name) $Role $Observation failed: $($reasons -join '; ')."
+    }
+}
+
+function Assert-PollSkipRoleReference(
+    [string]$WorkloadName,
+    [string]$Role,
+    $Reference,
+    $Sample
+) {
+    $work = Compare-EqualWorkRecords `
+        (Get-PollSkipExactWorkRecord $WorkloadName $Reference) `
+        (Get-PollSkipExactWorkRecord $WorkloadName $Sample)
+    $counters = Compare-EqualWorkRecords `
+        (Get-PollSkipCounterRecord $Reference) `
+        (Get-PollSkipCounterRecord $Sample)
+    if (-not $work.matches -or -not $counters.matches) {
+        $fields = @($work.mismatched_fields) + @($counters.mismatched_fields) |
+            Sort-Object -Unique
+        throw "$WorkloadName $Role is not deterministic: $($fields -join ', ')."
+    }
+}
+
+function Assert-PollSkipPair([string]$WorkloadName, $SkipOn, $SkipOff, [string]$Label) {
+    $work = Compare-EqualWorkRecords `
+        (Get-PollSkipExactWorkRecord $WorkloadName $SkipOn) `
+        (Get-PollSkipExactWorkRecord $WorkloadName $SkipOff)
+    if (-not $work.matches) {
+        throw "$WorkloadName $Label exact work differs: $($work.mismatched_fields -join ', ')."
+    }
+    $reduction = [int64]$SkipOff.perf.instructions - [int64]$SkipOn.perf.instructions
+    if ($reduction -le 0) {
+        throw "$WorkloadName $Label did not produce a positive instruction reduction."
+    }
+    return [uint64]$reduction
+}
+
+function Get-PollSkipVerdict([double]$Median, [double]$Lower95, [int]$RunCount) {
+    if ([double]::IsNaN($Median) -or [double]::IsInfinity($Median) -or
+        [double]::IsNaN($Lower95) -or [double]::IsInfinity($Lower95) -or
+        $Median -le 0 -or $Lower95 -le 0) {
+        throw "POLL-SKIP verdict inputs must be finite and positive."
+    }
+    if ($RunCount -notin @(6, 12)) {
+        throw "POLL-SKIP verdicts require exactly 6 or 12 measured pairs."
+    }
+    $classification = if ($Median -lt 0.98 -or
+        $Lower95 -lt 0.97) {
+        "regression"
+    } elseif ($Median -gt 1.0 -and $Lower95 -gt 1.0) {
+        "improved"
+    } elseif ($Median -gt 1.0) {
+        "positive_but_inconclusive"
+    } else {
+        "neutral"
+    }
+    $verdict = if ($RunCount -eq 12 -and $classification -cne "improved") {
+        "speedup_not_demonstrated"
+    } else {
+        $classification
+    }
+    return [pscustomobject][ordered]@{
+        classification = $classification
+        verdict = $verdict
+        twelve_pair_confirmation_required = $RunCount -eq 6 -and
+            $classification -ceq "positive_but_inconclusive"
+    }
+}
+
+function Get-PollSkipPairedMetric([double[]]$Ratios, [int]$RunCount) {
+    if ($RunCount -notin @(6, 12) -or $Ratios.Count -ne $RunCount) {
+        throw "POLL-SKIP paired metrics require exactly 6 or 12 ratios."
+    }
+    $metric = Get-PairedMetric $Ratios
+    $geometricMean = [Math]::Exp((@($Ratios | ForEach-Object {
+        [Math]::Log($_)
+    }) | Measure-Object -Average).Average)
+    $verdict = Get-PollSkipVerdict $metric.median_ratio $metric.lower_95_ratio $RunCount
+    return [pscustomobject][ordered]@{
+        median_ratio = $metric.median_ratio
+        geometric_mean_ratio = $geometricMean
+        lower_95_ratio = $metric.lower_95_ratio
+        lower_bound_confidence = "one-sided 95% Student-t on log ratios"
+        lower_bound_estimand = "geometric mean skip_on / skip_off real-time-factor ratio"
+        classification = $verdict.classification
+        verdict = $verdict.verdict
+        twelve_pair_confirmation_required = $verdict.twelve_pair_confirmation_required
+    }
+}
+
 function Assert-TrackMComparisonMode(
     [bool]$IsBackendBakeoff,
     [bool]$IsReportOnly,
@@ -757,6 +1104,400 @@ function Get-TrackMWorkloadSummary(
             @($semanticReasons) + @($exactWorkReasons) +
             @($provenanceReasons) + @($performanceReasons)
         )
+    }
+}
+
+function Get-PollSkipRoleDeterminism(
+    [string]$WorkloadName,
+    [object[]]$Samples
+) {
+    $exactMismatches = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $counterMismatches = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    if ($Samples.Count -eq 0) {
+        $null = $exactMismatches.Add("missing_samples")
+        $null = $counterMismatches.Add("missing_samples")
+    } else {
+        $exactReference = Get-PollSkipExactWorkRecord $WorkloadName $Samples[0]
+        $counterReference = Get-PollSkipCounterRecord $Samples[0]
+        for ($index = 1; $index -lt $Samples.Count; $index++) {
+            $exact = Compare-EqualWorkRecords `
+                $exactReference (Get-PollSkipExactWorkRecord $WorkloadName $Samples[$index])
+            foreach ($field in $exact.mismatched_fields) {
+                $null = $exactMismatches.Add($field)
+            }
+            $counters = Compare-EqualWorkRecords `
+                $counterReference (Get-PollSkipCounterRecord $Samples[$index])
+            foreach ($field in $counters.mismatched_fields) {
+                $null = $counterMismatches.Add($field)
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        exact_work = [ordered]@{
+            deterministic = $exactMismatches.Count -eq 0
+            mismatched_fields = @($exactMismatches | Sort-Object)
+        }
+        counters = [ordered]@{
+            deterministic = $counterMismatches.Count -eq 0
+            mismatched_fields = @($counterMismatches | Sort-Object)
+        }
+    }
+}
+
+function Get-PollSkipWorkloadSummary(
+    $Policy,
+    [object[]]$SkipOn,
+    [object[]]$SkipOff,
+    $WarmupBucket
+) {
+    if ($SkipOn.Count -ne $SkipOff.Count -or $SkipOn.Count -notin @(6, 12)) {
+        throw "$($Policy.name) requires 6 or 12 complete POLL-SKIP pairs."
+    }
+    $skipOnWarmups = @($WarmupBucket.skip_on)
+    $skipOffWarmups = @($WarmupBucket.skip_off)
+    if ($skipOnWarmups.Count -ne 1 -or $skipOffWarmups.Count -ne 1) {
+        throw "$($Policy.name) requires one discarded warmup per POLL-SKIP role."
+    }
+
+    $semanticReasons = @(
+        @(Get-BackendCompatibilityReasons $Policy "skip_on" @($skipOnWarmups + $SkipOn)) +
+        @(Get-BackendCompatibilityReasons $Policy "skip_off" @($skipOffWarmups + $SkipOff))
+    )
+    foreach ($sample in @($skipOnWarmups + $SkipOn + $skipOffWarmups + $SkipOff)) {
+        if ($null -eq $sample.timedemo -or $sample.timedemo.gametics -ne 2134 -or
+            $sample.timedemo.realtics -ne 843) {
+            $semanticReasons += "$($sample.gate_role) $($sample.gate_observation) missed the exact 843 anchor"
+        }
+    }
+
+    $provenanceReasons = @()
+    foreach ($role in @("skip_off", "skip_on")) {
+        $samples = if ($role -ceq "skip_off") {
+            @($skipOffWarmups + $SkipOff)
+        } else {
+            @($skipOnWarmups + $SkipOn)
+        }
+        foreach ($sample in $samples) {
+            $provenanceReasons += @(Get-PollSkipSampleFailureReasons `
+                $sample $role $sample.gate_observation $Policy)
+        }
+    }
+
+    $exactWorkReasons = @()
+    $counterReasons = @()
+    $rtfRatios = @()
+    $ipsRatios = @()
+    $instructionReductions = @()
+    $pairs = for ($index = 0; $index -lt $SkipOn.Count; $index++) {
+        $exactWork = Compare-EqualWorkRecords `
+            (Get-PollSkipExactWorkRecord $Policy.name $SkipOn[$index]) `
+            (Get-PollSkipExactWorkRecord $Policy.name $SkipOff[$index])
+        if (-not $exactWork.matches) {
+            $exactWorkReasons += "pair $($index + 1): $($exactWork.mismatched_fields -join ', ')"
+        }
+        $reduction = [int64]$SkipOff[$index].perf.instructions -
+            [int64]$SkipOn[$index].perf.instructions
+        if ($reduction -le 0) {
+            $counterReasons += "pair $($index + 1): instruction reduction is not positive"
+        }
+        $instructionReductions += $reduction
+        $rtfRatio = $SkipOn[$index].real_time_factor / $SkipOff[$index].real_time_factor
+        $ipsRatio = $SkipOn[$index].instructions_per_host_second /
+            $SkipOff[$index].instructions_per_host_second
+        $rtfRatios += $rtfRatio
+        $ipsRatios += $ipsRatio
+        [ordered]@{
+            pair = $index + 1
+            skip_on_observation = $SkipOn[$index].gate_observation
+            skip_off_observation = $SkipOff[$index].gate_observation
+            real_time_factor_ratio = $rtfRatio
+            instructions_per_host_second_ratio_diagnostic = $ipsRatio
+            instruction_reduction = $reduction
+            exact_work = $exactWork
+        }
+    }
+    $warmupExactWork = Compare-EqualWorkRecords `
+        (Get-PollSkipExactWorkRecord $Policy.name $skipOnWarmups[0]) `
+        (Get-PollSkipExactWorkRecord $Policy.name $skipOffWarmups[0])
+    if (-not $warmupExactWork.matches) {
+        $exactWorkReasons += "warmup: $($warmupExactWork.mismatched_fields -join ', ')"
+    }
+    $warmupReduction = [int64]$skipOffWarmups[0].perf.instructions -
+        [int64]$skipOnWarmups[0].perf.instructions
+    if ($warmupReduction -le 0) {
+        $counterReasons += "warmup: instruction reduction is not positive"
+    }
+    $instructionReductions += $warmupReduction
+
+    $skipOnDeterminism = Get-PollSkipRoleDeterminism `
+        $Policy.name @($skipOnWarmups + $SkipOn)
+    $skipOffDeterminism = Get-PollSkipRoleDeterminism `
+        $Policy.name @($skipOffWarmups + $SkipOff)
+    $roleDeterminism = [ordered]@{
+        skip_on = $skipOnDeterminism
+        skip_off = $skipOffDeterminism
+    }
+    foreach ($entry in $roleDeterminism.GetEnumerator()) {
+        if (-not $entry.Value.exact_work.deterministic) {
+            $exactWorkReasons += "$($entry.Key) role: $($entry.Value.exact_work.mismatched_fields -join ', ')"
+        }
+        if (-not $entry.Value.counters.deterministic) {
+            $counterReasons += "$($entry.Key) role: $($entry.Value.counters.mismatched_fields -join ', ')"
+        }
+    }
+    if (@($instructionReductions | Sort-Object -Unique).Count -ne 1) {
+        $counterReasons += "instruction reduction is not stable across warmups and measured pairs"
+    }
+
+    $rtfMetric = Get-PollSkipPairedMetric ([double[]]$rtfRatios) $SkipOn.Count
+    $nonPerformancePass = $semanticReasons.Count -eq 0 -and
+        $provenanceReasons.Count -eq 0 -and $exactWorkReasons.Count -eq 0 -and
+        $counterReasons.Count -eq 0
+    return [ordered]@{
+        name = $Policy.name
+        mode = $Policy.mode
+        configuration = [ordered]@{
+            cpu_mode = $Policy.mode
+            memory_mib = 24
+            video = "vega"
+            cycle_budget = $Policy.cycle_budget
+            required_timedemo = "2134 gametics and exactly 843 realtics"
+        }
+        skip_on = Get-RoleSummary "skip_on" $Policy.mode $SkipOn $false
+        skip_off = Get-RoleSummary "skip_off" $Policy.mode $SkipOff $false
+        discarded_warmups = [ordered]@{
+            skip_off = [object[]]$skipOffWarmups
+            skip_on = [object[]]$skipOnWarmups
+            included_in_performance_statistics = $false
+        }
+        pairs = [object[]]$pairs
+        paired_metrics = [ordered]@{
+            real_time_factor = $rtfMetric
+        }
+        diagnostic_metrics = [ordered]@{
+            instructions_per_host_second = [ordered]@{
+                graded = $false
+                reason = "retired instruction counts intentionally differ"
+                pair_ratios = [double[]]$ipsRatios
+                median_ratio = Get-Median ([double[]]$ipsRatios)
+            }
+        }
+        exact_work = [ordered]@{
+            verdict = if ($exactWorkReasons.Count -eq 0) { "pass" } else { "fail" }
+            warmup = $warmupExactWork
+            skip_on_role_determinism = $skipOnDeterminism.exact_work
+            skip_off_role_determinism = $skipOffDeterminism.exact_work
+            failure_reasons = [object[]]$exactWorkReasons
+        }
+        poll_counters = [ordered]@{
+            verdict = if ($counterReasons.Count -eq 0) { "pass" } else { "fail" }
+            skip_off_expected = "zero spans and iterations"
+            skip_on_expected = "positive stable spans and iterations"
+            skip_off_counts = Get-PollSkipCounterRecord $skipOffWarmups[0]
+            skip_on_counts = Get-PollSkipCounterRecord $skipOnWarmups[0]
+            skip_on_role_determinism = $skipOnDeterminism.counters
+            skip_off_role_determinism = $skipOffDeterminism.counters
+            stable_instruction_reduction = if (
+                @($instructionReductions | Sort-Object -Unique).Count -eq 1 -and
+                $instructionReductions[0] -gt 0
+            ) {
+                $instructionReductions[0]
+            } else {
+                $null
+            }
+            failure_reasons = [object[]]$counterReasons
+        }
+        checks = [ordered]@{
+            semantic = [ordered]@{
+                verdict = if ($semanticReasons.Count -eq 0) { "pass" } else { "fail" }
+                failure_reasons = [object[]]$semanticReasons
+            }
+            provenance = [ordered]@{
+                verdict = if ($provenanceReasons.Count -eq 0) { "pass" } else { "fail" }
+                failure_reasons = [object[]]$provenanceReasons
+            }
+            performance = [ordered]@{
+                verdict = if ($nonPerformancePass) { $rtfMetric.verdict } else { "invalid" }
+                classification = $rtfMetric.classification
+                failure_reasons = @()
+            }
+        }
+        verdicts = [ordered]@{
+            semantic = if ($semanticReasons.Count -eq 0) { "pass" } else { "fail" }
+            exact_work = if ($exactWorkReasons.Count -eq 0) { "pass" } else { "fail" }
+            provenance = if ($provenanceReasons.Count -eq 0) { "pass" } else { "fail" }
+            poll_counters = if ($counterReasons.Count -eq 0) { "pass" } else { "fail" }
+            performance = if ($nonPerformancePass) { $rtfMetric.verdict } else { "invalid" }
+        }
+        valid_performance_result = $nonPerformancePass
+        failure_reasons = [object[]]@(
+            @($semanticReasons) + @($exactWorkReasons) +
+            @($provenanceReasons) + @($counterReasons)
+        )
+    }
+}
+
+function New-PollSkipComparisonSummary([object[]]$Workloads) {
+    $globalProvenanceReasons = @()
+    if (-not $candidateArtifact.verified -or -not $candidateArtifact.built_this_invocation) {
+        $globalProvenanceReasons += "the executable was not freshly built from an isolated revision"
+    }
+    if ($candidateArtifact.artifact_source.head_commit -cne $revision -or
+        $candidateArtifact.artifact_source.head_tree -cne $repositoryAtSelection.head_tree) {
+        $globalProvenanceReasons += "the executable revision identity is wrong"
+    }
+    if ($repositoryAtSelection.dirty -or -not $repositoryStable) {
+        $globalProvenanceReasons += "the repository was dirty or changed during measurement"
+    }
+    if (-not $candidateExecutableStable) {
+        $globalProvenanceReasons += "the frozen executable changed during measurement"
+    }
+    if (-not $doomFrozenStable -or -not $doomSourceStable) {
+        $globalProvenanceReasons += "the source or frozen Doom tree changed during measurement"
+    }
+    if (-not $gateSourceClosureStable -or $gateScriptHashAfter -cne $gateScriptHash) {
+        $globalProvenanceReasons += "the gate source closure changed during measurement"
+    }
+    if (-not $fixtureManifestStable) {
+        $globalProvenanceReasons += "the accepted workload manifest changed during measurement"
+    }
+    if ($null -eq $fixtureManifestMatches.doom -or
+        -not $fixtureManifestMatches.doom.preflight_required_inputs -or
+        -not $fixtureManifestMatches.doom.preflight_canonical_tree -or
+        -not $fixtureManifestMatches.doom.frozen_required_inputs -or
+        -not $fixtureManifestMatches.doom.frozen_canonical_tree -or
+        $null -eq $workloadInputHashes.doom_586 -or
+        [string]$workloadCanonicalTreeHashes.doom -notmatch '^[0-9a-f]{64}$') {
+        $globalProvenanceReasons += "the canonical Doom input identity is missing or wrong"
+    }
+    if (-not $verifiedChildAffinityStable -or
+        $verifiedChildAffinityMasks.Count -ne 2 + 2 * $Runs) {
+        $globalProvenanceReasons += "not every POLL-SKIP child used verified processor 8 affinity"
+    }
+    if ($null -ne $outerAffinityRestoreFailure) {
+        $globalProvenanceReasons += "the gate process affinity did not restore after measurement"
+    }
+    if (-not $powerSchemeStable -or -not $pollSkipPowerSchemeEligible) {
+        $globalProvenanceReasons += "the High Performance power scheme was not recorded and stable"
+    }
+    if ($null -eq $measurementLockEvidence -or
+        $measurementLockEvidence.path -cne [IO.Path]::GetFullPath($MeasurementLockPath)) {
+        $globalProvenanceReasons += "the exclusive measurement lock is missing or wrong"
+    }
+    if ($detectedBuildEnvironmentOverrides.Count -ne 0) {
+        $globalProvenanceReasons += "build environment overrides were present"
+    }
+    if ($Runs -notin @(6, 12) -or $Workloads.Count -ne 1 -or
+        $Workloads[0].name -cne "doom-586") {
+        $globalProvenanceReasons += "the Doom/586 workload or pair count is incomplete"
+    }
+
+    $workload = if ($Workloads.Count -eq 1) { $Workloads[0] } else { $null }
+    $workloadValid = $null -ne $workload -and $workload.valid_performance_result
+    $validPerformanceResult = $workloadValid -and $globalProvenanceReasons.Count -eq 0
+    $verdict = if (-not $validPerformanceResult) {
+        "invalid"
+    } else {
+        $workload.paired_metrics.real_time_factor.verdict
+    }
+    $failureReasons = @()
+    if ($null -ne $workload) {
+        $failureReasons += @($workload.failure_reasons)
+    }
+    $failureReasons += $globalProvenanceReasons
+
+    return [ordered]@{
+        schema = "izarravm-poll-skip-comparison-v1"
+        comparison_class = "same_executable_poll_skip_toggle"
+        formal = $true
+        evidence_grade = if ($Runs -eq 6) { "six_pair_proof" } else { "twelve_pair_confirmation" }
+        verdict = $verdict
+        valid_performance_result = $validPerformanceResult
+        twelve_pair_confirmation_required = $validPerformanceResult -and
+            $workload.paired_metrics.real_time_factor.twelve_pair_confirmation_required
+        revision = [ordered]@{
+            commit = $revision
+            tree = $candidateArtifact.artifact_source.head_tree
+        }
+        executable = $candidateArtifact
+        role_executables = [ordered]@{
+            skip_off = [ordered]@{
+                path = $candidateArtifact.executed_copy_path
+                sha256 = $candidateArtifact.sha256
+            }
+            skip_on = [ordered]@{
+                path = $candidateArtifact.executed_copy_path
+                sha256 = $candidateArtifact.sha256
+            }
+            same_executable = $true
+        }
+        execution = [ordered]@{
+            skip_off = $pollSkipExecutionPolicies.skip_off
+            skip_on = $pollSkipExecutionPolicies.skip_on
+            diagnostics_unset = [string[]]$diagnosticVariables
+        }
+        repository_at_selection = $repositoryAtSelection
+        repository_at_completion = $repositoryAtCompletion
+        verification = [ordered]@{
+            build_environment_override_names = @($detectedBuildEnvironmentOverrides.Keys | Sort-Object)
+            workload_manifest_matches = $fixtureManifestMatches
+            doom_source_stable = $doomSourceStable
+            doom_frozen_stable = $doomFrozenStable
+            executable_stable = $candidateExecutableStable
+        }
+        measurement_lock = $measurementLockEvidence
+        gate_source_closure = $gateSourceClosureEvidence
+        workload_manifest_sha256 = [ordered]@{
+            at_entry = $fixtureManifestHash
+            at_completion = $fixtureManifestHashAfter
+        }
+        workload_inputs_sha256 = $workloadInputHashes
+        workload_trees_sha256 = $workloadTreeHashes
+        workload_canonical_trees_sha256 = $workloadCanonicalTreeHashes
+        injected_exitvm_sha256 = $exitVmHash
+        generated_utc = [DateTime]::UtcNow.ToString("o")
+        host = [ordered]@{
+            identity = $hostIdentity
+            active_power_scheme_at_completion = $activePowerSchemeAtCompletion
+            high_performance_at_entry = $pollSkipPowerSchemeEligible
+            active_power_scheme_stable = $powerSchemeStable
+        }
+        processor_affinity = [ordered]@{
+            policy = "one inherited processor per child"
+            requested_processor_index = $ProcessorIndex
+            requested_mask = Format-AffinityMask $requestedProcessorMask
+            verified_child_processes = $verifiedChildAffinityMasks.Count
+            expected_child_processes = 2 + 2 * $Runs
+            verified_child_masks = @($verifiedChildAffinityMasks | Sort-Object -Unique)
+            parent_restore_succeeded = $null -eq $outerAffinityRestoreFailure
+        }
+        measured_pairs = $Runs
+        pair_seed = $PairSeed
+        warmup_order = [string[]](Get-PollSkipWarmupOrder)
+        pair_order = @(1..$Runs | ForEach-Object {
+            [ordered]@{ pair = $_; roles = @(Get-PairOrder $_ $PairSeed $pairRoles) }
+        })
+        wall_samples_serialized = $true
+        acceptance = [ordered]@{
+            improvement_median_ratio_exclusive = 1.0
+            improvement_lower_95_ratio_exclusive = 1.0
+            no_regression_median_ratio = 0.98
+            no_regression_lower_95_ratio = 0.97
+            paired_lower_bound = "one-sided 95% Student-t on log ratios"
+            graded_metric = "skip_on / skip_off real-time factor"
+            ips_is_diagnostic_only = $true
+            exact_work_fields = @(
+                "master_ticks", "elapsed_budget_clocks", "executed_cpu_core_clocks",
+                "raw_bus_clocks", "stop", "timedemo_identity",
+                "result_block_identity", "measurement_fixture_identity"
+            )
+            excluded_exact_work_fields = @(
+                "perf.instructions", "perf.poll_skip_spans", "perf.poll_skip_iterations"
+            )
+            warmups_are_discarded_from_statistics = $true
+        }
+        workloads = $Workloads
+        failure_reasons = [object[]]$failureReasons
     }
 }
 

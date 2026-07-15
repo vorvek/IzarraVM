@@ -448,6 +448,76 @@ function Invoke-RealtimeGateSelfTest {
     foreach ($case in $trackMModeFailures.GetEnumerator()) {
         Assert-SelfTestThrows $case.Value "Track M"
     }
+    Assert-PollSkipComparisonMode `
+        $false $false $false $false $false $false $false $false $false `
+        6 "Doom586" 8 "C:\gate.lock"
+    Assert-PollSkipComparisonMode `
+        $false $false $false $false $false $false $false $false $false `
+        12 "Doom586" 8 "C:\gate.lock"
+    $pollSkipModeFailures = [ordered]@{
+        backend = { Assert-PollSkipComparisonMode $true $false $false $false $false $false $false $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        track_m = { Assert-PollSkipComparisonMode $false $true $false $false $false $false $false $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        report = { Assert-PollSkipComparisonMode $false $false $true $false $false $false $false $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        baseline = { Assert-PollSkipComparisonMode $false $false $false $true $false $false $false $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        jit = { Assert-PollSkipComparisonMode $false $false $false $false $true $false $false $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        executable = { Assert-PollSkipComparisonMode $false $false $false $false $false $true $false $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        skip_build = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $true $false $false 6 "Doom586" 8 "C:\gate.lock" }
+        execution_role = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $true $false 6 "Doom586" 8 "C:\gate.lock" }
+        screening = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $false $true 6 "Doom586" 8 "C:\gate.lock" }
+        six_minus_one = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $false $false 5 "Doom586" 8 "C:\gate.lock" }
+        twelve_plus_one = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $false $false 13 "Doom586" 8 "C:\gate.lock" }
+        workload = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $false $false 6 "Both" 8 "C:\gate.lock" }
+        processor = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $false $false 6 "Doom586" 7 "C:\gate.lock" }
+        lock = { Assert-PollSkipComparisonMode $false $false $false $false $false $false $false $false $false 6 "Doom586" 8 "gate.lock" }
+    }
+    foreach ($case in $pollSkipModeFailures.GetEnumerator()) {
+        Assert-SelfTestThrows $case.Value "POLL-SKIP comparison"
+    }
+    $skipOffPolicy = Get-PollSkipExecutionPolicy "skip_off"
+    $skipOnPolicy = Get-PollSkipExecutionPolicy "skip_on"
+    if ($skipOffPolicy.cli -cne "--interpreter" -or $skipOnPolicy.cli -cne "--interpreter" -or
+        $skipOffPolicy.environment.IZARRAVM_JIT -cne "0" -or
+        $skipOnPolicy.environment.IZARRAVM_JIT -cne "0" -or
+        $skipOffPolicy.environment.IZARRAVM_POLL_SKIP -cne "0" -or
+        $skipOnPolicy.environment.IZARRAVM_POLL_SKIP -cne "1") {
+        throw "POLL-SKIP role policies do not force the interpreter and exact toggle values."
+    }
+    Assert-SelfTestThrows {
+        Get-PollSkipExecutionPolicy "wrong"
+    } "Unknown POLL-SKIP"
+    if ((Get-PollSkipWarmupOrder) -join "," -cne "skip_off,skip_on") {
+        throw "POLL-SKIP warmups are not fixed to skip_off then skip_on."
+    }
+    $pollSkipRoles = @("skip_on", "skip_off")
+    foreach ($seed in @(2, 3)) {
+        $first = @(Get-PairOrder 1 $seed $pollSkipRoles)
+        $second = @(Get-PairOrder 2 $seed $pollSkipRoles)
+        if ($first[0] -ceq $second[0] -or $first[1] -ceq $second[1]) {
+            throw "POLL-SKIP measured role order did not alternate for seed $seed."
+        }
+    }
+    $requiredDiagnostics = @(
+        "IZARRAVM_POLL_SKIP_DIAG", "IZARRAVM_UNIT_SIM",
+        "IZARRAVM_IO_HIST", "IZARRAVM_PROFILE_ITERS"
+    )
+    $knownDiagnostics = @(Get-KnownDiagnosticVariables)
+    foreach ($name in $requiredDiagnostics) {
+        if ($knownDiagnostics -cnotcontains $name) {
+            throw "The fixed diagnostic scrub list is missing $name."
+        }
+    }
+    $childEnvironment = New-IzarraChildEnvironment `
+        "C:\isolated-home" $knownDiagnostics $skipOnPolicy.environment
+    foreach ($name in $requiredDiagnostics) {
+        if (-not $childEnvironment.ContainsKey($name) -or $null -ne $childEnvironment[$name]) {
+            throw "The child environment did not explicitly unset $name."
+        }
+    }
+    if ($childEnvironment.IZARRAVM_JIT -cne "0" -or
+        $childEnvironment.IZARRAVM_POLL_SKIP -cne "1" -or
+        $childEnvironment.HOME -cne "C:\isolated-home") {
+        throw "The child environment did not apply the role after diagnostic scrubbing."
+    }
     $automaticPolicy = Get-TrackMExecutionPolicy "automatic"
     $interpreterPolicy = Get-TrackMExecutionPolicy "interpreter"
     if ($automaticPolicy.cli -cne "default automatic backend" -or
@@ -482,6 +552,37 @@ function Invoke-RealtimeGateSelfTest {
         (Get-PairedMetricVerdict 0.98 0.97) -ne "pass") {
         throw "Track M or generic paired threshold boundaries changed."
     }
+    $pollSkipVerdictCases = @(
+        @([double]1.000001, [double]1.000001, 6, "improved", "improved", $false),
+        @([double]1.000001, [double]1.0, 6, "positive_but_inconclusive", "positive_but_inconclusive", $true),
+        @([double]1.0, [double]1.0, 6, "neutral", "neutral", $false),
+        @([double]0.98, [double]0.97, 6, "neutral", "neutral", $false),
+        @([double]0.979999, [double]1.01, 6, "regression", "regression", $false),
+        @([double]1.01, [double]0.969999, 6, "regression", "regression", $false),
+        @([double]1.01, [double]1.0, 12, "positive_but_inconclusive", "speedup_not_demonstrated", $false),
+        @([double]1.0, [double]1.0, 12, "neutral", "speedup_not_demonstrated", $false),
+        @([double]1.01, [double]1.01, 12, "improved", "improved", $false)
+    )
+    foreach ($case in $pollSkipVerdictCases) {
+        $result = Get-PollSkipVerdict $case[0] $case[1] $case[2]
+        if ($result.classification -cne $case[3] -or $result.verdict -cne $case[4] -or
+            $result.twelve_pair_confirmation_required -ne $case[5]) {
+            throw "POLL-SKIP verdict boundary $($case -join ',') was classified incorrectly."
+        }
+    }
+    $pollSkipMetric = Get-PollSkipPairedMetric `
+        ([double[]](1.01, 1.01, 1.01, 1.01, 1.01, 1.01)) 6
+    if ($pollSkipMetric.verdict -cne "improved" -or
+        [Math]::Abs($pollSkipMetric.geometric_mean_ratio - 1.01) -gt 1.0e-12 -or
+        $pollSkipMetric.lower_bound_estimand -notlike "*geometric mean*") {
+        throw "POLL-SKIP paired metrics do not expose the log-ratio estimand."
+    }
+    Assert-SelfTestThrows {
+        Get-PollSkipVerdict ([double]::NaN) 1.0 6
+    } "finite and positive"
+    Assert-SelfTestThrows {
+        Get-PollSkipPairedMetric ([double[]](1, 1, 1, 1, 1, 1)) 12
+    } "6 or 12 ratios"
     $resultBlockSelfTestPath = Join-Path ([IO.Path]::GetTempPath()) (
         "izarravm-result-block-$([guid]::NewGuid().ToString('N')).log"
     )
@@ -531,6 +632,36 @@ function Invoke-RealtimeGateSelfTest {
     if ($unequalComparison.matches -or
         $unequalComparison.mismatched_fields -notcontains "raw_bus_clocks") {
         throw "Equal-work comparison did not preserve a valid negative result."
+    }
+    $pollExactA = $exactSampleA | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $pollExactA.perf | Add-Member -NotePropertyName poll_skip_spans -NotePropertyValue 0
+    $pollExactA.perf | Add-Member -NotePropertyName poll_skip_iterations -NotePropertyValue 0
+    $pollExactA | Add-Member `
+        -NotePropertyName gate_measurement_fixture_sha256 `
+        -NotePropertyValue ("b" * 64)
+    $pollExactB = $pollExactA | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $pollExactB.perf.instructions = 5
+    $pollExactB.perf.poll_skip_spans = 7
+    $pollExactB.perf.poll_skip_iterations = 11
+    $pollExactComparison = Compare-EqualWorkRecords `
+        (Get-PollSkipExactWorkRecord "doom-586" $pollExactA) `
+        (Get-PollSkipExactWorkRecord "doom-586" $pollExactB)
+    if (-not $pollExactComparison.matches) {
+        throw "POLL-SKIP exact work compared retired instructions or poll counters."
+    }
+    $pollExactRecord = Get-PollSkipExactWorkRecord "doom-586" $pollExactA
+    foreach ($field in $pollExactRecord.Keys) {
+        $mutatedRecord = [ordered]@{}
+        foreach ($entry in $pollExactRecord.GetEnumerator()) {
+            $mutatedRecord[$entry.Key] = $entry.Value
+        }
+        $mutatedRecord[$field] = "changed-$field"
+        $fieldComparison = Compare-EqualWorkRecords $pollExactRecord $mutatedRecord
+        if ($fieldComparison.matches -or
+            $fieldComparison.mismatched_fields.Count -ne 1 -or
+            $fieldComparison.mismatched_fields[0] -cne $field) {
+            throw "POLL-SKIP exact-work field $field was not enforced independently."
+        }
     }
     $screeningPolicy = Get-BackendEvidencePolicy $true
     $finalPolicy = Get-BackendEvidencePolicy $false
@@ -1476,6 +1607,270 @@ function Invoke-RealtimeGateSelfTest {
         } "unexpected result artifact"
     } finally {
         Remove-Item -LiteralPath $evidenceRoot -Recurse -Force
+    }
+
+    $pollPolicy = Get-WorkloadPolicy "doom-586"
+    $newPollSample = {
+        param(
+            [string]$Role,
+            [string]$Observation,
+            [double]$RealTimeFactor
+        )
+        $enabled = $Role -ceq "skip_on"
+        $instructions = if ($enabled) { [uint64]900 } else { [uint64]1000 }
+        return [pscustomobject][ordered]@{
+            wall_seconds = 10.0
+            guest_seconds = 10.0 * $RealTimeFactor
+            real_time_factor = $RealTimeFactor
+            instructions_per_host_second = $instructions / 10.0
+            direct_native_coverage = 0.0
+            direct_slow_exits_per_100_instructions = 0.0
+            perf = [pscustomobject][ordered]@{
+                instructions = $instructions
+                jit_region_entries = 0
+                jit_region_insns = 0
+                jit_native_insns = 0
+                jit_direct_entries = 0
+                jit_direct_insns = 0
+                jit_direct_side_exits = 0
+                poll_skip_spans = if ($enabled) { [uint64]5 } else { [uint64]0 }
+                poll_skip_iterations = if ($enabled) { [uint64]100 } else { [uint64]0 }
+            }
+            master_ticks = [uint64]2000
+            elapsed_budget_clocks = [uint64]3000
+            executed_cpu_core_clocks = [uint64]1100
+            raw_bus_clocks = [uint64]1900
+            stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
+            timedemo = [pscustomobject]@{ gametics = 2134; realtics = 843 }
+            gate_process_exit_code = 0
+            gate_role = $Role
+            gate_observation = $Observation
+            gate_processor_index = 8
+            gate_processor_affinity_mask = "0x0000000000000100"
+            gate_processor_affinity_verified = $true
+            gate_execution_cli = "--interpreter"
+            gate_execution_jit = "0"
+            gate_poll_skip = if ($enabled) { "1" } else { "0" }
+            gate_measurement_fixture_sha256 = "c" * 64
+            gate_termination_policy = "lotura_test_exit"
+            gate_fixture = $null
+            gate_artifacts = [pscustomobject][ordered]@{
+                profile_json_file = "doom-586-$Role-$Observation.json"
+                profile_json_sha256 = "4" * 64
+                stdout_file = "doom-586-$Role-$Observation.stdout.log"
+                stdout_sha256 = "5" * 64
+                stderr_file = "doom-586-$Role-$Observation.stderr.log"
+                stderr_sha256 = "6" * 64
+                qconsole_file = $null
+                qconsole_sha256 = $null
+                result_block_status = "valid"
+                result_block_count = 1
+                result_block_sha256 = "7" * 64
+                result_block_normalized_bytes = 128
+            }
+        }
+    }
+    $newPollComparison = {
+        param([double[]]$Ratios)
+        $skipOn = @()
+        $skipOff = @()
+        foreach ($pair in 1..$Ratios.Count) {
+            $skipOn += & $newPollSample "skip_on" "pair$pair" $Ratios[$pair - 1]
+            $skipOff += & $newPollSample "skip_off" "pair$pair" 1.0
+        }
+        return [pscustomobject][ordered]@{
+            skip_on = [object[]]$skipOn
+            skip_off = [object[]]$skipOff
+            warmups = [pscustomobject][ordered]@{
+                skip_off = [object[]]@(& $newPollSample "skip_off" "warmup" 1.0)
+                skip_on = [object[]]@(& $newPollSample "skip_on" "warmup" 1.0)
+            }
+        }
+    }
+    $pollComparison = & $newPollComparison `
+        ([double[]](1.01, 1.01, 1.01, 1.01, 1.01, 1.01))
+    $pollWorkload = Get-PollSkipWorkloadSummary `
+        $pollPolicy $pollComparison.skip_on $pollComparison.skip_off $pollComparison.warmups
+    if (-not $pollWorkload.valid_performance_result -or
+        $pollWorkload.verdicts.performance -cne "improved" -or
+        $pollWorkload.poll_counters.stable_instruction_reduction -ne 100 -or
+        $null -ne $pollWorkload.diagnostic_metrics.instructions_per_host_second.PSObject.Properties["verdict"]) {
+        throw "A valid POLL-SKIP comparison was rejected or graded by IPS."
+    }
+    Assert-PollSkipSample $pollComparison.warmups.skip_off[0] `
+        "skip_off" "warmup" $pollPolicy
+    Assert-PollSkipSample $pollComparison.warmups.skip_on[0] `
+        "skip_on" "warmup" $pollPolicy
+    if ((Assert-PollSkipPair `
+        $pollPolicy.name $pollComparison.warmups.skip_on[0] `
+        $pollComparison.warmups.skip_off[0] "warmup") -ne 100) {
+        throw "POLL-SKIP warmup instruction reduction is wrong."
+    }
+
+    $sampleFailureCases = [ordered]@{
+        anchor = { param($sample) $sample.timedemo.realtics = 842 }
+        result = { param($sample) $sample.gate_artifacts.result_block_status = "invalid" }
+        jit = { param($sample) $sample.perf.jit_direct_entries = 1 }
+        fixture = { param($sample) $sample.gate_measurement_fixture_sha256 = $null }
+        affinity = { param($sample) $sample.gate_processor_index = 7 }
+        execution = { param($sample) $sample.gate_execution_cli = "automatic" }
+        skip_off_counter = { param($sample) $sample.perf.poll_skip_spans = 1 }
+    }
+    foreach ($case in $sampleFailureCases.GetEnumerator()) {
+        $sample = $pollComparison.warmups.skip_off[0] |
+            ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        & $case.Value $sample
+        Assert-SelfTestThrows {
+            Assert-PollSkipSample $sample "skip_off" "warmup" $pollPolicy
+        } "failed"
+    }
+    $disabledOnSample = $pollComparison.warmups.skip_on[0] |
+        ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $disabledOnSample.perf.poll_skip_iterations = 0
+    Assert-SelfTestThrows {
+        Assert-PollSkipSample $disabledOnSample "skip_on" "warmup" $pollPolicy
+    } "positive POLL-SKIP counters"
+    foreach ($field in @("instructions", "poll_skip_spans", "poll_skip_iterations")) {
+        $drift = $pollComparison.skip_on[0] |
+            ConvertTo-Json -Depth 12 | ConvertFrom-Json
+        $drift.perf.$field++
+        Assert-SelfTestThrows {
+            Assert-PollSkipRoleReference `
+                $pollPolicy.name "skip_on" $pollComparison.warmups.skip_on[0] $drift
+        } $field
+    }
+    $timingDrift = $pollComparison.skip_on[0] |
+        ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $timingDrift.raw_bus_clocks++
+    Assert-SelfTestThrows {
+        Assert-PollSkipRoleReference `
+            $pollPolicy.name "skip_on" $pollComparison.warmups.skip_on[0] $timingDrift
+    } "raw_bus_clocks"
+    $noReduction = $pollComparison.skip_on[0] |
+        ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $noReduction.perf.instructions = $pollComparison.skip_off[0].perf.instructions
+    Assert-SelfTestThrows {
+        Assert-PollSkipPair $pollPolicy.name $noReduction $pollComparison.skip_off[0] "pair 1"
+    } "positive instruction reduction"
+
+    $Runs = 6
+    $policies = @($pollPolicy)
+    $pairRoles = @("skip_on", "skip_off")
+    $pollSkipExecutionPolicies = [ordered]@{
+        skip_off = $skipOffPolicy
+        skip_on = $skipOnPolicy
+    }
+    $diagnosticVariables = [string[]](Get-KnownDiagnosticVariables)
+    $verifiedChildAffinityMasks = [Collections.Generic.List[string]]::new()
+    foreach ($child in 1..(2 + 2 * $Runs)) {
+        $verifiedChildAffinityMasks.Add("0x0000000000000100")
+    }
+    $verifiedChildAffinityStable = $true
+    $fixtureManifestMatches = [ordered]@{
+        doom = [ordered]@{
+            preflight_required_inputs = $true
+            preflight_canonical_tree = $true
+            frozen_required_inputs = $true
+            frozen_canonical_tree = $true
+        }
+    }
+    $workloadInputHashes = [ordered]@{
+        doom_586 = [ordered]@{ "AUTOEXEC.BAT" = "a" * 64 }
+    }
+    $workloadTreeHashes = [ordered]@{ doom = "b" * 64 }
+    $workloadCanonicalTreeHashes = [ordered]@{ doom = "c" * 64 }
+    $pollSkipPowerSchemeEligible = $true
+    $pollSummary = New-PollSkipComparisonSummary @($pollWorkload)
+    if ($pollSummary.schema -cne "izarravm-poll-skip-comparison-v1" -or
+        $pollSummary.verdict -cne "improved" -or -not $pollSummary.valid_performance_result -or
+        -not $pollSummary.role_executables.same_executable -or
+        $pollSummary.role_executables.skip_on.path -cne $pollSummary.role_executables.skip_off.path -or
+        $pollSummary.role_executables.skip_on.sha256 -cne $pollSummary.role_executables.skip_off.sha256 -or
+        ($pollSummary.warmup_order -join ",") -cne "skip_off,skip_on" -or
+        $pollSummary.acceptance.ips_is_diagnostic_only -ne $true) {
+        throw "The POLL-SKIP top-level proof summary is incomplete."
+    }
+    $sixPairRouting = $pollWorkload | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $sixPairRouting.paired_metrics.real_time_factor.verdict = "positive_but_inconclusive"
+    $sixPairRouting.paired_metrics.real_time_factor.classification = "positive_but_inconclusive"
+    $sixPairRouting.paired_metrics.real_time_factor.twelve_pair_confirmation_required = $true
+    $sixPairRouting.verdicts.performance = "positive_but_inconclusive"
+    $sixPairRouting.checks.performance.verdict = "positive_but_inconclusive"
+    $sixPairSummary = New-PollSkipComparisonSummary @($sixPairRouting)
+    if ($sixPairSummary.verdict -cne "positive_but_inconclusive" -or
+        -not $sixPairSummary.twelve_pair_confirmation_required) {
+        throw "A positive six-pair POLL-SKIP result did not request confirmation."
+    }
+    $Runs = 12
+    $verifiedChildAffinityMasks = [Collections.Generic.List[string]]::new()
+    foreach ($child in 1..(2 + 2 * $Runs)) {
+        $verifiedChildAffinityMasks.Add("0x0000000000000100")
+    }
+    $twelvePairRouting = $pollWorkload | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+    $twelvePairRouting.paired_metrics.real_time_factor.verdict = "speedup_not_demonstrated"
+    $twelvePairRouting.paired_metrics.real_time_factor.classification = "neutral"
+    $twelvePairRouting.paired_metrics.real_time_factor.twelve_pair_confirmation_required = $false
+    $twelvePairRouting.verdicts.performance = "speedup_not_demonstrated"
+    $twelvePairRouting.checks.performance.verdict = "speedup_not_demonstrated"
+    $twelvePairSummary = New-PollSkipComparisonSummary @($twelvePairRouting)
+    if ($twelvePairSummary.verdict -cne "speedup_not_demonstrated" -or
+        $twelvePairSummary.twelve_pair_confirmation_required) {
+        throw "A non-improved twelve-pair result was not marked speedup_not_demonstrated."
+    }
+    $Runs = 6
+    $verifiedChildAffinityMasks = [Collections.Generic.List[string]]::new()
+    foreach ($child in 1..(2 + 2 * $Runs)) {
+        $verifiedChildAffinityMasks.Add("0x0000000000000100")
+    }
+    $pollGlobalProvenanceCases = [ordered]@{
+        executable = [pscustomobject]@{
+            mutate = { $candidateArtifact.verified = $false }
+            restore = { $candidateArtifact.verified = $true }
+        }
+        repository = [pscustomobject]@{
+            mutate = { $repositoryAtSelection.dirty = $true }
+            restore = { $repositoryAtSelection.dirty = $false }
+        }
+        fixture = [pscustomobject]@{
+            mutate = { $doomFrozenStable = $false }
+            restore = { $doomFrozenStable = $true }
+        }
+        affinity = [pscustomobject]@{
+            mutate = { $verifiedChildAffinityStable = $false }
+            restore = { $verifiedChildAffinityStable = $true }
+        }
+        power = [pscustomobject]@{
+            mutate = { $pollSkipPowerSchemeEligible = $false }
+            restore = { $pollSkipPowerSchemeEligible = $true }
+        }
+        lock = [pscustomobject]@{
+            mutate = { $measurementLockEvidence.path = "C:\wrong.lock" }
+            restore = { $measurementLockEvidence.path = $MeasurementLockPath }
+        }
+        source_closure = [pscustomobject]@{
+            mutate = { $gateSourceClosureStable = $false }
+            restore = { $gateSourceClosureStable = $true }
+        }
+        manifest = [pscustomobject]@{
+            mutate = { $fixtureManifestStable = $false }
+            restore = { $fixtureManifestStable = $true }
+        }
+        canonical_hash = [pscustomobject]@{
+            mutate = { $workloadCanonicalTreeHashes.doom = "wrong" }
+            restore = { $workloadCanonicalTreeHashes.doom = "c" * 64 }
+        }
+    }
+    foreach ($case in $pollGlobalProvenanceCases.GetEnumerator()) {
+        try {
+            . $case.Value.mutate
+            $invalidPollSummary = New-PollSkipComparisonSummary @($pollWorkload)
+            if ($invalidPollSummary.verdict -cne "invalid" -or
+                $invalidPollSummary.valid_performance_result) {
+                throw "POLL-SKIP global provenance mutation $($case.Key) was accepted."
+            }
+        } finally {
+            . $case.Value.restore
+        }
     }
 
     $movedSummaryProbe = Get-RoleSummary "self-test" "486" @(
