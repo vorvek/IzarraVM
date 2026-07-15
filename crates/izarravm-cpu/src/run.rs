@@ -826,6 +826,14 @@ impl CpuGsw {
         self.jit_regions.set_auto_admit(on && jit::host_supported());
     }
 
+    /// G1: shared demotion tail of both admission gates. Parks the key Dormant, stamps its entry
+    /// chunk for cool-down recovery, and counts the demotion.
+    #[cfg(feature = "jit")]
+    fn smc_heat_demote(&mut self, key: jit::direct::BlockKey, epoch: u32) {
+        self.jit_direct.demote_smc_hot(key, epoch);
+        self.perf.smc_heat_demotions += 1;
+    }
+
     #[cfg(feature = "jit")]
     fn try_direct_continuation<B: CpuBus>(
         &mut self,
@@ -853,6 +861,12 @@ impl CpuGsw {
         let block = match probe {
             jit::direct::BlockProbe::Interpret => return Ok(DirectContinuation::Interpret),
             jit::direct::BlockProbe::Rejected => {
+                // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out lifts
+                // back to Seen here, so the next encounter re-admits through the normal path.
+                // Dormants without a heat stamp (Retry, G4 cover failure) stay parked. On the cold
+                // Rejected path only, so Ready hits never pay the lookup.
+                let heat_epoch = self.smc_heat_epoch();
+                self.jit_direct.lift_cold_smc_dormant(key, heat_epoch);
                 return Ok(DirectContinuation::Interpret);
             }
             jit::direct::BlockProbe::Ready(id) => self
@@ -867,8 +881,7 @@ impl CpuGsw {
                 // form to installed blocks, so a demoted region starves naturally.
                 let heat_epoch = self.smc_heat_epoch();
                 if self.jit_direct.smc_heat_chunk_hot(key.physical, heat_epoch) {
-                    self.jit_direct.dormant(key);
-                    self.perf.smc_heat_demotions += 1;
+                    self.smc_heat_demote(key, heat_epoch);
                     return Ok(DirectContinuation::Interpret);
                 }
                 let compile_start = std::time::Instant::now();
@@ -914,8 +927,7 @@ impl CpuGsw {
                     u32::from(compilation.span.guest_len),
                     heat_epoch,
                 ) {
-                    self.jit_direct.dormant(key);
-                    self.perf.smc_heat_demotions += 1;
+                    self.smc_heat_demote(key, heat_epoch);
                     return Ok(DirectContinuation::Interpret);
                 }
                 let Some(id) = self.jit_direct.install(&compilation) else {

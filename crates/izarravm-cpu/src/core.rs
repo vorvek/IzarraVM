@@ -362,6 +362,9 @@ impl CpuGsw {
     /// G1 heat epoch: the retired-instruction megacount. Both the invalidation choke (which bumps
     /// heat) and the admission gate (which reads it) derive the epoch from this one clock, so a
     /// chunk's churn count is only live within the ~1M-instruction window it accrued in.
+    /// Corner: `reset_perf_counters` restarts the instruction count, so epoch numbers repeat and a
+    /// stale epoch-0 stamp can briefly read as current again (one epoch of over-conservative
+    /// demotion at worst; correctness is unaffected, demotion only routes to the interpreter).
     #[cfg(feature = "jit")]
     #[inline]
     pub(super) fn smc_heat_epoch(&self) -> u32 {

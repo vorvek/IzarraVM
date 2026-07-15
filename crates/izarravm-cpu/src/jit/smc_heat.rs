@@ -80,7 +80,51 @@ impl SmcHeatMap {
         (first..=last).any(|global_chunk| self.effective(global_chunk << 4, epoch) >= threshold)
     }
 
+    /// One-shot recovery probe: true when the chunk at `physical` carries a recorded stamp
+    /// (count > 0) from an OLDER epoch, meaning its heat has aged out. Consumes the stamp so a
+    /// later non-heat Dormant at the same chunk is never spuriously lifted by ancient history.
+    pub(crate) fn take_stale_stamp(&mut self, physical: u32, epoch: u32) -> bool {
+        let Some(chunks) = self.pages.get_mut(&(physical >> 12)) else {
+            return false;
+        };
+        let slot = &mut chunks[((physical & 0x0fff) >> 4) as usize];
+        if slot.1 > 0 && slot.0 != epoch {
+            *slot = (0, 0);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.pages.clear();
+    }
+}
+
+/// The heat accessors of the block cache live beside the map they wrap (the cache's `smc_heat`
+/// and `smc_heat_threshold` fields are `pub(super)` for exactly this split). The demotion and
+/// recovery methods that also need the cache's entry states stay in direct.rs.
+impl super::direct::BlockCache {
+    /// G1: record `width` bytes of code invalidation at `physical` for `epoch` (the choke calls
+    /// this ONLY on an actual kill). Returns chunks that newly crossed the demotion threshold.
+    pub(crate) fn smc_heat_bump(&mut self, physical: u32, width: u32, epoch: u32) -> u32 {
+        let threshold = self.smc_heat_threshold;
+        self.smc_heat.bump(physical, width, epoch, threshold)
+    }
+
+    /// G1 cheap pre-compile gate: is the entry chunk at `physical` hot this epoch?
+    pub(crate) fn smc_heat_chunk_hot(&self, physical: u32, epoch: u32) -> bool {
+        self.smc_heat.effective(physical, epoch) >= self.smc_heat_threshold
+    }
+
+    /// G1 full-span gate: does any chunk under `[physical, physical+len)` read hot this epoch?
+    pub(crate) fn smc_heat_span_hot(&self, physical: u32, len: u32, epoch: u32) -> bool {
+        self.smc_heat
+            .span_hot(physical, len, epoch, self.smc_heat_threshold)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_smc_heat_threshold(&mut self, threshold: u8) {
+        self.smc_heat_threshold = threshold;
     }
 }

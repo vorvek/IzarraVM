@@ -551,8 +551,9 @@ pub(crate) struct BlockCache {
     auto_admit: bool,
     admission_heat: u8,
     /// G1 SMC heat (super::smc_heat): kept out of the refcounted watch pages; cleared ONLY on reset.
-    smc_heat: SmcHeatMap,
-    smc_heat_threshold: u8,
+    /// `pub(super)` because the plain heat accessors live in smc_heat.rs beside the map.
+    pub(super) smc_heat: SmcHeatMap,
+    pub(super) smc_heat_threshold: u8,
     stats: BlockCacheStats,
     code_watch: Box<NativeCodeWatch>,
     #[cfg(test)]
@@ -851,27 +852,26 @@ impl BlockCache {
         }
     }
 
-    /// G1: record `width` bytes of code invalidation at `physical` for `epoch` (the choke calls
-    /// this ONLY on an actual kill). Returns chunks that newly crossed the demotion threshold.
-    pub(crate) fn smc_heat_bump(&mut self, physical: u32, width: u32, epoch: u32) -> u32 {
-        self.smc_heat
-            .bump(physical, width, epoch, self.smc_heat_threshold)
+    /// G1 demotion: park a heat-hot key Dormant AND stamp its entry chunk at the demote epoch.
+    /// The stamp is what makes the Dormant recognizably heat-scoped: once it goes stale (a later
+    /// epoch), `lift_cold_smc_dormant` re-admits the key. Dormants parked for other reasons
+    /// (compile Retry, G4 cover failure) carry no stamp and stay parked as before.
+    pub(crate) fn demote_smc_hot(&mut self, key: BlockKey, epoch: u32) {
+        self.dormant(key);
+        let threshold = self.smc_heat_threshold;
+        let _ = self.smc_heat.bump(key.physical, 1, epoch, threshold);
     }
 
-    /// G1 cheap pre-compile gate: is the entry chunk at `physical` hot this epoch?
-    pub(crate) fn smc_heat_chunk_hot(&self, physical: u32, epoch: u32) -> bool {
-        self.smc_heat.effective(physical, epoch) >= self.smc_heat_threshold
-    }
-
-    /// G1 full-span gate: does any chunk under `[physical, physical+len)` read hot this epoch?
-    pub(crate) fn smc_heat_span_hot(&self, physical: u32, len: u32, epoch: u32) -> bool {
-        self.smc_heat
-            .span_hot(physical, len, epoch, self.smc_heat_threshold)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_smc_heat_threshold(&mut self, threshold: u8) {
-        self.smc_heat_threshold = threshold;
+    /// G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out (older epoch)
+    /// returns to Seen, so the next probe walks the normal admission path (both heat gates
+    /// re-check). Seen rather than a remove keeps the key tracked exactly once in `physical_keys`
+    /// (the `retire_key_for_recompile` transition); the stamp is consumed, one recovery per demotion.
+    pub(crate) fn lift_cold_smc_dormant(&mut self, key: BlockKey, epoch: u32) {
+        if self.entries.get(&key) == Some(&BlockState::Dormant)
+            && self.smc_heat.take_stale_stamp(key.physical, epoch)
+        {
+            self.entries.insert(key, BlockState::Seen);
+        }
     }
 
     /// Retire one descriptor-specialized block while keeping its key in the observed state. The

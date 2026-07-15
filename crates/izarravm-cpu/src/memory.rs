@@ -821,7 +821,17 @@ impl CpuGsw {
         while completed < width {
             let at = linear.wrapping_add(completed);
             let fragment = Self::page_local_fragment_width(at, width - completed);
-            self.write_linear_fragment(bus, at, fragment, value >> (completed * 8), kind)?;
+            // G2: mask to the fragment width so the same-value compare in write_linear_fragment
+            // sees only the bytes this fragment stores. Unmasked high bits made every cross-page
+            // sub-dword fragment read as changed, defeating elision; the store itself writes only
+            // `fragment` bytes either way, so masking is behavior-neutral for the write.
+            let shifted = value >> (completed * 8);
+            let fragment_value = match fragment {
+                BusWidth::Byte => shifted & 0xff,
+                BusWidth::Word => shifted & 0xffff,
+                BusWidth::Dword => shifted,
+            };
+            self.write_linear_fragment(bus, at, fragment, fragment_value, kind)?;
             completed += fragment.bytes();
         }
         Ok(())

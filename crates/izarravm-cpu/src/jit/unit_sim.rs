@@ -371,7 +371,9 @@ impl UnitSim {
     /// byte's page too (a store touches at most two pages here), matching the caller's old two-call
     /// contract. The production feed lives inside `note_code_write_hit`, so the sim only sees stores
     /// that survived G2 same-value elision: it mirrors the post-elision production invalidation
-    /// choke, never the raw store stream.
+    /// choke, never the raw store stream. Sized stores are additionally watch-gated at the caller
+    /// (write_linear_fragment probes the code watch before calling the hit path), so the sim never
+    /// observes sized stores that miss all watched code.
     pub(crate) fn note_code_write(&mut self, physical: u32, width: u32) {
         let first_page = physical >> 12;
         let last = physical.wrapping_add(width.saturating_sub(1));
