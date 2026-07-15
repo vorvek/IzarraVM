@@ -365,8 +365,71 @@ fn attempt_poll_skip(machine: &mut Machine, batch_core: u32, cap: u64) -> Option
     with_cpu_and_bus(machine, |cpu, bus| {
         bus.prior_runs_core_clocks = u64::from(batch_core);
         bus.core_clocks_so_far = 0;
-        run::try_poll_skip(cpu, bus, &mut diagnostics, batch_core, cap)
+        let poll = run::classify_poll_skip_boundary(cpu, &mut diagnostics)?;
+        run::try_poll_skip(cpu, bus, &mut diagnostics, poll, batch_core, cap)
     })
+}
+
+#[cfg(feature = "jit")]
+fn assert_poll_skip_classifier_case(
+    machine: &mut Machine,
+    expected_buckets: [u64; 4],
+    expected_rejections: u64,
+    expected_structural_hits: u64,
+) {
+    machine.poll_skip_diagnostics.enable_for_test();
+    assert_eq!(
+        machine.run_cycles(1).expect("one bounded run boundary"),
+        StopReason::CycleLimit { requested: 1 }
+    );
+    let diagnostics = &machine.poll_skip_diagnostics;
+    let (calls, buckets) = diagnostics.classifier_accounting();
+    assert_eq!(calls, 1);
+    assert_eq!(buckets, expected_buckets);
+    assert_eq!(buckets.into_iter().sum::<u64>(), calls);
+    assert_eq!(
+        diagnostics.admission_accounting(),
+        (expected_rejections, expected_structural_hits)
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_run_source_has_one_classifier_call_site() {
+    let source = include_str!("run.rs");
+    assert_eq!(
+        source.matches(".poll_loop()").count(),
+        1,
+        "run.rs must classify only through classify_poll_skip_boundary"
+    );
+    assert!(source.contains("let poll = cpu.poll_loop();"));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_run_boundary_classifies_once_with_distinct_admission_semantics() {
+    let mut ineligible =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw386, 0x08, true);
+    assert_poll_skip_classifier_case(&mut ineligible, [1, 0, 0, 0], 1, 0);
+
+    let mut structural_miss =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw486, 0x08, true);
+    assert_poll_skip_classifier_case(&mut structural_miss, [0, 1, 0, 0], 0, 0);
+
+    let mut non_head =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw486, 0x08, true);
+    prepare_setup_poll_head(&mut non_head, false, false, 0x1234_03da, 0x08, true);
+    with_cpu_and_bus(&mut non_head, |cpu, _| {
+        cpu.registers.set_edx(0x03da);
+        cpu.registers.eip = 0x10f;
+        cpu.poll_skip_backedge_housekeeping();
+    });
+    assert_poll_skip_classifier_case(&mut non_head, [0, 0, 1, 0], 0, 0);
+
+    let mut head =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw486, 0x08, true);
+    prepare_setup_poll_head(&mut head, false, false, 0x1234_03da, 0x08, true);
+    assert_poll_skip_classifier_case(&mut head, [0, 0, 0, 1], 0, 1);
 }
 
 #[cfg(feature = "jit")]
@@ -517,11 +580,12 @@ fn poll_skip_edge_is_strict_and_the_reserved_final_iteration_runs_real() {
     let (charged, retired, final_eip) = with_cpu_and_bus(&mut after, |cpu, bus| {
         bus.prior_runs_core_clocks = 0;
         bus.core_clocks_so_far = 0;
-        let poll = cpu.poll_loop().expect("warm poll before bulk commit");
+        let poll = run::classify_poll_skip_boundary(cpu, &mut diagnostics)
+            .expect("warm poll before bulk commit");
         let certificate = bus
             .poll_bus_certificate(poll)
             .expect("RAM poll certificate before bulk commit");
-        let charged = run::try_poll_skip(cpu, bus, &mut diagnostics, 0, cap)
+        let charged = run::try_poll_skip(cpu, bus, &mut diagnostics, poll, 0, cap)
             .expect("edge one dot after the bulk boundary admits K");
         assert_eq!(cpu.perf_counters().poll_skip_iterations, K);
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::*;
+#[cfg(feature = "jit")]
+use izarravm_cpu::PollLoop;
 
 pub(super) fn jit_auto_admit_policy(
     value: Option<&str>,
@@ -50,6 +52,16 @@ pub(super) struct PollSkipDiagnostics {
     edge_cap_rejections: u64,
     committed_spans: u64,
     committed_iterations: u64,
+    #[cfg(test)]
+    classifier_calls: u64,
+    #[cfg(test)]
+    classifier_ineligible_none: u64,
+    #[cfg(test)]
+    classifier_eligible_none: u64,
+    #[cfg(test)]
+    classifier_non_head: u64,
+    #[cfg(test)]
+    classifier_head: u64,
 }
 
 #[cfg(feature = "jit")]
@@ -111,6 +123,46 @@ impl PollSkipDiagnostics {
             self.committed_iterations = self.committed_iterations.saturating_add(iterations);
         }
     }
+
+    #[cfg(test)]
+    fn classifier_observation(&mut self, poll: Option<PollLoop>, eligible: bool) {
+        self.classifier_calls = self.classifier_calls.saturating_add(1);
+        let counter = match poll {
+            None if eligible => &mut self.classifier_eligible_none,
+            None => &mut self.classifier_ineligible_none,
+            Some(poll) if poll.at_head() => &mut self.classifier_head,
+            Some(_) => &mut self.classifier_non_head,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    #[cfg(test)]
+    pub(super) fn enable_for_test(&mut self) {
+        self.enabled = true;
+    }
+
+    #[cfg(test)]
+    pub(super) fn classifier_accounting(&self) -> (u64, [u64; 4]) {
+        (
+            self.classifier_calls,
+            [
+                self.classifier_ineligible_none,
+                self.classifier_eligible_none,
+                self.classifier_non_head,
+                self.classifier_head,
+            ],
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn admission_accounting(&self) -> (u64, u64) {
+        (
+            self.cpu_eligibility_rejections,
+            self.structural_hits_direct3
+                .saturating_add(self.structural_hits_setup_direct)
+                .saturating_add(self.structural_hits_setup_paired),
+        )
+    }
 }
 
 #[cfg(feature = "jit")]
@@ -136,10 +188,26 @@ impl Drop for PollSkipDiagnostics {
 }
 
 #[cfg(feature = "jit")]
+pub(super) fn classify_poll_skip_boundary(
+    cpu: &CpuGsw,
+    diagnostics: &mut PollSkipDiagnostics,
+) -> Option<PollLoop> {
+    let poll = cpu.poll_loop();
+    let eligible = poll.is_some() || cpu.poll_skip_eligible();
+    #[cfg(test)]
+    diagnostics.classifier_observation(poll, eligible);
+    if poll.is_none() && !eligible {
+        diagnostics.cpu_eligibility_rejection();
+    }
+    poll
+}
+
+#[cfg(feature = "jit")]
 pub(super) fn try_poll_skip(
     cpu: &mut CpuGsw,
     bus: &mut MachineBus<'_>,
     diagnostics: &mut PollSkipDiagnostics,
+    poll: PollLoop,
     batch_core: u32,
     cap: u64,
 ) -> Option<u32> {
@@ -147,7 +215,6 @@ pub(super) fn try_poll_skip(
         diagnostics.cpu_eligibility_rejection();
         return None;
     }
-    let poll = cpu.poll_loop()?;
     diagnostics.structural_hit(poll.diagnostic_class());
     if !poll.at_head() {
         return None;
@@ -725,12 +792,15 @@ impl Machine {
                             // public call, so canonicalize the matching bus scratch
                             // only inside the opt-in path.
                             bus.core_clocks_so_far = 0;
-                            let align = cpu.poll_loop().is_some_and(|poll| !poll.at_head());
+                            let poll = classify_poll_skip_boundary(cpu, poll_skip_diagnostics);
+                            let align = poll.is_some_and(|poll| !poll.at_head());
                             if !align
+                                && let Some(poll) = poll
                                 && let Some(skipped_core) = try_poll_skip(
                                     cpu,
                                     &mut bus,
                                     poll_skip_diagnostics,
+                                    poll,
                                     batch_core,
                                     cap,
                                 )
