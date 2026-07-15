@@ -668,6 +668,16 @@ pub(crate) struct KateaTreeVolume {
     /// Files whose bytes `reconcile` has re-read from the disk. Counts the work the
     /// `last_gather` skip exists to avoid, so a test can prove the skip fires.
     gathers: u64,
+    /// Exact file states whose most recent gather or host write failed. An inline
+    /// reconcile retries only the same state; a later guest write makes it an
+    /// ordinary changing file again and defers it until the final reconcile.
+    retry_gathers: HashMap<(u32, [u8; 11]), FileState>,
+    #[cfg(test)]
+    gathered_bytes: u64,
+    #[cfg(test)]
+    atomic_writes: u64,
+    #[cfg(test)]
+    atomic_write_bytes: u64,
 }
 
 /// Katea's belief about one host-side entry (file or dir): where it lives, the
@@ -710,6 +720,26 @@ struct Gather {
     all_present: bool,
 }
 
+/// The guest-side identity and write watermark of a file decision. Unlike
+/// [`Gather::seq`], `chain_seq` is the current maximum over this file's chain,
+/// not the store's global sequence at the end of an earlier decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileState {
+    first_cluster: u32,
+    size: u32,
+    chain_id: u64,
+    chain_seq: u64,
+}
+
+/// Why reconcile is running. ATA command completion must not mistake an
+/// interleaved metadata write for a growing file becoming quiescent. Explicit
+/// flush and eject calls, on the other hand, must materialize everything now.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileMode {
+    AfterWrite,
+    Final,
+}
+
 /// Hash a cluster chain into a comparable id. Cheap and session-only, like
 /// `katea_write::fingerprint`: never persisted, only compared within one run.
 fn chain_id(chain: &[u32]) -> u64 {
@@ -737,6 +767,9 @@ struct PendingWrite {
     key: (u32, [u8; 11]),
     fingerprint: u64,
     first_cluster: u32,
+    /// The exact state whose host write is being attempted. Kept as a retry marker
+    /// when `atomic_write` fails.
+    state: FileState,
     /// What this gather saw, recorded on the mirror entry only if the write
     /// lands. A held or failed write leaves the entry's watermark alone, so the
     /// next pass gathers again.
@@ -888,6 +921,13 @@ impl KateaTreeVolume {
             mirrored,
             system_names,
             gathers: 0,
+            retry_gathers: HashMap::new(),
+            #[cfg(test)]
+            gathered_bytes: 0,
+            #[cfg(test)]
+            atomic_writes: 0,
+            #[cfg(test)]
+            atomic_write_bytes: 0,
         })
     }
 
@@ -896,6 +936,21 @@ impl KateaTreeVolume {
     #[allow(dead_code)]
     pub(crate) fn gathers(&self) -> u64 {
         self.gathers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gathered_bytes(&self) -> u64 {
+        self.gathered_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn atomic_writes(&self) -> u64 {
+        self.atomic_writes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn atomic_write_bytes(&self) -> u64 {
+        self.atomic_write_bytes
     }
 
     /// The whole-disk sector count, so the ATA layer can derive its geometry.
@@ -1017,8 +1072,20 @@ impl KateaTreeVolume {
     /// atomically materialize each *complete, touched, changed* 8.3 file, and
     /// create host subdirectories for MKDIR'd entries. Conservative — an
     /// incomplete or ambiguous entry is held in the overlay and retried next pass.
-    /// Called after each HostFolder ATA write command and at eject/flush.
+    /// This entry point is the forced final pass used by explicit flush/eject.
     pub(crate) fn reconcile(&mut self) {
+        self.reconcile_mode(ReconcileMode::Final);
+    }
+
+    /// Reconcile after a successful ATA write command. A file is materialized on
+    /// its first completed shape, then later changing shapes are left in the guest
+    /// write store until an explicit flush/eject. This keeps a growing file from
+    /// re-reading and re-writing its whole prefix after every command.
+    pub(crate) fn reconcile_after_write(&mut self) {
+        self.reconcile_mode(ReconcileMode::AfterWrite);
+    }
+
+    fn reconcile_mode(&mut self, mode: ReconcileMode) {
         // A guest-written sector that cannot be read back reads as zeros, and zeros
         // are not a safe input here: phase 2 reads a zeroed FAT entry as "chain
         // freed" and deletes the host file, `parse_dir` stops at the first zero
@@ -1040,6 +1107,10 @@ impl KateaTreeVolume {
         }
         let live_keys: HashSet<(u32, [u8; 11])> =
             live.iter().map(|l| (l.dir_cluster, l.name)).collect();
+        // The live scan is complete and trustworthy here. Drop retry markers for
+        // entries that disappeared; doing this before the read-error check above
+        // could let an incomplete scan discard the only immediate retry state.
+        self.retry_gathers.retain(|key, _| live_keys.contains(key));
         // first_cluster -> the live entries claiming it (for rename matching in phase 2).
         let mut live_by_cluster: HashMap<u32, Vec<(u32, [u8; 11], bool)>> = HashMap::new();
         for l in &live {
@@ -1223,6 +1294,8 @@ impl KateaTreeVolume {
             // Counted here and folded in below: the decision loop holds `self`
             // shared, so it cannot touch `self.gathers` directly.
             let mut gathers = 0u64;
+            #[cfg(test)]
+            let mut gathered_bytes = 0u64;
 
             for e in crate::katea_write::parse_dir(&dir_bytes) {
                 match crate::katea_write::classify(&e, &self.system_names) {
@@ -1293,16 +1366,38 @@ impl KateaTreeVolume {
                             .map(|c| self.store.max_seq_in(self.cluster_to_lba(*c), spc))
                             .max()
                             .unwrap_or(0);
-                        if let Some(g) = self
-                            .mirrored
-                            .get(&(dir_cluster, name))
-                            .and_then(|m| m.last_gather)
+                        let key = (dir_cluster, name);
+                        let last_gather = self.mirrored.get(&key).and_then(|m| m.last_gather);
+                        if let Some(g) = last_gather
                             && g.all_present
                             && g.size == size
                             && g.chain_id == chain_now
                             && chain_seq <= g.seq
                         {
+                            self.retry_gathers.remove(&key);
                             continue; // provably unchanged since the last decision
+                        }
+
+                        let state = FileState {
+                            first_cluster,
+                            size,
+                            chain_id: chain_now,
+                            chain_seq,
+                        };
+                        let changed_since_completed = last_gather.is_some_and(|g| {
+                            g.size != size || g.chain_id != chain_now || chain_seq > g.seq
+                        });
+                        let retry_exact = self.retry_gathers.get(&key) == Some(&state);
+                        if mode == ReconcileMode::AfterWrite
+                            && changed_since_completed
+                            && !retry_exact
+                        {
+                            // Every invocation of this mode follows some successful
+                            // guest write command. An unchanged per-file snapshot can
+                            // therefore be only an interleaved FAT, directory, FSInfo,
+                            // or unrelated write, not proof that this file is done.
+                            self.retry_gathers.remove(&key);
+                            continue;
                         }
 
                         // Gather the file bytes (store-then-base), truncate to size.
@@ -1312,6 +1407,10 @@ impl KateaTreeVolume {
                         // view reads), so the skip above must not fire next pass.
                         let decided_at = self.store.seq();
                         gathers += 1;
+                        #[cfg(test)]
+                        {
+                            gathered_bytes += u64::from(size);
+                        }
                         let mut all_present = true;
                         let mut data = Vec::with_capacity(size as usize);
                         'gather: for c in &fchain {
@@ -1334,6 +1433,7 @@ impl KateaTreeVolume {
                                 "katea: holding {} after a failed read of its own data",
                                 crate::katea_volume::decode_83(&name)
                             );
+                            self.retry_gathers.insert(key, state);
                             continue;
                         }
 
@@ -1352,7 +1452,7 @@ impl KateaTreeVolume {
                         {
                             // Unchanged since last pass. Date the entry so the skip
                             // above can spare the next pass this same re-read.
-                            watermarks.push(((dir_cluster, name), gather));
+                            watermarks.push((key, gather));
                             continue;
                         }
                         let host_path = self
@@ -1368,6 +1468,7 @@ impl KateaTreeVolume {
                             key: (dir_cluster, name),
                             fingerprint: fp,
                             first_cluster,
+                            state,
                             gather,
                         });
                     }
@@ -1376,10 +1477,15 @@ impl KateaTreeVolume {
 
             // Apply mutations + host I/O (no `self` borrow held across reads now).
             self.gathers += gathers;
+            #[cfg(test)]
+            {
+                self.gathered_bytes += gathered_bytes;
+            }
             for (key, gather) in watermarks {
                 if let Some(m) = self.mirrored.get_mut(&key) {
                     m.last_gather = Some(gather);
                 }
+                self.retry_gathers.remove(&key);
             }
             for (parent, name, first_cluster, path) in mkdirs {
                 if let Err(e) = std::fs::create_dir_all(&path) {
@@ -1399,6 +1505,11 @@ impl KateaTreeVolume {
                 }
             }
             for w in writes {
+                #[cfg(test)]
+                {
+                    self.atomic_writes += 1;
+                    self.atomic_write_bytes += w.data.len() as u64;
+                }
                 match crate::katea_write::atomic_write(&w.path, &w.data) {
                     Ok(()) => {
                         self.mirrored.insert(
@@ -1414,11 +1525,13 @@ impl KateaTreeVolume {
                                 last_gather: Some(w.gather),
                             },
                         );
+                        self.retry_gathers.remove(&w.key);
                     }
                     Err(e) => {
                         // Hold on failure: the real host file is untouched; retry
                         // next pass. atomic_write guarantees no torn file.
                         eprintln!("katea: materialize {} failed: {e}", w.path.display());
+                        self.retry_gathers.insert(w.key, w.state);
                     }
                 }
             }

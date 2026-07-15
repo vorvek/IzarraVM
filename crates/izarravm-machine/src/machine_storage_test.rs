@@ -300,6 +300,58 @@ fn flush_hdd_folder_runs_a_final_reconcile() {
 }
 
 #[test]
+fn flush_hdd_folder_forces_a_changed_direct_write_past_the_inline_debounce() {
+    let dir = std::env::temp_dir().join(format!("katea_flush_direct_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("A.TXT"), b"before!!").unwrap();
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Vega),
+        izarravm_firmware::izarra_bios(),
+    )
+    .unwrap();
+    machine.mount_hdd_folder(&dir).unwrap();
+
+    // Resolve A.TXT through the synthesized BPB and root directory, then write its
+    // data sector through AtaDisk::write_lba. The BIOS/INT 13 paths use this direct
+    // route and deliberately do not run the inline ATA-command reconcile.
+    let part_start = crate::katea_volume::PART_START;
+    let disk = machine.ata.as_ref().unwrap();
+    let vbr = disk.read_lba(part_start).unwrap();
+    let spc = u32::from(vbr[0x0D]);
+    let reserved = u32::from(u16::from_le_bytes([vbr[0x0E], vbr[0x0F]]));
+    let fats = u32::from(vbr[0x10]);
+    let fatsz = u32::from_le_bytes([vbr[0x24], vbr[0x25], vbr[0x26], vbr[0x27]]);
+    let root_cluster = u32::from_le_bytes([vbr[0x2C], vbr[0x2D], vbr[0x2E], vbr[0x2F]]);
+    let data_start = part_start + reserved + fats * fatsz;
+    let root_lba = data_start + (root_cluster - 2) * spc;
+    let root = disk.read_lba(root_lba).unwrap();
+    let slot = (0..16)
+        .map(|index| index * 32)
+        .find(|&offset| &root[offset..offset + 11] == b"A       TXT")
+        .expect("A.TXT in root directory");
+    let first_cluster = (u32::from(u16::from_le_bytes([root[slot + 20], root[slot + 21]])) << 16)
+        | u32::from(u16::from_le_bytes([root[slot + 26], root[slot + 27]]));
+    let file_lba = data_start + (first_cluster - 2) * spc;
+    let mut sector = disk.read_lba(file_lba).unwrap();
+    sector[..8].copy_from_slice(b"FIRST!!!");
+    assert!(machine.ata.as_mut().unwrap().write_lba(file_lba, &sector));
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"before!!");
+    machine.flush_hdd_folder();
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"FIRST!!!");
+
+    // With a completed gather now recorded, an inline reconcile would debounce
+    // this second direct change. One explicit flush must bypass that debounce.
+    sector[..8].copy_from_slice(b"AFTER!!!");
+    assert!(machine.ata.as_mut().unwrap().write_lba(file_lba, &sector));
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"FIRST!!!");
+    machine.flush_hdd_folder();
+    assert_eq!(std::fs::read(dir.join("A.TXT")).unwrap(), b"AFTER!!!");
+    drop(machine);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn mount_hdd_publishes_int41_fixed_disk_parameter_table() {
     let mut m = machine_with_hdd(4032); // 4 cylinders, 16 heads, 63 spt
     let off = read_u16(&mut m, 0x41 * 4);
