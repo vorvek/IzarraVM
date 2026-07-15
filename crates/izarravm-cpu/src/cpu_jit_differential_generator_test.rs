@@ -869,17 +869,13 @@ fn generated_watched_store_exits_for_same_and_changed_code() {
         ) > 0
     );
     assert_eq!(direct.perf_counters().jit_direct_exit_code_watch, exits + 1);
+    // G2: the same-value store side-exits the native block (the watch fires) but elides the
+    // invalidation, so the rejected span survives and admission does not churn. The probe stays
+    // Rejected with no re-reject needed; only a value-changing store re-opens the region.
     assert!(matches!(
         direct.jit_direct.probe(rejected),
-        jit::direct::BlockProbe::Interpret
+        jit::direct::BlockProbe::Rejected
     ));
-    assert!(matches!(
-        direct.jit_direct.probe(rejected),
-        jit::direct::BlockProbe::Compile
-    ));
-    direct
-        .jit_direct
-        .reject(jit::direct::RejectedSpan::new(rejected, 4).expect("page-local rejected fixture"));
 
     let native = assert_measured_pair(
         &mut interpreter,

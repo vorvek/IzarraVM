@@ -369,7 +369,9 @@ impl UnitSim {
     /// touched page is invalidated (v1), or, under L3, restamped when the store is confined to a
     /// member's tail. The store visits the first byte's page and, when it spans a boundary, the last
     /// byte's page too (a store touches at most two pages here), matching the caller's old two-call
-    /// contract.
+    /// contract. The production feed lives inside `note_code_write_hit`, so the sim only sees stores
+    /// that survived G2 same-value elision: it mirrors the post-elision production invalidation
+    /// choke, never the raw store stream.
     pub(crate) fn note_code_write(&mut self, physical: u32, width: u32) {
         let first_page = physical >> 12;
         let last = physical.wrapping_add(width.saturating_sub(1));

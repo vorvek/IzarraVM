@@ -236,6 +236,8 @@ impl CpuGsw {
         self.perf.device_write_ranges += 1;
         self.perf.device_write_bytes += u64::from(width);
         let prefetch_hit = self.prefetch.overlaps_physical_range(physical, width);
+        // G2 out of scope: a device/HLE write range invalidates unconditionally. The device wrote
+        // the bytes through its own path, so the CPU has no pre-write old-byte snapshot to compare.
         let code_hit = self.note_code_write(physical, width);
         if prefetch_hit {
             self.prefetch.invalidate();
@@ -250,8 +252,29 @@ impl CpuGsw {
     /// re-decode those lines. Byte-exact: a 16-bit stack push just below the code (the flat
     /// tiny-model layout the benchmarks use) writes only its own two bytes, so it never disturbs the
     /// adjacent code.
-    #[inline]
     pub(super) fn note_code_write(&mut self, physical: u32, width: u32) -> bool {
+        self.note_code_write_hit(physical, width)
+    }
+
+    /// Cheap, side-effect-free probe hoisted out of `note_code_write_hit`: does the store range
+    /// touch any watched code (a compiled block's physical span or a decoded instruction line)?
+    /// Value-aware callers (the sized-store path) gate the read-old-bytes comparison that drives
+    /// G2 same-value elision on this, paying nothing extra when the store misses all code.
+    #[inline]
+    pub(super) fn code_write_watched(&self, physical: u32, width: u32) -> bool {
+        #[cfg(feature = "jit")]
+        if self.jit_direct.range_hits_compiled_code(physical, width) {
+            return true;
+        }
+        self.decode_cache.range_hits_code(physical, width)
+    }
+
+    /// The invalidation body of a code write. Only reached once the store is known to have changed
+    /// a watched code byte (G2 elision skips it for same-value sized stores) or from a value-less
+    /// caller through `note_code_write`. The unit-sim feed lives here, behind the elision choke, so
+    /// the diagnostic mirrors the post-elision production invalidation path exactly.
+    #[inline]
+    pub(super) fn note_code_write_hit(&mut self, physical: u32, width: u32) -> bool {
         // Diagnostic: mirror the guest store into the unit simulator so a write into a simulated
         // unit's page invalidates it, exactly as an SMC store retires the real region. The sim's
         // own map ignores pages it does not own, so this is a cheap no-op off the measured path.
