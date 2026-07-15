@@ -6,7 +6,8 @@ function Get-KnownDiagnosticVariables {
         "IZARRAVM_AUDIO_DEBUG", "IZARRAVM_CPU_PROFILE", "IZARRAVM_DECODE_CACHE_LINES",
         "IZARRAVM_DIFF_TRACE", "IZARRAVM_DUMP_LINEAR", "IZARRAVM_FAULT_TRACE",
         "IZARRAVM_IO_HIST", "IZARRAVM_JIT_FOLD", "IZARRAVM_JIT_REGION",
-        "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_POLL_SKIP_DIAG", "IZARRAVM_PROFILE_ITERS",
+        "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_POLL_SKIP", "IZARRAVM_POLL_SKIP_DIAG",
+        "IZARRAVM_PROFILE_ITERS",
         "IZARRAVM_RUNTIME_PROFILE", "IZARRAVM_UNIT_SIM", "RUST_LOG"
     )
 }
@@ -398,14 +399,26 @@ function Get-TrackMExecutionPolicy([string]$RequestedExecutionRole) {
             return [pscustomobject][ordered]@{
                 name = "automatic"
                 cli = "default automatic backend"
-                jit = "1"
+                environment = [ordered]@{
+                    IZARRAVM_JIT = "1"
+                    IZARRAVM_POLL_SKIP = "0"
+                }
+                required_zero_counters = [object[]]@(
+                    "poll_skip_spans", "poll_skip_iterations"
+                )
             }
         }
         "interpreter" {
             return [pscustomobject][ordered]@{
                 name = "interpreter"
                 cli = "--interpreter"
-                jit = "0"
+                environment = [ordered]@{
+                    IZARRAVM_JIT = "0"
+                    IZARRAVM_POLL_SKIP = "0"
+                }
+                required_zero_counters = [object[]]@(
+                    "poll_skip_spans", "poll_skip_iterations"
+                )
             }
         }
         default { throw "Unknown Track M execution role '$RequestedExecutionRole'." }
@@ -853,7 +866,8 @@ function Get-TrackMSampleProvenanceReasons(
         "gate_role", "gate_observation", "gate_processor_index",
         "gate_processor_affinity_mask", "gate_processor_affinity_verified",
         "gate_execution_role", "gate_execution_cli", "gate_execution_jit",
-        "gate_measurement_fixture_sha256", "gate_termination_policy", "gate_artifacts"
+        "gate_poll_skip", "gate_measurement_fixture_sha256", "gate_termination_policy",
+        "gate_artifacts"
     )) {
         if ($null -eq $Sample.PSObject.Properties[$property]) {
             $reasons += "$label is missing $property"
@@ -874,7 +888,8 @@ function Get-TrackMSampleProvenanceReasons(
     }
     if ($Sample.gate_execution_role -cne $ExecutionPolicy.name -or
         $Sample.gate_execution_cli -cne $ExecutionPolicy.cli -or
-        [string]$Sample.gate_execution_jit -cne $ExecutionPolicy.jit) {
+        [string]$Sample.gate_execution_jit -cne $ExecutionPolicy.environment.IZARRAVM_JIT -or
+        [string]$Sample.gate_poll_skip -cne $ExecutionPolicy.environment.IZARRAVM_POLL_SKIP) {
         $reasons += "$label did not use the forced $($ExecutionPolicy.name) execution policy"
     }
     if ([string]$Sample.gate_measurement_fixture_sha256 -notmatch '^[0-9a-f]{64}$') {
@@ -940,8 +955,18 @@ function Get-TrackMSampleProvenanceReasons(
             $reasons += "$label performance counters are missing $field"
         }
     }
+    foreach ($field in @($ExecutionPolicy.required_zero_counters)) {
+        if ($null -eq $Sample.perf.PSObject.Properties[$field]) {
+            $reasons += "$label performance counters are missing required zero counter $field"
+        }
+    }
     if ($reasons.Count -ne 0) {
         return @($reasons)
+    }
+    foreach ($field in @($ExecutionPolicy.required_zero_counters)) {
+        if ($Sample.perf.$field -ne 0) {
+            $reasons += "$label required zero counter $field was nonzero"
+        }
     }
     if ($ExecutionPolicy.name -ceq "automatic") {
         if ($Sample.perf.jit_direct_entries -le 0 -or $Sample.perf.jit_direct_insns -le 0) {
@@ -1405,6 +1430,17 @@ function New-PollSkipComparisonSummary([object[]]$Workloads) {
         $failureReasons += @($workload.failure_reasons)
     }
     $failureReasons += $globalProvenanceReasons
+    $roleEnvironmentNames = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    foreach ($role in @("skip_off", "skip_on")) {
+        foreach ($name in $pollSkipExecutionPolicies[$role].environment.Keys) {
+            $null = $roleEnvironmentNames.Add([string]$name)
+        }
+    }
+    $unsetDiagnosticVariables = [string[]]@(
+        $diagnosticVariables | Where-Object { -not $roleEnvironmentNames.Contains($_) }
+    )
 
     return [ordered]@{
         schema = "izarravm-poll-skip-comparison-v1"
@@ -1434,7 +1470,7 @@ function New-PollSkipComparisonSummary([object[]]$Workloads) {
         execution = [ordered]@{
             skip_off = $pollSkipExecutionPolicies.skip_off
             skip_on = $pollSkipExecutionPolicies.skip_on
-            diagnostics_unset = [string[]]$diagnosticVariables
+            diagnostics_unset = $unsetDiagnosticVariables
         }
         repository_at_selection = $repositoryAtSelection
         repository_at_completion = $repositoryAtCompletion
@@ -1623,13 +1659,16 @@ function New-TrackMComparisonSummary([object[]]$Workloads) {
         }
         execution = [ordered]@{
             role = $trackMExecutionPolicy.name
+            required_zero_counters = [object[]]@(
+                $trackMExecutionPolicy.required_zero_counters
+            )
             candidate = [ordered]@{
                 cli = $trackMExecutionPolicy.cli
-                environment = [ordered]@{ IZARRAVM_JIT = $trackMExecutionPolicy.jit }
+                environment = $trackMExecutionPolicy.environment
             }
             parent = [ordered]@{
                 cli = $trackMExecutionPolicy.cli
-                environment = [ordered]@{ IZARRAVM_JIT = $trackMExecutionPolicy.jit }
+                environment = $trackMExecutionPolicy.environment
             }
         }
         repository_at_selection = $repositoryAtSelection

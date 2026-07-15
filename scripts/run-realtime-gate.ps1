@@ -1866,7 +1866,7 @@ function Invoke-IzarraProcess(
             IZARRAVM_JIT = if ($BackendRole -eq "automatic") { "1" } else { "0" }
         }
     } elseif ($TrackMComparison) {
-        [ordered]@{ IZARRAVM_JIT = $trackMExecutionPolicy.jit }
+        $trackMExecutionPolicy.environment
     } else {
         [ordered]@{ IZARRAVM_JIT = $Jit }
     }
@@ -2250,7 +2250,9 @@ function Invoke-Observation(
             $sample | Add-Member -NotePropertyName gate_execution_cli `
                 -NotePropertyValue $trackMExecutionPolicy.cli
             $sample | Add-Member -NotePropertyName gate_execution_jit `
-                -NotePropertyValue $trackMExecutionPolicy.jit
+                -NotePropertyValue $trackMExecutionPolicy.environment.IZARRAVM_JIT
+            $sample | Add-Member -NotePropertyName gate_poll_skip `
+                -NotePropertyValue $trackMExecutionPolicy.environment.IZARRAVM_POLL_SKIP
             $sample | Add-Member -NotePropertyName gate_measurement_fixture_sha256 `
                 -NotePropertyValue $measurementFixtureHash
         }
