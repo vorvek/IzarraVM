@@ -1,7 +1,9 @@
 // This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
 // SPDX-License-Identifier: GPL-3.0-only
 
-#![recursion_limit = "256"]
+// The hand-built perf_counters_json object expands one json! recursion level
+// per key; the counter set is large enough to need headroom above the default.
+#![recursion_limit = "512"]
 
 mod bench;
 mod bench_reference;

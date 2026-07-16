@@ -82,7 +82,7 @@ fn poll_loop_classifier_accepts_only_the_v1_shapes_and_restamps_smc() {
     let bit1 = cpu.poll_loop().expect("restamped bit-1 poll");
     assert_eq!(bit1.status_mask(), 0x01);
 
-    let (cpu, _) = warm_poll_shape(&[0xec, 0xa8, 0x01, 0x75, 0xfb], 0x03da);
+    let (mut cpu, _) = warm_poll_shape(&[0xec, 0xa8, 0x01, 0x75, 0xfb], 0x03da);
     assert!(cpu.poll_loop().is_some(), "JNZ bit-1 poll");
     for (code, dx) in [
         (&[0xec, 0xa8, 0x02, 0x74, 0xfb][..], 0x03da),
@@ -90,7 +90,7 @@ fn poll_loop_classifier_accepts_only_the_v1_shapes_and_restamps_smc() {
         (&[0x66, 0xec, 0xa8, 0x08, 0x74, 0xfa][..], 0x03da),
         (&[0xec, 0xa8, 0x08, 0x74, 0xfb][..], 0x03ba),
     ] {
-        let (cpu, _) = warm_poll_shape(code, dx);
+        let (mut cpu, _) = warm_poll_shape(code, dx);
         assert!(cpu.poll_loop().is_none(), "rejected shape {code:02x?}");
     }
 

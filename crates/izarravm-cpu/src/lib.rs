@@ -612,6 +612,13 @@ pub struct PerfCounters {
     /// `IZARRAVM_POLL_SKIP` is enabled. They are diagnostics, not retired instructions.
     pub poll_skip_spans: u64,
     pub poll_skip_iterations: u64,
+    /// Poll negative cache: classify boundaries answered without a scan.
+    pub poll_neg_cache_hits: u64,
+    /// Structural negatives recorded into the cache (each was a full scan
+    /// with the cache enabled).
+    pub poll_neg_cache_stores: u64,
+    /// Volatile negatives (scanned, uncacheable: register/segment reasons).
+    pub poll_neg_cache_volatile: u64,
     pub jit_direct_reject_mode_key: u64,
     pub jit_direct_reject_x87_top: u64,
     pub jit_direct_reject_cs_layout: u64,
@@ -1011,6 +1018,11 @@ pub struct CpuGsw {
     jit_direct: Box<jit::direct::BlockCache>,
     #[cfg(feature = "jit")]
     direct_runtime: DirectRuntimeState,
+    /// IZARRAVM_POLL_SKIP_NEG_CACHE (default on, "0"/"" disables): consult
+    /// and populate the poll negative cache. Kill switch for A/B proofs;
+    /// the scan itself is always correct without it.
+    #[cfg(feature = "jit")]
+    poll_neg_cache_enabled: bool,
     /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
     /// clones start empty like the other host-only accelerator caches.
     #[cfg(all(
@@ -1099,6 +1111,8 @@ impl Default for CpuGsw {
             jit_direct,
             #[cfg(feature = "jit")]
             direct_runtime: DirectRuntimeState::default(),
+            #[cfg(feature = "jit")]
+            poll_neg_cache_enabled: poll_neg_cache_default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
@@ -1113,6 +1127,15 @@ impl Default for CpuGsw {
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
         }
+    }
+}
+
+#[cfg(all(test, feature = "jit"))]
+impl CpuGsw {
+    /// Force the poll negative cache on or off, independent of the ambient
+    /// IZARRAVM_POLL_SKIP_NEG_CACHE value. A/B behavioral tests only.
+    pub fn set_poll_neg_cache_enabled_for_test(&mut self, enabled: bool) {
+        self.poll_neg_cache_enabled = enabled;
     }
 }
 
@@ -1848,9 +1871,27 @@ const POLL_NEG_GEN_SLOTS: usize = 1024;
 /// Slot count for the poll negative cache itself. Power of two.
 #[cfg(feature = "jit")]
 const POLL_NEG_SLOTS: usize = 8192;
-/// Generation payload width inside a packed negative entry.
+/// Generation payload width inside a packed negative entry. The 30-bit window
+/// can wrap after 2^30 inserts on one page; a bucket aliasing back to an old
+/// value only makes a stale negative look live, which suppresses a skip and
+/// never corrupts guest state.
 #[cfg(feature = "jit")]
 const POLL_NEG_GEN_MASK: u32 = 0x3FFF_FFFF;
+
+/// IZARRAVM_POLL_SKIP_NEG_CACHE policy: enabled unless explicitly "0" or "".
+/// Lives here with the flag it feeds (`CpuGsw::poll_neg_cache_enabled`) rather
+/// than in run.rs, which is at its line-policy ceiling.
+#[cfg(feature = "jit")]
+pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
+    !matches!(value, Some("" | "0"))
+}
+
+/// Ambient default for the poll negative cache, read fresh at CPU construction.
+#[cfg(feature = "jit")]
+pub(crate) fn poll_neg_cache_default() -> bool {
+    let value = std::env::var("IZARRAVM_POLL_SKIP_NEG_CACHE").ok();
+    poll_neg_cache_policy(value.as_deref())
+}
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
 /// (`cs.base + eip`). It lets a hot loop skip re-decoding the same bytes every iteration. The `gen`
@@ -2249,8 +2290,11 @@ impl DecodeCache {
     #[cfg(feature = "jit")]
     #[inline]
     fn poll_neg_slot(lin: u32, d: bool) -> usize {
+        // Fold the top log2(POLL_NEG_SLOTS) bits of the 32-bit mix. Deriving the
+        // shift from the slot count keeps the two in lockstep (8192 slots => 19).
+        const SHIFT: u32 = 32 - POLL_NEG_SLOTS.trailing_zeros();
         let mixed = (lin ^ (lin >> 13) ^ (u32::from(d) << 5)).wrapping_mul(0x9E37_79B9);
-        (mixed >> 19) as usize & (POLL_NEG_SLOTS - 1)
+        (mixed >> SHIFT) as usize & (POLL_NEG_SLOTS - 1)
     }
 
     /// Whether a live negative covers (lin, d): same key, same page insert

@@ -435,27 +435,51 @@ fn exact_poll_test_branch(test: &Slot, branch: &Slot) -> Option<(u8, bool)> {
     Some((mask, branch.insn.opcode == 0x74))
 }
 
+/// One backward-scan probe's outcome, split so the negative cache only ever
+/// stores results that are pure functions of the page's warm decode lines
+/// and the code-segment d bit.
+pub(crate) enum PollScanOutcome {
+    Found(PollLoop),
+    /// No shape matched, for code-byte-only reasons: cacheable until the
+    /// next warm-line insert on the page.
+    NegativeCacheable,
+    /// A structural shape matched but a register or segment check failed
+    /// (3-slot EDX port source, within-live-CS limits). The same bytes can
+    /// classify differently under other register/segment state: never cache.
+    NegativeVolatile,
+}
+
 /// Recognize only the reviewed 3DA poll-loop shapes from the same warm decode-cache
 /// view used by compiled blocks. Re-running this before every span makes an SMC
 /// restamp replace the descriptor rather than reusing stale bytes or addresses.
-fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
+fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
     let d = cpu.registers.cs().default_size_32;
-    let (slots, is_loop) = build_block(cpu, entry, d)?;
+    let Some((slots, is_loop)) = build_block(cpu, entry, d) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
 
+    // 3-slot direct shape. Structure first, register check second, so a
+    // register failure is reported volatile instead of cached.
     if let [input, test, branch] = slots.as_slice()
         && d
         && is_loop
         && input.insn.opcode == 0xec
         && input.insn.len == 1
-        && cpu.registers.edx() as u16 == 0x03da
         && loop_back_edge_target(&branch.insn, branch.lin) == Some(entry)
     {
-        let (mask, branch_when_zero) = exact_poll_test_branch(test, branch)?;
-        if !poll_slots_within_live_cs(cpu, &slots) {
-            return None;
+        let Some((mask, branch_when_zero)) = exact_poll_test_branch(test, branch) else {
+            return PollScanOutcome::NegativeCacheable;
+        };
+        if cpu.registers.edx() as u16 != 0x03da {
+            return PollScanOutcome::NegativeVolatile;
         }
-        let (fetches, fetch_count) = poll_fetches(&slots)?;
-        return Some(PollLoop {
+        if !poll_slots_within_live_cs(cpu, &slots) {
+            return PollScanOutcome::NegativeVolatile;
+        }
+        let Some((fetches, fetch_count)) = poll_fetches(&slots) else {
+            return PollScanOutcome::NegativeCacheable;
+        };
+        return PollScanOutcome::Found(PollLoop {
             fetches,
             fetch_count,
             port_source: PollPortSource::CurrentDx,
@@ -467,8 +491,11 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
         });
     }
 
+    // 5/6-slot shapes: the structural predicate chain is unchanged; each
+    // structural mismatch becomes NegativeCacheable and each
+    // poll_slots_within_live_cs failure becomes NegativeVolatile.
     let [setup, clear, input, test, branch] = slots.as_slice() else {
-        return None;
+        return PollScanOutcome::NegativeCacheable;
     };
     if !d
         || setup.insn.opcode != 0x89
@@ -484,7 +511,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
         || input.insn.opcode != 0xec
         || input.insn.len != 1
     {
-        return None;
+        return PollScanOutcome::NegativeCacheable;
     }
     let port_source = match setup
         .insn
@@ -493,16 +520,22 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
     {
         Some((3, 3, 2)) => PollPortSource::Ebx,
         Some((3, 1, 2)) => PollPortSource::Ecx,
-        _ => return None,
+        _ => return PollScanOutcome::NegativeCacheable,
     };
-    let (mask, branch_when_zero) = exact_poll_test_branch(test, branch)?;
-    let branch_target = loop_back_edge_target(&branch.insn, branch.lin)?;
+    let Some((mask, branch_when_zero)) = exact_poll_test_branch(test, branch) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
+    let Some(branch_target) = loop_back_edge_target(&branch.insn, branch.lin) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
     if is_loop && branch_target == entry {
         if !poll_slots_within_live_cs(cpu, &slots) {
-            return None;
+            return PollScanOutcome::NegativeVolatile;
         }
-        let (fetches, fetch_count) = poll_fetches(&slots)?;
-        return Some(PollLoop {
+        let Some((fetches, fetch_count)) = poll_fetches(&slots) else {
+            return PollScanOutcome::NegativeCacheable;
+        };
+        return PollScanOutcome::Found(PollLoop {
             fetches,
             fetch_count,
             port_source,
@@ -514,34 +547,42 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
         });
     }
 
-    let jmp_entry = entry.checked_add(9)?;
-    let exit = entry.checked_add(11)?;
+    let Some(jmp_entry) = entry.checked_add(9) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
+    let Some(exit) = entry.checked_add(11) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
     if is_loop
         || branch_target != exit
         || jmp_entry & !0x0fff != entry & !0x0fff
         || exit.wrapping_sub(1) & !0x0fff != entry & !0x0fff
     {
-        return None;
+        return PollScanOutcome::NegativeCacheable;
     }
-    let (jmp_slots, jmp_is_loop) = build_block(cpu, jmp_entry, true)?;
+    let Some((jmp_slots, jmp_is_loop)) = build_block(cpu, jmp_entry, true) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
     let [jmp] = jmp_slots.as_slice() else {
-        return None;
+        return PollScanOutcome::NegativeCacheable;
     };
     if jmp_is_loop
         || jmp.insn.opcode != 0xeb
         || jmp.insn.len != 2
         || loop_back_edge_target(&jmp.insn, jmp.lin) != Some(entry)
     {
-        return None;
+        return PollScanOutcome::NegativeCacheable;
     }
     if !poll_slots_within_live_cs(cpu, &slots)
         || !poll_slots_within_live_cs(cpu, std::slice::from_ref(jmp))
     {
-        return None;
+        return PollScanOutcome::NegativeVolatile;
     }
-    let (mut fetches, _) = poll_fetches(&slots)?;
+    let Some((mut fetches, _)) = poll_fetches(&slots) else {
+        return PollScanOutcome::NegativeCacheable;
+    };
     fetches[5] = (jmp.lin, jmp.physical, jmp.insn.len);
-    Some(PollLoop {
+    PollScanOutcome::Found(PollLoop {
         fetches,
         fetch_count: 6,
         port_source,
@@ -555,25 +596,41 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> Option<PollLoop> {
 
 /// Find an exact poll shape containing the current instruction start. The bounded
 /// backward scan stays in the current code page and accepts only captured slot starts.
-pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> Option<PollLoop> {
+/// A negative aggregates the per-entry outcomes: cacheable only when every probe
+/// on the page rejected for code-byte reasons, volatile if any probe hit a
+/// register or segment gate.
+pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
     let current = cpu.linear_eip();
     let page = current & !0x0fff;
+    let mut volatile_seen = false;
     for back in 0..=9u32 {
-        let entry = current.checked_sub(back)?;
+        let Some(entry) = current.checked_sub(back) else {
+            break;
+        };
         if entry & !0x0fff != page {
             break;
         }
-        let Some(poll) = build_poll_loop_at(cpu, entry) else {
-            continue;
-        };
-        if (0..poll.fetch_count()).any(|index| {
-            poll.fetch(index)
-                .is_some_and(|(linear, _, _)| linear == current)
-        }) {
-            return Some(poll);
+        match build_poll_loop_at(cpu, entry) {
+            PollScanOutcome::Found(poll) => {
+                if (0..poll.fetch_count()).any(|index| {
+                    poll.fetch(index)
+                        .is_some_and(|(linear, _, _)| linear == current)
+                }) {
+                    return PollScanOutcome::Found(poll);
+                }
+                // A shape exists here but does not contain the current EIP:
+                // that fact is a pure function of the code bytes, so the
+                // aggregate negative stays cacheable.
+            }
+            PollScanOutcome::NegativeCacheable => {}
+            PollScanOutcome::NegativeVolatile => volatile_seen = true,
         }
     }
-    None
+    if volatile_seen {
+        PollScanOutcome::NegativeVolatile
+    } else {
+        PollScanOutcome::NegativeCacheable
+    }
 }
 
 impl CpuGsw {
@@ -590,12 +647,36 @@ impl CpuGsw {
                 || (!self.is_v86_mode() && self.current_privilege_level() <= self.iopl()))
     }
 
-    /// Classify the current warm loop head. The result is rebuilt on every call.
-    pub fn poll_loop(&self) -> Option<PollLoop> {
+    /// Classify the current warm loop head. Positives are rebuilt on every
+    /// call (SMC restamps must replace descriptors). Structural negatives
+    /// are answered from the negative cache when the page's insert
+    /// generation is unchanged; register-dependent negatives are never
+    /// cached. `&mut self` mutates host bookkeeping only (cache slots and
+    /// perf counters), never guest state.
+    pub fn poll_loop(&mut self) -> Option<PollLoop> {
         if !self.poll_skip_eligible() {
             return None;
         }
-        build_poll_loop(self)
+        let lin = self.linear_eip();
+        let d = self.registers.cs().default_size_32;
+        if self.poll_neg_cache_enabled && self.decode_cache.poll_negative_live(lin, d) {
+            self.perf.poll_neg_cache_hits += 1;
+            return None;
+        }
+        match build_poll_loop(self) {
+            PollScanOutcome::Found(poll) => Some(poll),
+            PollScanOutcome::NegativeCacheable => {
+                if self.poll_neg_cache_enabled {
+                    self.perf.poll_neg_cache_stores += 1;
+                    self.decode_cache.record_poll_negative(lin, d);
+                }
+                None
+            }
+            PollScanOutcome::NegativeVolatile => {
+                self.perf.poll_neg_cache_volatile += 1;
+                None
+            }
+        }
     }
 }
 

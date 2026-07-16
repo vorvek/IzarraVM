@@ -55,7 +55,7 @@ fn cpu_registers_field_offset_is_stable() {
     // (456 -> 464 when Round 1 added the `jit_table_clears` u64 to PerfCounters, which precedes
     // `registers`; the emitter re-reads the offset, so this is a documentation update).
     assert_eq!(
-        off, 472,
+        off, 504,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -795,8 +795,8 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
-    // Pending flags offset for direct native writes. Poll-skip adds two diagnostic u64 counters.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4376);
+    // Pending flags offset for direct native writes; shifts whenever PerfCounters grows.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4432);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the
@@ -2482,42 +2482,6 @@ fn enter_v86_direct(cpu: &mut CpuGsw, ip: u32, sp: u32) {
     // the cached `cpl` must be seeded to the fixed V86 level by hand, same as a real
     // transition would leave it.
     cpu.cpl = 3;
-}
-
-/// Storage-layer semantics for the poll-classification negative cache: a live negative is keyed
-/// on (lin, d) AND the page's insert generation, so `put` (a warm-line install, the one mutation
-/// that can turn a structural negative into a match) retires every negative on its page, while
-/// removals (narrow kills, whole-cache generation flushes) leave negatives live since they can
-/// only shrink what would match, never grow it.
-#[cfg(feature = "jit")]
-#[test]
-fn poll_negative_cache_page_generation_semantics() {
-    let (mut nop_cpu, nop_mem) = real_mode_cpu(&[0x90], 0x10);
-    let mut nop_bus = TestBus::with_memory(nop_mem);
-    nop_cpu.begin_instruction();
-    let insn = nop_cpu.decode(&mut nop_bus).expect("0x90 NOP decodes");
-
-    let mut cache = DecodeCache::new(1024);
-    let lin = 0x0010_2340u32;
-    assert!(!cache.poll_negative_live(lin, true));
-    cache.record_poll_negative(lin, true);
-    assert!(cache.poll_negative_live(lin, true));
-    // d is part of the key.
-    assert!(!cache.poll_negative_live(lin, false));
-    // A put on the SAME page retires the negative.
-    let _ = cache.put(lin + 8, insn, true, lin + 8);
-    assert!(!cache.poll_negative_live(lin, true));
-    // Re-record, then a put on a DIFFERENT page whose generation slot does not alias lin's
-    // (POLL_NEG_GEN_SLOTS is 1024 = 2^10, so an offset that is itself a multiple of 2^22 bytes
-    // wraps the slot back to the same index; 0x10_0000 (256 pages) does not) leaves it live.
-    cache.record_poll_negative(lin, true);
-    let far = lin + 0x10_0000;
-    let _ = cache.put(far, insn, true, far);
-    assert!(cache.poll_negative_live(lin, true));
-    // A whole-cache generation flush does NOT retire negatives (removals
-    // are benign); only inserts do.
-    cache.generation = cache.generation.wrapping_add(1);
-    assert!(cache.poll_negative_live(lin, true));
 }
 
 #[path = "cpu_alu_data_test.rs"]

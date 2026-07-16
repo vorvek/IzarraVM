@@ -111,14 +111,18 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
                 skipped_stop, baseline_stop,
                 "mode={mode:?} mask={mask:#04x}"
             );
+            // poll_loop now borrows &mut, so materialize the diagnostic before the
+            // assert rather than inside its format args (which hold the other &self
+            // borrows). Its only effect is host bookkeeping, invisible to every
+            // field assert_poll_machine_boundary_eq compares.
+            let loop_diag = skipped.cpu.poll_loop();
             assert!(
                 skipped.cpu.perf_counters().poll_skip_spans > 0,
-                "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={:?}",
+                "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={loop_diag:?}",
                 skipped.cpu.registers.eip,
                 skipped.cpu.linear_eip(),
                 skipped.cpu.registers.edx() as u16,
                 skipped.cpu.poll_skip_eligible(),
-                skipped.cpu.poll_loop()
             );
             assert!(skipped.cpu.perf_counters().poll_skip_iterations > 1);
             assert!(

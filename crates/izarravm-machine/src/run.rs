@@ -189,7 +189,7 @@ impl Drop for PollSkipDiagnostics {
 
 #[cfg(feature = "jit")]
 pub(super) fn classify_poll_skip_boundary(
-    cpu: &CpuGsw,
+    cpu: &mut CpuGsw,
     diagnostics: &mut PollSkipDiagnostics,
 ) -> Option<PollLoop> {
     let poll = cpu.poll_loop();
