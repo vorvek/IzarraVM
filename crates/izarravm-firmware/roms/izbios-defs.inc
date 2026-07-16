@@ -77,6 +77,10 @@
 ; to the live Lotura register at POST bring-up so the choice survives reboot.
 %define SU_NVRAM_GSW 0x12
 
+; CMOS NVRAM byte 0x14 controls the BIOS POST mirror on COM1. Only 1 enables
+; output; zero and unknown values leave BIOS output off.
+%define DEBUG_CMOS_COM1 0x14
+
 ; Boot-device choice (segment 0 byte), written by the boot menu and read by
 ; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives after
 ; the BOX_* fields in the free tail of BIOS_SCRATCH. Defaults to floppy.
@@ -86,6 +90,9 @@
 %define POST_HOTKEY    (BIOS_SCRATCH + 0x18)   ; 0x0538
 %define POST_HOTKEY_SETUP 1
 %define POST_HOTKEY_BOOT  2
+; Cached COM1 debug setting for the current POST. com1_init writes it from
+; CMOS before the step sequencer starts using it.
+%define DEBUG_COM1_ACTIVE (BIOS_SCRATCH + 0x19) ; 0x0539
 
 ; Boot-console layout (mode 13h pixels, 8x8 glyphs). The POST draws a text boot
 ; log: a title row, then one line per step with its name and OK/FAIL/value.

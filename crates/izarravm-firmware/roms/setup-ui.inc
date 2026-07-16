@@ -10,16 +10,16 @@
 ; the Margo LFB mode (0x150, 320x240x8 - the graphical POST's own mode) and draw
 ; the main menu inside a bordered box, matching the POST screen's palette. The
 ; menu is navigated by Up/Down (highlight), Left/Right (edit the inline rows:
-; keyboard layout and GSW mode), Enter (open a sub-page or fire a Save/Discard
-; action), and Esc (back out, treated as Discard on the main menu). A one-line
-; context-sensitive help string under the box changes with the highlighted row.
+; keyboard layout, GSW mode, and COM1 debug output), Enter (open a sub-page or
+; fire a Save/Discard action), and Esc (back out, treated as Discard on the main
+; menu). A one-line help string under the box changes with the highlighted row.
 ;
 ; The page edits a working copy held in SETUP_SCRATCH and seeded at entry from the
 ; live hardware and CMOS NVRAM. Nothing is committed until Save: Save writes the
-; CMOS NVRAM area (layout 0x10, GSW default 0x12), refreshes the 0x2E/0x2F
-; checksum, sets the RTC registers when the time was edited, and writes the GSW
-; default to the live Lotura mode register (PORT_LOTURA_MODE). Discard leaves all
-; of that untouched. Both exits return to the boot path.
+; CMOS NVRAM area (layout 0x10, GSW default 0x12, COM1 debug 0x14), refreshes
+; the 0x2E/0x2F checksum, sets the RTC registers when the time was edited, and
+; writes the GSW default to the live Lotura mode register (PORT_LOTURA_MODE).
+; Discard leaves all of that untouched. Both exits return to the boot path.
 ;
 ; The peripherals page re-runs the POST probe routines live (they are
 ; non-destructive) and shows each as PASS/FAIL in a boxed table with an aligned
@@ -37,16 +37,18 @@
 %define SU_TIME_DAY       SETUP_SCRATCH + 8
 %define SU_TIME_MONTH     SETUP_SCRATCH + 9
 %define SU_TIME_YEAR      SETUP_SCRATCH + 10   ; two-digit year (0..99)
+%define SU_WORKING_COM1   SETUP_SCRATCH + 11   ; COM1 debug output (0/1)
 
 ; Main-menu selectable rows, in highlight order.
 %define SU_ROW_TIME       0
 %define SU_ROW_LAYOUT     1
 %define SU_ROW_GSW        2
-%define SU_ROW_PERIPH     3
-%define SU_ROW_REPAIR     4
-%define SU_ROW_SAVE       5
-%define SU_ROW_DISCARD    6
-%define SU_SEL_COUNT      7
+%define SU_ROW_COM1       3
+%define SU_ROW_PERIPH     4
+%define SU_ROW_REPAIR     5
+%define SU_ROW_SAVE       6
+%define SU_ROW_DISCARD    7
+%define SU_SEL_COUNT      8
 
 ; Time sub-page fields, in Left/Right edit order.
 %define SU_TF_HOUR        0
@@ -363,7 +365,7 @@ su_run_menu:
     je .save
     cmp al, SU_ROW_DISCARD
     je .discard
-    ; LAYOUT and GSW are inline: Enter cycles them forward, like Right.
+    ; LAYOUT, GSW, and COM1 are inline: Enter cycles them forward, like Right.
     call su_edit_right
     call su_redraw_cursor_row
     jmp .loop
@@ -424,6 +426,15 @@ su_seed:
     xor al, al
 .layout_ok:
     mov bx, SU_WORKING_LAYOUT
+    mov [bx], al
+    ; BIOS debug output from CMOS 0x14. Only 1 is a valid enabled value.
+    mov al, DEBUG_CMOS_COM1
+    call su_cmos_read
+    cmp al, 1
+    je .com1_ok
+    xor al, al
+.com1_ok:
+    mov bx, SU_WORKING_COM1
     mov [bx], al
     ; Time fields from the RTC (binary, 24-hour).
     mov al, SU_RTC_HOUR
@@ -523,7 +534,8 @@ su_cursor_inc:
 
 ; su_edit_left / su_edit_right: Left/Right on the main menu edit the inline rows.
 ; LAYOUT cycles the keyboard layout 0..16. GSW cycles the four modes
-; (386/486/586/386-slow), wrapping after the bootbox 386-slow row.
+; (386/486/586/386-slow), wrapping after the bootbox 386-slow row. COM1 toggles
+; the BIOS debug mirror.
 ; Other rows are not inline-editable, so the keys are ignored there. DS = 0. Clobbers
 ; AX, BX.
 su_edit_left:
@@ -535,6 +547,8 @@ su_edit_left:
     je .layout_dec
     cmp al, SU_ROW_GSW
     je .gsw_dec
+    cmp al, SU_ROW_COM1
+    je .com1_toggle
     ret
 .layout_dec:
     mov bx, SU_WORKING_LAYOUT
@@ -556,6 +570,10 @@ su_edit_left:
     dec al
     mov [bx], al
     ret
+.com1_toggle:
+    mov bx, SU_WORKING_COM1
+    xor byte [bx], 1
+    ret
 
 su_edit_right:
     xor ax, ax
@@ -566,6 +584,8 @@ su_edit_right:
     je .layout_inc
     cmp al, SU_ROW_GSW
     je .gsw_inc
+    cmp al, SU_ROW_COM1
+    je .com1_toggle
     ret
 .layout_inc:
     mov bx, SU_WORKING_LAYOUT
@@ -587,11 +607,15 @@ su_edit_right:
 .gsw_store:
     mov [bx], al
     ret
+.com1_toggle:
+    mov bx, SU_WORKING_COM1
+    xor byte [bx], 1
+    ret
 
 ; su_commit: write the working copy to hardware and CMOS, the Save action.
-; Layout -> CMOS 0x10, GSW default -> CMOS 0x12, recompute the 0x2E/0x2F checksum
-; over 0x10..0x2D, set the RTC registers if the time was edited, and write the GSW
-; default to the live Lotura register. DS = 0. Clobbers AX, BX, CX.
+; Layout -> CMOS 0x10, GSW default -> CMOS 0x12, COM1 debug -> CMOS 0x14. Save
+; recomputes the checksum over 0x10..0x2D, writes edited RTC fields, and applies
+; the GSW default to the live Lotura register. DS = 0. Clobbers AX, BX, CX.
 su_commit:
     xor cx, cx
     mov ds, cx
@@ -627,6 +651,11 @@ su_commit:
     mov bx, SU_WORKING_MODE
     mov al, [bx]
     mov ah, SU_NVRAM_GSW
+    call su_cmos_write
+    ; CMOS 0x14 = BIOS debug output on COM1.
+    mov bx, SU_WORKING_COM1
+    mov al, [bx]
+    mov ah, DEBUG_CMOS_COM1
     call su_cmos_write
     ; Refresh the NVRAM checksum now that the general-area bytes changed.
     call su_cmos_checksum
@@ -671,8 +700,8 @@ su_commit:
 
 ; ============================ Main-menu drawing ============================
 ; su_draw: paint the main menu from scratch. Title bar, a bordered box holding
-; the eight selectable rows (Time/Layout/GSW with their values, Peripherals/
-; Health, Repair/Save/Discard), and a two-line context-sensitive help footer
+; the eight selectable rows (Time/Layout/GSW/COM1 with their values,
+; Peripherals, Repair/Save/Discard), and a two-line context-sensitive help footer
 ; below the box. Sets DS = CS for the ROM strings; reads SU_CURSOR and the
 ; working values from segment 0.
 ; su_draw_fresh clears the whole framebuffer (and re-asserts the LFB mode +
@@ -721,8 +750,8 @@ su_draw:
     ret
 
 ; ROM table: main-menu row label strings, indexed by row.
-su_row_labels:  dw su_str_time, su_str_layout, su_str_gsw, su_str_periph
-                dw su_str_repair, su_str_save, su_str_discard
+su_row_labels:  dw su_str_time, su_str_layout, su_str_gsw, su_str_com1
+                dw su_str_periph, su_str_repair, su_str_save, su_str_discard
 
 ; su_draw_row: repaint one main-menu row in place: wipe its band back to the
 ; field colour (erasing a stale highlight), then the label (su_row_colors
@@ -764,6 +793,8 @@ su_draw_row:
     je su_draw_layout_value
     cmp bl, SU_ROW_GSW
     je su_draw_mode_value
+    cmp bl, SU_ROW_COM1
+    je su_draw_com1_value
     ret
 
 ; su_redraw_cursor_row: repaint just the highlighted row (an inline value edit
@@ -815,6 +846,8 @@ su_help_str_for_row:
     je .layout
     cmp bl, SU_ROW_GSW
     je .gsw
+    cmp bl, SU_ROW_COM1
+    je .com1
     cmp bl, SU_ROW_PERIPH
     je .periph
     cmp bl, SU_ROW_REPAIR
@@ -831,6 +864,9 @@ su_help_str_for_row:
     ret
 .gsw:
     mov si, su_str_help_gsw
+    ret
+.com1:
+    mov si, su_str_help_com1
     ret
 .periph:
     mov si, su_str_help_periph
@@ -971,6 +1007,31 @@ su_draw_mode_value:
     mov di, SU_VALUE_X
     mov ax, SU_MENU_Y + SU_ROW_DY * 2
     mov bl, SU_ROW_GSW
+    call su_cs_row_text_colors
+    call lfb_text
+    pop cx
+    ret
+
+; su_draw_com1_value: draw the working BIOS debug-output setting. Only the
+; Enabled state writes POST text to COM1; the UART itself remains available.
+su_draw_com1_value:
+    push cx
+    xor cx, cx
+    mov ds, cx
+    mov bx, SU_WORKING_COM1
+    mov al, [bx]
+    push cs
+    pop ds
+    cmp al, 1
+    je .enabled
+    mov si, su_str_disabled
+    jmp .put
+.enabled:
+    mov si, su_str_enabled
+.put:
+    mov di, SU_VALUE_X
+    mov ax, SU_MENU_Y + SU_ROW_DY * 3
+    mov bl, SU_ROW_COM1
     call su_cs_row_text_colors
     call lfb_text
     pop cx
@@ -1521,6 +1582,7 @@ su_str_title:        db 'IZARRA 3000 SETUP', 0
 su_str_time:         db 'TIME', 0
 su_str_layout:       db 'KEYBOARD', 0
 su_str_gsw:          db 'CPU MODE', 0
+su_str_com1:         db 'DEBUG ON COM1', 0
 su_str_periph:       db 'PERIPHERALS', 0
 su_str_repair:       db 'REPAIR TOKA-DOS', 0
 su_str_repaired:     db 'Toka-DOS repaired', 0
@@ -1536,6 +1598,8 @@ su_str_help_layout:  db 'Left/Right: change keyboard', 0
                      db 'Enter: open', 0
 su_str_help_gsw:     db 'Left/Right: change CPU speed', 0
                      db 'Enter: open', 0
+su_str_help_com1:    db 'Left/Right: toggle debug output', 0
+                     db 'Enter: toggle', 0
 su_str_help_periph:  db 'Enter: check devices', 0
                      db 'Up/Dn move  Esc back', 0
 su_str_help_repair:  db 'Enter: reinstall Toka-DOS', 0
@@ -1554,6 +1618,8 @@ su_str_mode386:      db '386', 0
 su_str_mode486:      db '486', 0
 su_str_mode586:      db '586', 0
 su_str_mode386slow:  db '386-slow', 0
+su_str_enabled:      db 'Enabled', 0
+su_str_disabled:     db 'Disabled', 0
 
 ; Keyboard layout names, indexed by CMOS 0x10 (0 US .. 16 LA).
 ; Codes match the MS-DOS KEYB tool identifiers.

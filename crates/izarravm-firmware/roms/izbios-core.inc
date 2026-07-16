@@ -300,7 +300,7 @@ run_post:
     out PORT_PIT_CH0, al
     out PORT_PIT_CH0, al
     call console_init           ; paint the graphical POST screen
-    call com1_init              ; bring up COM1 and write the POST log header
+    call com1_init              ; bring up COM1 and apply the debug setting
     mov al, RESULT_BEGIN
     mov si, str_suite_name
     call result_append          ; BEGIN suite.izarra
@@ -320,7 +320,7 @@ run_post:
     pop si                      ; name pointer
     call console_step_line      ; light this component's icon grey->colour on PASS
     call post_step_pace         ; brief real-time pause so the reveal is visible
-    call com1_log_step          ; mirror the line to COM1 (status AL, name SI)
+    call com1_log_step          ; optionally mirror the line to COM1
     inc al                      ; map HRES_* (0/1/2) -> RESULT_* (1/2/3)
     call result_append
     pop bx
@@ -370,23 +370,33 @@ enter_setup_or_boot:
 str_post_toka: db 'Starting Toka-DOS...', 0
 
 ; --- COM1 POST log mirror ---------------------------------------------------
-; The graphical screen and the serial console carry the same POST progress. The
-; emulator captures bytes written to the COM1 transmit register (0x3F8, DLAB
-; clear) and pins the line status register to "transmitter empty", so the poll
-; loop never stalls. Init programs the standard 8N1, 9600-baud setup once.
+; CMOS 0x14 controls whether POST progress is copied to COM1. The UART is always
+; initialized so the guest-visible state stays the same when debug output is
+; disabled. The emulator captures bytes written to the transmit register and
+; pins the line status register to "transmitter empty", so polling cannot stall.
 COM1_THR      equ PORT_COM1_BASE          ; transmit holding register (DLAB=0)
 COM1_DLL      equ PORT_COM1_BASE          ; divisor latch low (DLAB=1)
 COM1_DLM      equ PORT_COM1_BASE + 1      ; divisor latch high (DLAB=1)
 COM1_LCR      equ PORT_COM1_BASE + 3      ; line control register
 COM1_THRE_BIT equ 0x20                    ; LSR bit 5: transmit holding empty
 
-; com1_init: set 8N1 at 9600 baud (divisor 12 for a 1.8432 MHz UART clock).
-; Then write a one-line header so a log reader knows where POST starts.
+; com1_init: cache the CMOS setting and set 8N1 at 9600 baud (divisor 12 for a
+; 1.8432 MHz UART clock). Write the header only when debug output is enabled.
 ; Preserves all caller registers.
 com1_init:
     push ax
     push dx
     push ds
+    xor ax, ax
+    mov ds, ax                   ; cache lives in segment 0
+    mov byte [DEBUG_COM1_ACTIVE], 0
+    mov al, DEBUG_CMOS_COM1
+    out 0x70, al
+    in al, 0x71
+    cmp al, 1
+    jne .configure
+    mov byte [DEBUG_COM1_ACTIVE], 1
+.configure:
     mov dx, COM1_LCR
     mov al, 0x80                 ; DLAB = 1: expose the divisor latch
     out dx, al
@@ -399,10 +409,13 @@ com1_init:
     mov dx, COM1_LCR
     mov al, 0x03                 ; DLAB = 0, 8 data bits, no parity, 1 stop bit
     out dx, al
+    cmp byte [DEBUG_COM1_ACTIVE], 1
+    jne .done
     push cs
     pop ds                       ; DS = CS so DS:SI reaches the ROM string
     mov si, com1_str_header
     call com1_puts
+.done:
     pop ds
     pop dx
     pop ax
@@ -413,6 +426,8 @@ com1_init:
 ; Enter with DS = 0 (the sequencer's contract before result_append). Reads the
 ; prefix and the name from ROM via CS overrides. Preserves all caller registers.
 com1_log_step:
+    cmp byte [DEBUG_COM1_ACTIVE], 1
+    jne .disabled
     push ax
     push bx
     push si
@@ -444,6 +459,7 @@ com1_log_step:
     pop si
     pop bx
     pop ax
+.disabled:
     ret
 
 ; com1_puts: write the ASCIIZ string at DS:SI to COM1, polling LSR THRE before

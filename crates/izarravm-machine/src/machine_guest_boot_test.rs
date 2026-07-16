@@ -519,12 +519,36 @@ fn serial_tx_is_captured_and_lsr_reports_empty() {
 }
 
 #[test]
-fn izarra_bios_mirrors_post_log_to_com1() {
+fn izarra_bios_post_log_is_disabled_by_default() {
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    assert!(
+        machine.serial_output().is_empty(),
+        "a fresh CMOS must leave BIOS debug output disabled"
+    );
+}
+
+#[test]
+fn izarra_bios_ignores_unknown_com1_debug_values() {
+    let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.set_cmos_byte(0x14, 2);
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    assert!(
+        machine.serial_output().is_empty(),
+        "only CMOS value 1 may enable BIOS debug output"
+    );
+}
+
+#[test]
+fn izarra_bios_mirrors_post_log_to_com1_when_enabled() {
     // POST initializes COM1 and writes each step's status and name to 0x3F8.
     // After a full POST run the serial log carries the header and the
     // foundation reference step, proving the mirror is live.
     let profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+    machine.set_cmos_byte(0x14, 1);
     // The RLE background blit delays com1_init/the step loop to ~10M cycles.
     machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let serial = machine.serial_text();

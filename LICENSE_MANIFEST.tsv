@@ -38,7 +38,7 @@ crates/izarravm-firmware/roms/dos/vcpimem.com	generated-guest-binary	IzarraVM pr
 crates/izarravm-firmware/roms/dos/vcpisw.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	4c6664e02c679def02a51188d2bff37f2cec073e42a84b7f66366511bf6bc893
 crates/izarravm-firmware/roms/dos/xmstest.com	generated-guest-binary	IzarraVM project source	GPL-3.0-only	abe3525797632eb696d3f925622e1c20042dbec3d2ee383d3bbe29bb5d42b752
 crates/izarravm-firmware/roms/i386dx25-test.bin	generated-guest-binary	IzarraVM project source	GPL-3.0-only	ba3a1717b073d4c41b0c2f9f83aec51d082431251de1d3cb239d64c9d41c4932
-crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	7bf0865752a7bf37ea5464c20d2b531a45b7da60c870660026a8696b1619f3df
+crates/izarravm-firmware/roms/izarra-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	4df462cd1745736c8abb76d66eec847343a80d9ee34a6fccd3f017694e9acf0a
 crates/izarravm-firmware/roms/izbios-art.inc	generated-source	IzarraVM gen_art.py	GPL-3.0-only	9e9e9b94a787498051ccc3a89cf512bbf3e5ebc2c31d3a88b6bf194d5a09c853
 crates/izarravm-firmware/roms/izbios-logo.inc	generated-source	IzarraVM project artwork	GPL-3.0-only	55e62c1bb449c8c659e4f447d95885d2baa73c6363fb3d5a4767f9afdba227e1
 crates/izarravm-firmware/roms/kbd-bios.bin	generated-firmware	IzarraVM firmware and Microsoft MS-DOS 4.0 keyboard tables	GPL-3.0-only AND MIT	43b71ebdd508b4c237bbad71aa2debfbcd3e07a829ca05fe7bbc9fb4f8f78973
