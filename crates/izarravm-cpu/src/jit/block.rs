@@ -446,6 +446,8 @@ pub(crate) enum PollScanOutcome {
     /// A structural shape matched but a register or segment check failed
     /// (3-slot EDX port source, within-live-CS limits). The same bytes can
     /// classify differently under other register/segment state: never cache.
+    /// Forward rule: any new register- or segment-dependent check added to a
+    /// shape must return NegativeVolatile, never NegativeCacheable.
     NegativeVolatile,
 }
 

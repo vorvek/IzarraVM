@@ -618,6 +618,9 @@ pub struct PerfCounters {
     /// with the cache enabled).
     pub poll_neg_cache_stores: u64,
     /// Volatile negatives (scanned, uncacheable: register/segment reasons).
+    /// Counts every such scan regardless of `poll_neg_cache_enabled`: volatile
+    /// outcomes are never cached, so they re-fire with the switch off. A nonzero
+    /// value with the cache disabled is expected, not a leak.
     pub poll_neg_cache_volatile: u64,
     pub jit_direct_reject_mode_key: u64,
     pub jit_direct_reject_x87_top: u64,
@@ -1130,10 +1133,10 @@ impl Default for CpuGsw {
     }
 }
 
-#[cfg(all(test, feature = "jit"))]
+#[cfg(feature = "jit")]
 impl CpuGsw {
-    /// Force the poll negative cache on or off, independent of the ambient
-    /// IZARRAVM_POLL_SKIP_NEG_CACHE value. A/B behavioral tests only.
+    /// Test seam: force the poll negative cache on or off regardless of the
+    /// IZARRAVM_POLL_SKIP_NEG_CACHE environment. Host bookkeeping only.
     pub fn set_poll_neg_cache_enabled_for_test(&mut self, enabled: bool) {
         self.poll_neg_cache_enabled = enabled;
     }

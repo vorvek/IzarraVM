@@ -798,6 +798,181 @@ fn natural_event_caps_eventually_offer_a_poll_loop_head() {
     );
 }
 
+// Program offset of the self-loop head warmed by `warm_non_poll_machine`. It is
+// the .COM origin, so its linear (CS.base + this) is also its physical byte in
+// real mode, which the SMC test in `code_write_retires_negative...` relies on.
+#[cfg(feature = "jit")]
+const NON_POLL_HEAD_OFFSET: u32 = 0x100;
+
+// A warm self-incrementing loop (`inc eax; inc eax; jmp head`) whose head matches
+// no certified poll shape, so classifying it is a cacheable structural negative.
+// Reused by the negative-cache hit and SMC-retire tests: no existing helper builds
+// a non-poll warm loop, so this is the "warm straight-line loop that is not a
+// certified shape" those tests require.
+#[cfg(feature = "jit")]
+fn warm_non_poll_machine() -> Machine {
+    let program = [
+        0x40, // inc eax
+        0x40, // inc eax
+        0xeb, 0xfc, // jmp -4 back to the head
+    ];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    machine.cpu.set_native_backend_enabled(false);
+    // poll_skip off so warming never classifies: the tests own the first scan.
+    machine.poll_skip_enabled = false;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine.run_cycles(1_000).unwrap();
+    machine
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_negative_cache_answers_repeat_scans() {
+    // A structural (code-byte-only) negative is recorded on the first scan and
+    // answered from the page-generation cache on the next scan at the same
+    // linear, without a second full backward scan.
+    let mut machine = warm_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.reset_perf_counters();
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+
+    assert!(machine.cpu.poll_loop().is_none());
+    let stores = machine.cpu.perf_counters().poll_neg_cache_stores;
+    let hits = machine.cpu.perf_counters().poll_neg_cache_hits;
+    assert!(stores >= 1, "the first scan records a structural negative");
+
+    // Same linear, no code write in between, so the live negative answers it.
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_neg_cache_stores,
+        stores,
+        "the repeat scan is answered from the cache, not re-recorded"
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_neg_cache_hits, hits + 1);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn edx_dependent_negative_is_not_cached() {
+    // The 3-slot direct shape (IN AL,DX; TEST AL,imm8; Jcc back) is structural,
+    // but its port comes from live EDX. A non-3DA EDX is a volatile negative that
+    // must never be cached, because the same bytes classify as a poll the moment
+    // EDX addresses the 3DA status port.
+    let mut machine = poll_skip_test_machine(false, TracingMode::Off, GswMode::Gsw586, 0x08);
+    machine.run_cycles(1_000).unwrap();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.reset_perf_counters();
+
+    // Head of the warm 3-slot phase, with EDX not pointing at the 3DA port.
+    machine.cpu.registers.set_edx(0x0000_0100);
+    machine.cpu.registers.eip = 0x108;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(machine.cpu.perf_counters().poll_neg_cache_stores, 0);
+    assert!(machine.cpu.perf_counters().poll_neg_cache_volatile >= 1);
+
+    // The identical bytes classify as a poll once EDX addresses the 3DA port,
+    // proving the earlier volatile negative had to stay uncached.
+    machine.cpu.registers.set_edx(0x0000_03da);
+    machine.cpu.registers.eip = 0x108;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(machine.cpu.poll_loop().is_some());
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn code_write_retires_negative_and_new_poll_is_recognized() {
+    // A negative is keyed on the page's insert generation. A guest code write
+    // that installs a real poll shape at the same linear must retire the stale
+    // negative (its re-decode bumps the page generation), or a legitimate new
+    // poll would be silently suppressed.
+    const HEAD: u32 = NON_POLL_HEAD_OFFSET;
+    // Certified 5-slot setup-direct poll: mov edx,ebx; sub eax,eax; in al,dx;
+    // test al,8; jnz -9 back to the head. EBX supplies the 3DA port downstream;
+    // this shape's classification is structural (no register gate).
+    const SETUP_DIRECT: &[u8] = &[0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x75, 0xf7];
+    const SETUP_STARTS: &[u32] = &[0, 2, 4, 5, 7];
+
+    let mut machine = warm_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_loop().is_none(),
+        "the non-poll head classifies as a negative"
+    );
+    assert!(machine.cpu.perf_counters().poll_neg_cache_stores >= 1);
+
+    // SMC: overwrite the head with the setup-direct poll shape through the normal
+    // recorded write path, which invalidates the stale decode lines at HEAD.
+    let base = machine.cpu.registers.cs().base;
+    for (offset, byte) in SETUP_DIRECT.iter().copied().enumerate() {
+        machine.write_physical_u8(base + HEAD + offset as u32, byte);
+    }
+    // Re-warm the new shape so its decode lines exist. Each fresh decode is a
+    // `put`, which bumps the head page's insert generation and retires the
+    // negative. EBX/EDX address the 3DA port so IN AL,DX does not fault.
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        cpu.registers.set_ebx(0x0000_03da);
+        cpu.registers.set_edx(0x0000_03da);
+        for offset in SETUP_STARTS {
+            cpu.registers.eip = HEAD + offset;
+            cpu.poll_skip_backedge_housekeeping();
+            cpu.run_budgeted(bus, 0)
+                .expect("warm the new setup poll slot");
+        }
+    });
+
+    // Reclassify at the SAME linear the negative was cached for.
+    machine.cpu.registers.set_ebx(0x0000_03da);
+    machine.cpu.registers.eip = HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_loop().is_some(),
+        "a stale negative suppressed a legitimate new poll shape"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn cache_on_and_off_commit_identical_spans() {
+    // A stale negative may only ever SUPPRESS a skip, never change committed
+    // state, so a scenario that really skips must commit the identical span set,
+    // iteration count, instruction count, and registers with the cache on or off.
+    let run = |cache: bool| {
+        let mut machine =
+            setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+        prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+        machine.cpu.set_poll_neg_cache_enabled_for_test(cache);
+        let mut halted = false;
+        for _ in 0..128 {
+            if machine.run_cycles(100_000).unwrap() == StopReason::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "the setup poll never reached its edge");
+        (
+            machine.cpu.perf_counters().poll_skip_spans,
+            machine.cpu.perf_counters().poll_skip_iterations,
+            machine.cpu.perf_counters().instructions,
+            machine.cpu.registers.clone(),
+        )
+    };
+    let with_cache = run(true);
+    let without_cache = run(false);
+    assert!(with_cache.0 > 0, "scenario must actually skip");
+    assert_eq!(with_cache, without_cache);
+}
+
 #[test]
 fn compiled_window_requires_approximate_timing_and_trace_off() {
     let mut machine = test_machine();

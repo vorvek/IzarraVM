@@ -51,9 +51,9 @@ fn cpu_registers_field_offset_is_stable() {
     // The current layout places `registers` at a non-zero offset (rustc reorders CpuGsw's
     // fields for alignment). The emitter handles any value (it bakes `offset_of!` at emit
     // time, verified by the differential suites jit_region + jit_general); this assertion
-    // freezes the known position so a change is visible. The constant tracks the live layout
-    // (456 -> 464 when Round 1 added the `jit_table_clears` u64 to PerfCounters, which precedes
-    // `registers`; the emitter re-reads the offset, so this is a documentation update).
+    // freezes the known position so a change is visible. The constant shifts whenever
+    // PerfCounters grows (that field precedes `registers`); the emitter re-reads the offset,
+    // so updating this number is a documentation change, not a code fix.
     assert_eq!(
         off, 504,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
