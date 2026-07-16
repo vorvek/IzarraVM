@@ -941,3 +941,17 @@ fn poll_negative_cache_page_generation_semantics() {
     cache.poll_neg[slot] ^= 1u64 << 32;
     assert!(!cache.poll_negative_live(lin2, false));
 }
+
+/// IZARRAVM_POLL_SKIP_NEG_CACHE policy is default-on with a kill switch: the cache runs unless
+/// the env var is explicitly "0" or "" (unset, i.e. `None`, means ON here, which is the opposite
+/// sense of the machine crate's `poll_skip_requested`, where `None` means OFF; that one-token
+/// difference is exactly what this test pins).
+#[cfg(feature = "jit")]
+#[test]
+fn poll_neg_cache_policy_default_on_with_kill_switch() {
+    assert!(poll_neg_cache_policy(None));
+    assert!(poll_neg_cache_policy(Some("1")));
+    assert!(poll_neg_cache_policy(Some("yes")));
+    assert!(!poll_neg_cache_policy(Some("0")));
+    assert!(!poll_neg_cache_policy(Some("")));
+}
