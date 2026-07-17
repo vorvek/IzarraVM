@@ -454,6 +454,8 @@ pub(crate) enum PollScanOutcome {
 /// Recognize only the reviewed 3DA poll-loop shapes from the same warm decode-cache
 /// view used by compiled blocks. Re-running this before every span makes an SMC
 /// restamp replace the descriptor rather than reusing stale bytes or addresses.
+/// Slot opcodes here are mirrored in poll_head_possible's set; extending the
+/// shapes requires extending that set.
 fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
     let d = cpu.registers.cs().default_size_32;
     let Some((slots, is_loop)) = build_block(cpu, entry, d) else {
@@ -635,6 +637,29 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
     }
 }
 
+/// Loop-head prefilter: whether the current boundary could possibly be
+/// inside a certified poll shape. Every shape requires 32-bit code (d) and
+/// every Found's fetch set contains the current EIP as a slot START, whose
+/// opcode is one of the fixed set below (3-slot: IN/TEST/Jcc; 5-slot adds
+/// MOV 0x89 and SUB 0x29; paired adds JMP 0xEB). A cold line cannot be a
+/// slot (build_block chains only warm lines), and warming goes through
+/// `put`, which bumps the page insert generation guarding any cached
+/// negative. Containment is structural, so this rejection is a
+/// code-byte-only fact under EVERY register state, even when a nearby
+/// shape would scan as register-volatile. Extending the shape table in
+/// build_poll_loop_at requires extending this set; the every-phase test
+/// exact_setup_poll_shapes_cover_sources_senses_and_every_phase fails if
+/// any slot opcode goes missing here.
+fn poll_head_possible(cpu: &CpuGsw, lin: u32, d: bool) -> bool {
+    if !d {
+        return false;
+    }
+    match cpu.decode_cache.get(lin, d) {
+        Some(insn) => matches!(insn.opcode, 0x89 | 0x29 | 0xec | 0xa8 | 0x74 | 0x75 | 0xeb),
+        None => false,
+    }
+}
+
 impl CpuGsw {
     /// Conservative machine-level poll-skip entry gate. This mirrors the direct
     /// IN permission fast path and rejects every state where the interpreter
@@ -654,13 +679,18 @@ impl CpuGsw {
     /// are answered from the negative cache when the page's insert
     /// generation is unchanged; register-dependent negatives are never
     /// cached. `&mut self` mutates host bookkeeping only (cache slots and
-    /// perf counters), never guest state.
+    /// perf counters), never guest state. The loop-head prefilter answers
+    /// the dominant non-poll boundaries before any cache probe or scan.
     pub fn poll_loop(&mut self) -> Option<PollLoop> {
         if !self.poll_skip_eligible() {
             return None;
         }
         let lin = self.linear_eip();
         let d = self.registers.cs().default_size_32;
+        if !poll_head_possible(self, lin, d) {
+            self.perf.poll_head_prefilter_rejects += 1;
+            return None;
+        }
         if self.poll_neg_cache_enabled && self.decode_cache.poll_negative_live(lin, d) {
             self.perf.poll_neg_cache_hits += 1;
             return None;

@@ -622,6 +622,10 @@ pub struct PerfCounters {
     /// outcomes are never cached, so they re-fire with the switch off. A nonzero
     /// value with the cache disabled is expected, not a leak.
     pub poll_neg_cache_volatile: u64,
+    /// Classify boundaries rejected by the loop-head prefilter (cold line,
+    /// 16-bit code, or an opcode no certified shape slot can carry) before
+    /// any scan or cache probe. Counts regardless of the cache switch.
+    pub poll_head_prefilter_rejects: u64,
     pub jit_direct_reject_mode_key: u64,
     pub jit_direct_reject_x87_top: u64,
     pub jit_direct_reject_cs_layout: u64,

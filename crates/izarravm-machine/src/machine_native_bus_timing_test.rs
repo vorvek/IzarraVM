@@ -798,32 +798,25 @@ fn natural_event_caps_eventually_offer_a_poll_loop_head() {
     );
 }
 
-// Program offset of the self-loop head warmed by `warm_non_poll_machine`. It is
-// the .COM origin, so its linear (CS.base + this) is also its physical byte in
-// real mode, which the SMC test in `code_write_retires_negative...` relies on.
+// Program offset of the self-loop head warmed by the non-poll machine helpers.
+// It is the .COM origin, so its linear (CS.base + this) is also its physical byte
+// in real mode, which the SMC test in `code_write_retires_negative...` relies on.
 #[cfg(feature = "jit")]
 const NON_POLL_HEAD_OFFSET: u32 = 0x100;
 
-// A warm self-incrementing loop (`inc eax; inc eax; jmp head`) whose head matches
-// no certified poll shape, so classifying it is a cacheable structural negative.
-// Reused by the negative-cache hit and SMC-retire tests: no existing helper builds
-// a non-poll warm loop, so this is the "warm straight-line loop that is not a
-// certified shape" those tests require.
+// Warm a 32-bit self-loop whose head matches no certified poll shape, so
+// classifying it is a cacheable structural negative. `poll_skip` stays off so
+// warming never classifies: the tests own the first scan. The caller picks the
+// loop body so the head opcode lands on either side of the loop-head prefilter.
 #[cfg(feature = "jit")]
-fn warm_non_poll_machine() -> Machine {
-    let program = [
-        0x40, // inc eax
-        0x40, // inc eax
-        0xeb, 0xfc, // jmp -4 back to the head
-    ];
+fn warm_non_poll_loop_machine(program: &[u8]) -> Machine {
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
-    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    let mut machine = Machine::new_raw_program(profile, program).unwrap();
     let mut cs = machine.cpu.registers.cs();
     cs.default_size_32 = true;
     machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
     machine.cpu.set_native_backend_enabled(false);
-    // poll_skip off so warming never classifies: the tests own the first scan.
     machine.poll_skip_enabled = false;
     machine.trace.set_tracing_mode(TracingMode::Off);
     machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
@@ -832,19 +825,47 @@ fn warm_non_poll_machine() -> Machine {
     machine
 }
 
+// A warm `mov edx,ebx; mov eax,ebx; jmp head` loop. This builds a 3-slot
+// [0x89, 0x89, 0xEB] is_loop block that matches no certified poll shape, so the
+// scan records a cacheable structural negative. The head opcode 0x89 is inside
+// the loop-head prefilter set, so the boundary reaches the scan rather than being
+// rejected up front. Reused by the negative-cache hit and SMC-retire tests, which
+// need a warm non-poll loop whose head clears the prefilter.
+#[cfg(feature = "jit")]
+fn warm_in_set_non_poll_machine() -> Machine {
+    warm_non_poll_loop_machine(&[
+        0x89, 0xda, // mov edx, ebx  (0x89 in set)
+        0x89, 0xd8, // mov eax, ebx  (0x89 in set)
+        0xeb, 0xfa, // jmp -6 back to the head
+    ])
+}
+
+// A warm `inc eax; inc eax; jmp head` loop. The head opcode 0x40 is outside the
+// loop-head prefilter set, so the prefilter rejects the boundary before any scan
+// or cache probe. Used by the prefilter-reject tests.
+#[cfg(feature = "jit")]
+fn warm_out_of_set_non_poll_machine() -> Machine {
+    warm_non_poll_loop_machine(&[
+        0x40, // inc eax
+        0x40, // inc eax
+        0xeb, 0xfc, // jmp -4 back to the head
+    ])
+}
+
 #[cfg(feature = "jit")]
 #[test]
 fn poll_negative_cache_answers_repeat_scans() {
     // A structural (code-byte-only) negative is recorded on the first scan and
     // answered from the page-generation cache on the next scan at the same
     // linear, without a second full backward scan.
-    let mut machine = warm_non_poll_machine();
+    let mut machine = warm_in_set_non_poll_machine();
     machine.cpu.set_poll_neg_cache_enabled_for_test(true);
     machine.cpu.reset_perf_counters();
     machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
     machine.cpu.poll_skip_backedge_housekeeping();
 
     assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(machine.cpu.perf_counters().poll_head_prefilter_rejects, 0);
     let stores = machine.cpu.perf_counters().poll_neg_cache_stores;
     let hits = machine.cpu.perf_counters().poll_neg_cache_hits;
     assert!(stores >= 1, "the first scan records a structural negative");
@@ -901,7 +922,7 @@ fn code_write_retires_negative_and_new_poll_is_recognized() {
     const SETUP_DIRECT: &[u8] = &[0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x75, 0xf7];
     const SETUP_STARTS: &[u32] = &[0, 2, 4, 5, 7];
 
-    let mut machine = warm_non_poll_machine();
+    let mut machine = warm_in_set_non_poll_machine();
     machine.cpu.set_poll_neg_cache_enabled_for_test(true);
     machine.cpu.registers.eip = HEAD;
     machine.cpu.poll_skip_backedge_housekeeping();
@@ -938,6 +959,82 @@ fn code_write_retires_negative_and_new_poll_is_recognized() {
     assert!(
         machine.cpu.poll_loop().is_some(),
         "a stale negative suppressed a legitimate new poll shape"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn out_of_set_boundary_is_prefilter_rejected_without_cache_traffic() {
+    // A warm head whose opcode (0x40) no certified shape slot can carry is
+    // rejected on the opcode peek, before any cache probe or backward scan.
+    let mut machine = warm_out_of_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(machine.cpu.poll_loop().is_none());
+    let perf = machine.cpu.perf_counters();
+    assert!(perf.poll_head_prefilter_rejects >= 1);
+    assert_eq!(perf.poll_neg_cache_stores, 0);
+    assert_eq!(perf.poll_neg_cache_hits, 0);
+    let rejects = perf.poll_head_prefilter_rejects;
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_head_prefilter_rejects,
+        rejects + 1
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_neg_cache_hits, 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn cold_boundary_is_prefilter_rejected() {
+    // EIP at never-executed bytes: the decode line is cold, so no shape can
+    // contain it and the prefilter answers without a scan.
+    let mut machine = warm_out_of_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET + 0x40;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    let before = machine.cpu.perf_counters().poll_head_prefilter_rejects;
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_head_prefilter_rejects,
+        before + 1
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn sixteen_bit_code_is_prefilter_rejected() {
+    // d = false matches no certified shape; eligibility passes in real mode, so
+    // the prefilter is the rejector even when the head opcode (0x89) is in-set.
+    // A 16-bit real-mode fixture: same shape as the in-set helper but with the
+    // code segment left at its default 16-bit width, so decode d is false.
+    let program = [
+        0x89, 0xda, // mov dx, bx  (0x89 in set, but 16-bit code)
+        0xeb, 0xfc, // jmp -4 back to the head
+    ];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = false;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine.run_cycles(1_000).unwrap();
+
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_skip_eligible(),
+        "real mode with IOPL clearance must stay poll-skip eligible so d=false is the rejector"
+    );
+    let before = machine.cpu.perf_counters().poll_head_prefilter_rejects;
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_head_prefilter_rejects,
+        before + 1
     );
 }
 

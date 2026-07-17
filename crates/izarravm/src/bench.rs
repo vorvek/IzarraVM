@@ -949,6 +949,7 @@ pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "poll_neg_cache_hits": perf.poll_neg_cache_hits,
         "poll_neg_cache_stores": perf.poll_neg_cache_stores,
         "poll_neg_cache_volatile": perf.poll_neg_cache_volatile,
+        "poll_head_prefilter_rejects": perf.poll_head_prefilter_rejects,
         "code_invalidations": perf.code_invalidations,
         "data_direct_reads": perf.data_direct_reads,
         "data_slow_reads": perf.data_slow_reads,
