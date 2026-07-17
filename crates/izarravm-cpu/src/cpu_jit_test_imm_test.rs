@@ -956,3 +956,201 @@ fn poll_neg_cache_policy_default_on_with_kill_switch() {
     assert!(!poll_neg_cache_policy(Some("0")));
     assert!(!poll_neg_cache_policy(Some("")));
 }
+
+/// IZARRAVM_POLL_SKIP_MEMORY shares the exact same default-on truth table.
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_memory_policy_default_on_with_kill_switch() {
+    assert!(poll_skip_memory_policy(None));
+    assert!(poll_skip_memory_policy(Some("1")));
+    assert!(poll_skip_memory_policy(Some("yes")));
+    assert!(!poll_skip_memory_policy(Some("0")));
+    assert!(!poll_skip_memory_policy(Some("")));
+}
+
+const MEMORY_POLL_CELL: u32 = 0x4000;
+
+/// `CMP EAX,DS:[disp32]; Jcc rel8` back to entry: the certified M1 shape, the
+/// exact form the 2026-07-17 runtime probe confirmed at Doom's maketic loop
+/// (0x473849/0x47384F). `jz` selects the branch sense (0x74/JE spins-while-
+/// equal, 0x75/JNE spins-while-not-equal); the real loop uses 0x75.
+fn memory_poll_code(cell_disp: u32, jz: bool) -> Vec<u8> {
+    let mut code = vec![0x3b, 0x05];
+    code.extend_from_slice(&cell_disp.to_le_bytes());
+    code.push(if jz { 0x74 } else { 0x75 });
+    code.push(0xf8); // rel8 -8: CMP (6 bytes) + Jcc (2 bytes) = 8, back to entry.
+    code
+}
+
+fn memory_poll_starts() -> &'static [u32] {
+    &[0, 6]
+}
+
+fn warm_exact_memory_poll(
+    jz: bool,
+    cell_disp: u32,
+    eax: u32,
+    cell_value: u32,
+) -> (CpuGsw, TestBus) {
+    let code = memory_poll_code(cell_disp, jz);
+    let mut memory = vec![0xf4; 0x6000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    memory[cell_disp as usize..cell_disp as usize + 4].copy_from_slice(&cell_value.to_le_bytes());
+    let mut cpu = flat_cpu(GswMode::Gsw586);
+    cpu.set_native_backend_enabled(false);
+    cpu.registers.set_eax(eax);
+    let mut bus = TestBus::with_memory(memory);
+    bus.lazy_io_reads = true;
+    for offset in memory_poll_starts() {
+        cpu.set_eip(ENTRY + offset);
+        cpu.fetch_decoded(&mut bus, ENTRY + offset)
+            .expect("memory poll instruction decode");
+    }
+    cpu.set_eip(ENTRY);
+    (cpu, bus)
+}
+
+/// Structural recognition (test 1) and the prefilter completeness tripwire
+/// (test 2): every slot start classifies `Found` in every phase, for both
+/// branch senses. If 0x3B were missing from `poll_head_possible`'s set, the
+/// offset-0 (CMP) phase would be rejected by the prefilter and this test
+/// would fail exactly like the io shapes' equivalent coverage test does.
+#[cfg(feature = "jit")]
+#[test]
+fn exact_memory_poll_shape_covers_senses_and_every_phase() {
+    for jz in [false, true] {
+        for cell_value in [0x0000_0011u32, 0x0000_0099u32] {
+            let eax = 0x0000_0099u32;
+            let (mut cpu, _) = warm_exact_memory_poll(jz, MEMORY_POLL_CELL, eax, cell_value);
+            let poll = cpu.poll_loop().expect("exact memory poll");
+            assert_eq!(poll.family(), PollFamily::Memory);
+            assert_eq!(poll.fetch_count(), 2);
+            assert_eq!(poll.memory_cell_linear(), Some(MEMORY_POLL_CELL));
+            assert_eq!(poll.memory_cell_width(), Some(4));
+            assert_eq!(poll.memory_comparand(&cpu), Some(eax));
+            let equal = cell_value == eax;
+            let expected_spin = if jz { equal } else { !equal };
+            assert_eq!(
+                poll.memory_spin_predicate(cell_value, eax),
+                Some(expected_spin)
+            );
+            for offset in memory_poll_starts() {
+                cpu.set_eip(ENTRY + offset);
+                let phase = cpu.poll_loop().expect("certified phase membership");
+                assert_eq!(phase.at_head(), *offset == 0, "offset={offset}");
+            }
+        }
+    }
+}
+
+/// R6a: a certified memory-poll loop entered with the comparand already equal
+/// to the cell (JNE: about to exit) must report `memory_spin_predicate` false
+/// in both senses, so the executor does not commit a phantom skip.
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_spin_predicate_false_at_exit_both_senses() {
+    for jz in [false, true] {
+        // JNE (jz=false) spins while NOT equal, so equal values mean "about to
+        // exit" -> predicate must be false. JE (jz=true) spins while equal, so
+        // equal values mean "still spinning" -> predicate must be true; use
+        // unequal values there to hit its own exit case instead.
+        let (cell_value, eax, expect_spin) = if jz { (5, 9, false) } else { (7, 7, false) };
+        let (mut cpu, _) = warm_exact_memory_poll(jz, MEMORY_POLL_CELL, eax, cell_value);
+        let poll = cpu.poll_loop().expect("exact memory poll");
+        assert_eq!(
+            poll.memory_spin_predicate(cell_value, eax),
+            Some(expect_spin),
+            "jz={jz}"
+        );
+    }
+}
+
+/// Structural/register-dependent rejects for the memory shape, mirroring
+/// `exact_setup_poll_rejects_mismatch_cold_prefix_mode_targets_page_cs_and_smc`.
+#[cfg(feature = "jit")]
+#[test]
+fn exact_memory_poll_rejects_non_bare_disp32_and_narrow_cs_limit() {
+    // A base register (`[eax+disp32]`, ModRM mod=10 rm=0 with a disp32) is a
+    // different addressing form (base present); structurally not the
+    // certified bare-disp32 shape.
+    let based = vec![0x3b, 0x80, 0x00, 0x40, 0x00, 0x00, 0x75, 0xf8];
+    let (mut cpu, _) = warm_exact_poll(&based, ENTRY, &[0, 6], 0, 0, 0);
+    assert!(cpu.poll_loop().is_none(), "base register must be rejected");
+
+    // A 16-bit operand-size CMP (0x66 prefix) is prefixed, already rejected by
+    // build_block's unprefixed requirement, exercised here for the shape.
+    let word_form = vec![0x66, 0x3b, 0x05, 0x00, 0x40, 0x00, 0x00, 0x75, 0xf7];
+    let (mut cpu, _) = warm_exact_poll(&word_form, ENTRY, &[0, 7], 0, 0, 0);
+    assert!(cpu.poll_loop().is_none(), "16-bit CMP must be rejected");
+
+    // Live CS limit shrunk below the loop's end: a register/segment-dependent
+    // (NegativeVolatile) rejection, not a structural one.
+    let (mut cpu, _) = warm_exact_memory_poll(false, MEMORY_POLL_CELL, 1, 2);
+    assert!(cpu.poll_loop().is_some(), "sanity: unshrunk CS certifies");
+    let mut cs = cpu.registers.cs();
+    cs.limit = ENTRY + 6;
+    cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    assert!(
+        cpu.poll_loop().is_none(),
+        "narrow CS limit must reject the memory shape too"
+    );
+}
+
+/// The IZARRAVM_POLL_SKIP_MEMORY sub-flag is the single choke point (gated
+/// inside `build_poll_loop_at`'s M1 arm): with it off, a structurally
+/// certified memory loop classifies as if the shape did not exist at all,
+/// regardless of which slot the classify call starts from.
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_memory_sub_flag_suppresses_the_shape_entirely() {
+    // The flag is read once at CPU construction in production (an env-fixed
+    // value for the process lifetime); this test mirrors that by setting it
+    // BEFORE the first classify call in each case, rather than toggling a
+    // live cache's already-recorded verdict (a cached structural negative
+    // recorded while off is a correct, pure function of code bytes for a
+    // flag fixed for the run, so it is not expected to un-cache on a
+    // mid-run flip -- that is not production usage).
+    let (mut cpu_on, _) = warm_exact_memory_poll(false, MEMORY_POLL_CELL, 1, 2);
+    cpu_on.set_poll_skip_memory_enabled_for_test(true);
+    assert!(cpu_on.poll_loop().is_some(), "on: shape certifies");
+
+    let (mut cpu_off, _) = warm_exact_memory_poll(false, MEMORY_POLL_CELL, 1, 2);
+    cpu_off.set_poll_skip_memory_enabled_for_test(false);
+    assert!(
+        cpu_off.poll_loop().is_none(),
+        "off: the sub-flag must suppress the memory shape entirely"
+    );
+}
+
+/// R2: `probe_linear_read_physical` is TLB-hit-only and non-mutating. Unpaged
+/// mode returns the linear identity; paged mode requires an already-warm TLB
+/// entry (never walks) and declines on a miss or a user-mode protection
+/// mismatch, without ever touching CR2.
+#[cfg(feature = "jit")]
+#[test]
+fn probe_linear_read_physical_is_tlb_hit_only_and_pure() {
+    let cpu = flat_cpu(GswMode::Gsw586);
+    assert_eq!(cpu.control.cr2, 0);
+    assert_eq!(cpu.probe_linear_read_physical(0x1234), Some(0x1234));
+
+    let mut cpu = paged_cpu(GswMode::Gsw586);
+    // No warm TLB entry at this linear page yet: decline, zero perturbation.
+    let cr2_before = cpu.control.cr2;
+    assert_eq!(cpu.probe_linear_read_physical(0x0000_7000), None);
+    assert_eq!(cpu.control.cr2, cr2_before, "a decline must not set CR2");
+
+    // Warm the TLB by hand for a user-accessible page (linear page 5) and
+    // confirm the probe then serves it without walking (no bus needed: cr3
+    // is never consulted once the TLB entry is present).
+    cpu.tlb.insert(5, 0x0000_9000, true, true, true);
+    assert_eq!(
+        cpu.probe_linear_read_physical(0x0000_5abc),
+        Some(0x0000_9abc)
+    );
+
+    // A supervisor-only page (linear page 6) declines for a CPL-3 accessor.
+    cpu.cpl = 3;
+    cpu.tlb.insert(6, 0x0000_a000, true, false, true);
+    assert_eq!(cpu.probe_linear_read_physical(0x0000_6000), None);
+    assert_eq!(cpu.control.cr2, cr2_before, "a decline must not set CR2");
+}
