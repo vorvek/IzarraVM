@@ -1650,6 +1650,466 @@ fn paged_fast_map_tlb_collision_keeps_interpreter_and_native_timing_equal() {
     );
 }
 
+// --- Memory-poll (M1) machine-side tests ---
+//
+// The certified memory shape: `MOV EAX,imm32; CMP EAX,DS:[disp32]; JNZ/JZ rel8`
+// back to the CMP, then HLT on exit. Program offsets (CS.base = 0x2000 for a
+// raw .COM program): mov at eip 0x100, CMP head at 0x105, Jcc at 0x10b, HLT
+// at 0x10d. The polled cell lives at ds.base + MEMORY_POLL_CELL_DISP.
+
+#[cfg(feature = "jit")]
+const MEMORY_POLL_HEAD_EIP: u32 = 0x105;
+#[cfg(feature = "jit")]
+const MEMORY_POLL_CELL_DISP: u32 = 0x3000;
+#[cfg(feature = "jit")]
+const MEMORY_POLL_COMPARAND: u32 = 0x8765_4321;
+
+#[cfg(feature = "jit")]
+fn memory_poll_program(cell_disp: u32, jz: bool) -> Vec<u8> {
+    let mut program = vec![0xb8];
+    program.extend_from_slice(&MEMORY_POLL_COMPARAND.to_le_bytes());
+    program.extend_from_slice(&[0x3b, 0x05]);
+    program.extend_from_slice(&cell_disp.to_le_bytes());
+    program.push(if jz { 0x74 } else { 0x75 });
+    program.push(0xf8);
+    program.push(0xf4);
+    program
+}
+
+#[cfg(feature = "jit")]
+fn memory_poll_machine(
+    enabled: bool,
+    memory_sub_flag: bool,
+    jz: bool,
+    cell_disp: u32,
+    cell_value: u32,
+) -> Machine {
+    let program = memory_poll_program(cell_disp, jz);
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = enabled;
+    machine
+        .cpu
+        .set_poll_skip_memory_enabled_for_test(memory_sub_flag);
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    let ds_base = machine.cpu.registers.segment(SegmentIndex::Ds).base;
+    machine.write_physical_u32(ds_base.wrapping_add(cell_disp), cell_value);
+    machine
+}
+
+/// State + timing identity at batch boundaries with the sub-flag on vs off
+/// (spec tests 7 + 8): a spinning tic-wait whose cell never changes must leave
+/// every architectural, timing, and device field byte-identical at every batch
+/// boundary. `assert_poll_machine_boundary_eq` includes `elapsed_clocks`,
+/// `timing_rem`, `trace.elapsed_clocks()`, and the beam, so this is also the
+/// timing-identity oracle that PINS `MEMORY_POLL_RAW_CORE_CLOCKS` (a wrong
+/// constant shows up as an elapsed-clock divergence on the first skipping
+/// boundary) and the R7 caveats (the certificate's per-slot fetch sum plus one
+/// warm dword data charge must total exactly the interpreter's per-iteration
+/// charge, or these totals split).
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_skip_matches_the_interpreter_at_batch_boundaries() {
+    for jz in [false, true] {
+        // Pick a cell value that SPINS for the sense under test: JNZ (0x75)
+        // spins while not equal, JZ (0x74) spins while equal.
+        let cell_value = if jz {
+            MEMORY_POLL_COMPARAND
+        } else {
+            MEMORY_POLL_COMPARAND ^ 0x1111
+        };
+        let mut baseline = memory_poll_machine(true, false, jz, MEMORY_POLL_CELL_DISP, cell_value);
+        let mut skipped = memory_poll_machine(true, true, jz, MEMORY_POLL_CELL_DISP, cell_value);
+
+        for boundary in 0..8 {
+            let baseline_stop = baseline.run_cycles(100_000).unwrap();
+            let skipped_stop = skipped.run_cycles(100_000).unwrap();
+            assert_eq!(skipped_stop, baseline_stop, "jz={jz} boundary={boundary}");
+            assert_poll_machine_boundary_eq(&skipped, &baseline);
+        }
+        let skipped_perf = skipped.cpu.perf_counters();
+        assert!(
+            skipped_perf.poll_skip_memory_spans > 0,
+            "jz={jz}: the memory shape must have committed spans"
+        );
+        assert!(skipped_perf.poll_skip_memory_iterations > 1);
+        assert_eq!(
+            skipped_perf.poll_skip_spans, skipped_perf.poll_skip_memory_spans,
+            "no io shape exists in this program"
+        );
+        let baseline_perf = baseline.cpu.perf_counters();
+        assert_eq!(baseline_perf.poll_skip_memory_spans, 0);
+        assert_eq!(baseline_perf.poll_skip_spans, 0);
+        assert!(skipped_perf.instructions < baseline_perf.instructions);
+    }
+}
+
+/// Spec test 4 (IF=0): a masked-interrupt spin still skips, bounded by the
+/// ordinary batch cap, with no special-case branch. Identity against the
+/// sub-flag-off interpreter proves the bound is exactly the cap either way.
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_skip_commits_with_interrupts_masked() {
+    let cell_value = MEMORY_POLL_COMPARAND ^ 0x22;
+    let mut baseline = memory_poll_machine(true, false, false, MEMORY_POLL_CELL_DISP, cell_value);
+    let mut skipped = memory_poll_machine(true, true, false, MEMORY_POLL_CELL_DISP, cell_value);
+    for machine in [&mut baseline, &mut skipped] {
+        machine.cpu.registers.eflags &= !0x0200;
+    }
+    for _ in 0..4 {
+        let baseline_stop = baseline.run_cycles(100_000).unwrap();
+        let skipped_stop = skipped.run_cycles(100_000).unwrap();
+        assert_eq!(skipped_stop, baseline_stop);
+        assert_poll_machine_boundary_eq(&skipped, &baseline);
+    }
+    assert!(skipped.cpu.perf_counters().poll_skip_memory_spans > 0);
+    assert_eq!(skipped.cpu.registers.eflags & 0x0200, 0);
+}
+
+/// R6a at the executor level: warm the loop spinning, then bump the cell to
+/// the exit value (what the timer ISR does), re-enter at the head, and require
+/// the executor to DECLINE (no phantom bulk commit) so the interpreter runs
+/// the exit iteration with correct flags and clocks. Both senses.
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_executor_declines_at_the_head_when_about_to_exit() {
+    for jz in [false, true] {
+        let (spin_value, exit_value) = if jz {
+            (MEMORY_POLL_COMPARAND, MEMORY_POLL_COMPARAND ^ 0x40)
+        } else {
+            (MEMORY_POLL_COMPARAND ^ 0x40, MEMORY_POLL_COMPARAND)
+        };
+        let mut baseline = memory_poll_machine(true, false, jz, MEMORY_POLL_CELL_DISP, spin_value);
+        let mut skipped = memory_poll_machine(true, true, jz, MEMORY_POLL_CELL_DISP, spin_value);
+        for machine in [&mut baseline, &mut skipped] {
+            machine.run_cycles(2_000).unwrap();
+            let ds_base = machine.cpu.registers.segment(SegmentIndex::Ds).base;
+            machine.write_physical_u32(ds_base + MEMORY_POLL_CELL_DISP, exit_value);
+            machine.cpu.registers.eip = MEMORY_POLL_HEAD_EIP;
+            machine.cpu.poll_skip_backedge_housekeeping();
+            machine.cpu.reset_perf_counters();
+        }
+        let baseline_stop = baseline.run_until_halt_or_cycles(100_000).unwrap();
+        let skipped_stop = skipped.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(baseline_stop, StopReason::Halted, "jz={jz}");
+        assert_eq!(skipped_stop, baseline_stop, "jz={jz}");
+        assert_eq!(
+            skipped.cpu.perf_counters().poll_skip_memory_spans,
+            0,
+            "jz={jz}: an about-to-exit head must never bulk-commit"
+        );
+        assert_eq!(skipped.cpu.eflags(), baseline.cpu.eflags(), "jz={jz}");
+        assert_poll_machine_boundary_eq(&skipped, &baseline);
+    }
+}
+
+/// Spec test 3 (rewritten per R6): a polled cell resolving into the VGA
+/// aperture, reached through the real (unpaged-identity) translation, must be
+/// rejected by the memory certificate; the loop interprets identically.
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_skip_declines_for_an_mmio_polled_cell() {
+    let ds_base = 0x2000u32; // raw .COM DS base (asserted below)
+    let disp = 0x000a_0000 - ds_base;
+    let make = |sub_flag| {
+        let mut machine = memory_poll_machine(true, sub_flag, false, disp, 0);
+        assert_eq!(
+            machine.cpu.registers.segment(SegmentIndex::Ds).base,
+            ds_base
+        );
+        assert!(machine.set_vga_mode(0x13));
+        machine
+    };
+    let mut baseline = make(false);
+    let mut skipped = make(true);
+    for _ in 0..3 {
+        let baseline_stop = baseline.run_cycles(50_000).unwrap();
+        let skipped_stop = skipped.run_cycles(50_000).unwrap();
+        assert_eq!(skipped_stop, baseline_stop);
+        assert_poll_machine_boundary_eq(&skipped, &baseline);
+    }
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_memory_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+}
+
+/// Spec test 6 (rewritten per R6): a dword cell crossing a 4 KiB physical page
+/// boundary is rejected by the certificate's single-physical-page check.
+#[cfg(feature = "jit")]
+#[test]
+fn memory_poll_skip_declines_for_a_page_crossing_cell() {
+    // ds.base 0x2000 + 0x2ffe = linear 0x4ffe: bytes 0x4ffe..=0x5001 straddle
+    // the 0x5000 page boundary.
+    let disp = 0x2ffe;
+    let cell_value = MEMORY_POLL_COMPARAND ^ 0x3333;
+    let mut baseline = memory_poll_machine(true, false, false, disp, cell_value);
+    let mut skipped = memory_poll_machine(true, true, false, disp, cell_value);
+    for _ in 0..3 {
+        let baseline_stop = baseline.run_cycles(50_000).unwrap();
+        let skipped_stop = skipped.run_cycles(50_000).unwrap();
+        assert_eq!(skipped_stop, baseline_stop);
+        assert_poll_machine_boundary_eq(&skipped, &baseline);
+    }
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_memory_spans, 0);
+    assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
+}
+
+/// Spec test 5: SMC installing a memory-poll shape over a cached structural
+/// negative must be recognized after the rewrite (the warm-line re-inserts bump
+/// the page generation and retire the negative), mirroring
+/// `code_write_retires_negative_and_new_poll_is_recognized` for the io shapes.
+#[cfg(feature = "jit")]
+#[test]
+fn code_write_retires_negative_and_new_memory_poll_is_recognized() {
+    const HEAD: u32 = NON_POLL_HEAD_OFFSET;
+    let mut machine = warm_in_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.set_poll_skip_memory_enabled_for_test(true);
+    machine.cpu.registers.eip = HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_loop().is_none(),
+        "the non-poll head classifies as a negative"
+    );
+    assert!(machine.cpu.perf_counters().poll_neg_cache_stores >= 1);
+
+    // SMC: overwrite the head with the M1 memory-poll shape through the normal
+    // recorded write path. CMP EAX,[0x3000]; JNZ -8 (cell in plain RAM).
+    let mut shape = vec![0x3b, 0x05];
+    shape.extend_from_slice(&MEMORY_POLL_CELL_DISP.to_le_bytes());
+    shape.extend_from_slice(&[0x75, 0xf8]);
+    let base = machine.cpu.registers.cs().base;
+    for (offset, byte) in shape.iter().copied().enumerate() {
+        machine.write_physical_u8(base + HEAD + offset as u32, byte);
+    }
+    // Keep the loop spinning while re-warming (EAX != cell for JNZ).
+    let ds_base = machine.cpu.registers.segment(SegmentIndex::Ds).base;
+    machine.write_physical_u32(
+        ds_base + MEMORY_POLL_CELL_DISP,
+        MEMORY_POLL_COMPARAND ^ 0x77,
+    );
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        cpu.registers.set_eax(MEMORY_POLL_COMPARAND);
+        for offset in [0u32, 6] {
+            cpu.registers.eip = HEAD + offset;
+            cpu.poll_skip_backedge_housekeeping();
+            cpu.run_budgeted(bus, 0)
+                .expect("warm the new memory poll slot");
+        }
+    });
+
+    machine.cpu.registers.eip = HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    let poll = machine
+        .cpu
+        .poll_loop()
+        .expect("a stale negative suppressed a legitimate new memory poll shape");
+    assert_eq!(poll.family(), izarravm_cpu::PollFamily::Memory);
+}
+
+// --- R6b: paged translation fixtures ---
+//
+// Protected paged 586 with a flat CS/DS: PD at 0x1000 (PD[0] -> PT 0x2000),
+// identity PTEs for the low pages, and the polled cell's linear page 5
+// (0x5000) mapped NON-identically to frame 0x9000. Code at identity page 3.
+// IF stays clear (no IDT is installed).
+
+#[cfg(feature = "jit")]
+const PAGED_PD: u32 = 0x1000;
+#[cfg(feature = "jit")]
+const PAGED_PT: u32 = 0x2000;
+#[cfg(feature = "jit")]
+const PAGED_CODE: u32 = 0x3000;
+#[cfg(feature = "jit")]
+const PAGED_CELL_LINEAR: u32 = 0x5000;
+#[cfg(feature = "jit")]
+const PAGED_CELL_FRAME: u32 = 0x9000;
+#[cfg(feature = "jit")]
+const PAGED_HEAD: u32 = PAGED_CODE + 5;
+
+#[cfg(feature = "jit")]
+fn paged_memory_poll_machine(identity_alias_value: u32, mapped_frame_value: u32) -> Machine {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &[0xf4]).unwrap();
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = true;
+    machine.cpu.set_poll_skip_memory_enabled_for_test(true);
+    machine.trace.set_tracing_mode(TracingMode::Off);
+
+    machine.write_physical_u32(PAGED_PD, PAGED_PT | 7);
+    for page in 0u32..16 {
+        let pte = if page == PAGED_CELL_LINEAR >> 12 {
+            PAGED_CELL_FRAME | 7
+        } else {
+            (page << 12) | 7
+        };
+        machine.write_physical_u32(PAGED_PT + page * 4, pte);
+    }
+    // The TLB-eviction alias (linear page 5 + 64 shares TLB slot 5).
+    machine.write_physical_u32(PAGED_PT + (5 + 64) * 4, 0x6000 | 7);
+
+    let mut program = vec![0xb8];
+    program.extend_from_slice(&MEMORY_POLL_COMPARAND.to_le_bytes());
+    program.extend_from_slice(&[0x3b, 0x05]);
+    program.extend_from_slice(&PAGED_CELL_LINEAR.to_le_bytes());
+    program.extend_from_slice(&[0x75, 0xf8, 0xf4]);
+    for (offset, byte) in program.into_iter().enumerate() {
+        machine.write_physical_u8(PAGED_CODE + offset as u32, byte);
+    }
+    // TLB-eviction snippet at identity page 4: mov ebx,[alias]; hlt.
+    let alias_linear: u32 = (5 + 64) << 12;
+    let mut snippet = vec![0x8b, 0x1d];
+    snippet.extend_from_slice(&alias_linear.to_le_bytes());
+    snippet.push(0xf4);
+    for (offset, byte) in snippet.into_iter().enumerate() {
+        machine.write_physical_u8(0x4000 + offset as u32, byte);
+    }
+
+    machine.write_physical_u32(PAGED_CELL_LINEAR, identity_alias_value);
+    machine.write_physical_u32(PAGED_CELL_FRAME, mapped_frame_value);
+
+    machine.cpu.control.cr0 |= 0x8000_0001;
+    machine.cpu.control.cr3 = PAGED_PD;
+    machine
+        .cpu
+        .registers
+        .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0x08, 0x9b));
+    for segment in [
+        SegmentIndex::Ds,
+        SegmentIndex::Ss,
+        SegmentIndex::Es,
+        SegmentIndex::Fs,
+        SegmentIndex::Gs,
+    ] {
+        machine
+            .cpu
+            .registers
+            .set_segment(segment, SegmentRegister::flat(0x10, 0x93));
+    }
+    machine.cpu.registers.eflags &= !0x0200;
+    machine.cpu.registers.eip = PAGED_CODE;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine
+}
+
+#[cfg(feature = "jit")]
+fn warm_paged_memory_poll(machine: &mut Machine) {
+    with_cpu_and_bus(machine, |cpu, bus| {
+        // A budgeted run ends early while lines are still cold; several short
+        // runs spin the loop enough to warm every slot and the cell's TLB. A
+        // fixture whose cell starts at the exit value halts immediately; stop
+        // there (the head re-entry below still owns the classify state).
+        for _ in 0..8 {
+            let outcome = cpu.run_budgeted(bus, 500).expect("warm paged poll spin");
+            if outcome.halted {
+                cpu.halted = false;
+                break;
+            }
+        }
+    });
+    machine.cpu.registers.eip = PAGED_HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine.cpu.reset_perf_counters();
+}
+
+/// R6b (non-identity mapping): the certificate and the spin read must use the
+/// MAPPED physical frame, not the linear-identity alias. The alias holds the
+/// comparand (equal: a wrong linear-identity read would decline as
+/// about-to-exit) while the mapped frame differs (spinning), so a committed
+/// skip proves the correct physical was used end to end.
+#[cfg(feature = "jit")]
+#[test]
+fn paged_memory_poll_uses_the_mapped_physical_cell() {
+    let mut machine =
+        paged_memory_poll_machine(MEMORY_POLL_COMPARAND, MEMORY_POLL_COMPARAND ^ 0x5a5a);
+    warm_paged_memory_poll(&mut machine);
+    let charged = attempt_poll_skip(&mut machine, 0, 200_000);
+    assert!(
+        charged.is_some(),
+        "the mapped frame differs from the comparand, so the loop spins and must skip"
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_skip_memory_spans, 1);
+    assert!(machine.cpu.perf_counters().poll_skip_memory_iterations > 1);
+
+    // The inverse assignment: mapped frame equal (about to exit), identity
+    // alias different. A linear-identity read would wrongly see "spinning";
+    // the correct mapped read declines.
+    let mut machine =
+        paged_memory_poll_machine(MEMORY_POLL_COMPARAND ^ 0x5a5a, MEMORY_POLL_COMPARAND);
+    warm_paged_memory_poll(&mut machine);
+    assert!(
+        attempt_poll_skip(&mut machine, 0, 200_000).is_none(),
+        "the mapped frame equals the comparand, so the executor must decline"
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_skip_memory_spans, 0);
+}
+
+/// R6b (not-present decline): with the cell's PTE cleared and its TLB entry
+/// evicted, the probe declines with ZERO perturbation (CR2, elapsed clocks,
+/// trace clocks, timing remainder, and the PTE bytes are untouched), and the
+/// interpreted access then takes the #PF path (CR2 = the cell's linear).
+#[cfg(feature = "jit")]
+#[test]
+fn paged_memory_poll_declines_on_a_not_present_page_without_perturbation() {
+    let mut machine =
+        paged_memory_poll_machine(MEMORY_POLL_COMPARAND ^ 0x11, MEMORY_POLL_COMPARAND ^ 0x22);
+    warm_paged_memory_poll(&mut machine);
+
+    // Retire the mapping, then evict the stale TLB entry by touching the
+    // aliasing linear page (TLB slot 5) from the eviction snippet.
+    let cell_pte = PAGED_PT + (PAGED_CELL_LINEAR >> 12) * 4;
+    machine.write_physical_u32(cell_pte, 0);
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        cpu.registers.eip = 0x4000;
+        cpu.poll_skip_backedge_housekeeping();
+        cpu.run_budgeted(bus, 0).expect("evict the cell's TLB slot");
+        cpu.registers.eip = PAGED_HEAD;
+        cpu.poll_skip_backedge_housekeeping();
+    });
+    machine.cpu.reset_perf_counters();
+    // Not vacuous: the shape still classifies at the head; only the R2 probe
+    // (TLB miss for the cell's page) declines the executor.
+    assert!(machine.cpu.poll_loop().is_some());
+
+    const CR2_SENTINEL: u32 = 0xdead_0000;
+    machine.cpu.control.cr2 = CR2_SENTINEL;
+    let elapsed_before = machine.cpu.elapsed_clocks;
+    let rem_before = machine.cpu.poll_skip_timing_remainder();
+    let trace_before = machine.trace.elapsed_clocks();
+    let pde_before = machine.memory.read_u32(PAGED_PD as usize).unwrap();
+
+    assert!(
+        attempt_poll_skip(&mut machine, 0, 200_000).is_none(),
+        "a TLB-missing cell page must decline the skip"
+    );
+    assert_eq!(machine.cpu.control.cr2, CR2_SENTINEL, "decline set CR2");
+    assert_eq!(machine.cpu.elapsed_clocks, elapsed_before);
+    assert_eq!(machine.cpu.poll_skip_timing_remainder(), rem_before);
+    assert_eq!(machine.trace.elapsed_clocks(), trace_before);
+    assert_eq!(machine.memory.read_u32(cell_pte as usize).unwrap(), 0);
+    assert_eq!(
+        machine.memory.read_u32(PAGED_PD as usize).unwrap(),
+        pde_before,
+        "decline touched a page-walk entry"
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_skip_memory_spans, 0);
+
+    // The interpreted iteration then walks and takes the #PF path: CR2 is set
+    // to the cell's linear address by the real fault delivery.
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        let _ = cpu.run_budgeted(bus, 10_000);
+    });
+    assert_eq!(
+        machine.cpu.control.cr2, PAGED_CELL_LINEAR,
+        "the interpreted access must deliver the #PF for the cell"
+    );
+}
+
 #[test]
 fn ram_lookup_does_not_expose_partial_final_pages_as_full_pages() {
     let vega = Vega::default();

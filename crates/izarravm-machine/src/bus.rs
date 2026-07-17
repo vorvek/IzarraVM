@@ -281,12 +281,13 @@ impl RamWriteRecorder for RamWriteFootprint {
 }
 
 impl MachineBus<'_> {
-    /// Certify exact warm-RAM fetch and I/O costs for the classified poll loop.
+    /// The fetch-byte certification loop shared by every poll shape family:
+    /// certify each slot's warm-RAM fetch range (rejecting a BIOS-stub overlay
+    /// alias or any device-window byte) and sum the per-byte fetch cost.
+    /// Callers add their own family-specific addend (the io wait-state read or
+    /// the memory family's data-read cost) on top.
     #[cfg(feature = "jit")]
-    pub(super) fn poll_bus_certificate(&self, poll: PollLoop) -> Option<PollBusCertificate> {
-        if self.trace.tracing_mode() != TracingMode::Off || !self.lazy_port_reads {
-            return None;
-        }
+    fn poll_fetch_certificate_raw(&self, poll: PollLoop) -> Option<u64> {
         let mut raw = 0u64;
         for index in 0..poll.fetch_count() {
             let (linear, physical, len) = poll.fetch(index)?;
@@ -317,10 +318,75 @@ impl MachineBus<'_> {
                 self.cache.code_fetch_wait_states(),
             )))?;
         }
+        Some(raw)
+    }
+
+    /// Certify exact warm-RAM fetch and I/O costs for the classified io-family
+    /// poll loop. BYTE-IDENTICAL to the pre-memory-poll-shape behavior: this
+    /// function is never called for a memory-family `PollLoop` (the executor
+    /// dispatches on `family()` before certification), so its own logic and
+    /// order are unchanged.
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_bus_certificate(&self, poll: PollLoop) -> Option<PollBusCertificate> {
+        if self.trace.tracing_mode() != TracingMode::Off || !self.lazy_port_reads {
+            return None;
+        }
+        let mut raw = self.poll_fetch_certificate_raw(poll)?;
         raw = raw.checked_add(u64::from(BusCycle::clocks_for(
             BusWidth::Byte,
             self.wait_states.io,
         )))?;
+        Some(PollBusCertificate {
+            raw_clocks_per_iteration: raw,
+        })
+    }
+
+    /// Certify exact warm-RAM fetch and data-read costs for the classified
+    /// memory-family poll loop. `data_physical` is the polled cell's physical
+    /// address, already resolved through `CpuGsw::probe_linear_read_physical`
+    /// (R2: a TLB-hit-only, non-mutating probe run by the caller before this
+    /// certificate is built). This function then applies the SAME
+    /// `apply_a20` + `is_device_window` + single-physical-page checks the
+    /// fetch certificate already applies to every fetch byte, to the data
+    /// address, and adds one flat dword data-access charge
+    /// (`jit_data_cost_clocks`, the same model `charge_direct_memory`'s
+    /// direct-page hit uses).
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_memory_bus_certificate(
+        &self,
+        poll: PollLoop,
+        data_physical: u32,
+    ) -> Option<PollBusCertificate> {
+        if self.trace.tracing_mode() != TracingMode::Off {
+            return None;
+        }
+        let mut raw = self.poll_fetch_certificate_raw(poll)?;
+        let width = u32::from(poll.memory_cell_width()?);
+        if width == 0 {
+            return None;
+        }
+        // Single-physical-page requirement: the R2 probe translated only the
+        // first byte's page, so a range crossing a 4 KiB boundary has an
+        // unverified physical for its tail bytes. Reject it outright (the
+        // interpreter handles the split access correctly on its own).
+        if (data_physical & 0x0fff) + width > 0x1000 {
+            return None;
+        }
+        let last = data_physical.checked_add(width - 1)?;
+        let first_gated = self.apply_a20(data_physical);
+        let last_gated = self.apply_a20(last);
+        if last_gated != first_gated.checked_add(width - 1)?
+            || usize::try_from(last_gated).ok()? >= self.memory.len()
+        {
+            return None;
+        }
+        for offset in 0..width {
+            let address = first_gated.checked_add(offset)?;
+            if self.is_device_window(address, BusWidth::Byte) {
+                return None;
+            }
+        }
+        raw = raw.checked_add(self.jit_data_cost_clocks(BusWidth::Dword))?;
         Some(PollBusCertificate {
             raw_clocks_per_iteration: raw,
         })
@@ -353,6 +419,26 @@ impl MachineBus<'_> {
             .expect("projected poll bus clock addition must succeed");
         self.trace.add_elapsed_clocks(additional);
         self.vega.status1_side_effects();
+    }
+
+    /// Commit the certified aggregate clocks for a memory-family span. Unlike
+    /// `poll_commit_bus`, there is no port side effect to replay: the memory
+    /// shape never touches a device port.
+    #[cfg(feature = "jit")]
+    pub(super) fn poll_commit_memory_bus(
+        &mut self,
+        certificate: PollBusCertificate,
+        iterations: u64,
+    ) {
+        let additional = certificate
+            .raw_clocks_per_iteration
+            .checked_mul(iterations)
+            .expect("projected poll bus multiplication must succeed");
+        self.trace
+            .elapsed_clocks()
+            .checked_add(additional)
+            .expect("projected poll bus clock addition must succeed");
+        self.trace.add_elapsed_clocks(additional);
     }
 
     fn record_pending_device_memory_write(&mut self, physical: u32, width: u32) {
