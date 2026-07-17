@@ -12,6 +12,9 @@ struct BenchRun {
     wall: std::time::Duration,
     /// Host-side perf counters for this run (decode-cache + straight-line diagnostics).
     perf: PerfCounters,
+    /// Memory-poll subset, stored outside PerfCounters on the CPU (layout
+    /// preservation; see PollSkipMemoryCounters) and captured here alongside.
+    poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
     machine_profile: MachineHostProfileSnapshot,
     cpu_profile: CpuProfileSnapshot,
 }
@@ -84,6 +87,7 @@ fn run_bench_one_profiled(
         aux: machine.bench_aux(),
         wall,
         perf,
+        poll_skip_memory: machine.cpu().poll_skip_memory(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
     })
@@ -927,14 +931,17 @@ fn write_profile_json(
                 "register_samples": opcode.register_samples,
                 "memory_samples": opcode.memory_samples,
             })).collect::<Vec<_>>(),
-            "perf": perf_counters_json(&profiled.perf),
+            "perf": perf_counters_json(&profiled.perf, profiled.poll_skip_memory),
         },
     });
     std::fs::write(json_path, serde_json::to_string_pretty(&report)?)?;
     Ok(())
 }
 
-pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
+pub(super) fn perf_counters_json(
+    perf: &PerfCounters,
+    poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
+) -> serde_json::Value {
     json!({
         "instructions": perf.instructions,
         "decode_misses": perf.decode_misses,
@@ -950,8 +957,8 @@ pub(super) fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
         "poll_neg_cache_stores": perf.poll_neg_cache_stores,
         "poll_neg_cache_volatile": perf.poll_neg_cache_volatile,
         "poll_head_prefilter_rejects": perf.poll_head_prefilter_rejects,
-        "poll_skip_memory_spans": perf.poll_skip_memory_spans,
-        "poll_skip_memory_iterations": perf.poll_skip_memory_iterations,
+        "poll_skip_memory_spans": poll_skip_memory.spans,
+        "poll_skip_memory_iterations": poll_skip_memory.iterations,
         "code_invalidations": perf.code_invalidations,
         "data_direct_reads": perf.data_direct_reads,
         "data_slow_reads": perf.data_slow_reads,

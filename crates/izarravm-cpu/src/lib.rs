@@ -633,11 +633,6 @@ pub struct PerfCounters {
     /// 16-bit code, or an opcode no certified shape slot can carry) before
     /// any scan or cache probe. Counts regardless of the cache switch.
     pub poll_head_prefilter_rejects: u64,
-    /// Subset of `poll_skip_spans`/`poll_skip_iterations` attributable to the
-    /// memory-poll shape family (M1: CMP EAX,DS:[disp32]; Jcc back to entry),
-    /// bumped alongside the general totals in `commit_poll_skip_core`.
-    pub poll_skip_memory_spans: u64,
-    pub poll_skip_memory_iterations: u64,
     pub jit_direct_reject_mode_key: u64,
     pub jit_direct_reject_x87_top: u64,
     pub jit_direct_reject_cs_layout: u64,
@@ -878,6 +873,29 @@ impl PartialEq for PerfCounters {
     }
 }
 impl Eq for PerfCounters {}
+
+/// Subset of `poll_skip_spans`/`poll_skip_iterations` attributable to the
+/// memory-poll shape family (M1: CMP r32,DS:[disp32]; Jcc back to entry),
+/// bumped alongside the general totals in `commit_poll_skip_core`. Kept OUT
+/// of `PerfCounters` and at the very tail of `CpuGsw` so no pre-existing
+/// field offset moves (growing `PerfCounters` shifted the hot `pending_flags`
+/// field and cost the interpreter measurable wall time; the offset pin in
+/// cpu_test.rs guards 4440). Serialized into the same perf JSON keys by
+/// `perf_counters_json`. Unconditional (not cfg jit) like the other poll
+/// counters in `PerfCounters`, so non-jit consumers can name the type.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollSkipMemoryCounters {
+    pub spans: u64,
+    pub iterations: u64,
+}
+
+impl PartialEq for PollSkipMemoryCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PollSkipMemoryCounters {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
@@ -1168,6 +1186,12 @@ pub struct CpuGsw {
     /// the frame's own CS is loaded, which must not be mistaken for the CPL the pushes
     /// execute under).
     cpl: u8,
+    /// Memory-poll skip counters, deliberately the LAST field: adding them to
+    /// `PerfCounters` (declared far above) shifted every later CpuGsw field,
+    /// moving the hot `pending_flags` off its pinned 4440 and costing the
+    /// interpreter measurable wall time. At the tail they change only the
+    /// struct's total size. See `PollSkipMemoryCounters`.
+    poll_skip_memory: PollSkipMemoryCounters,
 }
 
 impl Default for CpuGsw {
@@ -1226,6 +1250,7 @@ impl Default for CpuGsw {
             #[cfg(feature = "jit")]
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
+            poll_skip_memory: PollSkipMemoryCounters::default(),
         }
     }
 }

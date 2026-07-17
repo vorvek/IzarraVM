@@ -1732,20 +1732,22 @@ fn memory_poll_skip_matches_the_interpreter_at_batch_boundaries() {
             assert_eq!(skipped_stop, baseline_stop, "jz={jz} boundary={boundary}");
             assert_poll_machine_boundary_eq(&skipped, &baseline);
         }
-        let skipped_perf = skipped.cpu.perf_counters();
+        let skipped_memory = skipped.cpu.poll_skip_memory();
         assert!(
-            skipped_perf.poll_skip_memory_spans > 0,
+            skipped_memory.spans > 0,
             "jz={jz}: the memory shape must have committed spans"
         );
-        assert!(skipped_perf.poll_skip_memory_iterations > 1);
+        assert!(skipped_memory.iterations > 1);
         assert_eq!(
-            skipped_perf.poll_skip_spans, skipped_perf.poll_skip_memory_spans,
+            skipped.cpu.perf_counters().poll_skip_spans,
+            skipped_memory.spans,
             "no io shape exists in this program"
         );
-        let baseline_perf = baseline.cpu.perf_counters();
-        assert_eq!(baseline_perf.poll_skip_memory_spans, 0);
-        assert_eq!(baseline_perf.poll_skip_spans, 0);
-        assert!(skipped_perf.instructions < baseline_perf.instructions);
+        assert_eq!(baseline.cpu.poll_skip_memory().spans, 0);
+        assert_eq!(baseline.cpu.perf_counters().poll_skip_spans, 0);
+        assert!(
+            skipped.cpu.perf_counters().instructions < baseline.cpu.perf_counters().instructions
+        );
     }
 }
 
@@ -1767,7 +1769,7 @@ fn memory_poll_skip_commits_with_interrupts_masked() {
         assert_eq!(skipped_stop, baseline_stop);
         assert_poll_machine_boundary_eq(&skipped, &baseline);
     }
-    assert!(skipped.cpu.perf_counters().poll_skip_memory_spans > 0);
+    assert!(skipped.cpu.poll_skip_memory().spans > 0);
     assert_eq!(skipped.cpu.registers.eflags & 0x0200, 0);
 }
 
@@ -1799,7 +1801,7 @@ fn memory_poll_executor_declines_at_the_head_when_about_to_exit() {
         assert_eq!(baseline_stop, StopReason::Halted, "jz={jz}");
         assert_eq!(skipped_stop, baseline_stop, "jz={jz}");
         assert_eq!(
-            skipped.cpu.perf_counters().poll_skip_memory_spans,
+            skipped.cpu.poll_skip_memory().spans,
             0,
             "jz={jz}: an about-to-exit head must never bulk-commit"
         );
@@ -1833,7 +1835,7 @@ fn memory_poll_skip_declines_for_an_mmio_polled_cell() {
         assert_eq!(skipped_stop, baseline_stop);
         assert_poll_machine_boundary_eq(&skipped, &baseline);
     }
-    assert_eq!(skipped.cpu.perf_counters().poll_skip_memory_spans, 0);
+    assert_eq!(skipped.cpu.poll_skip_memory().spans, 0);
     assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
 }
 
@@ -1854,7 +1856,7 @@ fn memory_poll_skip_declines_for_a_page_crossing_cell() {
         assert_eq!(skipped_stop, baseline_stop);
         assert_poll_machine_boundary_eq(&skipped, &baseline);
     }
-    assert_eq!(skipped.cpu.perf_counters().poll_skip_memory_spans, 0);
+    assert_eq!(skipped.cpu.poll_skip_memory().spans, 0);
     assert_eq!(skipped.cpu.perf_counters().poll_skip_spans, 0);
 }
 
@@ -2033,8 +2035,8 @@ fn paged_memory_poll_uses_the_mapped_physical_cell() {
         charged.is_some(),
         "the mapped frame differs from the comparand, so the loop spins and must skip"
     );
-    assert_eq!(machine.cpu.perf_counters().poll_skip_memory_spans, 1);
-    assert!(machine.cpu.perf_counters().poll_skip_memory_iterations > 1);
+    assert_eq!(machine.cpu.poll_skip_memory().spans, 1);
+    assert!(machine.cpu.poll_skip_memory().iterations > 1);
 
     // The inverse assignment: mapped frame equal (about to exit), identity
     // alias different. A linear-identity read would wrongly see "spinning";
@@ -2046,7 +2048,7 @@ fn paged_memory_poll_uses_the_mapped_physical_cell() {
         attempt_poll_skip(&mut machine, 0, 200_000).is_none(),
         "the mapped frame equals the comparand, so the executor must decline"
     );
-    assert_eq!(machine.cpu.perf_counters().poll_skip_memory_spans, 0);
+    assert_eq!(machine.cpu.poll_skip_memory().spans, 0);
 }
 
 /// R6b (not-present decline): with the cell's PTE cleared and its TLB entry
@@ -2097,7 +2099,7 @@ fn paged_memory_poll_declines_on_a_not_present_page_without_perturbation() {
         pde_before,
         "decline touched a page-walk entry"
     );
-    assert_eq!(machine.cpu.perf_counters().poll_skip_memory_spans, 0);
+    assert_eq!(machine.cpu.poll_skip_memory().spans, 0);
 
     // The interpreted iteration then walks and takes the #PF path: CR2 is set
     // to the cell's linear address by the real fault delivery.

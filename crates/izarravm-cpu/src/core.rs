@@ -593,13 +593,22 @@ impl CpuGsw {
 
     /// Host-side performance counters accumulated since construction or the last
     /// `reset_perf_counters`. Diagnostics for `--headless-bench`; not architectural state.
+    /// The memory-poll skip counter subset (stored outside `PerfCounters`;
+    /// see `PollSkipMemoryCounters` for why). Reset alongside the other
+    /// counters by `reset_perf_counters`.
+    pub fn poll_skip_memory(&self) -> PollSkipMemoryCounters {
+        self.poll_skip_memory
+    }
+
     pub fn perf_counters(&self) -> &PerfCounters {
         &self.perf
     }
 
-    /// Zero the host-side performance counters.
+    /// Zero the host-side performance counters, including the memory-poll
+    /// subset stored outside `PerfCounters` (see `PollSkipMemoryCounters`).
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
+        self.poll_skip_memory = PollSkipMemoryCounters::default();
     }
 
     #[cfg(feature = "jit")]
@@ -638,11 +647,9 @@ impl CpuGsw {
         self.perf.poll_skip_spans = self.perf.poll_skip_spans.saturating_add(1);
         self.perf.poll_skip_iterations = self.perf.poll_skip_iterations.saturating_add(iterations);
         if poll.family() == crate::PollFamily::Memory {
-            self.perf.poll_skip_memory_spans = self.perf.poll_skip_memory_spans.saturating_add(1);
-            self.perf.poll_skip_memory_iterations = self
-                .perf
-                .poll_skip_memory_iterations
-                .saturating_add(iterations);
+            self.poll_skip_memory.spans = self.poll_skip_memory.spans.saturating_add(1);
+            self.poll_skip_memory.iterations =
+                self.poll_skip_memory.iterations.saturating_add(iterations);
         }
         Some(charged)
     }
