@@ -22,14 +22,17 @@ pub(super) fn jit_auto_admit_default(backend: ExecutionBackend) -> bool {
     )
 }
 
+// Poll skipping defaults on for the interpreter backend; it is never engaged on any
+// other backend regardless of the env var.
 #[cfg(feature = "jit")]
 pub(super) fn poll_skip_policy(value: Option<&str>, backend: ExecutionBackend) -> bool {
     backend == ExecutionBackend::Interpreter && poll_skip_requested(value)
 }
 
+// Default on: unset means enabled. "0" or empty explicitly disables it.
 #[cfg(feature = "jit")]
 fn poll_skip_requested(value: Option<&str>) -> bool {
-    !matches!(value, None | Some("" | "0"))
+    !matches!(value, Some("" | "0"))
 }
 
 #[cfg(feature = "jit")]
@@ -68,11 +71,14 @@ pub(super) struct PollSkipDiagnostics {
 impl PollSkipDiagnostics {
     pub(super) fn new(backend: ExecutionBackend) -> Self {
         let requested_value = std::env::var("IZARRAVM_POLL_SKIP").ok();
-        let requested = poll_skip_requested(requested_value.as_deref());
+        let explicitly_requested = matches!(
+            requested_value.as_deref(),
+            Some(v) if !matches!(v, "" | "0")
+        );
         let enabled = std::env::var("IZARRAVM_POLL_SKIP_DIAG")
             .ok()
             .is_some_and(|value| !matches!(value.as_str(), "" | "0"));
-        let backend_rejected = requested && backend != ExecutionBackend::Interpreter;
+        let backend_rejected = explicitly_requested && backend != ExecutionBackend::Interpreter;
         if backend_rejected {
             eprintln!(
                 "IZARRAVM_POLL_SKIP requested with a non-interpreter backend; poll skipping is disabled"
@@ -790,7 +796,7 @@ impl Machine {
                             // The CPU resets its run-scoped offset before the first
                             // real instruction. Poll projection happens before that
                             // public call, so canonicalize the matching bus scratch
-                            // only inside the opt-in path.
+                            // only inside the poll-skip-enabled path.
                             bus.core_clocks_so_far = 0;
                             let poll = classify_poll_skip_boundary(cpu, poll_skip_diagnostics);
                             let align = poll.is_some_and(|poll| !poll.at_head());

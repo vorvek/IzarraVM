@@ -56,10 +56,9 @@ fn jit_auto_admission_policy_defaults_on_only_when_available() {
 
 #[cfg(feature = "jit")]
 #[test]
-fn poll_skip_policy_is_opt_in_and_interpreter_only() {
-    for value in [None, Some(""), Some("0")] {
-        assert!(!run::poll_skip_policy(value, ExecutionBackend::Interpreter));
-    }
+fn poll_skip_policy_is_default_on_and_interpreter_only() {
+    // Default on for the interpreter; "0" or empty disables; never on elsewhere.
+    assert!(run::poll_skip_policy(None, ExecutionBackend::Interpreter));
     assert!(run::poll_skip_policy(
         Some("1"),
         ExecutionBackend::Interpreter
@@ -68,6 +67,15 @@ fn poll_skip_policy_is_opt_in_and_interpreter_only() {
         Some("yes"),
         ExecutionBackend::Interpreter
     ));
+    assert!(!run::poll_skip_policy(
+        Some("0"),
+        ExecutionBackend::Interpreter
+    ));
+    assert!(!run::poll_skip_policy(
+        Some(""),
+        ExecutionBackend::Interpreter
+    ));
+    assert!(!run::poll_skip_policy(None, ExecutionBackend::Automatic));
     assert!(!run::poll_skip_policy(
         Some("1"),
         ExecutionBackend::Automatic
