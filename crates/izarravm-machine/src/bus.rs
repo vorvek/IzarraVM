@@ -2077,7 +2077,9 @@ impl MachineBus<'_> {
     /// effect, so it sits at the one CPU bus seam and covers fetches and data
     /// alike. Host-side pokes (write_physical_u8 and friends) deliberately bypass
     /// it: they address exact physical cells, not the guest's gated bus.
-    fn apply_a20(&self, address: u32) -> u32 {
+    /// pub(super) so the memory-poll executor's spin read gates the certified
+    /// physical exactly like the certificate and the interpreter do.
+    pub(super) fn apply_a20(&self, address: u32) -> u32 {
         if self.keyboard.a20_enabled() {
             address
         } else {

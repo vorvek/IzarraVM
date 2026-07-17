@@ -485,6 +485,26 @@ function Invoke-RealtimeGateSelfTest {
     Assert-SelfTestThrows {
         Get-PollSkipExecutionPolicy "wrong"
     } "Unknown POLL-SKIP"
+    # Memory-marginal scope: both roles pin IZARRAVM_POLL_SKIP=1 and differ
+    # only in the memory sub-flag. The lowercase spelling must also resolve
+    # (the gate parameter binds case-insensitively).
+    foreach ($scopeSpelling in @("Memory", "memory")) {
+        $memoryOffPolicy = Get-PollSkipExecutionPolicy "skip_off" $scopeSpelling
+        $memoryOnPolicy = Get-PollSkipExecutionPolicy "skip_on" $scopeSpelling
+        if ($memoryOffPolicy.cli -cne "--interpreter" -or
+            $memoryOnPolicy.cli -cne "--interpreter" -or
+            $memoryOffPolicy.environment.IZARRAVM_JIT -cne "0" -or
+            $memoryOnPolicy.environment.IZARRAVM_JIT -cne "0" -or
+            $memoryOffPolicy.environment.IZARRAVM_POLL_SKIP -cne "1" -or
+            $memoryOnPolicy.environment.IZARRAVM_POLL_SKIP -cne "1" -or
+            $memoryOffPolicy.environment.IZARRAVM_POLL_SKIP_MEMORY -cne "0" -or
+            $memoryOnPolicy.environment.IZARRAVM_POLL_SKIP_MEMORY -cne "1") {
+            throw "Memory-scope POLL-SKIP role policies ($scopeSpelling) are wrong."
+        }
+    }
+    Assert-SelfTestThrows {
+        Get-PollSkipExecutionPolicy "skip_on" "wrong"
+    } "Unknown POLL-SKIP comparison scope"
     if ((Get-PollSkipWarmupOrder) -join "," -cne "skip_off,skip_on") {
         throw "POLL-SKIP warmups are not fixed to skip_off then skip_on."
     }
@@ -1796,6 +1816,60 @@ function Invoke-RealtimeGateSelfTest {
     Assert-SelfTestThrows {
         Assert-PollSkipSample $disabledOnSample "skip_on" "warmup" $pollPolicy
     } "positive POLL-SKIP counters"
+
+    # Memory-marginal scope samples: gate_poll_skip is "1" in BOTH roles, the
+    # gate_poll_skip_memory key carries the role, the io counters stay
+    # positive everywhere, and the memory subset counters carry the
+    # zero/positive role distinction.
+    $newMemoryScopeSample = {
+        param([string]$Role)
+        $memoryOn = $Role -ceq "skip_on"
+        $sample = & $newPollSample $Role "warmup" 1.0
+        $sample.gate_poll_skip = "1"
+        $sample | Add-Member -NotePropertyName gate_poll_skip_memory `
+            -NotePropertyValue $(if ($memoryOn) { "1" } else { "0" })
+        $sample.perf.poll_skip_spans = [uint64]5
+        $sample.perf.poll_skip_iterations = [uint64]100
+        $sample.perf | Add-Member -NotePropertyName poll_skip_memory_spans `
+            -NotePropertyValue $(if ($memoryOn) { [uint64]3 } else { [uint64]0 })
+        $sample.perf | Add-Member -NotePropertyName poll_skip_memory_iterations `
+            -NotePropertyValue $(if ($memoryOn) { [uint64]60 } else { [uint64]0 })
+        return $sample
+    }
+    foreach ($role in @("skip_off", "skip_on")) {
+        Assert-PollSkipSample (& $newMemoryScopeSample $role) `
+            $role "warmup" $pollPolicy "Memory"
+    }
+    $memoryScopeFailureCases = [ordered]@{
+        missing_metadata_key = @("skip_off", "memory sub-flag policy", {
+            param($sample) $sample.PSObject.Properties.Remove("gate_poll_skip_memory")
+        })
+        wrong_sub_flag = @("skip_off", "memory sub-flag policy", {
+            param($sample) $sample.gate_poll_skip_memory = "1"
+        })
+        missing_memory_counters = @("skip_on", "POLL-SKIP memory counters are missing", {
+            param($sample) $sample.perf.PSObject.Properties.Remove("poll_skip_memory_spans")
+        })
+        skip_off_memory_counter = @("skip_off", "nonzero POLL-SKIP memory counters", {
+            param($sample) $sample.perf.poll_skip_memory_spans = 1
+        })
+        skip_on_memory_counter = @("skip_on", "positive POLL-SKIP memory counters", {
+            param($sample) $sample.perf.poll_skip_memory_iterations = 0
+        })
+    }
+    foreach ($case in $memoryScopeFailureCases.GetEnumerator()) {
+        $role = $case.Value[0]
+        $sample = & $newMemoryScopeSample $role
+        & $case.Value[2] $sample
+        Assert-SelfTestThrows {
+            Assert-PollSkipSample $sample $role "warmup" $pollPolicy "Memory"
+        } $case.Value[1]
+    }
+    # A Combined-scope sample must not carry or require the memory key.
+    $combinedSample = $pollComparison.warmups.skip_on[0]
+    if ($null -ne $combinedSample.PSObject.Properties["gate_poll_skip_memory"]) {
+        throw "A Combined-scope sample unexpectedly carries gate_poll_skip_memory."
+    }
     foreach ($field in @("instructions", "poll_skip_spans", "poll_skip_iterations")) {
         $drift = $pollComparison.skip_on[0] |
             ConvertTo-Json -Depth 12 | ConvertFrom-Json

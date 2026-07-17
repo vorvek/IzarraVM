@@ -153,7 +153,7 @@ function Get-PollSkipExecutionPolicy([string]$Role, [string]$Scope = "Combined")
     if ($Role -notin @("skip_off", "skip_on")) {
         throw "Unknown POLL-SKIP comparison role '$Role'."
     }
-    if ($Scope -ceq "Memory") {
+    if ($Scope -ieq "Memory") {
         # Memory-marginal comparison: both roles run with the io family active
         # (IZARRAVM_POLL_SKIP=1) and differ only in the memory-shape sub-flag,
         # isolating the memory family's own contribution on top of v1.
@@ -168,7 +168,7 @@ function Get-PollSkipExecutionPolicy([string]$Role, [string]$Scope = "Combined")
             }
         }
     }
-    if ($Scope -cne "Combined") {
+    if ($Scope -ine "Combined") {
         throw "Unknown POLL-SKIP comparison scope '$Scope'."
     }
     $pollSkip = if ($Role -ceq "skip_on") { "1" } else { "0" }
@@ -265,7 +265,7 @@ function Get-PollSkipSampleFailureReasons(
     if ($null -eq $Sample.perf.PSObject.Properties["poll_skip_spans"] -or
         $null -eq $Sample.perf.PSObject.Properties["poll_skip_iterations"]) {
         $reasons += "POLL-SKIP counters are missing"
-    } elseif ($Scope -ceq "Memory") {
+    } elseif ($Scope -ieq "Memory") {
         # Memory-marginal scope: the io family is active in BOTH roles, so the
         # aggregate counters stay positive everywhere and the memory subset
         # counters carry the role distinction.

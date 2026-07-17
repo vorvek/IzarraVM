@@ -401,7 +401,10 @@ fn try_poll_skip_memory(
     // read (never CpuBus::read_memory/read_memory_direct/charge_direct_memory,
     // which all record trace clocks and would break timing identity), then
     // require the loop to actually be spinning before committing anything.
-    let cell_value = bus.memory.read_u32(physical as usize).ok()?;
+    // The read uses the A20-gated physical so it agrees with both the
+    // certificate's checks and the interpreter's own access (identity today:
+    // the M1 shape requires 32-bit code, where A20 is open in practice).
+    let cell_value = bus.memory.read_u32(bus.apply_a20(physical) as usize).ok()?;
     let comparand = poll.memory_comparand(cpu)?;
     if !poll.memory_spin_predicate(cell_value, comparand)? {
         diagnostics.memory_spin_rejection();

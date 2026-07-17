@@ -1106,6 +1106,13 @@ if (-not $PollSkipComparison -and
     $PSBoundParameters.ContainsKey("PollSkipComparisonScope")) {
     throw "PollSkipComparisonScope is only valid with PollSkipComparison."
 }
+# ValidateSet binds case-insensitively but preserves the caller's casing;
+# normalize once so the scope-sensitive policy helpers see the canonical name.
+$PollSkipComparisonScope = if ($PollSkipComparisonScope -ieq "Memory") {
+    "Memory"
+} else {
+    "Combined"
+}
 if ($PollSkipComparison) {
     Assert-PollSkipComparisonMode `
         ([bool]$BackendBakeoff) ([bool]$TrackMComparison) ([bool]$ReportOnly) `
