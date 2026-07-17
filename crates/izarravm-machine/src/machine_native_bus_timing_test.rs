@@ -111,14 +111,18 @@ fn poll_skip_matches_the_interpreter_at_batch_boundaries() {
                 skipped_stop, baseline_stop,
                 "mode={mode:?} mask={mask:#04x}"
             );
+            // poll_loop now borrows &mut, so materialize the diagnostic before the
+            // assert rather than inside its format args (which hold the other &self
+            // borrows). Its only effect is host bookkeeping, invisible to every
+            // field assert_poll_machine_boundary_eq compares.
+            let loop_diag = skipped.cpu.poll_loop();
             assert!(
                 skipped.cpu.perf_counters().poll_skip_spans > 0,
-                "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={:?}",
+                "mode={mode:?} mask={mask:#04x} eip={:08x} linear={:08x} dx={:04x} eligible={} loop={loop_diag:?}",
                 skipped.cpu.registers.eip,
                 skipped.cpu.linear_eip(),
                 skipped.cpu.registers.edx() as u16,
                 skipped.cpu.poll_skip_eligible(),
-                skipped.cpu.poll_loop()
             );
             assert!(skipped.cpu.perf_counters().poll_skip_iterations > 1);
             assert!(
@@ -365,8 +369,71 @@ fn attempt_poll_skip(machine: &mut Machine, batch_core: u32, cap: u64) -> Option
     with_cpu_and_bus(machine, |cpu, bus| {
         bus.prior_runs_core_clocks = u64::from(batch_core);
         bus.core_clocks_so_far = 0;
-        run::try_poll_skip(cpu, bus, &mut diagnostics, batch_core, cap)
+        let poll = run::classify_poll_skip_boundary(cpu, &mut diagnostics)?;
+        run::try_poll_skip(cpu, bus, &mut diagnostics, poll, batch_core, cap)
     })
+}
+
+#[cfg(feature = "jit")]
+fn assert_poll_skip_classifier_case(
+    machine: &mut Machine,
+    expected_buckets: [u64; 4],
+    expected_rejections: u64,
+    expected_structural_hits: u64,
+) {
+    machine.poll_skip_diagnostics.enable_for_test();
+    assert_eq!(
+        machine.run_cycles(1).expect("one bounded run boundary"),
+        StopReason::CycleLimit { requested: 1 }
+    );
+    let diagnostics = &machine.poll_skip_diagnostics;
+    let (calls, buckets) = diagnostics.classifier_accounting();
+    assert_eq!(calls, 1);
+    assert_eq!(buckets, expected_buckets);
+    assert_eq!(buckets.into_iter().sum::<u64>(), calls);
+    assert_eq!(
+        diagnostics.admission_accounting(),
+        (expected_rejections, expected_structural_hits)
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_run_source_has_one_classifier_call_site() {
+    let source = include_str!("run.rs");
+    assert_eq!(
+        source.matches(".poll_loop()").count(),
+        1,
+        "run.rs must classify only through classify_poll_skip_boundary"
+    );
+    assert!(source.contains("let poll = cpu.poll_loop();"));
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_skip_run_boundary_classifies_once_with_distinct_admission_semantics() {
+    let mut ineligible =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw386, 0x08, true);
+    assert_poll_skip_classifier_case(&mut ineligible, [1, 0, 0, 0], 1, 0);
+
+    let mut structural_miss =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw486, 0x08, true);
+    assert_poll_skip_classifier_case(&mut structural_miss, [0, 1, 0, 0], 0, 0);
+
+    let mut non_head =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw486, 0x08, true);
+    prepare_setup_poll_head(&mut non_head, false, false, 0x1234_03da, 0x08, true);
+    with_cpu_and_bus(&mut non_head, |cpu, _| {
+        cpu.registers.set_edx(0x03da);
+        cpu.registers.eip = 0x10f;
+        cpu.poll_skip_backedge_housekeeping();
+    });
+    assert_poll_skip_classifier_case(&mut non_head, [0, 0, 1, 0], 0, 0);
+
+    let mut head =
+        setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw486, 0x08, true);
+    prepare_setup_poll_head(&mut head, false, false, 0x1234_03da, 0x08, true);
+    assert_poll_skip_classifier_case(&mut head, [0, 0, 0, 1], 0, 1);
 }
 
 #[cfg(feature = "jit")]
@@ -517,11 +584,12 @@ fn poll_skip_edge_is_strict_and_the_reserved_final_iteration_runs_real() {
     let (charged, retired, final_eip) = with_cpu_and_bus(&mut after, |cpu, bus| {
         bus.prior_runs_core_clocks = 0;
         bus.core_clocks_so_far = 0;
-        let poll = cpu.poll_loop().expect("warm poll before bulk commit");
+        let poll = run::classify_poll_skip_boundary(cpu, &mut diagnostics)
+            .expect("warm poll before bulk commit");
         let certificate = bus
             .poll_bus_certificate(poll)
             .expect("RAM poll certificate before bulk commit");
-        let charged = run::try_poll_skip(cpu, bus, &mut diagnostics, 0, cap)
+        let charged = run::try_poll_skip(cpu, bus, &mut diagnostics, poll, 0, cap)
             .expect("edge one dot after the bulk boundary admits K");
         assert_eq!(cpu.perf_counters().poll_skip_iterations, K);
 
@@ -728,6 +796,278 @@ fn natural_event_caps_eventually_offer_a_poll_loop_head() {
         "32 natural caps never offered IN at a warm loop head; final eip={:08x}",
         machine.cpu.registers.eip
     );
+}
+
+// Program offset of the self-loop head warmed by the non-poll machine helpers.
+// It is the .COM origin, so its linear (CS.base + this) is also its physical byte
+// in real mode, which the SMC test in `code_write_retires_negative...` relies on.
+#[cfg(feature = "jit")]
+const NON_POLL_HEAD_OFFSET: u32 = 0x100;
+
+// Warm a 32-bit self-loop whose head matches no certified poll shape, so
+// classifying it is a cacheable structural negative. `poll_skip` stays off so
+// warming never classifies: the tests own the first scan. The caller picks the
+// loop body so the head opcode lands on either side of the loop-head prefilter.
+#[cfg(feature = "jit")]
+fn warm_non_poll_loop_machine(program: &[u8]) -> Machine {
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, program).unwrap();
+    let mut cs = machine.cpu.registers.cs();
+    cs.default_size_32 = true;
+    machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = false;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine.run_cycles(1_000).unwrap();
+    machine
+}
+
+// A warm `mov edx,ebx; mov eax,ebx; jmp head` loop. This builds a 3-slot
+// [0x89, 0x89, 0xEB] is_loop block that matches no certified poll shape, so the
+// scan records a cacheable structural negative. The head opcode 0x89 is inside
+// the loop-head prefilter set, so the boundary reaches the scan rather than being
+// rejected up front. Reused by the negative-cache hit and SMC-retire tests, which
+// need a warm non-poll loop whose head clears the prefilter.
+#[cfg(feature = "jit")]
+fn warm_in_set_non_poll_machine() -> Machine {
+    warm_non_poll_loop_machine(&[
+        0x89, 0xda, // mov edx, ebx  (0x89 in set)
+        0x89, 0xd8, // mov eax, ebx  (0x89 in set)
+        0xeb, 0xfa, // jmp -6 back to the head
+    ])
+}
+
+// A warm `inc eax; inc eax; jmp head` loop. The head opcode 0x40 is outside the
+// loop-head prefilter set, so the prefilter rejects the boundary before any scan
+// or cache probe. Used by the prefilter-reject tests.
+#[cfg(feature = "jit")]
+fn warm_out_of_set_non_poll_machine() -> Machine {
+    warm_non_poll_loop_machine(&[
+        0x40, // inc eax
+        0x40, // inc eax
+        0xeb, 0xfc, // jmp -4 back to the head
+    ])
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn poll_negative_cache_answers_repeat_scans() {
+    // A structural (code-byte-only) negative is recorded on the first scan and
+    // answered from the page-generation cache on the next scan at the same
+    // linear, without a second full backward scan.
+    let mut machine = warm_in_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.reset_perf_counters();
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(machine.cpu.perf_counters().poll_head_prefilter_rejects, 0);
+    let stores = machine.cpu.perf_counters().poll_neg_cache_stores;
+    let hits = machine.cpu.perf_counters().poll_neg_cache_hits;
+    assert!(stores >= 1, "the first scan records a structural negative");
+
+    // Same linear, no code write in between, so the live negative answers it.
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_neg_cache_stores,
+        stores,
+        "the repeat scan is answered from the cache, not re-recorded"
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_neg_cache_hits, hits + 1);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn edx_dependent_negative_is_not_cached() {
+    // The 3-slot direct shape (IN AL,DX; TEST AL,imm8; Jcc back) is structural,
+    // but its port comes from live EDX. A non-3DA EDX is a volatile negative that
+    // must never be cached, because the same bytes classify as a poll the moment
+    // EDX addresses the 3DA status port.
+    let mut machine = poll_skip_test_machine(false, TracingMode::Off, GswMode::Gsw586, 0x08);
+    machine.run_cycles(1_000).unwrap();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.reset_perf_counters();
+
+    // Head of the warm 3-slot phase, with EDX not pointing at the 3DA port.
+    machine.cpu.registers.set_edx(0x0000_0100);
+    machine.cpu.registers.eip = 0x108;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(machine.cpu.perf_counters().poll_neg_cache_stores, 0);
+    assert!(machine.cpu.perf_counters().poll_neg_cache_volatile >= 1);
+
+    // The identical bytes classify as a poll once EDX addresses the 3DA port,
+    // proving the earlier volatile negative had to stay uncached.
+    machine.cpu.registers.set_edx(0x0000_03da);
+    machine.cpu.registers.eip = 0x108;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(machine.cpu.poll_loop().is_some());
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn code_write_retires_negative_and_new_poll_is_recognized() {
+    // A negative is keyed on the page's insert generation. A guest code write
+    // that installs a real poll shape at the same linear must retire the stale
+    // negative (its re-decode bumps the page generation), or a legitimate new
+    // poll would be silently suppressed.
+    const HEAD: u32 = NON_POLL_HEAD_OFFSET;
+    // Certified 5-slot setup-direct poll: mov edx,ebx; sub eax,eax; in al,dx;
+    // test al,8; jnz -9 back to the head. EBX supplies the 3DA port downstream;
+    // this shape's classification is structural (no register gate).
+    const SETUP_DIRECT: &[u8] = &[0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x75, 0xf7];
+    const SETUP_STARTS: &[u32] = &[0, 2, 4, 5, 7];
+
+    let mut machine = warm_in_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_loop().is_none(),
+        "the non-poll head classifies as a negative"
+    );
+    assert!(machine.cpu.perf_counters().poll_neg_cache_stores >= 1);
+
+    // SMC: overwrite the head with the setup-direct poll shape through the normal
+    // recorded write path, which invalidates the stale decode lines at HEAD.
+    let base = machine.cpu.registers.cs().base;
+    for (offset, byte) in SETUP_DIRECT.iter().copied().enumerate() {
+        machine.write_physical_u8(base + HEAD + offset as u32, byte);
+    }
+    // Re-warm the new shape so its decode lines exist. Each fresh decode is a
+    // `put`, which bumps the head page's insert generation and retires the
+    // negative. EBX/EDX address the 3DA port so IN AL,DX does not fault.
+    with_cpu_and_bus(&mut machine, |cpu, bus| {
+        cpu.registers.set_ebx(0x0000_03da);
+        cpu.registers.set_edx(0x0000_03da);
+        for offset in SETUP_STARTS {
+            cpu.registers.eip = HEAD + offset;
+            cpu.poll_skip_backedge_housekeeping();
+            cpu.run_budgeted(bus, 0)
+                .expect("warm the new setup poll slot");
+        }
+    });
+
+    // Reclassify at the SAME linear the negative was cached for.
+    machine.cpu.registers.set_ebx(0x0000_03da);
+    machine.cpu.registers.eip = HEAD;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_loop().is_some(),
+        "a stale negative suppressed a legitimate new poll shape"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn out_of_set_boundary_is_prefilter_rejected_without_cache_traffic() {
+    // A warm head whose opcode (0x40) no certified shape slot can carry is
+    // rejected on the opcode peek, before any cache probe or backward scan.
+    let mut machine = warm_out_of_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(machine.cpu.poll_loop().is_none());
+    let perf = machine.cpu.perf_counters();
+    assert!(perf.poll_head_prefilter_rejects >= 1);
+    assert_eq!(perf.poll_neg_cache_stores, 0);
+    assert_eq!(perf.poll_neg_cache_hits, 0);
+    let rejects = perf.poll_head_prefilter_rejects;
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_head_prefilter_rejects,
+        rejects + 1
+    );
+    assert_eq!(machine.cpu.perf_counters().poll_neg_cache_hits, 0);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn cold_boundary_is_prefilter_rejected() {
+    // EIP at never-executed bytes: the decode line is cold, so no shape can
+    // contain it and the prefilter answers without a scan.
+    let mut machine = warm_out_of_set_non_poll_machine();
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET + 0x40;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    let before = machine.cpu.perf_counters().poll_head_prefilter_rejects;
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_head_prefilter_rejects,
+        before + 1
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn sixteen_bit_code_is_prefilter_rejected() {
+    // d = false matches no certified shape; eligibility passes in real mode, so
+    // the prefilter is the rejector even when the head opcode (0x89) is in-set.
+    // A 16-bit real-mode fixture: same shape as the in-set helper but with the
+    // code segment left at its default 16-bit width, so decode d is false.
+    let program = [
+        0x89, 0xda, // mov dx, bx  (0x89 in set, but 16-bit code)
+        0xeb, 0xfc, // jmp -4 back to the head
+    ];
+    let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
+    profile.cpu = GswMode::Gsw586;
+    let mut machine = Machine::new_raw_program(profile, &program).unwrap();
+    machine.cpu.set_native_backend_enabled(false);
+    machine.poll_skip_enabled = false;
+    machine.trace.set_tracing_mode(TracingMode::Off);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    machine.run_cycles(1_000).unwrap();
+
+    machine.cpu.set_poll_neg_cache_enabled_for_test(true);
+    machine.cpu.registers.eip = NON_POLL_HEAD_OFFSET;
+    machine.cpu.poll_skip_backedge_housekeeping();
+    assert!(
+        machine.cpu.poll_skip_eligible(),
+        "real mode with IOPL clearance must stay poll-skip eligible so d=false is the rejector"
+    );
+    let before = machine.cpu.perf_counters().poll_head_prefilter_rejects;
+    assert!(machine.cpu.poll_loop().is_none());
+    assert_eq!(
+        machine.cpu.perf_counters().poll_head_prefilter_rejects,
+        before + 1
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn cache_on_and_off_commit_identical_spans() {
+    // A stale negative may only ever SUPPRESS a skip, never change committed
+    // state, so a scenario that really skips must commit the identical span set,
+    // iteration count, instruction count, and registers with the cache on or off.
+    let run = |cache: bool| {
+        let mut machine =
+            setup_poll_machine_case(true, false, false, 0x1234_03da, GswMode::Gsw586, 0x08, true);
+        prepare_setup_poll_head(&mut machine, false, false, 0x1234_03da, 0x08, true);
+        machine.cpu.set_poll_neg_cache_enabled_for_test(cache);
+        let mut halted = false;
+        for _ in 0..128 {
+            if machine.run_cycles(100_000).unwrap() == StopReason::Halted {
+                halted = true;
+                break;
+            }
+        }
+        assert!(halted, "the setup poll never reached its edge");
+        (
+            machine.cpu.perf_counters().poll_skip_spans,
+            machine.cpu.perf_counters().poll_skip_iterations,
+            machine.cpu.perf_counters().instructions,
+            machine.cpu.registers.clone(),
+        )
+    };
+    let with_cache = run(true);
+    let without_cache = run(false);
+    assert!(with_cache.0 > 0, "scenario must actually skip");
+    assert_eq!(with_cache, without_cache);
 }
 
 #[test]

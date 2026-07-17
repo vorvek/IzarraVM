@@ -612,6 +612,20 @@ pub struct PerfCounters {
     /// `IZARRAVM_POLL_SKIP` is enabled. They are diagnostics, not retired instructions.
     pub poll_skip_spans: u64,
     pub poll_skip_iterations: u64,
+    /// Poll negative cache: classify boundaries answered without a scan.
+    pub poll_neg_cache_hits: u64,
+    /// Structural negatives recorded into the cache (each was a full scan
+    /// with the cache enabled).
+    pub poll_neg_cache_stores: u64,
+    /// Volatile negatives (scanned, uncacheable: register/segment reasons).
+    /// Counts every such scan regardless of `poll_neg_cache_enabled`: volatile
+    /// outcomes are never cached, so they re-fire with the switch off. A nonzero
+    /// value with the cache disabled is expected, not a leak.
+    pub poll_neg_cache_volatile: u64,
+    /// Classify boundaries rejected by the loop-head prefilter (cold line,
+    /// 16-bit code, or an opcode no certified shape slot can carry) before
+    /// any scan or cache probe. Counts regardless of the cache switch.
+    pub poll_head_prefilter_rejects: u64,
     pub jit_direct_reject_mode_key: u64,
     pub jit_direct_reject_x87_top: u64,
     pub jit_direct_reject_cs_layout: u64,
@@ -1011,6 +1025,11 @@ pub struct CpuGsw {
     jit_direct: Box<jit::direct::BlockCache>,
     #[cfg(feature = "jit")]
     direct_runtime: DirectRuntimeState,
+    /// IZARRAVM_POLL_SKIP_NEG_CACHE (default on, "0"/"" disables): consult
+    /// and populate the poll negative cache. Kill switch for A/B proofs;
+    /// the scan itself is always correct without it.
+    #[cfg(feature = "jit")]
+    poll_neg_cache_enabled: bool,
     /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
     /// clones start empty like the other host-only accelerator caches.
     #[cfg(all(
@@ -1099,6 +1118,8 @@ impl Default for CpuGsw {
             jit_direct,
             #[cfg(feature = "jit")]
             direct_runtime: DirectRuntimeState::default(),
+            #[cfg(feature = "jit")]
+            poll_neg_cache_enabled: poll_neg_cache_default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
@@ -1113,6 +1134,15 @@ impl Default for CpuGsw {
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
         }
+    }
+}
+
+#[cfg(feature = "jit")]
+impl CpuGsw {
+    /// Test seam: force the poll negative cache on or off regardless of the
+    /// IZARRAVM_POLL_SKIP_NEG_CACHE environment. Host bookkeeping only.
+    pub fn set_poll_neg_cache_enabled_for_test(&mut self, enabled: bool) {
+        self.poll_neg_cache_enabled = enabled;
     }
 }
 
@@ -1840,6 +1870,36 @@ struct PageCodeInfo {
     aliased: bool,
 }
 
+/// Slot count for the poll negative cache's per-page insert generations
+/// (4 KiB linear pages, hashed by low page bits). Collisions merely
+/// over-invalidate. Power of two.
+#[cfg(feature = "jit")]
+const POLL_NEG_GEN_SLOTS: usize = 1024;
+/// Slot count for the poll negative cache itself. Power of two.
+#[cfg(feature = "jit")]
+const POLL_NEG_SLOTS: usize = 8192;
+/// Generation payload width inside a packed negative entry. The 30-bit window
+/// can wrap after 2^30 inserts on one page; a bucket aliasing back to an old
+/// value only makes a stale negative look live, which suppresses a skip and
+/// never corrupts guest state.
+#[cfg(feature = "jit")]
+const POLL_NEG_GEN_MASK: u32 = 0x3FFF_FFFF;
+
+/// IZARRAVM_POLL_SKIP_NEG_CACHE policy: enabled unless explicitly "0" or "".
+/// Lives here with the flag it feeds (`CpuGsw::poll_neg_cache_enabled`) rather
+/// than in run.rs, which is at its line-policy ceiling.
+#[cfg(feature = "jit")]
+pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
+    !matches!(value, Some("" | "0"))
+}
+
+/// Ambient default for the poll negative cache, read fresh at CPU construction.
+#[cfg(feature = "jit")]
+pub(crate) fn poll_neg_cache_default() -> bool {
+    let value = std::env::var("IZARRAVM_POLL_SKIP_NEG_CACHE").ok();
+    poll_neg_cache_policy(value.as_deref())
+}
+
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
 /// (`cs.base + eip`). It lets a hot loop skip re-decoding the same bytes every iteration. The `gen`
 /// counter is advanced whenever a decode could change meaning: CS base / paging / mode changes (via
@@ -1882,6 +1942,22 @@ struct DecodeCache {
     /// path's physical-to-linear bridge). Populated by `put`, cleared with the marks, so it
     /// exactly describes the currently markable lines.
     code_page_lin: std::collections::HashMap<u32, PageCodeInfo, U32BuildHasher>,
+    /// Per-linear-page insert generations for the poll-classification
+    /// negative cache. Bumped ONLY by `put`: removals (narrow kills, whole
+    /// cache generation flushes, displacement evictions) can never turn a
+    /// structural "no poll shape" into a match, because every certified
+    /// shape ends on a warm branch terminator and a shortened block ends on
+    /// a non-terminator, so adding a warm line is the one mutation that can
+    /// flip a negative, and every warm line is added through `put`. Host
+    /// bookkeeping, excluded from CPU equality like the rest of the cache.
+    #[cfg(feature = "jit")]
+    poll_neg_gens: Box<[u32]>,
+    /// Direct-mapped negative cache: packed (lin:32 | d:1 | valid:1 |
+    /// gen:30) entries. A live entry means "the last full backward scan at
+    /// this (lin, d) found no poll shape for code-byte-only reasons and no
+    /// insert has touched the page since."
+    #[cfg(feature = "jit")]
+    poll_neg: Box<[u64]>,
     /// Bumped whenever a narrow SMC kill lands inside an installed JIT region's physical span:
     /// the region's slot table may now be stale (the entry line's stamp can survive a kill of a
     /// LATER slot's line). `run_region` refuses a region whose `valid_epoch` lags and unstamps
@@ -1954,6 +2030,10 @@ impl DecodeCache {
             dirty_byte_words: Vec::new(),
             dirty_page_words: Vec::new(),
             code_page_lin: std::collections::HashMap::default(),
+            #[cfg(feature = "jit")]
+            poll_neg_gens: vec![0u32; POLL_NEG_GEN_SLOTS].into_boxed_slice(),
+            #[cfg(feature = "jit")]
+            poll_neg: vec![0u64; POLL_NEG_SLOTS].into_boxed_slice(),
             #[cfg(feature = "jit")]
             jit_smc_epoch: 0,
         }
@@ -2083,6 +2163,14 @@ impl DecodeCache {
             return DecodeInsertOutcome::rejected();
         }
 
+        // A new warm line can turn a cached poll-scan negative on this page
+        // into a match; retire the page's negatives. Decode-miss path only.
+        #[cfg(feature = "jit")]
+        {
+            let gen_slot = ((lin >> 12) as usize) & (POLL_NEG_GEN_SLOTS - 1);
+            self.poll_neg_gens[gen_slot] = self.poll_neg_gens[gen_slot].wrapping_add(1);
+        }
+
         let slot = lin & self.mask;
         let index = slot as usize;
         let previous = self.lines[index];
@@ -2197,6 +2285,45 @@ impl DecodeCache {
     fn line_live(&self, lin: u32, d: bool) -> bool {
         let line = &self.lines[(lin & self.mask) as usize];
         line.generation == self.generation && line.tag == lin && line.d == d
+    }
+
+    /// Current insert generation for the page holding `lin`.
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn poll_neg_gen(&self, lin: u32) -> u32 {
+        self.poll_neg_gens[((lin >> 12) as usize) & (POLL_NEG_GEN_SLOTS - 1)]
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn poll_neg_slot(lin: u32, d: bool) -> usize {
+        // Fold the top log2(POLL_NEG_SLOTS) bits of the 32-bit mix. Deriving the
+        // shift from the slot count keeps the two in lockstep (8192 slots => 19).
+        const SHIFT: u32 = 32 - POLL_NEG_SLOTS.trailing_zeros();
+        let mixed = (lin ^ (lin >> 13) ^ (u32::from(d) << 5)).wrapping_mul(0x9E37_79B9);
+        (mixed >> SHIFT) as usize & (POLL_NEG_SLOTS - 1)
+    }
+
+    /// Whether a live negative covers (lin, d): same key, same page insert
+    /// generation. A hit means the scan would still return None.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn poll_negative_live(&self, lin: u32, d: bool) -> bool {
+        let entry = self.poll_neg[Self::poll_neg_slot(lin, d)];
+        entry & 0xFFFF_FFFF == u64::from(lin)
+            && (entry >> 32) & 1 == u64::from(d)
+            && (entry >> 33) & 1 == 1
+            && (entry >> 34) as u32 == self.poll_neg_gen(lin) & POLL_NEG_GEN_MASK
+    }
+
+    /// Record a structural (code-byte-only) negative for (lin, d).
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn record_poll_negative(&mut self, lin: u32, d: bool) {
+        // `gen` is a reserved keyword under the 2024 edition (generator blocks).
+        let page_gen = u64::from(self.poll_neg_gen(lin) & POLL_NEG_GEN_MASK);
+        self.poll_neg[Self::poll_neg_slot(lin, d)] =
+            u64::from(lin) | (u64::from(d) << 32) | (1u64 << 33) | (page_gen << 34);
     }
 
     /// Drop the region stamp from the live line for `lin` (the region went stale via a narrow SMC

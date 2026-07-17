@@ -51,11 +51,11 @@ fn cpu_registers_field_offset_is_stable() {
     // The current layout places `registers` at a non-zero offset (rustc reorders CpuGsw's
     // fields for alignment). The emitter handles any value (it bakes `offset_of!` at emit
     // time, verified by the differential suites jit_region + jit_general); this assertion
-    // freezes the known position so a change is visible. The constant tracks the live layout
-    // (456 -> 464 when Round 1 added the `jit_table_clears` u64 to PerfCounters, which precedes
-    // `registers`; the emitter re-reads the offset, so this is a documentation update).
+    // freezes the known position so a change is visible. The constant shifts whenever
+    // PerfCounters grows (that field precedes `registers`); the emitter re-reads the offset,
+    // so updating this number is a documentation change, not a code fix.
     assert_eq!(
-        off, 472,
+        off, 504,
         "CpuGsw.registers offset moved; update the emitter's baked offset"
     );
 }
@@ -795,8 +795,8 @@ fn region_ctx_fn_pointer_offsets() {
     assert_eq!(core::mem::offset_of!(RegionCtx, set_pending_add_fn), 16);
     assert_eq!(core::mem::offset_of!(RegionCtx, set_shift_flags_fn), 24);
     assert_eq!(core::mem::offset_of!(RegionCtx, native_u8_fn), 32);
-    // Pending flags offset for direct native writes. Poll-skip adds two diagnostic u64 counters.
-    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4376);
+    // Pending flags offset for direct native writes; shifts whenever PerfCounters grows.
+    assert_eq!(core::mem::offset_of!(CpuGsw, pending_flags), 4440);
 }
 
 /// The JIT's `jit_set_pending_add` helper must construct the identical pending descriptor the

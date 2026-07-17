@@ -678,7 +678,7 @@ fn exact_current_dx_poll_shapes_cover_masks_and_branch_senses() {
     for mask in [0x01, 0x08] {
         for jz in [false, true] {
             let code = [0xec, 0xa8, mask, if jz { 0x74 } else { 0x75 }, 0xfb];
-            let (cpu, _) = warm_exact_poll(&code, ENTRY, &[0, 1, 3], 0, 0, 0xaaaa_03da);
+            let (mut cpu, _) = warm_exact_poll(&code, ENTRY, &[0, 1, 3], 0, 0, 0xaaaa_03da);
             let poll = cpu.poll_loop().expect("exact CurrentDx poll");
             assert_eq!(poll.diagnostic_class(), 0);
             assert_eq!(poll.raw_core_clocks(), 17);
@@ -787,7 +787,7 @@ fn exact_setup_poll_rejects_mismatch_cold_prefix_mode_targets_page_cs_and_smc() 
     );
 
     let prefixed = [0x66, 0x89, 0xda, 0x29, 0xc0, 0xec, 0xa8, 0x08, 0x74, 0xf6];
-    let (cpu, _) = warm_exact_poll(&prefixed, ENTRY, &[0, 3, 5, 6, 8], 0x03da, 0, 0);
+    let (mut cpu, _) = warm_exact_poll(&prefixed, ENTRY, &[0, 3, 5, 6, 8], 0x03da, 0, 0);
     assert!(cpu.poll_loop().is_none());
 
     let malformed: Vec<(&str, Vec<u8>, &[u32])> = vec![
@@ -844,14 +844,14 @@ fn exact_setup_poll_rejects_mismatch_cold_prefix_mode_targets_page_cs_and_smc() 
         ),
     ];
     for (name, code, starts) in malformed {
-        let (cpu, _) = warm_exact_poll(&code, ENTRY, starts, 0x03da, 0, 0);
+        let (mut cpu, _) = warm_exact_poll(&code, ENTRY, starts, 0x03da, 0, 0);
         assert!(cpu.poll_loop().is_none(), "accepted {name}");
     }
 
-    let (cpu, _) = warm_exact_poll(PAIRED, ENTRY, direct_starts, 0x03da, 0, 0);
+    let (mut cpu, _) = warm_exact_poll(PAIRED, ENTRY, direct_starts, 0x03da, 0, 0);
     assert!(cpu.poll_loop().is_none(), "paired JMP remained cold");
 
-    let (cpu, _) = warm_exact_poll(PAIRED, 0x0ff8, paired_starts, 0x03da, 0, 0);
+    let (mut cpu, _) = warm_exact_poll(PAIRED, 0x0ff8, paired_starts, 0x03da, 0, 0);
     assert!(cpu.poll_loop().is_none());
 
     for (paired, mutations) in [
@@ -890,4 +890,69 @@ fn exact_setup_poll_rejects_mismatch_cold_prefix_mode_targets_page_cs_and_smc() 
             );
         }
     }
+}
+
+/// Storage-layer semantics for the poll-classification negative cache: a live negative is keyed
+/// on (lin, d) AND the page's insert generation, so `put` (a warm-line install, the one mutation
+/// that can turn a structural negative into a match) retires every negative on its page, while
+/// removals (narrow kills, whole-cache generation flushes) leave negatives live since they can
+/// only shrink what would match, never grow it. Lives here rather than cpu_test.rs, which is at
+/// its line-policy ceiling.
+#[cfg(feature = "jit")]
+#[test]
+fn poll_negative_cache_page_generation_semantics() {
+    let (mut nop_cpu, nop_mem) = real_mode_cpu(&[0x90], 0x10);
+    let mut nop_bus = TestBus::with_memory(nop_mem);
+    nop_cpu.begin_instruction();
+    let insn = nop_cpu.decode(&mut nop_bus).expect("0x90 NOP decodes");
+
+    let mut cache = DecodeCache::new(1024);
+    let lin = 0x0010_2340u32;
+    assert!(!cache.poll_negative_live(lin, true));
+    cache.record_poll_negative(lin, true);
+    assert!(cache.poll_negative_live(lin, true));
+    // d is part of the key.
+    assert!(!cache.poll_negative_live(lin, false));
+    // A put on the SAME page retires the negative.
+    let _ = cache.put(lin + 8, insn, true, lin + 8);
+    assert!(!cache.poll_negative_live(lin, true));
+    // Re-record, then a put on a DIFFERENT page whose generation slot does not alias lin's
+    // (POLL_NEG_GEN_SLOTS is 1024 = 2^10, so an offset that is itself a multiple of 2^22 bytes
+    // wraps the slot back to the same index; 0x10_0000 (256 pages) does not) leaves it live.
+    cache.record_poll_negative(lin, true);
+    let far = lin + 0x10_0000;
+    let _ = cache.put(far, insn, true, far);
+    assert!(cache.poll_negative_live(lin, true));
+    // A whole-cache generation flush does NOT retire negatives (removals are benign); only
+    // inserts do.
+    cache.generation = cache.generation.wrapping_add(1);
+    assert!(cache.poll_negative_live(lin, true));
+
+    // Exercise the packed d bit directly: forge an entry for (lin2, d=false) in lin2's own slot,
+    // then probe (lin2, true); if the probe's slot happens to differ the check is vacuous, so
+    // probe (lin2, false) too to pin the packing round-trip.
+    let lin2 = 0x0020_0000u32;
+    cache.record_poll_negative(lin2, false);
+    assert!(cache.poll_negative_live(lin2, false));
+    assert!(!cache.poll_negative_live(lin2, true));
+    // Flip only the packed d bit in that same slot: the probe for (lin2, false) must now miss,
+    // pinning that the packed d gates the hit, not just the slot.
+    let slot = DecodeCache::poll_neg_slot(lin2, false);
+    cache.poll_neg[slot] ^= 1u64 << 32;
+    assert!(!cache.poll_negative_live(lin2, false));
+}
+
+/// IZARRAVM_POLL_SKIP_NEG_CACHE policy is default-on with a kill switch: the cache runs unless
+/// the env var is explicitly "0" or "" (unset, i.e. `None`, means ON). The machine crate's
+/// `poll_skip_requested` now shares this exact truth table (`None` also means ON there); this
+/// test pins the neg-cache policy's table on its own so a future change to either policy cannot
+/// silently drift from the other.
+#[cfg(feature = "jit")]
+#[test]
+fn poll_neg_cache_policy_default_on_with_kill_switch() {
+    assert!(poll_neg_cache_policy(None));
+    assert!(poll_neg_cache_policy(Some("1")));
+    assert!(poll_neg_cache_policy(Some("yes")));
+    assert!(!poll_neg_cache_policy(Some("0")));
+    assert!(!poll_neg_cache_policy(Some("")));
 }
