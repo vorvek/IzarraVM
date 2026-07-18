@@ -124,6 +124,8 @@ fn lowerable(kind: &DirectKind) -> bool {
             | DirectKind::Store { .. }
             | DirectKind::Push { .. }
             | DirectKind::Pop { .. }
+            | DirectKind::AluMemSource { .. }
+            | DirectKind::TestImmMem { .. }
     )
 }
 
@@ -693,6 +695,17 @@ impl<'a> UnitBuilder<'a> {
             } => {
                 self.lower_store(source, width, &addr, slot, delta);
             }
+            DirectKind::AluMemSource {
+                op,
+                dst,
+                width,
+                addr,
+            } => {
+                self.lower_alu_mem_source(op, dst, width, &addr, slot, delta);
+            }
+            DirectKind::TestImmMem { width, addr, .. } => {
+                self.lower_test_imm_mem(width, &addr, slot, delta);
+            }
             DirectKind::Push { source } => {
                 self.lower_push(source, slot, delta);
             }
@@ -1099,6 +1112,79 @@ impl<'a> UnitBuilder<'a> {
         let new_esp = self.b.ins().iadd_imm(esp, 4);
         self.set_gpr32(4, new_esp);
         self.set_gpr32(dst, value);
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// `AluMemSource` (design section 1.3 item 3): the read-only memory ALU form
+    /// (`ADD/OR/ADC/SBB/AND/SUB/XOR/CMP reg, [mem]`). The full READ check list, the memory
+    /// operand loaded at `width` as `b`, then C1b's `lower_alu` reused unchanged (the same
+    /// op-dependent lowering `AluReg` runs, including the ADC/SBB runtime carry branch and
+    /// the CMP no-write arm), writing back into `dst`'s home and threading the pending
+    /// flags exactly as the register form does. No new flag mechanism, per the design.
+    fn lower_alu_mem_source(
+        &mut self,
+        op: u8,
+        dst: u8,
+        width: MemoryWidth,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let eff = self.mem_effective_address(addr, slot);
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+        let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let b = match width {
+            MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
+            MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
+            MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
+        };
+        self.lower_alu(op, dst, b, width);
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// `TestImmMem` (design section 1.3 item 5): read-only, the Logic-tag pending bundle
+    /// (`AND` semantics, `TestImmReg`'s shape with the register operand replaced by the
+    /// checked memory load). The slot's operand table carries BOTH the immediate and the
+    /// addressing displacement (the two-lane case, amendment 1). No write, no code-watch
+    /// check (nothing is stored).
+    fn lower_test_imm_mem(
+        &mut self,
+        width: MemoryWidth,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let eff = self.mem_effective_address(addr, slot);
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+        let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let va = match width {
+            MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
+            MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
+            MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
+        };
+        let vb = match width {
+            MemoryWidth::Byte => self.imm8(slot),
+            _ => self.imm32(slot),
+        };
+        let vb = self.b.ins().band_imm(vb, i64::from(width_mask(width)));
+        let result = self.b.ins().band(va, vb);
+        self.lower_logic_flags(result, width);
         self.finish_mem_slot(side, delta);
     }
 

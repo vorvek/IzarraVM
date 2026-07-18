@@ -281,7 +281,8 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
     match *kind {
         DirectKind::MovImm { imm, .. }
         | DirectKind::AluImm { imm, .. }
-        | DirectKind::TestImmReg { imm, .. } => imm,
+        | DirectKind::TestImmReg { imm, .. }
+        | DirectKind::TestImmMem { imm, .. } => imm,
         DirectKind::MovImmByte { imm, .. } | DirectKind::AluByteImm { imm, .. } => u32::from(imm),
         DirectKind::Shift { count, .. } => u32::from(count),
         DirectKind::DoubleShiftReg {

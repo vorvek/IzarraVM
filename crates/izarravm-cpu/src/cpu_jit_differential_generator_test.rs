@@ -1214,7 +1214,7 @@ fn generated_hma_load_tracks_a20_alias_and_cache_invalidation() {
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn assert_clif_forced_case(mode: GswMode, code: &[u8], gpr: [u32; 8], eflags: u32) {
+pub(super) fn assert_clif_forced_case(mode: GswMode, code: &[u8], gpr: [u32; 8], eflags: u32) {
     let _ = run_clif_forced_case(mode, code, gpr, eflags);
 }
 
@@ -1225,7 +1225,12 @@ fn assert_clif_forced_case(mode: GswMode, code: &[u8], gpr: [u32; 8], eflags: u3
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn run_clif_forced_case(mode: GswMode, code: &[u8], gpr: [u32; 8], eflags: u32) -> CpuGsw {
+pub(super) fn run_clif_forced_case(
+    mode: GswMode,
+    code: &[u8],
+    gpr: [u32; 8],
+    eflags: u32,
+) -> CpuGsw {
     let mut memory = vec![0xf4u8; MEMORY_LEN];
     let entry = 0x1000u32;
     memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
@@ -1312,7 +1317,7 @@ fn run_clif_forced_case(mode: GswMode, code: &[u8], gpr: [u32; 8], eflags: u32) 
     target_arch = "x86_64",
     any(target_os = "windows", target_os = "linux")
 ))]
-fn forced_gpr() -> [u32; 8] {
+pub(super) fn forced_gpr() -> [u32; 8] {
     // ESP parked in scratch RAM; values chosen to exercise carries, sign bits, and byte
     // lanes (AH/DH nonzero high lanes).
     [
@@ -2694,7 +2699,7 @@ fn clif_plan_access_counts_match_direct_compilation() {
     // stores, moffs and modrm, store-immediate), each small enough that Direct's compile
     // heuristics admit every slot, so the two backends cover IDENTICAL slot lists and the
     // count comparison is like-for-like.
-    let corpora: [&[u8]; 3] = [
+    let corpora: [&[u8]; 5] = [
         &[
             0x40, // inc eax
             0xa1, 0x00, 0x50, 0x00, 0x00, // mov eax, [0x5000]     (dword read)
@@ -2718,6 +2723,27 @@ fn clif_plan_access_counts_match_direct_compilation() {
             0x53, // push ebx (dword store)
             0x59, // pop ecx (dword read)
             0x5a, // pop edx (dword read)
+            0xf4,
+        ],
+        // C1c increment 3: AluMemSource reads (word/dword; the byte form does not exist
+        // by classification, its zero-contribution pin lives in
+        // clif_byte_alu_mem_source_asymmetry; the word form exists only as CMP per the
+        // classifier's word gate).
+        &[
+            0x40, // inc eax
+            0x03, 0x05, 0x00, 0x50, 0x00, 0x00, // add eax, [0x5000] (dword read)
+            0x66, 0x3b, 0x05, 0x04, 0x50, 0x00, 0x00, // cmp ax, [0x5004] (word read)
+            0x2b, 0x1d, 0x08, 0x50, 0x00, 0x00, // sub ebx, [0x5008] (dword read)
+            0xf4,
+        ],
+        // TestImmMem byte and dword reads (memory_alu slots, kept within Direct's
+        // four-instruction memory-alu block cap).
+        &[
+            0x40, // inc eax
+            0xf6, 0x05, 0x0c, 0x50, 0x00, 0x00, 0x7f, // test byte [0x500c], 0x7f
+            0xf7, 0x05, 0x10, 0x50, 0x00, 0x00, 0x44, 0x33, 0x22,
+            0x11, // test dword [0x5010], 0x11223344
+            0x43, // inc ebx
             0xf4,
         ],
     ];
@@ -2979,4 +3005,134 @@ fn clif_push_into_watched_page_side_exits_before_commit() {
         clif.jit_direct.clif_units.state(key),
         Some(ClifUnitState::Compiled(_))
     ));
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C C1c increment 3: the read-only memory ALU battery (AluMemSource + TestImmMem).
+// ---------------------------------------------------------------------------------------
+
+/// AluMemSource across every op (0..=7) at dword width, the ADC/SBB entry-carry arms via
+/// STC/CLC, CMP's no-write arm, and the word forms on the 586 persona. The memory operand
+/// is C1b's register `b` replaced by a checked load; flags ride the identical lowering,
+/// so the pending-descriptor bytes and raw eflags are compared byte-for-byte through the
+/// forced harness.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_alu_mem_source_op_matrix() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for op in 0..=7u8 {
+            // nop starter (the continuation probe lands on the memory op), then
+            // op reg, [0x5000] over the 0xf4 filler bytes; dst varies with op.
+            let opcode = (op << 3) | 3;
+            let modrm = 0x05 | ((op & 7) << 3);
+            assert_clif_forced_case(
+                mode,
+                &[0x90, opcode, modrm, 0x00, 0x50, 0x00, 0x00, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+        }
+        // ADC/SBB with both entry-carry arms (the lazy and eager flag shapes); the
+        // interpreted STC/CLC starter doubles as the continuation position.
+        for (setcc, op) in [(0xf9u8, 2u8), (0xf8, 2), (0xf9, 3), (0xf8, 3)] {
+            let opcode = (op << 3) | 3;
+            assert_clif_forced_case(
+                mode,
+                &[setcc, opcode, 0x05, 0x00, 0x50, 0x00, 0x00, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+        }
+        // An in-unit producer feeding the memory ADC: ADD sets carry, ADC consumes it.
+        assert_clif_forced_case(
+            mode,
+            &[
+                0x01, 0xd8, // add eax, ebx (sets CF from the forced gpr values)
+                0x13, 0x0d, 0x00, 0x50, 0x00, 0x00, // adc ecx, [0x5000]
+                0xf4,
+            ],
+            forced_gpr(),
+            0x202,
+        );
+    }
+    // Word forms, 586 only. The classifier's word gate admits only the CMP encodings
+    // (0x39/0x3b) among the sub-0x40 ALU opcodes, so CMP is the word AluMemSource shape.
+    assert_clif_forced_case(
+        GswMode::Gsw586,
+        &[
+            0x90, // nop starter
+            0x66, 0x3b, 0x1d, 0x04, 0x50, 0x00, 0x00, // cmp bx, [0x5004]
+            0x66, 0x3b, 0x05, 0x00, 0x50, 0x00, 0x00, // cmp ax, [0x5000]
+            0xf4,
+        ],
+        forced_gpr(),
+        0x202,
+    );
+}
+
+/// The M4 byte-width AluMemSource asymmetry, both halves: (a) the byte ALU-mem-source
+/// encodings (form 2, e.g. 0x02 `add r8, r/m8`) are not classified at all, so NEITHER
+/// backend admits them and growth stops identically (design section 1.1's
+/// excluded-by-construction discipline, proven rather than asserted); (b) a hand-built
+/// byte AluMemSource kind contributes ZERO byte reads through the shared accessor
+/// (`byte_reads` deliberately omits it), so `plan_unit` matches Direct exactly on the
+/// shape by shared code.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_byte_alu_mem_source_asymmetry() {
+    use crate::jit::clif::cache::walk_unit;
+    use crate::jit::clif::lower::plan_unit;
+    use crate::jit::direct::{DirectAddr, DirectKind, MemoryWidth};
+
+    // (a) Non-admission: nop; inc eax; add al,[0x5000]; hlt. The walker stops BEFORE the
+    // 0x02 form on both backends; the run stays byte-identical (the forced harness
+    // requires at least one clif entry, satisfied by the inc-only unit).
+    let clif = run_clif_forced_case(
+        GswMode::Gsw586,
+        &[0x90, 0x40, 0x02, 0x05, 0x00, 0x50, 0x00, 0x00, 0xf4],
+        forced_gpr(),
+        0x202,
+    );
+    let layout = walk_unit(&clif, 0x1001, true).expect("walked layout");
+    assert_eq!(
+        layout.kinds.len(),
+        1,
+        "the byte ALU-mem-source form must stop growth (not classified)"
+    );
+
+    // (b) The accessor asymmetry, pinned at the plan level: byte width contributes zero
+    // reads (byte_reads omits AluMemSource), while word/dword contribute one, all through
+    // DirectKind's own accessors.
+    let addr = DirectAddr {
+        segment: SegmentIndex::Ds,
+        base: None,
+        index: None,
+        scale: 1,
+        disp: 0x5000,
+    };
+    for (width, expect_byte, expect_word, expect_dword) in [
+        (MemoryWidth::Byte, 0u8, 0u8, 0u8),
+        (MemoryWidth::Word, 0, 1, 0),
+        (MemoryWidth::Dword, 0, 0, 1),
+    ] {
+        let kinds = [DirectKind::AluMemSource {
+            op: 0,
+            dst: 0,
+            width,
+            addr,
+        }];
+        let plan = plan_unit(&kinds, true);
+        assert_eq!(plan.access_total.byte_reads, expect_byte);
+        assert_eq!(plan.access_total.word_reads, expect_word);
+        assert_eq!(plan.access_total.dword_reads, expect_dword);
+        assert_eq!(plan.access_total.stores(), 0, "read-only form");
+    }
 }
