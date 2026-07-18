@@ -24,10 +24,12 @@ use crate::CpuGsw;
 /// gives a unit real continue/exit outcomes.
 pub(crate) const SIDE_EXIT_DISPOSITION: i64 = 0;
 
-/// The dispatcher-shaped entry ABI for every clif unit: `*mut CpuGsw`, the unit's own entry
-/// address, returning its disposition. C1a's shells are the first tenant; later sub-slices
-/// widen what the callee does, not this shape.
-pub(crate) type ClifEntryFn = unsafe extern "C" fn(*mut CpuGsw, *const u8) -> i64;
+/// The C1a shell entry ABI: `*mut CpuGsw`, the unit's own entry address, returning its
+/// disposition. Renamed from `ClifEntryFn` when C1b-pre introduced the widened five-parameter
+/// `callout::ClifEntryFn` (the definitive C1b-onward arity, design section 1.2); the shells
+/// stay on this narrower shape until C1b-main rewires `run_clif_shell` to the widened one, so
+/// both adapters coexist temporarily.
+pub(crate) type ClifShellEntryFn = unsafe extern "C" fn(*mut CpuGsw, *const u8) -> i64;
 
 fn shell_signature() -> Signature {
     let mut sig = Signature::new(CallConv::Tail);
@@ -89,16 +91,16 @@ impl ClifBackend {
     }
 
     /// The dispatcher-shaped adapter, compiled once and reused for every clif unit entry.
-    pub(crate) fn adapter(&mut self) -> Option<ClifEntryFn> {
+    pub(crate) fn adapter(&mut self) -> Option<ClifShellEntryFn> {
         if let Some(addr) = self.adapter_entry {
             // SAFETY: built once at the host default convention with exactly this signature
             // and lives in sealed executable memory for the backend's lifetime.
-            return Some(unsafe { std::mem::transmute::<usize, ClifEntryFn>(addr) });
+            return Some(unsafe { std::mem::transmute::<usize, ClifShellEntryFn>(addr) });
         }
         let isa = self.isa.clone();
         let addr = self.finalize(build_adapter_function(isa.as_ref()))? as usize;
         self.adapter_entry = Some(addr);
         // SAFETY: as above.
-        Some(unsafe { std::mem::transmute::<usize, ClifEntryFn>(addr) })
+        Some(unsafe { std::mem::transmute::<usize, ClifShellEntryFn>(addr) })
     }
 }

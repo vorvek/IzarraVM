@@ -47,6 +47,10 @@ pub(crate) struct ClifBackend {
     shell_entry: Option<usize>,
     /// The dispatcher-shaped adapter's installed address, compiled once and reused the same way.
     adapter_entry: Option<usize>,
+    /// The widened five-parameter adapter's installed address (Track C C1b-pre, the call-out
+    /// ABI, design section 1.2), compiled once and reused the same way. Coexists with the C1a
+    /// shell adapter until C1b-main rewires `run_clif_shell` onto the widened shape.
+    callout_adapter_entry: Option<usize>,
 }
 
 impl ClifBackend {
@@ -73,6 +77,7 @@ impl ClifBackend {
             relocation_fallbacks: 0,
             shell_entry: None,
             adapter_entry: None,
+            callout_adapter_entry: None,
         })
     }
 
@@ -104,8 +109,13 @@ impl ClifBackend {
 }
 
 pub(crate) mod cache;
+pub(crate) mod callout;
 pub(crate) mod unit;
 
 #[cfg(test)]
 #[path = "proof_test.rs"]
 mod proof_tests;
+
+#[cfg(test)]
+#[path = "callout_proof_test.rs"]
+mod callout_proof_tests;
