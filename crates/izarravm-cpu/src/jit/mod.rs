@@ -272,9 +272,13 @@ impl JitState {
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    pub(crate) fn clif_invalidate_physical_range(&mut self, physical: u32, width: u32) {
+    pub(crate) fn clif_invalidate_physical_range(
+        &mut self,
+        physical: u32,
+        width: u32,
+    ) -> clif::cache::ClifInvalidateOutcome {
         self.clif_units
-            .invalidate_physical_range(&mut self.code_watch, physical, width);
+            .invalidate_physical_range(&mut self.code_watch, physical, width)
     }
 }
 

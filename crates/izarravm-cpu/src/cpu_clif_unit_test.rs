@@ -296,6 +296,12 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         cum_access_before: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
         access_total: Default::default(),
         terminal: false,
+        disp_len: [0; MAX_BLOCK_INSTRUCTIONS],
+        imm_len: [0; MAX_BLOCK_INSTRUCTIONS],
+        imm_extend: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
+        lea_mask: 0,
+        moffs_mask: 0,
+        code_host: 0,
         successors: [None; 2],
     };
     // A stand-in sentinel-descriptor address (any stable nonzero address works for a

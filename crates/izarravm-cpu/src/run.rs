@@ -1208,6 +1208,12 @@ impl CpuGsw {
                     self.jit_direct.clif_units.dormant(key);
                     return Ok(ClifContinuation::Interpret);
                 }
+                // C1e: the certified code page's host pointer, kept on the descriptor so
+                // a restamp's post-write re-read goes through the SAME physical-RAM
+                // mapping the cover check just proved (design section 2.1, review m1).
+                let code_host = code_page
+                    .map(|page| page.ptr as usize)
+                    .expect("cover check passed");
                 // G1 pre-install gate (full span).
                 if self.jit_direct.smc_heat.span_hot(
                     key.physical,
@@ -1324,6 +1330,12 @@ impl CpuGsw {
                     cum_access_before: plan.cum_access_before,
                     access_total: plan.access_total,
                     terminal: plan.terminal,
+                    disp_len: layout.disp_len,
+                    imm_len: layout.imm_len,
+                    imm_extend: layout.imm_extend,
+                    lea_mask: layout.lea_mask,
+                    moffs_mask: layout.moffs_mask,
+                    code_host,
                     successors: layout.successors,
                 };
                 let Some(index) = self

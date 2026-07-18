@@ -315,18 +315,30 @@ impl CpuGsw {
             invalidated = killed != 0;
             heat_hit |= killed != 0;
         }
-        // C1b: a write into a compiled clif unit's span kills the unit. This rides the same
-        // choke as Direct's invalidation (decode-native marks route the write here; G2
-        // same-value elision upstream is sound for clif too, since unchanged bytes cannot
-        // stale a compiled unit).
+        // C1b: a write into a compiled clif unit's span invalidates it. This rides the
+        // same choke as Direct's invalidation (decode-native marks route the write here;
+        // G2 same-value elision upstream is sound for clif too, since unchanged bytes
+        // cannot stale a compiled unit). C1e (D3): the cache now classifies the write
+        // per slot; a tail-confined single-slot write RESTAMPS the live descriptor's
+        // operand lane(s) instead of killing, and only KILLS feed the G1 heat map
+        // (design 2.2c: restamp is the cheap survivor path, so it neither heats nor
+        // demotes; a restamp storm must not park the unit Dormant).
         #[cfg(all(
             feature = "jit",
             feature = "clif-backend",
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_direct
-            .clif_invalidate_physical_range(physical, width);
+        {
+            let clif = self
+                .jit_direct
+                .clif_invalidate_physical_range(physical, width);
+            self.jit_clif.smc_unit_kills += u64::from(clif.kills);
+            self.jit_clif.smc_unit_restamps += u64::from(clif.restamps);
+            self.jit_clif.smc_unit_kills_no_layout += u64::from(clif.kills_no_layout);
+            self.jit_clif.smc_unit_kills_multi_slot += u64::from(clif.kills_multi_slot);
+            heat_hit |= clif.kills != 0;
+        }
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
             if self.profile.enabled {
