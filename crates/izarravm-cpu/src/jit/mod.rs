@@ -227,6 +227,44 @@ impl JitState {
     pub(crate) fn mark_code_range(&mut self, physical: u32, len: u8) {
         self.code_watch.acquire_range(physical, u32::from(len));
     }
+
+    /// Install a compiled clif unit descriptor, registering its guest physical range with
+    /// the shared watch (design section 2.5/6, the M5 deliverable). Splits the borrow
+    /// between `clif_units` and the hoisted `code_watch`, mirroring the `install`/`clear`
+    /// wrappers above for Direct's own cache.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn clif_install(
+        &mut self,
+        descriptor: clif::cache::ClifUnitDescriptor,
+    ) -> Option<u32> {
+        self.clif_units.install(&mut self.code_watch, descriptor)
+    }
+
+    /// Wholesale clif-cache drop, releasing every installed unit's watch registration first.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn clif_clear(&mut self) {
+        self.clif_units.clear(&mut self.code_watch);
+    }
+
+    /// SMC invalidation for the clif cache, releasing the watch registration of any compiled
+    /// unit dropped by the write (M5's eviction-side discipline).
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn clif_invalidate_physical_range(&mut self, physical: u32, width: u32) {
+        self.clif_units
+            .invalidate_physical_range(&mut self.code_watch, physical, width);
+    }
 }
 
 impl std::fmt::Debug for JitState {

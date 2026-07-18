@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use super::super::code_watch::NativeCodeWatch;
 use super::super::direct::{
     self, DirectKind, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, SmcHeatMap, UnitTerminal,
 };
@@ -309,13 +310,24 @@ impl ClifUnitCache {
         }
     }
 
-    /// Install a compiled shell descriptor for a key previously recorded `Seen`.
-    pub(crate) fn install(&mut self, descriptor: ClifUnitDescriptor) -> Option<u32> {
+    /// Install a compiled unit descriptor for a key previously recorded `Seen`. Registers the
+    /// unit's guest physical range with the SHARED `NativeCodeWatch` (design section 2.5's
+    /// D-C1c.1, the M5 registration deliverable): a clif unit's resident bytes must read as
+    /// watched the instant it becomes reachable, exactly mirroring Direct's own
+    /// `acquire_range` call at install time (`direct.rs:793`/`845`), since an unregistered
+    /// unit's own inline-lowered store would pass the code-watch check straight through a
+    /// still-resident, still-executable copy of itself.
+    pub(crate) fn install(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        descriptor: ClifUnitDescriptor,
+    ) -> Option<u32> {
         if self.entries.get(&descriptor.key) != Some(&ClifUnitState::Seen) {
             return None;
         }
         let index = u32::try_from(self.units.len()).ok()?;
         let key = descriptor.key;
+        watch.acquire_range(key.physical, u32::from(descriptor.guest_len));
         self.units.push(descriptor);
         self.entries.insert(key, ClifUnitState::Compiled(index));
         self.units_admitted = self.units_admitted.saturating_add(1);
@@ -326,7 +338,24 @@ impl ClifUnitCache {
         self.units.get(index as usize)
     }
 
-    pub(crate) fn clear(&mut self) {
+    /// Wholesale drop. Releases every currently-installed unit's watch registration first
+    /// (the M5 discipline: every eviction path releases what it acquired), rather than
+    /// relying on a coincidentally-paired wholesale `NativeCodeWatch::clear()` elsewhere,
+    /// since this cache and Direct's block cache release independently and a Direct clear
+    /// does not always accompany a clif clear (`core.rs`'s two callers are always paired
+    /// today, but the cache must stay correct on its own, not by that coincidence).
+    pub(crate) fn clear(&mut self, watch: &mut NativeCodeWatch) {
+        // Only entries still reachable as `Compiled` hold a live registration: `units` is
+        // append-only (an invalidated slot's descriptor merely goes unreachable, mirroring
+        // Direct's own arena-fill note), so releasing every stored descriptor here would
+        // double-release ranges an earlier `invalidate_physical_range` already released.
+        for state in self.entries.values() {
+            if let ClifUnitState::Compiled(index) = state
+                && let Some(unit) = self.units.get(*index as usize)
+            {
+                watch.release_range(unit.key.physical, u32::from(unit.guest_len));
+            }
+        }
         self.entries.clear();
         self.units.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -344,15 +373,21 @@ impl ClifUnitCache {
     /// ratchets the clif arena toward full. On fill, `ClifBackend::finalize` returns `None`
     /// and new keys park Dormant, i.e. reject-and-interpret: sound, merely slower. Span
     /// reuse/compaction is future work (the C1 plan's single-page compaction item).
-    pub(crate) fn invalidate_physical_range(&mut self, start: u32, len: u32) {
+    pub(crate) fn invalidate_physical_range(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        start: u32,
+        len: u32,
+    ) {
         if len == 0 {
             return;
         }
         let end = start.saturating_add(len);
         let before = self.entries.len();
+        let units = &self.units;
         self.entries.retain(|key, state| {
             let span = match state {
-                ClifUnitState::Compiled(index) => Self::unit_span(&self.units, *index, *key),
+                ClifUnitState::Compiled(index) => Self::unit_span(units, *index, *key),
                 // Conservative page-overlap drop for non-compiled states (no recorded
                 // guest_len exists for them).
                 ClifUnitState::Seen | ClifUnitState::Dormant => (
@@ -360,7 +395,14 @@ impl ClifUnitCache {
                     (key.physical & !0xfff).saturating_add(0x1000),
                 ),
             };
-            span.1 <= start || span.0 >= end
+            let overlaps = !(span.1 <= start || span.0 >= end);
+            // M5: release the watch registration exactly when a COMPILED unit is the one
+            // dropped, mirroring Direct's `retire_block` releasing on eviction; `Seen`/
+            // `Dormant` keys never acquired a registration in the first place.
+            if overlaps && let ClifUnitState::Compiled(_) = state {
+                watch.release_range(span.0, span.1 - span.0);
+            }
+            !overlaps
         });
         if self.entries.len() != before {
             // B1: an in-flight unit whose entry just died must not resume its lowered

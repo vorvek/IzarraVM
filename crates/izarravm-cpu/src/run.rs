@@ -1241,7 +1241,7 @@ impl CpuGsw {
                     raw_clocks_total: plan.raw_clocks_total,
                     lowered_total: plan.lowered_total,
                 };
-                let Some(index) = self.jit_direct.clif_units.install(descriptor) else {
+                let Some(index) = self.jit_direct.clif_install(descriptor) else {
                     self.jit_direct.clif_units.dormant(key);
                     return Ok(None);
                 };

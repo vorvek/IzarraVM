@@ -129,7 +129,7 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        self.jit_direct.clif_units.clear();
+        self.jit_direct.clif_clear();
     }
 
     fn invalidate_decode_frontend(&mut self) {
@@ -326,8 +326,7 @@ impl CpuGsw {
             any(target_os = "windows", target_os = "linux")
         ))]
         self.jit_direct
-            .clif_units
-            .invalidate_physical_range(physical, width);
+            .clif_invalidate_physical_range(physical, width);
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
             if self.profile.enabled {
