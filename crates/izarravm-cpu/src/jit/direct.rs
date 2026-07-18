@@ -1794,7 +1794,7 @@ struct DirectInsn {
 }
 
 #[derive(Clone, Copy)]
-enum DirectKind {
+pub(crate) enum DirectKind {
     MovReg {
         dst: u8,
         src: u8,
@@ -1924,7 +1924,7 @@ enum DirectKind {
 }
 
 #[derive(Clone, Copy)]
-enum MemoryWidth {
+pub(crate) enum MemoryWidth {
     Byte,
     Word,
     Dword,
@@ -1945,29 +1945,29 @@ impl MemoryWidth {
 }
 
 #[derive(Clone, Copy)]
-enum StoreSource {
+pub(crate) enum StoreSource {
     Reg(u8),
     Imm(u32),
     EipDelta(u32),
 }
 
 #[derive(Clone, Copy)]
-enum ShiftCount {
+pub(crate) enum ShiftCount {
     Immediate(u8),
     Cl,
 }
 
 #[derive(Clone, Copy)]
-struct DirectAddr {
-    segment: SegmentIndex,
-    base: Option<u8>,
-    index: Option<u8>,
-    scale: u8,
-    disp: u32,
+pub(crate) struct DirectAddr {
+    pub(crate) segment: SegmentIndex,
+    pub(crate) base: Option<u8>,
+    pub(crate) index: Option<u8>,
+    pub(crate) scale: u8,
+    pub(crate) disp: u32,
 }
 
 impl DirectKind {
-    fn raw_clocks(self) -> u32 {
+    pub(crate) fn raw_clocks(self) -> u32 {
         match self {
             Self::Jcc { .. } => 3,
             Self::Pop { .. } => 4,
@@ -2538,6 +2538,9 @@ pub(crate) struct UnitGrowthStep {
     pub(crate) wide_access: bool,
     pub(crate) read_segments: u8,
     pub(crate) write_segments: u8,
+    /// The full classification, carried so the C1b lowering compiles the same shape the
+    /// walker admitted (the walker's reduced fields above stay authoritative for layout).
+    pub(crate) kind: DirectKind,
 }
 
 /// Classify one decoded instruction for clif unit growth with the SAME classifier the
@@ -2573,6 +2576,7 @@ pub(crate) fn unit_growth_classify(
         wide_access,
         read_segments,
         write_segments,
+        kind,
     })
 }
 

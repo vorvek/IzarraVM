@@ -308,13 +308,12 @@ fn generated_direct_blocks_match_interpreter_in_486_and_586_modes() {
     run_generated_mode(GswMode::Gsw586, CASES_PER_MODE);
 }
 
-/// Track C C1a's third differential arm: the same generator suite routed through the clif
-/// side-exit-shell policy instead of Direct. A C1a shell never retires a guest instruction
-/// natively (F-A1 option B), so every path, guard-reject or guard-pass, ends with the
-/// interpreter retiring the current instruction; state and timing must therefore be
-/// BYTE-IDENTICAL to the plain interpreter run, not merely equal on the architectural fields
-/// Direct's own assertions check. A mismatch here indicts the admission/guard/dispatch/
-/// exit-state layer, since no lowering exists yet to blame instead.
+/// The clif differential arm: the same generator suite routed through the clif policy
+/// instead of Direct. Since C1b the units retire their leading register/immediate runs
+/// NATIVELY (real lowering), yet state and timing must stay BYTE-IDENTICAL to the plain
+/// interpreter run, including the pending-flag descriptor bytes, raw eflags, elapsed core
+/// clocks, and bus trace clocks. A mismatch indicts the lowering, the guard layer, or the
+/// batch charging.
 #[cfg(all(
     feature = "clif-backend",
     target_arch = "x86_64",
@@ -1198,4 +1197,752 @@ fn generated_hma_load_tracks_a20_alias_and_cache_invalidation() {
             "A20 change retained native code"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C C1b: the forced-case clif lowering battery (design section 6.1). Each case is a
+// small guest program routed through the interpreter and the clif policy, asserting
+// BYTE-IDENTICAL full CPU state (registers, raw eflags, the pending descriptor itself,
+// x87), memory, and the section 5.3 timing set (elapsed core clocks, bus trace clocks,
+// timing_rem, fp_rem) after every pass, including the compile pass. The random generator
+// cannot be trusted to hit the ADC/SBB carry-set arms, the shift count classes, or the
+// word partial-write merges at useful density, so they are forced here explicitly.
+// ---------------------------------------------------------------------------------------
+
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn assert_clif_forced_case(mode: GswMode, code: &[u8], gpr: [u32; 8], eflags: u32) {
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    let entry = 0x1000u32;
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut interp = generated_cpu(mode);
+    let mut clif = generated_cpu(mode);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    for pass in 0..6 {
+        for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+            cpu.halted = false;
+            cpu.interrupt_shadow = false;
+            cpu.registers.gpr = gpr;
+            cpu.registers.eflags = eflags;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            cpu.fp_rem = 0;
+            cpu.fpu.finit();
+            cpu.fpu.push(1.25);
+            cpu.fpu.push(-2.5);
+            for _ in 0..64 {
+                let outcome = cpu
+                    .run_budgeted(bus, 4096)
+                    .expect("forced case runs to halt");
+                if outcome.halted {
+                    break;
+                }
+            }
+            assert!(cpu.halted, "forced case did not halt: {code:02x?}");
+        }
+        assert_eq!(clif.registers, interp.registers, "pass {pass}: {code:02x?}");
+        assert_eq!(
+            clif.pending_flags, interp.pending_flags,
+            "pending descriptor differs, pass {pass}: {code:02x?}"
+        );
+        assert_eq!(
+            clif.registers.eflags, interp.registers.eflags,
+            "raw eflags differ, pass {pass}: {code:02x?}"
+        );
+        assert_eq!(clif.eflags(), interp.eflags(), "pass {pass}: {code:02x?}");
+        assert_eq!(clif.fpu, interp.fpu, "pass {pass}: {code:02x?}");
+        assert_eq!(clif, interp, "full state, pass {pass}: {code:02x?}");
+        assert_eq!(
+            clif_bus.memory, interp_bus.memory,
+            "pass {pass}: {code:02x?}"
+        );
+        assert_eq!(
+            clif.elapsed_clocks, interp.elapsed_clocks,
+            "core clocks, pass {pass}: {code:02x?}"
+        );
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "bus clocks, pass {pass}: {code:02x?}"
+        );
+        assert_eq!(
+            clif.timing_rem, interp.timing_rem,
+            "timing remainder, pass {pass}: {code:02x?}"
+        );
+        assert_eq!(
+            clif.fp_rem, interp.fp_rem,
+            "fp remainder, pass {pass}: {code:02x?}"
+        );
+    }
+    assert!(
+        clif.jit_clif_counters().entries > 0,
+        "forced case never entered a clif unit: {code:02x?}, {:#?}",
+        clif.jit_clif_counters()
+    );
+}
+
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn forced_gpr() -> [u32; 8] {
+    // ESP parked in scratch RAM; values chosen to exercise carries, sign bits, and byte
+    // lanes (AH/DH nonzero high lanes).
+    [
+        0x8000_00ff,
+        0x0000_0011,
+        0xfff0_1234,
+        0x7fff_ffff,
+        0x1_f000,
+        0x0f0f_0f0f,
+        0xdead_beef,
+        0x0000_0000,
+    ]
+}
+
+/// ADC/SBB, both carry arms, dword and byte operand forms (design section 3.3): the
+/// carry-clear arm must leave the LAZY descriptor, the carry-set arm the EAGER eflags.
+/// Entry carry comes from an interpreter-retired STC/CLC (the unit's entry-state read) and
+/// from an in-unit producer (the SSA-resident read).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_adc_sbb_both_carry_arms() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // STC; ADC EAX,EBX (carry set, entry state); HLT
+        assert_clif_forced_case(mode, &[0xf9, 0x11, 0xd8, 0xf4], forced_gpr(), 0x202);
+        // CLC; ADC EAX,EBX (carry clear, entry state; lazy arm); HLT
+        assert_clif_forced_case(mode, &[0xf8, 0x11, 0xd8, 0xf4], forced_gpr(), 0x203);
+        // STC; SBB ECX,EDX; HLT
+        assert_clif_forced_case(mode, &[0xf9, 0x19, 0xd1, 0xf4], forced_gpr(), 0x202);
+        // CLC; SBB ECX,EDX; HLT
+        assert_clif_forced_case(mode, &[0xf8, 0x19, 0xd1, 0xf4], forced_gpr(), 0x203);
+        // In-unit producer: ADD EAX,EBX (sets carry from 0x800000ff + 0x7fffffff);
+        // ADC EDX,ECX; SBB EAX,EBX; HLT
+        assert_clif_forced_case(
+            mode,
+            &[0x01, 0xd8, 0x11, 0xca, 0x19, 0xd8, 0xf4],
+            forced_gpr(),
+            0x202,
+        );
+        // Byte forms through 0x80 /2 and /3 (ADC/SBB AL/CH,imm8), both entry-carry arms.
+        assert_clif_forced_case(mode, &[0xf9, 0x80, 0xd0, 0x7f, 0xf4], forced_gpr(), 0x202);
+        assert_clif_forced_case(mode, &[0xf8, 0x80, 0xd0, 0x7f, 0xf4], forced_gpr(), 0x202);
+        assert_clif_forced_case(mode, &[0xf9, 0x80, 0xdd, 0x81, 0xf4], forced_gpr(), 0x202);
+        // ADC through the dword immediate group 0x81 /2 and the sign-extended 0x83 /3.
+        assert_clif_forced_case(
+            mode,
+            &[0xf9, 0x81, 0xd3, 0xff, 0xff, 0xff, 0x7f, 0xf4],
+            forced_gpr(),
+            0x202,
+        );
+        assert_clif_forced_case(mode, &[0xf9, 0x83, 0xdb, 0x80, 0xf4], forced_gpr(), 0x202);
+    }
+}
+
+/// INC/DEC preserve CF through cf_override, from both a live entry CF and an in-unit
+/// pending producer; the descriptor bytes themselves are compared (b == 1, tag bits
+/// 16/17).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_inc_dec_preserve_cf() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // STC; INC EAX; HLT and CLC; DEC EBX; HLT (entry-state CF).
+        assert_clif_forced_case(mode, &[0xf9, 0x40, 0xf4], forced_gpr(), 0x202);
+        assert_clif_forced_case(mode, &[0xf8, 0x4b, 0xf4], forced_gpr(), 0x203);
+        // ADD sets CF; INC must carry it through the pending override; then DEC again.
+        assert_clif_forced_case(mode, &[0x01, 0xd8, 0x41, 0x4a, 0xf4], forced_gpr(), 0x202);
+        // SUB sets borrow; DEC and INC of wrapping values.
+        assert_clif_forced_case(mode, &[0x29, 0xd9, 0x4f, 0x47, 0xf4], forced_gpr(), 0x202);
+    }
+}
+
+/// Single shifts: count classes 0, 1, > 1, 31, and a masked-to-zero 32, for SHL/SHR/SAR
+/// (immediate counts; the single-shift CL form is not in the admitted set), plus the
+/// implicit-count 0xd1 forms. Counts follow an in-unit flag producer AND stand alone at
+/// unit entry (the runtime pending-none arm of set_shift_result_flags).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_shift_count_classes() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for op in [0xe0u8, 0xe8, 0xf8] {
+            for count in [0u8, 1, 5, 31, 32] {
+                // TEST EAX,EBX first: the shift sees a live Logic descriptor.
+                assert_clif_forced_case(
+                    mode,
+                    &[0x85, 0xd8, 0xc1, op, count, 0xf4],
+                    forced_gpr(),
+                    0x202,
+                );
+                // Shift at unit entry (behind an interpreted NOP starter, so the unit
+                // begins AT the shift): the shift sees pending none at runtime and the
+                // stale descriptor bytes must survive untouched.
+                assert_clif_forced_case(mode, &[0x90, 0xc1, op, count, 0xf4], forced_gpr(), 0x2d7);
+            }
+            // 0xd1: the implicit count-1 encoding, after an ADD producer.
+            assert_clif_forced_case(mode, &[0x01, 0xd8, 0xd1, op, 0xf4], forced_gpr(), 0x202);
+        }
+    }
+}
+
+/// Double shifts (SHLD/SHRD, dword): immediate counts 0/1/>1/31 and CL counts, with the
+/// flag state both live-pending and none at the shift.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_double_shift_count_classes() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for count in [0u8, 1, 7, 31] {
+            // SHLD EAX,EBX,imm and SHRD EDX,ESI,imm after ADD (pending live).
+            assert_clif_forced_case(
+                mode,
+                &[0x01, 0xd8, 0x0f, 0xa4, 0xd8, count, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+            assert_clif_forced_case(
+                mode,
+                &[0x01, 0xd8, 0x0f, 0xac, 0xf2, count, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+            // At unit entry behind an interpreted NOP starter (pending none at the
+            // shift).
+            assert_clif_forced_case(
+                mode,
+                &[0x90, 0x0f, 0xa4, 0xd8, count, 0xf4],
+                forced_gpr(),
+                0x2d7,
+            );
+            // CL forms: MOV CL,count; SHLD by CL then SHRD by CL.
+            assert_clif_forced_case(
+                mode,
+                &[0xb1, count, 0x0f, 0xa5, 0xd8, 0x0f, 0xad, 0xf2, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+        }
+    }
+}
+
+/// The no-flags group: register/immediate moves (including the AH/CH/DH high byte lanes),
+/// LEA with base/index/scale/displacement, and the TEST immediate forms.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_moves_lea_and_test_forms() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        assert_clif_forced_case(
+            mode,
+            &[
+                0xb8, 0x78, 0x56, 0x34, 0x12, // mov eax,0x12345678
+                0xb4, 0xa5, // mov ah,0xa5
+                0xb1, 0x5a, // mov cl,0x5a
+                0x88, 0xe6, // mov dh,ah
+                0x88, 0xc8, // mov al,cl
+                0x89, 0xc7, // mov edi,eax
+                0x8d, 0x84, 0x8e, 0x40, 0x02, 0x00, 0x00, // lea eax,[esi+ecx*4+0x240]
+                0xc7, 0xc3, 0x11, 0x22, 0x33, 0x44, // mov ebx,0x44332211 (c7 /0 reg)
+                0xc6, 0xc5, 0x99, // mov ch,0x99 (c6 /0 reg)
+                0xf4,
+            ],
+            forced_gpr(),
+            0x202,
+        );
+        // TEST forms: 0x85, 0xa8 (AL,imm8), 0xa9 (EAX,imm32), 0xf6 /0, 0xf7 /0.
+        assert_clif_forced_case(
+            mode,
+            &[
+                0x85, 0xf7, // test edi,esi
+                0xa8, 0x81, // test al,0x81
+                0xa9, 0x00, 0x00, 0x00, 0x80, // test eax,0x80000000
+                0xf6, 0xc6, 0xff, // test dh,0xff
+                0xf7, 0xc2, 0x34, 0x12, 0x00, 0x00, // test edx,0x1234
+                0xf4,
+            ],
+            forced_gpr(),
+            0x2d7,
+        );
+    }
+}
+
+/// I586 word forms: MOV r16 partial writes (high half preserved), word INC/DEC, and the
+/// word CMPs (0x39/0x3b), the exact word whitelist the classifier admits.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_word_forms_on_586() {
+    let code = [
+        0x66, 0x89, 0xd8, // mov ax,bx (high EAX half must survive)
+        0x66, 0x40, // inc ax
+        0x66, 0x4a, // dec dx
+        0x66, 0x39, 0xc8, // cmp ax,cx
+        0x66, 0x3b, 0xf7, // cmp si,di
+        0xf4,
+    ];
+    assert_clif_forced_case(GswMode::Gsw586, &code, forced_gpr(), 0x202);
+    // Word INC wrap at 0xffff with CF preservation from STC.
+    assert_clif_forced_case(
+        GswMode::Gsw586,
+        &[0xf9, 0x66, 0x40, 0xf4],
+        [0x1234_ffff, 0, 0, 0, 0x1_f000, 0, 0, 0],
+        0x202,
+    );
+}
+
+/// The Logic-tag group's live-AF write (alu_logic): AND/OR/XOR register and immediate
+/// forms, with a live AF inherited from a pending producer and from raw eflags.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_logic_af_semantics() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // ADD (sets pending with AF-worthy operands); AND: AF must materialize live.
+        assert_clif_forced_case(mode, &[0x01, 0xd8, 0x21, 0xca, 0xf4], forced_gpr(), 0x202);
+        // Entry AF set in raw eflags, pending none: OR then XOR then the imm forms keep it.
+        assert_clif_forced_case(
+            mode,
+            &[
+                0x09, 0xd8, 0x31, 0xf7, 0x83, 0xc9, 0x0f, 0x80, 0xe2, 0x3c, 0xf4,
+            ],
+            forced_gpr(),
+            0x212,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C C1b: the x87 call-out differential battery (design section 6.1's call-out group,
+// the end-to-end twin of clif/callout_proof_test.rs): real CpuGsw/CpuBus through the
+// widened ABI, all three dispositions.
+// ---------------------------------------------------------------------------------------
+
+/// Continue path: lowered integer instructions mixed with x87 call-outs in one unit. The
+/// shim delegates each x87 instruction to the interpreter (charging fp clocks through the
+/// normal path) and the unit resumes its next lowered slot; state, x87 stack, fp_rem, and
+/// all clocks must stay byte-identical (the F1 mixed-mechanism charging shape: batch static
+/// profile for the lowered slots, interpreter path for the call-outs, in one entry).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_x87_callout_continue_path() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // add eax,ebx; fld1; fadd st0,st1; inc ecx; fmulp; dec edx; hlt
+        let code = [
+            0x01, 0xd8, // add eax,ebx
+            0xd9, 0xe8, // fld1
+            0xd8, 0xc1, // fadd st0,st1
+            0x41, // inc ecx
+            0xde, 0xc9, // fmulp st1,st0
+            0x4a, // dec edx
+            0xf4,
+        ];
+        assert_clif_forced_case(mode, &code, forced_gpr(), 0x202);
+    }
+}
+
+/// Exit path (design finding B1's end-to-end pin): the x87 instruction delivers a real
+/// architectural fault (#NM under CR0.TS) through the interpreter inside the call-out; the
+/// retire is Ok with EIP redirected to the handler, the shim's fall-through predicate
+/// catches it, and the unit exits WITHOUT running its next lowered slot; the handler EIP is
+/// preserved bit-for-bit. State equality against the interpreter covers all of it (the
+/// interpreter also never runs the slot after the faulting instruction).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_x87_callout_fault_exit_path() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut memory = vec![0xf4u8; MEMORY_LEN];
+        let entry = 0x1000u32;
+        // add eax,ebx; fld1 (#NM under TS); inc ecx (must never run); hlt
+        let code = [0x01, 0xd8, 0xd9, 0xe8, 0x41, 0xf4];
+        memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+        // #NM handler: hlt at 0x2000. Interrupt gate for vector 7 in an IDT at 0x3000.
+        let handler = 0x2000u32;
+        memory[handler as usize] = 0xf4;
+        let idt = 0x3000usize;
+        let gate = idt + 7 * 8;
+        memory[gate] = (handler & 0xff) as u8;
+        memory[gate + 1] = ((handler >> 8) & 0xff) as u8;
+        memory[gate + 2] = 0x08; // selector low
+        memory[gate + 3] = 0x00; // selector high
+        memory[gate + 4] = 0x00;
+        memory[gate + 5] = 0x8e; // present 32-bit interrupt gate
+        memory[gate + 6] = ((handler >> 16) & 0xff) as u8;
+        memory[gate + 7] = ((handler >> 24) & 0xff) as u8;
+        // Flat GDT at 0x3800 (code 0x08, data 0x10) so the gate's CS selector loads.
+        let gdt = 0x3800usize;
+        memory[gdt + 8..gdt + 16].copy_from_slice(&[0xff, 0xff, 0, 0, 0, 0x9b, 0xcf, 0]);
+        memory[gdt + 16..gdt + 24].copy_from_slice(&[0xff, 0xff, 0, 0, 0, 0x93, 0xcf, 0]);
+
+        let mut interp = generated_cpu(mode);
+        let mut clif = generated_cpu(mode);
+        clif.set_clif_backend_enabled(true);
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut clif_bus = TestBus::with_memory(memory.clone());
+        for bus in [&mut interp_bus, &mut clif_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+
+        for pass in 0..6 {
+            for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr = forced_gpr();
+                cpu.registers.eflags = 0x202;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.control.cr0 |= CR0_TS;
+                cpu.idtr = DescriptorTable {
+                    base: 0x3000,
+                    limit: 0x7ff,
+                };
+                cpu.gdtr = DescriptorTable {
+                    base: 0x3800,
+                    limit: 0xff,
+                };
+                cpu.set_eip(entry);
+                cpu.elapsed_clocks = 0;
+                cpu.core_clocks_so_far = 0;
+                cpu.timing_rem = 0;
+                cpu.fp_rem = 0;
+                for _ in 0..64 {
+                    let outcome = cpu.run_budgeted(bus, 4096).expect("fault case reaches hlt");
+                    if outcome.halted {
+                        break;
+                    }
+                }
+                assert!(cpu.halted, "fault case did not halt");
+            }
+            assert_eq!(clif.registers, interp.registers, "pass {pass}");
+            assert_eq!(
+                clif.registers.eip,
+                handler.wrapping_add(1),
+                "both policies must halt inside the #NM handler, pass {pass}"
+            );
+            assert_eq!(clif.pending_flags, interp.pending_flags, "pass {pass}");
+            assert_eq!(clif, interp, "pass {pass}");
+            assert_eq!(clif_bus.memory, interp_bus.memory, "pass {pass}");
+            assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks, "pass {pass}");
+            assert_eq!(
+                clif_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "pass {pass}"
+            );
+            assert_eq!(clif.timing_rem, interp.timing_rem, "pass {pass}");
+            assert_eq!(clif.fp_rem, interp.fp_rem, "pass {pass}");
+        }
+        assert!(
+            clif.jit_clif_counters().entries > 0,
+            "fault case never entered a clif unit: {:#?}",
+            clif.jit_clif_counters()
+        );
+    }
+}
+
+/// Hard-stop path (design finding B2's end-to-end pin): a genuine bus error arriving from
+/// INSIDE the call-out (an x87 memory operand at an unmapped address) must relay through
+/// CLIF_CALLOUT_HARD_STOP as the IDENTICAL Err(CpuError) the interpreter-only policy
+/// returns from the same guest program, with identical CPU state left behind.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_x87_callout_bus_error_hard_stop() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let mut memory = vec![0xf4u8; MEMORY_LEN];
+        let entry = 0x1000u32;
+        // add eax,ebx; fld dword [0x00ff0000] (unmapped in TestBus); inc ecx; hlt
+        let code = [
+            0x01, 0xd8, // add eax,ebx
+            0xd9, 0x05, 0x00, 0x00, 0xff, 0x00, // fld dword [0x00ff0000]
+            0x41, // inc ecx (must never run)
+            0xf4,
+        ];
+        memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+
+        let mut interp = generated_cpu(mode);
+        let mut clif = generated_cpu(mode);
+        clif.set_clif_backend_enabled(true);
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut clif_bus = TestBus::with_memory(memory.clone());
+        for bus in [&mut interp_bus, &mut clif_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+
+        for pass in 0..6 {
+            let mut errors = Vec::new();
+            for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr = forced_gpr();
+                cpu.registers.eflags = 0x202;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.set_eip(entry);
+                cpu.elapsed_clocks = 0;
+                cpu.core_clocks_so_far = 0;
+                cpu.timing_rem = 0;
+                cpu.fp_rem = 0;
+                cpu.fpu.finit();
+                let mut error = None;
+                for _ in 0..64 {
+                    match cpu.run_budgeted(bus, 4096) {
+                        Ok(outcome) => {
+                            assert!(!outcome.halted, "the guest must error before hlt");
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
+                errors.push(error.expect("the unmapped x87 load must produce a bus error"));
+            }
+            assert_eq!(
+                errors[0], errors[1],
+                "pass {pass}: relayed Err must be identical"
+            );
+            assert_eq!(clif.registers, interp.registers, "pass {pass}");
+            assert_eq!(clif.pending_flags, interp.pending_flags, "pass {pass}");
+            assert_eq!(clif, interp, "pass {pass}");
+            assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks, "pass {pass}");
+            assert_eq!(clif.timing_rem, interp.timing_rem, "pass {pass}");
+            assert_eq!(clif.fp_rem, interp.fp_rem, "pass {pass}");
+        }
+        assert!(
+            clif.jit_clif_counters().entries > 0,
+            "hard-stop case never entered a clif unit: {:#?}",
+            clif.jit_clif_counters()
+        );
+    }
+}
+
+/// Review finding B1's reproducer, pinned: an x87 call-out that stores into the IN-FLIGHT
+/// unit's own remaining guest bytes must exit the unit rather than run stale lowering. The
+/// warm passes store to scratch (the Continue path); the final pass points EBX at the
+/// unit's own `inc eax` byte and stores an f32 whose bits decode as four `inc ebx`. The
+/// interpreter re-fetches and executes the fresh bytes (eax stays 0, ebx walks to 0x1007);
+/// the clif policy must match, which requires the invalidation-generation exit latch (the
+/// SMC choke alone only kills the unit for the NEXT entry).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_x87_store_into_own_unit_exits_in_flight() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let entry = 0x1000u32;
+        // nop (interpreted starter); fstp dword [ebx]; inc eax; hlt
+        let code = [0x90, 0xd9, 0x1b, 0x40, 0xf4];
+        let inc_eax_addr = entry + 3;
+        // f32 whose stored bits are 43 43 43 43: four `inc ebx` over the inc eax byte and
+        // the trailing hlt bytes (the fill after them is hlt again).
+        let smc_value = f64::from(f32::from_bits(0x4343_4343));
+
+        let mut memory = vec![0xf4u8; MEMORY_LEN];
+        memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+
+        let mut interp = generated_cpu(mode);
+        let mut clif = generated_cpu(mode);
+        clif.set_clif_backend_enabled(true);
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut clif_bus = TestBus::with_memory(memory.clone());
+        for bus in [&mut interp_bus, &mut clif_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+
+        for pass in 0..6 {
+            let final_pass = pass == 5;
+            let ebx = if final_pass { inc_eax_addr } else { 0x5000 };
+            for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr = [0, 0, 0, ebx, 0x1_f000, 0, 0, 0];
+                cpu.registers.eflags = 0x202;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.set_eip(entry);
+                cpu.elapsed_clocks = 0;
+                cpu.core_clocks_so_far = 0;
+                cpu.timing_rem = 0;
+                cpu.fp_rem = 0;
+                cpu.fpu.finit();
+                cpu.fpu.push(smc_value);
+                for _ in 0..64 {
+                    let outcome = cpu.run_budgeted(bus, 4096).expect("smc case reaches hlt");
+                    if outcome.halted {
+                        break;
+                    }
+                }
+                assert!(cpu.halted, "smc case did not halt, pass {pass}");
+            }
+            assert_eq!(clif.registers, interp.registers, "pass {pass}");
+            assert_eq!(clif.pending_flags, interp.pending_flags, "pass {pass}");
+            assert_eq!(clif, interp, "pass {pass}");
+            assert_eq!(clif_bus.memory, interp_bus.memory, "pass {pass}");
+            assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks, "pass {pass}");
+            assert_eq!(
+                clif_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "pass {pass}"
+            );
+            assert_eq!(clif.timing_rem, interp.timing_rem, "pass {pass}");
+            if final_pass {
+                // The fresh bytes ran: the overwritten inc eax never executed, and the four
+                // inc ebx did.
+                assert_eq!(clif.registers.eax(), 0, "stale lowering executed inc eax");
+                assert_eq!(clif.registers.ebx(), inc_eax_addr + 4);
+            }
+        }
+        assert!(
+            clif.jit_clif_counters().entries > 0,
+            "smc case never entered a clif unit: {:#?}",
+            clif.jit_clif_counters()
+        );
+    }
+}
+
+/// M1: the compile-outcome clif arm. A walkable unit whose ENTRY slot is not lowerable
+/// (a memory form) parks Dormant instead of compiling a no-op body; a compiled unit killed
+/// by an SMC write is dropped from the cache entirely (generation bumped) and the next
+/// encounter re-admits through the normal Seen -> Compiled path.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_compile_outcomes_dormant_and_smc_readmission() {
+    use crate::jit::clif::cache::{ClifUnitState, clif_key_for};
+
+    let entry = 0x1000u32;
+    // nop; mov eax,[0x5000]; hlt: the unit at the load has nothing lowerable at its entry.
+    let load_code = [0x90, 0x8b, 0x05, 0x00, 0x50, 0x00, 0x00, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + load_code.len()].copy_from_slice(&load_code);
+    let mut cpu = generated_cpu(GswMode::Gsw586);
+    cpu.set_clif_backend_enabled(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    for _ in 0..4 {
+        cpu.halted = false;
+        cpu.registers.gpr = [0, 0, 0, 0, 0x1_f000, 0, 0, 0];
+        cpu.set_eip(entry);
+        while !cpu.run_budgeted(&mut bus, 4096).expect("runs").halted {}
+    }
+    let key = clif_key_for(&cpu, entry + 1, true).expect("warm key");
+    assert_eq!(
+        cpu.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Dormant),
+        "a leading-0 unit must park Dormant"
+    );
+    assert_eq!(cpu.jit_clif_counters().units_installed, 0);
+
+    // Fresh CPU: a real unit compiles, an SMC write into its span drops the entry and
+    // bumps the generation, and the next encounters re-admit (Seen, then Compiled again).
+    let code = [0x90, 0x01, 0xd8, 0x40, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = generated_cpu(GswMode::Gsw586);
+    cpu.set_clif_backend_enabled(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    let run_pass = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.halted = false;
+        cpu.registers.gpr = [1, 0, 0, 2, 0x1_f000, 0, 0, 0];
+        cpu.registers.eflags = 0x202;
+        cpu.set_eip(entry);
+        while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+    };
+    for _ in 0..4 {
+        run_pass(&mut cpu, &mut bus);
+    }
+    let key = clif_key_for(&cpu, entry + 1, true).expect("warm key");
+    assert!(matches!(
+        cpu.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+    assert!(cpu.jit_clif_counters().units_installed >= 1);
+    let generation = cpu.jit_direct.clif_units.generation;
+
+    // SMC: rewrite the add's modrm byte (same-length instruction, different registers).
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        entry + 2,
+        0xda,
+        BusAccessKind::DataWrite,
+    )
+    .expect("smc store");
+    assert!(
+        cpu.jit_direct.clif_units.state(key).is_none(),
+        "the killed unit's entry must drop entirely"
+    );
+    assert!(
+        cpu.jit_direct.clif_units.generation > generation,
+        "the invalidation generation must move"
+    );
+
+    for _ in 0..4 {
+        run_pass(&mut cpu, &mut bus);
+    }
+    assert!(matches!(
+        cpu.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+    assert!(
+        cpu.jit_clif_counters().units_installed >= 2,
+        "the rewritten span must recompile through the normal admission path: {:#?}",
+        cpu.jit_clif_counters()
+    );
 }

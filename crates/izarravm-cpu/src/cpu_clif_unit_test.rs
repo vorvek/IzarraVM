@@ -284,6 +284,13 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         has_wide_accesses: false,
         is_self_loop: false,
         entry: 0,
+        immediates: [0; MAX_BLOCK_INSTRUCTIONS],
+        leading: 1,
+        x87_mask: 0,
+        cum_raw_before: [0; MAX_BLOCK_INSTRUCTIONS],
+        cum_lowered_before: [0; MAX_BLOCK_INSTRUCTIONS],
+        raw_clocks_total: 2,
+        lowered_total: 1,
     };
     assert!(cache.state(key).is_none());
     // Install without Seen refuses.
@@ -297,4 +304,122 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
     assert_eq!(cache.state(key), Some(ClifUnitState::Dormant));
     cache.clear();
     assert!(cache.state(key).is_none());
+}
+
+/// C1b probe: one tiny lowered unit end to end against the interpreter.
+#[test]
+fn clif_lowered_probe_minimal() {
+    // inc eax; add eax,ebx; jnz +1 (forward, not taken when zf...) then hlt
+    let code = [0x40, 0x01, 0xd8, 0x75, 0x01, 0xf4, 0xf4];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut interp = flat_cpu();
+    interp.registers.set_eax(5);
+    interp.registers.set_ebx(7);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    interp_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+    for _ in 0..8 {
+        interp.set_eip(ENTRY);
+        interp.halted = false;
+        loop {
+            let outcome = interp
+                .run_budgeted(&mut interp_bus, 4096)
+                .expect("interp run");
+            if outcome.halted {
+                break;
+            }
+        }
+    }
+
+    let mut clif = flat_cpu();
+    clif.set_clif_backend_enabled(true);
+    clif.registers.set_eax(5);
+    clif.registers.set_ebx(7);
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    clif_bus.direct_pages_enabled = true;
+    clif_bus.direct_page_clocks = true;
+    for pass in 0..8 {
+        clif.set_eip(ENTRY);
+        clif.halted = false;
+        loop {
+            let outcome = clif.run_budgeted(&mut clif_bus, 4096).expect("clif run");
+            if outcome.halted {
+                break;
+            }
+        }
+        println!(
+            "pass {pass}: eip={:#x} eax={:#x} eflags_raw={:#x} pending={:x?} entries={}",
+            clif.registers.eip,
+            clif.registers.eax(),
+            clif.registers.eflags,
+            clif.pending_flags,
+            clif.jit_clif_counters().entries
+        );
+    }
+
+    assert!(
+        clif.jit_clif_counters().entries > 0,
+        "unit never entered: {:#?}",
+        clif.jit_clif_counters()
+    );
+    assert_eq!(clif.registers, interp.registers);
+    assert_eq!(clif.eflags(), interp.eflags());
+    assert_eq!(clif.pending_flags, interp.pending_flags);
+    assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+    assert_eq!(
+        clif_bus.trace.elapsed_clocks(),
+        interp_bus.trace.elapsed_clocks()
+    );
+}
+
+/// C1b probe: straight-line unit with no terminal, full-state check per pass.
+#[test]
+fn clif_lowered_probe_straight_line() {
+    // inc eax; add eax,ebx; hlt
+    let code = [0x40, 0x01, 0xd8, 0xf4];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+
+    let mut interp = flat_cpu();
+    interp.registers.set_eax(5);
+    interp.registers.set_ebx(7);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    interp_bus.direct_pages_enabled = true;
+    interp_bus.direct_page_clocks = true;
+
+    let mut clif = flat_cpu();
+    clif.set_clif_backend_enabled(true);
+    clif.registers.set_eax(5);
+    clif.registers.set_ebx(7);
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    clif_bus.direct_pages_enabled = true;
+    clif_bus.direct_page_clocks = true;
+
+    for pass in 0..6 {
+        for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+            cpu.set_eip(ENTRY);
+            cpu.halted = false;
+            loop {
+                let outcome = cpu.run_budgeted(bus, 4096).expect("run");
+                if outcome.halted {
+                    break;
+                }
+            }
+        }
+        assert_eq!(clif.registers, interp.registers, "pass {pass}");
+        assert_eq!(clif.pending_flags, interp.pending_flags, "pass {pass}");
+        assert_eq!(
+            clif.registers.eflags, interp.registers.eflags,
+            "pass {pass}"
+        );
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks, "pass {pass}");
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "pass {pass}"
+        );
+    }
+    assert!(clif.jit_clif_counters().entries > 0);
 }

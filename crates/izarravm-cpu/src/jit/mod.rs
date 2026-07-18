@@ -97,6 +97,16 @@ pub(crate) struct JitState {
         any(target_os = "windows", target_os = "linux")
     ))]
     pub(crate) clif_backend: Option<clif::ClifBackend>,
+    /// Per-entry call-out scratch (Track C C1b): the hard-stop error relay (design finding
+    /// B2), the N1 key-material snapshot for `callout_exit_latched`, and the exit-point/
+    /// clock bookkeeping the dispatcher reads after a unit returns. Host bookkeeping only,
+    /// excluded from CpuGsw equality through this type's always-true PartialEq.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) clif_run: clif::callout::ClifRunScratch,
 }
 
 impl JitState {
@@ -117,6 +127,12 @@ impl JitState {
                 any(target_os = "windows", target_os = "linux")
             ))]
             clif_backend: None,
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            clif_run: clif::callout::ClifRunScratch::default(),
         }
     }
 }
@@ -143,6 +159,12 @@ impl Clone for JitState {
                 any(target_os = "windows", target_os = "linux")
             ))]
             clif_backend: None,
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            clif_run: clif::callout::ClifRunScratch::default(),
         }
     }
 }
