@@ -92,7 +92,7 @@ fn bcd_to_bin(n: u8) -> u8 {
 const DAYS_IN_MONTH: [u8; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 fn is_leap_year(year: u16) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 fn days_in_month(year: u16, month: u8) -> u8 {

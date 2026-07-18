@@ -902,14 +902,14 @@ impl Machine {
         // Next PIT OUT rising edge: channel 0 feeds IRQ0, channel 2 the
         // speaker/GATE timing games poll. (Channel 1: see above.)
         for channel in [0usize, 2] {
-            if let Some(ticks) = self.pit.clocks_until_out_rise(channel) {
-                if let Some(clocks) = self.timeline.cpu_clocks_until(
+            if let Some(ticks) = self.pit.clocks_until_out_rise(channel)
+                && let Some(clocks) = self.timeline.cpu_clocks_until(
                     timeline::DeviceClock::Pit,
                     ticks,
                     u64::from(PIT_INPUT_HZ),
-                ) {
-                    cap = cap.min(clocks);
-                }
+                )
+            {
+                cap = cap.min(clocks);
             }
         }
         // Next audio block IRQ edge. Both counters are expressed in output

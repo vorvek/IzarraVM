@@ -376,12 +376,11 @@ impl CpuGsw {
         // not observed until control flow or the next refill invalidates the queue.
         if self.written_pages_overflow {
             self.prefetch.invalidate();
-        } else if self.written_count > 0 {
-            if let Some(code_page) = self.prefetch.physical_page() {
-                if self.written_pages.contains(&Some(code_page)) {
-                    self.prefetch.invalidate();
-                }
-            }
+        } else if self.written_count > 0
+            && let Some(code_page) = self.prefetch.physical_page()
+            && self.written_pages.contains(&Some(code_page))
+        {
+            self.prefetch.invalidate();
         }
         // Clear only the slots that were actually written this instruction (most
         // instructions are register-only and written_count is 0, so this is a no-op

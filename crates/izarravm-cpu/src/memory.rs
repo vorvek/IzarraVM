@@ -333,10 +333,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear {
-            if self.populate_fast_map(linear, physical, page, false) {
-                self.data_read_pages.note_fast_map_linear(physical, linear);
-            }
+        if let Some(linear) = _linear
+            && self.populate_fast_map(linear, physical, page, false)
+        {
+            self.data_read_pages.note_fast_map_linear(physical, linear);
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         self.record_data_read(kind, true);
@@ -488,10 +488,10 @@ impl CpuGsw {
             target_arch = "x86_64",
             any(target_os = "windows", target_os = "linux")
         ))]
-        if let Some(linear) = _linear {
-            if self.populate_fast_map(linear, physical, page, true) {
-                self.data_write_pages.note_fast_map_linear(physical, linear);
-            }
+        if let Some(linear) = _linear
+            && self.populate_fast_map(linear, physical, page, true)
+        {
+            self.data_write_pages.note_fast_map_linear(physical, linear);
         }
         bus.charge_direct_memory(physical, BusWidth::Byte, kind)?;
         let changed = unsafe { *page.ptr.add(offset) != value };
@@ -917,7 +917,7 @@ impl CpuGsw {
         if width <= 1 || !self.alignment_armed {
             return Ok(());
         }
-        if self.current_privilege_level() == 3 && offset % width != 0 {
+        if self.current_privilege_level() == 3 && !offset.is_multiple_of(width) {
             // Real 486 #AC pushes a zero error code; this core models it without one,
             // matching the rest of the spec's fault contract. Flagged as a divergence.
             return Err(InternalFault::Exception {

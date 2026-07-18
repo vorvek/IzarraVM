@@ -600,7 +600,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(0);
         }
         let access = access_width.bytes() as usize;
-        if out.len() % access != 0 {
+        if !out.len().is_multiple_of(access) {
             return Ok(0);
         }
         if let Some((address, start, end)) =
@@ -635,7 +635,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(0);
         }
         let access = access_width.bytes() as usize;
-        if data.len() % access != 0 {
+        if !data.len().is_multiple_of(access) {
             return Ok(0);
         }
         if let Some((address, start, end)) =
@@ -669,7 +669,7 @@ impl CpuBus for MachineBus<'_> {
     ) -> usize {
         if !matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
             || bytes == 0
-            || bytes % access_width.bytes() as usize != 0
+            || !bytes.is_multiple_of(access_width.bytes() as usize)
         {
             return 0;
         }
@@ -1157,15 +1157,15 @@ impl CpuBus for MachineBus<'_> {
         // cacheable-RAM arm and charge ONE I-cache access at the constant
         // wait-state, so charge exactly that in one step. ROM/device/A20-edge
         // runs keep the full classification, byte-for-byte.
-        if let Some(end) = physical_start.checked_add(count - 1) {
-            if end < 0x000A_0000 {
-                self.trace.record_instruction_fetch_run(
-                    physical_start,
-                    1,
-                    self.cache.code_fetch_wait_states(),
-                );
-                return Ok(());
-            }
+        if let Some(end) = physical_start.checked_add(count - 1)
+            && end < 0x000A_0000
+        {
+            self.trace.record_instruction_fetch_run(
+                physical_start,
+                1,
+                self.cache.code_fetch_wait_states(),
+            );
+            return Ok(());
         }
         let first = self.apply_a20(physical_start);
         let last = self.apply_a20(physical_start.wrapping_add(count - 1));
@@ -1358,13 +1358,13 @@ impl CpuBus for MachineBus<'_> {
                     return Ok(u32::from(value));
                 }
             }
-        } else if self.vega.port_enabled(port) {
-            if let Some(value) = self.vega.read_port(port) {
-                if !skip_io_touched {
-                    *self.io_touched = true;
-                }
-                return Ok(u32::from(value));
+        } else if self.vega.port_enabled(port)
+            && let Some(value) = self.vega.read_port(port)
+        {
+            if !skip_io_touched {
+                *self.io_touched = true;
             }
+            return Ok(u32::from(value));
         }
         // Port 0x61 bits 4/5 use the same lazy
         // per-port dispatch discipline as 3DA/3BA/3C2 above -- 0x61 always lands

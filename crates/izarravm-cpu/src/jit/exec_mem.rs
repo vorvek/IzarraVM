@@ -167,7 +167,7 @@ impl ExecutableArena {
     }
 
     fn slot_is_sealed(&self, offset: usize) -> bool {
-        offset % self.page_len == 0
+        offset.is_multiple_of(self.page_len)
             && offset
                 .checked_add(self.page_len)
                 .is_some_and(|end| end <= self.sealed)

@@ -19,7 +19,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94"
 license = "GPL-3.0-only"
 repository = "https://github.com/vorvek/IzarraVM"
 authors = ["IzarraVM contributors"]

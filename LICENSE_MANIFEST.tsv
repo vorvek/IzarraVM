@@ -1,7 +1,7 @@
 path	class	origin	license	sha256
-Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	7a3a6ddbcd9dfa50d818a75180e07924c41fd239bf6bde26f324624d8e54a1ce
+Cargo.lock	generated-metadata	Cargo package resolver	GPL-3.0-only	c4eb70ee5f9017e52aafdcbb0c66f8a08daf6d9d65370ff3e3beeee7c71eb642
 LICENSE	license-text	Free Software Foundation GPL version 3 text	GPL-3.0-only	3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986
-NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	8a836e2211363a304ed1cd6d483a39e3176cfc84e664caeb830916c7022c0fbb
+NOTICE	attribution-text	IzarraVM project	GPL-3.0-only	4472cbbb564afbfaca3a3f179dadd9efecf55a80b917b62ec032db6743f88532
 crates/izarravm-cpu/tests/fixtures/conformance_sample.json	test-fixture	IzarraVM project	GPL-3.0-only	6191f0dc08877a7a1d0630386c3337a9aa4b4cb08fe6506c1fcd75769182164a
 crates/izarravm-firmware/roms/boot-suite/izarravm-test.img	generated-guest-binary	IzarraVM project source	GPL-3.0-only	12d0f8138667c06f0ed070bb672d6327a5d4cf8aa15fb0cf451999faaaeee418
 crates/izarravm-firmware/roms/boot-suite/results.inc	generated-source	IzarraVM boot suite	GPL-3.0-only	1b59bb368a2089b05b118059cbdcd38a8a8e02bf02f6d9e4acf6a7c332e37db7
@@ -91,6 +91,7 @@ scripts/realtime-gate-inputs.json	benchmark-fixture-manifest	IzarraVM project	GP
 third_party/fluidr3mono/FluidR3Mono_GM.sf3	vendored-soundfont	FluidR3Mono from MuseScore	MIT	cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2
 third_party/fluidr3mono/FluidR3Mono_License.md	third-party-license-text	FluidR3Mono by Frank Wen and Michael Cowgill	MIT	09926f9451f751408abd65162c99343f840234d2a708584808fd46427633063f
 third_party/licenses/cpal-0.15.3-Apache-2.0.txt	third-party-license-text	cpal 0.15.3	Apache-2.0	c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4
+third_party/licenses/cranelift-0.133.1-Apache-2.0-WITH-LLVM-exception.txt	third-party-license-text	Cranelift 0.133.1 from the Bytecode Alliance	Apache-2.0 WITH LLVM-exception	268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5
 third_party/licenses/midir-0.10.4-MIT.txt	third-party-license-text	midir 0.10.4 and RtMidi contributors	MIT	6fe6f623b1fa80e90679aee2f917d8978a184988ebb995ebc254cc9633903cac
 toka-dos/freedos/choice/kitten/LICENSE	third-party-license-text	FreeDOS kitten NLS	LGPL-2.1-only	20c17d8b8c48a600800dfd14f95d5cb9ff47066a9641ddeab48dc54aec96e331
 toka-dos/freedos/choice/tnyprntf/LICENSE	third-party-license-text	tnyprntf by Pasquale J. Villani	GPL-2.0-or-later	8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643

@@ -163,7 +163,7 @@ impl FluidSynth {
     }
 
     pub fn render_interleaved_i16(&mut self, output: &mut [i16]) -> Result<(), Error> {
-        if output.len() % 2 != 0 {
+        if !output.len().is_multiple_of(2) {
             return Err(Error::OutputMustBeStereo);
         }
         let frames = c_int::try_from(output.len() / 2).map_err(|_| Error::TooManyFrames)?;

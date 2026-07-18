@@ -2865,7 +2865,7 @@ const fn width_sign(width: BusWidth) -> u32 {
 }
 
 fn parity(value: u8) -> bool {
-    value.count_ones() % 2 == 0
+    value.count_ones().is_multiple_of(2)
 }
 
 /// The processor pushes a 32-bit error code after the return frame for these

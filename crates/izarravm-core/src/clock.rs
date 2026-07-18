@@ -55,7 +55,7 @@ impl ClockRate {
     pub const fn master_ticks_per_clock(self) -> Option<u64> {
         let scaled = MASTER_CLOCK_HZ as u128 * self.denominator as u128;
         let divisor = self.numerator_hz as u128;
-        if scaled % divisor != 0 {
+        if !scaled.is_multiple_of(divisor) {
             return None;
         }
         let ticks = scaled / divisor;

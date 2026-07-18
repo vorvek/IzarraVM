@@ -14,6 +14,7 @@ authors.workspace = true
 # Forward the CPU template JIT by default. Disabling defaults keeps the interpreter-only path.
 default = ["jit"]
 jit = ["izarravm-cpu/jit"]
+clif-backend = ["izarravm-cpu/clif-backend"]
 
 [dependencies]
 thiserror.workspace = true

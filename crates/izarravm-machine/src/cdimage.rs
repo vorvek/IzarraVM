@@ -107,7 +107,7 @@ impl CdImage {
     /// Mount a plain ISO: a single MODE1/2048 data track. The length must divide
     /// evenly by 2048.
     pub fn from_iso(bytes: Vec<u8>) -> Result<Self, String> {
-        if bytes.is_empty() || bytes.len() % DATA_SECTOR != 0 {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(DATA_SECTOR) {
             return Err(format!(
                 "ISO length {} is not a multiple of {DATA_SECTOR}",
                 bytes.len()

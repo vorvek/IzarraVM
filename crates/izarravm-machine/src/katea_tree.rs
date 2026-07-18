@@ -1134,34 +1134,34 @@ impl KateaTreeVolume {
             }
             // Rename/move: exactly one FRESH live entry (not already mirrored) holds
             // this entry's clusters, with a real cluster and matching kind.
-            if m.first_cluster >= 2 {
-                if let Some(claimants) = live_by_cluster.get(&m.first_cluster) {
-                    let fresh: Vec<&(u32, [u8; 11], bool)> = claimants
-                        .iter()
-                        .filter(|(d, n, is_dir)| {
-                            *is_dir == m.is_dir
+            if m.first_cluster >= 2
+                && let Some(claimants) = live_by_cluster.get(&m.first_cluster)
+            {
+                let fresh: Vec<&(u32, [u8; 11], bool)> = claimants
+                    .iter()
+                    .filter(|(d, n, is_dir)| {
+                        *is_dir == m.is_dir
                                 && !self.mirrored.contains_key(&(*d, *n))
                                 // Already taken as another disappearance's rename target
                                 // this pass (only reachable under guest-aliased clusters);
                                 // hold rather than clobber the first rename's destination.
                                 && !handled.contains(&(*d, *n))
-                        })
-                        .collect();
-                    if fresh.len() == 1 {
-                        let &(ndir, nname, _) = fresh[0];
-                        if let Some(host_dir) = self.dir_paths.get(&ndir).cloned() {
-                            let new_path = host_dir.join(crate::katea_volume::decode_83(&nname));
-                            renames.push(PendingRename {
-                                old_key: *key,
-                                new_key: (ndir, nname),
-                                old_path: m.host_path.clone(),
-                                new_path,
-                                first_cluster: m.first_cluster,
-                                is_dir: m.is_dir,
-                            });
-                            handled.insert((ndir, nname));
-                            continue;
-                        }
+                    })
+                    .collect();
+                if fresh.len() == 1 {
+                    let &(ndir, nname, _) = fresh[0];
+                    if let Some(host_dir) = self.dir_paths.get(&ndir).cloned() {
+                        let new_path = host_dir.join(crate::katea_volume::decode_83(&nname));
+                        renames.push(PendingRename {
+                            old_key: *key,
+                            new_key: (ndir, nname),
+                            old_path: m.host_path.clone(),
+                            new_path,
+                            first_cluster: m.first_cluster,
+                            is_dir: m.is_dir,
+                        });
+                        handled.insert((ndir, nname));
+                        continue;
                     }
                 }
             }
@@ -1225,11 +1225,11 @@ impl KateaTreeVolume {
             } else {
                 std::fs::remove_file(&d.path)
             };
-            if let Err(e) = res {
-                if d.path.exists() {
-                    eprintln!("katea: delete {} failed: {e}", d.path.display());
-                    continue; // hold
-                }
+            if let Err(e) = res
+                && d.path.exists()
+            {
+                eprintln!("katea: delete {} failed: {e}", d.path.display());
+                continue; // hold
             }
             self.mirrored.remove(&d.key);
             if d.is_dir {
