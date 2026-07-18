@@ -372,7 +372,7 @@ fn run_generated_mode_clif(mode: GswMode, mode_offset: u32) {
         restore_bus(&mut clif_bus, &pristine);
         arm(&mut interpreter, case);
         arm(&mut clif, case);
-        let before = clif.perf_counters().clone();
+        let before = clif.jit_clif_counters();
         let expected_fpu = interpreter.fpu.clone();
 
         let interpreted = run_to_halt(&mut interpreter, &mut interpreter_bus, case);
@@ -396,8 +396,9 @@ fn run_generated_mode_clif(mode: GswMode, mode_offset: u32) {
             "bus clocks differ: {case:#?}"
         );
         assert!(
-            clif.perf_counters().jit_clif_entries > before.jit_clif_entries,
-            "accepted seed never entered the clif shell: {case:#?}, perf={:#?}",
+            clif.jit_clif_counters().entries > before.entries,
+            "accepted seed never entered the clif shell: {case:#?}, clif={:#?}, perf={:#?}",
+            clif.jit_clif_counters(),
             clif.perf_counters()
         );
     }

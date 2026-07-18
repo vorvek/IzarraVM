@@ -643,24 +643,6 @@ pub struct PerfCounters {
     pub jit_direct_reject_alignment: u64,
     pub jit_direct_reject_fetch_limit: u64,
     pub jit_direct_reject_zero_budget: u64,
-    /// Track C C1a: clif side-exit shell admission and entry diagnostics, the clif analogues
-    /// of the `jit_direct_*`/`jit_direct_reject_*` counters above. A C1a shell never retires a
-    /// guest instruction natively (F-A1 option B: it side-exits immediately), so there is no
-    /// `jit_clif_insns` counterpart yet; `jit_clif_entries` counts adapter round trips instead.
-    pub jit_clif_compile_attempts: u64,
-    pub jit_clif_units_installed: u64,
-    pub jit_clif_entries: u64,
-    pub jit_clif_side_exits: u64,
-    pub jit_clif_reject_observer: u64,
-    pub jit_clif_reject_interrupt_shadow: u64,
-    pub jit_clif_reject_aggregate_accounting: u64,
-    pub jit_clif_reject_mode_key: u64,
-    pub jit_clif_reject_cs_layout: u64,
-    pub jit_clif_reject_cpl: u64,
-    pub jit_clif_reject_data_segment: u64,
-    pub jit_clif_reject_alignment: u64,
-    pub jit_clif_reject_fetch_limit: u64,
-    pub jit_clif_reject_zero_budget: u64,
     pub jit_direct_cache_resets: u64,
     pub jit_direct_arena_compactions: u64,
     pub jit_direct_arena_compaction_live_blocks: u64,
@@ -926,6 +908,41 @@ impl PartialEq for PollSkipMemoryCounters {
     }
 }
 impl Eq for PollSkipMemoryCounters {}
+
+/// Track C C1a: clif side-exit shell admission and entry diagnostics, the clif analogues of
+/// the `jit_direct_*`/`jit_direct_reject_*` counters in `PerfCounters`. Kept OUT of
+/// `PerfCounters` and at the very tail of `CpuGsw`, following the `PollSkipMemoryCounters`
+/// pattern exactly: growing `PerfCounters` shifts the hot `pending_flags` field off its
+/// pinned 4440 and costs the interpreter measurable wall time (the offset pin in cpu_test.rs
+/// guards it). A C1a shell never retires a guest instruction natively (F-A1 option B: it
+/// side-exits immediately), so there is no `insns` counterpart yet; `entries` counts adapter
+/// round trips instead. Unconditional (not cfg-gated) like the other diagnostic counters, so
+/// non-clif consumers can name the type.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitClifCounters {
+    pub compile_attempts: u64,
+    pub units_installed: u64,
+    pub entries: u64,
+    pub side_exits: u64,
+    pub reject_observer: u64,
+    pub reject_interrupt_shadow: u64,
+    pub reject_aggregate_accounting: u64,
+    pub reject_mode_key: u64,
+    pub reject_cs_layout: u64,
+    pub reject_cpl: u64,
+    pub reject_data_segment: u64,
+    pub reject_alignment: u64,
+    pub reject_fetch_limit: u64,
+    pub reject_zero_budget: u64,
+}
+
+impl PartialEq for JitClifCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for JitClifCounters {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
@@ -1218,6 +1235,9 @@ pub struct CpuGsw {
     /// interpreter measurable wall time. At the tail they change only the
     /// struct's total size. See `PollSkipMemoryCounters`.
     poll_skip_memory: PollSkipMemoryCounters,
+    /// Clif shell diagnostics, also at the tail for the same layout reason (Track C C1a);
+    /// see `JitClifCounters`.
+    jit_clif: JitClifCounters,
 }
 
 impl Default for CpuGsw {
@@ -1277,6 +1297,7 @@ impl Default for CpuGsw {
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
+            jit_clif: JitClifCounters::default(),
         }
     }
 }

@@ -1144,7 +1144,7 @@ impl CpuGsw {
                     // again once the decode cache has warmed enough lines to walk one unit.
                     return Ok(());
                 };
-                self.perf.jit_clif_compile_attempts += 1;
+                self.jit_clif.compile_attempts += 1;
                 // G4 dynamic half (dev_docs/specs/2026-07-15-smc-hardening-design.md): the
                 // kind MUST stay InstructionPrefetch, exactly as Direct's own gate requires
                 // (section 6.2): only a true-RAM page answers under this kind.
@@ -1207,7 +1207,7 @@ impl CpuGsw {
                     self.jit_direct.clif_units.dormant(key);
                     return Ok(());
                 };
-                self.perf.jit_clif_units_installed += 1;
+                self.jit_clif.units_installed += 1;
                 index
             }
         };
@@ -1222,8 +1222,12 @@ impl CpuGsw {
     /// a C1a shell has no native x87 codegen and so no compile-time TOP assumption to protect.
     /// G8 uses the non-chain form only (C1a has no linking yet, C1d's job). G11 (deferred
     /// short blocks) has no clif analogue: C1a has no chaining/short-block deferral concept,
-    /// so there is nothing to gate. On any reject, the interpreter runs next, matching
-    /// `run_direct_block`'s reject semantics exactly: the compiled entry is never invoked.
+    /// so there is nothing to gate. On any reject, the interpreter runs next and the compiled
+    /// entry is never invoked. One deliberate difference from `run_direct_block`: the G6/G7/G8
+    /// rejects do NOT retire-for-recompile. Retirement exists so Direct can re-specialize a
+    /// block for the new descriptor snapshot, but a C1a shell bakes nothing in, so recompiling
+    /// it would produce the identical no-op body; a stale unit can only be rejected here,
+    /// never wrongly entered. C1b revisits this once units carry real lowered state.
     #[cfg(all(
         feature = "jit",
         feature = "clif-backend",
@@ -1237,35 +1241,35 @@ impl CpuGsw {
         budget: ContinuationBudget,
     ) -> Result<(), CpuError> {
         if self.profile.enabled || diff_trace_enabled() {
-            self.perf.jit_clif_reject_observer += 1;
+            self.jit_clif.reject_observer += 1;
             return Ok(());
         }
         if self.interrupt_shadow {
-            self.perf.jit_clif_reject_interrupt_shadow += 1;
+            self.jit_clif.reject_interrupt_shadow += 1;
             return Ok(());
         }
         if !bus.native_aggregate_accounting_allowed() {
-            self.perf.jit_clif_reject_aggregate_accounting += 1;
+            self.jit_clif.reject_aggregate_accounting += 1;
             return Ok(());
         }
         if unit.key.mode_key != self.jit_mode_key() {
-            self.perf.jit_clif_reject_mode_key += 1;
+            self.jit_clif.reject_mode_key += 1;
             return Ok(());
         }
         if !unit.cs_descriptor_matches(self) {
-            self.perf.jit_clif_reject_cs_layout += 1;
+            self.jit_clif.reject_cs_layout += 1;
             return Ok(());
         }
         if unit.memory_cpl3 != (self.current_privilege_level() == 3) {
-            self.perf.jit_clif_reject_cpl += 1;
+            self.jit_clif.reject_cpl += 1;
             return Ok(());
         }
         if !unit.data_descriptors_match(self) {
-            self.perf.jit_clif_reject_data_segment += 1;
+            self.jit_clif.reject_data_segment += 1;
             return Ok(());
         }
         if unit.has_wide_accesses && self.alignment_armed && self.current_privilege_level() == 3 {
-            self.perf.jit_clif_reject_alignment += 1;
+            self.jit_clif.reject_alignment += 1;
             return Ok(());
         }
         let eip = self.registers.eip;
@@ -1277,7 +1281,7 @@ impl CpuGsw {
             .checked_sub(fetch_last)
             .is_none_or(|last_start| eip > last_start)
         {
-            self.perf.jit_clif_reject_fetch_limit += 1;
+            self.jit_clif.reject_fetch_limit += 1;
             return Ok(());
         }
         // B1, reduced to the empty-static-profile special case (plan section 5.2): a C1a
@@ -1291,7 +1295,7 @@ impl CpuGsw {
         let used = budget.total.saturating_add(bus_growth);
         let available = budget.cap.saturating_sub(used).saturating_sub(1);
         if available == 0 {
-            self.perf.jit_clif_reject_zero_budget += 1;
+            self.jit_clif.reject_zero_budget += 1;
             return Ok(());
         }
 
@@ -1316,8 +1320,8 @@ impl CpuGsw {
             jit::clif::unit::SIDE_EXIT_DISPOSITION,
             "a C1a shell has exactly one disposition"
         );
-        self.perf.jit_clif_entries += 1;
-        self.perf.jit_clif_side_exits += 1;
+        self.jit_clif.entries += 1;
+        self.jit_clif.side_exits += 1;
         Ok(())
     }
 
