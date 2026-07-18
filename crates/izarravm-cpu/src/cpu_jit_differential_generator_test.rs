@@ -2699,7 +2699,7 @@ fn clif_plan_access_counts_match_direct_compilation() {
     // stores, moffs and modrm, store-immediate), each small enough that Direct's compile
     // heuristics admit every slot, so the two backends cover IDENTICAL slot lists and the
     // count comparison is like-for-like.
-    let corpora: [&[u8]; 5] = [
+    let corpora: [&[u8]; 6] = [
         &[
             0x40, // inc eax
             0xa1, 0x00, 0x50, 0x00, 0x00, // mov eax, [0x5000]     (dword read)
@@ -2744,6 +2744,15 @@ fn clif_plan_access_counts_match_direct_compilation() {
             0xf7, 0x05, 0x10, 0x50, 0x00, 0x00, 0x44, 0x33, 0x22,
             0x11, // test dword [0x5010], 0x11223344
             0x43, // inc ebx
+            0xf4,
+        ],
+        // C1c increment 4: AluMemDest, including the second M4 asymmetry (CMP counts a
+        // READ at its width but NO store, the op 0..=6 gate on the store accessors).
+        &[
+            0x40, // inc eax
+            0x01, 0x1d, 0x00, 0x50, 0x00, 0x00, // add [0x5000], ebx (read + store)
+            0x39, 0x0d, 0x04, 0x50, 0x00, 0x00, // cmp [0x5004], ecx (read, NO store)
+            0x80, 0x3d, 0x08, 0x50, 0x00, 0x00, 0x5a, // cmp byte [0x5008], 0x5a (byte read)
             0xf4,
         ],
     ];
@@ -3135,4 +3144,341 @@ fn clif_byte_alu_mem_source_asymmetry() {
         assert_eq!(plan.access_total.dword_reads, expect_dword);
         assert_eq!(plan.access_total.stores(), 0, "read-only form");
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C C1c increment 4: the AluMemDest read-modify-write battery.
+// ---------------------------------------------------------------------------------------
+
+/// AluMemDest across every op and immediate form: the register-source encodings
+/// (`(op << 3) | 1`) for ops 0..=6 plus CMP (0x39), the byte 0x80 group with imm8 (all
+/// eight ops, two-lane slots: displacement AND operand immediate), the dword 0x81 imm32
+/// and sign-extended 0x83 imm8 groups, the ADC/SBB entry-carry arms, and the word CMP
+/// form (the only word AluMemDest the classifier's word gate admits). CMP's read-only
+/// early-return leaves memory untouched with the lazy Sub descriptor; every write form
+/// commits result and flags only past the full check list.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_alu_mem_dest_op_matrix() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // Register-source dword forms: op [0x5000], reg (src varies with op).
+        for op in 0..=7u8 {
+            let opcode = (op << 3) | 1;
+            let modrm = 0x05 | ((op & 7) << 3);
+            assert_clif_forced_case(
+                mode,
+                &[0x90, opcode, modrm, 0x00, 0x50, 0x00, 0x00, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+        }
+        // Byte 0x80 group, all eight ops, imm8 operands over the 0xf4 filler.
+        for op in 0..=7u8 {
+            assert_clif_forced_case(
+                mode,
+                &[
+                    0x90,
+                    0x80,
+                    0x05 | (op << 3),
+                    0x00,
+                    0x50,
+                    0x00,
+                    0x00,
+                    0x5a,
+                    0xf4,
+                ],
+                forced_gpr(),
+                0x202,
+            );
+        }
+        // Dword immediate groups: 0x81 imm32 and the sign-extended 0x83 imm8.
+        for op in [0u8, 1, 4, 5, 6, 7] {
+            assert_clif_forced_case(
+                mode,
+                &[
+                    0x90,
+                    0x81,
+                    0x05 | (op << 3),
+                    0x00,
+                    0x50,
+                    0x00,
+                    0x00,
+                    0x44,
+                    0x33,
+                    0x22,
+                    0x11,
+                    0xf4,
+                ],
+                forced_gpr(),
+                0x202,
+            );
+            assert_clif_forced_case(
+                mode,
+                &[
+                    0x90,
+                    0x83,
+                    0x05 | (op << 3),
+                    0x00,
+                    0x50,
+                    0x00,
+                    0x00,
+                    0x80,
+                    0xf4,
+                ],
+                forced_gpr(),
+                0x202,
+            );
+        }
+        // ADC/SBB memory destinations, both entry-carry arms, via 0x81 /2 and /3.
+        for (setcc, op) in [(0xf9u8, 2u8), (0xf8, 2), (0xf9, 3), (0xf8, 3)] {
+            assert_clif_forced_case(
+                mode,
+                &[
+                    setcc,
+                    0x81,
+                    0x05 | (op << 3),
+                    0x00,
+                    0x50,
+                    0x00,
+                    0x00,
+                    0xff,
+                    0xff,
+                    0xff,
+                    0x7f,
+                    0xf4,
+                ],
+                forced_gpr(),
+                0x202,
+            );
+        }
+        // Register-source ADC/SBB memory destinations (0x11/0x19).
+        for (setcc, opcode) in [(0xf9u8, 0x11u8), (0xf8, 0x11), (0xf9, 0x19), (0xf8, 0x19)] {
+            assert_clif_forced_case(
+                mode,
+                &[setcc, opcode, 0x1d, 0x00, 0x50, 0x00, 0x00, 0xf4],
+                forced_gpr(),
+                0x202,
+            );
+        }
+    }
+    // Word CMP memory-destination form, 586 only (0x39 is in the classifier's word list).
+    assert_clif_forced_case(
+        GswMode::Gsw586,
+        &[
+            0x90, // nop starter
+            0x66, 0x39, 0x05, 0x00, 0x50, 0x00, 0x00, // cmp word [0x5000], ax
+            0xf4,
+        ],
+        forced_gpr(),
+        0x202,
+    );
+}
+
+/// The provisional-effect fault case (design section 5 test 8): the WRITE-side permission
+/// check fails while the READ would have succeeded (a ring-3 RMW into a user READ-ONLY
+/// page). The unit side-exits BEFORE any read or candidate computation commits anything:
+/// destination memory, registers, the pending-descriptor bytes, and EFLAGS all stay
+/// byte-identical to the interpreter-only run, whose canonical re-execution raises the
+/// same fault (checked as outcome equality, not just no-crash).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_alu_mem_dest_write_denied_keeps_all_state() {
+    let entry = 0x1000u32;
+    let ring3_cpu = || {
+        let mut cpu = generated_cpu(GswMode::Gsw586);
+        cpu.control.cr0 |= CR0_PG | CR0_WP;
+        cpu.control.cr3 = 0x3000;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0b,
+                base: 0,
+                limit: u32::MAX,
+                access: 0xfb,
+                default_size_32: true,
+            },
+        );
+        for segment in [
+            SegmentIndex::Ds,
+            SegmentIndex::Ss,
+            SegmentIndex::Es,
+            SegmentIndex::Fs,
+            SegmentIndex::Gs,
+        ] {
+            cpu.registers.set_segment(
+                segment,
+                SegmentRegister {
+                    selector: 0x13,
+                    base: 0,
+                    limit: u32::MAX,
+                    access: 0xf3,
+                    default_size_32: true,
+                },
+            );
+        }
+        cpu.cpl = 3;
+        cpu
+    };
+    // Page 0x11 is user read-only (flags 5); everything else user RW (flags 7). The
+    // leading load of the RO page is PERMITTED and populates its FastMap flags, so the
+    // RMW's write-permission check is the one that fires (not the kind/unavailable one).
+    let code: &[u8] = &[
+        0x40, // inc eax
+        0xa1, 0x00, 0x10, 0x01, 0x00, // mov eax, [0x11000] (permitted read, populates)
+        0x01, 0x1d, 0x00, 0x10, 0x01, 0x00, // add [0x11000], ebx (write-denied RMW)
+        0xf4,
+    ];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+    memory[0x3000..0x3004].copy_from_slice(&0x4007u32.to_le_bytes());
+    for page in 0..32u32 {
+        let flags = if page == 0x11 { 5 } else { 7 };
+        let pte = (page << 12) | flags;
+        let offset = 0x4000 + page as usize * 4;
+        memory[offset..offset + 4].copy_from_slice(&pte.to_le_bytes());
+    }
+
+    let mut interp = ring3_cpu();
+    let mut clif = ring3_cpu();
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for _ in 0..4 {
+        let mut results = Vec::new();
+        for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+            bus.memory.copy_from_slice(&memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = [0x1122_3344, 0, 0, 0x5566_7788, 0x1_f000, 0, 0, 0];
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            let mut outcome = Ok(());
+            for _ in 0..64 {
+                match cpu.run_budgeted(bus, 4096) {
+                    Ok(o) if o.halted => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            results.push(outcome);
+        }
+        assert_eq!(results[0], results[1], "outcome differs");
+        assert_eq!(clif.registers, interp.registers);
+        assert_eq!(clif.pending_flags, interp.pending_flags);
+        assert_eq!(clif.eflags(), interp.eflags());
+        assert_eq!(clif_bus.memory, interp_bus.memory);
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+    }
+    let counters = clif.jit_clif_counters();
+    assert!(counters.entries > 0, "{counters:#?}");
+    assert!(
+        counters.mem_exit_permission > 0,
+        "the denied RMW must exit through the write-permission check: {counters:#?}"
+    );
+}
+
+/// A watched-destination RMW: `or dword [own unit bytes], 0` writes the identical value,
+/// so the inline code-watch check side-exits before ANY commit (no store, no flag
+/// change), the interpreter's canonical RMW elides the invalidation (G2), the unit
+/// survives, and state plus timing stay byte-identical across passes.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_alu_mem_dest_watched_dest_exits_before_commit() {
+    use crate::jit::clif::cache::{ClifUnitState, clif_key_for};
+
+    let entry = 0x1000u32;
+    // nop; or dword [0x1004], 0 (0x1004 holds the instruction's own displacement/imm
+    // bytes; OR with zero leaves them unchanged); inc ebx; hlt. Unit spans 0x1001..0x100d.
+    let code: &[u8] = &[
+        0x90, 0x81, 0x0d, 0x04, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0xf4,
+    ];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut interp = generated_cpu(GswMode::Gsw586);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let pass = |interp: &mut CpuGsw,
+                clif: &mut CpuGsw,
+                interp_bus: &mut TestBus,
+                clif_bus: &mut TestBus| {
+        for (cpu, bus) in [
+            (&mut *interp, &mut *interp_bus),
+            (&mut *clif, &mut *clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = forced_gpr();
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+        }
+        assert_eq!(clif.registers, interp.registers);
+        assert_eq!(clif.pending_flags, interp.pending_flags);
+        assert_eq!(clif.eflags(), interp.eflags());
+        assert_eq!(clif_bus.memory, interp_bus.memory);
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(clif.timing_rem, interp.timing_rem);
+    };
+    for _ in 0..4 {
+        pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    }
+    let key = clif_key_for(&clif, entry + 1, true).expect("warm key");
+    assert!(matches!(
+        clif.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+    let before = clif.jit_clif_counters();
+    pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    let after = clif.jit_clif_counters();
+    assert!(
+        after.mem_exit_code_watch > before.mem_exit_code_watch,
+        "the watched-destination RMW must exit through the code-watch check: {after:#?}"
+    );
+    assert!(matches!(
+        clif.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Compiled(_))
+    ));
 }

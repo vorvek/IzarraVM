@@ -297,6 +297,10 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
             source: direct::StoreSource::Imm(imm),
             ..
         }
+        | DirectKind::AluMemDest {
+            source: direct::StoreSource::Imm(imm),
+            ..
+        }
         | DirectKind::Push {
             source: direct::StoreSource::Imm(imm),
         } => imm,

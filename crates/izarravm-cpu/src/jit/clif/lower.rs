@@ -126,6 +126,7 @@ fn lowerable(kind: &DirectKind) -> bool {
             | DirectKind::Pop { .. }
             | DirectKind::AluMemSource { .. }
             | DirectKind::TestImmMem { .. }
+            | DirectKind::AluMemDest { .. }
     )
 }
 
@@ -706,6 +707,14 @@ impl<'a> UnitBuilder<'a> {
             DirectKind::TestImmMem { width, addr, .. } => {
                 self.lower_test_imm_mem(width, &addr, slot, delta);
             }
+            DirectKind::AluMemDest {
+                op,
+                source,
+                width,
+                addr,
+            } => {
+                self.lower_alu_mem_dest(op, source, width, &addr, slot, delta);
+            }
             DirectKind::Push { source } => {
                 self.lower_push(source, slot, delta);
             }
@@ -1186,6 +1195,238 @@ impl<'a> UnitBuilder<'a> {
         let result = self.b.ins().band(va, vb);
         self.lower_logic_flags(result, width);
         self.finish_mem_slot(side, delta);
+    }
+
+    /// The memory-form store-source operand: a register home read at `width` (byte forms
+    /// through the lane convention) or the slot's table-loaded operand immediate, masked.
+    fn store_source_value(
+        &mut self,
+        source: StoreSource,
+        width: MemoryWidth,
+        slot: usize,
+    ) -> Value {
+        match source {
+            StoreSource::Reg(src) => self.read_width(src, width),
+            StoreSource::Imm(_) => {
+                let v = match width {
+                    MemoryWidth::Byte => self.imm8(slot),
+                    _ => self.imm32(slot),
+                };
+                self.b.ins().band_imm(v, i64::from(width_mask(width)))
+            }
+            StoreSource::EipDelta(_) => {
+                unreachable!("EipDelta store sources exist only inside Call, a terminal")
+            }
+        }
+    }
+
+    /// The store instruction for a memory-form commit at `width` through an
+    /// already-checked host pointer.
+    fn store_width(&mut self, width: MemoryWidth, value: Value, host: Value) {
+        let memflags = self.flags();
+        match width {
+            MemoryWidth::Byte => {
+                self.b.ins().istore8(memflags, value, host, 0);
+            }
+            MemoryWidth::Word => {
+                self.b.ins().istore16(memflags, value, host, 0);
+            }
+            MemoryWidth::Dword => {
+                self.b.ins().store(memflags, value, host, 0);
+            }
+        }
+    }
+
+    /// `AluMemDest` (design section 1.3 item 4), the first read-modify-write form:
+    /// `ADD/OR/ADC/SBB/AND/SUB/XOR/CMP [mem], reg/imm`.
+    ///
+    /// `op == 7` (CMP) takes the read-only early-return shape `emit_alu_mem_dest` does
+    /// (emit.rs:1483-1496): the READ check list, the old value as `a`, the source as `b`,
+    /// a lazy Sub pending descriptor, no write and no code-watch check, since nothing is
+    /// written (this is also why the store accessors gate AluMemDest on `op: 0..=6`, the
+    /// second M4 asymmetry).
+    ///
+    /// The write forms run the checks in the normative order: the WRITE permission gate,
+    /// then the old-value read through the READ bias (section 2.9's discipline: the read
+    /// happens only after the write-permission check has passed, so a unit that fails the
+    /// write gate never performs even a successful read for this access shape), then the
+    /// write bias and sentinel (ONE lookup, its SSA value reused for the commit per
+    /// delta-resolution d2), then the code-watch check. The candidate ALU and flags
+    /// computation sits AFTER the last check rather than between steps 8 and 9: it is
+    /// pure SSA computation, so it commutes invisibly with the watch check (section 2's
+    /// fidelity note: the CHECK order is preserved exactly and no check can observe the
+    /// candidate), and placing it after the last check keeps the provisional-effects
+    /// discipline structural, exactly like Push's ESP update: no pending/eflags variable
+    /// is ever redefined on a path that can still side-exit, so a side exit's spill_all
+    /// materializes untouched state by SSA construction rather than by rollback.
+    fn lower_alu_mem_dest(
+        &mut self,
+        op: u8,
+        source: StoreSource,
+        width: MemoryWidth,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let eff = self.mem_effective_address(addr, slot);
+        if op == 7 {
+            let (linear, page64) =
+                self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+            let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+            let memflags = self.flags();
+            let a = match width {
+                MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
+                MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
+                MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
+            };
+            let b_masked = self.store_source_value(source, width, slot);
+            let result = self.b.ins().isub(a, b_masked);
+            let result = self.b.ins().band_imm(result, i64::from(width_mask(width)));
+            let tag = self.iconst(0x8000_0001 | width_tag(width));
+            self.set_pending(tag, a, b_masked, result);
+            self.finish_mem_slot(side, delta);
+            return;
+        }
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true);
+        let read_host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let a = match width {
+            MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, read_host, 0),
+            MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, read_host, 0),
+            MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, read_host, 0),
+        };
+        let write_host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
+        self.code_watch_checks(map, linear, page64, width, slot, side);
+        let b_in = self.store_source_value(source, width, slot);
+        self.alu_mem_dest_commit(op, a, b_in, width, write_host);
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// The commit half of a write-form `AluMemDest`, past every check: the candidate, the
+    /// flags bundle (the identical per-op shapes `lower_alu` gives the register forms,
+    /// with `a` the OLD MEMORY value), and the store through the ALREADY-DERIVED step-8
+    /// write pointer (d2: one lookup; `host` dominates both ADC/SBB arms since it was
+    /// produced before the carry branch).
+    fn alu_mem_dest_commit(
+        &mut self,
+        op: u8,
+        a: Value,
+        b_in: Value,
+        width: MemoryWidth,
+        host: Value,
+    ) {
+        let mask = width_mask(width);
+        let sign = width_sign(width);
+        let b_masked = self.b.ins().band_imm(b_in, i64::from(mask));
+        match op {
+            0 | 5 => {
+                let is_sub = op != 0;
+                let result = if is_sub {
+                    self.b.ins().isub(a, b_masked)
+                } else {
+                    self.b.ins().iadd(a, b_masked)
+                };
+                let result = self.b.ins().band_imm(result, i64::from(mask));
+                let tag = self.iconst(0x8000_0000 | width_tag(width) | u32::from(is_sub));
+                self.set_pending(tag, a, b_masked, result);
+                self.store_width(width, result, host);
+            }
+            1 | 4 | 6 => {
+                let result = match op {
+                    1 => self.b.ins().bor(a, b_masked),
+                    4 => self.b.ins().band(a, b_masked),
+                    _ => self.b.ins().bxor(a, b_masked),
+                };
+                let result = self.b.ins().band_imm(result, i64::from(mask));
+                self.lower_logic_flags(result, width);
+                self.store_width(width, result, host);
+            }
+            2 | 3 => {
+                // ADC/SBB: the interpreter's runtime carry branch, byte-for-byte the
+                // register form's two arms (lower_alu op 2|3) with the memory old value
+                // as `a` and the store as the destination write.
+                let cf = self.flag_cf();
+                let carry_block = self.b.create_block();
+                let clear_block = self.b.create_block();
+                let join = self.b.create_block();
+                self.b.ins().brif(cf, carry_block, &[], clear_block, &[]);
+
+                self.b.switch_to_block(clear_block);
+                self.b.seal_block(clear_block);
+                {
+                    let is_sub = op == 3;
+                    let result = if is_sub {
+                        self.b.ins().isub(a, b_masked)
+                    } else {
+                        self.b.ins().iadd(a, b_masked)
+                    };
+                    let result = self.b.ins().band_imm(result, i64::from(mask));
+                    let tag = self.iconst(0x8000_0000 | width_tag(width) | u32::from(is_sub));
+                    self.set_pending(tag, a, b_masked, result);
+                    self.store_width(width, result, host);
+                }
+                self.b.ins().jump(join, &[]);
+
+                self.b.switch_to_block(carry_block);
+                self.b.seal_block(carry_block);
+                {
+                    let a64 = self.b.ins().uextend(types::I64, a);
+                    let b64 = self.b.ins().uextend(types::I64, b_masked);
+                    let (result, cf_new, of) = if op == 2 {
+                        // alu_add_eager with carry == 1.
+                        let sum = self.b.ins().iadd(a64, b64);
+                        let sum = self.b.ins().iadd_imm(sum, 1);
+                        let result = self.b.ins().ireduce(types::I32, sum);
+                        let result = self.b.ins().band_imm(result, i64::from(mask));
+                        let cf_new =
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::UnsignedGreaterThan, sum, i64::from(mask));
+                        let cf_new = self.b.ins().uextend(types::I32, cf_new);
+                        let axr = self.b.ins().bxor(a, result);
+                        let bxr = self.b.ins().bxor(b_masked, result);
+                        let bits = self.b.ins().band(axr, bxr);
+                        let bits = self.b.ins().band_imm(bits, i64::from(sign));
+                        let of = self.b.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+                        let of = self.b.ins().uextend(types::I32, of);
+                        (result, cf_new, of)
+                    } else {
+                        // alu_sub_eager with borrow == 1: rhs = b + 1, result = a - rhs.
+                        let rhs = self.b.ins().iadd_imm(b64, 1);
+                        let diff = self.b.ins().isub(a64, rhs);
+                        let result = self.b.ins().ireduce(types::I32, diff);
+                        let result = self.b.ins().band_imm(result, i64::from(mask));
+                        let cf_new = self.b.ins().icmp(IntCC::UnsignedLessThan, a64, rhs);
+                        let cf_new = self.b.ins().uextend(types::I32, cf_new);
+                        let axb = self.b.ins().bxor(a, b_masked);
+                        let axr = self.b.ins().bxor(a, result);
+                        let bits = self.b.ins().band(axb, axr);
+                        let bits = self.b.ins().band_imm(bits, i64::from(sign));
+                        let of = self.b.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+                        let of = self.b.ins().uextend(types::I32, of);
+                        (result, cf_new, of)
+                    };
+                    let x = self.b.ins().bxor(a, b_masked);
+                    let x = self.b.ins().bxor(x, result);
+                    let af = self.bit(x, 4);
+                    let (zf, sf, pf) = self.szp_bits(result, sign);
+                    self.write_eflags_all(cf_new, pf, af, zf, sf, of);
+                    self.store_width(width, result, host);
+                }
+                self.b.ins().jump(join, &[]);
+
+                self.b.switch_to_block(join);
+                self.b.seal_block(join);
+            }
+            _ => unreachable!("alu op {op}"),
+        }
     }
 
     /// `inc_dec` (core.rs:1158): Add/Sub pending tag with the CURRENT CF preserved through
