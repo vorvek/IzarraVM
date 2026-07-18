@@ -1,0 +1,153 @@
+// This file is part of IzarraVM and is licensed under GNU GPL version 3 only.
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! Backend-neutral link-chaining vocabulary (Track C C1d-pre hoist).
+//!
+//! `LinkTarget`, `BlockPortal` (plus `zero_portal`), `LinkCell`, and `LinkSource` moved out of
+//! `jit::direct` VERBATIM (field-for-field, method-for-method): none of the four referenced
+//! anything Direct-specific in their own definitions, and the extraction is behavior-preserving
+//! for Direct (see `dev_docs/plans/2026-07-19-track-c1d-design.md` section 5.1). `LinkSource` is
+//! generic over its own `SourceId` type parameter so a future backend (clif, Track C1d-main) can
+//! instantiate it over its own unit-index type without pulling in Direct's `BlockId` (which stays
+//! in `direct.rs`, since it carries Direct's generational-slot semantics and is not itself
+//! mechanism-neutral); Direct instantiates `LinkSource<BlockId>`.
+//!
+//! These types are mechanism-neutral pointers-with-ordering ONLY: they carry no assumption about
+//! what a "hidden" or "unresolved" link looks like. `zero_portal()` and `BlockPortal`/`LinkCell`'s
+//! zero-address default are DIRECT'S OWN mechanism (an inline zero-check against a permanent
+//! sentinel portal whose `body` is always 0), documented on each method below; a different backend
+//! may publish its own sentinel portal with a non-zero, backend-specific address and compare
+//! against THAT instead of zero (as clif's design does, see the C1d design doc section 3.3b). Do
+//! not read `zero_portal`/the zero-body convention as a shared invariant every backend must honor.
+//!
+//! CACHE-level bookkeeping (the tables that key, resolve, and invalidate against these types) and
+//! the resolution algorithms that operate on them stay OWNED separately by each backend's own
+//! cache type; only this shared vocabulary is common.
+
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU32, AtomicUsize, Ordering},
+};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct LinkTarget {
+    pub(crate) linear: u32,
+    pub(crate) mode_key: u32,
+}
+
+/// A published jump target: the address of whatever landing record a resolved link should
+/// transfer to. Direct publishes a `CompiledBlock`'s native entry point here; a different
+/// backend may publish a different kind of landing record (e.g. a descriptor address), since
+/// the portal itself does not interpret `body`, it only stores and orders it.
+#[repr(C)]
+pub(crate) struct BlockPortal {
+    pub(crate) body: AtomicUsize,
+}
+
+impl BlockPortal {
+    pub(crate) fn new() -> Self {
+        Self {
+            body: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn address(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Direct's own hide: publish the zero sentinel value. `zero`'s meaning ("unresolved" or
+    /// "hidden") is Direct's convention, not a property this type enforces; a backend that needs
+    /// a different hidden representation should not call `clear` and should instead `publish`
+    /// its own sentinel address (see the module doc comment).
+    pub(crate) fn clear(&self) {
+        self.body.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn publish(&self, body: usize) {
+        debug_assert_ne!(body, 0);
+        self.body.store(body, Ordering::Release);
+    }
+
+    /// Direct's own linked-ness predicate: non-zero `body`. This is DIRECT'S mechanism (the
+    /// inline zero-check unresolved sentinel), not a shared invariant; a backend using a
+    /// non-zero sentinel representation must not rely on this predicate and should define its
+    /// own comparison against its own sentinel address instead.
+    pub(crate) fn visible(&self) -> bool {
+        self.body.load(Ordering::Acquire) != 0
+    }
+}
+
+/// Direct's own permanent zero-body sentinel portal: every fresh `LinkCell` points at this until
+/// linked, and hiding a block repoints its portal back to the zero body. This is Direct's
+/// mechanism for representing "unresolved"/"hidden"; it is not shared, mechanism-neutral storage
+/// in the sense the rest of this module is; a different backend that needs its own sentinel
+/// representation (e.g. a non-zero sentinel descriptor address) publishes its own static portal
+/// instead of calling this function. Kept in the shared module because it is, structurally, just
+/// a static `BlockPortal` instance holding a permanent value; only its zero-body INTERPRETATION is
+/// Direct-specific.
+pub(crate) fn zero_portal() -> &'static BlockPortal {
+    static ZERO_PORTAL: OnceLock<BlockPortal> = OnceLock::new();
+    ZERO_PORTAL.get_or_init(BlockPortal::new)
+}
+
+#[repr(C)]
+pub(crate) struct LinkCell {
+    pub(crate) portal: AtomicUsize,
+    pub(crate) target_eip: AtomicU32,
+}
+
+impl LinkCell {
+    /// A fresh cell defaults to Direct's own zero-body sentinel portal (`zero_portal`); see that
+    /// function's doc comment for why this default is Direct-mechanism, not a shared invariant.
+    pub(crate) fn new() -> Self {
+        Self {
+            portal: AtomicUsize::new(zero_portal().address()),
+            target_eip: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn address(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Direct's own unlink: repoint this cell at the zero-body sentinel portal (`zero_portal`).
+    /// See `zero_portal`'s doc comment: this default is Direct's mechanism, not a shared
+    /// invariant every backend must reproduce.
+    pub(crate) fn clear(&self) {
+        self.portal
+            .store(zero_portal().address(), Ordering::Release);
+    }
+
+    pub(crate) fn set(&self, portal: &BlockPortal) {
+        self.portal.store(portal.address(), Ordering::Release);
+    }
+
+    pub(crate) fn set_dynamic(&self, target_eip: u32, portal: &BlockPortal) {
+        self.target_eip.store(target_eip, Ordering::Relaxed);
+        self.set(portal);
+    }
+
+    /// Direct's own linked-ness predicate: compares the loaded portal address against
+    /// `zero_portal`'s address, then defers to `BlockPortal::visible` (also a Direct-mechanism
+    /// zero-body check). A different backend's linked-ness predicate should compare against its
+    /// own sentinel portal's address instead (see the module doc comment).
+    pub(crate) fn linked(&self) -> bool {
+        let portal = self.portal.load(Ordering::Acquire);
+        if portal == zero_portal().address() {
+            return false;
+        }
+        // A live cache owns every published portal in stable Arc storage. BlockCache::drop clears
+        // every cell to the permanent sentinel before releasing that storage.
+        unsafe { &*(portal as *const BlockPortal) }.visible()
+    }
+}
+
+/// One inbound reference: the source unit and which of its (at most two) outbound slots points
+/// at the target this `LinkSource` is recorded against. Generic over `Id` so each backend can
+/// instantiate this with its own unit-identity type (Direct: `BlockId`, staying in `direct.rs`
+/// since it carries Direct's generational-slot semantics and is not itself mechanism-neutral).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LinkSource<Id> {
+    pub(crate) block: Id,
+    pub(crate) slot: u8,
+}

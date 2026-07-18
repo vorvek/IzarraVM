@@ -41,6 +41,14 @@ pub(crate) mod exec_mem;
     any(target_os = "windows", target_os = "linux")
 ))]
 pub(crate) mod fast_map;
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
+pub(crate) mod links;
 #[allow(dead_code)]
 pub(crate) mod native_x87;
 mod region;

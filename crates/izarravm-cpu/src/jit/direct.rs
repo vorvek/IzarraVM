@@ -6,13 +6,7 @@
 mod classify;
 mod emit;
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use izarravm_core::CpuPersona;
 
@@ -72,95 +66,13 @@ const DEFAULT_ADMISSION_HEAT: u8 = 1;
 pub(crate) use super::smc_heat::SMC_HEAT_THRESHOLD;
 pub(crate) use super::smc_heat::{SMC_HEAT_EPOCH_SHIFT, SmcHeatMap};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct LinkTarget {
-    linear: u32,
-    mode_key: u32,
-}
-
-#[repr(C)]
-struct BlockPortal {
-    body: AtomicUsize,
-}
-
-impl BlockPortal {
-    fn new() -> Self {
-        Self {
-            body: AtomicUsize::new(0),
-        }
-    }
-
-    fn address(&self) -> usize {
-        std::ptr::from_ref(self) as usize
-    }
-
-    fn clear(&self) {
-        self.body.store(0, Ordering::Release);
-    }
-
-    fn publish(&self, body: usize) {
-        debug_assert_ne!(body, 0);
-        self.body.store(body, Ordering::Release);
-    }
-
-    fn visible(&self) -> bool {
-        self.body.load(Ordering::Acquire) != 0
-    }
-}
-
-fn zero_portal() -> &'static BlockPortal {
-    static ZERO_PORTAL: OnceLock<BlockPortal> = OnceLock::new();
-    ZERO_PORTAL.get_or_init(BlockPortal::new)
-}
-
-#[repr(C)]
-struct LinkCell {
-    portal: AtomicUsize,
-    target_eip: AtomicU32,
-}
-
-impl LinkCell {
-    fn new() -> Self {
-        Self {
-            portal: AtomicUsize::new(zero_portal().address()),
-            target_eip: AtomicU32::new(0),
-        }
-    }
-
-    fn address(&self) -> usize {
-        std::ptr::from_ref(self) as usize
-    }
-
-    fn clear(&self) {
-        self.portal
-            .store(zero_portal().address(), Ordering::Release);
-    }
-
-    fn set(&self, portal: &BlockPortal) {
-        self.portal.store(portal.address(), Ordering::Release);
-    }
-
-    fn set_dynamic(&self, target_eip: u32, portal: &BlockPortal) {
-        self.target_eip.store(target_eip, Ordering::Relaxed);
-        self.set(portal);
-    }
-
-    fn linked(&self) -> bool {
-        let portal = self.portal.load(Ordering::Acquire);
-        if portal == zero_portal().address() {
-            return false;
-        }
-        // A live cache owns every published portal in stable Arc storage. BlockCache::drop clears
-        // every cell to the permanent sentinel before releasing that storage.
-        unsafe { &*(portal as *const BlockPortal) }.visible()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LinkSource {
-    block: BlockId,
-    slot: u8,
-}
+// Track C C1d-pre hoist: LinkTarget/BlockPortal (+ zero_portal)/LinkCell/LinkSource moved,
+// verbatim, into the backend-neutral `jit::links` module (see that module's doc comment for the
+// mechanism-neutrality contract). `LinkSource` is generic over its source-id type; Direct
+// instantiates it with its own `BlockId`, which stays here since it carries Direct's
+// generational-slot semantics.
+use super::links::LinkSource;
+pub(crate) use super::links::{BlockPortal, LinkCell, LinkTarget, zero_portal};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BlockCacheStats {
@@ -529,11 +441,11 @@ pub(crate) struct BlockCache {
     blocks: Vec<CompiledBlock>,
     block_portals: Vec<Arc<BlockPortal>>,
     link_cells: Vec<[Arc<LinkCell>; 2]>,
-    link_sources: HashMap<usize, LinkSource>,
+    link_sources: HashMap<usize, LinkSource<BlockId>>,
     outbound: Vec<[Option<BlockId>; 2]>,
     dynamic_next_slots: Vec<u8>,
-    inbound: HashMap<BlockId, Vec<LinkSource>>,
-    waiting: HashMap<LinkTarget, Vec<LinkSource>>,
+    inbound: HashMap<BlockId, Vec<LinkSource<BlockId>>>,
+    waiting: HashMap<LinkTarget, Vec<LinkSource<BlockId>>>,
     linear_blocks: HashMap<LinkTarget, BlockId>,
     decode_dependencies: Box<[Vec<BlockId>]>,
     block_decode_slots: Vec<Vec<u32>>,
