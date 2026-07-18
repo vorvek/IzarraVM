@@ -55,22 +55,45 @@ fn cli_accepts_explicit_interpreter_backend() {
 #[test]
 fn execution_backend_requires_avx2_only_for_native_builds() {
     assert_eq!(
-        requested_execution_backend(false, true, true),
+        requested_execution_backend(false, false, true, true, false),
         Ok(ExecutionBackend::Automatic)
     );
     assert!(
-        requested_execution_backend(false, true, false)
+        requested_execution_backend(false, false, true, false, false)
             .unwrap_err()
             .contains("AVX2")
     );
     assert_eq!(
-        requested_execution_backend(true, true, false),
+        requested_execution_backend(true, false, true, false, false),
         Ok(ExecutionBackend::Interpreter)
     );
     assert_eq!(
-        requested_execution_backend(false, false, false),
+        requested_execution_backend(false, false, false, false, false),
         Ok(ExecutionBackend::Interpreter)
     );
+}
+
+/// F-A6 pin: --clif without the clif-backend feature is a loud CLI error, never a silent
+/// fallback; with the feature it selects the Clif policy and still requires AVX2.
+#[test]
+fn clif_backend_selection_fails_loudly_without_the_feature() {
+    assert!(
+        requested_execution_backend(false, true, true, true, false)
+            .unwrap_err()
+            .contains("clif-backend")
+    );
+    assert_eq!(
+        requested_execution_backend(false, true, true, true, true),
+        Ok(ExecutionBackend::Clif)
+    );
+    assert!(
+        requested_execution_backend(false, true, true, false, true)
+            .unwrap_err()
+            .contains("AVX2")
+    );
+    let cli = Cli::try_parse_from(["izarravm", "--clif"]).unwrap();
+    assert!(cli.clif);
+    assert!(Cli::try_parse_from(["izarravm", "--clif", "--interpreter"]).is_err());
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

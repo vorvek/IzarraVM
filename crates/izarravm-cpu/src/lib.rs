@@ -909,6 +909,41 @@ impl PartialEq for PollSkipMemoryCounters {
 }
 impl Eq for PollSkipMemoryCounters {}
 
+/// Track C C1a: clif side-exit shell admission and entry diagnostics, the clif analogues of
+/// the `jit_direct_*`/`jit_direct_reject_*` counters in `PerfCounters`. Kept OUT of
+/// `PerfCounters` and at the very tail of `CpuGsw`, following the `PollSkipMemoryCounters`
+/// pattern exactly: growing `PerfCounters` shifts the hot `pending_flags` field off its
+/// pinned 4440 and costs the interpreter measurable wall time (the offset pin in cpu_test.rs
+/// guards it). A C1a shell never retires a guest instruction natively (F-A1 option B: it
+/// side-exits immediately), so there is no `insns` counterpart yet; `entries` counts adapter
+/// round trips instead. Unconditional (not cfg-gated) like the other diagnostic counters, so
+/// non-clif consumers can name the type.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitClifCounters {
+    pub compile_attempts: u64,
+    pub units_installed: u64,
+    pub entries: u64,
+    pub side_exits: u64,
+    pub reject_observer: u64,
+    pub reject_interrupt_shadow: u64,
+    pub reject_aggregate_accounting: u64,
+    pub reject_mode_key: u64,
+    pub reject_cs_layout: u64,
+    pub reject_cpl: u64,
+    pub reject_data_segment: u64,
+    pub reject_alignment: u64,
+    pub reject_fetch_limit: u64,
+    pub reject_zero_budget: u64,
+}
+
+impl PartialEq for JitClifCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for JitClifCounters {}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
     pub name: &'static str,
@@ -1200,6 +1235,9 @@ pub struct CpuGsw {
     /// interpreter measurable wall time. At the tail they change only the
     /// struct's total size. See `PollSkipMemoryCounters`.
     poll_skip_memory: PollSkipMemoryCounters,
+    /// Clif shell diagnostics, also at the tail for the same layout reason (Track C C1a);
+    /// see `JitClifCounters`.
+    jit_clif: JitClifCounters,
 }
 
 impl Default for CpuGsw {
@@ -1259,6 +1297,7 @@ impl Default for CpuGsw {
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
             poll_skip_memory: PollSkipMemoryCounters::default(),
+            jit_clif: JitClifCounters::default(),
         }
     }
 }
@@ -1982,6 +2021,15 @@ struct DecodeLine {
     /// Saturating direct-code admission count, independent of legacy region stamps.
     #[cfg(feature = "jit")]
     jit_direct_hotness: u8,
+    /// Independent clif admission counter (Track C C1a, plan section 2.4 row P4): the two
+    /// backends compile under a runtime policy switch (decision D-C1.4) with their own
+    /// hotness history, so this never shares `jit_direct_hotness`.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    jit_clif_hotness: u8,
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
@@ -2332,6 +2380,12 @@ impl DecodeCache {
             jit_hotness: 0,
             #[cfg(feature = "jit")]
             jit_direct_hotness: 0,
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_clif_hotness: 0,
         };
 
         DecodeInsertOutcome {
@@ -2514,6 +2568,26 @@ impl DecodeCache {
             line.jit_direct_hotness += 1;
         }
         line.jit_direct_hotness == threshold
+    }
+
+    /// Clif analogue of `direct_hot` (Track C C1a, plan section 2.4 row P4): an independent
+    /// per-decode-line counter, since the two backends compile under a runtime policy switch
+    /// (decision D-C1.4) and never share admission history.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn clif_hot(&mut self, lin: u32, d: bool, threshold: u8) -> bool {
+        let line = &mut self.lines[(lin & self.mask) as usize];
+        if line.generation != self.generation || line.tag != lin || line.d != d {
+            return false;
+        }
+        if line.jit_clif_hotness < threshold {
+            line.jit_clif_hotness += 1;
+        }
+        line.jit_clif_hotness == threshold
     }
 
     /// Invalidate every cached line and drop every matching code watch. The generation advance and

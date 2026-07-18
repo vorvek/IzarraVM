@@ -5,7 +5,11 @@ use super::*;
 
 // C0 Task L battery: nested here (rather than in cpu_test.rs, which sits at its frozen
 // legacy line ceiling) so the shared TestBus fixture stays reachable.
-#[cfg(feature = "clif-backend")]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
 #[path = "cpu_clif_unit_test.rs"]
 mod clif_unit;
 

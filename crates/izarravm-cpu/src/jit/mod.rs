@@ -70,10 +70,33 @@ pub(crate) use region::RegionTable;
 /// single pointer, so the hot interpreter field offsets stay put (the pending_flags pin in
 /// cpu_test.rs). `Deref` to the block cache keeps the pervasive `jit_direct.<method>` call
 /// surface unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
     pub(crate) smc_heat: direct::SmcHeatMap,
+    /// The per-instance clif policy flag (Track C C1a, plan decision D-C1.4 seam 2): the
+    /// clif analogue of the Direct backend's enabled bit, settable per CpuGsw so
+    /// differential tests route one instance through clif and another through Direct in one
+    /// process. Present in every jit build (not only clif-backend) so policy gates such as
+    /// poll_skip_eligible read one condition everywhere; without the feature no admission
+    /// path ever consults it beyond that gate.
+    pub(crate) clif_enabled: bool,
+    /// The clif unit cache (Track C C1a, decision D-C1.1): key-based entries and per-unit
+    /// descriptors, parallel to `direct` and sharing `smc_heat` through split borrows.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) clif_units: clif::cache::ClifUnitCache,
+    /// The pinned-ISA compile-and-install backend, built lazily on the first clif admission
+    /// attempt so a run that never enables the clif policy never pays for the ISA pin or the
+    /// arena reservation. `None` both before first use and after an unsupported-host failure.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) clif_backend: Option<clif::ClifBackend>,
 }
 
 impl JitState {
@@ -81,7 +104,55 @@ impl JitState {
         Self {
             direct,
             smc_heat: direct::SmcHeatMap::default(),
+            clif_enabled: false,
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            clif_units: clif::cache::ClifUnitCache::default(),
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            clif_backend: None,
         }
+    }
+}
+
+// Manual Clone/Debug (replacing the prior derive) because the clif backend and unit cache are
+// host-only accelerators, not architectural state: a clone gets a FRESH backend and an empty
+// unit cache (exactly how `BlockCache::clone` drops its compiled blocks), never a deep copy of
+// installed native code or the pinned ISA handle.
+impl Clone for JitState {
+    fn clone(&self) -> Self {
+        Self {
+            direct: self.direct.clone(),
+            smc_heat: self.smc_heat.clone(),
+            clif_enabled: self.clif_enabled,
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            clif_units: clif::cache::ClifUnitCache::default(),
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            clif_backend: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for JitState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitState")
+            .field("direct", &self.direct)
+            .field("clif_enabled", &self.clif_enabled)
+            .finish()
     }
 }
 
@@ -97,3 +168,14 @@ impl std::ops::DerefMut for JitState {
         &mut self.direct
     }
 }
+
+// Host-only policy and cache state (F-A8): never influences architectural comparisons, so
+// equality always holds, exactly like the block cache and heat map it wraps. The
+// clif_enabled policy flag must not make two otherwise-identical CPUs compare unequal in
+// differential tests that route one instance through each backend.
+impl PartialEq for JitState {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for JitState {}

@@ -177,3 +177,124 @@ fn clif_register_unit_matches_the_interpreter_state() {
     assert_eq!(native.registers.eip, interpreter.registers.eip);
     assert_eq!(native.registers.eip, ENTRY + GUEST_BYTES.len() as u32);
 }
+
+use crate::jit::clif::cache::{ClifUnitState, clif_key_for, walk_unit};
+
+fn warm_lines(cpu: &mut CpuGsw, bus: &mut TestBus, starts: &[u32]) {
+    for &offset in starts {
+        cpu.set_eip(offset);
+        cpu.fetch_decoded(bus, offset).expect("warm decode");
+    }
+    cpu.set_eip(ENTRY);
+}
+
+/// C1a growth walker (F-A5): terminates on a Jcc terminal (included), computes the guest
+/// byte layout, flags the self-loop, and stops at the first unclassifiable opcode.
+#[test]
+fn clif_walker_terminates_on_jcc_and_flags_the_self_loop() {
+    // inc eax; add eax, ebx; jnz -4 (back to entry): 1 + 2 + 2 bytes.
+    let code = [0x40, 0x01, 0xd8, 0x75, 0xfb];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    warm_lines(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 3]);
+    let layout = walk_unit(&cpu, ENTRY, true).expect("unit layout");
+    assert_eq!(layout.instructions, 3);
+    assert_eq!(layout.guest_len, 5);
+    assert_eq!(&layout.fetch_lens[..3], &[1, 2, 2]);
+    assert!(layout.is_self_loop, "taken target is the unit entry");
+    assert!(!layout.has_wide_accesses, "register-only unit");
+
+    // The same body with a forward Jcc is not a self-loop.
+    let code = [0x40, 0x01, 0xd8, 0x75, 0x02];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    warm_lines(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 3]);
+    let layout = walk_unit(&cpu, ENTRY, true).expect("unit layout");
+    assert_eq!(layout.instructions, 3);
+    assert!(!layout.is_self_loop);
+}
+
+/// Q1 stop-growth: the first structurally unclassifiable opcode ends the unit BEFORE it,
+/// and a cold line ends it the same way.
+#[test]
+fn clif_walker_stops_before_an_unclassifiable_opcode() {
+    // inc eax; hlt (0xf4 is not classifiable by the Direct classifier).
+    let code = [0x40, 0xf4];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    warm_lines(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1]);
+    let layout = walk_unit(&cpu, ENTRY, true).expect("unit layout");
+    assert_eq!(layout.instructions, 1);
+    assert_eq!(layout.guest_len, 1);
+    // An entry that is itself unclassifiable yields no unit at all.
+    assert!(walk_unit(&cpu, ENTRY + 1, true).is_none());
+}
+
+/// K1-K5: the clif key applies the same static exclusions as direct::key_for.
+#[test]
+fn clif_key_for_applies_the_direct_static_exclusions() {
+    let code = [0x40, 0x75, 0xfd];
+    let mut memory = vec![0xf4u8; 0x2000];
+    memory[ENTRY as usize..ENTRY as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = flat_cpu();
+    let mut bus = TestBus::with_memory(memory);
+    warm_lines(&mut cpu, &mut bus, &[ENTRY]);
+    let key = clif_key_for(&cpu, ENTRY, true).expect("flat 586 key");
+    assert_eq!(key.linear, ENTRY);
+    assert_eq!(key.physical, ENTRY);
+    assert_eq!(key.mode_key, cpu.jit_mode_key());
+    // K2: the 16-bit decode variant never keys.
+    assert!(clif_key_for(&cpu, ENTRY, false).is_none());
+    // K3: only the Approximate personas key.
+    cpu.set_mode(GswMode::Gsw386);
+    assert!(clif_key_for(&cpu, ENTRY, true).is_none());
+    cpu.set_mode(GswMode::Gsw586);
+    // K4: the BIOS F-page window never keys.
+    assert!(clif_key_for(&cpu, 0x000f_f000, true).is_none());
+    assert!(clif_key_for(&cpu, 0x000f_f3ff, true).is_none());
+    // K5: a cold line (no physical) never keys.
+    assert!(clif_key_for(&cpu, ENTRY + 0x100, true).is_none());
+}
+
+/// Cache admission states mirror the Direct roles: Seen before install, Compiled after,
+/// Dormant parks, and install refuses keys not in Seen.
+#[test]
+fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
+    use crate::jit::clif::cache::{ClifUnitCache, ClifUnitDescriptor, ClifUnitKey};
+    use crate::jit::direct::{MAX_BLOCK_INSTRUCTIONS, SegmentLayout};
+    let mut cache = ClifUnitCache::default();
+    let key = ClifUnitKey {
+        linear: 0x1000,
+        physical: 0x1000,
+        mode_key: 7,
+    };
+    let descriptor = ClifUnitDescriptor {
+        key,
+        guest_len: 3,
+        fetch_lens: [0; MAX_BLOCK_INSTRUCTIONS],
+        instructions: 2,
+        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0).expect("default layout"),
+        memory_cpl3: false,
+        has_wide_accesses: false,
+        is_self_loop: false,
+        entry: 0,
+    };
+    assert!(cache.state(key).is_none());
+    // Install without Seen refuses.
+    assert!(cache.install(descriptor.clone()).is_none());
+    cache.note_seen(key);
+    assert_eq!(cache.state(key), Some(ClifUnitState::Seen));
+    let index = cache.install(descriptor).expect("install after Seen");
+    assert_eq!(cache.state(key), Some(ClifUnitState::Compiled(index)));
+    assert_eq!(cache.unit(index).expect("descriptor").instructions, 2);
+    cache.park_dormant(key);
+    assert_eq!(cache.state(key), Some(ClifUnitState::Dormant));
+    cache.clear();
+    assert!(cache.state(key).is_none());
+}

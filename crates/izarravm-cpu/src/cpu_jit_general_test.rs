@@ -138,6 +138,24 @@ fn poll_skip_eligibility_rejects_native_privilege_v86_and_shadow() {
     assert!(!cpu.poll_skip_eligible());
 }
 
+/// F-A3 pin (Track C C1a): poll skipping must disengage under the clif policy exactly as it
+/// does under Direct, or the C1f same-executable wall comparison would run an
+/// interpreter-side optimization in one policy arm and not the other.
+#[test]
+fn poll_skip_eligibility_rejects_the_clif_policy() {
+    let mut cpu = fresh();
+    cpu.set_native_backend_enabled(false);
+    assert!(cpu.poll_skip_eligible());
+
+    cpu.set_clif_backend_enabled(true);
+    assert!(cpu.clif_backend_enabled());
+    assert!(!cpu.poll_skip_eligible());
+
+    cpu.set_clif_backend_enabled(false);
+    assert!(!cpu.clif_backend_enabled());
+    assert!(cpu.poll_skip_eligible());
+}
+
 #[test]
 fn poll_head_alignment_runs_one_real_instruction_per_zero_cap() {
     let (mut taken, mut taken_bus) = warm_poll_shape(&[0xec, 0xa8, 0x08, 0x74, 0xfb], 0x03da);

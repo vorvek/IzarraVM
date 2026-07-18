@@ -28,7 +28,7 @@ use izarravm_video::{
 pub use izarravm_video::{MARGO_ID_VALUE, VideoMode};
 #[cfg(test)]
 use izarravm_video::{Margo, Vga, VgaRaster};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
 mod ata;
@@ -202,24 +202,31 @@ pub enum ExecutionBackend {
     #[default]
     Automatic,
     Interpreter,
+    /// The Track C cranelift policy (C1a onward). Selecting it disables the Direct backend;
+    /// one native backend is active at a time (plan decision D-C1.4).
+    Clif,
 }
 
-static PROCESS_INTERPRETER_ONLY: AtomicBool = AtomicBool::new(false);
+// Widened from an AtomicBool when ExecutionBackend became tri-valued (Track C C1a, review
+// finding F-A2). Encoding: 0 Automatic, 1 Interpreter, 2 Clif.
+static PROCESS_EXECUTION_BACKEND: AtomicU8 = AtomicU8::new(0);
 
 /// Set the execution backend inherited by subsequently constructed machines.
 pub fn set_process_execution_backend(backend: ExecutionBackend) {
-    PROCESS_INTERPRETER_ONLY.store(
-        matches!(backend, ExecutionBackend::Interpreter),
-        Ordering::Release,
-    );
+    let encoded = match backend {
+        ExecutionBackend::Automatic => 0,
+        ExecutionBackend::Interpreter => 1,
+        ExecutionBackend::Clif => 2,
+    };
+    PROCESS_EXECUTION_BACKEND.store(encoded, Ordering::Release);
 }
 
 /// Return the execution backend currently inherited by new machines.
 pub fn process_execution_backend() -> ExecutionBackend {
-    if PROCESS_INTERPRETER_ONLY.load(Ordering::Acquire) {
-        ExecutionBackend::Interpreter
-    } else {
-        ExecutionBackend::Automatic
+    match PROCESS_EXECUTION_BACKEND.load(Ordering::Acquire) {
+        1 => ExecutionBackend::Interpreter,
+        2 => ExecutionBackend::Clif,
+        _ => ExecutionBackend::Automatic,
     }
 }
 
@@ -1156,6 +1163,10 @@ impl Machine {
         machine
             .cpu
             .set_native_backend_enabled(matches!(execution_backend, ExecutionBackend::Automatic));
+        #[cfg(feature = "jit")]
+        machine
+            .cpu
+            .set_clif_backend_enabled(matches!(execution_backend, ExecutionBackend::Clif));
         machine.set_jit_auto_admit(run::jit_auto_admit_default(execution_backend));
         // Seed NVRAM 0x12 (the GSW code the BIOS applies at POST) from the boot
         // profile so a fresh CMOS reproduces the profile's speed; a loaded

@@ -617,11 +617,20 @@ impl CpuGsw {
         &self.perf
     }
 
-    /// Zero the host-side performance counters, including the memory-poll
-    /// subset stored outside `PerfCounters` (see `PollSkipMemoryCounters`).
+    /// The clif shell diagnostic subset, stored outside `PerfCounters` at the
+    /// `CpuGsw` tail (see `JitClifCounters` for why). Reset alongside the
+    /// other counters by `reset_perf_counters`.
+    pub fn jit_clif_counters(&self) -> JitClifCounters {
+        self.jit_clif
+    }
+
+    /// Zero the host-side performance counters, including the memory-poll and
+    /// clif subsets stored outside `PerfCounters` (see `PollSkipMemoryCounters`
+    /// and `JitClifCounters`).
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
         self.poll_skip_memory = PollSkipMemoryCounters::default();
+        self.jit_clif = JitClifCounters::default();
     }
 
     #[cfg(feature = "jit")]
