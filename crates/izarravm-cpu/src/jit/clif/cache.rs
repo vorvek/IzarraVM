@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use super::super::code_watch::NativeCodeWatch;
 use super::super::direct::{
     self, DirectKind, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, SmcHeatMap, UnitTerminal,
 };
@@ -80,13 +81,16 @@ pub(crate) struct ClifUnitDescriptor {
     pub(crate) is_self_loop: bool,
     /// The compiled unit's native entry.
     pub(crate) entry: usize,
-    /// The immediate table (F4/design section 2.2): one `u32` slot per instruction, indexed
-    /// by the same index `fetch_lens` uses, holding `insn.imm` verbatim (the decoder already
-    /// operand-width-extended it, including 0x83's sign extension). Slots for instructions
-    /// with no immediate hold the structural constant the lowering loads (0 when none), so
-    /// every lowered load is uniform and D3 can later patch a genuinely-immediate slot
-    /// without touching compiled code.
-    pub(crate) immediates: [u32; MAX_BLOCK_INSTRUCTIONS],
+    /// The operand table (F4/design section 2.2, widened by C1c): TWO `u32` lanes per
+    /// instruction slot, `[2 * i]` the operand immediate (`insn.imm` verbatim; the decoder
+    /// already operand-width-extended it, including 0x83's sign extension) and `[2 * i + 1]`
+    /// the addressing-mode displacement (design section 1.2's F4 extension). Both lanes are
+    /// guest-controlled values, so both load from this table at compile-time-constant
+    /// offsets, never bake as constants. The second lane exists because a memory form with
+    /// an immediate source (`mov dword [ebx+disp], imm32`, 0xc7) carries BOTH a displacement
+    /// AND an operand immediate; the design's single-slot table cannot hold both (a recorded
+    /// C1c deviation from design section 1.2's "no new table shape is needed" claim).
+    pub(crate) operands: [u32; 2 * MAX_BLOCK_INSTRUCTIONS],
     /// How many leading slots execute natively (lowered instructions plus x87 call-outs);
     /// the unit side-exits at slot `leading` (the stop slot) with EIP materialized there.
     pub(crate) leading: u8,
@@ -105,6 +109,43 @@ pub(crate) struct ClifUnitDescriptor {
     /// charge).
     pub(crate) raw_clocks_total: u16,
     pub(crate) lowered_total: u8,
+    /// Static per-width memory access counts (C1c, design section 4/M4): cumulative counts
+    /// of LOWERED slots with index < i, computed by `plan_unit` through `DirectKind`'s own
+    /// per-width accessors verbatim, so the two backends' counts are equal by shared code.
+    /// X87 slots are excluded (their call-out charges its own accesses through the
+    /// interpreter, the no-double-charge invariant).
+    pub(crate) cum_access_before: [ClifAccessCounts; MAX_BLOCK_INSTRUCTIONS],
+    /// The full leading run's access counts (the normal full-run charge).
+    pub(crate) access_total: ClifAccessCounts,
+}
+
+/// Per-width static memory access counts for one unit prefix, the clif mirror of the six
+/// accumulator fields Direct's `Compilation` carries (design section 4's parallel-field
+/// decision, D-C1.1). In increment 1 every natively retired access is RAM by construction
+/// (the identity check side-exits on the mode13 kind), so these static counts equal the
+/// dynamic counts Direct would have accumulated and RAM-lane charging is exact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClifAccessCounts {
+    pub(crate) byte_reads: u8,
+    pub(crate) word_reads: u8,
+    pub(crate) dword_reads: u8,
+    pub(crate) byte_stores: u8,
+    pub(crate) word_stores: u8,
+    pub(crate) dword_stores: u8,
+}
+
+impl ClifAccessCounts {
+    pub(crate) fn is_zero(self) -> bool {
+        self == Self::default()
+    }
+
+    pub(crate) fn reads(self) -> u64 {
+        u64::from(self.byte_reads) + u64::from(self.word_reads) + u64::from(self.dword_reads)
+    }
+
+    pub(crate) fn stores(self) -> u64 {
+        u64::from(self.byte_stores) + u64::from(self.word_stores) + u64::from(self.dword_stores)
+    }
 }
 
 impl ClifUnitDescriptor {
@@ -133,9 +174,9 @@ pub(crate) struct UnitLayout {
     /// The per-slot classifications, in slot order, for the C1b lowering (compile-time
     /// input only; the descriptor stores derived data, never the kinds themselves).
     pub(crate) kinds: Vec<DirectKind>,
-    /// Per-slot decoded immediate (`insn.imm` verbatim), populating the descriptor's
-    /// immediate table.
-    pub(crate) imms: [u32; MAX_BLOCK_INSTRUCTIONS],
+    /// Per-slot operand-immediate and addressing-displacement lanes (`[2 * i]` /
+    /// `[2 * i + 1]`), populating the descriptor's operand table.
+    pub(crate) operands: [u32; 2 * MAX_BLOCK_INSTRUCTIONS],
 }
 
 /// Forward-decode a unit from the hot root, terminating on the four terminal kinds
@@ -155,7 +196,7 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
     let mut kinds = Vec::new();
-    let mut imms = [0u32; MAX_BLOCK_INSTRUCTIONS];
+    let mut operands = [0u32; 2 * MAX_BLOCK_INSTRUCTIONS];
     // The word-form prefix acceptance and 586 gate mirror Direct's compile loop exactly
     // (`compile_with_instruction_limit`'s `prefixes_supported` and persona checks): a word
     // form is exactly one operand-size override, admitted only on the I586 persona.
@@ -185,8 +226,20 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         let Some(step) = direct::unit_growth_classify(&insn, lin, entry_lin) else {
             break;
         };
+        // C1c section 1.4: the stack-width admission gate, identical to Direct's
+        // compile-time reject (`direct.rs`'s uses_stack + !stack_is_32bit Retry). A 16-bit
+        // stack's SP wrap is a form this design does not build, so growth stops at the
+        // slot exactly as an unclassifiable opcode would (no new stop tag, per the
+        // question ledger). Push/Pop are the only lowered kinds that touch SS implicitly;
+        // Call/Ret are terminals and not lowered at all.
+        if matches!(step.kind, DirectKind::Push { .. } | DirectKind::Pop { .. })
+            && !cpu.stack_is_32bit()
+        {
+            break;
+        }
         fetch_lens[instructions] = insn.len;
-        imms[instructions] = slot_immediate(&step.kind);
+        operands[2 * instructions] = slot_immediate(&step.kind);
+        operands[2 * instructions + 1] = slot_displacement(&step.kind);
         instructions += 1;
         guest_len += u32::from(insn.len);
         has_wide_accesses |= step.wide_access;
@@ -215,7 +268,7 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         read_segments,
         write_segments,
         kinds,
-        imms,
+        operands,
     })
 }
 
@@ -228,14 +281,52 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
     match *kind {
         DirectKind::MovImm { imm, .. }
         | DirectKind::AluImm { imm, .. }
-        | DirectKind::TestImmReg { imm, .. } => imm,
+        | DirectKind::TestImmReg { imm, .. }
+        | DirectKind::TestImmMem { imm, .. } => imm,
         DirectKind::MovImmByte { imm, .. } | DirectKind::AluByteImm { imm, .. } => u32::from(imm),
         DirectKind::Shift { count, .. } => u32::from(count),
         DirectKind::DoubleShiftReg {
             count: direct::ShiftCount::Immediate(count),
             ..
+        }
+        | DirectKind::DoubleShiftMem {
+            count: direct::ShiftCount::Immediate(count),
+            ..
         } => u32::from(count),
         DirectKind::Lea { addr, .. } => addr.disp,
+        // C1c: a store's or push's immediate source is an ordinary F4-governed operand
+        // immediate, distinct from the same slot's displacement lane (design section 1.3
+        // items 2 and 8).
+        DirectKind::Store {
+            source: direct::StoreSource::Imm(imm),
+            ..
+        }
+        | DirectKind::AluMemDest {
+            source: direct::StoreSource::Imm(imm),
+            ..
+        }
+        | DirectKind::Push {
+            source: direct::StoreSource::Imm(imm),
+        } => imm,
+        _ => 0,
+    }
+}
+
+/// The addressing-mode displacement lane for one slot's table entry (design section 1.2:
+/// a displacement is a guest immediate exactly like an ALU operand, so it loads from the
+/// table for the identical D3 re-stamp reason). Zero for non-memory forms (never loaded).
+/// `Lea` keeps its displacement in the IMMEDIATE lane (C1b's established layout, its only
+/// operand); the memory forms use this second lane so a form carrying both an operand
+/// immediate and a displacement (0xc6/0xc7 store-immediate) has a home for each.
+fn slot_displacement(kind: &DirectKind) -> u32 {
+    match *kind {
+        DirectKind::Load { addr, .. }
+        | DirectKind::Store { addr, .. }
+        | DirectKind::AluMemSource { addr, .. }
+        | DirectKind::AluMemDest { addr, .. }
+        | DirectKind::TestImmMem { addr, .. }
+        | DirectKind::DoubleShiftMem { addr, .. }
+        | DirectKind::RmwIncDec { addr, .. } => addr.disp,
         _ => 0,
     }
 }
@@ -309,13 +400,24 @@ impl ClifUnitCache {
         }
     }
 
-    /// Install a compiled shell descriptor for a key previously recorded `Seen`.
-    pub(crate) fn install(&mut self, descriptor: ClifUnitDescriptor) -> Option<u32> {
+    /// Install a compiled unit descriptor for a key previously recorded `Seen`. Registers the
+    /// unit's guest physical range with the SHARED `NativeCodeWatch` (design section 2.5's
+    /// D-C1c.1, the M5 registration deliverable): a clif unit's resident bytes must read as
+    /// watched the instant it becomes reachable, exactly mirroring Direct's own
+    /// `acquire_range` call at install time (`direct.rs:793`/`845`), since an unregistered
+    /// unit's own inline-lowered store would pass the code-watch check straight through a
+    /// still-resident, still-executable copy of itself.
+    pub(crate) fn install(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        descriptor: ClifUnitDescriptor,
+    ) -> Option<u32> {
         if self.entries.get(&descriptor.key) != Some(&ClifUnitState::Seen) {
             return None;
         }
         let index = u32::try_from(self.units.len()).ok()?;
         let key = descriptor.key;
+        watch.acquire_range(key.physical, u32::from(descriptor.guest_len));
         self.units.push(descriptor);
         self.entries.insert(key, ClifUnitState::Compiled(index));
         self.units_admitted = self.units_admitted.saturating_add(1);
@@ -326,7 +428,24 @@ impl ClifUnitCache {
         self.units.get(index as usize)
     }
 
-    pub(crate) fn clear(&mut self) {
+    /// Wholesale drop. Releases every currently-installed unit's watch registration first
+    /// (the M5 discipline: every eviction path releases what it acquired), rather than
+    /// relying on a coincidentally-paired wholesale `NativeCodeWatch::clear()` elsewhere,
+    /// since this cache and Direct's block cache release independently and a Direct clear
+    /// does not always accompany a clif clear (`core.rs`'s two callers are always paired
+    /// today, but the cache must stay correct on its own, not by that coincidence).
+    pub(crate) fn clear(&mut self, watch: &mut NativeCodeWatch) {
+        // Only entries still reachable as `Compiled` hold a live registration: `units` is
+        // append-only (an invalidated slot's descriptor merely goes unreachable, mirroring
+        // Direct's own arena-fill note), so releasing every stored descriptor here would
+        // double-release ranges an earlier `invalidate_physical_range` already released.
+        for state in self.entries.values() {
+            if let ClifUnitState::Compiled(index) = state
+                && let Some(unit) = self.units.get(*index as usize)
+            {
+                watch.release_range(unit.key.physical, u32::from(unit.guest_len));
+            }
+        }
         self.entries.clear();
         self.units.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -344,15 +463,21 @@ impl ClifUnitCache {
     /// ratchets the clif arena toward full. On fill, `ClifBackend::finalize` returns `None`
     /// and new keys park Dormant, i.e. reject-and-interpret: sound, merely slower. Span
     /// reuse/compaction is future work (the C1 plan's single-page compaction item).
-    pub(crate) fn invalidate_physical_range(&mut self, start: u32, len: u32) {
+    pub(crate) fn invalidate_physical_range(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        start: u32,
+        len: u32,
+    ) {
         if len == 0 {
             return;
         }
         let end = start.saturating_add(len);
         let before = self.entries.len();
+        let units = &self.units;
         self.entries.retain(|key, state| {
             let span = match state {
-                ClifUnitState::Compiled(index) => Self::unit_span(&self.units, *index, *key),
+                ClifUnitState::Compiled(index) => Self::unit_span(units, *index, *key),
                 // Conservative page-overlap drop for non-compiled states (no recorded
                 // guest_len exists for them).
                 ClifUnitState::Seen | ClifUnitState::Dormant => (
@@ -360,7 +485,14 @@ impl ClifUnitCache {
                     (key.physical & !0xfff).saturating_add(0x1000),
                 ),
             };
-            span.1 <= start || span.0 >= end
+            let overlaps = !(span.1 <= start || span.0 >= end);
+            // M5: release the watch registration exactly when a COMPILED unit is the one
+            // dropped, mirroring Direct's `retire_block` releasing on eviction; `Seen`/
+            // `Dormant` keys never acquired a registration in the first place.
+            if overlaps && let ClifUnitState::Compiled(_) = state {
+                watch.release_range(span.0, span.1 - span.0);
+            }
+            !overlaps
         });
         if self.entries.len() != before {
             // B1: an in-flight unit whose entry just died must not resume its lowered

@@ -69,10 +69,36 @@ pub(crate) type ClifEntryFn = unsafe extern "C" fn(
     *const u8,
 ) -> i64;
 
+/// The dynamic mode13 lanes (Track C C1c increment 6, design section 4's last bullet): a
+/// compile-time-static count cannot tell RAM from VGA for a memory form whose page kind
+/// depends on the runtime address, so the compiled unit increments these AT RUN TIME on
+/// the mode13 arm of each access (post-commit only, per the section 2.9 discipline) and
+/// `run_clif_unit` consumes them after exit: RAM lanes are the retired prefix's static
+/// counts MINUS these (every retired access is exactly one of the two kinds), reads charge
+/// at the mode13 bus cost, writes and the dirty-page bitset relay through
+/// `charge_native_mode13_writes` exactly as Direct's `NativeExit` lanes do. `repr(C)` with
+/// the unit baking the struct's address plus `offset_of` field offsets: the address is
+/// stable because `JitState` lives in one `Box` for the CPU's lifetime, and a CLONED CpuGsw
+/// gets a fresh empty unit cache (no unit with a stale pointer survives a clone).
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct ClifMode13Lanes {
+    pub(crate) byte_reads: u64,
+    pub(crate) word_reads: u64,
+    pub(crate) dword_reads: u64,
+    pub(crate) byte_writes: u64,
+    pub(crate) word_writes: u64,
+    pub(crate) dword_writes: u64,
+    /// Bitset over the VGA aperture's pages: bit `(physical_page - 0xA0000) >> 12`.
+    pub(crate) dirty_pages: u64,
+}
+
 /// Per-entry call-out scratch on the jit state (Track C C1b). The shim is the only writer
 /// during a unit run; `run_clif_unit` resets it before entry and consumes it after exit.
 #[derive(Default)]
 pub(crate) struct ClifRunScratch {
+    /// C1c increment 6: the dynamic mode13 lanes the compiled unit increments in place.
+    pub(crate) mode13: ClifMode13Lanes,
     /// A panic payload caught by the shim's belt (review finding m1): the shim must not
     /// unwind through compiled frames with no unwind info, so the payload crosses the
     /// boundary here and `run_clif_unit` resumes the unwind once the disposition is back

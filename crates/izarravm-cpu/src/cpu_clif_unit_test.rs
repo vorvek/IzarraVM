@@ -267,8 +267,10 @@ fn clif_key_for_applies_the_direct_static_exclusions() {
 #[test]
 fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
     use crate::jit::clif::cache::{ClifUnitCache, ClifUnitDescriptor, ClifUnitKey};
+    use crate::jit::code_watch::NativeCodeWatch;
     use crate::jit::direct::{MAX_BLOCK_INSTRUCTIONS, SegmentLayout};
     let mut cache = ClifUnitCache::default();
+    let mut watch = NativeCodeWatch::default();
     let key = ClifUnitKey {
         linear: 0x1000,
         physical: 0x1000,
@@ -284,26 +286,47 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         has_wide_accesses: false,
         is_self_loop: false,
         entry: 0,
-        immediates: [0; MAX_BLOCK_INSTRUCTIONS],
+        operands: [0; 2 * MAX_BLOCK_INSTRUCTIONS],
         leading: 1,
         x87_mask: 0,
         cum_raw_before: [0; MAX_BLOCK_INSTRUCTIONS],
         cum_lowered_before: [0; MAX_BLOCK_INSTRUCTIONS],
         raw_clocks_total: 2,
         lowered_total: 1,
+        cum_access_before: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
+        access_total: Default::default(),
     };
     assert!(cache.state(key).is_none());
     // Install without Seen refuses.
-    assert!(cache.install(descriptor.clone()).is_none());
+    assert!(cache.install(&mut watch, descriptor.clone()).is_none());
     cache.note_seen(key);
     assert_eq!(cache.state(key), Some(ClifUnitState::Seen));
-    let index = cache.install(descriptor).expect("install after Seen");
+    let index = cache
+        .install(&mut watch, descriptor)
+        .expect("install after Seen");
     assert_eq!(cache.state(key), Some(ClifUnitState::Compiled(index)));
     assert_eq!(cache.unit(index).expect("descriptor").instructions, 2);
-    cache.park_dormant(key);
-    assert_eq!(cache.state(key), Some(ClifUnitState::Dormant));
-    cache.clear();
+    // M5: the installed unit's own guest physical range reads watched immediately, proving
+    // the install-time `acquire_range` registration actually happened (design section 5
+    // test 3's registration probe), not merely that the check machinery works when a watch
+    // happens to exist for some other reason.
+    assert!(watch.range_watched(key.physical, 3));
+    // A separate Seen key parks Dormant without ever acquiring a registration.
+    let dormant_key = ClifUnitKey {
+        linear: 0x2000,
+        physical: 0x2000,
+        mode_key: 7,
+    };
+    cache.note_seen(dormant_key);
+    cache.park_dormant(dormant_key);
+    assert_eq!(cache.state(dormant_key), Some(ClifUnitState::Dormant));
+    assert!(!watch.range_watched(dormant_key.physical, 3));
+    cache.clear(&mut watch);
     assert!(cache.state(key).is_none());
+    assert!(cache.state(dormant_key).is_none());
+    // Clearing the cache releases the registration too: the shared watch reports the range
+    // unwatched again once the unit is gone (no leaked refcount past a wholesale drop).
+    assert!(!watch.range_watched(key.physical, 3));
 }
 
 /// C1b probe: one tiny lowered unit end to end against the interpreter.

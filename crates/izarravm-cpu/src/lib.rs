@@ -934,6 +934,13 @@ pub struct JitClifCounters {
     pub reject_alignment: u64,
     pub reject_fetch_limit: u64,
     pub reject_zero_budget: u64,
+    /// C1c memory side-exit reasons (diagnostic only; the guest cannot observe which check
+    /// fired, per the design's un-advanced-EIP discipline).
+    pub mem_exit_alignment: u64,
+    pub mem_exit_unavailable_or_kind: u64,
+    pub mem_exit_permission: u64,
+    pub mem_exit_code_watch: u64,
+    pub mem_exit_segment_limit: u64,
 }
 
 impl PartialEq for JitClifCounters {

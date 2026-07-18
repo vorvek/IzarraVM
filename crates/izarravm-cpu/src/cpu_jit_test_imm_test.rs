@@ -1127,3 +1127,46 @@ fn probe_linear_read_physical_is_tlb_hit_only_and_pure() {
     assert_eq!(cpu.probe_linear_read_physical(0x0000_6000), None);
     assert_eq!(cpu.control.cr2, cr2_before, "a decline must not set CR2");
 }
+
+/// Track C C1c increment 3 (design section 5 test 10): the clif arm for `TestImmMem`.
+/// Reuses this file's own instruction builder for the group-memory TEST forms (byte and
+/// dword, moffs-style disp32) plus a base+disp8 form, exercising the operand table's
+/// two-lane slot (the operand immediate AND the addressing displacement in one slot,
+/// implementation amendment 1) alongside the operand-immediate use C1b already proved.
+/// The shared forced harness asserts byte-identical state, memory, raw eflags, the
+/// pending-descriptor bytes, and the section 5.3 timing set against the interpreter.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_test_imm_mem_forms_match_the_interpreter() {
+    use super::jit_differential_generator::{assert_clif_forced_case, forced_gpr};
+
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for (width, imm) in [
+            (Width::Byte, 0x7fu32),
+            (Width::Byte, 0x80),
+            (Width::Dword, 0x1122_3344),
+            (Width::Dword, 0x8000_0001),
+        ] {
+            // Nop starter: the continuation probe lands on the TEST itself.
+            let mut code = vec![0x90];
+            code.extend_from_slice(&instruction(Form::GroupMemory, width, imm, Some(0x5000)));
+            code.push(0xf4);
+            assert_clif_forced_case(mode, &code, forced_gpr(), 0x202);
+        }
+        // Base+disp8 addressing: test dword [ebx+0x10], imm32 with EBX pointed at RAM
+        // (the displacement lane carries 0x10 while the immediate lane carries the
+        // operand, the two-lane slot in its register-relative shape).
+        let mut gpr = forced_gpr();
+        gpr[3] = 0x5100;
+        assert_clif_forced_case(
+            mode,
+            &[0x90, 0xf7, 0x43, 0x10, 0x44, 0x33, 0x22, 0x11, 0xf4],
+            gpr,
+            0x202,
+        );
+    }
+}
