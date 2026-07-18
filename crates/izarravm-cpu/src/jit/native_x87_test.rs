@@ -28,6 +28,8 @@ fn insn(opcode: u16, mode: u8, reg: u8, rm: u8) -> DecodedInsn {
         imm2: 0,
         group: DecodeGroup::Fpu,
         continuable: true,
+        disp_len: 0,
+        imm_len: 0,
     }
 }
 
