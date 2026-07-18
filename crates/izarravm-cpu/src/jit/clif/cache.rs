@@ -226,6 +226,17 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         let Some(step) = direct::unit_growth_classify(&insn, lin, entry_lin) else {
             break;
         };
+        // C1c section 1.4: the stack-width admission gate, identical to Direct's
+        // compile-time reject (`direct.rs`'s uses_stack + !stack_is_32bit Retry). A 16-bit
+        // stack's SP wrap is a form this design does not build, so growth stops at the
+        // slot exactly as an unclassifiable opcode would (no new stop tag, per the
+        // question ledger). Push/Pop are the only lowered kinds that touch SS implicitly;
+        // Call/Ret are terminals and not lowered at all.
+        if matches!(step.kind, DirectKind::Push { .. } | DirectKind::Pop { .. })
+            && !cpu.stack_is_32bit()
+        {
+            break;
+        }
         fetch_lens[instructions] = insn.len;
         operands[2 * instructions] = slot_immediate(&step.kind);
         operands[2 * instructions + 1] = slot_displacement(&step.kind);
@@ -278,11 +289,15 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
             ..
         } => u32::from(count),
         DirectKind::Lea { addr, .. } => addr.disp,
-        // C1c: a store's immediate source is an ordinary F4-governed operand immediate,
-        // distinct from the same slot's displacement lane (design section 1.3 item 2).
+        // C1c: a store's or push's immediate source is an ordinary F4-governed operand
+        // immediate, distinct from the same slot's displacement lane (design section 1.3
+        // items 2 and 8).
         DirectKind::Store {
             source: direct::StoreSource::Imm(imm),
             ..
+        }
+        | DirectKind::Push {
+            source: direct::StoreSource::Imm(imm),
         } => imm,
         _ => 0,
     }

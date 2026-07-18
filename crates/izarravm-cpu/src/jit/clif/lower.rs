@@ -122,6 +122,8 @@ fn lowerable(kind: &DirectKind) -> bool {
             | DirectKind::DoubleShiftReg { .. }
             | DirectKind::Load { .. }
             | DirectKind::Store { .. }
+            | DirectKind::Push { .. }
+            | DirectKind::Pop { .. }
     )
 }
 
@@ -691,6 +693,12 @@ impl<'a> UnitBuilder<'a> {
             } => {
                 self.lower_store(source, width, &addr, slot, delta);
             }
+            DirectKind::Push { source } => {
+                self.lower_push(source, slot, delta);
+            }
+            DirectKind::Pop { dst } => {
+                self.lower_pop(dst, slot, delta);
+            }
             DirectKind::X87 { .. } => {
                 self.lower_x87_callout(slot, delta, len);
             }
@@ -740,13 +748,18 @@ impl<'a> UnitBuilder<'a> {
 
     /// Steps 1-4 of the normative check sequence (design section 2's intro): segment limit
     /// (including the compile-time underflow edge), the wide-page guard, the identity/kind
-    /// check, and the CPL3-conditional permission check. Returns `(linear, page64, flags)`:
-    /// the segmented linear address, the linear page index widened to i64, and the loaded
-    /// FastMap flags byte for the permission step already applied.
+    /// check, and the CPL3-conditional permission check. Returns `(linear, page64)`: the
+    /// segmented linear address and the linear page index widened to i64, with the
+    /// permission step already applied. The clippy arity allowance is deliberate: this is
+    /// the one shared body of the per-access check sequence and every argument is a
+    /// distinct check input; splitting it would scatter the normative order across
+    /// helpers.
+    #[allow(clippy::too_many_arguments)]
     fn mem_checked_page(
         &mut self,
         map: NativeMapBases,
-        addr: &DirectAddr,
+        segment: crate::SegmentIndex,
+        eff: Value,
         width: MemoryWidth,
         slot: usize,
         side: Block,
@@ -756,8 +769,7 @@ impl<'a> UnitBuilder<'a> {
         // matching emit_segmented_linear_address (emit.rs:1741). The descriptor is the
         // unit's own captured snapshot, compile-time data (the entry guards revalidate it
         // against live segment state before every entry).
-        let eff = self.mem_effective_address(addr, slot);
-        let descriptor = self.mem.segments.descriptor(addr.segment);
+        let descriptor = self.mem.segments.descriptor(segment);
         if descriptor.limit != u32::MAX {
             match descriptor.limit.checked_sub(width.bytes() - 1) {
                 None => {
@@ -951,7 +963,9 @@ impl<'a> UnitBuilder<'a> {
             .expect("memory-form slot requires fast-map bases");
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
-        let (linear, page64) = self.mem_checked_page(map, addr, width, slot, side, false);
+        let eff = self.mem_effective_address(addr, slot);
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
         let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let value = match width {
@@ -981,7 +995,9 @@ impl<'a> UnitBuilder<'a> {
             .expect("memory-form slot requires fast-map bases");
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
-        let (linear, page64) = self.mem_checked_page(map, addr, width, slot, side, true);
+        let eff = self.mem_effective_address(addr, slot);
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true);
         let host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
         self.code_watch_checks(map, linear, page64, width, slot, side);
         let value = match source {
@@ -1006,6 +1022,83 @@ impl<'a> UnitBuilder<'a> {
                 self.b.ins().store(memflags, value, host, 0);
             }
         }
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// `Push` (design section 1.3 item 8): `Store` at `[ESP - 4]`, dword, through the SS
+    /// descriptor (the SS-base discipline of `stack_addr`, emit.rs:6-14), then `ESP -= 4`
+    /// as a plain SSA subtract AFTER the store commits. Store-before-decrement makes
+    /// `PUSH ESP` store the PRE-decrement value, the architecturally correct one, with no
+    /// special case; and every side exit leaves ESP unmodified by SSA construction (the
+    /// side block's predecessors all branch before the ESP redefinition). The implicit
+    /// displacement -4 is STRUCTURAL (no guest byte encodes it, so no re-stamp can ever
+    /// patch it), baked per the same F4 exemption 0xd1's implicit count uses; the pushed
+    /// immediate (0x68/0x6a), by contrast, is a guest operand and loads from the table.
+    /// Only ever compiled when `cpu.stack_is_32bit()` (the walker gate, section 1.4), so
+    /// no 16-bit SP wrap logic exists here, mirroring Direct's omission exactly.
+    fn lower_push(&mut self, source: StoreSource, slot: usize, delta: u32) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let esp = self.gpr32(4);
+        let eff = self.b.ins().iadd_imm(esp, -4);
+        let (linear, page64) = self.mem_checked_page(
+            map,
+            crate::SegmentIndex::Ss,
+            eff,
+            MemoryWidth::Dword,
+            slot,
+            side,
+            true,
+        );
+        let host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
+        self.code_watch_checks(map, linear, page64, MemoryWidth::Dword, slot, side);
+        let value = match source {
+            StoreSource::Reg(src) => self.gpr32(src),
+            StoreSource::Imm(_) => self.imm32(slot),
+            StoreSource::EipDelta(_) => {
+                unreachable!("EipDelta store sources exist only inside Call, a terminal")
+            }
+        };
+        let memflags = self.flags();
+        self.b.ins().store(memflags, value, host, 0);
+        let new_esp = self.b.ins().iadd_imm(esp, -4);
+        self.set_gpr32(4, new_esp);
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// `Pop` (design section 1.3 item 9), in Direct's exact order (emit.rs:431-434): run
+    /// `Load`'s READ check list at `[ESP]` (dword, SS) into a scratch SSA value, THEN
+    /// `ESP += 4`, THEN write the scratch into `dst`'s home. The increment-before-dst-write
+    /// order is load-bearing: for `POP ESP` the final dst write overwrites the incremented
+    /// ESP with the LOADED value, which is what x86 requires; a write-then-increment order
+    /// would compute loaded + 4. The implicit displacement 0 is structural, like Push's -4.
+    fn lower_pop(&mut self, dst: u8, slot: usize, delta: u32) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let esp = self.gpr32(4);
+        let (linear, page64) = self.mem_checked_page(
+            map,
+            crate::SegmentIndex::Ss,
+            esp,
+            MemoryWidth::Dword,
+            slot,
+            side,
+            false,
+        );
+        let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let value = self.b.ins().load(types::I32, memflags, host, 0);
+        let new_esp = self.b.ins().iadd_imm(esp, 4);
+        self.set_gpr32(4, new_esp);
+        self.set_gpr32(dst, value);
         self.finish_mem_slot(side, delta);
     }
 
