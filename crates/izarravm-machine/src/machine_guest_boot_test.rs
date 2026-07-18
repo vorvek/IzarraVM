@@ -385,14 +385,13 @@ fn izarra_bios_tab_before_ramtest_wins_over_later_del() {
     machine.set_fast_post(false);
     for _ in 0..40 {
         machine.run_until_halt_or_cycles(1_000_000).unwrap();
-        if let Ok(results) = izarravm_firmware::parse_result_block(machine.memory().as_slice()) {
-            if results
+        if let Ok(results) = izarravm_firmware::parse_result_block(machine.memory().as_slice())
+            && results
                 .records
                 .iter()
                 .any(|record| record.name == "video.margo_caps")
-            {
-                break;
-            }
+        {
+            break;
         }
     }
 

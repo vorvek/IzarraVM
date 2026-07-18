@@ -2226,7 +2226,7 @@ fn bcd_to_bin(n: u8) -> u8 {
 /// reports. Gregorian leap years; the date is assumed valid (the RTC clamps it).
 fn days_since_1980(year: u16, month: u8, day: u8) -> u16 {
     const MONTH_DAYS: [u16; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = |y: u16| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let is_leap = |y: u16| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
     let mut days = 0u32;
     for y in 1980..year {
         days += if is_leap(y) { 366 } else { 365 };

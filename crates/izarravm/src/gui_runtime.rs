@@ -280,14 +280,14 @@ impl ApplicationHandler for WinitApp {
             event: key_event, ..
         } = &event
         {
-            if !self.raw_keys {
-                if let PhysicalKey::Code(code) = key_event.physical_key {
-                    self.handle_guest_key(
-                        code,
-                        key_event.state == ElementState::Pressed,
-                        key_event.repeat,
-                    );
-                }
+            if !self.raw_keys
+                && let PhysicalKey::Code(code) = key_event.physical_key
+            {
+                self.handle_guest_key(
+                    code,
+                    key_event.state == ElementState::Pressed,
+                    key_event.repeat,
+                );
             }
             return;
         }
@@ -364,12 +364,12 @@ impl ApplicationHandler for WinitApp {
             DeviceEvent::Key(raw) => {
                 let first_raw = !self.raw_keys;
                 self.raw_keys = true;
-                if self.focused {
-                    if let PhysicalKey::Code(code) = raw.physical_key {
-                        let pressed = raw.state == ElementState::Pressed;
-                        let repeat = pressed && !first_raw && self.host_kbd.is_held(code);
-                        self.handle_guest_key(code, pressed, repeat);
-                    }
+                if self.focused
+                    && let PhysicalKey::Code(code) = raw.physical_key
+                {
+                    let pressed = raw.state == ElementState::Pressed;
+                    let repeat = pressed && !first_raw && self.host_kbd.is_held(code);
+                    self.handle_guest_key(code, pressed, repeat);
                 }
             }
             // Raw relative pointer motion drives the captured guest cursor.
@@ -384,10 +384,10 @@ impl ApplicationHandler for WinitApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Enter capture if the monitor image was clicked this frame; the event
         // loop owns the winit Window that monitor_ui does not.
-        if self.gui.take_want_capture() {
-            if let Some(window) = &self.window {
-                self.gui.toggle_capture(window, &mut self.host_kbd);
-            }
+        if self.gui.take_want_capture()
+            && let Some(window) = &self.window
+        {
+            self.gui.toggle_capture(window, &mut self.host_kbd);
         }
         // Apply the raw mouse motion the Windows WM_INPUT hook accumulated since
         // the last pass (zero elsewhere, where DeviceEvent::MouseMotion drives

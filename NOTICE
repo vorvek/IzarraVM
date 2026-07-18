@@ -56,6 +56,13 @@ artwork are project assets distributed under GPL-3.0-only.
 Host audio output uses cpal 0.15.3 under Apache-2.0. External MIDI output uses
 midir 0.10.4, Copyright (c) 2015 Patrick Reisert and the RtMidi contributors,
 under MIT. Exact license texts are in third_party/licenses.
+The optional clif-backend build feature links the Cranelift code generator
+0.133.1 (cranelift-codegen, cranelift-frontend, cranelift-native and their
+Bytecode Alliance companion crates), Copyright (c) the Cranelift Project
+Developers, under Apache-2.0 WITH LLVM-exception; its permissive transitive
+crates carry MIT, Apache-2.0, and Zlib terms. The default build does not
+compile or link any of them. The exact license text is in
+third_party/licenses.
 TOKAEMM.SYS (the XMS/UMB/EMS memory manager and V86 monitor) is a 386MAX
 adaptation: its VCPI 1.0 server and its V86 privileged-instruction emulation
 (the INT 67h AH=DEh handlers, the DE0C mode switch, and the MOV CRn/DRn /

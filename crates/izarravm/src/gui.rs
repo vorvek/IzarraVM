@@ -1284,12 +1284,11 @@ fn flush_floppy(machine: &mut Machine, flush_path: &mut Option<PathBuf>) {
         *flush_path = None;
         return;
     };
-    if dirty {
-        if let Some(path) = flush_path.as_ref() {
-            if let Err(err) = std::fs::write(path, &bytes) {
-                error!(%err, path = %path.display(), "failed to flush floppy image");
-            }
-        }
+    if dirty
+        && let Some(path) = flush_path.as_ref()
+        && let Err(err) = std::fs::write(path, &bytes)
+    {
+        error!(%err, path = %path.display(), "failed to flush floppy image");
     }
     *flush_path = None;
 }

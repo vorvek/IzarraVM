@@ -141,10 +141,10 @@ impl CpuGsw {
             };
             let mut desc = [0u8; 8];
             for (i, b) in desc.iter_mut().enumerate() {
-                if let Ok(phys) = self.translate_linear(bus, base + index + i as u32, false) {
-                    if let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead) {
-                        *b = v as u8;
-                    }
+                if let Ok(phys) = self.translate_linear(bus, base + index + i as u32, false)
+                    && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
+                {
+                    *b = v as u8;
                 }
             }
             eprintln!(
@@ -164,12 +164,11 @@ impl CpuGsw {
             for (label, addr) in targets {
                 let mut d = [0u8; 8];
                 for (i, b) in d.iter_mut().enumerate() {
-                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false) {
-                        if let Ok(v) =
+                    if let Ok(phys) = self.translate_linear(bus, addr + i as u32, false)
+                        && let Ok(v) =
                             bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
-                        {
-                            *b = v as u8;
-                        }
+                    {
+                        *b = v as u8;
                     }
                 }
                 eprintln!("fault trace: {label} ({tag}) @{addr:#010x} = {d:02x?}");
@@ -186,10 +185,10 @@ impl CpuGsw {
             let start = ss_base + (self.registers.esp() & !0xF).saturating_sub(16);
             let mut stack = [0u8; 96];
             for (i, b) in stack.iter_mut().enumerate() {
-                if let Ok(phys) = self.translate_linear(bus, start + i as u32, false) {
-                    if let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead) {
-                        *b = v as u8;
-                    }
+                if let Ok(phys) = self.translate_linear(bus, start + i as u32, false)
+                    && let Ok(v) = bus.read_memory(phys, BusWidth::Byte, BusAccessKind::DataRead)
+                {
+                    *b = v as u8;
                 }
             }
             for (row, chunk) in stack.chunks(16).enumerate() {

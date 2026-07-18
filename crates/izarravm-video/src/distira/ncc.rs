@@ -129,11 +129,13 @@ impl NccState {
 
 fn decode_register(register: usize) -> Option<(usize, usize)> {
     if (SST_NCC_TABLE0_Y0..=SST_NCC_TABLE0_Q3).contains(&register) {
-        return ((register - SST_NCC_TABLE0_Y0) % 4 == 0)
+        return (register - SST_NCC_TABLE0_Y0)
+            .is_multiple_of(4)
             .then_some((0, (register - SST_NCC_TABLE0_Y0) / 4));
     }
     if (SST_NCC_TABLE1_Y0..=SST_NCC_TABLE1_Q3).contains(&register) {
-        return ((register - SST_NCC_TABLE1_Y0) % 4 == 0)
+        return (register - SST_NCC_TABLE1_Y0)
+            .is_multiple_of(4)
             .then_some((1, (register - SST_NCC_TABLE1_Y0) / 4));
     }
     None

@@ -15,11 +15,17 @@ authors.workspace = true
 # build for unsupported hosts and differential checks.
 default = ["jit"]
 jit = []
+# Track C cranelift backend (off by default; slice C0 onward). The pin is exact:
+# 0.133.1 was verified current and not yanked, rust_version 1.94.0.
+clif-backend = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-native"]
 
 [dependencies]
 thiserror.workspace = true
 izarravm-bus = { path = "../izarravm-bus" }
 izarravm-core = { path = "../izarravm-core" }
+cranelift-codegen = { version = "=0.133.1", optional = true }
+cranelift-frontend = { version = "=0.133.1", optional = true }
+cranelift-native = { version = "=0.133.1", optional = true }
 
 [dev-dependencies]
 serde = { workspace = true }

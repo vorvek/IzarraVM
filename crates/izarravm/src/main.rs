@@ -1139,14 +1139,12 @@ fn stop_reason_json(stop: &StopReason) -> serde_json::Value {
 fn extract_timedemo_realtics(text: &str) -> Option<(u32, u32)> {
     for line in text.lines() {
         let line = line.trim();
-        if let Some(after_timed) = line.strip_prefix("timed ") {
-            if let Some((g_str, rest)) = after_timed.split_once(" gametics in ") {
-                if let Some(r_str) = rest.strip_suffix(" realtics") {
-                    if let (Ok(g), Ok(r)) = (g_str.parse::<u32>(), r_str.parse::<u32>()) {
-                        return Some((g, r));
-                    }
-                }
-            }
+        if let Some(after_timed) = line.strip_prefix("timed ")
+            && let Some((g_str, rest)) = after_timed.split_once(" gametics in ")
+            && let Some(r_str) = rest.strip_suffix(" realtics")
+            && let (Ok(g), Ok(r)) = (g_str.parse::<u32>(), r_str.parse::<u32>())
+        {
+            return Some((g, r));
         }
     }
     None

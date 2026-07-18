@@ -102,10 +102,10 @@ impl FromStr for VideoCard {
 
 fn split_device_path_and_args(rest: &str) -> (&str, &str) {
     let rest = rest.trim_start();
-    if let Some(quoted) = rest.strip_prefix('"') {
-        if let Some(end) = quoted.find('"') {
-            return (&quoted[..end], quoted[end + 1..].trim_start());
-        }
+    if let Some(quoted) = rest.strip_prefix('"')
+        && let Some(end) = quoted.find('"')
+    {
+        return (&quoted[..end], quoted[end + 1..].trim_start());
     }
     let path_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     (&rest[..path_end], rest[path_end..].trim_start())

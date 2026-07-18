@@ -196,15 +196,15 @@ impl Keyboard8042 {
         // Only a fresh (OBF-set) byte gets pushed back; a stale byte left in the
         // output register after a read (OBF clear) was already consumed and must
         // not be re-queued.
-        if self.status & STATUS_OBF != 0 {
-            if let Some(latched) = self.output.take() {
-                if self.output_is_aux {
-                    self.mouse.queue.push_front(latched);
-                } else {
-                    self.queue.push_front(latched);
-                }
-                self.device_byte_ready = true;
+        if self.status & STATUS_OBF != 0
+            && let Some(latched) = self.output.take()
+        {
+            if self.output_is_aux {
+                self.mouse.queue.push_front(latched);
+            } else {
+                self.queue.push_front(latched);
             }
+            self.device_byte_ready = true;
         }
         self.output = Some(response);
         self.output_is_aux = false;
@@ -255,17 +255,15 @@ impl Keyboard8042 {
                 self.irq_armed = true;
             }
             self.device_byte_ready = false;
-        } else if !aux_disabled {
-            if let Some(code) = self.mouse.queue.pop_front() {
-                self.output = Some(code);
-                self.output_is_aux = true;
-                self.status |= STATUS_OBF | STATUS_AUX;
-                // Command byte bit 1 enables the mouse interrupt (IRQ12).
-                if self.command_byte & 0x02 != 0 {
-                    self.irq12_armed = true;
-                }
-                self.device_byte_ready = false;
+        } else if !aux_disabled && let Some(code) = self.mouse.queue.pop_front() {
+            self.output = Some(code);
+            self.output_is_aux = true;
+            self.status |= STATUS_OBF | STATUS_AUX;
+            // Command byte bit 1 enables the mouse interrupt (IRQ12).
+            if self.command_byte & 0x02 != 0 {
+                self.irq12_armed = true;
             }
+            self.device_byte_ready = false;
         }
     }
 

@@ -213,7 +213,7 @@ impl AtaDisk {
     /// Mount a flat sector image, padding up to a whole sector if needed. The
     /// geometry is derived from the padded length.
     pub fn new(mut image: Vec<u8>) -> Self {
-        if image.len() % SECTOR != 0 {
+        if !image.len().is_multiple_of(SECTOR) {
             let pad = SECTOR - (image.len() % SECTOR);
             image.resize(image.len() + pad, 0);
         }

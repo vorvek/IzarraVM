@@ -699,11 +699,11 @@ impl Distira {
                 let l2 = w2 * inv_area;
                 let depth_raw = depths.map(|[za, zb, zc]| lerp_f32(za, zb, zc, l0, l1, l2));
                 let depth = depth_raw.map(|raw| self.biased_triangle_depth(raw));
-                if let Some(depth) = depth {
-                    if !self.depth_test_passes(x, draw_y, depth) {
-                        self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
-                        continue;
-                    }
+                if let Some(depth) = depth
+                    && !self.depth_test_passes(x, draw_y, depth)
+                {
+                    self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
+                    continue;
                 }
 
                 let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);

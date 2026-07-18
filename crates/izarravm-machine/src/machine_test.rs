@@ -432,7 +432,7 @@ fn audio_cd(frames: u32) -> CdImage {
 }
 
 fn iso_dir_record(lba: u32, len: u32, flags: u8, name: &[u8]) -> Vec<u8> {
-    let pad = usize::from(name.len() % 2 == 0);
+    let pad = usize::from(name.len().is_multiple_of(2));
     let mut record = vec![0u8; 33 + name.len() + pad];
     record[0] = record.len() as u8;
     record[2..6].copy_from_slice(&lba.to_le_bytes());

@@ -677,11 +677,12 @@ impl BlockCache {
             return BlockProbe::Rejected;
         }
         let hot_index = key.hot_index();
-        if let Some(hit) = self.hot[hot_index] {
-            if hit.generation == self.hot_generation && hit.key == key {
-                self.stats.hot_hits += 1;
-                return BlockProbe::Ready(hit.id);
-            }
+        if let Some(hit) = self.hot[hot_index]
+            && hit.generation == self.hot_generation
+            && hit.key == key
+        {
+            self.stats.hot_hits += 1;
+            return BlockProbe::Ready(hit.id);
         }
         match self.entries.get(&key).copied() {
             Some(BlockState::Compiled(id)) => {

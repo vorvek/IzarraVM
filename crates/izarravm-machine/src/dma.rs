@@ -184,7 +184,7 @@ pub(crate) struct DmaChip {
 impl DmaChip {
     fn addr_channel(local: u8) -> Option<usize> {
         // local 0,2,4,6 -> address channels 0..3
-        if local < 8 && local % 2 == 0 {
+        if local < 8 && local.is_multiple_of(2) {
             Some((local / 2) as usize)
         } else {
             None

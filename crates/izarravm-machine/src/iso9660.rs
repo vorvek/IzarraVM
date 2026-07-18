@@ -473,10 +473,9 @@ fn dir_own_name(nodes: &[Vec<Child>], node_index: usize) -> Vec<u8> {
                 name,
                 node_index: idx,
             } = child
+                && *idx == node_index
             {
-                if *idx == node_index {
-                    return name.clone();
-                }
+                return name.clone();
             }
         }
     }

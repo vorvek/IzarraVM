@@ -1927,7 +1927,7 @@ impl CpuBus for TestBus {
     ) -> usize {
         if !matches!(kind, BusAccessKind::DataRead | BusAccessKind::DataWrite)
             || bytes == 0
-            || bytes % width.bytes() as usize != 0
+            || !bytes.is_multiple_of(width.bytes() as usize)
             || (address as usize & 0x0fff) + bytes > 0x1000
         {
             return 0;

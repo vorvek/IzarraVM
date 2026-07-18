@@ -555,10 +555,10 @@ impl Machine {
                 None
             }
             unittester::CMD_SNAPSHOT => {
-                if let Some(path) = self.test_snapshot_path.clone() {
-                    if let Err(err) = self.write_snapshot_ppm(&path) {
-                        eprintln!("unit tester: snapshot to {} failed: {err}", path.display());
-                    }
+                if let Some(path) = self.test_snapshot_path.clone()
+                    && let Err(err) = self.write_snapshot_ppm(&path)
+                {
+                    eprintln!("unit tester: snapshot to {} failed: {err}", path.display());
                 }
                 None
             }

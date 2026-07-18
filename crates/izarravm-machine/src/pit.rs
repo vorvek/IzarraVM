@@ -222,7 +222,7 @@ impl Counter {
     /// count trimmed on the first CLK of the half (by one with OUT high, by
     /// three with OUT low), so an odd period splits (N+1)/2 high, (N-1)/2 low.
     fn mode3_half(value: u64, out: bool) -> u64 {
-        if value % 2 == 0 || !out {
+        if value.is_multiple_of(2) || !out {
             (value / 2).max(1)
         } else {
             value.div_ceil(2)
@@ -362,7 +362,7 @@ impl Counter {
                     // low), not `reload`'s single clock -- the "halves sum to
                     // reload" identity the general branch leans on does not hold
                     // here, so this folds the remainder by 2 directly instead.
-                    return if rem % 2 == 0 { level } else { !level };
+                    return if rem.is_multiple_of(2) { level } else { !level };
                 }
                 let phase = rem % reload;
                 let half = Self::mode3_half(reload, level);

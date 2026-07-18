@@ -140,34 +140,36 @@ impl CpuGsw {
         // shadow is active the interrupt check is skipped so the instruction after STI
         // always executes before an interrupt can be taken; the consume happens in
         // `cycle_no_interrupt_check` when that next instruction runs.
-        if !self.interrupt_shadow && self.flag(FLAG_IF) && bus.interrupt_pending() {
-            if let Some(vector) = bus.acknowledge_interrupt() {
-                // The interrupt frame sees the paused REP's start EIP. Once delivery begins, the
-                // saved host continuation is stale; IRET restarts from guest code and refetches.
-                self.rep_resume_active = false;
-                self.rep_execution.resume = None;
-                self.hardware_interrupt(bus, vector)
-                    .map_err(|fault| match fault {
-                        InternalFault::Cpu(error) => error,
-                        // A fault raised while `hardware_interrupt` (which calls
-                        // `deliver_exception`) was building the IRQ's own frame is a
-                        // genuinely nested fault, not an IDT-limit violation on `vector`
-                        // itself -- report it truthfully instead of relabeling it.
-                        InternalFault::Exception {
-                            vector: nested_vector,
-                            ..
-                        } => CpuError::NestedFaultDuringDelivery {
-                            original_vector: vector,
-                            nested_vector,
-                        },
-                    })?;
-                let charged = self.scale_clocks(61);
-                self.elapsed_clocks += charged;
-                return Ok(Some(CycleOutcome {
-                    core_clocks: charged.min(u64::from(u32::MAX)) as u32,
-                    halted: false,
-                }));
-            }
+        if !self.interrupt_shadow
+            && self.flag(FLAG_IF)
+            && bus.interrupt_pending()
+            && let Some(vector) = bus.acknowledge_interrupt()
+        {
+            // The interrupt frame sees the paused REP's start EIP. Once delivery begins, the
+            // saved host continuation is stale; IRET restarts from guest code and refetches.
+            self.rep_resume_active = false;
+            self.rep_execution.resume = None;
+            self.hardware_interrupt(bus, vector)
+                .map_err(|fault| match fault {
+                    InternalFault::Cpu(error) => error,
+                    // A fault raised while `hardware_interrupt` (which calls
+                    // `deliver_exception`) was building the IRQ's own frame is a
+                    // genuinely nested fault, not an IDT-limit violation on `vector`
+                    // itself -- report it truthfully instead of relabeling it.
+                    InternalFault::Exception {
+                        vector: nested_vector,
+                        ..
+                    } => CpuError::NestedFaultDuringDelivery {
+                        original_vector: vector,
+                        nested_vector,
+                    },
+                })?;
+            let charged = self.scale_clocks(61);
+            self.elapsed_clocks += charged;
+            return Ok(Some(CycleOutcome {
+                core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+                halted: false,
+            }));
         }
 
         Ok(None)
@@ -243,15 +245,15 @@ impl CpuGsw {
         // measures fault-free hot code, so observe only the Ok retirements (a decode miss leaves
         // `decoded` None and never observes). `d` is the pre-execution decode key.
         #[cfg(feature = "jit")]
-        if result.is_ok() {
-            if let Some(insn) = &decoded {
-                self.unit_sim_observe(
-                    insn,
-                    lin,
-                    start_cs_register.default_size_32,
-                    start_cs_register.base,
-                );
-            }
+        if result.is_ok()
+            && let Some(insn) = &decoded
+        {
+            self.unit_sim_observe(
+                insn,
+                lin,
+                start_cs_register.default_size_32,
+                start_cs_register.base,
+            );
         }
         self.finish_instruction(
             bus,
@@ -2723,18 +2725,14 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x8a {
-            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
-                let memory = self.resolve_memory_addr_mode(&addr);
-                let value = self.read_memory_u8(
-                    bus,
-                    memory.segment,
-                    memory.offset,
-                    BusAccessKind::DataRead,
-                )?;
-                self.write_gpr8(modrm.reg, value);
-                return Ok(clocks(2));
-            }
+        if insn.opcode == 0x8a
+            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
+        {
+            let memory = self.resolve_memory_addr_mode(&addr);
+            let value =
+                self.read_memory_u8(bus, memory.segment, memory.offset, BusAccessKind::DataRead)?;
+            self.write_gpr8(modrm.reg, value);
+            return Ok(clocks(2));
         }
         self.execute_hot_cached_or_decoded(insn, bus)
     }
@@ -2752,19 +2750,19 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x88 {
-            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
-                let memory = self.resolve_memory_addr_mode(&addr);
-                let value = self.read_gpr8(modrm.reg);
-                self.write_memory_u8(
-                    bus,
-                    memory.segment,
-                    memory.offset,
-                    value,
-                    BusAccessKind::DataWrite,
-                )?;
-                return Ok(clocks(2));
-            }
+        if insn.opcode == 0x88
+            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
+        {
+            let memory = self.resolve_memory_addr_mode(&addr);
+            let value = self.read_gpr8(modrm.reg);
+            self.write_memory_u8(
+                bus,
+                memory.segment,
+                memory.offset,
+                value,
+                BusAccessKind::DataWrite,
+            )?;
+            return Ok(clocks(2));
         }
         self.execute_hot_cached_or_decoded(insn, bus)
     }
@@ -2782,19 +2780,19 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x8b {
-            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
-                let memory = self.resolve_memory_addr_mode(&addr);
-                let value = self.read_memory_sized(
-                    bus,
-                    memory.segment,
-                    memory.offset,
-                    insn.operand_size,
-                    BusAccessKind::DataRead,
-                )?;
-                self.write_gpr_sized(modrm.reg, insn.operand_size, value);
-                return Ok(clocks(2));
-            }
+        if insn.opcode == 0x8b
+            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
+        {
+            let memory = self.resolve_memory_addr_mode(&addr);
+            let value = self.read_memory_sized(
+                bus,
+                memory.segment,
+                memory.offset,
+                insn.operand_size,
+                BusAccessKind::DataRead,
+            )?;
+            self.write_gpr_sized(modrm.reg, insn.operand_size, value);
+            return Ok(clocks(2));
         }
         self.execute_hot_cached_or_decoded(insn, bus)
     }
@@ -2810,20 +2808,20 @@ impl CpuGsw {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        if insn.opcode == 0x89 {
-            if let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand) {
-                let memory = self.resolve_memory_addr_mode(&addr);
-                let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
-                self.write_memory_sized(
-                    bus,
-                    memory.segment,
-                    memory.offset,
-                    insn.operand_size,
-                    value,
-                    BusAccessKind::DataWrite,
-                )?;
-                return Ok(clocks(2));
-            }
+        if insn.opcode == 0x89
+            && let (Some(modrm), Some(DecodedOperand::Mem(addr))) = (insn.modrm, insn.operand)
+        {
+            let memory = self.resolve_memory_addr_mode(&addr);
+            let value = self.read_gpr_sized(modrm.reg, insn.operand_size);
+            self.write_memory_sized(
+                bus,
+                memory.segment,
+                memory.offset,
+                insn.operand_size,
+                value,
+                BusAccessKind::DataWrite,
+            )?;
+            return Ok(clocks(2));
         }
         self.execute_hot_cached_or_decoded(insn, bus)
     }
