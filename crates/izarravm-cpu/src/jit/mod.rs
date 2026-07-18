@@ -248,8 +248,11 @@ impl JitState {
     pub(crate) fn clif_install(
         &mut self,
         descriptor: clif::cache::ClifUnitDescriptor,
+        cells: [std::sync::Arc<links::LinkCell>; 2],
+        sentinel_addr: usize,
     ) -> Option<u32> {
-        self.clif_units.install(&mut self.code_watch, descriptor)
+        self.clif_units
+            .install(&mut self.code_watch, descriptor, cells, sentinel_addr)
     }
 
     /// Wholesale clif-cache drop, releasing every installed unit's watch registration first.

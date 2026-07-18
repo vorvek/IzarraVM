@@ -4,8 +4,10 @@
 //! C1b-pre proof battery: the widened five-parameter call-out ABI (design section 1.7),
 //! proven standalone before any lowering builds on it, mirroring C0's tail-call proof
 //! discipline. Every unit here uses the FINAL `ClifEntryFn` arity (cpu, bus_opaque, table,
-//! imm_table, entry) with the four-live-parameter Tail unit signature (review finding M2), so
-//! the battery covers exactly the ABI C1b-main's compiler emits, not a narrower stand-in. No
+//! imm_table, quota, entry) with the five-live-parameter Tail unit signature (C1d's B3
+//! widening; quota threaded and forwarded across hops, exercised by the standalone chain
+//! proof in chain_proof_test.rs), so the battery covers exactly the ABI the compiler emits,
+//! not a narrower stand-in. No
 //! real `CpuGsw`/`CpuBus` is involved: the `cpu` parameter carries a `#[repr(C)]` proof
 //! context and the shims are stubs, mirroring how `proof_test.rs` used synthetic bodies.
 
@@ -207,6 +209,7 @@ fn build_chain_callout_unit(backend: &mut ClifBackend) -> Option<*const u8> {
     let bus = builder.block_params(entry)[1];
     let table = builder.block_params(entry)[2];
     let imm_table = builder.block_params(entry)[3];
+    let quota = builder.block_params(entry)[4];
     let flags = MemFlagsData::trusted();
 
     let hops = builder.ins().load(types::I64, flags, ctx, 0x00);
@@ -273,14 +276,14 @@ fn build_chain_callout_unit(backend: &mut ClifBackend) -> Option<*const u8> {
     let target = builder.ins().load(types::I64, flags, ctx, 0x28);
     builder
         .ins()
-        .return_call_indirect(unit_sig, target, &[ctx, bus, table, imm_table]);
+        .return_call_indirect(unit_sig, target, &[ctx, bus, table, imm_table, quota]);
 
     builder.switch_to_block(resolve);
     builder.seal_block(resolve);
     let resolver = builder.ins().load(types::I64, flags, ctx, 0x30);
     builder
         .ins()
-        .return_call_indirect(unit_sig, resolver, &[ctx, bus, table, imm_table]);
+        .return_call_indirect(unit_sig, resolver, &[ctx, bus, table, imm_table, quota]);
 
     builder.finalize();
     backend.finalize(func)
@@ -357,7 +360,7 @@ fn enter(
 ) -> i64 {
     let mut bus_marker = 0u64;
     // SAFETY: the adapter and every entry were compiled by this harness's backend at exactly
-    // the five-parameter/four-live-parameter signatures and live in sealed executable memory;
+    // the six-parameter/five-live-parameter signatures and live in sealed executable memory;
     // ctx, table, the immediate slice, and the bus marker outlive the call.
     unsafe {
         (harness.adapter)(
@@ -365,6 +368,7 @@ fn enter(
             std::ptr::from_mut(&mut bus_marker).cast(),
             std::ptr::from_ref(table),
             imm_table.as_ptr(),
+            1,
             entry,
         )
     }

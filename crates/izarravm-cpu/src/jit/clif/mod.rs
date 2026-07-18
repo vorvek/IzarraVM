@@ -41,10 +41,18 @@ pub(crate) struct ClifBackend {
     arena: ExecutableArena,
     /// Units rejected by the zero-relocation install invariant (counted fallback).
     relocation_fallbacks: u64,
-    /// The widened five-parameter adapter's installed address (Track C C1b, the call-out
-    /// ABI, design section 1.2), compiled once and reused for every unit entry. The single
-    /// adapter since C1b-main retired the C1a shell shapes.
+    /// The six-parameter adapter's installed address (Track C C1b's call-out ABI at C1d's
+    /// widened arity, design section 4.2), compiled once and reused for every unit entry.
     callout_adapter_entry: Option<usize>,
+    /// The unresolved-sentinel descriptor (Track C C1d, design section 3.3b): one static
+    /// descriptor per backend whose `entry` is the resolver trampoline (compiled into THIS
+    /// backend's arena, hence per-backend ownership, never process-static) and whose
+    /// `operands` is the all-zeros table (never loaded, but dereferenceable-shaped so the
+    /// branch-free transfer thunk computes its imm_table without a special case). Boxed for
+    /// address stability: portals publish this address, so it must outlive every cell that
+    /// could name it and is torn down only with the backend itself (the N1(b) drop
+    /// discipline). Every other field is inert filler, never read.
+    sentinel: Option<Box<cache::ClifUnitDescriptor>>,
 }
 
 impl ClifBackend {
@@ -70,6 +78,7 @@ impl ClifBackend {
             arena: ExecutableArena::new()?,
             relocation_fallbacks: 0,
             callout_adapter_entry: None,
+            sentinel: None,
         })
     }
 
@@ -98,6 +107,20 @@ impl ClifBackend {
     pub(crate) fn relocation_fallbacks(&self) -> u64 {
         self.relocation_fallbacks
     }
+
+    /// The per-backend unresolved-sentinel descriptor (design section 3.3b), built lazily
+    /// on first use: compiles the resolver trampoline into this backend's arena and wraps
+    /// it in a boxed, address-stable `ClifUnitDescriptor` whose `operands` table is all
+    /// zeros. Returns the stable address; `None` if the trampoline cannot compile (arena
+    /// full or an unsupported shape, both of which already disable the backend's other
+    /// compiles too).
+    pub(crate) fn sentinel_descriptor(&mut self) -> Option<&cache::ClifUnitDescriptor> {
+        if self.sentinel.is_none() {
+            let entry = self.finalize(callout::build_unresolved_trampoline())? as usize;
+            self.sentinel = Some(Box::new(cache::ClifUnitDescriptor::sentinel(entry)));
+        }
+        self.sentinel.as_deref()
+    }
 }
 
 pub(crate) mod cache;
@@ -111,3 +134,7 @@ mod proof_tests;
 #[cfg(test)]
 #[path = "callout_proof_test.rs"]
 mod callout_proof_tests;
+
+#[cfg(test)]
+#[path = "chain_proof_test.rs"]
+mod chain_proof_tests;

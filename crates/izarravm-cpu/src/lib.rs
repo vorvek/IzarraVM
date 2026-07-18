@@ -941,6 +941,10 @@ pub struct JitClifCounters {
     pub mem_exit_permission: u64,
     pub mem_exit_code_watch: u64,
     pub mem_exit_segment_limit: u64,
+    /// C1d: completed linked transfers (Direct's `linked_transfers` analogue) and hops
+    /// that landed in the resolver trampoline (the unresolved split).
+    pub linked_transfers: u64,
+    pub unresolved_transfers: u64,
 }
 
 impl PartialEq for JitClifCounters {
