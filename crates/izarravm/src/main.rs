@@ -930,7 +930,7 @@ fn write_hdd_profile_json(
         })).collect::<Vec<_>>(),
         "classified_wall_ns": classified_wall_ns,
         "unattributed_wall_ns": total_wall_ns.saturating_sub(classified_wall_ns),
-        "perf": bench::perf_counters_json(perf),
+        "perf": bench::perf_counters_json(perf, machine.cpu().poll_skip_memory()),
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
     Ok(())

@@ -3,7 +3,7 @@
 
 use super::*;
 #[cfg(feature = "jit")]
-use izarravm_cpu::PollLoop;
+use izarravm_cpu::{PollFamily, PollLoop};
 
 pub(super) fn jit_auto_admit_policy(
     value: Option<&str>,
@@ -55,6 +55,12 @@ pub(super) struct PollSkipDiagnostics {
     edge_cap_rejections: u64,
     committed_spans: u64,
     committed_iterations: u64,
+    // Memory-family-only diagnostics (own certification and spin predicate,
+    // no port/vega involvement; see try_poll_skip_memory).
+    memory_structural_hits: u64,
+    memory_translate_or_certificate_rejections: u64,
+    memory_spin_rejections: u64,
+    memory_cap_rejections: u64,
     #[cfg(test)]
     classifier_calls: u64,
     #[cfg(test)]
@@ -130,6 +136,33 @@ impl PollSkipDiagnostics {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    fn memory_structural_hit(&mut self) {
+        Self::increment(self.enabled, &mut self.memory_structural_hits);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn memory_translate_or_certificate_rejection(&mut self) {
+        Self::increment(
+            self.enabled,
+            &mut self.memory_translate_or_certificate_rejections,
+        );
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn memory_spin_rejection(&mut self) {
+        Self::increment(self.enabled, &mut self.memory_spin_rejections);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn memory_cap_rejection(&mut self) {
+        Self::increment(self.enabled, &mut self.memory_cap_rejections);
+    }
+
     #[cfg(test)]
     fn classifier_observation(&mut self, poll: Option<PollLoop>, eligible: bool) {
         self.classifier_calls = self.classifier_calls.saturating_add(1);
@@ -178,7 +211,7 @@ impl Drop for PollSkipDiagnostics {
             return;
         }
         eprintln!(
-            "poll-skip diag: policy_backend_rejections={} cpu_eligibility_rejections={} structural_hits_direct3={} structural_hits_setup_direct={} structural_hits_setup_paired={} source_port_mismatches={} vga_bus_certificate_rejections={} edge_cap_rejections={} committed_spans={} committed_iterations={}",
+            "poll-skip diag: policy_backend_rejections={} cpu_eligibility_rejections={} structural_hits_direct3={} structural_hits_setup_direct={} structural_hits_setup_paired={} source_port_mismatches={} vga_bus_certificate_rejections={} edge_cap_rejections={} committed_spans={} committed_iterations={} memory_structural_hits={} memory_translate_or_certificate_rejections={} memory_spin_rejections={} memory_cap_rejections={}",
             self.policy_backend_rejections,
             self.cpu_eligibility_rejections,
             self.structural_hits_direct3,
@@ -189,6 +222,10 @@ impl Drop for PollSkipDiagnostics {
             self.edge_cap_rejections,
             self.committed_spans,
             self.committed_iterations,
+            self.memory_structural_hits,
+            self.memory_translate_or_certificate_rejections,
+            self.memory_spin_rejections,
+            self.memory_cap_rejections,
         );
     }
 }
@@ -220,6 +257,13 @@ pub(super) fn try_poll_skip(
     if !cpu.poll_skip_eligible() {
         diagnostics.cpu_eligibility_rejection();
         return None;
+    }
+    // Family dispatch (R4): the memory shape is a parallel executor with its
+    // own certification, spin predicate, and cap-only binary search, no port
+    // or vega calls. Everything below this branch is the io path, BYTE-
+    // IDENTICAL to before the memory-poll shape existed.
+    if poll.family() == PollFamily::Memory {
+        return try_poll_skip_memory(cpu, bus, diagnostics, poll, batch_core, cap);
     }
     diagnostics.structural_hit(poll.diagnostic_class());
     if !poll.at_head() {
@@ -328,6 +372,115 @@ pub(super) fn try_poll_skip(
     debug_assert_eq!(committed, charged);
     cpu.poll_skip_backedge_housekeeping();
     bus.poll_commit_bus(certificate, best);
+    diagnostics.committed(best);
+    Some(charged_u32)
+}
+
+/// The memory-family poll-skip executor (R4): certifies the polled cell's
+/// data address through the real translation seam, checks the spin predicate
+/// (R1) before committing anything, and bounds the skip by `cap` alone (no
+/// device-specific edge exists for a plain-RAM cell: its only possible writer
+/// is a device advance, and every device advance runs at batch end, after
+/// `cap`; see the design doc's R3). No vega or port calls anywhere in this
+/// function.
+#[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
+fn try_poll_skip_memory(
+    cpu: &mut CpuGsw,
+    bus: &mut MachineBus<'_>,
+    diagnostics: &mut PollSkipDiagnostics,
+    poll: PollLoop,
+    batch_core: u32,
+    cap: u64,
+) -> Option<u32> {
+    diagnostics.memory_structural_hit();
+    if !poll.at_head() {
+        return None;
+    }
+    let linear = poll.memory_cell_linear()?;
+    let Some(physical) = cpu.probe_linear_read_physical(linear) else {
+        diagnostics.memory_translate_or_certificate_rejection();
+        return None;
+    };
+    let Some(certificate) = bus.poll_memory_bus_certificate(poll, physical) else {
+        diagnostics.memory_translate_or_certificate_rejection();
+        return None;
+    };
+    // R1: read the polled cell through the plain, uncharged backing-store
+    // read (never CpuBus::read_memory/read_memory_direct/charge_direct_memory,
+    // which all record trace clocks and would break timing identity), then
+    // require the loop to actually be spinning before committing anything.
+    // The read uses the A20-gated physical so it agrees with both the
+    // certificate's checks and the interpreter's own access (identity today:
+    // the M1 shape requires 32-bit code, where A20 is open in practice).
+    let cell_value = bus.memory.read_u32(bus.apply_a20(physical) as usize).ok()?;
+    let comparand = poll.memory_comparand(cpu)?;
+    if !poll.memory_spin_predicate(cell_value, comparand)? {
+        diagnostics.memory_spin_rejection();
+        return None;
+    }
+
+    let current_bus = bus.poll_project_scaled_bus_clocks(certificate, 0)?;
+    let spent = u64::from(batch_core).checked_add(current_bus)?;
+    let upper = cap
+        .checked_sub(spent)?
+        .min(u64::from(u32::MAX))
+        .saturating_sub(1);
+    if upper < 2 {
+        diagnostics.memory_cap_rejection();
+        return None;
+    }
+
+    // Cap-only admissibility: the same one-iteration-headroom convention as
+    // the io executor, minus the vretrace edge term (there is none for this
+    // shape; see the design doc's "no new device query is needed" section).
+    let admissible = |iterations: u64| -> bool {
+        let Some(reserved) = iterations.checked_add(1) else {
+            return false;
+        };
+        let Some(reserved_core) = cpu.project_poll_skip_core(poll, reserved) else {
+            return false;
+        };
+        let Some(reserved_bus) = bus.poll_project_scaled_bus_clocks(certificate, reserved) else {
+            return false;
+        };
+        let Some(reserved_total) = u64::from(batch_core)
+            .checked_add(reserved_core)
+            .and_then(|total| total.checked_add(reserved_bus))
+        else {
+            return false;
+        };
+        reserved_total <= cap
+    };
+
+    let mut low = 2u64;
+    let mut high = upper;
+    let mut best = 0u64;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if admissible(mid) {
+            best = mid;
+            low = mid.saturating_add(1);
+        } else {
+            high = mid.saturating_sub(1);
+        }
+    }
+    if best < 2 {
+        diagnostics.memory_cap_rejection();
+        return None;
+    }
+
+    let charged = cpu.project_poll_skip_core(poll, best)?;
+    let charged_u32 = u32::try_from(charged).ok()?;
+    bus.poll_project_scaled_bus_clocks(certificate, best)?;
+
+    let committed = cpu
+        .commit_poll_skip_core(poll, best)
+        .expect("projected poll core commit must succeed");
+    debug_assert_eq!(committed, charged);
+    cpu.poll_skip_backedge_housekeeping();
+    bus.poll_commit_memory_bus(certificate, best);
     diagnostics.committed(best);
     Some(charged_u32)
 }

@@ -414,6 +414,15 @@ impl Registers {
         self.gpr[7]
     }
 
+    /// GPR by ModRM index (0=eax..7=edi), for the memory-poll shape's comparand
+    /// register (the CMP instruction's ModRM reg field names any GPR).
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn gpr32(&self, index: u8) -> u32 {
+        self.gpr[usize::from(index & 7)]
+    }
+
     pub fn set_eax(&mut self, value: u32) {
         self.gpr[0] = value;
     }
@@ -710,12 +719,18 @@ pub struct PerfCounters {
 pub struct PollLoop {
     fetches: [(u32, u32, u8); 6],
     fetch_count: u8,
+    // Meaningful only for the Io family (PollFamily::Io / `memory.is_none()`); a
+    // memory-family loop fills these with an arbitrary placeholder. The executor
+    // must dispatch on `family()` before consulting any Io-only accessor
+    // (`resolved_port`, `status_mask`, `fresh_iteration_spins`).
     port_source: PollPortSource,
     branch_shape: PollBranchShape,
     status_mask: u8,
     branch_when_zero: bool,
     raw_core_clocks: u64,
     at_head: bool,
+    /// Present only for the memory-poll family (M1). `None` means Io.
+    memory: Option<PollMemoryFields>,
 }
 
 #[cfg(feature = "jit")]
@@ -731,6 +746,36 @@ enum PollPortSource {
 enum PollBranchShape {
     Direct,
     PairedJmp,
+}
+
+/// Which certified shape family a `PollLoop` belongs to. The machine-side
+/// executor dispatches on this before touching any family-specific field.
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollFamily {
+    Io,
+    Memory,
+}
+
+/// Fields specific to the memory-poll family (shape M1: `CMP r32,DS:[disp32]`
+/// with no base/index register, terminal `Jcc rel8` back to entry). The bare
+/// disp32 restriction means the effective linear address depends on no GPR,
+/// only DS's base, which is read fresh at every classification (Found
+/// results are never cached, so a DS reload cannot leave a stale linear).
+#[cfg(feature = "jit")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PollMemoryFields {
+    /// The polled cell's LINEAR address (ds.base + disp32), resolved at
+    /// classification time. Not yet translated to physical: paging requires a
+    /// fresh TLB probe every certification (see `CpuGsw::probe_linear_read_physical`).
+    linear: u32,
+    /// Access width in bytes (4, the shape is dword-only).
+    width: u8,
+    /// GPR index (ModRM reg field of the CMP) holding the comparand.
+    comparand_gpr: u8,
+    /// True for opcode 0x74 (JE): the loop spins while the cell equals the
+    /// comparand. False for 0x75 (JNE): spins while they differ.
+    spins_while_equal: bool,
 }
 
 #[cfg(feature = "jit")]
@@ -785,6 +830,52 @@ impl PollLoop {
     pub fn fresh_backedge_taken(self, status: u8) -> bool {
         self.fresh_iteration_spins(status)
     }
+
+    /// Which certified shape family this loop belongs to. The executor must
+    /// check this before calling any Io-only accessor.
+    #[cold]
+    #[inline(never)]
+    pub fn family(self) -> PollFamily {
+        if self.memory.is_some() {
+            PollFamily::Memory
+        } else {
+            PollFamily::Io
+        }
+    }
+
+    /// The polled cell's linear address, for the memory family only.
+    #[cold]
+    #[inline(never)]
+    pub fn memory_cell_linear(self) -> Option<u32> {
+        self.memory.map(|m| m.linear)
+    }
+
+    /// The polled cell's access width in bytes, for the memory family only.
+    #[cold]
+    #[inline(never)]
+    pub fn memory_cell_width(self) -> Option<u8> {
+        self.memory.map(|m| m.width)
+    }
+
+    /// The comparand register's LIVE value, for the memory family only.
+    #[cold]
+    #[inline(never)]
+    pub fn memory_comparand(self, cpu: &CpuGsw) -> Option<u32> {
+        let mem = self.memory?;
+        Some(cpu.registers.gpr32(mem.comparand_gpr))
+    }
+
+    /// Whether the loop is currently spinning, given the polled cell's current
+    /// value and the comparand's live value (R1: the executor must check this
+    /// before committing any memory-family skip). `None` outside the memory
+    /// family.
+    #[cold]
+    #[inline(never)]
+    pub fn memory_spin_predicate(self, cell_value: u32, comparand: u32) -> Option<bool> {
+        let mem = self.memory?;
+        let equal = cell_value == comparand;
+        Some(if mem.spins_while_equal { equal } else { !equal })
+    }
 }
 
 impl PartialEq for PerfCounters {
@@ -794,6 +885,29 @@ impl PartialEq for PerfCounters {
     }
 }
 impl Eq for PerfCounters {}
+
+/// Subset of `poll_skip_spans`/`poll_skip_iterations` attributable to the
+/// memory-poll shape family (M1: CMP r32,DS:[disp32]; Jcc back to entry),
+/// bumped alongside the general totals in `commit_poll_skip_core`. Kept OUT
+/// of `PerfCounters` and at the very tail of `CpuGsw` so no pre-existing
+/// field offset moves (growing `PerfCounters` shifted the hot `pending_flags`
+/// field and cost the interpreter measurable wall time; the offset pin in
+/// cpu_test.rs guards 4440). Serialized into the same perf JSON keys by
+/// `perf_counters_json`. Unconditional (not cfg jit) like the other poll
+/// counters in `PerfCounters`, so non-jit consumers can name the type.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollSkipMemoryCounters {
+    pub spans: u64,
+    pub iterations: u64,
+}
+
+impl PartialEq for PollSkipMemoryCounters {
+    // Diagnostic-only, like PerfCounters: never affects CpuGsw equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PollSkipMemoryCounters {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuProfileBucket {
@@ -1030,6 +1144,13 @@ pub struct CpuGsw {
     /// the scan itself is always correct without it.
     #[cfg(feature = "jit")]
     poll_neg_cache_enabled: bool,
+    /// IZARRAVM_POLL_SKIP_MEMORY (default on, "0"/"" disables): whether the
+    /// classifier's memory-poll shape (M1) may be recognized at all. A
+    /// campaign-only sub-toggle under the same IZARRAVM_POLL_SKIP kill
+    /// switch, so a same-binary run can isolate the memory family's own
+    /// marginal contribution on top of the io family's already-proven win.
+    #[cfg(feature = "jit")]
+    poll_skip_memory_enabled: bool,
     /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
     /// clones start empty like the other host-only accelerator caches.
     #[cfg(all(
@@ -1077,6 +1198,12 @@ pub struct CpuGsw {
     /// the frame's own CS is loaded, which must not be mistaken for the CPL the pushes
     /// execute under).
     cpl: u8,
+    /// Memory-poll skip counters, deliberately the LAST field: adding them to
+    /// `PerfCounters` (declared far above) shifted every later CpuGsw field,
+    /// moving the hot `pending_flags` off its pinned 4440 and costing the
+    /// interpreter measurable wall time. At the tail they change only the
+    /// struct's total size. See `PollSkipMemoryCounters`.
+    poll_skip_memory: PollSkipMemoryCounters,
 }
 
 impl Default for CpuGsw {
@@ -1120,6 +1247,8 @@ impl Default for CpuGsw {
             direct_runtime: DirectRuntimeState::default(),
             #[cfg(feature = "jit")]
             poll_neg_cache_enabled: poll_neg_cache_default(),
+            #[cfg(feature = "jit")]
+            poll_skip_memory_enabled: poll_skip_memory_default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
@@ -1133,6 +1262,7 @@ impl Default for CpuGsw {
             #[cfg(feature = "jit")]
             unit_sim: UnitSimSlot::default(),
             cpl: 0,
+            poll_skip_memory: PollSkipMemoryCounters::default(),
         }
     }
 }
@@ -1143,6 +1273,14 @@ impl CpuGsw {
     /// IZARRAVM_POLL_SKIP_NEG_CACHE environment. Host bookkeeping only.
     pub fn set_poll_neg_cache_enabled_for_test(&mut self, enabled: bool) {
         self.poll_neg_cache_enabled = enabled;
+    }
+
+    /// Test seam: force the memory-poll shape's sub-flag on or off regardless
+    /// of the IZARRAVM_POLL_SKIP_MEMORY environment. Host bookkeeping only.
+    #[cold]
+    #[inline(never)]
+    pub fn set_poll_skip_memory_enabled_for_test(&mut self, enabled: bool) {
+        self.poll_skip_memory_enabled = enabled;
     }
 }
 
@@ -1898,6 +2036,26 @@ pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
 pub(crate) fn poll_neg_cache_default() -> bool {
     let value = std::env::var("IZARRAVM_POLL_SKIP_NEG_CACHE").ok();
     poll_neg_cache_policy(value.as_deref())
+}
+
+/// IZARRAVM_POLL_SKIP_MEMORY policy: enabled unless explicitly "0" or "".
+/// Campaign-only sub-toggle for the memory-poll shape family, independent of
+/// the io shapes; gated at the single classifier choke point in
+/// `build_poll_loop_at` (see the M1 arm in `jit/block.rs`).
+#[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
+pub(crate) fn poll_skip_memory_policy(value: Option<&str>) -> bool {
+    !matches!(value, Some("" | "0"))
+}
+
+/// Ambient default for the memory-poll sub-flag, read fresh at CPU construction.
+#[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
+pub(crate) fn poll_skip_memory_default() -> bool {
+    let value = std::env::var("IZARRAVM_POLL_SKIP_MEMORY").ok();
+    poll_skip_memory_policy(value.as_deref())
 }
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP

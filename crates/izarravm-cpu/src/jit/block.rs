@@ -52,8 +52,19 @@ use super::region::{CompiledRegion, JIT_REGION_TABLE_CAP};
 use super::step::{RegionCtx, RegionEntryFn, RegionExitKind, Slot, SlotKind};
 use crate::{
     AddressSize, CpuGsw, CpuPersona, DecodeGroup, DecodedInsn, DecodedOperand, OperandSize,
-    PollBranchShape, PollLoop, PollPortSource, Prefixes, SegmentIndex,
+    PollBranchShape, PollLoop, PollMemoryFields, PollPortSource, Prefixes, SegmentIndex,
 };
+
+/// Empirically-derived (not a per-opcode sum) core-clock cost of one iteration
+/// of the certified memory-poll shape (M1: `CMP r32,DS:[disp32]` (6 bytes) +
+/// `Jcc rel8` (2 bytes) back to entry), measured from the interpreter's own
+/// per-iteration charge for these exact bytes and pinned by the machine-side
+/// state+timing identity test
+/// `memory_poll_skip_matches_the_interpreter_at_batch_boundaries`. Mirrors how
+/// 17/21/28 were pinned for the io shapes: not derivable from the direct-JIT
+/// `DirectKind::raw_clocks` table, which has no entry for a memory-operand CMP
+/// (that path never reaches native codegen).
+const MEMORY_POLL_RAW_CORE_CLOCKS: u64 = 5;
 
 /// Cap on a compiled block's slot count, to bound the emit and the compile pass. A block that
 /// reaches the cap ends linearly (its tail is interpreted); real hot loops are far smaller.
@@ -492,6 +503,69 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
             branch_when_zero,
             raw_core_clocks: 17,
             at_head: cpu.linear_eip() == entry,
+            memory: None,
+        });
+    }
+
+    // 2-slot memory-compare shape (M1: `CMP r32,DS:[disp32]` with no base and
+    // no index register; terminal `Jcc rel8` back to entry). The bare-disp32
+    // restriction is the safety condition for register/segment invariance
+    // (hazard e in the design doc): with no base and no index, the effective
+    // linear address depends on NO GPR at all, only DS's base/limit, which
+    // `poll_slots_within_live_cs` re-checks fresh on every call. Gated by the
+    // IZARRAVM_POLL_SKIP_MEMORY sub-flag at this single choke point: with it
+    // off, this arm never returns `Found`, which is sufficient regardless of
+    // which slot address the backward scan enters from (the shared Jcc
+    // opcodes 0x74/0x75 stay in `poll_head_possible`'s set for the io shapes).
+    if let [cmp, branch] = slots.as_slice()
+        && d
+        && is_loop
+        && cmp.insn.opcode == 0x3b
+        && cmp.insn.len == 6
+        && cmp.insn.operand_size == OperandSize::Dword
+        && matches!(branch.insn.opcode, 0x74 | 0x75)
+        && branch.insn.len == 2
+        && loop_back_edge_target(&branch.insn, branch.lin) == Some(entry)
+    {
+        if !cpu.poll_skip_memory_enabled {
+            return PollScanOutcome::NegativeCacheable;
+        }
+        let Some(modrm) = cmp.insn.modrm else {
+            return PollScanOutcome::NegativeCacheable;
+        };
+        let Some(DecodedOperand::Mem(addr)) = cmp.insn.operand else {
+            return PollScanOutcome::NegativeCacheable;
+        };
+        if addr.address_size != AddressSize::Dword
+            || addr.segment != SegmentIndex::Ds
+            || addr.base.is_some()
+            || addr.index.is_some()
+        {
+            return PollScanOutcome::NegativeCacheable;
+        }
+        if !poll_slots_within_live_cs(cpu, &slots) {
+            return PollScanOutcome::NegativeVolatile;
+        }
+        let Some((fetches, fetch_count)) = poll_fetches(&slots) else {
+            return PollScanOutcome::NegativeCacheable;
+        };
+        let ds_base = cpu.registers.segment(SegmentIndex::Ds).base;
+        let linear = ds_base.wrapping_add(addr.disp as u32);
+        return PollScanOutcome::Found(PollLoop {
+            fetches,
+            fetch_count,
+            port_source: PollPortSource::CurrentDx,
+            branch_shape: PollBranchShape::Direct,
+            status_mask: 0,
+            branch_when_zero: false,
+            raw_core_clocks: MEMORY_POLL_RAW_CORE_CLOCKS,
+            at_head: cpu.linear_eip() == entry,
+            memory: Some(PollMemoryFields {
+                linear,
+                width: 4,
+                comparand_gpr: modrm.reg,
+                spins_while_equal: branch.insn.opcode == 0x74,
+            }),
         });
     }
 
@@ -548,6 +622,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
             branch_when_zero,
             raw_core_clocks: 21,
             at_head: cpu.linear_eip() == entry,
+            memory: None,
         });
     }
 
@@ -595,6 +670,7 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
         branch_when_zero,
         raw_core_clocks: 28,
         at_head: cpu.linear_eip() == entry,
+        memory: None,
     })
 }
 
@@ -641,21 +717,31 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
 /// inside a certified poll shape. Every shape requires 32-bit code (d) and
 /// every Found's fetch set contains the current EIP as a slot START, whose
 /// opcode is one of the fixed set below (3-slot: IN/TEST/Jcc; 5-slot adds
-/// MOV 0x89 and SUB 0x29; paired adds JMP 0xEB). A cold line cannot be a
+/// MOV 0x89 and SUB 0x29; paired adds JMP 0xEB; the memory shape M1 adds CMP
+/// 0x3B, shared with the io shapes' Jcc 0x74/0x75). A cold line cannot be a
 /// slot (build_block chains only warm lines), and warming goes through
 /// `put`, which bumps the page insert generation guarding any cached
 /// negative. Containment is structural, so this rejection is a
 /// code-byte-only fact under EVERY register state, even when a nearby
-/// shape would scan as register-volatile. Extending the shape table in
-/// build_poll_loop_at requires extending this set; the every-phase test
-/// exact_setup_poll_shapes_cover_sources_senses_and_every_phase fails if
-/// any slot opcode goes missing here.
+/// shape would scan as register-volatile. The IZARRAVM_POLL_SKIP_MEMORY
+/// sub-flag is NOT consulted here (0x3B always stays possible): the single
+/// choke point that suppresses the memory shape lives in
+/// `build_poll_loop_at`'s M1 arm, because the shared Jcc opcodes mean a
+/// backward scan can reach the CMP slot even when the current boundary sits
+/// on the branch. Extending the shape table in build_poll_loop_at requires
+/// extending this set; the every-phase tests
+/// exact_setup_poll_shapes_cover_sources_senses_and_every_phase and
+/// exact_memory_poll_shape_covers_senses_and_every_phase fail if any slot
+/// opcode goes missing here.
 fn poll_head_possible(cpu: &CpuGsw, lin: u32, d: bool) -> bool {
     if !d {
         return false;
     }
     match cpu.decode_cache.get(lin, d) {
-        Some(insn) => matches!(insn.opcode, 0x89 | 0x29 | 0xec | 0xa8 | 0x74 | 0x75 | 0xeb),
+        Some(insn) => matches!(
+            insn.opcode,
+            0x89 | 0x29 | 0xec | 0xa8 | 0x74 | 0x75 | 0xeb | 0x3b
+        ),
         None => false,
     }
 }

@@ -593,13 +593,23 @@ impl CpuGsw {
 
     /// Host-side performance counters accumulated since construction or the last
     /// `reset_perf_counters`. Diagnostics for `--headless-bench`; not architectural state.
+    /// The memory-poll skip counter subset (stored outside `PerfCounters`;
+    /// see `PollSkipMemoryCounters` for why). Reset alongside the other
+    /// counters by `reset_perf_counters`.
+    #[inline(never)]
+    pub fn poll_skip_memory(&self) -> PollSkipMemoryCounters {
+        self.poll_skip_memory
+    }
+
     pub fn perf_counters(&self) -> &PerfCounters {
         &self.perf
     }
 
-    /// Zero the host-side performance counters.
+    /// Zero the host-side performance counters, including the memory-poll
+    /// subset stored outside `PerfCounters` (see `PollSkipMemoryCounters`).
     pub fn reset_perf_counters(&mut self) {
         self.perf = PerfCounters::default();
+        self.poll_skip_memory = PollSkipMemoryCounters::default();
     }
 
     #[cfg(feature = "jit")]
@@ -637,7 +647,41 @@ impl CpuGsw {
         self.timing_rem = remainder;
         self.perf.poll_skip_spans = self.perf.poll_skip_spans.saturating_add(1);
         self.perf.poll_skip_iterations = self.perf.poll_skip_iterations.saturating_add(iterations);
+        if poll.family() == crate::PollFamily::Memory {
+            self.poll_skip_memory.spans = self.poll_skip_memory.spans.saturating_add(1);
+            self.poll_skip_memory.iterations =
+                self.poll_skip_memory.iterations.saturating_add(iterations);
+        }
         Some(charged)
+    }
+
+    /// TLB-hit-only, non-mutating linear-to-physical PROBE for a data READ
+    /// (the poll-skip memory certification seam, R2). Unpaged mode returns the
+    /// linear identity. Paged mode consults ONLY the cached TLB entry's
+    /// read-protection bit (never the dirty bit: this is a read, never a
+    /// write); DECLINES (`None`) on a TLB miss or a would-fault protection
+    /// mismatch. Deliberately does NOT call `translate_linear`/
+    /// `translate_linear_checked`: the full walk sets CR2 on a fault, issues
+    /// charged PageWalkRead bus reads, and can write the PTE accessed bit into
+    /// guest RAM on a fill, none of which a pure certification probe may do.
+    /// A decline costs nothing beyond one ordinary interpreted iteration
+    /// before the next batch's classifier retries: `try_poll_skip` requires
+    /// `at_head`, so the previous iteration's CMP just executed and warmed
+    /// this exact page's TLB entry.
+    #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
+    pub fn probe_linear_read_physical(&self, linear: u32) -> Option<u32> {
+        if !self.is_paging_enabled() {
+            return Some(linear);
+        }
+        let page = linear >> 12;
+        let entry = self.tlb.lookup(page)?;
+        let user = self.current_privilege_level() == 3;
+        if user && !entry.user {
+            return None;
+        }
+        Some(entry.phys | (linear & 0x0000_0fff))
     }
 
     /// Apply the non-architectural housekeeping a taken backedge performs while
