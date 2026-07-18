@@ -643,6 +643,24 @@ pub struct PerfCounters {
     pub jit_direct_reject_alignment: u64,
     pub jit_direct_reject_fetch_limit: u64,
     pub jit_direct_reject_zero_budget: u64,
+    /// Track C C1a: clif side-exit shell admission and entry diagnostics, the clif analogues
+    /// of the `jit_direct_*`/`jit_direct_reject_*` counters above. A C1a shell never retires a
+    /// guest instruction natively (F-A1 option B: it side-exits immediately), so there is no
+    /// `jit_clif_insns` counterpart yet; `jit_clif_entries` counts adapter round trips instead.
+    pub jit_clif_compile_attempts: u64,
+    pub jit_clif_units_installed: u64,
+    pub jit_clif_entries: u64,
+    pub jit_clif_side_exits: u64,
+    pub jit_clif_reject_observer: u64,
+    pub jit_clif_reject_interrupt_shadow: u64,
+    pub jit_clif_reject_aggregate_accounting: u64,
+    pub jit_clif_reject_mode_key: u64,
+    pub jit_clif_reject_cs_layout: u64,
+    pub jit_clif_reject_cpl: u64,
+    pub jit_clif_reject_data_segment: u64,
+    pub jit_clif_reject_alignment: u64,
+    pub jit_clif_reject_fetch_limit: u64,
+    pub jit_clif_reject_zero_budget: u64,
     pub jit_direct_cache_resets: u64,
     pub jit_direct_arena_compactions: u64,
     pub jit_direct_arena_compaction_live_blocks: u64,
@@ -1982,6 +2000,15 @@ struct DecodeLine {
     /// Saturating direct-code admission count, independent of legacy region stamps.
     #[cfg(feature = "jit")]
     jit_direct_hotness: u8,
+    /// Independent clif admission counter (Track C C1a, plan section 2.4 row P4): the two
+    /// backends compile under a runtime policy switch (decision D-C1.4) with their own
+    /// hotness history, so this never shares `jit_direct_hotness`.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    jit_clif_hotness: u8,
 }
 
 /// Per-physical-page code bookkeeping for the narrow SMC path: the ONE linear page code on this
@@ -2332,6 +2359,12 @@ impl DecodeCache {
             jit_hotness: 0,
             #[cfg(feature = "jit")]
             jit_direct_hotness: 0,
+            #[cfg(all(
+                feature = "clif-backend",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            jit_clif_hotness: 0,
         };
 
         DecodeInsertOutcome {
@@ -2514,6 +2547,26 @@ impl DecodeCache {
             line.jit_direct_hotness += 1;
         }
         line.jit_direct_hotness == threshold
+    }
+
+    /// Clif analogue of `direct_hot` (Track C C1a, plan section 2.4 row P4): an independent
+    /// per-decode-line counter, since the two backends compile under a runtime policy switch
+    /// (decision D-C1.4) and never share admission history.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    #[inline]
+    fn clif_hot(&mut self, lin: u32, d: bool, threshold: u8) -> bool {
+        let line = &mut self.lines[(lin & self.mask) as usize];
+        if line.generation != self.generation || line.tag != lin || line.d != d {
+            return false;
+        }
+        if line.jit_clif_hotness < threshold {
+            line.jit_clif_hotness += 1;
+        }
+        line.jit_clif_hotness == threshold
     }
 
     /// Invalidate every cached line and drop every matching code watch. The generation advance and

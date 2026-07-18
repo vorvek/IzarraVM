@@ -11,8 +11,16 @@
 
 use std::collections::HashMap;
 
-use super::super::direct::{self, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, UnitTerminal};
+use super::super::direct::{self, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, SmcHeatMap, UnitTerminal};
 use crate::{CpuGsw, CpuPersona, Prefixes, U32BuildHasher};
+
+/// The clif hotness threshold (P4): an independent per-decode-line counter at Direct's
+/// `admission_heat` defaults (plan section 2.4, row P4), so the two backends compile
+/// independently under a runtime policy switch (decision D-C1.4) without sharing a counter.
+#[cfg(not(test))]
+pub(crate) const CLIF_DEFAULT_ADMISSION_HEAT: u8 = 8;
+#[cfg(test)]
+pub(crate) const CLIF_DEFAULT_ADMISSION_HEAT: u8 = 1;
 
 /// The clif unit key: the same three fields as `jit::direct::BlockKey` with identical
 /// semantics (plan section 2.1), as a parallel type per decision D-C1.1.
@@ -70,6 +78,20 @@ pub(crate) struct ClifUnitDescriptor {
     pub(crate) is_self_loop: bool,
     /// The shell's native entry, once compiled and installed (C1a: a side-exit shell).
     pub(crate) entry: usize,
+}
+
+impl ClifUnitDescriptor {
+    /// G6: full CS descriptor equality, not selector-only (mirrors
+    /// `CompiledBlock::cs_descriptor_matches`).
+    pub(crate) fn cs_descriptor_matches(&self, cpu: &CpuGsw) -> bool {
+        self.segment_layout.cs_matches(cpu)
+    }
+
+    /// G8, non-chain form only (C1a has no linking; the chain variant is C1d's job, per the
+    /// checklist's deferred-to-C1d note).
+    pub(crate) fn data_descriptors_match(&self, cpu: &CpuGsw) -> bool {
+        self.segment_layout.data_matches(cpu)
+    }
 }
 
 /// The result of the unit-boundary growth walk (F-A5).
@@ -181,6 +203,30 @@ impl ClifUnitCache {
     pub(crate) fn park_dormant(&mut self, key: ClifUnitKey) {
         self.entries.insert(key, ClifUnitState::Dormant);
         self.heat_demotions = self.heat_demotions.saturating_add(1);
+    }
+
+    /// Park a key Dormant for a non-heat reason (G4 cover failure, a failed compile or
+    /// install), mirroring Direct's plain `dormant()`: only a `Seen` key transitions, and the
+    /// heat-demotion diagnostic is untouched since no heat gate fired.
+    pub(crate) fn dormant(&mut self, key: ClifUnitKey) {
+        if self.entries.get(&key) == Some(&ClifUnitState::Seen) {
+            self.entries.insert(key, ClifUnitState::Dormant);
+        }
+    }
+
+    /// G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out returns to
+    /// `Seen`, mirroring `BlockCache::lift_cold_smc_dormant`.
+    pub(crate) fn lift_cold_dormant(
+        &mut self,
+        heat: &mut SmcHeatMap,
+        key: ClifUnitKey,
+        epoch: u32,
+    ) {
+        if self.entries.get(&key) == Some(&ClifUnitState::Dormant)
+            && heat.take_stale_stamp(key.physical, epoch)
+        {
+            self.entries.insert(key, ClifUnitState::Seen);
+        }
     }
 
     /// Install a compiled shell descriptor for a key previously recorded `Seen`.

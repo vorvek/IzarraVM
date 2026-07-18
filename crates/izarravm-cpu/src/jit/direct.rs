@@ -253,11 +253,11 @@ impl SegmentLayout {
         })
     }
 
-    fn cs_matches(self, cpu: &CpuGsw) -> bool {
+    pub(crate) fn cs_matches(self, cpu: &CpuGsw) -> bool {
         self.cs == cpu.registers.cs()
     }
 
-    fn data_matches(self, cpu: &CpuGsw) -> bool {
+    pub(crate) fn data_matches(self, cpu: &CpuGsw) -> bool {
         SEGMENT_ORDER.into_iter().all(|segment| {
             self.used & segment_bit(segment) == 0
                 || self.data[segment_index(segment)] == cpu.registers.segment(segment)

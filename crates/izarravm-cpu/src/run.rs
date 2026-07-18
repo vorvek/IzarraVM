@@ -560,6 +560,10 @@ impl CpuGsw {
             self.direct_runtime.admission_active
                 || legacy_requested && self.jit_direct.backend_enabled()
         };
+        // One native backend runs at a time (plan decision D-C1.4): the clif policy takes this
+        // branch INSTEAD of Direct/legacy-region admission, never alongside it.
+        #[cfg(feature = "jit")]
+        let clif_continuations_active = self.clif_backend_enabled();
         // Guest-clock budget honesty: `cap` is a guest-clock budget (the machine
         // derives it from PIT-edge instants), but `total` counts core clocks
         // only. Track the batch's scaled-bus growth across this run so a
@@ -608,7 +612,27 @@ impl CpuGsw {
                 // break checks below then fire at exactly the boundary the region stopped at.
                 // The probe read+branch is the whole per-continuation dispatch cost.
                 #[cfg(feature = "jit")]
-                let region_outcome = if !native_continuations_active {
+                let region_outcome = if clif_continuations_active {
+                    #[cfg(all(
+                        feature = "clif-backend",
+                        target_arch = "x86_64",
+                        any(target_os = "windows", target_os = "linux")
+                    ))]
+                    if self.mode().uses_approximate_timing() {
+                        let continuation_budget = ContinuationBudget {
+                            total,
+                            bus_at_entry,
+                            cap,
+                        };
+                        self.try_clif_continuation(
+                            bus,
+                            lin,
+                            cs.default_size_32,
+                            continuation_budget,
+                        )?;
+                    }
+                    None
+                } else if !native_continuations_active {
                     None
                 } else {
                     let stamped_region = self.decode_cache.region_at(lin, cs.default_size_32);
@@ -1057,6 +1081,244 @@ impl CpuGsw {
             DirectBlockOutcome::Prefix(outcome) => Ok(DirectContinuation::Prefix(outcome)),
             DirectBlockOutcome::NotRun => Ok(DirectContinuation::Interpret),
         }
+    }
+
+    /// Track C C1a admission: the clif analogue of `try_direct_continuation`. A C1a unit is a
+    /// SIDE-EXIT-PER-INSTRUCTION shell (review finding F-A1, option B), so this never returns
+    /// a run/prefix outcome; every path, guard-reject or guard-pass, ends with the interpreter
+    /// retiring the current instruction. Guard-pass additionally enters the compiled shell
+    /// through the dispatcher-shaped adapter (a pure round-trip proof: the shell reads and
+    /// writes nothing) before falling through, so state and timing stay byte-identical to the
+    /// interpreter-only policy by construction.
+    #[cfg(all(
+        feature = "jit",
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn try_clif_continuation<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        lin: u32,
+        d: bool,
+        budget: ContinuationBudget,
+    ) -> Result<(), CpuError> {
+        if !self
+            .decode_cache
+            .clif_hot(lin, d, jit::clif::cache::CLIF_DEFAULT_ADMISSION_HEAT)
+        {
+            return Ok(());
+        }
+        let Some(key) = jit::clif::cache::clif_key_for(self, lin, d) else {
+            return Ok(());
+        };
+        let unit_index = match self.jit_direct.clif_units.state(key) {
+            None => {
+                self.jit_direct.clif_units.note_seen(key);
+                return Ok(());
+            }
+            Some(jit::clif::cache::ClifUnitState::Dormant) => {
+                // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp aged out lifts
+                // back to Seen here, mirroring Direct's cold-Rejected recovery path.
+                let heat_epoch = self.smc_heat_epoch();
+                self.sync_smc_heat();
+                let jit = &mut *self.jit_direct;
+                jit.clif_units
+                    .lift_cold_dormant(&mut jit.smc_heat, key, heat_epoch);
+                return Ok(());
+            }
+            Some(jit::clif::cache::ClifUnitState::Compiled(index)) => index,
+            Some(jit::clif::cache::ClifUnitState::Seen) => {
+                // G1 pre-compile gate (entry chunk only, cheap).
+                let heat_epoch = self.smc_heat_epoch();
+                self.sync_smc_heat();
+                if self.jit_direct.smc_heat.chunk_hot(key.physical, heat_epoch) {
+                    let jit = &mut *self.jit_direct;
+                    jit.smc_heat.bump(key.physical, 1, heat_epoch);
+                    jit.clif_units.park_dormant(key);
+                    self.perf.smc_heat_demotions += 1;
+                    return Ok(());
+                }
+                let Some(layout) = jit::clif::cache::walk_unit(self, key.linear, d) else {
+                    // A cold or structurally unclassifiable entry: nothing to admit yet, try
+                    // again once the decode cache has warmed enough lines to walk one unit.
+                    return Ok(());
+                };
+                self.perf.jit_clif_compile_attempts += 1;
+                // G4 dynamic half (dev_docs/specs/2026-07-15-smc-hardening-design.md): the
+                // kind MUST stay InstructionPrefetch, exactly as Direct's own gate requires
+                // (section 6.2): only a true-RAM page answers under this kind.
+                let code_page =
+                    bus.direct_page(key.physical, BusAccessKind::InstructionPrefetch)?;
+                let code_page_covers_unit = code_page.is_some_and(|page| {
+                    page.physical_page == key.physical & !0x0fff
+                        && (key.physical & 0x0fff)
+                            .checked_add(u32::from(layout.guest_len))
+                            .is_some_and(|end| end as usize <= page.len)
+                });
+                if !code_page_covers_unit {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(());
+                }
+                // G1 pre-install gate (full span).
+                if self.jit_direct.smc_heat.span_hot(
+                    key.physical,
+                    u32::from(layout.guest_len),
+                    heat_epoch,
+                ) {
+                    let jit = &mut *self.jit_direct;
+                    jit.smc_heat.bump(key.physical, 1, heat_epoch);
+                    jit.clif_units.park_dormant(key);
+                    self.perf.smc_heat_demotions += 1;
+                    return Ok(());
+                }
+                let Some(segment_layout) = jit::direct::SegmentLayout::capture(
+                    self,
+                    layout.read_segments,
+                    layout.write_segments,
+                ) else {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(());
+                };
+                let memory_cpl3 = self.current_privilege_level() == 3;
+                if self.jit_direct.clif_backend.is_none() {
+                    self.jit_direct.clif_backend = jit::clif::ClifBackend::new();
+                }
+                let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(());
+                };
+                let Some(shell_entry) = backend.shell_entry() else {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(());
+                };
+                let descriptor = jit::clif::cache::ClifUnitDescriptor {
+                    key,
+                    guest_len: layout.guest_len,
+                    fetch_lens: layout.fetch_lens,
+                    instructions: layout.instructions,
+                    segment_layout,
+                    memory_cpl3,
+                    has_wide_accesses: layout.has_wide_accesses,
+                    is_self_loop: layout.is_self_loop,
+                    entry: shell_entry as usize,
+                };
+                let Some(index) = self.jit_direct.clif_units.install(descriptor) else {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(());
+                };
+                self.perf.jit_clif_units_installed += 1;
+                index
+            }
+        };
+        let Some(unit) = self.jit_direct.clif_units.unit(unit_index).cloned() else {
+            return Ok(());
+        };
+        self.run_clif_shell(bus, &unit, budget)
+    }
+
+    /// The per-entry dynamic guards, in Direct's order (`run_direct_block`, plan section 2.3),
+    /// applied to a compiled clif shell. G5 (x87 TOP) is correctly omitted per plan section 4:
+    /// a C1a shell has no native x87 codegen and so no compile-time TOP assumption to protect.
+    /// G8 uses the non-chain form only (C1a has no linking yet, C1d's job). G11 (deferred
+    /// short blocks) has no clif analogue: C1a has no chaining/short-block deferral concept,
+    /// so there is nothing to gate. On any reject, the interpreter runs next, matching
+    /// `run_direct_block`'s reject semantics exactly: the compiled entry is never invoked.
+    #[cfg(all(
+        feature = "jit",
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    fn run_clif_shell<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        unit: &jit::clif::cache::ClifUnitDescriptor,
+        budget: ContinuationBudget,
+    ) -> Result<(), CpuError> {
+        if self.profile.enabled || diff_trace_enabled() {
+            self.perf.jit_clif_reject_observer += 1;
+            return Ok(());
+        }
+        if self.interrupt_shadow {
+            self.perf.jit_clif_reject_interrupt_shadow += 1;
+            return Ok(());
+        }
+        if !bus.native_aggregate_accounting_allowed() {
+            self.perf.jit_clif_reject_aggregate_accounting += 1;
+            return Ok(());
+        }
+        if unit.key.mode_key != self.jit_mode_key() {
+            self.perf.jit_clif_reject_mode_key += 1;
+            return Ok(());
+        }
+        if !unit.cs_descriptor_matches(self) {
+            self.perf.jit_clif_reject_cs_layout += 1;
+            return Ok(());
+        }
+        if unit.memory_cpl3 != (self.current_privilege_level() == 3) {
+            self.perf.jit_clif_reject_cpl += 1;
+            return Ok(());
+        }
+        if !unit.data_descriptors_match(self) {
+            self.perf.jit_clif_reject_data_segment += 1;
+            return Ok(());
+        }
+        if unit.has_wide_accesses && self.alignment_armed && self.current_privilege_level() == 3 {
+            self.perf.jit_clif_reject_alignment += 1;
+            return Ok(());
+        }
+        let eip = self.registers.eip;
+        let fetch_last = u32::from(unit.guest_len) - 1;
+        if self
+            .registers
+            .cs()
+            .limit
+            .checked_sub(fetch_last)
+            .is_none_or(|last_start| eip > last_start)
+        {
+            self.perf.jit_clif_reject_fetch_limit += 1;
+            return Ok(());
+        }
+        // B1, reduced to the empty-static-profile special case (plan section 5.2): a C1a
+        // shell charges nothing, so the only meaningful check is whether the batch's cap is
+        // already exhausted, not a per-iteration cost (there is none to charge). This
+        // introduces no new timing machinery; it reuses the same budget quantities
+        // `run_direct_block` computes (`total`, the bus-clock growth since entry, `cap`).
+        let bus_growth = bus
+            .in_batch_scaled_bus_clocks()
+            .saturating_sub(budget.bus_at_entry);
+        let used = budget.total.saturating_add(bus_growth);
+        let available = budget.cap.saturating_sub(used).saturating_sub(1);
+        if available == 0 {
+            self.perf.jit_clif_reject_zero_budget += 1;
+            return Ok(());
+        }
+
+        // Guards passed: enter the compiled shell through the dispatcher-shaped adapter. The
+        // shell reads and writes no `CpuGsw` field (no lowering exists yet), so this call is a
+        // pure entry-ABI round-trip proof; the interpreter retires the unit's guest bytes
+        // after this returns, exactly as it would have on a guard reject.
+        let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
+            return Ok(());
+        };
+        let Some(adapter) = backend.adapter() else {
+            return Ok(());
+        };
+        let entry_ptr = unit.entry as *const u8;
+        // SAFETY: `entry_ptr` was installed by this backend's zero-relocation compile-and-
+        // install path (`ClifBackend::finalize`) and stays live for the backend's lifetime;
+        // `adapter` was compiled once at the host default convention with exactly this
+        // two-argument signature.
+        let disposition = unsafe { adapter(self as *mut CpuGsw, entry_ptr) };
+        debug_assert_eq!(
+            disposition,
+            jit::clif::unit::SIDE_EXIT_DISPOSITION,
+            "a C1a shell has exactly one disposition"
+        );
+        self.perf.jit_clif_entries += 1;
+        self.perf.jit_clif_side_exits += 1;
+        Ok(())
     }
 
     #[cfg(all(

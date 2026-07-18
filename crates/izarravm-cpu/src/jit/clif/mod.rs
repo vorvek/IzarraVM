@@ -41,6 +41,12 @@ pub(crate) struct ClifBackend {
     arena: ExecutableArena,
     /// Units rejected by the zero-relocation install invariant (counted fallback).
     relocation_fallbacks: u64,
+    /// The C1a side-exit shell body's installed address (Track C C1a, F-A1 option B), compiled
+    /// once on first use and reused for every admitted key: every C1a shell is architecturally
+    /// identical (no lowering exists yet), so there is nothing per-key to bake in.
+    shell_entry: Option<usize>,
+    /// The dispatcher-shaped adapter's installed address, compiled once and reused the same way.
+    adapter_entry: Option<usize>,
 }
 
 impl ClifBackend {
@@ -65,6 +71,8 @@ impl ClifBackend {
             isa,
             arena: ExecutableArena::new()?,
             relocation_fallbacks: 0,
+            shell_entry: None,
+            adapter_entry: None,
         })
     }
 
@@ -96,6 +104,7 @@ impl ClifBackend {
 }
 
 pub(crate) mod cache;
+pub(crate) mod unit;
 
 #[cfg(test)]
 #[path = "proof_test.rs"]
