@@ -596,6 +596,7 @@ impl CpuGsw {
     /// The memory-poll skip counter subset (stored outside `PerfCounters`;
     /// see `PollSkipMemoryCounters` for why). Reset alongside the other
     /// counters by `reset_perf_counters`.
+    #[inline(never)]
     pub fn poll_skip_memory(&self) -> PollSkipMemoryCounters {
         self.poll_skip_memory
     }
@@ -668,6 +669,8 @@ impl CpuGsw {
     /// `at_head`, so the previous iteration's CMP just executed and warmed
     /// this exact page's TLB entry.
     #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
     pub fn probe_linear_read_physical(&self, linear: u32) -> Option<u32> {
         if !self.is_paging_enabled() {
             return Some(linear);

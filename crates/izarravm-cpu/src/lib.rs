@@ -417,6 +417,8 @@ impl Registers {
     /// GPR by ModRM index (0=eax..7=edi), for the memory-poll shape's comparand
     /// register (the CMP instruction's ModRM reg field names any GPR).
     #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
     pub(crate) fn gpr32(&self, index: u8) -> u32 {
         self.gpr[usize::from(index & 7)]
     }
@@ -831,6 +833,8 @@ impl PollLoop {
 
     /// Which certified shape family this loop belongs to. The executor must
     /// check this before calling any Io-only accessor.
+    #[cold]
+    #[inline(never)]
     pub fn family(self) -> PollFamily {
         if self.memory.is_some() {
             PollFamily::Memory
@@ -840,16 +844,22 @@ impl PollLoop {
     }
 
     /// The polled cell's linear address, for the memory family only.
+    #[cold]
+    #[inline(never)]
     pub fn memory_cell_linear(self) -> Option<u32> {
         self.memory.map(|m| m.linear)
     }
 
     /// The polled cell's access width in bytes, for the memory family only.
+    #[cold]
+    #[inline(never)]
     pub fn memory_cell_width(self) -> Option<u8> {
         self.memory.map(|m| m.width)
     }
 
     /// The comparand register's LIVE value, for the memory family only.
+    #[cold]
+    #[inline(never)]
     pub fn memory_comparand(self, cpu: &CpuGsw) -> Option<u32> {
         let mem = self.memory?;
         Some(cpu.registers.gpr32(mem.comparand_gpr))
@@ -859,6 +869,8 @@ impl PollLoop {
     /// value and the comparand's live value (R1: the executor must check this
     /// before committing any memory-family skip). `None` outside the memory
     /// family.
+    #[cold]
+    #[inline(never)]
     pub fn memory_spin_predicate(self, cell_value: u32, comparand: u32) -> Option<bool> {
         let mem = self.memory?;
         let equal = cell_value == comparand;
@@ -1265,6 +1277,8 @@ impl CpuGsw {
 
     /// Test seam: force the memory-poll shape's sub-flag on or off regardless
     /// of the IZARRAVM_POLL_SKIP_MEMORY environment. Host bookkeeping only.
+    #[cold]
+    #[inline(never)]
     pub fn set_poll_skip_memory_enabled_for_test(&mut self, enabled: bool) {
         self.poll_skip_memory_enabled = enabled;
     }
@@ -2029,12 +2043,16 @@ pub(crate) fn poll_neg_cache_default() -> bool {
 /// the io shapes; gated at the single classifier choke point in
 /// `build_poll_loop_at` (see the M1 arm in `jit/block.rs`).
 #[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
 pub(crate) fn poll_skip_memory_policy(value: Option<&str>) -> bool {
     !matches!(value, Some("" | "0"))
 }
 
 /// Ambient default for the memory-poll sub-flag, read fresh at CPU construction.
 #[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
 pub(crate) fn poll_skip_memory_default() -> bool {
     let value = std::env::var("IZARRAVM_POLL_SKIP_MEMORY").ok();
     poll_skip_memory_policy(value.as_deref())

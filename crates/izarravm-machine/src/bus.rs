@@ -287,6 +287,8 @@ impl MachineBus<'_> {
     /// Callers add their own family-specific addend (the io wait-state read or
     /// the memory family's data-read cost) on top.
     #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
     fn poll_fetch_certificate_raw(&self, poll: PollLoop) -> Option<u64> {
         let mut raw = 0u64;
         for index in 0..poll.fetch_count() {
@@ -352,6 +354,8 @@ impl MachineBus<'_> {
     /// (`jit_data_cost_clocks`, the same model `charge_direct_memory`'s
     /// direct-page hit uses).
     #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
     pub(super) fn poll_memory_bus_certificate(
         &self,
         poll: PollLoop,
@@ -425,6 +429,8 @@ impl MachineBus<'_> {
     /// `poll_commit_bus`, there is no port side effect to replay: the memory
     /// shape never touches a device port.
     #[cfg(feature = "jit")]
+    #[cold]
+    #[inline(never)]
     pub(super) fn poll_commit_memory_bus(
         &mut self,
         certificate: PollBusCertificate,

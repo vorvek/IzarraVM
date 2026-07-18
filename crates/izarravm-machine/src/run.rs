@@ -136,10 +136,14 @@ impl PollSkipDiagnostics {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     fn memory_structural_hit(&mut self) {
         Self::increment(self.enabled, &mut self.memory_structural_hits);
     }
 
+    #[cold]
+    #[inline(never)]
     fn memory_translate_or_certificate_rejection(&mut self) {
         Self::increment(
             self.enabled,
@@ -147,10 +151,14 @@ impl PollSkipDiagnostics {
         );
     }
 
+    #[cold]
+    #[inline(never)]
     fn memory_spin_rejection(&mut self) {
         Self::increment(self.enabled, &mut self.memory_spin_rejections);
     }
 
+    #[cold]
+    #[inline(never)]
     fn memory_cap_rejection(&mut self) {
         Self::increment(self.enabled, &mut self.memory_cap_rejections);
     }
@@ -376,6 +384,8 @@ pub(super) fn try_poll_skip(
 /// `cap`; see the design doc's R3). No vega or port calls anywhere in this
 /// function.
 #[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
 fn try_poll_skip_memory(
     cpu: &mut CpuGsw,
     bus: &mut MachineBus<'_>,
