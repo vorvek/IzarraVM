@@ -70,7 +70,7 @@ pub(crate) use region::RegionTable;
 /// single pointer, so the hot interpreter field offsets stay put (the pending_flags pin in
 /// cpu_test.rs). `Deref` to the block cache keeps the pervasive `jit_direct.<method>` call
 /// surface unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
     pub(crate) smc_heat: direct::SmcHeatMap,
@@ -105,3 +105,14 @@ impl std::ops::DerefMut for JitState {
         &mut self.direct
     }
 }
+
+// Host-only policy and cache state (F-A8): never influences architectural comparisons, so
+// equality always holds, exactly like the block cache and heat map it wraps. The
+// clif_enabled policy flag must not make two otherwise-identical CPUs compare unequal in
+// differential tests that route one instance through each backend.
+impl PartialEq for JitState {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for JitState {}

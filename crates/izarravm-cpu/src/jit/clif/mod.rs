@@ -95,6 +95,8 @@ impl ClifBackend {
     }
 }
 
+pub(crate) mod cache;
+
 #[cfg(test)]
 #[path = "proof_test.rs"]
 mod proof_tests;

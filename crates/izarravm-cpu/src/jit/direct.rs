@@ -221,14 +221,14 @@ const SEGMENT_ORDER: [SegmentIndex; 6] = [
 /// block are retained. A linked target must have the identical snapshot, so validating the root
 /// block also validates every body reached through its successor cells.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SegmentLayout {
+pub(crate) struct SegmentLayout {
     cs: SegmentRegister,
     data: [SegmentRegister; 6],
     used: u8,
 }
 
 impl SegmentLayout {
-    fn capture(cpu: &CpuGsw, read_segments: u8, write_segments: u8) -> Option<Self> {
+    pub(crate) fn capture(cpu: &CpuGsw, read_segments: u8, write_segments: u8) -> Option<Self> {
         let data = SEGMENT_ORDER.map(|segment| cpu.registers.segment(segment));
         let used = read_segments | write_segments;
         for segment in SEGMENT_ORDER {
@@ -2512,6 +2512,68 @@ fn dynamic_counter_fields() -> [(u16, i8, usize); 7] {
             core::mem::offset_of!(NativeExit, mode13_dword_reads),
         ),
     ]
+}
+
+/// Terminal kinds for the clif unit-boundary growth walker (Track C C1a, F-A5).
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(crate) enum UnitTerminal {
+    Jcc { taken_delta: u32 },
+    Jmp,
+    Call,
+    Ret,
+}
+
+/// One growth-walk classification step for the clif walker (Track C C1a, F-A5).
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(crate) struct UnitGrowthStep {
+    pub(crate) terminal: Option<UnitTerminal>,
+    pub(crate) wide_access: bool,
+    pub(crate) read_segments: u8,
+    pub(crate) write_segments: u8,
+}
+
+/// Classify one decoded instruction for clif unit growth with the SAME classifier the
+/// Direct compiler uses (`classify::classify`, reused unchanged), reduced to the fields
+/// the walker needs. `None` is the stop-growth signal: the first structurally
+/// unclassifiable opcode ends the unit before it (plan Q1 resolution). Wide-access uses
+/// Direct's exact rule (the `has_wide_accesses` accumulation in `compile`); the word-gate
+/// persona restriction there is a compile heuristic, not a classification fact, so it is
+/// deliberately NOT replicated here.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+pub(crate) fn unit_growth_classify(
+    insn: &DecodedInsn,
+    lin: u32,
+    entry_lin: u32,
+) -> Option<UnitGrowthStep> {
+    let kind = classify::classify(insn, lin, entry_lin)?;
+    let wide_access = kind.has_word_access() || kind.has_dword_read() || kind.has_dword_store();
+    let read_segments = kind.read_segment().map_or(0, segment_bit);
+    let write_segments = kind.write_segment().map_or(0, segment_bit);
+    let terminal = match kind {
+        DirectKind::Jcc { taken_delta, .. } => Some(UnitTerminal::Jcc { taken_delta }),
+        DirectKind::Jmp { .. } => Some(UnitTerminal::Jmp),
+        DirectKind::Call { .. } => Some(UnitTerminal::Call),
+        DirectKind::Ret { .. } => Some(UnitTerminal::Ret),
+        _ => None,
+    };
+    Some(UnitGrowthStep {
+        terminal,
+        wide_access,
+        read_segments,
+        write_segments,
+    })
 }
 
 pub(crate) fn key_for(cpu: &CpuGsw, lin: u32, d: bool) -> Option<BlockKey> {
