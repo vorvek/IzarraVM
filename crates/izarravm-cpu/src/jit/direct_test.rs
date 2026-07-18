@@ -3,6 +3,34 @@
 
 use super::*;
 
+use crate::jit::JitState;
+
+/// Post-hoist constructor shim (Track C C1c-pre): the `NativeCodeWatch` now lives on
+/// `JitState`, so this battery drives the cache through the SAME `JitState` wrapper surface
+/// production uses (which carries the pre-hoist method signatures). Shadowing the
+/// constructor names keeps every pre-existing call site below textually unchanged; field
+/// and non-watch method access reaches the inner cache through `JitState`'s `Deref`.
+struct BlockCache;
+
+#[allow(clippy::new_ret_no_self)] // constructor-name shims, deliberately returning JitState
+impl BlockCache {
+    fn default() -> JitState {
+        JitState::new(super::BlockCache::default())
+    }
+
+    fn new(decode_slot_count: usize) -> JitState {
+        JitState::new(super::BlockCache::new(decode_slot_count))
+    }
+
+    fn with_entry_cap(entry_cap: usize) -> JitState {
+        JitState::new(super::BlockCache::with_entry_cap(entry_cap))
+    }
+
+    fn arena_compaction_can_reclaim(live_blocks: usize, capacity: usize) -> bool {
+        super::BlockCache::arena_compaction_can_reclaim(live_blocks, capacity)
+    }
+}
+
 fn key(linear: u32) -> BlockKey {
     BlockKey::new(linear, 0x20_000 + (linear & 0xfff), 7)
 }
@@ -57,7 +85,7 @@ fn compilation_with_fetch_lens(key: BlockKey, fetch_lens: &[u8]) -> Compilation 
     compilation
 }
 
-fn reject(cache: &mut BlockCache, key: BlockKey, guest_len: usize) {
+fn reject(cache: &mut JitState, key: BlockKey, guest_len: usize) {
     cache.reject(RejectedSpan::new(key, guest_len).expect("rejected test span"));
 }
 
@@ -65,7 +93,7 @@ fn reject(cache: &mut BlockCache, key: BlockKey, guest_len: usize) {
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")
 ))]
-fn install_trivial(cache: &mut BlockCache, key: BlockKey, guest_len: usize) -> BlockId {
+fn install_trivial(cache: &mut JitState, key: BlockKey, guest_len: usize) -> BlockId {
     assert!(matches!(cache.probe(key), BlockProbe::Interpret));
     assert!(matches!(cache.probe(key), BlockProbe::Compile));
     let span = BlockSpan::new(key, guest_len, 1).expect("test block must be page local");
@@ -78,7 +106,7 @@ fn install_trivial(cache: &mut BlockCache, key: BlockKey, guest_len: usize) -> B
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")
 ))]
-fn install_dynamic_trivial(cache: &mut BlockCache, key: BlockKey) -> BlockId {
+fn install_dynamic_trivial(cache: &mut JitState, key: BlockKey) -> BlockId {
     assert!(matches!(cache.probe(key), BlockProbe::Interpret));
     assert!(matches!(cache.probe(key), BlockProbe::Compile));
     let span = BlockSpan::new(key, 1, 1).expect("test block must be page local");
@@ -93,7 +121,7 @@ fn install_dynamic_trivial(cache: &mut BlockCache, key: BlockKey) -> BlockId {
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")
 ))]
-fn install_with_fetch_lens(cache: &mut BlockCache, key: BlockKey, fetch_lens: &[u8]) -> BlockId {
+fn install_with_fetch_lens(cache: &mut JitState, key: BlockKey, fetch_lens: &[u8]) -> BlockId {
     assert!(matches!(cache.probe(key), BlockProbe::Interpret));
     assert!(matches!(cache.probe(key), BlockProbe::Compile));
     cache
@@ -679,7 +707,8 @@ fn decode_slot_suspension_requires_revalidation() {
     let id = install_trivial(&mut cache, block, 1);
     assert!(cache.is_link_visible(id));
 
-    cache.suspend_decode_slot(block.linear as usize & cache.decode_slot_mask);
+    let slot = block.linear as usize & cache.decode_slot_mask;
+    cache.suspend_decode_slot(slot);
     assert!(!cache.is_link_visible(id));
     assert!(matches!(cache.probe(block), BlockProbe::Ready(hit) if hit == id));
 
@@ -1537,4 +1566,51 @@ fn smc_heat_accrues_only_on_actual_code_invalidation() {
         cold.jit_direct.probe(data_key),
         BlockProbe::Ready(_)
     ));
+}
+
+/// C1c-pre pin (design section 2.5 / D-C1c.1): the hoist moves the watch's OWNER, never the
+/// watch itself. The published `table_base()` Direct's emitted code bakes must stay one
+/// stable address across every hoist-era cache operation (install, reject, per-range
+/// invalidation, wholesale clear, storage reset), and the acquire/release/clear semantics
+/// must behave exactly as they did when `BlockCache` owned the instance.
+#[test]
+fn hoisted_code_watch_keeps_the_table_base_and_the_watch_semantics() {
+    let mut cache = BlockCache::default();
+    let base = cache.native_code_watch_table();
+    assert_ne!(base, 0);
+
+    // Install acquires; the block's chunks read watched through the shared instance.
+    let installed = key(0x400);
+    install_trivial(&mut cache, installed, 4);
+    assert_eq!(cache.native_code_watch_table(), base);
+    assert!(cache.range_hits_compiled_code(installed.physical, 4));
+
+    // Reject (after the Seen transition) acquires on the same shared instance.
+    let rejected = key(0x800);
+    assert!(matches!(cache.probe(rejected), BlockProbe::Interpret));
+    assert!(matches!(cache.probe(rejected), BlockProbe::Compile));
+    reject(&mut cache, rejected, 4);
+    assert!(matches!(cache.probe(rejected), BlockProbe::Rejected));
+    assert_eq!(cache.native_code_watch_table(), base);
+    assert!(cache.range_hits_compiled_code(rejected.physical, 4));
+
+    // Per-range invalidation releases exactly the dead owner's chunks.
+    assert_eq!(cache.invalidate_physical_range(installed.physical, 1), 1);
+    assert!(!cache.range_hits_compiled_code(installed.physical, 4));
+    assert!(cache.range_hits_compiled_code(rejected.physical, 4));
+    assert_eq!(cache.native_code_watch_table(), base);
+
+    // Wholesale clear drops the remaining watch bits; the table allocation survives.
+    cache.clear();
+    assert!(!cache.range_hits_compiled_code(rejected.physical, 4));
+    assert_eq!(cache.native_code_watch_table(), base);
+
+    // The whole JitState (the new owner) moving does not move the published table either:
+    // the box allocations inside the watch are what the emitted code points at.
+    let mut moved = cache;
+    assert_eq!(moved.native_code_watch_table(), base);
+    let reinstalled = key(0xc00);
+    install_trivial(&mut moved, reinstalled, 4);
+    assert!(moved.range_hits_compiled_code(reinstalled.physical, 4));
+    assert_eq!(moved.native_code_watch_table(), base);
 }

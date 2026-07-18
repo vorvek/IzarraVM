@@ -73,6 +73,15 @@ pub(crate) use region::RegionTable;
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
     pub(crate) smc_heat: direct::SmcHeatMap,
+    /// The native code watch, HOISTED out of `BlockCache` (Track C C1c-pre, design decision
+    /// D-C1c.1, mirroring the C1a-pre `SmcHeatMap` hoist): "watched" is a property of what
+    /// physical code is currently resident and executable, not which backend put it there,
+    /// so both backends register into ONE instance and the baked table-1 base stays a
+    /// single shared pointer. Plain field reached by split borrow, no `Arc`/`Mutex` (guest
+    /// execution is single-threaded). The `Box` moves as a whole across the hoist, so the
+    /// published `table_base()` and per-page addresses Direct's emitted code bakes stay
+    /// stable (the inner table/page allocations never reallocate on a field move).
+    pub(crate) code_watch: Box<code_watch::NativeCodeWatch>,
     /// The per-instance clif policy flag (Track C C1a, plan decision D-C1.4 seam 2): the
     /// clif analogue of the Direct backend's enabled bit, settable per CpuGsw so
     /// differential tests route one instance through clif and another through Direct in one
@@ -114,6 +123,7 @@ impl JitState {
         Self {
             direct,
             smc_heat: direct::SmcHeatMap::default(),
+            code_watch: Box::default(),
             clif_enabled: false,
             #[cfg(all(
                 feature = "clif-backend",
@@ -146,6 +156,9 @@ impl Clone for JitState {
         Self {
             direct: self.direct.clone(),
             smc_heat: self.smc_heat.clone(),
+            // A clone gets a fresh, empty watch, exactly as the pre-hoist BlockCache clone
+            // produced (its clone built a new cache with a new watch).
+            code_watch: Box::default(),
             clif_enabled: self.clif_enabled,
             #[cfg(all(
                 feature = "clif-backend",
@@ -166,6 +179,53 @@ impl Clone for JitState {
             ))]
             clif_run: clif::callout::ClifRunScratch::default(),
         }
+    }
+}
+
+// Pre-hoist call-site compatibility: the watch-consuming cache operations keep their
+// original names and signatures HERE, splitting the borrow between the cache and the
+// hoisted watch internally. Inherent methods win over the `Deref` to `BlockCache`, so
+// every existing `jit_direct.<method>(..)` call site, production and test, compiles
+// unchanged against the hoisted ownership.
+impl JitState {
+    pub(crate) fn probe(&mut self, key: direct::BlockKey) -> direct::BlockProbe {
+        self.direct.probe(&mut self.code_watch, key)
+    }
+
+    pub(crate) fn install(&mut self, compilation: &direct::Compilation) -> Option<direct::BlockId> {
+        self.direct.install(&mut self.code_watch, compilation)
+    }
+
+    pub(crate) fn reject(&mut self, span: direct::RejectedSpan) {
+        self.direct.reject(&mut self.code_watch, span);
+    }
+
+    pub(crate) fn retire_key_for_recompile(&mut self, key: direct::BlockKey) -> bool {
+        self.direct
+            .retire_key_for_recompile(&mut self.code_watch, key)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.direct.clear(&mut self.code_watch);
+    }
+
+    pub(crate) fn invalidate_physical_range(&mut self, physical: u32, width: u32) -> usize {
+        self.direct
+            .invalidate_physical_range(&mut self.code_watch, physical, width)
+    }
+
+    /// The shared table-1 base every backend's emitted store checks consult.
+    pub(crate) fn native_code_watch_table(&mut self) -> usize {
+        self.code_watch.table_base()
+    }
+
+    pub(crate) fn range_hits_compiled_code(&self, physical: u32, width: u32) -> bool {
+        self.code_watch.range_watched(physical, width)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_code_range(&mut self, physical: u32, len: u8) {
+        self.code_watch.acquire_range(physical, u32::from(len));
     }
 }
 
