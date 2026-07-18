@@ -20,7 +20,7 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use super::ClifBackend;
-use crate::CpuGsw;
+use crate::{CpuBus, CpuError, CpuGsw, SegmentRegister};
 
 /// The three-valued call-out disposition (design section 1.6). `Continue` means the
 /// instruction retired in sequence (the shim's positive fall-through predicate held) and the
@@ -68,6 +68,110 @@ pub(crate) type ClifEntryFn = unsafe extern "C" fn(
     *const u32,
     *const u8,
 ) -> i64;
+
+/// Per-entry call-out scratch on the jit state (Track C C1b). The shim is the only writer
+/// during a unit run; `run_clif_shell` resets it before entry and consumes it after exit.
+#[derive(Debug, Default)]
+pub(crate) struct ClifRunScratch {
+    /// B2's hard-stop relay: a genuine `CpuError` (a bus error, never a delivered guest
+    /// fault) stashed by the shim and taken back out by the dispatcher to return `Err(..)`.
+    pub(crate) pending_hard_error: Option<CpuError>,
+    /// The site EIP of the most recent call-out this entry, mapping an Exit/HardStop
+    /// disposition back to its slot for prefix charging.
+    pub(crate) last_callout_eip: u32,
+    /// Core clocks the call-outs charged through the interpreter path this entry; folded
+    /// into the dispatcher's returned `CycleOutcome` so the batch budget sees them.
+    pub(crate) callout_core_clocks: u32,
+    /// Call-out panics caught by the shim's belt (a bug if ever nonzero; the unit exits
+    /// hard rather than unwinding into frames with no unwind info).
+    pub(crate) callout_panics: u64,
+    /// N1's key-material snapshot, stashed by `run_clif_shell` before the adapter call;
+    /// `callout_exit_latched` compares live state against it.
+    pub(crate) snapshot_mode_key: u32,
+    pub(crate) snapshot_cpl: u8,
+    pub(crate) snapshot_cs: SegmentRegister,
+}
+
+/// The B1 Continue predicate's latch half: did the retired call-out instruction change the
+/// unit's key material (mode key, CPL, or its own EIP via CS identity)? The EIP fall-through
+/// test and `rep_resume_active` are checked by the shim directly; this covers the snapshot
+/// comparison (N1). The exact member list stays a code-review item per the design.
+impl CpuGsw {
+    pub(crate) fn clif_callout_exit_latched(&self) -> bool {
+        let scratch = &self.jit_direct.clif_run;
+        self.jit_mode_key() != scratch.snapshot_mode_key
+            || self.current_privilege_level() != scratch.snapshot_cpl
+            || self.registers.cs() != scratch.snapshot_cs
+    }
+}
+
+/// The real x87 call-out shim (design section 1.5): monomorphized per bus type, its address
+/// taken in Rust by the dispatcher when it assembles the per-call table, so cranelift never
+/// sees it and no relocation exists. Delegates the ENTIRE instruction to the interpreter's
+/// own single-instruction entry (`cycle_no_interrupt_check`, the literal function a
+/// standalone interpreter cycle uses minus the per-batch interrupt prologue the batch loop
+/// already ran), then applies the B1 positive fall-through predicate: Continue ONLY when the
+/// instruction retired in sequence and nothing latched an exit condition. A delivered
+/// architectural fault (#NM/#MF/#PF/#GP) arrives HERE as `Ok` with EIP redirected to the
+/// handler; the EIP test catches it (design finding B1).
+///
+/// # Safety
+/// `cpu` and `bus_opaque` must be live for this call only, `bus_opaque` produced from a
+/// `&mut B` by the identically-monomorphized caller in the same call (design section 1.4).
+pub(crate) unsafe extern "C" fn clif_x87_callout_shim<B: CpuBus>(
+    cpu: *mut CpuGsw,
+    bus_opaque: *mut core::ffi::c_void,
+    site_eip: u32,
+    fetch_len: u32,
+) -> i64 {
+    // SAFETY: per the function contract; site_eip/fetch_len are structural layout data
+    // baked by the unit compiler at the call site (exempt from F4, which governs guest
+    // operand VALUES only).
+    let cpu = unsafe { &mut *cpu };
+    // SAFETY: as above; the identically-monomorphized caller produced this from &mut B.
+    let bus = unsafe { &mut *bus_opaque.cast::<B>() };
+    debug_assert_eq!(
+        cpu.registers.eip, site_eip,
+        "unit must materialize its own EIP before calling out"
+    );
+    cpu.jit_direct.clif_run.last_callout_eip = site_eip;
+    let expected_fall_through = site_eip.wrapping_add(fetch_len);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cpu.cycle_no_interrupt_check(bus)
+    })) {
+        Ok(Ok(outcome)) => {
+            cpu.jit_direct.clif_run.callout_core_clocks = cpu
+                .jit_direct
+                .clif_run
+                .callout_core_clocks
+                .saturating_add(outcome.core_clocks);
+            if !outcome.halted
+                && cpu.registers.eip == expected_fall_through
+                && !cpu.rep_resume_active
+                && !bus.requires_step_break()
+                && !cpu.clif_callout_exit_latched()
+            {
+                CLIF_CALLOUT_CONTINUE
+            } else {
+                CLIF_CALLOUT_EXIT
+            }
+        }
+        Ok(Err(cpu_error)) => {
+            // A REAL bus-level error (CpuError::Bus), never a delivered guest fault (those
+            // retire as Ok and are handled above, per B1). Relay it through the hard-stop
+            // channel (design section 1.6, finding B2).
+            cpu.jit_direct.clif_run.pending_hard_error = Some(cpu_error);
+            CLIF_CALLOUT_HARD_STOP
+        }
+        Err(_panic) => {
+            // Call-outs must be panic-free per the base design; this belt exists so a bug
+            // never unwinds into a frame with no unwind info (unwind_info=false is pinned
+            // at ClifBackend::new). Reaching here is itself a bug to fix.
+            cpu.jit_direct.clif_run.callout_panics += 1;
+            CLIF_CALLOUT_HARD_STOP
+        }
+    }
+}
 
 /// The unit-side `CallConv::Tail` signature: four live parameters (cpu, bus_opaque, table,
 /// imm_table), one `i64` disposition return.

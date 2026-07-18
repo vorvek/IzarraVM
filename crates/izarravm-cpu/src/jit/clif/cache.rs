@@ -5,14 +5,16 @@
 //! `jit::direct::BlockCache` (plan decision D-C1.1), reusing Direct's DESIGN: the same key
 //! fields (section 2.1), the same static exclusions K1-K5 (section 2.2), and the same
 //! classifier for unit growth (F-A5), while keeping clif's compile path decoupled from
-//! Direct's emission internals. C1a units are SIDE-EXIT-PER-INSTRUCTION shells (review
-//! finding F-A1, Option B): no lowering, an empty static timing profile, every instruction
-//! retired by the interpreter after the side exit.
+//! Direct's emission internals. Since C1b a unit executes its leading run of
+//! register/immediate slots natively (jit/clif/lower.rs) with x87 slots as call-outs, and
+//! side-exits at the first non-lowered slot, which the interpreter retires.
 
 use std::collections::HashMap;
 
-use super::super::direct::{self, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, SmcHeatMap, UnitTerminal};
-use crate::{CpuGsw, CpuPersona, Prefixes, U32BuildHasher};
+use super::super::direct::{
+    self, DirectKind, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, SmcHeatMap, UnitTerminal,
+};
+use crate::{CpuGsw, CpuPersona, OperandSize, Prefixes, U32BuildHasher};
 
 /// The clif hotness threshold (P4): an independent per-decode-line counter at Direct's
 /// `admission_heat` defaults (plan section 2.4, row P4), so the two backends compile
@@ -76,8 +78,33 @@ pub(crate) struct ClifUnitDescriptor {
     pub(crate) has_wide_accesses: bool,
     /// Terminal Jcc whose taken target is the unit entry.
     pub(crate) is_self_loop: bool,
-    /// The shell's native entry, once compiled and installed (C1a: a side-exit shell).
+    /// The compiled unit's native entry.
     pub(crate) entry: usize,
+    /// The immediate table (F4/design section 2.2): one `u32` slot per instruction, indexed
+    /// by the same index `fetch_lens` uses, holding `insn.imm` verbatim (the decoder already
+    /// operand-width-extended it, including 0x83's sign extension). Slots for instructions
+    /// with no immediate hold the structural constant the lowering loads (0 when none), so
+    /// every lowered load is uniform and D3 can later patch a genuinely-immediate slot
+    /// without touching compiled code.
+    pub(crate) immediates: [u32; MAX_BLOCK_INSTRUCTIONS],
+    /// How many leading slots execute natively (lowered instructions plus x87 call-outs);
+    /// the unit side-exits at slot `leading` (the stop slot) with EIP materialized there.
+    pub(crate) leading: u8,
+    /// Bit i set when slot i is an x87 call-out (charged by the interpreter during the
+    /// call-out, excluded from the static profile per the no-double-charge invariant).
+    pub(crate) x87_mask: u32,
+    /// Static profile: cumulative raw core clocks of LOWERED slots with index < i (x87 and
+    /// never-executed slots excluded), reusing Direct's per-kind cost table
+    /// (`DirectKind::raw_clocks`). Index `leading` (== the full leading run) is carried in
+    /// `raw_clocks_total` since the array is indexed by slot.
+    pub(crate) cum_raw_before: [u16; MAX_BLOCK_INSTRUCTIONS],
+    /// Cumulative count of LOWERED slots with index < i (the design's
+    /// `lowered_instructions` fetch-population split: x87 slots excluded).
+    pub(crate) cum_lowered_before: [u8; MAX_BLOCK_INSTRUCTIONS],
+    /// The full leading run's raw clocks and lowered-slot count (the normal side-exit
+    /// charge).
+    pub(crate) raw_clocks_total: u16,
+    pub(crate) lowered_total: u8,
 }
 
 impl ClifUnitDescriptor {
@@ -103,6 +130,12 @@ pub(crate) struct UnitLayout {
     pub(crate) is_self_loop: bool,
     pub(crate) read_segments: u8,
     pub(crate) write_segments: u8,
+    /// The per-slot classifications, in slot order, for the C1b lowering (compile-time
+    /// input only; the descriptor stores derived data, never the kinds themselves).
+    pub(crate) kinds: Vec<DirectKind>,
+    /// Per-slot decoded immediate (`insn.imm` verbatim), populating the descriptor's
+    /// immediate table.
+    pub(crate) imms: [u32; MAX_BLOCK_INSTRUCTIONS],
 }
 
 /// Forward-decode a unit from the hot root, terminating on the four terminal kinds
@@ -121,6 +154,15 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
     let mut is_self_loop = false;
     let mut read_segments = 0u8;
     let mut write_segments = 0u8;
+    let mut kinds = Vec::new();
+    let mut imms = [0u32; MAX_BLOCK_INSTRUCTIONS];
+    // The word-form prefix acceptance and 586 gate mirror Direct's compile loop exactly
+    // (`compile_with_instruction_limit`'s `prefixes_supported` and persona checks): a word
+    // form is exactly one operand-size override, admitted only on the I586 persona.
+    let word_prefixes = Prefixes {
+        operand_size_override: true,
+        ..Prefixes::default()
+    };
     while instructions < MAX_BLOCK_INSTRUCTIONS {
         if lin & !0xfff != entry_page {
             break;
@@ -128,7 +170,13 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         let Some(insn) = cpu.decode_cache.get(lin, d) else {
             break;
         };
-        if insn.prefixes != Prefixes::default() {
+        let prefixes_supported = match insn.operand_size {
+            OperandSize::Word => {
+                insn.prefixes == word_prefixes && cpu.persona() == CpuPersona::I586
+            }
+            OperandSize::Dword => insn.prefixes == Prefixes::default(),
+        };
+        if !prefixes_supported {
             break;
         }
         if (lin & 0xfff) + u32::from(insn.len) > 0x1000 {
@@ -138,11 +186,13 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
             break;
         };
         fetch_lens[instructions] = insn.len;
+        imms[instructions] = slot_immediate(&step.kind);
         instructions += 1;
         guest_len += u32::from(insn.len);
         has_wide_accesses |= step.wide_access;
         read_segments |= step.read_segments;
         write_segments |= step.write_segments;
+        kinds.push(step.kind);
         lin = lin.wrapping_add(u32::from(insn.len));
         match step.terminal {
             Some(UnitTerminal::Jcc { taken_delta }) => {
@@ -164,7 +214,30 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         is_self_loop,
         read_segments,
         write_segments,
+        kinds,
+        imms,
     })
+}
+
+/// The operative immediate for one slot's table entry: `insn.imm` verbatim for the genuine
+/// immediate forms (the classifier stored it verbatim, decoder-width-extended per m1,
+/// including 0x83's sign extension), the structural constant for forms whose count is
+/// implied by the encoding (0xd1's shift-by-1 carries no immediate byte, so D3 can never
+/// patch it), and 0 for slots with no immediate (never loaded).
+fn slot_immediate(kind: &DirectKind) -> u32 {
+    match *kind {
+        DirectKind::MovImm { imm, .. }
+        | DirectKind::AluImm { imm, .. }
+        | DirectKind::TestImmReg { imm, .. } => imm,
+        DirectKind::MovImmByte { imm, .. } | DirectKind::AluByteImm { imm, .. } => u32::from(imm),
+        DirectKind::Shift { count, .. } => u32::from(count),
+        DirectKind::DoubleShiftReg {
+            count: direct::ShiftCount::Immediate(count),
+            ..
+        } => u32::from(count),
+        DirectKind::Lea { addr, .. } => addr.disp,
+        _ => 0,
+    }
 }
 
 /// Admission states, mirroring the Direct cache's `BlockState` roles: `Seen` (first
@@ -249,5 +322,37 @@ impl ClifUnitCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.units.clear();
+    }
+
+    /// SMC/code-invalidation for compiled clif units (new in C1b: a C1a shell executed
+    /// nothing, so staleness could not matter; a lowered unit executes real guest code and
+    /// MUST die when its bytes change). Drops every entry whose physical span overlaps the
+    /// written range; `Seen`/`Dormant` states are dropped too (their walk-derived layout may
+    /// be stale). A linear scan is fine at C1b's correctness tier; the per-page index is a
+    /// later perf item.
+    pub(crate) fn invalidate_physical_range(&mut self, start: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.entries.retain(|key, state| {
+            let span = match state {
+                ClifUnitState::Compiled(index) => Self::unit_span(&self.units, *index, *key),
+                // Conservative page-overlap drop for non-compiled states (no recorded
+                // guest_len exists for them).
+                ClifUnitState::Seen | ClifUnitState::Dormant => (
+                    key.physical & !0xfff,
+                    (key.physical & !0xfff).saturating_add(0x1000),
+                ),
+            };
+            span.1 <= start || span.0 >= end
+        });
+    }
+
+    fn unit_span(units: &[ClifUnitDescriptor], index: u32, key: ClifUnitKey) -> (u32, u32) {
+        let len = units
+            .get(index as usize)
+            .map_or(0x1000, |unit| u32::from(unit.guest_len));
+        (key.physical, key.physical.saturating_add(len))
     }
 }

@@ -114,6 +114,22 @@ impl CpuGsw {
         self.invalidate_decode_frontend();
         #[cfg(feature = "jit")]
         self.jit_direct.clear();
+        self.clif_units_clear();
+    }
+
+    /// Drop every compiled clif unit (Track C C1b). Lowered units execute real guest code,
+    /// so any event that can stale their bytes-to-code mapping without a per-range write
+    /// notification (a global decode flush clears the SMC marks that route writes into
+    /// `note_code_write_hit`) must kill them wholesale. No-op without the clif backend.
+    #[inline]
+    pub(super) fn clif_units_clear(&mut self) {
+        #[cfg(all(
+            feature = "jit",
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_direct.clif_units.clear();
     }
 
     fn invalidate_decode_frontend(&mut self) {
@@ -131,6 +147,7 @@ impl CpuGsw {
         self.invalidate_decode_frontend();
         #[cfg(feature = "jit")]
         self.jit_direct.invalidate_translation();
+        self.clif_units_clear();
     }
 
     fn invalidate_direct_pages(&mut self) {
@@ -298,6 +315,19 @@ impl CpuGsw {
             invalidated = killed != 0;
             heat_hit |= killed != 0;
         }
+        // C1b: a write into a compiled clif unit's span kills the unit. This rides the same
+        // choke as Direct's invalidation (decode-native marks route the write here; G2
+        // same-value elision upstream is sound for clif too, since unchanged bytes cannot
+        // stale a compiled unit).
+        #[cfg(all(
+            feature = "jit",
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        ))]
+        self.jit_direct
+            .clif_units
+            .invalidate_physical_range(physical, width);
         if self.decode_cache.range_hits_code(physical, width) {
             invalidated = true;
             if self.profile.enabled {
@@ -343,6 +373,9 @@ impl CpuGsw {
                     self.decode_cache.invalidate_and_clear_code_marks();
                     #[cfg(feature = "jit")]
                     self.jit_direct.invalidate_translation();
+                    // The marks that route future writes here are gone; drop every clif
+                    // unit rather than trust an unwatched page.
+                    self.clif_units_clear();
                 }
             }
             // The fetch-page snapshot may hold the written bytes under either outcome.

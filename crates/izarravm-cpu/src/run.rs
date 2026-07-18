@@ -618,20 +618,37 @@ impl CpuGsw {
                         target_arch = "x86_64",
                         any(target_os = "windows", target_os = "linux")
                     ))]
-                    if self.mode().uses_approximate_timing() {
+                    let clif_outcome = if self.mode().uses_approximate_timing()
+                        && !std::mem::take(&mut skip_direct_once)
+                    {
                         let continuation_budget = ContinuationBudget {
                             total,
                             bus_at_entry,
                             cap,
                         };
-                        self.try_clif_continuation(
+                        let ran = self.try_clif_continuation(
                             bus,
                             lin,
                             cs.default_size_32,
                             continuation_budget,
                         )?;
-                    }
-                    None
+                        // A unit exit lands at a slot the interpreter retires next; skip
+                        // clif once so that retirement happens before any re-admission
+                        // attempt at the exit address (Direct's Prefix skip shape).
+                        if ran.is_some() {
+                            skip_direct_once = true;
+                        }
+                        ran
+                    } else {
+                        None
+                    };
+                    #[cfg(not(all(
+                        feature = "clif-backend",
+                        target_arch = "x86_64",
+                        any(target_os = "windows", target_os = "linux")
+                    )))]
+                    let clif_outcome: Option<CycleOutcome> = None;
+                    clif_outcome
                 } else if !native_continuations_active {
                     None
                 } else {
@@ -1102,20 +1119,20 @@ impl CpuGsw {
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
-    ) -> Result<(), CpuError> {
+    ) -> Result<Option<CycleOutcome>, CpuError> {
         if !self
             .decode_cache
             .clif_hot(lin, d, jit::clif::cache::CLIF_DEFAULT_ADMISSION_HEAT)
         {
-            return Ok(());
+            return Ok(None);
         }
         let Some(key) = jit::clif::cache::clif_key_for(self, lin, d) else {
-            return Ok(());
+            return Ok(None);
         };
         let unit_index = match self.jit_direct.clif_units.state(key) {
             None => {
                 self.jit_direct.clif_units.note_seen(key);
-                return Ok(());
+                return Ok(None);
             }
             Some(jit::clif::cache::ClifUnitState::Dormant) => {
                 // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp aged out lifts
@@ -1125,7 +1142,7 @@ impl CpuGsw {
                 let jit = &mut *self.jit_direct;
                 jit.clif_units
                     .lift_cold_dormant(&mut jit.smc_heat, key, heat_epoch);
-                return Ok(());
+                return Ok(None);
             }
             Some(jit::clif::cache::ClifUnitState::Compiled(index)) => index,
             Some(jit::clif::cache::ClifUnitState::Seen) => {
@@ -1137,13 +1154,22 @@ impl CpuGsw {
                     jit.smc_heat.bump(key.physical, 1, heat_epoch);
                     jit.clif_units.park_dormant(key);
                     self.perf.smc_heat_demotions += 1;
-                    return Ok(());
+                    return Ok(None);
                 }
                 let Some(layout) = jit::clif::cache::walk_unit(self, key.linear, d) else {
                     // A cold or structurally unclassifiable entry: nothing to admit yet, try
                     // again once the decode cache has warmed enough lines to walk one unit.
-                    return Ok(());
+                    return Ok(None);
                 };
+                // The unit executes its leading run of lowerable slots natively (Track C
+                // C1b); a unit with nothing lowerable at its entry parks Dormant and stays
+                // on the interpreter (entering a no-op body would consume a loop iteration
+                // without progress).
+                let plan = jit::clif::lower::plan_unit(&layout.kinds, true);
+                if plan.leading == 0 {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(None);
+                }
                 self.jit_clif.compile_attempts += 1;
                 // G4 dynamic half (dev_docs/specs/2026-07-15-smc-hardening-design.md): the
                 // kind MUST stay InstructionPrefetch, exactly as Direct's own gate requires
@@ -1158,7 +1184,7 @@ impl CpuGsw {
                 });
                 if !code_page_covers_unit {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(());
+                    return Ok(None);
                 }
                 // G1 pre-install gate (full span).
                 if self.jit_direct.smc_heat.span_hot(
@@ -1170,7 +1196,7 @@ impl CpuGsw {
                     jit.smc_heat.bump(key.physical, 1, heat_epoch);
                     jit.clif_units.park_dormant(key);
                     self.perf.smc_heat_demotions += 1;
-                    return Ok(());
+                    return Ok(None);
                 }
                 let Some(segment_layout) = jit::direct::SegmentLayout::capture(
                     self,
@@ -1178,19 +1204,24 @@ impl CpuGsw {
                     layout.write_segments,
                 ) else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(());
+                    return Ok(None);
                 };
                 let memory_cpl3 = self.current_privilege_level() == 3;
+                let entry_eip = key.linear.wrapping_sub(self.registers.cs().base);
                 if self.jit_direct.clif_backend.is_none() {
                     self.jit_direct.clif_backend = jit::clif::ClifBackend::new();
                 }
                 let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(());
+                    return Ok(None);
                 };
-                let Some(shell_entry) = backend.shell_entry() else {
+                let compile_start = std::time::Instant::now();
+                let compiled = jit::clif::lower::compile_unit(backend, &layout, &plan, entry_eip);
+                self.perf.jit_direct_compile_ns +=
+                    compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                let Some(entry) = compiled else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(());
+                    return Ok(None);
                 };
                 let descriptor = jit::clif::cache::ClifUnitDescriptor {
                     key,
@@ -1201,76 +1232,88 @@ impl CpuGsw {
                     memory_cpl3,
                     has_wide_accesses: layout.has_wide_accesses,
                     is_self_loop: layout.is_self_loop,
-                    entry: shell_entry as usize,
+                    entry,
+                    immediates: layout.imms,
+                    leading: plan.leading,
+                    x87_mask: plan.x87_mask,
+                    cum_raw_before: plan.cum_raw_before,
+                    cum_lowered_before: plan.cum_lowered_before,
+                    raw_clocks_total: plan.raw_clocks_total,
+                    lowered_total: plan.lowered_total,
                 };
                 let Some(index) = self.jit_direct.clif_units.install(descriptor) else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(());
+                    return Ok(None);
                 };
                 self.jit_clif.units_installed += 1;
                 index
             }
         };
         let Some(unit) = self.jit_direct.clif_units.unit(unit_index).cloned() else {
-            return Ok(());
+            return Ok(None);
         };
-        self.run_clif_shell(bus, &unit, budget)
+        self.run_clif_unit(bus, &unit, budget)
     }
 
-    /// The per-entry dynamic guards, in Direct's order (`run_direct_block`, plan section 2.3),
-    /// applied to a compiled clif shell. G5 (x87 TOP) is correctly omitted per plan section 4:
-    /// a C1a shell has no native x87 codegen and so no compile-time TOP assumption to protect.
-    /// G8 uses the non-chain form only (C1a has no linking yet, C1d's job). G11 (deferred
-    /// short blocks) has no clif analogue: C1a has no chaining/short-block deferral concept,
-    /// so there is nothing to gate. On any reject, the interpreter runs next and the compiled
-    /// entry is never invoked. One deliberate difference from `run_direct_block`: the G6/G7/G8
-    /// rejects do NOT retire-for-recompile. Retirement exists so Direct can re-specialize a
-    /// block for the new descriptor snapshot, but a C1a shell bakes nothing in, so recompiling
-    /// it would produce the identical no-op body; a stale unit can only be rejected here,
-    /// never wrongly entered. C1b revisits this once units carry real lowered state.
+    /// The per-entry dynamic guards, in Direct's order (`run_direct_block`, plan section
+    /// 2.3), then one native unit run. G5 (x87 TOP) stays correctly omitted (plan section
+    /// 4: a call-out delegates the whole x87 operation, TOP included, to the interpreter,
+    /// so no compile-time TOP assumption exists to protect). G8 uses the non-chain form
+    /// only (linking is C1d). The G6/G7/G8 rejects still do not retire-for-recompile: the
+    /// next admission attempt at the same key already recompiles through the normal path
+    /// on a mode-key change (a new key), and a descriptor mismatch only rejects, never
+    /// wrongly enters; the retire refinement is revisited with chaining in C1d.
+    ///
+    /// After the guards, the unit runs its leading lowered slots natively and side-exits
+    /// with exact interpreter-equivalent state materialized (design section 4). Charging
+    /// happens here afterwards, through the SAME batch functions Direct uses
+    /// (`scale_clocks_batch`, `charge_cached_fetch`/bulk fetch), over the retired prefix's
+    /// static profile; x87 call-outs charged themselves through the interpreter during the
+    /// run (the no-double-charge invariant, design section 5) and contribute their core
+    /// clocks to the returned outcome so the batch budget sees them.
     #[cfg(all(
         feature = "jit",
         feature = "clif-backend",
         target_arch = "x86_64",
         any(target_os = "windows", target_os = "linux")
     ))]
-    fn run_clif_shell<B: CpuBus>(
+    fn run_clif_unit<B: CpuBus>(
         &mut self,
         bus: &mut B,
         unit: &jit::clif::cache::ClifUnitDescriptor,
         budget: ContinuationBudget,
-    ) -> Result<(), CpuError> {
+    ) -> Result<Option<CycleOutcome>, CpuError> {
         if self.profile.enabled || diff_trace_enabled() {
             self.jit_clif.reject_observer += 1;
-            return Ok(());
+            return Ok(None);
         }
         if self.interrupt_shadow {
             self.jit_clif.reject_interrupt_shadow += 1;
-            return Ok(());
+            return Ok(None);
         }
         if !bus.native_aggregate_accounting_allowed() {
             self.jit_clif.reject_aggregate_accounting += 1;
-            return Ok(());
+            return Ok(None);
         }
         if unit.key.mode_key != self.jit_mode_key() {
             self.jit_clif.reject_mode_key += 1;
-            return Ok(());
+            return Ok(None);
         }
         if !unit.cs_descriptor_matches(self) {
             self.jit_clif.reject_cs_layout += 1;
-            return Ok(());
+            return Ok(None);
         }
         if unit.memory_cpl3 != (self.current_privilege_level() == 3) {
             self.jit_clif.reject_cpl += 1;
-            return Ok(());
+            return Ok(None);
         }
         if !unit.data_descriptors_match(self) {
             self.jit_clif.reject_data_segment += 1;
-            return Ok(());
+            return Ok(None);
         }
         if unit.has_wide_accesses && self.alignment_armed && self.current_privilege_level() == 3 {
             self.jit_clif.reject_alignment += 1;
-            return Ok(());
+            return Ok(None);
         }
         let eip = self.registers.eip;
         let fetch_last = u32::from(unit.guest_len) - 1;
@@ -1282,47 +1325,154 @@ impl CpuGsw {
             .is_none_or(|last_start| eip > last_start)
         {
             self.jit_clif.reject_fetch_limit += 1;
-            return Ok(());
+            return Ok(None);
         }
-        // B1, reduced to the empty-static-profile special case (plan section 5.2): a C1a
-        // shell charges nothing, so the only meaningful check is whether the batch's cap is
-        // already exhausted, not a per-iteration cost (there is none to charge). This
-        // introduces no new timing machinery; it reuses the same budget quantities
-        // `run_direct_block` computes (`total`, the bus-clock growth since entry, `cap`).
+        // B1: one iteration must fit under the cap (Direct's quota shape with the chain
+        // count pinned at 1: C1b has no linking and no native self-loop repetition, so the
+        // only question is whether this single pass fits). The unit's static profile has no
+        // memory accesses (memory forms are not lowered) and no fp weight (x87 charges
+        // itself), so the bound is scaled core clocks plus the lowered-population fetch
+        // estimate, through the same scaling calls run_direct_block uses.
+        let (num, den) = level_timing(self.persona());
+        let scaled_core_upper = u64::from(unit.raw_clocks_total)
+            .saturating_mul(u64::from(num))
+            .saturating_add(u64::from(den) - 1)
+            / u64::from(den);
+        let fetch_upper = bus
+            .jit_fetch_cost_clocks()
+            .saturating_mul(u64::from(unit.lowered_total));
+        let iteration_upper =
+            scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(fetch_upper));
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
         let used = budget.total.saturating_add(bus_growth);
         let available = budget.cap.saturating_sub(used).saturating_sub(1);
-        if available == 0 {
+        if available.checked_div(iteration_upper).unwrap_or(u64::MAX) == 0 {
             self.jit_clif.reject_zero_budget += 1;
-            return Ok(());
+            return Ok(None);
         }
 
-        // Guards passed: enter the compiled shell through the dispatcher-shaped adapter. The
-        // shell reads and writes no `CpuGsw` field (no lowering exists yet), so this call is a
-        // pure entry-ABI round-trip proof; the interpreter retires the unit's guest bytes
-        // after this returns, exactly as it would have on a guard reject.
+        // Guards passed. Stash the N1 key-material snapshot and reset the per-entry
+        // call-out scratch, then enter the compiled unit through the widened adapter with
+        // this call's monomorphized shim table as a stack local (design section 1.3).
         let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
-        let Some(adapter) = backend.adapter() else {
-            return Ok(());
+        let Some(adapter) = backend.callout_adapter() else {
+            return Ok(None);
+        };
+        self.jit_direct.clif_run.pending_hard_error = None;
+        self.jit_direct.clif_run.last_callout_eip = 0;
+        self.jit_direct.clif_run.callout_core_clocks = 0;
+        self.jit_direct.clif_run.snapshot_mode_key = self.jit_mode_key();
+        self.jit_direct.clif_run.snapshot_cpl = self.current_privilege_level();
+        self.jit_direct.clif_run.snapshot_cs = self.registers.cs();
+        self.begin_instruction();
+        self.core_clocks_so_far = budget.total;
+        let table = jit::clif::callout::ClifCallOutTable {
+            x87: jit::clif::callout::clif_x87_callout_shim::<B>,
         };
         let entry_ptr = unit.entry as *const u8;
-        // SAFETY: `entry_ptr` was installed by this backend's zero-relocation compile-and-
-        // install path (`ClifBackend::finalize`) and stays live for the backend's lifetime;
-        // `adapter` was compiled once at the host default convention with exactly this
-        // two-argument signature.
-        let disposition = unsafe { adapter(self as *mut CpuGsw, entry_ptr) };
-        debug_assert_eq!(
-            disposition,
-            jit::clif::unit::SIDE_EXIT_DISPOSITION,
-            "a C1a shell has exactly one disposition"
-        );
+        // SAFETY: the entry and adapter were installed by this backend's zero-relocation
+        // compile-and-install path at exactly the five-parameter/four-live-parameter
+        // signatures and stay live for the backend's lifetime; the table and the immediate
+        // slice outlive the call (the table is this frame's local, the immediates this
+        // frame's descriptor copy), and the bus pointer is dereferenced only by the
+        // identically-monomorphized shim during this call (design section 1.4).
+        let disposition = unsafe {
+            adapter(
+                self as *mut CpuGsw,
+                std::ptr::from_mut(bus).cast(),
+                &table,
+                unit.immediates.as_ptr(),
+                entry_ptr,
+            )
+        };
+
+        // Map the exit back to its slot for prefix charging: a normal side exit ran the
+        // whole leading run; a call-out Exit/HardStop stopped at the recorded site.
+        let entry_eip = unit
+            .key
+            .linear
+            .wrapping_sub(self.jit_direct.clif_run.snapshot_cs.base);
+        let (stop_slot, raw_clocks, lowered_retired) =
+            if disposition == jit::clif::callout::CLIF_CALLOUT_CONTINUE {
+                (
+                    unit.leading as usize,
+                    u64::from(unit.raw_clocks_total),
+                    u64::from(unit.lowered_total),
+                )
+            } else {
+                let mut slot_eip = entry_eip;
+                let mut stop = unit.leading as usize;
+                for slot in 0..unit.leading as usize {
+                    if unit.x87_mask & (1 << slot) != 0
+                        && slot_eip == self.jit_direct.clif_run.last_callout_eip
+                    {
+                        stop = slot;
+                        break;
+                    }
+                    slot_eip = slot_eip.wrapping_add(u32::from(unit.fetch_lens[slot]));
+                }
+                debug_assert!(
+                    stop < unit.leading as usize,
+                    "exit disposition without a site"
+                );
+                (
+                    stop,
+                    u64::from(unit.cum_raw_before[stop]),
+                    u64::from(unit.cum_lowered_before[stop]),
+                )
+            };
+
+        // Fetch charging for the retired lowered slots, mirroring run_direct_block's two
+        // shapes (bulk flat cost under uniform fetches, the per-instruction cached-fetch
+        // replay otherwise); x87 slots are skipped, their call-out performed its own fetch.
+        if bus.native_fetches_are_uniform() {
+            bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(lowered_retired));
+        } else {
+            // charge_cached_fetch advances EIP as part of the interpreter's own warm-hit
+            // replay; the unit (or the call-out's fault delivery) already materialized the
+            // exact exit EIP, so restore it afterwards, exactly as run_direct_block's trace
+            // replay restores final_eip.
+            let final_eip = self.registers.eip;
+            let mut fetch_lin = unit.key.linear;
+            for slot in 0..stop_slot {
+                let len = unit.fetch_lens[slot];
+                if unit.x87_mask & (1 << slot) == 0 {
+                    self.charge_cached_fetch(bus, fetch_lin, len)
+                        .expect("validated clif-unit fetch charge cannot fault");
+                }
+                fetch_lin = fetch_lin.wrapping_add(u32::from(len));
+            }
+            self.registers.eip = final_eip;
+        }
+        let charged = self.scale_clocks_batch(raw_clocks);
+        self.elapsed_clocks += charged;
+        self.perf.instructions += lowered_retired;
+        if self.is_ring0_protected() {
+            self.perf.monitor_resident_core_clocks += charged;
+        }
         self.jit_clif.entries += 1;
         self.jit_clif.side_exits += 1;
-        Ok(())
+        let outcome = CycleOutcome {
+            core_clocks: (charged
+                .saturating_add(u64::from(self.jit_direct.clif_run.callout_core_clocks)))
+            .min(u64::from(u32::MAX)) as u32,
+            halted: false,
+        };
+        if disposition == jit::clif::callout::CLIF_CALLOUT_HARD_STOP {
+            // B2's relay: reproduce the identical Err the interpreter-only policy would
+            // have returned from the same guest program (the failing instruction's own
+            // partial state is already in CpuGsw, left by the interpreter inside the
+            // call-out). A hard stop with no stashed error is the shim's panic belt; the
+            // unit still stops, the panic counter records the bug.
+            if let Some(error) = self.jit_direct.clif_run.pending_hard_error.take() {
+                return Err(error);
+            }
+        }
+        Ok(Some(outcome))
     }
 
     #[cfg(all(
