@@ -74,6 +74,13 @@ pub(crate) use region::RegionTable;
 pub(crate) struct JitState {
     pub(crate) direct: direct::BlockCache,
     pub(crate) smc_heat: direct::SmcHeatMap,
+    /// The per-instance clif policy flag (Track C C1a, plan decision D-C1.4 seam 2): the
+    /// clif analogue of the Direct backend's enabled bit, settable per CpuGsw so
+    /// differential tests route one instance through clif and another through Direct in one
+    /// process. Present in every jit build (not only clif-backend) so policy gates such as
+    /// poll_skip_eligible read one condition everywhere; without the feature no admission
+    /// path ever consults it beyond that gate.
+    pub(crate) clif_enabled: bool,
 }
 
 impl JitState {
@@ -81,6 +88,7 @@ impl JitState {
         Self {
             direct,
             smc_heat: direct::SmcHeatMap::default(),
+            clif_enabled: false,
         }
     }
 }

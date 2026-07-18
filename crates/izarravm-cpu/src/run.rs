@@ -853,6 +853,21 @@ impl CpuGsw {
         self.finish_direct_execution_transition(was_enabled);
     }
 
+    /// Enable or disable the clif (Track C) policy on this CPU instance, the per-instance
+    /// seam mirroring `set_native_backend_enabled` (plan decision D-C1.4). One native
+    /// backend runs at a time: enabling clif does not enable Direct, and the machine-level
+    /// selector never enables both. Unsupported hosts cannot be enabled.
+    #[cfg(feature = "jit")]
+    pub fn set_clif_backend_enabled(&mut self, on: bool) {
+        self.jit_direct.clif_enabled = on && jit::host_supported();
+    }
+
+    /// Whether the clif policy is enabled on this instance.
+    #[cfg(feature = "jit")]
+    pub fn clif_backend_enabled(&self) -> bool {
+        self.jit_direct.clif_enabled
+    }
+
     #[cfg(feature = "jit")]
     fn finish_direct_execution_transition(&mut self, was_enabled: bool) {
         let enabled = self.jit_direct.execution_enabled();
