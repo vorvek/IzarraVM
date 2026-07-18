@@ -288,6 +288,10 @@ fn slot_immediate(kind: &DirectKind) -> u32 {
         DirectKind::DoubleShiftReg {
             count: direct::ShiftCount::Immediate(count),
             ..
+        }
+        | DirectKind::DoubleShiftMem {
+            count: direct::ShiftCount::Immediate(count),
+            ..
         } => u32::from(count),
         DirectKind::Lea { addr, .. } => addr.disp,
         // C1c: a store's or push's immediate source is an ordinary F4-governed operand

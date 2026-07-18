@@ -127,6 +127,8 @@ fn lowerable(kind: &DirectKind) -> bool {
             | DirectKind::AluMemSource { .. }
             | DirectKind::TestImmMem { .. }
             | DirectKind::AluMemDest { .. }
+            | DirectKind::RmwIncDec { .. }
+            | DirectKind::DoubleShiftMem { .. }
     )
 }
 
@@ -714,6 +716,21 @@ impl<'a> UnitBuilder<'a> {
                 addr,
             } => {
                 self.lower_alu_mem_dest(op, source, width, &addr, slot, delta);
+            }
+            DirectKind::RmwIncDec {
+                is_dec,
+                width,
+                addr,
+            } => {
+                self.lower_rmw_inc_dec(is_dec, width, &addr, slot, delta);
+            }
+            DirectKind::DoubleShiftMem {
+                left,
+                src,
+                count,
+                addr,
+            } => {
+                self.lower_double_shift_mem(left, src, count, &addr, slot, delta);
             }
             DirectKind::Push { source } => {
                 self.lower_push(source, slot, delta);
@@ -1734,6 +1751,146 @@ impl<'a> UnitBuilder<'a> {
         let bv = self.b.ins().select(live, zero, old_b);
         let res = self.b.ins().select(live, zero, old_res);
         self.set_pending(tag, a, bv, res);
+    }
+
+    /// `RmwIncDec` (design section 1.3 item 7): `INC/DEC [mem]`, word/dword ONLY by
+    /// classification (opcode 0xFF /0 and /1; the byte form 0xFE has no classify arm, the
+    /// m2 note). The one variant whose code-watch check runs BEFORE any read
+    /// (emit.rs:1873: "INC/DEC always changes its operand, so a watched chunk exits before
+    /// any mutation"), a DIFFERENT ordering from AluMemDest's candidate-then-check shape,
+    /// reproduced here rather than normalized: checks 1-4 (write shape), then step 5 the
+    /// watch check, then both bias sentinels, the old-value load, `IncDecReg`'s
+    /// cf_override pending shape (the CURRENT CF preserved through tag bits 16/17, b = 1),
+    /// and the store through the already-derived write pointer.
+    fn lower_rmw_inc_dec(
+        &mut self,
+        is_dec: bool,
+        width: MemoryWidth,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        debug_assert!(
+            !matches!(width, MemoryWidth::Byte),
+            "group-5 INC/DEC is word or dword by classification"
+        );
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let eff = self.mem_effective_address(addr, slot);
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true);
+        // Step 5: the RmwIncDec-only pre-read code-watch check.
+        self.code_watch_checks(map, linear, page64, width, slot, side);
+        let read_host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let write_host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let a = match width {
+            MemoryWidth::Byte => unreachable!("group-5 INC/DEC is word or dword"),
+            MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, read_host, 0),
+            MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, read_host, 0),
+        };
+        let result = if is_dec {
+            self.b.ins().iadd_imm(a, -1)
+        } else {
+            self.b.ins().iadd_imm(a, 1)
+        };
+        let result = self.b.ins().band_imm(result, i64::from(width_mask(width)));
+        // The CURRENT CF, read before the pending descriptor is redefined.
+        let cf = self.flag_cf();
+        let base_tag = 0x8001_0000u32 | width_tag(width) | u32::from(is_dec);
+        let cf_shifted = self.b.ins().ishl_imm(cf, 17);
+        let base = self.iconst(base_tag);
+        let tag = self.b.ins().bor(base, cf_shifted);
+        let one = self.iconst(1);
+        self.set_pending(tag, a, one, result);
+        self.store_width(width, result, write_host);
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// `DoubleShiftMem` (design section 1.3 item 6): `SHLD/SHRD [mem], reg, count`, dword
+    /// only by classification. `AluMemDest`'s candidate-then-check shape (write checks,
+    /// old dword through the read bias, the d2 single write pointer, the code-watch check)
+    /// with `DoubleShiftReg`'s count-class flag lowering: a zero masked count is a true
+    /// no-op for flags (the candidate is the unchanged old value, stored back exactly as
+    /// Direct's unconditional store does); a nonzero count computes the SHLD/SHRD result,
+    /// commits the eager flag set through `commit_shift_flags` (all six bits when a
+    /// pending descriptor was live, CF/SZP plus the count==1 OF otherwise, stale pending
+    /// bytes preserved), and stores.
+    fn lower_double_shift_mem(
+        &mut self,
+        left: bool,
+        src: u8,
+        count: ShiftCount,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let eff = self.mem_effective_address(addr, slot);
+        let (linear, page64) =
+            self.mem_checked_page(map, addr.segment, eff, MemoryWidth::Dword, slot, side, true);
+        let read_host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let d = self.b.ins().load(types::I32, memflags, read_host, 0);
+        let write_host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
+        self.code_watch_checks(map, linear, page64, MemoryWidth::Dword, slot, side);
+
+        let count_v = match count {
+            ShiftCount::Immediate(_) => self.imm8(slot),
+            ShiftCount::Cl => self.gpr8(1),
+        };
+        let count_v = self.b.ins().band_imm(count_v, 0x1f);
+        let shift_block = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.append_block_param(join, types::I32);
+        let is_zero = self.b.ins().icmp_imm(IntCC::Equal, count_v, 0);
+        self.b
+            .ins()
+            .brif(is_zero, join, &[d.into()], shift_block, &[]);
+
+        self.b.switch_to_block(shift_block);
+        self.b.seal_block(shift_block);
+        {
+            let s = self.gpr32(src);
+            let thirty_two = self.iconst(32);
+            let inv = self.b.ins().isub(thirty_two, count_v);
+            let count_m1 = self.b.ins().iadd_imm(count_v, -1);
+            let (result, cf) = if left {
+                let hi = self.b.ins().ishl(d, count_v);
+                let lo = self.b.ins().ushr(s, inv);
+                let result = self.b.ins().bor(hi, lo);
+                let cf = self.b.ins().ushr(d, inv);
+                let cf = self.b.ins().band_imm(cf, 1);
+                (result, cf)
+            } else {
+                let lo = self.b.ins().ushr(d, count_v);
+                let hi = self.b.ins().ishl(s, inv);
+                let result = self.b.ins().bor(lo, hi);
+                let cf = self.b.ins().ushr(d, count_m1);
+                let cf = self.b.ins().band_imm(cf, 1);
+                (result, cf)
+            };
+            let change = self.b.ins().bxor(d, result);
+            let of_defined = self.bit(change, 31);
+            let count_is_one = self.b.ins().icmp_imm(IntCC::Equal, count_v, 1);
+            self.commit_shift_flags(result, cf, of_defined, count_is_one, MemoryWidth::Dword);
+            self.b.ins().jump(join, &[result.into()]);
+        }
+
+        self.b.switch_to_block(join);
+        self.b.seal_block(join);
+        let result = self.b.block_params(join)[0];
+        self.store_width(MemoryWidth::Dword, result, write_host);
+        self.finish_mem_slot(side, delta);
     }
 
     /// The x87 call-out slot (design sections 1 and 4): materialize everything, call the

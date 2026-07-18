@@ -1881,10 +1881,10 @@ fn clif_compile_outcomes_dormant_and_smc_readmission() {
     use crate::jit::clif::cache::{ClifUnitState, clif_key_for};
 
     let entry = 0x1000u32;
-    // nop; inc dword [0x5000]; hlt: the RmwIncDec form is classifiable but not lowered
-    // (C1c increment 1 lowers Load/Store only), so the unit at it has leading 0. The
-    // original fixture used a Load here; C1c made Load lowerable.
-    let load_code = [0x90, 0xff, 0x05, 0x00, 0x50, 0x00, 0x00, 0xf4];
+    // nop; jmp +0; hlt: a TERMINAL at the unit entry is classifiable but never lowered
+    // (terminals are C1d's job), so the unit at it has leading 0. Earlier fixtures used a
+    // Load and then an RmwIncDec here; C1c's increments made every memory form lowerable.
+    let load_code = [0x90, 0xeb, 0x00, 0xf4];
     let mut memory = vec![0xf4u8; MEMORY_LEN];
     memory[entry as usize..entry as usize + load_code.len()].copy_from_slice(&load_code);
     let mut cpu = generated_cpu(GswMode::Gsw586);
@@ -2699,7 +2699,7 @@ fn clif_plan_access_counts_match_direct_compilation() {
     // stores, moffs and modrm, store-immediate), each small enough that Direct's compile
     // heuristics admit every slot, so the two backends cover IDENTICAL slot lists and the
     // count comparison is like-for-like.
-    let corpora: [&[u8]; 6] = [
+    let corpora: [&[u8]; 8] = [
         &[
             0x40, // inc eax
             0xa1, 0x00, 0x50, 0x00, 0x00, // mov eax, [0x5000]     (dword read)
@@ -2753,6 +2753,24 @@ fn clif_plan_access_counts_match_direct_compilation() {
             0x01, 0x1d, 0x00, 0x50, 0x00, 0x00, // add [0x5000], ebx (read + store)
             0x39, 0x0d, 0x04, 0x50, 0x00, 0x00, // cmp [0x5004], ecx (read, NO store)
             0x80, 0x3d, 0x08, 0x50, 0x00, 0x00, 0x5a, // cmp byte [0x5008], 0x5a (byte read)
+            0xf4,
+        ],
+        // C1c increment 5: RmwIncDec counts a read AND a store at its width (word and
+        // dword; the byte-lane pin lives in clif_byte_rmw_inc_dec_non_existence).
+        &[
+            0x40, // inc eax
+            0xff, 0x05, 0x00, 0x50, 0x00, 0x00, // inc dword [0x5000]
+            0x66, 0xff, 0x0d, 0x04, 0x50, 0x00, 0x00, // dec word [0x5004]
+            0x43, // inc ebx
+            0xf4,
+        ],
+        // DoubleShiftMem: one dword read plus one dword store per slot (memory_alu, kept
+        // within Direct's block cap).
+        &[
+            0x40, // inc eax
+            0x0f, 0xa4, 0x1d, 0x00, 0x50, 0x00, 0x00, 0x07, // shld [0x5000], ebx, 7
+            0x0f, 0xad, 0x0d, 0x04, 0x50, 0x00, 0x00, // shrd [0x5004], ecx, cl
+            0x43, // inc ebx
             0xf4,
         ],
     ];
@@ -3481,4 +3499,284 @@ fn clif_alu_mem_dest_watched_dest_exits_before_commit() {
         clif.jit_direct.clif_units.state(key),
         Some(ClifUnitState::Compiled(_))
     ));
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C C1c increment 5: the RmwIncDec + DoubleShiftMem battery.
+// ---------------------------------------------------------------------------------------
+
+/// Memory INC/DEC across word and dword widths with the CF-preservation pins: the
+/// pending-descriptor bytes (cf_override tag bits 16/17, b == 1) are compared
+/// byte-for-byte with entry CF from STC/CLC and from an in-unit pending producer.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_rmw_inc_dec_matrix_and_cf_pins() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        // Dword INC/DEC over the 0xf4 filler, entry CF both ways.
+        for modrm in [0x05u8, 0x0d] {
+            for setcc in [0xf9u8, 0xf8] {
+                assert_clif_forced_case(
+                    mode,
+                    &[setcc, 0xff, modrm, 0x00, 0x50, 0x00, 0x00, 0xf4],
+                    forced_gpr(),
+                    0x202,
+                );
+            }
+        }
+        // In-unit pending producer: ADD sets CF, the memory INC/DEC must preserve it
+        // through cf_override while its own descriptor takes over.
+        assert_clif_forced_case(
+            mode,
+            &[
+                0x01, 0xd8, // add eax, ebx (sets CF from the forced gpr values)
+                0xff, 0x05, 0x00, 0x50, 0x00, 0x00, // inc dword [0x5000]
+                0xff, 0x0d, 0x04, 0x50, 0x00, 0x00, // dec dword [0x5004]
+                0xf4,
+            ],
+            forced_gpr(),
+            0x202,
+        );
+        // Wrap edges: 0xffffffff increments to zero, zero decrements to 0xffffffff.
+        assert_clif_forced_case(
+            mode,
+            &[
+                0x90, // nop starter
+                0xc7, 0x05, 0x00, 0x50, 0x00, 0x00, 0xff, 0xff, 0xff,
+                0xff, // mov dword [0x5000], -1
+                0xff, 0x05, 0x00, 0x50, 0x00, 0x00, // inc dword [0x5000] (wraps to 0, ZF)
+                0xc7, 0x05, 0x04, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, // mov dword [0x5004], 0
+                0xff, 0x0d, 0x04, 0x50, 0x00, 0x00, // dec dword [0x5004] (wraps to -1)
+                0xf4,
+            ],
+            forced_gpr(),
+            0x202,
+        );
+    }
+    // Word forms, 586 only (0xff is in the classifier's word list).
+    assert_clif_forced_case(
+        GswMode::Gsw586,
+        &[
+            0xf9, // stc
+            0x66, 0xff, 0x05, 0x00, 0x50, 0x00, 0x00, // inc word [0x5000]
+            0x66, 0xff, 0x0d, 0x02, 0x50, 0x00, 0x00, // dec word [0x5002]
+            0xf4,
+        ],
+        forced_gpr(),
+        0x202,
+    );
+}
+
+/// The m2 byte-form non-existence pin, mirroring the byte-AluMemSource shape: the 0xFE
+/// group (byte INC/DEC r/m) has no classify arm at all, so NEITHER backend admits it and
+/// growth stops identically; and a hand-built byte RmwIncDec contributes nothing through
+/// any accessor lane (it is absent from byte_reads and byte_stores by design).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_byte_rmw_inc_dec_non_existence() {
+    use crate::jit::clif::cache::walk_unit;
+    use crate::jit::clif::lower::plan_unit;
+    use crate::jit::direct::{DirectAddr, DirectKind, MemoryWidth};
+
+    // nop; inc eax; inc byte [0x5000] (0xFE /0, unclassified); hlt.
+    let clif = run_clif_forced_case(
+        GswMode::Gsw586,
+        &[0x90, 0x40, 0xfe, 0x05, 0x00, 0x50, 0x00, 0x00, 0xf4],
+        forced_gpr(),
+        0x202,
+    );
+    let layout = walk_unit(&clif, 0x1001, true).expect("walked layout");
+    assert_eq!(
+        layout.kinds.len(),
+        1,
+        "the byte INC/DEC group must stop growth (not classified)"
+    );
+
+    let addr = DirectAddr {
+        segment: SegmentIndex::Ds,
+        base: None,
+        index: None,
+        scale: 1,
+        disp: 0x5000,
+    };
+    let kinds = [DirectKind::RmwIncDec {
+        is_dec: false,
+        width: MemoryWidth::Byte,
+        addr,
+    }];
+    let plan = plan_unit(&kinds, true);
+    assert_eq!(plan.access_total.reads(), 0, "no byte RmwIncDec read lane");
+    assert_eq!(
+        plan.access_total.stores(),
+        0,
+        "no byte RmwIncDec store lane"
+    );
+}
+
+/// SHLD/SHRD memory destinations across the count classes (0, 1, > 1, 31, and a
+/// masked-to-zero 32), immediate and CL counts, both directions, with a live in-unit
+/// pending descriptor feeding the commit's fallback arms.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_double_shift_mem_count_classes() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for opcode in [0xa4u8, 0xac] {
+            // Immediate counts: the zero-count no-op, the count==1 defined-OF arm, a
+            // middle count, 31, and 32 (masked to zero).
+            for count in [0u8, 1, 7, 31, 32] {
+                assert_clif_forced_case(
+                    mode,
+                    &[
+                        0x90, 0x0f, opcode, 0x1d, 0x00, 0x50, 0x00, 0x00, count, 0xf4,
+                    ],
+                    forced_gpr(),
+                    0x202,
+                );
+            }
+        }
+        // CL counts (forced_gpr's ECX low byte is 0x11 = 17), both directions, plus a
+        // pending producer so the commit's live-descriptor fallback arm runs.
+        for opcode in [0xa5u8, 0xad] {
+            assert_clif_forced_case(
+                mode,
+                &[
+                    0x01, 0xd8, // add eax, ebx (a live pending descriptor)
+                    0x0f, opcode, 0x35, 0x00, 0x50, 0x00, 0x00, // shld/shrd [0x5000], esi, cl
+                    0xf4,
+                ],
+                forced_gpr(),
+                0x202,
+            );
+        }
+    }
+}
+
+/// The two RMW check orderings, pinned through the diagnostic counters over a WATCHED
+/// destination: RmwIncDec checks code-watch BEFORE any read (emit.rs:1873's front-loaded
+/// check), AluMemDest and DoubleShiftMem after the candidate; all three side-exit with
+/// the CodeWatch reason and zero guest-visible effects, and the failing slot charges
+/// nothing in every case (the cum-prefix arrays exclude it identically under both
+/// orderings, so the orderings are charge-equivalent by construction; the design's
+/// fidelity note makes the emitted ORDER the mirrored property, not an observable one).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_rmw_watched_dest_orderings_exit_with_code_watch() {
+    use crate::jit::clif::cache::{ClifUnitState, clif_key_for};
+
+    // Three shapes hitting the unit's own watched chunk. OR with 0 and SHLD by 0 target
+    // the unit's own bytes value-preservingly (G2 elides the invalidation); the INC
+    // targets the PADDING dword just past its unit's span but inside the unit's watched
+    // 16-byte chunk, touching no decoded byte, so it is a chunk-granular conservative
+    // watch hit: the value CHANGES each pass yet the interpreter's canonical INC hits no
+    // code and invalidates nothing. All three units survive across passes and every pass
+    // exits through the watch check.
+    let cases: [(&[u8], bool); 3] = [
+        // nop; inc dword [0x1008]; hlt: the front-loaded pre-read watch check (the
+        // RmwIncDec-only ordering) over the same-chunk padding target.
+        (&[0x90, 0xff, 0x05, 0x08, 0x10, 0x00, 0x00, 0xf4], true),
+        // nop; or dword [0x1004], 0; inc ebx; hlt: value-preserving AluMemDest.
+        (
+            &[
+                0x90, 0x81, 0x0d, 0x04, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x43, 0xf4,
+            ],
+            true,
+        ),
+        // nop; shld [0x1004], ebx, 0; inc ebx; hlt: zero count stores the old value.
+        (
+            &[
+                0x90, 0x0f, 0xa4, 0x1d, 0x04, 0x10, 0x00, 0x00, 0x00, 0x43, 0xf4,
+            ],
+            true,
+        ),
+    ];
+    for (code, value_preserving) in cases {
+        let entry = 0x1000u32;
+        let mut memory = vec![0xf4u8; MEMORY_LEN];
+        memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+        let mut interp = generated_cpu(GswMode::Gsw586);
+        let mut clif = generated_cpu(GswMode::Gsw586);
+        clif.set_clif_backend_enabled(true);
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut clif_bus = TestBus::with_memory(memory.clone());
+        for bus in [&mut interp_bus, &mut clif_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        let pass = |interp: &mut CpuGsw,
+                    clif: &mut CpuGsw,
+                    interp_bus: &mut TestBus,
+                    clif_bus: &mut TestBus| {
+            for (cpu, bus) in [
+                (&mut *interp, &mut *interp_bus),
+                (&mut *clif, &mut *clif_bus),
+            ] {
+                bus.memory.copy_from_slice(&memory);
+                bus.trace.clear();
+                cpu.halted = false;
+                cpu.registers.gpr = forced_gpr();
+                cpu.registers.eflags = 0x202;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.set_eip(entry);
+                cpu.elapsed_clocks = 0;
+                cpu.core_clocks_so_far = 0;
+                cpu.timing_rem = 0;
+                while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+            }
+            assert_eq!(clif.registers, interp.registers, "{code:02x?}");
+            assert_eq!(clif.pending_flags, interp.pending_flags, "{code:02x?}");
+            assert_eq!(clif.eflags(), interp.eflags(), "{code:02x?}");
+            assert_eq!(clif_bus.memory, interp_bus.memory, "{code:02x?}");
+            assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks, "{code:02x?}");
+            assert_eq!(
+                clif_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "{code:02x?}"
+            );
+        };
+        if value_preserving {
+            for _ in 0..4 {
+                pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+            }
+            let key = clif_key_for(&clif, entry + 1, true).expect("warm key");
+            assert!(matches!(
+                clif.jit_direct.clif_units.state(key),
+                Some(ClifUnitState::Compiled(_))
+            ));
+            let before = clif.jit_clif_counters();
+            pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+            let after = clif.jit_clif_counters();
+            assert!(
+                after.mem_exit_code_watch > before.mem_exit_code_watch,
+                "the watched-destination RMW must exit through the code-watch check: \
+                 {code:02x?}, {after:#?}"
+            );
+            assert_eq!(
+                after.mem_exit_unavailable_or_kind, before.mem_exit_unavailable_or_kind,
+                "the watch reason, not a bias miss: {code:02x?}"
+            );
+            assert!(matches!(
+                clif.jit_direct.clif_units.state(key),
+                Some(ClifUnitState::Compiled(_))
+            ));
+        } else {
+            unreachable!("every current case survives across passes");
+        }
+    }
 }

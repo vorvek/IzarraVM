@@ -591,3 +591,45 @@ fn nonflat_segment_falls_back_before_the_precise_limit_fault() {
     );
     assert_eq!(fixture.native_bus.memory, fixture.interpreter_bus.memory);
 }
+
+/// Track C C1c increment 5 (design section 5 test 10): the clif arm for `DoubleShiftMem`,
+/// through this file's own instruction builder: both directions, immediate counts across
+/// the count classes (0, 1, mid, 31, and 32 masked to zero) and the CL forms, memory
+/// destinations, against the shared forced harness's byte-identity and timing set. A
+/// register-form pending producer precedes half the cases so the commit's live-descriptor
+/// fallback arms run.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_double_shift_mem_forms_match_the_interpreter() {
+    use super::jit_differential_generator::{assert_clif_forced_case, forced_gpr};
+
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        for left in [true, false] {
+            for count in [0u8, 1, 13, 31, 32] {
+                let mut code = vec![0x90];
+                code.extend_from_slice(&double_shift_instruction(
+                    left,
+                    CountSource::Immediate,
+                    count,
+                    Some(0x5000),
+                ));
+                code.push(0xf4);
+                assert_clif_forced_case(mode, &code, forced_gpr(), 0x202);
+            }
+            // CL count with a live in-unit pending descriptor feeding the fallbacks.
+            let mut code = vec![0x01, 0xd8]; // add eax, ebx
+            code.extend_from_slice(&double_shift_instruction(
+                left,
+                CountSource::Cl,
+                0,
+                Some(0x5000),
+            ));
+            code.push(0xf4);
+            assert_clif_forced_case(mode, &code, forced_gpr(), 0x202);
+        }
+    }
+}
