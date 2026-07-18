@@ -308,6 +308,112 @@ fn generated_direct_blocks_match_interpreter_in_486_and_586_modes() {
     run_generated_mode(GswMode::Gsw586, CASES_PER_MODE);
 }
 
+/// Track C C1a's third differential arm: the same generator suite routed through the clif
+/// side-exit-shell policy instead of Direct. A C1a shell never retires a guest instruction
+/// natively (F-A1 option B), so every path, guard-reject or guard-pass, ends with the
+/// interpreter retiring the current instruction; state and timing must therefore be
+/// BYTE-IDENTICAL to the plain interpreter run, not merely equal on the architectural fields
+/// Direct's own assertions check. A mismatch here indicts the admission/guard/dispatch/
+/// exit-state layer, since no lowering exists yet to blame instead.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn prime_clif(cpu: &mut CpuGsw, bus: &mut TestBus, pristine: &[u8], case: &GeneratedCase) {
+    cpu.set_clif_backend_enabled(false);
+    restore_bus(bus, pristine);
+    arm(cpu, case);
+    run_to_halt(cpu, bus, case).unwrap();
+    cpu.set_clif_backend_enabled(true);
+    for _ in 0..4 {
+        restore_bus(bus, pristine);
+        arm(cpu, case);
+        run_to_halt(cpu, bus, case).unwrap();
+    }
+}
+
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn run_generated_mode_clif(mode: GswMode, mode_offset: u32) {
+    let cases: Vec<_> = (0..CASES_PER_MODE)
+        .map(|index| generated_case(index, mode_offset))
+        .collect();
+    let mut pristine = vec![0; MEMORY_LEN];
+    let mut fill = Rng::new(0x7265_7072_6f64_7563 ^ u64::from(mode_offset));
+    for byte in &mut pristine {
+        *byte = fill.u32() as u8;
+    }
+    for case in &cases {
+        let start = case.entry as usize;
+        pristine[start..start + case.bytes.len()].copy_from_slice(&case.bytes);
+    }
+
+    let mut interpreter = generated_cpu(mode);
+    let mut clif = generated_cpu(mode);
+    let mut interpreter_bus = TestBus::with_memory(pristine.clone());
+    let mut clif_bus = TestBus::with_memory(pristine.clone());
+    for bus in [&mut interpreter_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    for case in &cases {
+        restore_bus(&mut interpreter_bus, &pristine);
+        restore_bus(&mut clif_bus, &pristine);
+        arm(&mut interpreter, case);
+        run_to_halt(&mut interpreter, &mut interpreter_bus, case).unwrap();
+        prime_clif(&mut clif, &mut clif_bus, &pristine, case);
+
+        restore_bus(&mut interpreter_bus, &pristine);
+        restore_bus(&mut clif_bus, &pristine);
+        arm(&mut interpreter, case);
+        arm(&mut clif, case);
+        let before = clif.perf_counters().clone();
+        let expected_fpu = interpreter.fpu.clone();
+
+        let interpreted = run_to_halt(&mut interpreter, &mut interpreter_bus, case);
+        let native = run_to_halt(&mut clif, &mut clif_bus, case);
+
+        assert_eq!(native, interpreted, "run outcome differs: {case:#?}");
+        assert_eq!(clif.registers, interpreter.registers, "{case:#?}");
+        assert_eq!(clif.registers.eip, interpreter.registers.eip, "{case:#?}");
+        assert_eq!(clif.eflags(), interpreter.eflags(), "{case:#?}");
+        assert_eq!(clif.fpu, expected_fpu, "clif x87 changed: {case:#?}");
+        assert_eq!(
+            interpreter.fpu, expected_fpu,
+            "interpreter x87 changed: {case:#?}"
+        );
+        assert_eq!(clif, interpreter, "full CPU state differs: {case:#?}");
+        assert_eq!(clif_bus.memory, interpreter_bus.memory, "{case:#?}");
+        assert_eq!(clif.elapsed_clocks, interpreter.elapsed_clocks, "{case:#?}");
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interpreter_bus.trace.elapsed_clocks(),
+            "bus clocks differ: {case:#?}"
+        );
+        assert!(
+            clif.perf_counters().jit_clif_entries > before.jit_clif_entries,
+            "accepted seed never entered the clif shell: {case:#?}, perf={:#?}",
+            clif.perf_counters()
+        );
+    }
+}
+
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn generated_clif_shells_match_interpreter_in_486_and_586_modes() {
+    run_generated_mode_clif(GswMode::Gsw486, 0);
+    run_generated_mode_clif(GswMode::Gsw586, CASES_PER_MODE);
+}
+
 fn single_case_memory(case: &GeneratedCase) -> Vec<u8> {
     let mut memory = vec![0; MEMORY_LEN];
     let start = case.entry as usize;
