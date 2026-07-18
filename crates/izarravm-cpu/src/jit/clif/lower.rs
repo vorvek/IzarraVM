@@ -39,11 +39,12 @@ use super::super::fast_map::{
     NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER,
     NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND, NATIVE_UNAVAILABLE_BIAS, NativeMapBases,
 };
+use super::super::links::{BlockPortal, LinkCell};
 use super::ClifBackend;
 use super::cache::{ClifAccessCounts, UnitLayout};
 use super::callout::{
-    CLIF_CALLOUT_CONTINUE, ClifCallOutTable, ClifMode13Lanes, callout_shim_signature,
-    callout_unit_signature,
+    CLIF_CALLOUT_CONTINUE, CLIF_CHAIN_QUOTA_EXHAUSTED, ClifCallOutTable, ClifChainLanes,
+    ClifMode13Lanes, callout_shim_signature, callout_unit_signature,
 };
 use crate::{CpuGsw, PendingFlags, Registers};
 
@@ -89,6 +90,13 @@ pub(crate) struct UnitMemoryContext {
     /// lanes the compiled unit increments in place. Stable for the CPU's lifetime (one
     /// `Box<JitState>`; clones drop all units).
     pub(crate) mode13_lanes: usize,
+    /// C1d: the baked addresses of this unit's two outbound `LinkCell`s (slot 0 the
+    /// taken/only edge, slot 1 the `Jcc` fall-through), created and sentinel-repointed
+    /// BEFORE compile (N1a) so the terminal transfer thunks can bake them.
+    pub(crate) cell_addrs: [usize; 2],
+    /// C1d: the baked address of `ClifRunScratch.chain` (the transfer count and landing
+    /// trace the thunks record; design section 4.3).
+    pub(crate) chain_lanes: usize,
 }
 
 /// The static execution plan derived from a walked unit's kinds: which leading slots run
@@ -105,6 +113,10 @@ pub(crate) struct UnitPlan {
     /// design section 4/M4), through `DirectKind`'s own accessors verbatim.
     pub(crate) cum_access_before: [ClifAccessCounts; MAX_BLOCK_INSTRUCTIONS],
     pub(crate) access_total: ClifAccessCounts,
+    /// C1d: the leading run ends in a natively-retired `Jmp`/`Jcc` terminal (its transfer
+    /// thunks or side-exit arms terminate every path, so the compiler skips the shared
+    /// stop-slot epilogue).
+    pub(crate) terminal: bool,
 }
 
 fn lowerable(kind: &DirectKind) -> bool {
@@ -150,6 +162,7 @@ pub(crate) fn plan_unit(kinds: &[DirectKind], admit_x87: bool) -> UnitPlan {
         lowered_total: 0,
         cum_access_before: [ClifAccessCounts::default(); MAX_BLOCK_INSTRUCTIONS],
         access_total: ClifAccessCounts::default(),
+        terminal: false,
     };
     let mut raw = 0u16;
     let mut lowered = 0u8;
@@ -164,6 +177,16 @@ pub(crate) fn plan_unit(kinds: &[DirectKind], admit_x87: bool) -> UnitPlan {
             continue;
         }
         if !lowerable(kind) {
+            // C1d: a terminal Jmp/Jcc as the walk's LAST slot retires natively (its edges
+            // become transfer thunks or side exits); Call/Ret terminals stay stop slots.
+            if i + 1 == kinds.len()
+                && matches!(kind, DirectKind::Jmp { .. } | DirectKind::Jcc { .. })
+            {
+                raw = raw.saturating_add(kind.raw_clocks() as u16);
+                lowered += 1;
+                plan.leading = (i + 1) as u8;
+                plan.terminal = true;
+            }
             break;
         }
         raw = raw.saturating_add(kind.raw_clocks() as u16);
@@ -252,6 +275,12 @@ struct UnitBuilder<'a> {
     mem: UnitMemoryContext,
     entry_eip: u32,
     shim_sig: cranelift_codegen::ir::SigRef,
+    /// C1d: the unit's own Tail signature, for the terminal transfer thunks'
+    /// `return_call_indirect`.
+    unit_sig: cranelift_codegen::ir::SigRef,
+    /// C1d: the quota, the entry block's fifth live parameter (defined in the entry block,
+    /// so it dominates every thunk site).
+    quota: Value,
 }
 
 impl<'a> UnitBuilder<'a> {
@@ -604,8 +633,21 @@ impl<'a> UnitBuilder<'a> {
     }
 
     /// Lower one slot. `delta` is the guest-byte offset of this slot from unit entry.
-    fn lower_slot(&mut self, kind: &DirectKind, slot: usize, delta: u32, len: u8) {
+    /// Returns true when the slot TERMINATED the function on every path (a lowered
+    /// terminal), so the caller skips the shared stop-slot epilogue.
+    fn lower_slot(&mut self, kind: &DirectKind, slot: usize, delta: u32, len: u8) -> bool {
         match *kind {
+            DirectKind::Jmp { target_delta } => {
+                self.lower_terminal_jmp(target_delta);
+                return true;
+            }
+            DirectKind::Jcc {
+                condition,
+                taken_delta,
+            } => {
+                self.lower_terminal_jcc(condition, taken_delta, delta.wrapping_add(u32::from(len)));
+                return true;
+            }
             DirectKind::MovReg { dst, src, width } => {
                 let v = self.read_width(src, width);
                 self.write_width(dst, width, v);
@@ -748,6 +790,193 @@ impl<'a> UnitBuilder<'a> {
             }
             _ => unreachable!("non-lowerable kind reached the unit body"),
         }
+        false
+    }
+
+    /// i32 0/1 ZF over the runtime pending descriptor (masked result equals zero) with the
+    /// live-eflags fallback, the `arith_flag` decision-tree shape `flag_cf` established.
+    fn flag_zf(&mut self) -> Value {
+        let live = self.pending_live();
+        let result = self.b.use_var(self.vars.pres);
+        let (mask, _) = self.pending_mask_sign();
+        let masked = self.b.ins().band(result, mask);
+        let zf_pending = self.b.ins().icmp_imm(IntCC::Equal, masked, 0);
+        let zf_pending = self.b.ins().uextend(types::I32, zf_pending);
+        let eflags = self.b.use_var(self.vars.eflags);
+        let zf_live = self.bit(eflags, 6);
+        self.b.ins().select(live, zf_pending, zf_live)
+    }
+
+    /// i32 0/1 SF (the masked result's sign bit) with the live-eflags fallback.
+    fn flag_sf(&mut self) -> Value {
+        let live = self.pending_live();
+        let result = self.b.use_var(self.vars.pres);
+        let (_, sign) = self.pending_mask_sign();
+        let bits = self.b.ins().band(result, sign);
+        let sf_pending = self.b.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+        let sf_pending = self.b.ins().uextend(types::I32, sf_pending);
+        let eflags = self.b.use_var(self.vars.eflags);
+        let sf_live = self.bit(eflags, 7);
+        self.b.ins().select(live, sf_pending, sf_live)
+    }
+
+    /// i32 0/1 PF (even parity of the result's low byte) with the live-eflags fallback.
+    fn flag_pf(&mut self) -> Value {
+        let live = self.pending_live();
+        let result = self.b.use_var(self.vars.pres);
+        let low = self.b.ins().band_imm(result, 0xff);
+        let ones = self.b.ins().popcnt(low);
+        let odd = self.b.ins().band_imm(ones, 1);
+        let pf_pending = self.b.ins().bxor_imm(odd, 1);
+        let eflags = self.b.use_var(self.vars.eflags);
+        let pf_live = self.bit(eflags, 2);
+        self.b.ins().select(live, pf_pending, pf_live)
+    }
+
+    /// The x86 condition-code value (i32 0/1) for `Jcc` condition `cc` (0..=15): the base
+    /// predicate per `cc >> 1` (O, C, Z, C|Z, S, P, S^O, Z|(S^O)), inverted for odd codes,
+    /// over the SAME lazy-flag accessors the rest of the lowering uses (pure reads: the
+    /// pending descriptor stays byte-for-byte intact, exactly as the interpreter's Jcc
+    /// leaves it).
+    fn condition_value(&mut self, cc: u8) -> Value {
+        let base = match cc >> 1 {
+            0 => self.flag_of(),
+            1 => self.flag_cf(),
+            2 => self.flag_zf(),
+            3 => {
+                let cf = self.flag_cf();
+                let zf = self.flag_zf();
+                self.b.ins().bor(cf, zf)
+            }
+            4 => self.flag_sf(),
+            5 => self.flag_pf(),
+            6 => {
+                let sf = self.flag_sf();
+                let of = self.flag_of();
+                self.b.ins().bxor(sf, of)
+            }
+            _ => {
+                let zf = self.flag_zf();
+                let sf = self.flag_sf();
+                let of = self.flag_of();
+                let l = self.b.ins().bxor(sf, of);
+                self.b.ins().bor(zf, l)
+            }
+        };
+        if cc & 1 == 1 {
+            self.b.ins().bxor_imm(base, 1)
+        } else {
+            base
+        }
+    }
+
+    /// One edge's linked-transfer thunk (design sections 3.3/3.3b/4.2), emitted with all
+    /// guest state ALREADY spilled at the edge's target EIP. Direct's decrement-and-check-
+    /// BEFORE-transfer order: quota - 1 == 0 yields `CLIF_CHAIN_QUOTA_EXHAUSTED` (the
+    /// resume point is already exact); otherwise the branch-free landing-record loads
+    /// (cell -> portal -> descriptor body -> entry, with the target's own operand table as
+    /// the forwarded imm_table) record the hop in the chain trace and tail-call the loaded
+    /// entry with the decremented quota as the fifth live argument. An unresolved or
+    /// hidden edge's body IS the sentinel descriptor, whose entry is the resolver
+    /// trampoline: no branch at the transfer site.
+    fn emit_transfer_thunk(&mut self, cell_slot: usize) {
+        let memflags = self.flags();
+        let next_quota = self.b.ins().iadd_imm(self.quota, -1);
+        let exhausted = self.b.create_block();
+        let transfer = self.b.create_block();
+        let is_exhausted = self.b.ins().icmp_imm(IntCC::Equal, next_quota, 0);
+        self.b
+            .ins()
+            .brif(is_exhausted, exhausted, &[], transfer, &[]);
+
+        self.b.switch_to_block(exhausted);
+        self.b.seal_block(exhausted);
+        let disposition = self.b.ins().iconst(types::I64, CLIF_CHAIN_QUOTA_EXHAUSTED);
+        self.b.ins().return_(&[disposition]);
+
+        self.b.switch_to_block(transfer);
+        self.b.seal_block(transfer);
+        let cell = self.iconst64(self.mem.cell_addrs[cell_slot] as u64);
+        let portal_off =
+            i32::try_from(offset_of!(LinkCell, portal)).expect("cell portal offset fits");
+        let portal = self.b.ins().load(types::I64, memflags, cell, portal_off);
+        let body_off =
+            i32::try_from(offset_of!(BlockPortal, body)).expect("portal body offset fits");
+        let body = self.b.ins().load(types::I64, memflags, portal, body_off);
+        // The chain trace (design section 4.3): record the landing record and bump the
+        // transfer count, so the Rust side can resolve which units the chain traversed.
+        let chain = self.iconst64(self.mem.chain_lanes as u64);
+        let transfers_off = i32::try_from(offset_of!(ClifChainLanes, transfers))
+            .expect("chain transfers offset fits");
+        let count = self
+            .b
+            .ins()
+            .load(types::I64, memflags, chain, transfers_off);
+        let trace_base =
+            self.iconst64((self.mem.chain_lanes + offset_of!(ClifChainLanes, trace)) as u64);
+        let idx8 = self.b.ins().ishl_imm(count, 3);
+        let slot_addr = self.b.ins().iadd(trace_base, idx8);
+        self.b.ins().store(memflags, body, slot_addr, 0);
+        let count = self.b.ins().iadd_imm(count, 1);
+        self.b.ins().store(memflags, count, chain, transfers_off);
+        // The landing record's dependent loads at compile-time-constant offsets.
+        let entry_off = i32::try_from(offset_of!(super::cache::ClifUnitDescriptor, entry))
+            .expect("descriptor entry offset fits");
+        let target = self.b.ins().load(types::I64, memflags, body, entry_off);
+        let operands_off = i64::try_from(offset_of!(super::cache::ClifUnitDescriptor, operands))
+            .expect("descriptor operands offset fits");
+        let imm_table = self.b.ins().iadd_imm(body, operands_off);
+        self.b.ins().return_call_indirect(
+            self.unit_sig,
+            target,
+            &[
+                self.ctx.cpu,
+                self.ctx.bus,
+                self.ctx.table,
+                imm_table,
+                next_quota,
+            ],
+        );
+    }
+
+    /// The lowered `Jmp` terminal: spill at the target and transfer through cell slot 0; a
+    /// self-referential target (delta 0) never links (m2) and side-exits at the entry EIP
+    /// through the normal dispatcher path instead.
+    fn lower_terminal_jmp(&mut self, target_delta: u32) {
+        self.spill_all(target_delta);
+        if target_delta == 0 {
+            let side_exit = self.b.ins().iconst(types::I64, 0);
+            self.b.ins().return_(&[side_exit]);
+        } else {
+            self.emit_transfer_thunk(0);
+        }
+    }
+
+    /// The lowered `Jcc` terminal (design section 4.2's per-taken-edge specification): the
+    /// condition evaluates over the lazy-flag accessors, then EACH edge spills its OWN
+    /// target EIP and runs its OWN thunk (taken through cell slot 0, fall-through slot 1).
+    /// A self-referential taken edge stays a side exit (m2); its fall-through edge links
+    /// normally.
+    fn lower_terminal_jcc(&mut self, condition: u8, taken_delta: u32, fallthrough_delta: u32) {
+        let cond = self.condition_value(condition);
+        let taken = self.b.create_block();
+        let not_taken = self.b.create_block();
+        self.b.ins().brif(cond, taken, &[], not_taken, &[]);
+
+        self.b.switch_to_block(taken);
+        self.b.seal_block(taken);
+        self.spill_all(taken_delta);
+        if taken_delta == 0 {
+            let side_exit = self.b.ins().iconst(types::I64, 0);
+            self.b.ins().return_(&[side_exit]);
+        } else {
+            self.emit_transfer_thunk(0);
+        }
+
+        self.b.switch_to_block(not_taken);
+        self.b.seal_block(not_taken);
+        self.spill_all(fallthrough_delta);
+        self.emit_transfer_thunk(1);
     }
 
     fn iconst64(&mut self, v: u64) -> Value {
@@ -2102,6 +2331,7 @@ pub(crate) fn compile_unit(
     let mut builder = FunctionBuilder::new(&mut func, &mut fbc);
     let shim_sig =
         builder.import_signature(callout_shim_signature(backend.isa().default_call_conv()));
+    let unit_sig = builder.import_signature(callout_unit_signature());
 
     let entry = builder.create_block();
     builder.append_block_params_for_function_params(entry);
@@ -2111,10 +2341,9 @@ pub(crate) fn compile_unit(
     let bus = builder.block_params(entry)[1];
     let table = builder.block_params(entry)[2];
     let imm_table = builder.block_params(entry)[3];
-    // The C1d quota rides as the fifth live parameter (design section 4.2). The single-unit
-    // body performs no transfers yet, so the parameter is received and unused; C1d-main's
-    // terminal transfer thunks are its first consumer.
-    let _quota = builder.block_params(entry)[4];
+    // The C1d quota, the fifth live parameter (design section 4.2), consumed by the
+    // terminal transfer thunks.
+    let quota = builder.block_params(entry)[4];
 
     let vars = Vars {
         gpr: core::array::from_fn(|_| builder.declare_var(types::I32)),
@@ -2138,6 +2367,8 @@ pub(crate) fn compile_unit(
         mem,
         entry_eip,
         shim_sig,
+        unit_sig,
+        quota,
     };
 
     // Load-all at entry: byte-transparent (an untouched value spills back identically).
@@ -2145,18 +2376,22 @@ pub(crate) fn compile_unit(
     ub.reload_all();
 
     let mut delta = 0u32;
+    let mut terminated = false;
     for slot in 0..plan.leading as usize {
         let kind = &layout.kinds[slot];
         let len = layout.fetch_lens[slot];
-        ub.lower_slot(kind, slot, delta, len);
+        terminated = ub.lower_slot(kind, slot, delta, len);
         delta = delta.wrapping_add(u32::from(len));
     }
 
     // The stop-slot side exit: materialize with EIP at the first non-lowered slot (or the
-    // unit end when the whole walked span lowered).
-    ub.spill_all(delta);
-    let side_exit = ub.b.ins().iconst(types::I64, 0);
-    ub.b.ins().return_(&[side_exit]);
+    // unit end when the whole walked span lowered). A lowered terminal (C1d) already
+    // terminated every path with its own spills and returns.
+    if !terminated {
+        ub.spill_all(delta);
+        let side_exit = ub.b.ins().iconst(types::I64, 0);
+        ub.b.ins().return_(&[side_exit]);
+    }
 
     ub.b.finalize();
     backend.finalize(func).map(|ptr| ptr as usize)

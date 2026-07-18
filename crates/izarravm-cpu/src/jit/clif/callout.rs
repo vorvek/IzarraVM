@@ -115,10 +115,34 @@ pub(crate) struct ClifMode13Lanes {
 
 /// Per-entry call-out scratch on the jit state (Track C C1b). The shim is the only writer
 /// during a unit run; `run_clif_unit` resets it before entry and consumes it after exit.
+/// The C1d chain lanes (design section 4.3): the completed-transfer count and the landing
+/// trace the compiled transfer thunks record in place, consumed by `run_clif_unit` to
+/// resolve which units the chain traversed and charge each unit's own static profile in
+/// one Rust-side batch (the tail-call chain cannot call back into Rust per hop). The trace
+/// stores the loaded portal BODY (a descriptor address, real or sentinel) per completed
+/// transfer; capacity is `MAX_CHAIN_BLOCKS` because the quota computation caps transfers
+/// at `MAX_CHAIN_BLOCKS - 1`.
+#[repr(C)]
+pub(crate) struct ClifChainLanes {
+    pub(crate) transfers: u64,
+    pub(crate) trace: [usize; super::super::direct::MAX_CHAIN_BLOCKS],
+}
+
+impl Default for ClifChainLanes {
+    fn default() -> Self {
+        Self {
+            transfers: 0,
+            trace: [0; super::super::direct::MAX_CHAIN_BLOCKS],
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ClifRunScratch {
     /// C1c increment 6: the dynamic mode13 lanes the compiled unit increments in place.
     pub(crate) mode13: ClifMode13Lanes,
+    /// C1d: the chain transfer count and landing trace.
+    pub(crate) chain: ClifChainLanes,
     /// A panic payload caught by the shim's belt (review finding m1): the shim must not
     /// unwind through compiled frames with no unwind info, so the payload crosses the
     /// boundary here and `run_clif_unit` resumes the unwind once the disposition is back

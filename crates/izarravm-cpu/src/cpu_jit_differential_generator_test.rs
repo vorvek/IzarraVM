@@ -1881,10 +1881,11 @@ fn clif_compile_outcomes_dormant_and_smc_readmission() {
     use crate::jit::clif::cache::{ClifUnitState, clif_key_for};
 
     let entry = 0x1000u32;
-    // nop; jmp +0; hlt: a TERMINAL at the unit entry is classifiable but never lowered
-    // (terminals are C1d's job), so the unit at it has leading 0. Earlier fixtures used a
-    // Load and then an RmwIncDec here; C1c's increments made every memory form lowerable.
-    let load_code = [0x90, 0xeb, 0x00, 0xf4];
+    // nop; call +0; hlt: a CALL terminal at the unit entry is classifiable but never
+    // lowered (C1d lowers Jmp/Jcc terminals only; Call/Ret stay stop slots), so the unit
+    // at it has leading 0. Earlier fixtures used a Load, then an RmwIncDec, then a Jmp
+    // here; C1c/C1d made each lowerable in turn.
+    let load_code = [0x90, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xf4];
     let mut memory = vec![0xf4u8; MEMORY_LEN];
     memory[entry as usize..entry as usize + load_code.len()].copy_from_slice(&load_code);
     let mut cpu = generated_cpu(GswMode::Gsw586);
@@ -4071,5 +4072,503 @@ fn clif_unserved_write_window_side_exits_to_the_canonical_bus_write() {
     assert!(
         after.mem_exit_unavailable_or_kind > before.mem_exit_unavailable_or_kind,
         "the unserved write window must exit through the bias sentinel: {after:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C C1d: the chaining battery (design section 10 as amended).
+// ---------------------------------------------------------------------------------------
+
+/// The shared chain harness: run both arms to halt for `passes` passes over `code`,
+/// asserting the full byte-identity and timing set each pass, and return the clif CPU and
+/// buses for counter assertions. `gpr` resets each pass.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+struct ChainHarness {
+    interp: CpuGsw,
+    clif: CpuGsw,
+    interp_bus: TestBus,
+    clif_bus: TestBus,
+    memory: Vec<u8>,
+    entry: u32,
+    gpr: [u32; 8],
+}
+
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+impl ChainHarness {
+    fn new(code: &[u8], gpr: [u32; 8]) -> Self {
+        let entry = 0x1000u32;
+        let mut memory = vec![0xf4u8; MEMORY_LEN];
+        memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+        let interp = generated_cpu(GswMode::Gsw586);
+        let mut clif = generated_cpu(GswMode::Gsw586);
+        clif.set_clif_backend_enabled(true);
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut clif_bus = TestBus::with_memory(memory.clone());
+        for bus in [&mut interp_bus, &mut clif_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+        Self {
+            interp,
+            clif,
+            interp_bus,
+            clif_bus,
+            memory,
+            entry,
+            gpr,
+        }
+    }
+
+    /// One to-halt pass on both arms with full equality asserts.
+    fn pass(&mut self) {
+        for (cpu, bus) in [
+            (&mut self.interp, &mut self.interp_bus),
+            (&mut self.clif, &mut self.clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&self.memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = self.gpr;
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(self.entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+        }
+        self.compare("chain pass");
+    }
+
+    /// One BUDGETED pass on both arms (for never-halting spins): `calls` run_budgeted
+    /// invocations at `cap`, equality asserted after the batch.
+    fn budgeted_pass(&mut self, calls: usize, cap: u64) {
+        for (cpu, bus) in [
+            (&mut self.interp, &mut self.interp_bus),
+            (&mut self.clif, &mut self.clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&self.memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = self.gpr;
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(self.entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            for _ in 0..calls {
+                let outcome = cpu.run_budgeted(bus, cap).expect("runs");
+                assert!(!outcome.halted, "the spin must not halt");
+            }
+        }
+        self.compare("budgeted spin");
+    }
+
+    fn compare(&self, what: &str) {
+        assert_eq!(self.clif.registers, self.interp.registers, "{what}");
+        assert_eq!(self.clif.pending_flags, self.interp.pending_flags, "{what}");
+        assert_eq!(self.clif.eflags(), self.interp.eflags(), "{what}");
+        assert_eq!(self.clif_bus.memory, self.interp_bus.memory, "{what}");
+        assert_eq!(
+            self.clif.elapsed_clocks, self.interp.elapsed_clocks,
+            "{what}: elapsed"
+        );
+        assert_eq!(
+            self.clif_bus.trace.elapsed_clocks(),
+            self.interp_bus.trace.elapsed_clocks(),
+            "{what}: bus clocks"
+        );
+        assert_eq!(self.clif.timing_rem, self.interp.timing_rem, "{what}: rem");
+    }
+}
+
+/// A-Jmp-B (design section 10's first forced shape): once both units compile, A's taken
+/// edge resolves through `resolve_waiting` and every later entry transfers NATIVELY from A
+/// into B, byte-identically, with `linked_transfers` counting the hops and the second cell
+/// staying permanently at the sentinel.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_jmp_links_and_transfers_natively() {
+    // 0x1000: nop (starter); A at 0x1001: inc eax; add eax,ebx; jmp +8 -> B at 0x1010:
+    // inc ebx; sub eax,ecx; hlt.
+    let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xeb, 0x0a];
+    code.resize(0x10, 0x90); // padding the jmp skips
+    code.extend_from_slice(&[0x43, 0x29, 0xc8, 0xf4]);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..4 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    harness.pass();
+    let after = harness.clif.jit_clif_counters();
+    assert!(
+        after.linked_transfers > before.linked_transfers,
+        "the resolved A-Jmp-B edge must transfer natively: {after:#?}"
+    );
+}
+
+/// A-Jcc with BOTH edges resolved to distinct units (the per-taken-edge specification):
+/// the taken pass and the fall-through pass each transfer through their own cell with
+/// their own EIP materialization, and both stay byte-identical.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_jcc_transfers_through_both_edges() {
+    // 0x1000: nop; A at 0x1001: test eax,eax; jnz +8 -> T at 0x100d; fall-through F at
+    // 0x1005: inc ecx; hlt; T at 0x100d: inc ebx; hlt.
+    let mut code = vec![0x90, 0x85, 0xc0, 0x75, 0x08, 0x41, 0xf4];
+    code.resize(0xd, 0x90);
+    code.extend_from_slice(&[0x43, 0xf4]);
+    // Taken direction (eax nonzero).
+    let mut gpr = forced_gpr();
+    gpr[0] = 1;
+    let mut harness = ChainHarness::new(&code, gpr);
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    harness.pass();
+    let after = harness.clif.jit_clif_counters();
+    assert!(
+        after.linked_transfers > before.linked_transfers,
+        "the taken edge must transfer natively: {after:#?}"
+    );
+    // Fall-through direction (eax zero) on the SAME warmed pair of CPUs.
+    harness.gpr[0] = 0;
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    harness.pass();
+    let after = harness.clif.jit_clif_counters();
+    assert!(
+        after.linked_transfers > before.linked_transfers,
+        "the fall-through edge must transfer natively: {after:#?}"
+    );
+}
+
+/// The SMC mid-chain probe (design section 10, pinning section 6's invariant directly): with
+/// A linked to B, invalidating B's bytes BEFORE the next entry hides B's portal to the
+/// sentinel descriptor, so the next A transfer lands in the resolver trampoline (an
+/// unresolved exit, NEVER a stale jump), the dispatcher re-enters and recompiles B, and the
+/// SAME cell relinks through `resolve_waiting` on B's reinstall.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_smc_on_target_lands_in_the_trampoline_then_relinks() {
+    let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xeb, 0x0a];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(&[0x43, 0x29, 0xc8, 0xf4]);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..4 {
+        harness.pass();
+    }
+    let warmed = harness.clif.jit_clif_counters();
+    assert!(warmed.linked_transfers > 0, "{warmed:#?}");
+
+    // Invalidate B's bytes out-of-band on BOTH arms (a same-length rewrite: inc ebx
+    // becomes inc edx at 0x1010), mirroring a device/SMC write between entries.
+    harness.memory[0x1010] = 0x42;
+    for (cpu, bus) in [
+        (&mut harness.interp, &mut harness.interp_bus),
+        (&mut harness.clif, &mut harness.clif_bus),
+    ] {
+        bus.memory[0x1010] = 0x42;
+        cpu.note_device_memory_write_range(0x1010, 1);
+    }
+    let before = harness.clif.jit_clif_counters();
+    harness.pass();
+    let after = harness.clif.jit_clif_counters();
+    // Hiding B republished the sentinel-descriptor address into B's portal, so A's
+    // `has_link` is now false and A runs ALONE at quota 1 (Direct's own retire-and-hide
+    // shape): no transfer into the freed target, no stale jump. State stays byte-identical
+    // because the interpreter retires B's rewritten bytes canonically.
+    assert_eq!(
+        after.linked_transfers, before.linked_transfers,
+        "the hidden edge must not transfer into the retired target: {after:#?}"
+    );
+    // B recompiles and the SAME cell relinks through resolve_waiting: transfers flow again.
+    for _ in 0..4 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    harness.pass();
+    let after = harness.clif.jit_clif_counters();
+    assert!(
+        after.linked_transfers > before.linked_transfers,
+        "the rewritten target must relink after recompile: {after:#?}"
+    );
+}
+
+/// Quota exhaustion yields to the Machine (the device-free two-unit spin): A-Jmp-B and
+/// B-Jmp-A link into a cycle with no I/O anywhere; every budgeted call returns on schedule
+/// (the quota, not a halt, ends the native excursion) and the arms stay byte-identical in
+/// state and charged clocks throughout.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_two_unit_spin_yields_on_quota() {
+    // 0x1000: nop; A at 0x1001: inc eax; jmp +9 -> B at 0x100d: inc ebx; jmp -15 -> A.
+    // (A's jmp is at 0x1002 ending 0x1004, so +9 lands 0x100d; B's jmp is at 0x100e
+    // ending 0x1010, so -15 lands 0x1001, back at A.)
+    let mut code = vec![0x90, 0x40, 0xeb, 0x09];
+    code.resize(0xd, 0x90);
+    code.extend_from_slice(&[0x43, 0xeb, 0xf1]);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    // The spin never halts: budgeted passes only. At a chain-admitting cap the quota
+    // admits many hops, so the cycle chains natively and the quota (never a halt) is what
+    // returns control to the Machine on schedule; state and charged clocks stay
+    // byte-identical throughout.
+    harness.budgeted_pass(4, 4096);
+    harness.budgeted_pass(8, 4096);
+    let counters = harness.clif.jit_clif_counters();
+    assert!(
+        counters.linked_transfers > 0,
+        "the cycle must chain natively at a chain-admitting cap: {counters:#?}"
+    );
+    assert!(counters.entries > 0);
+}
+
+/// The B2 alignment pin (section 8b's G9 row): under `alignment_armed && cpl == 3` a
+/// chain-eligible entry resolves to quota = 1, so the edge yields EXHAUSTED before any
+/// transfer and the dispatcher round-trips between units; state stays byte-identical and
+/// no linked transfer ever happens while armed.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_alignment_armed_cpl3_forces_quota_one() {
+    let entry = 0x1000u32;
+    let ring3_cpu = || {
+        let mut cpu = generated_cpu(GswMode::Gsw586);
+        cpu.control.cr0 |= CR0_PG | CR0_WP;
+        cpu.control.cr3 = 0x3000;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0b,
+                base: 0,
+                limit: u32::MAX,
+                access: 0xfb,
+                default_size_32: true,
+            },
+        );
+        for segment in [
+            SegmentIndex::Ds,
+            SegmentIndex::Ss,
+            SegmentIndex::Es,
+            SegmentIndex::Fs,
+            SegmentIndex::Gs,
+        ] {
+            cpu.registers.set_segment(
+                segment,
+                SegmentRegister {
+                    selector: 0x13,
+                    base: 0,
+                    limit: u32::MAX,
+                    access: 0xf3,
+                    default_size_32: true,
+                },
+            );
+        }
+        cpu.cpl = 3;
+        cpu
+    };
+    // nop; A: inc eax; jmp +9 -> B at 0x100d: inc ebx; hlt. No wide accesses anywhere, so
+    // the G9 entry reject does not fire and the chain gate is what is being pinned.
+    let mut code = vec![0x90, 0x40, 0xeb, 0x09];
+    code.resize(0xd, 0x90);
+    code.extend_from_slice(&[0x43, 0xf4]);
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+    memory[0x3000..0x3004].copy_from_slice(&0x4007u32.to_le_bytes());
+    for page in 0..32u32 {
+        let pte = (page << 12) | 7;
+        let offset = 0x4000 + page as usize * 4;
+        memory[offset..offset + 4].copy_from_slice(&pte.to_le_bytes());
+    }
+    let mut interp = ring3_cpu();
+    let mut clif = ring3_cpu();
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let pass = |interp: &mut CpuGsw,
+                clif: &mut CpuGsw,
+                interp_bus: &mut TestBus,
+                clif_bus: &mut TestBus,
+                armed: bool| {
+        let mut results: Vec<Result<(), CpuError>> = Vec::new();
+        for (cpu, bus) in [
+            (&mut *interp, &mut *interp_bus),
+            (&mut *clif, &mut *clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&memory);
+            bus.trace.clear();
+            cpu.alignment_armed = armed;
+            cpu.halted = false;
+            cpu.registers.gpr = forced_gpr();
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            // HLT is privileged: at CPL3 the pass ends in the same delivered-fault error
+            // on both arms (no IDT), which is the deterministic stopping point here.
+            let mut outcome = Ok(());
+            for _ in 0..64 {
+                match cpu.run_budgeted(bus, 4096) {
+                    Ok(o) if o.halted => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            results.push(outcome);
+        }
+        assert_eq!(results[0], results[1], "outcome differs");
+        assert_eq!(clif.registers, interp.registers);
+        assert_eq!(clif.eflags(), interp.eflags());
+        assert_eq!(clif_bus.memory, interp_bus.memory);
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+    };
+    // Warm unarmed: the chain links and transfers.
+    for _ in 0..4 {
+        pass(
+            &mut interp,
+            &mut clif,
+            &mut interp_bus,
+            &mut clif_bus,
+            false,
+        );
+    }
+    assert!(clif.jit_clif_counters().linked_transfers > 0);
+    // Armed: quota = 1, no transfer, byte-identical through the dispatcher round-trip.
+    let before = clif.jit_clif_counters();
+    pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus, true);
+    let after = clif.jit_clif_counters();
+    assert_eq!(
+        after.linked_transfers, before.linked_transfers,
+        "alignment-armed CPL3 must force quota = 1 (no inline transfer): {after:#?}"
+    );
+    assert!(after.entries > before.entries);
+}
+
+/// The N2 x87-parity pin: an integer unit's edge into an x87-BEARING unit never links
+/// (Direct refuses the same edge via its `has_x87` equality), so the hop stays a sentinel
+/// trip forever while state remains byte-identical; the chain-bound switch is therefore
+/// exact by construction.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_x87_parity_refuses_mixed_links() {
+    // nop; A: inc eax; jmp +9 -> B at 0x100d: fld st0; fstp st0; hlt (an x87-bearing unit).
+    let mut code = vec![0x90, 0x40, 0xeb, 0x09];
+    code.resize(0xd, 0x90);
+    code.extend_from_slice(&[0xd9, 0xc0, 0xdd, 0xd8, 0xf4]);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..4 {
+        harness.pass();
+    }
+    harness.pass();
+    let after = harness.clif.jit_clif_counters();
+    // The refused edge never links: `has_link` stays false, so the entry gets quota = 1
+    // and A yields to the dispatcher without a transfer, exactly as Direct's own
+    // has_x87-inequality refusal leaves the two blocks unlinked. Both units still run
+    // (entries climb), byte-identically, but no linked transfer ever happens.
+    assert_eq!(
+        after.linked_transfers, 0,
+        "an integer-to-x87 edge must never link (N2 parity): {after:#?}"
+    );
+    assert!(after.entries > 0);
+}
+
+/// The three-unit chain sweep (the clif arm of the Direct three-block-chain shape): A-Jmp-B
+/// -Jmp-C across the same cap sweep, asserting at least two linked transfers accumulate
+/// and byte-identity holds at every cap.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_three_units_aggregate_across_event_caps() {
+    // nop; A: inc eax; jmp +9 -> B at 0x100d: inc ebx; jmp +7 -> C at 0x1017: inc ecx;
+    // hlt. (A's jmp@0x1002 ends 0x1004, +9 = 0x100d; B's jmp@0x100e ends 0x1010, +7 =
+    // 0x1017.)
+    let mut code = vec![0x90, 0x40, 0xeb, 0x09];
+    code.resize(0xd, 0x90);
+    code.extend_from_slice(&[0x43, 0xeb, 0x07]);
+    code.resize(0x17, 0x90);
+    code.extend_from_slice(&[0x41, 0xf4]);
+    // One harness swept across the caps (Direct's aggregate shape): the warmed chain
+    // accumulates linked transfers across the sweep, byte-identically at every cap. Small
+    // caps yield quota = 1 (exactly as Direct's own conservative per-hop bound), so the
+    // transfers accumulate at the chain-admitting caps.
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for cap in [1u64, 7, 31, 127, 511, 4096] {
+        for _ in 0..4 {
+            for (cpu, bus) in [
+                (&mut harness.interp, &mut harness.interp_bus),
+                (&mut harness.clif, &mut harness.clif_bus),
+            ] {
+                bus.memory.copy_from_slice(&harness.memory);
+                bus.trace.clear();
+                cpu.halted = false;
+                cpu.registers.gpr = harness.gpr;
+                cpu.registers.eflags = 0x202;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.set_eip(harness.entry);
+                cpu.elapsed_clocks = 0;
+                cpu.core_clocks_so_far = 0;
+                cpu.timing_rem = 0;
+                while !cpu.run_budgeted(bus, cap).expect("runs").halted {}
+            }
+            harness.compare("cap sweep");
+        }
+    }
+    let counters = harness.clif.jit_clif_counters();
+    assert!(
+        counters.linked_transfers >= 2,
+        "the warmed three-unit chain must aggregate at least two transfers across the \
+         cap sweep: {counters:#?}"
     );
 }

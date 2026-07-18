@@ -10,11 +10,13 @@
 //! side-exits at the first non-lowered slot, which the interpreter retires.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::super::code_watch::NativeCodeWatch;
 use super::super::direct::{
     self, DirectKind, MAX_BLOCK_INSTRUCTIONS, SegmentLayout, SmcHeatMap, UnitTerminal,
 };
+use super::super::links::{BlockPortal, LinkCell, LinkSource, LinkTarget};
 use crate::{CpuGsw, CpuPersona, OperandSize, Prefixes, U32BuildHasher};
 
 /// The clif hotness threshold (P4): an independent per-decode-line counter at Direct's
@@ -117,6 +119,15 @@ pub(crate) struct ClifUnitDescriptor {
     pub(crate) cum_access_before: [ClifAccessCounts; MAX_BLOCK_INSTRUCTIONS],
     /// The full leading run's access counts (the normal full-run charge).
     pub(crate) access_total: ClifAccessCounts,
+    /// C1d: the leading run ends in a natively-retired `Jmp`/`Jcc` terminal, so a normal
+    /// full-run exit lands at a FRESH target instruction (Direct's `Run` continuation
+    /// shape: no interpret-one-first skip) rather than at an un-retired stop slot.
+    pub(crate) terminal: bool,
+    /// C1d (design section 3.6/M2): the statically-known link targets of the terminal
+    /// `Jmp`/`Jcc` edges. Slot 0 the taken/only edge, slot 1 the `Jcc` not-taken
+    /// fall-through, matching Direct's two-successor convention. A self-referential taken
+    /// edge stores `None` (it never links in C1d; the edge stays a side exit).
+    pub(crate) successors: [Option<LinkTarget>; 2],
 }
 
 /// Per-width static memory access counts for one unit prefix, the clif mirror of the six
@@ -179,7 +190,28 @@ impl ClifUnitDescriptor {
             lowered_total: 0,
             cum_access_before: [ClifAccessCounts::default(); MAX_BLOCK_INSTRUCTIONS],
             access_total: ClifAccessCounts::default(),
+            terminal: false,
+            successors: [None; 2],
         }
+    }
+
+    /// C1d's clif `link_compatible` (design section 8b as amended by N2): equal mode key,
+    /// equal CPL model, x87 PARITY on `x87_mask != 0` (Direct's `has_x87` equality clause
+    /// mirrored; the TOP clauses stay dropped because clif bakes no TOP assumption, the
+    /// recorded G5 omission), and full CS plus full data-segment equality. Subsumes the
+    /// per-entry guards G4m/G6/G7/G8/G10 for linked transfers per the section 8b table.
+    pub(crate) fn link_compatible(&self, target: &Self) -> bool {
+        self.key.mode_key == target.key.mode_key
+            && self.memory_cpl3 == target.memory_cpl3
+            && (self.x87_mask != 0) == (target.x87_mask != 0)
+            && self.segment_layout.link_compatible(target.segment_layout)
+    }
+
+    /// G8 chain form (design section 8): all six segments regardless of use, because a
+    /// resolved chain validates every body reachable through this unit's own link cells,
+    /// not only the segments this unit's own instructions touched.
+    pub(crate) fn chain_descriptors_match(&self, cpu: &CpuGsw) -> bool {
+        self.segment_layout.all_data_matches(cpu)
     }
 
     /// G6: full CS descriptor equality, not selector-only (mirrors
@@ -210,6 +242,10 @@ pub(crate) struct UnitLayout {
     /// Per-slot operand-immediate and addressing-displacement lanes (`[2 * i]` /
     /// `[2 * i + 1]`), populating the descriptor's operand table.
     pub(crate) operands: [u32; 2 * MAX_BLOCK_INSTRUCTIONS],
+    /// C1d: the terminal's static link targets (design section 3.6), slot 0 taken/only,
+    /// slot 1 the `Jcc` fall-through; `None` for self-referential edges and non-linking
+    /// terminals.
+    pub(crate) successors: [Option<LinkTarget>; 2],
 }
 
 /// Forward-decode a unit from the hot root, terminating on the four terminal kinds
@@ -230,6 +266,8 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
     let mut write_segments = 0u8;
     let mut kinds = Vec::new();
     let mut operands = [0u32; 2 * MAX_BLOCK_INSTRUCTIONS];
+    let mut successors: [Option<LinkTarget>; 2] = [None; 2];
+    let mode_key = cpu.jit_mode_key();
     // The word-form prefix acceptance and 586 gate mirror Direct's compile loop exactly
     // (`compile_with_instruction_limit`'s `prefixes_supported` and persona checks): a word
     // form is exactly one operand-size override, admitted only on the I586 persona.
@@ -283,9 +321,28 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         match step.terminal {
             Some(UnitTerminal::Jcc { taken_delta }) => {
                 is_self_loop = taken_delta == 0;
+                // Slot 0 the taken edge (None when self-referential, the m2 rule: that
+                // edge never links and stays a side exit), slot 1 the fall-through.
+                successors[0] = (taken_delta != 0).then_some(LinkTarget {
+                    linear: entry_lin.wrapping_add(taken_delta),
+                    mode_key,
+                });
+                successors[1] = Some(LinkTarget {
+                    linear: lin,
+                    mode_key,
+                });
                 break;
             }
-            Some(UnitTerminal::Jmp | UnitTerminal::Call | UnitTerminal::Ret) => break,
+            Some(UnitTerminal::Jmp) => {
+                if let DirectKind::Jmp { target_delta } = step.kind {
+                    successors[0] = (target_delta != 0).then_some(LinkTarget {
+                        linear: entry_lin.wrapping_add(target_delta),
+                        mode_key,
+                    });
+                }
+                break;
+            }
+            Some(UnitTerminal::Call | UnitTerminal::Ret) => break,
             None => {}
         }
     }
@@ -302,6 +359,7 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         write_segments,
         kinds,
         operands,
+        successors,
     })
 }
 
@@ -382,7 +440,35 @@ pub(crate) enum ClifUnitState {
 #[derive(Default)]
 pub(crate) struct ClifUnitCache {
     entries: HashMap<ClifUnitKey, ClifUnitState, U32BuildHasher>,
-    units: Vec<ClifUnitDescriptor>,
+    /// Boxed for ADDRESS STABILITY across Vec reallocation (C1d design M1: Box, not Arc;
+    /// the cache stays sole owner, and the retire discipline orders every teardown so no
+    /// dangling window needs shared ownership): portals publish descriptor ADDRESSES as
+    /// landing records, so a descriptor must never move while a portal can name it. The
+    /// `Vec<Box<..>>` is the point: `Vec<T>` would move the descriptors on realloc,
+    /// dangling every published portal body.
+    #[allow(clippy::vec_box)]
+    units: Vec<Box<ClifUnitDescriptor>>,
+    /// Whether the unit at each index is still reachable (retire clears this; the Vec is
+    /// append-only within a generation, so indices stay stable).
+    live: Vec<bool>,
+    /// C1d link bookkeeping, the clif-owned instances of the shared `links` vocabulary
+    /// (design section 5.2: the tables stay per-backend; only the types are shared).
+    portals: Vec<Arc<BlockPortal>>,
+    cells: Vec<[Arc<LinkCell>; 2]>,
+    outbound: Vec<[Option<u32>; 2]>,
+    inbound: HashMap<u32, Vec<LinkSource<u32>>>,
+    waiting: HashMap<LinkTarget, Vec<LinkSource<u32>>>,
+    linear_units: HashMap<LinkTarget, u32>,
+    /// The clif sentinel PORTAL (design section 3.3b): its `body` permanently holds the
+    /// backend's sentinel-descriptor address; every fresh cell points here (N1a) and every
+    /// hide republishes through it. Created on first link-bearing install, torn down with
+    /// the rest of the bookkeeping on `clear` (N1b: a new backend generation gets a new
+    /// sentinel).
+    sentinel_portal: Option<Arc<BlockPortal>>,
+    /// The current backend generation's sentinel-descriptor address (the clif linked-ness
+    /// predicate compares against THIS, never against zero, per the links module's
+    /// mechanism-neutrality contract).
+    sentinel_addr: usize,
     /// Invalidation generation (review finding B1): bumped whenever a unit dies (a code
     /// write overlapping compiled spans, or a wholesale clear). `run_clif_unit` snapshots
     /// it before entering a unit; the call-out shim's exit latch compares live vs snapshot
@@ -405,6 +491,10 @@ impl ClifUnitCache {
     }
 
     pub(crate) fn park_dormant(&mut self, key: ClifUnitKey) {
+        debug_assert!(
+            matches!(self.entries.get(&key), Some(ClifUnitState::Seen) | None),
+            "park_dormant called on a non-Seen entry"
+        );
         self.entries.insert(key, ClifUnitState::Dormant);
         self.heat_demotions = self.heat_demotions.saturating_add(1);
     }
@@ -444,21 +534,267 @@ impl ClifUnitCache {
         &mut self,
         watch: &mut NativeCodeWatch,
         descriptor: ClifUnitDescriptor,
+        cells: [Arc<LinkCell>; 2],
+        sentinel_addr: usize,
     ) -> Option<u32> {
         if self.entries.get(&descriptor.key) != Some(&ClifUnitState::Seen) {
             return None;
         }
+        debug_assert!(
+            self.sentinel_addr == 0 || self.sentinel_addr == sentinel_addr,
+            "one sentinel descriptor per backend generation"
+        );
+        self.sentinel_addr = sentinel_addr;
         let index = u32::try_from(self.units.len()).ok()?;
         let key = descriptor.key;
         watch.acquire_range(key.physical, u32::from(descriptor.guest_len));
-        self.units.push(descriptor);
+        self.units.push(Box::new(descriptor));
+        self.live.push(true);
+        self.portals.push(Arc::new(BlockPortal::new()));
+        self.cells.push(cells);
+        self.outbound.push([None, None]);
         self.entries.insert(key, ClifUnitState::Compiled(index));
         self.units_admitted = self.units_admitted.saturating_add(1);
+        // The make_link_visible port (direct.rs:1520-1541, minus Direct's link-epoch
+        // machinery, which exists for partial translation invalidation; clif's
+        // invalidations are wholesale per N1(b)): register the landing key, resolve this
+        // unit's own successors, resolve anyone waiting on this key, then publish this
+        // unit's own DESCRIPTOR ADDRESS as the portal body (the landing record, design
+        // section 3.3).
+        let target = LinkTarget {
+            linear: key.linear,
+            mode_key: key.mode_key,
+        };
+        self.linear_units.insert(target, index);
+        self.resolve_successors(index);
+        self.resolve_waiting(target, index);
+        let body = std::ptr::from_ref::<ClifUnitDescriptor>(&*self.units[index as usize]) as usize;
+        self.portals[index as usize].publish(body);
         Some(index)
     }
 
+    /// The clif sentinel portal, created on first use with the backend's sentinel
+    /// descriptor address as its permanent body (design section 3.3b).
+    pub(crate) fn sentinel_portal(&mut self, sentinel_addr: usize) -> Arc<BlockPortal> {
+        debug_assert!(
+            self.sentinel_addr == 0 || self.sentinel_addr == sentinel_addr,
+            "one sentinel descriptor per backend generation"
+        );
+        self.sentinel_addr = sentinel_addr;
+        if self.sentinel_portal.is_none() {
+            let portal = Arc::new(BlockPortal::new());
+            portal.publish(sentinel_addr);
+            self.sentinel_portal = Some(portal);
+        }
+        self.sentinel_portal
+            .clone()
+            .expect("sentinel portal was just created")
+    }
+
+    /// The clif linked-ness predicate (design section 3.3b's consequence bullet): a cell
+    /// is linked when its portal is not the sentinel portal AND the portal body is not the
+    /// sentinel descriptor's address. Never a zero-compare: zero is Direct's mechanism.
+    fn cell_linked(&self, index: usize, slot: usize) -> bool {
+        let Some(cells) = self.cells.get(index) else {
+            return false;
+        };
+        let portal_addr = cells[slot]
+            .portal
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Some(sentinel) = &self.sentinel_portal
+            && portal_addr == sentinel.address()
+        {
+            return false;
+        }
+        // A live cache owns every published portal in stable Arc storage; every cell is
+        // repointed at the sentinel before that storage drops (N1(b)).
+        let body = unsafe { &*(portal_addr as *const BlockPortal) }
+            .body
+            .load(std::sync::atomic::Ordering::Acquire);
+        body != self.sentinel_addr && body != 0
+    }
+
+    /// The dynamic `has_link` predicate for the chain guards (design section 8): does
+    /// either of this unit's outbound cells currently resolve to a linked portal? Mirrors
+    /// Direct's `has_linked_successor` with the sentinel-address comparison.
+    pub(crate) fn has_linked_successor(&self, index: u32) -> bool {
+        self.cell_linked(index as usize, 0) || self.cell_linked(index as usize, 1)
+    }
+
+    /// resolve_successors port (direct.rs:1346-1365): try to link each statically-known
+    /// successor of `source`; queue unresolved edges into `waiting`.
+    fn resolve_successors(&mut self, source: u32) {
+        let successors = self.units[source as usize].successors;
+        for (slot, successor) in successors.into_iter().enumerate() {
+            let Some(successor) = successor else {
+                continue;
+            };
+            if let Some(target) = self.linear_units.get(&successor).copied()
+                && self.try_link(source, slot as u8, target)
+            {
+                continue;
+            }
+            self.waiting.entry(successor).or_default().push(LinkSource {
+                block: source,
+                slot: slot as u8,
+            });
+        }
+    }
+
+    /// resolve_waiting port (direct.rs:1367-1382): link every queued edge waiting on this
+    /// key; keep still-unresolvable live sources queued.
+    fn resolve_waiting(&mut self, key: LinkTarget, target: u32) {
+        let Some(waiting) = self.waiting.remove(&key) else {
+            return;
+        };
+        let mut unresolved = Vec::new();
+        for source in waiting {
+            if !self.try_link(source.block, source.slot, target)
+                && self.live.get(source.block as usize).copied() == Some(true)
+            {
+                unresolved.push(source);
+            }
+        }
+        if !unresolved.is_empty() {
+            self.waiting.insert(key, unresolved);
+        }
+    }
+
+    /// try_link_inner port (direct.rs:1388-1430), static edges only (clif links no dynamic
+    /// RET targets in C1d): both ends live, `link_compatible` (the section 8b subsumption
+    /// clauses), then repoint the cell at the target's portal and record the edge.
+    fn try_link(&mut self, source: u32, slot: u8, target: u32) -> bool {
+        let source_index = source as usize;
+        let target_index = target as usize;
+        if self.live.get(source_index).copied() != Some(true)
+            || self.live.get(target_index).copied() != Some(true)
+            || !self.units[source_index].link_compatible(&self.units[target_index])
+        {
+            return false;
+        }
+        let slot_index = usize::from(slot);
+        if self.outbound[source_index][slot_index] == Some(target) {
+            return true;
+        }
+        self.unlink_outbound(source, slot);
+        self.cells[source_index][slot_index].set(self.portals[target_index].as_ref());
+        self.outbound[source_index][slot_index] = Some(target);
+        self.inbound.entry(target).or_default().push(LinkSource {
+            block: source,
+            slot,
+        });
+        true
+    }
+
+    /// unlink_outbound port (direct.rs:1432-1449), with the N1(a) repoint discipline: a
+    /// clif cell is NEVER left at the zero-portal default, so where Direct calls
+    /// `clear()`, clif repoints at the sentinel portal.
+    fn unlink_outbound(&mut self, source: u32, slot: u8) {
+        let source_index = source as usize;
+        let slot_index = usize::from(slot);
+        let sentinel = self
+            .sentinel_portal
+            .clone()
+            .expect("linked cells exist only after the sentinel portal");
+        let Some(target) = self.outbound[source_index][slot_index].take() else {
+            self.cells[source_index][slot_index].set(sentinel.as_ref());
+            return;
+        };
+        self.cells[source_index][slot_index].set(sentinel.as_ref());
+        if let Some(inbound) = self.inbound.get_mut(&target) {
+            inbound.retain(|link| !(link.block == source && link.slot == slot));
+            if inbound.is_empty() {
+                self.inbound.remove(&target);
+            }
+        }
+    }
+
+    /// unlink_block port (direct.rs:1451-1482): tear down every edge naming `index`, in
+    /// Direct's exact sequence: drop this unit's waiting queue entries, unregister the
+    /// landing key, repoint every inbound predecessor's cell at the sentinel and re-queue
+    /// it into `waiting` when the predecessor still names this successor, then unlink this
+    /// unit's own outbound edges.
+    fn unlink_unit(&mut self, index: u32) {
+        self.remove_waiting_sources(index);
+        let key = self.units[index as usize].key;
+        let target_key = LinkTarget {
+            linear: key.linear,
+            mode_key: key.mode_key,
+        };
+        if self.linear_units.get(&target_key) == Some(&index) {
+            self.linear_units.remove(&target_key);
+        }
+        let sentinel = self
+            .sentinel_portal
+            .clone()
+            .expect("linked cells exist only after the sentinel portal");
+        if let Some(inbound) = self.inbound.remove(&index) {
+            for link in inbound {
+                let source_index = link.block as usize;
+                if self.live.get(source_index).copied() == Some(true) {
+                    self.cells[source_index][usize::from(link.slot)].set(sentinel.as_ref());
+                    self.outbound[source_index][usize::from(link.slot)] = None;
+                    if let Some(successor) =
+                        self.units[source_index].successors[usize::from(link.slot)]
+                    {
+                        self.waiting.entry(successor).or_default().push(link);
+                    }
+                }
+            }
+        }
+        for slot in 0..2 {
+            self.unlink_outbound(index, slot);
+        }
+        self.remove_waiting_sources(index);
+    }
+
+    fn remove_waiting_sources(&mut self, index: u32) {
+        self.waiting.retain(|_, sources| {
+            sources.retain(|source| source.block != index);
+            !sources.is_empty()
+        });
+    }
+
+    /// retire port (direct.rs:1491-1511, the section 7 reversal of the earlier no-retire
+    /// default): hide this unit's own portal by publishing the sentinel descriptor's
+    /// address (ONE Release store hides every inbound edge, design section 3.3b), unlink
+    /// every edge in Direct's sequence, mark the unit dead, and release its watch
+    /// registration. The boxed descriptor stays allocated (M1's address stability: an
+    /// in-flight chain compiled before this call may still hold its address; the portal
+    /// hide is what prevents any FUTURE transfer from landing in it).
+    fn retire_unit(&mut self, watch: &mut NativeCodeWatch, index: u32) {
+        if self.live.get(index as usize).copied() != Some(true) {
+            return;
+        }
+
+        let key = self.units[index as usize].key;
+        let guest_len = self.units[index as usize].guest_len;
+        if self.sentinel_addr != 0 {
+            self.portals[index as usize].publish(self.sentinel_addr);
+            self.unlink_unit(index);
+        }
+        self.live[index as usize] = false;
+        watch.release_range(key.physical, u32::from(guest_len));
+    }
+
+    /// The current backend generation's sentinel-descriptor address (zero before any
+    /// link-bearing install).
+    pub(crate) fn sentinel_descriptor_addr(&self) -> usize {
+        self.sentinel_addr
+    }
+
+    /// Map a landing-record address back to a unit index (the Rust-side resolution of the
+    /// chain trace the compiled thunks record; design section 4.3). Linear over the live
+    /// units, fine at the correctness tier.
+    pub(crate) fn unit_index_by_descriptor_addr(&self, addr: usize) -> Option<u32> {
+        self.units.iter().enumerate().find_map(|(index, unit)| {
+            (std::ptr::from_ref::<ClifUnitDescriptor>(&**unit) as usize == addr)
+                .then_some(index as u32)
+        })
+    }
+
     pub(crate) fn unit(&self, index: u32) -> Option<&ClifUnitDescriptor> {
-        self.units.get(index as usize)
+        self.units.get(index as usize).map(|unit| &**unit)
     }
 
     /// Wholesale drop. Releases every currently-installed unit's watch registration first
@@ -474,13 +810,27 @@ impl ClifUnitCache {
         // double-release ranges an earlier `invalidate_physical_range` already released.
         for state in self.entries.values() {
             if let ClifUnitState::Compiled(index) = state
+                && self.live.get(*index as usize).copied() == Some(true)
                 && let Some(unit) = self.units.get(*index as usize)
             {
                 watch.release_range(unit.key.physical, u32::from(unit.guest_len));
             }
         }
         self.entries.clear();
+        // N1(b): a wholesale reset tears down ALL link bookkeeping together with the
+        // units, never units alone (a reset that left resolved cells standing would leave
+        // portals publishing freed descriptors). The sentinel portal and address go too: a
+        // new backend generation means a new arena, a new trampoline, a new sentinel.
         self.units.clear();
+        self.live.clear();
+        self.portals.clear();
+        self.cells.clear();
+        self.outbound.clear();
+        self.inbound.clear();
+        self.waiting.clear();
+        self.linear_units.clear();
+        self.sentinel_portal = None;
+        self.sentinel_addr = 0;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -507,10 +857,14 @@ impl ClifUnitCache {
         }
         let end = start.saturating_add(len);
         let before = self.entries.len();
-        let units = &self.units;
-        self.entries.retain(|key, state| {
+        // Two passes so the retire-and-unlink sequence (section 7: hide the portal via one
+        // Release store of the sentinel address, repoint and re-queue every inbound
+        // predecessor, unlink outbound, release the watch) runs with full &mut access
+        // BEFORE the entries drop.
+        let mut dying: Vec<(ClifUnitKey, Option<u32>)> = Vec::new();
+        for (key, state) in &self.entries {
             let span = match state {
-                ClifUnitState::Compiled(index) => Self::unit_span(units, *index, *key),
+                ClifUnitState::Compiled(index) => Self::unit_span(&self.units, *index, *key),
                 // Conservative page-overlap drop for non-compiled states (no recorded
                 // guest_len exists for them).
                 ClifUnitState::Seen | ClifUnitState::Dormant => (
@@ -518,15 +872,20 @@ impl ClifUnitCache {
                     (key.physical & !0xfff).saturating_add(0x1000),
                 ),
             };
-            let overlaps = !(span.1 <= start || span.0 >= end);
-            // M5: release the watch registration exactly when a COMPILED unit is the one
-            // dropped, mirroring Direct's `retire_block` releasing on eviction; `Seen`/
-            // `Dormant` keys never acquired a registration in the first place.
-            if overlaps && let ClifUnitState::Compiled(_) = state {
-                watch.release_range(span.0, span.1 - span.0);
+            if !(span.1 <= start || span.0 >= end) {
+                let index = match state {
+                    ClifUnitState::Compiled(index) => Some(*index),
+                    _ => None,
+                };
+                dying.push((*key, index));
             }
-            !overlaps
-        });
+        }
+        for (key, index) in dying {
+            if let Some(index) = index {
+                self.retire_unit(watch, index);
+            }
+            self.entries.remove(&key);
+        }
         if self.entries.len() != before {
             // B1: an in-flight unit whose entry just died must not resume its lowered
             // slots; the generation mismatch trips the call-out exit latch.
@@ -534,7 +893,7 @@ impl ClifUnitCache {
         }
     }
 
-    fn unit_span(units: &[ClifUnitDescriptor], index: u32, key: ClifUnitKey) -> (u32, u32) {
+    fn unit_span(units: &[Box<ClifUnitDescriptor>], index: u32, key: ClifUnitKey) -> (u32, u32) {
         let len = units
             .get(index as usize)
             .map_or(0x1000, |unit| u32::from(unit.guest_len));

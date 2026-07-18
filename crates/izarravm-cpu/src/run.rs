@@ -78,6 +78,22 @@ enum DirectContinuation {
     Interpret,
 }
 
+/// The clif continuation outcome (Track C C1d), mirroring `DirectContinuation`: `Run`
+/// resumes at a fresh instruction (a retired terminal or a chain hop's exact resume
+/// point), `Prefix` requires the interpreter to retire the exit-slot instruction before
+/// re-admission, `Interpret` ran nothing.
+#[cfg(all(
+    feature = "jit",
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+enum ClifContinuation {
+    Run(CycleOutcome),
+    Prefix(CycleOutcome),
+    Interpret,
+}
+
 #[cfg(feature = "jit")]
 enum DirectBlockOutcome {
     NotRun,
@@ -626,19 +642,25 @@ impl CpuGsw {
                             bus_at_entry,
                             cap,
                         };
-                        let ran = self.try_clif_continuation(
+                        match self.try_clif_continuation(
                             bus,
                             lin,
                             cs.default_size_32,
                             continuation_budget,
-                        )?;
-                        // A unit exit lands at a slot the interpreter retires next; skip
-                        // clif once so that retirement happens before any re-admission
-                        // attempt at the exit address (Direct's Prefix skip shape).
-                        if ran.is_some() {
-                            skip_direct_once = true;
+                        )? {
+                            // A completed chain resumes at a fresh instruction: no skip,
+                            // so back-to-back units and chain targets admit immediately
+                            // (Direct's Run shape).
+                            ClifContinuation::Run(outcome) => Some(outcome),
+                            // A stop-slot or failing-slot exit: the interpreter retires
+                            // that instruction before any re-admission at the exit
+                            // address (Direct's Prefix skip shape).
+                            ClifContinuation::Prefix(outcome) => {
+                                skip_direct_once = true;
+                                Some(outcome)
+                            }
+                            ClifContinuation::Interpret => None,
                         }
-                        ran
                     } else {
                         None
                     };
@@ -1119,20 +1141,20 @@ impl CpuGsw {
         lin: u32,
         d: bool,
         budget: ContinuationBudget,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
+    ) -> Result<ClifContinuation, CpuError> {
         if !self
             .decode_cache
             .clif_hot(lin, d, jit::clif::cache::CLIF_DEFAULT_ADMISSION_HEAT)
         {
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         let Some(key) = jit::clif::cache::clif_key_for(self, lin, d) else {
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         };
         let unit_index = match self.jit_direct.clif_units.state(key) {
             None => {
                 self.jit_direct.clif_units.note_seen(key);
-                return Ok(None);
+                return Ok(ClifContinuation::Interpret);
             }
             Some(jit::clif::cache::ClifUnitState::Dormant) => {
                 // G1 recovery: a heat-demoted Dormant whose entry-chunk stamp aged out lifts
@@ -1142,7 +1164,7 @@ impl CpuGsw {
                 let jit = &mut *self.jit_direct;
                 jit.clif_units
                     .lift_cold_dormant(&mut jit.smc_heat, key, heat_epoch);
-                return Ok(None);
+                return Ok(ClifContinuation::Interpret);
             }
             Some(jit::clif::cache::ClifUnitState::Compiled(index)) => index,
             Some(jit::clif::cache::ClifUnitState::Seen) => {
@@ -1154,12 +1176,12 @@ impl CpuGsw {
                     jit.smc_heat.bump(key.physical, 1, heat_epoch);
                     jit.clif_units.park_dormant(key);
                     self.perf.smc_heat_demotions += 1;
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 }
                 let Some(layout) = jit::clif::cache::walk_unit(self, key.linear, d) else {
                     // A cold or structurally unclassifiable entry: nothing to admit yet, try
                     // again once the decode cache has warmed enough lines to walk one unit.
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 };
                 // The unit executes its leading run of lowerable slots natively (Track C
                 // C1b); a unit with nothing lowerable at its entry parks Dormant and stays
@@ -1168,7 +1190,7 @@ impl CpuGsw {
                 let plan = jit::clif::lower::plan_unit(&layout.kinds, true);
                 if plan.leading == 0 {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 }
                 self.jit_clif.compile_attempts += 1;
                 // G4 dynamic half (dev_docs/specs/2026-07-15-smc-hardening-design.md): the
@@ -1184,7 +1206,7 @@ impl CpuGsw {
                 });
                 if !code_page_covers_unit {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 }
                 // G1 pre-install gate (full span).
                 if self.jit_direct.smc_heat.span_hot(
@@ -1196,7 +1218,7 @@ impl CpuGsw {
                     jit.smc_heat.bump(key.physical, 1, heat_epoch);
                     jit.clif_units.park_dormant(key);
                     self.perf.smc_heat_demotions += 1;
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 }
                 let Some(segment_layout) = jit::direct::SegmentLayout::capture(
                     self,
@@ -1204,7 +1226,7 @@ impl CpuGsw {
                     layout.write_segments,
                 ) else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 };
                 let memory_cpl3 = self.current_privilege_level() == 3;
                 let entry_eip = key.linear.wrapping_sub(self.registers.cs().base);
@@ -1216,7 +1238,7 @@ impl CpuGsw {
                 let has_memory = !plan.access_total.is_zero();
                 let map = if has_memory {
                     let Some(map) = self.jit_fast_map.native_bases() else {
-                        return Ok(None);
+                        return Ok(ClifContinuation::Interpret);
                     };
                     Some(map)
                 } else {
@@ -1234,13 +1256,44 @@ impl CpuGsw {
                     // Stable for the CPU's lifetime: one Box<JitState>, and clones drop
                     // every compiled unit, so no unit outlives its baked pointer.
                     mode13_lanes: std::ptr::from_mut(&mut self.jit_direct.clif_run.mode13) as usize,
+                    chain_lanes: std::ptr::from_mut(&mut self.jit_direct.clif_run.chain) as usize,
+                    // Placeholder; the cells exist just below, before compile.
+                    cell_addrs: [0; 2],
                 };
                 if self.jit_direct.clif_backend.is_none() {
                     self.jit_direct.clif_backend = jit::clif::ClifBackend::new();
                 }
                 let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
+                };
+                // C1d: the sentinel descriptor and portal exist before any cell is
+                // created, and fresh cells are IMMEDIATELY repointed at the sentinel
+                // portal (N1a: a clif cell must never sit at the zero-portal default,
+                // because the branch-free thunk would dereference the zero body as a
+                // descriptor address).
+                let Some(sentinel_addr) = backend
+                    .sentinel_descriptor()
+                    .map(|sentinel| std::ptr::from_ref(sentinel) as usize)
+                else {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(ClifContinuation::Interpret);
+                };
+                let sentinel_portal = self.jit_direct.clif_units.sentinel_portal(sentinel_addr);
+                let cells = [
+                    std::sync::Arc::new(jit::links::LinkCell::new()),
+                    std::sync::Arc::new(jit::links::LinkCell::new()),
+                ];
+                for cell in &cells {
+                    cell.set(sentinel_portal.as_ref());
+                }
+                let mem_context = jit::clif::lower::UnitMemoryContext {
+                    cell_addrs: [cells[0].address(), cells[1].address()],
+                    ..mem_context
+                };
+                let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
+                    self.jit_direct.clif_units.dormant(key);
+                    return Ok(ClifContinuation::Interpret);
                 };
                 let compile_start = std::time::Instant::now();
                 let compiled =
@@ -1249,7 +1302,7 @@ impl CpuGsw {
                     compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                 let Some(entry) = compiled else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 };
                 let descriptor = jit::clif::cache::ClifUnitDescriptor {
                     key,
@@ -1270,19 +1323,24 @@ impl CpuGsw {
                     lowered_total: plan.lowered_total,
                     cum_access_before: plan.cum_access_before,
                     access_total: plan.access_total,
+                    terminal: plan.terminal,
+                    successors: layout.successors,
                 };
-                let Some(index) = self.jit_direct.clif_install(descriptor) else {
+                let Some(index) = self
+                    .jit_direct
+                    .clif_install(descriptor, cells, sentinel_addr)
+                else {
                     self.jit_direct.clif_units.dormant(key);
-                    return Ok(None);
+                    return Ok(ClifContinuation::Interpret);
                 };
                 self.jit_clif.units_installed += 1;
                 index
             }
         };
         let Some(unit) = self.jit_direct.clif_units.unit(unit_index).cloned() else {
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         };
-        self.run_clif_unit(bus, &unit, budget)
+        self.run_clif_unit(bus, &unit, unit_index, budget)
     }
 
     /// The per-entry dynamic guards, in Direct's order (`run_direct_block`, plan section
@@ -1311,39 +1369,51 @@ impl CpuGsw {
         &mut self,
         bus: &mut B,
         unit: &jit::clif::cache::ClifUnitDescriptor,
+        unit_index: u32,
         budget: ContinuationBudget,
-    ) -> Result<Option<CycleOutcome>, CpuError> {
+    ) -> Result<ClifContinuation, CpuError> {
         if self.profile.enabled || diff_trace_enabled() {
             self.jit_clif.reject_observer += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         if self.interrupt_shadow {
             self.jit_clif.reject_interrupt_shadow += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         if !bus.native_aggregate_accounting_allowed() {
             self.jit_clif.reject_aggregate_accounting += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         if unit.key.mode_key != self.jit_mode_key() {
             self.jit_clif.reject_mode_key += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         if !unit.cs_descriptor_matches(self) {
             self.jit_clif.reject_cs_layout += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         if unit.memory_cpl3 != (self.current_privilege_level() == 3) {
             self.jit_clif.reject_cpl += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
-        if !unit.data_descriptors_match(self) {
+        // G8, chain form when this unit has a live linked successor (design section 8):
+        // a resolved chain validates every body reachable through this unit's own cells,
+        // so ALL six data segments must match, not only the used ones. `has_link` is
+        // DYNAMIC (the successor may not have existed when this unit compiled): the cell
+        // is linked when its portal body is not the sentinel descriptor's address.
+        let has_link = self.jit_direct.clif_units.has_linked_successor(unit_index);
+        if has_link {
+            if !unit.chain_descriptors_match(self) {
+                self.jit_clif.reject_data_segment += 1;
+                return Ok(ClifContinuation::Interpret);
+            }
+        } else if !unit.data_descriptors_match(self) {
             self.jit_clif.reject_data_segment += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         if unit.has_wide_accesses && self.alignment_armed && self.current_privilege_level() == 3 {
             self.jit_clif.reject_alignment += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         let eip = self.registers.eip;
         let fetch_last = u32::from(unit.guest_len) - 1;
@@ -1355,7 +1425,7 @@ impl CpuGsw {
             .is_none_or(|last_start| eip > last_start)
         {
             self.jit_clif.reject_fetch_limit += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
         // B1: one iteration must fit under the cap (Direct's quota shape with the chain
         // count pinned at 1: no linking and no native self-loop repetition, so the only
@@ -1400,25 +1470,62 @@ impl CpuGsw {
             .saturating_sub(budget.bus_at_entry);
         let used = budget.total.saturating_add(bus_growth);
         let available = budget.cap.saturating_sub(used).saturating_sub(1);
-        if available.checked_div(iteration_upper).unwrap_or(u64::MAX) == 0 {
+        let budget_quota = available.checked_div(iteration_upper).unwrap_or(u64::MAX);
+        if budget_quota == 0 {
             self.jit_clif.reject_zero_budget += 1;
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         }
+        // C1d: the linked-transfer quota, Direct's exact formula (run.rs's chain arm). The
+        // B2/G9 gate: an alignment-armed CPL3 entry is never chain-eligible and gets
+        // exactly one unit, so a dispatcher round-trip re-checks G9 before any successor
+        // runs. The per-hop bound switches on the ENTRY unit's x87-bearing-ness; the N2
+        // x87-parity link clause makes mixed chains unreachable, so the switch is exact by
+        // construction.
+        let chain_eligible =
+            has_link && !(self.alignment_armed && self.current_privilege_level() == 3);
+        let quota: u64 = if !chain_eligible {
+            1
+        } else {
+            let unscaled_max_core = if unit.x87_mask != 0 {
+                jit::direct::MAX_X87_BLOCK_CORE_CLOCKS
+            } else {
+                4u64.saturating_mul(jit::direct::MAX_BLOCK_INSTRUCTIONS as u64) + 6
+            };
+            let max_core = unscaled_max_core
+                .saturating_mul(u64::from(num))
+                .saturating_add(u64::from(den) - 1)
+                / u64::from(den);
+            let max_read = dword_data_upper.max(word_data_upper).max(byte_data_upper);
+            let max_store = max_read;
+            let global_raw_bus_upper = (jit::direct::MAX_BLOCK_INSTRUCTIONS as u64).saturating_mul(
+                bus.jit_fetch_cost_clocks()
+                    .saturating_add(max_read)
+                    .saturating_add(max_store),
+            );
+            let global_block_upper =
+                max_core.saturating_add(bus.jit_scale_bus_cost_upper(global_raw_bus_upper));
+            let additional = available
+                .saturating_sub(iteration_upper)
+                .checked_div(global_block_upper)
+                .unwrap_or(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1);
+            1 + additional.min(jit::direct::MAX_CHAIN_BLOCKS as u64 - 1)
+        };
 
         // Guards passed. Stash the N1 key-material snapshot and reset the per-entry
         // call-out scratch, then enter the compiled unit through the widened adapter with
         // this call's monomorphized shim table as a stack local (design section 1.3).
         let Some(backend) = self.jit_direct.clif_backend.as_mut() else {
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         };
         let Some(adapter) = backend.callout_adapter() else {
-            return Ok(None);
+            return Ok(ClifContinuation::Interpret);
         };
         self.jit_direct.clif_run.pending_hard_error = None;
         self.jit_direct.clif_run.caught_panic = None;
         self.jit_direct.clif_run.last_callout_eip = 0;
         self.jit_direct.clif_run.callout_core_clocks = 0;
         self.jit_direct.clif_run.mode13 = Default::default();
+        self.jit_direct.clif_run.chain.transfers = 0;
         self.jit_direct.clif_run.snapshot_mode_key = self.jit_mode_key();
         self.jit_direct.clif_run.snapshot_cpl = self.current_privilege_level();
         self.jit_direct.clif_run.snapshot_cs = self.registers.cs();
@@ -1441,10 +1548,7 @@ impl CpuGsw {
                 std::ptr::from_mut(bus).cast(),
                 &table,
                 unit.operands.as_ptr(),
-                // C1d ABI: the linked-transfer quota. The single-unit path passes 1 (no
-                // transfers exist yet, so the value is received and never consumed),
-                // preserving pre-chain behavior exactly until C1d-main wires real chains.
-                1,
+                quota,
                 entry_ptr,
             )
         };
@@ -1455,93 +1559,200 @@ impl CpuGsw {
             std::panic::resume_unwind(panic);
         }
 
-        // Map the exit back to its slot for prefix charging: a normal side exit ran the
-        // whole leading run; a memory-check side exit carries its failing slot in the
-        // disposition (C1c, the distinct-code shape the question ledger leaned to); a
-        // call-out Exit/HardStop stopped at the recorded site.
-        let entry_eip = unit
+        // C1d: resolve the chain the thunks recorded (design section 4.3). Every trace
+        // entry is a landing record the transfer loaded from a portal: a live descriptor
+        // address, or the sentinel descriptor for an unresolved/hidden edge (necessarily
+        // the LAST entry, since the trampoline performs no further hops). Units that
+        // PERFORMED a transfer ran their full leading run; only the chain's final real
+        // unit can stop mid-run, and its stop decodes from the disposition exactly as a
+        // single unit's always has.
+        let transfers = self.jit_direct.clif_run.chain.transfers as usize;
+        debug_assert!(
+            (transfers as u64) < quota,
+            "the run.rs:1897 invariant shape"
+        );
+        let sentinel_addr = self.jit_direct.clif_units.sentinel_descriptor_addr();
+        let mut hop_indices: Vec<u32> = Vec::with_capacity(transfers);
+        let mut unresolved_hop = false;
+        for i in 0..transfers {
+            let body = self.jit_direct.clif_run.chain.trace[i];
+            if body == sentinel_addr {
+                debug_assert_eq!(i + 1, transfers, "the sentinel hop ends the chain");
+                unresolved_hop = true;
+                break;
+            }
+            let index = self
+                .jit_direct
+                .clif_units
+                .unit_index_by_descriptor_addr(body)
+                .expect("a chain trace entry names a live descriptor");
+            hop_indices.push(index);
+        }
+        let completed_transfers = hop_indices.len() as u64;
+        let final_unit_owned;
+        let final_unit: &jit::clif::cache::ClifUnitDescriptor =
+            if let Some(&last) = hop_indices.last() {
+                final_unit_owned = self
+                    .jit_direct
+                    .clif_units
+                    .unit(last)
+                    .cloned()
+                    .expect("the chain's final unit is live");
+                &final_unit_owned
+            } else {
+                unit
+            };
+        // The fully-run set: the entry unit whenever ANY hop happened (a unit only reaches
+        // its transfer thunk after its whole leading run retired, section 6.3's invariant),
+        // plus every hop target that itself hopped onward; a sentinel landing means the
+        // last REAL unit also ran fully. `full_prefix` excludes the final unit, whose
+        // charge the disposition decides below.
+        let mut full_prefix: Vec<u32> = Vec::new();
+        if !hop_indices.is_empty() || unresolved_hop {
+            full_prefix.push(unit_index);
+        }
+        if !hop_indices.is_empty() {
+            let keep = hop_indices.len() - usize::from(!unresolved_hop);
+            full_prefix.extend_from_slice(&hop_indices[..keep]);
+        }
+        let final_ran_fully = unresolved_hop
+            || disposition == jit::clif::callout::CLIF_CALLOUT_CONTINUE
+            || disposition == jit::clif::callout::CLIF_CHAIN_QUOTA_EXHAUSTED
+            || disposition == jit::clif::callout::CLIF_CHAIN_UNRESOLVED;
+        // Sum the fully-run prefix units' static profiles (each unit's own full totals,
+        // the additive generalization of the single-unit charge).
+        let mut prefix_raw = 0u64;
+        let mut prefix_lowered = 0u64;
+        let mut acc = [0u64; 6];
+        let mut replay: Vec<(u32, [u8; jit::direct::MAX_BLOCK_INSTRUCTIONS], u32, usize)> =
+            Vec::with_capacity(full_prefix.len() + 1);
+        for &index in &full_prefix {
+            let hop = self
+                .jit_direct
+                .clif_units
+                .unit(index)
+                .expect("a fully-run chain unit is live");
+            prefix_raw += u64::from(hop.raw_clocks_total);
+            prefix_lowered += u64::from(hop.lowered_total);
+            acc[0] += u64::from(hop.access_total.byte_reads);
+            acc[1] += u64::from(hop.access_total.word_reads);
+            acc[2] += u64::from(hop.access_total.dword_reads);
+            acc[3] += u64::from(hop.access_total.byte_stores);
+            acc[4] += u64::from(hop.access_total.word_stores);
+            acc[5] += u64::from(hop.access_total.dword_stores);
+            replay.push((
+                hop.key.linear,
+                hop.fetch_lens,
+                hop.x87_mask,
+                hop.leading as usize,
+            ));
+        }
+        // Map the final unit's exit back to its slot for prefix charging: a full run (a
+        // normal side exit, an exhausted or unresolved transfer edge) charges the whole
+        // leading run; a memory-check side exit carries its failing slot in the
+        // disposition; a call-out Exit/HardStop stopped at the recorded site.
+        let entry_eip = final_unit
             .key
             .linear
             .wrapping_sub(self.jit_direct.clif_run.snapshot_cs.base);
-        let (stop_slot, raw_clocks, lowered_retired) =
-            if disposition == jit::clif::callout::CLIF_CALLOUT_CONTINUE {
-                (
-                    unit.leading as usize,
-                    u64::from(unit.raw_clocks_total),
-                    u64::from(unit.lowered_total),
-                )
-            } else if disposition & 0xff == jit::clif::lower::CLIF_MEM_EXIT {
-                let stop = jit::clif::lower::clif_mem_exit_slot(disposition);
-                debug_assert!(
-                    stop < unit.leading as usize,
-                    "memory exit past the leading run"
-                );
-                // Diagnostic reason counters only: the guest cannot observe which check
-                // fired (all exit at the un-advanced EIP with zero state change).
-                match jit::clif::lower::clif_mem_exit_reason(disposition) {
-                    r if r == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
-                        self.jit_clif.mem_exit_alignment += 1;
-                    }
-                    r if r == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
-                        self.jit_clif.mem_exit_unavailable_or_kind += 1;
-                    }
-                    r if r == jit::direct::SideExitReason::Permission as u32 => {
-                        self.jit_clif.mem_exit_permission += 1;
-                    }
-                    r if r == jit::direct::SideExitReason::CodeWatch as u32 => {
-                        self.jit_clif.mem_exit_code_watch += 1;
-                    }
-                    _ => {
-                        self.jit_clif.mem_exit_segment_limit += 1;
-                    }
+        let unit = final_unit;
+        let (stop_slot, final_raw, final_lowered) = if unresolved_hop {
+            // The sentinel hop's SOURCE (the chain's final real unit) is already in
+            // the fully-run prefix; the trampoline itself is not a unit and charges
+            // nothing (the spent quota decrement reconciles as an unresolved exit,
+            // not a completed transfer).
+            (0, 0, 0)
+        } else if final_ran_fully {
+            (
+                unit.leading as usize,
+                u64::from(unit.raw_clocks_total),
+                u64::from(unit.lowered_total),
+            )
+        } else if disposition & 0xff == jit::clif::lower::CLIF_MEM_EXIT {
+            let stop = jit::clif::lower::clif_mem_exit_slot(disposition);
+            debug_assert!(
+                stop < unit.leading as usize,
+                "memory exit past the leading run"
+            );
+            // Diagnostic reason counters only: the guest cannot observe which check
+            // fired (all exit at the un-advanced EIP with zero state change).
+            match jit::clif::lower::clif_mem_exit_reason(disposition) {
+                r if r == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
+                    self.jit_clif.mem_exit_alignment += 1;
                 }
-                (
-                    stop,
-                    u64::from(unit.cum_raw_before[stop]),
-                    u64::from(unit.cum_lowered_before[stop]),
-                )
-            } else {
-                let mut slot_eip = entry_eip;
-                let mut stop = unit.leading as usize;
-                for slot in 0..unit.leading as usize {
-                    if unit.x87_mask & (1 << slot) != 0
-                        && slot_eip == self.jit_direct.clif_run.last_callout_eip
-                    {
-                        stop = slot;
-                        break;
-                    }
-                    slot_eip = slot_eip.wrapping_add(u32::from(unit.fetch_lens[slot]));
+                r if r == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
+                    self.jit_clif.mem_exit_unavailable_or_kind += 1;
                 }
-                debug_assert!(
-                    stop < unit.leading as usize,
-                    "exit disposition without a site"
-                );
-                (
-                    stop,
-                    u64::from(unit.cum_raw_before[stop]),
-                    u64::from(unit.cum_lowered_before[stop]),
-                )
-            };
+                r if r == jit::direct::SideExitReason::Permission as u32 => {
+                    self.jit_clif.mem_exit_permission += 1;
+                }
+                r if r == jit::direct::SideExitReason::CodeWatch as u32 => {
+                    self.jit_clif.mem_exit_code_watch += 1;
+                }
+                _ => {
+                    self.jit_clif.mem_exit_segment_limit += 1;
+                }
+            }
+            (
+                stop,
+                u64::from(unit.cum_raw_before[stop]),
+                u64::from(unit.cum_lowered_before[stop]),
+            )
+        } else {
+            let mut slot_eip = entry_eip;
+            let mut stop = unit.leading as usize;
+            for slot in 0..unit.leading as usize {
+                if unit.x87_mask & (1 << slot) != 0
+                    && slot_eip == self.jit_direct.clif_run.last_callout_eip
+                {
+                    stop = slot;
+                    break;
+                }
+                slot_eip = slot_eip.wrapping_add(u32::from(unit.fetch_lens[slot]));
+            }
+            debug_assert!(
+                stop < unit.leading as usize,
+                "exit disposition without a site"
+            );
+            (
+                stop,
+                u64::from(unit.cum_raw_before[stop]),
+                u64::from(unit.cum_lowered_before[stop]),
+            )
+        };
+        replay.push((unit.key.linear, unit.fetch_lens, unit.x87_mask, stop_slot));
+        let raw_clocks = prefix_raw + final_raw;
+        let lowered_retired = prefix_lowered + final_lowered;
+        // Direct's Run-vs-Prefix continuation split: a chain that ended at a RETIRED
+        // terminal (a completed transfer edge, an exhausted or unresolved hop, or a
+        // lowered terminal's own side-exit arm) resumes at a FRESH instruction, so the
+        // dispatcher may probe admission there immediately; a stop-slot or failing-slot
+        // exit must let the interpreter retire that instruction first.
+        let run_shaped = final_ran_fully && unit.terminal
+            || disposition == jit::clif::callout::CLIF_CHAIN_QUOTA_EXHAUSTED
+            || disposition == jit::clif::callout::CLIF_CHAIN_UNRESOLVED
+            || unresolved_hop;
 
-        // Fetch charging for the retired lowered slots, mirroring run_direct_block's two
-        // shapes (bulk flat cost under uniform fetches, the per-instruction cached-fetch
-        // replay otherwise); x87 slots are skipped, their call-out performed its own fetch.
+        // Fetch charging for the retired lowered slots across the whole chain, mirroring
+        // run_direct_block's two shapes (bulk flat cost under uniform fetches, the
+        // per-unit cached-fetch replay otherwise); x87 slots are skipped, their call-out
+        // performed its own fetch.
         if bus.native_fetches_are_uniform() {
             bus.charge_bus_clocks_bulk(bus.jit_fetch_cost_clocks().saturating_mul(lowered_retired));
         } else {
             // charge_cached_fetch advances EIP as part of the interpreter's own warm-hit
-            // replay; the unit (or the call-out's fault delivery) already materialized the
-            // exact exit EIP, so restore it afterwards, exactly as run_direct_block's trace
-            // replay restores final_eip.
+            // replay; the exit already materialized the exact resume EIP, so restore it
+            // afterwards, exactly as run_direct_block's trace replay restores final_eip.
             let final_eip = self.registers.eip;
-            let mut fetch_lin = unit.key.linear;
-            for slot in 0..stop_slot {
-                let len = unit.fetch_lens[slot];
-                if unit.x87_mask & (1 << slot) == 0 {
-                    self.charge_cached_fetch(bus, fetch_lin, len)
-                        .expect("validated clif-unit fetch charge cannot fault");
+            for (linear, fetch_lens, x87_mask, slots) in &replay {
+                let mut fetch_lin = *linear;
+                for (slot, &len) in fetch_lens.iter().take(*slots).enumerate() {
+                    if x87_mask & (1 << slot) == 0 {
+                        self.charge_cached_fetch(bus, fetch_lin, len)
+                            .expect("validated clif-unit fetch charge cannot fault");
+                    }
+                    fetch_lin = fetch_lin.wrapping_add(u32::from(len));
                 }
-                fetch_lin = fetch_lin.wrapping_add(u32::from(len));
             }
             self.registers.eip = final_eip;
         }
@@ -1553,18 +1764,34 @@ impl CpuGsw {
         // cost; mode13 READS charge at the mode13 data cost; mode13 WRITES and the
         // dirty-page bitset relay through charge_native_mode13_writes, never through
         // data_clocks, exactly as run_direct_block splits them.
-        let access = if stop_slot == unit.leading as usize {
+        let final_access = if unresolved_hop {
+            jit::clif::cache::ClifAccessCounts::default()
+        } else if stop_slot == unit.leading as usize {
             unit.access_total
         } else {
             unit.cum_access_before[stop_slot]
         };
+        acc[0] += u64::from(final_access.byte_reads);
+        acc[1] += u64::from(final_access.word_reads);
+        acc[2] += u64::from(final_access.dword_reads);
+        acc[3] += u64::from(final_access.byte_stores);
+        acc[4] += u64::from(final_access.word_stores);
+        acc[5] += u64::from(final_access.dword_stores);
+        let [
+            byte_reads,
+            word_reads,
+            dword_reads,
+            byte_stores,
+            word_stores,
+            dword_stores,
+        ] = acc;
         let m13 = &self.jit_direct.clif_run.mode13;
-        debug_assert!(m13.byte_reads <= u64::from(access.byte_reads));
-        debug_assert!(m13.word_reads <= u64::from(access.word_reads));
-        debug_assert!(m13.dword_reads <= u64::from(access.dword_reads));
-        debug_assert!(m13.byte_writes <= u64::from(access.byte_stores));
-        debug_assert!(m13.word_writes <= u64::from(access.word_stores));
-        debug_assert!(m13.dword_writes <= u64::from(access.dword_stores));
+        debug_assert!(m13.byte_reads <= byte_reads);
+        debug_assert!(m13.word_reads <= word_reads);
+        debug_assert!(m13.dword_reads <= dword_reads);
+        debug_assert!(m13.byte_writes <= byte_stores);
+        debug_assert!(m13.word_writes <= word_stores);
+        debug_assert!(m13.dword_writes <= dword_stores);
         debug_assert!(m13.dirty_pages <= u64::from(u16::MAX));
         let mode13_writes = izarravm_bus::NativeMode13Writes {
             dirty_pages: m13.dirty_pages as u16,
@@ -1572,13 +1799,12 @@ impl CpuGsw {
             word_writes: m13.word_writes,
             dword_writes: m13.dword_writes,
         };
-        if !access.is_zero() {
-            let ram_bytes = (u64::from(access.byte_reads) - m13.byte_reads)
-                + (u64::from(access.byte_stores) - m13.byte_writes);
-            let ram_words = (u64::from(access.word_reads) - m13.word_reads)
-                + (u64::from(access.word_stores) - m13.word_writes);
-            let ram_dwords = (u64::from(access.dword_reads) - m13.dword_reads)
-                + (u64::from(access.dword_stores) - m13.dword_writes);
+        let any_access =
+            byte_reads + word_reads + dword_reads + byte_stores + word_stores + dword_stores != 0;
+        if any_access {
+            let ram_bytes = (byte_reads - m13.byte_reads) + (byte_stores - m13.byte_writes);
+            let ram_words = (word_reads - m13.word_reads) + (word_stores - m13.word_writes);
+            let ram_dwords = (dword_reads - m13.dword_reads) + (dword_stores - m13.dword_writes);
             let mode13_read_clocks = bus
                 .jit_mode13_data_cost_clocks(BusWidth::Byte)
                 .saturating_mul(m13.byte_reads)
@@ -1603,7 +1829,7 @@ impl CpuGsw {
                 )
                 .saturating_add(mode13_read_clocks);
             bus.charge_bus_clocks_bulk(data_clocks);
-            if access.stores() != 0
+            if byte_stores + word_stores + dword_stores != 0
                 && let Some(page) = self.prefetch.physical_page()
             {
                 // Native stores are charged in one batch without per-write addresses; mark
@@ -1621,6 +1847,10 @@ impl CpuGsw {
         }
         self.jit_clif.entries += 1;
         self.jit_clif.side_exits += 1;
+        self.jit_clif.linked_transfers += completed_transfers;
+        if unresolved_hop {
+            self.jit_clif.unresolved_transfers += 1;
+        }
         let outcome = CycleOutcome {
             core_clocks: (charged
                 .saturating_add(u64::from(self.jit_direct.clif_run.callout_core_clocks)))
@@ -1637,7 +1867,11 @@ impl CpuGsw {
                 return Err(error);
             }
         }
-        Ok(Some(outcome))
+        Ok(if run_shaped {
+            ClifContinuation::Run(outcome)
+        } else {
+            ClifContinuation::Prefix(outcome)
+        })
     }
 
     #[cfg(all(

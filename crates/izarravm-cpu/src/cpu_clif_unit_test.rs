@@ -295,14 +295,35 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         lowered_total: 1,
         cum_access_before: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
         access_total: Default::default(),
+        terminal: false,
+        successors: [None; 2],
+    };
+    // A stand-in sentinel-descriptor address (any stable nonzero address works for a
+    // linkless unit test); fresh cells are sentinel-repointed per the N1a discipline.
+    let sentinel_marker = 0u64;
+    let sentinel_addr = std::ptr::from_ref(&sentinel_marker) as usize;
+    let sentinel_portal = cache.sentinel_portal(sentinel_addr);
+    let make_cells = || {
+        let cells = [
+            std::sync::Arc::new(crate::jit::links::LinkCell::new()),
+            std::sync::Arc::new(crate::jit::links::LinkCell::new()),
+        ];
+        for cell in &cells {
+            cell.set(sentinel_portal.as_ref());
+        }
+        cells
     };
     assert!(cache.state(key).is_none());
     // Install without Seen refuses.
-    assert!(cache.install(&mut watch, descriptor.clone()).is_none());
+    assert!(
+        cache
+            .install(&mut watch, descriptor.clone(), make_cells(), sentinel_addr)
+            .is_none()
+    );
     cache.note_seen(key);
     assert_eq!(cache.state(key), Some(ClifUnitState::Seen));
     let index = cache
-        .install(&mut watch, descriptor)
+        .install(&mut watch, descriptor, make_cells(), sentinel_addr)
         .expect("install after Seen");
     assert_eq!(cache.state(key), Some(ClifUnitState::Compiled(index)));
     assert_eq!(cache.unit(index).expect("descriptor").instructions, 2);

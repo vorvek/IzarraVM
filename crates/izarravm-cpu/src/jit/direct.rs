@@ -199,13 +199,13 @@ impl SegmentLayout {
         })
     }
 
-    fn all_data_matches(self, cpu: &CpuGsw) -> bool {
+    pub(crate) fn all_data_matches(self, cpu: &CpuGsw) -> bool {
         SEGMENT_ORDER
             .into_iter()
             .all(|segment| self.data[segment_index(segment)] == cpu.registers.segment(segment))
     }
 
-    fn link_compatible(self, target: Self) -> bool {
+    pub(crate) fn link_compatible(self, target: Self) -> bool {
         self.cs == target.cs && self.data == target.data
     }
 
