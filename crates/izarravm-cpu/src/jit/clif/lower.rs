@@ -2111,6 +2111,10 @@ pub(crate) fn compile_unit(
     let bus = builder.block_params(entry)[1];
     let table = builder.block_params(entry)[2];
     let imm_table = builder.block_params(entry)[3];
+    // The C1d quota rides as the fifth live parameter (design section 4.2). The single-unit
+    // body performs no transfers yet, so the parameter is received and unused; C1d-main's
+    // terminal transfer thunks are its first consumer.
+    let _quota = builder.block_params(entry)[4];
 
     let vars = Vars {
         gpr: core::array::from_fn(|_| builder.declare_var(types::I32)),

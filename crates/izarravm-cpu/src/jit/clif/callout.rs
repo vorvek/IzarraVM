@@ -32,6 +32,22 @@ pub(crate) const CLIF_CALLOUT_CONTINUE: i64 = 0;
 pub(crate) const CLIF_CALLOUT_EXIT: i64 = 1;
 pub(crate) const CLIF_CALLOUT_HARD_STOP: i64 = 2;
 
+/// C1d chain dispositions (design section 4.2, the recommended fourth value plus the
+/// trampoline's unresolved exit). Values 5 and 6 stay disjoint from the memory side-exit
+/// family, whose encoded dispositions always carry low byte 4
+/// (`lower::CLIF_MEM_EXIT` | reason << 8 | slot << 16), and from the three call-out values
+/// above; `run_clif_unit` can therefore classify every disposition by value alone.
+///
+/// `CLIF_CHAIN_QUOTA_EXHAUSTED`: a transfer edge decremented the quota to zero and yielded
+/// BEFORE the transfer (Direct's decrement-and-check-before-jump order), with the resume
+/// EIP already materialized by the edge's own thunk.
+pub(crate) const CLIF_CHAIN_QUOTA_EXHAUSTED: i64 = 5;
+/// `CLIF_CHAIN_UNRESOLVED`: a branch-free transfer landed on the sentinel descriptor's
+/// resolver trampoline (design section 3.3b), which returns this disposition through the
+/// tail-call chain; the spent quota decrement is reconciled as an unresolved exit, not a
+/// completed transfer.
+pub(crate) const CLIF_CHAIN_UNRESOLVED: i64 = 6;
+
 /// A call-out shim's signature. `cpu`/`bus_opaque` are forwarded from the unit entry
 /// unchanged; `site_eip` and `fetch_len` identify the calling slot (its guest EIP and its
 /// instruction length), both compile-time-baked at the call site as STRUCTURAL unit-layout
@@ -55,17 +71,21 @@ pub(crate) struct ClifCallOutTable {
     // Future call-out kinds append here; C1b ships exactly one populated slot.
 }
 
-/// The widened dispatcher-shaped entry ABI, C1b onward (design section 1.2, the definitive
-/// five-parameter arity per review finding M1): cpu, the opaque bus pointer (valid for this
-/// call only), this call's monomorphized shim table, the unit's immediate table
-/// (`unit.immediates.as_ptr()`, dereferenced only by the unit body's own loads), and the unit
-/// entry address (the adapter's own operand). The compiled unit's `CallConv::Tail` signature
-/// carries the first four as live parameters.
+/// The dispatcher-shaped entry ABI at the C1d SIX-parameter arity (design section 4.2,
+/// review finding B3): cpu, the opaque bus pointer (valid for this call only), this call's
+/// monomorphized shim table, the unit's operand table (dereferenced only by the unit body's
+/// own loads), the linked-transfer QUOTA (the initial value of the inner signature's fifth
+/// live parameter; a chain entered with quota N performs at most N - 1 transfers), and the
+/// unit entry address (the adapter's own operand). The compiled unit's `CallConv::Tail`
+/// signature carries the first five as live parameters; the quota must be a live parameter
+/// rather than a stack local because `return_call` deallocates the caller's frame at every
+/// hop, so no native local can survive a transfer.
 pub(crate) type ClifEntryFn = unsafe extern "C" fn(
     *mut CpuGsw,
     *mut core::ffi::c_void,
     *const ClifCallOutTable,
     *const u32,
+    u64,
     *const u8,
 ) -> i64;
 
@@ -229,11 +249,12 @@ pub(crate) unsafe extern "C" fn clif_x87_callout_shim<B: CpuBus>(
     }
 }
 
-/// The unit-side `CallConv::Tail` signature: four live parameters (cpu, bus_opaque, table,
-/// imm_table), one `i64` disposition return.
+/// The unit-side `CallConv::Tail` signature at the C1d arity: five live parameters (cpu,
+/// bus_opaque, table, imm_table, quota), one `i64` disposition return. The quota rides the
+/// signature because it must survive `return_call_indirect` hops (design section 4.2).
 pub(crate) fn callout_unit_signature() -> Signature {
     let mut sig = Signature::new(CallConv::Tail);
-    for _ in 0..4 {
+    for _ in 0..5 {
         sig.params.push(AbiParam::new(types::I64));
     }
     sig.returns.push(AbiParam::new(types::I64));
@@ -253,13 +274,13 @@ pub(crate) fn callout_shim_signature(default_call_conv: CallConv) -> Signature {
     sig
 }
 
-/// Build the widened adapter: host-default convention, five parameters per `ClifEntryFn`, one
-/// ordinary `call_indirect` into the Tail unit forwarding the four live parameters opaquely,
-/// returning the unit's disposition. The same shape as the C1a shell adapter
-/// (`unit.rs::build_adapter_function`) at the widened arity.
+/// Build the six-parameter adapter (design section 4.2, B3's corrected arithmetic): host
+/// default convention, six parameters per `ClifEntryFn` (the inner signature's five live
+/// parameters plus the entry address), one ordinary `call_indirect` into the Tail unit
+/// forwarding the five live parameters opaquely, returning the unit's disposition.
 fn build_callout_adapter_function(default_call_conv: CallConv) -> Function {
     let mut sig = Signature::new(default_call_conv);
-    for _ in 0..5 {
+    for _ in 0..6 {
         sig.params.push(AbiParam::new(types::I64));
     }
     sig.returns.push(AbiParam::new(types::I64));
@@ -275,20 +296,41 @@ fn build_callout_adapter_function(default_call_conv: CallConv) -> Function {
     let bus = builder.block_params(entry)[1];
     let table = builder.block_params(entry)[2];
     let imm_table = builder.block_params(entry)[3];
-    let callee = builder.block_params(entry)[4];
+    let quota = builder.block_params(entry)[4];
+    let callee = builder.block_params(entry)[5];
     let call = builder
         .ins()
-        .call_indirect(sig_ref, callee, &[cpu, bus, table, imm_table]);
+        .call_indirect(sig_ref, callee, &[cpu, bus, table, imm_table, quota]);
     let disposition = builder.inst_results(call)[0];
     builder.ins().return_(&[disposition]);
     builder.finalize();
     func
 }
 
+/// The unresolved-sentinel resolver trampoline (design section 3.3b, productionizing the
+/// C0 `build_resolver` shape): a `CallConv::Tail` function at the unit signature that
+/// returns the unresolved disposition and nothing else. State needs no materialization
+/// here: the SOURCE unit's transfer thunk spills all guest state (with the un-executed
+/// target's entry EIP) before every hop, so by the time a hop lands in this trampoline the
+/// resume point is already exact.
+pub(super) fn build_unresolved_trampoline() -> Function {
+    let mut func =
+        Function::with_name_signature(UserFuncName::user(0, 31), callout_unit_signature());
+    let mut fbc = FunctionBuilderContext::new();
+    let mut builder = FunctionBuilder::new(&mut func, &mut fbc);
+    let entry = builder.create_block();
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let disposition = builder.ins().iconst(types::I64, CLIF_CHAIN_UNRESOLVED);
+    builder.ins().return_(&[disposition]);
+    builder.finalize();
+    func
+}
+
 impl ClifBackend {
-    /// The widened five-parameter adapter (design section 1.2), compiled once and reused for
-    /// every C1b-onward unit entry. Coexists with the C1a shell adapter until C1b-main rewires
-    /// `run_clif_shell` onto this shape.
+    /// The six-parameter adapter (design section 4.2), compiled once and reused for
+    /// every unit entry.
     pub(crate) fn callout_adapter(&mut self) -> Option<ClifEntryFn> {
         if let Some(addr) = self.callout_adapter_entry {
             // SAFETY: built once at the host default convention with exactly this signature

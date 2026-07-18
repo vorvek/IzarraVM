@@ -165,6 +165,29 @@ impl SegmentLayout {
         })
     }
 
+    /// An inert all-zeros layout for sentinel descriptors (Track C C1d, design section
+    /// 3.3b): filler for a descriptor whose only live fields are `entry` and `operands`;
+    /// nothing ever validates or reads it. Consumed by the clif backend only.
+    #[cfg(all(
+        feature = "clif-backend",
+        target_arch = "x86_64",
+        any(target_os = "windows", target_os = "linux")
+    ))]
+    pub(crate) fn inert() -> Self {
+        let zero = SegmentRegister {
+            selector: 0,
+            base: 0,
+            limit: 0,
+            access: 0,
+            default_size_32: false,
+        };
+        Self {
+            cs: zero,
+            data: [zero; 6],
+            used: 0,
+        }
+    }
+
     pub(crate) fn cs_matches(self, cpu: &CpuGsw) -> bool {
         self.cs == cpu.registers.cs()
     }

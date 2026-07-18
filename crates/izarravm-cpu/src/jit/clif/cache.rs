@@ -149,6 +149,39 @@ impl ClifAccessCounts {
 }
 
 impl ClifUnitDescriptor {
+    /// The unresolved-sentinel descriptor (C1d design section 3.3b): `entry` is the
+    /// resolver trampoline, `operands` the static all-zeros table; every other field is
+    /// inert filler that nothing reads (zero leading, zero profiles, an inert segment
+    /// snapshot). The branch-free transfer thunk treats this exactly like a real landing
+    /// record: it loads `entry` and computes `operands`' address, and the hop lands in the
+    /// trampoline, which returns the unresolved disposition.
+    pub(crate) fn sentinel(trampoline_entry: usize) -> Self {
+        Self {
+            key: ClifUnitKey {
+                linear: 0,
+                physical: 0,
+                mode_key: 0,
+            },
+            guest_len: 0,
+            fetch_lens: [0; MAX_BLOCK_INSTRUCTIONS],
+            instructions: 0,
+            segment_layout: SegmentLayout::inert(),
+            memory_cpl3: false,
+            has_wide_accesses: false,
+            is_self_loop: false,
+            entry: trampoline_entry,
+            operands: [0; 2 * MAX_BLOCK_INSTRUCTIONS],
+            leading: 0,
+            x87_mask: 0,
+            cum_raw_before: [0; MAX_BLOCK_INSTRUCTIONS],
+            cum_lowered_before: [0; MAX_BLOCK_INSTRUCTIONS],
+            raw_clocks_total: 0,
+            lowered_total: 0,
+            cum_access_before: [ClifAccessCounts::default(); MAX_BLOCK_INSTRUCTIONS],
+            access_total: ClifAccessCounts::default(),
+        }
+    }
+
     /// G6: full CS descriptor equality, not selector-only (mirrors
     /// `CompiledBlock::cs_descriptor_matches`).
     pub(crate) fn cs_descriptor_matches(&self, cpu: &CpuGsw) -> bool {

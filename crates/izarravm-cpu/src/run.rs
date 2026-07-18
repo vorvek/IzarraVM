@@ -1441,6 +1441,10 @@ impl CpuGsw {
                 std::ptr::from_mut(bus).cast(),
                 &table,
                 unit.operands.as_ptr(),
+                // C1d ABI: the linked-transfer quota. The single-unit path passes 1 (no
+                // transfers exist yet, so the value is received and never consumed),
+                // preserving pre-chain behavior exactly until C1d-main wires real chains.
+                1,
                 entry_ptr,
             )
         };
