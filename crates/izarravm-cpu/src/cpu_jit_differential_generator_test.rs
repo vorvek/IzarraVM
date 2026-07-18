@@ -5048,11 +5048,13 @@ fn clif_restamp_disp32_feeds_the_effective_address() {
 ))]
 fn clif_restamp_preserves_chain_links() {
     // 0x1000: nop; A at 0x1001: inc eax; add eax, ebx; jmp -> B at 0x1010: inc ebx;
-    // mov bl, 0x11 (the restampable imm8 at 0x1012); hlt. B keeps the SAME 4-byte
-    // length as the established chain-test target: the C1d chained-hop accounting
-    // under-models the jump-target prefetch refill for LONGER targets (a pre-existing
-    // divergence found while building this test, reported separately), and this test's
-    // subject is link preservation, not hop timing.
+    // mov bl, 0x11 (the restampable imm8 at 0x1012); hlt. CORRECTED ATTRIBUTION
+    // (2026-07-19, PR #597's investigation): an earlier note here blamed a pre-existing
+    // C1d chained-hop under-charge for a bus-clock divergence seen while building this
+    // test. False: main is clock-identical for chained targets of every byte length
+    // (PR #597's sweep pins it). The divergence was THIS branch's restamp re-decode
+    // skew on the post-patch pass, which is why that pass below uses
+    // pass_state_strict_bus_lenient; B's length is immaterial.
     let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xeb, 0x0a];
     code.resize(0x10, 0x90);
     code.extend_from_slice(&[0x43, 0xb3, 0x11, 0xf4]);
