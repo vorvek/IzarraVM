@@ -1144,13 +1144,6 @@ pub struct CpuGsw {
     /// the scan itself is always correct without it.
     #[cfg(feature = "jit")]
     poll_neg_cache_enabled: bool,
-    /// IZARRAVM_POLL_SKIP_MEMORY (default on, "0"/"" disables): whether the
-    /// classifier's memory-poll shape (M1) may be recognized at all. A
-    /// campaign-only sub-toggle under the same IZARRAVM_POLL_SKIP kill
-    /// switch, so a same-binary run can isolate the memory family's own
-    /// marginal contribution on top of the io family's already-proven win.
-    #[cfg(feature = "jit")]
-    poll_skip_memory_enabled: bool,
     /// Linear-page pointer map for the direct x64 backend. Large arrays allocate on first fill;
     /// clones start empty like the other host-only accelerator caches.
     #[cfg(all(
@@ -1247,8 +1240,6 @@ impl Default for CpuGsw {
             direct_runtime: DirectRuntimeState::default(),
             #[cfg(feature = "jit")]
             poll_neg_cache_enabled: poll_neg_cache_default(),
-            #[cfg(feature = "jit")]
-            poll_skip_memory_enabled: poll_skip_memory_default(),
             #[cfg(all(
                 feature = "jit",
                 target_arch = "x86_64",
@@ -1273,14 +1264,6 @@ impl CpuGsw {
     /// IZARRAVM_POLL_SKIP_NEG_CACHE environment. Host bookkeeping only.
     pub fn set_poll_neg_cache_enabled_for_test(&mut self, enabled: bool) {
         self.poll_neg_cache_enabled = enabled;
-    }
-
-    /// Test seam: force the memory-poll shape's sub-flag on or off regardless
-    /// of the IZARRAVM_POLL_SKIP_MEMORY environment. Host bookkeeping only.
-    #[cold]
-    #[inline(never)]
-    pub fn set_poll_skip_memory_enabled_for_test(&mut self, enabled: bool) {
-        self.poll_skip_memory_enabled = enabled;
     }
 }
 
@@ -2036,26 +2019,6 @@ pub(crate) fn poll_neg_cache_policy(value: Option<&str>) -> bool {
 pub(crate) fn poll_neg_cache_default() -> bool {
     let value = std::env::var("IZARRAVM_POLL_SKIP_NEG_CACHE").ok();
     poll_neg_cache_policy(value.as_deref())
-}
-
-/// IZARRAVM_POLL_SKIP_MEMORY policy: enabled unless explicitly "0" or "".
-/// Campaign-only sub-toggle for the memory-poll shape family, independent of
-/// the io shapes; gated at the single classifier choke point in
-/// `build_poll_loop_at` (see the M1 arm in `jit/block.rs`).
-#[cfg(feature = "jit")]
-#[cold]
-#[inline(never)]
-pub(crate) fn poll_skip_memory_policy(value: Option<&str>) -> bool {
-    !matches!(value, Some("" | "0"))
-}
-
-/// Ambient default for the memory-poll sub-flag, read fresh at CPU construction.
-#[cfg(feature = "jit")]
-#[cold]
-#[inline(never)]
-pub(crate) fn poll_skip_memory_default() -> bool {
-    let value = std::env::var("IZARRAVM_POLL_SKIP_MEMORY").ok();
-    poll_skip_memory_policy(value.as_deref())
 }
 
 /// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP

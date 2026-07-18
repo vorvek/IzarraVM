@@ -512,11 +512,10 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
     // restriction is the safety condition for register/segment invariance
     // (hazard e in the design doc): with no base and no index, the effective
     // linear address depends on NO GPR at all, only DS's base/limit, which
-    // `poll_slots_within_live_cs` re-checks fresh on every call. Gated by the
-    // IZARRAVM_POLL_SKIP_MEMORY sub-flag at this single choke point: with it
-    // off, this arm never returns `Found`, which is sufficient regardless of
-    // which slot address the backward scan enters from (the shared Jcc
-    // opcodes 0x74/0x75 stay in `poll_head_possible`'s set for the io shapes).
+    // `poll_slots_within_live_cs` re-checks fresh on every call. Unconditional
+    // under IZARRAVM_POLL_SKIP like every other certified shape (the
+    // campaign-only IZARRAVM_POLL_SKIP_MEMORY sub-flag was folded back after
+    // the memory-marginal proof was accepted).
     if let [cmp, branch] = slots.as_slice()
         && d
         && is_loop
@@ -527,9 +526,6 @@ fn build_poll_loop_at(cpu: &CpuGsw, entry: u32) -> PollScanOutcome {
         && branch.insn.len == 2
         && loop_back_edge_target(&branch.insn, branch.lin) == Some(entry)
     {
-        if !cpu.poll_skip_memory_enabled {
-            return PollScanOutcome::NegativeCacheable;
-        }
         let Some(modrm) = cmp.insn.modrm else {
             return PollScanOutcome::NegativeCacheable;
         };
@@ -723,12 +719,7 @@ pub(crate) fn build_poll_loop(cpu: &CpuGsw) -> PollScanOutcome {
 /// `put`, which bumps the page insert generation guarding any cached
 /// negative. Containment is structural, so this rejection is a
 /// code-byte-only fact under EVERY register state, even when a nearby
-/// shape would scan as register-volatile. The IZARRAVM_POLL_SKIP_MEMORY
-/// sub-flag is NOT consulted here (0x3B always stays possible): the single
-/// choke point that suppresses the memory shape lives in
-/// `build_poll_loop_at`'s M1 arm, because the shared Jcc opcodes mean a
-/// backward scan can reach the CMP slot even when the current boundary sits
-/// on the branch. Extending the shape table in build_poll_loop_at requires
+/// shape would scan as register-volatile. Extending the shape table in build_poll_loop_at requires
 /// extending this set; the every-phase tests
 /// exact_setup_poll_shapes_cover_sources_senses_and_every_phase and
 /// exact_memory_poll_shape_covers_senses_and_every_phase fail if any slot

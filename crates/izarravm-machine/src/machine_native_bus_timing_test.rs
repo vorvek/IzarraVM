@@ -1677,13 +1677,7 @@ fn memory_poll_program(cell_disp: u32, jz: bool) -> Vec<u8> {
 }
 
 #[cfg(feature = "jit")]
-fn memory_poll_machine(
-    enabled: bool,
-    memory_sub_flag: bool,
-    jz: bool,
-    cell_disp: u32,
-    cell_value: u32,
-) -> Machine {
+fn memory_poll_machine(enabled: bool, jz: bool, cell_disp: u32, cell_value: u32) -> Machine {
     let program = memory_poll_program(cell_disp, jz);
     let mut profile = MachineProfile::gsw_386(16, VideoCard::Vega);
     profile.cpu = GswMode::Gsw586;
@@ -1693,17 +1687,15 @@ fn memory_poll_machine(
     machine.cpu.registers.set_segment(SegmentIndex::Cs, cs);
     machine.cpu.set_native_backend_enabled(false);
     machine.poll_skip_enabled = enabled;
-    machine
-        .cpu
-        .set_poll_skip_memory_enabled_for_test(memory_sub_flag);
     machine.trace.set_tracing_mode(TracingMode::Off);
     let ds_base = machine.cpu.registers.segment(SegmentIndex::Ds).base;
     machine.write_physical_u32(ds_base.wrapping_add(cell_disp), cell_value);
     machine
 }
 
-/// State + timing identity at batch boundaries with the sub-flag on vs off
-/// (spec tests 7 + 8): a spinning tic-wait whose cell never changes must leave
+/// State + timing identity at batch boundaries, skip on vs the plain
+/// interpreter (spec tests 7 + 8): a spinning tic-wait whose cell never
+/// changes must leave
 /// every architectural, timing, and device field byte-identical at every batch
 /// boundary. `assert_poll_machine_boundary_eq` includes `elapsed_clocks`,
 /// `timing_rem`, `trace.elapsed_clocks()`, and the beam, so this is also the
@@ -1723,8 +1715,8 @@ fn memory_poll_skip_matches_the_interpreter_at_batch_boundaries() {
         } else {
             MEMORY_POLL_COMPARAND ^ 0x1111
         };
-        let mut baseline = memory_poll_machine(true, false, jz, MEMORY_POLL_CELL_DISP, cell_value);
-        let mut skipped = memory_poll_machine(true, true, jz, MEMORY_POLL_CELL_DISP, cell_value);
+        let mut baseline = memory_poll_machine(false, jz, MEMORY_POLL_CELL_DISP, cell_value);
+        let mut skipped = memory_poll_machine(true, jz, MEMORY_POLL_CELL_DISP, cell_value);
 
         for boundary in 0..8 {
             let baseline_stop = baseline.run_cycles(100_000).unwrap();
@@ -1753,13 +1745,13 @@ fn memory_poll_skip_matches_the_interpreter_at_batch_boundaries() {
 
 /// Spec test 4 (IF=0): a masked-interrupt spin still skips, bounded by the
 /// ordinary batch cap, with no special-case branch. Identity against the
-/// sub-flag-off interpreter proves the bound is exactly the cap either way.
+/// plain interpreter proves the bound is exactly the cap either way.
 #[cfg(feature = "jit")]
 #[test]
 fn memory_poll_skip_commits_with_interrupts_masked() {
     let cell_value = MEMORY_POLL_COMPARAND ^ 0x22;
-    let mut baseline = memory_poll_machine(true, false, false, MEMORY_POLL_CELL_DISP, cell_value);
-    let mut skipped = memory_poll_machine(true, true, false, MEMORY_POLL_CELL_DISP, cell_value);
+    let mut baseline = memory_poll_machine(false, false, MEMORY_POLL_CELL_DISP, cell_value);
+    let mut skipped = memory_poll_machine(true, false, MEMORY_POLL_CELL_DISP, cell_value);
     for machine in [&mut baseline, &mut skipped] {
         machine.cpu.registers.eflags &= !0x0200;
     }
@@ -1786,8 +1778,8 @@ fn memory_poll_executor_declines_at_the_head_when_about_to_exit() {
         } else {
             (MEMORY_POLL_COMPARAND ^ 0x40, MEMORY_POLL_COMPARAND)
         };
-        let mut baseline = memory_poll_machine(true, false, jz, MEMORY_POLL_CELL_DISP, spin_value);
-        let mut skipped = memory_poll_machine(true, true, jz, MEMORY_POLL_CELL_DISP, spin_value);
+        let mut baseline = memory_poll_machine(false, jz, MEMORY_POLL_CELL_DISP, spin_value);
+        let mut skipped = memory_poll_machine(true, jz, MEMORY_POLL_CELL_DISP, spin_value);
         for machine in [&mut baseline, &mut skipped] {
             machine.run_cycles(2_000).unwrap();
             let ds_base = machine.cpu.registers.segment(SegmentIndex::Ds).base;
@@ -1818,8 +1810,8 @@ fn memory_poll_executor_declines_at_the_head_when_about_to_exit() {
 fn memory_poll_skip_declines_for_an_mmio_polled_cell() {
     let ds_base = 0x2000u32; // raw .COM DS base (asserted below)
     let disp = 0x000a_0000 - ds_base;
-    let make = |sub_flag| {
-        let mut machine = memory_poll_machine(true, sub_flag, false, disp, 0);
+    let make = |enabled| {
+        let mut machine = memory_poll_machine(enabled, false, disp, 0);
         assert_eq!(
             machine.cpu.registers.segment(SegmentIndex::Ds).base,
             ds_base
@@ -1848,8 +1840,8 @@ fn memory_poll_skip_declines_for_a_page_crossing_cell() {
     // the 0x5000 page boundary.
     let disp = 0x2ffe;
     let cell_value = MEMORY_POLL_COMPARAND ^ 0x3333;
-    let mut baseline = memory_poll_machine(true, false, false, disp, cell_value);
-    let mut skipped = memory_poll_machine(true, true, false, disp, cell_value);
+    let mut baseline = memory_poll_machine(false, false, disp, cell_value);
+    let mut skipped = memory_poll_machine(true, false, disp, cell_value);
     for _ in 0..3 {
         let baseline_stop = baseline.run_cycles(50_000).unwrap();
         let skipped_stop = skipped.run_cycles(50_000).unwrap();
@@ -1870,7 +1862,6 @@ fn code_write_retires_negative_and_new_memory_poll_is_recognized() {
     const HEAD: u32 = NON_POLL_HEAD_OFFSET;
     let mut machine = warm_in_set_non_poll_machine();
     machine.cpu.set_poll_neg_cache_enabled_for_test(true);
-    machine.cpu.set_poll_skip_memory_enabled_for_test(true);
     machine.cpu.registers.eip = HEAD;
     machine.cpu.poll_skip_backedge_housekeeping();
     assert!(
@@ -1940,7 +1931,6 @@ fn paged_memory_poll_machine(identity_alias_value: u32, mapped_frame_value: u32)
     let mut machine = Machine::new_raw_program(profile, &[0xf4]).unwrap();
     machine.cpu.set_native_backend_enabled(false);
     machine.poll_skip_enabled = true;
-    machine.cpu.set_poll_skip_memory_enabled_for_test(true);
     machine.trace.set_tracing_mode(TracingMode::Off);
 
     machine.write_physical_u32(PAGED_PD, PAGED_PT | 7);
