@@ -259,6 +259,13 @@ pub(crate) enum ClifUnitState {
 pub(crate) struct ClifUnitCache {
     entries: HashMap<ClifUnitKey, ClifUnitState, U32BuildHasher>,
     units: Vec<ClifUnitDescriptor>,
+    /// Invalidation generation (review finding B1): bumped whenever a unit dies (a code
+    /// write overlapping compiled spans, or a wholesale clear). `run_clif_unit` snapshots
+    /// it before entering a unit; the call-out shim's exit latch compares live vs snapshot
+    /// so an IN-FLIGHT unit whose own remaining bytes were just rewritten by its call-out
+    /// exits instead of running stale lowering (the SMC choke alone only protects the NEXT
+    /// entry).
+    pub(crate) generation: u64,
     /// C1a diagnostics, excluded from CpuGsw equality through the enclosing type (F-A8).
     pub(crate) units_admitted: u64,
     pub(crate) heat_demotions: u64,
@@ -322,6 +329,7 @@ impl ClifUnitCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.units.clear();
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// SMC/code-invalidation for compiled clif units (new in C1b: a C1a shell executed
@@ -330,11 +338,18 @@ impl ClifUnitCache {
     /// written range; `Seen`/`Dormant` states are dropped too (their walk-derived layout may
     /// be stale). A linear scan is fine at C1b's correctness tier; the per-page index is a
     /// later perf item.
+    ///
+    /// Arena-fill behavior (review finding m3, recorded): an invalidated unit's arena span
+    /// is never freed (its descriptor merely goes unreachable), so a long SMC-heavy run
+    /// ratchets the clif arena toward full. On fill, `ClifBackend::finalize` returns `None`
+    /// and new keys park Dormant, i.e. reject-and-interpret: sound, merely slower. Span
+    /// reuse/compaction is future work (the C1 plan's single-page compaction item).
     pub(crate) fn invalidate_physical_range(&mut self, start: u32, len: u32) {
         if len == 0 {
             return;
         }
         let end = start.saturating_add(len);
+        let before = self.entries.len();
         self.entries.retain(|key, state| {
             let span = match state {
                 ClifUnitState::Compiled(index) => Self::unit_span(&self.units, *index, *key),
@@ -347,6 +362,11 @@ impl ClifUnitCache {
             };
             span.1 <= start || span.0 >= end
         });
+        if self.entries.len() != before {
+            // B1: an in-flight unit whose entry just died must not resume its lowered
+            // slots; the generation mismatch trips the call-out exit latch.
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     fn unit_span(units: &[ClifUnitDescriptor], index: u32, key: ClifUnitKey) -> (u32, u32) {

@@ -70,9 +70,14 @@ pub(crate) type ClifEntryFn = unsafe extern "C" fn(
 ) -> i64;
 
 /// Per-entry call-out scratch on the jit state (Track C C1b). The shim is the only writer
-/// during a unit run; `run_clif_shell` resets it before entry and consumes it after exit.
-#[derive(Debug, Default)]
+/// during a unit run; `run_clif_unit` resets it before entry and consumes it after exit.
+#[derive(Default)]
 pub(crate) struct ClifRunScratch {
+    /// A panic payload caught by the shim's belt (review finding m1): the shim must not
+    /// unwind through compiled frames with no unwind info, so the payload crosses the
+    /// boundary here and `run_clif_unit` resumes the unwind once the disposition is back
+    /// on the Rust side.
+    pub(crate) caught_panic: Option<Box<dyn std::any::Any + Send>>,
     /// B2's hard-stop relay: a genuine `CpuError` (a bus error, never a delivered guest
     /// fault) stashed by the shim and taken back out by the dispatcher to return `Err(..)`.
     pub(crate) pending_hard_error: Option<CpuError>,
@@ -90,6 +95,22 @@ pub(crate) struct ClifRunScratch {
     pub(crate) snapshot_mode_key: u32,
     pub(crate) snapshot_cpl: u8,
     pub(crate) snapshot_cs: SegmentRegister,
+    /// The clif unit cache's invalidation generation at entry (review finding B1): a
+    /// mismatch means a call-out killed compiled units, possibly including the in-flight
+    /// one whose remaining lowered bytes may now be stale, so the unit must exit.
+    pub(crate) snapshot_cache_generation: u64,
+}
+
+impl std::fmt::Debug for ClifRunScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClifRunScratch")
+            .field("pending_hard_error", &self.pending_hard_error)
+            .field("last_callout_eip", &self.last_callout_eip)
+            .field("callout_core_clocks", &self.callout_core_clocks)
+            .field("callout_panics", &self.callout_panics)
+            .field("caught_panic", &self.caught_panic.is_some())
+            .finish()
+    }
 }
 
 /// The B1 Continue predicate's latch half: did the retired call-out instruction change the
@@ -102,6 +123,11 @@ impl CpuGsw {
         self.jit_mode_key() != scratch.snapshot_mode_key
             || self.current_privilege_level() != scratch.snapshot_cpl
             || self.registers.cs() != scratch.snapshot_cs
+            // B1: the retired instruction invalidated compiled units (an SMC store into
+            // watched code). The in-flight unit's own remaining bytes may be among them;
+            // the SMC choke only protects the NEXT entry, so exit this one now with the
+            // exact state the call-out already materialized.
+            || self.jit_direct.clif_units.generation != scratch.snapshot_cache_generation
     }
 }
 
@@ -163,11 +189,15 @@ pub(crate) unsafe extern "C" fn clif_x87_callout_shim<B: CpuBus>(
             cpu.jit_direct.clif_run.pending_hard_error = Some(cpu_error);
             CLIF_CALLOUT_HARD_STOP
         }
-        Err(_panic) => {
+        Err(panic) => {
             // Call-outs must be panic-free per the base design; this belt exists so a bug
             // never unwinds into a frame with no unwind info (unwind_info=false is pinned
-            // at ClifBackend::new). Reaching here is itself a bug to fix.
+            // at ClifBackend::new). Reaching here is itself a bug to fix: the payload is
+            // stashed and `run_clif_unit` RESUMES the unwind once the disposition has
+            // crossed back through the compiled frames (review finding m1), so the panic
+            // surfaces instead of the run continuing on partial state.
             cpu.jit_direct.clif_run.callout_panics += 1;
+            cpu.jit_direct.clif_run.caught_panic = Some(panic);
             CLIF_CALLOUT_HARD_STOP
         }
     }

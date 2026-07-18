@@ -1363,11 +1363,13 @@ impl CpuGsw {
             return Ok(None);
         };
         self.jit_direct.clif_run.pending_hard_error = None;
+        self.jit_direct.clif_run.caught_panic = None;
         self.jit_direct.clif_run.last_callout_eip = 0;
         self.jit_direct.clif_run.callout_core_clocks = 0;
         self.jit_direct.clif_run.snapshot_mode_key = self.jit_mode_key();
         self.jit_direct.clif_run.snapshot_cpl = self.current_privilege_level();
         self.jit_direct.clif_run.snapshot_cs = self.registers.cs();
+        self.jit_direct.clif_run.snapshot_cache_generation = self.jit_direct.clif_units.generation;
         self.begin_instruction();
         self.core_clocks_so_far = budget.total;
         let table = jit::clif::callout::ClifCallOutTable {
@@ -1389,6 +1391,12 @@ impl CpuGsw {
                 entry_ptr,
             )
         };
+
+        // m1: a panic caught by the shim's belt resumes here, now that the disposition has
+        // crossed back through the compiled frames (which carry no unwind info).
+        if let Some(panic) = self.jit_direct.clif_run.caught_panic.take() {
+            std::panic::resume_unwind(panic);
+        }
 
         // Map the exit back to its slot for prefix charging: a normal side exit ran the
         // whole leading run; a call-out Exit/HardStop stopped at the recorded site.
