@@ -61,3 +61,39 @@ pub(crate) mod unit_sim;
 pub(crate) mod x87_avx2_emit;
 
 pub(crate) use region::RegionTable;
+
+/// The CPU's jit state: the Direct block cache plus state owned ABOVE the individual backends.
+/// Track C C1a-pre hoists the G1 SMC heat map here so the Direct cache and the future clif
+/// cache share one map through SPLIT BORROWS on this struct. Deliberately no `Arc` and no
+/// `Mutex`: guest execution is single-threaded by design, so plain `&mut` discipline is the
+/// whole synchronization story. One boxed allocation on `CpuGsw` keeps the inline footprint a
+/// single pointer, so the hot interpreter field offsets stay put (the pending_flags pin in
+/// cpu_test.rs). `Deref` to the block cache keeps the pervasive `jit_direct.<method>` call
+/// surface unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JitState {
+    pub(crate) direct: direct::BlockCache,
+    pub(crate) smc_heat: direct::SmcHeatMap,
+}
+
+impl JitState {
+    pub(crate) fn new(direct: direct::BlockCache) -> Self {
+        Self {
+            direct,
+            smc_heat: direct::SmcHeatMap::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for JitState {
+    type Target = direct::BlockCache;
+    fn deref(&self) -> &Self::Target {
+        &self.direct
+    }
+}
+
+impl std::ops::DerefMut for JitState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.direct
+    }
+}

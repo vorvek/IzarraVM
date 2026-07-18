@@ -351,7 +351,8 @@ impl CpuGsw {
         #[cfg(feature = "jit")]
         if heat_hit {
             let epoch = self.smc_heat_epoch();
-            let newly_hot = self.jit_direct.smc_heat_bump(physical, width, epoch);
+            self.sync_smc_heat();
+            let newly_hot = self.jit_direct.smc_heat.bump(physical, width, epoch);
             self.perf.smc_heat_chunks_hot += u64::from(newly_hot);
         }
         #[cfg(not(feature = "jit"))]
@@ -369,6 +370,18 @@ impl CpuGsw {
     #[inline]
     pub(super) fn smc_heat_epoch(&self) -> u32 {
         (self.perf.instructions >> jit::direct::SMC_HEAT_EPOCH_SHIFT) as u32
+    }
+
+    /// Reset coupling for the hoisted heat map: heat drops exactly when the ACTIVE backend's
+    /// cache resets its storage. The cache signals resets through a counter (it cannot reach the
+    /// map itself; internal resets fire from inside `probe`/`install`), and every heat access
+    /// synchronizes here first, so the observable lifetime is identical to the map living inside
+    /// the cache. Single-threaded by design: plain fields and split borrows, no Arc, no Mutex.
+    #[cfg(feature = "jit")]
+    pub(crate) fn sync_smc_heat(&mut self) {
+        let jit = &mut *self.jit_direct;
+        let resets = jit.direct.heat_resets();
+        jit.smc_heat.sync_resets(resets);
     }
 
     pub(super) fn begin_instruction(&mut self) {
