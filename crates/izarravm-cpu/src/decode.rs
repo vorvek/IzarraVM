@@ -880,6 +880,11 @@ impl CpuGsw {
         let tail = self.registers.eip.wrapping_sub(self.decode_tail_start) as u8;
         insn.disp_len = self.decode_disp_len;
         insn.imm_len = tail - self.decode_disp_len;
+        // Zero the scratch so no decode residue outlives the call (the two lockstep arms
+        // decode different numbers of times once one runs natively; persistent residue
+        // would fail the derived CpuGsw equality on nothing architectural).
+        self.decode_tail_start = 0;
+        self.decode_disp_len = 0;
         // Resolve the continuation gate once per decode (the ModRM is in by now), so the
         // per-continuation check in `run_straight_line` reads a single cached flag.
         insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm, self.persona());

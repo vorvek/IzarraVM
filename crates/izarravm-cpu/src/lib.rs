@@ -1174,8 +1174,13 @@ pub struct CpuGsw {
     /// C1e decode scratch (valid only during one `decode` call): the EIP watermark after
     /// the last STRUCTURAL byte (opcode/ModRM/SIB) and the displacement byte count
     /// consumed so far, from which the finalize step derives the recorded
-    /// `{disp_len, imm_len}` pair. Deterministic across lockstep CPUs (pure decode
-    /// residue), so the derived equality stays sound.
+    /// `{disp_len, imm_len}` pair. Both are ZEROED by the finalize step so no residue
+    /// outlives the decode: two lockstep arms legally decode different numbers of times
+    /// (a native clif unit retires slots without re-decoding), so persistent residue
+    /// would trip the derived `CpuGsw` equality on nothing architectural (found by the
+    /// C1e storm battery). Loose fields, not a struct: the lone `u8` packs into an
+    /// existing padding hole, keeping `pending_flags` on its pinned offset 4440 (the
+    /// cpu_test.rs offset pin; a `{u32, u8}` struct here shifted it by 8).
     decode_tail_start: u32,
     decode_disp_len: u8,
     data_read_pages: DirectPageCache,

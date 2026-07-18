@@ -182,10 +182,18 @@ pub(crate) enum ImmExtend {
     SignByte,
     /// Two bytes little-endian, zero-extended (the 0x66-gated word immediates and the
     /// 16-bit moffs forms 0xA0-0xA3, whose offset is an unsigned 16-bit address).
+    /// UNREACHABLE today, deliberately kept: `classify`'s word whitelist
+    /// (`classify.rs`, the `0x39|0x3b|0x40..=0x4f|0x89|0x8b|0xff` gate) admits no
+    /// word-IMMEDIATE form, so no admitted slot records `imm_len == 2`; the arm is
+    /// pinned by a unit test below so a future word-imm admission cannot silently
+    /// inherit the wrong extension.
     Word,
     /// Two bytes little-endian, SIGN-extended (a ModRM disp16: `parse_16bit_address`
     /// sign-extends both the mode-2 and the mode-0/rm-6 disp16 into its i32, distinct
     /// from the zero-extending moffs form above; the walk tells them apart by opcode).
+    /// UNREACHABLE today for the same keep-it-pinned reason: `direct_addr` rejects
+    /// 16-bit address-size forms outright, so no admitted slot records a 2-byte
+    /// displacement.
     SignWord,
     /// Four bytes little-endian, full width.
     Dword,
@@ -1079,18 +1087,32 @@ impl ClifUnitCache {
         // 2.2/m4): no `retire_unit`, no watch release (the surviving unit's bytes must
         // STAY watched or the next SMC write to them would bypass this classifier
         // entirely), no cache-state transition, no link churn.
+        let restamped = !restamps.is_empty();
         for (index, slot, slot_off) in restamps {
             if let Some(unit) = self.units.get_mut(index as usize) {
                 Self::restamp_slot(unit, slot, slot_off);
             }
         }
-        if self.entries.len() != before {
+        if self.entries.len() != before || restamped {
             // B1: an in-flight unit whose entry just died must not resume its lowered
-            // slots; the generation mismatch trips the call-out exit latch. A PURE restamp
-            // deliberately does NOT bump the generation (design 3.2, sound because the
-            // operand-table loads are non-readonly `MemFlagsData::trusted()` and the x87
-            // call-out that performed the patch is a real `call_indirect` no later load
-            // can be hoisted above; the readonly regression guard pins the first half).
+            // slots; the generation mismatch trips the call-out exit latch.
+            //
+            // DESIGN REVERSAL, section 3.2's own trigger clause fired (C1e
+            // implementation finding): the design argued a PURE restamp need not bump
+            // because the operand-table loads are non-readonly `MemFlagsData::trusted()`
+            // loads that cranelift's alias model may not hoist across the x87 call-out's
+            // `call_indirect`. MEASURED FALSE on cranelift 0.133.1: the C1e in-flight
+            // battery (`clif_restamp_in_flight_callout_patch_is_observed_by_later_slots`)
+            // observed a compiled unit consume a PRE-PATCH operand after a mid-call-out
+            // restamp had already stored the new lane value, i.e. the optimizer DID
+            // reorder the trusted() load relative to the call. Section 3.2's closing
+            // paragraph mandates the reversal for exactly this evidence: a restamp now
+            // bumps the generation, so an in-flight unit exits at the call-out return and
+            // the interpreter (and every FRESH native entry, which loads the patched
+            // lane) observes the new operand. Everything else the restamp saves is
+            // preserved: no re-walk, no re-lower, no re-install, no link churn, no watch
+            // churn, no heat, no demotion; the bump costs one side exit for the
+            // in-flight entry only.
             self.generation = self.generation.wrapping_add(1);
         }
         outcome
@@ -1206,5 +1228,41 @@ impl ClifUnitCache {
             .get(index as usize)
             .map_or(0x1000, |unit| u32::from(unit.guest_len));
         (key.physical, key.physical.saturating_add(len))
+    }
+}
+
+#[cfg(test)]
+mod restamp_extension_tests {
+    use super::*;
+
+    /// C1e: the restamp re-read must reproduce the DECODER's extension semantics
+    /// byte-for-byte (design section 2.1's correctness cliff). The Word/SignWord arms are
+    /// currently unreachable through admission (no word-immediate or 16-bit-addressing
+    /// form classifies) but are pinned here so a future admission widening cannot
+    /// silently misextend.
+    #[test]
+    fn extend_bytes_reproduces_the_decoder_rules() {
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0xf0], ImmExtend::ZeroByte),
+            0x0000_00f0
+        );
+        // sign_extend_u8 extends to the FULL 32 bits regardless of operand size.
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0xf0], ImmExtend::SignByte),
+            0xffff_fff0
+        );
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0x34, 0xf0], ImmExtend::Word),
+            0x0000_f034
+        );
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0x34, 0xf0], ImmExtend::SignWord),
+            0xffff_f034
+        );
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0x78, 0x56, 0x34, 0xf2], ImmExtend::Dword),
+            0xf234_5678
+        );
+        assert_eq!(ClifUnitCache::extend_bytes(&[], ImmExtend::None), 0);
     }
 }
