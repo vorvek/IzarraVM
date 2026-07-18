@@ -1135,8 +1135,11 @@ pub struct CpuGsw {
     jit_regions: jit::RegionTable,
     /// Helper-free register block cache. Like the decode and region caches, this is host-only
     /// accelerator state and clones empty.
+    /// The Direct block cache plus the jit state shared across backends (the hoisted G1 SMC
+    /// heat map; see `jit::JitState`). Kept under the existing field name because the wrapper
+    /// derefs to the block cache, preserving every `jit_direct.<method>` call site.
     #[cfg(feature = "jit")]
-    jit_direct: Box<jit::direct::BlockCache>,
+    jit_direct: Box<jit::JitState>,
     #[cfg(feature = "jit")]
     direct_runtime: DirectRuntimeState,
     /// IZARRAVM_POLL_SKIP_NEG_CACHE (default on, "0"/"" disables): consult
@@ -1203,7 +1206,9 @@ impl Default for CpuGsw {
     fn default() -> Self {
         let decode_cache = DecodeCache::default();
         #[cfg(feature = "jit")]
-        let jit_direct = Box::new(jit::direct::BlockCache::new(decode_cache.line_count()));
+        let jit_direct = Box::new(jit::JitState::new(jit::direct::BlockCache::new(
+            decode_cache.line_count(),
+        )));
         Self {
             registers: Registers::default(),
             fpu: X87::default(),

@@ -546,9 +546,11 @@ fn smc_heat_pre_compile_gate_demotes_a_hot_entry_chunk() {
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
     cpu.set_jit_auto_admit(true);
     let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
-    // Heat the entry 16-byte chunk past the churn threshold within epoch 0.
+    // Heat the entry 16-byte chunk past the churn threshold within epoch 0 (sync first so a
+    // reset pending from setup is observed before the seed, not after).
+    cpu.sync_smc_heat();
     for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
-        cpu.jit_direct.smc_heat_bump(ENTRY, 1, 0);
+        cpu.jit_direct.smc_heat.bump(ENTRY, 1, 0);
     }
     let attempts = cpu.perf_counters().jit_direct_compile_attempts;
     let installed = cpu.perf_counters().jit_direct_blocks_installed;
@@ -597,11 +599,12 @@ fn smc_heat_pre_install_gate_demotes_a_hot_span_after_compiling() {
     // Heat a chunk inside the span but NOT the entry chunk: the cheap pre-compile gate passes and
     // the full-span gate after compilation must catch it before install.
     let far = ENTRY + 16;
+    cpu.sync_smc_heat();
     for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
-        cpu.jit_direct.smc_heat_bump(far, 1, 0);
+        cpu.jit_direct.smc_heat.bump(far, 1, 0);
     }
     assert!(
-        !cpu.jit_direct.smc_heat_chunk_hot(ENTRY, 0),
+        !cpu.jit_direct.smc_heat.chunk_hot(ENTRY, 0),
         "entry chunk stays cold"
     );
     let attempts = cpu.perf_counters().jit_direct_compile_attempts;
@@ -688,8 +691,9 @@ fn smc_heat_demoted_key_recovers_when_its_chunk_cools() {
     warm(&mut cpu, &mut bus, &[ENTRY, ENTRY + 1, ENTRY + 2]);
     cpu.set_jit_auto_admit(true);
     let key = jit::direct::key_for(&cpu, ENTRY, true).expect("fixture key");
+    cpu.sync_smc_heat();
     for _ in 0..jit::direct::SMC_HEAT_THRESHOLD {
-        cpu.jit_direct.smc_heat_bump(ENTRY, 1, 0);
+        cpu.jit_direct.smc_heat.bump(ENTRY, 1, 0);
     }
     // Demote through the gate: parked Dormant, no install, and probing within the same epoch does
     // NOT lift it (the stamp still reads current).

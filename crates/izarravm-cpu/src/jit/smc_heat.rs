@@ -3,9 +3,15 @@
 
 //! G1 self-modifying-code heat map. A separate structure from the refcounted watch pages: the
 //! review proved a counter living in a refcounted page ping-pongs (demotion zeroes refcounts, the
-//! page resets, the heat is lost, the code re-admits). Its lifetime is tied to the block cache and
-//! it is cleared ONLY in the cache's reset_storage/clear. See
+//! page resets, the heat is lost, the code re-admits). See
 //! dev_docs/specs/2026-07-15-smc-hardening-design.md.
+//!
+//! Ownership (Track C C1a-pre hoist): the map is a PLAIN FIELD on `CpuGsw`, shared by the Direct
+//! cache and the future clif cache through SPLIT BORROWS. Deliberately no `Arc` and no `Mutex`:
+//! guest execution is single-threaded by design, so plain `&mut` discipline is the whole
+//! synchronization story. Heat is shared history at a physical address; it is cleared ONLY when
+//! the ACTIVE backend's cache resets its storage (the reset-coupling counter on `BlockCache`,
+//! observed by `CpuGsw::sync_smc_heat`), never by an inactive backend's reset.
 
 use std::collections::HashMap;
 
@@ -26,9 +32,24 @@ pub(crate) const SMC_HEAT_EPOCH_SHIFT: u32 = 20;
 /// 4096-byte page split into 256 sixteen-byte chunks. Each chunk carries `(epoch, count)`; a count
 /// is only live while its stamp equals the current epoch (older stamps read as zero), which is the
 /// two-epoch aging that keeps normal level-load rewrites from ever accumulating to the threshold.
-#[derive(Default)]
+/// The demotion threshold travels with the map so every consumer applies one policy.
 pub(crate) struct SmcHeatMap {
     pages: HashMap<u32, Box<[(u32, u8); 256]>, U32BuildHasher>,
+    threshold: u8,
+    /// The owning cache's `heat_resets` value this map last synchronized against
+    /// (`CpuGsw::sync_smc_heat`). Lives inside the map so it shares the map's
+    /// transparent-accelerator equality and clone conventions.
+    synced_resets: u64,
+}
+
+impl Default for SmcHeatMap {
+    fn default() -> Self {
+        Self {
+            pages: HashMap::default(),
+            threshold: SMC_HEAT_THRESHOLD,
+            synced_resets: 0,
+        }
+    }
 }
 
 impl SmcHeatMap {
@@ -42,9 +63,9 @@ impl SmcHeatMap {
     }
 
     /// Bump every 16-byte chunk touched by `[physical, physical+width)` for the current epoch and
-    /// return how many of them crossed `threshold` on this bump (a diagnostic of distinct hot
+    /// return how many of them crossed the threshold on this bump (a diagnostic of distinct hot
     /// chunks). A store touches at most two chunks here; a block-span check never bumps.
-    pub(crate) fn bump(&mut self, physical: u32, width: u32, epoch: u32, threshold: u8) -> u32 {
+    pub(crate) fn bump(&mut self, physical: u32, width: u32, epoch: u32) -> u32 {
         if width == 0 {
             return 0;
         }
@@ -62,7 +83,7 @@ impl SmcHeatMap {
             let before = if slot.0 == epoch { slot.1 } else { 0 };
             let after = before.saturating_add(1);
             *slot = (epoch, after);
-            if before < threshold && after >= threshold {
+            if before < self.threshold && after >= self.threshold {
                 newly_hot += 1;
             }
             global_chunk += 1;
@@ -70,14 +91,20 @@ impl SmcHeatMap {
         newly_hot
     }
 
-    /// Any 16-byte chunk overlapping `[physical, physical+len)` at or above `threshold` for `epoch`.
-    pub(crate) fn span_hot(&self, physical: u32, len: u32, epoch: u32, threshold: u8) -> bool {
+    /// G1 cheap pre-compile gate: is the entry chunk at `physical` hot this epoch?
+    pub(crate) fn chunk_hot(&self, physical: u32, epoch: u32) -> bool {
+        self.effective(physical, epoch) >= self.threshold
+    }
+
+    /// G1 full-span gate: any 16-byte chunk overlapping `[physical, physical+len)` at or above the
+    /// threshold for `epoch`.
+    pub(crate) fn span_hot(&self, physical: u32, len: u32, epoch: u32) -> bool {
         if len == 0 {
             return false;
         }
         let first = physical >> 4;
         let last = physical.wrapping_add(len - 1) >> 4;
-        (first..=last).any(|global_chunk| self.effective(global_chunk << 4, epoch) >= threshold)
+        (first..=last).any(|global_chunk| self.chunk_hot(global_chunk << 4, epoch))
     }
 
     /// One-shot recovery probe: true when the chunk at `physical` carries a recorded stamp
@@ -99,32 +126,44 @@ impl SmcHeatMap {
     pub(crate) fn clear(&mut self) {
         self.pages.clear();
     }
-}
 
-/// The heat accessors of the block cache live beside the map they wrap (the cache's `smc_heat`
-/// and `smc_heat_threshold` fields are `pub(super)` for exactly this split). The demotion and
-/// recovery methods that also need the cache's entry states stay in direct.rs.
-impl super::direct::BlockCache {
-    /// G1: record `width` bytes of code invalidation at `physical` for `epoch` (the choke calls
-    /// this ONLY on an actual kill). Returns chunks that newly crossed the demotion threshold.
-    pub(crate) fn smc_heat_bump(&mut self, physical: u32, width: u32, epoch: u32) -> u32 {
-        let threshold = self.smc_heat_threshold;
-        self.smc_heat.bump(physical, width, epoch, threshold)
-    }
-
-    /// G1 cheap pre-compile gate: is the entry chunk at `physical` hot this epoch?
-    pub(crate) fn smc_heat_chunk_hot(&self, physical: u32, epoch: u32) -> bool {
-        self.smc_heat.effective(physical, epoch) >= self.smc_heat_threshold
-    }
-
-    /// G1 full-span gate: does any chunk under `[physical, physical+len)` read hot this epoch?
-    pub(crate) fn smc_heat_span_hot(&self, physical: u32, len: u32, epoch: u32) -> bool {
-        self.smc_heat
-            .span_hot(physical, len, epoch, self.smc_heat_threshold)
+    /// Reset coupling: drop the heat when the owning cache's reset counter has moved since the
+    /// last synchronization. See `CpuGsw::sync_smc_heat` for the contract.
+    pub(crate) fn sync_resets(&mut self, resets: u64) {
+        if self.synced_resets != resets {
+            self.clear();
+            self.synced_resets = resets;
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn set_smc_heat_threshold(&mut self, threshold: u8) {
-        self.smc_heat_threshold = threshold;
+    pub(crate) fn set_threshold(&mut self, threshold: u8) {
+        self.threshold = threshold;
+    }
+}
+
+// The map is a host-only accelerator field on CpuGsw, so it follows the decode-cache
+// conventions: clones drop the accumulated heat (the threshold policy is kept), equality always
+// holds (transparent to CpuGsw comparisons), and Debug prints terse.
+impl Clone for SmcHeatMap {
+    fn clone(&self) -> Self {
+        Self {
+            pages: HashMap::default(),
+            threshold: self.threshold,
+            synced_resets: 0,
+        }
+    }
+}
+
+impl PartialEq for SmcHeatMap {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SmcHeatMap {}
+
+impl std::fmt::Debug for SmcHeatMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SmcHeatMap {{ {} pages }}", self.pages.len())
     }
 }

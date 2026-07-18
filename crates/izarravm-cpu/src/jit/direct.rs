@@ -68,7 +68,9 @@ const DEFAULT_ADMISSION_HEAT: u8 = 8;
 #[cfg(test)]
 const DEFAULT_ADMISSION_HEAT: u8 = 1;
 
-pub(crate) use super::smc_heat::{SMC_HEAT_EPOCH_SHIFT, SMC_HEAT_THRESHOLD, SmcHeatMap};
+#[cfg(test)]
+pub(crate) use super::smc_heat::SMC_HEAT_THRESHOLD;
+pub(crate) use super::smc_heat::{SMC_HEAT_EPOCH_SHIFT, SmcHeatMap};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct LinkTarget {
@@ -550,10 +552,13 @@ pub(crate) struct BlockCache {
     backend_enabled: bool,
     auto_admit: bool,
     admission_heat: u8,
-    /// G1 SMC heat (super::smc_heat): kept out of the refcounted watch pages; cleared ONLY on reset.
-    /// `pub(super)` because the plain heat accessors live in smc_heat.rs beside the map.
-    pub(super) smc_heat: SmcHeatMap,
-    pub(super) smc_heat_threshold: u8,
+    /// Reset-coupling counter for the HOISTED heat map (Track C C1a-pre): the map lives on
+    /// `CpuGsw`, shared across backends by split borrow, but its lifetime contract is unchanged:
+    /// heat drops exactly when THIS cache resets its storage. Every reset (reset_storage and the
+    /// empty-cache clear fast path) bumps this; `CpuGsw::sync_smc_heat` observes the bump and
+    /// clears the shared map before the next heat access. An inactive backend's cache never
+    /// resets, so it can never erase the live backend's demotion evidence.
+    heat_resets: u64,
     stats: BlockCacheStats,
     code_watch: Box<NativeCodeWatch>,
     #[cfg(test)]
@@ -618,8 +623,7 @@ impl BlockCache {
             backend_enabled: super::host_supported(),
             auto_admit: false,
             admission_heat: DEFAULT_ADMISSION_HEAT,
-            smc_heat: SmcHeatMap::default(),
-            smc_heat_threshold: SMC_HEAT_THRESHOLD,
+            heat_resets: 0,
             stats: BlockCacheStats::default(),
             code_watch: Box::default(),
             #[cfg(test)]
@@ -855,19 +859,29 @@ impl BlockCache {
     /// The stamp is what makes the Dormant recognizably heat-scoped: once it goes stale (a later
     /// epoch), `lift_cold_smc_dormant` re-admits the key. Dormants parked for other reasons
     /// (compile Retry, G4 cover failure) carry no stamp and stay parked as before.
-    pub(crate) fn demote_smc_hot(&mut self, key: BlockKey, epoch: u32) {
+    /// How many storage resets this cache has performed (the hoisted heat map's reset
+    /// coupling; see the `heat_resets` field).
+    pub(crate) fn heat_resets(&self) -> u64 {
+        self.heat_resets
+    }
+
+    pub(crate) fn demote_smc_hot(&mut self, heat: &mut SmcHeatMap, key: BlockKey, epoch: u32) {
         self.dormant(key);
-        let threshold = self.smc_heat_threshold;
-        let _ = self.smc_heat.bump(key.physical, 1, epoch, threshold);
+        let _ = heat.bump(key.physical, 1, epoch);
     }
 
     /// G1 recovery: a heat-demoted Dormant whose entry-chunk stamp has aged out (older epoch)
     /// returns to Seen, so the next probe walks the normal admission path (both heat gates
     /// re-check). Seen rather than a remove keeps the key tracked exactly once in `physical_keys`
     /// (the `retire_key_for_recompile` transition); the stamp is consumed, one recovery per demotion.
-    pub(crate) fn lift_cold_smc_dormant(&mut self, key: BlockKey, epoch: u32) {
+    pub(crate) fn lift_cold_smc_dormant(
+        &mut self,
+        heat: &mut SmcHeatMap,
+        key: BlockKey,
+        epoch: u32,
+    ) {
         if self.entries.get(&key) == Some(&BlockState::Dormant)
-            && self.smc_heat.take_stale_stamp(key.physical, epoch)
+            && heat.take_stale_stamp(key.physical, epoch)
         {
             self.entries.insert(key, BlockState::Seen);
         }
@@ -897,8 +911,8 @@ impl BlockCache {
             if self.code_watch.has_resident_pages() {
                 self.code_watch.clear();
             }
-            // A full clear is the only place heat is dropped (cheap no-op when already empty).
-            self.smc_heat.clear();
+            // A full clear still drops heat: signal the owner of the hoisted map.
+            self.heat_resets = self.heat_resets.wrapping_add(1);
             self.disabled = false;
             return;
         }
@@ -1385,7 +1399,8 @@ impl BlockCache {
         }
         self.block_link_epochs.clear();
         self.code_watch.clear();
-        self.smc_heat.clear();
+        // Every storage reset drops heat; the owner of the hoisted map observes this counter.
+        self.heat_resets = self.heat_resets.wrapping_add(1);
         self.block_active.clear();
         self.free_block_slots.clear();
         self.live_blocks = 0;

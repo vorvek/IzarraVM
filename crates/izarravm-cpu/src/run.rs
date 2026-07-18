@@ -889,7 +889,11 @@ impl CpuGsw {
     /// chunk for cool-down recovery, and counts the demotion.
     #[cfg(feature = "jit")]
     fn smc_heat_demote(&mut self, key: jit::direct::BlockKey, epoch: u32) {
-        self.jit_direct.demote_smc_hot(key, epoch);
+        // Split borrow on the jit state: the cache mutates its entry states while stamping
+        // the shared map.
+        self.sync_smc_heat();
+        let jit = &mut *self.jit_direct;
+        jit.direct.demote_smc_hot(&mut jit.smc_heat, key, epoch);
         self.perf.smc_heat_demotions += 1;
     }
 
@@ -925,7 +929,10 @@ impl CpuGsw {
                 // Dormants without a heat stamp (Retry, G4 cover failure) stay parked. On the cold
                 // Rejected path only, so Ready hits never pay the lookup.
                 let heat_epoch = self.smc_heat_epoch();
-                self.jit_direct.lift_cold_smc_dormant(key, heat_epoch);
+                self.sync_smc_heat();
+                let jit = &mut *self.jit_direct;
+                jit.direct
+                    .lift_cold_smc_dormant(&mut jit.smc_heat, key, heat_epoch);
                 return Ok(DirectContinuation::Interpret);
             }
             jit::direct::BlockProbe::Ready(id) => self
@@ -939,7 +946,8 @@ impl CpuGsw {
                 // keep the demoted page alive; existing valid blocks keep running and links only
                 // form to installed blocks, so a demoted region starves naturally.
                 let heat_epoch = self.smc_heat_epoch();
-                if self.jit_direct.smc_heat_chunk_hot(key.physical, heat_epoch) {
+                self.sync_smc_heat();
+                if self.jit_direct.smc_heat.chunk_hot(key.physical, heat_epoch) {
                     self.smc_heat_demote(key, heat_epoch);
                     return Ok(DirectContinuation::Interpret);
                 }
@@ -981,7 +989,7 @@ impl CpuGsw {
                 // G1 pre-install gate (full span): the compiled block may cover chunks past its
                 // entry that are churning even when the entry chunk is cold. Refuse installation
                 // and park it Dormant so the whole span runs on the interpreter.
-                if self.jit_direct.smc_heat_span_hot(
+                if self.jit_direct.smc_heat.span_hot(
                     key.physical,
                     u32::from(compilation.span.guest_len),
                     heat_epoch,

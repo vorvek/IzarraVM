@@ -1390,61 +1390,60 @@ fn ranged_device_write_preserves_unrelated_blocks_and_unlinks_overlap() {
 
 #[test]
 fn smc_heat_crosses_the_threshold_within_one_epoch() {
-    let mut cache = BlockCache::default();
+    let mut heat = SmcHeatMap::default();
     let phys = 0x2_1234;
     for _ in 0..SMC_HEAT_THRESHOLD - 1 {
-        assert_eq!(cache.smc_heat_bump(phys, 4, 0), 0);
+        assert_eq!(heat.bump(phys, 4, 0), 0);
     }
-    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+    assert!(!heat.chunk_hot(phys, 0));
     // The threshold-th bump crosses and reports exactly one newly-hot chunk.
-    assert_eq!(cache.smc_heat_bump(phys, 4, 0), 1);
-    assert!(cache.smc_heat_chunk_hot(phys, 0));
+    assert_eq!(heat.bump(phys, 4, 0), 1);
+    assert!(heat.chunk_hot(phys, 0));
     // Saturated bumps neither overflow nor re-report the chunk.
-    assert_eq!(cache.smc_heat_bump(phys, 4, 0), 0);
-    assert!(cache.smc_heat_chunk_hot(phys, 0));
+    assert_eq!(heat.bump(phys, 4, 0), 0);
+    assert!(heat.chunk_hot(phys, 0));
 }
 
 #[test]
 fn smc_heat_ages_out_across_epochs_and_reenables_admission() {
-    let mut cache = BlockCache::default();
+    let mut heat = SmcHeatMap::default();
     let phys = 0x2_1234;
     for _ in 0..SMC_HEAT_THRESHOLD {
-        cache.smc_heat_bump(phys, 4, 7);
+        heat.bump(phys, 4, 7);
     }
-    assert!(cache.smc_heat_chunk_hot(phys, 7));
+    assert!(heat.chunk_hot(phys, 7));
     // A later epoch reads the stale stamp as zero, so admission is re-enabled, and a fresh bump
     // starts that epoch's count from one rather than inheriting the saturated older count.
-    assert!(!cache.smc_heat_chunk_hot(phys, 8));
-    assert_eq!(cache.smc_heat_bump(phys, 4, 8), 0);
-    assert!(!cache.smc_heat_chunk_hot(phys, 8));
+    assert!(!heat.chunk_hot(phys, 8));
+    assert_eq!(heat.bump(phys, 4, 8), 0);
+    assert!(!heat.chunk_hot(phys, 8));
 }
 
 #[test]
 fn smc_heat_span_hot_only_flags_overlapping_chunks() {
-    let mut cache = BlockCache::default();
+    let mut heat = SmcHeatMap::default();
     let hot = 0x2_1234; // 16-byte chunk 0x2_123
     for _ in 0..SMC_HEAT_THRESHOLD {
-        cache.smc_heat_bump(hot, 1, 0);
+        heat.bump(hot, 1, 0);
     }
-    assert!(cache.smc_heat_span_hot(0x2_1230, 8, 0));
-    assert!(!cache.smc_heat_span_hot(0x2_1220, 8, 0));
-    assert!(!cache.smc_heat_span_hot(0x2_1240, 8, 0));
+    assert!(heat.span_hot(0x2_1230, 8, 0));
+    assert!(!heat.span_hot(0x2_1220, 8, 0));
+    assert!(!heat.span_hot(0x2_1240, 8, 0));
     // A wide span reaching across the boundary into the hot chunk still demotes.
-    assert!(cache.smc_heat_span_hot(0x2_1228, 16, 0));
+    assert!(heat.span_hot(0x2_1228, 16, 0));
 }
 
 #[test]
 fn smc_heat_threshold_setter_and_clear() {
-    let mut cache = BlockCache::default();
-    cache.set_smc_heat_threshold(2);
+    let mut heat = SmcHeatMap::default();
+    heat.set_threshold(2);
     let phys = 0x2_1234;
-    cache.smc_heat_bump(phys, 4, 0);
-    assert!(!cache.smc_heat_chunk_hot(phys, 0));
-    cache.smc_heat_bump(phys, 4, 0);
-    assert!(cache.smc_heat_chunk_hot(phys, 0));
-    // A whole-cache clear is the only place heat is dropped.
-    cache.clear();
-    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+    heat.bump(phys, 4, 0);
+    assert!(!heat.chunk_hot(phys, 0));
+    heat.bump(phys, 4, 0);
+    assert!(heat.chunk_hot(phys, 0));
+    heat.clear();
+    assert!(!heat.chunk_hot(phys, 0));
 }
 
 #[cfg(any(
@@ -1453,22 +1452,58 @@ fn smc_heat_threshold_setter_and_clear() {
 ))]
 #[test]
 fn reset_storage_drops_smc_heat_but_incremental_invalidation_keeps_it() {
-    let mut cache = BlockCache::default();
+    // The hoisted-map reset coupling: the cache signals its storage resets through
+    // heat_resets, and the map owner (CpuGsw::sync_smc_heat) clears on observing one.
+    let mut cpu = CpuGsw::default();
     let phys = 0x60_010;
     for _ in 0..SMC_HEAT_THRESHOLD {
-        cache.smc_heat_bump(phys, 4, 0);
+        cpu.jit_direct.smc_heat.bump(phys, 4, 0);
     }
-    // Installing then draining a block (an incremental invalidation) leaves heat intact.
-    install_trivial(&mut cache, BlockKey::new(0x1000, phys, 7), 16);
-    cache.invalidate_physical_range(phys, 4);
+    // Installing then draining a block (an incremental invalidation) leaves heat intact:
+    // no storage reset happened, so a sync is a no-op.
+    install_trivial(&mut cpu.jit_direct, BlockKey::new(0x1000, phys, 7), 16);
+    cpu.jit_direct.invalidate_physical_range(phys, 4);
+    cpu.sync_smc_heat();
     assert!(
-        cache.smc_heat_chunk_hot(phys, 0),
+        cpu.jit_direct.smc_heat.chunk_hot(phys, 0),
         "heat survives invalidation"
     );
-    // A full reset (arena pressure / clear) is the only wipe.
-    install_trivial(&mut cache, BlockKey::new(0x1000, phys, 7), 16);
-    cache.clear();
-    assert!(!cache.smc_heat_chunk_hot(phys, 0));
+    // A full reset (arena pressure / clear) is the only wipe: the non-empty clear routes
+    // through reset_storage, which bumps the coupling counter.
+    install_trivial(&mut cpu.jit_direct, BlockKey::new(0x1000, phys, 7), 16);
+    cpu.jit_direct.clear();
+    cpu.sync_smc_heat();
+    assert!(!cpu.jit_direct.smc_heat.chunk_hot(phys, 0));
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn hoisted_heat_survives_a_foreign_reset_and_drops_on_the_owned_one() {
+    // Reset-coupling invariant (Track C C1a-pre): only the ACTIVE backend cache reset clears
+    // the shared map. A dormant backend resetting its own EMPTY cache must not erase the live
+    // backend demotion evidence: the map is keyed to the OWNED cache counter, so a foreign
+    // cache reset moves no counter the owner observes.
+    let mut cpu = CpuGsw::default();
+    let phys = 0x60_010;
+    for _ in 0..SMC_HEAT_THRESHOLD {
+        cpu.jit_direct.smc_heat.bump(phys, 4, 0);
+    }
+    // An unrelated (inactive) cache resets its empty storage; the shared map is untouched.
+    let mut foreign = BlockCache::default();
+    foreign.clear();
+    cpu.sync_smc_heat();
+    assert!(
+        cpu.jit_direct.smc_heat.chunk_hot(phys, 0),
+        "an inactive backend reset must not clear the shared map"
+    );
+    // The empty-cache clear FAST PATH on the owned cache still drops heat, exactly as it did
+    // when the map lived inside the cache.
+    cpu.jit_direct.clear();
+    cpu.sync_smc_heat();
+    assert!(!cpu.jit_direct.smc_heat.chunk_hot(phys, 0));
 }
 
 #[cfg(any(
@@ -1485,7 +1520,7 @@ fn smc_heat_accrues_only_on_actual_code_invalidation() {
         install_trivial(&mut cpu.jit_direct, key, 16);
         cpu.note_code_write(key.physical, 4);
     }
-    assert!(cpu.jit_direct.smc_heat_chunk_hot(key.physical, 0));
+    assert!(cpu.jit_direct.smc_heat.chunk_hot(key.physical, 0));
     assert_eq!(cpu.perf.smc_heat_chunks_hot, 1);
 
     // A data byte sharing the same 16-byte chunk as cold code (the block watches only its own
@@ -1496,7 +1531,7 @@ fn smc_heat_accrues_only_on_actual_code_invalidation() {
     for _ in 0..8 {
         cold.note_code_write(0x61_004, 1); // same chunk 0x61_00, unwatched byte
     }
-    assert!(!cold.jit_direct.smc_heat_chunk_hot(data_key.physical, 0));
+    assert!(!cold.jit_direct.smc_heat.chunk_hot(data_key.physical, 0));
     assert_eq!(cold.perf.smc_heat_chunks_hot, 0);
     assert!(matches!(
         cold.jit_direct.probe(data_key),
