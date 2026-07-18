@@ -956,6 +956,66 @@ fn linked_blocks_relocate_without_replacing_link_cells() {
     all(target_os = "linux", target_arch = "x86_64")
 ))]
 #[test]
+fn multi_page_span_filled_arena_compacts_and_relocates_blocks() {
+    // Fill-then-compact round trip through BlockCache::install's real full-arena
+    // recovery path, with a multi-page install_span alongside the one-page
+    // blocks so the span registry sees mixed span sizes in the source arena.
+    use super::super::exec_mem;
+    let mut cache = BlockCache::default();
+    let mut arena = exec_mem::ExecutableArena::with_len_for_test(8 * exec_mem::host_page_len())
+        .expect("small test arena");
+    let page = arena.slot_len();
+    let span_entry = arena
+        .install_span(&vec![0xC3u8; page + 8])
+        .expect("multi-page span");
+    assert!(arena.contains_sealed_span_range(span_entry, page + 8));
+    cache.arena = Some(arena);
+
+    // Six one-page blocks fill the remaining six pages.
+    let keys: Vec<BlockKey> = (0u32..6).map(|i| key(0x1000 + i * 0x100)).collect();
+    let ids: Vec<BlockId> = keys
+        .iter()
+        .map(|k| install_trivial(&mut cache, *k, 1))
+        .collect();
+    assert!(cache.arena.as_ref().expect("arena").is_full());
+
+    // Retire one block so compaction can reclaim, then let the next install
+    // fire compact_arena inside install() (the production recovery path).
+    assert_eq!(cache.invalidate_physical_range(keys[0].physical, 1), 1);
+    let new_key = key(0x2000);
+    let new_id = install_trivial(&mut cache, new_key, 1);
+
+    let stats = cache.take_stats();
+    assert_eq!(stats.arena_compactions, 1);
+    assert_eq!(stats.arena_compaction_failures, 0);
+    assert_eq!(stats.arena_compaction_live_blocks, 5);
+    assert_eq!(stats.cache_resets, 0);
+
+    // Every surviving entry relocated into the fresh arena stays a valid,
+    // executable span base under both range checks, and its portal is
+    // republished.
+    let survivors: Vec<BlockId> = ids[1..].iter().copied().chain([new_id]).collect();
+    let arena = cache.arena.as_ref().expect("fresh arena");
+    for id in survivors {
+        let block = cache.block(id).expect("surviving block");
+        let entry = block.entry_ptr();
+        let code_len = block.code_len as usize;
+        assert!(arena.contains_sealed_slot_range(entry, code_len));
+        assert!(arena.contains_sealed_span_range(entry, code_len));
+        let index = cache.active_index(id).expect("active survivor");
+        assert!(cache.block_portals[index].visible());
+        let f: extern "C" fn() = unsafe { std::mem::transmute(entry) };
+        f();
+    }
+    // The retired block did not survive.
+    assert!(cache.block(ids[0]).is_none());
+}
+
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
 fn unresolved_waiting_edge_survives_arena_compaction() {
     let mut cache = BlockCache::default();
     let source = key(0x1b00);

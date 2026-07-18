@@ -16,13 +16,21 @@ pub(crate) struct ExecutableBuffer {
 /// blocks can be sealed Read+Execute while unused slots remain Read+Write.
 pub(crate) const EXECUTABLE_ARENA_LEN: usize = 32 * 1024 * 1024;
 
-/// A bounded collection of one-page executable-code slots.
+/// A bounded collection of page-multiple executable-code spans. The Direct backend installs
+/// one-page spans through `install`; the clif backend's units may span multiple contiguous
+/// pages through `install_span`. Only span BASES are valid entries; the registry records every
+/// span as `(offset, len_rounded_to_pages)` in offset order.
 pub(crate) struct ExecutableArena {
     ptr: *mut u8,
     len: usize,
     page_len: usize,
     used: usize,
     sealed: usize,
+    /// Sealed spans, `(offset, rounded_len)`, sorted by offset (installation order).
+    spans: Vec<(usize, usize)>,
+    /// Spans appended by `append_unsealed` and not yet sealed; they register into `spans`
+    /// when `seal_used_prefix` succeeds.
+    pending_spans: Vec<(usize, usize)>,
 }
 
 /// Identifies one arena slot without exposing its address before that slot is executable.
@@ -73,8 +81,12 @@ impl ExecutableArena {
     /// Reserve the fixed-size arena as Read+Write memory. Individual pages become Read+Execute as
     /// blocks are installed. Unsupported hosts and allocation failure both return `None`.
     pub(crate) fn new() -> Option<Self> {
+        Self::with_len(EXECUTABLE_ARENA_LEN)
+    }
+
+    fn with_len(total_len: usize) -> Option<Self> {
         let page_len = page_size();
-        let len = EXECUTABLE_ARENA_LEN / page_len * page_len;
+        let len = total_len / page_len * page_len;
         if len == 0 {
             return None;
         }
@@ -85,28 +97,53 @@ impl ExecutableArena {
             page_len,
             used: 0,
             sealed: 0,
+            spans: Vec::new(),
+            pending_spans: Vec::new(),
         })
     }
 
-    /// Copy one block into the next page and seal that page Read+Execute.
+    /// Test seam: a small arena so fill-then-compact paths run without 32MB of installs.
+    #[cfg(test)]
+    pub(crate) fn with_len_for_test(total_len: usize) -> Option<Self> {
+        Self::with_len(total_len)
+    }
+
+    /// Copy one block into the next page and seal that page Read+Execute. A thin one-page-cap
+    /// wrapper over `install_span`, so the Direct backend's callers (which pre-reject oversized
+    /// compilations) govern unchanged.
     pub(crate) fn install(&mut self, code: &[u8]) -> Option<*const u8> {
-        if code.is_empty()
-            || code.len() > self.page_len
-            || self.is_full()
-            || self.sealed != self.used
-        {
+        if code.len() > self.page_len {
             return None;
         }
-        // SAFETY: `used < len`, both values are page-aligned, and this page has not previously
-        // been exposed or sealed.
-        let slot = unsafe { self.ptr.add(self.used) };
-        // SAFETY: the slot has `page_len` writable bytes and `code` fits in it.
+        self.install_span(code)
+    }
+
+    /// Copy a code buffer of any length into the next span (rounded up to a page multiple) and
+    /// seal exactly that span Read+Execute. The span registers under its base offset; only the
+    /// base is a valid entry.
+    pub(crate) fn install_span(&mut self, code: &[u8]) -> Option<*const u8> {
+        if code.is_empty() || self.sealed != self.used {
+            return None;
+        }
+        let rounded = code
+            .len()
+            .div_ceil(self.page_len)
+            .checked_mul(self.page_len)?;
+        let offset = self.used;
+        if rounded > self.len - offset {
+            return None;
+        }
+        // SAFETY: `offset + rounded <= len`, all values are page-aligned, and these pages have
+        // not previously been exposed or sealed.
+        let slot = unsafe { self.ptr.add(offset) };
+        // SAFETY: the span has `rounded` writable bytes and `code` fits in it.
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), slot, code.len()) };
-        if !flush_instruction_cache(slot, self.page_len) || !make_rx(slot, self.page_len) {
+        if !flush_instruction_cache(slot, rounded) || !make_rx(slot, rounded) {
             return None;
         }
-        self.used += self.page_len;
+        self.used += rounded;
         self.sealed = self.used;
+        self.spans.push((offset, rounded));
         Some(slot)
     }
 
@@ -123,6 +160,7 @@ impl ExecutableArena {
         // SAFETY: the slot has `page_len` writable bytes and `code` fits in it.
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), slot, code.len()) };
         self.used += self.page_len;
+        self.pending_spans.push((offset, self.page_len));
         Some(ArenaSlot(offset))
     }
 
@@ -136,25 +174,40 @@ impl ExecutableArena {
             return false;
         }
         self.sealed = self.used;
+        // `sealed == 0` above means `spans` is still empty, so the pending appends (made in
+        // offset order) keep the registry sorted.
+        self.spans.append(&mut self.pending_spans);
         true
     }
 
-    /// Return the entry for a slot only after its whole page has been sealed executable.
+    /// Return the entry for a slot only after its whole span has been sealed executable.
     pub(crate) fn sealed_slot_entry(&self, slot: ArenaSlot) -> Option<*const u8> {
-        self.slot_is_sealed(slot.0)
-            // SAFETY: `slot_is_sealed` proves the offset lies within this allocation.
+        self.sealed_span_len_at(slot.0)
+            .is_some()
+            // SAFETY: a registered sealed span proves the offset lies within this allocation.
             .then(|| unsafe { self.ptr.add(slot.0) as *const u8 })
     }
 
-    /// Whether `entry..entry+code_len` starts at, and stays within, one sealed arena slot.
-    pub(crate) fn contains_sealed_slot_range(&self, entry: *const u8, code_len: usize) -> bool {
-        if code_len == 0 || code_len > self.page_len {
+    /// Whether `entry..entry+code_len` starts at a sealed span BASE and stays within that span.
+    pub(crate) fn contains_sealed_span_range(&self, entry: *const u8, code_len: usize) -> bool {
+        if code_len == 0 {
             return false;
         }
         let Some(offset) = (entry as usize).checked_sub(self.ptr as usize) else {
             return false;
         };
-        self.slot_is_sealed(offset)
+        self.sealed_span_len_at(offset)
+            .is_some_and(|span_len| code_len <= span_len)
+    }
+
+    /// Whether `entry..entry+code_len` starts at, and stays within, one sealed arena slot. The
+    /// one-page-cap contract for the Direct backend's callers; implemented over the span
+    /// registry (every legacy one-page install is a one-page span).
+    pub(crate) fn contains_sealed_slot_range(&self, entry: *const u8, code_len: usize) -> bool {
+        if code_len > self.page_len {
+            return false;
+        }
+        self.contains_sealed_span_range(entry, code_len)
     }
 
     /// Borrow the exact requested bytes from a validated sealed slot.
@@ -166,11 +219,16 @@ impl ExecutableArena {
         Some(unsafe { std::slice::from_raw_parts(entry, code_len) })
     }
 
-    fn slot_is_sealed(&self, offset: usize) -> bool {
-        offset.is_multiple_of(self.page_len)
-            && offset
-                .checked_add(self.page_len)
-                .is_some_and(|end| end <= self.sealed)
+    /// The registered span length at `offset` when `offset` is a span BASE whose whole span is
+    /// sealed, else `None`. Mid-span offsets (including interior page boundaries) have no
+    /// registry entry and always miss.
+    fn sealed_span_len_at(&self, offset: usize) -> Option<usize> {
+        let index = self
+            .spans
+            .binary_search_by_key(&offset, |(base, _)| *base)
+            .ok()?;
+        let (base, span_len) = self.spans[index];
+        (base + span_len <= self.sealed).then_some(span_len)
     }
 
     pub(crate) fn is_full(&self) -> bool {
