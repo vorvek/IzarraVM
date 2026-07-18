@@ -1231,6 +1231,9 @@ impl CpuGsw {
                     code_watch_tables,
                     segments: segment_layout,
                     cpl3: memory_cpl3,
+                    // Stable for the CPU's lifetime: one Box<JitState>, and clones drop
+                    // every compiled unit, so no unit outlives its baked pointer.
+                    mode13_lanes: std::ptr::from_mut(&mut self.jit_direct.clif_run.mode13) as usize,
                 };
                 if self.jit_direct.clif_backend.is_none() {
                     self.jit_direct.clif_backend = jit::clif::ClifBackend::new();
@@ -1415,6 +1418,7 @@ impl CpuGsw {
         self.jit_direct.clif_run.caught_panic = None;
         self.jit_direct.clif_run.last_callout_eip = 0;
         self.jit_direct.clif_run.callout_core_clocks = 0;
+        self.jit_direct.clif_run.mode13 = Default::default();
         self.jit_direct.clif_run.snapshot_mode_key = self.jit_mode_key();
         self.jit_direct.clif_run.snapshot_cpl = self.current_privilege_level();
         self.jit_direct.clif_run.snapshot_cs = self.registers.cs();
@@ -1537,27 +1541,63 @@ impl CpuGsw {
             }
             self.registers.eip = final_eip;
         }
-        // C1c: the retired prefix's static data-access counts, charged through the SAME
-        // RAM-lane bus call Direct's run uses (run.rs's data_clocks region). Static counts
-        // are exact here because increment 1's identity check retires RAM accesses only
-        // (a mode13 or unavailable page side-exits before its slot charges anything), and
-        // the failing slot itself contributes nothing (cum_access_before is a strict-prefix
-        // array, the no-double-charge rule of design section 3).
+        // C1c: the retired prefix's data-access charges in Direct's exact split
+        // (run.rs's data_clocks region): RAM lanes are the STATIC prefix counts MINUS the
+        // DYNAMIC mode13 lanes the unit accrued (every retired access is exactly one of
+        // the two kinds; the failing slot contributed to neither, per the strict-prefix
+        // cum arrays and the post-commit completion discipline), charged at the RAM data
+        // cost; mode13 READS charge at the mode13 data cost; mode13 WRITES and the
+        // dirty-page bitset relay through charge_native_mode13_writes, never through
+        // data_clocks, exactly as run_direct_block splits them.
         let access = if stop_slot == unit.leading as usize {
             unit.access_total
         } else {
             unit.cum_access_before[stop_slot]
         };
+        let m13 = &self.jit_direct.clif_run.mode13;
+        debug_assert!(m13.byte_reads <= u64::from(access.byte_reads));
+        debug_assert!(m13.word_reads <= u64::from(access.word_reads));
+        debug_assert!(m13.dword_reads <= u64::from(access.dword_reads));
+        debug_assert!(m13.byte_writes <= u64::from(access.byte_stores));
+        debug_assert!(m13.word_writes <= u64::from(access.word_stores));
+        debug_assert!(m13.dword_writes <= u64::from(access.dword_stores));
+        debug_assert!(m13.dirty_pages <= u64::from(u16::MAX));
+        let mode13_writes = izarravm_bus::NativeMode13Writes {
+            dirty_pages: m13.dirty_pages as u16,
+            byte_writes: m13.byte_writes,
+            word_writes: m13.word_writes,
+            dword_writes: m13.dword_writes,
+        };
         if !access.is_zero() {
-            let data_clocks =
-                bus.jit_data_cost_clocks(BusWidth::Byte)
-                    .saturating_mul(u64::from(access.byte_reads) + u64::from(access.byte_stores))
-                    .saturating_add(bus.jit_data_cost_clocks(BusWidth::Word).saturating_mul(
-                        u64::from(access.word_reads) + u64::from(access.word_stores),
-                    ))
-                    .saturating_add(bus.jit_data_cost_clocks(BusWidth::Dword).saturating_mul(
-                        u64::from(access.dword_reads) + u64::from(access.dword_stores),
-                    ));
+            let ram_bytes = (u64::from(access.byte_reads) - m13.byte_reads)
+                + (u64::from(access.byte_stores) - m13.byte_writes);
+            let ram_words = (u64::from(access.word_reads) - m13.word_reads)
+                + (u64::from(access.word_stores) - m13.word_writes);
+            let ram_dwords = (u64::from(access.dword_reads) - m13.dword_reads)
+                + (u64::from(access.dword_stores) - m13.dword_writes);
+            let mode13_read_clocks = bus
+                .jit_mode13_data_cost_clocks(BusWidth::Byte)
+                .saturating_mul(m13.byte_reads)
+                .saturating_add(
+                    bus.jit_mode13_data_cost_clocks(BusWidth::Word)
+                        .saturating_mul(m13.word_reads),
+                )
+                .saturating_add(
+                    bus.jit_mode13_data_cost_clocks(BusWidth::Dword)
+                        .saturating_mul(m13.dword_reads),
+                );
+            let data_clocks = bus
+                .jit_data_cost_clocks(BusWidth::Byte)
+                .saturating_mul(ram_bytes)
+                .saturating_add(
+                    bus.jit_data_cost_clocks(BusWidth::Word)
+                        .saturating_mul(ram_words),
+                )
+                .saturating_add(
+                    bus.jit_data_cost_clocks(BusWidth::Dword)
+                        .saturating_mul(ram_dwords),
+                )
+                .saturating_add(mode13_read_clocks);
             bus.charge_bus_clocks_bulk(data_clocks);
             if access.stores() != 0
                 && let Some(page) = self.prefetch.physical_page()
@@ -1568,6 +1608,7 @@ impl CpuGsw {
                 self.record_write_page(page << 12);
             }
         }
+        bus.charge_native_mode13_writes(mode13_writes);
         let charged = self.scale_clocks_batch(raw_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += lowered_retired;

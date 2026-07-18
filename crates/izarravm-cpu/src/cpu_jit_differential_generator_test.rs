@@ -3780,3 +3780,296 @@ fn clif_rmw_watched_dest_orderings_exit_with_code_watch() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Track C C1c increment 6: the mode13 dynamic-lane battery (design test 9's VGA-aperture
+// coverage) plus the residual section 5 items.
+// ---------------------------------------------------------------------------------------
+
+/// Every write-capable variant against the VGA aperture (design section 4's dynamic
+/// lanes): loads, stores, an RMW ALU, a word memory INC, a memory double shift, and a
+/// push/pop pair with ESP parked in the aperture, all retiring NATIVELY on mode13 pages
+/// with byte-identical state, memory, and timing, and with the bus-side mode13 write
+/// counters and the dirty-page bitset equal across the arms and matching the exact pages
+/// written (bits 1, 3, and 5 for 0xA1000/0xA3000/0xA5000).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_vga_aperture_accesses_match_interpreter_and_dirty_lanes() {
+    let entry = 0x1000u32;
+    let code: &[u8] = &[
+        0x90, // nop starter
+        0xa1, 0x00, 0x10, 0x0a, 0x00, // mov eax, [0xa1000] (mode13 dword read)
+        0xa3, 0x00, 0x10, 0x0a, 0x00, // mov [0xa1000], eax (mode13 dword write, bit 1)
+        0x8a, 0x1d, 0x04, 0x10, 0x0a, 0x00, // mov bl, [0xa1004] (mode13 byte read)
+        0x88, 0x1d, 0x05, 0x10, 0x0a, 0x00, // mov [0xa1005], bl (mode13 byte write)
+        0x66, 0x8b, 0x0d, 0x06, 0x10, 0x0a, 0x00, // mov cx, [0xa1006] (mode13 word read)
+        0x66, 0x89, 0x0d, 0x08, 0x10, 0x0a, 0x00, // mov [0xa1008], cx (mode13 word write)
+        0x01, 0x05, 0x00, 0x30, 0x0a, 0x00, // add [0xa3000], eax (mode13 RMW, bit 3)
+        0x66, 0xff, 0x05, 0x0c, 0x10, 0x0a, 0x00, // inc word [0xa100c] (mode13 word RMW)
+        0x0f, 0xa4, 0x1d, 0x10, 0x10, 0x0a, 0x00, 0x05, // shld [0xa1010], ebx, 5 (mode13 RMW)
+        0x50, // push eax (ESP parked at 0xa5004: mode13 dword write, bit 5)
+        0x5f, // pop edi (mode13 dword read)
+        0xf4,
+    ];
+    let mut memory = vec![0xf4u8; 0xb0000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut interp = generated_cpu(GswMode::Gsw586);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let pass = |interp: &mut CpuGsw,
+                clif: &mut CpuGsw,
+                interp_bus: &mut TestBus,
+                clif_bus: &mut TestBus| {
+        for (cpu, bus) in [
+            (&mut *interp, &mut *interp_bus),
+            (&mut *clif, &mut *clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&memory);
+            bus.trace.clear();
+            bus.mode13_dirty_pages = 0;
+            bus.mode13_byte_writes = 0;
+            bus.mode13_word_writes = 0;
+            bus.mode13_dword_writes = 0;
+            cpu.halted = false;
+            cpu.registers.gpr = [
+                0x1122_3344,
+                0x0000_0011,
+                0xfff0_1234,
+                0x7fff_ffff,
+                0xa_5004,
+                0x0f0f_0f0f,
+                0xdead_beef,
+                0,
+            ];
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+        }
+        assert_eq!(clif.registers, interp.registers);
+        assert_eq!(clif.pending_flags, interp.pending_flags);
+        assert_eq!(clif.eflags(), interp.eflags());
+        assert_eq!(clif_bus.memory, interp_bus.memory);
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+        assert_eq!(clif.timing_rem, interp.timing_rem);
+        // The bus-side mode13 lanes must agree across the arms EVERY pass, whichever mix
+        // of native and interpreted retirement produced them.
+        assert_eq!(clif_bus.mode13_dirty_pages, interp_bus.mode13_dirty_pages);
+        assert_eq!(clif_bus.mode13_byte_writes, interp_bus.mode13_byte_writes);
+        assert_eq!(clif_bus.mode13_word_writes, interp_bus.mode13_word_writes);
+        assert_eq!(clif_bus.mode13_dword_writes, interp_bus.mode13_dword_writes);
+    };
+    for _ in 0..4 {
+        pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    }
+    let before = clif.jit_clif_counters();
+    assert!(before.entries > 0, "unit never entered: {before:#?}");
+    pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    let after = clif.jit_clif_counters();
+    // A warm pass retires the whole aperture mix natively: no unavailable/kind exits.
+    assert_eq!(
+        after.mem_exit_unavailable_or_kind, before.mem_exit_unavailable_or_kind,
+        "warm mode13 accesses must retire natively: {after:#?}"
+    );
+    assert!(after.entries > before.entries);
+    // The exact dirty pages: 0xa1000 (bit 1), 0xa3000 (bit 3), 0xa5000 (bit 5).
+    assert_eq!(
+        clif_bus.mode13_dirty_pages,
+        (1 << 1) | (1 << 3) | (1 << 5),
+        "the dirty-page bitset must name exactly the written aperture pages"
+    );
+    assert!(clif_bus.mode13_dword_writes > 0);
+    assert!(clif_bus.mode13_word_writes > 0);
+    assert!(clif_bus.mode13_byte_writes > 0);
+}
+
+/// The dword memory INC/DEC stays RAM-only on BOTH backends (Direct's
+/// emit_rmw_inc_dec_dword admits a single kind; the clif lowering mirrors it per the
+/// fidelity rule): on a mode13 page it side-exits with the unavailable/kind reason every
+/// entry and the interpreter retires it canonically, byte-identically.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_dword_inc_on_vga_stays_ram_only_like_direct() {
+    let entry = 0x1000u32;
+    let code: &[u8] = &[
+        0x40, // inc eax (a retired native prefix)
+        0xff, 0x05, 0x00, 0x10, 0x0a, 0x00, // inc dword [0xa1000] (RAM-only form)
+        0xf4,
+    ];
+    let mut memory = vec![0xf4u8; 0xb0000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut interp = generated_cpu(GswMode::Gsw586);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    let pass = |interp: &mut CpuGsw,
+                clif: &mut CpuGsw,
+                interp_bus: &mut TestBus,
+                clif_bus: &mut TestBus| {
+        for (cpu, bus) in [
+            (&mut *interp, &mut *interp_bus),
+            (&mut *clif, &mut *clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = forced_gpr();
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+        }
+        assert_eq!(clif.registers, interp.registers);
+        assert_eq!(clif.eflags(), interp.eflags());
+        assert_eq!(clif_bus.memory, interp_bus.memory);
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+    };
+    for _ in 0..4 {
+        pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    }
+    let before = clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    let after = clif.jit_clif_counters();
+    assert!(
+        after.mem_exit_unavailable_or_kind > before.mem_exit_unavailable_or_kind,
+        "the RAM-only dword INC must side-exit on the mode13 page: {after:#?}"
+    );
+}
+
+/// Design section 5 test 6: a 16-bit addressing mode (address-size override) never
+/// reaches either backend as a memory-form kind; growth stops identically at the
+/// prefixed instruction, proving the excluded-by-construction claim rather than
+/// asserting it.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_sixteen_bit_addressing_stops_growth() {
+    use crate::jit::clif::cache::walk_unit;
+
+    // nop; inc eax; mov eax, [0x5000] with the 0x67 prefix (16-bit moffs); hlt.
+    let clif = run_clif_forced_case(
+        GswMode::Gsw586,
+        &[0x90, 0x40, 0x67, 0xa1, 0x00, 0x50, 0xf4],
+        forced_gpr(),
+        0x202,
+    );
+    let layout = walk_unit(&clif, 0x1001, true).expect("walked layout");
+    assert_eq!(
+        layout.kinds.len(),
+        1,
+        "a 16-bit addressing form must stop growth on both backends"
+    );
+}
+
+/// A data window the FastMap cannot serve for WRITES (the MMIO-shaped rejection of design
+/// section 5 test 4, in this harness's vocabulary: the bus denies the direct write page,
+/// so no write bias can ever populate): reads retire natively, the store side-exits with
+/// the unavailable reason every entry, and the interpreter performs the canonical bus
+/// write, byte-identically.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_unserved_write_window_side_exits_to_the_canonical_bus_write() {
+    let entry = 0x1000u32;
+    let code: &[u8] = &[
+        0x40, // inc eax
+        0xa1, 0x00, 0x80, 0x0b, 0x00, // mov eax, [0xb8000] (read side serves natively)
+        0xa3, 0x00, 0x80, 0x0b, 0x00, // mov [0xb8000], eax (write page denied)
+        0xf4,
+    ];
+    let mut memory = vec![0xf4u8; 0xc0000];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(code);
+
+    let mut interp = generated_cpu(GswMode::Gsw586);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+        bus.direct_write_denied_page = Some(0xb_8000);
+    }
+    let pass = |interp: &mut CpuGsw,
+                clif: &mut CpuGsw,
+                interp_bus: &mut TestBus,
+                clif_bus: &mut TestBus| {
+        for (cpu, bus) in [
+            (&mut *interp, &mut *interp_bus),
+            (&mut *clif, &mut *clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = forced_gpr();
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+        }
+        assert_eq!(clif.registers, interp.registers);
+        assert_eq!(clif.eflags(), interp.eflags());
+        assert_eq!(clif_bus.memory, interp_bus.memory);
+        assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks);
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks()
+        );
+    };
+    for _ in 0..4 {
+        pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    }
+    let before = clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    pass(&mut interp, &mut clif, &mut interp_bus, &mut clif_bus);
+    let after = clif.jit_clif_counters();
+    assert!(
+        after.mem_exit_unavailable_or_kind > before.mem_exit_unavailable_or_kind,
+        "the unserved write window must exit through the bias sentinel: {after:#?}"
+    );
+}

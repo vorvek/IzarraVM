@@ -36,13 +36,14 @@ use super::super::direct::{
     SideExitReason, StoreSource,
 };
 use super::super::fast_map::{
-    NATIVE_KIND_MASK, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER, NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND,
-    NATIVE_UNAVAILABLE_BIAS, NativeMapBases,
+    NATIVE_KIND_MASK, NATIVE_MODE13_KIND, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER,
+    NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND, NATIVE_UNAVAILABLE_BIAS, NativeMapBases,
 };
 use super::ClifBackend;
 use super::cache::{ClifAccessCounts, UnitLayout};
 use super::callout::{
-    CLIF_CALLOUT_CONTINUE, ClifCallOutTable, callout_shim_signature, callout_unit_signature,
+    CLIF_CALLOUT_CONTINUE, ClifCallOutTable, ClifMode13Lanes, callout_shim_signature,
+    callout_unit_signature,
 };
 use crate::{CpuGsw, PendingFlags, Registers};
 
@@ -84,6 +85,10 @@ pub(crate) struct UnitMemoryContext {
     pub(crate) code_watch_tables: [usize; 2],
     pub(crate) segments: SegmentLayout,
     pub(crate) cpl3: bool,
+    /// The baked address of `ClifRunScratch.mode13` (C1c increment 6): the dynamic mode13
+    /// lanes the compiled unit increments in place. Stable for the CPU's lifetime (one
+    /// `Box<JitState>`; clones drop all units).
+    pub(crate) mode13_lanes: usize,
 }
 
 /// The static execution plan derived from a walked unit's kinds: which leading slots run
@@ -786,13 +791,14 @@ impl<'a> UnitBuilder<'a> {
     }
 
     /// Steps 1-4 of the normative check sequence (design section 2's intro): segment limit
-    /// (including the compile-time underflow edge), the wide-page guard, the identity/kind
-    /// check, and the CPL3-conditional permission check. Returns `(linear, page64)`: the
-    /// segmented linear address and the linear page index widened to i64, with the
-    /// permission step already applied. The clippy arity allowance is deliberate: this is
-    /// the one shared body of the per-access check sequence and every argument is a
-    /// distinct check input; splitting it would scatter the normative order across
-    /// helpers.
+    /// (including the compile-time underflow edge), the wide-page guard, the two-kind
+    /// identity check, and the CPL3-conditional permission check. Returns
+    /// `(linear, page64, is_mode13)`: the segmented linear address, the linear page index
+    /// widened to i64, and the runtime mode13 flag (i32 0/1, constant zero when the
+    /// variant is RAM-only), with the permission step already applied. The clippy arity
+    /// allowance is deliberate: this is the one shared body of the per-access check
+    /// sequence and every argument is a distinct check input; splitting it would scatter
+    /// the normative order across helpers.
     #[allow(clippy::too_many_arguments)]
     fn mem_checked_page(
         &mut self,
@@ -803,7 +809,8 @@ impl<'a> UnitBuilder<'a> {
         slot: usize,
         side: Block,
         write: bool,
-    ) -> (Value, Value) {
+        admit_mode13: bool,
+    ) -> (Value, Value, Value) {
         // Step 1: segment limit against the EFFECTIVE address, before the base add,
         // matching emit_segmented_linear_address (emit.rs:1741). The descriptor is the
         // unit's own captured snapshot, compile-time data (the entry guards revalidate it
@@ -847,12 +854,11 @@ impl<'a> UnitBuilder<'a> {
             );
             self.check_fail(cond, side, slot, SideExitReason::CrossPageOrAlignment);
         }
-        // Step 3: identity/kind. INCREMENT-1 RESTRICTION (recorded deviation): only
-        // NATIVE_RAM_KIND continues; a mode13 page side-exits to the interpreter's
-        // canonical access instead of taking Direct's mode13 arm, because the dynamic
-        // mode13 counter/dirty lanes are not threaded through the clif unit yet. Sound and
-        // byte-identical (the failing slot charges nothing natively and the interpreter
-        // re-executes it), merely slower on VGA-touching units until the mode13 increment.
+        // Step 3: identity/kind, the two-kind branch (design section 2.1; the increment-1
+        // RAM-only restriction is lifted, amendment 3): NATIVE_RAM_KIND and
+        // NATIVE_MODE13_KIND both continue, anything else side-exits. `admit_mode13` is
+        // false only where Direct's own emission is RAM-only (the dword memory INC/DEC,
+        // emit_rmw_inc_dec_dword's single-kind compare), mirrored per the fidelity rule.
         let page = self.b.ins().ushr_imm(linear, i64::from(NATIVE_PAGE_SHIFT));
         let page64 = self.b.ins().uextend(types::I64, page);
         let flags_base = self.iconst64(map.flags() as u64);
@@ -860,11 +866,24 @@ impl<'a> UnitBuilder<'a> {
         let memflags = self.flags();
         let fb = self.b.ins().uload8(types::I32, memflags, flags_addr, 0);
         let kind = self.b.ins().band_imm(fb, i64::from(NATIVE_KIND_MASK));
-        let cond = self
+        let is_ram = self
             .b
             .ins()
-            .icmp_imm(IntCC::NotEqual, kind, i64::from(NATIVE_RAM_KIND));
-        self.check_fail(cond, side, slot, SideExitReason::UnavailableOrKind);
+            .icmp_imm(IntCC::Equal, kind, i64::from(NATIVE_RAM_KIND));
+        let (fail, is_mode13) = if admit_mode13 {
+            let is_m13 = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(NATIVE_MODE13_KIND));
+            let ok = self.b.ins().bor(is_ram, is_m13);
+            let fail = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+            let is_m13 = self.b.ins().uextend(types::I32, is_m13);
+            (fail, is_m13)
+        } else {
+            let fail = self.b.ins().icmp_imm(IntCC::Equal, is_ram, 0);
+            (fail, self.iconst(0))
+        };
+        self.check_fail(fail, side, slot, SideExitReason::UnavailableOrKind);
         // Step 4: permission, CPL3-conditional at COMPILE time (two code shapes, never a
         // runtime CPL read), matching emit_read/write_permission_check (emit.rs:2047-2072):
         // ring 0 emits no check at all (a populated bias already proves the walk admitted
@@ -879,7 +898,115 @@ impl<'a> UnitBuilder<'a> {
             let cond = self.b.ins().icmp_imm(IntCC::NotEqual, bits, need);
             self.check_fail(cond, side, slot, SideExitReason::Permission);
         }
-        (linear, page64)
+        (linear, page64, is_mode13)
+    }
+
+    /// One dynamic mode13 lane increment through the baked scratch pointer.
+    fn mode13_lane_bump(&mut self, field_offset: usize) {
+        let ptr = self.iconst64((self.mem.mode13_lanes + field_offset) as u64);
+        let memflags = self.flags();
+        let v = self.b.ins().load(types::I64, memflags, ptr, 0);
+        let v = self.b.ins().iadd_imm(v, 1);
+        self.b.ins().store(memflags, v, ptr, 0);
+    }
+
+    /// The dirty-page bit for a committed mode13 write: bit
+    /// `(physical_page - 0xA0000) >> 12` of the lanes' bitset, mirroring
+    /// emit_mode13_dirty_bit (emit.rs:2251).
+    fn mode13_dirty_bit(&mut self, map: NativeMapBases, page64: Value) {
+        let memflags = self.flags();
+        let idx4 = self.b.ins().ishl_imm(page64, 2);
+        let ppb = self.iconst64(map.physical_pages() as u64);
+        let pa = self.b.ins().iadd(ppb, idx4);
+        let phys = self.b.ins().load(types::I32, memflags, pa, 0);
+        let rel = self.b.ins().iadd_imm(phys, -0x000a_0000i64);
+        let idx = self.b.ins().ushr_imm(rel, 12);
+        let idx64 = self.b.ins().uextend(types::I64, idx);
+        let one = self.b.ins().iconst(types::I64, 1);
+        let bit = self.b.ins().ishl(one, idx64);
+        let ptr = self
+            .iconst64((self.mem.mode13_lanes + offset_of!(ClifMode13Lanes, dirty_pages)) as u64);
+        let cur = self.b.ins().load(types::I64, memflags, ptr, 0);
+        let merged = self.b.ins().bor(cur, bit);
+        self.b.ins().store(memflags, merged, ptr, 0);
+    }
+
+    fn mode13_read_lane(width: MemoryWidth) -> usize {
+        match width {
+            MemoryWidth::Byte => offset_of!(ClifMode13Lanes, byte_reads),
+            MemoryWidth::Word => offset_of!(ClifMode13Lanes, word_reads),
+            MemoryWidth::Dword => offset_of!(ClifMode13Lanes, dword_reads),
+        }
+    }
+
+    fn mode13_write_lane(width: MemoryWidth) -> usize {
+        match width {
+            MemoryWidth::Byte => offset_of!(ClifMode13Lanes, byte_writes),
+            MemoryWidth::Word => offset_of!(ClifMode13Lanes, word_writes),
+            MemoryWidth::Dword => offset_of!(ClifMode13Lanes, dword_writes),
+        }
+    }
+
+    /// Post-commit dynamic accounting for a completed READ (design section 4's mode13
+    /// bullet, mirroring emit_mode13_read_completion): the mode13 arm bumps its width
+    /// lane; the RAM arm counts nothing dynamically (RAM lanes are static minus mode13 on
+    /// the Rust side).
+    fn mode13_read_completion(&mut self, is_mode13: Value, width: MemoryWidth) {
+        let blk = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.ins().brif(is_mode13, blk, &[], join, &[]);
+        self.b.switch_to_block(blk);
+        self.b.seal_block(blk);
+        self.mode13_lane_bump(Self::mode13_read_lane(width));
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+        self.b.seal_block(join);
+    }
+
+    /// Post-commit dynamic accounting for a completed STORE: the mode13 arm bumps its
+    /// width write lane and sets the dirty-page bit (mirroring emit_store's mode13 arm).
+    fn mode13_write_completion(
+        &mut self,
+        is_mode13: Value,
+        width: MemoryWidth,
+        map: NativeMapBases,
+        page64: Value,
+    ) {
+        let blk = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.ins().brif(is_mode13, blk, &[], join, &[]);
+        self.b.switch_to_block(blk);
+        self.b.seal_block(blk);
+        self.mode13_lane_bump(Self::mode13_write_lane(width));
+        self.mode13_dirty_bit(map, page64);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+        self.b.seal_block(join);
+    }
+
+    /// Post-commit dynamic accounting for a completed READ-MODIFY-WRITE: the mode13 arm
+    /// bumps BOTH width lanes plus the dirty bit (mirroring the mode13 arms of
+    /// emit_alu_mem_dest, emit_double_shift_mem, and the word emit_rmw_inc_dec; per the
+    /// section 2.9 discipline the internal read counts nothing until the whole access
+    /// commits).
+    fn mode13_rmw_completion(
+        &mut self,
+        is_mode13: Value,
+        width: MemoryWidth,
+        map: NativeMapBases,
+        page64: Value,
+    ) {
+        let blk = self.b.create_block();
+        let join = self.b.create_block();
+        self.b.ins().brif(is_mode13, blk, &[], join, &[]);
+        self.b.switch_to_block(blk);
+        self.b.seal_block(blk);
+        self.mode13_lane_bump(Self::mode13_read_lane(width));
+        self.mode13_lane_bump(Self::mode13_write_lane(width));
+        self.mode13_dirty_bit(map, page64);
+        self.b.ins().jump(join, &[]);
+        self.b.switch_to_block(join);
+        self.b.seal_block(join);
     }
 
     /// One bias-table lookup plus the UNAVAILABLE sentinel check (design section 2.3, the
@@ -1003,8 +1130,8 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+        let (linear, page64, is_mode13) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false, true);
         let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let value = match width {
@@ -1012,6 +1139,7 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
         };
+        self.mode13_read_completion(is_mode13, width);
         self.write_width(dst, width, value);
         self.finish_mem_slot(side, delta);
     }
@@ -1035,8 +1163,8 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true);
+        let (linear, page64, is_mode13) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true, true);
         let host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
         self.code_watch_checks(map, linear, page64, width, slot, side);
         let value = match source {
@@ -1049,18 +1177,8 @@ impl<'a> UnitBuilder<'a> {
                 unreachable!("EipDelta store sources exist only inside Call, a terminal")
             }
         };
-        let memflags = self.flags();
-        match width {
-            MemoryWidth::Byte => {
-                self.b.ins().istore8(memflags, value, host, 0);
-            }
-            MemoryWidth::Word => {
-                self.b.ins().istore16(memflags, value, host, 0);
-            }
-            MemoryWidth::Dword => {
-                self.b.ins().store(memflags, value, host, 0);
-            }
-        }
+        self.store_width(width, value, host);
+        self.mode13_write_completion(is_mode13, width, map, page64);
         self.finish_mem_slot(side, delta);
     }
 
@@ -1084,13 +1202,14 @@ impl<'a> UnitBuilder<'a> {
         self.b.append_block_param(side, types::I64);
         let esp = self.gpr32(4);
         let eff = self.b.ins().iadd_imm(esp, -4);
-        let (linear, page64) = self.mem_checked_page(
+        let (linear, page64, is_mode13) = self.mem_checked_page(
             map,
             crate::SegmentIndex::Ss,
             eff,
             MemoryWidth::Dword,
             slot,
             side,
+            true,
             true,
         );
         let host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
@@ -1104,6 +1223,7 @@ impl<'a> UnitBuilder<'a> {
         };
         let memflags = self.flags();
         self.b.ins().store(memflags, value, host, 0);
+        self.mode13_write_completion(is_mode13, MemoryWidth::Dword, map, page64);
         let new_esp = self.b.ins().iadd_imm(esp, -4);
         self.set_gpr32(4, new_esp);
         self.finish_mem_slot(side, delta);
@@ -1123,7 +1243,7 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let esp = self.gpr32(4);
-        let (linear, page64) = self.mem_checked_page(
+        let (linear, page64, is_mode13) = self.mem_checked_page(
             map,
             crate::SegmentIndex::Ss,
             esp,
@@ -1131,10 +1251,12 @@ impl<'a> UnitBuilder<'a> {
             slot,
             side,
             false,
+            true,
         );
         let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let value = self.b.ins().load(types::I32, memflags, host, 0);
+        self.mode13_read_completion(is_mode13, MemoryWidth::Dword);
         let new_esp = self.b.ins().iadd_imm(esp, 4);
         self.set_gpr32(4, new_esp);
         self.set_gpr32(dst, value);
@@ -1163,8 +1285,8 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+        let (linear, page64, is_mode13) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false, true);
         let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let b = match width {
@@ -1172,6 +1294,7 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
         };
+        self.mode13_read_completion(is_mode13, width);
         self.lower_alu(op, dst, b, width);
         self.finish_mem_slot(side, delta);
     }
@@ -1195,8 +1318,8 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+        let (linear, page64, is_mode13) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, false, true);
         let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let va = match width {
@@ -1204,6 +1327,7 @@ impl<'a> UnitBuilder<'a> {
             MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
             MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
         };
+        self.mode13_read_completion(is_mode13, width);
         let vb = match width {
             MemoryWidth::Byte => self.imm8(slot),
             _ => self.imm32(slot),
@@ -1293,8 +1417,8 @@ impl<'a> UnitBuilder<'a> {
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
         if op == 7 {
-            let (linear, page64) =
-                self.mem_checked_page(map, addr.segment, eff, width, slot, side, false);
+            let (linear, page64, is_mode13) =
+                self.mem_checked_page(map, addr.segment, eff, width, slot, side, false, true);
             let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
             let memflags = self.flags();
             let a = match width {
@@ -1302,6 +1426,7 @@ impl<'a> UnitBuilder<'a> {
                 MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
                 MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
             };
+            self.mode13_read_completion(is_mode13, width);
             let b_masked = self.store_source_value(source, width, slot);
             let result = self.b.ins().isub(a, b_masked);
             let result = self.b.ins().band_imm(result, i64::from(width_mask(width)));
@@ -1310,8 +1435,8 @@ impl<'a> UnitBuilder<'a> {
             self.finish_mem_slot(side, delta);
             return;
         }
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true);
+        let (linear, page64, is_mode13) =
+            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true, true);
         let read_host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let a = match width {
@@ -1323,6 +1448,7 @@ impl<'a> UnitBuilder<'a> {
         self.code_watch_checks(map, linear, page64, width, slot, side);
         let b_in = self.store_source_value(source, width, slot);
         self.alu_mem_dest_commit(op, a, b_in, width, write_host);
+        self.mode13_rmw_completion(is_mode13, width, map, page64);
         self.finish_mem_slot(side, delta);
     }
 
@@ -1781,8 +1907,19 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, width, slot, side, true);
+        // Direct's dword memory INC/DEC admits RAM only (emit_rmw_inc_dec_dword's
+        // single-kind compare); the word form takes the two-kind branch. Mirrored.
+        let admit_mode13 = matches!(width, MemoryWidth::Word);
+        let (linear, page64, is_mode13) = self.mem_checked_page(
+            map,
+            addr.segment,
+            eff,
+            width,
+            slot,
+            side,
+            true,
+            admit_mode13,
+        );
         // Step 5: the RmwIncDec-only pre-read code-watch check.
         self.code_watch_checks(map, linear, page64, width, slot, side);
         let read_host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
@@ -1808,6 +1945,7 @@ impl<'a> UnitBuilder<'a> {
         let one = self.iconst(1);
         self.set_pending(tag, a, one, result);
         self.store_width(width, result, write_host);
+        self.mode13_rmw_completion(is_mode13, width, map, page64);
         self.finish_mem_slot(side, delta);
     }
 
@@ -1836,8 +1974,16 @@ impl<'a> UnitBuilder<'a> {
         let side = self.b.create_block();
         self.b.append_block_param(side, types::I64);
         let eff = self.mem_effective_address(addr, slot);
-        let (linear, page64) =
-            self.mem_checked_page(map, addr.segment, eff, MemoryWidth::Dword, slot, side, true);
+        let (linear, page64, is_mode13) = self.mem_checked_page(
+            map,
+            addr.segment,
+            eff,
+            MemoryWidth::Dword,
+            slot,
+            side,
+            true,
+            true,
+        );
         let read_host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
         let memflags = self.flags();
         let d = self.b.ins().load(types::I32, memflags, read_host, 0);
@@ -1890,6 +2036,7 @@ impl<'a> UnitBuilder<'a> {
         self.b.seal_block(join);
         let result = self.b.block_params(join)[0];
         self.store_width(MemoryWidth::Dword, result, write_host);
+        self.mode13_rmw_completion(is_mode13, MemoryWidth::Dword, map, page64);
         self.finish_mem_slot(side, delta);
     }
 
