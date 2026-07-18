@@ -1208,6 +1208,30 @@ impl CpuGsw {
                 };
                 let memory_cpl3 = self.current_privilege_level() == 3;
                 let entry_eip = key.linear.wrapping_sub(self.registers.cs().base);
+                // C1c: a unit with lowered memory slots bakes the FastMap SoA bases and the
+                // two code-watch table bases at compile time, exactly as Direct's emission
+                // does. No storage yet means nothing to bake; skip WITHOUT parking Dormant
+                // (Direct's Retry shape: the map appears once the interpreter's accesses
+                // populate it).
+                let has_memory = !plan.access_total.is_zero();
+                let map = if has_memory {
+                    let Some(map) = self.jit_fast_map.native_bases() else {
+                        return Ok(None);
+                    };
+                    Some(map)
+                } else {
+                    None
+                };
+                let code_watch_tables = [
+                    self.decode_cache.native_code_watch_table(),
+                    self.jit_direct.native_code_watch_table(),
+                ];
+                let mem_context = jit::clif::lower::UnitMemoryContext {
+                    map,
+                    code_watch_tables,
+                    segments: segment_layout,
+                    cpl3: memory_cpl3,
+                };
                 if self.jit_direct.clif_backend.is_none() {
                     self.jit_direct.clif_backend = jit::clif::ClifBackend::new();
                 }
@@ -1216,7 +1240,8 @@ impl CpuGsw {
                     return Ok(None);
                 };
                 let compile_start = std::time::Instant::now();
-                let compiled = jit::clif::lower::compile_unit(backend, &layout, &plan, entry_eip);
+                let compiled =
+                    jit::clif::lower::compile_unit(backend, &layout, &plan, entry_eip, mem_context);
                 self.perf.jit_direct_compile_ns +=
                     compile_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
                 let Some(entry) = compiled else {
@@ -1233,13 +1258,15 @@ impl CpuGsw {
                     has_wide_accesses: layout.has_wide_accesses,
                     is_self_loop: layout.is_self_loop,
                     entry,
-                    immediates: layout.imms,
+                    operands: layout.operands,
                     leading: plan.leading,
                     x87_mask: plan.x87_mask,
                     cum_raw_before: plan.cum_raw_before,
                     cum_lowered_before: plan.cum_lowered_before,
                     raw_clocks_total: plan.raw_clocks_total,
                     lowered_total: plan.lowered_total,
+                    cum_access_before: plan.cum_access_before,
+                    access_total: plan.access_total,
                 };
                 let Some(index) = self.jit_direct.clif_install(descriptor) else {
                     self.jit_direct.clif_units.dormant(key);
@@ -1328,11 +1355,13 @@ impl CpuGsw {
             return Ok(None);
         }
         // B1: one iteration must fit under the cap (Direct's quota shape with the chain
-        // count pinned at 1: C1b has no linking and no native self-loop repetition, so the
-        // only question is whether this single pass fits). The unit's static profile has no
-        // memory accesses (memory forms are not lowered) and no fp weight (x87 charges
-        // itself), so the bound is scaled core clocks plus the lowered-population fetch
-        // estimate, through the same scaling calls run_direct_block uses.
+        // count pinned at 1: no linking and no native self-loop repetition, so the only
+        // question is whether this single pass fits). The bound is scaled core clocks plus
+        // the lowered-population fetch estimate plus (C1c) the static per-width data-access
+        // bound, through the same scaling calls run_direct_block uses (run.rs's
+        // byte/word/dword_data_upper shape; the mode13 max() keeps the bound conservative
+        // even though increment 1 retires RAM accesses only). No fp weight (x87 charges
+        // itself).
         let (num, den) = level_timing(self.persona());
         let scaled_core_upper = u64::from(unit.raw_clocks_total)
             .saturating_mul(u64::from(num))
@@ -1341,8 +1370,28 @@ impl CpuGsw {
         let fetch_upper = bus
             .jit_fetch_cost_clocks()
             .saturating_mul(u64::from(unit.lowered_total));
-        let iteration_upper =
-            scaled_core_upper.saturating_add(bus.jit_scale_bus_cost_upper(fetch_upper));
+        let byte_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Byte)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Byte));
+        let word_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Word)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Word));
+        let dword_data_upper = bus
+            .jit_data_cost_clocks(BusWidth::Dword)
+            .max(bus.jit_mode13_data_cost_clocks(BusWidth::Dword));
+        let access_total = unit.access_total;
+        let data_upper = byte_data_upper
+            .saturating_mul(
+                u64::from(access_total.byte_reads) + u64::from(access_total.byte_stores),
+            )
+            .saturating_add(word_data_upper.saturating_mul(
+                u64::from(access_total.word_reads) + u64::from(access_total.word_stores),
+            ))
+            .saturating_add(dword_data_upper.saturating_mul(
+                u64::from(access_total.dword_reads) + u64::from(access_total.dword_stores),
+            ));
+        let iteration_upper = scaled_core_upper
+            .saturating_add(bus.jit_scale_bus_cost_upper(fetch_upper.saturating_add(data_upper)));
         let bus_growth = bus
             .in_batch_scaled_bus_clocks()
             .saturating_sub(budget.bus_at_entry);
@@ -1387,7 +1436,7 @@ impl CpuGsw {
                 self as *mut CpuGsw,
                 std::ptr::from_mut(bus).cast(),
                 &table,
-                unit.immediates.as_ptr(),
+                unit.operands.as_ptr(),
                 entry_ptr,
             )
         };
@@ -1399,7 +1448,9 @@ impl CpuGsw {
         }
 
         // Map the exit back to its slot for prefix charging: a normal side exit ran the
-        // whole leading run; a call-out Exit/HardStop stopped at the recorded site.
+        // whole leading run; a memory-check side exit carries its failing slot in the
+        // disposition (C1c, the distinct-code shape the question ledger leaned to); a
+        // call-out Exit/HardStop stopped at the recorded site.
         let entry_eip = unit
             .key
             .linear
@@ -1410,6 +1461,36 @@ impl CpuGsw {
                     unit.leading as usize,
                     u64::from(unit.raw_clocks_total),
                     u64::from(unit.lowered_total),
+                )
+            } else if disposition & 0xff == jit::clif::lower::CLIF_MEM_EXIT {
+                let stop = jit::clif::lower::clif_mem_exit_slot(disposition);
+                debug_assert!(
+                    stop < unit.leading as usize,
+                    "memory exit past the leading run"
+                );
+                // Diagnostic reason counters only: the guest cannot observe which check
+                // fired (all exit at the un-advanced EIP with zero state change).
+                match jit::clif::lower::clif_mem_exit_reason(disposition) {
+                    r if r == jit::direct::SideExitReason::CrossPageOrAlignment as u32 => {
+                        self.jit_clif.mem_exit_alignment += 1;
+                    }
+                    r if r == jit::direct::SideExitReason::UnavailableOrKind as u32 => {
+                        self.jit_clif.mem_exit_unavailable_or_kind += 1;
+                    }
+                    r if r == jit::direct::SideExitReason::Permission as u32 => {
+                        self.jit_clif.mem_exit_permission += 1;
+                    }
+                    r if r == jit::direct::SideExitReason::CodeWatch as u32 => {
+                        self.jit_clif.mem_exit_code_watch += 1;
+                    }
+                    _ => {
+                        self.jit_clif.mem_exit_segment_limit += 1;
+                    }
+                }
+                (
+                    stop,
+                    u64::from(unit.cum_raw_before[stop]),
+                    u64::from(unit.cum_lowered_before[stop]),
                 )
             } else {
                 let mut slot_eip = entry_eip;
@@ -1455,6 +1536,37 @@ impl CpuGsw {
                 fetch_lin = fetch_lin.wrapping_add(u32::from(len));
             }
             self.registers.eip = final_eip;
+        }
+        // C1c: the retired prefix's static data-access counts, charged through the SAME
+        // RAM-lane bus call Direct's run uses (run.rs's data_clocks region). Static counts
+        // are exact here because increment 1's identity check retires RAM accesses only
+        // (a mode13 or unavailable page side-exits before its slot charges anything), and
+        // the failing slot itself contributes nothing (cum_access_before is a strict-prefix
+        // array, the no-double-charge rule of design section 3).
+        let access = if stop_slot == unit.leading as usize {
+            unit.access_total
+        } else {
+            unit.cum_access_before[stop_slot]
+        };
+        if !access.is_zero() {
+            let data_clocks =
+                bus.jit_data_cost_clocks(BusWidth::Byte)
+                    .saturating_mul(u64::from(access.byte_reads) + u64::from(access.byte_stores))
+                    .saturating_add(bus.jit_data_cost_clocks(BusWidth::Word).saturating_mul(
+                        u64::from(access.word_reads) + u64::from(access.word_stores),
+                    ))
+                    .saturating_add(bus.jit_data_cost_clocks(BusWidth::Dword).saturating_mul(
+                        u64::from(access.dword_reads) + u64::from(access.dword_stores),
+                    ));
+            bus.charge_bus_clocks_bulk(data_clocks);
+            if access.stores() != 0
+                && let Some(page) = self.prefetch.physical_page()
+            {
+                // Native stores are charged in one batch without per-write addresses; mark
+                // the current prefetch page conservatively, exactly as run_direct_block
+                // does after a store-carrying block.
+                self.record_write_page(page << 12);
+            }
         }
         let charged = self.scale_clocks_batch(raw_clocks);
         self.elapsed_clocks += charged;

@@ -46,7 +46,14 @@ impl CpuGsw {
         #[cfg(not(test))]
         let admission_active = self.direct_runtime.admission_active;
 
-        admission_active && self.mode().uses_approximate_timing() && !self.jit_regions.auto_admit()
+        // Track C C1c: the clif policy's lowered memory forms consume the SAME FastMap
+        // projection Direct does, and a FastMap miss exits to the interpreter for "the
+        // canonical access and publication" (the base design's wording). Publication IS
+        // this population, so it must be active under the clif policy too; without this
+        // the clif memory path would side-exit on every access forever.
+        (admission_active || self.jit_direct.clif_enabled)
+            && self.mode().uses_approximate_timing()
+            && !self.jit_regions.auto_admit()
     }
 
     #[cfg(all(

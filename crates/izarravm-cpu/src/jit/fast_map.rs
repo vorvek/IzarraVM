@@ -157,7 +157,7 @@ pub(crate) struct FastMap {
 /// coupling emitted code to Rust's layout for `FastMap` or `Option<FastMapStorage>`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-pub(super) struct NativeMapBases {
+pub(crate) struct NativeMapBases {
     read_biases: usize,
     write_biases: usize,
     physical_pages: usize,
@@ -167,41 +167,41 @@ pub(super) struct NativeMapBases {
 
 #[allow(dead_code)]
 impl NativeMapBases {
-    pub(super) const fn read_biases(self) -> usize {
+    pub(crate) const fn read_biases(self) -> usize {
         self.read_biases
     }
 
-    pub(super) const fn write_biases(self) -> usize {
+    pub(crate) const fn write_biases(self) -> usize {
         self.write_biases
     }
 
-    pub(super) const fn physical_pages(self) -> usize {
+    pub(crate) const fn physical_pages(self) -> usize {
         self.physical_pages
     }
 
-    pub(super) const fn mapping_epochs(self) -> usize {
+    pub(crate) const fn mapping_epochs(self) -> usize {
         self.mapping_epochs
     }
 
-    pub(super) const fn flags(self) -> usize {
+    pub(crate) const fn flags(self) -> usize {
         self.flags
     }
 }
 
 #[allow(dead_code)]
-pub(super) const NATIVE_PAGE_SHIFT: u32 = PAGE_SHIFT;
+pub(crate) const NATIVE_PAGE_SHIFT: u32 = PAGE_SHIFT;
 #[allow(dead_code)]
-pub(super) const NATIVE_UNAVAILABLE_BIAS: usize = UNAVAILABLE_BIAS;
+pub(crate) const NATIVE_UNAVAILABLE_BIAS: usize = UNAVAILABLE_BIAS;
 #[allow(dead_code)]
-pub(super) const NATIVE_KIND_MASK: u8 = KIND_MASK;
+pub(crate) const NATIVE_KIND_MASK: u8 = KIND_MASK;
 #[allow(dead_code)]
-pub(super) const NATIVE_RAM_KIND: u8 = PageKind::Ram as u8;
+pub(crate) const NATIVE_RAM_KIND: u8 = PageKind::Ram as u8;
 #[allow(dead_code)]
-pub(super) const NATIVE_MODE13_KIND: u8 = PageKind::Mode13 as u8;
+pub(crate) const NATIVE_MODE13_KIND: u8 = PageKind::Mode13 as u8;
 #[allow(dead_code)]
-pub(super) const NATIVE_PAGE_WRITABLE: u8 = PAGE_WRITABLE;
+pub(crate) const NATIVE_PAGE_WRITABLE: u8 = PAGE_WRITABLE;
 #[allow(dead_code)]
-pub(super) const NATIVE_PAGE_USER: u8 = PAGE_USER;
+pub(crate) const NATIVE_PAGE_USER: u8 = PAGE_USER;
 
 impl FastMap {
     /// Resolve a populated linear mapping for the interpreter without revisiting the small TLB.
@@ -286,7 +286,7 @@ impl FastMap {
 
     /// Return stable array bases for native code generation after the first map fill.
     #[allow(dead_code)]
-    pub(super) fn native_bases(&self) -> Option<NativeMapBases> {
+    pub(crate) fn native_bases(&self) -> Option<NativeMapBases> {
         self.storage.as_ref().map(|storage| NativeMapBases {
             read_biases: storage.read_biases.as_ptr() as usize,
             write_biases: storage.write_biases.as_ptr() as usize,

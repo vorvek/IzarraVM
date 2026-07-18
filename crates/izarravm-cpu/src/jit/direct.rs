@@ -274,7 +274,7 @@ impl SegmentLayout {
         self.cs == target.cs && self.data == target.data
     }
 
-    fn descriptor(self, segment: SegmentIndex) -> SegmentRegister {
+    pub(crate) fn descriptor(self, segment: SegmentIndex) -> SegmentRegister {
         debug_assert_ne!(self.used & segment_bit(segment), 0);
         self.data[segment_index(segment)]
     }
@@ -1926,7 +1926,7 @@ pub(crate) enum MemoryWidth {
 }
 
 impl MemoryWidth {
-    const fn bytes(self) -> u32 {
+    pub(crate) const fn bytes(self) -> u32 {
         match self {
             Self::Byte => 1,
             Self::Word => 2,
@@ -1934,7 +1934,7 @@ impl MemoryWidth {
         }
     }
 
-    const fn needs_alignment_guard(self) -> bool {
+    pub(crate) const fn needs_alignment_guard(self) -> bool {
         !matches!(self, Self::Byte)
     }
 }
@@ -1983,7 +1983,7 @@ impl DirectKind {
         }
     }
 
-    fn byte_reads(self) -> u8 {
+    pub(crate) fn byte_reads(self) -> u8 {
         u8::from(matches!(
             self,
             Self::Load {
@@ -1999,7 +1999,7 @@ impl DirectKind {
         ))
     }
 
-    fn word_reads(self) -> u8 {
+    pub(crate) fn word_reads(self) -> u8 {
         u8::from(matches!(
             self,
             Self::Load {
@@ -2021,7 +2021,7 @@ impl DirectKind {
         ))
     }
 
-    fn dword_reads(self) -> u8 {
+    pub(crate) fn dword_reads(self) -> u8 {
         u8::from(
             matches!(
                 self,
@@ -2055,7 +2055,7 @@ impl DirectKind {
         )
     }
 
-    fn byte_stores(self) -> u8 {
+    pub(crate) fn byte_stores(self) -> u8 {
         u8::from(
             matches!(
                 self,
@@ -2074,7 +2074,7 @@ impl DirectKind {
         )
     }
 
-    fn word_stores(self) -> u8 {
+    pub(crate) fn word_stores(self) -> u8 {
         u8::from(
             matches!(
                 self,
@@ -2096,7 +2096,7 @@ impl DirectKind {
         )
     }
 
-    fn dword_stores(self) -> u8 {
+    pub(crate) fn dword_stores(self) -> u8 {
         u8::from(
             matches!(
                 self,

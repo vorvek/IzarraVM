@@ -26,12 +26,21 @@
 use core::mem::offset_of;
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{Function, InstBuilder, MemFlagsData, UserFuncName, Value, types};
+use cranelift_codegen::ir::{
+    Block, Function, InstBuilder, MemFlagsData, UserFuncName, Value, types,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use super::super::direct::{DirectKind, MAX_BLOCK_INSTRUCTIONS, MemoryWidth, ShiftCount};
+use super::super::direct::{
+    DirectAddr, DirectKind, MAX_BLOCK_INSTRUCTIONS, MemoryWidth, SegmentLayout, ShiftCount,
+    SideExitReason, StoreSource,
+};
+use super::super::fast_map::{
+    NATIVE_KIND_MASK, NATIVE_PAGE_SHIFT, NATIVE_PAGE_USER, NATIVE_PAGE_WRITABLE, NATIVE_RAM_KIND,
+    NATIVE_UNAVAILABLE_BIAS, NativeMapBases,
+};
 use super::ClifBackend;
-use super::cache::UnitLayout;
+use super::cache::{ClifAccessCounts, UnitLayout};
 use super::callout::{
     CLIF_CALLOUT_CONTINUE, ClifCallOutTable, callout_shim_signature, callout_unit_signature,
 };
@@ -39,6 +48,43 @@ use crate::{CpuGsw, PendingFlags, Registers};
 
 /// The six arithmetic EFLAGS bits (CF|PF|AF|ZF|SF|OF).
 const ARITH_MASK: u32 = 0x8d5;
+
+/// The memory side-exit disposition family (C1c, design section 3's "genuinely new
+/// wrinkle", resolved per the question ledger's distinct-code lean): low byte 4 (disjoint
+/// from `CLIF_CALLOUT_CONTINUE`/`EXIT`/`HARD_STOP` at 0/1/2), the failing slot's index in
+/// bits 16..24, and the diagnostic `SideExitReason` in bits 8..16. The compiled unit itself
+/// returns the failing slot, so `run_clif_unit`'s prefix charging treats a memory exit and a
+/// call-out exit uniformly once the slot is known. The reason lane is diagnostic only: every
+/// memory check side-exits at the un-advanced EIP with zero guest-visible state change, so
+/// the guest cannot distinguish which check fired (design section 2's fidelity note).
+pub(crate) const CLIF_MEM_EXIT: i64 = 4;
+
+pub(crate) fn clif_mem_exit_disposition(slot: usize, reason: SideExitReason) -> i64 {
+    CLIF_MEM_EXIT | ((reason as i64) << 8) | ((slot as i64) << 16)
+}
+
+pub(crate) fn clif_mem_exit_slot(disposition: i64) -> usize {
+    ((disposition >> 16) & 0xff) as usize
+}
+
+pub(crate) fn clif_mem_exit_reason(disposition: i64) -> u32 {
+    ((disposition >> 8) & 0xff) as u32
+}
+
+/// Compile-time-baked memory context for one unit (the clif analogue of Direct's
+/// `MemoryEmitContext`): the FastMap structure-of-arrays bases, the two code-watch table
+/// bases (index 0 the decode cache's sticky watch, index 1 the shared hoisted
+/// `NativeCodeWatch`), the captured segment snapshot, and the CPL3 flag. All four are
+/// STRUCTURAL compile-time data (table addresses, segment layout, privilege), not guest
+/// operand values, so baking them as constants is exempt from F4 exactly as Direct's own
+/// `mov_r64_imm64` bakes are.
+#[derive(Clone, Copy)]
+pub(crate) struct UnitMemoryContext {
+    pub(crate) map: Option<NativeMapBases>,
+    pub(crate) code_watch_tables: [usize; 2],
+    pub(crate) segments: SegmentLayout,
+    pub(crate) cpl3: bool,
+}
 
 /// The static execution plan derived from a walked unit's kinds: which leading slots run
 /// natively and the cumulative charge profile (x87 slots excluded per the no-double-charge
@@ -50,9 +96,15 @@ pub(crate) struct UnitPlan {
     pub(crate) cum_lowered_before: [u8; MAX_BLOCK_INSTRUCTIONS],
     pub(crate) raw_clocks_total: u16,
     pub(crate) lowered_total: u8,
+    /// Cumulative per-width access counts before each slot plus the full-run totals (C1c,
+    /// design section 4/M4), through `DirectKind`'s own accessors verbatim.
+    pub(crate) cum_access_before: [ClifAccessCounts; MAX_BLOCK_INSTRUCTIONS],
+    pub(crate) access_total: ClifAccessCounts,
 }
 
 fn lowerable(kind: &DirectKind) -> bool {
+    // C1c increment 1 adds Load and Store (the two single-access memory forms); the
+    // remaining seven memory variants stay growth-run stoppers until their increments land.
     matches!(
         kind,
         DirectKind::MovReg { .. }
@@ -68,6 +120,8 @@ fn lowerable(kind: &DirectKind) -> bool {
             | DirectKind::TestImmReg { .. }
             | DirectKind::Shift { .. }
             | DirectKind::DoubleShiftReg { .. }
+            | DirectKind::Load { .. }
+            | DirectKind::Store { .. }
     )
 }
 
@@ -82,12 +136,16 @@ pub(crate) fn plan_unit(kinds: &[DirectKind], admit_x87: bool) -> UnitPlan {
         cum_lowered_before: [0; MAX_BLOCK_INSTRUCTIONS],
         raw_clocks_total: 0,
         lowered_total: 0,
+        cum_access_before: [ClifAccessCounts::default(); MAX_BLOCK_INSTRUCTIONS],
+        access_total: ClifAccessCounts::default(),
     };
     let mut raw = 0u16;
     let mut lowered = 0u8;
+    let mut access = ClifAccessCounts::default();
     for (i, kind) in kinds.iter().enumerate() {
         plan.cum_raw_before[i] = raw;
         plan.cum_lowered_before[i] = lowered;
+        plan.cum_access_before[i] = access;
         if matches!(kind, DirectKind::X87 { .. }) && admit_x87 {
             plan.x87_mask |= 1 << i;
             plan.leading = (i + 1) as u8;
@@ -98,10 +156,19 @@ pub(crate) fn plan_unit(kinds: &[DirectKind], admit_x87: bool) -> UnitPlan {
         }
         raw = raw.saturating_add(kind.raw_clocks() as u16);
         lowered += 1;
+        // M4: the per-width counts come from DirectKind's own accessors VERBATIM, never a
+        // re-derivation, so the two backends' static counts are equal by shared code.
+        access.byte_reads += kind.byte_reads();
+        access.word_reads += kind.word_reads();
+        access.dword_reads += kind.dword_reads();
+        access.byte_stores += kind.byte_stores();
+        access.word_stores += kind.word_stores();
+        access.dword_stores += kind.dword_stores();
         plan.leading = (i + 1) as u8;
     }
     plan.raw_clocks_total = raw;
     plan.lowered_total = lowered;
+    plan.access_total = access;
     plan
 }
 
@@ -170,6 +237,7 @@ struct UnitBuilder<'a> {
     vars: Vars,
     offs: Offsets,
     ctx: Ctx,
+    mem: UnitMemoryContext,
     entry_eip: u32,
     shim_sig: cranelift_codegen::ir::SigRef,
 }
@@ -248,8 +316,11 @@ impl<'a> UnitBuilder<'a> {
         }
     }
 
+    /// The operand table holds two u32 lanes per slot (immediate at `slot * 8`,
+    /// displacement at `slot * 8 + 4`); the offsets are structural and baked, the values
+    /// never are (F4).
     fn imm32(&mut self, slot: usize) -> Value {
-        let off = i32::try_from(slot * 4).expect("imm slot offset fits");
+        let off = i32::try_from(slot * 8).expect("imm slot offset fits");
         let flags = self.flags();
         self.b
             .ins()
@@ -257,10 +328,19 @@ impl<'a> UnitBuilder<'a> {
     }
 
     fn imm8(&mut self, slot: usize) -> Value {
-        let off = i32::try_from(slot * 4).expect("imm slot offset fits");
+        let off = i32::try_from(slot * 8).expect("imm slot offset fits");
         let flags = self.flags();
         let v = self.b.ins().load(types::I8, flags, self.ctx.imm_table, off);
         self.b.ins().uextend(types::I32, v)
+    }
+
+    /// The addressing-mode displacement lane (design section 1.2's F4 extension).
+    fn disp32(&mut self, slot: usize) -> Value {
+        let off = i32::try_from(slot * 8 + 4).expect("disp slot offset fits");
+        let flags = self.flags();
+        self.b
+            .ins()
+            .load(types::I32, flags, self.ctx.imm_table, off)
     }
 
     fn set_pending(&mut self, tag: Value, a: Value, b: Value, result: Value) {
@@ -598,11 +678,335 @@ impl<'a> UnitBuilder<'a> {
             } => {
                 self.lower_double_shift(left, dst, src, count, slot);
             }
+            DirectKind::Load {
+                dst, width, addr, ..
+            } => {
+                self.lower_load(dst, width, &addr, slot, delta);
+            }
+            DirectKind::Store {
+                source,
+                width,
+                addr,
+                ..
+            } => {
+                self.lower_store(source, width, &addr, slot, delta);
+            }
             DirectKind::X87 { .. } => {
                 self.lower_x87_callout(slot, delta, len);
             }
             _ => unreachable!("non-lowerable kind reached the unit body"),
         }
+    }
+
+    fn iconst64(&mut self, v: u64) -> Value {
+        self.b.ins().iconst(types::I64, v as i64)
+    }
+
+    /// One failing-check branch: on `cond`, jump to the slot's shared side-exit block
+    /// carrying the encoded disposition (slot index plus the diagnostic reason); otherwise
+    /// continue in a fresh sealed block.
+    fn check_fail(&mut self, cond: Value, side: Block, slot: usize, reason: SideExitReason) {
+        let disp = self
+            .b
+            .ins()
+            .iconst(types::I64, clif_mem_exit_disposition(slot, reason));
+        let ok = self.b.create_block();
+        self.b.ins().brif(cond, side, &[disp.into()], ok, &[]);
+        self.b.switch_to_block(ok);
+        self.b.seal_block(ok);
+    }
+
+    /// Effective address for a memory form: displacement from the operand table's
+    /// displacement lane (F4, design section 1.2), register/scale shape structural,
+    /// mirroring `emit_effective_address` (emit.rs:1725).
+    fn mem_effective_address(&mut self, addr: &DirectAddr, slot: usize) -> Value {
+        let mut v = self.disp32(slot);
+        if let Some(base) = addr.base {
+            let b = self.gpr32(base);
+            v = self.b.ins().iadd(v, b);
+        }
+        if let Some(index) = addr.index {
+            let idx = self.gpr32(index);
+            let scaled = match addr.scale {
+                1 => idx,
+                2 => self.b.ins().ishl_imm(idx, 1),
+                4 => self.b.ins().ishl_imm(idx, 2),
+                _ => self.b.ins().ishl_imm(idx, 3),
+            };
+            v = self.b.ins().iadd(v, scaled);
+        }
+        v
+    }
+
+    /// Steps 1-4 of the normative check sequence (design section 2's intro): segment limit
+    /// (including the compile-time underflow edge), the wide-page guard, the identity/kind
+    /// check, and the CPL3-conditional permission check. Returns `(linear, page64, flags)`:
+    /// the segmented linear address, the linear page index widened to i64, and the loaded
+    /// FastMap flags byte for the permission step already applied.
+    fn mem_checked_page(
+        &mut self,
+        map: NativeMapBases,
+        addr: &DirectAddr,
+        width: MemoryWidth,
+        slot: usize,
+        side: Block,
+        write: bool,
+    ) -> (Value, Value) {
+        // Step 1: segment limit against the EFFECTIVE address, before the base add,
+        // matching emit_segmented_linear_address (emit.rs:1741). The descriptor is the
+        // unit's own captured snapshot, compile-time data (the entry guards revalidate it
+        // against live segment state before every entry).
+        let eff = self.mem_effective_address(addr, slot);
+        let descriptor = self.mem.segments.descriptor(addr.segment);
+        if descriptor.limit != u32::MAX {
+            match descriptor.limit.checked_sub(width.bytes() - 1) {
+                None => {
+                    // m3's underflow edge: no access of this width fits under the limit,
+                    // so the check is an unconditional side exit (emitted as a
+                    // constant-true branch so the block structure stays uniform).
+                    let t = self.iconst(1);
+                    self.check_fail(t, side, slot, SideExitReason::Other);
+                }
+                Some(max_start) => {
+                    let cond = self.b.ins().icmp_imm(
+                        IntCC::UnsignedGreaterThan,
+                        eff,
+                        i64::from(max_start),
+                    );
+                    self.check_fail(cond, side, slot, SideExitReason::Other);
+                }
+            }
+        }
+        let linear = if descriptor.base != 0 {
+            self.b.ins().iadd_imm(eff, i64::from(descriptor.base))
+        } else {
+            eff
+        };
+        // Step 2: wide-page guard, reject-only (design section 2.6): misalignment, then the
+        // page-boundary cross (`> 0x1000 - width`, not `>=`). Byte accesses skip both.
+        if width.needs_alignment_guard() {
+            let off = self.b.ins().band_imm(linear, i64::from(width.bytes() - 1));
+            let cond = self.b.ins().icmp_imm(IntCC::NotEqual, off, 0);
+            self.check_fail(cond, side, slot, SideExitReason::CrossPageOrAlignment);
+            let poff = self.b.ins().band_imm(linear, 0xfff);
+            let cond = self.b.ins().icmp_imm(
+                IntCC::UnsignedGreaterThan,
+                poff,
+                i64::from(0x1000 - width.bytes()),
+            );
+            self.check_fail(cond, side, slot, SideExitReason::CrossPageOrAlignment);
+        }
+        // Step 3: identity/kind. INCREMENT-1 RESTRICTION (recorded deviation): only
+        // NATIVE_RAM_KIND continues; a mode13 page side-exits to the interpreter's
+        // canonical access instead of taking Direct's mode13 arm, because the dynamic
+        // mode13 counter/dirty lanes are not threaded through the clif unit yet. Sound and
+        // byte-identical (the failing slot charges nothing natively and the interpreter
+        // re-executes it), merely slower on VGA-touching units until the mode13 increment.
+        let page = self.b.ins().ushr_imm(linear, i64::from(NATIVE_PAGE_SHIFT));
+        let page64 = self.b.ins().uextend(types::I64, page);
+        let flags_base = self.iconst64(map.flags() as u64);
+        let flags_addr = self.b.ins().iadd(flags_base, page64);
+        let memflags = self.flags();
+        let fb = self.b.ins().uload8(types::I32, memflags, flags_addr, 0);
+        let kind = self.b.ins().band_imm(fb, i64::from(NATIVE_KIND_MASK));
+        let cond = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::NotEqual, kind, i64::from(NATIVE_RAM_KIND));
+        self.check_fail(cond, side, slot, SideExitReason::UnavailableOrKind);
+        // Step 4: permission, CPL3-conditional at COMPILE time (two code shapes, never a
+        // runtime CPL read), matching emit_read/write_permission_check (emit.rs:2047-2072):
+        // ring 0 emits no check at all (a populated bias already proves the walk admitted
+        // the current context while CR0.WP is clear).
+        if self.mem.cpl3 {
+            let need = if write {
+                i64::from(NATIVE_PAGE_USER | NATIVE_PAGE_WRITABLE)
+            } else {
+                i64::from(NATIVE_PAGE_USER)
+            };
+            let bits = self.b.ins().band_imm(fb, need);
+            let cond = self.b.ins().icmp_imm(IntCC::NotEqual, bits, need);
+            self.check_fail(cond, side, slot, SideExitReason::Permission);
+        }
+        (linear, page64)
+    }
+
+    /// One bias-table lookup plus the UNAVAILABLE sentinel check (design section 2.3, the
+    /// pointer-producing step and the epoch mechanism's actual enforcement point), then the
+    /// host pointer `bias + linear`.
+    fn mem_host_pointer(
+        &mut self,
+        biases_base: usize,
+        page64: Value,
+        linear: Value,
+        slot: usize,
+        side: Block,
+    ) -> Value {
+        let idx8 = self.b.ins().ishl_imm(page64, 3);
+        let base = self.iconst64(biases_base as u64);
+        let addr = self.b.ins().iadd(base, idx8);
+        let memflags = self.flags();
+        let bias = self.b.ins().load(types::I64, memflags, addr, 0);
+        let cond = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, bias, NATIVE_UNAVAILABLE_BIAS as i64);
+        self.check_fail(cond, side, slot, SideExitReason::UnavailableOrKind);
+        let lin64 = self.b.ins().uextend(types::I64, linear);
+        self.b.ins().iadd(bias, lin64)
+    }
+
+    /// Both code-watch families by inline bit-test (design section 2.5, mirroring
+    /// emit_code_watch_branch, emit.rs:2134-2185): the physical page number indexes each
+    /// baked table; a null page pointer skips; a set chunk bit side-exits. A wide access
+    /// additionally tests the last byte's chunk (same-page by the wide guard, possibly a
+    /// different 16-byte chunk).
+    fn code_watch_checks(
+        &mut self,
+        map: NativeMapBases,
+        linear: Value,
+        page64: Value,
+        width: MemoryWidth,
+        slot: usize,
+        side: Block,
+    ) {
+        let memflags = self.flags();
+        let idx4 = self.b.ins().ishl_imm(page64, 2);
+        let ppb = self.iconst64(map.physical_pages() as u64);
+        let pa = self.b.ins().iadd(ppb, idx4);
+        let phys = self.b.ins().load(types::I32, memflags, pa, 0);
+        let wp = self.b.ins().ushr_imm(phys, i64::from(NATIVE_PAGE_SHIFT));
+        let wp64 = self.b.ins().uextend(types::I64, wp);
+        for table in self.mem.code_watch_tables {
+            let t = self.iconst64(table as u64);
+            let idx8 = self.b.ins().ishl_imm(wp64, 3);
+            let ta = self.b.ins().iadd(t, idx8);
+            let ptr = self.b.ins().load(types::I64, memflags, ta, 0);
+            let has = self.b.ins().icmp_imm(IntCC::NotEqual, ptr, 0);
+            let test_blk = self.b.create_block();
+            let next_blk = self.b.create_block();
+            self.b.ins().brif(has, test_blk, &[], next_blk, &[]);
+            self.b.switch_to_block(test_blk);
+            self.b.seal_block(test_blk);
+            let last = width.bytes() - 1;
+            let offsets: &[u32] = if width.needs_alignment_guard() {
+                &[0, 1]
+            } else {
+                &[0]
+            };
+            for &which in offsets {
+                let po = self.b.ins().band_imm(linear, 0xfff);
+                let po = if which != 0 {
+                    self.b.ins().iadd_imm(po, i64::from(last))
+                } else {
+                    po
+                };
+                let chunk = self.b.ins().ushr_imm(po, 4);
+                let word_idx = self.b.ins().ushr_imm(chunk, 6);
+                let wi64 = self.b.ins().uextend(types::I64, word_idx);
+                let wi8 = self.b.ins().ishl_imm(wi64, 3);
+                let wa = self.b.ins().iadd(ptr, wi8);
+                let word = self.b.ins().load(types::I64, memflags, wa, 0);
+                let bitidx = self.b.ins().band_imm(chunk, 63);
+                let bit64 = self.b.ins().uextend(types::I64, bitidx);
+                let shifted = self.b.ins().ushr(word, bit64);
+                let bit = self.b.ins().band_imm(shifted, 1);
+                let cond = self.b.ins().icmp_imm(IntCC::NotEqual, bit, 0);
+                self.check_fail(cond, side, slot, SideExitReason::CodeWatch);
+            }
+            self.b.ins().jump(next_blk, &[]);
+            self.b.switch_to_block(next_blk);
+            self.b.seal_block(next_blk);
+        }
+    }
+
+    /// Terminate one memory slot: jump the happy path to a fresh block, then fill the
+    /// slot's shared side-exit block (materialize state at the UN-ADVANCED failing slot's
+    /// EIP per design section 3, return the encoded disposition).
+    fn finish_mem_slot(&mut self, side: Block, delta: u32) {
+        let done = self.b.create_block();
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(side);
+        self.b.seal_block(side);
+        let disp = self.b.block_params(side)[0];
+        self.spill_all(delta);
+        self.b.ins().return_(&[disp]);
+        self.b.switch_to_block(done);
+        self.b.seal_block(done);
+    }
+
+    /// `Load` (design section 1.3 item 1): the READ check list, one notrap load through the
+    /// read bias, the partial-write-aware destination write. No flags.
+    fn lower_load(
+        &mut self,
+        dst: u8,
+        width: MemoryWidth,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let (linear, page64) = self.mem_checked_page(map, addr, width, slot, side, false);
+        let host = self.mem_host_pointer(map.read_biases(), page64, linear, slot, side);
+        let memflags = self.flags();
+        let value = match width {
+            MemoryWidth::Byte => self.b.ins().uload8(types::I32, memflags, host, 0),
+            MemoryWidth::Word => self.b.ins().uload16(types::I32, memflags, host, 0),
+            MemoryWidth::Dword => self.b.ins().load(types::I32, memflags, host, 0),
+        };
+        self.write_width(dst, width, value);
+        self.finish_mem_slot(side, delta);
+    }
+
+    /// `Store` (design section 1.3 item 2): the WRITE check list, the code-watch check
+    /// (both families) BEFORE the store commits, then one notrap store through the write
+    /// bias. No flags. Nothing is committed before the last check passes (section 2.9's
+    /// discipline is trivial here: the store instruction is the only effect).
+    fn lower_store(
+        &mut self,
+        source: StoreSource,
+        width: MemoryWidth,
+        addr: &DirectAddr,
+        slot: usize,
+        delta: u32,
+    ) {
+        let map = self
+            .mem
+            .map
+            .expect("memory-form slot requires fast-map bases");
+        let side = self.b.create_block();
+        self.b.append_block_param(side, types::I64);
+        let (linear, page64) = self.mem_checked_page(map, addr, width, slot, side, true);
+        let host = self.mem_host_pointer(map.write_biases(), page64, linear, slot, side);
+        self.code_watch_checks(map, linear, page64, width, slot, side);
+        let value = match source {
+            StoreSource::Reg(src) => self.read_width(src, width),
+            StoreSource::Imm(_) => {
+                let v = self.imm32(slot);
+                self.b.ins().band_imm(v, i64::from(width_mask(width)))
+            }
+            StoreSource::EipDelta(_) => {
+                unreachable!("EipDelta store sources exist only inside Call, a terminal")
+            }
+        };
+        let memflags = self.flags();
+        match width {
+            MemoryWidth::Byte => {
+                self.b.ins().istore8(memflags, value, host, 0);
+            }
+            MemoryWidth::Word => {
+                self.b.ins().istore16(memflags, value, host, 0);
+            }
+            MemoryWidth::Dword => {
+                self.b.ins().store(memflags, value, host, 0);
+            }
+        }
+        self.finish_mem_slot(side, delta);
     }
 
     /// `inc_dec` (core.rs:1158): Add/Sub pending tag with the CURRENT CF preserved through
@@ -965,6 +1369,7 @@ pub(crate) fn compile_unit(
     layout: &UnitLayout,
     plan: &UnitPlan,
     entry_eip: u32,
+    mem: UnitMemoryContext,
 ) -> Option<usize> {
     debug_assert!(plan.leading >= 1);
     let mut func =
@@ -1002,6 +1407,7 @@ pub(crate) fn compile_unit(
             table,
             imm_table,
         },
+        mem,
         entry_eip,
         shim_sig,
     };

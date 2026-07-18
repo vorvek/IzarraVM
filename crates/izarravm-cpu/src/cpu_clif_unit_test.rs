@@ -286,13 +286,15 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         has_wide_accesses: false,
         is_self_loop: false,
         entry: 0,
-        immediates: [0; MAX_BLOCK_INSTRUCTIONS],
+        operands: [0; 2 * MAX_BLOCK_INSTRUCTIONS],
         leading: 1,
         x87_mask: 0,
         cum_raw_before: [0; MAX_BLOCK_INSTRUCTIONS],
         cum_lowered_before: [0; MAX_BLOCK_INSTRUCTIONS],
         raw_clocks_total: 2,
         lowered_total: 1,
+        cum_access_before: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
+        access_total: Default::default(),
     };
     assert!(cache.state(key).is_none());
     // Install without Seen refuses.
