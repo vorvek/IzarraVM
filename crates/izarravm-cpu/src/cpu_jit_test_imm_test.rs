@@ -3,6 +3,12 @@
 
 use super::*;
 
+// C0 Task L battery: nested here (rather than in cpu_test.rs, which sits at its frozen
+// legacy line ceiling) so the shared TestBus fixture stays reachable.
+#[cfg(feature = "clif-backend")]
+#[path = "cpu_clif_unit_test.rs"]
+mod clif_unit;
+
 const ENTRY: u32 = 0x501;
 const RAM_TARGET: u32 = 0x3000;
 const MODE13_TARGET: u32 = 0x000a_1000;
