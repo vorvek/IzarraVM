@@ -4572,3 +4572,130 @@ fn clif_chain_three_units_aggregate_across_event_caps() {
          cap sweep: {counters:#?}"
     );
 }
+
+// ===== C1d chained-hop fetch-charging byte-length sweep (owner-mandated regression
+// battery, 2026-07-19). Investigation verdict: the reported "chained-hop fetch
+// under-charge for imm32-bearing targets" DOES NOT EXIST on main. The observed
+// 26-vs-28 bus-clock divergence reproduces ONLY on the C1e restamp branch, ONLY on the
+// pass AFTER a tail restamp, and at ANY target length (a 4-byte target diverges
+// identically): it is the C1e restamp survivor legitimately skipping the interpreter's
+// transient post-SMC re-decode prefetch refill, already documented and handled there
+// (pass_state_strict_bus_lenient). On main the same write KILLS the unit and both arms
+// re-enter through the interpreter, so the charge stays symmetric. Every warm/chained
+// shape below (byte lengths 1-6, Jmp and Jcc hops, multi-hop, long-mid-chain) is
+// bus-clock-identical through the STRICT ChainHarness compare; this battery pins the
+// chained-hop charging so a future change that really does under-charge by target
+// length fails loudly.
+
+/// One warmed A-Jmp-B chain with the given B body, strict-compared every pass; asserts
+/// the hop actually resolved natively (otherwise the sweep proves nothing).
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn assert_chain_target_clock_identical(b_body: &[u8]) {
+    // 0x1000: nop; A at 0x1001: inc eax; add eax, ebx; jmp +0x0a -> B at 0x1010.
+    let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xeb, 0x0a];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(b_body);
+    code.push(0xf4);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..8 {
+        harness.pass();
+    }
+    let counters = harness.clif.jit_clif_counters();
+    assert!(
+        counters.linked_transfers > 0,
+        "the A-to-B hop must resolve natively for {b_body:02x?}: {counters:#?}"
+    );
+}
+
+/// The owner's named case: a 6-byte add-imm32 chained target.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_imm32_target_stays_clock_identical() {
+    assert_chain_target_clock_identical(&[0x81, 0xc3, 0x11, 0x11, 0x11, 0x11]);
+}
+
+/// Byte-length sweep over the classifiable single-instruction targets: 1-byte inc,
+/// 2-byte mov-imm8, 3-byte add-imm8 (0x83 sign-extended), 5-byte mov-imm32, 6-byte
+/// add-imm32, and the 6-byte disp32 memory load (the imm and disp lanes both exercise
+/// the operand-table fetch shape).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_target_byte_length_sweep() {
+    for body in [
+        &[0x43u8][..],                             // inc ebx (1 byte)
+        &[0xb3, 0x5a][..],                         // mov bl, 0x5a (2 bytes)
+        &[0x83, 0xc3, 0x7f][..],                   // add ebx, imm8 (3 bytes)
+        &[0xb9, 0x11, 0x22, 0x33, 0x44][..],       // mov ecx, imm32 (5 bytes)
+        &[0x81, 0xc3, 0x11, 0x11, 0x11, 0x11][..], // add ebx, imm32 (6 bytes)
+        &[0x8b, 0x0d, 0x00, 0x31, 0x00, 0x00][..], // mov ecx, [0x3100] (6 bytes, disp32)
+    ] {
+        assert_chain_target_clock_identical(body);
+    }
+}
+
+/// Jcc hops (both edges) into an imm32-bearing target: the taken edge and the
+/// fall-through edge each land in a long-instruction unit, strict-compared.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_jcc_imm32_targets_stay_clock_identical() {
+    // 0x1000: nop; A at 0x1001: test eax,eax; jnz +0x10 -> T at 0x1015; fall-through F
+    // at 0x1005: add ebx, imm32; hlt; T at 0x1015: add ecx, imm32; hlt.
+    let mut code = vec![0x90, 0x85, 0xc0, 0x75, 0x10];
+    code.extend_from_slice(&[0x81, 0xc3, 0x11, 0x11, 0x11, 0x11, 0xf4]);
+    code.resize(0x15, 0x90);
+    code.extend_from_slice(&[0x81, 0xc1, 0x22, 0x22, 0x22, 0x22, 0xf4]);
+    for eax in [1u32, 0] {
+        let mut gpr = forced_gpr();
+        gpr[0] = eax;
+        let mut harness = ChainHarness::new(&code, gpr);
+        for _ in 0..8 {
+            harness.pass();
+        }
+        let counters = harness.clif.jit_clif_counters();
+        assert!(counters.linked_transfers > 0, "eax={eax}: {counters:#?}");
+    }
+}
+
+/// Multi-hop chain A -> B -> C with a LONG instruction mid-chain (B carries the
+/// imm32), strict-compared: the per-hop accumulation must stay byte-length-honest
+/// across consecutive native hops, not just for the final unit.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_chain_multi_hop_long_mid_chain_stays_clock_identical() {
+    // 0x1000: nop; A at 0x1001: inc eax; jmp +0x0c -> B at 0x1010: inc ebx;
+    // add ebx, imm32; jmp +0x03 -> C at 0x101c: add ecx, imm32; hlt.
+    let mut code = vec![0x90, 0x40, 0xeb, 0x0c];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(&[0x43, 0x81, 0xc3, 0x11, 0x11, 0x11, 0x11, 0xeb, 0x03]);
+    code.resize(0x1c, 0x90);
+    code.extend_from_slice(&[0x81, 0xc1, 0x22, 0x22, 0x22, 0x22, 0xf4]);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..10 {
+        harness.pass();
+    }
+    let counters = harness.clif.jit_clif_counters();
+    assert!(
+        counters.linked_transfers >= 2,
+        "both hops must resolve natively: {counters:#?}"
+    );
+}
