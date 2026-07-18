@@ -1763,3 +1763,186 @@ fn clif_forced_x87_callout_bus_error_hard_stop() {
         );
     }
 }
+
+/// Review finding B1's reproducer, pinned: an x87 call-out that stores into the IN-FLIGHT
+/// unit's own remaining guest bytes must exit the unit rather than run stale lowering. The
+/// warm passes store to scratch (the Continue path); the final pass points EBX at the
+/// unit's own `inc eax` byte and stores an f32 whose bits decode as four `inc ebx`. The
+/// interpreter re-fetches and executes the fresh bytes (eax stays 0, ebx walks to 0x1007);
+/// the clif policy must match, which requires the invalidation-generation exit latch (the
+/// SMC choke alone only kills the unit for the NEXT entry).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_forced_x87_store_into_own_unit_exits_in_flight() {
+    for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+        let entry = 0x1000u32;
+        // nop (interpreted starter); fstp dword [ebx]; inc eax; hlt
+        let code = [0x90, 0xd9, 0x1b, 0x40, 0xf4];
+        let inc_eax_addr = entry + 3;
+        // f32 whose stored bits are 43 43 43 43: four `inc ebx` over the inc eax byte and
+        // the trailing hlt bytes (the fill after them is hlt again).
+        let smc_value = f64::from(f32::from_bits(0x4343_4343));
+
+        let mut memory = vec![0xf4u8; MEMORY_LEN];
+        memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+
+        let mut interp = generated_cpu(mode);
+        let mut clif = generated_cpu(mode);
+        clif.set_clif_backend_enabled(true);
+        let mut interp_bus = TestBus::with_memory(memory.clone());
+        let mut clif_bus = TestBus::with_memory(memory.clone());
+        for bus in [&mut interp_bus, &mut clif_bus] {
+            bus.direct_pages_enabled = true;
+            bus.direct_page_clocks = true;
+        }
+
+        for pass in 0..6 {
+            let final_pass = pass == 5;
+            let ebx = if final_pass { inc_eax_addr } else { 0x5000 };
+            for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+                cpu.halted = false;
+                cpu.interrupt_shadow = false;
+                cpu.registers.gpr = [0, 0, 0, ebx, 0x1_f000, 0, 0, 0];
+                cpu.registers.eflags = 0x202;
+                cpu.pending_flags = PendingFlags::default();
+                cpu.set_eip(entry);
+                cpu.elapsed_clocks = 0;
+                cpu.core_clocks_so_far = 0;
+                cpu.timing_rem = 0;
+                cpu.fp_rem = 0;
+                cpu.fpu.finit();
+                cpu.fpu.push(smc_value);
+                for _ in 0..64 {
+                    let outcome = cpu.run_budgeted(bus, 4096).expect("smc case reaches hlt");
+                    if outcome.halted {
+                        break;
+                    }
+                }
+                assert!(cpu.halted, "smc case did not halt, pass {pass}");
+            }
+            assert_eq!(clif.registers, interp.registers, "pass {pass}");
+            assert_eq!(clif.pending_flags, interp.pending_flags, "pass {pass}");
+            assert_eq!(clif, interp, "pass {pass}");
+            assert_eq!(clif_bus.memory, interp_bus.memory, "pass {pass}");
+            assert_eq!(clif.elapsed_clocks, interp.elapsed_clocks, "pass {pass}");
+            assert_eq!(
+                clif_bus.trace.elapsed_clocks(),
+                interp_bus.trace.elapsed_clocks(),
+                "pass {pass}"
+            );
+            assert_eq!(clif.timing_rem, interp.timing_rem, "pass {pass}");
+            if final_pass {
+                // The fresh bytes ran: the overwritten inc eax never executed, and the four
+                // inc ebx did.
+                assert_eq!(clif.registers.eax(), 0, "stale lowering executed inc eax");
+                assert_eq!(clif.registers.ebx(), inc_eax_addr + 4);
+            }
+        }
+        assert!(
+            clif.jit_clif_counters().entries > 0,
+            "smc case never entered a clif unit: {:#?}",
+            clif.jit_clif_counters()
+        );
+    }
+}
+
+/// M1: the compile-outcome clif arm. A walkable unit whose ENTRY slot is not lowerable
+/// (a memory form) parks Dormant instead of compiling a no-op body; a compiled unit killed
+/// by an SMC write is dropped from the cache entirely (generation bumped) and the next
+/// encounter re-admits through the normal Seen -> Compiled path.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_compile_outcomes_dormant_and_smc_readmission() {
+    use crate::jit::clif::cache::{ClifUnitState, clif_key_for};
+
+    let entry = 0x1000u32;
+    // nop; mov eax,[0x5000]; hlt: the unit at the load has nothing lowerable at its entry.
+    let load_code = [0x90, 0x8b, 0x05, 0x00, 0x50, 0x00, 0x00, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + load_code.len()].copy_from_slice(&load_code);
+    let mut cpu = generated_cpu(GswMode::Gsw586);
+    cpu.set_clif_backend_enabled(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    for _ in 0..4 {
+        cpu.halted = false;
+        cpu.registers.gpr = [0, 0, 0, 0, 0x1_f000, 0, 0, 0];
+        cpu.set_eip(entry);
+        while !cpu.run_budgeted(&mut bus, 4096).expect("runs").halted {}
+    }
+    let key = clif_key_for(&cpu, entry + 1, true).expect("warm key");
+    assert_eq!(
+        cpu.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Dormant),
+        "a leading-0 unit must park Dormant"
+    );
+    assert_eq!(cpu.jit_clif_counters().units_installed, 0);
+
+    // Fresh CPU: a real unit compiles, an SMC write into its span drops the entry and
+    // bumps the generation, and the next encounters re-admit (Seen, then Compiled again).
+    let code = [0x90, 0x01, 0xd8, 0x40, 0xf4];
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+    let mut cpu = generated_cpu(GswMode::Gsw586);
+    cpu.set_clif_backend_enabled(true);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+    let run_pass = |cpu: &mut CpuGsw, bus: &mut TestBus| {
+        cpu.halted = false;
+        cpu.registers.gpr = [1, 0, 0, 2, 0x1_f000, 0, 0, 0];
+        cpu.registers.eflags = 0x202;
+        cpu.set_eip(entry);
+        while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+    };
+    for _ in 0..4 {
+        run_pass(&mut cpu, &mut bus);
+    }
+    let key = clif_key_for(&cpu, entry + 1, true).expect("warm key");
+    assert!(matches!(
+        cpu.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+    assert!(cpu.jit_clif_counters().units_installed >= 1);
+    let generation = cpu.jit_direct.clif_units.generation;
+
+    // SMC: rewrite the add's modrm byte (same-length instruction, different registers).
+    cpu.write_memory_u8(
+        &mut bus,
+        SegmentIndex::Ds,
+        entry + 2,
+        0xda,
+        BusAccessKind::DataWrite,
+    )
+    .expect("smc store");
+    assert!(
+        cpu.jit_direct.clif_units.state(key).is_none(),
+        "the killed unit's entry must drop entirely"
+    );
+    assert!(
+        cpu.jit_direct.clif_units.generation > generation,
+        "the invalidation generation must move"
+    );
+
+    for _ in 0..4 {
+        run_pass(&mut cpu, &mut bus);
+    }
+    assert!(matches!(
+        cpu.jit_direct.clif_units.state(key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+    assert!(
+        cpu.jit_clif_counters().units_installed >= 2,
+        "the rewritten span must recompile through the normal admission path: {:#?}",
+        cpu.jit_clif_counters()
+    );
+}
