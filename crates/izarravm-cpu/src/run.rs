@@ -732,12 +732,11 @@ impl CpuGsw {
     /// architectural state unchanged (it is excluded from `CpuGsw` equality).
     #[cfg(feature = "jit")]
     pub fn set_unit_sim_enabled(&mut self, on: bool) {
-        // The C-pre-4 measurement set is {L0, L4, L6, P}: the L0 anchor, L4 as the secondary anchor,
-        // L6 as the poll-wait rung's baseline, and P itself. L5 is DROPPED from the measurement set
-        // (C-pre-3 recorded its global-hashed-table result as a net negative on both Dooms; it is not
-        // re-run here). The complete ladder stays available via `SimLadder::new()` for tests.
+        // The C-pre-2.5 measurement set is {L0, L2, L3, L4}: the L0 anchor, call/ret linking at
+        // L2, strict re-stamp at L3, and the full mechanism set at L4. The complete ladder stays
+        // available via `SimLadder::new()` for tests.
         self.unit_sim.0 = on.then(|| {
-            let mut ladder = jit::unit_sim::SimLadder::with_rungs(&[0, 4, 6, 7]);
+            let mut ladder = jit::unit_sim::SimLadder::with_rungs(&[0, 2, 3, 4]);
             if io_hist_requested() {
                 ladder.enable_io_hist();
             }
