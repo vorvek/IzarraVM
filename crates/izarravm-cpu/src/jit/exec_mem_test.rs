@@ -195,6 +195,33 @@ fn mid_span_page_boundary_is_not_a_valid_entry() {
     assert!(arena.contains_sealed_span_range(entry, 2 * page));
 }
 
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn install_span_rejects_oversized_empty_and_unsealed_prefix() {
+    // Span larger than the whole (small) arena.
+    let mut arena =
+        ExecutableArena::with_len_for_test(2 * host_page_len()).expect("small test arena");
+    let page = arena.slot_len();
+    assert!(arena.install_span(&vec![0xC3u8; 2 * page + 1]).is_none());
+    assert!(arena.install_span(&[]).is_none());
+    assert_eq!(arena.used_slots(), 0);
+    // A span that exactly fills the arena still installs.
+    assert!(arena.install_span(&vec![0xC3u8; 2 * page]).is_some());
+    assert!(arena.is_full());
+    assert!(arena.install_span(&[0xC3]).is_none());
+
+    // A pending unsealed prefix (sealed != used) blocks install_span until sealed.
+    let mut fresh = ExecutableArena::new().expect("allocation must succeed on a supported host");
+    let slot = fresh.append_unsealed(&[0xC3]).expect("pending slot");
+    assert!(fresh.install_span(&[0xC3]).is_none());
+    assert!(fresh.seal_used_prefix());
+    assert!(fresh.sealed_slot_entry(slot).is_some());
+    assert!(fresh.install_span(&[0xC3]).is_some());
+}
+
 #[cfg(not(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "linux", target_arch = "x86_64")

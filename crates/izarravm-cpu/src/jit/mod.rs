@@ -9,6 +9,15 @@ pub(crate) fn host_supported() -> bool {
 }
 
 pub(crate) mod block;
+// dead_code until C1 wires the dispatcher: in C0 the backend is exercised only by its
+// proof battery and the register-unit differential test.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[allow(dead_code)]
+pub(crate) mod clif;
 #[cfg_attr(
     not(all(
         target_arch = "x86_64",
