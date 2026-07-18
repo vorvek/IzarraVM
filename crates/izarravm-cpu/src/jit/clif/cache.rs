@@ -158,6 +158,18 @@ pub(crate) struct ClifUnitDescriptor {
     /// change that could (`note_direct_map_changed`, A20) wholesale-clears the clif
     /// cache first.
     pub(crate) code_host: usize,
+    /// C1e timing-identity cooldown: set by a restamp, consumed by the dispatcher's next
+    /// visit. The interpreter arm pays a transient post-SMC charge when it first
+    /// re-executes the patched line (measured: one extra byte-wide InstructionPrefetch
+    /// cycle, a prefetch-window-state-dependent amount that CANNOT be synthesized as a
+    /// constant), so the restamped unit's next entry runs the INTERPRETER over the same
+    /// instructions instead of the native body: the identical charge then arises from the
+    /// identical code path, keeping the C1 contract (state AND timing identity) with no
+    /// modeled constants. The unit stays installed and linked; only one entry is
+    /// interpreted. While the flag is set the unit's portal publishes the sentinel, so
+    /// CHAINED entries (which bypass the dispatcher) fall into the resolver, exit, and
+    /// route through the dispatcher's cooldown path too; `take_interp_once` republishes.
+    pub(crate) interp_once: bool,
     /// C1d (design section 3.6/M2): the statically-known link targets of the terminal
     /// `Jmp`/`Jcc` edges. Slot 0 the taken/only edge, slot 1 the `Jcc` not-taken
     /// fall-through, matching Direct's two-successor convention. A self-referential taken
@@ -298,6 +310,7 @@ impl ClifUnitDescriptor {
             imm_extend: [ImmExtend::None; MAX_BLOCK_INSTRUCTIONS],
             lea_mask: 0,
             moffs_mask: 0,
+            interp_once: false,
             code_host: 0,
             successors: [None; 2],
         }
@@ -958,6 +971,25 @@ impl ClifUnitCache {
         self.units.get(index as usize).map(|unit| &**unit)
     }
 
+    /// C1e: consume the post-restamp interp-once cooldown (see the descriptor field doc).
+    /// Returns true when the caller must interpret THIS entry; the flag clears and the
+    /// unit's portal republishes its own body so chained transfers resume natively from
+    /// the following entry.
+    pub(crate) fn take_interp_once(&mut self, index: u32) -> bool {
+        let Some(unit) = self.units.get_mut(index as usize) else {
+            return false;
+        };
+        if !unit.interp_once {
+            return false;
+        }
+        unit.interp_once = false;
+        let body = std::ptr::from_ref::<ClifUnitDescriptor>(&**unit) as usize;
+        if self.sentinel_addr != 0 && self.live.get(index as usize).copied() == Some(true) {
+            self.portals[index as usize].publish(body);
+        }
+        true
+    }
+
     /// Wholesale drop. Releases every currently-installed unit's watch registration first
     /// (the M5 discipline: every eviction path releases what it acquired), rather than
     /// relying on a coincidentally-paired wholesale `NativeCodeWatch::clear()` elsewhere,
@@ -1091,6 +1123,15 @@ impl ClifUnitCache {
         for (index, slot, slot_off) in restamps {
             if let Some(unit) = self.units.get_mut(index as usize) {
                 Self::restamp_slot(unit, slot, slot_off);
+                // Timing-identity cooldown (see the field doc): the next entry interprets
+                // once. Hide the portal so chained entries route through the dispatcher's
+                // cooldown path as well; links themselves stay intact (cells reference the
+                // PORTAL, so the later republish restores every edge with no
+                // re-resolution).
+                unit.interp_once = true;
+                if self.sentinel_addr != 0 {
+                    self.portals[index as usize].publish(self.sentinel_addr);
+                }
             }
         }
         if self.entries.len() != before || restamped {

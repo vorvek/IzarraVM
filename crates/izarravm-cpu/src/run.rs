@@ -1166,7 +1166,16 @@ impl CpuGsw {
                     .lift_cold_dormant(&mut jit.smc_heat, key, heat_epoch);
                 return Ok(ClifContinuation::Interpret);
             }
-            Some(jit::clif::cache::ClifUnitState::Compiled(index)) => index,
+            Some(jit::clif::cache::ClifUnitState::Compiled(index)) => {
+                // C1e post-restamp cooldown: interpret this one entry so the transient
+                // post-SMC fetch charge arises from the same interpreter path the oracle
+                // arm takes (timing identity by construction, not synthesis); the portal
+                // republishes inside `take_interp_once` and the next entry runs natively.
+                if self.jit_direct.clif_units.take_interp_once(index) {
+                    return Ok(ClifContinuation::Interpret);
+                }
+                index
+            }
             Some(jit::clif::cache::ClifUnitState::Seen) => {
                 // G1 pre-compile gate (entry chunk only, cheap).
                 let heat_epoch = self.smc_heat_epoch();
@@ -1335,6 +1344,7 @@ impl CpuGsw {
                     imm_extend: layout.imm_extend,
                     lea_mask: layout.lea_mask,
                     moffs_mask: layout.moffs_mask,
+                    interp_once: false,
                     code_host,
                     successors: layout.successors,
                 };

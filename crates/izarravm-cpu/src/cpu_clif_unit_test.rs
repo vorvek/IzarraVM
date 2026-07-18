@@ -301,6 +301,7 @@ fn clif_unit_cache_tracks_seen_compiled_and_dormant() {
         imm_extend: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
         lea_mask: 0,
         moffs_mask: 0,
+        interp_once: false,
         code_host: 0,
         successors: [None; 2],
     };

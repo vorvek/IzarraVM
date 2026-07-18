@@ -4173,44 +4173,6 @@ impl ChainHarness {
         self.compare("budgeted spin");
     }
 
-    /// C1e: one to-halt pass asserting FULL architectural state (registers, flags, FPU,
-    /// memory, CORE clocks) but tolerating a bus-clock delta. A restamp-surviving unit
-    /// legitimately skips the interpreter's transient post-SMC re-decode prefetch refill
-    /// (~2 bus clocks per patched non-root decode line): the unit keeps charging its
-    /// static fetch profile while the interpreter re-decodes the patched line once. This
-    /// is the first sanctioned timing-approx divergence in the clif differential suite
-    /// (the 2026-07-08 owner doctrine: state exact, timing approximate); every KILL path
-    /// remains fully clock-identical because a killed unit's bytes re-enter through the
-    /// interpreter on both arms.
-    fn pass_state_strict_bus_lenient(&mut self) {
-        for (cpu, bus) in [
-            (&mut self.interp, &mut self.interp_bus),
-            (&mut self.clif, &mut self.clif_bus),
-        ] {
-            bus.memory.copy_from_slice(&self.memory);
-            bus.trace.clear();
-            cpu.halted = false;
-            cpu.registers.gpr = self.gpr;
-            cpu.registers.eflags = 0x202;
-            cpu.pending_flags = PendingFlags::default();
-            cpu.set_eip(self.entry);
-            cpu.elapsed_clocks = 0;
-            cpu.core_clocks_so_far = 0;
-            cpu.timing_rem = 0;
-            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
-        }
-        let what = "restamp pass (bus-lenient)";
-        assert_eq!(self.clif.registers, self.interp.registers, "{what}");
-        assert_eq!(self.clif.pending_flags, self.interp.pending_flags, "{what}");
-        assert_eq!(self.clif.eflags(), self.interp.eflags(), "{what}");
-        assert_eq!(self.clif.fpu, self.interp.fpu, "{what}");
-        assert_eq!(self.clif_bus.memory, self.interp_bus.memory, "{what}");
-        assert_eq!(
-            self.clif.elapsed_clocks, self.interp.elapsed_clocks,
-            "{what}: elapsed"
-        );
-    }
-
     fn compare(&self, what: &str) {
         assert_eq!(self.clif.registers, self.interp.registers, "{what}");
         assert_eq!(self.clif.pending_flags, self.interp.pending_flags, "{what}");
@@ -4825,14 +4787,18 @@ fn clif_restamp_tail_patch_survives_without_recompile() {
     assert_eq!(harness.clif.registers.gpr[1], 0xaa34_5678, "ecx");
     let settled = harness.clif.jit_clif_counters();
     // kills == 0 is the no-recompile proof (restamp never removes an entry; only a kill
-    // forces the re-walk/re-lower/re-install path), and the install count agrees.
+    // forces the re-walk/re-lower/re-install path for THIS unit). `units_installed` is
+    // deliberately NOT pinned: the patched ROOT line's narrow decode invalidation makes
+    // the next pass interpret it naturally (the probe needs a live line), and that
+    // interpreted window can legitimately admit a NEW unit at a continuation root; the
+    // restamped unit itself stays Compiled with its patched lane, re-asserted here.
     assert_eq!(
         settled.smc_unit_kills, before.smc_unit_kills,
         "{settled:#?}"
     );
     assert_eq!(
-        settled.units_installed, after.units_installed,
-        "{settled:#?}"
+        compiled_unit(&harness.clif, 0x1001).operands[0],
+        0xaa34_5678
     );
 }
 
@@ -5052,9 +5018,9 @@ fn clif_restamp_preserves_chain_links() {
     // (2026-07-19, PR #597's investigation): an earlier note here blamed a pre-existing
     // C1d chained-hop under-charge for a bus-clock divergence seen while building this
     // test. False: main is clock-identical for chained targets of every byte length
-    // (PR #597's sweep pins it). The divergence was THIS branch's restamp re-decode
-    // skew on the post-patch pass, which is why that pass below uses
-    // pass_state_strict_bus_lenient; B's length is immaterial.
+    // (PR #597's sweep pins it). The divergence was THIS branch's own post-restamp
+    // transient, now closed by the interp-once cooldown
+    // (`ClifUnitDescriptor::interp_once`), so every pass here is the STRICT compare.
     let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xeb, 0x0a];
     code.resize(0x10, 0x90);
     code.extend_from_slice(&[0x43, 0xb3, 0x11, 0xf4]);
@@ -5073,16 +5039,23 @@ fn clif_restamp_preserves_chain_links() {
         "{after:#?}"
     );
     assert_eq!(after.smc_unit_kills, warmed.smc_unit_kills, "{after:#?}");
+    // First post-patch pass: the interp-once cooldown routes B through the resolver and
+    // the dispatcher interprets it once (charging the same transient the oracle arm
+    // pays); the pass itself stays STRICTLY byte-identical.
+    harness.pass();
+    // Second post-patch pass: the portal republished, so the SAME cell transfers
+    // natively again with no re-resolution, and B's compiled body consumes the patched
+    // lane.
     let before_pass = harness.clif.jit_clif_counters();
-    harness.pass_state_strict_bus_lenient();
+    harness.pass();
     let settled = harness.clif.jit_clif_counters();
     assert!(
         settled.linked_transfers > before_pass.linked_transfers,
-        "the restamped target must stay natively linked: {settled:#?}"
+        "the restamped target must resume native transfers after the cooldown: {settled:#?}"
     );
     assert_eq!(
         settled.unresolved_transfers, before_pass.unresolved_transfers,
-        "no hop may fall into the resolver: {settled:#?}"
+        "the republished portal must not leave hops in the resolver: {settled:#?}"
     );
     assert_eq!(
         harness.clif.registers.gpr[3] & 0xff,
@@ -5143,7 +5116,7 @@ fn clif_restamp_in_flight_callout_patch_is_observed_by_later_slots() {
     // consumed after an in-flight patch), so the interpreter finishes the pass with the
     // patched bytes and every LATER native entry loads the patched lane. No kill, no
     // retirement, no recompile anywhere.
-    harness.pass_state_strict_bus_lenient();
+    harness.pass();
     let settled = harness.clif.jit_clif_counters();
     assert!(
         settled.smc_unit_restamps > after.smc_unit_restamps,
@@ -5160,7 +5133,7 @@ fn clif_restamp_in_flight_callout_patch_is_observed_by_later_slots() {
     );
     // Later passes keep restamping the resident unit (the value-less x87 note fires per
     // pass against the template-reset bytes) and it stays Compiled throughout.
-    harness.pass_state_strict_bus_lenient();
+    harness.pass();
     let final_counters = harness.clif.jit_clif_counters();
     assert_eq!(
         final_counters.smc_unit_kills, before.smc_unit_kills,
@@ -5201,7 +5174,7 @@ fn clif_restamp_in_flight_callout_leading_write_still_kills() {
         before.smc_unit_restamps + 1,
         "the disp retarget itself is still a tail restamp: {after:#?}"
     );
-    harness.pass_state_strict_bus_lenient();
+    harness.pass();
     let settled = harness.clif.jit_clif_counters();
     assert!(
         settled.smc_unit_kills > before.smc_unit_kills,
@@ -5273,9 +5246,9 @@ fn clif_restamp_storm_neither_kills_nor_demotes() {
         0x90, 0x40, 0xb3, 0x55, 0xf4,
     ];
     // Persistent-memory pass loop (the pass counter must survive across passes, so the
-    // ChainHarness template reset cannot be used), state-strict but BUS-lenient on the
-    // storm passes for the same reason `pass_state_strict_bus_lenient` documents: the
-    // surviving unit skips the interpreter's transient post-SMC re-decode refill.
+    // ChainHarness template reset cannot be used), STRICT on every axis including bus
+    // clocks: the interp-once cooldown makes the restamp survivor charge the same
+    // transient post-SMC fetch the oracle arm pays.
     let mut memory = vec![0xf4u8; MEMORY_LEN];
     memory[0x1000..0x1000 + code.len()].copy_from_slice(&code);
     let mut interp = generated_cpu(GswMode::Gsw586);
@@ -5305,6 +5278,11 @@ fn clif_restamp_storm_neither_kills_nor_demotes() {
         assert_eq!(
             clif.elapsed_clocks, interp.elapsed_clocks,
             "storm core clocks"
+        );
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "storm bus clocks (the interp-once cooldown must keep timing identity)"
         );
     }
     let counters = clif.jit_clif_counters();
