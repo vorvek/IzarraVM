@@ -19,8 +19,6 @@ param(
     [switch]$BackendBakeoff,
     [switch]$TrackMComparison,
     [switch]$PollSkipComparison,
-    [ValidateSet("Combined", "Memory")]
-    [string]$PollSkipComparisonScope = "Combined",
     [string]$ExecutionRole = "",
     [switch]$Screening,
     [string]$MeasurementLockPath = "",
@@ -1102,17 +1100,6 @@ $explicitBaseline = $PSBoundParameters.ContainsKey("BaselineRevision")
 $explicitExecutionRole = $PSBoundParameters.ContainsKey("ExecutionRole")
 $trackMExecutionPolicy = $null
 $pollSkipExecutionPolicies = $null
-if (-not $PollSkipComparison -and
-    $PSBoundParameters.ContainsKey("PollSkipComparisonScope")) {
-    throw "PollSkipComparisonScope is only valid with PollSkipComparison."
-}
-# ValidateSet binds case-insensitively but preserves the caller's casing;
-# normalize once so the scope-sensitive policy helpers see the canonical name.
-$PollSkipComparisonScope = if ($PollSkipComparisonScope -ieq "Memory") {
-    "Memory"
-} else {
-    "Combined"
-}
 if ($PollSkipComparison) {
     Assert-PollSkipComparisonMode `
         ([bool]$BackendBakeoff) ([bool]$TrackMComparison) ([bool]$ReportOnly) `
@@ -1120,8 +1107,8 @@ if ($PollSkipComparison) {
         $explicitExecutionRole ([bool]$Screening) $Runs $Workload `
         $ProcessorIndex $MeasurementLockPath
     $pollSkipExecutionPolicies = [ordered]@{
-        skip_off = Get-PollSkipExecutionPolicy "skip_off" $PollSkipComparisonScope
-        skip_on = Get-PollSkipExecutionPolicy "skip_on" $PollSkipComparisonScope
+        skip_off = Get-PollSkipExecutionPolicy "skip_off"
+        skip_on = Get-PollSkipExecutionPolicy "skip_on"
     }
 } elseif ($TrackMComparison) {
     Assert-TrackMComparisonMode `
@@ -2253,12 +2240,6 @@ function Invoke-Observation(
                 -NotePropertyValue $rolePolicy.environment.IZARRAVM_JIT
             $sample | Add-Member -NotePropertyName gate_poll_skip `
                 -NotePropertyValue $rolePolicy.environment.IZARRAVM_POLL_SKIP
-            if ($rolePolicy.environment.Contains("IZARRAVM_POLL_SKIP_MEMORY")) {
-                # Memory-marginal scope only: the Combined scope's metadata
-                # stays byte-compatible with the pre-scope harness.
-                $sample | Add-Member -NotePropertyName gate_poll_skip_memory `
-                    -NotePropertyValue $rolePolicy.environment.IZARRAVM_POLL_SKIP_MEMORY
-            }
             $sample | Add-Member -NotePropertyName gate_measurement_fixture_sha256 `
                 -NotePropertyValue $measurementFixtureHash
         } elseif ($BackendBakeoff) {
@@ -2389,8 +2370,7 @@ try {
                 $warmup = Invoke-Observation `
                     $policy $sourceFolder $role "warmup" $artifact.executed_copy_path
                 if ($PollSkipComparison) {
-                    Assert-PollSkipSample $warmup $role "warmup" $policy `
-                        $PollSkipComparisonScope
+                    Assert-PollSkipSample $warmup $role "warmup" $policy
                 }
                 $discardedWarmups[$policy.name][$role] += $warmup
             }
@@ -2421,8 +2401,7 @@ try {
                     }
                     $sample = Invoke-Observation $policy $sourceFolder $role "pair$pair" $artifact.executed_copy_path
                     if ($PollSkipComparison) {
-                        Assert-PollSkipSample $sample $role "pair$pair" $policy `
-                            $PollSkipComparisonScope
+                        Assert-PollSkipSample $sample $role "pair$pair" $policy
                         Assert-PollSkipRoleReference `
                             $policy.name $role `
                             $discardedWarmups[$policy.name][$role][0] $sample
@@ -2458,7 +2437,7 @@ try {
         if ($PollSkipComparison) {
             $workloads += Get-PollSkipWorkloadSummary `
                 $policy $bucket.skip_on $bucket.skip_off `
-                $discardedWarmups[$policy.name] $PollSkipComparisonScope
+                $discardedWarmups[$policy.name]
         } elseif ($TrackMComparison) {
             $workloads += Get-TrackMWorkloadSummary `
                 $policy $bucket.candidate $bucket.parent `

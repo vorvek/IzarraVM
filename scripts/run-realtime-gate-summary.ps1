@@ -7,7 +7,7 @@ function Get-KnownDiagnosticVariables {
         "IZARRAVM_DIFF_TRACE", "IZARRAVM_DUMP_LINEAR", "IZARRAVM_FAULT_TRACE",
         "IZARRAVM_IO_HIST", "IZARRAVM_JIT_FOLD", "IZARRAVM_JIT_REGION",
         "IZARRAVM_MACHINE_PROFILE", "IZARRAVM_POLL_SKIP", "IZARRAVM_POLL_SKIP_DIAG",
-        "IZARRAVM_POLL_SKIP_MEMORY", "IZARRAVM_PROFILE_ITERS",
+        "IZARRAVM_PROFILE_ITERS",
         "IZARRAVM_RUNTIME_PROFILE", "IZARRAVM_UNIT_SIM", "RUST_LOG"
     )
 }
@@ -149,29 +149,12 @@ function Assert-PollSkipComparisonMode(
     }
 }
 
-function Get-PollSkipExecutionPolicy([string]$Role, [string]$Scope = "Combined") {
-    if ($Role -notin @("skip_off", "skip_on")) {
-        throw "Unknown POLL-SKIP comparison role '$Role'."
+function Get-PollSkipExecutionPolicy([string]$Role) {
+    $pollSkip = switch ($Role) {
+        "skip_off" { "0" }
+        "skip_on" { "1" }
+        default { throw "Unknown POLL-SKIP comparison role '$Role'." }
     }
-    if ($Scope -ieq "Memory") {
-        # Memory-marginal comparison: both roles run with the io family active
-        # (IZARRAVM_POLL_SKIP=1) and differ only in the memory-shape sub-flag,
-        # isolating the memory family's own contribution on top of v1.
-        $pollSkipMemory = if ($Role -ceq "skip_on") { "1" } else { "0" }
-        return [pscustomobject][ordered]@{
-            name = $Role
-            cli = "--interpreter"
-            environment = [ordered]@{
-                IZARRAVM_JIT = "0"
-                IZARRAVM_POLL_SKIP = "1"
-                IZARRAVM_POLL_SKIP_MEMORY = $pollSkipMemory
-            }
-        }
-    }
-    if ($Scope -ine "Combined") {
-        throw "Unknown POLL-SKIP comparison scope '$Scope'."
-    }
-    $pollSkip = if ($Role -ceq "skip_on") { "1" } else { "0" }
     return [pscustomobject][ordered]@{
         name = $Role
         cli = "--interpreter"
@@ -214,11 +197,10 @@ function Get-PollSkipSampleFailureReasons(
     $Sample,
     [string]$Role,
     [string]$Observation,
-    $Policy,
-    [string]$Scope = "Combined"
+    $Policy
 ) {
     $reasons = @()
-    $rolePolicy = Get-PollSkipExecutionPolicy $Role $Scope
+    $rolePolicy = Get-PollSkipExecutionPolicy $Role
     if ($Sample.gate_role -cne $Role -or $Sample.gate_observation -cne $Observation) {
         $reasons += "role or observation identity is wrong"
     }
@@ -230,12 +212,6 @@ function Get-PollSkipSampleFailureReasons(
         $Sample.gate_execution_jit -cne $rolePolicy.environment.IZARRAVM_JIT -or
         $Sample.gate_poll_skip -cne $rolePolicy.environment.IZARRAVM_POLL_SKIP) {
         $reasons += "execution policy is wrong"
-    }
-    if ($rolePolicy.environment.Contains("IZARRAVM_POLL_SKIP_MEMORY") -and
-        ($null -eq $Sample.PSObject.Properties["gate_poll_skip_memory"] -or
-        [string]$Sample.gate_poll_skip_memory -cne
-        $rolePolicy.environment.IZARRAVM_POLL_SKIP_MEMORY)) {
-        $reasons += "memory sub-flag policy is wrong"
     }
     if ([string]$Sample.gate_measurement_fixture_sha256 -notmatch '^[0-9a-f]{64}$') {
         $reasons += "measurement fixture identity is missing"
@@ -265,22 +241,6 @@ function Get-PollSkipSampleFailureReasons(
     if ($null -eq $Sample.perf.PSObject.Properties["poll_skip_spans"] -or
         $null -eq $Sample.perf.PSObject.Properties["poll_skip_iterations"]) {
         $reasons += "POLL-SKIP counters are missing"
-    } elseif ($Scope -ieq "Memory") {
-        # Memory-marginal scope: the io family is active in BOTH roles, so the
-        # aggregate counters stay positive everywhere and the memory subset
-        # counters carry the role distinction.
-        if ($null -eq $Sample.perf.PSObject.Properties["poll_skip_memory_spans"] -or
-            $null -eq $Sample.perf.PSObject.Properties["poll_skip_memory_iterations"]) {
-            $reasons += "POLL-SKIP memory counters are missing"
-        } elseif ($Role -ceq "skip_off" -and
-            ($Sample.perf.poll_skip_memory_spans -ne 0 -or
-            $Sample.perf.poll_skip_memory_iterations -ne 0)) {
-            $reasons += "skip_off reported nonzero POLL-SKIP memory counters"
-        } elseif ($Role -ceq "skip_on" -and
-            ($Sample.perf.poll_skip_memory_spans -le 0 -or
-            $Sample.perf.poll_skip_memory_iterations -le 0)) {
-            $reasons += "skip_on did not report positive POLL-SKIP memory counters"
-        }
     } elseif ($Role -ceq "skip_off" -and
         ($Sample.perf.poll_skip_spans -ne 0 -or $Sample.perf.poll_skip_iterations -ne 0)) {
         $reasons += "skip_off reported nonzero POLL-SKIP counters"
@@ -295,10 +255,9 @@ function Assert-PollSkipSample(
     $Sample,
     [string]$Role,
     [string]$Observation,
-    $Policy,
-    [string]$Scope = "Combined"
+    $Policy
 ) {
-    $reasons = @(Get-PollSkipSampleFailureReasons $Sample $Role $Observation $Policy $Scope)
+    $reasons = @(Get-PollSkipSampleFailureReasons $Sample $Role $Observation $Policy)
     if ($reasons.Count -ne 0) {
         throw "$($Policy.name) $Role $Observation failed: $($reasons -join '; ')."
     }
@@ -1214,8 +1173,7 @@ function Get-PollSkipWorkloadSummary(
     $Policy,
     [object[]]$SkipOn,
     [object[]]$SkipOff,
-    $WarmupBucket,
-    [string]$Scope = "Combined"
+    $WarmupBucket
 ) {
     if ($SkipOn.Count -ne $SkipOff.Count -or $SkipOn.Count -notin @(6, 12)) {
         throw "$($Policy.name) requires 6 or 12 complete POLL-SKIP pairs."
@@ -1246,7 +1204,7 @@ function Get-PollSkipWorkloadSummary(
         }
         foreach ($sample in $samples) {
             $provenanceReasons += @(Get-PollSkipSampleFailureReasons `
-                $sample $role $sample.gate_observation $Policy $Scope)
+                $sample $role $sample.gate_observation $Policy)
         }
     }
 
@@ -1484,19 +1442,9 @@ function New-PollSkipComparisonSummary([object[]]$Workloads) {
         $diagnosticVariables | Where-Object { -not $roleEnvironmentNames.Contains($_) }
     )
 
-    # The Memory scope changes only the class label and the embedded role
-    # environments; a Combined-scope summary stays byte-identical to the
-    # pre-scope harness.
-    $comparisonClass = if (
-        $pollSkipExecutionPolicies.skip_on.environment.Contains("IZARRAVM_POLL_SKIP_MEMORY")
-    ) {
-        "same_executable_poll_skip_memory_toggle"
-    } else {
-        "same_executable_poll_skip_toggle"
-    }
     return [ordered]@{
         schema = "izarravm-poll-skip-comparison-v1"
-        comparison_class = $comparisonClass
+        comparison_class = "same_executable_poll_skip_toggle"
         formal = $true
         evidence_grade = if ($Runs -eq 6) { "six_pair_proof" } else { "twelve_pair_confirmation" }
         verdict = $verdict

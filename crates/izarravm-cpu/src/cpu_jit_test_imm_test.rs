@@ -957,17 +957,6 @@ fn poll_neg_cache_policy_default_on_with_kill_switch() {
     assert!(!poll_neg_cache_policy(Some("")));
 }
 
-/// IZARRAVM_POLL_SKIP_MEMORY shares the exact same default-on truth table.
-#[cfg(feature = "jit")]
-#[test]
-fn poll_skip_memory_policy_default_on_with_kill_switch() {
-    assert!(poll_skip_memory_policy(None));
-    assert!(poll_skip_memory_policy(Some("1")));
-    assert!(poll_skip_memory_policy(Some("yes")));
-    assert!(!poll_skip_memory_policy(Some("0")));
-    assert!(!poll_skip_memory_policy(Some("")));
-}
-
 const MEMORY_POLL_CELL: u32 = 0x4000;
 
 /// `CMP EAX,DS:[disp32]; Jcc rel8` back to entry: the certified M1 shape, the
@@ -1093,32 +1082,6 @@ fn exact_memory_poll_rejects_non_bare_disp32_and_narrow_cs_limit() {
     assert!(
         cpu.poll_loop().is_none(),
         "narrow CS limit must reject the memory shape too"
-    );
-}
-
-/// The IZARRAVM_POLL_SKIP_MEMORY sub-flag is the single choke point (gated
-/// inside `build_poll_loop_at`'s M1 arm): with it off, a structurally
-/// certified memory loop classifies as if the shape did not exist at all,
-/// regardless of which slot the classify call starts from.
-#[cfg(feature = "jit")]
-#[test]
-fn poll_skip_memory_sub_flag_suppresses_the_shape_entirely() {
-    // The flag is read once at CPU construction in production (an env-fixed
-    // value for the process lifetime); this test mirrors that by setting it
-    // BEFORE the first classify call in each case, rather than toggling a
-    // live cache's already-recorded verdict (a cached structural negative
-    // recorded while off is a correct, pure function of code bytes for a
-    // flag fixed for the run, so it is not expected to un-cache on a
-    // mid-run flip -- that is not production usage).
-    let (mut cpu_on, _) = warm_exact_memory_poll(false, MEMORY_POLL_CELL, 1, 2);
-    cpu_on.set_poll_skip_memory_enabled_for_test(true);
-    assert!(cpu_on.poll_loop().is_some(), "on: shape certifies");
-
-    let (mut cpu_off, _) = warm_exact_memory_poll(false, MEMORY_POLL_CELL, 1, 2);
-    cpu_off.set_poll_skip_memory_enabled_for_test(false);
-    assert!(
-        cpu_off.poll_loop().is_none(),
-        "off: the sub-flag must suppress the memory shape entirely"
     );
 }
 
