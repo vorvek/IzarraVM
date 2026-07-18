@@ -301,7 +301,7 @@ fn emitted_size_exhaustion_is_retryable_for_short_and_long_blocks() {
     ));
 }
 
-fn reject(cache: &mut jit::direct::BlockCache, key: jit::direct::BlockKey, len: usize) {
+fn reject(cache: &mut jit::JitState, key: jit::direct::BlockKey, len: usize) {
     assert!(matches!(
         cache.probe(key),
         jit::direct::BlockProbe::Interpret
@@ -317,14 +317,14 @@ fn reject(cache: &mut jit::direct::BlockCache, key: jit::direct::BlockKey, len: 
 #[test]
 fn rejected_span_invalidates_on_every_owned_byte_but_not_adjacent_bytes() {
     for offset in 0..4 {
-        let mut cache = jit::direct::BlockCache::default();
+        let mut cache = jit::JitState::new(jit::direct::BlockCache::default());
         let key = jit::direct::BlockKey::new(0x200, 0x320, 7);
         reject(&mut cache, key, 4);
         assert_eq!(cache.invalidate_physical_range(0x320 + offset, 1), 1);
         assert!(!cache.range_hits_compiled_code(0x320, 4));
     }
 
-    let mut cache = jit::direct::BlockCache::default();
+    let mut cache = jit::JitState::new(jit::direct::BlockCache::default());
     let key = jit::direct::BlockKey::new(0x200, 0x320, 7);
     reject(&mut cache, key, 4);
     assert_eq!(cache.invalidate_physical_range(0x31f, 1), 0);
@@ -337,7 +337,7 @@ fn rejected_span_invalidates_on_every_owned_byte_but_not_adjacent_bytes() {
 
 #[test]
 fn repeated_reject_does_not_acquire_a_second_watch_owner() {
-    let mut cache = jit::direct::BlockCache::default();
+    let mut cache = jit::JitState::new(jit::direct::BlockCache::default());
     let key = jit::direct::BlockKey::new(0x200, 0x320, 7);
     reject(&mut cache, key, 4);
     cache.reject(jit::direct::RejectedSpan::new(key, 4).expect("rejected fixture span"));
@@ -402,7 +402,7 @@ fn compiled_and_rejected_owners_share_a_chunk_until_both_retire() {
 
 #[test]
 fn cache_clear_unpublishes_rejected_watch_and_keeps_the_table_base() {
-    let mut cache = jit::direct::BlockCache::default();
+    let mut cache = jit::JitState::new(jit::direct::BlockCache::default());
     let key = jit::direct::BlockKey::new(0x200, 0x12_320, 7);
     let base = cache.native_code_watch_table();
     let entry = unsafe { (base as *const usize).add((key.physical >> 12) as usize) };

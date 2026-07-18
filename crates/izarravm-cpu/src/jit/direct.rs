@@ -560,7 +560,6 @@ pub(crate) struct BlockCache {
     /// resets, so it can never erase the live backend's demotion evidence.
     heat_resets: u64,
     stats: BlockCacheStats,
-    code_watch: Box<NativeCodeWatch>,
     #[cfg(test)]
     defer_short_for_test: bool,
     #[cfg(test)]
@@ -625,7 +624,6 @@ impl BlockCache {
             admission_heat: DEFAULT_ADMISSION_HEAT,
             heat_resets: 0,
             stats: BlockCacheStats::default(),
-            code_watch: Box::default(),
             #[cfg(test)]
             defer_short_for_test: false,
             #[cfg(test)]
@@ -676,7 +674,7 @@ impl BlockCache {
         self.fast_map_enabled_for_test = enabled;
     }
 
-    pub(crate) fn probe(&mut self, key: BlockKey) -> BlockProbe {
+    pub(crate) fn probe(&mut self, watch: &mut NativeCodeWatch, key: BlockKey) -> BlockProbe {
         if self.disabled {
             return BlockProbe::Rejected;
         }
@@ -701,7 +699,7 @@ impl BlockCache {
             None => {
                 self.stats.lookup_misses += 1;
                 if self.entries.len() == self.entry_cap {
-                    self.reset_storage();
+                    self.reset_storage(watch);
                 }
                 self.entries.insert(key, BlockState::Seen);
                 self.track_physical_key(key);
@@ -711,7 +709,11 @@ impl BlockCache {
     }
 
     /// Install bytes produced after `probe` returned `Compile`.
-    pub(crate) fn install(&mut self, compilation: &Compilation) -> Option<BlockId> {
+    pub(crate) fn install(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        compilation: &Compilation,
+    ) -> Option<BlockId> {
         let span = compilation.span;
         if self.disabled || self.entries.get(&span.key) != Some(&BlockState::Seen) {
             return None;
@@ -739,7 +741,7 @@ impl BlockCache {
                 if can_compact {
                     self.stats.arena_compaction_failures += 1;
                 }
-                self.reset_storage();
+                self.reset_storage(watch);
                 self.entries.insert(span.key, BlockState::Seen);
                 self.track_physical_key(span.key);
             }
@@ -789,8 +791,7 @@ impl BlockCache {
             dynamic_successor: compilation.dynamic_successor,
             successors: compilation.successors,
         };
-        self.code_watch
-            .acquire_range(span.key.physical, u32::from(span.guest_len));
+        watch.acquire_range(span.key.physical, u32::from(span.guest_len));
         if index == self.blocks.len() {
             self.blocks.push(block);
             if index == self.block_portals.len() {
@@ -839,10 +840,9 @@ impl BlockCache {
     }
 
     /// Prevent repeated compilation attempts for a block the emitter cannot handle.
-    pub(crate) fn reject(&mut self, span: RejectedSpan) {
+    pub(crate) fn reject(&mut self, watch: &mut NativeCodeWatch, span: RejectedSpan) {
         if self.entries.get(&span.key) == Some(&BlockState::Seen) {
-            self.code_watch
-                .acquire_range(span.key.physical, u32::from(span.guest_len));
+            watch.acquire_range(span.key.physical, u32::from(span.guest_len));
             self.entries.insert(span.key, BlockState::Rejected(span));
         }
     }
@@ -890,7 +890,11 @@ impl BlockCache {
     /// Retire one descriptor-specialized block while keeping its key in the observed state. The
     /// current encounter falls back to the interpreter; the next encounter recompiles directly
     /// for the then-current segment layout instead of paying another first-seen pass.
-    pub(crate) fn retire_key_for_recompile(&mut self, key: BlockKey) -> bool {
+    pub(crate) fn retire_key_for_recompile(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        key: BlockKey,
+    ) -> bool {
         let Some(BlockState::Compiled(id)) = self.entries.get(&key).copied() else {
             return false;
         };
@@ -899,24 +903,24 @@ impl BlockCache {
             self.hot[hot_index] = None;
         }
         self.entries.insert(key, BlockState::Seen);
-        self.retire_block(id);
+        self.retire_block(watch, id);
         true
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self, watch: &mut NativeCodeWatch) {
         // CS reloads and monitor transitions can invalidate code millions of times while the
         // direct cache is unused. Avoid clearing the 65,536-entry hot table when it is already
         // empty.
         if self.entries.is_empty() && self.blocks.is_empty() && self.arena.is_none() {
-            if self.code_watch.has_resident_pages() {
-                self.code_watch.clear();
+            if watch.has_resident_pages() {
+                watch.clear();
             }
             // A full clear still drops heat: signal the owner of the hoisted map.
             self.heat_resets = self.heat_resets.wrapping_add(1);
             self.disabled = false;
             return;
         }
-        self.reset_storage();
+        self.reset_storage(watch);
         self.disabled = false;
     }
 
@@ -997,7 +1001,12 @@ impl BlockCache {
 
     /// Remove direct-cache entries whose translated physical bytes overlap a guest write. Block
     /// IDs and executable pages stay in place until the arena's normal whole-cache reset.
-    pub(crate) fn invalidate_physical_range(&mut self, physical: u32, width: u32) -> usize {
+    pub(crate) fn invalidate_physical_range(
+        &mut self,
+        watch: &mut NativeCodeWatch,
+        physical: u32,
+        width: u32,
+    ) -> usize {
         if width == 0 || self.entries.is_empty() {
             return 0;
         }
@@ -1048,10 +1057,10 @@ impl BlockCache {
                         self.hot[hot_index] = None;
                     }
                     match state {
-                        BlockState::Rejected(span) => self
-                            .code_watch
-                            .release_range(span.key.physical, u32::from(span.guest_len)),
-                        BlockState::Compiled(id) => self.retire_block(id),
+                        BlockState::Rejected(span) => {
+                            watch.release_range(span.key.physical, u32::from(span.guest_len));
+                        }
+                        BlockState::Compiled(id) => self.retire_block(watch, id),
                         BlockState::Seen | BlockState::Dormant => {}
                     }
                     invalidated += 1;
@@ -1078,19 +1087,6 @@ impl BlockCache {
 
     pub(crate) fn take_stats(&mut self) -> BlockCacheStats {
         std::mem::take(&mut self.stats)
-    }
-
-    pub(crate) fn native_code_watch_table(&mut self) -> usize {
-        self.code_watch.table_base()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_code_range(&mut self, physical: u32, len: u8) {
-        self.code_watch.acquire_range(physical, u32::from(len));
-    }
-
-    pub(crate) fn range_hits_compiled_code(&self, physical: u32, width: u32) -> bool {
-        self.code_watch.range_watched(physical, width)
     }
 
     pub(crate) fn has_linked_successor(&self, block: CompiledBlock) -> bool {
@@ -1365,7 +1361,7 @@ impl BlockCache {
         true
     }
 
-    fn reset_storage(&mut self) {
+    fn reset_storage(&mut self, watch: &mut NativeCodeWatch) {
         let links = self
             .outbound
             .iter()
@@ -1398,7 +1394,7 @@ impl BlockCache {
             slots.clear();
         }
         self.block_link_epochs.clear();
-        self.code_watch.clear();
+        watch.clear();
         // Every storage reset drops heat; the owner of the hoisted map observes this counter.
         self.heat_resets = self.heat_resets.wrapping_add(1);
         self.block_active.clear();
@@ -1557,7 +1553,7 @@ impl BlockCache {
         });
     }
 
-    fn retire_block(&mut self, id: BlockId) {
+    fn retire_block(&mut self, watch: &mut NativeCodeWatch, id: BlockId) {
         let Some(index) = self.active_index(id) else {
             return;
         };
@@ -1576,8 +1572,7 @@ impl BlockCache {
         self.free_block_slots
             .push(u16::try_from(index).expect("block slot index must fit its ID"));
         self.live_blocks -= 1;
-        self.code_watch
-            .release_range(span.key.physical, u32::from(span.guest_len));
+        watch.release_range(span.key.physical, u32::from(span.guest_len));
     }
 
     fn track_physical_key(&mut self, key: BlockKey) {
