@@ -1098,15 +1098,27 @@ impl ClifUnitCache {
                         }
                     }
                 }
-                // Conservative page-overlap drop for non-compiled states (no recorded
-                // guest_len or slot layout exists for them).
-                ClifUnitState::Seen | ClifUnitState::Dormant => {
-                    let page = key.physical & !0xfff;
-                    if !(page.saturating_add(0x1000) <= start || page >= end) {
-                        dying.push((*key, None));
-                        outcome.kills_no_layout += 1;
-                    }
-                }
+                // C1f (dev_docs/plans/2026-07-19-clif-compile-churn-fix-design.md, Option
+                // 2): deliberately a no-op. `Seen`/`Dormant` are bare markers (no payload
+                // at all, cache.rs:602-607): only `install` ever registers a physical
+                // range with the shared `NativeCodeWatch`, and only for a transition INTO
+                // `Compiled` (cache.rs:707-748); a `Seen`/`Dormant` entry holds no watch
+                // registration, no baked pointer, no span -- there is nothing here for a
+                // stale write to invalidate. Whenever a `Seen` entry is finally promoted,
+                // `walk_unit` re-reads the CURRENT guest bytes at that exact moment, so a
+                // write in the interim changes what gets compiled, never what a cached
+                // verdict wrongly kept believing. This arm used to drop both states on ANY
+                // write landing anywhere in the entry's entire 4096-byte physical page (256x
+                // coarser than the `Compiled` arm's byte-exact check three lines above),
+                // which produced a compile-churn treadmill: a heat-parked `Dormant` verdict
+                // was erased by the next unrelated same-page write, forcing a full re-walk
+                // and a full failed Cranelift recompile for the same underlying reason,
+                // repeated forever (180,852 compile attempts against 7,645 installs on the
+                // Quake/586 1200M-cycle bakeoff). The `Compiled` byte-exact arm above is
+                // completely unchanged: it still kills/restamps on any write that actually
+                // overlaps a compiled unit's own span, which is the only arm that ever held
+                // a resource (the watch registration) worth protecting.
+                ClifUnitState::Seen | ClifUnitState::Dormant => {}
             }
         }
         for (key, index) in dying {

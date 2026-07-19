@@ -4148,6 +4148,31 @@ impl ChainHarness {
         self.compare("chain pass");
     }
 
+    /// One to-halt pass on both arms with full equality asserts, starting at a
+    /// caller-chosen entry instead of the fixed `self.entry` (C1f: for driving TWO
+    /// independent, non-linked routines that live on the same harness/page but each halt on
+    /// their own, so neither `pass()`'s single shared entry nor a chaining jmp between them
+    /// is needed).
+    fn pass_from(&mut self, entry: u32) {
+        for (cpu, bus) in [
+            (&mut self.interp, &mut self.interp_bus),
+            (&mut self.clif, &mut self.clif_bus),
+        ] {
+            bus.memory.copy_from_slice(&self.memory);
+            bus.trace.clear();
+            cpu.halted = false;
+            cpu.registers.gpr = self.gpr;
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(entry);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("runs").halted {}
+        }
+        self.compare("pass_from");
+    }
+
     /// One BUDGETED pass on both arms (for never-halting spins): `calls` run_budgeted
     /// invocations at `cap`, equality asserted after the batch.
     fn budgeted_pass(&mut self, calls: usize, cap: u64) {
@@ -5304,5 +5329,172 @@ fn clif_restamp_storm_neither_kills_nor_demotes() {
             Some(ClifUnitState::Compiled(_))
         ),
         "the stormed unit must stay resident and Compiled"
+    );
+}
+
+// ===== C1f (dev_docs/plans/2026-07-19-clif-compile-churn-fix-design.md, Option 2): the
+// differential churn battery. The unit-level test in cpu_clif_unit_test.rs is the
+// load-bearing proof (it exercises `invalidate_physical_range` directly); this battery
+// additionally proves the fix guest-invisibly through a real admission cycle: an
+// independent routine parked `Dormant` by a genuine STRUCTURAL admission failure (not the
+// no-FastMap early-return at run.rs:1253-1261, which leaves the entry `Seen` and would
+// falsely re-attempt on both the buggy and the fixed code alike -- see MINOR-2 in the PR
+// description) must survive repeated unrelated writes to its own shared code page without
+// ever re-entering the compile pipeline.
+
+/// A writable but EXPAND-DOWN data segment: fully legal and correctly handled by the
+/// INTERPRETER's own segment check (`memory.rs`'s `segment_linear_byte` computes the
+/// expand-down limit sense but never rejects the descriptor outright), yet unconditionally
+/// REFUSED by the JIT's admission-time check (`direct.rs`'s `segment_access_supported`:
+/// `if expand_down || ... { return false; }`, with no data/read/write case that can pass).
+/// This is a real, intentional asymmetry between the two checks (the JIT declines to lower
+/// expand-down accesses rather than model their reversed limit sense), which makes it the
+/// cleanest available lever to force `SegmentLayout::capture` (`run.rs:1238-1245`) to fail
+/// structurally on every attempt without ever faulting the interpreter's OWN execution of
+/// the guest instruction that uses it.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn expand_down_data_segment() -> SegmentRegister {
+    SegmentRegister {
+        selector: 0x10,
+        base: 0,
+        // limit: 0 means every offset > 0 is in-bounds for an expand-down segment (the
+        // 386 PRM's reversed limit sense), so any nonzero write target the routine below
+        // uses stays valid for the interpreter.
+        limit: 0,
+        access: 0x97, // P=1, DPL=0, S=1 (data), expand-down, writable.
+        default_size_32: true,
+    }
+}
+
+/// B's one memory write's target: unrelated to the 0x1000-page code entirely (a different
+/// physical page), so nothing about the fix's shared-CODE-page mechanics touches it.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+const CHURN_B_WRITE_TARGET: u32 = 0x1_0000;
+/// The unrelated third byte on A/B's SHARED 4KB code page (0x1000..0x1fff): far from both
+/// A's bytes (0x1001..0x1004) and B's bytes (0x100f..0x1016), so a write here can never be
+/// classified as touching either unit's own span; only page MEMBERSHIP connects it to them.
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+const CHURN_THIRD_ADDR: u32 = 0x1800;
+
+/// The independent, non-linked A/B differential churn battery. A (register-only, no memory
+/// access) and B (one memory write through DS) sit on the SAME physical page but never
+/// chain: each has its own starter nop, its own entry, and its own `hlt`, run through
+/// `ChainHarness::pass_from` rather than a shared fall-through/jmp so there is no native
+/// link edge between them at all (B never compiles, so no such edge could ever resolve
+/// anyway, but this keeps the construction unambiguous). DS is corrupted to the
+/// expand-down descriptor above BEFORE B is ever warmed, so B's admission always fails at
+/// `SegmentLayout::capture` and parks `Dormant` with no heat bump (the structural-failure
+/// shape, not the G1 heat-demotion shape) -- exactly the "permanent until `clif_clear`"
+/// residual gap the design's section 4/MINOR-4 discloses.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_dormant_structural_failure_survives_unrelated_same_page_writes() {
+    use crate::jit::clif::cache::{ClifUnitKey, ClifUnitState};
+
+    const A_ENTRY: u32 = 0x1000; // nop; A (inc eax; add eax,ebx; hlt) keyed at 0x1001.
+    const B_ENTRY: u32 = 0x100f; // nop; B (mov [target], eax; hlt) keyed at 0x1010.
+
+    // 0x1000: nop; 0x1001: inc eax; 0x1002: add eax,ebx; 0x1004: hlt (A's own halt).
+    let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xf4];
+    code.resize(0x0f, 0x90); // padding, never reached (A halts at 0x1004).
+    code.push(0x90); // 0x100f: B's starter nop.
+    code.push(0x89); // 0x1010: mov [disp32], eax ...
+    code.push(0x05); // ... ModRM: mod=00 reg=000(eax) rm=101 (disp32, no base).
+    code.extend_from_slice(&CHURN_B_WRITE_TARGET.to_le_bytes());
+    code.push(0xf4); // 0x1016: hlt (B's own halt).
+
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for cpu in [&mut harness.interp, &mut harness.clif] {
+        cpu.registers
+            .set_segment(SegmentIndex::Ds, expand_down_data_segment());
+    }
+
+    // Warm A to Compiled: register-only, never touches DS, unaffected by the corruption.
+    for _ in 0..6 {
+        harness.pass_from(A_ENTRY);
+    }
+    let a_key = ClifUnitKey {
+        linear: 0x1001,
+        physical: 0x1001,
+        mode_key: harness.clif.jit_mode_key(),
+    };
+    assert!(
+        matches!(
+            harness.clif.jit_direct.clif_units.state(a_key),
+            Some(ClifUnitState::Compiled(_))
+        ),
+        "A must compile normally; DS corruption must not affect a unit that never uses it"
+    );
+
+    // Warm B: its first (and, under the fix, ONLY ever) admission attempt structurally
+    // fails at SegmentLayout::capture (DS is expand-down) and parks Dormant.
+    for _ in 0..6 {
+        harness.pass_from(B_ENTRY);
+    }
+    let b_key = ClifUnitKey {
+        linear: 0x1010,
+        physical: 0x1010,
+        mode_key: harness.clif.jit_mode_key(),
+    };
+    assert_eq!(
+        harness.clif.jit_direct.clif_units.state(b_key),
+        Some(ClifUnitState::Dormant),
+        "B must structurally fail admission (segment capture) and park Dormant"
+    );
+    let warmed = harness.clif.jit_clif_counters();
+    assert!(warmed.compile_attempts > 0, "{warmed:#?}");
+    // MINOR-3: the permanent-zero tripwire holds even across the one genuine (failed)
+    // attempt above; kills_no_layout counts EVICTIONS, and nothing evicted anything yet.
+    assert_eq!(warmed.smc_unit_kills_no_layout, 0, "{warmed:#?}");
+
+    // The churn loop: N rounds of (an unrelated same-page write, then two consecutive
+    // visits to B). Two consecutive visits matter because a `None` state needs one visit
+    // to reach `Seen` and a SECOND to actually re-attempt the compile (`run.rs:1154-1204`);
+    // this deterministically forces one full re-admission cycle per round on the UNFIXED
+    // code (the treadmill from the design's section 3), and zero extra cycles on the fixed
+    // code (B never leaves `Dormant`, so both visits are cheap `lift_cold_dormant` no-ops).
+    const ROUNDS: u32 = 10;
+    for round in 0..ROUNDS {
+        note_patch(&mut harness, CHURN_THIRD_ADDR as usize, &[0xaa]);
+        harness.pass_from(B_ENTRY);
+        harness.pass_from(B_ENTRY);
+        assert_eq!(
+            harness.clif.jit_direct.clif_units.state(b_key),
+            Some(ClifUnitState::Dormant),
+            "round {round}: B must still be (or be back to) Dormant"
+        );
+        assert!(
+            matches!(
+                harness.clif.jit_direct.clif_units.state(a_key),
+                Some(ClifUnitState::Compiled(_))
+            ),
+            "round {round}: A is on a different address on the same page and must be untouched"
+        );
+    }
+
+    let settled = harness.clif.jit_clif_counters();
+    assert_eq!(
+        settled.smc_unit_kills_no_layout, warmed.smc_unit_kills_no_layout,
+        "no Seen/Dormant entry may be evicted by an unrelated same-page write: {settled:#?}"
+    );
+    assert_eq!(
+        settled.compile_attempts, warmed.compile_attempts,
+        "B must never re-enter the compile pipeline once Dormant: {settled:#?}"
     );
 }
