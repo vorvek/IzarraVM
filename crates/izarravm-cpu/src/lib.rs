@@ -949,9 +949,14 @@ pub struct JitClifCounters {
     /// `smc_unit_kills` partition every SMC write that hit a COMPILED clif unit's span;
     /// `smc_unit_kills_multi_slot` is the subset of kills escalated by the coarse
     /// multi-slot rule (every touched slot individually tail-confined, but more than one
-    /// touched); `smc_unit_kills_no_layout` counts `Seen`/`Dormant` conservative-span
-    /// drops separately (no member layout exists to classify, so they are not
-    /// "eligible" in the same sense).
+    /// touched). `smc_unit_kills_no_layout` is C1f's permanent-zero regression tripwire
+    /// (dev_docs/plans/2026-07-19-clif-compile-churn-fix-design.md, Option 2): it used to
+    /// count `Seen`/`Dormant` entries dropped by a page-granular conservative-eviction rule
+    /// that caused a compile-churn treadmill (a heat-parked verdict erased by any unrelated
+    /// write sharing its 4KB page, forcing a full re-walk and recompile for no reason); that
+    /// rule is gone (`Seen`/`Dormant` hold no resource a write could invalidate, so nothing
+    /// is lost by never dropping them), so this field is now EXPECTED to stay zero forever.
+    /// A nonzero value signals the page-eviction bug has been reintroduced.
     pub smc_unit_kills: u64,
     pub smc_unit_restamps: u64,
     pub smc_unit_kills_no_layout: u64,

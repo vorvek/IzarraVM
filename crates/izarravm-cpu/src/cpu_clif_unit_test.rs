@@ -474,3 +474,140 @@ fn clif_lowered_probe_straight_line() {
     }
     assert!(clif.jit_clif_counters().entries > 0);
 }
+
+/// C1f (`dev_docs/plans/2026-07-19-clif-compile-churn-fix-design.md`, Option 2), the
+/// LEAD/load-bearing regression: a write elsewhere on a shared 4KB physical page must not
+/// evict `Seen`/`Dormant` entries anymore. Both states are bare markers (`cache.rs:602-607`
+/// carries no span/guest_len/watch registration for either), so there is nothing a stale
+/// write could invalidate; the eventual promotion attempt always re-walks LIVE bytes via
+/// `walk_unit` regardless of what happened to the bookkeeping meanwhile. Before the fix this
+/// test FAILS the predicted way: both same-page entries are dropped (`state` -> `None`) and
+/// `kills_no_layout == 2`. A companion `Compiled` unit on a DIFFERENT page proves the
+/// byte-exact `Compiled` arm (real SMC handling) is completely untouched by the fix, both by
+/// surviving an unrelated write and by still dying on a write that actually overlaps it.
+#[test]
+fn clif_invalidate_physical_range_no_longer_evicts_seen_dormant_on_page_overlap() {
+    use crate::jit::clif::cache::{ClifUnitCache, ClifUnitDescriptor, ClifUnitKey};
+    use crate::jit::code_watch::NativeCodeWatch;
+    use crate::jit::direct::{MAX_BLOCK_INSTRUCTIONS, SegmentLayout};
+
+    let mut cache = ClifUnitCache::default();
+    let mut watch = NativeCodeWatch::default();
+
+    // Two keys sharing ONE 4KB physical page (0x2000..0x2fff): Seen at 0x2000, Dormant at
+    // 0x2040. Neither has a span; the buggy arm dropped both on ANY write anywhere in the
+    // shared page, regardless of how far it lands from either key's own address.
+    let seen_key = ClifUnitKey {
+        linear: 0x2000,
+        physical: 0x2000,
+        mode_key: 7,
+    };
+    let dormant_key = ClifUnitKey {
+        linear: 0x2040,
+        physical: 0x2040,
+        mode_key: 7,
+    };
+    cache.note_seen(seen_key);
+    cache.note_seen(dormant_key);
+    cache.park_dormant(dormant_key);
+    assert_eq!(cache.state(seen_key), Some(ClifUnitState::Seen));
+    assert_eq!(cache.state(dormant_key), Some(ClifUnitState::Dormant));
+
+    // A real Compiled unit on a DIFFERENT page (0x5000), single 3-byte slot with an empty
+    // tail (disp_len/imm_len both 0), so any write overlapping its 3 bytes is unambiguously
+    // structural (Kill), independent of the fix under test.
+    let compiled_key = ClifUnitKey {
+        linear: 0x5000,
+        physical: 0x5000,
+        mode_key: 7,
+    };
+    let mut fetch_lens = [0u8; MAX_BLOCK_INSTRUCTIONS];
+    fetch_lens[0] = 3;
+    let descriptor = ClifUnitDescriptor {
+        key: compiled_key,
+        guest_len: 3,
+        fetch_lens,
+        instructions: 1,
+        segment_layout: SegmentLayout::capture(&CpuGsw::default(), 0, 0).expect("default layout"),
+        memory_cpl3: false,
+        has_wide_accesses: false,
+        is_self_loop: false,
+        entry: 0,
+        operands: [0; 2 * MAX_BLOCK_INSTRUCTIONS],
+        leading: 1,
+        x87_mask: 0,
+        cum_raw_before: [0; MAX_BLOCK_INSTRUCTIONS],
+        cum_lowered_before: [0; MAX_BLOCK_INSTRUCTIONS],
+        raw_clocks_total: 3,
+        lowered_total: 1,
+        cum_access_before: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
+        access_total: Default::default(),
+        terminal: false,
+        disp_len: [0; MAX_BLOCK_INSTRUCTIONS],
+        imm_len: [0; MAX_BLOCK_INSTRUCTIONS],
+        imm_extend: [Default::default(); MAX_BLOCK_INSTRUCTIONS],
+        lea_mask: 0,
+        moffs_mask: 0,
+        interp_once: false,
+        code_host: 0,
+        successors: [None; 2],
+    };
+    let sentinel_marker = 0u64;
+    let sentinel_addr = std::ptr::from_ref(&sentinel_marker) as usize;
+    let sentinel_portal = cache.sentinel_portal(sentinel_addr);
+    let make_cells = || {
+        let cells = [
+            std::sync::Arc::new(crate::jit::links::LinkCell::new()),
+            std::sync::Arc::new(crate::jit::links::LinkCell::new()),
+        ];
+        for cell in &cells {
+            cell.set(sentinel_portal.as_ref());
+        }
+        cells
+    };
+    cache.note_seen(compiled_key);
+    cache
+        .install(&mut watch, descriptor, make_cells(), sentinel_addr)
+        .expect("install after Seen");
+    assert!(matches!(
+        cache.state(compiled_key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+
+    // The write under test: one byte at 0x2020. On the SAME page as both seen_key
+    // (0x2000) and dormant_key (0x2040), but touching neither key's own address, and
+    // nowhere near the Compiled unit's page (0x5000) at all.
+    let outcome = cache.invalidate_physical_range(&mut watch, 0x2020, 1);
+
+    // THE FIX under test: page-sharing alone must no longer evict Seen/Dormant
+    // bookkeeping. (Pre-fix, this is exactly where the test fails: both states become
+    // `None` and `outcome.kills_no_layout == 2`.)
+    assert_eq!(
+        cache.state(seen_key),
+        Some(ClifUnitState::Seen),
+        "a Seen entry must survive an unrelated same-page write"
+    );
+    assert_eq!(
+        cache.state(dormant_key),
+        Some(ClifUnitState::Dormant),
+        "a Dormant entry must survive an unrelated same-page write"
+    );
+    assert_eq!(outcome.kills_no_layout, 0, "{outcome:?}");
+    // Unaffected either way: a different page entirely, and the Compiled arm was never in
+    // scope for this write.
+    assert!(matches!(
+        cache.state(compiled_key),
+        Some(ClifUnitState::Compiled(_))
+    ));
+
+    // Companion regression guard: the Compiled arm's real, byte-exact SMC handling is
+    // completely untouched by the fix. A write landing INSIDE the compiled unit's own span
+    // (0x5000..0x5003) must still kill it, exactly as before.
+    let outcome2 = cache.invalidate_physical_range(&mut watch, 0x5000, 1);
+    assert_eq!(
+        cache.state(compiled_key),
+        None,
+        "a write that actually overlaps a Compiled unit's span must still kill it"
+    );
+    assert_eq!(outcome2.kills, 1, "{outcome2:?}");
+}
