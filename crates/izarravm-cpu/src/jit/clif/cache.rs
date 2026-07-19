@@ -1022,7 +1022,13 @@ impl ClifUnitCache {
         // N1(b): a wholesale reset tears down ALL link bookkeeping together with the
         // units, never units alone (a reset that left resolved cells standing would leave
         // portals publishing freed descriptors). The sentinel portal and address go too: a
-        // new backend generation means a new arena, a new trampoline, a new sentinel.
+        // new backend generation means a new arena, a new trampoline, a new sentinel -- and
+        // since Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`), that is
+        // finally true: this method only clears the cache side immediately (arena-byte-free,
+        // so it is safe even mid-frame, design section 3.3); the sibling arena side reclaims
+        // on the next frame-free admission via `JitState::apply_deferred_clif_arena_reset`,
+        // which also drops the backend's cached adapter/sentinel handles so they rebuild
+        // against the fresh arena (design section 8).
         self.units.clear();
         self.live.clear();
         self.portals.clear();

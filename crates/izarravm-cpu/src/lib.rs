@@ -1033,10 +1033,12 @@ pub struct JitClifCounters {
     /// `park_compile_failed = 108,293` (73.5 s of `compile_ns`, one Quake/586 1200M-cycle
     /// run, design doc section 0) down to O(1) rejects: only the handful of units that fill
     /// the arena for the FIRST time ever pay a genuine compile-then-fail; every later
-    /// admission — including every wholesale-`clif_clear()`-resurrected re-attempt of the
-    /// same working set, since this slice does not reset the arena (that is A2, a separate
-    /// deferred redesign) — counts here instead. Counted, not left inferred, exactly like
-    /// the other `park_*` reasons above.
+    /// admission on the SAME backend generation counts here instead. Track C A2
+    /// (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`) clears this flag on the next
+    /// frame-free admission after a wholesale `clif_clear()`, so a re-attempt of the same
+    /// working set after a clear compiles fresh against the reclaimed arena rather than
+    /// rejecting here forever. Counted, not left inferred, exactly like the other `park_*`
+    /// reasons above.
     pub park_arena_exhausted: u64,
     pub park_no_lowerable: u64,
     pub park_heat_chunk: u64,

@@ -1867,6 +1867,171 @@ fn clif_forced_x87_store_into_own_unit_exits_in_flight() {
     }
 }
 
+/// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`, section 11 test 2;
+/// MAJOR-2/MAJOR-3): the safety proof. Reuses the reproducer just above verbatim (an x87
+/// store into the in-flight unit's own remaining guest bytes) with ONE addition: the code's
+/// own physical page is marked ALIASED first (the same crate-internal seam
+/// `narrow_smc_falls_back_globally_on_an_aliased_page`, `cpu_jit_region_test.rs`, uses --
+/// a second `DecodeCache::put` mapping through a different linear page onto the same
+/// physical page, no real page tables needed), so `note_code_write_hit`'s per-byte narrow
+/// fold refuses (the physical-to-linear reconstruction is now ambiguous) and the SMC store
+/// falls back to a WHOLESALE `clif_units_clear()` (`core.rs:389`) -- not the narrow per-unit
+/// kill the un-aliased test above exercises -- DURING the x87 shim's
+/// `cycle_no_interrupt_check`, with the compiled unit's native frame still live on the host
+/// stack below it. This is the exact BLOCKING-1 scenario the design's frame-free proof
+/// (section 5) closes: the deferred reset means the clear only sets `backend_needs_reset`
+/// here; the arena reclaim happens later, at the next frame-free `try_clif_continuation`,
+/// never freeing bytes out from under this live frame. The unit is a single, NON-CHAINED
+/// entry (`transfers == 0`, no jmp/jcc successor ever created): a chained x87 unit taking
+/// this path mid-chain hits a distinct, pre-existing C1d resolver panic (design section 13,
+/// tracked separately as task_68a42409) -- deliberately not exercised here.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_arena_reset_a2_x87_smc_wholesale_clear_mid_frame_is_safe() {
+    let entry = 0x1000u32;
+    // nop (interpreted starter); fstp dword [ebx]; inc eax; hlt
+    let code = [0x90, 0xd9, 0x1b, 0x40, 0xf4];
+    let inc_eax_addr = entry + 3;
+    // f32 whose stored bits are 43 43 43 43: four `inc ebx` over the `inc eax` byte and the
+    // trailing hlt bytes (the fill after them is hlt again) -- verbatim from the un-aliased
+    // reproducer above.
+    let smc_value = f64::from(f32::from_bits(0x4343_4343));
+
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[entry as usize..entry as usize + code.len()].copy_from_slice(&code);
+
+    let mut interp = generated_cpu(GswMode::Gsw586);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory.clone());
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+
+    fn arm(cpu: &mut CpuGsw, entry: u32, ebx: u32, smc_value: f64) {
+        cpu.halted = false;
+        cpu.interrupt_shadow = false;
+        cpu.registers.gpr = [0, 0, 0, ebx, 0x1_f000, 0, 0, 0];
+        cpu.registers.eflags = 0x202;
+        cpu.pending_flags = PendingFlags::default();
+        cpu.set_eip(entry);
+        cpu.elapsed_clocks = 0;
+        cpu.core_clocks_so_far = 0;
+        cpu.timing_rem = 0;
+        cpu.fp_rem = 0;
+        cpu.fpu.finit();
+        cpu.fpu.push(smc_value);
+    }
+
+    // Warm-up passes (a harmless scratch EBX target): the unit compiles and runs native,
+    // exactly as the un-aliased original does -- the aliasing injection below is the ONLY
+    // difference from that reproducer.
+    for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+        for _ in 0..5 {
+            arm(cpu, entry, 0x5000, smc_value);
+            for _ in 0..64 {
+                let outcome = cpu.run_budgeted(bus, 4096).expect("warm-up reaches hlt");
+                if outcome.halted {
+                    break;
+                }
+            }
+            assert!(cpu.halted, "warm-up pass must halt");
+        }
+    }
+    assert!(
+        clif.jit_clif_counters().entries > 0,
+        "the unit must be resident before the SMC store: {:#?}",
+        clif.jit_clif_counters()
+    );
+
+    // The aliasing injection (design section 5.4's threat-model mechanism, constructed here
+    // via the decode cache's own crate-internal seam instead of real page tables): a second
+    // linear mapping onto the SAME physical code page makes the physical-to-linear
+    // reconstruction ambiguous, so the upcoming store's narrow fold must refuse.
+    let insn = clif
+        .decode_cache
+        .get(entry, true)
+        .expect("the unit's own entry line must be resident after warm-up");
+    assert!(
+        clif.decode_cache.put(0x5_0000, insn, true, entry).inserted,
+        "a second linear mapping onto the same physical page must register"
+    );
+
+    // `decode_inval_smc` increments ONLY in the decode cache's own `None` (wholesale) arm
+    // (`core.rs`, the per-byte narrow fold's fallback) -- unlike `clif_units.generation`,
+    // which also bumps on an ordinary NARROW per-unit kill (the un-aliased reproducer above
+    // triggers exactly that, through clif's own always-running SMC invalidation, independent
+    // of the decode cache's narrow/wholesale choice). This is the precise discriminator that
+    // the aliasing actually forced the wholesale path, not merely "some invalidation ran".
+    let decode_inval_smc_before = clif.perf_counters().decode_inval_smc;
+
+    // The final pass: EBX now targets the unit's own resident code (`inc_eax_addr`), so the
+    // x87 store's interpreter re-entry retires an SMC write into watched, now-ALIASED code
+    // while the compiled unit's native frame is live on the host stack below the shim.
+    arm(&mut interp, entry, inc_eax_addr, smc_value);
+    arm(&mut clif, entry, inc_eax_addr, smc_value);
+    for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+        for _ in 0..64 {
+            let outcome = cpu.run_budgeted(bus, 4096).expect("smc case reaches hlt");
+            if outcome.halted {
+                break;
+            }
+        }
+        assert!(cpu.halted, "smc case did not halt");
+    }
+
+    // The mechanism under test genuinely fired: the decode cache's wholesale fallback (NOT
+    // merely clif's own always-running narrow per-unit kill, which the un-aliased reproducer
+    // above already exercises safely).
+    assert!(
+        clif.perf_counters().decode_inval_smc > decode_inval_smc_before,
+        "the aliased page must force the decode cache's wholesale fallback, not a narrow kill"
+    );
+
+    // No UAF, no corrupted state: the in-flight unit exited cleanly via the generation latch,
+    // the fresh bytes ran (the overwritten `inc eax` never executed; the four `inc ebx` did),
+    // and clif stayed byte-identical to the interpreter throughout.
+    assert_eq!(clif.registers, interp.registers);
+    assert_eq!(clif.pending_flags, interp.pending_flags);
+    assert_eq!(clif_bus.memory, interp_bus.memory);
+    assert_eq!(
+        clif.registers.eax(),
+        0,
+        "stale lowering must not have executed inc eax"
+    );
+    assert_eq!(clif.registers.ebx(), inc_eax_addr + 4);
+
+    // Recovery: the backend is not wedged by the deferred reset. The wholesale clear already
+    // dropped the cache, so the SAME unit re-admits from scratch and, after warming up again,
+    // installs and runs native once more -- proof the reset (consumed by now, on some
+    // frame-free `try_clif_continuation` call after this frame unwound) left a working arena
+    // behind rather than a poisoned one.
+    let installed_before = clif.jit_clif_counters().units_installed;
+    for _ in 0..6 {
+        arm(&mut clif, entry, 0x5000, smc_value);
+        for _ in 0..64 {
+            let outcome = clif.run_budgeted(&mut clif_bus, 4096).expect("recovers");
+            if outcome.halted {
+                break;
+            }
+        }
+    }
+    assert!(
+        !clif.jit_direct.backend_needs_reset,
+        "the deferred reset must have run by now"
+    );
+    assert!(
+        clif.jit_clif_counters().units_installed > installed_before,
+        "a fresh admission after the clear must install and run native again"
+    );
+}
+
 /// M1: the compile-outcome clif arm. A walkable unit whose ENTRY slot is not lowerable
 /// (a memory form) parks Dormant instead of compiling a no-op body; a compiled unit killed
 /// by an SMC write is dropped from the cache entirely (generation bumped) and the next

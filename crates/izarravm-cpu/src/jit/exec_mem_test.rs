@@ -232,3 +232,76 @@ fn unsupported_host_never_allocates() {
     assert!(ExecutableBuffer::new(&code).is_none());
     assert!(ExecutableArena::new().is_none());
 }
+
+/// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md` section 7.2): `reset`
+/// reclaims a full arena back to the empty state `with_len_for_test` produced -- capacity,
+/// used/sealed bookkeeping, and the span registry all reset -- so a fresh `install_span`
+/// after it succeeds and runs correctly, exactly as it would against a brand-new arena.
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn reset_reclaims_a_full_arena_back_to_empty() {
+    let mut arena =
+        ExecutableArena::with_len_for_test(2 * host_page_len()).expect("small test arena");
+    let page = arena.slot_len();
+    let returns_42 = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+    let returns_7 = [0xB8, 0x07, 0x00, 0x00, 0x00, 0xC3];
+    let first = arena.install(&returns_42).expect("first install");
+    let second = arena.install(&returns_7).expect("second install fills it");
+    assert!(arena.is_full());
+    assert!(
+        arena.install(&[0xC3]).is_none(),
+        "no room left before reset"
+    );
+
+    assert!(arena.reset(), "reset must succeed on a supported host");
+    assert_eq!(arena.used_slots(), 0, "reset must reclaim every span");
+    assert!(!arena.is_full());
+    // The old entries no longer register as sealed spans (a stale pointer must not validate).
+    assert!(!arena.contains_sealed_span_range(first, returns_42.len()));
+    assert!(!arena.contains_sealed_span_range(second, returns_7.len()));
+
+    // The reclaimed arena behaves exactly like a fresh one: same capacity, and code installed
+    // into it actually runs (the pages are genuinely writable again, not just bookkeeping).
+    let reinstalled = arena.install(&returns_42).expect("install after reset");
+    let f: extern "C" fn() -> i32 = unsafe { std::mem::transmute(reinstalled) };
+    assert_eq!(f(), 42);
+    assert_eq!(arena.used_slots(), 1);
+    assert!(
+        arena.install(&vec![0xC3u8; page]).is_some(),
+        "arena has its full capacity back"
+    );
+    assert!(arena.is_full());
+}
+
+/// `reset` on an arena that never sealed anything (nothing installed, or only pending
+/// `append_unsealed` slots) is a no-op that still succeeds and leaves the arena writable and
+/// empty -- the `sealed == 0` early return (design section 7.2).
+#[cfg(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "x86_64")
+))]
+#[test]
+fn reset_on_a_never_sealed_arena_is_a_sound_no_op() {
+    let mut fresh = ExecutableArena::new().expect("allocation must succeed on a supported host");
+    assert!(fresh.reset());
+    assert_eq!(fresh.used_slots(), 0);
+    assert!(
+        fresh
+            .install(&[0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3])
+            .is_some()
+    );
+
+    let mut pending = ExecutableArena::new().expect("allocation must succeed on a supported host");
+    let code = [0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3];
+    let slot = pending.append_unsealed(&code).expect("pending slot");
+    assert!(
+        pending.reset(),
+        "an unsealed-only arena must still reset cleanly"
+    );
+    assert_eq!(pending.used_slots(), 0);
+    assert!(pending.sealed_slot_entry(slot).is_none());
+    assert!(pending.install(&code).is_some());
+}

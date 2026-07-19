@@ -264,6 +264,44 @@ impl ExecutableArena {
         self.used == self.len
     }
 
+    /// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md` section 7.2):
+    /// reclaim the whole arena, re-arming the sealed prefix writable and dropping every span
+    /// registration, returning it to the empty state `new`/`with_len` produced. Returns false
+    /// if the OS protection change fails; the caller must then abandon this arena (section 7.3,
+    /// the drop+rebuild fallback) rather than trust an indeterminate mix of RW/RX pages.
+    ///
+    /// SAFETY CONTRACT (caller-enforced, not expressible in the type): no code in this arena
+    /// may be on any thread's call stack when this runs. `ClifBackend::reset_arena` (the sole
+    /// caller, section 7.4) upholds this by calling it only from the frame-free top-of-
+    /// admission point the design's section 5 proof establishes.
+    #[cfg_attr(
+        not(all(
+            feature = "clif-backend",
+            target_arch = "x86_64",
+            any(target_os = "windows", target_os = "linux")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn reset(&mut self) -> bool {
+        if self.sealed == 0 {
+            // Nothing was ever sealed executable (a fresh arena, or one whose only spans are
+            // still-unsealed `append_unsealed` slots): no page needs a protection flip, only
+            // the bookkeeping below.
+            self.used = 0;
+            self.spans.clear();
+            self.pending_spans.clear();
+            return true;
+        }
+        if !make_rw(self.ptr, self.sealed) {
+            return false;
+        }
+        self.used = 0;
+        self.sealed = 0;
+        self.spans.clear();
+        self.pending_spans.clear();
+        true
+    }
+
     pub(crate) fn slot_len(&self) -> usize {
         self.page_len
     }
@@ -377,6 +415,15 @@ mod os {
         unsafe { VirtualProtect(ptr as *mut c_void, len, PAGE_EXECUTE_READ, &mut old) != 0 }
     }
 
+    /// Track C A2 (design section 7.1): the inverse of `make_rx`, re-arming a sealed span
+    /// writable so `ExecutableArena::reset` can reclaim it. The whole arena is one
+    /// `MEM_COMMIT|MEM_RESERVE` region from a single `VirtualAlloc`, so one call may span the
+    /// entire sealed prefix even though it was made RX in span-sized chunks.
+    pub(super) fn make_rw(ptr: *mut u8, len: usize) -> bool {
+        let mut old = 0u32;
+        unsafe { VirtualProtect(ptr as *mut c_void, len, PAGE_READWRITE, &mut old) != 0 }
+    }
+
     pub(super) fn flush_instruction_cache(ptr: *mut u8, len: usize) -> bool {
         unsafe { FlushInstructionCache(GetCurrentProcess(), ptr as *const c_void, len) != 0 }
     }
@@ -441,6 +488,13 @@ mod os {
     pub(super) fn make_rx(ptr: *mut u8, len: usize) -> bool {
         unsafe { mprotect(ptr as *mut c_void, len, PROT_READ | PROT_EXEC) == 0 }
     }
+
+    /// Track C A2 (design section 7.1): the inverse of `make_rx`, re-arming a sealed span
+    /// writable so `ExecutableArena::reset` can reclaim it.
+    pub(super) fn make_rw(ptr: *mut u8, len: usize) -> bool {
+        unsafe { mprotect(ptr as *mut c_void, len, PROT_READ | PROT_WRITE) == 0 }
+    }
+
     pub(super) fn flush_instruction_cache(_ptr: *mut u8, _len: usize) -> bool {
         true
     }
@@ -466,13 +520,16 @@ mod os {
     pub(super) fn make_rx(_ptr: *mut u8, _len: usize) -> bool {
         false
     }
+    pub(super) fn make_rw(_ptr: *mut u8, _len: usize) -> bool {
+        false
+    }
     pub(super) fn flush_instruction_cache(_ptr: *mut u8, _len: usize) -> bool {
         false
     }
     pub(super) unsafe fn free(_ptr: *mut u8, _len: usize) {}
 }
 
-use os::{alloc_rw, flush_instruction_cache, free, make_rx, page_size};
+use os::{alloc_rw, flush_instruction_cache, free, make_rw, make_rx, page_size};
 
 pub(crate) fn host_page_len() -> usize {
     page_size()
