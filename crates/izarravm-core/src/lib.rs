@@ -3,9 +3,16 @@
 
 #![forbid(unsafe_code)]
 
+mod canonical_state;
 mod clock;
 mod gsw;
 
+pub use canonical_state::{
+    CANONICAL_STATE_CONTAINER_MAGIC, CANONICAL_STATE_CONTAINER_MAJOR,
+    CANONICAL_STATE_CONTAINER_MINOR, CanonicalFieldWriter, CanonicalSection, CanonicalSectionId,
+    CanonicalSectionRequirement, CanonicalSectionVersion, CanonicalStateError, CanonicalStateView,
+    CanonicalStateWriter,
+};
 pub use clock::{ClockRate, MASTER_CLOCK_HZ};
 pub use gsw::{CacheGeometry, CpuPersona, GSW_MODE_SPECS, GswMode, GswModeSpec, L1Cache};
 
