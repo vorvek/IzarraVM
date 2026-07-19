@@ -247,6 +247,176 @@ fn clif_arena_exhausted_sets_only_on_capacity_not_on_relocation_reject() {
     assert!(!fresh.arena_exhausted());
 }
 
+/// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md` sections 7-9): the
+/// backend-level half of the durability proof. A one-page arena fills exactly like the A1
+/// test above, `arena_exhausted()` latches, and the cached adapter/sentinel handles are built.
+/// `reset_arena` must reclaim the arena (capacity comes back), clear `arena_exhausted` (the A1
+/// interaction, design section 9), and drop both cached handles so they rebuild lazily
+/// (design section 8) -- proven here by compiling a fresh unit AND rebuilding the adapter and
+/// sentinel afterward, all against the SAME backend instance.
+#[test]
+fn clif_reset_arena_reclaims_capacity_and_invalidates_cached_handles() {
+    // Three pages: room for the adapter (1), the sentinel trampoline (1), and exactly one
+    // `build_add_unit()` (1) before the arena is genuinely full.
+    let page = crate::jit::exec_mem::host_page_len();
+    let mut backend = ClifBackend::with_arena_len_for_test(3 * page)
+        .expect("small test arena on a supported host");
+
+    // Build both arena-resident handles BEFORE filling the rest of the arena, so their
+    // pre-reset presence is unambiguous (a fresh backend's `is_none()` on both fields is the
+    // trivial, uninteresting case; this proves the reset actively invalidates handles that
+    // were actually populated).
+    assert!(backend.callout_adapter().is_some());
+    assert!(backend.sentinel_descriptor().is_some());
+    assert!(
+        !backend.callout_adapter_and_sentinel_are_unset_for_test(),
+        "both handles must be populated before the reset under test"
+    );
+
+    // One more unit exactly fills the remaining page; the next one fails.
+    assert!(backend.finalize(build_add_unit()).is_some());
+    assert!(!backend.arena_exhausted());
+    assert!(backend.finalize(build_add_unit()).is_none());
+    assert!(
+        backend.arena_exhausted(),
+        "a fourth unit must fail: only three pages exist"
+    );
+    assert_eq!(
+        backend.arena_used_slots_for_test(),
+        3,
+        "adapter+sentinel+one unit"
+    );
+
+    assert!(
+        backend.reset_arena(0),
+        "reset must succeed on a supported host"
+    );
+    assert!(!backend.arena_exhausted(), "A1's flag must clear on reset");
+    assert_eq!(
+        backend.arena_used_slots_for_test(),
+        0,
+        "the arena must be empty again"
+    );
+    assert!(
+        backend.callout_adapter_and_sentinel_are_unset_for_test(),
+        "both cached handles must be invalidated so they rebuild against the fresh arena"
+    );
+
+    // The durability proof: a unit that would have failed a moment ago (the arena was full)
+    // now installs, and the two handles rebuild lazily on next use.
+    assert!(
+        backend.finalize(build_add_unit()).is_some(),
+        "a previously-failing unit must install after the reset"
+    );
+    assert!(!backend.arena_exhausted());
+    assert!(backend.callout_adapter().is_some(), "adapter must rebuild");
+    assert!(
+        backend.sentinel_descriptor().is_some(),
+        "sentinel must rebuild"
+    );
+}
+
+/// Track C A2 (design section 6, MAJOR-1/MINOR-4): the release-safe guard. With a (today
+/// impossible; design section 5) live native frame simulated by forcing `native_frame_depth`
+/// nonzero, `apply_deferred_clif_arena_reset` must SKIP the reset and leave
+/// `backend_needs_reset` SET -- proven here by observing the backend's cached handles survive
+/// untouched despite a pending reset request. In a debug build the guard additionally trips a
+/// loud `debug_assert!`; this test catches that panic (exactly as the x87 shim's own belt
+/// does in production) so the SAME test can then check the release-relevant invariant: the
+/// branch that runs before any panic, and unconditionally in a release build where the assert
+/// compiles to nothing, must leave every bit of state untouched. A second call with the depth
+/// reported back to zero then proves the pending reset was never lost -- it reclaims on the
+/// very next frame-free attempt.
+#[test]
+fn clif_deferred_reset_guard_skips_and_preserves_state_when_a_frame_is_reported_live() {
+    let page = crate::jit::exec_mem::host_page_len();
+    let mut cpu = flat_cpu();
+    cpu.set_clif_backend_enabled(true);
+    cpu.jit_direct.clif_backend = crate::jit::clif::ClifBackend::with_arena_len_for_test(4 * page);
+    {
+        let backend = cpu
+            .jit_direct
+            .clif_backend
+            .as_mut()
+            .expect("small test backend");
+        assert!(backend.callout_adapter().is_some());
+        assert!(backend.sentinel_descriptor().is_some());
+    }
+
+    cpu.jit_direct.backend_needs_reset = true;
+    cpu.jit_direct.native_frame_depth = 1;
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cpu.jit_direct.apply_deferred_clif_arena_reset();
+    }));
+    if cfg!(debug_assertions) {
+        assert!(
+            result.is_err(),
+            "a live-frame reset attempt must trip the debug assert"
+        );
+    } else {
+        assert!(result.is_ok(), "a release build must not panic here");
+    }
+
+    // The release-relevant invariant, true regardless of whether the debug assert fired: the
+    // flag stays set (deferred, never silently dropped) and the backend's arena-resident
+    // handles were never touched (proof `reset_arena` did not run under the live frame).
+    assert!(
+        cpu.jit_direct.backend_needs_reset,
+        "a live-frame skip must leave the reset pending"
+    );
+    assert!(
+        !cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend still present")
+            .callout_adapter_and_sentinel_are_unset_for_test(),
+        "a skipped reset must not touch the backend's cached handles"
+    );
+
+    // Report the frame gone (depth == 0, the normal post-unwind state): the SAME pending flag
+    // reclaims on the very next call, with nothing left to block it.
+    cpu.jit_direct.native_frame_depth = 0;
+    cpu.jit_direct.apply_deferred_clif_arena_reset();
+    assert!(
+        !cpu.jit_direct.backend_needs_reset,
+        "a frame-free retry must consume the deferred reset"
+    );
+    assert!(
+        cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend still present")
+            .callout_adapter_and_sentinel_are_unset_for_test(),
+        "the deferred reset must invalidate the cached handles once it actually runs"
+    );
+}
+
+/// The drop guard itself (design section 6, MINOR-4): `NativeFrameGuard` must decrement
+/// `native_frame_depth` on an unwind, not only on a normal return, so a caught call-out panic
+/// (`run_clif_unit`'s `resume_unwind` path) can never wedge the depth permanently nonzero and
+/// permanently suppress every future reset.
+#[test]
+fn clif_native_frame_guard_decrements_on_unwind() {
+    let mut cpu = flat_cpu();
+    cpu.set_clif_backend_enabled(true);
+    assert_eq!(cpu.jit_direct.native_frame_depth, 0);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _frame = unsafe {
+            crate::jit::NativeFrameGuard::enter(std::ptr::from_mut(
+                &mut cpu.jit_direct.native_frame_depth,
+            ))
+        };
+        assert_eq!(cpu.jit_direct.native_frame_depth, 1, "enter must increment");
+        panic!("simulate a call-out panic crossing the guard's scope");
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        cpu.jit_direct.native_frame_depth, 0,
+        "the guard must decrement on the unwind path, not only on a normal return"
+    );
+}
+
 /// Build a minimal function whose body makes a genuine external `call` -- referencing an
 /// unresolved user external symbol rather than the `call_indirect`-through-a-baked-pointer
 /// shape the real unit/adapter lowering always uses -- so the compiled buffer carries a real
@@ -709,4 +879,189 @@ fn clif_invalidate_physical_range_no_longer_evicts_seen_dormant_on_page_overlap(
         "a write that actually overlaps a Compiled unit's span must still kill it"
     );
     assert_eq!(outcome2.kills, 1, "{outcome2:?}");
+}
+
+/// Track C A2 (`dev_docs/plans/2026-07-19-clif-arena-reset-design.md`): the production-path
+/// durability proof (design section 11, test 1). A tiny 3-page backend (room for exactly one
+/// unit's sentinel trampoline + shared adapter + body, design section 8) admits unit A and
+/// runs it natively, filling the arena; a different-address unit B then fails to install --
+/// the arena is genuinely full and A1's `arena_exhausted` flag latches, exactly the pre-A2
+/// dead end (`dev_docs/plans/2026-07-19-clif-compile-second-cause-design.md` section 3.7).
+/// A wholesale `clif_clear()` (standing in for the paging/mode/SMC invalidation events that
+/// reach it in production, `core.rs:117/150/389`) DEFERS the reset -- the arena stays full and
+/// `arena_exhausted()` stays latched until the next admission. Driving one more admission
+/// through the real production path (`run_budgeted`, never a direct call into the reset
+/// primitive) reclaims the arena at the top of `try_clif_continuation`, and unit B -- the
+/// previously-failing key -- now installs and runs native, matching the interpreter exactly:
+/// this is "A2 makes clif a JIT past the first arena fill."
+#[test]
+fn clif_arena_reset_reclaims_after_a_wholesale_clear_and_reinstalls() {
+    const ENTRY_A: u32 = 0x1000;
+    const ENTRY_B: u32 = 0x2000;
+    // The batch loop's very first retired instruction after `set_eip` is always interpreted
+    // (`run.rs`'s `first` step), so the clif-admitted unit actually begins at ENTRY+1: a
+    // second, real `inc` instruction there, followed by `hlt`, gives the walker a one-slot
+    // leading run to lower (mirrors `clif_lowered_probe_straight_line`'s shape).
+    let code_a = [0x40, 0x40, 0xf4]; // inc eax; inc eax; hlt
+    let code_b = [0x43, 0x43, 0xf4]; // inc ebx; inc ebx; hlt
+
+    let mut memory = vec![0xf4u8; 0x3000];
+    memory[ENTRY_A as usize..ENTRY_A as usize + code_a.len()].copy_from_slice(&code_a);
+    memory[ENTRY_B as usize..ENTRY_B as usize + code_b.len()].copy_from_slice(&code_b);
+
+    let mut cpu = flat_cpu();
+    cpu.set_clif_backend_enabled(true);
+    let page = crate::jit::exec_mem::host_page_len();
+    cpu.jit_direct.clif_backend = ClifBackend::with_arena_len_for_test(3 * page);
+    let mut bus = TestBus::with_memory(memory);
+    bus.direct_pages_enabled = true;
+    bus.direct_page_clocks = true;
+
+    fn run_to_halt_from(cpu: &mut CpuGsw, bus: &mut TestBus, entry: u32) {
+        cpu.set_eip(entry);
+        cpu.halted = false;
+        loop {
+            let outcome = cpu.run_budgeted(bus, 4096).expect("runs");
+            if outcome.halted {
+                break;
+            }
+        }
+    }
+
+    // Unit A: warm it up until it compiles and runs native, consuming the whole 3-page arena
+    // (the sentinel trampoline, the shared adapter, and A's own body -- design section 8).
+    for _ in 0..6 {
+        run_to_halt_from(&mut cpu, &mut bus, ENTRY_A);
+    }
+    let key_a = clif_key_for(&cpu, ENTRY_A + 1, true).expect("flat 586 key");
+    assert!(
+        matches!(
+            cpu.jit_direct.clif_units.state(key_a),
+            Some(ClifUnitState::Compiled(_))
+        ),
+        "unit A must compile and install"
+    );
+    assert_eq!(cpu.jit_clif_counters().units_installed, 1);
+    assert!(
+        !cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend present")
+            .arena_exhausted()
+    );
+
+    // Unit B: a DIFFERENT address. The arena has no room left, so its compile fails and the
+    // sticky A1 flag latches.
+    for _ in 0..6 {
+        run_to_halt_from(&mut cpu, &mut bus, ENTRY_B);
+    }
+    let key_b = clif_key_for(&cpu, ENTRY_B + 1, true).expect("flat 586 key");
+    assert!(
+        !matches!(
+            cpu.jit_direct.clif_units.state(key_b),
+            Some(ClifUnitState::Compiled(_))
+        ),
+        "unit B must fail to install: the arena is full"
+    );
+    assert!(
+        cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend present")
+            .arena_exhausted(),
+        "a genuine capacity failure must latch A1's flag"
+    );
+    assert_eq!(
+        cpu.jit_clif_counters().units_installed,
+        1,
+        "B must not install"
+    );
+
+    // The wholesale clear: cache torn down immediately, arena reset DEFERRED (design
+    // section 3) -- the load-bearing deferral proof.
+    cpu.jit_direct.clif_clear();
+    assert!(
+        cpu.jit_direct.backend_needs_reset,
+        "the clear must request a reset"
+    );
+    assert_eq!(
+        cpu.jit_direct.clif_units.state(key_a),
+        None,
+        "the clear drops every cached admission state"
+    );
+    assert!(
+        cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend present")
+            .arena_exhausted(),
+        "deferral: the arena must NOT be reset yet"
+    );
+    assert_eq!(
+        cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend present")
+            .arena_used_slots_for_test(),
+        3,
+        "deferral: the arena stays full until the next frame-free admission"
+    );
+
+    // Drive one more admission through the REAL production path: the very first
+    // `try_clif_continuation` call reclaims the arena at its top, before anything else runs.
+    for _ in 0..6 {
+        run_to_halt_from(&mut cpu, &mut bus, ENTRY_B);
+    }
+    assert!(
+        !cpu.jit_direct.backend_needs_reset,
+        "the deferred reset must have consumed the flag by now"
+    );
+    assert!(
+        !cpu.jit_direct
+            .clif_backend
+            .as_ref()
+            .expect("backend present")
+            .arena_exhausted(),
+        "A1's flag must clear along with the reset"
+    );
+    assert!(
+        matches!(
+            cpu.jit_direct.clif_units.state(key_b),
+            Some(ClifUnitState::Compiled(_))
+        ),
+        "the previously-failing key must install after the deferred reset"
+    );
+    assert_eq!(
+        cpu.jit_clif_counters().units_installed,
+        2,
+        "a second unit must have installed after the reset (the durability proof)"
+    );
+
+    // State correctness (MINOR-6, design section 10): A2 changes WHICH executor retires the
+    // instruction, never the resulting state. One more full pass, compared against a plain
+    // interpreter (clif disabled) started from the same EBX, proves unit B's compiled body
+    // (installed only after the deferred reset) is byte-identical, not merely "some code ran".
+    let ebx_before = cpu.registers.ebx();
+    let mut reference = flat_cpu();
+    reference.registers.set_ebx(ebx_before);
+    let mut reference_bus = TestBus::with_memory(vec![0xf4u8; 0x3000]);
+    reference_bus.memory[ENTRY_B as usize..ENTRY_B as usize + code_b.len()]
+        .copy_from_slice(&code_b);
+    reference_bus.direct_pages_enabled = true;
+    reference_bus.direct_page_clocks = true;
+    run_to_halt_from(&mut reference, &mut reference_bus, ENTRY_B);
+
+    run_to_halt_from(&mut cpu, &mut bus, ENTRY_B);
+    // EAX is deliberately excluded: `cpu` also ran unit A repeatedly earlier in this same
+    // test, accumulating unrelated `inc eax` retirements the reference (unit-B-only) CPU
+    // never saw. EBX, the flags, and EIP are exactly what unit B's own body touches.
+    assert_eq!(
+        cpu.registers.ebx(),
+        ebx_before + 2,
+        "two inc ebx must retire"
+    );
+    assert_eq!(cpu.registers.ebx(), reference.registers.ebx());
+    assert_eq!(cpu.registers.eip, reference.registers.eip);
+    assert_eq!(cpu.pending_flags, reference.pending_flags);
+    assert_eq!(cpu.eflags(), reference.eflags());
 }
