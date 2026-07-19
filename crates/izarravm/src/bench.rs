@@ -15,6 +15,9 @@ struct BenchRun {
     /// Memory-poll subset, stored outside PerfCounters on the CPU (layout
     /// preservation; see PollSkipMemoryCounters) and captured here alongside.
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
+    /// Clif churn subset (C1e), captured alongside for the same layout-preservation
+    /// reason.
+    jit_clif: izarravm_cpu::JitClifCounters,
     machine_profile: MachineHostProfileSnapshot,
     cpu_profile: CpuProfileSnapshot,
 }
@@ -88,6 +91,7 @@ fn run_bench_one_profiled(
         wall,
         perf,
         poll_skip_memory: machine.cpu().poll_skip_memory(),
+        jit_clif: machine.cpu().jit_clif_counters(),
         machine_profile: machine.host_profile_snapshot(),
         cpu_profile: machine.cpu().profile_snapshot(),
     })
@@ -931,7 +935,7 @@ fn write_profile_json(
                 "register_samples": opcode.register_samples,
                 "memory_samples": opcode.memory_samples,
             })).collect::<Vec<_>>(),
-            "perf": perf_counters_json(&profiled.perf, profiled.poll_skip_memory),
+            "perf": perf_counters_json(&profiled.perf, profiled.poll_skip_memory, profiled.jit_clif),
         },
     });
     std::fs::write(json_path, serde_json::to_string_pretty(&report)?)?;
@@ -941,6 +945,7 @@ fn write_profile_json(
 pub(super) fn perf_counters_json(
     perf: &PerfCounters,
     poll_skip_memory: izarravm_cpu::PollSkipMemoryCounters,
+    jit_clif: izarravm_cpu::JitClifCounters,
 ) -> serde_json::Value {
     json!({
         "instructions": perf.instructions,
@@ -1032,6 +1037,10 @@ pub(super) fn perf_counters_json(
         "jit_native_load_hits": perf.jit_native_load_hits,
         "jit_native_store_hits": perf.jit_native_store_hits,
         "jit_paged_tlb_successes": perf.jit_paged_tlb_successes,
+        "jit_clif_smc_unit_kills": jit_clif.smc_unit_kills,
+        "jit_clif_smc_unit_restamps": jit_clif.smc_unit_restamps,
+        "jit_clif_smc_unit_kills_no_layout": jit_clif.smc_unit_kills_no_layout,
+        "jit_clif_smc_unit_kills_multi_slot": jit_clif.smc_unit_kills_multi_slot,
     })
 }
 

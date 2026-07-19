@@ -456,7 +456,17 @@ impl CpuGsw {
             // Placeholder; the finalize below resolves it once the ModRM (the 0xFF /ext
             // discriminator) has been pre-parsed.
             continuable: false,
+            // Placeholders; the finalize below derives both from the tail watermark and
+            // the displacement count the parsers record (C1e, design section 1.2).
+            disp_len: 0,
+            imm_len: 0,
         };
+
+        // C1e: the tail watermark starts after the opcode byte(s); `fetch_modrm` and the
+        // address parsers push it past the ModRM/SIB bytes, so everything after it is the
+        // displacement-then-immediate tail (the ISA's fixed encoding order).
+        self.decode_tail_start = self.registers.eip;
+        self.decode_disp_len = 0;
 
         // Pre-parse the operands of converted groups, dispatching on the group resolved above.
         match group {
@@ -862,6 +872,19 @@ impl CpuGsw {
         // captures the total bytes `decode` consumed (prefixes + opcode + operands). Any future
         // early `Ok` return before this line would skip BOTH `len` and `continuable`.
         insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
+        // C1e: derive the recorded pair from the tail watermark. Everything consumed
+        // after the last structural byte is displacement-then-immediate; the parsers
+        // recorded the displacement's share. Fallback groups pre-parse nothing here (their
+        // executors re-read operand bytes), so their pair is 0/0, which is fine: nothing
+        // classifiable ever routes through them.
+        let tail = self.registers.eip.wrapping_sub(self.decode_tail_start) as u8;
+        insn.disp_len = self.decode_disp_len;
+        insn.imm_len = tail - self.decode_disp_len;
+        // Zero the scratch so no decode residue outlives the call (the two lockstep arms
+        // decode different numbers of times once one runs natively; persistent residue
+        // would fail the derived CpuGsw equality on nothing architectural).
+        self.decode_tail_start = 0;
+        self.decode_disp_len = 0;
         // Resolve the continuation gate once per decode (the ModRM is in by now), so the
         // per-continuation check in `run_straight_line` reads a single cached flag.
         insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm, self.persona());
@@ -1179,14 +1202,25 @@ impl CpuGsw {
         bus: &mut B,
         address_size: AddressSize,
     ) -> ExecResult<u32> {
+        // C1e: moffs bytes count as DISPLACEMENT (they are one architecturally, and the
+        // clif restamp's lane routing depends on the distinction).
         match address_size {
-            AddressSize::Word => Ok(u32::from(self.fetch_u16(bus)?)),
-            AddressSize::Dword => self.fetch_u32(bus),
+            AddressSize::Word => {
+                self.decode_disp_len = 2;
+                Ok(u32::from(self.fetch_u16(bus)?))
+            }
+            AddressSize::Dword => {
+                self.decode_disp_len = 4;
+                self.fetch_u32(bus)
+            }
         }
     }
 
     fn fetch_modrm<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<ModRm> {
         let value = self.fetch_u8(bus)?;
+        // C1e: the ModRM byte is structural; the tail starts after it (the address
+        // parsers push the watermark past the SIB byte too).
+        self.decode_tail_start = self.registers.eip;
         Ok(ModRm {
             mode: value >> 6,
             reg: (value >> 3) & 0x07,
@@ -1296,11 +1330,22 @@ impl CpuGsw {
             _ => (Some(3), None), // bx
         };
 
+        // C1e: 16-bit addressing has no SIB; the tail starts after the ModRM byte, which
+        // fetch_modrm already recorded.
         let disp = match modrm.mode {
-            0 if modrm.rm == 6 => i32::from(self.fetch_u16(bus)? as i16),
+            0 if modrm.rm == 6 => {
+                self.decode_disp_len = 2;
+                i32::from(self.fetch_u16(bus)? as i16)
+            }
             0 => 0,
-            1 => self.fetch_i8(bus)? as i32,
-            2 => i32::from(self.fetch_u16(bus)? as i16),
+            1 => {
+                self.decode_disp_len = 1;
+                self.fetch_i8(bus)? as i32
+            }
+            2 => {
+                self.decode_disp_len = 2;
+                i32::from(self.fetch_u16(bus)? as i16)
+            }
             _ => 0,
         };
 
@@ -1342,12 +1387,23 @@ impl CpuGsw {
         } else if !(modrm.mode == 0 && modrm.rm == 5) {
             base_reg = Some(modrm.rm);
         }
+        // C1e: the SIB byte (when present) was structural; the tail starts here.
+        self.decode_tail_start = self.registers.eip;
 
         let disp = match modrm.mode {
-            0 if base_reg.is_none() => self.fetch_u32(bus)? as i32,
+            0 if base_reg.is_none() => {
+                self.decode_disp_len = 4;
+                self.fetch_u32(bus)? as i32
+            }
             0 => 0,
-            1 => self.fetch_i8(bus)? as i32,
-            2 => self.fetch_u32(bus)? as i32,
+            1 => {
+                self.decode_disp_len = 1;
+                self.fetch_i8(bus)? as i32
+            }
+            2 => {
+                self.decode_disp_len = 4;
+                self.fetch_u32(bus)? as i32
+            }
             _ => 0,
         };
         let segment = if matches!(base_reg, Some(4 | 5)) {

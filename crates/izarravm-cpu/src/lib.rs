@@ -945,6 +945,17 @@ pub struct JitClifCounters {
     /// that landed in the resolver trampoline (the unresolved split).
     pub linked_transfers: u64,
     pub unresolved_transfers: u64,
+    /// C1e: clif-only recompile-churn diagnostics (D3). `smc_unit_restamps` and
+    /// `smc_unit_kills` partition every SMC write that hit a COMPILED clif unit's span;
+    /// `smc_unit_kills_multi_slot` is the subset of kills escalated by the coarse
+    /// multi-slot rule (every touched slot individually tail-confined, but more than one
+    /// touched); `smc_unit_kills_no_layout` counts `Seen`/`Dormant` conservative-span
+    /// drops separately (no member layout exists to classify, so they are not
+    /// "eligible" in the same sense).
+    pub smc_unit_kills: u64,
+    pub smc_unit_restamps: u64,
+    pub smc_unit_kills_no_layout: u64,
+    pub smc_unit_kills_multi_slot: u64,
 }
 
 impl PartialEq for JitClifCounters {
@@ -1160,6 +1171,18 @@ pub struct CpuGsw {
     tlb: Tlb,
     code_page: CodePageCache,
     prefetch: PrefetchWindow,
+    /// C1e decode scratch (valid only during one `decode` call): the EIP watermark after
+    /// the last STRUCTURAL byte (opcode/ModRM/SIB) and the displacement byte count
+    /// consumed so far, from which the finalize step derives the recorded
+    /// `{disp_len, imm_len}` pair. Both are ZEROED by the finalize step so no residue
+    /// outlives the decode: two lockstep arms legally decode different numbers of times
+    /// (a native clif unit retires slots without re-decoding), so persistent residue
+    /// would trip the derived `CpuGsw` equality on nothing architectural (found by the
+    /// C1e storm battery). Loose fields, not a struct: the lone `u8` packs into an
+    /// existing padding hole, keeping `pending_flags` on its pinned offset 4440 (the
+    /// cpu_test.rs offset pin; a `{u32, u8}` struct here shifted it by 8).
+    decode_tail_start: u32,
+    decode_disp_len: u8,
     data_read_pages: DirectPageCache,
     data_write_pages: DirectPageCache,
     fetch_page: FetchPageCache,
@@ -1279,6 +1302,8 @@ impl Default for CpuGsw {
             tlb: Tlb::default(),
             code_page: CodePageCache::default(),
             prefetch: PrefetchWindow::default(),
+            decode_tail_start: 0,
+            decode_disp_len: 0,
             data_read_pages: DirectPageCache::default(),
             data_write_pages: DirectPageCache::default(),
             fetch_page: FetchPageCache::default(),
@@ -1917,6 +1942,19 @@ struct DecodedInsn {
     /// recover it); resolve admission at decode, never in the run loop — this
     /// measurement is the reason.
     continuable: bool,
+    /// C1e (D3, review finding M3): the ENCODED byte counts of this instruction's
+    /// displacement and immediate fields, recorded by the decoder as it consumes them
+    /// (the single decode authority; never back-computed from the stored values, whose
+    /// widths are ambiguous after sign extension). The moffs address bytes of 0xA0-0xA3
+    /// count as DISPLACEMENT (they are one architecturally, and clif's operand-lane
+    /// routing depends on it).
+    /// MEASURED layout effect (the L2-note truthfulness check the design mandates): the
+    /// pair did NOT fit `DecodedInsn`'s padding; `size_of::<DecodedInsn>()` grew 36 -> 40
+    /// (pinned by a test), so a `DecodeLine` grows by the same 4 bytes and the 4096-line
+    /// cache by ~16 KB, still comfortably inside a normal L2 (the sizing comment at
+    /// `DECODE_CACHE_LINES` is updated to match).
+    disp_len: u8,
+    imm_len: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1947,8 +1985,10 @@ struct RepExecution {
 /// continuations at 2048 lines: the pmode code footprint thrashes a 2048-entry direct-mapped
 /// cache. Doubling to 4096 cut those misses by 53% (227M -> 106M breaks), boosted insns/run from
 /// 14.5 to 23.2 (+60%), and lifted decode_hit from 94.85% to 97.66%. 8192 gave diminishing
-/// returns (24.9 insns/run, +7% over 4096). At ~48 bytes per line (DecodeLine = tag + generation +
-/// DecodedInsn) 4096 lines is ~192 KB, still inside L2 on a normal (8-32 MB L3) machine.
+/// returns (24.9 insns/run, +7% over 4096). At ~52 bytes per line (DecodeLine = tag + generation +
+/// DecodedInsn; DecodedInsn grew 36 -> 40 bytes when C1e added the recorded
+/// {disp_len, imm_len} pair) 4096 lines is ~208 KB, still inside L2 on a normal (8-32 MB L3)
+/// machine.
 /// Purely microarchitectural: the decode cache is transparent to CpuGsw equality, so this needs
 /// no conformance/regolden work.
 const DECODE_CACHE_LINES: usize = 4096;

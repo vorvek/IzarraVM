@@ -4579,8 +4579,8 @@ fn clif_chain_three_units_aggregate_across_event_caps() {
 // 26-vs-28 bus-clock divergence reproduces ONLY on the C1e restamp branch, ONLY on the
 // pass AFTER a tail restamp, and at ANY target length (a 4-byte target diverges
 // identically): it is the C1e restamp survivor legitimately skipping the interpreter's
-// transient post-SMC re-decode prefetch refill, already documented and handled there
-// (pass_state_strict_bus_lenient). On main the same write KILLS the unit and both arms
+// transient post-SMC re-decode prefetch refill, handled there by the interp-once
+// cooldown (timing identity by construction). On main the same write KILLS the unit and both arms
 // re-enter through the interpreter, so the charge stays symmetric. Every warm/chained
 // shape below (byte lengths 1-6, Jmp and Jcc hops, multi-hop, long-mid-chain) is
 // bus-clock-identical through the STRICT ChainHarness compare; this battery pins the
@@ -4697,5 +4697,612 @@ fn clif_chain_multi_hop_long_mid_chain_stays_clock_identical() {
     assert!(
         counters.linked_transfers >= 2,
         "both hops must resolve natively: {counters:#?}"
+    );
+}
+
+// ===== C1e (D3): the tail-byte re-stamp battery (design 2026-07-19-track-c1e-design.md
+// section 7). Out-of-band cases drive precise byte writes through
+// `note_device_memory_write_range` (value-less, so no G2 elision masks the classifier);
+// guest-driven cases run persistent-memory forced cases so the SMC survives across passes.
+// Every sequence opens with a starter nop at 0x1000: the clif dispatcher roots units at
+// the instruction AFTER the pass entry (the chain tests' established "starter" shape), so
+// the unit under test is keyed at 0x1001.
+
+/// Note one out-of-band SMC write on both harness arms: template + both bus copies +
+/// the invalidation note (the existing chain-SMC test's pattern, kept in sync so the
+/// per-pass template reset cannot silently revert patched bytes under a live lane).
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn note_patch(harness: &mut ChainHarness, addr: usize, bytes: &[u8]) {
+    harness.memory[addr..addr + bytes.len()].copy_from_slice(bytes);
+    for (cpu, bus) in [
+        (&mut harness.interp, &mut harness.interp_bus),
+        (&mut harness.clif, &mut harness.clif_bus),
+    ] {
+        bus.memory[addr..addr + bytes.len()].copy_from_slice(bytes);
+        cpu.note_device_memory_write_range(addr as u32, bytes.len() as u32);
+    }
+}
+
+/// The compiled clif unit rooted at `linear` on the harness's clif arm, for lane-precise
+/// descriptor assertions (linear == physical: the harness runs flat unpaged).
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn compiled_unit(clif: &CpuGsw, linear: u32) -> &crate::jit::clif::cache::ClifUnitDescriptor {
+    use crate::jit::clif::cache::{ClifUnitKey, ClifUnitState};
+    let key = ClifUnitKey {
+        linear,
+        physical: linear,
+        mode_key: clif.jit_mode_key(),
+    };
+    let Some(ClifUnitState::Compiled(index)) = clif.jit_direct.clif_units.state(key) else {
+        panic!("the unit at {linear:#x} must be Compiled");
+    };
+    clif.jit_direct
+        .clif_units
+        .unit(index)
+        .expect("compiled index resolves")
+}
+
+/// Battery 1: a tail-confined immediate patch RESTAMPS: the unit survives (no kill, no
+/// reinstall), the lane updates, and the next entry observes the new operand natively.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_tail_patch_survives_without_recompile() {
+    // 0x1000: nop; 0x1001: mov ecx, 0x12345678; 0x1006: add eax, ecx; hlt.
+    let code = [0x90, 0xb9, 0x78, 0x56, 0x34, 0x12, 0x01, 0xc8, 0xf4];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    // Patch the immediate's top byte (0x1005, the slot-0 tail's last byte).
+    note_patch(&mut harness, 0x1005, &[0xaa]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        before.smc_unit_restamps + 1,
+        "{after:#?}"
+    );
+    assert_eq!(after.smc_unit_kills, before.smc_unit_kills, "{after:#?}");
+    // The lane holds the patched full-width immediate (slot 0's immediate lane).
+    assert_eq!(
+        compiled_unit(&harness.clif, 0x1001).operands[0],
+        0xaa34_5678
+    );
+    // Byte identity across re-entries: a stale lane would diverge here.
+    harness.pass();
+    harness.pass();
+    assert_eq!(harness.clif.registers.gpr[1], 0xaa34_5678, "ecx");
+    let settled = harness.clif.jit_clif_counters();
+    // kills == 0 is the no-recompile proof (restamp never removes an entry; only a kill
+    // forces the re-walk/re-lower/re-install path for THIS unit). `units_installed` is
+    // deliberately NOT pinned: the patched ROOT line's narrow decode invalidation makes
+    // the next pass interpret it naturally (the probe needs a live line), and that
+    // interpreted window can legitimately admit a NEW unit at a continuation root; the
+    // restamped unit itself stays Compiled with its patched lane, re-asserted here.
+    assert_eq!(
+        settled.smc_unit_kills, before.smc_unit_kills,
+        "{settled:#?}"
+    );
+    assert_eq!(
+        compiled_unit(&harness.clif, 0x1001).operands[0],
+        0xaa34_5678
+    );
+}
+
+/// Battery 2: a leading/structural byte write KILLS (the opcode byte rewrite: mov ecx
+/// becomes mov edx), and the rewritten stream re-admits byte-identically.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_leading_byte_write_kills() {
+    let code = [0x90, 0xb9, 0x78, 0x56, 0x34, 0x12, 0x01, 0xc8, 0xf4];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    note_patch(&mut harness, 0x1001, &[0xba]); // mov EDX, imm32 now
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_kills,
+        before.smc_unit_kills + 1,
+        "{after:#?}"
+    );
+    assert_eq!(
+        after.smc_unit_restamps, before.smc_unit_restamps,
+        "{after:#?}"
+    );
+    for _ in 0..6 {
+        harness.pass();
+    }
+    assert_eq!(harness.clif.registers.gpr[2], 0x1234_5678, "edx");
+}
+
+/// Battery 3: a write spanning a slot boundary KILLS. Note the structural fact the coarse
+/// multi-slot counter records nothing here: every x86 instruction starts with at least one
+/// structural byte (its opcode), so a CONTIGUOUS write crossing a slot boundary always
+/// touches the next slot's leading byte and kills through the leading rule before the
+/// multi-slot escalation is ever consulted; `smc_unit_kills_multi_slot` is asserted
+/// unchanged to pin that reasoning (deviation from the design's test sketch, which
+/// expected the multi-slot counter to fire; the design's own dword-store-spanning-two-
+/// tails example cannot exist for contiguous writes).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_boundary_spanning_write_kills() {
+    // 0x1000: nop; 0x1001: mov ecx, imm32; 0x1006: mov edx, imm32; hlt.
+    let code = [
+        0x90, 0xb9, 0x78, 0x56, 0x34, 0x12, 0xba, 0x21, 0x43, 0x65, 0x07, 0xf4,
+    ];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    // Two bytes: slot 0's last tail byte + slot 1's opcode byte (0xba stays 0xba so the
+    // stream remains valid; the CLASSIFIER cannot know that and must kill).
+    note_patch(&mut harness, 0x1005, &[0xcc, 0xba]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_kills,
+        before.smc_unit_kills + 1,
+        "{after:#?}"
+    );
+    assert_eq!(
+        after.smc_unit_kills_multi_slot, before.smc_unit_kills_multi_slot,
+        "contiguous boundary writes kill via the LEADING rule, never multi-slot: {after:#?}"
+    );
+    assert_eq!(
+        after.smc_unit_restamps, before.smc_unit_restamps,
+        "{after:#?}"
+    );
+    harness.pass();
+    assert_eq!(harness.clif.registers.gpr[1], 0xcc34_5678, "ecx");
+}
+
+/// Battery 4a: the 0x83 sign-extension forced case (the design's single highest-risk
+/// value case): patching the imm8 to a high-bit value must SIGN-extend the lane, and the
+/// end-to-end comparison result must match the interpreter.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_sign_extends_the_0x83_imm8() {
+    // 0x1000: nop; 0x1001: cmp eax, 0x10 (83 f8 10); hlt. EAX = 0xFFFFFFF0 so the
+    // post-patch compare against sign-extended 0xF0 is EQUAL (ZF set); a zero-extending
+    // restamp would store 0x000000F0 and clear ZF instead.
+    let code = [0x90, 0x83, 0xf8, 0x10, 0xf4];
+    let mut gpr = forced_gpr();
+    gpr[0] = 0xffff_fff0;
+    let mut harness = ChainHarness::new(&code, gpr);
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    note_patch(&mut harness, 0x1003, &[0xf0]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        before.smc_unit_restamps + 1,
+        "{after:#?}"
+    );
+    assert_eq!(after.smc_unit_kills, before.smc_unit_kills, "{after:#?}");
+    assert_eq!(
+        compiled_unit(&harness.clif, 0x1001).operands[0],
+        0xffff_fff0,
+        "0x83's imm8 must SIGN-extend on restamp"
+    );
+    harness.pass();
+    assert_ne!(
+        harness.clif.eflags() & 0x40,
+        0,
+        "ZF: 0xFFFFFFF0 == sext(0xF0)"
+    );
+}
+
+/// Battery 4b: the byte-op imm8 does NOT sign-extend (the inverted-rule regression pin).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_zero_extends_the_byte_op_imm8() {
+    // 0x1000: nop; 0x1001: mov bl, 0x10 (b3 10); add eax, ebx; hlt.
+    let code = [0x90, 0xb3, 0x10, 0x01, 0xd8, 0xf4];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    note_patch(&mut harness, 0x1002, &[0xf0]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        before.smc_unit_restamps + 1,
+        "{after:#?}"
+    );
+    assert_eq!(
+        compiled_unit(&harness.clif, 0x1001).operands[0],
+        0x0000_00f0,
+        "a plain byte-op imm8 must ZERO-extend on restamp"
+    );
+    harness.pass();
+    assert_eq!(harness.clif.registers.gpr[3] & 0xff, 0xf0, "bl");
+}
+
+// Battery 4c (the design's imm16 forced case) is deliberately NOT a differential test:
+// `classify`'s word whitelist (0x39/0x3b/0x40-0x4f/0x89/0x8b/0xff) admits no
+// word-IMMEDIATE form, so no compiled unit can carry an `imm_len == 2` slot today and no
+// guest sequence can exercise a word-imm restamp end-to-end. The extension rule itself
+// (little-endian assembly, zero-extension) is pinned by
+// `cache.rs`'s `restamp_extension_tests` at the helper level instead, alongside the
+// equally-unreachable SignWord disp16 arm (recorded deviation from the design's test
+// sketch).
+
+/// Battery 4d: the disp32 end-to-end case: patching a displacement byte must move the
+/// EFFECTIVE ADDRESS the FastMap path computes, not merely the raw lane.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_disp32_feeds_the_effective_address() {
+    // 0x1000: nop; 0x1001: mov ecx, [0x3100] (8b 0d 00 31 00 00); hlt.
+    let code = [0x90, 0x8b, 0x0d, 0x00, 0x31, 0x00, 0x00, 0xf4];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    harness.memory[0x3100..0x3104].copy_from_slice(&0x1111_1111u32.to_le_bytes());
+    harness.memory[0x3200..0x3204].copy_from_slice(&0x2222_2222u32.to_le_bytes());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    // Patch the displacement's second byte: 0x3100 -> 0x3200.
+    note_patch(&mut harness, 0x1004, &[0x32]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        before.smc_unit_restamps + 1,
+        "{after:#?}"
+    );
+    assert_eq!(
+        compiled_unit(&harness.clif, 0x1001).operands[1],
+        0x0000_3200,
+        "the DISPLACEMENT lane (2i+1) must hold the patched address"
+    );
+    harness.pass();
+    assert_eq!(
+        harness.clif.registers.gpr[1], 0x2222_2222,
+        "ecx loads via the new EA"
+    );
+}
+
+/// Battery 5: chain preservation. A restamp inside a linked target does not unlink it:
+/// the next A-to-B hop still transfers natively AND observes the patched operand.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_preserves_chain_links() {
+    // 0x1000: nop; A at 0x1001: inc eax; add eax, ebx; jmp -> B at 0x1010: inc ebx;
+    // mov bl, 0x11 (the restampable imm8 at 0x1012); hlt. CORRECTED ATTRIBUTION
+    // (2026-07-19, PR #597's investigation): an earlier note here blamed a pre-existing
+    // C1d chained-hop under-charge for a bus-clock divergence seen while building this
+    // test. False: main is clock-identical for chained targets of every byte length
+    // (PR #597's sweep pins it). The divergence was THIS branch's own post-restamp
+    // transient, now closed by the interp-once cooldown
+    // (`ClifUnitDescriptor::interp_once`), so every pass here is the STRICT compare.
+    let mut code = vec![0x90, 0x40, 0x01, 0xd8, 0xeb, 0x0a];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(&[0x43, 0xb3, 0x11, 0xf4]);
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let warmed = harness.clif.jit_clif_counters();
+    assert!(warmed.linked_transfers > 0, "{warmed:#?}");
+    // Patch B's immediate (0x1012, tail-confined).
+    note_patch(&mut harness, 0x1012, &[0xaa]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        warmed.smc_unit_restamps + 1,
+        "{after:#?}"
+    );
+    assert_eq!(after.smc_unit_kills, warmed.smc_unit_kills, "{after:#?}");
+    // First post-patch pass: the interp-once cooldown routes B through the resolver and
+    // the dispatcher interprets it once (charging the same transient the oracle arm
+    // pays); the pass itself stays STRICTLY byte-identical.
+    harness.pass();
+    // Second post-patch pass: the portal republished, so the SAME cell transfers
+    // natively again with no re-resolution, and B's compiled body consumes the patched
+    // lane.
+    let before_pass = harness.clif.jit_clif_counters();
+    harness.pass();
+    let settled = harness.clif.jit_clif_counters();
+    assert!(
+        settled.linked_transfers > before_pass.linked_transfers,
+        "the restamped target must resume native transfers after the cooldown: {settled:#?}"
+    );
+    assert_eq!(
+        settled.unresolved_transfers, before_pass.unresolved_transfers,
+        "the republished portal must not leave hops in the resolver: {settled:#?}"
+    );
+    assert_eq!(
+        harness.clif.registers.gpr[3] & 0xff,
+        0xaa,
+        "the patched operand must take effect through the native chain hop"
+    );
+}
+
+/// Battery 6 (the in-flight case, design 3.1 case 2): an x87 call-out inside the unit
+/// writes a LATER slot's immediate tail. The restamp must not force an exit (no kill, no
+/// generation bump), and the later slot's lowered ALU must consume the PATCHED operand in
+/// the same entry, byte-identically with the interpreter.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_in_flight_callout_patch_is_observed_by_later_slots() {
+    // The admission dynamic this shape navigates: an x87 store's note is VALUE-LESS (no
+    // old-byte snapshot on its write path), so a unit whose call-out patches its own span
+    // on every run drops its own Seen entry each pass and can never admit; the in-flight
+    // scenario is only reachable when the patching starts AFTER the unit compiles. So:
+    // the fistp targets harmless DATA (0x3800) while the unit warms and compiles, and the
+    // fistp's OWN disp32 (an x87 slot's tail, itself restampable) is then patched
+    // out-of-band to aim at the add's immediate. Every later pass performs the guest
+    // write MID-CALL-OUT into the unit's own later slot: design 3.1 case 2 live.
+    //
+    // 0x1000: nop; 0x1001: mov ecx, 0x3400 (the stable ROOT line)
+    // 0x1006: fild dword [0x3004]          db 05 04 30 00 00
+    // 0x100c: fistp dword [0x3800]         db 1d 00 38 00 00 (disp bytes at 0x100e)
+    // 0x1012: add ebx, 0x11223344          81 c3 44 33 22 11 (imm at 0x1014)
+    // 0x1018: hlt
+    let code = [
+        0x90, 0xb9, 0x00, 0x34, 0x00, 0x00, 0xdb, 0x05, 0x04, 0x30, 0x00, 0x00, 0xdb, 0x1d, 0x00,
+        0x38, 0x00, 0x00, 0x81, 0xc3, 0x44, 0x33, 0x22, 0x11, 0xf4,
+    ];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    harness.memory[0x3004..0x3008].copy_from_slice(&0x0000_0077u32.to_le_bytes());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    // Retarget the fistp at the add's imm32 (a tail-confined x87-slot restamp itself).
+    note_patch(&mut harness, 0x100e, &[0x14, 0x10, 0x00, 0x00]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        before.smc_unit_restamps + 1,
+        "the disp retarget must itself restamp: {after:#?}"
+    );
+    assert_eq!(after.smc_unit_kills, before.smc_unit_kills, "{after:#?}");
+    // The next pass performs the mid-call-out write: the classifier restamps the add's
+    // immediate lane DURING the call-out and the generation bump exits the in-flight
+    // entry at the call-out return (the section-3.2 REVERSAL: this battery is the test
+    // that empirically falsified the no-bump alias argument by observing a stale operand
+    // consumed after an in-flight patch), so the interpreter finishes the pass with the
+    // patched bytes and every LATER native entry loads the patched lane. No kill, no
+    // retirement, no recompile anywhere.
+    harness.pass();
+    let settled = harness.clif.jit_clif_counters();
+    assert!(
+        settled.smc_unit_restamps > after.smc_unit_restamps,
+        "the mid-call-out tail write must restamp: {settled:#?}"
+    );
+    assert_eq!(
+        settled.smc_unit_kills, before.smc_unit_kills,
+        "a restamp must never kill: {settled:#?}"
+    );
+    assert_eq!(
+        harness.clif.registers.gpr[3],
+        forced_gpr()[3].wrapping_add(0x77),
+        "the add must consume the operand the call-out just stored"
+    );
+    // Later passes keep restamping the resident unit (the value-less x87 note fires per
+    // pass against the template-reset bytes) and it stays Compiled throughout.
+    harness.pass();
+    let final_counters = harness.clif.jit_clif_counters();
+    assert_eq!(
+        final_counters.smc_unit_kills, before.smc_unit_kills,
+        "{final_counters:#?}"
+    );
+}
+
+/// Battery 6's companion negative: the same shape, but the call-out's write lands on the
+/// later slot's LEADING bytes (its opcode): the pre-existing Kill/generation-bump path
+/// must still fire (the restamp branch must not have suppressed it).
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_in_flight_callout_leading_write_still_kills() {
+    // The positive case's shape with the fistp retargeted at 0x1012, the add's OPCODE
+    // byte (a LEADING-byte write). The stored value 0xF4F4F4F4 rewrites the stream to an
+    // immediate hlt, identically on both arms; the clif arm must KILL through the
+    // pre-existing mid-call-out generation-bump path (the restamp branch must not have
+    // suppressed it).
+    let code = [
+        0x90, 0xb9, 0x00, 0x34, 0x00, 0x00, 0xdb, 0x05, 0x04, 0x30, 0x00, 0x00, 0xdb, 0x1d, 0x00,
+        0x38, 0x00, 0x00, 0x81, 0xc3, 0x44, 0x33, 0x22, 0x11, 0xf4,
+    ];
+    let mut harness = ChainHarness::new(&code, forced_gpr());
+    harness.memory[0x3004..0x3008].copy_from_slice(&0xf4f4_f4f4u32.to_le_bytes());
+    for _ in 0..6 {
+        harness.pass();
+    }
+    let before = harness.clif.jit_clif_counters();
+    assert!(before.entries > 0, "{before:#?}");
+    note_patch(&mut harness, 0x100e, &[0x12, 0x10, 0x00, 0x00]);
+    let after = harness.clif.jit_clif_counters();
+    assert_eq!(
+        after.smc_unit_restamps,
+        before.smc_unit_restamps + 1,
+        "the disp retarget itself is still a tail restamp: {after:#?}"
+    );
+    harness.pass();
+    let settled = harness.clif.jit_clif_counters();
+    assert!(
+        settled.smc_unit_kills > before.smc_unit_kills,
+        "a leading-byte write from inside a call-out must kill: {settled:#?}"
+    );
+}
+
+/// Battery 8: G2 same-value elision upstream: a lowered store of an UNCHANGED byte into
+/// watched code side-exits on the watch (the C1c discipline), but the interpreter's
+/// old-byte comparison elides the note, so the classifier never runs at all.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_same_value_store_is_elided_upstream() {
+    // 0x1000: nop; 0x1001: mov byte [0x100a], 0xAA (c6 05 0a 10 00 00 aa); 0x1009:
+    // mov bl, 0xAA (b3 aa, imm at 0x100a == the stored value); hlt.
+    let code = [
+        0x90, 0xc6, 0x05, 0x0a, 0x10, 0x00, 0x00, 0xaa, 0xb3, 0xaa, 0xf4,
+    ];
+    let clif = run_clif_forced_case(GswMode::Gsw586, &code, forced_gpr(), 0x202);
+    let counters = clif.jit_clif_counters();
+    assert_eq!(counters.smc_unit_restamps, 0, "{counters:#?}");
+    assert_eq!(counters.smc_unit_kills, 0, "{counters:#?}");
+    assert!(
+        counters.mem_exit_code_watch > 0,
+        "the watched store must still side-exit (proving the path was exercised): {counters:#?}"
+    );
+}
+
+/// Battery 9 (heat non-interaction, design 2.2c): a restamp STORM (a changed tail byte on
+/// every pass, Doom's renderer shape) never kills, never demotes, and the unit stays
+/// resident and Compiled at the end.
+#[test]
+#[cfg(all(
+    feature = "clif-backend",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+fn clif_restamp_storm_neither_kills_nor_demotes() {
+    // The storm must start only AFTER the victim compiles (a changed write into a
+    // not-yet-compiled unit's page drops its Seen entry, so an always-on storm starves
+    // admission forever): the first two passes skip the patcher via the counter branch,
+    // the victim unit admits clean, and every later pass writes the (always-changing)
+    // pass counter into the victim's imm8 from a DIFFERENT unit.
+    //
+    // The counter cell starts at the harness's 0xF4 memory fill, so it runs
+    // 0xF5, 0xF6, ... per pass; the UNSIGNED compare against 0xF7 skips the patcher for
+    // the first two passes.
+    //
+    // 0x1000: nop
+    // 0x1001: inc byte [0x3000]            fe 05 00 30 00 00
+    // 0x1007: cmp byte [0x3000], 0xf8      80 3d 00 30 00 00 f8
+    // 0x100e: jb +0x0e -> 0x101e           72 0e
+    // (three patch-free passes: the victim's first pass is a decode-miss with no probe,
+    // the second seeds Seen, the third compiles; the storm then runs passes 4-6)
+    // 0x1010: mov al, [0x3000]             (the patcher, passes 3+ only)
+    // 0x1015: mov [0x1021], al
+    // 0x101a: nops
+    // 0x101e: nop (run start, never probed); 0x101f: inc eax (the victim unit's stable,
+    // LOWERABLE root: a nop-rooted unit has nothing lowerable at its entry and parks
+    // Dormant)
+    // 0x1020: mov bl, 0x55 (imm at 0x1021); hlt.
+    let code = [
+        0x90, 0xfe, 0x05, 0x00, 0x30, 0x00, 0x00, 0x80, 0x3d, 0x00, 0x30, 0x00, 0x00, 0xf8, 0x72,
+        0x0e, 0xa0, 0x00, 0x30, 0x00, 0x00, 0xa2, 0x21, 0x10, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x40, 0xb3, 0x55, 0xf4,
+    ];
+    // Persistent-memory pass loop (the pass counter must survive across passes, so the
+    // ChainHarness template reset cannot be used), STRICT on every axis including bus
+    // clocks: the interp-once cooldown makes the restamp survivor charge the same
+    // transient post-SMC fetch the oracle arm pays.
+    let mut memory = vec![0xf4u8; MEMORY_LEN];
+    memory[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+    let mut interp = generated_cpu(GswMode::Gsw586);
+    let mut clif = generated_cpu(GswMode::Gsw586);
+    clif.set_clif_backend_enabled(true);
+    let mut interp_bus = TestBus::with_memory(memory.clone());
+    let mut clif_bus = TestBus::with_memory(memory);
+    for bus in [&mut interp_bus, &mut clif_bus] {
+        bus.direct_pages_enabled = true;
+        bus.direct_page_clocks = true;
+    }
+    for _ in 0..8 {
+        for (cpu, bus) in [(&mut interp, &mut interp_bus), (&mut clif, &mut clif_bus)] {
+            cpu.halted = false;
+            cpu.registers.gpr = forced_gpr();
+            cpu.registers.eflags = 0x202;
+            cpu.pending_flags = PendingFlags::default();
+            cpu.set_eip(0x1000);
+            cpu.elapsed_clocks = 0;
+            cpu.core_clocks_so_far = 0;
+            cpu.timing_rem = 0;
+            while !cpu.run_budgeted(bus, 4096).expect("storm pass runs").halted {}
+        }
+        assert_eq!(clif.registers, interp.registers, "storm");
+        assert_eq!(clif.eflags(), interp.eflags(), "storm");
+        assert_eq!(clif_bus.memory, interp_bus.memory, "storm");
+        assert_eq!(
+            clif.elapsed_clocks, interp.elapsed_clocks,
+            "storm core clocks"
+        );
+        assert_eq!(
+            clif_bus.trace.elapsed_clocks(),
+            interp_bus.trace.elapsed_clocks(),
+            "storm bus clocks (the interp-once cooldown must keep timing identity)"
+        );
+    }
+    let counters = clif.jit_clif_counters();
+    assert!(
+        counters.smc_unit_restamps >= 2,
+        "the storm must keep restamping, not killing: {counters:#?}"
+    );
+    assert_eq!(counters.smc_unit_kills, 0, "{counters:#?}");
+    // No demotion: the storm never fed the heat map, so nothing parked Dormant.
+    use crate::jit::clif::cache::{ClifUnitKey, ClifUnitState};
+    let key = ClifUnitKey {
+        linear: 0x101f,
+        physical: 0x101f,
+        mode_key: clif.jit_mode_key(),
+    };
+    assert!(
+        matches!(
+            clif.jit_direct.clif_units.state(key),
+            Some(ClifUnitState::Compiled(_))
+        ),
+        "the stormed unit must stay resident and Compiled"
     );
 }

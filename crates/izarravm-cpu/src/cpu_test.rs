@@ -2574,3 +2574,17 @@ mod jit_double_shift;
 ))]
 #[path = "cpu_jit_test_imm_test.rs"]
 mod jit_test_imm;
+
+/// C1e: `DecodedInsn`'s recorded `{disp_len, imm_len}` pair (design section 1.2, review
+/// finding M3) did NOT fit the struct's padding: the size grew 36 -> 40 and is pinned
+/// here so the DecodeCache L2 sizing note (updated to ~52 bytes/line, ~208 KB at 4096
+/// lines) stays truthful against any further growth.
+#[test]
+fn decoded_insn_size_is_pinned_after_the_operand_length_pair() {
+    assert_eq!(
+        core::mem::size_of::<DecodedInsn>(),
+        40,
+        "DecodedInsn's size is load-bearing for the DecodeCache L2 sizing note; \
+         re-verify that note before accepting growth"
+    );
+}

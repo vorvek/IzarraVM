@@ -123,11 +123,125 @@ pub(crate) struct ClifUnitDescriptor {
     /// full-run exit lands at a FRESH target instruction (Direct's `Run` continuation
     /// shape: no interpret-one-first skip) rather than at an un-retired stop slot.
     pub(crate) terminal: bool,
+    /// C1e (design section 1.2): the per-slot ENCODED displacement and immediate byte
+    /// counts, decoder-recorded (never value-derived: a disp8 of -1 and a disp32 of
+    /// 0xFFFFFFFF are indistinguishable by value, only by consumed width). The slot's
+    /// tail (its restampable region) is the LAST `disp_len[i] + imm_len[i]` bytes;
+    /// everything before is structural (prefixes/opcode/ModRM/SIB) and a write there
+    /// kills. Terminal slots (Jmp/Jcc/Call/Ret) store 0/0 deliberately: their
+    /// branch-offset bytes are BAKED into the compiled code and the successor records,
+    /// not loaded from the operand table, so no tail patch can repair them (a C1e
+    /// implementation correction to the design's generic tail rule; Kill is always
+    /// sound).
+    pub(crate) disp_len: [u8; MAX_BLOCK_INSTRUCTIONS],
+    pub(crate) imm_len: [u8; MAX_BLOCK_INSTRUCTIONS],
+    /// C1e (design section 2.1): the per-slot immediate extension rule for restamp
+    /// re-reads (see `ImmExtend`; displacement re-reads need no discriminant: disp8 is
+    /// always sign-extended, disp32/moffs full-width).
+    pub(crate) imm_extend: [ImmExtend; MAX_BLOCK_INSTRUCTIONS],
+    /// C1e lane-routing bit i set when slot i is `Lea`, whose displacement VALUE lives in
+    /// the IMMEDIATE lane (`slot_immediate`'s `Lea` arm, C1b's established layout), so a
+    /// displacement restamp must patch `operands[2*i]`, not the `[2*i+1]` lane the memory
+    /// forms use. Patching the wrong lane would leave the loaded lane stale: silent
+    /// divergence, exactly what the routing bit prevents.
+    pub(crate) lea_mask: u32,
+    /// C1e extension-routing bit i set when slot i is a moffs form (0xA0-0xA3): its
+    /// 2-byte offset is ZERO-extended (`fetch_moffs`), while every other disp16 is
+    /// sign-extended (`parse_16bit_address`), and `disp_len == 2` alone cannot tell the
+    /// two apart (the same value-width collapse as 0x81/0x83 on the immediate side).
+    pub(crate) moffs_mask: u32,
+    /// C1e (design section 2.1, review m1): the host pointer to the unit's code PAGE,
+    /// captured from the SAME `direct_page(key.physical, InstructionPrefetch)` cover
+    /// check G4 admission already performs, so the restamp's post-write re-read goes
+    /// through the certified physical-RAM mapping with no re-translation. Stable for the
+    /// unit's life: a data-aperture remap never moves machine RAM, and every mapping
+    /// change that could (`note_direct_map_changed`, A20) wholesale-clears the clif
+    /// cache first.
+    pub(crate) code_host: usize,
+    /// C1e timing-identity cooldown: set by a restamp, consumed by the dispatcher's next
+    /// visit. The interpreter arm pays a transient post-SMC charge when it first
+    /// re-executes the patched line (measured: one extra byte-wide InstructionPrefetch
+    /// cycle, a prefetch-window-state-dependent amount that CANNOT be synthesized as a
+    /// constant), so the restamped unit's next entry runs the INTERPRETER over the same
+    /// instructions instead of the native body: the identical charge then arises from the
+    /// identical code path, keeping the C1 contract (state AND timing identity) with no
+    /// modeled constants. The unit stays installed and linked; only one entry is
+    /// interpreted. While the flag is set the unit's portal publishes the sentinel, so
+    /// CHAINED entries (which bypass the dispatcher) fall into the resolver, exit, and
+    /// route through the dispatcher's cooldown path too; `take_interp_once` republishes.
+    pub(crate) interp_once: bool,
     /// C1d (design section 3.6/M2): the statically-known link targets of the terminal
     /// `Jmp`/`Jcc` edges. Slot 0 the taken/only edge, slot 1 the `Jcc` not-taken
     /// fall-through, matching Direct's two-successor convention. A self-referential taken
     /// edge stores `None` (it never links in C1d; the edge stays a side exit).
     pub(crate) successors: [Option<LinkTarget>; 2],
+}
+
+/// C1e (design section 2.1): the extension rule a restamp applies when re-reading an
+/// immediate field from guest memory, recorded at walk time from `insn.opcode` and
+/// `insn.operand_size` while the raw `DecodedInsn` is in scope (review finding B1:
+/// `DirectKind` CANNOT supply this, because classify collapses 0x81/0x83 into identical
+/// kinds, losing both the width and the sign-extension distinction).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ImmExtend {
+    /// No immediate bytes (or a slot whose tail is structurally baked: terminals).
+    #[default]
+    None,
+    /// One byte, zero-extended (the plain byte-op forms: 0xB0-0xB7, the 0x80 group,
+    /// 0xC6, 0xA8, 0xF6, the shift/double-shift count bytes).
+    ZeroByte,
+    /// One byte, SIGN-extended (0x83's imm8 group and 0x6A push imm8).
+    SignByte,
+    /// Two bytes little-endian, zero-extended (the 0x66-gated word immediates and the
+    /// 16-bit moffs forms 0xA0-0xA3, whose offset is an unsigned 16-bit address).
+    /// UNREACHABLE today, deliberately kept: `classify`'s word whitelist
+    /// (`classify.rs`, the `0x39|0x3b|0x40..=0x4f|0x89|0x8b|0xff` gate) admits no
+    /// word-IMMEDIATE form, so no admitted slot records `imm_len == 2`; the arm is
+    /// pinned by a unit test below so a future word-imm admission cannot silently
+    /// inherit the wrong extension.
+    Word,
+    /// Two bytes little-endian, SIGN-extended (a ModRM disp16: `parse_16bit_address`
+    /// sign-extends both the mode-2 and the mode-0/rm-6 disp16 into its i32, distinct
+    /// from the zero-extending moffs form above; the walk tells them apart by opcode).
+    /// UNREACHABLE today for the same keep-it-pinned reason: `direct_addr` rejects
+    /// 16-bit address-size forms outright, so no admitted slot records a 2-byte
+    /// displacement.
+    SignWord,
+    /// Four bytes little-endian, full width.
+    Dword,
+}
+
+/// C1e (design section 5): what one `invalidate_physical_range` call did, returned so
+/// `note_code_write_hit` can feed the churn counters and the G1 heat map (design 2.2c:
+/// only KILLS heat; restamps are the cheap survivor path and contribute nothing).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ClifInvalidateOutcome {
+    /// Compiled units retired by the Kill verdict (leading-byte or multi-slot writes).
+    pub(crate) kills: u32,
+    /// Compiled units whose operand lane(s) were patched in place, no retirement.
+    pub(crate) restamps: u32,
+    /// `Seen`/`Dormant` entries dropped by the conservative page-overlap rule (no member
+    /// layout exists to classify against).
+    pub(crate) kills_no_layout: u32,
+    /// The subset of `kills` escalated by the coarse multi-slot rule (design 1.3: every
+    /// touched slot was individually tail-confined, but more than one slot was touched).
+    pub(crate) kills_multi_slot: u32,
+}
+
+/// Per-slot verdict aggregation for one write against one compiled unit (design 1.1).
+enum WriteVerdict {
+    /// A leading/structural byte (prefix/opcode/ModRM/SIB, or a terminal's baked tail)
+    /// was touched: the compiled code's structure may be stale.
+    Kill,
+    /// Every touched byte was tail-confined per slot, but more than one slot was touched
+    /// (the coarse rule accepted by the design review, section 1.3/Q1).
+    KillMultiSlot,
+    /// Exactly one slot touched, tail bytes only: patch its lane(s) in place.
+    Restamp {
+        slot: usize,
+        /// The slot's byte offset from the unit's physical anchor.
+        slot_off: u32,
+    },
 }
 
 /// Per-width static memory access counts for one unit prefix, the clif mirror of the six
@@ -191,6 +305,13 @@ impl ClifUnitDescriptor {
             cum_access_before: [ClifAccessCounts::default(); MAX_BLOCK_INSTRUCTIONS],
             access_total: ClifAccessCounts::default(),
             terminal: false,
+            disp_len: [0; MAX_BLOCK_INSTRUCTIONS],
+            imm_len: [0; MAX_BLOCK_INSTRUCTIONS],
+            imm_extend: [ImmExtend::None; MAX_BLOCK_INSTRUCTIONS],
+            lea_mask: 0,
+            moffs_mask: 0,
+            interp_once: false,
+            code_host: 0,
             successors: [None; 2],
         }
     }
@@ -246,6 +367,13 @@ pub(crate) struct UnitLayout {
     /// slot 1 the `Jcc` fall-through; `None` for self-referential edges and non-linking
     /// terminals.
     pub(crate) successors: [Option<LinkTarget>; 2],
+    /// C1e: the per-slot decoder-recorded operand byte counts and extension rules (see
+    /// the descriptor's field docs).
+    pub(crate) disp_len: [u8; MAX_BLOCK_INSTRUCTIONS],
+    pub(crate) imm_len: [u8; MAX_BLOCK_INSTRUCTIONS],
+    pub(crate) imm_extend: [ImmExtend; MAX_BLOCK_INSTRUCTIONS],
+    pub(crate) lea_mask: u32,
+    pub(crate) moffs_mask: u32,
 }
 
 /// Forward-decode a unit from the hot root, terminating on the four terminal kinds
@@ -267,6 +395,11 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
     let mut kinds = Vec::new();
     let mut operands = [0u32; 2 * MAX_BLOCK_INSTRUCTIONS];
     let mut successors: [Option<LinkTarget>; 2] = [None; 2];
+    let mut disp_len = [0u8; MAX_BLOCK_INSTRUCTIONS];
+    let mut imm_len = [0u8; MAX_BLOCK_INSTRUCTIONS];
+    let mut imm_extend = [ImmExtend::None; MAX_BLOCK_INSTRUCTIONS];
+    let mut lea_mask = 0u32;
+    let mut moffs_mask = 0u32;
     let mode_key = cpu.jit_mode_key();
     // The word-form prefix acceptance and 586 gate mirror Direct's compile loop exactly
     // (`compile_with_instruction_limit`'s `prefixes_supported` and persona checks): a word
@@ -311,6 +444,42 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         fetch_lens[instructions] = insn.len;
         operands[2 * instructions] = slot_immediate(&step.kind);
         operands[2 * instructions + 1] = slot_displacement(&step.kind);
+        // C1e: the restamp metadata, captured while the raw DecodedInsn is in scope (the
+        // B1 rule: the extension discriminant comes from insn.opcode/operand_size, never
+        // from DirectKind, which collapses 0x81/0x83). Terminal kinds zero their tail
+        // deliberately: their branch-offset bytes are baked into compiled EIP
+        // materialization and the successor records, not table-loaded, so any touch must
+        // Kill (see the descriptor field doc).
+        if step.terminal.is_some() {
+            disp_len[instructions] = 0;
+            imm_len[instructions] = 0;
+            imm_extend[instructions] = ImmExtend::None;
+        } else {
+            disp_len[instructions] = insn.disp_len;
+            imm_len[instructions] = insn.imm_len;
+            imm_extend[instructions] = match insn.imm_len {
+                0 => ImmExtend::None,
+                // The only classifiable sign-extending imm8 forms are 0x83's group and
+                // 0x6A push (0x6B imul also sign-extends but `classify` has no arm for
+                // it, so it can never occupy a lowered slot); everything else with one
+                // immediate byte is a plain zero-extended byte operand or a shift count.
+                1 => {
+                    if matches!(insn.opcode, 0x83 | 0x6a) {
+                        ImmExtend::SignByte
+                    } else {
+                        ImmExtend::ZeroByte
+                    }
+                }
+                2 => ImmExtend::Word,
+                _ => ImmExtend::Dword,
+            };
+            if matches!(step.kind, DirectKind::Lea { .. }) {
+                lea_mask |= 1 << instructions;
+            }
+            if matches!(insn.opcode, 0xa0..=0xa3) {
+                moffs_mask |= 1 << instructions;
+            }
+        }
         instructions += 1;
         guest_len += u32::from(insn.len);
         has_wide_accesses |= step.wide_access;
@@ -360,6 +529,11 @@ pub(crate) fn walk_unit(cpu: &CpuGsw, entry_lin: u32, d: bool) -> Option<UnitLay
         kinds,
         operands,
         successors,
+        disp_len,
+        imm_len,
+        imm_extend,
+        lea_mask,
+        moffs_mask,
     })
 }
 
@@ -797,6 +971,25 @@ impl ClifUnitCache {
         self.units.get(index as usize).map(|unit| &**unit)
     }
 
+    /// C1e: consume the post-restamp interp-once cooldown (see the descriptor field doc).
+    /// Returns true when the caller must interpret THIS entry; the flag clears and the
+    /// unit's portal republishes its own body so chained transfers resume natively from
+    /// the following entry.
+    pub(crate) fn take_interp_once(&mut self, index: u32) -> bool {
+        let Some(unit) = self.units.get_mut(index as usize) else {
+            return false;
+        };
+        if !unit.interp_once {
+            return false;
+        }
+        unit.interp_once = false;
+        let body = std::ptr::from_ref::<ClifUnitDescriptor>(&**unit) as usize;
+        if self.sentinel_addr != 0 && self.live.get(index as usize).copied() == Some(true) {
+            self.portals[index as usize].publish(body);
+        }
+        true
+    }
+
     /// Wholesale drop. Releases every currently-installed unit's watch registration first
     /// (the M5 discipline: every eviction path releases what it acquired), rather than
     /// relying on a coincidentally-paired wholesale `NativeCodeWatch::clear()` elsewhere,
@@ -846,38 +1039,74 @@ impl ClifUnitCache {
     /// ratchets the clif arena toward full. On fill, `ClifBackend::finalize` returns `None`
     /// and new keys park Dormant, i.e. reject-and-interpret: sound, merely slower. Span
     /// reuse/compaction is future work (the C1 plan's single-page compaction item).
+    ///
+    /// C1e restructures the per-unit verdict from unconditional Kill to the D3 tail-byte
+    /// classifier (design section 1): a write confined to one slot's displacement/
+    /// immediate tail RESTAMPS the live descriptor's operand lane(s) in place (the unit,
+    /// its watch registration, its links, and its cache state all survive untouched);
+    /// anything touching a leading/structural byte, or more than one slot, still kills.
+    ///
+    /// Scan-cost caveat (C1e deliverable, recorded): this runs a LINEAR scan of every
+    /// cache entry per SMC write that reaches the choke, on top of the per-slot
+    /// classification for each overlapping unit. Fine at current unit counts (the
+    /// SmcHeatMap demotes the pathological churn cases before the cache can grow hot
+    /// spans), but a restamp-heavy workload with thousands of resident units would want
+    /// the per-page index the C1b comment above already names as the later perf item.
     pub(crate) fn invalidate_physical_range(
         &mut self,
         watch: &mut NativeCodeWatch,
         start: u32,
         len: u32,
-    ) {
+    ) -> ClifInvalidateOutcome {
+        let mut outcome = ClifInvalidateOutcome::default();
         if len == 0 {
-            return;
+            return outcome;
         }
         let end = start.saturating_add(len);
         let before = self.entries.len();
-        // Two passes so the retire-and-unlink sequence (section 7: hide the portal via one
-        // Release store of the sentinel address, repoint and re-queue every inbound
-        // predecessor, unlink outbound, release the watch) runs with full &mut access
-        // BEFORE the entries drop.
+        // Three-way pass split so the retire-and-unlink sequence (section 7: hide the
+        // portal via one Release store of the sentinel address, repoint and re-queue every
+        // inbound predecessor, unlink outbound, release the watch) and the restamp patches
+        // both run with full &mut access AFTER the shared entry scan.
         let mut dying: Vec<(ClifUnitKey, Option<u32>)> = Vec::new();
+        let mut restamps: Vec<(u32, usize, u32)> = Vec::new();
         for (key, state) in &self.entries {
-            let span = match state {
-                ClifUnitState::Compiled(index) => Self::unit_span(&self.units, *index, *key),
+            match state {
+                ClifUnitState::Compiled(index) => {
+                    let span = Self::unit_span(&self.units, *index, *key);
+                    if span.1 <= start || span.0 >= end {
+                        continue;
+                    }
+                    let Some(unit) = self.units.get(*index as usize) else {
+                        dying.push((*key, Some(*index)));
+                        outcome.kills += 1;
+                        continue;
+                    };
+                    match Self::classify_write(unit, start, end) {
+                        WriteVerdict::Kill => {
+                            dying.push((*key, Some(*index)));
+                            outcome.kills += 1;
+                        }
+                        WriteVerdict::KillMultiSlot => {
+                            dying.push((*key, Some(*index)));
+                            outcome.kills += 1;
+                            outcome.kills_multi_slot += 1;
+                        }
+                        WriteVerdict::Restamp { slot, slot_off } => {
+                            restamps.push((*index, slot, slot_off));
+                            outcome.restamps += 1;
+                        }
+                    }
+                }
                 // Conservative page-overlap drop for non-compiled states (no recorded
-                // guest_len exists for them).
-                ClifUnitState::Seen | ClifUnitState::Dormant => (
-                    key.physical & !0xfff,
-                    (key.physical & !0xfff).saturating_add(0x1000),
-                ),
-            };
-            if !(span.1 <= start || span.0 >= end) {
-                let index = match state {
-                    ClifUnitState::Compiled(index) => Some(*index),
-                    _ => None,
-                };
-                dying.push((*key, index));
+                // guest_len or slot layout exists for them).
+                ClifUnitState::Seen | ClifUnitState::Dormant => {
+                    let page = key.physical & !0xfff;
+                    if !(page.saturating_add(0x1000) <= start || page >= end) {
+                        dying.push((*key, None));
+                        outcome.kills_no_layout += 1;
+                    }
+                }
             }
         }
         for (key, index) in dying {
@@ -886,10 +1115,152 @@ impl ClifUnitCache {
             }
             self.entries.remove(&key);
         }
-        if self.entries.len() != before {
+        // The restamp branch deliberately touches NOTHING but the operand lanes (design
+        // 2.2/m4): no `retire_unit`, no watch release (the surviving unit's bytes must
+        // STAY watched or the next SMC write to them would bypass this classifier
+        // entirely), no cache-state transition, no link churn.
+        let restamped = !restamps.is_empty();
+        for (index, slot, slot_off) in restamps {
+            if let Some(unit) = self.units.get_mut(index as usize) {
+                Self::restamp_slot(unit, slot, slot_off);
+                // Timing-identity cooldown (see the field doc): the next entry interprets
+                // once. Hide the portal so chained entries route through the dispatcher's
+                // cooldown path as well; links themselves stay intact (cells reference the
+                // PORTAL, so the later republish restores every edge with no
+                // re-resolution).
+                unit.interp_once = true;
+                if self.sentinel_addr != 0 {
+                    self.portals[index as usize].publish(self.sentinel_addr);
+                }
+            }
+        }
+        if self.entries.len() != before || restamped {
             // B1: an in-flight unit whose entry just died must not resume its lowered
             // slots; the generation mismatch trips the call-out exit latch.
+            //
+            // DESIGN REVERSAL, section 3.2's own trigger clause fired (C1e
+            // implementation finding): the design argued a PURE restamp need not bump
+            // because the operand-table loads are non-readonly `MemFlagsData::trusted()`
+            // loads that cranelift's alias model may not hoist across the x87 call-out's
+            // `call_indirect`. MEASURED FALSE on cranelift 0.133.1: the C1e in-flight
+            // battery (`clif_restamp_in_flight_callout_patch_is_observed_by_later_slots`)
+            // observed a compiled unit consume a PRE-PATCH operand after a mid-call-out
+            // restamp had already stored the new lane value, i.e. the optimizer DID
+            // reorder the trusted() load relative to the call. Section 3.2's closing
+            // paragraph mandates the reversal for exactly this evidence: a restamp now
+            // bumps the generation, so an in-flight unit exits at the call-out return and
+            // the interpreter (and every FRESH native entry, which loads the patched
+            // lane) observes the new operand. Everything else the restamp saves is
+            // preserved: no re-walk, no re-lower, no re-install, no link churn, no watch
+            // churn, no heat, no demotion; the bump costs one side exit for the
+            // in-flight entry only.
             self.generation = self.generation.wrapping_add(1);
+        }
+        outcome
+    }
+
+    /// The D3 tail-byte classifier (design section 1): per touched slot, a write into the
+    /// leading/structural bytes (`fetch_lens[i] - disp_len[i] - imm_len[i]` at the front)
+    /// kills; a write confined to the operand tail restamps; more than one touched slot
+    /// kills coarsely (Q1). Terminal slots recorded 0/0 tails at walk time, so any touch
+    /// on them is a leading touch.
+    fn classify_write(unit: &ClifUnitDescriptor, start: u32, end: u32) -> WriteVerdict {
+        let mut off = 0u32;
+        let mut touched: Option<(usize, u32)> = None;
+        let mut multi = false;
+        for i in 0..usize::from(unit.instructions) {
+            let len = u32::from(unit.fetch_lens[i]);
+            let s0 = unit.key.physical.wrapping_add(off);
+            let s1 = s0.wrapping_add(len);
+            off += len;
+            if end <= s0 || start >= s1 {
+                continue;
+            }
+            let tail = u32::from(unit.disp_len[i]) + u32::from(unit.imm_len[i]);
+            // The write's low byte WITHIN this slot; anything below the tail boundary is
+            // a structural touch.
+            if start.max(s0) < s1 - tail {
+                return WriteVerdict::Kill;
+            }
+            if touched.is_some() {
+                multi = true;
+            } else {
+                touched = Some((i, off - len));
+            }
+        }
+        match touched {
+            _ if multi => WriteVerdict::KillMultiSlot,
+            Some((slot, slot_off)) => WriteVerdict::Restamp { slot, slot_off },
+            // Defensive: the span overlap guaranteed at least one slot intersects (slots
+            // tile the unit's span exactly); kill rather than ignore if that ever breaks.
+            None => WriteVerdict::Kill,
+        }
+    }
+
+    /// The restamp action (design section 2): re-read the slot's FULL operand tail from
+    /// physical RAM post-write (guest memory is the canonical merged state, so re-reading
+    /// both sub-fields is always correct no matter which bytes the triggering write
+    /// touched) and patch the descriptor's lane(s) in place. The value transformation
+    /// reproduces the DECODER's own extension semantics exactly (the correctness cliff:
+    /// a zero-extending restamp of 0x83's sign-extended imm8 would silently corrupt every
+    /// later read of the operand).
+    fn restamp_slot(unit: &mut ClifUnitDescriptor, slot: usize, slot_off: u32) {
+        // An x87 call-out slot is never lowered and loads no lane (its call-out re-fetches
+        // its own bytes through the interpreter, which the decode-cache invalidation
+        // refreshed independently); leave its lanes at their walk-time zeros rather than
+        // write values nothing reads.
+        if unit.x87_mask & (1u32 << slot) != 0 {
+            return;
+        }
+        let disp_len = usize::from(unit.disp_len[slot]);
+        let imm_len = usize::from(unit.imm_len[slot]);
+        let tail = disp_len + imm_len;
+        if tail == 0 {
+            return;
+        }
+        let leading = usize::from(unit.fetch_lens[slot]) - tail;
+        let base =
+            unit.code_host + (unit.key.physical & 0xfff) as usize + slot_off as usize + leading;
+        // SAFETY: `code_host` is the host pointer of the direct RAM page the G4 admission
+        // cover check certified for the unit's WHOLE `guest_len` span (captured in run.rs
+        // at install), the slot tail lies inside that span by construction, and every
+        // mapping change that could move machine RAM wholesale-clears this cache first
+        // (see the `code_host` field doc), so the pointer is live and in bounds.
+        let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, tail) };
+        if disp_len > 0 {
+            let ext = match disp_len {
+                1 => ImmExtend::SignByte,
+                2 if unit.moffs_mask & (1u32 << slot) != 0 => ImmExtend::Word,
+                2 => ImmExtend::SignWord,
+                _ => ImmExtend::Dword,
+            };
+            let value = Self::extend_bytes(&bytes[..disp_len], ext);
+            // Lane routing: `Lea` keeps its displacement in the IMMEDIATE lane (C1b's
+            // layout, `slot_immediate`'s `Lea` arm); the memory forms use the second lane.
+            let lane = if unit.lea_mask & (1u32 << slot) != 0 {
+                2 * slot
+            } else {
+                2 * slot + 1
+            };
+            unit.operands[lane] = value;
+        }
+        if imm_len > 0 {
+            unit.operands[2 * slot] = Self::extend_bytes(&bytes[disp_len..], unit.imm_extend[slot]);
+        }
+    }
+
+    /// The decoder's extension semantics, reproduced byte-for-byte (design 2.1): the lane
+    /// must end up exactly what a fresh decode-and-classify of the patched bytes would
+    /// have stored (`sign_extend_u8` extends to the FULL 32 bits regardless of operand
+    /// size, so `SignByte` needs no word-size split).
+    fn extend_bytes(bytes: &[u8], ext: ImmExtend) -> u32 {
+        match ext {
+            ImmExtend::None => 0,
+            ImmExtend::ZeroByte => u32::from(bytes[0]),
+            ImmExtend::SignByte => bytes[0] as i8 as i32 as u32,
+            ImmExtend::Word => u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+            ImmExtend::SignWord => u16::from_le_bytes([bytes[0], bytes[1]]) as i16 as i32 as u32,
+            ImmExtend::Dword => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         }
     }
 
@@ -898,5 +1269,41 @@ impl ClifUnitCache {
             .get(index as usize)
             .map_or(0x1000, |unit| u32::from(unit.guest_len));
         (key.physical, key.physical.saturating_add(len))
+    }
+}
+
+#[cfg(test)]
+mod restamp_extension_tests {
+    use super::*;
+
+    /// C1e: the restamp re-read must reproduce the DECODER's extension semantics
+    /// byte-for-byte (design section 2.1's correctness cliff). The Word/SignWord arms are
+    /// currently unreachable through admission (no word-immediate or 16-bit-addressing
+    /// form classifies) but are pinned here so a future admission widening cannot
+    /// silently misextend.
+    #[test]
+    fn extend_bytes_reproduces_the_decoder_rules() {
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0xf0], ImmExtend::ZeroByte),
+            0x0000_00f0
+        );
+        // sign_extend_u8 extends to the FULL 32 bits regardless of operand size.
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0xf0], ImmExtend::SignByte),
+            0xffff_fff0
+        );
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0x34, 0xf0], ImmExtend::Word),
+            0x0000_f034
+        );
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0x34, 0xf0], ImmExtend::SignWord),
+            0xffff_f034
+        );
+        assert_eq!(
+            ClifUnitCache::extend_bytes(&[0x78, 0x56, 0x34, 0xf2], ImmExtend::Dword),
+            0xf234_5678
+        );
+        assert_eq!(ClifUnitCache::extend_bytes(&[], ImmExtend::None), 0);
     }
 }
