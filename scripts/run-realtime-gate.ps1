@@ -999,12 +999,19 @@ function Get-QuakeCompletionIdentityKey([string]$WorkloadName, $Sample) {
 function Get-EqualWorkRecord([string]$WorkloadName, $Sample) {
     $resultStatus = [string]$Sample.gate_artifacts.result_block_status
     $resultHash = [string]$Sample.gate_artifacts.result_block_sha256
+    $scaledBusClocks = if ($null -eq $Sample.PSObject.Properties["scaled_bus_clocks"] -or
+        $null -eq $Sample.scaled_bus_clocks) {
+        "not_recorded"
+    } else {
+        [uint64]$Sample.scaled_bus_clocks
+    }
     return [ordered]@{
         instructions = [uint64]$Sample.perf.instructions
         master_ticks = [uint64]$Sample.master_ticks
         elapsed_budget_clocks = [uint64]$Sample.elapsed_budget_clocks
         executed_cpu_core_clocks = [uint64]$Sample.executed_cpu_core_clocks
         raw_bus_clocks = [uint64]$Sample.raw_bus_clocks
+        scaled_bus_clocks = $scaledBusClocks
         stop = Get-StopIdentityKey $Sample
         timedemo_identity = Get-TimedemoIdentityKey $WorkloadName $Sample
         result_block_identity = "$resultStatus|$resultHash"
@@ -1022,7 +1029,11 @@ function Get-EqualWorkRecord([string]$WorkloadName, $Sample) {
 function Compare-EqualWorkRecords($Left, $Right) {
     $mismatches = @()
     foreach ($field in $Left.Keys) {
-        if ([string]$Left[$field] -cne [string]$Right[$field]) {
+        $unobservedScaledBusClocks = $field -ceq "scaled_bus_clocks" -and
+            ([string]$Left[$field] -ceq "not_recorded" -or
+                [string]$Right[$field] -ceq "not_recorded")
+        if ($unobservedScaledBusClocks -or
+            [string]$Left[$field] -cne [string]$Right[$field]) {
             $mismatches += $field
         }
     }
@@ -3041,7 +3052,7 @@ if ($PollSkipComparison) {
             paired_lower_bound = "one-sided 95% Student-t"
             exact_work_fields = @(
                 "perf.instructions", "master_ticks", "elapsed_budget_clocks",
-                "executed_cpu_core_clocks", "raw_bus_clocks", "stop",
+                "executed_cpu_core_clocks", "raw_bus_clocks", "scaled_bus_clocks", "stop",
                 "timedemo_identity", "result_block_sha256",
                 "measurement_fixture_identity", "quake_completion_identity"
             )

@@ -934,6 +934,7 @@ fn write_hdd_profile_json(
         "elapsed_budget_clocks": machine.elapsed_clocks(),
         "executed_cpu_core_clocks": machine.cpu().elapsed_clocks,
         "raw_bus_clocks": machine.raw_bus_clocks(),
+        "scaled_bus_clocks": machine.scaled_bus_clocks(),
         "instructions_per_host_second": perf.instructions as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "budget_clocks_per_host_second": machine.elapsed_clocks() as f64 / wall_seconds.max(f64::MIN_POSITIVE),
         "cpu_core_clocks_per_host_second": machine.cpu().elapsed_clocks as f64 / wall_seconds.max(f64::MIN_POSITIVE),

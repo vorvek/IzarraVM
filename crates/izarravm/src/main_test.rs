@@ -341,6 +341,11 @@ fn hdd_profile_json_reports_fixed_time_and_native_metrics() {
     );
     assert!(report["perf"]["instructions"].as_u64().unwrap() > 0);
     assert!(report["raw_bus_clocks"].as_u64().unwrap() > 0);
+    assert_eq!(
+        report["scaled_bus_clocks"].as_u64(),
+        Some(machine.scaled_bus_clocks())
+    );
+    assert!(machine.scaled_bus_clocks() > 0);
     assert!(report["perf"]["jit_direct_entries"].as_u64().is_some());
     assert!(report["perf"]["jit_direct_insns"].as_u64().is_some());
     assert!(report["perf"]["jit_direct_side_exits"].as_u64().is_some());

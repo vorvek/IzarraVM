@@ -690,6 +690,9 @@ pub struct Machine {
     // mode is not rounded to zero (mirrors the CPU's `timing_rem` for instruction
     // clocks). Reset on a mode switch (the per-mode ratio changes).
     bus_rem: u64,
+    // Cumulative scaled bus clocks committed by successful CPU batches. This is
+    // proof timing, separate from the mode-local fractional carry above.
+    scaled_bus_clocks: u64,
     #[cfg(feature = "jit")]
     poll_skip_enabled: bool,
     #[cfg(feature = "jit")]
@@ -1051,6 +1054,7 @@ impl Machine {
             cpu,
             cache_model: CacheModel::new(active_mode),
             bus_rem: 0,
+            scaled_bus_clocks: 0,
             #[cfg(feature = "jit")]
             poll_skip_enabled: run::poll_skip_default(execution_backend),
             #[cfg(feature = "jit")]
@@ -1352,6 +1356,11 @@ impl Machine {
     /// The machine timeline applies the active mode's bus ratio separately.
     pub fn raw_bus_clocks(&self) -> u64 {
         self.trace.elapsed_clocks()
+    }
+
+    /// Scaled bus clocks committed by successful CPU batches since reset.
+    pub fn scaled_bus_clocks(&self) -> u64 {
+        self.scaled_bus_clocks
     }
 
     pub fn memory(&self) -> &Memory {

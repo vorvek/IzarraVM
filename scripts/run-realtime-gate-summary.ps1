@@ -1276,7 +1276,8 @@ function Get-DirectQuakeSampleReasons(
         "gate_measurement_fixture_sha256", "gate_termination_policy",
         "gate_process_exit_code", "gate_power_scheme_before",
         "gate_power_scheme_after", "gate_argv", "gate_argv_sha256",
-        "gate_executable_sha256", "gate_hdd_tree", "gate_artifacts"
+        "gate_executable_sha256", "gate_hdd_tree", "gate_artifacts",
+        "scaled_bus_clocks"
     )) {
         if ($null -eq $Sample.PSObject.Properties[$property]) {
             $reasons += "$label is missing $property"
@@ -1284,6 +1285,9 @@ function Get-DirectQuakeSampleReasons(
     }
     if ($reasons.Count -ne 0) {
         return [object[]]$reasons
+    }
+    if ($null -eq $Sample.scaled_bus_clocks) {
+        $reasons += "$label has a null scaled_bus_clocks value"
     }
     if ($Sample.gate_role -cne $RevisionRole -or
         $Sample.gate_observation -cne $ExpectedObservation -or
@@ -2128,7 +2132,7 @@ function New-TrackMComparisonSummary([object[]]$Workloads) {
             paired_lower_bound = "one-sided 95% Student-t"
             exact_work_fields = @(
                 "perf.instructions", "master_ticks", "elapsed_budget_clocks",
-                "executed_cpu_core_clocks", "raw_bus_clocks", "stop",
+                "executed_cpu_core_clocks", "raw_bus_clocks", "scaled_bus_clocks", "stop",
                 "timedemo_identity", "result_block_identity",
                 "measurement_fixture_identity", "quake_completion_identity",
                 "qconsole_sha256"
@@ -2235,7 +2239,6 @@ function New-DirectQuakeCampaignSummary([object[]]$Workloads) {
         retention_eligible = $false
         retention_blockers = [object[]]@(
             "StateSnapshotV1 is not yet captured",
-            "scaled bus-clock total is not yet exposed",
             "the per-slice deterministic counter allowlist is not yet implemented"
         )
         revision_pair = [ordered]@{

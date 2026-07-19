@@ -741,6 +741,7 @@ function Invoke-RealtimeGateSelfTest {
         elapsed_budget_clocks = 30
         executed_cpu_core_clocks = 11
         raw_bus_clocks = 19
+        scaled_bus_clocks = 17
         stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
         timedemo = [pscustomobject]@{ gametics = 2134; realtics = 830 }
         gate_artifacts = [pscustomobject]@{
@@ -763,6 +764,38 @@ function Invoke-RealtimeGateSelfTest {
         $unequalComparison.mismatched_fields -notcontains "raw_bus_clocks") {
         throw "Equal-work comparison did not preserve a valid negative result."
     }
+    $exactSampleB.raw_bus_clocks = 19
+    $exactSampleB.scaled_bus_clocks = 16
+    $scaledComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($scaledComparison.matches -or
+        $scaledComparison.mismatched_fields.Count -ne 1 -or
+        $scaledComparison.mismatched_fields[0] -cne "scaled_bus_clocks") {
+        throw "Equal-work comparison did not enforce scaled bus clocks independently."
+    }
+    $exactSampleA.PSObject.Properties.Remove("scaled_bus_clocks")
+    $exactSampleB.PSObject.Properties.Remove("scaled_bus_clocks")
+    $missingScaledComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($missingScaledComparison.matches -or
+        $missingScaledComparison.mismatched_fields.Count -ne 1 -or
+        $missingScaledComparison.mismatched_fields[0] -cne "scaled_bus_clocks") {
+        throw "Equal-work comparison accepted two missing scaled bus totals."
+    }
+    $exactSampleA | Add-Member -NotePropertyName scaled_bus_clocks -NotePropertyValue $null
+    $exactSampleB | Add-Member -NotePropertyName scaled_bus_clocks -NotePropertyValue $null
+    $nullScaledComparison = Compare-EqualWorkRecords `
+        (Get-EqualWorkRecord "doom-586" $exactSampleA) `
+        (Get-EqualWorkRecord "doom-586" $exactSampleB)
+    if ($nullScaledComparison.matches -or
+        $nullScaledComparison.mismatched_fields.Count -ne 1 -or
+        $nullScaledComparison.mismatched_fields[0] -cne "scaled_bus_clocks") {
+        throw "Equal-work comparison accepted two null scaled bus totals."
+    }
+    $exactSampleA.scaled_bus_clocks = 17
+    $exactSampleB.scaled_bus_clocks = 17
     $pollExactA = $exactSampleA | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     $pollExactA.perf | Add-Member -NotePropertyName poll_skip_spans -NotePropertyValue 0
     $pollExactA.perf | Add-Member -NotePropertyName poll_skip_iterations -NotePropertyValue 0
@@ -1219,6 +1252,7 @@ function Invoke-RealtimeGateSelfTest {
             elapsed_budget_clocks = [uint64]3000
             executed_cpu_core_clocks = [uint64]1100
             raw_bus_clocks = [uint64]1900
+            scaled_bus_clocks = [uint64]1700
             stop = [pscustomobject]@{ kind = "test_exit"; code = 0 }
             timedemo = if ($isQuake) { $null } else {
                 [pscustomobject]@{ gametics = 2134; realtics = 830 }
@@ -1394,6 +1428,17 @@ function Invoke-RealtimeGateSelfTest {
             throw "The Direct Quake campaign accepted legacy Clif activity."
         }
         $directCandidate[0].perf.jit_clif_entries = 0
+        $directCandidate[0].PSObject.Properties.Remove("scaled_bus_clocks")
+        $missingScaledBus = Get-DirectQuakeCampaignWorkloadSummary `
+            (Get-WorkloadPolicy "quake-586") $directCandidate $directParent `
+            $directWarmups $directCorrectness $directPolicy "Proof" $candidateSha $parentSha
+        if ($missingScaledBus.provenance.verdict -cne "fail" -or
+            ($missingScaledBus.provenance.failure_reasons -join " ") -notmatch
+                "scaled_bus_clocks") {
+            throw "The Direct Quake campaign accepted a missing scaled bus total."
+        }
+        $directCandidate[0] | Add-Member `
+            -NotePropertyName scaled_bus_clocks -NotePropertyValue ([uint64]1700)
     } finally {
         $Runs = $savedRunsForDirectSelfTest
     }
@@ -1443,6 +1488,7 @@ function Invoke-RealtimeGateSelfTest {
         elapsed_budget_clocks = { param($sample) $sample.elapsed_budget_clocks++ }
         executed_cpu_core_clocks = { param($sample) $sample.executed_cpu_core_clocks++ }
         raw_bus_clocks = { param($sample) $sample.raw_bus_clocks++ }
+        scaled_bus_clocks = { param($sample) $sample.scaled_bus_clocks++ }
         stop = { param($sample) $sample.stop.code = 1 }
         timedemo_identity = { param($sample) $sample.quake_timedemo.line = "969 frames  22.7 seconds  42.6 fps" }
         result_block_identity = { param($sample) $sample.gate_artifacts.result_block_sha256 = "9" * 64 }
@@ -1468,6 +1514,34 @@ function Invoke-RealtimeGateSelfTest {
         $warmupMismatchScreen.warmups $automaticPolicy
     if ($warmupMismatchResult.verdicts.exact_work -ne "fail") {
         throw "Track M accepted unequal discarded warmups."
+    }
+    $missingScaledScreen = & $newTrackMScreen `
+        $trackMPolicies[0] $automaticPolicy 3 ([double[]](1, 1, 1))
+    foreach ($sample in @(
+        $missingScaledScreen.candidate + $missingScaledScreen.parent +
+        $missingScaledScreen.warmups.candidate + $missingScaledScreen.warmups.parent
+    )) {
+        $sample.PSObject.Properties.Remove("scaled_bus_clocks")
+    }
+    $missingScaledResult = Get-TrackMWorkloadSummary `
+        $trackMPolicies[0] $missingScaledScreen.candidate $missingScaledScreen.parent `
+        $missingScaledScreen.warmups $automaticPolicy
+    if ($missingScaledResult.verdicts.exact_work -ne "fail") {
+        throw "Track M accepted scaled bus totals missing from both roles."
+    }
+    $nullScaledScreen = & $newTrackMScreen `
+        $trackMPolicies[0] $automaticPolicy 3 ([double[]](1, 1, 1))
+    foreach ($sample in @(
+        $nullScaledScreen.candidate + $nullScaledScreen.parent +
+        $nullScaledScreen.warmups.candidate + $nullScaledScreen.warmups.parent
+    )) {
+        $sample.scaled_bus_clocks = $null
+    }
+    $nullScaledResult = Get-TrackMWorkloadSummary `
+        $trackMPolicies[0] $nullScaledScreen.candidate $nullScaledScreen.parent `
+        $nullScaledScreen.warmups $automaticPolicy
+    if ($nullScaledResult.verdicts.exact_work -ne "fail") {
+        throw "Track M accepted null scaled bus totals from both roles."
     }
 
     $semanticMutations = [ordered]@{
@@ -1767,7 +1841,13 @@ function Invoke-RealtimeGateSelfTest {
             $directCampaignSummary.verdict -cne "normal_promotion_threshold_met" -or
             -not $directCampaignSummary.evidence_valid -or
             $directCampaignSummary.retention_eligible -or
-            $directCampaignSummary.retention_blockers.Count -ne 3) {
+            $directCampaignSummary.retention_blockers.Count -ne 2 -or
+            $directCampaignSummary.retention_blockers -notcontains
+                "StateSnapshotV1 is not yet captured" -or
+            $directCampaignSummary.retention_blockers -notcontains
+                "the per-slice deterministic counter allowlist is not yet implemented" -or
+            ($directCampaignSummary.retention_blockers -join " ") -match
+                "scaled bus-clock") {
             throw "The Direct Quake campaign top-level partial-proof summary is wrong."
         }
         $CampaignStage = "Noise"
